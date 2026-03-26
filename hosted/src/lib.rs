@@ -37,7 +37,7 @@ impl Cpu for HostedCpu {
         std::thread::park();
     }
 
-    fn unpark(&self, _hart: HartId) {}
+    fn start_hart(&self, _hart: HartId) {}
 
     fn now(&self) -> Instant {
         Instant::new(self.started_at.elapsed().as_nanos() as u64)

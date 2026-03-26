@@ -1,12 +1,16 @@
 #![no_std]
-
+extern crate alloc;
 use core::fmt::Write;
 
 use crate::memory::MemoryRegion;
 
 pub mod cpu;
+pub mod fs;
+pub mod io;
 pub mod memory;
+pub mod net;
 pub mod timer;
+
 pub struct Platform<Console: Write + Send + 'static, Cpu: cpu::Cpu, Regions>
 where
     Regions: IntoIterator<Item = MemoryRegion>,
