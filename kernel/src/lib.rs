@@ -81,7 +81,7 @@ fn bootstrap_init<Console, CpuImpl, Regions>(
         "Kernel initialized on bootstrap hart={}",
         cpu.bootstrap_hart().id()
     );
-    tracing::info!("{}", include_str!("welcome.txt"));
+    tracing::info!("{}\n\n", include_str!("welcome.txt"));
 
     BOOT_STATE.store(BOOT_READY, Ordering::Release);
 
