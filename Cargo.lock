@@ -21,6 +21,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "async-task"
+version = "4.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b75356056920673b02621b35afd0f7dda9306d03c79a30f5c56c44cf256e3de"
+
+[[package]]
+name = "atomic-waker"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
+
+[[package]]
 name = "bitflags"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -183,15 +195,20 @@ version = "0.1.0"
 name = "helios-hosted"
 version = "0.1.0"
 dependencies = [
+ "critical-section",
  "helios-hal",
  "helios-kernel",
+ "tracing",
 ]
 
 [[package]]
 name = "helios-kernel"
 version = "0.1.0"
 dependencies = [
+ "async-task",
+ "atomic-waker",
  "buddy_system_allocator",
+ "critical-section",
  "helios-hal",
  "nu-ansi-term",
  "spinning_top",
@@ -204,6 +221,7 @@ dependencies = [
 name = "helios-riscv"
 version = "0.1.0"
 dependencies = [
+ "critical-section",
  "fdt",
  "helios-hal",
  "helios-kernel",

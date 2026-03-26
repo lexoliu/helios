@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+critical-section = { version = "1.2.0", features = ["restore-state-bool"] }
 fdt = { version = "0.1.5", default-features = false }
 riscv = "0.16.0"
 riscv-rt = { version = "0.17.1", features = ["s-mode"] }

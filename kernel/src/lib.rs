@@ -1,14 +1,22 @@
 #![no_std]
 extern crate alloc;
+mod executor;
 mod log;
 mod program;
+mod task;
+mod timer;
 
+pub use executor::{JoinHandle, Spawner};
 pub use helios_hal::Platform;
+pub use task::{YieldNow, yield_now};
+pub use timer::{Sleep, Timer};
 
 use core::sync::atomic::{AtomicU8, Ordering};
+use core::time::Duration;
 
 use buddy_system_allocator::LockedHeap;
-use helios_hal::cpu::{Cpu, HartId};
+use executor::Executor;
+use helios_hal::cpu::{Cpu, HartId, Instant};
 use helios_hal::memory::MemoryRegion;
 
 const HEAP_ORDER: usize = 32;
@@ -20,10 +28,77 @@ const BOOT_READY: u8 = 2;
 static ALLOCATOR: LockedHeap<HEAP_ORDER> = LockedHeap::empty();
 static BOOT_STATE: AtomicU8 = AtomicU8::new(BOOT_UNINITIALIZED);
 
-pub fn init<Console, CpuImpl, Regions>(platform: Platform<Console, CpuImpl, Regions>)
+pub struct Kernel<CpuImpl: Cpu + Clone> {
+    cpu: CpuImpl,
+    executor: Executor,
+    timer: Timer<CpuImpl>,
+}
+
+impl<CpuImpl: Cpu + Clone> Kernel<CpuImpl> {
+    pub fn spawner(&self) -> Spawner {
+        self.executor.spawner()
+    }
+
+    pub fn timer(&self) -> Timer<CpuImpl> {
+        self.timer.clone()
+    }
+
+    pub fn spawn<Fut>(&self, future: Fut) -> JoinHandle<Fut::Output>
+    where
+        Fut: core::future::Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        self.spawner().spawn(future)
+    }
+
+    pub fn spawn_detached<Fut>(&self, future: Fut)
+    where
+        Fut: core::future::Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        self.spawner().spawn_detached(future);
+    }
+
+    pub fn sleep_until(&self, deadline: Instant) -> Sleep<CpuImpl> {
+        self.timer.sleep_until(deadline)
+    }
+
+    pub fn sleep_for(&self, duration: Duration) -> Sleep<CpuImpl> {
+        self.timer.sleep_for(duration)
+    }
+
+    pub fn run_until_stalled(&self) -> usize {
+        let mut progress = 0;
+
+        loop {
+            let fired = self.timer.fire_expired();
+            let ran = self.executor.run_until_stalled();
+
+            if fired == 0 && ran == 0 {
+                return progress;
+            }
+
+            progress += fired + ran;
+        }
+    }
+
+    pub fn run(&self) -> ! {
+        loop {
+            if self.run_until_stalled() != 0 {
+                continue;
+            }
+
+            self.cpu.park_current();
+        }
+    }
+}
+
+pub fn init<Console, CpuImpl, Regions>(
+    platform: Platform<Console, CpuImpl, Regions>,
+) -> Kernel<CpuImpl>
 where
     Console: core::fmt::Write + Send + 'static,
-    CpuImpl: Cpu,
+    CpuImpl: Cpu + Clone,
     Regions: IntoIterator<Item = MemoryRegion>,
 {
     let Platform {
@@ -39,7 +114,18 @@ where
         wait_for_bootstrap(&cpu);
     }
 
-    tracing::info!("Hart online hart={}", current_hart.id());
+    let kernel = Kernel {
+        timer: Timer::new(cpu.clone()),
+        cpu,
+        executor: Executor::new(),
+    };
+
+    let hart_id = current_hart.id();
+    kernel.spawn_detached(async move {
+        tracing::info!("Hart online hart={hart_id}");
+    });
+
+    kernel
 }
 
 fn init_allocator<Regions>(memory_regions: Regions)

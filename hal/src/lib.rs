@@ -9,7 +9,6 @@ pub mod fs;
 pub mod io;
 pub mod memory;
 pub mod net;
-pub mod timer;
 
 pub struct Platform<Console: Write + Send + 'static, Cpu: cpu::Cpu, Regions>
 where

@@ -1,21 +1,56 @@
 use std::fmt::{self, Write};
-use std::time::Instant as StdInstant;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::thread::Thread;
+use std::time::{Duration, Instant as StdInstant};
 
 use helios_hal::Platform;
 use helios_hal::cpu::{Cpu, HartId, Instant};
 use helios_hal::memory::MemoryRegion;
-use helios_kernel::init;
+use helios_kernel::{init, yield_now};
 
 const HOSTED_HEAP_SIZE: usize = 16 * 1024 * 1024;
 
+#[derive(Clone)]
 struct HostedCpu {
     started_at: StdInstant,
+    main_thread: Thread,
+    timer_tx: Sender<StdInstant>,
 }
 
 impl HostedCpu {
     fn new() -> Self {
+        let started_at = StdInstant::now();
+        let main_thread = std::thread::current();
+        let (timer_tx, timer_rx) = mpsc::channel();
+        let timer_thread = main_thread.clone();
+        std::thread::spawn(move || timer_thread_main(timer_rx, timer_thread));
+
         Self {
-            started_at: StdInstant::now(),
+            started_at,
+            main_thread,
+            timer_tx,
+        }
+    }
+}
+
+fn timer_thread_main(timer_rx: Receiver<StdInstant>, main_thread: Thread) {
+    while let Ok(mut deadline) = timer_rx.recv() {
+        loop {
+            let now = StdInstant::now();
+            if now >= deadline {
+                main_thread.unpark();
+                break;
+            }
+
+            let timeout = deadline.saturating_duration_since(now);
+            match timer_rx.recv_timeout(timeout) {
+                Ok(next_deadline) => deadline = next_deadline,
+                Err(RecvTimeoutError::Timeout) => {
+                    main_thread.unpark();
+                    break;
+                }
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
         }
     }
 }
@@ -43,7 +78,20 @@ impl Cpu for HostedCpu {
         Instant::new(self.started_at.elapsed().as_nanos() as u64)
     }
 
-    fn set_deadline(&self, _deadline: Instant) {}
+    fn timer_frequency(&self) -> u64 {
+        1_000_000_000
+    }
+
+    fn set_deadline(&self, deadline: Instant) {
+        let absolute_deadline = self
+            .started_at
+            .checked_add(Duration::from_nanos(deadline.ticks()))
+            .expect("hosted timer deadline overflow");
+        self.timer_tx
+            .send(absolute_deadline)
+            .expect("hosted timer thread stopped unexpectedly");
+        self.main_thread.unpark();
+    }
 
     fn shutdown(&self) -> ! {
         std::process::exit(0);
@@ -75,9 +123,22 @@ pub fn main() {
     let heap = vec![0; HOSTED_HEAP_SIZE].into_boxed_slice();
     let heap = Box::leak(heap);
     let memory_regions = [MemoryRegion::from(heap)];
-    init(Platform::new(
+    let kernel = init(Platform::new(
         StdoutConsole,
         memory_regions,
         HostedCpu::new(),
     ));
+    let spawner = kernel.spawner();
+    let timer = kernel.timer();
+    kernel.spawn_detached(async move {
+        let joined = spawner
+            .spawn(async move {
+                timer.sleep_for(Duration::from_millis(10)).await;
+                yield_now().await;
+                2usize + 2
+            })
+            .await;
+        tracing::info!("Executor join result={joined}");
+    });
+    kernel.run();
 }
