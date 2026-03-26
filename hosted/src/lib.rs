@@ -1,9 +1,58 @@
 use std::fmt::{self, Write};
+use std::time::Instant as StdInstant;
 
 use helios_hal::Platform;
+use helios_hal::cpu::{Cpu, HartId, Instant};
+use helios_hal::memory::MemoryRegion;
 use helios_kernel::init;
 
 const HOSTED_HEAP_SIZE: usize = 16 * 1024 * 1024;
+
+struct HostedCpu {
+    started_at: StdInstant,
+}
+
+impl HostedCpu {
+    fn new() -> Self {
+        Self {
+            started_at: StdInstant::now(),
+        }
+    }
+}
+
+impl Cpu for HostedCpu {
+    fn current_hart(&self) -> HartId {
+        HartId::new(0)
+    }
+
+    fn hart_count(&self) -> usize {
+        1
+    }
+
+    fn bootstrap_hart(&self) -> HartId {
+        HartId::new(0)
+    }
+
+    fn park_current(&self) {
+        std::thread::park();
+    }
+
+    fn unpark(&self, _hart: HartId) {}
+
+    fn now(&self) -> Instant {
+        Instant::new(self.started_at.elapsed().as_nanos() as u64)
+    }
+
+    fn set_deadline(&self, _deadline: Instant) {}
+
+    fn shutdown(&self) -> ! {
+        std::process::exit(0);
+    }
+
+    fn reboot(&self) -> ! {
+        std::process::exit(1);
+    }
+}
 
 struct StdoutConsole;
 
@@ -25,5 +74,10 @@ pub fn main() {
 
     let heap = vec![0; HOSTED_HEAP_SIZE].into_boxed_slice();
     let heap = Box::leak(heap);
-    init(Platform::new(StdoutConsole, heap));
+    let memory_regions = [MemoryRegion::from(heap)];
+    init(Platform::new(
+        StdoutConsole,
+        memory_regions,
+        HostedCpu::new(),
+    ));
 }
