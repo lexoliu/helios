@@ -8,12 +8,6 @@ use linked_list_allocator::LockedHeap;
 #[cfg_attr(target_os = "none", global_allocator)]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
-#[cfg_attr(target_os = "none", panic_handler)]
-fn panic(info: &core::panic::PanicInfo) -> ! {
-    tracing::error!("Kernel Panic: {info}");
-    loop {}
-}
-
 #[cfg(not(target_os = "none"))]
 compile_error!(
     "This crate is only for the kernel. Please use `helios_hosted` for hosted applications."

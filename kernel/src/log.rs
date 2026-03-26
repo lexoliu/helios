@@ -1,5 +1,6 @@
 use core::fmt::Write;
 
+use nu_ansi_term::{Color, Style};
 use spinning_top::Spinlock;
 use tracing::Subscriber;
 
@@ -20,6 +21,9 @@ impl<Console: Write + Send + 'static> Subscriber for KernelConsoleSubscriber<Con
 
     fn event(&self, event: &tracing::Event<'_>) {
         let mut console = self.0.lock();
+        let metadata = event.metadata();
+        let (style, level) = level_style(metadata.level());
+        let _ = write!(console, "{} [{}] ", style.paint(level), metadata.target());
         let mut visitor = ConsoleVisitor(&mut *console);
         event.record(&mut visitor);
         let _ = writeln!(console);
@@ -34,10 +38,18 @@ struct ConsoleVisitor<'a, Console>(&'a mut Console);
 
 impl<Console: Write> tracing::field::Visit for ConsoleVisitor<'_, Console> {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn core::fmt::Debug) {
+        if is_message_field(field) {
+            let _ = write!(self.0, "{value:?} ");
+            return;
+        }
         let _ = write!(self.0, "{}={:?} ", field.name(), value);
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if is_message_field(field) {
+            let _ = write!(self.0, "{value} ");
+            return;
+        }
         let _ = write!(self.0, "{}={} ", field.name(), value);
     }
 
@@ -61,4 +73,18 @@ impl<Console: Write> tracing::field::Visit for ConsoleVisitor<'_, Console> {
 pub fn init_logger(console: impl Write + Send + 'static) {
     tracing::subscriber::set_global_default(KernelConsoleSubscriber(Spinlock::new(console)))
         .expect("Failed to set global logger");
+}
+
+fn level_style(level: &tracing::Level) -> (Style, &'static str) {
+    match *level {
+        tracing::Level::ERROR => (Color::Red.bold(), "ERROR"),
+        tracing::Level::WARN => (Color::Yellow.bold(), "WARN "),
+        tracing::Level::INFO => (Color::Green.bold(), "INFO "),
+        tracing::Level::DEBUG => (Color::Blue.bold(), "DEBUG"),
+        tracing::Level::TRACE => (Color::LightGray.normal(), "TRACE"),
+    }
+}
+
+fn is_message_field(field: &tracing::field::Field) -> bool {
+    field.name().contains("message")
 }

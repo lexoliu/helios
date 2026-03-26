@@ -16,6 +16,8 @@ helios-hosted = { path = "hosted" }
 helios-riscv = { path = "riscv" }
 helios-kernel = { path = "kernel" }
 helios = { path = "." }
+tracing = { version = "0.1.44",  default-features = false }
+
 
 [target.'cfg(not(target_os = "none"))'.dependencies]
 helios-hosted.workspace = true
