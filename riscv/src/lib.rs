@@ -4,6 +4,25 @@ use core::fmt::Write;
 use core::result::Result::Ok;
 use riscv_rt::entry;
 
+#[cfg_attr(target_os = "none", panic_handler)]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    if let Some(location) = info.location() {
+        tracing::error!(
+            "Kernel panic: {} ({}:{}:{})",
+            info.message(),
+            location.file(),
+            location.line(),
+            location.column()
+        );
+    } else {
+        tracing::error!("Kernel panic: {}", info.message());
+    }
+    sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
 pub struct SbiConsole;
 
 impl Write for SbiConsole {
