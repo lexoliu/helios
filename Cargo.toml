@@ -1,0 +1,30 @@
+[workspace]
+members = [
+    "hal", "hosted", "kernel", "riscv",
+]
+resolver = "2"
+
+
+[package]
+name = "helios"
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+helios-hal = { path = "hal" }
+helios-hosted = { path = "hosted" }
+helios-riscv = { path = "riscv" }
+helios-kernel = { path = "kernel" }
+helios = { path = "." }
+
+[target.'cfg(not(target_os = "none"))'.dependencies]
+helios-hosted.workspace = true
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+helios-riscv.workspace = true
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
