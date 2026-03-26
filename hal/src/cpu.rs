@@ -1,4 +1,4 @@
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct HartId(u16);
 
 impl HartId {
@@ -30,7 +30,7 @@ pub trait Cpu {
     fn bootstrap_hart(&self) -> HartId;
 
     fn park_current(&self);
-    fn unpark(&self, hart: HartId);
+    fn start_hart(&self, hart: HartId);
 
     fn now(&self) -> Instant;
     fn set_deadline(&self, deadline: Instant);

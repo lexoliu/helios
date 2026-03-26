@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "hal", "hosted", "kernel", "riscv",
+    "hal", "hosted", "kernel", "riscv", "virtio",
 ]
 resolver = "2"
 
