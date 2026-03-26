@@ -1,0 +1,10 @@
+[package]
+name = "helios-riscv"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+riscv = "0.16.0"
+riscv-rt = { version = "0.17.1", features = ["s-mode"] }
+sbi-rt = { version = "0.0.3", features = ["legacy"]}
+helios-kernel.workspace = true
