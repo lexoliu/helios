@@ -75,6 +75,11 @@ impl Cpu for HostedCpu {
 
     fn start_hart(&self, _hart: HartId) {}
 
+    fn wake_hart(&self, hart: HartId) {
+        assert!(hart == HartId::new(0), "hosted backend exposes only hart 0");
+        self.main_thread.unpark();
+    }
+
     fn now(&self) -> Instant {
         Instant::new(self.started_at.elapsed().as_nanos() as u64)
     }

@@ -37,7 +37,7 @@ impl Instant {
     }
 }
 
-pub trait Cpu {
+pub trait Cpu: Send + Sync + 'static {
     /// Returns the hart currently executing this code path.
     ///
     /// This must be cheap and stable for the lifetime of the `Cpu` value because
@@ -70,6 +70,14 @@ pub trait Cpu {
     /// bootstrap hart. Implementations may panic if the platform cannot start the
     /// requested hart, because that is a real bring-up failure.
     fn start_hart(&self, hart: HartId);
+
+    /// Nudges a hart that may currently be parked so it can observe newly
+    /// runnable work.
+    ///
+    /// This is the wakeup primitive used for cross-hart scheduling. On RISC-V
+    /// this maps naturally to an IPI; in hosted mode it maps to unparking the
+    /// backing thread.
+    fn wake_hart(&self, hart: HartId);
 
     /// Returns the current monotonic time in platform timer ticks.
     fn now(&self) -> Instant;
