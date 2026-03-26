@@ -5,12 +5,14 @@ use core::arch::global_asm;
 use core::fmt::Write;
 use core::ops::Range;
 use core::result::Result::Ok;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
 
 use fdt::Fdt;
 use helios_hal::cpu::{Cpu, HartId, Instant};
 use helios_hal::memory::MemoryRegion;
-use riscv_rt::entry;
+use helios_kernel::Timer;
+use riscv::interrupt::supervisor::Interrupt;
+use riscv_rt::{core_interrupt, entry};
 
 global_asm!(include_str!("mp_hook.S"));
 global_asm!(include_str!("secondary_entry.S"));
@@ -18,6 +20,40 @@ global_asm!(include_str!("secondary_entry.S"));
 const UNINITIALIZED_BOOT_HART: usize = usize::MAX;
 
 static BOOT_HART_ID: AtomicUsize = AtomicUsize::new(UNINITIALIZED_BOOT_HART);
+
+struct SupervisorCriticalSection;
+
+critical_section::set_impl!(SupervisorCriticalSection);
+
+unsafe impl critical_section::Impl for SupervisorCriticalSection {
+    unsafe fn acquire() -> bool {
+        let interrupts_were_enabled = riscv::register::sstatus::read().sie();
+        riscv::interrupt::supervisor::disable();
+        compiler_fence(Ordering::SeqCst);
+        interrupts_were_enabled
+    }
+
+    unsafe fn release(interrupts_were_enabled: bool) {
+        compiler_fence(Ordering::SeqCst);
+        if interrupts_were_enabled {
+            unsafe {
+                riscv::interrupt::supervisor::enable();
+            }
+        }
+    }
+}
+
+struct HartRuntime {
+    timer: Timer<RiscvCpu>,
+}
+
+impl HartRuntime {
+    fn install(&self) {
+        unsafe {
+            riscv::register::sscratch::write(self as *const Self as usize);
+        }
+    }
+}
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
@@ -43,10 +79,12 @@ impl Write for SbiConsole {
     }
 }
 
+#[derive(Clone)]
 pub struct RiscvCpu {
     current_hart: HartId,
     bootstrap_hart: HartId,
     hart_count: usize,
+    timebase_frequency: u64,
     fdt_addr: usize,
 }
 
@@ -55,12 +93,14 @@ impl RiscvCpu {
         current_hart: HartId,
         bootstrap_hart: HartId,
         hart_count: usize,
+        timebase_frequency: u64,
         fdt_addr: usize,
     ) -> Self {
         Self {
             current_hart,
             bootstrap_hart,
             hart_count,
+            timebase_frequency,
             fdt_addr,
         }
     }
@@ -105,6 +145,10 @@ impl Cpu for RiscvCpu {
         Instant::new(riscv::register::time::read64())
     }
 
+    fn timer_frequency(&self) -> u64 {
+        self.timebase_frequency
+    }
+
     fn set_deadline(&self, deadline: Instant) {
         sbi_rt::set_timer(deadline.ticks());
     }
@@ -135,11 +179,19 @@ extern "C" fn secondary_start_rust(hart_id: usize, fdt_addr: usize) -> ! {
     run_hart(hart_id, fdt_addr)
 }
 
+#[core_interrupt(Interrupt::SupervisorTimer)]
+fn supervisor_timer() {
+    current_hart_runtime().timer.handle_interrupt();
+}
+
 fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     let console = SbiConsole;
     let fdt = unsafe { Fdt::from_ptr(fdt_addr as *const u8) }
         .expect("OpenSBI did not provide a valid FDT");
-    let hart_count = fdt.cpus().count();
+    let mut cpus = fdt.cpus();
+    let first_cpu = cpus.next().expect("FDT does not describe any CPU");
+    let hart_count = 1 + cpus.count();
+    let timebase_frequency = first_cpu.timebase_frequency() as u64;
     let allocator_window = allocator_window();
     let memory = fdt.memory();
     let memory_regions = memory
@@ -156,13 +208,23 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         .map(range_to_memory_region);
     let current_hart = HartId::new(hart_id as u16);
     let bootstrap_hart = remember_bootstrap_hart(hart_id);
-    let cpu = RiscvCpu::new(current_hart, bootstrap_hart, hart_count, fdt_addr);
+    let cpu = RiscvCpu::new(
+        current_hart,
+        bootstrap_hart,
+        hart_count,
+        timebase_frequency,
+        fdt_addr,
+    );
 
-    helios_kernel::init(helios_kernel::Platform::new(console, memory_regions, cpu));
-
-    loop {
-        core::hint::spin_loop();
+    let kernel = helios_kernel::init(helios_kernel::Platform::new(console, memory_regions, cpu));
+    let hart_runtime = HartRuntime {
+        timer: kernel.timer(),
+    };
+    hart_runtime.install();
+    unsafe {
+        configure_interrupts();
     }
+    kernel.run();
 }
 
 unsafe extern "C" {
@@ -210,5 +272,25 @@ fn remember_bootstrap_hart(current_hart: usize) -> HartId {
     ) {
         Ok(_) => HartId::new(current_hart as u16),
         Err(bootstrap_hart) => HartId::new(bootstrap_hart as u16),
+    }
+}
+
+fn current_hart_runtime() -> &'static HartRuntime {
+    let ptr = riscv::register::sscratch::read();
+    assert!(ptr != 0, "hart runtime is not installed");
+
+    unsafe { &*(ptr as *const HartRuntime) }
+}
+
+unsafe fn configure_interrupts() {
+    unsafe extern "Rust" {
+        #[link_name = "_default_setup_interrupts"]
+        fn default_setup_interrupts();
+    }
+
+    unsafe {
+        default_setup_interrupts();
+        riscv::register::sie::set_stimer();
+        riscv::register::sstatus::set_sie();
     }
 }
