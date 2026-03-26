@@ -1,4 +1,5 @@
 use std::fmt::{self, Write};
+use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::Thread;
 use std::time::{Duration, Instant as StdInstant};
@@ -139,6 +140,11 @@ pub fn main() {
             })
             .await;
         tracing::info!("Executor join result={joined}");
+    });
+    let local_message: Rc<str> = Rc::from("spawn_local works");
+    kernel.spawn_local_detached(async move {
+        yield_now().await;
+        tracing::info!("{local_message}");
     });
     kernel.run();
 }

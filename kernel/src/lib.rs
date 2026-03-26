@@ -6,7 +6,7 @@ mod program;
 mod task;
 mod timer;
 
-pub use executor::{JoinHandle, Spawner};
+pub use executor::{JoinHandle, LocalJoinHandle, Spawner};
 pub use helios_hal::Platform;
 pub use task::{YieldNow, yield_now};
 pub use timer::{Sleep, Timer};
@@ -57,6 +57,22 @@ impl<CpuImpl: Cpu + Clone> Kernel<CpuImpl> {
         Fut::Output: Send + 'static,
     {
         self.spawner().spawn_detached(future);
+    }
+
+    pub fn spawn_local<Fut>(&self, future: Fut) -> LocalJoinHandle<Fut::Output>
+    where
+        Fut: core::future::Future + 'static,
+        Fut::Output: 'static,
+    {
+        self.spawner().spawn_local(future)
+    }
+
+    pub fn spawn_local_detached<Fut>(&self, future: Fut)
+    where
+        Fut: core::future::Future + 'static,
+        Fut::Output: 'static,
+    {
+        self.spawner().spawn_local_detached(future);
     }
 
     pub fn sleep_until(&self, deadline: Instant) -> Sleep<CpuImpl> {
@@ -167,7 +183,7 @@ fn bootstrap_init<Console, CpuImpl, Regions>(
         "Kernel initialized on bootstrap hart={}",
         cpu.bootstrap_hart().id()
     );
-    tracing::info!("{}\n\n", include_str!("welcome.txt"));
+    tracing::info!("Kernel is ready\n\n{}", include_str!("welcome.txt"));
 
     BOOT_STATE.store(BOOT_READY, Ordering::Release);
 
