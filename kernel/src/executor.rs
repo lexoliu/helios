@@ -8,6 +8,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use async_task::{Builder, Runnable, Task};
+use helios_hal::cpu::{Cpu, HartId};
 use spinning_top::Spinlock;
 
 type ReadyQueue = Spinlock<VecDeque<Runnable>>;
@@ -24,8 +25,10 @@ pub struct LocalJoinHandle<T> {
 }
 
 #[derive(Clone)]
-pub struct Spawner {
+pub struct Spawner<CpuImpl: Cpu + Clone> {
     ready_queue: Arc<ReadyQueue>,
+    cpu: CpuImpl,
+    owner_hart: HartId,
 }
 
 pub struct Executor {
@@ -39,9 +42,12 @@ impl Executor {
         }
     }
 
-    pub fn spawner(&self) -> Spawner {
+    pub fn spawner<CpuImpl: Cpu + Clone>(&self, cpu: CpuImpl) -> Spawner<CpuImpl> {
+        let owner_hart = cpu.current_hart();
         Spawner {
             ready_queue: self.ready_queue.clone(),
+            cpu,
+            owner_hart,
         }
     }
 
@@ -60,18 +66,24 @@ impl Executor {
     }
 }
 
-impl Spawner {
+impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
+    fn schedule(&self, runnable: Runnable) {
+        critical_section::with(|_| {
+            self.ready_queue.lock().push_back(runnable);
+        });
+
+        if self.cpu.current_hart() != self.owner_hart {
+            self.cpu.wake_hart(self.owner_hart);
+        }
+    }
+
     pub fn spawn<Fut>(&self, future: Fut) -> JoinHandle<Fut::Output>
     where
         Fut: Future + Send + 'static,
         Fut::Output: Send + 'static,
     {
-        let ready_queue = self.ready_queue.clone();
-        let schedule = move |runnable| {
-            critical_section::with(|_| {
-                ready_queue.lock().push_back(runnable);
-            });
-        };
+        let spawner = self.clone();
+        let schedule = move |runnable| spawner.schedule(runnable);
         let (runnable, task) = Builder::new().spawn(move |_| future, schedule);
         runnable.schedule();
         task
@@ -90,16 +102,12 @@ impl Spawner {
         Fut: Future + 'static,
         Fut::Output: 'static,
     {
-        let ready_queue = self.ready_queue.clone();
-        let schedule = move |runnable| {
-            critical_section::with(|_| {
-                ready_queue.lock().push_back(runnable);
-            });
-        };
+        let spawner = self.clone();
+        let schedule = move |runnable| spawner.schedule(runnable);
 
-        // SAFETY: the runnable is enqueued only into this executor's hart-local ready
-        // queue. At the current stage there is no cross-hart injection path, so the
-        // task will only be polled and dropped by the hart that spawned it.
+        // SAFETY: the runnable is always re-enqueued onto the spawning hart's ready
+        // queue, and `LocalJoinHandle` is `!Send`, so the task cannot be awaited or
+        // dropped from a different hart through safe Rust.
         let (runnable, task) = unsafe { Builder::new().spawn_unchecked(move |_| future, schedule) };
         runnable.schedule();
         LocalJoinHandle {

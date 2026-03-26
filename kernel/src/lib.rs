@@ -35,8 +35,8 @@ pub struct Kernel<CpuImpl: Cpu + Clone> {
 }
 
 impl<CpuImpl: Cpu + Clone> Kernel<CpuImpl> {
-    pub fn spawner(&self) -> Spawner {
-        self.executor.spawner()
+    pub fn spawner(&self) -> Spawner<CpuImpl> {
+        self.executor.spawner(self.cpu.clone())
     }
 
     pub fn timer(&self) -> Timer<CpuImpl> {

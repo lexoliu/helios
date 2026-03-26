@@ -44,6 +44,7 @@ unsafe impl critical_section::Impl for SupervisorCriticalSection {
 }
 
 struct HartRuntime {
+    hart_id: HartId,
     timer: Timer<RiscvCpu>,
 }
 
@@ -108,7 +109,12 @@ impl RiscvCpu {
 
 impl Cpu for RiscvCpu {
     fn current_hart(&self) -> HartId {
-        self.current_hart
+        let runtime_ptr = riscv::register::sscratch::read();
+        if runtime_ptr == 0 {
+            return self.current_hart;
+        }
+
+        unsafe { (*(runtime_ptr as *const HartRuntime)).hart_id }
     }
 
     fn hart_count(&self) -> usize {
@@ -135,6 +141,24 @@ impl Cpu for RiscvCpu {
 
         panic!(
             "failed to start hart {} via SBI HSM: error={} value={}",
+            hart.id(),
+            ret.error,
+            ret.value
+        );
+    }
+
+    fn wake_hart(&self, hart: HartId) {
+        if self.current_hart() == hart {
+            return;
+        }
+
+        let ret = sbi_rt::send_ipi(sbi_rt::HartMask::from_mask_base(1, hart.id() as usize));
+        if ret.is_ok() {
+            return;
+        }
+
+        panic!(
+            "failed to wake hart {} via SBI IPI: error={} value={}",
             hart.id(),
             ret.error,
             ret.value
@@ -184,6 +208,13 @@ fn supervisor_timer() {
     current_hart_runtime().timer.handle_interrupt();
 }
 
+#[core_interrupt(Interrupt::SupervisorSoft)]
+fn supervisor_soft() {
+    unsafe {
+        riscv::register::sip::clear_ssoft();
+    }
+}
+
 fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     let console = SbiConsole;
     let fdt = unsafe { Fdt::from_ptr(fdt_addr as *const u8) }
@@ -218,6 +249,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
 
     let kernel = helios_kernel::init(helios_kernel::Platform::new(console, memory_regions, cpu));
     let hart_runtime = HartRuntime {
+        hart_id: current_hart,
         timer: kernel.timer(),
     };
     hart_runtime.install();
@@ -290,6 +322,7 @@ unsafe fn configure_interrupts() {
 
     unsafe {
         default_setup_interrupts();
+        riscv::register::sie::set_ssoft();
         riscv::register::sie::set_stimer();
         riscv::register::sstatus::set_sie();
     }
