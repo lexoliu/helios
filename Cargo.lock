@@ -176,6 +176,10 @@ version = "0.1.0"
 [[package]]
 name = "helios-hosted"
 version = "0.1.0"
+dependencies = [
+ "helios-hal",
+ "helios-kernel",
+]
 
 [[package]]
 name = "helios-kernel"
