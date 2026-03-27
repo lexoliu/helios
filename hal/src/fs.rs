@@ -32,7 +32,10 @@ bitflags! {
 
 bitflags! {
     #[derive(Clone, Copy, PartialEq, Eq)]
-    pub struct BlockDeviceRights: u8 {}
+    pub struct BlockDeviceRights: u8 {
+        const READ = 1 << 0;
+        const WRITE = 1 << 1;
+    }
 }
 
 macro_rules! impl_resource_rights {
@@ -54,6 +57,11 @@ impl_resource_rights!(
     BlockDeviceRights,
 );
 
+pub type FileSystemHandle<T> = KernelResource<T, FileSystemRights>;
+pub type FileHandle<T> = KernelResource<T, FileRights>;
+pub type DirectoryHandle<T> = KernelResource<T, DirectoryRights>;
+pub type BlockDeviceHandle<T> = KernelResource<T, BlockDeviceRights>;
+
 /// Filesystem lookup result with concrete, already-rights-clamped resources.
 ///
 /// The resource itself carries its own rights, so callers do not need to keep a
@@ -63,7 +71,7 @@ pub enum DirectoryEntry<Directory, File> {
     File(File),
 }
 
-pub trait FileSystem: Send + Sync + KernelResource<Rights = FileSystemRights> {
+pub trait FileSystem: Send + Sync {
     type Directory: Directory;
     type File: File;
 
@@ -73,12 +81,12 @@ pub trait FileSystem: Send + Sync + KernelResource<Rights = FileSystemRights> {
     ) -> impl Future<Output = IoResult<Option<DirectoryEntry<Self::Directory, Self::File>>>> + Send;
 }
 
-pub trait File: Send + KernelResource<Rights = FileRights> {
+pub trait File: Send {
     fn read(&mut self, buf: &mut [u8]) -> impl Future<Output = usize> + Send;
     fn write(&mut self, buf: &[u8]) -> impl Future<Output = usize> + Send;
 }
 
-pub trait Directory: Send + KernelResource<Rights = DirectoryRights> {
+pub trait Directory: Send {
     type File: File;
 
     fn list(&self) -> impl Future<Output = Vec<DirectoryEntry<Self, Self::File>>> + Send
@@ -86,7 +94,7 @@ pub trait Directory: Send + KernelResource<Rights = DirectoryRights> {
         Self: Sized;
 }
 
-pub trait BlockDevice: Send + Sync + KernelResource<Rights = BlockDeviceRights> {
+pub trait BlockDevice: Send + Sync {
     fn read_block(
         &self,
         block_id: usize,

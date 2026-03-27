@@ -4,3 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+helios-hal.workspace = true
+spinning_top = "0.3.0"
+virtio-drivers = "0.13.0"
+
+[dev-dependencies]
+futures-lite = "2.6.1"
+zerocopy = { version = "0.8.27", features = ["derive"] }

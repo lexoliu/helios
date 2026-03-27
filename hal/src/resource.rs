@@ -1,3 +1,6 @@
+use bitflags::bitflags;
+use triomphe::Arc;
+
 /// Capability set carried by a kernel resource.
 ///
 /// The kernel only needs one operation at this layer: checking whether one
@@ -8,27 +11,100 @@ pub trait ResourceRights: Copy + Eq {
     fn contains(self, other: Self) -> bool;
 }
 
-/// Cloneable kernel object with an explicit, derivable capability set.
+bitflags! {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    /// WASI-style rights for a resource.
+    pub struct WasiRights:u64{
+        const FD_DATASYNC           = 1 << 0;
+        const FD_READ               = 1 << 1;
+        const FD_SEEK               = 1 << 2;
+        const FD_FDSTAT_SET_FLAGS   = 1 << 3;
+        const FD_SYNC               = 1 << 4;
+        const FD_TELL               = 1 << 5;
+        const FD_WRITE              = 1 << 6;
+        const FD_ADVISE             = 1 << 7;
+        const FD_ALLOCATE           = 1 << 8;
+
+
+    }
+}
+
+impl ResourceRights for WasiRights {
+    fn contains(self, other: Self) -> bool {
+        (self.bits() & other.bits()) == other.bits()
+    }
+}
+
+/// Reference-counted capability handle to a kernel object.
 ///
-/// Implementors only provide the unchecked "same object, narrower rights"
-/// operation. The safe `derive` entry point lives here so every resource type
-/// gets the same subset check and cannot accidentally forget it.
-pub trait KernelResource: Clone {
-    type Rights: ResourceRights;
+/// The handle owns a strong reference to the underlying object and carries the
+/// rights exposed through this particular view. Deriving a new handle can only
+/// narrow rights; the backing object is shared through RAII and drops once the
+/// last handle is released.
+pub struct KernelResource<T, Rights>
+where
+    Rights: ResourceRights,
+{
+    object: Arc<T>,
+    rights: Rights,
+}
 
-    fn rights(&self) -> Self::Rights;
+impl<T, Rights> KernelResource<T, Rights>
+where
+    Rights: ResourceRights,
+{
+    pub fn new(object: T, rights: Rights) -> Self {
+        Self {
+            object: Arc::new(object),
+            rights,
+        }
+    }
 
-    /// Clones the same underlying resource with a new capability set.
-    ///
-    /// # Safety
-    ///
-    /// `rights` must be a subset of `self.rights()`. Callers should use
-    /// [`KernelResource::derive`] instead of invoking this directly.
-    unsafe fn clone_with_rights(&self, rights: Self::Rights) -> Self;
+    pub fn from_arc(object: Arc<T>, rights: Rights) -> Self {
+        Self { object, rights }
+    }
 
-    fn derive(&self, rights: Self::Rights) -> Option<Self> {
-        self.rights()
-            .contains(rights)
-            .then(|| unsafe { self.clone_with_rights(rights) })
+    pub fn rights(&self) -> Rights {
+        self.rights
+    }
+
+    pub fn derive(&self, rights: Rights) -> Option<Self> {
+        self.rights.contains(rights).then(|| Self {
+            object: self.object.clone(),
+            rights,
+        })
+    }
+
+    pub fn object(&self) -> &T {
+        &self.object
+    }
+
+    pub fn into_arc(self) -> Arc<T> {
+        self.object
+    }
+
+    pub fn as_arc(&self) -> &Arc<T> {
+        &self.object
+    }
+}
+
+impl<T, Rights> Clone for KernelResource<T, Rights>
+where
+    Rights: ResourceRights,
+{
+    fn clone(&self) -> Self {
+        Self {
+            object: self.object.clone(),
+            rights: self.rights,
+        }
+    }
+}
+
+impl<T, Rights> AsRef<T> for KernelResource<T, Rights>
+where
+    Rights: ResourceRights,
+{
+    fn as_ref(&self) -> &T {
+        self.object()
     }
 }

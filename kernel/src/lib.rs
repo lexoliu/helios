@@ -7,10 +7,7 @@ mod program;
 mod task;
 mod timer;
 
-pub use compute_pool::{
-    ComputePool, ComputePoolConfig, ComputePoolSnapshot, ComputePriority,
-    SubmitError as ComputeSubmitError,
-};
+pub use compute_pool::{ComputePool, ComputePriority, SpawnError as ComputeSpawnError};
 pub use executor::{JoinHandle, LocalJoinHandle, Spawner};
 pub use helios_hal::Platform;
 pub use task::{YieldNow, yield_now};
