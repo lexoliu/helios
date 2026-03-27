@@ -2,6 +2,7 @@
 name = "helios-kernel"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [dependencies]
 async-task = { version = "4.7.1", default-features = false }
@@ -14,17 +15,23 @@ objectpool = { version = "0.1.0", default-features = false, features = ["alloc"]
 virtio-drivers = "0.13.0"
 helios-hal.workspace = true
 spinning_top = "0.3.0"
+thiserror = { version = "2.0.17", default-features = false }
 tracing.workspace = true
 bitflags = "2.11.0"
 
 [dev-dependencies]
 critical-section = { version = "1.2.0", features = ["std"] }
 futures-lite = "2.6.1"
-wat = "1.241.2"
+helios-kernel-macro.workspace = true
+wasm-encoder = "0.245.0"
 
-[target.'cfg(target_os = "none")'.dependencies]
+[build-dependencies]
+wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["all-arch", "component-model", "component-model-async", "cranelift", "runtime", "std"] }
+walkdir = "2.5.0"
+wit-component = "0.245.0"
+
+[target.'cfg(all(target_os = "none", target_arch = "riscv64"))'.dependencies]
 wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["riscv64", "cranelift", "runtime"] }
 
 [target.'cfg(not(target_os = "none"))'.dependencies]
-libc = "0.2.177"
-wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["host-arch", "cranelift", "runtime", "custom-native-signals", "custom-sync-primitives", "custom-virtual-memory"] }
+wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["host-arch", "cranelift", "runtime", "std"] }

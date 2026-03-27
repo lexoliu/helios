@@ -1,15 +1,27 @@
 #![no_std]
 extern crate alloc;
+extern crate self as helios_kernel;
+#[cfg(not(target_os = "none"))]
+extern crate std;
+mod bootfs;
 mod compute_pool;
+mod embedded_component;
+mod embedded_init;
+mod embedded_program;
 mod executor;
 mod log;
 mod program;
 mod task;
 mod timer;
-#[cfg(not(target_os = "none"))]
-mod wasmtime_shims;
 
+pub use bootfs::{
+    BootDirectory, BootDirectoryEntry, BootDirectoryHandleExt, BootFile, EmbeddedBootFile,
+    EmbeddedBootFs,
+};
 pub use compute_pool::{ComputePool, ComputePriority, SpawnError as ComputeSpawnError};
+pub use embedded_component::EmbeddedComponent;
+pub use embedded_init::{EmbeddedInit, embedded_init};
+pub use embedded_program::EmbeddedProgram;
 pub use executor::{JoinHandle, LocalJoinHandle, Spawner};
 pub use helios_hal::Platform;
 pub use program::{

@@ -2,7 +2,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 use nu_ansi_term::{Color, Style};
@@ -15,15 +15,21 @@ pub struct KernelConsoleSubscriber<Console> {
     queue: ConcurrentQueue<ReusableObject<String>>,
     buffers: Pool<String>,
     flushing: AtomicBool,
+    next_span_id: AtomicU64,
 }
 
 impl<Console: Write + Send + 'static> Subscriber for KernelConsoleSubscriber<Console> {
-    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
-        true
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        matches!(
+            *metadata.level(),
+            tracing::Level::ERROR | tracing::Level::WARN | tracing::Level::INFO
+        )
     }
 
     fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(0)
+        let span_id = self.next_span_id.fetch_add(1, Ordering::Relaxed);
+        assert!(span_id != 0, "kernel tracing span id counter overflowed");
+        tracing::span::Id::from_u64(span_id)
     }
 
     fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
@@ -130,6 +136,7 @@ pub fn init_logger(console: impl Write + Send + 'static) {
         queue: ConcurrentQueue::unbounded(),
         buffers: Pool::unbounded(|| String::with_capacity(256), String::clear),
         flushing: AtomicBool::new(false),
+        next_span_id: AtomicU64::new(1),
     })
     .expect("Failed to set global logger");
 }

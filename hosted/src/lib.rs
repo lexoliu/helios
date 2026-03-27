@@ -1,6 +1,8 @@
+mod bootfs_mount;
 mod config;
 mod console;
 mod cpu;
+mod init_program;
 mod runtime;
 
 #[global_allocator]

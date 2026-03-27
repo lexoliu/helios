@@ -1,0 +1,8 @@
+[package]
+name = "helios-api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+helios-api-macro = { path = "../api-macro" }
+wit-bindgen = { workspace = true, features = ["async", "macros", "realloc"] }

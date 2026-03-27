@@ -1,0 +1,15 @@
+[package]
+name = "helios-kernel-macro"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1.0.103"
+quote = "1.0.41"
+syn = { version = "2.0.108", features = ["parsing"] }
+walkdir = "2.5.0"
+wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["all-arch", "cranelift", "runtime", "std"] }
+wat = "1.241.2"
