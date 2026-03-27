@@ -6,10 +6,16 @@ mod log;
 mod program;
 mod task;
 mod timer;
+#[cfg(not(target_os = "none"))]
+mod wasmtime_shims;
 
 pub use compute_pool::{ComputePool, ComputePriority, SpawnError as ComputeSpawnError};
 pub use executor::{JoinHandle, LocalJoinHandle, Spawner};
 pub use helios_hal::Platform;
+pub use program::{
+    Blueprint, CompileError as ProgramCompileError, ExitCode, ProgramRuntime, ProgramRuntimeConfig,
+    ProgramRuntimeError, ProgramRuntimeInitError, ResourceTable, RunError as ProgramRunError, Task,
+};
 pub use task::{YieldNow, yield_now};
 pub use timer::{Sleep, Timer};
 
