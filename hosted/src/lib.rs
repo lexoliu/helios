@@ -5,7 +5,7 @@ use std::thread::Thread;
 use std::time::{Duration, Instant as StdInstant};
 
 use helios_hal::Platform;
-use helios_hal::cpu::{Cpu, HartId, Instant};
+use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
 use helios_kernel::{init, yield_now};
 
@@ -57,26 +57,29 @@ fn timer_thread_main(timer_rx: Receiver<StdInstant>, main_thread: Thread) {
 }
 
 impl Cpu for HostedCpu {
-    fn current_hart(&self) -> HartId {
-        HartId::new(0)
+    fn current_processor(&self) -> ProcessorId {
+        ProcessorId::new(0)
     }
 
-    fn hart_count(&self) -> usize {
+    fn processor_count(&self) -> usize {
         1
     }
 
-    fn bootstrap_hart(&self) -> HartId {
-        HartId::new(0)
+    fn bootstrap_processor(&self) -> ProcessorId {
+        ProcessorId::new(0)
     }
 
     fn park_current(&self) {
         std::thread::park();
     }
 
-    fn start_hart(&self, _hart: HartId) {}
+    fn start_processor(&self, _processor: ProcessorId) {}
 
-    fn wake_hart(&self, hart: HartId) {
-        assert!(hart == HartId::new(0), "hosted backend exposes only hart 0");
+    fn wake_processor(&self, processor: ProcessorId) {
+        assert!(
+            processor == ProcessorId::new(0),
+            "hosted backend exposes only processor 0"
+        );
         self.main_thread.unpark();
     }
 
