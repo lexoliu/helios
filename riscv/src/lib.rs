@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+pub mod compute;
+
 use core::arch::{asm, global_asm};
 use core::fmt::Write;
 use core::ops::Range;
