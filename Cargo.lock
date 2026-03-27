@@ -15,12 +15,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
-name = "arbitrary"
-version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
-
-[[package]]
 name = "async-task"
 version = "4.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -123,15 +117,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "413d67b29ef1021b4d60f4aa1e925ca031751e213832b4b1d588fae623c05c60"
 
 [[package]]
-name = "cpp_demangle"
-version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2bb79cb74d735044c972aae58ed0aaa9a837e85b01106a54c39e42e97f62253"
-dependencies = [
- "cfg-if",
-]
-
-[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -191,7 +176,6 @@ dependencies = [
  "pulley-interpreter",
  "regalloc2",
  "rustc-hash",
- "serde",
  "smallvec",
  "target-lexicon",
  "wasmtime-internal-core",
@@ -215,9 +199,6 @@ version = "0.131.0"
 [[package]]
 name = "cranelift-control"
 version = "0.131.0"
-dependencies = [
- "arbitrary",
-]
 
 [[package]]
 name = "cranelift-entity"
@@ -243,15 +224,6 @@ dependencies = [
 [[package]]
 name = "cranelift-isle"
 version = "0.131.0"
-
-[[package]]
-name = "cranelift-native"
-version = "0.131.0"
-dependencies = [
- "cranelift-codegen",
- "libc",
- "target-lexicon",
-]
 
 [[package]]
 name = "cranelift-srcgen"
@@ -447,7 +419,6 @@ dependencies = [
  "fnv",
  "hashbrown 0.16.1",
  "indexmap",
- "stable_deref_trait",
 ]
 
 [[package]]
@@ -832,12 +803,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3f2ad9f15a07f4a0e1677124f9120ce7e83ab7e1ca7186af0ca9da529b62e80"
 
 [[package]]
-name = "rustc-demangle"
-version = "0.1.27"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b50b8869d9fc858ce7266cce0194bd74df58b9d0e3f6df3a9fc8eb470d95c09d"
-
-[[package]]
 name = "rustc-hash"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -968,12 +933,6 @@ checksum = "d96d2d1d716fb500937168cc09353ffdc7a012be8475ac7308e1bdf0e3923300"
 dependencies = [
  "lock_api",
 ]
-
-[[package]]
-name = "stable_deref_trait"
-version = "1.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "syn"
@@ -1138,7 +1097,6 @@ dependencies = [
  "wasmtime-internal-cranelift",
  "wasmtime-internal-unwinder",
  "wasmtime-internal-versioned-export-macros",
- "wasmtime-internal-winch",
  "windows-sys",
 ]
 
@@ -1147,7 +1105,6 @@ name = "wasmtime-environ"
 version = "44.0.0"
 dependencies = [
  "anyhow",
- "cpp_demangle",
  "cranelift-bforest",
  "cranelift-bitset",
  "cranelift-entity",
@@ -1157,7 +1114,6 @@ dependencies = [
  "log",
  "object",
  "postcard",
- "rustc-demangle",
  "serde",
  "serde_derive",
  "sha2",
@@ -1186,7 +1142,6 @@ dependencies = [
  "cranelift-control",
  "cranelift-entity",
  "cranelift-frontend",
- "cranelift-native",
  "gimli",
  "itertools",
  "log",
@@ -1223,21 +1178,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wasmtime-internal-winch"
-version = "44.0.0"
-dependencies = [
- "cranelift-codegen",
- "gimli",
- "log",
- "object",
- "target-lexicon",
- "wasmparser",
- "wasmtime-environ",
- "wasmtime-internal-cranelift",
- "winch-codegen",
-]
-
-[[package]]
 name = "wast"
 version = "245.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1257,23 +1197,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd48d1679b6858988cb96b154dda0ec5bbb09275b71db46057be37332d5477be"
 dependencies = [
  "wast",
-]
-
-[[package]]
-name = "winch-codegen"
-version = "44.0.0"
-dependencies = [
- "cranelift-assembler-x64",
- "cranelift-codegen",
- "gimli",
- "regalloc2",
- "smallvec",
- "target-lexicon",
- "thiserror",
- "wasmparser",
- "wasmtime-environ",
- "wasmtime-internal-core",
- "wasmtime-internal-cranelift",
 ]
 
 [[package]]
