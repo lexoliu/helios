@@ -8,4 +8,5 @@ critical-section = { version = "1.2.0", features = ["std"] }
 crossbeam-channel = "0.5.15"
 helios-hal.workspace = true
 helios-kernel.workspace = true
+mimalloc = "0.1.48"
 tracing.workspace = true
