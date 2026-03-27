@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use core::arch::global_asm;
+use core::arch::{asm, global_asm};
 use core::fmt::Write;
 use core::ops::Range;
 use core::result::Result::Ok;
@@ -11,8 +11,10 @@ use fdt::Fdt;
 use helios_hal::cpu::{Cpu, HartId, Instant};
 use helios_hal::memory::MemoryRegion;
 use helios_kernel::Timer;
-use riscv::interrupt::supervisor::Interrupt;
-use riscv_rt::{core_interrupt, entry};
+use riscv::interrupt::Trap;
+use riscv::interrupt::supervisor::{Exception, Interrupt};
+use riscv_rt::entry;
+use trapframe::TrapFrame;
 
 global_asm!(include_str!("mp_hook.S"));
 global_asm!(include_str!("secondary_entry.S"));
@@ -50,9 +52,10 @@ struct HartRuntime {
 
 impl HartRuntime {
     fn install(&self) {
-        unsafe {
-            riscv::register::sscratch::write(self as *const Self as usize);
-        }
+        // `trapframe` owns `sscratch`, so hart-local runtime state lives in `tp`.
+        // This keeps trap entry correct while still giving the kernel a cheap
+        // per-hart lookup path.
+        write_hart_runtime(self as *const Self);
     }
 }
 
@@ -109,7 +112,7 @@ impl RiscvCpu {
 
 impl Cpu for RiscvCpu {
     fn current_hart(&self) -> HartId {
-        let runtime_ptr = riscv::register::sscratch::read();
+        let runtime_ptr = read_hart_runtime();
         if runtime_ptr == 0 {
             return self.current_hart;
         }
@@ -203,19 +206,29 @@ extern "C" fn secondary_start_rust(hart_id: usize, fdt_addr: usize) -> ! {
     run_hart(hart_id, fdt_addr)
 }
 
-#[core_interrupt(Interrupt::SupervisorTimer)]
-fn supervisor_timer() {
-    current_hart_runtime().timer.handle_interrupt();
-}
-
-#[core_interrupt(Interrupt::SupervisorSoft)]
-fn supervisor_soft() {
-    unsafe {
-        riscv::register::sip::clear_ssoft();
+#[unsafe(no_mangle)]
+extern "C" fn trap_handler(tf: &mut TrapFrame) {
+    match riscv::register::scause::read().cause().try_into() {
+        Ok(Trap::Interrupt(Interrupt::SupervisorTimer)) => {
+            current_hart_runtime().timer.handle_interrupt();
+        }
+        Ok(Trap::Interrupt(Interrupt::SupervisorSoft)) => unsafe {
+            riscv::register::sip::clear_ssoft();
+        },
+        Ok(Trap::Interrupt(Interrupt::SupervisorExternal)) => {
+            panic!("unexpected supervisor external interrupt: tf={tf:#x?}");
+        }
+        Ok(Trap::Exception(exception)) => {
+            handle_exception(exception, tf);
+        }
+        Err(err) => {
+            panic!("invalid supervisor trap cause: {err:?}, tf={tf:#x?}");
+        }
     }
 }
 
 fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
+    clear_hart_runtime();
     let console = SbiConsole;
     let fdt = unsafe { Fdt::from_ptr(fdt_addr as *const u8) }
         .expect("OpenSBI did not provide a valid FDT");
@@ -308,22 +321,47 @@ fn remember_bootstrap_hart(current_hart: usize) -> HartId {
 }
 
 fn current_hart_runtime() -> &'static HartRuntime {
-    let ptr = riscv::register::sscratch::read();
+    let ptr = read_hart_runtime();
     assert!(ptr != 0, "hart runtime is not installed");
 
     unsafe { &*(ptr as *const HartRuntime) }
 }
 
 unsafe fn configure_interrupts() {
-    unsafe extern "Rust" {
-        #[link_name = "_default_setup_interrupts"]
-        fn default_setup_interrupts();
-    }
-
     unsafe {
-        default_setup_interrupts();
+        trapframe::init();
         riscv::register::sie::set_ssoft();
         riscv::register::sie::set_stimer();
         riscv::register::sstatus::set_sie();
     }
+}
+
+fn handle_exception(exception: Exception, tf: &TrapFrame) -> ! {
+    let stval = riscv::register::stval::read();
+    panic!(
+        "unexpected supervisor exception: {exception:?}, sepc={:#x}, stval={:#x}, tf={tf:#x?}",
+        tf.sepc, stval,
+    );
+}
+
+fn current_hart_runtime_ptr() -> usize {
+    let runtime_ptr: usize;
+    unsafe {
+        asm!("mv {}, tp", out(reg) runtime_ptr, options(nomem, nostack, preserves_flags));
+    }
+    runtime_ptr
+}
+
+fn read_hart_runtime() -> usize {
+    current_hart_runtime_ptr()
+}
+
+fn write_hart_runtime(runtime: *const HartRuntime) {
+    unsafe {
+        asm!("mv tp, {}", in(reg) runtime, options(nomem, nostack, preserves_flags));
+    }
+}
+
+fn clear_hart_runtime() {
+    write_hart_runtime(core::ptr::null());
 }

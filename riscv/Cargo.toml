@@ -9,6 +9,7 @@ fdt = { version = "0.1.5", default-features = false }
 riscv = "0.16.0"
 riscv-rt = { version = "0.17.1", features = ["s-mode"] }
 sbi-rt = { version = "0.0.3", features = ["legacy"]}
+trapframe = { version = "0.10.1", default-features = false }
 helios-hal.workspace = true
 helios-kernel.workspace = true
 tracing.workspace = true
