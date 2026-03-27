@@ -4,13 +4,20 @@ use alloc::boxed::Box;
 use alloc::collections::BinaryHeap;
 use alloc::sync::Arc;
 use core::cmp::Ordering;
+use core::future::Future;
 use core::mem;
+use core::pin::Pin;
+use core::task::{Context, Poll};
 
+use atomic_waker::AtomicWaker;
 use spinning_top::Spinlock;
 
-/// Priority of a compute job submitted to the internal kernel compute pool.
-///
-/// Higher numeric values run first. Jobs of equal priority preserve FIFO order.
+/// Error returned when the compute pool cannot accept more work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpawnError {
+    MemoryLimitExceeded,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ComputePriority(u8);
 
@@ -28,23 +35,19 @@ impl ComputePriority {
     }
 }
 
-/// Immutable configuration for a compute pool.
+/// Immutable configuration for the kernel-internal compute pool.
 ///
-/// The total memory limit covers:
-/// - all worker stacks reserved by the pool
-/// - all queued jobs currently waiting for a worker
-///
-/// Queued jobs are rejected once admitting them would exceed the configured
-/// memory cap.
+/// This is crate-private because the kernel, not arbitrary callers, owns the
+/// worker topology and memory budget.
 #[derive(Clone, Copy)]
-pub struct ComputePoolConfig {
-    pub worker_count: usize,
-    pub worker_stack_size: usize,
-    pub max_memory_bytes: usize,
+pub(crate) struct ComputePoolConfig {
+    pub(crate) worker_count: usize,
+    pub(crate) worker_stack_size: usize,
+    pub(crate) max_memory_bytes: usize,
 }
 
 impl ComputePoolConfig {
-    pub const fn reserved_stack_bytes(self) -> usize {
+    pub(crate) const fn reserved_stack_bytes(self) -> usize {
         self.worker_count.saturating_mul(self.worker_stack_size)
     }
 }
@@ -72,30 +75,36 @@ struct ComputeJob {
     callback: Box<dyn FnOnce() + Send + 'static>,
 }
 
-/// Summary of current pool pressure.
-#[derive(Clone, Copy)]
-pub struct ComputePoolSnapshot {
-    pub queued_jobs: usize,
-    pub queued_bytes: usize,
-    pub reserved_stack_bytes: usize,
-    pub total_bytes: usize,
-    pub max_memory_bytes: usize,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SubmitError {
-    MemoryLimitExceeded,
+pub(crate) enum ConfigError {
     InvalidConfig,
 }
 
+pub(crate) struct ComputePoolSnapshot {
+    pub(crate) queued_jobs: usize,
+    pub(crate) queued_bytes: usize,
+    pub(crate) reserved_stack_bytes: usize,
+    pub(crate) total_bytes: usize,
+    pub(crate) max_memory_bytes: usize,
+}
+
+struct Completion<T> {
+    state: Arc<CompletionState<T>>,
+}
+
+struct CompletionState<T> {
+    result: Spinlock<Option<Result<T, SpawnError>>>,
+    waker: AtomicWaker,
+}
+
 impl ComputePool {
-    pub fn new(config: ComputePoolConfig) -> Result<Self, SubmitError> {
+    pub(crate) fn new(config: ComputePoolConfig) -> Result<Self, ConfigError> {
         let reserved_stack_bytes = config.reserved_stack_bytes();
         if config.worker_count == 0 || config.worker_stack_size == 0 {
-            return Err(SubmitError::InvalidConfig);
+            return Err(ConfigError::InvalidConfig);
         }
         if reserved_stack_bytes > config.max_memory_bytes {
-            return Err(SubmitError::InvalidConfig);
+            return Err(ConfigError::InvalidConfig);
         }
 
         Ok(Self {
@@ -108,46 +117,17 @@ impl ComputePool {
         })
     }
 
-    /// Enqueues a pure compute job for execution by the pool.
-    ///
-    /// This API is intentionally restricted to owned `'static` work because the
-    /// pool is meant for isolated kernel-internal computation without borrowing
-    /// ambient async state or waiting on external resources.
-    pub fn submit<F>(&self, priority: ComputePriority, job: F) -> Result<(), SubmitError>
+    /// Runs pure compute work on the internal compute pool and resolves once
+    /// the job either completes or is rejected.
+    pub async fn spawn<F, T>(&self, priority: ComputePriority, job: F) -> Result<T, SpawnError>
     where
-        F: FnOnce() + Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
     {
-        let queued_bytes = mem::size_of::<F>();
-        critical_section::with(|_| {
-            let mut state = self.state.lock();
-            let reserved_stack_bytes = state.config.reserved_stack_bytes();
-            let next_total = reserved_stack_bytes
-                .checked_add(state.queued_bytes)
-                .and_then(|n| n.checked_add(queued_bytes))
-                .expect("compute pool memory accounting overflow");
-            if next_total > state.config.max_memory_bytes {
-                return Err(SubmitError::MemoryLimitExceeded);
-            }
-
-            let sequence = state.next_sequence;
-            state.next_sequence = state
-                .next_sequence
-                .checked_add(1)
-                .expect("compute pool sequence overflow");
-            state.queued_bytes += queued_bytes;
-            state.queue.push(QueuedJob {
-                priority,
-                sequence,
-                job: ComputeJob {
-                    queued_bytes,
-                    callback: Box::new(job),
-                },
-            });
-            Ok(())
-        })
+        self.spawn_internal(priority, job).await
     }
 
-    pub fn snapshot(&self) -> ComputePoolSnapshot {
+    pub(crate) fn snapshot(&self) -> ComputePoolSnapshot {
         critical_section::with(|_| {
             let state = self.state.lock();
             let reserved_stack_bytes = state.config.reserved_stack_bytes();
@@ -161,17 +141,11 @@ impl ComputePool {
         })
     }
 
-    pub fn config(&self) -> ComputePoolConfig {
+    pub(crate) fn config(&self) -> ComputePoolConfig {
         critical_section::with(|_| self.state.lock().config)
     }
 
-    /// Runs exactly one queued compute job, if any.
-    ///
-    /// This is the narrow execution boundary for worker implementations:
-    /// queueing, prioritization, and memory accounting stay inside
-    /// `ComputePool`, while the concrete worker runtime decides when to call
-    /// `run_next`.
-    pub fn run_next(&self) -> bool {
+    pub(crate) fn run_next(&self) -> bool {
         let Some(job) = self.dequeue() else {
             return false;
         };
@@ -180,9 +154,7 @@ impl ComputePool {
         true
     }
 
-    /// Runs queued jobs until the pool becomes empty and returns the number of
-    /// completed jobs.
-    pub fn run_until_stalled(&self) -> usize {
+    pub(crate) fn run_until_stalled(&self) -> usize {
         let mut completed = 0;
 
         while self.run_next() {
@@ -190,6 +162,60 @@ impl ComputePool {
         }
 
         completed
+    }
+
+    fn spawn_internal<F, T>(&self, priority: ComputePriority, job: F) -> Completion<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let completion = Completion::new();
+        let state = completion.state.clone();
+        let queued_bytes = mem::size_of::<F>();
+        let callback = move || {
+            state.complete(Ok(job()));
+        };
+
+        if let Err(error) = self.enqueue(priority, queued_bytes, Box::new(callback)) {
+            completion.state.complete(Err(error));
+        }
+
+        completion
+    }
+
+    fn enqueue(
+        &self,
+        priority: ComputePriority,
+        queued_bytes: usize,
+        callback: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Result<(), SpawnError> {
+        critical_section::with(|_| {
+            let mut state = self.state.lock();
+            let reserved_stack_bytes = state.config.reserved_stack_bytes();
+            let next_total = reserved_stack_bytes
+                .checked_add(state.queued_bytes)
+                .and_then(|n| n.checked_add(queued_bytes))
+                .expect("compute pool memory accounting overflow");
+            if next_total > state.config.max_memory_bytes {
+                return Err(SpawnError::MemoryLimitExceeded);
+            }
+
+            let sequence = state.next_sequence;
+            state.next_sequence = state
+                .next_sequence
+                .checked_add(1)
+                .expect("compute pool sequence overflow");
+            state.queued_bytes += queued_bytes;
+            state.queue.push(QueuedJob {
+                priority,
+                sequence,
+                job: ComputeJob {
+                    queued_bytes,
+                    callback,
+                },
+            });
+            Ok(())
+        })
     }
 
     fn dequeue(&self) -> Option<DequeuedJob> {
@@ -214,6 +240,43 @@ pub(crate) struct DequeuedJob {
 impl DequeuedJob {
     pub(crate) fn run(self) {
         (self.callback)();
+    }
+}
+
+impl<T> Completion<T> {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(CompletionState {
+                result: Spinlock::new(None),
+                waker: AtomicWaker::new(),
+            }),
+        }
+    }
+}
+
+impl<T> Future for Completion<T> {
+    type Output = Result<T, SpawnError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if let Some(result) = self.state.result.lock().take() {
+            return Poll::Ready(result);
+        }
+
+        self.state.waker.register(cx.waker());
+
+        if let Some(result) = self.state.result.lock().take() {
+            return Poll::Ready(result);
+        }
+
+        Poll::Pending
+    }
+}
+
+impl<T> CompletionState<T> {
+    fn complete(&self, result: Result<T, SpawnError>) {
+        let replaced = self.result.lock().replace(result);
+        assert!(replaced.is_none(), "compute completion was resolved twice");
+        self.waker.wake();
     }
 }
 
@@ -247,9 +310,10 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    use futures_lite::future::block_on;
     use spinning_top::Spinlock;
 
-    use super::{ComputePool, ComputePoolConfig, ComputePriority, SubmitError};
+    use super::{ComputePool, ComputePoolConfig, ComputePriority, SpawnError};
 
     #[test]
     fn preserves_priority_and_fifo_order() {
@@ -261,23 +325,24 @@ mod tests {
         .expect("pool config should be valid");
         let seen = Arc::new(Spinlock::new(Vec::new()));
 
-        {
+        let first = {
             let seen = seen.clone();
-            pool.submit(ComputePriority::LOW, move || seen.lock().push(1))
-                .expect("low priority job should fit");
-        }
-        {
+            pool.spawn_internal(ComputePriority::LOW, move || seen.lock().push(1))
+        };
+        let second = {
             let seen = seen.clone();
-            pool.submit(ComputePriority::HIGH, move || seen.lock().push(2))
-                .expect("high priority job should fit");
-        }
-        {
+            pool.spawn_internal(ComputePriority::HIGH, move || seen.lock().push(2))
+        };
+        let third = {
             let seen = seen.clone();
-            pool.submit(ComputePriority::HIGH, move || seen.lock().push(3))
-                .expect("second high priority job should fit");
-        }
+            pool.spawn_internal(ComputePriority::HIGH, move || seen.lock().push(3))
+        };
 
         while pool.run_next() {}
+
+        block_on(first).expect("low priority job should complete");
+        block_on(second).expect("first high priority job should complete");
+        block_on(third).expect("second high priority job should complete");
 
         assert_eq!(&*seen.lock(), &[2, 3, 1]);
     }
@@ -286,10 +351,12 @@ mod tests {
     fn enforces_memory_limit() {
         struct Large([u8; 96]);
 
-        fn large_job(count: Arc<AtomicUsize>) -> impl FnOnce() + Send + 'static {
+        fn large_job(count: Arc<AtomicUsize>) -> impl FnOnce() -> usize + Send + 'static {
             let payload = Large([0; 96]);
             move || {
-                count.fetch_add(usize::from(payload.0[0]) + 1, Ordering::Relaxed);
+                let value = usize::from(payload.0[0]) + 1;
+                count.fetch_add(value, Ordering::Relaxed);
+                value
             }
         }
 
@@ -303,13 +370,12 @@ mod tests {
         .expect("pool config should be valid");
         let count = Arc::new(AtomicUsize::new(0));
 
-        pool.submit(ComputePriority::NORMAL, large_job(count.clone()))
-            .expect("first job should fit");
+        let first = pool.spawn_internal(ComputePriority::NORMAL, large_job(count.clone()));
+        let second = pool.spawn_internal(ComputePriority::NORMAL, large_job(count));
 
-        let second_job = large_job(count);
-        assert_eq!(core::mem::size_of_val(&second_job), queued_bytes);
-        let result = pool.submit(ComputePriority::NORMAL, second_job);
+        pool.run_next();
 
-        assert_eq!(result, Err(SubmitError::MemoryLimitExceeded));
+        assert_eq!(block_on(first), Ok(1));
+        assert_eq!(block_on(second), Err(SpawnError::MemoryLimitExceeded));
     }
 }
