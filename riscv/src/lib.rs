@@ -6,7 +6,6 @@ pub mod compute;
 use core::arch::{asm, global_asm};
 use core::fmt::Write;
 use core::ops::Range;
-use core::result::Result::Ok;
 use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
 
 use fdt::Fdt;
@@ -22,6 +21,7 @@ global_asm!(include_str!("mp_hook.S"));
 global_asm!(include_str!("secondary_entry.S"));
 
 const UNINITIALIZED_BOOT_HART: usize = usize::MAX;
+const SSTATUS_SPP_BIT: usize = 1 << 8;
 
 static BOOT_HART_ID: AtomicUsize = AtomicUsize::new(UNINITIALIZED_BOOT_HART);
 
@@ -63,12 +63,7 @@ impl HartRuntime {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    let _ = writeln!(SbiConsole, "panic: {info}");
-    helios_kernel::panic_log(info);
-    sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
-    loop {
-        core::hint::spin_loop();
-    }
+    fatal_panic(info)
 }
 
 pub struct SbiConsole;
@@ -218,7 +213,10 @@ extern "C" fn trap_handler(tf: &mut TrapFrame) {
             riscv::register::sip::clear_ssoft();
         },
         Ok(Trap::Interrupt(Interrupt::SupervisorExternal)) => {
-            panic!("unexpected supervisor external interrupt: tf={tf:#x?}");
+            panic!(
+                "unhandled hardware interrupt: interrupt={:?}, tf={tf:#x?}",
+                Interrupt::SupervisorExternal
+            );
         }
         Ok(Trap::Exception(exception)) => {
             handle_exception(exception, tf);
@@ -334,16 +332,78 @@ unsafe fn configure_interrupts() {
         trapframe::init();
         riscv::register::sie::set_ssoft();
         riscv::register::sie::set_stimer();
+        riscv::register::sie::set_sext();
         riscv::register::sstatus::set_sie();
     }
 }
 
 fn handle_exception(exception: Exception, tf: &TrapFrame) -> ! {
     let stval = riscv::register::stval::read();
+    match trap_origin(tf) {
+        TrapOrigin::Kernel => panic!(
+            "kernel exception: {exception:?}, sepc={:#x}, stval={:#x}, tf={tf:#x?}",
+            tf.sepc, stval,
+        ),
+        TrapOrigin::User => handle_user_exception(exception, stval, tf),
+    }
+}
+
+fn handle_user_exception(exception: Exception, stval: usize, tf: &TrapFrame) -> ! {
     panic!(
-        "unexpected supervisor exception: {exception:?}, sepc={:#x}, stval={:#x}, tf={tf:#x?}",
+        "unhandled user trap: exception={exception:?}, sepc={:#x}, stval={:#x}, tf={tf:#x?}",
         tf.sepc, stval,
-    );
+    )
+}
+
+fn fatal_panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    mask_interrupts();
+
+    let mut console = SbiConsole;
+    let _ = console.write_str("Kernel panic");
+    if let Some(location) = info.location() {
+        let _ = write!(
+            console,
+            " at {}:{}:{}",
+            location.file(),
+            location.line(),
+            location.column()
+        );
+    }
+    let _ = console.write_str("\n");
+    let _ = writeln!(console, "{}", info.message());
+
+    shutdown_machine()
+}
+
+fn mask_interrupts() {
+    unsafe {
+        riscv::interrupt::supervisor::disable();
+        riscv::register::sie::clear_ssoft();
+        riscv::register::sie::clear_stimer();
+        riscv::register::sie::clear_sext();
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
+fn shutdown_machine() -> ! {
+    sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrapOrigin {
+    Kernel,
+    User,
+}
+
+fn trap_origin(tf: &TrapFrame) -> TrapOrigin {
+    if tf.sstatus & SSTATUS_SPP_BIT != 0 {
+        TrapOrigin::Kernel
+    } else {
+        TrapOrigin::User
+    }
 }
 
 fn current_hart_runtime_ptr() -> usize {

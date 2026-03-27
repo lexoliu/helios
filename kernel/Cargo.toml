@@ -23,7 +23,7 @@ futures-lite = "2.6.1"
 wat = "1.241.2"
 
 [target.'cfg(target_os = "none")'.dependencies]
-wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["all-arch", "cranelift", "runtime"] }
+wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["riscv64", "cranelift", "runtime"] }
 
 [target.'cfg(not(target_os = "none"))'.dependencies]
 libc = "0.2.177"
