@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "hal", "hosted", "kernel", "riscv", "virtio",
+    "api", "api-macro", "kernel-macro", "hal", "hosted", "init", "kernel", "riscv", "virtio",
 ]
 resolver = "2"
 
@@ -12,11 +12,14 @@ edition = "2024"
 
 [workspace.dependencies]
 helios-hal = { path = "hal" }
+helios-api = { path = "api" }
 helios-hosted = { path = "hosted" }
+helios-kernel-macro = { path = "kernel-macro" }
 helios-riscv = { path = "riscv" }
 helios-kernel = { path = "kernel" }
 helios = { path = "." }
 tracing = { version = "0.1.44",  default-features = false }
+wit-bindgen = { version = "0.53.0", default-features = false }
 
 
 [target.'cfg(not(target_os = "none"))'.dependencies]
