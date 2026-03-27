@@ -21,7 +21,7 @@ use core::time::Duration;
 
 use buddy_system_allocator::LockedHeap;
 use executor::Executor;
-use helios_hal::cpu::{Cpu, HartId, Instant};
+use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
 
 const HEAP_ORDER: usize = 32;
@@ -127,9 +127,9 @@ where
         cpu,
         memory_regions,
     } = platform;
-    let current_hart = cpu.current_hart();
+    let current_processor = cpu.current_processor();
 
-    if current_hart == cpu.bootstrap_hart() {
+    if current_processor == cpu.bootstrap_processor() {
         bootstrap_init(console, memory_regions, &cpu);
     } else {
         wait_for_bootstrap(&cpu);
@@ -141,9 +141,9 @@ where
         executor: Executor::new(),
     };
 
-    let hart_id = current_hart.id();
+    let processor_id = current_processor.id();
     kernel.spawn_detached(async move {
-        tracing::info!("Hart online hart={hart_id}");
+        tracing::info!("Processor online processor={processor_id}");
     });
 
     kernel
@@ -179,23 +179,23 @@ fn bootstrap_init<Console, CpuImpl, Regions>(
         Ordering::Acquire,
     ) {
         Ok(_) => {}
-        Err(state) => panic!("bootstrap hart observed invalid boot state {state}"),
+        Err(state) => panic!("bootstrap processor observed invalid boot state {state}"),
     }
 
     init_allocator(memory_regions);
     log::init_logger(console);
     tracing::info!(
-        "Kernel initialized on bootstrap hart={}",
-        cpu.bootstrap_hart().id()
+        "Kernel initialized on bootstrap processor={}",
+        cpu.bootstrap_processor().id()
     );
     tracing::info!("Kernel is ready\n\n{}", include_str!("welcome.txt"));
 
     BOOT_STATE.store(BOOT_READY, Ordering::Release);
 
-    for hart in 0..cpu.hart_count() {
-        let hart = HartId::new(hart as u16);
-        if hart != cpu.bootstrap_hart() {
-            cpu.start_hart(hart);
+    for processor in 0..cpu.processor_count() {
+        let processor = ProcessorId::new(processor as u16);
+        if processor != cpu.bootstrap_processor() {
+            cpu.start_processor(processor);
         }
     }
 }

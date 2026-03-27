@@ -8,16 +8,16 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use async_task::{Builder, Runnable, Task};
-use helios_hal::cpu::{Cpu, HartId};
+use helios_hal::cpu::{Cpu, ProcessorId};
 use spinning_top::Spinlock;
 
 type ReadyQueue = Spinlock<VecDeque<Runnable>>;
 pub type JoinHandle<T> = Task<T>;
 
-/// Join handle for a task that is constrained to the spawning hart.
+/// Join handle for a task that is constrained to the spawning processor.
 ///
 /// The marker makes the handle `!Send` and `!Sync`, which prevents accidental
-/// migration of a local task to a different hart through the type system.
+/// migration of a local task to a different processor through the type system.
 #[must_use = "tasks get canceled when dropped, use `.detach()` to run them in the background"]
 pub struct LocalJoinHandle<T> {
     task: Task<T>,
@@ -28,7 +28,7 @@ pub struct LocalJoinHandle<T> {
 pub struct Spawner<CpuImpl: Cpu + Clone> {
     ready_queue: Arc<ReadyQueue>,
     cpu: CpuImpl,
-    owner_hart: HartId,
+    owner_processor: ProcessorId,
 }
 
 pub struct Executor {
@@ -43,11 +43,11 @@ impl Executor {
     }
 
     pub fn spawner<CpuImpl: Cpu + Clone>(&self, cpu: CpuImpl) -> Spawner<CpuImpl> {
-        let owner_hart = cpu.current_hart();
+        let owner_processor = cpu.current_processor();
         Spawner {
             ready_queue: self.ready_queue.clone(),
             cpu,
-            owner_hart,
+            owner_processor,
         }
     }
 
@@ -72,8 +72,8 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
             self.ready_queue.lock().push_back(runnable);
         });
 
-        if self.cpu.current_hart() != self.owner_hart {
-            self.cpu.wake_hart(self.owner_hart);
+        if self.cpu.current_processor() != self.owner_processor {
+            self.cpu.wake_processor(self.owner_processor);
         }
     }
 
@@ -105,9 +105,9 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         let spawner = self.clone();
         let schedule = move |runnable| spawner.schedule(runnable);
 
-        // SAFETY: the runnable is always re-enqueued onto the spawning hart's ready
+        // SAFETY: the runnable is always re-enqueued onto the spawning processor's ready
         // queue, and `LocalJoinHandle` is `!Send`, so the task cannot be awaited or
-        // dropped from a different hart through safe Rust.
+        // dropped from a different processor through safe Rust.
         let (runnable, task) = unsafe { Builder::new().spawn_unchecked(move |_| future, schedule) };
         runnable.schedule();
         LocalJoinHandle {

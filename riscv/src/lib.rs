@@ -10,7 +10,7 @@ use core::result::Result::Ok;
 use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
 
 use fdt::Fdt;
-use helios_hal::cpu::{Cpu, HartId, Instant};
+use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
 use helios_kernel::Timer;
 use riscv::interrupt::Trap;
@@ -48,7 +48,7 @@ unsafe impl critical_section::Impl for SupervisorCriticalSection {
 }
 
 struct HartRuntime {
-    hart_id: HartId,
+    hart_id: ProcessorId,
     timer: Timer<RiscvCpu>,
 }
 
@@ -87,8 +87,8 @@ impl Write for SbiConsole {
 
 #[derive(Clone)]
 pub struct RiscvCpu {
-    current_hart: HartId,
-    bootstrap_hart: HartId,
+    current_hart: ProcessorId,
+    bootstrap_hart: ProcessorId,
     hart_count: usize,
     timebase_frequency: u64,
     fdt_addr: usize,
@@ -96,8 +96,8 @@ pub struct RiscvCpu {
 
 impl RiscvCpu {
     pub const fn new(
-        current_hart: HartId,
-        bootstrap_hart: HartId,
+        current_hart: ProcessorId,
+        bootstrap_hart: ProcessorId,
         hart_count: usize,
         timebase_frequency: u64,
         fdt_addr: usize,
@@ -113,7 +113,7 @@ impl RiscvCpu {
 }
 
 impl Cpu for RiscvCpu {
-    fn current_hart(&self) -> HartId {
+    fn current_processor(&self) -> ProcessorId {
         let runtime_ptr = read_hart_runtime();
         if runtime_ptr == 0 {
             return self.current_hart;
@@ -122,11 +122,11 @@ impl Cpu for RiscvCpu {
         unsafe { (*(runtime_ptr as *const HartRuntime)).hart_id }
     }
 
-    fn hart_count(&self) -> usize {
+    fn processor_count(&self) -> usize {
         self.hart_count
     }
 
-    fn bootstrap_hart(&self) -> HartId {
+    fn bootstrap_processor(&self) -> ProcessorId {
         self.bootstrap_hart
     }
 
@@ -134,7 +134,7 @@ impl Cpu for RiscvCpu {
         riscv::asm::wfi();
     }
 
-    fn start_hart(&self, hart: HartId) {
+    fn start_processor(&self, hart: ProcessorId) {
         let ret = sbi_rt::hart_start(
             hart.id() as usize,
             core::ptr::addr_of!(_secondary_start).addr(),
@@ -152,8 +152,8 @@ impl Cpu for RiscvCpu {
         );
     }
 
-    fn wake_hart(&self, hart: HartId) {
-        if self.current_hart() == hart {
+    fn wake_processor(&self, hart: ProcessorId) {
+        if self.current_processor() == hart {
             return;
         }
 
@@ -252,11 +252,11 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         })
         .filter_map(move |region| intersect(region, allocator_window.clone()))
         .map(range_to_memory_region);
-    let current_hart = HartId::new(hart_id as u16);
-    let bootstrap_hart = remember_bootstrap_hart(hart_id);
+    let current_hart = ProcessorId::new(hart_id as u16);
+    let bootstrap_processor = remember_bootstrap_hart(hart_id);
     let cpu = RiscvCpu::new(
         current_hart,
-        bootstrap_hart,
+        bootstrap_processor,
         hart_count,
         timebase_frequency,
         fdt_addr,
@@ -310,15 +310,15 @@ const fn align_up(value: usize, align: usize) -> usize {
     (value + (align - 1)) & !(align - 1)
 }
 
-fn remember_bootstrap_hart(current_hart: usize) -> HartId {
+fn remember_bootstrap_hart(current_hart: usize) -> ProcessorId {
     match BOOT_HART_ID.compare_exchange(
         UNINITIALIZED_BOOT_HART,
         current_hart,
         Ordering::AcqRel,
         Ordering::Acquire,
     ) {
-        Ok(_) => HartId::new(current_hart as u16),
-        Err(bootstrap_hart) => HartId::new(bootstrap_hart as u16),
+        Ok(_) => ProcessorId::new(current_hart as u16),
+        Err(bootstrap_hart) => ProcessorId::new(bootstrap_hart as u16),
     }
 }
 

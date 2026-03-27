@@ -1,11 +1,12 @@
-/// Logical hardware thread identifier.
+/// Logical processor identifier.
 ///
-/// In the RISC-V backend this maps to a hart id. In hosted mode it is the
-/// synthetic CPU slot used by the test runtime.
+/// This is the architecture-neutral execution slot identifier exposed to the
+/// kernel. Backends map it onto their native concept: a RISC-V hart id, an
+/// x86 APIC CPU id, an ARM PE index, or a synthetic hosted test CPU slot.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct HartId(u16);
+pub struct ProcessorId(u16);
 
-impl HartId {
+impl ProcessorId {
     pub const fn new(id: u16) -> Self {
         Self(id)
     }
@@ -38,25 +39,25 @@ impl Instant {
 }
 
 pub trait Cpu: Send + Sync + 'static {
-    /// Returns the hart currently executing this code path.
+    /// Returns the processor currently executing this code path.
     ///
     /// This must be cheap and stable for the lifetime of the `Cpu` value because
     /// the kernel queries it during boot, scheduling, and panic reporting.
-    fn current_hart(&self) -> HartId;
+    fn current_processor(&self) -> ProcessorId;
 
-    /// Returns the number of harts the platform exposes to the kernel.
+    /// Returns the number of processors the platform exposes to the kernel.
     ///
-    /// The kernel uses this to decide which secondary harts to start during SMP
+    /// The kernel uses this to decide which secondary processors to start during SMP
     /// bootstrap. This is a platform capability, not a scheduler state query.
-    fn hart_count(&self) -> usize;
+    fn processor_count(&self) -> usize;
 
-    /// Returns the hart designated as the bootstrap hart.
+    /// Returns the processor designated as the bootstrap processor.
     ///
-    /// Exactly one hart performs one-time global initialization such as heap and
-    /// logger setup; all other harts wait until that work is complete.
-    fn bootstrap_hart(&self) -> HartId;
+    /// Exactly one processor performs one-time global initialization such as heap and
+    /// logger setup; all other processors wait until that work is complete.
+    fn bootstrap_processor(&self) -> ProcessorId;
 
-    /// Parks the current hart until some external event makes forward progress
+    /// Parks the current processor until some external event makes forward progress
     /// possible again.
     ///
     /// Typical implementations are `wfi` on bare metal and `thread::park()` in
@@ -64,20 +65,20 @@ pub trait Cpu: Send + Sync + 'static {
     /// stronger fairness guarantee.
     fn park_current(&self);
 
-    /// Starts execution on a secondary hart.
+    /// Starts execution on a secondary processor.
     ///
-    /// The kernel calls this during bootstrap for every hart other than the
-    /// bootstrap hart. Implementations may panic if the platform cannot start the
-    /// requested hart, because that is a real bring-up failure.
-    fn start_hart(&self, hart: HartId);
+    /// The kernel calls this during bootstrap for every processor other than the
+    /// bootstrap processor. Implementations may panic if the platform cannot start the
+    /// requested processor, because that is a real bring-up failure.
+    fn start_processor(&self, processor: ProcessorId);
 
-    /// Nudges a hart that may currently be parked so it can observe newly
+    /// Nudges a processor that may currently be parked so it can observe newly
     /// runnable work.
     ///
-    /// This is the wakeup primitive used for cross-hart scheduling. On RISC-V
+    /// This is the wakeup primitive used for cross-processor scheduling. On RISC-V
     /// this maps naturally to an IPI; in hosted mode it maps to unparking the
     /// backing thread.
-    fn wake_hart(&self, hart: HartId);
+    fn wake_processor(&self, processor: ProcessorId);
 
     /// Returns the current monotonic time in platform timer ticks.
     fn now(&self) -> Instant;
@@ -89,7 +90,7 @@ pub trait Cpu: Send + Sync + 'static {
     /// code.
     fn timer_frequency(&self) -> u64;
 
-    /// Programs the next wakeup deadline for the current hart.
+    /// Programs the next wakeup deadline for the current processor.
     ///
     /// The deadline is absolute, in the same tick domain as [`Cpu::now`]. Calling
     /// this again replaces the previous deadline.
