@@ -1,11 +1,16 @@
 #![no_std]
 extern crate alloc;
+mod compute_pool;
 mod executor;
 mod log;
 mod program;
 mod task;
 mod timer;
 
+pub use compute_pool::{
+    ComputePool, ComputePoolConfig, ComputePoolSnapshot, ComputePriority,
+    SubmitError as ComputeSubmitError,
+};
 pub use executor::{JoinHandle, LocalJoinHandle, Spawner};
 pub use helios_hal::Platform;
 pub use task::{YieldNow, yield_now};

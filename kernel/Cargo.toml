@@ -14,3 +14,6 @@ wasmtime = { version = "29.0", default-features = false, features = [] }
 helios-hal.workspace = true
 spinning_top = "0.3.0"
 tracing.workspace = true
+
+[dev-dependencies]
+critical-section = { version = "1.2.0", features = ["std"] }
