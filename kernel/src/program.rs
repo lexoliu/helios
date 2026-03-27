@@ -1,11 +1,14 @@
 extern crate alloc;
 
+use alloc::string::String;
 use alloc::vec::Vec;
 
+use helios_hal::fs::DirectoryHandle;
 use helios_hal::resource::WasiRights;
-use wasmtime::{Config, Engine, Instance, Module, Store};
+use thiserror::Error;
+use wasmtime::{Config, Engine, Linker, Module, Store};
 
-use crate::{ComputePool, ComputePriority, ComputeSpawnError};
+use crate::{BootDirectory, ComputePool, ComputePriority, ComputeSpawnError, EmbeddedProgram};
 
 /// Immutable compilation settings for the user-mode runtime.
 ///
@@ -46,27 +49,35 @@ pub struct ProgramRuntime {
     compile_priority: ComputePriority,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum ProgramRuntimeInitError {
+    #[error("compute runtime configuration is invalid")]
     InvalidComputeConfig,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum ProgramRuntimeError {
+    #[error(transparent)]
     Init(ProgramRuntimeInitError),
+    #[error("failed to initialize Wasmtime engine: {0}")]
     Wasmtime(wasmtime::Error),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum CompileError {
+    #[error("compute queue rejected the compile job: {0}")]
     QueueSaturated(ComputeSpawnError),
-    ImportedModule { import_count: usize },
+    #[error("module exports neither _start nor main")]
     MissingEntry,
+    #[error("unsupported import {module}::{name}")]
+    UnsupportedImportModule { module: String, name: String },
+    #[error("Wasmtime compilation failed: {0}")]
     Wasmtime(wasmtime::Error),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum RunError {
+    #[error("Wasmtime execution failed: {0}")]
     Wasmtime(wasmtime::Error),
 }
 
@@ -76,18 +87,23 @@ pub enum RunError {
 /// bytes plus the initial capability mask that will become the task's root
 /// authority.
 pub struct Blueprint<'a> {
-    wasm: &'a [u8],
+    source: BlueprintSource<'a>,
     rights: WasiRights,
+    boot_directory: Option<DirectoryHandle<BootDirectory>>,
+}
+
+enum BlueprintSource<'a> {
+    Wasm(&'a [u8]),
+    Embedded(&'a EmbeddedProgram),
 }
 
 /// Per-task kernel-visible resource namespace.
 ///
-/// The initial pure-wasm runtime has no host imports, so the table starts empty
-/// and only tracks ownership/lifetime. Host bindings will extend this type
-/// later without changing the compiled task representation.
+/// The table currently only tracks ownership/lifetime. Host bindings will move
+/// concrete kernel objects into this namespace as the user-mode runtime grows.
 #[derive(Default)]
 pub struct ResourceTable {
-    slots: Vec<()>,
+    boot_directory: Option<DirectoryHandle<BootDirectory>>,
 }
 
 #[derive(Clone, Copy)]
@@ -130,23 +146,50 @@ impl ProgramRuntime {
     }
 
     pub async fn compile(&self, blueprint: Blueprint<'_>) -> Result<Task, CompileError> {
-        let wasm = blueprint.wasm.to_vec();
+        let source = blueprint.source;
         let rights = blueprint.rights;
+        let boot_directory = blueprint.boot_directory;
         let engine_config = self.engine_config.clone();
 
-        self.compiler
-            .spawn(self.compile_priority, move || {
+        match source {
+            BlueprintSource::Wasm(wasm) => {
+                let wasm = wasm.to_vec();
+                self.compiler
+                    .spawn(self.compile_priority, move || {
+                        let engine = Engine::new(&engine_config).map_err(CompileError::Wasmtime)?;
+                        compile_wasm_task(engine, wasm, rights, boot_directory)
+                    })
+                    .await
+                    .map_err(CompileError::QueueSaturated)?
+            }
+            BlueprintSource::Embedded(program) => {
                 let engine = Engine::new(&engine_config).map_err(CompileError::Wasmtime)?;
-                compile_task(engine, wasm, rights)
-            })
-            .await
-            .map_err(CompileError::QueueSaturated)?
+                compile_embedded_task(engine, program, rights, boot_directory)
+            }
+        }
     }
 }
 
 impl<'a> Blueprint<'a> {
     pub const fn new_wasm(wasm: &'a [u8], rights: WasiRights) -> Self {
-        Self { wasm, rights }
+        Self {
+            source: BlueprintSource::Wasm(wasm),
+            rights,
+            boot_directory: None,
+        }
+    }
+
+    pub const fn new_embedded(program: &'a EmbeddedProgram, rights: WasiRights) -> Self {
+        Self {
+            source: BlueprintSource::Embedded(program),
+            rights,
+            boot_directory: None,
+        }
+    }
+
+    pub fn with_boot_directory(mut self, boot_directory: DirectoryHandle<BootDirectory>) -> Self {
+        self.boot_directory = Some(boot_directory);
+        self
     }
 
     /// Launches kernel compute work that JIT-compiles this wasm blueprint.
@@ -157,15 +200,27 @@ impl<'a> Blueprint<'a> {
 
 impl ResourceTable {
     pub const fn new() -> Self {
-        Self { slots: Vec::new() }
+        Self {
+            boot_directory: None,
+        }
+    }
+
+    pub fn with_boot_directory(boot_directory: DirectoryHandle<BootDirectory>) -> Self {
+        Self {
+            boot_directory: Some(boot_directory),
+        }
     }
 
     pub fn len(&self) -> usize {
-        self.slots.len()
+        usize::from(self.boot_directory.is_some())
     }
 
     pub fn is_empty(&self) -> bool {
-        self.slots.is_empty()
+        self.boot_directory.is_none()
+    }
+
+    pub fn boot_directory(&self) -> Option<&DirectoryHandle<BootDirectory>> {
+        self.boot_directory.as_ref()
     }
 }
 
@@ -179,25 +234,26 @@ impl Task {
     }
 
     pub async fn run(self) -> Result<ExitCode, RunError> {
-        let mut store = Store::new(
-            self.module.engine(),
-            TaskState {
-                rights: self.rights,
-                resources: self.resources,
-            },
-        );
-        let instance = Instance::new(&mut store, &self.module, &[]).map_err(RunError::Wasmtime)?;
+        let Task {
+            module,
+            rights,
+            resources,
+            entry,
+        } = self;
 
-        if self.entry.returns_exit_code {
+        let mut store = Store::new(module.engine(), TaskState { rights, resources });
+        let instance = instantiate_task(&module, &mut store).map_err(RunError::Wasmtime)?;
+
+        if entry.returns_exit_code {
             let main = instance
-                .get_typed_func::<(), i32>(&mut store, self.entry.name)
+                .get_typed_func::<(), i32>(&mut store, entry.name)
                 .map_err(RunError::Wasmtime)?;
             let code = main.call(&mut store, ()).map_err(RunError::Wasmtime)?;
             return Ok(code as u32);
         }
 
         let start = instance
-            .get_typed_func::<(), ()>(&mut store, self.entry.name)
+            .get_typed_func::<(), ()>(&mut store, entry.name)
             .map_err(RunError::Wasmtime)?;
         start.call(&mut store, ()).map_err(RunError::Wasmtime)?;
         let TaskState { rights, resources } = store.into_data();
@@ -205,6 +261,14 @@ impl Task {
         let _ = resources;
         Ok(0)
     }
+}
+
+fn instantiate_task(
+    module: &Module,
+    store: &mut Store<TaskState>,
+) -> Result<wasmtime::Instance, wasmtime::Error> {
+    let mut linker = Linker::<TaskState>::new(module.engine());
+    linker.instantiate(store, module)
 }
 
 fn build_engine_config() -> Config {
@@ -215,21 +279,57 @@ fn build_engine_config() -> Config {
     config
 }
 
-fn compile_task(engine: Engine, wasm: Vec<u8>, rights: WasiRights) -> Result<Task, CompileError> {
+fn compile_wasm_task(
+    engine: Engine,
+    wasm: Vec<u8>,
+    rights: WasiRights,
+    boot_directory: Option<DirectoryHandle<BootDirectory>>,
+) -> Result<Task, CompileError> {
     let module = Module::from_binary(&engine, &wasm).map_err(CompileError::Wasmtime)?;
-    let import_count = module.imports().len();
-    if import_count != 0 {
-        return Err(CompileError::ImportedModule { import_count });
-    }
+    finish_task(module, rights, boot_directory)
+}
+
+fn compile_embedded_task(
+    engine: Engine,
+    program: &EmbeddedProgram,
+    rights: WasiRights,
+    boot_directory: Option<DirectoryHandle<BootDirectory>>,
+) -> Result<Task, CompileError> {
+    let module = unsafe { Module::deserialize(&engine, program.artifact()) }
+        .map_err(CompileError::Wasmtime)?;
+    finish_task(module, rights, boot_directory)
+}
+
+fn finish_task(
+    module: Module,
+    rights: WasiRights,
+    boot_directory: Option<DirectoryHandle<BootDirectory>>,
+) -> Result<Task, CompileError> {
+    validate_imports(&module)?;
 
     let entry = detect_entry(&module)?;
+    let resources = match boot_directory {
+        Some(boot_directory) => ResourceTable::with_boot_directory(boot_directory),
+        None => ResourceTable::new(),
+    };
 
     Ok(Task {
         module,
         rights,
-        resources: ResourceTable::new(),
+        resources,
         entry,
     })
+}
+
+fn validate_imports(module: &Module) -> Result<(), CompileError> {
+    for import in module.imports() {
+        return Err(CompileError::UnsupportedImportModule {
+            module: import.module().into(),
+            name: import.name().into(),
+        });
+    }
+
+    Ok(())
 }
 
 fn detect_entry(module: &Module) -> Result<EntryPoint, CompileError> {
@@ -254,33 +354,33 @@ fn detect_entry(module: &Module) -> Result<EntryPoint, CompileError> {
 mod tests {
     extern crate std;
 
+    use alloc::boxed::Box;
     use alloc::vec::Vec;
     use futures_lite::future::block_on;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use super::{
-        Blueprint, CompileError, ProgramRuntime, ProgramRuntimeConfig, ProgramRuntimeError,
+    use wasm_encoder::{
+        CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection,
+        ImportSection, Instruction, MemorySection, MemoryType, Module, TypeSection,
     };
-    use crate::{ComputePool, ComputePriority};
+
+    use super::{Blueprint, CompileError, ProgramRuntimeConfig, ProgramRuntimeError};
+    use crate::{ComputePriority, EmbeddedProgram};
     use helios_hal::resource::WasiRights;
 
-    fn test_runtime() -> Result<ProgramRuntime, ProgramRuntimeError> {
-        ProgramRuntime::new(
-            ProgramRuntimeConfig::new(1, 64 * 1024, 512 * 1024)
+    fn test_runtime() -> Result<super::ProgramRuntime, ProgramRuntimeError> {
+        super::ProgramRuntime::new(
+            ProgramRuntimeConfig::new(2, 64 * 1024, 1024 * 1024)
                 .with_compile_priority(ComputePriority::HIGH),
         )
     }
 
-    fn parse_wat(source: &str) -> Vec<u8> {
-        wat::parse_str(source).expect("test module must be valid wat")
-    }
-
     fn spawn_compile_workers(
-        compiler: ComputePool,
+        runtime: &super::ProgramRuntime,
         worker_count: usize,
         expected_jobs: usize,
     ) -> Vec<std::thread::JoinHandle<()>> {
+        let compiler = runtime.compiler.clone();
         let completed = Arc::new(AtomicUsize::new(0));
 
         (0..worker_count)
@@ -301,21 +401,125 @@ mod tests {
             .collect()
     }
 
+    fn join_workers(workers: Vec<std::thread::JoinHandle<()>>) {
+        for worker in workers {
+            worker
+                .join()
+                .unwrap_or_else(|_| panic!("compile worker panicked unexpectedly"));
+        }
+    }
+
+    fn start_module() -> Vec<u8> {
+        let mut types = TypeSection::new();
+        types.ty().function([], []);
+
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+
+        let mut exports = ExportSection::new();
+        exports.export("_start", ExportKind::Func, 0);
+
+        let mut code = CodeSection::new();
+        let mut function = Function::new([]);
+        function.instruction(&Instruction::End);
+        code.function(&function);
+
+        let mut module = Module::new();
+        module.section(&types);
+        module.section(&functions);
+        module.section(&exports);
+        module.section(&code);
+        module.finish()
+    }
+
+    fn memory_main_module() -> Vec<u8> {
+        let mut types = TypeSection::new();
+        types.ty().function([], [wasm_encoder::ValType::I32]);
+
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+
+        let mut memories = MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: 1,
+            maximum: Some(2),
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+
+        let mut exports = ExportSection::new();
+        exports.export("main", ExportKind::Func, 0);
+        exports.export("memory", ExportKind::Memory, 0);
+
+        let mut code = CodeSection::new();
+        let mut function = Function::new([]);
+        function.instruction(&Instruction::I32Const(0));
+        function.instruction(&Instruction::End);
+        code.function(&function);
+
+        let mut module = Module::new();
+        module.section(&types);
+        module.section(&functions);
+        module.section(&memories);
+        module.section(&exports);
+        module.section(&code);
+        module.finish()
+    }
+
+    fn imported_module() -> Vec<u8> {
+        let mut types = TypeSection::new();
+        types.ty().function([], []);
+
+        let mut imports = ImportSection::new();
+        imports.import("env", "noop", EntityType::Function(0));
+
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+
+        let mut exports = ExportSection::new();
+        exports.export("_start", ExportKind::Func, 1);
+
+        let mut code = CodeSection::new();
+        let mut function = Function::new([]);
+        function.instruction(&Instruction::End);
+        code.function(&function);
+
+        let mut module = Module::new();
+        module.section(&types);
+        module.section(&imports);
+        module.section(&functions);
+        module.section(&exports);
+        module.section(&code);
+        module.finish()
+    }
+
+    fn precompiled_start_program() -> EmbeddedProgram {
+        let mut config = wasmtime::Config::new();
+        config
+            .target(env!("HELIOS_BUILD_TARGET"))
+            .expect("Helios build target must be accepted by Wasmtime");
+        let engine = wasmtime::Engine::new(&config)
+            .unwrap_or_else(|error| panic!("test engine init failed: {error}"));
+        let artifact = engine
+            .precompile_module(&start_module())
+            .unwrap_or_else(|error| panic!("test module precompile failed: {error}"));
+        let artifact = Box::leak(artifact.into_boxed_slice());
+
+        EmbeddedProgram::new("program-start-test", env!("HELIOS_BUILD_TARGET"), artifact)
+    }
+
     #[test]
     fn compiles_and_runs_start_module() {
         let runtime =
             test_runtime().unwrap_or_else(|error| panic!("program runtime init failed: {error:?}"));
-        let compiler = runtime.compiler.clone();
-        let workers = spawn_compile_workers(compiler, 1, 1);
-        let wasm = parse_wat(include_str!("program_start_test.wat"));
+        let workers = spawn_compile_workers(&runtime, 1, 1);
+        let wasm = start_module();
 
         let task = block_on(Blueprint::new_wasm(&wasm, WasiRights::empty()).compile(&runtime))
             .expect("pure wasm module should compile");
         let exit_code = block_on(task.run()).expect("compiled task should run");
-
-        for worker in workers {
-            worker.join().expect("compile worker should complete");
-        }
+        join_workers(workers);
         assert_eq!(exit_code, 0);
     }
 
@@ -323,22 +527,18 @@ mod tests {
     fn rejects_imported_modules() {
         let runtime =
             test_runtime().unwrap_or_else(|error| panic!("program runtime init failed: {error:?}"));
-        let compiler = runtime.compiler.clone();
-        let workers = spawn_compile_workers(compiler, 1, 1);
-        let wasm = parse_wat(include_str!("program_import_test.wat"));
+        let workers = spawn_compile_workers(&runtime, 1, 1);
+        let wasm = imported_module();
 
         let error =
             match block_on(Blueprint::new_wasm(&wasm, WasiRights::empty()).compile(&runtime)) {
                 Ok(_) => panic!("imported module must be rejected"),
                 Err(error) => error,
             };
-
-        for worker in workers {
-            worker.join().expect("compile worker should complete");
-        }
+        join_workers(workers);
         assert!(matches!(
             error,
-            CompileError::ImportedModule { import_count: 1 }
+            CompileError::UnsupportedImportModule { .. }
         ));
     }
 
@@ -346,31 +546,26 @@ mod tests {
     fn compiles_memory_module() {
         let runtime =
             test_runtime().unwrap_or_else(|error| panic!("program runtime init failed: {error:?}"));
-        let compiler = runtime.compiler.clone();
-        let workers = spawn_compile_workers(compiler, 1, 1);
-        let wasm = parse_wat(include_str!("program_memory_test.wat"));
+        let workers = spawn_compile_workers(&runtime, 1, 1);
+        let wasm = memory_main_module();
 
         let task = block_on(Blueprint::new_wasm(&wasm, WasiRights::empty()).compile(&runtime))
             .expect("memory module should compile");
         let exit_code = block_on(task.run()).expect("memory module should run");
-
-        for worker in workers {
-            worker.join().expect("compile worker should complete");
-        }
+        join_workers(workers);
         assert_eq!(exit_code, 0);
     }
 
     #[test]
     fn compiles_multiple_modules_in_parallel() {
-        let runtime = ProgramRuntime::new(
+        let runtime = super::ProgramRuntime::new(
             ProgramRuntimeConfig::new(2, 64 * 1024, 1024 * 1024)
                 .with_compile_priority(ComputePriority::HIGH),
         )
         .unwrap_or_else(|error| panic!("program runtime init failed: {error:?}"));
-        let compiler = runtime.compiler.clone();
-        let workers = spawn_compile_workers(compiler, 2, 2);
-        let first = parse_wat(include_str!("program_start_test.wat"));
-        let second = parse_wat(include_str!("program_memory_test.wat"));
+        let workers = spawn_compile_workers(&runtime, 2, 2);
+        let first = start_module();
+        let second = memory_main_module();
 
         let (task_a, task_b) = block_on(async {
             futures_lite::future::zip(
@@ -383,11 +578,21 @@ mod tests {
         let task_a = task_a.expect("first module should compile");
         let task_b = task_b.expect("second module should compile");
 
-        for worker in workers {
-            worker.join().expect("compile worker should complete");
-        }
-
         assert_eq!(block_on(task_a.run()).expect("first module should run"), 0);
         assert_eq!(block_on(task_b.run()).expect("second module should run"), 0);
+        join_workers(workers);
+    }
+
+    #[test]
+    fn loads_embedded_aot_module() {
+        let runtime =
+            test_runtime().unwrap_or_else(|error| panic!("program runtime init failed: {error:?}"));
+        let program = precompiled_start_program();
+        let task =
+            block_on(Blueprint::new_embedded(&program, WasiRights::empty()).compile(&runtime))
+                .expect("embedded AOT module should load");
+
+        let exit_code = block_on(task.run()).expect("embedded AOT module should run");
+        assert_eq!(exit_code, 0);
     }
 }
