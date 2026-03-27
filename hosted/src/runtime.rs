@@ -12,11 +12,13 @@ use helios_hal::memory::MemoryRegion;
 use crate::config::HostedConfig;
 use crate::console::HostedConsole;
 use crate::cpu::HostedCpu;
+use crate::init_program;
 
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 pub struct HostedRuntime {
     machine: Arc<HostedMachine>,
+    config: HostedConfig,
 }
 
 pub(crate) struct HostedMachine {
@@ -46,6 +48,7 @@ impl HostedRuntime {
     pub fn new(config: HostedConfig) -> Self {
         Self {
             machine: HostedMachine::new(&config),
+            config,
         }
     }
 
@@ -55,7 +58,12 @@ impl HostedRuntime {
 
         for processor_index in 0..self.machine.processor_count() {
             let processor = ProcessorId::new(processor_index as u16);
-            let handle = spawn_processor_thread(self.machine.clone(), processor, ready_tx.clone());
+            let handle = spawn_processor_thread(
+                self.machine.clone(),
+                self.config.clone(),
+                processor,
+                ready_tx.clone(),
+            );
 
             if processor == self.machine.bootstrap_processor() {
                 bootstrap_handle = Some(handle);
@@ -198,6 +206,7 @@ impl HeapReservation {
 
 fn spawn_processor_thread(
     machine: Arc<HostedMachine>,
+    config: HostedConfig,
     processor: ProcessorId,
     ready_tx: Sender<ProcessorId>,
 ) -> JoinHandle<()> {
@@ -217,6 +226,9 @@ fn spawn_processor_thread(
             let cpu = HostedCpu::new(processor, machine.clone());
             let memory_regions = machine.bootstrap_memory_regions(processor);
             let kernel = helios_kernel::init(Platform::new(console, memory_regions, cpu));
+            if processor == machine.bootstrap_processor() {
+                init_program::spawn(&kernel, &config);
+            }
             kernel.run();
         })
         .unwrap_or_else(|err| panic!("failed to spawn processor {}: {err}", processor.id()))

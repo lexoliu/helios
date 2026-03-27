@@ -12,6 +12,7 @@ use core::task::{Context, Poll};
 
 use atomic_waker::AtomicWaker;
 use concurrent_queue::{ConcurrentQueue, PopError, PushError};
+use thiserror::Error;
 
 const PRIORITY_LEVELS: usize = 256;
 const COMPLETION_PENDING: u8 = 0;
@@ -19,8 +20,9 @@ const COMPLETION_READY: u8 = 1;
 const COMPLETION_CONSUMED: u8 = 2;
 
 /// Error returned when the compute pool cannot accept more work.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum SpawnError {
+    #[error("compute pool memory budget is exhausted")]
     MemoryLimitExceeded,
 }
 
@@ -74,8 +76,9 @@ struct ComputeJob {
     callback: Box<dyn FnOnce() + Send + 'static>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub(crate) enum ConfigError {
+    #[error("compute pool configuration is invalid")]
     InvalidConfig,
 }
 

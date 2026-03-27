@@ -1,4 +1,4 @@
-pub use crate::io::IoResult;
+pub use crate::io::{IoError, IoResult};
 
 use crate::resource::{KernelResource, ResourceRights};
 use alloc::vec::Vec;
@@ -82,14 +82,14 @@ pub trait FileSystem: Send + Sync {
 }
 
 pub trait File: Send {
-    fn read(&mut self, buf: &mut [u8]) -> impl Future<Output = usize> + Send;
-    fn write(&mut self, buf: &[u8]) -> impl Future<Output = usize> + Send;
+    fn read(&mut self, buf: &mut [u8]) -> impl Future<Output = IoResult<usize>> + Send;
+    fn write(&mut self, buf: &[u8]) -> impl Future<Output = IoResult<usize>> + Send;
 }
 
 pub trait Directory: Send {
     type File: File;
 
-    fn list(&self) -> impl Future<Output = Vec<DirectoryEntry<Self, Self::File>>> + Send
+    fn list(&self) -> impl Future<Output = IoResult<Vec<DirectoryEntry<Self, Self::File>>>> + Send
     where
         Self: Sized;
 }
