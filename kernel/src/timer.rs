@@ -6,11 +6,12 @@ use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use core::task::{Context, Poll};
 use core::time::Duration;
 
 use atomic_waker::AtomicWaker;
+use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 use helios_hal::cpu::{Cpu, Instant};
 use spinning_top::Spinlock;
 
@@ -18,6 +19,9 @@ use spinning_top::Spinlock;
 pub struct Timer<CpuImpl: Cpu + Clone> {
     cpu: CpuImpl,
     state: Arc<Spinlock<TimerState>>,
+    inbox: Arc<ConcurrentQueue<TimerEntry>>,
+    next_id: Arc<AtomicU64>,
+    published_deadline: Arc<AtomicU64>,
 }
 
 pub struct Sleep<CpuImpl: Cpu + Clone> {
@@ -26,7 +30,6 @@ pub struct Sleep<CpuImpl: Cpu + Clone> {
 }
 
 struct TimerState {
-    next_id: u64,
     sleepers: BinaryHeap<TimerEntry>,
 }
 
@@ -49,9 +52,11 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
         Self {
             cpu,
             state: Arc::new(Spinlock::new(TimerState {
-                next_id: 0,
                 sleepers: BinaryHeap::new(),
             })),
+            inbox: Arc::new(ConcurrentQueue::unbounded()),
+            next_id: Arc::new(AtomicU64::new(0)),
+            published_deadline: Arc::new(AtomicU64::new(u64::MAX)),
         }
     }
 
@@ -92,6 +97,7 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
         let next_deadline = {
             critical_section::with(|_| {
                 let mut state = self.state.lock();
+                queue_changed |= self.drain_inbox(&mut state);
 
                 while let Some(entry) = state.sleepers.peek() {
                     if entry.state.cancelled.load(AtomicOrdering::Acquire)
@@ -122,6 +128,10 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
             state.fire();
         }
 
+        let published_deadline = next_deadline.map_or(u64::MAX, |deadline| deadline.ticks());
+        self.published_deadline
+            .store(published_deadline, AtomicOrdering::Release);
+
         match next_deadline {
             Some(deadline) => self.cpu.set_deadline(deadline),
             None if disarm_when_empty => self.cpu.set_deadline(Instant::new(u64::MAX)),
@@ -134,26 +144,55 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
 
     fn enqueue(&self, state: Arc<SleepState>) {
         let deadline = state.deadline;
-        let earliest_deadline = {
-            critical_section::with(|_| {
-                let mut timer_state = self.state.lock();
-                let id = timer_state.next_id;
-                timer_state.next_id = timer_state
-                    .next_id
-                    .checked_add(1)
-                    .expect("timer entry id overflow");
-                timer_state.sleepers.push(TimerEntry {
-                    deadline,
-                    id,
-                    state,
-                });
-
-                next_live_deadline(&mut timer_state)
-            })
+        let id = self.next_id.fetch_add(1, AtomicOrdering::AcqRel);
+        let entry = TimerEntry {
+            deadline,
+            id,
+            state,
         };
 
-        if let Some(deadline) = earliest_deadline {
-            self.cpu.set_deadline(deadline);
+        match self.inbox.push(entry) {
+            Ok(()) => self.publish_deadline(deadline),
+            Err(PushError::Full(_)) => unreachable!("unbounded timer inbox reported full"),
+            Err(PushError::Closed(_)) => panic!("timer inbox was closed unexpectedly"),
+        }
+    }
+
+    fn drain_inbox(&self, state: &mut TimerState) -> bool {
+        let mut drained = false;
+
+        loop {
+            match self.inbox.pop() {
+                Ok(entry) => {
+                    state.sleepers.push(entry);
+                    drained = true;
+                }
+                Err(PopError::Empty | PopError::Closed) => return drained,
+            }
+        }
+    }
+
+    fn publish_deadline(&self, deadline: Instant) {
+        let deadline = deadline.ticks();
+
+        loop {
+            let published = self.published_deadline.load(AtomicOrdering::Acquire);
+            if deadline >= published {
+                return;
+            }
+
+            match self.published_deadline.compare_exchange_weak(
+                published,
+                deadline,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.cpu.set_deadline(Instant::new(deadline));
+                    return;
+                }
+                Err(_) => continue,
+            }
         }
     }
 }

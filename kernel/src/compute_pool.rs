@@ -1,16 +1,22 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::collections::BinaryHeap;
 use alloc::sync::Arc;
-use core::cmp::Ordering;
+use core::cell::UnsafeCell;
 use core::future::Future;
 use core::mem;
+use core::mem::MaybeUninit;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
 use core::task::{Context, Poll};
 
 use atomic_waker::AtomicWaker;
-use spinning_top::Spinlock;
+use concurrent_queue::{ConcurrentQueue, PopError, PushError};
+
+const PRIORITY_LEVELS: usize = 256;
+const COMPLETION_PENDING: u8 = 0;
+const COMPLETION_READY: u8 = 1;
+const COMPLETION_CONSUMED: u8 = 2;
 
 /// Error returned when the compute pool cannot accept more work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +39,10 @@ impl ComputePriority {
     pub const fn value(self) -> u8 {
         self.0
     }
+
+    const fn lane(self) -> usize {
+        self.0 as usize
+    }
 }
 
 /// Immutable configuration for the kernel-internal compute pool.
@@ -54,20 +64,9 @@ impl ComputePoolConfig {
 
 #[derive(Clone)]
 pub struct ComputePool {
-    state: Arc<Spinlock<ComputePoolState>>,
-}
-
-struct ComputePoolState {
     config: ComputePoolConfig,
-    next_sequence: u64,
-    queued_bytes: usize,
-    queue: BinaryHeap<QueuedJob>,
-}
-
-struct QueuedJob {
-    priority: ComputePriority,
-    sequence: u64,
-    job: ComputeJob,
+    queued_bytes: Arc<AtomicUsize>,
+    queues: Arc<[ConcurrentQueue<ComputeJob>; PRIORITY_LEVELS]>,
 }
 
 struct ComputeJob {
@@ -93,9 +92,13 @@ struct Completion<T> {
 }
 
 struct CompletionState<T> {
-    result: Spinlock<Option<Result<T, SpawnError>>>,
+    result: UnsafeCell<MaybeUninit<Result<T, SpawnError>>>,
+    status: AtomicU8,
     waker: AtomicWaker,
 }
+
+unsafe impl<T: Send> Send for CompletionState<T> {}
+unsafe impl<T: Send> Sync for CompletionState<T> {}
 
 impl ComputePool {
     pub(crate) fn new(config: ComputePoolConfig) -> Result<Self, ConfigError> {
@@ -108,12 +111,9 @@ impl ComputePool {
         }
 
         Ok(Self {
-            state: Arc::new(Spinlock::new(ComputePoolState {
-                config,
-                next_sequence: 0,
-                queued_bytes: 0,
-                queue: BinaryHeap::new(),
-            })),
+            config,
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+            queues: Arc::new(core::array::from_fn(|_| ConcurrentQueue::unbounded())),
         })
     }
 
@@ -128,21 +128,21 @@ impl ComputePool {
     }
 
     pub(crate) fn snapshot(&self) -> ComputePoolSnapshot {
-        critical_section::with(|_| {
-            let state = self.state.lock();
-            let reserved_stack_bytes = state.config.reserved_stack_bytes();
-            ComputePoolSnapshot {
-                queued_jobs: state.queue.len(),
-                queued_bytes: state.queued_bytes,
-                reserved_stack_bytes,
-                total_bytes: reserved_stack_bytes + state.queued_bytes,
-                max_memory_bytes: state.config.max_memory_bytes,
-            }
-        })
+        let queued_jobs = self.queues.iter().map(ConcurrentQueue::len).sum();
+        let queued_bytes = self.queued_bytes.load(AtomicOrdering::Acquire);
+        let reserved_stack_bytes = self.config.reserved_stack_bytes();
+
+        ComputePoolSnapshot {
+            queued_jobs,
+            queued_bytes,
+            reserved_stack_bytes,
+            total_bytes: reserved_stack_bytes + queued_bytes,
+            max_memory_bytes: self.config.max_memory_bytes,
+        }
     }
 
     pub(crate) fn config(&self) -> ComputePoolConfig {
-        critical_section::with(|_| self.state.lock().config)
+        self.config
     }
 
     pub(crate) fn run_next(&self) -> bool {
@@ -150,7 +150,7 @@ impl ComputePool {
             return false;
         };
 
-        job.run();
+        (job.callback)();
         true
     }
 
@@ -189,57 +189,72 @@ impl ComputePool {
         queued_bytes: usize,
         callback: Box<dyn FnOnce() + Send + 'static>,
     ) -> Result<(), SpawnError> {
-        critical_section::with(|_| {
-            let mut state = self.state.lock();
-            let reserved_stack_bytes = state.config.reserved_stack_bytes();
+        self.reserve_bytes(queued_bytes)?;
+        let job = ComputeJob {
+            queued_bytes,
+            callback,
+        };
+
+        match self.queues[priority.lane()].push(job) {
+            Ok(()) => Ok(()),
+            Err(PushError::Full(_)) => unreachable!("unbounded compute queue reported full"),
+            Err(PushError::Closed(job)) => {
+                self.release_bytes(job.queued_bytes);
+                panic!(
+                    "compute queue for priority {} was closed unexpectedly",
+                    priority.value()
+                );
+            }
+        }
+    }
+
+    fn dequeue(&self) -> Option<ComputeJob> {
+        for queue in self.queues.iter().rev() {
+            match queue.pop() {
+                Ok(job) => {
+                    self.release_bytes(job.queued_bytes);
+                    return Some(job);
+                }
+                Err(PopError::Empty | PopError::Closed) => continue,
+            }
+        }
+
+        None
+    }
+
+    fn reserve_bytes(&self, queued_bytes: usize) -> Result<(), SpawnError> {
+        let reserved_stack_bytes = self.config.reserved_stack_bytes();
+
+        loop {
+            let current = self.queued_bytes.load(AtomicOrdering::Acquire);
             let next_total = reserved_stack_bytes
-                .checked_add(state.queued_bytes)
+                .checked_add(current)
                 .and_then(|n| n.checked_add(queued_bytes))
                 .expect("compute pool memory accounting overflow");
-            if next_total > state.config.max_memory_bytes {
+            if next_total > self.config.max_memory_bytes {
                 return Err(SpawnError::MemoryLimitExceeded);
             }
 
-            let sequence = state.next_sequence;
-            state.next_sequence = state
-                .next_sequence
-                .checked_add(1)
-                .expect("compute pool sequence overflow");
-            state.queued_bytes += queued_bytes;
-            state.queue.push(QueuedJob {
-                priority,
-                sequence,
-                job: ComputeJob {
-                    queued_bytes,
-                    callback,
-                },
-            });
-            Ok(())
-        })
+            match self.queued_bytes.compare_exchange_weak(
+                current,
+                current + queued_bytes,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(_) => continue,
+            }
+        }
     }
 
-    fn dequeue(&self) -> Option<DequeuedJob> {
-        critical_section::with(|_| {
-            let mut state = self.state.lock();
-            let queued = state.queue.pop()?;
-            state.queued_bytes = state
-                .queued_bytes
-                .checked_sub(queued.job.queued_bytes)
-                .expect("compute pool queued bytes underflow");
-            Some(DequeuedJob {
-                callback: queued.job.callback,
-            })
-        })
-    }
-}
-
-pub(crate) struct DequeuedJob {
-    callback: Box<dyn FnOnce() + Send + 'static>,
-}
-
-impl DequeuedJob {
-    pub(crate) fn run(self) {
-        (self.callback)();
+    fn release_bytes(&self, queued_bytes: usize) {
+        let previous = self
+            .queued_bytes
+            .fetch_sub(queued_bytes, AtomicOrdering::AcqRel);
+        assert!(
+            previous >= queued_bytes,
+            "compute pool queued bytes underflow"
+        );
     }
 }
 
@@ -247,7 +262,8 @@ impl<T> Completion<T> {
     fn new() -> Self {
         Self {
             state: Arc::new(CompletionState {
-                result: Spinlock::new(None),
+                result: UnsafeCell::new(MaybeUninit::uninit()),
+                status: AtomicU8::new(COMPLETION_PENDING),
                 waker: AtomicWaker::new(),
             }),
         }
@@ -258,13 +274,13 @@ impl<T> Future for Completion<T> {
     type Output = Result<T, SpawnError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(result) = self.state.result.lock().take() {
+        if let Some(result) = self.state.try_take() {
             return Poll::Ready(result);
         }
 
         self.state.waker.register(cx.waker());
 
-        if let Some(result) = self.state.result.lock().take() {
+        if let Some(result) = self.state.try_take() {
             return Poll::Ready(result);
         }
 
@@ -274,31 +290,44 @@ impl<T> Future for Completion<T> {
 
 impl<T> CompletionState<T> {
     fn complete(&self, result: Result<T, SpawnError>) {
-        let replaced = self.result.lock().replace(result);
-        assert!(replaced.is_none(), "compute completion was resolved twice");
+        let previous = self.status.load(AtomicOrdering::Acquire);
+        assert_eq!(
+            previous, COMPLETION_PENDING,
+            "compute completion was resolved twice"
+        );
+
+        unsafe {
+            (*self.result.get()).write(result);
+        }
+        self.status.store(COMPLETION_READY, AtomicOrdering::Release);
         self.waker.wake();
     }
-}
 
-impl PartialEq for QueuedJob {
-    fn eq(&self, other: &Self) -> bool {
-        self.priority == other.priority && self.sequence == other.sequence
+    fn try_take(&self) -> Option<Result<T, SpawnError>> {
+        if self
+            .status
+            .compare_exchange(
+                COMPLETION_READY,
+                COMPLETION_CONSUMED,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            )
+            .is_err()
+        {
+            return None;
+        }
+
+        Some(unsafe { (*self.result.get()).assume_init_read() })
     }
 }
 
-impl Eq for QueuedJob {}
-
-impl PartialOrd for QueuedJob {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for QueuedJob {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.priority
-            .cmp(&other.priority)
-            .then_with(|| other.sequence.cmp(&self.sequence))
+impl<T> Drop for CompletionState<T> {
+    fn drop(&mut self) {
+        if *self.status.get_mut() == COMPLETION_READY {
+            unsafe {
+                self.result.get_mut().assume_init_drop();
+            }
+        }
     }
 }
 

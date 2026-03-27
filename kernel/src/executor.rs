@@ -1,6 +1,5 @@
 extern crate alloc;
 
-use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use core::future::Future;
 use core::marker::PhantomData;
@@ -8,10 +7,10 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use async_task::{Builder, Runnable, Task};
+use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 use helios_hal::cpu::{Cpu, ProcessorId};
-use spinning_top::Spinlock;
 
-type ReadyQueue = Spinlock<VecDeque<Runnable>>;
+type ReadyQueue = ConcurrentQueue<Runnable>;
 pub type JoinHandle<T> = Task<T>;
 
 /// Join handle for a task that is constrained to the spawning processor.
@@ -38,7 +37,7 @@ pub struct Executor {
 impl Executor {
     pub fn new() -> Self {
         Self {
-            ready_queue: Arc::new(Spinlock::new(VecDeque::new())),
+            ready_queue: Arc::new(ConcurrentQueue::unbounded()),
         }
     }
 
@@ -55,9 +54,9 @@ impl Executor {
         let mut runnable_count = 0;
 
         loop {
-            let Some(runnable) = critical_section::with(|_| self.ready_queue.lock().pop_front())
-            else {
-                return runnable_count;
+            let runnable = match self.ready_queue.pop() {
+                Ok(runnable) => runnable,
+                Err(PopError::Empty | PopError::Closed) => return runnable_count,
             };
 
             runnable.run();
@@ -68,9 +67,11 @@ impl Executor {
 
 impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
     fn schedule(&self, runnable: Runnable) {
-        critical_section::with(|_| {
-            self.ready_queue.lock().push_back(runnable);
-        });
+        match self.ready_queue.push(runnable) {
+            Ok(()) => {}
+            Err(PushError::Full(_)) => unreachable!("unbounded ready queue reported full"),
+            Err(PushError::Closed(_)) => panic!("executor ready queue was closed unexpectedly"),
+        }
 
         if self.cpu.current_processor() != self.owner_processor {
             self.cpu.wake_processor(self.owner_processor);

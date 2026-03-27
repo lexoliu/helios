@@ -3,6 +3,9 @@ mod console;
 mod cpu;
 mod runtime;
 
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::any::Any;
 use std::fmt;
 use std::panic::PanicHookInfo;
