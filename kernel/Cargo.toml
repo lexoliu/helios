@@ -12,12 +12,13 @@ critical-section = "1.2.0"
 nu-ansi-term = { version = "0.50.3", default-features = false }
 objectpool = { version = "0.1.0", default-features = false, features = ["alloc"] }
 virtio-drivers = "0.13.0"
-wasmtime = { version = "29.0", default-features = false, features = [] }
 helios-hal.workspace = true
 spinning_top = "0.3.0"
 tracing.workspace = true
 bitflags = "2.11.0"
+wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["cranelift", "runtime"] }
 
 [dev-dependencies]
 critical-section = { version = "1.2.0", features = ["std"] }
 futures-lite = "2.6.1"
+wat = "1.241.2"
