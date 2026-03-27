@@ -41,7 +41,7 @@ impl ProgramRuntimeConfig {
 
 #[derive(Clone)]
 pub struct ProgramRuntime {
-    engine: Engine,
+    engine_config: Config,
     compiler: ComputePool,
     compile_priority: ComputePriority,
 }
@@ -119,9 +119,11 @@ impl ProgramRuntime {
             max_memory_bytes: config.max_memory_bytes,
         })
         .map_err(|_| ProgramRuntimeError::Init(ProgramRuntimeInitError::InvalidComputeConfig))?;
+        let engine_config = build_engine_config();
+        Engine::new(&engine_config).map_err(ProgramRuntimeError::Wasmtime)?;
 
         Ok(Self {
-            engine: build_engine().map_err(ProgramRuntimeError::Wasmtime)?,
+            engine_config,
             compiler,
             compile_priority: config.compile_priority,
         })
@@ -130,10 +132,11 @@ impl ProgramRuntime {
     pub async fn compile(&self, blueprint: Blueprint<'_>) -> Result<Task, CompileError> {
         let wasm = blueprint.wasm.to_vec();
         let rights = blueprint.rights;
-        let engine = self.engine.clone();
+        let engine_config = self.engine_config.clone();
 
         self.compiler
             .spawn(self.compile_priority, move || {
+                let engine = Engine::new(&engine_config).map_err(CompileError::Wasmtime)?;
                 compile_task(engine, wasm, rights)
             })
             .await
@@ -204,10 +207,12 @@ impl Task {
     }
 }
 
-fn build_engine() -> Result<Engine, wasmtime::Error> {
+fn build_engine_config() -> Config {
     let mut config = Config::new();
-    config.target(env!("HELIOS_BUILD_TARGET"))?;
-    Engine::new(&config)
+    config
+        .target(env!("HELIOS_BUILD_TARGET"))
+        .expect("Helios build target must be accepted by Wasmtime");
+    config
 }
 
 fn compile_task(engine: Engine, wasm: Vec<u8>, rights: WasiRights) -> Result<Task, CompileError> {
@@ -251,11 +256,13 @@ mod tests {
 
     use alloc::vec::Vec;
     use futures_lite::future::block_on;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
         Blueprint, CompileError, ProgramRuntime, ProgramRuntimeConfig, ProgramRuntimeError,
     };
-    use crate::ComputePriority;
+    use crate::{ComputePool, ComputePriority};
     use helios_hal::resource::WasiRights;
 
     fn test_runtime() -> Result<ProgramRuntime, ProgramRuntimeError> {
@@ -269,42 +276,55 @@ mod tests {
         wat::parse_str(source).expect("test module must be valid wat")
     }
 
+    fn spawn_compile_workers(
+        compiler: ComputePool,
+        worker_count: usize,
+        expected_jobs: usize,
+    ) -> Vec<std::thread::JoinHandle<()>> {
+        let completed = Arc::new(AtomicUsize::new(0));
+
+        (0..worker_count)
+            .map(|_| {
+                let compiler = compiler.clone();
+                let completed = completed.clone();
+                std::thread::spawn(move || {
+                    while completed.load(Ordering::Acquire) < expected_jobs {
+                        if compiler.run_next() {
+                            completed.fetch_add(1, Ordering::AcqRel);
+                            continue;
+                        }
+
+                        std::thread::yield_now();
+                    }
+                })
+            })
+            .collect()
+    }
+
     #[test]
     fn compiles_and_runs_start_module() {
-        let runtime = match test_runtime() {
-            Ok(runtime) => runtime,
-            Err(ProgramRuntimeError::Wasmtime(_)) => return,
-            Err(error) => panic!("program runtime initialization failed: {error:?}"),
-        };
+        let runtime =
+            test_runtime().unwrap_or_else(|error| panic!("program runtime init failed: {error:?}"));
         let compiler = runtime.compiler.clone();
-        let worker = std::thread::spawn(move || {
-            while !compiler.run_next() {
-                std::thread::yield_now();
-            }
-        });
+        let workers = spawn_compile_workers(compiler, 1, 1);
         let wasm = parse_wat(include_str!("program_start_test.wat"));
 
         let task = block_on(Blueprint::new_wasm(&wasm, WasiRights::empty()).compile(&runtime))
             .expect("pure wasm module should compile");
         let exit_code = block_on(task.run()).expect("compiled task should run");
 
-        worker.join().expect("compile worker should complete");
+        for worker in workers {
+            worker.join().expect("compile worker should complete");
+        }
         assert_eq!(exit_code, 0);
     }
 
     #[test]
     fn rejects_imported_modules() {
-        let runtime = match test_runtime() {
-            Ok(runtime) => runtime,
-            Err(ProgramRuntimeError::Wasmtime(_)) => return,
-            Err(error) => panic!("program runtime initialization failed: {error:?}"),
-        };
+        let runtime =
+            test_runtime().unwrap_or_else(|error| panic!("program runtime init failed: {error:?}"));
         let compiler = runtime.compiler.clone();
-        let worker = std::thread::spawn(move || {
-            while !compiler.run_next() {
-                std::thread::yield_now();
-            }
-        });
+        let workers = spawn_compile_workers(compiler, 1, 1);
         let wasm = parse_wat(include_str!("program_import_test.wat"));
 
         let error =
@@ -313,10 +333,61 @@ mod tests {
                 Err(error) => error,
             };
 
-        worker.join().expect("compile worker should complete");
+        for worker in workers {
+            worker.join().expect("compile worker should complete");
+        }
         assert!(matches!(
             error,
             CompileError::ImportedModule { import_count: 1 }
         ));
+    }
+
+    #[test]
+    fn compiles_memory_module() {
+        let runtime =
+            test_runtime().unwrap_or_else(|error| panic!("program runtime init failed: {error:?}"));
+        let compiler = runtime.compiler.clone();
+        let workers = spawn_compile_workers(compiler, 1, 1);
+        let wasm = parse_wat(include_str!("program_memory_test.wat"));
+
+        let task = block_on(Blueprint::new_wasm(&wasm, WasiRights::empty()).compile(&runtime))
+            .expect("memory module should compile");
+        let exit_code = block_on(task.run()).expect("memory module should run");
+
+        for worker in workers {
+            worker.join().expect("compile worker should complete");
+        }
+        assert_eq!(exit_code, 0);
+    }
+
+    #[test]
+    fn compiles_multiple_modules_in_parallel() {
+        let runtime = ProgramRuntime::new(
+            ProgramRuntimeConfig::new(2, 64 * 1024, 1024 * 1024)
+                .with_compile_priority(ComputePriority::HIGH),
+        )
+        .unwrap_or_else(|error| panic!("program runtime init failed: {error:?}"));
+        let compiler = runtime.compiler.clone();
+        let workers = spawn_compile_workers(compiler, 2, 2);
+        let first = parse_wat(include_str!("program_start_test.wat"));
+        let second = parse_wat(include_str!("program_memory_test.wat"));
+
+        let (task_a, task_b) = block_on(async {
+            futures_lite::future::zip(
+                Blueprint::new_wasm(&first, WasiRights::empty()).compile(&runtime),
+                Blueprint::new_wasm(&second, WasiRights::empty()).compile(&runtime),
+            )
+            .await
+        });
+
+        let task_a = task_a.expect("first module should compile");
+        let task_b = task_b.expect("second module should compile");
+
+        for worker in workers {
+            worker.join().expect("compile worker should complete");
+        }
+
+        assert_eq!(block_on(task_a.run()).expect("first module should run"), 0);
+        assert_eq!(block_on(task_b.run()).expect("second module should run"), 0);
     }
 }
