@@ -13,6 +13,7 @@ use core::time::Duration;
 use atomic_waker::AtomicWaker;
 use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 use helios_hal::cpu::{Cpu, Instant};
+use objectpool::Pool;
 use spinning_top::Spinlock;
 
 #[derive(Clone)]
@@ -22,6 +23,7 @@ pub struct Timer<CpuImpl: Cpu + Clone> {
     inbox: Arc<ConcurrentQueue<TimerEntry>>,
     next_id: Arc<AtomicU64>,
     published_deadline: Arc<AtomicU64>,
+    ready_pool: Pool<Vec<Arc<SleepState>>>,
 }
 
 pub struct Sleep<CpuImpl: Cpu + Clone> {
@@ -57,6 +59,7 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
             inbox: Arc::new(ConcurrentQueue::unbounded()),
             next_id: Arc::new(AtomicU64::new(0)),
             published_deadline: Arc::new(AtomicU64::new(u64::MAX)),
+            ready_pool: Pool::bounded(8, Vec::new, Vec::clear),
         }
     }
 
@@ -92,7 +95,9 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
 
     fn fire_expired_inner(&self, disarm_when_empty: bool) -> usize {
         let now = self.now();
-        let mut ready = Vec::new();
+        // Timer interrupts can be frequent, so keep the temporary ready list
+        // out of the global allocator after the first few warmup cycles.
+        let mut ready = self.ready_pool.get_owned();
         let mut queue_changed = false;
         let next_deadline = {
             critical_section::with(|_| {
@@ -124,7 +129,7 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
             })
         };
 
-        for state in &ready {
+        for state in ready.iter() {
             state.fire();
         }
 
