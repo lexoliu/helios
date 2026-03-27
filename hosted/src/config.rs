@@ -1,0 +1,77 @@
+use std::env;
+use std::thread;
+
+use helios_hal::cpu::ProcessorId;
+
+const DEFAULT_HEAP_BYTES: usize = 128 * 1024 * 1024;
+
+/// Hosted runtime configuration sourced from the process environment.
+///
+/// Keeping this in one place makes the hosted backend deterministic and easy to
+/// mirror in tests without hardcoding settings throughout the runtime.
+pub struct HostedConfig {
+    processor_count: usize,
+    bootstrap_processor: ProcessorId,
+    heap_bytes: usize,
+}
+
+impl HostedConfig {
+    pub fn from_env() -> Self {
+        let processor_count =
+            parse_env_usize("HELIOS_HOSTED_PROCESSORS").unwrap_or_else(default_processor_count);
+        assert!(
+            processor_count != 0,
+            "HELIOS_HOSTED_PROCESSORS must be greater than zero"
+        );
+
+        let bootstrap_processor = parse_env_usize("HELIOS_HOSTED_BOOTSTRAP_PROCESSOR").unwrap_or(0);
+        assert!(
+            bootstrap_processor < processor_count,
+            "HELIOS_HOSTED_BOOTSTRAP_PROCESSOR={} is out of range for {} processors",
+            bootstrap_processor,
+            processor_count
+        );
+
+        let heap_bytes = parse_env_usize("HELIOS_HOSTED_HEAP_BYTES").unwrap_or(DEFAULT_HEAP_BYTES);
+        assert!(
+            heap_bytes != 0,
+            "HELIOS_HOSTED_HEAP_BYTES must be greater than zero"
+        );
+
+        Self {
+            processor_count,
+            bootstrap_processor: ProcessorId::new(bootstrap_processor as u16),
+            heap_bytes,
+        }
+    }
+
+    pub fn processor_count(&self) -> usize {
+        self.processor_count
+    }
+
+    pub fn bootstrap_processor(&self) -> ProcessorId {
+        self.bootstrap_processor
+    }
+
+    pub fn heap_bytes(&self) -> usize {
+        self.heap_bytes
+    }
+}
+
+fn default_processor_count() -> usize {
+    thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+}
+
+fn parse_env_usize(name: &str) -> Option<usize> {
+    match env::var(name) {
+        Ok(value) => Some(
+            value
+                .parse()
+                .unwrap_or_else(|err| panic!("failed to parse {name}={value:?} as usize: {err}")),
+        ),
+        Err(env::VarError::NotPresent) => None,
+        Err(err) => panic!("failed to read environment variable {name}: {err}"),
+    }
+}

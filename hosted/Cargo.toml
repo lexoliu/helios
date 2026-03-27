@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 critical-section = { version = "1.2.0", features = ["std"] }
+crossbeam-channel = "0.5.15"
 helios-hal.workspace = true
 helios-kernel.workspace = true
 tracing.workspace = true

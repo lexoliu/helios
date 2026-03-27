@@ -1,158 +1,41 @@
-use std::fmt::{self, Write};
-use std::rc::Rc;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::thread::Thread;
-use std::time::{Duration, Instant as StdInstant};
+mod config;
+mod console;
+mod cpu;
+mod runtime;
 
-use helios_hal::Platform;
-use helios_hal::cpu::{Cpu, Instant, ProcessorId};
-use helios_hal::memory::MemoryRegion;
-use helios_kernel::{init, yield_now};
+use std::any::Any;
+use std::fmt;
+use std::panic::PanicHookInfo;
 
-const HOSTED_HEAP_SIZE: usize = 16 * 1024 * 1024;
-
-#[derive(Clone)]
-struct HostedCpu {
-    started_at: StdInstant,
-    main_thread: Thread,
-    timer_tx: Sender<StdInstant>,
-}
-
-impl HostedCpu {
-    fn new() -> Self {
-        let started_at = StdInstant::now();
-        let main_thread = std::thread::current();
-        let (timer_tx, timer_rx) = mpsc::channel();
-        let timer_thread = main_thread.clone();
-        std::thread::spawn(move || timer_thread_main(timer_rx, timer_thread));
-
-        Self {
-            started_at,
-            main_thread,
-            timer_tx,
-        }
-    }
-}
-
-fn timer_thread_main(timer_rx: Receiver<StdInstant>, main_thread: Thread) {
-    while let Ok(mut deadline) = timer_rx.recv() {
-        loop {
-            let now = StdInstant::now();
-            if now >= deadline {
-                main_thread.unpark();
-                break;
-            }
-
-            let timeout = deadline.saturating_duration_since(now);
-            match timer_rx.recv_timeout(timeout) {
-                Ok(next_deadline) => deadline = next_deadline,
-                Err(RecvTimeoutError::Timeout) => {
-                    main_thread.unpark();
-                    break;
-                }
-                Err(RecvTimeoutError::Disconnected) => return,
-            }
-        }
-    }
-}
-
-impl Cpu for HostedCpu {
-    fn current_processor(&self) -> ProcessorId {
-        ProcessorId::new(0)
-    }
-
-    fn processor_count(&self) -> usize {
-        1
-    }
-
-    fn bootstrap_processor(&self) -> ProcessorId {
-        ProcessorId::new(0)
-    }
-
-    fn park_current(&self) {
-        std::thread::park();
-    }
-
-    fn start_processor(&self, _processor: ProcessorId) {}
-
-    fn wake_processor(&self, processor: ProcessorId) {
-        assert!(
-            processor == ProcessorId::new(0),
-            "hosted backend exposes only processor 0"
-        );
-        self.main_thread.unpark();
-    }
-
-    fn now(&self) -> Instant {
-        Instant::new(self.started_at.elapsed().as_nanos() as u64)
-    }
-
-    fn timer_frequency(&self) -> u64 {
-        1_000_000_000
-    }
-
-    fn set_deadline(&self, deadline: Instant) {
-        let absolute_deadline = self
-            .started_at
-            .checked_add(Duration::from_nanos(deadline.ticks()))
-            .expect("hosted timer deadline overflow");
-        self.timer_tx
-            .send(absolute_deadline)
-            .expect("hosted timer thread stopped unexpectedly");
-        self.main_thread.unpark();
-    }
-
-    fn shutdown(&self) -> ! {
-        std::process::exit(0);
-    }
-
-    fn reboot(&self) -> ! {
-        std::process::exit(1);
-    }
-}
-
-struct StdoutConsole;
-
-impl Write for StdoutConsole {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        use std::io::Write as _;
-
-        let mut stdout = std::io::stdout().lock();
-        stdout.write_all(s.as_bytes()).map_err(|_| fmt::Error)?;
-        stdout.flush().map_err(|_| fmt::Error)
-    }
-}
+use config::HostedConfig;
+use runtime::HostedRuntime;
 
 pub fn main() {
-    std::panic::set_hook(Box::new(|info| {
-        let message = info.payload_as_str().unwrap_or("non-string panic payload");
-        helios_kernel::panic_log_message(message, info.location());
-    }));
-
-    let heap = vec![0; HOSTED_HEAP_SIZE].into_boxed_slice();
-    let heap = Box::leak(heap);
-    let memory_regions = [MemoryRegion::from(heap)];
-    let kernel = init(Platform::new(
-        StdoutConsole,
-        memory_regions,
-        HostedCpu::new(),
-    ));
-    let spawner = kernel.spawner();
-    let timer = kernel.timer();
-    kernel.spawn_detached(async move {
-        let joined = spawner
-            .spawn(async move {
-                timer.sleep_for(Duration::from_millis(10)).await;
-                yield_now().await;
-                2usize + 2
-            })
-            .await;
-        tracing::info!("Executor join result={joined}");
-    });
-    let local_message: Rc<str> = Rc::from("spawn_local works");
-    kernel.spawn_local_detached(async move {
-        yield_now().await;
-        tracing::info!("{local_message}");
-    });
-    kernel.run();
+    install_panic_hook();
+    HostedRuntime::new(HostedConfig::from_env()).run();
 }
+
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        helios_kernel::panic_log_message(PanicPayload(info.payload()), info.location());
+    }));
+}
+
+struct PanicPayload<'a>(&'a (dyn Any + Send));
+
+impl fmt::Display for PanicPayload<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(message) = self.0.downcast_ref::<&str>() {
+            return f.write_str(message);
+        }
+
+        if let Some(message) = self.0.downcast_ref::<String>() {
+            return f.write_str(message);
+        }
+
+        f.write_str("non-string panic payload")
+    }
+}
+
+#[allow(dead_code)]
+fn _panic_hook_typecheck(_: &PanicHookInfo<'_>) {}
