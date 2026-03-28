@@ -1,17 +1,19 @@
 extern crate alloc;
 
 use alloc::string::String;
+use core::cell::UnsafeCell;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 use nu_ansi_term::{Color, Style};
 use objectpool::{Pool, ReusableObject};
-use spinning_top::Spinlock;
 use tracing::Subscriber;
 
 pub struct KernelConsoleSubscriber<Console> {
-    console: Spinlock<Console>,
+    // The `flushing` flag serializes all writes into this single console value,
+    // so we do not need an additional spinlock here.
+    console: UnsafeCell<Console>,
     queue: ConcurrentQueue<ReusableObject<String>>,
     buffers: Pool<String>,
     flushing: AtomicBool,
@@ -79,7 +81,8 @@ impl<Console: Write> KernelConsoleSubscriber<Console> {
     }
 
     fn flush_queue(&self) {
-        let mut console = self.console.lock();
+        // SAFETY: `try_flush` guarantees exactly one active flusher at a time.
+        let console = unsafe { &mut *self.console.get() };
 
         loop {
             match self.queue.pop() {
@@ -132,7 +135,7 @@ impl tracing::field::Visit for ConsoleVisitor<'_> {
 
 pub fn init_logger(console: impl Write + Send + 'static) {
     tracing::subscriber::set_global_default(KernelConsoleSubscriber {
-        console: Spinlock::new(console),
+        console: UnsafeCell::new(console),
         queue: ConcurrentQueue::unbounded(),
         buffers: Pool::unbounded(|| String::with_capacity(256), String::clear),
         flushing: AtomicBool::new(false),
@@ -165,3 +168,6 @@ fn level_style(level: &tracing::Level) -> (Style, &'static str) {
 fn is_message_field(field: &tracing::field::Field) -> bool {
     field.name().contains("message")
 }
+
+unsafe impl<Console: Send> Send for KernelConsoleSubscriber<Console> {}
+unsafe impl<Console: Send> Sync for KernelConsoleSubscriber<Console> {}

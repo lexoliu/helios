@@ -1,32 +1,29 @@
 use std::sync::Arc;
 
-use tokio::sync::{
-    Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard,
-    RwLock as AsyncRwLock,
-};
+use helios_kernel::{OwnedRawMutexLease, OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease};
 use wasmtime::component::{Accessor, Resource};
 
 use crate::init_bindings::bindings;
 use crate::init_program::StoreData;
 
 pub struct HostedRawMutex {
-    inner: Arc<AsyncMutex<()>>,
+    inner: Arc<helios_kernel::RawMutex>,
 }
 
 pub struct HostedRawMutexGuard {
-    _guard: OwnedMutexGuard<()>,
+    _lease: OwnedRawMutexLease,
 }
 
 pub struct HostedRawRwLock {
-    inner: Arc<AsyncRwLock<()>>,
+    inner: Arc<helios_kernel::RawRwLock>,
 }
 
 pub struct HostedRawRwLockReadGuard {
-    _guard: OwnedRwLockReadGuard<()>,
+    _lease: OwnedRawRwLockReadLease,
 }
 
 pub struct HostedRawRwLockWriteGuard {
-    _guard: OwnedRwLockWriteGuard<()>,
+    _lease: OwnedRawRwLockWriteLease,
 }
 
 impl bindings::helios::system::sync::Host for StoreData {}
@@ -34,7 +31,7 @@ impl bindings::helios::system::sync::Host for StoreData {}
 impl bindings::helios::system::sync::HostRawMutex for StoreData {
     fn new(&mut self) -> wasmtime::Result<Resource<HostedRawMutex>> {
         Ok(self.table.push(HostedRawMutex {
-            inner: Arc::new(AsyncMutex::new(())),
+            inner: Arc::new(helios_kernel::RawMutex::new()),
         })?)
     }
 
@@ -52,12 +49,12 @@ impl bindings::helios::system::sync::HostRawMutexWithStore for StoreData {
         let mutex = accessor.with(|mut access| {
             Ok::<_, wasmtime::Error>(access.get().table.get(&resource)?.inner.clone())
         })?;
-        let guard = mutex.lock_owned().await;
+        let lease = mutex.lock_owned().await;
         accessor.with(|mut access| {
             Ok(access
                 .get()
                 .table
-                .push(HostedRawMutexGuard { _guard: guard })?)
+                .push(HostedRawMutexGuard { _lease: lease })?)
         })
     }
 }
@@ -72,7 +69,7 @@ impl bindings::helios::system::sync::HostRawMutexGuard for StoreData {
 impl bindings::helios::system::sync::HostRawRwLock for StoreData {
     fn new(&mut self) -> wasmtime::Result<Resource<HostedRawRwLock>> {
         Ok(self.table.push(HostedRawRwLock {
-            inner: Arc::new(AsyncRwLock::new(())),
+            inner: Arc::new(helios_kernel::RawRwLock::new()),
         })?)
     }
 
@@ -104,12 +101,12 @@ impl bindings::helios::system::sync::HostRawRwLockWithStore for StoreData {
         let rwlock = accessor.with(|mut access| {
             Ok::<_, wasmtime::Error>(access.get().table.get(&resource)?.inner.clone())
         })?;
-        let guard = rwlock.read_owned().await;
+        let lease = rwlock.read_owned().await;
         accessor.with(|mut access| {
             Ok(access
                 .get()
                 .table
-                .push(HostedRawRwLockReadGuard { _guard: guard })?)
+                .push(HostedRawRwLockReadGuard { _lease: lease })?)
         })
     }
 
@@ -120,12 +117,12 @@ impl bindings::helios::system::sync::HostRawRwLockWithStore for StoreData {
         let rwlock = accessor.with(|mut access| {
             Ok::<_, wasmtime::Error>(access.get().table.get(&resource)?.inner.clone())
         })?;
-        let guard = rwlock.write_owned().await;
+        let lease = rwlock.write_owned().await;
         accessor.with(|mut access| {
             Ok(access
                 .get()
                 .table
-                .push(HostedRawRwLockWriteGuard { _guard: guard })?)
+                .push(HostedRawRwLockWriteGuard { _lease: lease })?)
         })
     }
 }

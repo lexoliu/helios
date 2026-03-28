@@ -341,9 +341,9 @@ mod tests {
     use alloc::vec::Vec;
     use core::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::Mutex;
 
     use futures_lite::future::block_on;
-    use spinning_top::Spinlock;
 
     use super::{ComputePool, ComputePoolConfig, ComputePriority, SpawnError};
 
@@ -355,19 +355,25 @@ mod tests {
             max_memory_bytes: 4096 + 4096,
         })
         .expect("pool config should be valid");
-        let seen = Arc::new(Spinlock::new(Vec::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
 
         let first = {
             let seen = seen.clone();
-            pool.spawn_internal(ComputePriority::LOW, move || seen.lock().push(1))
+            pool.spawn_internal(ComputePriority::LOW, move || {
+                seen.lock().unwrap().push(1);
+            })
         };
         let second = {
             let seen = seen.clone();
-            pool.spawn_internal(ComputePriority::HIGH, move || seen.lock().push(2))
+            pool.spawn_internal(ComputePriority::HIGH, move || {
+                seen.lock().unwrap().push(2);
+            })
         };
         let third = {
             let seen = seen.clone();
-            pool.spawn_internal(ComputePriority::HIGH, move || seen.lock().push(3))
+            pool.spawn_internal(ComputePriority::HIGH, move || {
+                seen.lock().unwrap().push(3);
+            })
         };
 
         while pool.run_next() {}
@@ -376,7 +382,7 @@ mod tests {
         block_on(second).expect("first high priority job should complete");
         block_on(third).expect("second high priority job should complete");
 
-        assert_eq!(&*seen.lock(), &[2, 3, 1]);
+        assert_eq!(&*seen.lock().unwrap(), &[2, 3, 1]);
     }
 
     #[test]

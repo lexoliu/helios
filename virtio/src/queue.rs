@@ -1,0 +1,426 @@
+use alloc::boxed::Box;
+use alloc::vec;
+use core::alloc::Layout;
+use core::mem::size_of;
+use core::sync::atomic::{Ordering, fence};
+
+use helios_hal::io::{IoError, IoResult};
+
+use crate::bus::{DeviceBus, DmaBuffer, DmaPool};
+use crate::transport::VirtioTransport;
+
+const DESC_FLAG_NEXT: u16 = 1;
+const DESC_FLAG_WRITE: u16 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Descriptor {
+    addr: u64,
+    len: u32,
+    flags: u16,
+    next: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct UsedElem {
+    id: u32,
+    len: u32,
+}
+
+pub struct VirtQueue<T: VirtioTransport> {
+    index: u16,
+    size: u16,
+    descriptors: <<T::Bus as DeviceBus>::DmaPool as DmaPool>::Buffer,
+    driver_area: <<T::Bus as DeviceBus>::DmaPool as DmaPool>::Buffer,
+    device_area: <<T::Bus as DeviceBus>::DmaPool as DmaPool>::Buffer,
+    desc_shadow: Box<[Descriptor]>,
+    free_head: u16,
+    num_used: u16,
+    avail_idx: u16,
+    last_used_idx: u16,
+}
+
+impl<T: VirtioTransport> VirtQueue<T> {
+    pub fn new(transport: &T, index: u16, size: u16) -> IoResult<Self> {
+        if size == 0 || !size.is_power_of_two() {
+            return Err(IoError::Unsupported);
+        }
+
+        let descriptor_layout =
+            Layout::from_size_align(size_of::<Descriptor>() * usize::from(size), 16)
+                .map_err(|_| IoError::DeviceFault)?;
+        let driver_layout =
+            Layout::from_size_align(driver_area_len(size), 2).map_err(|_| IoError::DeviceFault)?;
+        let device_layout =
+            Layout::from_size_align(device_area_len(size), 4).map_err(|_| IoError::DeviceFault)?;
+        let dma = transport.bus().dma();
+
+        let descriptors = dma.allocate_zeroed(descriptor_layout)?;
+        let driver_area = dma.allocate_zeroed(driver_layout)?;
+        let device_area = dma.allocate_zeroed(device_layout)?;
+        let mut desc_shadow = vec![Descriptor::default(); usize::from(size)].into_boxed_slice();
+
+        for index in 0..(size - 1) {
+            desc_shadow[usize::from(index)].next = index + 1;
+        }
+
+        transport.set_queue(
+            index,
+            size,
+            descriptors.phys_addr(),
+            driver_area.phys_addr(),
+            device_area.phys_addr(),
+        );
+
+        Ok(Self {
+            index,
+            size,
+            descriptors,
+            driver_area,
+            device_area,
+            desc_shadow,
+            free_head: 0,
+            num_used: 0,
+            avail_idx: 0,
+            last_used_idx: 0,
+        })
+    }
+
+    pub fn submit(&mut self, inputs: &[&[u8]], outputs: &mut [&mut [u8]]) -> IoResult<u16> {
+        if inputs.is_empty() && outputs.is_empty() {
+            return Err(IoError::DeviceFault);
+        }
+
+        let descriptors_needed = inputs.len() + outputs.len();
+        if self.num_used as usize + descriptors_needed > usize::from(self.size) {
+            return Err(IoError::DeviceFault);
+        }
+
+        let head = self.free_head;
+        let mut last = self.free_head;
+
+        for buffer in inputs {
+            last = self.push_descriptor(buffer, false);
+        }
+
+        for output in outputs.iter_mut() {
+            last = self.push_descriptor(output, true);
+        }
+
+        self.desc_shadow[usize::from(last)].flags &= !DESC_FLAG_NEXT;
+        self.write_desc(last);
+
+        let slot = self.avail_idx & (self.size - 1);
+        self.write_avail_ring(slot, head);
+        fence(Ordering::Release);
+        self.avail_idx = self.avail_idx.wrapping_add(1);
+        self.write_avail_idx(self.avail_idx);
+        self.num_used += descriptors_needed as u16;
+
+        Ok(head)
+    }
+
+    pub fn pop_used(&mut self) -> Option<u16> {
+        let used_idx = self.read_used_idx();
+        if used_idx == self.last_used_idx {
+            return None;
+        }
+
+        fence(Ordering::Acquire);
+        let slot = self.last_used_idx & (self.size - 1);
+        let elem = self.read_used_elem(slot);
+        self.last_used_idx = self.last_used_idx.wrapping_add(1);
+        let head = elem.id as u16;
+        self.recycle_chain(head);
+        Some(head)
+    }
+
+    pub fn notify(&self, transport: &T) {
+        transport.notify_queue(self.index);
+    }
+
+    fn push_descriptor(&mut self, buffer: &[u8], writable: bool) -> u16 {
+        assert!(!buffer.is_empty(), "virtqueue buffers must not be empty");
+
+        let desc_index = self.free_head;
+        let desc = &mut self.desc_shadow[usize::from(desc_index)];
+        let mut flags = DESC_FLAG_NEXT;
+        if writable {
+            flags |= DESC_FLAG_WRITE;
+        }
+
+        *desc = Descriptor {
+            addr: buffer.as_ptr() as usize as u64,
+            len: buffer.len() as u32,
+            flags,
+            next: desc.next,
+        };
+        self.free_head = desc.next;
+        self.write_desc(desc_index);
+        desc_index
+    }
+
+    fn recycle_chain(&mut self, head: u16) {
+        let mut cursor = head;
+        let mut returned = 0u16;
+
+        loop {
+            returned = returned.wrapping_add(1);
+            let next = self.desc_shadow[usize::from(cursor)].next;
+            let has_next = self.desc_shadow[usize::from(cursor)].flags & DESC_FLAG_NEXT != 0;
+            self.desc_shadow[usize::from(cursor)].next = self.free_head;
+            self.free_head = cursor;
+            if !has_next {
+                break;
+            }
+            cursor = next;
+        }
+
+        let previous = self.num_used;
+        self.num_used = self.num_used.wrapping_sub(returned);
+        assert!(previous >= returned, "virtqueue used descriptor underflow");
+    }
+
+    fn write_desc(&self, index: u16) {
+        unsafe {
+            self.descriptors
+                .as_ptr()
+                .cast::<Descriptor>()
+                .add(usize::from(index))
+                .write_volatile(self.desc_shadow[usize::from(index)]);
+        }
+    }
+
+    fn write_avail_ring(&self, slot: u16, head: u16) {
+        unsafe {
+            self.driver_area
+                .as_ptr()
+                .cast::<u16>()
+                .add(2 + usize::from(slot))
+                .write_volatile(head);
+        }
+    }
+
+    fn write_avail_idx(&self, index: u16) {
+        unsafe {
+            self.driver_area
+                .as_ptr()
+                .cast::<u16>()
+                .add(1)
+                .write_volatile(index);
+        }
+    }
+
+    fn read_used_idx(&self) -> u16 {
+        unsafe {
+            self.device_area
+                .as_ptr()
+                .cast::<u16>()
+                .add(1)
+                .read_volatile()
+        }
+    }
+
+    fn read_used_elem(&self, slot: u16) -> UsedElem {
+        unsafe {
+            self.device_area
+                .as_ptr()
+                .add(4 + (usize::from(slot) * size_of::<UsedElem>()))
+                .cast::<UsedElem>()
+                .read_volatile()
+        }
+    }
+}
+
+fn driver_area_len(size: u16) -> usize {
+    4 + (usize::from(size) * 2) + 2
+}
+
+fn device_area_len(size: u16) -> usize {
+    4 + (usize::from(size) * size_of::<UsedElem>()) + 2
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::alloc::{alloc_zeroed, dealloc};
+    use core::alloc::Layout;
+    use core::ptr::NonNull;
+
+    use helios_hal::io::{IoError, IoResult};
+
+    use super::{Descriptor, UsedElem, VirtQueue};
+    use crate::bus::{DeviceBus, DmaBuffer, DmaPool};
+    use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
+
+    #[derive(Clone, Copy, Default)]
+    struct FakeDmaPool;
+
+    struct FakeDmaBuffer {
+        ptr: NonNull<u8>,
+        layout: Layout,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct FakeBus {
+        dma: FakeDmaPool,
+    }
+
+    struct FakeTransport {
+        bus: FakeBus,
+    }
+
+    impl DmaPool for FakeDmaPool {
+        type Buffer = FakeDmaBuffer;
+
+        fn allocate_zeroed(&self, layout: Layout) -> IoResult<Self::Buffer> {
+            let ptr = unsafe { alloc_zeroed(layout) };
+            let ptr = NonNull::new(ptr).ok_or(IoError::DeviceFault)?;
+            Ok(FakeDmaBuffer { ptr, layout })
+        }
+    }
+
+    impl DmaBuffer for FakeDmaBuffer {
+        fn phys_addr(&self) -> u64 {
+            self.ptr.as_ptr() as usize as u64
+        }
+
+        fn as_ptr(&self) -> *mut u8 {
+            self.ptr.as_ptr()
+        }
+
+        fn len(&self) -> usize {
+            self.layout.size()
+        }
+    }
+
+    impl Drop for FakeDmaBuffer {
+        fn drop(&mut self) {
+            unsafe {
+                dealloc(self.ptr.as_ptr(), self.layout);
+            }
+        }
+    }
+
+    impl DeviceBus for FakeBus {
+        type DmaPool = FakeDmaPool;
+
+        fn read_u32(&self, _offset: usize) -> u32 {
+            0
+        }
+
+        fn write_u32(&self, _offset: usize, _value: u32) {}
+
+        fn dma(&self) -> &Self::DmaPool {
+            &self.dma
+        }
+    }
+
+    impl VirtioTransport for FakeTransport {
+        type Bus = FakeBus;
+
+        fn bus(&self) -> &Self::Bus {
+            &self.bus
+        }
+
+        fn device_type(&self) -> DeviceType {
+            DeviceType::Block
+        }
+
+        fn reset(&self) {}
+
+        fn status(&self) -> DeviceStatus {
+            DeviceStatus::empty()
+        }
+
+        fn set_status(&self, _status: DeviceStatus) {}
+
+        fn device_features(&self) -> u64 {
+            0
+        }
+
+        fn set_driver_features(&self, _features: u64) {}
+
+        fn queue_max_size(&self, _index: u16) -> u16 {
+            8
+        }
+
+        fn set_queue(
+            &self,
+            _index: u16,
+            _size: u16,
+            _descriptor_area: u64,
+            _driver_area: u64,
+            _device_area: u64,
+        ) {
+        }
+
+        fn notify_queue(&self, _index: u16) {}
+
+        fn ack_interrupt(&self) {}
+
+        fn read_config_u32(&self, _offset: usize) -> u32 {
+            0
+        }
+    }
+
+    unsafe impl Send for FakeDmaBuffer {}
+    unsafe impl Sync for FakeDmaBuffer {}
+    unsafe impl Send for FakeBus {}
+    unsafe impl Sync for FakeBus {}
+
+    #[test]
+    fn queue_submit_and_pop_used_recycles_descriptors() {
+        let transport = FakeTransport {
+            bus: FakeBus { dma: FakeDmaPool },
+        };
+        let mut queue = VirtQueue::new(&transport, 0, 8).expect("queue should initialize");
+
+        let input = [1u8; 16];
+        let mut output = [0u8; 16];
+        let token = queue
+            .submit(&[&input], &mut [&mut output])
+            .expect("submission should succeed");
+        assert_eq!(token, 0);
+
+        let desc_table = queue.descriptors.as_ptr().cast::<Descriptor>();
+        let first = unsafe { desc_table.read() };
+        let second = unsafe { desc_table.add(1).read() };
+        assert_eq!(first.addr, input.as_ptr() as usize as u64);
+        assert_eq!(first.flags & 1, 1);
+        assert_eq!(second.addr, output.as_ptr() as usize as u64);
+        assert_ne!(second.flags & 2, 0);
+
+        let avail_idx = unsafe {
+            queue
+                .driver_area
+                .as_ptr()
+                .cast::<u16>()
+                .add(1)
+                .read_volatile()
+        };
+        assert_eq!(avail_idx, 1);
+
+        unsafe {
+            queue
+                .device_area
+                .as_ptr()
+                .cast::<u16>()
+                .add(1)
+                .write_volatile(1);
+            queue
+                .device_area
+                .as_ptr()
+                .add(4)
+                .cast::<UsedElem>()
+                .write_volatile(UsedElem {
+                    id: token as u32,
+                    len: 0,
+                });
+        }
+
+        assert_eq!(queue.pop_used(), Some(token));
+        assert_eq!(queue.num_used, 0);
+        assert_eq!(queue.free_head, 1);
+    }
+}

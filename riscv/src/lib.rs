@@ -179,16 +179,12 @@ impl Cpu for RiscvCpu {
 
     fn shutdown(&self) -> ! {
         sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
-        loop {
-            core::hint::spin_loop();
-        }
+        halt_forever()
     }
 
     fn reboot(&self) -> ! {
         sbi_rt::system_reset(sbi_rt::ColdReboot, sbi_rt::NoReason);
-        loop {
-            core::hint::spin_loop();
-        }
+        halt_forever()
     }
 }
 
@@ -387,8 +383,12 @@ fn mask_interrupts() {
 
 fn shutdown_machine() -> ! {
     sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
+    halt_forever()
+}
+
+fn halt_forever() -> ! {
     loop {
-        core::hint::spin_loop();
+        riscv::asm::wfi();
     }
 }
 

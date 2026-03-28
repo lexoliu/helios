@@ -267,7 +267,7 @@ fn instantiate_task(
     module: &Module,
     store: &mut Store<TaskState>,
 ) -> Result<wasmtime::Instance, wasmtime::Error> {
-    let mut linker = Linker::<TaskState>::new(module.engine());
+    let linker = Linker::<TaskState>::new(module.engine());
     linker.instantiate(store, module)
 }
 
