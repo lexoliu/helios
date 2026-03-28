@@ -5,9 +5,7 @@ edition = "2024"
 autobins = false
 
 [dependencies]
-futures = { version = "0.3.31", default-features = false, features = ["alloc", "async-await"] }
 helios-api.workspace = true
-wit-bindgen = { workspace = true, features = ["async", "macros", "realloc"] }
 
 [lib]
 name = "helios_init"

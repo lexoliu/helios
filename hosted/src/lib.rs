@@ -2,8 +2,10 @@ mod bootfs_mount;
 mod config;
 mod console;
 mod cpu;
+mod init_bindings;
 mod init_program;
 mod runtime;
+mod sync_host;
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;

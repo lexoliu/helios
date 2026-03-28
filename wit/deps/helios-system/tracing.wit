@@ -1,0 +1,53 @@
+package helios:system@0.1.0;
+
+interface tracing {
+  /// Monotonic nanoseconds since system boot.
+  type mono-nanos = u64;
+
+  enum level {
+    error,
+    warn,
+    info,
+    debug,
+    trace,
+  }
+
+  variant value {
+    boolean(bool),
+    signed64(s64),
+    unsigned64(u64),
+    float64(f64),
+    text(string),
+    blob(list<u8>),
+  }
+
+  record field {
+    key: string,
+    value: value,
+  }
+
+  /// A tracing event as exposed to user space.
+  ///
+  /// This intentionally exposes the event payload only. It does not leak
+  /// internal span ids, scheduler state, or source file locations from the
+  /// kernel implementation.
+  record event {
+    timestamp: mono-nanos,
+    level: level,
+    target: string,
+    fields: list<field>,
+  }
+
+  record filter {
+    /// Minimum included level. `none` means no level filter.
+    min-level: option<level>,
+    /// Prefix matches on tracing target. Empty means no target restriction.
+    target-prefixes: list<string>,
+  }
+
+  /// Returns at most `limit` newest matching events, ordered oldest to newest.
+  recent: func(filter: filter, limit: u32) -> list<event>;
+
+  /// Subscribes to future matching events.
+  subscribe: func(filter: filter) -> stream<event>;
+}
