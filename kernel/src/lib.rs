@@ -11,6 +11,7 @@ mod embedded_program;
 mod executor;
 mod log;
 mod program;
+mod sync;
 mod task;
 mod timer;
 
@@ -27,6 +28,11 @@ pub use helios_hal::Platform;
 pub use program::{
     Blueprint, CompileError as ProgramCompileError, ExitCode, ProgramRuntime, ProgramRuntimeConfig,
     ProgramRuntimeError, ProgramRuntimeInitError, ResourceTable, RunError as ProgramRunError, Task,
+};
+pub use sync::{
+    Mutex, MutexGuard, Notified, Notify, OwnedRawMutexLease, OwnedRawRwLockReadLease,
+    OwnedRawRwLockWriteLease, RawMutex, RawMutexLease, RawRwLock, RawRwLockReadLease,
+    RawRwLockWriteLease, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
 pub use task::{YieldNow, yield_now};
 pub use timer::{Sleep, Timer};

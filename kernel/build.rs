@@ -112,6 +112,10 @@ fn build_default_init_component(out_dir: &Path) -> PathBuf {
         .arg("wasm32-wasip2")
         .arg("--target-dir")
         .arg(&target_dir);
+    // The init program is built for `wasm32-wasip2`, so it must not inherit the
+    // kernel's outer bare-metal linker scripts.
+    command.env_remove("CARGO_ENCODED_RUSTFLAGS");
+    command.env_remove("RUSTFLAGS");
     let status = command
         .status()
         .unwrap_or_else(|error| panic!("failed to invoke cargo for init component build: {error}"));

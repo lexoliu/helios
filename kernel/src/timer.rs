@@ -3,6 +3,7 @@ extern crate alloc;
 use alloc::collections::BinaryHeap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::cell::UnsafeCell;
 use core::cmp::Ordering;
 use core::future::Future;
 use core::pin::Pin;
@@ -14,16 +15,11 @@ use atomic_waker::AtomicWaker;
 use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 use helios_hal::cpu::{Cpu, Instant};
 use objectpool::Pool;
-use spinning_top::Spinlock;
 
 #[derive(Clone)]
 pub struct Timer<CpuImpl: Cpu + Clone> {
     cpu: CpuImpl,
-    state: Arc<Spinlock<TimerState>>,
-    inbox: Arc<ConcurrentQueue<TimerEntry>>,
-    next_id: Arc<AtomicU64>,
-    published_deadline: Arc<AtomicU64>,
-    ready_pool: Pool<Vec<Arc<SleepState>>>,
+    shared: Arc<TimerShared>,
 }
 
 pub struct Sleep<CpuImpl: Cpu + Clone> {
@@ -33,6 +29,17 @@ pub struct Sleep<CpuImpl: Cpu + Clone> {
 
 struct TimerState {
     sleepers: BinaryHeap<TimerEntry>,
+}
+
+struct TimerShared {
+    // This heap is owned by the kernel event loop running on the timer's home
+    // processor. Interrupt handlers never touch it; they only disarm the timer
+    // and return so normal async/task context can finish the work.
+    state: UnsafeCell<TimerState>,
+    inbox: ConcurrentQueue<TimerEntry>,
+    next_id: AtomicU64,
+    published_deadline: AtomicU64,
+    ready_pool: Pool<Vec<Arc<SleepState>>>,
 }
 
 struct TimerEntry {
@@ -53,13 +60,15 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     pub fn new(cpu: CpuImpl) -> Self {
         Self {
             cpu,
-            state: Arc::new(Spinlock::new(TimerState {
-                sleepers: BinaryHeap::new(),
-            })),
-            inbox: Arc::new(ConcurrentQueue::unbounded()),
-            next_id: Arc::new(AtomicU64::new(0)),
-            published_deadline: Arc::new(AtomicU64::new(u64::MAX)),
-            ready_pool: Pool::bounded(8, Vec::new, Vec::clear),
+            shared: Arc::new(TimerShared {
+                state: UnsafeCell::new(TimerState {
+                    sleepers: BinaryHeap::new(),
+                }),
+                inbox: ConcurrentQueue::unbounded(),
+                next_id: AtomicU64::new(0),
+                published_deadline: AtomicU64::new(u64::MAX),
+                ready_pool: Pool::bounded(8, Vec::new, Vec::clear),
+            }),
         }
     }
 
@@ -86,93 +95,71 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     }
 
     pub fn fire_expired(&self) -> usize {
-        self.fire_expired_inner(false)
-    }
-
-    pub fn handle_interrupt(&self) -> usize {
-        self.fire_expired_inner(true)
-    }
-
-    fn fire_expired_inner(&self, disarm_when_empty: bool) -> usize {
         let now = self.now();
-        // Timer interrupts can be frequent, so keep the temporary ready list
-        // out of the global allocator after the first few warmup cycles.
-        let mut ready = self.ready_pool.get_owned();
-        let mut queue_changed = false;
-        let next_deadline = {
-            critical_section::with(|_| {
-                let mut state = self.state.lock();
-                queue_changed |= self.drain_inbox(&mut state);
+        // Timer wakeups are frequent, so keep the temporary ready list out of
+        // the allocator fast path once the pool has warmed up.
+        let mut ready = self.shared.ready_pool.get_owned();
+        let state = self.state_mut();
+        self.drain_inbox(state);
 
-                while let Some(entry) = state.sleepers.peek() {
-                    if entry.state.cancelled.load(AtomicOrdering::Acquire)
-                        || entry.state.fired.load(AtomicOrdering::Acquire)
-                    {
-                        queue_changed = true;
-                        state.sleepers.pop();
-                        continue;
-                    }
+        while let Some(entry) = state.sleepers.peek() {
+            if entry.state.cancelled.load(AtomicOrdering::Acquire)
+                || entry.state.fired.load(AtomicOrdering::Acquire)
+            {
+                state.sleepers.pop();
+                continue;
+            }
 
-                    if entry.deadline > now {
-                        break;
-                    }
+            if entry.deadline > now {
+                break;
+            }
 
-                    let entry = state
-                        .sleepers
-                        .pop()
-                        .expect("timer heap peek succeeded but pop failed");
-                    queue_changed = true;
-                    ready.push(entry.state);
-                }
+            let entry = state
+                .sleepers
+                .pop()
+                .expect("timer heap peek succeeded but pop failed");
+            ready.push(entry.state);
+        }
 
-                next_live_deadline(&mut state)
-            })
-        };
+        let next_deadline = next_live_deadline(state);
 
         for state in ready.iter() {
             state.fire();
         }
 
-        let published_deadline = next_deadline.map_or(u64::MAX, |deadline| deadline.ticks());
-        self.published_deadline
-            .store(published_deadline, AtomicOrdering::Release);
-
-        match next_deadline {
-            Some(deadline) => self.cpu.set_deadline(deadline),
-            None if disarm_when_empty => self.cpu.set_deadline(Instant::new(u64::MAX)),
-            None if queue_changed => self.cpu.set_deadline(Instant::new(u64::MAX)),
-            None => {}
-        }
-
+        self.commit_deadline(next_deadline, now);
         ready.len()
+    }
+
+    pub fn handle_interrupt(&self) -> usize {
+        self.shared
+            .published_deadline
+            .store(u64::MAX, AtomicOrdering::Release);
+        self.cpu.set_deadline(Instant::new(u64::MAX));
+        0
     }
 
     fn enqueue(&self, state: Arc<SleepState>) {
         let deadline = state.deadline;
-        let id = self.next_id.fetch_add(1, AtomicOrdering::AcqRel);
+        let id = self.shared.next_id.fetch_add(1, AtomicOrdering::AcqRel);
         let entry = TimerEntry {
             deadline,
             id,
             state,
         };
 
-        match self.inbox.push(entry) {
+        match self.shared.inbox.push(entry) {
             Ok(()) => self.publish_deadline(deadline),
             Err(PushError::Full(_)) => unreachable!("unbounded timer inbox reported full"),
             Err(PushError::Closed(_)) => panic!("timer inbox was closed unexpectedly"),
         }
     }
 
-    fn drain_inbox(&self, state: &mut TimerState) -> bool {
-        let mut drained = false;
-
+    fn drain_inbox(&self, state: &mut TimerState) {
         loop {
-            match self.inbox.pop() {
-                Ok(entry) => {
-                    state.sleepers.push(entry);
-                    drained = true;
-                }
-                Err(PopError::Empty | PopError::Closed) => return drained,
+            match self.shared.inbox.pop() {
+                Ok(entry) => state.sleepers.push(entry),
+                Err(PopError::Empty | PopError::Closed) => return,
             }
         }
     }
@@ -181,12 +168,12 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
         let deadline = deadline.ticks();
 
         loop {
-            let published = self.published_deadline.load(AtomicOrdering::Acquire);
+            let published = self.shared.published_deadline.load(AtomicOrdering::Acquire);
             if deadline >= published {
                 return;
             }
 
-            match self.published_deadline.compare_exchange_weak(
+            match self.shared.published_deadline.compare_exchange_weak(
                 published,
                 deadline,
                 AtomicOrdering::AcqRel,
@@ -199,6 +186,42 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
                 Err(_) => continue,
             }
         }
+    }
+
+    fn commit_deadline(&self, deadline: Option<Instant>, now: Instant) {
+        let candidate = deadline.map_or(u64::MAX, |deadline| deadline.ticks());
+        let now = now.ticks();
+
+        loop {
+            let published = self.shared.published_deadline.load(AtomicOrdering::Acquire);
+            if published == candidate {
+                return;
+            }
+
+            if published > now && candidate > published {
+                return;
+            }
+
+            match self.shared.published_deadline.compare_exchange_weak(
+                published,
+                candidate,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.cpu.set_deadline(Instant::new(candidate));
+                    return;
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    fn state_mut(&self) -> &mut TimerState {
+        // SAFETY: the timer heap is owned by the kernel event loop on this
+        // processor. Sleep futures only enqueue through the lock-free inbox, and
+        // interrupt handlers only disarm the hardware timer.
+        unsafe { &mut *self.shared.state.get() }
     }
 }
 
@@ -294,3 +317,6 @@ fn duration_to_ticks(duration: Duration, frequency: u64) -> u64 {
 
     u64::try_from(ticks).expect("timer duration does not fit into u64 ticks")
 }
+
+unsafe impl Send for TimerShared {}
+unsafe impl Sync for TimerShared {}

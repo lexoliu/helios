@@ -1,31 +1,26 @@
 use core::ptr::NonNull;
 
 use helios_hal::fs::BlockDeviceRights;
-use helios_hal::io::{IoError, IoResult};
-use virtio_drivers::Hal;
-use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
-use virtio_drivers::transport::{DeviceType, Transport};
+use helios_hal::io::IoResult;
 
 use crate::block::{VirtioBlockDevice, VirtioBlockResource};
-use crate::error::map_mmio_error;
+use crate::bus::{IdentityDmaPool, MmioBus};
+use crate::transport::VirtioMmioTransport;
 
-pub type VirtioMmioBlockDevice<H> = VirtioBlockResource<H, MmioTransport<'static>>;
+pub type VirtioMmioBlockDevice = VirtioBlockResource<VirtioMmioTransport<MmioBus>>;
 
 /// Builds a VirtIO block resource from a permanently mapped MMIO header.
 ///
-/// The MMIO region must remain valid for the lifetime of the device, which is
-/// why this constructor requires the caller to uphold the `'static` mapping
-/// invariant.
-pub unsafe fn block_from_mmio<H: Hal>(
-    header: NonNull<VirtIOHeader>,
+/// The current backend assumes identity-mapped DMA addresses, which matches
+/// the bare-metal no-MMU configuration Helios uses today. A future bus-backed
+/// driver runtime can swap in a different `DmaPool` without changing the block
+/// driver layer.
+pub unsafe fn block_from_mmio(
+    header: NonNull<u8>,
     mmio_size: usize,
     rights: BlockDeviceRights,
-) -> IoResult<VirtioMmioBlockDevice<H>> {
-    let transport = unsafe { MmioTransport::new(header, mmio_size) }.map_err(map_mmio_error)?;
-
-    if transport.device_type() != DeviceType::Block {
-        return Err(IoError::Unsupported);
-    }
-
+) -> IoResult<VirtioMmioBlockDevice> {
+    let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
+    let transport = VirtioMmioTransport::new(bus)?;
     VirtioBlockDevice::new_resource(transport, rights)
 }
