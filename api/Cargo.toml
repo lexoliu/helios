@@ -4,5 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-channel = "2.5.0"
+futures-io = "0.3.31"
+futures-lite = "2.6.1"
 helios-api-macro = { path = "../api-macro" }
 wit-bindgen = { workspace = true, features = ["async", "macros", "realloc"] }

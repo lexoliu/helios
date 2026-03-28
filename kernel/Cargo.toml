@@ -29,6 +29,7 @@ wasm-encoder = "0.245.0"
 wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["all-arch", "component-model", "component-model-async", "cranelift", "runtime", "std"] }
 walkdir = "2.5.0"
 wit-component = "0.245.0"
+wasmparser = "0.245.0"
 
 [target.'cfg(all(target_os = "none", target_arch = "riscv64"))'.dependencies]
 wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["riscv64", "cranelift", "runtime"] }

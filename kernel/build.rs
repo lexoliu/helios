@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use walkdir::WalkDir;
+use wasmparser::Parser;
 use wasmtime::{Config, Engine};
 use wit_component::ComponentEncoder;
 
@@ -108,7 +109,7 @@ fn build_default_init_component(out_dir: &Path) -> PathBuf {
         .arg("--manifest-path")
         .arg(manifest_path)
         .arg("--target")
-        .arg("wasm32-unknown-unknown")
+        .arg("wasm32-wasip2")
         .arg("--target-dir")
         .arg(&target_dir);
     let status = command
@@ -126,7 +127,7 @@ fn build_default_init_component(out_dir: &Path) -> PathBuf {
         other => other,
     };
     let core_module_path = target_dir
-        .join("wasm32-unknown-unknown")
+        .join("wasm32-wasip2")
         .join(profile_dir)
         .join("helios_init.wasm");
     let core_module_path = canonicalize_file(&core_module_path, "generated init core module");
@@ -172,6 +173,9 @@ fn precompile_component(path: &Path, target: &str) -> Vec<u8> {
 fn encode_component(path: &Path) -> Vec<u8> {
     let wasm =
         fs::read(path).unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    if Parser::is_component(&wasm) {
+        return wasm;
+    }
     ComponentEncoder::default()
         .module(&wasm)
         .unwrap_or_else(|error| panic!("failed to load core module {}: {error}", path.display()))

@@ -3,7 +3,7 @@ use std::thread;
 
 use helios_kernel::{EmbeddedInit, Kernel, embedded_init};
 use thiserror::Error;
-use wasmtime::component::{Component, Linker, ResourceTable};
+use wasmtime::component::{Component, HasData, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::p3::bindings::Command;
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -11,6 +11,7 @@ use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, W
 use crate::bootfs_mount::{MountError, MountedBootFs};
 use crate::config::HostedConfig;
 use crate::cpu::HostedCpu;
+use crate::init_bindings::bindings::SyncHost;
 
 const GUEST_ROOT_PATH: &str = "/";
 
@@ -57,6 +58,9 @@ async fn run_init(init: EmbeddedInit, config: HostedConfig) -> Result<i32, InitE
     let store_data = create_store_data(init, mounted_bootfs, &config)?;
 
     let mut linker = Linker::<StoreData>::new(&engine);
+    SyncHost::add_to_linker::<_, StoreData>(&mut linker, |state| state)
+        .map_err(InitError::LinkHelios)?;
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(InitError::LinkWasiPreview2)?;
     wasmtime_wasi::p3::add_to_linker(&mut linker).map_err(InitError::LinkWasi)?;
 
     let mut store = Store::new(&engine, store_data);
@@ -122,9 +126,9 @@ fn build_argv(init: EmbeddedInit, config: &HostedConfig) -> Vec<String> {
     argv
 }
 
-struct StoreData {
+pub(crate) struct StoreData {
     wasi: WasiCtx,
-    table: ResourceTable,
+    pub(crate) table: ResourceTable,
     // Keep the temporary root alive for the entire lifetime of the store.
     _mounted_bootfs: MountedBootFs,
 }
@@ -136,6 +140,10 @@ impl WasiView for StoreData {
             table: &mut self.table,
         }
     }
+}
+
+impl HasData for StoreData {
+    type Data<'a> = &'a mut Self;
 }
 
 #[derive(Debug, Error)]
@@ -150,6 +158,10 @@ enum InitError {
     MountBootFs(MountError),
     #[error("failed to expose bootfs as a WASI preopen: {0}")]
     CreatePreopen(wasmtime::Error),
+    #[error("failed to add Helios host bindings: {0}")]
+    LinkHelios(wasmtime::Error),
+    #[error("failed to add WASI Preview 2 host bindings: {0}")]
+    LinkWasiPreview2(wasmtime::Error),
     #[error("failed to add WASI Preview 3 host bindings: {0}")]
     LinkWasi(wasmtime::Error),
     #[error("failed to instantiate init component: {0}")]
