@@ -4,12 +4,19 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+arrayvec = { version = "0.7.6", default-features = false }
 critical-section = { version = "1.2.0", features = ["restore-state-bool"] }
 fdt = { version = "0.1.5", default-features = false }
+futures = { version = "0.3.31", default-features = false, features = ["alloc"] }
+ns16550a = "0.5.0"
 riscv = "0.16.0"
 riscv-rt = { version = "0.17.1", features = ["s-mode"] }
 sbi-rt = { version = "0.0.3", features = ["legacy"]}
+spin = { version = "0.9.8", default-features = false, features = ["mutex", "spin_mutex"] }
 trapframe = { version = "0.10.1", default-features = false }
 helios-hal.workspace = true
 helios-kernel.workspace = true
 tracing.workspace = true
+thiserror = { version = "2.0.17", default-features = false }
+wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["async", "component-model", "component-model-async", "cranelift", "riscv64", "runtime"] }
+wasmtime-wasi-io = { path = "../../wasmtime/crates/wasi-io", default-features = false }

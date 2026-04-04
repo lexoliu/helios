@@ -1,0 +1,22 @@
+[package]
+name = "helios-shell-protocol"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+guest = ["dep:helios-api"]
+
+[dependencies]
+anyhow = "1.0.100"
+bytes = "1.10.1"
+futures-core = "0.3.31"
+futures-io = "0.3.31"
+futures-lite = "2.6.1"
+helios-api = { workspace = true, optional = true }
+tokio = { version = "1.48.0", features = ["io-util", "sync"] }
+tokio-util = { version = "0.7.16", features = ["compat"] }
+wit-bindgen-wrpc = "0.10.0"
+wrpc-transport = { version = "0.28.4", default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1.48.0", features = ["io-util"] }

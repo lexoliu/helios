@@ -23,7 +23,3 @@ interface sync {
   /// Held while the corresponding rwlock is write-locked.
   resource raw-rw-lock-write-guard {}
 }
-
-world sync-host {
-  import sync;
-}

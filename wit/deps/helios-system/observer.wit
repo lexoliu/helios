@@ -1,6 +1,0 @@
-package helios:system@0.1.0;
-
-world observer {
-  import tracing;
-  import stats;
-}

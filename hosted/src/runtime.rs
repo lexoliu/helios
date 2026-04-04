@@ -13,6 +13,7 @@ use crate::config::HostedConfig;
 use crate::console::HostedConsole;
 use crate::cpu::HostedCpu;
 use crate::init_program;
+use crate::observer_buffer::{ObserverBuffer, SharedObserverBuffer};
 
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
@@ -25,6 +26,7 @@ pub(crate) struct HostedMachine {
     processor_count: usize,
     bootstrap_processor: ProcessorId,
     started_at: StdInstant,
+    observer: SharedObserverBuffer,
     heap: HeapReservation,
     slots: Box<[ProcessorSlot]>,
     timer_tx: Sender<TimerCommand>,
@@ -88,10 +90,12 @@ impl HostedRuntime {
 impl HostedMachine {
     fn new(config: &HostedConfig) -> Arc<Self> {
         let (timer_tx, timer_rx) = crossbeam_channel::unbounded();
+        let started_at = StdInstant::now();
         let machine = Arc::new(Self {
             processor_count: config.processor_count(),
             bootstrap_processor: config.bootstrap_processor(),
-            started_at: StdInstant::now(),
+            observer: ObserverBuffer::new(started_at),
+            started_at,
             heap: HeapReservation::new(config.heap_bytes()),
             slots: (0..config.processor_count())
                 .map(|_| ProcessorSlot::new())
@@ -164,6 +168,10 @@ impl HostedMachine {
             .expect("hosted monotonic clock does not fit into u64 nanoseconds")
     }
 
+    pub(crate) fn observer(&self) -> SharedObserverBuffer {
+        self.observer.clone()
+    }
+
     fn slot(&self, processor: ProcessorId) -> &ProcessorSlot {
         self.slots
             .get(processor.id() as usize)
@@ -222,12 +230,13 @@ fn spawn_processor_thread(
             // processors online with the same start primitive it uses on hardware.
             thread::park();
 
-            let console = HostedConsole::new();
+            let console = HostedConsole::new(machine.observer());
             let cpu = HostedCpu::new(processor, machine.clone());
             let memory_regions = machine.bootstrap_memory_regions(processor);
             let kernel = helios_kernel::init(Platform::new(console, memory_regions, cpu));
             if processor == machine.bootstrap_processor() {
-                init_program::spawn(&kernel, &config);
+                init_program::spawn_init(&kernel, &config, machine.observer());
+                init_program::spawn_debugger(&kernel, &config, machine.observer());
             }
             kernel.run();
         })

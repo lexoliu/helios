@@ -8,13 +8,12 @@ use quote::quote;
 use syn::parse::{Parse, ParseStream};
 use syn::{LitStr, Result, parse_macro_input};
 use walkdir::WalkDir;
-use wasmtime::{Config, Engine};
 
-struct AotMacroInput {
+struct WasmMacroInput {
     wasm_path: LitStr,
 }
 
-impl Parse for AotMacroInput {
+impl Parse for WasmMacroInput {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let wasm_path = input.parse()?;
         Ok(Self { wasm_path })
@@ -34,10 +33,10 @@ impl Parse for BootFsMacroInput {
 }
 
 #[proc_macro]
-pub fn aot_wasm(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as AotMacroInput);
-    expand_aot_wasm(input)
-        .unwrap_or_else(|error| panic!("failed to AOT compile wasm for embedding: {error}"))
+pub fn embed_wasm(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as WasmMacroInput);
+    expand_embed_wasm(input)
+        .unwrap_or_else(|error| panic!("failed to embed wasm for JIT loading: {error}"))
 }
 
 #[proc_macro]
@@ -46,37 +45,23 @@ pub fn bootfs(input: TokenStream) -> TokenStream {
     expand_bootfs(input).unwrap_or_else(|error| panic!("failed to embed bootfs directory: {error}"))
 }
 
-fn expand_aot_wasm(input: AotMacroInput) -> std::result::Result<TokenStream, String> {
+fn expand_embed_wasm(input: WasmMacroInput) -> std::result::Result<TokenStream, String> {
     let wasm_path = resolve_input_path(&input.wasm_path)?;
     let wasm_path = fs::canonicalize(&wasm_path)
         .map_err(|error| format!("failed to resolve {}: {error}", wasm_path.display()))?;
     let wasm = wat::parse_file(&wasm_path)
         .map_err(|error| format!("failed to parse {}: {error}", wasm_path.display()))?;
     let span = input.wasm_path.span();
-    let target = env::var("HELIOS_BUILD_TARGET")
-        .or_else(|_| env::var("TARGET"))
-        .map_err(|_| "target triple is missing; set HELIOS_BUILD_TARGET or TARGET".to_owned())?;
-
-    let mut config = Config::new();
-    config
-        .target(&target)
-        .map_err(|error| format!("invalid target {target:?}: {error}"))?;
-    let engine = Engine::new(&config)
-        .map_err(|error| format!("failed to create wasmtime engine for {target}: {error}"))?;
-    let artifact = engine
-        .precompile_module(&wasm)
-        .map_err(|error| format!("failed to precompile {}: {error}", wasm_path.display()))?;
 
     let name = wasm_path
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| format!("{} has no valid UTF-8 file name", wasm_path.display()))?;
     let name = LitStr::new(name, span);
-    let target = LitStr::new(&target, span);
-    let artifact = Literal::byte_string(&artifact);
+    let bytes = Literal::byte_string(&wasm);
 
     Ok(quote! {
-        ::helios_kernel::EmbeddedProgram::new(#name, #target, #artifact)
+        ::helios_kernel::EmbeddedProgram::new(#name, #bytes)
     }
     .into())
 }

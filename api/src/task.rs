@@ -1,5 +1,6 @@
 //! Async task utilities modeled after `async_std::task`.
 
+use std::future::Future;
 use std::time::Duration;
 
 use crate::bindings::wasi::clocks::monotonic_clock;
@@ -12,6 +13,11 @@ pub async fn sleep(duration: Duration) {
 /// Yields execution back to the host scheduler once.
 pub async fn yield_now() {
     monotonic_clock::wait_until(monotonic_clock::now()).await;
+}
+
+/// Spawns `future` to run concurrently within the current component task.
+pub fn spawn(future: impl Future<Output = ()> + 'static) {
+    crate::wit_bindgen::spawn(future);
 }
 
 fn duration_to_nanos(duration: Duration) -> u64 {

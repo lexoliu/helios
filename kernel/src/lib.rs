@@ -6,6 +6,7 @@ extern crate std;
 mod bootfs;
 mod compute_pool;
 mod embedded_component;
+mod embedded_debugger;
 mod embedded_init;
 mod embedded_program;
 mod executor;
@@ -21,6 +22,7 @@ pub use bootfs::{
 };
 pub use compute_pool::{ComputePool, ComputePriority, SpawnError as ComputeSpawnError};
 pub use embedded_component::EmbeddedComponent;
+pub use embedded_debugger::{EmbeddedDebugger, embedded_debugger};
 pub use embedded_init::{EmbeddedInit, embedded_init};
 pub use embedded_program::EmbeddedProgram;
 pub use executor::{JoinHandle, LocalJoinHandle, Spawner};
@@ -151,7 +153,11 @@ where
     let current_processor = cpu.current_processor();
 
     if current_processor == cpu.bootstrap_processor() {
-        bootstrap_init(console, memory_regions, &cpu);
+        match BOOT_STATE.load(Ordering::Acquire) {
+            BOOT_UNINITIALIZED => bootstrap_init(console, memory_regions, &cpu),
+            BOOT_INITIALIZING => finish_bootstrap(console, &cpu),
+            state => panic!("bootstrap processor observed invalid boot state {state}"),
+        }
     } else {
         wait_for_bootstrap(&cpu);
     }
@@ -184,6 +190,21 @@ where
     }
 }
 
+pub fn prime_bootstrap_allocator<Regions>(memory_regions: Regions)
+where
+    Regions: IntoIterator<Item = MemoryRegion>,
+{
+    match BOOT_STATE.compare_exchange(
+        BOOT_UNINITIALIZED,
+        BOOT_INITIALIZING,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => init_allocator(memory_regions),
+        Err(state) => panic!("bootstrap allocator observed invalid boot state {state}"),
+    }
+}
+
 fn bootstrap_init<Console, CpuImpl, Regions>(
     console: Console,
     memory_regions: Regions,
@@ -193,17 +214,15 @@ fn bootstrap_init<Console, CpuImpl, Regions>(
     CpuImpl: Cpu,
     Regions: IntoIterator<Item = MemoryRegion>,
 {
-    match BOOT_STATE.compare_exchange(
-        BOOT_UNINITIALIZED,
-        BOOT_INITIALIZING,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    ) {
-        Ok(_) => {}
-        Err(state) => panic!("bootstrap processor observed invalid boot state {state}"),
-    }
+    prime_bootstrap_allocator(memory_regions);
+    finish_bootstrap(console, cpu);
+}
 
-    init_allocator(memory_regions);
+fn finish_bootstrap<Console, CpuImpl>(console: Console, cpu: &CpuImpl)
+where
+    Console: core::fmt::Write + Send + 'static,
+    CpuImpl: Cpu,
+{
     log::init_logger(console);
     tracing::info!(
         "Kernel initialized on bootstrap processor={}",

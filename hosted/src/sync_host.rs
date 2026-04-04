@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use helios_kernel::{OwnedRawMutexLease, OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease};
-use wasmtime::component::{Accessor, Resource};
+use wasmtime::component::{Accessor, HasSelf, Resource};
 
-use crate::init_bindings::bindings;
 use crate::init_program::StoreData;
+use crate::program_bindings::bindings;
 
 pub struct HostedRawMutex {
     inner: Arc<helios_kernel::RawMutex>,
@@ -29,19 +29,19 @@ pub struct HostedRawRwLockWriteGuard {
 impl bindings::helios::system::sync::Host for StoreData {}
 
 impl bindings::helios::system::sync::HostRawMutex for StoreData {
-    fn new(&mut self) -> wasmtime::Result<Resource<HostedRawMutex>> {
+    async fn new(&mut self) -> wasmtime::Result<Resource<HostedRawMutex>> {
         Ok(self.table.push(HostedRawMutex {
             inner: Arc::new(helios_kernel::RawMutex::new()),
         })?)
     }
 
-    fn drop(&mut self, resource: Resource<HostedRawMutex>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, resource: Resource<HostedRawMutex>) -> wasmtime::Result<()> {
         let _ = self.table.delete(resource)?;
         Ok(())
     }
 }
 
-impl bindings::helios::system::sync::HostRawMutexWithStore for StoreData {
+impl bindings::helios::system::sync::HostRawMutexWithStore for HasSelf<StoreData> {
     async fn lock<T: 'static>(
         accessor: &Accessor<T, Self>,
         resource: Resource<HostedRawMutex>,
@@ -60,40 +60,43 @@ impl bindings::helios::system::sync::HostRawMutexWithStore for StoreData {
 }
 
 impl bindings::helios::system::sync::HostRawMutexGuard for StoreData {
-    fn drop(&mut self, resource: Resource<HostedRawMutexGuard>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, resource: Resource<HostedRawMutexGuard>) -> wasmtime::Result<()> {
         let _ = self.table.delete(resource)?;
         Ok(())
     }
 }
 
 impl bindings::helios::system::sync::HostRawRwLock for StoreData {
-    fn new(&mut self) -> wasmtime::Result<Resource<HostedRawRwLock>> {
+    async fn new(&mut self) -> wasmtime::Result<Resource<HostedRawRwLock>> {
         Ok(self.table.push(HostedRawRwLock {
             inner: Arc::new(helios_kernel::RawRwLock::new()),
         })?)
     }
 
-    fn drop(&mut self, resource: Resource<HostedRawRwLock>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, resource: Resource<HostedRawRwLock>) -> wasmtime::Result<()> {
         let _ = self.table.delete(resource)?;
         Ok(())
     }
 }
 
 impl bindings::helios::system::sync::HostRawRwLockReadGuard for StoreData {
-    fn drop(&mut self, resource: Resource<HostedRawRwLockReadGuard>) -> wasmtime::Result<()> {
+    async fn drop(&mut self, resource: Resource<HostedRawRwLockReadGuard>) -> wasmtime::Result<()> {
         let _ = self.table.delete(resource)?;
         Ok(())
     }
 }
 
 impl bindings::helios::system::sync::HostRawRwLockWriteGuard for StoreData {
-    fn drop(&mut self, resource: Resource<HostedRawRwLockWriteGuard>) -> wasmtime::Result<()> {
+    async fn drop(
+        &mut self,
+        resource: Resource<HostedRawRwLockWriteGuard>,
+    ) -> wasmtime::Result<()> {
         let _ = self.table.delete(resource)?;
         Ok(())
     }
 }
 
-impl bindings::helios::system::sync::HostRawRwLockWithStore for StoreData {
+impl bindings::helios::system::sync::HostRawRwLockWithStore for HasSelf<StoreData> {
     async fn read<T: 'static>(
         accessor: &Accessor<T, Self>,
         resource: Resource<HostedRawRwLock>,
