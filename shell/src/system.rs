@@ -1,10 +1,8 @@
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::time::Duration;
-use std::time::Instant;
 
 use anyhow::{Context as _, Result};
-use async_io::Timer;
 use helios_shell_protocol::system::{stats, tracing};
 
 use crate::runtime;
@@ -12,82 +10,28 @@ use crate::serial::RpcClient;
 
 const INITIAL_REMOTE_TIMEOUT: Duration = Duration::from_secs(180);
 
-pub struct StatsPane {
+pub struct StatsConfig {
     pub period_ms: u64,
-    pub last_rendered: String,
-    pub last_updated: Option<Instant>,
 }
 
-pub struct TracingPane {
+pub struct TracingConfig {
     pub limit: u32,
     pub min_level: Option<tracing::Level>,
     pub target_prefixes: Vec<String>,
-    pub last_rendered: String,
-    pub last_updated: Option<Instant>,
 }
 
-impl StatsPane {
+impl StatsConfig {
     pub fn new() -> Self {
-        Self {
-            period_ms: 1_000,
-            last_rendered: "waiting for first stats sample".to_owned(),
-            last_updated: None,
-        }
-    }
-
-    pub async fn refresh(&mut self, client: &mut RpcClient) -> Result<()> {
-        let sample = runtime::timeout(INITIAL_REMOTE_TIMEOUT, stats::snapshot(client))
-            .await
-            .context("timed out waiting for remote stats snapshot")?
-            .context("failed to fetch remote stats snapshot")?;
-        self.last_rendered = render_sample(&sample)?;
-        self.last_updated = Some(Instant::now());
-        Ok(())
+        Self { period_ms: 1_000 }
     }
 }
 
-pub async fn run_stats(mut client: RpcClient, period_ms: u64) -> Result<()> {
-    let mut stdout = std::io::stdout();
-
-    loop {
-        let sample = runtime::timeout(INITIAL_REMOTE_TIMEOUT, stats::snapshot(&mut client))
-            .await
-            .context("timed out waiting for remote stats snapshot")?
-            .context("failed to fetch remote stats snapshot")?;
-        stdout.write_all(render_sample(&sample)?.as_bytes())?;
-        stdout.write_all(b"\n")?;
-        stdout.flush()?;
-        Timer::after(Duration::from_millis(period_ms)).await;
-    }
-}
-
-pub async fn run_tracing(
-    mut client: RpcClient,
-    limit: u32,
-    min_level: Option<&str>,
-    target_prefixes: Vec<String>,
-) -> Result<()> {
-    let mut pane = TracingPane::new();
-    pane.limit = limit;
-    pane.min_level = match min_level {
-        Some(level) => parse_level(level)?,
-        None => pane.min_level,
-    };
-    pane.target_prefixes = target_prefixes;
-    pane.refresh(&mut client).await?;
-    std::io::stdout().write_all(pane.last_rendered.as_bytes())?;
-    std::io::stdout().write_all(b"\n")?;
-    Ok(())
-}
-
-impl TracingPane {
+impl TracingConfig {
     pub fn new() -> Self {
         Self {
             limit: 64,
             min_level: Some(tracing::Level::Info),
             target_prefixes: Vec::new(),
-            last_rendered: "waiting for tracing history".to_owned(),
-            last_updated: None,
         }
     }
 
@@ -97,19 +41,46 @@ impl TracingPane {
             target_prefixes: self.target_prefixes.clone(),
         }
     }
+}
 
-    pub async fn refresh(&mut self, client: &mut RpcClient) -> Result<()> {
-        let events = runtime::timeout(
-            INITIAL_REMOTE_TIMEOUT,
-            tracing::recent(client, &self.filter(), self.limit),
-        )
+pub async fn fetch_stats(client: &mut RpcClient) -> Result<stats::Sample> {
+    runtime::timeout(INITIAL_REMOTE_TIMEOUT, stats::snapshot(client))
         .await
-        .context("timed out waiting for remote tracing events")?
-        .context("failed to fetch remote tracing events")?;
-        self.last_rendered = render_events(&events)?;
-        self.last_updated = Some(Instant::now());
-        Ok(())
-    }
+        .context("timed out waiting for remote stats snapshot")?
+        .context("failed to fetch remote stats snapshot")
+}
+
+pub async fn fetch_tracing(
+    client: &mut RpcClient,
+    config: &TracingConfig,
+) -> Result<Vec<tracing::Event>> {
+    runtime::timeout(
+        INITIAL_REMOTE_TIMEOUT,
+        tracing::recent(client, &config.filter(), config.limit),
+    )
+    .await
+    .context("timed out waiting for remote tracing events")?
+    .context("failed to fetch remote tracing events")
+}
+
+pub async fn run_tracing(
+    mut client: RpcClient,
+    limit: u32,
+    min_level: Option<&str>,
+    target_prefixes: Vec<String>,
+) -> Result<()> {
+    let mut config = TracingConfig::new();
+    config.limit = limit;
+    config.min_level = match min_level {
+        Some(level) => parse_level(level)?,
+        None => config.min_level,
+    };
+    config.target_prefixes = target_prefixes;
+
+    let events = fetch_tracing(&mut client, &config).await?;
+    std::io::stdout().write_all(render_tracing_events(&events)?.as_bytes())?;
+    std::io::stdout().write_all(b"\n")?;
+    Ok(())
 }
 
 pub fn parse_level(value: &str) -> Result<Option<tracing::Level>> {
@@ -135,7 +106,7 @@ pub fn format_targets(prefixes: &[String]) -> String {
     }
 }
 
-fn render_sample(sample: &stats::Sample) -> Result<String> {
+pub fn render_stats_sample(sample: &stats::Sample) -> Result<String> {
     let mut text = String::new();
     writeln!(&mut text, "timestamp: {}", sample.timestamp)?;
     writeln!(&mut text, "uptime: {}", sample.uptime)?;
@@ -161,7 +132,7 @@ fn render_sample(sample: &stats::Sample) -> Result<String> {
     Ok(text)
 }
 
-fn render_events(events: &[tracing::Event]) -> Result<String> {
+pub fn render_tracing_events(events: &[tracing::Event]) -> Result<String> {
     if events.is_empty() {
         return Ok("no tracing events matched the current filter".to_owned());
     }

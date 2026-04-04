@@ -2,13 +2,9 @@ stats command help
 
 Commands:
   stats
-      Fetch one stats snapshot immediately.
+      Open the live stats view.
   stats period <ms>
-      Set the refresh cadence used when stats is the current view.
-  use stats
-      Make stats the current view.
-  refresh
-      If stats is the current view, fetch another stats snapshot.
+      Set the refresh cadence used by the live stats view.
 
 What you get:
   timestamp
@@ -20,5 +16,11 @@ What you get:
 Examples:
   stats
   stats period 1000
-  use stats
-  refresh
+
+Controls inside the live view:
+  q
+      Return to the shell.
+  Esc
+      Return to the shell.
+  Ctrl-C
+      Return to the shell.

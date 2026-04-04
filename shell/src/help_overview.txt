@@ -5,27 +5,21 @@ Core:
   help stats
   help tracing
   help rpc
-  refresh
-  quit
   exit
 
-Views:
+Interactive:
   stats
-      Fetch one stats snapshot and make stats the current view.
+      Open the live stats view. Press `q` to return to the shell.
   tracing
-      Fetch recent tracing events and make tracing the current view.
-  use stats
-  use tracing
-  use rpc
-      Change the current view used by `refresh`.
+      Fetch one tracing snapshot with the current filters.
 
 Stats:
   stats period <ms>
-      Set the refresh cadence used when stats is the current view.
+      Set the refresh cadence used by the live stats view.
 
 Tracing:
   tracing limit <n>
-      Limit the number of events fetched by `tracing` and `refresh`.
+      Limit the number of events fetched by `tracing`.
   tracing level <none|error|warn|info|debug|trace>
       Set the minimum tracing level filter.
   tracing targets <prefix-a,prefix-b>
@@ -49,8 +43,6 @@ Examples:
   rpc call
 
 Notes:
-  `refresh` repeats the current view:
-    stats view   -> fetch one stats snapshot
-    tracing view -> fetch recent tracing events
-    rpc view     -> repeat the last configured RPC call
-  Use `./qemu-shell -- tui` only when you explicitly want the dashboard.
+  `stats` is the only built-in full-screen view.
+  The shell itself stays line-oriented; only commands that benefit from live updates
+  switch into a temporary TUI.

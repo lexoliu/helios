@@ -9,10 +9,6 @@ Commands:
       Set the request payload as lowercase or uppercase hexadecimal bytes.
   rpc call
       Invoke the configured remote call and print the raw response as hex.
-  use rpc
-      Make rpc the current view.
-  refresh
-      If rpc is the current view, repeat the last configured call.
 
 Examples:
   rpc instance helios:system/stats@0.1.0
