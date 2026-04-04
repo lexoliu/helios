@@ -8,6 +8,8 @@ mod debug_state;
 mod debug_transport;
 mod debugger_bindings;
 mod debugger_program;
+mod debugger_wasi;
+mod debugger_wasi_p2;
 
 use core::arch::{asm, global_asm};
 use core::cell::Cell;

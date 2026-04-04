@@ -21,6 +21,7 @@ use rustyline::validate::{
 use rustyline::{CompletionType, Config, Context as RustyContext, EditMode, Editor, Helper};
 use strsim::normalized_damerau_levenshtein;
 
+use crate::filesystem;
 use crate::rpc::RpcPane;
 use crate::runtime;
 use crate::serial::RpcClient;
@@ -63,7 +64,9 @@ pub fn run(mut client: RpcClient) -> Result<()> {
 
 const PROMPT: &str = "helios> ";
 const LIVE_STATS_PERIOD_MS: u64 = 1_000;
-const ROOT_CANDIDATES: &[&str] = &["help", "clear", "exit", "stats", "tracing", "rpc", "--help"];
+const ROOT_CANDIDATES: &[&str] = &[
+    "help", "clear", "exit", "ls", "rm", "touch", "stats", "tracing", "rpc", "--help",
+];
 const HELP_CANDIDATES: &[&str] = &["overview", "stats", "tracing", "rpc", "--help"];
 const STATS_CANDIDATES: &[&str] = &["--help"];
 const TRACING_CANDIDATES: &[&str] = &["limit", "level", "targets", "--help"];
@@ -126,6 +129,12 @@ enum CliCommand {
     Clear,
     /// Leave the shell.
     Exit,
+    /// List files in the remote debugger filesystem.
+    Ls { path: Option<String> },
+    /// Remove a file or an empty directory from the remote debugger filesystem.
+    Rm { path: String },
+    /// Create a file if it does not exist in the remote debugger filesystem.
+    Touch { path: String },
     /// Open the live stats view.
     Stats,
     /// Fetch tracing events or configure tracing filters.
@@ -177,6 +186,9 @@ enum Command {
     Help(HelpTopic),
     Clear,
     Exit,
+    List(Option<String>),
+    Remove(String),
+    Touch(String),
     ShowStats,
     ShowTracing,
     TracingLimit(u32),
@@ -246,6 +258,12 @@ impl Shell {
             Command::Help(topic) => self.print_block(&render_help(topic))?,
             Command::Clear => self.clear_screen()?,
             Command::Exit => return Ok(true),
+            Command::List(path) => {
+                let output = filesystem::list(client, path.as_deref()).await?;
+                self.print_block(&output)?;
+            }
+            Command::Remove(path) => filesystem::remove(client, &path).await?,
+            Command::Touch(path) => filesystem::touch(client, &path).await?,
             Command::ShowStats => stats_tui::run(client, LIVE_STATS_PERIOD_MS).await?,
             Command::ShowTracing => self.show_tracing(client).await?,
             Command::TracingLimit(limit) => {
@@ -574,6 +592,9 @@ impl CliCommand {
             Self::Help { topic } => Command::Help(topic.unwrap_or(HelpTopic::Overview)),
             Self::Clear => Command::Clear,
             Self::Exit => Command::Exit,
+            Self::Ls { path } => Command::List(path),
+            Self::Rm { path } => Command::Remove(path),
+            Self::Touch { path } => Command::Touch(path),
             Self::Stats => Command::ShowStats,
             Self::Tracing { action } => match action {
                 None => Command::ShowTracing,
@@ -674,6 +695,30 @@ mod tests {
         match parse_line("clear") {
             ParsedLine::Command(Command::Clear) => {}
             _ => panic!("clear command must parse"),
+        }
+    }
+
+    #[test]
+    fn parses_ls_command() {
+        match parse_line("ls /tmp") {
+            ParsedLine::Command(Command::List(Some(path))) => assert_eq!(path, "/tmp"),
+            _ => panic!("ls command must parse"),
+        }
+    }
+
+    #[test]
+    fn parses_rm_command() {
+        match parse_line("rm /tmp/file") {
+            ParsedLine::Command(Command::Remove(path)) => assert_eq!(path, "/tmp/file"),
+            _ => panic!("rm command must parse"),
+        }
+    }
+
+    #[test]
+    fn parses_touch_command() {
+        match parse_line("touch /tmp/file") {
+            ParsedLine::Command(Command::Touch(path)) => assert_eq!(path, "/tmp/file"),
+            _ => panic!("touch command must parse"),
         }
     }
 

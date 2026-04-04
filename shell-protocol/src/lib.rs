@@ -1,3 +1,4 @@
+pub mod debugger;
 mod wire;
 
 pub mod system;

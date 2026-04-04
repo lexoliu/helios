@@ -2,7 +2,6 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::format;
-use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::pin::Pin;
@@ -23,8 +22,8 @@ use wasmtime::{
 };
 use wasmtime_wasi_io::IoView;
 use wasmtime_wasi_io::bytes::Bytes;
-use wasmtime_wasi_io::poll::{Pollable, subscribe};
-use wasmtime_wasi_io::streams::{DynOutputStream, OutputStream, StreamError};
+use wasmtime_wasi_io::poll::Pollable;
+use wasmtime_wasi_io::streams::{OutputStream, StreamError};
 
 use crate::debug_state::{
     RuntimeState, StatsSample, TraceEvent, TraceField, TraceFilter, TraceLevel, TraceValue,
@@ -33,14 +32,6 @@ use crate::debugger_bindings::bindings;
 use crate::{RiscvCpu, try_read_debug_serial_byte, write_debug_serial_bytes};
 
 const WASMTIME_TARGET: &str = "riscv64gc-unknown-none-elf";
-const CLI_ENVIRONMENT_IMPORTS: &[&str] =
-    &["wasi:cli/environment@0.2.0", "wasi:cli/environment@0.2.6"];
-const CLI_EXIT_IMPORTS: &[&str] = &["wasi:cli/exit@0.2.0", "wasi:cli/exit@0.2.6"];
-const CLI_STDERR_IMPORTS: &[&str] = &["wasi:cli/stderr@0.2.4", "wasi:cli/stderr@0.2.6"];
-const MONOTONIC_CLOCK_IMPORTS: &[&str] = &[
-    "wasi:clocks/monotonic-clock@0.2.4",
-    "wasi:clocks/monotonic-clock@0.2.6",
-];
 
 struct RiscvCodeMemory;
 
@@ -62,10 +53,10 @@ impl CustomCodeMemory for RiscvCodeMemory {
 }
 
 pub struct SbiSerialPort;
-struct DebugSerialOutputStream;
-struct DeadlinePollable {
-    cpu: RiscvCpu,
-    deadline_nanos: u64,
+pub(crate) struct DebugSerialOutputStream;
+pub(crate) struct DeadlinePollable {
+    pub(crate) cpu: RiscvCpu,
+    pub(crate) deadline_nanos: u64,
 }
 pub struct SbiRawMutex {
     inner: Arc<RawMutex>,
@@ -137,7 +128,8 @@ fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), Debugge
     tracing::info!("debugger hart: preparing component linker");
     let mut linker = Linker::<StoreData>::new(&engine);
     wasmtime_wasi_io::add_to_linker_async(&mut linker).map_err(DebuggerError::LinkComponent)?;
-    add_wasi_to_linker(&mut linker).map_err(DebuggerError::LinkComponent)?;
+    crate::debugger_wasi_p2::add_to_linker(&mut linker).map_err(DebuggerError::LinkComponent)?;
+    crate::debugger_wasi::add_to_linker(&mut linker).map_err(DebuggerError::LinkComponent)?;
     add_serial_to_linker(&mut linker).map_err(DebuggerError::LinkComponent)?;
     add_sync_to_linker(&mut linker).map_err(DebuggerError::LinkComponent)?;
     add_system_to_linker(&mut linker).map_err(DebuggerError::LinkComponent)?;
@@ -151,6 +143,7 @@ fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), Debugge
             debug_state: cpu.debug_state(),
             cpu,
             debug_port: Some(()),
+            filesystem: crate::debugger_wasi::DebugFileSystem::new(),
         },
     );
     emit_stage_marker("store:ok");
@@ -158,6 +151,7 @@ fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), Debugge
     emit_stage_marker("pre:begin");
     tracing::info!("debugger hart: instantiating embedded debugger component");
     if let Err(error) = linker.instantiate_pre(&component) {
+        emit_error_marker("pre:error", &format!("{error:#}"));
         log_wasmtime_error_chain("debugger hart: instantiate_pre failed", &error);
         return Err(DebuggerError::InstantiateComponent(error));
     }
@@ -166,7 +160,10 @@ fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), Debugge
     let instance = block_on(bindings::Init::instantiate_async(
         &mut store, &component, &linker,
     ))
-    .map_err(DebuggerError::InstantiateComponent)?;
+    .map_err(|error| {
+        emit_error_marker("instantiate:error", &format!("{error:#}"));
+        DebuggerError::InstantiateComponent(error)
+    })?;
     emit_stage_marker("instantiate:ok");
     tracing::info!("debugger hart: entering wasi:cli/run");
     emit_stage_marker("run:begin");
@@ -174,7 +171,10 @@ fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), Debugge
         block_on(store.run_concurrent(async move |accessor| {
             instance.wasi_cli_run().call_run(accessor).await
         }))
-        .map_err(DebuggerError::RunComponent)?;
+        .map_err(|error| {
+            emit_error_marker("run:error", &format!("{error:#}"));
+            DebuggerError::RunComponent(error)
+        })?;
     emit_stage_marker("run:ok");
     tracing::info!("debugger hart: wasi:cli/run returned");
     match result {
@@ -204,90 +204,6 @@ fn build_engine() -> Result<Engine, DebuggerError> {
     config.wasm_component_model(true);
     config.wasm_component_model_async(true);
     Engine::new(&config).map_err(DebuggerError::CreateEngine)
-}
-
-fn add_wasi_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
-    for &name in CLI_ENVIRONMENT_IMPORTS {
-        let mut instance = linker.instance(name)?;
-        instance.func_wrap("get-environment", |_caller, (): ()| {
-            Ok((Vec::<(String, String)>::new(),))
-        })?;
-        instance.func_wrap("get-arguments", |_caller, (): ()| {
-            Ok((Vec::<String>::new(),))
-        })?;
-        instance.func_wrap("initial-cwd", |_caller, (): ()| {
-            Ok((Option::<String>::None,))
-        })?;
-    }
-
-    for &name in CLI_EXIT_IMPORTS {
-        let mut instance = linker.instance(name)?;
-        instance.func_wrap(
-            "exit",
-            |_caller, (status,): (Result<(), ()>,)| -> wasmtime::Result<()> {
-                let message = match status {
-                    Ok(()) => String::from("guest requested wasi exit success"),
-                    Err(()) => String::from("guest requested wasi exit failure"),
-                };
-                Err(wasmtime::Error::msg(message))
-            },
-        )?;
-        instance.func_wrap(
-            "exit-with-code",
-            |_caller, (status_code,): (u8,)| -> wasmtime::Result<()> {
-                Err(wasmtime::Error::msg(format!(
-                    "guest requested wasi exit code {status_code}"
-                )))
-            },
-        )?;
-    }
-
-    for &name in CLI_STDERR_IMPORTS {
-        let mut instance = linker.instance(name)?;
-        instance.func_wrap(
-            "get-stderr",
-            |mut caller: StoreContextMut<'_, StoreData>, (): ()| {
-                let stream: DynOutputStream = Box::new(DebugSerialOutputStream);
-                let resource = caller.data_mut().table.push(stream)?;
-                Ok((resource,))
-            },
-        )?;
-    }
-
-    for &name in MONOTONIC_CLOCK_IMPORTS {
-        let mut instance = linker.instance(name)?;
-        instance.func_wrap("now", |caller: StoreContextMut<'_, StoreData>, (): ()| {
-            Ok((caller.data().now_nanos(),))
-        })?;
-        instance.func_wrap("resolution", |_caller, (): ()| Ok((1_u64,)))?;
-        instance.func_wrap(
-            "subscribe-instant",
-            |mut caller: StoreContextMut<'_, StoreData>, (when,): (u64,)| {
-                let cpu = caller.data().cpu.clone();
-                let resource = caller.data_mut().table.push(DeadlinePollable {
-                    cpu,
-                    deadline_nanos: when,
-                })?;
-                let pollable = subscribe(caller.data_mut().table(), resource)?;
-                Ok((pollable,))
-            },
-        )?;
-        instance.func_wrap(
-            "subscribe-duration",
-            |mut caller: StoreContextMut<'_, StoreData>, (duration,): (u64,)| {
-                let deadline_nanos = caller.data().now_nanos().saturating_add(duration);
-                let cpu = caller.data().cpu.clone();
-                let resource = caller.data_mut().table.push(DeadlinePollable {
-                    cpu,
-                    deadline_nanos,
-                })?;
-                let pollable = subscribe(caller.data_mut().table(), resource)?;
-                Ok((pollable,))
-            },
-        )?;
-    }
-
-    Ok(())
 }
 
 fn add_system_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
@@ -550,15 +466,16 @@ fn add_tracing_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()>
     Ok(())
 }
 
-struct StoreData {
-    table: ResourceTable,
-    cpu: RiscvCpu,
-    debug_state: RuntimeState,
-    debug_port: Option<()>,
+pub(crate) struct StoreData {
+    pub(crate) table: ResourceTable,
+    pub(crate) cpu: RiscvCpu,
+    pub(crate) debug_state: RuntimeState,
+    pub(crate) debug_port: Option<()>,
+    pub(crate) filesystem: crate::debugger_wasi::DebugFileSystem,
 }
 
 impl StoreData {
-    fn now_nanos(&self) -> u64 {
+    pub(crate) fn now_nanos(&self) -> u64 {
         self.debug_state.ticks_to_nanos(self.cpu.now().ticks())
     }
 }
@@ -1036,6 +953,20 @@ fn write_serial(bytes: &[u8]) {
 fn emit_stage_marker(stage: &str) {
     write_debug_serial_bytes(b"\n[KDBG ");
     write_debug_serial_bytes(stage.as_bytes());
+    write_debug_serial_bytes(b"]\n");
+}
+
+fn emit_error_marker(label: &str, message: &str) {
+    write_debug_serial_bytes(b"\n[KDBG ");
+    write_debug_serial_bytes(label.as_bytes());
+    write_debug_serial_bytes(b": ");
+    for byte in message.bytes() {
+        match byte {
+            b'\n' | b'\r' => write_debug_serial_bytes(b" "),
+            b']' => write_debug_serial_bytes(b")"),
+            other => write_debug_serial_bytes(&[other]),
+        }
+    }
     write_debug_serial_bytes(b"]\n");
 }
 
