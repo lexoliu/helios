@@ -106,32 +106,6 @@ pub fn format_targets(prefixes: &[String]) -> String {
     }
 }
 
-pub fn render_stats_sample(sample: &stats::Sample) -> Result<String> {
-    let mut text = String::new();
-    writeln!(&mut text, "timestamp: {}", sample.timestamp)?;
-    writeln!(&mut text, "uptime: {}", sample.uptime)?;
-    writeln!(
-        &mut text,
-        "processors: configured={} online={}",
-        sample.processors.configured, sample.processors.online
-    )?;
-    for processor in &sample.processors.utilization {
-        writeln!(
-            &mut text,
-            "  cpu{} busy={} permille",
-            processor.id, processor.busy
-        )?;
-    }
-    writeln!(
-        &mut text,
-        "memory: total={} available={} pressure={}",
-        sample.memory.total_bytes,
-        sample.memory.available_bytes,
-        memory_pressure_name(sample.memory.pressure),
-    )?;
-    Ok(text)
-}
-
 pub fn render_tracing_events(events: &[tracing::Event]) -> Result<String> {
     if events.is_empty() {
         return Ok("no tracing events matched the current filter".to_owned());
@@ -164,17 +138,6 @@ fn level_name(level: tracing::Level) -> &'static str {
         Level::Info => "INFO",
         Level::Debug => "DEBUG",
         Level::Trace => "TRACE",
-    }
-}
-
-fn memory_pressure_name(pressure: stats::MemoryPressure) -> &'static str {
-    use stats::MemoryPressure;
-
-    match pressure {
-        MemoryPressure::Nominal => "nominal",
-        MemoryPressure::Elevated => "elevated",
-        MemoryPressure::High => "high",
-        MemoryPressure::Critical => "critical",
     }
 }
 
