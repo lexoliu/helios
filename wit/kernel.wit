@@ -8,9 +8,19 @@ world init {
   import helios:system/serial@0.1.0;
 }
 
+world debugger {
+  include wasi:cli/command@0.3.0-rc-2026-03-15;
+  import helios:system/stats@0.1.0;
+  import helios:system/tracing@0.1.0;
+  import helios:system/sync@0.1.0;
+  import helios:system/serial@0.1.0;
+  import helios:system/instances@0.1.0;
+}
+
 world remote-system {
   export helios:system/stats@0.1.0;
   export helios:system/tracing@0.1.0;
   export helios:system/sync@0.1.0;
   export helios:system/serial@0.1.0;
+  export helios:system/instances@0.1.0;
 }

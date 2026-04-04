@@ -8,6 +8,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use helios_hal::Platform;
 use helios_hal::cpu::{Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
+use helios_kernel::InstanceRegistry;
 
 use crate::config::HostedConfig;
 use crate::console::HostedConsole;
@@ -27,6 +28,7 @@ pub(crate) struct HostedMachine {
     bootstrap_processor: ProcessorId,
     started_at: StdInstant,
     observer: SharedObserverBuffer,
+    instance_registry: InstanceRegistry,
     heap: HeapReservation,
     slots: Box<[ProcessorSlot]>,
     timer_tx: Sender<TimerCommand>,
@@ -96,6 +98,7 @@ impl HostedMachine {
             bootstrap_processor: config.bootstrap_processor(),
             observer: ObserverBuffer::new(started_at),
             started_at,
+            instance_registry: InstanceRegistry::new(),
             heap: HeapReservation::new(config.heap_bytes()),
             slots: (0..config.processor_count())
                 .map(|_| ProcessorSlot::new())
@@ -172,6 +175,10 @@ impl HostedMachine {
         self.observer.clone()
     }
 
+    pub(crate) fn instance_registry(&self) -> InstanceRegistry {
+        self.instance_registry.clone()
+    }
+
     fn slot(&self, processor: ProcessorId) -> &ProcessorSlot {
         self.slots
             .get(processor.id() as usize)
@@ -235,8 +242,20 @@ fn spawn_processor_thread(
             let memory_regions = machine.bootstrap_memory_regions(processor);
             let kernel = helios_kernel::init(Platform::new(console, memory_regions, cpu));
             if processor == machine.bootstrap_processor() {
-                init_program::spawn_init(&kernel, &config, machine.observer());
-                init_program::spawn_debugger(&kernel, &config, machine.observer());
+                init_program::spawn_init(
+                    &kernel,
+                    &config,
+                    machine.observer(),
+                    machine.instance_registry(),
+                    machine.started_at,
+                );
+                init_program::spawn_debugger(
+                    &kernel,
+                    &config,
+                    machine.observer(),
+                    machine.instance_registry(),
+                    machine.started_at,
+                );
             }
             kernel.run();
         })

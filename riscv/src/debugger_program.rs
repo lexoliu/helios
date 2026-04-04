@@ -9,8 +9,9 @@ use core::task::{Context, Poll, Waker};
 
 use helios_hal::cpu::Cpu;
 use helios_kernel::{
-    EmbeddedDebugger, OwnedRawMutexLease, OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease,
-    RawMutex, RawRwLock, embedded_debugger, heap_stats,
+    EmbeddedDebugger, InstanceExecutionTransition, InstanceRegistry, OwnedRawMutexLease,
+    OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease, RawMutex, RawRwLock, RegisteredInstance,
+    embedded_debugger, heap_stats,
 };
 use thiserror::Error;
 use wasmtime::component::{
@@ -18,7 +19,8 @@ use wasmtime::component::{
     StreamReader, StreamResult,
 };
 use wasmtime::{
-    Config, CustomCodeMemory, Engine, OptLevel, RegallocAlgorithm, Store, StoreContextMut,
+    CallHook, Config, CustomCodeMemory, Engine, OptLevel, RegallocAlgorithm, ResourceLimiter,
+    Store, StoreContextMut,
 };
 use wasmtime_wasi_io::IoView;
 use wasmtime_wasi_io::bytes::Bytes;
@@ -136,16 +138,27 @@ fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), Debugge
     emit_stage_marker("linker:ok");
 
     emit_stage_marker("store:new");
+    let debug_state = cpu.debug_state();
+    let instance_registry = cpu.instance_registry();
+    let instance =
+        instance_registry.register("debugger", debug_state.uptime_nanos(cpu.now().ticks()));
     let mut store = Store::new(
         &engine,
         StoreData {
             table: ResourceTable::new(),
-            debug_state: cpu.debug_state(),
+            debug_state,
+            instance_registry,
+            instance,
             cpu,
             debug_port: Some(()),
             filesystem: crate::debugger_wasi::DebugFileSystem::new(),
         },
     );
+    store.limiter(|state| state);
+    store.call_hook(|mut caller: StoreContextMut<'_, StoreData>, hook| {
+        caller.data_mut().record_call_hook(hook);
+        Ok(())
+    });
     emit_stage_marker("store:ok");
 
     emit_stage_marker("pre:begin");
@@ -157,7 +170,7 @@ fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), Debugge
     }
     emit_stage_marker("pre:ok");
     emit_stage_marker("instantiate:begin");
-    let instance = block_on(bindings::Init::instantiate_async(
+    let instance = block_on(bindings::Debugger::instantiate_async(
         &mut store, &component, &linker,
     ))
     .map_err(|error| {
@@ -208,6 +221,7 @@ fn build_engine() -> Result<Engine, DebuggerError> {
 
 fn add_system_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
     add_stats_to_linker(linker)?;
+    add_instances_to_linker(linker)?;
     add_tracing_to_linker(linker)?;
     Ok(())
 }
@@ -466,17 +480,70 @@ fn add_tracing_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()>
     Ok(())
 }
 
+fn add_instances_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
+    let mut instance = linker.instance("helios:system/instances@0.1.0")?;
+    instance.func_wrap("snapshot", |caller, (): ()| {
+        Ok((caller
+            .data()
+            .instance_registry
+            .snapshot(caller.data().now_nanos())
+            .into_iter()
+            .map(convert_instance)
+            .collect::<Vec<_>>(),))
+    })?;
+    Ok(())
+}
+
 pub(crate) struct StoreData {
     pub(crate) table: ResourceTable,
     pub(crate) cpu: RiscvCpu,
     pub(crate) debug_state: RuntimeState,
+    pub(crate) instance_registry: InstanceRegistry,
+    pub(crate) instance: RegisteredInstance,
     pub(crate) debug_port: Option<()>,
     pub(crate) filesystem: crate::debugger_wasi::DebugFileSystem,
 }
 
 impl StoreData {
     pub(crate) fn now_nanos(&self) -> u64 {
-        self.debug_state.ticks_to_nanos(self.cpu.now().ticks())
+        self.debug_state.uptime_nanos(self.cpu.now().ticks())
+    }
+
+    pub(crate) fn record_call_hook(&mut self, hook: CallHook) {
+        let transition = match hook {
+            CallHook::CallingWasm | CallHook::ReturningFromHost => {
+                InstanceExecutionTransition::Resume
+            }
+            CallHook::ReturningFromWasm | CallHook::CallingHost => {
+                InstanceExecutionTransition::Pause
+            }
+        };
+        self.instance.transition(transition, self.now_nanos());
+    }
+}
+
+impl ResourceLimiter for StoreData {
+    fn memory_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        let allow = maximum.is_none_or(|maximum| desired <= maximum);
+        if allow {
+            self.instance
+                .set_memory_bytes(u64::try_from(desired).expect("desired memory exceeds u64"));
+        }
+        Ok(allow)
+    }
+
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        Ok(maximum.is_none_or(|maximum| desired <= maximum))
     }
 }
 
@@ -846,6 +913,19 @@ fn convert_sample(sample: StatsSample) -> bindings::helios::system::stats::Sampl
             available_bytes,
             pressure: convert_memory_pressure(total_bytes, available_bytes),
         },
+    }
+}
+
+fn convert_instance(
+    instance: helios_kernel::InstanceSnapshot,
+) -> bindings::helios::system::instances::Instance {
+    bindings::helios::system::instances::Instance {
+        id: instance.id.raw(),
+        name: instance.name,
+        started_at: instance.started_at,
+        uptime: instance.uptime,
+        memory_bytes: instance.memory_bytes,
+        cpu_busy: instance.cpu_busy,
     }
 }
 

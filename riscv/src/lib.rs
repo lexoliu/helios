@@ -144,6 +144,10 @@ impl RiscvCpu {
     pub(crate) fn debug_state(&self) -> debug_state::RuntimeState {
         self.debug_state.clone()
     }
+
+    pub(crate) fn instance_registry(&self) -> helios_kernel::InstanceRegistry {
+        self.debug_state.instance_registry()
+    }
 }
 
 impl Cpu for RiscvCpu {

@@ -7,7 +7,7 @@ autobins = false
 [dependencies]
 anyhow = "1.0.100"
 futures-io = "0.3.31"
-helios-api = { path = "../../api", default-features = false, features = ["serial", "stats", "tracing"] }
+helios-api = { path = "../../api", default-features = false, features = ["instances", "serial", "stats", "tracing"] }
 helios-shell-protocol = { path = "../../shell-protocol", default-features = false, features = ["guest"] }
 
 [lib]

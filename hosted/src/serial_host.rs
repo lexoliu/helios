@@ -12,7 +12,6 @@ use tokio::io::{DuplexStream, ReadHalf, WriteHalf, split};
 use wasmtime::component::{Accessor, HasSelf, Resource};
 
 use crate::init_program::StoreData;
-use crate::program_bindings::bindings;
 
 type IoFuture<'a, T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send + 'a>>;
 
@@ -235,6 +234,7 @@ impl HostedSerialBackend for DuplexSerialBackend {
     }
 }
 
+#[cfg(test)]
 fn is_serial_disconnect(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -246,65 +246,101 @@ fn is_serial_disconnect(error: &io::Error) -> bool {
     )
 }
 
-impl bindings::helios::system::serial::Host for StoreData {
-    async fn debug_port(&mut self) -> wasmtime::Result<Option<Resource<HostedSerialPort>>> {
-        match &self.serial {
-            Some(io) => Ok(Some(self.table.push(HostedSerialPort { io: io.clone() })?)),
-            None => Ok(None),
+fn debug_port_resource(
+    store: &mut StoreData,
+) -> wasmtime::Result<Option<Resource<HostedSerialPort>>> {
+    match &store.serial {
+        Some(io) => Ok(Some(store.table.push(HostedSerialPort { io: io.clone() })?)),
+        None => Ok(None),
+    }
+}
+
+fn serial_rights<T>(
+    table: &mut wasmtime::component::ResourceTable,
+    resource: Resource<T>,
+) -> wasmtime::Result<()>
+where
+    T: 'static,
+{
+    let _ = table.get(&resource)?;
+    Ok(())
+}
+
+fn serial_io(
+    store: &mut StoreData,
+    resource: &Resource<HostedSerialPort>,
+) -> wasmtime::Result<HostedSerialIo> {
+    Ok(store.table.get(resource)?.io.clone())
+}
+
+macro_rules! impl_serial_bindings {
+    ($bindings:ident) => {
+        impl crate::$bindings::bindings::helios::system::serial::Host for StoreData {
+            async fn debug_port(&mut self) -> wasmtime::Result<Option<Resource<HostedSerialPort>>> {
+                debug_port_resource(self)
+            }
         }
-    }
+
+        impl crate::$bindings::bindings::helios::system::serial::HostSerialPort for StoreData {
+            async fn rights(
+                &mut self,
+                resource: Resource<HostedSerialPort>,
+            ) -> wasmtime::Result<crate::$bindings::bindings::helios::system::serial::SerialRights>
+            {
+                serial_rights(&mut self.table, resource)?;
+                Ok(
+                    crate::$bindings::bindings::helios::system::serial::SerialRights::READ
+                        | crate::$bindings::bindings::helios::system::serial::SerialRights::WRITE
+                        | crate::$bindings::bindings::helios::system::serial::SerialRights::FLUSH,
+                )
+            }
+
+            async fn drop(&mut self, resource: Resource<HostedSerialPort>) -> wasmtime::Result<()> {
+                let _ = self.table.delete(resource)?;
+                Ok(())
+            }
+        }
+
+        impl crate::$bindings::bindings::helios::system::serial::HostSerialPortWithStore
+            for HasSelf<StoreData>
+        {
+            async fn read<T: 'static + Send>(
+                accessor: &Accessor<T, Self>,
+                resource: Resource<HostedSerialPort>,
+                max_bytes: u32,
+            ) -> wasmtime::Result<Vec<u8>> {
+                let io = accessor.with(|mut access| {
+                    Ok::<_, wasmtime::Error>(serial_io(access.get(), &resource)?)
+                })?;
+                io.backend.read(max_bytes).await.map_err(Into::into)
+            }
+
+            async fn write<T: 'static + Send>(
+                accessor: &Accessor<T, Self>,
+                resource: Resource<HostedSerialPort>,
+                bytes: Vec<u8>,
+            ) -> wasmtime::Result<()> {
+                let io = accessor.with(|mut access| {
+                    Ok::<_, wasmtime::Error>(serial_io(access.get(), &resource)?)
+                })?;
+                io.backend.write(bytes).await.map_err(Into::into)
+            }
+
+            async fn flush<T: 'static + Send>(
+                accessor: &Accessor<T, Self>,
+                resource: Resource<HostedSerialPort>,
+            ) -> wasmtime::Result<()> {
+                let io = accessor.with(|mut access| {
+                    Ok::<_, wasmtime::Error>(serial_io(access.get(), &resource)?)
+                })?;
+                io.backend.flush().await.map_err(Into::into)
+            }
+        }
+    };
 }
 
-impl bindings::helios::system::serial::HostSerialPort for StoreData {
-    async fn rights(
-        &mut self,
-        resource: Resource<HostedSerialPort>,
-    ) -> wasmtime::Result<bindings::helios::system::serial::SerialRights> {
-        let _ = self.table.get(&resource)?;
-        Ok(bindings::helios::system::serial::SerialRights::READ
-            | bindings::helios::system::serial::SerialRights::WRITE
-            | bindings::helios::system::serial::SerialRights::FLUSH)
-    }
-
-    async fn drop(&mut self, resource: Resource<HostedSerialPort>) -> wasmtime::Result<()> {
-        let _ = self.table.delete(resource)?;
-        Ok(())
-    }
-}
-
-impl bindings::helios::system::serial::HostSerialPortWithStore for HasSelf<StoreData> {
-    async fn read<T: 'static + Send>(
-        accessor: &Accessor<T, Self>,
-        resource: Resource<HostedSerialPort>,
-        max_bytes: u32,
-    ) -> wasmtime::Result<Vec<u8>> {
-        let io = accessor.with(|mut access| {
-            Ok::<_, wasmtime::Error>(access.get().table.get(&resource)?.io.clone())
-        })?;
-        io.backend.read(max_bytes).await.map_err(Into::into)
-    }
-
-    async fn write<T: 'static + Send>(
-        accessor: &Accessor<T, Self>,
-        resource: Resource<HostedSerialPort>,
-        bytes: Vec<u8>,
-    ) -> wasmtime::Result<()> {
-        let io = accessor.with(|mut access| {
-            Ok::<_, wasmtime::Error>(access.get().table.get(&resource)?.io.clone())
-        })?;
-        io.backend.write(bytes).await.map_err(Into::into)
-    }
-
-    async fn flush<T: 'static + Send>(
-        accessor: &Accessor<T, Self>,
-        resource: Resource<HostedSerialPort>,
-    ) -> wasmtime::Result<()> {
-        let io = accessor.with(|mut access| {
-            Ok::<_, wasmtime::Error>(access.get().table.get(&resource)?.io.clone())
-        })?;
-        io.backend.flush().await.map_err(Into::into)
-    }
-}
+impl_serial_bindings!(program_bindings);
+impl_serial_bindings!(debugger_bindings);
 
 #[cfg(test)]
 mod tests {

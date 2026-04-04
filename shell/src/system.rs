@@ -4,7 +4,7 @@ use std::io::Write as _;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use helios_shell_protocol::system::{stats, tracing};
+use helios_shell_protocol::system::{instances, stats, tracing};
 
 use crate::runtime;
 use crate::serial::RpcClient;
@@ -40,6 +40,13 @@ pub async fn fetch_stats(client: &mut RpcClient) -> Result<stats::Sample> {
         .await
         .context("timed out waiting for remote stats snapshot")?
         .context("failed to fetch remote stats snapshot")
+}
+
+pub async fn fetch_instances(client: &mut RpcClient) -> Result<Vec<instances::Instance>> {
+    runtime::timeout(INITIAL_REMOTE_TIMEOUT, instances::snapshot(client))
+        .await
+        .context("timed out waiting for remote instances snapshot")?
+        .context("failed to fetch remote instances snapshot")
 }
 
 pub async fn fetch_tracing(
