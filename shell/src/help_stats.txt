@@ -1,0 +1,24 @@
+stats command help
+
+Commands:
+  stats
+      Fetch one stats snapshot immediately.
+  stats period <ms>
+      Set the refresh cadence used when stats is the current view.
+  use stats
+      Make stats the current view.
+  refresh
+      If stats is the current view, fetch another stats snapshot.
+
+What you get:
+  timestamp
+  uptime
+  configured and online processor counts
+  per-processor busy permille
+  memory totals and memory pressure
+
+Examples:
+  stats
+  stats period 1000
+  use stats
+  refresh

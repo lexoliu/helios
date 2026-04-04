@@ -2,7 +2,7 @@ use std::io::Write as _;
 use std::time::Duration;
 
 use crate::runtime;
-use crate::serial::{RpcClient, SerialIo};
+use crate::serial::RpcClient;
 use anyhow::{Context as _, Result};
 
 const INITIAL_REMOTE_TIMEOUT: Duration = Duration::from_secs(180);
@@ -43,8 +43,12 @@ impl RpcPane {
     }
 }
 
-pub async fn run_call(io: SerialIo, instance: &str, func: &str, request_hex: &str) -> Result<()> {
-    let mut client = io.into_client();
+pub async fn run_call(
+    mut client: RpcClient,
+    instance: &str,
+    func: &str,
+    request_hex: &str,
+) -> Result<()> {
     let mut pane = RpcPane::new();
     pane.instance = instance.to_owned();
     pane.func = func.to_owned();

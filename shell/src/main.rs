@@ -1,3 +1,5 @@
+mod ready;
+mod repl;
 mod rpc;
 mod runtime;
 mod serial;
@@ -17,12 +19,16 @@ struct Args {
     #[arg(long, default_value_t = 115_200)]
     baud: u32,
 
+    #[arg(long, hide = true)]
+    boot_sync: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    Tui,
     Stats {
         #[arg(long, default_value_t = 1_000)]
         period_ms: u64,
@@ -46,22 +52,38 @@ enum Command {
 }
 
 fn main() -> Result<()> {
-    runtime::block_on(async move {
-        let args = Args::parse();
+    let args = Args::parse();
+    let client = runtime::block_on(async move {
         let io = serial::open(&args.device, args.baud).await?;
-        match args.command {
-            None => tui::run(io).await,
-            Some(Command::Stats { period_ms }) => system::run_stats(io, period_ms).await,
-            Some(Command::Tracing {
-                limit,
-                min_level,
-                target_prefix,
-            }) => system::run_tracing(io, limit, min_level.as_deref(), target_prefix).await,
-            Some(Command::Rpc {
-                instance,
-                func,
-                request_hex,
-            }) => rpc::run_call(io, &instance, &func, &request_hex).await,
+        if args.boot_sync {
+            Ok::<_, anyhow::Error>(ready::connect_after_boot(io).await?)
+        } else {
+            let mut client = io.into_client();
+            ready::wait_until_ready(&mut client).await?;
+            Ok::<_, anyhow::Error>(client)
         }
-    })
+    })?;
+
+    match args.command {
+        None => repl::run(client),
+        Some(Command::Tui) => runtime::block_on(tui::run(client)),
+        Some(Command::Stats { period_ms }) => {
+            runtime::block_on(system::run_stats(client, period_ms))
+        }
+        Some(Command::Tracing {
+            limit,
+            min_level,
+            target_prefix,
+        }) => runtime::block_on(system::run_tracing(
+            client,
+            limit,
+            min_level.as_deref(),
+            target_prefix,
+        )),
+        Some(Command::Rpc {
+            instance,
+            func,
+            request_hex,
+        }) => runtime::block_on(rpc::run_call(client, &instance, &func, &request_hex)),
+    }
 }

@@ -1,16 +1,11 @@
-use std::fs::File;
-use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
-use std::os::unix::fs::FileTypeExt;
-use std::time::Duration;
-
 use anyhow::{Context as _, Result};
 use async_io::Async;
 use async_net::unix::UnixStream;
 use futures_io::{AsyncRead, AsyncWrite};
-use futures_lite::io::AsyncReadExt as _;
-
-use crate::runtime;
+use std::fs::File;
+use std::io;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::unix::fs::FileTypeExt;
 
 pub(crate) trait SerialRead: AsyncRead + Unpin + Send {}
 pub(crate) trait SerialWrite: AsyncWrite + Unpin + Send {}
@@ -28,7 +23,7 @@ pub(crate) struct SerialIo {
 }
 
 pub(crate) async fn open(device: &str, baud: u32) -> Result<SerialIo> {
-    let (mut read, write) = if is_unix_socket(device)? {
+    let (read, write) = if is_unix_socket(device)? {
         let stream = UnixStream::connect(device)
             .await
             .with_context(|| format!("failed to connect to serial socket {device}"))?;
@@ -39,8 +34,6 @@ pub(crate) async fn open(device: &str, baud: u32) -> Result<SerialIo> {
     } else {
         open_tty_transport(device, baud)?
     };
-
-    drain_startup_noise(&mut read).await?;
     Ok(SerialIo { read, write })
 }
 
@@ -50,21 +43,6 @@ fn is_unix_socket(device: &str) -> Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(device.ends_with(".sock")),
         Err(error) => {
             Err(error).with_context(|| format!("failed to inspect serial device {device}"))
-        }
-    }
-}
-
-async fn drain_startup_noise(read: &mut SerialReader) -> Result<()> {
-    let mut buffer = [0_u8; 4096];
-    loop {
-        let read_result =
-            runtime::timeout(Duration::from_millis(150), read.read(&mut buffer)).await;
-        match read_result {
-            Some(Ok(0)) | None => return Ok(()),
-            Some(Ok(_)) => {}
-            Some(Err(error)) => {
-                return Err(error).context("failed while draining startup serial noise")
-            }
         }
     }
 }

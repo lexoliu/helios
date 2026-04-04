@@ -1,21 +1,34 @@
 //! Async-first userland helpers for Helios components.
 
 pub mod bindings;
+#[cfg(feature = "channel")]
 pub mod channel;
+#[cfg(any(feature = "fs", feature = "io"))]
 mod error;
+#[cfg(feature = "fs")]
 pub mod fs;
+#[cfg(feature = "io")]
 pub mod io;
 pub mod prelude;
+#[cfg(feature = "serial")]
 pub mod serial;
+#[cfg(feature = "stats")]
 pub mod stats;
+#[cfg(feature = "sync")]
 pub mod sync;
+#[cfg(feature = "task")]
 pub mod task;
+#[cfg(feature = "tracing")]
 pub mod tracing;
 
+#[cfg(any(feature = "fs", feature = "io"))]
 pub use error::Result;
+#[cfg(feature = "io")]
 pub use futures_io::{AsyncRead, AsyncWrite};
 pub use helios_api_macro::main;
+#[cfg(feature = "io")]
 pub use io::{ReadExt, WriteExt};
+#[cfg(feature = "io")]
 pub use std::io::Error;
 pub use wit_bindgen;
 

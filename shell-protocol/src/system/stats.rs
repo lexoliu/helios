@@ -1,22 +1,23 @@
-use anyhow::Result;
-use wrpc_transport::Invoke;
+#[cfg(feature = "host")]
+use crate::transport::Client;
+#[cfg(feature = "host")]
+use anyhow::{Context as _, Result};
+#[cfg(feature = "host")]
+use futures_io::{AsyncRead, AsyncWrite};
 
-use super::Subscription;
-use super::imports::helios::system::stats as raw;
+pub use super::bindings::helios::system::stats::{
+    Memory, MemoryPressure, MonoNanos, Permille, Processor, Processors, Sample,
+};
 
-pub use raw::{Memory, MemoryPressure, MonoNanos, Permille, Processor, Processors, Sample};
-
-pub async fn snapshot<C>(wrpc: &C) -> Result<Sample>
+#[cfg(feature = "host")]
+pub async fn snapshot<R, W>(client: &Client<R, W>) -> Result<Sample>
 where
-    C: Invoke<Context = ()>,
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
 {
-    raw::snapshot(wrpc, ()).await
-}
-
-pub async fn subscribe<'a, C>(wrpc: &'a C, period: MonoNanos) -> Result<Subscription<'a, Sample>>
-where
-    C: Invoke<Context = ()> + 'a,
-{
-    let (stream, driver) = raw::subscribe(wrpc, (), period).await?;
-    Ok(Subscription::new(stream, driver))
+    let bytes = client
+        .invoke_raw("helios:system/stats@0.1.0", "snapshot", Vec::new())
+        .await
+        .context("failed to invoke remote stats.snapshot")?;
+    postcard::from_bytes(&bytes).context("failed to decode remote stats snapshot")
 }

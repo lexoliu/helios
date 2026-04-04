@@ -18,7 +18,9 @@ use wasmtime::component::{
     Accessor, Destination, HasSelf, Linker, Resource, ResourceTable, ResourceType, StreamProducer,
     StreamReader, StreamResult,
 };
-use wasmtime::{Config, CustomCodeMemory, Engine, OptLevel, Store, StoreContextMut};
+use wasmtime::{
+    Config, CustomCodeMemory, Engine, OptLevel, RegallocAlgorithm, Store, StoreContextMut,
+};
 use wasmtime_wasi_io::IoView;
 use wasmtime_wasi_io::bytes::Bytes;
 use wasmtime_wasi_io::poll::{Pollable, subscribe};
@@ -96,9 +98,11 @@ pub fn should_run_on(hart_id: u16, hart_count: usize, bootstrap_hart: u16) -> bo
 pub fn run_forever(cpu: RiscvCpu) -> ! {
     let debugger = embedded_debugger()
         .unwrap_or_else(|| panic!("no embedded debugger program found; set HELIOS_DEBUGGER_WASM"));
+    emit_stage_marker("boot");
     tracing::info!("debugger hart: launching embedded debugger component");
     run_debugger(debugger, cpu.clone())
         .unwrap_or_else(|error| panic!("failed to launch embedded debugger component:\n{error:#}"));
+    emit_stage_marker("done");
     tracing::info!("debugger hart: embedded debugger component exited cleanly");
     cpu.shutdown()
 }
@@ -119,13 +123,17 @@ fn debug_processor(bootstrap_hart: u16, hart_count: usize) -> u16 {
 }
 
 fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), DebuggerError> {
+    emit_stage_marker("engine:new");
     tracing::info!("debugger hart: creating wasmtime engine");
     let engine = build_engine()?;
+    emit_stage_marker("engine:ok");
     tracing::info!("debugger hart: compiling embedded debugger component");
     let component =
         wasmtime::component::Component::from_binary(&engine, debugger.component().bytes())
             .map_err(DebuggerError::CompileComponent)?;
+    emit_stage_marker("component:ok");
 
+    emit_stage_marker("linker:new");
     tracing::info!("debugger hart: preparing component linker");
     let mut linker = Linker::<StoreData>::new(&engine);
     wasmtime_wasi_io::add_to_linker_async(&mut linker).map_err(DebuggerError::LinkComponent)?;
@@ -133,7 +141,9 @@ fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), Debugge
     add_serial_to_linker(&mut linker).map_err(DebuggerError::LinkComponent)?;
     add_sync_to_linker(&mut linker).map_err(DebuggerError::LinkComponent)?;
     add_system_to_linker(&mut linker).map_err(DebuggerError::LinkComponent)?;
+    emit_stage_marker("linker:ok");
 
+    emit_stage_marker("store:new");
     let mut store = Store::new(
         &engine,
         StoreData {
@@ -143,22 +153,29 @@ fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), Debugge
             debug_port: Some(()),
         },
     );
+    emit_stage_marker("store:ok");
 
+    emit_stage_marker("pre:begin");
     tracing::info!("debugger hart: instantiating embedded debugger component");
     if let Err(error) = linker.instantiate_pre(&component) {
         log_wasmtime_error_chain("debugger hart: instantiate_pre failed", &error);
         return Err(DebuggerError::InstantiateComponent(error));
     }
+    emit_stage_marker("pre:ok");
+    emit_stage_marker("instantiate:begin");
     let instance = block_on(bindings::Init::instantiate_async(
         &mut store, &component, &linker,
     ))
     .map_err(DebuggerError::InstantiateComponent)?;
+    emit_stage_marker("instantiate:ok");
     tracing::info!("debugger hart: entering wasi:cli/run");
+    emit_stage_marker("run:begin");
     let result =
         block_on(store.run_concurrent(async move |accessor| {
             instance.wasi_cli_run().call_run(accessor).await
         }))
         .map_err(DebuggerError::RunComponent)?;
+    emit_stage_marker("run:ok");
     tracing::info!("debugger hart: wasi:cli/run returned");
     match result {
         Ok(Ok(())) => Ok(()),
@@ -173,6 +190,8 @@ fn build_engine() -> Result<Engine, DebuggerError> {
         .target(WASMTIME_TARGET)
         .expect("Helios build target must be accepted by Wasmtime");
     config.cranelift_opt_level(OptLevel::None);
+    config.cranelift_regalloc_algorithm(RegallocAlgorithm::SinglePass);
+    config.cranelift_debug_verifier(false);
     config.with_custom_code_memory(Some(Arc::new(RiscvCodeMemory)));
     // The RISC-V backend has not wired Wasmtime's custom virtual-memory and
     // native-signal hooks yet, so the engine configuration must match the
@@ -988,6 +1007,12 @@ fn read_serial(max_bytes: u32) -> Vec<u8> {
 
 fn write_serial(bytes: &[u8]) {
     write_debug_serial_bytes(bytes);
+}
+
+fn emit_stage_marker(stage: &str) {
+    write_debug_serial_bytes(b"\n[KDBG ");
+    write_debug_serial_bytes(stage.as_bytes());
+    write_debug_serial_bytes(b"]\n");
 }
 
 fn log_wasmtime_error_chain(prefix: &str, error: &wasmtime::Error) {

@@ -5,7 +5,7 @@ edition = "2024"
 autobins = false
 
 [dependencies]
-helios-api.workspace = true
+helios-api = { path = "../../api", default-features = false }
 
 [lib]
 name = "helios_init"

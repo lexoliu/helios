@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 #[helios_api::main]
-async fn main() -> helios_api::Result<()> {
+async fn main() -> std::io::Result<()> {
     let root = Path::new("/");
     println!("helios init: online root={}", root.display());
 

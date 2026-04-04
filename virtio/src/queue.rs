@@ -122,6 +122,10 @@ impl<T: VirtioTransport> VirtQueue<T> {
     }
 
     pub fn pop_used(&mut self) -> Option<u16> {
+        self.pop_used_with_len().map(|(head, _)| head)
+    }
+
+    pub fn pop_used_with_len(&mut self) -> Option<(u16, u32)> {
         let used_idx = self.read_used_idx();
         if used_idx == self.last_used_idx {
             return None;
@@ -133,7 +137,7 @@ impl<T: VirtioTransport> VirtQueue<T> {
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
         let head = elem.id as u16;
         self.recycle_chain(head);
-        Some(head)
+        Some((head, elem.len))
     }
 
     pub fn notify(&self, transport: &T) {
