@@ -1,7 +1,9 @@
 use std::borrow::Cow::{self, Borrowed, Owned};
+use std::fmt::Write as _;
 use std::io::Write as _;
 
 use anyhow::{Context as _, Result};
+use clap::error::ErrorKind;
 use clap::{ColorChoice, CommandFactory, Parser, Subcommand, ValueEnum};
 use helios_shell_protocol::system::tracing;
 use nu_ansi_term::{Color, Style as AnsiStyle};
@@ -14,6 +16,7 @@ use rustyline::validate::{
     MatchingBracketValidator, ValidationContext, ValidationResult, Validator,
 };
 use rustyline::{CompletionType, Config, Context as RustyContext, EditMode, Editor, Helper};
+use strsim::normalized_damerau_levenshtein;
 
 use crate::rpc::RpcPane;
 use crate::runtime;
@@ -421,15 +424,106 @@ fn parse_line(input: &str) -> ParsedLine {
         }
     };
 
-    match ReplCli::try_parse_from(tokens) {
+    match ReplCli::try_parse_from(tokens.iter().map(String::as_str)) {
         Ok(cli) => ParsedLine::Command(cli.command.into_runtime_command()),
-        Err(error) => ParsedLine::Output(render_clap_error(error)),
+        Err(error) => ParsedLine::Output(render_clap_error(error, &tokens)),
     }
 }
 
-fn render_clap_error(error: clap::Error) -> String {
+fn render_clap_error(error: clap::Error, tokens: &[String]) -> String {
+    if matches!(
+        error.kind(),
+        ErrorKind::InvalidSubcommand | ErrorKind::UnknownArgument
+    ) {
+        if let Some(output) = render_unknown_command(tokens) {
+            return output;
+        }
+    }
+
     error.use_stderr();
     error.render().ansi().to_string()
+}
+
+fn render_unknown_command(tokens: &[String]) -> Option<String> {
+    let current = tokens.last()?;
+    if current.starts_with('-') {
+        return None;
+    }
+
+    let prefix = tokens[..tokens.len().saturating_sub(1)]
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let candidates = completion_candidates(&prefix, current);
+    let suggestion = best_suggestion(current, candidates);
+    let help_hint = render_help_hint(&prefix);
+
+    let mut output = String::new();
+    write!(
+        &mut output,
+        "{}: unknown command `{}`",
+        AnsiStyle::new().fg(Color::Red).bold().paint("error"),
+        AnsiStyle::new().fg(Color::Yellow).paint(current),
+    )
+    .expect("writing into String must succeed");
+
+    if !prefix.is_empty() {
+        write!(
+            &mut output,
+            "\n  {}: {}",
+            AnsiStyle::new().fg(Color::Fixed(244)).paint("context"),
+            prefix.join(" "),
+        )
+        .expect("writing into String must succeed");
+    }
+
+    if let Some(suggestion) = suggestion {
+        write!(
+            &mut output,
+            "\n\n  {}: did you mean `{}`?",
+            AnsiStyle::new().fg(Color::Green).bold().paint("tip"),
+            AnsiStyle::new().fg(Color::Green).paint(suggestion),
+        )
+        .expect("writing into String must succeed");
+    }
+
+    write!(
+        &mut output,
+        "\n\n{} {}",
+        AnsiStyle::new().fg(Color::Fixed(244)).paint("try:"),
+        help_hint,
+    )
+    .expect("writing into String must succeed");
+
+    Some(output)
+}
+
+fn best_suggestion<'a>(current: &str, candidates: &'a [&'a str]) -> Option<&'a str> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|candidate| !candidate.starts_with("--"))
+        .filter_map(|candidate| {
+            let score = normalized_damerau_levenshtein(current, candidate);
+            (score >= 0.5).then_some((candidate, score))
+        })
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(candidate, _)| candidate)
+}
+
+fn render_help_hint(prefix: &[&str]) -> String {
+    match prefix.first().copied() {
+        None => format!(
+            "`{}` or `{}`",
+            AnsiStyle::new().fg(Color::Green).paint("help"),
+            AnsiStyle::new().fg(Color::Green).paint("--help"),
+        ),
+        Some(command) => format!(
+            "`help {}` or `{} --help`",
+            AnsiStyle::new().fg(Color::Green).paint(command),
+            AnsiStyle::new().fg(Color::Green).paint(command),
+        ),
+    }
 }
 
 fn render_help(topic: HelpTopic) -> String {
@@ -596,7 +690,11 @@ mod tests {
     #[test]
     fn clap_suggests_similar_command() {
         match parse_line("staats") {
-            ParsedLine::Output(text) => assert!(text.contains("stats")),
+            ParsedLine::Output(text) => {
+                assert!(text.contains("unknown command"));
+                assert!(text.contains("stats"));
+                assert!(!text.contains("subcommand"));
+            }
             _ => panic!("invalid command must produce clap output"),
         }
     }
