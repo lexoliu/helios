@@ -9,12 +9,20 @@ Core:
   exit
 
 Interactive:
+  pwd
+      Print the current remote working directory.
   ls [path]
       List files in the remote debugger filesystem. Paths are resolved from `/`.
+  cat <path>
+      Print a remote file to the terminal.
+  mkdir <path>
+      Create a directory in the remote debugger filesystem.
   rm <path>
       Remove a file or an empty directory in the remote debugger filesystem.
   touch <path>
       Create a file if it does not already exist.
+  echo [words...]
+      Print text. Use `echo ... > /path` or `echo ... >> /path` to write remote files.
   stats
       Open the live stats view. Press `q` to return to the shell.
   tracing
@@ -40,8 +48,12 @@ RPC:
       Configure and invoke an arbitrary remote system call.
 
 Examples:
+  pwd
   ls
   ls /boot
+  mkdir /tmp
+  echo hello > /tmp/note.txt
+  cat /tmp/note.txt
   touch /tmp/marker
   rm /tmp/marker
   stats
