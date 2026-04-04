@@ -3,8 +3,8 @@ mod repl;
 mod rpc;
 mod runtime;
 mod serial;
+mod stats_tui;
 mod system;
-mod tui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -28,7 +28,6 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Tui,
     Stats {
         #[arg(long, default_value_t = 1_000)]
         period_ms: u64,
@@ -66,10 +65,10 @@ fn main() -> Result<()> {
 
     match args.command {
         None => repl::run(client),
-        Some(Command::Tui) => runtime::block_on(tui::run(client)),
-        Some(Command::Stats { period_ms }) => {
-            runtime::block_on(system::run_stats(client, period_ms))
-        }
+        Some(Command::Stats { period_ms }) => runtime::block_on(async move {
+            let mut client = client;
+            stats_tui::run(&mut client, period_ms).await
+        }),
         Some(Command::Tracing {
             limit,
             min_level,

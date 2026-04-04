@@ -9,15 +9,9 @@ Commands:
       Set the minimum tracing level filter.
   tracing targets <prefix-a,prefix-b>
       Restrict events to targets whose names start with one of the prefixes.
-  use tracing
-      Make tracing the current view.
-  refresh
-      If tracing is the current view, fetch another event batch.
 
 Examples:
   tracing
   tracing limit 128
   tracing level debug
   tracing targets helios_kernel,helios_riscv
-  use tracing
-  refresh

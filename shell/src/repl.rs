@@ -8,7 +8,8 @@ use rustyline::DefaultEditor;
 use crate::rpc::RpcPane;
 use crate::runtime;
 use crate::serial::RpcClient;
-use crate::system::{self, StatsPane, TracingPane};
+use crate::stats_tui;
+use crate::system::{self, StatsConfig, TracingConfig};
 
 pub fn run(mut client: RpcClient) -> Result<()> {
     let mut editor = DefaultEditor::new().context("failed to initialize shell line editor")?;
@@ -48,9 +49,8 @@ pub fn run(mut client: RpcClient) -> Result<()> {
 }
 
 struct Shell {
-    current: View,
-    stats: StatsPane,
-    tracing: TracingPane,
+    stats: StatsConfig,
+    tracing: TracingConfig,
     rpc: RpcPane,
 }
 
@@ -62,20 +62,11 @@ enum HelpTopic {
     Rpc,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum View {
-    Stats,
-    Tracing,
-    Rpc,
-}
-
 enum Command {
     Help(HelpTopic),
-    Quit,
-    Refresh,
+    Exit,
     ShowStats,
     ShowTracing,
-    Use(View),
     StatsPeriod(u64),
     TracingLimit(u32),
     TracingLevel(Option<tracing::Level>),
@@ -89,9 +80,8 @@ enum Command {
 impl Shell {
     fn new() -> Self {
         Self {
-            current: View::Stats,
-            stats: StatsPane::new(),
-            tracing: TracingPane::new(),
+            stats: StatsConfig::new(),
+            tracing: TracingConfig::new(),
             rpc: RpcPane::new(),
         }
     }
@@ -128,28 +118,9 @@ impl Shell {
     async fn execute(&mut self, client: &mut RpcClient, command: Command) -> Result<bool> {
         match command {
             Command::Help(topic) => self.print_block(help_text(topic))?,
-            Command::Quit => return Ok(true),
-            Command::Refresh => match self.current {
-                View::Stats => self.show_stats(client).await?,
-                View::Tracing => self.show_tracing(client).await?,
-                View::Rpc => self.call_rpc(client).await?,
-            },
-            Command::ShowStats => {
-                self.current = View::Stats;
-                self.show_stats(client).await?;
-            }
-            Command::ShowTracing => {
-                self.current = View::Tracing;
-                self.show_tracing(client).await?;
-            }
-            Command::Use(view) => {
-                self.current = view;
-                self.print_line(match view {
-                    View::Stats => "current view: stats",
-                    View::Tracing => "current view: tracing",
-                    View::Rpc => "current view: rpc",
-                })?;
-            }
+            Command::Exit => return Ok(true),
+            Command::ShowStats => stats_tui::run(client, self.stats.period_ms).await?,
+            Command::ShowTracing => self.show_tracing(client).await?,
             Command::StatsPeriod(period_ms) => {
                 self.stats.period_ms = period_ms;
                 self.print_line(&format!("stats period set to {period_ms}ms"))?;
@@ -173,37 +144,26 @@ impl Shell {
                 ))?;
             }
             Command::RpcInstance(instance) => {
-                self.current = View::Rpc;
                 self.rpc.instance = instance;
                 self.print_line("rpc instance updated")?;
             }
             Command::RpcFunc(func) => {
-                self.current = View::Rpc;
                 self.rpc.func = func;
                 self.print_line("rpc function updated")?;
             }
             Command::RpcPayload(payload) => {
-                self.current = View::Rpc;
                 self.rpc.request_hex = payload;
                 self.print_line("rpc payload updated")?;
             }
-            Command::RpcCall => {
-                self.current = View::Rpc;
-                self.call_rpc(client).await?;
-            }
+            Command::RpcCall => self.call_rpc(client).await?,
         }
 
         Ok(false)
     }
 
-    async fn show_stats(&mut self, client: &mut RpcClient) -> Result<()> {
-        self.stats.refresh(client).await?;
-        self.print_block(&self.stats.last_rendered)
-    }
-
     async fn show_tracing(&mut self, client: &mut RpcClient) -> Result<()> {
-        self.tracing.refresh(client).await?;
-        self.print_block(&self.tracing.last_rendered)
+        let events = system::fetch_tracing(client, &self.tracing).await?;
+        self.print_block(&system::render_tracing_events(&events)?)
     }
 
     async fn call_rpc(&mut self, client: &mut RpcClient) -> Result<()> {
@@ -224,13 +184,9 @@ fn parse_command(input: &str) -> Result<Command> {
         ("help", "stats") => Ok(Command::Help(HelpTopic::Stats)),
         ("help", "tracing") => Ok(Command::Help(HelpTopic::Tracing)),
         ("help", "rpc") => Ok(Command::Help(HelpTopic::Rpc)),
-        ("quit", _) | ("exit", _) => Ok(Command::Quit),
-        ("refresh", _) => Ok(Command::Refresh),
+        ("exit", _) => Ok(Command::Exit),
         ("stats", "") => Ok(Command::ShowStats),
         ("tracing", "") => Ok(Command::ShowTracing),
-        ("use", "stats") => Ok(Command::Use(View::Stats)),
-        ("use", "tracing") => Ok(Command::Use(View::Tracing)),
-        ("use", "rpc") => Ok(Command::Use(View::Rpc)),
         ("stats", "period") => Ok(Command::StatsPeriod(
             tail.parse()
                 .context("stats period must be an integer in milliseconds")?,
@@ -279,7 +235,7 @@ fn tracing_level_name(level: Option<tracing::Level>) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_command, Command, HelpTopic, View};
+    use super::{parse_command, Command, HelpTopic};
     use helios_shell_protocol::system::tracing::Level;
 
     #[test]
@@ -290,10 +246,19 @@ mod tests {
     }
 
     #[test]
-    fn parses_use_command() {
-        let command = parse_command("use rpc")
-            .unwrap_or_else(|error| panic!("failed to parse use command: {error}"));
-        assert!(matches!(command, Command::Use(View::Rpc)));
+    fn rejects_quit_alias() {
+        let error = parse_command("quit")
+            .err()
+            .unwrap_or_else(|| panic!("quit alias must not remain accepted"));
+        assert_eq!(error.to_string(), "unknown command `quit`");
+    }
+
+    #[test]
+    fn rejects_refresh_command() {
+        let error = parse_command("refresh")
+            .err()
+            .unwrap_or_else(|| panic!("refresh command must not remain accepted"));
+        assert_eq!(error.to_string(), "unknown command `refresh`");
     }
 
     #[test]
