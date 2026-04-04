@@ -1262,6 +1262,7 @@ dependencies = [
  "rustyline",
  "serialport",
  "shell-words",
+ "strsim",
 ]
 
 [[package]]
