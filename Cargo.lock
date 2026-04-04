@@ -1256,10 +1256,12 @@ dependencies = [
  "futures-lite",
  "helios-shell-protocol",
  "hex",
+ "nu-ansi-term",
  "ratatui",
  "rustix 1.1.4",
  "rustyline",
  "serialport",
+ "shell-words",
 ]
 
 [[package]]

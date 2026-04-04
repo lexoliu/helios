@@ -1,9 +1,19 @@
+use std::borrow::Cow::{self, Borrowed, Owned};
 use std::io::Write as _;
 
 use anyhow::{Context as _, Result};
+use clap::{ColorChoice, CommandFactory, Parser, Subcommand, ValueEnum};
 use helios_shell_protocol::system::tracing;
+use nu_ansi_term::{Color, Style as AnsiStyle};
+use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
+use rustyline::highlight::{Highlighter, MatchingBracketHighlighter};
+use rustyline::hint::{Hinter, HistoryHinter};
+use rustyline::history::DefaultHistory;
+use rustyline::validate::{
+    MatchingBracketValidator, ValidationContext, ValidationResult, Validator,
+};
+use rustyline::{CompletionType, Config, Context as RustyContext, EditMode, Editor, Helper};
 
 use crate::rpc::RpcPane;
 use crate::runtime;
@@ -12,13 +22,13 @@ use crate::stats_tui;
 use crate::system::{self, StatsConfig, TracingConfig};
 
 pub fn run(mut client: RpcClient) -> Result<()> {
-    let mut editor = DefaultEditor::new().context("failed to initialize shell line editor")?;
+    let mut editor = build_editor()?;
     let mut shell = Shell::new();
 
     shell.print_banner()?;
 
     loop {
-        let line = match editor.readline("helios> ") {
+        let line = match editor.readline(PROMPT) {
             Ok(line) => line,
             Err(ReadlineError::Interrupted) => continue,
             Err(ReadlineError::Eof) => return Ok(()),
@@ -34,32 +44,134 @@ pub fn run(mut client: RpcClient) -> Result<()> {
             .add_history_entry(line)
             .context("failed to record shell history entry")?;
 
-        let command = match parse_command(line) {
-            Ok(command) => command,
-            Err(error) => {
-                shell.print_error(&error.to_string())?;
-                continue;
+        match parse_line(line) {
+            ParsedLine::Command(command) => {
+                if runtime::block_on(shell.execute(&mut client, command))? {
+                    return Ok(());
+                }
             }
-        };
-
-        if runtime::block_on(shell.execute(&mut client, command))? {
-            return Ok(());
+            ParsedLine::Output(output) => shell.print_block(&output)?,
         }
     }
+}
+
+const PROMPT: &str = "helios> ";
+const ROOT_CANDIDATES: &[&str] = &["help", "exit", "stats", "tracing", "rpc", "--help"];
+const HELP_CANDIDATES: &[&str] = &["overview", "stats", "tracing", "rpc", "--help"];
+const STATS_CANDIDATES: &[&str] = &["period", "--help"];
+const TRACING_CANDIDATES: &[&str] = &["limit", "level", "targets", "--help"];
+const TRACING_LEVEL_CANDIDATES: &[&str] = &["none", "error", "warn", "info", "debug", "trace"];
+const RPC_CANDIDATES: &[&str] = &["instance", "func", "payload", "call", "--help"];
+const RPC_INSTANCE_CANDIDATES: &[&str] = &[
+    "helios:system/stats@0.1.0",
+    "helios:system/tracing@0.1.0",
+    "helios:system/serial@0.1.0",
+    "helios:system/sync@0.1.0",
+];
+const RPC_FUNC_CANDIDATES: &[&str] = &[
+    "snapshot",
+    "recent",
+    "debug-port",
+    "raw-mutex",
+    "raw-rw-lock",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum HelpTopic {
+    Overview,
+    Stats,
+    Tracing,
+    Rpc,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum TracingLevelArg {
+    None,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "helios",
+    no_binary_name = true,
+    disable_version_flag = true,
+    disable_help_subcommand = true,
+    color = ColorChoice::Always,
+    subcommand_required = true
+)]
+struct ReplCli {
+    #[command(subcommand)]
+    command: CliCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum CliCommand {
+    /// Show help for the shell or a specific command.
+    Help {
+        #[arg(value_enum)]
+        topic: Option<HelpTopic>,
+    },
+    /// Leave the shell.
+    Exit,
+    /// Open the live stats view or configure its refresh interval.
+    Stats {
+        #[command(subcommand)]
+        action: Option<StatsAction>,
+    },
+    /// Fetch tracing events or configure tracing filters.
+    Tracing {
+        #[command(subcommand)]
+        action: Option<TracingAction>,
+    },
+    /// Configure or invoke a raw remote system call.
+    Rpc {
+        #[command(subcommand)]
+        action: RpcAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum StatsAction {
+    /// Set the live stats refresh interval in milliseconds.
+    Period { ms: u64 },
+}
+
+#[derive(Debug, Subcommand)]
+enum TracingAction {
+    /// Set the maximum number of events fetched by `tracing`.
+    Limit { count: u32 },
+    /// Set the minimum tracing level.
+    Level { level: TracingLevelArg },
+    /// Set comma-separated tracing target prefixes. Empty clears the filter.
+    Targets {
+        #[arg(default_value = "")]
+        prefixes: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RpcAction {
+    /// Set the remote WIT instance identifier.
+    Instance { name: String },
+    /// Set the remote function name.
+    Func { name: String },
+    /// Set the request payload as hexadecimal bytes.
+    Payload {
+        #[arg(default_value = "")]
+        hex: String,
+    },
+    /// Invoke the configured remote call.
+    Call,
 }
 
 struct Shell {
     stats: StatsConfig,
     tracing: TracingConfig,
     rpc: RpcPane,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum HelpTopic {
-    Overview,
-    Stats,
-    Tracing,
-    Rpc,
 }
 
 enum Command {
@@ -77,6 +189,18 @@ enum Command {
     RpcCall,
 }
 
+enum ParsedLine {
+    Command(Command),
+    Output(String),
+}
+
+struct ShellHelper {
+    highlighter: MatchingBracketHighlighter,
+    hinter: HistoryHinter,
+    validator: MatchingBracketValidator,
+    colored_prompt: String,
+}
+
 impl Shell {
     fn new() -> Self {
         Self {
@@ -88,7 +212,7 @@ impl Shell {
 
     fn print_banner(&self) -> Result<()> {
         let mut stdout = std::io::stdout().lock();
-        stdout.write_all(b"Helios shell ready. Type `help` for commands.\n")?;
+        stdout.write_all(b"Helios shell ready. Type `help` or use `--help` on any command.\n")?;
         stdout.flush()?;
         Ok(())
     }
@@ -111,13 +235,9 @@ impl Shell {
         Ok(())
     }
 
-    fn print_error(&self, error: &str) -> Result<()> {
-        self.print_line(&format!("error: {error}"))
-    }
-
     async fn execute(&mut self, client: &mut RpcClient, command: Command) -> Result<bool> {
         match command {
-            Command::Help(topic) => self.print_block(help_text(topic))?,
+            Command::Help(topic) => self.print_block(&render_help(topic))?,
             Command::Exit => return Ok(true),
             Command::ShowStats => stats_tui::run(client, self.stats.period_ms).await?,
             Command::ShowTracing => self.show_tracing(client).await?,
@@ -172,35 +292,225 @@ impl Shell {
     }
 }
 
-fn parse_command(input: &str) -> Result<Command> {
-    let mut parts = input.splitn(3, ' ');
-    let head = parts.next().context("empty command")?;
-    let middle = parts.next().unwrap_or_default();
-    let tail = parts.next().unwrap_or_default().trim();
+impl ShellHelper {
+    fn new() -> Self {
+        Self {
+            highlighter: MatchingBracketHighlighter::new(),
+            hinter: HistoryHinter::new(),
+            validator: MatchingBracketValidator::new(),
+            colored_prompt: format!(
+                "{}{} ",
+                AnsiStyle::new().fg(Color::Green).bold().paint("helios"),
+                AnsiStyle::new().fg(Color::Fixed(244)).paint(">")
+            ),
+        }
+    }
+}
 
-    match (head, middle) {
-        ("help", "") => Ok(Command::Help(HelpTopic::Overview)),
-        ("help", "overview") => Ok(Command::Help(HelpTopic::Overview)),
-        ("help", "stats") => Ok(Command::Help(HelpTopic::Stats)),
-        ("help", "tracing") => Ok(Command::Help(HelpTopic::Tracing)),
-        ("help", "rpc") => Ok(Command::Help(HelpTopic::Rpc)),
-        ("exit", _) => Ok(Command::Exit),
-        ("stats", "") => Ok(Command::ShowStats),
-        ("tracing", "") => Ok(Command::ShowTracing),
-        ("stats", "period") => Ok(Command::StatsPeriod(
-            tail.parse()
-                .context("stats period must be an integer in milliseconds")?,
-        )),
-        ("tracing", "limit") => Ok(Command::TracingLimit(
-            tail.parse().context("tracing limit must be an integer")?,
-        )),
-        ("tracing", "level") => Ok(Command::TracingLevel(system::parse_level(tail)?)),
-        ("tracing", "targets") => Ok(Command::TracingTargets(parse_targets(tail))),
-        ("rpc", "instance") => Ok(Command::RpcInstance(tail.to_owned())),
-        ("rpc", "func") => Ok(Command::RpcFunc(tail.to_owned())),
-        ("rpc", "payload") => Ok(Command::RpcPayload(tail.to_owned())),
-        ("rpc", "call") => Ok(Command::RpcCall),
-        _ => anyhow::bail!("unknown command `{input}`"),
+impl Helper for ShellHelper {}
+
+impl Completer for ShellHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &RustyContext<'_>,
+    ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
+        let (start, current, tokens) = completion_context(line, pos);
+        let candidates = completion_candidates(&tokens, current)
+            .into_iter()
+            .filter(|candidate| candidate.starts_with(current))
+            .map(|candidate| Pair {
+                display: candidate.to_string(),
+                replacement: candidate.to_string(),
+            })
+            .collect();
+        Ok((start, candidates))
+    }
+}
+
+impl Hinter for ShellHelper {
+    type Hint = String;
+
+    fn hint(&self, line: &str, pos: usize, ctx: &RustyContext<'_>) -> Option<Self::Hint> {
+        if let Some(hint) = self.hinter.hint(line, pos, ctx) {
+            return Some(hint);
+        }
+
+        if pos != line.len() {
+            return None;
+        }
+
+        let (_, current, tokens) = completion_context(line, pos);
+        if current.is_empty() {
+            return None;
+        }
+
+        let matches = completion_candidates(&tokens, current)
+            .into_iter()
+            .filter(|candidate| candidate.starts_with(current))
+            .collect::<Vec<_>>();
+
+        if matches.len() == 1 {
+            let candidate = matches[0];
+            if candidate.len() > current.len() {
+                return Some(candidate[current.len()..].to_owned());
+            }
+        }
+
+        None
+    }
+}
+
+impl Highlighter for ShellHelper {
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        default: bool,
+    ) -> Cow<'b, str> {
+        if default {
+            Borrowed(&self.colored_prompt)
+        } else {
+            Borrowed(prompt)
+        }
+    }
+
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        Owned(
+            AnsiStyle::new()
+                .fg(Color::Fixed(244))
+                .italic()
+                .paint(hint)
+                .to_string(),
+        )
+    }
+
+    fn highlight<'l>(&self, line: &'l str, pos: usize) -> Cow<'l, str> {
+        self.highlighter.highlight(line, pos)
+    }
+
+    fn highlight_char(&self, line: &str, pos: usize, forced: bool) -> bool {
+        self.highlighter.highlight_char(line, pos, forced)
+    }
+}
+
+impl Validator for ShellHelper {
+    fn validate(&self, ctx: &mut ValidationContext<'_>) -> rustyline::Result<ValidationResult> {
+        self.validator.validate(ctx)
+    }
+}
+
+fn build_editor() -> Result<Editor<ShellHelper, DefaultHistory>> {
+    let config = Config::builder()
+        .completion_type(CompletionType::List)
+        .edit_mode(EditMode::Emacs)
+        .history_ignore_space(true)
+        .build();
+    let mut editor = Editor::with_config(config).context("failed to create line editor")?;
+    editor.set_helper(Some(ShellHelper::new()));
+    Ok(editor)
+}
+
+fn parse_line(input: &str) -> ParsedLine {
+    let tokens = match shell_words::split(input) {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            return ParsedLine::Output(format!("error: failed to parse shell input: {error}"));
+        }
+    };
+
+    match ReplCli::try_parse_from(tokens) {
+        Ok(cli) => ParsedLine::Command(cli.command.into_runtime_command()),
+        Err(error) => ParsedLine::Output(render_clap_error(error)),
+    }
+}
+
+fn render_clap_error(error: clap::Error) -> String {
+    error.use_stderr();
+    error.render().ansi().to_string()
+}
+
+fn render_help(topic: HelpTopic) -> String {
+    let mut root = ReplCli::command().color(ColorChoice::Always);
+    let mut output = match topic {
+        HelpTopic::Overview => root.render_long_help().ansi().to_string(),
+        HelpTopic::Stats => root
+            .find_subcommand_mut("stats")
+            .expect("stats help command must exist")
+            .render_long_help()
+            .ansi()
+            .to_string(),
+        HelpTopic::Tracing => root
+            .find_subcommand_mut("tracing")
+            .expect("tracing help command must exist")
+            .render_long_help()
+            .ansi()
+            .to_string(),
+        HelpTopic::Rpc => root
+            .find_subcommand_mut("rpc")
+            .expect("rpc help command must exist")
+            .render_long_help()
+            .ansi()
+            .to_string(),
+    };
+
+    let appendix = match topic {
+        HelpTopic::Overview => include_str!("help_overview.txt"),
+        HelpTopic::Stats => include_str!("help_stats.txt"),
+        HelpTopic::Tracing => include_str!("help_tracing.txt"),
+        HelpTopic::Rpc => include_str!("help_rpc.txt"),
+    };
+
+    if !appendix.trim().is_empty() {
+        output.push('\n');
+        output.push_str(appendix);
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+
+    output
+}
+
+impl CliCommand {
+    fn into_runtime_command(self) -> Command {
+        match self {
+            Self::Help { topic } => Command::Help(topic.unwrap_or(HelpTopic::Overview)),
+            Self::Exit => Command::Exit,
+            Self::Stats { action } => match action {
+                None => Command::ShowStats,
+                Some(StatsAction::Period { ms }) => Command::StatsPeriod(ms),
+            },
+            Self::Tracing { action } => match action {
+                None => Command::ShowTracing,
+                Some(TracingAction::Limit { count }) => Command::TracingLimit(count),
+                Some(TracingAction::Level { level }) => Command::TracingLevel(level.into_runtime()),
+                Some(TracingAction::Targets { prefixes }) => {
+                    Command::TracingTargets(parse_targets(&prefixes))
+                }
+            },
+            Self::Rpc { action } => match action {
+                RpcAction::Instance { name } => Command::RpcInstance(name),
+                RpcAction::Func { name } => Command::RpcFunc(name),
+                RpcAction::Payload { hex } => Command::RpcPayload(hex),
+                RpcAction::Call => Command::RpcCall,
+            },
+        }
+    }
+}
+
+impl TracingLevelArg {
+    fn into_runtime(self) -> Option<tracing::Level> {
+        match self {
+            Self::None => None,
+            Self::Error => Some(tracing::Level::Error),
+            Self::Warn => Some(tracing::Level::Warn),
+            Self::Info => Some(tracing::Level::Info),
+            Self::Debug => Some(tracing::Level::Debug),
+            Self::Trace => Some(tracing::Level::Trace),
+        }
     }
 }
 
@@ -211,15 +521,6 @@ fn parse_targets(input: &str) -> Vec<String> {
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .collect()
-}
-
-fn help_text(topic: HelpTopic) -> &'static str {
-    match topic {
-        HelpTopic::Overview => include_str!("help_overview.txt"),
-        HelpTopic::Stats => include_str!("help_stats.txt"),
-        HelpTopic::Tracing => include_str!("help_tracing.txt"),
-        HelpTopic::Rpc => include_str!("help_rpc.txt"),
-    }
 }
 
 fn tracing_level_name(level: Option<tracing::Level>) -> &'static str {
@@ -233,45 +534,78 @@ fn tracing_level_name(level: Option<tracing::Level>) -> &'static str {
     }
 }
 
+fn completion_context<'a>(line: &'a str, pos: usize) -> (usize, &'a str, Vec<&'a str>) {
+    let prefix = &line[..pos];
+    let ends_with_space = prefix.chars().next_back().is_some_and(char::is_whitespace);
+    let mut tokens = prefix.split_whitespace().collect::<Vec<_>>();
+    let current = if ends_with_space {
+        ""
+    } else {
+        tokens.pop().unwrap_or("")
+    };
+    let start = pos.saturating_sub(current.len());
+    (start, current, tokens)
+}
+
+fn completion_candidates<'a>(tokens: &[&str], current: &str) -> &'a [&'a str] {
+    if current.starts_with("--") || tokens.last().is_some_and(|token| token.starts_with("--")) {
+        return &["--help"];
+    }
+
+    match tokens {
+        [] => ROOT_CANDIDATES,
+        ["help"] => HELP_CANDIDATES,
+        ["stats"] => STATS_CANDIDATES,
+        ["tracing"] => TRACING_CANDIDATES,
+        ["tracing", "level"] => TRACING_LEVEL_CANDIDATES,
+        ["rpc"] => RPC_CANDIDATES,
+        ["rpc", "instance"] => RPC_INSTANCE_CANDIDATES,
+        ["rpc", "func"] => RPC_FUNC_CANDIDATES,
+        _ => &[],
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_command, Command, HelpTopic};
-    use helios_shell_protocol::system::tracing::Level;
+    use super::{parse_line, Command, HelpTopic, ParsedLine};
 
     #[test]
     fn parses_stats_command() {
-        let command = parse_command("stats")
-            .unwrap_or_else(|error| panic!("failed to parse stats command: {error}"));
-        assert!(matches!(command, Command::ShowStats));
+        match parse_line("stats") {
+            ParsedLine::Command(Command::ShowStats) => {}
+            _ => panic!("stats command must parse"),
+        }
     }
 
     #[test]
-    fn rejects_quit_alias() {
-        let error = parse_command("quit")
-            .err()
-            .unwrap_or_else(|| panic!("quit alias must not remain accepted"));
-        assert_eq!(error.to_string(), "unknown command `quit`");
+    fn parses_rpc_payload_without_argument() {
+        match parse_line("rpc payload") {
+            ParsedLine::Command(Command::RpcPayload(value)) => assert!(value.is_empty()),
+            _ => panic!("rpc payload without argument must parse"),
+        }
     }
 
     #[test]
-    fn rejects_refresh_command() {
-        let error = parse_command("refresh")
-            .err()
-            .unwrap_or_else(|| panic!("refresh command must not remain accepted"));
-        assert_eq!(error.to_string(), "unknown command `refresh`");
+    fn keeps_help_command() {
+        match parse_line("help tracing") {
+            ParsedLine::Command(Command::Help(HelpTopic::Tracing)) => {}
+            _ => panic!("help tracing must parse"),
+        }
     }
 
     #[test]
-    fn parses_help_topic() {
-        let command = parse_command("help tracing")
-            .unwrap_or_else(|error| panic!("failed to parse help command: {error}"));
-        assert!(matches!(command, Command::Help(HelpTopic::Tracing)));
+    fn clap_suggests_similar_command() {
+        match parse_line("staats") {
+            ParsedLine::Output(text) => assert!(text.contains("stats")),
+            _ => panic!("invalid command must produce clap output"),
+        }
     }
 
     #[test]
-    fn parses_tracing_level_info() {
-        let command = parse_command("tracing level info")
-            .unwrap_or_else(|error| panic!("failed to parse level command: {error}"));
-        assert!(matches!(command, Command::TracingLevel(Some(Level::Info))));
+    fn clap_supports_help_flag() {
+        match parse_line("stats --help") {
+            ParsedLine::Output(text) => assert!(text.contains("period")),
+            _ => panic!("stats --help must print help text"),
+        }
     }
 }
