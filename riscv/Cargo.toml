@@ -12,7 +12,7 @@ ns16550a = "0.5.0"
 riscv = "0.16.0"
 riscv-rt = { version = "0.17.1", features = ["s-mode"] }
 sbi-rt = { version = "0.0.3", features = ["legacy"]}
-spin = { version = "0.9.8", default-features = false, features = ["mutex", "spin_mutex"] }
+spin = { version = "0.9.8", default-features = false, features = ["mutex", "once", "spin_mutex"] }
 trapframe = { version = "0.10.1", default-features = false }
 helios-hal.workspace = true
 helios-kernel.workspace = true

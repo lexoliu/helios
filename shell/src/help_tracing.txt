@@ -2,9 +2,9 @@ tracing command help
 
 Commands:
   tracing
-      Fetch recent tracing events immediately.
+      Stream matching tracing events continuously. Stop with `Ctrl+C`.
   tracing limit <n>
-      Set how many recent events are fetched.
+      Set how many recent events are kept in the incremental polling window.
   tracing level <none|error|warn|info|debug|trace>
       Set the minimum tracing level filter.
   tracing targets <prefix-a,prefix-b>

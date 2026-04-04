@@ -18,7 +18,7 @@ Interactive:
   stats
       Open the live stats view. Press `q` to return to the shell.
   tracing
-      Fetch one tracing snapshot with the current filters.
+      Stream tracing events with the current filters. Press `Ctrl+C` to return.
 
 Stats:
   stats
@@ -54,5 +54,6 @@ Examples:
 
 Notes:
   `stats` is the only built-in full-screen view.
+  `tracing` stays line-oriented and streams until you interrupt it with `Ctrl+C`.
   The shell itself stays line-oriented; only commands that benefit from live updates
   switch into a temporary TUI.

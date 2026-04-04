@@ -26,6 +26,7 @@ use helios_kernel::Timer;
 use riscv::interrupt::Trap;
 use riscv::interrupt::supervisor::{Exception, Interrupt};
 use riscv_rt::entry;
+use spin::Once;
 use trapframe::TrapFrame;
 
 global_asm!(include_str!("mp_hook.S"));
@@ -35,6 +36,7 @@ const UNINITIALIZED_BOOT_HART: usize = usize::MAX;
 const SSTATUS_SPP_BIT: usize = 1 << 8;
 
 static BOOT_HART_ID: AtomicUsize = AtomicUsize::new(UNINITIALIZED_BOOT_HART);
+static DEBUG_STATE: Once<debug_state::RuntimeState> = Once::new();
 
 struct SupervisorCriticalSection;
 
@@ -282,11 +284,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         helios_kernel::prime_bootstrap_allocator(memory_regions.iter().copied());
     }
 
-    let debug_state = debug_state::RuntimeState::new(
-        timebase_frequency,
-        hart_count,
-        riscv::register::time::read64(),
-    );
+    let debug_state = shared_debug_state(timebase_frequency, hart_count);
     let debug_transport = DebugTransport::discover(&fdt);
     let console = SbiConsole::new(
         debug_state.clone(),
@@ -320,6 +318,18 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         debugger_program::run_forever(cpu.clone());
     }
     kernel.run();
+}
+
+fn shared_debug_state(timebase_frequency: u64, hart_count: usize) -> debug_state::RuntimeState {
+    DEBUG_STATE
+        .call_once(|| {
+            debug_state::RuntimeState::new(
+                timebase_frequency,
+                hart_count,
+                riscv::register::time::read64(),
+            )
+        })
+        .clone()
 }
 
 unsafe extern "C" {

@@ -7,7 +7,7 @@ mod serial;
 mod stats_tui;
 mod system;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 use std::io::Write as _;
 
@@ -41,6 +41,7 @@ enum Command {
         period_ms: u64,
     },
     Tracing {
+        /// Maximum number of recent events kept in the incremental polling window.
         #[arg(long, default_value_t = 64)]
         limit: u32,
         #[arg(long)]
@@ -73,21 +74,21 @@ fn main() -> Result<()> {
 
     match args.command {
         None => repl::run(client),
-        Some(Command::Ls { path }) => runtime::block_on(async move {
+        Some(Command::Ls { path }) => run_interruptible(async move {
             let mut client = client;
             let output = filesystem::list(&mut client, path.as_deref()).await?;
             std::io::stdout().write_all(output.as_bytes())?;
             Ok(())
         }),
-        Some(Command::Rm { path }) => runtime::block_on(async move {
+        Some(Command::Rm { path }) => run_interruptible(async move {
             let mut client = client;
             filesystem::remove(&mut client, &path).await
         }),
-        Some(Command::Touch { path }) => runtime::block_on(async move {
+        Some(Command::Touch { path }) => run_interruptible(async move {
             let mut client = client;
             filesystem::touch(&mut client, &path).await
         }),
-        Some(Command::Stats { period_ms }) => runtime::block_on(async move {
+        Some(Command::Stats { period_ms }) => run_interruptible(async move {
             let mut client = client;
             stats_tui::run(&mut client, period_ms).await
         }),
@@ -95,7 +96,7 @@ fn main() -> Result<()> {
             limit,
             min_level,
             target_prefix,
-        }) => runtime::block_on(system::run_tracing(
+        }) => run_interruptible(system::run_tracing(
             client,
             limit,
             min_level.as_deref(),
@@ -105,6 +106,15 @@ fn main() -> Result<()> {
             instance,
             func,
             request_hex,
-        }) => runtime::block_on(rpc::run_call(client, &instance, &func, &request_hex)),
+        }) => run_interruptible(rpc::run_call(client, &instance, &func, &request_hex)),
+    }
+}
+
+fn run_interruptible(command: impl std::future::Future<Output = Result<()>>) -> Result<()> {
+    match runtime::block_on(runtime::interruptible(command))
+        .context("failed to listen for Ctrl+C during command execution")?
+    {
+        runtime::CommandRun::Completed(result) => result,
+        runtime::CommandRun::Interrupted => Ok(()),
     }
 }
