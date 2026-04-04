@@ -30,12 +30,23 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Print the current remote working directory.
+    Pwd,
     /// List files in the remote debugger filesystem.
     Ls { path: Option<String> },
+    /// Print remote file contents.
+    Cat { path: String },
+    /// Create a directory in the remote debugger filesystem.
+    Mkdir { path: String },
     /// Remove a file or an empty directory from the remote debugger filesystem.
     Rm { path: String },
     /// Create a file if it does not exist in the remote debugger filesystem.
     Touch { path: String },
+    /// Print text or write it into a remote file with `>` or `>>`.
+    Echo {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        words: Vec<String>,
+    },
     Stats {
         #[arg(long, default_value_t = 1_000)]
         period_ms: u64,
@@ -74,11 +85,26 @@ fn main() -> Result<()> {
 
     match args.command {
         None => repl::run(client),
+        Some(Command::Pwd) => run_interruptible(async move {
+            std::io::stdout().write_all(filesystem::pwd().as_bytes())?;
+            std::io::stdout().write_all(b"\n")?;
+            Ok(())
+        }),
         Some(Command::Ls { path }) => run_interruptible(async move {
             let mut client = client;
             let output = filesystem::list(&mut client, path.as_deref()).await?;
             std::io::stdout().write_all(output.as_bytes())?;
             Ok(())
+        }),
+        Some(Command::Cat { path }) => run_interruptible(async move {
+            let mut client = client;
+            let bytes = filesystem::cat(&mut client, &path).await?;
+            std::io::stdout().write_all(&bytes)?;
+            Ok(())
+        }),
+        Some(Command::Mkdir { path }) => run_interruptible(async move {
+            let mut client = client;
+            filesystem::mkdir(&mut client, &path).await
         }),
         Some(Command::Rm { path }) => run_interruptible(async move {
             let mut client = client;
@@ -87,6 +113,18 @@ fn main() -> Result<()> {
         Some(Command::Touch { path }) => run_interruptible(async move {
             let mut client = client;
             filesystem::touch(&mut client, &path).await
+        }),
+        Some(Command::Echo { words }) => run_interruptible(async move {
+            let mut client = client;
+            match filesystem::parse_echo(&words)? {
+                filesystem::EchoTarget::Stdout(bytes) => std::io::stdout().write_all(&bytes)?,
+                filesystem::EchoTarget::File {
+                    path,
+                    bytes,
+                    append,
+                } => filesystem::write(&mut client, &path, &bytes, append).await?,
+            }
+            Ok(())
         }),
         Some(Command::Stats { period_ms }) => run_interruptible(async move {
             let mut client = client;

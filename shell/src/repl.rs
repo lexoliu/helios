@@ -72,7 +72,8 @@ pub fn run(mut client: RpcClient) -> Result<()> {
 const PROMPT: &str = "helios> ";
 const LIVE_STATS_PERIOD_MS: u64 = 1_000;
 const ROOT_CANDIDATES: &[&str] = &[
-    "help", "clear", "exit", "ls", "rm", "touch", "stats", "tracing", "rpc", "--help",
+    "help", "clear", "exit", "pwd", "ls", "cat", "mkdir", "rm", "touch", "echo", "stats",
+    "tracing", "rpc", "--help",
 ];
 const HELP_CANDIDATES: &[&str] = &["overview", "stats", "tracing", "rpc", "--help"];
 const STATS_CANDIDATES: &[&str] = &["--help"];
@@ -136,12 +137,23 @@ enum CliCommand {
     Clear,
     /// Leave the shell.
     Exit,
+    /// Print the current remote working directory.
+    Pwd,
     /// List files in the remote debugger filesystem.
     Ls { path: Option<String> },
+    /// Print remote file contents.
+    Cat { path: String },
+    /// Create a directory in the remote debugger filesystem.
+    Mkdir { path: String },
     /// Remove a file or an empty directory from the remote debugger filesystem.
     Rm { path: String },
     /// Create a file if it does not exist in the remote debugger filesystem.
     Touch { path: String },
+    /// Print text or write it into a remote file with `>` or `>>`.
+    Echo {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        words: Vec<String>,
+    },
     /// Open the live stats view.
     Stats,
     /// Stream tracing events until interrupted or configure tracing filters.
@@ -193,9 +205,13 @@ enum Command {
     Help(HelpTopic),
     Clear,
     Exit,
+    Pwd,
     List(Option<String>),
+    Cat(String),
+    Mkdir(String),
     Remove(String),
     Touch(String),
+    Echo(filesystem::EchoTarget),
     ShowStats,
     ShowTracing,
     TracingLimit(u32),
@@ -252,6 +268,13 @@ impl Shell {
         Ok(())
     }
 
+    fn write_bytes(&self, bytes: &[u8]) -> Result<()> {
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(bytes)?;
+        stdout.flush()?;
+        Ok(())
+    }
+
     fn clear_screen(&self) -> Result<()> {
         let mut stdout = std::io::stdout().lock();
         execute!(stdout, Clear(ClearType::All), MoveTo(0, 0))
@@ -265,12 +288,26 @@ impl Shell {
             Command::Help(topic) => self.print_block(&render_help(topic))?,
             Command::Clear => self.clear_screen()?,
             Command::Exit => return Ok(true),
+            Command::Pwd => self.print_line(filesystem::pwd())?,
             Command::List(path) => {
                 let output = filesystem::list(client, path.as_deref()).await?;
                 self.print_block(&output)?;
             }
+            Command::Cat(path) => {
+                let bytes = filesystem::cat(client, &path).await?;
+                self.write_bytes(&bytes)?;
+            }
+            Command::Mkdir(path) => filesystem::mkdir(client, &path).await?,
             Command::Remove(path) => filesystem::remove(client, &path).await?,
             Command::Touch(path) => filesystem::touch(client, &path).await?,
+            Command::Echo(target) => match target {
+                filesystem::EchoTarget::Stdout(bytes) => self.write_bytes(&bytes)?,
+                filesystem::EchoTarget::File {
+                    path,
+                    bytes,
+                    append,
+                } => filesystem::write(client, &path, &bytes, append).await?,
+            },
             Command::ShowStats => stats_tui::run(client, LIVE_STATS_PERIOD_MS).await?,
             Command::ShowTracing => self.show_tracing(client).await?,
             Command::TracingLimit(limit) => {
@@ -449,7 +486,10 @@ fn parse_line(input: &str) -> ParsedLine {
     };
 
     match ReplCli::try_parse_from(tokens.iter().map(String::as_str)) {
-        Ok(cli) => ParsedLine::Command(cli.command.into_runtime_command()),
+        Ok(cli) => match cli.command.into_runtime_command() {
+            Ok(command) => ParsedLine::Command(command),
+            Err(error) => ParsedLine::Output(format!("error: {error}")),
+        },
         Err(error) => ParsedLine::Output(render_clap_error(error, &tokens)),
     }
 }
@@ -593,14 +633,18 @@ fn render_help(topic: HelpTopic) -> String {
 }
 
 impl CliCommand {
-    fn into_runtime_command(self) -> Command {
-        match self {
+    fn into_runtime_command(self) -> Result<Command> {
+        Ok(match self {
             Self::Help { topic } => Command::Help(topic.unwrap_or(HelpTopic::Overview)),
             Self::Clear => Command::Clear,
             Self::Exit => Command::Exit,
+            Self::Pwd => Command::Pwd,
             Self::Ls { path } => Command::List(path),
+            Self::Cat { path } => Command::Cat(path),
+            Self::Mkdir { path } => Command::Mkdir(path),
             Self::Rm { path } => Command::Remove(path),
             Self::Touch { path } => Command::Touch(path),
+            Self::Echo { words } => Command::Echo(filesystem::parse_echo(&words)?),
             Self::Stats => Command::ShowStats,
             Self::Tracing { action } => match action {
                 None => Command::ShowTracing,
@@ -616,7 +660,7 @@ impl CliCommand {
                 RpcAction::Payload { hex } => Command::RpcPayload(hex),
                 RpcAction::Call => Command::RpcCall,
             },
-        }
+        })
     }
 }
 
@@ -686,7 +730,9 @@ fn completion_candidates<'a>(tokens: &[&str], current: &str) -> &'a [&'a str] {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_line, Command, HelpTopic, ParsedLine};
+    use crate::filesystem::EchoTarget;
+
+    use super::{Command, HelpTopic, ParsedLine, parse_line};
 
     #[test]
     fn parses_stats_command() {
@@ -701,6 +747,14 @@ mod tests {
         match parse_line("clear") {
             ParsedLine::Command(Command::Clear) => {}
             _ => panic!("clear command must parse"),
+        }
+    }
+
+    #[test]
+    fn parses_pwd_command() {
+        match parse_line("pwd") {
+            ParsedLine::Command(Command::Pwd) => {}
+            _ => panic!("pwd command must parse"),
         }
     }
 
@@ -725,6 +779,38 @@ mod tests {
         match parse_line("touch /tmp/file") {
             ParsedLine::Command(Command::Touch(path)) => assert_eq!(path, "/tmp/file"),
             _ => panic!("touch command must parse"),
+        }
+    }
+
+    #[test]
+    fn parses_cat_command() {
+        match parse_line("cat /tmp/file") {
+            ParsedLine::Command(Command::Cat(path)) => assert_eq!(path, "/tmp/file"),
+            _ => panic!("cat command must parse"),
+        }
+    }
+
+    #[test]
+    fn parses_mkdir_command() {
+        match parse_line("mkdir /tmp/dir") {
+            ParsedLine::Command(Command::Mkdir(path)) => assert_eq!(path, "/tmp/dir"),
+            _ => panic!("mkdir command must parse"),
+        }
+    }
+
+    #[test]
+    fn parses_echo_redirection() {
+        match parse_line("echo hello > /tmp/file") {
+            ParsedLine::Command(Command::Echo(EchoTarget::File {
+                path,
+                bytes,
+                append,
+            })) => {
+                assert_eq!(path, "/tmp/file");
+                assert_eq!(bytes, b"hello\n");
+                assert!(!append);
+            }
+            _ => panic!("echo redirection must parse"),
         }
     }
 

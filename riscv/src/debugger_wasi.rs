@@ -567,6 +567,47 @@ impl DebugFileSystem {
         Ok(())
     }
 
+    fn create_directory_at(
+        &mut self,
+        base: &FsDescriptor,
+        path: &str,
+        now_nanos: u64,
+    ) -> core::result::Result<(), fs_types::ErrorCode> {
+        if !base
+            .flags
+            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
+        {
+            return Err(fs_types::ErrorCode::ReadOnly);
+        }
+        if base.kind != FsNodeKind::Directory {
+            return Err(fs_types::ErrorCode::NotDirectory);
+        }
+
+        let absolute = resolve_child_path(&base.path, path)?;
+        if absolute == "/" {
+            return Err(fs_types::ErrorCode::Exist);
+        }
+        if self.get_node(&absolute).is_ok() {
+            return Err(fs_types::ErrorCode::Exist);
+        }
+
+        let parent = parent_path(&absolute);
+        let parent_node = self.get_node(parent)?;
+        if parent_node.kind != FsNodeKind::Directory {
+            return Err(fs_types::ErrorCode::NotDirectory);
+        }
+
+        self.nodes.push(FsNode {
+            path: absolute,
+            kind: FsNodeKind::Directory,
+            contents: Vec::new(),
+            inode: self.next_inode,
+            modified_nanos: now_nanos,
+        });
+        self.next_inode += 1;
+        Ok(())
+    }
+
     fn unlink_file_at(
         &mut self,
         base: &FsDescriptor,
@@ -971,11 +1012,18 @@ impl wasi::filesystem::types::HostDescriptorWithStore for HasSelf<StoreData> {
     }
 
     async fn create_directory_at<T: Send>(
-        _: &Accessor<T, Self>,
-        _: Resource<FsDescriptor>,
-        _: String,
+        accessor: &Accessor<T, Self>,
+        descriptor: Resource<FsDescriptor>,
+        path: String,
     ) -> Result<core::result::Result<(), fs_types::ErrorCode>> {
-        Ok(Err(fs_types::ErrorCode::Unsupported))
+        Ok(accessor.with(|mut access| {
+            let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
+            let now_nanos = access.get().now_nanos();
+            access
+                .get()
+                .filesystem
+                .create_directory_at(&descriptor, &path, now_nanos)
+        }))
     }
 
     async fn stat<T: Send>(
@@ -1574,5 +1622,41 @@ fn is_dir_first(kind: fs_types::DescriptorType) -> u8 {
     match kind {
         fs_types::DescriptorType::Directory => 0,
         _ => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DebugFileSystem, FsNodeKind, bindings};
+
+    #[test]
+    fn create_directory_adds_node() {
+        let mut filesystem = DebugFileSystem::new();
+        let root = filesystem.root_descriptor();
+
+        filesystem
+            .create_directory_at(&root, "tmp", 7)
+            .expect("directory creation must succeed");
+
+        let node = filesystem
+            .get_node("/tmp")
+            .expect("directory node must exist after creation");
+        assert_eq!(node.kind, FsNodeKind::Directory);
+        assert_eq!(node.modified_nanos, 7);
+    }
+
+    #[test]
+    fn create_directory_rejects_existing_path() {
+        let mut filesystem = DebugFileSystem::new();
+        let root = filesystem.root_descriptor();
+
+        filesystem
+            .create_directory_at(&root, "tmp", 1)
+            .expect("initial directory creation must succeed");
+
+        let error = filesystem
+            .create_directory_at(&root, "tmp", 2)
+            .expect_err("creating the same directory twice must fail");
+        assert_eq!(error, bindings::wasi::filesystem::types::ErrorCode::Exist);
     }
 }
