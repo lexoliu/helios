@@ -1,6 +1,7 @@
 mod config;
 mod console;
 mod cpu;
+mod debugger_bindings;
 mod init_program;
 mod observer_buffer;
 mod observer_host;

@@ -1,0 +1,24 @@
+package helios:system@0.1.0;
+
+interface instances {
+  /// Stable identifier for a live wasm instance.
+  type instance-id = u64;
+
+  /// Monotonic nanoseconds since system boot.
+  type mono-nanos = u64;
+
+  /// Recent instance CPU activity in permille over the last observation window.
+  type permille = u16;
+
+  record instance {
+    id: instance-id,
+    name: string,
+    started-at: mono-nanos,
+    uptime: mono-nanos,
+    memory-bytes: u64,
+    cpu-busy: permille,
+  }
+
+  /// Returns the current live wasm instances visible to the privileged caller.
+  snapshot: func() -> list<instance>;
+}

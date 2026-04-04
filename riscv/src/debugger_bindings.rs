@@ -1,7 +1,7 @@
 pub(crate) mod bindings {
     wasmtime::component::bindgen!({
         path: "../wit",
-        world: "init",
+        world: "debugger",
         imports: { default: async | store | trappable },
         exports: { default: async },
         with: {

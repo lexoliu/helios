@@ -1218,6 +1218,7 @@ dependencies = [
  "helios-kernel-macro",
  "nu-ansi-term",
  "objectpool",
+ "spin 0.9.8",
  "thiserror",
  "tracing",
  "walkdir",

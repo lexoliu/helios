@@ -2,11 +2,11 @@ use std::io;
 
 use anyhow::{Context as _, Result, bail};
 use futures_io::{AsyncRead, AsyncWrite};
-use helios_api::{stats as host_stats, tracing as host_tracing};
+use helios_api::{instances as host_instances, stats as host_stats, tracing as host_tracing};
 
 use crate::wire::{Frame, read_frame, write_frame};
 
-use super::bindings::helios::system::{stats, tracing};
+use super::bindings::helios::system::{instances, stats, tracing};
 use crate::debugger::filesystem;
 
 pub async fn serve<R, W>(mut read: R, mut write: W) -> Result<()>
@@ -71,7 +71,9 @@ where
 fn supports_request(instance: &str, func: &str) -> bool {
     matches!(
         (instance, func),
-        ("helios:system/stats@0.1.0", "snapshot") | ("helios:system/tracing@0.1.0", "recent")
+        ("helios:system/stats@0.1.0", "snapshot")
+            | ("helios:system/instances@0.1.0", "snapshot")
+            | ("helios:system/tracing@0.1.0", "recent")
     ) || filesystem::supports(instance, func)
 }
 
@@ -83,6 +85,16 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>>
             }
             let snapshot = convert_sample(host_stats::snapshot());
             postcard::to_allocvec(&snapshot).context("failed to encode stats snapshot response")
+        }
+        ("helios:system/instances@0.1.0", "snapshot") => {
+            if !payload.is_empty() {
+                bail!("instances.snapshot does not accept request payload bytes");
+            }
+            let snapshot = host_instances::snapshot()
+                .into_iter()
+                .map(convert_instance)
+                .collect::<Vec<_>>();
+            postcard::to_allocvec(&snapshot).context("failed to encode instances snapshot response")
         }
         ("helios:system/tracing@0.1.0", "recent") => {
             let (filter, limit): (tracing::Filter, u32) = postcard::from_bytes(payload)
@@ -190,6 +202,17 @@ fn convert_memory_pressure(pressure: host_stats::MemoryPressure) -> stats::Memor
         host_stats::MemoryPressure::Elevated => stats::MemoryPressure::Elevated,
         host_stats::MemoryPressure::High => stats::MemoryPressure::High,
         host_stats::MemoryPressure::Critical => stats::MemoryPressure::Critical,
+    }
+}
+
+fn convert_instance(instance: host_instances::Instance) -> instances::Instance {
+    instances::Instance {
+        id: instance.id,
+        name: instance.name,
+        started_at: instance.started_at,
+        uptime: instance.uptime,
+        memory_bytes: instance.memory_bytes,
+        cpu_busy: instance.cpu_busy,
     }
 }
 

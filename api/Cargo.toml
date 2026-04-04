@@ -7,6 +7,7 @@ edition = "2021"
 default = ["channel", "fs", "io", "serial", "stats", "sync", "task", "tracing"]
 channel = ["dep:async-channel"]
 fs = ["dep:futures-lite"]
+instances = []
 io = ["dep:futures-io", "dep:futures-lite"]
 serial = []
 stats = []

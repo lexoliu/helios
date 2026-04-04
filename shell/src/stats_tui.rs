@@ -10,12 +10,15 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use futures_lite::future;
+use helios_shell_protocol::system::instances;
 use helios_shell_protocol::system::stats::{self, MemoryPressure};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Bar, BarChart, BarGroup, Block, Borders, Gauge, Paragraph, Wrap};
+use ratatui::widgets::{
+    Bar, BarChart, BarGroup, Block, Borders, Cell, Gauge, Paragraph, Row, Table, Wrap,
+};
 use ratatui::Terminal;
 
 use crate::serial::RpcClient;
@@ -70,6 +73,7 @@ impl Drop for TerminalGuard {
 struct App {
     period_ms: u64,
     sample: Option<stats::Sample>,
+    instances: Vec<instances::Instance>,
     last_updated: Option<Instant>,
     status: String,
 }
@@ -85,6 +89,7 @@ impl App {
         Self {
             period_ms,
             sample: None,
+            instances: Vec::new(),
             last_updated: None,
             status: "live stats view; press q to return to the shell".to_owned(),
         }
@@ -106,13 +111,17 @@ impl App {
     }
 
     async fn refresh(&mut self, client: &mut RpcClient) {
-        match system::fetch_stats(client).await {
-            Ok(sample) => {
+        match (
+            system::fetch_stats(client).await,
+            system::fetch_instances(client).await,
+        ) {
+            (Ok(sample), Ok(instances)) => {
                 self.sample = Some(sample);
+                self.instances = instances;
                 self.last_updated = Some(Instant::now());
                 self.status = "live stats view; press q to return to the shell".to_owned();
             }
-            Err(error) => {
+            (Err(error), _) | (_, Err(error)) => {
                 self.status = error.to_string();
             }
         }
@@ -161,7 +170,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(5),
-            Constraint::Min(10),
+            Constraint::Min(14),
             Constraint::Length(3),
         ])
         .split(frame.area());
@@ -169,7 +178,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     match &app.sample {
         Some(sample) => {
             draw_summary(frame, layout[0], sample);
-            draw_main_panels(frame, layout[1], sample);
+            draw_main_panels(frame, layout[1], sample, &app.instances);
         }
         None => draw_empty(frame, layout[0], layout[1], app),
     }
@@ -226,14 +235,25 @@ fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Samp
     );
 }
 
-fn draw_main_panels(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Sample) {
+fn draw_main_panels(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    sample: &stats::Sample,
+    instances: &[instances::Instance],
+) {
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(10), Constraint::Min(6)])
+        .split(area);
+
     let panels = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
-        .split(area);
+        .split(sections[0]);
 
     draw_cpu_chart(frame, panels[0], sample);
     draw_memory_panel(frame, panels[1], sample);
+    draw_instances_panel(frame, sections[1], instances);
 }
 
 fn draw_empty(frame: &mut ratatui::Frame<'_>, top: Rect, body: Rect, app: &App) {
@@ -263,6 +283,55 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         )
         .wrap(Wrap { trim: true });
     frame.render_widget(status, area);
+}
+
+fn draw_instances_panel(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    instances: &[instances::Instance],
+) {
+    if instances.is_empty() {
+        frame.render_widget(
+            Paragraph::new("no live wasm instances reported")
+                .block(Block::default().title("Instances").borders(Borders::ALL))
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    }
+
+    let rows = instances.iter().map(|instance| {
+        Row::new([
+            Cell::from(instance.id.to_string()),
+            Cell::from(instance.name.clone()),
+            Cell::from(format_duration(instance.started_at)),
+            Cell::from(format_duration(instance.uptime)),
+            Cell::from(format!("{:>5.1}%", f64::from(instance.cpu_busy) / 10.0)),
+            Cell::from(format_bytes(instance.memory_bytes)),
+        ])
+    });
+    let header = Row::new(["id", "name", "started", "uptime", "cpu", "memory"])
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .bottom_margin(1);
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(4),
+            Constraint::Min(16),
+            Constraint::Length(8),
+            Constraint::Length(8),
+            Constraint::Length(7),
+            Constraint::Length(12),
+        ],
+    )
+    .header(header)
+    .block(Block::default().title("Instances").borders(Borders::ALL))
+    .column_spacing(1);
+    frame.render_widget(table, area);
 }
 
 fn draw_cpu_chart(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Sample) {

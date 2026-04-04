@@ -1,21 +1,22 @@
 use std::fs;
 use std::path::Path;
 use std::thread;
+use std::time::Instant as StdInstant;
 
 use helios_kernel::{
-    EmbeddedComponent, EmbeddedDebugger, EmbeddedInit, Kernel, embedded_debugger, embedded_init,
+    EmbeddedComponent, EmbeddedDebugger, EmbeddedInit, InstanceExecutionTransition,
+    InstanceRegistry, Kernel, RegisteredInstance, embedded_debugger, embedded_init,
 };
 use tempfile::TempDir;
 use thiserror::Error;
 use wasmtime::component::{HasSelf, ResourceTable};
-use wasmtime::{Config, Engine, Store};
+use wasmtime::{CallHook, Config, Engine, ResourceLimiter, Store};
 use wasmtime_wasi::cli;
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::config::HostedConfig;
 use crate::cpu::HostedCpu;
 use crate::observer_buffer::SharedObserverBuffer;
-use crate::program_bindings::bindings::Init;
 use crate::serial_host::HostedSerialIo;
 
 const WASMTIME_TARGET: &str = env!("HELIOS_HOSTED_TARGET");
@@ -24,6 +25,8 @@ pub fn spawn_init(
     _kernel: &Kernel<HostedCpu>,
     config: &HostedConfig,
     observer: SharedObserverBuffer,
+    instance_registry: InstanceRegistry,
+    boot_started_at: StdInstant,
 ) {
     let init = embedded_init()
         .unwrap_or_else(|| panic!("no embedded init program found; set HELIOS_INIT_WASM"));
@@ -31,7 +34,15 @@ pub fn spawn_init(
 
     thread::Builder::new()
         .name("helios-init".to_owned())
-        .spawn(move || run_component_thread(EmbeddedHostedProgram::Init(init), config, observer))
+        .spawn(move || {
+            run_component_thread(
+                EmbeddedHostedProgram::Init(init),
+                config,
+                observer,
+                instance_registry,
+                boot_started_at,
+            )
+        })
         .unwrap_or_else(|error| panic!("failed to spawn hosted init thread: {error}"));
 }
 
@@ -39,6 +50,8 @@ pub fn spawn_debugger(
     _kernel: &Kernel<HostedCpu>,
     config: &HostedConfig,
     observer: SharedObserverBuffer,
+    instance_registry: InstanceRegistry,
+    boot_started_at: StdInstant,
 ) {
     let debugger = embedded_debugger()
         .unwrap_or_else(|| panic!("no embedded debugger program found; set HELIOS_DEBUGGER_WASM"));
@@ -47,7 +60,13 @@ pub fn spawn_debugger(
     thread::Builder::new()
         .name("helios-debugger".to_owned())
         .spawn(move || {
-            run_component_thread(EmbeddedHostedProgram::Debugger(debugger), config, observer)
+            run_component_thread(
+                EmbeddedHostedProgram::Debugger(debugger),
+                config,
+                observer,
+                instance_registry,
+                boot_started_at,
+            )
         })
         .unwrap_or_else(|error| panic!("failed to spawn hosted debugger thread: {error}"));
 }
@@ -56,15 +75,26 @@ fn run_component_thread(
     program: EmbeddedHostedProgram,
     config: HostedConfig,
     observer: SharedObserverBuffer,
+    instance_registry: InstanceRegistry,
+    boot_started_at: StdInstant,
 ) {
-    run_component_thread_with_serial(program, config, observer, Some(HostedSerialIo::new()))
-        .unwrap_or_else(|error| panic!("failed to launch embedded component: {error}"));
+    run_component_thread_with_serial(
+        program,
+        config,
+        observer,
+        instance_registry,
+        boot_started_at,
+        Some(HostedSerialIo::new()),
+    )
+    .unwrap_or_else(|error| panic!("failed to launch embedded component: {error}"));
 }
 
 fn run_component_thread_with_serial(
     program: EmbeddedHostedProgram,
     config: HostedConfig,
     observer: SharedObserverBuffer,
+    instance_registry: InstanceRegistry,
+    boot_started_at: StdInstant,
     serial: Option<HostedSerialIo>,
 ) -> Result<(), HostedProgramError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -73,7 +103,12 @@ fn run_component_thread_with_serial(
         .unwrap_or_else(|error| panic!("failed to build hosted component runtime: {error}"));
 
     runtime.block_on(run_component_with_serial(
-        program, &config, observer, serial,
+        program,
+        &config,
+        observer,
+        instance_registry,
+        boot_started_at,
+        serial,
     ))
 }
 
@@ -81,6 +116,8 @@ async fn run_component_with_serial(
     program: EmbeddedHostedProgram,
     config: &HostedConfig,
     observer: SharedObserverBuffer,
+    instance_registry: InstanceRegistry,
+    boot_started_at: StdInstant,
     serial: Option<HostedSerialIo>,
 ) -> Result<(), HostedProgramError> {
     let engine = build_engine()?;
@@ -92,16 +129,8 @@ async fn run_component_with_serial(
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)
         .map_err(HostedProgramError::LinkComponent)?;
     wasmtime_wasi::p3::add_to_linker(&mut linker).map_err(HostedProgramError::LinkComponent)?;
-    crate::program_bindings::bindings::helios::system::serial::add_to_linker::<_, HasSelf<_>>(
-        &mut linker,
-        |state| state,
-    )
-    .map_err(HostedProgramError::LinkComponent)?;
-    crate::program_bindings::bindings::helios::system::sync::add_to_linker::<_, HasSelf<_>>(
-        &mut linker,
-        |state| state,
-    )
-    .map_err(HostedProgramError::LinkComponent)?;
+    add_generated_bindings_to_linker(&program, &mut linker)
+        .map_err(HostedProgramError::LinkComponent)?;
     crate::observer_host::add_to_linker(&mut linker).map_err(HostedProgramError::LinkComponent)?;
 
     let mounted_bootfs = match &program {
@@ -112,6 +141,8 @@ async fn run_component_with_serial(
     };
     let wasi = build_wasi_ctx(config, &program, mounted_bootfs.as_ref())
         .map_err(HostedProgramError::ConfigureWasi)?;
+    let instance =
+        instance_registry.register(program.name().to_string(), nanos_since(boot_started_at));
     let mut store = Store::new(
         &engine,
         StoreData {
@@ -119,21 +150,79 @@ async fn run_component_with_serial(
             wasi,
             serial,
             processor_count: config.processor_count() as u32,
-            started_at: std::time::Instant::now(),
+            boot_started_at,
             observer,
+            instance_registry,
+            instance,
             mounted_bootfs,
         },
     );
+    store.limiter(|state| state);
+    store.call_hook(|mut caller, hook| {
+        caller.data_mut().record_call_hook(hook);
+        Ok(())
+    });
 
-    let instance = Init::instantiate_async(&mut store, &component, &linker)
-        .await
-        .map_err(HostedProgramError::InstantiateComponent)?;
-    let result = store
-        .run_concurrent(async move |accessor| instance.wasi_cli_run().call_run(accessor).await)
-        .await
-        .map_err(HostedProgramError::RunConcurrent)?
-        .map_err(HostedProgramError::RunComponent)?;
+    let result = match &program {
+        EmbeddedHostedProgram::Init(_) => {
+            let instance = crate::program_bindings::bindings::Init::instantiate_async(
+                &mut store, &component, &linker,
+            )
+            .await
+            .map_err(HostedProgramError::InstantiateComponent)?;
+            store
+                .run_concurrent(async move |accessor| {
+                    instance.wasi_cli_run().call_run(accessor).await
+                })
+                .await
+                .map_err(HostedProgramError::RunConcurrent)?
+                .map_err(HostedProgramError::RunComponent)?
+        }
+        EmbeddedHostedProgram::Debugger(_) => {
+            let instance = crate::debugger_bindings::bindings::Debugger::instantiate_async(
+                &mut store, &component, &linker,
+            )
+            .await
+            .map_err(HostedProgramError::InstantiateComponent)?;
+            store
+                .run_concurrent(async move |accessor| {
+                    instance.wasi_cli_run().call_run(accessor).await
+                })
+                .await
+                .map_err(HostedProgramError::RunConcurrent)?
+                .map_err(HostedProgramError::RunComponent)?
+        }
+    };
     result.map_err(|()| HostedProgramError::GuestFailed(program.name().to_owned()))?;
+    Ok(())
+}
+
+fn add_generated_bindings_to_linker(
+    program: &EmbeddedHostedProgram,
+    linker: &mut wasmtime::component::Linker<StoreData>,
+) -> wasmtime::Result<()> {
+    match program {
+        EmbeddedHostedProgram::Init(_) => {
+            crate::program_bindings::bindings::helios::system::serial::add_to_linker::<
+                _,
+                HasSelf<_>,
+            >(linker, |state| state)?;
+            crate::program_bindings::bindings::helios::system::sync::add_to_linker::<_, HasSelf<_>>(
+                linker,
+                |state| state,
+            )?;
+        }
+        EmbeddedHostedProgram::Debugger(_) => {
+            crate::debugger_bindings::bindings::helios::system::serial::add_to_linker::<
+                _,
+                HasSelf<_>,
+            >(linker, |state| state)?;
+            crate::debugger_bindings::bindings::helios::system::sync::add_to_linker::<_, HasSelf<_>>(
+                linker,
+                |state| state,
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -215,9 +304,54 @@ pub(crate) struct StoreData {
     pub(crate) wasi: WasiCtx,
     pub(crate) serial: Option<HostedSerialIo>,
     pub(crate) processor_count: u32,
-    pub(crate) started_at: std::time::Instant,
+    pub(crate) boot_started_at: StdInstant,
     pub(crate) observer: SharedObserverBuffer,
+    pub(crate) instance_registry: InstanceRegistry,
+    pub(crate) instance: RegisteredInstance,
     mounted_bootfs: Option<MountedBootFs>,
+}
+
+impl StoreData {
+    pub(crate) fn boot_now_nanos(&self) -> u64 {
+        nanos_since(self.boot_started_at)
+    }
+
+    fn record_call_hook(&mut self, hook: CallHook) {
+        let transition = match hook {
+            CallHook::CallingWasm | CallHook::ReturningFromHost => {
+                InstanceExecutionTransition::Resume
+            }
+            CallHook::ReturningFromWasm | CallHook::CallingHost => {
+                InstanceExecutionTransition::Pause
+            }
+        };
+        self.instance.transition(transition, self.boot_now_nanos());
+    }
+}
+
+impl ResourceLimiter for StoreData {
+    fn memory_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        let allow = maximum.is_none_or(|maximum| desired <= maximum);
+        if allow {
+            self.instance
+                .set_memory_bytes(u64::try_from(desired).expect("desired memory exceeds u64"));
+        }
+        Ok(allow)
+    }
+
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        Ok(maximum.is_none_or(|maximum| desired <= maximum))
+    }
 }
 
 impl WasiView for StoreData {
@@ -266,6 +400,11 @@ impl MountedBootFs {
     fn path(&self) -> &Path {
         self.directory.path()
     }
+}
+
+fn nanos_since(started_at: StdInstant) -> u64 {
+    u64::try_from(started_at.elapsed().as_nanos())
+        .expect("hosted monotonic nanoseconds do not fit into u64")
 }
 
 #[derive(Debug, Error)]
@@ -322,7 +461,7 @@ mod tests {
     use std::time::Duration;
     use std::time::Instant as StdInstant;
 
-    use helios_kernel::embedded_debugger;
+    use helios_kernel::{InstanceRegistry, embedded_debugger};
     use tokio::time::timeout;
     use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 
@@ -362,12 +501,16 @@ mod tests {
                 let (serial, peer, serial_trace) = HostedSerialIo::traced_duplex_pair(4096);
                 let component_config = config.clone();
                 let component_observer = observer.clone();
+                let instance_registry = InstanceRegistry::new();
+                let boot_started_at = StdInstant::now();
                 let (result_tx, result_rx) = mpsc::sync_channel(1);
                 let component_thread = std::thread::spawn(move || {
                     let result = run_component_thread_with_serial(
                         EmbeddedHostedProgram::Debugger(debugger),
                         component_config,
                         component_observer,
+                        instance_registry,
+                        boot_started_at,
                         Some(serial),
                     );
                     result_tx.send(result).unwrap_or_else(|error| {
@@ -463,131 +606,17 @@ mod tests {
                     "second stats processor list must match reported online processor count"
                 );
 
-                let early_raw_mutex = timeout(
+                let instances = timeout(
                     Duration::from_secs(30),
-                    helios_shell_protocol::system::sync::raw_mutex(&mut client),
+                    helios_shell_protocol::system::instances::snapshot(&mut client),
                 )
                 .await
-                .unwrap_or_else(|_| panic!("timed out creating early remote raw mutex"))
-                .unwrap_or_else(|error| panic!("failed to create early remote raw mutex: {error}"));
-                let early_raw_mutex_guard =
-                    timeout(Duration::from_secs(30), early_raw_mutex.lock(&mut client))
-                        .await
-                        .unwrap_or_else(|_| panic!("timed out locking early remote raw mutex"))
-                        .unwrap_or_else(|error| {
-                            panic!("failed to lock early remote raw mutex: {error}")
-                        });
-                timeout(
-                    Duration::from_secs(30),
-                    early_raw_mutex_guard.drop_remote(&mut client),
-                )
-                .await
-                .unwrap_or_else(|_| panic!("timed out dropping early remote raw mutex guard"))
-                .unwrap_or_else(|error| {
-                    panic!("failed to drop early remote raw mutex guard: {error}")
-                });
-                timeout(Duration::from_secs(30), early_raw_mutex.drop_remote(&mut client))
-                    .await
-                    .unwrap_or_else(|_| panic!("timed out dropping early remote raw mutex"))
-                    .unwrap_or_else(|error| {
-                        panic!("failed to drop early remote raw mutex: {error}")
-                    });
-
-                let debug_port = timeout(
-                    Duration::from_secs(30),
-                    helios_shell_protocol::system::serial::debug_port(&mut client),
-                )
-                .await
-                .unwrap_or_else(|_| {
-                    let debugger_status = match result_rx.try_recv() {
-                        Ok(result) => format!("thread exited with {result:?}"),
-                        Err(mpsc::TryRecvError::Empty) => "thread still running".to_owned(),
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            "thread panicked or disconnected".to_owned()
-                        }
-                    };
-                    panic!(
-                        "timed out waiting for remote debug serial capability; {debugger_status}; reads={}, writes={}, flushes={}, read-bytes={}, write-bytes={}",
-                        serial_trace.reads(),
-                        serial_trace.writes(),
-                        serial_trace.flushes(),
-                        format_serial_chunks(&serial_trace.read_bytes()),
-                        format_serial_chunks(&serial_trace.write_bytes()),
-                    )
-                })
-                .unwrap_or_else(|error| {
-                    panic!("failed to fetch remote debug serial capability: {error:#}")
-                })
-                .unwrap_or_else(|| panic!("remote debugger did not expose a debug serial capability"));
-                let rights = timeout(Duration::from_secs(30), debug_port.rights(&mut client))
-                    .await
-                    .unwrap_or_else(|_| panic!("timed out waiting for remote debug serial rights"))
-                    .unwrap_or_else(|error| {
-                        let debugger_status = match result_rx.try_recv() {
-                            Ok(result) => format!("thread exited with {result:?}"),
-                            Err(mpsc::TryRecvError::Empty) => "thread still running".to_owned(),
-                            Err(mpsc::TryRecvError::Disconnected) => {
-                                "thread panicked or disconnected".to_owned()
-                            }
-                        };
-                        panic!(
-                            "failed to fetch remote debug serial rights: {error:#}; {debugger_status}"
-                        )
-                    });
+                .unwrap_or_else(|_| panic!("timed out waiting for remote instances snapshot"))
+                .unwrap_or_else(|error| panic!("failed to fetch remote instances: {error:#}"));
                 assert!(
-                    rights
-                        == helios_shell_protocol::system::serial::SerialRights::READ
-                            | helios_shell_protocol::system::serial::SerialRights::WRITE
-                            | helios_shell_protocol::system::serial::SerialRights::FLUSH,
-                    "remote debug serial rights were incomplete"
+                    instances.iter().any(|instance| instance.name == "debugger"),
+                    "remote instances snapshot did not include the debugger: {instances:?}"
                 );
-                timeout(Duration::from_secs(30), debug_port.drop_remote(&mut client))
-                    .await
-                    .unwrap_or_else(|_| panic!("timed out dropping remote debug serial capability"))
-                    .unwrap_or_else(|error| panic!("failed to drop remote debug serial capability: {error}"));
-
-                let raw_mutex = timeout(
-                    Duration::from_secs(30),
-                    helios_shell_protocol::system::sync::raw_mutex(&mut client),
-                )
-                .await
-                .unwrap_or_else(|_| panic!("timed out creating remote raw mutex"))
-                .unwrap_or_else(|error| panic!("failed to create remote raw mutex: {error}"));
-                let raw_mutex_guard = timeout(Duration::from_secs(30), raw_mutex.lock(&mut client))
-                    .await
-                    .unwrap_or_else(|_| panic!("timed out locking remote raw mutex"))
-                    .unwrap_or_else(|error| panic!("failed to lock remote raw mutex: {error}"));
-                timeout(
-                    Duration::from_secs(30),
-                    raw_mutex_guard.drop_remote(&mut client),
-                )
-                .await
-                .unwrap_or_else(|_| panic!("timed out dropping remote raw mutex guard"))
-                .unwrap_or_else(|error| panic!("failed to drop remote raw mutex guard: {error}"));
-                timeout(Duration::from_secs(30), raw_mutex.drop_remote(&mut client))
-                    .await
-                    .unwrap_or_else(|_| panic!("timed out dropping remote raw mutex"))
-                    .unwrap_or_else(|error| panic!("failed to drop remote raw mutex: {error}"));
-
-                {
-                    let mut subscription = timeout(
-                        Duration::from_secs(30),
-                        helios_shell_protocol::system::stats::subscribe(&mut client, 1),
-                    )
-                    .await
-                    .unwrap_or_else(|_| panic!("timed out subscribing to remote stats"))
-                    .unwrap_or_else(|error| panic!("failed to subscribe to remote stats: {error}"));
-                    let streamed = timeout(Duration::from_secs(30), subscription.next())
-                        .await
-                        .unwrap_or_else(|_| panic!("timed out waiting for streamed stats sample"))
-                        .unwrap_or_else(|error| panic!("failed to read streamed stats sample: {error}"))
-                        .unwrap_or_else(|| panic!("remote stats stream closed before first sample"));
-                    assert_eq!(
-                        streamed.processors.configured,
-                        config.processor_count() as u32,
-                        "streamed stats processor count must match configured processor count"
-                    );
-                }
 
                 let filter = helios_shell_protocol::system::tracing::Filter {
                     min_level: Some(helios_shell_protocol::system::tracing::Level::Info),
@@ -614,25 +643,6 @@ mod tests {
                     }),
                     "remote tracing stream did not include the expected kernel log: {events:?}"
                 );
-
-                {
-                    let mut subscription = timeout(
-                        Duration::from_secs(30),
-                        helios_shell_protocol::system::tracing::subscribe(&mut client, &filter),
-                    )
-                    .await
-                    .unwrap_or_else(|_| panic!("timed out subscribing to remote tracing"))
-                    .unwrap_or_else(|error| {
-                        panic!("failed to subscribe to remote tracing: {error}")
-                    });
-                    observer.record_console_text("INFO [helios_kernel] Kernel initialized\n");
-                    let event = timeout(Duration::from_secs(30), subscription.next())
-                        .await
-                        .unwrap_or_else(|_| panic!("timed out waiting for streamed tracing event"))
-                        .unwrap_or_else(|error| panic!("failed to read streamed tracing event: {error}"))
-                        .unwrap_or_else(|| panic!("remote tracing stream closed before first event"));
-                    assert_eq!(event.target, "helios_kernel");
-                }
 
                 drop(client);
 

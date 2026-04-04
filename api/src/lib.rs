@@ -7,6 +7,8 @@ pub mod channel;
 mod error;
 #[cfg(feature = "fs")]
 pub mod fs;
+#[cfg(feature = "instances")]
+pub mod instances;
 #[cfg(feature = "io")]
 pub mod io;
 pub mod prelude;

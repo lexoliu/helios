@@ -10,6 +10,7 @@ mod embedded_debugger;
 mod embedded_init;
 mod embedded_program;
 mod executor;
+mod instance;
 mod log;
 mod program;
 mod sync;
@@ -27,6 +28,9 @@ pub use embedded_init::{EmbeddedInit, embedded_init};
 pub use embedded_program::EmbeddedProgram;
 pub use executor::{JoinHandle, LocalJoinHandle, Spawner};
 pub use helios_hal::Platform;
+pub use instance::{
+    InstanceExecutionTransition, InstanceId, InstanceRegistry, InstanceSnapshot, RegisteredInstance,
+};
 pub use program::{
     Blueprint, CompileError as ProgramCompileError, ExitCode, ProgramRuntime, ProgramRuntimeConfig,
     ProgramRuntimeError, ProgramRuntimeInitError, ResourceTable, RunError as ProgramRunError, Task,

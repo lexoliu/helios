@@ -7,6 +7,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use helios_kernel::InstanceRegistry;
 use spin::Mutex;
 
 const HISTORY_CAPACITY: usize = 512;
@@ -20,6 +21,7 @@ struct RuntimeStateInner {
     boot_ticks: u64,
     timebase_frequency: u64,
     processor_count: u32,
+    instance_registry: InstanceRegistry,
     tracing: Mutex<TraceHistory>,
 }
 
@@ -81,6 +83,7 @@ impl RuntimeState {
                 boot_ticks,
                 timebase_frequency,
                 processor_count: processor_count as u32,
+                instance_registry: InstanceRegistry::new(),
                 tracing: Mutex::new(TraceHistory {
                     next_seq: 1,
                     events: VecDeque::with_capacity(HISTORY_CAPACITY),
@@ -142,6 +145,14 @@ impl RuntimeState {
 
     pub(crate) fn ticks_to_nanos(&self, ticks: u64) -> u64 {
         ticks.saturating_mul(1_000_000_000) / self.inner.timebase_frequency
+    }
+
+    pub(crate) fn uptime_nanos(&self, current_ticks: u64) -> u64 {
+        self.ticks_to_nanos(current_ticks.saturating_sub(self.inner.boot_ticks))
+    }
+
+    pub(crate) fn instance_registry(&self) -> InstanceRegistry {
+        self.inner.instance_registry.clone()
     }
 }
 
