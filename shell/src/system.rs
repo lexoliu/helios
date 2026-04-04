@@ -1,3 +1,4 @@
+use std::collections::{HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::time::Duration;
@@ -9,6 +10,7 @@ use crate::runtime;
 use crate::serial::RpcClient;
 
 const INITIAL_REMOTE_TIMEOUT: Duration = Duration::from_secs(180);
+const LIVE_TRACING_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 pub struct TracingConfig {
     pub limit: u32,
@@ -67,10 +69,7 @@ pub async fn run_tracing(
     };
     config.target_prefixes = target_prefixes;
 
-    let events = fetch_tracing(&mut client, &config).await?;
-    std::io::stdout().write_all(render_tracing_events(&events)?.as_bytes())?;
-    std::io::stdout().write_all(b"\n")?;
-    Ok(())
+    stream_tracing(&mut client, &config).await
 }
 
 pub fn parse_level(value: &str) -> Result<Option<tracing::Level>> {
@@ -96,25 +95,36 @@ pub fn format_targets(prefixes: &[String]) -> String {
     }
 }
 
-pub fn render_tracing_events(events: &[tracing::Event]) -> Result<String> {
-    if events.is_empty() {
-        return Ok("no tracing events matched the current filter".to_owned());
-    }
+pub async fn stream_tracing(client: &mut RpcClient, config: &TracingConfig) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    let mut emitted = EmittedEvents::new(config.limit);
 
-    let mut text = String::new();
-    for event in events {
-        write!(
-            &mut text,
-            "[{}] {} {}",
-            event.timestamp,
-            level_name(event.level),
-            event.target
-        )?;
-        for field in &event.fields {
-            write!(&mut text, " {}=", field.key)?;
-            write_value(&mut text, &field.value)?;
+    loop {
+        let events = fetch_tracing(client, config).await?;
+        for event in events {
+            let line = render_tracing_event(&event)?;
+            if emitted.insert(line.clone()) {
+                stdout.write_all(line.as_bytes())?;
+                stdout.write_all(b"\n")?;
+            }
         }
-        writeln!(&mut text)?;
+        stdout.flush()?;
+        async_io::Timer::after(LIVE_TRACING_POLL_INTERVAL).await;
+    }
+}
+
+fn render_tracing_event(event: &tracing::Event) -> Result<String> {
+    let mut text = String::new();
+    write!(
+        &mut text,
+        "[{}] {} {}",
+        event.timestamp,
+        level_name(event.level),
+        event.target
+    )?;
+    for field in &event.fields {
+        write!(&mut text, " {}=", field.key)?;
+        write_value(&mut text, &field.value)?;
     }
     Ok(text)
 }
@@ -143,4 +153,39 @@ fn write_value(output: &mut String, value: &tracing::Value) -> Result<()> {
         Value::Blob(value) => write!(output, "{value:?}")?,
     }
     Ok(())
+}
+
+struct EmittedEvents {
+    capacity: usize,
+    lines: VecDeque<String>,
+    seen: HashSet<String>,
+}
+
+impl EmittedEvents {
+    fn new(limit: u32) -> Self {
+        let capacity = usize::try_from(limit.max(1))
+            .expect("tracing limit does not fit into usize")
+            .saturating_mul(4);
+        Self {
+            capacity,
+            lines: VecDeque::with_capacity(capacity),
+            seen: HashSet::with_capacity(capacity),
+        }
+    }
+
+    fn insert(&mut self, line: String) -> bool {
+        if !self.seen.insert(line.clone()) {
+            return false;
+        }
+
+        self.lines.push_back(line);
+        while self.lines.len() > self.capacity {
+            let removed = self
+                .lines
+                .pop_front()
+                .expect("emitted tracing event ring must not underflow");
+            self.seen.remove(&removed);
+        }
+        true
+    }
 }

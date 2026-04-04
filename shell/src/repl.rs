@@ -53,8 +53,15 @@ pub fn run(mut client: RpcClient) -> Result<()> {
 
         match parse_line(line) {
             ParsedLine::Command(command) => {
-                if runtime::block_on(shell.execute(&mut client, command))? {
-                    return Ok(());
+                match runtime::block_on(runtime::interruptible(shell.execute(&mut client, command)))
+                    .context("failed to listen for Ctrl+C during shell command execution")?
+                {
+                    runtime::CommandRun::Completed(result) => {
+                        if result? {
+                            return Ok(());
+                        }
+                    }
+                    runtime::CommandRun::Interrupted => shell.print_line("interrupted")?,
                 }
             }
             ParsedLine::Output(output) => shell.print_block(&output)?,
@@ -137,7 +144,7 @@ enum CliCommand {
     Touch { path: String },
     /// Open the live stats view.
     Stats,
-    /// Fetch tracing events or configure tracing filters.
+    /// Stream tracing events until interrupted or configure tracing filters.
     Tracing {
         #[command(subcommand)]
         action: Option<TracingAction>,
@@ -303,8 +310,7 @@ impl Shell {
     }
 
     async fn show_tracing(&mut self, client: &mut RpcClient) -> Result<()> {
-        let events = system::fetch_tracing(client, &self.tracing).await?;
-        self.print_block(&system::render_tracing_events(&events)?)
+        system::stream_tracing(client, &self.tracing).await
     }
 
     async fn call_rpc(&mut self, client: &mut RpcClient) -> Result<()> {

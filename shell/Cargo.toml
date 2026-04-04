@@ -8,6 +8,7 @@ anyhow = "1.0.100"
 async-channel = "2.5.0"
 async-io = "2.6.0"
 async-net = "2.0.0"
+async-signal = "0.2.13"
 clap = { version = "4.5.48", features = ["derive"] }
 crossterm = "0.28.1"
 futures-io = "0.3.31"
