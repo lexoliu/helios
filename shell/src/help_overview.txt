@@ -14,8 +14,8 @@ Interactive:
       Fetch one tracing snapshot with the current filters.
 
 Stats:
-  stats period <ms>
-      Set the refresh cadence used by the live stats view.
+  stats
+      Open the live stats view.
 
 Tracing:
   tracing limit <n>
@@ -34,7 +34,6 @@ RPC:
 
 Examples:
   stats
-  stats period 250
   tracing
   tracing level debug
   tracing targets helios_kernel,helios_riscv

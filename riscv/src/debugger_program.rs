@@ -11,7 +11,7 @@ use core::task::{Context, Poll, Waker};
 use helios_hal::cpu::Cpu;
 use helios_kernel::{
     EmbeddedDebugger, OwnedRawMutexLease, OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease,
-    RawMutex, RawRwLock, embedded_debugger,
+    RawMutex, RawRwLock, embedded_debugger, heap_stats,
 };
 use thiserror::Error;
 use wasmtime::component::{
@@ -909,6 +909,11 @@ fn snapshot_sample(store: &StoreData) -> bindings::helios::system::stats::Sample
 }
 
 fn convert_sample(sample: StatsSample) -> bindings::helios::system::stats::Sample {
+    let heap = heap_stats();
+    let total_bytes =
+        u64::try_from(heap.total_bytes).expect("kernel heap total bytes do not fit into u64");
+    let available_bytes = u64::try_from(heap.available_bytes())
+        .expect("kernel heap available bytes do not fit into u64");
     bindings::helios::system::stats::Sample {
         timestamp: sample.timestamp,
         uptime: sample.uptime,
@@ -920,10 +925,29 @@ fn convert_sample(sample: StatsSample) -> bindings::helios::system::stats::Sampl
                 .collect(),
         },
         memory: bindings::helios::system::stats::Memory {
-            total_bytes: 0,
-            available_bytes: 0,
-            pressure: bindings::helios::system::stats::MemoryPressure::Nominal,
+            total_bytes,
+            available_bytes,
+            pressure: convert_memory_pressure(total_bytes, available_bytes),
         },
+    }
+}
+
+fn convert_memory_pressure(
+    total_bytes: u64,
+    available_bytes: u64,
+) -> bindings::helios::system::stats::MemoryPressure {
+    if total_bytes == 0 {
+        return bindings::helios::system::stats::MemoryPressure::Nominal;
+    }
+
+    let used_permille =
+        ((total_bytes.saturating_sub(available_bytes.min(total_bytes))) * 1_000) / total_bytes;
+
+    match used_permille {
+        0..=699 => bindings::helios::system::stats::MemoryPressure::Nominal,
+        700..=849 => bindings::helios::system::stats::MemoryPressure::Elevated,
+        850..=949 => bindings::helios::system::stats::MemoryPressure::High,
+        _ => bindings::helios::system::stats::MemoryPressure::Critical,
     }
 }
 

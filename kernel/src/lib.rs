@@ -56,6 +56,18 @@ const BOOT_READY: u8 = 2;
 static ALLOCATOR: LockedHeap<HEAP_ORDER> = LockedHeap::empty();
 static BOOT_STATE: AtomicU8 = AtomicU8::new(BOOT_UNINITIALIZED);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeapStats {
+    pub total_bytes: usize,
+    pub allocated_bytes: usize,
+}
+
+impl HeapStats {
+    pub fn available_bytes(self) -> usize {
+        self.total_bytes.saturating_sub(self.allocated_bytes)
+    }
+}
+
 pub struct Kernel<CpuImpl: Cpu + Clone> {
     cpu: CpuImpl,
     executor: Executor,
@@ -269,4 +281,12 @@ pub fn panic_log_message(
     }
 
     tracing::error!("Kernel panic: {}", message);
+}
+
+pub fn heap_stats() -> HeapStats {
+    let allocator = ALLOCATOR.lock();
+    HeapStats {
+        total_bytes: allocator.stats_total_bytes(),
+        allocated_bytes: allocator.stats_alloc_actual(),
+    }
 }

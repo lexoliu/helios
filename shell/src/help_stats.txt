@@ -3,8 +3,6 @@ stats command help
 Commands:
   stats
       Open the live stats view.
-  stats period <ms>
-      Set the refresh cadence used by the live stats view.
 
 What you get:
   timestamp
@@ -15,7 +13,6 @@ What you get:
 
 Examples:
   stats
-  stats period 1000
 
 Controls inside the live view:
   q
