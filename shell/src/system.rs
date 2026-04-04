@@ -10,20 +10,10 @@ use crate::serial::RpcClient;
 
 const INITIAL_REMOTE_TIMEOUT: Duration = Duration::from_secs(180);
 
-pub struct StatsConfig {
-    pub period_ms: u64,
-}
-
 pub struct TracingConfig {
     pub limit: u32,
     pub min_level: Option<tracing::Level>,
     pub target_prefixes: Vec<String>,
-}
-
-impl StatsConfig {
-    pub fn new() -> Self {
-        Self { period_ms: 1_000 }
-    }
 }
 
 impl TracingConfig {

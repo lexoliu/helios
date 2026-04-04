@@ -161,25 +161,23 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(5),
-            Constraint::Length(7),
-            Constraint::Min(6),
+            Constraint::Min(10),
             Constraint::Length(3),
         ])
         .split(frame.area());
 
     match &app.sample {
         Some(sample) => {
-            draw_summary(frame, layout[0], app, sample);
+            draw_summary(frame, layout[0], sample);
             draw_main_panels(frame, layout[1], sample);
-            draw_details(frame, layout[2], app, sample);
         }
-        None => draw_empty(frame, layout[0], layout[1], layout[2], app),
+        None => draw_empty(frame, layout[0], layout[1], app),
     }
 
-    draw_status(frame, layout[3], app);
+    draw_status(frame, layout[2], app);
 }
 
-fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App, sample: &stats::Sample) {
+fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Sample) {
     let cards = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -190,12 +188,13 @@ fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App, sample: &
         ])
         .split(area);
 
+    let memory = MemoryView::new(sample);
     render_card(
         frame,
         cards[0],
         "Uptime",
         &format_duration(sample.uptime),
-        &format!("refresh {}ms", app.period_ms),
+        None,
         Color::Cyan,
     );
     render_card(
@@ -206,7 +205,7 @@ fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App, sample: &
             "{}/{} online",
             sample.processors.online, sample.processors.configured
         ),
-        &format!("{} cores reporting", sample.processors.utilization.len()),
+        None,
         Color::Green,
     );
     render_card(
@@ -214,16 +213,16 @@ fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App, sample: &
         cards[2],
         "Busiest Core",
         &busiest_core_text(sample),
-        &format!("peak {}", peak_cpu_percent(sample)),
+        Some(&peak_cpu_percent(sample)),
         cpu_color(peak_cpu_busy(sample)),
     );
     render_card(
         frame,
         cards[3],
-        "Memory Pressure",
-        memory_pressure_label(sample.memory.pressure),
-        &format!("{} free", format_bytes(sample.memory.available_bytes)),
-        pressure_color(sample.memory.pressure),
+        "Memory",
+        &memory.card_value(),
+        Some(&memory.card_detail()),
+        memory.accent(sample.memory.pressure),
     );
 }
 
@@ -237,58 +236,16 @@ fn draw_main_panels(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::
     draw_memory_panel(frame, panels[1], sample);
 }
 
-fn draw_details(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App, sample: &stats::Sample) {
-    let details = vec![
-        Line::from(vec![
-            Span::styled("timestamp ", Style::default().fg(Color::Cyan)),
-            Span::raw(sample.timestamp.to_string()),
-        ]),
-        Line::from(vec![
-            Span::styled("refresh  ", Style::default().fg(Color::Cyan)),
-            Span::raw(format!("every {}ms", app.period_ms)),
-        ]),
-        Line::from(vec![
-            Span::styled("memory   ", Style::default().fg(Color::Cyan)),
-            Span::raw(format!(
-                "{} total, {} available, {} used",
-                format_bytes(sample.memory.total_bytes),
-                format_bytes(sample.memory.available_bytes),
-                format_bytes(
-                    sample
-                        .memory
-                        .total_bytes
-                        .saturating_sub(sample.memory.available_bytes)
-                )
-            )),
-        ]),
-        Line::from(vec![
-            Span::styled("cpu load ", Style::default().fg(Color::Cyan)),
-            Span::raw(cpu_load_line(sample)),
-        ]),
-    ];
-
-    let details = Paragraph::new(Text::from(details))
-        .block(Block::default().title("Details").borders(Borders::ALL))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(details, area);
-}
-
-fn draw_empty(frame: &mut ratatui::Frame<'_>, top: Rect, middle: Rect, bottom: Rect, app: &App) {
+fn draw_empty(frame: &mut ratatui::Frame<'_>, top: Rect, body: Rect, app: &App) {
     let placeholder = Paragraph::new("waiting for first stats snapshot")
         .block(Block::default().title("Stats").borders(Borders::ALL))
         .wrap(Wrap { trim: true });
     frame.render_widget(placeholder, top);
     frame.render_widget(
         Paragraph::new(app.status.clone())
-            .block(Block::default().title("State").borders(Borders::ALL))
+            .block(Block::default().title("Stats").borders(Borders::ALL))
             .wrap(Wrap { trim: true }),
-        middle,
-    );
-    frame.render_widget(
-        Paragraph::new("no sample available yet")
-            .block(Block::default().title("Details").borders(Borders::ALL))
-            .wrap(Wrap { trim: true }),
-        bottom,
+        body,
     );
 }
 
@@ -350,30 +307,14 @@ fn draw_memory_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats:
         ])
         .split(area);
 
-    let total = sample.memory.total_bytes;
-    let available = sample.memory.available_bytes.min(total);
-    let used = total.saturating_sub(available);
-    let used_ratio = if total == 0 {
-        0.0
-    } else {
-        used as f64 / total as f64
-    };
-    let free_ratio = if total == 0 {
-        0.0
-    } else {
-        available as f64 / total as f64
-    };
+    let memory = MemoryView::new(sample);
 
     let used_gauge = Gauge::default()
         .block(Block::default().title("Used Memory").borders(Borders::ALL))
         .gauge_style(pressure_color(sample.memory.pressure))
-        .ratio(used_ratio)
+        .ratio(memory.used_ratio())
         .use_unicode(true)
-        .label(if total == 0 {
-            "unreported".to_owned()
-        } else {
-            format!("{} / {}", format_bytes(used), format_bytes(total))
-        });
+        .label(memory.used_label());
     frame.render_widget(used_gauge, layout[0]);
 
     let free_gauge = Gauge::default()
@@ -383,13 +324,9 @@ fn draw_memory_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats:
                 .borders(Borders::ALL),
         )
         .gauge_style(Color::Green)
-        .ratio(free_ratio)
+        .ratio(memory.free_ratio())
         .use_unicode(true)
-        .label(if total == 0 {
-            "unreported".to_owned()
-        } else {
-            format!("{} free", format_bytes(available))
-        });
+        .label(memory.available_label());
     frame.render_widget(free_gauge, layout[1]);
 
     let details = Paragraph::new(Text::from(vec![
@@ -401,12 +338,12 @@ fn draw_memory_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats:
             ),
         ]),
         Line::from(vec![
-            Span::styled("usage    ", Style::default().fg(Color::Cyan)),
-            Span::raw(if total == 0 {
-                "unreported".to_owned()
-            } else {
-                format!("{:.1}%", used_ratio * 100.0)
-            }),
+            Span::styled("used     ", Style::default().fg(Color::Cyan)),
+            Span::raw(memory.used_detail()),
+        ]),
+        Line::from(vec![
+            Span::styled("free     ", Style::default().fg(Color::Cyan)),
+            Span::raw(memory.free_detail()),
         ]),
     ]))
     .block(Block::default().title("Memory").borders(Borders::ALL))
@@ -419,24 +356,125 @@ fn render_card(
     area: Rect,
     title: &str,
     value: &str,
-    detail: &str,
+    detail: Option<&str>,
     accent: Color,
 ) {
-    let card = Paragraph::new(Text::from(vec![
-        Line::from(Span::styled(
-            value.to_owned(),
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(detail.to_owned()),
-    ]))
-    .block(
-        Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(accent)),
-    )
-    .wrap(Wrap { trim: true });
+    let mut lines = vec![Line::from(Span::styled(
+        value.to_owned(),
+        Style::default().fg(accent).add_modifier(Modifier::BOLD),
+    ))];
+    if let Some(detail) = detail {
+        lines.push(Line::from(detail.to_owned()));
+    }
+
+    let card = Paragraph::new(Text::from(lines))
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(accent)),
+        )
+        .wrap(Wrap { trim: true });
     frame.render_widget(card, area);
+}
+
+struct MemoryView {
+    total_bytes: Option<u64>,
+    available_bytes: u64,
+}
+
+impl MemoryView {
+    fn new(sample: &stats::Sample) -> Self {
+        let total_bytes = (sample.memory.total_bytes != 0).then_some(sample.memory.total_bytes);
+        let available_bytes = total_bytes
+            .map(|total| sample.memory.available_bytes.min(total))
+            .unwrap_or(0);
+
+        Self {
+            total_bytes,
+            available_bytes,
+        }
+    }
+
+    fn used_bytes(&self) -> Option<u64> {
+        self.total_bytes
+            .map(|total_bytes| total_bytes.saturating_sub(self.available_bytes))
+    }
+
+    fn used_ratio(&self) -> f64 {
+        match (self.used_bytes(), self.total_bytes) {
+            (Some(used_bytes), Some(total_bytes)) if total_bytes != 0 => {
+                used_bytes as f64 / total_bytes as f64
+            }
+            _ => 0.0,
+        }
+    }
+
+    fn free_ratio(&self) -> f64 {
+        match self.total_bytes {
+            Some(total_bytes) if total_bytes != 0 => {
+                self.available_bytes as f64 / total_bytes as f64
+            }
+            _ => 0.0,
+        }
+    }
+
+    fn card_value(&self) -> String {
+        match self.available_bytes() {
+            Some(available_bytes) => format!("{} free", format_bytes(available_bytes)),
+            None => "unreported".to_owned(),
+        }
+    }
+
+    fn card_detail(&self) -> String {
+        match self.total_bytes {
+            Some(total_bytes) => format!("{} total", format_bytes(total_bytes)),
+            None => "stats unavailable".to_owned(),
+        }
+    }
+
+    fn accent(&self, pressure: MemoryPressure) -> Color {
+        match self.total_bytes {
+            Some(_) => pressure_color(pressure),
+            None => Color::DarkGray,
+        }
+    }
+
+    fn used_label(&self) -> String {
+        match (self.used_bytes(), self.total_bytes) {
+            (Some(used_bytes), Some(total_bytes)) => {
+                format!(
+                    "{} / {}",
+                    format_bytes(used_bytes),
+                    format_bytes(total_bytes)
+                )
+            }
+            _ => "unreported".to_owned(),
+        }
+    }
+
+    fn available_label(&self) -> String {
+        match self.available_bytes() {
+            Some(available_bytes) => format!("{} free", format_bytes(available_bytes)),
+            None => "unreported".to_owned(),
+        }
+    }
+
+    fn used_detail(&self) -> String {
+        self.used_bytes()
+            .map(format_bytes)
+            .unwrap_or_else(|| "unreported".to_owned())
+    }
+
+    fn free_detail(&self) -> String {
+        self.available_bytes()
+            .map(format_bytes)
+            .unwrap_or_else(|| "unreported".to_owned())
+    }
+
+    fn available_bytes(&self) -> Option<u64> {
+        self.total_bytes.map(|_| self.available_bytes)
+    }
 }
 
 fn format_duration(nanos: u64) -> String {
@@ -485,22 +523,6 @@ fn busiest_core_text(sample: &stats::Sample) -> String {
         .max_by_key(|processor| processor.busy)
         .map(|processor| format!("cpu{}", processor.id))
         .unwrap_or_else(|| "n/a".to_owned())
-}
-
-fn cpu_load_line(sample: &stats::Sample) -> String {
-    sample
-        .processors
-        .utilization
-        .iter()
-        .map(|processor| {
-            format!(
-                "cpu{} {:>5.1}%",
-                processor.id,
-                f64::from(processor.busy) / 10.0
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("   ")
 }
 
 fn cpu_color(busy: u16) -> Color {

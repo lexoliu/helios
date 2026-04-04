@@ -22,7 +22,7 @@ use crate::rpc::RpcPane;
 use crate::runtime;
 use crate::serial::RpcClient;
 use crate::stats_tui;
-use crate::system::{self, StatsConfig, TracingConfig};
+use crate::system::{self, TracingConfig};
 
 pub fn run(mut client: RpcClient) -> Result<()> {
     let mut editor = build_editor()?;
@@ -59,9 +59,10 @@ pub fn run(mut client: RpcClient) -> Result<()> {
 }
 
 const PROMPT: &str = "helios> ";
+const LIVE_STATS_PERIOD_MS: u64 = 1_000;
 const ROOT_CANDIDATES: &[&str] = &["help", "exit", "stats", "tracing", "rpc", "--help"];
 const HELP_CANDIDATES: &[&str] = &["overview", "stats", "tracing", "rpc", "--help"];
-const STATS_CANDIDATES: &[&str] = &["period", "--help"];
+const STATS_CANDIDATES: &[&str] = &["--help"];
 const TRACING_CANDIDATES: &[&str] = &["limit", "level", "targets", "--help"];
 const TRACING_LEVEL_CANDIDATES: &[&str] = &["none", "error", "warn", "info", "debug", "trace"];
 const RPC_CANDIDATES: &[&str] = &["instance", "func", "payload", "call", "--help"];
@@ -120,11 +121,8 @@ enum CliCommand {
     },
     /// Leave the shell.
     Exit,
-    /// Open the live stats view or configure its refresh interval.
-    Stats {
-        #[command(subcommand)]
-        action: Option<StatsAction>,
-    },
+    /// Open the live stats view.
+    Stats,
     /// Fetch tracing events or configure tracing filters.
     Tracing {
         #[command(subcommand)]
@@ -135,12 +133,6 @@ enum CliCommand {
         #[command(subcommand)]
         action: RpcAction,
     },
-}
-
-#[derive(Debug, Subcommand)]
-enum StatsAction {
-    /// Set the live stats refresh interval in milliseconds.
-    Period { ms: u64 },
 }
 
 #[derive(Debug, Subcommand)]
@@ -172,7 +164,6 @@ enum RpcAction {
 }
 
 struct Shell {
-    stats: StatsConfig,
     tracing: TracingConfig,
     rpc: RpcPane,
 }
@@ -182,7 +173,6 @@ enum Command {
     Exit,
     ShowStats,
     ShowTracing,
-    StatsPeriod(u64),
     TracingLimit(u32),
     TracingLevel(Option<tracing::Level>),
     TracingTargets(Vec<String>),
@@ -207,7 +197,6 @@ struct ShellHelper {
 impl Shell {
     fn new() -> Self {
         Self {
-            stats: StatsConfig::new(),
             tracing: TracingConfig::new(),
             rpc: RpcPane::new(),
         }
@@ -242,12 +231,8 @@ impl Shell {
         match command {
             Command::Help(topic) => self.print_block(&render_help(topic))?,
             Command::Exit => return Ok(true),
-            Command::ShowStats => stats_tui::run(client, self.stats.period_ms).await?,
+            Command::ShowStats => stats_tui::run(client, LIVE_STATS_PERIOD_MS).await?,
             Command::ShowTracing => self.show_tracing(client).await?,
-            Command::StatsPeriod(period_ms) => {
-                self.stats.period_ms = period_ms;
-                self.print_line(&format!("stats period set to {period_ms}ms"))?;
-            }
             Command::TracingLimit(limit) => {
                 self.tracing.limit = limit;
                 self.print_line(&format!("tracing limit set to {limit}"))?;
@@ -573,10 +558,7 @@ impl CliCommand {
         match self {
             Self::Help { topic } => Command::Help(topic.unwrap_or(HelpTopic::Overview)),
             Self::Exit => Command::Exit,
-            Self::Stats { action } => match action {
-                None => Command::ShowStats,
-                Some(StatsAction::Period { ms }) => Command::StatsPeriod(ms),
-            },
+            Self::Stats => Command::ShowStats,
             Self::Tracing { action } => match action {
                 None => Command::ShowTracing,
                 Some(TracingAction::Limit { count }) => Command::TracingLimit(count),
@@ -672,6 +654,14 @@ mod tests {
     }
 
     #[test]
+    fn rejects_removed_stats_period_command() {
+        match parse_line("stats period 250") {
+            ParsedLine::Output(text) => assert!(text.contains("unknown command")),
+            _ => panic!("removed stats period command must stay rejected"),
+        }
+    }
+
+    #[test]
     fn parses_rpc_payload_without_argument() {
         match parse_line("rpc payload") {
             ParsedLine::Command(Command::RpcPayload(value)) => assert!(value.is_empty()),
@@ -702,7 +692,7 @@ mod tests {
     #[test]
     fn clap_supports_help_flag() {
         match parse_line("stats --help") {
-            ParsedLine::Output(text) => assert!(text.contains("period")),
+            ParsedLine::Output(text) => assert!(text.contains("live stats view")),
             _ => panic!("stats --help must print help text"),
         }
     }
