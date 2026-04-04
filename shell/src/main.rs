@@ -1,3 +1,4 @@
+mod filesystem;
 mod ready;
 mod repl;
 mod rpc;
@@ -8,6 +9,7 @@ mod system;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::io::Write as _;
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -28,6 +30,12 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// List files in the remote debugger filesystem.
+    Ls { path: Option<String> },
+    /// Remove a file or an empty directory from the remote debugger filesystem.
+    Rm { path: String },
+    /// Create a file if it does not exist in the remote debugger filesystem.
+    Touch { path: String },
     Stats {
         #[arg(long, default_value_t = 1_000)]
         period_ms: u64,
@@ -65,6 +73,20 @@ fn main() -> Result<()> {
 
     match args.command {
         None => repl::run(client),
+        Some(Command::Ls { path }) => runtime::block_on(async move {
+            let mut client = client;
+            let output = filesystem::list(&mut client, path.as_deref()).await?;
+            std::io::stdout().write_all(output.as_bytes())?;
+            Ok(())
+        }),
+        Some(Command::Rm { path }) => runtime::block_on(async move {
+            let mut client = client;
+            filesystem::remove(&mut client, &path).await
+        }),
+        Some(Command::Touch { path }) => runtime::block_on(async move {
+            let mut client = client;
+            filesystem::touch(&mut client, &path).await
+        }),
         Some(Command::Stats { period_ms }) => runtime::block_on(async move {
             let mut client = client;
             stats_tui::run(&mut client, period_ms).await

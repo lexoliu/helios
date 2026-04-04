@@ -7,6 +7,7 @@ use helios_api::{stats as host_stats, tracing as host_tracing};
 use crate::wire::{Frame, read_frame, write_frame};
 
 use super::bindings::helios::system::{stats, tracing};
+use crate::debugger::filesystem;
 
 pub async fn serve<R, W>(mut read: R, mut write: W) -> Result<()>
 where
@@ -31,7 +32,7 @@ where
                 &Frame::Reject {
                     invocation,
                     message: format!(
-                        "remote system call {instance}.{func} is not exposed by the embedded debugger"
+                        "remote invocation {instance}.{func} is not exposed by the embedded debugger"
                     ),
                 },
             )
@@ -44,7 +45,7 @@ where
             .await
             .context("failed to accept debugger request stream")?;
         let payload = read_root_payload(&mut read, invocation).await?;
-        let response = dispatch(&instance, &func, &payload)?;
+        let response = dispatch(&instance, &func, &payload).await?;
         write_frame(
             &mut write,
             &Frame::Data {
@@ -71,10 +72,10 @@ fn supports_request(instance: &str, func: &str) -> bool {
     matches!(
         (instance, func),
         ("helios:system/stats@0.1.0", "snapshot") | ("helios:system/tracing@0.1.0", "recent")
-    )
+    ) || filesystem::supports(instance, func)
 }
 
-fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>> {
+async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>> {
     match (instance, func) {
         ("helios:system/stats@0.1.0", "snapshot") => {
             if !payload.is_empty() {
@@ -92,6 +93,7 @@ fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>> {
                 .collect::<Vec<_>>();
             postcard::to_allocvec(&events).context("failed to encode tracing.recent response")
         }
+        _ if filesystem::supports(instance, func) => filesystem::dispatch(func, payload).await,
         _ => unreachable!("supports_request must reject unsupported methods before dispatch"),
     }
 }

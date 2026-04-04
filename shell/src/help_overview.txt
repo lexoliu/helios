@@ -9,6 +9,12 @@ Core:
   exit
 
 Interactive:
+  ls [path]
+      List files in the remote debugger filesystem. Paths are resolved from `/`.
+  rm <path>
+      Remove a file or an empty directory in the remote debugger filesystem.
+  touch <path>
+      Create a file if it does not already exist.
   stats
       Open the live stats view. Press `q` to return to the shell.
   tracing
@@ -34,6 +40,10 @@ RPC:
       Configure and invoke an arbitrary remote system call.
 
 Examples:
+  ls
+  ls /boot
+  touch /tmp/marker
+  rm /tmp/marker
   stats
   tracing
   tracing level debug
