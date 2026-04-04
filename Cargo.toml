@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "api", "api-macro", "kernel-macro", "hal", "hosted", "init", "kernel", "riscv", "virtio",
+    "api", "api-macro", "hal", "hosted", "kernel", "kernel-macro", "programs/debugger", "programs/init", "riscv", "shell", "shell-protocol", "virtio",
 ]
 resolver = "2"
 
@@ -15,6 +15,7 @@ helios-hal = { path = "hal" }
 helios-api = { path = "api" }
 helios-hosted = { path = "hosted" }
 helios-kernel-macro = { path = "kernel-macro" }
+helios-shell-protocol = { path = "shell-protocol" }
 helios-riscv = { path = "riscv" }
 helios-kernel = { path = "kernel" }
 helios = { path = "." }
@@ -28,8 +29,16 @@ helios-hosted.workspace = true
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 helios-riscv.workspace = true
 
+[dev-dependencies]
+helios-shell-protocol.workspace = true
+wasmtime = { path = "../wasmtime/crates/wasmtime", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
+
 [profile.dev]
 panic = "abort"
+
+[profile.dev.package.helios-debugger]
+debug = 0
+opt-level = "z"
 
 [profile.release]
 panic = "abort"

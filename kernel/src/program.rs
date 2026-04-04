@@ -4,7 +4,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use helios_hal::fs::DirectoryHandle;
-use helios_hal::resource::WasiRights;
+use helios_hal::resource::{SerialRights, WasiRights};
 use thiserror::Error;
 use wasmtime::{Config, Engine, Linker, Module, Store};
 
@@ -90,6 +90,7 @@ pub struct Blueprint<'a> {
     source: BlueprintSource<'a>,
     rights: WasiRights,
     boot_directory: Option<DirectoryHandle<BootDirectory>>,
+    debug_serial: Option<SerialRights>,
 }
 
 enum BlueprintSource<'a> {
@@ -104,6 +105,7 @@ enum BlueprintSource<'a> {
 #[derive(Default)]
 pub struct ResourceTable {
     boot_directory: Option<DirectoryHandle<BootDirectory>>,
+    debug_serial: Option<SerialRights>,
 }
 
 #[derive(Clone, Copy)]
@@ -149,6 +151,7 @@ impl ProgramRuntime {
         let source = blueprint.source;
         let rights = blueprint.rights;
         let boot_directory = blueprint.boot_directory;
+        let debug_serial = blueprint.debug_serial;
         let engine_config = self.engine_config.clone();
 
         match source {
@@ -157,14 +160,14 @@ impl ProgramRuntime {
                 self.compiler
                     .spawn(self.compile_priority, move || {
                         let engine = Engine::new(&engine_config).map_err(CompileError::Wasmtime)?;
-                        compile_wasm_task(engine, wasm, rights, boot_directory)
+                        compile_wasm_task(engine, wasm, rights, boot_directory, debug_serial)
                     })
                     .await
                     .map_err(CompileError::QueueSaturated)?
             }
             BlueprintSource::Embedded(program) => {
                 let engine = Engine::new(&engine_config).map_err(CompileError::Wasmtime)?;
-                compile_embedded_task(engine, program, rights, boot_directory)
+                compile_embedded_task(engine, program, rights, boot_directory, debug_serial)
             }
         }
     }
@@ -176,6 +179,7 @@ impl<'a> Blueprint<'a> {
             source: BlueprintSource::Wasm(wasm),
             rights,
             boot_directory: None,
+            debug_serial: None,
         }
     }
 
@@ -184,11 +188,17 @@ impl<'a> Blueprint<'a> {
             source: BlueprintSource::Embedded(program),
             rights,
             boot_directory: None,
+            debug_serial: None,
         }
     }
 
     pub fn with_boot_directory(mut self, boot_directory: DirectoryHandle<BootDirectory>) -> Self {
         self.boot_directory = Some(boot_directory);
+        self
+    }
+
+    pub fn with_debug_serial(mut self, rights: SerialRights) -> Self {
+        self.debug_serial = Some(rights);
         self
     }
 
@@ -202,25 +212,36 @@ impl ResourceTable {
     pub const fn new() -> Self {
         Self {
             boot_directory: None,
+            debug_serial: None,
         }
     }
 
     pub fn with_boot_directory(boot_directory: DirectoryHandle<BootDirectory>) -> Self {
         Self {
             boot_directory: Some(boot_directory),
+            debug_serial: None,
         }
     }
 
+    pub fn with_debug_serial(mut self, rights: SerialRights) -> Self {
+        self.debug_serial = Some(rights);
+        self
+    }
+
     pub fn len(&self) -> usize {
-        usize::from(self.boot_directory.is_some())
+        usize::from(self.boot_directory.is_some()) + usize::from(self.debug_serial.is_some())
     }
 
     pub fn is_empty(&self) -> bool {
-        self.boot_directory.is_none()
+        self.boot_directory.is_none() && self.debug_serial.is_none()
     }
 
     pub fn boot_directory(&self) -> Option<&DirectoryHandle<BootDirectory>> {
         self.boot_directory.as_ref()
+    }
+
+    pub fn debug_serial(&self) -> Option<SerialRights> {
+        self.debug_serial
     }
 }
 
@@ -284,9 +305,10 @@ fn compile_wasm_task(
     wasm: Vec<u8>,
     rights: WasiRights,
     boot_directory: Option<DirectoryHandle<BootDirectory>>,
+    debug_serial: Option<SerialRights>,
 ) -> Result<Task, CompileError> {
     let module = Module::from_binary(&engine, &wasm).map_err(CompileError::Wasmtime)?;
-    finish_task(module, rights, boot_directory)
+    finish_task(module, rights, boot_directory, debug_serial)
 }
 
 fn compile_embedded_task(
@@ -294,24 +316,28 @@ fn compile_embedded_task(
     program: &EmbeddedProgram,
     rights: WasiRights,
     boot_directory: Option<DirectoryHandle<BootDirectory>>,
+    debug_serial: Option<SerialRights>,
 ) -> Result<Task, CompileError> {
-    let module = unsafe { Module::deserialize(&engine, program.artifact()) }
-        .map_err(CompileError::Wasmtime)?;
-    finish_task(module, rights, boot_directory)
+    let module = Module::from_binary(&engine, program.bytes()).map_err(CompileError::Wasmtime)?;
+    finish_task(module, rights, boot_directory, debug_serial)
 }
 
 fn finish_task(
     module: Module,
     rights: WasiRights,
     boot_directory: Option<DirectoryHandle<BootDirectory>>,
+    debug_serial: Option<SerialRights>,
 ) -> Result<Task, CompileError> {
     validate_imports(&module)?;
 
     let entry = detect_entry(&module)?;
-    let resources = match boot_directory {
+    let mut resources = match boot_directory {
         Some(boot_directory) => ResourceTable::with_boot_directory(boot_directory),
         None => ResourceTable::new(),
     };
+    if let Some(debug_serial) = debug_serial {
+        resources = resources.with_debug_serial(debug_serial);
+    }
 
     Ok(Task {
         module,
@@ -494,19 +520,9 @@ mod tests {
         module.finish()
     }
 
-    fn precompiled_start_program() -> EmbeddedProgram {
-        let mut config = wasmtime::Config::new();
-        config
-            .target(env!("HELIOS_BUILD_TARGET"))
-            .expect("Helios build target must be accepted by Wasmtime");
-        let engine = wasmtime::Engine::new(&config)
-            .unwrap_or_else(|error| panic!("test engine init failed: {error}"));
-        let artifact = engine
-            .precompile_module(&start_module())
-            .unwrap_or_else(|error| panic!("test module precompile failed: {error}"));
-        let artifact = Box::leak(artifact.into_boxed_slice());
-
-        EmbeddedProgram::new("program-start-test", env!("HELIOS_BUILD_TARGET"), artifact)
+    fn embedded_start_program() -> EmbeddedProgram {
+        let bytes = Box::leak(start_module().into_boxed_slice());
+        EmbeddedProgram::new("program-start-test", bytes)
     }
 
     #[test]
@@ -584,15 +600,15 @@ mod tests {
     }
 
     #[test]
-    fn loads_embedded_aot_module() {
+    fn loads_embedded_jit_module() {
         let runtime =
             test_runtime().unwrap_or_else(|error| panic!("program runtime init failed: {error:?}"));
-        let program = precompiled_start_program();
+        let program = embedded_start_program();
         let task =
             block_on(Blueprint::new_embedded(&program, WasiRights::empty()).compile(&runtime))
-                .expect("embedded AOT module should load");
+                .expect("embedded module should load");
 
-        let exit_code = block_on(task.run()).expect("embedded AOT module should run");
+        let exit_code = block_on(task.run()).expect("embedded module should run");
         assert_eq!(exit_code, 0);
     }
 }

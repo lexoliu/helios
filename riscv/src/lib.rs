@@ -1,17 +1,25 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 pub mod compute;
+mod debug_state;
+mod debugger_bindings;
+mod debugger_program;
 
 use core::arch::{asm, global_asm};
+use core::cell::Cell;
 use core::fmt::Write;
 use core::ops::Range;
 use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
 
+use arrayvec::ArrayVec;
 use fdt::Fdt;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
 use helios_kernel::Timer;
+use ns16550a::Uart;
 use riscv::interrupt::Trap;
 use riscv::interrupt::supervisor::{Exception, Interrupt};
 use riscv_rt::entry;
@@ -50,6 +58,8 @@ unsafe impl critical_section::Impl for SupervisorCriticalSection {
 struct HartRuntime {
     hart_id: ProcessorId,
     timer: Timer<RiscvCpu>,
+    wasmtime_tls: Cell<*mut u8>,
+    debug_uart_base: Option<usize>,
 }
 
 impl HartRuntime {
@@ -66,10 +76,20 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     fatal_panic(info)
 }
 
-pub struct SbiConsole;
+struct SbiConsole {
+    debug_state: debug_state::RuntimeState,
+}
+
+impl SbiConsole {
+    fn new(debug_state: debug_state::RuntimeState) -> Self {
+        Self { debug_state }
+    }
+}
 
 impl Write for SbiConsole {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.debug_state
+            .record_console_text(riscv::register::time::read64(), s);
         for byte in s.bytes() {
             let ret = sbi_rt::console_write_byte(byte);
             if ret.is_err() {
@@ -87,15 +107,17 @@ pub struct RiscvCpu {
     hart_count: usize,
     timebase_frequency: u64,
     fdt_addr: usize,
+    debug_state: debug_state::RuntimeState,
 }
 
 impl RiscvCpu {
-    pub const fn new(
+    pub(crate) fn new(
         current_hart: ProcessorId,
         bootstrap_hart: ProcessorId,
         hart_count: usize,
         timebase_frequency: u64,
         fdt_addr: usize,
+        debug_state: debug_state::RuntimeState,
     ) -> Self {
         Self {
             current_hart,
@@ -103,7 +125,12 @@ impl RiscvCpu {
             hart_count,
             timebase_frequency,
             fdt_addr,
+            debug_state,
         }
+    }
+
+    pub(crate) fn debug_state(&self) -> debug_state::RuntimeState {
+        self.debug_state.clone()
     }
 }
 
@@ -200,7 +227,13 @@ extern "C" fn secondary_start_rust(hart_id: usize, fdt_addr: usize) -> ! {
 }
 
 #[unsafe(no_mangle)]
+#[unsafe(link_section = ".trap.rust")]
 extern "C" fn trap_handler(tf: &mut TrapFrame) {
+    trap_dispatch(tf);
+}
+
+#[inline(never)]
+fn trap_dispatch(tf: &mut TrapFrame) {
     match riscv::register::scause::read().cause().try_into() {
         Ok(Trap::Interrupt(Interrupt::SupervisorTimer)) => {
             current_hart_runtime().timer.handle_interrupt();
@@ -225,7 +258,6 @@ extern "C" fn trap_handler(tf: &mut TrapFrame) {
 
 fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     clear_hart_runtime();
-    let console = SbiConsole;
     let fdt = unsafe { Fdt::from_ptr(fdt_addr as *const u8) }
         .expect("OpenSBI did not provide a valid FDT");
     let mut cpus = fdt.cpus();
@@ -233,37 +265,46 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     let hart_count = 1 + cpus.count();
     let timebase_frequency = first_cpu.timebase_frequency() as u64;
     let allocator_window = allocator_window();
-    let memory = fdt.memory();
-    let memory_regions = memory
-        .regions()
-        .map(|region| {
-            let start = region.starting_address as usize;
-            let end = start
-                .checked_add(region.size.unwrap())
-                .expect("FDT memory region overflows usize");
-
-            start..end
-        })
-        .filter_map(move |region| intersect(region, allocator_window.clone()))
-        .map(range_to_memory_region);
+    let memory_regions = collect_memory_regions(fdt.memory(), allocator_window.clone());
     let current_hart = ProcessorId::new(hart_id as u16);
     let bootstrap_processor = remember_bootstrap_hart(hart_id);
+    if current_hart == bootstrap_processor {
+        helios_kernel::prime_bootstrap_allocator(memory_regions.iter().copied());
+    }
+
+    let debug_state = debug_state::RuntimeState::new(
+        timebase_frequency,
+        hart_count,
+        riscv::register::time::read64(),
+    );
+    let debug_uart_base = find_debug_uart_base(&fdt);
+    let console = SbiConsole::new(debug_state.clone());
     let cpu = RiscvCpu::new(
         current_hart,
         bootstrap_processor,
         hart_count,
         timebase_frequency,
         fdt_addr,
+        debug_state,
     );
 
-    let kernel = helios_kernel::init(helios_kernel::Platform::new(console, memory_regions, cpu));
+    let kernel = helios_kernel::init(helios_kernel::Platform::new(
+        console,
+        memory_regions.into_iter(),
+        cpu.clone(),
+    ));
     let hart_runtime = HartRuntime {
         hart_id: current_hart,
         timer: kernel.timer(),
+        wasmtime_tls: Cell::new(core::ptr::null_mut()),
+        debug_uart_base,
     };
     hart_runtime.install();
     unsafe {
         configure_interrupts();
+    }
+    if debugger_program::should_run_on(current_hart.id(), hart_count, bootstrap_processor.id()) {
+        debugger_program::run_forever(cpu.clone());
     }
     kernel.run();
 }
@@ -284,6 +325,55 @@ fn allocator_window() -> Range<usize> {
 
     assert!(start < stack_bottom, "allocator window is empty");
     start..stack_bottom
+}
+
+fn collect_memory_regions<'fdt>(
+    memory: fdt::standard_nodes::Memory<'fdt, 'fdt>,
+    allocator_window: Range<usize>,
+) -> ArrayVec<MemoryRegion, 8> {
+    let mut regions = ArrayVec::new();
+
+    for region in memory
+        .regions()
+        .map(|region| {
+            let start = region.starting_address as usize;
+            let end = start
+                .checked_add(region.size.unwrap())
+                .expect("FDT memory region overflows usize");
+
+            start..end
+        })
+        .filter_map(move |region| intersect(region, allocator_window.clone()))
+        .map(range_to_memory_region)
+    {
+        regions.try_push(region).unwrap_or_else(|_| {
+            panic!("FDT described more memory regions than the kernel supports")
+        });
+    }
+
+    regions
+}
+
+fn find_debug_uart_base(fdt: &Fdt<'_>) -> Option<usize> {
+    let chosen = fdt.find_node("/chosen")?;
+    let stdout_path = chosen
+        .properties()
+        .find(|property| property.name == "stdin-path")
+        .or_else(|| {
+            chosen
+                .properties()
+                .find(|property| property.name == "stdout-path")
+        })?;
+    let path = core::str::from_utf8(stdout_path.value)
+        .ok()?
+        .trim_end_matches('\0')
+        .split(':')
+        .next()?;
+    let node = fdt
+        .find_node(path)
+        .or_else(|| fdt.aliases().and_then(|aliases| aliases.resolve_node(path)))?;
+    let region = node.reg()?.next()?;
+    Some(region.starting_address as usize)
 }
 
 fn intersect(left: Range<usize>, right: Range<usize>) -> Option<Range<usize>> {
@@ -323,6 +413,43 @@ fn current_hart_runtime() -> &'static HartRuntime {
     unsafe { &*(ptr as *const HartRuntime) }
 }
 
+fn current_debug_uart() -> Uart {
+    let runtime = current_hart_runtime();
+    let base = runtime
+        .debug_uart_base
+        .expect("debug UART is missing from the device tree");
+    Uart::new(base)
+}
+
+pub(crate) fn try_read_debug_serial_byte() -> Option<u8> {
+    current_debug_uart().get()
+}
+
+pub(crate) fn write_debug_serial_bytes(bytes: &[u8]) {
+    let uart = current_debug_uart();
+    for &byte in bytes {
+        while uart.put(byte).is_none() {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_tls_get() -> *mut u8 {
+    let runtime = read_hart_runtime();
+    if runtime == 0 {
+        return core::ptr::null_mut();
+    }
+
+    unsafe { (*(runtime as *const HartRuntime)).wasmtime_tls.get() }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_tls_set(ptr: *mut u8) {
+    let runtime = current_hart_runtime();
+    runtime.wasmtime_tls.set(ptr);
+}
+
 unsafe fn configure_interrupts() {
     unsafe {
         trapframe::init();
@@ -354,7 +481,21 @@ fn handle_user_exception(exception: Exception, stval: usize, tf: &TrapFrame) -> 
 fn fatal_panic(info: &core::panic::PanicInfo<'_>) -> ! {
     mask_interrupts();
 
-    let mut console = SbiConsole;
+    struct PanicConsole;
+
+    impl Write for PanicConsole {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            for byte in s.bytes() {
+                let ret = sbi_rt::console_write_byte(byte);
+                if ret.is_err() {
+                    return Err(core::fmt::Error);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let mut console = PanicConsole;
     let _ = console.write_str("Kernel panic");
     if let Some(location) = info.location() {
         let _ = write!(

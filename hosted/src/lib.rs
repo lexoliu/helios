@@ -1,10 +1,12 @@
-mod bootfs_mount;
 mod config;
 mod console;
 mod cpu;
-mod init_bindings;
 mod init_program;
+mod observer_buffer;
+mod observer_host;
+mod program_bindings;
 mod runtime;
+mod serial_host;
 mod sync_host;
 
 #[global_allocator]

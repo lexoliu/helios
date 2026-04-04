@@ -1,32 +1,23 @@
-/// Target-specific precompiled wasm artifact embedded into the binary.
+/// Raw wasm module bytes embedded into the binary.
 ///
-/// Higher layers decide when to load an embedded program. The kernel only
-/// carries opaque AOT bytes plus a small amount of identity metadata.
+/// Higher layers decide when to launch an embedded program. The kernel keeps
+/// the payload opaque and JIT-compiles it at runtime for the active target.
 #[derive(Clone, Copy)]
 pub struct EmbeddedProgram {
     name: &'static str,
-    target: &'static str,
-    artifact: &'static [u8],
+    bytes: &'static [u8],
 }
 
 impl EmbeddedProgram {
-    pub const fn new(name: &'static str, target: &'static str, artifact: &'static [u8]) -> Self {
-        Self {
-            name,
-            target,
-            artifact,
-        }
+    pub const fn new(name: &'static str, bytes: &'static [u8]) -> Self {
+        Self { name, bytes }
     }
 
     pub const fn name(&self) -> &'static str {
         self.name
     }
 
-    pub const fn target(&self) -> &'static str {
-        self.target
-    }
-
-    pub const fn artifact(&self) -> &'static [u8] {
-        self.artifact
+    pub const fn bytes(&self) -> &'static [u8] {
+        self.bytes
     }
 }

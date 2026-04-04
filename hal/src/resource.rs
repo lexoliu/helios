@@ -29,7 +29,23 @@ bitflags! {
     }
 }
 
+bitflags! {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    /// Rights for a serial transport capability.
+    pub struct SerialRights:u8{
+        const READ  = 1 << 0;
+        const WRITE = 1 << 1;
+        const FLUSH = 1 << 2;
+    }
+}
+
 impl ResourceRights for WasiRights {
+    fn contains(self, other: Self) -> bool {
+        (self.bits() & other.bits()) == other.bits()
+    }
+}
+
+impl ResourceRights for SerialRights {
     fn contains(self, other: Self) -> bool {
         (self.bits() & other.bits()) == other.bits()
     }
@@ -108,3 +124,5 @@ where
         self.object()
     }
 }
+
+pub type SerialResource<T> = KernelResource<T, SerialRights>;
