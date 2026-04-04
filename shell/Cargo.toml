@@ -15,5 +15,6 @@ futures-lite = "2.6.1"
 hex = "0.4.3"
 helios-shell-protocol.workspace = true
 ratatui = "0.29.0"
+rustyline = "14.0.0"
 rustix = { version = "1.1.4", features = ["termios", "std"] }
 serialport = "4.9.0"

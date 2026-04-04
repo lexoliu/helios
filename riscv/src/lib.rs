@@ -5,6 +5,7 @@ extern crate alloc;
 
 pub mod compute;
 mod debug_state;
+mod debug_transport;
 mod debugger_bindings;
 mod debugger_program;
 
@@ -15,11 +16,11 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
 
 use arrayvec::ArrayVec;
+use debug_transport::DebugTransport;
 use fdt::Fdt;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
 use helios_kernel::Timer;
-use ns16550a::Uart;
 use riscv::interrupt::Trap;
 use riscv::interrupt::supervisor::{Exception, Interrupt};
 use riscv_rt::entry;
@@ -59,7 +60,7 @@ struct HartRuntime {
     hart_id: ProcessorId,
     timer: Timer<RiscvCpu>,
     wasmtime_tls: Cell<*mut u8>,
-    debug_uart_base: Option<usize>,
+    debug_transport: Option<DebugTransport>,
 }
 
 impl HartRuntime {
@@ -78,11 +79,15 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
 struct SbiConsole {
     debug_state: debug_state::RuntimeState,
+    mirror_to_uart: bool,
 }
 
 impl SbiConsole {
-    fn new(debug_state: debug_state::RuntimeState) -> Self {
-        Self { debug_state }
+    fn new(debug_state: debug_state::RuntimeState, mirror_to_uart: bool) -> Self {
+        Self {
+            debug_state,
+            mirror_to_uart,
+        }
     }
 }
 
@@ -90,6 +95,9 @@ impl Write for SbiConsole {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         self.debug_state
             .record_console_text(riscv::register::time::read64(), s);
+        if !self.mirror_to_uart {
+            return Ok(());
+        }
         for byte in s.bytes() {
             let ret = sbi_rt::console_write_byte(byte);
             if ret.is_err() {
@@ -277,8 +285,11 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         hart_count,
         riscv::register::time::read64(),
     );
-    let debug_uart_base = find_debug_uart_base(&fdt);
-    let console = SbiConsole::new(debug_state.clone());
+    let debug_transport = DebugTransport::discover(&fdt);
+    let console = SbiConsole::new(
+        debug_state.clone(),
+        helios_kernel::embedded_debugger().is_none(),
+    );
     let cpu = RiscvCpu::new(
         current_hart,
         bootstrap_processor,
@@ -297,7 +308,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         hart_id: current_hart,
         timer: kernel.timer(),
         wasmtime_tls: Cell::new(core::ptr::null_mut()),
-        debug_uart_base,
+        debug_transport,
     };
     hart_runtime.install();
     unsafe {
@@ -354,28 +365,6 @@ fn collect_memory_regions<'fdt>(
     regions
 }
 
-fn find_debug_uart_base(fdt: &Fdt<'_>) -> Option<usize> {
-    let chosen = fdt.find_node("/chosen")?;
-    let stdout_path = chosen
-        .properties()
-        .find(|property| property.name == "stdin-path")
-        .or_else(|| {
-            chosen
-                .properties()
-                .find(|property| property.name == "stdout-path")
-        })?;
-    let path = core::str::from_utf8(stdout_path.value)
-        .ok()?
-        .trim_end_matches('\0')
-        .split(':')
-        .next()?;
-    let node = fdt
-        .find_node(path)
-        .or_else(|| fdt.aliases().and_then(|aliases| aliases.resolve_node(path)))?;
-    let region = node.reg()?.next()?;
-    Some(region.starting_address as usize)
-}
-
 fn intersect(left: Range<usize>, right: Range<usize>) -> Option<Range<usize>> {
     let start = left.start.max(right.start);
     let end = left.end.min(right.end);
@@ -413,25 +402,20 @@ fn current_hart_runtime() -> &'static HartRuntime {
     unsafe { &*(ptr as *const HartRuntime) }
 }
 
-fn current_debug_uart() -> Uart {
+fn current_debug_transport() -> &'static DebugTransport {
     let runtime = current_hart_runtime();
-    let base = runtime
-        .debug_uart_base
-        .expect("debug UART is missing from the device tree");
-    Uart::new(base)
+    runtime
+        .debug_transport
+        .as_ref()
+        .expect("debug transport is missing from the current hart runtime")
 }
 
 pub(crate) fn try_read_debug_serial_byte() -> Option<u8> {
-    current_debug_uart().get()
+    current_debug_transport().try_read_byte()
 }
 
 pub(crate) fn write_debug_serial_bytes(bytes: &[u8]) {
-    let uart = current_debug_uart();
-    for &byte in bytes {
-        while uart.put(byte).is_none() {
-            core::hint::spin_loop();
-        }
-    }
+    current_debug_transport().write_bytes(bytes);
 }
 
 #[unsafe(no_mangle)]

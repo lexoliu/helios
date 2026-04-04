@@ -1,0 +1,56 @@
+Helios shell commands
+
+Core:
+  help
+  help stats
+  help tracing
+  help rpc
+  refresh
+  quit
+  exit
+
+Views:
+  stats
+      Fetch one stats snapshot and make stats the current view.
+  tracing
+      Fetch recent tracing events and make tracing the current view.
+  use stats
+  use tracing
+  use rpc
+      Change the current view used by `refresh`.
+
+Stats:
+  stats period <ms>
+      Set the refresh cadence used when stats is the current view.
+
+Tracing:
+  tracing limit <n>
+      Limit the number of events fetched by `tracing` and `refresh`.
+  tracing level <none|error|warn|info|debug|trace>
+      Set the minimum tracing level filter.
+  tracing targets <prefix-a,prefix-b>
+      Restrict tracing to matching targets. Empty means any target.
+
+RPC:
+  rpc instance <name>
+  rpc func <name>
+  rpc payload <hex>
+  rpc call
+      Configure and invoke an arbitrary remote system call.
+
+Examples:
+  stats
+  stats period 250
+  tracing
+  tracing level debug
+  tracing targets helios_kernel,helios_riscv
+  rpc instance helios:system/stats@0.1.0
+  rpc func snapshot
+  rpc call
+
+Notes:
+  `refresh` repeats the current view:
+    stats view   -> fetch one stats snapshot
+    tracing view -> fetch recent tracing events
+    rpc view     -> repeat the last configured RPC call
+  Use `./qemu-shell -- tui` only when you explicitly want the dashboard.

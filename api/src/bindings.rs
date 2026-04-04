@@ -6,5 +6,4 @@ crate::wit_bindgen::generate!({
     generate_all,
     default_bindings_module: "bindings",
     pub_export_macro: true,
-    additional_derives: [serde::Serialize, serde::Deserialize],
 });

@@ -20,14 +20,13 @@ use ratatui::widgets::{Block, Borders, Paragraph, Tabs, Wrap};
 use ratatui::Terminal;
 
 use crate::rpc::RpcPane;
-use crate::serial::{RpcClient, SerialIo};
+use crate::serial::RpcClient;
 use crate::system::{self, StatsPane, TracingPane};
 use helios_shell_protocol::system::tracing;
 
-pub async fn run(io: SerialIo) -> Result<()> {
+pub async fn run(mut client: RpcClient) -> Result<()> {
     let mut terminal = setup_terminal()?;
     let guard = TerminalGuard;
-    let mut client = io.into_client();
     let mut app = App::new();
     let events = spawn_events();
 
@@ -123,8 +122,13 @@ impl App {
             KeyCode::Enter => {
                 let command = self.input.trim().to_owned();
                 self.input.clear();
-                if !command.is_empty() && self.execute_command(client, &command).await? {
-                    return Ok(true);
+                if !command.is_empty() {
+                    let Some(command) = self.prepare_command(&command) else {
+                        return Ok(false);
+                    };
+                    if self.execute_command(client, command).await {
+                        return Ok(true);
+                    }
                 }
             }
             KeyCode::Char(ch) => {
@@ -135,12 +139,22 @@ impl App {
         Ok(false)
     }
 
-    async fn execute_command(&mut self, client: &mut RpcClient, command: &str) -> Result<bool> {
-        match parse_command(command)? {
+    fn prepare_command(&mut self, command: &str) -> Option<Command> {
+        match parse_command(command) {
+            Ok(parsed) => Some(parsed),
+            Err(error) => {
+                self.status = error.to_string();
+                None
+            }
+        }
+    }
+
+    async fn execute_command(&mut self, client: &mut RpcClient, command: Command) -> bool {
+        match command {
             Command::Help => {
                 self.status = help_text();
             }
-            Command::Quit => return Ok(true),
+            Command::Quit => return true,
             Command::SwitchTab(tab) => {
                 self.tab = tab;
                 self.refresh_current(client).await;
@@ -194,7 +208,7 @@ impl App {
                 }
             },
         }
-        Ok(false)
+        false
     }
 
     async fn tick(&mut self, client: &mut RpcClient) {
@@ -450,7 +464,7 @@ fn format_updated(updated: Option<std::time::Instant>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_command, Command, Tab};
+    use super::{parse_command, App, Command, Tab};
     use helios_shell_protocol::system::tracing::Level;
 
     #[test]
@@ -472,5 +486,13 @@ mod tests {
         let command = parse_command("tracing level info")
             .unwrap_or_else(|error| panic!("failed to parse level command: {error}"));
         assert!(matches!(command, Command::TracingLevel(Some(Level::Info))));
+    }
+
+    #[test]
+    fn invalid_command_updates_status_instead_of_bubbling() {
+        let mut app = App::new();
+        let command = app.prepare_command("helo");
+        assert!(command.is_none());
+        assert_eq!(app.status, "unknown command `helo`");
     }
 }

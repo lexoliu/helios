@@ -4,10 +4,11 @@ use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::{Context as _, Result};
+use async_io::Timer;
 use helios_shell_protocol::system::{stats, tracing};
 
 use crate::runtime;
-use crate::serial::{RpcClient, SerialIo};
+use crate::serial::RpcClient;
 
 const INITIAL_REMOTE_TIMEOUT: Duration = Duration::from_secs(180);
 
@@ -45,38 +46,27 @@ impl StatsPane {
     }
 }
 
-pub async fn run_stats(io: SerialIo, period_ms: u64) -> Result<()> {
-    let mut client = io.into_client();
-    let period = duration_to_nanos(Duration::from_millis(period_ms));
-    let mut stream = runtime::timeout(
-        INITIAL_REMOTE_TIMEOUT,
-        stats::subscribe(&mut client, period),
-    )
-    .await
-    .context("timed out waiting for remote stats subscription")?
-    .context("failed to subscribe to remote stats stream")?;
+pub async fn run_stats(mut client: RpcClient, period_ms: u64) -> Result<()> {
     let mut stdout = std::io::stdout();
 
-    while let Some(sample) = runtime::timeout(INITIAL_REMOTE_TIMEOUT, stream.next())
-        .await
-        .context("timed out waiting for streamed stats sample")?
-        .context("failed to read streamed stats sample")?
-    {
+    loop {
+        let sample = runtime::timeout(INITIAL_REMOTE_TIMEOUT, stats::snapshot(&mut client))
+            .await
+            .context("timed out waiting for remote stats snapshot")?
+            .context("failed to fetch remote stats snapshot")?;
         stdout.write_all(render_sample(&sample)?.as_bytes())?;
         stdout.write_all(b"\n")?;
         stdout.flush()?;
+        Timer::after(Duration::from_millis(period_ms)).await;
     }
-
-    Ok(())
 }
 
 pub async fn run_tracing(
-    io: SerialIo,
+    mut client: RpcClient,
     limit: u32,
     min_level: Option<&str>,
     target_prefixes: Vec<String>,
 ) -> Result<()> {
-    let mut client = io.into_client();
     let mut pane = TracingPane::new();
     pane.limit = limit;
     pane.min_level = match min_level {
@@ -86,6 +76,7 @@ pub async fn run_tracing(
     pane.target_prefixes = target_prefixes;
     pane.refresh(&mut client).await?;
     std::io::stdout().write_all(pane.last_rendered.as_bytes())?;
+    std::io::stdout().write_all(b"\n")?;
     Ok(())
 }
 
@@ -228,11 +219,4 @@ fn write_value(output: &mut String, value: &tracing::Value) -> Result<()> {
         Value::Blob(value) => write!(output, "{value:?}")?,
     }
     Ok(())
-}
-
-fn duration_to_nanos(duration: Duration) -> u64 {
-    duration
-        .as_nanos()
-        .try_into()
-        .expect("duration does not fit into u64 nanoseconds")
 }

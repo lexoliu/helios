@@ -33,6 +33,7 @@ const CONFIG_SPACE_OFFSET: usize = 0x100;
 #[repr(u32)]
 pub enum DeviceType {
     Block = 2,
+    Console = 3,
 }
 
 bitflags! {
@@ -96,6 +97,7 @@ impl<B: DeviceBus> VirtioMmioTransport<B> {
 
         let device_type = match bus.read_u32(REG_DEVICE_ID) {
             2 => DeviceType::Block,
+            3 => DeviceType::Console,
             _ => return Err(IoError::Unsupported),
         };
 

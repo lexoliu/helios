@@ -1,22 +1,23 @@
-use anyhow::Result;
-use wrpc_transport::Invoke;
+#[cfg(feature = "host")]
+use crate::transport::Client;
+#[cfg(feature = "host")]
+use anyhow::{Context as _, Result};
+#[cfg(feature = "host")]
+use futures_io::{AsyncRead, AsyncWrite};
 
-use super::Subscription;
-use super::imports::helios::system::tracing as raw;
+pub use super::bindings::helios::system::tracing::{Event, Field, Filter, Level, MonoNanos, Value};
 
-pub use raw::{Event, Field, Filter, Level, MonoNanos, Value};
-
-pub async fn recent<C>(wrpc: &C, filter: &Filter, limit: u32) -> Result<Vec<Event>>
+#[cfg(feature = "host")]
+pub async fn recent<R, W>(client: &Client<R, W>, filter: &Filter, limit: u32) -> Result<Vec<Event>>
 where
-    C: Invoke<Context = ()>,
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
 {
-    raw::recent(wrpc, (), filter, limit).await
-}
-
-pub async fn subscribe<'a, C>(wrpc: &'a C, filter: &Filter) -> Result<Subscription<'a, Event>>
-where
-    C: Invoke<Context = ()> + 'a,
-{
-    let (stream, driver) = raw::subscribe(wrpc, (), filter).await?;
-    Ok(Subscription::new(stream, driver))
+    let request = postcard::to_allocvec(&(filter, limit))
+        .context("failed to encode remote tracing.recent request")?;
+    let bytes = client
+        .invoke_raw("helios:system/tracing@0.1.0", "recent", request)
+        .await
+        .context("failed to invoke remote tracing.recent")?;
+    postcard::from_bytes(&bytes).context("failed to decode remote tracing events")
 }

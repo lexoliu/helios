@@ -36,7 +36,21 @@ wasmtime = { path = "../wasmtime/crates/wasmtime", default-features = false, fea
 [profile.dev]
 panic = "abort"
 
+[profile.dev.package."*"]
+opt-level = 2
+debug = 0
+debug-assertions = false
+overflow-checks = false
+
 [profile.dev.package.helios-debugger]
+debug = 0
+opt-level = "z"
+
+[profile.dev.package.helios-api]
+debug = 0
+opt-level = "z"
+
+[profile.dev.package.helios-shell-protocol]
 debug = 0
 opt-level = "z"
 
