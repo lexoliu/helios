@@ -5,6 +5,9 @@ use std::io::Write as _;
 use anyhow::{Context as _, Result};
 use clap::error::ErrorKind;
 use clap::{ColorChoice, CommandFactory, Parser, Subcommand, ValueEnum};
+use crossterm::cursor::MoveTo;
+use crossterm::execute;
+use crossterm::terminal::{Clear, ClearType};
 use helios_shell_protocol::system::tracing;
 use nu_ansi_term::{Color, Style as AnsiStyle};
 use rustyline::completion::{Completer, Pair};
@@ -60,7 +63,7 @@ pub fn run(mut client: RpcClient) -> Result<()> {
 
 const PROMPT: &str = "helios> ";
 const LIVE_STATS_PERIOD_MS: u64 = 1_000;
-const ROOT_CANDIDATES: &[&str] = &["help", "exit", "stats", "tracing", "rpc", "--help"];
+const ROOT_CANDIDATES: &[&str] = &["help", "clear", "exit", "stats", "tracing", "rpc", "--help"];
 const HELP_CANDIDATES: &[&str] = &["overview", "stats", "tracing", "rpc", "--help"];
 const STATS_CANDIDATES: &[&str] = &["--help"];
 const TRACING_CANDIDATES: &[&str] = &["limit", "level", "targets", "--help"];
@@ -119,6 +122,8 @@ enum CliCommand {
         #[arg(value_enum)]
         topic: Option<HelpTopic>,
     },
+    /// Clear the screen and move the cursor to the top-left corner.
+    Clear,
     /// Leave the shell.
     Exit,
     /// Open the live stats view.
@@ -170,6 +175,7 @@ struct Shell {
 
 enum Command {
     Help(HelpTopic),
+    Clear,
     Exit,
     ShowStats,
     ShowTracing,
@@ -227,9 +233,18 @@ impl Shell {
         Ok(())
     }
 
+    fn clear_screen(&self) -> Result<()> {
+        let mut stdout = std::io::stdout().lock();
+        execute!(stdout, Clear(ClearType::All), MoveTo(0, 0))
+            .context("failed to clear shell screen")?;
+        stdout.flush()?;
+        Ok(())
+    }
+
     async fn execute(&mut self, client: &mut RpcClient, command: Command) -> Result<bool> {
         match command {
             Command::Help(topic) => self.print_block(&render_help(topic))?,
+            Command::Clear => self.clear_screen()?,
             Command::Exit => return Ok(true),
             Command::ShowStats => stats_tui::run(client, LIVE_STATS_PERIOD_MS).await?,
             Command::ShowTracing => self.show_tracing(client).await?,
@@ -557,6 +572,7 @@ impl CliCommand {
     fn into_runtime_command(self) -> Command {
         match self {
             Self::Help { topic } => Command::Help(topic.unwrap_or(HelpTopic::Overview)),
+            Self::Clear => Command::Clear,
             Self::Exit => Command::Exit,
             Self::Stats => Command::ShowStats,
             Self::Tracing { action } => match action {
@@ -650,6 +666,14 @@ mod tests {
         match parse_line("stats") {
             ParsedLine::Command(Command::ShowStats) => {}
             _ => panic!("stats command must parse"),
+        }
+    }
+
+    #[test]
+    fn parses_clear_command() {
+        match parse_line("clear") {
+            ParsedLine::Command(Command::Clear) => {}
+            _ => panic!("clear command must parse"),
         }
     }
 

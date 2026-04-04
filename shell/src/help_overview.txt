@@ -5,6 +5,7 @@ Core:
   help stats
   help tracing
   help rpc
+  clear
   exit
 
 Interactive:
