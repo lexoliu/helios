@@ -3,6 +3,7 @@ extern crate alloc;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::marker::PhantomData;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
@@ -44,6 +45,9 @@ pub(crate) mod bindings {
                 "wasi:filesystem/types.descriptor": crate::debugger_wasi::FsDescriptor,
                 "wasi:sockets/types.tcp-socket": crate::debugger_wasi::TcpSocket,
                 "wasi:sockets/types.udp-socket": crate::debugger_wasi::UdpSocket,
+            },
+            trappable_error_type: {
+                "wasi:filesystem/types.error-code" => crate::debugger_wasi::FsError,
             },
         });
     }
@@ -108,6 +112,53 @@ pub struct TerminalInput;
 pub struct TerminalOutput;
 pub struct TcpSocket;
 pub struct UdpSocket;
+
+#[repr(transparent)]
+pub struct TrappableError<T> {
+    err: wasmtime::Error,
+    _marker: PhantomData<T>,
+}
+
+pub type FsError = TrappableError<fs_types::ErrorCode>;
+
+impl<T> TrappableError<T> {
+    fn trap(err: impl Into<wasmtime::Error>) -> Self {
+        Self {
+            err: err.into(),
+            _marker: PhantomData,
+        }
+    }
+
+    fn downcast(self) -> Result<T>
+    where
+        T: core::error::Error + Send + Sync + 'static,
+    {
+        self.err.downcast()
+    }
+}
+
+impl<T> From<T> for TrappableError<T>
+where
+    T: core::error::Error + Send + Sync + 'static,
+{
+    fn from(error: T) -> Self {
+        Self::trap(error)
+    }
+}
+
+impl<T> core::fmt::Debug for TrappableError<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.err.fmt(f)
+    }
+}
+
+impl<T> core::fmt::Display for TrappableError<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.err.fmt(f)
+    }
+}
+
+impl<T> core::error::Error for TrappableError<T> {}
 
 #[derive(Default)]
 pub(crate) struct DebugFileSystem {
@@ -820,7 +871,11 @@ impl wasi::filesystem::preopens::Host for StoreData {
     }
 }
 
-impl wasi::filesystem::types::Host for StoreData {}
+impl wasi::filesystem::types::Host for StoreData {
+    fn convert_error_code(&mut self, error: FsError) -> Result<fs_types::ErrorCode> {
+        error.downcast()
+    }
+}
 impl wasi::filesystem::types::HostDescriptor for StoreData {
     fn drop(&mut self, descriptor: Resource<FsDescriptor>) -> Result<()> {
         self.table.delete(descriptor)?;
@@ -929,46 +984,47 @@ impl wasi::filesystem::types::HostDescriptorWithStore for HasSelf<StoreData> {
         _: u64,
         _: u64,
         _: fs_types::Advice,
-    ) -> Result<core::result::Result<(), fs_types::ErrorCode>> {
-        Ok(Err(fs_types::ErrorCode::Unsupported))
+    ) -> Result<(), FsError> {
+        Err(fs_types::ErrorCode::Unsupported.into())
     }
 
     async fn sync_data<T: Send>(
         _: &Accessor<T, Self>,
         _: Resource<FsDescriptor>,
-    ) -> Result<core::result::Result<(), fs_types::ErrorCode>> {
-        Ok(Ok(()))
+    ) -> Result<(), FsError> {
+        Ok(())
     }
 
     async fn get_flags<T: Send>(
         accessor: &Accessor<T, Self>,
         descriptor: Resource<FsDescriptor>,
-    ) -> Result<core::result::Result<fs_types::DescriptorFlags, fs_types::ErrorCode>> {
-        Ok(accessor.with(|mut access| {
-            get_fs_descriptor(access.get(), &descriptor).map(|descriptor| descriptor.flags)
-        }))
+    ) -> Result<fs_types::DescriptorFlags, FsError> {
+        accessor.with(|mut access| {
+            let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
+            Ok(descriptor.flags)
+        })
     }
 
     async fn get_type<T: Send>(
         accessor: &Accessor<T, Self>,
         descriptor: Resource<FsDescriptor>,
-    ) -> Result<core::result::Result<fs_types::DescriptorType, fs_types::ErrorCode>> {
-        Ok(accessor.with(|mut access| {
+    ) -> Result<fs_types::DescriptorType, FsError> {
+        accessor.with(|mut access| {
             let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
             let kind = match descriptor.kind {
                 FsNodeKind::Directory => fs_types::DescriptorType::Directory,
                 FsNodeKind::File => fs_types::DescriptorType::RegularFile,
             };
             Ok(kind)
-        }))
+        })
     }
 
     async fn set_size<T: Send>(
         _: &Accessor<T, Self>,
         _: Resource<FsDescriptor>,
         _: u64,
-    ) -> Result<core::result::Result<(), fs_types::ErrorCode>> {
-        Ok(Err(fs_types::ErrorCode::Unsupported))
+    ) -> Result<(), FsError> {
+        Err(fs_types::ErrorCode::Unsupported.into())
     }
 
     async fn set_times<T: Send>(
@@ -976,8 +1032,8 @@ impl wasi::filesystem::types::HostDescriptorWithStore for HasSelf<StoreData> {
         _: Resource<FsDescriptor>,
         _: fs_types::NewTimestamp,
         _: fs_types::NewTimestamp,
-    ) -> Result<core::result::Result<(), fs_types::ErrorCode>> {
-        Ok(Err(fs_types::ErrorCode::Unsupported))
+    ) -> Result<(), FsError> {
+        Err(fs_types::ErrorCode::Unsupported.into())
     }
 
     fn read_directory<T>(
@@ -1013,34 +1069,35 @@ impl wasi::filesystem::types::HostDescriptorWithStore for HasSelf<StoreData> {
     async fn sync<T: Send>(
         _: &Accessor<T, Self>,
         _: Resource<FsDescriptor>,
-    ) -> Result<core::result::Result<(), fs_types::ErrorCode>> {
-        Ok(Ok(()))
+    ) -> Result<(), FsError> {
+        Ok(())
     }
 
     async fn create_directory_at<T: Send>(
         accessor: &Accessor<T, Self>,
         descriptor: Resource<FsDescriptor>,
         path: String,
-    ) -> Result<core::result::Result<(), fs_types::ErrorCode>> {
-        Ok(accessor.with(|mut access| {
+    ) -> Result<(), FsError> {
+        accessor.with(|mut access| {
             let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
             let now_nanos = access.get().now_nanos();
             access
                 .get()
                 .filesystem
                 .create_directory_at(&descriptor, &path, now_nanos)
-        }))
+                .map_err(Into::into)
+        })
     }
 
     async fn stat<T: Send>(
         accessor: &Accessor<T, Self>,
         descriptor: Resource<FsDescriptor>,
-    ) -> Result<core::result::Result<fs_types::DescriptorStat, fs_types::ErrorCode>> {
-        Ok(accessor.with(|mut access| {
+    ) -> Result<fs_types::DescriptorStat, FsError> {
+        accessor.with(|mut access| {
             let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
             let path = descriptor.path;
-            access.get().filesystem.stat(&path)
-        }))
+            access.get().filesystem.stat(&path).map_err(Into::into)
+        })
     }
 
     async fn stat_at<T: Send>(
@@ -1048,15 +1105,15 @@ impl wasi::filesystem::types::HostDescriptorWithStore for HasSelf<StoreData> {
         descriptor: Resource<FsDescriptor>,
         path_flags: fs_types::PathFlags,
         path: String,
-    ) -> Result<core::result::Result<fs_types::DescriptorStat, fs_types::ErrorCode>> {
+    ) -> Result<fs_types::DescriptorStat, FsError> {
         if path_flags.contains(fs_types::PathFlags::SYMLINK_FOLLOW) {
-            return Ok(Err(fs_types::ErrorCode::Unsupported));
+            return Err(fs_types::ErrorCode::Unsupported.into());
         }
-        Ok(accessor.with(|mut access| {
+        accessor.with(|mut access| {
             let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
             let absolute = resolve_child_path(&descriptor.path, &path)?;
-            access.get().filesystem.stat(&absolute)
-        }))
+            access.get().filesystem.stat(&absolute).map_err(Into::into)
+        })
     }
 
     async fn set_times_at<T: Send>(
@@ -1066,8 +1123,8 @@ impl wasi::filesystem::types::HostDescriptorWithStore for HasSelf<StoreData> {
         _: String,
         _: fs_types::NewTimestamp,
         _: fs_types::NewTimestamp,
-    ) -> Result<core::result::Result<(), fs_types::ErrorCode>> {
-        Ok(Err(fs_types::ErrorCode::Unsupported))
+    ) -> Result<(), FsError> {
+        Err(fs_types::ErrorCode::Unsupported.into())
     }
 
     async fn link_at<T: Send>(
@@ -1077,8 +1134,8 @@ impl wasi::filesystem::types::HostDescriptorWithStore for HasSelf<StoreData> {
         _: String,
         _: Resource<FsDescriptor>,
         _: String,
-    ) -> Result<core::result::Result<(), fs_types::ErrorCode>> {
-        Ok(Err(fs_types::ErrorCode::Unsupported))
+    ) -> Result<(), FsError> {
+        Err(fs_types::ErrorCode::Unsupported.into())
     }
 
     async fn open_at<T: Send>(
@@ -1088,16 +1145,17 @@ impl wasi::filesystem::types::HostDescriptorWithStore for HasSelf<StoreData> {
         path: String,
         open_flags: fs_types::OpenFlags,
         flags: fs_types::DescriptorFlags,
-    ) -> Result<core::result::Result<Resource<FsDescriptor>, fs_types::ErrorCode>> {
+    ) -> Result<Resource<FsDescriptor>, FsError> {
         accessor.with(|mut access| {
             let base = get_fs_descriptor(access.get(), &descriptor)?;
             let now_nanos = access.get().now_nanos();
             let opened = access
                 .get()
                 .filesystem
-                .open_at(&base, path_flags, &path, open_flags, flags, now_nanos)?;
-            let resource = access.get().table.push(opened)?;
-            Ok(Ok(resource))
+                .open_at(&base, path_flags, &path, open_flags, flags, now_nanos)
+                .map_err(FsError::from)?;
+            let resource = access.get().table.push(opened).map_err(FsError::trap)?;
+            Ok(resource)
         })
     }
 
@@ -1105,22 +1163,23 @@ impl wasi::filesystem::types::HostDescriptorWithStore for HasSelf<StoreData> {
         _: &Accessor<T, Self>,
         _: Resource<FsDescriptor>,
         _: String,
-    ) -> Result<core::result::Result<String, fs_types::ErrorCode>> {
-        Ok(Err(fs_types::ErrorCode::Unsupported))
+    ) -> Result<String, FsError> {
+        Err(fs_types::ErrorCode::Unsupported.into())
     }
 
     async fn remove_directory_at<T: Send>(
         accessor: &Accessor<T, Self>,
         descriptor: Resource<FsDescriptor>,
         path: String,
-    ) -> Result<core::result::Result<(), fs_types::ErrorCode>> {
-        Ok(accessor.with(|mut access| {
+    ) -> Result<(), FsError> {
+        accessor.with(|mut access| {
             let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
             access
                 .get()
                 .filesystem
                 .remove_directory_at(&descriptor, &path)
-        }))
+                .map_err(Into::into)
+        })
     }
 
     async fn rename_at<T: Send>(
@@ -1129,8 +1188,8 @@ impl wasi::filesystem::types::HostDescriptorWithStore for HasSelf<StoreData> {
         _: String,
         _: Resource<FsDescriptor>,
         _: String,
-    ) -> Result<core::result::Result<(), fs_types::ErrorCode>> {
-        Ok(Err(fs_types::ErrorCode::Unsupported))
+    ) -> Result<(), FsError> {
+        Err(fs_types::ErrorCode::Unsupported.into())
     }
 
     async fn symlink_at<T: Send>(
@@ -1138,19 +1197,23 @@ impl wasi::filesystem::types::HostDescriptorWithStore for HasSelf<StoreData> {
         _: Resource<FsDescriptor>,
         _: String,
         _: String,
-    ) -> Result<core::result::Result<(), fs_types::ErrorCode>> {
-        Ok(Err(fs_types::ErrorCode::Unsupported))
+    ) -> Result<(), FsError> {
+        Err(fs_types::ErrorCode::Unsupported.into())
     }
 
     async fn unlink_file_at<T: Send>(
         accessor: &Accessor<T, Self>,
         descriptor: Resource<FsDescriptor>,
         path: String,
-    ) -> Result<core::result::Result<(), fs_types::ErrorCode>> {
-        Ok(accessor.with(|mut access| {
+    ) -> Result<(), FsError> {
+        accessor.with(|mut access| {
             let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-            access.get().filesystem.unlink_file_at(&descriptor, &path)
-        }))
+            access
+                .get()
+                .filesystem
+                .unlink_file_at(&descriptor, &path)
+                .map_err(Into::into)
+        })
     }
 
     async fn is_same_object<T: Send>(
@@ -1168,12 +1231,16 @@ impl wasi::filesystem::types::HostDescriptorWithStore for HasSelf<StoreData> {
     async fn metadata_hash<T: Send>(
         accessor: &Accessor<T, Self>,
         descriptor: Resource<FsDescriptor>,
-    ) -> Result<core::result::Result<fs_types::MetadataHashValue, fs_types::ErrorCode>> {
-        Ok(accessor.with(|mut access| {
+    ) -> Result<fs_types::MetadataHashValue, FsError> {
+        accessor.with(|mut access| {
             let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
             let path = descriptor.path;
-            access.get().filesystem.metadata_hash(&path)
-        }))
+            access
+                .get()
+                .filesystem
+                .metadata_hash(&path)
+                .map_err(Into::into)
+        })
     }
 
     async fn metadata_hash_at<T: Send>(
@@ -1181,15 +1248,19 @@ impl wasi::filesystem::types::HostDescriptorWithStore for HasSelf<StoreData> {
         descriptor: Resource<FsDescriptor>,
         path_flags: fs_types::PathFlags,
         path: String,
-    ) -> Result<core::result::Result<fs_types::MetadataHashValue, fs_types::ErrorCode>> {
+    ) -> Result<fs_types::MetadataHashValue, FsError> {
         if path_flags.contains(fs_types::PathFlags::SYMLINK_FOLLOW) {
-            return Ok(Err(fs_types::ErrorCode::Unsupported));
+            return Err(fs_types::ErrorCode::Unsupported.into());
         }
-        Ok(accessor.with(|mut access| {
+        accessor.with(|mut access| {
             let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
             let absolute = resolve_child_path(&descriptor.path, &path)?;
-            access.get().filesystem.metadata_hash(&absolute)
-        }))
+            access
+                .get()
+                .filesystem
+                .metadata_hash(&absolute)
+                .map_err(Into::into)
+        })
     }
 }
 

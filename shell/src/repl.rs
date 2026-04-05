@@ -1,14 +1,13 @@
 use std::borrow::Cow::{self, Borrowed, Owned};
+use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::Path;
+use std::rc::Rc;
 
 use anyhow::{Context as _, Result};
 use clap::error::ErrorKind;
 use clap::{ColorChoice, Parser, Subcommand, ValueEnum};
-use crossterm::cursor::MoveTo;
-use crossterm::execute;
-use crossterm::terminal::{Clear, ClearType};
 use helios_shell_protocol::system::tracing;
 use nu_ansi_term::{Color, Style as AnsiStyle};
 use rustyline::completion::{Completer, Pair};
@@ -37,14 +36,16 @@ use crate::serial::RpcClient;
 use crate::stats_tui;
 use crate::system::{self, TracingConfig};
 
+type SharedEditor = Rc<RefCell<Editor<ShellHelper, DefaultHistory>>>;
+
 pub fn run(mut client: RpcClient) -> Result<()> {
-    let mut editor = build_editor()?;
-    let mut shell = Shell::new();
+    let editor = Rc::new(RefCell::new(build_editor()?));
+    let mut shell = Shell::new(InteractiveTerminal::new(Rc::clone(&editor))?);
 
     shell.print_banner()?;
 
     loop {
-        let Some(input) = read_program(&mut editor)? else {
+        let Some(input) = read_program(&editor)? else {
             return Ok(());
         };
         let input = input.trim();
@@ -53,6 +54,7 @@ pub fn run(mut client: RpcClient) -> Result<()> {
         }
 
         editor
+            .borrow_mut()
             .add_history_entry(input)
             .context("failed to record shell history entry")?;
 
@@ -64,8 +66,13 @@ pub fn run(mut client: RpcClient) -> Result<()> {
                 .context("failed to listen for Ctrl+C during shell command execution")?
                 {
                     runtime::CommandRun::Completed(result) => {
-                        if result?.should_exit {
-                            return Ok(());
+                        match result {
+                            Ok(status) => {
+                                if status.should_exit {
+                                    return Ok(());
+                                }
+                            }
+                            Err(error) => shell.print_line(&format!("error: {error:#}"))?,
                         }
                     }
                     runtime::CommandRun::Interrupted => shell.print_line("interrupted")?,
@@ -76,11 +83,11 @@ pub fn run(mut client: RpcClient) -> Result<()> {
     }
 }
 
-fn read_program(editor: &mut Editor<ShellHelper, DefaultHistory>) -> Result<Option<String>> {
+fn read_program(editor: &SharedEditor) -> Result<Option<String>> {
     let mut input = String::new();
     let mut prompt = PROMPT;
     loop {
-        let line = match editor.readline(prompt) {
+        let line = match editor.borrow_mut().readline(prompt) {
             Ok(line) => line,
             Err(ReadlineError::Interrupted) => return Ok(Some(String::new())),
             Err(ReadlineError::Eof) => return Ok(None),
@@ -242,7 +249,19 @@ enum RpcAction {
     Call,
 }
 
-struct Shell {
+trait TerminalIo {
+    fn print(&mut self, text: &str) -> Result<()>;
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<()>;
+    fn clear_screen(&mut self) -> Result<()>;
+}
+
+struct InteractiveTerminal {
+    editor: SharedEditor,
+    printer: Box<dyn rustyline::ExternalPrinter>,
+}
+
+struct Shell<T> {
+    terminal: T,
     tracing: TracingConfig,
     rpc: RpcPane,
 }
@@ -290,52 +309,73 @@ struct ShellHelper {
     colored_prompt: String,
 }
 
-impl Shell {
-    fn new() -> Self {
+impl InteractiveTerminal {
+    fn new(editor: SharedEditor) -> Result<Self> {
+        let printer = editor
+            .borrow_mut()
+            .create_external_printer()
+            .context("failed to create shell external printer")?;
+        Ok(Self {
+            editor,
+            printer: Box::new(printer),
+        })
+    }
+}
+
+impl TerminalIo for InteractiveTerminal {
+    fn print(&mut self, text: &str) -> Result<()> {
+        self.printer
+            .print(text.to_owned())
+            .context("failed to print shell output")
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => self.print(text),
+            Err(_) => write_stdout(bytes),
+        }
+    }
+
+    fn clear_screen(&mut self) -> Result<()> {
+        self.editor
+            .borrow_mut()
+            .clear_screen()
+            .context("failed to clear shell screen")
+    }
+}
+
+impl<T: TerminalIo> Shell<T> {
+    fn new(terminal: T) -> Self {
         Self {
+            terminal,
             tracing: TracingConfig::new(),
             rpc: RpcPane::new(),
         }
     }
 
-    fn print_banner(&self) -> Result<()> {
-        let mut stdout = std::io::stdout().lock();
-        stdout.write_all(b"Helios shell ready. Type `help` or use `--help` on any command.\n")?;
-        stdout.flush()?;
-        Ok(())
+    fn print_banner(&mut self) -> Result<()> {
+        self.terminal
+            .print("Helios shell ready. Type `help` or use `--help` on any command.\n")
     }
 
-    fn print_line(&self, line: &str) -> Result<()> {
-        let mut stdout = std::io::stdout().lock();
-        stdout.write_all(line.as_bytes())?;
-        stdout.write_all(b"\n")?;
-        stdout.flush()?;
-        Ok(())
+    fn print_line(&mut self, line: &str) -> Result<()> {
+        let mut output = String::with_capacity(line.len() + 1);
+        output.push_str(line);
+        output.push('\n');
+        self.terminal.print(&output)
     }
 
-    fn print_block(&self, text: &str) -> Result<()> {
-        let mut stdout = std::io::stdout().lock();
-        stdout.write_all(text.as_bytes())?;
+    fn print_block(&mut self, text: &str) -> Result<()> {
+        let mut output = String::with_capacity(text.len() + 1);
+        output.push_str(text);
         if !text.ends_with('\n') {
-            stdout.write_all(b"\n")?;
+            output.push('\n');
         }
-        stdout.flush()?;
-        Ok(())
+        self.terminal.print(&output)
     }
 
-    fn write_bytes(&self, bytes: &[u8]) -> Result<()> {
-        let mut stdout = std::io::stdout().lock();
-        stdout.write_all(bytes)?;
-        stdout.flush()?;
-        Ok(())
-    }
-
-    fn clear_screen(&self) -> Result<()> {
-        let mut stdout = std::io::stdout().lock();
-        execute!(stdout, Clear(ClearType::All), MoveTo(0, 0))
-            .context("failed to clear shell screen")?;
-        stdout.flush()?;
-        Ok(())
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        self.terminal.write_bytes(bytes)
     }
 
     #[async_recursion::async_recursion(?Send)]
@@ -393,15 +433,11 @@ impl Shell {
         client: &mut RpcClient,
         command: Command,
     ) -> Result<CommandStatus> {
+        if let Some(status) = self.execute_immediate_command(&command)? {
+            return Ok(status);
+        }
+
         match command {
-            Command::Help(topic) => self.print_block(&render_help(topic))?,
-            Command::Clear => self.clear_screen()?,
-            Command::Exit => {
-                return Ok(CommandStatus {
-                    should_exit: true,
-                    success: true,
-                });
-            }
             Command::Pwd => self.print_line(filesystem::pwd())?,
             Command::List(path) => {
                 let output = filesystem::list(client, path.as_deref()).await?;
@@ -479,6 +515,7 @@ impl Shell {
                 self.print_line("rpc payload updated")?;
             }
             Command::RpcCall => self.call_rpc(client).await?,
+            Command::Help(_) | Command::Clear | Command::Exit => unreachable!(),
         }
 
         Ok(CommandStatus {
@@ -487,13 +524,39 @@ impl Shell {
         })
     }
 
+    fn execute_immediate_command(&mut self, command: &Command) -> Result<Option<CommandStatus>> {
+        let status = match command {
+            Command::Help(topic) => {
+                self.print_block(&render_help(*topic))?;
+                CommandStatus {
+                    should_exit: false,
+                    success: true,
+                }
+            }
+            Command::Clear => {
+                self.terminal.clear_screen()?;
+                CommandStatus {
+                    should_exit: false,
+                    success: true,
+                }
+            }
+            Command::Exit => CommandStatus {
+                should_exit: true,
+                success: true,
+            },
+            _ => return Ok(None),
+        };
+        Ok(Some(status))
+    }
+
     async fn show_tracing(&mut self, client: &mut RpcClient) -> Result<()> {
         system::stream_tracing(client, &self.tracing).await
     }
 
     async fn call_rpc(&mut self, client: &mut RpcClient) -> Result<()> {
         self.rpc.call(client).await?;
-        self.print_block(&self.rpc.response_hex)
+        let response = self.rpc.response_hex.clone();
+        self.print_block(&response)
     }
 }
 
@@ -625,6 +688,13 @@ fn build_editor() -> Result<Editor<ShellHelper, DefaultHistory>> {
     Ok(editor)
 }
 
+fn write_stdout(bytes: &[u8]) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(bytes)?;
+    stdout.flush()?;
+    Ok(())
+}
+
 fn parse_input(input: &str) -> ParsedLine {
     match script::parse(input) {
         Ok(script::ParseState::Complete(program)) => {
@@ -632,7 +702,7 @@ fn parse_input(input: &str) -> ParsedLine {
             for statement in program {
                 match validate_statement(statement) {
                     Ok(statement) => commands.push(statement),
-                    Err(error) => return ParsedLine::Output(format!("error: {error}")),
+                    Err(error) => return ParsedLine::Output(format_parse_error(&error.to_string())),
                 }
             }
             ParsedLine::Program(commands)
@@ -640,7 +710,15 @@ fn parse_input(input: &str) -> ParsedLine {
         Ok(script::ParseState::Incomplete) => {
             ParsedLine::Output("error: shell block is incomplete".to_owned())
         }
-        Err(error) => ParsedLine::Output(format!("error: {error}")),
+        Err(error) => ParsedLine::Output(format_parse_error(&error.to_string())),
+    }
+}
+
+fn format_parse_error(error: &str) -> String {
+    if error.starts_with("error:") {
+        error.to_owned()
+    } else {
+        format!("error: {error}")
     }
 }
 
@@ -707,6 +785,10 @@ fn render_unknown_command(tokens: &[String]) -> Option<String> {
         return None;
     }
 
+    if let Some(output) = render_reserved_block_keyword_error(tokens) {
+        return Some(output);
+    }
+
     let prefix = tokens[..tokens.len().saturating_sub(1)]
         .iter()
         .map(String::as_str)
@@ -760,12 +842,39 @@ fn best_suggestion<'a>(current: &str, candidates: &'a [&'a str]) -> Option<&'a s
         .iter()
         .copied()
         .filter(|candidate| !candidate.starts_with("--"))
+        .filter(|candidate| *candidate != current)
         .filter_map(|candidate| {
             let score = normalized_damerau_levenshtein(current, candidate);
             (score >= 0.5).then_some((candidate, score))
         })
         .max_by(|(_, left), (_, right)| left.total_cmp(right))
         .map(|(candidate, _)| candidate)
+}
+
+fn render_reserved_block_keyword_error(tokens: &[String]) -> Option<String> {
+    let keyword = tokens.last()?.as_str();
+    let message = match keyword {
+        "if" => "`if` starts a shell block and requires a condition command, for example `if test -e /tmp/file`",
+        "else" => "`else` is only valid inside an `if ... end` block",
+        "end" => "`end` is only valid when closing an open shell block",
+        _ => return None,
+    };
+
+    let mut output = String::new();
+    write!(
+        &mut output,
+        "{}: {}",
+        AnsiStyle::new().fg(Color::Red).bold().paint("error"),
+        message,
+    )
+    .expect("writing into String must succeed");
+    write!(
+        &mut output,
+        "\n\n{} `if test -e /tmp/file`",
+        AnsiStyle::new().fg(Color::Fixed(244)).paint("try:"),
+    )
+    .expect("writing into String must succeed");
+    Some(output)
 }
 
 fn render_help_hint(prefix: &[&str]) -> String {
@@ -1013,10 +1122,41 @@ fn highlight_argument_token(command: &str, token: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Result;
+
     use crate::filesystem::EchoTarget;
     use crate::script::Statement;
 
     use super::{parse_input, Command, HelpTopic, ParsedLine};
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum TerminalEvent {
+        Print(String),
+        Bytes(Vec<u8>),
+        Clear,
+    }
+
+    #[derive(Default)]
+    struct MockTerminal {
+        events: Vec<TerminalEvent>,
+    }
+
+    impl super::TerminalIo for MockTerminal {
+        fn print(&mut self, text: &str) -> Result<()> {
+            self.events.push(TerminalEvent::Print(text.to_owned()));
+            Ok(())
+        }
+
+        fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+            self.events.push(TerminalEvent::Bytes(bytes.to_vec()));
+            Ok(())
+        }
+
+        fn clear_screen(&mut self) -> Result<()> {
+            self.events.push(TerminalEvent::Clear);
+            Ok(())
+        }
+    }
 
     fn single_command(input: &str) -> Command {
         match parse_input(input) {
@@ -1173,6 +1313,19 @@ mod tests {
     }
 
     #[test]
+    fn reserved_if_keyword_reports_block_specific_error() {
+        match parse_input("if") {
+            ParsedLine::Output(text) => {
+                assert!(text.contains("`if` starts a shell block"));
+                assert!(text.contains("if test -e /tmp/file"));
+                assert!(!text.contains("did you mean `if`"));
+                assert!(!text.contains("error: error:"));
+            }
+            _ => panic!("bare if must produce a parse error"),
+        }
+    }
+
+    #[test]
     fn parses_if_program() {
         match parse_input("if test -e /tmp/file\n echo yes\nelse\n echo no\nend") {
             ParsedLine::Program(program) => {
@@ -1180,5 +1333,37 @@ mod tests {
             }
             ParsedLine::Output(text) => panic!("unexpected parse output: {text}"),
         }
+    }
+
+    #[test]
+    fn clear_command_uses_terminal_clear_path() {
+        let mut shell = super::Shell::new(MockTerminal::default());
+        let status = shell
+            .execute_immediate_command(&Command::Clear)
+            .expect("clear must execute successfully")
+            .expect("clear must complete immediately");
+
+        assert!(!status.should_exit);
+        assert!(status.success);
+        assert_eq!(shell.terminal.events, vec![TerminalEvent::Clear]);
+    }
+
+    #[test]
+    fn print_block_adds_only_one_trailing_newline() {
+        let mut shell = super::Shell::new(MockTerminal::default());
+        shell
+            .print_block("kernel ready")
+            .expect("printing a block must succeed");
+        shell
+            .print_block("already terminated\n")
+            .expect("printing a terminated block must succeed");
+
+        assert_eq!(
+            shell.terminal.events,
+            vec![
+                TerminalEvent::Print("kernel ready\n".to_owned()),
+                TerminalEvent::Print("already terminated\n".to_owned()),
+            ]
+        );
     }
 }

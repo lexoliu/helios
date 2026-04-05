@@ -89,7 +89,7 @@ pub(crate) fn install_program_service(
                 cpu.bootstrap_processor().id(),
             )
         {
-            cpu.wake_processor(hart);
+            cpu.start_processor(hart);
         }
     }
 

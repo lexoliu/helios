@@ -12,8 +12,8 @@ use futures_lite::future::zip;
 use helios_api::bindings::wasi::filesystem::preopens;
 #[cfg(feature = "guest")]
 use helios_api::bindings::wasi::filesystem::types::{
-    Descriptor, DescriptorFlags, DescriptorType, DirectoryEntry as WasiDirectoryEntry, OpenFlags,
-    PathFlags,
+    Descriptor, DescriptorFlags, DescriptorType, DirectoryEntry as WasiDirectoryEntry, ErrorCode,
+    OpenFlags, PathFlags,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "guest")]
@@ -235,9 +235,10 @@ fn decode_path_request(payload: &[u8], operation: &str) -> Result<String> {
 #[cfg(feature = "guest")]
 async fn list_directory(path: &str) -> Result<Vec<DirectoryEntry>> {
     let descriptor = open_path(path, DescriptorFlags::READ, OpenFlags::empty()).await?;
-    let descriptor_type = descriptor.get_type().await.map_err(|code| {
-        anyhow::anyhow!("failed to inspect debugger filesystem path {path}: {code:?}")
-    })?;
+    let descriptor_type = descriptor
+        .get_type()
+        .await
+        .map_err(|code| filesystem_error(path, "inspect", code))?;
     if matches!(descriptor_type, DescriptorType::Directory) {
         let (stream, result) = descriptor.read_directory();
         let mut entries = stream
@@ -246,9 +247,9 @@ async fn list_directory(path: &str) -> Result<Vec<DirectoryEntry>> {
             .into_iter()
             .map(convert_directory_entry)
             .collect::<Vec<_>>();
-        result.await.map_err(|code| {
-            anyhow::anyhow!("failed to read debugger directory {path}: {code:?}")
-        })?;
+        result
+            .await
+            .map_err(|code| filesystem_error(path, "read directory", code))?;
         entries.sort_by(|left, right| {
             left.kind
                 .cmp(&right.kind)
@@ -266,9 +267,10 @@ async fn list_directory(path: &str) -> Result<Vec<DirectoryEntry>> {
 #[cfg(feature = "guest")]
 async fn read_file(path: &str) -> Result<Vec<u8>> {
     let descriptor = open_path(path, DescriptorFlags::READ, OpenFlags::empty()).await?;
-    let descriptor_type = descriptor.get_type().await.map_err(|code| {
-        anyhow::anyhow!("failed to inspect debugger filesystem path {path}: {code:?}")
-    })?;
+    let descriptor_type = descriptor
+        .get_type()
+        .await
+        .map_err(|code| filesystem_error(path, "inspect", code))?;
     if matches!(descriptor_type, DescriptorType::Directory) {
         bail!("debugger filesystem path {path} is a directory");
     }
@@ -276,7 +278,7 @@ async fn read_file(path: &str) -> Result<Vec<u8>> {
     let bytes = stream.collect().await;
     result
         .await
-        .map_err(|code| anyhow::anyhow!("failed to read debugger file {path}: {code:?}"))?;
+        .map_err(|code| filesystem_error(path, "read file", code))?;
     Ok(bytes)
 }
 
@@ -286,17 +288,16 @@ async fn remove_path(path: &str) -> Result<()> {
     let stat = parent
         .stat_at(PathFlags::empty(), name.clone())
         .await
-        .map_err(|code| {
-            anyhow::anyhow!("failed to inspect debugger filesystem path {path}: {code:?}")
-        })?;
+        .map_err(|code| filesystem_error(path, "inspect", code))?;
     match stat.type_ {
-        DescriptorType::Directory => parent.remove_directory_at(name).await.map_err(|code| {
-            anyhow::anyhow!("failed to remove debugger directory {path}: {code:?}")
-        })?,
+        DescriptorType::Directory => parent
+            .remove_directory_at(name)
+            .await
+            .map_err(|code| filesystem_error(path, "remove directory", code))?,
         _ => parent
             .unlink_file_at(name)
             .await
-            .map_err(|code| anyhow::anyhow!("failed to remove debugger file {path}: {code:?}"))?,
+            .map_err(|code| filesystem_error(path, "remove file", code))?,
     }
     Ok(())
 }
@@ -307,7 +308,7 @@ async fn create_directory_path(path: &str) -> Result<()> {
     parent
         .create_directory_at(name)
         .await
-        .map_err(|code| anyhow::anyhow!("failed to create debugger directory {path}: {code:?}"))?;
+        .map_err(|code| filesystem_error(path, "create directory", code))?;
     Ok(())
 }
 
@@ -322,7 +323,7 @@ async fn touch_path(path: &str) -> Result<()> {
             DescriptorFlags::WRITE,
         )
         .await
-        .map_err(|code| anyhow::anyhow!("failed to touch debugger path {path}: {code:?}"))?;
+        .map_err(|code| filesystem_error(path, "touch", code))?;
     Ok(())
 }
 
@@ -338,7 +339,7 @@ async fn write_file(path: &str, bytes: &[u8], append: bool) -> Result<()> {
         descriptor
             .stat()
             .await
-            .map_err(|code| anyhow::anyhow!("failed to stat debugger file {path}: {code:?}"))?
+            .map_err(|code| filesystem_error(path, "stat", code))?
             .size
     } else {
         0
@@ -350,7 +351,7 @@ async fn write_file(path: &str, bytes: &[u8], append: bool) -> Result<()> {
             descriptor
                 .write_via_stream(rx, offset)
                 .await
-                .map_err(|code| anyhow::anyhow!("failed to write debugger file {path}: {code:?}"))
+                .map_err(|code| filesystem_error(path, "write file", code))
         },
         async move {
             tx.write(bytes).await;
@@ -361,6 +362,25 @@ async fn write_file(path: &str, bytes: &[u8], append: bool) -> Result<()> {
     .await;
     feed_result?;
     write_result
+}
+
+#[cfg(feature = "guest")]
+fn normalized_components(path: &str) -> Result<Vec<String>> {
+    let mut components = Vec::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(segment) => components.push(
+                segment
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("path {path:?} contains a non-utf8 segment"))?
+                    .to_owned(),
+            ),
+            Component::ParentDir => bail!("path {path:?} contains unsupported parent traversal"),
+            Component::Prefix(_) => bail!("path {path:?} uses an unsupported path prefix"),
+        }
+    }
+    Ok(components)
 }
 
 #[cfg(feature = "guest")]
@@ -400,9 +420,7 @@ async fn open_path(
                 next_flags,
             )
             .await
-            .map_err(|code| {
-                anyhow::anyhow!("failed to open debugger filesystem path {path}: {code:?}")
-            })?;
+            .map_err(|code| filesystem_error(path, "open", code))?;
     }
 
     Ok(descriptor)
@@ -425,31 +443,34 @@ async fn open_parent_directory(path: &str) -> Result<(Descriptor, String)> {
                 DescriptorFlags::READ | DescriptorFlags::MUTATE_DIRECTORY,
             )
             .await
-            .map_err(|code| {
-                anyhow::anyhow!("failed to open parent directory for {path}: {code:?}")
-            })?;
+            .map_err(|code| filesystem_error(path, "open parent directory for", code))?;
     }
 
     Ok((descriptor, name))
 }
 
 #[cfg(feature = "guest")]
-fn normalized_components(path: &str) -> Result<Vec<String>> {
-    let mut components = Vec::new();
-    for component in Path::new(path).components() {
-        match component {
-            Component::RootDir | Component::CurDir => {}
-            Component::Normal(segment) => components.push(
-                segment
-                    .to_str()
-                    .ok_or_else(|| anyhow::anyhow!("path {path:?} contains a non-utf8 segment"))?
-                    .to_owned(),
-            ),
-            Component::ParentDir => bail!("path {path:?} contains unsupported parent traversal"),
-            Component::Prefix(_) => bail!("path {path:?} uses an unsupported path prefix"),
-        }
+fn filesystem_error(path: &str, action: &str, code: ErrorCode) -> anyhow::Error {
+    anyhow::anyhow!("failed to {action} {path}: {}", describe_error_code(code))
+}
+
+#[cfg(feature = "guest")]
+fn describe_error_code(code: ErrorCode) -> &'static str {
+    match code {
+        ErrorCode::BadDescriptor => "bad file descriptor",
+        ErrorCode::Busy => "resource busy",
+        ErrorCode::Exist => "file exists",
+        ErrorCode::Invalid => "invalid argument",
+        ErrorCode::IsDirectory => "is a directory",
+        ErrorCode::NoEntry => "no such file or directory",
+        ErrorCode::NotDirectory => "not a directory",
+        ErrorCode::NotEmpty => "directory not empty",
+        ErrorCode::NotPermitted => "operation not permitted",
+        ErrorCode::Overflow => "value overflow",
+        ErrorCode::ReadOnly => "read-only filesystem",
+        ErrorCode::Unsupported => "operation not supported",
+        _ => "filesystem error",
     }
-    Ok(components)
 }
 
 #[cfg(feature = "guest")]
