@@ -6,6 +6,8 @@ mod init_program;
 mod observer_buffer;
 mod observer_host;
 mod program_bindings;
+mod program_host;
+mod programs_host;
 mod runtime;
 mod serial_host;
 mod sync_host;

@@ -14,7 +14,6 @@ use wasmtime::component::{
 };
 
 use crate::debugger_program::StoreData;
-use crate::write_debug_serial_bytes;
 
 pub(crate) mod bindings {
     mod generated {
@@ -116,13 +115,18 @@ pub(crate) struct DebugFileSystem {
     next_inode: u64,
 }
 
-struct SerialStreamConsumer {
+struct SerialStreamConsumer<T> {
+    getter: fn(&mut T) -> &mut StoreData,
     result: Option<oneshot::Sender<core::result::Result<(), cli_types::ErrorCode>>>,
 }
 
-impl SerialStreamConsumer {
-    fn new(result: oneshot::Sender<core::result::Result<(), cli_types::ErrorCode>>) -> Self {
+impl<T> SerialStreamConsumer<T> {
+    fn new(
+        getter: fn(&mut T) -> &mut StoreData,
+        result: oneshot::Sender<core::result::Result<(), cli_types::ErrorCode>>,
+    ) -> Self {
         Self {
+            getter,
             result: Some(result),
         }
     }
@@ -134,19 +138,19 @@ impl SerialStreamConsumer {
     }
 }
 
-impl Drop for SerialStreamConsumer {
+impl<T> Drop for SerialStreamConsumer<T> {
     fn drop(&mut self) {
         self.complete(Ok(()));
     }
 }
 
-impl<D> StreamConsumer<D> for SerialStreamConsumer {
+impl<T: 'static> StreamConsumer<T> for SerialStreamConsumer<T> {
     type Item = u8;
 
     fn poll_consume(
         self: Pin<&mut Self>,
         _: &mut Context<'_>,
-        mut store: wasmtime::StoreContextMut<'_, D>,
+        mut store: wasmtime::StoreContextMut<'_, T>,
         mut source: Source<'_, Self::Item>,
         _: bool,
     ) -> Poll<Result<StreamResult>> {
@@ -157,7 +161,8 @@ impl<D> StreamConsumer<D> for SerialStreamConsumer {
 
         let mut bytes = Vec::with_capacity(available);
         source.read(&mut store, &mut bytes)?;
-        write_debug_serial_bytes(&bytes);
+        let getter = self.as_ref().get_ref().getter;
+        getter(store.data_mut()).write_output(&bytes);
         Poll::Ready(Ok(StreamResult::Completed))
     }
 }
@@ -672,11 +677,11 @@ impl wasi::clocks::system_clock::Host for StoreData {
 
 impl wasi::cli::environment::Host for StoreData {
     fn get_arguments(&mut self) -> Result<Vec<String>> {
-        Ok(Vec::new())
+        Ok(self.arguments.clone())
     }
 
     fn get_environment(&mut self) -> Result<Vec<(String, String)>> {
-        Ok(Vec::new())
+        Ok(self.environment.clone())
     }
 
     fn get_initial_cwd(&mut self) -> Result<Option<String>> {
@@ -725,7 +730,8 @@ impl wasi::cli::stdout::HostWithStore for HasSelf<StoreData> {
         data: StreamReader<u8>,
     ) -> Result<FutureReader<core::result::Result<(), cli_types::ErrorCode>>> {
         let (tx, rx) = oneshot::channel();
-        data.pipe(&mut access, SerialStreamConsumer::new(tx))?;
+        let getter = access.getter();
+        data.pipe(&mut access, SerialStreamConsumer::new(getter, tx))?;
         FutureReader::new(&mut access, async move {
             match rx.await {
                 Ok(result) => Ok::<_, wasmtime::Error>(result),

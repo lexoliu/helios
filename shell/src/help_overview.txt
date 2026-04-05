@@ -23,6 +23,8 @@ Interactive:
       Create a file if it does not already exist.
   echo [words...]
       Print text. Use `echo ... > /path` or `echo ... >> /path` to write remote files.
+  run <path> [args...]
+      Launch a host-local wasm file inside Helios with the default minimal rights set.
   stats
       Open the live stats view. Press `q` to return to the shell.
   tracing
@@ -54,6 +56,7 @@ Examples:
   mkdir /tmp
   echo hello > /tmp/note.txt
   cat /tmp/note.txt
+  run ./target/wasm32-wasip2/debug/helios_ping.wasm google.com
   touch /tmp/marker
   rm /tmp/marker
   stats

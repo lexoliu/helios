@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 use std::path::{Component, Path};
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use helios_shell_protocol::debugger::filesystem::{self, DirectoryEntry, EntryKind};
 
 use crate::serial::RpcClient;
@@ -97,7 +97,7 @@ fn display_entry(entry: &DirectoryEntry) -> String {
     }
 }
 
-fn normalize_path(input: &str) -> Result<String> {
+pub fn normalize_path(input: &str) -> Result<String> {
     let path = Path::new(input);
     let mut segments = Vec::new();
     for component in path.components() {
@@ -123,7 +123,7 @@ fn normalize_path(input: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EchoTarget, normalize_path, parse_echo};
+    use super::{normalize_path, parse_echo, EchoTarget};
 
     #[test]
     fn normalizes_relative_paths_from_root() {

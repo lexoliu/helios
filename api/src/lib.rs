@@ -11,7 +11,11 @@ pub mod fs;
 pub mod instances;
 #[cfg(feature = "io")]
 pub mod io;
+#[cfg(feature = "net")]
+pub mod net;
 pub mod prelude;
+#[cfg(feature = "programs")]
+pub mod programs;
 #[cfg(feature = "serial")]
 pub mod serial;
 #[cfg(feature = "stats")]
@@ -32,6 +36,7 @@ pub use helios_api_macro::main;
 pub use io::{ReadExt, WriteExt};
 #[cfg(feature = "io")]
 pub use std::io::Error;
+use std::io::Write as _;
 pub use wit_bindgen;
 
 pub trait MainOutput {
@@ -44,8 +49,17 @@ impl MainOutput for () {
     }
 }
 
-impl<E> MainOutput for core::result::Result<(), E> {
+impl<E> MainOutput for core::result::Result<(), E>
+where
+    E: core::fmt::Display,
+{
     fn into_run_result(self) -> core::result::Result<(), ()> {
-        self.map_err(|_| ())
+        match self {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = writeln!(std::io::stderr().lock(), "{error}");
+                Err(())
+            }
+        }
     }
 }

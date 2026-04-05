@@ -1,17 +1,20 @@
 extern crate alloc;
 
+use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::format;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
 use helios_hal::cpu::Cpu;
+use helios_hal::resource::WasiRights;
 use helios_kernel::{
     EmbeddedDebugger, InstanceExecutionTransition, InstanceRegistry, OwnedRawMutexLease,
-    OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease, RawMutex, RawRwLock, RegisteredInstance,
-    embedded_debugger, heap_stats,
+    OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease, ProgramLaunchErrorKind, RawMutex, RawRwLock,
+    RegisteredInstance, embedded_debugger, heap_stats,
 };
 use thiserror::Error;
 use wasmtime::component::{
@@ -55,10 +58,23 @@ impl CustomCodeMemory for RiscvCodeMemory {
 }
 
 pub struct SbiSerialPort;
-pub(crate) struct DebugSerialOutputStream;
+#[derive(Clone)]
+struct GuestOutput {
+    mode: OutputMode,
+    debug_state: RuntimeState,
+    cpu: RiscvCpu,
+}
+pub(crate) struct DebugSerialOutputStream {
+    sink: GuestOutput,
+}
 pub(crate) struct DeadlinePollable {
     pub(crate) cpu: RiscvCpu,
     pub(crate) deadline_nanos: u64,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputMode {
+    Serial,
+    Trace,
 }
 pub struct SbiRawMutex {
     inner: Arc<RawMutex>,
@@ -118,7 +134,7 @@ fn debug_processor(bootstrap_hart: u16, hart_count: usize) -> u16 {
 fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), DebuggerError> {
     emit_stage_marker("engine:new");
     tracing::info!("debugger hart: creating wasmtime engine");
-    let engine = build_engine()?;
+    let engine = build_engine().map_err(DebuggerError::CreateEngine)?;
     emit_stage_marker("engine:ok");
     tracing::info!("debugger hart: compiling embedded debugger component");
     let component =
@@ -152,6 +168,9 @@ fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), Debugge
             cpu,
             debug_port: Some(()),
             filesystem: crate::debugger_wasi::DebugFileSystem::new(),
+            arguments: Vec::new(),
+            environment: Vec::new(),
+            output_mode: OutputMode::Serial,
         },
     );
     store.limiter(|state| state);
@@ -197,7 +216,7 @@ fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), Debugge
     }
 }
 
-fn build_engine() -> Result<Engine, DebuggerError> {
+pub(crate) fn build_engine() -> wasmtime::Result<Engine> {
     let mut config = Config::new();
     config
         .target(WASMTIME_TARGET)
@@ -216,17 +235,27 @@ fn build_engine() -> Result<Engine, DebuggerError> {
     config.memory_init_cow(false);
     config.wasm_component_model(true);
     config.wasm_component_model_async(true);
-    Engine::new(&config).map_err(DebuggerError::CreateEngine)
+    Engine::new(&config)
 }
 
 fn add_system_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
+    add_programs_to_linker(linker)?;
+    add_net_to_linker(linker)?;
     add_stats_to_linker(linker)?;
     add_instances_to_linker(linker)?;
     add_tracing_to_linker(linker)?;
     Ok(())
 }
 
-fn add_serial_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
+pub(crate) fn add_program_world_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
+    add_programs_to_program_linker(linker)?;
+    add_net_to_program_linker(linker)?;
+    add_stats_to_program_linker(linker)?;
+    add_tracing_to_program_linker(linker)?;
+    Ok(())
+}
+
+pub(crate) fn add_serial_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
     let mut instance = linker.instance("helios:system/serial@0.1.0")?;
     instance.resource_concurrent(
         "serial-port",
@@ -297,7 +326,7 @@ fn add_serial_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> 
     Ok(())
 }
 
-fn add_sync_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
+pub(crate) fn add_sync_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
     let mut instance = linker.instance("helios:system/sync@0.1.0")?;
     instance.resource_concurrent(
         "raw-mutex",
@@ -451,6 +480,138 @@ fn add_stats_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
     Ok(())
 }
 
+fn add_programs_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
+    let mut instance = linker.instance("helios:system/programs@0.1.0")?;
+    // `programs.launch` is intentionally a synchronous WIT call. The guest
+    // blocks on launch completion while the host internally awaits the
+    // compile/queue path on Wasmtime's async fiber.
+    instance.func_wrap_async(
+        "launch",
+        |caller: StoreContextMut<'_, StoreData>,
+         (request,): (bindings::helios::system::programs::LaunchRequest,)| {
+            let service = caller.data().debug_state.program_service().or_else(|| {
+                crate::program_host::install_program_service(
+                    &caller.data().cpu,
+                    &caller.data().debug_state,
+                )
+            });
+            Box::new(async move {
+                let Some(service) = service else {
+                    return Ok::<_, wasmtime::Error>((Err(
+                        bindings::helios::system::programs::LaunchError {
+                            kind: bindings::helios::system::programs::LaunchErrorKind::Unavailable,
+                            detail: "program launching is unavailable on this machine".to_owned(),
+                        },
+                    ),));
+                };
+                let response = service
+                    .launch(
+                        request.name,
+                        request.args,
+                        &request.wasm,
+                        WasiRights::empty(),
+                    )
+                    .await
+                    .map(|instance_id| instance_id.raw())
+                    .map_err(convert_launch_error);
+                Ok::<_, wasmtime::Error>((response,))
+            })
+        },
+    )?;
+    Ok(())
+}
+
+fn add_programs_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
+    let mut instance = linker.instance("helios:system/programs@0.1.0")?;
+    instance.func_wrap_async(
+        "launch",
+        |caller: StoreContextMut<'_, StoreData>,
+         (request,): (crate::program_bindings::bindings::helios::system::programs::LaunchRequest,)| {
+            let service = caller.data().debug_state.program_service().or_else(|| {
+                crate::program_host::install_program_service(
+                    &caller.data().cpu,
+                    &caller.data().debug_state,
+                )
+            });
+            Box::new(async move {
+                let Some(service) = service else {
+                    return Ok::<_, wasmtime::Error>((Err(
+                        crate::program_bindings::bindings::helios::system::programs::LaunchError {
+                            kind: crate::program_bindings::bindings::helios::system::programs::LaunchErrorKind::Unavailable,
+                            detail: "program launching is unavailable on this machine".to_owned(),
+                        },
+                    ),));
+                };
+                let response = service
+                    .launch(request.name, request.args, &request.wasm, WasiRights::empty())
+                    .await
+                    .map(|instance_id| instance_id.raw())
+                    .map_err(convert_program_launch_error);
+                Ok::<_, wasmtime::Error>((response,))
+            })
+        },
+    )?;
+    Ok(())
+}
+
+fn add_net_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
+    let mut instance = linker.instance("helios:system/net@0.1.0")?;
+    instance.func_wrap_concurrent(
+        "ping",
+        |accessor: &Accessor<StoreData>, (host, timeout): (String, u64)| {
+            Box::pin(async move {
+                let service = accessor.with(|mut access| {
+                    Ok::<_, wasmtime::Error>(access.get().debug_state.network_service())
+                })?;
+                let Some(service) = service else {
+                    return Ok::<_, wasmtime::Error>((Err(
+                        bindings::helios::system::net::PingError {
+                            kind: bindings::helios::system::net::PingErrorKind::Unavailable,
+                            detail: "network service is unavailable on this machine".to_owned(),
+                        },
+                    ),));
+                };
+                let response = service
+                    .ping(&host, timeout)
+                    .await
+                    .map(convert_ping_reply)
+                    .map_err(convert_ping_error);
+                Ok::<_, wasmtime::Error>((response,))
+            })
+        },
+    )?;
+    Ok(())
+}
+
+fn add_net_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
+    let mut instance = linker.instance("helios:system/net@0.1.0")?;
+    instance.func_wrap_concurrent(
+        "ping",
+        |accessor: &Accessor<StoreData>, (host, timeout): (String, u64)| {
+            Box::pin(async move {
+                let service = accessor.with(|mut access| {
+                    Ok::<_, wasmtime::Error>(access.get().debug_state.network_service())
+                })?;
+                let Some(service) = service else {
+                    return Ok::<_, wasmtime::Error>((Err(
+                        crate::program_bindings::bindings::helios::system::net::PingError {
+                            kind: crate::program_bindings::bindings::helios::system::net::PingErrorKind::Unavailable,
+                            detail: "network service is unavailable on this machine".to_owned(),
+                        },
+                    ),));
+                };
+                let response = service
+                    .ping(&host, timeout)
+                    .await
+                    .map(convert_program_ping_reply)
+                    .map_err(convert_program_ping_error);
+                Ok::<_, wasmtime::Error>((response,))
+            })
+        },
+    )?;
+    Ok(())
+}
+
 fn add_tracing_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
     let mut instance = linker.instance("helios:system/tracing@0.1.0")?;
     instance.func_wrap(
@@ -480,6 +641,174 @@ fn add_tracing_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()>
     Ok(())
 }
 
+fn add_stats_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
+    let mut instance = linker.instance("helios:system/stats@0.1.0")?;
+    instance.func_wrap("snapshot", |caller, (): ()| {
+        Ok((snapshot_program_sample(caller.data()),))
+    })?;
+    instance.func_wrap("subscribe", |mut caller, (period,): (u64,)| {
+        let reader = StreamReader::new(&mut caller, ProgramStatsStreamProducer::new(period))?;
+        Ok((reader,))
+    })?;
+    Ok(())
+}
+
+fn add_tracing_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
+    let mut instance = linker.instance("helios:system/tracing@0.1.0")?;
+    instance.func_wrap(
+        "recent",
+        |caller,
+         (filter, limit): (
+            crate::program_bindings::bindings::helios::system::tracing::Filter,
+            u32,
+        )| {
+            let filter = convert_program_filter(filter);
+            let events = caller
+                .data()
+                .debug_state
+                .recent(&filter, limit)
+                .into_iter()
+                .map(convert_program_event)
+                .collect::<Vec<_>>();
+            Ok((events,))
+        },
+    )?;
+    instance.func_wrap(
+        "subscribe",
+        |mut caller,
+         (filter,): (crate::program_bindings::bindings::helios::system::tracing::Filter,)| {
+            let reader = StreamReader::new(
+                &mut caller,
+                ProgramTracingStreamProducer::new(convert_program_filter(filter)),
+            )?;
+            Ok((reader,))
+        },
+    )?;
+    Ok(())
+}
+
+fn convert_launch_error(
+    error: helios_kernel::ProgramLaunchError,
+) -> bindings::helios::system::programs::LaunchError {
+    bindings::helios::system::programs::LaunchError {
+        kind: match error.kind {
+            ProgramLaunchErrorKind::InvalidBinary => {
+                bindings::helios::system::programs::LaunchErrorKind::InvalidBinary
+            }
+            ProgramLaunchErrorKind::MissingEntry => {
+                bindings::helios::system::programs::LaunchErrorKind::MissingEntry
+            }
+            ProgramLaunchErrorKind::UnsupportedImport => {
+                bindings::helios::system::programs::LaunchErrorKind::UnsupportedImport
+            }
+            ProgramLaunchErrorKind::QueueSaturated => {
+                bindings::helios::system::programs::LaunchErrorKind::QueueSaturated
+            }
+            ProgramLaunchErrorKind::Unavailable => {
+                bindings::helios::system::programs::LaunchErrorKind::Unavailable
+            }
+            ProgramLaunchErrorKind::Internal => {
+                bindings::helios::system::programs::LaunchErrorKind::Internal
+            }
+        },
+        detail: error.detail,
+    }
+}
+
+fn convert_program_launch_error(
+    error: helios_kernel::ProgramLaunchError,
+) -> crate::program_bindings::bindings::helios::system::programs::LaunchError {
+    crate::program_bindings::bindings::helios::system::programs::LaunchError {
+        kind: match error.kind {
+            ProgramLaunchErrorKind::InvalidBinary => {
+                crate::program_bindings::bindings::helios::system::programs::LaunchErrorKind::InvalidBinary
+            }
+            ProgramLaunchErrorKind::MissingEntry => {
+                crate::program_bindings::bindings::helios::system::programs::LaunchErrorKind::MissingEntry
+            }
+            ProgramLaunchErrorKind::UnsupportedImport => {
+                crate::program_bindings::bindings::helios::system::programs::LaunchErrorKind::UnsupportedImport
+            }
+            ProgramLaunchErrorKind::QueueSaturated => {
+                crate::program_bindings::bindings::helios::system::programs::LaunchErrorKind::QueueSaturated
+            }
+            ProgramLaunchErrorKind::Unavailable => {
+                crate::program_bindings::bindings::helios::system::programs::LaunchErrorKind::Unavailable
+            }
+            ProgramLaunchErrorKind::Internal => {
+                crate::program_bindings::bindings::helios::system::programs::LaunchErrorKind::Internal
+            }
+        },
+        detail: error.detail,
+    }
+}
+
+fn convert_ping_reply(reply: crate::net::PingReply) -> bindings::helios::system::net::PingReply {
+    let octets = reply.address.octets();
+    bindings::helios::system::net::PingReply {
+        address: bindings::helios::system::net::IpAddress::Ipv4((
+            octets[0], octets[1], octets[2], octets[3],
+        )),
+        round_trip: reply.round_trip_nanos,
+        payload_bytes: reply.payload_bytes,
+    }
+}
+
+fn convert_program_ping_reply(
+    reply: crate::net::PingReply,
+) -> crate::program_bindings::bindings::helios::system::net::PingReply {
+    let octets = reply.address.octets();
+    crate::program_bindings::bindings::helios::system::net::PingReply {
+        address: crate::program_bindings::bindings::helios::system::net::IpAddress::Ipv4((
+            octets[0], octets[1], octets[2], octets[3],
+        )),
+        round_trip: reply.round_trip_nanos,
+        payload_bytes: reply.payload_bytes,
+    }
+}
+
+fn convert_ping_error(error: crate::net::PingError) -> bindings::helios::system::net::PingError {
+    bindings::helios::system::net::PingError {
+        kind: match error.kind {
+            crate::net::PingErrorKind::UnresolvedHost => {
+                bindings::helios::system::net::PingErrorKind::UnresolvedHost
+            }
+            crate::net::PingErrorKind::Timeout => {
+                bindings::helios::system::net::PingErrorKind::Timeout
+            }
+            crate::net::PingErrorKind::Unavailable => {
+                bindings::helios::system::net::PingErrorKind::Unavailable
+            }
+            crate::net::PingErrorKind::Internal => {
+                bindings::helios::system::net::PingErrorKind::Internal
+            }
+        },
+        detail: error.detail,
+    }
+}
+
+fn convert_program_ping_error(
+    error: crate::net::PingError,
+) -> crate::program_bindings::bindings::helios::system::net::PingError {
+    crate::program_bindings::bindings::helios::system::net::PingError {
+        kind: match error.kind {
+            crate::net::PingErrorKind::UnresolvedHost => {
+                crate::program_bindings::bindings::helios::system::net::PingErrorKind::UnresolvedHost
+            }
+            crate::net::PingErrorKind::Timeout => {
+                crate::program_bindings::bindings::helios::system::net::PingErrorKind::Timeout
+            }
+            crate::net::PingErrorKind::Unavailable => {
+                crate::program_bindings::bindings::helios::system::net::PingErrorKind::Unavailable
+            }
+            crate::net::PingErrorKind::Internal => {
+                crate::program_bindings::bindings::helios::system::net::PingErrorKind::Internal
+            }
+        },
+        detail: error.detail,
+    }
+}
+
 fn add_instances_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
     let mut instance = linker.instance("helios:system/instances@0.1.0")?;
     instance.func_wrap("snapshot", |caller, (): ()| {
@@ -502,11 +831,18 @@ pub(crate) struct StoreData {
     pub(crate) instance: RegisteredInstance,
     pub(crate) debug_port: Option<()>,
     pub(crate) filesystem: crate::debugger_wasi::DebugFileSystem,
+    pub(crate) arguments: Vec<String>,
+    pub(crate) environment: Vec<(String, String)>,
+    pub(crate) output_mode: OutputMode,
 }
 
 impl StoreData {
     pub(crate) fn now_nanos(&self) -> u64 {
         self.debug_state.uptime_nanos(self.cpu.now().ticks())
+    }
+
+    pub(crate) fn write_output(&self, bytes: &[u8]) {
+        GuestOutput::from_store(self).write(bytes);
     }
 
     pub(crate) fn record_call_hook(&mut self, hook: CallHook) {
@@ -553,6 +889,37 @@ impl IoView for StoreData {
     }
 }
 
+impl GuestOutput {
+    fn from_store(store: &StoreData) -> Self {
+        Self {
+            mode: store.output_mode,
+            debug_state: store.debug_state.clone(),
+            cpu: store.cpu.clone(),
+        }
+    }
+
+    fn write(&self, bytes: &[u8]) {
+        match self.mode {
+            OutputMode::Serial => write_serial(bytes),
+            OutputMode::Trace => {
+                let text = core::str::from_utf8(bytes).unwrap_or_else(|error| {
+                    panic!("guest attempted to write non-utf8 stdout/stderr bytes: {error}")
+                });
+                self.debug_state
+                    .record_console_text(self.cpu.now().ticks(), text);
+            }
+        }
+    }
+}
+
+impl DebugSerialOutputStream {
+    pub(crate) fn from_store(store: &StoreData) -> Self {
+        Self {
+            sink: GuestOutput::from_store(store),
+        }
+    }
+}
+
 #[wasmtime_wasi_io::async_trait]
 impl Pollable for DebugSerialOutputStream {
     async fn ready(&mut self) {}
@@ -561,7 +928,7 @@ impl Pollable for DebugSerialOutputStream {
 #[wasmtime_wasi_io::async_trait]
 impl OutputStream for DebugSerialOutputStream {
     fn write(&mut self, bytes: Bytes) -> Result<(), StreamError> {
-        write_serial(bytes.as_ref());
+        self.sink.write(bytes.as_ref());
         Ok(())
     }
 
@@ -847,6 +1214,51 @@ impl StreamProducer<StoreData> for StatsStreamProducer {
     }
 }
 
+struct ProgramStatsStreamProducer {
+    period_nanos: u64,
+    next_due: Option<u64>,
+}
+
+impl ProgramStatsStreamProducer {
+    fn new(period_nanos: u64) -> Self {
+        assert!(period_nanos != 0, "stats subscribe period must be non-zero");
+        Self {
+            period_nanos,
+            next_due: None,
+        }
+    }
+}
+
+impl StreamProducer<StoreData> for ProgramStatsStreamProducer {
+    type Item = crate::program_bindings::bindings::helios::system::stats::Sample;
+    type Buffer = Option<Self::Item>;
+
+    fn poll_produce<'a>(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        store: StoreContextMut<'_, StoreData>,
+        mut destination: Destination<'a, Self::Item, Self::Buffer>,
+        finish: bool,
+    ) -> Poll<wasmtime::Result<StreamResult>> {
+        if finish {
+            return Poll::Ready(Ok(StreamResult::Cancelled));
+        }
+
+        let now = store.data().now_nanos();
+        let period_nanos = self.period_nanos;
+        let due = self
+            .next_due
+            .get_or_insert_with(|| now.saturating_add(period_nanos));
+        if now < *due {
+            return Poll::Pending;
+        }
+
+        *due = now.saturating_add(period_nanos);
+        destination.set_buffer(Some(snapshot_program_sample(store.data())));
+        Poll::Ready(Ok(StreamResult::Completed))
+    }
+}
+
 struct TracingStreamProducer {
     filter: TraceFilter,
     cursor: u64,
@@ -888,8 +1300,55 @@ impl StreamProducer<StoreData> for TracingStreamProducer {
     }
 }
 
+struct ProgramTracingStreamProducer {
+    filter: TraceFilter,
+    cursor: u64,
+}
+
+impl ProgramTracingStreamProducer {
+    fn new(filter: TraceFilter) -> Self {
+        Self { filter, cursor: 0 }
+    }
+}
+
+impl StreamProducer<StoreData> for ProgramTracingStreamProducer {
+    type Item = crate::program_bindings::bindings::helios::system::tracing::Event;
+    type Buffer = Option<Self::Item>;
+
+    fn poll_produce<'a>(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        store: StoreContextMut<'_, StoreData>,
+        mut destination: Destination<'a, Self::Item, Self::Buffer>,
+        finish: bool,
+    ) -> Poll<wasmtime::Result<StreamResult>> {
+        if finish {
+            return Poll::Ready(Ok(StreamResult::Cancelled));
+        }
+
+        match store
+            .data()
+            .debug_state
+            .next_after(self.cursor, &self.filter)
+        {
+            Some((seq, event)) => {
+                self.cursor = seq;
+                destination.set_buffer(Some(convert_program_event(event)));
+                Poll::Ready(Ok(StreamResult::Completed))
+            }
+            None => Poll::Pending,
+        }
+    }
+}
+
 fn snapshot_sample(store: &StoreData) -> bindings::helios::system::stats::Sample {
     convert_sample(store.debug_state.snapshot(store.cpu.now().ticks()))
+}
+
+fn snapshot_program_sample(
+    store: &StoreData,
+) -> crate::program_bindings::bindings::helios::system::stats::Sample {
+    convert_program_sample(store.debug_state.snapshot(store.cpu.now().ticks()))
 }
 
 fn convert_sample(sample: StatsSample) -> bindings::helios::system::stats::Sample {
@@ -912,6 +1371,37 @@ fn convert_sample(sample: StatsSample) -> bindings::helios::system::stats::Sampl
             total_bytes,
             available_bytes,
             pressure: convert_memory_pressure(total_bytes, available_bytes),
+        },
+    }
+}
+
+fn convert_program_sample(
+    sample: StatsSample,
+) -> crate::program_bindings::bindings::helios::system::stats::Sample {
+    let heap = heap_stats();
+    let total_bytes =
+        u64::try_from(heap.total_bytes).expect("kernel heap total bytes do not fit into u64");
+    let available_bytes = u64::try_from(heap.available_bytes())
+        .expect("kernel heap available bytes do not fit into u64");
+    crate::program_bindings::bindings::helios::system::stats::Sample {
+        timestamp: sample.timestamp,
+        uptime: sample.uptime,
+        processors: crate::program_bindings::bindings::helios::system::stats::Processors {
+            configured: sample.configured_processors,
+            online: sample.online_processors,
+            utilization: (0..sample.configured_processors)
+                .map(
+                    |id| crate::program_bindings::bindings::helios::system::stats::Processor {
+                        id,
+                        busy: 0,
+                    },
+                )
+                .collect(),
+        },
+        memory: crate::program_bindings::bindings::helios::system::stats::Memory {
+            total_bytes,
+            available_bytes,
+            pressure: convert_program_memory_pressure(total_bytes, available_bytes),
         },
     }
 }
@@ -948,9 +1438,41 @@ fn convert_memory_pressure(
     }
 }
 
+fn convert_program_memory_pressure(
+    total_bytes: u64,
+    available_bytes: u64,
+) -> crate::program_bindings::bindings::helios::system::stats::MemoryPressure {
+    if total_bytes == 0 {
+        return crate::program_bindings::bindings::helios::system::stats::MemoryPressure::Nominal;
+    }
+
+    let used_permille =
+        ((total_bytes.saturating_sub(available_bytes.min(total_bytes))) * 1_000) / total_bytes;
+
+    match used_permille {
+        0..=699 => {
+            crate::program_bindings::bindings::helios::system::stats::MemoryPressure::Nominal
+        }
+        700..=849 => {
+            crate::program_bindings::bindings::helios::system::stats::MemoryPressure::Elevated
+        }
+        850..=949 => crate::program_bindings::bindings::helios::system::stats::MemoryPressure::High,
+        _ => crate::program_bindings::bindings::helios::system::stats::MemoryPressure::Critical,
+    }
+}
+
 fn convert_filter(filter: bindings::helios::system::tracing::Filter) -> TraceFilter {
     TraceFilter {
         min_level: filter.min_level.map(convert_level_to_local),
+        target_prefixes: filter.target_prefixes,
+    }
+}
+
+fn convert_program_filter(
+    filter: crate::program_bindings::bindings::helios::system::tracing::Filter,
+) -> TraceFilter {
+    TraceFilter {
+        min_level: filter.min_level.map(convert_program_level_to_local),
         target_prefixes: filter.target_prefixes,
     }
 }
@@ -964,10 +1486,34 @@ fn convert_event(event: TraceEvent) -> bindings::helios::system::tracing::Event 
     }
 }
 
+fn convert_program_event(
+    event: TraceEvent,
+) -> crate::program_bindings::bindings::helios::system::tracing::Event {
+    crate::program_bindings::bindings::helios::system::tracing::Event {
+        timestamp: event.timestamp,
+        level: convert_program_level_from_local(event.level),
+        target: event.target,
+        fields: event
+            .fields
+            .into_iter()
+            .map(convert_program_field)
+            .collect(),
+    }
+}
+
 fn convert_field(field: TraceField) -> bindings::helios::system::tracing::Field {
     bindings::helios::system::tracing::Field {
         key: field.key,
         value: convert_value(field.value),
+    }
+}
+
+fn convert_program_field(
+    field: TraceField,
+) -> crate::program_bindings::bindings::helios::system::tracing::Field {
+    crate::program_bindings::bindings::helios::system::tracing::Field {
+        key: field.key,
+        value: convert_program_value(field.value),
     }
 }
 
@@ -981,6 +1527,31 @@ fn convert_value(value: TraceValue) -> bindings::helios::system::tracing::Value 
         TraceValue::Float64(value) => bindings::helios::system::tracing::Value::Float64(value),
         TraceValue::Text(value) => bindings::helios::system::tracing::Value::Text(value),
         TraceValue::Blob(value) => bindings::helios::system::tracing::Value::Blob(value),
+    }
+}
+
+fn convert_program_value(
+    value: TraceValue,
+) -> crate::program_bindings::bindings::helios::system::tracing::Value {
+    match value {
+        TraceValue::Boolean(value) => {
+            crate::program_bindings::bindings::helios::system::tracing::Value::Boolean(value)
+        }
+        TraceValue::Signed64(value) => {
+            crate::program_bindings::bindings::helios::system::tracing::Value::Signed64(value)
+        }
+        TraceValue::Unsigned64(value) => {
+            crate::program_bindings::bindings::helios::system::tracing::Value::Unsigned64(value)
+        }
+        TraceValue::Float64(value) => {
+            crate::program_bindings::bindings::helios::system::tracing::Value::Float64(value)
+        }
+        TraceValue::Text(value) => {
+            crate::program_bindings::bindings::helios::system::tracing::Value::Text(value)
+        }
+        TraceValue::Blob(value) => {
+            crate::program_bindings::bindings::helios::system::tracing::Value::Blob(value)
+        }
     }
 }
 
@@ -1001,6 +1572,42 @@ fn convert_level_to_local(level: bindings::helios::system::tracing::Level) -> Tr
         bindings::helios::system::tracing::Level::Info => TraceLevel::Info,
         bindings::helios::system::tracing::Level::Debug => TraceLevel::Debug,
         bindings::helios::system::tracing::Level::Trace => TraceLevel::Trace,
+    }
+}
+
+fn convert_program_level_from_local(
+    level: TraceLevel,
+) -> crate::program_bindings::bindings::helios::system::tracing::Level {
+    match level {
+        TraceLevel::Error => {
+            crate::program_bindings::bindings::helios::system::tracing::Level::Error
+        }
+        TraceLevel::Warn => crate::program_bindings::bindings::helios::system::tracing::Level::Warn,
+        TraceLevel::Info => crate::program_bindings::bindings::helios::system::tracing::Level::Info,
+        TraceLevel::Debug => {
+            crate::program_bindings::bindings::helios::system::tracing::Level::Debug
+        }
+        TraceLevel::Trace => {
+            crate::program_bindings::bindings::helios::system::tracing::Level::Trace
+        }
+    }
+}
+
+fn convert_program_level_to_local(
+    level: crate::program_bindings::bindings::helios::system::tracing::Level,
+) -> TraceLevel {
+    match level {
+        crate::program_bindings::bindings::helios::system::tracing::Level::Error => {
+            TraceLevel::Error
+        }
+        crate::program_bindings::bindings::helios::system::tracing::Level::Warn => TraceLevel::Warn,
+        crate::program_bindings::bindings::helios::system::tracing::Level::Info => TraceLevel::Info,
+        crate::program_bindings::bindings::helios::system::tracing::Level::Debug => {
+            TraceLevel::Debug
+        }
+        crate::program_bindings::bindings::helios::system::tracing::Level::Trace => {
+            TraceLevel::Trace
+        }
     }
 }
 
@@ -1054,7 +1661,7 @@ fn log_wasmtime_error_chain(prefix: &str, error: &wasmtime::Error) {
     tracing::error!("{prefix}: {error:?}");
 }
 
-fn block_on<F: Future>(future: F) -> F::Output {
+pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
     let waker = Waker::noop();
     let mut context = Context::from_waker(waker);
     let mut future = Pin::from(Box::new(future));

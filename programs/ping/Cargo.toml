@@ -1,0 +1,13 @@
+[package]
+name = "helios-ping"
+version = "0.1.0"
+edition = "2024"
+autobins = false
+
+[dependencies]
+helios-api = { path = "../../api", default-features = false, features = ["net"] }
+
+[lib]
+name = "helios_ping"
+path = "src/main.rs"
+crate-type = ["cdylib"]

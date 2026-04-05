@@ -65,7 +65,11 @@ impl<T: VirtioTransport> VirtioConsoleDevice<T> {
             return Err(IoError::Unsupported);
         }
 
-        let receive = ReceiveState::new(VirtQueue::new(&transport, RECEIVE_QUEUE_INDEX, receive_size)?);
+        let receive = ReceiveState::new(VirtQueue::new(
+            &transport,
+            RECEIVE_QUEUE_INDEX,
+            receive_size,
+        )?);
         let transmit = VirtQueue::new(&transport, TRANSMIT_QUEUE_INDEX, transmit_size)?;
         transport.set_status(
             DeviceStatus::ACKNOWLEDGE
@@ -129,14 +133,16 @@ impl<T: VirtioTransport> ReceiveState<T> {
             if self.offset == self.available {
                 self.available = 0;
                 self.offset = 0;
-                self.queue_buffer(transport)
-                    .unwrap_or_else(|error| panic!("failed to re-arm virtio console receive queue: {error:?}"));
+                self.queue_buffer(transport).unwrap_or_else(|error| {
+                    panic!("failed to re-arm virtio console receive queue: {error:?}")
+                });
             }
             return Some(byte);
         }
 
-        self.queue_buffer(transport)
-            .unwrap_or_else(|error| panic!("failed to arm virtio console receive queue: {error:?}"));
+        self.queue_buffer(transport).unwrap_or_else(|error| {
+            panic!("failed to arm virtio console receive queue: {error:?}")
+        });
 
         let Some((token, used_len)) = self.queue.pop_used_with_len() else {
             return None;
@@ -157,8 +163,9 @@ impl<T: VirtioTransport> ReceiveState<T> {
         self.offset = 0;
 
         if self.available == 0 {
-            self.queue_buffer(transport)
-                .unwrap_or_else(|error| panic!("failed to requeue empty virtio console receive buffer: {error:?}"));
+            self.queue_buffer(transport).unwrap_or_else(|error| {
+                panic!("failed to requeue empty virtio console receive buffer: {error:?}")
+            });
             return None;
         }
 
@@ -167,8 +174,9 @@ impl<T: VirtioTransport> ReceiveState<T> {
         if self.offset == self.available {
             self.available = 0;
             self.offset = 0;
-            self.queue_buffer(transport)
-                .unwrap_or_else(|error| panic!("failed to requeue single-byte virtio console receive buffer: {error:?}"));
+            self.queue_buffer(transport).unwrap_or_else(|error| {
+                panic!("failed to requeue single-byte virtio console receive buffer: {error:?}")
+            });
         }
         Some(byte)
     }

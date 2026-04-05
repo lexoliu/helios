@@ -130,6 +130,11 @@ fn render_tracing_event(event: &tracing::Event) -> Result<String> {
         event.target
     )?;
     for field in &event.fields {
+        if field.key == "message" {
+            write!(&mut text, " ")?;
+            write_value(&mut text, &field.value)?;
+            continue;
+        }
         write!(&mut text, " {}=", field.key)?;
         write_value(&mut text, &field.value)?;
     }

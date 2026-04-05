@@ -14,6 +14,8 @@ use atomic_waker::AtomicWaker;
 use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 use thiserror::Error;
 
+use crate::sync::Notify;
+
 const PRIORITY_LEVELS: usize = 256;
 const COMPLETION_PENDING: u8 = 0;
 const COMPLETION_READY: u8 = 1;
@@ -69,6 +71,7 @@ pub struct ComputePool {
     config: ComputePoolConfig,
     queued_bytes: Arc<AtomicUsize>,
     queues: Arc<[ConcurrentQueue<ComputeJob>; PRIORITY_LEVELS]>,
+    ready: Arc<Notify>,
 }
 
 struct ComputeJob {
@@ -77,17 +80,9 @@ struct ComputeJob {
 }
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-pub(crate) enum ConfigError {
+pub enum ConfigError {
     #[error("compute pool configuration is invalid")]
     InvalidConfig,
-}
-
-pub(crate) struct ComputePoolSnapshot {
-    pub(crate) queued_jobs: usize,
-    pub(crate) queued_bytes: usize,
-    pub(crate) reserved_stack_bytes: usize,
-    pub(crate) total_bytes: usize,
-    pub(crate) max_memory_bytes: usize,
 }
 
 struct Completion<T> {
@@ -104,7 +99,19 @@ unsafe impl<T: Send> Send for CompletionState<T> {}
 unsafe impl<T: Send> Sync for CompletionState<T> {}
 
 impl ComputePool {
-    pub(crate) fn new(config: ComputePoolConfig) -> Result<Self, ConfigError> {
+    pub fn new(
+        worker_count: usize,
+        worker_stack_size: usize,
+        max_memory_bytes: usize,
+    ) -> Result<Self, ConfigError> {
+        Self::new_configured(ComputePoolConfig {
+            worker_count,
+            worker_stack_size,
+            max_memory_bytes,
+        })
+    }
+
+    pub(crate) fn new_configured(config: ComputePoolConfig) -> Result<Self, ConfigError> {
         let reserved_stack_bytes = config.reserved_stack_bytes();
         if config.worker_count == 0 || config.worker_stack_size == 0 {
             return Err(ConfigError::InvalidConfig);
@@ -117,6 +124,7 @@ impl ComputePool {
             config,
             queued_bytes: Arc::new(AtomicUsize::new(0)),
             queues: Arc::new(core::array::from_fn(|_| ConcurrentQueue::unbounded())),
+            ready: Arc::new(Notify::new()),
         })
     }
 
@@ -130,25 +138,7 @@ impl ComputePool {
         self.spawn_internal(priority, job).await
     }
 
-    pub(crate) fn snapshot(&self) -> ComputePoolSnapshot {
-        let queued_jobs = self.queues.iter().map(ConcurrentQueue::len).sum();
-        let queued_bytes = self.queued_bytes.load(AtomicOrdering::Acquire);
-        let reserved_stack_bytes = self.config.reserved_stack_bytes();
-
-        ComputePoolSnapshot {
-            queued_jobs,
-            queued_bytes,
-            reserved_stack_bytes,
-            total_bytes: reserved_stack_bytes + queued_bytes,
-            max_memory_bytes: self.config.max_memory_bytes,
-        }
-    }
-
-    pub(crate) fn config(&self) -> ComputePoolConfig {
-        self.config
-    }
-
-    pub(crate) fn run_next(&self) -> bool {
+    pub fn run_next(&self) -> bool {
         let Some(job) = self.dequeue() else {
             return false;
         };
@@ -157,14 +147,12 @@ impl ComputePool {
         true
     }
 
-    pub(crate) fn run_until_stalled(&self) -> usize {
-        let mut completed = 0;
+    pub async fn wait_for_work(&self) {
+        self.ready.notified().await;
+    }
 
-        while self.run_next() {
-            completed += 1;
-        }
-
-        completed
+    pub(crate) fn ready_notify(&self) -> Arc<Notify> {
+        self.ready.clone()
     }
 
     fn spawn_internal<F, T>(&self, priority: ComputePriority, job: F) -> Completion<T>
@@ -199,7 +187,10 @@ impl ComputePool {
         };
 
         match self.queues[priority.lane()].push(job) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.ready.notify_one();
+                Ok(())
+            }
             Err(PushError::Full(_)) => unreachable!("unbounded compute queue reported full"),
             Err(PushError::Closed(job)) => {
                 self.release_bytes(job.queued_bytes);
@@ -345,16 +336,11 @@ mod tests {
 
     use futures_lite::future::block_on;
 
-    use super::{ComputePool, ComputePoolConfig, ComputePriority, SpawnError};
+    use super::{ComputePool, ComputePriority, SpawnError};
 
     #[test]
     fn preserves_priority_and_fifo_order() {
-        let pool = ComputePool::new(ComputePoolConfig {
-            worker_count: 1,
-            worker_stack_size: 4096,
-            max_memory_bytes: 4096 + 4096,
-        })
-        .expect("pool config should be valid");
+        let pool = ComputePool::new(1, 4096, 4096 + 4096).expect("pool config should be valid");
         let seen = Arc::new(Mutex::new(Vec::new()));
 
         let first = {
@@ -400,12 +386,8 @@ mod tests {
 
         let first_job = large_job(Arc::new(AtomicUsize::new(0)));
         let queued_bytes = core::mem::size_of_val(&first_job);
-        let pool = ComputePool::new(ComputePoolConfig {
-            worker_count: 1,
-            worker_stack_size: 128,
-            max_memory_bytes: 128 + queued_bytes,
-        })
-        .expect("pool config should be valid");
+        let pool =
+            ComputePool::new(1, 128, 128 + queued_bytes).expect("pool config should be valid");
         let count = Arc::new(AtomicUsize::new(0));
 
         let first = pool.spawn_internal(ComputePriority::NORMAL, large_job(count.clone()));
@@ -415,5 +397,23 @@ mod tests {
 
         assert_eq!(block_on(first), Ok(1));
         assert_eq!(block_on(second), Err(SpawnError::MemoryLimitExceeded));
+    }
+
+    #[test]
+    fn wait_for_work_is_woken_by_future_enqueue() {
+        let pool = ComputePool::new(1, 128, 4096).expect("pool config should be valid");
+
+        let waiter = {
+            let pool = pool.clone();
+            std::thread::spawn(move || block_on(pool.wait_for_work()))
+        };
+
+        let job = pool.spawn_internal(ComputePriority::NORMAL, || 7usize);
+
+        waiter
+            .join()
+            .unwrap_or_else(|_| panic!("compute wait thread panicked unexpectedly"));
+        pool.run_next();
+        assert_eq!(block_on(job), Ok(7));
     }
 }

@@ -2,6 +2,8 @@ package helios:kernel@0.1.0;
 
 world init {
   include wasi:cli/command@0.3.0-rc-2026-03-15;
+  import helios:system/programs@0.1.0;
+  import helios:system/net@0.1.0;
   import helios:system/stats@0.1.0;
   import helios:system/tracing@0.1.0;
   import helios:system/sync@0.1.0;
@@ -10,6 +12,8 @@ world init {
 
 world debugger {
   include wasi:cli/command@0.3.0-rc-2026-03-15;
+  import helios:system/programs@0.1.0;
+  import helios:system/net@0.1.0;
   import helios:system/stats@0.1.0;
   import helios:system/tracing@0.1.0;
   import helios:system/sync@0.1.0;
@@ -18,6 +22,8 @@ world debugger {
 }
 
 world remote-system {
+  export helios:system/programs@0.1.0;
+  export helios:system/net@0.1.0;
   export helios:system/stats@0.1.0;
   export helios:system/tracing@0.1.0;
   export helios:system/sync@0.1.0;

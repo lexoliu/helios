@@ -269,11 +269,11 @@ mod tests {
 
         instance.transition(InstanceExecutionTransition::Resume, 220);
         let second = registry.snapshot(260);
-        assert_eq!(second[0].cpu_busy, 1_000);
+        assert_eq!(second[0].cpu_busy, 666);
 
         instance.transition(InstanceExecutionTransition::Pause, 280);
         let third = registry.snapshot(320);
-        assert_eq!(third[0].cpu_busy, 500);
+        assert_eq!(third[0].cpu_busy, 333);
     }
 
     #[test]

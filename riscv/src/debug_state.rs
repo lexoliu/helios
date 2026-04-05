@@ -7,7 +7,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use helios_kernel::InstanceRegistry;
+use helios_kernel::{InstanceRegistry, Notify};
 use spin::Mutex;
 
 const HISTORY_CAPACITY: usize = 512;
@@ -22,6 +22,9 @@ struct RuntimeStateInner {
     timebase_frequency: u64,
     processor_count: u32,
     instance_registry: InstanceRegistry,
+    program_service: Mutex<Option<crate::program_host::UserProgramService>>,
+    program_service_ready: Notify,
+    network_service: Mutex<Option<crate::net::NetworkService>>,
     tracing: Mutex<TraceHistory>,
 }
 
@@ -84,6 +87,9 @@ impl RuntimeState {
                 timebase_frequency,
                 processor_count: processor_count as u32,
                 instance_registry: InstanceRegistry::new(),
+                program_service: Mutex::new(None),
+                program_service_ready: Notify::new(),
+                network_service: Mutex::new(None),
                 tracing: Mutex::new(TraceHistory {
                     next_seq: 1,
                     events: VecDeque::with_capacity(HISTORY_CAPACITY),
@@ -153,6 +159,43 @@ impl RuntimeState {
 
     pub(crate) fn instance_registry(&self) -> InstanceRegistry {
         self.inner.instance_registry.clone()
+    }
+
+    pub(crate) fn install_program_service(&self, service: crate::program_host::UserProgramService) {
+        let mut slot = self.inner.program_service.lock();
+        assert!(
+            slot.is_none(),
+            "program service was installed more than once"
+        );
+        *slot = Some(service);
+        self.inner.program_service_ready.notify_all();
+    }
+
+    pub(crate) fn program_service(&self) -> Option<crate::program_host::UserProgramService> {
+        self.inner.program_service.lock().clone()
+    }
+
+    pub(crate) async fn wait_for_program_service(&self) -> crate::program_host::UserProgramService {
+        loop {
+            if let Some(service) = self.program_service() {
+                return service;
+            }
+
+            self.inner.program_service_ready.notified().await;
+        }
+    }
+
+    pub(crate) fn install_network_service(&self, service: crate::net::NetworkService) {
+        let mut slot = self.inner.network_service.lock();
+        assert!(
+            slot.is_none(),
+            "network service was installed more than once"
+        );
+        *slot = Some(service);
+    }
+
+    pub(crate) fn network_service(&self) -> Option<crate::net::NetworkService> {
+        self.inner.network_service.lock().clone()
     }
 }
 

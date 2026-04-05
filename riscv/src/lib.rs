@@ -10,6 +10,9 @@ mod debugger_bindings;
 mod debugger_program;
 mod debugger_wasi;
 mod debugger_wasi_p2;
+mod net;
+mod program_bindings;
+mod program_host;
 
 use core::arch::{asm, global_asm};
 use core::cell::Cell;
@@ -36,6 +39,8 @@ const UNINITIALIZED_BOOT_HART: usize = usize::MAX;
 const SSTATUS_SPP_BIT: usize = 1 << 8;
 
 static BOOT_HART_ID: AtomicUsize = AtomicUsize::new(UNINITIALIZED_BOOT_HART);
+static CRITICAL_SECTION_OWNER: AtomicUsize = AtomicUsize::new(0);
+static CRITICAL_SECTION_DEPTH: AtomicUsize = AtomicUsize::new(0);
 static DEBUG_STATE: Once<debug_state::RuntimeState> = Once::new();
 
 struct SupervisorCriticalSection;
@@ -43,15 +48,48 @@ struct SupervisorCriticalSection;
 critical_section::set_impl!(SupervisorCriticalSection);
 
 unsafe impl critical_section::Impl for SupervisorCriticalSection {
-    unsafe fn acquire() -> bool {
+    unsafe fn acquire() -> usize {
         let interrupts_were_enabled = riscv::register::sstatus::read().sie();
         riscv::interrupt::supervisor::disable();
         compiler_fence(Ordering::SeqCst);
-        interrupts_were_enabled
+
+        let owner = critical_section_owner();
+        loop {
+            match CRITICAL_SECTION_OWNER.compare_exchange(
+                0,
+                owner,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    CRITICAL_SECTION_DEPTH.store(1, Ordering::Relaxed);
+                    return critical_section_token(interrupts_were_enabled, true);
+                }
+                Err(current) if current == owner => {
+                    let depth = CRITICAL_SECTION_DEPTH.fetch_add(1, Ordering::Relaxed);
+                    assert!(depth != usize::MAX, "critical section nesting overflowed");
+                    return critical_section_token(interrupts_were_enabled, false);
+                }
+                Err(_) => core::hint::spin_loop(),
+            }
+        }
     }
 
-    unsafe fn release(interrupts_were_enabled: bool) {
+    unsafe fn release(restore_state: usize) {
         compiler_fence(Ordering::SeqCst);
+        let interrupts_were_enabled = critical_section_restore_interrupts(restore_state);
+        let outermost = critical_section_is_outermost(restore_state);
+        let previous_depth = CRITICAL_SECTION_DEPTH.fetch_sub(1, Ordering::Relaxed);
+        assert!(previous_depth != 0, "critical section depth underflowed");
+
+        if outermost {
+            assert!(
+                previous_depth == 1,
+                "outermost critical section release observed nested depth {previous_depth}"
+            );
+            CRITICAL_SECTION_OWNER.store(0, Ordering::Release);
+        }
+
         if interrupts_were_enabled {
             unsafe {
                 riscv::interrupt::supervisor::enable();
@@ -65,6 +103,7 @@ struct HartRuntime {
     timer: Timer<RiscvCpu>,
     wasmtime_tls: Cell<*mut u8>,
     debug_transport: Option<DebugTransport>,
+    external_interrupts: Option<net::ExternalInterrupts>,
 }
 
 impl HartRuntime {
@@ -173,21 +212,33 @@ impl Cpu for RiscvCpu {
     }
 
     fn start_processor(&self, hart: ProcessorId) {
-        let ret = sbi_rt::hart_start(
-            hart.id() as usize,
-            core::ptr::addr_of!(_secondary_start).addr(),
-            self.fdt_addr,
-        );
-        if ret.is_ok() {
-            return;
-        }
+        match hart_status(hart) {
+            sbi_spec::hsm::hart_state::STARTED => {
+                self.wake_processor(hart);
+            }
+            sbi_spec::hsm::hart_state::STOPPED => {
+                let ret = sbi_rt::hart_start(
+                    hart.id() as usize,
+                    core::ptr::addr_of!(_secondary_start).addr(),
+                    self.fdt_addr,
+                );
+                if ret.is_ok() {
+                    return;
+                }
 
-        panic!(
-            "failed to start hart {} via SBI HSM: error={} value={}",
-            hart.id(),
-            ret.error,
-            ret.value
-        );
+                panic!(
+                    "failed to start hart {} via SBI HSM: error={} value={}",
+                    hart.id(),
+                    ret.error,
+                    ret.value
+                );
+            }
+            state => panic!(
+                "hart {} reported unexpected SBI HSM state {}",
+                hart.id(),
+                state
+            ),
+        }
     }
 
     fn wake_processor(&self, hart: ProcessorId) {
@@ -258,10 +309,14 @@ fn trap_dispatch(tf: &mut TrapFrame) {
             riscv::register::sip::clear_ssoft();
         },
         Ok(Trap::Interrupt(Interrupt::SupervisorExternal)) => {
-            panic!(
-                "unhandled hardware interrupt: interrupt={:?}, tf={tf:#x?}",
-                Interrupt::SupervisorExternal
-            );
+            let runtime = current_hart_runtime();
+            let interrupts = runtime.external_interrupts.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "unhandled hardware interrupt without registered dispatch: interrupt={:?}, tf={tf:#x?}",
+                    Interrupt::SupervisorExternal
+                )
+            });
+            interrupts.handle();
         }
         Ok(Trap::Exception(exception)) => {
             handle_exception(exception, tf);
@@ -285,6 +340,9 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     let current_hart = ProcessorId::new(hart_id as u16);
     let bootstrap_processor = remember_bootstrap_hart(hart_id);
     if current_hart == bootstrap_processor {
+        release_early_boot_harts();
+    }
+    if current_hart == bootstrap_processor {
         helios_kernel::prime_bootstrap_allocator(memory_regions.iter().copied());
     }
 
@@ -300,7 +358,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         hart_count,
         timebase_frequency,
         fdt_addr,
-        debug_state,
+        debug_state.clone(),
     );
 
     let kernel = helios_kernel::init(helios_kernel::Platform::new(
@@ -308,11 +366,17 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         memory_regions.into_iter(),
         cpu.clone(),
     ));
+    let external_interrupts = if current_hart == bootstrap_processor {
+        net::install_network_service(&cpu, &kernel, &fdt, &debug_state)
+    } else {
+        None
+    };
     let hart_runtime = HartRuntime {
         hart_id: current_hart,
         timer: kernel.timer(),
         wasmtime_tls: Cell::new(core::ptr::null_mut()),
         debug_transport,
+        external_interrupts,
     };
     hart_runtime.install();
     unsafe {
@@ -320,6 +384,9 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     }
     if debugger_program::should_run_on(current_hart.id(), hart_count, bootstrap_processor.id()) {
         debugger_program::run_forever(cpu.clone());
+    }
+    if program_host::should_run_on(current_hart.id(), hart_count, bootstrap_processor.id()) {
+        program_host::run_forever(cpu.clone(), kernel);
     }
     kernel.run();
 }
@@ -336,10 +403,18 @@ fn shared_debug_state(timebase_frequency: u64, hart_count: usize) -> debug_state
         .clone()
 }
 
+pub(crate) fn global_debug_state() -> debug_state::RuntimeState {
+    DEBUG_STATE
+        .get()
+        .expect("global debug state was requested before bootstrap initialization")
+        .clone()
+}
+
 unsafe extern "C" {
     static __ebss: u8;
     static __stack_bottom_value: usize;
     static _secondary_start: u8;
+    fn _release_mp_harts();
 }
 
 fn allocator_window() -> Range<usize> {
@@ -409,6 +484,59 @@ fn remember_bootstrap_hart(current_hart: usize) -> ProcessorId {
         Ok(_) => ProcessorId::new(current_hart as u16),
         Err(bootstrap_hart) => ProcessorId::new(bootstrap_hart as u16),
     }
+}
+
+const CRITICAL_SECTION_RESTORE_INTERRUPTS_BIT: usize = 1;
+const CRITICAL_SECTION_OUTERMOST_BIT: usize = 1 << 1;
+
+const fn critical_section_token(interrupts_were_enabled: bool, outermost: bool) -> usize {
+    (interrupts_were_enabled as usize) | ((outermost as usize) << 1)
+}
+
+const fn critical_section_restore_interrupts(token: usize) -> bool {
+    token & CRITICAL_SECTION_RESTORE_INTERRUPTS_BIT != 0
+}
+
+const fn critical_section_is_outermost(token: usize) -> bool {
+    token & CRITICAL_SECTION_OUTERMOST_BIT != 0
+}
+
+fn critical_section_owner() -> usize {
+    let runtime = read_hart_runtime();
+    if runtime != 0 {
+        return runtime;
+    }
+
+    // Before hart-local runtime state is installed, the kernel has not yet
+    // started using any shared async synchronization primitives. Use a stable
+    // bootstrap sentinel in that narrow window so early critical sections still
+    // function without requiring M-mode-only hart-id registers.
+    1
+}
+
+fn release_early_boot_harts() {
+    // `_mp_hook` keeps every non-winning hart in a tiny early-boot spin loop
+    // until the winner has completed the runtime's RAM initialization. Once
+    // Rust code is safe to execute, publish the release gate so the other harts
+    // can proceed into `helios_kernel::init`, which will park them again until
+    // full kernel bootstrap is complete.
+    unsafe {
+        _release_mp_harts();
+    }
+}
+
+fn hart_status(hart: ProcessorId) -> usize {
+    let ret = sbi_rt::hart_get_status(hart.id() as usize);
+    if ret.is_ok() {
+        return ret.value;
+    }
+
+    panic!(
+        "failed to query hart {} via SBI HSM: error={} value={}",
+        hart.id(),
+        ret.error,
+        ret.value
+    );
 }
 
 fn current_hart_runtime() -> &'static HartRuntime {

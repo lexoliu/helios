@@ -181,6 +181,8 @@ fi
   -m "$memory" \
   -smp "$smp" \
   -bios "$bios" \
+  -netdev user,id=net0 \
+  -device virtio-net-device,netdev=net0 \
   -kernel "$kernel_image" \
   -serial "unix:$socket_path,server=on,wait=on" \
   >"$qemu_log" 2>&1 &

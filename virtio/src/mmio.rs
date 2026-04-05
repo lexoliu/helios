@@ -6,10 +6,12 @@ use helios_hal::io::IoResult;
 use crate::block::{VirtioBlockDevice, VirtioBlockResource};
 use crate::bus::{IdentityDmaPool, MmioBus};
 use crate::console::VirtioConsoleDevice;
+use crate::net::VirtioNetDevice;
 use crate::transport::VirtioMmioTransport;
 
 pub type VirtioMmioBlockDevice = VirtioBlockResource<VirtioMmioTransport<MmioBus>>;
 pub type VirtioMmioConsoleDevice = VirtioConsoleDevice<VirtioMmioTransport<MmioBus>>;
+pub type VirtioMmioNetDevice = VirtioNetDevice<VirtioMmioTransport<MmioBus>>;
 
 /// Builds a VirtIO block resource from a permanently mapped MMIO header.
 ///
@@ -35,4 +37,14 @@ pub unsafe fn console_from_mmio(
     let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     VirtioConsoleDevice::new(transport)
+}
+
+/// Builds a VirtIO network device from a permanently mapped MMIO header.
+pub unsafe fn net_from_mmio(
+    header: NonNull<u8>,
+    mmio_size: usize,
+) -> IoResult<VirtioMmioNetDevice> {
+    let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
+    let transport = VirtioMmioTransport::new(bus)?;
+    VirtioNetDevice::new(transport)
 }
