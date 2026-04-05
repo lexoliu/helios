@@ -88,7 +88,7 @@ where
 fn supports_request(instance: &str, func: &str) -> bool {
     matches!(
         (instance, func),
-        ("helios:system/programs@0.1.0", "launch")
+        ("helios:system/programs@0.1.0", "exec")
             | ("helios:system/stats@0.1.0", "snapshot")
             | ("helios:system/instances@0.1.0", "snapshot")
             | ("helios:system/tracing@0.1.0", "recent")
@@ -97,19 +97,19 @@ fn supports_request(instance: &str, func: &str) -> bool {
 
 async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>> {
     match (instance, func) {
-        ("helios:system/programs@0.1.0", "launch") => {
-            let request = postcard::from_bytes::<programs::LaunchRequest>(payload)
-                .context("failed to decode programs.launch request payload")?;
-            let response = host_programs::launch(&host_programs::LaunchRequest {
+        ("helios:system/programs@0.1.0", "exec") => {
+            let request = postcard::from_bytes::<programs::ExecRequest>(payload)
+                .context("failed to decode programs.exec request payload")?;
+            let response = host_programs::exec(&host_programs::ExecRequest {
                 name: request.name,
                 args: request.args,
                 wasm: request.wasm,
             });
-            let response = response.map_err(|error| programs::LaunchError {
+            let response = response.map_err(|error| programs::ExecError {
                 kind: convert_launch_error_kind(error.kind),
                 detail: error.detail,
             });
-            postcard::to_allocvec(&response).context("failed to encode programs.launch response")
+            postcard::to_allocvec(&response).context("failed to encode programs.exec response")
         }
         ("helios:system/stats@0.1.0", "snapshot") => {
             if !payload.is_empty() {
@@ -142,16 +142,16 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>>
     }
 }
 
-fn convert_launch_error_kind(kind: host_programs::LaunchErrorKind) -> programs::LaunchErrorKind {
+fn convert_launch_error_kind(kind: host_programs::ExecErrorKind) -> programs::ExecErrorKind {
     match kind {
-        host_programs::LaunchErrorKind::InvalidBinary => programs::LaunchErrorKind::InvalidBinary,
-        host_programs::LaunchErrorKind::MissingEntry => programs::LaunchErrorKind::MissingEntry,
-        host_programs::LaunchErrorKind::UnsupportedImport => {
-            programs::LaunchErrorKind::UnsupportedImport
+        host_programs::ExecErrorKind::InvalidBinary => programs::ExecErrorKind::InvalidBinary,
+        host_programs::ExecErrorKind::MissingEntry => programs::ExecErrorKind::MissingEntry,
+        host_programs::ExecErrorKind::UnsupportedImport => {
+            programs::ExecErrorKind::UnsupportedImport
         }
-        host_programs::LaunchErrorKind::QueueSaturated => programs::LaunchErrorKind::QueueSaturated,
-        host_programs::LaunchErrorKind::Unavailable => programs::LaunchErrorKind::Unavailable,
-        host_programs::LaunchErrorKind::Internal => programs::LaunchErrorKind::Internal,
+        host_programs::ExecErrorKind::QueueSaturated => programs::ExecErrorKind::QueueSaturated,
+        host_programs::ExecErrorKind::Unavailable => programs::ExecErrorKind::Unavailable,
+        host_programs::ExecErrorKind::Internal => programs::ExecErrorKind::Internal,
     }
 }
 

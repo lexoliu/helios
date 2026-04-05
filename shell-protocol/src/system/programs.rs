@@ -6,22 +6,22 @@ use anyhow::{Context as _, Result};
 use futures_io::{AsyncRead, AsyncWrite};
 
 pub use super::bindings::helios::system::programs::{
-    InstanceId, LaunchError, LaunchErrorKind, LaunchRequest,
+    InstanceId, ExecError, ExecErrorKind, ExecRequest,
 };
 
 #[cfg(feature = "host")]
-pub async fn launch<R, W>(client: &Client<R, W>, request: &LaunchRequest) -> Result<InstanceId>
+pub async fn exec<R, W>(client: &Client<R, W>, request: &ExecRequest) -> Result<InstanceId>
 where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
     let bytes = postcard::to_allocvec(request)
-        .context("failed to encode remote programs.launch request")?;
+        .context("failed to encode remote programs.exec request")?;
     let bytes = client
-        .invoke_raw_streaming("helios:system/programs@0.1.0", "launch", bytes)
+        .invoke_raw_streaming("helios:system/programs@0.1.0", "exec", bytes)
         .await
-        .context("failed to invoke remote programs.launch")?;
-    let response = postcard::from_bytes::<Result<InstanceId, LaunchError>>(&bytes)
-        .context("failed to decode remote programs.launch response")?;
+        .context("failed to invoke remote programs.exec")?;
+    let response = postcard::from_bytes::<Result<InstanceId, ExecError>>(&bytes)
+        .context("failed to decode remote programs.exec response")?;
     response.map_err(|error| anyhow::anyhow!("{:?}: {}", error.kind, error.detail))
 }

@@ -8,8 +8,8 @@ use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 use helios_hal::cpu::Cpu;
 use helios_hal::resource::WasiRights;
 use helios_kernel::{
-    ComputePool, ComputePriority, InstanceId, InstanceRegistry, Notify, ProgramLaunchError,
-    ProgramLaunchErrorKind, RegisteredInstance, heap_stats,
+    ComputePool, ComputePriority, InstanceId, InstanceRegistry, Notify, ProgramExecError,
+    ProgramExecErrorKind, RegisteredInstance, heap_stats,
 };
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Engine, Store};
@@ -53,7 +53,7 @@ pub(crate) fn install_program_service(
     let worker_count = worker_hart_count(cpu.processor_count(), cpu.bootstrap_processor().id());
     if worker_count == 0 {
         tracing::warn!(
-            "program launching is unavailable: no worker harts remain after reserving the debugger hart"
+            "program exec is unavailable: no worker harts remain after reserving the debugger hart"
         );
         return None;
     }
@@ -118,13 +118,13 @@ pub(crate) fn run_forever(cpu: RiscvCpu, kernel: helios_kernel::Kernel<RiscvCpu>
 }
 
 impl UserProgramService {
-    pub(crate) async fn launch(
+    pub(crate) async fn exec(
         &self,
         name: impl Into<String>,
         args: Vec<String>,
         wasm: &[u8],
         _rights: WasiRights,
-    ) -> Result<InstanceId, ProgramLaunchError> {
+    ) -> Result<InstanceId, ProgramExecError> {
         let name = name.into();
         let component = self.compile_component(wasm).await?;
         let started_at = monotonic_nanos(self.inner.timebase_frequency);
@@ -145,8 +145,8 @@ impl UserProgramService {
                 Ok(id)
             }
             Err(PushError::Full(_)) => unreachable!("unbounded program queue reported full"),
-            Err(PushError::Closed(_)) => Err(ProgramLaunchError {
-                kind: ProgramLaunchErrorKind::Unavailable,
+            Err(PushError::Closed(_)) => Err(ProgramExecError {
+                kind: ProgramExecErrorKind::Unavailable,
                 detail: "program worker queue was closed unexpectedly".to_string(),
             }),
         }
@@ -203,7 +203,7 @@ impl UserProgramService {
         .await;
     }
 
-    async fn compile_component(&self, wasm: &[u8]) -> Result<Component, ProgramLaunchError> {
+    async fn compile_component(&self, wasm: &[u8]) -> Result<Component, ProgramExecError> {
         let engine = self.inner.engine.clone();
         let wasm = wasm.to_vec();
         self.inner
@@ -212,12 +212,12 @@ impl UserProgramService {
                 Component::from_binary(&engine, &wasm)
             })
             .await
-            .map_err(|error| ProgramLaunchError {
-                kind: ProgramLaunchErrorKind::QueueSaturated,
+            .map_err(|error| ProgramExecError {
+                kind: ProgramExecErrorKind::QueueSaturated,
                 detail: error.to_string(),
             })?
-            .map_err(|error| ProgramLaunchError {
-                kind: ProgramLaunchErrorKind::InvalidBinary,
+            .map_err(|error| ProgramExecError {
+                kind: ProgramExecErrorKind::InvalidBinary,
                 detail: error.to_string(),
             })
     }

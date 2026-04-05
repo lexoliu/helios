@@ -92,7 +92,7 @@ fn run_component_thread(
         boot_started_at,
         Some(HostedSerialIo::new()),
     )
-    .unwrap_or_else(|error| panic!("failed to launch embedded component: {error}"));
+    .unwrap_or_else(|error| panic!("failed to exec embedded component: {error}"));
 }
 
 fn run_component_thread_with_serial(
@@ -718,7 +718,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap_or_else(|error| {
-                panic!("failed to build tokio runtime for hosted debugger launch test: {error}")
+                panic!("failed to build tokio runtime for hosted debugger exec test: {error}")
             })
             .block_on(async {
                 let debugger = embedded_debugger()
@@ -749,7 +749,7 @@ mod tests {
                         Some(serial),
                     );
                     result_tx.send(result).unwrap_or_else(|error| {
-                        panic!("failed to send debugger launch-test result: {error}")
+                        panic!("failed to send debugger exec-test result: {error}")
                     });
                 });
 
@@ -764,41 +764,41 @@ mod tests {
                 match result_rx.try_recv() {
                     Ok(result) => {
                         component_thread.join().unwrap_or_else(|_| {
-                            panic!("hosted debugger launch-test thread panicked unexpectedly")
+                            panic!("hosted debugger exec-test thread panicked unexpectedly")
                         });
-                        panic!("debugger thread exited before launch test: {result:?}");
+                        panic!("debugger thread exited before exec test: {result:?}");
                     }
                     Err(mpsc::TryRecvError::Empty) => {}
                     Err(mpsc::TryRecvError::Disconnected) => {
                         component_thread.join().unwrap_or_else(|_| {
-                            panic!("hosted debugger launch-test thread panicked unexpectedly")
+                            panic!("hosted debugger exec-test thread panicked unexpectedly")
                         });
-                        panic!("debugger thread disconnected before launch test");
+                        panic!("debugger thread disconnected before exec test");
                     }
                 }
 
                 let instance_id = timeout(
                     Duration::from_secs(30),
-                    helios_shell_protocol::system::programs::launch(
+                    helios_shell_protocol::system::programs::exec(
                         &mut client,
-                        &helios_shell_protocol::system::programs::LaunchRequest {
+                        &helios_shell_protocol::system::programs::ExecRequest {
                             name: "spin.wasm".to_owned(),
                             wasm: spin_start_module(),
                         },
                     ),
                 )
                 .await
-                .unwrap_or_else(|_| panic!("timed out waiting for remote programs.launch"))
-                .unwrap_or_else(|error| panic!("remote programs.launch failed: {error:#}"));
+                .unwrap_or_else(|_| panic!("timed out waiting for remote programs.exec"))
+                .unwrap_or_else(|error| panic!("remote programs.exec failed: {error:#}"));
 
                 let instances = timeout(
                     Duration::from_secs(30),
                     helios_shell_protocol::system::instances::snapshot(&mut client),
                 )
                 .await
-                .unwrap_or_else(|_| panic!("timed out waiting for remote instances after launch"))
+                .unwrap_or_else(|_| panic!("timed out waiting for remote instances after exec"))
                 .unwrap_or_else(|error| {
-                    panic!("failed to fetch remote instances after launch: {error:#}")
+                    panic!("failed to fetch remote instances after exec: {error:#}")
                 });
 
                 assert!(

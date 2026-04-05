@@ -10,6 +10,7 @@ async-io = "2.6.0"
 async-net = "2.0.0"
 async-recursion = "1.1.1"
 async-signal = "0.2.13"
+async-trait = "0.1.89"
 clap = { version = "4.5.48", features = ["derive"] }
 crossterm = "0.29.0"
 futures-io = "0.3.31"
@@ -23,6 +24,7 @@ ratatui-code-editor = "0.0.3"
 rustyline = "14.0.0"
 rustix = { version = "1.1.4", features = ["termios", "std"] }
 serialport = "4.9.0"
+shell-core = { path = "../shell-core" }
 shell-words = "1.1.0"
 strsim = "0.11.1"
 wasmparser = "0.245.0"

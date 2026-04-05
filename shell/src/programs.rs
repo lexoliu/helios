@@ -1,6 +1,6 @@
 use anyhow::{bail, Context as _, Result};
 use helios_shell_protocol::debugger::filesystem;
-use helios_shell_protocol::system::programs::{self, LaunchRequest};
+use helios_shell_protocol::system::programs::{self, ExecRequest};
 use wasmparser::Parser;
 use wit_component::ComponentEncoder;
 
@@ -14,13 +14,13 @@ pub struct StartedProgram {
     pub name: String,
 }
 
-pub async fn run(client: &mut RpcClient, path: &str, args: &[String]) -> Result<StartedProgram> {
+pub async fn exec(client: &mut RpcClient, path: &str, args: &[String]) -> Result<StartedProgram> {
     let resolved = resolve_program(client, path).await?;
     let wasm = load_component(&resolved.path, &resolved.wasm)?;
     let name = infer_instance_name(&resolved.path)?;
-    let instance_id = programs::launch(
+    let instance_id = programs::exec(
         &*client,
-        &LaunchRequest {
+        &ExecRequest {
             name: name.clone(),
             args: args.to_vec(),
             wasm,

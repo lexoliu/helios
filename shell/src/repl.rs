@@ -31,7 +31,7 @@ use crate::help;
 use crate::programs;
 use crate::rpc::RpcPane;
 use crate::runtime;
-use crate::script::{self, Statement};
+use shell_core::{self, CommandStatus, ScriptHost, Statement};
 use crate::serial::RpcClient;
 use crate::stats_tui;
 use crate::system::{self, TracingConfig};
@@ -68,7 +68,7 @@ pub fn run(mut client: RpcClient) -> Result<()> {
                     runtime::CommandRun::Completed(result) => {
                         match result {
                             Ok(status) => {
-                                if status.should_exit {
+                                if status.should_exit() {
                                     return Ok(());
                                 }
                             }
@@ -97,7 +97,7 @@ fn read_program(editor: &SharedEditor) -> Result<Option<String>> {
             input.push('\n');
         }
         input.push_str(&line);
-        if !script::needs_more_input(&input)? {
+        if !shell_core::needs_more_input(&input)? {
             return Ok(Some(input));
         }
         prompt = CONTINUATION_PROMPT;
@@ -109,7 +109,7 @@ const CONTINUATION_PROMPT: &str = "....> ";
 const LIVE_STATS_PERIOD_MS: u64 = 1_000;
 const ROOT_CANDIDATES: &[&str] = &[
     "help", "clear", "exit", "pwd", "ls", "cat", "edit", "mkdir", "rm", "cp", "mv", "touch", "echo", "test",
-    "source", "stats", "run", "tracing", "rpc", "if", "else", "end", "--help",
+    "source", "stats", "exec", "tracing", "rpc", "if", "else", "end", "--help",
 ];
 const HELP_CANDIDATES: &[&str] = &["overview", "stats", "tracing", "rpc", "--help"];
 const STATS_CANDIDATES: &[&str] = &["--help"];
@@ -124,7 +124,7 @@ const RPC_INSTANCE_CANDIDATES: &[&str] = &[
     "helios:system/sync@0.1.0",
 ];
 const RPC_FUNC_CANDIDATES: &[&str] = &[
-    "launch",
+    "exec",
     "snapshot",
     "recent",
     "debug-port",
@@ -205,8 +205,8 @@ enum CliCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         words: Vec<String>,
     },
-    /// Launch a wasm guest program from the remote filesystem with the default minimal rights set.
-    Run {
+    /// Exec a wasm guest program from the remote filesystem with the default minimal rights set.
+    Exec {
         path: String,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -286,7 +286,7 @@ enum Command {
     Move { source: String, destination: String },
     Touch(String),
     Echo(filesystem::EchoTarget),
-    Run { path: String, args: Vec<String> },
+    Exec { path: String, args: Vec<String> },
     ShowStats,
     ShowTracing,
     TracingLimit(u32),
@@ -306,11 +306,6 @@ enum ParsedLine {
 enum ParsedCommandLine {
     Command(Command),
     Output(String),
-}
-
-struct CommandStatus {
-    should_exit: bool,
-    success: bool,
 }
 
 struct ShellHelper {
@@ -355,6 +350,24 @@ impl TerminalIo for InteractiveTerminal {
     }
 }
 
+struct ScriptRuntime<'a, T> {
+    shell: &'a mut Shell<T>,
+    client: &'a mut RpcClient,
+}
+
+#[async_trait::async_trait(?Send)]
+impl<T: TerminalIo> ScriptHost for ScriptRuntime<'_, T> {
+    async fn execute_line(&mut self, line: &str) -> Result<CommandStatus> {
+        match parse_command_line(line)? {
+            ParsedCommandLine::Command(command) => self.shell.execute_command(self.client, command).await,
+            ParsedCommandLine::Output(output) => {
+                self.shell.print_block(&output)?;
+                Ok(CommandStatus::SUCCESS)
+            }
+        }
+    }
+}
+
 impl<T: TerminalIo> Shell<T> {
     fn new(terminal: T) -> Self {
         Self {
@@ -389,60 +402,13 @@ impl<T: TerminalIo> Shell<T> {
         self.terminal.write_bytes(bytes)
     }
 
-    #[async_recursion::async_recursion(?Send)]
     async fn execute_program(
         &mut self,
         client: &mut RpcClient,
         program: &[Statement],
     ) -> Result<CommandStatus> {
-        let mut last = CommandStatus {
-            should_exit: false,
-            success: true,
-        };
-        for statement in program {
-            last = self.execute_statement(client, statement).await?;
-            if last.should_exit {
-                return Ok(last);
-            }
-        }
-        Ok(last)
-    }
-
-    #[async_recursion::async_recursion(?Send)]
-    async fn execute_statement(
-        &mut self,
-        client: &mut RpcClient,
-        statement: &Statement,
-    ) -> Result<CommandStatus> {
-        match statement {
-            Statement::Command(line) => match parse_command_line(line)? {
-                ParsedCommandLine::Command(command) => self.execute_command(client, command).await,
-                ParsedCommandLine::Output(output) => {
-                    self.print_block(&output)?;
-                    Ok(CommandStatus {
-                        should_exit: false,
-                        success: true,
-                    })
-                }
-            },
-            Statement::If {
-                condition,
-                then_branch,
-                else_branch,
-            } => {
-                let status = self
-                    .execute_statement(client, &Statement::Command(condition.clone()))
-                    .await?;
-                if status.should_exit {
-                    return Ok(status);
-                }
-                if status.success {
-                    self.execute_program(client, then_branch).await
-                } else {
-                    self.execute_program(client, else_branch).await
-                }
-            }
-        }
+        let mut host = ScriptRuntime { shell: self, client };
+        shell_core::execute_script(&mut host, program).await
     }
 
     async fn execute_command(
@@ -467,10 +433,7 @@ impl<T: TerminalIo> Shell<T> {
             Command::Edit(path) => edit_tui::run(client, &path).await?,
             Command::Test(expression) => {
                 let success = filesystem::test(client, &expression).await?;
-                return Ok(CommandStatus {
-                    should_exit: false,
-                    success,
-                });
+                return Ok(CommandStatus::new(if success { 0 } else { 1 }));
             }
             Command::Source(path) => {
                 let script = std::fs::read_to_string(&path)
@@ -498,8 +461,8 @@ impl<T: TerminalIo> Shell<T> {
                     append,
                 } => filesystem::write(client, &path, &bytes, append).await?,
             },
-            Command::Run { path, args } => {
-                let started = programs::run(client, &path, &args).await?;
+            Command::Exec { path, args } => {
+                let started = programs::exec(client, &path, &args).await?;
                 self.print_line(&format!(
                     "started instance {} {}",
                     started.instance_id, started.name
@@ -541,32 +504,20 @@ impl<T: TerminalIo> Shell<T> {
             Command::Help(_) | Command::Clear | Command::Exit => unreachable!(),
         }
 
-        Ok(CommandStatus {
-            should_exit: false,
-            success: true,
-        })
+        Ok(CommandStatus::SUCCESS)
     }
 
     fn execute_immediate_command(&mut self, command: &Command) -> Result<Option<CommandStatus>> {
         let status = match command {
             Command::Help(topic) => {
                 self.print_block(&render_help(*topic))?;
-                CommandStatus {
-                    should_exit: false,
-                    success: true,
-                }
+                CommandStatus::SUCCESS
             }
             Command::Clear => {
                 self.terminal.clear_screen()?;
-                CommandStatus {
-                    should_exit: false,
-                    success: true,
-                }
+                CommandStatus::SUCCESS
             }
-            Command::Exit => CommandStatus {
-                should_exit: true,
-                success: true,
-            },
+            Command::Exit => CommandStatus::exiting(0),
             _ => return Ok(None),
         };
         Ok(Some(status))
@@ -719,8 +670,8 @@ fn write_stdout(bytes: &[u8]) -> Result<()> {
 }
 
 fn parse_input(input: &str) -> ParsedLine {
-    match script::parse(input) {
-        Ok(script::ParseState::Complete(program)) => {
+    match shell_core::parse(input) {
+        Ok(shell_core::ParseState::Complete(program)) => {
             let mut commands = Vec::with_capacity(program.len());
             for statement in program {
                 match validate_statement(statement) {
@@ -730,7 +681,7 @@ fn parse_input(input: &str) -> ParsedLine {
             }
             ParsedLine::Program(commands)
         }
-        Ok(script::ParseState::Incomplete) => {
+        Ok(shell_core::ParseState::Incomplete) => {
             ParsedLine::Output("error: shell block is incomplete".to_owned())
         }
         Err(error) => ParsedLine::Output(format_parse_error(&error.to_string())),
@@ -940,7 +891,7 @@ impl CliCommand {
             Self::Mv { source, destination } => Command::Move { source, destination },
             Self::Touch { path } => Command::Touch(path),
             Self::Echo { words } => Command::Echo(filesystem::parse_echo(&words)?),
-            Self::Run { path, args } => Command::Run { path, args },
+            Self::Exec { path, args } => Command::Exec { path, args },
             Self::Stats => Command::ShowStats,
             Self::Tracing { action } => match action {
                 None => Command::ShowTracing,
@@ -1043,7 +994,7 @@ fn completion_display(tokens: &[&str], candidate: &str) -> String {
         (_, "test") => "evaluate a filesystem predicate",
         (_, "source") => "run a host-local shell script",
         (Some("help"), "stats") => "help for the stats view",
-        (_, "run") => "launch a guest program from the remote filesystem",
+        (_, "exec") => "exec a guest program from the remote filesystem",
         (Some("help"), "tracing") => "help for tracing controls",
         (Some("help"), "rpc") => "help for raw RPC calls",
         (_, "stats") => "open the live stats view",
@@ -1127,7 +1078,7 @@ fn highlight_command_token(command: &str) -> String {
 }
 
 fn highlight_argument_token(command: &str, token: &str) -> String {
-    if matches!(command, "run" | "source") {
+    if matches!(command, "exec" | "source") {
         let style = if Path::new(token).exists() {
             AnsiStyle::new().fg(Color::Cyan).underline()
         } else {
@@ -1155,7 +1106,7 @@ mod tests {
     use anyhow::Result;
 
     use crate::filesystem::EchoTarget;
-    use crate::script::Statement;
+    use shell_core::Statement;
 
     use super::{parse_input, Command, HelpTopic, ParsedLine};
 
@@ -1316,13 +1267,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_run_command() {
-        match single_command("run ./target/ping.wasm google.com 1500") {
-            Command::Run { path, args } => {
+    fn parses_exec_command() {
+        match single_command("exec ./target/ping.wasm google.com 1500") {
+            Command::Exec { path, args } => {
                 assert_eq!(path, "./target/ping.wasm");
                 assert_eq!(args, vec!["google.com", "1500"]);
             }
-            _ => panic!("run command must parse"),
+            _ => panic!("exec command must parse"),
         }
     }
 
@@ -1408,8 +1359,8 @@ mod tests {
             .expect("clear must execute successfully")
             .expect("clear must complete immediately");
 
-        assert!(!status.should_exit);
-        assert!(status.success);
+        assert!(!status.should_exit());
+        assert!(status.is_success());
         assert_eq!(shell.terminal.events, vec![TerminalEvent::Clear]);
     }
 

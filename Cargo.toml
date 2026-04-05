@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "api", "api-macro", "hal", "hosted", "kernel", "kernel-macro", "programs/curl", "programs/debugger", "programs/init", "programs/ping", "riscv", "shell", "shell-protocol", "virtio",
+    "api", "api-macro", "hal", "hosted", "kernel", "kernel-macro", "programs/curl", "programs/debugger", "programs/init", "programs/ping", "programs/sh", "riscv", "shell", "shell-core", "shell-protocol", "virtio",
 ]
 resolver = "2"
 

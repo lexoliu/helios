@@ -13,7 +13,7 @@ use helios_hal::cpu::Cpu;
 use helios_hal::resource::WasiRights;
 use helios_kernel::{
     EmbeddedDebugger, InstanceExecutionTransition, InstanceRegistry, OwnedRawMutexLease,
-    OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease, ProgramLaunchErrorKind, RawMutex, RawRwLock,
+    OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease, ProgramExecErrorKind, RawMutex, RawRwLock,
     RegisteredInstance, embedded_debugger, heap_stats,
 };
 use thiserror::Error;
@@ -114,7 +114,7 @@ pub fn run_forever(cpu: RiscvCpu) -> ! {
     emit_stage_marker("boot");
     tracing::info!("debugger hart: launching embedded debugger component");
     run_debugger(debugger, cpu.clone())
-        .unwrap_or_else(|error| panic!("failed to launch embedded debugger component:\n{error:#}"));
+        .unwrap_or_else(|error| panic!("failed to exec embedded debugger component:\n{error:#}"));
     emit_stage_marker("done");
     tracing::info!("debugger hart: embedded debugger component exited cleanly");
     cpu.shutdown()
@@ -486,13 +486,13 @@ fn add_stats_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
 
 fn add_programs_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
     let mut instance = linker.instance("helios:system/programs@0.1.0")?;
-    // `programs.launch` is intentionally a synchronous WIT call. The guest
-    // blocks on launch completion while the host internally awaits the
+    // `programs.exec` is intentionally a synchronous WIT call. The guest
+    // blocks on exec completion while the host internally awaits the
     // compile/queue path on Wasmtime's async fiber.
     instance.func_wrap_async(
-        "launch",
+        "exec",
         |caller: StoreContextMut<'_, StoreData>,
-         (request,): (bindings::helios::system::programs::LaunchRequest,)| {
+         (request,): (bindings::helios::system::programs::ExecRequest,)| {
             let service = caller.data().debug_state.program_service().or_else(|| {
                 crate::program_host::install_program_service(
                     &caller.data().cpu,
@@ -502,14 +502,14 @@ fn add_programs_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()
             Box::new(async move {
                 let Some(service) = service else {
                     return Ok::<_, wasmtime::Error>((Err(
-                        bindings::helios::system::programs::LaunchError {
-                            kind: bindings::helios::system::programs::LaunchErrorKind::Unavailable,
-                            detail: "program launching is unavailable on this machine".to_owned(),
+                        bindings::helios::system::programs::ExecError {
+                            kind: bindings::helios::system::programs::ExecErrorKind::Unavailable,
+                            detail: "program exec is unavailable on this machine".to_owned(),
                         },
                     ),));
                 };
                 let response = service
-                    .launch(
+                    .exec(
                         request.name,
                         request.args,
                         &request.wasm,
@@ -528,9 +528,9 @@ fn add_programs_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()
 fn add_programs_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
     let mut instance = linker.instance("helios:system/programs@0.1.0")?;
     instance.func_wrap_async(
-        "launch",
+        "exec",
         |caller: StoreContextMut<'_, StoreData>,
-         (request,): (crate::program_bindings::bindings::helios::system::programs::LaunchRequest,)| {
+         (request,): (crate::program_bindings::bindings::helios::system::programs::ExecRequest,)| {
             let service = caller.data().debug_state.program_service().or_else(|| {
                 crate::program_host::install_program_service(
                     &caller.data().cpu,
@@ -540,14 +540,14 @@ fn add_programs_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::R
             Box::new(async move {
                 let Some(service) = service else {
                     return Ok::<_, wasmtime::Error>((Err(
-                        crate::program_bindings::bindings::helios::system::programs::LaunchError {
-                            kind: crate::program_bindings::bindings::helios::system::programs::LaunchErrorKind::Unavailable,
-                            detail: "program launching is unavailable on this machine".to_owned(),
+                        crate::program_bindings::bindings::helios::system::programs::ExecError {
+                            kind: crate::program_bindings::bindings::helios::system::programs::ExecErrorKind::Unavailable,
+                            detail: "program exec is unavailable on this machine".to_owned(),
                         },
                     ),));
                 };
                 let response = service
-                    .launch(request.name, request.args, &request.wasm, WasiRights::empty())
+                    .exec(request.name, request.args, &request.wasm, WasiRights::empty())
                     .await
                     .map(|instance_id| instance_id.raw())
                     .map_err(convert_program_launch_error);
@@ -879,27 +879,27 @@ fn add_tracing_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::Re
 }
 
 fn convert_launch_error(
-    error: helios_kernel::ProgramLaunchError,
-) -> bindings::helios::system::programs::LaunchError {
-    bindings::helios::system::programs::LaunchError {
+    error: helios_kernel::ProgramExecError,
+) -> bindings::helios::system::programs::ExecError {
+    bindings::helios::system::programs::ExecError {
         kind: match error.kind {
-            ProgramLaunchErrorKind::InvalidBinary => {
-                bindings::helios::system::programs::LaunchErrorKind::InvalidBinary
+            ProgramExecErrorKind::InvalidBinary => {
+                bindings::helios::system::programs::ExecErrorKind::InvalidBinary
             }
-            ProgramLaunchErrorKind::MissingEntry => {
-                bindings::helios::system::programs::LaunchErrorKind::MissingEntry
+            ProgramExecErrorKind::MissingEntry => {
+                bindings::helios::system::programs::ExecErrorKind::MissingEntry
             }
-            ProgramLaunchErrorKind::UnsupportedImport => {
-                bindings::helios::system::programs::LaunchErrorKind::UnsupportedImport
+            ProgramExecErrorKind::UnsupportedImport => {
+                bindings::helios::system::programs::ExecErrorKind::UnsupportedImport
             }
-            ProgramLaunchErrorKind::QueueSaturated => {
-                bindings::helios::system::programs::LaunchErrorKind::QueueSaturated
+            ProgramExecErrorKind::QueueSaturated => {
+                bindings::helios::system::programs::ExecErrorKind::QueueSaturated
             }
-            ProgramLaunchErrorKind::Unavailable => {
-                bindings::helios::system::programs::LaunchErrorKind::Unavailable
+            ProgramExecErrorKind::Unavailable => {
+                bindings::helios::system::programs::ExecErrorKind::Unavailable
             }
-            ProgramLaunchErrorKind::Internal => {
-                bindings::helios::system::programs::LaunchErrorKind::Internal
+            ProgramExecErrorKind::Internal => {
+                bindings::helios::system::programs::ExecErrorKind::Internal
             }
         },
         detail: error.detail,
@@ -907,27 +907,27 @@ fn convert_launch_error(
 }
 
 fn convert_program_launch_error(
-    error: helios_kernel::ProgramLaunchError,
-) -> crate::program_bindings::bindings::helios::system::programs::LaunchError {
-    crate::program_bindings::bindings::helios::system::programs::LaunchError {
+    error: helios_kernel::ProgramExecError,
+) -> crate::program_bindings::bindings::helios::system::programs::ExecError {
+    crate::program_bindings::bindings::helios::system::programs::ExecError {
         kind: match error.kind {
-            ProgramLaunchErrorKind::InvalidBinary => {
-                crate::program_bindings::bindings::helios::system::programs::LaunchErrorKind::InvalidBinary
+            ProgramExecErrorKind::InvalidBinary => {
+                crate::program_bindings::bindings::helios::system::programs::ExecErrorKind::InvalidBinary
             }
-            ProgramLaunchErrorKind::MissingEntry => {
-                crate::program_bindings::bindings::helios::system::programs::LaunchErrorKind::MissingEntry
+            ProgramExecErrorKind::MissingEntry => {
+                crate::program_bindings::bindings::helios::system::programs::ExecErrorKind::MissingEntry
             }
-            ProgramLaunchErrorKind::UnsupportedImport => {
-                crate::program_bindings::bindings::helios::system::programs::LaunchErrorKind::UnsupportedImport
+            ProgramExecErrorKind::UnsupportedImport => {
+                crate::program_bindings::bindings::helios::system::programs::ExecErrorKind::UnsupportedImport
             }
-            ProgramLaunchErrorKind::QueueSaturated => {
-                crate::program_bindings::bindings::helios::system::programs::LaunchErrorKind::QueueSaturated
+            ProgramExecErrorKind::QueueSaturated => {
+                crate::program_bindings::bindings::helios::system::programs::ExecErrorKind::QueueSaturated
             }
-            ProgramLaunchErrorKind::Unavailable => {
-                crate::program_bindings::bindings::helios::system::programs::LaunchErrorKind::Unavailable
+            ProgramExecErrorKind::Unavailable => {
+                crate::program_bindings::bindings::helios::system::programs::ExecErrorKind::Unavailable
             }
-            ProgramLaunchErrorKind::Internal => {
-                crate::program_bindings::bindings::helios::system::programs::LaunchErrorKind::Internal
+            ProgramExecErrorKind::Internal => {
+                crate::program_bindings::bindings::helios::system::programs::ExecErrorKind::Internal
             }
         },
         detail: error.detail,
