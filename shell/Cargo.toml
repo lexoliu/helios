@@ -8,11 +8,13 @@ anyhow = "1.0.100"
 async-channel = "2.5.0"
 async-io = "2.6.0"
 async-net = "2.0.0"
+async-recursion = "1.1.1"
 async-signal = "0.2.13"
 clap = { version = "4.5.48", features = ["derive"] }
 crossterm = "0.29.0"
 futures-io = "0.3.31"
 futures-lite = "2.6.1"
+globset = "0.4.18"
 hex = "0.4.3"
 helios-shell-protocol.workspace = true
 nu-ansi-term = "0.50.3"

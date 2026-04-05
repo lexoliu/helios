@@ -2,6 +2,7 @@ use std::fmt::Write as _;
 use std::path::{Component, Path};
 
 use anyhow::{bail, Result};
+use globset::Glob;
 use helios_shell_protocol::debugger::filesystem::{self, DirectoryEntry, EntryKind};
 
 use crate::serial::RpcClient;
@@ -20,7 +21,11 @@ pub fn pwd() -> &'static str {
 }
 
 pub async fn list(client: &mut RpcClient, path: Option<&str>) -> Result<String> {
-    let path = normalize_path(path.unwrap_or("/"))?;
+    let path = path.unwrap_or("/");
+    if has_glob(path) {
+        return list_glob(client, path).await;
+    }
+    let path = normalize_path(path)?;
     let entries = filesystem::list(client, &path).await?;
     render_entries(&entries)
 }
@@ -48,6 +53,29 @@ pub async fn touch(client: &mut RpcClient, path: &str) -> Result<()> {
 pub async fn write(client: &mut RpcClient, path: &str, bytes: &[u8], append: bool) -> Result<()> {
     let path = normalize_path(path)?;
     filesystem::write(client, &path, bytes, append).await
+}
+
+pub async fn test(client: &mut RpcClient, expression: &[String]) -> Result<bool> {
+    match expression {
+        [flag, path] => {
+            let path = normalize_path(path)?;
+            let entries = match filesystem::list(client, &path).await {
+                Ok(entries) => entries,
+                Err(_) => return Ok(false),
+            };
+            let kind = entries
+                .first()
+                .map(|entry| entry.kind)
+                .ok_or_else(|| anyhow::anyhow!("path {path} does not exist"))?;
+            Ok(match flag.as_str() {
+                "-e" => true,
+                "-f" => matches!(kind, EntryKind::File),
+                "-d" => matches!(kind, EntryKind::Directory),
+                _ => bail!("unsupported test flag {flag:?}; expected -e, -f, or -d"),
+            })
+        }
+        _ => bail!("test expects exactly one flag and one path"),
+    }
 }
 
 pub fn parse_echo(words: &[String]) -> Result<EchoTarget> {
@@ -97,6 +125,89 @@ fn display_entry(entry: &DirectoryEntry) -> String {
     }
 }
 
+async fn list_glob(client: &mut RpcClient, pattern: &str) -> Result<String> {
+    let pattern = normalize_glob_pattern(pattern)?;
+    let matcher = Glob::new(&pattern)
+        .map_err(|error| anyhow::anyhow!("invalid glob pattern {pattern:?}: {error}"))?
+        .compile_matcher();
+    let mut paths = Vec::new();
+    collect_paths(client, "/", &mut paths).await?;
+    paths.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut output = String::new();
+    for (path, kind) in paths {
+        if matcher.is_match(path.trim_start_matches('/')) {
+            writeln!(&mut output, "{}", display_path(&path, kind))?;
+        }
+    }
+    Ok(output)
+}
+
+async fn collect_paths(
+    client: &mut RpcClient,
+    directory: &str,
+    output: &mut Vec<(String, EntryKind)>,
+) -> Result<()> {
+    let entries = filesystem::list(client, directory).await?;
+    for entry in entries {
+        let path = join_path(directory, &entry.name);
+        output.push((path.clone(), entry.kind));
+        if matches!(entry.kind, EntryKind::Directory) {
+            Box::pin(collect_paths(client, &path, output)).await?;
+        }
+    }
+    Ok(())
+}
+
+fn join_path(parent: &str, child: &str) -> String {
+    if parent == "/" {
+        format!("/{child}")
+    } else {
+        format!("{parent}/{child}")
+    }
+}
+
+fn display_path(path: &str, kind: EntryKind) -> String {
+    match kind {
+        EntryKind::Directory => format!("{path}/"),
+        EntryKind::File | EntryKind::Other => path.to_owned(),
+    }
+}
+
+fn has_glob(input: &str) -> bool {
+    input.contains('*') || input.contains('?') || input.contains('[')
+}
+
+fn normalize_glob_pattern(input: &str) -> Result<String> {
+    let path = Path::new(input);
+    let mut segments = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(segment) => segments.push(
+                segment
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("path {input:?} contains a non-utf8 segment"))?
+                    .to_owned(),
+            ),
+            Component::ParentDir => bail!("path {input:?} contains unsupported parent traversal"),
+            Component::Prefix(_) => bail!("path {input:?} uses an unsupported path prefix"),
+        }
+    }
+
+    let mut normalized = Vec::new();
+    for segment in segments {
+        if segment.starts_with("**") && segment.len() > 2 {
+            normalized.push("**".to_owned());
+            normalized.push(format!("*{}", &segment[2..]));
+        } else {
+            normalized.push(segment);
+        }
+    }
+
+    Ok(normalized.join("/"))
+}
+
 pub fn normalize_path(input: &str) -> Result<String> {
     let path = Path::new(input);
     let mut segments = Vec::new();
@@ -123,7 +234,7 @@ pub fn normalize_path(input: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_path, parse_echo, EchoTarget};
+    use super::{has_glob, normalize_glob_pattern, normalize_path, parse_echo, EchoTarget};
 
     #[test]
     fn normalizes_relative_paths_from_root() {
@@ -178,5 +289,21 @@ mod tests {
             }
             _ => panic!("echo append redirection must target a file"),
         }
+    }
+
+    #[test]
+    fn detects_globs() {
+        assert!(has_glob("**.jpg"));
+        assert!(has_glob("/tmp/*.txt"));
+        assert!(!has_glob("/tmp/file"));
+    }
+
+    #[test]
+    fn normalizes_recursive_glob_suffixes() {
+        assert_eq!(normalize_glob_pattern("**.jpg").unwrap(), "**/*.jpg");
+        assert_eq!(
+            normalize_glob_pattern("/tmp/**.log").unwrap(),
+            "tmp/**/*.log"
+        );
     }
 }

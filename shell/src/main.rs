@@ -5,6 +5,7 @@ mod ready;
 mod repl;
 mod rpc;
 mod runtime;
+mod script;
 mod serial;
 mod stats_tui;
 mod system;

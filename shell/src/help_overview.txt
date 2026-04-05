@@ -15,6 +15,12 @@ Interactive:
       List files in the remote debugger filesystem. Paths are resolved from `/`.
   cat <path>
       Print a remote file to the terminal.
+  edit <path>
+      Open a remote UTF-8 text file in the full-screen editor.
+  test <-e|-f|-d> <path>
+      Evaluate a remote filesystem predicate. Intended for `if ... end` scripts.
+  source <path>
+      Execute a host-local shell script against the current remote session.
   mkdir <path>
       Create a directory in the remote debugger filesystem.
   rm <path>
@@ -59,6 +65,11 @@ Examples:
   run ./target/wasm32-wasip2/debug/helios_ping.wasm google.com
   touch /tmp/marker
   rm /tmp/marker
+  if test -e /tmp/note.txt
+      cat /tmp/note.txt
+    else
+      echo missing
+    end
   stats
   tracing
   tracing level debug
@@ -68,7 +79,11 @@ Examples:
   rpc call
 
 Notes:
+  Fish-style blocks are supported with `if ... end` and optional `else` / `else if`.
+  `source <path>` runs a host-local script file using the same shell language.
+  `ls **.jpg` and similar recursive globs are expanded against the remote debugger filesystem.
   `stats` is the only built-in full-screen view.
   `tracing` stays line-oriented and streams until you interrupt it with `Ctrl+C`.
-  The shell itself stays line-oriented; only commands that benefit from live updates
-  switch into a temporary TUI.
+  Right arrow accepts history suggestions, and `Ctrl+F` mirrors fish-style hint acceptance.
+  The shell itself stays line-oriented; only commands that benefit from live updates switch into
+  a temporary TUI.
