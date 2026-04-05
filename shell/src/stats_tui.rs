@@ -1,43 +1,37 @@
-use std::io;
-use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result};
-use async_channel::Receiver;
-use crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use anyhow::Result;
+use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers};
 use futures_lite::future;
 use helios_shell_protocol::system::instances;
 use helios_shell_protocol::system::stats::{self, MemoryPressure};
-use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Bar, BarChart, BarGroup, Block, Borders, Cell, Gauge, Paragraph, Row, Table, Wrap,
 };
-use ratatui::Terminal;
 
 use crate::serial::RpcClient;
 use crate::system;
+use crate::tui;
 
 pub async fn run(client: &mut RpcClient, period_ms: u64) -> Result<()> {
-    let mut terminal = setup_terminal()?;
-    let guard = TerminalGuard;
-    let events = spawn_events();
+    let mut session = tui::Session::open(false, "stats view")?;
+    let events = tui::spawn_events();
     let mut app = App::new(period_ms);
 
     app.refresh(client).await;
 
     loop {
-        terminal.draw(|frame| draw(frame, &app))?;
-        match future::or(async { events.recv().await.ok() }, async {
-            async_io::Timer::after(Duration::from_millis(100)).await;
-            Some(UiEvent::Tick)
-        })
+        session.terminal().draw(|frame| draw(frame, &app))?;
+        match future::or(
+            async { events.recv().await.ok().and_then(UiEvent::from_crossterm) },
+            async {
+                async_io::Timer::after(Duration::from_millis(100)).await;
+                Some(UiEvent::Tick)
+            },
+        )
         .await
         {
             Some(UiEvent::Key(key)) => {
@@ -55,19 +49,7 @@ pub async fn run(client: &mut RpcClient, period_ms: u64) -> Result<()> {
         }
     }
 
-    restore_terminal(&mut terminal)?;
-    std::mem::forget(guard);
-    Ok(())
-}
-
-struct TerminalGuard;
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let mut stdout = io::stdout();
-        let _ = execute!(stdout, LeaveAlternateScreen);
-    }
+    session.close()
 }
 
 struct App {
@@ -82,6 +64,16 @@ enum UiEvent {
     Key(KeyEvent),
     Resize,
     Tick,
+}
+
+impl UiEvent {
+    fn from_crossterm(event: CrosstermEvent) -> Option<Self> {
+        match event {
+            CrosstermEvent::Key(key) => Some(Self::Key(key)),
+            CrosstermEvent::Resize(_, _) => Some(Self::Resize),
+            _ => None,
+        }
+    }
 }
 
 impl App {
@@ -126,43 +118,6 @@ impl App {
             }
         }
     }
-}
-
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
-    enable_raw_mode().context("failed to enable raw mode for stats view")?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).context("failed to enter stats screen")?;
-    Terminal::new(CrosstermBackend::new(stdout)).context("failed to create stats terminal")
-}
-
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    disable_raw_mode().context("failed to disable raw mode for stats view")?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)
-        .context("failed to leave stats screen")?;
-    terminal.show_cursor().context("failed to restore cursor")
-}
-
-fn spawn_events() -> Receiver<UiEvent> {
-    let (tx, rx) = async_channel::unbounded();
-    thread::spawn(move || loop {
-        if event::poll(Duration::from_millis(100)).unwrap_or(false) {
-            match event::read() {
-                Ok(CrosstermEvent::Key(key)) => {
-                    if tx.send_blocking(UiEvent::Key(key)).is_err() {
-                        break;
-                    }
-                }
-                Ok(CrosstermEvent::Resize(_, _)) => {
-                    if tx.send_blocking(UiEvent::Resize).is_err() {
-                        break;
-                    }
-                }
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
-    });
-    rx
 }
 
 fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {

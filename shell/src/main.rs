@@ -1,3 +1,4 @@
+mod edit_tui;
 mod filesystem;
 mod programs;
 mod ready;
@@ -7,6 +8,7 @@ mod runtime;
 mod serial;
 mod stats_tui;
 mod system;
+mod tui;
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
@@ -37,6 +39,8 @@ enum Command {
     Ls { path: Option<String> },
     /// Print remote file contents.
     Cat { path: String },
+    /// Edit a remote text file inside a full-screen terminal editor.
+    Edit { path: String },
     /// Create a directory in the remote debugger filesystem.
     Mkdir { path: String },
     /// Remove a file or an empty directory from the remote debugger filesystem.
@@ -108,6 +112,10 @@ fn main() -> Result<()> {
             let bytes = filesystem::cat(&mut client, &path).await?;
             std::io::stdout().write_all(&bytes)?;
             Ok(())
+        }),
+        Some(Command::Edit { path }) => run_interruptible(async move {
+            let mut client = client;
+            edit_tui::run(&mut client, &path).await
         }),
         Some(Command::Mkdir { path }) => run_interruptible(async move {
             let mut client = client;

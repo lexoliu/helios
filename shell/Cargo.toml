@@ -10,13 +10,14 @@ async-io = "2.6.0"
 async-net = "2.0.0"
 async-signal = "0.2.13"
 clap = { version = "4.5.48", features = ["derive"] }
-crossterm = "0.28.1"
+crossterm = "0.29.0"
 futures-io = "0.3.31"
 futures-lite = "2.6.1"
 hex = "0.4.3"
 helios-shell-protocol.workspace = true
 nu-ansi-term = "0.50.3"
-ratatui = "0.29.0"
+ratatui = "0.30.0"
+ratatui-code-editor = "0.0.3"
 rustyline = "14.0.0"
 rustix = { version = "1.1.4", features = ["termios", "std"] }
 serialport = "4.9.0"
