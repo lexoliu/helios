@@ -37,7 +37,7 @@ pub use program::{
     ProgramRuntimeDriver, ProgramRuntimeError, ProgramRuntimeInitError, ResourceTable,
     RunError as ProgramRunError, Task,
 };
-pub use program_service::{ProgramLaunchError, ProgramLaunchErrorKind, ProgramService};
+pub use program_service::{ProgramExecError, ProgramExecErrorKind, ProgramService};
 pub use sync::{
     Mutex, MutexGuard, Notified, Notify, OwnedRawMutexLease, OwnedRawRwLockReadLease,
     OwnedRawRwLockWriteLease, RawMutex, RawMutexLease, RawRwLock, RawRwLockReadLease,

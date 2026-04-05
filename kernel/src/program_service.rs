@@ -36,16 +36,16 @@ struct QueuedProgram {
 }
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-pub enum ProgramLaunchErrorKind {
+pub enum ProgramExecErrorKind {
     #[error("the wasm binary is invalid")]
     InvalidBinary,
     #[error("the wasm binary exports no supported entry point")]
     MissingEntry,
     #[error("the wasm binary imports unsupported host functions")]
     UnsupportedImport,
-    #[error("the launch queues are saturated")]
+    #[error("the exec queues are saturated")]
     QueueSaturated,
-    #[error("program launching is unavailable on this platform")]
+    #[error("program exec is unavailable on this platform")]
     Unavailable,
     #[error("the kernel rejected the program for an internal reason")]
     Internal,
@@ -53,8 +53,8 @@ pub enum ProgramLaunchErrorKind {
 
 #[derive(Debug, Error)]
 #[error("{kind}: {detail}")]
-pub struct ProgramLaunchError {
-    pub kind: ProgramLaunchErrorKind,
+pub struct ProgramExecError {
+    pub kind: ProgramExecErrorKind,
     pub detail: String,
 }
 
@@ -83,19 +83,19 @@ impl<CpuImpl: Cpu + Clone> ProgramService<CpuImpl> {
         self.inner.runtime.compile_worker_count()
     }
 
-    pub async fn launch(
+    pub async fn exec(
         &self,
         name: impl Into<String>,
         wasm: &[u8],
         rights: WasiRights,
-    ) -> Result<InstanceId, ProgramLaunchError> {
+    ) -> Result<InstanceId, ProgramExecError> {
         let name = name.into();
         let task = self
             .inner
             .runtime
             .compile(Blueprint::new_wasm(wasm, rights))
             .await
-            .map_err(ProgramLaunchError::from)?;
+            .map_err(ProgramExecError::from)?;
         let started_at = monotonic_nanos(&self.inner.clock_cpu);
         let instance = self.inner.instance_registry.register(name, started_at);
         let id = instance.id();
@@ -106,8 +106,8 @@ impl<CpuImpl: Cpu + Clone> ProgramService<CpuImpl> {
                 Ok(id)
             }
             Err(PushError::Full(_)) => unreachable!("unbounded program queue reported full"),
-            Err(PushError::Closed(_)) => Err(ProgramLaunchError {
-                kind: ProgramLaunchErrorKind::Unavailable,
+            Err(PushError::Closed(_)) => Err(ProgramExecError {
+                kind: ProgramExecErrorKind::Unavailable,
                 detail: "program worker queue was closed unexpectedly".to_string(),
             }),
         }
@@ -163,23 +163,23 @@ impl<CpuImpl: Cpu + Clone> ProgramService<CpuImpl> {
     }
 }
 
-impl From<CompileError> for ProgramLaunchError {
+impl From<CompileError> for ProgramExecError {
     fn from(error: CompileError) -> Self {
         match error {
             CompileError::QueueSaturated(error) => Self {
-                kind: ProgramLaunchErrorKind::QueueSaturated,
+                kind: ProgramExecErrorKind::QueueSaturated,
                 detail: error.to_string(),
             },
             CompileError::MissingEntry => Self {
-                kind: ProgramLaunchErrorKind::MissingEntry,
+                kind: ProgramExecErrorKind::MissingEntry,
                 detail: error.to_string(),
             },
             CompileError::UnsupportedImportModule { .. } => Self {
-                kind: ProgramLaunchErrorKind::UnsupportedImport,
+                kind: ProgramExecErrorKind::UnsupportedImport,
                 detail: error.to_string(),
             },
             CompileError::Wasmtime(error) => Self {
-                kind: ProgramLaunchErrorKind::InvalidBinary,
+                kind: ProgramExecErrorKind::InvalidBinary,
                 detail: error.to_string(),
             },
         }

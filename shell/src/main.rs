@@ -6,7 +6,6 @@ mod ready;
 mod repl;
 mod rpc;
 mod runtime;
-mod script;
 mod serial;
 mod stats_tui;
 mod system;
@@ -58,8 +57,8 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         words: Vec<String>,
     },
-    /// Launch a wasm guest program from the remote filesystem with the default minimal rights set.
-    Run {
+    /// Exec a wasm guest program from the remote filesystem with the default minimal rights set.
+    Exec {
         path: String,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -155,9 +154,9 @@ fn main() -> Result<()> {
             }
             Ok(())
         }),
-        Some(Command::Run { path, args }) => run_interruptible(async move {
+        Some(Command::Exec { path, args }) => run_interruptible(async move {
             let mut client = client;
-            let started = programs::run(&mut client, &path, &args).await?;
+            let started = programs::exec(&mut client, &path, &args).await?;
             writeln!(
                 std::io::stdout(),
                 "started instance {} {}",

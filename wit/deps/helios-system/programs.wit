@@ -4,7 +4,7 @@ interface programs {
   /// Stable identifier for a live wasm instance.
   type instance-id = u64;
 
-  record launch-request {
+  record exec-request {
     /// User-visible instance name used for inspection and diagnostics.
     name: string,
     /// Argument vector passed to the launched component.
@@ -13,7 +13,7 @@ interface programs {
     wasm: list<u8>,
   }
 
-  enum launch-error-kind {
+  enum exec-error-kind {
     invalid-binary,
     missing-entry,
     unsupported-import,
@@ -22,11 +22,11 @@ interface programs {
     internal,
   }
 
-  record launch-error {
-    kind: launch-error-kind,
+  record exec-error {
+    kind: exec-error-kind,
     detail: string,
   }
 
   /// Launches a pure wasm program with the platform's default minimal rights.
-  launch: func(request: launch-request) -> result<instance-id, launch-error>;
+  exec: func(request: exec-request) -> result<instance-id, exec-error>;
 }
