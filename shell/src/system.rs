@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use helios_shell_protocol::system::{instances, stats, tracing};
+use nu_ansi_term::{Color, Style as AnsiStyle};
 
 use crate::runtime;
 use crate::serial::RpcClient;
@@ -109,8 +110,9 @@ pub async fn stream_tracing(client: &mut RpcClient, config: &TracingConfig) -> R
     loop {
         let events = fetch_tracing(client, config).await?;
         for event in events {
+            let key = tracing_event_key(&event)?;
             let line = render_tracing_event(&event)?;
-            if emitted.insert(line.clone()) {
+            if emitted.insert(key) {
                 stdout.write_all(line.as_bytes())?;
                 stdout.write_all(b"\n")?;
             }
@@ -124,19 +126,50 @@ fn render_tracing_event(event: &tracing::Event) -> Result<String> {
     let mut text = String::new();
     write!(
         &mut text,
-        "[{}] {} {}",
+        "{}",
+        level_style(event.level).paint(level_name(event.level))
+    )?;
+    write!(
+        &mut text,
+        " {}",
+        AnsiStyle::new().fg(Color::Fixed(244)).paint(&event.target)
+    )?;
+    for field in &event.fields {
+        if field.key == "message" {
+            write!(&mut text, " ")?;
+            write!(
+                &mut text,
+                "{}",
+                AnsiStyle::new()
+                    .fg(Color::White)
+                    .paint(render_value(&field.value)?)
+            )?;
+            continue;
+        }
+        write!(
+            &mut text,
+            " {}={}",
+            AnsiStyle::new().fg(Color::Fixed(109)).paint(&field.key),
+            AnsiStyle::new()
+                .fg(Color::Fixed(252))
+                .paint(render_value(&field.value)?)
+        )?;
+    }
+    Ok(text)
+}
+
+fn tracing_event_key(event: &tracing::Event) -> Result<String> {
+    let mut text = String::new();
+    write!(
+        &mut text,
+        "{}|{}|{}",
         event.timestamp,
         level_name(event.level),
         event.target
     )?;
     for field in &event.fields {
-        if field.key == "message" {
-            write!(&mut text, " ")?;
-            write_value(&mut text, &field.value)?;
-            continue;
-        }
-        write!(&mut text, " {}=", field.key)?;
-        write_value(&mut text, &field.value)?;
+        write!(&mut text, "|{}=", field.key)?;
+        text.push_str(&render_value(&field.value)?);
     }
     Ok(text)
 }
@@ -153,9 +186,22 @@ fn level_name(level: tracing::Level) -> &'static str {
     }
 }
 
-fn write_value(output: &mut String, value: &tracing::Value) -> Result<()> {
+fn level_style(level: tracing::Level) -> AnsiStyle {
+    use tracing::Level;
+
+    match level {
+        Level::Error => AnsiStyle::new().fg(Color::Red).bold(),
+        Level::Warn => AnsiStyle::new().fg(Color::Yellow).bold(),
+        Level::Info => AnsiStyle::new().fg(Color::Green).bold(),
+        Level::Debug => AnsiStyle::new().fg(Color::Blue).bold(),
+        Level::Trace => AnsiStyle::new().fg(Color::Purple).bold(),
+    }
+}
+
+fn render_value(value: &tracing::Value) -> Result<String> {
     use tracing::Value;
 
+    let mut output = String::new();
     match value {
         Value::Boolean(value) => write!(output, "{value}")?,
         Value::Signed64(value) => write!(output, "{value}")?,
@@ -164,12 +210,12 @@ fn write_value(output: &mut String, value: &tracing::Value) -> Result<()> {
         Value::Text(value) => write!(output, "{value}")?,
         Value::Blob(value) => write!(output, "{value:?}")?,
     }
-    Ok(())
+    Ok(output)
 }
 
 struct EmittedEvents {
     capacity: usize,
-    lines: VecDeque<String>,
+    keys: VecDeque<String>,
     seen: HashSet<String>,
 }
 
@@ -180,24 +226,83 @@ impl EmittedEvents {
             .saturating_mul(4);
         Self {
             capacity,
-            lines: VecDeque::with_capacity(capacity),
+            keys: VecDeque::with_capacity(capacity),
             seen: HashSet::with_capacity(capacity),
         }
     }
 
-    fn insert(&mut self, line: String) -> bool {
-        if !self.seen.insert(line.clone()) {
+    fn insert(&mut self, key: String) -> bool {
+        if !self.seen.insert(key.clone()) {
             return false;
         }
 
-        self.lines.push_back(line);
-        while self.lines.len() > self.capacity {
+        self.keys.push_back(key);
+        while self.keys.len() > self.capacity {
             let removed = self
-                .lines
+                .keys
                 .pop_front()
                 .expect("emitted tracing event ring must not underflow");
             self.seen.remove(&removed);
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use helios_shell_protocol::system::tracing::{Event, Field, Level, Value};
+
+    use super::{render_tracing_event, tracing_event_key, EmittedEvents};
+
+    #[test]
+    fn tracing_render_omits_timestamp_and_message_prefix() {
+        let event = Event {
+            timestamp: 8_059_000,
+            level: Level::Info,
+            target: "helios_kernel".to_owned(),
+            fields: vec![
+                Field {
+                    key: "message".to_owned(),
+                    value: Value::Text("Kernel initialized".to_owned()),
+                },
+                Field {
+                    key: "processor".to_owned(),
+                    value: Value::Unsigned64(1),
+                },
+            ],
+        };
+
+        let rendered = render_tracing_event(&event).expect("tracing render must succeed");
+
+        assert!(!rendered.contains("[8059000]"));
+        assert!(!rendered.contains("message="));
+        assert!(rendered.contains("Kernel initialized"));
+        assert!(rendered.contains("processor"));
+    }
+
+    #[test]
+    fn tracing_dedup_key_keeps_distinct_timestamps() {
+        let first = Event {
+            timestamp: 1,
+            level: Level::Info,
+            target: "helios_kernel".to_owned(),
+            fields: vec![Field {
+                key: "message".to_owned(),
+                value: Value::Text("tick".to_owned()),
+            }],
+        };
+        let second = Event {
+            timestamp: 2,
+            level: Level::Info,
+            target: "helios_kernel".to_owned(),
+            fields: vec![Field {
+                key: "message".to_owned(),
+                value: Value::Text("tick".to_owned()),
+            }],
+        };
+        let mut emitted = EmittedEvents::new(4);
+
+        assert!(emitted.insert(tracing_event_key(&first).expect("key generation must succeed")));
+        assert!(emitted.insert(tracing_event_key(&second).expect("key generation must succeed")));
     }
 }
