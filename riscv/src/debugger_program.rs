@@ -58,6 +58,10 @@ impl CustomCodeMemory for RiscvCodeMemory {
 }
 
 pub struct SbiSerialPort;
+pub struct SbiTcpStream {
+    service: crate::net::NetworkService,
+    stream: crate::net::TcpStreamId,
+}
 #[derive(Clone)]
 struct GuestOutput {
     mode: OutputMode,
@@ -556,6 +560,21 @@ fn add_programs_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::R
 
 fn add_net_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
     let mut instance = linker.instance("helios:system/net@0.1.0")?;
+    instance.resource_concurrent(
+        "tcp-stream",
+        ResourceType::host::<SbiTcpStream>(),
+        |accessor, rep| {
+            Box::pin(async move {
+                let stream = accessor.with(|mut access| {
+                    let resource = Resource::<SbiTcpStream>::new_own(rep);
+                    let stream = access.get().table.delete(resource)?;
+                    Ok::<_, wasmtime::Error>(stream)
+                })?;
+                stream.service.tcp_close(stream.stream).await;
+                Ok::<_, wasmtime::Error>(())
+            })
+        },
+    )?;
     instance.func_wrap_concurrent(
         "ping",
         |accessor: &Accessor<StoreData>, (host, timeout): (String, u64)| {
@@ -580,11 +599,103 @@ fn add_net_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
             })
         },
     )?;
+    instance.func_wrap_concurrent(
+        "tcp-connect",
+        |accessor: &Accessor<StoreData>, (host, port, timeout): (String, u16, u64)| {
+            Box::pin(async move {
+                let service = accessor.with(|mut access| {
+                    Ok::<_, wasmtime::Error>(access.get().debug_state.network_service())
+                })?;
+                let Some(service) = service else {
+                    return Ok::<_, wasmtime::Error>((Err(unavailable_tcp_error()),));
+                };
+                let connected = service.tcp_connect(&host, port, timeout).await;
+                let response = match connected {
+                    Ok(stream) => {
+                        let resource = accessor.with(|mut access| {
+                            access.get().table.push(SbiTcpStream {
+                                service: service.clone(),
+                                stream,
+                            })
+                        })?;
+                        Ok(resource)
+                    }
+                    Err(error) => Err(convert_tcp_error(error)),
+                };
+                Ok::<_, wasmtime::Error>((response,))
+            })
+        },
+    )?;
+    instance.func_wrap_concurrent(
+        "[method]tcp-stream.read",
+        |accessor: &Accessor<StoreData>,
+         (resource, max_bytes, timeout): (Resource<SbiTcpStream>, u32, u64)| {
+            Box::pin(async move {
+                let socket = accessor.with(|mut access| {
+                    let socket = access.get().table.get(&resource)?;
+                    Ok::<_, wasmtime::Error>((socket.service.clone(), socket.stream))
+                })?;
+                let response = socket
+                    .0
+                    .tcp_read(socket.1, max_bytes, timeout)
+                    .await
+                    .map_err(convert_tcp_error);
+                Ok::<_, wasmtime::Error>((response,))
+            })
+        },
+    )?;
+    instance.func_wrap_concurrent(
+        "[method]tcp-stream.write",
+        |accessor: &Accessor<StoreData>,
+         (resource, bytes, timeout): (Resource<SbiTcpStream>, Vec<u8>, u64)| {
+            Box::pin(async move {
+                let socket = accessor.with(|mut access| {
+                    let socket = access.get().table.get(&resource)?;
+                    Ok::<_, wasmtime::Error>((socket.service.clone(), socket.stream))
+                })?;
+                let response = socket
+                    .0
+                    .tcp_write_all(socket.1, &bytes, timeout)
+                    .await
+                    .map(|()| bytes.len() as u64)
+                    .map_err(convert_tcp_error);
+                Ok::<_, wasmtime::Error>((response,))
+            })
+        },
+    )?;
+    instance.func_wrap_concurrent(
+        "[method]tcp-stream.close",
+        |accessor: &Accessor<StoreData>, (resource,): (Resource<SbiTcpStream>,)| {
+            Box::pin(async move {
+                let socket = accessor.with(|mut access| {
+                    let socket = access.get().table.get(&resource)?;
+                    Ok::<_, wasmtime::Error>((socket.service.clone(), socket.stream))
+                })?;
+                socket.0.tcp_close(socket.1).await;
+                Ok::<_, wasmtime::Error>((Ok::<(), bindings::helios::system::net::TcpError>(()),))
+            })
+        },
+    )?;
     Ok(())
 }
 
 fn add_net_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
     let mut instance = linker.instance("helios:system/net@0.1.0")?;
+    instance.resource_concurrent(
+        "tcp-stream",
+        ResourceType::host::<SbiTcpStream>(),
+        |accessor, rep| {
+            Box::pin(async move {
+                let stream = accessor.with(|mut access| {
+                    let resource = Resource::<SbiTcpStream>::new_own(rep);
+                    let stream = access.get().table.delete(resource)?;
+                    Ok::<_, wasmtime::Error>(stream)
+                })?;
+                stream.service.tcp_close(stream.stream).await;
+                Ok::<_, wasmtime::Error>(())
+            })
+        },
+    )?;
     instance.func_wrap_concurrent(
         "ping",
         |accessor: &Accessor<StoreData>, (host, timeout): (String, u64)| {
@@ -606,6 +717,86 @@ fn add_net_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result
                     .map(convert_program_ping_reply)
                     .map_err(convert_program_ping_error);
                 Ok::<_, wasmtime::Error>((response,))
+            })
+        },
+    )?;
+    instance.func_wrap_concurrent(
+        "tcp-connect",
+        |accessor: &Accessor<StoreData>, (host, port, timeout): (String, u16, u64)| {
+            Box::pin(async move {
+                let service = accessor.with(|mut access| {
+                    Ok::<_, wasmtime::Error>(access.get().debug_state.network_service())
+                })?;
+                let Some(service) = service else {
+                    return Ok::<_, wasmtime::Error>((Err(unavailable_program_tcp_error()),));
+                };
+                let connected = service.tcp_connect(&host, port, timeout).await;
+                let response = match connected {
+                    Ok(stream) => {
+                        let resource = accessor.with(|mut access| {
+                            access.get().table.push(SbiTcpStream {
+                                service: service.clone(),
+                                stream,
+                            })
+                        })?;
+                        Ok(resource)
+                    }
+                    Err(error) => Err(convert_program_tcp_error(error)),
+                };
+                Ok::<_, wasmtime::Error>((response,))
+            })
+        },
+    )?;
+    instance.func_wrap_concurrent(
+        "[method]tcp-stream.read",
+        |accessor: &Accessor<StoreData>,
+         (resource, max_bytes, timeout): (Resource<SbiTcpStream>, u32, u64)| {
+            Box::pin(async move {
+                let socket = accessor.with(|mut access| {
+                    let socket = access.get().table.get(&resource)?;
+                    Ok::<_, wasmtime::Error>((socket.service.clone(), socket.stream))
+                })?;
+                let response = socket
+                    .0
+                    .tcp_read(socket.1, max_bytes, timeout)
+                    .await
+                    .map_err(convert_program_tcp_error);
+                Ok::<_, wasmtime::Error>((response,))
+            })
+        },
+    )?;
+    instance.func_wrap_concurrent(
+        "[method]tcp-stream.write",
+        |accessor: &Accessor<StoreData>,
+         (resource, bytes, timeout): (Resource<SbiTcpStream>, Vec<u8>, u64)| {
+            Box::pin(async move {
+                let socket = accessor.with(|mut access| {
+                    let socket = access.get().table.get(&resource)?;
+                    Ok::<_, wasmtime::Error>((socket.service.clone(), socket.stream))
+                })?;
+                let response = socket
+                    .0
+                    .tcp_write_all(socket.1, &bytes, timeout)
+                    .await
+                    .map(|()| bytes.len() as u64)
+                    .map_err(convert_program_tcp_error);
+                Ok::<_, wasmtime::Error>((response,))
+            })
+        },
+    )?;
+    instance.func_wrap_concurrent(
+        "[method]tcp-stream.close",
+        |accessor: &Accessor<StoreData>, (resource,): (Resource<SbiTcpStream>,)| {
+            Box::pin(async move {
+                let socket = accessor.with(|mut access| {
+                    let socket = access.get().table.get(&resource)?;
+                    Ok::<_, wasmtime::Error>((socket.service.clone(), socket.stream))
+                })?;
+                socket.0.tcp_close(socket.1).await;
+                Ok::<_, wasmtime::Error>((Ok::<
+                    (),
+                    crate::program_bindings::bindings::helios::system::net::TcpError,
+                >(()),))
             })
         },
     )?;
@@ -803,6 +994,63 @@ fn convert_program_ping_error(
             }
             crate::net::PingErrorKind::Internal => {
                 crate::program_bindings::bindings::helios::system::net::PingErrorKind::Internal
+            }
+        },
+        detail: error.detail,
+    }
+}
+
+fn unavailable_tcp_error() -> bindings::helios::system::net::TcpError {
+    bindings::helios::system::net::TcpError {
+        kind: bindings::helios::system::net::TcpErrorKind::Unavailable,
+        detail: "network service is unavailable on this machine".to_owned(),
+    }
+}
+
+fn unavailable_program_tcp_error()
+-> crate::program_bindings::bindings::helios::system::net::TcpError {
+    crate::program_bindings::bindings::helios::system::net::TcpError {
+        kind: crate::program_bindings::bindings::helios::system::net::TcpErrorKind::Unavailable,
+        detail: "network service is unavailable on this machine".to_owned(),
+    }
+}
+
+fn convert_tcp_error(error: crate::net::TcpError) -> bindings::helios::system::net::TcpError {
+    bindings::helios::system::net::TcpError {
+        kind: match error.kind {
+            crate::net::TcpErrorKind::UnresolvedHost => {
+                bindings::helios::system::net::TcpErrorKind::UnresolvedHost
+            }
+            crate::net::TcpErrorKind::Timeout => {
+                bindings::helios::system::net::TcpErrorKind::Timeout
+            }
+            crate::net::TcpErrorKind::Unavailable => {
+                bindings::helios::system::net::TcpErrorKind::Unavailable
+            }
+            crate::net::TcpErrorKind::Internal => {
+                bindings::helios::system::net::TcpErrorKind::Internal
+            }
+        },
+        detail: error.detail,
+    }
+}
+
+fn convert_program_tcp_error(
+    error: crate::net::TcpError,
+) -> crate::program_bindings::bindings::helios::system::net::TcpError {
+    crate::program_bindings::bindings::helios::system::net::TcpError {
+        kind: match error.kind {
+            crate::net::TcpErrorKind::UnresolvedHost => {
+                crate::program_bindings::bindings::helios::system::net::TcpErrorKind::UnresolvedHost
+            }
+            crate::net::TcpErrorKind::Timeout => {
+                crate::program_bindings::bindings::helios::system::net::TcpErrorKind::Timeout
+            }
+            crate::net::TcpErrorKind::Unavailable => {
+                crate::program_bindings::bindings::helios::system::net::TcpErrorKind::Unavailable
+            }
+            crate::net::TcpErrorKind::Internal => {
+                crate::program_bindings::bindings::helios::system::net::TcpErrorKind::Internal
             }
         },
         detail: error.detail,

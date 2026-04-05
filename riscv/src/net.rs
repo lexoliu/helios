@@ -21,7 +21,7 @@ use helios_kernel::{Kernel, Notify, Timer};
 use plic::Plic;
 use smoltcp::iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::{dhcpv4, dns, icmp};
+use smoltcp::socket::{dhcpv4, dns, icmp, tcp};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{
     DnsQueryType, EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr,
@@ -43,6 +43,9 @@ const ICMP_IDENTIFIER: u16 = 0x4845;
 const ICMP_PAYLOAD: &[u8] = b"helios";
 const ICMP_BUFFER_BYTES: usize = 512;
 const ICMP_BUFFER_PACKETS: usize = 4;
+const TCP_BUFFER_BYTES: usize = 8 * 1024;
+const TCP_EPHEMERAL_PORT_START: u16 = 49_152;
+const TCP_EPHEMERAL_PORT_END: u16 = 65_535;
 
 #[derive(Clone)]
 pub(crate) struct NetworkService {
@@ -55,7 +58,7 @@ struct NetworkServiceInner {
     timer: Timer<RiscvCpu>,
     device: Arc<helios_virtio::VirtioMmioNetDevice>,
     state: helios_kernel::Mutex<NetworkState>,
-    requests: ConcurrentQueue<PingRequest>,
+    requests: ConcurrentQueue<NetworkRequest>,
     request_ready: Notify,
 }
 
@@ -89,20 +92,77 @@ pub(crate) struct PingReply {
     pub(crate) payload_bytes: u16,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum TcpErrorKind {
+    UnresolvedHost,
+    Timeout,
+    Unavailable,
+    Internal,
+}
+
+pub(crate) struct TcpError {
+    pub(crate) kind: TcpErrorKind,
+    pub(crate) detail: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TcpStreamId(NonZeroU32);
+
+enum NetworkRequest {
+    Ping(PingRequest),
+    TcpConnect(TcpConnectRequest),
+    TcpWrite(TcpWriteRequest),
+    TcpRead(TcpReadRequest),
+    TcpClose(TcpCloseRequest),
+}
+
 struct PingRequest {
     host: String,
     timeout_nanos: u64,
-    response: PingResponse,
+    response: RequestResponse<Result<PingReply, PingError>>,
 }
 
-#[derive(Clone)]
-struct PingResponse {
-    inner: Arc<PingResponseInner>,
+struct TcpConnectRequest {
+    host: String,
+    port: u16,
+    timeout_nanos: u64,
+    response: RequestResponse<Result<TcpStreamId, TcpError>>,
 }
 
-struct PingResponseInner {
-    result: helios_kernel::Mutex<Option<Result<PingReply, PingError>>>,
+struct TcpWriteRequest {
+    stream: TcpStreamId,
+    bytes: Vec<u8>,
+    timeout_nanos: u64,
+    response: RequestResponse<Result<(), TcpError>>,
+}
+
+struct TcpReadRequest {
+    stream: TcpStreamId,
+    max_bytes: u32,
+    timeout_nanos: u64,
+    response: RequestResponse<Result<Option<Vec<u8>>, TcpError>>,
+}
+
+struct TcpCloseRequest {
+    stream: TcpStreamId,
+    response: RequestResponse<()>,
+}
+
+struct RequestResponse<T> {
+    inner: Arc<RequestResponseInner<T>>,
+}
+
+struct RequestResponseInner<T> {
+    result: helios_kernel::Mutex<Option<T>>,
     ready: Notify,
+}
+
+impl<T> Clone for RequestResponse<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 struct NetworkState {
@@ -116,7 +176,13 @@ struct NetworkState {
     ipv4_address: Option<Ipv4Cidr>,
     dns_servers: Vec<IpAddress>,
     next_echo_sequence: u16,
+    next_tcp_local_port: u16,
+    tcp_streams: Vec<Option<TcpStreamState>>,
     max_frame_len: usize,
+}
+
+struct TcpStreamState {
+    handle: SocketHandle,
 }
 
 struct QueueDevice<'a> {
@@ -145,6 +211,17 @@ struct NetworkProbe {
     irq_source: InterruptSourceId,
     plic: &'static Plic,
     context: PlicContext,
+}
+
+enum TcpConnectProgress {
+    Pending,
+    Connected,
+}
+
+enum TcpReadProgress {
+    Pending,
+    Data(Vec<u8>),
+    Eof,
 }
 
 pub(crate) fn install_network_service(
@@ -215,31 +292,125 @@ impl NetworkService {
         host: &str,
         timeout_nanos: u64,
     ) -> Result<PingReply, PingError> {
-        let response = PingResponse::new();
-        let request = PingRequest {
+        let response = RequestResponse::new();
+        self.enqueue_request(NetworkRequest::Ping(PingRequest {
             host: host.to_owned(),
             timeout_nanos,
             response: response.clone(),
-        };
+        }));
+        response.wait().await
+    }
+
+    pub(crate) async fn tcp_connect(
+        &self,
+        host: &str,
+        port: u16,
+        timeout_nanos: u64,
+    ) -> Result<TcpStreamId, TcpError> {
+        let response = RequestResponse::new();
+        self.enqueue_request(NetworkRequest::TcpConnect(TcpConnectRequest {
+            host: host.to_owned(),
+            port,
+            timeout_nanos,
+            response: response.clone(),
+        }));
+        response.wait().await
+    }
+
+    pub(crate) async fn tcp_write_all(
+        &self,
+        stream: TcpStreamId,
+        bytes: &[u8],
+        timeout_nanos: u64,
+    ) -> Result<(), TcpError> {
+        let response = RequestResponse::new();
+        self.enqueue_request(NetworkRequest::TcpWrite(TcpWriteRequest {
+            stream,
+            bytes: bytes.to_vec(),
+            timeout_nanos,
+            response: response.clone(),
+        }));
+        response.wait().await
+    }
+
+    pub(crate) async fn tcp_read(
+        &self,
+        stream: TcpStreamId,
+        max_bytes: u32,
+        timeout_nanos: u64,
+    ) -> Result<Option<Vec<u8>>, TcpError> {
+        let response = RequestResponse::new();
+        self.enqueue_request(NetworkRequest::TcpRead(TcpReadRequest {
+            stream,
+            max_bytes,
+            timeout_nanos,
+            response: response.clone(),
+        }));
+        response.wait().await
+    }
+
+    pub(crate) async fn tcp_close(&self, stream: TcpStreamId) {
+        let response = RequestResponse::new();
+        self.enqueue_request(NetworkRequest::TcpClose(TcpCloseRequest {
+            stream,
+            response: response.clone(),
+        }));
+        response.wait().await;
+    }
+
+    fn enqueue_request(&self, request: NetworkRequest) {
         match self.inner.requests.push(request) {
             Ok(()) => self.inner.request_ready.notify_one(),
             Err(PushError::Full(_)) => unreachable!("unbounded network queue reported full"),
             Err(PushError::Closed(_)) => panic!("network request queue was closed unexpectedly"),
         }
-        response.wait().await
     }
 
     async fn run_requests(&self) {
         loop {
             let request = self.next_request().await;
-            let result = self
-                .execute_ping(&request.host, request.timeout_nanos)
-                .await;
-            request.response.complete(result).await;
+            match request {
+                NetworkRequest::Ping(request) => {
+                    let result = self
+                        .execute_ping(&request.host, request.timeout_nanos)
+                        .await;
+                    request.response.complete(result).await;
+                }
+                NetworkRequest::TcpConnect(request) => {
+                    let result = self
+                        .execute_tcp_connect(&request.host, request.port, request.timeout_nanos)
+                        .await;
+                    request.response.complete(result).await;
+                }
+                NetworkRequest::TcpWrite(request) => {
+                    let result = self
+                        .execute_tcp_write_all(
+                            request.stream,
+                            &request.bytes,
+                            request.timeout_nanos,
+                        )
+                        .await;
+                    request.response.complete(result).await;
+                }
+                NetworkRequest::TcpRead(request) => {
+                    let result = self
+                        .execute_tcp_read(request.stream, request.max_bytes, request.timeout_nanos)
+                        .await;
+                    request.response.complete(result).await;
+                }
+                NetworkRequest::TcpClose(request) => {
+                    self.inner
+                        .state
+                        .lock()
+                        .await
+                        .remove_tcp_stream(request.stream);
+                    request.response.complete(()).await;
+                }
+            }
         }
     }
 
-    async fn next_request(&self) -> PingRequest {
+    async fn next_request(&self) -> NetworkRequest {
         loop {
             match self.inner.requests.pop() {
                 Ok(request) => return request,
@@ -251,8 +422,8 @@ impl NetworkService {
 
     async fn execute_ping(&self, host: &str, timeout_nanos: u64) -> Result<PingReply, PingError> {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
-        self.wait_for_ipv4(deadline_nanos).await?;
-        let destination = self.resolve_host(host, deadline_nanos).await?;
+        self.wait_for_ipv4_ping(deadline_nanos).await?;
+        let destination = self.resolve_host_ping(host, deadline_nanos).await?;
         let (sequence, sent_at_nanos) = {
             let mut state = self.inner.state.lock().await;
             let sequence = state.start_ping(destination)?;
@@ -260,7 +431,7 @@ impl NetworkService {
         };
 
         let payload_bytes = self
-            .wait_until(
+            .wait_until_ping(
                 deadline_nanos,
                 PingError {
                     kind: PingErrorKind::Timeout,
@@ -279,8 +450,120 @@ impl NetworkService {
         })
     }
 
-    async fn wait_for_ipv4(&self, deadline_nanos: u64) -> Result<(), PingError> {
-        self.wait_until(
+    async fn execute_tcp_connect(
+        &self,
+        host: &str,
+        port: u16,
+        timeout_nanos: u64,
+    ) -> Result<TcpStreamId, TcpError> {
+        let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
+        self.wait_for_ipv4_tcp(deadline_nanos).await?;
+        let destination = self.resolve_host_tcp(host, deadline_nanos).await?;
+        let stream = {
+            let mut state = self.inner.state.lock().await;
+            state.start_tcp_connect(destination, port)?
+        };
+
+        loop {
+            self.drive_tcp().await?;
+            let now_nanos = self.now_nanos();
+            let next_wait = {
+                let mut state = self.inner.state.lock().await;
+                match state.poll_tcp_connect(stream) {
+                    Ok(TcpConnectProgress::Connected) => return Ok(stream),
+                    Ok(TcpConnectProgress::Pending) => {
+                        if now_nanos >= deadline_nanos {
+                            state.remove_tcp_stream(stream);
+                            return Err(TcpError {
+                                kind: TcpErrorKind::Timeout,
+                                detail: format!(
+                                    "tcp connect to {}:{} timed out",
+                                    format_ipv4(destination),
+                                    port
+                                ),
+                            });
+                        }
+                        state.next_wait_duration(now_nanos, deadline_nanos)
+                    }
+                    Err(error) => {
+                        state.remove_tcp_stream(stream);
+                        return Err(error);
+                    }
+                }
+            };
+            self.wait_for_progress(next_wait).await;
+        }
+    }
+
+    async fn execute_tcp_write_all(
+        &self,
+        stream: TcpStreamId,
+        bytes: &[u8],
+        timeout_nanos: u64,
+    ) -> Result<(), TcpError> {
+        let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            self.drive_tcp().await?;
+            let now_nanos = self.now_nanos();
+            let next_wait = {
+                let mut state = self.inner.state.lock().await;
+                match state.try_write_tcp(stream, &bytes[offset..])? {
+                    Some(written) => {
+                        assert!(written != 0, "tcp write reported zero-byte progress");
+                        offset = offset
+                            .checked_add(written)
+                            .expect("tcp write offset overflowed usize");
+                        continue;
+                    }
+                    None => {
+                        if now_nanos >= deadline_nanos {
+                            return Err(TcpError {
+                                kind: TcpErrorKind::Timeout,
+                                detail: format!("tcp write on stream {} timed out", stream.0.get()),
+                            });
+                        }
+                        state.next_wait_duration(now_nanos, deadline_nanos)
+                    }
+                }
+            };
+            self.wait_for_progress(next_wait).await;
+        }
+        Ok(())
+    }
+
+    async fn execute_tcp_read(
+        &self,
+        stream: TcpStreamId,
+        max_bytes: u32,
+        timeout_nanos: u64,
+    ) -> Result<Option<Vec<u8>>, TcpError> {
+        let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
+        loop {
+            self.drive_tcp().await?;
+            let now_nanos = self.now_nanos();
+            let next_wait = {
+                let mut state = self.inner.state.lock().await;
+                match state.poll_tcp_read(stream, max_bytes as usize)? {
+                    TcpReadProgress::Data(bytes) => return Ok(Some(bytes)),
+                    TcpReadProgress::Eof => return Ok(None),
+                    TcpReadProgress::Pending => {
+                        if now_nanos >= deadline_nanos {
+                            return Err(TcpError {
+                                kind: TcpErrorKind::Timeout,
+                                detail: format!("tcp read on stream {} timed out", stream.0.get()),
+                            });
+                        }
+                        state.next_wait_duration(now_nanos, deadline_nanos)
+                    }
+                }
+            };
+            self.wait_for_progress(next_wait).await;
+        }
+    }
+
+    async fn wait_for_ipv4_ping(&self, deadline_nanos: u64) -> Result<(), PingError> {
+        self.wait_until_ping(
             deadline_nanos,
             PingError {
                 kind: PingErrorKind::Timeout,
@@ -291,7 +574,28 @@ impl NetworkService {
         .await
     }
 
-    async fn resolve_host(
+    async fn wait_for_ipv4_tcp(&self, deadline_nanos: u64) -> Result<(), TcpError> {
+        loop {
+            self.drive_tcp().await?;
+            let now_nanos = self.now_nanos();
+            let next_wait = {
+                let mut state = self.inner.state.lock().await;
+                if state.is_configured() {
+                    return Ok(());
+                }
+                if now_nanos >= deadline_nanos {
+                    return Err(TcpError {
+                        kind: TcpErrorKind::Timeout,
+                        detail: "network configuration timed out".to_owned(),
+                    });
+                }
+                state.next_wait_duration(now_nanos, deadline_nanos)
+            };
+            self.wait_for_progress(next_wait).await;
+        }
+    }
+
+    async fn resolve_host_ping(
         &self,
         host: &str,
         deadline_nanos: u64,
@@ -305,7 +609,7 @@ impl NetworkService {
             state.start_dns_query(host)?
         };
         let result = self
-            .wait_until(
+            .wait_until_ping(
                 deadline_nanos,
                 PingError {
                     kind: PingErrorKind::Timeout,
@@ -327,14 +631,50 @@ impl NetworkService {
         result
     }
 
-    async fn wait_until<T>(
+    async fn resolve_host_tcp(
+        &self,
+        host: &str,
+        deadline_nanos: u64,
+    ) -> Result<Ipv4Address, TcpError> {
+        if let Some(address) = parse_ipv4(host) {
+            return Ok(address);
+        }
+
+        let query = {
+            let mut state = self.inner.state.lock().await;
+            state.start_dns_query_tcp(host)?
+        };
+        loop {
+            self.drive_tcp().await?;
+            let now_nanos = self.now_nanos();
+            let next_wait = {
+                let mut state = self.inner.state.lock().await;
+                match state.take_dns_result_tcp(query)? {
+                    Some(address) => return Ok(address),
+                    None => {
+                        if now_nanos >= deadline_nanos {
+                            state.cancel_dns_query(query);
+                            return Err(TcpError {
+                                kind: TcpErrorKind::Timeout,
+                                detail: format!("dns lookup for {host} timed out"),
+                            });
+                        }
+                        state.next_wait_duration(now_nanos, deadline_nanos)
+                    }
+                }
+            };
+            self.wait_for_progress(next_wait).await;
+        }
+    }
+
+    async fn wait_until_ping<T>(
         &self,
         deadline_nanos: u64,
         timeout_error: PingError,
         mut check: impl FnMut(&mut NetworkState) -> Result<Option<T>, PingError>,
     ) -> Result<T, PingError> {
         loop {
-            self.drive().await?;
+            self.drive_ping().await?;
 
             let now_nanos = self.now_nanos();
             let next_wait = {
@@ -352,16 +692,26 @@ impl NetworkService {
         }
     }
 
-    async fn drive(&self) -> Result<(), PingError> {
+    async fn drive_ping(&self) -> Result<(), PingError> {
+        self.drive_network()
+            .await
+            .map_err(|error| PingError::from_io(error, "failed to advance virtio network"))
+    }
+
+    async fn drive_tcp(&self) -> Result<(), TcpError> {
+        self.drive_network()
+            .await
+            .map_err(|error| TcpError::from_io(error, "failed to advance virtio network"))
+    }
+
+    async fn drive_network(&self) -> Result<(), IoError> {
         loop {
             let mut received = Vec::new();
             loop {
                 match self.inner.device.try_receive().await {
                     Ok(Some(frame)) => received.push(frame),
                     Ok(None) => break,
-                    Err(error) => {
-                        return Err(PingError::from_io(error, "failed to receive virtio frame"));
-                    }
+                    Err(error) => return Err(error),
                 }
             }
 
@@ -382,9 +732,7 @@ impl NetworkService {
             // back after every burst so inbound packets that arrived while transmitting are
             // drained before we sleep again.
             for frame in outbound {
-                self.inner.device.transmit(&frame).await.map_err(|error| {
-                    PingError::from_io(error, "failed to transmit virtio frame")
-                })?;
+                self.inner.device.transmit(&frame).await?;
             }
         }
     }
@@ -454,22 +802,39 @@ impl PingError {
     }
 }
 
-impl PingResponse {
+impl TcpError {
+    fn from_io(error: IoError, context: &str) -> Self {
+        let kind = match error {
+            IoError::Unsupported | IoError::PermissionDenied | IoError::ReadOnly => {
+                TcpErrorKind::Unavailable
+            }
+            IoError::InvalidBufferLength { .. } | IoError::OutOfBounds | IoError::DeviceFault => {
+                TcpErrorKind::Internal
+            }
+        };
+        Self {
+            kind,
+            detail: format!("{context}: {error}"),
+        }
+    }
+}
+
+impl<T> RequestResponse<T> {
     fn new() -> Self {
         Self {
-            inner: Arc::new(PingResponseInner {
+            inner: Arc::new(RequestResponseInner {
                 result: helios_kernel::Mutex::new(None),
                 ready: Notify::new(),
             }),
         }
     }
 
-    async fn complete(&self, result: Result<PingReply, PingError>) {
+    async fn complete(&self, result: T) {
         *self.inner.result.lock().await = Some(result);
         self.inner.ready.notify_one();
     }
 
-    async fn wait(&self) -> Result<PingReply, PingError> {
+    async fn wait(&self) -> T {
         loop {
             if let Some(result) = self.inner.result.lock().await.take() {
                 return result;
@@ -524,6 +889,8 @@ impl NetworkState {
             ipv4_address: None,
             dns_servers: Vec::new(),
             next_echo_sequence: 1,
+            next_tcp_local_port: TCP_EPHEMERAL_PORT_START,
+            tcp_streams: Vec::new(),
             max_frame_len,
         }
     }
@@ -607,6 +974,23 @@ impl NetworkState {
             })
     }
 
+    fn start_dns_query_tcp(&mut self, host: &str) -> Result<dns::QueryHandle, TcpError> {
+        if self.dns_servers.is_empty() {
+            return Err(TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: "no DNS servers are configured yet".to_owned(),
+            });
+        }
+
+        self.sockets
+            .get_mut::<dns::Socket>(self.dns_handle)
+            .start_query(self.iface.context(), host, DnsQueryType::A)
+            .map_err(|error| TcpError {
+                kind: TcpErrorKind::UnresolvedHost,
+                detail: format!("failed to start DNS query for {host}: {error}"),
+            })
+    }
+
     fn take_dns_result(
         &mut self,
         query: dns::QueryHandle,
@@ -622,6 +1006,26 @@ impl NetworkState {
             Err(dns::GetQueryResultError::Pending) => Ok(None),
             Err(dns::GetQueryResultError::Failed) => Err(PingError {
                 kind: PingErrorKind::UnresolvedHost,
+                detail: "DNS lookup failed".to_owned(),
+            }),
+        }
+    }
+
+    fn take_dns_result_tcp(
+        &mut self,
+        query: dns::QueryHandle,
+    ) -> Result<Option<Ipv4Address>, TcpError> {
+        match self
+            .sockets
+            .get_mut::<dns::Socket>(self.dns_handle)
+            .get_query_result(query)
+        {
+            Ok(addresses) => Ok(addresses.into_iter().next().map(|address| match address {
+                IpAddress::Ipv4(address) => address,
+            })),
+            Err(dns::GetQueryResultError::Pending) => Ok(None),
+            Err(dns::GetQueryResultError::Failed) => Err(TcpError {
+                kind: TcpErrorKind::UnresolvedHost,
                 detail: "DNS lookup failed".to_owned(),
             }),
         }
@@ -695,6 +1099,178 @@ impl NetworkState {
             }
         }
         None
+    }
+
+    fn start_tcp_connect(
+        &mut self,
+        destination: Ipv4Address,
+        port: u16,
+    ) -> Result<TcpStreamId, TcpError> {
+        let local_port = self.allocate_tcp_local_port()?;
+        let socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]),
+            tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]),
+        );
+        let handle = self.sockets.add(socket);
+        let connect_result = self.sockets.get_mut::<tcp::Socket>(handle).connect(
+            self.iface.context(),
+            (IpAddress::Ipv4(destination), port),
+            local_port,
+        );
+        if let Err(error) = connect_result {
+            let _ = self.sockets.remove(handle);
+            return Err(TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: format!(
+                    "failed to start tcp connect to {}:{}: {error}",
+                    format_ipv4(destination),
+                    port
+                ),
+            });
+        }
+
+        Ok(self.insert_tcp_stream(handle))
+    }
+
+    fn poll_tcp_connect(&mut self, stream: TcpStreamId) -> Result<TcpConnectProgress, TcpError> {
+        let socket = self.tcp_socket_mut(stream)?;
+        if socket.may_send() || socket.can_recv() {
+            return Ok(TcpConnectProgress::Connected);
+        }
+
+        match socket.state() {
+            tcp::State::Closed | tcp::State::TimeWait => Err(TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: format!("tcp stream {} closed during connect", stream.0.get()),
+            }),
+            _ => Ok(TcpConnectProgress::Pending),
+        }
+    }
+
+    fn try_write_tcp(
+        &mut self,
+        stream: TcpStreamId,
+        bytes: &[u8],
+    ) -> Result<Option<usize>, TcpError> {
+        let socket = self.tcp_socket_mut(stream)?;
+        if socket.can_send() {
+            let written = socket.send_slice(bytes).map_err(|error| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: format!(
+                    "failed to queue tcp write on stream {}: {error}",
+                    stream.0.get()
+                ),
+            })?;
+            return Ok(Some(written));
+        }
+        if !socket.may_send() {
+            return Err(TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: format!("tcp stream {} is no longer writable", stream.0.get()),
+            });
+        }
+        Ok(None)
+    }
+
+    fn poll_tcp_read(
+        &mut self,
+        stream: TcpStreamId,
+        max_bytes: usize,
+    ) -> Result<TcpReadProgress, TcpError> {
+        let socket = self.tcp_socket_mut(stream)?;
+        if socket.can_recv() {
+            let mut bytes = vec![0; max_bytes.max(1)];
+            let read = socket.recv_slice(&mut bytes).map_err(|error| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: format!(
+                    "failed to receive on tcp stream {}: {error}",
+                    stream.0.get()
+                ),
+            })?;
+            bytes.truncate(read);
+            return Ok(TcpReadProgress::Data(bytes));
+        }
+        if socket.may_recv() {
+            return Ok(TcpReadProgress::Pending);
+        }
+        match socket.state() {
+            tcp::State::Closed | tcp::State::TimeWait => Err(TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: format!("tcp stream {} closed unexpectedly", stream.0.get()),
+            }),
+            _ => Ok(TcpReadProgress::Eof),
+        }
+    }
+
+    fn remove_tcp_stream(&mut self, stream: TcpStreamId) {
+        let index = stream_index(stream);
+        let Some(slot) = self.tcp_streams.get_mut(index) else {
+            return;
+        };
+        let Some(state) = slot.take() else {
+            return;
+        };
+        let _ = self.sockets.remove(state.handle);
+    }
+
+    fn insert_tcp_stream(&mut self, handle: SocketHandle) -> TcpStreamId {
+        if let Some((index, slot)) = self
+            .tcp_streams
+            .iter_mut()
+            .enumerate()
+            .find(|(_, slot)| slot.is_none())
+        {
+            *slot = Some(TcpStreamState { handle });
+            return tcp_stream_id(index);
+        }
+
+        self.tcp_streams.push(Some(TcpStreamState { handle }));
+        tcp_stream_id(self.tcp_streams.len() - 1)
+    }
+
+    fn tcp_socket_mut(
+        &mut self,
+        stream: TcpStreamId,
+    ) -> Result<&mut tcp::Socket<'static>, TcpError> {
+        let handle = self
+            .tcp_streams
+            .get(stream_index(stream))
+            .and_then(|slot| slot.as_ref())
+            .map(|state| state.handle)
+            .ok_or_else(|| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: format!("unknown tcp stream {}", stream.0.get()),
+            })?;
+        Ok(self.sockets.get_mut::<tcp::Socket>(handle))
+    }
+
+    fn allocate_tcp_local_port(&mut self) -> Result<u16, TcpError> {
+        let attempts = usize::from(TCP_EPHEMERAL_PORT_END - TCP_EPHEMERAL_PORT_START) + 1;
+        for _ in 0..attempts {
+            let candidate = self.next_tcp_local_port;
+            self.next_tcp_local_port = if self.next_tcp_local_port == TCP_EPHEMERAL_PORT_END {
+                TCP_EPHEMERAL_PORT_START
+            } else {
+                self.next_tcp_local_port + 1
+            };
+            if self.is_tcp_local_port_free(candidate) {
+                return Ok(candidate);
+            }
+        }
+
+        Err(TcpError {
+            kind: TcpErrorKind::Unavailable,
+            detail: "no ephemeral tcp ports are available".to_owned(),
+        })
+    }
+
+    fn is_tcp_local_port_free(&self, port: u16) -> bool {
+        self.tcp_streams.iter().flatten().all(|state| {
+            self.sockets
+                .get::<tcp::Socket>(state.handle)
+                .local_endpoint()
+                .is_none_or(|endpoint| endpoint.port != port)
+        })
     }
 
     fn next_wait_duration(&mut self, now_nanos: u64, deadline_nanos: u64) -> Duration {
@@ -954,6 +1530,17 @@ fn parse_ipv4(input: &str) -> Option<Ipv4Address> {
 fn format_ipv4(address: Ipv4Address) -> String {
     let octets = address.octets();
     format!("{}.{}.{}.{}", octets[0], octets[1], octets[2], octets[3])
+}
+
+fn tcp_stream_id(index: usize) -> TcpStreamId {
+    let raw =
+        u32::try_from(index + 1).unwrap_or_else(|_| panic!("tcp stream index {index} exceeds u32"));
+    TcpStreamId(NonZeroU32::new(raw).unwrap_or_else(|| panic!("tcp stream ids must never be zero")))
+}
+
+fn stream_index(stream: TcpStreamId) -> usize {
+    usize::try_from(stream.0.get() - 1)
+        .unwrap_or_else(|_| panic!("tcp stream id {} does not fit into usize", stream.0.get()))
 }
 
 fn parse_cpu_hart_id(node: FdtNode<'_, '_>, address_cells: usize) -> Option<u16> {

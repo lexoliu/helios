@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "api", "api-macro", "hal", "hosted", "kernel", "kernel-macro", "programs/debugger", "programs/init", "programs/ping", "riscv", "shell", "shell-protocol", "virtio",
+    "api", "api-macro", "hal", "hosted", "kernel", "kernel-macro", "programs/curl", "programs/debugger", "programs/init", "programs/ping", "riscv", "shell", "shell-protocol", "virtio",
 ]
 resolver = "2"
 
@@ -47,6 +47,11 @@ debug = 0
 opt-level = "z"
 
 [profile.dev.package.helios-ping]
+debug = 0
+opt-level = "z"
+codegen-units = 1
+
+[profile.dev.package.helios-curl]
 debug = 0
 opt-level = "z"
 codegen-units = 1
