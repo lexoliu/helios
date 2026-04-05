@@ -5,7 +5,7 @@ use std::path::Path;
 
 use anyhow::{Context as _, Result};
 use clap::error::ErrorKind;
-use clap::{ColorChoice, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{ColorChoice, Parser, Subcommand, ValueEnum};
 use crossterm::cursor::MoveTo;
 use crossterm::execute;
 use crossterm::terminal::{Clear, ClearType};
@@ -28,6 +28,7 @@ use strsim::normalized_damerau_levenshtein;
 
 use crate::edit_tui;
 use crate::filesystem;
+use crate::help;
 use crate::programs;
 use crate::rpc::RpcPane;
 use crate::runtime;
@@ -125,7 +126,7 @@ const RPC_FUNC_CANDIDATES: &[&str] = &[
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum HelpTopic {
+pub(crate) enum HelpTopic {
     Overview,
     Stats,
     Tracing,
@@ -151,7 +152,7 @@ enum TracingLevelArg {
     color = ColorChoice::Always,
     subcommand_required = true
 )]
-struct ReplCli {
+pub(crate) struct ReplCli {
     #[command(subcommand)]
     command: CliCommand,
 }
@@ -783,45 +784,7 @@ fn render_help_hint(prefix: &[&str]) -> String {
 }
 
 fn render_help(topic: HelpTopic) -> String {
-    let mut root = ReplCli::command().color(ColorChoice::Always);
-    let mut output = match topic {
-        HelpTopic::Overview => root.render_long_help().ansi().to_string(),
-        HelpTopic::Stats => root
-            .find_subcommand_mut("stats")
-            .expect("stats help command must exist")
-            .render_long_help()
-            .ansi()
-            .to_string(),
-        HelpTopic::Tracing => root
-            .find_subcommand_mut("tracing")
-            .expect("tracing help command must exist")
-            .render_long_help()
-            .ansi()
-            .to_string(),
-        HelpTopic::Rpc => root
-            .find_subcommand_mut("rpc")
-            .expect("rpc help command must exist")
-            .render_long_help()
-            .ansi()
-            .to_string(),
-    };
-
-    let appendix = match topic {
-        HelpTopic::Overview => include_str!("help_overview.txt"),
-        HelpTopic::Stats => include_str!("help_stats.txt"),
-        HelpTopic::Tracing => include_str!("help_tracing.txt"),
-        HelpTopic::Rpc => include_str!("help_rpc.txt"),
-    };
-
-    if !appendix.trim().is_empty() {
-        output.push('\n');
-        output.push_str(appendix);
-        if !output.ends_with('\n') {
-            output.push('\n');
-        }
-    }
-
-    output
+    help::render(topic)
 }
 
 impl CliCommand {

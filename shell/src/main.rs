@@ -1,5 +1,6 @@
 mod edit_tui;
 mod filesystem;
+mod help;
 mod programs;
 mod ready;
 mod repl;
