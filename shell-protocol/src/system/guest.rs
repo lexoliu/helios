@@ -48,7 +48,21 @@ where
             .await
             .context("failed to accept debugger request stream")?;
         let payload = read_root_payload(&mut read, invocation).await?;
-        let response = dispatch(&instance, &func, &payload).await?;
+        let response = match dispatch(&instance, &func, &payload).await {
+            Ok(response) => response,
+            Err(error) => {
+                write_frame(
+                    &mut write,
+                    &Frame::Reject {
+                        invocation,
+                        message: format!("{error:#}"),
+                    },
+                )
+                .await
+                .context("failed to report debugger request failure")?;
+                continue;
+            }
+        };
         write_frame(
             &mut write,
             &Frame::Data {

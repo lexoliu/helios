@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::task::{Context, Poll};
 
@@ -24,6 +24,7 @@ const RAW_UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
 struct InboundBuffers {
     chunks: HashMap<Vec<usize>, VecDeque<Bytes>>,
     closed: HashSet<Vec<usize>>,
+    error: Option<String>,
 }
 
 enum InvocationOwner<R, W> {
@@ -35,6 +36,7 @@ struct Invocation<R, W> {
     id: u32,
     owner: InvocationOwner<R, W>,
     inbound: StdMutex<InboundBuffers>,
+    accepted: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -313,6 +315,7 @@ impl<R, W> Invocation<R, W> {
             id,
             owner: InvocationOwner::Client(Arc::downgrade(inner)),
             inbound: StdMutex::new(InboundBuffers::default()),
+            accepted: AtomicBool::new(false),
         });
         register_invocation(&inner.active, &invocation);
         invocation
@@ -323,6 +326,7 @@ impl<R, W> Invocation<R, W> {
             id,
             owner: InvocationOwner::Server(Arc::downgrade(inner)),
             inbound: StdMutex::new(InboundBuffers::default()),
+            accepted: AtomicBool::new(true),
         });
         register_invocation(&inner.active, &invocation);
         invocation
@@ -373,6 +377,30 @@ impl<R, W> Invocation<R, W> {
             .closed
             .contains(path)
     }
+
+    fn mark_accepted(&self) {
+        self.accepted.store(true, Ordering::Release);
+    }
+
+    fn is_accepted(&self) -> bool {
+        self.accepted.load(Ordering::Acquire)
+    }
+
+    fn set_error(&self, message: String) {
+        let mut inbound = self
+            .inbound
+            .lock()
+            .unwrap_or_else(|_| panic!("invocation inbound buffer mutex poisoned"));
+        inbound.error = Some(message);
+    }
+
+    fn error_message(&self) -> Option<String> {
+        self.inbound
+            .lock()
+            .unwrap_or_else(|_| panic!("invocation inbound buffer mutex poisoned"))
+            .error
+            .clone()
+    }
 }
 
 impl<R, W> Drop for Invocation<R, W> {
@@ -407,6 +435,9 @@ where
         loop {
             if self.has_payload(&path) || self.is_closed(&path) {
                 return Ok(());
+            }
+            if let Some(message) = self.error_message() {
+                return Err(io::Error::other(message));
             }
 
             match &self.owner {
@@ -543,6 +574,9 @@ where
 
             if self.invocation.is_closed(self.path.as_ref()) {
                 return Poll::Ready(Ok(()));
+            }
+            if let Some(message) = self.invocation.error_message() {
+                return Poll::Ready(Err(io::Error::other(message)));
             }
 
             {
@@ -767,20 +801,48 @@ fn dispatch_close<R, W>(
     invocation: u32,
     path: Vec<usize>,
 ) {
-    let target = {
-        let mut active = active
-            .lock()
-            .unwrap_or_else(|_| panic!("active invocation table mutex poisoned"));
-        match active.get(&invocation).and_then(Weak::upgrade) {
-            Some(target) => Some(target),
-            None => {
-                active.remove(&invocation);
-                None
-            }
-        }
-    };
+    let target = resolve_invocation(active, invocation);
     if let Some(target) = target {
         target.mark_closed(path);
+    }
+}
+
+fn mark_invocation_accepted<R, W>(
+    active: &StdMutex<HashMap<u32, Weak<Invocation<R, W>>>>,
+    invocation: u32,
+) {
+    if let Some(target) = resolve_invocation(active, invocation) {
+        target.mark_accepted();
+    }
+}
+
+fn dispatch_reject<R, W>(
+    active: &StdMutex<HashMap<u32, Weak<Invocation<R, W>>>>,
+    invocation: u32,
+    message: String,
+) -> bool {
+    match resolve_invocation(active, invocation) {
+        Some(target) if target.is_accepted() => {
+            target.set_error(message);
+            true
+        }
+        Some(_) | None => false,
+    }
+}
+
+fn resolve_invocation<R, W>(
+    active: &StdMutex<HashMap<u32, Weak<Invocation<R, W>>>>,
+    invocation: u32,
+) -> Option<Arc<Invocation<R, W>>> {
+    let mut active = active
+        .lock()
+        .unwrap_or_else(|_| panic!("active invocation table mutex poisoned"));
+    match active.get(&invocation).and_then(Weak::upgrade) {
+        Some(target) => Some(target),
+        None => {
+            active.remove(&invocation);
+            None
+        }
     }
 }
 
@@ -827,6 +889,7 @@ where
 
     match frame {
         Frame::Accept { invocation } => {
+            mark_invocation_accepted(&client.active, invocation);
             client
                 .replies
                 .lock()
@@ -837,11 +900,13 @@ where
             invocation,
             message,
         } => {
-            client
-                .replies
-                .lock()
-                .unwrap_or_else(|_| panic!("client reply table mutex poisoned"))
-                .insert(invocation, Reply::Reject(message));
+            if !dispatch_reject(&client.active, invocation, message.clone()) {
+                client
+                    .replies
+                    .lock()
+                    .unwrap_or_else(|_| panic!("client reply table mutex poisoned"))
+                    .insert(invocation, Reply::Reject(message));
+            }
         }
         Frame::Data {
             invocation,
@@ -1224,6 +1289,63 @@ mod tests {
                 ping_task
                     .await
                     .unwrap_or_else(|error| panic!("ping task panicked: {error}"));
+            });
+    }
+
+    #[test]
+    fn accepted_invocation_can_fail_without_tearing_down_transport() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap_or_else(|error| panic!("failed to build test runtime: {error}"))
+            .block_on(async {
+                let (host, peer) = tokio::io::duplex(4096);
+                let (host_read, host_write) = tokio::io::split(host);
+                let server = Server::new(host_read.compat(), host_write.compat_write());
+                let (peer_read, peer_write) = tokio::io::split(peer);
+                let client = Client::new(peer_read.compat(), peer_write.compat_write());
+
+                let mut calls = server
+                    .serve("transport:test", "fail", [])
+                    .await
+                    .unwrap_or_else(|error| panic!("failed to register fail handler: {error}"));
+                let server_task = tokio::spawn(async move {
+                    let (_, _outgoing, mut incoming) = calls
+                        .next()
+                        .await
+                        .unwrap_or_else(|| panic!("fail invocation stream ended early"))
+                        .unwrap_or_else(|error| panic!("failed to accept fail invocation: {error}"));
+                    let mut request = Vec::new();
+                    incoming
+                        .read_to_end(&mut request)
+                        .await
+                        .unwrap_or_else(|error| panic!("failed to read fail request: {error}"));
+                    assert_eq!(request, b"request");
+
+                    let mut io = server.inner.write.lock().await;
+                    super::write_frame(
+                        &mut *io,
+                        &super::Frame::Reject {
+                            invocation: 1,
+                            message: "remote failure".to_owned(),
+                        },
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("failed to write reject frame: {error}"));
+                });
+
+                let error = client
+                    .invoke_raw("transport:test", "fail", b"request".to_vec())
+                    .await
+                    .expect_err("accepted invocation must surface remote failure");
+                assert!(
+                    format!("{error:#}").contains("remote failure"),
+                    "unexpected error: {error:#}"
+                );
+
+                server_task
+                    .await
+                    .unwrap_or_else(|error| panic!("fail server task panicked: {error}"));
             });
     }
 
