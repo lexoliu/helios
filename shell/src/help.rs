@@ -83,10 +83,12 @@ impl Section {
 
 const OVERVIEW_EXAMPLES: &[&str] = &[
     "pwd",
-    "ls /boot",
+    "ls /bin",
     "echo hello > /tmp/note.txt",
     "cat /tmp/note.txt",
-    "run ./target/wasm32-wasip2/debug/helios_ping.wasm google.com",
+    "cp /tmp/note.txt /tmp/note.bak",
+    "mv /tmp/note.bak /tmp/renamed.txt",
+    "run ping google.com",
     "if test -e /tmp/note.txt",
     "    cat /tmp/note.txt",
     "  else",

@@ -1,5 +1,7 @@
 extern crate alloc;
 
+use alloc::borrow::ToOwned;
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -8,6 +10,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use futures::channel::oneshot;
+use helios_kernel::{EmbeddedBootFile, EmbeddedBootFs, embedded_init};
 use wasmtime::Result;
 use wasmtime::component::{
     Access, Accessor, FutureReader, HasSelf, Linker, Resource, ResourceTableError, Source,
@@ -99,6 +102,7 @@ struct FsNode {
     contents: Vec<u8>,
     inode: u64,
     modified_nanos: u64,
+    readonly: bool,
 }
 
 #[derive(Clone)]
@@ -320,16 +324,95 @@ impl<T: 'static> StreamConsumer<T> for FileWriteConsumer<T> {
 
 impl DebugFileSystem {
     pub(crate) fn new() -> Self {
-        Self {
+        let mut filesystem = Self {
             nodes: vec![FsNode {
                 path: String::from("/"),
                 kind: FsNodeKind::Directory,
                 contents: Vec::new(),
                 inode: 1,
                 modified_nanos: 0,
+                readonly: false,
             }],
             next_inode: 2,
+        };
+
+        if let Some(init) = embedded_init() {
+            filesystem.seed_bootfs(init.bootfs());
         }
+
+        filesystem
+    }
+
+    fn seed_bootfs(&mut self, image: EmbeddedBootFs) {
+        for file in image.files() {
+            self.insert_bootfs_file(file);
+        }
+    }
+
+    fn insert_bootfs_file(&mut self, file: &EmbeddedBootFile) {
+        let absolute = format!("/{}", file.path());
+        let mut current = String::from("/");
+
+        for segment in file.path().split('/').filter(|segment| !segment.is_empty()) {
+            let next = if current == "/" {
+                format!("/{segment}")
+            } else {
+                format!("{current}/{segment}")
+            };
+
+            if next == absolute {
+                break;
+            }
+
+            self.ensure_directory(&next, true);
+            current = next;
+        }
+
+        if self.get_node(&absolute).is_ok() {
+            return;
+        }
+
+        let inode = self.allocate_inode();
+        self.nodes.push(FsNode {
+            path: absolute,
+            kind: FsNodeKind::File,
+            contents: file.contents().to_vec(),
+            inode,
+            modified_nanos: 0,
+            readonly: true,
+        });
+    }
+
+    fn ensure_directory(&mut self, path: &str, readonly: bool) {
+        if path == "/" {
+            return;
+        }
+
+        if let Some(existing) = self.nodes.iter_mut().find(|node| node.path == path) {
+            assert!(
+                existing.kind == FsNodeKind::Directory,
+                "bootfs directory path {} collided with an existing file",
+                path
+            );
+            existing.readonly |= readonly;
+            return;
+        }
+
+        let inode = self.allocate_inode();
+        self.nodes.push(FsNode {
+            path: path.to_owned(),
+            kind: FsNodeKind::Directory,
+            contents: Vec::new(),
+            inode,
+            modified_nanos: 0,
+            readonly,
+        });
+    }
+
+    fn allocate_inode(&mut self) -> u64 {
+        let inode = self.next_inode;
+        self.next_inode += 1;
+        inode
     }
 
     fn root_descriptor(&self) -> FsDescriptor {
@@ -481,6 +564,9 @@ impl DebugFileSystem {
         if node.kind != FsNodeKind::File {
             return Err(fs_types::ErrorCode::IsDirectory);
         }
+        if node.readonly {
+            return Err(fs_types::ErrorCode::ReadOnly);
+        }
         if !descriptor.flags.contains(fs_types::DescriptorFlags::WRITE) {
             return Err(fs_types::ErrorCode::ReadOnly);
         }
@@ -537,9 +623,17 @@ impl DebugFileSystem {
             {
                 return Err(fs_types::ErrorCode::NotDirectory);
             }
+            if !open_flags.contains(fs_types::OpenFlags::DIRECTORY)
+                && existing.kind == FsNodeKind::Directory
+            {
+                return Err(fs_types::ErrorCode::IsDirectory);
+            }
             if open_flags.contains(fs_types::OpenFlags::TRUNCATE) {
                 if existing.kind != FsNodeKind::File {
                     return Err(fs_types::ErrorCode::IsDirectory);
+                }
+                if existing.readonly {
+                    return Err(fs_types::ErrorCode::ReadOnly);
                 }
                 if !base
                     .flags
@@ -563,6 +657,9 @@ impl DebugFileSystem {
         if open_flags.contains(fs_types::OpenFlags::DIRECTORY) {
             return Err(fs_types::ErrorCode::Unsupported);
         }
+        if self.get_node(&base.path)?.readonly {
+            return Err(fs_types::ErrorCode::ReadOnly);
+        }
         if !base
             .flags
             .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
@@ -576,14 +673,15 @@ impl DebugFileSystem {
             return Err(fs_types::ErrorCode::NotDirectory);
         }
 
+        let inode = self.allocate_inode();
         let node = FsNode {
             path: absolute.clone(),
             kind: FsNodeKind::File,
             contents: Vec::new(),
-            inode: self.next_inode,
+            inode,
             modified_nanos: now_nanos,
+            readonly: false,
         };
-        self.next_inode += 1;
         self.nodes.push(node);
         Ok(FsDescriptor {
             path: absolute,
@@ -608,6 +706,9 @@ impl DebugFileSystem {
             return Err(fs_types::ErrorCode::NotPermitted);
         }
         let node = self.get_node(&absolute)?;
+        if node.readonly {
+            return Err(fs_types::ErrorCode::ReadOnly);
+        }
         if node.kind != FsNodeKind::Directory {
             return Err(fs_types::ErrorCode::NotDirectory);
         }
@@ -638,6 +739,9 @@ impl DebugFileSystem {
         if base.kind != FsNodeKind::Directory {
             return Err(fs_types::ErrorCode::NotDirectory);
         }
+        if self.get_node(&base.path)?.readonly {
+            return Err(fs_types::ErrorCode::ReadOnly);
+        }
 
         let absolute = resolve_child_path(&base.path, path)?;
         if absolute == "/" {
@@ -653,14 +757,15 @@ impl DebugFileSystem {
             return Err(fs_types::ErrorCode::NotDirectory);
         }
 
+        let inode = self.allocate_inode();
         self.nodes.push(FsNode {
             path: absolute,
             kind: FsNodeKind::Directory,
             contents: Vec::new(),
-            inode: self.next_inode,
+            inode,
             modified_nanos: now_nanos,
+            readonly: false,
         });
-        self.next_inode += 1;
         Ok(())
     }
 
@@ -677,10 +782,97 @@ impl DebugFileSystem {
         }
         let absolute = resolve_child_path(&base.path, path)?;
         let node = self.get_node(&absolute)?;
+        if node.readonly {
+            return Err(fs_types::ErrorCode::ReadOnly);
+        }
         if node.kind != FsNodeKind::File {
             return Err(fs_types::ErrorCode::IsDirectory);
         }
         self.nodes.retain(|node| node.path != absolute);
+        Ok(())
+    }
+
+    fn rename_at(
+        &mut self,
+        source_base: &FsDescriptor,
+        source_path: &str,
+        destination_base: &FsDescriptor,
+        destination_path: &str,
+        now_nanos: u64,
+    ) -> core::result::Result<(), fs_types::ErrorCode> {
+        if source_base.kind != FsNodeKind::Directory || destination_base.kind != FsNodeKind::Directory
+        {
+            return Err(fs_types::ErrorCode::NotDirectory);
+        }
+        if !source_base
+            .flags
+            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
+            || !destination_base
+                .flags
+                .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
+        {
+            return Err(fs_types::ErrorCode::ReadOnly);
+        }
+        if self.get_node(&source_base.path)?.readonly || self.get_node(&destination_base.path)?.readonly
+        {
+            return Err(fs_types::ErrorCode::ReadOnly);
+        }
+
+        let source_absolute = resolve_child_path(&source_base.path, source_path)?;
+        let destination_absolute = resolve_child_path(&destination_base.path, destination_path)?;
+        if source_absolute == "/" || destination_absolute == "/" {
+            return Err(fs_types::ErrorCode::NotPermitted);
+        }
+        if source_absolute == destination_absolute {
+            return Ok(());
+        }
+
+        let source_node = self.get_node(&source_absolute)?.clone();
+        if source_node.readonly {
+            return Err(fs_types::ErrorCode::ReadOnly);
+        }
+        if self.get_node(&destination_absolute).is_ok() {
+            return Err(fs_types::ErrorCode::Exist);
+        }
+
+        let destination_parent = parent_path(&destination_absolute);
+        let destination_parent_node = self.get_node(destination_parent)?;
+        if destination_parent_node.kind != FsNodeKind::Directory {
+            return Err(fs_types::ErrorCode::NotDirectory);
+        }
+        if destination_parent_node.readonly {
+            return Err(fs_types::ErrorCode::ReadOnly);
+        }
+
+        if source_node.kind == FsNodeKind::Directory {
+            let source_prefix = directory_prefix(&source_absolute);
+            if destination_absolute == source_absolute
+                || destination_absolute.starts_with(&source_prefix)
+            {
+                return Err(fs_types::ErrorCode::NotPermitted);
+            }
+        }
+
+        let source_prefix = directory_prefix(&source_absolute);
+        for node in &mut self.nodes {
+            if node.path == source_absolute {
+                node.path = destination_absolute.clone();
+                node.modified_nanos = now_nanos;
+                continue;
+            }
+
+            if source_node.kind == FsNodeKind::Directory
+                && node.path.starts_with(&source_prefix)
+            {
+                node.path = format!(
+                    "{}{suffix}",
+                    destination_absolute,
+                    suffix = &node.path[source_absolute.len()..]
+                );
+                node.modified_nanos = now_nanos;
+            }
+        }
+
         Ok(())
     }
 }
@@ -1183,13 +1375,28 @@ impl wasi::filesystem::types::HostDescriptorWithStore for HasSelf<StoreData> {
     }
 
     async fn rename_at<T: Send>(
-        _: &Accessor<T, Self>,
-        _: Resource<FsDescriptor>,
-        _: String,
-        _: Resource<FsDescriptor>,
-        _: String,
+        accessor: &Accessor<T, Self>,
+        source_descriptor: Resource<FsDescriptor>,
+        source_path: String,
+        destination_descriptor: Resource<FsDescriptor>,
+        destination_path: String,
     ) -> Result<(), FsError> {
-        Err(fs_types::ErrorCode::Unsupported.into())
+        accessor.with(|mut access| {
+            let source_base = get_fs_descriptor(access.get(), &source_descriptor)?;
+            let destination_base = get_fs_descriptor(access.get(), &destination_descriptor)?;
+            let now_nanos = access.get().now_nanos();
+            access
+                .get()
+                .filesystem
+                .rename_at(
+                    &source_base,
+                    &source_path,
+                    &destination_base,
+                    &destination_path,
+                    now_nanos,
+                )
+                .map_err(Into::into)
+        })
     }
 
     async fn symlink_at<T: Send>(
@@ -1704,6 +1911,8 @@ fn is_dir_first(kind: fs_types::DescriptorType) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use helios_kernel::{EmbeddedBootFile, EmbeddedBootFs};
+
     use super::{DebugFileSystem, FsNodeKind, bindings};
 
     #[test]
@@ -1735,5 +1944,70 @@ mod tests {
             .create_directory_at(&root, "tmp", 2)
             .expect_err("creating the same directory twice must fail");
         assert_eq!(error, bindings::wasi::filesystem::types::ErrorCode::Exist);
+    }
+
+    #[test]
+    fn bootfs_seed_adds_readonly_programs() {
+        let mut filesystem = DebugFileSystem::new();
+        let bootfs = EmbeddedBootFs::new(&[EmbeddedBootFile::new("bin/ping", b"ping")]);
+        filesystem.seed_bootfs(bootfs);
+
+        let program = filesystem
+            .get_node("/bin/ping")
+            .expect("bootfs program must be present");
+        assert_eq!(program.kind, FsNodeKind::File);
+        assert!(program.readonly);
+
+        let directory = filesystem
+            .get_node("/bin")
+            .expect("bootfs program directory must be present");
+        assert_eq!(directory.kind, FsNodeKind::Directory);
+        assert!(directory.readonly);
+    }
+
+    #[test]
+    fn readonly_bootfs_file_rejects_writes() {
+        let mut filesystem = DebugFileSystem::new();
+        let bootfs = EmbeddedBootFs::new(&[EmbeddedBootFile::new("bin/ping", b"ping")]);
+        filesystem.seed_bootfs(bootfs);
+        let root = filesystem.root_descriptor();
+
+        let descriptor = filesystem
+            .open_at(
+                &root,
+                bindings::wasi::filesystem::types::PathFlags::empty(),
+                "bin/ping",
+                bindings::wasi::filesystem::types::OpenFlags::empty(),
+                bindings::wasi::filesystem::types::DescriptorFlags::WRITE,
+                0,
+            )
+            .expect("opening readonly bootfs file must succeed for lookup");
+
+        let error = filesystem
+            .write_at(&descriptor, 0, b"x", 1)
+            .expect_err("readonly bootfs file must reject writes");
+        assert_eq!(error, bindings::wasi::filesystem::types::ErrorCode::ReadOnly);
+    }
+
+    #[test]
+    fn opening_existing_directory_without_directory_flag_fails() {
+        let mut filesystem = DebugFileSystem::new();
+        let root = filesystem.root_descriptor();
+
+        filesystem
+            .create_directory_at(&root, "tmp", 1)
+            .expect("directory creation must succeed");
+
+        let error = filesystem
+            .open_at(
+                &root,
+                bindings::wasi::filesystem::types::PathFlags::empty(),
+                "tmp",
+                bindings::wasi::filesystem::types::OpenFlags::CREATE,
+                bindings::wasi::filesystem::types::DescriptorFlags::WRITE,
+                2,
+            )
+            .expect_err("opening an existing directory as a file must fail");
+        assert_eq!(error, bindings::wasi::filesystem::types::ErrorCode::IsDirectory);
     }
 }
