@@ -45,6 +45,18 @@ pub async fn remove(client: &mut RpcClient, path: &str) -> Result<()> {
     filesystem::remove(client, &path).await
 }
 
+pub async fn copy(client: &mut RpcClient, source: &str, destination: &str) -> Result<()> {
+    let source = normalize_path(source)?;
+    let destination = normalize_path(destination)?;
+    filesystem::copy(client, &source, &destination).await
+}
+
+pub async fn move_path(client: &mut RpcClient, source: &str, destination: &str) -> Result<()> {
+    let source = normalize_path(source)?;
+    let destination = normalize_path(destination)?;
+    filesystem::move_path(client, &source, &destination).await
+}
+
 pub async fn touch(client: &mut RpcClient, path: &str) -> Result<()> {
     let path = normalize_path(path)?;
     filesystem::touch(client, &path).await

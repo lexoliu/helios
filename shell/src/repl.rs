@@ -108,7 +108,7 @@ const PROMPT: &str = "helios> ";
 const CONTINUATION_PROMPT: &str = "....> ";
 const LIVE_STATS_PERIOD_MS: u64 = 1_000;
 const ROOT_CANDIDATES: &[&str] = &[
-    "help", "clear", "exit", "pwd", "ls", "cat", "edit", "mkdir", "rm", "touch", "echo", "test",
+    "help", "clear", "exit", "pwd", "ls", "cat", "edit", "mkdir", "rm", "cp", "mv", "touch", "echo", "test",
     "source", "stats", "run", "tracing", "rpc", "if", "else", "end", "--help",
 ];
 const HELP_CANDIDATES: &[&str] = &["overview", "stats", "tracing", "rpc", "--help"];
@@ -194,6 +194,10 @@ enum CliCommand {
     Mkdir { path: String },
     /// Remove a file or an empty directory from the remote debugger filesystem.
     Rm { path: String },
+    /// Copy a remote file inside the debugger filesystem.
+    Cp { source: String, destination: String },
+    /// Move or rename a remote path inside the debugger filesystem.
+    Mv { source: String, destination: String },
     /// Create a file if it does not exist in the remote debugger filesystem.
     Touch { path: String },
     /// Print text or write it into a remote file with `>` or `>>`.
@@ -201,7 +205,7 @@ enum CliCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         words: Vec<String>,
     },
-    /// Launch a host-local wasm file inside Helios with the default minimal rights set.
+    /// Launch a wasm guest program from the remote filesystem with the default minimal rights set.
     Run {
         path: String,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -278,6 +282,8 @@ enum Command {
     Source(String),
     Mkdir(String),
     Remove(String),
+    Copy { source: String, destination: String },
+    Move { source: String, destination: String },
     Touch(String),
     Echo(filesystem::EchoTarget),
     Run { path: String, args: Vec<String> },
@@ -294,6 +300,11 @@ enum Command {
 
 enum ParsedLine {
     Program(Vec<Statement>),
+    Output(String),
+}
+
+enum ParsedCommandLine {
+    Command(Command),
     Output(String),
 }
 
@@ -404,10 +415,16 @@ impl<T: TerminalIo> Shell<T> {
         statement: &Statement,
     ) -> Result<CommandStatus> {
         match statement {
-            Statement::Command(line) => {
-                let command = parse_command_line(line)?;
-                self.execute_command(client, command).await
-            }
+            Statement::Command(line) => match parse_command_line(line)? {
+                ParsedCommandLine::Command(command) => self.execute_command(client, command).await,
+                ParsedCommandLine::Output(output) => {
+                    self.print_block(&output)?;
+                    Ok(CommandStatus {
+                        should_exit: false,
+                        success: true,
+                    })
+                }
+            },
             Statement::If {
                 condition,
                 then_branch,
@@ -466,6 +483,12 @@ impl<T: TerminalIo> Shell<T> {
             }
             Command::Mkdir(path) => filesystem::mkdir(client, &path).await?,
             Command::Remove(path) => filesystem::remove(client, &path).await?,
+            Command::Copy { source, destination } => {
+                filesystem::copy(client, &source, &destination).await?
+            }
+            Command::Move { source, destination } => {
+                filesystem::move_path(client, &source, &destination).await?
+            }
             Command::Touch(path) => filesystem::touch(client, &path).await?,
             Command::Echo(target) => match target {
                 filesystem::EchoTarget::Stdout(bytes) => self.write_bytes(&bytes)?,
@@ -751,7 +774,7 @@ fn validate_statement(statement: Statement) -> Result<Statement> {
     }
 }
 
-fn parse_command_line(input: &str) -> Result<Command> {
+fn parse_command_line(input: &str) -> Result<ParsedCommandLine> {
     let tokens = match shell_words::split(input) {
         Ok(tokens) => tokens,
         Err(error) => {
@@ -760,7 +783,10 @@ fn parse_command_line(input: &str) -> Result<Command> {
     };
 
     match ReplCli::try_parse_from(tokens.iter().map(String::as_str)) {
-        Ok(cli) => cli.command.into_runtime_command(),
+        Ok(cli) => Ok(ParsedCommandLine::Command(cli.command.into_runtime_command()?)),
+        Err(error) if error.kind() == ErrorKind::DisplayHelp => {
+            Ok(ParsedCommandLine::Output(error.render().ansi().to_string()))
+        }
         Err(error) => anyhow::bail!(render_clap_error(error, &tokens)),
     }
 }
@@ -910,6 +936,8 @@ impl CliCommand {
             Self::Source { path } => Command::Source(path),
             Self::Mkdir { path } => Command::Mkdir(path),
             Self::Rm { path } => Command::Remove(path),
+            Self::Cp { source, destination } => Command::Copy { source, destination },
+            Self::Mv { source, destination } => Command::Move { source, destination },
             Self::Touch { path } => Command::Touch(path),
             Self::Echo { words } => Command::Echo(filesystem::parse_echo(&words)?),
             Self::Run { path, args } => Command::Run { path, args },
@@ -1008,12 +1036,14 @@ fn completion_display(tokens: &[&str], candidate: &str) -> String {
         (_, "edit") => "open the full-screen editor",
         (_, "mkdir") => "create a remote directory",
         (_, "rm") => "remove a remote path",
+        (_, "cp") => "copy a remote file",
+        (_, "mv") => "move or rename a remote path",
         (_, "touch") => "create an empty remote file",
         (_, "echo") => "print or redirect text",
         (_, "test") => "evaluate a filesystem predicate",
         (_, "source") => "run a host-local shell script",
         (Some("help"), "stats") => "help for the stats view",
-        (_, "run") => "launch a wasm guest program",
+        (_, "run") => "launch a guest program from the remote filesystem",
         (Some("help"), "tracing") => "help for tracing controls",
         (Some("help"), "rpc") => "help for raw RPC calls",
         (_, "stats") => "open the live stats view",
@@ -1108,7 +1138,7 @@ fn highlight_argument_token(command: &str, token: &str) -> String {
 
     if matches!(
         command,
-        "ls" | "cat" | "edit" | "mkdir" | "rm" | "touch" | "test"
+        "ls" | "cat" | "edit" | "mkdir" | "rm" | "cp" | "mv" | "touch" | "test"
     ) {
         let style = match filesystem::normalize_path(token) {
             Ok(_) => AnsiStyle::new().fg(Color::Cyan).underline(),
@@ -1161,8 +1191,14 @@ mod tests {
     fn single_command(input: &str) -> Command {
         match parse_input(input) {
             ParsedLine::Program(program) => match program.as_slice() {
-                [Statement::Command(line)] => super::parse_command_line(line)
-                    .expect("single command program must parse successfully"),
+                [Statement::Command(line)] => match super::parse_command_line(line)
+                    .expect("single command program must parse successfully")
+                {
+                    super::ParsedCommandLine::Command(command) => command,
+                    super::ParsedCommandLine::Output(output) => {
+                        panic!("expected command parse, got output: {output}")
+                    }
+                },
                 _ => panic!("expected a single command statement"),
             },
             ParsedLine::Output(output) => panic!("unexpected parse output: {output}"),
@@ -1214,6 +1250,28 @@ mod tests {
         match single_command("rm /tmp/file") {
             Command::Remove(path) => assert_eq!(path, "/tmp/file"),
             _ => panic!("rm command must parse"),
+        }
+    }
+
+    #[test]
+    fn parses_cp_command() {
+        match single_command("cp /tmp/from /tmp/to") {
+            Command::Copy { source, destination } => {
+                assert_eq!(source, "/tmp/from");
+                assert_eq!(destination, "/tmp/to");
+            }
+            _ => panic!("cp command must parse"),
+        }
+    }
+
+    #[test]
+    fn parses_mv_command() {
+        match single_command("mv /tmp/from /tmp/to") {
+            Command::Move { source, destination } => {
+                assert_eq!(source, "/tmp/from");
+                assert_eq!(destination, "/tmp/to");
+            }
+            _ => panic!("mv command must parse"),
         }
     }
 
@@ -1306,9 +1364,16 @@ mod tests {
 
     #[test]
     fn clap_supports_help_flag() {
-        match parse_input("stats --help") {
-            ParsedLine::Output(text) => assert!(text.contains("live stats view")),
-            _ => panic!("stats --help must print help text"),
+        match super::parse_command_line("stats --help")
+            .expect("stats --help must parse successfully")
+        {
+            super::ParsedCommandLine::Output(text) => {
+                assert!(text.contains("Open the live stats view"));
+                assert!(!text.starts_with("error:"));
+            }
+            super::ParsedCommandLine::Command(_) => {
+                panic!("stats --help must render help output")
+            }
         }
     }
 

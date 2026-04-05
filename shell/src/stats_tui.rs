@@ -126,7 +126,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         .constraints([
             Constraint::Length(5),
             Constraint::Min(14),
-            Constraint::Length(3),
+            Constraint::Length(1),
         ])
         .split(frame.area());
 
@@ -164,12 +164,9 @@ fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Samp
     render_card(
         frame,
         cards[1],
-        "Processors",
-        &format!(
-            "{}/{} online",
-            sample.processors.online, sample.processors.configured
-        ),
-        None,
+        "Cores",
+        &core_count_value(sample),
+        core_count_detail(sample).as_deref(),
         Color::Green,
     );
     render_card(
@@ -226,16 +223,7 @@ fn draw_empty(frame: &mut ratatui::Frame<'_>, top: Rect, body: Rect, app: &App) 
 
 fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let status = Paragraph::new(Text::from(app.status.clone()))
-        .block(
-            Block::default()
-                .title("Controls")
-                .borders(Borders::ALL)
-                .border_style(
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-        )
+        .style(Style::default().fg(Color::DarkGray))
         .wrap(Wrap { trim: true });
     frame.render_widget(status, area);
 }
@@ -547,6 +535,15 @@ fn busiest_core_text(sample: &stats::Sample) -> String {
         .max_by_key(|processor| processor.busy)
         .map(|processor| format!("cpu{}", processor.id))
         .unwrap_or_else(|| "n/a".to_owned())
+}
+
+fn core_count_value(sample: &stats::Sample) -> String {
+    sample.processors.configured.to_string()
+}
+
+fn core_count_detail(sample: &stats::Sample) -> Option<String> {
+    (sample.processors.online != sample.processors.configured)
+        .then(|| format!("{} online", sample.processors.online))
 }
 
 fn cpu_color(busy: u16) -> Color {

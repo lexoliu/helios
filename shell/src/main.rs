@@ -47,6 +47,10 @@ enum Command {
     Mkdir { path: String },
     /// Remove a file or an empty directory from the remote debugger filesystem.
     Rm { path: String },
+    /// Copy a remote file inside the debugger filesystem.
+    Cp { source: String, destination: String },
+    /// Move or rename a remote path inside the debugger filesystem.
+    Mv { source: String, destination: String },
     /// Create a file if it does not exist in the remote debugger filesystem.
     Touch { path: String },
     /// Print text or write it into a remote file with `>` or `>>`.
@@ -54,7 +58,7 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         words: Vec<String>,
     },
-    /// Launch a host-local wasm file inside Helios with the default minimal rights set.
+    /// Launch a wasm guest program from the remote filesystem with the default minimal rights set.
     Run {
         path: String,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -126,6 +130,14 @@ fn main() -> Result<()> {
         Some(Command::Rm { path }) => run_interruptible(async move {
             let mut client = client;
             filesystem::remove(&mut client, &path).await
+        }),
+        Some(Command::Cp { source, destination }) => run_interruptible(async move {
+            let mut client = client;
+            filesystem::copy(&mut client, &source, &destination).await
+        }),
+        Some(Command::Mv { source, destination }) => run_interruptible(async move {
+            let mut client = client;
+            filesystem::move_path(&mut client, &source, &destination).await
         }),
         Some(Command::Touch { path }) => run_interruptible(async move {
             let mut client = client;

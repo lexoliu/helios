@@ -46,6 +46,12 @@ pub(crate) struct WriteRequest {
     append: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PathPairRequest {
+    source: String,
+    destination: String,
+}
+
 impl PathRequest {
     #[cfg(feature = "host")]
     pub(crate) fn new(path: &str) -> Self {
@@ -67,6 +73,16 @@ impl WriteRequest {
             path: path.to_owned(),
             bytes: bytes.to_vec(),
             append,
+        }
+    }
+}
+
+impl PathPairRequest {
+    #[cfg(feature = "host")]
+    pub(crate) fn new(source: &str, destination: &str) -> Self {
+        Self {
+            source: source.to_owned(),
+            destination: destination.to_owned(),
         }
     }
 }
@@ -170,6 +186,42 @@ where
         .context("failed to decode debugger filesystem.write response")
 }
 
+#[cfg(feature = "host")]
+pub async fn copy<R, W>(client: &Client<R, W>, source: &str, destination: &str) -> Result<()>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    let request = postcard::to_allocvec(&PathPairRequest::new(source, destination))
+        .context("failed to encode debugger filesystem.copy request")?;
+    let bytes = client
+        .invoke_raw(FILESYSTEM_INSTANCE, "copy", request)
+        .await
+        .context("failed to invoke debugger filesystem.copy")?;
+    postcard::from_bytes::<()>(&bytes)
+        .context("failed to decode debugger filesystem.copy response")
+}
+
+#[cfg(feature = "host")]
+pub async fn move_path<R, W>(
+    client: &Client<R, W>,
+    source: &str,
+    destination: &str,
+) -> Result<()>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    let request = postcard::to_allocvec(&PathPairRequest::new(source, destination))
+        .context("failed to encode debugger filesystem.move request")?;
+    let bytes = client
+        .invoke_raw(FILESYSTEM_INSTANCE, "move", request)
+        .await
+        .context("failed to invoke debugger filesystem.move")?;
+    postcard::from_bytes::<()>(&bytes)
+        .context("failed to decode debugger filesystem.move response")
+}
+
 #[cfg(feature = "guest")]
 pub(crate) fn supports(instance: &str, func: &str) -> bool {
     matches!(
@@ -180,6 +232,8 @@ pub(crate) fn supports(instance: &str, func: &str) -> bool {
             | (FILESYSTEM_INSTANCE, "create-directory")
             | (FILESYSTEM_INSTANCE, "touch")
             | (FILESYSTEM_INSTANCE, "write")
+            | (FILESYSTEM_INSTANCE, "copy")
+            | (FILESYSTEM_INSTANCE, "move")
     )
 }
 
@@ -221,6 +275,18 @@ pub(crate) async fn dispatch(func: &str, payload: &[u8]) -> Result<Vec<u8>> {
             postcard::to_allocvec(&())
                 .context("failed to encode debugger filesystem.write response")
         }
+        "copy" => {
+            let request = decode_path_pair_request(payload, "filesystem.copy")?;
+            copy_path(&request.source, &request.destination).await?;
+            postcard::to_allocvec(&())
+                .context("failed to encode debugger filesystem.copy response")
+        }
+        "move" => {
+            let request = decode_path_pair_request(payload, "filesystem.move")?;
+            move_path(&request.source, &request.destination).await?;
+            postcard::to_allocvec(&())
+                .context("failed to encode debugger filesystem.move response")
+        }
         _ => unreachable!("filesystem::supports must filter unsupported debugger methods"),
     }
 }
@@ -230,6 +296,12 @@ fn decode_path_request(payload: &[u8], operation: &str) -> Result<String> {
     let request = postcard::from_bytes::<PathRequest>(payload)
         .with_context(|| format!("failed to decode {operation} request payload"))?;
     Ok(request.into_path())
+}
+
+#[cfg(feature = "guest")]
+fn decode_path_pair_request(payload: &[u8], operation: &str) -> Result<PathPairRequest> {
+    postcard::from_bytes::<PathPairRequest>(payload)
+        .with_context(|| format!("failed to decode {operation} request payload"))
 }
 
 #[cfg(feature = "guest")]
@@ -362,6 +434,44 @@ async fn write_file(path: &str, bytes: &[u8], append: bool) -> Result<()> {
     .await;
     feed_result?;
     write_result
+}
+
+#[cfg(feature = "guest")]
+async fn copy_path(source: &str, destination: &str) -> Result<()> {
+    if source == destination {
+        bail!("debugger filesystem copy requires distinct source and destination paths");
+    }
+
+    let descriptor = open_path(source, DescriptorFlags::READ, OpenFlags::empty()).await?;
+    let descriptor_type = descriptor
+        .get_type()
+        .await
+        .map_err(|code| filesystem_error(source, "inspect", code))?;
+    if matches!(descriptor_type, DescriptorType::Directory) {
+        bail!("debugger filesystem copy does not support directories: {source}");
+    }
+
+    let (stream, result) = descriptor.read_via_stream(0);
+    let bytes = stream.collect().await;
+    result
+        .await
+        .map_err(|code| filesystem_error(source, "read file", code))?;
+    write_file(destination, &bytes, false).await
+}
+
+#[cfg(feature = "guest")]
+async fn move_path(source: &str, destination: &str) -> Result<()> {
+    if source == destination {
+        bail!("debugger filesystem move requires distinct source and destination paths");
+    }
+
+    let (source_parent, source_name) = open_parent_directory(source).await?;
+    let (destination_parent, destination_name) = open_parent_directory(destination).await?;
+    source_parent
+        .rename_at(source_name, &destination_parent, destination_name)
+        .await
+        .map_err(|code| filesystem_error(source, "move", code))?;
+    Ok(())
 }
 
 #[cfg(feature = "guest")]

@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use toml::Value;
 use walkdir::WalkDir;
 use wasmparser::Parser;
 use wit_component::ComponentEncoder;
@@ -52,7 +53,7 @@ fn generate_embedded_init(out_dir: &Path) -> String {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_else(|| panic!("{} has no valid UTF-8 file name", component_path.display()));
-    let bootfs = render_embedded_bootfs(&bootfs_root);
+    let bootfs = render_embedded_bootfs(&bootfs_root, &build_boot_program_assets(out_dir));
 
     format!(
         "pub const EMBEDDED_INIT: Option<EmbeddedInitDescriptor> = Some(EmbeddedInitDescriptor {{\n    component: EmbeddedComponent::new(\n        r#\"{name}\"#,\n        include_bytes!(r#\"{component}\"#),\n    ),\n    argv0: r#\"{argv0}\"#,\n    bootfs: {bootfs},\n}});\n",
@@ -61,6 +62,119 @@ fn generate_embedded_init(out_dir: &Path) -> String {
         argv0 = argv0,
         bootfs = bootfs,
     )
+}
+
+struct EmbeddedBootAsset {
+    path: String,
+    source: PathBuf,
+}
+
+struct ProgramManifest {
+    command: String,
+    manifest_path: PathBuf,
+    artifact_name: String,
+}
+
+fn build_boot_program_assets(out_dir: &Path) -> Vec<EmbeddedBootAsset> {
+    let programs_root = Path::new("../programs");
+    let mut manifests = fs::read_dir(programs_root)
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to read programs directory {}: {error}",
+                programs_root.display()
+            )
+        })
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .filter_map(|path| {
+            let command = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_else(|| {
+                    panic!("program directory {} has no valid UTF-8 name", path.display())
+                });
+            if matches!(command, "init" | "debugger") {
+                return None;
+            }
+            Some(read_program_manifest(command, &path.join("Cargo.toml")))
+        })
+        .collect::<Vec<_>>();
+    manifests.sort_by(|left, right| left.command.cmp(&right.command));
+
+    manifests
+        .into_iter()
+        .map(|manifest| build_boot_program_asset(out_dir, manifest))
+        .collect()
+}
+
+fn build_boot_program_asset(out_dir: &Path, manifest: ProgramManifest) -> EmbeddedBootAsset {
+    let core_module_path = build_wasip2_program(
+        out_dir,
+        &manifest.manifest_path,
+        &format!("helios-bootfs-{}-target", manifest.command),
+        &manifest.artifact_name,
+    );
+    let core_module_path = canonicalize_file(&core_module_path, "generated bootfs core module");
+    let component_path = out_dir.join(format!("{}_bootfs_component.wasm", manifest.command));
+    let component = encode_component(&core_module_path);
+    fs::write(&component_path, component).unwrap_or_else(|error| {
+        panic!(
+            "failed to write generated bootfs component {}: {error}",
+            component_path.display()
+        )
+    });
+
+    EmbeddedBootAsset {
+        path: format!("bin/{}", manifest.command),
+        source: canonicalize_file(&component_path, "generated bootfs component"),
+    }
+}
+
+fn read_program_manifest(command: &str, manifest_path: &Path) -> ProgramManifest {
+    assert!(
+        manifest_path.is_file(),
+        "default program crate manifest {} is missing",
+        manifest_path.display()
+    );
+    println!("cargo:rerun-if-changed={}", manifest_path.display());
+
+    let manifest = fs::read_to_string(manifest_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read program manifest {}: {error}",
+            manifest_path.display()
+        )
+    });
+    let manifest = manifest.parse::<Value>().unwrap_or_else(|error| {
+        panic!(
+            "failed to parse program manifest {}: {error}",
+            manifest_path.display()
+        )
+    });
+    let artifact_stem = manifest
+        .get("lib")
+        .and_then(|lib| lib.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            manifest
+                .get("package")
+                .and_then(|package| package.get("name"))
+                .and_then(Value::as_str)
+                .map(|name| name.replace('-', "_"))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "program manifest {} is missing package.name or lib.name",
+                manifest_path.display()
+            )
+        });
+
+    ProgramManifest {
+        command: command.to_owned(),
+        manifest_path: manifest_path.to_path_buf(),
+        artifact_name: format!("{artifact_stem}.wasm"),
+    }
 }
 
 fn generate_embedded_debugger(out_dir: &Path) -> String {
@@ -246,7 +360,7 @@ fn encode_component(path: &Path) -> Vec<u8> {
         .unwrap_or_else(|error| panic!("failed to encode component {}: {error}", path.display()))
 }
 
-fn render_embedded_bootfs(root: &Path) -> String {
+fn render_embedded_bootfs(root: &Path, extra_assets: &[EmbeddedBootAsset]) -> String {
     let mut entries = Vec::new();
 
     for entry in WalkDir::new(root).sort_by_file_name() {
@@ -279,6 +393,16 @@ fn render_embedded_bootfs(root: &Path) -> String {
             path = path.display(),
         ));
     }
+
+    for asset in extra_assets {
+        entries.push(format!(
+            "EmbeddedBootFile::new(r#\"{path}\"#, include_bytes!(r#\"{source}\"#))",
+            path = asset.path,
+            source = asset.source.display(),
+        ));
+    }
+
+    entries.sort();
 
     format!("EmbeddedBootFs::new(&[{}])", entries.join(", "))
 }
