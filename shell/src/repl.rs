@@ -21,6 +21,7 @@ use rustyline::validate::{
 use rustyline::{CompletionType, Config, Context as RustyContext, EditMode, Editor, Helper};
 use strsim::normalized_damerau_levenshtein;
 
+use crate::edit_tui;
 use crate::filesystem;
 use crate::programs;
 use crate::rpc::RpcPane;
@@ -73,8 +74,8 @@ pub fn run(mut client: RpcClient) -> Result<()> {
 const PROMPT: &str = "helios> ";
 const LIVE_STATS_PERIOD_MS: u64 = 1_000;
 const ROOT_CANDIDATES: &[&str] = &[
-    "help", "clear", "exit", "pwd", "ls", "cat", "mkdir", "rm", "touch", "echo", "stats", "run",
-    "tracing", "rpc", "--help",
+    "help", "clear", "exit", "pwd", "ls", "cat", "edit", "mkdir", "rm", "touch", "echo", "stats",
+    "run", "tracing", "rpc", "--help",
 ];
 const HELP_CANDIDATES: &[&str] = &["overview", "stats", "tracing", "rpc", "--help"];
 const STATS_CANDIDATES: &[&str] = &["--help"];
@@ -146,6 +147,8 @@ enum CliCommand {
     Ls { path: Option<String> },
     /// Print remote file contents.
     Cat { path: String },
+    /// Edit a remote text file inside a full-screen terminal editor.
+    Edit { path: String },
     /// Create a directory in the remote debugger filesystem.
     Mkdir { path: String },
     /// Remove a file or an empty directory from the remote debugger filesystem.
@@ -217,6 +220,7 @@ enum Command {
     Pwd,
     List(Option<String>),
     Cat(String),
+    Edit(String),
     Mkdir(String),
     Remove(String),
     Touch(String),
@@ -307,6 +311,7 @@ impl Shell {
                 let bytes = filesystem::cat(client, &path).await?;
                 self.write_bytes(&bytes)?;
             }
+            Command::Edit(path) => edit_tui::run(client, &path).await?,
             Command::Mkdir(path) => filesystem::mkdir(client, &path).await?,
             Command::Remove(path) => filesystem::remove(client, &path).await?,
             Command::Touch(path) => filesystem::touch(client, &path).await?,
@@ -658,6 +663,7 @@ impl CliCommand {
             Self::Pwd => Command::Pwd,
             Self::Ls { path } => Command::List(path),
             Self::Cat { path } => Command::Cat(path),
+            Self::Edit { path } => Command::Edit(path),
             Self::Mkdir { path } => Command::Mkdir(path),
             Self::Rm { path } => Command::Remove(path),
             Self::Touch { path } => Command::Touch(path),
@@ -757,6 +763,14 @@ mod tests {
         match parse_line("stats") {
             ParsedLine::Command(Command::ShowStats) => {}
             _ => panic!("stats command must parse"),
+        }
+    }
+
+    #[test]
+    fn parses_edit_command() {
+        match parse_line("edit /tmp/debug.txt") {
+            ParsedLine::Command(Command::Edit(path)) => assert_eq!(path, "/tmp/debug.txt"),
+            _ => panic!("edit command must parse"),
         }
     }
 
