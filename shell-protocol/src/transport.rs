@@ -18,6 +18,7 @@ use crate::wire::{Frame, read_frame, write_frame};
 
 type IoFuture<T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send + 'static>>;
 type ServeFuture = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
+const RAW_UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Default)]
 struct InboundBuffers {
@@ -131,9 +132,27 @@ where
         func: &str,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>> {
+        let chunk_bytes = payload.len().max(1);
+        self.invoke_raw_chunked(instance, func, payload, chunk_bytes)
+            .await
+    }
+
+    pub async fn invoke_raw_chunked(
+        &self,
+        instance: &str,
+        func: &str,
+        payload: Vec<u8>,
+        chunk_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        let chunk_bytes = chunk_bytes.max(1);
         let paths: [Box<[Option<usize>]>; 0] = [];
         let (mut outgoing, mut incoming) =
-            Invoke::invoke(self, (), instance, func, Bytes::from(payload), paths).await?;
+            Invoke::invoke(self, (), instance, func, Bytes::new(), paths).await?;
+        for chunk in payload.chunks(chunk_bytes) {
+            outgoing.write_all(chunk).await.with_context(|| {
+                format!("failed to stream raw request payload for {instance}.{func}")
+            })?;
+        }
         outgoing
             .shutdown()
             .await
@@ -144,6 +163,16 @@ where
             .await
             .context("failed to read raw response channel")?;
         Ok(response)
+    }
+
+    pub async fn invoke_raw_streaming(
+        &self,
+        instance: &str,
+        func: &str,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        self.invoke_raw_chunked(instance, func, payload, RAW_UPLOAD_CHUNK_BYTES)
+            .await
     }
 }
 

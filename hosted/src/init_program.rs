@@ -5,7 +5,7 @@ use std::time::Instant as StdInstant;
 
 use helios_kernel::{
     EmbeddedComponent, EmbeddedDebugger, EmbeddedInit, InstanceExecutionTransition,
-    InstanceRegistry, Kernel, RegisteredInstance, embedded_debugger, embedded_init,
+    InstanceRegistry, Kernel, ProgramService, RegisteredInstance, embedded_debugger, embedded_init,
 };
 use tempfile::TempDir;
 use thiserror::Error;
@@ -26,6 +26,7 @@ pub fn spawn_init(
     config: &HostedConfig,
     observer: SharedObserverBuffer,
     instance_registry: InstanceRegistry,
+    program_service: Option<ProgramService<HostedCpu>>,
     boot_started_at: StdInstant,
 ) {
     let init = embedded_init()
@@ -40,6 +41,7 @@ pub fn spawn_init(
                 config,
                 observer,
                 instance_registry,
+                program_service,
                 boot_started_at,
             )
         })
@@ -51,6 +53,7 @@ pub fn spawn_debugger(
     config: &HostedConfig,
     observer: SharedObserverBuffer,
     instance_registry: InstanceRegistry,
+    program_service: Option<ProgramService<HostedCpu>>,
     boot_started_at: StdInstant,
 ) {
     let debugger = embedded_debugger()
@@ -65,6 +68,7 @@ pub fn spawn_debugger(
                 config,
                 observer,
                 instance_registry,
+                program_service,
                 boot_started_at,
             )
         })
@@ -76,6 +80,7 @@ fn run_component_thread(
     config: HostedConfig,
     observer: SharedObserverBuffer,
     instance_registry: InstanceRegistry,
+    program_service: Option<ProgramService<HostedCpu>>,
     boot_started_at: StdInstant,
 ) {
     run_component_thread_with_serial(
@@ -83,6 +88,7 @@ fn run_component_thread(
         config,
         observer,
         instance_registry,
+        program_service,
         boot_started_at,
         Some(HostedSerialIo::new()),
     )
@@ -94,6 +100,7 @@ fn run_component_thread_with_serial(
     config: HostedConfig,
     observer: SharedObserverBuffer,
     instance_registry: InstanceRegistry,
+    program_service: Option<ProgramService<HostedCpu>>,
     boot_started_at: StdInstant,
     serial: Option<HostedSerialIo>,
 ) -> Result<(), HostedProgramError> {
@@ -107,6 +114,7 @@ fn run_component_thread_with_serial(
         &config,
         observer,
         instance_registry,
+        program_service,
         boot_started_at,
         serial,
     ))
@@ -117,6 +125,7 @@ async fn run_component_with_serial(
     config: &HostedConfig,
     observer: SharedObserverBuffer,
     instance_registry: InstanceRegistry,
+    program_service: Option<ProgramService<HostedCpu>>,
     boot_started_at: StdInstant,
     serial: Option<HostedSerialIo>,
 ) -> Result<(), HostedProgramError> {
@@ -153,6 +162,7 @@ async fn run_component_with_serial(
             boot_started_at,
             observer,
             instance_registry,
+            program_service,
             instance,
             mounted_bootfs,
         },
@@ -203,6 +213,10 @@ fn add_generated_bindings_to_linker(
 ) -> wasmtime::Result<()> {
     match program {
         EmbeddedHostedProgram::Init(_) => {
+            crate::program_bindings::bindings::helios::system::programs::add_to_linker::<
+                _,
+                HasSelf<_>,
+            >(linker, |state| state)?;
             crate::program_bindings::bindings::helios::system::serial::add_to_linker::<
                 _,
                 HasSelf<_>,
@@ -213,6 +227,10 @@ fn add_generated_bindings_to_linker(
             )?;
         }
         EmbeddedHostedProgram::Debugger(_) => {
+            crate::debugger_bindings::bindings::helios::system::programs::add_to_linker::<
+                _,
+                HasSelf<_>,
+            >(linker, |state| state)?;
             crate::debugger_bindings::bindings::helios::system::serial::add_to_linker::<
                 _,
                 HasSelf<_>,
@@ -307,6 +325,7 @@ pub(crate) struct StoreData {
     pub(crate) boot_started_at: StdInstant,
     pub(crate) observer: SharedObserverBuffer,
     pub(crate) instance_registry: InstanceRegistry,
+    pub(crate) program_service: Option<ProgramService<HostedCpu>>,
     pub(crate) instance: RegisteredInstance,
     mounted_bootfs: Option<MountedBootFs>,
 }
@@ -464,9 +483,15 @@ mod tests {
     use helios_kernel::{InstanceRegistry, embedded_debugger};
     use tokio::time::timeout;
     use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
+    use wasm_encoder::{
+        CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction, Module,
+        TypeSection,
+    };
 
     use super::{EmbeddedHostedProgram, HostedConfig, run_component_thread_with_serial};
     use crate::observer_buffer::ObserverBuffer;
+    use crate::program_host;
+    use crate::runtime::HostedMachine;
     use crate::serial_host::HostedSerialIo;
 
     fn format_serial_chunks(chunks: &[Vec<u8>]) -> String {
@@ -481,6 +506,32 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("|")
+    }
+
+    fn spin_start_module() -> Vec<u8> {
+        let mut types = TypeSection::new();
+        types.ty().function([], []);
+
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+
+        let mut exports = ExportSection::new();
+        exports.export("_start", ExportKind::Func, 0);
+
+        let mut code = CodeSection::new();
+        let mut function = Function::new([]);
+        function.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+        function.instruction(&Instruction::Br(0));
+        function.instruction(&Instruction::End);
+        function.instruction(&Instruction::End);
+        code.function(&function);
+
+        let mut module = Module::new();
+        module.section(&types);
+        module.section(&functions);
+        module.section(&exports);
+        module.section(&code);
+        module.finish()
     }
 
     #[test]
@@ -510,6 +561,7 @@ mod tests {
                         component_config,
                         component_observer,
                         instance_registry,
+                        None,
                         boot_started_at,
                         Some(serial),
                     );
@@ -657,6 +709,104 @@ mod tests {
                 component_result.unwrap_or_else(|error| {
                     panic!("hosted debugger thread returned an error after disconnect: {error}")
                 });
+            });
+    }
+
+    #[test]
+    fn embedded_debugger_launches_remote_programs() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap_or_else(|error| {
+                panic!("failed to build tokio runtime for hosted debugger launch test: {error}")
+            })
+            .block_on(async {
+                let debugger = embedded_debugger()
+                    .unwrap_or_else(|| panic!("embedded debugger component is missing"));
+                let config = HostedConfig::from_env();
+                let observer = ObserverBuffer::new(StdInstant::now());
+                let machine = HostedMachine::new(&config);
+                let program_service = program_host::create_program_service(
+                    &config,
+                    crate::cpu::HostedCpu::new(machine.bootstrap_processor(), machine.clone()),
+                    machine.instance_registry(),
+                );
+
+                let (serial, peer, _) = HostedSerialIo::traced_duplex_pair(4096);
+                let component_config = config.clone();
+                let component_observer = observer.clone();
+                let instance_registry = machine.instance_registry();
+                let boot_started_at = StdInstant::now();
+                let (result_tx, result_rx) = mpsc::sync_channel(1);
+                let component_thread = std::thread::spawn(move || {
+                    let result = run_component_thread_with_serial(
+                        EmbeddedHostedProgram::Debugger(debugger),
+                        component_config,
+                        component_observer,
+                        instance_registry,
+                        Some(program_service),
+                        boot_started_at,
+                        Some(serial),
+                    );
+                    result_tx.send(result).unwrap_or_else(|error| {
+                        panic!("failed to send debugger launch-test result: {error}")
+                    });
+                });
+
+                let (peer_read, peer_write) = tokio::io::split(peer);
+                let mut client = helios_shell_protocol::transport::Client::new(
+                    peer_read.compat(),
+                    peer_write.compat_write(),
+                );
+                tokio::task::yield_now().await;
+                std::thread::sleep(Duration::from_millis(100));
+
+                match result_rx.try_recv() {
+                    Ok(result) => {
+                        component_thread.join().unwrap_or_else(|_| {
+                            panic!("hosted debugger launch-test thread panicked unexpectedly")
+                        });
+                        panic!("debugger thread exited before launch test: {result:?}");
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        component_thread.join().unwrap_or_else(|_| {
+                            panic!("hosted debugger launch-test thread panicked unexpectedly")
+                        });
+                        panic!("debugger thread disconnected before launch test");
+                    }
+                }
+
+                let instance_id = timeout(
+                    Duration::from_secs(30),
+                    helios_shell_protocol::system::programs::launch(
+                        &mut client,
+                        &helios_shell_protocol::system::programs::LaunchRequest {
+                            name: "spin.wasm".to_owned(),
+                            wasm: spin_start_module(),
+                        },
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for remote programs.launch"))
+                .unwrap_or_else(|error| panic!("remote programs.launch failed: {error:#}"));
+
+                let instances = timeout(
+                    Duration::from_secs(30),
+                    helios_shell_protocol::system::instances::snapshot(&mut client),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for remote instances after launch"))
+                .unwrap_or_else(|error| {
+                    panic!("failed to fetch remote instances after launch: {error:#}")
+                });
+
+                assert!(
+                    instances.iter().any(|instance| {
+                        instance.id == instance_id && instance.name == "spin.wasm"
+                    }),
+                    "launched program did not appear in remote instances: {instances:?}"
+                );
             });
     }
 }

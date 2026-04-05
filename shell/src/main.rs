@@ -1,4 +1,5 @@
 mod filesystem;
+mod programs;
 mod ready;
 mod repl;
 mod rpc;
@@ -46,6 +47,12 @@ enum Command {
     Echo {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         words: Vec<String>,
+    },
+    /// Launch a host-local wasm file inside Helios with the default minimal rights set.
+    Run {
+        path: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     Stats {
         #[arg(long, default_value_t = 1_000)]
@@ -124,6 +131,17 @@ fn main() -> Result<()> {
                     append,
                 } => filesystem::write(&mut client, &path, &bytes, append).await?,
             }
+            Ok(())
+        }),
+        Some(Command::Run { path, args }) => run_interruptible(async move {
+            let mut client = client;
+            let started = programs::run(&mut client, &path, &args).await?;
+            writeln!(
+                std::io::stdout(),
+                "started instance {} {}",
+                started.instance_id,
+                started.name
+            )?;
             Ok(())
         }),
         Some(Command::Stats { period_ms }) => run_interruptible(async move {

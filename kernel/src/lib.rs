@@ -13,6 +13,7 @@ mod executor;
 mod instance;
 mod log;
 mod program;
+mod program_service;
 mod sync;
 mod task;
 mod timer;
@@ -33,8 +34,10 @@ pub use instance::{
 };
 pub use program::{
     Blueprint, CompileError as ProgramCompileError, ExitCode, ProgramRuntime, ProgramRuntimeConfig,
-    ProgramRuntimeError, ProgramRuntimeInitError, ResourceTable, RunError as ProgramRunError, Task,
+    ProgramRuntimeDriver, ProgramRuntimeError, ProgramRuntimeInitError, ResourceTable,
+    RunError as ProgramRunError, Task,
 };
+pub use program_service::{ProgramLaunchError, ProgramLaunchErrorKind, ProgramService};
 pub use sync::{
     Mutex, MutexGuard, Notified, Notify, OwnedRawMutexLease, OwnedRawRwLockReadLease,
     OwnedRawRwLockWriteLease, RawMutex, RawMutexLease, RawRwLock, RawRwLockReadLease,

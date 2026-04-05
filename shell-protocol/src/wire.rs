@@ -3,6 +3,9 @@ use std::pin::Pin;
 
 use futures_io::{AsyncRead, AsyncWrite};
 
+#[cfg(feature = "host")]
+use std::io::Write as _;
+
 pub(crate) const FRAME_MAGIC: [u8; 8] = [0xff, 0x00, b'H', b'R', b'P', b'C', 0xaa, 0x55];
 const MAX_FRAME_SIZE: usize = 1 << 20;
 
@@ -72,11 +75,19 @@ where
     T: AsyncRead + Unpin,
 {
     let mut matched = 0usize;
+    #[cfg(feature = "host")]
+    let mut stray = Vec::new();
     loop {
         let mut byte = [0_u8; 1];
         match std::future::poll_fn(|cx| Pin::new(&mut *io).poll_read(cx, &mut byte)).await {
-            Ok(0) if matched == 0 => return Ok(false),
+            Ok(0) if matched == 0 => {
+                #[cfg(feature = "host")]
+                flush_stray_bytes(&mut stray)?;
+                return Ok(false);
+            }
             Ok(0) => {
+                #[cfg(feature = "host")]
+                flush_stray_bytes(&mut stray)?;
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "truncated frame header",
@@ -89,13 +100,68 @@ where
         if byte[0] == FRAME_MAGIC[matched] {
             matched += 1;
             if matched == FRAME_MAGIC.len() {
+                #[cfg(feature = "host")]
+                flush_stray_bytes(&mut stray)?;
                 return Ok(true);
             }
         } else {
+            #[cfg(feature = "host")]
+            {
+                if matched != 0 {
+                    stray.extend_from_slice(&FRAME_MAGIC[..matched]);
+                }
+                stray.push(byte[0]);
+                flush_stray_bytes_on_newline(&mut stray)?;
+            }
             matched = usize::from(byte[0] == FRAME_MAGIC[0]);
         }
     }
 }
+
+#[cfg(feature = "host")]
+fn flush_stray_bytes_on_newline(stray: &mut Vec<u8>) -> io::Result<()> {
+    if stray
+        .last()
+        .is_some_and(|byte| matches!(*byte, b'\n' | b'\r'))
+    {
+        flush_stray_bytes(stray)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "host")]
+fn flush_stray_bytes(stray: &mut Vec<u8>) -> io::Result<()> {
+    if stray.is_empty() {
+        return Ok(());
+    }
+
+    let mut stderr = std::io::stderr().lock();
+    stderr.write_all(b"helios-shell: remote serial: ")?;
+    for &byte in stray.iter() {
+        match byte {
+            b'\n' => stderr.write_all(b"\\n")?,
+            b'\r' => stderr.write_all(b"\\r")?,
+            b'\t' => stderr.write_all(b"\\t")?,
+            0x20..=0x7e => stderr.write_all(&[byte])?,
+            other => {
+                let encoded = [
+                    b'\\',
+                    b'x',
+                    HEX[(other >> 4) as usize],
+                    HEX[(other & 0x0f) as usize],
+                ];
+                stderr.write_all(&encoded)?;
+            }
+        }
+    }
+    stderr.write_all(b"\n")?;
+    stderr.flush()?;
+    stray.clear();
+    Ok(())
+}
+
+#[cfg(feature = "host")]
+const HEX: &[u8; 16] = b"0123456789abcdef";
 
 async fn write_all<T>(io: &mut T, mut bytes: &[u8]) -> io::Result<()>
 where

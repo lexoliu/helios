@@ -2,11 +2,14 @@ use std::io;
 
 use anyhow::{Context as _, Result, bail};
 use futures_io::{AsyncRead, AsyncWrite};
-use helios_api::{instances as host_instances, stats as host_stats, tracing as host_tracing};
+use helios_api::{
+    instances as host_instances, programs as host_programs, stats as host_stats,
+    tracing as host_tracing,
+};
 
 use crate::wire::{Frame, read_frame, write_frame};
 
-use super::bindings::helios::system::{instances, stats, tracing};
+use super::bindings::helios::system::{instances, programs, stats, tracing};
 use crate::debugger::filesystem;
 
 pub async fn serve<R, W>(mut read: R, mut write: W) -> Result<()>
@@ -71,7 +74,8 @@ where
 fn supports_request(instance: &str, func: &str) -> bool {
     matches!(
         (instance, func),
-        ("helios:system/stats@0.1.0", "snapshot")
+        ("helios:system/programs@0.1.0", "launch")
+            | ("helios:system/stats@0.1.0", "snapshot")
             | ("helios:system/instances@0.1.0", "snapshot")
             | ("helios:system/tracing@0.1.0", "recent")
     ) || filesystem::supports(instance, func)
@@ -79,6 +83,20 @@ fn supports_request(instance: &str, func: &str) -> bool {
 
 async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>> {
     match (instance, func) {
+        ("helios:system/programs@0.1.0", "launch") => {
+            let request = postcard::from_bytes::<programs::LaunchRequest>(payload)
+                .context("failed to decode programs.launch request payload")?;
+            let response = host_programs::launch(&host_programs::LaunchRequest {
+                name: request.name,
+                args: request.args,
+                wasm: request.wasm,
+            });
+            let response = response.map_err(|error| programs::LaunchError {
+                kind: convert_launch_error_kind(error.kind),
+                detail: error.detail,
+            });
+            postcard::to_allocvec(&response).context("failed to encode programs.launch response")
+        }
         ("helios:system/stats@0.1.0", "snapshot") => {
             if !payload.is_empty() {
                 bail!("stats.snapshot does not accept request payload bytes");
@@ -107,6 +125,19 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>>
         }
         _ if filesystem::supports(instance, func) => filesystem::dispatch(func, payload).await,
         _ => unreachable!("supports_request must reject unsupported methods before dispatch"),
+    }
+}
+
+fn convert_launch_error_kind(kind: host_programs::LaunchErrorKind) -> programs::LaunchErrorKind {
+    match kind {
+        host_programs::LaunchErrorKind::InvalidBinary => programs::LaunchErrorKind::InvalidBinary,
+        host_programs::LaunchErrorKind::MissingEntry => programs::LaunchErrorKind::MissingEntry,
+        host_programs::LaunchErrorKind::UnsupportedImport => {
+            programs::LaunchErrorKind::UnsupportedImport
+        }
+        host_programs::LaunchErrorKind::QueueSaturated => programs::LaunchErrorKind::QueueSaturated,
+        host_programs::LaunchErrorKind::Unavailable => programs::LaunchErrorKind::Unavailable,
+        host_programs::LaunchErrorKind::Internal => programs::LaunchErrorKind::Internal,
     }
 }
 

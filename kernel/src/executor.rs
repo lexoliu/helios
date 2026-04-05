@@ -73,9 +73,7 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
             Err(PushError::Closed(_)) => panic!("executor ready queue was closed unexpectedly"),
         }
 
-        if self.cpu.current_processor() != self.owner_processor {
-            self.cpu.wake_processor(self.owner_processor);
-        }
+        self.cpu.wake_processor(self.owner_processor);
     }
 
     pub fn spawn<Fut>(&self, future: Fut) -> JoinHandle<Fut::Output>

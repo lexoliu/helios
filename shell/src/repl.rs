@@ -22,6 +22,7 @@ use rustyline::{CompletionType, Config, Context as RustyContext, EditMode, Edito
 use strsim::normalized_damerau_levenshtein;
 
 use crate::filesystem;
+use crate::programs;
 use crate::rpc::RpcPane;
 use crate::runtime;
 use crate::serial::RpcClient;
@@ -72,7 +73,7 @@ pub fn run(mut client: RpcClient) -> Result<()> {
 const PROMPT: &str = "helios> ";
 const LIVE_STATS_PERIOD_MS: u64 = 1_000;
 const ROOT_CANDIDATES: &[&str] = &[
-    "help", "clear", "exit", "pwd", "ls", "cat", "mkdir", "rm", "touch", "echo", "stats",
+    "help", "clear", "exit", "pwd", "ls", "cat", "mkdir", "rm", "touch", "echo", "stats", "run",
     "tracing", "rpc", "--help",
 ];
 const HELP_CANDIDATES: &[&str] = &["overview", "stats", "tracing", "rpc", "--help"];
@@ -81,12 +82,14 @@ const TRACING_CANDIDATES: &[&str] = &["limit", "level", "targets", "--help"];
 const TRACING_LEVEL_CANDIDATES: &[&str] = &["none", "error", "warn", "info", "debug", "trace"];
 const RPC_CANDIDATES: &[&str] = &["instance", "func", "payload", "call", "--help"];
 const RPC_INSTANCE_CANDIDATES: &[&str] = &[
+    "helios:system/programs@0.1.0",
     "helios:system/stats@0.1.0",
     "helios:system/tracing@0.1.0",
     "helios:system/serial@0.1.0",
     "helios:system/sync@0.1.0",
 ];
 const RPC_FUNC_CANDIDATES: &[&str] = &[
+    "launch",
     "snapshot",
     "recent",
     "debug-port",
@@ -154,6 +157,12 @@ enum CliCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         words: Vec<String>,
     },
+    /// Launch a host-local wasm file inside Helios with the default minimal rights set.
+    Run {
+        path: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Open the live stats view.
     Stats,
     /// Stream tracing events until interrupted or configure tracing filters.
@@ -212,6 +221,7 @@ enum Command {
     Remove(String),
     Touch(String),
     Echo(filesystem::EchoTarget),
+    Run { path: String, args: Vec<String> },
     ShowStats,
     ShowTracing,
     TracingLimit(u32),
@@ -308,6 +318,13 @@ impl Shell {
                     append,
                 } => filesystem::write(client, &path, &bytes, append).await?,
             },
+            Command::Run { path, args } => {
+                let started = programs::run(client, &path, &args).await?;
+                self.print_line(&format!(
+                    "started instance {} {}",
+                    started.instance_id, started.name
+                ))?;
+            }
             Command::ShowStats => stats_tui::run(client, LIVE_STATS_PERIOD_MS).await?,
             Command::ShowTracing => self.show_tracing(client).await?,
             Command::TracingLimit(limit) => {
@@ -645,6 +662,7 @@ impl CliCommand {
             Self::Rm { path } => Command::Remove(path),
             Self::Touch { path } => Command::Touch(path),
             Self::Echo { words } => Command::Echo(filesystem::parse_echo(&words)?),
+            Self::Run { path, args } => Command::Run { path, args },
             Self::Stats => Command::ShowStats,
             Self::Tracing { action } => match action {
                 None => Command::ShowTracing,
@@ -732,7 +750,7 @@ fn completion_candidates<'a>(tokens: &[&str], current: &str) -> &'a [&'a str] {
 mod tests {
     use crate::filesystem::EchoTarget;
 
-    use super::{Command, HelpTopic, ParsedLine, parse_line};
+    use super::{parse_line, Command, HelpTopic, ParsedLine};
 
     #[test]
     fn parses_stats_command() {
@@ -811,6 +829,17 @@ mod tests {
                 assert!(!append);
             }
             _ => panic!("echo redirection must parse"),
+        }
+    }
+
+    #[test]
+    fn parses_run_command() {
+        match parse_line("run ./target/ping.wasm google.com 1500") {
+            ParsedLine::Command(Command::Run { path, args }) => {
+                assert_eq!(path, "./target/ping.wasm");
+                assert_eq!(args, vec!["google.com", "1500"]);
+            }
+            _ => panic!("run command must parse"),
         }
     }
 

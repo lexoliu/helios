@@ -3,12 +3,16 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use helios_hal::cpu::Cpu;
 use helios_hal::fs::DirectoryHandle;
 use helios_hal::resource::{SerialRights, WasiRights};
 use thiserror::Error;
-use wasmtime::{Config, Engine, Linker, Module, Store};
+use wasmtime::{CallHook, Config, Engine, Linker, Module, ResourceLimiter, Store};
 
-use crate::{BootDirectory, ComputePool, ComputePriority, ComputeSpawnError, EmbeddedProgram};
+use crate::{
+    BootDirectory, ComputePool, ComputePriority, ComputeSpawnError, EmbeddedProgram,
+    InstanceExecutionTransition, RegisteredInstance,
+};
 
 /// Immutable compilation settings for the user-mode runtime.
 ///
@@ -47,6 +51,12 @@ pub struct ProgramRuntime {
     engine_config: Config,
     compiler: ComputePool,
     compile_priority: ComputePriority,
+    compile_worker_count: usize,
+}
+
+#[derive(Clone)]
+pub struct ProgramRuntimeDriver {
+    compiler: ComputePool,
 }
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -129,13 +139,20 @@ struct TaskState {
     resources: ResourceTable,
 }
 
+struct TrackedTaskState<CpuImpl: Cpu + Clone> {
+    rights: WasiRights,
+    resources: ResourceTable,
+    cpu: CpuImpl,
+    instance: RegisteredInstance,
+}
+
 impl ProgramRuntime {
     pub fn new(config: ProgramRuntimeConfig) -> Result<Self, ProgramRuntimeError> {
-        let compiler = ComputePool::new(crate::compute_pool::ComputePoolConfig {
-            worker_count: config.compute_workers,
-            worker_stack_size: config.worker_stack_size,
-            max_memory_bytes: config.max_memory_bytes,
-        })
+        let compiler = ComputePool::new(
+            config.compute_workers,
+            config.worker_stack_size,
+            config.max_memory_bytes,
+        )
         .map_err(|_| ProgramRuntimeError::Init(ProgramRuntimeInitError::InvalidComputeConfig))?;
         let engine_config = build_engine_config();
         Engine::new(&engine_config).map_err(ProgramRuntimeError::Wasmtime)?;
@@ -144,7 +161,18 @@ impl ProgramRuntime {
             engine_config,
             compiler,
             compile_priority: config.compile_priority,
+            compile_worker_count: config.compute_workers,
         })
+    }
+
+    pub fn compile_worker_count(&self) -> usize {
+        self.compile_worker_count
+    }
+
+    pub fn driver(&self) -> ProgramRuntimeDriver {
+        ProgramRuntimeDriver {
+            compiler: self.compiler.clone(),
+        }
     }
 
     pub async fn compile(&self, blueprint: Blueprint<'_>) -> Result<Task, CompileError> {
@@ -170,6 +198,20 @@ impl ProgramRuntime {
                 compile_embedded_task(engine, program, rights, boot_directory, debug_serial)
             }
         }
+    }
+}
+
+impl ProgramRuntimeDriver {
+    pub fn run_next(&self) -> bool {
+        self.compiler.run_next()
+    }
+
+    pub async fn wait_for_work(&self) {
+        self.compiler.wait_for_work().await;
+    }
+
+    pub(crate) fn ready_notify(&self) -> alloc::sync::Arc<crate::sync::Notify> {
+        self.compiler.ready_notify()
     }
 }
 
@@ -264,23 +306,52 @@ impl Task {
 
         let mut store = Store::new(module.engine(), TaskState { rights, resources });
         let instance = instantiate_task(&module, &mut store).map_err(RunError::Wasmtime)?;
-
-        if entry.returns_exit_code {
-            let main = instance
-                .get_typed_func::<(), i32>(&mut store, entry.name)
-                .map_err(RunError::Wasmtime)?;
-            let code = main.call(&mut store, ()).map_err(RunError::Wasmtime)?;
-            return Ok(code as u32);
-        }
-
-        let start = instance
-            .get_typed_func::<(), ()>(&mut store, entry.name)
-            .map_err(RunError::Wasmtime)?;
-        start.call(&mut store, ()).map_err(RunError::Wasmtime)?;
+        let output = run_entry(&instance, &mut store, entry);
         let TaskState { rights, resources } = store.into_data();
         let _ = rights;
         let _ = resources;
-        Ok(0)
+        output
+    }
+
+    pub fn run_tracked<CpuImpl: Cpu + Clone>(
+        self,
+        cpu: CpuImpl,
+        instance: RegisteredInstance,
+    ) -> Result<ExitCode, RunError> {
+        let Task {
+            module,
+            rights,
+            resources,
+            entry,
+        } = self;
+
+        let mut store = Store::new(
+            module.engine(),
+            TrackedTaskState {
+                rights,
+                resources,
+                cpu,
+                instance,
+            },
+        );
+        store.limiter(|state| state);
+        store.call_hook(|mut caller, hook| {
+            caller.data_mut().record_call_hook(hook);
+            Ok(())
+        });
+        let instance = instantiate_tracked_task(&module, &mut store).map_err(RunError::Wasmtime)?;
+        if let Some(memory) = instance.get_memory(&mut store, "memory") {
+            let memory_bytes = u64::try_from(memory.data_size(&store))
+                .expect("wasm memory size exceeds u64 during task start");
+            store.data().instance.set_memory_bytes(memory_bytes);
+        }
+        let output = run_entry(&instance, &mut store, entry);
+        let TrackedTaskState {
+            rights, resources, ..
+        } = store.into_data();
+        let _ = rights;
+        let _ = resources;
+        output
     }
 }
 
@@ -290,6 +361,79 @@ fn instantiate_task(
 ) -> Result<wasmtime::Instance, wasmtime::Error> {
     let linker = Linker::<TaskState>::new(module.engine());
     linker.instantiate(store, module)
+}
+
+fn instantiate_tracked_task<CpuImpl: Cpu + Clone>(
+    module: &Module,
+    store: &mut Store<TrackedTaskState<CpuImpl>>,
+) -> Result<wasmtime::Instance, wasmtime::Error> {
+    let linker = Linker::<TrackedTaskState<CpuImpl>>::new(module.engine());
+    linker.instantiate(store, module)
+}
+
+impl<CpuImpl: Cpu + Clone> TrackedTaskState<CpuImpl> {
+    fn now_nanos(&self) -> u64 {
+        let ticks = self.cpu.now().ticks();
+        ticks.saturating_mul(1_000_000_000) / self.cpu.timer_frequency()
+    }
+
+    fn record_call_hook(&mut self, hook: CallHook) {
+        let transition = match hook {
+            CallHook::CallingWasm | CallHook::ReturningFromHost => {
+                InstanceExecutionTransition::Resume
+            }
+            CallHook::ReturningFromWasm | CallHook::CallingHost => {
+                InstanceExecutionTransition::Pause
+            }
+        };
+        self.instance.transition(transition, self.now_nanos());
+    }
+}
+
+impl<CpuImpl: Cpu + Clone> ResourceLimiter for TrackedTaskState<CpuImpl> {
+    fn memory_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        let allow = maximum.is_none_or(|maximum| desired <= maximum);
+        if allow {
+            let memory_bytes =
+                u64::try_from(desired).expect("wasm memory size exceeds u64 during growth");
+            self.instance.set_memory_bytes(memory_bytes);
+        }
+        Ok(allow)
+    }
+
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        Ok(maximum.is_none_or(|maximum| desired <= maximum))
+    }
+}
+
+fn run_entry<T>(
+    instance: &wasmtime::Instance,
+    store: &mut Store<T>,
+    entry: EntryPoint,
+) -> Result<ExitCode, RunError> {
+    if entry.returns_exit_code {
+        let main = instance
+            .get_typed_func::<(), i32>(&mut *store, entry.name)
+            .map_err(RunError::Wasmtime)?;
+        let code = main.call(&mut *store, ()).map_err(RunError::Wasmtime)?;
+        return Ok(code as u32);
+    }
+
+    let start = instance
+        .get_typed_func::<(), ()>(&mut *store, entry.name)
+        .map_err(RunError::Wasmtime)?;
+    start.call(&mut *store, ()).map_err(RunError::Wasmtime)?;
+    Ok(0)
 }
 
 fn build_engine_config() -> Config {

@@ -32,6 +32,7 @@ const CONFIG_SPACE_OFFSET: usize = 0x100;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum DeviceType {
+    Network = 1,
     Block = 2,
     Console = 3,
 }
@@ -96,6 +97,7 @@ impl<B: DeviceBus> VirtioMmioTransport<B> {
         }
 
         let device_type = match bus.read_u32(REG_DEVICE_ID) {
+            1 => DeviceType::Network,
             2 => DeviceType::Block,
             3 => DeviceType::Console,
             _ => return Err(IoError::Unsupported),

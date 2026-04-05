@@ -134,11 +134,11 @@ impl InputStream for EmptyInputStream {
 
 impl cli_bindings::cli::environment::Host for StoreData {
     fn get_environment(&mut self) -> Result<Vec<(String, String)>> {
-        Ok(Vec::new())
+        Ok(self.environment.clone())
     }
 
     fn get_arguments(&mut self) -> Result<Vec<String>> {
-        Ok(Vec::new())
+        Ok(self.arguments.clone())
     }
 
     fn initial_cwd(&mut self) -> Result<Option<String>> {
@@ -174,7 +174,7 @@ impl cli_bindings::cli::stdout::Host for StoreData {
     fn get_stdout(&mut self) -> Result<Resource<DynOutputStream>> {
         Ok(self
             .table
-            .push(Box::new(DebugSerialOutputStream) as DynOutputStream)?)
+            .push(Box::new(DebugSerialOutputStream::from_store(self)) as DynOutputStream)?)
     }
 }
 
@@ -182,7 +182,7 @@ impl cli_bindings::cli::stderr::Host for StoreData {
     fn get_stderr(&mut self) -> Result<Resource<DynOutputStream>> {
         Ok(self
             .table
-            .push(Box::new(DebugSerialOutputStream) as DynOutputStream)?)
+            .push(Box::new(DebugSerialOutputStream::from_store(self)) as DynOutputStream)?)
     }
 }
 

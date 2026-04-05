@@ -15,6 +15,7 @@ use crate::console::HostedConsole;
 use crate::cpu::HostedCpu;
 use crate::init_program;
 use crate::observer_buffer::{ObserverBuffer, SharedObserverBuffer};
+use crate::program_host;
 
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
@@ -90,7 +91,7 @@ impl HostedRuntime {
 }
 
 impl HostedMachine {
-    fn new(config: &HostedConfig) -> Arc<Self> {
+    pub(crate) fn new(config: &HostedConfig) -> Arc<Self> {
         let (timer_tx, timer_rx) = crossbeam_channel::unbounded();
         let started_at = StdInstant::now();
         let machine = Arc::new(Self {
@@ -242,11 +243,17 @@ fn spawn_processor_thread(
             let memory_regions = machine.bootstrap_memory_regions(processor);
             let kernel = helios_kernel::init(Platform::new(console, memory_regions, cpu));
             if processor == machine.bootstrap_processor() {
+                let program_service = program_host::create_program_service(
+                    &config,
+                    HostedCpu::new(machine.bootstrap_processor(), machine.clone()),
+                    machine.instance_registry(),
+                );
                 init_program::spawn_init(
                     &kernel,
                     &config,
                     machine.observer(),
                     machine.instance_registry(),
+                    Some(program_service.clone()),
                     machine.started_at,
                 );
                 init_program::spawn_debugger(
@@ -254,6 +261,7 @@ fn spawn_processor_thread(
                     &config,
                     machine.observer(),
                     machine.instance_registry(),
+                    Some(program_service),
                     machine.started_at,
                 );
             }

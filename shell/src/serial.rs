@@ -1,11 +1,11 @@
 use anyhow::{Context as _, Result};
 use async_io::Async;
-use async_net::unix::UnixStream;
 use futures_io::{AsyncRead, AsyncWrite};
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::FileTypeExt;
+use std::os::unix::net::UnixStream;
 
 pub(crate) trait SerialRead: AsyncRead + Unpin + Send {}
 pub(crate) trait SerialWrite: AsyncWrite + Unpin + Send {}
@@ -24,13 +24,7 @@ pub(crate) struct SerialIo {
 
 pub(crate) async fn open(device: &str, baud: u32) -> Result<SerialIo> {
     let (read, write) = if is_unix_socket(device)? {
-        let stream = UnixStream::connect(device)
-            .await
-            .with_context(|| format!("failed to connect to serial socket {device}"))?;
-        (
-            Box::new(stream.clone()) as SerialReader,
-            Box::new(stream) as SerialWriter,
-        )
+        open_socket_transport(device)?
     } else {
         open_tty_transport(device, baud)?
     };
@@ -89,6 +83,54 @@ impl io::Write for AsyncSerialPort {
 
     fn flush(&mut self) -> io::Result<()> {
         self.port.flush()
+    }
+}
+
+struct AsyncUnixSocket {
+    stream: UnixStream,
+}
+
+impl AsyncUnixSocket {
+    fn connect(device: &str) -> Result<Self> {
+        let stream = UnixStream::connect(device)
+            .with_context(|| format!("failed to connect to serial socket {device}"))?;
+        stream.set_nonblocking(true).with_context(|| {
+            format!("failed to configure serial socket {device} as nonblocking")
+        })?;
+        Ok(Self { stream })
+    }
+
+    fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            stream: self
+                .stream
+                .try_clone()
+                .context("failed to duplicate unix serial socket")?,
+        })
+    }
+}
+
+unsafe impl async_io::IoSafe for AsyncUnixSocket {}
+
+impl AsFd for AsyncUnixSocket {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.stream.as_fd()
+    }
+}
+
+impl io::Read for AsyncUnixSocket {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream.read(buf)
+    }
+}
+
+impl io::Write for AsyncUnixSocket {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
     }
 }
 
@@ -178,6 +220,25 @@ fn open_tty_transport(device: &str, baud: u32) -> Result<(SerialReader, SerialWr
             ))
         }
     }
+}
+
+fn open_socket_transport(device: &str) -> Result<(SerialReader, SerialWriter)> {
+    let socket = AsyncUnixSocket::connect(device)?;
+    let read_socket = socket
+        .try_clone()
+        .with_context(|| format!("failed to clone serial socket {device}"))?;
+    Ok((
+        Box::new(
+            Async::new(read_socket).with_context(|| {
+                format!("failed to register serial socket {device} for reading")
+            })?,
+        ) as SerialReader,
+        Box::new(
+            Async::new(socket).with_context(|| {
+                format!("failed to register serial socket {device} for writing")
+            })?,
+        ) as SerialWriter,
+    ))
 }
 
 fn configure_raw_tty(file: &File, baud: u32) -> io::Result<()> {

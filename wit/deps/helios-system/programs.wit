@@ -1,0 +1,32 @@
+package helios:system@0.1.0;
+
+interface programs {
+  /// Stable identifier for a live wasm instance.
+  type instance-id = u64;
+
+  record launch-request {
+    /// User-visible instance name used for inspection and diagnostics.
+    name: string,
+    /// Argument vector passed to the launched component.
+    args: list<string>,
+    /// Raw wasm module bytes to JIT-compile and execute.
+    wasm: list<u8>,
+  }
+
+  enum launch-error-kind {
+    invalid-binary,
+    missing-entry,
+    unsupported-import,
+    queue-saturated,
+    unavailable,
+    internal,
+  }
+
+  record launch-error {
+    kind: launch-error-kind,
+    detail: string,
+  }
+
+  /// Launches a pure wasm program with the platform's default minimal rights.
+  launch: func(request: launch-request) -> result<instance-id, launch-error>;
+}

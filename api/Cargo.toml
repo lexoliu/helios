@@ -4,11 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["channel", "fs", "io", "serial", "stats", "sync", "task", "tracing"]
+default = ["channel", "fs", "io", "net", "serial", "stats", "sync", "task", "tracing"]
 channel = ["dep:async-channel"]
 fs = ["dep:futures-lite"]
 instances = []
 io = ["dep:futures-io", "dep:futures-lite"]
+net = []
+programs = []
 serial = []
 stats = []
 sync = []

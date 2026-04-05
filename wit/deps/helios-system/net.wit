@@ -1,0 +1,33 @@
+package helios:system@0.1.0;
+
+interface net {
+  /// Monotonic nanoseconds since system boot.
+  type mono-nanos = u64;
+
+  type ipv4-address = tuple<u8, u8, u8, u8>;
+
+  variant ip-address {
+    ipv4(ipv4-address),
+  }
+
+  record ping-reply {
+    address: ip-address,
+    round-trip: mono-nanos,
+    payload-bytes: u16,
+  }
+
+  enum ping-error-kind {
+    unresolved-host,
+    timeout,
+    unavailable,
+    internal,
+  }
+
+  record ping-error {
+    kind: ping-error-kind,
+    detail: string,
+  }
+
+  /// Resolves `host` and sends one ICMP echo request through the platform network stack.
+  ping: async func(host: string, timeout: mono-nanos) -> result<ping-reply, ping-error>;
+}

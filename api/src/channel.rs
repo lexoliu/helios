@@ -5,6 +5,6 @@
 //! implementation instead of inventing another one.
 
 pub use async_channel::{
-    bounded, unbounded, Receiver, Recv, RecvError, Send, SendError, Sender, TryRecvError,
-    TrySendError,
+    Receiver, Recv, RecvError, Send, SendError, Sender, TryRecvError, TrySendError, bounded,
+    unbounded,
 };
