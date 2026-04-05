@@ -1,6 +1,7 @@
 use std::borrow::Cow::{self, Borrowed, Owned};
 use std::fmt::Write as _;
 use std::io::Write as _;
+use std::path::Path;
 
 use anyhow::{Context as _, Result};
 use clap::error::ErrorKind;
@@ -18,7 +19,11 @@ use rustyline::history::DefaultHistory;
 use rustyline::validate::{
     MatchingBracketValidator, ValidationContext, ValidationResult, Validator,
 };
-use rustyline::{CompletionType, Config, Context as RustyContext, EditMode, Editor, Helper};
+use rustyline::Cmd;
+use rustyline::{
+    CompletionType, Config, Context as RustyContext, EditMode, Editor, Event as RustyEvent, Helper,
+    KeyCode as RustyKeyCode, KeyEvent as RustyKeyEvent, Modifiers as RustyModifiers,
+};
 use strsim::normalized_damerau_levenshtein;
 
 use crate::edit_tui;
@@ -26,6 +31,7 @@ use crate::filesystem;
 use crate::programs;
 use crate::rpc::RpcPane;
 use crate::runtime;
+use crate::script::{self, Statement};
 use crate::serial::RpcClient;
 use crate::stats_tui;
 use crate::system::{self, TracingConfig};
@@ -37,29 +43,27 @@ pub fn run(mut client: RpcClient) -> Result<()> {
     shell.print_banner()?;
 
     loop {
-        let line = match editor.readline(PROMPT) {
-            Ok(line) => line,
-            Err(ReadlineError::Interrupted) => continue,
-            Err(ReadlineError::Eof) => return Ok(()),
-            Err(error) => return Err(error).context("failed to read shell input"),
+        let Some(input) = read_program(&mut editor)? else {
+            return Ok(());
         };
-
-        let line = line.trim();
-        if line.is_empty() {
+        let input = input.trim();
+        if input.is_empty() {
             continue;
         }
 
         editor
-            .add_history_entry(line)
+            .add_history_entry(input)
             .context("failed to record shell history entry")?;
 
-        match parse_line(line) {
-            ParsedLine::Command(command) => {
-                match runtime::block_on(runtime::interruptible(shell.execute(&mut client, command)))
-                    .context("failed to listen for Ctrl+C during shell command execution")?
+        match parse_input(input) {
+            ParsedLine::Program(program) => {
+                match runtime::block_on(runtime::interruptible(
+                    shell.execute_program(&mut client, &program),
+                ))
+                .context("failed to listen for Ctrl+C during shell command execution")?
                 {
                     runtime::CommandRun::Completed(result) => {
-                        if result? {
+                        if result?.should_exit {
                             return Ok(());
                         }
                     }
@@ -71,11 +75,33 @@ pub fn run(mut client: RpcClient) -> Result<()> {
     }
 }
 
+fn read_program(editor: &mut Editor<ShellHelper, DefaultHistory>) -> Result<Option<String>> {
+    let mut input = String::new();
+    let mut prompt = PROMPT;
+    loop {
+        let line = match editor.readline(prompt) {
+            Ok(line) => line,
+            Err(ReadlineError::Interrupted) => return Ok(Some(String::new())),
+            Err(ReadlineError::Eof) => return Ok(None),
+            Err(error) => return Err(error).context("failed to read shell input"),
+        };
+        if !input.is_empty() {
+            input.push('\n');
+        }
+        input.push_str(&line);
+        if !script::needs_more_input(&input)? {
+            return Ok(Some(input));
+        }
+        prompt = CONTINUATION_PROMPT;
+    }
+}
+
 const PROMPT: &str = "helios> ";
+const CONTINUATION_PROMPT: &str = "....> ";
 const LIVE_STATS_PERIOD_MS: u64 = 1_000;
 const ROOT_CANDIDATES: &[&str] = &[
-    "help", "clear", "exit", "pwd", "ls", "cat", "edit", "mkdir", "rm", "touch", "echo", "stats",
-    "run", "tracing", "rpc", "--help",
+    "help", "clear", "exit", "pwd", "ls", "cat", "edit", "mkdir", "rm", "touch", "echo", "test",
+    "source", "stats", "run", "tracing", "rpc", "if", "else", "end", "--help",
 ];
 const HELP_CANDIDATES: &[&str] = &["overview", "stats", "tracing", "rpc", "--help"];
 const STATS_CANDIDATES: &[&str] = &["--help"];
@@ -149,6 +175,13 @@ enum CliCommand {
     Cat { path: String },
     /// Edit a remote text file inside a full-screen terminal editor.
     Edit { path: String },
+    /// Evaluate a remote filesystem predicate for scripts and conditionals.
+    Test {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        expression: Vec<String>,
+    },
+    /// Execute a host-local shell script that controls the remote debugger session.
+    Source { path: String },
     /// Create a directory in the remote debugger filesystem.
     Mkdir { path: String },
     /// Remove a file or an empty directory from the remote debugger filesystem.
@@ -221,6 +254,8 @@ enum Command {
     List(Option<String>),
     Cat(String),
     Edit(String),
+    Test(Vec<String>),
+    Source(String),
     Mkdir(String),
     Remove(String),
     Touch(String),
@@ -238,8 +273,13 @@ enum Command {
 }
 
 enum ParsedLine {
-    Command(Command),
+    Program(Vec<Statement>),
     Output(String),
+}
+
+struct CommandStatus {
+    should_exit: bool,
+    success: bool,
 }
 
 struct ShellHelper {
@@ -297,11 +337,70 @@ impl Shell {
         Ok(())
     }
 
-    async fn execute(&mut self, client: &mut RpcClient, command: Command) -> Result<bool> {
+    #[async_recursion::async_recursion(?Send)]
+    async fn execute_program(
+        &mut self,
+        client: &mut RpcClient,
+        program: &[Statement],
+    ) -> Result<CommandStatus> {
+        let mut last = CommandStatus {
+            should_exit: false,
+            success: true,
+        };
+        for statement in program {
+            last = self.execute_statement(client, statement).await?;
+            if last.should_exit {
+                return Ok(last);
+            }
+        }
+        Ok(last)
+    }
+
+    #[async_recursion::async_recursion(?Send)]
+    async fn execute_statement(
+        &mut self,
+        client: &mut RpcClient,
+        statement: &Statement,
+    ) -> Result<CommandStatus> {
+        match statement {
+            Statement::Command(line) => {
+                let command = parse_command_line(line)?;
+                self.execute_command(client, command).await
+            }
+            Statement::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                let status = self
+                    .execute_statement(client, &Statement::Command(condition.clone()))
+                    .await?;
+                if status.should_exit {
+                    return Ok(status);
+                }
+                if status.success {
+                    self.execute_program(client, then_branch).await
+                } else {
+                    self.execute_program(client, else_branch).await
+                }
+            }
+        }
+    }
+
+    async fn execute_command(
+        &mut self,
+        client: &mut RpcClient,
+        command: Command,
+    ) -> Result<CommandStatus> {
         match command {
             Command::Help(topic) => self.print_block(&render_help(topic))?,
             Command::Clear => self.clear_screen()?,
-            Command::Exit => return Ok(true),
+            Command::Exit => {
+                return Ok(CommandStatus {
+                    should_exit: true,
+                    success: true,
+                });
+            }
             Command::Pwd => self.print_line(filesystem::pwd())?,
             Command::List(path) => {
                 let output = filesystem::list(client, path.as_deref()).await?;
@@ -312,6 +411,22 @@ impl Shell {
                 self.write_bytes(&bytes)?;
             }
             Command::Edit(path) => edit_tui::run(client, &path).await?,
+            Command::Test(expression) => {
+                let success = filesystem::test(client, &expression).await?;
+                return Ok(CommandStatus {
+                    should_exit: false,
+                    success,
+                });
+            }
+            Command::Source(path) => {
+                let script = std::fs::read_to_string(&path)
+                    .with_context(|| format!("failed to read shell script {path}"))?;
+                let program = match parse_input(&script) {
+                    ParsedLine::Program(program) => program,
+                    ParsedLine::Output(output) => anyhow::bail!("{output}"),
+                };
+                return self.execute_program(client, &program).await;
+            }
             Command::Mkdir(path) => filesystem::mkdir(client, &path).await?,
             Command::Remove(path) => filesystem::remove(client, &path).await?,
             Command::Touch(path) => filesystem::touch(client, &path).await?,
@@ -365,7 +480,10 @@ impl Shell {
             Command::RpcCall => self.call_rpc(client).await?,
         }
 
-        Ok(false)
+        Ok(CommandStatus {
+            should_exit: false,
+            success: true,
+        })
     }
 
     async fn show_tracing(&mut self, client: &mut RpcClient) -> Result<()> {
@@ -409,7 +527,7 @@ impl Completer for ShellHelper {
             .into_iter()
             .filter(|candidate| candidate.starts_with(current))
             .map(|candidate| Pair {
-                display: candidate.to_string(),
+                display: completion_display(&tokens, candidate),
                 replacement: candidate.to_string(),
             })
             .collect();
@@ -474,7 +592,10 @@ impl Highlighter for ShellHelper {
     }
 
     fn highlight<'l>(&self, line: &'l str, pos: usize) -> Cow<'l, str> {
-        self.highlighter.highlight(line, pos)
+        let _ = pos;
+        highlight_shell_line(line)
+            .unwrap_or_else(|| self.highlighter.highlight(line, pos).into_owned())
+            .into()
     }
 
     fn highlight_char(&self, line: &str, pos: usize, forced: bool) -> bool {
@@ -496,23 +617,72 @@ fn build_editor() -> Result<Editor<ShellHelper, DefaultHistory>> {
         .build();
     let mut editor = Editor::with_config(config).context("failed to create line editor")?;
     editor.set_helper(Some(ShellHelper::new()));
+    editor.bind_sequence(
+        RustyEvent::from(RustyKeyEvent(RustyKeyCode::Char('F'), RustyModifiers::CTRL)),
+        Cmd::CompleteHint,
+    );
     Ok(editor)
 }
 
-fn parse_line(input: &str) -> ParsedLine {
+fn parse_input(input: &str) -> ParsedLine {
+    match script::parse(input) {
+        Ok(script::ParseState::Complete(program)) => {
+            let mut commands = Vec::with_capacity(program.len());
+            for statement in program {
+                match validate_statement(statement) {
+                    Ok(statement) => commands.push(statement),
+                    Err(error) => return ParsedLine::Output(format!("error: {error}")),
+                }
+            }
+            ParsedLine::Program(commands)
+        }
+        Ok(script::ParseState::Incomplete) => {
+            ParsedLine::Output("error: shell block is incomplete".to_owned())
+        }
+        Err(error) => ParsedLine::Output(format!("error: {error}")),
+    }
+}
+
+fn validate_statement(statement: Statement) -> Result<Statement> {
+    match statement {
+        Statement::Command(line) => {
+            parse_command_line(&line)?;
+            Ok(Statement::Command(line))
+        }
+        Statement::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            parse_command_line(&condition)?;
+            let then_branch = then_branch
+                .into_iter()
+                .map(validate_statement)
+                .collect::<Result<Vec<_>>>()?;
+            let else_branch = else_branch
+                .into_iter()
+                .map(validate_statement)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Statement::If {
+                condition,
+                then_branch,
+                else_branch,
+            })
+        }
+    }
+}
+
+fn parse_command_line(input: &str) -> Result<Command> {
     let tokens = match shell_words::split(input) {
         Ok(tokens) => tokens,
         Err(error) => {
-            return ParsedLine::Output(format!("error: failed to parse shell input: {error}"));
+            anyhow::bail!("failed to parse shell input: {error}");
         }
     };
 
     match ReplCli::try_parse_from(tokens.iter().map(String::as_str)) {
-        Ok(cli) => match cli.command.into_runtime_command() {
-            Ok(command) => ParsedLine::Command(command),
-            Err(error) => ParsedLine::Output(format!("error: {error}")),
-        },
-        Err(error) => ParsedLine::Output(render_clap_error(error, &tokens)),
+        Ok(cli) => cli.command.into_runtime_command(),
+        Err(error) => anyhow::bail!(render_clap_error(error, &tokens)),
     }
 }
 
@@ -664,6 +834,8 @@ impl CliCommand {
             Self::Ls { path } => Command::List(path),
             Self::Cat { path } => Command::Cat(path),
             Self::Edit { path } => Command::Edit(path),
+            Self::Test { expression } => Command::Test(expression),
+            Self::Source { path } => Command::Source(path),
             Self::Mkdir { path } => Command::Mkdir(path),
             Self::Rm { path } => Command::Remove(path),
             Self::Touch { path } => Command::Touch(path),
@@ -741,6 +913,7 @@ fn completion_candidates<'a>(tokens: &[&str], current: &str) -> &'a [&'a str] {
 
     match tokens {
         [] => ROOT_CANDIDATES,
+        ["if"] => ROOT_CANDIDATES,
         ["help"] => HELP_CANDIDATES,
         ["stats"] => STATS_CANDIDATES,
         ["tracing"] => TRACING_CANDIDATES,
@@ -752,92 +925,227 @@ fn completion_candidates<'a>(tokens: &[&str], current: &str) -> &'a [&'a str] {
     }
 }
 
+fn completion_display(tokens: &[&str], candidate: &str) -> String {
+    let description = match (tokens.first().copied(), candidate) {
+        (_, "help") => "show shell help",
+        (_, "clear") => "clear the screen",
+        (_, "exit") => "leave the shell",
+        (_, "pwd") => "print the remote working directory",
+        (_, "ls") => "list remote debugger files",
+        (_, "cat") => "print a remote file",
+        (_, "edit") => "open the full-screen editor",
+        (_, "mkdir") => "create a remote directory",
+        (_, "rm") => "remove a remote path",
+        (_, "touch") => "create an empty remote file",
+        (_, "echo") => "print or redirect text",
+        (_, "test") => "evaluate a filesystem predicate",
+        (_, "source") => "run a host-local shell script",
+        (Some("help"), "stats") => "help for the stats view",
+        (_, "run") => "launch a wasm guest program",
+        (Some("help"), "tracing") => "help for tracing controls",
+        (Some("help"), "rpc") => "help for raw RPC calls",
+        (_, "stats") => "open the live stats view",
+        (_, "tracing") => "stream kernel tracing events",
+        (_, "rpc") => "invoke a raw remote WIT method",
+        (_, "if") => "start a shell conditional block",
+        (_, "else") => "alternate branch inside `if`",
+        (_, "end") => "close the current shell block",
+        (_, "--help") => "show command help",
+        (Some("help"), "overview") => "shell command overview",
+        (Some("tracing"), "limit") => "set the fetch window size",
+        (Some("tracing"), "level") => "set the minimum tracing level",
+        (Some("tracing"), "targets") => "set tracing target prefixes",
+        (Some("rpc"), "instance") => "set the remote WIT instance id",
+        (Some("rpc"), "func") => "set the remote function name",
+        (Some("rpc"), "payload") => "set the hex request payload",
+        (Some("rpc"), "call") => "invoke the configured remote method",
+        _ => "",
+    };
+
+    if description.is_empty() {
+        candidate.to_owned()
+    } else {
+        format!("{candidate:<16} {description}")
+    }
+}
+
+fn highlight_shell_line(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed == "else" || trimmed == "end" || trimmed.starts_with("if ") {
+        return Some(highlight_block_header(line));
+    }
+
+    let tokens = shell_words::split(line).ok()?;
+    let command = tokens.first()?;
+    let mut output = String::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if index != 0 {
+            output.push(' ');
+        }
+        if index == 0 {
+            output.push_str(&highlight_command_token(command));
+            continue;
+        }
+        output.push_str(&highlight_argument_token(command, token));
+    }
+    Some(output)
+}
+
+fn highlight_block_header(line: &str) -> String {
+    let trimmed = line.trim_start();
+    let indent = &line[..line.len().saturating_sub(trimmed.len())];
+    let style = AnsiStyle::new().fg(Color::Purple).bold();
+    if let Some(condition) = trimmed.strip_prefix("if ") {
+        format!(
+            "{indent}{} {}",
+            style.paint("if"),
+            AnsiStyle::new().fg(Color::White).paint(condition)
+        )
+    } else {
+        format!("{indent}{}", style.paint(trimmed))
+    }
+}
+
+fn highlight_command_token(command: &str) -> String {
+    if ROOT_CANDIDATES.contains(&command) {
+        return AnsiStyle::new()
+            .fg(Color::Blue)
+            .bold()
+            .paint(command)
+            .to_string();
+    }
+    AnsiStyle::new()
+        .fg(Color::Red)
+        .bold()
+        .paint(command)
+        .to_string()
+}
+
+fn highlight_argument_token(command: &str, token: &str) -> String {
+    if matches!(command, "run" | "source") {
+        let style = if Path::new(token).exists() {
+            AnsiStyle::new().fg(Color::Cyan).underline()
+        } else {
+            AnsiStyle::new().fg(Color::Red).underline()
+        };
+        return style.paint(token).to_string();
+    }
+
+    if matches!(
+        command,
+        "ls" | "cat" | "edit" | "mkdir" | "rm" | "touch" | "test"
+    ) {
+        let style = match filesystem::normalize_path(token) {
+            Ok(_) => AnsiStyle::new().fg(Color::Cyan).underline(),
+            Err(_) => AnsiStyle::new().fg(Color::Red).underline(),
+        };
+        return style.paint(token).to_string();
+    }
+
+    AnsiStyle::new().fg(Color::White).paint(token).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::filesystem::EchoTarget;
+    use crate::script::Statement;
 
-    use super::{parse_line, Command, HelpTopic, ParsedLine};
+    use super::{parse_input, Command, HelpTopic, ParsedLine};
+
+    fn single_command(input: &str) -> Command {
+        match parse_input(input) {
+            ParsedLine::Program(program) => match program.as_slice() {
+                [Statement::Command(line)] => super::parse_command_line(line)
+                    .expect("single command program must parse successfully"),
+                _ => panic!("expected a single command statement"),
+            },
+            ParsedLine::Output(output) => panic!("unexpected parse output: {output}"),
+        }
+    }
 
     #[test]
     fn parses_stats_command() {
-        match parse_line("stats") {
-            ParsedLine::Command(Command::ShowStats) => {}
+        match single_command("stats") {
+            Command::ShowStats => {}
             _ => panic!("stats command must parse"),
         }
     }
 
     #[test]
     fn parses_edit_command() {
-        match parse_line("edit /tmp/debug.txt") {
-            ParsedLine::Command(Command::Edit(path)) => assert_eq!(path, "/tmp/debug.txt"),
+        match single_command("edit /tmp/debug.txt") {
+            Command::Edit(path) => assert_eq!(path, "/tmp/debug.txt"),
             _ => panic!("edit command must parse"),
         }
     }
 
     #[test]
     fn parses_clear_command() {
-        match parse_line("clear") {
-            ParsedLine::Command(Command::Clear) => {}
+        match single_command("clear") {
+            Command::Clear => {}
             _ => panic!("clear command must parse"),
         }
     }
 
     #[test]
     fn parses_pwd_command() {
-        match parse_line("pwd") {
-            ParsedLine::Command(Command::Pwd) => {}
+        match single_command("pwd") {
+            Command::Pwd => {}
             _ => panic!("pwd command must parse"),
         }
     }
 
     #[test]
     fn parses_ls_command() {
-        match parse_line("ls /tmp") {
-            ParsedLine::Command(Command::List(Some(path))) => assert_eq!(path, "/tmp"),
+        match single_command("ls /tmp") {
+            Command::List(Some(path)) => assert_eq!(path, "/tmp"),
             _ => panic!("ls command must parse"),
         }
     }
 
     #[test]
     fn parses_rm_command() {
-        match parse_line("rm /tmp/file") {
-            ParsedLine::Command(Command::Remove(path)) => assert_eq!(path, "/tmp/file"),
+        match single_command("rm /tmp/file") {
+            Command::Remove(path) => assert_eq!(path, "/tmp/file"),
             _ => panic!("rm command must parse"),
         }
     }
 
     #[test]
     fn parses_touch_command() {
-        match parse_line("touch /tmp/file") {
-            ParsedLine::Command(Command::Touch(path)) => assert_eq!(path, "/tmp/file"),
+        match single_command("touch /tmp/file") {
+            Command::Touch(path) => assert_eq!(path, "/tmp/file"),
             _ => panic!("touch command must parse"),
         }
     }
 
     #[test]
     fn parses_cat_command() {
-        match parse_line("cat /tmp/file") {
-            ParsedLine::Command(Command::Cat(path)) => assert_eq!(path, "/tmp/file"),
+        match single_command("cat /tmp/file") {
+            Command::Cat(path) => assert_eq!(path, "/tmp/file"),
             _ => panic!("cat command must parse"),
         }
     }
 
     #[test]
     fn parses_mkdir_command() {
-        match parse_line("mkdir /tmp/dir") {
-            ParsedLine::Command(Command::Mkdir(path)) => assert_eq!(path, "/tmp/dir"),
+        match single_command("mkdir /tmp/dir") {
+            Command::Mkdir(path) => assert_eq!(path, "/tmp/dir"),
             _ => panic!("mkdir command must parse"),
         }
     }
 
     #[test]
     fn parses_echo_redirection() {
-        match parse_line("echo hello > /tmp/file") {
-            ParsedLine::Command(Command::Echo(EchoTarget::File {
+        match single_command("echo hello > /tmp/file") {
+            Command::Echo(EchoTarget::File {
                 path,
                 bytes,
                 append,
-            })) => {
+            }) => {
                 assert_eq!(path, "/tmp/file");
                 assert_eq!(bytes, b"hello\n");
                 assert!(!append);
@@ -848,8 +1156,8 @@ mod tests {
 
     #[test]
     fn parses_run_command() {
-        match parse_line("run ./target/ping.wasm google.com 1500") {
-            ParsedLine::Command(Command::Run { path, args }) => {
+        match single_command("run ./target/ping.wasm google.com 1500") {
+            Command::Run { path, args } => {
                 assert_eq!(path, "./target/ping.wasm");
                 assert_eq!(args, vec!["google.com", "1500"]);
             }
@@ -859,7 +1167,7 @@ mod tests {
 
     #[test]
     fn rejects_removed_stats_period_command() {
-        match parse_line("stats period 250") {
+        match parse_input("stats period 250") {
             ParsedLine::Output(text) => assert!(text.contains("unknown command")),
             _ => panic!("removed stats period command must stay rejected"),
         }
@@ -867,23 +1175,23 @@ mod tests {
 
     #[test]
     fn parses_rpc_payload_without_argument() {
-        match parse_line("rpc payload") {
-            ParsedLine::Command(Command::RpcPayload(value)) => assert!(value.is_empty()),
+        match single_command("rpc payload") {
+            Command::RpcPayload(value) => assert!(value.is_empty()),
             _ => panic!("rpc payload without argument must parse"),
         }
     }
 
     #[test]
     fn keeps_help_command() {
-        match parse_line("help tracing") {
-            ParsedLine::Command(Command::Help(HelpTopic::Tracing)) => {}
+        match single_command("help tracing") {
+            Command::Help(HelpTopic::Tracing) => {}
             _ => panic!("help tracing must parse"),
         }
     }
 
     #[test]
     fn clap_suggests_similar_command() {
-        match parse_line("staats") {
+        match parse_input("staats") {
             ParsedLine::Output(text) => {
                 assert!(text.contains("unknown command"));
                 assert!(text.contains("stats"));
@@ -895,9 +1203,19 @@ mod tests {
 
     #[test]
     fn clap_supports_help_flag() {
-        match parse_line("stats --help") {
+        match parse_input("stats --help") {
             ParsedLine::Output(text) => assert!(text.contains("live stats view")),
             _ => panic!("stats --help must print help text"),
+        }
+    }
+
+    #[test]
+    fn parses_if_program() {
+        match parse_input("if test -e /tmp/file\n echo yes\nelse\n echo no\nend") {
+            ParsedLine::Program(program) => {
+                assert!(matches!(program[0], Statement::If { .. }));
+            }
+            ParsedLine::Output(text) => panic!("unexpected parse output: {text}"),
         }
     }
 }
