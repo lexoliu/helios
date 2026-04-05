@@ -5,6 +5,7 @@ pub(crate) mod bindings {
         imports: { default: async | store | trappable },
         exports: { default: async },
         with: {
+            "helios:system/net.tcp-stream": crate::debugger_program::SbiTcpStream,
             "helios:system/serial.serial-port": crate::debugger_program::SbiSerialPort,
             "helios:system/sync.raw-mutex": crate::debugger_program::SbiRawMutex,
             "helios:system/sync.raw-mutex-guard": crate::debugger_program::SbiRawMutexGuard,

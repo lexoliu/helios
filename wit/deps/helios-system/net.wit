@@ -28,6 +28,34 @@ interface net {
     detail: string,
   }
 
+  enum tcp-error-kind {
+    unresolved-host,
+    timeout,
+    unavailable,
+    internal,
+  }
+
+  record tcp-error {
+    kind: tcp-error-kind,
+    detail: string,
+  }
+
+  resource tcp-stream {
+    /// Reads up to `max-bytes` octets from the peer.
+    ///
+    /// `none` indicates an orderly EOF after the peer closed its transmit side.
+    read: async func(max-bytes: u32, timeout: mono-nanos) -> result<option<list<u8>>, tcp-error>;
+
+    /// Writes the complete `bytes` buffer before returning.
+    write: async func(bytes: list<u8>, timeout: mono-nanos) -> result<u64, tcp-error>;
+
+    /// Releases the underlying TCP socket immediately.
+    close: async func() -> result<_, tcp-error>;
+  }
+
   /// Resolves `host` and sends one ICMP echo request through the platform network stack.
   ping: async func(host: string, timeout: mono-nanos) -> result<ping-reply, ping-error>;
+
+  /// Resolves `host` and opens an outbound TCP stream to `port`.
+  tcp-connect: async func(host: string, port: u16, timeout: mono-nanos) -> result<tcp-stream, tcp-error>;
 }
