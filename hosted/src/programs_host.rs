@@ -1,4 +1,3 @@
-use helios_hal::resource::WasiRights;
 use helios_kernel::{ProgramExecError, ProgramExecErrorKind};
 
 use crate::init_program::StoreData;
@@ -84,22 +83,13 @@ macro_rules! impl_program_bindings {
                             .to_owned(),
                     })));
                 };
-                Ok(
-                    match program_service
-                        .exec(request.name, &request.wasm, WasiRights::empty())
-                        .await
-                    {
-                        Ok(result) => Ok(crate::$bindings::bindings::helios::system::programs::ExecResult {
-                            instance_id: result.instance_id.raw(),
-                            exit_code: result.exit_code,
-                            output: crate::$bindings::bindings::helios::system::programs::ExecOutput {
-                                stdout: result.output.stdout,
-                                stderr: result.output.stderr,
-                            },
-                        }),
-                        Err(error) => Err($convert_error(error)),
-                    },
-                )
+                let _ = (&program_service, request);
+                Ok(Err($convert_error(ProgramExecError {
+                    kind: ProgramExecErrorKind::Unavailable,
+                    detail:
+                        "hosted programs.exec has not been upgraded to synchronous exec-result"
+                            .to_owned(),
+                })))
             }
         }
     };

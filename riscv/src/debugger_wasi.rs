@@ -992,7 +992,7 @@ impl wasi::cli::stderr::Host for StoreData {}
 
 impl wasi::cli::stderr::HostWithStore for HasSelf<StoreData> {
     fn write_via_stream<T>(
-        access: Access<'_, T, Self>,
+        mut access: Access<'_, T, Self>,
         data: StreamReader<u8>,
     ) -> Result<FutureReader<core::result::Result<(), cli_types::ErrorCode>>> {
         let (tx, rx) = oneshot::channel();

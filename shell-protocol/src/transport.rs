@@ -632,9 +632,10 @@ where
         }
 
         if state.pending_write.is_none() {
-            let bytes = Bytes::copy_from_slice(buf);
+            let chunk_len = buf.len().min(RAW_UPLOAD_CHUNK_BYTES);
+            let bytes = Bytes::copy_from_slice(&buf[..chunk_len]);
             state.pending_write = Some((
-                buf.len(),
+                chunk_len,
                 Box::pin(
                     self.invocation
                         .clone()
@@ -1103,7 +1104,7 @@ fn decode_path(path: &[u32]) -> io::Result<Vec<usize>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Client, Server};
+    use super::{Client, RAW_UPLOAD_CHUNK_BYTES, Server};
     use bytes::Bytes;
     use futures_lite::StreamExt as _;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -1600,6 +1601,63 @@ mod tests {
                 server_task
                     .await
                     .unwrap_or_else(|error| panic!("resource-zero server task panicked: {error}"));
+            });
+    }
+
+    #[test]
+    fn large_raw_response_is_chunked_across_frames() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap_or_else(|error| panic!("failed to build test runtime: {error}"))
+            .block_on(async {
+                let (host, peer) = tokio::io::duplex(4096);
+                let (host_read, host_write) = tokio::io::split(host);
+                let server = Server::new(host_read.compat(), host_write.compat_write());
+                let (peer_read, peer_write) = tokio::io::split(peer);
+                let client = Client::new(peer_read.compat(), peer_write.compat_write());
+
+                let expected = vec![0x5a; RAW_UPLOAD_CHUNK_BYTES * 3 + 17];
+                let mut calls = server
+                    .serve("transport:test", "large-response", [])
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("failed to register large-response handler: {error}")
+                    });
+                let expected_response = expected.clone();
+                let server_task = tokio::spawn(async move {
+                    let (_, mut outgoing, mut incoming) = calls
+                        .next()
+                        .await
+                        .unwrap_or_else(|| panic!("large-response invocation stream ended early"))
+                        .unwrap_or_else(|error| {
+                            panic!("failed to accept large-response invocation: {error}")
+                        });
+                    let mut request = Vec::new();
+                    incoming.read_to_end(&mut request).await.unwrap_or_else(|error| {
+                        panic!("failed to read large-response request: {error}")
+                    });
+                    assert!(request.is_empty(), "unexpected request payload: {request:?}");
+                    outgoing
+                        .write_all(&expected_response)
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!("failed to write large-response payload: {error}")
+                        });
+                    outgoing.shutdown().await.unwrap_or_else(|error| {
+                        panic!("failed to close large-response stream: {error}")
+                    });
+                });
+
+                let actual = client
+                    .invoke_raw("transport:test", "large-response", Vec::new())
+                    .await
+                    .unwrap_or_else(|error| panic!("large-response invocation failed: {error}"));
+                assert_eq!(actual, expected);
+
+                server_task
+                    .await
+                    .unwrap_or_else(|error| panic!("large-response server task panicked: {error}"));
             });
     }
 }
