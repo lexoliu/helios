@@ -511,7 +511,9 @@ impl<T: TerminalIo> Shell<T> {
         if !result.output.stderr.is_empty() {
             self.write_bytes(&result.output.stderr)?;
         }
-        Ok(CommandStatus::new(result.exit_code as u8))
+        let exit_code = u8::try_from(result.exit_code)
+            .with_context(|| format!("guest exit code {} exceeded u8", result.exit_code))?;
+        Ok(CommandStatus::new(exit_code))
     }
 
     async fn show_tracing(&mut self, client: &mut RpcClient) -> Result<()> {

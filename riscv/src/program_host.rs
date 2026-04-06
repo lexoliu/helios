@@ -4,7 +4,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use concurrent_queue::{ConcurrentQueue, PopError, PushError};
+use concurrent_queue::{ConcurrentQueue, PopError};
 use helios_hal::cpu::Cpu;
 use helios_hal::resource::WasiRights;
 use helios_kernel::{
@@ -289,6 +289,8 @@ fn run_component(
             arguments: argv,
             environment: Vec::new(),
             output_mode,
+            captured_stdout: Vec::new(),
+            captured_stderr: Vec::new(),
         },
     );
     store.limiter(|state| state);

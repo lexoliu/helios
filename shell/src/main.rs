@@ -156,13 +156,16 @@ fn main() -> Result<()> {
         }),
         Some(Command::Exec { path, args }) => run_interruptible(async move {
             let mut client = client;
-            let started = programs::exec(&mut client, &path, &args).await?;
-            writeln!(
-                std::io::stdout(),
-                "instance {} exited with code {}",
-                started.instance_id,
-                started.exit_code
-            )?;
+            let result = programs::exec(&mut client, &path, &args).await?;
+            std::io::stdout().write_all(&result.output.stdout)?;
+            std::io::stderr().write_all(&result.output.stderr)?;
+            if result.exit_code != 0 {
+                anyhow::bail!(
+                    "instance {} exited with code {}",
+                    result.instance_id,
+                    result.exit_code
+                );
+            }
             Ok(())
         }),
         Some(Command::Stats { period_ms }) => run_interruptible(async move {

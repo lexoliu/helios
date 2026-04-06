@@ -12,6 +12,8 @@ use crate::wire::{Frame, read_frame, write_frame};
 use super::bindings::helios::system::{instances, programs, stats, tracing};
 use crate::debugger::filesystem;
 
+const RESPONSE_CHUNK_BYTES: usize = 64 * 1024;
+
 pub async fn serve<R, W>(mut read: R, mut write: W) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -63,16 +65,18 @@ where
                 continue;
             }
         };
-        write_frame(
-            &mut write,
-            &Frame::Data {
-                invocation,
-                path: Vec::new(),
-                payload: response,
-            },
-        )
-        .await
-        .context("failed to write debugger response payload")?;
+        for chunk in response.chunks(RESPONSE_CHUNK_BYTES) {
+            write_frame(
+                &mut write,
+                &Frame::Data {
+                    invocation,
+                    path: Vec::new(),
+                    payload: chunk.to_vec(),
+                },
+            )
+            .await
+            .context("failed to write debugger response payload")?;
+        }
         write_frame(
             &mut write,
             &Frame::Close {

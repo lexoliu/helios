@@ -146,7 +146,13 @@ async fn exec_program(program: &str, args: &[String]) -> Result<CommandStatus> {
         args: args.to_vec(),
         wasm,
     }) {
-        Ok(_) => Ok(CommandStatus::SUCCESS),
+        Ok(result) => {
+            io::stdout().write_all(&result.output.stdout)?;
+            io::stderr().write_all(&result.output.stderr)?;
+            let code = u8::try_from(result.exit_code)
+                .with_context(|| format!("guest exit code {} exceeded u8", result.exit_code))?;
+            Ok(CommandStatus::new(code))
+        }
         Err(error) if error.kind == ExecErrorKind::Unavailable => {
             bail!("program exec is unavailable: {}", error.detail)
         }
