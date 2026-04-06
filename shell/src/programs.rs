@@ -1,6 +1,6 @@
 use anyhow::{bail, Context as _, Result};
 use helios_shell_protocol::debugger::filesystem;
-use helios_shell_protocol::system::programs::{self, ExecRequest};
+use helios_shell_protocol::system::programs::{self, ExecRequest, ExecResult};
 use wasmparser::Parser;
 use wit_component::ComponentEncoder;
 
@@ -9,16 +9,11 @@ use crate::serial::RpcClient;
 
 const PROGRAM_SEARCH_DIRECTORIES: &[&str] = &["/bin"];
 
-pub struct StartedProgram {
-    pub instance_id: u64,
-    pub name: String,
-}
-
-pub async fn exec(client: &mut RpcClient, path: &str, args: &[String]) -> Result<StartedProgram> {
+pub async fn exec(client: &mut RpcClient, path: &str, args: &[String]) -> Result<ExecResult> {
     let resolved = resolve_program(client, path).await?;
     let wasm = load_component(&resolved.path, &resolved.wasm)?;
     let name = infer_instance_name(&resolved.path)?;
-    let instance_id = programs::exec(
+    let result = programs::exec(
         &*client,
         &ExecRequest {
             name: name.clone(),
@@ -28,7 +23,8 @@ pub async fn exec(client: &mut RpcClient, path: &str, args: &[String]) -> Result
     )
     .await?;
 
-    Ok(StartedProgram { instance_id, name })
+    let _ = name;
+    Ok(result)
 }
 
 struct ResolvedProgram {

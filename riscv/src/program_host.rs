@@ -19,6 +19,20 @@ use crate::{RiscvCpu, debug_state::RuntimeState, program_bindings};
 
 const WORKER_STACK_SIZE: usize = 256 * 1024;
 
+#[derive(Clone, Debug)]
+pub(crate) struct ExecOutput {
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ExecResult {
+    pub(crate) instance_id: InstanceId,
+    pub(crate) exit_code: u32,
+    pub(crate) output: ExecOutput,
+}
+
+
 #[derive(Clone)]
 pub(crate) struct UserProgramService {
     inner: Arc<UserProgramServiceInner>,
@@ -120,11 +134,12 @@ pub(crate) fn run_forever(cpu: RiscvCpu, kernel: helios_kernel::Kernel<RiscvCpu>
 impl UserProgramService {
     pub(crate) async fn exec(
         &self,
+        execution_cpu: RiscvCpu,
         name: impl Into<String>,
         args: Vec<String>,
         wasm: &[u8],
         _rights: WasiRights,
-    ) -> Result<InstanceId, ProgramExecError> {
+    ) -> Result<ExecResult, ProgramExecError> {
         let name = name.into();
         let component = self.compile_component(wasm).await?;
         let started_at = monotonic_nanos(self.inner.timebase_frequency);
@@ -132,24 +147,28 @@ impl UserProgramService {
             .inner
             .instance_registry
             .register(name.clone(), started_at);
-        let id = instance.id();
-        let queued = QueuedProgram {
-            name,
-            args,
-            component,
-            instance,
-        };
-        match self.inner.run_queue.push(queued) {
-            Ok(()) => {
-                self.inner.run_ready.notify_one();
-                Ok(id)
-            }
-            Err(PushError::Full(_)) => unreachable!("unbounded program queue reported full"),
-            Err(PushError::Closed(_)) => Err(ProgramExecError {
-                kind: ProgramExecErrorKind::Unavailable,
-                detail: "program worker queue was closed unexpectedly".to_string(),
-            }),
-        }
+        let instance_id = instance.id();
+        let (exit_code, output) = run_component(
+            QueuedProgram {
+                name,
+                args,
+                component,
+                instance,
+            },
+            execution_cpu,
+            self.inner.debug_state.clone(),
+            self.inner.instance_registry.clone(),
+            OutputMode::Capture,
+        )
+        .map_err(|error| ProgramExecError {
+            kind: ProgramExecErrorKind::Internal,
+            detail: error.to_string(),
+        })?;
+        Ok(ExecResult {
+            instance_id,
+            exit_code,
+            output,
+        })
     }
 
     pub(crate) fn run_next_on(&self, execution_cpu: &RiscvCpu) -> bool {
@@ -162,8 +181,9 @@ impl UserProgramService {
                     execution_cpu.clone(),
                     self.inner.debug_state.clone(),
                     self.inner.instance_registry.clone(),
+                    OutputMode::Trace,
                 ) {
-                    Ok(exit_code) => {
+                    Ok((exit_code, _output)) => {
                         tracing::info!(
                             "Program exited instance={} name={} code={}",
                             instance_id,
@@ -237,7 +257,8 @@ fn run_component(
     cpu: RiscvCpu,
     debug_state: RuntimeState,
     instance_registry: InstanceRegistry,
-) -> Result<u32, wasmtime::Error> {
+    output_mode: OutputMode,
+) -> Result<(u32, ExecOutput), wasmtime::Error> {
     let QueuedProgram {
         name,
         args,
@@ -267,7 +288,7 @@ fn run_component(
             filesystem: crate::debugger_wasi::DebugFileSystem::new(),
             arguments: argv,
             environment: Vec::new(),
-            output_mode: OutputMode::Trace,
+            output_mode,
         },
     );
     store.limiter(|state| state);
@@ -283,11 +304,13 @@ fn run_component(
         debugger_program::block_on(store.run_concurrent(async move |accessor| {
             program.wasi_cli_run().call_run(accessor).await
         }))?;
-    match result {
-        Ok(Ok(())) => Ok(0),
-        Ok(Err(())) => Ok(1),
-        Err(error) => Err(error),
-    }
+    let exit_code = match result {
+        Ok(Ok(())) => 0,
+        Ok(Err(())) => 1,
+        Err(error) => return Err(error),
+    };
+    let output = store.data().take_captured_output();
+    Ok((exit_code, output))
 }
 
 fn monotonic_nanos(timebase_frequency: u64) -> u64 {

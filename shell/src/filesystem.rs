@@ -67,29 +67,6 @@ pub async fn write(client: &mut RpcClient, path: &str, bytes: &[u8], append: boo
     filesystem::write(client, &path, bytes, append).await
 }
 
-pub async fn test(client: &mut RpcClient, expression: &[String]) -> Result<bool> {
-    match expression {
-        [flag, path] => {
-            let path = normalize_path(path)?;
-            let entries = match filesystem::list(client, &path).await {
-                Ok(entries) => entries,
-                Err(_) => return Ok(false),
-            };
-            let kind = entries
-                .first()
-                .map(|entry| entry.kind)
-                .ok_or_else(|| anyhow::anyhow!("path {path} does not exist"))?;
-            Ok(match flag.as_str() {
-                "-e" => true,
-                "-f" => matches!(kind, EntryKind::File),
-                "-d" => matches!(kind, EntryKind::Directory),
-                _ => bail!("unsupported test flag {flag:?}; expected -e, -f, or -d"),
-            })
-        }
-        _ => bail!("test expects exactly one flag and one path"),
-    }
-}
-
 pub fn parse_echo(words: &[String]) -> Result<EchoTarget> {
     let redirects = words
         .iter()
