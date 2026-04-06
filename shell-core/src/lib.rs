@@ -411,14 +411,16 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn executes_block_script_via_host_trait() {
-        let ParseState::Complete(program) = parse("if test\n echo yes\nelse\n echo no\nend")?
+        let ParseState::Complete(program) = parse("if test\n echo yes\nelse\n echo no\nend")
+            .expect("script parse must succeed")
         else {
             panic!("script must be complete");
         };
         let mut host = ScriptRecordingHost { lines: Vec::new() };
-        let status = execute_script(&mut host, &program).await?;
+        let status = execute_script(&mut host, &program)
+            .await
+            .expect("script execution must succeed");
         assert!(status.is_success());
         assert_eq!(host.lines, vec!["test", "echo yes"]);
-        Ok::<(), anyhow::Error>(())
     }
 }

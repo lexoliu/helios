@@ -73,7 +73,7 @@ macro_rules! impl_program_bindings {
                 request: crate::$bindings::bindings::helios::system::programs::ExecRequest,
             ) -> wasmtime::Result<
                 Result<
-                    crate::$bindings::bindings::helios::system::programs::InstanceId,
+                    crate::$bindings::bindings::helios::system::programs::ExecResult,
                     crate::$bindings::bindings::helios::system::programs::ExecError,
                 >,
             > {
@@ -89,7 +89,14 @@ macro_rules! impl_program_bindings {
                         .exec(request.name, &request.wasm, WasiRights::empty())
                         .await
                     {
-                        Ok(instance_id) => Ok(instance_id.raw()),
+                        Ok(result) => Ok(crate::$bindings::bindings::helios::system::programs::ExecResult {
+                            instance_id: result.instance_id.raw(),
+                            exit_code: result.exit_code,
+                            output: crate::$bindings::bindings::helios::system::programs::ExecOutput {
+                                stdout: result.output.stdout,
+                                stderr: result.output.stderr,
+                            },
+                        }),
                         Err(error) => Err($convert_error(error)),
                     },
                 )

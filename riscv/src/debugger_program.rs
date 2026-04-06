@@ -79,6 +79,7 @@ pub(crate) struct DeadlinePollable {
 pub(crate) enum OutputMode {
     Serial,
     Trace,
+    Capture,
 }
 pub struct SbiRawMutex {
     inner: Arc<RawMutex>,
@@ -175,6 +176,8 @@ fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), Debugge
             arguments: Vec::new(),
             environment: Vec::new(),
             output_mode: OutputMode::Serial,
+            captured_stdout: Vec::new(),
+            captured_stderr: Vec::new(),
         },
     );
     store.limiter(|state| state);
@@ -493,6 +496,7 @@ fn add_programs_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()
         "exec",
         |caller: StoreContextMut<'_, StoreData>,
          (request,): (bindings::helios::system::programs::ExecRequest,)| {
+            let execution_cpu = caller.data().cpu.clone();
             let service = caller.data().debug_state.program_service().or_else(|| {
                 crate::program_host::install_program_service(
                     &caller.data().cpu,
@@ -510,13 +514,21 @@ fn add_programs_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()
                 };
                 let response = service
                     .exec(
+                        execution_cpu,
                         request.name,
                         request.args,
                         &request.wasm,
                         WasiRights::empty(),
                     )
                     .await
-                    .map(|instance_id| instance_id.raw())
+                    .map(|result| bindings::helios::system::programs::ExecResult {
+                        instance_id: result.instance_id.raw(),
+                        exit_code: result.exit_code,
+                        output: bindings::helios::system::programs::ExecOutput {
+                            stdout: result.output.stdout,
+                            stderr: result.output.stderr,
+                        },
+                    })
                     .map_err(convert_launch_error);
                 Ok::<_, wasmtime::Error>((response,))
             })
@@ -531,6 +543,7 @@ fn add_programs_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::R
         "exec",
         |caller: StoreContextMut<'_, StoreData>,
          (request,): (crate::program_bindings::bindings::helios::system::programs::ExecRequest,)| {
+            let execution_cpu = caller.data().cpu.clone();
             let service = caller.data().debug_state.program_service().or_else(|| {
                 crate::program_host::install_program_service(
                     &caller.data().cpu,
@@ -547,9 +560,22 @@ fn add_programs_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::R
                     ),));
                 };
                 let response = service
-                    .exec(request.name, request.args, &request.wasm, WasiRights::empty())
+                    .exec(
+                        execution_cpu,
+                        request.name,
+                        request.args,
+                        &request.wasm,
+                        WasiRights::empty(),
+                    )
                     .await
-                    .map(|instance_id| instance_id.raw())
+                    .map(|result| crate::program_bindings::bindings::helios::system::programs::ExecResult {
+                        instance_id: result.instance_id.raw(),
+                        exit_code: result.exit_code,
+                        output: crate::program_bindings::bindings::helios::system::programs::ExecOutput {
+                            stdout: result.output.stdout,
+                            stderr: result.output.stderr,
+                        },
+                    })
                     .map_err(convert_program_launch_error);
                 Ok::<_, wasmtime::Error>((response,))
             })
@@ -1082,6 +1108,8 @@ pub(crate) struct StoreData {
     pub(crate) arguments: Vec<String>,
     pub(crate) environment: Vec<(String, String)>,
     pub(crate) output_mode: OutputMode,
+    pub(crate) captured_stdout: Vec<u8>,
+    pub(crate) captured_stderr: Vec<u8>,
 }
 
 impl StoreData {
@@ -1089,8 +1117,15 @@ impl StoreData {
         self.debug_state.uptime_nanos(self.cpu.now().ticks())
     }
 
-    pub(crate) fn write_output(&self, bytes: &[u8]) {
-        GuestOutput::from_store(self).write(bytes);
+    pub(crate) fn write_output(&mut self, stream: OutputStreamKind, bytes: &[u8]) {
+        GuestOutput::from_store(self).write(self, stream, bytes);
+    }
+
+    pub(crate) fn take_captured_output(&self) -> crate::program_host::ExecOutput {
+        crate::program_host::ExecOutput {
+            stdout: self.captured_stdout.clone(),
+            stderr: self.captured_stderr.clone(),
+        }
     }
 
     pub(crate) fn record_call_hook(&mut self, hook: CallHook) {
@@ -1137,6 +1172,13 @@ impl IoView for StoreData {
     }
 }
 
+
+#[derive(Clone, Copy)]
+pub(crate) enum OutputStreamKind {
+    Stdout,
+    Stderr,
+}
+
 impl GuestOutput {
     fn from_store(store: &StoreData) -> Self {
         Self {
@@ -1146,7 +1188,7 @@ impl GuestOutput {
         }
     }
 
-    fn write(&self, bytes: &[u8]) {
+    fn write(&self, store: &mut StoreData, stream: OutputStreamKind, bytes: &[u8]) {
         match self.mode {
             OutputMode::Serial => write_serial(bytes),
             OutputMode::Trace => {
@@ -1156,6 +1198,10 @@ impl GuestOutput {
                 self.debug_state
                     .record_console_text(self.cpu.now().ticks(), text);
             }
+            OutputMode::Capture => match stream {
+                OutputStreamKind::Stdout => store.captured_stdout.extend_from_slice(bytes),
+                OutputStreamKind::Stderr => store.captured_stderr.extend_from_slice(bytes),
+            },
         }
     }
 }
@@ -1176,7 +1222,20 @@ impl Pollable for DebugSerialOutputStream {
 #[wasmtime_wasi_io::async_trait]
 impl OutputStream for DebugSerialOutputStream {
     fn write(&mut self, bytes: Bytes) -> Result<(), StreamError> {
-        self.sink.write(bytes.as_ref());
+        match self.sink.mode {
+            OutputMode::Serial => write_serial(bytes.as_ref()),
+            OutputMode::Trace => {
+                let text = core::str::from_utf8(bytes.as_ref()).unwrap_or_else(|error| {
+                    panic!("guest attempted to write non-utf8 stdout/stderr bytes: {error}")
+                });
+                self.sink
+                    .debug_state
+                    .record_console_text(self.sink.cpu.now().ticks(), text);
+            }
+            OutputMode::Capture => {
+                panic!("captured output must flow through wasi stream glue")
+            }
+        }
         Ok(())
     }
 

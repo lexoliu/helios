@@ -159,9 +159,9 @@ fn main() -> Result<()> {
             let started = programs::exec(&mut client, &path, &args).await?;
             writeln!(
                 std::io::stdout(),
-                "started instance {} {}",
+                "instance {} exited with code {}",
                 started.instance_id,
-                started.name
+                started.exit_code
             )?;
             Ok(())
         }),

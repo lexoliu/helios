@@ -28,7 +28,7 @@ use strsim::normalized_damerau_levenshtein;
 use crate::edit_tui;
 use crate::filesystem;
 use crate::help;
-use crate::programs;
+use crate::programs::exec as exec_program;
 use crate::rpc::RpcPane;
 use crate::runtime;
 use shell_core::{self, CommandStatus, ScriptHost, Statement};
@@ -421,20 +421,7 @@ impl<T: TerminalIo> Shell<T> {
         }
 
         match command {
-            Command::Pwd => self.print_line(filesystem::pwd())?,
-            Command::List(path) => {
-                let output = filesystem::list(client, path.as_deref()).await?;
-                self.print_block(&output)?;
-            }
-            Command::Cat(path) => {
-                let bytes = filesystem::cat(client, &path).await?;
-                self.write_bytes(&bytes)?;
-            }
             Command::Edit(path) => edit_tui::run(client, &path).await?,
-            Command::Test(expression) => {
-                let success = filesystem::test(client, &expression).await?;
-                return Ok(CommandStatus::new(if success { 0 } else { 1 }));
-            }
             Command::Source(path) => {
                 let script = std::fs::read_to_string(&path)
                     .with_context(|| format!("failed to read shell script {path}"))?;
@@ -443,30 +430,6 @@ impl<T: TerminalIo> Shell<T> {
                     ParsedLine::Output(output) => anyhow::bail!("{output}"),
                 };
                 return self.execute_program(client, &program).await;
-            }
-            Command::Mkdir(path) => filesystem::mkdir(client, &path).await?,
-            Command::Remove(path) => filesystem::remove(client, &path).await?,
-            Command::Copy { source, destination } => {
-                filesystem::copy(client, &source, &destination).await?
-            }
-            Command::Move { source, destination } => {
-                filesystem::move_path(client, &source, &destination).await?
-            }
-            Command::Touch(path) => filesystem::touch(client, &path).await?,
-            Command::Echo(target) => match target {
-                filesystem::EchoTarget::Stdout(bytes) => self.write_bytes(&bytes)?,
-                filesystem::EchoTarget::File {
-                    path,
-                    bytes,
-                    append,
-                } => filesystem::write(client, &path, &bytes, append).await?,
-            },
-            Command::Exec { path, args } => {
-                let started = programs::exec(client, &path, &args).await?;
-                self.print_line(&format!(
-                    "started instance {} {}",
-                    started.instance_id, started.name
-                ))?;
             }
             Command::ShowStats => stats_tui::run(client, LIVE_STATS_PERIOD_MS).await?,
             Command::ShowTracing => self.show_tracing(client).await?,
@@ -501,6 +464,17 @@ impl<T: TerminalIo> Shell<T> {
                 self.print_line("rpc payload updated")?;
             }
             Command::RpcCall => self.call_rpc(client).await?,
+            Command::Pwd
+            | Command::List(_)
+            | Command::Cat(_)
+            | Command::Test(_)
+            | Command::Mkdir(_)
+            | Command::Remove(_)
+            | Command::Copy { .. }
+            | Command::Move { .. }
+            | Command::Touch(_)
+            | Command::Echo(_)
+            | Command::Exec { .. } => return self.execute_guest_command(client, &command).await,
             Command::Help(_) | Command::Clear | Command::Exit => unreachable!(),
         }
 
@@ -521,6 +495,23 @@ impl<T: TerminalIo> Shell<T> {
             _ => return Ok(None),
         };
         Ok(Some(status))
+    }
+
+
+    async fn execute_guest_command(
+        &mut self,
+        client: &mut RpcClient,
+        command: &Command,
+    ) -> Result<CommandStatus> {
+        let line = render_command_for_guest(command)?;
+        let result = exec_program(client, "/bin/sh", &["-c".to_owned(), line]).await?;
+        if !result.output.stdout.is_empty() {
+            self.write_bytes(&result.output.stdout)?;
+        }
+        if !result.output.stderr.is_empty() {
+            self.write_bytes(&result.output.stderr)?;
+        }
+        Ok(CommandStatus::new(result.exit_code as u8))
     }
 
     async fn show_tracing(&mut self, client: &mut RpcClient) -> Result<()> {
@@ -866,6 +857,69 @@ fn render_help_hint(prefix: &[&str]) -> String {
             AnsiStyle::new().fg(Color::Green).paint(command),
             AnsiStyle::new().fg(Color::Green).paint(command),
         ),
+    }
+}
+
+
+fn render_command_for_guest(command: &Command) -> Result<String> {
+    match command {
+        Command::Pwd => Ok("pwd".to_owned()),
+        Command::List(path) => Ok(match path {
+            Some(path) => format!("ls {}", shell_words::quote(path)),
+            None => "ls".to_owned(),
+        }),
+        Command::Cat(path) => Ok(format!("cat {}", shell_words::quote(path))),
+        Command::Test(expression) => Ok(format!(
+            "test {}",
+            expression.iter().map(|part| shell_words::quote(part)).collect::<Vec<_>>().join(" ")
+        )),
+        Command::Mkdir(path) => Ok(format!("mkdir {}", shell_words::quote(path))),
+        Command::Remove(path) => Ok(format!("rm {}", shell_words::quote(path))),
+        Command::Copy { source, destination } => Ok(format!(
+            "cp {} {}",
+            shell_words::quote(source),
+            shell_words::quote(destination)
+        )),
+        Command::Move { source, destination } => Ok(format!(
+            "mv {} {}",
+            shell_words::quote(source),
+            shell_words::quote(destination)
+        )),
+        Command::Touch(path) => Ok(format!("touch {}", shell_words::quote(path))),
+        Command::Echo(target) => match target {
+            filesystem::EchoTarget::Stdout(bytes) => Ok(format!(
+                "echo {}",
+                shell_words::quote(core::str::from_utf8(bytes).unwrap_or("").trim_end_matches('\n'))
+            )),
+            filesystem::EchoTarget::File { path, bytes, append } => {
+                let operator = if *append { ">>" } else { ">" };
+                Ok(format!(
+                    "echo {} {} {}",
+                    shell_words::quote(core::str::from_utf8(bytes).unwrap_or("").trim_end_matches('\n')),
+                    operator,
+                    shell_words::quote(path)
+                ))
+            }
+        },
+        Command::Exec { path, args } => {
+            let mut rendered = vec!["exec".to_owned(), shell_words::quote(path).to_string()];
+            rendered.extend(args.iter().map(|arg| shell_words::quote(arg).to_string()));
+            Ok(rendered.join(" "))
+        }
+        Command::Help(_)
+        | Command::Clear
+        | Command::Exit
+        | Command::Edit(_)
+        | Command::Source(_)
+        | Command::ShowStats
+        | Command::ShowTracing
+        | Command::TracingLimit(_)
+        | Command::TracingLevel(_)
+        | Command::TracingTargets(_)
+        | Command::RpcInstance(_)
+        | Command::RpcFunc(_)
+        | Command::RpcPayload(_)
+        | Command::RpcCall => anyhow::bail!("command is not delegated to guest shell"),
     }
 }
 

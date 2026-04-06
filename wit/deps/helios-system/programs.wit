@@ -13,6 +13,17 @@ interface programs {
     wasm: list<u8>,
   }
 
+  record exec-output {
+    stdout: list<u8>,
+    stderr: list<u8>,
+  }
+
+  record exec-result {
+    instance-id: instance-id,
+    exit-code: u32,
+    output: exec-output,
+  }
+
   enum exec-error-kind {
     invalid-binary,
     missing-entry,
@@ -27,6 +38,6 @@ interface programs {
     detail: string,
   }
 
-  /// Launches a pure wasm program with the platform's default minimal rights.
-  exec: func(request: exec-request) -> result<instance-id, exec-error>;
+  /// Executes a pure wasm program with the platform's default minimal rights and waits for completion.
+  exec: func(request: exec-request) -> result<exec-result, exec-error>;
 }

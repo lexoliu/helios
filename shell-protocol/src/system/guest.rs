@@ -105,7 +105,16 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>>
                 args: request.args,
                 wasm: request.wasm,
             });
-            let response = response.map_err(|error| programs::ExecError {
+            let response = response
+                .map(|result| programs::ExecResult {
+                    instance_id: result.instance_id,
+                    exit_code: result.exit_code,
+                    output: programs::ExecOutput {
+                        stdout: result.output.stdout,
+                        stderr: result.output.stderr,
+                    },
+                })
+                .map_err(|error| programs::ExecError {
                 kind: convert_launch_error_kind(error.kind),
                 detail: error.detail,
             });

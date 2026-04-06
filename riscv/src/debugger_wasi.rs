@@ -17,7 +17,7 @@ use wasmtime::component::{
     StreamConsumer, StreamReader, StreamResult,
 };
 
-use crate::debugger_program::StoreData;
+use crate::debugger_program::{OutputStreamKind, StoreData};
 
 pub(crate) mod bindings {
     mod generated {
@@ -172,6 +172,7 @@ pub(crate) struct DebugFileSystem {
 
 struct SerialStreamConsumer<T> {
     getter: fn(&mut T) -> &mut StoreData,
+    stream: OutputStreamKind,
     result: Option<oneshot::Sender<core::result::Result<(), cli_types::ErrorCode>>>,
 }
 
@@ -179,9 +180,11 @@ impl<T> SerialStreamConsumer<T> {
     fn new(
         getter: fn(&mut T) -> &mut StoreData,
         result: oneshot::Sender<core::result::Result<(), cli_types::ErrorCode>>,
+        stream: OutputStreamKind,
     ) -> Self {
         Self {
             getter,
+            stream,
             result: Some(result),
         }
     }
@@ -216,8 +219,9 @@ impl<T: 'static> StreamConsumer<T> for SerialStreamConsumer<T> {
 
         let mut bytes = Vec::with_capacity(available);
         source.read(&mut store, &mut bytes)?;
-        let getter = self.as_ref().get_ref().getter;
-        getter(store.data_mut()).write_output(&bytes);
+        let consumer = self.as_ref().get_ref();
+        let getter = consumer.getter;
+        getter(store.data_mut()).write_output(consumer.stream, &bytes);
         Poll::Ready(Ok(StreamResult::Completed))
     }
 }
@@ -974,7 +978,7 @@ impl wasi::cli::stdout::HostWithStore for HasSelf<StoreData> {
     ) -> Result<FutureReader<core::result::Result<(), cli_types::ErrorCode>>> {
         let (tx, rx) = oneshot::channel();
         let getter = access.getter();
-        data.pipe(&mut access, SerialStreamConsumer::new(getter, tx))?;
+        data.pipe(&mut access, SerialStreamConsumer::new(getter, tx, OutputStreamKind::Stdout))?;
         FutureReader::new(&mut access, async move {
             match rx.await {
                 Ok(result) => Ok::<_, wasmtime::Error>(result),
@@ -991,7 +995,15 @@ impl wasi::cli::stderr::HostWithStore for HasSelf<StoreData> {
         access: Access<'_, T, Self>,
         data: StreamReader<u8>,
     ) -> Result<FutureReader<core::result::Result<(), cli_types::ErrorCode>>> {
-        wasi::cli::stdout::HostWithStore::write_via_stream(access, data)
+        let (tx, rx) = oneshot::channel();
+        let getter = access.getter();
+        data.pipe(&mut access, SerialStreamConsumer::new(getter, tx, OutputStreamKind::Stderr))?;
+        FutureReader::new(&mut access, async move {
+            match rx.await {
+                Ok(result) => Ok::<_, wasmtime::Error>(result),
+                Err(_) => Ok::<_, wasmtime::Error>(Ok::<(), cli_types::ErrorCode>(())),
+            }
+        })
     }
 }
 
