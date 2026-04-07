@@ -10,6 +10,8 @@ use futures_io::{AsyncRead, AsyncWrite};
 use helios_api::fs;
 #[cfg(feature = "guest")]
 use helios_api::programs as host_programs;
+#[cfg(feature = "guest")]
+use shell_core::programs::infer_program_name;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "guest")]
 use std::path::Path;
@@ -62,7 +64,7 @@ pub(crate) async fn dispatch(func: &str, payload: &[u8]) -> Result<Vec<u8>> {
         "exec-path" => {
             let request = postcard::from_bytes::<ExecPathRequest>(payload)
                 .context("failed to decode debugger programs.exec-path request payload")?;
-            let name = infer_instance_name(&request.path)?;
+            let name = infer_program_name(Path::new(&request.path))?;
             let wasm = fs::read(&request.path)
                 .await
                 .with_context(|| format!("failed to read executable {}", request.path))?;
@@ -88,15 +90,6 @@ pub(crate) async fn dispatch(func: &str, payload: &[u8]) -> Result<Vec<u8>> {
         }
         _ => unreachable!("supports must reject unsupported debugger program requests"),
     }
-}
-
-#[cfg(feature = "guest")]
-fn infer_instance_name(path: &str) -> Result<String> {
-    let name = Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("program path does not end with a valid utf-8 file name")?;
-    Ok(name.strip_suffix(".wasm").unwrap_or(name).to_owned())
 }
 
 #[cfg(feature = "guest")]

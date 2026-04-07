@@ -1642,6 +1642,7 @@ dependencies = [
  "helios-api",
  "postcard",
  "serde",
+ "shell-core",
  "tokio",
  "tokio-util",
  "wit-bindgen 0.53.1",
