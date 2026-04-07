@@ -1,3 +1,4 @@
+pub mod guest_commands;
 pub mod programs;
 
 use anyhow::{Result, bail};

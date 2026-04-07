@@ -2,19 +2,11 @@ use std::fmt::Write as _;
 use std::path::{Component, Path};
 
 use anyhow::{bail, Result};
+pub use shell_core::guest_commands::EchoTarget;
 use globset::Glob;
 use helios_shell_protocol::debugger::filesystem::{self, DirectoryEntry, EntryKind};
 
 use crate::serial::RpcClient;
-
-pub enum EchoTarget {
-    Stdout(Vec<u8>),
-    File {
-        path: String,
-        bytes: Vec<u8>,
-        append: bool,
-    },
-}
 
 pub fn pwd() -> &'static str {
     "/"
