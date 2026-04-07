@@ -39,15 +39,13 @@ pub use std::io::Error;
 use std::io::Write as _;
 pub use wit_bindgen;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RunError;
-
+#[allow(clippy::result_unit_err)]
 pub trait MainOutput {
-    fn into_run_result(self) -> core::result::Result<(), RunError>;
+    fn into_run_result(self) -> core::result::Result<(), ()>;
 }
 
 impl MainOutput for () {
-    fn into_run_result(self) -> core::result::Result<(), RunError> {
+    fn into_run_result(self) -> core::result::Result<(), ()> {
         Ok(())
     }
 }
@@ -56,12 +54,12 @@ impl<E> MainOutput for core::result::Result<(), E>
 where
     E: core::fmt::Display,
 {
-    fn into_run_result(self) -> core::result::Result<(), RunError> {
+    fn into_run_result(self) -> core::result::Result<(), ()> {
         match self {
             Ok(()) => Ok(()),
             Err(error) => {
                 let _ = writeln!(std::io::stderr().lock(), "{error}");
-                Err(RunError)
+                Err(())
             }
         }
     }
