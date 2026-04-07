@@ -1,8 +1,7 @@
 use std::fmt::Write as _;
-use std::path::{Component, Path};
-
 use anyhow::{bail, Result};
 pub use shell_core::guest_commands::EchoTarget;
+use shell_core::paths::normalize_segments;
 pub use shell_core::paths::normalize_absolute as normalize_path;
 use globset::Glob;
 use helios_shell_protocol::debugger::filesystem::{self, DirectoryEntry, EntryKind};
@@ -161,24 +160,8 @@ fn has_glob(input: &str) -> bool {
 }
 
 fn normalize_glob_pattern(input: &str) -> Result<String> {
-    let path = Path::new(input);
-    let mut segments = Vec::new();
-    for component in path.components() {
-        match component {
-            Component::RootDir | Component::CurDir => {}
-            Component::Normal(segment) => segments.push(
-                segment
-                    .to_str()
-                    .ok_or_else(|| anyhow::anyhow!("path {input:?} contains a non-utf8 segment"))?
-                    .to_owned(),
-            ),
-            Component::ParentDir => bail!("path {input:?} contains unsupported parent traversal"),
-            Component::Prefix(_) => bail!("path {input:?} uses an unsupported path prefix"),
-        }
-    }
-
     let mut normalized = Vec::new();
-    for segment in segments {
+    for segment in normalize_segments(input)? {
         if segment.starts_with("**") && segment.len() > 2 {
             normalized.push("**".to_owned());
             normalized.push(format!("*{}", &segment[2..]));
