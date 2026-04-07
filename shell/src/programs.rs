@@ -1,8 +1,6 @@
-use anyhow::{bail, Context as _, Result};
+use anyhow::{bail, Result};
 use helios_shell_protocol::debugger::filesystem;
 use helios_shell_protocol::system::programs::{self, ExecRequest, ExecResult};
-use wasmparser::Parser;
-use wit_component::ComponentEncoder;
 
 use crate::filesystem::normalize_path;
 use crate::serial::RpcClient;
@@ -11,14 +9,13 @@ const PROGRAM_SEARCH_DIRECTORIES: &[&str] = &["/bin"];
 
 pub async fn exec(client: &mut RpcClient, path: &str, args: &[String]) -> Result<ExecResult> {
     let resolved = resolve_program(client, path).await?;
-    let wasm = load_component(&resolved.path, &resolved.wasm)?;
     let name = infer_instance_name(&resolved.path)?;
     let result = programs::exec(
         &*client,
         &ExecRequest {
             name: name.clone(),
             args: args.to_vec(),
-            wasm,
+            wasm: resolved.wasm,
         },
     )
     .await?;
@@ -47,19 +44,6 @@ async fn resolve_program(client: &mut RpcClient, input: &str) -> Result<Resolved
         "failed to locate runnable program {input:?} in the guest filesystem:\n{}",
         errors.join("\n")
     );
-}
-
-fn load_component(path: &str, wasm: &[u8]) -> Result<Vec<u8>> {
-    if Parser::is_component(&wasm) {
-        return Ok(wasm.to_vec());
-    }
-
-    ComponentEncoder::default()
-        .module(&wasm)
-        .with_context(|| format!("failed to load core wasm module {path}"))?
-        .validate(true)
-        .encode()
-        .with_context(|| format!("failed to encode component {path}"))
 }
 
 fn infer_instance_name(path: &str) -> Result<String> {

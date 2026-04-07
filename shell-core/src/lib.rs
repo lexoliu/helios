@@ -1,14 +1,5 @@
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Result, bail};
 use async_trait::async_trait;
-use conch_parser::ast::TopLevelCommand;
-use conch_parser::lexer::Lexer;
-use conch_parser::parse::DefaultParser;
-use thiserror::Error;
-
-#[derive(Debug)]
-pub struct Program {
-    commands: Vec<TopLevelCommand<String>>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Statement {
@@ -26,41 +17,15 @@ pub enum ParseState {
     Incomplete,
 }
 
-#[derive(Debug, Error)]
-pub enum ShellParseError {
-    #[error("shell parse error: {0}")]
-    Parse(String),
-}
-
-#[async_trait(?Send)]
-pub trait ShellHost {
-    async fn execute_program(&mut self, program: &Program) -> Result<ExitStatus>;
-}
-
 #[async_trait(?Send)]
 pub trait ScriptHost {
     async fn execute_line(&mut self, line: &str) -> Result<CommandStatus>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ExitStatus(u8);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommandStatus {
     code: u8,
     should_exit: bool,
-}
-
-impl ExitStatus {
-    pub const SUCCESS: Self = Self(0);
-
-    pub const fn new(code: u8) -> Self {
-        Self(code)
-    }
-
-    pub const fn code(self) -> u8 {
-        self.0
-    }
 }
 
 impl CommandStatus {
@@ -94,26 +59,6 @@ impl CommandStatus {
     pub const fn should_exit(self) -> bool {
         self.should_exit
     }
-}
-
-impl Program {
-    pub fn parse(input: &str) -> core::result::Result<Self, ShellParseError> {
-        let parser = DefaultParser::new(Lexer::new(input.chars()));
-        let commands = parser
-            .into_iter()
-            .collect::<core::result::Result<Vec<_>, _>>()
-            .map_err(|error| ShellParseError::Parse(error.to_string()))?;
-        Ok(Self { commands })
-    }
-
-    pub fn commands(&self) -> &[TopLevelCommand<String>] {
-        &self.commands
-    }
-}
-
-pub async fn run<H: ShellHost>(host: &mut H, input: &str) -> Result<ExitStatus> {
-    let program = Program::parse(input).context("failed to parse shell input")?;
-    host.execute_program(&program).await
 }
 
 pub async fn execute_script<H: ScriptHost>(host: &mut H, program: &[Statement]) -> Result<CommandStatus> {
@@ -315,39 +260,9 @@ impl BlockParser<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandStatus, ExitStatus, ParseState, Program, ScriptHost, ShellHost, Statement, execute_script, needs_more_input, parse, run};
+    use super::{CommandStatus, ParseState, ScriptHost, Statement, execute_script, needs_more_input, parse};
     use anyhow::Result;
     use async_trait::async_trait;
-
-    struct RecordingHost {
-        count: usize,
-    }
-
-    #[async_trait(?Send)]
-    impl ShellHost for RecordingHost {
-        async fn execute_program(&mut self, program: &Program) -> Result<ExitStatus> {
-            self.count = program.commands().len();
-            Ok(ExitStatus::SUCCESS)
-        }
-    }
-
-    #[test]
-    fn parses_if_syntax() {
-        let program = Program::parse("if true; then echo ok; fi\n").expect("if syntax must parse");
-        assert_eq!(program.commands().len(), 1);
-    }
-
-    #[test]
-    fn parses_pipeline_syntax() {
-        let program = Program::parse("echo hi | cat\n").expect("pipeline syntax must parse");
-        assert_eq!(program.commands().len(), 1);
-    }
-
-    #[test]
-    fn rejects_invalid_syntax() {
-        let error = Program::parse("if\n").expect_err("invalid shell syntax must fail");
-        assert!(error.to_string().contains("shell parse error"));
-    }
 
     #[test]
     fn parses_simple_if_else_end_block() {
@@ -387,14 +302,6 @@ mod tests {
                 ..
             } if matches!(&else_branch[0], Statement::If { condition, .. } if condition == "test -e /b")
         ));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn forwards_program_to_host() {
-        let mut host = RecordingHost { count: 0 };
-        let status = run(&mut host, "echo hi\n").await.expect("shell run must succeed");
-        assert_eq!(status.code(), 0);
-        assert_eq!(host.count, 1);
     }
 
     struct ScriptRecordingHost {

@@ -27,5 +27,3 @@ serialport = "4.9.0"
 shell-core = { path = "../shell-core" }
 shell-words = "1.1.0"
 strsim = "0.11.1"
-wasmparser = "0.245.0"
-wit-component = "0.245.0"
