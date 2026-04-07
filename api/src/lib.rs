@@ -39,12 +39,15 @@ pub use std::io::Error;
 use std::io::Write as _;
 pub use wit_bindgen;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunError;
+
 pub trait MainOutput {
-    fn into_run_result(self) -> core::result::Result<(), ()>;
+    fn into_run_result(self) -> core::result::Result<(), RunError>;
 }
 
 impl MainOutput for () {
-    fn into_run_result(self) -> core::result::Result<(), ()> {
+    fn into_run_result(self) -> core::result::Result<(), RunError> {
         Ok(())
     }
 }
@@ -53,12 +56,12 @@ impl<E> MainOutput for core::result::Result<(), E>
 where
     E: core::fmt::Display,
 {
-    fn into_run_result(self) -> core::result::Result<(), ()> {
+    fn into_run_result(self) -> core::result::Result<(), RunError> {
         match self {
             Ok(()) => Ok(()),
             Err(error) => {
                 let _ = writeln!(std::io::stderr().lock(), "{error}");
-                Err(())
+                Err(RunError)
             }
         }
     }

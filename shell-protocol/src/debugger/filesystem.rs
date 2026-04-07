@@ -3,7 +3,7 @@ use crate::transport::Client;
 #[cfg(feature = "host")]
 use anyhow::{Context as _, Result};
 #[cfg(feature = "guest")]
-use anyhow::{Context as _, Result, bail};
+use anyhow::bail;
 #[cfg(feature = "host")]
 use futures_io::{AsyncRead, AsyncWrite};
 #[cfg(feature = "guest")]
@@ -285,7 +285,7 @@ pub(crate) async fn dispatch(func: &str, payload: &[u8]) -> Result<Vec<u8>> {
         }
         "move" => {
             let request = decode_path_pair_request(payload, "filesystem.move")?;
-            move_path(&request.source, &request.destination).await?;
+            move_guest_path(&request.source, &request.destination).await?;
             postcard::to_allocvec(&())
                 .context("failed to encode debugger filesystem.move response")
         }
@@ -482,7 +482,7 @@ async fn copy_path(source: &str, destination: &str) -> Result<()> {
 }
 
 #[cfg(feature = "guest")]
-async fn move_path(source: &str, destination: &str) -> Result<()> {
+async fn move_guest_path(source: &str, destination: &str) -> Result<()> {
     if source == destination {
         bail!("debugger filesystem move requires distinct source and destination paths");
     }

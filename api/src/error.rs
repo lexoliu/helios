@@ -30,14 +30,17 @@ pub fn filesystem(
     io::Error::other(format!("filesystem operation on {path:?} failed: {code:?}"))
 }
 
+#[cfg(feature = "io")]
 pub fn stdout(code: crate::bindings::wasi::cli::types::ErrorCode) -> io::Error {
     io::Error::other(format!("stdout write failed: {code:?}"))
 }
 
+#[cfg(feature = "io")]
 pub fn stderr(code: crate::bindings::wasi::cli::types::ErrorCode) -> io::Error {
     io::Error::other(format!("stderr write failed: {code:?}"))
 }
 
+#[cfg(feature = "io")]
 pub fn stdin(code: crate::bindings::wasi::cli::types::ErrorCode) -> io::Error {
     io::Error::other(format!("stdin read failed: {code:?}"))
 }

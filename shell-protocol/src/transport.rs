@@ -18,6 +18,7 @@ use crate::wire::{Frame, read_frame, write_frame};
 
 type IoFuture<T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send + 'static>>;
 type ServeFuture = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
+type InvocationAccept<R, W> = Result<((), Outgoing<R, W>, Incoming<R, W>)>;
 const RAW_UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Default)]
@@ -70,7 +71,7 @@ struct ServerInner<R, W> {
 
 #[derive(Clone)]
 struct Registration<R, W> {
-    tx: mpsc::Sender<Result<((), Outgoing<R, W>, Incoming<R, W>)>>,
+    tx: mpsc::Sender<InvocationAccept<R, W>>,
 }
 
 enum Reply {
@@ -105,7 +106,7 @@ struct OutgoingState {
 
 pub struct InvocationStream<R, W> {
     server: Arc<ServerInner<R, W>>,
-    rx: mpsc::Receiver<Result<((), Outgoing<R, W>, Incoming<R, W>)>>,
+    rx: mpsc::Receiver<InvocationAccept<R, W>>,
     pending: Option<ServeFuture>,
 }
 
@@ -453,7 +454,7 @@ where
                     })?;
                     pump_server_once(inner)
                         .await
-                        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+                        .map_err(io::Error::other)?;
                 }
             }
         }
@@ -1261,8 +1262,9 @@ mod tests {
                         ping_release.notify_one();
                     });
 
+                let empty_paths: [[Option<usize>; 0]; 0] = [];
                 let (mut first_outgoing, mut first_incoming) = client
-                    .invoke((), "transport:test", "stream", Bytes::new(), [[None; 0]; 0])
+                    .invoke((), "transport:test", "stream", Bytes::new(), empty_paths)
                     .await
                     .unwrap_or_else(|error| panic!("failed to open stream invocation: {error}"));
                 first_outgoing.shutdown().await.unwrap_or_else(|error| {

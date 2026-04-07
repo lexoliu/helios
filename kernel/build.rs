@@ -323,11 +323,7 @@ fn build_wasip2_program(
     );
 
     let profile = env::var("PROFILE").unwrap_or_else(|error| panic!("PROFILE is missing: {error}"));
-    let profile_dir = match profile.as_str() {
-        "debug" => "debug",
-        "release" => "release",
-        other => other,
-    };
+    let profile_dir = profile.as_str();
     target_dir
         .join("wasm32-wasip2")
         .join(profile_dir)
