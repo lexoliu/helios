@@ -16,6 +16,7 @@ use helios_kernel::{
     OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease, ProgramExecErrorKind, RawMutex, RawRwLock,
     RegisteredInstance, embedded_debugger, heap_stats,
 };
+use spin::Mutex;
 use thiserror::Error;
 use wasmtime::component::{
     Accessor, Destination, HasSelf, Linker, Resource, ResourceTable, ResourceType, StreamProducer,
@@ -67,9 +68,12 @@ struct GuestOutput {
     mode: OutputMode,
     debug_state: RuntimeState,
     cpu: RiscvCpu,
+    captured_stdout: Arc<Mutex<Vec<u8>>>,
+    captured_stderr: Arc<Mutex<Vec<u8>>>,
 }
 pub(crate) struct DebugSerialOutputStream {
     sink: GuestOutput,
+    stream: OutputStreamKind,
 }
 pub(crate) struct DeadlinePollable {
     pub(crate) cpu: RiscvCpu,
@@ -176,8 +180,8 @@ fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), Debugge
             arguments: Vec::new(),
             environment: Vec::new(),
             output_mode: OutputMode::Serial,
-            captured_stdout: Vec::new(),
-            captured_stderr: Vec::new(),
+            captured_stdout: Arc::new(Mutex::new(Vec::new())),
+            captured_stderr: Arc::new(Mutex::new(Vec::new())),
         },
     );
     store.limiter(|state| state);
@@ -496,7 +500,6 @@ fn add_programs_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()
         "exec",
         |caller: StoreContextMut<'_, StoreData>,
          (request,): (bindings::helios::system::programs::ExecRequest,)| {
-            let execution_cpu = caller.data().cpu.clone();
             let service = caller.data().debug_state.program_service().or_else(|| {
                 crate::program_host::install_program_service(
                     &caller.data().cpu,
@@ -514,7 +517,6 @@ fn add_programs_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()
                 };
                 let response = service
                     .exec(
-                        execution_cpu,
                         request.name,
                         request.args,
                         &request.wasm,
@@ -543,7 +545,6 @@ fn add_programs_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::R
         "exec",
         |caller: StoreContextMut<'_, StoreData>,
          (request,): (crate::program_bindings::bindings::helios::system::programs::ExecRequest,)| {
-            let execution_cpu = caller.data().cpu.clone();
             let service = caller.data().debug_state.program_service().or_else(|| {
                 crate::program_host::install_program_service(
                     &caller.data().cpu,
@@ -561,7 +562,6 @@ fn add_programs_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::R
                 };
                 let response = service
                     .exec(
-                        execution_cpu,
                         request.name,
                         request.args,
                         &request.wasm,
@@ -1108,8 +1108,8 @@ pub(crate) struct StoreData {
     pub(crate) arguments: Vec<String>,
     pub(crate) environment: Vec<(String, String)>,
     pub(crate) output_mode: OutputMode,
-    pub(crate) captured_stdout: Vec<u8>,
-    pub(crate) captured_stderr: Vec<u8>,
+    pub(crate) captured_stdout: Arc<Mutex<Vec<u8>>>,
+    pub(crate) captured_stderr: Arc<Mutex<Vec<u8>>>,
 }
 
 impl StoreData {
@@ -1118,13 +1118,13 @@ impl StoreData {
     }
 
     pub(crate) fn write_output(&mut self, stream: OutputStreamKind, bytes: &[u8]) {
-        GuestOutput::from_store(self).write(self, stream, bytes);
+        GuestOutput::from_store(self).write(stream, bytes);
     }
 
     pub(crate) fn take_captured_output(&self) -> crate::program_host::ExecOutput {
         crate::program_host::ExecOutput {
-            stdout: self.captured_stdout.clone(),
-            stderr: self.captured_stderr.clone(),
+            stdout: self.captured_stdout.lock().clone(),
+            stderr: self.captured_stderr.lock().clone(),
         }
     }
 
@@ -1185,10 +1185,12 @@ impl GuestOutput {
             mode: store.output_mode,
             debug_state: store.debug_state.clone(),
             cpu: store.cpu.clone(),
+            captured_stdout: store.captured_stdout.clone(),
+            captured_stderr: store.captured_stderr.clone(),
         }
     }
 
-    fn write(&self, store: &mut StoreData, stream: OutputStreamKind, bytes: &[u8]) {
+    fn write(&self, stream: OutputStreamKind, bytes: &[u8]) {
         match self.mode {
             OutputMode::Serial => write_serial(bytes),
             OutputMode::Trace => {
@@ -1199,17 +1201,18 @@ impl GuestOutput {
                     .record_console_text(self.cpu.now().ticks(), text);
             }
             OutputMode::Capture => match stream {
-                OutputStreamKind::Stdout => store.captured_stdout.extend_from_slice(bytes),
-                OutputStreamKind::Stderr => store.captured_stderr.extend_from_slice(bytes),
+                OutputStreamKind::Stdout => self.captured_stdout.lock().extend_from_slice(bytes),
+                OutputStreamKind::Stderr => self.captured_stderr.lock().extend_from_slice(bytes),
             },
         }
     }
 }
 
 impl DebugSerialOutputStream {
-    pub(crate) fn from_store(store: &StoreData) -> Self {
+    pub(crate) fn from_store(store: &StoreData, stream: OutputStreamKind) -> Self {
         Self {
             sink: GuestOutput::from_store(store),
+            stream,
         }
     }
 }
@@ -1222,20 +1225,7 @@ impl Pollable for DebugSerialOutputStream {
 #[wasmtime_wasi_io::async_trait]
 impl OutputStream for DebugSerialOutputStream {
     fn write(&mut self, bytes: Bytes) -> Result<(), StreamError> {
-        match self.sink.mode {
-            OutputMode::Serial => write_serial(bytes.as_ref()),
-            OutputMode::Trace => {
-                let text = core::str::from_utf8(bytes.as_ref()).unwrap_or_else(|error| {
-                    panic!("guest attempted to write non-utf8 stdout/stderr bytes: {error}")
-                });
-                self.sink
-                    .debug_state
-                    .record_console_text(self.sink.cpu.now().ticks(), text);
-            }
-            OutputMode::Capture => {
-                panic!("captured output must flow through wasi stream glue")
-            }
-        }
+        self.sink.write(self.stream, bytes.as_ref());
         Ok(())
     }
 
