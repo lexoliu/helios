@@ -9,7 +9,9 @@ use std::string::String;
 use std::vec::Vec;
 
 use crate::bindings::wasi::filesystem::preopens;
-use crate::bindings::wasi::filesystem::types::{Descriptor, DescriptorFlags, OpenFlags, PathFlags};
+use crate::bindings::wasi::filesystem::types::{
+    Descriptor, DescriptorFlags, DescriptorType, ErrorCode, OpenFlags, PathFlags,
+};
 use crate::error;
 use crate::error::Result;
 use futures_lite::future::zip;
@@ -59,6 +61,18 @@ pub async fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> Result
     write_result
 }
 
+pub async fn exists(path: impl AsRef<Path>) -> bool {
+    metadata_type(path).await.is_ok()
+}
+
+pub async fn is_file(path: impl AsRef<Path>) -> bool {
+    matches!(metadata_type(path).await, Ok(DescriptorType::RegularFile))
+}
+
+pub async fn is_dir(path: impl AsRef<Path>) -> bool {
+    matches!(metadata_type(path).await, Ok(DescriptorType::Directory))
+}
+
 fn root_descriptor() -> Result<Descriptor> {
     preopens::get_directories()
         .into_iter()
@@ -67,63 +81,31 @@ fn root_descriptor() -> Result<Descriptor> {
 }
 
 async fn open_file(path: &Path) -> Result<Descriptor> {
-    let mut components = normalized_components(path)?;
-    let display = display_path(path);
-    let file_name = components.pop().ok_or_else(|| {
-        error::filesystem(
-            &display,
-            crate::bindings::wasi::filesystem::types::ErrorCode::Invalid,
-        )
-    })?;
-    let mut descriptor = root_descriptor()?;
+    open_leaf(path, OpenFlags::empty(), DescriptorFlags::READ).await
+}
 
-    for component in components {
-        descriptor = descriptor
-            .open_at(
-                PathFlags::empty(),
-                component,
-                OpenFlags::DIRECTORY,
-                DescriptorFlags::READ,
-            )
-            .await
-            .map_err(|code| error::filesystem(&display, code))?;
+async fn open_directory(path: &Path, writable: bool) -> Result<Descriptor> {
+    if path == Path::new(ROOT_PATH) {
+        return root_descriptor();
     }
 
-    descriptor
-        .open_at(
-            PathFlags::empty(),
-            file_name,
-            OpenFlags::empty(),
-            DescriptorFlags::READ,
-        )
-        .await
-        .map_err(|code| error::filesystem(&display, code))
+    let flags = if writable {
+        DescriptorFlags::READ | DescriptorFlags::MUTATE_DIRECTORY
+    } else {
+        DescriptorFlags::READ
+    };
+    open_leaf(path, OpenFlags::DIRECTORY, flags).await
 }
 
 async fn open_file_for_write(path: &Path) -> Result<Descriptor> {
     let mut components = normalized_components(path)?;
     let display = display_path(path);
     let file_name = components.pop().ok_or_else(|| {
-        error::filesystem(
-            &display,
-            crate::bindings::wasi::filesystem::types::ErrorCode::Invalid,
-        )
+        error::filesystem(&display, ErrorCode::Invalid)
     })?;
-    let mut descriptor = root_descriptor()?;
+    let parent = open_parent_directory(&components, true, &display).await?;
 
-    for component in components {
-        descriptor = descriptor
-            .open_at(
-                PathFlags::empty(),
-                component,
-                OpenFlags::DIRECTORY,
-                DescriptorFlags::READ | DescriptorFlags::MUTATE_DIRECTORY,
-            )
-            .await
-            .map_err(|code| error::filesystem(&display, code))?;
-    }
-
-    descriptor
+    parent
         .open_at(
             PathFlags::empty(),
             file_name,
@@ -132,6 +114,73 @@ async fn open_file_for_write(path: &Path) -> Result<Descriptor> {
         )
         .await
         .map_err(|code| error::filesystem(&display, code))
+}
+
+async fn open_leaf(path: &Path, open_flags: OpenFlags, flags: DescriptorFlags) -> Result<Descriptor> {
+    let mut components = normalized_components(path)?;
+    let display = display_path(path);
+    let file_name = components.pop().ok_or_else(|| {
+        error::filesystem(&display, ErrorCode::Invalid)
+    })?;
+    let parent = open_parent_directory(
+        &components,
+        flags == (DescriptorFlags::READ | DescriptorFlags::MUTATE_DIRECTORY),
+        &display,
+    )
+    .await?;
+
+    parent
+        .open_at(PathFlags::empty(), file_name, open_flags, flags)
+        .await
+        .map_err(|code| error::filesystem(&display, code))
+}
+
+async fn open_parent_directory(
+    components: &[String],
+    writable: bool,
+    display: &str,
+) -> Result<Descriptor> {
+    let mut descriptor = root_descriptor()?;
+    let flags = if writable {
+        DescriptorFlags::READ | DescriptorFlags::MUTATE_DIRECTORY
+    } else {
+        DescriptorFlags::READ
+    };
+
+    for component in components {
+        descriptor = descriptor
+            .open_at(
+                PathFlags::empty(),
+                component.clone(),
+                OpenFlags::DIRECTORY,
+                flags,
+            )
+            .await
+            .map_err(|code| error::filesystem(display, code))?;
+    }
+
+    Ok(descriptor)
+}
+
+async fn metadata_type(path: impl AsRef<Path>) -> Result<DescriptorType> {
+    let path = path.as_ref();
+    if path == Path::new(ROOT_PATH) {
+        return Ok(DescriptorType::Directory);
+    }
+
+    match open_file(path).await {
+        Ok(_) => Ok(DescriptorType::RegularFile),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::IsADirectory
+            ) =>
+        {
+            open_directory(path, false).await?;
+            Ok(DescriptorType::Directory)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn normalized_components(path: &Path) -> Result<Vec<String>> {

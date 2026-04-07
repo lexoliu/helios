@@ -1,5 +1,4 @@
 use std::env;
-use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -105,7 +104,7 @@ impl ScriptHost for GuestShell {
                 io::stdout().write_all(&bytes)?;
                 Ok(CommandStatus::SUCCESS)
             }
-            "test" => run_test(&tokens[1..]),
+            "test" => run_test(&tokens[1..]).await,
             "exec" => {
                 let path = tokens.get(1).context("`exec` requires a program path")?;
                 exec_program(path, &tokens[2..]).await
@@ -131,11 +130,11 @@ fn run_echo(words: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn run_test(args: &[String]) -> Result<CommandStatus> {
+async fn run_test(args: &[String]) -> Result<CommandStatus> {
     match args {
-        [flag, path] if flag == "-e" => Ok(CommandStatus::new((!exists(path)) as u8)),
-        [flag, path] if flag == "-f" => Ok(CommandStatus::new((!is_file(path)) as u8)),
-        [flag, path] if flag == "-d" => Ok(CommandStatus::new((!is_dir(path)) as u8)),
+        [flag, path] if flag == "-e" => Ok(CommandStatus::new((!helios_fs::exists(path).await) as u8)),
+        [flag, path] if flag == "-f" => Ok(CommandStatus::new((!helios_fs::is_file(path).await) as u8)),
+        [flag, path] if flag == "-d" => Ok(CommandStatus::new((!helios_fs::is_dir(path).await) as u8)),
         _ => bail!("unsupported test expression: expected `test -e|-f|-d <path>`"),
     }
 }
@@ -199,36 +198,6 @@ fn explicit_candidate_paths(input: &str) -> Result<Vec<String>> {
     Ok(vec![path.clone(), format!("{path}.wasm")])
 }
 
-fn exists(path: impl AsRef<Path>) -> bool {
-    fs::metadata(wasi_path(path.as_ref())).is_ok()
-}
-
-fn is_file(path: impl AsRef<Path>) -> bool {
-    fs::metadata(wasi_path(path.as_ref()))
-        .map(|metadata| metadata.is_file())
-        .unwrap_or(false)
-}
-
-fn is_dir(path: impl AsRef<Path>) -> bool {
-    fs::metadata(wasi_path(path.as_ref()))
-        .map(|metadata| metadata.is_dir())
-        .unwrap_or(false)
-}
-
-fn wasi_path(path: &Path) -> PathBuf {
-    if !path.is_absolute() {
-        return path.to_path_buf();
-    }
-
-    let relative = path
-        .strip_prefix("/")
-        .expect("absolute guest paths must be rooted at /");
-    if relative.as_os_str().is_empty() {
-        PathBuf::from(".")
-    } else {
-        relative.to_path_buf()
-    }
-}
 
 fn single_argument<'a>(command: &str, args: &'a [String]) -> Result<&'a str> {
     match args {
