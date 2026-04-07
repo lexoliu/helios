@@ -71,6 +71,7 @@ struct EmbeddedBootAsset {
 
 struct ProgramManifest {
     command: String,
+    bootfs_name: String,
     manifest_path: PathBuf,
     artifact_name: String,
 }
@@ -126,7 +127,7 @@ fn build_boot_program_asset(out_dir: &Path, manifest: ProgramManifest) -> Embedd
     });
 
     EmbeddedBootAsset {
-        path: format!("bin/{}", manifest.command),
+        path: format!("bin/{}", manifest.bootfs_name),
         source: canonicalize_file(&component_path, "generated bootfs component"),
     }
 }
@@ -172,6 +173,10 @@ fn read_program_manifest(command: &str, manifest_path: &Path) -> ProgramManifest
 
     ProgramManifest {
         command: command.to_owned(),
+        bootfs_name: match command {
+            "sh" => "dash".to_owned(),
+            other => other.to_owned(),
+        },
         manifest_path: manifest_path.to_path_buf(),
         artifact_name: format!("{artifact_stem}.wasm"),
     }
