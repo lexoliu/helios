@@ -1,5 +1,6 @@
 mod edit_tui;
 mod filesystem;
+mod guest_exec;
 mod help;
 mod programs;
 mod ready;
@@ -14,6 +15,7 @@ mod tui;
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
+use shell_core::guest_commands::GuestCommand;
 use std::io::Write as _;
 
 #[derive(Debug, Parser)]
@@ -90,6 +92,33 @@ enum Command {
     },
 }
 
+impl Command {
+    fn as_guest_command(&self) -> Result<Option<GuestCommand>> {
+        Ok(match self {
+            Self::Pwd => Some(GuestCommand::Pwd),
+            Self::Ls { path } => Some(GuestCommand::List(path.clone())),
+            Self::Cat { path } => Some(GuestCommand::Cat(path.clone())),
+            Self::Mkdir { path } => Some(GuestCommand::Mkdir(path.clone())),
+            Self::Rm { path } => Some(GuestCommand::Remove(path.clone())),
+            Self::Cp { source, destination } => Some(GuestCommand::Copy {
+                source: source.clone(),
+                destination: destination.clone(),
+            }),
+            Self::Mv { source, destination } => Some(GuestCommand::Move {
+                source: source.clone(),
+                destination: destination.clone(),
+            }),
+            Self::Touch { path } => Some(GuestCommand::Touch(path.clone())),
+            Self::Echo { words } => Some(GuestCommand::Echo(filesystem::parse_echo(words)?)),
+            Self::Exec { path, args } => Some(GuestCommand::Exec {
+                path: path.clone(),
+                args: args.clone(),
+            }),
+            Self::Edit { .. } | Self::Stats { .. } | Self::Tracing { .. } | Self::Rpc { .. } => None,
+        })
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let client = runtime::block_on(async move {
@@ -105,92 +134,56 @@ fn main() -> Result<()> {
 
     match args.command {
         None => repl::run(client),
-        Some(Command::Pwd) => run_interruptible(async move {
-            std::io::stdout().write_all(filesystem::pwd().as_bytes())?;
-            std::io::stdout().write_all(b"\n")?;
-            Ok(())
-        }),
-        Some(Command::Ls { path }) => run_interruptible(async move {
-            let mut client = client;
-            let output = filesystem::list(&mut client, path.as_deref()).await?;
-            std::io::stdout().write_all(output.as_bytes())?;
-            Ok(())
-        }),
-        Some(Command::Cat { path }) => run_interruptible(async move {
-            let mut client = client;
-            let bytes = filesystem::cat(&mut client, &path).await?;
-            std::io::stdout().write_all(&bytes)?;
-            Ok(())
-        }),
-        Some(Command::Edit { path }) => run_interruptible(async move {
-            let mut client = client;
-            edit_tui::run(&mut client, &path).await
-        }),
-        Some(Command::Mkdir { path }) => run_interruptible(async move {
-            let mut client = client;
-            filesystem::mkdir(&mut client, &path).await
-        }),
-        Some(Command::Rm { path }) => run_interruptible(async move {
-            let mut client = client;
-            filesystem::remove(&mut client, &path).await
-        }),
-        Some(Command::Cp { source, destination }) => run_interruptible(async move {
-            let mut client = client;
-            filesystem::copy(&mut client, &source, &destination).await
-        }),
-        Some(Command::Mv { source, destination }) => run_interruptible(async move {
-            let mut client = client;
-            filesystem::move_path(&mut client, &source, &destination).await
-        }),
-        Some(Command::Touch { path }) => run_interruptible(async move {
-            let mut client = client;
-            filesystem::touch(&mut client, &path).await
-        }),
-        Some(Command::Echo { words }) => run_interruptible(async move {
-            let mut client = client;
-            match filesystem::parse_echo(&words)? {
-                filesystem::EchoTarget::Stdout(bytes) => std::io::stdout().write_all(&bytes)?,
-                filesystem::EchoTarget::File {
-                    path,
-                    bytes,
-                    append,
-                } => filesystem::write(&mut client, &path, &bytes, append).await?,
+        Some(command) => {
+            if let Some(command) = command.as_guest_command()? {
+                return run_interruptible(async move {
+                    let mut client = client;
+                    let output = guest_exec::run(&mut client, &command).await?;
+                    std::io::stdout().write_all(&output.stdout)?;
+                    std::io::stderr().write_all(&output.stderr)?;
+                    if output.exit_code != 0 {
+                        anyhow::bail!("guest command exited with code {}", output.exit_code);
+                    }
+                    Ok(())
+                });
             }
-            Ok(())
-        }),
-        Some(Command::Exec { path, args }) => run_interruptible(async move {
-            let mut client = client;
-            let result = programs::exec(&mut client, &path, &args).await?;
-            std::io::stdout().write_all(&result.output.stdout)?;
-            std::io::stderr().write_all(&result.output.stderr)?;
-            if result.exit_code != 0 {
-                anyhow::bail!(
-                    "instance {} exited with code {}",
-                    result.instance_id,
-                    result.exit_code
-                );
+
+            match command {
+                Command::Edit { path } => run_interruptible(async move {
+                    let mut client = client;
+                    edit_tui::run(&mut client, &path).await
+                }),
+                Command::Stats { period_ms } => run_interruptible(async move {
+                    let mut client = client;
+                    stats_tui::run(&mut client, period_ms).await
+                }),
+                Command::Tracing {
+                    limit,
+                    min_level,
+                    target_prefix,
+                } => run_interruptible(system::run_tracing(
+                    client,
+                    limit,
+                    min_level.as_deref(),
+                    target_prefix,
+                )),
+                Command::Rpc {
+                    instance,
+                    func,
+                    request_hex,
+                } => run_interruptible(rpc::run_call(client, &instance, &func, &request_hex)),
+                Command::Pwd
+                | Command::Ls { .. }
+                | Command::Cat { .. }
+                | Command::Mkdir { .. }
+                | Command::Rm { .. }
+                | Command::Cp { .. }
+                | Command::Mv { .. }
+                | Command::Touch { .. }
+                | Command::Echo { .. }
+                | Command::Exec { .. } => unreachable!(),
             }
-            Ok(())
-        }),
-        Some(Command::Stats { period_ms }) => run_interruptible(async move {
-            let mut client = client;
-            stats_tui::run(&mut client, period_ms).await
-        }),
-        Some(Command::Tracing {
-            limit,
-            min_level,
-            target_prefix,
-        }) => run_interruptible(system::run_tracing(
-            client,
-            limit,
-            min_level.as_deref(),
-            target_prefix,
-        )),
-        Some(Command::Rpc {
-            instance,
-            func,
-            request_hex,
-        }) => run_interruptible(rpc::run_call(client, &instance, &func, &request_hex)),
+        }
     }
 }
 
