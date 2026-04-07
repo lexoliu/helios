@@ -174,7 +174,10 @@ impl cli_bindings::cli::stdout::Host for StoreData {
     fn get_stdout(&mut self) -> Result<Resource<DynOutputStream>> {
         Ok(self
             .table
-            .push(Box::new(DebugSerialOutputStream::from_store(self)) as DynOutputStream)?)
+            .push(Box::new(DebugSerialOutputStream::from_store(
+                self,
+                crate::debugger_program::OutputStreamKind::Stdout,
+            )) as DynOutputStream)?)
     }
 }
 
@@ -182,7 +185,10 @@ impl cli_bindings::cli::stderr::Host for StoreData {
     fn get_stderr(&mut self) -> Result<Resource<DynOutputStream>> {
         Ok(self
             .table
-            .push(Box::new(DebugSerialOutputStream::from_store(self)) as DynOutputStream)?)
+            .push(Box::new(DebugSerialOutputStream::from_store(
+                self,
+                crate::debugger_program::OutputStreamKind::Stderr,
+            )) as DynOutputStream)?)
     }
 }
 

@@ -4,13 +4,16 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use concurrent_queue::{ConcurrentQueue, PopError};
+use concurrent_queue::{ConcurrentQueue, PopError, PushError};
+use futures::channel::oneshot;
 use helios_hal::cpu::Cpu;
 use helios_hal::resource::WasiRights;
 use helios_kernel::{
     ComputePool, ComputePriority, InstanceId, InstanceRegistry, Notify, ProgramExecError,
     ProgramExecErrorKind, RegisteredInstance, heap_stats,
 };
+use lru::LruCache;
+use spin::Mutex;
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Engine, Store};
 
@@ -18,6 +21,7 @@ use crate::debugger_program::{self, OutputMode, StoreData};
 use crate::{RiscvCpu, debug_state::RuntimeState, program_bindings};
 
 const WORKER_STACK_SIZE: usize = 256 * 1024;
+const COMPONENT_CACHE_FRACTION: usize = 8;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ExecOutput {
@@ -42,6 +46,7 @@ struct UserProgramServiceInner {
     engine: Engine,
     compiler: ComputePool,
     compile_priority: ComputePriority,
+    component_cache: Mutex<ComponentCache>,
     timebase_frequency: u64,
     debug_state: RuntimeState,
     instance_registry: InstanceRegistry,
@@ -52,8 +57,16 @@ struct UserProgramServiceInner {
 struct QueuedProgram {
     name: String,
     args: Vec<String>,
-    component: Component,
+    component: Arc<Component>,
     instance: RegisteredInstance,
+    output_mode: OutputMode,
+    completion: Option<oneshot::Sender<Result<ExecResult, ProgramExecError>>>,
+}
+
+struct ComponentCache {
+    budget_bytes: usize,
+    resident_bytes: usize,
+    entries: LruCache<Arc<[u8]>, Arc<Component>>,
 }
 
 pub(crate) fn install_program_service(
@@ -72,19 +85,25 @@ pub(crate) fn install_program_service(
         return None;
     }
 
-    let memory_budget = heap_stats()
-        .available_bytes()
-        .max(worker_count * WORKER_STACK_SIZE);
+    let available_bytes = heap_stats().available_bytes();
+    let reserved_stack_bytes = worker_count * WORKER_STACK_SIZE;
+    let cache_budget = available_bytes
+        .saturating_sub(reserved_stack_bytes)
+        / COMPONENT_CACHE_FRACTION;
+    let compiler_budget = available_bytes
+        .saturating_sub(cache_budget)
+        .max(reserved_stack_bytes);
     let engine = debugger_program::build_engine().unwrap_or_else(|error| {
         panic!("failed to create RISC-V component engine for user programs: {error:#}")
     });
-    let compiler = ComputePool::new(worker_count, WORKER_STACK_SIZE, memory_budget)
+    let compiler = ComputePool::new(worker_count, WORKER_STACK_SIZE, compiler_budget)
         .unwrap_or_else(|error| panic!("failed to create user-program compute pool: {error}"));
     let service = UserProgramService {
         inner: Arc::new(UserProgramServiceInner {
             engine,
             compiler,
             compile_priority: ComputePriority::NORMAL,
+            component_cache: Mutex::new(ComponentCache::new(cache_budget)),
             timebase_frequency: cpu.timer_frequency(),
             debug_state: debug_state.clone(),
             instance_registry: debug_state.instance_registry(),
@@ -134,7 +153,6 @@ pub(crate) fn run_forever(cpu: RiscvCpu, kernel: helios_kernel::Kernel<RiscvCpu>
 impl UserProgramService {
     pub(crate) async fn exec(
         &self,
-        execution_cpu: RiscvCpu,
         name: impl Into<String>,
         args: Vec<String>,
         wasm: &[u8],
@@ -147,46 +165,63 @@ impl UserProgramService {
             .inner
             .instance_registry
             .register(name.clone(), started_at);
-        let instance_id = instance.id();
-        let (exit_code, output) = run_component(
-            QueuedProgram {
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .run_queue
+            .push(QueuedProgram {
                 name,
                 args,
                 component,
                 instance,
-            },
-            execution_cpu,
-            self.inner.debug_state.clone(),
-            self.inner.instance_registry.clone(),
-            OutputMode::Capture,
-        )
-        .map_err(|error| ProgramExecError {
-            kind: ProgramExecErrorKind::Internal,
-            detail: error.to_string(),
-        })?;
-        Ok(ExecResult {
-            instance_id,
-            exit_code,
-            output,
+                output_mode: OutputMode::Capture,
+                completion: Some(tx),
+            })
+            .unwrap_or_else(|error| match error {
+                PushError::Full(_) => unreachable!("program run queue reported full"),
+                PushError::Closed(_) => panic!("program run queue was closed unexpectedly"),
+            });
+        self.inner.run_ready.notify_one();
+        rx.await.unwrap_or_else(|_| {
+            Err(ProgramExecError {
+                kind: ProgramExecErrorKind::Internal,
+                detail: "program worker dropped exec result before completion".to_string(),
+            })
         })
     }
 
     pub(crate) fn run_next_on(&self, execution_cpu: &RiscvCpu) -> bool {
         match self.inner.run_queue.pop() {
-            Ok(queued) => {
-                let instance_id = queued.instance.id().raw();
+            Ok(mut queued) => {
+                let instance_id = queued.instance.id();
                 let instance_name = queued.instance.name().to_string();
-                match run_component(
+                let completion = queued.completion.take();
+                let result = run_component(
                     queued,
                     execution_cpu.clone(),
                     self.inner.debug_state.clone(),
                     self.inner.instance_registry.clone(),
-                    OutputMode::Trace,
-                ) {
+                );
+                if let Some(completion) = completion {
+                    let response = result
+                        .as_ref()
+                        .map(|(exit_code, output)| ExecResult {
+                            instance_id,
+                            exit_code: *exit_code,
+                            output: output.clone(),
+                        })
+                        .map_err(|error| ProgramExecError {
+                            kind: ProgramExecErrorKind::Internal,
+                            detail: error.to_string(),
+                        });
+                    completion.send(response).unwrap_or_else(|_| {
+                        panic!("program exec waiter dropped before receiving result")
+                    });
+                }
+                match result {
                     Ok((exit_code, _output)) => {
                         tracing::info!(
                             "Program exited instance={} name={} code={}",
-                            instance_id,
+                            instance_id.raw(),
                             instance_name,
                             exit_code
                         );
@@ -194,7 +229,7 @@ impl UserProgramService {
                     Err(error) => {
                         tracing::error!(
                             "Program trapped instance={} name={} error={}",
-                            instance_id,
+                            instance_id.raw(),
                             instance_name,
                             error
                         );
@@ -223,13 +258,19 @@ impl UserProgramService {
         .await;
     }
 
-    async fn compile_component(&self, wasm: &[u8]) -> Result<Component, ProgramExecError> {
+    async fn compile_component(&self, wasm: &[u8]) -> Result<Arc<Component>, ProgramExecError> {
+        if let Some(component) = self.inner.component_cache.lock().get(wasm) {
+            return Ok(component);
+        }
+
         let engine = self.inner.engine.clone();
-        let wasm = wasm.to_vec();
-        self.inner
+        let wasm = Arc::<[u8]>::from(wasm.to_vec());
+        let compiled = self
+            .inner
             .compiler
-            .spawn(self.inner.compile_priority, move || {
-                Component::from_binary(&engine, &wasm)
+            .spawn(self.inner.compile_priority, {
+                let wasm = wasm.clone();
+                move || Component::from_binary(&engine, &wasm)
             })
             .await
             .map_err(|error| ProgramExecError {
@@ -239,7 +280,62 @@ impl UserProgramService {
             .map_err(|error| ProgramExecError {
                 kind: ProgramExecErrorKind::InvalidBinary,
                 detail: error.to_string(),
-            })
+            })?;
+
+        let component = Arc::new(compiled);
+        Ok(self
+            .inner
+            .component_cache
+            .lock()
+            .insert_if_missing(wasm, component))
+    }
+}
+
+impl ComponentCache {
+    fn new(budget_bytes: usize) -> Self {
+        Self {
+            budget_bytes,
+            resident_bytes: 0,
+            entries: LruCache::unbounded(),
+        }
+    }
+
+    fn get(&mut self, wasm: &[u8]) -> Option<Arc<Component>> {
+        self.entries.get(wasm).cloned()
+    }
+
+    fn insert_if_missing(
+        &mut self,
+        wasm: Arc<[u8]>,
+        component: Arc<Component>,
+    ) -> Arc<Component> {
+        if let Some(existing) = self.entries.get(wasm.as_ref()).cloned() {
+            return existing;
+        }
+
+        self.resident_bytes = self
+            .resident_bytes
+            .checked_add(wasm.len())
+            .expect("component cache byte accounting overflow");
+        let replaced = self.entries.put(wasm, component.clone());
+        assert!(
+            replaced.is_none(),
+            "component cache replaced an entry after miss revalidation"
+        );
+        self.evict_to_budget();
+        component
+    }
+
+    fn evict_to_budget(&mut self) {
+        while self.resident_bytes > self.budget_bytes {
+            let Some((wasm, _component)) = self.entries.pop_lru() else {
+                panic!("component cache accounting lost track of resident bytes");
+            };
+            self.resident_bytes = self
+                .resident_bytes
+                .checked_sub(wasm.len())
+                .expect("component cache byte accounting underflow");
+        }
     }
 }
 
@@ -257,13 +353,14 @@ fn run_component(
     cpu: RiscvCpu,
     debug_state: RuntimeState,
     instance_registry: InstanceRegistry,
-    output_mode: OutputMode,
 ) -> Result<(u32, ExecOutput), wasmtime::Error> {
     let QueuedProgram {
         name,
         args,
         component,
         instance,
+        output_mode,
+        completion: _,
     } = queued;
     let mut argv = Vec::with_capacity(args.len() + 1);
     argv.push(name);
@@ -289,8 +386,8 @@ fn run_component(
             arguments: argv,
             environment: Vec::new(),
             output_mode,
-            captured_stdout: Vec::new(),
-            captured_stderr: Vec::new(),
+            captured_stdout: Arc::new(Mutex::new(Vec::new())),
+            captured_stderr: Arc::new(Mutex::new(Vec::new())),
         },
     );
     store.limiter(|state| state);
