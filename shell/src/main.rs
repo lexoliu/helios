@@ -3,6 +3,7 @@ mod filesystem;
 mod help;
 mod programs;
 mod ready;
+mod remote;
 mod repl;
 mod rpc;
 mod runtime;

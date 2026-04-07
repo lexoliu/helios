@@ -1,11 +1,7 @@
 use std::io::Write as _;
-use std::time::Duration;
-
-use crate::runtime;
+use crate::remote;
 use crate::serial::RpcClient;
 use anyhow::{Context as _, Result};
-
-const INITIAL_REMOTE_TIMEOUT: Duration = Duration::from_secs(180);
 
 pub struct RpcPane {
     pub instance: String,
@@ -26,12 +22,11 @@ impl RpcPane {
 
     pub async fn call(&mut self, client: &mut RpcClient) -> Result<()> {
         let request = decode_hex(&self.request_hex)?;
-        let response = runtime::timeout(
-            INITIAL_REMOTE_TIMEOUT,
+        let response = remote::call(
             client.invoke_raw(&self.instance, &self.func, request),
+            "remote rpc response",
         )
         .await
-        .context("timed out waiting for remote rpc response")?
         .with_context(|| {
             format!(
                 "failed to invoke remote method {}.{}",

@@ -7,10 +7,9 @@ use anyhow::{Context as _, Result};
 use helios_shell_protocol::system::{instances, stats, tracing};
 use nu_ansi_term::{Color, Style as AnsiStyle};
 
-use crate::runtime;
+use crate::remote;
 use crate::serial::RpcClient;
 
-const INITIAL_REMOTE_TIMEOUT: Duration = Duration::from_secs(180);
 const LIVE_TRACING_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 pub struct TracingConfig {
@@ -37,16 +36,14 @@ impl TracingConfig {
 }
 
 pub async fn fetch_stats(client: &mut RpcClient) -> Result<stats::Sample> {
-    runtime::timeout(INITIAL_REMOTE_TIMEOUT, stats::snapshot(client))
+    remote::call(stats::snapshot(client), "remote stats snapshot")
         .await
-        .context("timed out waiting for remote stats snapshot")?
         .context("failed to fetch remote stats snapshot")
 }
 
 pub async fn fetch_instances(client: &mut RpcClient) -> Result<Vec<instances::Instance>> {
-    runtime::timeout(INITIAL_REMOTE_TIMEOUT, instances::snapshot(client))
+    remote::call(instances::snapshot(client), "remote instances snapshot")
         .await
-        .context("timed out waiting for remote instances snapshot")?
         .context("failed to fetch remote instances snapshot")
 }
 
@@ -54,12 +51,11 @@ pub async fn fetch_tracing(
     client: &mut RpcClient,
     config: &TracingConfig,
 ) -> Result<Vec<tracing::Event>> {
-    runtime::timeout(
-        INITIAL_REMOTE_TIMEOUT,
+    remote::call(
         tracing::recent(client, &config.filter(), config.limit),
+        "remote tracing events",
     )
     .await
-    .context("timed out waiting for remote tracing events")?
     .context("failed to fetch remote tracing events")
 }
 
