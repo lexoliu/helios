@@ -292,6 +292,11 @@ mod tests {
     }
 
     #[test]
+    fn bare_if_is_not_treated_as_a_multiline_block() {
+        assert!(!needs_more_input("if").expect("parse must succeed"));
+    }
+
+    #[test]
     fn parses_else_if_as_nested_if() {
         let script = "if test -e /a\n echo a\nelse if test -e /b\n echo b\nend";
         let ParseState::Complete(statements) = parse(script).expect("script parse must succeed")

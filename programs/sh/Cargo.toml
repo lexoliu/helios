@@ -1,5 +1,5 @@
 [package]
-name = "helios-sh"
+name = "helios-dash"
 version = "0.1.0"
 edition = "2024"
 autobins = false
@@ -12,6 +12,6 @@ shell-core = { path = "../../shell-core" }
 shell-words = "1.1.0"
 
 [lib]
-name = "helios_sh"
+name = "helios_dash"
 path = "src/main.rs"
 crate-type = ["cdylib"]

@@ -1467,6 +1467,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-dash"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "helios-api",
+ "shell-core",
+ "shell-words",
+]
+
+[[package]]
 name = "helios-debugger"
 version = "0.1.0"
 dependencies = [
@@ -1514,6 +1525,35 @@ name = "helios-init"
 version = "0.1.0"
 dependencies = [
  "helios-api",
+]
+
+[[package]]
+name = "helios-inspector"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "async-io",
+ "async-net",
+ "async-recursion",
+ "async-signal",
+ "async-trait",
+ "clap",
+ "crossterm",
+ "futures-io",
+ "futures-lite",
+ "globset",
+ "helios-shell-protocol",
+ "hex",
+ "nu-ansi-term",
+ "ratatui",
+ "ratatui-code-editor",
+ "rustix 1.1.4",
+ "rustyline",
+ "serialport",
+ "shell-core",
+ "shell-words",
+ "strsim",
 ]
 
 [[package]]
@@ -1588,46 +1628,6 @@ dependencies = [
  "trapframe",
  "wasmtime",
  "wasmtime-wasi-io",
-]
-
-[[package]]
-name = "helios-sh"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "helios-api",
- "shell-core",
- "shell-words",
-]
-
-[[package]]
-name = "helios-shell"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-channel",
- "async-io",
- "async-net",
- "async-recursion",
- "async-signal",
- "async-trait",
- "clap",
- "crossterm",
- "futures-io",
- "futures-lite",
- "globset",
- "helios-shell-protocol",
- "hex",
- "nu-ansi-term",
- "ratatui",
- "ratatui-code-editor",
- "rustix 1.1.4",
- "rustyline",
- "serialport",
- "shell-core",
- "shell-words",
- "strsim",
 ]
 
 [[package]]

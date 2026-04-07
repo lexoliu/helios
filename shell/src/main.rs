@@ -1,12 +1,7 @@
-mod edit_tui;
-mod filesystem;
-mod guest_exec;
-mod help;
 mod programs;
 mod ready;
 mod remote;
 mod repl;
-mod rpc;
 mod runtime;
 mod serial;
 mod stats_tui;
@@ -14,17 +9,17 @@ mod system;
 mod tui;
 
 use anyhow::{Context as _, Result};
-use clap::{Parser, Subcommand};
-use shell_core::guest_commands::{self, EchoTarget, GuestCommand, GuestCommandSource};
+use clap::{Args as ClapArgs, Parser, Subcommand};
 use std::io::Write as _;
 
 #[derive(Debug, Parser)]
+#[command(name = "helios-inspector")]
 struct Args {
-    /// Host serial device used as the shell transport.
+    /// Host serial device used as the inspector transport.
     #[arg(long)]
     device: String,
 
-    /// Baud rate for the shell transport.
+    /// Baud rate for the inspector transport.
     #[arg(long, default_value_t = 115_200)]
     baud: u32,
 
@@ -36,145 +31,39 @@ struct Args {
 }
 
 #[derive(Debug, Subcommand)]
-enum Command {
-    /// Print the current remote working directory.
-    Pwd,
-    /// List files in the remote debugger filesystem.
-    Ls { path: Option<String> },
-    /// Print remote file contents.
-    Cat { path: String },
-    /// Edit a remote text file inside a full-screen terminal editor.
-    Edit { path: String },
-    /// Create a directory in the remote debugger filesystem.
-    Mkdir { path: String },
-    /// Remove a file or an empty directory from the remote debugger filesystem.
-    Rm { path: String },
-    /// Copy a remote file inside the debugger filesystem.
-    Cp { source: String, destination: String },
-    /// Move or rename a remote path inside the debugger filesystem.
-    Mv { source: String, destination: String },
-    /// Create a file if it does not exist in the remote debugger filesystem.
-    Touch { path: String },
-    /// Print text or write it into a remote file with `>` or `>>`.
-    Echo {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        words: Vec<String>,
-    },
-    /// Exec a wasm guest program from the remote filesystem with the default minimal rights set.
-    Exec {
-        path: String,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-    /// Open the live stats view.
-    Stats {
-        #[arg(long, default_value_t = 1_000)]
-        period_ms: u64,
-    },
+pub(crate) enum Command {
+    /// Execute a shell script inside the remote guest dash program.
+    Dash(DashCommand),
     /// Stream tracing events until interrupted.
-    Tracing {
-        /// Maximum number of recent events kept in the incremental polling window.
-        #[arg(long, default_value_t = 64)]
-        limit: u32,
-        #[arg(long)]
-        min_level: Option<String>,
-        #[arg(long)]
-        target_prefix: Vec<String>,
-    },
-    /// Invoke a raw remote WIT method.
-    Rpc {
-        #[arg(long)]
-        instance: String,
-        #[arg(long)]
-        func: String,
-        #[arg(long, default_value = "")]
-        request_hex: String,
-    },
+    Tracing(TracingCommand),
+    /// Open the live system monitor.
+    Stats,
+    /// Start an interactive shell that forwards most input to remote dash.
+    Repl,
 }
 
-struct MainGuestCommand<'a> {
-    command: &'a Command,
-    echo_target: Option<EchoTarget>,
+#[derive(Debug, ClapArgs)]
+pub(crate) struct DashCommand {
+    /// Inline script passed to `dash -c`.
+    #[arg(short = 'c', long = "command", conflicts_with = "script")]
+    command: Option<String>,
+
+    /// Path to a local script file whose contents are executed remotely.
+    #[arg(conflicts_with = "command")]
+    script: Option<String>,
 }
 
-impl<'a> MainGuestCommand<'a> {
-    fn new(command: &'a Command) -> Result<Self> {
-        let echo_target = match command {
-            Command::Echo { words } => Some(filesystem::parse_echo(words)?),
-            _ => None,
-        };
-        Ok(Self { command, echo_target })
-    }
+#[derive(Debug, ClapArgs)]
+pub(crate) struct TracingCommand {
+    /// Maximum number of recent events kept in the incremental polling window.
+    #[arg(long, default_value_t = 64)]
+    limit: u32,
 
-    fn into_guest_command(self) -> Option<GuestCommand> {
-        guest_commands::from_source(&self)
-    }
-}
+    #[arg(long)]
+    min_level: Option<String>,
 
-impl GuestCommandSource for MainGuestCommand<'_> {
-    fn pwd(&self) -> bool {
-        matches!(self.command, Command::Pwd)
-    }
-
-    fn list_path(&self) -> Option<Option<&str>> {
-        match self.command {
-            Command::Ls { path } => Some(path.as_deref()),
-            _ => None,
-        }
-    }
-
-    fn cat_path(&self) -> Option<&str> {
-        match self.command {
-            Command::Cat { path } => Some(path),
-            _ => None,
-        }
-    }
-
-    fn mkdir_path(&self) -> Option<&str> {
-        match self.command {
-            Command::Mkdir { path } => Some(path),
-            _ => None,
-        }
-    }
-
-    fn remove_path(&self) -> Option<&str> {
-        match self.command {
-            Command::Rm { path } => Some(path),
-            _ => None,
-        }
-    }
-
-    fn copy_paths(&self) -> Option<(&str, &str)> {
-        match self.command {
-            Command::Cp { source, destination } => Some((source, destination)),
-            _ => None,
-        }
-    }
-
-    fn move_paths(&self) -> Option<(&str, &str)> {
-        match self.command {
-            Command::Mv { source, destination } => Some((source, destination)),
-            _ => None,
-        }
-    }
-
-    fn touch_path(&self) -> Option<&str> {
-        match self.command {
-            Command::Touch { path } => Some(path),
-            _ => None,
-        }
-    }
-
-    fn echo_target(&self) -> Option<&EchoTarget> {
-        self.echo_target.as_ref()
-    }
-
-    fn exec_program(&self) -> Option<(&str, &[String])> {
-        match self.command {
-            Command::Exec { path, args } => Some((path, args)),
-            _ => None,
-        }
-    }
+    #[arg(long)]
+    target_prefix: Vec<String>,
 }
 
 fn main() -> Result<()> {
@@ -191,63 +80,33 @@ fn main() -> Result<()> {
     })?;
 
     match args.command {
-        None => repl::run(client),
-        Some(command) => {
-            if let Some(command) = MainGuestCommand::new(&command)?.into_guest_command() {
-                return run_interruptible(async move {
-                    let mut client = client;
-                    let output = guest_exec::run(&mut client, &command).await?;
-                    std::io::stdout().write_all(&output.stdout)?;
-                    std::io::stderr().write_all(&output.stderr)?;
-                    if output.exit_code != 0 {
-                        anyhow::bail!("guest command exited with code {}", output.exit_code);
-                    }
-                    Ok(())
-                });
+        Some(Command::Dash(command)) => run_interruptible(async move {
+            let mut client = client;
+            let output = repl::run_dash_command(&mut client, &command).await?;
+            std::io::stdout().write_all(&output.output.stdout)?;
+            std::io::stderr().write_all(&output.output.stderr)?;
+            if output.exit_code != 0 {
+                anyhow::bail!("remote dash exited with code {}", output.exit_code);
             }
-
-            match command {
-                Command::Edit { path } => run_interruptible(async move {
-                    let mut client = client;
-                    edit_tui::run(&mut client, &path).await
-                }),
-                Command::Stats { period_ms } => run_interruptible(async move {
-                    let mut client = client;
-                    stats_tui::run(&mut client, period_ms).await
-                }),
-                Command::Tracing {
-                    limit,
-                    min_level,
-                    target_prefix,
-                } => run_interruptible(system::run_tracing(
-                    client,
-                    limit,
-                    min_level.as_deref(),
-                    target_prefix,
-                )),
-                Command::Rpc {
-                    instance,
-                    func,
-                    request_hex,
-                } => run_interruptible(rpc::run_call(client, &instance, &func, &request_hex)),
-                Command::Pwd
-                | Command::Ls { .. }
-                | Command::Cat { .. }
-                | Command::Mkdir { .. }
-                | Command::Rm { .. }
-                | Command::Cp { .. }
-                | Command::Mv { .. }
-                | Command::Touch { .. }
-                | Command::Echo { .. }
-                | Command::Exec { .. } => unreachable!(),
-            }
-        }
+            Ok(())
+        }),
+        Some(Command::Tracing(command)) => run_interruptible(system::run_tracing(
+            client,
+            command.limit,
+            command.min_level.as_deref(),
+            command.target_prefix,
+        )),
+        Some(Command::Stats) => run_interruptible(async move {
+            let mut client = client;
+            stats_tui::run(&mut client).await
+        }),
+        Some(Command::Repl) | None => repl::run(client),
     }
 }
 
 fn run_interruptible(command: impl std::future::Future<Output = Result<()>>) -> Result<()> {
     match runtime::block_on(runtime::interruptible(command))
-        .context("failed to listen for Ctrl+C during command execution")?
+        .context("failed to listen for Ctrl+C during inspector command execution")?
     {
         runtime::CommandRun::Completed(result) => result,
         runtime::CommandRun::Interrupted => Ok(()),

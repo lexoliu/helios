@@ -9,6 +9,7 @@ use nu_ansi_term::{Color, Style as AnsiStyle};
 
 use crate::remote;
 use crate::serial::RpcClient;
+use crate::TracingCommand;
 
 const LIVE_TRACING_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -65,6 +66,27 @@ pub async fn run_tracing(
     min_level: Option<&str>,
     target_prefixes: Vec<String>,
 ) -> Result<()> {
+    let config = tracing_config(limit, min_level, target_prefixes)?;
+    stream_tracing(&mut client, &config).await
+}
+
+pub async fn stream_tracing_command(
+    client: &mut RpcClient,
+    command: &TracingCommand,
+) -> Result<()> {
+    let config = tracing_config(
+        command.limit,
+        command.min_level.as_deref(),
+        command.target_prefix.clone(),
+    )?;
+    stream_tracing(client, &config).await
+}
+
+fn tracing_config(
+    limit: u32,
+    min_level: Option<&str>,
+    target_prefixes: Vec<String>,
+) -> Result<TracingConfig> {
     let mut config = TracingConfig::new();
     config.limit = limit;
     config.min_level = match min_level {
@@ -72,8 +94,7 @@ pub async fn run_tracing(
         None => config.min_level,
     };
     config.target_prefixes = target_prefixes;
-
-    stream_tracing(&mut client, &config).await
+    Ok(config)
 }
 
 pub fn parse_level(value: &str) -> Result<Option<tracing::Level>> {
@@ -89,14 +110,6 @@ pub fn parse_level(value: &str) -> Result<Option<tracing::Level>> {
         _ => anyhow::bail!("unknown tracing level {value}"),
     };
     Ok(Some(level))
-}
-
-pub fn format_targets(prefixes: &[String]) -> String {
-    if prefixes.is_empty() {
-        "any".to_owned()
-    } else {
-        prefixes.join(", ")
-    }
 }
 
 pub async fn stream_tracing(client: &mut RpcClient, config: &TracingConfig) -> Result<()> {

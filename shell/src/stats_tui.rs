@@ -16,10 +16,12 @@ use crate::serial::RpcClient;
 use crate::system;
 use crate::tui;
 
-pub async fn run(client: &mut RpcClient, period_ms: u64) -> Result<()> {
+const LIVE_STATS_PERIOD_MS: u64 = 1_000;
+
+pub async fn run(client: &mut RpcClient) -> Result<()> {
     let mut session = tui::Session::open(false, "stats view")?;
     let events = tui::spawn_events();
-    let mut app = App::new(period_ms);
+    let mut app = App::new(LIVE_STATS_PERIOD_MS);
 
     app.refresh(client).await;
 

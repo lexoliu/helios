@@ -2,21 +2,21 @@
 set -euo pipefail
 
 usage() {
-  printf '%s\n' "Usage: scripts/qemu-shell [options] [-- shell-args...]"
+  printf '%s\n' "Usage: scripts/qemu-shell [options] [-- inspector-args...]"
   printf '%s\n' "Options:"
   printf '%s\n' "  --no-build           Skip cargo build steps."
   printf '%s\n' "  --qemu-bin PATH      QEMU executable. Default: qemu-system-riscv64."
   printf '%s\n' "  --kernel PATH        Kernel image path."
-  printf '%s\n' "  --shell-bin PATH     Host shell binary path."
+  printf '%s\n' "  --shell-bin PATH     Host inspector binary path."
   printf '%s\n' "  --socket PATH        Unix socket path for the debug serial link."
   printf '%s\n' "  --smp N              Processor count for QEMU. Default: 4."
   printf '%s\n' "  --memory SIZE        Guest RAM size. Default: 512M."
   printf '%s\n' "  --bios VALUE         QEMU -bios argument. Default: default."
-  printf '%s\n' "  --baud RATE          Shell baud rate hint. Default: 115200."
+  printf '%s\n' "  --baud RATE          Inspector baud rate hint. Default: 115200."
   printf '%s\n' "  --help               Show this message."
   printf '%s\n' "Example:"
   printf '%s\n' "  scripts/qemu-shell"
-  printf '%s\n' "  scripts/qemu-shell -- stats --period-ms 250"
+  printf '%s\n' "  scripts/qemu-shell -- stats"
 }
 
 repo_root=$(
@@ -27,7 +27,7 @@ repo_root=$(
 kernel_target="riscv64gc-unknown-none-elf"
 qemu_bin="${QEMU_BIN:-qemu-system-riscv64}"
 kernel_image="${KERNEL_IMAGE:-$repo_root/target/$kernel_target/debug/helios}"
-shell_bin="${SHELL_BIN:-$repo_root/target/debug/helios-shell}"
+shell_bin="${SHELL_BIN:-$repo_root/target/debug/helios-inspector}"
 socket_path=""
 socket_dir=""
 qemu_log=""
@@ -161,7 +161,7 @@ require_command "$qemu_bin"
 
 if ((build)); then
   cargo build --target "$kernel_target" --bin helios
-  cargo build -p helios-shell
+  cargo build -p helios-inspector
 fi
 
 if [[ ! -x "$shell_bin" ]]; then

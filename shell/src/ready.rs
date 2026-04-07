@@ -103,6 +103,6 @@ fn report_stage(stage: &str) -> Result<()> {
     };
 
     let mut stderr = std::io::stderr().lock();
-    writeln!(stderr, "helios-shell: {detail}")?;
+    writeln!(stderr, "helios-inspector: {detail}")?;
     Ok(())
 }

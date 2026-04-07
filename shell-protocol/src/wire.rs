@@ -136,7 +136,7 @@ fn flush_stray_bytes(stray: &mut Vec<u8>) -> io::Result<()> {
     }
 
     let mut stderr = std::io::stderr().lock();
-    stderr.write_all(b"helios-shell: remote serial: ")?;
+    stderr.write_all(b"helios-inspector: remote serial: ")?;
     for &byte in stray.iter() {
         match byte {
             b'\n' => stderr.write_all(b"\\n")?,

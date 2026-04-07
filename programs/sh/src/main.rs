@@ -33,13 +33,13 @@ impl Invocation {
     fn from_env() -> Result<Self> {
         let mut args = env::args().skip(1);
         match args.next().as_deref() {
-            None => bail!("interactive helios-sh is not implemented yet; use `sh -c <command>` or `sh <script>`"),
+            None => bail!("interactive dash is not implemented yet; use `dash -c <command>` or `dash <script>`"),
             Some("-c") => {
                 let command = args
                     .next()
-                    .context("`sh -c` requires a command string")?;
+                    .context("`dash -c` requires a command string")?;
                 if args.next().is_some() {
-                    bail!("`sh -c` does not accept extra positional arguments yet")
+                    bail!("`dash -c` does not accept extra positional arguments yet")
                 }
                 Ok(Self {
                     inline_command: Some(command),
@@ -48,7 +48,7 @@ impl Invocation {
             }
             Some(path) => {
                 if args.next().is_some() {
-                    bail!("`sh <script>` does not accept extra positional arguments yet")
+                    bail!("`dash <script>` does not accept extra positional arguments yet")
                 }
                 Ok(Self {
                     inline_command: None,
