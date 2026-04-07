@@ -31,7 +31,7 @@ use crate::guest_exec;
 use crate::help;
 use crate::rpc::RpcPane;
 use crate::runtime;
-use shell_core::guest_commands::GuestCommand;
+use shell_core::guest_commands::{self, GuestCommand, GuestCommandSource};
 use shell_core::{self, CommandStatus, ScriptHost, Statement};
 use crate::serial::RpcClient;
 use crate::stats_tui;
@@ -369,44 +369,86 @@ impl<T: TerminalIo> ScriptHost for ScriptRuntime<'_, T> {
     }
 }
 
+impl GuestCommandSource for Command {
+    fn pwd(&self) -> bool {
+        matches!(self, Self::Pwd)
+    }
+
+    fn list_path(&self) -> Option<Option<&str>> {
+        match self {
+            Self::List(path) => Some(path.as_deref()),
+            _ => None,
+        }
+    }
+
+    fn cat_path(&self) -> Option<&str> {
+        match self {
+            Self::Cat(path) => Some(path),
+            _ => None,
+        }
+    }
+
+    fn test_expression(&self) -> Option<&[String]> {
+        match self {
+            Self::Test(expression) => Some(expression),
+            _ => None,
+        }
+    }
+
+    fn mkdir_path(&self) -> Option<&str> {
+        match self {
+            Self::Mkdir(path) => Some(path),
+            _ => None,
+        }
+    }
+
+    fn remove_path(&self) -> Option<&str> {
+        match self {
+            Self::Remove(path) => Some(path),
+            _ => None,
+        }
+    }
+
+    fn copy_paths(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::Copy { source, destination } => Some((source, destination)),
+            _ => None,
+        }
+    }
+
+    fn move_paths(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::Move { source, destination } => Some((source, destination)),
+            _ => None,
+        }
+    }
+
+    fn touch_path(&self) -> Option<&str> {
+        match self {
+            Self::Touch(path) => Some(path),
+            _ => None,
+        }
+    }
+
+    fn echo_target(&self) -> Option<&shell_core::guest_commands::EchoTarget> {
+        match self {
+            Self::Echo(target) => Some(target),
+            _ => None,
+        }
+    }
+
+    fn exec_program(&self) -> Option<(&str, &[String])> {
+        match self {
+            Self::Exec { path, args } => Some((path, args)),
+            _ => None,
+        }
+    }
+}
+
 impl Command {
     fn as_guest_command(&self) -> Result<GuestCommand> {
-        Ok(match self {
-            Self::Pwd => GuestCommand::Pwd,
-            Self::List(path) => GuestCommand::List(path.clone()),
-            Self::Cat(path) => GuestCommand::Cat(path.clone()),
-            Self::Test(expression) => GuestCommand::Test(expression.clone()),
-            Self::Mkdir(path) => GuestCommand::Mkdir(path.clone()),
-            Self::Remove(path) => GuestCommand::Remove(path.clone()),
-            Self::Copy { source, destination } => GuestCommand::Copy {
-                source: source.clone(),
-                destination: destination.clone(),
-            },
-            Self::Move { source, destination } => GuestCommand::Move {
-                source: source.clone(),
-                destination: destination.clone(),
-            },
-            Self::Touch(path) => GuestCommand::Touch(path.clone()),
-            Self::Echo(target) => GuestCommand::Echo(target.clone()),
-            Self::Exec { path, args } => GuestCommand::Exec {
-                path: path.clone(),
-                args: args.clone(),
-            },
-            Self::Help(_)
-            | Self::Clear
-            | Self::Exit
-            | Self::Edit(_)
-            | Self::Source(_)
-            | Self::ShowStats
-            | Self::ShowTracing
-            | Self::TracingLimit(_)
-            | Self::TracingLevel(_)
-            | Self::TracingTargets(_)
-            | Self::RpcInstance(_)
-            | Self::RpcFunc(_)
-            | Self::RpcPayload(_)
-            | Self::RpcCall => anyhow::bail!("command is not delegated to guest shell"),
-        })
+        guest_commands::from_source(self)
+            .ok_or_else(|| anyhow::anyhow!("command is not delegated to guest shell"))
     }
 }
 
