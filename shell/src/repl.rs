@@ -636,7 +636,8 @@ impl Completer for ShellHelper {
     ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
         let (start, current, tokens) = completion_context(line, pos);
         let candidates = completion_candidates(&tokens, current)
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|candidate| candidate.starts_with(current))
             .map(|candidate| Pair {
                 display: completion_display(&tokens, candidate),
@@ -665,7 +666,8 @@ impl Hinter for ShellHelper {
         }
 
         let matches = completion_candidates(&tokens, current)
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|candidate| candidate.starts_with(current))
             .collect::<Vec<_>>();
 
@@ -1019,7 +1021,7 @@ fn tracing_level_name(level: Option<tracing::Level>) -> &'static str {
     }
 }
 
-fn completion_context<'a>(line: &'a str, pos: usize) -> (usize, &'a str, Vec<&'a str>) {
+fn completion_context(line: &str, pos: usize) -> (usize, &str, Vec<&str>) {
     let prefix = &line[..pos];
     let ends_with_space = prefix.chars().next_back().is_some_and(char::is_whitespace);
     let mut tokens = prefix.split_whitespace().collect::<Vec<_>>();

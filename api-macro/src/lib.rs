@@ -22,7 +22,7 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
 fn expand_main(function: ItemFn) -> Result<proc_macro2::TokenStream> {
     if function.sig.asyncness.is_none() {
         return Err(syn::Error::new_spanned(
-            &function.sig.fn_token,
+            function.sig.fn_token,
             "`#[helios_api::main]` requires `async fn`",
         ));
     }
@@ -41,7 +41,7 @@ fn expand_main(function: ItemFn) -> Result<proc_macro2::TokenStream> {
         ));
     }
 
-    for input in &function.sig.inputs {
+    if let Some(input) = function.sig.inputs.first() {
         match input {
             FnArg::Receiver(receiver) => {
                 return Err(syn::Error::new_spanned(
