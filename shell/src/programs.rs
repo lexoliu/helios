@@ -1,6 +1,7 @@
 use anyhow::{bail, Result};
 use helios_shell_protocol::debugger::programs as debugger_programs;
 use helios_shell_protocol::system::programs::ExecResult;
+use shell_core::programs::candidate_program_paths;
 
 use crate::filesystem::normalize_path;
 use crate::serial::RpcClient;
@@ -27,15 +28,7 @@ fn candidate_paths(input: &str) -> Result<Vec<String>> {
     if input.contains('/') || input.starts_with('.') {
         return explicit_candidate_paths(input);
     }
-
-    let mut candidates = Vec::with_capacity(PROGRAM_SEARCH_DIRECTORIES.len() * 2);
-    for directory in PROGRAM_SEARCH_DIRECTORIES {
-        candidates.push(format!("{directory}/{input}"));
-        if !input.ends_with(".wasm") {
-            candidates.push(format!("{directory}/{input}.wasm"));
-        }
-    }
-    Ok(candidates)
+    Ok(candidate_program_paths(input, PROGRAM_SEARCH_DIRECTORIES))
 }
 
 fn explicit_candidate_paths(input: &str) -> Result<Vec<String>> {
