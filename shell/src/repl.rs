@@ -31,6 +31,7 @@ use crate::help;
 use crate::programs::exec as exec_program;
 use crate::rpc::RpcPane;
 use crate::runtime;
+use shell_core::guest_commands::{self, GuestCommand};
 use shell_core::{self, CommandStatus, ScriptHost, Statement};
 use crate::serial::RpcClient;
 use crate::stats_tui;
@@ -368,6 +369,47 @@ impl<T: TerminalIo> ScriptHost for ScriptRuntime<'_, T> {
     }
 }
 
+impl Command {
+    fn as_guest_command(&self) -> Result<GuestCommand> {
+        Ok(match self {
+            Self::Pwd => GuestCommand::Pwd,
+            Self::List(path) => GuestCommand::List(path.clone()),
+            Self::Cat(path) => GuestCommand::Cat(path.clone()),
+            Self::Test(expression) => GuestCommand::Test(expression.clone()),
+            Self::Mkdir(path) => GuestCommand::Mkdir(path.clone()),
+            Self::Remove(path) => GuestCommand::Remove(path.clone()),
+            Self::Copy { source, destination } => GuestCommand::Copy {
+                source: source.clone(),
+                destination: destination.clone(),
+            },
+            Self::Move { source, destination } => GuestCommand::Move {
+                source: source.clone(),
+                destination: destination.clone(),
+            },
+            Self::Touch(path) => GuestCommand::Touch(path.clone()),
+            Self::Echo(target) => GuestCommand::Echo(target.clone()),
+            Self::Exec { path, args } => GuestCommand::Exec {
+                path: path.clone(),
+                args: args.clone(),
+            },
+            Self::Help(_)
+            | Self::Clear
+            | Self::Exit
+            | Self::Edit(_)
+            | Self::Source(_)
+            | Self::ShowStats
+            | Self::ShowTracing
+            | Self::TracingLimit(_)
+            | Self::TracingLevel(_)
+            | Self::TracingTargets(_)
+            | Self::RpcInstance(_)
+            | Self::RpcFunc(_)
+            | Self::RpcPayload(_)
+            | Self::RpcCall => anyhow::bail!("command is not delegated to guest shell"),
+        })
+    }
+}
+
 impl<T: TerminalIo> Shell<T> {
     fn new(terminal: T) -> Self {
         Self {
@@ -503,7 +545,7 @@ impl<T: TerminalIo> Shell<T> {
         client: &mut RpcClient,
         command: &Command,
     ) -> Result<CommandStatus> {
-        let line = render_command_for_guest(command)?;
+        let line = guest_commands::render(&command.as_guest_command()?)?;
         let result = exec_program(client, "/bin/sh", &["-c".to_owned(), line]).await?;
         if !result.output.stdout.is_empty() {
             self.write_bytes(&result.output.stdout)?;
@@ -862,68 +904,6 @@ fn render_help_hint(prefix: &[&str]) -> String {
     }
 }
 
-
-fn render_command_for_guest(command: &Command) -> Result<String> {
-    match command {
-        Command::Pwd => Ok("pwd".to_owned()),
-        Command::List(path) => Ok(match path {
-            Some(path) => format!("ls {}", shell_words::quote(path)),
-            None => "ls".to_owned(),
-        }),
-        Command::Cat(path) => Ok(format!("cat {}", shell_words::quote(path))),
-        Command::Test(expression) => Ok(format!(
-            "test {}",
-            expression.iter().map(|part| shell_words::quote(part)).collect::<Vec<_>>().join(" ")
-        )),
-        Command::Mkdir(path) => Ok(format!("mkdir {}", shell_words::quote(path))),
-        Command::Remove(path) => Ok(format!("rm {}", shell_words::quote(path))),
-        Command::Copy { source, destination } => Ok(format!(
-            "cp {} {}",
-            shell_words::quote(source),
-            shell_words::quote(destination)
-        )),
-        Command::Move { source, destination } => Ok(format!(
-            "mv {} {}",
-            shell_words::quote(source),
-            shell_words::quote(destination)
-        )),
-        Command::Touch(path) => Ok(format!("touch {}", shell_words::quote(path))),
-        Command::Echo(target) => match target {
-            filesystem::EchoTarget::Stdout(bytes) => Ok(format!(
-                "echo {}",
-                shell_words::quote(core::str::from_utf8(bytes).unwrap_or("").trim_end_matches('\n'))
-            )),
-            filesystem::EchoTarget::File { path, bytes, append } => {
-                let operator = if *append { ">>" } else { ">" };
-                Ok(format!(
-                    "echo {} {} {}",
-                    shell_words::quote(core::str::from_utf8(bytes).unwrap_or("").trim_end_matches('\n')),
-                    operator,
-                    shell_words::quote(path)
-                ))
-            }
-        },
-        Command::Exec { path, args } => {
-            let mut rendered = vec!["exec".to_owned(), shell_words::quote(path).to_string()];
-            rendered.extend(args.iter().map(|arg| shell_words::quote(arg).to_string()));
-            Ok(rendered.join(" "))
-        }
-        Command::Help(_)
-        | Command::Clear
-        | Command::Exit
-        | Command::Edit(_)
-        | Command::Source(_)
-        | Command::ShowStats
-        | Command::ShowTracing
-        | Command::TracingLimit(_)
-        | Command::TracingLevel(_)
-        | Command::TracingTargets(_)
-        | Command::RpcInstance(_)
-        | Command::RpcFunc(_)
-        | Command::RpcPayload(_)
-        | Command::RpcCall => anyhow::bail!("command is not delegated to guest shell"),
-    }
-}
 
 fn render_help(topic: HelpTopic) -> String {
     help::render(topic)
