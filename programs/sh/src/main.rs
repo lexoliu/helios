@@ -5,17 +5,16 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
+use helios_api::fs as helios_fs;
 use helios_api::programs::{self, ExecErrorKind, ExecRequest};
 use shell_core::{CommandStatus, ParseState, ScriptHost, Statement};
-use wasmparser::Parser;
-use wit_component::ComponentEncoder;
 
 const PROGRAM_SEARCH_DIRECTORIES: &[&str] = &["/bin"];
 
 #[helios_api::main]
 async fn main() -> Result<()> {
     let invocation = Invocation::from_env()?;
-    let program = invocation.load_program()?;
+    let program = invocation.load_program().await?;
     let mut shell = GuestShell;
     let status = shell_core::execute_script(&mut shell, &program).await?;
     if status.is_success() {
@@ -59,11 +58,13 @@ impl Invocation {
         }
     }
 
-    fn load_program(&self) -> Result<Vec<Statement>> {
+    async fn load_program(&self) -> Result<Vec<Statement>> {
         let source = match (&self.inline_command, &self.script_path) {
             (Some(command), None) => command.clone(),
             (None, Some(path)) => {
-                fs::read_to_string(path).with_context(|| format!("failed to read shell script {}", path.display()))?
+                helios_fs::read_to_string(path)
+                    .await
+                    .with_context(|| format!("failed to read shell script {}", path.display()))?
             }
             _ => unreachable!("invocation construction must choose exactly one shell source"),
         };
@@ -97,7 +98,8 @@ impl ScriptHost for GuestShell {
             }
             "cat" => {
                 let path = single_argument(command, &tokens[1..])?;
-                let bytes = fs::read(path)
+                let bytes = helios_fs::read(path)
+                    .await
                     .with_context(|| format!("failed to read file {path}"))?;
                 io::stdout().write_all(&bytes)?;
                 Ok(CommandStatus::SUCCESS)
@@ -130,21 +132,20 @@ fn run_echo(words: &[String]) -> Result<()> {
 
 fn run_test(args: &[String]) -> Result<CommandStatus> {
     match args {
-        [flag, path] if flag == "-e" => Ok(CommandStatus::new((!Path::new(path).exists()) as u8)),
-        [flag, path] if flag == "-f" => Ok(CommandStatus::new((!Path::new(path).is_file()) as u8)),
-        [flag, path] if flag == "-d" => Ok(CommandStatus::new((!Path::new(path).is_dir()) as u8)),
+        [flag, path] if flag == "-e" => Ok(CommandStatus::new((!exists(path)) as u8)),
+        [flag, path] if flag == "-f" => Ok(CommandStatus::new((!is_file(path)) as u8)),
+        [flag, path] if flag == "-d" => Ok(CommandStatus::new((!is_dir(path)) as u8)),
         _ => bail!("unsupported test expression: expected `test -e|-f|-d <path>`"),
     }
 }
 
 async fn exec_program(program: &str, args: &[String]) -> Result<CommandStatus> {
-    let resolved = resolve_program(program)?;
-    let wasm = load_component(&resolved)?;
-    let name = infer_instance_name(&resolved)?;
+    let resolved = resolve_program(program).await?;
+    let name = infer_instance_name(Path::new(&resolved.path))?;
     match programs::exec(&ExecRequest {
         name,
         args: args.to_vec(),
-        wasm,
+        wasm: resolved.wasm,
     }) {
         Ok(result) => {
             io::stdout().write_all(&result.output.stdout)?;
@@ -160,49 +161,49 @@ async fn exec_program(program: &str, args: &[String]) -> Result<CommandStatus> {
     }
 }
 
-fn resolve_program(input: &str) -> Result<PathBuf> {
+async fn resolve_program(input: &str) -> Result<ResolvedProgram> {
+    let mut errors = Vec::new();
+
+    for path in candidate_paths(input)? {
+        match helios_fs::read(&path).await {
+            Ok(wasm) => return Ok(ResolvedProgram { path, wasm }),
+            Err(error) => errors.push(format!("{path}: {error:#}")),
+        }
+    }
+
+    bail!(
+        "failed to locate executable program {input:?}:\n{}",
+        errors.join("\n")
+    )
+}
+
+struct ResolvedProgram {
+    path: String,
+    wasm: Vec<u8>,
+}
+
+fn candidate_paths(input: &str) -> Result<Vec<String>> {
     if input.contains('/') || input.starts_with('.') {
-        return resolve_explicit_path(input);
+        return explicit_candidate_paths(input);
     }
 
+    let mut candidates = Vec::with_capacity(PROGRAM_SEARCH_DIRECTORIES.len() * 2);
     for directory in PROGRAM_SEARCH_DIRECTORIES {
-        let direct = PathBuf::from(directory).join(input);
-        if direct.exists() {
-            return Ok(direct);
-        }
-        let wasm = direct.with_extension("wasm");
-        if wasm.exists() {
-            return Ok(wasm);
+        candidates.push(format!("{directory}/{input}"));
+        if !input.ends_with(".wasm") {
+            candidates.push(format!("{directory}/{input}.wasm"));
         }
     }
-
-    bail!("failed to locate executable program {input:?}")
+    Ok(candidates)
 }
 
-fn resolve_explicit_path(input: &str) -> Result<PathBuf> {
-    let path = PathBuf::from(input);
-    if path.exists() {
-        return Ok(path);
-    }
-    let wasm = path.with_extension("wasm");
-    if wasm.exists() {
-        return Ok(wasm);
-    }
-    bail!("failed to locate executable path {input:?}")
-}
-
-fn load_component(path: &Path) -> Result<Vec<u8>> {
-    let wasm = fs::read(path).with_context(|| format!("failed to read wasm file {}", path.display()))?;
-    if Parser::is_component(&wasm) {
-        return Ok(wasm);
+fn explicit_candidate_paths(input: &str) -> Result<Vec<String>> {
+    let path = input.to_owned();
+    if path.ends_with(".wasm") {
+        return Ok(vec![path]);
     }
 
-    ComponentEncoder::default()
-        .module(&wasm)
-        .with_context(|| format!("failed to load core wasm module {}", path.display()))?
-        .validate(true)
-        .encode()
-        .with_context(|| format!("failed to encode component {}", path.display()))
+    Ok(vec![path.clone(), format!("{path}.wasm")])
 }
 
 fn infer_instance_name(path: &Path) -> Result<String> {
@@ -211,6 +212,37 @@ fn infer_instance_name(path: &Path) -> Result<String> {
         .and_then(|name| name.to_str())
         .context("program path does not end with a valid utf-8 file name")?;
     Ok(name.strip_suffix(".wasm").unwrap_or(name).to_owned())
+}
+
+fn exists(path: impl AsRef<Path>) -> bool {
+    fs::metadata(wasi_path(path.as_ref())).is_ok()
+}
+
+fn is_file(path: impl AsRef<Path>) -> bool {
+    fs::metadata(wasi_path(path.as_ref()))
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+}
+
+fn is_dir(path: impl AsRef<Path>) -> bool {
+    fs::metadata(wasi_path(path.as_ref()))
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+}
+
+fn wasi_path(path: &Path) -> PathBuf {
+    if !path.is_absolute() {
+        return path.to_path_buf();
+    }
+
+    let relative = path
+        .strip_prefix("/")
+        .expect("absolute guest paths must be rooted at /");
+    if relative.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        relative.to_path_buf()
+    }
 }
 
 fn single_argument<'a>(command: &str, args: &'a [String]) -> Result<&'a str> {

@@ -7,11 +7,9 @@ autobins = false
 [dependencies]
 anyhow = "1.0.100"
 async-trait = "0.1.89"
-helios-api = { path = "../../api", default-features = false, features = ["programs"] }
+helios-api = { path = "../../api", default-features = false, features = ["fs", "programs"] }
 shell-core = { path = "../../shell-core" }
 shell-words = "1.1.0"
-wasmparser = "0.245.0"
-wit-component = "0.245.0"
 
 [lib]
 name = "helios_sh"

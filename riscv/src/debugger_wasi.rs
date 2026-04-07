@@ -90,7 +90,7 @@ pub(crate) fn add_to_linker(linker: &mut Linker<StoreData>) -> Result<()> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FsNodeKind {
+pub(crate) enum FsNodeKind {
     Directory,
     File,
 }
@@ -107,9 +107,9 @@ struct FsNode {
 
 #[derive(Clone)]
 pub struct FsDescriptor {
-    path: String,
-    kind: FsNodeKind,
-    flags: fs_types::DescriptorFlags,
+    pub(crate) path: String,
+    pub(crate) kind: FsNodeKind,
+    pub(crate) flags: fs_types::DescriptorFlags,
 }
 
 pub struct TerminalInput;
@@ -419,7 +419,7 @@ impl DebugFileSystem {
         inode
     }
 
-    fn root_descriptor(&self) -> FsDescriptor {
+    pub(crate) fn root_descriptor(&self) -> FsDescriptor {
         FsDescriptor {
             path: String::from("/"),
             kind: FsNodeKind::Directory,
@@ -446,7 +446,7 @@ impl DebugFileSystem {
             .ok_or(fs_types::ErrorCode::NoEntry)
     }
 
-    fn stat(
+    pub(crate) fn stat(
         &self,
         path: &str,
     ) -> core::result::Result<fs_types::DescriptorStat, fs_types::ErrorCode> {
@@ -469,7 +469,7 @@ impl DebugFileSystem {
         })
     }
 
-    fn metadata_hash(
+    pub(crate) fn metadata_hash(
         &self,
         path: &str,
     ) -> core::result::Result<fs_types::MetadataHashValue, fs_types::ErrorCode> {
@@ -484,7 +484,7 @@ impl DebugFileSystem {
         })
     }
 
-    fn read_directory(
+    pub(crate) fn read_directory(
         &self,
         path: &str,
     ) -> core::result::Result<Vec<fs_types::DirectoryEntry>, fs_types::ErrorCode> {
@@ -535,7 +535,7 @@ impl DebugFileSystem {
         Ok(entries)
     }
 
-    fn read_file(
+    pub(crate) fn read_file(
         &self,
         descriptor: &FsDescriptor,
         offset: u64,
@@ -557,7 +557,7 @@ impl DebugFileSystem {
         Ok(node.contents[offset..].to_vec())
     }
 
-    fn write_at(
+    pub(crate) fn write_at(
         &mut self,
         descriptor: &FsDescriptor,
         offset: usize,
@@ -589,7 +589,7 @@ impl DebugFileSystem {
         Ok(())
     }
 
-    fn append(
+    pub(crate) fn append(
         &mut self,
         descriptor: &FsDescriptor,
         bytes: &[u8],
@@ -599,7 +599,7 @@ impl DebugFileSystem {
         self.write_at(descriptor, offset, bytes, now_nanos)
     }
 
-    fn open_at(
+    pub(crate) fn open_at(
         &mut self,
         base: &FsDescriptor,
         path_flags: fs_types::PathFlags,
@@ -694,7 +694,7 @@ impl DebugFileSystem {
         })
     }
 
-    fn remove_directory_at(
+    pub(crate) fn remove_directory_at(
         &mut self,
         base: &FsDescriptor,
         path: &str,
@@ -728,7 +728,7 @@ impl DebugFileSystem {
         Ok(())
     }
 
-    fn create_directory_at(
+    pub(crate) fn create_directory_at(
         &mut self,
         base: &FsDescriptor,
         path: &str,
@@ -773,7 +773,7 @@ impl DebugFileSystem {
         Ok(())
     }
 
-    fn unlink_file_at(
+    pub(crate) fn unlink_file_at(
         &mut self,
         base: &FsDescriptor,
         path: &str,
@@ -796,7 +796,7 @@ impl DebugFileSystem {
         Ok(())
     }
 
-    fn rename_at(
+    pub(crate) fn rename_at(
         &mut self,
         source_base: &FsDescriptor,
         source_path: &str,
@@ -1838,7 +1838,7 @@ fn get_fs_descriptor(
         .map_err(fs_resource_error)
 }
 
-fn fs_resource_error(error: ResourceTableError) -> fs_types::ErrorCode {
+pub(crate) fn fs_resource_error(error: ResourceTableError) -> fs_types::ErrorCode {
     match error {
         ResourceTableError::NotPresent | ResourceTableError::WrongType => {
             fs_types::ErrorCode::BadDescriptor
@@ -1848,7 +1848,7 @@ fn fs_resource_error(error: ResourceTableError) -> fs_types::ErrorCode {
     }
 }
 
-fn resolve_child_path(
+pub(crate) fn resolve_child_path(
     base: &str,
     child: &str,
 ) -> core::result::Result<String, fs_types::ErrorCode> {
