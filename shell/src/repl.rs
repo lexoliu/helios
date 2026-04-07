@@ -27,11 +27,11 @@ use strsim::normalized_damerau_levenshtein;
 
 use crate::edit_tui;
 use crate::filesystem;
+use crate::guest_exec;
 use crate::help;
-use crate::programs::exec as exec_program;
 use crate::rpc::RpcPane;
 use crate::runtime;
-use shell_core::guest_commands::{self, GuestCommand};
+use shell_core::guest_commands::GuestCommand;
 use shell_core::{self, CommandStatus, ScriptHost, Statement};
 use crate::serial::RpcClient;
 use crate::stats_tui;
@@ -545,17 +545,14 @@ impl<T: TerminalIo> Shell<T> {
         client: &mut RpcClient,
         command: &Command,
     ) -> Result<CommandStatus> {
-        let line = guest_commands::render(&command.as_guest_command()?)?;
-        let result = exec_program(client, "/bin/sh", &["-c".to_owned(), line]).await?;
-        if !result.output.stdout.is_empty() {
-            self.write_bytes(&result.output.stdout)?;
+        let output = guest_exec::run(client, &command.as_guest_command()?).await?;
+        if !output.stdout.is_empty() {
+            self.write_bytes(&output.stdout)?;
         }
-        if !result.output.stderr.is_empty() {
-            self.write_bytes(&result.output.stderr)?;
+        if !output.stderr.is_empty() {
+            self.write_bytes(&output.stderr)?;
         }
-        let exit_code = u8::try_from(result.exit_code)
-            .with_context(|| format!("guest exit code {} exceeded u8", result.exit_code))?;
-        Ok(CommandStatus::new(exit_code))
+        Ok(CommandStatus::new(output.exit_code))
     }
 
     async fn show_tracing(&mut self, client: &mut RpcClient) -> Result<()> {
