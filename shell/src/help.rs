@@ -88,7 +88,7 @@ const OVERVIEW_EXAMPLES: &[&str] = &[
     "cat /tmp/note.txt",
     "cp /tmp/note.txt /tmp/note.bak",
     "mv /tmp/note.bak /tmp/renamed.txt",
-    "run ping google.com",
+    "exec ping google.com",
     "if test -e /tmp/note.txt",
     "    cat /tmp/note.txt",
     "  else",

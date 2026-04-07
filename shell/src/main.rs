@@ -64,10 +64,12 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Open the live stats view.
     Stats {
         #[arg(long, default_value_t = 1_000)]
         period_ms: u64,
     },
+    /// Stream tracing events until interrupted.
     Tracing {
         /// Maximum number of recent events kept in the incremental polling window.
         #[arg(long, default_value_t = 64)]
@@ -77,6 +79,7 @@ enum Command {
         #[arg(long)]
         target_prefix: Vec<String>,
     },
+    /// Invoke a raw remote WIT method.
     Rpc {
         #[arg(long)]
         instance: String,
