@@ -6,7 +6,7 @@ use anyhow::{Context as _, Result};
 use futures_io::{AsyncRead, AsyncWrite};
 
 pub use super::bindings::helios::system::programs::{
-    ExecError, ExecErrorKind, ExecRequest, ExecResult,
+    ExecError, ExecErrorKind, ExecOutput, ExecRequest, ExecResult,
 };
 
 #[cfg(feature = "host")]

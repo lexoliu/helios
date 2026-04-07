@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
-use helios_shell_protocol::debugger::filesystem;
-use helios_shell_protocol::system::programs::{self, ExecRequest, ExecResult};
+use helios_shell_protocol::debugger::programs as debugger_programs;
+use helios_shell_protocol::system::programs::ExecResult;
 
 use crate::filesystem::normalize_path;
 use crate::serial::RpcClient;
@@ -8,53 +8,19 @@ use crate::serial::RpcClient;
 const PROGRAM_SEARCH_DIRECTORIES: &[&str] = &["/bin"];
 
 pub async fn exec(client: &mut RpcClient, path: &str, args: &[String]) -> Result<ExecResult> {
-    let resolved = resolve_program(client, path).await?;
-    let name = infer_instance_name(&resolved.path)?;
-    let result = programs::exec(
-        &*client,
-        &ExecRequest {
-            name: name.clone(),
-            args: args.to_vec(),
-            wasm: resolved.wasm,
-        },
-    )
-    .await?;
-
-    let _ = name;
-    Ok(result)
-}
-
-struct ResolvedProgram {
-    path: String,
-    wasm: Vec<u8>,
-}
-
-async fn resolve_program(client: &mut RpcClient, input: &str) -> Result<ResolvedProgram> {
-    let candidates = candidate_paths(input)?;
     let mut errors = Vec::new();
 
-    for path in candidates {
-        match filesystem::read(client, &path).await {
-            Ok(wasm) => return Ok(ResolvedProgram { path, wasm }),
-            Err(error) => errors.push(format!("{path}: {error:#}")),
+    for candidate in candidate_paths(path)? {
+        match debugger_programs::exec_path(&*client, &candidate, args).await {
+            Ok(result) => return Ok(result),
+            Err(error) => errors.push(format!("{candidate}: {error:#}")),
         }
     }
 
     bail!(
-        "failed to locate runnable program {input:?} in the guest filesystem:\n{}",
+        "failed to locate runnable program {path:?} in the guest filesystem:\n{}",
         errors.join("\n")
-    );
-}
-
-fn infer_instance_name(path: &str) -> Result<String> {
-    let Some(name) = path.rsplit('/').next() else {
-        bail!("path {path:?} does not name a runnable file");
-    };
-    if name.is_empty() {
-        bail!("path {path:?} does not name a runnable file");
-    }
-
-    Ok(name.strip_suffix(".wasm").unwrap_or(name).to_owned())
+    )
 }
 
 fn candidate_paths(input: &str) -> Result<Vec<String>> {
@@ -83,7 +49,7 @@ fn explicit_candidate_paths(input: &str) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{candidate_paths, infer_instance_name};
+    use super::candidate_paths;
 
     #[test]
     fn bare_program_name_searches_bin_with_wasm_suffix() {
@@ -101,11 +67,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn instance_name_strips_wasm_extension() {
-        assert_eq!(
-            infer_instance_name("/bin/ping.wasm").expect("instance name must infer"),
-            "ping"
-        );
-    }
 }
