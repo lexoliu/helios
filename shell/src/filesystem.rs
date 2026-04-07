@@ -3,6 +3,7 @@ use std::path::{Component, Path};
 
 use anyhow::{bail, Result};
 pub use shell_core::guest_commands::EchoTarget;
+pub use shell_core::paths::normalize_absolute as normalize_path;
 use globset::Glob;
 use helios_shell_protocol::debugger::filesystem::{self, DirectoryEntry, EntryKind};
 
@@ -189,29 +190,6 @@ fn normalize_glob_pattern(input: &str) -> Result<String> {
     Ok(normalized.join("/"))
 }
 
-pub fn normalize_path(input: &str) -> Result<String> {
-    let path = Path::new(input);
-    let mut segments = Vec::new();
-    for component in path.components() {
-        match component {
-            Component::RootDir | Component::CurDir => {}
-            Component::Normal(segment) => segments.push(
-                segment
-                    .to_str()
-                    .ok_or_else(|| anyhow::anyhow!("path {input:?} contains a non-utf8 segment"))?
-                    .to_owned(),
-            ),
-            Component::ParentDir => bail!("path {input:?} contains unsupported parent traversal"),
-            Component::Prefix(_) => bail!("path {input:?} uses an unsupported path prefix"),
-        }
-    }
-
-    if segments.is_empty() {
-        return Ok("/".to_owned());
-    }
-
-    Ok(format!("/{}", segments.join("/")))
-}
 
 #[cfg(test)]
 mod tests {

@@ -1,9 +1,9 @@
 use anyhow::{bail, Result};
 use helios_shell_protocol::debugger::programs as debugger_programs;
 use helios_shell_protocol::system::programs::ExecResult;
+use shell_core::paths::normalize_absolute as normalize_path;
 use shell_core::programs::candidate_program_paths;
 
-use crate::filesystem::normalize_path;
 use crate::serial::RpcClient;
 
 const PROGRAM_SEARCH_DIRECTORIES: &[&str] = &["/bin"];
