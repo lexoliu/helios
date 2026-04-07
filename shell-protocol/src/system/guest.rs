@@ -10,7 +10,7 @@ use helios_api::{
 use crate::wire::{Frame, read_frame, write_frame};
 
 use super::bindings::helios::system::{instances, programs, stats, tracing};
-use crate::debugger::filesystem;
+use crate::debugger::{filesystem, programs as debugger_programs};
 
 const RESPONSE_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -97,6 +97,7 @@ fn supports_request(instance: &str, func: &str) -> bool {
             | ("helios:system/instances@0.1.0", "snapshot")
             | ("helios:system/tracing@0.1.0", "recent")
     ) || filesystem::supports(instance, func)
+        || debugger_programs::supports(instance, func)
 }
 
 async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>> {
@@ -151,6 +152,9 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>>
             postcard::to_allocvec(&events).context("failed to encode tracing.recent response")
         }
         _ if filesystem::supports(instance, func) => filesystem::dispatch(func, payload).await,
+        _ if debugger_programs::supports(instance, func) => {
+            debugger_programs::dispatch(func, payload).await
+        }
         _ => unreachable!("supports_request must reject unsupported methods before dispatch"),
     }
 }

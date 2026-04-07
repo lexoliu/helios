@@ -259,7 +259,16 @@ impl UserProgramService {
     }
 
     async fn compile_component(&self, wasm: &[u8]) -> Result<Arc<Component>, ProgramExecError> {
+        let started_at = monotonic_nanos(self.inner.timebase_frequency);
         if let Some(component) = self.inner.component_cache.lock().get(wasm) {
+            tracing::info!(
+                target: "helios_riscv::program_host",
+                phase = "compile-component",
+                cache = "hit",
+                wasm_bytes = wasm.len(),
+                elapsed_ms = elapsed_millis(started_at, self.inner.timebase_frequency),
+                "program component cache hit"
+            );
             return Ok(component);
         }
 
@@ -283,6 +292,14 @@ impl UserProgramService {
             })?;
 
         let component = Arc::new(compiled);
+        tracing::info!(
+            target: "helios_riscv::program_host",
+            phase = "compile-component",
+            cache = "miss",
+            wasm_bytes = wasm.len(),
+            elapsed_ms = elapsed_millis(started_at, self.inner.timebase_frequency),
+            "program component compiled"
+        );
         Ok(self
             .inner
             .component_cache
@@ -365,6 +382,8 @@ fn run_component(
     let mut argv = Vec::with_capacity(args.len() + 1);
     argv.push(name);
     argv.extend(args);
+    let timebase_frequency = cpu.timer_frequency();
+    let store_started_at = monotonic_nanos(timebase_frequency);
     let mut linker = Linker::<StoreData>::new(component.engine());
     wasmtime_wasi_io::add_to_linker_async(&mut linker)?;
     crate::debugger_wasi_p2::add_to_linker(&mut linker)?;
@@ -395,14 +414,37 @@ fn run_component(
         caller.data_mut().record_call_hook(hook);
         Ok(())
     });
+    tracing::info!(
+        target: "helios_riscv::program_host",
+        phase = "prepare-store",
+        instance = store.data().instance.id().raw(),
+        elapsed_ms = elapsed_millis(store_started_at, timebase_frequency),
+        "program store prepared"
+    );
 
+    let instantiate_started_at = monotonic_nanos(timebase_frequency);
     let program = debugger_program::block_on(program_bindings::bindings::Init::instantiate_async(
         &mut store, &component, &linker,
     ))?;
+    tracing::info!(
+        target: "helios_riscv::program_host",
+        phase = "instantiate",
+        instance = store.data().instance.id().raw(),
+        elapsed_ms = elapsed_millis(instantiate_started_at, timebase_frequency),
+        "program component instantiated"
+    );
+    let run_started_at = monotonic_nanos(timebase_frequency);
     let result =
         debugger_program::block_on(store.run_concurrent(async move |accessor| {
             program.wasi_cli_run().call_run(accessor).await
         }))?;
+    tracing::info!(
+        target: "helios_riscv::program_host",
+        phase = "call-run",
+        instance = store.data().instance.id().raw(),
+        elapsed_ms = elapsed_millis(run_started_at, timebase_frequency),
+        "program call_run completed"
+    );
     let exit_code = match result {
         Ok(Ok(())) => 0,
         Ok(Err(())) => 1,
@@ -415,4 +457,10 @@ fn run_component(
 fn monotonic_nanos(timebase_frequency: u64) -> u64 {
     let ticks = riscv::register::time::read64();
     ticks.saturating_mul(1_000_000_000) / timebase_frequency
+}
+
+fn elapsed_millis(started_at: u64, timebase_frequency: u64) -> u64 {
+    monotonic_nanos(timebase_frequency)
+        .saturating_sub(started_at)
+        / 1_000_000
 }
