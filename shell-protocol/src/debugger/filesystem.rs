@@ -17,7 +17,9 @@ use helios_api::bindings::wasi::filesystem::types::{
 };
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "guest")]
-use std::path::{Component, Path};
+use shell_core::paths::normalize_segments;
+#[cfg(feature = "guest")]
+use std::path::Path;
 
 const FILESYSTEM_INSTANCE: &str = "helios:debugger/filesystem@0.1.0";
 
@@ -306,34 +308,54 @@ fn decode_path_pair_request(payload: &[u8], operation: &str) -> Result<PathPairR
 
 #[cfg(feature = "guest")]
 async fn list_directory(path: &str) -> Result<Vec<DirectoryEntry>> {
-    let descriptor = open_path(path, DescriptorFlags::READ, OpenFlags::empty()).await?;
-    let descriptor_type = descriptor
-        .get_type()
+    let components = normalized_components(path)?;
+    if components.is_empty() {
+        return read_directory_entries(root_descriptor()?, path).await;
+    }
+
+    let (parent, name) = open_parent_directory(path).await?;
+    let stat = parent
+        .stat_at(PathFlags::empty(), name.clone())
         .await
         .map_err(|code| filesystem_error(path, "inspect", code))?;
-    if matches!(descriptor_type, DescriptorType::Directory) {
-        let (stream, result) = descriptor.read_directory();
-        let mut entries = stream
-            .collect()
+
+    if matches!(stat.type_, DescriptorType::Directory) {
+        let descriptor = parent
+            .open_at(
+                PathFlags::empty(),
+                name,
+                OpenFlags::DIRECTORY,
+                DescriptorFlags::READ | DescriptorFlags::MUTATE_DIRECTORY,
+            )
             .await
-            .into_iter()
-            .map(convert_directory_entry)
-            .collect::<Vec<_>>();
-        result
-            .await
-            .map_err(|code| filesystem_error(path, "read directory", code))?;
-        entries.sort_by(|left, right| {
-            left.kind
-                .cmp(&right.kind)
-                .then_with(|| left.name.cmp(&right.name))
-        });
-        return Ok(entries);
+            .map_err(|code| filesystem_error(path, "open directory", code))?;
+        return read_directory_entries(descriptor, path).await;
     }
 
     Ok(vec![DirectoryEntry {
         name: display_name(path),
-        kind: convert_entry_kind(descriptor_type),
+        kind: convert_entry_kind(stat.type_),
     }])
+}
+
+#[cfg(feature = "guest")]
+async fn read_directory_entries(descriptor: Descriptor, path: &str) -> Result<Vec<DirectoryEntry>> {
+    let (stream, result) = descriptor.read_directory();
+    let mut entries = stream
+        .collect()
+        .await
+        .into_iter()
+        .map(convert_directory_entry)
+        .collect::<Vec<_>>();
+    result
+        .await
+        .map_err(|code| filesystem_error(path, "read directory", code))?;
+    entries.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(entries)
 }
 
 #[cfg(feature = "guest")]
@@ -476,21 +498,7 @@ async fn move_path(source: &str, destination: &str) -> Result<()> {
 
 #[cfg(feature = "guest")]
 fn normalized_components(path: &str) -> Result<Vec<String>> {
-    let mut components = Vec::new();
-    for component in Path::new(path).components() {
-        match component {
-            Component::RootDir | Component::CurDir => {}
-            Component::Normal(segment) => components.push(
-                segment
-                    .to_str()
-                    .ok_or_else(|| anyhow::anyhow!("path {path:?} contains a non-utf8 segment"))?
-                    .to_owned(),
-            ),
-            Component::ParentDir => bail!("path {path:?} contains unsupported parent traversal"),
-            Component::Prefix(_) => bail!("path {path:?} uses an unsupported path prefix"),
-        }
-    }
-    Ok(components)
+    normalize_segments(path)
 }
 
 #[cfg(feature = "guest")]
