@@ -15,7 +15,7 @@ mod tui;
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
-use shell_core::guest_commands::GuestCommand;
+use shell_core::guest_commands::{self, EchoTarget, GuestCommand, GuestCommandSource};
 use std::io::Write as _;
 
 #[derive(Debug, Parser)]
@@ -92,30 +92,88 @@ enum Command {
     },
 }
 
-impl Command {
-    fn as_guest_command(&self) -> Result<Option<GuestCommand>> {
-        Ok(match self {
-            Self::Pwd => Some(GuestCommand::Pwd),
-            Self::Ls { path } => Some(GuestCommand::List(path.clone())),
-            Self::Cat { path } => Some(GuestCommand::Cat(path.clone())),
-            Self::Mkdir { path } => Some(GuestCommand::Mkdir(path.clone())),
-            Self::Rm { path } => Some(GuestCommand::Remove(path.clone())),
-            Self::Cp { source, destination } => Some(GuestCommand::Copy {
-                source: source.clone(),
-                destination: destination.clone(),
-            }),
-            Self::Mv { source, destination } => Some(GuestCommand::Move {
-                source: source.clone(),
-                destination: destination.clone(),
-            }),
-            Self::Touch { path } => Some(GuestCommand::Touch(path.clone())),
-            Self::Echo { words } => Some(GuestCommand::Echo(filesystem::parse_echo(words)?)),
-            Self::Exec { path, args } => Some(GuestCommand::Exec {
-                path: path.clone(),
-                args: args.clone(),
-            }),
-            Self::Edit { .. } | Self::Stats { .. } | Self::Tracing { .. } | Self::Rpc { .. } => None,
-        })
+struct MainGuestCommand<'a> {
+    command: &'a Command,
+    echo_target: Option<EchoTarget>,
+}
+
+impl<'a> MainGuestCommand<'a> {
+    fn new(command: &'a Command) -> Result<Self> {
+        let echo_target = match command {
+            Command::Echo { words } => Some(filesystem::parse_echo(words)?),
+            _ => None,
+        };
+        Ok(Self { command, echo_target })
+    }
+
+    fn into_guest_command(self) -> Option<GuestCommand> {
+        guest_commands::from_source(&self)
+    }
+}
+
+impl GuestCommandSource for MainGuestCommand<'_> {
+    fn pwd(&self) -> bool {
+        matches!(self.command, Command::Pwd)
+    }
+
+    fn list_path(&self) -> Option<Option<&str>> {
+        match self.command {
+            Command::Ls { path } => Some(path.as_deref()),
+            _ => None,
+        }
+    }
+
+    fn cat_path(&self) -> Option<&str> {
+        match self.command {
+            Command::Cat { path } => Some(path),
+            _ => None,
+        }
+    }
+
+    fn mkdir_path(&self) -> Option<&str> {
+        match self.command {
+            Command::Mkdir { path } => Some(path),
+            _ => None,
+        }
+    }
+
+    fn remove_path(&self) -> Option<&str> {
+        match self.command {
+            Command::Rm { path } => Some(path),
+            _ => None,
+        }
+    }
+
+    fn copy_paths(&self) -> Option<(&str, &str)> {
+        match self.command {
+            Command::Cp { source, destination } => Some((source, destination)),
+            _ => None,
+        }
+    }
+
+    fn move_paths(&self) -> Option<(&str, &str)> {
+        match self.command {
+            Command::Mv { source, destination } => Some((source, destination)),
+            _ => None,
+        }
+    }
+
+    fn touch_path(&self) -> Option<&str> {
+        match self.command {
+            Command::Touch { path } => Some(path),
+            _ => None,
+        }
+    }
+
+    fn echo_target(&self) -> Option<&EchoTarget> {
+        self.echo_target.as_ref()
+    }
+
+    fn exec_program(&self) -> Option<(&str, &[String])> {
+        match self.command {
+            Command::Exec { path, args } => Some((path, args)),
+            _ => None,
+        }
     }
 }
 
@@ -135,7 +193,7 @@ fn main() -> Result<()> {
     match args.command {
         None => repl::run(client),
         Some(command) => {
-            if let Some(command) = command.as_guest_command()? {
+            if let Some(command) = MainGuestCommand::new(&command)?.into_guest_command() {
                 return run_interruptible(async move {
                     let mut client = client;
                     let output = guest_exec::run(&mut client, &command).await?;

@@ -27,6 +27,98 @@ pub enum GuestCommand {
     Exec { path: String, args: Vec<String> },
 }
 
+pub trait GuestCommandSource {
+    fn pwd(&self) -> bool {
+        false
+    }
+
+    fn list_path(&self) -> Option<Option<&str>> {
+        None
+    }
+
+    fn cat_path(&self) -> Option<&str> {
+        None
+    }
+
+    fn test_expression(&self) -> Option<&[String]> {
+        None
+    }
+
+    fn mkdir_path(&self) -> Option<&str> {
+        None
+    }
+
+    fn remove_path(&self) -> Option<&str> {
+        None
+    }
+
+    fn copy_paths(&self) -> Option<(&str, &str)> {
+        None
+    }
+
+    fn move_paths(&self) -> Option<(&str, &str)> {
+        None
+    }
+
+    fn touch_path(&self) -> Option<&str> {
+        None
+    }
+
+    fn echo_target(&self) -> Option<&EchoTarget> {
+        None
+    }
+
+    fn exec_program(&self) -> Option<(&str, &[String])> {
+        None
+    }
+}
+
+pub fn from_source(source: &impl GuestCommandSource) -> Option<GuestCommand> {
+    if source.pwd() {
+        return Some(GuestCommand::Pwd);
+    }
+    if let Some(path) = source.list_path() {
+        return Some(GuestCommand::List(path.map(ToOwned::to_owned)));
+    }
+    if let Some(path) = source.cat_path() {
+        return Some(GuestCommand::Cat(path.to_owned()));
+    }
+    if let Some(expression) = source.test_expression() {
+        return Some(GuestCommand::Test(expression.to_vec()));
+    }
+    if let Some(path) = source.mkdir_path() {
+        return Some(GuestCommand::Mkdir(path.to_owned()));
+    }
+    if let Some(path) = source.remove_path() {
+        return Some(GuestCommand::Remove(path.to_owned()));
+    }
+    if let Some((source_path, destination_path)) = source.copy_paths() {
+        return Some(GuestCommand::Copy {
+            source: source_path.to_owned(),
+            destination: destination_path.to_owned(),
+        });
+    }
+    if let Some((source_path, destination_path)) = source.move_paths() {
+        return Some(GuestCommand::Move {
+            source: source_path.to_owned(),
+            destination: destination_path.to_owned(),
+        });
+    }
+    if let Some(path) = source.touch_path() {
+        return Some(GuestCommand::Touch(path.to_owned()));
+    }
+    if let Some(target) = source.echo_target() {
+        return Some(GuestCommand::Echo(target.clone()));
+    }
+    if let Some((path, args)) = source.exec_program() {
+        return Some(GuestCommand::Exec {
+            path: path.to_owned(),
+            args: args.to_vec(),
+        });
+    }
+    None
+}
+
 pub fn render(command: &GuestCommand) -> Result<String> {
     match command {
         GuestCommand::Pwd => Ok("pwd".to_owned()),
