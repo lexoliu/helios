@@ -4,6 +4,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{bail, Context as _, Result};
+use bootloader::DiskImageBuilder;
 use clap::{Args as ClapArgs, Subcommand, ValueEnum};
 use console::style;
 use directories::ProjectDirs;
@@ -144,6 +145,12 @@ struct ResolvedVmCommand {
     command: Option<SessionCommand>,
 }
 
+#[derive(Debug)]
+enum BootArtifact {
+    Kernel(PathBuf),
+    DiskImage(PathBuf),
+}
+
 pub(crate) fn run(command: VmCommand) -> Result<()> {
     let command = resolve(command)?;
     ensure_qemu_command(&command)?;
@@ -266,6 +273,40 @@ fn connect_and_run(command: &ResolvedVmCommand, socket_path: &Path) -> Result<()
     run_connected(client, command.command.clone())
 }
 
+fn prepare_boot_artifact(
+    command: &ResolvedVmCommand,
+    runtime_dir: Option<&Path>,
+) -> Result<BootArtifact> {
+    match command.arch {
+        VmArch::Riscv64 => Ok(BootArtifact::Kernel(command.kernel.clone())),
+        VmArch::X86_64 => Ok(BootArtifact::DiskImage(create_x86_disk_image(
+            &command.kernel,
+            runtime_dir,
+        )?)),
+    }
+}
+
+fn create_x86_disk_image(kernel: &Path, runtime_dir: Option<&Path>) -> Result<PathBuf> {
+    let image_path = match runtime_dir {
+        Some(dir) => dir.join("helios-x86-bios.img"),
+        None => kernel.with_extension("bios.img"),
+    };
+    let spinner = spinner("building x86 BIOS disk image");
+    let mut builder = DiskImageBuilder::new(kernel.to_path_buf());
+    builder.create_bios_image(&image_path).with_context(|| {
+        format!(
+            "failed to create x86 BIOS disk image {}",
+            image_path.display()
+        )
+    })?;
+    spinner.finish_with_message(format!(
+        "{} {}",
+        style("built").green(),
+        image_path.display()
+    ));
+    Ok(image_path)
+}
+
 fn arch_label(arch: VmArch) -> &'static str {
     match arch {
         VmArch::Riscv64 => "riscv64",
@@ -315,13 +356,14 @@ impl VmRuntime {
             }
         };
 
+        let artifact = prepare_boot_artifact(command, tempdir.as_ref().map(TempDir::path))?;
+
         let spinner = spinner(&format!("starting QEMU for {}", arch_label(command.arch)));
         let mut qemu = Command::new(&command.qemu_bin);
         qemu.arg("-display").arg("none").arg("-monitor").arg("none");
         qemu.arg("-machine").arg(command.arch.qemu_machine());
         qemu.arg("-m").arg(&command.memory);
         qemu.arg("-smp").arg(command.smp.to_string());
-        qemu.arg("-kernel").arg(&command.kernel);
         qemu.arg("-serial")
             .arg(format!("unix:{},server=on,wait=on", socket_path.display()));
         qemu.stdout(Stdio::from(fs::File::create(&qemu_log).with_context(
@@ -334,12 +376,13 @@ impl VmRuntime {
                 .open(&qemu_log)
                 .with_context(|| format!("failed to open {} for append", qemu_log.display()))?,
         ));
-        match command.arch {
-            VmArch::Riscv64 => {
+        match (command.arch, &artifact) {
+            (VmArch::Riscv64, BootArtifact::Kernel(kernel)) => {
                 qemu.arg("-global").arg("virtio-mmio.force-legacy=false");
                 if let Some(bios) = &command.bios {
                     qemu.arg("-bios").arg(bios);
                 }
+                qemu.arg("-kernel").arg(kernel);
                 qemu.arg("-netdev").arg("user,id=net0");
                 qemu.arg("-device").arg("virtio-net-device,netdev=net0");
                 if let Some(shared_dir) = &command.shared_dir {
@@ -351,7 +394,9 @@ impl VmRuntime {
                         .arg("virtio-9p-device,fsdev=hostfs,mount_tag=hostshare");
                 }
             }
-            VmArch::X86_64 => {
+            (VmArch::X86_64, BootArtifact::DiskImage(image)) => {
+                qemu.arg("-drive")
+                    .arg(format!("format=raw,file={}", image.display()));
                 qemu.arg("-netdev").arg("user,id=net0");
                 qemu.arg("-device").arg("virtio-net-pci,netdev=net0");
                 if let Some(shared_dir) = &command.shared_dir {
@@ -361,6 +406,7 @@ impl VmRuntime {
                     ));
                 }
             }
+            _ => unreachable!("boot artifact must match VM architecture"),
         }
         let mut child = qemu.spawn().with_context(|| {
             format!(
