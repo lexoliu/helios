@@ -360,7 +360,9 @@ impl VmRuntime {
                         .arg("virtio-9p-device,fsdev=hostfs,mount_tag=hostshare");
                 }
             }
-            VmArch::X86_64 => unreachable!("x86_64 VM path must fail during boot artifact preparation"),
+            VmArch::X86_64 => {
+                unreachable!("x86_64 VM path must fail during boot artifact preparation")
+            }
         }
         let mut child = qemu.spawn().with_context(|| {
             format!(

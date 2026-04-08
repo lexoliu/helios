@@ -33,11 +33,10 @@ use wasmtime_wasi_io::bytes::Bytes;
 use wasmtime_wasi_io::poll::Pollable;
 use wasmtime_wasi_io::streams::{OutputStream, StreamError};
 
-use crate::debug_state::{
-    RuntimeState, StatsSample, TraceEvent, TraceField, TraceFilter, TraceLevel, TraceValue,
-};
+use crate::debug_state::RuntimeState;
 use crate::debugger_bindings::bindings;
 use crate::{RiscvCpu, try_read_debug_serial_byte, write_debug_serial_bytes};
+use helios_kernel::{StatsSample, TraceEvent, TraceField, TraceFilter, TraceLevel, TraceValue};
 
 const WASMTIME_TARGET: &str = "riscv64gc-unknown-none-elf";
 const SERIAL_INSTANCE: &str = "helios:system/serial@0.1.0";

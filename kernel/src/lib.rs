@@ -12,6 +12,7 @@ mod embedded_program;
 mod executor;
 mod instance;
 mod log;
+mod observer;
 mod program;
 mod program_service;
 mod sync;
@@ -31,6 +32,10 @@ pub use executor::{JoinHandle, LocalJoinHandle, Spawner};
 pub use helios_hal::Platform;
 pub use instance::{
     InstanceExecutionTransition, InstanceId, InstanceRegistry, InstanceSnapshot, RegisteredInstance,
+};
+pub use observer::{
+    DEFAULT_TRACE_HISTORY_CAPACITY, StatsSample, TraceEvent, TraceField, TraceFilter, TraceHistory,
+    TraceLevel, TraceValue, matches_trace_filter, parse_console_text,
 };
 pub use program::{
     Blueprint, CompileError as ProgramCompileError, ExitCode, ProgramRuntime, ProgramRuntimeConfig,
