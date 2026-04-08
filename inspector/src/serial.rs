@@ -15,7 +15,8 @@ impl<T> SerialWrite for T where T: AsyncWrite + Unpin + Send {}
 
 pub(crate) type SerialReader = Box<dyn SerialRead>;
 pub(crate) type SerialWriter = Box<dyn SerialWrite>;
-pub(crate) type RpcClient = helios_shell_protocol::transport::Client<SerialReader, SerialWriter>;
+pub(crate) type RpcClient =
+    helios_inspector_protocol::transport::Client<SerialReader, SerialWriter>;
 
 pub(crate) struct SerialIo {
     read: SerialReader,
@@ -44,7 +45,7 @@ fn is_unix_socket(device: &str) -> Result<bool> {
 impl SerialIo {
     pub(crate) fn into_client(self) -> RpcClient {
         let (read, write) = self.into_split();
-        helios_shell_protocol::transport::Client::new(read, write)
+        helios_inspector_protocol::transport::Client::new(read, write)
     }
 
     pub(crate) fn into_split(self) -> (SerialReader, SerialWriter) {

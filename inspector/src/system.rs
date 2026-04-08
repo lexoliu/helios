@@ -4,7 +4,7 @@ use std::io::Write as _;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use helios_shell_protocol::system::{instances, stats, tracing};
+use helios_inspector_protocol::system::{instances, stats, tracing};
 use nu_ansi_term::{Color, Style as AnsiStyle};
 
 use crate::remote;
@@ -259,7 +259,7 @@ impl EmittedEvents {
 
 #[cfg(test)]
 mod tests {
-    use helios_shell_protocol::system::tracing::{Event, Field, Level, Value};
+    use helios_inspector_protocol::system::tracing::{Event, Field, Level, Value};
 
     use super::{render_tracing_event, tracing_event_key, EmittedEvents};
 

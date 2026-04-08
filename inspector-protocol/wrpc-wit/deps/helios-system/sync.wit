@@ -1,0 +1,25 @@
+package helios:system@0.1.0;
+
+interface sync {
+  /// Kernel-managed mutex capability.
+  resource raw-mutex {
+    constructor();
+    lock: func() -> future<raw-mutex-guard>;
+  }
+
+  /// Held while the corresponding mutex is locked.
+  resource raw-mutex-guard {}
+
+  /// Kernel-managed reader/writer lock capability.
+  resource raw-rw-lock {
+    constructor();
+    read: func() -> future<raw-rw-lock-read-guard>;
+    write: func() -> future<raw-rw-lock-write-guard>;
+  }
+
+  /// Held while the corresponding rwlock is read-locked.
+  resource raw-rw-lock-read-guard {}
+
+  /// Held while the corresponding rwlock is write-locked.
+  resource raw-rw-lock-write-guard {}
+}

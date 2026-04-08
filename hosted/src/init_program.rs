@@ -571,7 +571,7 @@ mod tests {
                 });
 
                 let (peer_read, peer_write) = tokio::io::split(peer);
-                let mut client = helios_shell_protocol::transport::Client::new(
+                let mut client = helios_inspector_protocol::transport::Client::new(
                     peer_read.compat(),
                     peer_write.compat_write(),
                 );
@@ -596,7 +596,7 @@ mod tests {
 
                 let stats = timeout(
                     Duration::from_secs(30),
-                    helios_shell_protocol::system::stats::snapshot(&mut client),
+                    helios_inspector_protocol::system::stats::snapshot(&mut client),
                 )
                 .await
                     .unwrap_or_else(|_| {
@@ -638,7 +638,7 @@ mod tests {
 
                 let second_stats = timeout(
                     Duration::from_secs(30),
-                    helios_shell_protocol::system::stats::snapshot(&mut client),
+                    helios_inspector_protocol::system::stats::snapshot(&mut client),
                 )
                 .await
                 .unwrap_or_else(|_| {
@@ -660,7 +660,7 @@ mod tests {
 
                 let instances = timeout(
                     Duration::from_secs(30),
-                    helios_shell_protocol::system::instances::snapshot(&mut client),
+                    helios_inspector_protocol::system::instances::snapshot(&mut client),
                 )
                 .await
                 .unwrap_or_else(|_| panic!("timed out waiting for remote instances snapshot"))
@@ -670,13 +670,13 @@ mod tests {
                     "remote instances snapshot did not include the debugger: {instances:?}"
                 );
 
-                let filter = helios_shell_protocol::system::tracing::Filter {
-                    min_level: Some(helios_shell_protocol::system::tracing::Level::Info),
+                let filter = helios_inspector_protocol::system::tracing::Filter {
+                    min_level: Some(helios_inspector_protocol::system::tracing::Level::Info),
                     target_prefixes: vec!["helios_kernel".to_owned()],
                 };
                 let events = timeout(
                     Duration::from_secs(30),
-                    helios_shell_protocol::system::tracing::recent(&mut client, &filter, 8),
+                    helios_inspector_protocol::system::tracing::recent(&mut client, &filter, 8),
                 )
                 .await
                 .unwrap_or_else(|_| panic!("timed out waiting for remote tracing events"))
@@ -688,7 +688,7 @@ mod tests {
                                 field.key == "message"
                                     && matches!(
                                         &field.value,
-                                        helios_shell_protocol::system::tracing::Value::Text(text)
+                                        helios_inspector_protocol::system::tracing::Value::Text(text)
                                             if text == "Kernel initialized"
                                     )
                             })
@@ -754,7 +754,7 @@ mod tests {
                 });
 
                 let (peer_read, peer_write) = tokio::io::split(peer);
-                let mut client = helios_shell_protocol::transport::Client::new(
+                let mut client = helios_inspector_protocol::transport::Client::new(
                     peer_read.compat(),
                     peer_write.compat_write(),
                 );
@@ -779,9 +779,9 @@ mod tests {
 
                 let instance_id = timeout(
                     Duration::from_secs(30),
-                    helios_shell_protocol::system::programs::exec(
+                    helios_inspector_protocol::system::programs::exec(
                         &mut client,
-                        &helios_shell_protocol::system::programs::ExecRequest {
+                        &helios_inspector_protocol::system::programs::ExecRequest {
                             name: "spin.wasm".to_owned(),
                             wasm: spin_start_module(),
                         },
@@ -793,7 +793,7 @@ mod tests {
 
                 let instances = timeout(
                     Duration::from_secs(30),
-                    helios_shell_protocol::system::instances::snapshot(&mut client),
+                    helios_inspector_protocol::system::instances::snapshot(&mut client),
                 )
                 .await
                 .unwrap_or_else(|_| panic!("timed out waiting for remote instances after exec"))

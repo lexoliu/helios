@@ -21,6 +21,6 @@ wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, 
 wasmtime-wasi = { path = "../../wasmtime/crates/wasi", default-features = false, features = ["p2", "p3"] }
 
 [dev-dependencies]
-helios-shell-protocol.workspace = true
+helios-inspector-protocol.workspace = true
 tokio-util = { version = "0.7.16", features = ["compat"] }
 wasm-encoder = "0.245.0"

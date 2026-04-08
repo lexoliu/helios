@@ -1,5 +1,5 @@
 [package]
-name = "helios-shell-protocol"
+name = "helios-inspector-protocol"
 version = "0.1.0"
 edition = "2024"
 
@@ -17,7 +17,6 @@ futures-lite = "2.6.1"
 helios-api = { path = "../api", optional = true, default-features = false, features = ["fs", "instances", "programs", "serial", "stats", "tracing"] }
 postcard = { version = "1.1.3", features = ["alloc"] }
 serde = { version = "1.0.228", features = ["derive"] }
-shell-core = { path = "../shell-core" }
 tokio = { version = "1.48.0", features = ["io-util", "sync"], optional = true }
 tokio-util = { version = "0.7.16", features = ["compat"], optional = true }
 wrpc-transport = { version = "0.28.4", default-features = false, optional = true }

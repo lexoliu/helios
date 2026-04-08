@@ -13,5 +13,5 @@ pub async fn serve_debugger() -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("debug serial capability is missing"))?,
     );
     let (read, write) = transport_io::split(read_port, write_port);
-    helios_shell_protocol::system::serve(read, write).await
+    helios_inspector_protocol::system::serve(read, write).await
 }

@@ -17,8 +17,6 @@ use helios_api::bindings::wasi::filesystem::types::{
 };
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "guest")]
-use shell_core::paths::normalize_segments;
-#[cfg(feature = "guest")]
 use std::path::Path;
 
 const FILESYSTEM_INSTANCE: &str = "helios:debugger/filesystem@0.1.0";
@@ -499,6 +497,29 @@ async fn move_guest_path(source: &str, destination: &str) -> Result<()> {
 #[cfg(feature = "guest")]
 fn normalized_components(path: &str) -> Result<Vec<String>> {
     normalize_segments(path)
+}
+
+#[cfg(feature = "guest")]
+fn normalize_segments(input: &str) -> Result<Vec<String>> {
+    let mut segments = Vec::new();
+    for component in Path::new(input).components() {
+        match component {
+            std::path::Component::RootDir | std::path::Component::CurDir => {}
+            std::path::Component::Normal(segment) => segments.push(
+                segment
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("path {input:?} contains a non-utf8 segment"))?
+                    .to_owned(),
+            ),
+            std::path::Component::ParentDir => {
+                bail!("path {input:?} contains unsupported parent traversal")
+            }
+            std::path::Component::Prefix(_) => {
+                bail!("path {input:?} uses an unsupported path prefix")
+            }
+        }
+    }
+    Ok(segments)
 }
 
 #[cfg(feature = "guest")]

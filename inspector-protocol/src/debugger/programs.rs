@@ -8,8 +8,6 @@ use futures_io::{AsyncRead, AsyncWrite};
 use helios_api::fs;
 #[cfg(feature = "guest")]
 use helios_api::programs as host_programs;
-#[cfg(feature = "guest")]
-use shell_core::programs::infer_program_name;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "guest")]
 use std::path::Path;
@@ -100,4 +98,16 @@ fn convert_exec_error_kind(kind: host_programs::ExecErrorKind) -> ExecErrorKind 
         host_programs::ExecErrorKind::Unavailable => ExecErrorKind::Unavailable,
         host_programs::ExecErrorKind::Internal => ExecErrorKind::Internal,
     }
+}
+
+#[cfg(feature = "guest")]
+fn infer_program_name(path: &Path) -> Result<String> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("program path does not end with a valid utf-8 file name")?;
+    if name.is_empty() {
+        anyhow::bail!("program path does not name an executable")
+    }
+    Ok(name.strip_suffix(".wasm").unwrap_or(name).to_owned())
 }
