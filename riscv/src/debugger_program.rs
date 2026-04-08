@@ -40,6 +40,13 @@ use crate::debugger_bindings::bindings;
 use crate::{RiscvCpu, try_read_debug_serial_byte, write_debug_serial_bytes};
 
 const WASMTIME_TARGET: &str = "riscv64gc-unknown-none-elf";
+const SERIAL_INSTANCE: &str = "helios:system/serial@0.1.0";
+const SYNC_INSTANCE: &str = "helios:system/sync@0.1.0";
+const STATS_INSTANCE: &str = "helios:system/stats@0.1.0";
+const PROGRAMS_INSTANCE: &str = "helios:system/programs@0.1.0";
+const NET_INSTANCE: &str = "helios:system/net@0.1.0";
+const TRACING_INSTANCE: &str = "helios:system/tracing@0.1.0";
+const INSTANCES_INSTANCE: &str = "helios:system/instances@0.1.0";
 
 struct RiscvCodeMemory;
 
@@ -295,7 +302,7 @@ pub(crate) fn add_program_world_to_linker(linker: &mut Linker<StoreData>) -> was
 }
 
 pub(crate) fn add_serial_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
-    let mut instance = linker.instance("helios:system/serial@0.1.0")?;
+    let mut instance = linker.instance(SERIAL_INSTANCE)?;
     instance.resource_concurrent(
         "serial-port",
         ResourceType::host::<SbiSerialPort>(),
@@ -366,7 +373,7 @@ pub(crate) fn add_serial_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::
 }
 
 pub(crate) fn add_sync_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
-    let mut instance = linker.instance("helios:system/sync@0.1.0")?;
+    let mut instance = linker.instance(SYNC_INSTANCE)?;
     instance.resource_concurrent(
         "raw-mutex",
         ResourceType::host::<SbiRawMutex>(),
@@ -508,7 +515,7 @@ pub(crate) fn add_sync_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Re
 }
 
 fn add_stats_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
-    let mut instance = linker.instance("helios:system/stats@0.1.0")?;
+    let mut instance = linker.instance(STATS_INSTANCE)?;
     instance.func_wrap("snapshot", |caller, (): ()| {
         Ok((snapshot_sample(caller.data()),))
     })?;
@@ -520,7 +527,7 @@ fn add_stats_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
 }
 
 fn add_programs_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
-    let mut instance = linker.instance("helios:system/programs@0.1.0")?;
+    let mut instance = linker.instance(PROGRAMS_INSTANCE)?;
     // `programs.exec` is intentionally a synchronous WIT call. The guest
     // blocks on exec completion while the host internally awaits the
     // compile/queue path on Wasmtime's async fiber.
@@ -568,7 +575,7 @@ fn add_programs_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()
 }
 
 fn add_programs_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
-    let mut instance = linker.instance("helios:system/programs@0.1.0")?;
+    let mut instance = linker.instance(PROGRAMS_INSTANCE)?;
     instance.func_wrap_async(
         "exec",
         |caller: StoreContextMut<'_, StoreData>,
@@ -613,7 +620,7 @@ fn add_programs_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::R
 }
 
 fn add_net_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
-    let mut instance = linker.instance("helios:system/net@0.1.0")?;
+    let mut instance = linker.instance(NET_INSTANCE)?;
     instance.resource_concurrent(
         "tcp-stream",
         ResourceType::host::<SbiTcpStream>(),
@@ -734,7 +741,7 @@ fn add_net_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
 }
 
 fn add_net_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
-    let mut instance = linker.instance("helios:system/net@0.1.0")?;
+    let mut instance = linker.instance(NET_INSTANCE)?;
     instance.resource_concurrent(
         "tcp-stream",
         ResourceType::host::<SbiTcpStream>(),
@@ -858,7 +865,7 @@ fn add_net_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result
 }
 
 fn add_tracing_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
-    let mut instance = linker.instance("helios:system/tracing@0.1.0")?;
+    let mut instance = linker.instance(TRACING_INSTANCE)?;
     instance.func_wrap(
         "recent",
         |caller, (filter, limit): (bindings::helios::system::tracing::Filter, u32)| {
@@ -887,7 +894,7 @@ fn add_tracing_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()>
 }
 
 fn add_stats_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
-    let mut instance = linker.instance("helios:system/stats@0.1.0")?;
+    let mut instance = linker.instance(STATS_INSTANCE)?;
     instance.func_wrap("snapshot", |caller, (): ()| {
         Ok((snapshot_program_sample(caller.data()),))
     })?;
@@ -899,7 +906,7 @@ fn add_stats_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::Resu
 }
 
 fn add_tracing_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
-    let mut instance = linker.instance("helios:system/tracing@0.1.0")?;
+    let mut instance = linker.instance(TRACING_INSTANCE)?;
     instance.func_wrap(
         "recent",
         |caller,
@@ -1112,7 +1119,7 @@ fn convert_program_tcp_error(
 }
 
 fn add_instances_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
-    let mut instance = linker.instance("helios:system/instances@0.1.0")?;
+    let mut instance = linker.instance(INSTANCES_INSTANCE)?;
     instance.func_wrap("snapshot", |caller, (): ()| {
         Ok((caller
             .data()
