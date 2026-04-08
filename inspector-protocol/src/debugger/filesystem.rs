@@ -1,3 +1,4 @@
+use crate::debugger::methods::FILESYSTEM_INSTANCE;
 #[cfg(feature = "host")]
 use crate::transport::Client;
 use anyhow::Context as _;
@@ -19,8 +20,6 @@ use helios_api::bindings::wasi::filesystem::types::{
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "guest")]
 use std::path::Path;
-
-const FILESYSTEM_INSTANCE: &str = "helios:debugger/filesystem@0.1.0";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectoryEntry {
