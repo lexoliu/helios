@@ -4,7 +4,7 @@ use std::fs;
 use std::io::Write as _;
 use std::rc::Rc;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{bail, Context as _, Result};
 use clap::{ColorChoice, Parser};
 use helios_inspector_protocol::system::programs::{ExecOutput, ExecResult};
 use nu_ansi_term::{Color, Style as AnsiStyle};
@@ -13,20 +13,24 @@ use rustyline::error::ReadlineError;
 use rustyline::highlight::{Highlighter, MatchingBracketHighlighter};
 use rustyline::hint::{Hinter, HistoryHinter};
 use rustyline::history::DefaultHistory;
-use rustyline::validate::{MatchingBracketValidator, ValidationContext, ValidationResult, Validator};
+use rustyline::validate::{
+    MatchingBracketValidator, ValidationContext, ValidationResult, Validator,
+};
 use rustyline::Cmd;
-use rustyline::{CompletionType, Config, Context as RustyContext, EditMode, Editor, Event as RustyEvent, Helper, KeyCode as RustyKeyCode, KeyEvent as RustyKeyEvent, Modifiers as RustyModifiers};
+use rustyline::{
+    CompletionType, Config, Context as RustyContext, EditMode, Editor, Event as RustyEvent, Helper,
+    KeyCode as RustyKeyCode, KeyEvent as RustyKeyEvent, Modifiers as RustyModifiers,
+};
 
-use crate::{DashCommand, TracingCommand};
-use crate::programs;
+use crate::programs::{self, REMOTE_DASH_PATH};
 use crate::runtime;
 use crate::serial::RpcClient;
 use crate::stats_tui;
 use crate::system;
+use crate::{DashCommand, TracingCommand};
 
 const PROMPT: &str = "helios> ";
 const CONTINUATION_PROMPT: &str = "....> ";
-const REMOTE_DASH_PATH: &str = "/bin/dash";
 const ROOT_CANDIDATES: &[&str] = &["stats", "tracing", "clear", "exit", "quit"];
 const TRACING_CANDIDATES: &[&str] = &["--min-level", "--target-prefix", "--limit"];
 const LEVEL_CANDIDATES: &[&str] = &["none", "error", "warn", "info", "debug", "trace"];
@@ -341,10 +345,7 @@ fn build_editor() -> Result<Editor<ShellHelper, DefaultHistory>> {
     let mut editor = Editor::with_config(config).context("failed to create line editor")?;
     editor.set_helper(Some(ShellHelper::new()));
     editor.bind_sequence(
-        RustyEvent::from(RustyKeyEvent(
-            RustyKeyCode::Char('F'),
-            RustyModifiers::CTRL,
-        )),
+        RustyEvent::from(RustyKeyEvent(RustyKeyCode::Char('F'), RustyModifiers::CTRL)),
         Cmd::CompleteHint,
     );
     Ok(editor)
@@ -408,7 +409,6 @@ fn needs_more_input(input: &str) -> bool {
     }
     depth != 0
 }
-
 
 #[cfg(test)]
 mod tests {

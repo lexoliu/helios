@@ -93,7 +93,10 @@ fn build_boot_program_assets(out_dir: &Path) -> Vec<EmbeddedBootAsset> {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or_else(|| {
-                    panic!("program directory {} has no valid UTF-8 name", path.display())
+                    panic!(
+                        "program directory {} has no valid UTF-8 name",
+                        path.display()
+                    )
                 });
             if matches!(command, "init" | "debugger") {
                 return None;

@@ -14,8 +14,8 @@ use helios_kernel::{
 };
 use lru::LruCache;
 use spin::Mutex;
-use wasmtime::component::{Component, Linker, ResourceTable};
-use wasmtime::{Engine, Store};
+use wasmtime::Engine;
+use wasmtime::component::{Component, ResourceTable};
 
 use crate::debugger_program::{self, OutputMode, StoreData};
 use crate::{RiscvCpu, debug_state::RuntimeState, program_bindings};
@@ -35,7 +35,6 @@ pub(crate) struct ExecResult {
     pub(crate) exit_code: u32,
     pub(crate) output: ExecOutput,
 }
-
 
 #[derive(Clone)]
 pub(crate) struct UserProgramService {
@@ -87,9 +86,8 @@ pub(crate) fn install_program_service(
 
     let available_bytes = heap_stats().available_bytes();
     let reserved_stack_bytes = worker_count * WORKER_STACK_SIZE;
-    let cache_budget = available_bytes
-        .saturating_sub(reserved_stack_bytes)
-        / COMPONENT_CACHE_FRACTION;
+    let cache_budget =
+        available_bytes.saturating_sub(reserved_stack_bytes) / COMPONENT_CACHE_FRACTION;
     let compiler_budget = available_bytes
         .saturating_sub(cache_budget)
         .max(reserved_stack_bytes);
@@ -321,11 +319,7 @@ impl ComponentCache {
         self.entries.get(wasm).cloned()
     }
 
-    fn insert_if_missing(
-        &mut self,
-        wasm: Arc<[u8]>,
-        component: Arc<Component>,
-    ) -> Arc<Component> {
+    fn insert_if_missing(&mut self, wasm: Arc<[u8]>, component: Arc<Component>) -> Arc<Component> {
         if let Some(existing) = self.entries.get(wasm.as_ref()).cloned() {
             return existing;
         }
@@ -385,15 +379,12 @@ fn run_component(
     argv.extend(args);
     let timebase_frequency = cpu.timer_frequency();
     let store_started_at = monotonic_nanos(timebase_frequency);
-    let mut linker = Linker::<StoreData>::new(component.engine());
-    wasmtime_wasi_io::add_to_linker_async(&mut linker)?;
-    crate::debugger_wasi_p2::add_to_linker(&mut linker)?;
-    crate::debugger_wasi::add_to_linker(&mut linker)?;
-    debugger_program::add_serial_to_linker(&mut linker)?;
-    debugger_program::add_sync_to_linker(&mut linker)?;
-    debugger_program::add_program_world_to_linker(&mut linker)?;
+    let linker = debugger_program::component_linker(
+        component.engine(),
+        debugger_program::SystemWorld::Program,
+    )?;
 
-    let mut store = Store::new(
+    let mut store = debugger_program::store_with_state(
         component.engine(),
         StoreData {
             table: ResourceTable::new(),
@@ -410,11 +401,6 @@ fn run_component(
             captured_stderr: Arc::new(Mutex::new(Vec::new())),
         },
     );
-    store.limiter(|state| state);
-    store.call_hook(|mut caller, hook| {
-        caller.data_mut().record_call_hook(hook);
-        Ok(())
-    });
     tracing::info!(
         target: "helios_riscv::program_host",
         phase = "prepare-store",
@@ -461,7 +447,5 @@ fn monotonic_nanos(timebase_frequency: u64) -> u64 {
 }
 
 fn elapsed_millis(started_at: u64, timebase_frequency: u64) -> u64 {
-    monotonic_nanos(timebase_frequency)
-        .saturating_sub(started_at)
-        / 1_000_000
+    monotonic_nanos(timebase_frequency).saturating_sub(started_at) / 1_000_000
 }

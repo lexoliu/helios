@@ -242,7 +242,6 @@ mod tests {
         fn regs(&self) -> &[u32; 128] {
             unsafe { &*self.regs.get() }
         }
-
     }
 
     impl DeviceBus for FakeBus {
@@ -262,7 +261,9 @@ mod tests {
         }
 
         fn write_u32(&self, offset: usize, value: u32) {
-            unsafe { (*self.regs.get())[offset / 4] = value; }
+            unsafe {
+                (*self.regs.get())[offset / 4] = value;
+            }
         }
 
         fn dma(&self) -> &Self::DmaPool {

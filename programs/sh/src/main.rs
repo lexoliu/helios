@@ -34,11 +34,11 @@ impl Invocation {
     fn from_env() -> Result<Self> {
         let mut args = env::args().skip(1);
         match args.next().as_deref() {
-            None => bail!("interactive dash is not implemented yet; use `dash -c <command>` or `dash <script>`"),
+            None => bail!(
+                "interactive dash is not implemented yet; use `dash -c <command>` or `dash <script>`"
+            ),
             Some("-c") => {
-                let command = args
-                    .next()
-                    .context("`dash -c` requires a command string")?;
+                let command = args.next().context("`dash -c` requires a command string")?;
                 if args.next().is_some() {
                     bail!("`dash -c` does not accept extra positional arguments yet")
                 }
@@ -62,11 +62,9 @@ impl Invocation {
     async fn load_program(&self) -> Result<Vec<Statement>> {
         let source = match (&self.inline_command, &self.script_path) {
             (Some(command), None) => command.clone(),
-            (None, Some(path)) => {
-                helios_fs::read_to_string(path)
-                    .await
-                    .with_context(|| format!("failed to read shell script {}", path.display()))?
-            }
+            (None, Some(path)) => helios_fs::read_to_string(path)
+                .await
+                .with_context(|| format!("failed to read shell script {}", path.display()))?,
             _ => unreachable!("invocation construction must choose exactly one shell source"),
         };
         match script::parse(&source)? {
@@ -81,7 +79,8 @@ struct GuestShell;
 #[async_trait(?Send)]
 impl ScriptHost for GuestShell {
     async fn execute_line(&mut self, line: &str) -> Result<CommandStatus> {
-        let tokens = shell_words::split(line).with_context(|| format!("failed to parse shell line {line:?}"))?;
+        let tokens = shell_words::split(line)
+            .with_context(|| format!("failed to parse shell line {line:?}"))?;
         let Some(command) = tokens.first().map(String::as_str) else {
             return Ok(CommandStatus::SUCCESS);
         };
@@ -112,7 +111,9 @@ impl ScriptHost for GuestShell {
             }
             "exit" => {
                 let code = match tokens.get(1) {
-                    Some(value) => value.parse::<u8>().with_context(|| format!("invalid exit code {value:?}"))?,
+                    Some(value) => value
+                        .parse::<u8>()
+                        .with_context(|| format!("invalid exit code {value:?}"))?,
                     None => 0,
                 };
                 Ok(CommandStatus::exiting(code))
@@ -133,9 +134,15 @@ fn run_echo(words: &[String]) -> Result<()> {
 
 async fn run_test(args: &[String]) -> Result<CommandStatus> {
     match args {
-        [flag, path] if flag == "-e" => Ok(CommandStatus::new((!helios_fs::exists(path).await) as u8)),
-        [flag, path] if flag == "-f" => Ok(CommandStatus::new((!helios_fs::is_file(path).await) as u8)),
-        [flag, path] if flag == "-d" => Ok(CommandStatus::new((!helios_fs::is_dir(path).await) as u8)),
+        [flag, path] if flag == "-e" => {
+            Ok(CommandStatus::new((!helios_fs::exists(path).await) as u8))
+        }
+        [flag, path] if flag == "-f" => {
+            Ok(CommandStatus::new((!helios_fs::is_file(path).await) as u8))
+        }
+        [flag, path] if flag == "-d" => {
+            Ok(CommandStatus::new((!helios_fs::is_dir(path).await) as u8))
+        }
         _ => bail!("unsupported test expression: expected `test -e|-f|-d <path>`"),
     }
 }
@@ -158,7 +165,11 @@ async fn exec_program(program: &str, args: &[String]) -> Result<CommandStatus> {
         Err(error) if error.kind == ExecErrorKind::Unavailable => {
             bail!("program exec is unavailable: {}", error.detail)
         }
-        Err(error) => bail!("failed to exec {program:?}: {:?}: {}", error.kind, error.detail),
+        Err(error) => bail!(
+            "failed to exec {program:?}: {:?}: {}",
+            error.kind,
+            error.detail
+        ),
     }
 }
 

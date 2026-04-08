@@ -275,7 +275,10 @@ impl ExternalInterrupts {
     }
 
     pub(crate) fn attach_host_fs(&mut self, interrupt: crate::host_fs::HostFsInterrupt) {
-        assert!(self.host_fs.is_none(), "host-fs interrupt was installed more than once");
+        assert!(
+            self.host_fs.is_none(),
+            "host-fs interrupt was installed more than once"
+        );
         self.host_fs = Some(interrupt);
     }
 }
@@ -806,7 +809,11 @@ impl ExternalInterrupts {
                 continue;
             }
 
-            if self.host_fs.as_ref().is_some_and(|host_fs| source == host_fs.source) {
+            if self
+                .host_fs
+                .as_ref()
+                .is_some_and(|host_fs| source == host_fs.source)
+            {
                 self.host_fs
                     .as_ref()
                     .expect("host-fs interrupt disappeared unexpectedly")
@@ -833,16 +840,13 @@ impl PingError {
             | IoError::NotDirectory
             | IoError::IsDirectory
             | IoError::DirectoryNotEmpty
-            |
-            IoError::Unsupported | IoError::PermissionDenied | IoError::ReadOnly => {
-                PingErrorKind::Unavailable
-            }
+            | IoError::Unsupported
+            | IoError::PermissionDenied
+            | IoError::ReadOnly => PingErrorKind::Unavailable,
             IoError::InvalidBufferLength { .. }
             | IoError::OutOfBounds
             | IoError::InvalidDeviceConfig(_)
-            | IoError::DeviceFault => {
-                PingErrorKind::Internal
-            }
+            | IoError::DeviceFault => PingErrorKind::Internal,
         };
         Self {
             kind,
@@ -859,16 +863,13 @@ impl TcpError {
             | IoError::NotDirectory
             | IoError::IsDirectory
             | IoError::DirectoryNotEmpty
-            |
-            IoError::Unsupported | IoError::PermissionDenied | IoError::ReadOnly => {
-                TcpErrorKind::Unavailable
-            }
+            | IoError::Unsupported
+            | IoError::PermissionDenied
+            | IoError::ReadOnly => TcpErrorKind::Unavailable,
             IoError::InvalidBufferLength { .. }
             | IoError::OutOfBounds
             | IoError::InvalidDeviceConfig(_)
-            | IoError::DeviceFault => {
-                TcpErrorKind::Internal
-            }
+            | IoError::DeviceFault => TcpErrorKind::Internal,
         };
         Self {
             kind,

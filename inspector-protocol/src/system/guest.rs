@@ -120,9 +120,9 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>>
                     },
                 })
                 .map_err(|error| programs::ExecError {
-                kind: convert_launch_error_kind(error.kind),
-                detail: error.detail,
-            });
+                    kind: convert_launch_error_kind(error.kind),
+                    detail: error.detail,
+                });
             postcard::to_allocvec(&response).context("failed to encode programs.exec response")
         }
         ("helios:system/stats@0.1.0", "snapshot") => {

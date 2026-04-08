@@ -106,16 +106,9 @@ pub trait FileSystem: Send + Sync {
         path: &str,
     ) -> impl Future<Output = IoResult<Self::Directory>> + Send;
 
-    fn remove(
-        &self,
-        path: &str,
-    ) -> impl Future<Output = IoResult<()>> + Send;
+    fn remove(&self, path: &str) -> impl Future<Output = IoResult<()>> + Send;
 
-    fn rename(
-        &self,
-        source: &str,
-        destination: &str,
-    ) -> impl Future<Output = IoResult<()>> + Send;
+    fn rename(&self, source: &str, destination: &str) -> impl Future<Output = IoResult<()>> + Send;
 }
 
 pub trait File: Send {
@@ -132,28 +125,15 @@ pub trait Directory: Send {
     where
         Self: Sized;
 
-    fn create_directory(
-        &self,
-        path: &str,
-    ) -> impl Future<Output = IoResult<Self>> + Send
+    fn create_directory(&self, path: &str) -> impl Future<Output = IoResult<Self>> + Send
     where
         Self: Sized;
 
-    fn open_file(
-        &self,
-        path: &str,
-    ) -> impl Future<Output = IoResult<Option<Self::File>>> + Send;
+    fn open_file(&self, path: &str) -> impl Future<Output = IoResult<Option<Self::File>>> + Send;
 
-    fn remove(
-        &self,
-        path: &str,
-    ) -> impl Future<Output = IoResult<()>> + Send;
+    fn remove(&self, path: &str) -> impl Future<Output = IoResult<()>> + Send;
 
-    fn rename(
-        &self,
-        source: &str,
-        destination: &str,
-    ) -> impl Future<Output = IoResult<()>> + Send;
+    fn rename(&self, source: &str, destination: &str) -> impl Future<Output = IoResult<()>> + Send;
 }
 
 pub trait BlockDevice: Send + Sync {

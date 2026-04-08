@@ -199,16 +199,11 @@ where
         .invoke_raw(FILESYSTEM_INSTANCE, "copy", request)
         .await
         .context("failed to invoke debugger filesystem.copy")?;
-    postcard::from_bytes::<()>(&bytes)
-        .context("failed to decode debugger filesystem.copy response")
+    postcard::from_bytes::<()>(&bytes).context("failed to decode debugger filesystem.copy response")
 }
 
 #[cfg(feature = "host")]
-pub async fn move_path<R, W>(
-    client: &Client<R, W>,
-    source: &str,
-    destination: &str,
-) -> Result<()>
+pub async fn move_path<R, W>(client: &Client<R, W>, source: &str, destination: &str) -> Result<()>
 where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
@@ -219,8 +214,7 @@ where
         .invoke_raw(FILESYSTEM_INSTANCE, "move", request)
         .await
         .context("failed to invoke debugger filesystem.move")?;
-    postcard::from_bytes::<()>(&bytes)
-        .context("failed to decode debugger filesystem.move response")
+    postcard::from_bytes::<()>(&bytes).context("failed to decode debugger filesystem.move response")
 }
 
 #[cfg(feature = "guest")]
@@ -279,14 +273,12 @@ pub(crate) async fn dispatch(func: &str, payload: &[u8]) -> Result<Vec<u8>> {
         "copy" => {
             let request = decode_path_pair_request(payload, "filesystem.copy")?;
             copy_path(&request.source, &request.destination).await?;
-            postcard::to_allocvec(&())
-                .context("failed to encode debugger filesystem.copy response")
+            postcard::to_allocvec(&()).context("failed to encode debugger filesystem.copy response")
         }
         "move" => {
             let request = decode_path_pair_request(payload, "filesystem.move")?;
             move_guest_path(&request.source, &request.destination).await?;
-            postcard::to_allocvec(&())
-                .context("failed to encode debugger filesystem.move response")
+            postcard::to_allocvec(&()).context("failed to encode debugger filesystem.move response")
         }
         _ => unreachable!("filesystem::supports must filter unsupported debugger methods"),
     }
