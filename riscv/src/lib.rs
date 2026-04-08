@@ -14,6 +14,7 @@ mod host_fs;
 mod net;
 mod program_bindings;
 mod program_host;
+mod virtio_mmio;
 
 use core::arch::{asm, global_asm};
 use core::cell::Cell;

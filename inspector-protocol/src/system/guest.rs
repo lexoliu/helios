@@ -10,6 +10,10 @@ use helios_api::{
 use crate::wire::{Frame, read_frame, write_frame};
 
 use super::bindings::helios::system::{instances, programs, stats, tracing};
+use super::methods::{
+    INSTANCES_INSTANCE, INSTANCES_SNAPSHOT, PROGRAMS_EXEC, PROGRAMS_INSTANCE, STATS_INSTANCE,
+    STATS_SNAPSHOT, TRACING_INSTANCE, TRACING_RECENT,
+};
 use crate::debugger::{filesystem, programs as debugger_programs};
 
 const RESPONSE_CHUNK_BYTES: usize = 64 * 1024;
@@ -92,17 +96,17 @@ where
 fn supports_request(instance: &str, func: &str) -> bool {
     matches!(
         (instance, func),
-        ("helios:system/programs@0.1.0", "exec")
-            | ("helios:system/stats@0.1.0", "snapshot")
-            | ("helios:system/instances@0.1.0", "snapshot")
-            | ("helios:system/tracing@0.1.0", "recent")
+        (PROGRAMS_INSTANCE, PROGRAMS_EXEC)
+            | (STATS_INSTANCE, STATS_SNAPSHOT)
+            | (INSTANCES_INSTANCE, INSTANCES_SNAPSHOT)
+            | (TRACING_INSTANCE, TRACING_RECENT)
     ) || filesystem::supports(instance, func)
         || debugger_programs::supports(instance, func)
 }
 
 async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>> {
     match (instance, func) {
-        ("helios:system/programs@0.1.0", "exec") => {
+        (PROGRAMS_INSTANCE, PROGRAMS_EXEC) => {
             let request = postcard::from_bytes::<programs::ExecRequest>(payload)
                 .context("failed to decode programs.exec request payload")?;
             let response = host_programs::exec(&host_programs::ExecRequest {
@@ -125,14 +129,14 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>>
                 });
             postcard::to_allocvec(&response).context("failed to encode programs.exec response")
         }
-        ("helios:system/stats@0.1.0", "snapshot") => {
+        (STATS_INSTANCE, STATS_SNAPSHOT) => {
             if !payload.is_empty() {
                 bail!("stats.snapshot does not accept request payload bytes");
             }
             let snapshot = convert_sample(host_stats::snapshot());
             postcard::to_allocvec(&snapshot).context("failed to encode stats snapshot response")
         }
-        ("helios:system/instances@0.1.0", "snapshot") => {
+        (INSTANCES_INSTANCE, INSTANCES_SNAPSHOT) => {
             if !payload.is_empty() {
                 bail!("instances.snapshot does not accept request payload bytes");
             }
@@ -142,7 +146,7 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>>
                 .collect::<Vec<_>>();
             postcard::to_allocvec(&snapshot).context("failed to encode instances snapshot response")
         }
-        ("helios:system/tracing@0.1.0", "recent") => {
+        (TRACING_INSTANCE, TRACING_RECENT) => {
             let (filter, limit): (tracing::Filter, u32) = postcard::from_bytes(payload)
                 .context("failed to decode tracing.recent request payload")?;
             let events = host_tracing::recent(&convert_filter(filter), limit)

@@ -5,6 +5,8 @@ use anyhow::{Context as _, Result};
 #[cfg(feature = "host")]
 use futures_io::{AsyncRead, AsyncWrite};
 
+use super::methods::{STATS_INSTANCE, STATS_SNAPSHOT};
+
 pub use super::bindings::helios::system::stats::{
     Memory, MemoryPressure, MonoNanos, Permille, Processor, Processors, Sample,
 };
@@ -16,7 +18,7 @@ where
     W: AsyncWrite + Send + Unpin + 'static,
 {
     let bytes = client
-        .invoke_raw("helios:system/stats@0.1.0", "snapshot", Vec::new())
+        .invoke_raw(STATS_INSTANCE, STATS_SNAPSHOT, Vec::new())
         .await
         .context("failed to invoke remote stats.snapshot")?;
     postcard::from_bytes(&bytes).context("failed to decode remote stats snapshot")

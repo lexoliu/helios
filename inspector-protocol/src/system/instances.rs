@@ -5,6 +5,8 @@ use anyhow::{Context as _, Result};
 #[cfg(feature = "host")]
 use futures_io::{AsyncRead, AsyncWrite};
 
+use super::methods::{INSTANCES_INSTANCE, INSTANCES_SNAPSHOT};
+
 pub use super::bindings::helios::system::instances::{Instance, InstanceId, MonoNanos, Permille};
 
 #[cfg(feature = "host")]
@@ -14,7 +16,7 @@ where
     W: AsyncWrite + Send + Unpin + 'static,
 {
     let bytes = client
-        .invoke_raw("helios:system/instances@0.1.0", "snapshot", Vec::new())
+        .invoke_raw(INSTANCES_INSTANCE, INSTANCES_SNAPSHOT, Vec::new())
         .await
         .context("failed to invoke remote instances.snapshot")?;
     postcard::from_bytes(&bytes).context("failed to decode remote instances snapshot")
