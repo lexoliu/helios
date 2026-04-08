@@ -17,7 +17,7 @@ use std::path::Path;
 
 pub use crate::system::programs::{ExecError, ExecErrorKind, ExecResult};
 
-const PROGRAMS_INSTANCE: &str = "helios:debugger/programs@0.1.0";
+use crate::debugger::methods::{EXEC_PATH, PROGRAMS_INSTANCE};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ExecPathRequest {
@@ -48,7 +48,7 @@ where
     let request = postcard::to_allocvec(&ExecPathRequest::new(path, args))
         .context("failed to encode debugger programs.exec-path request")?;
     let bytes = client
-        .invoke_raw(PROGRAMS_INSTANCE, "exec-path", request)
+        .invoke_raw(PROGRAMS_INSTANCE, EXEC_PATH, request)
         .await
         .context("failed to invoke debugger programs.exec-path")?;
     let response = postcard::from_bytes::<core::result::Result<ExecResult, ExecError>>(&bytes)
@@ -58,13 +58,13 @@ where
 
 #[cfg(feature = "guest")]
 pub(crate) fn supports(instance: &str, func: &str) -> bool {
-    matches!((instance, func), (PROGRAMS_INSTANCE, "exec-path"))
+    matches!((instance, func), (PROGRAMS_INSTANCE, EXEC_PATH))
 }
 
 #[cfg(feature = "guest")]
 pub(crate) async fn dispatch(func: &str, payload: &[u8]) -> Result<Vec<u8>> {
     match func {
-        "exec-path" => {
+        EXEC_PATH => {
             let request = postcard::from_bytes::<ExecPathRequest>(payload)
                 .context("failed to decode debugger programs.exec-path request payload")?;
             let name = infer_program_name(Path::new(&request.path))?;
