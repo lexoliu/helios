@@ -22,6 +22,10 @@ pub trait DmaBuffer: Send + Sync + 'static {
     fn phys_addr(&self) -> u64;
     fn as_ptr(&self) -> *mut u8;
     fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -40,6 +44,11 @@ pub struct MmioBus<P = IdentityDmaPool> {
 }
 
 impl<P> MmioBus<P> {
+    /// # Safety
+    ///
+    /// `base..base+size` must name a valid, permanently mapped MMIO aperture
+    /// for the lifetime of the returned bus, and all accesses through it must
+    /// obey the device's register layout and aliasing requirements.
     pub unsafe fn new(base: NonNull<u8>, size: usize, dma: P) -> IoResult<Self> {
         if size < 0x100 {
             return Err(IoError::Unsupported);
@@ -54,7 +63,7 @@ impl<P> MmioBus<P> {
             .unwrap_or_else(|| panic!("MMIO offset overflow"));
         assert!(end <= self.size, "MMIO access out of range");
         assert!(
-            offset % core::mem::align_of::<u32>() == 0,
+            offset.is_multiple_of(core::mem::align_of::<u32>()),
             "MMIO access misaligned"
         );
 

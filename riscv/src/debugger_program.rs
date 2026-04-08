@@ -82,6 +82,7 @@ pub(crate) struct DeadlinePollable {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutputMode {
     Serial,
+    #[allow(dead_code)]
     Trace,
     Capture,
 }
@@ -1297,10 +1298,10 @@ impl bindings::helios::system::serial::HostSerialPortWithStore for HasSelf<Store
         resource: Resource<SbiSerialPort>,
         max_bytes: u32,
     ) -> wasmtime::Result<Vec<u8>> {
-        Ok(accessor.with(|mut access| {
+        accessor.with(|mut access| {
             let _ = access.get().table.get(&resource)?;
             Ok::<_, wasmtime::Error>(read_serial(max_bytes))
-        })?)
+        })
     }
 
     async fn write<T: 'static + Send>(

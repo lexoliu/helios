@@ -492,7 +492,7 @@ fn finish_task(
 }
 
 fn validate_imports(module: &Module) -> Result<(), CompileError> {
-    for import in module.imports() {
+    if let Some(import) = module.imports().next() {
         return Err(CompileError::UnsupportedImportModule {
             module: import.module().into(),
             name: import.name().into(),

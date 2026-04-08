@@ -204,10 +204,10 @@ impl HostedSerialBackend for DuplexSerialBackend {
             #[cfg(test)]
             self.trace.writes.fetch_add(1, Ordering::Relaxed);
             let mut io = self.write.lock().await;
-            if let Err(error) = io.write_all(&bytes).await {
-                if !is_serial_disconnect(&error) {
-                    return Err(error);
-                }
+            if let Err(error) = io.write_all(&bytes).await
+                && !is_serial_disconnect(&error)
+            {
+                return Err(error);
             }
             #[cfg(test)]
             self.trace
@@ -224,10 +224,10 @@ impl HostedSerialBackend for DuplexSerialBackend {
             #[cfg(test)]
             self.trace.flushes.fetch_add(1, Ordering::Relaxed);
             let mut io = self.write.lock().await;
-            if let Err(error) = io.flush().await {
-                if !is_serial_disconnect(&error) {
-                    return Err(error);
-                }
+            if let Err(error) = io.flush().await
+                && !is_serial_disconnect(&error)
+            {
+                return Err(error);
             }
             Ok(())
         })
@@ -309,9 +309,7 @@ macro_rules! impl_serial_bindings {
                 resource: Resource<HostedSerialPort>,
                 max_bytes: u32,
             ) -> wasmtime::Result<Vec<u8>> {
-                let io = accessor.with(|mut access| {
-                    Ok::<_, wasmtime::Error>(serial_io(access.get(), &resource)?)
-                })?;
+                let io = accessor.with(|mut access| serial_io(access.get(), &resource))?;
                 io.backend.read(max_bytes).await.map_err(Into::into)
             }
 
@@ -320,9 +318,7 @@ macro_rules! impl_serial_bindings {
                 resource: Resource<HostedSerialPort>,
                 bytes: Vec<u8>,
             ) -> wasmtime::Result<()> {
-                let io = accessor.with(|mut access| {
-                    Ok::<_, wasmtime::Error>(serial_io(access.get(), &resource)?)
-                })?;
+                let io = accessor.with(|mut access| serial_io(access.get(), &resource))?;
                 io.backend.write(bytes).await.map_err(Into::into)
             }
 
@@ -330,9 +326,7 @@ macro_rules! impl_serial_bindings {
                 accessor: &Accessor<T, Self>,
                 resource: Resource<HostedSerialPort>,
             ) -> wasmtime::Result<()> {
-                let io = accessor.with(|mut access| {
-                    Ok::<_, wasmtime::Error>(serial_io(access.get(), &resource)?)
-                })?;
+                let io = accessor.with(|mut access| serial_io(access.get(), &resource))?;
                 io.backend.flush().await.map_err(Into::into)
             }
         }

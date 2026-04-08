@@ -689,7 +689,7 @@ fn read_hart_runtime() -> usize {
 
 fn write_hart_runtime(runtime: *const HartRuntime) {
     unsafe {
-        asm!("mv tp, {}", in(reg) runtime, options(nomem, nostack, preserves_flags));
+        asm!("mv tp, {}", in(reg) runtime, options(nostack, preserves_flags));
     }
 }
 

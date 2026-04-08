@@ -1,9 +1,10 @@
 #[cfg(feature = "host")]
 use crate::transport::Client;
-#[cfg(feature = "host")]
-use anyhow::{Context as _, Result};
+use anyhow::Context as _;
+#[cfg(all(feature = "host", not(feature = "guest")))]
+use anyhow::Result;
 #[cfg(feature = "guest")]
-use anyhow::bail;
+use anyhow::{Result, bail};
 #[cfg(feature = "host")]
 use futures_io::{AsyncRead, AsyncWrite};
 #[cfg(feature = "guest")]

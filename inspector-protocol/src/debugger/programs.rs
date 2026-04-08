@@ -1,9 +1,12 @@
 #[cfg(feature = "host")]
 use crate::transport::Client;
-#[cfg(feature = "host")]
-use anyhow::{Context as _, Result};
+use anyhow::Context as _;
+#[cfg(all(feature = "host", not(feature = "guest")))]
+use anyhow::Result;
 #[cfg(feature = "host")]
 use futures_io::{AsyncRead, AsyncWrite};
+#[cfg(feature = "guest")]
+use anyhow::Result;
 #[cfg(feature = "guest")]
 use helios_api::fs;
 #[cfg(feature = "guest")]

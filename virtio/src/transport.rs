@@ -220,7 +220,7 @@ mod tests {
             regs[REG_VERSION / 4] = 2;
             regs[REG_DEVICE_ID / 4] = DeviceType::Block as u32;
             regs[REG_QUEUE_NUM_MAX / 4] = 16;
-            regs[(0x100 + 0) / 4] = 0xfeed_beef;
+            regs[0x100 / 4] = 0xfeed_beef;
             Self {
                 regs: UnsafeCell::new(regs),
                 dma: IdentityDmaPool,
@@ -231,9 +231,6 @@ mod tests {
             unsafe { &*self.regs.get() }
         }
 
-        fn regs_mut(&self) -> &mut [u32; 128] {
-            unsafe { &mut *self.regs.get() }
-        }
     }
 
     impl DeviceBus for FakeBus {
@@ -253,7 +250,7 @@ mod tests {
         }
 
         fn write_u32(&self, offset: usize, value: u32) {
-            self.regs_mut()[offset / 4] = value;
+            unsafe { (*self.regs.get())[offset / 4] = value; }
         }
 
         fn dma(&self) -> &Self::DmaPool {

@@ -245,7 +245,7 @@ fn validate_request(
         return Err(IoError::PermissionDenied);
     }
 
-    if len == 0 || len % SECTOR_SIZE != 0 {
+    if len == 0 || !len.is_multiple_of(SECTOR_SIZE) {
         return Err(IoError::InvalidBufferLength {
             required_multiple: SECTOR_SIZE,
             actual: len,
