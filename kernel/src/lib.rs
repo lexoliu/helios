@@ -13,6 +13,7 @@ mod executor;
 mod instance;
 mod log;
 mod observer;
+mod runtime_state;
 mod program;
 mod program_service;
 mod sync;
@@ -37,6 +38,7 @@ pub use observer::{
     DEFAULT_TRACE_HISTORY_CAPACITY, StatsSample, TraceEvent, TraceField, TraceFilter, TraceHistory,
     TraceLevel, TraceValue, matches_trace_filter, parse_console_text,
 };
+pub use runtime_state::RuntimeState;
 pub use program::{
     Blueprint, CompileError as ProgramCompileError, ExitCode, ProgramRuntime, ProgramRuntimeConfig,
     ProgramRuntimeDriver, ProgramRuntimeError, ProgramRuntimeInitError, ResourceTable,
