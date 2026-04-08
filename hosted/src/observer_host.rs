@@ -13,6 +13,10 @@ use crate::init_program::StoreData;
 use crate::observer_buffer::matches_filter;
 use crate::program_bindings::bindings as program_bindings;
 
+const STATS_INSTANCE: &str = "helios:system/stats@0.1.0";
+const TRACING_INSTANCE: &str = "helios:system/tracing@0.1.0";
+const INSTANCES_INSTANCE: &str = "helios:system/instances@0.1.0";
+
 /// Adds the hosted observer syscalls that are needed by the embedded debugger.
 ///
 /// `wasmtime::component::bindgen` currently lowers free functions returning a
@@ -28,7 +32,7 @@ pub(crate) fn add_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<
 }
 
 fn add_stats_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
-    let mut instance = linker.instance("helios:system/stats@0.1.0")?;
+    let mut instance = linker.instance(STATS_INSTANCE)?;
     instance.func_wrap_async("snapshot", |caller, (): ()| {
         Box::new(async move { Ok((snapshot_sample(caller.data()),)) })
     })?;
@@ -42,7 +46,7 @@ fn add_stats_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
 }
 
 fn add_tracing_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
-    let mut instance = linker.instance("helios:system/tracing@0.1.0")?;
+    let mut instance = linker.instance(TRACING_INSTANCE)?;
     instance.func_wrap_async(
         "recent",
         |caller, (filter, limit): (program_bindings::helios::system::tracing::Filter, u32)| {
@@ -82,7 +86,7 @@ fn add_tracing_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()>
 }
 
 fn add_instances_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
-    let mut instance = linker.instance("helios:system/instances@0.1.0")?;
+    let mut instance = linker.instance(INSTANCES_INSTANCE)?;
     instance.func_wrap_async("snapshot", |caller, (): ()| {
         Box::new(async move {
             Ok((caller
