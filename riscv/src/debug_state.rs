@@ -1,16 +1,12 @@
 extern crate alloc;
 
-use alloc::borrow::ToOwned;
-use alloc::collections::VecDeque;
-use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec;
-use alloc::vec::Vec;
 
-use helios_kernel::{InstanceRegistry, Notify};
+use helios_kernel::{
+    DEFAULT_TRACE_HISTORY_CAPACITY, InstanceRegistry, Notify, StatsSample, TraceEvent, TraceFilter,
+    TraceHistory,
+};
 use spin::Mutex;
-
-const HISTORY_CAPACITY: usize = 512;
 
 #[derive(Clone)]
 pub(crate) struct RuntimeState {
@@ -29,58 +25,6 @@ struct RuntimeStateInner {
     tracing: Mutex<TraceHistory>,
 }
 
-struct TraceHistory {
-    next_seq: u64,
-    events: VecDeque<(u64, TraceEvent)>,
-}
-
-#[derive(Clone)]
-pub(crate) struct TraceFilter {
-    pub min_level: Option<TraceLevel>,
-    pub target_prefixes: Vec<String>,
-}
-
-#[derive(Clone)]
-pub(crate) struct TraceEvent {
-    pub timestamp: u64,
-    pub level: TraceLevel,
-    pub target: String,
-    pub fields: Vec<TraceField>,
-}
-
-#[derive(Clone)]
-pub(crate) struct TraceField {
-    pub key: String,
-    pub value: TraceValue,
-}
-
-#[allow(dead_code)]
-#[derive(Clone)]
-pub(crate) enum TraceValue {
-    Boolean(bool),
-    Signed64(i64),
-    Unsigned64(u64),
-    Float64(f64),
-    Text(String),
-    Blob(Vec<u8>),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TraceLevel {
-    Error,
-    Warn,
-    Info,
-    Debug,
-    Trace,
-}
-
-pub(crate) struct StatsSample {
-    pub timestamp: u64,
-    pub uptime: u64,
-    pub configured_processors: u32,
-    pub online_processors: u32,
-}
-
 impl RuntimeState {
     pub(crate) fn new(timebase_frequency: u64, processor_count: usize, boot_ticks: u64) -> Self {
         Self {
@@ -93,10 +37,7 @@ impl RuntimeState {
                 program_service_ready: Notify::new(),
                 network_service: Mutex::new(None),
                 host_fs_service: Mutex::new(None),
-                tracing: Mutex::new(TraceHistory {
-                    next_seq: 1,
-                    events: VecDeque::with_capacity(HISTORY_CAPACITY),
-                }),
+                tracing: Mutex::new(TraceHistory::new(DEFAULT_TRACE_HISTORY_CAPACITY)),
             }),
         }
     }
@@ -113,30 +54,14 @@ impl RuntimeState {
 
     pub(crate) fn record_console_text(&self, current_ticks: u64, text: &str) {
         let timestamp = self.ticks_to_nanos(current_ticks.saturating_sub(self.inner.boot_ticks));
-        let stripped = strip_ansi(text);
-        for raw_line in stripped.lines() {
-            let line = raw_line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            self.push_event(parse_console_line(timestamp, line));
-        }
+        self.inner
+            .tracing
+            .lock()
+            .record_console_text(timestamp, text);
     }
 
-    pub(crate) fn recent(&self, filter: &TraceFilter, limit: u32) -> Vec<TraceEvent> {
-        let history = self.inner.tracing.lock();
-        let mut events = history
-            .events
-            .iter()
-            .map(|(_, event)| event)
-            .filter(|event| matches_filter(event, filter))
-            .cloned()
-            .collect::<Vec<_>>();
-        let keep = limit as usize;
-        if events.len() > keep {
-            events.drain(..events.len() - keep);
-        }
-        events
+    pub(crate) fn recent(&self, filter: &TraceFilter, limit: u32) -> alloc::vec::Vec<TraceEvent> {
+        self.inner.tracing.lock().recent(filter, limit)
     }
 
     pub(crate) fn next_after(
@@ -144,12 +69,7 @@ impl RuntimeState {
         cursor: u64,
         filter: &TraceFilter,
     ) -> Option<(u64, TraceEvent)> {
-        let history = self.inner.tracing.lock();
-        history
-            .events
-            .iter()
-            .find(|(seq, event)| *seq > cursor && matches_filter(event, filter))
-            .map(|(seq, event)| (*seq, event.clone()))
+        self.inner.tracing.lock().next_after(cursor, filter)
     }
 
     pub(crate) fn ticks_to_nanos(&self, ticks: u64) -> u64 {
@@ -213,123 +133,4 @@ impl RuntimeState {
     pub(crate) fn host_fs_service(&self) -> Option<crate::host_fs::HostFileSystemService> {
         self.inner.host_fs_service.lock().clone()
     }
-}
-
-fn push_frontier(history: &mut TraceHistory, event: TraceEvent) {
-    if history.events.len() == HISTORY_CAPACITY {
-        let dropped = history.events.pop_front();
-        assert!(dropped.is_some(), "trace history underflowed");
-    }
-    let seq = history.next_seq;
-    history.next_seq = history.next_seq.saturating_add(1);
-    history.events.push_back((seq, event));
-}
-
-impl RuntimeState {
-    fn push_event(&self, event: TraceEvent) {
-        let mut history = self.inner.tracing.lock();
-        push_frontier(&mut history, event);
-    }
-}
-
-fn parse_console_line(timestamp: u64, line: &str) -> TraceEvent {
-    if let Some((level, target, message)) = split_prefixed_line(line) {
-        return TraceEvent {
-            timestamp,
-            level,
-            target,
-            fields: vec![TraceField {
-                key: "message".to_owned(),
-                value: TraceValue::Text(message),
-            }],
-        };
-    }
-
-    TraceEvent {
-        timestamp,
-        level: TraceLevel::Info,
-        target: "console".to_owned(),
-        fields: vec![TraceField {
-            key: "message".to_owned(),
-            value: TraceValue::Text(line.to_owned()),
-        }],
-    }
-}
-
-fn split_prefixed_line(line: &str) -> Option<(TraceLevel, String, String)> {
-    let open = line.find('[')?;
-    let close = line[open..].find(']')? + open;
-    let level = parse_level(line[..open].trim())?;
-    let target = line[open + 1..close].trim();
-    let message = line[close + 1..].trim();
-    if target.is_empty() || message.is_empty() {
-        return None;
-    }
-    Some((level, target.to_owned(), message.to_owned()))
-}
-
-fn parse_level(level: &str) -> Option<TraceLevel> {
-    Some(match level {
-        "ERROR" => TraceLevel::Error,
-        "WARN" => TraceLevel::Warn,
-        "INFO" => TraceLevel::Info,
-        "DEBUG" => TraceLevel::Debug,
-        "TRACE" => TraceLevel::Trace,
-        _ => return None,
-    })
-}
-
-fn matches_filter(event: &TraceEvent, filter: &TraceFilter) -> bool {
-    if let Some(min_level) = filter.min_level
-        && level_priority(event.level) > level_priority(min_level)
-    {
-        return false;
-    }
-
-    if filter.target_prefixes.is_empty() {
-        return true;
-    }
-
-    filter
-        .target_prefixes
-        .iter()
-        .any(|prefix| event.target.starts_with(prefix))
-}
-
-fn level_priority(level: TraceLevel) -> u8 {
-    match level {
-        TraceLevel::Error => 0,
-        TraceLevel::Warn => 1,
-        TraceLevel::Info => 2,
-        TraceLevel::Debug => 3,
-        TraceLevel::Trace => 4,
-    }
-}
-
-fn strip_ansi(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut output = String::with_capacity(text.len());
-    let mut index = 0;
-
-    while index < bytes.len() {
-        if bytes[index] == 0x1b {
-            index += 1;
-            if index < bytes.len() && bytes[index] == b'[' {
-                index += 1;
-                while index < bytes.len() {
-                    let byte = bytes[index];
-                    index += 1;
-                    if byte.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-                continue;
-            }
-        }
-
-        output.push(bytes[index] as char);
-        index += 1;
-    }
-
-    output
 }

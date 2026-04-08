@@ -4,6 +4,7 @@ use core::time::Duration;
 
 use futures::Stream;
 use futures::stream;
+use helios_kernel::{TraceEvent, TraceField, TraceFilter, TraceLevel, TraceValue};
 use tokio::time::{self, Instant as TokioInstant, MissedTickBehavior};
 use wasmtime::StoreContextMut;
 use wasmtime::component::{Destination, Linker, StreamProducer, StreamReader, StreamResult};
@@ -17,13 +18,6 @@ const STATS_INSTANCE: &str = "helios:system/stats@0.1.0";
 const TRACING_INSTANCE: &str = "helios:system/tracing@0.1.0";
 const INSTANCES_INSTANCE: &str = "helios:system/instances@0.1.0";
 
-/// Adds the hosted observer syscalls that are needed by the embedded debugger.
-///
-/// `wasmtime::component::bindgen` currently lowers free functions returning a
-/// `stream<T>` through `Host`, not `HostWithStore`, so the generated trait
-/// never receives a `StoreContextMut`. We therefore wire these imports
-/// manually, which keeps stream creation in the `func_wrap_async` closure where
-/// the store is available.
 pub(crate) fn add_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
     add_stats_to_linker(linker)?;
     add_instances_to_linker(linker)?;
@@ -50,13 +44,24 @@ fn add_tracing_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()>
     instance.func_wrap_async(
         "recent",
         |caller, (filter, limit): (program_bindings::helios::system::tracing::Filter, u32)| {
-            Box::new(async move { Ok((caller.data().observer.recent(&filter, limit),)) })
+            Box::new(async move {
+                let filter = convert_filter(filter);
+                let events = caller
+                    .data()
+                    .observer
+                    .recent(&filter, limit)
+                    .into_iter()
+                    .map(convert_event)
+                    .collect::<Vec<_>>();
+                Ok((events,))
+            })
         },
     )?;
     instance.func_wrap_async(
         "subscribe",
         |mut caller, (filter,): (program_bindings::helios::system::tracing::Filter,)| {
             Box::new(async move {
+                let filter = convert_filter(filter);
                 let receiver = caller.data().observer.subscribe();
                 let stream = stream::unfold(receiver, move |mut receiver| {
                     let filter = filter.clone();
@@ -64,7 +69,7 @@ fn add_tracing_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()>
                         loop {
                             match receiver.recv().await {
                                 Ok(event) if matches_filter(&event, &filter) => {
-                                    return Some((event, receiver));
+                                    return Some((convert_event(event), receiver));
                                 }
                                 Ok(_) => continue,
                                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -133,6 +138,68 @@ fn convert_instance(
         uptime: instance.uptime,
         memory_bytes: instance.memory_bytes,
         cpu_busy: instance.cpu_busy,
+    }
+}
+
+fn convert_filter(filter: program_bindings::helios::system::tracing::Filter) -> TraceFilter {
+    TraceFilter {
+        min_level: filter.min_level.map(convert_level_to_local),
+        target_prefixes: filter.target_prefixes,
+    }
+}
+
+fn convert_event(event: TraceEvent) -> program_bindings::helios::system::tracing::Event {
+    program_bindings::helios::system::tracing::Event {
+        timestamp: event.timestamp,
+        level: convert_level_from_local(event.level),
+        target: event.target,
+        fields: event.fields.into_iter().map(convert_field).collect(),
+    }
+}
+
+fn convert_field(field: TraceField) -> program_bindings::helios::system::tracing::Field {
+    program_bindings::helios::system::tracing::Field {
+        key: field.key,
+        value: convert_value(field.value),
+    }
+}
+
+fn convert_value(value: TraceValue) -> program_bindings::helios::system::tracing::Value {
+    match value {
+        TraceValue::Boolean(value) => {
+            program_bindings::helios::system::tracing::Value::Boolean(value)
+        }
+        TraceValue::Signed64(value) => {
+            program_bindings::helios::system::tracing::Value::Signed64(value)
+        }
+        TraceValue::Unsigned64(value) => {
+            program_bindings::helios::system::tracing::Value::Unsigned64(value)
+        }
+        TraceValue::Float64(value) => {
+            program_bindings::helios::system::tracing::Value::Float64(value)
+        }
+        TraceValue::Text(value) => program_bindings::helios::system::tracing::Value::Text(value),
+        TraceValue::Blob(value) => program_bindings::helios::system::tracing::Value::Blob(value),
+    }
+}
+
+fn convert_level_from_local(level: TraceLevel) -> program_bindings::helios::system::tracing::Level {
+    match level {
+        TraceLevel::Error => program_bindings::helios::system::tracing::Level::Error,
+        TraceLevel::Warn => program_bindings::helios::system::tracing::Level::Warn,
+        TraceLevel::Info => program_bindings::helios::system::tracing::Level::Info,
+        TraceLevel::Debug => program_bindings::helios::system::tracing::Level::Debug,
+        TraceLevel::Trace => program_bindings::helios::system::tracing::Level::Trace,
+    }
+}
+
+fn convert_level_to_local(level: program_bindings::helios::system::tracing::Level) -> TraceLevel {
+    match level {
+        program_bindings::helios::system::tracing::Level::Error => TraceLevel::Error,
+        program_bindings::helios::system::tracing::Level::Warn => TraceLevel::Warn,
+        program_bindings::helios::system::tracing::Level::Info => TraceLevel::Info,
+        program_bindings::helios::system::tracing::Level::Debug => TraceLevel::Debug,
+        program_bindings::helios::system::tracing::Level::Trace => TraceLevel::Trace,
     }
 }
 
