@@ -571,7 +571,7 @@ mod tests {
                 });
 
                 let (peer_read, peer_write) = tokio::io::split(peer);
-                let mut client = helios_inspector_protocol::transport::Client::new(
+                let client = helios_inspector_protocol::transport::Client::new(
                     peer_read.compat(),
                     peer_write.compat_write(),
                 );
@@ -596,7 +596,7 @@ mod tests {
 
                 let stats = timeout(
                     Duration::from_secs(30),
-                    helios_inspector_protocol::system::stats::snapshot(&mut client),
+                    helios_inspector_protocol::system::stats::snapshot(&client),
                 )
                 .await
                     .unwrap_or_else(|_| {
@@ -638,7 +638,7 @@ mod tests {
 
                 let second_stats = timeout(
                     Duration::from_secs(30),
-                    helios_inspector_protocol::system::stats::snapshot(&mut client),
+                    helios_inspector_protocol::system::stats::snapshot(&client),
                 )
                 .await
                 .unwrap_or_else(|_| {
@@ -660,7 +660,7 @@ mod tests {
 
                 let instances = timeout(
                     Duration::from_secs(30),
-                    helios_inspector_protocol::system::instances::snapshot(&mut client),
+                    helios_inspector_protocol::system::instances::snapshot(&client),
                 )
                 .await
                 .unwrap_or_else(|_| panic!("timed out waiting for remote instances snapshot"))
@@ -676,7 +676,7 @@ mod tests {
                 };
                 let events = timeout(
                     Duration::from_secs(30),
-                    helios_inspector_protocol::system::tracing::recent(&mut client, &filter, 8),
+                    helios_inspector_protocol::system::tracing::recent(&client, &filter, 8),
                 )
                 .await
                 .unwrap_or_else(|_| panic!("timed out waiting for remote tracing events"))
@@ -754,7 +754,7 @@ mod tests {
                 });
 
                 let (peer_read, peer_write) = tokio::io::split(peer);
-                let mut client = helios_inspector_protocol::transport::Client::new(
+                let client = helios_inspector_protocol::transport::Client::new(
                     peer_read.compat(),
                     peer_write.compat_write(),
                 );
@@ -777,12 +777,13 @@ mod tests {
                     }
                 }
 
-                let instance_id = timeout(
+                let exec_result = timeout(
                     Duration::from_secs(30),
                     helios_inspector_protocol::system::programs::exec(
-                        &mut client,
+                        &client,
                         &helios_inspector_protocol::system::programs::ExecRequest {
                             name: "spin.wasm".to_owned(),
+                            args: Vec::new(),
                             wasm: spin_start_module(),
                         },
                     ),
@@ -790,10 +791,11 @@ mod tests {
                 .await
                 .unwrap_or_else(|_| panic!("timed out waiting for remote programs.exec"))
                 .unwrap_or_else(|error| panic!("remote programs.exec failed: {error:#}"));
+                let instance_id = exec_result.instance_id;
 
                 let instances = timeout(
                     Duration::from_secs(30),
-                    helios_inspector_protocol::system::instances::snapshot(&mut client),
+                    helios_inspector_protocol::system::instances::snapshot(&client),
                 )
                 .await
                 .unwrap_or_else(|_| panic!("timed out waiting for remote instances after exec"))

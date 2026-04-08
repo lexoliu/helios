@@ -53,6 +53,7 @@ pub(crate) struct TraceField {
     pub value: TraceValue,
 }
 
+#[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) enum TraceValue {
     Boolean(bool),
@@ -264,10 +265,10 @@ fn parse_level(level: &str) -> Option<TraceLevel> {
 }
 
 fn matches_filter(event: &TraceEvent, filter: &TraceFilter) -> bool {
-    if let Some(min_level) = filter.min_level {
-        if level_priority(event.level) > level_priority(min_level) {
-            return false;
-        }
+    if let Some(min_level) = filter.min_level
+        && level_priority(event.level) > level_priority(min_level)
+    {
+        return false;
     }
 
     if filter.target_prefixes.is_empty() {

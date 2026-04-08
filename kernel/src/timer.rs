@@ -99,7 +99,10 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
         // Timer wakeups are frequent, so keep the temporary ready list out of
         // the allocator fast path once the pool has warmed up.
         let mut ready = self.shared.ready_pool.get_owned();
-        let state = self.state_mut();
+        // SAFETY: the timer heap is owned by the kernel event loop on this
+        // processor. Sleep futures only enqueue through the lock-free inbox, and
+        // interrupt handlers only disarm the hardware timer.
+        let state = unsafe { &mut *self.shared.state.get() };
         self.drain_inbox(state);
 
         while let Some(entry) = state.sleepers.peek() {
@@ -215,13 +218,6 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
                 Err(_) => continue,
             }
         }
-    }
-
-    fn state_mut(&self) -> &mut TimerState {
-        // SAFETY: the timer heap is owned by the kernel event loop on this
-        // processor. Sleep futures only enqueue through the lock-free inbox, and
-        // interrupt handlers only disarm the hardware timer.
-        unsafe { &mut *self.shared.state.get() }
     }
 }
 

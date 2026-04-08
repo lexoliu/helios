@@ -344,20 +344,18 @@ impl File for BootFile {
         async move { Ok(count) }
     }
 
-    fn write(&mut self, _buf: &[u8]) -> impl core::future::Future<Output = IoResult<usize>> + Send {
-        async move { Err(IoError::ReadOnly) }
+    async fn write(&mut self, _buf: &[u8]) -> IoResult<usize> {
+        Err(IoError::ReadOnly)
     }
 }
 
 fn normalize_path(base: Option<&str>, path: &str) -> String {
     let mut segments: Vec<&str> = Vec::new();
 
-    if !path.starts_with('/') {
-        if let Some(base) = base {
-            for segment in base.split('/') {
-                if !segment.is_empty() {
-                    segments.push(segment);
-                }
+    if !path.starts_with('/') && let Some(base) = base {
+        for segment in base.split('/') {
+            if !segment.is_empty() {
+                segments.push(segment);
             }
         }
     }

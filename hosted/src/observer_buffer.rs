@@ -137,10 +137,10 @@ pub(crate) fn matches_filter(
     event: &bindings::helios::system::tracing::Event,
     filter: &bindings::helios::system::tracing::Filter,
 ) -> bool {
-    if let Some(min_level) = filter.min_level {
-        if level_priority(event.level) > level_priority(min_level) {
-            return false;
-        }
+    if let Some(min_level) = filter.min_level
+        && level_priority(event.level) > level_priority(min_level)
+    {
+        return false;
     }
 
     if filter.target_prefixes.is_empty() {

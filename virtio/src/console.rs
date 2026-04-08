@@ -144,9 +144,7 @@ impl<T: VirtioTransport> ReceiveState<T> {
             panic!("failed to arm virtio console receive queue: {error:?}")
         });
 
-        let Some((token, used_len)) = self.queue.pop_used_with_len() else {
-            return None;
-        };
+        let (token, used_len) = self.queue.pop_used_with_len()?;
         let expected = self
             .token
             .take()
