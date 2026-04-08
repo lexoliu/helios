@@ -3,10 +3,10 @@ use crate::transport::Client;
 use anyhow::Context as _;
 #[cfg(all(feature = "host", not(feature = "guest")))]
 use anyhow::Result;
-#[cfg(feature = "host")]
-use futures_io::{AsyncRead, AsyncWrite};
 #[cfg(feature = "guest")]
 use anyhow::Result;
+#[cfg(feature = "host")]
+use futures_io::{AsyncRead, AsyncWrite};
 #[cfg(feature = "guest")]
 use helios_api::fs;
 #[cfg(feature = "guest")]
@@ -36,7 +36,11 @@ impl ExecPathRequest {
 }
 
 #[cfg(feature = "host")]
-pub async fn exec_path<R, W>(client: &Client<R, W>, path: &str, args: &[String]) -> Result<ExecResult>
+pub async fn exec_path<R, W>(
+    client: &Client<R, W>,
+    path: &str,
+    args: &[String],
+) -> Result<ExecResult>
 where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,

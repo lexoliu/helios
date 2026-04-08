@@ -426,13 +426,8 @@ impl DebugFileSystem {
             return Some("/");
         }
 
-        path.strip_prefix("/host/").map(|suffix| {
-            if suffix.is_empty() {
-                "/"
-            } else {
-                suffix
-            }
-        })
+        path.strip_prefix("/host/")
+            .map(|suffix| if suffix.is_empty() { "/" } else { suffix })
     }
 
     fn host_service(
@@ -1059,7 +1054,8 @@ impl DebugFileSystem {
         destination_path: &str,
         now_nanos: u64,
     ) -> core::result::Result<(), fs_types::ErrorCode> {
-        if source_base.kind != FsNodeKind::Directory || destination_base.kind != FsNodeKind::Directory
+        if source_base.kind != FsNodeKind::Directory
+            || destination_base.kind != FsNodeKind::Directory
         {
             return Err(fs_types::ErrorCode::NotDirectory);
         }
@@ -1091,7 +1087,8 @@ impl DebugFileSystem {
             });
         }
 
-        if self.get_node(&source_base.path)?.readonly || self.get_node(&destination_base.path)?.readonly
+        if self.get_node(&source_base.path)?.readonly
+            || self.get_node(&destination_base.path)?.readonly
         {
             return Err(fs_types::ErrorCode::ReadOnly);
         }
@@ -1136,9 +1133,7 @@ impl DebugFileSystem {
                 continue;
             }
 
-            if source_node.kind == FsNodeKind::Directory
-                && node.path.starts_with(&source_prefix)
-            {
+            if source_node.kind == FsNodeKind::Directory && node.path.starts_with(&source_prefix) {
                 node.path = format!(
                     "{}{suffix}",
                     destination_absolute,
@@ -1249,7 +1244,10 @@ impl wasi::cli::stdout::HostWithStore for HasSelf<StoreData> {
     ) -> Result<FutureReader<core::result::Result<(), cli_types::ErrorCode>>> {
         let (tx, rx) = oneshot::channel();
         let getter = access.getter();
-        data.pipe(&mut access, SerialStreamConsumer::new(getter, tx, OutputStreamKind::Stdout))?;
+        data.pipe(
+            &mut access,
+            SerialStreamConsumer::new(getter, tx, OutputStreamKind::Stdout),
+        )?;
         FutureReader::new(&mut access, async move {
             match rx.await {
                 Ok(result) => Ok::<_, wasmtime::Error>(result),
@@ -1268,7 +1266,10 @@ impl wasi::cli::stderr::HostWithStore for HasSelf<StoreData> {
     ) -> Result<FutureReader<core::result::Result<(), cli_types::ErrorCode>>> {
         let (tx, rx) = oneshot::channel();
         let getter = access.getter();
-        data.pipe(&mut access, SerialStreamConsumer::new(getter, tx, OutputStreamKind::Stderr))?;
+        data.pipe(
+            &mut access,
+            SerialStreamConsumer::new(getter, tx, OutputStreamKind::Stderr),
+        )?;
         FutureReader::new(&mut access, async move {
             match rx.await {
                 Ok(result) => Ok::<_, wasmtime::Error>(result),
@@ -2208,7 +2209,9 @@ fn map_host_fs_error(error: crate::host_fs::HostFsError) -> fs_types::ErrorCode 
             fs_types::ErrorCode::NotEmpty
         }
         crate::host_fs::HostFsError::Transport(IoError::PermissionDenied)
-        | crate::host_fs::HostFsError::Transport(IoError::ReadOnly) => fs_types::ErrorCode::ReadOnly,
+        | crate::host_fs::HostFsError::Transport(IoError::ReadOnly) => {
+            fs_types::ErrorCode::ReadOnly
+        }
         crate::host_fs::HostFsError::Transport(IoError::Unsupported) => {
             fs_types::ErrorCode::Unsupported
         }
@@ -2306,7 +2309,10 @@ mod tests {
         let error = filesystem
             .write_at(&descriptor, 0, b"x", 1)
             .expect_err("readonly bootfs file must reject writes");
-        assert_eq!(error, bindings::wasi::filesystem::types::ErrorCode::ReadOnly);
+        assert_eq!(
+            error,
+            bindings::wasi::filesystem::types::ErrorCode::ReadOnly
+        );
     }
 
     #[test]
@@ -2328,6 +2334,9 @@ mod tests {
                 2,
             )
             .expect_err("opening an existing directory as a file must fail");
-        assert_eq!(error, bindings::wasi::filesystem::types::ErrorCode::IsDirectory);
+        assert_eq!(
+            error,
+            bindings::wasi::filesystem::types::ErrorCode::IsDirectory
+        );
     }
 }

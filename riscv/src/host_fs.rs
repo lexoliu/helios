@@ -8,13 +8,13 @@ use alloc::vec::Vec;
 
 use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 use core::num::NonZeroU32;
-use thiserror::Error;
 use fdt::Fdt;
 use futures::channel::oneshot;
 use helios_hal::cpu::Cpu;
 use helios_hal::io::IoError;
 use helios_kernel::{Kernel, Notify};
 use plic::Plic;
+use thiserror::Error;
 
 use crate::RiscvCpu;
 use crate::net::{InterruptSourceId, PlicContext};
@@ -51,7 +51,6 @@ const P9_DOTL_AT_REMOVEDIR: u32 = 0x200;
 const P9_STATS_BASIC: u64 = 0x0000_07ff;
 const P9_QTDIR: u8 = 0x80;
 const P9_WRITE_CHUNK: usize = (DEFAULT_MSIZE as usize) - 24;
-
 
 #[derive(Clone)]
 pub(crate) struct HostFileSystemService {
@@ -119,7 +118,9 @@ pub(crate) fn install(
         tracing::warn!("virtio 9p device was not discovered on the platform bus");
         return None;
     };
-    let Some((plic, context)) = crate::net::discover_plic_context(fdt, cpu.bootstrap_processor().id()) else {
+    let Some((plic, context)) =
+        crate::net::discover_plic_context(fdt, cpu.bootstrap_processor().id())
+    else {
         tracing::warn!("virtio 9p device was discovered but no PLIC context was available");
         return None;
     };
@@ -219,7 +220,8 @@ impl HostFileSystemService {
         request.push(ty);
         request.extend_from_slice(&P9_NOTAG.to_le_bytes());
         body(&mut request);
-        let size = u32::try_from(request.len()).map_err(|_| HostFsError::Protocol("request too large"))?;
+        let size =
+            u32::try_from(request.len()).map_err(|_| HostFsError::Protocol("request too large"))?;
         request[..4].copy_from_slice(&size.to_le_bytes());
 
         let response = self.raw_request(request, response_len).await?;
@@ -236,7 +238,9 @@ impl HostFileSystemService {
             return Err(HostFsError::Server(read_u32_le(&response, 7)?));
         }
 
-        let expected = ty.checked_add(1).ok_or(HostFsError::Protocol("response type overflowed"))?;
+        let expected = ty
+            .checked_add(1)
+            .ok_or(HostFsError::Protocol("response type overflowed"))?;
         if response_ty != expected {
             return Err(HostFsError::Protocol("unexpected 9p response type"));
         }
@@ -439,7 +443,10 @@ impl HostFileSystemService {
                 |body| {
                     push_u32(body, parent_fid);
                     push_u32(body, new_fid);
-                    push_u16(body, u16::try_from(segments.len()).expect("walk segment count overflowed u16"));
+                    push_u16(
+                        body,
+                        u16::try_from(segments.len()).expect("walk segment count overflowed u16"),
+                    );
                     for segment in &segments {
                         push_string(body, segment);
                     }
@@ -508,7 +515,8 @@ impl HostFileSystemService {
                 )
                 .await?;
             let mut cursor = 7;
-            let count = usize::try_from(read_u32_le(&response, cursor)?).map_err(|_| HostFsError::Protocol("read payload count overflowed usize"))?;
+            let count = usize::try_from(read_u32_le(&response, cursor)?)
+                .map_err(|_| HostFsError::Protocol("read payload count overflowed usize"))?;
             cursor += 4;
             if count == 0 {
                 break;
@@ -537,7 +545,8 @@ impl HostFileSystemService {
                 )
                 .await?;
             let mut cursor = 7;
-            let count = usize::try_from(read_u32_le(&response, cursor)?).map_err(|_| HostFsError::Protocol("readdir payload count overflowed usize"))?;
+            let count = usize::try_from(read_u32_le(&response, cursor)?)
+                .map_err(|_| HostFsError::Protocol("readdir payload count overflowed usize"))?;
             cursor += 4;
             if count == 0 {
                 break;
@@ -567,11 +576,7 @@ impl HostFileSystemService {
 
     async fn clunk(&self, fid: u32) -> Result<(), HostFsError> {
         let _ = self
-            .transact(
-                P9_TCLUNK,
-                |body| push_u32(body, fid),
-                16,
-            )
+            .transact(P9_TCLUNK, |body| push_u32(body, fid), 16)
             .await?;
         Ok(())
     }
@@ -590,7 +595,12 @@ impl HostFileSystemService {
         Ok(())
     }
 
-    async fn write_chunks(&self, fid: u32, mut offset: u64, mut bytes: &[u8]) -> Result<(), HostFsError> {
+    async fn write_chunks(
+        &self,
+        fid: u32,
+        mut offset: u64,
+        mut bytes: &[u8],
+    ) -> Result<(), HostFsError> {
         while !bytes.is_empty() {
             let count = bytes.len().min(P9_WRITE_CHUNK);
             let chunk = &bytes[..count];
@@ -600,7 +610,10 @@ impl HostFileSystemService {
                     |body| {
                         push_u32(body, fid);
                         push_u64(body, offset);
-                        push_u32(body, u32::try_from(count).expect("write chunk length overflowed u32"));
+                        push_u32(
+                            body,
+                            u32::try_from(count).expect("write chunk length overflowed u32"),
+                        );
                         body.extend_from_slice(chunk);
                     },
                     32,
@@ -621,7 +634,9 @@ impl HostFileSystemService {
 }
 
 fn split_path(path: &str) -> Vec<&str> {
-    path.split('/').filter(|segment| !segment.is_empty()).collect()
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect()
 }
 
 fn split_parent_name(path: &str) -> Result<(&str, &str), HostFsError> {
@@ -659,7 +674,9 @@ fn push_string(buf: &mut Vec<u8>, value: &str) {
 }
 
 fn read_u8(buf: &[u8], offset: usize) -> Result<u8, HostFsError> {
-    buf.get(offset).copied().ok_or(HostFsError::Protocol("buffer underrun"))
+    buf.get(offset)
+        .copied()
+        .ok_or(HostFsError::Protocol("buffer underrun"))
 }
 
 fn read_u16_le(buf: &[u8], offset: usize) -> Result<u16, HostFsError> {
@@ -720,10 +737,10 @@ fn discover_9p_device(
             .and_then(|irq| NonZeroU32::new(irq as u32))
             .map(InterruptSourceId)
             .unwrap_or_else(|| panic!("virtio-9p node at {base:#x} has no valid interrupt source"));
-        let device = unsafe { helios_virtio::p9_from_mmio(header, mmio_size) }.unwrap_or_else(|error| {panic!(
-                "failed to initialize virtio-9p device at {base:#x}: {error}"
-            )
-        });
+        let device =
+            unsafe { helios_virtio::p9_from_mmio(header, mmio_size) }.unwrap_or_else(|error| {
+                panic!("failed to initialize virtio-9p device at {base:#x}: {error}")
+            });
         return Some((Arc::new(device), irq_source));
     }
 

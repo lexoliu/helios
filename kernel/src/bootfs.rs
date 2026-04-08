@@ -407,7 +407,9 @@ impl File for BootFile {
 fn normalize_path(base: Option<&str>, path: &str) -> String {
     let mut segments: Vec<&str> = Vec::new();
 
-    if !path.starts_with('/') && let Some(base) = base {
+    if !path.starts_with('/')
+        && let Some(base) = base
+    {
         for segment in base.split('/') {
             if !segment.is_empty() {
                 segments.push(segment);

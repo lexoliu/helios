@@ -100,9 +100,9 @@ async fn open_directory(path: &Path, writable: bool) -> Result<Descriptor> {
 async fn open_file_for_write(path: &Path) -> Result<Descriptor> {
     let mut components = normalized_components(path)?;
     let display = display_path(path);
-    let file_name = components.pop().ok_or_else(|| {
-        error::filesystem(&display, ErrorCode::Invalid)
-    })?;
+    let file_name = components
+        .pop()
+        .ok_or_else(|| error::filesystem(&display, ErrorCode::Invalid))?;
     let parent = open_parent_directory(&components, true, &display).await?;
 
     parent
@@ -116,12 +116,16 @@ async fn open_file_for_write(path: &Path) -> Result<Descriptor> {
         .map_err(|code| error::filesystem(&display, code))
 }
 
-async fn open_leaf(path: &Path, open_flags: OpenFlags, flags: DescriptorFlags) -> Result<Descriptor> {
+async fn open_leaf(
+    path: &Path,
+    open_flags: OpenFlags,
+    flags: DescriptorFlags,
+) -> Result<Descriptor> {
     let mut components = normalized_components(path)?;
     let display = display_path(path);
-    let file_name = components.pop().ok_or_else(|| {
-        error::filesystem(&display, ErrorCode::Invalid)
-    })?;
+    let file_name = components
+        .pop()
+        .ok_or_else(|| error::filesystem(&display, ErrorCode::Invalid))?;
     let parent = open_parent_directory(
         &components,
         flags == (DescriptorFlags::READ | DescriptorFlags::MUTATE_DIRECTORY),

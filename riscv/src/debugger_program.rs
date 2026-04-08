@@ -88,6 +88,13 @@ pub(crate) enum OutputMode {
     Trace,
     Capture,
 }
+
+#[derive(Clone, Copy)]
+pub(crate) enum SystemWorld {
+    Debugger,
+    Program,
+}
+
 pub struct SbiRawMutex {
     inner: Arc<RawMutex>,
 }
@@ -156,13 +163,8 @@ fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), Debugge
 
     emit_stage_marker("linker:new");
     tracing::info!("debugger hart: preparing component linker");
-    let mut linker = Linker::<StoreData>::new(&engine);
-    wasmtime_wasi_io::add_to_linker_async(&mut linker).map_err(DebuggerError::LinkComponent)?;
-    crate::debugger_wasi_p2::add_to_linker(&mut linker).map_err(DebuggerError::LinkComponent)?;
-    crate::debugger_wasi::add_to_linker(&mut linker).map_err(DebuggerError::LinkComponent)?;
-    add_serial_to_linker(&mut linker).map_err(DebuggerError::LinkComponent)?;
-    add_sync_to_linker(&mut linker).map_err(DebuggerError::LinkComponent)?;
-    add_system_to_linker(&mut linker).map_err(DebuggerError::LinkComponent)?;
+    let linker =
+        component_linker(&engine, SystemWorld::Debugger).map_err(DebuggerError::LinkComponent)?;
     emit_stage_marker("linker:ok");
 
     emit_stage_marker("store:new");
@@ -171,7 +173,7 @@ fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), Debugge
     let instance_registry = cpu.instance_registry();
     let instance =
         instance_registry.register("debugger", debug_state.uptime_nanos(cpu.now().ticks()));
-    let mut store = Store::new(
+    let mut store = store_with_state(
         &engine,
         StoreData {
             table: ResourceTable::new(),
@@ -188,11 +190,6 @@ fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), Debugge
             captured_stderr: Arc::new(Mutex::new(Vec::new())),
         },
     );
-    store.limiter(|state| state);
-    store.call_hook(|mut caller: StoreContextMut<'_, StoreData>, hook| {
-        caller.data_mut().record_call_hook(hook);
-        Ok(())
-    });
     emit_stage_marker("store:ok");
 
     emit_stage_marker("pre:begin");
@@ -251,6 +248,33 @@ pub(crate) fn build_engine() -> wasmtime::Result<Engine> {
     config.wasm_component_model(true);
     config.wasm_component_model_async(true);
     Engine::new(&config)
+}
+
+pub(crate) fn component_linker(
+    engine: &Engine,
+    world: SystemWorld,
+) -> wasmtime::Result<Linker<StoreData>> {
+    let mut linker = Linker::<StoreData>::new(engine);
+    wasmtime_wasi_io::add_to_linker_async(&mut linker)?;
+    crate::debugger_wasi_p2::add_to_linker(&mut linker)?;
+    crate::debugger_wasi::add_to_linker(&mut linker)?;
+    add_serial_to_linker(&mut linker)?;
+    add_sync_to_linker(&mut linker)?;
+    match world {
+        SystemWorld::Debugger => add_system_to_linker(&mut linker)?,
+        SystemWorld::Program => add_program_world_to_linker(&mut linker)?,
+    }
+    Ok(linker)
+}
+
+pub(crate) fn store_with_state(engine: &Engine, state: StoreData) -> Store<StoreData> {
+    let mut store = Store::new(engine, state);
+    store.limiter(|state| state);
+    store.call_hook(|mut caller: StoreContextMut<'_, StoreData>, hook| {
+        caller.data_mut().record_call_hook(hook);
+        Ok(())
+    });
+    store
 }
 
 fn add_system_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
@@ -1175,7 +1199,6 @@ impl IoView for StoreData {
         &mut self.table
     }
 }
-
 
 #[derive(Clone, Copy)]
 pub(crate) enum OutputStreamKind {

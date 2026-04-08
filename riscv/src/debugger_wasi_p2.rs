@@ -695,16 +695,8 @@ impl filesystem_bindings::filesystem::types::HostDescriptor for StoreData {
         a: Resource<FsDescriptor>,
         b: Resource<FsDescriptor>,
     ) -> Result<bool> {
-        let left = self
-            .table
-            .get(&a)
-            .map_err(wasmtime::Error::from)?
-            .clone();
-        let right = self
-            .table
-            .get(&b)
-            .map_err(wasmtime::Error::from)?
-            .clone();
+        let left = self.table.get(&a).map_err(wasmtime::Error::from)?.clone();
+        let right = self.table.get(&b).map_err(wasmtime::Error::from)?.clone();
         Ok(left.path == right.path && left.kind == right.kind)
     }
 
@@ -934,7 +926,9 @@ fn directory_entry_from_p3(entry: p3fs::DirectoryEntry) -> p2fs::DirectoryEntry 
     }
 }
 
-fn datetime_from_p3(instant: debugger_wasi::bindings::clocks::system_clock::Instant) -> p2fs::Datetime {
+fn datetime_from_p3(
+    instant: debugger_wasi::bindings::clocks::system_clock::Instant,
+) -> p2fs::Datetime {
     p2fs::Datetime {
         seconds: instant
             .seconds

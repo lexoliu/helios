@@ -79,16 +79,14 @@ macro_rules! impl_program_bindings {
                 let Some(program_service) = self.program_service.as_ref() else {
                     return Ok(Err($convert_error(ProgramExecError {
                         kind: ProgramExecErrorKind::Unavailable,
-                        detail: "program exec is unavailable in this component context"
-                            .to_owned(),
+                        detail: "program exec is unavailable in this component context".to_owned(),
                     })));
                 };
                 let _ = (&program_service, request);
                 Ok(Err($convert_error(ProgramExecError {
                     kind: ProgramExecErrorKind::Unavailable,
-                    detail:
-                        "hosted programs.exec has not been upgraded to synchronous exec-result"
-                            .to_owned(),
+                    detail: "hosted programs.exec has not been upgraded to synchronous exec-result"
+                        .to_owned(),
                 })))
             }
         }

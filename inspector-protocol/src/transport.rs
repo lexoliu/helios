@@ -452,9 +452,7 @@ where
                     let inner = inner.upgrade().ok_or_else(|| {
                         io::Error::new(io::ErrorKind::BrokenPipe, "server transport disappeared")
                     })?;
-                    pump_server_once(inner)
-                        .await
-                        .map_err(io::Error::other)?;
+                    pump_server_once(inner).await.map_err(io::Error::other)?;
                 }
             }
         }
@@ -1317,7 +1315,9 @@ mod tests {
                         .next()
                         .await
                         .unwrap_or_else(|| panic!("fail invocation stream ended early"))
-                        .unwrap_or_else(|error| panic!("failed to accept fail invocation: {error}"));
+                        .unwrap_or_else(|error| {
+                            panic!("failed to accept fail invocation: {error}")
+                        });
                     let mut request = Vec::new();
                     incoming
                         .read_to_end(&mut request)
@@ -1636,10 +1636,16 @@ mod tests {
                             panic!("failed to accept large-response invocation: {error}")
                         });
                     let mut request = Vec::new();
-                    incoming.read_to_end(&mut request).await.unwrap_or_else(|error| {
-                        panic!("failed to read large-response request: {error}")
-                    });
-                    assert!(request.is_empty(), "unexpected request payload: {request:?}");
+                    incoming
+                        .read_to_end(&mut request)
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!("failed to read large-response request: {error}")
+                        });
+                    assert!(
+                        request.is_empty(),
+                        "unexpected request payload: {request:?}"
+                    );
                     outgoing
                         .write_all(&expected_response)
                         .await

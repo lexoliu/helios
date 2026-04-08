@@ -203,7 +203,10 @@ impl RuntimeState {
 
     pub(crate) fn install_host_fs_service(&self, service: crate::host_fs::HostFileSystemService) {
         let mut slot = self.inner.host_fs_service.lock();
-        assert!(slot.is_none(), "host-fs service was installed more than once");
+        assert!(
+            slot.is_none(),
+            "host-fs service was installed more than once"
+        );
         *slot = Some(service);
     }
 

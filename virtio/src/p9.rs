@@ -36,8 +36,7 @@ impl<T: VirtioTransport> Virtio9pDevice<T> {
 
         let offered = transport.device_features();
         let accepted = offered
-            & (VirtioFeatures::VERSION_1.bits()
-                | VirtioFeatures::RING_INDIRECT_DESC.bits());
+            & (VirtioFeatures::VERSION_1.bits() | VirtioFeatures::RING_INDIRECT_DESC.bits());
         if accepted & VirtioFeatures::VERSION_1.bits() == 0 {
             return Err(IoError::Unsupported);
         }
@@ -130,7 +129,6 @@ fn read_mount_tag<T: VirtioTransport>(transport: &T) -> IoResult<String> {
         *byte = transport.read_config_u8(2 + index);
     }
 
-    String::from_utf8(bytes).map_err(|_| {
-        IoError::InvalidDeviceConfig("virtio-9p mount tag was not valid utf-8")
-    })
+    String::from_utf8(bytes)
+        .map_err(|_| IoError::InvalidDeviceConfig("virtio-9p mount tag was not valid utf-8"))
 }

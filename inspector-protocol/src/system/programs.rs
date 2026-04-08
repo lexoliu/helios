@@ -15,8 +15,8 @@ where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
-    let bytes = postcard::to_allocvec(request)
-        .context("failed to encode remote programs.exec request")?;
+    let bytes =
+        postcard::to_allocvec(request).context("failed to encode remote programs.exec request")?;
     let bytes = client
         .invoke_raw_streaming("helios:system/programs@0.1.0", "exec", bytes)
         .await
