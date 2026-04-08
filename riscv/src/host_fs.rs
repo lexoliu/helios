@@ -19,12 +19,6 @@ use thiserror::Error;
 use crate::RiscvCpu;
 use crate::net::{InterruptSourceId, PlicContext};
 
-const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976;
-const VIRTIO_MMIO_MODERN_VERSION: u32 = 2;
-const VIRTIO_MMIO_9P_DEVICE_ID: u32 = 9;
-const VIRTIO_MMIO_MAGIC_OFFSET: usize = 0x000;
-const VIRTIO_MMIO_VERSION_OFFSET: usize = 0x004;
-const VIRTIO_MMIO_DEVICE_ID_OFFSET: usize = 0x008;
 const DEFAULT_MSIZE: u32 = (128 * 1024) + 24;
 const P9_NOTAG: u16 = u16::MAX;
 const P9_NOFID: u32 = u32::MAX;
@@ -51,6 +45,8 @@ const P9_DOTL_AT_REMOVEDIR: u32 = 0x200;
 const P9_STATS_BASIC: u64 = 0x0000_07ff;
 const P9_QTDIR: u8 = 0x80;
 const P9_WRITE_CHUNK: usize = (DEFAULT_MSIZE as usize) - 24;
+
+pub(crate) const HOST_MOUNT_PATH: &str = "/host";
 
 #[derive(Clone)]
 pub(crate) struct HostFileSystemService {
@@ -633,6 +629,15 @@ impl HostFileSystemService {
     }
 }
 
+pub(crate) fn guest_path_to_host(path: &str) -> Option<&str> {
+    if path == HOST_MOUNT_PATH {
+        return Some("/");
+    }
+
+    path.strip_prefix("/host/")
+        .map(|suffix| if suffix.is_empty() { "/" } else { suffix })
+}
+
 fn split_path(path: &str) -> Vec<&str> {
     path.split('/')
         .filter(|segment| !segment.is_empty())
@@ -748,15 +753,5 @@ fn discover_9p_device(
 }
 
 fn is_9p_mmio_device(base: usize) -> bool {
-    let magic = unsafe { read_u32(base + VIRTIO_MMIO_MAGIC_OFFSET) };
-    let version = unsafe { read_u32(base + VIRTIO_MMIO_VERSION_OFFSET) };
-    let device_id = unsafe { read_u32(base + VIRTIO_MMIO_DEVICE_ID_OFFSET) };
-    let matches = magic == VIRTIO_MMIO_MAGIC
-        && version == VIRTIO_MMIO_MODERN_VERSION
-        && device_id == VIRTIO_MMIO_9P_DEVICE_ID;
-    matches
-}
-
-unsafe fn read_u32(addr: usize) -> u32 {
-    unsafe { (addr as *const u32).read_volatile() }
+    crate::virtio_mmio::matches_device(base, helios_virtio::DeviceType::_9P)
 }

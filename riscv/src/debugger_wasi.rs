@@ -422,12 +422,7 @@ impl DebugFileSystem {
     }
 
     fn host_path<'a>(&self, path: &'a str) -> Option<&'a str> {
-        if path == "/host" {
-            return Some("/");
-        }
-
-        path.strip_prefix("/host/")
-            .map(|suffix| if suffix.is_empty() { "/" } else { suffix })
+        crate::host_fs::guest_path_to_host(path)
     }
 
     fn host_service(

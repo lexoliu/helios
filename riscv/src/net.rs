@@ -31,12 +31,6 @@ use smoltcp::wire::{
 use crate::RiscvCpu;
 use crate::debug_state::RuntimeState;
 
-const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976;
-const VIRTIO_MMIO_MODERN_VERSION: u32 = 2;
-const VIRTIO_MMIO_NETWORK_DEVICE_ID: u32 = 1;
-const VIRTIO_MMIO_MAGIC_OFFSET: usize = 0x000;
-const VIRTIO_MMIO_VERSION_OFFSET: usize = 0x004;
-const VIRTIO_MMIO_DEVICE_ID_OFFSET: usize = 0x008;
 const SUPERVISOR_EXTERNAL_INTERRUPT: u32 = 9;
 const DHCP_PARAMETERS: &[u8] = &[1, 3, 6];
 const ICMP_IDENTIFIER: u16 = 0x4845;
@@ -1561,15 +1555,7 @@ fn node_phandle(node: FdtNode<'_, '_>) -> Option<u32> {
 }
 
 fn is_network_mmio_device(base: usize) -> bool {
-    unsafe {
-        read_u32(base + VIRTIO_MMIO_MAGIC_OFFSET) == VIRTIO_MMIO_MAGIC
-            && read_u32(base + VIRTIO_MMIO_VERSION_OFFSET) == VIRTIO_MMIO_MODERN_VERSION
-            && read_u32(base + VIRTIO_MMIO_DEVICE_ID_OFFSET) == VIRTIO_MMIO_NETWORK_DEVICE_ID
-    }
-}
-
-unsafe fn read_u32(addr: usize) -> u32 {
-    unsafe { (addr as *const u32).read_volatile() }
+    crate::virtio_mmio::matches_device(base, helios_virtio::DeviceType::Network)
 }
 
 fn smol_now(nanos: u64) -> SmolInstant {
