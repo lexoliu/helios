@@ -10,6 +10,7 @@ mod debugger_bindings;
 mod debugger_program;
 mod debugger_wasi;
 mod debugger_wasi_p2;
+mod host_fs;
 mod net;
 mod program_bindings;
 mod program_host;
@@ -367,7 +368,24 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         cpu.clone(),
     ));
     let external_interrupts = if current_hart == bootstrap_processor {
-        net::install_network_service(&cpu, &kernel, &fdt, &debug_state)
+        let mut interrupts = net::install_network_service(&cpu, &kernel, &fdt, &debug_state);
+        if let Some(host_fs) = host_fs::install(&cpu, &kernel, &fdt, &debug_state) {
+            host_fs.plic.set_priority(host_fs.interrupt.source, 1);
+            host_fs.plic.enable(host_fs.interrupt.source, host_fs.context);
+            host_fs.plic.set_threshold(host_fs.context, 0);
+            match interrupts.as_mut() {
+                Some(interrupts_ref) => interrupts_ref.attach_host_fs(host_fs.interrupt),
+                None => {
+                    interrupts = Some(net::ExternalInterrupts::host_fs_only(
+                        host_fs.plic,
+                        host_fs.context,
+                        host_fs.interrupt,
+                    ));
+                }
+            }
+            tracing::info!("virtio 9p online mount_tag=hostshare");
+        }
+        interrupts
     } else {
         None
     };

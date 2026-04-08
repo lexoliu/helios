@@ -25,6 +25,7 @@ struct RuntimeStateInner {
     program_service: Mutex<Option<crate::program_host::UserProgramService>>,
     program_service_ready: Notify,
     network_service: Mutex<Option<crate::net::NetworkService>>,
+    host_fs_service: Mutex<Option<crate::host_fs::HostFileSystemService>>,
     tracing: Mutex<TraceHistory>,
 }
 
@@ -91,6 +92,7 @@ impl RuntimeState {
                 program_service: Mutex::new(None),
                 program_service_ready: Notify::new(),
                 network_service: Mutex::new(None),
+                host_fs_service: Mutex::new(None),
                 tracing: Mutex::new(TraceHistory {
                     next_seq: 1,
                     events: VecDeque::with_capacity(HISTORY_CAPACITY),
@@ -197,6 +199,16 @@ impl RuntimeState {
 
     pub(crate) fn network_service(&self) -> Option<crate::net::NetworkService> {
         self.inner.network_service.lock().clone()
+    }
+
+    pub(crate) fn install_host_fs_service(&self, service: crate::host_fs::HostFileSystemService) {
+        let mut slot = self.inner.host_fs_service.lock();
+        assert!(slot.is_none(), "host-fs service was installed more than once");
+        *slot = Some(service);
+    }
+
+    pub(crate) fn host_fs_service(&self) -> Option<crate::host_fs::HostFileSystemService> {
+        self.inner.host_fs_service.lock().clone()
     }
 }
 

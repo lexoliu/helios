@@ -7,11 +7,13 @@ use crate::block::{VirtioBlockDevice, VirtioBlockResource};
 use crate::bus::{IdentityDmaPool, MmioBus};
 use crate::console::VirtioConsoleDevice;
 use crate::net::VirtioNetDevice;
+use crate::p9::Virtio9pDevice;
 use crate::transport::VirtioMmioTransport;
 
 pub type VirtioMmioBlockDevice = VirtioBlockResource<VirtioMmioTransport<MmioBus>>;
 pub type VirtioMmioConsoleDevice = VirtioConsoleDevice<VirtioMmioTransport<MmioBus>>;
 pub type VirtioMmioNetDevice = VirtioNetDevice<VirtioMmioTransport<MmioBus>>;
+pub type VirtioMmio9pDevice = Virtio9pDevice<VirtioMmioTransport<MmioBus>>;
 
 /// Builds a VirtIO block resource from a permanently mapped MMIO header.
 ///
@@ -65,4 +67,17 @@ pub unsafe fn net_from_mmio(
     let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     VirtioNetDevice::new(transport)
+}
+
+/// Builds a VirtIO 9P device from a permanently mapped MMIO header.
+///
+/// # Safety
+///
+/// `header..header+mmio_size` must refer to a valid, permanently mapped VirtIO
+/// MMIO register block for a 9P device, and no other code may violate the
+/// transport's register access invariants while the returned driver is alive.
+pub unsafe fn p9_from_mmio(header: NonNull<u8>, mmio_size: usize) -> IoResult<VirtioMmio9pDevice> {
+    let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
+    let transport = VirtioMmioTransport::new(bus)?;
+    Virtio9pDevice::new(transport)
 }

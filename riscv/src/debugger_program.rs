@@ -5,8 +5,10 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::task::Wake;
 use alloc::vec::Vec;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use helios_hal::cpu::Cpu;
@@ -165,6 +167,7 @@ fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), Debugge
 
     emit_stage_marker("store:new");
     let debug_state = cpu.debug_state();
+    let filesystem = crate::debugger_wasi::DebugFileSystem::new(debug_state.clone());
     let instance_registry = cpu.instance_registry();
     let instance =
         instance_registry.register("debugger", debug_state.uptime_nanos(cpu.now().ticks()));
@@ -177,7 +180,7 @@ fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), Debugge
             instance,
             cpu,
             debug_port: Some(()),
-            filesystem: crate::debugger_wasi::DebugFileSystem::new(),
+            filesystem,
             arguments: Vec::new(),
             environment: Vec::new(),
             output_mode: OutputMode::Serial,
@@ -1960,15 +1963,49 @@ fn log_wasmtime_error_chain(prefix: &str, error: &wasmtime::Error) {
 }
 
 pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
-    let waker = Waker::noop();
-    let mut context = Context::from_waker(waker);
+    let parker = Arc::new(BlockOnParker::new());
+    let waker = Waker::from(parker.clone());
+    let mut context = Context::from_waker(&waker);
     let mut future = Pin::from(Box::new(future));
 
     loop {
+        parker.clear();
         match future.as_mut().poll(&mut context) {
             Poll::Ready(value) => return value,
-            Poll::Pending => core::hint::spin_loop(),
+            Poll::Pending => parker.wait(),
         }
+    }
+}
+
+struct BlockOnParker {
+    notified: AtomicBool,
+}
+
+impl BlockOnParker {
+    const fn new() -> Self {
+        Self {
+            notified: AtomicBool::new(true),
+        }
+    }
+
+    fn clear(&self) {
+        self.notified.store(false, Ordering::Release);
+    }
+
+    fn wait(&self) {
+        while !self.notified.swap(false, Ordering::AcqRel) {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+impl Wake for BlockOnParker {
+    fn wake(self: Arc<Self>) {
+        self.notified.store(true, Ordering::Release);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.notified.store(true, Ordering::Release);
     }
 }
 

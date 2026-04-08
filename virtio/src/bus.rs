@@ -7,6 +7,12 @@ use helios_hal::io::{IoError, IoResult};
 pub trait DeviceBus: Send + Sync + 'static {
     type DmaPool: DmaPool;
 
+    fn read_u8(&self, offset: usize) -> u8 {
+        let word_offset = offset & !0x3;
+        let byte_index = offset & 0x3;
+        self.read_u32(word_offset).to_le_bytes()[byte_index]
+    }
+
     fn read_u32(&self, offset: usize) -> u32;
     fn write_u32(&self, offset: usize, value: u32);
     fn dma(&self) -> &Self::DmaPool;
@@ -69,6 +75,12 @@ impl<P> MmioBus<P> {
 
         unsafe { self.base.as_ptr().add(offset).cast::<u32>() }
     }
+
+    fn checked_byte_ptr(&self, offset: usize) -> *mut u8 {
+        assert!(offset < self.size, "MMIO byte access out of range");
+
+        unsafe { self.base.as_ptr().add(offset) }
+    }
 }
 
 impl DmaPool for IdentityDmaPool {
@@ -105,6 +117,10 @@ impl Drop for IdentityDmaBuffer {
 
 impl<P: DmaPool> DeviceBus for MmioBus<P> {
     type DmaPool = P;
+
+    fn read_u8(&self, offset: usize) -> u8 {
+        unsafe { self.checked_byte_ptr(offset).read_volatile() }
+    }
 
     fn read_u32(&self, offset: usize) -> u32 {
         unsafe { self.checked_ptr(offset).read_volatile() }
