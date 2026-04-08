@@ -1961,11 +1961,11 @@ mod tests {
     #[test]
     fn bootfs_seed_adds_readonly_programs() {
         let mut filesystem = DebugFileSystem::new();
-        let bootfs = EmbeddedBootFs::new(&[EmbeddedBootFile::new("bin/ping", b"ping")]);
+        let bootfs = EmbeddedBootFs::new(&[EmbeddedBootFile::new("bin/tool", b"tool")]);
         filesystem.seed_bootfs(bootfs);
 
         let program = filesystem
-            .get_node("/bin/ping")
+            .get_node("/bin/tool")
             .expect("bootfs program must be present");
         assert_eq!(program.kind, FsNodeKind::File);
         assert!(program.readonly);
@@ -1980,7 +1980,7 @@ mod tests {
     #[test]
     fn readonly_bootfs_file_rejects_writes() {
         let mut filesystem = DebugFileSystem::new();
-        let bootfs = EmbeddedBootFs::new(&[EmbeddedBootFile::new("bin/ping", b"ping")]);
+        let bootfs = EmbeddedBootFs::new(&[EmbeddedBootFile::new("bin/tool", b"tool")]);
         filesystem.seed_bootfs(bootfs);
         let root = filesystem.root_descriptor();
 
@@ -1988,7 +1988,7 @@ mod tests {
             .open_at(
                 &root,
                 bindings::wasi::filesystem::types::PathFlags::empty(),
-                "bin/ping",
+                "bin/tool",
                 bindings::wasi::filesystem::types::OpenFlags::empty(),
                 bindings::wasi::filesystem::types::DescriptorFlags::WRITE,
                 0,
