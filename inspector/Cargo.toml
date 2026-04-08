@@ -11,6 +11,12 @@ async-net = "2.0.0"
 async-signal = "0.2.13"
 clap = { version = "4.5.48", features = ["derive"] }
 crossterm = "0.29.0"
+console = "0.16.1"
+directories = "6.0.0"
+indicatif = "0.18.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tempfile = "3.23.0"
 futures-io = "0.3.31"
 futures-lite = "2.6.1"
 helios-inspector-protocol.workspace = true
