@@ -8,7 +8,9 @@ fn main() {
     helios_hosted::main();
 }
 
-// otherwise, the entry point is defined in the hal and riscv crates, so we don't need to define it here
+// otherwise, the entry point is defined by the active bare-metal platform crate.
 
 #[cfg(target_arch = "riscv64")]
 use helios_riscv as _;
+#[cfg(target_arch = "x86_64")]
+use helios_x86 as _;
