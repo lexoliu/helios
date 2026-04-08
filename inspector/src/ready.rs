@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use helios_shell_protocol::system::stats;
+use helios_inspector_protocol::system::stats;
 
 use crate::remote;
 use crate::runtime;
@@ -18,7 +18,7 @@ pub(crate) async fn connect_after_boot(io: SerialIo) -> Result<RpcClient> {
         .await
         .context("timed out waiting for the embedded debugger cold-start markers")??;
 
-    let mut client = helios_shell_protocol::transport::Client::new(read, write);
+    let mut client = helios_inspector_protocol::transport::Client::new(read, write);
     wait_until_ready(&mut client).await?;
     Ok(client)
 }

@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "api", "api-macro", "hal", "hosted", "kernel", "kernel-macro", "programs/curl", "programs/debugger", "programs/init", "programs/ping", "programs/sh", "riscv", "shell", "shell-core", "shell-protocol", "virtio",
+    "api", "api-macro", "hal", "hosted", "kernel", "kernel-macro", "programs/curl", "programs/debugger", "programs/init", "programs/ping", "programs/sh", "riscv", "inspector", "inspector-protocol", "virtio",
 ]
 resolver = "2"
 
@@ -15,7 +15,7 @@ helios-hal = { path = "hal" }
 helios-api = { path = "api" }
 helios-hosted = { path = "hosted" }
 helios-kernel-macro = { path = "kernel-macro" }
-helios-shell-protocol = { path = "shell-protocol" }
+helios-inspector-protocol = { path = "inspector-protocol" }
 helios-riscv = { path = "riscv" }
 helios-kernel = { path = "kernel" }
 helios = { path = "." }
@@ -30,7 +30,7 @@ helios-hosted.workspace = true
 helios-riscv.workspace = true
 
 [dev-dependencies]
-helios-shell-protocol.workspace = true
+helios-inspector-protocol.workspace = true
 wasmtime = { path = "../wasmtime/crates/wasmtime", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
 
 [profile.dev]
@@ -60,7 +60,7 @@ codegen-units = 1
 debug = 0
 opt-level = "z"
 
-[profile.dev.package.helios-shell-protocol]
+[profile.dev.package.helios-inspector-protocol]
 debug = 0
 opt-level = "z"
 

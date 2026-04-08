@@ -1,3 +1,5 @@
+mod script;
+
 use std::env;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -6,8 +8,7 @@ use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
 use helios_api::fs as helios_fs;
 use helios_api::programs::{self, ExecErrorKind, ExecRequest};
-use shell_core::programs::{candidate_program_paths, infer_program_name};
-use shell_core::{CommandStatus, ParseState, ScriptHost, Statement};
+use script::{CommandStatus, ParseState, ScriptHost, Statement};
 
 const PROGRAM_SEARCH_DIRECTORIES: &[&str] = &["/bin"];
 
@@ -16,7 +17,7 @@ async fn main() -> Result<()> {
     let invocation = Invocation::from_env()?;
     let program = invocation.load_program().await?;
     let mut shell = GuestShell;
-    let status = shell_core::execute_script(&mut shell, &program).await?;
+    let status = script::execute_script(&mut shell, &program).await?;
     if status.is_success() {
         Ok(())
     } else {
@@ -68,7 +69,7 @@ impl Invocation {
             }
             _ => unreachable!("invocation construction must choose exactly one shell source"),
         };
-        match shell_core::parse(&source)? {
+        match script::parse(&source)? {
             ParseState::Complete(program) => Ok(program),
             ParseState::Incomplete => bail!("shell block is incomplete"),
         }
@@ -186,7 +187,15 @@ fn candidate_paths(input: &str) -> Result<Vec<String>> {
     if input.contains('/') || input.starts_with('.') {
         return explicit_candidate_paths(input);
     }
-    Ok(candidate_program_paths(input, PROGRAM_SEARCH_DIRECTORIES))
+
+    let mut candidates = Vec::with_capacity(PROGRAM_SEARCH_DIRECTORIES.len() * 2);
+    for directory in PROGRAM_SEARCH_DIRECTORIES {
+        candidates.push(format!("{directory}/{input}"));
+        if !input.ends_with(".wasm") {
+            candidates.push(format!("{directory}/{input}.wasm"));
+        }
+    }
+    Ok(candidates)
 }
 
 fn explicit_candidate_paths(input: &str) -> Result<Vec<String>> {
@@ -198,6 +207,16 @@ fn explicit_candidate_paths(input: &str) -> Result<Vec<String>> {
     Ok(vec![path.clone(), format!("{path}.wasm")])
 }
 
+fn infer_program_name(path: &Path) -> Result<String> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("program path does not end with a valid utf-8 file name")?;
+    if name.is_empty() {
+        bail!("program path does not name an executable")
+    }
+    Ok(name.strip_suffix(".wasm").unwrap_or(name).to_owned())
+}
 
 fn single_argument<'a>(command: &str, args: &'a [String]) -> Result<&'a str> {
     match args {

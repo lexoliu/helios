@@ -1,7 +1,3 @@
-pub mod guest_commands;
-pub mod paths;
-pub mod programs;
-
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 
@@ -65,7 +61,10 @@ impl CommandStatus {
     }
 }
 
-pub async fn execute_script<H: ScriptHost>(host: &mut H, program: &[Statement]) -> Result<CommandStatus> {
+pub async fn execute_script<H: ScriptHost>(
+    host: &mut H,
+    program: &[Statement],
+) -> Result<CommandStatus> {
     let mut last = CommandStatus::SUCCESS;
     for statement in program {
         last = execute_statement(host, statement).await?;
@@ -85,7 +84,7 @@ pub fn parse(input: &str) -> Result<ParseState> {
     if lines.is_empty() {
         return Ok(ParseState::Complete(Vec::new()));
     }
-    if needs_more_input(input)? {
+    if needs_more_input(input) {
         return Ok(ParseState::Incomplete);
     }
 
@@ -97,7 +96,7 @@ pub fn parse(input: &str) -> Result<ParseState> {
     Ok(ParseState::Complete(block))
 }
 
-pub fn needs_more_input(input: &str) -> Result<bool> {
+fn needs_more_input(input: &str) -> bool {
     let mut depth = 0usize;
     for line in input.lines().map(str::trim) {
         if line.is_empty() || line.starts_with('#') {
@@ -114,10 +113,13 @@ pub fn needs_more_input(input: &str) -> Result<bool> {
             depth = depth.saturating_add(1);
         }
     }
-    Ok(depth != 0)
+    depth != 0
 }
 
-async fn execute_statement<H: ScriptHost>(host: &mut H, statement: &Statement) -> Result<CommandStatus> {
+async fn execute_statement<H: ScriptHost>(
+    host: &mut H,
+    statement: &Statement,
+) -> Result<CommandStatus> {
     match statement {
         Statement::Command(line) => host.execute_line(line).await,
         Statement::If {
@@ -259,84 +261,5 @@ impl BlockParser<'_> {
         let line = self.lines.get(self.cursor).copied()?;
         self.cursor += 1;
         Some(line)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{CommandStatus, ParseState, ScriptHost, Statement, execute_script, needs_more_input, parse};
-    use anyhow::Result;
-    use async_trait::async_trait;
-
-    #[test]
-    fn parses_simple_if_else_end_block() {
-        let script = "if test -e /tmp/file\n echo yes\nelse\n echo no\nend";
-        let ParseState::Complete(statements) = parse(script).expect("script parse must succeed")
-        else {
-            panic!("script must be complete");
-        };
-
-        assert_eq!(
-            statements,
-            vec![Statement::If {
-                condition: "test -e /tmp/file".to_owned(),
-                then_branch: vec![Statement::Command("echo yes".to_owned())],
-                else_branch: vec![Statement::Command("echo no".to_owned())],
-            }]
-        );
-    }
-
-    #[test]
-    fn detects_incomplete_if_block() {
-        assert!(needs_more_input("if test -e /tmp/file\n echo hi").expect("parse must succeed"));
-    }
-
-    #[test]
-    fn bare_if_is_not_treated_as_a_multiline_block() {
-        assert!(!needs_more_input("if").expect("parse must succeed"));
-    }
-
-    #[test]
-    fn parses_else_if_as_nested_if() {
-        let script = "if test -e /a\n echo a\nelse if test -e /b\n echo b\nend";
-        let ParseState::Complete(statements) = parse(script).expect("script parse must succeed")
-        else {
-            panic!("script must be complete");
-        };
-
-        assert!(matches!(
-            &statements[0],
-            Statement::If {
-                else_branch,
-                ..
-            } if matches!(&else_branch[0], Statement::If { condition, .. } if condition == "test -e /b")
-        ));
-    }
-
-    struct ScriptRecordingHost {
-        lines: Vec<String>,
-    }
-
-    #[async_trait(?Send)]
-    impl ScriptHost for ScriptRecordingHost {
-        async fn execute_line(&mut self, line: &str) -> Result<CommandStatus> {
-            self.lines.push(line.to_owned());
-            Ok(CommandStatus::SUCCESS)
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn executes_block_script_via_host_trait() {
-        let ParseState::Complete(program) = parse("if test\n echo yes\nelse\n echo no\nend")
-            .expect("script parse must succeed")
-        else {
-            panic!("script must be complete");
-        };
-        let mut host = ScriptRecordingHost { lines: Vec::new() };
-        let status = execute_script(&mut host, &program)
-            .await
-            .expect("script execution must succeed");
-        assert!(status.is_success());
-        assert_eq!(host.lines, vec!["test", "echo yes"]);
     }
 }

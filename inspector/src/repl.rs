@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use anyhow::{Context as _, Result, bail};
 use clap::{ColorChoice, Parser};
-use helios_shell_protocol::system::programs::{ExecOutput, ExecResult};
+use helios_inspector_protocol::system::programs::{ExecOutput, ExecResult};
 use nu_ansi_term::{Color, Style as AnsiStyle};
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -141,7 +141,7 @@ fn read_program(editor: &SharedEditor) -> Result<Option<String>> {
             input.push('\n');
         }
         input.push_str(&line);
-        if !shell_core::needs_more_input(&input)? {
+        if !needs_more_input(&input) {
             return Ok(Some(input));
         }
         prompt = CONTINUATION_PROMPT;
@@ -387,6 +387,26 @@ fn write_stderr(bytes: &[u8]) -> Result<()> {
     stderr.write_all(bytes)?;
     stderr.flush()?;
     Ok(())
+}
+
+fn needs_more_input(input: &str) -> bool {
+    let mut depth = 0usize;
+    for line in input.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line == "end" {
+            depth = depth.saturating_sub(1);
+            continue;
+        }
+        if line == "else" || line.starts_with("else if ") {
+            continue;
+        }
+        if line.starts_with("if ") {
+            depth = depth.saturating_add(1);
+        }
+    }
+    depth != 0
 }
 
 

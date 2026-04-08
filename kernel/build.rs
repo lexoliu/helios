@@ -19,7 +19,7 @@ fn main() {
     rerun_if_changed_recursive(Path::new("../programs"));
     rerun_if_changed_recursive(Path::new("../api"));
     rerun_if_changed_recursive(Path::new("../api-macro"));
-    rerun_if_changed_recursive(Path::new("../shell-protocol"));
+    rerun_if_changed_recursive(Path::new("../inspector-protocol"));
     rerun_if_changed_recursive(Path::new("../wit"));
 
     let target = env::var("HELIOS_BUILD_TARGET")
