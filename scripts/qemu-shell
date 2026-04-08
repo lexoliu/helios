@@ -13,6 +13,7 @@ usage() {
   printf '%s\n' "  --memory SIZE        Guest RAM size. Default: 512M."
   printf '%s\n' "  --bios VALUE         QEMU -bios argument. Default: default."
   printf '%s\n' "  --baud RATE          Inspector baud rate hint. Default: 115200."
+  printf '%s\n' "  --shared-dir PATH    Share a host directory into the guest at /host via virtio-9p."
   printf '%s\n' "  --help               Show this message."
   printf '%s\n' "Example:"
   printf '%s\n' "  scripts/qemu-shell"
@@ -36,6 +37,7 @@ smp=4
 memory="512M"
 bios="default"
 baud="115200"
+shared_dir=""
 shell_args=()
 
 while (($# > 0)); do
@@ -74,6 +76,10 @@ while (($# > 0)); do
       ;;
     --baud)
       baud="$2"
+      shift 2
+      ;;
+    --shared-dir)
+      shared_dir="$2"
       shift 2
       ;;
     --help)
@@ -176,6 +182,7 @@ fi
 
 "$qemu_bin" \
   -machine virt \
+  -global virtio-mmio.force-legacy=false \
   -display none \
   -monitor none \
   -m "$memory" \
@@ -183,6 +190,8 @@ fi
   -bios "$bios" \
   -netdev user,id=net0 \
   -device virtio-net-device,netdev=net0 \
+  ${shared_dir:+-fsdev local,id=hostfs,path=$shared_dir,security_model=none,multidevs=remap} \
+  ${shared_dir:+-device virtio-9p-device,fsdev=hostfs,mount_tag=hostshare} \
   -kernel "$kernel_image" \
   -serial "unix:$socket_path,server=on,wait=on" \
   >"$qemu_log" 2>&1 &

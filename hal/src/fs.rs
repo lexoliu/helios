@@ -71,6 +71,27 @@ pub enum DirectoryEntry<Directory, File> {
     File(File),
 }
 
+pub trait DirectoryEntryExt<Directory, File> {
+    fn directory(self) -> Option<Directory>;
+    fn file(self) -> Option<File>;
+}
+
+impl<Directory, File> DirectoryEntryExt<Directory, File> for DirectoryEntry<Directory, File> {
+    fn directory(self) -> Option<Directory> {
+        match self {
+            Self::Directory(directory) => Some(directory),
+            Self::File(_) => None,
+        }
+    }
+
+    fn file(self) -> Option<File> {
+        match self {
+            Self::Directory(_) => None,
+            Self::File(file) => Some(file),
+        }
+    }
+}
+
 pub trait FileSystem: Send + Sync {
     type Directory: Directory;
     type File: File;
@@ -79,11 +100,29 @@ pub trait FileSystem: Send + Sync {
         &self,
         path: &str,
     ) -> impl Future<Output = IoResult<Option<DirectoryEntry<Self::Directory, Self::File>>>> + Send;
+
+    fn create_directory(
+        &self,
+        path: &str,
+    ) -> impl Future<Output = IoResult<Self::Directory>> + Send;
+
+    fn remove(
+        &self,
+        path: &str,
+    ) -> impl Future<Output = IoResult<()>> + Send;
+
+    fn rename(
+        &self,
+        source: &str,
+        destination: &str,
+    ) -> impl Future<Output = IoResult<()>> + Send;
 }
 
 pub trait File: Send {
     fn read(&mut self, buf: &mut [u8]) -> impl Future<Output = IoResult<usize>> + Send;
     fn write(&mut self, buf: &[u8]) -> impl Future<Output = IoResult<usize>> + Send;
+
+    fn truncate(&mut self) -> impl Future<Output = IoResult<()>> + Send;
 }
 
 pub trait Directory: Send {
@@ -92,6 +131,29 @@ pub trait Directory: Send {
     fn list(&self) -> impl Future<Output = IoResult<Vec<DirectoryEntry<Self, Self::File>>>> + Send
     where
         Self: Sized;
+
+    fn create_directory(
+        &self,
+        path: &str,
+    ) -> impl Future<Output = IoResult<Self>> + Send
+    where
+        Self: Sized;
+
+    fn open_file(
+        &self,
+        path: &str,
+    ) -> impl Future<Output = IoResult<Option<Self::File>>> + Send;
+
+    fn remove(
+        &self,
+        path: &str,
+    ) -> impl Future<Output = IoResult<()>> + Send;
+
+    fn rename(
+        &self,
+        source: &str,
+        destination: &str,
+    ) -> impl Future<Output = IoResult<()>> + Send;
 }
 
 pub trait BlockDevice: Send + Sync {

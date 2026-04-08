@@ -379,6 +379,7 @@ fn run_component(
         output_mode,
         completion: _,
     } = queued;
+    let filesystem = crate::debugger_wasi::DebugFileSystem::new(debug_state.clone());
     let mut argv = Vec::with_capacity(args.len() + 1);
     argv.push(name);
     argv.extend(args);
@@ -401,7 +402,7 @@ fn run_component(
             instance_registry,
             instance,
             debug_port: None,
-            filesystem: crate::debugger_wasi::DebugFileSystem::new(),
+            filesystem,
             arguments: argv,
             environment: Vec::new(),
             output_mode,

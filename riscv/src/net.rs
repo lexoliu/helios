@@ -65,7 +65,8 @@ struct NetworkServiceInner {
 pub(crate) struct ExternalInterrupts {
     plic: &'static Plic,
     context: PlicContext,
-    network: NetworkInterrupt,
+    network: Option<NetworkInterrupt>,
+    host_fs: Option<crate::host_fs::HostFsInterrupt>,
 }
 
 struct NetworkInterrupt {
@@ -201,10 +202,10 @@ struct QueueTxToken<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct PlicContext(usize);
+pub(crate) struct PlicContext(pub(crate) usize);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct InterruptSourceId(NonZeroU32);
+pub(crate) struct InterruptSourceId(pub(crate) NonZeroU32);
 
 struct NetworkProbe {
     device: Arc<helios_virtio::VirtioMmioNetDevice>,
@@ -251,11 +252,32 @@ pub(crate) fn install_network_service(
     Some(ExternalInterrupts {
         plic: probe.plic,
         context: probe.context,
-        network: NetworkInterrupt {
+        network: Some(NetworkInterrupt {
             source: probe.irq_source,
             service,
-        },
+        }),
+        host_fs: None,
     })
+}
+
+impl ExternalInterrupts {
+    pub(crate) fn host_fs_only(
+        plic: &'static Plic,
+        context: PlicContext,
+        interrupt: crate::host_fs::HostFsInterrupt,
+    ) -> Self {
+        Self {
+            plic,
+            context,
+            network: None,
+            host_fs: Some(interrupt),
+        }
+    }
+
+    pub(crate) fn attach_host_fs(&mut self, interrupt: crate::host_fs::HostFsInterrupt) {
+        assert!(self.host_fs.is_none(), "host-fs interrupt was installed more than once");
+        self.host_fs = Some(interrupt);
+    }
 }
 
 impl NetworkService {
@@ -770,8 +792,26 @@ impl ExternalInterrupts {
     pub(crate) fn handle(&self) {
         while let Some(source) = self.plic.claim(self.context) {
             let source = InterruptSourceId(source);
-            if source == self.network.source {
-                self.network.service.handle_interrupt();
+            if self
+                .network
+                .as_ref()
+                .is_some_and(|network| source == network.source)
+            {
+                self.network
+                    .as_ref()
+                    .expect("network interrupt disappeared unexpectedly")
+                    .service
+                    .handle_interrupt();
+                self.plic.complete(self.context, source);
+                continue;
+            }
+
+            if self.host_fs.as_ref().is_some_and(|host_fs| source == host_fs.source) {
+                self.host_fs
+                    .as_ref()
+                    .expect("host-fs interrupt disappeared unexpectedly")
+                    .service
+                    .handle_interrupt();
                 self.plic.complete(self.context, source);
                 continue;
             }
@@ -788,10 +828,19 @@ impl ExternalInterrupts {
 impl PingError {
     fn from_io(error: IoError, context: &str) -> Self {
         let kind = match error {
+            IoError::NotFound
+            | IoError::AlreadyExists
+            | IoError::NotDirectory
+            | IoError::IsDirectory
+            | IoError::DirectoryNotEmpty
+            |
             IoError::Unsupported | IoError::PermissionDenied | IoError::ReadOnly => {
                 PingErrorKind::Unavailable
             }
-            IoError::InvalidBufferLength { .. } | IoError::OutOfBounds | IoError::DeviceFault => {
+            IoError::InvalidBufferLength { .. }
+            | IoError::OutOfBounds
+            | IoError::InvalidDeviceConfig(_)
+            | IoError::DeviceFault => {
                 PingErrorKind::Internal
             }
         };
@@ -805,10 +854,19 @@ impl PingError {
 impl TcpError {
     fn from_io(error: IoError, context: &str) -> Self {
         let kind = match error {
+            IoError::NotFound
+            | IoError::AlreadyExists
+            | IoError::NotDirectory
+            | IoError::IsDirectory
+            | IoError::DirectoryNotEmpty
+            |
             IoError::Unsupported | IoError::PermissionDenied | IoError::ReadOnly => {
                 TcpErrorKind::Unavailable
             }
-            IoError::InvalidBufferLength { .. } | IoError::OutOfBounds | IoError::DeviceFault => {
+            IoError::InvalidBufferLength { .. }
+            | IoError::OutOfBounds
+            | IoError::InvalidDeviceConfig(_)
+            | IoError::DeviceFault => {
                 TcpErrorKind::Internal
             }
         };
@@ -1398,7 +1456,9 @@ fn discover_network_device(
             continue;
         }
 
-        let region = node.reg()?.next()?;
+        let Some(region) = node.reg().and_then(|mut regs| regs.next()) else {
+            continue;
+        };
         let base = region.starting_address as usize;
         if !is_network_mmio_device(base) {
             continue;
@@ -1408,8 +1468,8 @@ fn discover_network_device(
             .unwrap_or_else(|| panic!("virtio MMIO base {base:#x} was unexpectedly null"));
         let mmio_size = region.size.unwrap();
         let irq_source = node
-            .interrupts()?
-            .next()
+            .interrupts()
+            .and_then(|mut interrupts| interrupts.next())
             .and_then(|irq| NonZeroU32::new(irq as u32))
             .map(InterruptSourceId)
             .unwrap_or_else(|| {
@@ -1425,7 +1485,10 @@ fn discover_network_device(
     None
 }
 
-fn discover_plic_context(fdt: &Fdt<'_>, hart_id: u16) -> Option<(&'static Plic, PlicContext)> {
+pub(crate) fn discover_plic_context(
+    fdt: &Fdt<'_>,
+    hart_id: u16,
+) -> Option<(&'static Plic, PlicContext)> {
     let node = fdt.find_compatible(&["sifive,plic-1.0.0", "riscv,plic0"])?;
     let base = node.reg()?.next()?.starting_address as usize;
     let plic = unsafe { Plic::from_addr(base) };

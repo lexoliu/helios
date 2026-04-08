@@ -268,6 +268,25 @@ impl FileSystem for EmbeddedBootFs {
             Ok(image.file(&path).map(DirectoryEntry::File))
         }
     }
+
+    fn create_directory(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = IoResult<Self::Directory>> + Send {
+        async move { Err(IoError::ReadOnly) }
+    }
+
+    fn remove(&self, _path: &str) -> impl core::future::Future<Output = IoResult<()>> + Send {
+        async move { Err(IoError::ReadOnly) }
+    }
+
+    fn rename(
+        &self,
+        _source: &str,
+        _destination: &str,
+    ) -> impl core::future::Future<Output = IoResult<()>> + Send {
+        async move { Err(IoError::ReadOnly) }
+    }
 }
 
 impl Directory for BootDirectory {
@@ -329,6 +348,38 @@ impl Directory for BootDirectory {
             Ok(entries)
         }
     }
+
+    fn create_directory(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = IoResult<Self>> + Send
+    where
+        Self: Sized,
+    {
+        async move { Err(IoError::ReadOnly) }
+    }
+
+    fn open_file(
+        &self,
+        path: &str,
+    ) -> impl core::future::Future<Output = IoResult<Option<Self::File>>> + Send {
+        let directory = self.clone();
+        let path = path.to_owned();
+
+        async move { Ok(directory.image.file(&directory.resolve_path(&path))) }
+    }
+
+    fn remove(&self, _path: &str) -> impl core::future::Future<Output = IoResult<()>> + Send {
+        async move { Err(IoError::ReadOnly) }
+    }
+
+    fn rename(
+        &self,
+        _source: &str,
+        _destination: &str,
+    ) -> impl core::future::Future<Output = IoResult<()>> + Send {
+        async move { Err(IoError::ReadOnly) }
+    }
 }
 
 impl File for BootFile {
@@ -345,6 +396,10 @@ impl File for BootFile {
     }
 
     async fn write(&mut self, _buf: &[u8]) -> IoResult<usize> {
+        Err(IoError::ReadOnly)
+    }
+
+    async fn truncate(&mut self) -> IoResult<()> {
         Err(IoError::ReadOnly)
     }
 }

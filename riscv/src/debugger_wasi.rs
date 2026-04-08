@@ -10,6 +10,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use futures::channel::oneshot;
+use helios_hal::io::IoError;
 use helios_kernel::{EmbeddedBootFile, EmbeddedBootFs, embedded_init};
 use wasmtime::Result;
 use wasmtime::component::{
@@ -164,10 +165,10 @@ impl<T> core::fmt::Display for TrappableError<T> {
 
 impl<T> core::error::Error for TrappableError<T> {}
 
-#[derive(Default)]
 pub(crate) struct DebugFileSystem {
     nodes: Vec<FsNode>,
     next_inode: u64,
+    debug_state: crate::debug_state::RuntimeState,
 }
 
 struct SerialStreamConsumer<T> {
@@ -327,7 +328,7 @@ impl<T: 'static> StreamConsumer<T> for FileWriteConsumer<T> {
 }
 
 impl DebugFileSystem {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(debug_state: crate::debug_state::RuntimeState) -> Self {
         let mut filesystem = Self {
             nodes: vec![FsNode {
                 path: String::from("/"),
@@ -338,6 +339,7 @@ impl DebugFileSystem {
                 readonly: false,
             }],
             next_inode: 2,
+            debug_state,
         };
 
         if let Some(init) = embedded_init() {
@@ -419,6 +421,28 @@ impl DebugFileSystem {
         inode
     }
 
+    fn host_path<'a>(&self, path: &'a str) -> Option<&'a str> {
+        if path == "/host" {
+            return Some("/");
+        }
+
+        path.strip_prefix("/host/").map(|suffix| {
+            if suffix.is_empty() {
+                "/"
+            } else {
+                suffix
+            }
+        })
+    }
+
+    fn host_service(
+        &self,
+    ) -> core::result::Result<crate::host_fs::HostFileSystemService, fs_types::ErrorCode> {
+        self.debug_state
+            .host_fs_service()
+            .ok_or(fs_types::ErrorCode::NoEntry)
+    }
+
     pub(crate) fn root_descriptor(&self) -> FsDescriptor {
         FsDescriptor {
             path: String::from("/"),
@@ -450,6 +474,27 @@ impl DebugFileSystem {
         &self,
         path: &str,
     ) -> core::result::Result<fs_types::DescriptorStat, fs_types::ErrorCode> {
+        if let Some(host_path) = self.host_path(path) {
+            let metadata = crate::debugger_program::block_on(async {
+                self.host_service()?
+                    .stat_path(host_path)
+                    .await
+                    .map_err(map_host_fs_error)
+            })?;
+            return Ok(fs_types::DescriptorStat {
+                type_: if metadata.qid_type & 0x80 != 0 {
+                    fs_types::DescriptorType::Directory
+                } else {
+                    fs_types::DescriptorType::RegularFile
+                },
+                link_count: 1,
+                size: metadata.size,
+                data_access_timestamp: None,
+                data_modification_timestamp: None,
+                status_change_timestamp: None,
+            });
+        }
+
         let node = self.get_node(path)?;
         let size = match node.kind {
             FsNodeKind::Directory => 0,
@@ -473,6 +518,19 @@ impl DebugFileSystem {
         &self,
         path: &str,
     ) -> core::result::Result<fs_types::MetadataHashValue, fs_types::ErrorCode> {
+        if let Some(host_path) = self.host_path(path) {
+            let metadata = crate::debugger_program::block_on(async {
+                self.host_service()?
+                    .stat_path(host_path)
+                    .await
+                    .map_err(map_host_fs_error)
+            })?;
+            return Ok(fs_types::MetadataHashValue {
+                lower: metadata.qid_path,
+                upper: u64::from(metadata.mode) << 32 ^ metadata.size,
+            });
+        }
+
         let node = self.get_node(path)?;
         let size = match node.kind {
             FsNodeKind::Directory => 0,
@@ -488,6 +546,26 @@ impl DebugFileSystem {
         &self,
         path: &str,
     ) -> core::result::Result<Vec<fs_types::DirectoryEntry>, fs_types::ErrorCode> {
+        if let Some(host_path) = self.host_path(path) {
+            let entries = crate::debugger_program::block_on(async {
+                self.host_service()?
+                    .read_dir(host_path)
+                    .await
+                    .map_err(map_host_fs_error)
+            })?;
+            return Ok(entries
+                .into_iter()
+                .map(|entry| fs_types::DirectoryEntry {
+                    type_: if entry.is_directory {
+                        fs_types::DescriptorType::Directory
+                    } else {
+                        fs_types::DescriptorType::RegularFile
+                    },
+                    name: entry.name,
+                })
+                .collect());
+        }
+
         let node = self.get_node(path)?;
         if node.kind != FsNodeKind::Directory {
             return Err(fs_types::ErrorCode::NotDirectory);
@@ -527,6 +605,16 @@ impl DebugFileSystem {
             });
         }
 
+        if path == "/" && self.debug_state.host_fs_service().is_some() {
+            let has_host_mount = entries.iter().any(|entry| entry.name == "host");
+            if !has_host_mount {
+                entries.push(fs_types::DirectoryEntry {
+                    type_: fs_types::DescriptorType::Directory,
+                    name: String::from("host"),
+                });
+            }
+        }
+
         entries.sort_by(|left, right| {
             is_dir_first(left.type_.clone())
                 .cmp(&is_dir_first(right.type_.clone()))
@@ -540,6 +628,26 @@ impl DebugFileSystem {
         descriptor: &FsDescriptor,
         offset: u64,
     ) -> core::result::Result<Vec<u8>, fs_types::ErrorCode> {
+        if let Some(host_path) = self.host_path(&descriptor.path) {
+            if !descriptor.flags.contains(fs_types::DescriptorFlags::READ) {
+                return Err(fs_types::ErrorCode::ReadOnly);
+            }
+
+            let bytes = crate::debugger_program::block_on(async {
+                self.host_service()?
+                    .read_file(host_path)
+                    .await
+                    .map_err(map_host_fs_error)
+            })?;
+            let offset: usize = offset
+                .try_into()
+                .map_err(|_| fs_types::ErrorCode::Overflow)?;
+            if offset >= bytes.len() {
+                return Ok(Vec::new());
+            }
+            return Ok(bytes[offset..].to_vec());
+        }
+
         let node = self.get_node(&descriptor.path)?;
         if node.kind != FsNodeKind::File {
             return Err(fs_types::ErrorCode::IsDirectory);
@@ -564,6 +672,23 @@ impl DebugFileSystem {
         bytes: &[u8],
         now_nanos: u64,
     ) -> core::result::Result<(), fs_types::ErrorCode> {
+        if let Some(host_path) = self.host_path(&descriptor.path) {
+            if descriptor.kind != FsNodeKind::File {
+                return Err(fs_types::ErrorCode::IsDirectory);
+            }
+            if !descriptor.flags.contains(fs_types::DescriptorFlags::WRITE) {
+                return Err(fs_types::ErrorCode::ReadOnly);
+            }
+            let offset = u64::try_from(offset).map_err(|_| fs_types::ErrorCode::Overflow)?;
+            let _ = now_nanos;
+            return crate::debugger_program::block_on(async {
+                self.host_service()?
+                    .write_file(host_path, offset, bytes)
+                    .await
+                    .map_err(map_host_fs_error)
+            });
+        }
+
         let node = self.get_node_mut(&descriptor.path)?;
         if node.kind != FsNodeKind::File {
             return Err(fs_types::ErrorCode::IsDirectory);
@@ -595,6 +720,29 @@ impl DebugFileSystem {
         bytes: &[u8],
         now_nanos: u64,
     ) -> core::result::Result<(), fs_types::ErrorCode> {
+        if let Some(host_path) = self.host_path(&descriptor.path) {
+            if descriptor.kind != FsNodeKind::File {
+                return Err(fs_types::ErrorCode::IsDirectory);
+            }
+            if !descriptor.flags.contains(fs_types::DescriptorFlags::WRITE) {
+                return Err(fs_types::ErrorCode::ReadOnly);
+            }
+            let offset = crate::debugger_program::block_on(async {
+                self.host_service()?
+                    .stat_path(host_path)
+                    .await
+                    .map(|metadata| metadata.size)
+                    .map_err(map_host_fs_error)
+            })?;
+            let _ = now_nanos;
+            return crate::debugger_program::block_on(async {
+                self.host_service()?
+                    .write_file(host_path, offset, bytes)
+                    .await
+                    .map_err(map_host_fs_error)
+            });
+        }
+
         let offset = self.get_node(&descriptor.path)?.contents.len();
         self.write_at(descriptor, offset, bytes, now_nanos)
     }
@@ -616,6 +764,88 @@ impl DebugFileSystem {
         }
 
         let absolute = resolve_child_path(&base.path, path)?;
+        if let Some(host_path) = self.host_path(&absolute) {
+            let metadata = crate::debugger_program::block_on(async {
+                self.host_service()?
+                    .stat_path(host_path)
+                    .await
+                    .map_err(map_host_fs_error)
+            });
+
+            return match metadata {
+                Ok(metadata) => {
+                    let kind = if metadata.qid_type & 0x80 != 0 {
+                        FsNodeKind::Directory
+                    } else {
+                        FsNodeKind::File
+                    };
+                    if open_flags.contains(fs_types::OpenFlags::EXCLUSIVE)
+                        && open_flags.contains(fs_types::OpenFlags::CREATE)
+                    {
+                        return Err(fs_types::ErrorCode::Exist);
+                    }
+                    if open_flags.contains(fs_types::OpenFlags::DIRECTORY)
+                        && kind != FsNodeKind::Directory
+                    {
+                        return Err(fs_types::ErrorCode::NotDirectory);
+                    }
+                    if !open_flags.contains(fs_types::OpenFlags::DIRECTORY)
+                        && kind == FsNodeKind::Directory
+                    {
+                        return Err(fs_types::ErrorCode::IsDirectory);
+                    }
+                    if open_flags.contains(fs_types::OpenFlags::TRUNCATE) {
+                        if kind != FsNodeKind::File {
+                            return Err(fs_types::ErrorCode::IsDirectory);
+                        }
+                        if !base
+                            .flags
+                            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
+                        {
+                            return Err(fs_types::ErrorCode::ReadOnly);
+                        }
+                        crate::debugger_program::block_on(async {
+                            self.host_service()?
+                                .truncate_file(host_path)
+                                .await
+                                .map_err(map_host_fs_error)
+                        })?;
+                    }
+                    Ok(FsDescriptor {
+                        path: absolute,
+                        kind,
+                        flags: descriptor_flags,
+                    })
+                }
+                Err(fs_types::ErrorCode::NoEntry) => {
+                    if !open_flags.contains(fs_types::OpenFlags::CREATE) {
+                        return Err(fs_types::ErrorCode::NoEntry);
+                    }
+                    if open_flags.contains(fs_types::OpenFlags::DIRECTORY) {
+                        return Err(fs_types::ErrorCode::Unsupported);
+                    }
+                    if !base
+                        .flags
+                        .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
+                    {
+                        return Err(fs_types::ErrorCode::ReadOnly);
+                    }
+                    crate::debugger_program::block_on(async {
+                        self.host_service()?
+                            .create_file(host_path)
+                            .await
+                            .map_err(map_host_fs_error)
+                    })?;
+                    Ok(FsDescriptor {
+                        path: absolute,
+                        kind: FsNodeKind::File,
+                        flags: descriptor_flags,
+                    })
+                }
+                Err(error) => Err(error),
+            };
+        }
+
         if let Ok(existing) = self.get_node_mut(&absolute) {
             if open_flags.contains(fs_types::OpenFlags::EXCLUSIVE)
                 && open_flags.contains(fs_types::OpenFlags::CREATE)
@@ -706,6 +936,14 @@ impl DebugFileSystem {
             return Err(fs_types::ErrorCode::ReadOnly);
         }
         let absolute = resolve_child_path(&base.path, path)?;
+        if let Some(host_path) = self.host_path(&absolute) {
+            return crate::debugger_program::block_on(async {
+                self.host_service()?
+                    .remove(host_path, true)
+                    .await
+                    .map_err(map_host_fs_error)
+            });
+        }
         if absolute == "/" {
             return Err(fs_types::ErrorCode::NotPermitted);
         }
@@ -743,11 +981,20 @@ impl DebugFileSystem {
         if base.kind != FsNodeKind::Directory {
             return Err(fs_types::ErrorCode::NotDirectory);
         }
+        let absolute = resolve_child_path(&base.path, path)?;
+        if let Some(host_path) = self.host_path(&absolute) {
+            let _ = now_nanos;
+            return crate::debugger_program::block_on(async {
+                self.host_service()?
+                    .create_directory(host_path)
+                    .await
+                    .map_err(map_host_fs_error)
+            });
+        }
         if self.get_node(&base.path)?.readonly {
             return Err(fs_types::ErrorCode::ReadOnly);
         }
 
-        let absolute = resolve_child_path(&base.path, path)?;
         if absolute == "/" {
             return Err(fs_types::ErrorCode::Exist);
         }
@@ -785,6 +1032,14 @@ impl DebugFileSystem {
             return Err(fs_types::ErrorCode::ReadOnly);
         }
         let absolute = resolve_child_path(&base.path, path)?;
+        if let Some(host_path) = self.host_path(&absolute) {
+            return crate::debugger_program::block_on(async {
+                self.host_service()?
+                    .remove(host_path, false)
+                    .await
+                    .map_err(map_host_fs_error)
+            });
+        }
         let node = self.get_node(&absolute)?;
         if node.readonly {
             return Err(fs_types::ErrorCode::ReadOnly);
@@ -817,13 +1072,29 @@ impl DebugFileSystem {
         {
             return Err(fs_types::ErrorCode::ReadOnly);
         }
+        let source_absolute = resolve_child_path(&source_base.path, source_path)?;
+        let destination_absolute = resolve_child_path(&destination_base.path, destination_path)?;
+        let source_host = self.host_path(&source_absolute);
+        let destination_host = self.host_path(&destination_absolute);
+        if source_host.is_some() || destination_host.is_some() {
+            let Some(source_host) = source_host else {
+                return Err(fs_types::ErrorCode::CrossDevice);
+            };
+            let Some(destination_host) = destination_host else {
+                return Err(fs_types::ErrorCode::CrossDevice);
+            };
+            return crate::debugger_program::block_on(async {
+                self.host_service()?
+                    .rename(source_host, destination_host)
+                    .await
+                    .map_err(map_host_fs_error)
+            });
+        }
+
         if self.get_node(&source_base.path)?.readonly || self.get_node(&destination_base.path)?.readonly
         {
             return Err(fs_types::ErrorCode::ReadOnly);
         }
-
-        let source_absolute = resolve_child_path(&source_base.path, source_path)?;
-        let destination_absolute = resolve_child_path(&destination_base.path, destination_path)?;
         if source_absolute == "/" || destination_absolute == "/" {
             return Err(fs_types::ErrorCode::NotPermitted);
         }
@@ -1918,6 +2189,43 @@ fn is_dir_first(kind: fs_types::DescriptorType) -> u8 {
     match kind {
         fs_types::DescriptorType::Directory => 0,
         _ => 1,
+    }
+}
+
+fn map_host_fs_error(error: crate::host_fs::HostFsError) -> fs_types::ErrorCode {
+    match error {
+        crate::host_fs::HostFsError::Transport(IoError::NotFound) => fs_types::ErrorCode::NoEntry,
+        crate::host_fs::HostFsError::Transport(IoError::AlreadyExists) => {
+            fs_types::ErrorCode::Exist
+        }
+        crate::host_fs::HostFsError::Transport(IoError::NotDirectory) => {
+            fs_types::ErrorCode::NotDirectory
+        }
+        crate::host_fs::HostFsError::Transport(IoError::IsDirectory) => {
+            fs_types::ErrorCode::IsDirectory
+        }
+        crate::host_fs::HostFsError::Transport(IoError::DirectoryNotEmpty) => {
+            fs_types::ErrorCode::NotEmpty
+        }
+        crate::host_fs::HostFsError::Transport(IoError::PermissionDenied)
+        | crate::host_fs::HostFsError::Transport(IoError::ReadOnly) => fs_types::ErrorCode::ReadOnly,
+        crate::host_fs::HostFsError::Transport(IoError::Unsupported) => {
+            fs_types::ErrorCode::Unsupported
+        }
+        crate::host_fs::HostFsError::Transport(IoError::InvalidBufferLength { .. })
+        | crate::host_fs::HostFsError::Transport(IoError::InvalidDeviceConfig(_))
+        | crate::host_fs::HostFsError::Transport(IoError::OutOfBounds)
+        | crate::host_fs::HostFsError::Transport(IoError::DeviceFault)
+        | crate::host_fs::HostFsError::Protocol(_)
+        | crate::host_fs::HostFsError::Utf8 => fs_types::ErrorCode::Io,
+        crate::host_fs::HostFsError::Server(code) => match code {
+            2 => fs_types::ErrorCode::NoEntry,
+            17 => fs_types::ErrorCode::Exist,
+            20 => fs_types::ErrorCode::NotDirectory,
+            21 => fs_types::ErrorCode::IsDirectory,
+            39 => fs_types::ErrorCode::NotEmpty,
+            _ => fs_types::ErrorCode::Io,
+        },
     }
 }
 

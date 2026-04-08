@@ -35,6 +35,7 @@ pub enum DeviceType {
     Network = 1,
     Block = 2,
     Console = 3,
+    _9P = 9,
 }
 
 bitflags! {
@@ -79,6 +80,12 @@ pub trait VirtioTransport: Send + Sync + 'static {
     fn notify_queue(&self, index: u16);
     fn ack_interrupt(&self);
     fn read_config_u32(&self, offset: usize) -> u32;
+
+    fn read_config_u8(&self, offset: usize) -> u8 {
+        let word_offset = offset & !0x3;
+        let byte_index = offset & 0x3;
+        self.read_config_u32(word_offset).to_le_bytes()[byte_index]
+    }
 }
 
 pub struct VirtioMmioTransport<B: DeviceBus> {
@@ -100,6 +107,7 @@ impl<B: DeviceBus> VirtioMmioTransport<B> {
             1 => DeviceType::Network,
             2 => DeviceType::Block,
             3 => DeviceType::Console,
+            9 => DeviceType::_9P,
             _ => return Err(IoError::Unsupported),
         };
 
@@ -191,6 +199,10 @@ impl<B: DeviceBus> VirtioTransport for VirtioMmioTransport<B> {
 
     fn read_config_u32(&self, offset: usize) -> u32 {
         self.bus.read_u32(CONFIG_SPACE_OFFSET + offset)
+    }
+
+    fn read_config_u8(&self, offset: usize) -> u8 {
+        self.bus.read_u8(CONFIG_SPACE_OFFSET + offset)
     }
 }
 
