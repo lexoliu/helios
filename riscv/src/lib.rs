@@ -7,7 +7,6 @@ pub mod compute;
 mod debug_transport;
 mod debugger_program;
 mod debugger_wasi;
-mod debugger_wasi_p2;
 mod host_fs;
 mod net;
 mod virtio_mmio;
