@@ -640,7 +640,7 @@ pub(crate) fn component_linker(
 ) -> wasmtime::Result<Linker<StoreData>> {
     let mut linker = Linker::<StoreData>::new(engine);
     wasmtime_wasi_io::add_to_linker_async(&mut linker)?;
-    crate::debugger_wasi_p2::add_to_linker(&mut linker)?;
+    crate::debugger_wasi::p2::add_to_linker(&mut linker)?;
     crate::debugger_wasi::add_to_linker(&mut linker)?;
     add_serial_to_linker(&mut linker)?;
     add_sync_to_linker(&mut linker)?;

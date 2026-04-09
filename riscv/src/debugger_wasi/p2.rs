@@ -43,8 +43,8 @@ pub(crate) mod cli_bindings {
                 "wasi:io/poll.pollable": wasmtime_wasi_io::poll::DynPollable,
                 "wasi:io/streams.input-stream": wasmtime_wasi_io::streams::DynInputStream,
                 "wasi:io/streams.output-stream": wasmtime_wasi_io::streams::DynOutputStream,
-                "wasi:cli/terminal-input.terminal-input": crate::debugger_wasi_p2::TerminalInput,
-                "wasi:cli/terminal-output.terminal-output": crate::debugger_wasi_p2::TerminalOutput,
+                "wasi:cli/terminal-input.terminal-input": crate::debugger_wasi::p2::TerminalInput,
+                "wasi:cli/terminal-output.terminal-output": crate::debugger_wasi::p2::TerminalOutput,
             },
             require_store_data_send: true,
         });
@@ -95,7 +95,7 @@ pub(crate) mod filesystem_bindings {
                 "wasi:io/streams.input-stream": wasmtime_wasi_io::streams::DynInputStream,
                 "wasi:io/streams.output-stream": wasmtime_wasi_io::streams::DynOutputStream,
                 "wasi:filesystem/types.descriptor": crate::debugger_wasi::FsDescriptor,
-                "wasi:filesystem/types.directory-entry-stream": crate::debugger_wasi_p2::DirectoryEntryStream,
+                "wasi:filesystem/types.directory-entry-stream": crate::debugger_wasi::p2::DirectoryEntryStream,
             },
             require_store_data_send: true,
         });

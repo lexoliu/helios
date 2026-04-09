@@ -20,6 +20,8 @@ use wasmtime::component::{
 
 use crate::debugger_program::{OutputStreamKind, StoreData};
 
+pub(crate) mod p2;
+
 pub(crate) mod bindings {
     mod generated {
         wasmtime::component::bindgen!({
