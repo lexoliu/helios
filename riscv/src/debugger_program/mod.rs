@@ -15,7 +15,7 @@ use helios_hal::cpu::Cpu;
 use helios_hal::resource::WasiRights;
 use helios_kernel::{
     ComponentCache, ComputePool, ComputePriority, EmbeddedDebugger, ExecOutput, ExecResult,
-    InstanceExecutionTransition, InstanceRegistry, Notify, ProgramExecError, ProgramExecErrorKind,
+    InstanceRegistry, Notify, ProgramExecError, ProgramExecErrorKind,
     RawMutex, RawMutexGuardResource, RawMutexResource, RawRwLock, RawRwLockReadGuardResource,
     RawRwLockResource, RawRwLockWriteGuardResource, RegisteredInstance, SerialPortResource,
     TcpStreamResource, build_target_engine_config, elapsed_millis, embedded_debugger, heap_stats,
@@ -1184,15 +1184,7 @@ impl StoreData {
     }
 
     pub(crate) fn record_call_hook(&mut self, hook: CallHook) {
-        let transition = match hook {
-            CallHook::CallingWasm | CallHook::ReturningFromHost => {
-                InstanceExecutionTransition::Resume
-            }
-            CallHook::ReturningFromWasm | CallHook::CallingHost => {
-                InstanceExecutionTransition::Pause
-            }
-        };
-        self.instance.transition(transition, self.now_nanos());
+        helios_kernel::record_instance_call_hook(&self.instance, hook, self.now_nanos());
     }
 }
 
@@ -1203,12 +1195,11 @@ impl ResourceLimiter for StoreData {
         desired: usize,
         maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        let allow = maximum.is_none_or(|maximum| desired <= maximum);
-        if allow {
-            self.instance
-                .set_memory_bytes(u64::try_from(desired).expect("desired memory exceeds u64"));
-        }
-        Ok(allow)
+        Ok(helios_kernel::allow_instance_resource_growth(
+            &self.instance,
+            desired,
+            maximum,
+        ))
     }
 
     fn table_growing(
