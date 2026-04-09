@@ -1,6 +1,7 @@
 extern crate alloc;
 
 use alloc::borrow::ToOwned;
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -51,6 +52,20 @@ pub(crate) const HOST_MOUNT_TAG: &str = helios_hal::fs::HOST_SHARE_MOUNT_TAG;
 
 pub(crate) type HostFsError = KernelHostFsError;
 
+pub(crate) struct HostFsFuture<T> {
+    inner: core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = T> + Send + 'static>>,
+}
+
+impl<T> core::future::Future for HostFsFuture<T> {
+    type Output = T;
+
+    fn poll(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        self.inner.as_mut().poll(cx)
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct HostFileSystemService {
@@ -726,4 +741,90 @@ fn discover_9p_device(
 
 fn is_9p_mmio_device(base: usize) -> bool {
     crate::matches_virtio_mmio_device(base, helios_virtio::DeviceType::_9P)
+}
+
+impl helios_kernel::HostFileSystem for HostFileSystemService {
+    type StatFuture<'a> = HostFsFuture<Result<HostMetadata, HostFsError>>;
+    type ReadDirFuture<'a> = HostFsFuture<Result<Vec<HostDirEntry>, HostFsError>>;
+    type ReadFileFuture<'a> = HostFsFuture<Result<Vec<u8>, HostFsError>>;
+    type WriteFileFuture<'a> = HostFsFuture<Result<(), HostFsError>>;
+    type TruncateFileFuture<'a> = HostFsFuture<Result<(), HostFsError>>;
+    type CreateFileFuture<'a> = HostFsFuture<Result<(), HostFsError>>;
+    type CreateDirectoryFuture<'a> = HostFsFuture<Result<(), HostFsError>>;
+    type RemoveFuture<'a> = HostFsFuture<Result<(), HostFsError>>;
+    type RenameFuture<'a> = HostFsFuture<Result<(), HostFsError>>;
+
+    fn stat_path(&self, path: &str) -> Self::StatFuture<'_> {
+        let service = self.clone();
+        let path = path.to_owned();
+        HostFsFuture {
+            inner: Box::pin(async move { service.stat_path(&path).await }),
+        }
+    }
+
+    fn read_dir(&self, path: &str) -> Self::ReadDirFuture<'_> {
+        let service = self.clone();
+        let path = path.to_owned();
+        HostFsFuture {
+            inner: Box::pin(async move { service.read_dir(&path).await }),
+        }
+    }
+
+    fn read_file(&self, path: &str) -> Self::ReadFileFuture<'_> {
+        let service = self.clone();
+        let path = path.to_owned();
+        HostFsFuture {
+            inner: Box::pin(async move { service.read_file(&path).await }),
+        }
+    }
+
+    fn write_file(&self, path: &str, offset: u64, bytes: &[u8]) -> Self::WriteFileFuture<'_> {
+        let service = self.clone();
+        let path = path.to_owned();
+        let bytes = bytes.to_vec();
+        HostFsFuture {
+            inner: Box::pin(async move { service.write_file(&path, offset, &bytes).await }),
+        }
+    }
+
+    fn truncate_file(&self, path: &str) -> Self::TruncateFileFuture<'_> {
+        let service = self.clone();
+        let path = path.to_owned();
+        HostFsFuture {
+            inner: Box::pin(async move { service.truncate_file(&path).await }),
+        }
+    }
+
+    fn create_file(&self, path: &str) -> Self::CreateFileFuture<'_> {
+        let service = self.clone();
+        let path = path.to_owned();
+        HostFsFuture {
+            inner: Box::pin(async move { service.create_file(&path).await }),
+        }
+    }
+
+    fn create_directory(&self, path: &str) -> Self::CreateDirectoryFuture<'_> {
+        let service = self.clone();
+        let path = path.to_owned();
+        HostFsFuture {
+            inner: Box::pin(async move { service.create_directory(&path).await }),
+        }
+    }
+
+    fn remove(&self, path: &str, directory: bool) -> Self::RemoveFuture<'_> {
+        let service = self.clone();
+        let path = path.to_owned();
+        HostFsFuture {
+            inner: Box::pin(async move { service.remove(&path, directory).await }),
+        }
+    }
+
+    fn rename(&self, source: &str, destination: &str) -> Self::RenameFuture<'_> {
+        let service = self.clone();
+        let source = source.to_owned();
+        let destination = destination.to_owned();
+        HostFsFuture {
+            inner: Box::pin(async move { service.rename(&source, &destination).await }),
+        }
+    }
 }

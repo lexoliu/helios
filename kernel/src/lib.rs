@@ -75,7 +75,8 @@ pub use program::{
 pub use program_service::{ProgramExecError, ProgramExecErrorKind, ProgramService};
 pub use runtime_state::RuntimeState;
 pub use runtime_types::{
-    ExecOutput, ExecResult, HostDirEntry, HostFsError, HostMetadata, Ipv4Address, PingError,
+    ExecOutput, ExecResult, HostDirEntry, HostFileSystem, HostFsError, HostMetadata,
+    Ipv4Address, PingError,
     PingErrorKind, PingReply, TcpError, TcpErrorKind,
 };
 pub use sync::{
