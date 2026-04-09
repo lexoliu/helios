@@ -24,6 +24,7 @@ mod sync;
 mod task;
 mod time;
 mod timer;
+mod wasmtime_config;
 
 pub use block_on::block_on;
 pub use bootfs::{
@@ -68,6 +69,7 @@ pub use sync::{
 pub use task::{YieldNow, yield_now};
 pub use time::{elapsed_millis, monotonic_nanos};
 pub use timer::{Sleep, Timer};
+pub use wasmtime_config::build_target_engine_config;
 
 use core::sync::atomic::{AtomicU8, Ordering};
 use core::time::Duration;
