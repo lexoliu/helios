@@ -734,5 +734,5 @@ fn discover_9p_device(
 }
 
 fn is_9p_mmio_device(base: usize) -> bool {
-    crate::virtio_mmio::matches_device(base, helios_virtio::DeviceType::_9P)
+    crate::matches_virtio_mmio_device(base, helios_virtio::DeviceType::_9P)
 }

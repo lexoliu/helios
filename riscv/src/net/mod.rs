@@ -1536,7 +1536,7 @@ fn node_phandle(node: FdtNode<'_, '_>) -> Option<u32> {
 }
 
 fn is_network_mmio_device(base: usize) -> bool {
-    crate::virtio_mmio::matches_device(base, helios_virtio::DeviceType::Network)
+    crate::matches_virtio_mmio_device(base, helios_virtio::DeviceType::Network)
 }
 
 fn smol_now(nanos: u64) -> SmolInstant {
