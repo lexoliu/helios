@@ -239,7 +239,7 @@ pub(crate) fn build_engine() -> wasmtime::Result<Engine> {
     config.memory_reservation(0);
     config.memory_reservation_for_growth(1 << 20);
     config.memory_init_cow(false);
-    wasmtime::Engine::new(&config).or_else(|_| build_component_engine(WASMTIME_TARGET))
+    Engine::new(&config)
 }
 
 pub(crate) fn component_linker(
