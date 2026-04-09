@@ -145,7 +145,7 @@ impl HostFileSystemService {
                 PushError::Closed(_) => panic!("host-fs request queue was closed unexpectedly"),
             });
         self.inner.ready.notify_one();
-        rx.await.unwrap_or_else(|_| Err(IoError::DeviceFault))
+        rx.await.unwrap_or(Err(IoError::DeviceFault))
     }
 
     async fn run(&self) {
@@ -683,7 +683,7 @@ fn read_u64_le(buf: &[u8], offset: usize) -> Result<u64, HostFsError> {
     ]))
 }
 
-fn read_slice<'a>(buf: &'a [u8], offset: usize, len: usize) -> Result<&'a [u8], HostFsError> {
+fn read_slice(buf: &[u8], offset: usize, len: usize) -> Result<&[u8], HostFsError> {
     buf.get(offset..offset + len)
         .ok_or(HostFsError::Protocol("buffer underrun"))
 }
