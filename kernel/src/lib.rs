@@ -5,6 +5,7 @@ extern crate self as helios_kernel;
 extern crate std;
 mod block_on;
 mod bootfs;
+mod component_cache;
 mod component_types;
 mod compute_pool;
 mod embedded_component;
@@ -28,6 +29,7 @@ pub use bootfs::{
     BootDirectory, BootDirectoryEntry, BootDirectoryHandleExt, BootFile, EmbeddedBootFile,
     EmbeddedBootFs,
 };
+pub use component_cache::ComponentCache;
 pub use component_types::{
     RawMutexGuardResource, RawMutexResource, RawRwLockReadGuardResource, RawRwLockResource,
     RawRwLockWriteGuardResource, SerialPortResource, TcpStreamResource,
