@@ -14,11 +14,13 @@ use helios_hal::io::IoError;
 use helios_kernel::{EmbeddedBootFile, EmbeddedBootFs, embedded_init};
 use helios_kernel::wasmtime::{self, Result};
 use helios_kernel::wasmtime::component::{
-    Access, Accessor, FutureReader, HasSelf, Linker, Resource, ResourceTableError, Source,
+    Access, Accessor, FutureReader, HasSelf, Linker, Resource, Source,
     StreamConsumer, StreamReader, StreamResult,
 };
 
 use crate::debugger_program::{OutputStreamKind, StoreData};
+
+pub(crate) type FsNodeKind = helios_kernel::ComponentFsNodeKind;
 
 pub(crate) mod p2;
 
@@ -92,12 +94,6 @@ pub(crate) fn add_to_linker(linker: &mut Linker<StoreData>) -> Result<()> {
     wasi::sockets::types::add_to_linker::<_, Data>(linker, |state| state)?;
     wasi::sockets::ip_name_lookup::add_to_linker::<_, Data>(linker, |state| state)?;
     Ok(())
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FsNodeKind {
-    Directory,
-    File,
 }
 
 #[derive(Clone)]
@@ -2109,13 +2105,11 @@ fn get_fs_descriptor(
         .map_err(fs_resource_error)
 }
 
-pub(crate) fn fs_resource_error(error: ResourceTableError) -> fs_types::ErrorCode {
-    match error {
-        ResourceTableError::NotPresent | ResourceTableError::WrongType => {
-            fs_types::ErrorCode::BadDescriptor
-        }
-        ResourceTableError::HasChildren => fs_types::ErrorCode::Busy,
-        ResourceTableError::Full => fs_types::ErrorCode::Overflow,
+pub(crate) fn fs_resource_error(error: helios_kernel::wasmtime::component::ResourceTableError) -> fs_types::ErrorCode {
+    match helios_kernel::map_resource_table_error(error) {
+        helios_kernel::ComponentFsResourceError::BadDescriptor => fs_types::ErrorCode::BadDescriptor,
+        helios_kernel::ComponentFsResourceError::Busy => fs_types::ErrorCode::Busy,
+        helios_kernel::ComponentFsResourceError::Overflow => fs_types::ErrorCode::Overflow,
     }
 }
 
