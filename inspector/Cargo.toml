@@ -21,6 +21,7 @@ tempfile = "3.23.0"
 futures-io = "0.3.31"
 futures-lite = "2.6.1"
 helios-inspector-protocol.workspace = true
+helios-hal.workspace = true
 nu-ansi-term = "0.50.3"
 ratatui = "0.30.0"
 rustyline = "14.0.0"
