@@ -11,7 +11,7 @@ use wasmtime::{CallHook, Config, Engine, Linker, Module, ResourceLimiter, Store}
 
 use crate::{
     BootDirectory, ComputePool, ComputePriority, ComputeSpawnError, EmbeddedProgram,
-    InstanceExecutionTransition, RegisteredInstance,
+    InstanceExecutionTransition, RegisteredInstance, build_target_engine_config,
 };
 
 /// Immutable compilation settings for the user-mode runtime.
@@ -437,11 +437,7 @@ fn run_entry<T>(
 }
 
 fn build_engine_config() -> Config {
-    let mut config = Config::new();
-    config
-        .target(env!("HELIOS_BUILD_TARGET"))
-        .expect("Helios build target must be accepted by Wasmtime");
-    config
+    build_target_engine_config(env!("HELIOS_BUILD_TARGET"))
 }
 
 fn compile_wasm_task(

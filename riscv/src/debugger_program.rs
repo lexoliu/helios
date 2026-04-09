@@ -15,7 +15,7 @@ use helios_kernel::{
     EmbeddedDebugger, InstanceExecutionTransition, InstanceRegistry, ProgramExecErrorKind,
     RawMutex, RawMutexGuardResource, RawMutexResource, RawRwLock, RawRwLockReadGuardResource,
     RawRwLockResource, RawRwLockWriteGuardResource, RegisteredInstance, SerialPortResource,
-    TcpStreamResource, embedded_debugger, heap_stats,
+    TcpStreamResource, build_target_engine_config, embedded_debugger, heap_stats,
 };
 use spin::Mutex;
 use thiserror::Error;
@@ -24,8 +24,8 @@ use wasmtime::component::{
     StreamReader, StreamResult,
 };
 use wasmtime::{
-    CallHook, Config, CustomCodeMemory, Engine, OptLevel, RegallocAlgorithm, ResourceLimiter,
-    Store, StoreContextMut,
+    CallHook, CustomCodeMemory, Engine, OptLevel, RegallocAlgorithm, ResourceLimiter, Store,
+    StoreContextMut,
 };
 use wasmtime_wasi_io::IoView;
 use wasmtime_wasi_io::bytes::Bytes;
@@ -250,17 +250,11 @@ fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), Debugge
 }
 
 pub(crate) fn build_engine() -> wasmtime::Result<Engine> {
-    let mut config = Config::new();
-    config
-        .target(WASMTIME_TARGET)
-        .expect("Helios build target must be accepted by Wasmtime");
+    let mut config = build_target_engine_config(WASMTIME_TARGET);
     config.cranelift_opt_level(OptLevel::None);
     config.cranelift_regalloc_algorithm(RegallocAlgorithm::SinglePass);
     config.cranelift_debug_verifier(false);
     config.with_custom_code_memory(Some(Arc::new(RiscvCodeMemory)));
-    // The RISC-V backend has not wired Wasmtime's custom virtual-memory and
-    // native-signal hooks yet, so the engine configuration must match the
-    // currently available execution model exactly.
     config.signals_based_traps(false);
     config.memory_guard_size(0);
     config.memory_reservation(0);
