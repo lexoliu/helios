@@ -23,6 +23,7 @@ mod embedded_debugger;
 mod embedded_init;
 mod embedded_program;
 mod executor;
+mod host_share;
 mod instance;
 mod log;
 mod observer;
@@ -56,6 +57,7 @@ pub use embedded_debugger::{EmbeddedDebugger, embedded_debugger};
 pub use embedded_init::{EmbeddedInit, embedded_init};
 pub use embedded_program::EmbeddedProgram;
 pub use executor::{JoinHandle, LocalJoinHandle, Spawner};
+pub use host_share::{HOST_SHARE_GUEST_MOUNT_PATH, guest_host_share_path};
 pub use helios_hal::Platform;
 pub use instance::{
     InstanceExecutionTransition, InstanceId, InstanceRegistry, InstanceSnapshot, RegisteredInstance,
