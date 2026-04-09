@@ -15,6 +15,7 @@ pub use wasmtime_wasi_io::*;
 mod block_on;
 mod bootfs;
 mod component_cache;
+mod component_runtime;
 mod component_types;
 mod compute_pool;
 mod embedded_component;
@@ -41,6 +42,10 @@ pub use bootfs::{
     EmbeddedBootFs,
 };
 pub use component_cache::ComponentCache;
+pub use component_runtime::{
+    ComponentOutputMode, ComponentOutputStream, ComponentOutputStreamKind, ComponentStoreData,
+    DeadlinePollable,
+};
 pub use component_types::{
     RawMutexGuardResource, RawMutexResource, RawRwLockReadGuardResource, RawRwLockResource,
     RawRwLockWriteGuardResource, SerialPortResource, TcpStreamResource,

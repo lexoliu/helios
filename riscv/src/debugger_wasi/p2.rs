@@ -14,7 +14,8 @@ use helios_kernel::wasmtime_wasi_io::streams::{
     DynInputStream, DynOutputStream, Error as IoError, InputStream, StreamError,
 };
 
-use crate::debugger_program::{DeadlinePollable, DebugSerialOutputStream, StoreData};
+use crate::debugger_program::{DebugSerialOutputStream, RuntimeDeadlinePollable, StoreData};
+use crate::debugger_program::{OutputStreamKind, runtime_uptime_nanos};
 use crate::debugger_wasi;
 use crate::debugger_wasi::bindings::filesystem::types as p3fs;
 use crate::debugger_wasi::{FsDescriptor, FsNodeKind};
@@ -260,7 +261,7 @@ impl cli_bindings::cli::stdout::Host for StoreData {
             .table
             .push(Box::new(DebugSerialOutputStream::from_store(
                 self,
-                crate::debugger_program::OutputStreamKind::Stdout,
+                OutputStreamKind::Stdout,
             )) as DynOutputStream)?)
     }
 }
@@ -271,7 +272,7 @@ impl cli_bindings::cli::stderr::Host for StoreData {
             .table
             .push(Box::new(DebugSerialOutputStream::from_store(
                 self,
-                crate::debugger_program::OutputStreamKind::Stderr,
+                OutputStreamKind::Stderr,
             )) as DynOutputStream)?)
     }
 }
@@ -321,10 +322,12 @@ impl clocks_bindings::clocks::monotonic_clock::Host for StoreData {
     }
 
     fn subscribe_instant(&mut self, when: u64) -> Result<Resource<DynPollable>> {
-        let resource = self.table.push(DeadlinePollable {
-            cpu: self.cpu.clone(),
-            deadline_nanos: when,
-        })?;
+        let resource = self.table.push(RuntimeDeadlinePollable::new(
+            self.cpu.clone(),
+            self.runtime_state.clone(),
+            when,
+            runtime_uptime_nanos,
+        ))?;
         subscribe(&mut self.table, resource)
     }
 

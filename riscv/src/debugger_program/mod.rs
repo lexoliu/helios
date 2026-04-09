@@ -16,6 +16,8 @@ use helios_hal::resource::WasiRights;
 use helios_kernel::{
     ComponentCache, ComputePool, ComputePriority, EmbeddedDebugger, ExecOutput, ExecResult,
     InstanceRegistry, Notify, ProgramExecError, ProgramExecErrorKind,
+    ComponentOutputMode, ComponentOutputStream, ComponentOutputStreamKind, ComponentStoreData,
+    DeadlinePollable,
     RawMutex, RawMutexGuardResource, RawMutexResource, RawRwLock, RawRwLockReadGuardResource,
     RawRwLockResource, RawRwLockWriteGuardResource, RegisteredInstance, SerialPortResource,
     TcpStreamResource, build_component_engine_config, elapsed_millis,
@@ -23,17 +25,13 @@ use helios_kernel::{
     monotonic_nanos,
 };
 use helios_kernel::wasmtime::{
-    self, CallHook, CustomCodeMemory, Engine, OptLevel, RegallocAlgorithm, ResourceLimiter,
-    Store, StoreContextMut,
+    self, CustomCodeMemory, Engine, OptLevel, RegallocAlgorithm, Store, StoreContextMut,
 };
 use helios_kernel::wasmtime::component::{
-    Accessor, Component, Destination, HasSelf, Linker, Resource, ResourceTable, ResourceType,
-    StreamProducer, StreamReader, StreamResult,
+    Accessor, Component, Destination, HasSelf, Linker, Resource, ResourceType, StreamProducer,
+    StreamReader, StreamResult,
 };
-use helios_kernel::wasmtime_wasi_io::{self, IoView};
-use helios_kernel::wasmtime_wasi_io::bytes::Bytes;
-use helios_kernel::wasmtime_wasi_io::poll::Pollable;
-use helios_kernel::wasmtime_wasi_io::streams::{OutputStream, StreamError};
+use helios_kernel::wasmtime_wasi_io::{self};
 use spin::Mutex;
 use thiserror::Error;
 
@@ -99,29 +97,12 @@ pub struct RiscvTcpStream {
     service: crate::net::NetworkService,
     stream: crate::net::TcpStreamId,
 }
-#[derive(Clone)]
-struct GuestOutput {
-    mode: OutputMode,
-    debug_state: RuntimeState,
-    cpu: RiscvCpu,
-    captured_stdout: Arc<Mutex<Vec<u8>>>,
-    captured_stderr: Arc<Mutex<Vec<u8>>>,
-}
-pub(crate) struct DebugSerialOutputStream {
-    sink: GuestOutput,
-    stream: OutputStreamKind,
-}
-pub(crate) struct DeadlinePollable {
-    pub(crate) cpu: RiscvCpu,
-    pub(crate) deadline_nanos: u64,
-}
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OutputMode {
-    Serial,
-    #[allow(dead_code)]
-    Trace,
-    Capture,
-}
+pub(crate) type StoreData =
+    ComponentStoreData<RiscvCpu, RuntimeState, crate::debugger_wasi::DebugFileSystem>;
+pub(crate) type DebugSerialOutputStream = ComponentOutputStream<RiscvCpu, RuntimeState>;
+pub(crate) type OutputMode = ComponentOutputMode;
+pub(crate) type OutputStreamKind = ComponentOutputStreamKind;
+pub(crate) type RuntimeDeadlinePollable = DeadlinePollable<RiscvCpu, RuntimeState>;
 
 #[derive(Clone, Copy)]
 pub(crate) enum SystemWorld {
@@ -174,20 +155,20 @@ fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), Debugge
         instance_registry.register("debugger", debug_state.uptime_nanos(cpu.now().ticks()));
     let mut store = store_with_state(
         &engine,
-        StoreData {
-            table: ResourceTable::new(),
+        StoreData::new(
+            cpu,
             debug_state,
             instance_registry,
             instance,
-            cpu,
-            debug_port: Some(()),
+            Some(()),
             filesystem,
-            arguments: Vec::new(),
-            environment: Vec::new(),
-            output_mode: OutputMode::Serial,
-            captured_stdout: Arc::new(Mutex::new(Vec::new())),
-            captured_stderr: Arc::new(Mutex::new(Vec::new())),
-        },
+            Vec::new(),
+            Vec::new(),
+            OutputMode::Serial,
+            write_serial,
+            runtime_uptime_nanos,
+            runtime_record_console_text,
+        ),
     );
     emit_stage_marker("store:ok");
 
@@ -528,8 +509,8 @@ fn add_programs_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()
         "exec",
         |caller: StoreContextMut<'_, StoreData>,
          (request,): (bindings::helios::system::programs::ExecRequest,)| {
-            let service = caller.data().debug_state.program_service().or_else(|| {
-                install_program_service(&caller.data().cpu, &caller.data().debug_state)
+            let service = caller.data().runtime_state.program_service().or_else(|| {
+                install_program_service(&caller.data().cpu, &caller.data().runtime_state)
             });
             Box::new(async move {
                 let Some(service) = service else {
@@ -570,10 +551,10 @@ fn add_programs_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::R
         "exec",
         |caller: StoreContextMut<'_, StoreData>,
          (request,): (crate::program_bindings::bindings::helios::system::programs::ExecRequest,)| {
-            let service = caller.data().debug_state.program_service().or_else(|| {
+            let service = caller.data().runtime_state.program_service().or_else(|| {
                 install_program_service(
                     &caller.data().cpu,
-                    &caller.data().debug_state,
+                    &caller.data().runtime_state,
                 )
             });
             Box::new(async move {
@@ -636,7 +617,7 @@ fn add_net_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
         |accessor: &Accessor<StoreData>, (host, timeout): (String, u64)| {
             Box::pin(async move {
                 let service = accessor.with(|mut access| {
-                    Ok::<_, wasmtime::Error>(access.get().debug_state.network_service())
+                    Ok::<_, wasmtime::Error>(access.get().runtime_state.network_service())
                 })?;
                 let Some(service) = service else {
                     return Ok::<_, wasmtime::Error>((Err(
@@ -660,7 +641,7 @@ fn add_net_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
         |accessor: &Accessor<StoreData>, (host, port, timeout): (String, u16, u64)| {
             Box::pin(async move {
                 let service = accessor.with(|mut access| {
-                    Ok::<_, wasmtime::Error>(access.get().debug_state.network_service())
+                    Ok::<_, wasmtime::Error>(access.get().runtime_state.network_service())
                 })?;
                 let Some(service) = service else {
                     return Ok::<_, wasmtime::Error>((Err(unavailable_tcp_error()),));
@@ -771,7 +752,7 @@ fn add_net_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result
         |accessor: &Accessor<StoreData>, (host, timeout): (String, u64)| {
             Box::pin(async move {
                 let service = accessor.with(|mut access| {
-                    Ok::<_, wasmtime::Error>(access.get().debug_state.network_service())
+                    Ok::<_, wasmtime::Error>(access.get().runtime_state.network_service())
                 })?;
                 let Some(service) = service else {
                     return Ok::<_, wasmtime::Error>((Err(
@@ -795,7 +776,7 @@ fn add_net_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result
         |accessor: &Accessor<StoreData>, (host, port, timeout): (String, u16, u64)| {
             Box::pin(async move {
                 let service = accessor.with(|mut access| {
-                    Ok::<_, wasmtime::Error>(access.get().debug_state.network_service())
+                    Ok::<_, wasmtime::Error>(access.get().runtime_state.network_service())
                 })?;
                 let Some(service) = service else {
                     return Ok::<_, wasmtime::Error>((Err(unavailable_program_tcp_error()),));
@@ -890,7 +871,7 @@ fn add_tracing_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()>
             let filter = convert_filter(filter);
             let events = caller
                 .data()
-                .debug_state
+                .runtime_state
                 .recent(&filter, limit)
                 .into_iter()
                 .map(convert_event)
@@ -935,7 +916,7 @@ fn add_tracing_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::Re
             let filter = convert_program_filter(filter);
             let events = caller
                 .data()
-                .debug_state
+                .runtime_state
                 .recent(&filter, limit)
                 .into_iter()
                 .map(convert_program_event)
@@ -1150,149 +1131,12 @@ fn add_instances_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<(
     Ok(())
 }
 
-pub(crate) struct StoreData {
-    pub(crate) table: ResourceTable,
-    pub(crate) cpu: RiscvCpu,
-    pub(crate) debug_state: RuntimeState,
-    pub(crate) instance_registry: InstanceRegistry,
-    pub(crate) instance: RegisteredInstance,
-    pub(crate) debug_port: Option<()>,
-    pub(crate) filesystem: crate::debugger_wasi::DebugFileSystem,
-    pub(crate) arguments: Vec<String>,
-    pub(crate) environment: Vec<(String, String)>,
-    pub(crate) output_mode: OutputMode,
-    pub(crate) captured_stdout: Arc<Mutex<Vec<u8>>>,
-    pub(crate) captured_stderr: Arc<Mutex<Vec<u8>>>,
+pub(crate) fn runtime_uptime_nanos(state: &RuntimeState, ticks: u64) -> u64 {
+    state.uptime_nanos(ticks)
 }
 
-impl StoreData {
-    pub(crate) fn now_nanos(&self) -> u64 {
-        self.debug_state.uptime_nanos(self.cpu.now().ticks())
-    }
-
-    pub(crate) fn write_output(&mut self, stream: OutputStreamKind, bytes: &[u8]) {
-        GuestOutput::from_store(self).write(stream, bytes);
-    }
-
-    pub(crate) fn take_captured_output(&self) -> helios_kernel::ExecOutput {
-        helios_kernel::ExecOutput {
-            stdout: self.captured_stdout.lock().clone(),
-            stderr: self.captured_stderr.lock().clone(),
-        }
-    }
-
-    pub(crate) fn record_call_hook(&mut self, hook: CallHook) {
-        helios_kernel::record_instance_call_hook(&self.instance, hook, self.now_nanos());
-    }
-}
-
-impl ResourceLimiter for StoreData {
-    fn memory_growing(
-        &mut self,
-        _current: usize,
-        desired: usize,
-        maximum: Option<usize>,
-    ) -> wasmtime::Result<bool> {
-        Ok(helios_kernel::allow_instance_resource_growth(
-            &self.instance,
-            desired,
-            maximum,
-        ))
-    }
-
-    fn table_growing(
-        &mut self,
-        _current: usize,
-        desired: usize,
-        maximum: Option<usize>,
-    ) -> wasmtime::Result<bool> {
-        Ok(maximum.is_none_or(|maximum| desired <= maximum))
-    }
-}
-
-impl IoView for StoreData {
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.table
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum OutputStreamKind {
-    Stdout,
-    Stderr,
-}
-
-impl GuestOutput {
-    fn from_store(store: &StoreData) -> Self {
-        Self {
-            mode: store.output_mode,
-            debug_state: store.debug_state.clone(),
-            cpu: store.cpu.clone(),
-            captured_stdout: store.captured_stdout.clone(),
-            captured_stderr: store.captured_stderr.clone(),
-        }
-    }
-
-    fn write(&self, stream: OutputStreamKind, bytes: &[u8]) {
-        match self.mode {
-            OutputMode::Serial => write_serial(bytes),
-            OutputMode::Trace => {
-                let text = core::str::from_utf8(bytes).unwrap_or_else(|error| {
-                    panic!("guest attempted to write non-utf8 stdout/stderr bytes: {error}")
-                });
-                self.debug_state
-                    .record_console_text(self.cpu.now().ticks(), text);
-            }
-            OutputMode::Capture => match stream {
-                OutputStreamKind::Stdout => self.captured_stdout.lock().extend_from_slice(bytes),
-                OutputStreamKind::Stderr => self.captured_stderr.lock().extend_from_slice(bytes),
-            },
-        }
-    }
-}
-
-impl DebugSerialOutputStream {
-    pub(crate) fn from_store(store: &StoreData, stream: OutputStreamKind) -> Self {
-        Self {
-            sink: GuestOutput::from_store(store),
-            stream,
-        }
-    }
-}
-
-#[wasmtime_wasi_io::async_trait]
-impl Pollable for DebugSerialOutputStream {
-    async fn ready(&mut self) {}
-}
-
-#[wasmtime_wasi_io::async_trait]
-impl OutputStream for DebugSerialOutputStream {
-    fn write(&mut self, bytes: Bytes) -> Result<(), StreamError> {
-        self.sink.write(self.stream, bytes.as_ref());
-        Ok(())
-    }
-
-    fn flush(&mut self) -> Result<(), StreamError> {
-        Ok(())
-    }
-
-    fn check_write(&mut self) -> Result<usize, StreamError> {
-        Ok(4096)
-    }
-}
-
-#[wasmtime_wasi_io::async_trait]
-impl Pollable for DeadlinePollable {
-    async fn ready(&mut self) {
-        while self
-            .cpu
-            .debug_state()
-            .ticks_to_nanos(self.cpu.now().ticks())
-            < self.deadline_nanos
-        {
-            core::hint::spin_loop();
-        }
-    }
+pub(crate) fn runtime_record_console_text(state: &RuntimeState, ticks: u64, text: &str) {
+    state.record_console_text(ticks, text);
 }
 
 impl bindings::helios::system::serial::Host for StoreData {}
@@ -1630,7 +1474,7 @@ impl StreamProducer<StoreData> for TracingStreamProducer {
 
         match store
             .data()
-            .debug_state
+            .runtime_state
             .next_after(self.cursor, &self.filter)
         {
             Some((seq, event)) => {
@@ -1671,7 +1515,7 @@ impl StreamProducer<StoreData> for ProgramTracingStreamProducer {
 
         match store
             .data()
-            .debug_state
+            .runtime_state
             .next_after(self.cursor, &self.filter)
         {
             Some((seq, event)) => {
@@ -1685,13 +1529,13 @@ impl StreamProducer<StoreData> for ProgramTracingStreamProducer {
 }
 
 fn snapshot_sample(store: &StoreData) -> bindings::helios::system::stats::Sample {
-    convert_sample(store.debug_state.snapshot(store.cpu.now().ticks()))
+    convert_sample(store.runtime_state.snapshot(store.cpu.now().ticks()))
 }
 
 fn snapshot_program_sample(
     store: &StoreData,
 ) -> crate::program_bindings::bindings::helios::system::stats::Sample {
-    convert_program_sample(store.debug_state.snapshot(store.cpu.now().ticks()))
+    convert_program_sample(store.runtime_state.snapshot(store.cpu.now().ticks()))
 }
 
 fn convert_sample(sample: StatsSample) -> bindings::helios::system::stats::Sample {
