@@ -11,7 +11,8 @@ use wasmtime::{CallHook, Config, Engine, Linker, Module, ResourceLimiter, Store}
 
 use crate::{
     BootDirectory, ComputePool, ComputePriority, ComputeSpawnError, EmbeddedProgram,
-    InstanceExecutionTransition, RegisteredInstance, build_target_engine_config,
+    RegisteredInstance, allow_instance_resource_growth, build_target_engine_config,
+    record_instance_call_hook,
 };
 
 /// Immutable compilation settings for the user-mode runtime.
@@ -378,15 +379,7 @@ impl<CpuImpl: Cpu + Clone> TrackedTaskState<CpuImpl> {
     }
 
     fn record_call_hook(&mut self, hook: CallHook) {
-        let transition = match hook {
-            CallHook::CallingWasm | CallHook::ReturningFromHost => {
-                InstanceExecutionTransition::Resume
-            }
-            CallHook::ReturningFromWasm | CallHook::CallingHost => {
-                InstanceExecutionTransition::Pause
-            }
-        };
-        self.instance.transition(transition, self.now_nanos());
+        record_instance_call_hook(&self.instance, hook, self.now_nanos());
     }
 }
 
@@ -397,13 +390,11 @@ impl<CpuImpl: Cpu + Clone> ResourceLimiter for TrackedTaskState<CpuImpl> {
         desired: usize,
         maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        let allow = maximum.is_none_or(|maximum| desired <= maximum);
-        if allow {
-            let memory_bytes =
-                u64::try_from(desired).expect("wasm memory size exceeds u64 during growth");
-            self.instance.set_memory_bytes(memory_bytes);
-        }
-        Ok(allow)
+        Ok(allow_instance_resource_growth(
+            &self.instance,
+            desired,
+            maximum,
+        ))
     }
 
     fn table_growing(
