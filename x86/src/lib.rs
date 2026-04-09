@@ -13,6 +13,7 @@ use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
 use spin::Mutex;
 use x86_64::instructions::hlt;
+use x86_64::instructions::port::PortWriteOnly;
 use x86_64::instructions::port::Port;
 
 static BOOTLOADER_CONFIG: BootloaderConfig = {
@@ -126,7 +127,12 @@ impl Cpu for X86Cpu {
     }
 
     fn reboot(&self) -> ! {
-        panic!("x86 reboot is not implemented yet");
+        unsafe {
+            PortWriteOnly::new(0x64).write(0xfe_u8);
+        }
+        loop {
+            hlt();
+        }
     }
 }
 

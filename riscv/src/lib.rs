@@ -601,7 +601,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
                     ));
                 }
             }
-            tracing::info!("virtio 9p online mount_tag=hostshare");
+            tracing::info!("virtio 9p online mount_tag={}", crate::host_fs::HOST_MOUNT_TAG);
         }
         interrupts
     } else {

@@ -148,3 +148,6 @@ pub trait BlockDevice: Send + Sync {
 
     fn block_size(&self) -> usize;
 }
+
+
+pub const HOST_SHARE_MOUNT_TAG: &str = "hostshare";
