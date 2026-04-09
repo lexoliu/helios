@@ -18,7 +18,8 @@ use helios_kernel::{
     InstanceRegistry, Notify, ProgramExecError, ProgramExecErrorKind,
     RawMutex, RawMutexGuardResource, RawMutexResource, RawRwLock, RawRwLockReadGuardResource,
     RawRwLockResource, RawRwLockWriteGuardResource, RegisteredInstance, SerialPortResource,
-    TcpStreamResource, build_component_engine_config, elapsed_millis, embedded_debugger, heap_stats,
+    TcpStreamResource, build_component_engine, build_component_engine_config, elapsed_millis,
+    embedded_debugger, heap_stats,
     monotonic_nanos,
 };
 use spin::Mutex;
@@ -238,9 +239,7 @@ pub(crate) fn build_engine() -> wasmtime::Result<Engine> {
     config.memory_reservation(0);
     config.memory_reservation_for_growth(1 << 20);
     config.memory_init_cow(false);
-    config.wasm_component_model(true);
-    config.wasm_component_model_async(true);
-    Engine::new(&config)
+    wasmtime::Engine::new(&config).or_else(|_| build_component_engine(WASMTIME_TARGET))
 }
 
 pub(crate) fn component_linker(

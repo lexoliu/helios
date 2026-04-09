@@ -5,7 +5,7 @@ use std::time::Instant as StdInstant;
 
 use helios_kernel::{
     EmbeddedComponent, EmbeddedDebugger, EmbeddedInit, InstanceRegistry, Kernel, ProgramService,
-    RegisteredInstance, allow_instance_resource_growth, build_component_engine_config,
+    RegisteredInstance, allow_instance_resource_growth, build_component_engine,
     record_instance_call_hook, embedded_debugger, embedded_init,
 };
 use tempfile::TempDir;
@@ -246,8 +246,7 @@ fn add_generated_bindings_to_linker(
 }
 
 fn build_engine() -> Result<Engine, HostedProgramError> {
-    let config = build_component_engine_config(WASMTIME_TARGET);
-    Engine::new(&config).map_err(HostedProgramError::CreateEngine)
+    build_component_engine(WASMTIME_TARGET).map_err(HostedProgramError::CreateEngine)
 }
 
 fn build_wasi_ctx(
