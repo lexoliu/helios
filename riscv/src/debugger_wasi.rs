@@ -2188,35 +2188,35 @@ fn is_dir_first(kind: fs_types::DescriptorType) -> u8 {
     }
 }
 
-fn map_host_fs_error(error: crate::host_fs::HostFsError) -> fs_types::ErrorCode {
+fn map_host_fs_error(error: helios_kernel::HostFsError) -> fs_types::ErrorCode {
     match error {
-        crate::host_fs::HostFsError::Transport(IoError::NotFound) => fs_types::ErrorCode::NoEntry,
-        crate::host_fs::HostFsError::Transport(IoError::AlreadyExists) => {
+        helios_kernel::HostFsError::Transport(IoError::NotFound) => fs_types::ErrorCode::NoEntry,
+        helios_kernel::HostFsError::Transport(IoError::AlreadyExists) => {
             fs_types::ErrorCode::Exist
         }
-        crate::host_fs::HostFsError::Transport(IoError::NotDirectory) => {
+        helios_kernel::HostFsError::Transport(IoError::NotDirectory) => {
             fs_types::ErrorCode::NotDirectory
         }
-        crate::host_fs::HostFsError::Transport(IoError::IsDirectory) => {
+        helios_kernel::HostFsError::Transport(IoError::IsDirectory) => {
             fs_types::ErrorCode::IsDirectory
         }
-        crate::host_fs::HostFsError::Transport(IoError::DirectoryNotEmpty) => {
+        helios_kernel::HostFsError::Transport(IoError::DirectoryNotEmpty) => {
             fs_types::ErrorCode::NotEmpty
         }
-        crate::host_fs::HostFsError::Transport(IoError::PermissionDenied)
-        | crate::host_fs::HostFsError::Transport(IoError::ReadOnly) => {
+        helios_kernel::HostFsError::Transport(IoError::PermissionDenied)
+        | helios_kernel::HostFsError::Transport(IoError::ReadOnly) => {
             fs_types::ErrorCode::ReadOnly
         }
-        crate::host_fs::HostFsError::Transport(IoError::Unsupported) => {
+        helios_kernel::HostFsError::Transport(IoError::Unsupported) => {
             fs_types::ErrorCode::Unsupported
         }
-        crate::host_fs::HostFsError::Transport(IoError::InvalidBufferLength { .. })
-        | crate::host_fs::HostFsError::Transport(IoError::InvalidDeviceConfig(_))
-        | crate::host_fs::HostFsError::Transport(IoError::OutOfBounds)
-        | crate::host_fs::HostFsError::Transport(IoError::DeviceFault)
-        | crate::host_fs::HostFsError::Protocol(_)
-        | crate::host_fs::HostFsError::Utf8 => fs_types::ErrorCode::Io,
-        crate::host_fs::HostFsError::Server(code) => match code {
+        helios_kernel::HostFsError::Transport(IoError::InvalidBufferLength { .. })
+        | helios_kernel::HostFsError::Transport(IoError::InvalidDeviceConfig(_))
+        | helios_kernel::HostFsError::Transport(IoError::OutOfBounds)
+        | helios_kernel::HostFsError::Transport(IoError::DeviceFault)
+        | helios_kernel::HostFsError::Protocol(_)
+        | helios_kernel::HostFsError::Utf8 => fs_types::ErrorCode::Io,
+        helios_kernel::HostFsError::Server(code) => match code {
             2 => fs_types::ErrorCode::NoEntry,
             17 => fs_types::ErrorCode::Exist,
             20 => fs_types::ErrorCode::NotDirectory,

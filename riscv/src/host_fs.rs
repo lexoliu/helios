@@ -12,9 +12,10 @@ use fdt::Fdt;
 use futures::channel::oneshot;
 use helios_hal::cpu::Cpu;
 use helios_hal::io::IoError;
-use helios_kernel::{Kernel, Notify};
+use helios_kernel::{
+    HostDirEntry, HostFsError as KernelHostFsError, HostMetadata, Kernel, Notify,
+};
 use plic::Plic;
-use thiserror::Error;
 
 use crate::RiscvCpu;
 use crate::net::{InterruptSourceId, PlicContext};
@@ -48,6 +49,9 @@ const P9_WRITE_CHUNK: usize = (DEFAULT_MSIZE as usize) - 24;
 
 pub(crate) const HOST_MOUNT_PATH: &str = "/host";
 
+pub(crate) type HostFsError = KernelHostFsError;
+
+
 #[derive(Clone)]
 pub(crate) struct HostFileSystemService {
     inner: Arc<HostFileSystemServiceInner>,
@@ -57,32 +61,6 @@ struct HostFileSystemServiceInner {
     device: Arc<helios_virtio::VirtioMmio9pDevice>,
     requests: ConcurrentQueue<Request>,
     ready: Notify,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct HostDirEntry {
-    pub(crate) name: String,
-    pub(crate) is_directory: bool,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct HostMetadata {
-    pub(crate) qid_path: u64,
-    pub(crate) qid_type: u8,
-    pub(crate) mode: u32,
-    pub(crate) size: u64,
-}
-
-#[derive(Debug, Error)]
-pub(crate) enum HostFsError {
-    #[error("9p transport error: {0}")]
-    Transport(#[from] IoError),
-    #[error("9p protocol error: {0}")]
-    Protocol(&'static str),
-    #[error("9p server error code {0}")]
-    Server(u32),
-    #[error("9p string field is not valid utf-8")]
-    Utf8,
 }
 
 pub(crate) struct HostFsInterrupt {
@@ -220,7 +198,10 @@ impl HostFileSystemService {
             u32::try_from(request.len()).map_err(|_| HostFsError::Protocol("request too large"))?;
         request[..4].copy_from_slice(&size.to_le_bytes());
 
-        let response = self.raw_request(request, response_len).await?;
+        let response = self
+            .raw_request(request, response_len)
+            .await
+            .map_err(HostFsError::Transport)?;
         if response.len() < 7 {
             return Err(HostFsError::Protocol("response shorter than 9p header"));
         }
