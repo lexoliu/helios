@@ -42,7 +42,6 @@ use crate::debugger_bindings::bindings;
 use crate::{RiscvCpu, try_read_debug_serial_byte, write_debug_serial_bytes};
 use helios_kernel::{StatsSample, TraceEvent, TraceField, TraceFilter, TraceLevel, TraceValue};
 
-const WASMTIME_TARGET: &str = "riscv64gc-unknown-none-elf";
 const SERIAL_INSTANCE: &str = "helios:system/serial@0.1.0";
 const SYNC_INSTANCE: &str = "helios:system/sync@0.1.0";
 const STATS_INSTANCE: &str = "helios:system/stats@0.1.0";
@@ -60,17 +59,17 @@ pub(crate) use service::{
     run_forever, run_program_workers_forever, should_run_on,
 };
 
-struct RiscvCodeMemory;
+struct CpuCodeMemory<C> {
+    cpu: C,
+}
 
-impl CustomCodeMemory for RiscvCodeMemory {
+impl<C: Cpu + Clone> CustomCodeMemory for CpuCodeMemory<C> {
     fn required_alignment(&self) -> usize {
         1
     }
 
-    fn publish_executable(&self, _ptr: *const u8, _len: usize) -> wasmtime::Result<()> {
-        unsafe {
-            core::arch::asm!("fence.i", options(nostack, preserves_flags));
-        }
+    fn publish_executable(&self, ptr: *const u8, len: usize) -> wasmtime::Result<()> {
+        self.cpu.publish_executable_code(ptr, len);
         Ok(())
     }
 
@@ -153,7 +152,7 @@ pub struct SbiRawRwLockWriteGuard {
 fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), DebuggerError> {
     emit_stage_marker("engine:new");
     tracing::info!("debugger hart: creating wasmtime engine");
-    let engine = build_engine().map_err(DebuggerError::CreateEngine)?;
+    let engine = build_engine(&cpu).map_err(DebuggerError::CreateEngine)?;
     emit_stage_marker("engine:ok");
     tracing::info!("debugger hart: compiling embedded debugger component");
     let component =
@@ -228,12 +227,12 @@ fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), Debugge
     }
 }
 
-pub(crate) fn build_engine() -> wasmtime::Result<Engine> {
-    let mut config = build_component_engine_config(WASMTIME_TARGET);
+pub(crate) fn build_engine(cpu: &RiscvCpu) -> wasmtime::Result<Engine> {
+    let mut config = build_component_engine_config(cpu.wasmtime_target());
     config.cranelift_opt_level(OptLevel::None);
     config.cranelift_regalloc_algorithm(RegallocAlgorithm::SinglePass);
     config.cranelift_debug_verifier(false);
-    config.with_custom_code_memory(Some(Arc::new(RiscvCodeMemory)));
+    config.with_custom_code_memory(Some(Arc::new(CpuCodeMemory { cpu: cpu.clone() })));
     config.signals_based_traps(false);
     config.memory_guard_size(0);
     config.memory_reservation(0);

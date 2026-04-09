@@ -57,7 +57,7 @@ pub(crate) fn install_program_service(
     let compiler_budget = available_bytes
         .saturating_sub(cache_budget)
         .max(reserved_stack_bytes);
-    let engine = build_engine().unwrap_or_else(|error| {
+    let engine = build_engine(cpu).unwrap_or_else(|error| {
         panic!("failed to create RISC-V component engine for user programs: {error:#}")
     });
     let compiler = ComputePool::new(worker_count, WORKER_STACK_SIZE, compiler_budget)
