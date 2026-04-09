@@ -48,6 +48,7 @@ const P9_QTDIR: u8 = 0x80;
 const P9_WRITE_CHUNK: usize = (DEFAULT_MSIZE as usize) - 24;
 
 pub(crate) const HOST_MOUNT_PATH: &str = "/host";
+pub(crate) const HOST_MOUNT_TAG: &str = helios_hal::fs::HOST_SHARE_MOUNT_TAG;
 
 pub(crate) type HostFsError = KernelHostFsError;
 

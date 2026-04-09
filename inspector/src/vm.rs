@@ -8,6 +8,7 @@ use bootloader::BiosBoot;
 use clap::{Args as ClapArgs, Subcommand, ValueEnum};
 use console::style;
 use directories::ProjectDirs;
+use helios_hal::fs::HOST_SHARE_MOUNT_TAG;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
@@ -370,7 +371,7 @@ impl VmRuntime {
                         shared_dir.display()
                     ));
                     qemu.arg("-device")
-                        .arg("virtio-9p-device,fsdev=hostfs,mount_tag=hostshare");
+                        .arg(format!("virtio-9p-device,fsdev=hostfs,mount_tag={HOST_SHARE_MOUNT_TAG}"));
                 }
             }
             VmArch::X86_64 => {
