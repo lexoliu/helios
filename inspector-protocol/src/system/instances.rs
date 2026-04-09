@@ -5,6 +5,8 @@ use anyhow::{Context as _, Result};
 #[cfg(feature = "host")]
 use futures_io::{AsyncRead, AsyncWrite};
 
+#[cfg(feature = "host")]
+use super::methods::{INSTANCES_INSTANCE, INSTANCES_SNAPSHOT};
 
 pub use super::bindings::helios::system::instances::{Instance, InstanceId, MonoNanos, Permille};
 

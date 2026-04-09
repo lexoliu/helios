@@ -5,6 +5,8 @@ use anyhow::{Context as _, Result};
 #[cfg(feature = "host")]
 use futures_io::{AsyncRead, AsyncWrite};
 
+#[cfg(feature = "host")]
+use super::methods::{TRACING_INSTANCE, TRACING_RECENT};
 
 pub use super::bindings::helios::system::tracing::{Event, Field, Filter, Level, MonoNanos, Value};
 
