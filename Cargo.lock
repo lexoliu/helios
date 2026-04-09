@@ -1591,6 +1591,7 @@ dependencies = [
  "directories",
  "futures-io",
  "futures-lite",
+ "helios-hal",
  "helios-inspector-protocol",
  "indicatif",
  "nu-ansi-term",
