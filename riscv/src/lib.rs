@@ -157,14 +157,10 @@ static CRITICAL_SECTION_OWNER: AtomicUsize = AtomicUsize::new(0);
 static CRITICAL_SECTION_DEPTH: AtomicUsize = AtomicUsize::new(0);
 static DEBUG_STATE: Once<debug_state::RuntimeState> = Once::new();
 
-use core::arch::asm;
 use core::ptr::NonNull;
-
-use trapframe::TrapFrame;
 
 const SSTATUS_SIE_BIT: usize = 1 << 1;
 const SSTATUS_SPIE_BIT: usize = 1 << 5;
-const SSTATUS_SPP_BIT: usize = 1 << 8;
 
 pub type ComputeTaskEntry = extern "C" fn(usize) -> !;
 
