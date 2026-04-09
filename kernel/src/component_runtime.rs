@@ -1,9 +1,9 @@
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use alloc::boxed::Box;
 
 use spin::Mutex;
 
@@ -32,10 +32,16 @@ pub enum ComponentOutputStreamKind {
     Stderr,
 }
 
-pub struct ComponentStoreData<CpuImpl, RuntimeState, FileSystem> {
+pub trait ComponentRuntimeState: Clone + Send + 'static {
+    fn uptime_nanos(&self, current_ticks: u64) -> u64;
+
+    fn record_console_text(&self, current_ticks: u64, text: &str);
+}
+
+pub struct ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem> {
     pub table: ResourceTable,
     pub cpu: CpuImpl,
-    pub runtime_state: RuntimeState,
+    pub runtime_state: RuntimeStateImpl,
     pub instance_registry: InstanceRegistry,
     pub instance: RegisteredInstance,
     pub debug_port: Option<()>,
@@ -46,43 +52,39 @@ pub struct ComponentStoreData<CpuImpl, RuntimeState, FileSystem> {
     pub captured_stdout: Arc<Mutex<Vec<u8>>>,
     pub captured_stderr: Arc<Mutex<Vec<u8>>>,
     serial_writer: fn(&[u8]),
-    uptime_nanos: fn(&RuntimeState, u64) -> u64,
-    record_console_text: fn(&RuntimeState, u64, &str),
 }
 
 #[derive(Clone)]
-struct ComponentOutput<CpuImpl, RuntimeState> {
+struct ComponentOutput<CpuImpl, RuntimeStateImpl> {
     mode: ComponentOutputMode,
-    runtime_state: RuntimeState,
+    runtime_state: RuntimeStateImpl,
     cpu: CpuImpl,
     captured_stdout: Arc<Mutex<Vec<u8>>>,
     captured_stderr: Arc<Mutex<Vec<u8>>>,
     serial_writer: fn(&[u8]),
-    record_console_text: fn(&RuntimeState, u64, &str),
 }
 
-pub struct ComponentOutputStream<CpuImpl, RuntimeState> {
-    sink: ComponentOutput<CpuImpl, RuntimeState>,
+pub struct ComponentOutputStream<CpuImpl, RuntimeStateImpl> {
+    sink: ComponentOutput<CpuImpl, RuntimeStateImpl>,
     stream: ComponentOutputStreamKind,
 }
 
-pub struct DeadlinePollable<CpuImpl, RuntimeState> {
+pub struct DeadlinePollable<CpuImpl, RuntimeStateImpl> {
     cpu: CpuImpl,
-    runtime_state: RuntimeState,
+    runtime_state: RuntimeStateImpl,
     deadline_nanos: u64,
-    uptime_nanos: fn(&RuntimeState, u64) -> u64,
 }
 
-impl<CpuImpl, RuntimeState, FileSystem> ComponentStoreData<CpuImpl, RuntimeState, FileSystem>
+impl<CpuImpl, RuntimeStateImpl, FileSystem> ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem>
 where
     CpuImpl: Cpu + Clone,
-    RuntimeState: Clone + Send + 'static,
+    RuntimeStateImpl: ComponentRuntimeState,
     FileSystem: Send,
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cpu: CpuImpl,
-        runtime_state: RuntimeState,
+        runtime_state: RuntimeStateImpl,
         instance_registry: InstanceRegistry,
         instance: RegisteredInstance,
         debug_port: Option<()>,
@@ -91,8 +93,6 @@ where
         environment: Vec<(String, String)>,
         output_mode: ComponentOutputMode,
         serial_writer: fn(&[u8]),
-        uptime_nanos: fn(&RuntimeState, u64) -> u64,
-        record_console_text: fn(&RuntimeState, u64, &str),
     ) -> Self {
         Self {
             table: ResourceTable::new(),
@@ -108,13 +108,11 @@ where
             captured_stdout: Arc::new(Mutex::new(Vec::new())),
             captured_stderr: Arc::new(Mutex::new(Vec::new())),
             serial_writer,
-            uptime_nanos,
-            record_console_text,
         }
     }
 
     pub fn now_nanos(&self) -> u64 {
-        (self.uptime_nanos)(&self.runtime_state, self.cpu.now().ticks())
+        self.runtime_state.uptime_nanos(self.cpu.now().ticks())
     }
 
     pub fn write_output(&mut self, stream: ComponentOutputStreamKind, bytes: &[u8]) {
@@ -133,11 +131,11 @@ where
     }
 }
 
-impl<CpuImpl, RuntimeState, FileSystem> ResourceLimiter
-    for ComponentStoreData<CpuImpl, RuntimeState, FileSystem>
+impl<CpuImpl, RuntimeStateImpl, FileSystem> ResourceLimiter
+    for ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem>
 where
     CpuImpl: Cpu + Clone,
-    RuntimeState: Clone + Send,
+    RuntimeStateImpl: ComponentRuntimeState,
     FileSystem: Send,
 {
     fn memory_growing(
@@ -163,23 +161,24 @@ where
     }
 }
 
-impl<CpuImpl, RuntimeState, FileSystem> IoView for ComponentStoreData<CpuImpl, RuntimeState, FileSystem>
+impl<CpuImpl, RuntimeStateImpl, FileSystem> IoView
+    for ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem>
 where
     CpuImpl: Cpu + Clone,
-    RuntimeState: Clone + Send,
+    RuntimeStateImpl: ComponentRuntimeState,
 {
     fn table(&mut self) -> &mut ResourceTable {
         &mut self.table
     }
 }
 
-impl<CpuImpl, RuntimeState> ComponentOutput<CpuImpl, RuntimeState>
+impl<CpuImpl, RuntimeStateImpl> ComponentOutput<CpuImpl, RuntimeStateImpl>
 where
     CpuImpl: Cpu + Clone,
-    RuntimeState: Clone + Send + 'static,
+    RuntimeStateImpl: ComponentRuntimeState,
 {
     fn from_store<FileSystem>(
-        store: &ComponentStoreData<CpuImpl, RuntimeState, FileSystem>,
+        store: &ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem>,
     ) -> Self {
         Self {
             mode: store.output_mode,
@@ -188,7 +187,6 @@ where
             captured_stdout: store.captured_stdout.clone(),
             captured_stderr: store.captured_stderr.clone(),
             serial_writer: store.serial_writer,
-            record_console_text: store.record_console_text,
         }
     }
 
@@ -199,7 +197,8 @@ where
                 let text = core::str::from_utf8(bytes).unwrap_or_else(|error| {
                     panic!("guest attempted to write non-utf8 stdout/stderr bytes: {error}")
                 });
-                (self.record_console_text)(&self.runtime_state, self.cpu.now().ticks(), text);
+                self.runtime_state
+                    .record_console_text(self.cpu.now().ticks(), text);
             }
             ComponentOutputMode::Capture => match stream {
                 ComponentOutputStreamKind::Stdout => {
@@ -213,13 +212,13 @@ where
     }
 }
 
-impl<CpuImpl, RuntimeState> ComponentOutputStream<CpuImpl, RuntimeState>
+impl<CpuImpl, RuntimeStateImpl> ComponentOutputStream<CpuImpl, RuntimeStateImpl>
 where
     CpuImpl: Cpu + Clone,
-    RuntimeState: Clone + Send + 'static,
+    RuntimeStateImpl: ComponentRuntimeState,
 {
     pub fn from_store<FileSystem>(
-        store: &ComponentStoreData<CpuImpl, RuntimeState, FileSystem>,
+        store: &ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem>,
         stream: ComponentOutputStreamKind,
     ) -> Self {
         Self {
@@ -229,40 +228,34 @@ where
     }
 }
 
-impl<CpuImpl, RuntimeState> DeadlinePollable<CpuImpl, RuntimeState>
+impl<CpuImpl, RuntimeStateImpl> DeadlinePollable<CpuImpl, RuntimeStateImpl>
 where
     CpuImpl: Cpu + Clone,
-    RuntimeState: Clone + Send + 'static,
+    RuntimeStateImpl: ComponentRuntimeState,
 {
-    pub fn new(
-        cpu: CpuImpl,
-        runtime_state: RuntimeState,
-        deadline_nanos: u64,
-        uptime_nanos: fn(&RuntimeState, u64) -> u64,
-    ) -> Self {
+    pub fn new(cpu: CpuImpl, runtime_state: RuntimeStateImpl, deadline_nanos: u64) -> Self {
         Self {
             cpu,
             runtime_state,
             deadline_nanos,
-            uptime_nanos,
         }
     }
 }
 
 #[wasmtime_wasi_io::async_trait]
-impl<CpuImpl, RuntimeState> Pollable for ComponentOutputStream<CpuImpl, RuntimeState>
+impl<CpuImpl, RuntimeStateImpl> Pollable for ComponentOutputStream<CpuImpl, RuntimeStateImpl>
 where
     CpuImpl: Cpu + Clone,
-    RuntimeState: Clone + Send + 'static,
+    RuntimeStateImpl: ComponentRuntimeState,
 {
     async fn ready(&mut self) {}
 }
 
 #[wasmtime_wasi_io::async_trait]
-impl<CpuImpl, RuntimeState> OutputStream for ComponentOutputStream<CpuImpl, RuntimeState>
+impl<CpuImpl, RuntimeStateImpl> OutputStream for ComponentOutputStream<CpuImpl, RuntimeStateImpl>
 where
     CpuImpl: Cpu + Clone,
-    RuntimeState: Clone + Send + 'static,
+    RuntimeStateImpl: ComponentRuntimeState,
 {
     fn write(&mut self, bytes: Bytes) -> Result<(), StreamError> {
         self.sink.write(self.stream, bytes.as_ref());
@@ -279,14 +272,13 @@ where
 }
 
 #[wasmtime_wasi_io::async_trait]
-impl<CpuImpl, RuntimeState> Pollable for DeadlinePollable<CpuImpl, RuntimeState>
+impl<CpuImpl, RuntimeStateImpl> Pollable for DeadlinePollable<CpuImpl, RuntimeStateImpl>
 where
     CpuImpl: Cpu + Clone,
-    RuntimeState: Clone + Send + 'static,
+    RuntimeStateImpl: ComponentRuntimeState,
 {
     async fn ready(&mut self) {
-        while (self.uptime_nanos)(&self.runtime_state, self.cpu.now().ticks()) < self.deadline_nanos
-        {
+        while self.runtime_state.uptime_nanos(self.cpu.now().ticks()) < self.deadline_nanos {
             core::hint::spin_loop();
         }
     }

@@ -353,9 +353,7 @@ fn run_program_component(
             argv,
             Vec::new(),
             output_mode,
-            write_serial,
-            runtime_uptime_nanos,
-            runtime_record_console_text,
+            write_serial
         ),
     );
     tracing::info!(

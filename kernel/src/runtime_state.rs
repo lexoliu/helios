@@ -8,6 +8,8 @@ use crate::{
 };
 use spin::Mutex;
 
+use crate::component_runtime::ComponentRuntimeState;
+
 #[derive(Clone)]
 pub struct RuntimeState<ProgramService, NetworkService, HostFsService> {
     inner: Arc<RuntimeStateInner<ProgramService, NetworkService, HostFsService>>,
@@ -125,5 +127,21 @@ where
 
     pub fn host_fs_service(&self) -> Option<HostFsService> {
         self.inner.host_fs_service.lock().clone()
+    }
+}
+
+impl<ProgramService, NetworkService, HostFsService> ComponentRuntimeState
+    for RuntimeState<ProgramService, NetworkService, HostFsService>
+where
+    ProgramService: Clone + Send + 'static,
+    NetworkService: Clone + Send + 'static,
+    HostFsService: Clone + Send + 'static,
+{
+    fn uptime_nanos(&self, current_ticks: u64) -> u64 {
+        RuntimeState::uptime_nanos(self, current_ticks)
+    }
+
+    fn record_console_text(&self, current_ticks: u64, text: &str) {
+        RuntimeState::record_console_text(self, current_ticks, text);
     }
 }
