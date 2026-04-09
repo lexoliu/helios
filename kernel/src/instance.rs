@@ -153,6 +153,30 @@ impl Default for InstanceRegistry {
     }
 }
 
+pub fn record_instance_call_hook(instance: &RegisteredInstance, hook: wasmtime::CallHook, now_nanos: u64) {
+    let transition = match hook {
+        wasmtime::CallHook::CallingWasm | wasmtime::CallHook::ReturningFromHost => {
+            InstanceExecutionTransition::Resume
+        }
+        wasmtime::CallHook::ReturningFromWasm | wasmtime::CallHook::CallingHost => {
+            InstanceExecutionTransition::Pause
+        }
+    };
+    instance.transition(transition, now_nanos);
+}
+
+pub fn allow_instance_resource_growth(
+    instance: &RegisteredInstance,
+    desired: usize,
+    maximum: Option<usize>,
+) -> bool {
+    let allow = maximum.is_none_or(|maximum| desired <= maximum);
+    if allow {
+        instance.set_memory_bytes(u64::try_from(desired).expect("desired memory exceeds u64"));
+    }
+    allow
+}
+
 impl RegisteredInstance {
     pub fn id(&self) -> InstanceId {
         self.entry.id
