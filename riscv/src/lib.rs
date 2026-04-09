@@ -4,17 +4,68 @@
 extern crate alloc;
 
 pub mod compute;
-mod debug_state;
 mod debug_transport;
-mod debugger_bindings;
 mod debugger_program;
 mod debugger_wasi;
 mod debugger_wasi_p2;
 mod host_fs;
 mod net;
-mod program_bindings;
 mod program_host;
 mod virtio_mmio;
+
+mod debug_state {
+    pub(crate) type RuntimeState = helios_kernel::RuntimeState<
+        crate::program_host::UserProgramService,
+        crate::net::NetworkService,
+        crate::host_fs::HostFileSystemService,
+    >;
+}
+
+mod debugger_bindings {
+    pub(crate) mod bindings {
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "debugger",
+            imports: { default: async | store | trappable },
+            exports: { default: async },
+            with: {
+                "helios:system/net.tcp-stream": crate::debugger_program::SbiTcpStream,
+                "helios:system/serial.serial-port": crate::debugger_program::SbiSerialPort,
+                "helios:system/sync.raw-mutex": crate::debugger_program::SbiRawMutex,
+                "helios:system/sync.raw-mutex-guard": crate::debugger_program::SbiRawMutexGuard,
+                "helios:system/sync.raw-rw-lock": crate::debugger_program::SbiRawRwLock,
+                "helios:system/sync.raw-rw-lock-read-guard":
+                    crate::debugger_program::SbiRawRwLockReadGuard,
+                "helios:system/sync.raw-rw-lock-write-guard":
+                    crate::debugger_program::SbiRawRwLockWriteGuard,
+            },
+            require_store_data_send: true,
+        });
+    }
+}
+
+mod program_bindings {
+    pub(crate) mod bindings {
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "init",
+            imports: { default: async | store | trappable },
+            exports: { default: async },
+            with: {
+                "helios:system/net.tcp-stream": crate::debugger_program::SbiTcpStream,
+                "helios:system/serial.serial-port": crate::debugger_program::SbiSerialPort,
+                "helios:system/sync.raw-mutex": crate::debugger_program::SbiRawMutex,
+                "helios:system/sync.raw-mutex-guard": crate::debugger_program::SbiRawMutexGuard,
+                "helios:system/sync.raw-rw-lock": crate::debugger_program::SbiRawRwLock,
+                "helios:system/sync.raw-rw-lock-read-guard":
+                    crate::debugger_program::SbiRawRwLockReadGuard,
+                "helios:system/sync.raw-rw-lock-write-guard":
+                    crate::debugger_program::SbiRawRwLockWriteGuard,
+            },
+            require_store_data_send: true,
+        });
+    }
+}
 
 use core::arch::{asm, global_asm};
 use core::cell::Cell;
