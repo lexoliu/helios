@@ -343,20 +343,20 @@ fn run_program_component(
 
     let mut store = store_with_state(
         component.engine(),
-        StoreData {
-            table: ResourceTable::new(),
+        StoreData::new(
             cpu,
             debug_state,
             instance_registry,
             instance,
-            debug_port: None,
+            None,
             filesystem,
-            arguments: argv,
-            environment: Vec::new(),
+            argv,
+            Vec::new(),
             output_mode,
-            captured_stdout: Arc::new(Mutex::new(Vec::new())),
-            captured_stderr: Arc::new(Mutex::new(Vec::new())),
-        },
+            write_serial,
+            runtime_uptime_nanos,
+            runtime_record_console_text,
+        ),
     );
     tracing::info!(
         target: "helios_riscv::program_host",
