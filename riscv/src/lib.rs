@@ -10,12 +10,11 @@ mod debugger_wasi;
 mod debugger_wasi_p2;
 mod host_fs;
 mod net;
-mod program_host;
 mod virtio_mmio;
 
 mod debug_state {
     pub(crate) type RuntimeState = helios_kernel::RuntimeState<
-        crate::program_host::UserProgramService,
+        crate::debugger_program::UserProgramService,
         crate::net::NetworkService,
         crate::host_fs::HostFileSystemService,
     >;
@@ -457,8 +456,12 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     if debugger_program::should_run_on(current_hart.id(), hart_count, bootstrap_processor.id()) {
         debugger_program::run_forever(cpu.clone());
     }
-    if program_host::should_run_on(current_hart.id(), hart_count, bootstrap_processor.id()) {
-        program_host::run_forever(cpu.clone(), kernel);
+    if debugger_program::program_worker_should_run_on(
+        current_hart.id(),
+        hart_count,
+        bootstrap_processor.id(),
+    ) {
+        debugger_program::run_program_workers_forever(cpu.clone(), kernel);
     }
     kernel.run();
 }
