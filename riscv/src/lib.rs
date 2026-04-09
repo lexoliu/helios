@@ -63,7 +63,6 @@ mod program_bindings {
     }
 }
 
-use fdt::Fdt;
 use ns16550a::Uart;
 
 /// Debugger byte transport backed by the machine's boot UART. Kernel tracing
@@ -119,7 +118,7 @@ const VIRTIO_MMIO_MAGIC_OFFSET: usize = 0x000;
 const VIRTIO_MMIO_VERSION_OFFSET: usize = 0x004;
 const VIRTIO_MMIO_DEVICE_ID_OFFSET: usize = 0x008;
 
-pub(crate) fn matches_device(base: usize, expected: DeviceType) -> bool {
+pub(crate) fn matches_virtio_mmio_device(base: usize, expected: DeviceType) -> bool {
     unsafe {
         read_u32(base + VIRTIO_MMIO_MAGIC_OFFSET) == VIRTIO_MMIO_MAGIC
             && read_u32(base + VIRTIO_MMIO_VERSION_OFFSET) == VIRTIO_MMIO_MODERN_VERSION
