@@ -1,8 +1,17 @@
 #![no_std]
+#![allow(hidden_glob_reexports)]
 extern crate alloc;
 extern crate self as helios_kernel;
 #[cfg(not(target_os = "none"))]
 extern crate std;
+pub extern crate wasmtime;
+pub extern crate wasmtime_wasi_io;
+#[allow(hidden_glob_reexports)]
+pub use wasmtime::*;
+pub use wasmtime::component;
+#[allow(hidden_glob_reexports)]
+pub use wasmtime_wasi_io::*;
+
 mod block_on;
 mod bootfs;
 mod component_cache;

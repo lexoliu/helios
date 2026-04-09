@@ -23,5 +23,3 @@ helios-kernel.workspace = true
 helios-virtio = { path = "../virtio" }
 tracing.workspace = true
 thiserror = { version = "2.0.17", default-features = false }
-wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["async", "call-hook", "component-model", "component-model-async", "cranelift", "riscv64", "runtime"] }
-wasmtime-wasi-io = { path = "../../wasmtime/crates/wasi-io", default-features = false }

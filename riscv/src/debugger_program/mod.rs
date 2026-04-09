@@ -22,20 +22,20 @@ use helios_kernel::{
     embedded_debugger, heap_stats,
     monotonic_nanos,
 };
+use helios_kernel::wasmtime::{
+    self, CallHook, CustomCodeMemory, Engine, OptLevel, RegallocAlgorithm, ResourceLimiter,
+    Store, StoreContextMut,
+};
+use helios_kernel::wasmtime::component::{
+    Accessor, Component, Destination, HasSelf, Linker, Resource, ResourceTable, ResourceType,
+    StreamProducer, StreamReader, StreamResult,
+};
+use helios_kernel::wasmtime_wasi_io::{self, IoView};
+use helios_kernel::wasmtime_wasi_io::bytes::Bytes;
+use helios_kernel::wasmtime_wasi_io::poll::Pollable;
+use helios_kernel::wasmtime_wasi_io::streams::{OutputStream, StreamError};
 use spin::Mutex;
 use thiserror::Error;
-use wasmtime::component::{
-    Accessor, Destination, HasSelf, Linker, Resource, ResourceTable, ResourceType, StreamProducer,
-    StreamReader, StreamResult,
-};
-use wasmtime::{
-    CallHook, CustomCodeMemory, Engine, OptLevel, RegallocAlgorithm, ResourceLimiter, Store,
-    StoreContextMut,
-};
-use wasmtime_wasi_io::IoView;
-use wasmtime_wasi_io::bytes::Bytes;
-use wasmtime_wasi_io::poll::Pollable;
-use wasmtime_wasi_io::streams::{OutputStream, StreamError};
 
 use crate::debug_state::RuntimeState;
 use crate::debugger_bindings::bindings;
@@ -157,7 +157,7 @@ fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), Debugge
     emit_stage_marker("engine:ok");
     tracing::info!("debugger hart: compiling embedded debugger component");
     let component =
-        wasmtime::component::Component::from_binary(&engine, debugger.component().bytes())
+        Component::from_binary(&engine, debugger.component().bytes())
             .map_err(DebuggerError::CompileComponent)?;
     emit_stage_marker("component:ok");
 

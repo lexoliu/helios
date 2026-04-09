@@ -5,11 +5,12 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use wasmtime::Result;
-use wasmtime::component::{HasSelf, Linker, Resource};
-use wasmtime_wasi_io::bytes::Bytes;
-use wasmtime_wasi_io::poll::{DynPollable, Pollable, subscribe};
-use wasmtime_wasi_io::streams::{
+use helios_kernel::wasmtime::{self, Result};
+use helios_kernel::wasmtime::component::{HasSelf, Linker, Resource};
+use helios_kernel::wasmtime_wasi_io::{self};
+use helios_kernel::wasmtime_wasi_io::bytes::Bytes;
+use helios_kernel::wasmtime_wasi_io::poll::{DynPollable, Pollable, subscribe};
+use helios_kernel::wasmtime_wasi_io::streams::{
     DynInputStream, DynOutputStream, Error as IoError, InputStream, StreamError,
 };
 
@@ -20,7 +21,10 @@ use crate::debugger_wasi::{FsDescriptor, FsNodeKind};
 
 pub(crate) mod cli_bindings {
     mod generated {
-        wasmtime::component::bindgen!({
+        use helios_kernel::wasmtime;
+        use helios_kernel::wasmtime_wasi_io;
+
+        helios_kernel::wasmtime::component::bindgen!({
             inline: "
                 package helios:debugger-p2-cli;
 
@@ -55,7 +59,10 @@ pub(crate) mod cli_bindings {
 
 pub(crate) mod clocks_bindings {
     mod generated {
-        wasmtime::component::bindgen!({
+        use helios_kernel::wasmtime;
+        use helios_kernel::wasmtime_wasi_io;
+
+        helios_kernel::wasmtime::component::bindgen!({
             inline: "
                 package helios:debugger-p2-clocks;
 
@@ -78,7 +85,10 @@ pub(crate) mod clocks_bindings {
 
 pub(crate) mod filesystem_bindings {
     mod generated {
-        wasmtime::component::bindgen!({
+        use helios_kernel::wasmtime;
+        use helios_kernel::wasmtime_wasi_io;
+
+        helios_kernel::wasmtime::component::bindgen!({
             inline: "
                 package helios:debugger-p2-filesystem;
 
@@ -106,7 +116,9 @@ pub(crate) mod filesystem_bindings {
 
 pub(crate) mod random_bindings {
     mod generated {
-        wasmtime::component::bindgen!({
+        use helios_kernel::wasmtime;
+
+        helios_kernel::wasmtime::component::bindgen!({
             inline: "
                 package helios:debugger-p2-random;
 
