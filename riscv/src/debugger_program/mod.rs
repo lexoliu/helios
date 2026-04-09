@@ -165,9 +165,7 @@ fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), Debugge
             Vec::new(),
             Vec::new(),
             OutputMode::Serial,
-            write_serial,
-            runtime_uptime_nanos,
-            runtime_record_console_text,
+            write_serial
         ),
     );
     emit_stage_marker("store:ok");
@@ -1129,14 +1127,6 @@ fn add_instances_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<(
             .collect::<Vec<_>>(),))
     })?;
     Ok(())
-}
-
-pub(crate) fn runtime_uptime_nanos(state: &RuntimeState, ticks: u64) -> u64 {
-    state.uptime_nanos(ticks)
-}
-
-pub(crate) fn runtime_record_console_text(state: &RuntimeState, ticks: u64, text: &str) {
-    state.record_console_text(ticks, text);
 }
 
 impl bindings::helios::system::serial::Host for StoreData {}

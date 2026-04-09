@@ -15,7 +15,7 @@ use helios_kernel::wasmtime_wasi_io::streams::{
 };
 
 use crate::debugger_program::{DebugSerialOutputStream, RuntimeDeadlinePollable, StoreData};
-use crate::debugger_program::{OutputStreamKind, runtime_uptime_nanos};
+use crate::debugger_program::OutputStreamKind;
 use crate::debugger_wasi;
 use crate::debugger_wasi::bindings::filesystem::types as p3fs;
 use crate::debugger_wasi::{FsDescriptor, FsNodeKind};
@@ -325,8 +325,7 @@ impl clocks_bindings::clocks::monotonic_clock::Host for StoreData {
         let resource = self.table.push(RuntimeDeadlinePollable::new(
             self.cpu.clone(),
             self.runtime_state.clone(),
-            when,
-            runtime_uptime_nanos,
+            when
         ))?;
         subscribe(&mut self.table, resource)
     }
