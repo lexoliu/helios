@@ -4,12 +4,10 @@
 extern crate alloc;
 
 pub mod compute;
-mod debug_transport;
 mod debugger_program;
 mod debugger_wasi;
 mod host_fs;
 mod net;
-mod virtio_mmio;
 
 mod debug_state {
     pub(crate) type RuntimeState = helios_kernel::RuntimeState<
@@ -65,6 +63,74 @@ mod program_bindings {
     }
 }
 
+use fdt::Fdt;
+use ns16550a::Uart;
+
+/// Debugger byte transport backed by the machine's boot UART. Kernel tracing
+/// stays in memory so the line remains reserved for RPC traffic after boot.
+pub(crate) struct DebugTransport {
+    uart_base: usize,
+}
+
+impl DebugTransport {
+    pub(crate) fn discover(fdt: &Fdt<'_>) -> Option<Self> {
+        let chosen = fdt.find_node("/chosen")?;
+        let stdout_path = chosen
+            .properties()
+            .find(|property| property.name == "stdin-path")
+            .or_else(|| {
+                chosen
+                    .properties()
+                    .find(|property| property.name == "stdout-path")
+            })?;
+        let path = core::str::from_utf8(stdout_path.value)
+            .ok()?
+            .trim_end_matches('\0')
+            .split(':')
+            .next()?;
+        let node = fdt
+            .find_node(path)
+            .or_else(|| fdt.aliases().and_then(|aliases| aliases.resolve_node(path)))?;
+        let region = node.reg()?.next()?;
+        Some(Self {
+            uart_base: region.starting_address as usize,
+        })
+    }
+
+    pub(crate) fn try_read_byte(&self) -> Option<u8> {
+        Uart::new(self.uart_base).get()
+    }
+
+    pub(crate) fn write_bytes(&self, bytes: &[u8]) {
+        let uart = Uart::new(self.uart_base);
+        for &byte in bytes {
+            while uart.put(byte).is_none() {
+                core::hint::spin_loop();
+            }
+        }
+    }
+}
+
+use helios_virtio::DeviceType;
+
+const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976;
+const VIRTIO_MMIO_MODERN_VERSION: u32 = 2;
+const VIRTIO_MMIO_MAGIC_OFFSET: usize = 0x000;
+const VIRTIO_MMIO_VERSION_OFFSET: usize = 0x004;
+const VIRTIO_MMIO_DEVICE_ID_OFFSET: usize = 0x008;
+
+pub(crate) fn matches_device(base: usize, expected: DeviceType) -> bool {
+    unsafe {
+        read_u32(base + VIRTIO_MMIO_MAGIC_OFFSET) == VIRTIO_MMIO_MAGIC
+            && read_u32(base + VIRTIO_MMIO_VERSION_OFFSET) == VIRTIO_MMIO_MODERN_VERSION
+            && read_u32(base + VIRTIO_MMIO_DEVICE_ID_OFFSET) == expected as u32
+    }
+}
+
+unsafe fn read_u32(addr: usize) -> u32 {
+    unsafe { (addr as *const u32).read_volatile() }
+}
+
 use core::arch::{asm, global_asm};
 use core::cell::Cell;
 use core::fmt::Write;
@@ -72,7 +138,6 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
 
 use arrayvec::ArrayVec;
-use debug_transport::DebugTransport;
 use fdt::Fdt;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
