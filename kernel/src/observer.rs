@@ -226,9 +226,12 @@ fn strip_ansi(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use alloc::borrow::ToOwned;
+    use alloc::vec;
+
     use super::{
-        TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceValue,
-        matches_trace_filter, parse_console_text,
+        TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceValue, matches_trace_filter,
+        parse_console_text,
     };
 
     #[test]

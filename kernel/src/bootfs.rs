@@ -269,23 +269,16 @@ impl FileSystem for EmbeddedBootFs {
         }
     }
 
-    fn create_directory(
-        &self,
-        _path: &str,
-    ) -> impl core::future::Future<Output = IoResult<Self::Directory>> + Send {
-        async move { Err(IoError::ReadOnly) }
+    async fn create_directory(&self, _path: &str) -> IoResult<Self::Directory> {
+        Err(IoError::ReadOnly)
     }
 
-    fn remove(&self, _path: &str) -> impl core::future::Future<Output = IoResult<()>> + Send {
-        async move { Err(IoError::ReadOnly) }
+    async fn remove(&self, _path: &str) -> IoResult<()> {
+        Err(IoError::ReadOnly)
     }
 
-    fn rename(
-        &self,
-        _source: &str,
-        _destination: &str,
-    ) -> impl core::future::Future<Output = IoResult<()>> + Send {
-        async move { Err(IoError::ReadOnly) }
+    async fn rename(&self, _source: &str, _destination: &str) -> IoResult<()> {
+        Err(IoError::ReadOnly)
     }
 }
 
@@ -349,14 +342,11 @@ impl Directory for BootDirectory {
         }
     }
 
-    fn create_directory(
-        &self,
-        _path: &str,
-    ) -> impl core::future::Future<Output = IoResult<Self>> + Send
+    async fn create_directory(&self, _path: &str) -> IoResult<Self>
     where
         Self: Sized,
     {
-        async move { Err(IoError::ReadOnly) }
+        Err(IoError::ReadOnly)
     }
 
     fn open_file(
@@ -369,16 +359,12 @@ impl Directory for BootDirectory {
         async move { Ok(directory.image.file(&directory.resolve_path(&path))) }
     }
 
-    fn remove(&self, _path: &str) -> impl core::future::Future<Output = IoResult<()>> + Send {
-        async move { Err(IoError::ReadOnly) }
+    async fn remove(&self, _path: &str) -> IoResult<()> {
+        Err(IoError::ReadOnly)
     }
 
-    fn rename(
-        &self,
-        _source: &str,
-        _destination: &str,
-    ) -> impl core::future::Future<Output = IoResult<()>> + Send {
-        async move { Err(IoError::ReadOnly) }
+    async fn rename(&self, _source: &str, _destination: &str) -> IoResult<()> {
+        Err(IoError::ReadOnly)
     }
 }
 
