@@ -70,7 +70,7 @@ pub use sync::{
 pub use task::{YieldNow, yield_now};
 pub use time::{elapsed_millis, monotonic_nanos};
 pub use timer::{Sleep, Timer};
-pub use wasmtime_config::build_target_engine_config;
+pub use wasmtime_config::{build_component_engine_config, build_target_engine_config};
 
 use core::sync::atomic::{AtomicU8, Ordering};
 use core::time::Duration;

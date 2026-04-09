@@ -5,12 +5,13 @@ use std::time::Instant as StdInstant;
 
 use helios_kernel::{
     EmbeddedComponent, EmbeddedDebugger, EmbeddedInit, InstanceExecutionTransition,
-    InstanceRegistry, Kernel, ProgramService, RegisteredInstance, embedded_debugger, embedded_init,
+    InstanceRegistry, Kernel, ProgramService, RegisteredInstance, build_component_engine_config,
+    embedded_debugger, embedded_init,
 };
 use tempfile::TempDir;
 use thiserror::Error;
 use wasmtime::component::{HasSelf, ResourceTable};
-use wasmtime::{CallHook, Config, Engine, ResourceLimiter, Store};
+use wasmtime::{CallHook, Engine, ResourceLimiter, Store};
 use wasmtime_wasi::cli;
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
@@ -245,12 +246,7 @@ fn add_generated_bindings_to_linker(
 }
 
 fn build_engine() -> Result<Engine, HostedProgramError> {
-    let mut config = Config::new();
-    config
-        .target(WASMTIME_TARGET)
-        .expect("hosted Wasmtime target must be accepted");
-    config.wasm_component_model(true);
-    config.wasm_component_model_async(true);
+    let config = build_component_engine_config(WASMTIME_TARGET);
     Engine::new(&config).map_err(HostedProgramError::CreateEngine)
 }
 
