@@ -10,7 +10,8 @@ use helios_hal::cpu::Cpu;
 use helios_hal::resource::WasiRights;
 use helios_kernel::{
     ComponentCache, ComputePool, ComputePriority, ExecOutput, ExecResult, InstanceRegistry, Notify,
-    ProgramExecError, ProgramExecErrorKind, RegisteredInstance, heap_stats,
+    ProgramExecError, ProgramExecErrorKind, RegisteredInstance, elapsed_millis, heap_stats,
+    monotonic_nanos,
 };
 use spin::Mutex;
 use wasmtime::Engine;
@@ -32,7 +33,7 @@ struct UserProgramServiceInner {
     compiler: ComputePool,
     compile_priority: ComputePriority,
     component_cache: Mutex<ComponentCache<Component>>,
-    timebase_frequency: u64,
+    clock_cpu: RiscvCpu,
     debug_state: RuntimeState,
     instance_registry: InstanceRegistry,
     run_queue: ConcurrentQueue<QueuedProgram>,
@@ -82,7 +83,7 @@ pub(crate) fn install_program_service(
             compiler,
             compile_priority: ComputePriority::NORMAL,
             component_cache: Mutex::new(ComponentCache::new(cache_budget)),
-            timebase_frequency: cpu.timer_frequency(),
+            clock_cpu: cpu.clone(),
             debug_state: debug_state.clone(),
             instance_registry: debug_state.instance_registry(),
             run_queue: ConcurrentQueue::unbounded(),
@@ -138,7 +139,7 @@ impl UserProgramService {
     ) -> Result<ExecResult, ProgramExecError> {
         let name = name.into();
         let component = self.compile_component(wasm).await?;
-        let started_at = monotonic_nanos(self.inner.timebase_frequency);
+        let started_at = monotonic_nanos(&self.inner.clock_cpu);
         let instance = self
             .inner
             .instance_registry
@@ -237,14 +238,15 @@ impl UserProgramService {
     }
 
     async fn compile_component(&self, wasm: &[u8]) -> Result<Arc<Component>, ProgramExecError> {
-        let started_at = monotonic_nanos(self.inner.timebase_frequency);
+        let started_at = monotonic_nanos(&self.inner.clock_cpu);
         if let Some(component) = self.inner.component_cache.lock().get(wasm) {
+            let now = monotonic_nanos(&self.inner.clock_cpu);
             tracing::info!(
                 target: "helios_riscv::program_host",
                 phase = "compile-component",
                 cache = "hit",
                 wasm_bytes = wasm.len(),
-                elapsed_ms = elapsed_millis(started_at, self.inner.timebase_frequency),
+                elapsed_ms = elapsed_millis(started_at, now),
                 "program component cache hit"
             );
             return Ok(component);
@@ -270,12 +272,13 @@ impl UserProgramService {
             })?;
 
         let component = Arc::new(compiled);
+        let now = monotonic_nanos(&self.inner.clock_cpu);
         tracing::info!(
             target: "helios_riscv::program_host",
             phase = "compile-component",
             cache = "miss",
             wasm_bytes = wasm.len(),
-            elapsed_ms = elapsed_millis(started_at, self.inner.timebase_frequency),
+            elapsed_ms = elapsed_millis(started_at, now),
             "program component compiled"
         );
         Ok(self
@@ -313,8 +316,7 @@ fn run_component(
     let mut argv = Vec::with_capacity(args.len() + 1);
     argv.push(name);
     argv.extend(args);
-    let timebase_frequency = cpu.timer_frequency();
-    let store_started_at = monotonic_nanos(timebase_frequency);
+    let store_started_at = monotonic_nanos(&cpu);
     let linker = debugger_program::component_linker(
         component.engine(),
         debugger_program::SystemWorld::Program,
@@ -341,11 +343,11 @@ fn run_component(
         target: "helios_riscv::program_host",
         phase = "prepare-store",
         instance = store.data().instance.id().raw(),
-        elapsed_ms = elapsed_millis(store_started_at, timebase_frequency),
+        elapsed_ms = elapsed_millis(store_started_at, monotonic_nanos(&store.data().cpu)),
         "program store prepared"
     );
 
-    let instantiate_started_at = monotonic_nanos(timebase_frequency);
+    let instantiate_started_at = monotonic_nanos(&store.data().cpu);
     let program = helios_kernel::block_on(program_bindings::bindings::Init::instantiate_async(
         &mut store, &component, &linker,
     ))?;
@@ -353,10 +355,10 @@ fn run_component(
         target: "helios_riscv::program_host",
         phase = "instantiate",
         instance = store.data().instance.id().raw(),
-        elapsed_ms = elapsed_millis(instantiate_started_at, timebase_frequency),
+        elapsed_ms = elapsed_millis(instantiate_started_at, monotonic_nanos(&store.data().cpu)),
         "program component instantiated"
     );
-    let run_started_at = monotonic_nanos(timebase_frequency);
+    let run_started_at = monotonic_nanos(&store.data().cpu);
     let result =
         helios_kernel::block_on(store.run_concurrent(async move |accessor| {
             program.wasi_cli_run().call_run(accessor).await
@@ -365,7 +367,7 @@ fn run_component(
         target: "helios_riscv::program_host",
         phase = "call-run",
         instance = store.data().instance.id().raw(),
-        elapsed_ms = elapsed_millis(run_started_at, timebase_frequency),
+        elapsed_ms = elapsed_millis(run_started_at, monotonic_nanos(&store.data().cpu)),
         "program call_run completed"
     );
     let exit_code = match result {
@@ -375,13 +377,4 @@ fn run_component(
     };
     let output = store.data().take_captured_output();
     Ok((exit_code, output))
-}
-
-fn monotonic_nanos(timebase_frequency: u64) -> u64 {
-    let ticks = riscv::register::time::read64();
-    ticks.saturating_mul(1_000_000_000) / timebase_frequency
-}
-
-fn elapsed_millis(started_at: u64, timebase_frequency: u64) -> u64 {
-    monotonic_nanos(timebase_frequency).saturating_sub(started_at) / 1_000_000
 }

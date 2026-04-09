@@ -13,6 +13,7 @@ use thiserror::Error;
 use crate::program::CompileError;
 use crate::{
     Blueprint, InstanceId, InstanceRegistry, Notify, ProgramRuntime, ProgramRuntimeDriver, Task,
+    monotonic_nanos,
 };
 
 #[derive(Clone)]
@@ -184,9 +185,4 @@ impl From<CompileError> for ProgramExecError {
             },
         }
     }
-}
-
-fn monotonic_nanos<CpuImpl: Cpu>(cpu: &CpuImpl) -> u64 {
-    let ticks = cpu.now().ticks();
-    ticks.saturating_mul(1_000_000_000) / cpu.timer_frequency()
 }

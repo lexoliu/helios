@@ -22,6 +22,7 @@ mod runtime_state;
 mod runtime_types;
 mod sync;
 mod task;
+mod time;
 mod timer;
 
 pub use block_on::block_on;
@@ -65,6 +66,7 @@ pub use sync::{
     RawRwLockWriteLease, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
 pub use task::{YieldNow, yield_now};
+pub use time::{elapsed_millis, monotonic_nanos};
 pub use timer::{Sleep, Timer};
 
 use core::sync::atomic::{AtomicU8, Ordering};
