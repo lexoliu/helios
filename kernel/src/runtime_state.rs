@@ -9,6 +9,7 @@ use crate::{
 use spin::Mutex;
 
 use crate::component_runtime::ComponentRuntimeState;
+use crate::runtime_types::ComponentHostFilesystemState;
 
 #[derive(Clone)]
 pub struct RuntimeState<ProgramService, NetworkService, HostFsService> {
@@ -143,5 +144,18 @@ where
 
     fn record_console_text(&self, current_ticks: u64, text: &str) {
         RuntimeState::record_console_text(self, current_ticks, text);
+    }
+}
+
+impl<ProgramService, NetworkService, HostFsService>
+    ComponentHostFilesystemState<HostFsService>
+    for RuntimeState<ProgramService, NetworkService, HostFsService>
+where
+    ProgramService: Clone + Send + 'static,
+    NetworkService: Clone + Send + 'static,
+    HostFsService: crate::HostFileSystem,
+{
+    fn host_filesystem_service(&self) -> Option<HostFsService> {
+        self.host_fs_service()
     }
 }
