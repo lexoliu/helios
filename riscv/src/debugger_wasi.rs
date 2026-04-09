@@ -465,7 +465,7 @@ impl DebugFileSystem {
         path: &str,
     ) -> core::result::Result<fs_types::DescriptorStat, fs_types::ErrorCode> {
         if let Some(host_path) = self.host_path(path) {
-            let metadata = crate::debugger_program::block_on(async {
+            let metadata = helios_kernel::block_on(async {
                 self.host_service()?
                     .stat_path(host_path)
                     .await
@@ -509,7 +509,7 @@ impl DebugFileSystem {
         path: &str,
     ) -> core::result::Result<fs_types::MetadataHashValue, fs_types::ErrorCode> {
         if let Some(host_path) = self.host_path(path) {
-            let metadata = crate::debugger_program::block_on(async {
+            let metadata = helios_kernel::block_on(async {
                 self.host_service()?
                     .stat_path(host_path)
                     .await
@@ -537,7 +537,7 @@ impl DebugFileSystem {
         path: &str,
     ) -> core::result::Result<Vec<fs_types::DirectoryEntry>, fs_types::ErrorCode> {
         if let Some(host_path) = self.host_path(path) {
-            let entries = crate::debugger_program::block_on(async {
+            let entries = helios_kernel::block_on(async {
                 self.host_service()?
                     .read_dir(host_path)
                     .await
@@ -623,7 +623,7 @@ impl DebugFileSystem {
                 return Err(fs_types::ErrorCode::ReadOnly);
             }
 
-            let bytes = crate::debugger_program::block_on(async {
+            let bytes = helios_kernel::block_on(async {
                 self.host_service()?
                     .read_file(host_path)
                     .await
@@ -671,7 +671,7 @@ impl DebugFileSystem {
             }
             let offset = u64::try_from(offset).map_err(|_| fs_types::ErrorCode::Overflow)?;
             let _ = now_nanos;
-            return crate::debugger_program::block_on(async {
+            return helios_kernel::block_on(async {
                 self.host_service()?
                     .write_file(host_path, offset, bytes)
                     .await
@@ -717,7 +717,7 @@ impl DebugFileSystem {
             if !descriptor.flags.contains(fs_types::DescriptorFlags::WRITE) {
                 return Err(fs_types::ErrorCode::ReadOnly);
             }
-            let offset = crate::debugger_program::block_on(async {
+            let offset = helios_kernel::block_on(async {
                 self.host_service()?
                     .stat_path(host_path)
                     .await
@@ -725,7 +725,7 @@ impl DebugFileSystem {
                     .map_err(map_host_fs_error)
             })?;
             let _ = now_nanos;
-            return crate::debugger_program::block_on(async {
+            return helios_kernel::block_on(async {
                 self.host_service()?
                     .write_file(host_path, offset, bytes)
                     .await
@@ -755,7 +755,7 @@ impl DebugFileSystem {
 
         let absolute = resolve_child_path(&base.path, path)?;
         if let Some(host_path) = self.host_path(&absolute) {
-            let metadata = crate::debugger_program::block_on(async {
+            let metadata = helios_kernel::block_on(async {
                 self.host_service()?
                     .stat_path(host_path)
                     .await
@@ -794,7 +794,7 @@ impl DebugFileSystem {
                         {
                             return Err(fs_types::ErrorCode::ReadOnly);
                         }
-                        crate::debugger_program::block_on(async {
+                        helios_kernel::block_on(async {
                             self.host_service()?
                                 .truncate_file(host_path)
                                 .await
@@ -820,7 +820,7 @@ impl DebugFileSystem {
                     {
                         return Err(fs_types::ErrorCode::ReadOnly);
                     }
-                    crate::debugger_program::block_on(async {
+                    helios_kernel::block_on(async {
                         self.host_service()?
                             .create_file(host_path)
                             .await
@@ -927,7 +927,7 @@ impl DebugFileSystem {
         }
         let absolute = resolve_child_path(&base.path, path)?;
         if let Some(host_path) = self.host_path(&absolute) {
-            return crate::debugger_program::block_on(async {
+            return helios_kernel::block_on(async {
                 self.host_service()?
                     .remove(host_path, true)
                     .await
@@ -974,7 +974,7 @@ impl DebugFileSystem {
         let absolute = resolve_child_path(&base.path, path)?;
         if let Some(host_path) = self.host_path(&absolute) {
             let _ = now_nanos;
-            return crate::debugger_program::block_on(async {
+            return helios_kernel::block_on(async {
                 self.host_service()?
                     .create_directory(host_path)
                     .await
@@ -1023,7 +1023,7 @@ impl DebugFileSystem {
         }
         let absolute = resolve_child_path(&base.path, path)?;
         if let Some(host_path) = self.host_path(&absolute) {
-            return crate::debugger_program::block_on(async {
+            return helios_kernel::block_on(async {
                 self.host_service()?
                     .remove(host_path, false)
                     .await
@@ -1074,7 +1074,7 @@ impl DebugFileSystem {
             let Some(destination_host) = destination_host else {
                 return Err(fs_types::ErrorCode::CrossDevice);
             };
-            return crate::debugger_program::block_on(async {
+            return helios_kernel::block_on(async {
                 self.host_service()?
                     .rename(source_host, destination_host)
                     .await

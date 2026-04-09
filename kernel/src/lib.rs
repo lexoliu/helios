@@ -3,6 +3,7 @@ extern crate alloc;
 extern crate self as helios_kernel;
 #[cfg(not(target_os = "none"))]
 extern crate std;
+mod block_on;
 mod bootfs;
 mod compute_pool;
 mod embedded_component;
@@ -21,6 +22,7 @@ mod sync;
 mod task;
 mod timer;
 
+pub use block_on::block_on;
 pub use bootfs::{
     BootDirectory, BootDirectoryEntry, BootDirectoryHandleExt, BootFile, EmbeddedBootFile,
     EmbeddedBootFs,

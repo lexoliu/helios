@@ -398,7 +398,7 @@ fn run_component(
     );
 
     let instantiate_started_at = monotonic_nanos(timebase_frequency);
-    let program = debugger_program::block_on(program_bindings::bindings::Init::instantiate_async(
+    let program = helios_kernel::block_on(program_bindings::bindings::Init::instantiate_async(
         &mut store, &component, &linker,
     ))?;
     tracing::info!(
@@ -410,7 +410,7 @@ fn run_component(
     );
     let run_started_at = monotonic_nanos(timebase_frequency);
     let result =
-        debugger_program::block_on(store.run_concurrent(async move |accessor| {
+        helios_kernel::block_on(store.run_concurrent(async move |accessor| {
             program.wasi_cli_run().call_run(accessor).await
         }))?;
     tracing::info!(
