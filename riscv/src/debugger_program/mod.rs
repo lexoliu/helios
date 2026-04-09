@@ -18,7 +18,7 @@ use helios_kernel::{
     InstanceRegistry, Notify, ProgramExecError, ProgramExecErrorKind,
     RawMutex, RawMutexGuardResource, RawMutexResource, RawRwLock, RawRwLockReadGuardResource,
     RawRwLockResource, RawRwLockWriteGuardResource, RegisteredInstance, SerialPortResource,
-    TcpStreamResource, build_component_engine, build_component_engine_config, elapsed_millis,
+    TcpStreamResource, build_component_engine_config, elapsed_millis,
     embedded_debugger, heap_stats,
     monotonic_nanos,
 };
