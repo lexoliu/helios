@@ -5,6 +5,8 @@ use anyhow::{Context as _, Result};
 #[cfg(feature = "host")]
 use futures_io::{AsyncRead, AsyncWrite};
 
+#[cfg(feature = "host")]
+use super::methods::{STATS_INSTANCE, STATS_SNAPSHOT};
 
 pub use super::bindings::helios::system::stats::{
     Memory, MemoryPressure, MonoNanos, Permille, Processor, Processors, Sample,
