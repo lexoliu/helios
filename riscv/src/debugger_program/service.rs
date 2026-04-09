@@ -9,7 +9,7 @@ struct UserProgramServiceInner {
     engine: Engine,
     compiler: ComputePool,
     compile_priority: ComputePriority,
-    component_cache: Mutex<ComponentCache<wasmtime::component::Component>>,
+    component_cache: Mutex<ComponentCache<Component>>,
     clock_cpu: RiscvCpu,
     debug_state: RuntimeState,
     instance_registry: InstanceRegistry,
@@ -20,7 +20,7 @@ struct UserProgramServiceInner {
 struct QueuedProgram {
     name: String,
     args: Vec<String>,
-    component: Arc<wasmtime::component::Component>,
+    component: Arc<Component>,
     instance: RegisteredInstance,
     output_mode: OutputMode,
     completion: Option<oneshot::Sender<Result<ExecResult, ProgramExecError>>>,
@@ -259,7 +259,7 @@ impl UserProgramService {
     async fn compile_component(
         &self,
         wasm: &[u8],
-    ) -> Result<Arc<wasmtime::component::Component>, ProgramExecError> {
+    ) -> Result<Arc<Component>, ProgramExecError> {
         let started_at = monotonic_nanos(&self.inner.clock_cpu);
         if let Some(component) = self.inner.component_cache.lock().get(wasm) {
             let now = monotonic_nanos(&self.inner.clock_cpu);
@@ -281,7 +281,7 @@ impl UserProgramService {
             .compiler
             .spawn(self.inner.compile_priority, {
                 let wasm = wasm.clone();
-                move || wasmtime::component::Component::from_binary(&engine, &wasm)
+                move || Component::from_binary(&engine, &wasm)
             })
             .await
             .map_err(|error| ProgramExecError {
@@ -397,4 +397,3 @@ fn run_program_component(
     let output = store.data().take_captured_output();
     Ok((exit_code, output))
 }
-

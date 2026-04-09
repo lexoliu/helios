@@ -1649,6 +1649,7 @@ dependencies = [
  "wasm-encoder 0.245.1",
  "wasmparser 0.245.1",
  "wasmtime",
+ "wasmtime-wasi-io",
  "wit-component 0.245.1",
 ]
 
@@ -1686,8 +1687,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "trapframe",
- "wasmtime",
- "wasmtime-wasi-io",
 ]
 
 [[package]]

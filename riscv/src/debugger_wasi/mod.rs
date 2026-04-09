@@ -12,8 +12,8 @@ use core::task::{Context, Poll};
 use futures::channel::oneshot;
 use helios_hal::io::IoError;
 use helios_kernel::{EmbeddedBootFile, EmbeddedBootFs, embedded_init};
-use wasmtime::Result;
-use wasmtime::component::{
+use helios_kernel::wasmtime::{self, Result};
+use helios_kernel::wasmtime::component::{
     Access, Accessor, FutureReader, HasSelf, Linker, Resource, ResourceTableError, Source,
     StreamConsumer, StreamReader, StreamResult,
 };
@@ -24,7 +24,9 @@ pub(crate) mod p2;
 
 pub(crate) mod bindings {
     mod generated {
-        wasmtime::component::bindgen!({
+        use helios_kernel::wasmtime;
+
+        helios_kernel::wasmtime::component::bindgen!({
             path: "../../wasmtime/crates/wasi/src/p3/wit",
             world: "wasi:cli/command",
             imports: {

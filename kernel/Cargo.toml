@@ -35,9 +35,12 @@ wasmparser = "0.245.0"
 
 [target.'cfg(all(target_os = "none", target_arch = "riscv64"))'.dependencies]
 wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["call-hook", "component-model", "component-model-async", "riscv64", "cranelift", "runtime"] }
+wasmtime-wasi-io = { path = "../../wasmtime/crates/wasi-io", default-features = false }
 
 [target.'cfg(all(target_os = "none", target_arch = "x86_64"))'.dependencies]
 wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["call-hook", "component-model", "component-model-async", "x86", "cranelift", "runtime"] }
+wasmtime-wasi-io = { path = "../../wasmtime/crates/wasi-io", default-features = false }
 
 [target.'cfg(not(target_os = "none"))'.dependencies]
 wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["call-hook", "component-model", "component-model-async", "host-arch", "cranelift", "runtime", "std"] }
+wasmtime-wasi-io = { path = "../../wasmtime/crates/wasi-io" }

@@ -2,6 +2,8 @@
 #![no_main]
 
 extern crate alloc;
+extern crate helios_kernel as wasmtime;
+extern crate helios_kernel as wasmtime_wasi_io;
 
 mod debugger_program;
 mod debugger_wasi;
@@ -18,7 +20,9 @@ mod debug_state {
 
 mod debugger_bindings {
     pub(crate) mod bindings {
-        wasmtime::component::bindgen!({
+        use helios_kernel::wasmtime;
+
+        helios_kernel::wasmtime::component::bindgen!({
             path: "../wit",
             world: "debugger",
             imports: { default: async | store | trappable },
@@ -41,7 +45,9 @@ mod debugger_bindings {
 
 mod program_bindings {
     pub(crate) mod bindings {
-        wasmtime::component::bindgen!({
+        use helios_kernel::wasmtime;
+
+        helios_kernel::wasmtime::component::bindgen!({
             path: "../wit",
             world: "init",
             imports: { default: async | store | trappable },
