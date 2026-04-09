@@ -3,6 +3,8 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use core::future::Future;
+
 use crate::InstanceId;
 use helios_hal::io::IoError;
 
@@ -89,4 +91,53 @@ pub enum HostFsError {
     Protocol(&'static str),
     Server(u32),
     Utf8,
+}
+
+
+pub trait HostFileSystem: Clone + Send + 'static {
+    type StatFuture<'a>: Future<Output = Result<HostMetadata, HostFsError>> + 'a
+    where
+        Self: 'a;
+
+    type ReadDirFuture<'a>: Future<Output = Result<Vec<HostDirEntry>, HostFsError>> + 'a
+    where
+        Self: 'a;
+
+    type ReadFileFuture<'a>: Future<Output = Result<Vec<u8>, HostFsError>> + 'a
+    where
+        Self: 'a;
+
+    type WriteFileFuture<'a>: Future<Output = Result<(), HostFsError>> + 'a
+    where
+        Self: 'a;
+
+    type TruncateFileFuture<'a>: Future<Output = Result<(), HostFsError>> + 'a
+    where
+        Self: 'a;
+
+    type CreateFileFuture<'a>: Future<Output = Result<(), HostFsError>> + 'a
+    where
+        Self: 'a;
+
+    type CreateDirectoryFuture<'a>: Future<Output = Result<(), HostFsError>> + 'a
+    where
+        Self: 'a;
+
+    type RemoveFuture<'a>: Future<Output = Result<(), HostFsError>> + 'a
+    where
+        Self: 'a;
+
+    type RenameFuture<'a>: Future<Output = Result<(), HostFsError>> + 'a
+    where
+        Self: 'a;
+
+    fn stat_path(&self, path: &str) -> Self::StatFuture<'_>;
+    fn read_dir(&self, path: &str) -> Self::ReadDirFuture<'_>;
+    fn read_file(&self, path: &str) -> Self::ReadFileFuture<'_>;
+    fn write_file(&self, path: &str, offset: u64, bytes: &[u8]) -> Self::WriteFileFuture<'_>;
+    fn truncate_file(&self, path: &str) -> Self::TruncateFileFuture<'_>;
+    fn create_file(&self, path: &str) -> Self::CreateFileFuture<'_>;
+    fn create_directory(&self, path: &str) -> Self::CreateDirectoryFuture<'_>;
+    fn remove(&self, path: &str, directory: bool) -> Self::RemoveFuture<'_>;
+    fn rename(&self, source: &str, destination: &str) -> Self::RenameFuture<'_>;
 }
