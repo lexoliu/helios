@@ -413,6 +413,16 @@ impl RiscvCpu {
 }
 
 impl Cpu for RiscvCpu {
+    fn wasmtime_target(&self) -> &'static str {
+        "riscv64gc-unknown-none-elf"
+    }
+
+    fn publish_executable_code(&self, _ptr: *const u8, _len: usize) {
+        unsafe {
+            core::arch::asm!("fence.i", options(nostack, preserves_flags));
+        }
+    }
+
     fn current_processor(&self) -> ProcessorId {
         let runtime_ptr = read_hart_runtime();
         if runtime_ptr == 0 {

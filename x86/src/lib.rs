@@ -85,6 +85,12 @@ static WASMTIME_TLS: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 struct X86Cpu;
 
 impl Cpu for X86Cpu {
+    fn wasmtime_target(&self) -> &'static str {
+        "x86_64-unknown-none"
+    }
+
+    fn publish_executable_code(&self, _ptr: *const u8, _len: usize) {}
+
     fn current_processor(&self) -> ProcessorId {
         ProcessorId::new(0)
     }

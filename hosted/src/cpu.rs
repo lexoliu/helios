@@ -22,6 +22,12 @@ impl HostedCpu {
 }
 
 impl Cpu for HostedCpu {
+    fn wasmtime_target(&self) -> &'static str {
+        std::env::consts::ARCH
+    }
+
+    fn publish_executable_code(&self, _ptr: *const u8, _len: usize) {}
+
     fn current_processor(&self) -> ProcessorId {
         self.processor
     }
