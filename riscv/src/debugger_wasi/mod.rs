@@ -426,7 +426,7 @@ impl DebugFileSystem {
     }
 
     fn host_path<'a>(&self, path: &'a str) -> Option<&'a str> {
-        crate::host_fs::guest_path_to_host(path)
+        helios_kernel::guest_host_share_path(path)
     }
 
     fn host_service(

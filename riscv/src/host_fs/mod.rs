@@ -47,7 +47,6 @@ const P9_STATS_BASIC: u64 = 0x0000_07ff;
 const P9_QTDIR: u8 = 0x80;
 const P9_WRITE_CHUNK: usize = (DEFAULT_MSIZE as usize) - 24;
 
-pub(crate) const HOST_MOUNT_PATH: &str = "/host";
 pub(crate) const HOST_MOUNT_TAG: &str = helios_hal::fs::HOST_SHARE_MOUNT_TAG;
 
 pub(crate) type HostFsError = KernelHostFsError;
@@ -609,15 +608,6 @@ impl HostFileSystemService {
         }
         Ok(())
     }
-}
-
-pub(crate) fn guest_path_to_host(path: &str) -> Option<&str> {
-    if path == HOST_MOUNT_PATH {
-        return Some("/");
-    }
-
-    path.strip_prefix("/host/")
-        .map(|suffix| if suffix.is_empty() { "/" } else { suffix })
 }
 
 fn split_path(path: &str) -> Vec<&str> {
