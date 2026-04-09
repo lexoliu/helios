@@ -4,6 +4,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{bail, Context as _, Result};
+use bootloader::BiosBoot;
 use clap::{Args as ClapArgs, Subcommand, ValueEnum};
 use console::style;
 use directories::ProjectDirs;
@@ -269,8 +270,20 @@ fn connect_and_run(command: &ResolvedVmCommand, socket_path: &Path) -> Result<()
 fn prepare_boot_artifact(command: &ResolvedVmCommand) -> Result<PathBuf> {
     match command.arch {
         VmArch::Riscv64 => Ok(command.kernel.clone()),
-        VmArch::X86_64 => bail!("x86_64 VM boot is not wired yet; the published bootloader BIOS build chain is currently unusable on this toolchain"),
+        VmArch::X86_64 => prepare_x86_bios_image(command),
     }
+}
+
+fn prepare_x86_bios_image(command: &ResolvedVmCommand) -> Result<PathBuf> {
+    let kernel = fs::canonicalize(&command.kernel)
+        .with_context(|| format!("failed to canonicalize kernel {}", command.kernel.display()))?;
+    let image = kernel.with_extension("bios.img");
+    let spinner = spinner("building x86_64 BIOS disk image");
+    let bios = BiosBoot::new(&kernel);
+    bios.create_disk_image(&image)
+        .with_context(|| format!("failed to create BIOS image {}", image.display()))?;
+    spinner.finish_with_message(format!("{} {}", style("built").green(), image.display()));
+    Ok(image)
 }
 
 fn arch_label(arch: VmArch) -> &'static str {
@@ -361,7 +374,8 @@ impl VmRuntime {
                 }
             }
             VmArch::X86_64 => {
-                unreachable!("x86_64 VM path must fail during boot artifact preparation")
+                qemu.arg("-drive")
+                    .arg(format!("format=raw,file={}", artifact.display()));
             }
         }
         let mut child = qemu.spawn().with_context(|| {
