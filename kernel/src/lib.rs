@@ -15,6 +15,7 @@ pub use wasmtime_wasi_io::*;
 mod block_on;
 mod bootfs;
 mod component_cache;
+mod component_fs_path;
 mod component_runtime;
 mod component_types;
 mod compute_pool;
@@ -43,6 +44,7 @@ pub use bootfs::{
     EmbeddedBootFs,
 };
 pub use component_cache::ComponentCache;
+pub use component_fs_path::{ComponentFsPathError, directory_prefix, parent_path, resolve_child_path};
 pub use component_runtime::{
     ComponentOutputMode, ComponentOutputStream, ComponentOutputStreamKind, ComponentStoreData,
     DeadlinePollable,
