@@ -9,8 +9,8 @@ use futures::channel::oneshot;
 use helios_hal::cpu::Cpu;
 use helios_hal::resource::WasiRights;
 use helios_kernel::{
-    ComputePool, ComputePriority, InstanceId, InstanceRegistry, Notify, ProgramExecError,
-    ProgramExecErrorKind, RegisteredInstance, heap_stats,
+    ComputePool, ComputePriority, ExecOutput, ExecResult, InstanceRegistry, Notify,
+    ProgramExecError, ProgramExecErrorKind, RegisteredInstance, heap_stats,
 };
 use lru::LruCache;
 use spin::Mutex;
@@ -23,18 +23,6 @@ use crate::{RiscvCpu, debug_state::RuntimeState, program_bindings};
 const WORKER_STACK_SIZE: usize = 256 * 1024;
 const COMPONENT_CACHE_FRACTION: usize = 8;
 
-#[derive(Clone, Debug)]
-pub(crate) struct ExecOutput {
-    pub(crate) stdout: Vec<u8>,
-    pub(crate) stderr: Vec<u8>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ExecResult {
-    pub(crate) instance_id: InstanceId,
-    pub(crate) exit_code: u32,
-    pub(crate) output: ExecOutput,
-}
 
 #[derive(Clone)]
 pub(crate) struct UserProgramService {

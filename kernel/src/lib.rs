@@ -14,6 +14,7 @@ mod instance;
 mod log;
 mod observer;
 mod runtime_state;
+mod runtime_types;
 mod program;
 mod program_service;
 mod sync;
@@ -39,6 +40,10 @@ pub use observer::{
     TraceLevel, TraceValue, matches_trace_filter, parse_console_text,
 };
 pub use runtime_state::RuntimeState;
+pub use runtime_types::{
+    ExecOutput, ExecResult, HostDirEntry, HostFsError, HostMetadata, Ipv4Address, PingError,
+    PingErrorKind, PingReply, TcpError, TcpErrorKind,
+};
 pub use program::{
     Blueprint, CompileError as ProgramCompileError, ExitCode, ProgramRuntime, ProgramRuntimeConfig,
     ProgramRuntimeDriver, ProgramRuntimeError, ProgramRuntimeInitError, ResourceTable,

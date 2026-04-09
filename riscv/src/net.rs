@@ -17,7 +17,11 @@ use fdt::Fdt;
 use fdt::node::FdtNode;
 use helios_hal::cpu::Cpu;
 use helios_hal::io::IoError;
-use helios_kernel::{Kernel, Notify, Timer};
+use helios_kernel::{
+    Ipv4Address as KernelIpv4Address, Kernel, Notify, PingError as KernelPingError,
+    PingErrorKind as KernelPingErrorKind, PingReply as KernelPingReply, TcpError as KernelTcpError,
+    TcpErrorKind as KernelTcpErrorKind, Timer,
+};
 use plic::Plic;
 use smoltcp::iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -68,37 +72,12 @@ struct NetworkInterrupt {
     service: NetworkService,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum PingErrorKind {
-    UnresolvedHost,
-    Timeout,
-    Unavailable,
-    Internal,
-}
+pub(crate) type PingError = KernelPingError;
+pub(crate) type PingErrorKind = KernelPingErrorKind;
+pub(crate) type PingReply = KernelPingReply;
+pub(crate) type TcpError = KernelTcpError;
+pub(crate) type TcpErrorKind = KernelTcpErrorKind;
 
-pub(crate) struct PingError {
-    pub(crate) kind: PingErrorKind,
-    pub(crate) detail: String,
-}
-
-pub(crate) struct PingReply {
-    pub(crate) address: Ipv4Address,
-    pub(crate) round_trip_nanos: u64,
-    pub(crate) payload_bytes: u16,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum TcpErrorKind {
-    UnresolvedHost,
-    Timeout,
-    Unavailable,
-    Internal,
-}
-
-pub(crate) struct TcpError {
-    pub(crate) kind: TcpErrorKind,
-    pub(crate) detail: String,
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TcpStreamId(NonZeroU32);
@@ -159,6 +138,34 @@ impl<T> Clone for RequestResponse<T> {
         }
     }
 }
+impl<T> RequestResponse<T> {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(RequestResponseInner {
+                result: helios_kernel::Mutex::new(None),
+                ready: Notify::new(),
+            }),
+        }
+    }
+
+    async fn complete(&self, result: T) {
+        let mut slot = self.inner.result.lock().await;
+        assert!(slot.is_none(), "network request completed more than once");
+        *slot = Some(result);
+        self.inner.ready.notify_all();
+    }
+
+    async fn wait(&self) -> T {
+        loop {
+            if let Some(result) = self.inner.result.lock().await.take() {
+                return result;
+            }
+
+            self.inner.ready.notified().await;
+        }
+    }
+}
+
 
 struct NetworkState {
     iface: Interface,
@@ -218,6 +225,51 @@ enum TcpReadProgress {
     Data(Vec<u8>),
     Eof,
 }
+
+fn map_ipv4_address(address: Ipv4Address) -> KernelIpv4Address {
+    KernelIpv4Address::new(address.octets())
+}
+
+fn ping_error_from_io(error: IoError, context: &str) -> PingError {
+    PingError {
+        kind: match error {
+            IoError::Unsupported
+            | IoError::PermissionDenied
+            | IoError::ReadOnly => PingErrorKind::Unavailable,
+            IoError::NotFound
+            | IoError::AlreadyExists
+            | IoError::NotDirectory
+            | IoError::IsDirectory
+            | IoError::DirectoryNotEmpty
+            | IoError::InvalidBufferLength { .. }
+            | IoError::InvalidDeviceConfig(_)
+            | IoError::OutOfBounds
+            | IoError::DeviceFault => PingErrorKind::Internal,
+        },
+        detail: alloc::format!("{context}: {error}"),
+    }
+}
+
+fn tcp_error_from_io(error: IoError, context: &str) -> TcpError {
+    TcpError {
+        kind: match error {
+            IoError::Unsupported
+            | IoError::PermissionDenied
+            | IoError::ReadOnly => TcpErrorKind::Unavailable,
+            IoError::NotFound
+            | IoError::AlreadyExists
+            | IoError::NotDirectory
+            | IoError::IsDirectory
+            | IoError::DirectoryNotEmpty
+            | IoError::InvalidBufferLength { .. }
+            | IoError::InvalidDeviceConfig(_)
+            | IoError::OutOfBounds
+            | IoError::DeviceFault => TcpErrorKind::Internal,
+        },
+        detail: alloc::format!("{context}: {error}"),
+    }
+}
+
 
 pub(crate) fn install_network_service(
     cpu: &RiscvCpu,
@@ -463,7 +515,7 @@ impl NetworkService {
             )
             .await?;
         Ok(PingReply {
-            address: destination,
+            address: map_ipv4_address(destination),
             round_trip_nanos: self.now_nanos().saturating_sub(sent_at_nanos),
             payload_bytes,
         })
@@ -714,13 +766,13 @@ impl NetworkService {
     async fn drive_ping(&self) -> Result<(), PingError> {
         self.drive_network()
             .await
-            .map_err(|error| PingError::from_io(error, "failed to advance virtio network"))
+            .map_err(|error| ping_error_from_io(error, "failed to advance virtio network"))
     }
 
     async fn drive_tcp(&self) -> Result<(), TcpError> {
         self.drive_network()
             .await
-            .map_err(|error| TcpError::from_io(error, "failed to advance virtio network"))
+            .map_err(|error| tcp_error_from_io(error, "failed to advance virtio network"))
     }
 
     async fn drive_network(&self) -> Result<(), IoError> {
@@ -822,77 +874,6 @@ impl ExternalInterrupts {
                 source.0.get(),
                 self.context.0
             );
-        }
-    }
-}
-
-impl PingError {
-    fn from_io(error: IoError, context: &str) -> Self {
-        let kind = match error {
-            IoError::NotFound
-            | IoError::AlreadyExists
-            | IoError::NotDirectory
-            | IoError::IsDirectory
-            | IoError::DirectoryNotEmpty
-            | IoError::Unsupported
-            | IoError::PermissionDenied
-            | IoError::ReadOnly => PingErrorKind::Unavailable,
-            IoError::InvalidBufferLength { .. }
-            | IoError::OutOfBounds
-            | IoError::InvalidDeviceConfig(_)
-            | IoError::DeviceFault => PingErrorKind::Internal,
-        };
-        Self {
-            kind,
-            detail: format!("{context}: {error}"),
-        }
-    }
-}
-
-impl TcpError {
-    fn from_io(error: IoError, context: &str) -> Self {
-        let kind = match error {
-            IoError::NotFound
-            | IoError::AlreadyExists
-            | IoError::NotDirectory
-            | IoError::IsDirectory
-            | IoError::DirectoryNotEmpty
-            | IoError::Unsupported
-            | IoError::PermissionDenied
-            | IoError::ReadOnly => TcpErrorKind::Unavailable,
-            IoError::InvalidBufferLength { .. }
-            | IoError::OutOfBounds
-            | IoError::InvalidDeviceConfig(_)
-            | IoError::DeviceFault => TcpErrorKind::Internal,
-        };
-        Self {
-            kind,
-            detail: format!("{context}: {error}"),
-        }
-    }
-}
-
-impl<T> RequestResponse<T> {
-    fn new() -> Self {
-        Self {
-            inner: Arc::new(RequestResponseInner {
-                result: helios_kernel::Mutex::new(None),
-                ready: Notify::new(),
-            }),
-        }
-    }
-
-    async fn complete(&self, result: T) {
-        *self.inner.result.lock().await = Some(result);
-        self.inner.ready.notify_one();
-    }
-
-    async fn wait(&self) -> T {
-        loop {
-            if let Some(result) = self.inner.result.lock().await.take() {
-                return result;
-            }
-            self.inner.ready.notified().await;
         }
     }
 }

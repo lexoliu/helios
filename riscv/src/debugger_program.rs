@@ -1155,8 +1155,8 @@ impl StoreData {
         GuestOutput::from_store(self).write(stream, bytes);
     }
 
-    pub(crate) fn take_captured_output(&self) -> crate::program_host::ExecOutput {
-        crate::program_host::ExecOutput {
+    pub(crate) fn take_captured_output(&self) -> helios_kernel::ExecOutput {
+        helios_kernel::ExecOutput {
             stdout: self.captured_stdout.lock().clone(),
             stderr: self.captured_stderr.lock().clone(),
         }
