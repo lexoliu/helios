@@ -18,7 +18,7 @@ use helios_kernel::{
     InstanceRegistry, Notify, ProgramExecError, ProgramExecErrorKind,
     RawMutex, RawMutexGuardResource, RawMutexResource, RawRwLock, RawRwLockReadGuardResource,
     RawRwLockResource, RawRwLockWriteGuardResource, RegisteredInstance, SerialPortResource,
-    TcpStreamResource, build_target_engine_config, elapsed_millis, embedded_debugger, heap_stats,
+    TcpStreamResource, build_component_engine_config, elapsed_millis, embedded_debugger, heap_stats,
     monotonic_nanos,
 };
 use spin::Mutex;
@@ -228,7 +228,7 @@ fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), Debugge
 }
 
 pub(crate) fn build_engine() -> wasmtime::Result<Engine> {
-    let mut config = build_target_engine_config(WASMTIME_TARGET);
+    let mut config = build_component_engine_config(WASMTIME_TARGET);
     config.cranelift_opt_level(OptLevel::None);
     config.cranelift_regalloc_algorithm(RegallocAlgorithm::SinglePass);
     config.cranelift_debug_verifier(false);
