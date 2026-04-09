@@ -565,7 +565,7 @@ impl DebugFileSystem {
             return Err(fs_types::ErrorCode::NotDirectory);
         }
 
-        let prefix = directory_prefix(path);
+        let prefix = helios_kernel::directory_prefix(path);
         let mut entries = Vec::new();
         for child in &self.nodes {
             if child.path == path {
@@ -757,7 +757,7 @@ impl DebugFileSystem {
             return Err(fs_types::ErrorCode::NotDirectory);
         }
 
-        let absolute = resolve_child_path(&base.path, path)?;
+        let absolute = helios_kernel::resolve_child_path(&base.path, path).map_err(map_component_fs_path_error)?;
         if let Some(host_path) = self.host_path(&absolute) {
             let metadata = helios_kernel::block_on(async {
                 self.host_service()?
@@ -895,7 +895,7 @@ impl DebugFileSystem {
             return Err(fs_types::ErrorCode::ReadOnly);
         }
 
-        let parent = parent_path(&absolute);
+        let parent = helios_kernel::parent_path(&absolute);
         let parent_node = self.get_node(parent)?;
         if parent_node.kind != FsNodeKind::Directory {
             return Err(fs_types::ErrorCode::NotDirectory);
@@ -929,7 +929,7 @@ impl DebugFileSystem {
         {
             return Err(fs_types::ErrorCode::ReadOnly);
         }
-        let absolute = resolve_child_path(&base.path, path)?;
+        let absolute = helios_kernel::resolve_child_path(&base.path, path).map_err(map_component_fs_path_error)?;
         if let Some(host_path) = self.host_path(&absolute) {
             return helios_kernel::block_on(async {
                 self.host_service()?
@@ -948,7 +948,7 @@ impl DebugFileSystem {
         if node.kind != FsNodeKind::Directory {
             return Err(fs_types::ErrorCode::NotDirectory);
         }
-        let prefix = directory_prefix(&absolute);
+        let prefix = helios_kernel::directory_prefix(&absolute);
         if self
             .nodes
             .iter()
@@ -975,7 +975,7 @@ impl DebugFileSystem {
         if base.kind != FsNodeKind::Directory {
             return Err(fs_types::ErrorCode::NotDirectory);
         }
-        let absolute = resolve_child_path(&base.path, path)?;
+        let absolute = helios_kernel::resolve_child_path(&base.path, path).map_err(map_component_fs_path_error)?;
         if let Some(host_path) = self.host_path(&absolute) {
             let _ = now_nanos;
             return helios_kernel::block_on(async {
@@ -996,7 +996,7 @@ impl DebugFileSystem {
             return Err(fs_types::ErrorCode::Exist);
         }
 
-        let parent = parent_path(&absolute);
+        let parent = helios_kernel::parent_path(&absolute);
         let parent_node = self.get_node(parent)?;
         if parent_node.kind != FsNodeKind::Directory {
             return Err(fs_types::ErrorCode::NotDirectory);
@@ -1025,7 +1025,7 @@ impl DebugFileSystem {
         {
             return Err(fs_types::ErrorCode::ReadOnly);
         }
-        let absolute = resolve_child_path(&base.path, path)?;
+        let absolute = helios_kernel::resolve_child_path(&base.path, path).map_err(map_component_fs_path_error)?;
         if let Some(host_path) = self.host_path(&absolute) {
             return helios_kernel::block_on(async {
                 self.host_service()?
@@ -1067,8 +1067,8 @@ impl DebugFileSystem {
         {
             return Err(fs_types::ErrorCode::ReadOnly);
         }
-        let source_absolute = resolve_child_path(&source_base.path, source_path)?;
-        let destination_absolute = resolve_child_path(&destination_base.path, destination_path)?;
+        let source_absolute = helios_kernel::resolve_child_path(&source_base.path, source_path).map_err(map_component_fs_path_error)?;
+        let destination_absolute = helios_kernel::resolve_child_path(&destination_base.path, destination_path).map_err(map_component_fs_path_error)?;
         let source_host = self.host_path(&source_absolute);
         let destination_host = self.host_path(&destination_absolute);
         if source_host.is_some() || destination_host.is_some() {
@@ -1106,7 +1106,7 @@ impl DebugFileSystem {
             return Err(fs_types::ErrorCode::Exist);
         }
 
-        let destination_parent = parent_path(&destination_absolute);
+        let destination_parent = helios_kernel::parent_path(&destination_absolute);
         let destination_parent_node = self.get_node(destination_parent)?;
         if destination_parent_node.kind != FsNodeKind::Directory {
             return Err(fs_types::ErrorCode::NotDirectory);
@@ -1116,7 +1116,7 @@ impl DebugFileSystem {
         }
 
         if source_node.kind == FsNodeKind::Directory {
-            let source_prefix = directory_prefix(&source_absolute);
+            let source_prefix = helios_kernel::directory_prefix(&source_absolute);
             if destination_absolute == source_absolute
                 || destination_absolute.starts_with(&source_prefix)
             {
@@ -1124,7 +1124,7 @@ impl DebugFileSystem {
             }
         }
 
-        let source_prefix = directory_prefix(&source_absolute);
+        let source_prefix = helios_kernel::directory_prefix(&source_absolute);
         for node in &mut self.nodes {
             if node.path == source_absolute {
                 node.path = destination_absolute.clone();
@@ -1586,7 +1586,7 @@ impl wasi::filesystem::types::HostDescriptorWithStore for HasSelf<StoreData> {
         }
         accessor.with(|mut access| {
             let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-            let absolute = resolve_child_path(&descriptor.path, &path)?;
+            let absolute = helios_kernel::resolve_child_path(&descriptor.path, &path).map_err(map_component_fs_path_error)?;
             access.get().filesystem.stat(&absolute).map_err(Into::into)
         })
     }
@@ -1744,7 +1744,7 @@ impl wasi::filesystem::types::HostDescriptorWithStore for HasSelf<StoreData> {
         }
         accessor.with(|mut access| {
             let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-            let absolute = resolve_child_path(&descriptor.path, &path)?;
+            let absolute = helios_kernel::resolve_child_path(&descriptor.path, &path).map_err(map_component_fs_path_error)?;
             access
                 .get()
                 .filesystem
@@ -2119,76 +2119,17 @@ pub(crate) fn fs_resource_error(error: ResourceTableError) -> fs_types::ErrorCod
     }
 }
 
-pub(crate) fn resolve_child_path(
-    base: &str,
-    child: &str,
-) -> core::result::Result<String, fs_types::ErrorCode> {
-    if child.starts_with('/') {
-        return Err(fs_types::ErrorCode::NotPermitted);
-    }
-
-    let mut segments = split_absolute_path(base)?;
-    for segment in child.split('/') {
-        if segment.is_empty() || segment == "." {
-            continue;
-        }
-        if segment == ".." {
-            return Err(fs_types::ErrorCode::NotPermitted);
-        }
-        segments.push(segment.to_string());
-    }
-    Ok(build_absolute_path(&segments))
-}
-
-fn split_absolute_path(path: &str) -> core::result::Result<Vec<String>, fs_types::ErrorCode> {
-    if !path.starts_with('/') {
-        return Err(fs_types::ErrorCode::Invalid);
-    }
-
-    let mut segments = Vec::new();
-    for segment in path.split('/') {
-        if segment.is_empty() || segment == "." {
-            continue;
-        }
-        if segment == ".." {
-            return Err(fs_types::ErrorCode::NotPermitted);
-        }
-        segments.push(segment.to_string());
-    }
-    Ok(segments)
-}
-
-fn build_absolute_path(segments: &[String]) -> String {
-    if segments.is_empty() {
-        return String::from("/");
-    }
-
-    let mut path = String::new();
-    for segment in segments {
-        path.push('/');
-        path.push_str(segment);
-    }
-    path
-}
-
-fn directory_prefix(path: &str) -> String {
-    if path == "/" {
-        return String::from("/");
-    }
-    alloc::format!("{path}/")
-}
-
-fn parent_path(path: &str) -> &str {
-    match path.rsplit_once('/') {
-        Some(("", _)) | None => "/",
-        Some((parent, _)) => parent,
-    }
-}
-
 fn is_dir_first(kind: fs_types::DescriptorType) -> u8 {
     match kind {
         fs_types::DescriptorType::Directory => 0,
         _ => 1,
+    }
+}
+
+fn map_component_fs_path_error(error: helios_kernel::ComponentFsPathError) -> fs_types::ErrorCode {
+    match error {
+        helios_kernel::ComponentFsPathError::InvalidBasePath => fs_types::ErrorCode::Invalid,
+        helios_kernel::ComponentFsPathError::NotPermitted => fs_types::ErrorCode::NotPermitted,
     }
 }
 

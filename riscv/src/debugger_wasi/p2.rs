@@ -573,9 +573,9 @@ impl filesystem_bindings::filesystem::types::HostDescriptor for StoreData {
             Ok(descriptor) => descriptor,
             Err(error) => return Ok(Err(error)),
         };
-        let path = match debugger_wasi::resolve_child_path(&descriptor.path, &path) {
+        let path = match helios_kernel::resolve_child_path(&descriptor.path, &path) {
             Ok(path) => path,
-            Err(error) => return Ok(Err(error_code_from_p3(error))),
+            Err(error) => return Ok(Err(error_code_from_path(error))),
         };
         match self.filesystem.stat(&path) {
             Ok(stat) => Ok(Ok(descriptor_stat_from_p3(stat))),
@@ -741,9 +741,9 @@ impl filesystem_bindings::filesystem::types::HostDescriptor for StoreData {
             Ok(descriptor) => descriptor,
             Err(error) => return Ok(Err(error)),
         };
-        let path = match debugger_wasi::resolve_child_path(&descriptor.path, &path) {
+        let path = match helios_kernel::resolve_child_path(&descriptor.path, &path) {
             Ok(path) => path,
-            Err(error) => return Ok(Err(error_code_from_p3(error))),
+            Err(error) => return Ok(Err(error_code_from_path(error))),
         };
         match self.filesystem.metadata_hash(&path) {
             Ok(hash) => Ok(Ok(metadata_hash_from_p3(hash))),
@@ -949,6 +949,13 @@ fn datetime_from_p3(
             .try_into()
             .expect("preview2 filesystem cannot represent a negative timestamp"),
         nanoseconds: instant.nanoseconds,
+    }
+}
+
+fn error_code_from_path(error: helios_kernel::ComponentFsPathError) -> p2fs::ErrorCode {
+    match error {
+        helios_kernel::ComponentFsPathError::InvalidBasePath => p2fs::ErrorCode::Invalid,
+        helios_kernel::ComponentFsPathError::NotPermitted => p2fs::ErrorCode::NotPermitted,
     }
 }
 
