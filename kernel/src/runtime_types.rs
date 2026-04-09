@@ -141,3 +141,11 @@ pub trait HostFileSystem: Clone + Send + 'static {
     fn remove(&self, path: &str, directory: bool) -> Self::RemoveFuture<'_>;
     fn rename(&self, source: &str, destination: &str) -> Self::RenameFuture<'_>;
 }
+
+
+pub trait ComponentHostFilesystemState<Service>: Clone + Send + 'static
+where
+    Service: HostFileSystem,
+{
+    fn host_filesystem_service(&self) -> Option<Service>;
+}

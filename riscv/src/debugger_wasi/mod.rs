@@ -165,10 +165,10 @@ impl<T> core::fmt::Display for TrappableError<T> {
 
 impl<T> core::error::Error for TrappableError<T> {}
 
-pub(crate) struct DebugFileSystem {
+pub(crate) struct DebugFileSystem<State = crate::debug_state::RuntimeState> {
     nodes: Vec<FsNode>,
     next_inode: u64,
-    debug_state: crate::debug_state::RuntimeState,
+    runtime_state: State,
 }
 
 struct SerialStreamConsumer<T> {
@@ -327,8 +327,11 @@ impl<T: 'static> StreamConsumer<T> for FileWriteConsumer<T> {
     }
 }
 
-impl DebugFileSystem {
-    pub(crate) fn new(debug_state: crate::debug_state::RuntimeState) -> Self {
+impl<State> DebugFileSystem<State>
+where
+    State: helios_kernel::ComponentHostFilesystemState<crate::host_fs::HostFileSystemService>,
+{
+    pub(crate) fn new(runtime_state: State) -> Self {
         let mut filesystem = Self {
             nodes: vec![FsNode {
                 path: String::from("/"),
@@ -339,7 +342,7 @@ impl DebugFileSystem {
                 readonly: false,
             }],
             next_inode: 2,
-            debug_state,
+            runtime_state,
         };
 
         if let Some(init) = embedded_init() {
@@ -428,8 +431,8 @@ impl DebugFileSystem {
     fn host_service(
         &self,
     ) -> core::result::Result<crate::host_fs::HostFileSystemService, fs_types::ErrorCode> {
-        self.debug_state
-            .host_fs_service()
+        self.runtime_state
+            .host_filesystem_service()
             .ok_or(fs_types::ErrorCode::NoEntry)
     }
 
@@ -595,7 +598,7 @@ impl DebugFileSystem {
             });
         }
 
-        if path == "/" && self.debug_state.host_fs_service().is_some() {
+        if path == "/" && self.runtime_state.host_filesystem_service().is_some() {
             let has_host_mount = entries.iter().any(|entry| entry.name == "host");
             if !has_host_mount {
                 entries.push(fs_types::DirectoryEntry {
