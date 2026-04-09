@@ -5,6 +5,7 @@ extern crate self as helios_kernel;
 extern crate std;
 mod block_on;
 mod bootfs;
+mod component_types;
 mod compute_pool;
 mod embedded_component;
 mod embedded_debugger;
@@ -14,10 +15,10 @@ mod executor;
 mod instance;
 mod log;
 mod observer;
-mod runtime_state;
-mod runtime_types;
 mod program;
 mod program_service;
+mod runtime_state;
+mod runtime_types;
 mod sync;
 mod task;
 mod timer;
@@ -26,6 +27,10 @@ pub use block_on::block_on;
 pub use bootfs::{
     BootDirectory, BootDirectoryEntry, BootDirectoryHandleExt, BootFile, EmbeddedBootFile,
     EmbeddedBootFs,
+};
+pub use component_types::{
+    RawMutexGuardResource, RawMutexResource, RawRwLockReadGuardResource, RawRwLockResource,
+    RawRwLockWriteGuardResource, SerialPortResource, TcpStreamResource,
 };
 pub use compute_pool::{ComputePool, ComputePriority, SpawnError as ComputeSpawnError};
 pub use embedded_component::EmbeddedComponent;
@@ -41,17 +46,17 @@ pub use observer::{
     DEFAULT_TRACE_HISTORY_CAPACITY, StatsSample, TraceEvent, TraceField, TraceFilter, TraceHistory,
     TraceLevel, TraceValue, matches_trace_filter, parse_console_text,
 };
-pub use runtime_state::RuntimeState;
-pub use runtime_types::{
-    ExecOutput, ExecResult, HostDirEntry, HostFsError, HostMetadata, Ipv4Address, PingError,
-    PingErrorKind, PingReply, TcpError, TcpErrorKind,
-};
 pub use program::{
     Blueprint, CompileError as ProgramCompileError, ExitCode, ProgramRuntime, ProgramRuntimeConfig,
     ProgramRuntimeDriver, ProgramRuntimeError, ProgramRuntimeInitError, ResourceTable,
     RunError as ProgramRunError, Task,
 };
 pub use program_service::{ProgramExecError, ProgramExecErrorKind, ProgramService};
+pub use runtime_state::RuntimeState;
+pub use runtime_types::{
+    ExecOutput, ExecResult, HostDirEntry, HostFsError, HostMetadata, Ipv4Address, PingError,
+    PingErrorKind, PingReply, TcpError, TcpErrorKind,
+};
 pub use sync::{
     Mutex, MutexGuard, Notified, Notify, OwnedRawMutexLease, OwnedRawRwLockReadLease,
     OwnedRawRwLockWriteLease, RawMutex, RawMutexLease, RawRwLock, RawRwLockReadLease,

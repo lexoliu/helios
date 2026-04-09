@@ -12,9 +12,10 @@ use core::task::{Context, Poll};
 use helios_hal::cpu::Cpu;
 use helios_hal::resource::WasiRights;
 use helios_kernel::{
-    EmbeddedDebugger, InstanceExecutionTransition, InstanceRegistry, OwnedRawMutexLease,
-    OwnedRawRwLockReadLease, OwnedRawRwLockWriteLease, ProgramExecErrorKind, RawMutex, RawRwLock,
-    RegisteredInstance, embedded_debugger, heap_stats,
+    EmbeddedDebugger, InstanceExecutionTransition, InstanceRegistry, ProgramExecErrorKind,
+    RawMutex, RawMutexGuardResource, RawMutexResource, RawRwLock, RawRwLockReadGuardResource,
+    RawRwLockResource, RawRwLockWriteGuardResource, RegisteredInstance, SerialPortResource,
+    TcpStreamResource, embedded_debugger, heap_stats,
 };
 use spin::Mutex;
 use thiserror::Error;
@@ -64,8 +65,24 @@ impl CustomCodeMemory for RiscvCodeMemory {
     }
 }
 
-pub struct SbiSerialPort;
+pub struct SbiSerialPort {
+    _resource: SerialPortResource,
+}
+
 pub struct SbiTcpStream {
+    resource: TcpStreamResource<RiscvTcpStream>,
+}
+
+impl SbiTcpStream {
+    fn new(backend: RiscvTcpStream) -> Self {
+        Self {
+            resource: TcpStreamResource::new(backend),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct RiscvTcpStream {
     service: crate::net::NetworkService,
     stream: crate::net::TcpStreamId,
 }
@@ -100,23 +117,23 @@ pub(crate) enum SystemWorld {
 }
 
 pub struct SbiRawMutex {
-    inner: Arc<RawMutex>,
+    resource: RawMutexResource,
 }
 
 pub struct SbiRawMutexGuard {
-    _lease: OwnedRawMutexLease,
+    _resource: RawMutexGuardResource,
 }
 
 pub struct SbiRawRwLock {
-    inner: Arc<RawRwLock>,
+    resource: RawRwLockResource,
 }
 
 pub struct SbiRawRwLockReadGuard {
-    _lease: OwnedRawRwLockReadLease,
+    _resource: RawRwLockReadGuardResource,
 }
 
 pub struct SbiRawRwLockWriteGuard {
-    _lease: OwnedRawRwLockWriteLease,
+    _resource: RawRwLockWriteGuardResource,
 }
 
 pub fn should_run_on(hart_id: u16, hart_count: usize, bootstrap_hart: u16) -> bool {
@@ -317,7 +334,9 @@ pub(crate) fn add_serial_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::
         "debug-port",
         |mut caller: StoreContextMut<'_, StoreData>, (): ()| {
             let resource = match caller.data().debug_port {
-                Some(()) => Some(caller.data_mut().table.push(SbiSerialPort)?),
+                Some(()) => Some(caller.data_mut().table.push(SbiSerialPort {
+                    _resource: SerialPortResource,
+                })?),
                 None => None,
             };
             Ok((resource,))
@@ -440,7 +459,9 @@ pub(crate) fn add_sync_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Re
         "[constructor]raw-mutex",
         |mut caller: StoreContextMut<'_, StoreData>, (): ()| {
             let resource = caller.data_mut().table.push(SbiRawMutex {
-                inner: Arc::new(RawMutex::new()),
+                resource: RawMutexResource {
+                    inner: Arc::new(RawMutex::new()),
+                },
             })?;
             Ok((resource,))
         },
@@ -450,14 +471,15 @@ pub(crate) fn add_sync_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Re
         |accessor: &Accessor<StoreData>, (resource,): (Resource<SbiRawMutex>,)| {
             Box::pin(async move {
                 let mutex = accessor.with(|mut access| {
-                    Ok::<_, wasmtime::Error>(access.get().table.get(&resource)?.inner.clone())
+                    Ok::<_, wasmtime::Error>(
+                        access.get().table.get(&resource)?.resource.inner.clone(),
+                    )
                 })?;
                 let lease = mutex.lock_owned().await;
                 accessor.with(|mut access| {
-                    let guard = access
-                        .get()
-                        .table
-                        .push(SbiRawMutexGuard { _lease: lease })?;
+                    let guard = access.get().table.push(SbiRawMutexGuard {
+                        _resource: RawMutexGuardResource { _lease: lease },
+                    })?;
                     Ok::<_, wasmtime::Error>((guard,))
                 })
             })
@@ -467,7 +489,9 @@ pub(crate) fn add_sync_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Re
         "[constructor]raw-rw-lock",
         |mut caller: StoreContextMut<'_, StoreData>, (): ()| {
             let resource = caller.data_mut().table.push(SbiRawRwLock {
-                inner: Arc::new(RawRwLock::new()),
+                resource: RawRwLockResource {
+                    inner: Arc::new(RawRwLock::new()),
+                },
             })?;
             Ok((resource,))
         },
@@ -477,14 +501,15 @@ pub(crate) fn add_sync_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Re
         |accessor: &Accessor<StoreData>, (resource,): (Resource<SbiRawRwLock>,)| {
             Box::pin(async move {
                 let rwlock = accessor.with(|mut access| {
-                    Ok::<_, wasmtime::Error>(access.get().table.get(&resource)?.inner.clone())
+                    Ok::<_, wasmtime::Error>(
+                        access.get().table.get(&resource)?.resource.inner.clone(),
+                    )
                 })?;
                 let lease = rwlock.read_owned().await;
                 accessor.with(|mut access| {
-                    let guard = access
-                        .get()
-                        .table
-                        .push(SbiRawRwLockReadGuard { _lease: lease })?;
+                    let guard = access.get().table.push(SbiRawRwLockReadGuard {
+                        _resource: RawRwLockReadGuardResource { _lease: lease },
+                    })?;
                     Ok::<_, wasmtime::Error>((guard,))
                 })
             })
@@ -495,14 +520,15 @@ pub(crate) fn add_sync_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Re
         |accessor: &Accessor<StoreData>, (resource,): (Resource<SbiRawRwLock>,)| {
             Box::pin(async move {
                 let rwlock = accessor.with(|mut access| {
-                    Ok::<_, wasmtime::Error>(access.get().table.get(&resource)?.inner.clone())
+                    Ok::<_, wasmtime::Error>(
+                        access.get().table.get(&resource)?.resource.inner.clone(),
+                    )
                 })?;
                 let lease = rwlock.write_owned().await;
                 accessor.with(|mut access| {
-                    let guard = access
-                        .get()
-                        .table
-                        .push(SbiRawRwLockWriteGuard { _lease: lease })?;
+                    let guard = access.get().table.push(SbiRawRwLockWriteGuard {
+                        _resource: RawRwLockWriteGuardResource { _lease: lease },
+                    })?;
                     Ok::<_, wasmtime::Error>((guard,))
                 })
             })
@@ -628,7 +654,12 @@ fn add_net_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
                     let stream = access.get().table.delete(resource)?;
                     Ok::<_, wasmtime::Error>(stream)
                 })?;
-                stream.service.tcp_close(stream.stream).await;
+                stream
+                    .resource
+                    .backend
+                    .service
+                    .tcp_close(stream.resource.backend.stream)
+                    .await;
                 Ok::<_, wasmtime::Error>(())
             })
         },
@@ -671,10 +702,10 @@ fn add_net_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
                 let response = match connected {
                     Ok(stream) => {
                         let resource = accessor.with(|mut access| {
-                            access.get().table.push(SbiTcpStream {
+                            access.get().table.push(SbiTcpStream::new(RiscvTcpStream {
                                 service: service.clone(),
                                 stream,
-                            })
+                            }))
                         })?;
                         Ok(resource)
                     }
@@ -691,7 +722,10 @@ fn add_net_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
             Box::pin(async move {
                 let socket = accessor.with(|mut access| {
                     let socket = access.get().table.get(&resource)?;
-                    Ok::<_, wasmtime::Error>((socket.service.clone(), socket.stream))
+                    Ok::<_, wasmtime::Error>((
+                        socket.resource.backend.service.clone(),
+                        socket.resource.backend.stream,
+                    ))
                 })?;
                 let response = socket
                     .0
@@ -709,7 +743,10 @@ fn add_net_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
             Box::pin(async move {
                 let socket = accessor.with(|mut access| {
                     let socket = access.get().table.get(&resource)?;
-                    Ok::<_, wasmtime::Error>((socket.service.clone(), socket.stream))
+                    Ok::<_, wasmtime::Error>((
+                        socket.resource.backend.service.clone(),
+                        socket.resource.backend.stream,
+                    ))
                 })?;
                 let response = socket
                     .0
@@ -727,7 +764,10 @@ fn add_net_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
             Box::pin(async move {
                 let socket = accessor.with(|mut access| {
                     let socket = access.get().table.get(&resource)?;
-                    Ok::<_, wasmtime::Error>((socket.service.clone(), socket.stream))
+                    Ok::<_, wasmtime::Error>((
+                        socket.resource.backend.service.clone(),
+                        socket.resource.backend.stream,
+                    ))
                 })?;
                 socket.0.tcp_close(socket.1).await;
                 Ok::<_, wasmtime::Error>((Ok::<(), bindings::helios::system::net::TcpError>(()),))
@@ -749,7 +789,12 @@ fn add_net_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result
                     let stream = access.get().table.delete(resource)?;
                     Ok::<_, wasmtime::Error>(stream)
                 })?;
-                stream.service.tcp_close(stream.stream).await;
+                stream
+                    .resource
+                    .backend
+                    .service
+                    .tcp_close(stream.resource.backend.stream)
+                    .await;
                 Ok::<_, wasmtime::Error>(())
             })
         },
@@ -792,10 +837,10 @@ fn add_net_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result
                 let response = match connected {
                     Ok(stream) => {
                         let resource = accessor.with(|mut access| {
-                            access.get().table.push(SbiTcpStream {
+                            access.get().table.push(SbiTcpStream::new(RiscvTcpStream {
                                 service: service.clone(),
                                 stream,
-                            })
+                            }))
                         })?;
                         Ok(resource)
                     }
@@ -812,7 +857,10 @@ fn add_net_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result
             Box::pin(async move {
                 let socket = accessor.with(|mut access| {
                     let socket = access.get().table.get(&resource)?;
-                    Ok::<_, wasmtime::Error>((socket.service.clone(), socket.stream))
+                    Ok::<_, wasmtime::Error>((
+                        socket.resource.backend.service.clone(),
+                        socket.resource.backend.stream,
+                    ))
                 })?;
                 let response = socket
                     .0
@@ -830,7 +878,10 @@ fn add_net_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result
             Box::pin(async move {
                 let socket = accessor.with(|mut access| {
                     let socket = access.get().table.get(&resource)?;
-                    Ok::<_, wasmtime::Error>((socket.service.clone(), socket.stream))
+                    Ok::<_, wasmtime::Error>((
+                        socket.resource.backend.service.clone(),
+                        socket.resource.backend.stream,
+                    ))
                 })?;
                 let response = socket
                     .0
@@ -848,7 +899,10 @@ fn add_net_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result
             Box::pin(async move {
                 let socket = accessor.with(|mut access| {
                     let socket = access.get().table.get(&resource)?;
-                    Ok::<_, wasmtime::Error>((socket.service.clone(), socket.stream))
+                    Ok::<_, wasmtime::Error>((
+                        socket.resource.backend.service.clone(),
+                        socket.resource.backend.stream,
+                    ))
                 })?;
                 socket.0.tcp_close(socket.1).await;
                 Ok::<_, wasmtime::Error>((Ok::<
@@ -1290,7 +1344,9 @@ impl bindings::helios::system::serial::HostWithStore for HasSelf<StoreData> {
         accessor: &Accessor<T, Self>,
     ) -> wasmtime::Result<Option<Resource<SbiSerialPort>>> {
         accessor.with(|mut access| match access.get().debug_port {
-            Some(()) => Ok(Some(access.get().table.push(SbiSerialPort)?)),
+            Some(()) => Ok(Some(access.get().table.push(SbiSerialPort {
+                _resource: SerialPortResource,
+            })?)),
             None => Ok(None),
         })
     }
@@ -1367,7 +1423,9 @@ impl bindings::helios::system::sync::HostRawMutexWithStore for HasSelf<StoreData
     async fn new<T: Send>(accessor: &Accessor<T, Self>) -> wasmtime::Result<Resource<SbiRawMutex>> {
         accessor.with(|mut access| {
             Ok(access.get().table.push(SbiRawMutex {
-                inner: Arc::new(RawMutex::new()),
+                resource: RawMutexResource {
+                    inner: Arc::new(RawMutex::new()),
+                },
             })?)
         })
     }
@@ -1387,14 +1445,13 @@ impl bindings::helios::system::sync::HostRawMutexWithStore for HasSelf<StoreData
         resource: Resource<SbiRawMutex>,
     ) -> wasmtime::Result<Resource<SbiRawMutexGuard>> {
         let mutex = accessor.with(|mut access| {
-            Ok::<_, wasmtime::Error>(access.get().table.get(&resource)?.inner.clone())
+            Ok::<_, wasmtime::Error>(access.get().table.get(&resource)?.resource.inner.clone())
         })?;
         let lease = mutex.lock_owned().await;
         accessor.with(|mut access| {
-            Ok(access
-                .get()
-                .table
-                .push(SbiRawMutexGuard { _lease: lease })?)
+            Ok(access.get().table.push(SbiRawMutexGuard {
+                _resource: RawMutexGuardResource { _lease: lease },
+            })?)
         })
     }
 }
@@ -1421,7 +1478,9 @@ impl bindings::helios::system::sync::HostRawRwLockWithStore for HasSelf<StoreDat
     ) -> wasmtime::Result<Resource<SbiRawRwLock>> {
         accessor.with(|mut access| {
             Ok(access.get().table.push(SbiRawRwLock {
-                inner: Arc::new(RawRwLock::new()),
+                resource: RawRwLockResource {
+                    inner: Arc::new(RawRwLock::new()),
+                },
             })?)
         })
     }
@@ -1441,14 +1500,13 @@ impl bindings::helios::system::sync::HostRawRwLockWithStore for HasSelf<StoreDat
         resource: Resource<SbiRawRwLock>,
     ) -> wasmtime::Result<Resource<SbiRawRwLockReadGuard>> {
         let rwlock = accessor.with(|mut access| {
-            Ok::<_, wasmtime::Error>(access.get().table.get(&resource)?.inner.clone())
+            Ok::<_, wasmtime::Error>(access.get().table.get(&resource)?.resource.inner.clone())
         })?;
         let lease = rwlock.read_owned().await;
         accessor.with(|mut access| {
-            Ok(access
-                .get()
-                .table
-                .push(SbiRawRwLockReadGuard { _lease: lease })?)
+            Ok(access.get().table.push(SbiRawRwLockReadGuard {
+                _resource: RawRwLockReadGuardResource { _lease: lease },
+            })?)
         })
     }
 
@@ -1457,14 +1515,13 @@ impl bindings::helios::system::sync::HostRawRwLockWithStore for HasSelf<StoreDat
         resource: Resource<SbiRawRwLock>,
     ) -> wasmtime::Result<Resource<SbiRawRwLockWriteGuard>> {
         let rwlock = accessor.with(|mut access| {
-            Ok::<_, wasmtime::Error>(access.get().table.get(&resource)?.inner.clone())
+            Ok::<_, wasmtime::Error>(access.get().table.get(&resource)?.resource.inner.clone())
         })?;
         let lease = rwlock.write_owned().await;
         accessor.with(|mut access| {
-            Ok(access
-                .get()
-                .table
-                .push(SbiRawRwLockWriteGuard { _lease: lease })?)
+            Ok(access.get().table.push(SbiRawRwLockWriteGuard {
+                _resource: RawRwLockWriteGuardResource { _lease: lease },
+            })?)
         })
     }
 }
