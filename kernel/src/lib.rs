@@ -16,6 +16,7 @@ mod component_fs_path;
 mod component_host;
 mod component_resources;
 mod component_runtime;
+mod component_runtime_backend;
 mod component_types;
 mod component_wasi;
 mod compute_pool;
@@ -39,6 +40,7 @@ mod unsupported_host_fs;
 mod time;
 mod timer;
 mod wasi_rights;
+mod wasmtime_adapter;
 mod wasmtime_config;
 
 pub use block_on::block_on;
@@ -73,8 +75,12 @@ pub use component_resources::{
     ComponentRawRwLockWriteGuard, ComponentSerialPort, ComponentTcpBackend, ComponentTcpStream,
 };
 pub use component_runtime::{
-    ComponentOutputMode, ComponentOutputStream, ComponentOutputStreamKind, ComponentStoreData,
-    DeadlinePollable,
+    ComponentOutputMode, ComponentOutputStream, ComponentOutputStreamKind, ComponentRuntimeState,
+    ComponentStoreData, DeadlinePollable,
+};
+pub use component_runtime_backend::{
+    CompiledComponent, ComponentExecContext, ComponentExecutor, ComponentExitStatus,
+    ComponentRuntimeEngine, ComponentRuntimeFactory, ComponentWorld,
 };
 pub use component_types::{
     RawMutexGuardResource, RawMutexResource, RawRwLockReadGuardResource, RawRwLockResource,
@@ -126,6 +132,9 @@ pub use unsupported_host_fs::UnsupportedHostFileSystem;
 pub use wasi_rights::WasiRights;
 pub use time::{elapsed_millis, monotonic_nanos};
 pub use timer::{Sleep, Timer};
+pub use wasmtime_adapter::{
+    WasmtimeCompiledComponent, WasmtimeComponentRuntime, WasmtimeEngine, WasmtimeExecutor,
+};
 pub use wasmtime_config::{
     build_component_engine, build_component_engine_config, build_target_engine_config,
 };
