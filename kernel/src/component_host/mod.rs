@@ -171,79 +171,75 @@ where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
 {
+    use crate::{
+        ComponentExecContext, ComponentExecutor, ComponentExitStatus, ComponentRuntimeEngine,
+        ComponentRuntimeFactory, ComponentWorld,
+    };
+
     let component_name = component.name();
+    let runtime = crate::wasmtime_adapter::WasmtimeComponentRuntime::new(cpu.clone());
+
     emit_stage_marker(write_serial, "engine:new");
     tracing::info!(component = component_name, "creating system component engine");
-    let engine = build_component_engine_for_platform(&cpu).map_err(DebuggerError::CreateEngine)?;
+    let engine = <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as ComponentRuntimeFactory<CpuImpl, HostRuntimeState<CpuImpl, HostFs>, HostFs>>::create_engine(&runtime)
+        .map_err(DebuggerError::CreateEngine)?;
     emit_stage_marker(write_serial, "engine:ok");
+
     tracing::info!(component = component_name, "compiling embedded system component");
-    let component = Component::from_binary(&engine, component.bytes())
+    let compiled = engine
+        .compile(component.bytes())
         .map_err(DebuggerError::CompileComponent)?;
     emit_stage_marker(write_serial, "component:ok");
 
-    emit_stage_marker(write_serial, "linker:new");
-    tracing::info!(component = component_name, "preparing system component linker");
-    let linker = component_linker(&engine, world, None)
-        .map_err(DebuggerError::LinkComponent)?;
-    emit_stage_marker(write_serial, "linker:ok");
-
-    emit_stage_marker(write_serial, "store:new");
-    let filesystem = crate::component_wasi::DebugFileSystem::new(debug_state.clone());
-    let instance_registry = debug_state.instance_registry();
-    let instance = instance_registry.register(component_name, debug_state.uptime_nanos(cpu.now().ticks()));
-    let mut store = store_with_state(
-        &engine,
-        StoreData::<CpuImpl, HostFs>::new(
-            cpu,
-            debug_state,
-            instance_registry,
-            instance,
-            Some(()),
-            filesystem,
-            Vec::new(),
-            Vec::new(),
-            OutputMode::Serial,
-            read_serial,
-            write_serial,
-        ),
-    );
-    emit_stage_marker(write_serial, "store:ok");
-
-    emit_stage_marker(write_serial, "pre:begin");
-    tracing::info!(component = component_name, "instantiating system component");
-    if let Err(error) = linker.instantiate_pre(&component) {
-        emit_error_marker(write_serial, "pre:error", &format!("{error:#}"));
-        log_wasmtime_error_chain("system component instantiate_pre failed", &error);
-        return Err(DebuggerError::InstantiateComponent(error));
-    }
-    emit_stage_marker(write_serial, "pre:ok");
     emit_stage_marker(write_serial, "instantiate:begin");
-    let instance = crate::block_on(linker.instantiate_async(&mut store, &component)).map_err(
-        |error| {
-            emit_error_marker(write_serial, "instantiate:error", &format!("{error:#}"));
-            DebuggerError::InstantiateComponent(error)
-        },
-    )?;
+    tracing::info!(component = component_name, "instantiating system component");
+    let instance_registry = debug_state.instance_registry();
+    let instance = instance_registry.register(
+        component_name,
+        debug_state.uptime_nanos(cpu.now().ticks()),
+    );
+
+    let component_world = match world {
+        ComponentBindingSet::System => ComponentWorld::System,
+        ComponentBindingSet::Program => ComponentWorld::Program,
+    };
+
+    let context = ComponentExecContext::new(
+        cpu,
+        debug_state.clone(),
+        instance_registry,
+        instance,
+        true,
+        debug_state,
+        Vec::new(),
+        Vec::new(),
+        OutputMode::Serial,
+        read_serial,
+        write_serial,
+    );
+
+    let executor = runtime
+        .instantiate(&engine, &compiled, component_world, context)
+        .map_err(DebuggerError::InstantiateComponent)?;
     emit_stage_marker(write_serial, "instantiate:ok");
-    let run = resolve_wasi_cli_run(&component, &instance, &mut store).map_err(|error| {
-        emit_error_marker(write_serial, "run:error", &format!("{error:#}"));
-        DebuggerError::RunComponent(error)
-    })?;
+
     tracing::info!(component = component_name, "entering wasi:cli/run");
     emit_stage_marker(write_serial, "run:begin");
+
     let result = match run_mode {
-        ComponentRunMode::KernelExecutor => run_component_call(&mut store, run, kernel),
-        ComponentRunMode::Concurrent => run_component_call_concurrent(&mut store, run),
-    }
-    .map_err(|error| {
-        emit_error_marker(write_serial, "run:error", &format!("{error:#}"));
-        DebuggerError::RunComponent(error)
-    })?;
+        ComponentRunMode::KernelExecutor => executor
+            .run_cooperative(|| kernel.run_until_stalled())
+            .map_err(DebuggerError::RunComponent)?,
+        ComponentRunMode::Concurrent => crate::block_on(executor.run())
+            .map_err(DebuggerError::RunComponent)?,
+    };
+
     emit_stage_marker(write_serial, "run:ok");
     tracing::info!(component = component_name, "wasi:cli/run returned");
-    match result {
-        (Ok(()),) => Ok(()),
-        (Err(()),) => Err(DebuggerError::GuestFailed),
+
+    match result.status {
+        ComponentExitStatus::Ok => Ok(()),
+        ComponentExitStatus::Failed => Err(DebuggerError::GuestFailed),
     }
 }
 
