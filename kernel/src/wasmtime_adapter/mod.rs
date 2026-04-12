@@ -15,8 +15,9 @@ use wasmtime::Engine;
 
 use crate::{
     CodegenPlatform, ComponentExecContext, ComponentExecutor, ComponentExitStatus,
-    ComponentOutputMode, ComponentRuntimeEngine, ComponentRuntimeFactory, ComponentRuntimeState,
-    ComponentWorld, CompiledComponent, ExecOutput, HostFileSystem, InstanceId,
+    ComponentOutputMode, ComponentRunResult, ComponentRuntimeEngine, ComponentRuntimeFactory,
+    ComponentRuntimeState, ComponentWorld, CompiledComponent, ExecOutput, HostFileSystem,
+    InstanceId,
 };
 use crate::component_host::{
     ComponentBindingSet, HostRuntimeState, StoreData, component_linker, store_with_state,
@@ -68,58 +69,68 @@ where
 
     fn run(
         mut self,
-    ) -> impl core::future::Future<Output = Result<ComponentExitStatus, Self::Error>> + Send {
+    ) -> impl core::future::Future<Output = Result<ComponentRunResult, Self::Error>> + Send {
         async move {
             let run = self.run_func;
             let result = self
                 .store
                 .run_concurrent(async move |accessor| run.call_concurrent(accessor, ()).await)
                 .await??;
-            match result {
-                (Ok(()),) => Ok(ComponentExitStatus::Ok),
-                (Err(()),) => Ok(ComponentExitStatus::Failed),
-            }
+            // After run_concurrent completes, we can access the store again.
+            let status = match result {
+                (Ok(()),) => ComponentExitStatus::Ok,
+                (Err(()),) => ComponentExitStatus::Failed,
+            };
+            let instance_id = self.store.data().instance().id();
+            let output = self.store.data().take_captured_output();
+            Ok(ComponentRunResult {
+                status,
+                instance_id,
+                output,
+            })
         }
     }
 
     fn run_cooperative(
         mut self,
         mut tick: impl FnMut() -> usize,
-    ) -> Result<ComponentExitStatus, Self::Error> {
+    ) -> Result<ComponentRunResult, Self::Error> {
         let run = self.run_func;
 
         let parker = Arc::new(ComponentCallParker::new());
         let waker = core::task::Waker::from(parker.clone());
         let mut cx = core::task::Context::from_waker(&waker);
-        let mut call = core::pin::pin!(self
-            .store
-            .run_concurrent(async move |accessor| { run.call_concurrent(accessor, ()).await }));
 
-        loop {
-            parker.clear();
-            match call.as_mut().poll(&mut cx) {
-                core::task::Poll::Ready(result) => {
-                    let result = result??;
-                    return match result {
-                        (Ok(()),) => Ok(ComponentExitStatus::Ok),
-                        (Err(()),) => Ok(ComponentExitStatus::Failed),
-                    };
-                }
-                core::task::Poll::Pending => {
-                    if tick() == 0 {
-                        parker.wait();
+        let result = {
+            let mut call = core::pin::pin!(self
+                .store
+                .run_concurrent(
+                    async move |accessor| { run.call_concurrent(accessor, ()).await }
+                ));
+
+            loop {
+                parker.clear();
+                match call.as_mut().poll(&mut cx) {
+                    core::task::Poll::Ready(result) => break result,
+                    core::task::Poll::Pending => {
+                        if tick() == 0 {
+                            parker.wait();
+                        }
                     }
                 }
             }
-        }
-    }
+        };
 
-    fn take_captured_output(&self) -> ExecOutput {
-        self.store.data().take_captured_output()
-    }
-
-    fn instance_id(&self) -> InstanceId {
-        self.store.data().instance().id()
+        let result = result??;
+        let status = match result {
+            (Ok(()),) => ComponentExitStatus::Ok,
+            (Err(()),) => ComponentExitStatus::Failed,
+        };
+        Ok(ComponentRunResult {
+            status,
+            instance_id: self.store.data().instance().id(),
+            output: self.store.data().take_captured_output(),
+        })
     }
 }
 

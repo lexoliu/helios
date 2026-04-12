@@ -99,25 +99,26 @@ pub trait ComponentRuntimeEngine: Clone + Send + Sync + 'static {
     fn compile(&self, bytes: &[u8]) -> Result<Self::Compiled, Self::Error>;
 }
 
+/// Result of running a component to completion.
+pub struct ComponentRunResult {
+    pub status: ComponentExitStatus,
+    pub instance_id: InstanceId,
+    pub output: ExecOutput,
+}
+
 /// A running component instance that can be driven to completion.
 pub trait ComponentExecutor: Send + 'static {
     type Error: core::fmt::Display + Send + 'static;
 
     /// Run the component to completion asynchronously.
-    fn run(self) -> impl Future<Output = Result<ComponentExitStatus, Self::Error>> + Send;
+    fn run(self) -> impl Future<Output = Result<ComponentRunResult, Self::Error>> + Send;
 
     /// Run the component cooperatively, interleaving with kernel executor
     /// ticks. Returns when the component exits.
     fn run_cooperative(
         self,
         tick: impl FnMut() -> usize,
-    ) -> Result<ComponentExitStatus, Self::Error>;
-
-    /// Retrieve captured stdout/stderr output after execution.
-    fn take_captured_output(&self) -> ExecOutput;
-
-    /// The instance id of this execution.
-    fn instance_id(&self) -> InstanceId;
+    ) -> Result<ComponentRunResult, Self::Error>;
 }
 
 /// Factory that builds engines and executors from kernel-owned state.

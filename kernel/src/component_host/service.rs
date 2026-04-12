@@ -54,10 +54,11 @@ where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
 {
+    runtime: crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
     engine: Engine,
     compiler: ComputePool,
     compile_priority: ComputePriority,
-    component_cache: Mutex<ComponentCache<Component>>,
+    component_cache: Mutex<ComponentCache<crate::wasmtime_adapter::WasmtimeCompiledComponent>>,
     clock_cpu: CpuImpl,
     spawner: crate::Spawner<CpuImpl>,
     _marker: core::marker::PhantomData<fn() -> HostFs>,
@@ -139,8 +140,10 @@ where
         .unwrap_or_else(|error| panic!("failed to create launched-program engine: {error:#}"));
     let compiler = ComputePool::new(config.worker_count(), WORKER_STACK_SIZE, compiler_budget)
         .unwrap_or_else(|error| panic!("failed to create launched-program compute pool: {error}"));
+    let runtime = crate::wasmtime_adapter::WasmtimeComponentRuntime::new(cpu.clone());
     let service = UserProgramService {
         inner: Arc::new(UserProgramServiceInner {
+            runtime,
             engine,
             compiler,
             compile_priority: ComputePriority::NORMAL,
@@ -304,11 +307,15 @@ where
             request.args,
             request.rights,
             component,
+            &self.inner.runtime,
         )
         .await
     }
 
-    async fn compile_component(&self, wasm: &[u8]) -> Result<Arc<Component>, ProgramExecError> {
+    async fn compile_component(
+        &self,
+        wasm: &[u8],
+    ) -> Result<Arc<crate::wasmtime_adapter::WasmtimeCompiledComponent>, ProgramExecError> {
         let started_at = monotonic_nanos(&self.inner.clock_cpu);
         if let Some(component) = self.inner.component_cache.lock().get(wasm) {
             let now = monotonic_nanos(&self.inner.clock_cpu);
@@ -329,7 +336,13 @@ where
             {
                 let engine = self.inner.engine.clone();
                 let wasm = wasm.clone();
-                move || Component::from_binary(&engine, &wasm)
+                move || {
+                    let component = Component::from_binary(&engine, &wasm)?;
+                    Ok(crate::wasmtime_adapter::WasmtimeCompiledComponent {
+                        component,
+                        engine: engine.clone(),
+                    })
+                }
             },
         ));
         let compiled = core::future::poll_fn(|cx| match compiled.as_mut().poll(cx) {
@@ -346,9 +359,9 @@ where
             kind: ProgramExecErrorKind::QueueSaturated,
             detail: error.to_string(),
         })?
-        .map_err(|error| ProgramExecError {
+        .map_err(|error: wasmtime::Error| ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
-            detail: error.to_string(),
+            detail: format!("{error:#}"),
         })?;
 
         let component = Arc::new(compiled);
@@ -390,18 +403,18 @@ async fn run_program_component<CpuImpl, HostFs>(
     name: String,
     args: Vec<String>,
     _rights: WasiRights,
-    component: Arc<Component>,
+    compiled: Arc<crate::wasmtime_adapter::WasmtimeCompiledComponent>,
+    runtime: &crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
 ) -> Result<ExecResult, ProgramExecError>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
 {
-    let linker = component_linker(
-        component.engine(),
-        ComponentBindingSet::Program,
-        Some(&component),
-    )
-    .map_err(map_program_component_error)?;
+    use crate::{
+        ComponentExecContext, ComponentExecutor, ComponentExitStatus, ComponentRuntimeFactory,
+        ComponentWorld,
+    };
+
     let started_at = exec_context.runtime_state.uptime_nanos(exec_context.cpu.now().ticks());
     let launched_instance = exec_context
         .instance_registry
@@ -409,40 +422,41 @@ where
     let mut argv = Vec::with_capacity(args.len() + 1);
     argv.push(name);
     argv.extend(args);
-    let mut store = store_with_state(
-        component.engine(),
-        StoreData::<CpuImpl, HostFs>::new(
-            exec_context.cpu,
-            exec_context.runtime_state.clone(),
-            exec_context.instance_registry,
-            launched_instance,
-            None,
-            crate::component_wasi::DebugFileSystem::new(exec_context.runtime_state),
-            argv,
-            Vec::new(),
-            OutputMode::Capture,
-            exec_context.read_serial,
-            exec_context.write_serial,
-        ),
+
+    let context = ComponentExecContext::new(
+        exec_context.cpu,
+        exec_context.runtime_state.clone(),
+        exec_context.instance_registry,
+        launched_instance,
+        false,
+        exec_context.runtime_state,
+        argv,
+        Vec::new(),
+        OutputMode::Capture,
+        exec_context.read_serial,
+        exec_context.write_serial,
     );
-    let program = program_bindings::Init::instantiate_async(&mut store, &component, &linker)
-        .await
-        .map_err(map_program_component_error)?;
-    let status = store
-        .run_concurrent(async move |accessor| program.wasi_cli_run().call_run(accessor).await)
-        .await
-        .map_err(map_program_component_error)?
-        .map_err(map_program_component_error)?;
+
+    let engine = <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as ComponentRuntimeFactory<CpuImpl, HostRuntimeState<CpuImpl, HostFs>, HostFs>>::create_engine(runtime)
+        .map_err(map_program_runtime_error)?;
+    let executor = <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as ComponentRuntimeFactory<CpuImpl, HostRuntimeState<CpuImpl, HostFs>, HostFs>>::instantiate(runtime, &engine, &compiled, ComponentWorld::Program, context)
+        .map_err(map_program_runtime_error)?;
+
+    let result = executor.run().await.map_err(map_program_runtime_error)?;
+
     Ok(ExecResult {
-        instance_id: store.data().instance().id(),
-        exit_code: if status.is_ok() { 0 } else { 1 },
-        output: store.data().take_captured_output(),
+        instance_id: result.instance_id,
+        exit_code: match result.status {
+            ComponentExitStatus::Ok => 0,
+            ComponentExitStatus::Failed => 1,
+        },
+        output: result.output,
     })
 }
 
-fn map_program_component_error(error: wasmtime::Error) -> ProgramExecError {
+fn map_program_runtime_error(error: impl core::fmt::Display) -> ProgramExecError {
     ProgramExecError {
         kind: ProgramExecErrorKind::Internal,
-        detail: error.to_string(),
+        detail: format!("{error:#}"),
     }
 }

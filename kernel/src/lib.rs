@@ -80,7 +80,7 @@ pub use component_runtime::{
 };
 pub use component_runtime_backend::{
     CompiledComponent, ComponentExecContext, ComponentExecutor, ComponentExitStatus,
-    ComponentRuntimeEngine, ComponentRuntimeFactory, ComponentWorld,
+    ComponentRunResult, ComponentRuntimeEngine, ComponentRuntimeFactory, ComponentWorld,
 };
 pub use component_types::{
     RawMutexGuardResource, RawMutexResource, RawRwLockReadGuardResource, RawRwLockResource,
