@@ -39,18 +39,6 @@ impl Instant {
 }
 
 pub trait Cpu: Send + Sync + 'static {
-    /// Returns the Wasmtime target triple that matches this CPU backend.
-    ///
-    /// Component compilation belongs in shared runtime code, but target
-    /// selection is an architecture capability and therefore lives in the HAL.
-    fn wasmtime_target(&self) -> &'static str;
-
-    /// Publishes freshly generated executable code for this backend.
-    ///
-    /// Architectures that require explicit instruction-cache synchronization
-    /// must do it here. Backends without such requirements may leave this empty.
-    fn publish_executable_code(&self, ptr: *const u8, len: usize);
-
     /// Returns the processor currently executing this code path.
     ///
     /// This must be cheap and stable for the lifetime of the `Cpu` value because

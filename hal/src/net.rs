@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use crate::fs::IoResult;
+use crate::io::IoResult;
 
 type MacAddress = [u8; 6];
 

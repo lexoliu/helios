@@ -4,27 +4,26 @@ extern crate alloc;
 extern crate self as helios_kernel;
 #[cfg(not(target_os = "none"))]
 extern crate std;
-pub extern crate wasmtime;
-pub extern crate wasmtime_wasi_io;
-#[allow(hidden_glob_reexports)]
-pub use wasmtime::*;
-pub use wasmtime::component;
-#[allow(hidden_glob_reexports)]
-pub use wasmtime_wasi_io::*;
 
 mod block_on;
 mod bootfs;
+mod codegen_platform;
+pub mod component_bindings;
 mod component_cache;
+mod component_engine;
 mod component_fs;
 mod component_fs_path;
+mod component_host;
+mod component_resources;
 mod component_runtime;
 mod component_types;
+mod component_wasi;
 mod compute_pool;
 mod embedded_component;
-mod embedded_debugger;
 mod embedded_init;
 mod embedded_program;
 mod executor;
+mod host_fs_client;
 mod host_share;
 mod instance;
 mod log;
@@ -33,20 +32,46 @@ mod program;
 mod program_service;
 mod runtime_state;
 mod runtime_types;
+mod serial_transport;
 mod sync;
 mod task;
+mod unsupported_host_fs;
 mod time;
 mod timer;
+mod wasi_rights;
 mod wasmtime_config;
 
 pub use block_on::block_on;
+pub use codegen_platform::CodegenPlatform;
 pub use bootfs::{
     BootDirectory, BootDirectoryEntry, BootDirectoryHandleExt, BootFile, EmbeddedBootFile,
     EmbeddedBootFs,
 };
 pub use component_cache::ComponentCache;
-pub use component_fs::{ComponentFsNodeKind, ComponentFsResourceError, map_resource_table_error};
-pub use component_fs_path::{ComponentFsPathError, directory_prefix, parent_path, resolve_child_path};
+pub use component_engine::{
+    build_component_engine_for_platform, build_program_engine_for_platform, resolve_wasi_cli_run,
+};
+pub use component_fs::{
+    ComponentFsNodeKind, ComponentFsResourceError, ComponentResourceTableError,
+    map_resource_table_error,
+};
+pub use component_fs_path::{
+    ComponentFsPathError, directory_prefix, parent_path, resolve_child_path,
+};
+pub use component_host::{
+    ComponentBindingSet, ComponentHostProcessorRole, ComponentRunMode, HostRuntimeState,
+    ProgramServiceConfig, UserProgramService, component_host_processor_role,
+    component_host_system_processor, component_host_worker_count,
+    install_component_host_program_service, install_program_service,
+    install_program_service_with_config, run_component_host_processor_forever,
+    run_embedded_component_forever, run_embedded_component_in_mode_forever,
+    run_program_workers_forever,
+    system_component_should_run_on,
+};
+pub use component_resources::{
+    ComponentRawMutex, ComponentRawMutexGuard, ComponentRawRwLock, ComponentRawRwLockReadGuard,
+    ComponentRawRwLockWriteGuard, ComponentSerialPort, ComponentTcpBackend, ComponentTcpStream,
+};
 pub use component_runtime::{
     ComponentOutputMode, ComponentOutputStream, ComponentOutputStreamKind, ComponentStoreData,
     DeadlinePollable,
@@ -57,32 +82,39 @@ pub use component_types::{
 };
 pub use compute_pool::{ComputePool, ComputePriority, SpawnError as ComputeSpawnError};
 pub use embedded_component::EmbeddedComponent;
-pub use embedded_debugger::{EmbeddedDebugger, embedded_debugger};
-pub use embedded_init::{EmbeddedInit, embedded_init};
+pub use embedded_init::{
+    EmbeddedInit, embedded_boot_component, embedded_init, embedded_system_component,
+    has_embedded_system_component,
+};
 pub use embedded_program::EmbeddedProgram;
 pub use executor::{JoinHandle, LocalJoinHandle, Spawner};
-pub use host_share::{HOST_SHARE_GUEST_MOUNT_PATH, guest_host_share_path};
 pub use helios_hal::Platform;
+pub use host_fs_client::{HostFsClient, HostFsFuture, HostFsTransport};
+pub use host_share::{HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, guest_host_share_path};
 pub use instance::{
-    InstanceExecutionTransition, InstanceId, InstanceRegistry, InstanceSnapshot, RegisteredInstance,
-    allow_instance_resource_growth, record_instance_call_hook,
+    InstanceExecutionTransition, InstanceId, InstanceRegistry, InstanceSnapshot,
+    RegisteredInstance, allow_instance_resource_growth, record_instance_transition,
 };
 pub use observer::{
     DEFAULT_TRACE_HISTORY_CAPACITY, StatsSample, TraceEvent, TraceField, TraceFilter, TraceHistory,
     TraceLevel, TraceValue, matches_trace_filter, parse_console_text,
 };
 pub use program::{
-    Blueprint, CompileError as ProgramCompileError, ExitCode, ProgramRuntime, ProgramRuntimeConfig,
-    ProgramRuntimeDriver, ProgramRuntimeError, ProgramRuntimeInitError, ResourceTable,
+    Blueprint, CompileError as ProgramCompileError, ExitCode, ProgramRuntime,
+    ProgramRuntimeBackend, ProgramRuntimeConfig, ProgramRuntimeDriver, ProgramRuntimeDriverBackend,
+    ProgramRuntimeError, ProgramRuntimeInitError, ProgramTask, ResourceTable,
     RunError as ProgramRunError, Task,
 };
 pub use program_service::{ProgramExecError, ProgramExecErrorKind, ProgramService};
 pub use runtime_state::RuntimeState;
 pub use runtime_types::{
-    ComponentHostFilesystemState, ExecOutput, ExecResult, HostDirEntry, HostFileSystem,
-    HostFsError, HostMetadata,
-    Ipv4Address, PingError,
-    PingErrorKind, PingReply, TcpError, TcpErrorKind,
+    ComponentHostFilesystemState, ComponentNetworkService, ComponentNetworkState,
+    DynComponentNetworkService, DynamicNetworkService, ExecOutput, ExecResult, HostDirEntry,
+    HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata, Ipv4Address, PingError,
+    PingErrorKind, PingReply, TcpError, TcpErrorKind, TcpStreamToken,
+};
+pub use serial_transport::{
+    emit_serial_error_marker, emit_serial_stage_marker, read_serial, write_serial,
 };
 pub use sync::{
     Mutex, MutexGuard, Notified, Notify, OwnedRawMutexLease, OwnedRawRwLockReadLease,
@@ -90,6 +122,8 @@ pub use sync::{
     RawRwLockWriteLease, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
 pub use task::{YieldNow, yield_now};
+pub use unsupported_host_fs::UnsupportedHostFileSystem;
+pub use wasi_rights::WasiRights;
 pub use time::{elapsed_millis, monotonic_nanos};
 pub use timer::{Sleep, Timer};
 pub use wasmtime_config::{

@@ -2,36 +2,42 @@ extern crate alloc;
 
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
-use core::future::{Future, poll_fn};
+use core::future::poll_fn;
 use core::task::Poll;
 
 use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 use helios_hal::cpu::Cpu;
-use helios_hal::resource::WasiRights;
+use crate::WasiRights;
 use thiserror::Error;
 
 use crate::program::CompileError;
 use crate::{
-    Blueprint, InstanceId, InstanceRegistry, Notify, ProgramRuntime, ProgramRuntimeDriver, Task,
-    monotonic_nanos,
+    Blueprint, InstanceId, InstanceRegistry, Notify, ProgramRuntime, ProgramRuntimeBackend,
+    ProgramRuntimeDriverBackend, ProgramTask, monotonic_nanos,
 };
 
 #[derive(Clone)]
-pub struct ProgramService<CpuImpl: Cpu + Clone> {
-    inner: Arc<ProgramServiceInner<CpuImpl>>,
+pub struct ProgramService<CpuImpl: Cpu + Clone, Runtime = ProgramRuntime>
+where
+    Runtime: ProgramRuntimeBackend,
+{
+    inner: Arc<ProgramServiceInner<CpuImpl, Runtime>>,
 }
 
-struct ProgramServiceInner<CpuImpl: Cpu + Clone> {
-    runtime: ProgramRuntime,
-    compiler: ProgramRuntimeDriver,
+struct ProgramServiceInner<CpuImpl: Cpu + Clone, Runtime>
+where
+    Runtime: ProgramRuntimeBackend,
+{
+    runtime: Runtime,
+    compiler: Runtime::Driver,
     clock_cpu: CpuImpl,
     instance_registry: InstanceRegistry,
-    run_queue: ConcurrentQueue<QueuedProgram>,
+    run_queue: ConcurrentQueue<QueuedProgram<Runtime::Task>>,
     run_ready: Notify,
     compile_ready: Arc<Notify>,
 }
 
-struct QueuedProgram {
+struct QueuedProgram<Task> {
     task: Task,
     instance: crate::RegisteredInstance,
 }
@@ -59,12 +65,11 @@ pub struct ProgramExecError {
     pub detail: String,
 }
 
-impl<CpuImpl: Cpu + Clone> ProgramService<CpuImpl> {
-    pub fn new(
-        runtime: ProgramRuntime,
-        clock_cpu: CpuImpl,
-        instance_registry: InstanceRegistry,
-    ) -> Self {
+impl<CpuImpl: Cpu + Clone, Runtime> ProgramService<CpuImpl, Runtime>
+where
+    Runtime: ProgramRuntimeBackend,
+{
+    pub fn new(runtime: Runtime, clock_cpu: CpuImpl, instance_registry: InstanceRegistry) -> Self {
         let compiler = runtime.driver();
         let compile_ready = compiler.ready_notify();
         Self {

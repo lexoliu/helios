@@ -1,4 +1,6 @@
 use std::fs;
+use std::os::unix::fs::FileTypeExt;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -8,7 +10,8 @@ use bootloader::BiosBoot;
 use clap::{Args as ClapArgs, Subcommand, ValueEnum};
 use console::style;
 use directories::ProjectDirs;
-use helios_hal::fs::HOST_SHARE_MOUNT_TAG;
+/// Virtio 9p mount tag matching the kernel's host share device expectation.
+const HOST_SHARE_MOUNT_TAG: &str = "hostshare";
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
@@ -22,6 +25,7 @@ const DEFAULT_MEMORY: &str = "512M";
 const DEFAULT_RISCV_SMP: u16 = 4;
 const DEFAULT_X86_SMP: u16 = 2;
 const DEFAULT_SOCKET_WAIT: Duration = Duration::from_secs(10);
+const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -69,6 +73,8 @@ pub(crate) struct VmConfigFile {
     #[serde(default)]
     pub(crate) arch: Option<VmArch>,
     #[serde(default)]
+    pub(crate) release: Option<bool>,
+    #[serde(default)]
     pub(crate) qemu_bin: Option<PathBuf>,
     #[serde(default)]
     pub(crate) kernel: Option<PathBuf>,
@@ -88,6 +94,9 @@ pub(crate) struct VmConfigFile {
 pub(crate) struct VmCommand {
     #[arg(long, value_enum, default_value_t = VmArch::Riscv64)]
     arch: VmArch,
+
+    #[arg(long, default_value_t = false)]
+    release: bool,
 
     #[arg(long)]
     config: Option<PathBuf>,
@@ -125,7 +134,7 @@ pub(crate) struct VmCommand {
 
 #[derive(Debug, Subcommand)]
 enum VmSessionCommand {
-    Dash(crate::DashCommand),
+    Shell(crate::ShellCommand),
     Tracing(crate::TracingCommand),
     Stats,
     Repl,
@@ -134,6 +143,7 @@ enum VmSessionCommand {
 #[derive(Debug)]
 struct ResolvedVmCommand {
     arch: VmArch,
+    release: bool,
     qemu_bin: PathBuf,
     kernel: PathBuf,
     socket: Option<PathBuf>,
@@ -161,6 +171,7 @@ pub(crate) fn run(command: VmCommand) -> Result<()> {
 fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
     let file = load_config_file(command.config.as_deref())?;
     let arch = file.arch.unwrap_or(command.arch);
+    let release = command.release || file.release.unwrap_or(false);
     let qemu_bin = command
         .qemu_bin
         .or(file.qemu_bin)
@@ -168,7 +179,7 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
     let kernel = command
         .kernel
         .or(file.kernel)
-        .unwrap_or_else(|| default_kernel_path(arch));
+        .unwrap_or_else(|| default_kernel_path(arch, release));
     let smp = command
         .smp
         .or(file.smp)
@@ -191,6 +202,7 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
 
     Ok(ResolvedVmCommand {
         arch,
+        release,
         qemu_bin,
         kernel,
         socket: command.socket,
@@ -241,9 +253,7 @@ fn build_vm(command: &ResolvedVmCommand) -> Result<()> {
     let repo_root = repo_root();
     run_step(
         &format!("building {} kernel", arch_label(command.arch)),
-        Command::new("cargo")
-            .current_dir(repo_root)
-            .arg("build")
+        cargo_build_command(repo_root, command.release)
             .arg("--target")
             .arg(command.arch.cargo_target())
             .arg("--bin")
@@ -251,34 +261,46 @@ fn build_vm(command: &ResolvedVmCommand) -> Result<()> {
     )?;
     run_step(
         "building inspector",
-        Command::new("cargo")
-            .current_dir(repo_root)
-            .arg("build")
+        cargo_build_command(repo_root, command.release)
             .arg("-p")
             .arg("helios-inspector"),
     )?;
     Ok(())
 }
 
+fn cargo_build_command(repo_root: &Path, release: bool) -> Command {
+    let mut command = Command::new("cargo");
+    command.current_dir(repo_root).arg("build");
+    if release {
+        command.arg("--release");
+    }
+    command
+}
+
 fn connect_and_run(command: &ResolvedVmCommand, socket_path: &Path) -> Result<()> {
     let socket = socket_path.to_str().ok_or_else(|| {
         anyhow::anyhow!("socket path must be valid UTF-8: {}", socket_path.display())
     })?;
-    let client = connect_client(socket, command.baud, true)?;
+    let boot_sync = true;
+    let client = connect_client(socket, command.baud, boot_sync)
+        .context("failed to connect inspector RPC client")?;
     run_connected(client, command.command.clone())
 }
 
-fn prepare_boot_artifact(command: &ResolvedVmCommand) -> Result<PathBuf> {
+fn prepare_boot_artifact(command: &ResolvedVmCommand, runtime_dir: Option<&Path>) -> Result<PathBuf> {
     match command.arch {
         VmArch::Riscv64 => Ok(command.kernel.clone()),
-        VmArch::X86_64 => prepare_x86_bios_image(command),
+        VmArch::X86_64 => prepare_x86_bios_image(command, runtime_dir),
     }
 }
 
-fn prepare_x86_bios_image(command: &ResolvedVmCommand) -> Result<PathBuf> {
+fn prepare_x86_bios_image(command: &ResolvedVmCommand, runtime_dir: Option<&Path>) -> Result<PathBuf> {
     let kernel = fs::canonicalize(&command.kernel)
         .with_context(|| format!("failed to canonicalize kernel {}", command.kernel.display()))?;
-    let image = kernel.with_extension("bios.img");
+    let image = match runtime_dir {
+        Some(dir) => dir.join("kernel.bios.img"),
+        None => kernel.with_extension("bios.img"),
+    };
     let spinner = spinner("building x86_64 BIOS disk image");
     let bios = BiosBoot::new(&kernel);
     bios.create_disk_image(&image)
@@ -309,34 +331,24 @@ fn run_step(label: &str, command: &mut Command) -> Result<()> {
 
 struct VmRuntime {
     socket_path: PathBuf,
-    _tempdir: Option<TempDir>,
+    _tempdir: TempDir,
     child: Child,
 }
 
 impl VmRuntime {
     fn spawn(command: &ResolvedVmCommand) -> Result<Self> {
-        let (tempdir, socket_path) = match &command.socket {
-            Some(path) => (None, path.clone()),
-            None => {
-                let dir = tempfile::Builder::new()
-                    .prefix("helios-inspector-vm.")
-                    .tempdir()
-                    .context("failed to create temporary QEMU runtime directory")?;
-                (Some(dir), PathBuf::from("debug.sock"))
-            }
-        };
-        let (socket_path, qemu_log) = match &tempdir {
-            Some(dir) => (dir.path().join(socket_path), dir.path().join("qemu.log")),
-            None => {
-                let log = socket_path
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .join("qemu.log");
-                (socket_path, log)
-            }
-        };
+        let tempdir = tempfile::Builder::new()
+            .prefix("helios-inspector-vm.")
+            .tempdir()
+            .context("failed to create temporary QEMU runtime directory")?;
+        let socket_path = command
+            .socket
+            .clone()
+            .unwrap_or_else(|| tempdir.path().join("debug.sock"));
+        let qemu_log = tempdir.path().join("qemu.log");
 
-        let artifact = prepare_boot_artifact(command)?;
+        prepare_socket_path(&socket_path)?;
+        let artifact = prepare_boot_artifact(command, Some(tempdir.path()))?;
 
         let spinner = spinner(&format!("starting QEMU for {}", arch_label(command.arch)));
         let mut qemu = Command::new(&command.qemu_bin);
@@ -346,6 +358,8 @@ impl VmRuntime {
         qemu.arg("-smp").arg(command.smp.to_string());
         qemu.arg("-serial")
             .arg(format!("unix:{},server=on,wait=on", socket_path.display()));
+        qemu.process_group(0);
+        qemu.stdin(Stdio::null());
         qemu.stdout(Stdio::from(fs::File::create(&qemu_log).with_context(
             || format!("failed to create {}", qemu_log.display()),
         )?));
@@ -370,11 +384,13 @@ impl VmRuntime {
                         "local,id=hostfs,path={},security_model=none,multidevs=remap",
                         shared_dir.display()
                     ));
-                    qemu.arg("-device")
-                        .arg(format!("virtio-9p-device,fsdev=hostfs,mount_tag={HOST_SHARE_MOUNT_TAG}"));
+                    qemu.arg("-device").arg(format!(
+                        "virtio-9p-device,fsdev=hostfs,mount_tag={HOST_SHARE_MOUNT_TAG}"
+                    ));
                 }
             }
             VmArch::X86_64 => {
+                qemu.arg("-cpu").arg("max");
                 qemu.arg("-drive")
                     .arg(format!("format=raw,file={}", artifact.display()));
             }
@@ -416,6 +432,31 @@ impl Drop for VmRuntime {
     }
 }
 
+fn prepare_socket_path(socket_path: &Path) -> Result<()> {
+    if let Some(parent) = socket_path.parent().filter(|path| !path.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create socket directory {}", parent.display())
+        })?;
+    }
+    if !socket_path.exists() {
+        return Ok(());
+    }
+
+    let metadata = fs::symlink_metadata(socket_path).with_context(|| {
+        format!("failed to inspect existing socket path {}", socket_path.display())
+    })?;
+    if !metadata.file_type().is_socket() {
+        bail!(
+            "refusing to overwrite existing non-socket path {}",
+            socket_path.display()
+        );
+    }
+    fs::remove_file(socket_path).with_context(|| {
+        format!("failed to remove stale socket {}", socket_path.display())
+    })?;
+    Ok(())
+}
+
 fn wait_for_socket(socket_path: &Path, qemu_log: &Path, child: &mut Child) -> Result<()> {
     let started = std::time::Instant::now();
     while started.elapsed() < DEFAULT_SOCKET_WAIT {
@@ -427,7 +468,8 @@ fn wait_for_socket(socket_path: &Path, qemu_log: &Path, child: &mut Child) -> Re
             .context("failed to poll QEMU process state")?
             .is_some()
         {
-            let log = fs::read_to_string(qemu_log).unwrap_or_default();
+            let log = fs::read_to_string(qemu_log)
+                .with_context(|| format!("failed to read QEMU log {}", qemu_log.display()))?;
             bail!(
                 "QEMU exited before opening the debug serial socket {}
 {}",
@@ -435,7 +477,7 @@ fn wait_for_socket(socket_path: &Path, qemu_log: &Path, child: &mut Child) -> Re
                 log
             );
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(SOCKET_POLL_INTERVAL);
     }
     bail!(
         "timed out waiting for QEMU to create debug serial socket {}",
@@ -460,18 +502,18 @@ fn repo_root() -> &'static Path {
         .expect("inspector crate must live under repo root")
 }
 
-fn default_kernel_path(arch: VmArch) -> PathBuf {
+fn default_kernel_path(arch: VmArch, release: bool) -> PathBuf {
     repo_root()
         .join("target")
         .join(arch.cargo_target())
-        .join("debug")
+        .join(if release { "release" } else { "debug" })
         .join(arch.kernel_artifact_name())
 }
 
 impl From<VmSessionCommand> for SessionCommand {
     fn from(value: VmSessionCommand) -> Self {
         match value {
-            VmSessionCommand::Dash(command) => Self::Dash(command),
+            VmSessionCommand::Shell(command) => Self::Shell(command),
             VmSessionCommand::Tracing(command) => Self::Tracing(command),
             VmSessionCommand::Stats => Self::Stats,
             VmSessionCommand::Repl => Self::Repl,

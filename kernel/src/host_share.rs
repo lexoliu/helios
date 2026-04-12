@@ -1,3 +1,6 @@
+/// Virtio 9p mount tag used by backends to identify the host share device.
+pub const HOST_SHARE_MOUNT_TAG: &str = "hostshare";
+
 pub const HOST_SHARE_GUEST_MOUNT_PATH: &str = "/host";
 
 pub fn guest_host_share_path(path: &str) -> Option<&str> {

@@ -1,18 +1,21 @@
 extern crate alloc;
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use core::future::Future;
 use helios_hal::cpu::Cpu;
 use helios_hal::fs::DirectoryHandle;
-use helios_hal::resource::{SerialRights, WasiRights};
+use helios_hal::resource::SerialRights;
+use crate::WasiRights;
 use thiserror::Error;
 use wasmtime::{CallHook, Config, Engine, Linker, Module, ResourceLimiter, Store};
 
 use crate::{
     BootDirectory, ComputePool, ComputePriority, ComputeSpawnError, EmbeddedProgram,
-    RegisteredInstance, allow_instance_resource_growth, build_target_engine_config,
-    record_instance_call_hook,
+    InstanceExecutionTransition, RegisteredInstance, allow_instance_resource_growth,
+    build_target_engine_config, record_instance_transition,
 };
 
 /// Immutable compilation settings for the user-mode runtime.
@@ -135,6 +138,36 @@ pub struct Task {
 
 pub type ExitCode = u32;
 
+pub trait ProgramRuntimeBackend: Clone + Send + Sync + 'static {
+    type Driver: ProgramRuntimeDriverBackend;
+    type Task: ProgramTask;
+
+    fn compile_worker_count(&self) -> usize;
+
+    fn driver(&self) -> Self::Driver;
+
+    fn compile(
+        &self,
+        blueprint: Blueprint<'_>,
+    ) -> impl Future<Output = Result<Self::Task, CompileError>> + Send;
+}
+
+pub trait ProgramRuntimeDriverBackend: Clone + Send + 'static {
+    fn run_next(&self) -> bool;
+
+    fn wait_for_work(&self) -> impl Future<Output = ()> + Send;
+
+    fn ready_notify(&self) -> Arc<crate::sync::Notify>;
+}
+
+pub trait ProgramTask: Send + 'static {
+    fn run_tracked<CpuImpl: Cpu + Clone>(
+        self,
+        cpu: CpuImpl,
+        instance: RegisteredInstance,
+    ) -> Result<ExitCode, RunError>;
+}
+
 struct TaskState {
     rights: WasiRights,
     resources: ResourceTable,
@@ -213,6 +246,50 @@ impl ProgramRuntimeDriver {
 
     pub(crate) fn ready_notify(&self) -> alloc::sync::Arc<crate::sync::Notify> {
         self.compiler.ready_notify()
+    }
+}
+
+impl ProgramRuntimeBackend for ProgramRuntime {
+    type Driver = ProgramRuntimeDriver;
+    type Task = Task;
+
+    fn compile_worker_count(&self) -> usize {
+        self.compile_worker_count()
+    }
+
+    fn driver(&self) -> Self::Driver {
+        self.driver()
+    }
+
+    fn compile(
+        &self,
+        blueprint: Blueprint<'_>,
+    ) -> impl Future<Output = Result<Self::Task, CompileError>> + Send {
+        ProgramRuntime::compile(self, blueprint)
+    }
+}
+
+impl ProgramRuntimeDriverBackend for ProgramRuntimeDriver {
+    fn run_next(&self) -> bool {
+        self.run_next()
+    }
+
+    fn wait_for_work(&self) -> impl Future<Output = ()> + Send {
+        self.wait_for_work()
+    }
+
+    fn ready_notify(&self) -> Arc<crate::sync::Notify> {
+        self.ready_notify()
+    }
+}
+
+impl ProgramTask for Task {
+    fn run_tracked<CpuImpl: Cpu + Clone>(
+        self,
+        cpu: CpuImpl,
+        instance: RegisteredInstance,
+    ) -> Result<ExitCode, RunError> {
+        Task::run_tracked(self, cpu, instance)
     }
 }
 
@@ -379,7 +456,15 @@ impl<CpuImpl: Cpu + Clone> TrackedTaskState<CpuImpl> {
     }
 
     fn record_call_hook(&mut self, hook: CallHook) {
-        record_instance_call_hook(&self.instance, hook, self.now_nanos());
+        let transition = match hook {
+            CallHook::CallingWasm | CallHook::ReturningFromHost => {
+                InstanceExecutionTransition::Resume
+            }
+            CallHook::ReturningFromWasm | CallHook::CallingHost => {
+                InstanceExecutionTransition::Pause
+            }
+        };
+        record_instance_transition(&self.instance, transition, self.now_nanos());
     }
 }
 
@@ -523,7 +608,7 @@ mod tests {
 
     use super::{Blueprint, CompileError, ProgramRuntimeConfig, ProgramRuntimeError};
     use crate::{ComputePriority, EmbeddedProgram};
-    use helios_hal::resource::WasiRights;
+    use crate::WasiRights;
 
     fn test_runtime() -> Result<super::ProgramRuntime, ProgramRuntimeError> {
         super::ProgramRuntime::new(

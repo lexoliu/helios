@@ -2,76 +2,19 @@
 #![no_main]
 
 extern crate alloc;
-extern crate helios_kernel as wasmtime;
-extern crate helios_kernel as wasmtime_wasi_io;
-
-mod debugger_program;
-mod debugger_wasi;
 mod host_fs;
 mod net;
 
 mod debug_state {
-    pub(crate) type RuntimeState = helios_kernel::RuntimeState<
-        crate::debugger_program::UserProgramService,
-        crate::net::NetworkService,
-        crate::host_fs::HostFileSystemService,
-    >;
-}
-
-mod debugger_bindings {
-    pub(crate) mod bindings {
-        use helios_kernel::wasmtime;
-
-        helios_kernel::wasmtime::component::bindgen!({
-            path: "../wit",
-            world: "debugger",
-            imports: { default: async | store | trappable },
-            exports: { default: async },
-            with: {
-                "helios:system/net.tcp-stream": crate::debugger_program::SbiTcpStream,
-                "helios:system/serial.serial-port": crate::debugger_program::SbiSerialPort,
-                "helios:system/sync.raw-mutex": crate::debugger_program::SbiRawMutex,
-                "helios:system/sync.raw-mutex-guard": crate::debugger_program::SbiRawMutexGuard,
-                "helios:system/sync.raw-rw-lock": crate::debugger_program::SbiRawRwLock,
-                "helios:system/sync.raw-rw-lock-read-guard":
-                    crate::debugger_program::SbiRawRwLockReadGuard,
-                "helios:system/sync.raw-rw-lock-write-guard":
-                    crate::debugger_program::SbiRawRwLockWriteGuard,
-            },
-            require_store_data_send: true,
-        });
-    }
-}
-
-mod program_bindings {
-    pub(crate) mod bindings {
-        use helios_kernel::wasmtime;
-
-        helios_kernel::wasmtime::component::bindgen!({
-            path: "../wit",
-            world: "init",
-            imports: { default: async | store | trappable },
-            exports: { default: async },
-            with: {
-                "helios:system/net.tcp-stream": crate::debugger_program::SbiTcpStream,
-                "helios:system/serial.serial-port": crate::debugger_program::SbiSerialPort,
-                "helios:system/sync.raw-mutex": crate::debugger_program::SbiRawMutex,
-                "helios:system/sync.raw-mutex-guard": crate::debugger_program::SbiRawMutexGuard,
-                "helios:system/sync.raw-rw-lock": crate::debugger_program::SbiRawRwLock,
-                "helios:system/sync.raw-rw-lock-read-guard":
-                    crate::debugger_program::SbiRawRwLockReadGuard,
-                "helios:system/sync.raw-rw-lock-write-guard":
-                    crate::debugger_program::SbiRawRwLockWriteGuard,
-            },
-            require_store_data_send: true,
-        });
-    }
+    pub(crate) type RuntimeState =
+        helios_kernel::HostRuntimeState<crate::RiscvCpu, crate::host_fs::HostFileSystemService>;
 }
 
 use ns16550a::Uart;
 
 /// Debugger byte transport backed by the machine's boot UART. Kernel tracing
 /// stays in memory so the line remains reserved for RPC traffic after boot.
+#[derive(Clone, Copy)]
 pub(crate) struct DebugTransport {
     uart_base: usize,
 }
@@ -115,6 +58,16 @@ impl DebugTransport {
     }
 }
 
+impl ByteSerial for DebugTransport {
+    fn try_read_byte(&self) -> Option<u8> {
+        DebugTransport::try_read_byte(self)
+    }
+
+    fn write_bytes(&self, bytes: &[u8]) {
+        DebugTransport::write_bytes(self, bytes);
+    }
+}
+
 use helios_virtio::DeviceType;
 
 const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976;
@@ -145,6 +98,7 @@ use arrayvec::ArrayVec;
 use fdt::Fdt;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
+use helios_hal::serial::ByteSerial;
 use helios_kernel::Timer;
 use riscv::interrupt::Trap;
 use riscv::interrupt::supervisor::{Exception, Interrupt};
@@ -381,7 +335,6 @@ pub struct RiscvCpu {
     hart_count: usize,
     timebase_frequency: u64,
     fdt_addr: usize,
-    debug_state: debug_state::RuntimeState,
 }
 
 impl RiscvCpu {
@@ -391,7 +344,6 @@ impl RiscvCpu {
         hart_count: usize,
         timebase_frequency: u64,
         fdt_addr: usize,
-        debug_state: debug_state::RuntimeState,
     ) -> Self {
         Self {
             current_hart,
@@ -399,30 +351,19 @@ impl RiscvCpu {
             hart_count,
             timebase_frequency,
             fdt_addr,
-            debug_state,
         }
-    }
-
-    pub(crate) fn debug_state(&self) -> debug_state::RuntimeState {
-        self.debug_state.clone()
-    }
-
-    pub(crate) fn instance_registry(&self) -> helios_kernel::InstanceRegistry {
-        self.debug_state.instance_registry()
     }
 }
 
-impl Cpu for RiscvCpu {
-    fn wasmtime_target(&self) -> &'static str {
-        "riscv64gc-unknown-none-elf"
-    }
-
-    fn publish_executable_code(&self, _ptr: *const u8, _len: usize) {
+impl helios_kernel::CodegenPlatform for RiscvCpu {
+    fn publish_executable(&self, _ptr: *const u8, _len: usize) {
         unsafe {
             core::arch::asm!("fence.i", options(nostack, preserves_flags));
         }
     }
+}
 
+impl Cpu for RiscvCpu {
     fn current_processor(&self) -> ProcessorId {
         let runtime_ptr = read_hart_runtime();
         if runtime_ptr == 0 {
@@ -583,7 +524,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     let debug_transport = DebugTransport::discover(&fdt);
     let console = SbiConsole::new(
         debug_state.clone(),
-        helios_kernel::embedded_debugger().is_none(),
+        !helios_kernel::has_embedded_system_component(),
     );
     let cpu = RiscvCpu::new(
         current_hart,
@@ -591,7 +532,6 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         hart_count,
         timebase_frequency,
         fdt_addr,
-        debug_state.clone(),
     );
 
     let kernel = helios_kernel::init(helios_kernel::Platform::new(
@@ -617,7 +557,10 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
                     ));
                 }
             }
-            tracing::info!("virtio 9p online mount_tag={}", crate::host_fs::HOST_MOUNT_TAG);
+            tracing::info!(
+                "virtio 9p online mount_tag={}",
+                crate::host_fs::HOST_MOUNT_TAG
+            );
         }
         interrupts
     } else {
@@ -634,17 +577,35 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     unsafe {
         configure_interrupts();
     }
-    if debugger_program::should_run_on(current_hart.id(), hart_count, bootstrap_processor.id()) {
-        debugger_program::run_forever(cpu.clone());
+    let _program_service =
+        helios_kernel::install_component_host_program_service(&kernel, &cpu, &debug_state);
+    if current_hart == bootstrap_processor {
+        for hart in 0..hart_count {
+            let hart = ProcessorId::new(hart as u16);
+            if hart == bootstrap_processor {
+                continue;
+            }
+            if matches!(
+                helios_kernel::component_host_processor_role(
+                    hart,
+                    hart_count,
+                    bootstrap_processor,
+                ),
+                helios_kernel::ComponentHostProcessorRole::SystemComponent
+                    | helios_kernel::ComponentHostProcessorRole::ProgramWorker
+            ) {
+                cpu.start_processor(hart);
+            }
+        }
     }
-    if debugger_program::program_worker_should_run_on(
-        current_hart.id(),
-        hart_count,
-        bootstrap_processor.id(),
-    ) {
-        debugger_program::run_program_workers_forever(cpu.clone(), kernel);
-    }
-    kernel.run();
+    helios_kernel::run_component_host_processor_forever(
+        cpu,
+        kernel,
+        debug_state,
+        read_debug_serial,
+        write_debug_serial_bytes,
+        helios_kernel::ComponentRunMode::Concurrent,
+    );
 }
 
 fn shared_debug_state(timebase_frequency: u64, hart_count: usize) -> debug_state::RuntimeState {
@@ -656,13 +617,6 @@ fn shared_debug_state(timebase_frequency: u64, hart_count: usize) -> debug_state
                 riscv::register::time::read64(),
             )
         })
-        .clone()
-}
-
-pub(crate) fn global_debug_state() -> debug_state::RuntimeState {
-    DEBUG_STATE
-        .get()
-        .expect("global debug state was requested before bootstrap initialization")
         .clone()
 }
 
@@ -810,8 +764,8 @@ fn current_debug_transport() -> &'static DebugTransport {
         .expect("debug transport is missing from the current hart runtime")
 }
 
-pub(crate) fn try_read_debug_serial_byte() -> Option<u8> {
-    current_debug_transport().try_read_byte()
+fn read_debug_serial(max_bytes: u32) -> alloc::vec::Vec<u8> {
+    helios_kernel::read_serial(current_debug_transport(), max_bytes)
 }
 
 pub(crate) fn write_debug_serial_bytes(bytes: &[u8]) {
