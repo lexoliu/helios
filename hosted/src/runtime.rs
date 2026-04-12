@@ -1,23 +1,56 @@
+use std::io::{Read, Write};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant as StdInstant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use helios_hal::Platform;
-use helios_hal::cpu::{Instant, ProcessorId};
+use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
-use helios_kernel::InstanceRegistry;
 
 use crate::config::HostedConfig;
 use crate::console::HostedConsole;
 use crate::cpu::HostedCpu;
-use crate::init_program;
-use crate::observer_buffer::{ObserverBuffer, SharedObserverBuffer};
-use crate::program_host;
+use crate::host_fs::HostedFileSystem;
 
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
+
+type HostedRuntimeState = helios_kernel::HostRuntimeState<HostedCpu, HostedFileSystem>;
+
+/// Shared debug state across all hosted processor threads.
+static DEBUG_STATE: OnceLock<HostedRuntimeState> = OnceLock::new();
+
+/// Shared serial I/O mutex for debug transport over stdin/stdout.
+static SERIAL_INPUT: Mutex<Option<std::io::Stdin>> = Mutex::new(None);
+static SERIAL_OUTPUT: Mutex<Option<std::io::Stdout>> = Mutex::new(None);
+
+fn init_serial() {
+    let _ = SERIAL_INPUT.lock().unwrap().insert(std::io::stdin());
+    let _ = SERIAL_OUTPUT.lock().unwrap().insert(std::io::stdout());
+}
+
+fn read_debug_serial(max_bytes: u32) -> Vec<u8> {
+    let mut guard = SERIAL_INPUT.lock().unwrap();
+    let stdin = guard.as_mut().expect("serial not initialized");
+    let mut buf = vec![0u8; max_bytes as usize];
+    match stdin.read(&mut buf) {
+        Ok(n) => {
+            buf.truncate(n);
+            buf
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+fn write_debug_serial(bytes: &[u8]) {
+    let mut guard = SERIAL_OUTPUT.lock().unwrap();
+    if let Some(stdout) = guard.as_mut() {
+        let _ = stdout.write_all(bytes);
+        let _ = stdout.flush();
+    }
+}
 
 pub struct HostedRuntime {
     machine: Arc<HostedMachine>,
@@ -28,8 +61,6 @@ pub(crate) struct HostedMachine {
     processor_count: usize,
     bootstrap_processor: ProcessorId,
     started_at: StdInstant,
-    observer: SharedObserverBuffer,
-    instance_registry: InstanceRegistry,
     heap: HeapReservation,
     slots: Box<[ProcessorSlot]>,
     timer_tx: Sender<TimerCommand>,
@@ -97,16 +128,13 @@ impl HostedMachine {
         let machine = Arc::new(Self {
             processor_count: config.processor_count(),
             bootstrap_processor: config.bootstrap_processor(),
-            observer: ObserverBuffer::new(started_at),
             started_at,
-            instance_registry: InstanceRegistry::new(),
             heap: HeapReservation::new(config.heap_bytes()),
             slots: (0..config.processor_count())
                 .map(|_| ProcessorSlot::new())
                 .collect(),
             timer_tx,
         });
-
         spawn_timer_thread(machine.clone(), timer_rx);
         machine
     }
@@ -136,87 +164,59 @@ impl HostedMachine {
 
         let slot = self.slot(processor);
         if slot.started.swap(true, Ordering::AcqRel) {
-            panic!("processor {} was started more than once", processor.id());
+            return;
         }
 
-        self.unpark(processor);
+        slot.thread
+            .get()
+            .unwrap_or_else(|| {
+                panic!(
+                    "processor {} thread has not registered before start",
+                    processor.id()
+                )
+            })
+            .unpark();
     }
 
     pub(crate) fn wake_processor(&self, processor: ProcessorId) {
-        self.unpark(processor);
+        let slot = self.slot(processor);
+        if let Some(thread) = slot.thread.get() {
+            thread.unpark();
+        }
     }
 
     pub(crate) fn set_deadline(&self, processor: ProcessorId, deadline: Instant) {
-        let deadline = (deadline.ticks() != u64::MAX).then_some(deadline);
-        self.timer_tx
-            .send(TimerCommand {
-                processor,
-                deadline,
-            })
-            .unwrap_or_else(|err| panic!("failed to send timer command: {err}"));
+        let _ = self.timer_tx.send(TimerCommand {
+            processor,
+            deadline: Some(deadline),
+        });
     }
 
-    fn register_thread(&self, processor: ProcessorId, thread: Thread) {
+    pub(crate) fn register_thread(&self, processor: ProcessorId, thread: Thread) {
         self.slot(processor)
             .thread
             .set(thread)
-            .unwrap_or_else(|_| panic!("processor {} registered twice", processor.id()));
+            .unwrap_or_else(|_| panic!("processor {} thread was registered twice", processor.id()));
     }
 
-    fn bootstrap_memory_regions(&self, processor: ProcessorId) -> Option<MemoryRegion> {
-        (processor == self.bootstrap_processor).then(|| self.heap.region())
+    pub(crate) fn bootstrap_memory_regions(
+        &self,
+        processor: ProcessorId,
+    ) -> core::iter::Once<MemoryRegion> {
+        if processor == self.bootstrap_processor {
+            core::iter::once(self.heap.as_memory_region())
+        } else {
+            core::iter::once(NonNull::from(&[] as &[u8]))
+        }
     }
 
     fn now_ticks(&self) -> u64 {
         u64::try_from(self.started_at.elapsed().as_nanos())
-            .expect("hosted monotonic clock does not fit into u64 nanoseconds")
-    }
-
-    pub(crate) fn observer(&self) -> SharedObserverBuffer {
-        self.observer.clone()
-    }
-
-    pub(crate) fn instance_registry(&self) -> InstanceRegistry {
-        self.instance_registry.clone()
+            .unwrap_or_else(|err| panic!("hosted uptime exceeds u64 nanos: {err}"))
     }
 
     fn slot(&self, processor: ProcessorId) -> &ProcessorSlot {
-        self.slots
-            .get(processor.id() as usize)
-            .unwrap_or_else(|| panic!("processor {} is out of range", processor.id()))
-    }
-
-    fn unpark(&self, processor: ProcessorId) {
-        self.slot(processor)
-            .thread
-            .get()
-            .unwrap_or_else(|| panic!("processor {} thread is not registered", processor.id()))
-            .unpark();
-    }
-}
-
-impl ProcessorSlot {
-    fn new() -> Self {
-        Self {
-            thread: OnceLock::new(),
-            started: AtomicBool::new(false),
-        }
-    }
-}
-
-impl HeapReservation {
-    fn new(bytes: usize) -> Self {
-        Self {
-            backing: vec![0; bytes].into_boxed_slice(),
-        }
-    }
-
-    fn region(&self) -> MemoryRegion {
-        let pointer = self.backing.as_ptr() as *mut u8;
-        let length = self.backing.len();
-        let slice = std::ptr::slice_from_raw_parts_mut(pointer, length);
-
-        unsafe { NonNull::new_unchecked(slice) }
+        &self.slots[usize::from(processor.id())]
     }
 }
 
@@ -234,40 +234,61 @@ fn spawn_processor_thread(
                 .send(processor)
                 .unwrap_or_else(|err| panic!("failed to report processor readiness: {err}"));
 
-            // The thread exists before the kernel starts so bootstrap can bring
-            // processors online with the same start primitive it uses on hardware.
             thread::park();
 
-            let console = HostedConsole::new(machine.observer());
+            let console = HostedConsole::new();
             let cpu = HostedCpu::new(processor, machine.clone());
             let memory_regions = machine.bootstrap_memory_regions(processor);
-            let kernel = helios_kernel::init(Platform::new(console, memory_regions, cpu));
+            let kernel = helios_kernel::init(Platform::new(console, memory_regions, cpu.clone()));
+
+            let debug_state = shared_debug_state(&machine);
+
             if processor == machine.bootstrap_processor() {
-                let program_service = program_host::create_program_service(
-                    &config,
-                    HostedCpu::new(machine.bootstrap_processor(), machine.clone()),
-                    machine.instance_registry(),
-                );
-                init_program::spawn_init(
+                init_serial();
+
+                // Install host filesystem if configured.
+                if let Some(root) = config.init_wasi_root() {
+                    debug_state.install_host_fs_service(HostedFileSystem::new(root));
+                }
+
+                // Install component host program service (same as riscv/x86).
+                helios_kernel::install_component_host_program_service(
                     &kernel,
-                    &config,
-                    machine.observer(),
-                    machine.instance_registry(),
-                    Some(program_service.clone()),
-                    machine.started_at,
+                    &cpu,
+                    &debug_state,
                 );
-                init_program::spawn_debugger(
-                    &kernel,
-                    &config,
-                    machine.observer(),
-                    machine.instance_registry(),
-                    Some(program_service),
-                    machine.started_at,
-                );
+
+                // Start non-bootstrap processors for component host topology.
+                for p in helios_kernel::component_host_processors_to_start(
+                    machine.processor_count(),
+                    machine.bootstrap_processor(),
+                ) {
+                    cpu.start_processor(p);
+                }
             }
-            kernel.run();
+
+            helios_kernel::run_component_host_processor_forever(
+                cpu,
+                kernel,
+                debug_state,
+                read_debug_serial,
+                write_debug_serial,
+                helios_kernel::ComponentRunMode::Concurrent,
+            );
         })
         .unwrap_or_else(|err| panic!("failed to spawn processor {}: {err}", processor.id()))
+}
+
+fn shared_debug_state(machine: &HostedMachine) -> HostedRuntimeState {
+    DEBUG_STATE
+        .get_or_init(|| {
+            helios_kernel::RuntimeState::new(
+                machine.timer_frequency(),
+                machine.processor_count(),
+                machine.now_ticks(),
+            )
+        })
+        .clone()
 }
 
 fn wait_for_processor_registration(machine: &HostedMachine, ready_rx: &Receiver<ProcessorId>) {
@@ -278,72 +299,84 @@ fn wait_for_processor_registration(machine: &HostedMachine, ready_rx: &Receiver<
                 expected
             )
         });
-        let _ = processor;
+        tracing::info!(
+            "processor {} registered",
+            processor.id()
+        );
     }
 }
 
-fn spawn_timer_thread(machine: Arc<HostedMachine>, timer_rx: Receiver<TimerCommand>) {
+impl ProcessorSlot {
+    fn new() -> Self {
+        Self {
+            thread: OnceLock::new(),
+            started: AtomicBool::new(false),
+        }
+    }
+}
+
+impl HeapReservation {
+    fn new(bytes: usize) -> Self {
+        Self {
+            backing: vec![0u8; bytes].into_boxed_slice(),
+        }
+    }
+
+    fn as_memory_region(&self) -> MemoryRegion {
+        NonNull::from(self.backing.as_ref())
+    }
+}
+
+fn spawn_timer_thread(machine: Arc<HostedMachine>, rx: Receiver<TimerCommand>) {
     thread::Builder::new()
-        .name("helios-hosted-timer".to_owned())
-        .spawn(move || timer_loop(machine, timer_rx))
-        .unwrap_or_else(|err| panic!("failed to spawn hosted timer thread: {err}"));
-}
+        .name("helios-timer".to_owned())
+        .spawn(move || {
+            let mut deadlines = vec![None::<Instant>; machine.processor_count()];
 
-fn timer_loop(machine: Arc<HostedMachine>, timer_rx: Receiver<TimerCommand>) -> ! {
-    let mut deadlines = vec![None; machine.processor_count()];
+            loop {
+                let next_deadline = deadlines
+                    .iter()
+                    .filter_map(|&d| d)
+                    .min();
 
-    loop {
-        fire_due_deadlines(&machine, &mut deadlines);
-
-        match next_deadline(&deadlines) {
-            Some(deadline) => {
-                let now = machine.now_ticks();
-                if deadline <= now {
-                    continue;
-                }
-
-                let timeout = Duration::from_nanos(deadline - now);
-                match timer_rx.recv_timeout(timeout) {
-                    Ok(command) => apply_timer_command(&mut deadlines, command),
-                    Err(RecvTimeoutError::Timeout) => continue,
-                    Err(RecvTimeoutError::Disconnected) => {
-                        panic!("hosted timer command channel disconnected")
+                let command = if let Some(deadline) = next_deadline {
+                    let now = machine.now();
+                    if deadline <= now {
+                        fire_expired_deadlines(&machine, &mut deadlines);
+                        continue;
                     }
-                }
+                    let ticks_remaining = deadline.ticks().saturating_sub(now.ticks());
+                    let nanos = ticks_remaining;
+                    match rx.recv_timeout(Duration::from_nanos(nanos)) {
+                        Ok(cmd) => cmd,
+                        Err(RecvTimeoutError::Timeout) => {
+                            fire_expired_deadlines(&machine, &mut deadlines);
+                            continue;
+                        }
+                        Err(RecvTimeoutError::Disconnected) => return,
+                    }
+                } else {
+                    match rx.recv() {
+                        Ok(cmd) => cmd,
+                        Err(_) => return,
+                    }
+                };
+
+                let slot = usize::from(command.processor.id());
+                deadlines[slot] = command.deadline;
             }
-            None => {
-                let command = timer_rx
-                    .recv()
-                    .unwrap_or_else(|_| panic!("hosted timer command channel disconnected"));
-                apply_timer_command(&mut deadlines, command);
+        })
+        .unwrap_or_else(|err| panic!("failed to spawn timer thread: {err}"));
+}
+
+fn fire_expired_deadlines(machine: &HostedMachine, deadlines: &mut [Option<Instant>]) {
+    let now = machine.now();
+    for (slot, deadline) in deadlines.iter_mut().enumerate() {
+        if let Some(d) = *deadline {
+            if d <= now {
+                *deadline = None;
+                machine.wake_processor(ProcessorId::new(slot as u16));
             }
         }
     }
-}
-
-fn apply_timer_command(deadlines: &mut [Option<Instant>], command: TimerCommand) {
-    let slot = deadlines
-        .get_mut(command.processor.id() as usize)
-        .unwrap_or_else(|| {
-            panic!(
-                "timer update for invalid processor {}",
-                command.processor.id()
-            )
-        });
-    *slot = command.deadline;
-}
-
-fn fire_due_deadlines(machine: &HostedMachine, deadlines: &mut [Option<Instant>]) {
-    let now = machine.now_ticks();
-
-    for (index, deadline) in deadlines.iter_mut().enumerate() {
-        if deadline.is_some_and(|deadline| deadline.ticks() <= now) {
-            *deadline = None;
-            machine.wake_processor(ProcessorId::new(index as u16));
-        }
-    }
-}
-
-fn next_deadline(deadlines: &[Option<Instant>]) -> Option<u64> {
-    deadlines.iter().flatten().map(Instant::ticks).min()
 }

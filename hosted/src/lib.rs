@@ -1,16 +1,8 @@
 mod config;
 mod console;
 mod cpu;
-mod debugger_bindings;
-mod init_program;
-mod observer_buffer;
-mod observer_host;
-mod program_bindings;
-mod program_host;
-mod programs_host;
+mod host_fs;
 mod runtime;
-mod serial_host;
-mod sync_host;
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
