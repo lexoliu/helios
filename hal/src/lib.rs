@@ -5,12 +5,25 @@ use core::fmt::Write;
 use crate::memory::MemoryRegion;
 
 pub mod cpu;
+pub mod device;
 pub mod fs;
+pub mod interrupt;
 pub mod io;
 pub mod memory;
 pub mod net;
 pub mod resource;
 pub mod serial;
+
+/// Aligns `value` up to the next multiple of `align`.
+///
+/// Panics if the alignment would overflow.
+pub const fn align_up(value: usize, align: usize) -> usize {
+    let mask = align - 1;
+    match value.checked_add(mask) {
+        Some(next) => next & !mask,
+        None => panic!("alignment overflow"),
+    }
+}
 
 pub struct Platform<Console: Write + Send + 'static, Cpu: cpu::Cpu, Regions>
 where

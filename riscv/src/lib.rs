@@ -580,22 +580,8 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     let _program_service =
         helios_kernel::install_component_host_program_service(&kernel, &cpu, &debug_state);
     if current_hart == bootstrap_processor {
-        for hart in 0..hart_count {
-            let hart = ProcessorId::new(hart as u16);
-            if hart == bootstrap_processor {
-                continue;
-            }
-            if matches!(
-                helios_kernel::component_host_processor_role(
-                    hart,
-                    hart_count,
-                    bootstrap_processor,
-                ),
-                helios_kernel::ComponentHostProcessorRole::SystemComponent
-                    | helios_kernel::ComponentHostProcessorRole::ProgramWorker
-            ) {
-                cpu.start_processor(hart);
-            }
+        for processor in helios_kernel::component_host_processors_to_start(hart_count, bootstrap_processor) {
+            cpu.start_processor(processor);
         }
     }
     helios_kernel::run_component_host_processor_forever(
@@ -680,9 +666,7 @@ fn range_to_memory_region(range: Range<usize>) -> MemoryRegion {
     unsafe { MemoryRegion::new_unchecked(slice) }
 }
 
-const fn align_up(value: usize, align: usize) -> usize {
-    (value + (align - 1)) & !(align - 1)
-}
+use helios_hal::align_up;
 
 fn remember_bootstrap_hart(current_hart: usize) -> ProcessorId {
     match BOOT_HART_ID.compare_exchange(

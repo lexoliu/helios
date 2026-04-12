@@ -53,8 +53,8 @@ pub use service::{
     run_program_workers_forever,
 };
 pub use topology::{
-    ComponentHostProcessorRole, component_host_processor_role, component_host_system_processor,
-    component_host_worker_count, system_component_should_run_on,
+    ComponentHostProcessorRole, component_host_processor_role, component_host_processors_to_start,
+    component_host_system_processor, component_host_worker_count, system_component_should_run_on,
 };
 
 pub type SbiSerialPort = crate::ComponentSerialPort;

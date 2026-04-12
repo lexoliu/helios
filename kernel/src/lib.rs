@@ -63,7 +63,8 @@ pub use component_fs_path::{
 pub use component_host::{
     ComponentBindingSet, ComponentHostProcessorRole, ComponentRunMode, HostRuntimeState,
     ProgramServiceConfig, UserProgramService, component_host_processor_role,
-    component_host_system_processor, component_host_worker_count,
+    component_host_processors_to_start, component_host_system_processor,
+    component_host_worker_count,
     install_component_host_program_service, install_program_service,
     install_program_service_with_config, run_component_host_processor_forever,
     run_embedded_component_forever, run_embedded_component_in_mode_forever,
