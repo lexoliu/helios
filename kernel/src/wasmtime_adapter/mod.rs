@@ -15,9 +15,8 @@ use wasmtime::Engine;
 
 use crate::{
     CodegenPlatform, ComponentExecContext, ComponentExecutor, ComponentExitStatus,
-    ComponentOutputMode, ComponentRunResult, ComponentRuntimeEngine, ComponentRuntimeFactory,
-    ComponentRuntimeState, ComponentWorld, CompiledComponent, ExecOutput, HostFileSystem,
-    InstanceId,
+    ComponentRunResult, ComponentRuntimeEngine, ComponentRuntimeFactory,
+    ComponentWorld, CompiledComponent, HostFileSystem,
 };
 use crate::component_host::{
     ComponentBindingSet, HostRuntimeState, StoreData, component_linker, store_with_state,
@@ -26,7 +25,6 @@ use crate::component_host::{
 /// Wasmtime-backed compiled component artifact.
 pub struct WasmtimeCompiledComponent {
     pub(crate) component: Component,
-    pub(crate) engine: Engine,
 }
 
 impl CompiledComponent for WasmtimeCompiledComponent {}
@@ -43,10 +41,7 @@ impl ComponentRuntimeEngine for WasmtimeEngine {
 
     fn compile(&self, bytes: &[u8]) -> Result<Self::Compiled, Self::Error> {
         let component = Component::from_binary(&self.engine, bytes)?;
-        Ok(WasmtimeCompiledComponent {
-            component,
-            engine: self.engine.clone(),
-        })
+        Ok(WasmtimeCompiledComponent { component })
     }
 }
 

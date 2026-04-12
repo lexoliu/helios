@@ -25,8 +25,7 @@ use crate::{
     ProgramExecErrorKind, RawMutex, RawMutexGuardResource, RawMutexResource, RawRwLock,
     RawRwLockReadGuardResource, RawRwLockResource, RawRwLockWriteGuardResource,
     SerialPortResource, build_component_engine_for_platform, elapsed_millis,
-    emit_serial_error_marker, emit_serial_stage_marker, heap_stats, monotonic_nanos,
-    resolve_wasi_cli_run,
+    emit_serial_stage_marker, heap_stats, monotonic_nanos,
 };
 use spin::Mutex;
 use thiserror::Error;
@@ -284,86 +283,6 @@ where
         Ok(())
     });
     store
-}
-
-fn run_component_call<CpuImpl, HostFs>(
-    store: &mut Store<StoreData<CpuImpl, HostFs>>,
-    run: wasmtime::component::TypedFunc<(), (core::result::Result<(), ()>,)>,
-    kernel: &crate::Kernel<CpuImpl>,
-) -> wasmtime::Result<(core::result::Result<(), ()>,)>
-where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
-    HostFs: crate::HostFileSystem,
-{
-    let parker = Arc::new(ComponentCallParker::new());
-    let waker = core::task::Waker::from(parker.clone());
-    let mut context = Context::from_waker(&waker);
-    let mut call = core::pin::pin!(store.run_concurrent(async move |accessor| {
-        run.call_concurrent(accessor, ()).await
-    }));
-
-    loop {
-        parker.clear();
-        match call.as_mut().poll(&mut context) {
-            Poll::Ready(result) => return result?,
-            Poll::Pending => {
-                if kernel.run_until_stalled() == 0 {
-                    parker.wait();
-                }
-            }
-        }
-    }
-}
-
-fn run_component_call_concurrent<CpuImpl, HostFs>(
-    store: &mut Store<StoreData<CpuImpl, HostFs>>,
-    run: wasmtime::component::TypedFunc<(), (core::result::Result<(), ()>,)>,
-) -> wasmtime::Result<(core::result::Result<(), ()>,)>
-where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
-    HostFs: crate::HostFileSystem,
-{
-    crate::block_on(store.run_concurrent(async move |accessor| {
-        run.call_concurrent(accessor, ()).await
-    }))?
-}
-
-struct ComponentCallParker {
-    notified: core::sync::atomic::AtomicBool,
-}
-
-impl ComponentCallParker {
-    const fn new() -> Self {
-        Self {
-            notified: core::sync::atomic::AtomicBool::new(false),
-        }
-    }
-
-    fn clear(&self) {
-        self.notified
-            .store(false, core::sync::atomic::Ordering::Release);
-    }
-
-    fn wait(&self) {
-        while !self
-            .notified
-            .load(core::sync::atomic::Ordering::Acquire)
-        {
-            core::hint::spin_loop();
-        }
-    }
-}
-
-impl alloc::task::Wake for ComponentCallParker {
-    fn wake(self: Arc<Self>) {
-        self.notified
-            .store(true, core::sync::atomic::Ordering::Release);
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.notified
-            .store(true, core::sync::atomic::Ordering::Release);
-    }
 }
 
 fn add_system_to_linker<CpuImpl, HostFs>(
@@ -1977,14 +1896,6 @@ fn emit_stage_marker(write_serial: fn(&[u8]), stage: &str) {
     emit_serial_stage_marker(&MarkerSerial(write_serial), stage);
 }
 
-fn emit_error_marker(write_serial: fn(&[u8]), label: &str, message: &str) {
-    emit_serial_error_marker(&MarkerSerial(write_serial), label, message);
-}
-
-fn log_wasmtime_error_chain(prefix: &str, error: &wasmtime::Error) {
-    tracing::error!("{prefix}: {error:?}");
-}
-
 struct MarkerSerial(fn(&[u8]));
 
 impl ByteSerial for MarkerSerial {
@@ -2003,8 +1914,6 @@ enum DebuggerError {
     CreateEngine(wasmtime::Error),
     #[error("failed to JIT-compile embedded debugger component: {0}")]
     CompileComponent(wasmtime::Error),
-    #[error("failed to add debugger host bindings: {0}")]
-    LinkComponent(wasmtime::Error),
     #[error("failed to instantiate debugger component: {0}")]
     InstantiateComponent(wasmtime::Error),
     #[error("debugger component trapped: {0}")]

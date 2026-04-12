@@ -338,10 +338,7 @@ where
                 let wasm = wasm.clone();
                 move || {
                     let component = Component::from_binary(&engine, &wasm)?;
-                    Ok(crate::wasmtime_adapter::WasmtimeCompiledComponent {
-                        component,
-                        engine: engine.clone(),
-                    })
+                    Ok(crate::wasmtime_adapter::WasmtimeCompiledComponent { component })
                 }
             },
         ));
