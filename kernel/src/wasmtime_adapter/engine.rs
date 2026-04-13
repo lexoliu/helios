@@ -57,12 +57,6 @@ pub fn build_component_engine_for_platform<P: CodegenPlatform + Clone>(
     build_engine_for_platform(platform, true)
 }
 
-pub fn build_program_engine_for_platform<P: CodegenPlatform + Clone>(
-    platform: &P,
-) -> wasmtime::Result<Engine> {
-    build_engine_for_platform(platform, false)
-}
-
 pub fn resolve_wasi_cli_run<T: 'static>(
     component: &Component,
     instance: &Instance,

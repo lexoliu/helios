@@ -22,7 +22,3 @@ pub fn build_component_engine_config(target: &str) -> Config {
     config
 }
 
-pub fn build_component_engine(target: &str) -> wasmtime::Result<wasmtime::Engine> {
-    let config = build_component_engine_config(target);
-    wasmtime::Engine::new(&config)
-}

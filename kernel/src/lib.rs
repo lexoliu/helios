@@ -46,10 +46,7 @@ pub use bootfs::{
     BootDirectory, BootDirectoryEntry, BootDirectoryHandleExt, BootFile, EmbeddedBootFile,
     EmbeddedBootFs,
 };
-pub use component_cache::ComponentCache;
-pub use wasmtime_adapter::engine::{
-    build_component_engine_for_platform, build_program_engine_for_platform, resolve_wasi_cli_run,
-};
+pub(crate) use component_cache::ComponentCache;
 pub use component_fs::{
     ComponentFsNodeKind, ComponentFsResourceError, ComponentResourceTableError,
     map_resource_table_error,
@@ -131,12 +128,8 @@ pub use unsupported_host_fs::UnsupportedHostFileSystem;
 pub use wasi_rights::WasiRights;
 pub use time::{elapsed_millis, monotonic_nanos};
 pub use timer::{Sleep, Timer};
-pub use wasmtime_adapter::{
-    WasmtimeCompiledComponent, WasmtimeComponentRuntime, WasmtimeEngine, WasmtimeExecutor,
-};
-pub use wasmtime_adapter::config::{
-    build_component_engine, build_component_engine_config, build_target_engine_config,
-};
+// Wasmtime-specific helpers are crate-internal only.
+// External consumers use the ComponentRuntimeFactory trait.
 
 use core::sync::atomic::{AtomicU8, Ordering};
 use core::time::Duration;

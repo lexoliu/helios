@@ -15,7 +15,7 @@ use wasmtime::{CallHook, Config, Engine, Linker, Module, ResourceLimiter, Store}
 use crate::{
     BootDirectory, ComputePool, ComputePriority, ComputeSpawnError, EmbeddedProgram,
     InstanceExecutionTransition, RegisteredInstance, allow_instance_resource_growth,
-    build_target_engine_config, record_instance_transition,
+    record_instance_transition,
 };
 
 /// Immutable compilation settings for the user-mode runtime.
@@ -513,7 +513,7 @@ fn run_entry<T>(
 }
 
 fn build_engine_config() -> Config {
-    build_target_engine_config(env!("HELIOS_BUILD_TARGET"))
+    crate::wasmtime_adapter::config::build_target_engine_config(env!("HELIOS_BUILD_TARGET"))
 }
 
 fn compile_wasm_task(
