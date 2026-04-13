@@ -1,6 +1,5 @@
 extern crate alloc;
 
-use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -9,7 +8,7 @@ use spin::Mutex;
 
 use crate::{
     ExecOutput, InstanceExecutionTransition, InstanceRegistry, RegisteredInstance,
-    allow_instance_resource_growth, record_instance_transition, yield_now,
+    record_instance_transition,
 };
 use helios_hal::cpu::Cpu;
 use wasmtime::component::ResourceTable;

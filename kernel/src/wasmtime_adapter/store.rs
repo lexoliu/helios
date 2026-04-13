@@ -16,7 +16,7 @@ use wasmtime_wasi_io::poll::Pollable;
 use wasmtime_wasi_io::streams::{OutputStream, StreamError};
 
 use crate::{
-    ComponentOutputStream, ComponentOutputStreamKind, ComponentRuntimeState, ComponentStoreData,
+    ComponentOutputStream, ComponentRuntimeState, ComponentStoreData,
     allow_instance_resource_growth,
 };
 
