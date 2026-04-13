@@ -1,11 +1,12 @@
 use anyhow::{Context as _, Result};
 use async_io::Async;
+use async_net::unix::UnixStream as AsyncUnixStream;
+use futures_util::io::AsyncReadExt as _;
 use futures_io::{AsyncRead, AsyncWrite};
-use std::fs::File;
 use std::io;
+use std::time::{Duration, Instant};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::FileTypeExt;
-use std::os::unix::net::UnixStream;
 
 pub(crate) trait SerialRead: AsyncRead + Unpin + Send {}
 pub(crate) trait SerialWrite: AsyncWrite + Unpin + Send {}
@@ -18,6 +19,9 @@ pub(crate) type SerialWriter = Box<dyn SerialWrite>;
 pub(crate) type RpcClient =
     helios_inspector_protocol::transport::Client<SerialReader, SerialWriter>;
 
+const SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const SOCKET_CONNECT_POLL: Duration = Duration::from_millis(50);
+
 pub(crate) struct SerialIo {
     read: SerialReader,
     write: SerialWriter,
@@ -25,7 +29,7 @@ pub(crate) struct SerialIo {
 
 pub(crate) async fn open(device: &str, baud: u32) -> Result<SerialIo> {
     let (read, write) = if is_unix_socket(device)? {
-        open_socket_transport(device)?
+        open_socket_transport(device).await?
     } else {
         open_tty_transport(device, baud)?
     };
@@ -87,167 +91,46 @@ impl io::Write for AsyncSerialPort {
     }
 }
 
-struct AsyncUnixSocket {
-    stream: UnixStream,
-}
-
-impl AsyncUnixSocket {
-    fn connect(device: &str) -> Result<Self> {
-        let stream = UnixStream::connect(device)
-            .with_context(|| format!("failed to connect to serial socket {device}"))?;
-        stream.set_nonblocking(true).with_context(|| {
-            format!("failed to configure serial socket {device} as nonblocking")
-        })?;
-        Ok(Self { stream })
-    }
-
-    fn try_clone(&self) -> Result<Self> {
-        Ok(Self {
-            stream: self
-                .stream
-                .try_clone()
-                .context("failed to duplicate unix serial socket")?,
-        })
-    }
-}
-
-unsafe impl async_io::IoSafe for AsyncUnixSocket {}
-
-impl AsFd for AsyncUnixSocket {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.stream.as_fd()
-    }
-}
-
-impl io::Read for AsyncUnixSocket {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.stream.read(buf)
-    }
-}
-
-impl io::Write for AsyncUnixSocket {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.stream.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.stream.flush()
-    }
-}
-
-struct AsyncRawTty {
-    file: File,
-}
-
-impl AsyncRawTty {
-    fn open(device: &str, baud: u32) -> Result<Self> {
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .open(device)
-            .with_context(|| format!("failed to open tty device {device}"))?;
-        configure_raw_tty(&file, baud)
-            .with_context(|| format!("failed to configure tty device {device}"))?;
-        Ok(Self { file })
-    }
-
-    fn try_clone(&self) -> Result<Self> {
-        Ok(Self {
-            file: self
-                .file
-                .try_clone()
-                .context("failed to duplicate raw tty file descriptor")?,
-        })
-    }
-}
-
-unsafe impl async_io::IoSafe for AsyncRawTty {}
-
-impl AsFd for AsyncRawTty {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.file.as_fd()
-    }
-}
-
-impl io::Read for AsyncRawTty {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.file.read(buf)
-    }
-}
-
-impl io::Write for AsyncRawTty {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.file.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
-    }
-}
-
 fn open_tty_transport(device: &str, baud: u32) -> Result<(SerialReader, SerialWriter)> {
-    match serialport::new(device, baud).open_native() {
-        Ok(port) => {
-            let read_port = port
-                .try_clone_native()
-                .with_context(|| format!("failed to clone serial device {device}"))?;
-            Ok((
-                Box::new(
-                    Async::new(AsyncSerialPort::new(read_port))
-                        .with_context(|| format!("failed to register serial device {device}"))?,
-                ) as SerialReader,
-                Box::new(
-                    Async::new(AsyncSerialPort::new(port))
-                        .with_context(|| format!("failed to register serial device {device}"))?,
-                ) as SerialWriter,
-            ))
-        }
-        Err(error) => {
-            let raw_tty = AsyncRawTty::open(device, baud).with_context(|| {
-                format!(
-                    "failed to open serial device {device} via serialport ({error}) and raw tty"
-                )
-            })?;
-            let read_tty = raw_tty
-                .try_clone()
-                .with_context(|| format!("failed to clone tty device {device}"))?;
-            Ok((
-                Box::new(Async::new(read_tty).with_context(|| {
-                    format!("failed to register tty device {device} for reading")
-                })?) as SerialReader,
-                Box::new(Async::new(raw_tty).with_context(|| {
-                    format!("failed to register tty device {device} for writing")
-                })?) as SerialWriter,
-            ))
-        }
-    }
-}
-
-fn open_socket_transport(device: &str) -> Result<(SerialReader, SerialWriter)> {
-    let socket = AsyncUnixSocket::connect(device)?;
-    let read_socket = socket
-        .try_clone()
-        .with_context(|| format!("failed to clone serial socket {device}"))?;
+    let port = serialport::new(device, baud)
+        .open_native()
+        .with_context(|| format!("failed to open serial device {device} with serialport"))?;
+    let read_port = port
+        .try_clone_native()
+        .with_context(|| format!("failed to clone serial device {device}"))?;
     Ok((
         Box::new(
-            Async::new(read_socket).with_context(|| {
-                format!("failed to register serial socket {device} for reading")
-            })?,
+            Async::new(AsyncSerialPort::new(read_port))
+                .with_context(|| format!("failed to register serial device {device}"))?,
         ) as SerialReader,
         Box::new(
-            Async::new(socket).with_context(|| {
-                format!("failed to register serial socket {device} for writing")
-            })?,
+            Async::new(AsyncSerialPort::new(port))
+                .with_context(|| format!("failed to register serial device {device}"))?,
         ) as SerialWriter,
     ))
 }
 
-fn configure_raw_tty(file: &File, baud: u32) -> io::Result<()> {
-    use rustix::termios::{tcgetattr, tcsetattr, OptionalActions};
-
-    let mut termios = tcgetattr(file)?;
-    termios.make_raw();
-    termios.set_input_speed(baud)?;
-    termios.set_output_speed(baud)?;
-    Ok(tcsetattr(file, OptionalActions::Now, &termios)?)
+async fn open_socket_transport(device: &str) -> Result<(SerialReader, SerialWriter)> {
+    let deadline = Instant::now() + SOCKET_CONNECT_TIMEOUT;
+    let socket = loop {
+        match AsyncUnixStream::connect(device).await {
+            Ok(socket) => break socket,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionRefused
+                        | io::ErrorKind::NotFound
+                        | io::ErrorKind::AddrNotAvailable
+                ) && Instant::now() < deadline =>
+            {
+                async_io::Timer::after(SOCKET_CONNECT_POLL).await;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to connect to serial socket {device}"));
+            }
+        }
+    };
+    let (read, write) = socket.split();
+    Ok((Box::new(read) as SerialReader, Box::new(write) as SerialWriter))
 }

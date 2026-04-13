@@ -1,2 +1,7 @@
 /target
 /shell-protocol/wrpc-wit
+.DS_Store
+/artifacts/wasi-tools/
+/tools/wasi-apps/python/target
+/tools/wasi-apps/curl/target
+*.wasm

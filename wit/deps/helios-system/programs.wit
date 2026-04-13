@@ -39,5 +39,5 @@ interface programs {
   }
 
   /// Executes a pure wasm program with the platform's default minimal rights and waits for completion.
-  exec: func(request: exec-request) -> result<exec-result, exec-error>;
+  exec: async func(request: exec-request) -> result<exec-result, exec-error>;
 }

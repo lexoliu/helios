@@ -8,11 +8,11 @@ interface serial {
   }
 
   resource serial-port {
-    rights: func() -> serial-rights;
+    rights: async func() -> serial-rights;
     read: async func(max-bytes: u32) -> list<u8>;
     write: async func(bytes: list<u8>);
     flush: async func();
   }
 
-  debug-port: func() -> option<serial-port>;
+  debug-port: async func() -> option<serial-port>;
 }

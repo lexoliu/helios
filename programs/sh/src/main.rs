@@ -34,13 +34,13 @@ impl Invocation {
     fn from_env() -> Result<Self> {
         let mut args = env::args().skip(1);
         match args.next().as_deref() {
-            None => bail!(
-                "interactive dash is not implemented yet; use `dash -c <command>` or `dash <script>`"
-            ),
+            None => {
+                bail!("interactive dash is unsupported; use `dash -c <command>` or `dash <script>`")
+            }
             Some("-c") => {
                 let command = args.next().context("`dash -c` requires a command string")?;
                 if args.next().is_some() {
-                    bail!("`dash -c` does not accept extra positional arguments yet")
+                    bail!("`dash -c` does not accept extra positional arguments")
                 }
                 Ok(Self {
                     inline_command: Some(command),
@@ -49,7 +49,7 @@ impl Invocation {
             }
             Some(path) => {
                 if args.next().is_some() {
-                    bail!("`dash <script>` does not accept extra positional arguments yet")
+                    bail!("`dash <script>` does not accept extra positional arguments")
                 }
                 Ok(Self {
                     inline_command: None,
@@ -62,9 +62,9 @@ impl Invocation {
     async fn load_program(&self) -> Result<Vec<Statement>> {
         let source = match (&self.inline_command, &self.script_path) {
             (Some(command), None) => command.clone(),
-            (None, Some(path)) => helios_fs::read_to_string(path)
-                .await
-                .with_context(|| format!("failed to read shell script {}", path.display()))?,
+            (None, Some(path)) => helios_fs::read_to_string(path).await.map_err(|error| {
+                anyhow::anyhow!("failed to read shell script {}: {error:#}", path.display())
+            })?,
             _ => unreachable!("invocation construction must choose exactly one shell source"),
         };
         match script::parse(&source)? {
@@ -100,7 +100,7 @@ impl ScriptHost for GuestShell {
                 let path = single_argument(command, &tokens[1..])?;
                 let bytes = helios_fs::read(path)
                     .await
-                    .with_context(|| format!("failed to read file {path}"))?;
+                    .map_err(|error| anyhow::anyhow!("failed to read file {path}: {error:#}"))?;
                 io::stdout().write_all(&bytes)?;
                 Ok(CommandStatus::SUCCESS)
             }
@@ -150,11 +150,13 @@ async fn run_test(args: &[String]) -> Result<CommandStatus> {
 async fn exec_program(program: &str, args: &[String]) -> Result<CommandStatus> {
     let resolved = resolve_program(program).await?;
     let name = infer_program_name(Path::new(&resolved.path))?;
-    match programs::exec(&ExecRequest {
+    match programs::exec(ExecRequest {
         name,
         args: args.to_vec(),
         wasm: resolved.wasm,
-    }) {
+    })
+    .await
+    {
         Ok(result) => {
             io::stdout().write_all(&result.output.stdout)?;
             io::stderr().write_all(&result.output.stderr)?;

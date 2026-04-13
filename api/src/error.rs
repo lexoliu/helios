@@ -51,3 +51,10 @@ pub fn invalid_utf8(path: &str, error: std::string::FromUtf8Error) -> io::Error 
         format!("file {path:?} is not valid utf-8: {error}"),
     )
 }
+
+pub fn file_too_large(path: &str, size: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("file {path:?} size {size} does not fit into usize"),
+    )
+}

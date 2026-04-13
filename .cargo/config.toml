@@ -5,3 +5,8 @@ rustflags = [
   "-C", "link-arg=-Tmemory.x",
   "-C", "link-arg=-Tlink.x",
 ]
+
+[target.x86_64-unknown-none]
+rustflags = [
+  "-C", "target-feature=+sse,+sse2,-soft-float",
+]

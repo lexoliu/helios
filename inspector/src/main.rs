@@ -39,13 +39,13 @@ struct SerialOptions {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Execute a shell script inside the remote guest dash program.
-    Dash(DashCommand),
+    /// Execute a shell script inside the remote guest shell program (`/bin/dash`).
+    Shell(ShellCommand),
     /// Stream tracing events until interrupted.
     Tracing(TracingCommand),
     /// Open the live system monitor.
     Stats,
-    /// Start an interactive shell that forwards most input to remote dash.
+    /// Start an interactive shell that forwards most input to the remote shell.
     Repl,
     /// Launch a local QEMU VM, wait for the debugger, and connect the inspector.
     Vm(vm::VmCommand),
@@ -53,23 +53,23 @@ enum Command {
 
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum SessionCommand {
-    /// Execute a shell script inside the remote guest dash program.
-    Dash(DashCommand),
+    /// Execute a shell script inside the remote guest shell program (`/bin/dash`).
+    Shell(ShellCommand),
     /// Stream tracing events until interrupted.
     Tracing(TracingCommand),
     /// Open the live system monitor.
     Stats,
-    /// Start an interactive shell that forwards most input to remote dash.
+    /// Start an interactive shell that forwards most input to the remote shell.
     Repl,
 }
 
 #[derive(Debug, Clone, ClapArgs)]
-pub(crate) struct DashCommand {
-    /// Inline script passed to `dash -c`.
+pub(crate) struct ShellCommand {
+    /// Inline script passed to `/bin/dash -c`.
     #[arg(short = 'c', long = "command", conflicts_with = "script")]
     command: Option<String>,
 
-    /// Path to a local script file whose contents are executed remotely.
+    /// Path to a local script file whose contents are executed remotely by `/bin/dash`.
     #[arg(conflicts_with = "command")]
     script: Option<String>,
 }
@@ -125,22 +125,24 @@ pub(crate) fn run_connected(
     command: Option<SessionCommand>,
 ) -> Result<()> {
     match command.unwrap_or(SessionCommand::Repl) {
-        SessionCommand::Dash(command) => run_interruptible(async move {
+        SessionCommand::Shell(command) => run_interruptible(async move {
             let mut client = client;
-            let output = repl::run_dash_command(&mut client, &command).await?;
+            let output = repl::run_shell_command(&mut client, &command).await?;
             std::io::stdout().write_all(&output.output.stdout)?;
             std::io::stderr().write_all(&output.output.stderr)?;
             if output.exit_code != 0 {
-                bail!("remote dash exited with code {}", output.exit_code);
+                bail!("remote shell exited with code {}", output.exit_code);
             }
             Ok(())
         }),
-        SessionCommand::Tracing(command) => run_interruptible(system::run_tracing(
-            client,
-            command.limit,
-            command.min_level.as_deref(),
-            command.target_prefix,
-        )),
+        SessionCommand::Tracing(command) => {
+            runtime::block_on(system::run_tracing(
+                client,
+                command.limit,
+                command.min_level.as_deref(),
+                command.target_prefix,
+            ))
+        }
         SessionCommand::Stats => run_interruptible(async move {
             let mut client = client;
             stats_tui::run(&mut client).await
@@ -151,7 +153,7 @@ pub(crate) fn run_connected(
 
 fn into_session_command(command: Option<Command>) -> Option<SessionCommand> {
     match command {
-        Some(Command::Dash(command)) => Some(SessionCommand::Dash(command)),
+        Some(Command::Shell(command)) => Some(SessionCommand::Shell(command)),
         Some(Command::Tracing(command)) => Some(SessionCommand::Tracing(command)),
         Some(Command::Stats) => Some(SessionCommand::Stats),
         Some(Command::Repl) => Some(SessionCommand::Repl),
@@ -159,6 +161,64 @@ fn into_session_command(command: Option<Command>) -> Option<SessionCommand> {
             unreachable!("vm command must be handled before connecting transport")
         }
         None => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Args, Command};
+    use clap::Parser;
+
+    #[test]
+    fn parses_shell_subcommand() {
+        let args = Args::try_parse_from(["helios-inspector", "shell", "-c", "echo hi"])
+            .expect("shell subcommand must parse");
+        match args.command.expect("subcommand must be present") {
+            Command::Shell(_) => {}
+            _ => panic!("expected shell subcommand"),
+        }
+    }
+
+    #[test]
+    fn rejects_legacy_dash_subcommand() {
+        let result = Args::try_parse_from(["helios-inspector", "dash", "-c", "echo hi"]);
+        assert!(result.is_err(), "legacy dash subcommand must stay removed");
+    }
+
+    #[test]
+    fn parses_vm_shell_subcommand() {
+        let args = Args::try_parse_from([
+            "helios-inspector",
+            "vm",
+            "--arch",
+            "riscv64",
+            "--no-build",
+            "shell",
+            "-c",
+            "echo hi",
+        ])
+        .expect("vm shell subcommand must parse");
+        match args.command.expect("subcommand must be present") {
+            Command::Vm(_) => {}
+            _ => panic!("expected vm command"),
+        }
+    }
+
+    #[test]
+    fn parses_vm_release_flag() {
+        let args = Args::try_parse_from([
+            "helios-inspector",
+            "vm",
+            "--arch",
+            "x86-64",
+            "--release",
+            "repl",
+        ])
+        .expect("vm release flag must parse");
+        match args.command.expect("subcommand must be present") {
+            Command::Vm(_) => {}
+            _ => panic!("expected vm command"),
+        }
     }
 }
 

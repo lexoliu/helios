@@ -6,6 +6,6 @@ pub use crate::bindings::helios::system::programs::{
 };
 
 /// Launches a pure wasm program with the kernel's default minimal rights.
-pub fn exec(request: &ExecRequest) -> Result<ExecResult, ExecError> {
-    raw::exec(request)
+pub async fn exec(request: ExecRequest) -> Result<ExecResult, ExecError> {
+    raw::exec(request).await
 }

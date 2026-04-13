@@ -1,0 +1,2 @@
+qemu-system-x86_64: -serial unix:artifacts/vm-debug/x86.sock,server=on,wait=on: info: QEMU waiting for connection on: disconnected:unix:artifacts/vm-debug/x86.sock,server=on
+qemu-system-x86_64: terminating on signal 15 from pid 3870 (<unknown process>)

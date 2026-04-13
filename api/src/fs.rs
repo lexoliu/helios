@@ -17,31 +17,137 @@ use crate::error::Result;
 use futures_lite::future::zip;
 
 const ROOT_PATH: &str = "/";
+const FILE_READ_RESERVE_CHUNK: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WasiFileSystem;
+
+pub trait FileSystem {
+    fn read(&self, path: &Path) -> impl core::future::Future<Output = Result<Vec<u8>>> + Send;
+    fn read_to_string(
+        &self,
+        path: &Path,
+    ) -> impl core::future::Future<Output = Result<String>> + Send;
+    fn write(
+        &self,
+        path: &Path,
+        contents: &[u8],
+    ) -> impl core::future::Future<Output = Result<()>> + Send;
+    fn exists(&self, path: &Path) -> impl core::future::Future<Output = bool> + Send;
+    fn is_file(&self, path: &Path) -> impl core::future::Future<Output = bool> + Send;
+    fn is_dir(&self, path: &Path) -> impl core::future::Future<Output = bool> + Send;
+}
+
+pub const fn wasi_filesystem() -> WasiFileSystem {
+    WasiFileSystem
+}
 
 pub async fn read(path: impl AsRef<Path>) -> Result<Vec<u8>> {
+    read_impl(path.as_ref()).await
+}
+
+pub async fn read_to_string(path: impl AsRef<Path>) -> Result<String> {
+    let path = path.as_ref();
+    let display = display_path(path);
+    let bytes = read_impl(path).await?;
+    String::from_utf8(bytes).map_err(|source| error::invalid_utf8(&display, source))
+}
+
+pub async fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> Result<()> {
+    write_impl(path.as_ref(), contents.as_ref()).await
+}
+
+pub async fn exists(path: impl AsRef<Path>) -> bool {
+    metadata_type(path).await.is_ok()
+}
+
+pub async fn is_file(path: impl AsRef<Path>) -> bool {
+    matches!(metadata_type(path).await, Ok(DescriptorType::RegularFile))
+}
+
+pub async fn is_dir(path: impl AsRef<Path>) -> bool {
+    matches!(metadata_type(path).await, Ok(DescriptorType::Directory))
+}
+
+impl FileSystem for WasiFileSystem {
+    fn read(&self, path: &Path) -> impl core::future::Future<Output = Result<Vec<u8>>> + Send {
+        read_impl(path)
+    }
+
+    fn read_to_string(
+        &self,
+        path: &Path,
+    ) -> impl core::future::Future<Output = Result<String>> + Send {
+        let path = path.to_owned();
+        async move {
+            let display = display_path(&path);
+            let bytes = read_impl(&path).await?;
+            String::from_utf8(bytes).map_err(|source| error::invalid_utf8(&display, source))
+        }
+    }
+
+    fn write(
+        &self,
+        path: &Path,
+        contents: &[u8],
+    ) -> impl core::future::Future<Output = Result<()>> + Send {
+        let path = path.to_owned();
+        let contents = contents.to_vec();
+        async move { write_impl(&path, &contents).await }
+    }
+
+    fn exists(&self, path: &Path) -> impl core::future::Future<Output = bool> + Send {
+        let path = path.to_owned();
+        async move { metadata_type(path).await.is_ok() }
+    }
+
+    fn is_file(&self, path: &Path) -> impl core::future::Future<Output = bool> + Send {
+        let path = path.to_owned();
+        async move { matches!(metadata_type(path).await, Ok(DescriptorType::RegularFile)) }
+    }
+
+    fn is_dir(&self, path: &Path) -> impl core::future::Future<Output = bool> + Send {
+        let path = path.to_owned();
+        async move { matches!(metadata_type(path).await, Ok(DescriptorType::Directory)) }
+    }
+}
+
+async fn read_impl(path: &Path) -> Result<Vec<u8>> {
     let path = path.as_ref();
     let display = display_path(path);
     let descriptor = open_file(path).await?;
+    let expected_size = descriptor
+        .stat()
+        .await
+        .map_err(|code| error::filesystem(&display, code))?
+        .size;
+    let initial_capacity = usize::try_from(expected_size)
+        .map_err(|_| error::file_too_large(&display, expected_size))?;
     let (stream, result) = descriptor.read_via_stream(0);
-    let bytes = stream.collect().await;
+    let mut stream = stream;
+    let mut bytes = Vec::with_capacity(initial_capacity.saturating_add(1));
+    loop {
+        if bytes.len() == bytes.capacity() {
+            bytes.reserve(FILE_READ_RESERVE_CHUNK);
+        }
+        let (status, next) = stream.read(bytes).await;
+        bytes = next;
+        match status {
+            crate::wit_bindgen::StreamResult::Complete(_) => {}
+            crate::wit_bindgen::StreamResult::Dropped => break,
+            crate::wit_bindgen::StreamResult::Cancelled => unreachable!(),
+        }
+    }
     result
         .await
         .map_err(|code| error::filesystem(&display, code))?;
     Ok(bytes)
 }
 
-pub async fn read_to_string(path: impl AsRef<Path>) -> Result<String> {
-    let path = path.as_ref();
-    let display = display_path(path);
-    let bytes = read(path).await?;
-    String::from_utf8(bytes).map_err(|source| error::invalid_utf8(&display, source))
-}
-
-pub async fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> Result<()> {
-    let path = path.as_ref();
+async fn write_impl(path: &Path, contents: &[u8]) -> Result<()> {
     let descriptor = open_file_for_write(path).await?;
     let (mut tx, rx) = crate::bindings::wit_stream::new();
-    let bytes = contents.as_ref().to_vec();
+    let bytes = contents.to_vec();
     let display = display_path(path);
     let (write_result, feed_result) = zip(
         async move {
@@ -59,18 +165,6 @@ pub async fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> Result
     .await;
     feed_result?;
     write_result
-}
-
-pub async fn exists(path: impl AsRef<Path>) -> bool {
-    metadata_type(path).await.is_ok()
-}
-
-pub async fn is_file(path: impl AsRef<Path>) -> bool {
-    matches!(metadata_type(path).await, Ok(DescriptorType::RegularFile))
-}
-
-pub async fn is_dir(path: impl AsRef<Path>) -> bool {
-    matches!(metadata_type(path).await, Ok(DescriptorType::Directory))
 }
 
 fn root_descriptor() -> Result<Descriptor> {

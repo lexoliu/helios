@@ -1,0 +1,17 @@
+[package]
+name = "helios-curl-wasi"
+version = "0.1.0"
+edition = "2024"
+autobins = false
+
+[dependencies]
+anyhow = "1.0.100"
+helios-api = { path = "../../../api", default-features = false, features = ["net"] }
+url = "2.5.8"
+
+[lib]
+name = "helios_curl_wasi"
+path = "src/main.rs"
+crate-type = ["cdylib"]
+
+[workspace]

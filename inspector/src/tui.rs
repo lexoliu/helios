@@ -60,15 +60,16 @@ impl Drop for Session {
 pub(crate) fn spawn_events() -> Receiver<CrosstermEvent> {
     let (tx, rx) = async_channel::unbounded();
     thread::spawn(move || loop {
-        if event::poll(Duration::from_millis(100)).unwrap_or(false) {
-            match event::read() {
-                Ok(event) => {
-                    if tx.send_blocking(event).is_err() {
-                        break;
-                    }
+        match event::poll(Duration::from_millis(100)) {
+            Ok(false) => {}
+            Ok(true) => {
+                let event = event::read()
+                    .unwrap_or_else(|error| panic!("failed to read TUI event: {error}"));
+                if tx.send_blocking(event).is_err() {
+                    break;
                 }
-                Err(_) => break,
             }
+            Err(error) => panic!("failed to poll TUI events: {error}"),
         }
     });
     rx

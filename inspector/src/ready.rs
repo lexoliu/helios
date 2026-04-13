@@ -5,11 +5,11 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use helios_inspector_protocol::system::stats;
 
-use crate::remote;
 use crate::runtime;
 use crate::serial::{RpcClient, SerialIo, SerialReader};
 
 const BOOT_SYNC_TIMEOUT: Duration = Duration::from_secs(900);
+const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const DEBUGGER_RUN_STAGE: &str = "run:begin";
 
 pub(crate) async fn connect_after_boot(io: SerialIo) -> Result<RpcClient> {
@@ -24,14 +24,12 @@ pub(crate) async fn connect_after_boot(io: SerialIo) -> Result<RpcClient> {
 }
 
 pub(crate) async fn wait_until_ready(client: &mut RpcClient) -> Result<()> {
-    remote::call(
-        stats::snapshot(client),
-        "the embedded debugger to become ready",
-    )
-    .await
-    .context(
-        "failed to fetch initial remote stats snapshot while waiting for debugger readiness",
-    )?;
+    runtime::timeout(READY_PROBE_TIMEOUT, stats::snapshot(client))
+        .await
+        .context("timed out waiting for remote stats readiness probe")?
+        .context(
+            "failed to fetch initial remote stats snapshot while waiting for debugger readiness",
+        )?;
     Ok(())
 }
 

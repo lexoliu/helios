@@ -71,11 +71,12 @@ pub(crate) async fn dispatch(func: &str, payload: &[u8]) -> Result<Vec<u8>> {
             let wasm = fs::read(&request.path)
                 .await
                 .with_context(|| format!("failed to read executable {}", request.path))?;
-            let response = host_programs::exec(&host_programs::ExecRequest {
+            let response = host_programs::exec(host_programs::ExecRequest {
                 name,
                 args: request.args,
                 wasm,
             })
+            .await
             .map(|result| ExecResult {
                 instance_id: result.instance_id,
                 exit_code: result.exit_code,

@@ -17,7 +17,7 @@ helios-hosted = { path = "hosted" }
 helios-kernel-macro = { path = "kernel-macro" }
 helios-inspector-protocol = { path = "inspector-protocol" }
 helios-riscv = { path = "riscv" }
-helios-kernel = { path = "kernel" }
+helios-kernel = { path = "kernel", default-features = false }
 helios-x86 = { path = "x86" }
 helios = { path = "." }
 tracing = { version = "0.1.44",  default-features = false }
@@ -39,6 +39,8 @@ wasmtime = { path = "../wasmtime/crates/wasmtime", default-features = false, fea
 
 [profile.dev]
 panic = "abort"
+debug = 0
+strip = "symbols"
 
 [profile.dev.package."*"]
 opt-level = 2

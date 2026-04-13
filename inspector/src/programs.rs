@@ -6,7 +6,7 @@ use helios_inspector_protocol::system::programs::ExecResult;
 
 use crate::serial::RpcClient;
 
-pub(crate) const REMOTE_DASH_PATH: &str = "/bin/dash";
+pub(crate) const REMOTE_SHELL_PATH: &str = "/bin/dash";
 
 pub async fn exec(client: &mut RpcClient, path: &str, args: &[String]) -> Result<ExecResult> {
     let path = normalize_absolute(path)?;

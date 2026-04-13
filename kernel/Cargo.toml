@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2024"
 build = "build.rs"
 
+[features]
+default = ["wasmtime-host"]
+wasmtime-host = ["dep:wasmtime", "dep:wasmtime-wasi-io", "wasmtime/host-arch"]
+wasmtime-x86 = ["dep:wasmtime", "dep:wasmtime-wasi-io", "wasmtime/x86"]
+wasmtime-riscv64 = ["dep:wasmtime", "dep:wasmtime-wasi-io", "wasmtime/riscv64"]
+
 [dependencies]
 async-lock = { version = "3.4.2", default-features = false }
 async-task = { version = "4.7.1", default-features = false }
@@ -12,6 +18,7 @@ buddy_system_allocator = "0.12.0"
 concurrent-queue = { version = "2.5.0", default-features = false }
 critical-section = "1.2.0"
 event-listener = { version = "5.4.1", default-features = false, features = ["critical-section"] }
+futures = { version = "0.3.31", default-features = false, features = ["alloc"] }
 nu-ansi-term = { version = "0.50.3", default-features = false }
 objectpool = { version = "0.1.0", default-features = false, features = ["alloc"] }
 helios-hal.workspace = true
@@ -33,14 +40,10 @@ walkdir = "2.5.0"
 wit-component = "0.245.0"
 wasmparser = "0.245.0"
 
-[target.'cfg(all(target_os = "none", target_arch = "riscv64"))'.dependencies]
-wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["call-hook", "component-model", "component-model-async", "riscv64", "cranelift", "runtime"] }
-wasmtime-wasi-io = { path = "../../wasmtime/crates/wasi-io", default-features = false }
-
-[target.'cfg(all(target_os = "none", target_arch = "x86_64"))'.dependencies]
-wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["call-hook", "component-model", "component-model-async", "x86", "cranelift", "runtime"] }
-wasmtime-wasi-io = { path = "../../wasmtime/crates/wasi-io", default-features = false }
+[target.'cfg(target_os = "none")'.dependencies]
+wasmtime = { path = "../../wasmtime/crates/wasmtime", optional = true, default-features = false, features = ["call-hook", "component-model", "component-model-async", "cranelift", "runtime"] }
+wasmtime-wasi-io = { path = "../../wasmtime/crates/wasi-io", optional = true, default-features = false }
 
 [target.'cfg(not(target_os = "none"))'.dependencies]
-wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["call-hook", "component-model", "component-model-async", "host-arch", "cranelift", "runtime", "std"] }
-wasmtime-wasi-io = { path = "../../wasmtime/crates/wasi-io" }
+wasmtime = { path = "../../wasmtime/crates/wasmtime", optional = true, default-features = false, features = ["call-hook", "component-model", "component-model-async", "cranelift", "runtime", "std"] }
+wasmtime-wasi-io = { path = "../../wasmtime/crates/wasi-io", optional = true }

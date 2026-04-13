@@ -109,11 +109,12 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>>
         (PROGRAMS_INSTANCE, PROGRAMS_EXEC) => {
             let request = postcard::from_bytes::<programs::ExecRequest>(payload)
                 .context("failed to decode programs.exec request payload")?;
-            let response = host_programs::exec(&host_programs::ExecRequest {
+            let response = host_programs::exec(host_programs::ExecRequest {
                 name: request.name,
                 args: request.args,
                 wasm: request.wasm,
-            });
+            })
+            .await;
             let response = response
                 .map(|result| programs::ExecResult {
                     instance_id: result.instance_id,

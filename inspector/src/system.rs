@@ -1,3 +1,5 @@
+use async_signal::{Signal, Signals};
+use futures_lite::{StreamExt as _, future};
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -115,6 +117,7 @@ pub fn parse_level(value: &str) -> Result<Option<tracing::Level>> {
 pub async fn stream_tracing(client: &mut RpcClient, config: &TracingConfig) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
     let mut emitted = EmittedEvents::new(config.limit);
+    let mut signals = Signals::new([Signal::Int]).context("failed to listen for SIGINT")?;
 
     loop {
         let events = fetch_tracing(client, config).await?;
@@ -127,8 +130,32 @@ pub async fn stream_tracing(client: &mut RpcClient, config: &TracingConfig) -> R
             }
         }
         stdout.flush()?;
-        async_io::Timer::after(LIVE_TRACING_POLL_INTERVAL).await;
+        if wait_for_tracing_tick_or_interrupt(&mut signals).await? {
+            stdout.write_all(b"interrupted\n")?;
+            stdout.flush()?;
+            return Ok(());
+        }
     }
+}
+
+async fn wait_for_tracing_tick_or_interrupt(signals: &mut Signals) -> std::io::Result<bool> {
+    future::or(
+        async {
+            async_io::Timer::after(LIVE_TRACING_POLL_INTERVAL).await;
+            Ok(false)
+        },
+        async {
+            match signals.next().await {
+                Some(Ok(Signal::Int)) => Ok(true),
+                Some(Ok(signal)) => panic!(
+                    "unexpected signal while waiting for tracing cancellation: {signal:?}"
+                ),
+                Some(Err(error)) => Err(error),
+                None => panic!("signal stream ended while waiting for tracing cancellation"),
+            }
+        },
+    )
+    .await
 }
 
 fn render_tracing_event(event: &tracing::Event) -> Result<String> {

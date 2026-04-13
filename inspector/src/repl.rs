@@ -22,12 +22,12 @@ use rustyline::{
     KeyCode as RustyKeyCode, KeyEvent as RustyKeyEvent, Modifiers as RustyModifiers,
 };
 
-use crate::programs::{self, REMOTE_DASH_PATH};
+use crate::programs::{self, REMOTE_SHELL_PATH};
 use crate::runtime;
 use crate::serial::RpcClient;
 use crate::stats_tui;
 use crate::system;
-use crate::{DashCommand, TracingCommand};
+use crate::{ShellCommand, TracingCommand};
 
 const PROMPT: &str = "helios> ";
 const CONTINUATION_PROMPT: &str = "....> ";
@@ -63,7 +63,7 @@ pub fn run(mut client: RpcClient) -> Result<()> {
     let mut terminal = InteractiveTerminal::new(Rc::clone(&editor));
 
     terminal.print(
-        "Helios inspector ready. Builtins: stats, tracing, clear, exit. Everything else runs in remote dash.\n",
+        "Helios inspector ready. Builtins: stats, tracing, clear, exit. Everything else runs in remote shell.\n",
     )?;
 
     loop {
@@ -86,24 +86,17 @@ pub fn run(mut client: RpcClient) -> Result<()> {
                     .context("failed to open stats view")?;
             }
             BuiltinParse::Builtin(BuiltinCommand::Tracing(command)) => {
-                match runtime::block_on(runtime::interruptible(system::stream_tracing_command(
-                    &mut client,
-                    &command,
-                )))
-                .context("failed to listen for Ctrl+C during tracing stream")?
-                {
-                    runtime::CommandRun::Completed(result) => result?,
-                    runtime::CommandRun::Interrupted => terminal.print_line("interrupted")?,
-                }
+                runtime::block_on(system::stream_tracing_command(&mut client, &command))
+                    .context("failed to stream tracing events")?;
             }
             BuiltinParse::Builtin(BuiltinCommand::Clear) => terminal.clear_screen()?,
             BuiltinParse::Builtin(BuiltinCommand::Exit) => return Ok(()),
             BuiltinParse::Remote(script) => {
-                match runtime::block_on(runtime::interruptible(run_dash_script(
+                match runtime::block_on(runtime::interruptible(run_shell_script(
                     &mut client,
                     script,
                 )))
-                .context("failed to listen for Ctrl+C during remote dash execution")?
+                .context("failed to listen for Ctrl+C during remote shell execution")?
                 {
                     runtime::CommandRun::Completed(result) => {
                         let output = result?;
@@ -116,19 +109,22 @@ pub fn run(mut client: RpcClient) -> Result<()> {
     }
 }
 
-pub async fn run_dash_command(client: &mut RpcClient, command: &DashCommand) -> Result<ExecResult> {
+pub async fn run_shell_command(
+    client: &mut RpcClient,
+    command: &ShellCommand,
+) -> Result<ExecResult> {
     let script = match (&command.command, &command.script) {
         (Some(command), None) => command.clone(),
         (None, Some(path)) => fs::read_to_string(path)
-            .with_context(|| format!("failed to read local dash script {path}"))?,
-        (None, None) => bail!("dash requires either -c <script> or <script-file>"),
-        (Some(_), Some(_)) => unreachable!("clap must reject conflicting dash inputs"),
+            .with_context(|| format!("failed to read local shell script {path}"))?,
+        (None, None) => bail!("shell requires either -c <script> or <script-file>"),
+        (Some(_), Some(_)) => unreachable!("clap must reject conflicting shell inputs"),
     };
-    run_dash_script(client, script).await
+    run_shell_script(client, script).await
 }
 
-async fn run_dash_script(client: &mut RpcClient, script: String) -> Result<ExecResult> {
-    programs::exec(client, REMOTE_DASH_PATH, &["-c".to_owned(), script]).await
+async fn run_shell_script(client: &mut RpcClient, script: String) -> Result<ExecResult> {
+    programs::exec(client, REMOTE_SHELL_PATH, &["-c".to_owned(), script]).await
 }
 
 fn read_program(editor: &SharedEditor) -> Result<Option<String>> {
@@ -433,18 +429,18 @@ mod tests {
     }
 
     #[test]
-    fn repl_forwards_regular_shell_commands_to_remote_dash() {
+    fn repl_forwards_regular_shell_commands_to_remote_shell() {
         match BuiltinCommand::parse("ls /tmp") {
             BuiltinParse::Remote(script) => assert_eq!(script, "ls /tmp"),
-            _ => panic!("ls must be forwarded to remote dash"),
+            _ => panic!("ls must be forwarded to remote shell"),
         }
     }
 
     #[test]
-    fn repl_forwards_stats_with_extra_arguments_to_remote_dash() {
+    fn repl_forwards_stats_with_extra_arguments_to_remote_shell() {
         match BuiltinCommand::parse("stats --help") {
             BuiltinParse::Remote(script) => assert_eq!(script, "stats --help"),
-            _ => panic!("stats with arguments must not be treated as a local builtin"),
+            _ => panic!("stats with arguments must be forwarded to remote shell"),
         }
     }
 }

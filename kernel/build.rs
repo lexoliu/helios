@@ -14,8 +14,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=HELIOS_INIT_MANIFEST");
     println!("cargo:rerun-if-env-changed=HELIOS_INIT_ARGV0");
     println!("cargo:rerun-if-env-changed=HELIOS_BOOTFS_ROOT");
-    println!("cargo:rerun-if-env-changed=HELIOS_DEBUGGER_WASM");
-    println!("cargo:rerun-if-env-changed=HELIOS_DEBUGGER_MANIFEST");
     rerun_if_changed_recursive(Path::new("../programs"));
     rerun_if_changed_recursive(Path::new("../api"));
     rerun_if_changed_recursive(Path::new("../api-macro"));
@@ -31,11 +29,6 @@ fn main() {
     let init_destination = out_dir.join("embedded_init.rs");
     let init_source = generate_embedded_init(&out_dir);
     fs::write(init_destination, init_source).expect("failed to write embedded init description");
-
-    let debugger_destination = out_dir.join("embedded_debugger.rs");
-    let debugger_source = generate_embedded_debugger(&out_dir);
-    fs::write(debugger_destination, debugger_source)
-        .expect("failed to write embedded debugger description");
 }
 
 fn generate_embedded_init(out_dir: &Path) -> String {
@@ -98,7 +91,7 @@ fn build_boot_program_assets(out_dir: &Path) -> Vec<EmbeddedBootAsset> {
                         path.display()
                     )
                 });
-            if matches!(command, "init" | "debugger") {
+            if command == "init" {
                 return None;
             }
             Some(read_program_manifest(command, &path.join("Cargo.toml")))
@@ -185,31 +178,10 @@ fn read_program_manifest(command: &str, manifest_path: &Path) -> ProgramManifest
     }
 }
 
-fn generate_embedded_debugger(out_dir: &Path) -> String {
-    let component_path = resolve_debugger_component(out_dir);
-    let name = component_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_else(|| panic!("{} has no valid UTF-8 file name", component_path.display()));
-
-    format!(
-        "pub const EMBEDDED_DEBUGGER: Option<EmbeddedDebuggerDescriptor> = Some(EmbeddedDebuggerDescriptor {{\n    component: EmbeddedComponent::new(\n        r#\"{name}\"#,\n        include_bytes!(r#\"{component}\"#),\n    ),\n}});\n",
-        name = name,
-        component = component_path.display(),
-    )
-}
-
 fn resolve_init_component(out_dir: &Path) -> PathBuf {
     match env::var_os("HELIOS_INIT_WASM") {
         Some(path) => canonicalize_file(path.as_ref(), "HELIOS_INIT_WASM"),
         None => build_default_init_component(out_dir),
-    }
-}
-
-fn resolve_debugger_component(out_dir: &Path) -> PathBuf {
-    match env::var_os("HELIOS_DEBUGGER_WASM") {
-        Some(path) => canonicalize_file(path.as_ref(), "HELIOS_DEBUGGER_WASM"),
-        None => build_default_debugger_component(out_dir),
     }
 }
 
@@ -264,34 +236,6 @@ fn build_default_init_component(out_dir: &Path) -> PathBuf {
     canonicalize_file(&component_path, "generated init component")
 }
 
-fn build_default_debugger_component(out_dir: &Path) -> PathBuf {
-    let manifest_path = env::var_os("HELIOS_DEBUGGER_MANIFEST")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("../programs/debugger/Cargo.toml"));
-    assert!(
-        manifest_path.is_file(),
-        "default debugger crate manifest {} is missing",
-        manifest_path.display()
-    );
-
-    let core_module_path = build_wasip2_program(
-        out_dir,
-        &manifest_path,
-        "helios-debugger-target",
-        "helios_debugger.wasm",
-    );
-    let core_module_path = canonicalize_file(&core_module_path, "generated debugger core module");
-    let component_path = out_dir.join("helios_debugger_component.wasm");
-    let component = encode_component(&core_module_path);
-    fs::write(&component_path, component).unwrap_or_else(|error| {
-        panic!(
-            "failed to write generated debugger component {}: {error}",
-            component_path.display()
-        )
-    });
-    canonicalize_file(&component_path, "generated debugger component")
-}
-
 fn build_wasip2_program(
     out_dir: &Path,
     manifest_path: &Path,
@@ -299,6 +243,7 @@ fn build_wasip2_program(
     artifact_name: &str,
 ) -> PathBuf {
     let cargo = env::var_os("CARGO").expect("CARGO is missing");
+    let profile = env::var("PROFILE").unwrap_or_else(|error| panic!("PROFILE is missing: {error}"));
     let target_dir = out_dir.join(target_dir_name);
     let mut command = Command::new(cargo);
     command
@@ -309,10 +254,14 @@ fn build_wasip2_program(
         .arg("wasm32-wasip2")
         .arg("--target-dir")
         .arg(&target_dir);
-    command.env("CARGO_PROFILE_DEV_OPT_LEVEL", "z");
-    command.env("CARGO_PROFILE_DEV_DEBUG", "0");
-    command.env("CARGO_PROFILE_DEV_CODEGEN_UNITS", "1");
-    command.env("CARGO_PROFILE_DEV_PANIC", "abort");
+    if profile == "release" {
+        command.arg("--release");
+    } else {
+        command.env("CARGO_PROFILE_DEV_OPT_LEVEL", "z");
+        command.env("CARGO_PROFILE_DEV_DEBUG", "0");
+        command.env("CARGO_PROFILE_DEV_CODEGEN_UNITS", "1");
+        command.env("CARGO_PROFILE_DEV_PANIC", "abort");
+    }
     // `wasm32-wasip2` artifacts must not inherit the outer bare-metal linker
     // scripts from the kernel build. They also need their own wasm-specific
     // strip flags to keep embedded components small enough for guest-side JIT.
@@ -330,7 +279,6 @@ fn build_wasip2_program(
         manifest_path.display()
     );
 
-    let profile = env::var("PROFILE").unwrap_or_else(|error| panic!("PROFILE is missing: {error}"));
     let profile_dir = profile.as_str();
     target_dir
         .join("wasm32-wasip2")

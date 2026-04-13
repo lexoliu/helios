@@ -13,13 +13,13 @@ pub struct DebugPort {
 
 /// Returns the debugger serial endpoint when the current component holds the
 /// corresponding capability.
-pub fn debug_port() -> Option<DebugPort> {
-    serial::debug_port().map(|raw| DebugPort { raw })
+pub async fn debug_port() -> Option<DebugPort> {
+    serial::debug_port().await.map(|raw| DebugPort { raw })
 }
 
 impl DebugPort {
-    pub fn rights(&self) -> SerialRights {
-        self.raw.rights()
+    pub async fn rights(&self) -> SerialRights {
+        self.raw.rights().await
     }
 
     pub async fn read(&self, max_bytes: usize) -> io::Result<Vec<u8>> {
