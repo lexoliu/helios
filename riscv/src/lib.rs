@@ -297,35 +297,28 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     fatal_panic(info)
 }
 
-struct SbiConsole {
+fn sbi_console(
     debug_state: debug_state::RuntimeState,
     mirror_to_uart: bool,
-}
-
-impl SbiConsole {
-    fn new(debug_state: debug_state::RuntimeState, mirror_to_uart: bool) -> Self {
-        Self {
-            debug_state,
-            mirror_to_uart,
-        }
-    }
-}
-
-impl Write for SbiConsole {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        self.debug_state
-            .record_console_text(riscv::register::time::read64(), s);
-        if !self.mirror_to_uart {
-            return Ok(());
-        }
-        for byte in s.bytes() {
-            let ret = sbi_rt::console_write_byte(byte);
-            if ret.is_err() {
-                return Err(core::fmt::Error);
+) -> helios_kernel::RecordingConsole<
+    debug_state::RuntimeState,
+    impl FnMut() -> u64,
+    impl FnMut(&[u8]),
+> {
+    let write_fn: Option<fn(&[u8])> = if mirror_to_uart {
+        Some(|bytes: &[u8]| {
+            for &byte in bytes {
+                let _ = sbi_rt::console_write_byte(byte);
             }
-        }
-        Ok(())
-    }
+        })
+    } else {
+        None
+    };
+    helios_kernel::RecordingConsole::new(
+        debug_state,
+        || riscv::register::time::read64(),
+        write_fn,
+    )
 }
 
 #[derive(Clone)]
@@ -522,7 +515,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
 
     let debug_state = shared_debug_state(timebase_frequency, hart_count);
     let debug_transport = DebugTransport::discover(&fdt);
-    let console = SbiConsole::new(
+    let console = sbi_console(
         debug_state.clone(),
         !helios_kernel::has_embedded_system_component(),
     );

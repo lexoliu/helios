@@ -28,6 +28,7 @@ mod log;
 mod observer;
 mod program;
 mod program_service;
+mod recording_console;
 mod runtime_state;
 mod runtime_types;
 mod serial_transport;
@@ -102,6 +103,7 @@ pub use observer::{
     DEFAULT_TRACE_HISTORY_CAPACITY, StatsSample, TraceEvent, TraceField, TraceFilter, TraceHistory,
     TraceLevel, TraceValue, matches_trace_filter, parse_console_text,
 };
+pub use recording_console::RecordingConsole;
 pub use program::{
     Blueprint, CompileError as ProgramCompileError, ExitCode, ProgramRuntime,
     ProgramRuntimeBackend, ProgramRuntimeConfig, ProgramRuntimeDriver, ProgramRuntimeDriverBackend,

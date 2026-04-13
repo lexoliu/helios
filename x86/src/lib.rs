@@ -102,7 +102,7 @@ fn x86_kernel_main(boot_info: &'static mut BootInfo) -> ! {
     );
     smp::activate_runtime(boot.bootstrap_runtime());
     let mirror_to_uart = false;
-    let console = SerialConsole::new(debug_state.clone(), mirror_to_uart);
+    let console = serial_console(debug_state.clone(), mirror_to_uart);
     let cpu = X86Cpu::new(boot.platform());
     let kernel = helios_kernel::init(Platform::new(console, memory_regions, cpu.clone()));
     let debug_state = cpu.debug_state();
@@ -249,33 +249,29 @@ mod tests {
     }
 }
 
-struct SerialConsole {
+fn serial_console(
     debug_state: debug_state::RuntimeState,
     mirror_to_uart: bool,
-}
-
-impl SerialConsole {
-    fn new(debug_state: debug_state::RuntimeState, mirror_to_uart: bool) -> Self {
-        serial_uart_init();
-        Self {
-            debug_state,
-            mirror_to_uart,
-        }
-    }
-}
-
-impl Write for SerialConsole {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.debug_state.record_console_text(read_tsc(), s);
-        if !self.mirror_to_uart {
-            return Ok(());
-        }
-
-        for byte in s.bytes() {
-            serial_write_byte(byte);
-        }
-        Ok(())
-    }
+) -> helios_kernel::RecordingConsole<
+    debug_state::RuntimeState,
+    impl FnMut() -> u64,
+    impl FnMut(&[u8]),
+> {
+    serial_uart_init();
+    let write_fn: Option<fn(&[u8])> = if mirror_to_uart {
+        Some(|bytes: &[u8]| {
+            for &byte in bytes {
+                serial_write_byte(byte);
+            }
+        })
+    } else {
+        None
+    };
+    helios_kernel::RecordingConsole::new(
+        debug_state,
+        || read_tsc(),
+        write_fn,
+    )
 }
 
 #[derive(Clone)]
@@ -406,7 +402,7 @@ extern "C" fn secondary_start_rust(
     smp::activate_runtime(runtime);
 
     let debug_state = boot.platform().debug_state();
-    let console = SerialConsole::new(debug_state.clone(), false);
+    let console = serial_console(debug_state.clone(), false);
     let cpu = X86Cpu::new(boot.platform());
     let kernel = helios_kernel::init(Platform::new(
         console,
