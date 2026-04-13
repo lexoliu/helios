@@ -13,11 +13,6 @@ use crate::{
 };
 use helios_hal::cpu::Cpu;
 use wasmtime::component::ResourceTable;
-use wasmtime::{CallHook, ResourceLimiter};
-use wasmtime_wasi_io::IoView;
-use wasmtime_wasi_io::bytes::Bytes;
-use wasmtime_wasi_io::poll::Pollable;
-use wasmtime_wasi_io::streams::{OutputStream, StreamError};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ComponentOutputMode {
@@ -202,57 +197,11 @@ where
         (self.serial_writer)(bytes);
     }
 
-    pub fn record_call_hook(&mut self, hook: CallHook) {
-        let transition = match hook {
-            CallHook::CallingWasm | CallHook::ReturningFromHost => {
-                InstanceExecutionTransition::Resume
-            }
-            CallHook::ReturningFromWasm | CallHook::CallingHost => {
-                InstanceExecutionTransition::Pause
-            }
-        };
+    pub fn record_transition(
+        &mut self,
+        transition: InstanceExecutionTransition,
+    ) {
         record_instance_transition(self.instance(), transition, self.now_nanos());
-    }
-}
-
-impl<CpuImpl, RuntimeStateImpl, FileSystem> ResourceLimiter
-    for ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem>
-where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
-    RuntimeStateImpl: ComponentRuntimeState,
-    FileSystem: Send,
-{
-    fn memory_growing(
-        &mut self,
-        _current: usize,
-        desired: usize,
-        maximum: Option<usize>,
-    ) -> wasmtime::Result<bool> {
-        Ok(allow_instance_resource_growth(
-            self.instance(),
-            desired,
-            maximum,
-        ))
-    }
-
-    fn table_growing(
-        &mut self,
-        _current: usize,
-        desired: usize,
-        maximum: Option<usize>,
-    ) -> wasmtime::Result<bool> {
-        Ok(maximum.is_none_or(|maximum| desired <= maximum))
-    }
-}
-
-impl<CpuImpl, RuntimeStateImpl, FileSystem> IoView
-    for ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem>
-where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
-    RuntimeStateImpl: ComponentRuntimeState,
-{
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.table
     }
 }
 
@@ -319,6 +268,17 @@ where
     }
 }
 
+impl<CpuImpl, RuntimeStateImpl> ComponentOutputStream<CpuImpl, RuntimeStateImpl>
+where
+    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    RuntimeStateImpl: ComponentRuntimeState,
+{
+    /// Write output bytes through the configured output mode.
+    pub fn write_output(&mut self, bytes: &[u8]) {
+        self.sink.write(self.stream, bytes);
+    }
+}
+
 impl<CpuImpl, RuntimeStateImpl> DeadlinePollable<CpuImpl, RuntimeStateImpl>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
@@ -331,46 +291,15 @@ where
             deadline_nanos,
         }
     }
-}
 
-#[wasmtime_wasi_io::async_trait]
-impl<CpuImpl, RuntimeStateImpl> Pollable for ComponentOutputStream<CpuImpl, RuntimeStateImpl>
-where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
-    RuntimeStateImpl: ComponentRuntimeState,
-{
-    async fn ready(&mut self) {}
-}
-
-#[wasmtime_wasi_io::async_trait]
-impl<CpuImpl, RuntimeStateImpl> OutputStream for ComponentOutputStream<CpuImpl, RuntimeStateImpl>
-where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
-    RuntimeStateImpl: ComponentRuntimeState,
-{
-    fn write(&mut self, bytes: Bytes) -> Result<(), StreamError> {
-        self.sink.write(self.stream, bytes.as_ref());
-        Ok(())
+    pub fn uptime_nanos(&self) -> u64 {
+        self.runtime_state.uptime_nanos(self.cpu.now().ticks())
     }
 
-    fn flush(&mut self) -> Result<(), StreamError> {
-        Ok(())
-    }
-
-    fn check_write(&mut self) -> Result<usize, StreamError> {
-        Ok(4096)
+    pub fn deadline_nanos(&self) -> u64 {
+        self.deadline_nanos
     }
 }
 
-#[wasmtime_wasi_io::async_trait]
-impl<CpuImpl, RuntimeStateImpl> Pollable for DeadlinePollable<CpuImpl, RuntimeStateImpl>
-where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
-    RuntimeStateImpl: ComponentRuntimeState,
-{
-    async fn ready(&mut self) {
-        while self.runtime_state.uptime_nanos(self.cpu.now().ticks()) < self.deadline_nanos {
-            yield_now().await;
-        }
-    }
-}
+// Wasmtime trait impls (Pollable, OutputStream, ResourceLimiter, IoView)
+// live in wasmtime_adapter/store.rs.

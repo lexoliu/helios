@@ -10,6 +10,7 @@ extern crate alloc;
 pub mod bindings;
 pub mod config;
 pub mod engine;
+pub mod store;
 pub mod wasi;
 
 use alloc::sync::Arc;

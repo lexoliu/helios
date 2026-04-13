@@ -279,7 +279,8 @@ where
     let mut store = Store::new(engine, state);
     store.limiter(|state| state);
     store.call_hook(|mut caller: StoreContextMut<'_, StoreData<CpuImpl, HostFs>>, hook| {
-        caller.data_mut().record_call_hook(hook);
+        let transition = crate::wasmtime_adapter::store::translate_call_hook(hook);
+        caller.data_mut().record_transition(transition);
         Ok(())
     });
     store
