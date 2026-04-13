@@ -55,7 +55,7 @@ where
     HostFs: crate::HostFileSystem,
 {
     runtime: crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
-    engine: Engine,
+    engine: crate::wasmtime_adapter::WasmtimeEngine,
     compiler: ComputePool,
     compile_priority: ComputePriority,
     component_cache: Mutex<ComponentCache<crate::wasmtime_adapter::WasmtimeCompiledComponent>>,
@@ -136,11 +136,11 @@ where
     let compiler_budget = available_bytes
         .saturating_sub(cache_budget)
         .max(reserved_stack_bytes);
-    let engine = build_component_engine_for_platform(cpu)
-        .unwrap_or_else(|error| panic!("failed to create launched-program engine: {error:#}"));
     let compiler = ComputePool::new(config.worker_count(), WORKER_STACK_SIZE, compiler_budget)
         .unwrap_or_else(|error| panic!("failed to create launched-program compute pool: {error}"));
     let runtime = crate::wasmtime_adapter::WasmtimeComponentRuntime::new(cpu.clone());
+    let engine = <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as crate::ComponentRuntimeFactory<CpuImpl, HostRuntimeState<CpuImpl, HostFs>, HostFs>>::create_engine(&runtime)
+        .unwrap_or_else(|error| panic!("failed to create launched-program engine: {error:#}"));
     let service = UserProgramService {
         inner: Arc::new(UserProgramServiceInner {
             runtime,
@@ -337,8 +337,8 @@ where
                 let engine = self.inner.engine.clone();
                 let wasm = wasm.clone();
                 move || {
-                    let component = Component::from_binary(&engine, &wasm)?;
-                    Ok(crate::wasmtime_adapter::WasmtimeCompiledComponent { component })
+                    use crate::ComponentRuntimeEngine;
+                    engine.compile(&wasm)
                 }
             },
         ));

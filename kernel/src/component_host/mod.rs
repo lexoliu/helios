@@ -24,7 +24,7 @@ use crate::{
     EmbeddedComponent, ExecResult, ProgramExecError,
     ProgramExecErrorKind, RawMutex, RawMutexGuardResource, RawMutexResource, RawRwLock,
     RawRwLockReadGuardResource, RawRwLockResource, RawRwLockWriteGuardResource,
-    SerialPortResource, build_component_engine_for_platform, elapsed_millis,
+    SerialPortResource, elapsed_millis,
     emit_serial_stage_marker, heap_stats, monotonic_nanos,
 };
 use spin::Mutex;
