@@ -494,6 +494,24 @@ where
         });
     }
 
+    /// Cache host file content in the embedded FS so that subsequent stream
+    /// reads can proceed synchronously without async 9p I/O.
+    pub(crate) fn seed_host_file_content(&mut self, path: &str, content: Vec<u8>) {
+        if let Some(node) = self.nodes.iter_mut().find(|n| n.path == path) {
+            node.contents = content;
+            return;
+        }
+        let inode = self.allocate_inode();
+        self.nodes.push(FsNode {
+            path: path.to_owned(),
+            kind: FsNodeKind::File,
+            contents: content,
+            inode,
+            modified_nanos: 0,
+            readonly: true,
+        });
+    }
+
     fn ensure_directory(&mut self, path: &str, readonly: bool) {
         if path == "/" {
             return;
@@ -1883,6 +1901,121 @@ where
         open_flags: fs_types::OpenFlags,
         flags: fs_types::DescriptorFlags,
     ) -> Result<Resource<FsDescriptor>, FsError> {
+        // Extract base descriptor data and resolve absolute path synchronously.
+        let (base_path, base_kind, base_flags) = accessor.with(|mut access| {
+            let base = get_fs_descriptor(access.get(), &descriptor)?;
+            Ok::<_, FsError>((base.path.clone(), base.kind, base.flags))
+        })?;
+
+        if path_flags.contains(fs_types::PathFlags::SYMLINK_FOLLOW) {
+            return Err(fs_types::ErrorCode::Unsupported.into());
+        }
+        if base_kind != FsNodeKind::Directory {
+            return Err(fs_types::ErrorCode::NotDirectory.into());
+        }
+
+        let absolute = crate::resolve_child_path(&base_path, &path)
+            .map_err(map_component_fs_path_error)?;
+        let host_path = crate::guest_host_share_path(&absolute).map(|p| p.to_owned());
+
+        if let Some(host_path) = host_path {
+            // Host filesystem path — do async I/O outside accessor.
+            let service = accessor.with(|mut access| {
+                access.get().filesystem().host_service().map_err(FsError::from)
+            })?;
+
+            let metadata = service.stat_path(&host_path).await;
+            match metadata {
+                Ok(metadata) => {
+                    let kind = if metadata.qid_type & 0x80 != 0 {
+                        FsNodeKind::Directory
+                    } else {
+                        FsNodeKind::File
+                    };
+                    if open_flags.contains(fs_types::OpenFlags::EXCLUSIVE)
+                        && open_flags.contains(fs_types::OpenFlags::CREATE)
+                    {
+                        return Err(fs_types::ErrorCode::Exist.into());
+                    }
+                    if open_flags.contains(fs_types::OpenFlags::DIRECTORY)
+                        && kind != FsNodeKind::Directory
+                    {
+                        return Err(fs_types::ErrorCode::NotDirectory.into());
+                    }
+                    if !open_flags.contains(fs_types::OpenFlags::DIRECTORY)
+                        && kind == FsNodeKind::Directory
+                    {
+                        return Err(fs_types::ErrorCode::IsDirectory.into());
+                    }
+                    if open_flags.contains(fs_types::OpenFlags::TRUNCATE) {
+                        if kind != FsNodeKind::File {
+                            return Err(fs_types::ErrorCode::IsDirectory.into());
+                        }
+                        if !base_flags.contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY) {
+                            return Err(fs_types::ErrorCode::ReadOnly.into());
+                        }
+                        service
+                            .truncate_file(&host_path)
+                            .await
+                            .map_err(map_host_fs_error)?;
+                    }
+                    // For host files, eagerly read the content so that
+                    // subsequent stream reads work synchronously without
+                    // needing async 9p I/O inside poll_produce.
+                    if kind == FsNodeKind::File {
+                        let content = service
+                            .read_file(&host_path)
+                            .await
+                            .map_err(map_host_fs_error)?;
+                        let opened = FsDescriptor {
+                            path: absolute.clone(),
+                            kind,
+                            flags,
+                        };
+                        return accessor.with(|mut access| {
+                            access
+                                .get()
+                                .filesystem_mut()
+                                .seed_host_file_content(&absolute, content);
+                            access.get().table.push(opened).map_err(FsError::trap)
+                        });
+                    }
+                    let opened = FsDescriptor {
+                        path: absolute,
+                        kind,
+                        flags,
+                    };
+                    return accessor.with(|mut access| {
+                        access.get().table.push(opened).map_err(FsError::trap)
+                    });
+                }
+                Err(err) => {
+                    let err = map_host_fs_error(err);
+                    if matches!(err, fs_types::ErrorCode::NoEntry)
+                        && open_flags.contains(fs_types::OpenFlags::CREATE)
+                    {
+                        if !base_flags.contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY) {
+                            return Err(fs_types::ErrorCode::ReadOnly.into());
+                        }
+                        service
+                            .create_file(&host_path)
+                            .await
+                            .map_err(map_host_fs_error)?;
+                        let opened = FsDescriptor {
+                            path: absolute,
+                            kind: FsNodeKind::File,
+                            flags,
+                        };
+                        return accessor.with(|mut access| {
+                            access.get().table.push(opened).map_err(FsError::trap)
+                        });
+                    }
+                    return Err(err.into());
+                }
+            }
+        }
+
+        // Embedded filesystem path — fully synchronous.
         accessor.with(|mut access| {
             let base = get_fs_descriptor(access.get(), &descriptor)?;
             let now_nanos = access.get().now_nanos();
