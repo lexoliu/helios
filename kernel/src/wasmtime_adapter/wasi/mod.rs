@@ -1,6 +1,7 @@
 extern crate alloc;
 
 use alloc::borrow::ToOwned;
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -1768,9 +1769,40 @@ where
         accessor: &Accessor<T, Self>,
         descriptor: Resource<FsDescriptor>,
     ) -> Result<fs_types::DescriptorStat, FsError> {
-        accessor.with(|mut access| {
+        // Extract path from the descriptor synchronously, then do the
+        // (potentially async) FS operation outside the accessor so the
+        // kernel executor can drive the 9p transport concurrently.
+        let path = accessor.with(|mut access| {
             let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-            let path = descriptor.path;
+            Ok::<_, FsError>(descriptor.path.clone())
+        })?;
+        let host_path = crate::guest_host_share_path(&path).map(|p| p.to_owned());
+        if let Some(host_path) = host_path {
+            let service = accessor.with(|mut access| {
+                access
+                    .get()
+                    .filesystem()
+                    .host_service()
+                    .map_err(FsError::from)
+            })?;
+            let metadata = service
+                .stat_path(&host_path)
+                .await
+                .map_err(map_host_fs_error)?;
+            return Ok(fs_types::DescriptorStat {
+                type_: if metadata.qid_type & 0x80 != 0 {
+                    fs_types::DescriptorType::Directory
+                } else {
+                    fs_types::DescriptorType::RegularFile
+                },
+                link_count: 1,
+                size: metadata.size,
+                data_access_timestamp: None,
+                data_modification_timestamp: None,
+                status_change_timestamp: None,
+            });
+        }
+        accessor.with(|mut access| {
             access.get().filesystem().stat(&path).map_err(Into::into)
         })
     }
@@ -1784,10 +1816,39 @@ where
         if path_flags.contains(fs_types::PathFlags::SYMLINK_FOLLOW) {
             return Err(fs_types::ErrorCode::Unsupported.into());
         }
-        accessor.with(|mut access| {
+        let absolute = accessor.with(|mut access| {
             let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-            let absolute = crate::resolve_child_path(&descriptor.path, &path)
-                .map_err(map_component_fs_path_error)?;
+            crate::resolve_child_path(&descriptor.path, &path)
+                .map_err(map_component_fs_path_error)
+                .map_err(FsError::from)
+        })?;
+        let host_path = crate::guest_host_share_path(&absolute).map(|p| p.to_owned());
+        if let Some(host_path) = host_path {
+            let service = accessor.with(|mut access| {
+                access
+                    .get()
+                    .filesystem()
+                    .host_service()
+                    .map_err(FsError::from)
+            })?;
+            let metadata = service
+                .stat_path(&host_path)
+                .await
+                .map_err(map_host_fs_error)?;
+            return Ok(fs_types::DescriptorStat {
+                type_: if metadata.qid_type & 0x80 != 0 {
+                    fs_types::DescriptorType::Directory
+                } else {
+                    fs_types::DescriptorType::RegularFile
+                },
+                link_count: 1,
+                size: metadata.size,
+                data_access_timestamp: None,
+                data_modification_timestamp: None,
+                status_change_timestamp: None,
+            });
+        }
+        accessor.with(|mut access| {
             access.get().filesystem().stat(&absolute).map_err(Into::into)
         })
     }

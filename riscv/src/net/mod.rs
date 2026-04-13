@@ -9,7 +9,9 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use concurrent_queue::{ConcurrentQueue, PopError, PushError};
+use core::future::Future;
 use core::num::NonZeroU32;
+use core::pin::Pin;
 use core::task::Poll;
 use core::time::Duration;
 
@@ -78,9 +80,22 @@ pub(crate) type PingReply = KernelPingReply;
 pub(crate) type TcpError = KernelTcpError;
 pub(crate) type TcpErrorKind = KernelTcpErrorKind;
 
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TcpStreamId(NonZeroU32);
+
+impl helios_kernel::TcpStreamToken for TcpStreamId {
+    fn into_raw(self) -> u64 {
+        u64::from(self.0.get())
+    }
+
+    fn from_raw(raw: u64) -> Self {
+        let raw = u32::try_from(raw)
+            .unwrap_or_else(|_| panic!("tcp stream handle {raw} does not fit in u32"));
+        let raw =
+            NonZeroU32::new(raw).unwrap_or_else(|| panic!("tcp stream handle must be non-zero"));
+        Self(raw)
+    }
+}
 
 enum NetworkRequest {
     Ping(PingRequest),
@@ -166,7 +181,6 @@ impl<T> RequestResponse<T> {
     }
 }
 
-
 struct NetworkState {
     iface: Interface,
     sockets: SocketSet<'static>,
@@ -230,47 +244,6 @@ fn map_ipv4_address(address: Ipv4Address) -> KernelIpv4Address {
     KernelIpv4Address::new(address.octets())
 }
 
-fn ping_error_from_io(error: IoError, context: &str) -> PingError {
-    PingError {
-        kind: match error {
-            IoError::Unsupported
-            | IoError::PermissionDenied
-            | IoError::ReadOnly => PingErrorKind::Unavailable,
-            IoError::NotFound
-            | IoError::AlreadyExists
-            | IoError::NotDirectory
-            | IoError::IsDirectory
-            | IoError::DirectoryNotEmpty
-            | IoError::InvalidBufferLength { .. }
-            | IoError::InvalidDeviceConfig(_)
-            | IoError::OutOfBounds
-            | IoError::DeviceFault => PingErrorKind::Internal,
-        },
-        detail: alloc::format!("{context}: {error}"),
-    }
-}
-
-fn tcp_error_from_io(error: IoError, context: &str) -> TcpError {
-    TcpError {
-        kind: match error {
-            IoError::Unsupported
-            | IoError::PermissionDenied
-            | IoError::ReadOnly => TcpErrorKind::Unavailable,
-            IoError::NotFound
-            | IoError::AlreadyExists
-            | IoError::NotDirectory
-            | IoError::IsDirectory
-            | IoError::DirectoryNotEmpty
-            | IoError::InvalidBufferLength { .. }
-            | IoError::InvalidDeviceConfig(_)
-            | IoError::OutOfBounds
-            | IoError::DeviceFault => TcpErrorKind::Internal,
-        },
-        detail: alloc::format!("{context}: {error}"),
-    }
-}
-
-
 pub(crate) fn install_network_service(
     cpu: &RiscvCpu,
     kernel: &Kernel<RiscvCpu>,
@@ -284,7 +257,9 @@ pub(crate) fn install_network_service(
         kernel.timer(),
         probe.device.clone(),
     );
-    debug_state.install_network_service(service.clone());
+    debug_state.install_network_service(helios_kernel::DynamicNetworkService::from_service(
+        service.clone(),
+    ));
     let network_task = service.clone();
     kernel.spawn_local_detached(async move {
         network_task.run_requests().await;
@@ -766,13 +741,13 @@ impl NetworkService {
     async fn drive_ping(&self) -> Result<(), PingError> {
         self.drive_network()
             .await
-            .map_err(|error| ping_error_from_io(error, "failed to advance virtio network"))
+            .map_err(|error| PingError::from_io(error, "failed to advance virtio network"))
     }
 
     async fn drive_tcp(&self) -> Result<(), TcpError> {
         self.drive_network()
             .await
-            .map_err(|error| tcp_error_from_io(error, "failed to advance virtio network"))
+            .map_err(|error| TcpError::from_io(error, "failed to advance virtio network"))
     }
 
     async fn drive_network(&self) -> Result<(), IoError> {
@@ -837,6 +812,73 @@ impl NetworkService {
     }
 }
 
+impl helios_kernel::ComponentNetworkService for NetworkService {
+    type TcpStream = TcpStreamId;
+
+    type PingFuture<'a>
+        = Pin<Box<dyn Future<Output = Result<KernelPingReply, KernelPingError>> + Send + 'a>>
+    where
+        Self: 'a;
+
+    type TcpConnectFuture<'a>
+        = Pin<Box<dyn Future<Output = Result<Self::TcpStream, KernelTcpError>> + Send + 'a>>
+    where
+        Self: 'a;
+
+    type TcpWriteFuture<'a>
+        = Pin<Box<dyn Future<Output = Result<(), KernelTcpError>> + Send + 'a>>
+    where
+        Self: 'a;
+
+    type TcpReadFuture<'a>
+        = Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, KernelTcpError>> + Send + 'a>>
+    where
+        Self: 'a;
+
+    type TcpCloseFuture<'a>
+        = Pin<Box<dyn Future<Output = ()> + Send + 'a>>
+    where
+        Self: 'a;
+
+    fn ping(&self, host: &str, timeout_nanos: u64) -> Self::PingFuture<'_> {
+        let service = self.clone();
+        let host = host.to_owned();
+        Box::pin(async move { service.ping(&host, timeout_nanos).await })
+    }
+
+    fn tcp_connect(&self, host: &str, port: u16, timeout_nanos: u64) -> Self::TcpConnectFuture<'_> {
+        let service = self.clone();
+        let host = host.to_owned();
+        Box::pin(async move { service.tcp_connect(&host, port, timeout_nanos).await })
+    }
+
+    fn tcp_write_all(
+        &self,
+        stream: Self::TcpStream,
+        bytes: &[u8],
+        timeout_nanos: u64,
+    ) -> Self::TcpWriteFuture<'_> {
+        let service = self.clone();
+        let bytes = bytes.to_vec();
+        Box::pin(async move { service.tcp_write_all(stream, &bytes, timeout_nanos).await })
+    }
+
+    fn tcp_read(
+        &self,
+        stream: Self::TcpStream,
+        max_bytes: u32,
+        timeout_nanos: u64,
+    ) -> Self::TcpReadFuture<'_> {
+        let service = self.clone();
+        Box::pin(async move { service.tcp_read(stream, max_bytes, timeout_nanos).await })
+    }
+
+    fn tcp_close(&self, stream: Self::TcpStream) -> Self::TcpCloseFuture<'_> {
+        let service = self.clone();
+        Box::pin(async move { service.tcp_close(stream).await })
+    }
+}
+
 impl ExternalInterrupts {
     pub(crate) fn handle(&self) {
         while let Some(source) = self.plic.claim(self.context) {
@@ -863,7 +905,7 @@ impl ExternalInterrupts {
                 self.host_fs
                     .as_ref()
                     .expect("host-fs interrupt disappeared unexpectedly")
-                    .service
+                    .transport
                     .handle_interrupt();
                 self.plic.complete(self.context, source);
                 continue;

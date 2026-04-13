@@ -96,6 +96,7 @@ impl HostFsTransportService {
     }
 
     async fn raw_request(&self, bytes: Vec<u8>, response_len: usize) -> Result<Vec<u8>, IoError> {
+        tracing::info!("9p: enqueuing raw request ({} bytes)", bytes.len());
         let (completion, rx) = oneshot::channel();
         self.inner
             .requests
@@ -115,8 +116,10 @@ impl HostFsTransportService {
     }
 
     async fn run(&self) {
+        tracing::info!("9p transport runner started");
         loop {
             let request = self.next_request().await;
+            tracing::info!("9p transport: processing request");
             match request {
                 Request::Raw {
                     bytes,
@@ -124,6 +127,7 @@ impl HostFsTransportService {
                     completion,
                 } => {
                     let mut response = vec![0_u8; response_len];
+                    tracing::info!("9p transport: issuing device request ({} bytes)", bytes.len());
                     let result = self
                         .inner
                         .device
@@ -134,6 +138,7 @@ impl HostFsTransportService {
                             response.truncate(used);
                             Ok(response)
                         });
+                    tracing::info!("9p transport: device request completed, result={}", result.is_ok());
                     let _ = completion.send(result);
                 }
             }

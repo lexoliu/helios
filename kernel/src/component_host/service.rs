@@ -307,6 +307,7 @@ where
             request.args,
             request.rights,
             component,
+            &self.inner.engine,
             &self.inner.runtime,
         )
         .await
@@ -401,6 +402,7 @@ async fn run_program_component<CpuImpl, HostFs>(
     args: Vec<String>,
     _rights: WasiRights,
     compiled: Arc<crate::wasmtime_adapter::WasmtimeCompiledComponent>,
+    engine: &crate::wasmtime_adapter::WasmtimeEngine,
     runtime: &crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
 ) -> Result<ExecResult, ProgramExecError>
 where
@@ -434,9 +436,9 @@ where
         exec_context.write_serial,
     );
 
-    let engine = <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as ComponentRuntimeFactory<CpuImpl, HostRuntimeState<CpuImpl, HostFs>, HostFs>>::create_engine(runtime)
-        .map_err(map_program_runtime_error)?;
-    let executor = <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as ComponentRuntimeFactory<CpuImpl, HostRuntimeState<CpuImpl, HostFs>, HostFs>>::instantiate(runtime, &engine, &compiled, ComponentWorld::Program, context)
+    // Use the engine that compiled the component — Wasmtime requires
+    // component and store to share the same engine instance.
+    let executor = <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as ComponentRuntimeFactory<CpuImpl, HostRuntimeState<CpuImpl, HostFs>, HostFs>>::instantiate(runtime, engine, &compiled, ComponentWorld::Program, context)
         .map_err(map_program_runtime_error)?;
 
     let result = executor.run().await.map_err(map_program_runtime_error)?;

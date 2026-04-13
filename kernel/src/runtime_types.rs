@@ -458,43 +458,43 @@ impl HostFsError {
 }
 
 pub trait HostFileSystem: Clone + Send + 'static {
-    type StatFuture<'a>: Future<Output = Result<HostMetadata, HostFsError>> + 'a
+    type StatFuture<'a>: Future<Output = Result<HostMetadata, HostFsError>> + Send + 'a
     where
         Self: 'a;
 
-    type ReadDirFuture<'a>: Future<Output = Result<Vec<HostDirEntry>, HostFsError>> + 'a
+    type ReadDirFuture<'a>: Future<Output = Result<Vec<HostDirEntry>, HostFsError>> + Send + 'a
     where
         Self: 'a;
 
-    type ReadFileFuture<'a>: Future<Output = Result<Vec<u8>, HostFsError>> + 'a
+    type ReadFileFuture<'a>: Future<Output = Result<Vec<u8>, HostFsError>> + Send + 'a
     where
         Self: 'a;
 
-    type ReadFileRangeFuture<'a>: Future<Output = Result<Vec<u8>, HostFsError>> + 'a
+    type ReadFileRangeFuture<'a>: Future<Output = Result<Vec<u8>, HostFsError>> + Send + 'a
     where
         Self: 'a;
 
-    type WriteFileFuture<'a>: Future<Output = Result<(), HostFsError>> + 'a
+    type WriteFileFuture<'a>: Future<Output = Result<(), HostFsError>> + Send + 'a
     where
         Self: 'a;
 
-    type TruncateFileFuture<'a>: Future<Output = Result<(), HostFsError>> + 'a
+    type TruncateFileFuture<'a>: Future<Output = Result<(), HostFsError>> + Send + 'a
     where
         Self: 'a;
 
-    type CreateFileFuture<'a>: Future<Output = Result<(), HostFsError>> + 'a
+    type CreateFileFuture<'a>: Future<Output = Result<(), HostFsError>> + Send + 'a
     where
         Self: 'a;
 
-    type CreateDirectoryFuture<'a>: Future<Output = Result<(), HostFsError>> + 'a
+    type CreateDirectoryFuture<'a>: Future<Output = Result<(), HostFsError>> + Send + 'a
     where
         Self: 'a;
 
-    type RemoveFuture<'a>: Future<Output = Result<(), HostFsError>> + 'a
+    type RemoveFuture<'a>: Future<Output = Result<(), HostFsError>> + Send + 'a
     where
         Self: 'a;
 
-    type RenameFuture<'a>: Future<Output = Result<(), HostFsError>> + 'a
+    type RenameFuture<'a>: Future<Output = Result<(), HostFsError>> + Send + 'a
     where
         Self: 'a;
 
