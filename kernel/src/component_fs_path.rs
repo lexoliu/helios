@@ -10,10 +10,7 @@ pub enum ComponentFsPathError {
     NotPermitted,
 }
 
-pub fn resolve_child_path(
-    base: &str,
-    child: &str,
-) -> Result<String, ComponentFsPathError> {
+pub fn resolve_child_path(base: &str, child: &str) -> Result<String, ComponentFsPathError> {
     if child.starts_with('/') {
         return Err(ComponentFsPathError::NotPermitted);
     }

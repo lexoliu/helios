@@ -30,8 +30,8 @@ use crate::{
 use spin::Mutex;
 use thiserror::Error;
 
-use crate::component_bindings::debugger::bindings as debugger_bindings;
-use crate::component_bindings::program::bindings as program_bindings;
+use crate::wasmtime_adapter::bindings::debugger::bindings as debugger_bindings;
+use crate::wasmtime_adapter::bindings::program::bindings as program_bindings;
 use crate::{StatsSample, TraceEvent, TraceField, TraceFilter, TraceLevel, TraceValue};
 
 const SYNC_INSTANCE: &str = "helios:system/sync@0.1.0";
@@ -66,7 +66,7 @@ pub type HostRuntimeState<CpuImpl, HostFs> =
 pub type StoreData<CpuImpl, HostFs> = ComponentStoreData<
     CpuImpl,
     HostRuntimeState<CpuImpl, HostFs>,
-    crate::component_wasi::DebugFileSystem<HostRuntimeState<CpuImpl, HostFs>, HostFs>,
+    crate::wasmtime_adapter::wasi::DebugFileSystem<HostRuntimeState<CpuImpl, HostFs>, HostFs>,
 >;
 pub type DebugSerialOutputStream<CpuImpl, HostFs> =
     ComponentOutputStream<CpuImpl, HostRuntimeState<CpuImpl, HostFs>>;
@@ -257,8 +257,8 @@ where
         linker.define_unknown_imports_as_traps(component)?;
     }
     wasmtime_wasi_io::add_to_linker_async(&mut linker)?;
-    crate::component_wasi::p2::add_to_linker(&mut linker)?;
-    crate::component_wasi::add_to_linker(&mut linker)?;
+    crate::wasmtime_adapter::wasi::p2::add_to_linker(&mut linker)?;
+    crate::wasmtime_adapter::wasi::add_to_linker(&mut linker)?;
     add_serial_to_linker(&mut linker)?;
     add_sync_to_linker(&mut linker)?;
     match world {

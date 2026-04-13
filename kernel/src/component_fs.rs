@@ -1,9 +1,15 @@
-use wasmtime::component::ResourceTableError;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComponentFsNodeKind {
     Directory,
     File,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComponentResourceTableError {
+    NotPresent,
+    WrongType,
+    HasChildren,
+    Full,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -13,12 +19,12 @@ pub enum ComponentFsResourceError {
     Overflow,
 }
 
-pub fn map_resource_table_error(error: ResourceTableError) -> ComponentFsResourceError {
+pub fn map_resource_table_error(error: ComponentResourceTableError) -> ComponentFsResourceError {
     match error {
-        ResourceTableError::NotPresent | ResourceTableError::WrongType => {
+        ComponentResourceTableError::NotPresent | ComponentResourceTableError::WrongType => {
             ComponentFsResourceError::BadDescriptor
         }
-        ResourceTableError::HasChildren => ComponentFsResourceError::Busy,
-        ResourceTableError::Full => ComponentFsResourceError::Overflow,
+        ComponentResourceTableError::HasChildren => ComponentFsResourceError::Busy,
+        ComponentResourceTableError::Full => ComponentFsResourceError::Overflow,
     }
 }

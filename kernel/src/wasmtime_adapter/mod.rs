@@ -1,11 +1,16 @@
 //! Wasmtime-based implementation of the component runtime traits.
 //!
 //! This module is the **only** place in the kernel that should directly
-//! depend on `wasmtime::*` types outside of the legacy `component_host`
-//! internals. All other kernel code interacts with the runtime through
-//! the traits defined in [`crate::component_runtime_backend`].
+//! depend on `wasmtime::*` types. All other kernel code interacts with
+//! the runtime through the traits defined in
+//! [`crate::component_runtime_backend`].
 
 extern crate alloc;
+
+pub mod bindings;
+pub mod config;
+pub mod engine;
+pub mod wasi;
 
 use alloc::sync::Arc;
 
@@ -157,7 +162,7 @@ where
     type InstantiateError = wasmtime::Error;
 
     fn create_engine(&self) -> Result<Self::Engine, Self::CreateEngineError> {
-        let engine = crate::build_component_engine_for_platform(&self.platform)?;
+        let engine = engine::build_component_engine_for_platform(&self.platform)?;
         Ok(WasmtimeEngine { engine })
     }
 
@@ -176,7 +181,7 @@ where
         let linker = component_linker(&engine.engine, binding_set, Some(&compiled.component))?;
 
         let filesystem =
-            crate::component_wasi::DebugFileSystem::new(context.host_filesystem_state);
+            crate::wasmtime_adapter::wasi::DebugFileSystem::new(context.host_filesystem_state);
         let debug_port = if context.has_debug_port {
             Some(())
         } else {
@@ -204,7 +209,7 @@ where
             linker.instantiate_async(&mut store, &compiled.component),
         )?;
 
-        let run_func = crate::resolve_wasi_cli_run(&compiled.component, &instance, &mut store)?;
+        let run_func = engine::resolve_wasi_cli_run(&compiled.component, &instance, &mut store)?;
 
         Ok(WasmtimeExecutor { store, run_func })
     }

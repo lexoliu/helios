@@ -108,4 +108,4 @@ pub fn resolve_wasi_cli_run<T: 'static>(
         })
 }
 
-use crate::build_component_engine_config;
+use super::config::build_component_engine_config;

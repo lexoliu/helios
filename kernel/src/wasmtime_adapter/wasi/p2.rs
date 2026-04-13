@@ -15,9 +15,8 @@ use wasmtime_wasi_io::{self};
 
 use crate::component_host::OutputStreamKind;
 use crate::component_host::{DebugSerialOutputStream, RuntimeDeadlinePollable, StoreData};
-use crate::component_wasi;
-use crate::component_wasi::bindings::filesystem::types as p3fs;
-use crate::component_wasi::{FsDescriptor, FsNodeKind, P2Network, TcpSocket, UdpSocket};
+use super::bindings::filesystem::types as p3fs;
+use super::{FsDescriptor, FsNodeKind, P2Network, TcpSocket, UdpSocket};
 
 pub(crate) mod cli_bindings {
     mod generated {
@@ -47,8 +46,8 @@ pub(crate) mod cli_bindings {
                 "wasi:io/poll.pollable": wasmtime_wasi_io::poll::DynPollable,
                 "wasi:io/streams.input-stream": wasmtime_wasi_io::streams::DynInputStream,
                 "wasi:io/streams.output-stream": wasmtime_wasi_io::streams::DynOutputStream,
-                "wasi:cli/terminal-input.terminal-input": crate::component_wasi::p2::TerminalInput,
-                "wasi:cli/terminal-output.terminal-output": crate::component_wasi::p2::TerminalOutput,
+                "wasi:cli/terminal-input.terminal-input": crate::wasmtime_adapter::wasi::p2::TerminalInput,
+                "wasi:cli/terminal-output.terminal-output": crate::wasmtime_adapter::wasi::p2::TerminalOutput,
             },
             require_store_data_send: true,
         });
@@ -104,8 +103,8 @@ pub(crate) mod filesystem_bindings {
                 "wasi:io/poll.pollable": wasmtime_wasi_io::poll::DynPollable,
                 "wasi:io/streams.input-stream": wasmtime_wasi_io::streams::DynInputStream,
                 "wasi:io/streams.output-stream": wasmtime_wasi_io::streams::DynOutputStream,
-                "wasi:filesystem/types.descriptor": crate::component_wasi::FsDescriptor,
-                "wasi:filesystem/types.directory-entry-stream": crate::component_wasi::p2::DirectoryEntryStream,
+                "wasi:filesystem/types.descriptor": crate::wasmtime_adapter::wasi::FsDescriptor,
+                "wasi:filesystem/types.directory-entry-stream": crate::wasmtime_adapter::wasi::p2::DirectoryEntryStream,
             },
             require_store_data_send: true,
         });
@@ -162,9 +161,9 @@ pub(crate) mod sockets_bindings {
                 "wasi:io/poll.pollable": wasmtime_wasi_io::poll::DynPollable,
                 "wasi:io/streams.input-stream": wasmtime_wasi_io::streams::DynInputStream,
                 "wasi:io/streams.output-stream": wasmtime_wasi_io::streams::DynOutputStream,
-                "wasi:sockets/network.network": crate::component_wasi::P2Network,
-                "wasi:sockets/tcp.tcp-socket": crate::component_wasi::TcpSocket,
-                "wasi:sockets/udp.udp-socket": crate::component_wasi::UdpSocket,
+                "wasi:sockets/network.network": crate::wasmtime_adapter::wasi::P2Network,
+                "wasi:sockets/tcp.tcp-socket": crate::wasmtime_adapter::wasi::TcpSocket,
+                "wasi:sockets/udp.udp-socket": crate::wasmtime_adapter::wasi::UdpSocket,
             },
             require_store_data_send: true,
         });
@@ -1511,7 +1510,7 @@ where
         .table
         .get(resource)
         .cloned()
-        .map_err(component_wasi::fs_resource_error)
+        .map_err(super::fs_resource_error)
         .map_err(error_code_from_p3)
 }
 
@@ -1632,7 +1631,7 @@ fn directory_entry_from_p3(entry: p3fs::DirectoryEntry) -> p2fs::DirectoryEntry 
 }
 
 fn datetime_from_p3(
-    instant: crate::component_wasi::bindings::clocks::system_clock::Instant,
+    instant: crate::wasmtime_adapter::wasi::bindings::clocks::system_clock::Instant,
 ) -> p2fs::Datetime {
     p2fs::Datetime {
         seconds: instant

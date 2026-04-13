@@ -230,8 +230,8 @@ mod tests {
     use alloc::vec;
 
     use super::{
-        TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceValue, matches_trace_filter,
-        parse_console_text,
+        TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceValue,
+        matches_trace_filter, parse_console_text,
     };
 
     #[test]

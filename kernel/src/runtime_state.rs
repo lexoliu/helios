@@ -91,7 +91,10 @@ where
 
     pub fn install_program_service(&self, service: ProgramService) {
         let mut slot = self.inner.program_service.lock();
-        assert!(slot.is_none(), "program service was installed more than once");
+        assert!(
+            slot.is_none(),
+            "program service was installed more than once"
+        );
         *slot = Some(service);
         self.inner.program_service_ready.notify_all();
     }
@@ -112,7 +115,10 @@ where
 
     pub fn install_network_service(&self, service: NetworkService) {
         let mut slot = self.inner.network_service.lock();
-        assert!(slot.is_none(), "network service was installed more than once");
+        assert!(
+            slot.is_none(),
+            "network service was installed more than once"
+        );
         *slot = Some(service);
     }
 
@@ -122,7 +128,10 @@ where
 
     pub fn install_host_fs_service(&self, service: HostFsService) {
         let mut slot = self.inner.host_fs_service.lock();
-        assert!(slot.is_none(), "host-fs service was installed more than once");
+        assert!(
+            slot.is_none(),
+            "host-fs service was installed more than once"
+        );
         *slot = Some(service);
     }
 
@@ -147,8 +156,7 @@ where
     }
 }
 
-impl<ProgramService, NetworkService, HostFsService>
-    ComponentHostFilesystemState<HostFsService>
+impl<ProgramService, NetworkService, HostFsService> ComponentHostFilesystemState<HostFsService>
     for RuntimeState<ProgramService, NetworkService, HostFsService>
 where
     ProgramService: Clone + Send + 'static,

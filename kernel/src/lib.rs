@@ -8,9 +8,7 @@ extern crate std;
 mod block_on;
 mod bootfs;
 mod codegen_platform;
-pub mod component_bindings;
 mod component_cache;
-mod component_engine;
 mod component_fs;
 mod component_fs_path;
 mod component_host;
@@ -18,7 +16,6 @@ mod component_resources;
 mod component_runtime;
 mod component_runtime_backend;
 mod component_types;
-mod component_wasi;
 mod compute_pool;
 mod embedded_component;
 mod embedded_init;
@@ -40,8 +37,7 @@ mod unsupported_host_fs;
 mod time;
 mod timer;
 mod wasi_rights;
-mod wasmtime_adapter;
-mod wasmtime_config;
+pub(crate) mod wasmtime_adapter;
 
 pub use block_on::block_on;
 pub use codegen_platform::CodegenPlatform;
@@ -50,7 +46,7 @@ pub use bootfs::{
     EmbeddedBootFs,
 };
 pub use component_cache::ComponentCache;
-pub use component_engine::{
+pub use wasmtime_adapter::engine::{
     build_component_engine_for_platform, build_program_engine_for_platform, resolve_wasi_cli_run,
 };
 pub use component_fs::{
@@ -136,7 +132,7 @@ pub use timer::{Sleep, Timer};
 pub use wasmtime_adapter::{
     WasmtimeCompiledComponent, WasmtimeComponentRuntime, WasmtimeEngine, WasmtimeExecutor,
 };
-pub use wasmtime_config::{
+pub use wasmtime_adapter::config::{
     build_component_engine, build_component_engine_config, build_target_engine_config,
 };
 

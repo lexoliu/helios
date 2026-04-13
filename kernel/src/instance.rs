@@ -153,15 +153,11 @@ impl Default for InstanceRegistry {
     }
 }
 
-pub fn record_instance_call_hook(instance: &RegisteredInstance, hook: wasmtime::CallHook, now_nanos: u64) {
-    let transition = match hook {
-        wasmtime::CallHook::CallingWasm | wasmtime::CallHook::ReturningFromHost => {
-            InstanceExecutionTransition::Resume
-        }
-        wasmtime::CallHook::ReturningFromWasm | wasmtime::CallHook::CallingHost => {
-            InstanceExecutionTransition::Pause
-        }
-    };
+pub fn record_instance_transition(
+    instance: &RegisteredInstance,
+    transition: InstanceExecutionTransition,
+    now_nanos: u64,
+) {
     instance.transition(transition, now_nanos);
 }
 
@@ -274,7 +270,7 @@ mod tests {
     fn assigns_stable_ids() {
         let registry = InstanceRegistry::new();
         let first = registry.register("init", 10);
-        let second = registry.register("debugger", 20);
+        let second = registry.register("worker", 20);
 
         assert_eq!(first.id().raw(), 1);
         assert_eq!(second.id().raw(), 2);
@@ -283,7 +279,7 @@ mod tests {
     #[test]
     fn snapshot_reports_recent_cpu_and_memory() {
         let registry = InstanceRegistry::new();
-        let instance = registry.register("debugger", 100);
+        let instance = registry.register("worker", 100);
         instance.set_memory_bytes(4096);
 
         let first = registry.snapshot(200);
