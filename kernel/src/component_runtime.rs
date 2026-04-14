@@ -188,7 +188,10 @@ where
         ComponentOutput::from_store(self).write(stream, bytes);
     }
 
-    pub fn read_serial(&self, max_bytes: u32) -> Vec<u8> {
+    /// Drain whatever bytes are currently buffered on the serial input,
+    /// up to `max_bytes`. Never blocks; returns an empty `Vec` when the
+    /// port is idle so that callers can yield to the kernel executor.
+    pub fn try_read_serial(&self, max_bytes: u32) -> Vec<u8> {
         (self.serial_reader)(max_bytes)
     }
 

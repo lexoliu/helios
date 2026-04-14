@@ -676,7 +676,7 @@ fn serial_tx_ready() -> bool {
 }
 
 fn read_debug_serial(max_bytes: u32) -> alloc::vec::Vec<u8> {
-    helios_kernel::read_serial(&DebugSerial, max_bytes)
+    helios_kernel::try_read_serial(&DebugSerial, max_bytes)
 }
 
 pub(crate) fn write_debug_serial_bytes(bytes: &[u8]) {

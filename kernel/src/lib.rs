@@ -116,7 +116,8 @@ pub use runtime_types::{
     PingErrorKind, PingReply, TcpError, TcpErrorKind, TcpStreamToken,
 };
 pub use serial_transport::{
-    emit_serial_error_marker, emit_serial_stage_marker, read_serial, write_serial,
+    emit_serial_error_marker, emit_serial_stage_marker, read_serial, try_read_serial,
+    write_serial,
 };
 pub use sync::{
     Mutex, MutexGuard, Notified, Notify, OwnedRawMutexLease, OwnedRawRwLockReadLease,

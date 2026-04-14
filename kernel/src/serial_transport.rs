@@ -4,6 +4,24 @@ use alloc::vec::Vec;
 
 use helios_hal::serial::ByteSerial;
 
+/// Try a non-blocking read — returns whatever bytes are immediately
+/// available up to `max_bytes`. Returns an empty `Vec` when no byte is
+/// ready. Callers that need to wait for a byte should loop with
+/// `yield_now().await` between polls rather than spinning on the port.
+pub fn try_read_serial(io: &impl ByteSerial, max_bytes: u32) -> Vec<u8> {
+    let max_bytes = max_bytes as usize;
+    let mut bytes = Vec::with_capacity(max_bytes);
+    while bytes.len() < max_bytes {
+        let Some(byte) = io.try_read_byte() else {
+            break;
+        };
+        bytes.push(byte);
+    }
+    bytes
+}
+
+/// Synchronous blocking read used only during bootstrap (before the
+/// kernel executor is active). Spins on the port until a byte is available.
 pub fn read_serial(io: &impl ByteSerial, max_bytes: u32) -> Vec<u8> {
     let max_bytes = max_bytes as usize;
     let mut bytes = Vec::with_capacity(max_bytes);

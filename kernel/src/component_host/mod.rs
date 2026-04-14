@@ -1209,8 +1209,18 @@ where
     ) -> wasmtime::Result<Vec<u8>> {
         accessor.with(|mut access| {
             let _ = access.get().table.get(&resource)?;
-            Ok::<_, wasmtime::Error>(access.get().read_serial(max_bytes))
-        })
+            Ok::<_, wasmtime::Error>(())
+        })?;
+        // Poll the non-blocking serial reader and yield to the kernel
+        // executor between polls so host-fs transport and other tasks keep
+        // making progress while we wait for input.
+        loop {
+            let bytes = accessor.with(|mut access| access.get().try_read_serial(max_bytes));
+            if !bytes.is_empty() {
+                return Ok(bytes);
+            }
+            crate::yield_now().await;
+        }
     }
 
     async fn write<T: 'static + Send>(
