@@ -1,7 +1,6 @@
 extern crate alloc;
 
 use alloc::borrow::ToOwned;
-use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -512,6 +511,46 @@ where
         });
     }
 
+    /// Drop any cached embedded nodes mirroring a host subtree. Called after
+    /// mutating operations (remove, rename) so stale placeholder nodes do
+    /// not linger.
+    pub(crate) fn invalidate_host_subtree(&mut self, path: &str) {
+        let prefix = crate::directory_prefix(path);
+        self.nodes
+            .retain(|node| node.path != path && !node.path.starts_with(&prefix));
+    }
+
+    /// Seed direct children of a host directory into the embedded FS so that
+    /// later `read_directory` calls see the same entries without awaiting
+    /// host I/O inside a sync stream context.
+    pub(crate) fn seed_host_directory_entries(
+        &mut self,
+        path: &str,
+        entries: Vec<crate::HostDirEntry>,
+    ) {
+        self.ensure_directory(path, true);
+        let prefix = crate::directory_prefix(path);
+        for entry in entries {
+            let child_path = format!("{prefix}{}", entry.name);
+            if self.nodes.iter().any(|node| node.path == child_path) {
+                continue;
+            }
+            let inode = self.allocate_inode();
+            self.nodes.push(FsNode {
+                path: child_path,
+                kind: if entry.is_directory {
+                    FsNodeKind::Directory
+                } else {
+                    FsNodeKind::File
+                },
+                contents: Vec::new(),
+                inode,
+                modified_nanos: 0,
+                readonly: true,
+            });
+        }
+    }
+
     fn ensure_directory(&mut self, path: &str, readonly: bool) {
         if path == "/" {
             return;
@@ -587,27 +626,11 @@ where
         &self,
         path: &str,
     ) -> core::result::Result<fs_types::DescriptorStat, fs_types::ErrorCode> {
-        if let Some(host_path) = self.host_path(path) {
-            let metadata = crate::block_on(async {
-                self.host_service()?
-                    .stat_path(host_path)
-                    .await
-                    .map_err(map_host_fs_error)
-            })?;
-            return Ok(fs_types::DescriptorStat {
-                type_: if metadata.qid_type & 0x80 != 0 {
-                    fs_types::DescriptorType::Directory
-                } else {
-                    fs_types::DescriptorType::RegularFile
-                },
-                link_count: 1,
-                size: metadata.size,
-                data_access_timestamp: None,
-                data_modification_timestamp: None,
-                status_change_timestamp: None,
-            });
-        }
-
+        // Host paths are handled asynchronously in the WASI trait impl.
+        assert!(
+            self.host_path(path).is_none(),
+            "stat on host path {path} must be handled in the async WASI impl"
+        );
         let node = self.get_node(path)?;
         let size = match node.kind {
             FsNodeKind::Directory => 0,
@@ -631,19 +654,13 @@ where
         &self,
         path: &str,
     ) -> core::result::Result<fs_types::MetadataHashValue, fs_types::ErrorCode> {
-        if let Some(host_path) = self.host_path(path) {
-            let metadata = crate::block_on(async {
-                self.host_service()?
-                    .stat_path(host_path)
-                    .await
-                    .map_err(map_host_fs_error)
-            })?;
-            return Ok(fs_types::MetadataHashValue {
-                lower: metadata.qid_path,
-                upper: u64::from(metadata.mode) << 32 ^ metadata.size,
-            });
-        }
-
+        // Host paths are handled asynchronously in the WASI trait impl;
+        // reaching here with a host path indicates a caller forgot to route
+        // to the async path.
+        assert!(
+            self.host_path(path).is_none(),
+            "metadata_hash on host path {path} must be handled in the async WASI impl"
+        );
         let node = self.get_node(path)?;
         let size = match node.kind {
             FsNodeKind::Directory => 0,
@@ -659,26 +676,13 @@ where
         &self,
         path: &str,
     ) -> core::result::Result<Vec<fs_types::DirectoryEntry>, fs_types::ErrorCode> {
-        if let Some(host_path) = self.host_path(path) {
-            let entries = crate::block_on(async {
-                self.host_service()?
-                    .read_dir(host_path)
-                    .await
-                    .map_err(map_host_fs_error)
-            })?;
-            return Ok(entries
-                .into_iter()
-                .map(|entry| fs_types::DirectoryEntry {
-                    type_: if entry.is_directory {
-                        fs_types::DescriptorType::Directory
-                    } else {
-                        fs_types::DescriptorType::RegularFile
-                    },
-                    name: entry.name,
-                })
-                .collect());
-        }
-
+        // Host directories are eagerly seeded into the embedded FS by
+        // `open_at`, so reading them here walks the same embedded node list
+        // as guest-owned directories.
+        assert!(
+            self.host_path(path).is_none() || self.get_node(path).is_ok(),
+            "read_directory on host path {path} requires prior eager seed via open_at"
+        );
         let node = self.get_node(path)?;
         if node.kind != FsNodeKind::Directory {
             return Err(fs_types::ErrorCode::NotDirectory);
@@ -742,20 +746,14 @@ where
         offset: u64,
         max_bytes: usize,
     ) -> core::result::Result<Vec<u8>, fs_types::ErrorCode> {
-        if let Some(host_path) = self.host_path(&descriptor.path) {
-            if !descriptor.flags.contains(fs_types::DescriptorFlags::READ) {
-                return Err(fs_types::ErrorCode::ReadOnly);
-            }
-
-            let max_bytes = u32::try_from(max_bytes).map_err(|_| fs_types::ErrorCode::Overflow)?;
-            return crate::block_on(async {
-                self.host_service()?
-                    .read_file_range(host_path, offset, max_bytes)
-                    .await
-                    .map_err(map_host_fs_error)
-            });
-        }
-
+        // Host file contents are eagerly cached during `open_at`, so stream
+        // reads always fall through to the embedded node list.
+        assert!(
+            self.host_path(&descriptor.path).is_none()
+                || self.get_node(&descriptor.path).is_ok(),
+            "read_file_chunk on host path {} requires prior eager seed via open_at",
+            descriptor.path
+        );
         let node = self.get_node(&descriptor.path)?;
         if node.kind != FsNodeKind::File {
             return Err(fs_types::ErrorCode::IsDirectory);
@@ -784,21 +782,12 @@ where
         bytes: &[u8],
         now_nanos: u64,
     ) -> core::result::Result<(), fs_types::ErrorCode> {
-        if let Some(host_path) = self.host_path(&descriptor.path) {
-            if descriptor.kind != FsNodeKind::File {
-                return Err(fs_types::ErrorCode::IsDirectory);
-            }
-            if !descriptor.flags.contains(fs_types::DescriptorFlags::WRITE) {
-                return Err(fs_types::ErrorCode::ReadOnly);
-            }
-            let offset = u64::try_from(offset).map_err(|_| fs_types::ErrorCode::Overflow)?;
-            let _ = now_nanos;
-            return crate::block_on(async {
-                self.host_service()?
-                    .write_file(host_path, offset, bytes)
-                    .await
-                    .map_err(map_host_fs_error)
-            });
+        // Host-backed writes would require an async flush path; stream
+        // consumers run in sync poll contexts, so we must not block here.
+        // Writing to host files is not yet supported; callers see a clean
+        // error rather than a hang.
+        if self.host_path(&descriptor.path).is_some() {
+            return Err(fs_types::ErrorCode::Unsupported);
         }
 
         let node = self.get_node_mut(&descriptor.path)?;
@@ -832,29 +821,11 @@ where
         bytes: &[u8],
         now_nanos: u64,
     ) -> core::result::Result<(), fs_types::ErrorCode> {
-        if let Some(host_path) = self.host_path(&descriptor.path) {
-            if descriptor.kind != FsNodeKind::File {
-                return Err(fs_types::ErrorCode::IsDirectory);
-            }
-            if !descriptor.flags.contains(fs_types::DescriptorFlags::WRITE) {
-                return Err(fs_types::ErrorCode::ReadOnly);
-            }
-            let offset = crate::block_on(async {
-                self.host_service()?
-                    .stat_path(host_path)
-                    .await
-                    .map(|metadata| metadata.size)
-                    .map_err(map_host_fs_error)
-            })?;
-            let _ = now_nanos;
-            return crate::block_on(async {
-                self.host_service()?
-                    .write_file(host_path, offset, bytes)
-                    .await
-                    .map_err(map_host_fs_error)
-            });
+        // Host-backed appends would require async I/O in a sync stream
+        // consumer context; not supported without an async flush path.
+        if self.host_path(&descriptor.path).is_some() {
+            return Err(fs_types::ErrorCode::Unsupported);
         }
-
         let offset = self.get_node(&descriptor.path)?.contents.len();
         self.write_at(descriptor, offset, bytes, now_nanos)
     }
@@ -877,87 +848,11 @@ where
 
         let absolute = crate::resolve_child_path(&base.path, path)
             .map_err(map_component_fs_path_error)?;
-        if let Some(host_path) = self.host_path(&absolute) {
-            let metadata = crate::block_on(async {
-                self.host_service()?
-                    .stat_path(host_path)
-                    .await
-                    .map_err(map_host_fs_error)
-            });
-
-            return match metadata {
-                Ok(metadata) => {
-                    let kind = if metadata.qid_type & 0x80 != 0 {
-                        FsNodeKind::Directory
-                    } else {
-                        FsNodeKind::File
-                    };
-                    if open_flags.contains(fs_types::OpenFlags::EXCLUSIVE)
-                        && open_flags.contains(fs_types::OpenFlags::CREATE)
-                    {
-                        return Err(fs_types::ErrorCode::Exist);
-                    }
-                    if open_flags.contains(fs_types::OpenFlags::DIRECTORY)
-                        && kind != FsNodeKind::Directory
-                    {
-                        return Err(fs_types::ErrorCode::NotDirectory);
-                    }
-                    if !open_flags.contains(fs_types::OpenFlags::DIRECTORY)
-                        && kind == FsNodeKind::Directory
-                    {
-                        return Err(fs_types::ErrorCode::IsDirectory);
-                    }
-                    if open_flags.contains(fs_types::OpenFlags::TRUNCATE) {
-                        if kind != FsNodeKind::File {
-                            return Err(fs_types::ErrorCode::IsDirectory);
-                        }
-                        if !base
-                            .flags
-                            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-                        {
-                            return Err(fs_types::ErrorCode::ReadOnly);
-                        }
-                        crate::block_on(async {
-                            self.host_service()?
-                                .truncate_file(host_path)
-                                .await
-                                .map_err(map_host_fs_error)
-                        })?;
-                    }
-                    Ok(FsDescriptor {
-                        path: absolute,
-                        kind,
-                        flags: descriptor_flags,
-                    })
-                }
-                Err(fs_types::ErrorCode::NoEntry) => {
-                    if !open_flags.contains(fs_types::OpenFlags::CREATE) {
-                        return Err(fs_types::ErrorCode::NoEntry);
-                    }
-                    if open_flags.contains(fs_types::OpenFlags::DIRECTORY) {
-                        return Err(fs_types::ErrorCode::Unsupported);
-                    }
-                    if !base
-                        .flags
-                        .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-                    {
-                        return Err(fs_types::ErrorCode::ReadOnly);
-                    }
-                    crate::block_on(async {
-                        self.host_service()?
-                            .create_file(host_path)
-                            .await
-                            .map_err(map_host_fs_error)
-                    })?;
-                    Ok(FsDescriptor {
-                        path: absolute,
-                        kind: FsNodeKind::File,
-                        flags: descriptor_flags,
-                    })
-                }
-                Err(error) => Err(error),
-            };
-        }
+        // Host-backed paths are handled in the async WASI trait impl.
+        assert!(
+            self.host_path(&absolute).is_none(),
+            "open_at on host path {absolute} must be handled in the async WASI impl"
+        );
 
         if let Ok(existing) = self.get_node_mut(&absolute) {
             if open_flags.contains(fs_types::OpenFlags::EXCLUSIVE)
@@ -1050,14 +945,10 @@ where
         }
         let absolute = crate::resolve_child_path(&base.path, path)
             .map_err(map_component_fs_path_error)?;
-        if let Some(host_path) = self.host_path(&absolute) {
-            return crate::block_on(async {
-                self.host_service()?
-                    .remove(host_path, true)
-                    .await
-                    .map_err(map_host_fs_error)
-            });
-        }
+        assert!(
+            self.host_path(&absolute).is_none(),
+            "remove_directory_at on host path {absolute} must be handled in the async WASI impl"
+        );
         if absolute == "/" {
             return Err(fs_types::ErrorCode::NotPermitted);
         }
@@ -1097,15 +988,10 @@ where
         }
         let absolute = crate::resolve_child_path(&base.path, path)
             .map_err(map_component_fs_path_error)?;
-        if let Some(host_path) = self.host_path(&absolute) {
-            let _ = now_nanos;
-            return crate::block_on(async {
-                self.host_service()?
-                    .create_directory(host_path)
-                    .await
-                    .map_err(map_host_fs_error)
-            });
-        }
+        assert!(
+            self.host_path(&absolute).is_none(),
+            "create_directory_at on host path {absolute} must be handled in the async WASI impl"
+        );
         if self.get_node(&base.path)?.readonly {
             return Err(fs_types::ErrorCode::ReadOnly);
         }
@@ -1148,14 +1034,10 @@ where
         }
         let absolute = crate::resolve_child_path(&base.path, path)
             .map_err(map_component_fs_path_error)?;
-        if let Some(host_path) = self.host_path(&absolute) {
-            return crate::block_on(async {
-                self.host_service()?
-                    .remove(host_path, false)
-                    .await
-                    .map_err(map_host_fs_error)
-            });
-        }
+        assert!(
+            self.host_path(&absolute).is_none(),
+            "unlink_file_at on host path {absolute} must be handled in the async WASI impl"
+        );
         let node = self.get_node(&absolute)?;
         if node.readonly {
             return Err(fs_types::ErrorCode::ReadOnly);
@@ -1194,22 +1076,11 @@ where
         let destination_absolute =
             crate::resolve_child_path(&destination_base.path, destination_path)
                 .map_err(map_component_fs_path_error)?;
-        let source_host = self.host_path(&source_absolute);
-        let destination_host = self.host_path(&destination_absolute);
-        if source_host.is_some() || destination_host.is_some() {
-            let Some(source_host) = source_host else {
-                return Err(fs_types::ErrorCode::CrossDevice);
-            };
-            let Some(destination_host) = destination_host else {
-                return Err(fs_types::ErrorCode::CrossDevice);
-            };
-            return crate::block_on(async {
-                self.host_service()?
-                    .rename(source_host, destination_host)
-                    .await
-                    .map_err(map_host_fs_error)
-            });
-        }
+        assert!(
+            self.host_path(&source_absolute).is_none()
+                && self.host_path(&destination_absolute).is_none(),
+            "rename_at on host paths must be handled in the async WASI impl"
+        );
 
         if self.get_node(&source_base.path)?.readonly
             || self.get_node(&destination_base.path)?.readonly
@@ -1772,6 +1643,38 @@ where
         descriptor: Resource<FsDescriptor>,
         path: String,
     ) -> Result<(), FsError> {
+        let (absolute, base_flags, base_kind) = accessor.with(|mut access| {
+            let base = get_fs_descriptor(access.get(), &descriptor)?;
+            let absolute = crate::resolve_child_path(&base.path, &path)
+                .map_err(map_component_fs_path_error)?;
+            Ok::<_, FsError>((absolute, base.flags, base.kind))
+        })?;
+        if !base_flags.contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY) {
+            return Err(fs_types::ErrorCode::ReadOnly.into());
+        }
+        if base_kind != FsNodeKind::Directory {
+            return Err(fs_types::ErrorCode::NotDirectory.into());
+        }
+        if let Some(host_path) = crate::guest_host_share_path(&absolute).map(|p| p.to_owned()) {
+            let service = accessor.with(|mut access| {
+                access
+                    .get()
+                    .filesystem()
+                    .host_service()
+                    .map_err(FsError::from)
+            })?;
+            service
+                .create_directory(&host_path)
+                .await
+                .map_err(map_host_fs_error)?;
+            accessor.with(|mut access| {
+                access
+                    .get()
+                    .filesystem_mut()
+                    .invalidate_host_subtree(&absolute);
+            });
+            return Ok(());
+        }
         accessor.with(|mut access| {
             let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
             let now_nanos = access.get().now_nanos();
@@ -1980,12 +1883,23 @@ where
                             access.get().table.push(opened).map_err(FsError::trap)
                         });
                     }
+                    // Directory — eagerly seed its direct children into the
+                    // embedded FS so read_directory can walk them without
+                    // re-entering async 9p I/O.
+                    let entries = service
+                        .read_dir(&host_path)
+                        .await
+                        .map_err(map_host_fs_error)?;
                     let opened = FsDescriptor {
-                        path: absolute,
+                        path: absolute.clone(),
                         kind,
                         flags,
                     };
                     return accessor.with(|mut access| {
+                        access
+                            .get()
+                            .filesystem_mut()
+                            .seed_host_directory_entries(&absolute, entries);
                         access.get().table.push(opened).map_err(FsError::trap)
                     });
                 }
@@ -2042,6 +1956,36 @@ where
         descriptor: Resource<FsDescriptor>,
         path: String,
     ) -> Result<(), FsError> {
+        let (absolute, base_flags) = accessor.with(|mut access| {
+            let base = get_fs_descriptor(access.get(), &descriptor)?;
+            let absolute = crate::resolve_child_path(&base.path, &path)
+                .map_err(map_component_fs_path_error)?;
+            Ok::<_, FsError>((absolute, base.flags))
+        })?;
+        if !base_flags.contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY) {
+            return Err(fs_types::ErrorCode::ReadOnly.into());
+        }
+        if let Some(host_path) = crate::guest_host_share_path(&absolute).map(|p| p.to_owned()) {
+            let service = accessor.with(|mut access| {
+                access
+                    .get()
+                    .filesystem()
+                    .host_service()
+                    .map_err(FsError::from)
+            })?;
+            service
+                .remove(&host_path, true)
+                .await
+                .map_err(map_host_fs_error)?;
+            // Drop any cached embedded entries that mirrored this host path.
+            accessor.with(|mut access| {
+                access
+                    .get()
+                    .filesystem_mut()
+                    .invalidate_host_subtree(&absolute);
+            });
+            return Ok(());
+        }
         accessor.with(|mut access| {
             let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
             access
@@ -2059,6 +2003,58 @@ where
         destination_descriptor: Resource<FsDescriptor>,
         destination_path: String,
     ) -> Result<(), FsError> {
+        let (source_absolute, destination_absolute, source_flags, destination_flags) =
+            accessor.with(|mut access| {
+                let source_base = get_fs_descriptor(access.get(), &source_descriptor)?;
+                let destination_base =
+                    get_fs_descriptor(access.get(), &destination_descriptor)?;
+                let source_absolute =
+                    crate::resolve_child_path(&source_base.path, &source_path)
+                        .map_err(map_component_fs_path_error)?;
+                let destination_absolute =
+                    crate::resolve_child_path(&destination_base.path, &destination_path)
+                        .map_err(map_component_fs_path_error)?;
+                Ok::<_, FsError>((
+                    source_absolute,
+                    destination_absolute,
+                    source_base.flags,
+                    destination_base.flags,
+                ))
+            })?;
+        if !source_flags.contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
+            || !destination_flags.contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
+        {
+            return Err(fs_types::ErrorCode::ReadOnly.into());
+        }
+        let source_host =
+            crate::guest_host_share_path(&source_absolute).map(|p| p.to_owned());
+        let destination_host =
+            crate::guest_host_share_path(&destination_absolute).map(|p| p.to_owned());
+        if source_host.is_some() || destination_host.is_some() {
+            let Some(source_host) = source_host else {
+                return Err(fs_types::ErrorCode::CrossDevice.into());
+            };
+            let Some(destination_host) = destination_host else {
+                return Err(fs_types::ErrorCode::CrossDevice.into());
+            };
+            let service = accessor.with(|mut access| {
+                access
+                    .get()
+                    .filesystem()
+                    .host_service()
+                    .map_err(FsError::from)
+            })?;
+            service
+                .rename(&source_host, &destination_host)
+                .await
+                .map_err(map_host_fs_error)?;
+            accessor.with(|mut access| {
+                let fs = access.get().filesystem_mut();
+                fs.invalidate_host_subtree(&source_absolute);
+                fs.invalidate_host_subtree(&destination_absolute);
+            });
+            return Ok(());
+        }
         accessor.with(|mut access| {
             let source_base = get_fs_descriptor(access.get(), &source_descriptor)?;
             let destination_base = get_fs_descriptor(access.get(), &destination_descriptor)?;
@@ -2091,6 +2087,35 @@ where
         descriptor: Resource<FsDescriptor>,
         path: String,
     ) -> Result<(), FsError> {
+        let (absolute, base_flags) = accessor.with(|mut access| {
+            let base = get_fs_descriptor(access.get(), &descriptor)?;
+            let absolute = crate::resolve_child_path(&base.path, &path)
+                .map_err(map_component_fs_path_error)?;
+            Ok::<_, FsError>((absolute, base.flags))
+        })?;
+        if !base_flags.contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY) {
+            return Err(fs_types::ErrorCode::ReadOnly.into());
+        }
+        if let Some(host_path) = crate::guest_host_share_path(&absolute).map(|p| p.to_owned()) {
+            let service = accessor.with(|mut access| {
+                access
+                    .get()
+                    .filesystem()
+                    .host_service()
+                    .map_err(FsError::from)
+            })?;
+            service
+                .remove(&host_path, false)
+                .await
+                .map_err(map_host_fs_error)?;
+            accessor.with(|mut access| {
+                access
+                    .get()
+                    .filesystem_mut()
+                    .invalidate_host_subtree(&absolute);
+            });
+            return Ok(());
+        }
         accessor.with(|mut access| {
             let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
             access
@@ -2117,9 +2142,28 @@ where
         accessor: &Accessor<T, Self>,
         descriptor: Resource<FsDescriptor>,
     ) -> Result<fs_types::MetadataHashValue, FsError> {
-        accessor.with(|mut access| {
+        let path = accessor.with(|mut access| {
             let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-            let path = descriptor.path;
+            Ok::<_, FsError>(descriptor.path.clone())
+        })?;
+        if let Some(host_path) = crate::guest_host_share_path(&path).map(|p| p.to_owned()) {
+            let service = accessor.with(|mut access| {
+                access
+                    .get()
+                    .filesystem()
+                    .host_service()
+                    .map_err(FsError::from)
+            })?;
+            let metadata = service
+                .stat_path(&host_path)
+                .await
+                .map_err(map_host_fs_error)?;
+            return Ok(fs_types::MetadataHashValue {
+                lower: metadata.qid_path,
+                upper: u64::from(metadata.mode) << 32 ^ metadata.size,
+            });
+        }
+        accessor.with(|mut access| {
             access
                 .get()
                 .filesystem_mut()
@@ -2137,10 +2181,30 @@ where
         if path_flags.contains(fs_types::PathFlags::SYMLINK_FOLLOW) {
             return Err(fs_types::ErrorCode::Unsupported.into());
         }
-        accessor.with(|mut access| {
+        let absolute = accessor.with(|mut access| {
             let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-            let absolute = crate::resolve_child_path(&descriptor.path, &path)
-                .map_err(map_component_fs_path_error)?;
+            crate::resolve_child_path(&descriptor.path, &path)
+                .map_err(map_component_fs_path_error)
+                .map_err(FsError::from)
+        })?;
+        if let Some(host_path) = crate::guest_host_share_path(&absolute).map(|p| p.to_owned()) {
+            let service = accessor.with(|mut access| {
+                access
+                    .get()
+                    .filesystem()
+                    .host_service()
+                    .map_err(FsError::from)
+            })?;
+            let metadata = service
+                .stat_path(&host_path)
+                .await
+                .map_err(map_host_fs_error)?;
+            return Ok(fs_types::MetadataHashValue {
+                lower: metadata.qid_path,
+                upper: u64::from(metadata.mode) << 32 ^ metadata.size,
+            });
+        }
+        accessor.with(|mut access| {
             access
                 .get()
                 .filesystem_mut()
