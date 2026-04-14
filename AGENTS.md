@@ -63,7 +63,42 @@ crates.
   `println!`.
 - Never use `#[path = "…"]` to pull source files across crate boundaries.
 
-## 4. Inspector surface
+## 4. Async-first execution
+
+The kernel runs a cooperative async executor; anything that pins it blocks
+every other task, including the 9p host-fs transport, WASI futures, and
+timers. The rules below apply to every crate that is either `#![no_std]` or
+driven by the cooperative executor (hal, kernel, riscv, x86, hosted runtime
+paths, components).
+
+- **Do not call `block_on` in production code.** The only legitimate uses
+  are (a) tests, (b) bootstrap entry points that run *before* the kernel
+  executor starts (e.g. `run_system_component`), and (c) the `block_on`
+  definition itself. If you feel you need `block_on` elsewhere, make the
+  caller async instead.
+- **Never make an async operation look synchronous.** If an operation
+  reaches a trait that implements it with `.await`, the public entry point
+  must also be `async` (or return an `impl Future`). Do not hide an async
+  call behind a sync shim by `block_on`-ing internally.
+- **Never busy-wait on external state inside an async context.**
+  `core::hint::spin_loop()` is only acceptable for sub-microsecond hardware
+  synchronisation (UART TX FIFO drain, virtio descriptor completion,
+  critical-section contention). For anything that waits on software state
+  (I/O readiness, channel message, transport response), use `Notify`,
+  oneshot channels, or `yield_now().await`.
+- **Non-blocking adapters for blocking APIs.** Serial readers, channel
+  receivers, and similar interfaces expose a non-blocking "try" variant
+  (`try_read_serial`, `try_recv`, etc.) so async callers can yield between
+  polls. Blocking variants exist only for bootstrap paths.
+- **No `Arc<Mutex<T>>` hidden behind async APIs.** Prefer channels, kernel
+  `Notify`, or single-owner `RefCell` within a task. When a lock is
+  unavoidable, use the kernel's async `Mutex`/`RwLock` from
+  `kernel/src/sync.rs` and release the guard before `.await` points.
+- **Yielding, not spinning, is the currency.** Any loop that polls for
+  progress must `yield_now().await` on the non-ready path, giving the
+  executor a chance to drive the task that produces the progress.
+
+## 5. Inspector surface
 
 - Inspector commands are exactly `shell`, `stats`, `tracing`, `repl`, and
   `vm`. Do not re-introduce `qemu-shell` or any legacy `dash` CLI entry.
@@ -74,7 +109,7 @@ crates.
 - Inspector ↔ guest communication must go through WIT RPC defined in
   `helios-inspector-protocol`, not through ad-hoc side channels.
 
-## 5. WASI tooling
+## 6. WASI tooling
 
 - `tools/wasi-apps/python` and `tools/wasi-apps/curl` are the source of truth
   for shared-fs WASI tooling. `tools/wasi-apps/build.sh` owns their build
@@ -82,7 +117,7 @@ crates.
 - `docs/wasi-tools.md` documents the reproducible workflow. If runtime
   behaviour changes, update docs and paths atomically in the same change.
 
-## 6. Required checks before finishing a task
+## 7. Required checks before finishing a task
 
 Run these locally before declaring a change complete:
 
