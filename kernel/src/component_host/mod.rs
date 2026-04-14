@@ -217,9 +217,16 @@ where
         write_serial,
     );
 
-    let executor = runtime
-        .instantiate(&engine, &compiled, component_world, context)
-        .map_err(DebuggerError::InstantiateComponent)?;
+    // System components are launched from the bootstrap thread (before or
+    // during kernel startup), so `block_on` here does not contend with the
+    // cooperative executor.
+    let executor = crate::block_on(runtime.instantiate(
+        &engine,
+        &compiled,
+        component_world,
+        context,
+    ))
+    .map_err(DebuggerError::InstantiateComponent)?;
     emit_stage_marker(write_serial, "instantiate:ok");
 
     tracing::info!(component = component_name, "entering wasi:cli/run");

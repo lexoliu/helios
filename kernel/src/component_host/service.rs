@@ -439,6 +439,7 @@ where
     // Use the engine that compiled the component — Wasmtime requires
     // component and store to share the same engine instance.
     let executor = <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as ComponentRuntimeFactory<CpuImpl, HostRuntimeState<CpuImpl, HostFs>, HostFs>>::instantiate(runtime, engine, &compiled, ComponentWorld::Program, context)
+        .await
         .map_err(map_program_runtime_error)?;
 
     let result = executor.run().await.map_err(map_program_runtime_error)?;

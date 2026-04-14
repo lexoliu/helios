@@ -167,7 +167,7 @@ where
         Ok(WasmtimeEngine { engine })
     }
 
-    fn instantiate(
+    async fn instantiate(
         &self,
         engine: &Self::Engine,
         compiled: &WasmtimeCompiledComponent,
@@ -206,9 +206,9 @@ where
             ),
         );
 
-        let instance = crate::block_on(
-            linker.instantiate_async(&mut store, &compiled.component),
-        )?;
+        let instance = linker
+            .instantiate_async(&mut store, &compiled.component)
+            .await?;
 
         let run_func = engine::resolve_wasi_cli_run(&compiled.component, &instance, &mut store)?;
 

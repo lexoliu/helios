@@ -145,12 +145,14 @@ where
     fn create_engine(&self) -> Result<Self::Engine, Self::CreateEngineError>;
 
     /// Instantiate a compiled component with the given world and execution
-    /// context, producing an executor ready to be driven.
+    /// context, producing an executor ready to be driven. Instantiation is
+    /// async because backends typically resolve imports and run component
+    /// start functions that may await WASI host calls.
     fn instantiate(
         &self,
         engine: &Self::Engine,
         compiled: &<Self::Engine as ComponentRuntimeEngine>::Compiled,
         world: ComponentWorld,
         context: ComponentExecContext<CpuImpl, RuntimeStateImpl, HostFs>,
-    ) -> Result<Self::Executor, Self::InstantiateError>;
+    ) -> impl Future<Output = Result<Self::Executor, Self::InstantiateError>> + Send;
 }
