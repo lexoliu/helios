@@ -23,7 +23,7 @@ use crate::{
     ComponentStoreData, ComputePool, ComputePriority, DeadlinePollable, EmbeddedComponent,
     ExecResult, ProgramExecError, ProgramExecErrorKind, RawMutex, RawMutexGuardResource,
     RawMutexResource, RawRwLock, RawRwLockReadGuardResource, RawRwLockResource,
-    RawRwLockWriteGuardResource, SerialPortResource, byte_channel, elapsed_millis,
+    RawRwLockWriteGuardResource, SerialPortResource, elapsed_millis,
     emit_serial_stage_marker, heap_stats, monotonic_nanos,
 };
 use spin::Mutex;
@@ -159,6 +159,7 @@ macro_rules! impl_program_bindings {
                 }
             }
 
+            #[allow(unused_mut)]
             fn stdin<T>(
                 mut access: Access<'_, T, Self>,
                 child: wasmtime::component::Resource<ChildHandle>,
