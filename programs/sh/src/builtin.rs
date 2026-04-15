@@ -1,6 +1,7 @@
 //! Shell builtins. Each builtin is a single async fn; `dispatch`
-//! returns `Some(status)` when `name` matches a builtin and `None`
-//! otherwise.
+//! returns `Some((status, stdout_bytes))` when `name` matches a builtin
+//! and `None` otherwise. Builtins never write to the real stdout — that
+//! is the executor's job once it has applied the command's redirects.
 
 use std::io::{self, Write as _};
 
@@ -9,75 +10,78 @@ use helios_api::fs as helios_fs;
 
 use crate::exec::{CommandStatus, Context};
 
+pub struct BuiltinOutput {
+    pub status: CommandStatus,
+    pub stdout: Vec<u8>,
+}
+
 pub async fn dispatch(
     ctx: &mut Context,
     name: &str,
     args: &[String],
-) -> Result<Option<CommandStatus>> {
-    match name {
-        "true" => Ok(Some(CommandStatus::SUCCESS)),
-        "false" => Ok(Some(CommandStatus::new(1))),
-        "echo" => {
-            echo(args)?;
-            Ok(Some(CommandStatus::SUCCESS))
+) -> Result<Option<BuiltinOutput>> {
+    Ok(Some(match name {
+        "true" => BuiltinOutput::status_only(CommandStatus::SUCCESS),
+        "false" => BuiltinOutput::status_only(CommandStatus::new(1)),
+        "echo" => echo(args),
+        "cat" => cat(args).await?,
+        "pwd" => BuiltinOutput::with_stdout(CommandStatus::SUCCESS, b"/\n".to_vec()),
+        "cd" => BuiltinOutput::status_only(cd(args)?),
+        "test" | "[" => BuiltinOutput::status_only(run_test(name, args).await?),
+        "export" => BuiltinOutput::status_only(export(ctx, args)),
+        "unset" => BuiltinOutput::status_only(unset(ctx, args)),
+        "exit" => BuiltinOutput::status_only(exit(args)?),
+        ":" => BuiltinOutput::status_only(CommandStatus::SUCCESS),
+        _ => return Ok(None),
+    }))
+}
+
+impl BuiltinOutput {
+    fn status_only(status: CommandStatus) -> Self {
+        Self {
+            status,
+            stdout: Vec::new(),
         }
-        "pwd" => {
-            writeln!(io::stdout(), "/")?;
-            Ok(Some(CommandStatus::SUCCESS))
-        }
-        "cd" => Ok(Some(cd(args)?)),
-        "test" | "[" => Ok(Some(run_test(name, args).await?)),
-        "export" => Ok(Some(export(ctx, args))),
-        "unset" => Ok(Some(unset(ctx, args))),
-        "exit" => Ok(Some(exit(args)?)),
-        "exec" => {
-            // `exec <prog>` without redirections in POSIX replaces the
-            // current process. For our shell we treat it as "run the
-            // program, then exit with its status" which is the nearest
-            // sensible behaviour.
-            if args.is_empty() {
-                return Ok(Some(CommandStatus::SUCCESS));
-            }
-            // Fall through so the executor launches the program
-            // externally; mark as "not a builtin" to reuse the normal
-            // launch path.
-            let _ = ctx;
-            Ok(None)
-        }
-        ":" => Ok(Some(CommandStatus::SUCCESS)),
-        _ => Ok(None),
+    }
+
+    fn with_stdout(status: CommandStatus, stdout: Vec<u8>) -> Self {
+        Self { status, stdout }
     }
 }
 
-fn echo(args: &[String]) -> Result<()> {
-    let mut stdout = io::stdout().lock();
-    let mut newline = true;
-    let mut iter = args.iter().peekable();
-    // Parse -n flag.
-    while let Some(arg) = iter.peek() {
-        if arg.as_str() == "-n" {
-            newline = false;
-            iter.next();
-        } else {
-            break;
-        }
+async fn cat(args: &[String]) -> Result<BuiltinOutput> {
+    let mut buf = Vec::new();
+    for arg in args {
+        let bytes = helios_fs::read(arg)
+            .await
+            .map_err(|e| anyhow::anyhow!("cat: {arg}: {e:#}"))?;
+        buf.extend_from_slice(&bytes);
     }
-    let rest: Vec<&String> = iter.collect();
-    for (i, arg) in rest.iter().enumerate() {
+    Ok(BuiltinOutput::with_stdout(CommandStatus::SUCCESS, buf))
+}
+
+fn echo(args: &[String]) -> BuiltinOutput {
+    let mut newline = true;
+    let mut start = 0;
+    // Parse `-n` flags at the front.
+    while start < args.len() && args[start] == "-n" {
+        newline = false;
+        start += 1;
+    }
+    let mut buf = Vec::with_capacity(args.iter().skip(start).map(|s| s.len() + 1).sum());
+    for (i, arg) in args[start..].iter().enumerate() {
         if i > 0 {
-            stdout.write_all(b" ")?;
+            buf.push(b' ');
         }
-        stdout.write_all(arg.as_bytes())?;
+        buf.extend_from_slice(arg.as_bytes());
     }
     if newline {
-        stdout.write_all(b"\n")?;
+        buf.push(b'\n');
     }
-    Ok(())
+    BuiltinOutput::with_stdout(CommandStatus::SUCCESS, buf)
 }
 
 fn cd(args: &[String]) -> Result<CommandStatus> {
-    // We have a single-directory filesystem in the guest; make `cd /`
-    // succeed and anything else fail with a warning.
     match args.first().map(String::as_str) {
         None | Some("/") => Ok(CommandStatus::SUCCESS),
         Some(path) => {
@@ -91,7 +95,6 @@ fn cd(args: &[String]) -> Result<CommandStatus> {
 }
 
 async fn run_test(name: &str, raw_args: &[String]) -> Result<CommandStatus> {
-    // Trim the trailing `]` if invoked as `[`.
     let args: &[String] = if name == "[" {
         match raw_args.last() {
             Some(last) if last == "]" => &raw_args[..raw_args.len() - 1],

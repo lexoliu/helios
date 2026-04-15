@@ -168,8 +168,8 @@ async fn run_pipeline(ctx: &mut Context, pipeline: &Pipeline) -> Result<CommandS
     }
     // Single-command pipeline: trivial dispatch.
     if pipeline.seq.len() == 1 {
-        let status = run_command(ctx, &pipeline.seq[0], InputSource::Empty, OutputTarget::Inherit)
-            .await?;
+        let mut output = OutputTarget::Inherit;
+        let status = run_command(ctx, &pipeline.seq[0], InputSource::Empty, &mut output).await?;
         return Ok(if pipeline.bang {
             CommandStatus::new(if status.is_success() { 1 } else { 0 })
         } else {
@@ -177,8 +177,8 @@ async fn run_pipeline(ctx: &mut Context, pipeline: &Pipeline) -> Result<CommandS
         });
     }
     // Real pipe stages: feed stage N-1's captured stdout into stage N's
-    // stdin buffer. Middle stages capture to buffer; final stage inherits
-    // the shell's own stdout.
+    // stdin buffer. Middle stages capture to a fresh buffer; final stage
+    // inherits the shell's own stdout.
     let mut carry: Vec<u8> = Vec::new();
     let last_idx = pipeline.seq.len() - 1;
     let mut final_status = CommandStatus::SUCCESS;
@@ -188,15 +188,14 @@ async fn run_pipeline(ctx: &mut Context, pipeline: &Pipeline) -> Result<CommandS
         } else {
             InputSource::Bytes(std::mem::take(&mut carry))
         };
-        let mut output = if idx == last_idx {
+        let output = if idx == last_idx {
             OutputTarget::Inherit
         } else {
             OutputTarget::Buffer(Vec::new())
         };
-        final_status = run_command(ctx, command, input, output_target_ref_mut(&mut output)).await?;
-        if let OutputTarget::Buffer(bytes) = output {
-            carry = bytes;
-        }
+        let (status, produced) = run_command_capture(ctx, command, input, output).await?;
+        final_status = status;
+        carry = produced;
     }
     Ok(if pipeline.bang {
         CommandStatus::new(if final_status.is_success() { 1 } else { 0 })
@@ -205,22 +204,25 @@ async fn run_pipeline(ctx: &mut Context, pipeline: &Pipeline) -> Result<CommandS
     })
 }
 
-fn output_target_ref_mut(dst: &mut OutputTarget) -> OutputTarget {
-    match dst {
-        OutputTarget::Inherit => OutputTarget::Inherit,
-        OutputTarget::File { path, append } => OutputTarget::File {
-            path: path.clone(),
-            append: *append,
-        },
-        OutputTarget::Buffer(_) => OutputTarget::Buffer(Vec::new()),
-    }
+async fn run_command_capture(
+    ctx: &mut Context,
+    command: &Command,
+    input: InputSource,
+    mut output: OutputTarget,
+) -> Result<(CommandStatus, Vec<u8>)> {
+    let status = run_command(ctx, command, input, &mut output).await?;
+    let bytes = match output {
+        OutputTarget::Buffer(bytes) => bytes,
+        _ => Vec::new(),
+    };
+    Ok((status, bytes))
 }
 
 async fn run_command(
     ctx: &mut Context,
     command: &Command,
     input: InputSource,
-    output: OutputTarget,
+    output: &mut OutputTarget,
 ) -> Result<CommandStatus> {
     match command {
         Command::Simple(simple) => run_simple(ctx, simple, input, output).await,
@@ -236,7 +238,7 @@ async fn run_simple(
     ctx: &mut Context,
     command: &SimpleCommand,
     input: InputSource,
-    mut output: OutputTarget,
+    output: &mut OutputTarget,
 ) -> Result<CommandStatus> {
     let mut assignments = Vec::new();
     let mut args = Vec::new();
@@ -286,7 +288,7 @@ async fn run_simple(
 
     let mut effective_input = input;
     for redir in redirects {
-        apply_redirect(redir, ctx, &mut effective_input, &mut output)?;
+        apply_redirect(redir, ctx, &mut effective_input, output)?;
     }
 
     // No command name — this is a "pure assignment" statement. Commit
@@ -312,8 +314,9 @@ async fn run_simple(
     }
 
     if let Some(result) = builtin::dispatch(ctx, &program, &arguments).await? {
-        commit_output(&output, &[])?;
-        return Ok(result);
+        commit_output(output, &result.stdout).await?;
+        ctx.last_status = result.status.code();
+        return Ok(result.status);
     }
 
     launch_external(
@@ -373,7 +376,7 @@ async fn launch_external(
     args: Vec<String>,
     assignments: Vec<(String, String)>,
     input: InputSource,
-    output: OutputTarget,
+    output: &mut OutputTarget,
 ) -> Result<CommandStatus> {
     let resolved = resolve_program(program).await?;
     let name = infer_program_name(Path::new(&resolved.path))?;
@@ -384,7 +387,7 @@ async fn launch_external(
         env: assignments,
         wasm: resolved.wasm,
     };
-    let mut child = programs::spawn(request)
+    let child = programs::spawn(request)
         .await
         .map_err(|error| anyhow!("spawn failed: {:?}: {}", error.kind, error.detail))?;
 
@@ -404,7 +407,7 @@ async fn launch_external(
         .await
         .map_err(|error| anyhow!("child.wait failed: {:?}: {}", error.kind, error.detail))?;
 
-    commit_output(&output, &stdout_bytes)?;
+    commit_output(output, &stdout_bytes).await?;
     if !stderr_bytes.is_empty() {
         io::stderr().write_all(&stderr_bytes)?;
     }
@@ -424,26 +427,29 @@ async fn resolve_stdin(input: InputSource) -> Result<Vec<u8>> {
     }
 }
 
-fn commit_output(output: &OutputTarget, bytes: &[u8]) -> Result<()> {
+async fn commit_output(output: &mut OutputTarget, bytes: &[u8]) -> Result<()> {
     match output {
         OutputTarget::Inherit => {
             io::stdout().write_all(bytes)?;
             Ok(())
         }
-        OutputTarget::Buffer(_) => Ok(()), // handled by pipeline driver
-        OutputTarget::File { path, append } => {
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create(true);
-            if *append {
-                options.append(true);
-            } else {
-                options.truncate(true);
-            }
-            let mut file = options
-                .open(path)
-                .with_context(|| format!("failed to open redirect target {path}"))?;
-            file.write_all(bytes)?;
+        OutputTarget::Buffer(buffer) => {
+            buffer.extend_from_slice(bytes);
             Ok(())
+        }
+        OutputTarget::File { path, append } => {
+            if *append {
+                let existing = helios_fs::read(path.as_str()).await.unwrap_or_default();
+                let mut buf = existing;
+                buf.extend_from_slice(bytes);
+                helios_fs::write(path.as_str(), buf)
+                    .await
+                    .map_err(|e| anyhow!("failed to write redirect target {path}: {e:#}"))
+            } else {
+                helios_fs::write(path.as_str(), bytes.to_vec())
+                    .await
+                    .map_err(|e| anyhow!("failed to write redirect target {path}: {e:#}"))
+            }
         }
     }
 }
