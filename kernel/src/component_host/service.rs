@@ -79,7 +79,7 @@ pub struct ChildHandle {
     stdin: Option<crate::ByteWriter>,
     stdout: Option<crate::ByteReader>,
     stderr: Option<crate::ByteReader>,
-    exit: futures::channel::oneshot::Receiver<Result<ChildExit, ProgramExecError>>,
+    exit: Option<futures::channel::oneshot::Receiver<Result<ChildExit, ProgramExecError>>>,
 }
 
 impl ChildHandle {
@@ -99,13 +99,28 @@ impl ChildHandle {
         self.stderr.take()
     }
 
-    /// Await child exit.
-    pub async fn wait(self) -> Result<ChildExit, ProgramExecError> {
-        match self.exit.await {
-            Ok(result) => result,
-            Err(_) => Err(ProgramExecError {
+    /// Take the exit-status receiver so an external driver (e.g. the WIT
+    /// host `wait` impl that runs while the child resource is borrowed)
+    /// can await it without consuming the handle.
+    pub fn take_wait(
+        &mut self,
+    ) -> Option<futures::channel::oneshot::Receiver<Result<ChildExit, ProgramExecError>>> {
+        self.exit.take()
+    }
+
+    /// Await child exit. Consumes the handle.
+    pub async fn wait(mut self) -> Result<ChildExit, ProgramExecError> {
+        match self.exit.take() {
+            Some(rx) => match rx.await {
+                Ok(result) => result,
+                Err(_) => Err(ProgramExecError {
+                    kind: ProgramExecErrorKind::Internal,
+                    detail: "child exit channel dropped before signalling completion".into(),
+                }),
+            },
+            None => Err(ProgramExecError {
                 kind: ProgramExecErrorKind::Internal,
-                detail: "child exit channel dropped before signalling completion".into(),
+                detail: "child exit was already consumed".into(),
             }),
         }
     }
@@ -383,7 +398,7 @@ where
             stdin: Some(stdin_writer),
             stdout: Some(stdout_reader),
             stderr: Some(stderr_reader),
-            exit: exit_rx,
+            exit: Some(exit_rx),
         };
         Ok(child)
     }

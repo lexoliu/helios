@@ -125,21 +125,37 @@ macro_rules! impl_program_bindings {
                     $bindings::helios::system::programs::SpawnError,
                 >,
             > {
-                let handle = accessor.with(|mut access| {
-                    access
+                // Per WIT, `wait` borrows the child; we must not remove
+                // it from the table here — the guest's `Drop` impl does
+                // that separately once it releases the handle.
+                let wait_future = accessor.with(|mut access| {
+                    let handle = access
                         .get()
                         .table
-                        .delete(child)
-                        .map_err(wasmtime::Error::from)
+                        .get_mut(&child)
+                        .map_err(wasmtime::Error::from)?;
+                    Ok::<_, wasmtime::Error>(handle.take_wait())
                 })?;
-                match handle.wait().await {
-                    Ok(exit) => Ok(Ok(
-                        $bindings::helios::system::programs::ExitStatus {
-                            instance_id: exit.instance_id.raw(),
-                            code: exit.exit_code,
-                        },
-                    )),
-                    Err(error) => Ok(Err($convert_error(error))),
+                let Some(wait_future) = wait_future else {
+                    return Ok(Err($bindings::helios::system::programs::SpawnError {
+                        kind: $bindings::helios::system::programs::SpawnErrorKind::Internal,
+                        detail: "wait was already consumed for this child".to_owned(),
+                    }));
+                };
+                match wait_future.await {
+                    Ok(result) => match result {
+                        Ok(exit) => Ok(Ok(
+                            $bindings::helios::system::programs::ExitStatus {
+                                instance_id: exit.instance_id.raw(),
+                                code: exit.exit_code,
+                            },
+                        )),
+                        Err(error) => Ok(Err($convert_error(error))),
+                    },
+                    Err(_) => Ok(Err($bindings::helios::system::programs::SpawnError {
+                        kind: $bindings::helios::system::programs::SpawnErrorKind::Internal,
+                        detail: "child exit channel dropped before signalling completion".to_owned(),
+                    })),
                 }
             }
 
