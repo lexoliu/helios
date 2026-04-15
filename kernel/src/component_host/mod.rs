@@ -143,100 +143,86 @@ macro_rules! impl_program_bindings {
                 }
             }
 
-            async fn stdin<T: Send>(
-                accessor: &Accessor<T, Self>,
+            fn stdin<T>(
+                mut access: Access<'_, T, Self>,
                 child: wasmtime::component::Resource<ChildHandle>,
                 mut data: StreamReader<u8>,
             ) -> wasmtime::Result<FutureReader<core::result::Result<(), ()>>> {
                 use futures::channel::oneshot;
-                let writer = accessor.with(|mut access| {
-                    let handle = access
-                        .get()
-                        .table
-                        .get_mut(&child)
-                        .map_err(wasmtime::Error::from)?;
-                    Ok::<_, wasmtime::Error>(handle.take_stdin())
-                })?;
+                let handle = access
+                    .get()
+                    .table
+                    .get_mut(&child)
+                    .map_err(wasmtime::Error::from)?;
+                let writer = handle.take_stdin();
                 let Some(writer) = writer else {
-                    return accessor.with(|mut access| {
-                        FutureReader::new(&mut access, async move {
-                            Ok::<_, wasmtime::Error>(Ok::<(), ()>(()))
-                        })
+                    return FutureReader::new(&mut access, async move {
+                        Ok::<_, wasmtime::Error>(Ok::<(), ()>(()))
                     });
                 };
                 let (tx, rx) = oneshot::channel();
-                accessor.with(|mut access| {
-                    data.pipe(
+                data.pipe(
+                    &mut access,
+                    crate::wasmtime_adapter::wasi::ChannelStreamConsumer::new(writer, tx),
+                )?;
+                FutureReader::new(&mut access, async move {
+                    match rx.await {
+                        Ok(result) => Ok::<_, wasmtime::Error>(result),
+                        Err(_) => Ok::<_, wasmtime::Error>(Ok::<(), ()>(())),
+                    }
+                })
+            }
+
+            fn stdout<T>(
+                mut access: Access<'_, T, Self>,
+                child: wasmtime::component::Resource<ChildHandle>,
+            ) -> wasmtime::Result<(
+                StreamReader<u8>,
+                FutureReader<core::result::Result<(), ()>>,
+            )> {
+                let handle = access
+                    .get()
+                    .table
+                    .get_mut(&child)
+                    .map_err(wasmtime::Error::from)?;
+                let reader = handle.take_stdout();
+                let stream = match reader {
+                    Some(reader) => StreamReader::new(
                         &mut access,
-                        crate::wasmtime_adapter::wasi::ChannelStreamConsumer::new(writer, tx),
-                    )?;
-                    FutureReader::new(&mut access, async move {
-                        match rx.await {
-                            Ok(result) => Ok::<_, wasmtime::Error>(result),
-                            Err(_) => Ok::<_, wasmtime::Error>(Ok::<(), ()>(())),
-                        }
-                    })
-                })
+                        crate::wasmtime_adapter::wasi::ChannelStreamProducer::new(reader),
+                    )?,
+                    None => StreamReader::new(&mut access, Vec::<u8>::new())?,
+                };
+                let future = FutureReader::new(&mut access, async {
+                    Ok::<_, wasmtime::Error>(Ok::<(), ()>(()))
+                })?;
+                Ok((stream, future))
             }
 
-            async fn stdout<T: Send>(
-                accessor: &Accessor<T, Self>,
+            fn stderr<T>(
+                mut access: Access<'_, T, Self>,
                 child: wasmtime::component::Resource<ChildHandle>,
             ) -> wasmtime::Result<(
                 StreamReader<u8>,
                 FutureReader<core::result::Result<(), ()>>,
             )> {
-                let reader = accessor.with(|mut access| {
-                    let handle = access
-                        .get()
-                        .table
-                        .get_mut(&child)
-                        .map_err(wasmtime::Error::from)?;
-                    Ok::<_, wasmtime::Error>(handle.take_stdout())
+                let handle = access
+                    .get()
+                    .table
+                    .get_mut(&child)
+                    .map_err(wasmtime::Error::from)?;
+                let reader = handle.take_stderr();
+                let stream = match reader {
+                    Some(reader) => StreamReader::new(
+                        &mut access,
+                        crate::wasmtime_adapter::wasi::ChannelStreamProducer::new(reader),
+                    )?,
+                    None => StreamReader::new(&mut access, Vec::<u8>::new())?,
+                };
+                let future = FutureReader::new(&mut access, async {
+                    Ok::<_, wasmtime::Error>(Ok::<(), ()>(()))
                 })?;
-                accessor.with(|mut access| {
-                    let stream = match reader {
-                        Some(reader) => StreamReader::new(
-                            &mut access,
-                            crate::wasmtime_adapter::wasi::ChannelStreamProducer::new(reader),
-                        )?,
-                        None => StreamReader::new(&mut access, Vec::<u8>::new())?,
-                    };
-                    let future = FutureReader::new(&mut access, async {
-                        Ok::<_, wasmtime::Error>(Ok::<(), ()>(()))
-                    })?;
-                    Ok((stream, future))
-                })
-            }
-
-            async fn stderr<T: Send>(
-                accessor: &Accessor<T, Self>,
-                child: wasmtime::component::Resource<ChildHandle>,
-            ) -> wasmtime::Result<(
-                StreamReader<u8>,
-                FutureReader<core::result::Result<(), ()>>,
-            )> {
-                let reader = accessor.with(|mut access| {
-                    let handle = access
-                        .get()
-                        .table
-                        .get_mut(&child)
-                        .map_err(wasmtime::Error::from)?;
-                    Ok::<_, wasmtime::Error>(handle.take_stderr())
-                })?;
-                accessor.with(|mut access| {
-                    let stream = match reader {
-                        Some(reader) => StreamReader::new(
-                            &mut access,
-                            crate::wasmtime_adapter::wasi::ChannelStreamProducer::new(reader),
-                        )?,
-                        None => StreamReader::new(&mut access, Vec::<u8>::new())?,
-                    };
-                    let future = FutureReader::new(&mut access, async {
-                        Ok::<_, wasmtime::Error>(Ok::<(), ()>(()))
-                    })?;
-                    Ok((stream, future))
-                })
+                Ok((stream, future))
             }
         }
 

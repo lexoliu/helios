@@ -5,7 +5,12 @@ pub mod debugger {
         wasmtime::component::bindgen!({
             path: "../wit",
             world: "debugger",
-            imports: { default: async | store | trappable },
+            imports: {
+                "helios:system/programs.[method]child.stdin": store | trappable,
+                "helios:system/programs.[method]child.stdout": store | trappable,
+                "helios:system/programs.[method]child.stderr": store | trappable,
+                default: async | store | trappable
+            },
             exports: { default: async },
             with: {
                 "helios:system/net.tcp-stream": crate::ComponentTcpStream,
@@ -29,7 +34,12 @@ pub mod program {
         wasmtime::component::bindgen!({
             path: "../wit",
             world: "init",
-            imports: { default: async | store | trappable },
+            imports: {
+                "helios:system/programs.[method]child.stdin": store | trappable,
+                "helios:system/programs.[method]child.stdout": store | trappable,
+                "helios:system/programs.[method]child.stderr": store | trappable,
+                default: async | store | trappable
+            },
             exports: { default: async },
             with: {
                 "helios:system/net.tcp-stream": crate::ComponentTcpStream,
