@@ -10,8 +10,8 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use wasmtime::component::{
-    Accessor, Component, Destination, HasSelf, Linker, Resource, ResourceType, StreamProducer,
-    StreamReader, StreamResult,
+    Access, Accessor, Component, Destination, FutureReader, HasSelf, Linker, Resource,
+    ResourceType, StreamProducer, StreamReader, StreamResult,
 };
 use wasmtime::{self, Engine, Store, StoreContextMut};
 use wasmtime_wasi_io::{self};
@@ -19,12 +19,11 @@ use helios_hal::cpu::Cpu;
 use crate::WasiRights;
 use helios_hal::serial::ByteSerial;
 use crate::{
-    ComponentCache, ComponentNetworkService, ComponentOutputMode, ComponentOutputStream,
-    ComponentOutputStreamKind, ComponentStoreData, ComputePool, ComputePriority, DeadlinePollable,
-    EmbeddedComponent, ExecResult, ProgramExecError,
-    ProgramExecErrorKind, RawMutex, RawMutexGuardResource, RawMutexResource, RawRwLock,
-    RawRwLockReadGuardResource, RawRwLockResource, RawRwLockWriteGuardResource,
-    SerialPortResource, elapsed_millis,
+    ComponentCache, ComponentNetworkService, ComponentOutputMode, ComponentOutputStreamKind,
+    ComponentStoreData, ComputePool, ComputePriority, DeadlinePollable, EmbeddedComponent,
+    ExecResult, ProgramExecError, ProgramExecErrorKind, RawMutex, RawMutexGuardResource,
+    RawMutexResource, RawRwLock, RawRwLockReadGuardResource, RawRwLockResource,
+    RawRwLockWriteGuardResource, SerialPortResource, byte_channel, elapsed_millis,
     emit_serial_stage_marker, heap_stats, monotonic_nanos,
 };
 use spin::Mutex;
@@ -46,7 +45,7 @@ pub mod service;
 mod topology;
 
 pub use service::{
-    ComponentRunMode, ProgramServiceConfig, UserProgramService,
+    ChildExit, ChildHandle, ComponentRunMode, ProgramServiceConfig, UserProgramService,
     install_component_host_program_service, install_program_service,
     install_program_service_with_config, run_component_host_processor_forever,
     run_embedded_component_forever, run_embedded_component_in_mode_forever,
@@ -68,8 +67,6 @@ pub type StoreData<CpuImpl, HostFs> = ComponentStoreData<
     HostRuntimeState<CpuImpl, HostFs>,
     crate::wasmtime_adapter::wasi::DebugFileSystem<HostRuntimeState<CpuImpl, HostFs>, HostFs>,
 >;
-pub type DebugSerialOutputStream<CpuImpl, HostFs> =
-    ComponentOutputStream<CpuImpl, HostRuntimeState<CpuImpl, HostFs>>;
 pub type OutputMode = ComponentOutputMode;
 pub type OutputStreamKind = ComponentOutputStreamKind;
 pub type RuntimeDeadlinePollable<CpuImpl, HostFs> =
@@ -95,21 +92,162 @@ macro_rules! impl_program_bindings {
             HostFs: crate::HostFileSystem,
         {}
 
+        impl<CpuImpl, HostFs> $bindings::helios::system::programs::HostChild
+            for StoreData<CpuImpl, HostFs>
+        where
+            CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+            HostFs: crate::HostFileSystem,
+        {}
+
+        impl<CpuImpl, HostFs> $bindings::helios::system::programs::HostChildWithStore
+            for HasSelf<StoreData<CpuImpl, HostFs>>
+        where
+            CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+            HostFs: crate::HostFileSystem,
+        {
+            async fn drop<T>(
+                accessor: &Accessor<T, Self>,
+                child: wasmtime::component::Resource<ChildHandle>,
+            ) -> wasmtime::Result<()> {
+                accessor.with(|mut access| {
+                    let _ = access.get().table.delete(child)?;
+                    Ok::<_, wasmtime::Error>(())
+                })?;
+                Ok(())
+            }
+
+            async fn wait<T: Send>(
+                accessor: &Accessor<T, Self>,
+                child: wasmtime::component::Resource<ChildHandle>,
+            ) -> wasmtime::Result<
+                Result<
+                    $bindings::helios::system::programs::ExitStatus,
+                    $bindings::helios::system::programs::SpawnError,
+                >,
+            > {
+                let handle = accessor.with(|mut access| {
+                    access
+                        .get()
+                        .table
+                        .delete(child)
+                        .map_err(wasmtime::Error::from)
+                })?;
+                match handle.wait().await {
+                    Ok(exit) => Ok(Ok(
+                        $bindings::helios::system::programs::ExitStatus {
+                            instance_id: exit.instance_id.raw(),
+                            code: exit.exit_code,
+                        },
+                    )),
+                    Err(error) => Ok(Err($convert_error(error))),
+                }
+            }
+
+            async fn stdin<T: Send>(
+                _accessor: &Accessor<T, Self>,
+                _child: wasmtime::component::Resource<ChildHandle>,
+                _data: wasmtime::component::StreamReader<u8>,
+            ) -> wasmtime::Result<
+                wasmtime::component::FutureReader<core::result::Result<(), ()>>,
+            > {
+                Err(wasmtime::Error::msg(
+                    "child.stdin is not implemented yet",
+                ))
+            }
+
+            async fn stdout<T: Send>(
+                _accessor: &Accessor<T, Self>,
+                _child: wasmtime::component::Resource<ChildHandle>,
+            ) -> wasmtime::Result<(
+                wasmtime::component::StreamReader<u8>,
+                wasmtime::component::FutureReader<core::result::Result<(), ()>>,
+            )> {
+                Err(wasmtime::Error::msg(
+                    "child.stdout is not implemented yet",
+                ))
+            }
+
+            async fn stderr<T: Send>(
+                _accessor: &Accessor<T, Self>,
+                _child: wasmtime::component::Resource<ChildHandle>,
+            ) -> wasmtime::Result<(
+                wasmtime::component::StreamReader<u8>,
+                wasmtime::component::FutureReader<core::result::Result<(), ()>>,
+            )> {
+                Err(wasmtime::Error::msg(
+                    "child.stderr is not implemented yet",
+                ))
+            }
+        }
+
         impl<CpuImpl, HostFs> $bindings::helios::system::programs::HostWithStore
             for HasSelf<StoreData<CpuImpl, HostFs>>
         where
             CpuImpl: Cpu + crate::CodegenPlatform + Clone,
             HostFs: crate::HostFileSystem,
         {
+            fn spawn<T: Send>(
+                accessor: &Accessor<T, Self>,
+                request: $bindings::helios::system::programs::SpawnRequest,
+            ) -> impl core::future::Future<
+                Output = wasmtime::Result<
+                    Result<
+                        wasmtime::component::Resource<ChildHandle>,
+                        $bindings::helios::system::programs::SpawnError,
+                    >,
+                >,
+            > + Send {
+                let snapshot = accessor.with(|mut access| {
+                    Ok::<_, wasmtime::Error>((
+                        access.get().runtime_state.program_service(),
+                        crate::component_host::service::ProgramExecContext::from_store(
+                            access.get(),
+                        ),
+                    ))
+                });
+                async move {
+                    let (service, context) = snapshot?;
+                    let Some(service) = service else {
+                        return Ok(Err($bindings::helios::system::programs::SpawnError {
+                            kind: $bindings::helios::system::programs::SpawnErrorKind::Unavailable,
+                            detail: "program spawn is unavailable on this machine".to_owned(),
+                        }));
+                    };
+                    match service
+                        .spawn(
+                            context,
+                            request.name,
+                            request.args,
+                            request.env,
+                            request.wasm,
+                            WasiRights::empty(),
+                        )
+                        .await
+                    {
+                        Ok(child) => {
+                            let handle = accessor.with(|mut access| {
+                                access
+                                    .get()
+                                    .table
+                                    .push(child)
+                                    .map_err(wasmtime::Error::from)
+                            })?;
+                            Ok(Ok(handle))
+                        }
+                        Err(error) => Ok(Err($convert_error(error))),
+                    }
+                }
+            }
+
             fn exec<T: Send>(
                 accessor: &Accessor<T, Self>,
                 request: $bindings::helios::system::programs::ExecRequest,
             ) -> impl core::future::Future<
                 Output = wasmtime::Result<
-                Result<
-                    $bindings::helios::system::programs::ExecResult,
-                    $bindings::helios::system::programs::ExecError,
-                >,
+                    Result<
+                        $bindings::helios::system::programs::ExecResult,
+                        $bindings::helios::system::programs::ExecError,
+                    >,
                 >,
             > + Send {
                 let snapshot = accessor.with(|mut access| {
@@ -129,11 +267,13 @@ macro_rules! impl_program_bindings {
                         }));
                     };
                     Ok(service
-                        .exec(
+                        .exec_buffered(
                             context,
                             request.name,
                             request.args,
+                            request.env,
                             &request.wasm,
+                            request.stdin,
                             WasiRights::empty(),
                         )
                         .await
@@ -1215,7 +1355,7 @@ where
         // executor between polls so host-fs transport and other tasks keep
         // making progress while we wait for input.
         loop {
-            let bytes = accessor.with(|mut access| access.get().try_read_serial(max_bytes));
+            let bytes = accessor.with(|mut access| access.get().try_read_serial_port(max_bytes));
             if !bytes.is_empty() {
                 return Ok(bytes);
             }

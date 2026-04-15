@@ -1,16 +1,48 @@
 package helios:system@0.1.0;
 
+/// Spawn user wasm programs.
+///
+/// Two entry points are exposed:
+///
+/// * `spawn` returns a `child` resource that gives the parent direct
+///   access to the child's `wasi:cli/stdin/stdout/stderr` as byte
+///   streams. This is the low-level API used by the guest shell to
+///   implement pipes, redirection, and background jobs.
+///
+/// * `exec` is a higher-level convenience that spawns a program, blocks
+///   until it completes, and hands the parent the child's stdout and
+///   stderr as buffered byte arrays. It has no stdin input. It is meant
+///   for the RPC path where a remote inspector just wants one-shot
+///   "run and give me the output" semantics and does not need streaming.
+///
+/// Both end up running exactly the same component on exactly the same
+/// runtime — `exec` is just `spawn` + drain + wait, modelled at the
+/// interface boundary so the common case does not need to express
+/// streams in its wire format.
 interface programs {
-  /// Stable identifier for a live wasm instance.
+  /// Stable identifier for a live wasm instance, used by the observer.
   type instance-id = u64;
 
-  record exec-request {
+  record spawn-request {
     /// User-visible instance name used for inspection and diagnostics.
     name: string,
-    /// Argument vector passed to the launched component.
+    /// Argument vector passed to the launched component (argv[1..]).
     args: list<string>,
+    /// Environment variables presented to the child via
+    /// `wasi:cli/environment`.
+    env: list<tuple<string, string>>,
     /// Raw wasm module bytes to JIT-compile and execute.
     wasm: list<u8>,
+  }
+
+  record exec-request {
+    name: string,
+    args: list<string>,
+    env: list<tuple<string, string>>,
+    wasm: list<u8>,
+    /// Bytes piped into the child's stdin. Empty means "stdin closes
+    /// immediately".
+    stdin: list<u8>,
   }
 
   record exec-output {
@@ -24,7 +56,12 @@ interface programs {
     output: exec-output,
   }
 
-  enum exec-error-kind {
+  record exit-status {
+    instance-id: instance-id,
+    code: u32,
+  }
+
+  enum spawn-error-kind {
     invalid-binary,
     missing-entry,
     unsupported-import,
@@ -33,11 +70,37 @@ interface programs {
     internal,
   }
 
-  record exec-error {
-    kind: exec-error-kind,
+  record spawn-error {
+    kind: spawn-error-kind,
     detail: string,
   }
 
-  /// Executes a pure wasm program with the platform's default minimal rights and waits for completion.
+  /// Back-compat alias — old callers still use `exec-error`.
+  type exec-error-kind = spawn-error-kind;
+  type exec-error = spawn-error;
+
+  /// Handle to a running child program. Each stream accessor may be
+  /// called at most once; subsequent calls return empty streams.
+  /// Dropping the handle before `wait` completes terminates the child.
+  resource child {
+    /// Pipe bytes into the child's `wasi:cli/stdin`. Completing the
+    /// returned future closes stdin and delivers EOF to the child.
+    stdin: func(data: stream<u8>) -> future<result>;
+
+    /// Read the child's `wasi:cli/stdout` as a byte stream.
+    stdout: func() -> tuple<stream<u8>, future<result>>;
+
+    /// Read the child's `wasi:cli/stderr` as a byte stream.
+    stderr: func() -> tuple<stream<u8>, future<result>>;
+
+    /// Await child completion and return its exit status.
+    wait: async func() -> result<exit-status, spawn-error>;
+  }
+
+  /// Spawn a new program and return a handle for streaming its IO.
+  spawn: async func(request: spawn-request) -> result<child, spawn-error>;
+
+  /// Run a program to completion, returning its buffered stdout/stderr.
+  /// Equivalent to `spawn` + drain output + `wait`.
   exec: async func(request: exec-request) -> result<exec-result, exec-error>;
 }

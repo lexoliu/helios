@@ -74,7 +74,9 @@ pub(crate) async fn dispatch(func: &str, payload: &[u8]) -> Result<Vec<u8>> {
             let response = host_programs::exec(host_programs::ExecRequest {
                 name,
                 args: request.args,
+                env: Vec::new(),
                 wasm,
+                stdin: Vec::new(),
             })
             .await
             .map(|result| ExecResult {

@@ -153,7 +153,9 @@ async fn exec_program(program: &str, args: &[String]) -> Result<CommandStatus> {
     match programs::exec(ExecRequest {
         name,
         args: args.to_vec(),
+        env: Vec::new(),
         wasm: resolved.wasm,
+        stdin: Vec::new(),
     })
     .await
     {

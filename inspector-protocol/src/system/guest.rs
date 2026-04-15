@@ -112,7 +112,9 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>>
             let response = host_programs::exec(host_programs::ExecRequest {
                 name: request.name,
                 args: request.args,
+                env: Vec::new(),
                 wasm: request.wasm,
+                stdin: Vec::new(),
             })
             .await;
             let response = response

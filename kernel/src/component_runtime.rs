@@ -1,23 +1,59 @@
 extern crate alloc;
 
 use alloc::string::String;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use spin::Mutex;
-
+use crate::child_io::{ByteReader, ByteWriter, ClosedPeer, TryRead};
 use crate::{
-    ExecOutput, InstanceExecutionTransition, InstanceRegistry, RegisteredInstance,
-    record_instance_transition,
+    InstanceExecutionTransition, InstanceRegistry, RegisteredInstance, record_instance_transition,
 };
 use helios_hal::cpu::Cpu;
 use wasmtime::component::ResourceTable;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Where `wasi:cli/{stdin,stdout,stderr}` traffic flows for a component.
+///
+/// Three concrete routings are supported:
+///
+/// - `Serial`: debugger component path — stdout/stderr are written to the
+///   serial debug port; stdin reads drain it.
+/// - `Trace`: diagnostic path — stdout/stderr bytes are recorded as
+///   observer console text; stdin is always empty.
+/// - `Child { … }`: spawned-child path — stdin, stdout, and stderr are
+///   connected to byte channels the parent controls.
 pub enum ComponentOutputMode {
     Serial,
     Trace,
-    Capture,
+    Child {
+        stdin_rx: ByteReader,
+        stdout_tx: ByteWriter,
+        stderr_tx: ByteWriter,
+    },
+}
+
+impl ComponentOutputMode {
+    /// Obtain a cloneable writer for the requested child stream, when
+    /// this mode has one. Returns `None` for `Serial`/`Trace`; callers
+    /// should dispatch through `ComponentStoreData::write_output` for
+    /// those routes.
+    pub fn child_writer(&self, kind: ComponentOutputStreamKind) -> Option<ByteWriter> {
+        match (self, kind) {
+            (ComponentOutputMode::Child { stdout_tx, .. }, ComponentOutputStreamKind::Stdout) => {
+                Some(stdout_tx.clone())
+            }
+            (ComponentOutputMode::Child { stderr_tx, .. }, ComponentOutputStreamKind::Stderr) => {
+                Some(stderr_tx.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Obtain a reference to the child-stdin reader, when this mode has one.
+    pub fn child_stdin(&self) -> Option<&ByteReader> {
+        match self {
+            ComponentOutputMode::Child { stdin_rx, .. } => Some(stdin_rx),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -39,8 +75,6 @@ pub(crate) struct ComponentExecutionContext<FileSystem> {
     arguments: Vec<String>,
     environment: Vec<(String, String)>,
     output_mode: ComponentOutputMode,
-    captured_stdout: Arc<Mutex<Vec<u8>>>,
-    captured_stderr: Arc<Mutex<Vec<u8>>>,
 }
 
 pub struct ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem> {
@@ -51,21 +85,6 @@ pub struct ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem> {
     execution_context: ComponentExecutionContext<FileSystem>,
     serial_reader: fn(u32) -> Vec<u8>,
     serial_writer: fn(&[u8]),
-}
-
-#[derive(Clone)]
-struct ComponentOutput<CpuImpl, RuntimeStateImpl> {
-    mode: ComponentOutputMode,
-    runtime_state: RuntimeStateImpl,
-    cpu: CpuImpl,
-    captured_stdout: Arc<Mutex<Vec<u8>>>,
-    captured_stderr: Arc<Mutex<Vec<u8>>>,
-    serial_writer: fn(&[u8]),
-}
-
-pub struct ComponentOutputStream<CpuImpl, RuntimeStateImpl> {
-    sink: ComponentOutput<CpuImpl, RuntimeStateImpl>,
-    stream: ComponentOutputStreamKind,
 }
 
 pub struct DeadlinePollable<CpuImpl, RuntimeStateImpl> {
@@ -91,18 +110,8 @@ impl<FileSystem> ComponentExecutionContext<FileSystem> {
             arguments,
             environment,
             output_mode,
-            captured_stdout: Arc::new(Mutex::new(Vec::new())),
-            captured_stderr: Arc::new(Mutex::new(Vec::new())),
         }
     }
-
-    pub(crate) fn take_captured_output(&self) -> ExecOutput {
-        ExecOutput {
-            stdout: self.captured_stdout.lock().clone(),
-            stderr: self.captured_stderr.lock().clone(),
-        }
-    }
-
 }
 
 impl<CpuImpl, RuntimeStateImpl, FileSystem>
@@ -168,8 +177,8 @@ where
         &self.execution_context.environment
     }
 
-    pub(crate) fn take_captured_output(&self) -> ExecOutput {
-        self.execution_context.take_captured_output()
+    pub fn output_mode(&self) -> &ComponentOutputMode {
+        &self.execution_context.output_mode
     }
 
     pub(crate) fn serial_reader_fn(&self) -> fn(u32) -> Vec<u8> {
@@ -184,53 +193,13 @@ where
         self.runtime_state.uptime_nanos(self.cpu.now().ticks())
     }
 
-    pub fn write_output(&mut self, stream: ComponentOutputStreamKind, bytes: &[u8]) {
-        ComponentOutput::from_store(self).write(stream, bytes);
-    }
-
-    /// Drain whatever bytes are currently buffered on the serial input,
-    /// up to `max_bytes`. Never blocks; returns an empty `Vec` when the
-    /// port is idle so that callers can yield to the kernel executor.
-    pub fn try_read_serial(&self, max_bytes: u32) -> Vec<u8> {
-        (self.serial_reader)(max_bytes)
-    }
-
-    pub fn write_serial(&self, bytes: &[u8]) {
-        (self.serial_writer)(bytes);
-    }
-
-    pub fn record_transition(
-        &mut self,
-        transition: InstanceExecutionTransition,
-    ) {
-        record_instance_transition(self.instance(), transition, self.now_nanos());
-    }
-}
-
-impl<CpuImpl, RuntimeStateImpl> ComponentOutput<CpuImpl, RuntimeStateImpl>
-where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
-    RuntimeStateImpl: ComponentRuntimeState,
-{
-    fn from_store<FileSystem>(
-        store: &ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem>,
-    ) -> Self
-    where
-        FileSystem: Send,
-    {
-        let context = &store.execution_context;
-        Self {
-            mode: context.output_mode,
-            runtime_state: store.runtime_state.clone(),
-            cpu: store.cpu.clone(),
-            captured_stdout: context.captured_stdout.clone(),
-            captured_stderr: context.captured_stderr.clone(),
-            serial_writer: store.serial_writer,
+    /// Deliver a chunk of stdout/stderr bytes to whatever sink is
+    /// configured for this component. Never blocks.
+    pub fn write_output(&self, stream: ComponentOutputStreamKind, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
         }
-    }
-
-    fn write(&self, stream: ComponentOutputStreamKind, bytes: &[u8]) {
-        match self.mode {
+        match &self.execution_context.output_mode {
             ComponentOutputMode::Serial => (self.serial_writer)(bytes),
             ComponentOutputMode::Trace => {
                 let text = core::str::from_utf8(bytes).unwrap_or_else(|error| {
@@ -239,45 +208,79 @@ where
                 self.runtime_state
                     .record_console_text(self.cpu.now().ticks(), text);
             }
-            ComponentOutputMode::Capture => match stream {
-                ComponentOutputStreamKind::Stdout => {
-                    self.captured_stdout.lock().extend_from_slice(bytes)
+            ComponentOutputMode::Child {
+                stdout_tx,
+                stderr_tx,
+                ..
+            } => {
+                let writer = match stream {
+                    ComponentOutputStreamKind::Stdout => stdout_tx,
+                    ComponentOutputStreamKind::Stderr => stderr_tx,
+                };
+                // Ignore ClosedPeer: the parent dropped the reader, so
+                // further writes are simply discarded. This matches POSIX
+                // behavior when writing to a closed pipe with SIGPIPE
+                // suppressed.
+                let _: Result<(), ClosedPeer> = writer.write(bytes.to_vec());
+            }
+        }
+    }
+
+    /// Non-blocking drain of whatever stdin bytes are currently buffered,
+    /// up to `max_bytes`.  Returns an empty `Vec` when the port is idle so
+    /// callers can yield to the kernel executor.  For `Child` mode, the
+    /// reader half of the parent-provided channel is polled once.
+    pub fn try_read_stdin(&self, max_bytes: u32) -> Vec<u8> {
+        match &self.execution_context.output_mode {
+            ComponentOutputMode::Serial => (self.serial_reader)(max_bytes),
+            ComponentOutputMode::Trace => Vec::new(),
+            ComponentOutputMode::Child { stdin_rx, .. } => match stdin_rx.try_read() {
+                TryRead::Ready(mut bytes) => {
+                    let cap = max_bytes as usize;
+                    if bytes.len() > cap {
+                        bytes.truncate(cap);
+                    }
+                    bytes
                 }
-                ComponentOutputStreamKind::Stderr => {
-                    self.captured_stderr.lock().extend_from_slice(bytes)
-                }
+                TryRead::Pending | TryRead::Eof => Vec::new(),
             },
         }
     }
-}
 
-impl<CpuImpl, RuntimeStateImpl> ComponentOutputStream<CpuImpl, RuntimeStateImpl>
-where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
-    RuntimeStateImpl: ComponentRuntimeState,
-{
-    pub fn from_store<FileSystem>(
-        store: &ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem>,
-        stream: ComponentOutputStreamKind,
-    ) -> Self
-    where
-        FileSystem: Send,
-    {
-        Self {
-            sink: ComponentOutput::from_store(store),
-            stream,
+    /// Await the next stdin chunk, yielding the executor between polls.
+    /// Returns `None` on EOF (Child mode after parent closes stdin, or
+    /// for Trace mode which never produces bytes).
+    pub async fn await_stdin_chunk(&self) -> Option<Vec<u8>> {
+        match &self.execution_context.output_mode {
+            ComponentOutputMode::Serial => {
+                // Busy-poll with yield_now between polls — the serial
+                // port is a raw hardware reader without async wakeup.
+                loop {
+                    let bytes = (self.serial_reader)(u32::MAX);
+                    if !bytes.is_empty() {
+                        return Some(bytes);
+                    }
+                    crate::yield_now().await;
+                }
+            }
+            ComponentOutputMode::Trace => None,
+            ComponentOutputMode::Child { stdin_rx, .. } => stdin_rx.read().await,
         }
     }
-}
 
-impl<CpuImpl, RuntimeStateImpl> ComponentOutputStream<CpuImpl, RuntimeStateImpl>
-where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
-    RuntimeStateImpl: ComponentRuntimeState,
-{
-    /// Write output bytes through the configured output mode.
-    pub fn write_output(&mut self, bytes: &[u8]) {
-        self.sink.write(self.stream, bytes);
+    pub fn write_serial(&self, bytes: &[u8]) {
+        (self.serial_writer)(bytes);
+    }
+
+    /// Raw read of the serial debug port, regardless of this component's
+    /// configured stdio routing. Used by `helios:system/serial.read` and
+    /// the debugger shell to drain user input directly from hardware.
+    pub fn try_read_serial_port(&self, max_bytes: u32) -> Vec<u8> {
+        (self.serial_reader)(max_bytes)
+    }
+
+    pub fn record_transition(&mut self, transition: InstanceExecutionTransition) {
+        record_instance_transition(self.instance(), transition, self.now_nanos());
     }
 }
 

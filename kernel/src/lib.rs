@@ -7,6 +7,7 @@ extern crate std;
 
 mod block_on;
 mod bootfs;
+mod child_io;
 mod codegen_platform;
 mod component_cache;
 mod component_fs;
@@ -41,6 +42,7 @@ mod wasi_rights;
 pub(crate) mod wasmtime_adapter;
 
 pub use block_on::block_on;
+pub use child_io::{ByteReader, ByteWriter, ClosedPeer, TryRead, byte_channel};
 pub use codegen_platform::CodegenPlatform;
 pub use bootfs::{
     BootDirectory, BootDirectoryEntry, BootDirectoryHandleExt, BootFile, EmbeddedBootFile,
@@ -55,23 +57,21 @@ pub use component_fs_path::{
     ComponentFsPathError, directory_prefix, parent_path, resolve_child_path,
 };
 pub use component_host::{
-    ComponentBindingSet, ComponentHostProcessorRole, ComponentRunMode, HostRuntimeState,
-    ProgramServiceConfig, UserProgramService, component_host_processor_role,
+    ChildExit, ChildHandle, ComponentBindingSet, ComponentHostProcessorRole, ComponentRunMode,
+    HostRuntimeState, ProgramServiceConfig, UserProgramService, component_host_processor_role,
     component_host_processors_to_start, component_host_system_processor,
-    component_host_worker_count,
-    install_component_host_program_service, install_program_service,
+    component_host_worker_count, install_component_host_program_service, install_program_service,
     install_program_service_with_config, run_component_host_processor_forever,
     run_embedded_component_forever, run_embedded_component_in_mode_forever,
-    run_program_workers_forever,
-    system_component_should_run_on,
+    run_program_workers_forever, system_component_should_run_on,
 };
 pub use component_resources::{
     ComponentRawMutex, ComponentRawMutexGuard, ComponentRawRwLock, ComponentRawRwLockReadGuard,
     ComponentRawRwLockWriteGuard, ComponentSerialPort, ComponentTcpBackend, ComponentTcpStream,
 };
 pub use component_runtime::{
-    ComponentOutputMode, ComponentOutputStream, ComponentOutputStreamKind, ComponentRuntimeState,
-    ComponentStoreData, DeadlinePollable,
+    ComponentOutputMode, ComponentOutputStreamKind, ComponentRuntimeState, ComponentStoreData,
+    DeadlinePollable,
 };
 pub use component_runtime_backend::{
     CompiledComponent, ComponentExecContext, ComponentExecutor, ComponentExitStatus,

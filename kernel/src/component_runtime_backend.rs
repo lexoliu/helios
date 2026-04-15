@@ -4,8 +4,8 @@ use alloc::vec::Vec;
 use core::future::Future;
 
 use crate::{
-    ComponentOutputMode, ComponentRuntimeState, ExecOutput, HostFileSystem, InstanceId,
-    InstanceRegistry, RegisteredInstance,
+    ComponentOutputMode, ComponentRuntimeState, HostFileSystem, InstanceId, InstanceRegistry,
+    RegisteredInstance,
 };
 use helios_hal::cpu::Cpu;
 
@@ -100,10 +100,13 @@ pub trait ComponentRuntimeEngine: Clone + Send + Sync + 'static {
 }
 
 /// Result of running a component to completion.
+///
+/// stdio bytes are delivered through the channels bound by
+/// `ComponentOutputMode::Child` during execution, so this value only
+/// carries terminal metadata.
 pub struct ComponentRunResult {
     pub status: ComponentExitStatus,
     pub instance_id: InstanceId,
-    pub output: ExecOutput,
 }
 
 /// A running component instance that can be driven to completion.

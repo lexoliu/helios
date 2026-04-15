@@ -83,11 +83,9 @@ where
                 (Err(()),) => ComponentExitStatus::Failed,
             };
             let instance_id = self.store.data().instance().id();
-            let output = self.store.data().take_captured_output();
             Ok(ComponentRunResult {
                 status,
                 instance_id,
-                output,
             })
         }
     }
@@ -130,7 +128,6 @@ where
         Ok(ComponentRunResult {
             status,
             instance_id: self.store.data().instance().id(),
-            output: self.store.data().take_captured_output(),
         })
     }
 }

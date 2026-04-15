@@ -64,11 +64,57 @@ where
     _marker: core::marker::PhantomData<fn() -> HostFs>,
 }
 
-struct ProgramExecRequest {
+struct ProgramSpawnRequest {
     name: String,
     args: Vec<String>,
+    env: Vec<(String, String)>,
     wasm: Arc<[u8]>,
     rights: WasiRights,
+}
+
+/// Handle to a spawned child component as seen by the kernel and its
+/// direct Rust callers. WIT `child` resources wrap one of these.
+pub struct ChildHandle {
+    pub instance_id: crate::InstanceId,
+    stdin: Option<crate::ByteWriter>,
+    stdout: Option<crate::ByteReader>,
+    stderr: Option<crate::ByteReader>,
+    exit: futures::channel::oneshot::Receiver<Result<ChildExit, ProgramExecError>>,
+}
+
+impl ChildHandle {
+    /// Take the writer end of the child's stdin. Dropping it delivers
+    /// EOF to the child.
+    pub fn take_stdin(&mut self) -> Option<crate::ByteWriter> {
+        self.stdin.take()
+    }
+
+    /// Take the reader end of the child's stdout stream.
+    pub fn take_stdout(&mut self) -> Option<crate::ByteReader> {
+        self.stdout.take()
+    }
+
+    /// Take the reader end of the child's stderr stream.
+    pub fn take_stderr(&mut self) -> Option<crate::ByteReader> {
+        self.stderr.take()
+    }
+
+    /// Await child exit.
+    pub async fn wait(self) -> Result<ChildExit, ProgramExecError> {
+        match self.exit.await {
+            Ok(result) => result,
+            Err(_) => Err(ProgramExecError {
+                kind: ProgramExecErrorKind::Internal,
+                detail: "child exit channel dropped before signalling completion".into(),
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ChildExit {
+    pub instance_id: crate::InstanceId,
+    pub exit_code: u32,
 }
 
 pub fn install_program_service<CpuImpl, HostFs>(
@@ -273,44 +319,144 @@ where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
 {
-    pub(crate) async fn exec(
+    /// Spawn a new child program. The returned handle gives the caller
+    /// direct access to the child's stdin/stdout/stderr channels and a
+    /// future resolving with its exit status.
+    pub(crate) async fn spawn(
+        &self,
+        exec_context: ProgramExecContext<CpuImpl, HostFs>,
+        name: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        wasm: alloc::vec::Vec<u8>,
+        rights: WasiRights,
+    ) -> Result<ChildHandle, ProgramExecError> {
+        let request = ProgramSpawnRequest {
+            name,
+            args,
+            env,
+            wasm: Arc::<[u8]>::from(wasm),
+            rights,
+        };
+        let component = self.compile_component(&request.wasm).await?;
+
+        // Three byte channels between parent and child.
+        let (stdin_writer, stdin_reader) = crate::byte_channel();
+        let (stdout_writer, stdout_reader) = crate::byte_channel();
+        let (stderr_writer, stderr_reader) = crate::byte_channel();
+
+        // Register the child instance synchronously on the parent
+        // thread so we can return its id in the handle immediately.
+        let started_at = exec_context
+            .runtime_state
+            .uptime_nanos(exec_context.cpu.now().ticks());
+        let launched_instance = exec_context
+            .instance_registry
+            .register(request.name.clone(), started_at);
+        let instance_id = launched_instance.id();
+
+        let (exit_tx, exit_rx) = futures::channel::oneshot::channel();
+        let service = self.clone();
+        let runtime = self.inner.runtime.clone();
+        let engine = self.inner.engine.clone();
+
+        let _handle = self.inner.spawner.spawn(async move {
+            let _ = &service;
+            let result = run_program_component(
+                exec_context,
+                request.name,
+                request.args,
+                request.env,
+                request.rights,
+                component,
+                &engine,
+                &runtime,
+                launched_instance,
+                stdin_reader,
+                stdout_writer,
+                stderr_writer,
+            )
+            .await;
+            let _ = exit_tx.send(result);
+        });
+
+        let child = ChildHandle {
+            instance_id,
+            stdin: Some(stdin_writer),
+            stdout: Some(stdout_reader),
+            stderr: Some(stderr_reader),
+            exit: exit_rx,
+        };
+        Ok(child)
+    }
+
+    /// Convenience wrapper: spawn a program, feed it `stdin`, drain its
+    /// stdout and stderr into buffers, and return the collected output
+    /// along with the exit code.
+    pub(crate) async fn exec_buffered(
         &self,
         exec_context: ProgramExecContext<CpuImpl, HostFs>,
         name: impl Into<String>,
         args: Vec<String>,
+        env: Vec<(String, String)>,
         wasm: &[u8],
+        stdin: Vec<u8>,
         rights: WasiRights,
     ) -> Result<ExecResult, ProgramExecError> {
-        let request = ProgramExecRequest {
-            name: name.into(),
-            args,
-            wasm: Arc::<[u8]>::from(wasm.to_vec()),
-            rights,
-        };
-        let service = self.clone();
-        let task = self
-            .inner
-            .spawner
-            .spawn(async move { service.exec_on_kernel(exec_context, request).await });
-        task.await
-    }
+        let mut child = self
+            .spawn(
+                exec_context,
+                name.into(),
+                args,
+                env,
+                wasm.to_vec(),
+                rights,
+            )
+            .await?;
 
-    async fn exec_on_kernel(
-        &self,
-        exec_context: ProgramExecContext<CpuImpl, HostFs>,
-        request: ProgramExecRequest,
-    ) -> Result<ExecResult, ProgramExecError> {
-        let component = self.compile_component(&request.wasm).await?;
-        run_program_component(
-            exec_context,
-            request.name,
-            request.args,
-            request.rights,
-            component,
-            &self.inner.engine,
-            &self.inner.runtime,
+        // Feed stdin in one shot, then close the writer to signal EOF.
+        if let Some(writer) = child.take_stdin() {
+            if !stdin.is_empty() {
+                let _ = writer.write(stdin);
+            }
+            drop(writer);
+        }
+
+        let stdout_reader = child.take_stdout();
+        let stderr_reader = child.take_stderr();
+
+        let stdout_task = async move {
+            let mut bytes = Vec::new();
+            if let Some(reader) = stdout_reader {
+                while let Some(chunk) = reader.read().await {
+                    bytes.extend_from_slice(&chunk);
+                }
+            }
+            bytes
+        };
+        let stderr_task = async move {
+            let mut bytes = Vec::new();
+            if let Some(reader) = stderr_reader {
+                while let Some(chunk) = reader.read().await {
+                    bytes.extend_from_slice(&chunk);
+                }
+            }
+            bytes
+        };
+
+        let wait_task = child.wait();
+        let (stdout, (stderr, exit)) = futures::future::join(
+            stdout_task,
+            futures::future::join(stderr_task, wait_task),
         )
-        .await
+        .await;
+        let exit = exit?;
+
+        Ok(ExecResult {
+            instance_id: exit.instance_id,
+            exit_code: exit.exit_code,
+            output: crate::ExecOutput { stdout, stderr },
+        })
     }
 
     async fn compile_component(
@@ -396,15 +542,21 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_program_component<CpuImpl, HostFs>(
     exec_context: ProgramExecContext<CpuImpl, HostFs>,
     name: String,
     args: Vec<String>,
+    env: Vec<(String, String)>,
     _rights: WasiRights,
     compiled: Arc<crate::wasmtime_adapter::WasmtimeCompiledComponent>,
     engine: &crate::wasmtime_adapter::WasmtimeEngine,
     runtime: &crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
-) -> Result<ExecResult, ProgramExecError>
+    launched_instance: crate::RegisteredInstance,
+    stdin_reader: crate::ByteReader,
+    stdout_writer: crate::ByteWriter,
+    stderr_writer: crate::ByteWriter,
+) -> Result<ChildExit, ProgramExecError>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
@@ -414,10 +566,6 @@ where
         ComponentWorld,
     };
 
-    let started_at = exec_context.runtime_state.uptime_nanos(exec_context.cpu.now().ticks());
-    let launched_instance = exec_context
-        .instance_registry
-        .register(name.clone(), started_at);
     let mut argv = Vec::with_capacity(args.len() + 1);
     argv.push(name);
     argv.extend(args);
@@ -430,8 +578,12 @@ where
         false,
         exec_context.runtime_state,
         argv,
-        Vec::new(),
-        OutputMode::Capture,
+        env,
+        OutputMode::Child {
+            stdin_rx: stdin_reader,
+            stdout_tx: stdout_writer,
+            stderr_tx: stderr_writer,
+        },
         exec_context.read_serial,
         exec_context.write_serial,
     );
@@ -444,13 +596,12 @@ where
 
     let result = executor.run().await.map_err(map_program_runtime_error)?;
 
-    Ok(ExecResult {
+    Ok(ChildExit {
         instance_id: result.instance_id,
         exit_code: match result.status {
             ComponentExitStatus::Ok => 0,
             ComponentExitStatus::Failed => 1,
         },
-        output: result.output,
     })
 }
 
