@@ -356,12 +356,10 @@ where
         let instance_id = launched_instance.id();
 
         let (exit_tx, exit_rx) = futures::channel::oneshot::channel();
-        let service = self.clone();
         let runtime = self.inner.runtime.clone();
         let engine = self.inner.engine.clone();
 
-        let _handle = self.inner.spawner.spawn(async move {
-            let _ = &service;
+        self.inner.spawner.spawn_detached(async move {
             let result = run_program_component(
                 exec_context,
                 request.name,
