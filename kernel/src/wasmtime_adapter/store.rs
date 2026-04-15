@@ -78,14 +78,14 @@ where
 
 /// WASI P2 adapter: exposes a kernel `ByteReader` as an `InputStream`.
 pub struct ChannelInputStream {
-    reader: Arc<ByteReader>,
+    reader: ByteReader,
     carry: Arc<Mutex<Vec<u8>>>,
 }
 
 impl ChannelInputStream {
     pub fn new(reader: ByteReader) -> Self {
         Self {
-            reader: Arc::new(reader),
+            reader,
             carry: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -129,14 +129,12 @@ impl InputStream for ChannelInputStream {
 
 /// WASI P2 adapter: exposes a kernel `ByteWriter` as an `OutputStream`.
 pub struct ChannelOutputStream {
-    writer: Arc<ByteWriter>,
+    writer: ByteWriter,
 }
 
 impl ChannelOutputStream {
     pub fn new(writer: ByteWriter) -> Self {
-        Self {
-            writer: Arc::new(writer),
-        }
+        Self { writer }
     }
 }
 

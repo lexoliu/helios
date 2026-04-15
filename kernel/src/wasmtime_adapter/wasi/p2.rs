@@ -17,7 +17,7 @@ use crate::component_host::{RuntimeDeadlinePollable, StoreData};
 use crate::wasmtime_adapter::store::{
     ChannelInputStream, ChannelOutputStream, StdioOutputStream,
 };
-use crate::{ByteReader, ComponentOutputMode, ComponentOutputStreamKind};
+use crate::{ComponentOutputMode, ComponentOutputStreamKind};
 use super::bindings::filesystem::types as p3fs;
 use super::{FsDescriptor, FsNodeKind, P2Network, TcpSocket, UdpSocket};
 
@@ -323,8 +323,7 @@ where
     fn get_stdin(&mut self) -> Result<Resource<DynInputStream>> {
         let stream: DynInputStream = match self.output_mode() {
             ComponentOutputMode::Child { stdin_rx, .. } => {
-                Box::new(ChannelInputStream::new(clone_reader_by_channel(stdin_rx)))
-                    as DynInputStream
+                Box::new(ChannelInputStream::new(stdin_rx.clone())) as DynInputStream
             }
             ComponentOutputMode::Serial | ComponentOutputMode::Trace => {
                 Box::new(EmptyInputStream) as DynInputStream
@@ -379,20 +378,6 @@ where
     }
 }
 
-// The child stdin reader is single-owner but we need to hand it to a P2
-// input-stream resource that keeps reading from it. Because `ByteReader`
-// does not implement `Clone`, we serialise access through an `Arc` shared
-// with the stream wrapper constructed in `ChannelInputStream::new`.
-fn clone_reader_by_channel(reader: &ByteReader) -> ByteReader {
-    // The reader is not cloneable on purpose — only one consumer may
-    // drain the channel. For P2 `get-stdin` we hand back a fresh,
-    // immediately-empty reader so P2 programs see an EOF stdin. P3
-    // programs share the real reader through `cli::stdin::read-via-stream`.
-    let _ = reader;
-    let (writer, reader) = crate::byte_channel();
-    drop(writer);
-    reader
-}
 
 impl<CpuImpl, HostFs> cli_bindings::cli::terminal_input::Host for StoreData<CpuImpl, HostFs>
 where

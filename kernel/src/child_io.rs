@@ -69,10 +69,25 @@ pub struct ByteWriter {
     _liveness: Arc<WriterLiveness>,
 }
 
-/// Consumer half of a byte stream. Dropping the reader causes subsequent
-/// writer operations to observe a closed reader and drop their payload.
+/// Reader liveness guard — when the last cloned reader is dropped the
+/// channel is marked as reader-closed so writers can stop producing.
+struct ReaderLiveness {
+    channel: Arc<ByteChannel>,
+}
+
+impl Drop for ReaderLiveness {
+    fn drop(&mut self) {
+        self.channel.reader_closed.store(true, Ordering::Release);
+    }
+}
+
+/// Consumer half of a byte stream. Clonable so multiple async tasks can
+/// share the same byte feed — the underlying queue is already
+/// MPMC-safe. Dropping the last clone closes the reader side.
+#[derive(Clone)]
 pub struct ByteReader {
     channel: Arc<ByteChannel>,
+    _liveness: Arc<ReaderLiveness>,
 }
 
 pub fn byte_channel() -> (ByteWriter, ByteReader) {
@@ -84,7 +99,10 @@ pub fn byte_channel() -> (ByteWriter, ByteReader) {
                 channel: channel.clone(),
             }),
         },
-        ByteReader { channel },
+        ByteReader {
+            channel: channel.clone(),
+            _liveness: Arc::new(ReaderLiveness { channel }),
+        },
     )
 }
 
@@ -158,11 +176,6 @@ impl ByteReader {
     }
 }
 
-impl Drop for ByteReader {
-    fn drop(&mut self) {
-        self.channel.reader_closed.store(true, Ordering::Release);
-    }
-}
 
 pub enum TryRead {
     Ready(Vec<u8>),

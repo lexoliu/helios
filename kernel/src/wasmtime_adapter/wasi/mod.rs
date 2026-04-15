@@ -1,6 +1,7 @@
 extern crate alloc;
 
 use alloc::borrow::ToOwned;
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -1250,11 +1251,147 @@ where
         StreamReader<u8>,
         FutureReader<core::result::Result<(), cli_types::ErrorCode>>,
     )> {
-        let stream = StreamReader::new(&mut access, Vec::<u8>::new())?;
+        use crate::ComponentOutputMode;
+        // For spawn-mode programs, drain the parent-provided stdin reader
+        // one chunk at a time. For Serial/Trace programs, hand back an
+        // immediately empty stream (serial stdin is polled through the
+        // dedicated `helios:system/serial` interface instead).
+        let stream = match access.get().output_mode() {
+            ComponentOutputMode::Child { stdin_rx, .. } => {
+                let reader = stdin_rx.clone();
+                StreamReader::new(&mut access, ChannelStreamProducer::new(reader))?
+            }
+            ComponentOutputMode::Serial | ComponentOutputMode::Trace => {
+                StreamReader::new(&mut access, Vec::<u8>::new())?
+            }
+        };
         let future = FutureReader::new(&mut access, async {
             Ok::<_, wasmtime::Error>(Ok::<(), cli_types::ErrorCode>(()))
         })?;
         Ok((stream, future))
+    }
+}
+
+/// Bridges a kernel [`ByteReader`](crate::ByteReader) to a wasmtime
+/// component stream producer. Used for both `wasi:cli/stdin.read-via-stream`
+/// (when spawn-mode hooks the child's stdin to the parent channel) and
+/// `child.stdout` / `child.stderr` on the parent side.
+///
+/// Because `ByteReader::read` is async and `poll_produce` is sync, we
+/// keep a pinned boxed future representing the in-flight read; every
+/// poll drives it until a chunk is produced.
+pub(crate) struct ChannelStreamProducer {
+    reader: crate::ByteReader,
+    pending: Option<Pin<Box<dyn core::future::Future<Output = Option<Vec<u8>>> + Send>>>,
+}
+
+impl ChannelStreamProducer {
+    pub(crate) fn new(reader: crate::ByteReader) -> Self {
+        Self {
+            reader,
+            pending: None,
+        }
+    }
+}
+
+impl<T> StreamProducer<T> for ChannelStreamProducer {
+    type Item = u8;
+    type Buffer = VecBuffer<u8>;
+
+    fn poll_produce(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        _: wasmtime::StoreContextMut<'_, T>,
+        mut destination: Destination<'_, Self::Item, Self::Buffer>,
+        finish: bool,
+    ) -> Poll<Result<StreamResult>> {
+        loop {
+            if self.pending.is_none() {
+                let reader = self.reader.clone();
+                self.pending = Some(Box::pin(async move { reader.read().await }));
+            }
+            let fut = self
+                .pending
+                .as_mut()
+                .expect("pending future was just installed");
+            match fut.as_mut().poll(cx) {
+                Poll::Pending => {
+                    return if finish {
+                        Poll::Ready(Ok(StreamResult::Cancelled))
+                    } else {
+                        Poll::Pending
+                    };
+                }
+                Poll::Ready(None) => {
+                    self.pending = None;
+                    return Poll::Ready(Ok(StreamResult::Dropped));
+                }
+                Poll::Ready(Some(bytes)) => {
+                    self.pending = None;
+                    let bytes: Vec<u8> = bytes;
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    destination.set_buffer(VecBuffer::from(bytes));
+                    return Poll::Ready(Ok(StreamResult::Completed));
+                }
+            }
+        }
+    }
+}
+
+/// Bridges a wasmtime component stream consumer to a kernel
+/// [`ByteWriter`](crate::ByteWriter). Used for `child.stdin` so the
+/// parent-supplied stream is copied into the child's stdin channel.
+pub(crate) struct ChannelStreamConsumer {
+    writer: crate::ByteWriter,
+    completion: Option<oneshot::Sender<core::result::Result<(), ()>>>,
+}
+
+impl ChannelStreamConsumer {
+    pub(crate) fn new(
+        writer: crate::ByteWriter,
+        completion: oneshot::Sender<core::result::Result<(), ()>>,
+    ) -> Self {
+        Self {
+            writer,
+            completion: Some(completion),
+        }
+    }
+
+    fn finish(&mut self, result: core::result::Result<(), ()>) {
+        if let Some(tx) = self.completion.take() {
+            let _ = tx.send(result);
+        }
+    }
+}
+
+impl Drop for ChannelStreamConsumer {
+    fn drop(&mut self) {
+        self.finish(Ok(()));
+    }
+}
+
+impl<T: 'static> StreamConsumer<T> for ChannelStreamConsumer {
+    type Item = u8;
+
+    fn poll_consume(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        mut store: wasmtime::StoreContextMut<'_, T>,
+        mut source: Source<'_, Self::Item>,
+        _: bool,
+    ) -> Poll<Result<StreamResult>> {
+        let available = source.remaining(&mut store);
+        if available == 0 {
+            return Poll::Ready(Ok(StreamResult::Completed));
+        }
+        let mut bytes = Vec::with_capacity(available);
+        source.read(&mut store, &mut bytes)?;
+        match self.as_ref().get_ref().writer.write(bytes) {
+            Ok(()) => Poll::Ready(Ok(StreamResult::Completed)),
+            Err(_closed) => Poll::Ready(Ok(StreamResult::Dropped)),
+        }
     }
 }
 
