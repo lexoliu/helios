@@ -107,6 +107,9 @@ pub trait ComponentRuntimeEngine: Clone + Send + Sync + 'static {
 pub struct ComponentRunResult {
     pub status: ComponentExitStatus,
     pub instance_id: InstanceId,
+    /// Exit code the guest requested via `wasi:cli/exit`, or 0/1
+    /// derived from the `wasi:cli/run.run` return value.
+    pub exit_code: u32,
 }
 
 /// A running component instance that can be driven to completion.

@@ -240,18 +240,30 @@ async fn run_simple(
     input: InputSource,
     output: &mut OutputTarget,
 ) -> Result<CommandStatus> {
-    let mut assignments = Vec::new();
+    // Start with the shell's inherited environment so child processes
+    // see whatever `export` / prior `NAME=value` assignments set.
+    let mut assignments: Vec<(String, String)> =
+        ctx.variables.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     let mut args = Vec::new();
     let mut redirects = Vec::new();
+
+    let mut override_assignment = |assignments: &mut Vec<(String, String)>, name: String, value: String| {
+        if let Some(existing) = assignments.iter_mut().find(|(k, _)| k == &name) {
+            existing.1 = value;
+        } else {
+            assignments.push((name, value));
+        }
+    };
 
     if let Some(prefix) = &command.prefix {
         for item in &prefix.0 {
             match item {
                 CommandPrefixOrSuffixItem::AssignmentWord(assign, _) => {
-                    assignments.push((
+                    override_assignment(
+                        &mut assignments,
                         assign.name.to_string(),
                         expand_assignment_value(&assign.value, ctx)?,
-                    ));
+                    );
                 }
                 CommandPrefixOrSuffixItem::Word(word) => {
                     args.push(expand_word(word, ctx)?);
@@ -379,7 +391,10 @@ async fn launch_external(
     output: &mut OutputTarget,
 ) -> Result<CommandStatus> {
     let resolved = resolve_program(program).await?;
-    let name = infer_program_name(Path::new(&resolved.path))?;
+    // Use the full resolved path as argv[0] so runtimes that derive a
+    // prefix from `argv[0]` (notably CPython's `getpath`) can locate
+    // the standard library next to the executable.
+    let name = resolved.path.clone();
     let stdin = resolve_stdin(input).await?;
     let request = SpawnRequest {
         name,

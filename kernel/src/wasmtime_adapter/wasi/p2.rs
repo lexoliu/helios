@@ -1,3 +1,4 @@
+use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec;
@@ -17,6 +18,7 @@ use crate::component_host::{RuntimeDeadlinePollable, StoreData};
 use crate::wasmtime_adapter::store::{
     ChannelInputStream, ChannelOutputStream, StdioOutputStream,
 };
+use crate::wasmtime_adapter::wasi::map_host_fs_error;
 use crate::{ComponentOutputMode, ComponentOutputStreamKind};
 use super::bindings::filesystem::types as p3fs;
 use super::{FsDescriptor, FsNodeKind, P2Network, TcpSocket, UdpSocket};
@@ -100,7 +102,19 @@ pub(crate) mod filesystem_bindings {
                     }
                 ",
             path: "../../wasmtime/crates/wasi/src/p2/wit",
-            imports: { default: tracing | trappable },
+            imports: {
+                "wasi:filesystem/types.[method]descriptor.stat": async | tracing | trappable,
+                "wasi:filesystem/types.[method]descriptor.stat-at": async | tracing | trappable,
+                "wasi:filesystem/types.[method]descriptor.open-at": async | tracing | trappable,
+                "wasi:filesystem/types.[method]descriptor.read-directory": async | tracing | trappable,
+                "wasi:filesystem/types.[method]descriptor.create-directory-at": async | tracing | trappable,
+                "wasi:filesystem/types.[method]descriptor.unlink-file-at": async | tracing | trappable,
+                "wasi:filesystem/types.[method]descriptor.rename-at": async | tracing | trappable,
+                "wasi:filesystem/types.[method]descriptor.remove-directory-at": async | tracing | trappable,
+                "wasi:filesystem/types.[method]descriptor.metadata-hash": async | tracing | trappable,
+                "wasi:filesystem/types.[method]descriptor.metadata-hash-at": async | tracing | trappable,
+                default: tracing | trappable,
+            },
             with: {
                 "wasi:io/error": wasmtime_wasi_io::bindings::wasi::io::error,
                 "wasi:io/poll.pollable": wasmtime_wasi_io::poll::DynPollable,
@@ -301,14 +315,18 @@ where
     HostFs: crate::HostFileSystem,
 {
     fn exit(&mut self, status: core::result::Result<(), ()>) -> Result<()> {
-        let message = match status {
-            Ok(()) => "guest requested wasi p2 exit success",
-            Err(()) => "guest requested wasi p2 exit failure",
+        let code = match status {
+            Ok(()) => 0,
+            Err(()) => 1,
         };
-        Err(wasmtime::Error::msg(message))
+        self.request_exit(code);
+        Err(wasmtime::Error::msg(alloc::format!(
+            "guest requested wasi p2 exit code {code}"
+        )))
     }
 
     fn exit_with_code(&mut self, status_code: u8) -> Result<()> {
+        self.request_exit(status_code);
         Err(wasmtime::Error::msg(alloc::format!(
             "guest requested wasi p2 exit code {status_code}"
         )))
@@ -668,7 +686,7 @@ where
         }
     }
 
-    fn read_directory(
+    async fn read_directory(
         &mut self,
         descriptor: Resource<FsDescriptor>,
     ) -> Result<core::result::Result<Resource<DirectoryEntryStream>, p2fs::ErrorCode>> {
@@ -676,6 +694,25 @@ where
             Ok(descriptor) => descriptor,
             Err(error) => return Ok(Err(error)),
         };
+        // For host-mirrored paths, pull the entries through the async
+        // host-fs service first so the sync embedded path sees a fully
+        // populated view.
+        if let Some(host_path) = crate::guest_host_share_path(&descriptor.path) {
+            if let Ok(service) = self
+                .filesystem()
+                .host_service()
+                .map_err(error_code_from_p3)
+            {
+                let host_path = host_path.to_owned();
+                match service.read_dir(&host_path).await {
+                    Ok(entries) => {
+                        self.filesystem_mut()
+                            .seed_host_directory_entries(&descriptor.path, entries);
+                    }
+                    Err(err) => return Ok(Err(error_code_from_p3(map_host_fs_error(err)))),
+                }
+            }
+        }
         match self.filesystem_mut().read_directory(&descriptor.path) {
             Ok(entries) => {
                 let resource = self.table.push(DirectoryEntryStream {
@@ -695,7 +732,7 @@ where
         Ok(Ok(()))
     }
 
-    fn create_directory_at(
+    async fn create_directory_at(
         &mut self,
         descriptor: Resource<FsDescriptor>,
         path: String,
@@ -704,6 +741,24 @@ where
             Ok(descriptor) => descriptor,
             Err(error) => return Ok(Err(error)),
         };
+        let absolute = match crate::resolve_child_path(&descriptor.path, &path) {
+            Ok(path) => path,
+            Err(error) => return Ok(Err(error_code_from_path(error))),
+        };
+        if let Some(host_path) = crate::guest_host_share_path(&absolute) {
+            let service = match self.filesystem().host_service() {
+                Ok(service) => service,
+                Err(error) => return Ok(Err(error_code_from_p3(error))),
+            };
+            let host_path = host_path.to_owned();
+            return match service.create_directory(&host_path).await {
+                Ok(()) => {
+                    self.filesystem_mut().invalidate_host_subtree(&absolute);
+                    Ok(Ok(()))
+                }
+                Err(err) => Ok(Err(error_code_from_p3(map_host_fs_error(err)))),
+            };
+        }
         let now_nanos = self.now_nanos();
         match self
             .filesystem_mut()
@@ -714,7 +769,7 @@ where
         }
     }
 
-    fn stat(
+    async fn stat(
         &mut self,
         descriptor: Resource<FsDescriptor>,
     ) -> Result<core::result::Result<p2fs::DescriptorStat, p2fs::ErrorCode>> {
@@ -722,21 +777,41 @@ where
             Ok(descriptor) => descriptor,
             Err(error) => return Ok(Err(error)),
         };
+        if let Some(host_path) = crate::guest_host_share_path(&descriptor.path) {
+            let service = match self.filesystem().host_service() {
+                Ok(service) => service,
+                Err(error) => return Ok(Err(error_code_from_p3(error))),
+            };
+            let host_path = host_path.to_owned();
+            return match service.stat_path(&host_path).await {
+                Ok(metadata) => Ok(Ok(p2fs::DescriptorStat {
+                    type_: if metadata.qid_type & 0x80 != 0 {
+                        p2fs::DescriptorType::Directory
+                    } else {
+                        p2fs::DescriptorType::RegularFile
+                    },
+                    link_count: 1,
+                    size: metadata.size,
+                    data_access_timestamp: None,
+                    data_modification_timestamp: None,
+                    status_change_timestamp: None,
+                })),
+                Err(err) => Ok(Err(error_code_from_p3(map_host_fs_error(err)))),
+            };
+        }
         match self.filesystem_mut().stat(&descriptor.path) {
             Ok(stat) => Ok(Ok(descriptor_stat_from_p3(stat))),
             Err(error) => Ok(Err(error_code_from_p3(error))),
         }
     }
 
-    fn stat_at(
+    async fn stat_at(
         &mut self,
         descriptor: Resource<FsDescriptor>,
         path_flags: p2fs::PathFlags,
         path: String,
     ) -> Result<core::result::Result<p2fs::DescriptorStat, p2fs::ErrorCode>> {
-        if path_flags.contains(p2fs::PathFlags::SYMLINK_FOLLOW) {
-            return Ok(Err(p2fs::ErrorCode::Unsupported));
-        }
+        let _ = path_flags;
         let descriptor = match get_fs_descriptor(self, &descriptor) {
             Ok(descriptor) => descriptor,
             Err(error) => return Ok(Err(error)),
@@ -745,6 +820,28 @@ where
             Ok(path) => path,
             Err(error) => return Ok(Err(error_code_from_path(error))),
         };
+        if let Some(host_path) = crate::guest_host_share_path(&path) {
+            let service = match self.filesystem().host_service() {
+                Ok(service) => service,
+                Err(error) => return Ok(Err(error_code_from_p3(error))),
+            };
+            let host_path = host_path.to_owned();
+            return match service.stat_path(&host_path).await {
+                Ok(metadata) => Ok(Ok(p2fs::DescriptorStat {
+                    type_: if metadata.qid_type & 0x80 != 0 {
+                        p2fs::DescriptorType::Directory
+                    } else {
+                        p2fs::DescriptorType::RegularFile
+                    },
+                    link_count: 1,
+                    size: metadata.size,
+                    data_access_timestamp: None,
+                    data_modification_timestamp: None,
+                    status_change_timestamp: None,
+                })),
+                Err(err) => Ok(Err(error_code_from_p3(map_host_fs_error(err)))),
+            };
+        }
         match self.filesystem_mut().stat(&path) {
             Ok(stat) => Ok(Ok(descriptor_stat_from_p3(stat))),
             Err(error) => Ok(Err(error_code_from_p3(error))),
@@ -773,7 +870,7 @@ where
         Ok(Err(p2fs::ErrorCode::Unsupported))
     }
 
-    fn open_at(
+    async fn open_at(
         &mut self,
         descriptor: Resource<FsDescriptor>,
         path_flags: p2fs::PathFlags,
@@ -781,17 +878,93 @@ where
         open_flags: p2fs::OpenFlags,
         flags: p2fs::DescriptorFlags,
     ) -> Result<core::result::Result<Resource<FsDescriptor>, p2fs::ErrorCode>> {
-        let descriptor = match get_fs_descriptor(self, &descriptor) {
+        let _ = path_flags;
+        let base = match get_fs_descriptor(self, &descriptor) {
             Ok(descriptor) => descriptor,
             Err(error) => return Ok(Err(error)),
         };
+        if base.kind != crate::wasmtime_adapter::wasi::FsNodeKind::Directory {
+            return Ok(Err(p2fs::ErrorCode::NotDirectory));
+        }
+        let absolute = match crate::resolve_child_path(&base.path, &path) {
+            Ok(path) => path,
+            Err(error) => return Ok(Err(error_code_from_path(error))),
+        };
+        let open_flags_p3 = open_flags_to_p3(open_flags);
+        let descriptor_flags_p3 = descriptor_flags_to_p3(flags);
+        if let Some(host_path) = crate::guest_host_share_path(&absolute) {
+            let service = match self.filesystem().host_service() {
+                Ok(service) => service,
+                Err(error) => return Ok(Err(error_code_from_p3(error))),
+            };
+            let host_path = host_path.to_owned();
+            let metadata = match service.stat_path(&host_path).await {
+                Ok(meta) => Some(meta),
+                Err(err) => {
+                    let code = map_host_fs_error(err);
+                    if matches!(
+                        code,
+                        crate::wasmtime_adapter::wasi::bindings::filesystem::types::ErrorCode::NoEntry
+                    ) && open_flags_p3.contains(
+                        crate::wasmtime_adapter::wasi::bindings::filesystem::types::OpenFlags::CREATE,
+                    ) {
+                        None
+                    } else {
+                        return Ok(Err(error_code_from_p3(code)));
+                    }
+                }
+            };
+            let (kind, contents) = if let Some(meta) = metadata {
+                let is_dir = meta.qid_type & 0x80 != 0;
+                let kind = if is_dir {
+                    crate::wasmtime_adapter::wasi::FsNodeKind::Directory
+                } else {
+                    crate::wasmtime_adapter::wasi::FsNodeKind::File
+                };
+                if !is_dir {
+                    match service.read_file(&host_path).await {
+                        Ok(bytes) => (kind, Some(bytes)),
+                        Err(err) => {
+                            return Ok(Err(error_code_from_p3(map_host_fs_error(err))));
+                        }
+                    }
+                } else {
+                    let entries = match service.read_dir(&host_path).await {
+                        Ok(e) => e,
+                        Err(err) => {
+                            return Ok(Err(error_code_from_p3(map_host_fs_error(err))));
+                        }
+                    };
+                    self.filesystem_mut()
+                        .seed_host_directory_entries(&absolute, entries);
+                    (kind, None)
+                }
+            } else {
+                match service.create_file(&host_path).await {
+                    Ok(()) => (crate::wasmtime_adapter::wasi::FsNodeKind::File, Some(Vec::new())),
+                    Err(err) => {
+                        return Ok(Err(error_code_from_p3(map_host_fs_error(err))));
+                    }
+                }
+            };
+            if let Some(bytes) = contents {
+                self.filesystem_mut()
+                    .seed_host_file_content(&absolute, bytes);
+            }
+            let opened = crate::wasmtime_adapter::wasi::FsDescriptor {
+                path: absolute,
+                kind,
+                flags: descriptor_flags_p3,
+            };
+            return Ok(Ok(self.table.push(opened)?));
+        }
         let now_nanos = self.now_nanos();
         match self.filesystem_mut().open_at(
-            &descriptor,
+            &base,
             path_flags_to_p3(path_flags),
             &path,
-            open_flags_to_p3(open_flags),
-            descriptor_flags_to_p3(flags),
+            open_flags_p3,
+            descriptor_flags_p3,
             now_nanos,
         ) {
             Ok(opened) => Ok(Ok(self.table.push(opened)?)),
@@ -807,7 +980,7 @@ where
         Ok(Err(p2fs::ErrorCode::Unsupported))
     }
 
-    fn remove_directory_at(
+    async fn remove_directory_at(
         &mut self,
         descriptor: Resource<FsDescriptor>,
         path: String,
@@ -816,13 +989,31 @@ where
             Ok(descriptor) => descriptor,
             Err(error) => return Ok(Err(error)),
         };
+        let absolute = match crate::resolve_child_path(&descriptor.path, &path) {
+            Ok(path) => path,
+            Err(error) => return Ok(Err(error_code_from_path(error))),
+        };
+        if let Some(host_path) = crate::guest_host_share_path(&absolute) {
+            let service = match self.filesystem().host_service() {
+                Ok(service) => service,
+                Err(error) => return Ok(Err(error_code_from_p3(error))),
+            };
+            let host_path = host_path.to_owned();
+            return match service.remove(&host_path, true).await {
+                Ok(()) => {
+                    self.filesystem_mut().invalidate_host_subtree(&absolute);
+                    Ok(Ok(()))
+                }
+                Err(err) => Ok(Err(error_code_from_p3(map_host_fs_error(err)))),
+            };
+        }
         match self.filesystem_mut().remove_directory_at(&descriptor, &path) {
             Ok(()) => Ok(Ok(())),
             Err(error) => Ok(Err(error_code_from_p3(error))),
         }
     }
 
-    fn rename_at(
+    async fn rename_at(
         &mut self,
         source_descriptor: Resource<FsDescriptor>,
         source_path: String,
@@ -837,6 +1028,40 @@ where
             Ok(descriptor) => descriptor,
             Err(error) => return Ok(Err(error)),
         };
+        let src_abs =
+            match crate::resolve_child_path(&source_descriptor.path, &source_path) {
+                Ok(p) => p,
+                Err(error) => return Ok(Err(error_code_from_path(error))),
+            };
+        let dst_abs = match crate::resolve_child_path(
+            &destination_descriptor.path,
+            &destination_path,
+        ) {
+            Ok(p) => p,
+            Err(error) => return Ok(Err(error_code_from_path(error))),
+        };
+        let src_host = crate::guest_host_share_path(&src_abs).map(|p| p.to_owned());
+        let dst_host = crate::guest_host_share_path(&dst_abs).map(|p| p.to_owned());
+        if src_host.is_some() || dst_host.is_some() {
+            let Some(src_host) = src_host else {
+                return Ok(Err(p2fs::ErrorCode::CrossDevice));
+            };
+            let Some(dst_host) = dst_host else {
+                return Ok(Err(p2fs::ErrorCode::CrossDevice));
+            };
+            let service = match self.filesystem().host_service() {
+                Ok(service) => service,
+                Err(error) => return Ok(Err(error_code_from_p3(error))),
+            };
+            return match service.rename(&src_host, &dst_host).await {
+                Ok(()) => {
+                    self.filesystem_mut().invalidate_host_subtree(&src_abs);
+                    self.filesystem_mut().invalidate_host_subtree(&dst_abs);
+                    Ok(Ok(()))
+                }
+                Err(err) => Ok(Err(error_code_from_p3(map_host_fs_error(err)))),
+            };
+        }
         let now_nanos = self.now_nanos();
         match self.filesystem_mut().rename_at(
             &source_descriptor,
@@ -859,7 +1084,7 @@ where
         Ok(Err(p2fs::ErrorCode::Unsupported))
     }
 
-    fn unlink_file_at(
+    async fn unlink_file_at(
         &mut self,
         descriptor: Resource<FsDescriptor>,
         path: String,
@@ -868,6 +1093,24 @@ where
             Ok(descriptor) => descriptor,
             Err(error) => return Ok(Err(error)),
         };
+        let absolute = match crate::resolve_child_path(&descriptor.path, &path) {
+            Ok(p) => p,
+            Err(error) => return Ok(Err(error_code_from_path(error))),
+        };
+        if let Some(host_path) = crate::guest_host_share_path(&absolute) {
+            let service = match self.filesystem().host_service() {
+                Ok(service) => service,
+                Err(error) => return Ok(Err(error_code_from_p3(error))),
+            };
+            let host_path = host_path.to_owned();
+            return match service.remove(&host_path, false).await {
+                Ok(()) => {
+                    self.filesystem_mut().invalidate_host_subtree(&absolute);
+                    Ok(Ok(()))
+                }
+                Err(err) => Ok(Err(error_code_from_p3(map_host_fs_error(err)))),
+            };
+        }
         match self.filesystem_mut().unlink_file_at(&descriptor, &path) {
             Ok(()) => Ok(Ok(())),
             Err(error) => Ok(Err(error_code_from_p3(error))),
@@ -884,7 +1127,7 @@ where
         Ok(left.path == right.path && left.kind == right.kind)
     }
 
-    fn metadata_hash(
+    async fn metadata_hash(
         &mut self,
         descriptor: Resource<FsDescriptor>,
     ) -> Result<core::result::Result<p2fs::MetadataHashValue, p2fs::ErrorCode>> {
@@ -892,30 +1135,56 @@ where
             Ok(descriptor) => descriptor,
             Err(error) => return Ok(Err(error)),
         };
+        if let Some(host_path) = crate::guest_host_share_path(&descriptor.path) {
+            let service = match self.filesystem().host_service() {
+                Ok(service) => service,
+                Err(error) => return Ok(Err(error_code_from_p3(error))),
+            };
+            let host_path = host_path.to_owned();
+            return match service.stat_path(&host_path).await {
+                Ok(metadata) => Ok(Ok(p2fs::MetadataHashValue {
+                    lower: metadata.qid_path,
+                    upper: u64::from(metadata.mode) << 32 ^ metadata.size,
+                })),
+                Err(err) => Ok(Err(error_code_from_p3(map_host_fs_error(err)))),
+            };
+        }
         match self.filesystem_mut().metadata_hash(&descriptor.path) {
             Ok(hash) => Ok(Ok(metadata_hash_from_p3(hash))),
             Err(error) => Ok(Err(error_code_from_p3(error))),
         }
     }
 
-    fn metadata_hash_at(
+    async fn metadata_hash_at(
         &mut self,
         descriptor: Resource<FsDescriptor>,
         path_flags: p2fs::PathFlags,
         path: String,
     ) -> Result<core::result::Result<p2fs::MetadataHashValue, p2fs::ErrorCode>> {
-        if path_flags.contains(p2fs::PathFlags::SYMLINK_FOLLOW) {
-            return Ok(Err(p2fs::ErrorCode::Unsupported));
-        }
+        let _ = path_flags;
         let descriptor = match get_fs_descriptor(self, &descriptor) {
             Ok(descriptor) => descriptor,
             Err(error) => return Ok(Err(error)),
         };
-        let path = match crate::resolve_child_path(&descriptor.path, &path) {
+        let absolute = match crate::resolve_child_path(&descriptor.path, &path) {
             Ok(path) => path,
             Err(error) => return Ok(Err(error_code_from_path(error))),
         };
-        match self.filesystem_mut().metadata_hash(&path) {
+        if let Some(host_path) = crate::guest_host_share_path(&absolute) {
+            let service = match self.filesystem().host_service() {
+                Ok(service) => service,
+                Err(error) => return Ok(Err(error_code_from_p3(error))),
+            };
+            let host_path = host_path.to_owned();
+            return match service.stat_path(&host_path).await {
+                Ok(metadata) => Ok(Ok(p2fs::MetadataHashValue {
+                    lower: metadata.qid_path,
+                    upper: u64::from(metadata.mode) << 32 ^ metadata.size,
+                })),
+                Err(err) => Ok(Err(error_code_from_p3(map_host_fs_error(err)))),
+            };
+        }
+        match self.filesystem_mut().metadata_hash(&absolute) {
             Ok(hash) => Ok(Ok(metadata_hash_from_p3(hash))),
             Err(error) => Ok(Err(error_code_from_p3(error))),
         }

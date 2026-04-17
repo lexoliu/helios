@@ -85,6 +85,10 @@ pub struct ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem> {
     execution_context: ComponentExecutionContext<FileSystem>,
     serial_reader: fn(u32) -> Vec<u8>,
     serial_writer: fn(&[u8]),
+    /// Set by `wasi:cli/exit.{exit,exit-with-code}` before the guest
+    /// traps; the executor reads it to distinguish a clean requested
+    /// exit (turn into an exit code) from an actual runtime error.
+    requested_exit: Option<u8>,
 }
 
 pub struct DeadlinePollable<CpuImpl, RuntimeStateImpl> {
@@ -150,7 +154,19 @@ where
             ),
             serial_reader,
             serial_writer,
+            requested_exit: None,
         }
+    }
+
+    /// Record the exit code requested by `wasi:cli/exit` so the
+    /// executor can report it cleanly after the guest trap.
+    pub fn request_exit(&mut self, code: u8) {
+        self.requested_exit = Some(code);
+    }
+
+    /// Consume any exit code recorded before the guest trapped.
+    pub fn take_requested_exit(&mut self) -> Option<u8> {
+        self.requested_exit.take()
     }
 
     pub(crate) fn instance(&self) -> &RegisteredInstance {

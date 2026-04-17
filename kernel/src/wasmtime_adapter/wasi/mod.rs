@@ -840,9 +840,11 @@ where
         descriptor_flags: fs_types::DescriptorFlags,
         now_nanos: u64,
     ) -> core::result::Result<FsDescriptor, fs_types::ErrorCode> {
-        if path_flags.contains(fs_types::PathFlags::SYMLINK_FOLLOW) {
-            return Err(fs_types::ErrorCode::Unsupported);
-        }
+        // We deliberately ignore `path_flags::SYMLINK_FOLLOW`: our guest
+        // filesystem does not support symlinks at all, so following them
+        // is a no-op. POSIX `open()` defaults to following symlinks, so
+        // rejecting the flag would break the vast majority of programs.
+        let _ = path_flags;
         if base.kind != FsNodeKind::Directory {
             return Err(fs_types::ErrorCode::NotDirectory);
         }
@@ -1220,14 +1222,18 @@ where
     HostFs: crate::HostFileSystem,
 {
     fn exit(&mut self, status: core::result::Result<(), ()>) -> Result<()> {
-        let message = match status {
-            Ok(()) => "guest requested wasi exit success",
-            Err(()) => "guest requested wasi exit failure",
+        let code = match status {
+            Ok(()) => 0,
+            Err(()) => 1,
         };
-        Err(wasmtime::Error::msg(message))
+        self.request_exit(code);
+        Err(wasmtime::Error::msg(alloc::format!(
+            "guest requested wasi exit code {code}"
+        )))
     }
 
     fn exit_with_code(&mut self, status_code: u8) -> Result<()> {
+        self.request_exit(status_code);
         Err(wasmtime::Error::msg(alloc::format!(
             "guest requested wasi exit code {status_code}"
         )))
@@ -1871,9 +1877,8 @@ where
         path_flags: fs_types::PathFlags,
         path: String,
     ) -> Result<fs_types::DescriptorStat, FsError> {
-        if path_flags.contains(fs_types::PathFlags::SYMLINK_FOLLOW) {
-            return Err(fs_types::ErrorCode::Unsupported.into());
-        }
+        // Guest filesystem has no symlinks; SYMLINK_FOLLOW is a no-op.
+        let _ = path_flags;
         let absolute = accessor.with(|mut access| {
             let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
             crate::resolve_child_path(&descriptor.path, &path)
@@ -1947,9 +1952,8 @@ where
             Ok::<_, FsError>((base.path.clone(), base.kind, base.flags))
         })?;
 
-        if path_flags.contains(fs_types::PathFlags::SYMLINK_FOLLOW) {
-            return Err(fs_types::ErrorCode::Unsupported.into());
-        }
+        // No symlinks in our guest FS — SYMLINK_FOLLOW is a no-op.
+        let _ = path_flags;
         if base_kind != FsNodeKind::Directory {
             return Err(fs_types::ErrorCode::NotDirectory.into());
         }
@@ -2315,9 +2319,8 @@ where
         path_flags: fs_types::PathFlags,
         path: String,
     ) -> Result<fs_types::MetadataHashValue, FsError> {
-        if path_flags.contains(fs_types::PathFlags::SYMLINK_FOLLOW) {
-            return Err(fs_types::ErrorCode::Unsupported.into());
-        }
+        // No symlinks in our guest FS — SYMLINK_FOLLOW is a no-op.
+        let _ = path_flags;
         let absolute = accessor.with(|mut access| {
             let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
             crate::resolve_child_path(&descriptor.path, &path)
@@ -2778,7 +2781,7 @@ fn map_component_fs_path_error(error: crate::ComponentFsPathError) -> fs_types::
     }
 }
 
-fn map_host_fs_error(error: crate::HostFsError) -> fs_types::ErrorCode {
+pub(crate) fn map_host_fs_error(error: crate::HostFsError) -> fs_types::ErrorCode {
     match error.kind() {
         HostFsErrorKind::NoEntry => fs_types::ErrorCode::NoEntry,
         HostFsErrorKind::Exist => fs_types::ErrorCode::Exist,

@@ -73,18 +73,15 @@ where
     ) -> impl core::future::Future<Output = Result<ComponentRunResult, Self::Error>> + Send {
         async move {
             let run = self.run_func;
-            let result = self
+            let raw = self
                 .store
                 .run_concurrent(async move |accessor| run.call_concurrent(accessor, ()).await)
-                .await??;
-            // After run_concurrent completes, we can access the store again.
-            let status = match result {
-                (Ok(()),) => ComponentExitStatus::Ok,
-                (Err(()),) => ComponentExitStatus::Failed,
-            };
+                .await;
+            let (status, exit_code) = interpret_run_result(raw, self.store.data_mut())?;
             let instance_id = self.store.data().instance().id();
             Ok(ComponentRunResult {
                 status,
+                exit_code,
                 instance_id,
             })
         }
@@ -120,15 +117,43 @@ where
             }
         };
 
-        let result = result??;
-        let status = match result {
-            (Ok(()),) => ComponentExitStatus::Ok,
-            (Err(()),) => ComponentExitStatus::Failed,
-        };
+        let (status, exit_code) = interpret_run_result(result, self.store.data_mut())?;
         Ok(ComponentRunResult {
             status,
+            exit_code,
             instance_id: self.store.data().instance().id(),
         })
+    }
+}
+
+/// Turn the raw `wasmtime::Result<wasmtime::Result<(Result<(), ()>,)>>` coming
+/// out of `run_concurrent` into a clean `(status, exit_code)` pair.
+///
+/// Runtime traps that correspond to `wasi:cli/exit` requests are treated as
+/// a clean exit with the code the guest supplied; other traps still bubble
+/// up as `wasmtime::Error`.
+fn interpret_run_result<CpuImpl, HostFs>(
+    raw: wasmtime::Result<wasmtime::Result<(Result<(), ()>,)>>,
+    store_data: &mut StoreData<CpuImpl, HostFs>,
+) -> wasmtime::Result<(ComponentExitStatus, u32)>
+where
+    CpuImpl: Cpu + CodegenPlatform + Clone,
+    HostFs: HostFileSystem,
+{
+    match raw {
+        Ok(Ok((Ok(()),))) => Ok((ComponentExitStatus::Ok, 0)),
+        Ok(Ok((Err(()),))) => Ok((ComponentExitStatus::Failed, 1)),
+        Ok(Err(trap)) | Err(trap) => match store_data.take_requested_exit() {
+            Some(code) => {
+                let status = if code == 0 {
+                    ComponentExitStatus::Ok
+                } else {
+                    ComponentExitStatus::Failed
+                };
+                Ok((status, u32::from(code)))
+            }
+            None => Err(trap),
+        },
     }
 }
 

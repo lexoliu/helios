@@ -575,7 +575,7 @@ where
     HostFs: crate::HostFileSystem,
 {
     use crate::{
-        ComponentExecContext, ComponentExecutor, ComponentExitStatus, ComponentRuntimeFactory,
+        ComponentExecContext, ComponentExecutor, ComponentRuntimeFactory,
         ComponentWorld,
     };
 
@@ -611,10 +611,7 @@ where
 
     Ok(ChildExit {
         instance_id: result.instance_id,
-        exit_code: match result.status {
-            ComponentExitStatus::Ok => 0,
-            ComponentExitStatus::Failed => 1,
-        },
+        exit_code: result.exit_code,
     })
 }
 
