@@ -19,6 +19,12 @@ pub fn build_component_engine_config(target: &str) -> Config {
     let mut config = build_target_engine_config(target);
     config.wasm_component_model(true);
     config.wasm_component_model_async(true);
+    // CPython's class construction recurses deeply; the default
+    // 512 KB stack is not enough. Give component instances an 8 MB
+    // stack (both for the guest wasm call stack and for the host
+    // Rust async frames that drive it).
+    config.max_wasm_stack(8 * 1024 * 1024);
+    config.async_stack_size(8 * 1024 * 1024);
     config
 }
 

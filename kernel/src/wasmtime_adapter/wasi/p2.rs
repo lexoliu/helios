@@ -812,7 +812,6 @@ where
         path: String,
     ) -> Result<core::result::Result<p2fs::DescriptorStat, p2fs::ErrorCode>> {
         let _ = path_flags;
-        self.write_serial(alloc::format!("[p2:stat_at] path={path:?}\n").as_bytes());
         let descriptor = match get_fs_descriptor(self, &descriptor) {
             Ok(descriptor) => descriptor,
             Err(error) => return Ok(Err(error)),
@@ -880,7 +879,6 @@ where
         flags: p2fs::DescriptorFlags,
     ) -> Result<core::result::Result<Resource<FsDescriptor>, p2fs::ErrorCode>> {
         let _ = path_flags;
-        self.write_serial(alloc::format!("[p2:open_at] path={path:?}\n").as_bytes());
         let base = match get_fs_descriptor(self, &descriptor) {
             Ok(descriptor) => descriptor,
             Err(error) => return Ok(Err(error)),
@@ -903,13 +901,6 @@ where
             let metadata = match service.stat_path(&host_path).await {
                 Ok(meta) => Some(meta),
                 Err(err) => {
-                    self.write_serial(
-                        alloc::format!(
-                            "[p2:open_at] host stat failed path={host_path:?} kind={:?}\n",
-                            err.kind()
-                        )
-                        .as_bytes(),
-                    );
                     let code = map_host_fs_error(err);
                     if matches!(
                         code,
