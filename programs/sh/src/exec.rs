@@ -108,6 +108,10 @@ impl CommandStatus {
         matches!(self.flow, ControlFlow::ExitShell)
     }
 
+    pub const fn is_return(self) -> bool {
+        matches!(self.flow, ControlFlow::Return)
+    }
+
     pub const fn is_interrupting(self) -> bool {
         !matches!(self.flow, ControlFlow::None)
     }
@@ -385,6 +389,40 @@ where
         }
         self.last_status = last.code();
         Ok(last)
+    }
+
+    pub(crate) async fn eval_source_with_io(
+        &mut self,
+        source: &str,
+        io: ExecutionIo,
+    ) -> Result<CommandStatus> {
+        let program = parser::parse(source)?;
+        self.run_program_with_io(&program, io).await
+    }
+
+    pub(crate) async fn load_shell_source(&self, path: &Path) -> Result<String> {
+        let bytes = self.platform.read_file(path).await?;
+        String::from_utf8(bytes).map_err(|error| {
+            ShellError::message(format!(
+                "shell source {} is not valid utf-8: {error}",
+                path.display()
+            ))
+        })
+    }
+
+    pub(crate) async fn resolve_source_path(&self, input: &str) -> Result<PathBuf> {
+        let search_path = self
+            .variable("PATH")
+            .map(|variable| variable.value.as_str())
+            .unwrap_or("/bin");
+
+        for candidate in source_candidate_paths(&self.working_dir, input, search_path) {
+            if self.platform.is_file(&candidate).await {
+                return Ok(candidate);
+            }
+        }
+
+        Err(ShellError::message(format!("{input}: not found")))
     }
 
     #[async_recursion(?Send)]
@@ -2277,7 +2315,17 @@ fn apply_pipeline_bang(status: CommandStatus, bang: bool) -> CommandStatus {
 fn is_special_builtin(name: &str) -> bool {
     matches!(
         name,
-        ":" | "break" | "continue" | "exec" | "exit" | "export" | "return" | "unset"
+        "." | ":"
+            | "break"
+            | "continue"
+            | "eval"
+            | "exec"
+            | "exit"
+            | "export"
+            | "return"
+            | "set"
+            | "shift"
+            | "unset"
     )
 }
 
@@ -2310,6 +2358,18 @@ fn candidate_paths(cwd: &Path, input: &str, search_path: &str) -> Vec<PathBuf> {
         }
     }
     candidates
+}
+
+fn source_candidate_paths(cwd: &Path, input: &str, search_path: &str) -> Vec<PathBuf> {
+    if input.contains('/') || input.starts_with('.') {
+        return vec![resolve_path(cwd, Path::new(input))];
+    }
+
+    search_path
+        .split(':')
+        .filter(|segment| !segment.is_empty())
+        .map(|directory| resolve_path(cwd, Path::new(directory)).join(input))
+        .collect()
 }
 
 fn explicit_program_candidates(cwd: &Path, input: &str) -> Vec<PathBuf> {
@@ -2526,6 +2586,63 @@ mod tests {
     }
 
     #[test]
+    fn set_and_shift_manage_positional_parameters() {
+        let state = run_script(
+            "set foo bar\nfor value in \"$@\"; do echo \"<$value>\"; done\nshift\nfor value in \"$@\"; do echo \"[$value]\"; done\nset --\necho \"$#\"\n",
+            [],
+        );
+        assert_eq!(state.stdout, b"<foo>\n<bar>\n[bar]\n0\n");
+    }
+
+    #[test]
+    fn set_lists_variables_with_shell_quoting() {
+        let state = run_script("foo=bar\nbaz='a b'\nempty=\nset\n", []);
+        let stdout = String::from_utf8(state.stdout).expect("stdout should be utf-8");
+        assert!(stdout.contains("foo='bar'\n"));
+        assert!(stdout.contains("baz='a b'\n"));
+        assert!(stdout.contains("empty=''\n"));
+    }
+
+    #[test]
+    fn eval_runs_in_current_shell_context() {
+        let state = run_script(
+            "foo=bar\neval echo '$foo'\neval set -- c d\nfor value in \"$@\"; do echo \"<$value>\"; done\n",
+            [],
+        );
+        assert_eq!(state.stdout, b"bar\n<c>\n<d>\n");
+    }
+
+    #[test]
+    fn dot_sources_file_and_plainifies_return_status() {
+        let state = run_script(
+            "emit_source >/bin/source-me\n. source-me\necho \"$foo\"\nf(){ . /bin/return-me; echo \"dot=$?\"; echo after; }\nemit_return >/bin/return-me\nf\n",
+            [
+                ("emit_source", emit_source_command),
+                ("emit_return", emit_return_command),
+            ],
+        );
+        assert_eq!(state.stdout, b"sourced\nbar\ndot=4\nafter\n");
+    }
+
+    #[test]
+    fn special_builtin_errors_exit_noninteractive_shell() {
+        let (shift_status, shift_state) = run_script_with_status("shift x\necho no\n", []);
+        assert_eq!(shift_status.code(), 2);
+        assert!(shift_status.is_exit());
+        assert!(shift_state.stdout.is_empty());
+
+        let (eval_status, eval_state) = run_script_with_status("eval if\necho no\n", []);
+        assert_eq!(eval_status.code(), 2);
+        assert!(eval_status.is_exit());
+        assert!(eval_state.stdout.is_empty());
+
+        let (dot_status, dot_state) = run_script_with_status(". missing\necho no\n", []);
+        assert_eq!(dot_status.code(), 2);
+        assert!(dot_status.is_exit());
+        assert!(dot_state.stdout.is_empty());
+    }
+
+    #[test]
     fn subshell_and_pipeline_exit_do_not_abort_parent_shell() {
         let state = run_script(
             "(exit 7)\necho after-subshell\nexit 3 | cat\necho after-pipeline\n",
@@ -2614,6 +2731,22 @@ mod tests {
         TestCommandResult {
             exit_code: 0,
             stdout: b"a\n\n".to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    fn emit_source_command(_invocation: TestInvocation) -> TestCommandResult {
+        TestCommandResult {
+            exit_code: 0,
+            stdout: b"echo sourced\nfoo=bar\n".to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    fn emit_return_command(_invocation: TestInvocation) -> TestCommandResult {
+        TestCommandResult {
+            exit_code: 0,
+            stdout: b"return 4\n".to_vec(),
             stderr: Vec::new(),
         }
     }

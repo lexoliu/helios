@@ -10,14 +10,18 @@ pub async fn dispatch<P: ShellPlatform>(
     mut io: ExecutionIo,
 ) -> Result<Option<CommandStatus>> {
     let status = match name {
+        "." => Some(dot(shell, args, io.clone()).await?),
         "true" => Some(CommandStatus::SUCCESS),
         "false" => Some(CommandStatus::new(1)),
         "break" => Some(break_builtin(shell, args, &mut io).await?),
         "continue" => Some(continue_builtin(shell, args, &mut io).await?),
+        "eval" => Some(eval(shell, args, io.clone()).await?),
         "echo" => Some(echo(args, &mut io).await?),
         "cat" => Some(cat(shell, args, &mut io).await?),
         "pwd" => Some(pwd(shell, &mut io).await?),
         "cd" => Some(cd(shell, args, &mut io).await?),
+        "set" => Some(set_builtin(shell, args, &mut io).await?),
+        "shift" => Some(shift_builtin(shell, args, &mut io).await?),
         "test" | "[" => Some(run_test(shell, name, args).await?),
         "export" => Some(export(shell, args, &mut io).await?),
         "return" => Some(return_builtin(shell, args, &mut io).await?),
@@ -41,14 +45,17 @@ pub async fn dispatch<P: ShellPlatform>(
 pub fn is_builtin(name: &str) -> bool {
     matches!(
         name,
-        "true"
+        "." | "true"
             | "false"
             | "break"
             | "continue"
+            | "eval"
             | "echo"
             | "cat"
             | "pwd"
             | "cd"
+            | "set"
+            | "shift"
             | "test"
             | "["
             | "export"
@@ -58,6 +65,51 @@ pub fn is_builtin(name: &str) -> bool {
             | "exit"
             | ":"
     )
+}
+
+async fn dot<P: ShellPlatform>(
+    shell: &mut Shell<P>,
+    args: &[String],
+    io: ExecutionIo,
+) -> Result<CommandStatus> {
+    let Some(input) = args.first() else {
+        return Ok(CommandStatus::SUCCESS);
+    };
+
+    let path = match shell.resolve_source_path(input).await {
+        Ok(path) => path,
+        Err(error) => return special_builtin_error(".", error.to_string(), io).await,
+    };
+    let source = match shell.load_shell_source(&path).await {
+        Ok(source) => source,
+        Err(error) => return special_builtin_error(".", error.to_string(), io).await,
+    };
+    let status = match shell.eval_source_with_io(&source, io.clone()).await {
+        Ok(status) => status,
+        Err(error) => return special_builtin_error(".", error.to_string(), io).await,
+    };
+
+    Ok(if status.is_return() {
+        status.as_plain()
+    } else {
+        status
+    })
+}
+
+async fn eval<P: ShellPlatform>(
+    shell: &mut Shell<P>,
+    args: &[String],
+    io: ExecutionIo,
+) -> Result<CommandStatus> {
+    if args.is_empty() {
+        return Ok(CommandStatus::SUCCESS);
+    }
+
+    let source = args.join(" ");
+    match shell.eval_source_with_io(&source, io.clone()).await {
+        Ok(status) => Ok(status),
+        Err(error) => special_builtin_error("eval", error.to_string(), io).await,
+    }
 }
 
 async fn cat<P: ShellPlatform>(
@@ -114,7 +166,7 @@ async fn break_builtin<P: ShellPlatform>(
 ) -> Result<CommandStatus> {
     let depth = match parse_loop_depth("break", args, io).await? {
         Some(depth) => depth,
-        None => return Ok(CommandStatus::new(2)),
+        None => return Ok(CommandStatus::exit(2)),
     };
     if shell.loop_depth == 0 {
         return Ok(CommandStatus::SUCCESS);
@@ -129,12 +181,66 @@ async fn continue_builtin<P: ShellPlatform>(
 ) -> Result<CommandStatus> {
     let depth = match parse_loop_depth("continue", args, io).await? {
         Some(depth) => depth,
-        None => return Ok(CommandStatus::new(2)),
+        None => return Ok(CommandStatus::exit(2)),
     };
     if shell.loop_depth == 0 {
         return Ok(CommandStatus::SUCCESS);
     }
     Ok(CommandStatus::continue_loop(0, depth))
+}
+
+async fn set_builtin<P: ShellPlatform>(
+    shell: &mut Shell<P>,
+    args: &[String],
+    io: &mut ExecutionIo,
+) -> Result<CommandStatus> {
+    if args.is_empty() {
+        let mut names = shell.variables.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        for name in names {
+            let value = shell
+                .variable(&name)
+                .map(|variable| variable.value.clone())
+                .unwrap_or_default();
+            let line = format!("{name}={}\n", shell_quote(&value));
+            let mut stdout = io.output(1);
+            write_all(&mut stdout, line.as_bytes()).await?;
+        }
+        return Ok(CommandStatus::SUCCESS);
+    }
+
+    if args[0] == "--" {
+        shell.positional_parameters = args[1..].to_vec();
+        return Ok(CommandStatus::SUCCESS);
+    }
+
+    if args[0].starts_with('-') || args[0].starts_with('+') {
+        return special_builtin_error(
+            "set",
+            format!("shell options are not supported: {:?}", args[0]),
+            (*io).clone(),
+        )
+        .await;
+    }
+
+    shell.positional_parameters = args.to_vec();
+    Ok(CommandStatus::SUCCESS)
+}
+
+async fn shift_builtin<P: ShellPlatform>(
+    shell: &mut Shell<P>,
+    args: &[String],
+    io: &mut ExecutionIo,
+) -> Result<CommandStatus> {
+    let count = match parse_shift_count(args, io).await? {
+        Some(count) => count,
+        None => return Ok(CommandStatus::exit(2)),
+    };
+    if count > shell.positional_parameters.len() {
+        return special_builtin_error("shift", "can't shift that many", (*io).clone()).await;
+    }
+    shell.positional_parameters.drain(..count);
+    Ok(CommandStatus::SUCCESS)
 }
 
 async fn pwd<P: ShellPlatform>(shell: &Shell<P>, io: &mut ExecutionIo) -> Result<CommandStatus> {
@@ -316,7 +422,7 @@ async fn return_builtin<P: ShellPlatform>(
 ) -> Result<CommandStatus> {
     let code = match parse_status_code("return", args, shell.last_status, io).await? {
         Some(code) => code,
-        None => return Ok(CommandStatus::new(2)),
+        None => return Ok(CommandStatus::exit(2)),
     };
     if shell.function_depth == 0 {
         return Ok(CommandStatus::exit(code));
@@ -353,6 +459,19 @@ async fn parse_loop_depth(
     }
 }
 
+async fn parse_shift_count(args: &[String], io: &mut ExecutionIo) -> Result<Option<usize>> {
+    let Some(value) = args.first() else {
+        return Ok(Some(1));
+    };
+    match value.parse::<usize>() {
+        Ok(count) => Ok(Some(count)),
+        Err(_) => {
+            write_illegal_number("shift", value, io).await?;
+            Ok(None)
+        }
+    }
+}
+
 async fn parse_status_code(
     name: &str,
     args: &[String],
@@ -376,4 +495,19 @@ async fn write_illegal_number(name: &str, value: &str, io: &mut ExecutionIo) -> 
     let message = format!("{name}: Illegal number: {value}\n");
     write_all(&mut stderr, message.as_bytes()).await?;
     Ok(())
+}
+
+async fn special_builtin_error(
+    name: &str,
+    message: impl Into<String>,
+    io: ExecutionIo,
+) -> Result<CommandStatus> {
+    let mut stderr = io.output(2);
+    let message = format!("{name}: {}\n", message.into());
+    write_all(&mut stderr, message.as_bytes()).await?;
+    Ok(CommandStatus::exit(2))
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
