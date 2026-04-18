@@ -21,6 +21,7 @@ use glob::{MatchOptions, Pattern};
 use crate::builtin;
 use crate::error::{Result, ShellError};
 use crate::ifs::{DEFAULT_IFS, IfsConfig};
+use crate::options::ShellOptions;
 use crate::parser;
 use crate::platform::{ResolvedProgram, RunningProcess, ShellPlatform, SpawnRequest, WriteMode};
 use crate::streams::{InputStream, OutputStream, capture_output, write_all};
@@ -138,6 +139,7 @@ pub struct Shell<P> {
     pub(crate) shell_name: String,
     pub(crate) process_id: String,
     pub(crate) positional_parameters: Vec<String>,
+    pub(crate) options: ShellOptions,
     pub(crate) working_dir: PathBuf,
     pub(crate) last_status: i32,
     pub(crate) last_pipeline_statuses: Vec<i32>,
@@ -253,6 +255,7 @@ where
             shell_name: bootstrap.shell_name,
             process_id: bootstrap.process_id,
             positional_parameters: bootstrap.positional_parameters,
+            options: ShellOptions::default(),
             working_dir: bootstrap.working_dir,
             last_status: 0,
             last_pipeline_statuses: vec![0],
@@ -276,13 +279,16 @@ where
         match self.variables.get_mut(&name) {
             Some(existing) => {
                 existing.value = Some(value);
+                if self.options.allexport() {
+                    existing.exported = true;
+                }
             }
             None => {
                 self.variables.insert(
                     name,
                     Variable {
                         value: Some(value),
-                        exported: false,
+                        exported: self.options.allexport(),
                         readonly: false,
                     },
                 );
@@ -349,7 +355,7 @@ where
                     name.to_owned(),
                     Variable {
                         value,
-                        exported: false,
+                        exported: self.options.allexport(),
                         readonly: true,
                     },
                 );
@@ -467,6 +473,7 @@ where
             shell_name: self.shell_name.clone(),
             process_id: self.process_id.clone(),
             positional_parameters: self.positional_parameters.clone(),
+            options: self.options,
             working_dir: self.working_dir.clone(),
             last_status: self.last_status,
             last_pipeline_statuses: self.last_pipeline_statuses.clone(),
@@ -1454,7 +1461,7 @@ where
     async fn expand_pathnames(&self, fields: Vec<WordField>) -> Result<Vec<String>> {
         let mut expanded = Vec::new();
         for field in fields {
-            if !field.has_glob_metacharacters() {
+            if self.options.noglob() || !field.has_glob_metacharacters() {
                 expanded.push(field.render_text());
                 continue;
             }
@@ -1767,7 +1774,7 @@ where
                 is_set: true,
             },
             SpecialParameter::CurrentOptionFlags => ParameterState {
-                value: String::new(),
+                value: self.options.current_option_flags(),
                 is_set: true,
             },
             SpecialParameter::ProcessId => ParameterState {
@@ -2752,6 +2759,44 @@ mod tests {
             [],
         );
         assert_eq!(state.stdout, b"<foo>\n<bar>\n[bar]\n0\n");
+    }
+
+    #[test]
+    fn set_supports_allexport_and_tracks_current_flags() {
+        let state = run_script(
+            "set -a\nfoo=bar\nreadonly ro\nprintenv foo\nprintenv ro\necho \"$-\"\nset +a\nbar=baz\nprintenv bar\n",
+            [("printenv", printenv_command)],
+        );
+        assert_eq!(state.stdout, b"bar\na\n");
+    }
+
+    #[test]
+    fn set_supports_noglob_and_named_option_listing() {
+        let state = run_script(
+            ": >/a.rs\nset -f\necho *.rs\nset -o\nset +o\nset +o noglob\necho *.rs\n",
+            [],
+        );
+        let stdout = String::from_utf8(state.stdout).expect("stdout should be utf-8");
+        assert!(stdout.starts_with("*.rs\n"));
+        assert!(stdout.contains("Current option settings\n"));
+        assert!(stdout.contains("allexport       off\n"));
+        assert!(stdout.contains("noglob          on\n"));
+        assert!(stdout.contains("set +o allexport\n"));
+        assert!(stdout.contains("set -o noglob\n"));
+        assert!(stdout.ends_with("a.rs\n"));
+    }
+
+    #[test]
+    fn invalid_set_options_exit_noninteractive_shell() {
+        let (status, state) = run_script_with_status("set -z\necho no\n", []);
+        assert_eq!(status.code(), 2);
+        assert!(status.is_exit());
+        assert_eq!(state.stderr, b"set: Illegal option -z\n");
+
+        let (status, state) = run_script_with_status("set -o nope\necho no\n", []);
+        assert_eq!(status.code(), 2);
+        assert!(status.is_exit());
+        assert_eq!(state.stderr, b"set: Illegal option -o nope\n");
     }
 
     #[test]

@@ -7,6 +7,7 @@ mod builtin;
 mod error;
 mod exec;
 mod ifs;
+mod options;
 mod parser;
 mod platform;
 mod read;

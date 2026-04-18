@@ -1,5 +1,8 @@
 use crate::error::{Result, ShellError};
 use crate::exec::{CommandStatus, ExecutionIo, Shell};
+use crate::options::{
+    SetAction, format_named_option_settings, format_reusable_option_commands, parse_set_arguments,
+};
 use crate::platform::ShellPlatform;
 use crate::read::{ReadCommand, read_fields};
 use crate::streams::{close, read_all, write_all};
@@ -220,21 +223,34 @@ async fn set_builtin<P: ShellPlatform>(
         return Ok(CommandStatus::SUCCESS);
     }
 
-    if args[0] == "--" {
-        shell.positional_parameters = args[1..].to_vec();
-        return Ok(CommandStatus::SUCCESS);
+    match parse_set_arguments(args) {
+        Ok(SetAction::Update {
+            updates,
+            positional_parameters,
+        }) => {
+            for update in updates {
+                shell.options.set(
+                    update.option,
+                    matches!(update.mode, crate::options::OptionMode::Enable),
+                );
+            }
+            if let Some(positional_parameters) = positional_parameters {
+                shell.positional_parameters = positional_parameters;
+            }
+        }
+        Ok(SetAction::PrintNamedOptions) => {
+            let mut stdout = io.output(1);
+            let text = format_named_option_settings(shell.options);
+            write_all(&mut stdout, text.as_bytes()).await?;
+        }
+        Ok(SetAction::PrintReusableCommands) => {
+            let mut stdout = io.output(1);
+            let text = format_reusable_option_commands(shell.options);
+            write_all(&mut stdout, text.as_bytes()).await?;
+        }
+        Err(error) => return special_builtin_error("set", error.to_string(), (*io).clone()).await,
     }
 
-    if args[0].starts_with('-') || args[0].starts_with('+') {
-        return special_builtin_error(
-            "set",
-            format!("shell options are not supported: {:?}", args[0]),
-            (*io).clone(),
-        )
-        .await;
-    }
-
-    shell.positional_parameters = args.to_vec();
     Ok(CommandStatus::SUCCESS)
 }
 
