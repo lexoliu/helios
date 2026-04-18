@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use futures::channel::oneshot;
 use futures::future::{FutureExt, LocalBoxFuture};
 use futures::io::{AsyncRead, AsyncWrite};
+use glob::MatchOptions;
 use helios_api::bindings::wit_stream;
 use helios_api::programs;
 use helios_api::{fs as helios_fs, io as helios_io, task as helios_task};
@@ -67,6 +68,8 @@ pub trait ShellPlatform: Clone + 'static {
     async fn is_file(&self, path: &Path) -> bool;
 
     async fn is_dir(&self, path: &Path) -> bool;
+
+    async fn expand_glob(&self, cwd: &Path, pattern: &str) -> Result<Vec<String>>;
 
     async fn spawn(&self, request: SpawnRequest) -> Result<Self::Child>;
 }
@@ -153,6 +156,41 @@ impl ShellPlatform for HeliosPlatform {
 
     async fn is_dir(&self, path: &Path) -> bool {
         helios_fs::is_dir(path).await
+    }
+
+    async fn expand_glob(&self, cwd: &Path, pattern: &str) -> Result<Vec<String>> {
+        let raw_path = Path::new(pattern);
+        let absolute_pattern = if raw_path.is_absolute() {
+            raw_path.to_path_buf()
+        } else {
+            cwd.join(raw_path)
+        };
+        let rendered_pattern = absolute_pattern.display().to_string();
+        let relative = !raw_path.is_absolute();
+
+        let matches = match glob::glob_with(
+            &rendered_pattern,
+            MatchOptions {
+                case_sensitive: true,
+                require_literal_separator: true,
+                require_literal_leading_dot: true,
+            },
+        ) {
+            Ok(matches) => matches,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let mut expanded = Vec::new();
+        for path in matches {
+            let path = path.map_err(|error| {
+                ShellError::message(format!(
+                    "glob expansion failed for {rendered_pattern:?}: {error}"
+                ))
+            })?;
+            expanded.push(render_glob_match(path, cwd, relative));
+        }
+        expanded.sort();
+        Ok(expanded)
     }
 
     async fn spawn(&self, request: SpawnRequest) -> Result<Self::Child> {
@@ -293,10 +331,25 @@ async fn await_forwarder(receiver: oneshot::Receiver<Result<()>>) -> Result<()> 
         .map_err(|_| ShellError::message("shell stream forwarder dropped"))?
 }
 
+pub(crate) fn render_glob_match(path: PathBuf, cwd: &Path, relative: bool) -> String {
+    if relative {
+        match path.strip_prefix(cwd) {
+            Ok(relative_path) if !relative_path.as_os_str().is_empty() => {
+                relative_path.display().to_string()
+            }
+            Ok(_) => ".".to_owned(),
+            Err(_) => path.display().to_string(),
+        }
+    } else {
+        path.display().to_string()
+    }
+}
+
 struct HeliosFileWriter {
     path: PathBuf,
     mode: WriteMode,
     buffer: Vec<u8>,
+    initialized: bool,
     pending: Option<LocalBoxFuture<'static, io::Result<()>>>,
 }
 
@@ -306,6 +359,7 @@ impl HeliosFileWriter {
             path,
             mode,
             buffer: Vec::new(),
+            initialized: false,
             pending: None,
         }
     }
@@ -441,22 +495,22 @@ impl AsyncWrite for HeliosFileWriter {
             Poll::Pending => return Poll::Pending,
         }
 
-        if self.buffer.is_empty() {
+        if self.buffer.is_empty() && self.initialized {
             return Poll::Ready(Ok(()));
         }
 
         let bytes = std::mem::take(&mut self.buffer);
         let path = self.path.clone();
         let mode = self.mode;
+        let initialized = self.initialized;
+        self.initialized = true;
         self.pending = Some(Box::pin(async move {
-            let payload = match mode {
-                WriteMode::Truncate => bytes,
-                WriteMode::Append => {
-                    let mut existing = helios_fs::read(&path).await.unwrap_or_default();
-                    existing.extend_from_slice(&bytes);
-                    existing
-                }
+            let mut payload = if initialized || matches!(mode, WriteMode::Append) {
+                helios_fs::read(&path).await.unwrap_or_default()
+            } else {
+                Vec::new()
             };
+            payload.extend_from_slice(&bytes);
             helios_fs::write(&path, payload).await.map_err(|error| {
                 io::Error::other(format!("failed to write {}: {error:#}", path.display()))
             })

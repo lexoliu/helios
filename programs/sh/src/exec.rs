@@ -267,6 +267,25 @@ where
         resolve_path(&self.working_dir, Path::new(path))
     }
 
+    fn ifs_value(&self) -> &str {
+        self.variable("IFS")
+            .map(|variable| variable.value.as_str())
+            .unwrap_or(DEFAULT_IFS)
+    }
+
+    fn ifs_joiner(&self) -> String {
+        let ifs = self.ifs_value();
+        if let Some((index, _)) = ifs.char_indices().nth(1) {
+            ifs[..index].to_owned()
+        } else {
+            ifs.to_owned()
+        }
+    }
+
+    fn ifs_config(&self) -> IfsConfig<'_> {
+        IfsConfig::new(self.ifs_value())
+    }
+
     fn new_io(&self) -> ExecutionIo {
         ExecutionIo::new(
             InputStream::empty(),
@@ -602,9 +621,9 @@ where
     ) -> Result<CommandStatus> {
         let values = match &for_clause.values {
             Some(values) => {
-                let mut expanded = Vec::with_capacity(values.len());
+                let mut expanded = Vec::new();
                 for value in values {
-                    expanded.push(self.expand_word(value, &io).await?);
+                    expanded.extend(self.expand_command_word(value, &io).await?);
                 }
                 expanded
             }
@@ -692,7 +711,7 @@ where
                         ));
                     }
                     CommandPrefixOrSuffixItem::Word(word) => {
-                        args.push(self.expand_word(word, &io).await?)
+                        args.extend(self.expand_command_word(word, &io).await?)
                     }
                     CommandPrefixOrSuffixItem::IoRedirect(redirect) => {
                         redirects.push(redirect.clone())
@@ -705,17 +724,17 @@ where
         }
 
         if let Some(word) = &command.word_or_name {
-            args.push(self.expand_word(word, &io).await?);
+            args.extend(self.expand_command_word(word, &io).await?);
         }
 
         if let Some(suffix) = &command.suffix {
             for item in &suffix.0 {
                 match item {
                     CommandPrefixOrSuffixItem::AssignmentWord(_, word) => {
-                        args.push(self.expand_word(word, &io).await?);
+                        args.extend(self.expand_command_word(word, &io).await?);
                     }
                     CommandPrefixOrSuffixItem::Word(word) => {
-                        args.push(self.expand_word(word, &io).await?)
+                        args.extend(self.expand_command_word(word, &io).await?)
                     }
                     CommandPrefixOrSuffixItem::IoRedirect(redirect) => {
                         redirects.push(redirect.clone())
@@ -1026,13 +1045,23 @@ where
     }
 
     async fn expand_word(&mut self, word: &Word, io: &ExecutionIo) -> Result<String> {
-        self.expand_text(&word.value, io, ExpansionMode::Text, false)
-            .await
+        Ok(self
+            .expand_word_expansion(word, io)
+            .await?
+            .scalarize(&self.ifs_joiner()))
+    }
+
+    async fn expand_command_word(&mut self, word: &Word, io: &ExecutionIo) -> Result<Vec<String>> {
+        let expansion = self.expand_word_expansion(word, io).await?;
+        let fields = split_fields(expansion.fields, &self.ifs_config());
+        self.expand_pathnames(fields).await
     }
 
     async fn expand_pattern(&mut self, word: &Word, io: &ExecutionIo) -> Result<String> {
-        self.expand_text(&word.value, io, ExpansionMode::Pattern, false)
-            .await
+        Ok(self
+            .expand_word_expansion(word, io)
+            .await?
+            .render_pattern(&self.ifs_joiner()))
     }
 
     async fn expand_assignment_value(
@@ -1047,16 +1076,19 @@ where
         }
     }
 
+    async fn expand_word_expansion(&mut self, word: &Word, io: &ExecutionIo) -> Result<Expansion> {
+        self.expand_text(&word.value, io, false).await
+    }
+
     #[async_recursion(?Send)]
     async fn expand_text(
         &mut self,
         raw: &str,
         io: &ExecutionIo,
-        mode: ExpansionMode,
         quoted: bool,
-    ) -> Result<String> {
+    ) -> Result<Expansion> {
         let pieces = parser::parse_word(raw)?;
-        self.expand_pieces(&pieces, io, mode, quoted).await
+        self.expand_pieces(&pieces, io, quoted).await
     }
 
     #[async_recursion(?Send)]
@@ -1064,15 +1096,19 @@ where
         &mut self,
         pieces: &[WordPieceWithSource],
         io: &ExecutionIo,
-        mode: ExpansionMode,
         quoted: bool,
-    ) -> Result<String> {
-        let mut out = String::new();
+    ) -> Result<Expansion> {
+        let mut fields = Vec::new();
         for piece in pieces {
-            let expanded = self.expand_piece(&piece.piece, io, mode, quoted).await?;
-            out.push_str(&expanded);
+            let expanded = self.expand_piece(&piece.piece, io, quoted).await?;
+            let next_fields = if quoted && expanded.quote_behavior == QuoteBehavior::JoinFields {
+                vec![join_quoted_fields(expanded.fields, &self.ifs_joiner())]
+            } else {
+                expanded.fields
+            };
+            append_fields(&mut fields, next_fields);
         }
-        Ok(out)
+        Ok(Expansion::from_fields(fields))
     }
 
     #[async_recursion(?Send)]
@@ -1080,43 +1116,66 @@ where
         &mut self,
         piece: &WordPiece,
         io: &ExecutionIo,
-        mode: ExpansionMode,
         quoted: bool,
-    ) -> Result<String> {
+    ) -> Result<Expansion> {
         match piece {
             WordPiece::Text(text) | WordPiece::TildePrefix(text) => {
-                Ok(append_expanded_value(String::new(), text, mode, quoted))
+                Ok(Expansion::from_text(text.clone(), quoted))
             }
             WordPiece::SingleQuotedText(text) | WordPiece::AnsiCQuotedText(text) => {
-                Ok(append_expanded_value(String::new(), text, mode, true))
+                Ok(Expansion::from_text(text.clone(), true))
             }
-            WordPiece::EscapeSequence(text) => Ok(append_expanded_value(
-                String::new(),
-                unescape_sequence(text),
-                mode,
+            WordPiece::EscapeSequence(text) => Ok(Expansion::from_text(
+                unescape_sequence(text).to_owned(),
                 true,
             )),
             WordPiece::DoubleQuotedSequence(pieces)
             | WordPiece::GettextDoubleQuotedSequence(pieces) => {
-                self.expand_pieces(pieces, io, mode, true).await
+                if pieces.is_empty() {
+                    return Ok(Expansion::from_text(String::new(), true));
+                }
+                self.expand_pieces(pieces, io, true).await
             }
             WordPiece::ParameterExpansion(expr) => {
-                self.expand_parameter_expr(expr, io, mode, quoted).await
+                self.expand_parameter_expr(expr, io, quoted).await
             }
             WordPiece::CommandSubstitution(command)
-            | WordPiece::BackquotedCommandSubstitution(command) => Ok(append_expanded_value(
-                String::new(),
-                &self.expand_command_substitution(command, io).await?,
-                mode,
+            | WordPiece::BackquotedCommandSubstitution(command) => Ok(Expansion::from_text(
+                self.expand_command_substitution(command, io).await?,
                 quoted,
             )),
-            WordPiece::ArithmeticExpression(expr) => Ok(append_expanded_value(
-                String::new(),
-                &self.expand_arithmetic_expression(expr)?,
-                mode,
+            WordPiece::ArithmeticExpression(expr) => Ok(Expansion::from_text(
+                self.expand_arithmetic_expression(expr)?,
                 quoted,
             )),
         }
+    }
+
+    async fn expand_pathnames(&self, fields: Vec<WordField>) -> Result<Vec<String>> {
+        let mut expanded = Vec::new();
+        for field in fields {
+            if !field.has_glob_metacharacters() {
+                expanded.push(field.render_text());
+                continue;
+            }
+
+            let pattern = field.render_pattern();
+            if pattern.is_empty() {
+                expanded.push(String::new());
+                continue;
+            }
+
+            let matches = self
+                .platform
+                .expand_glob(&self.working_dir, &pattern)
+                .await?;
+            if matches.is_empty() {
+                expanded.push(field.render_text());
+            } else {
+                expanded.extend(matches);
+            }
+        }
+        Ok(expanded)
     }
 
     async fn expand_command_substitution(
@@ -1146,13 +1205,10 @@ where
         &mut self,
         expr: &ParameterExpr,
         io: &ExecutionIo,
-        mode: ExpansionMode,
         quoted: bool,
-    ) -> Result<String> {
+    ) -> Result<Expansion> {
         match expr {
-            ParameterExpr::Parameter { parameter, .. } => Ok(self
-                .parameter_state(parameter)?
-                .value_for_expansion(mode, quoted)),
+            ParameterExpr::Parameter { parameter, .. } => self.expand_parameter(parameter, quoted),
             ParameterExpr::UseDefaultValues {
                 parameter,
                 test_type,
@@ -1161,9 +1217,9 @@ where
             } => {
                 let state = self.parameter_state(parameter)?;
                 if parameter_satisfies_test(&state, test_type) {
-                    Ok(state.value_for_expansion(mode, quoted))
+                    self.expand_parameter(parameter, quoted)
                 } else {
-                    self.expand_default_value(default_value.as_deref(), io, mode, quoted)
+                    self.expand_default_value(default_value.as_deref(), io, quoted)
                         .await
                 }
             }
@@ -1175,12 +1231,12 @@ where
             } => {
                 let state = self.parameter_state(parameter)?;
                 if parameter_satisfies_test(&state, test_type) {
-                    Ok(state.value_for_expansion(mode, quoted))
+                    self.expand_parameter(parameter, quoted)
                 } else {
                     let value = self
-                        .expand_default_value(default_value.as_deref(), io, mode, quoted)
+                        .expand_default_value(default_value.as_deref(), io, quoted)
                         .await?;
-                    self.assign_parameter(parameter, value.clone())?;
+                    self.assign_parameter(parameter, value.scalarize(&self.ifs_joiner()))?;
                     Ok(value)
                 }
             }
@@ -1192,11 +1248,12 @@ where
             } => {
                 let state = self.parameter_state(parameter)?;
                 if parameter_satisfies_test(&state, test_type) {
-                    Ok(state.value_for_expansion(mode, quoted))
+                    self.expand_parameter(parameter, quoted)
                 } else {
                     let message = if let Some(error_message) = error_message {
-                        self.expand_text(error_message, io, ExpansionMode::Text, false)
+                        self.expand_text(error_message, io, false)
                             .await?
+                            .scalarize(&self.ifs_joiner())
                     } else {
                         format!("{}: parameter not set", parameter_display_name(parameter))
                     };
@@ -1211,15 +1268,18 @@ where
             } => {
                 let state = self.parameter_state(parameter)?;
                 if parameter_satisfies_test(&state, test_type) {
-                    self.expand_default_value(alternative_value.as_deref(), io, mode, quoted)
+                    self.expand_default_value(alternative_value.as_deref(), io, quoted)
                         .await
                 } else {
-                    Ok(String::new())
+                    Ok(Expansion::default())
                 }
             }
             ParameterExpr::ParameterLength { parameter, .. } => {
                 let state = self.parameter_state(parameter)?;
-                Ok(state.value.chars().count().to_string())
+                Ok(Expansion::from_text(
+                    state.value.chars().count().to_string(),
+                    quoted,
+                ))
             }
             ParameterExpr::RemoveSmallestSuffixPattern {
                 parameter, pattern, ..
@@ -1229,6 +1289,7 @@ where
                     pattern.as_deref(),
                     io,
                     PatternRemoval::SmallestSuffix,
+                    quoted,
                 )
                 .await
             }
@@ -1240,6 +1301,7 @@ where
                     pattern.as_deref(),
                     io,
                     PatternRemoval::LargestSuffix,
+                    quoted,
                 )
                 .await
             }
@@ -1251,6 +1313,7 @@ where
                     pattern.as_deref(),
                     io,
                     PatternRemoval::SmallestPrefix,
+                    quoted,
                 )
                 .await
             }
@@ -1262,6 +1325,7 @@ where
                     pattern.as_deref(),
                     io,
                     PatternRemoval::LargestPrefix,
+                    quoted,
                 )
                 .await
             }
@@ -1283,12 +1347,11 @@ where
         &mut self,
         raw: Option<&str>,
         io: &ExecutionIo,
-        mode: ExpansionMode,
         quoted: bool,
-    ) -> Result<String> {
+    ) -> Result<Expansion> {
         match raw {
-            Some(raw) => self.expand_text(raw, io, mode, quoted).await,
-            None => Ok(String::new()),
+            Some(raw) => self.expand_text(raw, io, quoted).await,
+            None => Ok(Expansion::from_text(String::new(), quoted)),
         }
     }
 
@@ -1298,16 +1361,20 @@ where
         pattern: Option<&str>,
         io: &ExecutionIo,
         removal: PatternRemoval,
-    ) -> Result<String> {
+        quoted: bool,
+    ) -> Result<Expansion> {
         let value = self.parameter_state(parameter)?.value;
         let pattern = match pattern {
-            Some(pattern) => {
-                self.expand_text(pattern, io, ExpansionMode::Pattern, false)
-                    .await?
-            }
+            Some(pattern) => self
+                .expand_text(pattern, io, false)
+                .await?
+                .render_pattern(&self.ifs_joiner()),
             None => String::new(),
         };
-        remove_shell_pattern(&value, &pattern, removal)
+        Ok(Expansion::from_text(
+            remove_shell_pattern(&value, &pattern, removal)?,
+            quoted,
+        ))
     }
 
     fn parameter_state(&self, parameter: &Parameter) -> Result<ParameterState> {
@@ -1339,10 +1406,56 @@ where
         }
     }
 
+    fn expand_parameter(&self, parameter: &Parameter, quoted: bool) -> Result<Expansion> {
+        match parameter {
+            Parameter::Positional(index) => {
+                let index = usize::try_from(*index).map_err(|_| {
+                    ShellError::message(format!("invalid positional parameter index {index}"))
+                })?;
+                Ok(Expansion::from_text(
+                    self.positional_parameters
+                        .get(index.saturating_sub(1))
+                        .cloned()
+                        .unwrap_or_default(),
+                    quoted,
+                ))
+            }
+            Parameter::Special(SpecialParameter::AllPositionalParameters { concatenate }) => {
+                let fields = self
+                    .positional_parameters
+                    .iter()
+                    .cloned()
+                    .map(|value| WordField::from_text(value, quoted))
+                    .collect();
+                Ok(Expansion {
+                    fields,
+                    quote_behavior: if quoted && *concatenate {
+                        QuoteBehavior::JoinFields
+                    } else {
+                        QuoteBehavior::PreserveFields
+                    },
+                })
+            }
+            Parameter::Special(special) => Ok(Expansion::from_text(
+                self.special_parameter_state(special).value,
+                quoted,
+            )),
+            Parameter::Named(name) => Ok(Expansion::from_text(
+                self.variable(name)
+                    .map(|variable| variable.value.clone())
+                    .unwrap_or_default(),
+                quoted,
+            )),
+            Parameter::NamedWithIndex { .. } | Parameter::NamedWithAllIndices { .. } => {
+                Err(ShellError::unsupported("array parameter expansion"))
+            }
+        }
+    }
+
     fn special_parameter_state(&self, parameter: &SpecialParameter) -> ParameterState {
         match parameter {
             SpecialParameter::AllPositionalParameters { .. } => ParameterState {
-                value: self.positional_parameters.join(" "),
+                value: self.positional_parameters.join(&self.ifs_joiner()),
                 is_set: !self.positional_parameters.is_empty(),
             },
             SpecialParameter::PositionalParameterCount => ParameterState {
@@ -1594,11 +1707,7 @@ where
     }
 }
 
-#[derive(Clone, Copy)]
-enum ExpansionMode {
-    Text,
-    Pattern,
-}
+const DEFAULT_IFS: &str = " \t\n";
 
 enum DuplicateTarget {
     Fd(IoFd),
@@ -1618,9 +1727,183 @@ struct ParameterState {
     is_set: bool,
 }
 
-impl ParameterState {
-    fn value_for_expansion(&self, mode: ExpansionMode, quoted: bool) -> String {
-        append_expanded_value(String::new(), &self.value, mode, quoted)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum QuoteBehavior {
+    #[default]
+    PreserveFields,
+    JoinFields,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Expansion {
+    fields: Vec<WordField>,
+    quote_behavior: QuoteBehavior,
+}
+
+impl Expansion {
+    fn from_fields(fields: Vec<WordField>) -> Self {
+        Self {
+            fields,
+            quote_behavior: QuoteBehavior::PreserveFields,
+        }
+    }
+
+    fn from_text(value: String, quoted: bool) -> Self {
+        Self::from_fields(vec![WordField::from_text(value, quoted)])
+    }
+
+    fn scalarize(&self, joiner: &str) -> String {
+        self.fields
+            .iter()
+            .map(WordField::render_text)
+            .collect::<Vec<_>>()
+            .join(joiner)
+    }
+
+    fn render_pattern(&self, joiner: &str) -> String {
+        self.fields
+            .iter()
+            .map(WordField::render_pattern)
+            .collect::<Vec<_>>()
+            .join(joiner)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct WordField(Vec<ExpansionPiece>);
+
+impl WordField {
+    fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    fn from_text(value: String, quoted: bool) -> Self {
+        Self(vec![ExpansionPiece::from_text(value, quoted)])
+    }
+
+    fn append(&mut self, other: WordField) {
+        self.0.extend(other.0);
+    }
+
+    fn push_char(&mut self, ch: char, splittable: bool) {
+        match self.0.last_mut() {
+            Some(ExpansionPiece::Splittable(existing)) if splittable => existing.push(ch),
+            Some(ExpansionPiece::Unsplittable(existing)) if !splittable => existing.push(ch),
+            _ => self
+                .0
+                .push(ExpansionPiece::from_text(ch.to_string(), !splittable)),
+        }
+    }
+
+    fn has_unsplittable_piece(&self) -> bool {
+        self.0.iter().any(ExpansionPiece::is_unsplittable)
+    }
+
+    fn render_text(&self) -> String {
+        self.0.iter().map(ExpansionPiece::as_str).collect()
+    }
+
+    fn render_pattern(&self) -> String {
+        let mut rendered = String::new();
+        for piece in &self.0 {
+            rendered.push_str(&piece.render_pattern());
+        }
+        rendered
+    }
+
+    fn has_glob_metacharacters(&self) -> bool {
+        self.0.iter().any(ExpansionPiece::has_glob_metacharacters)
+    }
+
+    fn chars(&self) -> Vec<FieldChar> {
+        let mut chars = Vec::new();
+        for piece in &self.0 {
+            let splittable = piece.is_splittable();
+            for ch in piece.as_str().chars() {
+                chars.push(FieldChar { ch, splittable });
+            }
+        }
+        chars
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ExpansionPiece {
+    Splittable(String),
+    Unsplittable(String),
+}
+
+impl ExpansionPiece {
+    fn from_text(value: String, quoted: bool) -> Self {
+        if quoted {
+            Self::Unsplittable(value)
+        } else {
+            Self::Splittable(value)
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Splittable(value) | Self::Unsplittable(value) => value,
+        }
+    }
+
+    fn is_splittable(&self) -> bool {
+        matches!(self, Self::Splittable(_))
+    }
+
+    fn is_unsplittable(&self) -> bool {
+        matches!(self, Self::Unsplittable(_))
+    }
+
+    fn render_pattern(&self) -> String {
+        match self {
+            Self::Splittable(value) => value.clone(),
+            Self::Unsplittable(value) => Pattern::escape(value),
+        }
+    }
+
+    fn has_glob_metacharacters(&self) -> bool {
+        self.is_splittable() && self.as_str().chars().any(is_glob_metacharacter)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FieldChar {
+    ch: char,
+    splittable: bool,
+}
+
+#[derive(Clone, Copy)]
+enum DelimiterKind {
+    Whitespace,
+    NonWhitespace,
+}
+
+#[derive(Clone, Copy)]
+struct IfsConfig<'a> {
+    raw: &'a str,
+}
+
+impl<'a> IfsConfig<'a> {
+    fn new(raw: &'a str) -> Self {
+        Self { raw }
+    }
+
+    fn is_empty(self) -> bool {
+        self.raw.is_empty()
+    }
+
+    fn is_whitespace(self, ch: char) -> bool {
+        matches!(ch, ' ' | '\t' | '\n') && self.raw.contains(ch)
+    }
+
+    fn is_non_whitespace(self, ch: char) -> bool {
+        self.raw.contains(ch) && !self.is_whitespace(ch)
+    }
+
+    fn is_delimiter(self, symbol: FieldChar) -> bool {
+        symbol.splittable && self.raw.contains(symbol.ch)
     }
 }
 
@@ -1653,23 +1936,127 @@ fn parameter_display_name(parameter: &Parameter) -> String {
     }
 }
 
-fn append_expanded_value(
-    mut buffer: String,
-    value: &str,
-    mode: ExpansionMode,
-    quoted: bool,
-) -> String {
-    match mode {
-        ExpansionMode::Text => buffer.push_str(value),
-        ExpansionMode::Pattern => {
-            if quoted {
-                buffer.push_str(&Pattern::escape(value));
-            } else {
-                buffer.push_str(value);
-            }
+fn append_fields(target: &mut Vec<WordField>, mut next_fields: Vec<WordField>) {
+    if next_fields.is_empty() {
+        return;
+    }
+
+    if let Some(last) = target.last_mut() {
+        let first = next_fields.remove(0);
+        last.append(first);
+    }
+
+    target.extend(next_fields);
+}
+
+fn join_quoted_fields(fields: Vec<WordField>, joiner: &str) -> WordField {
+    let mut joined = WordField::new();
+    if fields.is_empty() {
+        joined.0.push(ExpansionPiece::Unsplittable(String::new()));
+        return joined;
+    }
+
+    for (index, field) in fields.into_iter().enumerate() {
+        if index > 0 && !joiner.is_empty() {
+            joined
+                .0
+                .push(ExpansionPiece::Unsplittable(joiner.to_owned()));
+        }
+        for piece in field.0 {
+            joined.0.push(match piece {
+                ExpansionPiece::Splittable(value) | ExpansionPiece::Unsplittable(value) => {
+                    ExpansionPiece::Unsplittable(value)
+                }
+            });
         }
     }
-    buffer
+
+    joined
+}
+
+fn split_fields(fields: Vec<WordField>, ifs: &IfsConfig<'_>) -> Vec<WordField> {
+    let mut split = Vec::new();
+    for field in fields {
+        split.extend(split_field(field, ifs));
+    }
+    split
+}
+
+fn split_field(field: WordField, ifs: &IfsConfig<'_>) -> Vec<WordField> {
+    let chars = field.chars();
+    if chars.is_empty() {
+        return if field.has_unsplittable_piece() {
+            vec![WordField::new()]
+        } else {
+            Vec::new()
+        };
+    }
+
+    if ifs.is_empty() {
+        return vec![field];
+    }
+
+    let mut fields = Vec::new();
+    let mut current = WordField::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if let Some((kind, next_index)) = parse_delimiter(&chars, index, *ifs) {
+            match kind {
+                DelimiterKind::Whitespace => {
+                    if !current.0.is_empty() {
+                        fields.push(std::mem::take(&mut current));
+                    }
+                }
+                DelimiterKind::NonWhitespace => {
+                    fields.push(std::mem::take(&mut current));
+                }
+            }
+            index = next_index;
+            continue;
+        }
+
+        let symbol = chars[index];
+        current.push_char(symbol.ch, symbol.splittable);
+        index += 1;
+    }
+
+    if !current.0.is_empty() {
+        fields.push(current);
+    }
+    fields
+}
+
+fn parse_delimiter(
+    chars: &[FieldChar],
+    start: usize,
+    ifs: IfsConfig<'_>,
+) -> Option<(DelimiterKind, usize)> {
+    if !ifs.is_delimiter(*chars.get(start)?) {
+        return None;
+    }
+
+    let mut index = start;
+    while index < chars.len() && chars[index].splittable && ifs.is_whitespace(chars[index].ch) {
+        index += 1;
+    }
+
+    if index < chars.len() && chars[index].splittable && ifs.is_non_whitespace(chars[index].ch) {
+        index += 1;
+        while index < chars.len() && chars[index].splittable && ifs.is_whitespace(chars[index].ch) {
+            index += 1;
+        }
+        return Some((DelimiterKind::NonWhitespace, index));
+    }
+
+    if index > start {
+        return Some((DelimiterKind::Whitespace, index));
+    }
+
+    None
+}
+
+fn is_glob_metacharacter(ch: char) -> bool {
+    matches!(ch, '*' | '?' | '[')
 }
 
 fn unescape_sequence(value: &str) -> &str {
@@ -1946,6 +2333,42 @@ mod tests {
         assert_eq!(state.stdout, b"7\n7\n");
     }
 
+    #[test]
+    fn field_splitting_honors_ifs_rules() {
+        let state = run_script(
+            "x=\"a b\"\nfor value in $x; do echo \"<$value>\"; done\nIFS=,:\ny=\",a::b,\"\nfor value in $y; do echo \"<$value>\"; done\n",
+            [],
+        );
+        assert_eq!(state.stdout, b"<a>\n<b>\n<>\n<a>\n<>\n<b>\n");
+    }
+
+    #[test]
+    fn quoted_dollar_at_preserves_field_boundaries() {
+        let state = run_script(
+            "f(){ for value in \"x$@y\"; do echo \"<$value>\"; done; }\nf a b\nf\n",
+            [],
+        );
+        assert_eq!(state.stdout, b"<xa>\n<by>\n<xy>\n");
+    }
+
+    #[test]
+    fn command_words_expand_globs_and_retain_non_matches() {
+        let state = run_script(
+            ": >/a.rs\n: >/b.rs\nfor value in *.rs; do echo \"<$value>\"; done\nfor value in *.txt; do echo \"[$value]\"; done\nfor value in [; do echo \"{$value}\"; done\n",
+            [],
+        );
+        assert_eq!(state.stdout, b"<a.rs>\n<b.rs>\n[*.txt]\n{[}\n");
+    }
+
+    #[test]
+    fn empty_redirection_creates_truncated_file() {
+        let state = run_script(": >/empty.log\n", []);
+        assert_eq!(
+            state.files.get(Path::new("/empty.log")).map(Vec::as_slice),
+            Some(&[][..])
+        );
+    }
+
     fn run_script<const N: usize>(
         script: &str,
         commands: [(&'static str, TestCommandHandler); N],
@@ -2168,6 +2591,42 @@ mod tests {
             self.state.borrow().directories.contains(path)
         }
 
+        async fn expand_glob(&self, cwd: &Path, pattern: &str) -> Result<Vec<String>> {
+            let raw_path = Path::new(pattern);
+            let absolute_pattern = if raw_path.is_absolute() {
+                raw_path.to_path_buf()
+            } else {
+                cwd.join(raw_path)
+            };
+            let relative = !raw_path.is_absolute();
+            let rendered_pattern = absolute_pattern.display().to_string();
+            let pattern = match Pattern::new(&rendered_pattern) {
+                Ok(pattern) => pattern,
+                Err(_) => return Ok(Vec::new()),
+            };
+
+            let options = MatchOptions {
+                case_sensitive: true,
+                require_literal_separator: true,
+                require_literal_leading_dot: true,
+            };
+
+            let state = self.state.borrow();
+            let mut matches = state
+                .files
+                .keys()
+                .chain(state.directories.iter())
+                .filter(|path| pattern.matches_path_with(path, options))
+                .cloned()
+                .collect::<Vec<_>>();
+            matches.sort();
+            matches.dedup();
+            Ok(matches
+                .into_iter()
+                .map(|path| crate::platform::render_glob_match(path, cwd, relative))
+                .collect())
+        }
+
         async fn spawn(&self, request: SpawnRequest) -> Result<Self::Child> {
             let command_name = Path::new(&request.resolved.path)
                 .file_name()
@@ -2266,7 +2725,18 @@ mod tests {
             Poll::Ready(Ok(()))
         }
 
-        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_close(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if !self.initialized {
+                self.initialized = true;
+                let mut state = self.state.borrow_mut();
+                let file = state.files.entry(self.path.clone()).or_default();
+                if !self.append {
+                    file.clear();
+                }
+            }
             Poll::Ready(Ok(()))
         }
     }
