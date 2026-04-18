@@ -2,6 +2,7 @@ use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ShellOption {
+    Nounset,
     AllExport,
     NoGlob,
 }
@@ -9,6 +10,7 @@ pub(crate) enum ShellOption {
 impl ShellOption {
     pub(crate) fn short_flag(self) -> char {
         match self {
+            Self::Nounset => 'u',
             Self::AllExport => 'a',
             Self::NoGlob => 'f',
         }
@@ -16,6 +18,7 @@ impl ShellOption {
 
     pub(crate) fn long_name(self) -> &'static str {
         match self {
+            Self::Nounset => "nounset",
             Self::AllExport => "allexport",
             Self::NoGlob => "noglob",
         }
@@ -24,6 +27,7 @@ impl ShellOption {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ShellOptions {
+    nounset: bool,
     allexport: bool,
     noglob: bool,
 }
@@ -31,6 +35,7 @@ pub(crate) struct ShellOptions {
 impl ShellOptions {
     pub(crate) fn is_enabled(self, option: ShellOption) -> bool {
         match option {
+            ShellOption::Nounset => self.nounset,
             ShellOption::AllExport => self.allexport,
             ShellOption::NoGlob => self.noglob,
         }
@@ -38,9 +43,14 @@ impl ShellOptions {
 
     pub(crate) fn set(&mut self, option: ShellOption, enabled: bool) {
         match option {
+            ShellOption::Nounset => self.nounset = enabled,
             ShellOption::AllExport => self.allexport = enabled,
             ShellOption::NoGlob => self.noglob = enabled,
         }
+    }
+
+    pub(crate) fn nounset(self) -> bool {
+        self.nounset
     }
 
     pub(crate) fn allexport(self) -> bool {
@@ -178,6 +188,7 @@ fn parse_option_token(token: &str) -> Option<(OptionMode, &str)> {
 
 fn parse_short_option(flag: char) -> std::result::Result<ShellOption, SetOptionError> {
     match flag {
+        'u' => Ok(ShellOption::Nounset),
         'a' => Ok(ShellOption::AllExport),
         'f' => Ok(ShellOption::NoGlob),
         other => Err(SetOptionError::IllegalShort(other)),
@@ -186,12 +197,17 @@ fn parse_short_option(flag: char) -> std::result::Result<ShellOption, SetOptionE
 
 fn parse_long_option(name: &str) -> std::result::Result<ShellOption, SetOptionError> {
     match name {
+        "nounset" => Ok(ShellOption::Nounset),
         "allexport" => Ok(ShellOption::AllExport),
         "noglob" => Ok(ShellOption::NoGlob),
         other => Err(SetOptionError::IllegalLong(other.to_owned())),
     }
 }
 
-fn option_catalog() -> [ShellOption; 2] {
-    [ShellOption::AllExport, ShellOption::NoGlob]
+fn option_catalog() -> [ShellOption; 3] {
+    [
+        ShellOption::Nounset,
+        ShellOption::AllExport,
+        ShellOption::NoGlob,
+    ]
 }

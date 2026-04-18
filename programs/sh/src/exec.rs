@@ -730,7 +730,7 @@ where
         };
 
         match result {
-            Err(error @ ShellError::ReadonlyVariable(_)) => {
+            Err(error @ (ShellError::ReadonlyVariable(_) | ShellError::ShellDiagnostic(_))) => {
                 shell_fatal_error(error, error_io).await
             }
             other => other,
@@ -1557,14 +1557,10 @@ where
                 if parameter_satisfies_test(&state, test_type) {
                     self.expand_parameter(parameter, quoted)
                 } else {
-                    let message = if let Some(error_message) = error_message {
-                        self.expand_text(error_message, io, false)
-                            .await?
-                            .scalarize(&self.ifs_joiner())
-                    } else {
-                        format!("{}: parameter not set", parameter_display_name(parameter))
-                    };
-                    Err(ShellError::message(message))
+                    Err(ShellError::shell_diagnostic(
+                        self.parameter_error_message(parameter, test_type, error_message, io)
+                            .await?,
+                    ))
                 }
             }
             ParameterExpr::UseAlternativeValue {
@@ -1583,6 +1579,7 @@ where
             }
             ParameterExpr::ParameterLength { parameter, .. } => {
                 let state = self.parameter_state(parameter)?;
+                self.ensure_parameter_is_set_for_expansion(parameter, &state)?;
                 Ok(Expansion::from_text(
                     state.value.chars().count().to_string(),
                     quoted,
@@ -1670,7 +1667,9 @@ where
         removal: PatternRemoval,
         quoted: bool,
     ) -> Result<Expansion> {
-        let value = self.parameter_state(parameter)?.value;
+        let state = self.parameter_state(parameter)?;
+        self.ensure_parameter_is_set_for_expansion(parameter, &state)?;
+        let value = state.value;
         let pattern = match pattern {
             Some(pattern) => self
                 .expand_text(pattern, io, false)
@@ -1714,6 +1713,8 @@ where
     }
 
     fn expand_parameter(&self, parameter: &Parameter, quoted: bool) -> Result<Expansion> {
+        let state = self.parameter_state(parameter)?;
+        self.ensure_parameter_is_set_for_expansion(parameter, &state)?;
         match parameter {
             Parameter::Positional(index) => {
                 let index = usize::try_from(*index).map_err(|_| {
@@ -1757,6 +1758,50 @@ where
                 Err(ShellError::unsupported("array parameter expansion"))
             }
         }
+    }
+
+    fn ensure_parameter_is_set_for_expansion(
+        &self,
+        parameter: &Parameter,
+        state: &ParameterState,
+    ) -> Result<()> {
+        if !self.options.nounset() || state.is_set || allows_unset_with_nounset(parameter) {
+            return Ok(());
+        }
+
+        Err(ShellError::shell_diagnostic(format!(
+            "{}: parameter not set",
+            parameter_display_name(parameter)
+        )))
+    }
+
+    async fn parameter_error_message(
+        &mut self,
+        parameter: &Parameter,
+        test_type: &ParameterTestType,
+        error_message: &Option<String>,
+        io: &ExecutionIo,
+    ) -> Result<String> {
+        if let Some(error_message) = error_message {
+            if error_message.is_empty() {
+                return Ok(format!(
+                    "{}: {}",
+                    parameter_display_name(parameter),
+                    default_parameter_error_detail(test_type)
+                ));
+            }
+            let detail = self
+                .expand_text(error_message, io, false)
+                .await?
+                .scalarize(&self.ifs_joiner());
+            return Ok(format!("{}: {detail}", parameter_display_name(parameter)));
+        }
+
+        Ok(format!(
+            "{}: {}",
+            parameter_display_name(parameter),
+            default_parameter_error_detail(test_type)
+        ))
     }
 
     fn special_parameter_state(&self, parameter: &SpecialParameter) -> ParameterState {
@@ -2189,6 +2234,20 @@ fn parameter_satisfies_test(state: &ParameterState, test_type: &ParameterTestTyp
         ParameterTestType::UnsetOrNull => state.is_set && !state.value.is_empty(),
         ParameterTestType::Unset => state.is_set,
     }
+}
+
+fn default_parameter_error_detail(test_type: &ParameterTestType) -> &'static str {
+    match test_type {
+        ParameterTestType::UnsetOrNull => "parameter not set or null",
+        ParameterTestType::Unset => "parameter not set",
+    }
+}
+
+fn allows_unset_with_nounset(parameter: &Parameter) -> bool {
+    matches!(
+        parameter,
+        Parameter::Special(SpecialParameter::AllPositionalParameters { .. })
+    )
 }
 
 fn parameter_display_name(parameter: &Parameter) -> String {
@@ -2771,6 +2830,54 @@ mod tests {
     }
 
     #[test]
+    fn set_supports_nounset_and_parameter_errors_match_dash() {
+        let (status, state) = run_script_with_status("set -u\necho \"$-\"\necho \"$foo\"\n", []);
+        assert_eq!(status.code(), 2);
+        assert!(status.is_exit());
+        assert_eq!(state.stdout, b"u\n");
+        assert_eq!(state.stderr, b"foo: parameter not set\n");
+
+        let (status, state) = run_script_with_status("set -u\necho \"$1\"\n", []);
+        assert_eq!(status.code(), 2);
+        assert!(status.is_exit());
+        assert_eq!(state.stderr, b"1: parameter not set\n");
+
+        let (status, state) = run_script_with_status("set -u\necho \"$!\"\n", []);
+        assert_eq!(status.code(), 2);
+        assert!(status.is_exit());
+        assert_eq!(state.stderr, b"!: parameter not set\n");
+    }
+
+    #[test]
+    fn nounset_respects_dash_exceptions_and_parameter_operators() {
+        let state = run_script(
+            "set -u\necho \"<$@>|<$*>\"\necho $((foo + 1))\necho \"${foo-bar}\" \"${foo:-bar}\"\n: \"${foo:=baz}\"\necho \"$foo\"\n",
+            [],
+        );
+        assert_eq!(state.stdout, b"<>|<>\n1\nbar bar\nbaz\n");
+    }
+
+    #[test]
+    fn parameter_error_operator_uses_dash_messages() {
+        let (status, state) = run_script_with_status("echo ${foo?custom msg}\necho no\n", []);
+        assert_eq!(status.code(), 2);
+        assert!(status.is_exit());
+        assert_eq!(state.stderr, b"foo: custom msg\n");
+
+        let (status, state) = run_script_with_status("foo=\necho ${foo:?}\necho no\n", []);
+        assert_eq!(status.code(), 2);
+        assert!(status.is_exit());
+        assert_eq!(state.stderr, b"foo: parameter not set or null\n");
+    }
+
+    #[test]
+    fn nounset_in_command_substitution_does_not_abort_parent_shell() {
+        let state = run_script("set -u\necho \"$(echo $foo)\"\necho after\n", []);
+        assert_eq!(state.stdout, b"\nafter\n");
+        assert_eq!(state.stderr, b"foo: parameter not set\n");
+    }
+
+    #[test]
     fn set_supports_noglob_and_named_option_listing() {
         let state = run_script(
             ": >/a.rs\nset -f\necho *.rs\nset -o\nset +o\nset +o noglob\necho *.rs\n",
@@ -2779,8 +2886,10 @@ mod tests {
         let stdout = String::from_utf8(state.stdout).expect("stdout should be utf-8");
         assert!(stdout.starts_with("*.rs\n"));
         assert!(stdout.contains("Current option settings\n"));
+        assert!(stdout.contains("nounset         off\n"));
         assert!(stdout.contains("allexport       off\n"));
         assert!(stdout.contains("noglob          on\n"));
+        assert!(stdout.contains("set +o nounset\n"));
         assert!(stdout.contains("set +o allexport\n"));
         assert!(stdout.contains("set -o noglob\n"));
         assert!(stdout.ends_with("a.rs\n"));
