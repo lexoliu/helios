@@ -13,6 +13,7 @@ pub mod memory;
 pub mod net;
 pub mod resource;
 pub mod serial;
+pub mod watchdog;
 
 /// Aligns `value` up to the next multiple of `align`.
 ///
@@ -25,13 +26,19 @@ pub const fn align_up(value: usize, align: usize) -> usize {
     }
 }
 
-pub struct Platform<Console: Write + Send + 'static, Cpu: cpu::Cpu, Regions>
-where
+pub struct Platform<
+    Console: Write + Send + 'static,
+    Cpu: cpu::Cpu,
+    Regions,
+    Watchdog = watchdog::NoWatchdog,
+> where
     Regions: IntoIterator<Item = MemoryRegion>,
+    Watchdog: watchdog::Watchdog,
 {
     pub console: Console,
     pub cpu: Cpu,
     pub memory_regions: Regions,
+    pub watchdog: Watchdog,
 }
 
 impl<Console: Write + Send + 'static, Cpu: cpu::Cpu, Regions> Platform<Console, Cpu, Regions>
@@ -39,10 +46,27 @@ where
     Regions: IntoIterator<Item = MemoryRegion>,
 {
     pub const fn new(console: Console, memory_regions: Regions, cpu: Cpu) -> Self {
+        Self::with_watchdog(console, memory_regions, cpu, watchdog::NoWatchdog)
+    }
+}
+
+impl<Console: Write + Send + 'static, Cpu: cpu::Cpu, Regions, Watchdog>
+    Platform<Console, Cpu, Regions, Watchdog>
+where
+    Regions: IntoIterator<Item = MemoryRegion>,
+    Watchdog: watchdog::Watchdog,
+{
+    pub const fn with_watchdog(
+        console: Console,
+        memory_regions: Regions,
+        cpu: Cpu,
+        watchdog: Watchdog,
+    ) -> Self {
         Self {
             console,
             memory_regions,
             cpu,
+            watchdog,
         }
     }
 }

@@ -941,89 +941,103 @@ where
         return Ok(());
     }
 
-    let _dispatch = server.dispatch.lock().await;
-    let frame = {
-        let mut io = server.read.lock().await;
-        match read_frame(&mut *io).await? {
-            Some(frame) => frame,
-            None => {
-                mark_server_closed(&server);
-                return Ok(());
+    let handoff = {
+        let _dispatch = server.dispatch.lock().await;
+        let frame = {
+            let mut io = server.read.lock().await;
+            match read_frame(&mut *io).await? {
+                Some(frame) => frame,
+                None => {
+                    mark_server_closed(&server);
+                    return Ok(());
+                }
+            }
+        };
+
+        match frame {
+            Frame::Open {
+                invocation,
+                instance,
+                func,
+            } => {
+                let registration = server
+                    .registrations
+                    .lock()
+                    .unwrap_or_else(|_| panic!("server registration table mutex poisoned"))
+                    .get(&(instance.clone(), func.clone()))
+                    .map(|registration| Registration {
+                        tx: registration.tx.clone(),
+                    });
+
+                match registration {
+                    Some(registration) => {
+                        {
+                            let mut io = server.write.lock().await;
+                            write_frame(&mut *io, &Frame::Accept { invocation })
+                                .await
+                                .with_context(|| {
+                                    format!("failed to accept remote invocation {instance}.{func}")
+                                })?;
+                        }
+
+                        let invocation = Invocation::new_server(invocation, &server);
+                        Some((
+                            registration,
+                            Ok((
+                                (),
+                                Outgoing::root(invocation.clone()),
+                                Incoming::root(invocation),
+                            )),
+                            instance,
+                            func,
+                        ))
+                    }
+                    None => {
+                        let mut io = server.write.lock().await;
+                        write_frame(
+                            &mut *io,
+                            &Frame::Reject {
+                                invocation,
+                                message: format!("no handler registered for {instance}.{func}"),
+                            },
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("failed to reject remote invocation {instance}.{func}")
+                        })?;
+                        None
+                    }
+                }
+            }
+            Frame::Data {
+                invocation,
+                path,
+                payload,
+            } => {
+                dispatch_payload(
+                    &server.active,
+                    invocation,
+                    decode_path(&path)?,
+                    Bytes::from(payload),
+                );
+                None
+            }
+            Frame::Close { invocation, path } => {
+                dispatch_close(&server.active, invocation, decode_path(&path)?);
+                None
+            }
+            Frame::Accept { .. } | Frame::Reject { .. } => {
+                bail!("server transport received unexpected reply frame");
             }
         }
     };
 
-    match frame {
-        Frame::Open {
-            invocation,
-            instance,
-            func,
-        } => {
-            let registration = server
-                .registrations
-                .lock()
-                .unwrap_or_else(|_| panic!("server registration table mutex poisoned"))
-                .get(&(instance.clone(), func.clone()))
-                .map(|registration| Registration {
-                    tx: registration.tx.clone(),
-                });
-
-            match registration {
-                Some(registration) => {
-                    {
-                        let mut io = server.write.lock().await;
-                        write_frame(&mut *io, &Frame::Accept { invocation })
-                            .await
-                            .with_context(|| {
-                                format!("failed to accept remote invocation {instance}.{func}")
-                            })?;
-                    }
-
-                    let invocation = Invocation::new_server(invocation, &server);
-                    registration
-                        .tx
-                        .send(Ok((
-                            (),
-                            Outgoing::root(invocation.clone()),
-                            Incoming::root(invocation),
-                        )))
-                        .await
-                        .with_context(|| {
-                            format!("handler queue for {instance}.{func} was closed")
-                        })?;
-                }
-                None => {
-                    let mut io = server.write.lock().await;
-                    write_frame(
-                        &mut *io,
-                        &Frame::Reject {
-                            invocation,
-                            message: format!("no handler registered for {instance}.{func}"),
-                        },
-                    )
-                    .await
-                    .with_context(|| {
-                        format!("failed to reject remote invocation {instance}.{func}")
-                    })?;
-                }
-            }
-        }
-        Frame::Data {
-            invocation,
-            path,
-            payload,
-        } => dispatch_payload(
-            &server.active,
-            invocation,
-            decode_path(&path)?,
-            Bytes::from(payload),
-        ),
-        Frame::Close { invocation, path } => {
-            dispatch_close(&server.active, invocation, decode_path(&path)?)
-        }
-        Frame::Accept { .. } | Frame::Reject { .. } => {
-            bail!("server transport received unexpected reply frame");
-        }
+    if let Some((registration, invocation, instance, func)) = handoff {
+        registration
+            .tx
+            .send(invocation)
+            .await
+            .with_context(|| format!("handler queue for {instance}.{func} was closed"))?;
     }
 
     Ok(())
@@ -1108,6 +1122,7 @@ mod tests {
     use futures_lite::StreamExt as _;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::sync::Notify;
+    use tokio::time::{Duration, timeout};
     use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
     use wrpc_transport::{Invoke as _, InvokeExt as _, Serve as _, ServeExt as _};
 
@@ -1666,6 +1681,157 @@ mod tests {
                 server_task
                     .await
                     .unwrap_or_else(|error| panic!("large-response server task panicked: {error}"));
+            });
+    }
+
+    #[test]
+    fn queued_open_does_not_block_active_invocation_progress() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap_or_else(|error| panic!("failed to build test runtime: {error}"))
+            .block_on(async {
+                let (host, peer) = tokio::io::duplex(4096);
+                let (host_read, host_write) = tokio::io::split(host);
+                let server = Server::new(host_read.compat(), host_write.compat_write());
+                let (peer_read, peer_write) = tokio::io::split(peer);
+                let mut peer_read = peer_read.compat();
+                let mut peer_write = peer_write.compat_write();
+
+                let mut invocations = server
+                    .serve("transport:test", "queue", [])
+                    .await
+                    .unwrap_or_else(|error| panic!("failed to register queue handler: {error}"));
+
+                super::write_frame(
+                    &mut peer_write,
+                    &super::Frame::Open {
+                        invocation: 1,
+                        instance: "transport:test".to_owned(),
+                        func: "queue".to_owned(),
+                    },
+                )
+                .await
+                .unwrap_or_else(|error| panic!("failed to write first open frame: {error}"));
+                super::pump_server_once(server.inner.clone())
+                    .await
+                    .unwrap_or_else(|error| panic!("failed to accept first invocation: {error}"));
+                match super::read_frame(&mut peer_read)
+                    .await
+                    .unwrap_or_else(|error| panic!("failed to read first accept frame: {error}"))
+                {
+                    Some(super::Frame::Accept { invocation }) => assert_eq!(invocation, 1),
+                    other => panic!("unexpected first accept frame: {other:?}"),
+                }
+
+                let (_, _first_outgoing, mut first_incoming) = invocations
+                    .next()
+                    .await
+                    .unwrap_or_else(|| panic!("first invocation stream ended early"))
+                    .unwrap_or_else(|error| panic!("failed to receive first invocation: {error}"));
+
+                for invocation in 2..=9 {
+                    super::write_frame(
+                        &mut peer_write,
+                        &super::Frame::Open {
+                            invocation,
+                            instance: "transport:test".to_owned(),
+                            func: "queue".to_owned(),
+                        },
+                    )
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("failed to write queued open frame {invocation}: {error}")
+                    });
+                    super::pump_server_once(server.inner.clone())
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!("failed to pump queued open frame {invocation}: {error}")
+                        });
+                    match super::read_frame(&mut peer_read)
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!("failed to read queued accept frame {invocation}: {error}")
+                        }) {
+                        Some(super::Frame::Accept {
+                            invocation: accepted,
+                        }) => {
+                            assert_eq!(accepted, invocation);
+                        }
+                        other => panic!(
+                            "unexpected queued accept frame for invocation {invocation}: {other:?}"
+                        ),
+                    }
+                }
+
+                super::write_frame(
+                    &mut peer_write,
+                    &super::Frame::Open {
+                        invocation: 10,
+                        instance: "transport:test".to_owned(),
+                        func: "queue".to_owned(),
+                    },
+                )
+                .await
+                .unwrap_or_else(|error| panic!("failed to write blocked open frame: {error}"));
+
+                let blocked_pump = tokio::spawn({
+                    let server = server.inner.clone();
+                    async move { super::pump_server_once(server).await }
+                });
+
+                match super::read_frame(&mut peer_read)
+                    .await
+                    .unwrap_or_else(|error| panic!("failed to read blocked accept frame: {error}"))
+                {
+                    Some(super::Frame::Accept { invocation }) => assert_eq!(invocation, 10),
+                    other => panic!("unexpected blocked accept frame: {other:?}"),
+                }
+
+                tokio::task::yield_now().await;
+
+                super::write_frame(
+                    &mut peer_write,
+                    &super::Frame::Data {
+                        invocation: 1,
+                        path: Vec::new(),
+                        payload: b"request".to_vec(),
+                    },
+                )
+                .await
+                .unwrap_or_else(|error| panic!("failed to write active request data: {error}"));
+                super::write_frame(
+                    &mut peer_write,
+                    &super::Frame::Close {
+                        invocation: 1,
+                        path: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap_or_else(|error| panic!("failed to write active request close: {error}"));
+
+                let mut request = Vec::new();
+                timeout(
+                    Duration::from_millis(100),
+                    first_incoming.read_to_end(&mut request),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("active invocation stalled behind queued open"))
+                .unwrap_or_else(|error| {
+                    panic!("failed to read active invocation payload: {error}")
+                });
+                assert_eq!(request, b"request");
+
+                let _ = invocations
+                    .next()
+                    .await
+                    .unwrap_or_else(|| panic!("queued invocation stream ended unexpectedly"))
+                    .unwrap_or_else(|error| panic!("failed to release queued invocation: {error}"));
+
+                blocked_pump
+                    .await
+                    .unwrap_or_else(|error| panic!("blocked pump task panicked: {error}"))
+                    .unwrap_or_else(|error| panic!("blocked pump failed: {error}"));
             });
     }
 }

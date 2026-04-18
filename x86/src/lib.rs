@@ -4,17 +4,21 @@
 extern crate alloc;
 
 mod host_fs;
+mod pci;
 mod smp;
+mod watchdog;
 
 mod debug_state {
     pub(crate) type RuntimeState =
         helios_kernel::HostRuntimeState<crate::X86Cpu, crate::host_fs::HostFileSystemService>;
 }
 
+use alloc::sync::Arc;
 use bootloader_api::config::Mapping;
 use bootloader_api::info::MemoryRegionKind;
 use bootloader_api::{BootInfo, BootloaderConfig, entry_point};
 use core::arch::asm;
+use core::arch::global_asm;
 use core::arch::x86_64::{__cpuid, __cpuid_count, _rdtsc};
 use core::fmt::{self, Write};
 use core::ops::Range;
@@ -22,10 +26,9 @@ use helios_hal::Platform;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
+use helios_hal::watchdog::Watchdog;
 use x86_64::instructions::port::{Port, PortReadOnly, PortWriteOnly};
 use x86_64::registers::control::{Cr0, Cr0Flags, Cr3, Cr4, Cr4Flags};
-use alloc::sync::Arc;
-use core::arch::global_asm;
 
 const COM1_BASE: u16 = 0x3f8;
 const COM1_DATA: u16 = COM1_BASE;
@@ -104,7 +107,12 @@ fn x86_kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let mirror_to_uart = false;
     let console = serial_console(debug_state.clone(), mirror_to_uart);
     let cpu = X86Cpu::new(boot.platform());
-    let kernel = helios_kernel::init(Platform::new(console, memory_regions, cpu.clone()));
+    let kernel = helios_kernel::init_with_watchdog(Platform::with_watchdog(
+        console,
+        memory_regions,
+        cpu.clone(),
+        cpu.watchdog(),
+    ));
     let debug_state = cpu.debug_state();
     let _program_service =
         helios_kernel::install_component_host_program_service(&kernel, &cpu, &debug_state);
@@ -144,7 +152,9 @@ fn processor_count(boot_info: &'static BootInfo) -> usize {
         tsc_hz: 1,
     };
     let tables = unsafe { acpi::AcpiTables::from_rsdp(handler.clone(), rsdp as usize) }
-        .unwrap_or_else(|error| panic!("failed to parse ACPI tables for processor count: {error:?}"));
+        .unwrap_or_else(|error| {
+            panic!("failed to parse ACPI tables for processor count: {error:?}")
+        });
     let platform = acpi::platform::AcpiPlatform::new(tables, handler)
         .unwrap_or_else(|error| panic!("failed to construct ACPI platform info: {error:?}"));
     let processor_info = platform
@@ -222,18 +232,23 @@ mod tests {
 
     #[test]
     fn non_usable_region_yields_no_segments() {
-        assert!(collect_segments(
-            MemoryRegion {
-                start: 0x1000,
-                end: 0x4000,
-                kind: MemoryRegionKind::Bootloader,
-            },
-            None,
-        )
-        .is_empty());
+        assert!(
+            collect_segments(
+                MemoryRegion {
+                    start: 0x1000,
+                    end: 0x4000,
+                    kind: MemoryRegionKind::Bootloader,
+                },
+                None,
+            )
+            .is_empty()
+        );
     }
 
-    fn collect_segments(region: MemoryRegion, excluded: Option<&Range<usize>>) -> alloc::vec::Vec<Range<usize>> {
+    fn collect_segments(
+        region: MemoryRegion,
+        excluded: Option<&Range<usize>>,
+    ) -> alloc::vec::Vec<Range<usize>> {
         usable_region_segments(&region, excluded)
             .into_iter()
             .flatten()
@@ -267,11 +282,7 @@ fn serial_console(
     } else {
         None
     };
-    helios_kernel::RecordingConsole::new(
-        debug_state,
-        || read_tsc(),
-        write_fn,
-    )
+    helios_kernel::RecordingConsole::new(debug_state, || read_tsc(), write_fn)
 }
 
 #[derive(Clone)]
@@ -286,6 +297,10 @@ impl X86Cpu {
 
     pub(crate) fn debug_state(&self) -> debug_state::RuntimeState {
         self.state.debug_state()
+    }
+
+    pub(crate) fn watchdog(&self) -> crate::watchdog::X86Watchdog {
+        self.state.watchdog()
     }
 }
 
@@ -375,18 +390,20 @@ impl Cpu for X86Cpu {
     }
 }
 
-fn run_current_processor(
+fn run_current_processor<WatchdogImpl>(
     cpu: X86Cpu,
-    kernel: helios_kernel::Kernel<X86Cpu>,
+    kernel: helios_kernel::Kernel<X86Cpu, WatchdogImpl>,
     debug_state: debug_state::RuntimeState,
-) -> ! {
+) -> !
+where
+    WatchdogImpl: Watchdog + Clone,
+{
     helios_kernel::run_component_host_processor_forever(
         cpu,
         kernel,
         debug_state,
         read_debug_serial,
         write_debug_serial_bytes,
-        helios_kernel::ComponentRunMode::Concurrent,
     );
 }
 
@@ -404,10 +421,11 @@ extern "C" fn secondary_start_rust(
     let debug_state = boot.platform().debug_state();
     let console = serial_console(debug_state.clone(), false);
     let cpu = X86Cpu::new(boot.platform());
-    let kernel = helios_kernel::init(Platform::new(
+    let kernel = helios_kernel::init_with_watchdog(Platform::with_watchdog(
         console,
         core::iter::empty::<MemoryRegion>(),
         cpu.clone(),
+        cpu.watchdog(),
     ));
     run_current_processor(cpu, kernel, debug_state)
 }
@@ -460,9 +478,9 @@ fn detect_x86_native_feature(feature: &str) -> Option<bool> {
         "avx512vbmi" => {
             Some(leaf7.is_some_and(|leaf| leaf.ecx & (1 << 1) != 0) && avx512_os_enabled)
         }
-        "lzcnt" => Some(
-            max_extended >= 0x8000_0001 && unsafe { __cpuid(0x8000_0001) }.ecx & (1 << 5) != 0,
-        ),
+        "lzcnt" => {
+            Some(max_extended >= 0x8000_0001 && unsafe { __cpuid(0x8000_0001) }.ecx & (1 << 5) != 0)
+        }
         _ => None,
     }
 }
@@ -695,7 +713,9 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_tls_get() -> *mut u8 {
-    smp::current_runtime().wasmtime_tls.load(core::sync::atomic::Ordering::Acquire)
+    smp::current_runtime()
+        .wasmtime_tls
+        .load(core::sync::atomic::Ordering::Acquire)
 }
 
 #[unsafe(no_mangle)]

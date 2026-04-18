@@ -50,8 +50,7 @@ where
     _host_fs: core::marker::PhantomData<HostFs>,
 }
 
-impl<CpuImpl, RuntimeStateImpl, HostFs>
-    ComponentExecContext<CpuImpl, RuntimeStateImpl, HostFs>
+impl<CpuImpl, RuntimeStateImpl, HostFs> ComponentExecContext<CpuImpl, RuntimeStateImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
@@ -118,13 +117,6 @@ pub trait ComponentExecutor: Send + 'static {
 
     /// Run the component to completion asynchronously.
     fn run(self) -> impl Future<Output = Result<ComponentRunResult, Self::Error>> + Send;
-
-    /// Run the component cooperatively, interleaving with kernel executor
-    /// ticks. Returns when the component exits.
-    fn run_cooperative(
-        self,
-        tick: impl FnMut() -> usize,
-    ) -> Result<ComponentRunResult, Self::Error>;
 }
 
 /// Factory that builds engines and executors from kernel-owned state.

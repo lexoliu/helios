@@ -1,10 +1,5 @@
 use super::*;
-
-#[derive(Clone, Copy)]
-pub enum ComponentRunMode {
-    KernelExecutor,
-    Concurrent,
-}
+use helios_hal::watchdog::Watchdog;
 
 #[derive(Clone, Copy)]
 pub struct ProgramServiceConfig {
@@ -132,37 +127,35 @@ pub struct ChildExit {
     pub exit_code: u32,
 }
 
-pub fn install_program_service<CpuImpl, HostFs>(
-    kernel: &crate::Kernel<CpuImpl>,
+pub fn install_program_service<CpuImpl, HostFs, WatchdogImpl>(
+    kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
     cpu: &CpuImpl,
     debug_state: &HostRuntimeState<CpuImpl, HostFs>,
 ) -> UserProgramService<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
+    WatchdogImpl: Watchdog + Clone,
 {
-    install_program_service_with_config(
-        kernel,
-        cpu,
-        debug_state,
-        ProgramServiceConfig::new(1),
-    )
+    install_program_service_with_config(kernel, cpu, debug_state, ProgramServiceConfig::new(1))
 }
 
-pub fn install_component_host_program_service<CpuImpl, HostFs>(
-    kernel: &crate::Kernel<CpuImpl>,
+pub fn install_component_host_program_service<CpuImpl, HostFs, WatchdogImpl>(
+    kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
     cpu: &CpuImpl,
     debug_state: &HostRuntimeState<CpuImpl, HostFs>,
 ) -> Option<UserProgramService<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
+    WatchdogImpl: Watchdog + Clone,
 {
     if cpu.current_processor() != cpu.bootstrap_processor() {
         return None;
     }
 
-    let worker_count = component_host_worker_count(cpu.processor_count(), cpu.bootstrap_processor());
+    let worker_count =
+        component_host_worker_count(cpu.processor_count(), cpu.bootstrap_processor());
     Some(install_program_service_with_config(
         kernel,
         cpu,
@@ -171,8 +164,8 @@ where
     ))
 }
 
-pub fn install_program_service_with_config<CpuImpl, HostFs>(
-    kernel: &crate::Kernel<CpuImpl>,
+pub fn install_program_service_with_config<CpuImpl, HostFs, WatchdogImpl>(
+    kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
     cpu: &CpuImpl,
     debug_state: &HostRuntimeState<CpuImpl, HostFs>,
     config: ProgramServiceConfig,
@@ -180,6 +173,7 @@ pub fn install_program_service_with_config<CpuImpl, HostFs>(
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
+    WatchdogImpl: Watchdog + Clone,
 {
     if let Some(service) = debug_state.program_service() {
         return service;
@@ -218,11 +212,11 @@ where
     service
 }
 
-pub fn run_embedded_component_forever<CpuImpl, HostFs>(
+pub fn run_embedded_component_forever<CpuImpl, HostFs, WatchdogImpl>(
     component: EmbeddedComponent,
     world: ComponentBindingSet,
     cpu: CpuImpl,
-    kernel: &crate::Kernel<CpuImpl>,
+    kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
     debug_state: HostRuntimeState<CpuImpl, HostFs>,
     read_serial: fn(u32) -> Vec<u8>,
     write_serial: fn(&[u8]),
@@ -230,32 +224,7 @@ pub fn run_embedded_component_forever<CpuImpl, HostFs>(
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
-{
-    run_embedded_component_in_mode_forever(
-        component,
-        world,
-        cpu,
-        kernel,
-        debug_state,
-        read_serial,
-        write_serial,
-        ComponentRunMode::KernelExecutor,
-    )
-}
-
-pub fn run_embedded_component_in_mode_forever<CpuImpl, HostFs>(
-    component: EmbeddedComponent,
-    world: ComponentBindingSet,
-    cpu: CpuImpl,
-    kernel: &crate::Kernel<CpuImpl>,
-    debug_state: HostRuntimeState<CpuImpl, HostFs>,
-    read_serial: fn(u32) -> Vec<u8>,
-    write_serial: fn(&[u8]),
-    run_mode: ComponentRunMode,
-) -> !
-where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
-    HostFs: crate::HostFileSystem,
+    WatchdogImpl: Watchdog + Clone,
 {
     let component_name = component.name();
     super::emit_stage_marker(write_serial, "boot");
@@ -263,45 +232,48 @@ where
         component = component_name,
         "launching embedded system component"
     );
-    run_system_component(
-        component,
-        world,
-        cpu.clone(),
-        kernel,
-        debug_state,
-        read_serial,
-        write_serial,
-        run_mode,
-    )
-    .unwrap_or_else(|error| panic!("failed to exec embedded system component:\n{error:#}"));
+    kernel
+        .run_local_future(run_system_component(
+            component,
+            world,
+            cpu.clone(),
+            debug_state,
+            read_serial,
+            write_serial,
+        ))
+        .unwrap_or_else(|error| panic!("failed to exec embedded system component:\n{error:#}"));
     super::emit_stage_marker(write_serial, "done");
-    tracing::info!(component = component_name, "embedded system component exited cleanly");
+    tracing::info!(
+        component = component_name,
+        "embedded system component exited cleanly"
+    );
     cpu.shutdown()
 }
 
-pub fn run_program_workers_forever<CpuImpl, HostFs>(
+pub fn run_program_workers_forever<CpuImpl, HostFs, WatchdogImpl>(
     _cpu: CpuImpl,
-    kernel: crate::Kernel<CpuImpl>,
+    kernel: crate::Kernel<CpuImpl, WatchdogImpl>,
     _debug_state: HostRuntimeState<CpuImpl, HostFs>,
 ) -> !
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
+    WatchdogImpl: Watchdog + Clone,
 {
     kernel.run();
 }
 
-pub fn run_component_host_processor_forever<CpuImpl, HostFs>(
+pub fn run_component_host_processor_forever<CpuImpl, HostFs, WatchdogImpl>(
     cpu: CpuImpl,
-    kernel: crate::Kernel<CpuImpl>,
+    kernel: crate::Kernel<CpuImpl, WatchdogImpl>,
     debug_state: HostRuntimeState<CpuImpl, HostFs>,
     read_serial: fn(u32) -> Vec<u8>,
     write_serial: fn(&[u8]),
-    run_mode: ComponentRunMode,
 ) -> !
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
+    WatchdogImpl: Watchdog + Clone,
 {
     match component_host_processor_role(
         cpu.current_processor(),
@@ -312,7 +284,7 @@ where
         ComponentHostProcessorRole::SystemComponent => {
             let component = crate::embedded_system_component()
                 .unwrap_or_else(|| panic!("embedded init bootfs is missing the system component"));
-            run_embedded_component_in_mode_forever(
+            run_embedded_component_forever(
                 component,
                 ComponentBindingSet::System,
                 cpu,
@@ -320,7 +292,6 @@ where
                 debug_state,
                 read_serial,
                 write_serial,
-                run_mode,
             );
         }
         ComponentHostProcessorRole::ProgramWorker => {
@@ -417,14 +388,7 @@ where
         rights: WasiRights,
     ) -> Result<ExecResult, ProgramExecError> {
         let mut child = self
-            .spawn(
-                exec_context,
-                name.into(),
-                args,
-                env,
-                wasm.to_vec(),
-                rights,
-            )
+            .spawn(exec_context, name.into(), args, env, wasm.to_vec(), rights)
             .await?;
 
         // Feed stdin in one shot, then close the writer to signal EOF.
@@ -458,11 +422,8 @@ where
         };
 
         let wait_task = child.wait();
-        let (stdout, (stderr, exit)) = futures::future::join(
-            stdout_task,
-            futures::future::join(stderr_task, wait_task),
-        )
-        .await;
+        let (stdout, (stderr, exit)) =
+            futures::future::join(stdout_task, futures::future::join(stderr_task, wait_task)).await;
         let exit = exit?;
 
         Ok(ExecResult {
@@ -491,17 +452,15 @@ where
         }
 
         let wasm = Arc::<[u8]>::from(wasm.to_vec());
-        let mut compiled = core::pin::pin!(self.inner.compiler.spawn(
-            self.inner.compile_priority,
-            {
+        let mut compiled =
+            core::pin::pin!(self.inner.compiler.spawn(self.inner.compile_priority, {
                 let engine = self.inner.engine.clone();
                 let wasm = wasm.clone();
                 move || {
                     use crate::ComponentRuntimeEngine;
                     engine.compile(&wasm)
                 }
-            },
-        ));
+            },));
         let compiled = core::future::poll_fn(|cx| match compiled.as_mut().poll(cx) {
             core::task::Poll::Ready(result) => core::task::Poll::Ready(result),
             core::task::Poll::Pending => {
@@ -574,10 +533,7 @@ where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
 {
-    use crate::{
-        ComponentExecContext, ComponentExecutor, ComponentRuntimeFactory,
-        ComponentWorld,
-    };
+    use crate::{ComponentExecContext, ComponentExecutor, ComponentRuntimeFactory, ComponentWorld};
 
     let mut argv = Vec::with_capacity(args.len() + 1);
     argv.push(name);
@@ -603,7 +559,12 @@ where
 
     // Use the engine that compiled the component — Wasmtime requires
     // component and store to share the same engine instance.
-    let executor = <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as ComponentRuntimeFactory<CpuImpl, HostRuntimeState<CpuImpl, HostFs>, HostFs>>::instantiate(runtime, engine, &compiled, ComponentWorld::Program, context)
+    let executor =
+        <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as ComponentRuntimeFactory<
+            CpuImpl,
+            HostRuntimeState<CpuImpl, HostFs>,
+            HostFs,
+        >>::instantiate(runtime, engine, &compiled, ComponentWorld::Program, context)
         .await
         .map_err(map_program_runtime_error)?;
 

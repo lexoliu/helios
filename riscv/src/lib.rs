@@ -314,11 +314,7 @@ fn sbi_console(
     } else {
         None
     };
-    helios_kernel::RecordingConsole::new(
-        debug_state,
-        || riscv::register::time::read64(),
-        write_fn,
-    )
+    helios_kernel::RecordingConsole::new(debug_state, || riscv::register::time::read64(), write_fn)
 }
 
 #[derive(Clone)]
@@ -573,7 +569,9 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     let _program_service =
         helios_kernel::install_component_host_program_service(&kernel, &cpu, &debug_state);
     if current_hart == bootstrap_processor {
-        for processor in helios_kernel::component_host_processors_to_start(hart_count, bootstrap_processor) {
+        for processor in
+            helios_kernel::component_host_processors_to_start(hart_count, bootstrap_processor)
+        {
             cpu.start_processor(processor);
         }
     }
@@ -583,7 +581,6 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         debug_state,
         read_debug_serial,
         write_debug_serial_bytes,
-        helios_kernel::ComponentRunMode::Concurrent,
     );
 }
 

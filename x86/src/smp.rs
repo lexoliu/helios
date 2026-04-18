@@ -1,16 +1,17 @@
 extern crate alloc;
 
+use acpi::platform::{AcpiPlatform, ProcessorState};
+use acpi::{AcpiTables, Handler, PciAddress, PhysicalMapping};
 use alloc::alloc::{Layout, alloc_zeroed};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use acpi::platform::{AcpiPlatform, ProcessorState};
-use acpi::{AcpiTables, Handler, PhysicalMapping, PciAddress};
 use bootloader_api::BootInfo;
 use core::arch::x86_64::__cpuid;
 use core::ops::Range;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use helios_hal::cpu::ProcessorId;
+use pci_types::ConfigRegionAccess;
 use x86::apic::x2apic::X2APIC;
 use x86::apic::xapic::XAPIC;
 use x86::apic::{ApicControl, ApicId};
@@ -25,7 +26,9 @@ use x86_64::structures::paging::{
 
 use crate::KERNEL_STACK_BYTES;
 use crate::debug_state;
+use crate::pci::LegacyPciConfigAccess;
 use crate::read_tsc;
+use crate::watchdog::X86Watchdog;
 
 const WAKEUP_PAGE_BYTES: usize = 4096;
 const SIPI_MAX_PHYSICAL_ADDRESS: usize = 0x10_0000;
@@ -49,6 +52,7 @@ pub(crate) struct X86PlatformState {
     tsc_hz: u64,
     physical_memory_offset: usize,
     debug_state: debug_state::RuntimeState,
+    watchdog: X86Watchdog,
     processors: Box<[ProcessorSlot]>,
     wakeup_page: WakeupPage,
     boot_context: AtomicPtr<BootContext>,
@@ -87,9 +91,7 @@ pub(crate) fn reserve_wakeup_page(boot_info: &'static BootInfo) -> Range<usize> 
                 .is_some_and(|next| next <= end))
             .then_some(start..start + WAKEUP_PAGE_BYTES)
         })
-        .unwrap_or_else(|| {
-            panic!("failed to reserve a low-memory wakeup page for x86 AP startup")
-        })
+        .unwrap_or_else(|| panic!("failed to reserve a low-memory wakeup page for x86 AP startup"))
 }
 
 pub(crate) fn build_boot_context(
@@ -118,7 +120,8 @@ pub(crate) fn build_boot_context(
         .as_ref()
         .unwrap_or_else(|| panic!("ACPI platform info did not expose processor topology"));
 
-    let mut processors = alloc::vec::Vec::with_capacity(1 + processor_info.application_processors.len());
+    let mut processors =
+        alloc::vec::Vec::with_capacity(1 + processor_info.application_processors.len());
     processors.push(ProcessorSlot {
         apic_id: processor_info.boot_processor.local_apic_id,
         runtime: ProcessorRuntime {
@@ -159,11 +162,13 @@ pub(crate) fn build_boot_context(
             .checked_add(physical_memory_offset)
             .unwrap_or_else(|| panic!("x86 wakeup page virtual address overflow")),
     };
+    let watchdog = X86Watchdog::discover(physical_memory_offset);
     let platform = Arc::new(X86PlatformState {
         tsc_base,
         tsc_hz,
         physical_memory_offset,
         debug_state,
+        watchdog,
         processors: processors.into_boxed_slice(),
         wakeup_page,
         boot_context: AtomicPtr::new(core::ptr::null_mut()),
@@ -218,6 +223,10 @@ impl X86PlatformState {
 
     pub(crate) fn debug_state(&self) -> debug_state::RuntimeState {
         self.debug_state.clone()
+    }
+
+    pub(crate) fn watchdog(&self) -> X86Watchdog {
+        self.watchdog.clone()
     }
 
     pub(crate) fn processor_count(&self) -> usize {
@@ -405,7 +414,11 @@ impl PhysicalOffsetAcpiHandler {
 }
 
 impl Handler for PhysicalOffsetAcpiHandler {
-    unsafe fn map_physical_region<T>(&self, physical_address: usize, size: usize) -> PhysicalMapping<Self, T> {
+    unsafe fn map_physical_region<T>(
+        &self,
+        physical_address: usize,
+        size: usize,
+    ) -> PhysicalMapping<Self, T> {
         PhysicalMapping {
             physical_start: physical_address,
             virtual_start: self.physical_to_virtual(physical_address),
@@ -473,28 +486,28 @@ impl Handler for PhysicalOffsetAcpiHandler {
         unsafe { x86_64::instructions::port::PortWriteOnly::<u32>::new(port).write(value) }
     }
 
-    fn read_pci_u8(&self, _address: PciAddress, _offset: u16) -> u8 {
-        panic!("PCI config-space access is not implemented in the x86 ACPI handler")
+    fn read_pci_u8(&self, address: PciAddress, offset: u16) -> u8 {
+        LegacyPciConfigAccess::new().read_u8(address, offset)
     }
 
-    fn read_pci_u16(&self, _address: PciAddress, _offset: u16) -> u16 {
-        panic!("PCI config-space access is not implemented in the x86 ACPI handler")
+    fn read_pci_u16(&self, address: PciAddress, offset: u16) -> u16 {
+        LegacyPciConfigAccess::new().read_u16(address, offset)
     }
 
-    fn read_pci_u32(&self, _address: PciAddress, _offset: u16) -> u32 {
-        panic!("PCI config-space access is not implemented in the x86 ACPI handler")
+    fn read_pci_u32(&self, address: PciAddress, offset: u16) -> u32 {
+        unsafe { LegacyPciConfigAccess::new().read(address, offset) }
     }
 
-    fn write_pci_u8(&self, _address: PciAddress, _offset: u16, _value: u8) {
-        panic!("PCI config-space access is not implemented in the x86 ACPI handler")
+    fn write_pci_u8(&self, address: PciAddress, offset: u16, value: u8) {
+        LegacyPciConfigAccess::new().write_u8(address, offset, value)
     }
 
-    fn write_pci_u16(&self, _address: PciAddress, _offset: u16, _value: u16) {
-        panic!("PCI config-space access is not implemented in the x86 ACPI handler")
+    fn write_pci_u16(&self, address: PciAddress, offset: u16, value: u16) {
+        LegacyPciConfigAccess::new().write_u16(address, offset, value)
     }
 
-    fn write_pci_u32(&self, _address: PciAddress, _offset: u16, _value: u32) {
-        panic!("PCI config-space access is not implemented in the x86 ACPI handler")
+    fn write_pci_u32(&self, address: PciAddress, offset: u16, value: u32) {
+        unsafe { LegacyPciConfigAccess::new().write(address, offset, value) }
     }
 
     fn nanos_since_boot(&self) -> u64 {
@@ -528,7 +541,10 @@ impl Handler for PhysicalOffsetAcpiHandler {
 }
 
 fn prepare_wakeup_page(platform: &X86PlatformState) {
-    identity_map_wakeup_page(platform.physical_memory_offset, platform.wakeup_page.physical_start);
+    identity_map_wakeup_page(
+        platform.physical_memory_offset,
+        platform.wakeup_page.physical_start,
+    );
     let bytes = wakeup_image();
     assert!(
         bytes.len() <= WAKEUP_PAGE_BYTES,
@@ -536,7 +552,11 @@ fn prepare_wakeup_page(platform: &X86PlatformState) {
         bytes.len()
     );
     unsafe {
-        core::ptr::write_bytes(platform.wakeup_page.virtual_start as *mut u8, 0, WAKEUP_PAGE_BYTES);
+        core::ptr::write_bytes(
+            platform.wakeup_page.virtual_start as *mut u8,
+            0,
+            WAKEUP_PAGE_BYTES,
+        );
         core::ptr::copy_nonoverlapping(
             bytes.as_ptr(),
             platform.wakeup_page.virtual_start as *mut u8,
@@ -554,9 +574,21 @@ fn patch_wakeup_page(
     entry: usize,
 ) {
     write_u64_patch(wakeup_virtual_start, wakeup_cr3_offset(), cr3);
-    write_u64_patch(wakeup_virtual_start, wakeup_stack_top_offset(), stack_top as u64);
-    write_u64_patch(wakeup_virtual_start, wakeup_context_offset(), boot_context as u64);
-    write_u64_patch(wakeup_virtual_start, wakeup_runtime_offset(), runtime as u64);
+    write_u64_patch(
+        wakeup_virtual_start,
+        wakeup_stack_top_offset(),
+        stack_top as u64,
+    );
+    write_u64_patch(
+        wakeup_virtual_start,
+        wakeup_context_offset(),
+        boot_context as u64,
+    );
+    write_u64_patch(
+        wakeup_virtual_start,
+        wakeup_runtime_offset(),
+        runtime as u64,
+    );
     write_u64_patch(wakeup_virtual_start, wakeup_entry_offset(), entry as u64);
 }
 
@@ -583,7 +615,9 @@ fn identity_map_wakeup_page(physical_memory_offset: usize, wakeup_physical: usiz
     if mapper.translate_page(page).is_ok() {
         return;
     }
-    let mut frame_allocator = DirectMappedFrameAllocator { physical_memory_offset };
+    let mut frame_allocator = DirectMappedFrameAllocator {
+        physical_memory_offset,
+    };
     unsafe {
         mapper
             .map_to(
@@ -626,17 +660,19 @@ unsafe impl FrameAllocator<Size4KiB> for DirectMappedFrameAllocator {
         );
         let physical_address = virtual_address - self.physical_memory_offset;
         Some(
-            PhysFrame::from_start_address(PhysAddr::new(physical_address as u64))
-                .unwrap_or_else(|error| {
+            PhysFrame::from_start_address(PhysAddr::new(physical_address as u64)).unwrap_or_else(
+                |error| {
                     panic!("allocated x86 page-table frame had invalid physical address: {error:?}")
-                }),
+                },
+            ),
         )
     }
 }
 
 fn allocate_aligned_zeroed(size: usize, align: usize) -> usize {
-    let layout = Layout::from_size_align(size, align)
-        .unwrap_or_else(|_| panic!("failed to build aligned allocation layout size={size} align={align}"));
+    let layout = Layout::from_size_align(size, align).unwrap_or_else(|_| {
+        panic!("failed to build aligned allocation layout size={size} align={align}")
+    });
     let pointer = unsafe { alloc_zeroed(layout) };
     NonNull::new(pointer)
         .unwrap_or_else(|| panic!("aligned allocation of {size} bytes failed"))

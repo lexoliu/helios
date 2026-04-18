@@ -9,25 +9,25 @@ use alloc::vec::Vec;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
+use crate::WasiRights;
+use crate::{
+    ComponentCache, ComponentNetworkService, ComponentOutputMode, ComponentOutputStreamKind,
+    ComponentStoreData, ComputePool, ComputePriority, DeadlinePollable, EmbeddedComponent,
+    ExecResult, ProgramExecError, ProgramExecErrorKind, RawMutex, RawMutexGuardResource,
+    RawMutexResource, RawRwLock, RawRwLockReadGuardResource, RawRwLockResource,
+    RawRwLockWriteGuardResource, SerialPortResource, elapsed_millis, emit_serial_stage_marker,
+    heap_stats, monotonic_nanos,
+};
+use helios_hal::cpu::Cpu;
+use helios_hal::serial::ByteSerial;
+use spin::Mutex;
+use thiserror::Error;
 use wasmtime::component::{
     Access, Accessor, Component, Destination, FutureReader, HasSelf, Linker, Resource,
     ResourceType, StreamProducer, StreamReader, StreamResult,
 };
 use wasmtime::{self, Engine, Store, StoreContextMut};
 use wasmtime_wasi_io::{self};
-use helios_hal::cpu::Cpu;
-use crate::WasiRights;
-use helios_hal::serial::ByteSerial;
-use crate::{
-    ComponentCache, ComponentNetworkService, ComponentOutputMode, ComponentOutputStreamKind,
-    ComponentStoreData, ComputePool, ComputePriority, DeadlinePollable, EmbeddedComponent,
-    ExecResult, ProgramExecError, ProgramExecErrorKind, RawMutex, RawMutexGuardResource,
-    RawMutexResource, RawRwLock, RawRwLockReadGuardResource, RawRwLockResource,
-    RawRwLockWriteGuardResource, SerialPortResource, elapsed_millis,
-    emit_serial_stage_marker, heap_stats, monotonic_nanos,
-};
-use spin::Mutex;
-use thiserror::Error;
 
 use crate::wasmtime_adapter::bindings::debugger::bindings as debugger_bindings;
 use crate::wasmtime_adapter::bindings::program::bindings as program_bindings;
@@ -45,11 +45,10 @@ pub mod service;
 mod topology;
 
 pub use service::{
-    ChildExit, ChildHandle, ComponentRunMode, ProgramServiceConfig, UserProgramService,
+    ChildExit, ChildHandle, ProgramServiceConfig, UserProgramService,
     install_component_host_program_service, install_program_service,
     install_program_service_with_config, run_component_host_processor_forever,
-    run_embedded_component_forever, run_embedded_component_in_mode_forever,
-    run_program_workers_forever,
+    run_embedded_component_forever, run_program_workers_forever,
 };
 pub use topology::{
     ComponentHostProcessorRole, component_host_processor_role, component_host_processors_to_start,
@@ -90,14 +89,16 @@ macro_rules! impl_program_bindings {
         where
             CpuImpl: Cpu + crate::CodegenPlatform + Clone,
             HostFs: crate::HostFileSystem,
-        {}
+        {
+        }
 
         impl<CpuImpl, HostFs> $bindings::helios::system::programs::HostChild
             for StoreData<CpuImpl, HostFs>
         where
             CpuImpl: Cpu + crate::CodegenPlatform + Clone,
             HostFs: crate::HostFileSystem,
-        {}
+        {
+        }
 
         impl<CpuImpl, HostFs> $bindings::helios::system::programs::HostChildWithStore
             for HasSelf<StoreData<CpuImpl, HostFs>>
@@ -144,17 +145,16 @@ macro_rules! impl_program_bindings {
                 };
                 match wait_future.await {
                     Ok(result) => match result {
-                        Ok(exit) => Ok(Ok(
-                            $bindings::helios::system::programs::ExitStatus {
-                                instance_id: exit.instance_id.raw(),
-                                code: exit.exit_code,
-                            },
-                        )),
+                        Ok(exit) => Ok(Ok($bindings::helios::system::programs::ExitStatus {
+                            instance_id: exit.instance_id.raw(),
+                            code: exit.exit_code,
+                        })),
                         Err(error) => Ok(Err($convert_error(error))),
                     },
                     Err(_) => Ok(Err($bindings::helios::system::programs::SpawnError {
                         kind: $bindings::helios::system::programs::SpawnErrorKind::Internal,
-                        detail: "child exit channel dropped before signalling completion".to_owned(),
+                        detail: "child exit channel dropped before signalling completion"
+                            .to_owned(),
                     })),
                 }
             }
@@ -193,10 +193,8 @@ macro_rules! impl_program_bindings {
             fn stdout<T>(
                 mut access: Access<'_, T, Self>,
                 child: wasmtime::component::Resource<ChildHandle>,
-            ) -> wasmtime::Result<(
-                StreamReader<u8>,
-                FutureReader<core::result::Result<(), ()>>,
-            )> {
+            ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<core::result::Result<(), ()>>)>
+            {
                 let handle = access
                     .get()
                     .table
@@ -219,10 +217,8 @@ macro_rules! impl_program_bindings {
             fn stderr<T>(
                 mut access: Access<'_, T, Self>,
                 child: wasmtime::component::Resource<ChildHandle>,
-            ) -> wasmtime::Result<(
-                StreamReader<u8>,
-                FutureReader<core::result::Result<(), ()>>,
-            )> {
+            ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<core::result::Result<(), ()>>)>
+            {
                 let handle = access
                     .get()
                     .table
@@ -359,15 +355,13 @@ impl_program_bindings!(
     convert_program_launch_error
 );
 
-fn run_system_component<CpuImpl, HostFs>(
+async fn run_system_component<CpuImpl, HostFs>(
     component: EmbeddedComponent,
     world: ComponentBindingSet,
     cpu: CpuImpl,
-    kernel: &crate::Kernel<CpuImpl>,
     debug_state: HostRuntimeState<CpuImpl, HostFs>,
     read_serial: fn(u32) -> Vec<u8>,
     write_serial: fn(&[u8]),
-    run_mode: ComponentRunMode,
 ) -> Result<(), DebuggerError>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
@@ -382,12 +376,23 @@ where
     let runtime = crate::wasmtime_adapter::WasmtimeComponentRuntime::new(cpu.clone());
 
     emit_stage_marker(write_serial, "engine:new");
-    tracing::info!(component = component_name, "creating system component engine");
-    let engine = <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as ComponentRuntimeFactory<CpuImpl, HostRuntimeState<CpuImpl, HostFs>, HostFs>>::create_engine(&runtime)
+    tracing::info!(
+        component = component_name,
+        "creating system component engine"
+    );
+    let engine =
+        <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as ComponentRuntimeFactory<
+            CpuImpl,
+            HostRuntimeState<CpuImpl, HostFs>,
+            HostFs,
+        >>::create_engine(&runtime)
         .map_err(DebuggerError::CreateEngine)?;
     emit_stage_marker(write_serial, "engine:ok");
 
-    tracing::info!(component = component_name, "compiling embedded system component");
+    tracing::info!(
+        component = component_name,
+        "compiling embedded system component"
+    );
     let compiled = engine
         .compile(component.bytes())
         .map_err(DebuggerError::CompileComponent)?;
@@ -396,10 +401,8 @@ where
     emit_stage_marker(write_serial, "instantiate:begin");
     tracing::info!(component = component_name, "instantiating system component");
     let instance_registry = debug_state.instance_registry();
-    let instance = instance_registry.register(
-        component_name,
-        debug_state.uptime_nanos(cpu.now().ticks()),
-    );
+    let instance =
+        instance_registry.register(component_name, debug_state.uptime_nanos(cpu.now().ticks()));
 
     let component_world = match world {
         ComponentBindingSet::System => ComponentWorld::System,
@@ -420,28 +423,16 @@ where
         write_serial,
     );
 
-    // System components are launched from the bootstrap thread (before or
-    // during kernel startup), so `block_on` here does not contend with the
-    // cooperative executor.
-    let executor = crate::block_on(runtime.instantiate(
-        &engine,
-        &compiled,
-        component_world,
-        context,
-    ))
-    .map_err(DebuggerError::InstantiateComponent)?;
+    let executor = runtime
+        .instantiate(&engine, &compiled, component_world, context)
+        .await
+        .map_err(DebuggerError::InstantiateComponent)?;
     emit_stage_marker(write_serial, "instantiate:ok");
 
     tracing::info!(component = component_name, "entering wasi:cli/run");
     emit_stage_marker(write_serial, "run:begin");
 
-    let result = match run_mode {
-        ComponentRunMode::KernelExecutor => executor
-            .run_cooperative(|| kernel.run_until_stalled())
-            .map_err(DebuggerError::RunComponent)?,
-        ComponentRunMode::Concurrent => crate::block_on(executor.run())
-            .map_err(DebuggerError::RunComponent)?,
-    };
+    let result = executor.run().await.map_err(DebuggerError::RunComponent)?;
 
     emit_stage_marker(write_serial, "run:ok");
     tracing::info!(component = component_name, "wasi:cli/run returned");
@@ -488,11 +479,13 @@ where
 {
     let mut store = Store::new(engine, state);
     store.limiter(|state| state);
-    store.call_hook(|mut caller: StoreContextMut<'_, StoreData<CpuImpl, HostFs>>, hook| {
-        let transition = crate::wasmtime_adapter::store::translate_call_hook(hook);
-        caller.data_mut().record_transition(transition);
-        Ok(())
-    });
+    store.call_hook(
+        |mut caller: StoreContextMut<'_, StoreData<CpuImpl, HostFs>>, hook| {
+            let transition = crate::wasmtime_adapter::store::translate_call_hook(hook);
+            caller.data_mut().record_transition(transition);
+            Ok(())
+        },
+    );
     store
 }
 
@@ -655,7 +648,8 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]raw-rw-lock.read",
-        |accessor: &Accessor<StoreData<CpuImpl, HostFs>>, (resource,): (Resource<SbiRawRwLock>,)| {
+        |accessor: &Accessor<StoreData<CpuImpl, HostFs>>,
+         (resource,): (Resource<SbiRawRwLock>,)| {
             Box::pin(async move {
                 let rwlock = accessor.with(|mut access| {
                     Ok::<_, wasmtime::Error>(
@@ -674,7 +668,8 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]raw-rw-lock.write",
-        |accessor: &Accessor<StoreData<CpuImpl, HostFs>>, (resource,): (Resource<SbiRawRwLock>,)| {
+        |accessor: &Accessor<StoreData<CpuImpl, HostFs>>,
+         (resource,): (Resource<SbiRawRwLock>,)| {
             Box::pin(async move {
                 let rwlock = accessor.with(|mut access| {
                     Ok::<_, wasmtime::Error>(
@@ -778,7 +773,8 @@ where
                 let Some(service) = service else {
                     return Ok::<_, wasmtime::Error>((Err(
                         debugger_bindings::helios::system::net::PingError {
-                            kind: debugger_bindings::helios::system::net::PingErrorKind::Unavailable,
+                            kind:
+                                debugger_bindings::helios::system::net::PingErrorKind::Unavailable,
                             detail: "network service is unavailable on this machine".to_owned(),
                         },
                     ),));
@@ -794,7 +790,8 @@ where
     )?;
     instance.func_wrap_concurrent(
         "tcp-connect",
-        |accessor: &Accessor<StoreData<CpuImpl, HostFs>>, (host, port, timeout): (String, u16, u64)| {
+        |accessor: &Accessor<StoreData<CpuImpl, HostFs>>,
+         (host, port, timeout): (String, u16, u64)| {
             Box::pin(async move {
                 let service = accessor.with(|mut access| {
                     Ok::<_, wasmtime::Error>(access.get().runtime_state.network_service())
@@ -806,10 +803,13 @@ where
                 let response = match connected {
                     Ok(stream) => {
                         let resource = accessor.with(|mut access| {
-                            access.get().table.push(SbiTcpStream::new(NetworkTcpBackend {
-                                service: service.clone(),
-                                stream,
-                            }))
+                            access
+                                .get()
+                                .table
+                                .push(SbiTcpStream::new(NetworkTcpBackend {
+                                    service: service.clone(),
+                                    stream,
+                                }))
                         })?;
                         Ok(resource)
                     }
@@ -864,7 +864,8 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]tcp-stream.close",
-        |accessor: &Accessor<StoreData<CpuImpl, HostFs>>, (resource,): (Resource<SbiTcpStream>,)| {
+        |accessor: &Accessor<StoreData<CpuImpl, HostFs>>,
+         (resource,): (Resource<SbiTcpStream>,)| {
             Box::pin(async move {
                 let socket = accessor.with(|mut access| {
                     let socket = access.get().table.get(&resource)?;
@@ -874,7 +875,9 @@ where
                     ))
                 })?;
                 socket.0.tcp_close(socket.1).await;
-                Ok::<_, wasmtime::Error>((Ok::<(), debugger_bindings::helios::system::net::TcpError>(()),))
+                Ok::<_, wasmtime::Error>((
+                    Ok::<(), debugger_bindings::helios::system::net::TcpError>(()),
+                ))
             })
         },
     )?;
@@ -935,7 +938,8 @@ where
     )?;
     instance.func_wrap_concurrent(
         "tcp-connect",
-        |accessor: &Accessor<StoreData<CpuImpl, HostFs>>, (host, port, timeout): (String, u16, u64)| {
+        |accessor: &Accessor<StoreData<CpuImpl, HostFs>>,
+         (host, port, timeout): (String, u16, u64)| {
             Box::pin(async move {
                 let service = accessor.with(|mut access| {
                     Ok::<_, wasmtime::Error>(access.get().runtime_state.network_service())
@@ -947,10 +951,13 @@ where
                 let response = match connected {
                     Ok(stream) => {
                         let resource = accessor.with(|mut access| {
-                            access.get().table.push(SbiTcpStream::new(NetworkTcpBackend {
-                                service: service.clone(),
-                                stream,
-                            }))
+                            access
+                                .get()
+                                .table
+                                .push(SbiTcpStream::new(NetworkTcpBackend {
+                                    service: service.clone(),
+                                    stream,
+                                }))
                         })?;
                         Ok(resource)
                     }
@@ -1005,7 +1012,8 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]tcp-stream.close",
-        |accessor: &Accessor<StoreData<CpuImpl, HostFs>>, (resource,): (Resource<SbiTcpStream>,)| {
+        |accessor: &Accessor<StoreData<CpuImpl, HostFs>>,
+         (resource,): (Resource<SbiTcpStream>,)| {
             Box::pin(async move {
                 let socket = accessor.with(|mut access| {
                     let socket = access.get().table.get(&resource)?;
@@ -1015,10 +1023,9 @@ where
                     ))
                 })?;
                 socket.0.tcp_close(socket.1).await;
-                Ok::<_, wasmtime::Error>((Ok::<
-                    (),
-                    program_bindings::helios::system::net::TcpError,
-                >(()),))
+                Ok::<_, wasmtime::Error>((
+                    Ok::<(), program_bindings::helios::system::net::TcpError>(()),
+                ))
             })
         },
     )?;
@@ -1088,11 +1095,7 @@ where
     let mut instance = linker.instance(TRACING_INSTANCE)?;
     instance.func_wrap(
         "recent",
-        |caller,
-         (filter, limit): (
-            program_bindings::helios::system::tracing::Filter,
-            u32,
-        )| {
+        |caller, (filter, limit): (program_bindings::helios::system::tracing::Filter, u32)| {
             let filter = convert_program_filter(filter);
             let events = caller
                 .data()
@@ -1106,8 +1109,7 @@ where
     )?;
     instance.func_wrap(
         "subscribe",
-        |mut caller,
-         (filter,): (program_bindings::helios::system::tracing::Filter,)| {
+        |mut caller, (filter,): (program_bindings::helios::system::tracing::Filter,)| {
             let reader = StreamReader::new(
                 &mut caller,
                 ProgramTracingStreamProducer::new(convert_program_filter(filter)),
@@ -1200,7 +1202,9 @@ fn convert_program_launch_result(
     }
 }
 
-fn convert_ping_reply(reply: crate::PingReply) -> debugger_bindings::helios::system::net::PingReply {
+fn convert_ping_reply(
+    reply: crate::PingReply,
+) -> debugger_bindings::helios::system::net::PingReply {
     let octets = reply.address.octets();
     debugger_bindings::helios::system::net::PingReply {
         address: debugger_bindings::helios::system::net::IpAddress::Ipv4((
@@ -1224,7 +1228,9 @@ fn convert_program_ping_reply(
     }
 }
 
-fn convert_ping_error(error: crate::PingError) -> debugger_bindings::helios::system::net::PingError {
+fn convert_ping_error(
+    error: crate::PingError,
+) -> debugger_bindings::helios::system::net::PingError {
     debugger_bindings::helios::system::net::PingError {
         kind: match error.kind {
             crate::PingErrorKind::UnresolvedHost => {
@@ -1273,8 +1279,7 @@ fn unavailable_tcp_error() -> debugger_bindings::helios::system::net::TcpError {
     }
 }
 
-fn unavailable_program_tcp_error()
--> program_bindings::helios::system::net::TcpError {
+fn unavailable_program_tcp_error() -> program_bindings::helios::system::net::TcpError {
     program_bindings::helios::system::net::TcpError {
         kind: program_bindings::helios::system::net::TcpErrorKind::Unavailable,
         detail: "network service is unavailable on this machine".to_owned(),
@@ -1343,12 +1348,12 @@ where
     Ok(())
 }
 
-impl<CpuImpl, HostFs> debugger_bindings::helios::system::serial::Host
-    for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, HostFs> debugger_bindings::helios::system::serial::Host for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
-{}
+{
+}
 
 impl<CpuImpl, HostFs> debugger_bindings::helios::system::serial::HostWithStore
     for HasSelf<StoreData<CpuImpl, HostFs>>
@@ -1373,7 +1378,8 @@ impl<CpuImpl, HostFs> debugger_bindings::helios::system::serial::HostSerialPort
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
-{}
+{
+}
 
 impl<CpuImpl, HostFs> debugger_bindings::helios::system::serial::HostSerialPortWithStore
     for HasSelf<StoreData<CpuImpl, HostFs>>
@@ -1451,19 +1457,20 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::Host
-    for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::Host for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
-{}
+{
+}
 
 impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawMutex
     for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
-{}
+{
+}
 
 impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawMutexWithStore
     for HasSelf<StoreData<CpuImpl, HostFs>>
@@ -1512,7 +1519,8 @@ impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawMutexGuard
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
-{}
+{
+}
 
 impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawMutexGuardWithStore
     for HasSelf<StoreData<CpuImpl, HostFs>>
@@ -1536,7 +1544,8 @@ impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawRwLock
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
-{}
+{
+}
 
 impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawRwLockWithStore
     for HasSelf<StoreData<CpuImpl, HostFs>>
@@ -1602,7 +1611,8 @@ impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawRwLockRead
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
-{}
+{
+}
 
 impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawRwLockReadGuardWithStore
     for HasSelf<StoreData<CpuImpl, HostFs>>
@@ -1626,7 +1636,8 @@ impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawRwLockWrit
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
-{}
+{
+}
 
 impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawRwLockWriteGuardWithStore
     for HasSelf<StoreData<CpuImpl, HostFs>>
@@ -1877,9 +1888,7 @@ fn convert_sample(sample: StatsSample) -> debugger_bindings::helios::system::sta
     }
 }
 
-fn convert_program_sample(
-    sample: StatsSample,
-) -> program_bindings::helios::system::stats::Sample {
+fn convert_program_sample(sample: StatsSample) -> program_bindings::helios::system::stats::Sample {
     let heap = heap_stats();
     let total_bytes =
         u64::try_from(heap.total_bytes).expect("kernel heap total bytes do not fit into u64");
@@ -1892,12 +1901,7 @@ fn convert_program_sample(
             configured: sample.configured_processors,
             online: sample.online_processors,
             utilization: (0..sample.configured_processors)
-                .map(
-                    |id| program_bindings::helios::system::stats::Processor {
-                        id,
-                        busy: 0,
-                    },
-                )
+                .map(|id| program_bindings::helios::system::stats::Processor { id, busy: 0 })
                 .collect(),
         },
         memory: program_bindings::helios::system::stats::Memory {
@@ -1952,12 +1956,8 @@ fn convert_program_memory_pressure(
         ((total_bytes.saturating_sub(available_bytes.min(total_bytes))) * 1_000) / total_bytes;
 
     match used_permille {
-        0..=699 => {
-            program_bindings::helios::system::stats::MemoryPressure::Nominal
-        }
-        700..=849 => {
-            program_bindings::helios::system::stats::MemoryPressure::Elevated
-        }
+        0..=699 => program_bindings::helios::system::stats::MemoryPressure::Nominal,
+        700..=849 => program_bindings::helios::system::stats::MemoryPressure::Elevated,
         850..=949 => program_bindings::helios::system::stats::MemoryPressure::High,
         _ => program_bindings::helios::system::stats::MemoryPressure::Critical,
     }
@@ -1988,9 +1988,7 @@ fn convert_event(event: TraceEvent) -> debugger_bindings::helios::system::tracin
     }
 }
 
-fn convert_program_event(
-    event: TraceEvent,
-) -> program_bindings::helios::system::tracing::Event {
+fn convert_program_event(event: TraceEvent) -> program_bindings::helios::system::tracing::Event {
     program_bindings::helios::system::tracing::Event {
         timestamp: event.timestamp,
         level: convert_program_level_from_local(event.level),
@@ -2010,9 +2008,7 @@ fn convert_field(field: TraceField) -> debugger_bindings::helios::system::tracin
     }
 }
 
-fn convert_program_field(
-    field: TraceField,
-) -> program_bindings::helios::system::tracing::Field {
+fn convert_program_field(field: TraceField) -> program_bindings::helios::system::tracing::Field {
     program_bindings::helios::system::tracing::Field {
         key: field.key,
         value: convert_program_value(field.value),
@@ -2021,20 +2017,24 @@ fn convert_program_field(
 
 fn convert_value(value: TraceValue) -> debugger_bindings::helios::system::tracing::Value {
     match value {
-        TraceValue::Boolean(value) => debugger_bindings::helios::system::tracing::Value::Boolean(value),
-        TraceValue::Signed64(value) => debugger_bindings::helios::system::tracing::Value::Signed64(value),
+        TraceValue::Boolean(value) => {
+            debugger_bindings::helios::system::tracing::Value::Boolean(value)
+        }
+        TraceValue::Signed64(value) => {
+            debugger_bindings::helios::system::tracing::Value::Signed64(value)
+        }
         TraceValue::Unsigned64(value) => {
             debugger_bindings::helios::system::tracing::Value::Unsigned64(value)
         }
-        TraceValue::Float64(value) => debugger_bindings::helios::system::tracing::Value::Float64(value),
+        TraceValue::Float64(value) => {
+            debugger_bindings::helios::system::tracing::Value::Float64(value)
+        }
         TraceValue::Text(value) => debugger_bindings::helios::system::tracing::Value::Text(value),
         TraceValue::Blob(value) => debugger_bindings::helios::system::tracing::Value::Blob(value),
     }
 }
 
-fn convert_program_value(
-    value: TraceValue,
-) -> program_bindings::helios::system::tracing::Value {
+fn convert_program_value(value: TraceValue) -> program_bindings::helios::system::tracing::Value {
     match value {
         TraceValue::Boolean(value) => {
             program_bindings::helios::system::tracing::Value::Boolean(value)
@@ -2048,16 +2048,14 @@ fn convert_program_value(
         TraceValue::Float64(value) => {
             program_bindings::helios::system::tracing::Value::Float64(value)
         }
-        TraceValue::Text(value) => {
-            program_bindings::helios::system::tracing::Value::Text(value)
-        }
-        TraceValue::Blob(value) => {
-            program_bindings::helios::system::tracing::Value::Blob(value)
-        }
+        TraceValue::Text(value) => program_bindings::helios::system::tracing::Value::Text(value),
+        TraceValue::Blob(value) => program_bindings::helios::system::tracing::Value::Blob(value),
     }
 }
 
-fn convert_level_from_local(level: TraceLevel) -> debugger_bindings::helios::system::tracing::Level {
+fn convert_level_from_local(
+    level: TraceLevel,
+) -> debugger_bindings::helios::system::tracing::Level {
     match level {
         TraceLevel::Error => debugger_bindings::helios::system::tracing::Level::Error,
         TraceLevel::Warn => debugger_bindings::helios::system::tracing::Level::Warn,
@@ -2081,17 +2079,11 @@ fn convert_program_level_from_local(
     level: TraceLevel,
 ) -> program_bindings::helios::system::tracing::Level {
     match level {
-        TraceLevel::Error => {
-            program_bindings::helios::system::tracing::Level::Error
-        }
+        TraceLevel::Error => program_bindings::helios::system::tracing::Level::Error,
         TraceLevel::Warn => program_bindings::helios::system::tracing::Level::Warn,
         TraceLevel::Info => program_bindings::helios::system::tracing::Level::Info,
-        TraceLevel::Debug => {
-            program_bindings::helios::system::tracing::Level::Debug
-        }
-        TraceLevel::Trace => {
-            program_bindings::helios::system::tracing::Level::Trace
-        }
+        TraceLevel::Debug => program_bindings::helios::system::tracing::Level::Debug,
+        TraceLevel::Trace => program_bindings::helios::system::tracing::Level::Trace,
     }
 }
 
@@ -2099,17 +2091,11 @@ fn convert_program_level_to_local(
     level: program_bindings::helios::system::tracing::Level,
 ) -> TraceLevel {
     match level {
-        program_bindings::helios::system::tracing::Level::Error => {
-            TraceLevel::Error
-        }
+        program_bindings::helios::system::tracing::Level::Error => TraceLevel::Error,
         program_bindings::helios::system::tracing::Level::Warn => TraceLevel::Warn,
         program_bindings::helios::system::tracing::Level::Info => TraceLevel::Info,
-        program_bindings::helios::system::tracing::Level::Debug => {
-            TraceLevel::Debug
-        }
-        program_bindings::helios::system::tracing::Level::Trace => {
-            TraceLevel::Trace
-        }
+        program_bindings::helios::system::tracing::Level::Debug => TraceLevel::Debug,
+        program_bindings::helios::system::tracing::Level::Trace => TraceLevel::Trace,
     }
 }
 

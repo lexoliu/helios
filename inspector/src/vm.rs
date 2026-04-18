@@ -287,14 +287,20 @@ fn connect_and_run(command: &ResolvedVmCommand, socket_path: &Path) -> Result<()
     run_connected(client, command.command.clone())
 }
 
-fn prepare_boot_artifact(command: &ResolvedVmCommand, runtime_dir: Option<&Path>) -> Result<PathBuf> {
+fn prepare_boot_artifact(
+    command: &ResolvedVmCommand,
+    runtime_dir: Option<&Path>,
+) -> Result<PathBuf> {
     match command.arch {
         VmArch::Riscv64 => Ok(command.kernel.clone()),
         VmArch::X86_64 => prepare_x86_bios_image(command, runtime_dir),
     }
 }
 
-fn prepare_x86_bios_image(command: &ResolvedVmCommand, runtime_dir: Option<&Path>) -> Result<PathBuf> {
+fn prepare_x86_bios_image(
+    command: &ResolvedVmCommand,
+    runtime_dir: Option<&Path>,
+) -> Result<PathBuf> {
     let kernel = fs::canonicalize(&command.kernel)
         .with_context(|| format!("failed to canonicalize kernel {}", command.kernel.display()))?;
     let image = match runtime_dir {
@@ -391,6 +397,8 @@ impl VmRuntime {
             }
             VmArch::X86_64 => {
                 qemu.arg("-cpu").arg("max");
+                qemu.arg("-watchdog").arg("i6300esb");
+                qemu.arg("-watchdog-action").arg("reset");
                 qemu.arg("-drive")
                     .arg(format!("format=raw,file={}", artifact.display()));
             }
@@ -433,17 +441,22 @@ impl Drop for VmRuntime {
 }
 
 fn prepare_socket_path(socket_path: &Path) -> Result<()> {
-    if let Some(parent) = socket_path.parent().filter(|path| !path.as_os_str().is_empty()) {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create socket directory {}", parent.display())
-        })?;
+    if let Some(parent) = socket_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create socket directory {}", parent.display()))?;
     }
     if !socket_path.exists() {
         return Ok(());
     }
 
     let metadata = fs::symlink_metadata(socket_path).with_context(|| {
-        format!("failed to inspect existing socket path {}", socket_path.display())
+        format!(
+            "failed to inspect existing socket path {}",
+            socket_path.display()
+        )
     })?;
     if !metadata.file_type().is_socket() {
         bail!(
@@ -451,9 +464,8 @@ fn prepare_socket_path(socket_path: &Path) -> Result<()> {
             socket_path.display()
         );
     }
-    fs::remove_file(socket_path).with_context(|| {
-        format!("failed to remove stale socket {}", socket_path.display())
-    })?;
+    fs::remove_file(socket_path)
+        .with_context(|| format!("failed to remove stale socket {}", socket_path.display()))?;
     Ok(())
 }
 

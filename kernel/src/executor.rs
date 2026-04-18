@@ -9,9 +9,16 @@ use core::task::{Context, Poll};
 use async_task::{Builder, Runnable, Task};
 use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 use helios_hal::cpu::{Cpu, ProcessorId};
+use helios_hal::watchdog::ProgressCounter;
 
 type ReadyQueue = ConcurrentQueue<Runnable>;
 pub type JoinHandle<T> = Task<T>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProgressMode {
+    Counted,
+    Silent,
+}
 
 /// Join handle for a task that is constrained to the spawning processor.
 ///
@@ -28,16 +35,19 @@ pub struct Spawner<CpuImpl: Cpu + Clone> {
     ready_queue: Arc<ReadyQueue>,
     cpu: CpuImpl,
     owner_processor: ProcessorId,
+    progress: ProgressCounter,
 }
 
 pub struct Executor {
     ready_queue: Arc<ReadyQueue>,
+    progress: ProgressCounter,
 }
 
 impl Executor {
-    pub fn new() -> Self {
+    pub fn new(progress: ProgressCounter) -> Self {
         Self {
             ready_queue: Arc::new(ConcurrentQueue::unbounded()),
+            progress,
         }
     }
 
@@ -47,6 +57,7 @@ impl Executor {
             ready_queue: self.ready_queue.clone(),
             cpu,
             owner_processor,
+            progress: self.progress.clone(),
         }
     }
 
@@ -66,7 +77,11 @@ impl Executor {
 }
 
 impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
-    fn schedule(&self, runnable: Runnable) {
+    fn schedule(&self, runnable: Runnable, progress_mode: ProgressMode) {
+        if progress_mode == ProgressMode::Counted {
+            self.progress.record_progress();
+        }
+
         match self.ready_queue.push(runnable) {
             Ok(()) => {}
             Err(PushError::Full(_)) => unreachable!("unbounded ready queue reported full"),
@@ -76,33 +91,33 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         self.cpu.wake_processor(self.owner_processor);
     }
 
-    pub fn spawn<Fut>(&self, future: Fut) -> JoinHandle<Fut::Output>
+    fn spawn_with_progress<Fut>(
+        &self,
+        future: Fut,
+        progress_mode: ProgressMode,
+    ) -> JoinHandle<Fut::Output>
     where
         Fut: Future + Send + 'static,
         Fut::Output: Send + 'static,
     {
         let spawner = self.clone();
-        let schedule = move |runnable| spawner.schedule(runnable);
+        let schedule = move |runnable| spawner.schedule(runnable, progress_mode);
         let (runnable, task) = Builder::new().spawn(move |_| future, schedule);
         runnable.schedule();
         task
     }
 
-    pub fn spawn_detached<Fut>(&self, future: Fut)
-    where
-        Fut: Future + Send + 'static,
-        Fut::Output: Send + 'static,
-    {
-        self.spawn(future).detach();
-    }
-
-    pub fn spawn_local<Fut>(&self, future: Fut) -> LocalJoinHandle<Fut::Output>
+    fn spawn_local_with_progress<Fut>(
+        &self,
+        future: Fut,
+        progress_mode: ProgressMode,
+    ) -> LocalJoinHandle<Fut::Output>
     where
         Fut: Future + 'static,
         Fut::Output: 'static,
     {
         let spawner = self.clone();
-        let schedule = move |runnable| spawner.schedule(runnable);
+        let schedule = move |runnable| spawner.schedule(runnable, progress_mode);
 
         // SAFETY: the runnable is always re-enqueued onto the spawning processor's ready
         // queue, and `LocalJoinHandle` is `!Send`, so the task cannot be awaited or
@@ -115,12 +130,54 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         }
     }
 
+    pub fn spawn<Fut>(&self, future: Fut) -> JoinHandle<Fut::Output>
+    where
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        self.spawn_with_progress(future, ProgressMode::Counted)
+    }
+
+    pub fn spawn_detached<Fut>(&self, future: Fut)
+    where
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        self.spawn(future).detach();
+    }
+
+    pub(crate) fn spawn_detached_silent<Fut>(&self, future: Fut)
+    where
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        self.spawn_with_progress(future, ProgressMode::Silent)
+            .detach();
+    }
+
+    pub fn spawn_local<Fut>(&self, future: Fut) -> LocalJoinHandle<Fut::Output>
+    where
+        Fut: Future + 'static,
+        Fut::Output: 'static,
+    {
+        self.spawn_local_with_progress(future, ProgressMode::Counted)
+    }
+
     pub fn spawn_local_detached<Fut>(&self, future: Fut)
     where
         Fut: Future + 'static,
         Fut::Output: 'static,
     {
         self.spawn_local(future).detach();
+    }
+
+    pub(crate) fn spawn_local_detached_silent<Fut>(&self, future: Fut)
+    where
+        Fut: Future + 'static,
+        Fut::Output: 'static,
+    {
+        self.spawn_local_with_progress(future, ProgressMode::Silent)
+            .detach();
     }
 }
 

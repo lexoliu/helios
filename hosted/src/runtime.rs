@@ -252,11 +252,7 @@ fn spawn_processor_thread(
                 }
 
                 // Install component host program service (same as riscv/x86).
-                helios_kernel::install_component_host_program_service(
-                    &kernel,
-                    &cpu,
-                    &debug_state,
-                );
+                helios_kernel::install_component_host_program_service(&kernel, &cpu, &debug_state);
 
                 // Start non-bootstrap processors for component host topology.
                 for p in helios_kernel::component_host_processors_to_start(
@@ -273,7 +269,6 @@ fn spawn_processor_thread(
                 debug_state,
                 read_debug_serial,
                 write_debug_serial,
-                helios_kernel::ComponentRunMode::Concurrent,
             );
         })
         .unwrap_or_else(|err| panic!("failed to spawn processor {}: {err}", processor.id()))
@@ -299,10 +294,7 @@ fn wait_for_processor_registration(machine: &HostedMachine, ready_rx: &Receiver<
                 expected
             )
         });
-        tracing::info!(
-            "processor {} registered",
-            processor.id()
-        );
+        tracing::info!("processor {} registered", processor.id());
     }
 }
 
@@ -334,10 +326,7 @@ fn spawn_timer_thread(machine: Arc<HostedMachine>, rx: Receiver<TimerCommand>) {
             let mut deadlines = vec![None::<Instant>; machine.processor_count()];
 
             loop {
-                let next_deadline = deadlines
-                    .iter()
-                    .filter_map(|&d| d)
-                    .min();
+                let next_deadline = deadlines.iter().filter_map(|&d| d).min();
 
                 let command = if let Some(deadline) = next_deadline {
                     let now = machine.now();

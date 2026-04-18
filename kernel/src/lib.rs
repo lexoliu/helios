@@ -5,7 +5,6 @@ extern crate self as helios_kernel;
 #[cfg(not(target_os = "none"))]
 extern crate std;
 
-mod block_on;
 mod bootfs;
 mod child_io;
 mod codegen_platform;
@@ -35,19 +34,18 @@ mod runtime_types;
 mod serial_transport;
 mod sync;
 mod task;
-mod unsupported_host_fs;
 mod time;
 mod timer;
+mod unsupported_host_fs;
 mod wasi_rights;
 pub(crate) mod wasmtime_adapter;
 
-pub use block_on::block_on;
-pub use child_io::{ByteReader, ByteWriter, ClosedPeer, TryRead, byte_channel};
-pub use codegen_platform::CodegenPlatform;
 pub use bootfs::{
     BootDirectory, BootDirectoryEntry, BootDirectoryHandleExt, BootFile, EmbeddedBootFile,
     EmbeddedBootFs,
 };
+pub use child_io::{ByteReader, ByteWriter, ClosedPeer, TryRead, byte_channel};
+pub use codegen_platform::CodegenPlatform;
 pub(crate) use component_cache::ComponentCache;
 pub use component_fs::{
     ComponentFsNodeKind, ComponentFsResourceError, ComponentResourceTableError,
@@ -57,13 +55,12 @@ pub use component_fs_path::{
     ComponentFsPathError, directory_prefix, parent_path, resolve_child_path,
 };
 pub use component_host::{
-    ChildExit, ChildHandle, ComponentBindingSet, ComponentHostProcessorRole, ComponentRunMode,
-    HostRuntimeState, ProgramServiceConfig, UserProgramService, component_host_processor_role,
+    ChildExit, ChildHandle, ComponentBindingSet, ComponentHostProcessorRole, HostRuntimeState,
+    ProgramServiceConfig, UserProgramService, component_host_processor_role,
     component_host_processors_to_start, component_host_system_processor,
     component_host_worker_count, install_component_host_program_service, install_program_service,
     install_program_service_with_config, run_component_host_processor_forever,
-    run_embedded_component_forever, run_embedded_component_in_mode_forever,
-    run_program_workers_forever, system_component_should_run_on,
+    run_embedded_component_forever, run_program_workers_forever, system_component_should_run_on,
 };
 pub use component_resources::{
     ComponentRawMutex, ComponentRawMutexGuard, ComponentRawRwLock, ComponentRawRwLockReadGuard,
@@ -100,7 +97,6 @@ pub use observer::{
     DEFAULT_TRACE_HISTORY_CAPACITY, StatsSample, TraceEvent, TraceField, TraceFilter, TraceHistory,
     TraceLevel, TraceValue, matches_trace_filter, parse_console_text,
 };
-pub use recording_console::RecordingConsole;
 pub use program::{
     Blueprint, CompileError as ProgramCompileError, ExitCode, ProgramRuntime,
     ProgramRuntimeBackend, ProgramRuntimeConfig, ProgramRuntimeDriver, ProgramRuntimeDriverBackend,
@@ -108,6 +104,7 @@ pub use program::{
     RunError as ProgramRunError, Task,
 };
 pub use program_service::{ProgramExecError, ProgramExecErrorKind, ProgramService};
+pub use recording_console::RecordingConsole;
 pub use runtime_state::RuntimeState;
 pub use runtime_types::{
     ComponentHostFilesystemState, ComponentNetworkService, ComponentNetworkState,
@@ -116,8 +113,7 @@ pub use runtime_types::{
     PingErrorKind, PingReply, TcpError, TcpErrorKind, TcpStreamToken,
 };
 pub use serial_transport::{
-    emit_serial_error_marker, emit_serial_stage_marker, read_serial, try_read_serial,
-    write_serial,
+    emit_serial_error_marker, emit_serial_stage_marker, read_serial, try_read_serial, write_serial,
 };
 pub use sync::{
     Mutex, MutexGuard, Notified, Notify, OwnedRawMutexLease, OwnedRawRwLockReadLease,
@@ -125,25 +121,31 @@ pub use sync::{
     RawRwLockWriteLease, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
 pub use task::{YieldNow, yield_now};
-pub use unsupported_host_fs::UnsupportedHostFileSystem;
-pub use wasi_rights::WasiRights;
 pub use time::{elapsed_millis, monotonic_nanos};
 pub use timer::{Sleep, Timer};
+pub use unsupported_host_fs::UnsupportedHostFileSystem;
+pub use wasi_rights::WasiRights;
 // Wasmtime-specific helpers are crate-internal only.
 // External consumers use the ComponentRuntimeFactory trait.
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use alloc::sync::Arc;
+use alloc::task::Wake;
+use core::future::Future;
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 
 use buddy_system_allocator::LockedHeap;
 use executor::Executor;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
+use helios_hal::watchdog::{NoWatchdog, ProgressCounter, Watchdog};
 
 const HEAP_ORDER: usize = 32;
 const BOOT_UNINITIALIZED: u8 = 0;
 const BOOT_INITIALIZING: u8 = 1;
 const BOOT_READY: u8 = 2;
+const WATCHDOG_CHECK_DIVISOR: u32 = 4;
 
 #[cfg_attr(target_os = "none", global_allocator)]
 static ALLOCATOR: LockedHeap<HEAP_ORDER> = LockedHeap::empty();
@@ -161,13 +163,14 @@ impl HeapStats {
     }
 }
 
-pub struct Kernel<CpuImpl: Cpu + Clone> {
+pub struct Kernel<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone = NoWatchdog> {
     cpu: CpuImpl,
     executor: Executor,
     timer: Timer<CpuImpl>,
+    watchdog: WatchdogImpl,
 }
 
-impl<CpuImpl: Cpu + Clone> Kernel<CpuImpl> {
+impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, WatchdogImpl> {
     pub fn spawner(&self) -> Spawner<CpuImpl> {
         self.executor.spawner(self.cpu.clone())
     }
@@ -240,6 +243,105 @@ impl<CpuImpl: Cpu + Clone> Kernel<CpuImpl> {
             self.cpu.park_current();
         }
     }
+
+    pub fn run_local_future<Fut>(&self, future: Fut) -> Fut::Output
+    where
+        Fut: Future + 'static,
+        Fut::Output: 'static,
+    {
+        let parker = Arc::new(LocalFutureParker::new(self.cpu.clone()));
+        let waker = Waker::from(parker.clone());
+        let mut context = Context::from_waker(&waker);
+        let mut task = core::pin::pin!(self.spawn_local(future));
+
+        loop {
+            parker.clear();
+            match task.as_mut().poll(&mut context) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => {
+                    if self.run_until_stalled() == 0 {
+                        parker.park();
+                    }
+                }
+            }
+        }
+    }
+
+    fn spawn_watchdog_supervisor(&self) {
+        if !self.watchdog.is_enabled() {
+            return;
+        }
+
+        let timeout = self.watchdog.timeout();
+        assert!(
+            timeout > Duration::ZERO,
+            "enabled watchdog reported a zero timeout"
+        );
+        let interval = timeout
+            .checked_div(WATCHDOG_CHECK_DIVISOR)
+            .unwrap_or_else(|| panic!("watchdog timeout {timeout:?} is too short"));
+        assert!(
+            interval > Duration::ZERO,
+            "watchdog check interval computed as zero for timeout {timeout:?}"
+        );
+
+        let timer = self.timer();
+        let watchdog = self.watchdog.clone();
+        let progress = watchdog.progress();
+        self.spawner().spawn_local_detached_silent(async move {
+            watchdog.arm();
+            let mut last_progress = progress.snapshot();
+            loop {
+                timer.sleep_for(interval).await;
+                let current_progress = progress.snapshot();
+                if current_progress == last_progress {
+                    continue;
+                }
+                watchdog.pet();
+                last_progress = current_progress;
+            }
+        });
+    }
+}
+
+struct LocalFutureParker<CpuImpl: Cpu + Clone> {
+    cpu: CpuImpl,
+    owner_processor: ProcessorId,
+    notified: AtomicBool,
+}
+
+impl<CpuImpl: Cpu + Clone> LocalFutureParker<CpuImpl> {
+    fn new(cpu: CpuImpl) -> Self {
+        let owner_processor = cpu.current_processor();
+        Self {
+            cpu,
+            owner_processor,
+            notified: AtomicBool::new(false),
+        }
+    }
+
+    fn clear(&self) {
+        self.notified.store(false, Ordering::Release);
+    }
+
+    fn park(&self) {
+        if self.notified.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        self.cpu.park_current();
+    }
+}
+
+impl<CpuImpl: Cpu + Clone> Wake for LocalFutureParker<CpuImpl> {
+    fn wake(self: Arc<Self>) {
+        self.notified.store(true, Ordering::Release);
+        self.cpu.wake_processor(self.owner_processor);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.notified.store(true, Ordering::Release);
+        self.cpu.wake_processor(self.owner_processor);
+    }
 }
 
 pub fn init<Console, CpuImpl, Regions>(
@@ -250,10 +352,23 @@ where
     CpuImpl: Cpu + Clone,
     Regions: IntoIterator<Item = MemoryRegion>,
 {
+    init_with_watchdog(platform)
+}
+
+pub fn init_with_watchdog<Console, CpuImpl, Regions, WatchdogImpl>(
+    platform: Platform<Console, CpuImpl, Regions, WatchdogImpl>,
+) -> Kernel<CpuImpl, WatchdogImpl>
+where
+    Console: core::fmt::Write + Send + 'static,
+    CpuImpl: Cpu + Clone,
+    Regions: IntoIterator<Item = MemoryRegion>,
+    WatchdogImpl: Watchdog + Clone,
+{
     let Platform {
         console,
         cpu,
         memory_regions,
+        watchdog,
     } = platform;
     let current_processor = cpu.current_processor();
 
@@ -267,16 +382,25 @@ where
         wait_for_bootstrap(&cpu);
     }
 
+    let progress = if watchdog.is_enabled() {
+        watchdog.progress()
+    } else {
+        ProgressCounter::new()
+    };
     let kernel = Kernel {
         timer: Timer::new(cpu.clone()),
         cpu,
-        executor: Executor::new(),
+        executor: Executor::new(progress),
+        watchdog,
     };
 
     let processor_id = current_processor.id();
     kernel.spawn_detached(async move {
         tracing::info!("Processor online processor={processor_id}");
     });
+    if current_processor == kernel.cpu.bootstrap_processor() {
+        kernel.spawn_watchdog_supervisor();
+    }
 
     kernel
 }
