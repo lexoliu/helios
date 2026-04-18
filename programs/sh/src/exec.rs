@@ -41,31 +41,62 @@ pub struct Bootstrap {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommandStatus {
-    code: u8,
-    exiting: bool,
+    code: i32,
+    flow: ControlFlow,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum ControlFlow {
+    #[default]
+    None,
+    ExitShell,
+    Return,
+    Break(usize),
+    Continue(usize),
 }
 
 impl CommandStatus {
     pub const SUCCESS: Self = Self {
         code: 0,
-        exiting: false,
+        flow: ControlFlow::None,
     };
 
-    pub const fn new(code: u8) -> Self {
+    pub const fn new(code: i32) -> Self {
         Self {
             code,
-            exiting: false,
+            flow: ControlFlow::None,
         }
     }
 
-    pub const fn exit(code: u8) -> Self {
+    pub const fn exit(code: i32) -> Self {
         Self {
             code,
-            exiting: true,
+            flow: ControlFlow::ExitShell,
         }
     }
 
-    pub const fn code(self) -> u8 {
+    pub const fn shell_return(code: i32) -> Self {
+        Self {
+            code,
+            flow: ControlFlow::Return,
+        }
+    }
+
+    pub const fn break_loop(code: i32, depth: usize) -> Self {
+        Self {
+            code,
+            flow: ControlFlow::Break(depth),
+        }
+    }
+
+    pub const fn continue_loop(code: i32, depth: usize) -> Self {
+        Self {
+            code,
+            flow: ControlFlow::Continue(depth),
+        }
+    }
+
+    pub const fn code(self) -> i32 {
         self.code
     }
 
@@ -74,7 +105,23 @@ impl CommandStatus {
     }
 
     pub const fn is_exit(self) -> bool {
-        self.exiting
+        matches!(self.flow, ControlFlow::ExitShell)
+    }
+
+    pub const fn is_interrupting(self) -> bool {
+        !matches!(self.flow, ControlFlow::None)
+    }
+
+    pub const fn as_plain(self) -> Self {
+        Self::new(self.code)
+    }
+
+    const fn flow(self) -> ControlFlow {
+        self.flow
+    }
+
+    fn normalize_fork_boundary(self) -> Self {
+        Self::new(self.code)
     }
 }
 
@@ -86,10 +133,12 @@ pub struct Shell<P> {
     pub(crate) process_id: String,
     pub(crate) positional_parameters: Vec<String>,
     pub(crate) working_dir: PathBuf,
-    pub(crate) last_status: u8,
-    pub(crate) last_pipeline_statuses: Vec<u8>,
+    pub(crate) last_status: i32,
+    pub(crate) last_pipeline_statuses: Vec<i32>,
     pub(crate) last_background_job: Option<u64>,
     pub(crate) next_background_job: u64,
+    pub(crate) function_depth: usize,
+    pub(crate) loop_depth: usize,
     pub(crate) background_jobs: Rc<RefCell<HashMap<u64, oneshot::Receiver<Result<CommandStatus>>>>>,
 }
 
@@ -195,6 +244,8 @@ where
             last_pipeline_statuses: vec![0],
             last_background_job: None,
             next_background_job: 1,
+            function_depth: 0,
+            loop_depth: 0,
             background_jobs: Rc::new(RefCell::new(HashMap::new())),
         }
     }
@@ -307,6 +358,8 @@ where
             last_pipeline_statuses: self.last_pipeline_statuses.clone(),
             last_background_job: self.last_background_job,
             next_background_job: self.next_background_job,
+            function_depth: self.function_depth,
+            loop_depth: self.loop_depth,
             background_jobs: Rc::new(RefCell::new(HashMap::new())),
         }
     }
@@ -348,7 +401,7 @@ where
                 continue;
             }
             last = self.run_and_or(and_or, io.clone()).await?;
-            if last.is_exit() {
+            if last.is_interrupting() {
                 return Ok(last);
             }
         }
@@ -362,7 +415,7 @@ where
         io: ExecutionIo,
     ) -> Result<CommandStatus> {
         let mut last = self.run_pipeline(&and_or.first, io.clone()).await?;
-        if last.is_exit() {
+        if last.is_interrupting() {
             return Ok(last);
         }
 
@@ -380,7 +433,7 @@ where
             }
 
             last = self.run_pipeline(pipeline, io.clone()).await?;
-            if last.is_exit() {
+            if last.is_interrupting() {
                 return Ok(last);
             }
         }
@@ -449,7 +502,10 @@ where
         let mut shell = self.fork();
         let (sender, receiver) = oneshot::channel();
         self.platform.spawn_task(Box::pin(async move {
-            let result = shell.run_command(&command, io).await;
+            let result = shell
+                .run_command(&command, io)
+                .await
+                .map(CommandStatus::normalize_fork_boundary);
             let _ = sender.send(result);
         }));
         StageHandle { result: receiver }
@@ -468,7 +524,10 @@ where
         let mut background_io = io;
         background_io.set_input(0, InputStream::empty());
         self.platform.spawn_task(Box::pin(async move {
-            let result = shell.run_and_or(&and_or, background_io).await;
+            let result = shell
+                .run_and_or(&and_or, background_io)
+                .await
+                .map(CommandStatus::normalize_fork_boundary);
             let _ = sender.send(result);
         }));
     }
@@ -525,7 +584,10 @@ where
             CompoundCommand::BraceGroup(group) => self.run_compound_list(&group.list, io).await,
             CompoundCommand::Subshell(subshell) => {
                 let mut shell = self.fork();
-                shell.run_compound_list(&subshell.list, io).await
+                Ok(shell
+                    .run_compound_list(&subshell.list, io)
+                    .await?
+                    .normalize_fork_boundary())
             }
             CompoundCommand::IfClause(if_clause) => self.run_if(if_clause, io).await,
             CompoundCommand::WhileClause(while_clause) => {
@@ -551,7 +613,7 @@ where
         let condition = self
             .run_compound_list(&if_clause.condition, io.clone())
             .await?;
-        if condition.is_exit() {
+        if condition.is_interrupting() {
             return Ok(condition);
         }
 
@@ -564,7 +626,7 @@ where
         };
         for else_clause in elses {
             let status = self.run_else_clause(else_clause, io.clone()).await?;
-            if status.is_exit() || status.is_success() || else_clause.condition.is_none() {
+            if status.is_interrupting() || status.is_success() || else_clause.condition.is_none() {
                 return Ok(status);
             }
         }
@@ -579,7 +641,7 @@ where
     ) -> Result<CommandStatus> {
         if let Some(condition) = &else_clause.condition {
             let status = self.run_compound_list(condition, io.clone()).await?;
-            if status.is_exit() || !status.is_success() {
+            if status.is_interrupting() || !status.is_success() {
                 return Ok(status);
             }
         }
@@ -595,9 +657,27 @@ where
     ) -> Result<CommandStatus> {
         let mut last = CommandStatus::SUCCESS;
         loop {
-            let condition = self.run_compound_list(&clause.0, io.clone()).await?;
-            if condition.is_exit() {
-                return Ok(condition);
+            self.loop_depth += 1;
+            let condition = self.run_compound_list(&clause.0, io.clone()).await;
+            self.loop_depth -= 1;
+            let condition = condition?;
+            match condition.flow() {
+                ControlFlow::ExitShell | ControlFlow::Return => return Ok(condition),
+                ControlFlow::Break(depth) => {
+                    return Ok(if depth > 1 {
+                        CommandStatus::break_loop(condition.code(), depth - 1)
+                    } else {
+                        condition.as_plain()
+                    });
+                }
+                ControlFlow::Continue(depth) => {
+                    if depth > 1 {
+                        return Ok(CommandStatus::continue_loop(condition.code(), depth - 1));
+                    }
+                    last = condition.as_plain();
+                    continue;
+                }
+                ControlFlow::None => {}
             }
             let should_run = if invert {
                 !condition.is_success()
@@ -607,9 +687,27 @@ where
             if !should_run {
                 return Ok(last);
             }
-            last = self.run_compound_list(&clause.1.list, io.clone()).await?;
-            if last.is_exit() {
-                return Ok(last);
+            self.loop_depth += 1;
+            let body = self.run_compound_list(&clause.1.list, io.clone()).await;
+            self.loop_depth -= 1;
+            last = body?;
+            match last.flow() {
+                ControlFlow::ExitShell | ControlFlow::Return => return Ok(last),
+                ControlFlow::Break(depth) => {
+                    return Ok(if depth > 1 {
+                        CommandStatus::break_loop(last.code(), depth - 1)
+                    } else {
+                        last.as_plain()
+                    });
+                }
+                ControlFlow::Continue(depth) => {
+                    if depth > 1 {
+                        return Ok(CommandStatus::continue_loop(last.code(), depth - 1));
+                    }
+                    last = last.as_plain();
+                    continue;
+                }
+                ControlFlow::None => {}
             }
         }
     }
@@ -633,11 +731,29 @@ where
         let mut last = CommandStatus::SUCCESS;
         for value in values {
             self.set_variable(for_clause.variable_name.clone(), value, Some(false));
-            last = self
+            self.loop_depth += 1;
+            let body = self
                 .run_compound_list(&for_clause.body.list, io.clone())
-                .await?;
-            if last.is_exit() {
-                return Ok(last);
+                .await;
+            self.loop_depth -= 1;
+            last = body?;
+            match last.flow() {
+                ControlFlow::ExitShell | ControlFlow::Return => return Ok(last),
+                ControlFlow::Break(depth) => {
+                    return Ok(if depth > 1 {
+                        CommandStatus::break_loop(last.code(), depth - 1)
+                    } else {
+                        last.as_plain()
+                    });
+                }
+                ControlFlow::Continue(depth) => {
+                    if depth > 1 {
+                        return Ok(CommandStatus::continue_loop(last.code(), depth - 1));
+                    }
+                    last = last.as_plain();
+                    continue;
+                }
+                ControlFlow::None => {}
             }
         }
 
@@ -675,7 +791,7 @@ where
 
             if let Some(command) = &case.cmd {
                 result = self.run_compound_list(command, io.clone()).await?;
-                if result.is_exit() {
+                if result.is_interrupting() {
                     return Ok(result);
                 }
             }
@@ -816,10 +932,18 @@ where
         io: ExecutionIo,
     ) -> Result<CommandStatus> {
         let saved = self.positional_parameters.clone();
+        self.function_depth += 1;
         self.positional_parameters = arguments;
         let status = self.run_function_body(&function.body, io).await;
+        self.function_depth -= 1;
         self.positional_parameters = saved;
-        status
+        Ok(match status? {
+            CommandStatus {
+                code,
+                flow: ControlFlow::Return | ControlFlow::Break(_) | ControlFlow::Continue(_),
+            } => CommandStatus::new(code),
+            status => status,
+        })
     }
 
     async fn run_function_body(
@@ -856,7 +980,7 @@ where
                 stderr: io.output(2),
             })
             .await?;
-        Ok(CommandStatus::new(child.wait().await?))
+        Ok(CommandStatus::new(i32::from(child.wait().await?)))
     }
 
     async fn resolve_program(&self, input: &str) -> Result<ResolvedProgram> {
@@ -2140,6 +2264,9 @@ fn overlay_environment(
 }
 
 fn apply_pipeline_bang(status: CommandStatus, bang: bool) -> CommandStatus {
+    if status.is_interrupting() {
+        return status;
+    }
     if bang {
         CommandStatus::new(if status.is_success() { 1 } else { 0 })
     } else {
@@ -2148,7 +2275,10 @@ fn apply_pipeline_bang(status: CommandStatus, bang: bool) -> CommandStatus {
 }
 
 fn is_special_builtin(name: &str) -> bool {
-    matches!(name, ":" | "exec" | "exit" | "export" | "unset")
+    matches!(
+        name,
+        ":" | "break" | "continue" | "exec" | "exit" | "export" | "return" | "unset"
+    )
 }
 
 fn effective_fd(fd: Option<IoFd>, kind: &IoFileRedirectKind) -> IoFd {
@@ -2369,10 +2499,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn loop_control_builtins_follow_dash_semantics() {
+        let state = run_script(
+            "for value in a b c; do echo \"$value\"; break; done\nfor value in a b c; do [ \"$value\" = a ] && continue; echo \"$value\"; done\nbreak\ncontinue\n",
+            [],
+        );
+        assert_eq!(state.stdout, b"a\nb\nc\n");
+    }
+
+    #[test]
+    fn return_exits_functions_and_top_level_shell() {
+        let (status, state) = run_script_with_status(
+            "f(){ return 9; echo no; }\nf\necho after-function\nreturn 7\necho no\n",
+            [],
+        );
+        assert_eq!(status.code(), 7);
+        assert!(status.is_exit());
+        assert_eq!(state.stdout, b"after-function\n");
+    }
+
+    #[test]
+    fn function_return_preserves_shell_status_width() {
+        let state = run_script("f(){ return 256; }\nf\necho \"$?\"\n", []);
+        assert_eq!(state.stdout, b"256\n");
+    }
+
+    #[test]
+    fn subshell_and_pipeline_exit_do_not_abort_parent_shell() {
+        let state = run_script(
+            "(exit 7)\necho after-subshell\nexit 3 | cat\necho after-pipeline\n",
+            [],
+        );
+        assert_eq!(state.stdout, b"after-subshell\nafter-pipeline\n");
+    }
+
     fn run_script<const N: usize>(
         script: &str,
         commands: [(&'static str, TestCommandHandler); N],
     ) -> TestState {
+        let (status, state) = run_script_with_status(script, commands);
+        assert!(status.is_success(), "script exited with {}", status.code());
+        state
+    }
+
+    fn run_script_with_status<const N: usize>(
+        script: &str,
+        commands: [(&'static str, TestCommandHandler); N],
+    ) -> (CommandStatus, TestState) {
         let mut pool = LocalPool::new();
         let platform = TestPlatform::new(pool.spawner());
         for (name, command) in commands {
@@ -2380,7 +2554,7 @@ mod tests {
         }
 
         let platform_for_run = platform.clone();
-        pool.run_until(async move {
+        let status = pool.run_until(async move {
             let mut shell = Shell::new(
                 platform_for_run.clone(),
                 Bootstrap {
@@ -2392,14 +2566,13 @@ mod tests {
                 },
             );
             let program = parser::parse(script).expect("script should parse");
-            let status = shell
+            shell
                 .run_program(&program)
                 .await
-                .expect("script should run");
-            assert!(status.is_success(), "script exited with {}", status.code());
+                .expect("script should run")
         });
 
-        platform.snapshot()
+        (status, platform.snapshot())
     }
 
     fn printenv_command(invocation: TestInvocation) -> TestCommandResult {

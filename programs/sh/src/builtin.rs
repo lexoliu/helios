@@ -12,15 +12,18 @@ pub async fn dispatch<P: ShellPlatform>(
     let status = match name {
         "true" => Some(CommandStatus::SUCCESS),
         "false" => Some(CommandStatus::new(1)),
+        "break" => Some(break_builtin(shell, args, &mut io).await?),
+        "continue" => Some(continue_builtin(shell, args, &mut io).await?),
         "echo" => Some(echo(args, &mut io).await?),
         "cat" => Some(cat(shell, args, &mut io).await?),
         "pwd" => Some(pwd(shell, &mut io).await?),
         "cd" => Some(cd(shell, args, &mut io).await?),
         "test" | "[" => Some(run_test(shell, name, args).await?),
         "export" => Some(export(shell, args, &mut io).await?),
+        "return" => Some(return_builtin(shell, args, &mut io).await?),
         "unset" => Some(unset(shell, args)),
         "wait" => Some(wait(shell, args, &mut io).await?),
-        "exit" => Some(exit(shell, args)?),
+        "exit" => Some(exit(shell, args, &mut io).await?),
         ":" => Some(CommandStatus::SUCCESS),
         _ => None,
     };
@@ -40,6 +43,8 @@ pub fn is_builtin(name: &str) -> bool {
         name,
         "true"
             | "false"
+            | "break"
+            | "continue"
             | "echo"
             | "cat"
             | "pwd"
@@ -47,6 +52,7 @@ pub fn is_builtin(name: &str) -> bool {
             | "test"
             | "["
             | "export"
+            | "return"
             | "unset"
             | "wait"
             | "exit"
@@ -99,6 +105,36 @@ async fn echo(args: &[String], io: &mut ExecutionIo) -> Result<CommandStatus> {
     let mut stdout = io.output(1);
     write_all(&mut stdout, &bytes).await?;
     Ok(CommandStatus::SUCCESS)
+}
+
+async fn break_builtin<P: ShellPlatform>(
+    shell: &Shell<P>,
+    args: &[String],
+    io: &mut ExecutionIo,
+) -> Result<CommandStatus> {
+    let depth = match parse_loop_depth("break", args, io).await? {
+        Some(depth) => depth,
+        None => return Ok(CommandStatus::new(2)),
+    };
+    if shell.loop_depth == 0 {
+        return Ok(CommandStatus::SUCCESS);
+    }
+    Ok(CommandStatus::break_loop(0, depth))
+}
+
+async fn continue_builtin<P: ShellPlatform>(
+    shell: &Shell<P>,
+    args: &[String],
+    io: &mut ExecutionIo,
+) -> Result<CommandStatus> {
+    let depth = match parse_loop_depth("continue", args, io).await? {
+        Some(depth) => depth,
+        None => return Ok(CommandStatus::new(2)),
+    };
+    if shell.loop_depth == 0 {
+        return Ok(CommandStatus::SUCCESS);
+    }
+    Ok(CommandStatus::continue_loop(0, depth))
 }
 
 async fn pwd<P: ShellPlatform>(shell: &Shell<P>, io: &mut ExecutionIo) -> Result<CommandStatus> {
@@ -161,19 +197,19 @@ async fn run_test<P: ShellPlatform>(
                 (!shell
                     .platform
                     .exists(&shell.resolve_user_path(operand))
-                    .await) as u8,
+                    .await) as i32,
             )),
             "-f" => Ok(CommandStatus::new(
                 (!shell
                     .platform
                     .is_file(&shell.resolve_user_path(operand))
-                    .await) as u8,
+                    .await) as i32,
             )),
             "-d" => Ok(CommandStatus::new(
                 (!shell
                     .platform
                     .is_dir(&shell.resolve_user_path(operand))
-                    .await) as u8,
+                    .await) as i32,
             )),
             "-n" => Ok(CommandStatus::new(if operand.is_empty() { 1 } else { 0 })),
             "-z" => Ok(CommandStatus::new(if operand.is_empty() { 0 } else { 1 })),
@@ -273,12 +309,71 @@ async fn wait<P: ShellPlatform>(
     Ok(CommandStatus::new(last.code()))
 }
 
-fn exit<P: ShellPlatform>(shell: &Shell<P>, args: &[String]) -> Result<CommandStatus> {
-    let code = match args.first() {
-        Some(value) => value.parse::<u8>().map_err(|error| {
-            ShellError::message(format!("invalid exit code {value:?}: {error}"))
-        })?,
-        None => shell.last_status,
+async fn return_builtin<P: ShellPlatform>(
+    shell: &Shell<P>,
+    args: &[String],
+    io: &mut ExecutionIo,
+) -> Result<CommandStatus> {
+    let code = match parse_status_code("return", args, shell.last_status, io).await? {
+        Some(code) => code,
+        None => return Ok(CommandStatus::new(2)),
+    };
+    if shell.function_depth == 0 {
+        return Ok(CommandStatus::exit(code));
+    }
+    Ok(CommandStatus::shell_return(code))
+}
+
+async fn exit<P: ShellPlatform>(
+    shell: &Shell<P>,
+    args: &[String],
+    io: &mut ExecutionIo,
+) -> Result<CommandStatus> {
+    let code = match parse_status_code("exit", args, shell.last_status, io).await? {
+        Some(code) => code,
+        None => return Ok(CommandStatus::exit(2)),
     };
     Ok(CommandStatus::exit(code))
+}
+
+async fn parse_loop_depth(
+    name: &str,
+    args: &[String],
+    io: &mut ExecutionIo,
+) -> Result<Option<usize>> {
+    let Some(value) = args.first() else {
+        return Ok(Some(1));
+    };
+    match value.parse::<usize>() {
+        Ok(depth) if depth > 0 => Ok(Some(depth)),
+        _ => {
+            write_illegal_number(name, value, io).await?;
+            Ok(None)
+        }
+    }
+}
+
+async fn parse_status_code(
+    name: &str,
+    args: &[String],
+    default: i32,
+    io: &mut ExecutionIo,
+) -> Result<Option<i32>> {
+    let Some(value) = args.first() else {
+        return Ok(Some(default));
+    };
+    match value.parse::<i32>() {
+        Ok(code) if code >= 0 => Ok(Some(code)),
+        _ => {
+            write_illegal_number(name, value, io).await?;
+            Ok(None)
+        }
+    }
+}
+
+async fn write_illegal_number(name: &str, value: &str, io: &mut ExecutionIo) -> Result<()> {
+    let mut stderr = io.output(2);
+    let message = format!("{name}: Illegal number: {value}\n");
+    write_all(&mut stderr, message.as_bytes()).await?;
+    Ok(())
 }
