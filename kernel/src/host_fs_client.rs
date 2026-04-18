@@ -179,7 +179,13 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
         let cursor = 7;
         let walked = read_u16_le(&response, cursor)?;
         if usize::from(walked) != segments.len() {
-            return Err(HostFsError::Protocol("walk did not resolve the full path"));
+            // The server walked part of the path; the remaining segment
+            // doesn't exist. 9p leaves `new_fid` unattached in this case
+            // per the 2000.L spec ("if any walked element doesn't exist
+            // the final fid is not set"), so there is nothing to clunk.
+            return Err(HostFsError::Transport(
+                helios_hal::io::IoError::NotFound,
+            ));
         }
         Ok(new_fid)
     }

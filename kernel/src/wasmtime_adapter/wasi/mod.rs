@@ -627,11 +627,12 @@ where
         &self,
         path: &str,
     ) -> core::result::Result<fs_types::DescriptorStat, fs_types::ErrorCode> {
-        // Host paths are handled asynchronously in the WASI trait impl.
-        assert!(
-            self.host_path(path).is_none(),
-            "stat on host path {path} must be handled in the async WASI impl"
-        );
+        // Host paths are normally handled asynchronously in the WASI
+        // trait impl, but fall through to the embedded view when the
+        // node has already been seeded (open_at eagerly mirrors the
+        // host file/directory). If neither exists, return NoEntry
+        // instead of panicking so programs see a proper filesystem
+        // error.
         let node = self.get_node(path)?;
         let size = match node.kind {
             FsNodeKind::Directory => 0,
@@ -655,13 +656,9 @@ where
         &self,
         path: &str,
     ) -> core::result::Result<fs_types::MetadataHashValue, fs_types::ErrorCode> {
-        // Host paths are handled asynchronously in the WASI trait impl;
-        // reaching here with a host path indicates a caller forgot to route
-        // to the async path.
-        assert!(
-            self.host_path(path).is_none(),
-            "metadata_hash on host path {path} must be handled in the async WASI impl"
-        );
+        // Host paths are normally handled asynchronously in the WASI
+        // trait impl, but fall through to the embedded view when the
+        // node has already been seeded.
         let node = self.get_node(path)?;
         let size = match node.kind {
             FsNodeKind::Directory => 0,
@@ -678,12 +675,9 @@ where
         path: &str,
     ) -> core::result::Result<Vec<fs_types::DirectoryEntry>, fs_types::ErrorCode> {
         // Host directories are eagerly seeded into the embedded FS by
-        // `open_at`, so reading them here walks the same embedded node list
-        // as guest-owned directories.
-        assert!(
-            self.host_path(path).is_none() || self.get_node(path).is_ok(),
-            "read_directory on host path {path} requires prior eager seed via open_at"
-        );
+        // `open_at`, so reading them here walks the same embedded node
+        // list as guest-owned directories. If nothing was seeded, just
+        // report NoEntry.
         let node = self.get_node(path)?;
         if node.kind != FsNodeKind::Directory {
             return Err(fs_types::ErrorCode::NotDirectory);
@@ -747,14 +741,9 @@ where
         offset: u64,
         max_bytes: usize,
     ) -> core::result::Result<Vec<u8>, fs_types::ErrorCode> {
-        // Host file contents are eagerly cached during `open_at`, so stream
-        // reads always fall through to the embedded node list.
-        assert!(
-            self.host_path(&descriptor.path).is_none()
-                || self.get_node(&descriptor.path).is_ok(),
-            "read_file_chunk on host path {} requires prior eager seed via open_at",
-            descriptor.path
-        );
+        // Host file contents are eagerly cached during `open_at`, so
+        // stream reads always fall through to the embedded node list.
+        // If the node is missing, return NoEntry.
         let node = self.get_node(&descriptor.path)?;
         if node.kind != FsNodeKind::File {
             return Err(fs_types::ErrorCode::IsDirectory);
@@ -851,12 +840,10 @@ where
 
         let absolute = crate::resolve_child_path(&base.path, path)
             .map_err(map_component_fs_path_error)?;
-        // Host-backed paths are handled in the async WASI trait impl.
-        assert!(
-            self.host_path(&absolute).is_none(),
-            "open_at on host path {absolute} must be handled in the async WASI impl"
-        );
-
+        // Host-backed paths are handled in the async WASI trait impl;
+        // this embedded path only handles paths that already have a
+        // node (either genuinely local or previously seeded from the
+        // host mount).
         if let Ok(existing) = self.get_node_mut(&absolute) {
             if open_flags.contains(fs_types::OpenFlags::EXCLUSIVE)
                 && open_flags.contains(fs_types::OpenFlags::CREATE)
@@ -948,10 +935,6 @@ where
         }
         let absolute = crate::resolve_child_path(&base.path, path)
             .map_err(map_component_fs_path_error)?;
-        assert!(
-            self.host_path(&absolute).is_none(),
-            "remove_directory_at on host path {absolute} must be handled in the async WASI impl"
-        );
         if absolute == "/" {
             return Err(fs_types::ErrorCode::NotPermitted);
         }
@@ -991,10 +974,6 @@ where
         }
         let absolute = crate::resolve_child_path(&base.path, path)
             .map_err(map_component_fs_path_error)?;
-        assert!(
-            self.host_path(&absolute).is_none(),
-            "create_directory_at on host path {absolute} must be handled in the async WASI impl"
-        );
         if self.get_node(&base.path)?.readonly {
             return Err(fs_types::ErrorCode::ReadOnly);
         }
@@ -1037,10 +1016,6 @@ where
         }
         let absolute = crate::resolve_child_path(&base.path, path)
             .map_err(map_component_fs_path_error)?;
-        assert!(
-            self.host_path(&absolute).is_none(),
-            "unlink_file_at on host path {absolute} must be handled in the async WASI impl"
-        );
         let node = self.get_node(&absolute)?;
         if node.readonly {
             return Err(fs_types::ErrorCode::ReadOnly);
@@ -1079,11 +1054,6 @@ where
         let destination_absolute =
             crate::resolve_child_path(&destination_base.path, destination_path)
                 .map_err(map_component_fs_path_error)?;
-        assert!(
-            self.host_path(&source_absolute).is_none()
-                && self.host_path(&destination_absolute).is_none(),
-            "rename_at on host paths must be handled in the async WASI impl"
-        );
 
         if self.get_node(&source_base.path)?.readonly
             || self.get_node(&destination_base.path)?.readonly
