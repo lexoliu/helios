@@ -147,6 +147,11 @@ pub struct Shell<P> {
     pub(crate) background_jobs: Rc<RefCell<HashMap<u64, oneshot::Receiver<Result<CommandStatus>>>>>,
 }
 
+#[derive(Default)]
+struct TemporaryAssignments {
+    originals: HashMap<String, Option<Variable>>,
+}
+
 #[derive(Clone)]
 pub(crate) struct ExecutionIo {
     pub(crate) inputs: HashMap<IoFd, InputStream>,
@@ -403,6 +408,33 @@ where
         self.variable("IFS")
             .and_then(|variable| variable.value.as_deref())
             .unwrap_or(DEFAULT_IFS)
+    }
+
+    fn apply_temporary_assignments(
+        &mut self,
+        assignments: &[(String, String)],
+    ) -> Result<TemporaryAssignments> {
+        let mut originals = HashMap::new();
+        for (name, value) in assignments {
+            originals
+                .entry(name.clone())
+                .or_insert_with(|| self.variables.get(name).cloned());
+            self.assign_variable(name.clone(), value.clone())?;
+        }
+        Ok(TemporaryAssignments { originals })
+    }
+
+    fn restore_temporary_assignments(&mut self, assignments: TemporaryAssignments) {
+        for (name, original) in assignments.originals {
+            match original {
+                Some(variable) => {
+                    self.variables.insert(name, variable);
+                }
+                None => {
+                    self.variables.remove(&name);
+                }
+            }
+        }
     }
 
     fn ifs_joiner(&self) -> String {
@@ -1018,11 +1050,18 @@ where
         }
 
         if builtin::is_builtin(&program) {
-            let status = builtin::dispatch(self, &program, &arguments, io)
-                .await?
-                .ok_or_else(|| {
-                    ShellError::message(format!("builtin {program:?} disappeared during dispatch"))
-                })?;
+            let temporary_assignments = if special_builtin || assignments.is_empty() {
+                None
+            } else {
+                Some(self.apply_temporary_assignments(&assignments)?)
+            };
+            let dispatch_result = builtin::dispatch(self, &program, &arguments, io).await;
+            if let Some(temporary_assignments) = temporary_assignments {
+                self.restore_temporary_assignments(temporary_assignments);
+            }
+            let status = dispatch_result?.ok_or_else(|| {
+                ShellError::message(format!("builtin {program:?} disappeared during dispatch"))
+            })?;
             self.last_status = status.code();
             return Ok(if exec_requested {
                 CommandStatus::exit(status.code())
@@ -1032,7 +1071,16 @@ where
         }
 
         if let Some(function) = self.functions.get(&program).cloned() {
-            let status = self.run_function(&function, arguments, io).await?;
+            let temporary_assignments = if assignments.is_empty() {
+                None
+            } else {
+                Some(self.apply_temporary_assignments(&assignments)?)
+            };
+            let status_result = self.run_function(&function, arguments, io).await;
+            if let Some(temporary_assignments) = temporary_assignments {
+                self.restore_temporary_assignments(temporary_assignments);
+            }
+            let status = status_result?;
             self.last_status = status.code();
             return Ok(if exec_requested {
                 CommandStatus::exit(status.code())
@@ -2775,6 +2823,21 @@ mod tests {
         let stderr = String::from_utf8(state.stderr).expect("stderr should be utf-8");
         assert!(stderr.contains("cd: PWD: is read only\n"));
         assert!(stderr.contains("cd: OLDPWD: is read only\n"));
+    }
+
+    #[test]
+    fn temporary_assignments_apply_to_non_special_builtins_without_leaking() {
+        let state = run_script("HOME=/tmp cd\npwd\necho \"${HOME+set}\"\n", []);
+        assert_eq!(state.stdout, b"/tmp\n\n");
+    }
+
+    #[test]
+    fn temporary_assignments_scope_shell_functions_like_dash() {
+        let state = run_script(
+            "f(){ echo \"in:$foo\"; foo=inner; }\nfoo=outer\nfoo=temp f\necho \"out:$foo\"\n",
+            [],
+        );
+        assert_eq!(state.stdout, b"in:temp\nout:outer\n");
     }
 
     #[test]
