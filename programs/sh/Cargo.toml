@@ -5,11 +5,13 @@ edition = "2024"
 autobins = false
 
 [dependencies]
-anyhow = "1.0.100"
+async-recursion = "1.1.1"
 async-trait = "0.1.89"
 brush-parser = { version = "0.3.0", default-features = false }
 futures = { version = "0.3.31", default-features = false, features = ["alloc", "std"] }
-helios-api = { path = "../../api", default-features = false, features = ["fs", "io", "programs"] }
+helios-api = { path = "../../api", default-features = false, features = ["fs", "io", "programs", "task"] }
+thiserror = "2.0.17"
+tracing = "0.1.41"
 
 [lib]
 name = "helios_dash"

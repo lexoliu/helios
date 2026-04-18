@@ -3,9 +3,10 @@
 //! the executor walks it directly rather than re-lowering it into a
 //! custom representation.
 
-use anyhow::{anyhow, Result};
 use brush_parser::ast::Program;
 use brush_parser::{ParserOptions, SourceInfo};
+
+use crate::error::{Result, ShellError};
 
 pub fn parse(source: &str) -> Result<Program> {
     let options = ParserOptions {
@@ -19,7 +20,9 @@ pub fn parse(source: &str) -> Result<Program> {
     };
 
     let tokens = brush_parser::tokenize_str_with_options(source, &options.tokenizer_options())
-        .map_err(|error| anyhow!("failed to tokenize shell script: {error}"))?;
+        .map_err(|error| {
+            ShellError::message(format!("failed to tokenize shell script: {error}"))
+        })?;
     brush_parser::parse_tokens(&tokens, &options, &source_info)
-        .map_err(|error| anyhow!("failed to parse shell script: {error}"))
+        .map_err(|error| ShellError::message(format!("failed to parse shell script: {error}")))
 }
