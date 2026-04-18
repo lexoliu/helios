@@ -24,7 +24,7 @@ use crate::ifs::{DEFAULT_IFS, IfsConfig};
 use crate::options::ShellOptions;
 use crate::parser;
 use crate::platform::{ResolvedProgram, RunningProcess, ShellPlatform, SpawnRequest, WriteMode};
-use crate::streams::{InputStream, OutputStream, capture_output, write_all};
+use crate::streams::{InputStream, OutputStream, capture_output, close, write_all};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Variable {
@@ -731,9 +731,10 @@ where
 
         match result {
             Err(error @ (ShellError::ReadonlyVariable(_) | ShellError::ShellDiagnostic(_))) => {
-                shell_fatal_error(error, error_io).await
+                emit_command_error(error, error_io, true).await
             }
-            other => other,
+            Err(error) => emit_command_error(error, error_io, false).await,
+            Ok(status) => Ok(status),
         }
     }
 
@@ -1026,11 +1027,24 @@ where
         }
 
         let expansion_io = io.clone();
-        io = self.apply_redirects(io, &redirects, &expansion_io).await?;
+        let redirect_error_exits_shell = first_word_is_special_builtin(&args);
+        io = match self.apply_redirects(io, &redirects, &expansion_io).await {
+            Ok(io) => io,
+            Err(error @ (ShellError::ReadonlyVariable(_) | ShellError::ShellDiagnostic(_))) => {
+                return Err(error);
+            }
+            Err(error) => {
+                return emit_command_error(error, expansion_io, redirect_error_exits_shell).await;
+            }
+        };
 
         if args.is_empty() {
             for (name, value) in assignments {
                 self.assign_variable(name, value)?;
+            }
+            for fd in redirected_output_fds(&redirects) {
+                let mut output = io.output(fd);
+                close(&mut output).await?;
             }
             self.last_status = 0;
             return Ok(CommandStatus::SUCCESS);
@@ -1063,13 +1077,23 @@ where
             } else {
                 Some(self.apply_temporary_assignments(&assignments)?)
             };
+            let error_io = io.clone();
             let dispatch_result = builtin::dispatch(self, &program, &arguments, io).await;
             if let Some(temporary_assignments) = temporary_assignments {
                 self.restore_temporary_assignments(temporary_assignments);
             }
-            let status = dispatch_result?.ok_or_else(|| {
-                ShellError::message(format!("builtin {program:?} disappeared during dispatch"))
-            })?;
+            let status = match dispatch_result {
+                Ok(Some(status)) => status,
+                Ok(None) => {
+                    return Err(ShellError::message(format!(
+                        "builtin {program:?} disappeared during dispatch"
+                    )));
+                }
+                Err(error @ (ShellError::ReadonlyVariable(_) | ShellError::ShellDiagnostic(_))) => {
+                    return Err(error);
+                }
+                Err(error) => return emit_command_error(error, error_io, special_builtin).await,
+            };
             self.last_status = status.code();
             return Ok(if exec_requested {
                 CommandStatus::exit(status.code())
@@ -1084,11 +1108,18 @@ where
             } else {
                 Some(self.apply_temporary_assignments(&assignments)?)
             };
+            let error_io = io.clone();
             let status_result = self.run_function(&function, arguments, io).await;
             if let Some(temporary_assignments) = temporary_assignments {
                 self.restore_temporary_assignments(temporary_assignments);
             }
-            let status = status_result?;
+            let status = match status_result {
+                Ok(status) => status,
+                Err(error @ (ShellError::ReadonlyVariable(_) | ShellError::ShellDiagnostic(_))) => {
+                    return Err(error);
+                }
+                Err(error) => return emit_command_error(error, error_io, exec_requested).await,
+            };
             self.last_status = status.code();
             return Ok(if exec_requested {
                 CommandStatus::exit(status.code())
@@ -1097,9 +1128,17 @@ where
             });
         }
 
-        let status = self
-            .run_external(program, arguments, assignments, io)
-            .await?;
+        let error_io = io.clone();
+        let status = match self.run_external(program, arguments, assignments, io).await {
+            Ok(status) => status,
+            Err(error @ (ShellError::ReadonlyVariable(_) | ShellError::ShellDiagnostic(_))) => {
+                return Err(error);
+            }
+            Err(error) if exec_requested => {
+                return emit_prefixed_command_error("exec", error, error_io, true).await;
+            }
+            Err(error) => return emit_command_error(error, error_io, false).await,
+        };
         self.last_status = status.code();
         Ok(if exec_requested {
             CommandStatus::exit(status.code())
@@ -1171,23 +1210,24 @@ where
             .variable("PATH")
             .and_then(|variable| variable.value.as_deref())
             .unwrap_or("/bin");
-        let mut errors = Vec::new();
         for candidate in candidate_paths(&self.working_dir, input, search_path) {
-            match self.platform.read_file(&candidate).await {
-                Ok(wasm) => {
-                    return Ok(ResolvedProgram {
-                        path: display_path(&candidate),
-                        wasm,
-                    });
-                }
-                Err(error) => errors.push(format!("{}: {error}", candidate.display())),
+            if let Ok(wasm) = self.platform.read_file(&candidate).await {
+                return Ok(ResolvedProgram {
+                    path: display_path(&candidate),
+                    wasm,
+                });
             }
         }
 
-        Err(ShellError::message(format!(
-            "failed to locate executable program {input:?}:\n{}",
-            errors.join("\n")
-        )))
+        Err(ShellError::command_not_found(input))
+    }
+
+    fn default_output_write_mode(&self) -> WriteMode {
+        if self.options.noclobber() {
+            WriteMode::NoClobber
+        } else {
+            WriteMode::Truncate
+        }
     }
 
     async fn apply_redirects<'a, I>(
@@ -1208,7 +1248,16 @@ where
                             let path = self.resolve_redirect_path(target, expansion_io).await?;
                             io.set_input(fd, self.platform.open_input(&path).await?);
                         }
-                        IoFileRedirectKind::Write | IoFileRedirectKind::Clobber => {
+                        IoFileRedirectKind::Write => {
+                            let path = self.resolve_redirect_path(target, expansion_io).await?;
+                            io.set_output(
+                                fd,
+                                self.platform
+                                    .open_output(&path, self.default_output_write_mode())
+                                    .await?,
+                            );
+                        }
+                        IoFileRedirectKind::Clobber => {
                             let path = self.resolve_redirect_path(target, expansion_io).await?;
                             io.set_output(
                                 fd,
@@ -1271,7 +1320,7 @@ where
                             if *append {
                                 WriteMode::Append
                             } else {
-                                WriteMode::Truncate
+                                self.default_output_write_mode()
                             },
                         )
                         .await?;
@@ -2486,11 +2535,49 @@ fn apply_pipeline_bang(status: CommandStatus, bang: bool) -> CommandStatus {
     }
 }
 
-async fn shell_fatal_error(error: ShellError, io: ExecutionIo) -> Result<CommandStatus> {
+async fn emit_command_error(
+    error: ShellError,
+    io: ExecutionIo,
+    shell_exit: bool,
+) -> Result<CommandStatus> {
+    emit_formatted_command_error(format!("{error}"), error, io, shell_exit).await
+}
+
+async fn emit_prefixed_command_error(
+    prefix: &str,
+    error: ShellError,
+    io: ExecutionIo,
+    shell_exit: bool,
+) -> Result<CommandStatus> {
+    emit_formatted_command_error(format!("{prefix}: {error}"), error, io, shell_exit).await
+}
+
+async fn emit_formatted_command_error(
+    message: String,
+    error: ShellError,
+    io: ExecutionIo,
+    shell_exit: bool,
+) -> Result<CommandStatus> {
     let mut stderr = io.output(2);
-    let message = format!("{error}\n");
-    write_all(&mut stderr, message.as_bytes()).await?;
-    Ok(CommandStatus::exit(2))
+    let line = format!("{message}\n");
+    write_all(&mut stderr, line.as_bytes()).await?;
+    let code = command_error_status(&error);
+    Ok(if shell_exit {
+        CommandStatus::exit(code)
+    } else {
+        CommandStatus::new(code)
+    })
+}
+
+fn command_error_status(error: &ShellError) -> i32 {
+    match error {
+        ShellError::CommandNotFound(_) => 127,
+        _ => 2,
+    }
+}
+
+fn first_word_is_special_builtin(args: &[String]) -> bool {
+    matches!(args.first().map(String::as_str), Some(name) if is_special_builtin(name))
 }
 
 fn is_special_builtin(name: &str) -> bool {
@@ -2524,6 +2611,38 @@ fn effective_fd(fd: Option<IoFd>, kind: &IoFileRedirectKind) -> IoFd {
             | IoFileRedirectKind::DuplicateOutput => 1,
         },
     }
+}
+
+fn redirected_output_fds(redirects: &[IoRedirect]) -> Vec<IoFd> {
+    let mut fds = Vec::new();
+    for redirect in redirects {
+        match redirect {
+            IoRedirect::File(fd, kind, _)
+                if matches!(
+                    kind,
+                    IoFileRedirectKind::Write
+                        | IoFileRedirectKind::Clobber
+                        | IoFileRedirectKind::Append
+                        | IoFileRedirectKind::ReadAndWrite
+                        | IoFileRedirectKind::DuplicateOutput
+                ) =>
+            {
+                let fd = effective_fd(*fd, kind);
+                if !fds.contains(&fd) {
+                    fds.push(fd);
+                }
+            }
+            IoRedirect::OutputAndError(_, _) => {
+                for fd in [1, 2] {
+                    if !fds.contains(&fd) {
+                        fds.push(fd);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fds
 }
 
 fn candidate_paths(cwd: &Path, input: &str, search_path: &str) -> Vec<PathBuf> {
@@ -2878,21 +2997,88 @@ mod tests {
     }
 
     #[test]
-    fn set_supports_noglob_and_named_option_listing() {
+    fn set_supports_dash_option_ordering_for_flags_and_named_listings() {
         let state = run_script(
-            ": >/a.rs\nset -f\necho *.rs\nset -o\nset +o\nset +o noglob\necho *.rs\n",
+            ": >/a.rs\nset -a -C -u -f\necho \"$-\"\necho *.rs\nset -o\nset +o\nset +o noglob\necho *.rs\n",
             [],
         );
         let stdout = String::from_utf8(state.stdout).expect("stdout should be utf-8");
-        assert!(stdout.starts_with("*.rs\n"));
+        assert!(stdout.starts_with("uaCf\n*.rs\n"));
         assert!(stdout.contains("Current option settings\n"));
-        assert!(stdout.contains("nounset         off\n"));
-        assert!(stdout.contains("allexport       off\n"));
         assert!(stdout.contains("noglob          on\n"));
-        assert!(stdout.contains("set +o nounset\n"));
-        assert!(stdout.contains("set +o allexport\n"));
+        assert!(stdout.contains("noclobber       on\n"));
+        assert!(stdout.contains("allexport       on\n"));
+        assert!(stdout.contains("nounset         on\n"));
         assert!(stdout.contains("set -o noglob\n"));
+        assert!(stdout.contains("set -o noclobber\n"));
+        assert!(stdout.contains("set -o allexport\n"));
+        assert!(stdout.contains("set -o nounset\n"));
+        let noglob = stdout
+            .find("noglob          on\n")
+            .expect("noglob should be listed");
+        let noclobber = stdout
+            .find("noclobber       on\n")
+            .expect("noclobber should be listed");
+        let allexport = stdout
+            .find("allexport       on\n")
+            .expect("allexport should be listed");
+        let nounset = stdout
+            .find("nounset         on\n")
+            .expect("nounset should be listed");
+        assert!(noglob < noclobber && noclobber < allexport && allexport < nounset);
+        let reusable_noglob = stdout
+            .find("set -o noglob\n")
+            .expect("noglob reusable command should be listed");
+        let reusable_noclobber = stdout
+            .find("set -o noclobber\n")
+            .expect("noclobber reusable command should be listed");
+        let reusable_allexport = stdout
+            .find("set -o allexport\n")
+            .expect("allexport reusable command should be listed");
+        let reusable_nounset = stdout
+            .find("set -o nounset\n")
+            .expect("nounset reusable command should be listed");
+        assert!(
+            reusable_noglob < reusable_noclobber
+                && reusable_noclobber < reusable_allexport
+                && reusable_allexport < reusable_nounset
+        );
         assert!(stdout.ends_with("a.rs\n"));
+    }
+
+    #[test]
+    fn noclobber_rejects_plain_overwrite_but_allows_clobber_and_append() {
+        let state = run_script(
+            "echo seed >/log\nset -C\necho blocked >/log\necho \"status:$?\"\n>|/log\necho \"clobber:$?\"\necho ok >>/log\necho \"append:$?\"\ncat /log\n",
+            [],
+        );
+        assert_eq!(state.stdout, b"status:2\nclobber:0\nappend:0\nok\n");
+        assert_eq!(state.stderr, b"cannot create /log: File exists\n");
+    }
+
+    #[test]
+    fn noclobber_redirect_errors_exit_special_builtins() {
+        let (status, state) = run_script_with_status(": >/log\nset -C\n: >/log\necho no\n", []);
+        assert_eq!(status.code(), 2);
+        assert!(status.is_exit());
+        assert!(state.stdout.is_empty());
+        assert_eq!(state.stderr, b"cannot create /log: File exists\n");
+    }
+
+    #[test]
+    fn command_not_found_uses_dash_status_codes_without_aborting_shell() {
+        let state = run_script("missing\necho \"$?\"\necho after\n", []);
+        assert_eq!(state.stdout, b"127\nafter\n");
+        assert_eq!(state.stderr, b"missing: not found\n");
+    }
+
+    #[test]
+    fn exec_missing_exits_shell_with_127() {
+        let (status, state) = run_script_with_status("exec missing\necho no\n", []);
+        assert_eq!(status.code(), 127);
+        assert!(status.is_exit());
+        assert!(state.stdout.is_empty());
+        assert_eq!(state.stderr, b"exec: missing: not found\n");
     }
 
     #[test]
@@ -3321,6 +3507,10 @@ mod tests {
         }
 
         async fn open_output(&self, path: &Path, mode: WriteMode) -> Result<OutputStream> {
+            if matches!(mode, WriteMode::NoClobber) && self.state.borrow().files.contains_key(path)
+            {
+                return Err(crate::platform::existing_output_error(path));
+            }
             Ok(OutputStream::new(TestFileWriter {
                 state: self.state.clone(),
                 path: path.to_path_buf(),

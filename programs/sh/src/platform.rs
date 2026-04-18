@@ -25,7 +25,14 @@ pub struct ResolvedProgram {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriteMode {
     Truncate,
+    NoClobber,
     Append,
+}
+
+impl WriteMode {
+    fn appends(self) -> bool {
+        matches!(self, Self::Append)
+    }
 }
 
 pub struct SpawnRequest {
@@ -122,6 +129,9 @@ impl ShellPlatform for HeliosPlatform {
     }
 
     async fn open_output(&self, path: &Path, mode: WriteMode) -> Result<OutputStream> {
+        if matches!(mode, WriteMode::NoClobber) && helios_fs::is_file(path).await {
+            return Err(existing_output_error(path));
+        }
         Ok(OutputStream::new(HeliosFileWriter::new(
             path.to_path_buf(),
             mode,
@@ -345,6 +355,10 @@ pub(crate) fn render_glob_match(path: PathBuf, cwd: &Path, relative: bool) -> St
     }
 }
 
+pub(crate) fn existing_output_error(path: &Path) -> ShellError {
+    ShellError::message(format!("cannot create {}: File exists", path.display()))
+}
+
 struct HeliosFileWriter {
     path: PathBuf,
     mode: WriteMode,
@@ -505,7 +519,7 @@ impl AsyncWrite for HeliosFileWriter {
         let initialized = self.initialized;
         self.initialized = true;
         self.pending = Some(Box::pin(async move {
-            let mut payload = if initialized || matches!(mode, WriteMode::Append) {
+            let mut payload = if initialized || mode.appends() {
                 helios_fs::read(&path).await.unwrap_or_default()
             } else {
                 Vec::new()

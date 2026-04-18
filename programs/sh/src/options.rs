@@ -4,6 +4,7 @@ use thiserror::Error;
 pub(crate) enum ShellOption {
     Nounset,
     AllExport,
+    NoClobber,
     NoGlob,
 }
 
@@ -12,6 +13,7 @@ impl ShellOption {
         match self {
             Self::Nounset => 'u',
             Self::AllExport => 'a',
+            Self::NoClobber => 'C',
             Self::NoGlob => 'f',
         }
     }
@@ -20,6 +22,7 @@ impl ShellOption {
         match self {
             Self::Nounset => "nounset",
             Self::AllExport => "allexport",
+            Self::NoClobber => "noclobber",
             Self::NoGlob => "noglob",
         }
     }
@@ -29,6 +32,7 @@ impl ShellOption {
 pub(crate) struct ShellOptions {
     nounset: bool,
     allexport: bool,
+    noclobber: bool,
     noglob: bool,
 }
 
@@ -37,6 +41,7 @@ impl ShellOptions {
         match option {
             ShellOption::Nounset => self.nounset,
             ShellOption::AllExport => self.allexport,
+            ShellOption::NoClobber => self.noclobber,
             ShellOption::NoGlob => self.noglob,
         }
     }
@@ -45,6 +50,7 @@ impl ShellOptions {
         match option {
             ShellOption::Nounset => self.nounset = enabled,
             ShellOption::AllExport => self.allexport = enabled,
+            ShellOption::NoClobber => self.noclobber = enabled,
             ShellOption::NoGlob => self.noglob = enabled,
         }
     }
@@ -57,12 +63,16 @@ impl ShellOptions {
         self.allexport
     }
 
+    pub(crate) fn noclobber(self) -> bool {
+        self.noclobber
+    }
+
     pub(crate) fn noglob(self) -> bool {
         self.noglob
     }
 
     pub(crate) fn current_option_flags(self) -> String {
-        option_catalog()
+        option_flag_order()
             .iter()
             .filter(|option| self.is_enabled(**option))
             .map(|option| option.short_flag())
@@ -150,7 +160,7 @@ pub(crate) fn parse_set_arguments(
 
 pub(crate) fn format_named_option_settings(options: ShellOptions) -> String {
     let mut output = String::from("Current option settings\n");
-    for option in option_catalog() {
+    for option in named_option_order() {
         let state = if options.is_enabled(option) {
             "on"
         } else {
@@ -163,7 +173,7 @@ pub(crate) fn format_named_option_settings(options: ShellOptions) -> String {
 
 pub(crate) fn format_reusable_option_commands(options: ShellOptions) -> String {
     let mut output = String::new();
-    for option in option_catalog() {
+    for option in named_option_order() {
         let mode = if options.is_enabled(option) { '-' } else { '+' };
         output.push_str(&format!("set {mode}o {}\n", option.long_name()));
     }
@@ -190,6 +200,7 @@ fn parse_short_option(flag: char) -> std::result::Result<ShellOption, SetOptionE
     match flag {
         'u' => Ok(ShellOption::Nounset),
         'a' => Ok(ShellOption::AllExport),
+        'C' => Ok(ShellOption::NoClobber),
         'f' => Ok(ShellOption::NoGlob),
         other => Err(SetOptionError::IllegalShort(other)),
     }
@@ -199,15 +210,26 @@ fn parse_long_option(name: &str) -> std::result::Result<ShellOption, SetOptionEr
     match name {
         "nounset" => Ok(ShellOption::Nounset),
         "allexport" => Ok(ShellOption::AllExport),
+        "noclobber" => Ok(ShellOption::NoClobber),
         "noglob" => Ok(ShellOption::NoGlob),
         other => Err(SetOptionError::IllegalLong(other.to_owned())),
     }
 }
 
-fn option_catalog() -> [ShellOption; 3] {
+fn option_flag_order() -> [ShellOption; 4] {
     [
         ShellOption::Nounset,
         ShellOption::AllExport,
+        ShellOption::NoClobber,
         ShellOption::NoGlob,
+    ]
+}
+
+fn named_option_order() -> [ShellOption; 4] {
+    [
+        ShellOption::NoGlob,
+        ShellOption::NoClobber,
+        ShellOption::AllExport,
+        ShellOption::Nounset,
     ]
 }
