@@ -22,12 +22,13 @@ use crate::builtin;
 use crate::error::{Result, ShellError};
 use crate::parser;
 use crate::platform::{ResolvedProgram, RunningProcess, ShellPlatform, SpawnRequest, WriteMode};
-use crate::streams::{InputStream, OutputStream, capture_output};
+use crate::streams::{InputStream, OutputStream, capture_output, write_all};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Variable {
-    pub value: String,
+    pub value: Option<String>,
     pub exported: bool,
+    pub readonly: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -217,22 +218,25 @@ where
             variables.insert(
                 name,
                 Variable {
-                    value,
+                    value: Some(value),
                     exported: true,
+                    readonly: false,
                 },
             );
         }
         variables
             .entry("PATH".to_owned())
             .or_insert_with(|| Variable {
-                value: "/bin".to_owned(),
+                value: Some("/bin".to_owned()),
                 exported: true,
+                readonly: false,
             });
         variables.insert(
             "PWD".to_owned(),
             Variable {
-                value: display_path(&bootstrap.working_dir),
+                value: Some(display_path(&bootstrap.working_dir)),
                 exported: true,
+                readonly: false,
             },
         );
 
@@ -254,43 +258,104 @@ where
         }
     }
 
-    pub fn set_variable(&mut self, name: String, value: String, exported: Option<bool>) {
+    pub fn ensure_assignable(&self, name: &str) -> Result<()> {
+        if matches!(self.variables.get(name), Some(variable) if variable.readonly) {
+            return Err(ShellError::readonly_variable(name));
+        }
+        Ok(())
+    }
+
+    pub fn assign_variable(&mut self, name: String, value: String) -> Result<()> {
+        self.ensure_assignable(&name)?;
         match self.variables.get_mut(&name) {
             Some(existing) => {
-                existing.value = value;
-                if let Some(exported) = exported {
-                    existing.exported = exported;
-                }
+                existing.value = Some(value);
             }
             None => {
                 self.variables.insert(
                     name,
                     Variable {
-                        value,
-                        exported: exported.unwrap_or(false),
+                        value: Some(value),
+                        exported: false,
+                        readonly: false,
                     },
                 );
             }
         }
+        Ok(())
     }
 
-    pub fn mark_exported(&mut self, name: &str) {
+    pub fn assign_exported_variable(&mut self, name: String, value: String) -> Result<()> {
+        self.ensure_assignable(&name)?;
+        match self.variables.get_mut(&name) {
+            Some(existing) => {
+                existing.value = Some(value);
+                existing.exported = true;
+            }
+            None => {
+                self.variables.insert(
+                    name,
+                    Variable {
+                        value: Some(value),
+                        exported: true,
+                        readonly: false,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn mark_exported(&mut self, name: &str) -> Result<()> {
         if let Some(variable) = self.variables.get_mut(name) {
             variable.exported = true;
-            return;
+            return Ok(());
         }
 
         self.variables.insert(
             name.to_owned(),
             Variable {
-                value: String::new(),
+                value: None,
                 exported: true,
+                readonly: false,
             },
         );
+        Ok(())
     }
 
-    pub fn unset(&mut self, name: &str) {
+    pub fn mark_readonly(&mut self, name: &str, value: Option<String>) -> Result<()> {
+        match self.variables.get_mut(name) {
+            Some(variable) => {
+                if variable.readonly {
+                    if value.is_some() {
+                        return Err(ShellError::readonly_variable(name));
+                    }
+                    return Ok(());
+                }
+                if let Some(value) = value {
+                    variable.value = Some(value);
+                }
+                variable.readonly = true;
+                Ok(())
+            }
+            None => {
+                self.variables.insert(
+                    name.to_owned(),
+                    Variable {
+                        value,
+                        exported: false,
+                        readonly: true,
+                    },
+                );
+                Ok(())
+            }
+        }
+    }
+
+    pub fn unset(&mut self, name: &str) -> Result<()> {
+        self.ensure_assignable(name)?;
         self.variables.remove(name);
+        Ok(())
     }
 
     pub fn variable(&self, name: &str) -> Option<&Variable> {
@@ -300,18 +365,30 @@ where
     pub fn exported_environment(&self) -> Vec<(String, String)> {
         let mut pairs = Vec::new();
         for (name, variable) in &self.variables {
-            if variable.exported {
-                pairs.push((name.clone(), variable.value.clone()));
+            if variable.exported
+                && let Some(value) = &variable.value
+            {
+                pairs.push((name.clone(), value.clone()));
             }
         }
         pairs
     }
 
-    pub fn set_working_dir(&mut self, working_dir: PathBuf) {
+    pub fn set_working_dir(&mut self, working_dir: PathBuf) -> Vec<ShellError> {
         let oldpwd = self.working_dir.clone();
         self.working_dir = working_dir.clone();
-        self.set_variable("PWD".to_owned(), display_path(&working_dir), Some(true));
-        self.set_variable("OLDPWD".to_owned(), display_path(&oldpwd), Some(true));
+        let mut errors = Vec::new();
+        if let Err(error) =
+            self.assign_exported_variable("PWD".to_owned(), display_path(&working_dir))
+        {
+            errors.push(error);
+        }
+        if let Err(error) =
+            self.assign_exported_variable("OLDPWD".to_owned(), display_path(&oldpwd))
+        {
+            errors.push(error);
+        }
+        errors
     }
 
     pub fn current_dir(&self) -> &Path {
@@ -324,7 +401,7 @@ where
 
     fn ifs_value(&self) -> &str {
         self.variable("IFS")
-            .map(|variable| variable.value.as_str())
+            .and_then(|variable| variable.value.as_deref())
             .unwrap_or(DEFAULT_IFS)
     }
 
@@ -413,7 +490,7 @@ where
     pub(crate) async fn resolve_source_path(&self, input: &str) -> Result<PathBuf> {
         let search_path = self
             .variable("PATH")
-            .map(|variable| variable.value.as_str())
+            .and_then(|variable| variable.value.as_deref())
             .unwrap_or("/bin");
 
         for candidate in source_candidate_paths(&self.working_dir, input, search_path) {
@@ -591,7 +668,8 @@ where
 
     #[async_recursion(?Send)]
     async fn run_command(&mut self, command: &Command, io: ExecutionIo) -> Result<CommandStatus> {
-        match command {
+        let error_io = io.clone();
+        let result = match command {
             Command::Simple(simple) => self.run_simple(simple, io).await,
             Command::Compound(compound, redirects) => {
                 let io = if let Some(redirects) = redirects {
@@ -609,6 +687,13 @@ where
                 Ok(CommandStatus::SUCCESS)
             }
             Command::ExtendedTest(_) => Err(ShellError::unsupported("[[ ... ]] expressions")),
+        };
+
+        match result {
+            Err(error @ ShellError::ReadonlyVariable(_)) => {
+                shell_fatal_error(error, error_io).await
+            }
+            other => other,
         }
     }
 
@@ -768,7 +853,7 @@ where
 
         let mut last = CommandStatus::SUCCESS;
         for value in values {
-            self.set_variable(for_clause.variable_name.clone(), value, Some(false));
+            self.assign_variable(for_clause.variable_name.clone(), value)?;
             self.loop_depth += 1;
             let body = self
                 .run_compound_list(&for_clause.body.list, io.clone())
@@ -905,10 +990,14 @@ where
 
         if args.is_empty() {
             for (name, value) in assignments {
-                self.set_variable(name, value, None);
+                self.assign_variable(name, value)?;
             }
             self.last_status = 0;
             return Ok(CommandStatus::SUCCESS);
+        }
+
+        for (name, _) in &assignments {
+            self.ensure_assignable(name)?;
         }
 
         let mut program = args.remove(0);
@@ -924,7 +1013,7 @@ where
         let special_builtin = is_special_builtin(&program);
         if special_builtin {
             for (name, value) in &assignments {
-                self.set_variable(name.clone(), value.clone(), None);
+                self.assign_variable(name.clone(), value.clone())?;
             }
         }
 
@@ -1024,7 +1113,7 @@ where
     async fn resolve_program(&self, input: &str) -> Result<ResolvedProgram> {
         let search_path = self
             .variable("PATH")
-            .map(|variable| variable.value.as_str())
+            .and_then(|variable| variable.value.as_deref())
             .unwrap_or("/bin");
         let mut errors = Vec::new();
         for candidate in candidate_paths(&self.working_dir, input, search_path) {
@@ -1558,9 +1647,9 @@ where
             Parameter::Named(name) => Ok(ParameterState {
                 value: self
                     .variable(name)
-                    .map(|variable| variable.value.clone())
+                    .and_then(|variable| variable.value.clone())
                     .unwrap_or_default(),
-                is_set: self.variable(name).is_some(),
+                is_set: matches!(self.variable(name), Some(variable) if variable.value.is_some()),
             }),
             Parameter::NamedWithIndex { .. } | Parameter::NamedWithAllIndices { .. } => {
                 Err(ShellError::unsupported("array parameter expansion"))
@@ -1604,7 +1693,7 @@ where
             )),
             Parameter::Named(name) => Ok(Expansion::from_text(
                 self.variable(name)
-                    .map(|variable| variable.value.clone())
+                    .and_then(|variable| variable.value.clone())
                     .unwrap_or_default(),
                 quoted,
             )),
@@ -1827,10 +1916,13 @@ where
                 let Some(variable) = self.variable(name) else {
                     return Ok(0);
                 };
-                if variable.value.is_empty() {
+                let Some(value) = &variable.value else {
+                    return Ok(0);
+                };
+                if value.is_empty() {
                     return Ok(0);
                 }
-                let parsed = brush_parser::arithmetic::parse(&variable.value).map_err(|error| {
+                let parsed = brush_parser::arithmetic::parse(value).map_err(|error| {
                     ShellError::message(format!(
                         "failed to parse arithmetic variable {name:?}: {error}"
                     ))
@@ -1846,8 +1938,7 @@ where
     fn write_arithmetic_target(&mut self, target: &ArithmeticTarget, value: i64) -> Result<()> {
         match target {
             ArithmeticTarget::Variable(name) => {
-                self.set_variable(name.clone(), value.to_string(), None);
-                Ok(())
+                self.assign_variable(name.clone(), value.to_string())
             }
             ArithmeticTarget::ArrayElement(_, _) => {
                 Err(ShellError::unsupported("arithmetic array assignments"))
@@ -1857,10 +1948,7 @@ where
 
     fn assign_parameter(&mut self, parameter: &Parameter, value: String) -> Result<()> {
         match parameter {
-            Parameter::Named(name) => {
-                self.set_variable(name.clone(), value, None);
-                Ok(())
-            }
+            Parameter::Named(name) => self.assign_variable(name.clone(), value),
             _ => Err(ShellError::message(format!(
                 "cannot assign through parameter {}",
                 parameter_display_name(parameter)
@@ -2312,6 +2400,13 @@ fn apply_pipeline_bang(status: CommandStatus, bang: bool) -> CommandStatus {
     }
 }
 
+async fn shell_fatal_error(error: ShellError, io: ExecutionIo) -> Result<CommandStatus> {
+    let mut stderr = io.output(2);
+    let message = format!("{error}\n");
+    write_all(&mut stderr, message.as_bytes()).await?;
+    Ok(CommandStatus::exit(2))
+}
+
 fn is_special_builtin(name: &str) -> bool {
     matches!(
         name,
@@ -2322,6 +2417,7 @@ fn is_special_builtin(name: &str) -> bool {
             | "exec"
             | "exit"
             | "export"
+            | "readonly"
             | "return"
             | "set"
             | "shift"
@@ -2604,6 +2700,84 @@ mod tests {
     }
 
     #[test]
+    fn readonly_builtin_lists_unset_and_empty_values() {
+        let state = run_script(
+            "readonly foo\nreadonly bar=\nreadonly baz='a b'\nreadonly\n",
+            [],
+        );
+        assert_eq!(
+            state.stdout,
+            b"readonly bar=''\nreadonly baz='a b'\nreadonly foo\n"
+        );
+    }
+
+    #[test]
+    fn readonly_assignments_exit_noninteractive_shell() {
+        let (status, state) = run_script_with_status("readonly foo=bar\nfoo=baz\necho no\n", []);
+        assert_eq!(status.code(), 2);
+        assert!(status.is_exit());
+        assert!(state.stdout.is_empty());
+        assert_eq!(state.stderr, b"foo: is read only\n");
+
+        let (status, state) =
+            run_script_with_status("readonly foo=bar\nfoo=zzz true\necho no\n", []);
+        assert_eq!(status.code(), 2);
+        assert!(status.is_exit());
+        assert!(state.stdout.is_empty());
+        assert_eq!(state.stderr, b"foo: is read only\n");
+    }
+
+    #[test]
+    fn readonly_special_builtins_report_builtin_name() {
+        let (status, state) =
+            run_script_with_status("readonly foo=bar\nreadonly foo=baz\necho no\n", []);
+        assert_eq!(status.code(), 2);
+        assert!(status.is_exit());
+        assert!(state.stdout.is_empty());
+        assert_eq!(state.stderr, b"readonly: foo: is read only\n");
+
+        let (status, state) = run_script_with_status("readonly foo\nunset foo\necho no\n", []);
+        assert_eq!(status.code(), 2);
+        assert!(status.is_exit());
+        assert!(state.stdout.is_empty());
+        assert_eq!(state.stderr, b"unset: foo: is read only\n");
+
+        let (status, state) = run_script_with_status(
+            "readonly foo\nexport foo\nexport\nexport foo=baz\necho no\n",
+            [],
+        );
+        assert_eq!(status.code(), 2);
+        assert!(status.is_exit());
+        let stdout = String::from_utf8(state.stdout).expect("stdout should be utf-8");
+        assert!(stdout.contains("export foo\n"));
+        assert_eq!(state.stderr, b"export: foo: is read only\n");
+    }
+
+    #[test]
+    fn readonly_blocks_parameter_and_arithmetic_assignments() {
+        let (status, state) = run_script_with_status("readonly foo\n: ${foo:=bar}\necho no\n", []);
+        assert_eq!(status.code(), 2);
+        assert!(status.is_exit());
+        assert!(state.stdout.is_empty());
+        assert_eq!(state.stderr, b"foo: is read only\n");
+
+        let (status, state) = run_script_with_status("readonly x=1\necho $((x=2))\necho no\n", []);
+        assert_eq!(status.code(), 2);
+        assert!(status.is_exit());
+        assert!(state.stdout.is_empty());
+        assert_eq!(state.stderr, b"x: is read only\n");
+    }
+
+    #[test]
+    fn cd_warns_for_readonly_pwd_and_oldpwd_but_still_changes_directory() {
+        let state = run_script("readonly PWD\nreadonly OLDPWD\ncd /tmp\npwd\n", []);
+        assert_eq!(state.stdout, b"/tmp\n");
+        let stderr = String::from_utf8(state.stderr).expect("stderr should be utf-8");
+        assert!(stderr.contains("cd: PWD: is read only\n"));
+        assert!(stderr.contains("cd: OLDPWD: is read only\n"));
+    }
+
+    #[test]
     fn eval_runs_in_current_shell_context() {
         let state = run_script(
             "foo=bar\neval echo '$foo'\neval set -- c d\nfor value in \"$@\"; do echo \"<$value>\"; done\n",
@@ -2783,6 +2957,7 @@ mod tests {
         fn new(spawner: futures::executor::LocalSpawner) -> Self {
             let mut state = TestState::default();
             state.directories.insert(PathBuf::from("/"));
+            state.directories.insert(PathBuf::from("/tmp"));
             Self {
                 spawner,
                 state: Rc::new(RefCell::new(state)),

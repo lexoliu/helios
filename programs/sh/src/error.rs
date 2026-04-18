@@ -8,6 +8,8 @@ pub type Result<T> = std::result::Result<T, ShellError>;
 pub enum ShellError {
     #[error("{0}")]
     Message(String),
+    #[error("{0}: is read only")]
+    ReadonlyVariable(String),
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -19,5 +21,9 @@ impl ShellError {
 
     pub fn unsupported(feature: &'static str) -> Self {
         Self::Message(format!("{feature} is not supported"))
+    }
+
+    pub fn readonly_variable(name: impl Into<String>) -> Self {
+        Self::ReadonlyVariable(name.into())
     }
 }

@@ -24,8 +24,9 @@ pub async fn dispatch<P: ShellPlatform>(
         "shift" => Some(shift_builtin(shell, args, &mut io).await?),
         "test" | "[" => Some(run_test(shell, name, args).await?),
         "export" => Some(export(shell, args, &mut io).await?),
+        "readonly" => Some(readonly(shell, args, &mut io).await?),
         "return" => Some(return_builtin(shell, args, &mut io).await?),
-        "unset" => Some(unset(shell, args)),
+        "unset" => Some(unset(shell, args, &mut io).await?),
         "wait" => Some(wait(shell, args, &mut io).await?),
         "exit" => Some(exit(shell, args, &mut io).await?),
         ":" => Some(CommandStatus::SUCCESS),
@@ -59,6 +60,7 @@ pub fn is_builtin(name: &str) -> bool {
             | "test"
             | "["
             | "export"
+            | "readonly"
             | "return"
             | "unset"
             | "wait"
@@ -195,13 +197,18 @@ async fn set_builtin<P: ShellPlatform>(
     io: &mut ExecutionIo,
 ) -> Result<CommandStatus> {
     if args.is_empty() {
-        let mut names = shell.variables.keys().cloned().collect::<Vec<_>>();
+        let mut names = shell
+            .variables
+            .iter()
+            .filter(|(_, variable)| variable.value.is_some())
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
         names.sort();
         for name in names {
             let value = shell
                 .variable(&name)
-                .map(|variable| variable.value.clone())
-                .unwrap_or_default();
+                .and_then(|variable| variable.value.clone())
+                .expect("set listing only includes assigned variables");
             let line = format!("{name}={}\n", shell_quote(&value));
             let mut stdout = io.output(1);
             write_all(&mut stdout, line.as_bytes()).await?;
@@ -259,17 +266,21 @@ async fn cd<P: ShellPlatform>(
     let target = match args.first().map(String::as_str) {
         None => shell
             .variable("HOME")
-            .map(|variable| variable.value.clone())
+            .and_then(|variable| variable.value.clone())
             .unwrap_or_else(|| "/".to_owned()),
         Some("-") => shell
             .variable("OLDPWD")
-            .map(|variable| variable.value.clone())
+            .and_then(|variable| variable.value.clone())
             .unwrap_or_else(|| "/".to_owned()),
         Some(path) => path.to_owned(),
     };
     let resolved = shell.resolve_user_path(&target);
     if shell.platform.is_dir(&resolved).await {
-        shell.set_working_dir(resolved);
+        for error in shell.set_working_dir(resolved) {
+            let mut stderr = io.output(2);
+            let message = format!("cd: {error}\n");
+            write_all(&mut stderr, message.as_bytes()).await?;
+        }
         return Ok(CommandStatus::SUCCESS);
     }
 
@@ -353,11 +364,10 @@ async fn export<P: ShellPlatform>(
             .collect::<Vec<_>>();
         names.sort();
         for name in names {
-            let value = shell
+            let variable = shell
                 .variable(&name)
-                .map(|variable| variable.value.clone())
-                .unwrap_or_default();
-            let line = format!("export {name}={value}\n");
+                .expect("export listing only includes known variables");
+            let line = format_attribute_listing("export", &name, variable.value.as_deref());
             let mut stdout = io.output(1);
             write_all(&mut stdout, line.as_bytes()).await?;
         }
@@ -366,19 +376,66 @@ async fn export<P: ShellPlatform>(
 
     for arg in args {
         if let Some((name, value)) = arg.split_once('=') {
-            shell.set_variable(name.to_owned(), value.to_owned(), Some(true));
+            if let Err(error) = shell.assign_exported_variable(name.to_owned(), value.to_owned()) {
+                return special_builtin_error("export", error.to_string(), (*io).clone()).await;
+            }
         } else {
-            shell.mark_exported(arg);
+            if let Err(error) = shell.mark_exported(arg) {
+                return special_builtin_error("export", error.to_string(), (*io).clone()).await;
+            }
         }
     }
     Ok(CommandStatus::SUCCESS)
 }
 
-fn unset<P: ShellPlatform>(shell: &mut Shell<P>, args: &[String]) -> CommandStatus {
-    for name in args {
-        shell.unset(name);
+async fn readonly<P: ShellPlatform>(
+    shell: &mut Shell<P>,
+    args: &[String],
+    io: &mut ExecutionIo,
+) -> Result<CommandStatus> {
+    if args.is_empty() {
+        let mut names = shell
+            .variables
+            .iter()
+            .filter(|(_, variable)| variable.readonly)
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        names.sort();
+        for name in names {
+            let variable = shell
+                .variable(&name)
+                .expect("readonly listing only includes known variables");
+            let line = format_attribute_listing("readonly", &name, variable.value.as_deref());
+            let mut stdout = io.output(1);
+            write_all(&mut stdout, line.as_bytes()).await?;
+        }
+        return Ok(CommandStatus::SUCCESS);
     }
-    CommandStatus::SUCCESS
+
+    for arg in args {
+        let result = match arg.split_once('=') {
+            Some((name, value)) => shell.mark_readonly(name, Some(value.to_owned())),
+            None => shell.mark_readonly(arg, None),
+        };
+        if let Err(error) = result {
+            return special_builtin_error("readonly", error.to_string(), (*io).clone()).await;
+        }
+    }
+
+    Ok(CommandStatus::SUCCESS)
+}
+
+async fn unset<P: ShellPlatform>(
+    shell: &mut Shell<P>,
+    args: &[String],
+    io: &mut ExecutionIo,
+) -> Result<CommandStatus> {
+    for name in args {
+        if let Err(error) = shell.unset(name) {
+            return special_builtin_error("unset", error.to_string(), (*io).clone()).await;
+        }
+    }
+    Ok(CommandStatus::SUCCESS)
 }
 
 async fn wait<P: ShellPlatform>(
@@ -506,6 +563,13 @@ async fn special_builtin_error(
     let message = format!("{name}: {}\n", message.into());
     write_all(&mut stderr, message.as_bytes()).await?;
     Ok(CommandStatus::exit(2))
+}
+
+fn format_attribute_listing(keyword: &str, name: &str, value: Option<&str>) -> String {
+    match value {
+        Some(value) => format!("{keyword} {name}={}\n", shell_quote(value)),
+        None => format!("{keyword} {name}\n"),
+    }
 }
 
 fn shell_quote(value: &str) -> String {
