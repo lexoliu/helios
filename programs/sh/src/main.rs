@@ -6,9 +6,12 @@
 mod builtin;
 mod error;
 mod exec;
+mod ifs;
 mod parser;
 mod platform;
+mod read;
 mod streams;
+mod variable;
 
 use std::env;
 use std::path::PathBuf;

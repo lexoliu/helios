@@ -143,6 +143,16 @@ pub async fn read_all(reader: &mut InputStream) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+pub async fn read_byte(reader: &mut InputStream) -> io::Result<Option<u8>> {
+    let mut buffer = [0_u8; 1];
+    let read = poll_fn(|cx| Pin::new(&mut *reader).poll_read(cx, &mut buffer)).await?;
+    if read == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(buffer[0]))
+    }
+}
+
 pub async fn write_all(writer: &mut OutputStream, mut bytes: &[u8]) -> io::Result<()> {
     while !bytes.is_empty() {
         let written = poll_fn(|cx| Pin::new(&mut *writer).poll_write(cx, bytes)).await?;

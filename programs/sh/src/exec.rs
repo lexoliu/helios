@@ -20,6 +20,7 @@ use glob::{MatchOptions, Pattern};
 
 use crate::builtin;
 use crate::error::{Result, ShellError};
+use crate::ifs::{DEFAULT_IFS, IfsConfig};
 use crate::parser;
 use crate::platform::{ResolvedProgram, RunningProcess, ShellPlatform, SpawnRequest, WriteMode};
 use crate::streams::{InputStream, OutputStream, capture_output, write_all};
@@ -446,7 +447,7 @@ where
         }
     }
 
-    fn ifs_config(&self) -> IfsConfig<'_> {
+    pub(crate) fn ifs_config(&self) -> IfsConfig<'_> {
         IfsConfig::new(self.ifs_value())
     }
 
@@ -2005,8 +2006,6 @@ where
     }
 }
 
-const DEFAULT_IFS: &str = " \t\n";
-
 enum DuplicateTarget {
     Fd(IoFd),
     Close,
@@ -2178,33 +2177,6 @@ enum DelimiterKind {
     NonWhitespace,
 }
 
-#[derive(Clone, Copy)]
-struct IfsConfig<'a> {
-    raw: &'a str,
-}
-
-impl<'a> IfsConfig<'a> {
-    fn new(raw: &'a str) -> Self {
-        Self { raw }
-    }
-
-    fn is_empty(self) -> bool {
-        self.raw.is_empty()
-    }
-
-    fn is_whitespace(self, ch: char) -> bool {
-        matches!(ch, ' ' | '\t' | '\n') && self.raw.contains(ch)
-    }
-
-    fn is_non_whitespace(self, ch: char) -> bool {
-        self.raw.contains(ch) && !self.is_whitespace(ch)
-    }
-
-    fn is_delimiter(self, symbol: FieldChar) -> bool {
-        symbol.splittable && self.raw.contains(symbol.ch)
-    }
-}
-
 fn parameter_satisfies_test(state: &ParameterState, test_type: &ParameterTestType) -> bool {
     match test_type {
         ParameterTestType::UnsetOrNull => state.is_set && !state.value.is_empty(),
@@ -2329,7 +2301,7 @@ fn parse_delimiter(
     start: usize,
     ifs: IfsConfig<'_>,
 ) -> Option<(DelimiterKind, usize)> {
-    if !ifs.is_delimiter(*chars.get(start)?) {
+    if !chars.get(start)?.splittable || !ifs.contains(chars.get(start)?.ch) {
         return None;
     }
 
@@ -2601,6 +2573,50 @@ mod tests {
     }
 
     #[test]
+    fn read_builtin_consumes_input_and_obeys_ifs_rules() {
+        let state = run_script(
+            "words | { read first rest; echo \"<$first>|<$rest>\"; }\ncolon | { IFS=: read x y z; echo \"[$x]|[$y]|[$z]\"; }\n",
+            [("words", words_command), ("colon", colon_command)],
+        );
+        assert_eq!(state.stdout, b"<a>|<b c>\n[]|[]|[a::b::]\n");
+    }
+
+    #[test]
+    fn read_builtin_supports_backslash_processing_and_raw_mode() {
+        let state = run_script(
+            "escaped | { read cooked; echo \"<$cooked>\"; }\nescaped | { read -r raw_left raw_right; echo \"[$raw_left]|[$raw_right]\"; }\n",
+            [("escaped", escaped_command)],
+        );
+        assert_eq!(state.stdout, b"<a b>\n[a\\]|[b]\n");
+    }
+
+    #[test]
+    fn read_builtin_returns_eof_status_after_assigning_partial_line() {
+        let state = run_script(
+            "nonewline | { read value; echo \"status=$? value=<$value>\"; }\n",
+            [("nonewline", nonewline_command)],
+        );
+        assert_eq!(state.stdout, b"status=1 value=<abc>\n");
+    }
+
+    #[test]
+    fn read_builtin_errors_do_not_exit_shell_and_keep_partial_assignments() {
+        let state = run_script(
+            "words | { readonly second; read first second; echo \"status=$? first=<$first> second=<$second>\"; }\nempty | { read; echo \"arg=$?\"; }\nempty | { read -z value; echo \"opt=$?\"; }\nwords | { read first foo-bar; echo \"name=$? first=<$first>\"; }\n",
+            [("words", words_command), ("empty", empty_command)],
+        );
+        assert_eq!(
+            state.stdout,
+            b"status=2 first=<a> second=<>\narg=2\nopt=2\nname=2 first=<a>\n"
+        );
+        let stderr = String::from_utf8(state.stderr).expect("stderr should be utf-8");
+        assert!(stderr.contains("read: second: is read only\n"));
+        assert!(stderr.contains("read: arg count\n"));
+        assert!(stderr.contains("read: Illegal option -z\n"));
+        assert!(stderr.contains("read: foo-bar: bad variable name\n"));
+    }
+
+    #[test]
     fn if_clause_executes_then_branch() {
         let state = run_script("if true; then echo ok; else echo no; fi\n", []);
         assert_eq!(state.stdout, b"ok\n");
@@ -2802,6 +2818,24 @@ mod tests {
     }
 
     #[test]
+    fn special_builtins_reject_bad_variable_names() {
+        let (status, state) = run_script_with_status("export foo-bar=1\necho no\n", []);
+        assert_eq!(status.code(), 2);
+        assert!(status.is_exit());
+        assert_eq!(state.stderr, b"export: foo-bar: bad variable name\n");
+
+        let (status, state) = run_script_with_status("readonly foo-bar\necho no\n", []);
+        assert_eq!(status.code(), 2);
+        assert!(status.is_exit());
+        assert_eq!(state.stderr, b"readonly: foo-bar: bad variable name\n");
+
+        let (status, state) = run_script_with_status("unset foo-bar\necho no\n", []);
+        assert_eq!(status.code(), 2);
+        assert!(status.is_exit());
+        assert_eq!(state.stderr, b"unset: foo-bar: bad variable name\n");
+    }
+
+    #[test]
     fn readonly_blocks_parameter_and_arithmetic_assignments() {
         let (status, state) = run_script_with_status("readonly foo\n: ${foo:=bar}\necho no\n", []);
         assert_eq!(status.code(), 2);
@@ -2952,6 +2986,46 @@ mod tests {
         TestCommandResult {
             exit_code: 0,
             stdout: b"pipe-data\n".to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    fn words_command(_invocation: TestInvocation) -> TestCommandResult {
+        TestCommandResult {
+            exit_code: 0,
+            stdout: b"a b c\n".to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    fn colon_command(_invocation: TestInvocation) -> TestCommandResult {
+        TestCommandResult {
+            exit_code: 0,
+            stdout: b"::a::b::\n".to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    fn escaped_command(_invocation: TestInvocation) -> TestCommandResult {
+        TestCommandResult {
+            exit_code: 0,
+            stdout: b"a\\ b\n".to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    fn nonewline_command(_invocation: TestInvocation) -> TestCommandResult {
+        TestCommandResult {
+            exit_code: 0,
+            stdout: b"abc".to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    fn empty_command(_invocation: TestInvocation) -> TestCommandResult {
+        TestCommandResult {
+            exit_code: 0,
+            stdout: Vec::new(),
             stderr: Vec::new(),
         }
     }

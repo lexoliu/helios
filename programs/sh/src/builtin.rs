@@ -1,7 +1,9 @@
 use crate::error::{Result, ShellError};
 use crate::exec::{CommandStatus, ExecutionIo, Shell};
 use crate::platform::ShellPlatform;
+use crate::read::{ReadCommand, read_fields};
 use crate::streams::{close, read_all, write_all};
+use crate::variable::ensure_valid_variable_name;
 
 pub async fn dispatch<P: ShellPlatform>(
     shell: &mut Shell<P>,
@@ -23,6 +25,7 @@ pub async fn dispatch<P: ShellPlatform>(
         "set" => Some(set_builtin(shell, args, &mut io).await?),
         "shift" => Some(shift_builtin(shell, args, &mut io).await?),
         "test" | "[" => Some(run_test(shell, name, args).await?),
+        "read" => Some(read_builtin(shell, args, &mut io).await?),
         "export" => Some(export(shell, args, &mut io).await?),
         "readonly" => Some(readonly(shell, args, &mut io).await?),
         "return" => Some(return_builtin(shell, args, &mut io).await?),
@@ -59,6 +62,7 @@ pub fn is_builtin(name: &str) -> bool {
             | "shift"
             | "test"
             | "["
+            | "read"
             | "export"
             | "readonly"
             | "return"
@@ -350,6 +354,30 @@ async fn run_test<P: ShellPlatform>(
     }
 }
 
+async fn read_builtin<P: ShellPlatform>(
+    shell: &mut Shell<P>,
+    args: &[String],
+    io: &mut ExecutionIo,
+) -> Result<CommandStatus> {
+    let command = match ReadCommand::parse(args) {
+        Ok(command) => command,
+        Err(error) => return builtin_error("read", error.to_string(), (*io).clone()).await,
+    };
+
+    let mut stdin = io.input(0);
+    let outcome = read_fields(&mut stdin, &command, shell.ifs_config()).await?;
+    for (name, value) in command.variable_names.iter().zip(outcome.values.iter()) {
+        if let Err(error) = ensure_valid_variable_name(name) {
+            return builtin_error("read", error.to_string(), (*io).clone()).await;
+        }
+        if let Err(error) = shell.assign_variable(name.clone(), value.clone()) {
+            return builtin_error("read", error.to_string(), (*io).clone()).await;
+        }
+    }
+
+    Ok(CommandStatus::new(outcome.status))
+}
+
 async fn export<P: ShellPlatform>(
     shell: &mut Shell<P>,
     args: &[String],
@@ -376,10 +404,16 @@ async fn export<P: ShellPlatform>(
 
     for arg in args {
         if let Some((name, value)) = arg.split_once('=') {
+            if let Err(error) = ensure_valid_variable_name(name) {
+                return special_builtin_error("export", error.to_string(), (*io).clone()).await;
+            }
             if let Err(error) = shell.assign_exported_variable(name.to_owned(), value.to_owned()) {
                 return special_builtin_error("export", error.to_string(), (*io).clone()).await;
             }
         } else {
+            if let Err(error) = ensure_valid_variable_name(arg) {
+                return special_builtin_error("export", error.to_string(), (*io).clone()).await;
+            }
             if let Err(error) = shell.mark_exported(arg) {
                 return special_builtin_error("export", error.to_string(), (*io).clone()).await;
             }
@@ -414,8 +448,20 @@ async fn readonly<P: ShellPlatform>(
 
     for arg in args {
         let result = match arg.split_once('=') {
-            Some((name, value)) => shell.mark_readonly(name, Some(value.to_owned())),
-            None => shell.mark_readonly(arg, None),
+            Some((name, value)) => {
+                if let Err(error) = ensure_valid_variable_name(name) {
+                    return special_builtin_error("readonly", error.to_string(), (*io).clone())
+                        .await;
+                }
+                shell.mark_readonly(name, Some(value.to_owned()))
+            }
+            None => {
+                if let Err(error) = ensure_valid_variable_name(arg) {
+                    return special_builtin_error("readonly", error.to_string(), (*io).clone())
+                        .await;
+                }
+                shell.mark_readonly(arg, None)
+            }
         };
         if let Err(error) = result {
             return special_builtin_error("readonly", error.to_string(), (*io).clone()).await;
@@ -431,6 +477,9 @@ async fn unset<P: ShellPlatform>(
     io: &mut ExecutionIo,
 ) -> Result<CommandStatus> {
     for name in args {
+        if let Err(error) = ensure_valid_variable_name(name) {
+            return special_builtin_error("unset", error.to_string(), (*io).clone()).await;
+        }
         if let Err(error) = shell.unset(name) {
             return special_builtin_error("unset", error.to_string(), (*io).clone()).await;
         }
@@ -563,6 +612,17 @@ async fn special_builtin_error(
     let message = format!("{name}: {}\n", message.into());
     write_all(&mut stderr, message.as_bytes()).await?;
     Ok(CommandStatus::exit(2))
+}
+
+async fn builtin_error(
+    name: &str,
+    message: impl Into<String>,
+    io: ExecutionIo,
+) -> Result<CommandStatus> {
+    let mut stderr = io.output(2);
+    let message = format!("{name}: {}\n", message.into());
+    write_all(&mut stderr, message.as_bytes()).await?;
+    Ok(CommandStatus::new(2))
 }
 
 fn format_attribute_listing(keyword: &str, name: &str, value: Option<&str>) -> String {
