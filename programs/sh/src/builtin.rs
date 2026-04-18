@@ -19,14 +19,17 @@ pub async fn dispatch<P: ShellPlatform>(
         "test" | "[" => Some(run_test(shell, name, args).await?),
         "export" => Some(export(shell, args, &mut io).await?),
         "unset" => Some(unset(shell, args)),
+        "wait" => Some(wait(shell, args, &mut io).await?),
         "exit" => Some(exit(shell, args)?),
         ":" => Some(CommandStatus::SUCCESS),
         _ => None,
     };
 
     if status.is_some() {
-        close(&mut io.stdout).await?;
-        close(&mut io.stderr).await?;
+        let mut stdout = io.output(1);
+        close(&mut stdout).await?;
+        let mut stderr = io.output(2);
+        close(&mut stderr).await?;
     }
 
     Ok(status)
@@ -45,6 +48,7 @@ pub fn is_builtin(name: &str) -> bool {
             | "["
             | "export"
             | "unset"
+            | "wait"
             | "exit"
             | ":"
     )
@@ -56,15 +60,18 @@ async fn cat<P: ShellPlatform>(
     io: &mut ExecutionIo,
 ) -> Result<CommandStatus> {
     if args.is_empty() {
-        let bytes = read_all(&mut io.stdin).await?;
-        write_all(&mut io.stdout, &bytes).await?;
+        let mut stdin = io.input(0);
+        let bytes = read_all(&mut stdin).await?;
+        let mut stdout = io.output(1);
+        write_all(&mut stdout, &bytes).await?;
         return Ok(CommandStatus::SUCCESS);
     }
 
     for arg in args {
         let path = shell.resolve_user_path(arg);
         let bytes = shell.platform.read_file(&path).await?;
-        write_all(&mut io.stdout, &bytes).await?;
+        let mut stdout = io.output(1);
+        write_all(&mut stdout, &bytes).await?;
     }
 
     Ok(CommandStatus::SUCCESS)
@@ -89,14 +96,16 @@ async fn echo(args: &[String], io: &mut ExecutionIo) -> Result<CommandStatus> {
         bytes.push(b'\n');
     }
 
-    write_all(&mut io.stdout, &bytes).await?;
+    let mut stdout = io.output(1);
+    write_all(&mut stdout, &bytes).await?;
     Ok(CommandStatus::SUCCESS)
 }
 
 async fn pwd<P: ShellPlatform>(shell: &Shell<P>, io: &mut ExecutionIo) -> Result<CommandStatus> {
     let mut bytes = shell.current_dir().display().to_string().into_bytes();
     bytes.push(b'\n');
-    write_all(&mut io.stdout, &bytes).await?;
+    let mut stdout = io.output(1);
+    write_all(&mut stdout, &bytes).await?;
     Ok(CommandStatus::SUCCESS)
 }
 
@@ -123,7 +132,8 @@ async fn cd<P: ShellPlatform>(
     }
 
     let message = format!("cd: {}: not a directory\n", resolved.display());
-    write_all(&mut io.stderr, message.as_bytes()).await?;
+    let mut stderr = io.output(2);
+    write_all(&mut stderr, message.as_bytes()).await?;
     Ok(CommandStatus::new(1))
 }
 
@@ -206,7 +216,8 @@ async fn export<P: ShellPlatform>(
                 .map(|variable| variable.value.clone())
                 .unwrap_or_default();
             let line = format!("export {name}={value}\n");
-            write_all(&mut io.stdout, line.as_bytes()).await?;
+            let mut stdout = io.output(1);
+            write_all(&mut stdout, line.as_bytes()).await?;
         }
         return Ok(CommandStatus::SUCCESS);
     }
@@ -226,6 +237,40 @@ fn unset<P: ShellPlatform>(shell: &mut Shell<P>, args: &[String]) -> CommandStat
         shell.unset(name);
     }
     CommandStatus::SUCCESS
+}
+
+async fn wait<P: ShellPlatform>(
+    shell: &mut Shell<P>,
+    args: &[String],
+    io: &mut ExecutionIo,
+) -> Result<CommandStatus> {
+    let mut last = CommandStatus::SUCCESS;
+
+    if args.is_empty() {
+        for (_id, receiver) in shell.take_all_background_jobs() {
+            last = receiver
+                .await
+                .map_err(|_| ShellError::message("background job dropped"))??;
+        }
+        return Ok(CommandStatus::new(last.code()));
+    }
+
+    for arg in args {
+        let id = arg.parse::<u64>().map_err(|error| {
+            ShellError::message(format!("wait: invalid job id {arg:?}: {error}"))
+        })?;
+        let Some(receiver) = shell.take_background_job(id) else {
+            let mut stderr = io.output(2);
+            let message = format!("wait: unknown job {id}\n");
+            write_all(&mut stderr, message.as_bytes()).await?;
+            return Ok(CommandStatus::new(127));
+        };
+        last = receiver
+            .await
+            .map_err(|_| ShellError::message("background job dropped"))??;
+    }
+
+    Ok(CommandStatus::new(last.code()))
 }
 
 fn exit<P: ShellPlatform>(shell: &Shell<P>, args: &[String]) -> Result<CommandStatus> {

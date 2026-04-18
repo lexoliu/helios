@@ -4,17 +4,22 @@
 //! custom representation.
 
 use brush_parser::ast::Program;
+use brush_parser::word::WordPieceWithSource;
 use brush_parser::{ParserOptions, SourceInfo};
 
 use crate::error::{Result, ShellError};
 
-pub fn parse(source: &str) -> Result<Program> {
-    let options = ParserOptions {
+pub(crate) fn shell_parser_options() -> ParserOptions {
+    ParserOptions {
         posix_mode: true,
         sh_mode: true,
         enable_extended_globbing: false,
         tilde_expansion: false,
-    };
+    }
+}
+
+pub fn parse(source: &str) -> Result<Program> {
+    let options = shell_parser_options();
     let source_info = SourceInfo {
         source: "shell".to_owned(),
     };
@@ -25,4 +30,10 @@ pub fn parse(source: &str) -> Result<Program> {
         })?;
     brush_parser::parse_tokens(&tokens, &options, &source_info)
         .map_err(|error| ShellError::message(format!("failed to parse shell script: {error}")))
+}
+
+pub fn parse_word(word: &str) -> Result<Vec<WordPieceWithSource>> {
+    brush_parser::word::parse(word, &shell_parser_options()).map_err(|error| {
+        ShellError::message(format!("failed to parse shell word {word:?}: {error}"))
+    })
 }

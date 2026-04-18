@@ -1,23 +1,33 @@
+use std::cell::RefCell;
 use std::io;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll, ready};
 
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+use futures::future::LocalBoxFuture;
 use futures::io::{AsyncRead, AsyncWrite};
 use futures::stream::Stream;
 
+#[derive(Clone)]
 pub struct InputStream {
-    inner: Pin<Box<dyn AsyncRead>>,
+    inner: Rc<RefCell<Pin<Box<dyn AsyncRead>>>>,
 }
 
+#[derive(Clone)]
 pub struct OutputStream {
-    inner: Pin<Box<dyn AsyncWrite>>,
+    inner: Rc<RefCell<Pin<Box<dyn AsyncWrite>>>>,
+}
+
+#[derive(Clone)]
+pub struct CapturedOutput {
+    bytes: Rc<RefCell<Vec<u8>>>,
 }
 
 impl InputStream {
     pub fn new(reader: impl AsyncRead + 'static) -> Self {
         Self {
-            inner: Box::pin(reader),
+            inner: Rc::new(RefCell::new(Box::pin(reader))),
         }
     }
 
@@ -28,42 +38,88 @@ impl InputStream {
     pub fn empty() -> Self {
         Self::from_bytes(Vec::new())
     }
+
+    pub fn closed(fd: i32) -> Self {
+        Self::new(ClosedReader { fd })
+    }
 }
 
 impl OutputStream {
     pub fn new(writer: impl AsyncWrite + 'static) -> Self {
         Self {
-            inner: Box::pin(writer),
+            inner: Rc::new(RefCell::new(Box::pin(writer))),
         }
+    }
+
+    pub fn closed(fd: i32) -> Self {
+        Self::new(ClosedWriter { fd })
+    }
+}
+
+pub fn capture_output() -> (OutputStream, CapturedOutput) {
+    let bytes = Rc::new(RefCell::new(Vec::new()));
+    (
+        OutputStream::new(CaptureWriter {
+            bytes: bytes.clone(),
+        }),
+        CapturedOutput { bytes },
+    )
+}
+
+impl CapturedOutput {
+    pub fn take(&self) -> Vec<u8> {
+        std::mem::take(&mut *self.bytes.borrow_mut())
     }
 }
 
 impl AsyncRead for InputStream {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        self.inner.as_mut().poll_read(cx, buf)
+        self.inner.borrow_mut().as_mut().poll_read(cx, buf)
     }
 }
 
 impl AsyncWrite for OutputStream {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        self.inner.as_mut().poll_write(cx, buf)
+        self.inner.borrow_mut().as_mut().poll_write(cx, buf)
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.inner.as_mut().poll_flush(cx)
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.inner.borrow_mut().as_mut().poll_flush(cx)
     }
 
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.inner.as_mut().poll_close(cx)
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.inner.borrow_mut().as_mut().poll_close(cx)
     }
+}
+
+pub fn shared_buffer_file(
+    initial: Vec<u8>,
+    persist: impl Fn(Vec<u8>) -> LocalBoxFuture<'static, io::Result<()>> + 'static,
+) -> (InputStream, OutputStream) {
+    let state = Rc::new(RefCell::new(SharedBufferState {
+        bytes: initial,
+        cursor: 0,
+        dirty: false,
+    }));
+    let persist = Rc::new(persist);
+    (
+        InputStream::new(SharedBufferReader {
+            state: state.clone(),
+        }),
+        OutputStream::new(SharedBufferWriter {
+            state,
+            persist,
+            pending: None,
+        }),
+    )
 }
 
 pub fn pipe() -> (InputStream, OutputStream) {
@@ -229,6 +285,172 @@ impl AsyncWrite for PipeWriter {
     fn poll_close(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.sender = None;
         Poll::Ready(Ok(()))
+    }
+}
+
+struct CaptureWriter {
+    bytes: Rc<RefCell<Vec<u8>>>,
+}
+
+impl AsyncWrite for CaptureWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.bytes.borrow_mut().extend_from_slice(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+struct ClosedReader {
+    fd: i32,
+}
+
+impl AsyncRead for ClosedReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Err(io::Error::other(format!(
+            "file descriptor {} is closed",
+            self.fd
+        ))))
+    }
+}
+
+struct ClosedWriter {
+    fd: i32,
+}
+
+impl AsyncWrite for ClosedWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Err(io::Error::other(format!(
+            "file descriptor {} is closed",
+            self.fd
+        ))))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Err(io::Error::other(format!(
+            "file descriptor {} is closed",
+            self.fd
+        ))))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+struct SharedBufferState {
+    bytes: Vec<u8>,
+    cursor: usize,
+    dirty: bool,
+}
+
+struct SharedBufferReader {
+    state: Rc<RefCell<SharedBufferState>>,
+}
+
+impl AsyncRead for SharedBufferReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut state = self.state.borrow_mut();
+        if state.cursor >= state.bytes.len() {
+            return Poll::Ready(Ok(0));
+        }
+
+        let available = state.bytes.len() - state.cursor;
+        let count = available.min(buf.len());
+        buf[..count].copy_from_slice(&state.bytes[state.cursor..state.cursor + count]);
+        state.cursor += count;
+        Poll::Ready(Ok(count))
+    }
+}
+
+struct SharedBufferWriter {
+    state: Rc<RefCell<SharedBufferState>>,
+    persist: Rc<dyn Fn(Vec<u8>) -> LocalBoxFuture<'static, io::Result<()>>>,
+    pending: Option<LocalBoxFuture<'static, io::Result<()>>>,
+}
+
+impl SharedBufferWriter {
+    fn schedule_persist(&mut self) {
+        if self.pending.is_some() {
+            return;
+        }
+
+        let bytes = {
+            let mut state = self.state.borrow_mut();
+            if !state.dirty {
+                return;
+            }
+            state.dirty = false;
+            state.bytes.clone()
+        };
+        self.pending = Some((self.persist)(bytes));
+    }
+
+    fn poll_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.schedule_persist();
+        let Some(pending) = self.pending.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+
+        match pending.as_mut().poll(cx) {
+            Poll::Ready(result) => {
+                if result.is_err() {
+                    self.state.borrow_mut().dirty = true;
+                }
+                self.pending = None;
+                Poll::Ready(result)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncWrite for SharedBufferWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut state = self.state.borrow_mut();
+        let start = state.cursor;
+        let end = start + buf.len();
+        if end > state.bytes.len() {
+            state.bytes.resize(end, 0);
+        }
+        state.bytes[start..end].copy_from_slice(buf);
+        state.cursor = end;
+        state.dirty = true;
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_pending(cx)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_pending(cx)
     }
 }
 

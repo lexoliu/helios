@@ -5,7 +5,7 @@ use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use futures::channel::oneshot;
-use futures::future::LocalBoxFuture;
+use futures::future::{FutureExt, LocalBoxFuture};
 use futures::io::{AsyncRead, AsyncWrite};
 use helios_api::bindings::wit_stream;
 use helios_api::programs;
@@ -13,7 +13,7 @@ use helios_api::{fs as helios_fs, io as helios_io, task as helios_task};
 use tracing::debug;
 
 use crate::error::{Result, ShellError};
-use crate::streams::{InputStream, OutputStream, close, pipe, write_all};
+use crate::streams::{InputStream, OutputStream, close, pipe, shared_buffer_file, write_all};
 
 #[derive(Clone, Debug)]
 pub struct ResolvedProgram {
@@ -59,6 +59,8 @@ pub trait ShellPlatform: Clone + 'static {
     async fn open_input(&self, path: &Path) -> Result<InputStream>;
 
     async fn open_output(&self, path: &Path, mode: WriteMode) -> Result<OutputStream>;
+
+    async fn open_read_write(&self, path: &Path) -> Result<(InputStream, OutputStream)>;
 
     async fn exists(&self, path: &Path) -> bool;
 
@@ -121,6 +123,24 @@ impl ShellPlatform for HeliosPlatform {
             path.to_path_buf(),
             mode,
         )))
+    }
+
+    async fn open_read_write(&self, path: &Path) -> Result<(InputStream, OutputStream)> {
+        let initial = if helios_fs::exists(path).await {
+            self.read_file(path).await?
+        } else {
+            Vec::new()
+        };
+        let path = path.to_path_buf();
+        Ok(shared_buffer_file(initial, move |bytes| {
+            let path = path.clone();
+            async move {
+                helios_fs::write(&path, bytes).await.map_err(|error| {
+                    io::Error::other(format!("failed to write {}: {error:#}", path.display()))
+                })
+            }
+            .boxed_local()
+        }))
     }
 
     async fn exists(&self, path: &Path) -> bool {

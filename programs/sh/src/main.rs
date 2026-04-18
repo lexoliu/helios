@@ -93,6 +93,7 @@ impl Invocation {
     fn bootstrap(&self) -> Bootstrap {
         Bootstrap {
             shell_name: self.shell_name.clone(),
+            process_id: std::process::id().to_string(),
             positional_parameters: self.positional_parameters.clone(),
             working_dir: PathBuf::from("/"),
             environment: env::vars().collect(),
