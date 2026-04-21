@@ -5,7 +5,7 @@ use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant as StdInstant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
-use helios_hal::Platform;
+use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorTopology};
 use helios_hal::cpu::{Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
 use helios_kernel::InstanceRegistry;
@@ -241,7 +241,15 @@ fn spawn_processor_thread(
             let console = HostedConsole::new(machine.observer());
             let cpu = HostedCpu::new(processor, machine.clone());
             let memory_regions = machine.bootstrap_memory_regions(processor);
-            let kernel = helios_kernel::init(Platform::new(console, memory_regions, cpu));
+            let platform = Platform::new(console, memory_regions, cpu).with_topology(
+                ProcessorTopology::start_all_secondaries(
+                    machine.bootstrap_processor(),
+                    machine.processor_count(),
+                ),
+            )
+            .with_dma_model(DmaModel::Translated)
+            .with_devices(DeviceInventory::new());
+            let kernel = helios_kernel::init(platform);
             if processor == machine.bootstrap_processor() {
                 let program_service = program_host::create_program_service(
                     &config,

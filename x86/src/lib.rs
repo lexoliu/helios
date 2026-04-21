@@ -8,7 +8,7 @@ use bootloader_api::info::MemoryRegionKind;
 use bootloader_api::{BootInfo, BootloaderConfig, entry_point};
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicPtr, Ordering};
-use helios_hal::Platform;
+use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorTopology};
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
 use spin::Mutex;
@@ -28,7 +28,11 @@ fn x86_kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let memory_regions = boot_memory_regions(boot_info);
     let console = SerialConsole::new();
     let cpu = X86Cpu;
-    let kernel = helios_kernel::init(Platform::new(console, memory_regions, cpu));
+    let platform = Platform::new(console, memory_regions, cpu)
+        .with_topology(ProcessorTopology::bootstrap_only(ProcessorId::new(0)))
+        .with_dma_model(DmaModel::Translated)
+        .with_devices(DeviceInventory::new().with_debug_serial());
+    let kernel = helios_kernel::init(platform);
     kernel.run();
 }
 

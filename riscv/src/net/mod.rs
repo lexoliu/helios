@@ -1409,6 +1409,26 @@ impl NetworkProbe {
     }
 }
 
+pub(crate) fn has_network_device(fdt: &Fdt<'_>) -> bool {
+    for node in fdt.all_nodes() {
+        if !node
+            .compatible()
+            .is_some_and(|compatible| compatible.all().any(|entry| entry == "virtio,mmio"))
+        {
+            continue;
+        }
+
+        let Some(region) = node.reg().and_then(|mut regs| regs.next()) else {
+            continue;
+        };
+        if is_network_mmio_device(region.starting_address as usize) {
+            return true;
+        }
+    }
+
+    false
+}
+
 impl plic::HartContext for PlicContext {
     fn index(self) -> usize {
         self.0

@@ -102,6 +102,7 @@ use core::time::Duration;
 use buddy_system_allocator::LockedHeap;
 use executor::Executor;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
+use helios_hal::{ProcessorStartupPolicy, ProcessorTopology};
 use helios_hal::memory::MemoryRegion;
 
 const HEAP_ORDER: usize = 32;
@@ -218,13 +219,35 @@ where
         console,
         cpu,
         memory_regions,
+        topology,
+        timer_frequency_hz,
+        dma_model: _,
+        devices: _,
     } = platform;
     let current_processor = cpu.current_processor();
+    assert!(
+        cpu.bootstrap_processor() == topology.bootstrap_processor,
+        "platform topology bootstrap processor {} does not match CPU bootstrap processor {}",
+        topology.bootstrap_processor.id(),
+        cpu.bootstrap_processor().id()
+    );
+    assert!(
+        cpu.processor_count() == topology.configured_processors,
+        "platform topology processor count {} does not match CPU processor count {}",
+        topology.configured_processors,
+        cpu.processor_count()
+    );
+    assert!(
+        cpu.timer_frequency() == timer_frequency_hz,
+        "platform timer frequency {} does not match CPU timer frequency {}",
+        timer_frequency_hz,
+        cpu.timer_frequency()
+    );
 
-    if current_processor == cpu.bootstrap_processor() {
+    if current_processor == topology.bootstrap_processor {
         match BOOT_STATE.load(Ordering::Acquire) {
-            BOOT_UNINITIALIZED => bootstrap_init(console, memory_regions, &cpu),
-            BOOT_INITIALIZING => finish_bootstrap(console, &cpu),
+            BOOT_UNINITIALIZED => bootstrap_init(console, memory_regions, &cpu, topology),
+            BOOT_INITIALIZING => finish_bootstrap(console, &cpu, topology),
             state => panic!("bootstrap processor observed invalid boot state {state}"),
         }
     } else {
@@ -278,16 +301,21 @@ fn bootstrap_init<Console, CpuImpl, Regions>(
     console: Console,
     memory_regions: Regions,
     cpu: &CpuImpl,
+    topology: ProcessorTopology,
 ) where
     Console: core::fmt::Write + Send + 'static,
     CpuImpl: Cpu,
     Regions: IntoIterator<Item = MemoryRegion>,
 {
     prime_bootstrap_allocator(memory_regions);
-    finish_bootstrap(console, cpu);
+    finish_bootstrap(console, cpu, topology);
 }
 
-fn finish_bootstrap<Console, CpuImpl>(console: Console, cpu: &CpuImpl)
+fn finish_bootstrap<Console, CpuImpl>(
+    console: Console,
+    cpu: &CpuImpl,
+    topology: ProcessorTopology,
+)
 where
     Console: core::fmt::Write + Send + 'static,
     CpuImpl: Cpu,
@@ -295,16 +323,23 @@ where
     log::init_logger(console);
     tracing::info!(
         "Kernel initialized on bootstrap processor={}",
-        cpu.bootstrap_processor().id()
+        topology.bootstrap_processor.id()
+    );
+    tracing::info!(
+        "Kernel topology processors={} startup_policy={:?}",
+        topology.configured_processors,
+        topology.startup_policy
     );
     tracing::info!("Kernel is ready\n\n{}", include_str!("welcome.txt"));
 
     BOOT_STATE.store(BOOT_READY, Ordering::Release);
 
-    for processor in 0..cpu.processor_count() {
-        let processor = ProcessorId::new(processor as u16);
-        if processor != cpu.bootstrap_processor() {
-            cpu.start_processor(processor);
+    if topology.startup_policy == ProcessorStartupPolicy::StartAllSecondaries {
+        for processor in 0..topology.configured_processors {
+            let processor = ProcessorId::new(processor as u16);
+            if processor != topology.bootstrap_processor {
+                cpu.start_processor(processor);
+            }
         }
     }
 }

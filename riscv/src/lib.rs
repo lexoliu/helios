@@ -145,6 +145,7 @@ use arrayvec::ArrayVec;
 use fdt::Fdt;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
+use helios_hal::{DeviceInventory, DmaModel, ProcessorStartupPolicy, ProcessorTopology};
 use helios_kernel::Timer;
 use riscv::interrupt::Trap;
 use riscv::interrupt::supervisor::{Exception, Interrupt};
@@ -593,12 +594,29 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         fdt_addr,
         debug_state.clone(),
     );
+    let execution_plan =
+        debugger_program::RuntimeExecutionPlan::new(hart_count, bootstrap_processor);
 
-    let kernel = helios_kernel::init(helios_kernel::Platform::new(
-        console,
-        memory_regions.into_iter(),
-        cpu.clone(),
-    ));
+    let mut devices = DeviceInventory::new();
+    if debug_transport.is_some() {
+        devices = devices.with_debug_serial();
+    }
+    if net::has_network_device(&fdt) {
+        devices = devices.with_network();
+    }
+    if host_fs::has_9p_device(&fdt) {
+        devices = devices.with_host_share();
+    }
+    let platform = helios_kernel::Platform::new(console, memory_regions.into_iter(), cpu.clone())
+        .with_topology(ProcessorTopology::start_all_secondaries(
+            bootstrap_processor,
+            hart_count,
+        )
+        .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly))
+        .with_timer_frequency_hz(timebase_frequency)
+        .with_dma_model(DmaModel::Identity)
+        .with_devices(devices);
+    let kernel = helios_kernel::init(platform);
     let external_interrupts = if current_hart == bootstrap_processor {
         let mut interrupts = net::install_network_service(&cpu, &kernel, &fdt, &debug_state);
         if let Some(host_fs) = host_fs::install(&cpu, &kernel, &fdt, &debug_state) {
@@ -634,14 +652,25 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     unsafe {
         configure_interrupts();
     }
-    if debugger_program::should_run_on(current_hart.id(), hart_count, bootstrap_processor.id()) {
+
+    if current_hart == bootstrap_processor {
+        let _ = debugger_program::install_program_service(&cpu, &kernel, &debug_state);
+        if execution_plan.runs_debugger_locally() {
+            debugger_program::spawn_debugger_task(&kernel, cpu.clone());
+        }
+        for hart in 0..hart_count {
+            let hart = ProcessorId::new(hart as u16);
+            if hart != bootstrap_processor {
+                cpu.start_processor(hart);
+            }
+        }
+        kernel.run();
+    }
+
+    if execution_plan.is_debugger_hart(current_hart) {
         debugger_program::run_forever(cpu.clone());
     }
-    if debugger_program::program_worker_should_run_on(
-        current_hart.id(),
-        hart_count,
-        bootstrap_processor.id(),
-    ) {
+    if execution_plan.is_dedicated_program_worker(current_hart) {
         debugger_program::run_program_workers_forever(cpu.clone(), kernel);
     }
     kernel.run();

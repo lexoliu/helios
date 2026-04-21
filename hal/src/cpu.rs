@@ -3,7 +3,7 @@
 /// This is the architecture-neutral execution slot identifier exposed to the
 /// kernel. Backends map it onto their native concept: a RISC-V hart id, an
 /// x86 APIC CPU id, an ARM PE index, or a synthetic hosted test CPU slot.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ProcessorId(u16);
 
 impl ProcessorId {

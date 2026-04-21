@@ -53,6 +53,66 @@ const COMPONENT_CACHE_FRACTION: usize = 8;
 pub(crate) mod service {
     use super::*;
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) struct RuntimeExecutionPlan {
+        hart_count: usize,
+        bootstrap_hart: helios_hal::cpu::ProcessorId,
+    }
+
+    impl RuntimeExecutionPlan {
+        pub(crate) fn new(
+            hart_count: usize,
+            bootstrap_hart: helios_hal::cpu::ProcessorId,
+        ) -> Self {
+            assert!(hart_count != 0, "runtime execution plan requires at least one hart");
+            assert!(
+                usize::from(bootstrap_hart.id()) < hart_count,
+                "bootstrap hart {} is outside detected hart count {}",
+                bootstrap_hart.id(),
+                hart_count
+            );
+            Self {
+                hart_count,
+                bootstrap_hart,
+            }
+        }
+
+        pub(crate) fn debugger_hart(self) -> Option<helios_hal::cpu::ProcessorId> {
+            if self.hart_count == 1 {
+                return None;
+            }
+
+            let hart = if self.bootstrap_hart.id() == 0 { 1 } else { 0 };
+            Some(helios_hal::cpu::ProcessorId::new(hart))
+        }
+
+        pub(crate) fn runs_debugger_locally(self) -> bool {
+            self.debugger_hart().is_none()
+        }
+
+        pub(crate) fn is_debugger_hart(self, hart: helios_hal::cpu::ProcessorId) -> bool {
+            self.debugger_hart().is_some_and(|debugger| debugger == hart)
+        }
+
+        pub(crate) fn dedicated_program_worker_count(self) -> usize {
+            (0..self.hart_count)
+                .map(|hart| helios_hal::cpu::ProcessorId::new(hart as u16))
+                .filter(|hart| self.is_dedicated_program_worker(*hart))
+                .count()
+        }
+
+        pub(crate) fn runs_program_workers_locally(self) -> bool {
+            self.dedicated_program_worker_count() == 0
+        }
+
+        pub(crate) fn is_dedicated_program_worker(
+            self,
+            hart: helios_hal::cpu::ProcessorId,
+        ) -> bool {
+            hart != self.bootstrap_hart && !self.is_debugger_hart(hart)
+        }
+    }
+
     #[derive(Clone)]
     pub(crate) struct UserProgramService {
         inner: Arc<UserProgramServiceInner>,
@@ -79,29 +139,23 @@ pub(crate) mod service {
         completion: Option<oneshot::Sender<Result<ExecResult, ProgramExecError>>>,
     }
 
-    pub fn should_run_on(hart_id: u16, hart_count: usize, bootstrap_hart: u16) -> bool {
-        assert!(
-            hart_count > 1,
-            "embedded debugger requires at least two processors so one can be dedicated to shell I/O"
-        );
-        hart_id != bootstrap_hart && hart_id == debug_processor(bootstrap_hart, hart_count)
-    }
-
     pub(crate) fn install_program_service(
         cpu: &RiscvCpu,
+        kernel: &helios_kernel::Kernel<RiscvCpu>,
         debug_state: &crate::debug_state::RuntimeState,
-    ) -> Option<UserProgramService> {
+    ) -> UserProgramService {
         if let Some(service) = debug_state.program_service() {
-            return Some(service);
+            return service;
         }
 
-        let worker_count = worker_hart_count(cpu.processor_count(), cpu.bootstrap_processor().id());
-        if worker_count == 0 {
-            tracing::warn!(
-                "program exec is unavailable: no worker harts remain after reserving the debugger hart"
-            );
-            return None;
-        }
+        assert!(
+            cpu.current_processor() == cpu.bootstrap_processor(),
+            "program service must be installed from bootstrap hart {}, current hart {}",
+            cpu.bootstrap_processor().id(),
+            cpu.current_processor().id()
+        );
+        let execution_plan = RuntimeExecutionPlan::new(cpu.processor_count(), cpu.bootstrap_processor());
+        let worker_count = execution_plan.dedicated_program_worker_count().max(1);
 
         let available_bytes = heap_stats().available_bytes();
         let reserved_stack_bytes = worker_count * WORKER_STACK_SIZE;
@@ -130,30 +184,11 @@ pub(crate) mod service {
         };
         debug_state.install_program_service(service.clone());
 
-        for hart in 0..cpu.processor_count() {
-            let hart = helios_hal::cpu::ProcessorId::new(hart as u16);
-            if hart != cpu.bootstrap_processor()
-                && !should_run_on(
-                    hart.id(),
-                    cpu.processor_count(),
-                    cpu.bootstrap_processor().id(),
-                )
-            {
-                cpu.start_processor(hart);
-            }
+        if execution_plan.runs_program_workers_locally() {
+            spawn_program_worker_task(kernel, cpu.clone(), debug_state.clone());
         }
 
-        Some(service)
-    }
-
-    pub(crate) fn program_worker_should_run_on(
-        hart_id: u16,
-        hart_count: usize,
-        bootstrap_hart: u16,
-    ) -> bool {
-        hart_count > 2
-            && hart_id != bootstrap_hart
-            && !should_run_on(hart_id, hart_count, bootstrap_hart)
+        service
     }
 
     pub(crate) fn run_program_workers_forever(
@@ -161,17 +196,29 @@ pub(crate) mod service {
         kernel: helios_kernel::Kernel<RiscvCpu>,
     ) -> ! {
         let debug_state = crate::global_debug_state();
-        let worker_cpu = cpu.clone();
-        kernel.spawn_local_detached(async move {
-            let service = debug_state.wait_for_program_service().await;
-            loop {
-                if service.run_next_on(&worker_cpu) {
-                    continue;
-                }
-                service.wait_for_activity().await;
-            }
-        });
+        spawn_program_worker_task(&kernel, cpu, debug_state);
         kernel.run();
+    }
+
+    pub(crate) fn spawn_debugger_task(
+        kernel: &helios_kernel::Kernel<RiscvCpu>,
+        cpu: RiscvCpu,
+    ) {
+        kernel.spawn_local_detached(async move {
+            let debugger = embedded_debugger().unwrap_or_else(|| {
+                panic!("no embedded debugger program found; set HELIOS_DEBUGGER_WASM")
+            });
+            emit_stage_marker("boot");
+            tracing::info!("shared runtime: launching embedded debugger component");
+            run_debugger(debugger, cpu.clone())
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("failed to exec embedded debugger component:\n{error:#}")
+                });
+            emit_stage_marker("done");
+            tracing::info!("shared runtime: embedded debugger component exited cleanly");
+            cpu.shutdown()
+        });
     }
 
     pub fn run_forever(cpu: RiscvCpu) -> ! {
@@ -179,26 +226,11 @@ pub(crate) mod service {
             .unwrap_or_else(|| panic!("no embedded debugger program found; set HELIOS_DEBUGGER_WASM"));
         emit_stage_marker("boot");
         tracing::info!("debugger hart: launching embedded debugger component");
-        run_debugger(debugger, cpu.clone())
+        helios_kernel::block_on(run_debugger(debugger, cpu.clone()))
             .unwrap_or_else(|error| panic!("failed to exec embedded debugger component:\n{error:#}"));
         emit_stage_marker("done");
         tracing::info!("debugger hart: embedded debugger component exited cleanly");
         cpu.shutdown()
-    }
-
-    fn debug_processor(bootstrap_hart: u16, hart_count: usize) -> u16 {
-        assert!(
-            usize::from(bootstrap_hart) < hart_count,
-            "bootstrap hart {} is outside detected hart count {}",
-            bootstrap_hart,
-            hart_count
-        );
-
-        if bootstrap_hart == 0 {
-            return 1;
-        }
-
-        0
     }
 
     impl UserProgramService {
@@ -240,7 +272,7 @@ pub(crate) mod service {
             })
         }
 
-        pub(crate) fn run_next_on(&self, execution_cpu: &RiscvCpu) -> bool {
+        pub(crate) async fn run_next_on(&self, execution_cpu: &RiscvCpu) -> bool {
             match self.inner.run_queue.pop() {
                 Ok(mut queued) => {
                     let instance_id = queued.instance.id();
@@ -251,7 +283,8 @@ pub(crate) mod service {
                         execution_cpu.clone(),
                         self.inner.debug_state.clone(),
                         self.inner.instance_registry.clone(),
-                    );
+                    )
+                    .await;
                     if let Some(completion) = completion {
                         let response = result
                             .as_ref()
@@ -364,16 +397,23 @@ pub(crate) mod service {
         }
     }
 
-    fn worker_hart_count(hart_count: usize, bootstrap_hart: u16) -> usize {
-        (0..hart_count)
-            .filter(|hart| {
-                let hart = *hart as u16;
-                program_worker_should_run_on(hart, hart_count, bootstrap_hart)
-            })
-            .count()
+    fn spawn_program_worker_task(
+        kernel: &helios_kernel::Kernel<RiscvCpu>,
+        worker_cpu: RiscvCpu,
+        debug_state: RuntimeState,
+    ) {
+        kernel.spawn_local_detached(async move {
+            let service = debug_state.wait_for_program_service().await;
+            loop {
+                if service.run_next_on(&worker_cpu).await {
+                    continue;
+                }
+                service.wait_for_activity().await;
+            }
+        });
     }
 
-    fn run_program_component(
+    async fn run_program_component(
         queued: QueuedProgram,
         cpu: RiscvCpu,
         debug_state: RuntimeState,
@@ -418,9 +458,12 @@ pub(crate) mod service {
         );
 
         let instantiate_started_at = monotonic_nanos(&store.data().cpu);
-        let program = helios_kernel::block_on(crate::program_bindings::bindings::Init::instantiate_async(
-            &mut store, &component, &linker,
-        ))?;
+        let program = crate::program_bindings::bindings::Init::instantiate_async(
+            &mut store,
+            &component,
+            &linker,
+        )
+        .await?;
         tracing::info!(
             target: "helios_riscv::program_host",
             phase = "instantiate",
@@ -429,10 +472,9 @@ pub(crate) mod service {
             "program component instantiated"
         );
         let run_started_at = monotonic_nanos(&store.data().cpu);
-        let result =
-            helios_kernel::block_on(store.run_concurrent(async move |accessor| {
-                program.wasi_cli_run().call_run(accessor).await
-            }))?;
+        let result = store
+            .run_concurrent(async move |accessor| program.wasi_cli_run().call_run(accessor).await)
+            .await?;
         tracing::info!(
             target: "helios_riscv::program_host",
             phase = "call-run",
@@ -451,9 +493,46 @@ pub(crate) mod service {
 }
 
 pub(crate) use service::{
-    UserProgramService, install_program_service, program_worker_should_run_on,
-    run_forever, run_program_workers_forever, should_run_on,
+    RuntimeExecutionPlan, UserProgramService, install_program_service, run_forever,
+    run_program_workers_forever, spawn_debugger_task,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::RuntimeExecutionPlan;
+    use helios_hal::cpu::ProcessorId;
+
+    #[test]
+    fn single_hart_runs_debugger_and_workers_locally() {
+        let plan = RuntimeExecutionPlan::new(1, ProcessorId::new(0));
+
+        assert_eq!(plan.debugger_hart(), None);
+        assert!(plan.runs_debugger_locally());
+        assert!(plan.runs_program_workers_locally());
+        assert_eq!(plan.dedicated_program_worker_count(), 0);
+    }
+
+    #[test]
+    fn two_harts_dedicate_debugger_and_share_workers() {
+        let plan = RuntimeExecutionPlan::new(2, ProcessorId::new(0));
+
+        assert_eq!(plan.debugger_hart(), Some(ProcessorId::new(1)));
+        assert!(!plan.runs_debugger_locally());
+        assert!(plan.runs_program_workers_locally());
+        assert!(!plan.is_dedicated_program_worker(ProcessorId::new(1)));
+    }
+
+    #[test]
+    fn multi_hart_plan_reserves_debugger_and_workers_explicitly() {
+        let plan = RuntimeExecutionPlan::new(4, ProcessorId::new(2));
+
+        assert_eq!(plan.debugger_hart(), Some(ProcessorId::new(0)));
+        assert!(!plan.runs_program_workers_locally());
+        assert!(plan.is_dedicated_program_worker(ProcessorId::new(1)));
+        assert!(plan.is_dedicated_program_worker(ProcessorId::new(3)));
+        assert_eq!(plan.dedicated_program_worker_count(), 2);
+    }
+}
 
 struct CpuCodeMemory<C> {
     cpu: C,
@@ -528,7 +607,7 @@ pub struct SbiRawRwLockWriteGuard {
     _resource: RawRwLockWriteGuardResource,
 }
 
-fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), DebuggerError> {
+async fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), DebuggerError> {
     emit_stage_marker("engine:new");
     tracing::info!("debugger hart: creating wasmtime engine");
     let engine = build_engine(&cpu).map_err(DebuggerError::CreateEngine)?;
@@ -577,20 +656,18 @@ fn run_debugger(debugger: EmbeddedDebugger, cpu: RiscvCpu) -> Result<(), Debugge
     }
     emit_stage_marker("pre:ok");
     emit_stage_marker("instantiate:begin");
-    let instance = helios_kernel::block_on(bindings::Debugger::instantiate_async(
-        &mut store, &component, &linker,
-    ))
-    .map_err(|error| {
+    let instance = bindings::Debugger::instantiate_async(&mut store, &component, &linker)
+        .await
+        .map_err(|error| {
         emit_error_marker("instantiate:error", &format!("{error:#}"));
         DebuggerError::InstantiateComponent(error)
     })?;
     emit_stage_marker("instantiate:ok");
     tracing::info!("debugger hart: entering wasi:cli/run");
     emit_stage_marker("run:begin");
-    let result =
-        helios_kernel::block_on(store.run_concurrent(async move |accessor| {
-            instance.wasi_cli_run().call_run(accessor).await
-        }))
+    let result = store
+        .run_concurrent(async move |accessor| instance.wasi_cli_run().call_run(accessor).await)
+        .await
         .map_err(|error| {
             emit_error_marker("run:error", &format!("{error:#}"));
             DebuggerError::RunComponent(error)
@@ -905,9 +982,7 @@ fn add_programs_to_linker(linker: &mut Linker<StoreData>) -> wasmtime::Result<()
         "exec",
         |caller: StoreContextMut<'_, StoreData>,
          (request,): (bindings::helios::system::programs::ExecRequest,)| {
-            let service = caller.data().runtime_state.program_service().or_else(|| {
-                install_program_service(&caller.data().cpu, &caller.data().runtime_state)
-            });
+            let service = caller.data().runtime_state.program_service();
             Box::new(async move {
                 let Some(service) = service else {
                     return Ok::<_, wasmtime::Error>((Err(
@@ -947,12 +1022,7 @@ fn add_programs_to_program_linker(linker: &mut Linker<StoreData>) -> wasmtime::R
         "exec",
         |caller: StoreContextMut<'_, StoreData>,
          (request,): (crate::program_bindings::bindings::helios::system::programs::ExecRequest,)| {
-            let service = caller.data().runtime_state.program_service().or_else(|| {
-                install_program_service(
-                    &caller.data().cpu,
-                    &caller.data().runtime_state,
-                )
-            });
+            let service = caller.data().runtime_state.program_service();
             Box::new(async move {
                 let Some(service) = service else {
                     return Ok::<_, wasmtime::Error>((Err(

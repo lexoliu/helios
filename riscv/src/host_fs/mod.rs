@@ -739,6 +739,26 @@ fn discover_9p_device(
     None
 }
 
+pub(crate) fn has_9p_device(fdt: &Fdt<'_>) -> bool {
+    for node in fdt.all_nodes() {
+        if !node
+            .compatible()
+            .is_some_and(|compatible| compatible.all().any(|entry| entry == "virtio,mmio"))
+        {
+            continue;
+        }
+
+        let Some(region) = node.reg().and_then(|mut regs| regs.next()) else {
+            continue;
+        };
+        if is_9p_mmio_device(region.starting_address as usize) {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn is_9p_mmio_device(base: usize) -> bool {
     crate::matches_virtio_mmio_device(base, helios_virtio::DeviceType::_9P)
 }
