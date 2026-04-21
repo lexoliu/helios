@@ -379,6 +379,8 @@ impl VmRuntime {
         match command.arch {
             VmArch::Riscv64 => {
                 qemu.arg("-global").arg("virtio-mmio.force-legacy=false");
+                qemu.arg("-device").arg("i6300esb");
+                qemu.arg("-watchdog-action").arg("reset");
                 if let Some(bios) = &command.bios {
                     qemu.arg("-bios").arg(bios);
                 }
@@ -397,7 +399,7 @@ impl VmRuntime {
             }
             VmArch::X86_64 => {
                 qemu.arg("-cpu").arg("max");
-                qemu.arg("-watchdog").arg("i6300esb");
+                qemu.arg("-device").arg("i6300esb");
                 qemu.arg("-watchdog-action").arg("reset");
                 qemu.arg("-drive")
                     .arg(format!("format=raw,file={}", artifact.display()));
@@ -520,6 +522,181 @@ fn default_kernel_path(arch: VmArch, release: bool) -> PathBuf {
         .join(arch.cargo_target())
         .join(if release { "release" } else { "debug" })
         .join(arch.kernel_artifact_name())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{ErrorKind, Read};
+    use std::os::unix::net::UnixStream;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    use anyhow::{bail, Context as _, Result};
+
+    use super::{
+        default_kernel_path, repo_root, ResolvedVmCommand, VmArch, VmRuntime, DEFAULT_BAUD,
+        DEFAULT_MEMORY,
+    };
+
+    const WATCHDOG_SELF_TEST_DELAY_MS: &str = "5000";
+    const WATCHDOG_TIMEOUT_SECS: &str = "10";
+    const WATCHDOG_STAGE_TIMEOUT: Duration = Duration::from_secs(120);
+    const SERIAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+    const SERIAL_READ_TIMEOUT: Duration = Duration::from_millis(500);
+    const DEBUGGER_RUN_STAGE_MARKER: &[u8] = b"[KDBG run:begin]";
+
+    #[test]
+    #[ignore = "requires qemu and cross-compiled kernels"]
+    fn watchdog_self_test_resets_x86_and_riscv() -> Result<()> {
+        assert_watchdog_reset(VmArch::X86_64).context("x86 watchdog self-test failed")?;
+        assert_watchdog_reset(VmArch::Riscv64).context("riscv watchdog self-test failed")?;
+        Ok(())
+    }
+
+    fn assert_watchdog_reset(arch: VmArch) -> Result<()> {
+        build_watchdog_test_kernel(arch)?;
+        let command = watchdog_test_command(arch);
+        let mut runtime = VmRuntime::spawn(&command)?;
+        wait_for_stage_occurrences(runtime.socket_path(), DEBUGGER_RUN_STAGE_MARKER, 2)?;
+        runtime.shutdown();
+        Ok(())
+    }
+
+    fn build_watchdog_test_kernel(arch: VmArch) -> Result<()> {
+        let status = std::process::Command::new("cargo")
+            .current_dir(repo_root())
+            .arg("build")
+            .arg("--target")
+            .arg(arch.cargo_target())
+            .arg("--bin")
+            .arg(arch.kernel_artifact_name())
+            .env("HELIOS_BOOT_PROGRAMS", "debugger")
+            .env("HELIOS_WATCHDOG_SELF_TEST", "1")
+            .env("HELIOS_WATCHDOG_TIMEOUT_SECS", WATCHDOG_TIMEOUT_SECS)
+            .env(
+                "HELIOS_WATCHDOG_SELF_TEST_DELAY_MS",
+                WATCHDOG_SELF_TEST_DELAY_MS,
+            )
+            .status()
+            .context("failed to spawn cargo for watchdog self-test kernel build")?;
+        if status.success() {
+            return Ok(());
+        }
+        bail!("watchdog self-test kernel build exited with status {status}");
+    }
+
+    fn watchdog_test_command(arch: VmArch) -> ResolvedVmCommand {
+        ResolvedVmCommand {
+            arch,
+            release: false,
+            qemu_bin: arch.qemu_bin().into(),
+            kernel: default_kernel_path(arch, false),
+            socket: None,
+            no_build: true,
+            smp: arch.default_smp(),
+            memory: match arch {
+                VmArch::Riscv64 => "2G".to_owned(),
+                VmArch::X86_64 => DEFAULT_MEMORY.to_owned(),
+            },
+            bios: (arch == VmArch::Riscv64).then(|| "default".to_owned()),
+            baud: DEFAULT_BAUD,
+            shared_dir: None,
+            command: None,
+        }
+    }
+
+    fn connect_serial_socket(socket_path: &Path) -> Result<UnixStream> {
+        let started = Instant::now();
+        loop {
+            match UnixStream::connect(socket_path) {
+                Ok(stream) => {
+                    stream
+                        .set_read_timeout(Some(SERIAL_READ_TIMEOUT))
+                        .context("failed to configure serial socket read timeout")?;
+                    return Ok(stream);
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::ConnectionRefused | ErrorKind::NotFound
+                    ) && started.elapsed() < SERIAL_CONNECT_TIMEOUT => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to connect to QEMU debug serial socket {}",
+                            socket_path.display()
+                        )
+                    });
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn wait_for_stage_occurrences(
+        socket_path: &Path,
+        marker: &[u8],
+        expected: usize,
+    ) -> Result<()> {
+        let deadline = Instant::now() + WATCHDOG_STAGE_TIMEOUT;
+        let mut serial = connect_serial_socket(socket_path)?;
+        let mut line = Vec::new();
+        let mut seen = 0usize;
+        let mut buffer = [0_u8; 256];
+        let mut observed_stages = Vec::new();
+        let mut recent_lines = Vec::new();
+        let mut reconnects = 0usize;
+
+        while Instant::now() < deadline {
+            match serial.read(&mut buffer) {
+                Ok(0) => {
+                    reconnects += 1;
+                    serial = connect_serial_socket(socket_path)?;
+                }
+                Ok(count) => {
+                    for &byte in &buffer[..count] {
+                        match byte {
+                            b'\n' => {
+                                if !line.is_empty() {
+                                    recent_lines.push(String::from_utf8_lossy(&line).into_owned());
+                                    if recent_lines.len() > 32 {
+                                        recent_lines.remove(0);
+                                    }
+                                }
+                                if line.starts_with(b"[KDBG ") {
+                                    observed_stages
+                                        .push(String::from_utf8_lossy(&line).into_owned());
+                                    if observed_stages.len() > 32 {
+                                        observed_stages.remove(0);
+                                    }
+                                }
+                                if line.as_slice() == marker {
+                                    seen += 1;
+                                    if seen == expected {
+                                        return Ok(());
+                                    }
+                                }
+                                line.clear();
+                            }
+                            b'\r' => {}
+                            other => line.push(other),
+                        }
+                    }
+                }
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(error) => {
+                    return Err(error).context("failed while reading QEMU debug serial socket");
+                }
+            }
+        }
+
+        bail!(
+            "timed out waiting for {expected} debugger run markers; observed {seen}; reconnects: {reconnects}; recent stages: {}; recent lines: {}",
+            observed_stages.join(" | "),
+            recent_lines.join(" | ")
+        )
+    }
 }
 
 impl From<VmSessionCommand> for SessionCommand {

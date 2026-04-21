@@ -50,6 +50,7 @@ const PAGE_PRESENT: u64 = 1 << 0;
 const PAGE_HUGE: u64 = 1 << 7;
 const PAGE_NO_EXECUTE: u64 = 1 << 63;
 pub(crate) const KERNEL_STACK_BYTES: usize = 4 * 1024 * 1024;
+const WATCHDOG_SELF_TEST_ENABLED: bool = option_env!("HELIOS_WATCHDOG_SELF_TEST").is_some();
 
 global_asm!(include_str!("secondary_wakeup.S"));
 
@@ -104,7 +105,7 @@ fn x86_kernel_main(boot_info: &'static mut BootInfo) -> ! {
         debug_state.clone(),
     );
     smp::activate_runtime(boot.bootstrap_runtime());
-    let mirror_to_uart = false;
+    let mirror_to_uart = WATCHDOG_SELF_TEST_ENABLED;
     let console = serial_console(debug_state.clone(), mirror_to_uart);
     let cpu = X86Cpu::new(boot.platform());
     let kernel = helios_kernel::init_with_watchdog(Platform::with_watchdog(
@@ -419,7 +420,7 @@ extern "C" fn secondary_start_rust(
     smp::activate_runtime(runtime);
 
     let debug_state = boot.platform().debug_state();
-    let console = serial_console(debug_state.clone(), false);
+    let console = serial_console(debug_state.clone(), WATCHDOG_SELF_TEST_ENABLED);
     let cpu = X86Cpu::new(boot.platform());
     let kernel = helios_kernel::init_with_watchdog(Platform::with_watchdog(
         console,

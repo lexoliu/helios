@@ -4,6 +4,8 @@
 extern crate alloc;
 mod host_fs;
 mod net;
+mod pci;
+mod watchdog;
 
 mod debug_state {
     pub(crate) type RuntimeState =
@@ -116,6 +118,7 @@ static BOOT_HART_ID: AtomicUsize = AtomicUsize::new(UNINITIALIZED_BOOT_HART);
 static CRITICAL_SECTION_OWNER: AtomicUsize = AtomicUsize::new(0);
 static CRITICAL_SECTION_DEPTH: AtomicUsize = AtomicUsize::new(0);
 static DEBUG_STATE: Once<debug_state::RuntimeState> = Once::new();
+static WATCHDOG_STATE: Once<watchdog::RiscvWatchdog> = Once::new();
 
 use core::ptr::NonNull;
 
@@ -511,6 +514,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
 
     let debug_state = shared_debug_state(timebase_frequency, hart_count);
     let debug_transport = DebugTransport::discover(&fdt);
+    let watchdog = shared_watchdog(&fdt);
     let console = sbi_console(
         debug_state.clone(),
         !helios_kernel::has_embedded_system_component(),
@@ -523,10 +527,11 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         fdt_addr,
     );
 
-    let kernel = helios_kernel::init(helios_kernel::Platform::new(
+    let kernel = helios_kernel::init_with_watchdog(helios_kernel::Platform::with_watchdog(
         console,
         memory_regions.into_iter(),
         cpu.clone(),
+        watchdog,
     ));
     let external_interrupts = if current_hart == bootstrap_processor {
         let mut interrupts = net::install_network_service(&cpu, &kernel, &fdt, &debug_state);
@@ -594,6 +599,10 @@ fn shared_debug_state(timebase_frequency: u64, hart_count: usize) -> debug_state
             )
         })
         .clone()
+}
+
+fn shared_watchdog(fdt: &Fdt<'_>) -> watchdog::RiscvWatchdog {
+    WATCHDOG_STATE.call_once(|| watchdog::discover(fdt)).clone()
 }
 
 unsafe extern "C" {

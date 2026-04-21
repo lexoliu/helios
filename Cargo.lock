@@ -1424,6 +1424,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glob"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
+
+[[package]]
 name = "gpt"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1546,6 +1552,7 @@ dependencies = [
  "async-trait",
  "brush-parser",
  "futures",
+ "glob",
  "helios-api",
  "thiserror 2.0.18",
  "tracing",
@@ -1585,6 +1592,15 @@ dependencies = [
  "tokio-util",
  "tracing",
  "wasm-encoder 0.245.1",
+]
+
+[[package]]
+name = "i6300esb"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+ "helios-hal",
+ "pci_types",
 ]
 
 [[package]]
@@ -1694,9 +1710,11 @@ dependencies = [
  "fdt",
  "futures",
  "helios-hal",
+ "i6300esb",
  "helios-kernel",
  "helios-virtio",
  "ns16550a",
+ "pci_types",
  "plic",
  "riscv",
  "riscv-rt",
@@ -1729,7 +1747,9 @@ dependencies = [
  "bootloader_api",
  "critical-section",
  "helios-hal",
+ "i6300esb",
  "helios-kernel",
+ "pci_types",
  "x86",
  "x86_64",
 ]

@@ -146,6 +146,8 @@ const BOOT_UNINITIALIZED: u8 = 0;
 const BOOT_INITIALIZING: u8 = 1;
 const BOOT_READY: u8 = 2;
 const WATCHDOG_CHECK_DIVISOR: u32 = 4;
+#[cfg(helios_watchdog_self_test)]
+const WATCHDOG_SELF_TEST_DELAY_MILLIS_ENV: &str = env!("HELIOS_WATCHDOG_SELF_TEST_DELAY_MS");
 
 #[cfg_attr(target_os = "none", global_allocator)]
 static ALLOCATOR: LockedHeap<HEAP_ORDER> = LockedHeap::empty();
@@ -288,8 +290,8 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
         let timer = self.timer();
         let watchdog = self.watchdog.clone();
         let progress = watchdog.progress();
+        watchdog.arm();
         self.spawner().spawn_local_detached_silent(async move {
-            watchdog.arm();
             let mut last_progress = progress.snapshot();
             loop {
                 timer.sleep_for(interval).await;
@@ -302,6 +304,44 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
             }
         });
     }
+
+    #[cfg(helios_watchdog_self_test)]
+    fn spawn_watchdog_self_test(&self) {
+        if !self.watchdog.is_enabled() {
+            return;
+        }
+
+        let timer = self.timer();
+        let processor = self.cpu.current_processor().id();
+        let delay = watchdog_self_test_delay();
+        self.spawner().spawn_local_detached_silent(async move {
+            timer.sleep_for(delay).await;
+            tracing::error!(
+                processor,
+                delay_ms = delay.as_millis() as u64,
+                "watchdog self-test hanging processor"
+            );
+            loop {
+                core::hint::spin_loop();
+            }
+        });
+    }
+}
+
+#[cfg(helios_watchdog_self_test)]
+fn watchdog_self_test_delay() -> Duration {
+    let millis = WATCHDOG_SELF_TEST_DELAY_MILLIS_ENV
+        .parse::<u64>()
+        .unwrap_or_else(|error| {
+            panic!(
+                "invalid HELIOS_WATCHDOG_SELF_TEST_DELAY_MS={WATCHDOG_SELF_TEST_DELAY_MILLIS_ENV:?}: {error}"
+            )
+        });
+    assert!(
+        millis != 0,
+        "HELIOS_WATCHDOG_SELF_TEST_DELAY_MS must be non-zero"
+    );
+    Duration::from_millis(millis)
 }
 
 struct LocalFutureParker<CpuImpl: Cpu + Clone> {
@@ -393,6 +433,11 @@ where
         executor: Executor::new(progress),
         watchdog,
     };
+    #[cfg(helios_watchdog_self_test)]
+    assert!(
+        kernel.watchdog.is_enabled(),
+        "watchdog self-test requires an enabled hardware watchdog"
+    );
 
     let processor_id = current_processor.id();
     kernel.spawn_detached(async move {
@@ -401,6 +446,8 @@ where
     if current_processor == kernel.cpu.bootstrap_processor() {
         kernel.spawn_watchdog_supervisor();
     }
+    #[cfg(helios_watchdog_self_test)]
+    kernel.spawn_watchdog_self_test();
 
     kernel
 }

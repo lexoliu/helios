@@ -11,6 +11,7 @@ use fdt::Fdt;
 use futures::channel::oneshot;
 use helios_hal::cpu::Cpu;
 use helios_hal::io::IoError;
+use helios_hal::watchdog::Watchdog;
 use helios_kernel::{HostFsTransport, Kernel, Notify};
 use plic::Plic;
 
@@ -51,12 +52,15 @@ enum Request {
     },
 }
 
-pub(crate) fn install(
+pub(crate) fn install<WatchdogImpl>(
     cpu: &RiscvCpu,
-    kernel: &Kernel<RiscvCpu>,
+    kernel: &Kernel<RiscvCpu, WatchdogImpl>,
     fdt: &Fdt<'_>,
     debug_state: &crate::debug_state::RuntimeState,
-) -> Option<HostFsProbe> {
+) -> Option<HostFsProbe>
+where
+    WatchdogImpl: Watchdog + Clone,
+{
     let Some((device, source)) = discover_9p_device(fdt) else {
         tracing::warn!("virtio 9p device was not discovered on the platform bus");
         return None;
@@ -127,7 +131,10 @@ impl HostFsTransportService {
                     completion,
                 } => {
                     let mut response = vec![0_u8; response_len];
-                    tracing::info!("9p transport: issuing device request ({} bytes)", bytes.len());
+                    tracing::info!(
+                        "9p transport: issuing device request ({} bytes)",
+                        bytes.len()
+                    );
                     let result = self
                         .inner
                         .device
@@ -138,7 +145,10 @@ impl HostFsTransportService {
                             response.truncate(used);
                             Ok(response)
                         });
-                    tracing::info!("9p transport: device request completed, result={}", result.is_ok());
+                    tracing::info!(
+                        "9p transport: device request completed, result={}",
+                        result.is_ok()
+                    );
                     let _ = completion.send(result);
                 }
             }

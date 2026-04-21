@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,11 +10,15 @@ use wasmparser::Parser;
 use wit_component::ComponentEncoder;
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(helios_watchdog_self_test)");
     println!("cargo:rerun-if-env-changed=HELIOS_BUILD_TARGET");
     println!("cargo:rerun-if-env-changed=HELIOS_INIT_WASM");
     println!("cargo:rerun-if-env-changed=HELIOS_INIT_MANIFEST");
     println!("cargo:rerun-if-env-changed=HELIOS_INIT_ARGV0");
     println!("cargo:rerun-if-env-changed=HELIOS_BOOTFS_ROOT");
+    println!("cargo:rerun-if-env-changed=HELIOS_BOOT_PROGRAMS");
+    println!("cargo:rerun-if-env-changed=HELIOS_WATCHDOG_SELF_TEST");
+    println!("cargo:rerun-if-env-changed=HELIOS_WATCHDOG_SELF_TEST_DELAY_MS");
     rerun_if_changed_recursive(Path::new("../programs"));
     rerun_if_changed_recursive(Path::new("../api"));
     rerun_if_changed_recursive(Path::new("../api-macro"));
@@ -24,6 +29,12 @@ fn main() {
         .or_else(|_| env::var("TARGET"))
         .unwrap_or_else(|error| panic!("failed to determine Helios build target triple: {error}"));
     println!("cargo:rustc-env=HELIOS_BUILD_TARGET={target}");
+    if env::var_os("HELIOS_WATCHDOG_SELF_TEST").is_some() {
+        println!("cargo:rustc-cfg=helios_watchdog_self_test");
+        let delay_ms =
+            env::var("HELIOS_WATCHDOG_SELF_TEST_DELAY_MS").unwrap_or_else(|_| "5000".to_owned());
+        println!("cargo:rustc-env=HELIOS_WATCHDOG_SELF_TEST_DELAY_MS={delay_ms}");
+    }
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is missing"));
     let init_destination = out_dir.join("embedded_init.rs");
@@ -71,6 +82,8 @@ struct ProgramManifest {
 
 fn build_boot_program_assets(out_dir: &Path) -> Vec<EmbeddedBootAsset> {
     let programs_root = Path::new("../programs");
+    let selected_programs = selected_boot_programs();
+    let mut available_programs = BTreeSet::new();
     let mut manifests = fs::read_dir(programs_root)
         .unwrap_or_else(|error| {
             panic!(
@@ -94,15 +107,49 @@ fn build_boot_program_assets(out_dir: &Path) -> Vec<EmbeddedBootAsset> {
             if command == "init" {
                 return None;
             }
+            available_programs.insert(command.to_owned());
+            if selected_programs
+                .as_ref()
+                .is_some_and(|selected| !selected.contains(command))
+            {
+                return None;
+            }
             Some(read_program_manifest(command, &path.join("Cargo.toml")))
         })
         .collect::<Vec<_>>();
+    if let Some(selected_programs) = &selected_programs {
+        let missing_programs = selected_programs
+            .iter()
+            .filter(|command| !available_programs.contains(*command))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            missing_programs.is_empty(),
+            "HELIOS_BOOT_PROGRAMS referenced unknown program(s): {}",
+            missing_programs.join(", ")
+        );
+    }
     manifests.sort_by(|left, right| left.command.cmp(&right.command));
 
     manifests
         .into_iter()
         .map(|manifest| build_boot_program_asset(out_dir, manifest))
         .collect()
+}
+
+fn selected_boot_programs() -> Option<BTreeSet<String>> {
+    let raw = env::var("HELIOS_BOOT_PROGRAMS").ok()?;
+    let selected = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    assert!(
+        !selected.is_empty(),
+        "HELIOS_BOOT_PROGRAMS must name at least one boot program"
+    );
+    Some(selected)
 }
 
 fn build_boot_program_asset(out_dir: &Path, manifest: ProgramManifest) -> EmbeddedBootAsset {

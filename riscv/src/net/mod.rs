@@ -19,6 +19,7 @@ use fdt::Fdt;
 use fdt::node::FdtNode;
 use helios_hal::cpu::Cpu;
 use helios_hal::io::IoError;
+use helios_hal::watchdog::Watchdog;
 use helios_kernel::{
     Ipv4Address as KernelIpv4Address, Kernel, Notify, PingError as KernelPingError,
     PingErrorKind as KernelPingErrorKind, PingReply as KernelPingReply, TcpError as KernelTcpError,
@@ -244,12 +245,15 @@ fn map_ipv4_address(address: Ipv4Address) -> KernelIpv4Address {
     KernelIpv4Address::new(address.octets())
 }
 
-pub(crate) fn install_network_service(
+pub(crate) fn install_network_service<WatchdogImpl>(
     cpu: &RiscvCpu,
-    kernel: &Kernel<RiscvCpu>,
+    kernel: &Kernel<RiscvCpu, WatchdogImpl>,
     fdt: &Fdt<'_>,
     debug_state: &RuntimeState,
-) -> Option<ExternalInterrupts> {
+) -> Option<ExternalInterrupts>
+where
+    WatchdogImpl: Watchdog + Clone,
+{
     let probe = NetworkProbe::discover(fdt, cpu.bootstrap_processor().id())?;
     let service = NetworkService::new(
         cpu.clone(),

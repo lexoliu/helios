@@ -18,10 +18,11 @@ use x86::apic::{ApicControl, ApicId};
 use x86::msr::{IA32_FS_BASE, rdmsr, wrmsr};
 use x86_64::PhysAddr;
 use x86_64::VirtAddr;
+use x86_64::instructions::tlb;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageSize, PageTable, PageTableFlags, PhysFrame,
-    Size4KiB,
+    Size2MiB, Size4KiB,
 };
 
 use crate::KERNEL_STACK_BYTES;
@@ -34,6 +35,7 @@ const WAKEUP_PAGE_BYTES: usize = 4096;
 const SIPI_MAX_PHYSICAL_ADDRESS: usize = 0x10_0000;
 const AP_STARTUP_INIT_ASSERT_MICROS: u64 = 10_000;
 const AP_STARTUP_INTER_IPI_MICROS: u64 = 200;
+const PAGE_BYTES: usize = 4096;
 
 #[repr(C)]
 pub(crate) struct ProcessorRuntime {
@@ -113,6 +115,7 @@ pub(crate) fn build_boot_context(
         .unwrap_or_else(|| panic!("bootloader did not provide an RSDP address"));
     let tables = unsafe { AcpiTables::from_rsdp(handler.clone(), rsdp as usize) }
         .unwrap_or_else(|error| panic!("failed to parse ACPI tables: {error:?}"));
+    let watchdog = crate::watchdog::discover(&tables, physical_memory_offset);
     let platform = AcpiPlatform::new(tables, handler.clone())
         .unwrap_or_else(|error| panic!("failed to construct ACPI platform info: {error:?}"));
     let processor_info = platform
@@ -162,7 +165,6 @@ pub(crate) fn build_boot_context(
             .checked_add(physical_memory_offset)
             .unwrap_or_else(|| panic!("x86 wakeup page virtual address overflow")),
     };
-    let watchdog = X86Watchdog::discover(physical_memory_offset);
     let platform = Arc::new(X86PlatformState {
         tsc_base,
         tsc_hz,
@@ -631,6 +633,201 @@ fn identity_map_wakeup_page(physical_memory_offset: usize, wakeup_physical: usiz
     }
 }
 
+pub(crate) fn map_mmio_window(
+    physical_memory_offset: usize,
+    physical_start: usize,
+    bytes: usize,
+) -> usize {
+    let virtual_start = physical_memory_offset
+        .checked_add(physical_start)
+        .unwrap_or_else(|| panic!("x86 MMIO virtual address overflow at {physical_start:#x}"));
+    let page_offset = virtual_start & (PAGE_BYTES - 1);
+    let map_start = align_down(virtual_start, PAGE_BYTES);
+    let map_bytes = align_up(
+        page_offset
+            .checked_add(bytes)
+            .unwrap_or_else(|| panic!("x86 MMIO mapping size overflow")),
+        PAGE_BYTES,
+    );
+    let mut frame_allocator = DirectMappedFrameAllocator {
+        physical_memory_offset,
+    };
+
+    for virtual_address in (map_start..map_start + map_bytes).step_by(PAGE_BYTES) {
+        let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(virtual_address as u64))
+            .unwrap_or_else(|error| panic!("invalid x86 MMIO virtual page: {error:?}"));
+        let entry =
+            ensure_direct_mapped_leaf_entry(physical_memory_offset, page, &mut frame_allocator);
+        entry.set_flags(entry.flags() | PageTableFlags::NO_CACHE | PageTableFlags::WRITE_THROUGH);
+        tlb::flush(VirtAddr::new(virtual_address as u64));
+    }
+
+    virtual_start
+}
+
+fn ensure_direct_mapped_leaf_entry(
+    physical_memory_offset: usize,
+    page: Page<Size4KiB>,
+    frame_allocator: &mut DirectMappedFrameAllocator,
+) -> &mut x86_64::structures::paging::page_table::PageTableEntry {
+    let p4 = current_level_4_table(physical_memory_offset);
+    let p3 = next_table_mut(
+        physical_memory_offset,
+        &mut p4[page.p4_index()],
+        "x86 MMIO direct-map P4 entry",
+    );
+    let p2 = next_or_split_p3_table(
+        physical_memory_offset,
+        &mut p3[page.p3_index()],
+        frame_allocator,
+    );
+    let p1 = next_or_split_p2_table(
+        physical_memory_offset,
+        &mut p2[page.p2_index()],
+        frame_allocator,
+    );
+    let entry = &mut p1[page.p1_index()];
+    assert!(
+        !entry.is_unused(),
+        "x86 MMIO direct-map leaf entry was unexpectedly unmapped"
+    );
+    entry
+}
+
+fn current_level_4_table(physical_memory_offset: usize) -> &'static mut PageTable {
+    let (level_4, _) = Cr3::read();
+    let virtual_address = level_4
+        .start_address()
+        .as_u64()
+        .checked_add(physical_memory_offset as u64)
+        .unwrap_or_else(|| panic!("x86 level-4 page table virtual address overflow"));
+    unsafe { &mut *(virtual_address as *mut PageTable) }
+}
+
+fn next_table_mut<'a>(
+    physical_memory_offset: usize,
+    entry: &'a mut x86_64::structures::paging::page_table::PageTableEntry,
+    context: &str,
+) -> &'a mut PageTable {
+    assert!(!entry.is_unused(), "{context} was unexpectedly unmapped");
+    assert!(
+        !entry.flags().contains(PageTableFlags::HUGE_PAGE),
+        "{context} unexpectedly mapped a huge page"
+    );
+    let virtual_address = entry
+        .addr()
+        .as_u64()
+        .checked_add(physical_memory_offset as u64)
+        .unwrap_or_else(|| panic!("{context} virtual address overflow"));
+    unsafe { &mut *(virtual_address as *mut PageTable) }
+}
+
+fn next_or_split_p3_table<'a>(
+    physical_memory_offset: usize,
+    entry: &'a mut x86_64::structures::paging::page_table::PageTableEntry,
+    frame_allocator: &mut DirectMappedFrameAllocator,
+) -> &'a mut PageTable {
+    if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+        return split_p3_huge_page(physical_memory_offset, entry, frame_allocator);
+    }
+    next_table_mut(
+        physical_memory_offset,
+        entry,
+        "x86 MMIO direct-map P3 entry",
+    )
+}
+
+fn next_or_split_p2_table<'a>(
+    physical_memory_offset: usize,
+    entry: &'a mut x86_64::structures::paging::page_table::PageTableEntry,
+    frame_allocator: &mut DirectMappedFrameAllocator,
+) -> &'a mut PageTable {
+    if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+        return split_p2_huge_page(physical_memory_offset, entry, frame_allocator);
+    }
+    next_table_mut(
+        physical_memory_offset,
+        entry,
+        "x86 MMIO direct-map P2 entry",
+    )
+}
+
+fn split_p3_huge_page<'a>(
+    physical_memory_offset: usize,
+    entry: &'a mut x86_64::structures::paging::page_table::PageTableEntry,
+    frame_allocator: &mut DirectMappedFrameAllocator,
+) -> &'a mut PageTable {
+    let original_flags = entry.flags();
+    let base = entry.addr().as_u64();
+    let (frame, table) = allocate_page_table(physical_memory_offset, frame_allocator);
+    for (index, child_entry) in table.iter_mut().enumerate() {
+        let address = base
+            .checked_add((index as u64) * Size2MiB::SIZE)
+            .unwrap_or_else(|| panic!("x86 split 1GiB direct-map overflow"));
+        child_entry.set_addr(
+            PhysAddr::new(address),
+            original_flags | PageTableFlags::HUGE_PAGE,
+        );
+    }
+    entry.set_frame(frame, parent_table_flags(original_flags));
+    table
+}
+
+fn split_p2_huge_page<'a>(
+    physical_memory_offset: usize,
+    entry: &'a mut x86_64::structures::paging::page_table::PageTableEntry,
+    frame_allocator: &mut DirectMappedFrameAllocator,
+) -> &'a mut PageTable {
+    let original_flags = entry.flags();
+    let leaf_flags = original_flags & !PageTableFlags::HUGE_PAGE;
+    let base = entry.addr().as_u64();
+    let (frame, table) = allocate_page_table(physical_memory_offset, frame_allocator);
+    for (index, child_entry) in table.iter_mut().enumerate() {
+        let address = base
+            .checked_add((index as u64) * Size4KiB::SIZE)
+            .unwrap_or_else(|| panic!("x86 split 2MiB direct-map overflow"));
+        let frame = PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(address))
+            .unwrap_or_else(|error| panic!("invalid x86 split 2MiB frame address: {error:?}"));
+        child_entry.set_frame(frame, leaf_flags);
+    }
+    entry.set_frame(frame, parent_table_flags(original_flags));
+    table
+}
+
+fn allocate_page_table(
+    physical_memory_offset: usize,
+    frame_allocator: &mut DirectMappedFrameAllocator,
+) -> (PhysFrame<Size4KiB>, &'static mut PageTable) {
+    let frame = frame_allocator
+        .allocate_frame()
+        .unwrap_or_else(|| panic!("failed to allocate x86 page-table frame for MMIO split"));
+    let virtual_address = frame
+        .start_address()
+        .as_u64()
+        .checked_add(physical_memory_offset as u64)
+        .unwrap_or_else(|| panic!("x86 page-table frame virtual address overflow"));
+    let table = unsafe { &mut *(virtual_address as *mut PageTable) };
+    table.zero();
+    (frame, table)
+}
+
+fn parent_table_flags(flags: PageTableFlags) -> PageTableFlags {
+    let mut parent = PageTableFlags::PRESENT;
+    if flags.contains(PageTableFlags::WRITABLE) {
+        parent |= PageTableFlags::WRITABLE;
+    }
+    if flags.contains(PageTableFlags::USER_ACCESSIBLE) {
+        parent |= PageTableFlags::USER_ACCESSIBLE;
+    }
+    if flags.contains(PageTableFlags::WRITE_THROUGH) {
+        parent |= PageTableFlags::WRITE_THROUGH;
+    }
+    if flags.contains(PageTableFlags::NO_CACHE) {
+        parent |= PageTableFlags::NO_CACHE;
+    }
+    parent
+}
+
 unsafe fn current_mapper(physical_memory_offset: usize) -> OffsetPageTable<'static> {
     let (level_4, _) = Cr3::read();
     let virtual_address = level_4
@@ -680,6 +877,11 @@ fn allocate_aligned_zeroed(size: usize, align: usize) -> usize {
 }
 
 use helios_hal::align_up;
+
+fn align_down(value: usize, align: usize) -> usize {
+    assert!(align.is_power_of_two(), "alignment must be a power of two");
+    value & !(align - 1)
+}
 
 fn wakeup_image() -> &'static [u8] {
     unsafe {

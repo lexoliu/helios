@@ -1,10 +1,8 @@
-use pci_types::{ConfigRegionAccess, EndpointHeader, PciAddress, PciHeader};
+use pci_types::{ConfigRegionAccess, PciAddress};
 use x86_64::instructions::port::{PortReadOnly, PortWriteOnly};
 
 const PCI_CONFIG_ADDRESS_PORT: u16 = 0x0cf8;
 const PCI_CONFIG_DATA_PORT: u16 = 0x0cfc;
-const PCI_MAX_DEVICE: u8 = 32;
-const PCI_MAX_FUNCTION: u8 = 8;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct LegacyPciConfigAccess;
@@ -42,45 +40,6 @@ impl LegacyPciConfigAccess {
         data &= !(0xffff_u32 << shift);
         data |= u32::from(value) << shift;
         unsafe { self.write(address, aligned_offset, data) };
-    }
-
-    pub(crate) fn find_endpoint(&self, vendor_id: u16, device_id: u16) -> Option<EndpointHeader> {
-        for bus in 0..=u8::MAX {
-            for device in 0..PCI_MAX_DEVICE {
-                let slot = PciAddress::new(0, bus, device, 0);
-                let header = PciHeader::new(slot);
-                let (vendor, _) = header.id(self);
-                if vendor == u16::MAX {
-                    continue;
-                }
-
-                let function_count = if header.has_multiple_functions(self) {
-                    PCI_MAX_FUNCTION
-                } else {
-                    1
-                };
-                for function in 0..function_count {
-                    let address = PciAddress::new(0, bus, device, function);
-                    let header = PciHeader::new(address);
-                    let (vendor, device) = header.id(self);
-                    if vendor == u16::MAX {
-                        continue;
-                    }
-                    if vendor != vendor_id || device != device_id {
-                        continue;
-                    }
-                    return Some(
-                        EndpointHeader::from_header(header, self).unwrap_or_else(|| {
-                            panic!(
-                                "PCI function {address} matched watchdog id but was not an endpoint"
-                            )
-                        }),
-                    );
-                }
-            }
-        }
-
-        None
     }
 
     fn config_address(address: PciAddress, offset: u16) -> u32 {

@@ -1,191 +1,159 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
-use core::num::NonZeroU16;
-use core::time::Duration;
 
-use helios_hal::watchdog::{ProgressCounter, Watchdog};
-use pci_types::{CommandRegister, ConfigRegionAccess, PciHeader};
+use acpi::platform::PciConfigRegions;
+use acpi::{AcpiTables, Handler};
+use pci_types::{ConfigRegionAccess, PciAddress};
 
-use crate::pci::LegacyPciConfigAccess;
+pub(crate) type X86Watchdog = i6300esb::I6300EsbWatchdog<EnhancedPciConfigAccess>;
 
-const INTEL_VENDOR_ID: u16 = 0x8086;
-const I6300ESB_DEVICE_ID: u16 = 0x25ab;
-const DEFAULT_WATCHDOG_TIMEOUT_SECONDS: u16 = 30;
-const ESB_CONFIG_REG: u16 = 0x60;
-const ESB_LOCK_REG: u16 = 0x68;
-const ESB_TIMER1_REG: usize = 0x00;
-const ESB_TIMER2_REG: usize = 0x04;
-const ESB_RELOAD_REG: usize = 0x0c;
-const ESB_DISABLE_TIMER1_INTERRUPT: u16 = 0x0003;
-const ESB_WDT_ENABLE: u8 = 0x01 << 1;
-const ESB_WDT_TIMEOUT: u16 = 0x01 << 9;
-const ESB_WDT_RELOAD: u16 = 0x01 << 8;
-const ESB_UNLOCK1: u16 = 0x80;
-const ESB_UNLOCK2: u16 = 0x86;
+const PCI_ECAM_BUS_SHIFT: u64 = 20;
+const PCI_ECAM_DEVICE_SHIFT: u64 = 15;
+const PCI_ECAM_FUNCTION_SHIFT: u64 = 12;
+const PCI_CONFIG_SPACE_BYTES: u16 = 4096;
+const I6300ESB_MMIO_BYTES: usize = 0x10;
 
 #[derive(Clone)]
-pub(crate) struct X86Watchdog {
-    timeout: Duration,
-    progress: ProgressCounter,
-    device: Option<Arc<I6300EsbDevice>>,
+pub(crate) struct EnhancedPciConfigAccess {
+    physical_memory_offset: usize,
+    regions: Arc<[PciConfigRegion]>,
 }
 
-struct I6300EsbDevice {
-    address: pci_types::PciAddress,
-    base_address: usize,
+#[derive(Clone, Copy)]
+struct PciConfigRegion {
+    base_address: u64,
+    segment: u16,
+    bus_start: u8,
+    bus_end: u8,
 }
 
-impl X86Watchdog {
-    pub(crate) fn discover(physical_memory_offset: usize) -> Self {
-        let progress = ProgressCounter::new();
-        let access = LegacyPciConfigAccess::new();
-        let Some(endpoint) = access.find_endpoint(INTEL_VENDOR_ID, I6300ESB_DEVICE_ID) else {
-            return Self {
-                timeout: Duration::ZERO,
-                progress,
-                device: None,
-            };
+pub(crate) fn discover<H>(tables: &AcpiTables<H>, physical_memory_offset: usize) -> X86Watchdog
+where
+    H: Handler,
+{
+    let Ok(regions) = PciConfigRegions::new(tables) else {
+        return i6300esb::disabled();
+    };
+    let regions = regions
+        .regions
+        .into_iter()
+        .map(|entry| PciConfigRegion {
+            base_address: entry.base_address,
+            segment: entry.pci_segment_group,
+            bus_start: entry.bus_number_start,
+            bus_end: entry.bus_number_end,
+        })
+        .collect::<alloc::vec::Vec<_>>();
+    if regions.is_empty() {
+        return i6300esb::disabled();
+    }
+
+    let access = EnhancedPciConfigAccess {
+        physical_memory_offset,
+        regions: Arc::<[PciConfigRegion]>::from(regions),
+    };
+    i6300esb::discover_watchdog(access, 0..=u8::MAX, |physical_base| {
+        crate::smp::map_mmio_window(physical_memory_offset, physical_base, I6300ESB_MMIO_BYTES)
+    })
+}
+
+impl ConfigRegionAccess for EnhancedPciConfigAccess {
+    unsafe fn read(&self, address: PciAddress, offset: u16) -> u32 {
+        let Some(config_address) = self.config_address(address, offset) else {
+            return u32::MAX;
         };
+        unsafe { (config_address as *const u32).read_volatile() }
+    }
 
-        let timeout_seconds = NonZeroU16::new(DEFAULT_WATCHDOG_TIMEOUT_SECONDS)
-            .unwrap_or_else(|| panic!("x86 watchdog timeout must be non-zero"));
-        let address = endpoint.header().address();
-        let bar0 = unsafe { access.read(address, 0x10) };
+    unsafe fn write(&self, address: PciAddress, offset: u16, value: u32) {
+        let config_address = self
+            .config_address(address, offset)
+            .unwrap_or_else(|| panic!("PCI ECAM region was missing for {address}"));
+        unsafe { (config_address as *mut u32).write_volatile(value) };
+    }
+}
+
+impl i6300esb::PciConfigIo for EnhancedPciConfigAccess {
+    fn read_u8(&self, address: PciAddress, offset: u16) -> u8 {
+        let config_address = self
+            .byte_address(address, offset)
+            .unwrap_or_else(|| panic!("PCI ECAM region was missing for {address}"));
+        unsafe { (config_address as *const u8).read_volatile() }
+    }
+
+    fn read_u16(&self, address: PciAddress, offset: u16) -> u16 {
         assert!(
-            bar0 & 0x1 == 0,
-            "i6300esb BAR0 unexpectedly used I/O space at {address}"
+            offset & 0b1 == 0,
+            "PCI ECAM u16 access requires aligned offsets, got {offset:#x}"
         );
-        let physical_base = (bar0 as usize) & !0x0f;
-        assert!(
-            physical_base != 0,
-            "i6300esb BAR0 was not assigned a memory base address"
-        );
-        let base_address = physical_memory_offset
-            .checked_add(physical_base)
-            .unwrap_or_else(|| panic!("i6300esb BAR0 virtual address overflow"));
-        let device = Arc::new(I6300EsbDevice {
-            address,
-            base_address,
-        });
-        device.initialize(timeout_seconds);
+        let config_address = self
+            .byte_address(address, offset)
+            .unwrap_or_else(|| panic!("PCI ECAM region was missing for {address}"));
+        unsafe { (config_address as *const u16).read_volatile() }
+    }
 
-        Self {
-            timeout: Duration::from_secs(u64::from(timeout_seconds.get())),
-            progress,
-            device: Some(device),
-        }
+    fn write_u8(&self, address: PciAddress, offset: u16, value: u8) {
+        let config_address = self
+            .byte_address(address, offset)
+            .unwrap_or_else(|| panic!("PCI ECAM region was missing for {address}"));
+        unsafe { (config_address as *mut u8).write_volatile(value) };
+    }
+
+    fn write_u16(&self, address: PciAddress, offset: u16, value: u16) {
+        assert!(
+            offset & 0b1 == 0,
+            "PCI ECAM u16 access requires aligned offsets, got {offset:#x}"
+        );
+        let config_address = self
+            .byte_address(address, offset)
+            .unwrap_or_else(|| panic!("PCI ECAM region was missing for {address}"));
+        unsafe { (config_address as *mut u16).write_volatile(value) };
     }
 }
 
-impl Watchdog for X86Watchdog {
-    fn progress(&self) -> ProgressCounter {
-        self.progress.clone()
-    }
-
-    fn is_enabled(&self) -> bool {
-        self.device.is_some()
-    }
-
-    fn timeout(&self) -> Duration {
-        self.timeout
-    }
-
-    fn arm(&self) {
-        let Some(device) = &self.device else {
-            return;
-        };
-        device.arm(self.timeout);
-    }
-
-    fn pet(&self) {
-        let Some(device) = &self.device else {
-            return;
-        };
-        device.pet();
-    }
-
-    fn disarm(&self) {
-        let Some(device) = &self.device else {
-            return;
-        };
-        device.disarm();
-    }
-}
-
-impl I6300EsbDevice {
-    fn initialize(&self, timeout: NonZeroU16) {
-        let access = LegacyPciConfigAccess::new();
-        let mut header = PciHeader::new(self.address);
-        header.update_command(access, |command| command | CommandRegister::MEMORY_ENABLE);
-        access.write_u16(self.address, ESB_CONFIG_REG, ESB_DISABLE_TIMER1_INTERRUPT);
-        self.disarm();
-        self.clear_timeout_latched();
-        self.program_timeout(timeout);
-    }
-
-    fn arm(&self, timeout: Duration) {
-        let timeout_seconds = timeout
-            .as_secs()
-            .try_into()
-            .ok()
-            .and_then(NonZeroU16::new)
-            .unwrap_or_else(|| panic!("watchdog timeout {timeout:?} does not fit in i6300esb"));
-        self.program_timeout(timeout_seconds);
-        self.pet();
-        LegacyPciConfigAccess::new().write_u8(self.address, ESB_LOCK_REG, ESB_WDT_ENABLE);
-    }
-
-    fn pet(&self) {
-        critical_section::with(|_| {
-            self.unlock_registers();
-            self.write_reload(ESB_WDT_RELOAD);
-        });
-    }
-
-    fn disarm(&self) {
-        critical_section::with(|_| {
-            self.unlock_registers();
-            self.write_reload(ESB_WDT_RELOAD);
-            LegacyPciConfigAccess::new().write_u8(self.address, ESB_LOCK_REG, 0);
-        });
-    }
-
-    fn program_timeout(&self, timeout: NonZeroU16) {
-        let seconds = u32::from(timeout.get());
+impl EnhancedPciConfigAccess {
+    fn config_address(&self, address: PciAddress, offset: u16) -> Option<usize> {
         assert!(
-            seconds <= 2 * 0x03ff,
-            "i6300esb timeout must be in 1..=2046 seconds, got {seconds}"
+            offset & 0b11 == 0,
+            "PCI ECAM access requires aligned offsets, got {offset:#x}"
         );
-        let reload_ticks = seconds << 9;
-        critical_section::with(|_| {
-            self.unlock_registers();
-            self.write_timer(ESB_TIMER1_REG, reload_ticks);
-            self.unlock_registers();
-            self.write_timer(ESB_TIMER2_REG, reload_ticks);
-            self.unlock_registers();
-            self.write_reload(ESB_WDT_RELOAD);
-        });
+        assert!(
+            offset < PCI_CONFIG_SPACE_BYTES,
+            "PCI ECAM offset {offset:#x} exceeds config space"
+        );
+
+        let region = self.regions.iter().find(|region| {
+            region.segment == address.segment()
+                && (region.bus_start..=region.bus_end).contains(&address.bus())
+        })?;
+        let bus_index = u64::from(address.bus() - region.bus_start);
+        let physical_address = region.base_address
+            + (bus_index << PCI_ECAM_BUS_SHIFT)
+            + (u64::from(address.device()) << PCI_ECAM_DEVICE_SHIFT)
+            + (u64::from(address.function()) << PCI_ECAM_FUNCTION_SHIFT)
+            + u64::from(offset);
+        let physical_address = usize::try_from(physical_address).ok()?;
+        self.physical_memory_offset.checked_add(physical_address)
     }
 
-    fn clear_timeout_latched(&self) {
-        critical_section::with(|_| {
-            self.unlock_registers();
-            self.write_reload(ESB_WDT_TIMEOUT | ESB_WDT_RELOAD);
-        });
-    }
+    fn byte_address(&self, address: PciAddress, offset: u16) -> Option<usize> {
+        assert!(
+            offset < PCI_CONFIG_SPACE_BYTES,
+            "PCI ECAM offset {offset:#x} exceeds config space"
+        );
 
-    fn unlock_registers(&self) {
-        self.write_reload(ESB_UNLOCK1);
-        self.write_reload(ESB_UNLOCK2);
-    }
-
-    fn write_timer(&self, offset: usize, value: u32) {
-        unsafe { ((self.base_address + offset) as *mut u32).write_volatile(value) }
-    }
-
-    fn write_reload(&self, value: u16) {
-        let address = (self.base_address + ESB_RELOAD_REG) as *mut u16;
-        unsafe { address.write_volatile(value) }
+        let region = self.regions.iter().find(|region| {
+            region.segment == address.segment()
+                && (region.bus_start..=region.bus_end).contains(&address.bus())
+        })?;
+        let bus_index = u64::from(address.bus() - region.bus_start);
+        let physical_address = region.base_address
+            + (bus_index << PCI_ECAM_BUS_SHIFT)
+            + (u64::from(address.device()) << PCI_ECAM_DEVICE_SHIFT)
+            + (u64::from(address.function()) << PCI_ECAM_FUNCTION_SHIFT)
+            + u64::from(offset);
+        let physical_address = usize::try_from(physical_address).ok()?;
+        self.physical_memory_offset.checked_add(physical_address)
     }
 }
