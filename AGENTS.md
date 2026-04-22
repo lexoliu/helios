@@ -111,9 +111,13 @@ paths, components).
 
 ## 6. WASI tooling
 
-- `tools/wasi-apps/python` and `tools/wasi-apps/curl` are the source of truth
-  for shared-fs WASI tooling. `tools/wasi-apps/build.sh` owns their build
-  outputs under `artifacts/wasi-tools/`.
+- `tools/wasi-apps/build.sh` is the single entry point that stages WASI
+  shared-fs tooling. It downloads the official CPython WASI build and
+  places it under `artifacts/python3-root/` (python3.wasm + stdlib),
+  and builds our Rust `curl-wasi` under `artifacts/wasi-tools/`.
+- Do not reintroduce a hand-rolled Python interpreter (the old
+  `tools/wasi-apps/python` stub). helios tests against real CPython or
+  nothing.
 - `docs/wasi-tools.md` documents the reproducible workflow. If runtime
   behaviour changes, update docs and paths atomically in the same change.
 

@@ -65,6 +65,7 @@ pub use component_host::{
 pub use component_resources::{
     ComponentRawMutex, ComponentRawMutexGuard, ComponentRawRwLock, ComponentRawRwLockReadGuard,
     ComponentRawRwLockWriteGuard, ComponentSerialPort, ComponentTcpBackend, ComponentTcpStream,
+    ComponentUdpBackend, ComponentUdpSocket,
 };
 pub use component_runtime::{
     ComponentOutputMode, ComponentOutputStreamKind, ComponentRuntimeState, ComponentStoreData,
@@ -76,7 +77,7 @@ pub use component_runtime_backend::{
 };
 pub use component_types::{
     RawMutexGuardResource, RawMutexResource, RawRwLockReadGuardResource, RawRwLockResource,
-    RawRwLockWriteGuardResource, SerialPortResource, TcpStreamResource,
+    RawRwLockWriteGuardResource, SerialPortResource, TcpStreamResource, UdpSocketResource,
 };
 pub use compute_pool::{ComputePool, ComputePriority, SpawnError as ComputeSpawnError};
 pub use embedded_component::EmbeddedComponent;
@@ -110,7 +111,8 @@ pub use runtime_types::{
     ComponentHostFilesystemState, ComponentNetworkService, ComponentNetworkState,
     DynComponentNetworkService, DynamicNetworkService, ExecOutput, ExecResult, HostDirEntry,
     HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata, Ipv4Address, PingError,
-    PingErrorKind, PingReply, TcpError, TcpErrorKind, TcpStreamToken,
+    PingErrorKind, PingReply, TcpError, TcpErrorKind, TcpStreamToken, UdpBinding, UdpDatagram,
+    UdpError, UdpErrorKind, UdpSocketToken,
 };
 pub use serial_transport::{
     emit_serial_error_marker, emit_serial_stage_marker, read_serial, try_read_serial, write_serial,
@@ -140,6 +142,7 @@ use executor::Executor;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::watchdog::{NoWatchdog, ProgressCounter, Watchdog};
+use helios_hal::{DeviceInventory, DmaModel, ProcessorStartupPolicy, ProcessorTopology};
 
 const HEAP_ORDER: usize = 32;
 const BOOT_UNINITIALIZED: u8 = 0;
@@ -170,6 +173,9 @@ pub struct Kernel<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone = NoWatch
     executor: Executor,
     timer: Timer<CpuImpl>,
     watchdog: WatchdogImpl,
+    topology: ProcessorTopology,
+    dma_model: DmaModel,
+    devices: DeviceInventory,
 }
 
 impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, WatchdogImpl> {
@@ -179,6 +185,18 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
 
     pub fn timer(&self) -> Timer<CpuImpl> {
         self.timer.clone()
+    }
+
+    pub fn topology(&self) -> ProcessorTopology {
+        self.topology
+    }
+
+    pub fn dma_model(&self) -> DmaModel {
+        self.dma_model
+    }
+
+    pub fn devices(&self) -> DeviceInventory {
+        self.devices
     }
 
     pub fn spawn<Fut>(&self, future: Fut) -> JoinHandle<Fut::Output>
@@ -409,13 +427,37 @@ where
         cpu,
         memory_regions,
         watchdog,
+        topology,
+        timer_frequency_hz,
+        dma_model,
+        devices,
     } = platform;
     let current_processor = cpu.current_processor();
+    assert!(
+        cpu.bootstrap_processor() == topology.bootstrap_processor,
+        "platform topology bootstrap processor {} does not match CPU bootstrap processor {}",
+        topology.bootstrap_processor.id(),
+        cpu.bootstrap_processor().id()
+    );
+    assert!(
+        cpu.processor_count() == topology.configured_processors,
+        "platform topology processor count {} does not match CPU processor count {}",
+        topology.configured_processors,
+        cpu.processor_count()
+    );
+    assert!(
+        cpu.timer_frequency() == timer_frequency_hz,
+        "platform timer frequency {} does not match CPU timer frequency {}",
+        timer_frequency_hz,
+        cpu.timer_frequency()
+    );
 
-    if current_processor == cpu.bootstrap_processor() {
+    if current_processor == topology.bootstrap_processor {
         match BOOT_STATE.load(Ordering::Acquire) {
-            BOOT_UNINITIALIZED => bootstrap_init(console, memory_regions, &cpu),
-            BOOT_INITIALIZING => finish_bootstrap(console, &cpu),
+            BOOT_UNINITIALIZED => {
+                bootstrap_init(console, memory_regions, &cpu, topology, dma_model, devices)
+            }
+            BOOT_INITIALIZING => finish_bootstrap(console, &cpu, topology, dma_model, devices),
             state => panic!("bootstrap processor observed invalid boot state {state}"),
         }
     } else {
@@ -432,6 +474,9 @@ where
         cpu,
         executor: Executor::new(progress),
         watchdog,
+        topology,
+        dma_model,
+        devices,
     };
     #[cfg(helios_watchdog_self_test)]
     assert!(
@@ -443,7 +488,7 @@ where
     kernel.spawn_detached(async move {
         tracing::info!("Processor online processor={processor_id}");
     });
-    if current_processor == kernel.cpu.bootstrap_processor() {
+    if current_processor == kernel.topology.bootstrap_processor {
         kernel.spawn_watchdog_supervisor();
     }
     #[cfg(helios_watchdog_self_test)]
@@ -485,33 +530,55 @@ fn bootstrap_init<Console, CpuImpl, Regions>(
     console: Console,
     memory_regions: Regions,
     cpu: &CpuImpl,
+    topology: ProcessorTopology,
+    dma_model: DmaModel,
+    devices: DeviceInventory,
 ) where
     Console: core::fmt::Write + Send + 'static,
     CpuImpl: Cpu,
     Regions: IntoIterator<Item = MemoryRegion>,
 {
     prime_bootstrap_allocator(memory_regions);
-    finish_bootstrap(console, cpu);
+    finish_bootstrap(console, cpu, topology, dma_model, devices);
 }
 
-fn finish_bootstrap<Console, CpuImpl>(console: Console, cpu: &CpuImpl)
-where
+fn finish_bootstrap<Console, CpuImpl>(
+    console: Console,
+    cpu: &CpuImpl,
+    topology: ProcessorTopology,
+    dma_model: DmaModel,
+    devices: DeviceInventory,
+) where
     Console: core::fmt::Write + Send + 'static,
     CpuImpl: Cpu,
 {
     log::init_logger(console);
     tracing::info!(
         "Kernel initialized on bootstrap processor={}",
-        cpu.bootstrap_processor().id()
+        topology.bootstrap_processor.id()
+    );
+    tracing::info!(
+        "Kernel topology processors={} startup_policy={:?}",
+        topology.configured_processors,
+        topology.startup_policy
+    );
+    tracing::info!(
+        "Platform dma_model={dma_model:?} debug_serial={} network={} block_devices={} host_share={}",
+        devices.has_debug_serial,
+        devices.has_network,
+        devices.block_device_count,
+        devices.has_host_share
     );
     tracing::info!("Kernel is ready\n\n{}", include_str!("welcome.txt"));
 
     BOOT_STATE.store(BOOT_READY, Ordering::Release);
 
-    for processor in 0..cpu.processor_count() {
-        let processor = ProcessorId::new(processor as u16);
-        if processor != cpu.bootstrap_processor() {
-            cpu.start_processor(processor);
+    if topology.startup_policy == ProcessorStartupPolicy::StartAllSecondaries {
+        for processor in 0..topology.configured_processors {
+            let processor = ProcessorId::new(processor as u16);
+            if processor != topology.bootstrap_processor {
+                cpu.start_processor(processor);
+            }
         }
     }
 }

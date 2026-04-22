@@ -40,6 +40,24 @@ interface net {
     detail: string,
   }
 
+  enum udp-error-kind {
+    unresolved-host,
+    timeout,
+    unavailable,
+    internal,
+  }
+
+  record udp-error {
+    kind: udp-error-kind,
+    detail: string,
+  }
+
+  record udp-datagram {
+    address: ip-address,
+    port: u16,
+    bytes: list<u8>,
+  }
+
   resource tcp-stream {
     /// Reads up to `max-bytes` octets from the peer.
     ///
@@ -53,9 +71,25 @@ interface net {
     close: async func() -> result<_, tcp-error>;
   }
 
+  resource udp-socket {
+    /// Receives one datagram from the bound local port.
+    ///
+    /// `none` indicates that the socket was closed before a datagram arrived.
+    receive: async func(max-bytes: u32, timeout: mono-nanos) -> result<option<udp-datagram>, udp-error>;
+
+    /// Sends one datagram to `host:port`.
+    send: async func(host: string, port: u16, bytes: list<u8>, timeout: mono-nanos) -> result<u64, udp-error>;
+
+    /// Releases the underlying UDP socket immediately.
+    close: async func() -> result<_, udp-error>;
+  }
+
   /// Resolves `host` and sends one ICMP echo request through the platform network stack.
   ping: async func(host: string, timeout: mono-nanos) -> result<ping-reply, ping-error>;
 
   /// Resolves `host` and opens an outbound TCP stream to `port`.
   tcp-connect: async func(host: string, port: u16, timeout: mono-nanos) -> result<tcp-stream, tcp-error>;
+
+  /// Binds a UDP socket to `local-port`. `0` requests an ephemeral port.
+  udp-bind: async func(local-port: u16) -> result<udp-socket, udp-error>;
 }

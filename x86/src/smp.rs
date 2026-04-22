@@ -56,7 +56,7 @@ pub(crate) struct X86PlatformState {
     debug_state: debug_state::RuntimeState,
     watchdog: X86Watchdog,
     processors: Box<[ProcessorSlot]>,
-    wakeup_page: WakeupPage,
+    wakeup_page: Option<WakeupPage>,
     boot_context: AtomicPtr<BootContext>,
 }
 
@@ -99,7 +99,7 @@ pub(crate) fn reserve_wakeup_page(boot_info: &'static BootInfo) -> Range<usize> 
 pub(crate) fn build_boot_context(
     boot_info: &'static BootInfo,
     physical_memory_offset: usize,
-    wakeup_page: Range<usize>,
+    wakeup_page: Option<Range<usize>>,
     tsc_base: u64,
     tsc_hz: u64,
     debug_state: debug_state::RuntimeState,
@@ -153,17 +153,18 @@ pub(crate) fn build_boot_context(
             stack_top: stack + KERNEL_STACK_BYTES,
         });
     }
-    assert!(
-        processors.len() > 1,
-        "x86 component-host topology requires at least two processors"
-    );
-
-    let wakeup_page = WakeupPage {
-        physical_start: wakeup_page.start,
-        virtual_start: wakeup_page
-            .start
-            .checked_add(physical_memory_offset)
-            .unwrap_or_else(|| panic!("x86 wakeup page virtual address overflow")),
+    let wakeup_page = if processors.len() > 1 {
+        let wakeup_page =
+            wakeup_page.unwrap_or_else(|| panic!("x86 SMP startup requires a wakeup page"));
+        Some(WakeupPage {
+            physical_start: wakeup_page.start,
+            virtual_start: wakeup_page
+                .start
+                .checked_add(physical_memory_offset)
+                .unwrap_or_else(|| panic!("x86 wakeup page virtual address overflow")),
+        })
+    } else {
+        None
     };
     let platform = Arc::new(X86PlatformState {
         tsc_base,
@@ -175,7 +176,9 @@ pub(crate) fn build_boot_context(
         wakeup_page,
         boot_context: AtomicPtr::new(core::ptr::null_mut()),
     });
-    prepare_wakeup_page(&platform);
+    if let Some(wakeup_page) = platform.wakeup_page.as_ref() {
+        prepare_wakeup_page(&platform, wakeup_page);
+    }
     let context = Box::leak(Box::new(BootContext { platform }));
     context
         .platform
@@ -245,6 +248,10 @@ impl X86PlatformState {
 
     pub(crate) fn start_processor(&self, processor: ProcessorId, entry: usize) {
         let slot = self.processor_slot(processor);
+        let wakeup_page = self
+            .wakeup_page
+            .as_ref()
+            .unwrap_or_else(|| panic!("x86 startup state is missing the AP wakeup page"));
         assert!(
             processor != self.bootstrap_processor(),
             "bootstrap processor cannot be started twice"
@@ -256,7 +263,7 @@ impl X86PlatformState {
         );
 
         patch_wakeup_page(
-            self.wakeup_page.virtual_start,
+            wakeup_page.virtual_start,
             current_cr3(),
             slot.stack_top,
             self.boot_context_ptr(),
@@ -267,7 +274,7 @@ impl X86PlatformState {
         unsafe {
             wake_application_processor(
                 slot.apic_id,
-                self.wakeup_page.physical_start,
+                wakeup_page.physical_start,
                 self.physical_memory_offset,
                 self.tsc_hz,
             )
@@ -542,11 +549,8 @@ impl Handler for PhysicalOffsetAcpiHandler {
     }
 }
 
-fn prepare_wakeup_page(platform: &X86PlatformState) {
-    identity_map_wakeup_page(
-        platform.physical_memory_offset,
-        platform.wakeup_page.physical_start,
-    );
+fn prepare_wakeup_page(platform: &X86PlatformState, wakeup_page: &WakeupPage) {
+    identity_map_wakeup_page(platform.physical_memory_offset, wakeup_page.physical_start);
     let bytes = wakeup_image();
     assert!(
         bytes.len() <= WAKEUP_PAGE_BYTES,
@@ -554,14 +558,10 @@ fn prepare_wakeup_page(platform: &X86PlatformState) {
         bytes.len()
     );
     unsafe {
-        core::ptr::write_bytes(
-            platform.wakeup_page.virtual_start as *mut u8,
-            0,
-            WAKEUP_PAGE_BYTES,
-        );
+        core::ptr::write_bytes(wakeup_page.virtual_start as *mut u8, 0, WAKEUP_PAGE_BYTES);
         core::ptr::copy_nonoverlapping(
             bytes.as_ptr(),
-            platform.wakeup_page.virtual_start as *mut u8,
+            wakeup_page.virtual_start as *mut u8,
             bytes.len(),
         );
     }

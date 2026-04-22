@@ -5,7 +5,11 @@ pub fn build_target_engine_config(target: &str) -> Config {
     config
         .target(target)
         .expect("Helios build target must be accepted by Wasmtime");
-    #[cfg(all(target_arch = "x86_64", target_os = "none", not(target_feature = "soft-float")))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_os = "none",
+        not(target_feature = "soft-float")
+    ))]
     unsafe {
         // Helios' custom x86 bare-metal target uses the hardware floating-point
         // ABI, so Wasmtime's x86_64-unknown-none soft-float guard does not
@@ -27,4 +31,3 @@ pub fn build_component_engine_config(target: &str) -> Config {
     config.async_stack_size(8 * 1024 * 1024);
     config
 }
-

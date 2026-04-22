@@ -6,9 +6,9 @@ use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant as StdInstant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
-use helios_hal::Platform;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
+use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology};
 
 use crate::config::HostedConfig;
 use crate::console::HostedConsole;
@@ -239,10 +239,22 @@ fn spawn_processor_thread(
             let console = HostedConsole::new();
             let cpu = HostedCpu::new(processor, machine.clone());
             let memory_regions = machine.bootstrap_memory_regions(processor);
-            let kernel = helios_kernel::init(Platform::new(console, memory_regions, cpu.clone()));
-
+            let mut devices = DeviceInventory::new().with_debug_serial();
+            if config.init_wasi_root().is_some() {
+                devices = devices.with_host_share();
+            }
+            let platform = Platform::new(console, memory_regions, cpu.clone())
+                .with_topology(
+                    ProcessorTopology::start_all_secondaries(
+                        machine.bootstrap_processor(),
+                        machine.processor_count(),
+                    )
+                    .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
+                )
+                .with_dma_model(DmaModel::Translated)
+                .with_devices(devices);
+            let kernel = helios_kernel::init(platform);
             let debug_state = shared_debug_state(&machine);
-
             if processor == machine.bootstrap_processor() {
                 init_serial();
 

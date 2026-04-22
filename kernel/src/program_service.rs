@@ -5,9 +5,9 @@ use alloc::sync::Arc;
 use core::future::poll_fn;
 use core::task::Poll;
 
+use crate::WasiRights;
 use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 use helios_hal::cpu::Cpu;
-use crate::WasiRights;
 use thiserror::Error;
 
 use crate::program::CompileError;

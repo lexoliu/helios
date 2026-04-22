@@ -10,12 +10,18 @@ const DEFAULT_TCP_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_READ_CHUNK_BYTES: usize = 8 * 1024;
 
 pub use crate::bindings::helios::system::net::{
-    IpAddress, Ipv4Address, PingErrorKind, PingReply, TcpErrorKind,
+    IpAddress, Ipv4Address, PingErrorKind, PingReply, TcpErrorKind, UdpDatagram, UdpErrorKind,
 };
 
 /// Outbound TCP client stream backed by the kernel network service.
 pub struct TcpStream {
     raw: raw::TcpStream,
+    timeout: Duration,
+}
+
+/// Bound UDP socket backed by the kernel network service.
+pub struct UdpSocket {
+    raw: raw::UdpSocket,
     timeout: Duration,
 }
 
@@ -98,6 +104,68 @@ impl TcpStream {
     }
 }
 
+impl UdpSocket {
+    /// Binds a UDP socket to `local_port` using the default operation timeout.
+    pub async fn bind(local_port: u16) -> io::Result<Self> {
+        let raw = raw::udp_bind(local_port).await.map_err(map_udp_error)?;
+        Ok(Self {
+            raw,
+            timeout: DEFAULT_TCP_TIMEOUT,
+        })
+    }
+
+    /// Returns a copy of the current default operation timeout.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Replaces the default timeout used by [`receive`](Self::receive) and
+    /// [`send`](Self::send).
+    pub fn set_timeout(&mut self, timeout: Duration) {
+        self.timeout = timeout;
+    }
+
+    /// Receives at most one UDP datagram.
+    ///
+    /// `Ok(None)` indicates that the kernel-side socket was closed.
+    pub async fn receive(&self, max_bytes: usize) -> io::Result<Option<UdpDatagram>> {
+        let max_bytes = u32::try_from(max_bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "udp read size does not fit into u32",
+            )
+        })?;
+        self.raw
+            .receive(max_bytes, duration_to_nanos(self.timeout))
+            .await
+            .map_err(map_udp_error)
+    }
+
+    /// Sends one UDP datagram to `host:port`.
+    pub async fn send(&self, host: &str, port: u16, bytes: &[u8]) -> io::Result<()> {
+        let written = self
+            .raw
+            .send(
+                host.to_owned(),
+                port,
+                bytes.to_vec(),
+                duration_to_nanos(self.timeout),
+            )
+            .await
+            .map_err(map_udp_error)?;
+        assert!(
+            usize::try_from(written).ok() == Some(bytes.len()),
+            "kernel udp socket reported partial datagram write"
+        );
+        Ok(())
+    }
+
+    /// Releases the kernel-side UDP socket immediately.
+    pub async fn close(&self) -> io::Result<()> {
+        self.raw.close().await.map_err(map_udp_error)
+    }
+}
+
 fn duration_to_nanos(duration: Duration) -> u64 {
     duration
         .as_nanos()
@@ -115,6 +183,16 @@ fn map_tcp_error(error: raw::TcpError) -> io::Error {
         TcpErrorKind::UnresolvedHost => io::ErrorKind::NotFound,
         TcpErrorKind::Unavailable => io::ErrorKind::ConnectionAborted,
         TcpErrorKind::Internal => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, format!("{:?}: {}", error.kind, error.detail))
+}
+
+fn map_udp_error(error: raw::UdpError) -> io::Error {
+    let kind = match error.kind {
+        UdpErrorKind::Timeout => io::ErrorKind::TimedOut,
+        UdpErrorKind::UnresolvedHost => io::ErrorKind::NotFound,
+        UdpErrorKind::Unavailable => io::ErrorKind::ConnectionAborted,
+        UdpErrorKind::Internal => io::ErrorKind::Other,
     };
     io::Error::new(kind, format!("{:?}: {}", error.kind, error.detail))
 }

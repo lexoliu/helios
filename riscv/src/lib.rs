@@ -86,6 +86,17 @@ pub(crate) fn matches_virtio_mmio_device(base: usize, expected: DeviceType) -> b
     }
 }
 
+pub(crate) fn count_virtio_mmio_devices(fdt: &Fdt<'_>, expected: DeviceType) -> usize {
+    fdt.all_nodes()
+        .filter(|node| {
+            node.compatible()
+                .is_some_and(|compatible| compatible.all().any(|entry| entry == "virtio,mmio"))
+        })
+        .filter_map(|node| node.reg().and_then(|mut regs| regs.next()))
+        .filter(|region| matches_virtio_mmio_device(region.starting_address as usize, expected))
+        .count()
+}
+
 unsafe fn read_u32(addr: usize) -> u32 {
     unsafe { (addr as *const u32).read_volatile() }
 }
@@ -101,6 +112,7 @@ use fdt::Fdt;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
+use helios_hal::{DeviceInventory, DmaModel, ProcessorStartupPolicy, ProcessorTopology};
 use helios_kernel::Timer;
 use riscv::interrupt::Trap;
 use riscv::interrupt::supervisor::{Exception, Interrupt};
@@ -526,13 +538,35 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         timebase_frequency,
         fdt_addr,
     );
-
-    let kernel = helios_kernel::init_with_watchdog(helios_kernel::Platform::with_watchdog(
-        console,
-        memory_regions.into_iter(),
-        cpu.clone(),
-        watchdog,
-    ));
+    let mut devices = DeviceInventory::new();
+    if debug_transport.is_some() {
+        devices = devices.with_debug_serial();
+    }
+    if net::has_network_device(&fdt) {
+        devices = devices.with_network();
+    }
+    let block_device_count = count_virtio_mmio_devices(&fdt, DeviceType::Block);
+    if block_device_count != 0 {
+        devices = devices.with_block_devices(block_device_count);
+    }
+    if host_fs::has_9p_device(&fdt) {
+        devices = devices.with_host_share();
+    }
+    let kernel = helios_kernel::init_with_watchdog(
+        helios_kernel::Platform::with_watchdog(
+            console,
+            memory_regions.into_iter(),
+            cpu.clone(),
+            watchdog,
+        )
+        .with_topology(
+            ProcessorTopology::start_all_secondaries(bootstrap_processor, hart_count)
+                .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
+        )
+        .with_timer_frequency_hz(timebase_frequency)
+        .with_dma_model(DmaModel::Identity)
+        .with_devices(devices),
+    );
     let external_interrupts = if current_hart == bootstrap_processor {
         let mut interrupts = net::install_network_service(&cpu, &kernel, &fdt, &debug_state);
         if let Some(host_fs) = host_fs::install(&cpu, &kernel, &fdt, &debug_state) {

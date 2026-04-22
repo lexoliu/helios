@@ -131,6 +131,61 @@ impl TcpError {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UdpErrorKind {
+    UnresolvedHost,
+    Timeout,
+    Unavailable,
+    Internal,
+}
+
+impl UdpErrorKind {
+    pub const fn from_io(error: IoError) -> Self {
+        match error {
+            IoError::Unsupported | IoError::PermissionDenied | IoError::ReadOnly => {
+                UdpErrorKind::Unavailable
+            }
+            IoError::NotFound
+            | IoError::AlreadyExists
+            | IoError::NotDirectory
+            | IoError::IsDirectory
+            | IoError::DirectoryNotEmpty
+            | IoError::InvalidBufferLength { .. }
+            | IoError::InvalidDeviceConfig(_)
+            | IoError::OutOfBounds
+            | IoError::DeviceFault => UdpErrorKind::Internal,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct UdpError {
+    pub kind: UdpErrorKind,
+    pub detail: String,
+}
+
+impl UdpError {
+    pub fn from_io(error: IoError, context: impl Display) -> Self {
+        Self {
+            kind: UdpErrorKind::from_io(error),
+            detail: alloc::format!("{context}: {error}"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct UdpDatagram {
+    pub address: Ipv4Address,
+    pub port: u16,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct UdpBinding<Socket> {
+    pub socket: Socket,
+    pub local_port: u16,
+}
+
 pub trait TcpStreamToken: Copy + Send + 'static {
     fn into_raw(self) -> u64;
 
@@ -138,6 +193,22 @@ pub trait TcpStreamToken: Copy + Send + 'static {
 }
 
 impl TcpStreamToken for u64 {
+    fn into_raw(self) -> u64 {
+        self
+    }
+
+    fn from_raw(raw: u64) -> Self {
+        raw
+    }
+}
+
+pub trait UdpSocketToken: Copy + Send + 'static {
+    fn into_raw(self) -> u64;
+
+    fn from_raw(raw: u64) -> Self;
+}
+
+impl UdpSocketToken for u64 {
     fn into_raw(self) -> u64 {
         self
     }
@@ -176,6 +247,29 @@ pub trait DynComponentNetworkService: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, TcpError>> + Send + 'a>>;
 
     fn tcp_close<'a>(&'a self, stream: u64) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+    fn udp_bind<'a>(
+        &'a self,
+        local_port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<UdpBinding<u64>, UdpError>> + Send + 'a>>;
+
+    fn udp_send<'a>(
+        &'a self,
+        socket: u64,
+        host: String,
+        port: u16,
+        bytes: Vec<u8>,
+        timeout_nanos: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, UdpError>> + Send + 'a>>;
+
+    fn udp_receive<'a>(
+        &'a self,
+        socket: u64,
+        max_bytes: u32,
+        timeout_nanos: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<UdpDatagram>, UdpError>> + Send + 'a>>;
+
+    fn udp_close<'a>(&'a self, socket: u64) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
 #[derive(Clone)]
@@ -188,11 +282,16 @@ impl DynamicNetworkService {
     where
         Service: ComponentNetworkService + Sync,
         Service::TcpStream: TcpStreamToken,
+        Service::UdpSocket: UdpSocketToken,
         for<'a> Service::PingFuture<'a>: Send,
         for<'a> Service::TcpConnectFuture<'a>: Send,
         for<'a> Service::TcpWriteFuture<'a>: Send,
         for<'a> Service::TcpReadFuture<'a>: Send,
         for<'a> Service::TcpCloseFuture<'a>: Send,
+        for<'a> Service::UdpBindFuture<'a>: Send,
+        for<'a> Service::UdpSendFuture<'a>: Send,
+        for<'a> Service::UdpReceiveFuture<'a>: Send,
+        for<'a> Service::UdpCloseFuture<'a>: Send,
     {
         Self {
             inner: Arc::new(TypedNetworkService { service }),
@@ -202,6 +301,7 @@ impl DynamicNetworkService {
 
 impl ComponentNetworkService for DynamicNetworkService {
     type TcpStream = u64;
+    type UdpSocket = u64;
 
     type PingFuture<'a>
         = Pin<Box<dyn Future<Output = Result<PingReply, PingError>> + Send + 'a>>
@@ -224,6 +324,26 @@ impl ComponentNetworkService for DynamicNetworkService {
         Self: 'a;
 
     type TcpCloseFuture<'a>
+        = Pin<Box<dyn Future<Output = ()> + Send + 'a>>
+    where
+        Self: 'a;
+
+    type UdpBindFuture<'a>
+        = Pin<Box<dyn Future<Output = Result<UdpBinding<Self::UdpSocket>, UdpError>> + Send + 'a>>
+    where
+        Self: 'a;
+
+    type UdpSendFuture<'a>
+        = Pin<Box<dyn Future<Output = Result<u64, UdpError>> + Send + 'a>>
+    where
+        Self: 'a;
+
+    type UdpReceiveFuture<'a>
+        = Pin<Box<dyn Future<Output = Result<Option<UdpDatagram>, UdpError>> + Send + 'a>>
+    where
+        Self: 'a;
+
+    type UdpCloseFuture<'a>
         = Pin<Box<dyn Future<Output = ()> + Send + 'a>>
     where
         Self: 'a;
@@ -259,6 +379,40 @@ impl ComponentNetworkService for DynamicNetworkService {
     fn tcp_close(&self, stream: Self::TcpStream) -> Self::TcpCloseFuture<'_> {
         self.inner.tcp_close(stream)
     }
+
+    fn udp_bind(&self, local_port: u16) -> Self::UdpBindFuture<'_> {
+        self.inner.udp_bind(local_port)
+    }
+
+    fn udp_send(
+        &self,
+        socket: Self::UdpSocket,
+        host: &str,
+        port: u16,
+        bytes: &[u8],
+        timeout_nanos: u64,
+    ) -> Self::UdpSendFuture<'_> {
+        self.inner.udp_send(
+            socket,
+            String::from(host),
+            port,
+            bytes.to_vec(),
+            timeout_nanos,
+        )
+    }
+
+    fn udp_receive(
+        &self,
+        socket: Self::UdpSocket,
+        max_bytes: u32,
+        timeout_nanos: u64,
+    ) -> Self::UdpReceiveFuture<'_> {
+        self.inner.udp_receive(socket, max_bytes, timeout_nanos)
+    }
+
+    fn udp_close(&self, socket: Self::UdpSocket) -> Self::UdpCloseFuture<'_> {
+        self.inner.udp_close(socket)
+    }
 }
 
 struct TypedNetworkService<Service> {
@@ -269,11 +423,16 @@ impl<Service> DynComponentNetworkService for TypedNetworkService<Service>
 where
     Service: ComponentNetworkService + Sync,
     Service::TcpStream: TcpStreamToken,
+    Service::UdpSocket: UdpSocketToken,
     for<'a> Service::PingFuture<'a>: Send,
     for<'a> Service::TcpConnectFuture<'a>: Send,
     for<'a> Service::TcpWriteFuture<'a>: Send,
     for<'a> Service::TcpReadFuture<'a>: Send,
     for<'a> Service::TcpCloseFuture<'a>: Send,
+    for<'a> Service::UdpBindFuture<'a>: Send,
+    for<'a> Service::UdpSendFuture<'a>: Send,
+    for<'a> Service::UdpReceiveFuture<'a>: Send,
+    for<'a> Service::UdpCloseFuture<'a>: Send,
 {
     fn ping<'a>(
         &'a self,
@@ -341,10 +500,74 @@ where
                 .await
         })
     }
+
+    fn udp_bind<'a>(
+        &'a self,
+        local_port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<UdpBinding<u64>, UdpError>> + Send + 'a>> {
+        let service = self.service.clone();
+        Box::pin(async move {
+            let binding = service.udp_bind(local_port).await?;
+            Ok(UdpBinding {
+                socket: binding.socket.into_raw(),
+                local_port: binding.local_port,
+            })
+        })
+    }
+
+    fn udp_send<'a>(
+        &'a self,
+        socket: u64,
+        host: String,
+        port: u16,
+        bytes: Vec<u8>,
+        timeout_nanos: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, UdpError>> + Send + 'a>> {
+        let service = self.service.clone();
+        Box::pin(async move {
+            service
+                .udp_send(
+                    <Service::UdpSocket as UdpSocketToken>::from_raw(socket),
+                    &host,
+                    port,
+                    &bytes,
+                    timeout_nanos,
+                )
+                .await
+        })
+    }
+
+    fn udp_receive<'a>(
+        &'a self,
+        socket: u64,
+        max_bytes: u32,
+        timeout_nanos: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<UdpDatagram>, UdpError>> + Send + 'a>> {
+        let service = self.service.clone();
+        Box::pin(async move {
+            service
+                .udp_receive(
+                    <Service::UdpSocket as UdpSocketToken>::from_raw(socket),
+                    max_bytes,
+                    timeout_nanos,
+                )
+                .await
+        })
+    }
+
+    fn udp_close<'a>(&'a self, socket: u64) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        let service = self.service.clone();
+        Box::pin(async move {
+            service
+                .udp_close(<Service::UdpSocket as UdpSocketToken>::from_raw(socket))
+                .await
+        })
+    }
 }
 
 pub trait ComponentNetworkService: Clone + Send + 'static {
     type TcpStream: Copy + Send + 'static;
+    type UdpSocket: Copy + Send + 'static;
 
     type PingFuture<'a>: Future<Output = Result<PingReply, PingError>> + 'a
     where
@@ -363,6 +586,22 @@ pub trait ComponentNetworkService: Clone + Send + 'static {
         Self: 'a;
 
     type TcpCloseFuture<'a>: Future<Output = ()> + 'a
+    where
+        Self: 'a;
+
+    type UdpBindFuture<'a>: Future<Output = Result<UdpBinding<Self::UdpSocket>, UdpError>> + 'a
+    where
+        Self: 'a;
+
+    type UdpSendFuture<'a>: Future<Output = Result<u64, UdpError>> + 'a
+    where
+        Self: 'a;
+
+    type UdpReceiveFuture<'a>: Future<Output = Result<Option<UdpDatagram>, UdpError>> + 'a
+    where
+        Self: 'a;
+
+    type UdpCloseFuture<'a>: Future<Output = ()> + 'a
     where
         Self: 'a;
 
@@ -385,6 +624,26 @@ pub trait ComponentNetworkService: Clone + Send + 'static {
     ) -> Self::TcpReadFuture<'_>;
 
     fn tcp_close(&self, stream: Self::TcpStream) -> Self::TcpCloseFuture<'_>;
+
+    fn udp_bind(&self, local_port: u16) -> Self::UdpBindFuture<'_>;
+
+    fn udp_send(
+        &self,
+        socket: Self::UdpSocket,
+        host: &str,
+        port: u16,
+        bytes: &[u8],
+        timeout_nanos: u64,
+    ) -> Self::UdpSendFuture<'_>;
+
+    fn udp_receive(
+        &self,
+        socket: Self::UdpSocket,
+        max_bytes: u32,
+        timeout_nanos: u64,
+    ) -> Self::UdpReceiveFuture<'_>;
+
+    fn udp_close(&self, socket: Self::UdpSocket) -> Self::UdpCloseFuture<'_>;
 }
 
 pub trait ComponentNetworkState<Service>: Clone + Send + 'static

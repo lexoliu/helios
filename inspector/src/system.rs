@@ -1,5 +1,5 @@
 use async_signal::{Signal, Signals};
-use futures_lite::{StreamExt as _, future};
+use futures_lite::{future, StreamExt as _};
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -147,9 +147,9 @@ async fn wait_for_tracing_tick_or_interrupt(signals: &mut Signals) -> std::io::R
         async {
             match signals.next().await {
                 Some(Ok(Signal::Int)) => Ok(true),
-                Some(Ok(signal)) => panic!(
-                    "unexpected signal while waiting for tracing cancellation: {signal:?}"
-                ),
+                Some(Ok(signal)) => {
+                    panic!("unexpected signal while waiting for tracing cancellation: {signal:?}")
+                }
                 Some(Err(error)) => Err(error),
                 None => panic!("signal stream ended while waiting for tracing cancellation"),
             }

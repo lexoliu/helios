@@ -58,7 +58,9 @@ pub use topology::{
 pub type SbiSerialPort = crate::ComponentSerialPort;
 
 pub type NetworkTcpBackend = crate::ComponentTcpBackend<crate::DynamicNetworkService>;
+pub type NetworkUdpBackend = crate::ComponentUdpBackend<crate::DynamicNetworkService>;
 pub type SbiTcpStream = crate::ComponentTcpStream<NetworkTcpBackend>;
+pub type SbiUdpSocket = crate::ComponentUdpSocket<NetworkUdpBackend>;
 pub type HostRuntimeState<CpuImpl, HostFs> =
     crate::RuntimeState<UserProgramService<CpuImpl, HostFs>, crate::DynamicNetworkService, HostFs>;
 pub type StoreData<CpuImpl, HostFs> = ComponentStoreData<
@@ -763,6 +765,26 @@ where
             })
         },
     )?;
+    instance.resource_concurrent(
+        "udp-socket",
+        ResourceType::host::<SbiUdpSocket>(),
+        |accessor, rep| {
+            Box::pin(async move {
+                let socket = accessor.with(|mut access| {
+                    let resource = Resource::<SbiUdpSocket>::new_own(rep);
+                    let socket = access.get().table.delete(resource)?;
+                    Ok::<_, wasmtime::Error>(socket)
+                })?;
+                socket
+                    .resource
+                    .backend
+                    .service
+                    .udp_close(socket.resource.backend.socket)
+                    .await;
+                Ok::<_, wasmtime::Error>(())
+            })
+        },
+    )?;
     instance.func_wrap_concurrent(
         "ping",
         |accessor: &Accessor<StoreData<CpuImpl, HostFs>>, (host, timeout): (String, u64)| {
@@ -814,6 +836,36 @@ where
                         Ok(resource)
                     }
                     Err(error) => Err(convert_tcp_error(error)),
+                };
+                Ok::<_, wasmtime::Error>((response,))
+            })
+        },
+    )?;
+    instance.func_wrap_concurrent(
+        "udp-bind",
+        |accessor: &Accessor<StoreData<CpuImpl, HostFs>>, (local_port,): (u16,)| {
+            Box::pin(async move {
+                let service = accessor.with(|mut access| {
+                    Ok::<_, wasmtime::Error>(access.get().runtime_state.network_service())
+                })?;
+                let Some(service) = service else {
+                    return Ok::<_, wasmtime::Error>((Err(unavailable_udp_error()),));
+                };
+                let bound = service.udp_bind(local_port).await;
+                let response = match bound {
+                    Ok(binding) => {
+                        let resource = accessor.with(|mut access| {
+                            access
+                                .get()
+                                .table
+                                .push(SbiUdpSocket::new(NetworkUdpBackend {
+                                    service: service.clone(),
+                                    socket: binding.socket,
+                                }))
+                        })?;
+                        Ok(resource)
+                    }
+                    Err(error) => Err(convert_udp_error(error)),
                 };
                 Ok::<_, wasmtime::Error>((response,))
             })
@@ -881,6 +933,74 @@ where
             })
         },
     )?;
+    instance.func_wrap_concurrent(
+        "[method]udp-socket.receive",
+        |accessor: &Accessor<StoreData<CpuImpl, HostFs>>,
+         (resource, max_bytes, timeout): (Resource<SbiUdpSocket>, u32, u64)| {
+            Box::pin(async move {
+                let socket = accessor.with(|mut access| {
+                    let socket = access.get().table.get(&resource)?;
+                    Ok::<_, wasmtime::Error>((
+                        socket.resource.backend.service.clone(),
+                        socket.resource.backend.socket,
+                    ))
+                })?;
+                let response = socket
+                    .0
+                    .udp_receive(socket.1, max_bytes, timeout)
+                    .await
+                    .map(|datagram| datagram.map(convert_udp_datagram))
+                    .map_err(convert_udp_error);
+                Ok::<_, wasmtime::Error>((response,))
+            })
+        },
+    )?;
+    instance.func_wrap_concurrent(
+        "[method]udp-socket.send",
+        |accessor: &Accessor<StoreData<CpuImpl, HostFs>>,
+         (resource, host, port, bytes, timeout): (
+            Resource<SbiUdpSocket>,
+            String,
+            u16,
+            Vec<u8>,
+            u64,
+        )| {
+            Box::pin(async move {
+                let socket = accessor.with(|mut access| {
+                    let socket = access.get().table.get(&resource)?;
+                    Ok::<_, wasmtime::Error>((
+                        socket.resource.backend.service.clone(),
+                        socket.resource.backend.socket,
+                    ))
+                })?;
+                let response = socket
+                    .0
+                    .udp_send(socket.1, &host, port, &bytes, timeout)
+                    .await
+                    .map_err(convert_udp_error);
+                Ok::<_, wasmtime::Error>((response,))
+            })
+        },
+    )?;
+    instance.func_wrap_concurrent(
+        "[method]udp-socket.close",
+        |accessor: &Accessor<StoreData<CpuImpl, HostFs>>,
+         (resource,): (Resource<SbiUdpSocket>,)| {
+            Box::pin(async move {
+                let socket = accessor.with(|mut access| {
+                    let socket = access.get().table.get(&resource)?;
+                    Ok::<_, wasmtime::Error>((
+                        socket.resource.backend.service.clone(),
+                        socket.resource.backend.socket,
+                    ))
+                })?;
+                socket.0.udp_close(socket.1).await;
+                Ok::<_, wasmtime::Error>((
+                    Ok::<(), debugger_bindings::helios::system::net::UdpError>(()),
+                ))
+            })
+        },
+    )?;
     Ok(())
 }
 
@@ -907,6 +1027,26 @@ where
                     .backend
                     .service
                     .tcp_close(stream.resource.backend.stream)
+                    .await;
+                Ok::<_, wasmtime::Error>(())
+            })
+        },
+    )?;
+    instance.resource_concurrent(
+        "udp-socket",
+        ResourceType::host::<SbiUdpSocket>(),
+        |accessor, rep| {
+            Box::pin(async move {
+                let socket = accessor.with(|mut access| {
+                    let resource = Resource::<SbiUdpSocket>::new_own(rep);
+                    let socket = access.get().table.delete(resource)?;
+                    Ok::<_, wasmtime::Error>(socket)
+                })?;
+                socket
+                    .resource
+                    .backend
+                    .service
+                    .udp_close(socket.resource.backend.socket)
                     .await;
                 Ok::<_, wasmtime::Error>(())
             })
@@ -962,6 +1102,36 @@ where
                         Ok(resource)
                     }
                     Err(error) => Err(convert_program_tcp_error(error)),
+                };
+                Ok::<_, wasmtime::Error>((response,))
+            })
+        },
+    )?;
+    instance.func_wrap_concurrent(
+        "udp-bind",
+        |accessor: &Accessor<StoreData<CpuImpl, HostFs>>, (local_port,): (u16,)| {
+            Box::pin(async move {
+                let service = accessor.with(|mut access| {
+                    Ok::<_, wasmtime::Error>(access.get().runtime_state.network_service())
+                })?;
+                let Some(service) = service else {
+                    return Ok::<_, wasmtime::Error>((Err(unavailable_program_udp_error()),));
+                };
+                let bound = service.udp_bind(local_port).await;
+                let response = match bound {
+                    Ok(binding) => {
+                        let resource = accessor.with(|mut access| {
+                            access
+                                .get()
+                                .table
+                                .push(SbiUdpSocket::new(NetworkUdpBackend {
+                                    service: service.clone(),
+                                    socket: binding.socket,
+                                }))
+                        })?;
+                        Ok(resource)
+                    }
+                    Err(error) => Err(convert_program_udp_error(error)),
                 };
                 Ok::<_, wasmtime::Error>((response,))
             })
@@ -1025,6 +1195,74 @@ where
                 socket.0.tcp_close(socket.1).await;
                 Ok::<_, wasmtime::Error>((
                     Ok::<(), program_bindings::helios::system::net::TcpError>(()),
+                ))
+            })
+        },
+    )?;
+    instance.func_wrap_concurrent(
+        "[method]udp-socket.receive",
+        |accessor: &Accessor<StoreData<CpuImpl, HostFs>>,
+         (resource, max_bytes, timeout): (Resource<SbiUdpSocket>, u32, u64)| {
+            Box::pin(async move {
+                let socket = accessor.with(|mut access| {
+                    let socket = access.get().table.get(&resource)?;
+                    Ok::<_, wasmtime::Error>((
+                        socket.resource.backend.service.clone(),
+                        socket.resource.backend.socket,
+                    ))
+                })?;
+                let response = socket
+                    .0
+                    .udp_receive(socket.1, max_bytes, timeout)
+                    .await
+                    .map(|datagram| datagram.map(convert_program_udp_datagram))
+                    .map_err(convert_program_udp_error);
+                Ok::<_, wasmtime::Error>((response,))
+            })
+        },
+    )?;
+    instance.func_wrap_concurrent(
+        "[method]udp-socket.send",
+        |accessor: &Accessor<StoreData<CpuImpl, HostFs>>,
+         (resource, host, port, bytes, timeout): (
+            Resource<SbiUdpSocket>,
+            String,
+            u16,
+            Vec<u8>,
+            u64,
+        )| {
+            Box::pin(async move {
+                let socket = accessor.with(|mut access| {
+                    let socket = access.get().table.get(&resource)?;
+                    Ok::<_, wasmtime::Error>((
+                        socket.resource.backend.service.clone(),
+                        socket.resource.backend.socket,
+                    ))
+                })?;
+                let response = socket
+                    .0
+                    .udp_send(socket.1, &host, port, &bytes, timeout)
+                    .await
+                    .map_err(convert_program_udp_error);
+                Ok::<_, wasmtime::Error>((response,))
+            })
+        },
+    )?;
+    instance.func_wrap_concurrent(
+        "[method]udp-socket.close",
+        |accessor: &Accessor<StoreData<CpuImpl, HostFs>>,
+         (resource,): (Resource<SbiUdpSocket>,)| {
+            Box::pin(async move {
+                let socket = accessor.with(|mut access| {
+                    let socket = access.get().table.get(&resource)?;
+                    Ok::<_, wasmtime::Error>((
+                        socket.resource.backend.service.clone(),
+                        socket.resource.backend.socket,
+                    ))
+                })?;
+                socket.0.udp_close(socket.1).await;
+                Ok::<_, wasmtime::Error>((
+                    Ok::<(), program_bindings::helios::system::net::UdpError>(()),
                 ))
             })
         },
@@ -1286,6 +1524,20 @@ fn unavailable_program_tcp_error() -> program_bindings::helios::system::net::Tcp
     }
 }
 
+fn unavailable_udp_error() -> debugger_bindings::helios::system::net::UdpError {
+    debugger_bindings::helios::system::net::UdpError {
+        kind: debugger_bindings::helios::system::net::UdpErrorKind::Unavailable,
+        detail: "network service is unavailable on this machine".to_owned(),
+    }
+}
+
+fn unavailable_program_udp_error() -> program_bindings::helios::system::net::UdpError {
+    program_bindings::helios::system::net::UdpError {
+        kind: program_bindings::helios::system::net::UdpErrorKind::Unavailable,
+        detail: "network service is unavailable on this machine".to_owned(),
+    }
+}
+
 fn convert_tcp_error(error: crate::TcpError) -> debugger_bindings::helios::system::net::TcpError {
     debugger_bindings::helios::system::net::TcpError {
         kind: match error.kind {
@@ -1322,6 +1574,74 @@ fn convert_program_tcp_error(
             }
             crate::TcpErrorKind::Internal => {
                 program_bindings::helios::system::net::TcpErrorKind::Internal
+            }
+        },
+        detail: error.detail,
+    }
+}
+
+fn convert_udp_datagram(
+    datagram: crate::UdpDatagram,
+) -> debugger_bindings::helios::system::net::UdpDatagram {
+    let octets = datagram.address.octets();
+    debugger_bindings::helios::system::net::UdpDatagram {
+        address: debugger_bindings::helios::system::net::IpAddress::Ipv4((
+            octets[0], octets[1], octets[2], octets[3],
+        )),
+        port: datagram.port,
+        bytes: datagram.bytes,
+    }
+}
+
+fn convert_program_udp_datagram(
+    datagram: crate::UdpDatagram,
+) -> program_bindings::helios::system::net::UdpDatagram {
+    let octets = datagram.address.octets();
+    program_bindings::helios::system::net::UdpDatagram {
+        address: program_bindings::helios::system::net::IpAddress::Ipv4((
+            octets[0], octets[1], octets[2], octets[3],
+        )),
+        port: datagram.port,
+        bytes: datagram.bytes,
+    }
+}
+
+fn convert_udp_error(error: crate::UdpError) -> debugger_bindings::helios::system::net::UdpError {
+    debugger_bindings::helios::system::net::UdpError {
+        kind: match error.kind {
+            crate::UdpErrorKind::UnresolvedHost => {
+                debugger_bindings::helios::system::net::UdpErrorKind::UnresolvedHost
+            }
+            crate::UdpErrorKind::Timeout => {
+                debugger_bindings::helios::system::net::UdpErrorKind::Timeout
+            }
+            crate::UdpErrorKind::Unavailable => {
+                debugger_bindings::helios::system::net::UdpErrorKind::Unavailable
+            }
+            crate::UdpErrorKind::Internal => {
+                debugger_bindings::helios::system::net::UdpErrorKind::Internal
+            }
+        },
+        detail: error.detail,
+    }
+}
+
+fn convert_program_udp_error(
+    error: crate::UdpError,
+) -> program_bindings::helios::system::net::UdpError {
+    program_bindings::helios::system::net::UdpError {
+        kind: match error.kind {
+            crate::UdpErrorKind::UnresolvedHost => {
+                program_bindings::helios::system::net::UdpErrorKind::UnresolvedHost
+            }
+            crate::UdpErrorKind::Timeout => {
+                program_bindings::helios::system::net::UdpErrorKind::Timeout
+            }
+            crate::UdpErrorKind::Unavailable => {
+                program_bindings::helios::system::net::UdpErrorKind::Unavailable
+            }
+            crate::UdpErrorKind::Internal => {
+                program_bindings::helios::system::net::UdpErrorKind::Internal
             }
         },
         detail: error.detail,

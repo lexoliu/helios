@@ -7,6 +7,8 @@ __helios_mp_gate:
 .section .init.mp_hook, "ax"
 .global _mp_hook
 _mp_hook:
+    .option push
+    .option arch, +zaamo
     la t0, __helios_mp_gate
     lw t1, 0(t0)
     beqz t1, 2f
@@ -28,6 +30,7 @@ _mp_hook:
 4:
     li a0, 1
     ret
+    .option pop
 
 .section .text.mp_hook, "ax"
 .balign 4

@@ -135,14 +135,12 @@ pub(crate) fn run_connected(
             }
             Ok(())
         }),
-        SessionCommand::Tracing(command) => {
-            runtime::block_on(system::run_tracing(
-                client,
-                command.limit,
-                command.min_level.as_deref(),
-                command.target_prefix,
-            ))
-        }
+        SessionCommand::Tracing(command) => runtime::block_on(system::run_tracing(
+            client,
+            command.limit,
+            command.min_level.as_deref(),
+            command.target_prefix,
+        )),
         SessionCommand::Stats => run_interruptible(async move {
             let mut client = client;
             stats_tui::run(&mut client).await

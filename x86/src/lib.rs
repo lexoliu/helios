@@ -22,11 +22,11 @@ use core::arch::global_asm;
 use core::arch::x86_64::{__cpuid, __cpuid_count, _rdtsc};
 use core::fmt::{self, Write};
 use core::ops::Range;
-use helios_hal::Platform;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
 use helios_hal::watchdog::Watchdog;
+use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology};
 use x86_64::instructions::port::{Port, PortReadOnly, PortWriteOnly};
 use x86_64::registers::control::{Cr0, Cr0Flags, Cr3, Cr4, Cr4Flags};
 
@@ -85,17 +85,18 @@ fn x86_kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_uart_init();
     enable_fpu_simd();
     let physical_memory_offset = boot_physical_memory_offset(boot_info);
-    let wakeup_page = smp::reserve_wakeup_page(boot_info);
+    let processor_count = processor_count(boot_info);
+    let wakeup_page = (processor_count > 1).then(|| smp::reserve_wakeup_page(boot_info));
     helios_kernel::prime_bootstrap_allocator(boot_memory_regions(
         boot_info,
         physical_memory_offset,
-        Some(wakeup_page.clone()),
+        wakeup_page.clone(),
     ));
     let memory_regions =
-        boot_memory_regions(boot_info, physical_memory_offset, Some(wakeup_page.clone()));
+        boot_memory_regions(boot_info, physical_memory_offset, wakeup_page.clone());
     let tsc_hz = detect_tsc_frequency_hz();
     let tsc_base = read_tsc();
-    let debug_state = debug_state::RuntimeState::new(tsc_hz, processor_count(boot_info), 0);
+    let debug_state = debug_state::RuntimeState::new(tsc_hz, processor_count, 0);
     let boot = smp::build_boot_context(
         boot_info,
         physical_memory_offset,
@@ -108,15 +109,29 @@ fn x86_kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let mirror_to_uart = WATCHDOG_SELF_TEST_ENABLED;
     let console = serial_console(debug_state.clone(), mirror_to_uart);
     let cpu = X86Cpu::new(boot.platform());
-    let kernel = helios_kernel::init_with_watchdog(Platform::with_watchdog(
-        console,
-        memory_regions,
-        cpu.clone(),
-        cpu.watchdog(),
-    ));
+    let kernel = helios_kernel::init_with_watchdog(
+        Platform::with_watchdog(console, memory_regions, cpu.clone(), cpu.watchdog())
+            .with_topology(
+                ProcessorTopology::start_all_secondaries(
+                    cpu.bootstrap_processor(),
+                    cpu.processor_count(),
+                )
+                .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
+            )
+            .with_dma_model(DmaModel::Translated)
+            .with_devices(DeviceInventory::new().with_debug_serial()),
+    );
     let debug_state = cpu.debug_state();
     let _program_service =
         helios_kernel::install_component_host_program_service(&kernel, &cpu, &debug_state);
+    if cpu.current_processor() == cpu.bootstrap_processor() {
+        for processor in helios_kernel::component_host_processors_to_start(
+            cpu.processor_count(),
+            cpu.bootstrap_processor(),
+        ) {
+            cpu.start_processor(processor);
+        }
+    }
     run_current_processor(cpu, kernel, debug_state)
 }
 

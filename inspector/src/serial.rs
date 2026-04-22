@@ -1,12 +1,12 @@
 use anyhow::{Context as _, Result};
 use async_io::Async;
 use async_net::unix::UnixStream as AsyncUnixStream;
-use futures_util::io::AsyncReadExt as _;
 use futures_io::{AsyncRead, AsyncWrite};
+use futures_util::io::AsyncReadExt as _;
 use std::io;
-use std::time::{Duration, Instant};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::FileTypeExt;
+use std::time::{Duration, Instant};
 
 pub(crate) trait SerialRead: AsyncRead + Unpin + Send {}
 pub(crate) trait SerialWrite: AsyncWrite + Unpin + Send {}
@@ -132,5 +132,8 @@ async fn open_socket_transport(device: &str) -> Result<(SerialReader, SerialWrit
         }
     };
     let (read, write) = socket.split();
-    Ok((Box::new(read) as SerialReader, Box::new(write) as SerialWriter))
+    Ok((
+        Box::new(read) as SerialReader,
+        Box::new(write) as SerialWriter,
+    ))
 }

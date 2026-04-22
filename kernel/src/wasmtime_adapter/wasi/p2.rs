@@ -14,14 +14,15 @@ use wasmtime_wasi_io::streams::{
 };
 use wasmtime_wasi_io::{self};
 
-use crate::component_host::{RuntimeDeadlinePollable, StoreData};
-use crate::wasmtime_adapter::store::{
-    ChannelInputStream, ChannelOutputStream, StdioOutputStream,
+use super::bindings::filesystem::types as p3fs;
+use super::{
+    FsDescriptor, FsNodeKind, P2IncomingDatagramStream, P2Network, P2OutgoingDatagramStream,
+    TcpSocket, UdpSocket, WasiUdpSocketAddress, WasiUdpSocketError, WasiUdpSocketFamily,
 };
+use crate::component_host::{RuntimeDeadlinePollable, StoreData};
+use crate::wasmtime_adapter::store::{ChannelInputStream, ChannelOutputStream, StdioOutputStream};
 use crate::wasmtime_adapter::wasi::map_host_fs_error;
 use crate::{ComponentOutputMode, ComponentOutputStreamKind};
-use super::bindings::filesystem::types as p3fs;
-use super::{FsDescriptor, FsNodeKind, P2Network, TcpSocket, UdpSocket};
 
 pub(crate) mod cli_bindings {
     mod generated {
@@ -173,7 +174,13 @@ pub(crate) mod sockets_bindings {
                     }
                 ",
             path: "../../wasmtime/crates/wasi/src/p2/wit",
-            imports: { default: tracing | trappable },
+            imports: {
+                "wasi:sockets/udp.[method]udp-socket.start-bind": async | tracing | trappable,
+                "wasi:sockets/udp.[method]udp-socket.stream": async | tracing | trappable,
+                "wasi:sockets/udp.[method]incoming-datagram-stream.receive": async | tracing | trappable,
+                "wasi:sockets/udp.[method]outgoing-datagram-stream.send": async | tracing | trappable,
+                default: tracing | trappable,
+            },
             with: {
                 "wasi:io/poll.pollable": wasmtime_wasi_io::poll::DynPollable,
                 "wasi:io/streams.input-stream": wasmtime_wasi_io::streams::DynInputStream,
@@ -181,6 +188,8 @@ pub(crate) mod sockets_bindings {
                 "wasi:sockets/network.network": crate::wasmtime_adapter::wasi::P2Network,
                 "wasi:sockets/tcp.tcp-socket": crate::wasmtime_adapter::wasi::TcpSocket,
                 "wasi:sockets/udp.udp-socket": crate::wasmtime_adapter::wasi::UdpSocket,
+                "wasi:sockets/udp.incoming-datagram-stream": crate::wasmtime_adapter::wasi::P2IncomingDatagramStream,
+                "wasi:sockets/udp.outgoing-datagram-stream": crate::wasmtime_adapter::wasi::P2OutgoingDatagramStream,
             },
             require_store_data_send: true,
         });
@@ -225,38 +234,107 @@ where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
 {
+    cli_bindings::cli::environment::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
+    cli_bindings::cli::exit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        &Default::default(),
+        |state| state,
+    )?;
+    cli_bindings::cli::stdin::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
+    cli_bindings::cli::stdout::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
+    cli_bindings::cli::stderr::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
+    cli_bindings::cli::terminal_input::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
+    cli_bindings::cli::terminal_output::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
+    cli_bindings::cli::terminal_stdin::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
+    cli_bindings::cli::terminal_stdout::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
+    cli_bindings::cli::terminal_stderr::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
 
-    cli_bindings::cli::environment::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    cli_bindings::cli::exit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, &Default::default(), |state| state)?;
-    cli_bindings::cli::stdin::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    cli_bindings::cli::stdout::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    cli_bindings::cli::stderr::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    cli_bindings::cli::terminal_input::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    cli_bindings::cli::terminal_output::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    cli_bindings::cli::terminal_stdin::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    cli_bindings::cli::terminal_stdout::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    cli_bindings::cli::terminal_stderr::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
+    clocks_bindings::clocks::monotonic_clock::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, HostFs>>,
+    >(linker, |state| state)?;
+    clocks_bindings::clocks::wall_clock::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
 
-    clocks_bindings::clocks::monotonic_clock::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    clocks_bindings::clocks::wall_clock::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
+    filesystem_bindings::filesystem::preopens::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, HostFs>>,
+    >(linker, |state| state)?;
+    filesystem_bindings::filesystem::types::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
 
-    filesystem_bindings::filesystem::preopens::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    filesystem_bindings::filesystem::types::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-
-    random_bindings::random::random::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    random_bindings::random::insecure::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    random_bindings::random::insecure_seed::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
+    random_bindings::random::random::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
+    random_bindings::random::insecure::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
+    random_bindings::random::insecure_seed::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
     sockets_bindings::sockets::network::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
         linker,
         &Default::default(),
         |state| state,
     )?;
-    sockets_bindings::sockets::instance_network::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    sockets_bindings::sockets::udp::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    sockets_bindings::sockets::udp_create_socket::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    sockets_bindings::sockets::tcp::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    sockets_bindings::sockets::tcp_create_socket::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    sockets_bindings::sockets::ip_name_lookup::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
+    sockets_bindings::sockets::instance_network::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, HostFs>>,
+    >(linker, |state| state)?;
+    sockets_bindings::sockets::udp::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
+    sockets_bindings::sockets::udp_create_socket::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, HostFs>>,
+    >(linker, |state| state)?;
+    sockets_bindings::sockets::tcp::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
+    sockets_bindings::sockets::tcp_create_socket::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, HostFs>>,
+    >(linker, |state| state)?;
+    sockets_bindings::sockets::ip_name_lookup::add_to_linker::<
+        _,
+        HasSelf<StoreData<CpuImpl, HostFs>>,
+    >(linker, |state| state)?;
     Ok(())
 }
 
@@ -289,6 +367,21 @@ impl InputStream for FileInputStream {
         self.cursor = end;
         Ok(chunk)
     }
+}
+
+#[wasmtime_wasi_io::async_trait]
+impl Pollable for UdpSocket {
+    async fn ready(&mut self) {}
+}
+
+#[wasmtime_wasi_io::async_trait]
+impl Pollable for P2IncomingDatagramStream {
+    async fn ready(&mut self) {}
+}
+
+#[wasmtime_wasi_io::async_trait]
+impl Pollable for P2OutgoingDatagramStream {
+    async fn ready(&mut self) {}
 }
 
 impl<CpuImpl, HostFs> cli_bindings::cli::environment::Host for StoreData<CpuImpl, HostFs>
@@ -389,26 +482,26 @@ where
                 .expect("child mode always has stdout/stderr writers");
             StdioOutputStream::Child(ChannelOutputStream::new(writer))
         }
-        ComponentOutputMode::Serial => {
-            StdioOutputStream::Serial(store.serial_writer_fn())
-        }
+        ComponentOutputMode::Serial => StdioOutputStream::Serial(store.serial_writer_fn()),
         ComponentOutputMode::Trace => StdioOutputStream::Trace,
     }
 }
-
 
 impl<CpuImpl, HostFs> cli_bindings::cli::terminal_input::Host for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
-{}
+{
+}
 impl<CpuImpl, HostFs> cli_bindings::cli::terminal_output::Host for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
-{}
+{
+}
 
-impl<CpuImpl, HostFs> cli_bindings::cli::terminal_input::HostTerminalInput for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, HostFs> cli_bindings::cli::terminal_input::HostTerminalInput
+    for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
@@ -419,7 +512,8 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> cli_bindings::cli::terminal_output::HostTerminalOutput for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, HostFs> cli_bindings::cli::terminal_output::HostTerminalOutput
+    for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
@@ -526,7 +620,8 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> filesystem_bindings::filesystem::types::HostDescriptor for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, HostFs> filesystem_bindings::filesystem::types::HostDescriptor
+    for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
@@ -653,7 +748,10 @@ where
             Ok(length) => length,
             Err(_) => return Ok(Err(p2fs::ErrorCode::Overflow)),
         };
-        match self.filesystem_mut().read_file_chunk(&descriptor, offset, length) {
+        match self
+            .filesystem_mut()
+            .read_file_chunk(&descriptor, offset, length)
+        {
             Ok(bytes) => {
                 let eof = bytes.len() < length;
                 Ok(Ok((bytes, eof)))
@@ -698,11 +796,7 @@ where
         // host-fs service first so the sync embedded path sees a fully
         // populated view.
         if let Some(host_path) = crate::guest_host_share_path(&descriptor.path) {
-            if let Ok(service) = self
-                .filesystem()
-                .host_service()
-                .map_err(error_code_from_p3)
-            {
+            if let Ok(service) = self.filesystem().host_service().map_err(error_code_from_p3) {
                 let host_path = host_path.to_owned();
                 match service.read_dir(&host_path).await {
                     Ok(entries) => {
@@ -941,7 +1035,10 @@ where
                 }
             } else {
                 match service.create_file(&host_path).await {
-                    Ok(()) => (crate::wasmtime_adapter::wasi::FsNodeKind::File, Some(Vec::new())),
+                    Ok(()) => (
+                        crate::wasmtime_adapter::wasi::FsNodeKind::File,
+                        Some(Vec::new()),
+                    ),
                     Err(err) => {
                         return Ok(Err(error_code_from_p3(map_host_fs_error(err))));
                     }
@@ -1007,7 +1104,10 @@ where
                 Err(err) => Ok(Err(error_code_from_p3(map_host_fs_error(err)))),
             };
         }
-        match self.filesystem_mut().remove_directory_at(&descriptor, &path) {
+        match self
+            .filesystem_mut()
+            .remove_directory_at(&descriptor, &path)
+        {
             Ok(()) => Ok(Ok(())),
             Err(error) => Ok(Err(error_code_from_p3(error))),
         }
@@ -1028,18 +1128,15 @@ where
             Ok(descriptor) => descriptor,
             Err(error) => return Ok(Err(error)),
         };
-        let src_abs =
-            match crate::resolve_child_path(&source_descriptor.path, &source_path) {
-                Ok(p) => p,
-                Err(error) => return Ok(Err(error_code_from_path(error))),
-            };
-        let dst_abs = match crate::resolve_child_path(
-            &destination_descriptor.path,
-            &destination_path,
-        ) {
+        let src_abs = match crate::resolve_child_path(&source_descriptor.path, &source_path) {
             Ok(p) => p,
             Err(error) => return Ok(Err(error_code_from_path(error))),
         };
+        let dst_abs =
+            match crate::resolve_child_path(&destination_descriptor.path, &destination_path) {
+                Ok(p) => p,
+                Err(error) => return Ok(Err(error_code_from_path(error))),
+            };
         let src_host = crate::guest_host_share_path(&src_abs).map(|p| p.to_owned());
         let dst_host = crate::guest_host_share_path(&dst_abs).map(|p| p.to_owned());
         if src_host.is_some() || dst_host.is_some() {
@@ -1196,7 +1293,8 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> filesystem_bindings::filesystem::types::HostDirectoryEntryStream for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, HostFs> filesystem_bindings::filesystem::types::HostDirectoryEntryStream
+    for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
@@ -1308,7 +1406,8 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> sockets_bindings::sockets::instance_network::Host for StoreData<CpuImpl, HostFs>
+impl<CpuImpl, HostFs> sockets_bindings::sockets::instance_network::Host
+    for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
@@ -1322,33 +1421,44 @@ impl<CpuImpl, HostFs> p2udp::Host for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
-{}
+{
+}
 
 impl<CpuImpl, HostFs> p2udp::HostUdpSocket for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
 {
-    fn start_bind(
+    async fn start_bind(
         &mut self,
-        _: Resource<UdpSocket>,
-        _: Resource<p2udp::Network>,
-        _: p2udp::IpSocketAddress,
+        socket: Resource<UdpSocket>,
+        network: Resource<p2udp::Network>,
+        local_address: p2udp::IpSocketAddress,
     ) -> Result<core::result::Result<(), p2udp::ErrorCode>> {
-        socket_not_supported()
+        let _ = self.table.get(&network)?;
+        let socket = self.table.get(&socket)?.clone();
+        let local_address = match parse_p2_udp_socket_address(local_address, socket.family()) {
+            Ok(address) => address,
+            Err(error) => return Ok(Err(map_p2_udp_error(error))),
+        };
+        Ok(socket
+            .start_bind_p2(local_address)
+            .await
+            .map_err(map_p2_udp_error))
     }
 
     fn finish_bind(
         &mut self,
-        _: Resource<UdpSocket>,
+        socket: Resource<UdpSocket>,
     ) -> Result<core::result::Result<(), p2udp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.finish_bind_p2().map_err(map_p2_udp_error))
     }
 
-    fn stream(
+    async fn stream(
         &mut self,
-        _: Resource<UdpSocket>,
-        _: Option<p2udp::IpSocketAddress>,
+        socket_resource: Resource<UdpSocket>,
+        remote_address: Option<p2udp::IpSocketAddress>,
     ) -> Result<
         core::result::Result<
             (
@@ -1358,74 +1468,107 @@ where
             p2udp::ErrorCode,
         >,
     > {
-        socket_not_supported()
+        let socket = self.table.get(&socket_resource)?.clone();
+        let remote_address = match remote_address {
+            Some(address) => match parse_p2_udp_socket_address(address, socket.family()) {
+                Ok(address) => Some(address),
+                Err(error) => return Ok(Err(map_p2_udp_error(error))),
+            },
+            None => None,
+        };
+        let (incoming, outgoing) = match socket.open_p2_streams(remote_address) {
+            Ok(streams) => streams,
+            Err(error) => return Ok(Err(map_p2_udp_error(error))),
+        };
+        let incoming = self.table.push_child(incoming, &socket_resource)?;
+        let outgoing = self.table.push_child(outgoing, &socket_resource)?;
+        Ok(Ok((incoming, outgoing)))
     }
 
     fn local_address(
         &mut self,
-        _: Resource<UdpSocket>,
+        socket: Resource<UdpSocket>,
     ) -> Result<core::result::Result<p2udp::IpSocketAddress, p2udp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket
+            .local_address()
+            .map(format_p2_udp_socket_address)
+            .map_err(map_p2_udp_error))
     }
 
     fn remote_address(
         &mut self,
-        _: Resource<UdpSocket>,
+        socket: Resource<UdpSocket>,
     ) -> Result<core::result::Result<p2udp::IpSocketAddress, p2udp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket
+            .remote_address()
+            .map(format_p2_udp_socket_address)
+            .map_err(map_p2_udp_error))
     }
 
-    fn address_family(&mut self, _: Resource<UdpSocket>) -> Result<p2udp::IpAddressFamily> {
-        socket_unavailable()
+    fn address_family(&mut self, socket: Resource<UdpSocket>) -> Result<p2udp::IpAddressFamily> {
+        let socket = self.table.get(&socket)?.clone();
+        Ok(format_p2_udp_family(socket.family()))
     }
 
     fn unicast_hop_limit(
         &mut self,
-        _: Resource<UdpSocket>,
+        socket: Resource<UdpSocket>,
     ) -> Result<core::result::Result<u8, p2udp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.unicast_hop_limit().map_err(map_p2_udp_error))
     }
 
     fn set_unicast_hop_limit(
         &mut self,
-        _: Resource<UdpSocket>,
-        _: u8,
+        socket: Resource<UdpSocket>,
+        value: u8,
     ) -> Result<core::result::Result<(), p2udp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket
+            .set_unicast_hop_limit(value)
+            .map_err(map_p2_udp_error))
     }
 
     fn receive_buffer_size(
         &mut self,
-        _: Resource<UdpSocket>,
+        socket: Resource<UdpSocket>,
     ) -> Result<core::result::Result<u64, p2udp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.receive_buffer_size().map_err(map_p2_udp_error))
     }
 
     fn set_receive_buffer_size(
         &mut self,
-        _: Resource<UdpSocket>,
-        _: u64,
+        socket: Resource<UdpSocket>,
+        value: u64,
     ) -> Result<core::result::Result<(), p2udp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket
+            .set_receive_buffer_size(value)
+            .map_err(map_p2_udp_error))
     }
 
     fn send_buffer_size(
         &mut self,
-        _: Resource<UdpSocket>,
+        socket: Resource<UdpSocket>,
     ) -> Result<core::result::Result<u64, p2udp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.send_buffer_size().map_err(map_p2_udp_error))
     }
 
     fn set_send_buffer_size(
         &mut self,
-        _: Resource<UdpSocket>,
-        _: u64,
+        socket: Resource<UdpSocket>,
+        value: u64,
     ) -> Result<core::result::Result<(), p2udp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.set_send_buffer_size(value).map_err(map_p2_udp_error))
     }
 
-    fn subscribe(&mut self, _: Resource<UdpSocket>) -> Result<Resource<p2udp::Pollable>> {
-        socket_unavailable()
+    fn subscribe(&mut self, socket: Resource<UdpSocket>) -> Result<Resource<p2udp::Pollable>> {
+        subscribe(&mut self.table, socket)
     }
 
     fn drop(&mut self, resource: Resource<UdpSocket>) -> Result<()> {
@@ -1438,22 +1581,49 @@ where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
 {
-    fn receive(
+    async fn receive(
         &mut self,
-        _: Resource<p2udp::IncomingDatagramStream>,
-        _: u64,
+        resource: Resource<p2udp::IncomingDatagramStream>,
+        max_results: u64,
     ) -> Result<core::result::Result<Vec<p2udp::IncomingDatagram>, p2udp::ErrorCode>> {
-        socket_not_supported()
+        let (socket, remote_address) = {
+            let stream = self.table.get(&resource)?;
+            (stream.socket.clone(), stream.remote_address)
+        };
+        let max_results = usize::try_from(max_results).unwrap_or(usize::MAX);
+        if max_results == 0 {
+            return Ok(Ok(Vec::new()));
+        }
+
+        let mut datagrams = Vec::new();
+        while datagrams.len() < max_results {
+            match socket.receive_datagram(remote_address, 0).await {
+                Ok(datagram) => datagrams.push(p2udp::IncomingDatagram {
+                    data: datagram.bytes,
+                    remote_address: format_p2_udp_socket_address(datagram.remote_address),
+                }),
+                Err(WasiUdpSocketError::WouldBlock) => break,
+                Err(error) if !datagrams.is_empty() => {
+                    if matches!(error, WasiUdpSocketError::WouldBlock) {
+                        break;
+                    }
+                    return Ok(Ok(datagrams));
+                }
+                Err(error) => return Ok(Err(map_p2_udp_error(error))),
+            }
+        }
+        Ok(Ok(datagrams))
     }
 
     fn subscribe(
         &mut self,
-        _: Resource<p2udp::IncomingDatagramStream>,
+        resource: Resource<p2udp::IncomingDatagramStream>,
     ) -> Result<Resource<p2udp::Pollable>> {
-        socket_unavailable()
+        subscribe(&mut self.table, resource)
     }
 
     fn drop(&mut self, resource: Resource<p2udp::IncomingDatagramStream>) -> Result<()> {
+        self.table.get(&resource)?.socket.release_stream_handle();
         delete_resource(self, resource)
     }
 }
@@ -1465,27 +1635,79 @@ where
 {
     fn check_send(
         &mut self,
-        _: Resource<p2udp::OutgoingDatagramStream>,
+        resource: Resource<p2udp::OutgoingDatagramStream>,
     ) -> Result<core::result::Result<u64, p2udp::ErrorCode>> {
-        socket_not_supported()
+        let stream = self.table.get_mut(&resource)?;
+        stream.check_send_permit_count = 1;
+        Ok(Ok(1))
     }
 
-    fn send(
+    async fn send(
         &mut self,
-        _: Resource<p2udp::OutgoingDatagramStream>,
-        _: Vec<p2udp::OutgoingDatagram>,
+        resource: Resource<p2udp::OutgoingDatagramStream>,
+        datagrams: Vec<p2udp::OutgoingDatagram>,
     ) -> Result<core::result::Result<u64, p2udp::ErrorCode>> {
-        socket_not_supported()
+        if datagrams.is_empty() {
+            return Ok(Ok(0));
+        }
+        let (socket, connected_remote) = {
+            let stream = self.table.get_mut(&resource)?;
+            if datagrams.len() > stream.check_send_permit_count as usize {
+                return Err(wasmtime::Error::msg(
+                    "udp send exceeded the permit returned by check-send",
+                ));
+            }
+            stream.check_send_permit_count -= datagrams.len() as u64;
+            (stream.socket.clone(), stream.remote_address)
+        };
+
+        let mut sent = 0_u64;
+        for datagram in datagrams {
+            let remote_address = match (connected_remote, datagram.remote_address) {
+                (Some(connected), None) => Some(connected),
+                (Some(connected), Some(provided)) => {
+                    let provided = match parse_p2_udp_socket_address(provided, socket.family()) {
+                        Ok(address) => address,
+                        Err(error) => return Ok(Err(map_p2_udp_error(error))),
+                    };
+                    if connected == provided {
+                        Some(connected)
+                    } else {
+                        return Ok(Err(p2udp::ErrorCode::InvalidArgument));
+                    }
+                }
+                (None, Some(provided)) => {
+                    let provided = match parse_p2_udp_socket_address(provided, socket.family()) {
+                        Ok(address) => address,
+                        Err(error) => return Ok(Err(map_p2_udp_error(error))),
+                    };
+                    Some(provided)
+                }
+                _ => return Ok(Err(p2udp::ErrorCode::InvalidArgument)),
+            };
+            match socket
+                .send_datagram(&datagram.data, remote_address, 0)
+                .await
+            {
+                Ok(()) => sent += 1,
+                Err(WasiUdpSocketError::WouldBlock) if sent == 0 => return Ok(Ok(0)),
+                Err(WasiUdpSocketError::WouldBlock) => return Ok(Ok(sent)),
+                Err(error) if sent == 0 => return Ok(Err(map_p2_udp_error(error))),
+                Err(_) => return Ok(Ok(sent)),
+            }
+        }
+        Ok(Ok(sent))
     }
 
     fn subscribe(
         &mut self,
-        _: Resource<p2udp::OutgoingDatagramStream>,
+        resource: Resource<p2udp::OutgoingDatagramStream>,
     ) -> Result<Resource<p2udp::Pollable>> {
-        socket_unavailable()
+        subscribe(&mut self.table, resource)
     }
 
     fn drop(&mut self, resource: Resource<p2udp::OutgoingDatagramStream>) -> Result<()> {
+        self.table.get(&resource)?.socket.release_stream_handle();
         delete_resource(self, resource)
     }
 }
@@ -1497,9 +1719,76 @@ where
 {
     fn create_udp_socket(
         &mut self,
-        _: p2udp_create::IpAddressFamily,
+        address_family: p2udp_create::IpAddressFamily,
     ) -> Result<core::result::Result<Resource<UdpSocket>, p2udp_create::ErrorCode>> {
-        socket_not_supported()
+        let family = match address_family {
+            p2udp_create::IpAddressFamily::Ipv4 => WasiUdpSocketFamily::Ipv4,
+            p2udp_create::IpAddressFamily::Ipv6 => {
+                return Ok(Err(p2udp_create::ErrorCode::NotSupported));
+            }
+        };
+        let Some(service) = self.runtime_state.network_service() else {
+            return Ok(Err(p2udp_create::ErrorCode::Unknown));
+        };
+        let resource = self.table.push(UdpSocket::new(service, family))?;
+        Ok(Ok(resource))
+    }
+}
+
+fn parse_p2_udp_socket_address(
+    address: p2udp::IpSocketAddress,
+    family: WasiUdpSocketFamily,
+) -> core::result::Result<WasiUdpSocketAddress, WasiUdpSocketError> {
+    match (family, address) {
+        (WasiUdpSocketFamily::Ipv4, p2udp::IpSocketAddress::Ipv4(address)) => {
+            Ok(WasiUdpSocketAddress {
+                address: crate::Ipv4Address::new([
+                    address.address.0,
+                    address.address.1,
+                    address.address.2,
+                    address.address.3,
+                ]),
+                port: address.port,
+            })
+        }
+        (WasiUdpSocketFamily::Ipv4, p2udp::IpSocketAddress::Ipv6(_))
+        | (WasiUdpSocketFamily::Ipv6, _) => Err(WasiUdpSocketError::NotSupported),
+    }
+}
+
+fn format_p2_udp_socket_address(address: WasiUdpSocketAddress) -> p2udp::IpSocketAddress {
+    let [a, b, c, d] = address.address.octets();
+    p2udp::IpSocketAddress::Ipv4(p2net::Ipv4SocketAddress {
+        port: address.port,
+        address: (a, b, c, d),
+    })
+}
+
+fn format_p2_udp_family(family: WasiUdpSocketFamily) -> p2udp::IpAddressFamily {
+    match family {
+        WasiUdpSocketFamily::Ipv4 => p2udp::IpAddressFamily::Ipv4,
+        WasiUdpSocketFamily::Ipv6 => p2udp::IpAddressFamily::Ipv6,
+    }
+}
+
+fn map_p2_udp_error(error: WasiUdpSocketError) -> p2udp::ErrorCode {
+    match error {
+        WasiUdpSocketError::NotSupported => p2udp::ErrorCode::NotSupported,
+        WasiUdpSocketError::InvalidArgument => p2udp::ErrorCode::InvalidArgument,
+        WasiUdpSocketError::InvalidState => p2udp::ErrorCode::InvalidState,
+        WasiUdpSocketError::NotInProgress => p2udp::ErrorCode::NotInProgress,
+        WasiUdpSocketError::AddressNotBindable => p2udp::ErrorCode::AddressNotBindable,
+        WasiUdpSocketError::DatagramTooLarge => p2udp::ErrorCode::DatagramTooLarge,
+        WasiUdpSocketError::WouldBlock
+        | WasiUdpSocketError::Backend(crate::UdpError {
+            kind: crate::UdpErrorKind::Timeout,
+            ..
+        }) => p2udp::ErrorCode::WouldBlock,
+        WasiUdpSocketError::Backend(crate::UdpError {
+            kind: crate::UdpErrorKind::UnresolvedHost,
+            ..
+        }) => p2udp::ErrorCode::NameUnresolvable,
+        WasiUdpSocketError::Backend(_) => p2udp::ErrorCode::Unknown,
     }
 }
 
@@ -1507,7 +1796,8 @@ impl<CpuImpl, HostFs> p2tcp::Host for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
-{}
+{
+}
 
 impl<CpuImpl, HostFs> p2tcp::HostTcpSocket for StoreData<CpuImpl, HostFs>
 where

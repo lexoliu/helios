@@ -176,7 +176,6 @@ impl ByteReader {
     }
 }
 
-
 pub enum TryRead {
     Ready(Vec<u8>),
     Pending,

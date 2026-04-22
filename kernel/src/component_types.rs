@@ -19,6 +19,17 @@ impl<Backend> TcpStreamResource<Backend> {
     }
 }
 
+#[derive(Clone)]
+pub struct UdpSocketResource<Backend> {
+    pub backend: Backend,
+}
+
+impl<Backend> UdpSocketResource<Backend> {
+    pub const fn new(backend: Backend) -> Self {
+        Self { backend }
+    }
+}
+
 pub struct RawMutexResource {
     pub inner: Arc<RawMutex>,
 }

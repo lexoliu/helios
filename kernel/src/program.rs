@@ -4,11 +4,11 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use crate::WasiRights;
 use core::future::Future;
 use helios_hal::cpu::Cpu;
 use helios_hal::fs::DirectoryHandle;
 use helios_hal::resource::SerialRights;
-use crate::WasiRights;
 use thiserror::Error;
 use wasmtime::{CallHook, Config, Engine, Linker, Module, ResourceLimiter, Store};
 
@@ -607,8 +607,8 @@ mod tests {
     };
 
     use super::{Blueprint, CompileError, ProgramRuntimeConfig, ProgramRuntimeError};
-    use crate::{ComputePriority, EmbeddedProgram};
     use crate::WasiRights;
+    use crate::{ComputePriority, EmbeddedProgram};
 
     fn test_runtime() -> Result<super::ProgramRuntime, ProgramRuntimeError> {
         super::ProgramRuntime::new(

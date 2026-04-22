@@ -22,6 +22,8 @@ use exec::{Bootstrap, Shell};
 use helios_api::ReadExt as _;
 use platform::HeliosPlatform;
 
+const HELIOS_PROCESS_ID_ENV: &str = "HELIOS_PROCESS_ID";
+
 #[helios_api::main]
 async fn main() -> Result<()> {
     let invocation = Invocation::from_env()?;
@@ -97,7 +99,7 @@ impl Invocation {
     fn bootstrap(&self) -> Bootstrap {
         Bootstrap {
             shell_name: self.shell_name.clone(),
-            process_id: std::process::id().to_string(),
+            process_id: current_process_id(),
             positional_parameters: self.positional_parameters.clone(),
             working_dir: PathBuf::from("/"),
             environment: env::vars().collect(),
@@ -105,9 +107,14 @@ impl Invocation {
     }
 }
 
+fn current_process_id() -> String {
+    env::var(HELIOS_PROCESS_ID_ENV).unwrap_or_else(|_| "1".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Invocation;
+    use super::{HELIOS_PROCESS_ID_ENV, Invocation, current_process_id};
+    use std::env;
 
     #[test]
     fn parse_dash_c_arguments_like_posix_shell() {
@@ -115,6 +122,17 @@ mod tests {
             Invocation::from_env_with(["dash", "-c", "echo hi", "name", "arg1", "arg2"]);
         assert_eq!(invocation.shell_name, "name");
         assert_eq!(invocation.positional_parameters, vec!["arg1", "arg2"]);
+    }
+
+    #[test]
+    fn current_process_id_prefers_kernel_injected_environment() {
+        unsafe {
+            env::set_var(HELIOS_PROCESS_ID_ENV, "42");
+        }
+        assert_eq!(current_process_id(), "42");
+        unsafe {
+            env::remove_var(HELIOS_PROCESS_ID_ENV);
+        }
     }
 }
 

@@ -3,6 +3,7 @@ use helios_hal::cpu::ProcessorId;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComponentHostProcessorRole {
     Kernel,
+    SharedRuntime,
     SystemComponent,
     ProgramWorker,
 }
@@ -10,11 +11,10 @@ pub enum ComponentHostProcessorRole {
 pub fn component_host_system_processor(
     bootstrap_processor: ProcessorId,
     processor_count: usize,
-) -> ProcessorId {
-    assert!(
-        processor_count > 1,
-        "system component topology requires at least two processors"
-    );
+) -> Option<ProcessorId> {
+    if processor_count == 1 {
+        return None;
+    }
     assert!(
         usize::from(bootstrap_processor.id()) < processor_count,
         "bootstrap processor {} is outside detected processor count {}",
@@ -23,9 +23,9 @@ pub fn component_host_system_processor(
     );
 
     if bootstrap_processor.id() == 0 {
-        ProcessorId::new(1)
+        Some(ProcessorId::new(1))
     } else {
-        ProcessorId::new(0)
+        Some(ProcessorId::new(0))
     }
 }
 
@@ -34,7 +34,8 @@ pub fn system_component_should_run_on(
     processor_count: usize,
     bootstrap_processor: ProcessorId,
 ) -> bool {
-    current_processor == component_host_system_processor(bootstrap_processor, processor_count)
+    component_host_system_processor(bootstrap_processor, processor_count)
+        .is_some_and(|processor| current_processor == processor)
 }
 
 pub fn component_host_processor_role(
@@ -43,6 +44,9 @@ pub fn component_host_processor_role(
     bootstrap_processor: ProcessorId,
 ) -> ComponentHostProcessorRole {
     if current_processor == bootstrap_processor {
+        if processor_count == 1 {
+            return ComponentHostProcessorRole::SharedRuntime;
+        }
         return ComponentHostProcessorRole::Kernel;
     }
     if system_component_should_run_on(current_processor, processor_count, bootstrap_processor) {
@@ -88,8 +92,8 @@ pub fn component_host_processors_to_start(
 #[cfg(test)]
 mod tests {
     use super::{
-        ComponentHostProcessorRole, component_host_processor_role,
-        component_host_system_processor, component_host_worker_count,
+        ComponentHostProcessorRole, component_host_processor_role, component_host_system_processor,
+        component_host_worker_count,
     };
     use helios_hal::cpu::ProcessorId;
 
@@ -97,7 +101,7 @@ mod tests {
     fn chooses_secondary_processor_for_bootstrap_zero() {
         assert_eq!(
             component_host_system_processor(ProcessorId::new(0), 4),
-            ProcessorId::new(1)
+            Some(ProcessorId::new(1))
         );
     }
 
@@ -105,8 +109,21 @@ mod tests {
     fn chooses_processor_zero_for_non_zero_bootstrap() {
         assert_eq!(
             component_host_system_processor(ProcessorId::new(2), 4),
-            ProcessorId::new(0)
+            Some(ProcessorId::new(0))
         );
+    }
+
+    #[test]
+    fn single_processor_runs_kernel_and_system_component_locally() {
+        assert_eq!(
+            component_host_system_processor(ProcessorId::new(0), 1),
+            None
+        );
+        assert_eq!(
+            component_host_processor_role(ProcessorId::new(0), 1, ProcessorId::new(0)),
+            ComponentHostProcessorRole::SharedRuntime
+        );
+        assert_eq!(component_host_worker_count(1, ProcessorId::new(0)), 0);
     }
 
     #[test]

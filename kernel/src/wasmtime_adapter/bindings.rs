@@ -14,6 +14,7 @@ pub mod debugger {
             exports: { default: async },
             with: {
                 "helios:system/net.tcp-stream": crate::ComponentTcpStream,
+                "helios:system/net.udp-socket": crate::ComponentUdpSocket,
                 "helios:system/programs.child": crate::ChildHandle,
                 "helios:system/serial.serial-port": crate::ComponentSerialPort,
                 "helios:system/sync.raw-mutex": crate::ComponentRawMutex,
@@ -43,6 +44,7 @@ pub mod program {
             exports: { default: async },
             with: {
                 "helios:system/net.tcp-stream": crate::ComponentTcpStream,
+                "helios:system/net.udp-socket": crate::ComponentUdpSocket,
                 "helios:system/programs.child": crate::ChildHandle,
                 "helios:system/serial.serial-port": crate::ComponentSerialPort,
                 "helios:system/sync.raw-mutex": crate::ComponentRawMutex,

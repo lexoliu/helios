@@ -221,6 +221,10 @@ fn discover_9p_device(
     None
 }
 
+pub(crate) fn has_9p_device(fdt: &Fdt<'_>) -> bool {
+    crate::count_virtio_mmio_devices(fdt, helios_virtio::DeviceType::_9P) != 0
+}
+
 fn is_9p_mmio_device(base: usize) -> bool {
     crate::matches_virtio_mmio_device(base, helios_virtio::DeviceType::_9P)
 }

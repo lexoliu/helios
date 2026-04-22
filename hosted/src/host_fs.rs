@@ -67,11 +67,7 @@ impl HostFileSystem for HostedFileSystem {
         offset: u64,
         max_bytes: u32,
     ) -> Self::ReadFileRangeFuture<'_> {
-        core::future::ready(read_file_range_impl(
-            &self.resolve(path),
-            offset,
-            max_bytes,
-        ))
+        core::future::ready(read_file_range_impl(&self.resolve(path), offset, max_bytes))
     }
 
     fn write_file(&self, path: &str, offset: u64, bytes: &[u8]) -> Self::WriteFileFuture<'_> {
@@ -131,20 +127,13 @@ fn read_dir_impl(path: &Path) -> Result<Vec<HostDirEntry>, HostFsError> {
             .file_name()
             .into_string()
             .unwrap_or_else(|os| os.to_string_lossy().into_owned());
-        let is_directory = entry
-            .file_type()
-            .map(|ft| ft.is_dir())
-            .unwrap_or(false);
+        let is_directory = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
         result.push(HostDirEntry { name, is_directory });
     }
     Ok(result)
 }
 
-fn read_file_range_impl(
-    path: &Path,
-    offset: u64,
-    max_bytes: u32,
-) -> Result<Vec<u8>, HostFsError> {
+fn read_file_range_impl(path: &Path, offset: u64, max_bytes: u32) -> Result<Vec<u8>, HostFsError> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = fs::File::open(path).map_err(map_io_error)?;
     file.seek(SeekFrom::Start(offset)).map_err(map_io_error)?;

@@ -62,6 +62,10 @@ pub type FileHandle<T> = KernelResource<T, FileRights>;
 pub type DirectoryHandle<T> = KernelResource<T, DirectoryRights>;
 pub type BlockDeviceHandle<T> = KernelResource<T, BlockDeviceRights>;
 
+/// Virtio 9p mount tag used by platform tooling and backends to identify the
+/// optional host-share device.
+pub const HOST_SHARE_MOUNT_TAG: &str = "hostshare";
+
 /// Filesystem lookup result with concrete, already-rights-clamped resources.
 ///
 /// The resource itself carries its own rights, so callers do not need to keep a

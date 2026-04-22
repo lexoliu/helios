@@ -81,9 +81,7 @@ impl Child {
     }
 }
 
-async fn drain_stream(
-    pair: (StreamReader<u8>, FutureReader<Result<(), ()>>),
-) -> Vec<u8> {
+async fn drain_stream(pair: (StreamReader<u8>, FutureReader<Result<(), ()>>)) -> Vec<u8> {
     use crate::wit_bindgen::rt::async_support::StreamResult;
     let (mut stream, future) = pair;
     let mut collected = Vec::new();

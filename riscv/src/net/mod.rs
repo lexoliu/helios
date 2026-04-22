@@ -23,16 +23,17 @@ use helios_hal::watchdog::Watchdog;
 use helios_kernel::{
     Ipv4Address as KernelIpv4Address, Kernel, Notify, PingError as KernelPingError,
     PingErrorKind as KernelPingErrorKind, PingReply as KernelPingReply, TcpError as KernelTcpError,
-    TcpErrorKind as KernelTcpErrorKind, Timer,
+    TcpErrorKind as KernelTcpErrorKind, Timer, UdpBinding, UdpDatagram as KernelUdpDatagram,
+    UdpError as KernelUdpError, UdpErrorKind as KernelUdpErrorKind,
 };
 use plic::Plic;
 use smoltcp::iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::{dhcpv4, dns, icmp, tcp};
+use smoltcp::socket::{dhcpv4, dns, icmp, tcp, udp};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{
     DnsQueryType, EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr,
-    Ipv4Address, Ipv4Cidr,
+    IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv4Cidr,
 };
 
 use crate::RiscvCpu;
@@ -45,8 +46,10 @@ const ICMP_PAYLOAD: &[u8] = b"helios";
 const ICMP_BUFFER_BYTES: usize = 512;
 const ICMP_BUFFER_PACKETS: usize = 4;
 const TCP_BUFFER_BYTES: usize = 8 * 1024;
-const TCP_EPHEMERAL_PORT_START: u16 = 49_152;
-const TCP_EPHEMERAL_PORT_END: u16 = 65_535;
+const UDP_BUFFER_BYTES: usize = 8 * 1024;
+const UDP_BUFFER_PACKETS: usize = 16;
+const EPHEMERAL_PORT_START: u16 = 49_152;
+const EPHEMERAL_PORT_END: u16 = 65_535;
 
 #[derive(Clone)]
 pub(crate) struct NetworkService {
@@ -80,6 +83,9 @@ pub(crate) type PingErrorKind = KernelPingErrorKind;
 pub(crate) type PingReply = KernelPingReply;
 pub(crate) type TcpError = KernelTcpError;
 pub(crate) type TcpErrorKind = KernelTcpErrorKind;
+pub(crate) type UdpDatagram = KernelUdpDatagram;
+pub(crate) type UdpError = KernelUdpError;
+pub(crate) type UdpErrorKind = KernelUdpErrorKind;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TcpStreamId(NonZeroU32);
@@ -98,12 +104,33 @@ impl helios_kernel::TcpStreamToken for TcpStreamId {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UdpSocketId(NonZeroU32);
+
+impl helios_kernel::UdpSocketToken for UdpSocketId {
+    fn into_raw(self) -> u64 {
+        u64::from(self.0.get())
+    }
+
+    fn from_raw(raw: u64) -> Self {
+        let raw = u32::try_from(raw)
+            .unwrap_or_else(|_| panic!("udp socket handle {raw} does not fit in u32"));
+        let raw =
+            NonZeroU32::new(raw).unwrap_or_else(|| panic!("udp socket handle must be non-zero"));
+        Self(raw)
+    }
+}
+
 enum NetworkRequest {
     Ping(PingRequest),
     TcpConnect(TcpConnectRequest),
     TcpWrite(TcpWriteRequest),
     TcpRead(TcpReadRequest),
     TcpClose(TcpCloseRequest),
+    UdpBind(UdpBindRequest),
+    UdpSend(UdpSendRequest),
+    UdpReceive(UdpReceiveRequest),
+    UdpClose(UdpCloseRequest),
 }
 
 struct PingRequest {
@@ -135,6 +162,32 @@ struct TcpReadRequest {
 
 struct TcpCloseRequest {
     stream: TcpStreamId,
+    response: RequestResponse<()>,
+}
+
+struct UdpBindRequest {
+    local_port: u16,
+    response: RequestResponse<Result<UdpBinding<UdpSocketId>, UdpError>>,
+}
+
+struct UdpSendRequest {
+    socket: UdpSocketId,
+    host: String,
+    port: u16,
+    bytes: Vec<u8>,
+    timeout_nanos: u64,
+    response: RequestResponse<Result<u64, UdpError>>,
+}
+
+struct UdpReceiveRequest {
+    socket: UdpSocketId,
+    max_bytes: u32,
+    timeout_nanos: u64,
+    response: RequestResponse<Result<Option<UdpDatagram>, UdpError>>,
+}
+
+struct UdpCloseRequest {
+    socket: UdpSocketId,
     response: RequestResponse<()>,
 }
 
@@ -194,11 +247,17 @@ struct NetworkState {
     dns_servers: Vec<IpAddress>,
     next_echo_sequence: u16,
     next_tcp_local_port: u16,
+    next_udp_local_port: u16,
     tcp_streams: Vec<Option<TcpStreamState>>,
+    udp_sockets: Vec<Option<UdpSocketState>>,
     max_frame_len: usize,
 }
 
 struct TcpStreamState {
+    handle: SocketHandle,
+}
+
+struct UdpSocketState {
     handle: SocketHandle,
 }
 
@@ -239,6 +298,11 @@ enum TcpReadProgress {
     Pending,
     Data(Vec<u8>),
     Eof,
+}
+
+enum UdpReceiveProgress {
+    Pending,
+    Data(UdpDatagram),
 }
 
 fn map_ipv4_address(address: Ipv4Address) -> KernelIpv4Address {
@@ -408,6 +472,63 @@ impl NetworkService {
         response.wait().await;
     }
 
+    pub(crate) async fn udp_bind(
+        &self,
+        local_port: u16,
+    ) -> Result<UdpBinding<UdpSocketId>, UdpError> {
+        let response = RequestResponse::new();
+        self.enqueue_request(NetworkRequest::UdpBind(UdpBindRequest {
+            local_port,
+            response: response.clone(),
+        }));
+        response.wait().await
+    }
+
+    pub(crate) async fn udp_send(
+        &self,
+        socket: UdpSocketId,
+        host: &str,
+        port: u16,
+        bytes: &[u8],
+        timeout_nanos: u64,
+    ) -> Result<u64, UdpError> {
+        let response = RequestResponse::new();
+        self.enqueue_request(NetworkRequest::UdpSend(UdpSendRequest {
+            socket,
+            host: host.to_owned(),
+            port,
+            bytes: bytes.to_vec(),
+            timeout_nanos,
+            response: response.clone(),
+        }));
+        response.wait().await
+    }
+
+    pub(crate) async fn udp_receive(
+        &self,
+        socket: UdpSocketId,
+        max_bytes: u32,
+        timeout_nanos: u64,
+    ) -> Result<Option<UdpDatagram>, UdpError> {
+        let response = RequestResponse::new();
+        self.enqueue_request(NetworkRequest::UdpReceive(UdpReceiveRequest {
+            socket,
+            max_bytes,
+            timeout_nanos,
+            response: response.clone(),
+        }));
+        response.wait().await
+    }
+
+    pub(crate) async fn udp_close(&self, socket: UdpSocketId) {
+        let response = RequestResponse::new();
+        self.enqueue_request(NetworkRequest::UdpClose(UdpCloseRequest {
+            socket,
+            response: response.clone(),
+        }));
+        response.wait().await;
+    }
+
     fn enqueue_request(&self, request: NetworkRequest) {
         match self.inner.requests.push(request) {
             Ok(()) => self.inner.request_ready.notify_one(),
@@ -454,6 +575,40 @@ impl NetworkService {
                         .lock()
                         .await
                         .remove_tcp_stream(request.stream);
+                    request.response.complete(()).await;
+                }
+                NetworkRequest::UdpBind(request) => {
+                    let result = self.execute_udp_bind(request.local_port).await;
+                    request.response.complete(result).await;
+                }
+                NetworkRequest::UdpSend(request) => {
+                    let result = self
+                        .execute_udp_send(
+                            request.socket,
+                            &request.host,
+                            request.port,
+                            &request.bytes,
+                            request.timeout_nanos,
+                        )
+                        .await;
+                    request.response.complete(result).await;
+                }
+                NetworkRequest::UdpReceive(request) => {
+                    let result = self
+                        .execute_udp_receive(
+                            request.socket,
+                            request.max_bytes,
+                            request.timeout_nanos,
+                        )
+                        .await;
+                    request.response.complete(result).await;
+                }
+                NetworkRequest::UdpClose(request) => {
+                    self.inner
+                        .state
+                        .lock()
+                        .await
+                        .remove_udp_socket(request.socket);
                     request.response.complete(()).await;
                 }
             }
@@ -612,6 +767,84 @@ impl NetworkService {
         }
     }
 
+    async fn execute_udp_bind(&self, local_port: u16) -> Result<UdpBinding<UdpSocketId>, UdpError> {
+        let mut state = self.inner.state.lock().await;
+        state.start_udp_bind(local_port)
+    }
+
+    async fn execute_udp_send(
+        &self,
+        socket: UdpSocketId,
+        host: &str,
+        port: u16,
+        bytes: &[u8],
+        timeout_nanos: u64,
+    ) -> Result<u64, UdpError> {
+        let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
+        self.wait_for_ipv4_udp(deadline_nanos).await?;
+        let destination = self.resolve_host_udp(host, deadline_nanos).await?;
+        loop {
+            self.drive_udp().await?;
+            let now_nanos = self.now_nanos();
+            let next_wait = {
+                let mut state = self.inner.state.lock().await;
+                match state.try_send_udp(socket, destination, port, bytes)? {
+                    Some(written) => {
+                        return Ok(u64::try_from(written).unwrap_or_else(|_| {
+                            panic!("udp write length {} exceeds u64", written)
+                        }));
+                    }
+                    None => {
+                        if now_nanos >= deadline_nanos {
+                            return Err(UdpError {
+                                kind: UdpErrorKind::Timeout,
+                                detail: format!(
+                                    "udp send to {}:{} timed out",
+                                    format_ipv4(destination),
+                                    port
+                                ),
+                            });
+                        }
+                        state.next_wait_duration(now_nanos, deadline_nanos)
+                    }
+                }
+            };
+            self.wait_for_progress(next_wait).await;
+        }
+    }
+
+    async fn execute_udp_receive(
+        &self,
+        socket: UdpSocketId,
+        max_bytes: u32,
+        timeout_nanos: u64,
+    ) -> Result<Option<UdpDatagram>, UdpError> {
+        let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
+        loop {
+            self.drive_udp().await?;
+            let now_nanos = self.now_nanos();
+            let next_wait = {
+                let mut state = self.inner.state.lock().await;
+                match state.poll_udp_receive(socket, max_bytes as usize)? {
+                    UdpReceiveProgress::Data(datagram) => return Ok(Some(datagram)),
+                    UdpReceiveProgress::Pending => {
+                        if now_nanos >= deadline_nanos {
+                            return Err(UdpError {
+                                kind: UdpErrorKind::Timeout,
+                                detail: format!(
+                                    "udp receive on socket {} timed out",
+                                    socket.0.get()
+                                ),
+                            });
+                        }
+                        state.next_wait_duration(now_nanos, deadline_nanos)
+                    }
+                }
+            };
+            self.wait_for_progress(next_wait).await;
+        }
+    }
+
     async fn wait_for_ipv4_ping(&self, deadline_nanos: u64) -> Result<(), PingError> {
         self.wait_until_ping(
             deadline_nanos,
@@ -636,6 +869,27 @@ impl NetworkService {
                 if now_nanos >= deadline_nanos {
                     return Err(TcpError {
                         kind: TcpErrorKind::Timeout,
+                        detail: "network configuration timed out".to_owned(),
+                    });
+                }
+                state.next_wait_duration(now_nanos, deadline_nanos)
+            };
+            self.wait_for_progress(next_wait).await;
+        }
+    }
+
+    async fn wait_for_ipv4_udp(&self, deadline_nanos: u64) -> Result<(), UdpError> {
+        loop {
+            self.drive_udp().await?;
+            let now_nanos = self.now_nanos();
+            let next_wait = {
+                let mut state = self.inner.state.lock().await;
+                if state.is_configured() {
+                    return Ok(());
+                }
+                if now_nanos >= deadline_nanos {
+                    return Err(UdpError {
+                        kind: UdpErrorKind::Timeout,
                         detail: "network configuration timed out".to_owned(),
                     });
                 }
@@ -717,6 +971,42 @@ impl NetworkService {
         }
     }
 
+    async fn resolve_host_udp(
+        &self,
+        host: &str,
+        deadline_nanos: u64,
+    ) -> Result<Ipv4Address, UdpError> {
+        if let Some(address) = parse_ipv4(host) {
+            return Ok(address);
+        }
+
+        let query = {
+            let mut state = self.inner.state.lock().await;
+            state.start_dns_query_udp(host)?
+        };
+        loop {
+            self.drive_udp().await?;
+            let now_nanos = self.now_nanos();
+            let next_wait = {
+                let mut state = self.inner.state.lock().await;
+                match state.take_dns_result_udp(query)? {
+                    Some(address) => return Ok(address),
+                    None => {
+                        if now_nanos >= deadline_nanos {
+                            state.cancel_dns_query(query);
+                            return Err(UdpError {
+                                kind: UdpErrorKind::Timeout,
+                                detail: format!("dns lookup for {host} timed out"),
+                            });
+                        }
+                        state.next_wait_duration(now_nanos, deadline_nanos)
+                    }
+                }
+            };
+            self.wait_for_progress(next_wait).await;
+        }
+    }
+
     async fn wait_until_ping<T>(
         &self,
         deadline_nanos: u64,
@@ -752,6 +1042,12 @@ impl NetworkService {
         self.drive_network()
             .await
             .map_err(|error| TcpError::from_io(error, "failed to advance virtio network"))
+    }
+
+    async fn drive_udp(&self) -> Result<(), UdpError> {
+        self.drive_network()
+            .await
+            .map_err(|error| UdpError::from_io(error, "failed to advance virtio network"))
     }
 
     async fn drive_network(&self) -> Result<(), IoError> {
@@ -818,6 +1114,7 @@ impl NetworkService {
 
 impl helios_kernel::ComponentNetworkService for NetworkService {
     type TcpStream = TcpStreamId;
+    type UdpSocket = UdpSocketId;
 
     type PingFuture<'a>
         = Pin<Box<dyn Future<Output = Result<KernelPingReply, KernelPingError>> + Send + 'a>>
@@ -840,6 +1137,29 @@ impl helios_kernel::ComponentNetworkService for NetworkService {
         Self: 'a;
 
     type TcpCloseFuture<'a>
+        = Pin<Box<dyn Future<Output = ()> + Send + 'a>>
+    where
+        Self: 'a;
+
+    type UdpBindFuture<'a>
+        = Pin<
+        Box<dyn Future<Output = Result<UdpBinding<Self::UdpSocket>, KernelUdpError>> + Send + 'a>,
+    >
+    where
+        Self: 'a;
+
+    type UdpSendFuture<'a>
+        = Pin<Box<dyn Future<Output = Result<u64, KernelUdpError>> + Send + 'a>>
+    where
+        Self: 'a;
+
+    type UdpReceiveFuture<'a>
+        =
+        Pin<Box<dyn Future<Output = Result<Option<KernelUdpDatagram>, KernelUdpError>> + Send + 'a>>
+    where
+        Self: 'a;
+
+    type UdpCloseFuture<'a>
         = Pin<Box<dyn Future<Output = ()> + Send + 'a>>
     where
         Self: 'a;
@@ -880,6 +1200,44 @@ impl helios_kernel::ComponentNetworkService for NetworkService {
     fn tcp_close(&self, stream: Self::TcpStream) -> Self::TcpCloseFuture<'_> {
         let service = self.clone();
         Box::pin(async move { service.tcp_close(stream).await })
+    }
+
+    fn udp_bind(&self, local_port: u16) -> Self::UdpBindFuture<'_> {
+        let service = self.clone();
+        Box::pin(async move { service.udp_bind(local_port).await })
+    }
+
+    fn udp_send(
+        &self,
+        socket: Self::UdpSocket,
+        host: &str,
+        port: u16,
+        bytes: &[u8],
+        timeout_nanos: u64,
+    ) -> Self::UdpSendFuture<'_> {
+        let service = self.clone();
+        let host = host.to_owned();
+        let bytes = bytes.to_vec();
+        Box::pin(async move {
+            service
+                .udp_send(socket, &host, port, &bytes, timeout_nanos)
+                .await
+        })
+    }
+
+    fn udp_receive(
+        &self,
+        socket: Self::UdpSocket,
+        max_bytes: u32,
+        timeout_nanos: u64,
+    ) -> Self::UdpReceiveFuture<'_> {
+        let service = self.clone();
+        Box::pin(async move { service.udp_receive(socket, max_bytes, timeout_nanos).await })
+    }
+
+    fn udp_close(&self, socket: Self::UdpSocket) -> Self::UdpCloseFuture<'_> {
+        let service = self.clone();
+        Box::pin(async move { service.udp_close(socket).await })
     }
 }
 
@@ -969,8 +1327,10 @@ impl NetworkState {
             ipv4_address: None,
             dns_servers: Vec::new(),
             next_echo_sequence: 1,
-            next_tcp_local_port: TCP_EPHEMERAL_PORT_START,
+            next_tcp_local_port: EPHEMERAL_PORT_START,
+            next_udp_local_port: EPHEMERAL_PORT_START,
             tcp_streams: Vec::new(),
+            udp_sockets: Vec::new(),
             max_frame_len,
         }
     }
@@ -1071,6 +1431,23 @@ impl NetworkState {
             })
     }
 
+    fn start_dns_query_udp(&mut self, host: &str) -> Result<dns::QueryHandle, UdpError> {
+        if self.dns_servers.is_empty() {
+            return Err(UdpError {
+                kind: UdpErrorKind::Unavailable,
+                detail: "no DNS servers are configured yet".to_owned(),
+            });
+        }
+
+        self.sockets
+            .get_mut::<dns::Socket>(self.dns_handle)
+            .start_query(self.iface.context(), host, DnsQueryType::A)
+            .map_err(|error| UdpError {
+                kind: UdpErrorKind::UnresolvedHost,
+                detail: format!("failed to start DNS query for {host}: {error}"),
+            })
+    }
+
     fn take_dns_result(
         &mut self,
         query: dns::QueryHandle,
@@ -1106,6 +1483,26 @@ impl NetworkState {
             Err(dns::GetQueryResultError::Pending) => Ok(None),
             Err(dns::GetQueryResultError::Failed) => Err(TcpError {
                 kind: TcpErrorKind::UnresolvedHost,
+                detail: "DNS lookup failed".to_owned(),
+            }),
+        }
+    }
+
+    fn take_dns_result_udp(
+        &mut self,
+        query: dns::QueryHandle,
+    ) -> Result<Option<Ipv4Address>, UdpError> {
+        match self
+            .sockets
+            .get_mut::<dns::Socket>(self.dns_handle)
+            .get_query_result(query)
+        {
+            Ok(addresses) => Ok(addresses.into_iter().next().map(|address| match address {
+                IpAddress::Ipv4(address) => address,
+            })),
+            Err(dns::GetQueryResultError::Pending) => Ok(None),
+            Err(dns::GetQueryResultError::Failed) => Err(UdpError {
+                kind: UdpErrorKind::UnresolvedHost,
                 detail: "DNS lookup failed".to_owned(),
             }),
         }
@@ -1282,9 +1679,123 @@ impl NetworkState {
         }
     }
 
+    fn start_udp_bind(&mut self, local_port: u16) -> Result<UdpBinding<UdpSocketId>, UdpError> {
+        let local_port = if local_port == 0 {
+            self.allocate_udp_local_port()?
+        } else if self.is_udp_local_port_free(local_port) {
+            local_port
+        } else {
+            return Err(UdpError {
+                kind: UdpErrorKind::Unavailable,
+                detail: format!("udp local port {local_port} is already in use"),
+            });
+        };
+
+        let socket = udp::Socket::new(
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; UDP_BUFFER_PACKETS],
+                vec![0; UDP_BUFFER_BYTES],
+            ),
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; UDP_BUFFER_PACKETS],
+                vec![0; UDP_BUFFER_BYTES],
+            ),
+        );
+        let handle = self.sockets.add(socket);
+        let bind_result = self
+            .sockets
+            .get_mut::<udp::Socket>(handle)
+            .bind(IpListenEndpoint {
+                addr: None,
+                port: local_port,
+            });
+        if let Err(error) = bind_result {
+            let _ = self.sockets.remove(handle);
+            return Err(UdpError {
+                kind: UdpErrorKind::Unavailable,
+                detail: format!("failed to bind udp socket on port {local_port}: {error}"),
+            });
+        }
+
+        Ok(UdpBinding {
+            socket: self.insert_udp_socket(handle),
+            local_port,
+        })
+    }
+
+    fn try_send_udp(
+        &mut self,
+        socket: UdpSocketId,
+        destination: Ipv4Address,
+        port: u16,
+        bytes: &[u8],
+    ) -> Result<Option<usize>, UdpError> {
+        let socket = self.udp_socket_mut(socket)?;
+        if socket.can_send() {
+            if bytes.len() > socket.payload_send_capacity() {
+                return Err(UdpError {
+                    kind: UdpErrorKind::Unavailable,
+                    detail: format!(
+                        "udp datagram length {} exceeds transmit capacity {}",
+                        bytes.len(),
+                        socket.payload_send_capacity()
+                    ),
+                });
+            }
+            socket
+                .send_slice(
+                    bytes,
+                    IpEndpoint {
+                        addr: IpAddress::Ipv4(destination),
+                        port,
+                    },
+                )
+                .map_err(|error| UdpError {
+                    kind: UdpErrorKind::Unavailable,
+                    detail: format!("failed to queue udp datagram: {error}"),
+                })?;
+            return Ok(Some(bytes.len()));
+        }
+        Ok(None)
+    }
+
+    fn poll_udp_receive(
+        &mut self,
+        socket: UdpSocketId,
+        max_bytes: usize,
+    ) -> Result<UdpReceiveProgress, UdpError> {
+        let socket = self.udp_socket_mut(socket)?;
+        if socket.can_recv() {
+            let mut bytes = vec![0; max_bytes.max(1)];
+            let (read, metadata) = socket.recv_slice(&mut bytes).map_err(|error| UdpError {
+                kind: UdpErrorKind::Unavailable,
+                detail: format!("failed to receive udp datagram: {error}"),
+            })?;
+            bytes.truncate(read);
+            let IpAddress::Ipv4(address) = metadata.endpoint.addr;
+            return Ok(UdpReceiveProgress::Data(UdpDatagram {
+                address: map_ipv4_address(address),
+                port: metadata.endpoint.port,
+                bytes,
+            }));
+        }
+        Ok(UdpReceiveProgress::Pending)
+    }
+
     fn remove_tcp_stream(&mut self, stream: TcpStreamId) {
         let index = stream_index(stream);
         let Some(slot) = self.tcp_streams.get_mut(index) else {
+            return;
+        };
+        let Some(state) = slot.take() else {
+            return;
+        };
+        let _ = self.sockets.remove(state.handle);
+    }
+
+    fn remove_udp_socket(&mut self, socket: UdpSocketId) {
+        let index = socket_index(socket);
+        let Some(slot) = self.udp_sockets.get_mut(index) else {
             return;
         };
         let Some(state) = slot.take() else {
@@ -1308,6 +1819,21 @@ impl NetworkState {
         tcp_stream_id(self.tcp_streams.len() - 1)
     }
 
+    fn insert_udp_socket(&mut self, handle: SocketHandle) -> UdpSocketId {
+        if let Some((index, slot)) = self
+            .udp_sockets
+            .iter_mut()
+            .enumerate()
+            .find(|(_, slot)| slot.is_none())
+        {
+            *slot = Some(UdpSocketState { handle });
+            return udp_socket_id(index);
+        }
+
+        self.udp_sockets.push(Some(UdpSocketState { handle }));
+        udp_socket_id(self.udp_sockets.len() - 1)
+    }
+
     fn tcp_socket_mut(
         &mut self,
         stream: TcpStreamId,
@@ -1324,12 +1850,28 @@ impl NetworkState {
         Ok(self.sockets.get_mut::<tcp::Socket>(handle))
     }
 
+    fn udp_socket_mut(
+        &mut self,
+        socket: UdpSocketId,
+    ) -> Result<&mut udp::Socket<'static>, UdpError> {
+        let handle = self
+            .udp_sockets
+            .get(socket_index(socket))
+            .and_then(|slot| slot.as_ref())
+            .map(|state| state.handle)
+            .ok_or_else(|| UdpError {
+                kind: UdpErrorKind::Unavailable,
+                detail: format!("unknown udp socket {}", socket.0.get()),
+            })?;
+        Ok(self.sockets.get_mut::<udp::Socket>(handle))
+    }
+
     fn allocate_tcp_local_port(&mut self) -> Result<u16, TcpError> {
-        let attempts = usize::from(TCP_EPHEMERAL_PORT_END - TCP_EPHEMERAL_PORT_START) + 1;
+        let attempts = usize::from(EPHEMERAL_PORT_END - EPHEMERAL_PORT_START) + 1;
         for _ in 0..attempts {
             let candidate = self.next_tcp_local_port;
-            self.next_tcp_local_port = if self.next_tcp_local_port == TCP_EPHEMERAL_PORT_END {
-                TCP_EPHEMERAL_PORT_START
+            self.next_tcp_local_port = if self.next_tcp_local_port == EPHEMERAL_PORT_END {
+                EPHEMERAL_PORT_START
             } else {
                 self.next_tcp_local_port + 1
             };
@@ -1344,12 +1886,42 @@ impl NetworkState {
         })
     }
 
+    fn allocate_udp_local_port(&mut self) -> Result<u16, UdpError> {
+        let attempts = usize::from(EPHEMERAL_PORT_END - EPHEMERAL_PORT_START) + 1;
+        for _ in 0..attempts {
+            let candidate = self.next_udp_local_port;
+            self.next_udp_local_port = if self.next_udp_local_port == EPHEMERAL_PORT_END {
+                EPHEMERAL_PORT_START
+            } else {
+                self.next_udp_local_port + 1
+            };
+            if self.is_udp_local_port_free(candidate) {
+                return Ok(candidate);
+            }
+        }
+
+        Err(UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: "no ephemeral udp ports are available".to_owned(),
+        })
+    }
+
     fn is_tcp_local_port_free(&self, port: u16) -> bool {
         self.tcp_streams.iter().flatten().all(|state| {
             self.sockets
                 .get::<tcp::Socket>(state.handle)
                 .local_endpoint()
                 .is_none_or(|endpoint| endpoint.port != port)
+        })
+    }
+
+    fn is_udp_local_port_free(&self, port: u16) -> bool {
+        self.udp_sockets.iter().flatten().all(|state| {
+            self.sockets
+                .get::<udp::Socket>(state.handle)
+                .endpoint()
+                .port
+                != port
         })
     }
 
@@ -1453,6 +2025,10 @@ impl NetworkProbe {
         self.plic.enable(self.irq_source, self.context);
         self.plic.set_threshold(self.context, 0);
     }
+}
+
+pub(crate) fn has_network_device(fdt: &Fdt<'_>) -> bool {
+    crate::count_virtio_mmio_devices(fdt, helios_virtio::DeviceType::Network) != 0
 }
 
 impl plic::HartContext for PlicContext {
@@ -1618,6 +2194,17 @@ fn tcp_stream_id(index: usize) -> TcpStreamId {
 fn stream_index(stream: TcpStreamId) -> usize {
     usize::try_from(stream.0.get() - 1)
         .unwrap_or_else(|_| panic!("tcp stream id {} does not fit into usize", stream.0.get()))
+}
+
+fn udp_socket_id(index: usize) -> UdpSocketId {
+    let raw =
+        u32::try_from(index + 1).unwrap_or_else(|_| panic!("udp socket index {index} exceeds u32"));
+    UdpSocketId(NonZeroU32::new(raw).unwrap_or_else(|| panic!("udp socket ids must never be zero")))
+}
+
+fn socket_index(socket: UdpSocketId) -> usize {
+    usize::try_from(socket.0.get() - 1)
+        .unwrap_or_else(|_| panic!("udp socket id {} does not fit into usize", socket.0.get()))
 }
 
 fn parse_cpu_hart_id(node: FdtNode<'_, '_>, address_cells: usize) -> Option<u16> {

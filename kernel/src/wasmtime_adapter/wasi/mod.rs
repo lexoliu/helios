@@ -4,25 +4,33 @@ use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
+use crate::{
+    ComponentNetworkService, EmbeddedBootFile, EmbeddedBootFs, HostFsErrorKind, embedded_init,
+    yield_now,
+};
 use futures::channel::oneshot;
 use helios_hal::cpu::Cpu;
+use spin::Mutex;
 use wasmtime::component::{
     Access, Accessor, Destination, FutureReader, HasSelf, Linker, Resource, Source, StreamConsumer,
     StreamProducer, StreamReader, StreamResult, VecBuffer,
 };
 use wasmtime::{self, Result};
-use crate::{EmbeddedBootFile, EmbeddedBootFs, HostFsErrorKind, embedded_init, yield_now};
 
 use crate::component_host::{OutputStreamKind, StoreData};
 
 pub(crate) type FsNodeKind = crate::ComponentFsNodeKind;
 const FILE_READ_CHUNK_BYTES: usize = 1024 * 1024;
+const DEFAULT_WASI_UDP_BUFFER_BYTES: u64 = 64 * 1024;
+const DEFAULT_WASI_UDP_HOP_LIMIT: u8 = 64;
+const MAX_WASI_UDP_DATAGRAM_BYTES: usize = u16::MAX as usize;
 
 pub(crate) mod p2;
 
@@ -41,26 +49,80 @@ where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
 {
-
-    wasi::clocks::monotonic_clock::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    wasi::clocks::system_clock::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    wasi::cli::environment::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    wasi::cli::exit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, &Default::default(), |state| state)?;
-    wasi::cli::stdin::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    wasi::cli::stdout::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    wasi::cli::stderr::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    wasi::cli::terminal_input::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    wasi::cli::terminal_output::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    wasi::cli::terminal_stdin::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    wasi::cli::terminal_stdout::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    wasi::cli::terminal_stderr::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    wasi::random::random::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    wasi::random::insecure::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    wasi::random::insecure_seed::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    wasi::filesystem::types::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    wasi::filesystem::preopens::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    wasi::sockets::types::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
-    wasi::sockets::ip_name_lookup::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| state)?;
+    wasi::clocks::monotonic_clock::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
+    wasi::clocks::system_clock::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
+    wasi::cli::environment::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
+    wasi::cli::exit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        &Default::default(),
+        |state| state,
+    )?;
+    wasi::cli::stdin::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| {
+        state
+    })?;
+    wasi::cli::stdout::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| {
+        state
+    })?;
+    wasi::cli::stderr::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(linker, |state| {
+        state
+    })?;
+    wasi::cli::terminal_input::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
+    wasi::cli::terminal_output::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
+    wasi::cli::terminal_stdin::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
+    wasi::cli::terminal_stdout::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
+    wasi::cli::terminal_stderr::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
+    wasi::random::random::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
+    wasi::random::insecure::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
+    wasi::random::insecure_seed::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
+    wasi::filesystem::types::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
+    wasi::filesystem::preopens::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
+    wasi::sockets::types::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
+    wasi::sockets::ip_name_lookup::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+        linker,
+        |state| state,
+    )?;
     Ok(())
 }
 
@@ -85,7 +147,63 @@ pub struct TerminalInput;
 pub struct TerminalOutput;
 pub struct P2Network;
 pub struct TcpSocket;
-pub struct UdpSocket;
+#[derive(Clone)]
+pub struct UdpSocket {
+    inner: Arc<Mutex<UdpSocketState>>,
+}
+
+pub struct P2IncomingDatagramStream {
+    socket: UdpSocket,
+    remote_address: Option<WasiUdpSocketAddress>,
+}
+
+pub struct P2OutgoingDatagramStream {
+    socket: UdpSocket,
+    remote_address: Option<WasiUdpSocketAddress>,
+    check_send_permit_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WasiUdpSocketFamily {
+    Ipv4,
+    Ipv6,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WasiUdpSocketAddress {
+    address: crate::Ipv4Address,
+    port: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BoundUdpSocket {
+    socket: u64,
+    local_port: u16,
+}
+
+struct UdpSocketState {
+    service: crate::DynamicNetworkService,
+    family: WasiUdpSocketFamily,
+    bound: Option<BoundUdpSocket>,
+    pending_bind: Option<BoundUdpSocket>,
+    remote_address: Option<WasiUdpSocketAddress>,
+    hop_limit: u8,
+    receive_buffer_size: u64,
+    send_buffer_size: u64,
+    open_stream_handles: usize,
+}
+
+#[derive(Debug)]
+enum WasiUdpSocketError {
+    NotSupported,
+    InvalidArgument,
+    InvalidState,
+    NotInProgress,
+    AddressNotBindable,
+    DatagramTooLarge,
+    WouldBlock,
+    Backend(crate::UdpError),
+}
 
 #[repr(transparent)]
 pub struct TrappableError<T> {
@@ -133,6 +251,352 @@ impl<T> core::fmt::Display for TrappableError<T> {
 }
 
 impl<T> core::error::Error for TrappableError<T> {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WasiUdpSocketDatagram {
+    bytes: Vec<u8>,
+    remote_address: WasiUdpSocketAddress,
+}
+
+impl UdpSocket {
+    fn new(service: crate::DynamicNetworkService, family: WasiUdpSocketFamily) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(UdpSocketState {
+                service,
+                family,
+                bound: None,
+                pending_bind: None,
+                remote_address: None,
+                hop_limit: DEFAULT_WASI_UDP_HOP_LIMIT,
+                receive_buffer_size: DEFAULT_WASI_UDP_BUFFER_BYTES,
+                send_buffer_size: DEFAULT_WASI_UDP_BUFFER_BYTES,
+                open_stream_handles: 0,
+            })),
+        }
+    }
+
+    fn family(&self) -> WasiUdpSocketFamily {
+        self.inner.lock().family
+    }
+
+    fn local_address(&self) -> core::result::Result<WasiUdpSocketAddress, WasiUdpSocketError> {
+        let state = self.inner.lock();
+        let Some(bound) = state.bound else {
+            return Err(WasiUdpSocketError::InvalidState);
+        };
+        Ok(WasiUdpSocketAddress {
+            address: crate::Ipv4Address::new([0, 0, 0, 0]),
+            port: bound.local_port,
+        })
+    }
+
+    fn remote_address(&self) -> core::result::Result<WasiUdpSocketAddress, WasiUdpSocketError> {
+        self.inner
+            .lock()
+            .remote_address
+            .ok_or(WasiUdpSocketError::InvalidState)
+    }
+
+    fn unicast_hop_limit(&self) -> core::result::Result<u8, WasiUdpSocketError> {
+        Ok(self.inner.lock().hop_limit)
+    }
+
+    fn set_unicast_hop_limit(&self, value: u8) -> core::result::Result<(), WasiUdpSocketError> {
+        if value == 0 {
+            return Err(WasiUdpSocketError::InvalidArgument);
+        }
+        self.inner.lock().hop_limit = value;
+        Ok(())
+    }
+
+    fn receive_buffer_size(&self) -> core::result::Result<u64, WasiUdpSocketError> {
+        Ok(self.inner.lock().receive_buffer_size)
+    }
+
+    fn set_receive_buffer_size(&self, value: u64) -> core::result::Result<(), WasiUdpSocketError> {
+        if value == 0 {
+            return Err(WasiUdpSocketError::InvalidArgument);
+        }
+        self.inner.lock().receive_buffer_size = value;
+        Ok(())
+    }
+
+    fn send_buffer_size(&self) -> core::result::Result<u64, WasiUdpSocketError> {
+        Ok(self.inner.lock().send_buffer_size)
+    }
+
+    fn set_send_buffer_size(&self, value: u64) -> core::result::Result<(), WasiUdpSocketError> {
+        if value == 0 {
+            return Err(WasiUdpSocketError::InvalidArgument);
+        }
+        self.inner.lock().send_buffer_size = value;
+        Ok(())
+    }
+
+    async fn bind(
+        &self,
+        local_address: WasiUdpSocketAddress,
+    ) -> core::result::Result<(), WasiUdpSocketError> {
+        validate_udp_local_address(self.family(), local_address)?;
+        self.bind_backend(local_address.port, false).await
+    }
+
+    async fn start_bind_p2(
+        &self,
+        local_address: WasiUdpSocketAddress,
+    ) -> core::result::Result<(), WasiUdpSocketError> {
+        validate_udp_local_address(self.family(), local_address)?;
+        self.bind_backend(local_address.port, true).await
+    }
+
+    fn finish_bind_p2(&self) -> core::result::Result<(), WasiUdpSocketError> {
+        let mut state = self.inner.lock();
+        let Some(bound) = state.pending_bind.take() else {
+            return Err(WasiUdpSocketError::NotInProgress);
+        };
+        assert!(
+            state.bound.is_none(),
+            "udp socket completed a p2 bind while already bound"
+        );
+        state.bound = Some(bound);
+        Ok(())
+    }
+
+    async fn connect(
+        &self,
+        remote_address: WasiUdpSocketAddress,
+    ) -> core::result::Result<(), WasiUdpSocketError> {
+        validate_udp_remote_address(self.family(), remote_address)?;
+        let _ = self.ensure_bound(0).await?;
+        self.inner.lock().remote_address = Some(remote_address);
+        Ok(())
+    }
+
+    fn disconnect(&self) -> core::result::Result<(), WasiUdpSocketError> {
+        let mut state = self.inner.lock();
+        if state.remote_address.is_none() {
+            return Err(WasiUdpSocketError::InvalidState);
+        }
+        state.remote_address = None;
+        Ok(())
+    }
+
+    fn open_p2_streams(
+        &self,
+        remote_address: Option<WasiUdpSocketAddress>,
+    ) -> core::result::Result<
+        (P2IncomingDatagramStream, P2OutgoingDatagramStream),
+        WasiUdpSocketError,
+    > {
+        if let Some(remote_address) = remote_address {
+            validate_udp_remote_address(self.family(), remote_address)?;
+        }
+        let mut state = self.inner.lock();
+        if state.pending_bind.is_some() || state.bound.is_none() {
+            return Err(WasiUdpSocketError::InvalidState);
+        }
+        if state.open_stream_handles != 0 {
+            return Err(WasiUdpSocketError::InvalidState);
+        }
+        state.remote_address = remote_address;
+        state.open_stream_handles = 2;
+        let incoming = P2IncomingDatagramStream {
+            socket: self.clone(),
+            remote_address,
+        };
+        let outgoing = P2OutgoingDatagramStream {
+            socket: self.clone(),
+            remote_address,
+            check_send_permit_count: 0,
+        };
+        Ok((incoming, outgoing))
+    }
+
+    fn release_stream_handle(&self) {
+        let mut state = self.inner.lock();
+        if state.open_stream_handles == 0 {
+            return;
+        }
+        state.open_stream_handles -= 1;
+    }
+
+    async fn send_datagram(
+        &self,
+        bytes: &[u8],
+        remote_address: Option<WasiUdpSocketAddress>,
+        timeout_nanos: u64,
+    ) -> core::result::Result<(), WasiUdpSocketError> {
+        if bytes.len() > MAX_WASI_UDP_DATAGRAM_BYTES {
+            return Err(WasiUdpSocketError::DatagramTooLarge);
+        }
+        let target = {
+            let state = self.inner.lock();
+            resolve_udp_send_target(&state, remote_address)?
+        };
+        let bound = self.ensure_bound(0).await?;
+        let service = self.inner.lock().service.clone();
+        let host = format_ipv4_address(target.address);
+        let written = service
+            .udp_send(bound.socket, &host, target.port, bytes, timeout_nanos)
+            .await
+            .map_err(WasiUdpSocketError::Backend)?;
+        assert!(
+            usize::try_from(written).ok() == Some(bytes.len()),
+            "kernel udp service reported a partial datagram write"
+        );
+        Ok(())
+    }
+
+    async fn receive_datagram(
+        &self,
+        remote_address: Option<WasiUdpSocketAddress>,
+        timeout_nanos: u64,
+    ) -> core::result::Result<WasiUdpSocketDatagram, WasiUdpSocketError> {
+        let filter = {
+            let state = self.inner.lock();
+            if state.pending_bind.is_some() || state.bound.is_none() {
+                return Err(WasiUdpSocketError::InvalidState);
+            }
+            remote_address.or(state.remote_address)
+        };
+        let bound = self
+            .inner
+            .lock()
+            .bound
+            .ok_or(WasiUdpSocketError::InvalidState)?;
+        let service = self.inner.lock().service.clone();
+        loop {
+            let datagram = service
+                .udp_receive(
+                    bound.socket,
+                    MAX_WASI_UDP_DATAGRAM_BYTES as u32,
+                    timeout_nanos,
+                )
+                .await
+                .map_err(|error| {
+                    if timeout_nanos == 0 && matches!(error.kind, crate::UdpErrorKind::Timeout) {
+                        WasiUdpSocketError::WouldBlock
+                    } else {
+                        WasiUdpSocketError::Backend(error)
+                    }
+                })?
+                .ok_or(WasiUdpSocketError::InvalidState)?;
+            let remote = WasiUdpSocketAddress {
+                address: datagram.address,
+                port: datagram.port,
+            };
+            if filter.is_some_and(|expected| expected != remote) {
+                continue;
+            }
+            return Ok(WasiUdpSocketDatagram {
+                bytes: datagram.bytes,
+                remote_address: remote,
+            });
+        }
+    }
+
+    async fn bind_backend(
+        &self,
+        local_port: u16,
+        pending_bind: bool,
+    ) -> core::result::Result<(), WasiUdpSocketError> {
+        let service = {
+            let state = self.inner.lock();
+            if !matches!(state.family, WasiUdpSocketFamily::Ipv4) {
+                return Err(WasiUdpSocketError::NotSupported);
+            }
+            if state.pending_bind.is_some() || state.bound.is_some() {
+                return Err(WasiUdpSocketError::InvalidState);
+            }
+            state.service.clone()
+        };
+        let binding = service
+            .udp_bind(local_port)
+            .await
+            .map_err(WasiUdpSocketError::Backend)?;
+        let bound = BoundUdpSocket {
+            socket: binding.socket,
+            local_port: binding.local_port,
+        };
+        let mut state = self.inner.lock();
+        assert!(
+            state.pending_bind.is_none() && state.bound.is_none(),
+            "udp bind raced with a concurrent state transition"
+        );
+        if pending_bind {
+            state.pending_bind = Some(bound);
+        } else {
+            state.bound = Some(bound);
+        }
+        Ok(())
+    }
+
+    async fn ensure_bound(
+        &self,
+        local_port: u16,
+    ) -> core::result::Result<BoundUdpSocket, WasiUdpSocketError> {
+        {
+            let state = self.inner.lock();
+            if let Some(bound) = state.bound {
+                return Ok(bound);
+            }
+            if state.pending_bind.is_some() {
+                return Err(WasiUdpSocketError::InvalidState);
+            }
+        }
+        self.bind_backend(local_port, false).await?;
+        self.inner
+            .lock()
+            .bound
+            .ok_or(WasiUdpSocketError::InvalidState)
+    }
+}
+
+fn resolve_udp_send_target(
+    state: &UdpSocketState,
+    remote_address: Option<WasiUdpSocketAddress>,
+) -> core::result::Result<WasiUdpSocketAddress, WasiUdpSocketError> {
+    match (state.remote_address, remote_address) {
+        (Some(connected), None) => Ok(connected),
+        (Some(connected), Some(provided)) if connected == provided => Ok(connected),
+        (None, Some(provided)) => {
+            validate_udp_remote_address(state.family, provided)?;
+            Ok(provided)
+        }
+        _ => Err(WasiUdpSocketError::InvalidArgument),
+    }
+}
+
+fn validate_udp_local_address(
+    family: WasiUdpSocketFamily,
+    local_address: WasiUdpSocketAddress,
+) -> core::result::Result<(), WasiUdpSocketError> {
+    if !matches!(family, WasiUdpSocketFamily::Ipv4) {
+        return Err(WasiUdpSocketError::NotSupported);
+    }
+    if local_address.address.octets() != [0, 0, 0, 0] {
+        return Err(WasiUdpSocketError::AddressNotBindable);
+    }
+    Ok(())
+}
+
+fn validate_udp_remote_address(
+    family: WasiUdpSocketFamily,
+    remote_address: WasiUdpSocketAddress,
+) -> core::result::Result<(), WasiUdpSocketError> {
+    if !matches!(family, WasiUdpSocketFamily::Ipv4) {
+        return Err(WasiUdpSocketError::NotSupported);
+    }
+    if remote_address.address.octets() == [0, 0, 0, 0] || remote_address.port == 0 {
+        return Err(WasiUdpSocketError::InvalidArgument);
+    }
+    Ok(())
+}
+
+fn format_ipv4_address(address: crate::Ipv4Address) -> String {
+    let [a, b, c, d] = address.octets();
+    format!("{a}.{b}.{c}.{d}")
+}
 
 pub(crate) struct DebugFileSystem<State, HostFsService> {
     nodes: Vec<FsNode>,
@@ -279,8 +743,7 @@ where
     }
 }
 
-impl<T: 'static, CpuImpl, HostFs> StreamProducer<T>
-    for FileReadStreamProducer<T, CpuImpl, HostFs>
+impl<T: 'static, CpuImpl, HostFs> StreamProducer<T> for FileReadStreamProducer<T, CpuImpl, HostFs>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
@@ -302,10 +765,11 @@ where
 
         let getter = self.getter;
         let store_data = getter(store.data_mut());
-        match store_data
-            .filesystem()
-            .read_file_chunk(&self.descriptor, self.offset, self.chunk_bytes)
-        {
+        match store_data.filesystem().read_file_chunk(
+            &self.descriptor,
+            self.offset,
+            self.chunk_bytes,
+        ) {
             Ok(bytes) if bytes.is_empty() => {
                 self.complete(Ok(()));
                 Poll::Ready(Ok(StreamResult::Dropped))
@@ -404,9 +868,10 @@ where
         let now_nanos = store_data.now_nanos();
         let write_result = match &mut self.mode {
             FileWriteMode::At(offset) => {
-                let result = store_data
-                    .filesystem_mut()
-                    .write_at(&descriptor, *offset, &bytes, now_nanos);
+                let result =
+                    store_data
+                        .filesystem_mut()
+                        .write_at(&descriptor, *offset, &bytes, now_nanos);
                 if result.is_ok() {
                     *offset = offset
                         .checked_add(bytes.len())
@@ -414,7 +879,11 @@ where
                 }
                 result
             }
-            FileWriteMode::Append => store_data.filesystem_mut().append(&descriptor, &bytes, now_nanos),
+            FileWriteMode::Append => {
+                store_data
+                    .filesystem_mut()
+                    .append(&descriptor, &bytes, now_nanos)
+            }
         };
 
         match write_result {
@@ -588,9 +1057,7 @@ where
         crate::guest_host_share_path(path)
     }
 
-    fn host_service(
-        &self,
-    ) -> core::result::Result<HostFsService, fs_types::ErrorCode> {
+    fn host_service(&self) -> core::result::Result<HostFsService, fs_types::ErrorCode> {
         self.runtime_state
             .host_filesystem_service()
             .ok_or(fs_types::ErrorCode::NoEntry)
@@ -838,8 +1305,8 @@ where
             return Err(fs_types::ErrorCode::NotDirectory);
         }
 
-        let absolute = crate::resolve_child_path(&base.path, path)
-            .map_err(map_component_fs_path_error)?;
+        let absolute =
+            crate::resolve_child_path(&base.path, path).map_err(map_component_fs_path_error)?;
         // Host-backed paths are handled in the async WASI trait impl;
         // this embedded path only handles paths that already have a
         // node (either genuinely local or previously seeded from the
@@ -933,8 +1400,8 @@ where
         {
             return Err(fs_types::ErrorCode::ReadOnly);
         }
-        let absolute = crate::resolve_child_path(&base.path, path)
-            .map_err(map_component_fs_path_error)?;
+        let absolute =
+            crate::resolve_child_path(&base.path, path).map_err(map_component_fs_path_error)?;
         if absolute == "/" {
             return Err(fs_types::ErrorCode::NotPermitted);
         }
@@ -972,8 +1439,8 @@ where
         if base.kind != FsNodeKind::Directory {
             return Err(fs_types::ErrorCode::NotDirectory);
         }
-        let absolute = crate::resolve_child_path(&base.path, path)
-            .map_err(map_component_fs_path_error)?;
+        let absolute =
+            crate::resolve_child_path(&base.path, path).map_err(map_component_fs_path_error)?;
         if self.get_node(&base.path)?.readonly {
             return Err(fs_types::ErrorCode::ReadOnly);
         }
@@ -1014,8 +1481,8 @@ where
         {
             return Err(fs_types::ErrorCode::ReadOnly);
         }
-        let absolute = crate::resolve_child_path(&base.path, path)
-            .map_err(map_component_fs_path_error)?;
+        let absolute =
+            crate::resolve_child_path(&base.path, path).map_err(map_component_fs_path_error)?;
         let node = self.get_node(&absolute)?;
         if node.readonly {
             return Err(fs_types::ErrorCode::ReadOnly);
@@ -1129,7 +1596,8 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> wasi::clocks::monotonic_clock::HostWithStore for HasSelf<StoreData<CpuImpl, HostFs>>
+impl<CpuImpl, HostFs> wasi::clocks::monotonic_clock::HostWithStore
+    for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
@@ -1214,7 +1682,8 @@ impl<CpuImpl, HostFs> wasi::cli::stdin::Host for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
-{}
+{
+}
 
 impl<CpuImpl, HostFs> wasi::cli::stdin::HostWithStore for HasSelf<StoreData<CpuImpl, HostFs>>
 where
@@ -1375,7 +1844,8 @@ impl<CpuImpl, HostFs> wasi::cli::stdout::Host for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
-{}
+{
+}
 
 impl<CpuImpl, HostFs> wasi::cli::stdout::HostWithStore for HasSelf<StoreData<CpuImpl, HostFs>>
 where
@@ -1405,7 +1875,8 @@ impl<CpuImpl, HostFs> wasi::cli::stderr::Host for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
-{}
+{
+}
 
 impl<CpuImpl, HostFs> wasi::cli::stderr::HostWithStore for HasSelf<StoreData<CpuImpl, HostFs>>
 where
@@ -1435,7 +1906,8 @@ impl<CpuImpl, HostFs> wasi::cli::terminal_input::Host for StoreData<CpuImpl, Hos
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
-{}
+{
+}
 impl<CpuImpl, HostFs> wasi::cli::terminal_input::HostTerminalInput for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
@@ -1451,7 +1923,8 @@ impl<CpuImpl, HostFs> wasi::cli::terminal_output::Host for StoreData<CpuImpl, Ho
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
-{}
+{
+}
 impl<CpuImpl, HostFs> wasi::cli::terminal_output::HostTerminalOutput for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
@@ -1563,7 +2036,8 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> wasi::filesystem::types::HostDescriptorWithStore for HasSelf<StoreData<CpuImpl, HostFs>>
+impl<CpuImpl, HostFs> wasi::filesystem::types::HostDescriptorWithStore
+    for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
@@ -1836,9 +2310,7 @@ where
                 status_change_timestamp: None,
             });
         }
-        accessor.with(|mut access| {
-            access.get().filesystem().stat(&path).map_err(Into::into)
-        })
+        accessor.with(|mut access| access.get().filesystem().stat(&path).map_err(Into::into))
     }
 
     async fn stat_at<T: Send>(
@@ -1882,7 +2354,11 @@ where
             });
         }
         accessor.with(|mut access| {
-            access.get().filesystem().stat(&absolute).map_err(Into::into)
+            access
+                .get()
+                .filesystem()
+                .stat(&absolute)
+                .map_err(Into::into)
         })
     }
 
@@ -1928,14 +2404,18 @@ where
             return Err(fs_types::ErrorCode::NotDirectory.into());
         }
 
-        let absolute = crate::resolve_child_path(&base_path, &path)
-            .map_err(map_component_fs_path_error)?;
+        let absolute =
+            crate::resolve_child_path(&base_path, &path).map_err(map_component_fs_path_error)?;
         let host_path = crate::guest_host_share_path(&absolute).map(|p| p.to_owned());
 
         if let Some(host_path) = host_path {
             // Host filesystem path — do async I/O outside accessor.
             let service = accessor.with(|mut access| {
-                access.get().filesystem().host_service().map_err(FsError::from)
+                access
+                    .get()
+                    .filesystem()
+                    .host_service()
+                    .map_err(FsError::from)
             })?;
 
             let metadata = service.stat_path(&host_path).await;
@@ -2114,14 +2594,12 @@ where
         destination_descriptor: Resource<FsDescriptor>,
         destination_path: String,
     ) -> Result<(), FsError> {
-        let (source_absolute, destination_absolute, source_flags, destination_flags) =
-            accessor.with(|mut access| {
+        let (source_absolute, destination_absolute, source_flags, destination_flags) = accessor
+            .with(|mut access| {
                 let source_base = get_fs_descriptor(access.get(), &source_descriptor)?;
-                let destination_base =
-                    get_fs_descriptor(access.get(), &destination_descriptor)?;
-                let source_absolute =
-                    crate::resolve_child_path(&source_base.path, &source_path)
-                        .map_err(map_component_fs_path_error)?;
+                let destination_base = get_fs_descriptor(access.get(), &destination_descriptor)?;
+                let source_absolute = crate::resolve_child_path(&source_base.path, &source_path)
+                    .map_err(map_component_fs_path_error)?;
                 let destination_absolute =
                     crate::resolve_child_path(&destination_base.path, &destination_path)
                         .map_err(map_component_fs_path_error)?;
@@ -2137,8 +2615,7 @@ where
         {
             return Err(fs_types::ErrorCode::ReadOnly.into());
         }
-        let source_host =
-            crate::guest_host_share_path(&source_absolute).map(|p| p.to_owned());
+        let source_host = crate::guest_host_share_path(&source_absolute).map(|p| p.to_owned());
         let destination_host =
             crate::guest_host_share_path(&destination_absolute).map(|p| p.to_owned());
         if source_host.is_some() || destination_host.is_some() {
@@ -2328,7 +2805,8 @@ impl<CpuImpl, HostFs> wasi::sockets::types::Host for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
-{}
+{
+}
 impl<CpuImpl, HostFs> wasi::sockets::types::HostTcpSocket for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
@@ -2500,98 +2978,150 @@ where
 {
     async fn bind(
         &mut self,
-        _: Resource<UdpSocket>,
-        _: socket_types::IpSocketAddress,
+        socket: Resource<UdpSocket>,
+        local_address: socket_types::IpSocketAddress,
     ) -> Result<core::result::Result<(), socket_types::ErrorCode>> {
-        unreachable!("udp sockets are not available on the embedded debugger host")
+        let socket = self.table.get(&socket)?.clone();
+        let local_address = match parse_p3_udp_socket_address(local_address, socket.family()) {
+            Ok(address) => address,
+            Err(error) => return Ok(Err(map_p3_udp_socket_error(error))),
+        };
+        let result = socket
+            .bind(local_address)
+            .await
+            .map_err(map_p3_udp_socket_error);
+        Ok(result)
     }
 
     async fn connect(
         &mut self,
-        _: Resource<UdpSocket>,
-        _: socket_types::IpSocketAddress,
+        socket: Resource<UdpSocket>,
+        remote_address: socket_types::IpSocketAddress,
     ) -> Result<core::result::Result<(), socket_types::ErrorCode>> {
-        unreachable!("udp sockets are not available on the embedded debugger host")
+        let socket = self.table.get(&socket)?.clone();
+        let remote_address = match parse_p3_udp_socket_address(remote_address, socket.family()) {
+            Ok(address) => address,
+            Err(error) => return Ok(Err(map_p3_udp_socket_error(error))),
+        };
+        let result = socket
+            .connect(remote_address)
+            .await
+            .map_err(map_p3_udp_socket_error);
+        Ok(result)
     }
 
     fn create(
         &mut self,
-        _: socket_types::IpAddressFamily,
+        address_family: socket_types::IpAddressFamily,
     ) -> Result<core::result::Result<Resource<UdpSocket>, socket_types::ErrorCode>> {
-        Ok(Err(socket_types::ErrorCode::NotSupported))
+        let family = match map_p3_udp_family(address_family) {
+            Ok(family) => family,
+            Err(error) => return Ok(Err(map_p3_udp_socket_error(error))),
+        };
+        let Some(service) = self.runtime_state.network_service() else {
+            return Ok(Err(socket_types::ErrorCode::Other(Some(String::from(
+                "network service is unavailable on this machine",
+            )))));
+        };
+        let resource = self.table.push(UdpSocket::new(service, family))?;
+        Ok(Ok(resource))
     }
 
     fn disconnect(
         &mut self,
-        _: Resource<UdpSocket>,
+        socket: Resource<UdpSocket>,
     ) -> Result<core::result::Result<(), socket_types::ErrorCode>> {
-        unreachable!("udp sockets are not available on the embedded debugger host")
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.disconnect().map_err(map_p3_udp_socket_error))
     }
 
     fn get_local_address(
         &mut self,
-        _: Resource<UdpSocket>,
+        socket: Resource<UdpSocket>,
     ) -> Result<core::result::Result<socket_types::IpSocketAddress, socket_types::ErrorCode>> {
-        unreachable!("udp sockets are not available on the embedded debugger host")
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket
+            .local_address()
+            .map(format_p3_udp_socket_address)
+            .map_err(map_p3_udp_socket_error))
     }
 
     fn get_remote_address(
         &mut self,
-        _: Resource<UdpSocket>,
+        socket: Resource<UdpSocket>,
     ) -> Result<core::result::Result<socket_types::IpSocketAddress, socket_types::ErrorCode>> {
-        unreachable!("udp sockets are not available on the embedded debugger host")
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket
+            .remote_address()
+            .map(format_p3_udp_socket_address)
+            .map_err(map_p3_udp_socket_error))
     }
 
     fn get_address_family(
         &mut self,
-        _: Resource<UdpSocket>,
+        socket: Resource<UdpSocket>,
     ) -> Result<socket_types::IpAddressFamily> {
-        unreachable!("udp sockets are not available on the embedded debugger host")
+        let socket = self.table.get(&socket)?.clone();
+        Ok(format_p3_udp_family(socket.family()))
     }
 
     fn get_unicast_hop_limit(
         &mut self,
-        _: Resource<UdpSocket>,
+        socket: Resource<UdpSocket>,
     ) -> Result<core::result::Result<u8, socket_types::ErrorCode>> {
-        unreachable!("udp sockets are not available on the embedded debugger host")
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.unicast_hop_limit().map_err(map_p3_udp_socket_error))
     }
 
     fn set_unicast_hop_limit(
         &mut self,
-        _: Resource<UdpSocket>,
-        _: u8,
+        socket: Resource<UdpSocket>,
+        value: u8,
     ) -> Result<core::result::Result<(), socket_types::ErrorCode>> {
-        unreachable!("udp sockets are not available on the embedded debugger host")
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket
+            .set_unicast_hop_limit(value)
+            .map_err(map_p3_udp_socket_error))
     }
 
     fn get_receive_buffer_size(
         &mut self,
-        _: Resource<UdpSocket>,
+        socket: Resource<UdpSocket>,
     ) -> Result<core::result::Result<u64, socket_types::ErrorCode>> {
-        unreachable!("udp sockets are not available on the embedded debugger host")
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket
+            .receive_buffer_size()
+            .map_err(map_p3_udp_socket_error))
     }
 
     fn set_receive_buffer_size(
         &mut self,
-        _: Resource<UdpSocket>,
-        _: u64,
+        socket: Resource<UdpSocket>,
+        value: u64,
     ) -> Result<core::result::Result<(), socket_types::ErrorCode>> {
-        unreachable!("udp sockets are not available on the embedded debugger host")
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket
+            .set_receive_buffer_size(value)
+            .map_err(map_p3_udp_socket_error))
     }
 
     fn get_send_buffer_size(
         &mut self,
-        _: Resource<UdpSocket>,
+        socket: Resource<UdpSocket>,
     ) -> Result<core::result::Result<u64, socket_types::ErrorCode>> {
-        unreachable!("udp sockets are not available on the embedded debugger host")
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.send_buffer_size().map_err(map_p3_udp_socket_error))
     }
 
     fn set_send_buffer_size(
         &mut self,
-        _: Resource<UdpSocket>,
-        _: u64,
+        socket: Resource<UdpSocket>,
+        value: u64,
     ) -> Result<core::result::Result<(), socket_types::ErrorCode>> {
-        unreachable!("udp sockets are not available on the embedded debugger host")
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket
+            .set_send_buffer_size(value)
+            .map_err(map_p3_udp_socket_error))
     }
 
     fn drop(&mut self, resource: Resource<UdpSocket>) -> Result<()> {
@@ -2600,7 +3130,8 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> wasi::sockets::types::HostTcpSocketWithStore for HasSelf<StoreData<CpuImpl, HostFs>>
+impl<CpuImpl, HostFs> wasi::sockets::types::HostTcpSocketWithStore
+    for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
@@ -2640,27 +3171,116 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> wasi::sockets::types::HostUdpSocketWithStore for HasSelf<StoreData<CpuImpl, HostFs>>
+impl<CpuImpl, HostFs> wasi::sockets::types::HostUdpSocketWithStore
+    for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
 {
     async fn send<T>(
-        _: &Accessor<T, Self>,
-        _: Resource<UdpSocket>,
-        _: Vec<u8>,
-        _: Option<socket_types::IpSocketAddress>,
+        accessor: &Accessor<T, Self>,
+        socket: Resource<UdpSocket>,
+        bytes: Vec<u8>,
+        remote_address: Option<socket_types::IpSocketAddress>,
     ) -> Result<core::result::Result<(), socket_types::ErrorCode>> {
-        unreachable!("udp sockets are not available on the embedded debugger host")
+        let socket = accessor
+            .with(|mut access| access.get().table.get(&socket).map(|socket| socket.clone()))?;
+        let remote_address = match remote_address {
+            Some(address) => match parse_p3_udp_socket_address(address, socket.family()) {
+                Ok(address) => Some(address),
+                Err(error) => return Ok(Err(map_p3_udp_socket_error(error))),
+            },
+            None => None,
+        };
+        let result = socket
+            .send_datagram(&bytes, remote_address, u64::MAX)
+            .await
+            .map_err(map_p3_udp_socket_error);
+        Ok(result)
     }
 
     async fn receive<T>(
-        _: &Accessor<T, Self>,
-        _: Resource<UdpSocket>,
+        accessor: &Accessor<T, Self>,
+        socket: Resource<UdpSocket>,
     ) -> Result<
         core::result::Result<(Vec<u8>, socket_types::IpSocketAddress), socket_types::ErrorCode>,
     > {
-        unreachable!("udp sockets are not available on the embedded debugger host")
+        let socket = accessor
+            .with(|mut access| access.get().table.get(&socket).map(|socket| socket.clone()))?;
+        let result = socket
+            .receive_datagram(None, u64::MAX)
+            .await
+            .map(|datagram| {
+                (
+                    datagram.bytes,
+                    format_p3_udp_socket_address(datagram.remote_address),
+                )
+            })
+            .map_err(map_p3_udp_socket_error);
+        Ok(result)
+    }
+}
+
+fn map_p3_udp_family(
+    family: socket_types::IpAddressFamily,
+) -> core::result::Result<WasiUdpSocketFamily, WasiUdpSocketError> {
+    match family {
+        socket_types::IpAddressFamily::Ipv4 => Ok(WasiUdpSocketFamily::Ipv4),
+        socket_types::IpAddressFamily::Ipv6 => Err(WasiUdpSocketError::NotSupported),
+    }
+}
+
+fn format_p3_udp_family(family: WasiUdpSocketFamily) -> socket_types::IpAddressFamily {
+    match family {
+        WasiUdpSocketFamily::Ipv4 => socket_types::IpAddressFamily::Ipv4,
+        WasiUdpSocketFamily::Ipv6 => socket_types::IpAddressFamily::Ipv6,
+    }
+}
+
+fn parse_p3_udp_socket_address(
+    address: socket_types::IpSocketAddress,
+    family: WasiUdpSocketFamily,
+) -> core::result::Result<WasiUdpSocketAddress, WasiUdpSocketError> {
+    match (family, address) {
+        (WasiUdpSocketFamily::Ipv4, socket_types::IpSocketAddress::Ipv4(address)) => {
+            Ok(WasiUdpSocketAddress {
+                address: crate::Ipv4Address::new([
+                    address.address.0,
+                    address.address.1,
+                    address.address.2,
+                    address.address.3,
+                ]),
+                port: address.port,
+            })
+        }
+        (WasiUdpSocketFamily::Ipv4, socket_types::IpSocketAddress::Ipv6(_))
+        | (WasiUdpSocketFamily::Ipv6, _) => Err(WasiUdpSocketError::NotSupported),
+    }
+}
+
+fn format_p3_udp_socket_address(address: WasiUdpSocketAddress) -> socket_types::IpSocketAddress {
+    let [a, b, c, d] = address.address.octets();
+    socket_types::IpSocketAddress::Ipv4(socket_types::Ipv4SocketAddress {
+        port: address.port,
+        address: (a, b, c, d),
+    })
+}
+
+fn map_p3_udp_socket_error(error: WasiUdpSocketError) -> socket_types::ErrorCode {
+    match error {
+        WasiUdpSocketError::NotSupported => socket_types::ErrorCode::NotSupported,
+        WasiUdpSocketError::InvalidArgument => socket_types::ErrorCode::InvalidArgument,
+        WasiUdpSocketError::InvalidState | WasiUdpSocketError::NotInProgress => {
+            socket_types::ErrorCode::InvalidState
+        }
+        WasiUdpSocketError::AddressNotBindable => socket_types::ErrorCode::AddressNotBindable,
+        WasiUdpSocketError::DatagramTooLarge => socket_types::ErrorCode::DatagramTooLarge,
+        WasiUdpSocketError::WouldBlock
+        | WasiUdpSocketError::Backend(crate::UdpError {
+            kind: crate::UdpErrorKind::Timeout,
+            ..
+        }) => socket_types::ErrorCode::Timeout,
+        WasiUdpSocketError::Backend(error) => socket_types::ErrorCode::Other(Some(error.detail)),
     }
 }
 
@@ -2668,9 +3288,11 @@ impl<CpuImpl, HostFs> wasi::sockets::ip_name_lookup::Host for StoreData<CpuImpl,
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
-{}
+{
+}
 
-impl<CpuImpl, HostFs> wasi::sockets::ip_name_lookup::HostWithStore for HasSelf<StoreData<CpuImpl, HostFs>>
+impl<CpuImpl, HostFs> wasi::sockets::ip_name_lookup::HostWithStore
+    for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
@@ -2724,14 +3346,10 @@ pub(crate) fn fs_resource_error(
         wasmtime::component::ResourceTableError::HasChildren => {
             crate::ComponentResourceTableError::HasChildren
         }
-        wasmtime::component::ResourceTableError::Full => {
-            crate::ComponentResourceTableError::Full
-        }
+        wasmtime::component::ResourceTableError::Full => crate::ComponentResourceTableError::Full,
     };
     match crate::map_resource_table_error(mapped) {
-        crate::ComponentFsResourceError::BadDescriptor => {
-            fs_types::ErrorCode::BadDescriptor
-        }
+        crate::ComponentFsResourceError::BadDescriptor => fs_types::ErrorCode::BadDescriptor,
         crate::ComponentFsResourceError::Busy => fs_types::ErrorCode::Busy,
         crate::ComponentFsResourceError::Overflow => fs_types::ErrorCode::Overflow,
     }

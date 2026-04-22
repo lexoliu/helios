@@ -183,9 +183,7 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
             // doesn't exist. 9p leaves `new_fid` unattached in this case
             // per the 2000.L spec ("if any walked element doesn't exist
             // the final fid is not set"), so there is nothing to clunk.
-            return Err(HostFsError::Transport(
-                helios_hal::io::IoError::NotFound,
-            ));
+            return Err(HostFsError::Transport(helios_hal::io::IoError::NotFound));
         }
         Ok(new_fid)
     }

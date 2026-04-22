@@ -2,6 +2,8 @@
 .global _secondary_start
 _secondary_start:
     .option push
+    .option arch, +zmmul
+    .option push
     .option norelax
     la gp, __global_pointer$
     .option pop
@@ -15,3 +17,4 @@ _secondary_start:
     andi sp, t1, -16
 
     tail secondary_start_rust
+    .option pop

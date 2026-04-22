@@ -1,6 +1,8 @@
 use super::*;
 use helios_hal::watchdog::Watchdog;
 
+const HELIOS_PROCESS_ID_ENV: &str = "HELIOS_PROCESS_ID";
+
 #[derive(Clone, Copy)]
 pub struct ProgramServiceConfig {
     compile_workers: usize,
@@ -63,7 +65,6 @@ struct ProgramSpawnRequest {
     name: String,
     args: Vec<String>,
     env: Vec<(String, String)>,
-    wasm: Arc<[u8]>,
     rights: WasiRights,
 }
 
@@ -150,12 +151,13 @@ where
     HostFs: crate::HostFileSystem,
     WatchdogImpl: Watchdog + Clone,
 {
-    if cpu.current_processor() != cpu.bootstrap_processor() {
+    let topology = kernel.topology();
+    if cpu.current_processor() != topology.bootstrap_processor {
         return None;
     }
 
     let worker_count =
-        component_host_worker_count(cpu.processor_count(), cpu.bootstrap_processor());
+        component_host_worker_count(topology.configured_processors, topology.bootstrap_processor);
     Some(install_program_service_with_config(
         kernel,
         cpu,
@@ -275,13 +277,14 @@ where
     HostFs: crate::HostFileSystem,
     WatchdogImpl: Watchdog + Clone,
 {
+    let topology = kernel.topology();
     match component_host_processor_role(
         cpu.current_processor(),
-        cpu.processor_count(),
-        cpu.bootstrap_processor(),
+        topology.configured_processors,
+        topology.bootstrap_processor,
     ) {
         ComponentHostProcessorRole::Kernel => kernel.run(),
-        ComponentHostProcessorRole::SystemComponent => {
+        ComponentHostProcessorRole::SharedRuntime | ComponentHostProcessorRole::SystemComponent => {
             let component = crate::embedded_system_component()
                 .unwrap_or_else(|| panic!("embedded init bootfs is missing the system component"));
             run_embedded_component_forever(
@@ -313,18 +316,11 @@ where
         exec_context: ProgramExecContext<CpuImpl, HostFs>,
         name: String,
         args: Vec<String>,
-        env: Vec<(String, String)>,
+        mut env: Vec<(String, String)>,
         wasm: alloc::vec::Vec<u8>,
         rights: WasiRights,
     ) -> Result<ChildHandle, ProgramExecError> {
-        let request = ProgramSpawnRequest {
-            name,
-            args,
-            env,
-            wasm: Arc::<[u8]>::from(wasm),
-            rights,
-        };
-        let component = self.compile_component(&request.wasm).await?;
+        let component = self.compile_component(&wasm).await?;
 
         // Three byte channels between parent and child.
         let (stdin_writer, stdin_reader) = crate::byte_channel();
@@ -338,8 +334,20 @@ where
             .uptime_nanos(exec_context.cpu.now().ticks());
         let launched_instance = exec_context
             .instance_registry
-            .register(request.name.clone(), started_at);
+            .register(name.clone(), started_at);
         let instance_id = launched_instance.id();
+        assert!(
+            !env.iter()
+                .any(|(name, _)| name.as_str() == HELIOS_PROCESS_ID_ENV),
+            "{HELIOS_PROCESS_ID_ENV} is reserved for the kernel program launcher"
+        );
+        env.push((HELIOS_PROCESS_ID_ENV.into(), instance_id.raw().to_string()));
+        let request = ProgramSpawnRequest {
+            name,
+            args,
+            env,
+            rights,
+        };
 
         let (exit_tx, exit_rx) = futures::channel::oneshot::channel();
         let runtime = self.inner.runtime.clone();

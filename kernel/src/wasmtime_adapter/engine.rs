@@ -42,7 +42,9 @@ fn build_engine_for_platform<P: CodegenPlatform + Clone>(
     config.cranelift_opt_level(OptLevel::None);
     config.cranelift_regalloc_algorithm(RegallocAlgorithm::SinglePass);
     config.cranelift_debug_verifier(false);
-    config.with_custom_code_memory(Some(Arc::new(PlatformCodeMemory { platform: platform.clone() })));
+    config.with_custom_code_memory(Some(Arc::new(PlatformCodeMemory {
+        platform: platform.clone(),
+    })));
     config.signals_based_traps(false);
     config.memory_guard_size(0);
     config.memory_reservation(0);
