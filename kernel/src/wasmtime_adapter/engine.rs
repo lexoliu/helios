@@ -4,7 +4,7 @@ use alloc::sync::Arc;
 
 use crate::CodegenPlatform;
 use wasmtime::component::{Component, Instance, TypedFunc};
-use wasmtime::{AsContextMut, CustomCodeMemory, Engine, OptLevel, RegallocAlgorithm};
+use wasmtime::{AsContextMut, CustomCodeMemory, Engine};
 
 const COMPONENT_MEMORY_RESERVATION_FOR_GROWTH: u64 = 1 << 20;
 const WASI_CLI_RUN_FUNC: &str = "run";
@@ -39,8 +39,6 @@ fn build_engine_for_platform<P: CodegenPlatform + Clone>(
             config.detect_host_feature(probe);
         }
     }
-    config.cranelift_opt_level(OptLevel::None);
-    config.cranelift_regalloc_algorithm(RegallocAlgorithm::SinglePass);
     config.cranelift_debug_verifier(false);
     config.with_custom_code_memory(Some(Arc::new(PlatformCodeMemory {
         platform: platform.clone(),

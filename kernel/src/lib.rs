@@ -123,7 +123,7 @@ pub use sync::{
     RawRwLockWriteLease, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
 pub use task::{YieldNow, yield_now};
-pub use time::{elapsed_millis, monotonic_nanos};
+pub use time::{duration_to_ticks, elapsed_millis, monotonic_nanos};
 pub use timer::{Sleep, Timer};
 pub use unsupported_host_fs::UnsupportedHostFileSystem;
 pub use wasi_rights::WasiRights;
@@ -305,20 +305,28 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
             "watchdog check interval computed as zero for timeout {timeout:?}"
         );
 
-        let timer = self.timer();
+        let min_pet_ticks = duration_to_ticks(interval, self.cpu.timer_frequency());
+        assert!(
+            min_pet_ticks != 0,
+            "watchdog pet interval {interval:?} converted to zero timer ticks"
+        );
+
+        let cpu = self.cpu.clone();
         let watchdog = self.watchdog.clone();
-        let progress = watchdog.progress();
-        watchdog.arm();
+        let progress_notify = self.spawner().progress_notify();
+        if self.cpu.current_processor() == self.topology.bootstrap_processor {
+            watchdog.arm();
+        }
         self.spawner().spawn_local_detached_silent(async move {
-            let mut last_progress = progress.snapshot();
+            let mut last_pet_at = cpu.now();
             loop {
-                timer.sleep_for(interval).await;
-                let current_progress = progress.snapshot();
-                if current_progress == last_progress {
+                progress_notify.notified().await;
+                let now = cpu.now();
+                if now.ticks().saturating_sub(last_pet_at.ticks()) < min_pet_ticks {
                     continue;
                 }
                 watchdog.pet();
-                last_progress = current_progress;
+                last_pet_at = now;
             }
         });
     }
@@ -488,9 +496,7 @@ where
     kernel.spawn_detached(async move {
         tracing::info!("Processor online processor={processor_id}");
     });
-    if current_processor == kernel.topology.bootstrap_processor {
-        kernel.spawn_watchdog_supervisor();
-    }
+    kernel.spawn_watchdog_supervisor();
     #[cfg(helios_watchdog_self_test)]
     kernel.spawn_watchdog_self_test();
 

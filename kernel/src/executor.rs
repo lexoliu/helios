@@ -11,6 +11,8 @@ use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 use helios_hal::cpu::{Cpu, ProcessorId};
 use helios_hal::watchdog::ProgressCounter;
 
+use crate::sync::Notify;
+
 type ReadyQueue = ConcurrentQueue<Runnable>;
 pub type JoinHandle<T> = Task<T>;
 
@@ -36,11 +38,13 @@ pub struct Spawner<CpuImpl: Cpu + Clone> {
     cpu: CpuImpl,
     owner_processor: ProcessorId,
     progress: ProgressCounter,
+    progress_notify: Arc<Notify>,
 }
 
 pub struct Executor {
     ready_queue: Arc<ReadyQueue>,
     progress: ProgressCounter,
+    progress_notify: Arc<Notify>,
 }
 
 impl Executor {
@@ -48,6 +52,7 @@ impl Executor {
         Self {
             ready_queue: Arc::new(ConcurrentQueue::unbounded()),
             progress,
+            progress_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -58,6 +63,7 @@ impl Executor {
             cpu,
             owner_processor,
             progress: self.progress.clone(),
+            progress_notify: self.progress_notify.clone(),
         }
     }
 
@@ -77,9 +83,18 @@ impl Executor {
 }
 
 impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
+    pub(crate) fn progress_counter(&self) -> ProgressCounter {
+        self.progress.clone()
+    }
+
+    pub(crate) fn progress_notify(&self) -> Arc<Notify> {
+        self.progress_notify.clone()
+    }
+
     fn schedule(&self, runnable: Runnable, progress_mode: ProgressMode) {
         if progress_mode == ProgressMode::Counted {
             self.progress.record_progress();
+            self.progress_notify.notify_one();
         }
 
         match self.ready_queue.push(runnable) {

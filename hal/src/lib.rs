@@ -165,8 +165,10 @@ where
         cpu: Cpu,
         watchdog: WatchdogImpl,
     ) -> Self {
-        let topology =
-            ProcessorTopology::start_all_secondaries(cpu.bootstrap_processor(), cpu.processor_count());
+        let topology = ProcessorTopology::start_all_secondaries(
+            cpu.bootstrap_processor(),
+            cpu.processor_count(),
+        );
         let timer_frequency_hz = cpu.timer_frequency();
         Self {
             console,
