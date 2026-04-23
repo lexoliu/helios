@@ -77,9 +77,13 @@ pub(crate) struct ComponentExecutionContext<FileSystem> {
     output_mode: ComponentOutputMode,
 }
 
-pub struct ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem> {
+pub struct ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem>
+where
+    CpuImpl: Cpu + Clone,
+{
     pub table: ResourceTable,
     pub cpu: CpuImpl,
+    spawner: crate::Spawner<CpuImpl>,
     pub runtime_state: RuntimeStateImpl,
     pub instance_registry: InstanceRegistry,
     execution_context: ComponentExecutionContext<FileSystem>,
@@ -128,6 +132,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cpu: CpuImpl,
+        spawner: crate::Spawner<CpuImpl>,
         runtime_state: RuntimeStateImpl,
         instance_registry: InstanceRegistry,
         instance: RegisteredInstance,
@@ -142,6 +147,7 @@ where
         Self {
             table: ResourceTable::new(),
             cpu,
+            spawner,
             runtime_state,
             instance_registry,
             execution_context: ComponentExecutionContext::new(
@@ -207,6 +213,10 @@ where
 
     pub fn now_nanos(&self) -> u64 {
         self.runtime_state.uptime_nanos(self.cpu.now().ticks())
+    }
+
+    pub fn spawner(&self) -> &crate::Spawner<CpuImpl> {
+        &self.spawner
     }
 
     /// Deliver a chunk of stdout/stderr bytes to whatever sink is

@@ -312,14 +312,15 @@ async fn forward_child_output(
     use helios_api::wit_bindgen::rt::async_support::StreamResult;
 
     let (mut stream, future) = pair;
+    const CHUNK: usize = 16 * 1024;
     loop {
-        let (result, chunk) = stream.read(Vec::new()).await;
+        let (result, chunk) = stream.read(Vec::with_capacity(CHUNK)).await;
         if !chunk.is_empty() {
             write_all(output, &chunk).await?;
         }
         match result {
+            StreamResult::Complete(0) | StreamResult::Dropped => break,
             StreamResult::Complete(_) => {}
-            StreamResult::Dropped => break,
             StreamResult::Cancelled => {
                 return Err(ShellError::message(format!(
                     "child {stream_name} stream was cancelled"

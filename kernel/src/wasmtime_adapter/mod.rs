@@ -37,6 +37,12 @@ pub struct WasmtimeEngine {
     engine: Engine,
 }
 
+impl WasmtimeEngine {
+    pub(crate) fn increment_epoch(&self) {
+        self.engine.increment_epoch();
+    }
+}
+
 impl ComponentRuntimeEngine for WasmtimeEngine {
     type Compiled = WasmtimeCompiledComponent;
     type Error = wasmtime::Error;
@@ -173,6 +179,7 @@ where
             &engine.engine,
             StoreData::<CpuImpl, HostFs>::new(
                 context.cpu,
+                context.spawner,
                 context.runtime_state,
                 context.instance_registry,
                 context.instance,

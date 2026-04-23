@@ -37,6 +37,7 @@ where
     HostFs: HostFileSystem,
 {
     pub cpu: CpuImpl,
+    pub spawner: crate::Spawner<CpuImpl>,
     pub runtime_state: RuntimeStateImpl,
     pub instance_registry: InstanceRegistry,
     pub instance: RegisteredInstance,
@@ -59,6 +60,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cpu: CpuImpl,
+        spawner: crate::Spawner<CpuImpl>,
         runtime_state: RuntimeStateImpl,
         instance_registry: InstanceRegistry,
         instance: RegisteredInstance,
@@ -72,6 +74,7 @@ where
     ) -> Self {
         Self {
             cpu,
+            spawner,
             runtime_state,
             instance_registry,
             instance,

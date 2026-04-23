@@ -13,7 +13,7 @@ use helios_api::fs;
 use helios_api::programs as host_programs;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "guest")]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use crate::system::programs::{ExecError, ExecErrorKind, ExecResult};
 
@@ -67,12 +67,12 @@ pub(crate) async fn dispatch(func: &str, payload: &[u8]) -> Result<Vec<u8>> {
         EXEC_PATH => {
             let request = postcard::from_bytes::<ExecPathRequest>(payload)
                 .context("failed to decode debugger programs.exec-path request payload")?;
-            let name = infer_program_name(Path::new(&request.path))?;
+            let path = validate_program_path(Path::new(&request.path))?;
             let wasm = fs::read(&request.path)
                 .await
                 .with_context(|| format!("failed to read executable {}", request.path))?;
             let response = host_programs::exec(host_programs::ExecRequest {
-                name,
+                name: path.to_string_lossy().into_owned(),
                 args: request.args,
                 env: Vec::new(),
                 wasm,
@@ -111,13 +111,12 @@ fn convert_exec_error_kind(kind: host_programs::ExecErrorKind) -> ExecErrorKind 
 }
 
 #[cfg(feature = "guest")]
-fn infer_program_name(path: &Path) -> Result<String> {
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("program path does not end with a valid utf-8 file name")?;
+fn validate_program_path(path: &Path) -> Result<PathBuf> {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        anyhow::bail!("program path does not end with a valid utf-8 file name");
+    };
     if name.is_empty() {
         anyhow::bail!("program path does not name an executable")
     }
-    Ok(name.strip_suffix(".wasm").unwrap_or(name).to_owned())
+    Ok(path.to_path_buf())
 }

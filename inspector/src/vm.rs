@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{bail, Context as _, Result};
 use bootloader::BiosBoot;
 use clap::{Args as ClapArgs, Subcommand, ValueEnum};
 use console::style;
@@ -15,7 +15,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
-use crate::{SessionCommand, connect_client, run_connected};
+use crate::{connect_client, run_connected, SessionCommand};
 
 const DEFAULT_BAUD: u32 = 115_200;
 const DEFAULT_RISCV_QEMU_BIN: &str = "qemu-system-riscv64";
@@ -149,6 +149,8 @@ pub(crate) struct VmConfigFile {
     pub(crate) baud: Option<u32>,
     #[serde(default)]
     pub(crate) shared_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub(crate) gdb: Option<String>,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -189,6 +191,9 @@ pub(crate) struct VmCommand {
     #[arg(long)]
     shared_dir: Option<PathBuf>,
 
+    #[arg(long)]
+    gdb: Option<String>,
+
     #[command(subcommand)]
     command: Option<VmSessionCommand>,
 }
@@ -214,6 +219,7 @@ struct ResolvedVmCommand {
     bios: Option<String>,
     baud: u32,
     shared_dir: Option<PathBuf>,
+    gdb: Option<String>,
     command: Option<SessionCommand>,
 }
 
@@ -259,6 +265,7 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
         file.baud.unwrap_or(DEFAULT_BAUD)
     };
     let shared_dir = command.shared_dir.or(file.shared_dir);
+    let gdb = command.gdb.or(file.gdb);
 
     Ok(ResolvedVmCommand {
         profile,
@@ -272,6 +279,7 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
         bios,
         baud,
         shared_dir,
+        gdb,
         command: command.command.map(Into::into),
     })
 }
@@ -411,7 +419,10 @@ impl VmRuntime {
         let artifact = prepare_boot_artifact(command, Some(tempdir.path()))?;
         let block_image = prepare_block_image(command, tempdir.path())?;
 
-        let spinner = spinner(&format!("starting QEMU for {}", arch_label(command.profile.arch)));
+        let spinner = spinner(&format!(
+            "starting QEMU for {}",
+            arch_label(command.profile.arch)
+        ));
         let mut qemu = Command::new(&command.qemu_bin);
         qemu.arg("-display").arg("none").arg("-monitor").arg("none");
         qemu.arg("-machine").arg(command.profile.machine);
@@ -420,6 +431,9 @@ impl VmRuntime {
         if command.profile.console == VmConsoleProfile::SerialUnixSocket {
             qemu.arg("-serial")
                 .arg(format!("unix:{},server=on,wait=on", socket_path.display()));
+        }
+        if let Some(gdb) = &command.gdb {
+            qemu.arg("-gdb").arg(gdb);
         }
         if command.profile.arch == VmArch::X86_64 {
             qemu.arg("-cpu").arg("max");
@@ -644,8 +658,9 @@ fn configure_host_share(qemu: &mut Command, host_share: VmHostShareProfile, shar
                 "local,id=hostfs,path={},security_model=none,multidevs=remap",
                 shared_dir.display()
             ));
-            qemu.arg("-device")
-                .arg(format!("virtio-9p-device,fsdev=hostfs,mount_tag={HOST_SHARE_MOUNT_TAG}"));
+            qemu.arg("-device").arg(format!(
+                "virtio-9p-device,fsdev=hostfs,mount_tag={HOST_SHARE_MOUNT_TAG}"
+            ));
         }
     }
 }
@@ -676,13 +691,15 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant};
 
-    use anyhow::{Context as _, Result, bail};
+    use anyhow::{bail, Context as _, Result};
+    use helios_inspector_protocol::debugger::programs as debugger_programs;
 
     use super::*;
 
     const WATCHDOG_SELF_TEST_DELAY_MS: &str = "5000";
     const WATCHDOG_TIMEOUT_SECS: &str = "10";
     const WATCHDOG_STAGE_TIMEOUT: Duration = Duration::from_secs(120);
+    const DIRECT_EXEC_TIMEOUT: Duration = Duration::from_secs(900);
     const SERIAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
     const SERIAL_READ_TIMEOUT: Duration = Duration::from_millis(500);
     const DEBUGGER_RUN_STAGE_MARKER: &[u8] = b"[KDBG run:begin]";
@@ -755,6 +772,7 @@ mod tests {
             bios: None,
             baud: DEFAULT_BAUD,
             shared_dir: None,
+            gdb: None,
             command: None,
         };
 
@@ -830,6 +848,133 @@ mod tests {
             bios: arch.profile().default_bios.map(str::to_owned),
             baud: DEFAULT_BAUD,
             shared_dir: None,
+            gdb: None,
+            command: None,
+        }
+    }
+
+    #[test]
+    #[ignore = "requires qemu, a release riscv guest build, and staged host artifacts"]
+    fn exec_path_runs_host_curl_in_riscv_release_vm() -> Result<()> {
+        let command = direct_exec_command(VmArch::Riscv64);
+        build_vm(&command)?;
+        let mut runtime = VmRuntime::spawn(&command)?;
+        let socket = runtime
+            .socket_path()
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("socket path must be valid UTF-8"))?;
+        let client = connect_client(socket, DEFAULT_BAUD, true)
+            .context("failed to connect direct-exec RPC client")?;
+
+        let curl = crate::runtime::block_on(async {
+            crate::runtime::timeout(
+                DIRECT_EXEC_TIMEOUT,
+                debugger_programs::exec_path(
+                    &client,
+                    "/host/artifacts/wasi-tools/curl-stripped.wasm",
+                    &["http://example.com".to_owned()],
+                ),
+            )
+            .await
+        })
+        .ok_or_else(|| anyhow::anyhow!("timed out waiting for direct curl exec-path result"))??;
+        assert_eq!(curl.exit_code, 0, "curl exited non-zero: {curl:?}");
+        let curl_stdout = String::from_utf8_lossy(&curl.output.stdout).to_ascii_lowercase();
+        assert!(
+            curl_stdout.contains("<title>example domain</title>"),
+            "unexpected curl stdout: {}",
+            String::from_utf8_lossy(&curl.output.stdout)
+        );
+
+        runtime.shutdown();
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires qemu, a release riscv guest build, and staged host artifacts"]
+    fn exec_path_runs_host_cpython_in_riscv_release_vm() -> Result<()> {
+        let command = direct_exec_command(VmArch::Riscv64);
+        build_vm(&command)?;
+        let mut runtime = VmRuntime::spawn(&command)?;
+        let socket = runtime
+            .socket_path()
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("socket path must be valid UTF-8"))?;
+        let client = connect_client(socket, DEFAULT_BAUD, true)
+            .context("failed to connect direct-exec RPC client")?;
+
+        let python = crate::runtime::block_on(async {
+            crate::runtime::timeout(
+                DIRECT_EXEC_TIMEOUT,
+                debugger_programs::exec_path(
+                    &client,
+                    "/host/artifacts/python3-root/python3.wasm",
+                    &["-c".to_owned(), "print(40+2)".to_owned()],
+                ),
+            )
+            .await
+        })
+        .ok_or_else(|| anyhow::anyhow!("timed out waiting for direct CPython exec-path result"))??;
+        assert_eq!(python.exit_code, 0, "CPython exited non-zero: {python:?}");
+        let python_stdout = String::from_utf8_lossy(&python.output.stdout);
+        assert_eq!(python_stdout.trim(), "42", "unexpected CPython stdout");
+
+        runtime.shutdown();
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires qemu, a release riscv guest build, and staged host artifacts"]
+    fn shell_runs_host_cpython_in_riscv_release_vm() -> Result<()> {
+        let command = direct_exec_command(VmArch::Riscv64);
+        build_vm(&command)?;
+        let mut runtime = VmRuntime::spawn(&command)?;
+        let socket = runtime
+            .socket_path()
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("socket path must be valid UTF-8"))?;
+        let mut client = connect_client(socket, DEFAULT_BAUD, true)
+            .context("failed to connect shell RPC client")?;
+
+        let python = crate::runtime::block_on(async {
+            crate::runtime::timeout(
+                DIRECT_EXEC_TIMEOUT,
+                crate::programs::exec(
+                    &mut client,
+                    crate::programs::REMOTE_SHELL_PATH,
+                    &[
+                        "-c".to_owned(),
+                        "/host/artifacts/python3-root/python3.wasm -c \"print(40+2)\""
+                            .to_owned(),
+                    ],
+                ),
+            )
+            .await
+        })
+        .ok_or_else(|| anyhow::anyhow!("timed out waiting for shell CPython result"))??;
+        assert_eq!(python.exit_code, 0, "shell CPython exited non-zero: {python:?}");
+        let python_stdout = String::from_utf8_lossy(&python.output.stdout);
+        assert_eq!(python_stdout.trim(), "42", "unexpected shell CPython stdout");
+
+        runtime.shutdown();
+        Ok(())
+    }
+
+    fn direct_exec_command(arch: VmArch) -> ResolvedVmCommand {
+        let profile = arch.profile();
+        ResolvedVmCommand {
+            profile,
+            release: true,
+            qemu_bin: PathBuf::from(profile.qemu_bin),
+            kernel: default_kernel_path(arch, true),
+            socket: None,
+            no_build: true,
+            smp: profile.default_smp,
+            memory: profile.default_memory.to_owned(),
+            bios: profile.default_bios.map(str::to_owned),
+            baud: DEFAULT_BAUD,
+            shared_dir: Some(repo_root().to_path_buf()),
+            gdb: None,
             command: None,
         }
     }

@@ -1728,6 +1728,7 @@ where
 pub(crate) struct ChannelStreamProducer {
     reader: crate::ByteReader,
     pending: Option<Pin<Box<dyn core::future::Future<Output = Option<Vec<u8>>> + Send>>>,
+    completion: Option<oneshot::Sender<()>>,
 }
 
 impl ChannelStreamProducer {
@@ -1735,7 +1736,28 @@ impl ChannelStreamProducer {
         Self {
             reader,
             pending: None,
+            completion: None,
         }
+    }
+
+    pub(crate) fn new_with_completion(reader: crate::ByteReader, completion: oneshot::Sender<()>) -> Self {
+        Self {
+            reader,
+            pending: None,
+            completion: Some(completion),
+        }
+    }
+
+    fn finish(&mut self) {
+        if let Some(completion) = self.completion.take() {
+            let _ = completion.send(());
+        }
+    }
+}
+
+impl Drop for ChannelStreamProducer {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -1750,6 +1772,11 @@ impl<T> StreamProducer<T> for ChannelStreamProducer {
         mut destination: Destination<'_, Self::Item, Self::Buffer>,
         finish: bool,
     ) -> Poll<Result<StreamResult>> {
+        if finish {
+            self.finish();
+            return Poll::Ready(Ok(StreamResult::Cancelled));
+        }
+
         loop {
             if self.pending.is_none() {
                 let reader = self.reader.clone();
@@ -1761,14 +1788,11 @@ impl<T> StreamProducer<T> for ChannelStreamProducer {
                 .expect("pending future was just installed");
             match fut.as_mut().poll(cx) {
                 Poll::Pending => {
-                    return if finish {
-                        Poll::Ready(Ok(StreamResult::Cancelled))
-                    } else {
-                        Poll::Pending
-                    };
+                    return Poll::Pending;
                 }
                 Poll::Ready(None) => {
                     self.pending = None;
+                    self.finish();
                     return Poll::Ready(Ok(StreamResult::Dropped));
                 }
                 Poll::Ready(Some(bytes)) => {

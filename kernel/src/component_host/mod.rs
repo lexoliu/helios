@@ -197,6 +197,8 @@ macro_rules! impl_program_bindings {
                 child: wasmtime::component::Resource<ChildHandle>,
             ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<core::result::Result<(), ()>>)>
             {
+                use futures::channel::oneshot;
+
                 let handle = access
                     .get()
                     .table
@@ -204,10 +206,20 @@ macro_rules! impl_program_bindings {
                     .map_err(wasmtime::Error::from)?;
                 let reader = handle.take_stdout();
                 let stream = match reader {
-                    Some(reader) => StreamReader::new(
-                        &mut access,
-                        crate::wasmtime_adapter::wasi::ChannelStreamProducer::new(reader),
-                    )?,
+                    Some(reader) => {
+                        let (tx, rx) = oneshot::channel();
+                        let stream = StreamReader::new(
+                            &mut access,
+                            crate::wasmtime_adapter::wasi::ChannelStreamProducer::new_with_completion(reader, tx),
+                        )?;
+                        let future = FutureReader::new(&mut access, async move {
+                            match rx.await {
+                                Ok(()) => Ok::<_, wasmtime::Error>(Ok::<(), ()>(())),
+                                Err(_) => Ok::<_, wasmtime::Error>(Ok::<(), ()>(())),
+                            }
+                        })?;
+                        return Ok((stream, future));
+                    }
                     None => StreamReader::new(&mut access, Vec::<u8>::new())?,
                 };
                 let future = FutureReader::new(&mut access, async {
@@ -221,6 +233,8 @@ macro_rules! impl_program_bindings {
                 child: wasmtime::component::Resource<ChildHandle>,
             ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<core::result::Result<(), ()>>)>
             {
+                use futures::channel::oneshot;
+
                 let handle = access
                     .get()
                     .table
@@ -228,10 +242,20 @@ macro_rules! impl_program_bindings {
                     .map_err(wasmtime::Error::from)?;
                 let reader = handle.take_stderr();
                 let stream = match reader {
-                    Some(reader) => StreamReader::new(
-                        &mut access,
-                        crate::wasmtime_adapter::wasi::ChannelStreamProducer::new(reader),
-                    )?,
+                    Some(reader) => {
+                        let (tx, rx) = oneshot::channel();
+                        let stream = StreamReader::new(
+                            &mut access,
+                            crate::wasmtime_adapter::wasi::ChannelStreamProducer::new_with_completion(reader, tx),
+                        )?;
+                        let future = FutureReader::new(&mut access, async move {
+                            match rx.await {
+                                Ok(()) => Ok::<_, wasmtime::Error>(Ok::<(), ()>(())),
+                                Err(_) => Ok::<_, wasmtime::Error>(Ok::<(), ()>(())),
+                            }
+                        })?;
+                        return Ok((stream, future));
+                    }
                     None => StreamReader::new(&mut access, Vec::<u8>::new())?,
                 };
                 let future = FutureReader::new(&mut access, async {
@@ -361,6 +385,7 @@ async fn run_system_component<CpuImpl, HostFs>(
     component: EmbeddedComponent,
     world: ComponentBindingSet,
     cpu: CpuImpl,
+    spawner: crate::Spawner<CpuImpl>,
     debug_state: HostRuntimeState<CpuImpl, HostFs>,
     read_serial: fn(u32) -> Vec<u8>,
     write_serial: fn(&[u8]),
@@ -413,6 +438,7 @@ where
 
     let context = ComponentExecContext::new(
         cpu,
+        spawner,
         debug_state.clone(),
         instance_registry,
         instance,
@@ -488,6 +514,8 @@ where
             Ok(())
         },
     );
+    store.set_epoch_deadline(1);
+    store.epoch_deadline_async_yield_and_update(1);
     store
 }
 

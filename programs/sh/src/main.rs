@@ -22,7 +22,7 @@ use exec::{Bootstrap, Shell};
 use helios_api::ReadExt as _;
 use platform::HeliosPlatform;
 
-const HELIOS_PROCESS_ID_ENV: &str = "HELIOS_PROCESS_ID";
+pub(crate) const HELIOS_PROCESS_ID_ENV: &str = "HELIOS_PROCESS_ID";
 
 #[helios_api::main]
 async fn main() -> Result<()> {

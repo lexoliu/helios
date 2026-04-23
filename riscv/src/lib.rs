@@ -10,6 +10,8 @@ mod watchdog;
 mod debug_state {
     pub(crate) type RuntimeState =
         helios_kernel::HostRuntimeState<crate::RiscvCpu, crate::host_fs::HostFileSystemService>;
+    pub(crate) type ProgramService =
+        helios_kernel::UserProgramService<crate::RiscvCpu, crate::host_fs::HostFileSystemService>;
 }
 
 use ns16550a::Uart;
@@ -296,6 +298,7 @@ struct HartRuntime {
     wasmtime_tls: Cell<*mut u8>,
     debug_transport: Option<DebugTransport>,
     external_interrupts: Option<net::ExternalInterrupts>,
+    program_service: Option<debug_state::ProgramService>,
 }
 
 impl HartRuntime {
@@ -481,6 +484,9 @@ extern "C" fn trap_handler(tf: &mut TrapFrame) {
 fn trap_dispatch(tf: &mut TrapFrame) {
     match riscv::register::scause::read().cause().try_into() {
         Ok(Trap::Interrupt(Interrupt::SupervisorTimer)) => {
+            if let Some(program_service) = current_hart_runtime().program_service.as_ref() {
+                program_service.increment_epoch();
+            }
             current_hart_runtime().timer.handle_interrupt();
         }
         Ok(Trap::Interrupt(Interrupt::SupervisorSoft)) => unsafe {
@@ -594,19 +600,21 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     } else {
         None
     };
-    let hart_runtime = HartRuntime {
+    let mut hart_runtime = HartRuntime {
         hart_id: current_hart,
         timer: kernel.timer(),
         wasmtime_tls: Cell::new(core::ptr::null_mut()),
         debug_transport,
         external_interrupts,
+        program_service: None,
     };
     hart_runtime.install();
+    let program_service =
+        helios_kernel::install_component_host_program_service(&kernel, &cpu, &debug_state);
+    hart_runtime.program_service = program_service;
     unsafe {
         configure_interrupts();
     }
-    let _program_service =
-        helios_kernel::install_component_host_program_service(&kernel, &cpu, &debug_state);
     if current_hart == bootstrap_processor {
         for processor in
             helios_kernel::component_host_processors_to_start(hart_count, bootstrap_processor)

@@ -45,10 +45,12 @@ mkdir -p "$python_root"
 unzip -q "$zip_path" -d "$staging/cpython"
 
 echo "Converting python.wasm to a WASI P2 component..."
+python_component_raw="$staging/python3.component.wasm"
 wasm-tools component new \
   "$staging/cpython/python.wasm" \
   --adapt "$adapter_path" \
-  -o "$python_root/python3.wasm"
+  -o "$python_component_raw"
+wasm-tools strip "$python_component_raw" -o "$python_root/python3.wasm"
 
 cp -r "$staging/cpython/lib" "$python_root/"
 

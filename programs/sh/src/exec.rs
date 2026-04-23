@@ -25,6 +25,7 @@ use crate::options::ShellOptions;
 use crate::parser;
 use crate::platform::{ResolvedProgram, RunningProcess, ShellPlatform, SpawnRequest, WriteMode};
 use crate::streams::{InputStream, OutputStream, capture_output, close, write_all};
+use crate::HELIOS_PROCESS_ID_ENV;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Variable {
@@ -377,7 +378,8 @@ where
     pub fn exported_environment(&self) -> Vec<(String, String)> {
         let mut pairs = Vec::new();
         for (name, variable) in &self.variables {
-            if variable.exported
+            if name != HELIOS_PROCESS_ID_ENV
+                && variable.exported
                 && let Some(value) = &variable.value
             {
                 pairs.push((name.clone(), value.clone()));
@@ -2752,6 +2754,23 @@ mod tests {
     }
 
     #[test]
+    fn reserved_kernel_process_id_is_not_exported_to_external_commands() {
+        let (status, state) = run_script_with_bootstrap(
+            "printenv HELIOS_PROCESS_ID\n",
+            [("printenv", printenv_command)],
+            Bootstrap {
+                shell_name: "dash".to_owned(),
+                process_id: "42".to_owned(),
+                positional_parameters: Vec::new(),
+                working_dir: PathBuf::from("/"),
+                environment: vec![(HELIOS_PROCESS_ID_ENV.to_owned(), "42".to_owned())],
+            },
+        );
+        assert!(status.is_success(), "script exited with {}", status.code());
+        assert!(state.stdout.is_empty());
+    }
+
+    #[test]
     fn builtin_cat_reads_pipeline_input() {
         let state = run_script("producer | cat\n", [("producer", producer_command)]);
         assert_eq!(state.stdout, b"pipe-data\n");
@@ -3275,6 +3294,24 @@ mod tests {
         script: &str,
         commands: [(&'static str, TestCommandHandler); N],
     ) -> (CommandStatus, TestState) {
+        run_script_with_bootstrap(
+            script,
+            commands,
+            Bootstrap {
+                shell_name: "dash".to_owned(),
+                process_id: "1".to_owned(),
+                positional_parameters: Vec::new(),
+                working_dir: PathBuf::from("/"),
+                environment: Vec::new(),
+            },
+        )
+    }
+
+    fn run_script_with_bootstrap<const N: usize>(
+        script: &str,
+        commands: [(&'static str, TestCommandHandler); N],
+        bootstrap: Bootstrap,
+    ) -> (CommandStatus, TestState) {
         let mut pool = LocalPool::new();
         let platform = TestPlatform::new(pool.spawner());
         for (name, command) in commands {
@@ -3283,16 +3320,7 @@ mod tests {
 
         let platform_for_run = platform.clone();
         let status = pool.run_until(async move {
-            let mut shell = Shell::new(
-                platform_for_run.clone(),
-                Bootstrap {
-                    shell_name: "dash".to_owned(),
-                    process_id: "1".to_owned(),
-                    positional_parameters: Vec::new(),
-                    working_dir: PathBuf::from("/"),
-                    environment: Vec::new(),
-                },
-            );
+            let mut shell = Shell::new(platform_for_run.clone(), bootstrap);
             let program = parser::parse(script).expect("script should parse");
             shell
                 .run_program(&program)

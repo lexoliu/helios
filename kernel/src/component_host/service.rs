@@ -2,19 +2,33 @@ use super::*;
 use helios_hal::watchdog::Watchdog;
 
 const HELIOS_PROCESS_ID_ENV: &str = "HELIOS_PROCESS_ID";
+const PROGRAM_PHASE_HEARTBEAT_INTERVAL_NANOS: u64 = 5_000_000_000;
 
 #[derive(Clone, Copy)]
 pub struct ProgramServiceConfig {
     compile_workers: usize,
+    drive_compile_inline: bool,
 }
 
 impl ProgramServiceConfig {
     pub const fn new(compile_workers: usize) -> Self {
-        Self { compile_workers }
+        Self {
+            compile_workers,
+            drive_compile_inline: true,
+        }
+    }
+
+    pub const fn with_inline_compile_driver(mut self, drive_compile_inline: bool) -> Self {
+        self.drive_compile_inline = drive_compile_inline;
+        self
     }
 
     fn worker_count(self) -> usize {
         self.compile_workers
+    }
+
+    fn drive_compile_inline(self) -> bool {
+        self.drive_compile_inline
     }
 
     fn reserved_stack_bytes(self) -> usize {
@@ -40,6 +54,7 @@ where
     HostFs: crate::HostFileSystem,
 {
     cpu: CpuImpl,
+    spawner: crate::Spawner<CpuImpl>,
     runtime_state: HostRuntimeState<CpuImpl, HostFs>,
     instance_registry: crate::InstanceRegistry,
     read_serial: fn(u32) -> Vec<u8>,
@@ -55,8 +70,10 @@ where
     engine: crate::wasmtime_adapter::WasmtimeEngine,
     compiler: ComputePool,
     compile_priority: ComputePriority,
+    drive_compile_inline: bool,
     component_cache: Mutex<ComponentCache<crate::wasmtime_adapter::WasmtimeCompiledComponent>>,
     clock_cpu: CpuImpl,
+    progress: helios_hal::watchdog::ProgressCounter,
     spawner: crate::Spawner<CpuImpl>,
     _marker: core::marker::PhantomData<fn() -> HostFs>,
 }
@@ -66,6 +83,45 @@ struct ProgramSpawnRequest {
     args: Vec<String>,
     env: Vec<(String, String)>,
     rights: WasiRights,
+}
+
+fn spawn_program_phase_heartbeat<CpuImpl>(
+    spawner: &crate::Spawner<CpuImpl>,
+    cpu: &CpuImpl,
+    progress: &helios_hal::watchdog::ProgressCounter,
+    write_serial: fn(&[u8]),
+    phase: &'static str,
+    started_at: u64,
+    done: &Arc<core::sync::atomic::AtomicBool>,
+) where
+    CpuImpl: Cpu + Clone,
+{
+    spawner.spawn_detached({
+        let done = done.clone();
+        let cpu = cpu.clone();
+        let progress = progress.clone();
+        async move {
+            let mut next_heartbeat =
+                started_at.saturating_add(PROGRAM_PHASE_HEARTBEAT_INTERVAL_NANOS);
+            loop {
+                if done.load(core::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+
+                let now = monotonic_nanos(&cpu);
+                if now >= next_heartbeat {
+                    progress.record_progress();
+                    let elapsed_ms = elapsed_millis(started_at, now);
+                    let message =
+                        format!("\n[KDBG program:{phase}-progress elapsed_ms={elapsed_ms}]\n");
+                    write_serial(message.as_bytes());
+                    next_heartbeat = now.saturating_add(PROGRAM_PHASE_HEARTBEAT_INTERVAL_NANOS);
+                }
+
+                crate::yield_now().await;
+            }
+        }
+    });
 }
 
 /// Handle to a spawned child component as seen by the kernel and its
@@ -162,7 +218,8 @@ where
         kernel,
         cpu,
         debug_state,
-        ProgramServiceConfig::new(worker_count.max(1)),
+        ProgramServiceConfig::new(worker_count.max(1))
+            .with_inline_compile_driver(worker_count == 0),
     ))
 }
 
@@ -204,8 +261,10 @@ where
             engine,
             compiler,
             compile_priority: ComputePriority::NORMAL,
+            drive_compile_inline: config.drive_compile_inline(),
             component_cache: Mutex::new(ComponentCache::new(cache_budget)),
             clock_cpu: cpu.clone(),
+            progress: kernel.spawner().progress_counter(),
             spawner: kernel.spawner(),
             _marker: core::marker::PhantomData,
         }),
@@ -239,6 +298,7 @@ where
             component,
             world,
             cpu.clone(),
+            kernel.spawner(),
             debug_state,
             read_serial,
             write_serial,
@@ -255,14 +315,23 @@ where
 pub fn run_program_workers_forever<CpuImpl, HostFs, WatchdogImpl>(
     _cpu: CpuImpl,
     kernel: crate::Kernel<CpuImpl, WatchdogImpl>,
-    _debug_state: HostRuntimeState<CpuImpl, HostFs>,
+    debug_state: HostRuntimeState<CpuImpl, HostFs>,
 ) -> !
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
     WatchdogImpl: Watchdog + Clone,
 {
-    kernel.run();
+    kernel.run_local_future(async move {
+        let service = debug_state.wait_for_program_service().await;
+        loop {
+            if service.run_next_compile_job() {
+                continue;
+            }
+
+            service.wait_for_compile_work().await;
+        }
+    })
 }
 
 pub fn run_component_host_processor_forever<CpuImpl, HostFs, WatchdogImpl>(
@@ -308,6 +377,18 @@ where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
 {
+    pub fn increment_epoch(&self) {
+        self.inner.engine.increment_epoch();
+    }
+
+    fn run_next_compile_job(&self) -> bool {
+        self.inner.compiler.run_next()
+    }
+
+    async fn wait_for_compile_work(&self) {
+        self.inner.compiler.wait_for_work().await;
+    }
+
     /// Spawn a new child program. The returned handle gives the caller
     /// direct access to the child's stdin/stdout/stderr channels and a
     /// future resolving with its exit status.
@@ -320,7 +401,10 @@ where
         wasm: alloc::vec::Vec<u8>,
         rights: WasiRights,
     ) -> Result<ChildHandle, ProgramExecError> {
-        let component = self.compile_component(&wasm).await?;
+        super::emit_stage_marker(exec_context.write_serial, "program:spawn-begin");
+        let component = self
+            .compile_component(&wasm, exec_context.write_serial)
+            .await?;
 
         // Three byte channels between parent and child.
         let (stdin_writer, stdin_reader) = crate::byte_channel();
@@ -352,14 +436,19 @@ where
         let (exit_tx, exit_rx) = futures::channel::oneshot::channel();
         let runtime = self.inner.runtime.clone();
         let engine = self.inner.engine.clone();
+        let spawner = exec_context.spawner.clone();
+        let run_spawner = spawner.clone();
+        let progress = spawner.progress_counter();
 
-        self.inner.spawner.spawn_detached(async move {
+        spawner.spawn_detached(async move {
             let result = run_program_component(
                 exec_context,
                 request.name,
                 request.args,
                 request.env,
                 request.rights,
+                run_spawner,
+                progress,
                 component,
                 &engine,
                 &runtime,
@@ -444,9 +533,11 @@ where
     async fn compile_component(
         &self,
         wasm: &[u8],
+        write_serial: fn(&[u8]),
     ) -> Result<Arc<crate::wasmtime_adapter::WasmtimeCompiledComponent>, ProgramExecError> {
         let started_at = monotonic_nanos(&self.inner.clock_cpu);
         if let Some(component) = self.inner.component_cache.lock().get(wasm) {
+            super::emit_stage_marker(write_serial, "program:compile-cache-hit");
             let now = monotonic_nanos(&self.inner.clock_cpu);
             tracing::info!(
                 target: "helios_component_host::program_host",
@@ -460,25 +551,53 @@ where
         }
 
         let wasm = Arc::<[u8]>::from(wasm.to_vec());
-        let mut compiled =
-            core::pin::pin!(self.inner.compiler.spawn(self.inner.compile_priority, {
-                let engine = self.inner.engine.clone();
-                let wasm = wasm.clone();
-                move || {
-                    use crate::ComponentRuntimeEngine;
-                    engine.compile(&wasm)
-                }
-            },));
-        let compiled = core::future::poll_fn(|cx| match compiled.as_mut().poll(cx) {
-            core::task::Poll::Ready(result) => core::task::Poll::Ready(result),
-            core::task::Poll::Pending => {
-                if self.inner.compiler.run_next() {
-                    cx.waker().wake_by_ref();
-                }
-                core::task::Poll::Pending
+        super::emit_stage_marker(write_serial, "program:compile-begin");
+        tracing::info!(
+            target: "helios_component_host::program_host",
+            phase = "compile-component",
+            cache = "miss",
+            wasm_bytes = wasm.len(),
+            "program component compilation started"
+        );
+        let compile_done = Arc::new(core::sync::atomic::AtomicBool::new(false));
+        spawn_program_phase_heartbeat(
+            &self.inner.spawner,
+            &self.inner.clock_cpu,
+            &self.inner.progress,
+            write_serial,
+            "compile",
+            started_at,
+            &compile_done,
+        );
+        let compile = self.inner.compiler.spawn(self.inner.compile_priority, {
+            let engine = self.inner.engine.clone();
+            let wasm = wasm.clone();
+            let write_serial = write_serial;
+            move || {
+                use crate::ComponentRuntimeEngine;
+                super::emit_stage_marker(write_serial, "program:compile-worker-begin");
+                let compiled = engine.compile(&wasm);
+                super::emit_stage_marker(write_serial, "program:compile-worker-end");
+                compiled
             }
-        })
-        .await
+        });
+        let compiled = if self.inner.drive_compile_inline {
+            let mut compile = core::pin::pin!(compile);
+            core::future::poll_fn(|cx| match compile.as_mut().poll(cx) {
+                core::task::Poll::Ready(result) => core::task::Poll::Ready(result),
+                core::task::Poll::Pending => {
+                    if self.inner.compiler.run_next() {
+                        cx.waker().wake_by_ref();
+                    }
+                    core::task::Poll::Pending
+                }
+            })
+            .await
+        } else {
+            compile.await
+        };
+        compile_done.store(true, core::sync::atomic::Ordering::Release);
+        let compiled = compiled
         .map_err(|error| ProgramExecError {
             kind: ProgramExecErrorKind::QueueSaturated,
             detail: error.to_string(),
@@ -488,6 +607,7 @@ where
             detail: format!("{error:#}"),
         })?;
 
+        super::emit_stage_marker(write_serial, "program:compile-end");
         let component = Arc::new(compiled);
         let now = monotonic_nanos(&self.inner.clock_cpu);
         tracing::info!(
@@ -514,6 +634,7 @@ where
     pub(crate) fn from_store(store: &StoreData<CpuImpl, HostFs>) -> Self {
         Self {
             cpu: store.cpu.clone(),
+            spawner: store.spawner().clone(),
             runtime_state: store.runtime_state.clone(),
             instance_registry: store.instance_registry.clone(),
             read_serial: store.serial_reader_fn(),
@@ -529,6 +650,8 @@ async fn run_program_component<CpuImpl, HostFs>(
     args: Vec<String>,
     env: Vec<(String, String)>,
     _rights: WasiRights,
+    spawner: crate::Spawner<CpuImpl>,
+    progress: helios_hal::watchdog::ProgressCounter,
     compiled: Arc<crate::wasmtime_adapter::WasmtimeCompiledComponent>,
     engine: &crate::wasmtime_adapter::WasmtimeEngine,
     runtime: &crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
@@ -546,9 +669,12 @@ where
     let mut argv = Vec::with_capacity(args.len() + 1);
     argv.push(name);
     argv.extend(args);
+    let run_started_at = monotonic_nanos(&exec_context.cpu);
+    let run_cpu = exec_context.cpu.clone();
 
     let context = ComponentExecContext::new(
         exec_context.cpu,
+        exec_context.spawner.clone(),
         exec_context.runtime_state.clone(),
         exec_context.instance_registry,
         launched_instance,
@@ -567,6 +693,7 @@ where
 
     // Use the engine that compiled the component — Wasmtime requires
     // component and store to share the same engine instance.
+    super::emit_stage_marker(exec_context.write_serial, "program:instantiate-begin");
     let executor =
         <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as ComponentRuntimeFactory<
             CpuImpl,
@@ -575,8 +702,23 @@ where
         >>::instantiate(runtime, engine, &compiled, ComponentWorld::Program, context)
         .await
         .map_err(map_program_runtime_error)?;
+    super::emit_stage_marker(exec_context.write_serial, "program:instantiate-ok");
 
-    let result = executor.run().await.map_err(map_program_runtime_error)?;
+    let run_done = Arc::new(core::sync::atomic::AtomicBool::new(false));
+    spawn_program_phase_heartbeat(
+        &spawner,
+        &run_cpu,
+        &progress,
+        exec_context.write_serial,
+        "run",
+        run_started_at,
+        &run_done,
+    );
+    super::emit_stage_marker(exec_context.write_serial, "program:run-begin");
+    let result = executor.run().await;
+    run_done.store(true, core::sync::atomic::Ordering::Release);
+    let result = result.map_err(map_program_runtime_error)?;
+    super::emit_stage_marker(exec_context.write_serial, "program:run-end");
 
     Ok(ChildExit {
         instance_id: result.instance_id,

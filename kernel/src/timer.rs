@@ -16,6 +16,10 @@ use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 use helios_hal::cpu::{Cpu, Instant};
 use objectpool::Pool;
 
+use crate::time::duration_to_ticks;
+
+const SCHEDULER_INTERRUPT_INTERVAL: Duration = Duration::from_millis(100);
+
 #[derive(Clone)]
 pub struct Timer<CpuImpl: Cpu + Clone> {
     cpu: CpuImpl,
@@ -33,12 +37,14 @@ struct TimerState {
 
 struct TimerShared {
     // This heap is owned by the kernel event loop running on the timer's home
-    // processor. Interrupt handlers never touch it; they only disarm the timer
-    // and return so normal async/task context can finish the work.
+    // processor. Interrupt handlers never touch it; they only re-arm the next
+    // periodic/preemption tick so normal async/task context can finish the work.
     state: UnsafeCell<TimerState>,
     inbox: ConcurrentQueue<TimerEntry>,
     next_id: AtomicU64,
-    published_deadline: AtomicU64,
+    next_sleep_deadline: AtomicU64,
+    armed_deadline: AtomicU64,
+    interrupt_interval_ticks: u64,
     ready_pool: Pool<Vec<Arc<SleepState>>>,
 }
 
@@ -58,6 +64,14 @@ struct SleepState {
 
 impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     pub fn new(cpu: CpuImpl) -> Self {
+        let interrupt_interval_ticks =
+            duration_to_ticks(SCHEDULER_INTERRUPT_INTERVAL, cpu.timer_frequency());
+        assert!(
+            interrupt_interval_ticks != 0,
+            "scheduler interrupt interval {SCHEDULER_INTERRUPT_INTERVAL:?} converted to zero timer ticks"
+        );
+        let initial_deadline = cpu.now().saturating_add(interrupt_interval_ticks);
+        cpu.set_deadline(initial_deadline);
         Self {
             cpu,
             shared: Arc::new(TimerShared {
@@ -66,7 +80,9 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
                 }),
                 inbox: ConcurrentQueue::unbounded(),
                 next_id: AtomicU64::new(0),
-                published_deadline: AtomicU64::new(u64::MAX),
+                next_sleep_deadline: AtomicU64::new(u64::MAX),
+                armed_deadline: AtomicU64::new(initial_deadline.ticks()),
+                interrupt_interval_ticks,
                 ready_pool: Pool::bounded(8, Vec::new, Vec::clear),
             }),
         }
@@ -135,10 +151,8 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     }
 
     pub fn handle_interrupt(&self) -> usize {
-        self.shared
-            .published_deadline
-            .store(u64::MAX, AtomicOrdering::Release);
-        self.cpu.set_deadline(Instant::new(u64::MAX));
+        let next_deadline = self.next_interrupt_deadline_after(self.now());
+        self.arm_deadline(next_deadline);
         0
     }
 
@@ -169,55 +183,64 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
 
     fn publish_deadline(&self, deadline: Instant) {
         let deadline = deadline.ticks();
-
         loop {
-            let published = self.shared.published_deadline.load(AtomicOrdering::Acquire);
+            let published = self
+                .shared
+                .next_sleep_deadline
+                .load(AtomicOrdering::Acquire);
             if deadline >= published {
                 return;
             }
 
-            match self.shared.published_deadline.compare_exchange_weak(
+            match self.shared.next_sleep_deadline.compare_exchange_weak(
                 published,
                 deadline,
                 AtomicOrdering::AcqRel,
                 AtomicOrdering::Acquire,
             ) {
-                Ok(_) => {
-                    self.cpu.set_deadline(Instant::new(deadline));
-                    return;
-                }
+                Ok(_) => break,
                 Err(_) => continue,
             }
         }
+
+        let candidate = self.next_interrupt_deadline_after(self.now());
+        self.arm_deadline(candidate);
     }
 
     fn commit_deadline(&self, deadline: Option<Instant>, now: Instant) {
-        let candidate = deadline.map_or(u64::MAX, |deadline| deadline.ticks());
-        let now = now.ticks();
+        let next_sleep_deadline = deadline.map_or(u64::MAX, |deadline| deadline.ticks());
+        self.shared
+            .next_sleep_deadline
+            .store(next_sleep_deadline, AtomicOrdering::Release);
+        let candidate = self.next_interrupt_deadline_after(now);
+        self.arm_deadline(candidate);
+    }
 
-        loop {
-            let published = self.shared.published_deadline.load(AtomicOrdering::Acquire);
-            if published == candidate {
-                return;
-            }
+    fn next_interrupt_deadline_after(&self, now: Instant) -> Instant {
+        let periodic_deadline = now.saturating_add(self.shared.interrupt_interval_ticks);
+        let next_sleep_deadline = self
+            .shared
+            .next_sleep_deadline
+            .load(AtomicOrdering::Acquire);
 
-            if published > now && candidate > published {
-                return;
-            }
-
-            match self.shared.published_deadline.compare_exchange_weak(
-                published,
-                candidate,
-                AtomicOrdering::AcqRel,
-                AtomicOrdering::Acquire,
-            ) {
-                Ok(_) => {
-                    self.cpu.set_deadline(Instant::new(candidate));
-                    return;
-                }
-                Err(_) => continue,
-            }
+        if next_sleep_deadline <= now.ticks() {
+            return periodic_deadline;
         }
+
+        Instant::new(periodic_deadline.ticks().min(next_sleep_deadline))
+    }
+
+    fn arm_deadline(&self, deadline: Instant) {
+        let deadline_ticks = deadline.ticks();
+        let previous = self
+            .shared
+            .armed_deadline
+            .swap(deadline_ticks, AtomicOrdering::AcqRel);
+        if previous == deadline_ticks {
+            return;
+        }
+
+        self.cpu.set_deadline(deadline);
     }
 }
 
@@ -302,16 +325,6 @@ fn next_live_deadline(state: &mut TimerState) -> Option<Instant> {
     }
 
     None
-}
-
-fn duration_to_ticks(duration: Duration, frequency: u64) -> u64 {
-    let seconds = (duration.as_secs() as u128) * (frequency as u128);
-    let subsec = ((duration.subsec_nanos() as u128) * (frequency as u128)) / 1_000_000_000u128;
-    let ticks = seconds
-        .checked_add(subsec)
-        .expect("timer duration overflows tick conversion");
-
-    u64::try_from(ticks).expect("timer duration does not fit into u64 ticks")
 }
 
 unsafe impl Send for TimerShared {}
