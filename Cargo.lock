@@ -1595,15 +1595,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "i6300esb"
-version = "0.1.0"
-dependencies = [
- "critical-section",
- "helios-hal",
- "pci_types",
-]
-
-[[package]]
 name = "helios-init"
 version = "0.1.0"
 dependencies = [
@@ -1710,9 +1701,9 @@ dependencies = [
  "fdt",
  "futures",
  "helios-hal",
- "i6300esb",
  "helios-kernel",
  "helios-virtio",
+ "i6300esb",
  "ns16550a",
  "pci_types",
  "plic",
@@ -1747,8 +1738,8 @@ dependencies = [
  "bootloader_api",
  "critical-section",
  "helios-hal",
- "i6300esb",
  "helios-kernel",
+ "i6300esb",
  "pci_types",
  "x86",
  "x86_64",
@@ -1773,6 +1764,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc627f471c528ff0c4a49e1d5e60450c8f6461dd6d10ba9dcd3a61d3dff7728d"
 dependencies = [
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "i6300esb"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+ "helios-hal",
+ "pci_types",
 ]
 
 [[package]]
