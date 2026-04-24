@@ -171,6 +171,9 @@ paths, components).
   flexibly: inspect the QEMU process, gdbstub, kernel symbols, serial socket,
   and QEMU logs before drawing conclusions. Do not replace real target
   debugging with `hosted/` evidence.
+- Boot and kernel debugging must be evidence-first: reproduce the failure,
+  capture serial/QEMU logs plus GDB/LLDB/QMP state when needed, and only then
+  change boot, device topology, trap, or runtime code.
 - Inspector ↔ guest communication must go through WIT RPC defined in
   `helios-inspector-protocol`, not through ad-hoc side channels.
 
@@ -187,6 +190,9 @@ paths, components).
   behaviour changes, update docs and paths atomically in the same change.
 
 ## 7. Required checks before finishing a task
+
+Generate the matching `helios-cli kernel-prebuild` manifest first and pass it
+through `HELIOS_KERNEL_PREBUILD_MANIFEST` for the target being checked.
 
 Run these locally before declaring a change complete:
 

@@ -5,14 +5,19 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
+askama = "0.15.6"
 clap = { version = "4.5.38", features = ["derive"] }
+cranelift-codegen = { path = "../../wasmtime/cranelift/codegen", features = ["riscv64", "x86"] }
 ed25519-dalek = { version = "2.2.0", default-features = false, features = ["alloc", "rand_core", "std"] }
+fatfs = "0.3.6"
 helios-artifact.workspace = true
 hex = "0.4.3"
+mbrman = "0.5.4"
 rand = "0.8.5"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 toml = "0.8.23"
 wasmparser = "0.245.0"
-wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["all-arch", "component-model", "component-model-async-compile", "cranelift", "gc-null", "std", "winch"] }
+wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["component-model", "component-model-async-compile", "cranelift", "gc-null", "std", "winch"] }
+winch-codegen = { path = "../../wasmtime/winch/codegen", features = ["x64"] }
 wit-component = "0.245.0"

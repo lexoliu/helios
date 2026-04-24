@@ -91,8 +91,9 @@ fn read_kernel_prebuild_manifest(target: &str) -> PrebuildManifest {
     println!("cargo:rerun-if-changed={}", manifest_path.display());
     let manifest = fs::read(&manifest_path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest_path.display()));
-    let manifest: PrebuildManifest = serde_json::from_slice(&manifest)
+    let mut manifest: PrebuildManifest = serde_json::from_slice(&manifest)
         .unwrap_or_else(|error| panic!("failed to decode {}: {error}", manifest_path.display()));
+    absolutize_prebuild_manifest_paths(&manifest_path, &mut manifest);
     assert!(
         manifest.target == target,
         "prebuild target {} does not match kernel target {}",
@@ -116,6 +117,26 @@ fn read_kernel_prebuild_manifest(target: &str) -> PrebuildManifest {
         println!("cargo:rerun-if-changed={}", asset.source.display());
     }
     manifest
+}
+
+fn absolutize_prebuild_manifest_paths(manifest_path: &Path, manifest: &mut PrebuildManifest) {
+    let manifest_dir = manifest_path
+        .parent()
+        .unwrap_or_else(|| panic!("{} has no parent directory", manifest_path.display()));
+    manifest.init_component = manifest_relative_path(manifest_dir, &manifest.init_component);
+    manifest.bootfs_root = manifest_relative_path(manifest_dir, &manifest.bootfs_root);
+    manifest.root_public_key = manifest_relative_path(manifest_dir, &manifest.root_public_key);
+    manifest.root_secret_key = manifest_relative_path(manifest_dir, &manifest.root_secret_key);
+    for asset in &mut manifest.bootfs_assets {
+        asset.source = manifest_relative_path(manifest_dir, &asset.source);
+    }
+}
+
+fn manifest_relative_path(manifest_dir: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_owned();
+    }
+    manifest_dir.join(path)
 }
 
 fn write_trusted_root_file(out_dir: &Path, root_public_key: &Path, root_secret_key: &Path) {

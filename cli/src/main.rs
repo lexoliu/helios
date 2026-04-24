@@ -1,16 +1,19 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use askama::Template;
 use clap::{Parser, Subcommand, ValueEnum};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions};
 use helios_artifact::{
     CWASM_NO_VMEM_MEMORY_GUARD_SIZE, CWASM_NO_VMEM_MEMORY_RESERVATION,
     CWASM_NO_VMEM_MEMORY_RESERVATION_FOR_GROWTH, sign_payload_with_key,
 };
+use mbrman::{BOOT_ACTIVE, CHS, MBR, MBRPartitionEntry};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use toml::Value;
@@ -24,6 +27,17 @@ const PREBUILD_MANIFEST_FILE: &str = "kernel-prebuild.json";
 const DEFAULT_INIT_ARGV0: &str = "/init.wasm";
 const COMPILER_PLUGIN_BOOTFS_PATH: &str = "bin/compiler.cwasm";
 const COMPILER_PLUGIN_ROOT_KEY_ENV: &str = "HELIOS_COMPILER_ROOT_KEY_HEX";
+const LIMINE_IMAGE_BYTES: u64 = 768 * 1024 * 1024;
+const LIMINE_PARTITION_START_LBA: u32 = 2048;
+const LIMINE_SECTOR_BYTES: u64 = 512;
+const LIMINE_EFI_SYSTEM_PARTITION_TYPE: u8 = 0xef;
+const LIMINE_DISK_SIGNATURE: [u8; 4] = *b"HELO";
+
+#[derive(Template)]
+#[template(path = "limine.conf", escape = "none")]
+struct LimineConfigTemplate {
+    baud: u32,
+}
 
 #[derive(Parser)]
 #[command(name = "helios-cli")]
@@ -37,6 +51,7 @@ enum Commands {
     Aot(AotCommand),
     CompilerPlugin(CompilerPluginCommand),
     KernelPrebuild(KernelPrebuildCommand),
+    X86LimineUefiImage(X86LimineUefiImageCommand),
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -86,6 +101,16 @@ struct KernelPrebuildCommand {
     init_argv0: String,
 }
 
+#[derive(Parser)]
+struct X86LimineUefiImageCommand {
+    #[arg(long)]
+    kernel: PathBuf,
+    #[arg(long)]
+    output: PathBuf,
+    #[arg(long)]
+    baud: u32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PrebuildManifest {
     target: String,
@@ -117,6 +142,7 @@ fn main() -> Result<()> {
         Commands::Aot(command) => run_aot(command),
         Commands::CompilerPlugin(command) => run_compiler_plugin(command),
         Commands::KernelPrebuild(command) => run_kernel_prebuild(command),
+        Commands::X86LimineUefiImage(command) => run_x86_limine_uefi_image(command),
     }
 }
 
@@ -204,18 +230,317 @@ fn run_kernel_prebuild(command: KernelPrebuildCommand) -> Result<()> {
 
     let manifest = PrebuildManifest {
         target: command.target,
-        init_component: init_cwasm,
+        init_component: fs::canonicalize(&init_cwasm)
+            .with_context(|| format!("failed to resolve {}", init_cwasm.display()))?,
         init_argv0: command.init_argv0,
         bootfs_root: fs::canonicalize(&bootfs_root)
             .with_context(|| format!("failed to resolve {}", bootfs_root.display()))?,
-        root_public_key: root_public_path,
-        root_secret_key: root_secret_path,
+        root_public_key: fs::canonicalize(&root_public_path)
+            .with_context(|| format!("failed to resolve {}", root_public_path.display()))?,
+        root_secret_key: fs::canonicalize(&root_secret_path)
+            .with_context(|| format!("failed to resolve {}", root_secret_path.display()))?,
         bootfs_assets,
     };
     let manifest_path = command.out_dir.join(PREBUILD_MANIFEST_FILE);
     fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)
         .with_context(|| format!("failed to write {}", manifest_path.display()))?;
     Ok(())
+}
+
+fn run_x86_limine_uefi_image(command: X86LimineUefiImageCommand) -> Result<()> {
+    let kernel = fs::canonicalize(&command.kernel)
+        .with_context(|| format!("failed to canonicalize kernel {}", command.kernel.display()))?;
+    let limine = LimineToolchain::discover()?;
+    build_limine_uefi_image(&limine, &kernel, &command.output, command.baud)
+}
+
+struct LimineToolchain {
+    efi_bootloader: PathBuf,
+}
+
+impl LimineToolchain {
+    fn discover() -> Result<Self> {
+        let executable = std::env::var_os("HELIOS_LIMINE_BIN")
+            .map(PathBuf::from)
+            .or_else(|| find_executable_in_path("limine"))
+            .ok_or_else(|| {
+                anyhow!("failed to find Limine; install `limine` or set HELIOS_LIMINE_BIN")
+            })?;
+        let share_dir = std::env::var_os("HELIOS_LIMINE_SHARE")
+            .map(PathBuf::from)
+            .or_else(|| limine_datadir(&executable).ok())
+            .or_else(|| infer_limine_share_dir(&executable))
+            .ok_or_else(|| {
+                anyhow!("failed to locate Limine shared files; set HELIOS_LIMINE_SHARE")
+            })?;
+        let efi_bootloader = share_dir.join("BOOTX64.EFI");
+        ensure!(
+            efi_bootloader.is_file(),
+            "Limine x86_64 EFI bootloader is missing: {}",
+            efi_bootloader.display()
+        );
+        Ok(Self { efi_bootloader })
+    }
+}
+
+fn limine_datadir(executable: &Path) -> Result<PathBuf> {
+    let output = Command::new(executable)
+        .arg("--print-datadir")
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to query Limine data directory via {}",
+                executable.display()
+            )
+        })?;
+    ensure!(
+        output.status.success(),
+        "{} --print-datadir exited with status {}",
+        executable.display(),
+        output.status
+    );
+    let path = String::from_utf8(output.stdout).context("Limine data directory was not UTF-8")?;
+    Ok(PathBuf::from(path.trim()))
+}
+
+fn build_limine_uefi_image(
+    limine: &LimineToolchain,
+    kernel: &Path,
+    image: &Path,
+    baud: u32,
+) -> Result<()> {
+    let image_bytes = limine_image_bytes(kernel, &limine.efi_bootloader)?;
+    if let Some(parent) = image.parent().filter(|path| !path.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create image directory {}", parent.display()))?;
+    }
+    let mut image_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(image)
+        .with_context(|| format!("failed to create Limine image {}", image.display()))?;
+    image_file
+        .set_len(image_bytes)
+        .with_context(|| format!("failed to size Limine image {}", image.display()))?;
+    write_limine_mbr(&mut image_file, image_bytes)?;
+    write_limine_fat_volume(
+        &mut image_file,
+        image_bytes,
+        kernel,
+        &limine.efi_bootloader,
+        baud,
+    )
+}
+
+fn limine_image_bytes(kernel: &Path, efi_bootloader: &Path) -> Result<u64> {
+    let payload_bytes = fs::metadata(kernel)
+        .with_context(|| format!("failed to inspect kernel {}", kernel.display()))?
+        .len()
+        + fs::metadata(efi_bootloader)
+            .with_context(|| format!("failed to inspect {}", efi_bootloader.display()))?
+            .len();
+    Ok(LIMINE_IMAGE_BYTES.max(payload_bytes + 128 * 1024 * 1024))
+}
+
+fn write_limine_mbr(image: &mut fs::File, image_bytes: u64) -> Result<()> {
+    let mut mbr = MBR::new_from(image, LIMINE_SECTOR_BYTES as u32, LIMINE_DISK_SIGNATURE)
+        .context("failed to create Limine image MBR")?;
+    let total_sectors = u32::try_from(image_bytes / LIMINE_SECTOR_BYTES)
+        .context("Limine UEFI image is too large for an MBR partition table")?;
+    let partition_sectors = total_sectors
+        .checked_sub(LIMINE_PARTITION_START_LBA)
+        .ok_or_else(|| anyhow!("Limine UEFI image is too small for the FAT partition"))?;
+    mbr[1] = MBRPartitionEntry {
+        boot: BOOT_ACTIVE,
+        first_chs: CHS::empty(),
+        sys: LIMINE_EFI_SYSTEM_PARTITION_TYPE,
+        last_chs: CHS::empty(),
+        starting_lba: LIMINE_PARTITION_START_LBA,
+        sectors: partition_sectors,
+    };
+    mbr.write_into(image)
+        .context("failed to write Limine image MBR")
+}
+
+fn write_limine_fat_volume(
+    image: &mut fs::File,
+    image_bytes: u64,
+    kernel: &Path,
+    efi_bootloader: &Path,
+    baud: u32,
+) -> Result<()> {
+    let partition_offset = u64::from(LIMINE_PARTITION_START_LBA) * LIMINE_SECTOR_BYTES;
+    let partition_len = image_bytes
+        .checked_sub(partition_offset)
+        .ok_or_else(|| anyhow!("Limine partition offset exceeds image size"))?;
+    let mut partition = FileSlice::new(image, partition_offset, partition_len);
+    fatfs::format_volume(
+        &mut partition,
+        FormatVolumeOptions::new()
+            .fat_type(FatType::Fat32)
+            .volume_label(*b"HELIOS     "),
+    )
+    .context("failed to format Limine FAT32 partition")?;
+    write_fat32_hidden_sectors(&mut partition, LIMINE_PARTITION_START_LBA)?;
+    partition
+        .seek(SeekFrom::Start(0))
+        .context("failed to rewind Limine FAT32 partition")?;
+    let fs = FileSystem::new(partition, FsOptions::new())
+        .context("failed to open Limine FAT32 partition")?;
+    let root = fs.root_dir();
+    let boot = root.create_dir("boot").context("failed to create /boot")?;
+    let efi = root.create_dir("EFI").context("failed to create /EFI")?;
+    let efi_boot = efi
+        .create_dir("BOOT")
+        .context("failed to create /EFI/BOOT")?;
+    let limine_dir = boot
+        .create_dir("limine")
+        .context("failed to create /boot/limine")?;
+    write_file_to_fat(&efi_boot, "BOOTX64.EFI", efi_bootloader)?;
+    let config = LimineConfigTemplate { baud }
+        .render()
+        .context("failed to render Limine configuration")?;
+    let mut limine_conf = limine_dir
+        .create_file("limine.conf")
+        .context("failed to create /boot/limine/limine.conf")?;
+    limine_conf
+        .write_all(config.as_bytes())
+        .context("failed to write /boot/limine/limine.conf")?;
+    let mut efi_limine_conf = efi_boot
+        .create_file("limine.conf")
+        .context("failed to create /EFI/BOOT/limine.conf")?;
+    efi_limine_conf
+        .write_all(config.as_bytes())
+        .context("failed to write /EFI/BOOT/limine.conf")?;
+    write_file_to_fat(&boot, "helios", kernel)?;
+    Ok(())
+}
+
+fn write_fat32_hidden_sectors(partition: &mut FileSlice<'_>, hidden_sectors: u32) -> Result<()> {
+    const BPB_HIDDEN_SECTORS_OFFSET: u64 = 0x1c;
+    const FAT32_BACKUP_BOOT_SECTOR: u64 = 6 * LIMINE_SECTOR_BYTES;
+    for boot_sector in [0, FAT32_BACKUP_BOOT_SECTOR] {
+        partition
+            .seek(SeekFrom::Start(boot_sector + BPB_HIDDEN_SECTORS_OFFSET))
+            .context("failed to seek to FAT32 hidden-sectors field")?;
+        partition
+            .write_all(&hidden_sectors.to_le_bytes())
+            .context("failed to write FAT32 hidden-sectors field")?;
+    }
+    Ok(())
+}
+
+fn write_file_to_fat<IO>(root: &fatfs::Dir<'_, IO>, name: &str, source: &Path) -> Result<()>
+where
+    IO: fatfs::ReadWriteSeek,
+{
+    let mut input = fs::File::open(source)
+        .with_context(|| format!("failed to open source file {}", source.display()))?;
+    let mut output = root
+        .create_file(name)
+        .with_context(|| format!("failed to create FAT file {name}"))?;
+    std::io::copy(&mut input, &mut output)
+        .with_context(|| format!("failed to copy {} into FAT file {name}", source.display()))?;
+    Ok(())
+}
+
+fn find_executable_in_path(name: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|path| path.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+fn infer_limine_share_dir(executable: &Path) -> Option<PathBuf> {
+    let bin_dir = executable.parent()?;
+    let prefix_dir = bin_dir.parent()?;
+    [
+        prefix_dir.join("share").join("limine"),
+        prefix_dir.join("share"),
+    ]
+    .into_iter()
+    .find(|path| path.join("BOOTX64.EFI").is_file())
+}
+
+struct FileSlice<'a> {
+    file: &'a mut fs::File,
+    offset: u64,
+    len: u64,
+    position: u64,
+}
+
+impl<'a> FileSlice<'a> {
+    fn new(file: &'a mut fs::File, offset: u64, len: u64) -> Self {
+        Self {
+            file,
+            offset,
+            len,
+            position: 0,
+        }
+    }
+}
+
+impl Read for FileSlice<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.position >= self.len {
+            return Ok(0);
+        }
+        let remaining = self.len - self.position;
+        let count = remaining.min(buf.len() as u64) as usize;
+        self.file.seek(SeekFrom::Start(
+            self.offset
+                .checked_add(self.position)
+                .ok_or_else(|| std::io::Error::other("file slice position overflow"))?,
+        ))?;
+        let read = self.file.read(&mut buf[..count])?;
+        self.position += read as u64;
+        Ok(read)
+    }
+}
+
+impl Write for FileSlice<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.position >= self.len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "file slice write exceeds partition bounds",
+            ));
+        }
+        let remaining = self.len - self.position;
+        let count = remaining.min(buf.len() as u64) as usize;
+        self.file.seek(SeekFrom::Start(
+            self.offset
+                .checked_add(self.position)
+                .ok_or_else(|| std::io::Error::other("file slice position overflow"))?,
+        ))?;
+        let written = self.file.write(&buf[..count])?;
+        self.position += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl Seek for FileSlice<'_> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let next = match pos {
+            SeekFrom::Start(position) => i128::from(position),
+            SeekFrom::End(delta) => i128::from(self.len) + i128::from(delta),
+            SeekFrom::Current(delta) => i128::from(self.position) + i128::from(delta),
+        };
+        if !(0..=i128::from(self.len)).contains(&next) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "file slice seek is outside partition bounds",
+            ));
+        }
+        self.position = next as u64;
+        Ok(self.position)
+    }
 }
 
 fn build_compiler_plugin_asset(

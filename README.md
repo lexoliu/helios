@@ -16,10 +16,10 @@ hardware support lives in thin adaptation crates.
 - **Architecture-neutral kernel.** `helios-kernel` is `#![no_std]` and generic
   over a `Cpu` implementation supplied by the backend crate. No `#[cfg(target_arch)]`
   branches leak into core logic.
-- **Trusted AOT-only program loading.** The kernel no longer JIT-compiles raw
-  wasm in place. It loads trusted `cwasm` artifacts whose payload is a native
-  Wasmtime precompiled ELF blob, optionally followed by a Helios signature
-  trailer that ordinary Wasmtime runtimes can ignore.
+- **Trusted AOT-only program loading.** The kernel loads trusted `cwasm`
+  artifacts whose payload is a native Wasmtime precompiled ELF blob,
+  optionally followed by a Helios signature trailer that ordinary Wasmtime
+  runtimes can ignore.
 - **Async-first runtime.** A small cooperative executor built on `async-task`
   drives futures across processors without a dedicated compile-worker pool.
 - **Kernel plugins.** Non-core kernel features may depend on `kernel plugins`:
@@ -30,7 +30,7 @@ hardware support lives in thin adaptation crates.
 - **Three backends.**
   - `helios-riscv` — RISC-V 64 (`riscv64gc-unknown-none-elf`), SBI-based boot,
     virtio-mmio transport, ns16550a UART.
-  - `helios-x86` — x86_64 (`x86_64-unknown-none`), `bootloader_api` entry,
+  - `helios-x86` — x86_64 (`x86_64-unknown-none`), Limine protocol boot,
     COM1 serial, PIT-calibrated timer.
   - `helios-hosted` — runs the kernel on top of the host OS for fast iteration
     and testing.
@@ -102,7 +102,7 @@ debugger component:
 # Boot the RISC-V guest
 cargo run -p helios-inspector -- vm --arch riscv64
 
-# Boot the x86_64 guest (BIOS entry)
+# Boot the x86_64 guest (Limine UEFI entry)
 cargo run -p helios-inspector -- vm --arch x86_64
 ```
 

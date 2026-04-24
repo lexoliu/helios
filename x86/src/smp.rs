@@ -5,7 +5,6 @@ use acpi::{AcpiTables, Handler, PciAddress, PhysicalMapping};
 use alloc::alloc::{Layout, alloc_zeroed};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use bootloader_api::BootInfo;
 use core::arch::x86_64::__cpuid;
 use core::ops::Range;
 use core::ptr::NonNull;
@@ -32,8 +31,8 @@ use crate::pci::LegacyPciConfigAccess;
 use crate::read_tsc;
 use crate::watchdog::X86Watchdog;
 
-const WAKEUP_PAGE_BYTES: usize = 4096;
-const SIPI_MAX_PHYSICAL_ADDRESS: usize = 0x10_0000;
+pub(crate) const WAKEUP_PAGE_BYTES: usize = 4096;
+pub(crate) const SIPI_MAX_PHYSICAL_ADDRESS: usize = 0x10_0000;
 const AP_STARTUP_INIT_ASSERT_MICROS: u64 = 10_000;
 const AP_STARTUP_INTER_IPI_MICROS: u64 = 200;
 const PAGE_BYTES: usize = 4096;
@@ -81,26 +80,8 @@ pub(crate) struct PhysicalOffsetAcpiHandler {
     pub(crate) tsc_hz: u64,
 }
 
-pub(crate) fn reserve_wakeup_page(boot_info: &'static BootInfo) -> Range<usize> {
-    boot_info
-        .memory_regions
-        .iter()
-        .find_map(|region| {
-            if region.kind != bootloader_api::info::MemoryRegionKind::Usable {
-                return None;
-            }
-            let start = align_up(region.start as usize, WAKEUP_PAGE_BYTES);
-            let end = (region.end as usize).min(SIPI_MAX_PHYSICAL_ADDRESS);
-            (start
-                .checked_add(WAKEUP_PAGE_BYTES)
-                .is_some_and(|next| next <= end))
-            .then_some(start..start + WAKEUP_PAGE_BYTES)
-        })
-        .unwrap_or_else(|| panic!("failed to reserve a low-memory wakeup page for x86 AP startup"))
-}
-
 pub(crate) fn build_boot_context(
-    boot_info: &'static BootInfo,
+    rsdp_address: usize,
     physical_memory_offset: usize,
     wakeup_page: Option<Range<usize>>,
     tsc_base: u64,
@@ -112,11 +93,7 @@ pub(crate) fn build_boot_context(
         tsc_base,
         tsc_hz,
     };
-    let rsdp = boot_info
-        .rsdp_addr
-        .into_option()
-        .unwrap_or_else(|| panic!("bootloader did not provide an RSDP address"));
-    let tables = unsafe { AcpiTables::from_rsdp(handler.clone(), rsdp as usize) }
+    let tables = unsafe { AcpiTables::from_rsdp(handler.clone(), rsdp_address) }
         .unwrap_or_else(|error| panic!("failed to parse ACPI tables: {error:?}"));
     let watchdog = crate::watchdog::discover(&tables, physical_memory_offset);
     let platform = AcpiPlatform::new(tables, handler.clone())
@@ -435,6 +412,7 @@ impl Handler for PhysicalOffsetAcpiHandler {
         physical_address: usize,
         size: usize,
     ) -> PhysicalMapping<Self, T> {
+        ensure_hhdm_range_mapped(self.physical_memory_offset, physical_address, size);
         PhysicalMapping {
             physical_start: physical_address,
             virtual_start: self.physical_to_virtual(physical_address),
@@ -659,17 +637,92 @@ pub(crate) fn map_mmio_window(
     let mut frame_allocator = DirectMappedFrameAllocator {
         physical_memory_offset,
     };
+    let mut mapper = unsafe { current_mapper(physical_memory_offset) };
 
     for virtual_address in (map_start..map_start + map_bytes).step_by(PAGE_BYTES) {
         let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(virtual_address as u64))
             .unwrap_or_else(|error| panic!("invalid x86 MMIO virtual page: {error:?}"));
-        let entry =
-            ensure_direct_mapped_leaf_entry(physical_memory_offset, page, &mut frame_allocator);
-        entry.set_flags(entry.flags() | PageTableFlags::NO_CACHE | PageTableFlags::WRITE_THROUGH);
-        tlb::flush(VirtAddr::new(virtual_address as u64));
+        if mapper.translate_page(page).is_ok() {
+            let entry =
+                ensure_direct_mapped_leaf_entry(physical_memory_offset, page, &mut frame_allocator);
+            entry.set_flags(
+                entry.flags() | PageTableFlags::NO_CACHE | PageTableFlags::WRITE_THROUGH,
+            );
+            tlb::flush(VirtAddr::new(virtual_address as u64));
+            continue;
+        }
+
+        let physical_address = virtual_address
+            .checked_sub(physical_memory_offset)
+            .unwrap_or_else(|| {
+                panic!("x86 MMIO virtual address {virtual_address:#x} was outside the HHDM")
+            });
+        let frame =
+            PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(physical_address as u64))
+                .unwrap_or_else(|error| panic!("invalid x86 MMIO physical frame: {error:?}"));
+        unsafe {
+            mapper
+                .map_to(
+                    page,
+                    frame,
+                    PageTableFlags::PRESENT
+                        | PageTableFlags::WRITABLE
+                        | PageTableFlags::NO_CACHE
+                        | PageTableFlags::WRITE_THROUGH,
+                    &mut frame_allocator,
+                )
+                .unwrap_or_else(|error| panic!("failed to map x86 MMIO page: {error:?}"))
+                .flush();
+        }
     }
 
     virtual_start
+}
+
+pub(crate) fn ensure_hhdm_range_mapped(
+    physical_memory_offset: usize,
+    physical_start: usize,
+    bytes: usize,
+) {
+    let page_offset = physical_start & (PAGE_BYTES - 1);
+    let map_start = align_down(physical_start, PAGE_BYTES);
+    let map_bytes = align_up(
+        page_offset
+            .checked_add(bytes.max(1))
+            .unwrap_or_else(|| panic!("x86 HHDM mapping size overflow")),
+        PAGE_BYTES,
+    );
+    let mut mapper = unsafe { current_mapper(physical_memory_offset) };
+    let mut frame_allocator = DirectMappedFrameAllocator {
+        physical_memory_offset,
+    };
+
+    for physical_address in (map_start..map_start + map_bytes).step_by(PAGE_BYTES) {
+        let virtual_address = physical_memory_offset
+            .checked_add(physical_address)
+            .unwrap_or_else(|| {
+                panic!("x86 HHDM virtual address overflow at {physical_address:#x}")
+            });
+        let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(virtual_address as u64))
+            .unwrap_or_else(|error| panic!("invalid x86 HHDM virtual page: {error:?}"));
+        if mapper.translate_page(page).is_ok() {
+            continue;
+        }
+        let frame =
+            PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(physical_address as u64))
+                .unwrap_or_else(|error| panic!("invalid x86 HHDM physical frame: {error:?}"));
+        unsafe {
+            mapper
+                .map_to(
+                    page,
+                    frame,
+                    PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+                    &mut frame_allocator,
+                )
+                .unwrap_or_else(|error| panic!("failed to map x86 HHDM page: {error:?}"))
+                .flush();
+        }
+    }
 }
 
 fn ensure_direct_mapped_leaf_entry(

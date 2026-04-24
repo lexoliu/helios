@@ -15,9 +15,6 @@ mod debug_state {
 }
 
 use alloc::sync::Arc;
-use bootloader_api::config::Mapping;
-use bootloader_api::info::MemoryRegionKind;
-use bootloader_api::{BootInfo, BootloaderConfig, entry_point};
 use core::arch::asm;
 use core::arch::global_asm;
 use core::arch::x86_64::{__cpuid, __cpuid_count, _rdtsc};
@@ -28,6 +25,12 @@ use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
 use helios_hal::watchdog::Watchdog;
 use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology};
+use limine::BaseRevision;
+use limine::memory_map::{Entry, EntryType};
+use limine::request::{
+    ExecutableAddressRequest, ExecutableFileRequest, HhdmRequest, MemoryMapRequest, RsdpRequest,
+    StackSizeRequest,
+};
 use x86_64::instructions::port::{Port, PortReadOnly, PortWriteOnly};
 use x86_64::registers::control::{Cr0, Cr0Flags, Cr3, Cr4, Cr4Flags};
 
@@ -47,6 +50,7 @@ const PIT_BASE_HZ: u64 = 1_193_182;
 const PIT_CALIBRATION_HZ: u64 = 100;
 const PAGE_BYTES: usize = 4096;
 const PAGE_MASK: usize = PAGE_BYTES - 1;
+const MAX_USABLE_REGION_SEGMENTS: usize = 6;
 const PAGE_PRESENT: u64 = 1 << 0;
 const PAGE_HUGE: u64 = 1 << 7;
 const PAGE_NO_EXECUTE: u64 = 1 << 63;
@@ -55,12 +59,21 @@ const WATCHDOG_SELF_TEST_ENABLED: bool = option_env!("HELIOS_WATCHDOG_SELF_TEST"
 
 global_asm!(include_str!("secondary_wakeup.S"));
 
-static BOOTLOADER_CONFIG: BootloaderConfig = {
-    let mut config = BootloaderConfig::new_default();
-    config.mappings.physical_memory = Some(Mapping::Dynamic);
-    config.kernel_stack_size = KERNEL_STACK_BYTES as u64;
-    config
-};
+#[used]
+static BASE_REVISION: BaseRevision = BaseRevision::new();
+#[used]
+static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
+#[used]
+static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
+#[used]
+static EXECUTABLE_ADDRESS_REQUEST: ExecutableAddressRequest = ExecutableAddressRequest::new();
+#[used]
+static EXECUTABLE_FILE_REQUEST: ExecutableFileRequest = ExecutableFileRequest::new();
+#[used]
+static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
+#[used]
+static STACK_SIZE_REQUEST: StackSizeRequest =
+    StackSizeRequest::new().with_size(KERNEL_STACK_BYTES as u64);
 
 struct X86CriticalSection;
 
@@ -80,26 +93,39 @@ unsafe impl critical_section::Impl for X86CriticalSection {
     }
 }
 
-entry_point!(x86_kernel_main, config = &BOOTLOADER_CONFIG);
+#[unsafe(no_mangle)]
+extern "C" fn _start() -> ! {
+    x86_kernel_main()
+}
 
-fn x86_kernel_main(boot_info: &'static mut BootInfo) -> ! {
+fn x86_kernel_main() -> ! {
     serial_uart_init();
+    assert!(
+        BASE_REVISION.is_supported(),
+        "Limine bootloader does not support the required base protocol revision"
+    );
     enable_fpu_simd();
-    let physical_memory_offset = boot_physical_memory_offset(boot_info);
-    let processor_count = processor_count(boot_info);
-    let wakeup_page = (processor_count > 1).then(|| smp::reserve_wakeup_page(boot_info));
+    let physical_memory_offset = boot_physical_memory_offset();
+    let reserved_ranges = boot_reserved_ranges();
+    let reserved_wakeup_page = reserve_wakeup_page(&reserved_ranges);
     helios_kernel::prime_bootstrap_allocator(boot_memory_regions(
-        boot_info,
         physical_memory_offset,
-        wakeup_page.clone(),
+        &reserved_ranges,
+        Some(reserved_wakeup_page.clone()),
     ));
-    let memory_regions =
-        boot_memory_regions(boot_info, physical_memory_offset, wakeup_page.clone());
+    let rsdp_address = rsdp_address();
+    let processor_count = processor_count(rsdp_address, physical_memory_offset);
+    let wakeup_page = (processor_count > 1).then_some(reserved_wakeup_page);
+    let memory_regions = boot_memory_regions(
+        physical_memory_offset,
+        &reserved_ranges,
+        wakeup_page.clone(),
+    );
     let tsc_hz = detect_tsc_frequency_hz();
     let tsc_base = read_tsc();
     let debug_state = debug_state::RuntimeState::new(tsc_hz, processor_count, 0);
     let boot = smp::build_boot_context(
-        boot_info,
+        rsdp_address,
         physical_memory_offset,
         wakeup_page,
         tsc_base,
@@ -154,24 +180,27 @@ fn enable_fpu_simd() {
     // before advertising AVX/FMA/AVX512 to Wasmtime-generated code.
 }
 
-fn boot_physical_memory_offset(boot_info: &'static BootInfo) -> usize {
-    match boot_info.physical_memory_offset.into_option() {
-        Some(offset) => offset as usize,
-        None => panic!("bootloader did not provide a physical memory mapping"),
-    }
+fn boot_physical_memory_offset() -> usize {
+    HHDM_REQUEST
+        .get_response()
+        .unwrap_or_else(|| panic!("Limine did not provide an HHDM response"))
+        .offset() as usize
 }
 
-fn processor_count(boot_info: &'static BootInfo) -> usize {
-    let rsdp = boot_info
-        .rsdp_addr
-        .into_option()
-        .unwrap_or_else(|| panic!("bootloader did not provide an RSDP address"));
+fn rsdp_address() -> usize {
+    RSDP_REQUEST
+        .get_response()
+        .unwrap_or_else(|| panic!("Limine did not provide an RSDP response"))
+        .address()
+}
+
+fn processor_count(rsdp_address: usize, physical_memory_offset: usize) -> usize {
     let handler = smp::PhysicalOffsetAcpiHandler {
-        physical_memory_offset: boot_physical_memory_offset(boot_info),
+        physical_memory_offset,
         tsc_base: 0,
         tsc_hz: 1,
     };
-    let tables = unsafe { acpi::AcpiTables::from_rsdp(handler.clone(), rsdp as usize) }
+    let tables = unsafe { acpi::AcpiTables::from_rsdp(handler.clone(), rsdp_address) }
         .unwrap_or_else(|error| {
             panic!("failed to parse ACPI tables for processor count: {error:?}")
         });
@@ -184,13 +213,112 @@ fn processor_count(boot_info: &'static BootInfo) -> usize {
     1 + processor_info.application_processors.len()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BootMemoryRegion {
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+    pub(crate) usable: bool,
+}
+
+impl BootMemoryRegion {
+    fn from_limine(entry: &'static Entry) -> Self {
+        Self {
+            start: entry.base,
+            end: entry.base + entry.length,
+            usable: entry.entry_type == EntryType::USABLE,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BootReservedRanges {
+    ranges: [Option<Range<usize>>; 3],
+}
+
+impl BootReservedRanges {
+    fn iter(&self) -> impl Iterator<Item = &Range<usize>> {
+        self.ranges.iter().flatten()
+    }
+}
+
+fn boot_memory_region_entries() -> impl Iterator<Item = BootMemoryRegion> {
+    MEMORY_MAP_REQUEST
+        .get_response()
+        .unwrap_or_else(|| panic!("Limine did not provide a memory map response"))
+        .entries()
+        .iter()
+        .map(|entry| BootMemoryRegion::from_limine(entry))
+}
+
+fn boot_reserved_ranges() -> BootReservedRanges {
+    let executable_address = EXECUTABLE_ADDRESS_REQUEST
+        .get_response()
+        .unwrap_or_else(|| panic!("Limine did not provide an executable address response"));
+    let executable_file = EXECUTABLE_FILE_REQUEST
+        .get_response()
+        .unwrap_or_else(|| panic!("Limine did not provide an executable file response"))
+        .file();
+    let executable_bytes = align_up_usize(
+        usize::try_from(executable_file.size()).unwrap_or_else(|_| {
+            panic!(
+                "Limine executable file size does not fit usize: {}",
+                executable_file.size()
+            )
+        }),
+        PAGE_BYTES,
+    );
+    let loaded_executable_start = usize::try_from(executable_address.physical_base())
+        .unwrap_or_else(|_| {
+            panic!(
+                "Limine executable physical base does not fit usize: {:#x}",
+                executable_address.physical_base()
+            )
+        });
+    let loaded_executable_end = loaded_executable_start
+        .checked_add(executable_bytes)
+        .unwrap_or_else(|| {
+            panic!(
+                "Limine executable loaded range overflow: start={loaded_executable_start:#x}, len={executable_bytes:#x}"
+            )
+        });
+    let file_start = executable_file.addr() as usize;
+    let file_end = file_start.checked_add(executable_bytes).unwrap_or_else(|| {
+        panic!("Limine executable file range overflow: start={file_start:#x}, len={executable_bytes:#x}")
+    });
+
+    BootReservedRanges {
+        ranges: [
+            Some(loaded_executable_start..loaded_executable_end),
+            Some(file_start..file_end),
+            None,
+        ],
+    }
+}
+
+fn reserve_wakeup_page(reserved_ranges: &BootReservedRanges) -> Range<usize> {
+    boot_memory_region_entries()
+        .flat_map(|region| usable_region_segments(region, reserved_ranges))
+        .flatten()
+        .find_map(|segment| {
+            let start = align_up_usize(segment.start, smp::WAKEUP_PAGE_BYTES);
+            let end = segment.end.min(smp::SIPI_MAX_PHYSICAL_ADDRESS);
+            (start
+                .checked_add(smp::WAKEUP_PAGE_BYTES)
+                .is_some_and(|next| next <= end))
+            .then_some(start..start + smp::WAKEUP_PAGE_BYTES)
+        })
+        .unwrap_or_else(|| panic!("failed to reserve a low-memory wakeup page for x86 AP startup"))
+}
+
 fn boot_memory_regions(
-    boot_info: &'static BootInfo,
     physical_memory_offset: usize,
+    reserved_ranges: &BootReservedRanges,
     excluded: Option<Range<usize>>,
 ) -> impl IntoIterator<Item = MemoryRegion> {
-    boot_info.memory_regions.iter().flat_map(move |region| {
-        usable_region_segments(region, excluded.as_ref())
+    let mut reserved_ranges = reserved_ranges.clone();
+    reserved_ranges.ranges[2] = excluded;
+    boot_memory_region_entries().flat_map(move |region| {
+        usable_region_segments(region, &reserved_ranges)
             .into_iter()
             .flatten()
             .map(move |segment| {
@@ -205,33 +333,71 @@ fn boot_memory_regions(
 }
 
 fn usable_region_segments(
-    region: &bootloader_api::info::MemoryRegion,
-    excluded: Option<&Range<usize>>,
-) -> [Option<Range<usize>>; 2] {
-    if region.kind != MemoryRegionKind::Usable || region.end <= region.start {
-        return [None, None];
+    region: BootMemoryRegion,
+    reserved_ranges: &BootReservedRanges,
+) -> [Option<Range<usize>>; MAX_USABLE_REGION_SEGMENTS] {
+    if !region.usable || region.end <= region.start {
+        return [const { None }; MAX_USABLE_REGION_SEGMENTS];
     }
 
-    let start = region.start as usize;
-    let end = region.end as usize;
-    let Some(excluded) = excluded else {
-        return [Some(start..end), None];
-    };
-
-    if excluded.end <= start || excluded.start >= end {
-        return [Some(start..end), None];
+    let mut segments = [const { None }; MAX_USABLE_REGION_SEGMENTS];
+    segments[0] = Some(region.start as usize..region.end as usize);
+    for reserved in reserved_ranges.iter() {
+        segments = subtract_reserved_range(segments, reserved);
     }
+    segments
+}
 
-    [
-        (excluded.start > start).then_some(start..excluded.start),
-        (excluded.end < end).then_some(excluded.end..end),
-    ]
+fn subtract_reserved_range(
+    segments: [Option<Range<usize>>; MAX_USABLE_REGION_SEGMENTS],
+    reserved: &Range<usize>,
+) -> [Option<Range<usize>>; MAX_USABLE_REGION_SEGMENTS] {
+    let mut result = [const { None }; MAX_USABLE_REGION_SEGMENTS];
+    let mut next = 0;
+    for segment in segments.into_iter().flatten() {
+        if reserved.end <= segment.start || reserved.start >= segment.end {
+            assert!(
+                next < MAX_USABLE_REGION_SEGMENTS,
+                "too many x86 usable memory segments after reserving bootloader ranges"
+            );
+            result[next] = Some(segment);
+            next += 1;
+            continue;
+        }
+        if reserved.start > segment.start {
+            assert!(
+                next < MAX_USABLE_REGION_SEGMENTS,
+                "too many x86 usable memory segments after reserving bootloader ranges"
+            );
+            result[next] = Some(segment.start..reserved.start);
+            next += 1;
+        }
+        if reserved.end < segment.end {
+            assert!(
+                next < MAX_USABLE_REGION_SEGMENTS,
+                "too many x86 usable memory segments after reserving bootloader ranges"
+            );
+            result[next] = Some(reserved.end..segment.end);
+            next += 1;
+        }
+    }
+    result
+}
+
+fn align_up_usize(value: usize, align: usize) -> usize {
+    assert!(
+        align.is_power_of_two(),
+        "alignment must be a power of two, got {align}"
+    );
+    value
+        .checked_add(align - 1)
+        .map(|value| value & !(align - 1))
+        .unwrap_or_else(|| panic!("alignment overflow for value={value:#x}, align={align:#x}"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::usable_region_segments;
-    use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
+    use super::{BootMemoryRegion, BootReservedRanges, usable_region_segments};
     use core::ops::Range;
 
     #[test]
@@ -254,10 +420,10 @@ mod tests {
     fn non_usable_region_yields_no_segments() {
         assert!(
             collect_segments(
-                MemoryRegion {
+                BootMemoryRegion {
                     start: 0x1000,
                     end: 0x4000,
-                    kind: MemoryRegionKind::Bootloader,
+                    usable: false,
                 },
                 None,
             )
@@ -266,20 +432,23 @@ mod tests {
     }
 
     fn collect_segments(
-        region: MemoryRegion,
+        region: BootMemoryRegion,
         excluded: Option<&Range<usize>>,
     ) -> alloc::vec::Vec<Range<usize>> {
-        usable_region_segments(&region, excluded)
+        let reserved = BootReservedRanges {
+            ranges: [excluded.cloned(), None, None],
+        };
+        usable_region_segments(region, &reserved)
             .into_iter()
             .flatten()
             .collect()
     }
 
-    fn region(range: Range<usize>) -> MemoryRegion {
-        MemoryRegion {
+    fn region(range: Range<usize>) -> BootMemoryRegion {
+        BootMemoryRegion {
             start: range.start as u64,
             end: range.end as u64,
-            kind: MemoryRegionKind::Usable,
+            usable: true,
         }
     }
 }

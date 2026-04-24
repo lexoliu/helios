@@ -134,7 +134,7 @@ impl EnhancedPciConfigAccess {
             + (u64::from(address.function()) << PCI_ECAM_FUNCTION_SHIFT)
             + u64::from(offset);
         let physical_address = usize::try_from(physical_address).ok()?;
-        self.physical_memory_offset.checked_add(physical_address)
+        self.mapped_virtual_address(physical_address, core::mem::size_of::<u32>())
     }
 
     fn byte_address(&self, address: PciAddress, offset: u16) -> Option<usize> {
@@ -154,6 +154,11 @@ impl EnhancedPciConfigAccess {
             + (u64::from(address.function()) << PCI_ECAM_FUNCTION_SHIFT)
             + u64::from(offset);
         let physical_address = usize::try_from(physical_address).ok()?;
+        self.mapped_virtual_address(physical_address, 1)
+    }
+
+    fn mapped_virtual_address(&self, physical_address: usize, bytes: usize) -> Option<usize> {
+        crate::smp::ensure_hhdm_range_mapped(self.physical_memory_offset, physical_address, bytes);
         self.physical_memory_offset.checked_add(physical_address)
     }
 }

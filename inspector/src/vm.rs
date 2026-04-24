@@ -6,7 +6,6 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context as _, Result};
-use bootloader::BiosBoot;
 use clap::{Args as ClapArgs, Subcommand, ValueEnum};
 use console::style;
 use directories::ProjectDirs;
@@ -20,8 +19,8 @@ use crate::{connect_client, run_connected, SessionCommand};
 const DEFAULT_BAUD: u32 = 115_200;
 const DEFAULT_RISCV_QEMU_BIN: &str = "qemu-system-riscv64";
 const DEFAULT_X86_QEMU_BIN: &str = "qemu-system-x86_64";
-const DEFAULT_MEMORY: &str = "512M";
 const DEFAULT_RISCV_MEMORY: &str = "2G";
+const DEFAULT_X86_MEMORY: &str = "1G";
 const DEFAULT_RISCV_SMP: u16 = 4;
 const DEFAULT_X86_SMP: u16 = 2;
 const DEFAULT_SOCKET_WAIT: Duration = Duration::from_secs(10);
@@ -48,7 +47,7 @@ impl VmArch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VmBootArtifactKind {
     KernelBinary,
-    BiosDiskImage,
+    LimineUefiDiskImage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,9 +119,9 @@ const X86_64_VM_PROFILE: VmProfile = VmProfile {
     machine: "q35",
     kernel_artifact_name: "helios",
     default_smp: DEFAULT_X86_SMP,
-    default_memory: DEFAULT_MEMORY,
+    default_memory: DEFAULT_X86_MEMORY,
     default_bios: None,
-    boot_artifact: VmBootArtifactKind::BiosDiskImage,
+    boot_artifact: VmBootArtifactKind::LimineUefiDiskImage,
     console: VmConsoleProfile::SerialUnixSocket,
     network: Some(VmNetworkProfile::VirtioPciUser),
     block: Some(VmBlockProfile::VirtioPciBootDisk),
@@ -214,8 +213,8 @@ pub(crate) struct VmCommand {
     #[arg(long)]
     smp: Option<u16>,
 
-    #[arg(long, default_value = DEFAULT_MEMORY)]
-    memory: String,
+    #[arg(long)]
+    memory: Option<String>,
 
     #[arg(long)]
     bios: Option<String>,
@@ -346,12 +345,10 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
         .or(file.kernel)
         .unwrap_or_else(|| default_kernel_path(arch, build_profile_dir(release, kernel_debug)));
     let smp = command.smp.or(file.smp).unwrap_or(profile.default_smp);
-    let memory = if command.memory != DEFAULT_MEMORY {
-        command.memory
-    } else {
-        file.memory
-            .unwrap_or_else(|| profile.default_memory.to_owned())
-    };
+    let memory = command
+        .memory
+        .or(file.memory)
+        .unwrap_or_else(|| profile.default_memory.to_owned());
     let bios = command
         .bios
         .or(file.bios)
@@ -458,6 +455,12 @@ fn build_vm(command: &ResolvedVmCommand) -> Result<()> {
             .arg("-p")
             .arg("helios-inspector"),
     )?;
+    run_step(
+        "building helios-cli",
+        cargo_build_command(repo_root, command.release, false)
+            .arg("-p")
+            .arg("helios-cli"),
+    )?;
     Ok(())
 }
 
@@ -487,26 +490,62 @@ fn prepare_boot_artifact(
 ) -> Result<PathBuf> {
     match command.profile.boot_artifact {
         VmBootArtifactKind::KernelBinary => Ok(command.kernel.clone()),
-        VmBootArtifactKind::BiosDiskImage => prepare_x86_bios_image(command, runtime_dir),
+        VmBootArtifactKind::LimineUefiDiskImage => {
+            prepare_x86_limine_uefi_image(command, runtime_dir)
+        }
     }
 }
 
-fn prepare_x86_bios_image(
+fn prepare_x86_limine_uefi_image(
     command: &ResolvedVmCommand,
     runtime_dir: Option<&Path>,
 ) -> Result<PathBuf> {
     let kernel = fs::canonicalize(&command.kernel)
         .with_context(|| format!("failed to canonicalize kernel {}", command.kernel.display()))?;
     let image = match runtime_dir {
-        Some(dir) => dir.join("kernel.bios.img"),
-        None => kernel.with_extension("bios.img"),
+        Some(dir) => dir.join("kernel.uefi.img"),
+        None => kernel.with_extension("uefi.img"),
     };
-    let spinner = spinner("building x86_64 BIOS disk image");
-    let bios = BiosBoot::new(&kernel);
-    bios.create_disk_image(&image)
-        .with_context(|| format!("failed to create BIOS image {}", image.display()))?;
+    let spinner = spinner("building x86_64 Limine UEFI disk image");
+    let cli = discover_helios_cli()?;
+    let status = Command::new(&cli)
+        .arg("x86-limine-uefi-image")
+        .arg("--kernel")
+        .arg(&kernel)
+        .arg("--output")
+        .arg(&image)
+        .arg("--baud")
+        .arg(command.baud.to_string())
+        .status()
+        .with_context(|| format!("failed to spawn {}", cli.display()))?;
+    if !status.success() {
+        spinner.finish_and_clear();
+        bail!("helios-cli x86-limine-uefi-image exited with status {status}");
+    }
     spinner.finish_with_message(format!("{} {}", style("built").green(), image.display()));
     Ok(image)
+}
+
+fn discover_helios_cli() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("HELIOS_CLI_BIN").map(PathBuf::from) {
+        if path.is_file() {
+            return Ok(path);
+        }
+        bail!(
+            "HELIOS_CLI_BIN does not point to a file: {}",
+            path.display()
+        );
+    }
+    let current_exe = std::env::current_exe().context("failed to locate current executable")?;
+    if let Some(candidate) = current_exe.parent().map(|dir| dir.join("helios-cli")) {
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    if let Some(candidate) = find_executable_in_path("helios-cli") {
+        return Ok(candidate);
+    }
+    bail!("failed to find helios-cli; run `cargo build -p helios-cli` or set HELIOS_CLI_BIN")
 }
 
 fn arch_label(arch: VmArch) -> &'static str {
@@ -647,14 +686,12 @@ impl VmRuntime {
         if command.profile.arch == VmArch::Riscv64 {
             qemu.arg("-global").arg("virtio-mmio.force-legacy=false");
         }
-        if let Some(bios) = &command.bios {
-            qemu.arg("-bios").arg(bios);
-        }
+        configure_firmware(&mut qemu, command, runtime_dir.path())?;
         match command.profile.boot_artifact {
             VmBootArtifactKind::KernelBinary => {
                 qemu.arg("-kernel").arg(&artifact);
             }
-            VmBootArtifactKind::BiosDiskImage => {}
+            VmBootArtifactKind::LimineUefiDiskImage => {}
         }
         if let Some(network) = command.profile.network {
             configure_network_device(&mut qemu, network);
@@ -866,6 +903,89 @@ fn prepare_block_image(command: &ResolvedVmCommand, runtime_dir: &Path) -> Resul
     Ok(Some(image))
 }
 
+fn configure_firmware(
+    qemu: &mut Command,
+    command: &ResolvedVmCommand,
+    runtime_dir: &Path,
+) -> Result<()> {
+    if let Some(bios) = &command.bios {
+        qemu.arg("-bios").arg(bios);
+        return Ok(());
+    }
+    if command.profile.boot_artifact == VmBootArtifactKind::LimineUefiDiskImage {
+        let code = discover_qemu_edk2_x86_64_code(&command.qemu_bin)?;
+        let vars_template = discover_qemu_edk2_x86_64_vars(&code)?;
+        let vars = runtime_dir.join("edk2-x86_64-vars.fd");
+        fs::copy(&vars_template, &vars).with_context(|| {
+            format!(
+                "failed to prepare EDK2 variable store {} from {}",
+                vars.display(),
+                vars_template.display()
+            )
+        })?;
+        qemu.arg("-drive").arg(format!(
+            "if=pflash,format=raw,readonly=on,file={}",
+            code.display()
+        ));
+        qemu.arg("-drive")
+            .arg(format!("if=pflash,format=raw,file={}", vars.display()));
+    }
+    Ok(())
+}
+
+fn discover_qemu_edk2_x86_64_code(qemu_bin: &Path) -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("HELIOS_EDK2_X86_64_CODE").map(PathBuf::from) {
+        if path.is_file() {
+            return Ok(path);
+        }
+        bail!(
+            "HELIOS_EDK2_X86_64_CODE does not point to a file: {}",
+            path.display()
+        );
+    }
+    let qemu_bin = if qemu_bin.components().count() == 1 {
+        find_executable_in_path(qemu_bin.to_str().unwrap_or("")).unwrap_or_else(|| qemu_bin.into())
+    } else {
+        qemu_bin.into()
+    };
+    let mut candidates = Vec::new();
+    if let Some(prefix) = qemu_bin.parent().and_then(Path::parent) {
+        candidates.push(prefix.join("share/qemu/edk2-x86_64-code.fd"));
+    }
+    candidates.extend([
+        PathBuf::from("/opt/homebrew/share/qemu/edk2-x86_64-code.fd"),
+        PathBuf::from("/usr/local/share/qemu/edk2-x86_64-code.fd"),
+    ]);
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            anyhow::anyhow!("failed to find QEMU EDK2 x86_64 firmware; set HELIOS_EDK2_X86_64_CODE")
+        })
+}
+
+fn find_executable_in_path(name: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|path| path.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+fn discover_qemu_edk2_x86_64_vars(code: &Path) -> Result<PathBuf> {
+    for vars in [
+        code.with_file_name("edk2-x86_64-vars.fd"),
+        code.with_file_name("edk2-i386-vars.fd"),
+    ] {
+        if vars.is_file() {
+            return Ok(vars);
+        }
+    }
+    bail!(
+        "failed to find QEMU EDK2 x86_64 variable store next to {}",
+        code.display()
+    )
+}
+
 fn configure_network_device(qemu: &mut Command, network: VmNetworkProfile) {
     qemu.arg("-netdev").arg("user,id=net0");
     match network {
@@ -992,7 +1112,7 @@ mod tests {
         assert_eq!(X86_64_VM_PROFILE.machine, "q35");
         assert_eq!(
             X86_64_VM_PROFILE.boot_artifact,
-            VmBootArtifactKind::BiosDiskImage
+            VmBootArtifactKind::LimineUefiDiskImage
         );
         assert_eq!(
             X86_64_VM_PROFILE.network,
@@ -1025,7 +1145,7 @@ mod tests {
             socket: None,
             no_build: true,
             smp: None,
-            memory: DEFAULT_MEMORY.to_owned(),
+            memory: None,
             bios: None,
             baud: DEFAULT_BAUD,
             cpu: None,
@@ -1048,7 +1168,7 @@ mod tests {
         assert_eq!(resolved.profile, &X86_64_VM_PROFILE);
         assert!(!resolved.release);
         assert_eq!(resolved.smp, DEFAULT_X86_SMP);
-        assert_eq!(resolved.memory, DEFAULT_MEMORY);
+        assert_eq!(resolved.memory, DEFAULT_X86_MEMORY);
         assert_eq!(resolved.bios, None);
         assert_eq!(
             resolved.kernel,
@@ -1075,7 +1195,7 @@ mod tests {
             socket: None,
             no_build: true,
             smp: None,
-            memory: DEFAULT_MEMORY.to_owned(),
+            memory: None,
             bios: None,
             baud: DEFAULT_BAUD,
             cpu: None,
@@ -1159,10 +1279,7 @@ mod tests {
             socket: None,
             no_build: true,
             smp: arch.profile().default_smp,
-            memory: match arch {
-                VmArch::Riscv64 => "2G".to_owned(),
-                VmArch::X86_64 => DEFAULT_MEMORY.to_owned(),
-            },
+            memory: arch.profile().default_memory.to_owned(),
             bios: arch.profile().default_bios.map(str::to_owned),
             baud: DEFAULT_BAUD,
             cpu: None,
