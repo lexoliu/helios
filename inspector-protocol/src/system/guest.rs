@@ -115,7 +115,7 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>>
                 env: Vec::new(),
                 path: request.path,
                 stdin: Vec::new(),
-                hint: request.hint,
+                hint: request.hint.map(map_aot_hint_to_host),
             })
             .await;
             let response = response
@@ -164,6 +164,14 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>>
             debugger_programs::dispatch(func, payload).await
         }
         _ => unreachable!("supports_request must reject unsupported methods before dispatch"),
+    }
+}
+
+fn map_aot_hint_to_host(hint: programs::AotHint) -> host_programs::AotHint {
+    match hint {
+        programs::AotHint::Fast => host_programs::AotHint::Fast,
+        programs::AotHint::Balanced => host_programs::AotHint::Balanced,
+        programs::AotHint::Performance => host_programs::AotHint::Performance,
     }
 }
 

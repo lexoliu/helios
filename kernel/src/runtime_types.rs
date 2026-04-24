@@ -11,6 +11,7 @@ use core::pin::Pin;
 
 use crate::InstanceId;
 use helios_hal::io::IoError;
+use thiserror::Error;
 
 #[derive(Clone, Debug)]
 pub struct ExecOutput {
@@ -667,11 +668,15 @@ pub struct HostMetadata {
     pub size: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Error)]
 pub enum HostFsError {
+    #[error("transport error: {0}")]
     Transport(IoError),
+    #[error("protocol error: {0}")]
     Protocol(&'static str),
+    #[error("server error code {0}")]
     Server(u32),
+    #[error("invalid utf-8")]
     Utf8,
 }
 

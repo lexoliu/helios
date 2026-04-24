@@ -3,10 +3,13 @@ extern crate alloc;
 use alloc::borrow::ToOwned;
 use alloc::string::String;
 use alloc::vec::Vec;
+use thiserror::Error;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum ComponentFsPathError {
+    #[error("base path must be absolute")]
     InvalidBasePath,
+    #[error("path is not permitted")]
     NotPermitted,
 }
 

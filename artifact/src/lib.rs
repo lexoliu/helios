@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 use thiserror::Error;
 
-pub const TRAILER_MAGIC: &[u8; 8] = b"HLWSIG01";
+pub const TRAILER_MAGIC: &[u8; 8] = b"HLCWSG01";
 pub const TRAILER_VERSION: u8 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,7 +195,7 @@ pub fn verify_signed_payload<'a>(
 
 pub fn certificate_message(public_key: &[u8; 32]) -> [u8; 48] {
     let mut bytes = [0_u8; 48];
-    bytes[..16].copy_from_slice(b"helios-cert-v1:");
+    bytes[..16].copy_from_slice(b"helios-cert-v01:");
     bytes[16..].copy_from_slice(public_key);
     bytes
 }

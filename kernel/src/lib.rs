@@ -16,6 +16,7 @@ mod component_resources;
 mod component_runtime;
 mod component_runtime_backend;
 mod component_types;
+mod cwasm;
 mod embedded_component;
 mod embedded_init;
 mod embedded_program;
@@ -36,7 +37,6 @@ mod time;
 mod timer;
 mod unsupported_host_fs;
 mod wasi_rights;
-mod wasmc;
 pub(crate) mod wasmtime_adapter;
 
 pub use bootfs::{
@@ -55,11 +55,11 @@ pub use component_fs_path::{
 };
 pub use component_host::{
     ChildExit, ChildHandle, ComponentBindingSet, ComponentHostProcessorRole, HostRuntimeState,
-    ProgramServiceConfig, UserProgramService, component_host_processor_role,
-    component_host_processors_to_start, component_host_system_processor,
-    component_host_worker_count, install_component_host_program_service, install_program_service,
-    install_program_service_with_config, run_component_host_processor_forever,
-    run_embedded_component_forever, run_program_workers_forever, system_component_should_run_on,
+    UserProgramService, component_host_processor_role, component_host_processors_to_start,
+    component_host_system_processor, component_host_worker_count,
+    install_component_host_program_service, install_program_service,
+    run_component_host_processor_forever, run_embedded_component_forever,
+    run_program_workers_forever, system_component_should_run_on,
 };
 pub use component_resources::{
     ComponentRawMutex, ComponentRawMutexGuard, ComponentRawRwLock, ComponentRawRwLockReadGuard,
@@ -77,6 +77,10 @@ pub use component_runtime_backend::{
 pub use component_types::{
     RawMutexGuardResource, RawMutexResource, RawRwLockReadGuardResource, RawRwLockResource,
     RawRwLockWriteGuardResource, SerialPortResource, TcpStreamResource, UdpSocketResource,
+};
+pub use cwasm::{
+    ArtifactTrustError, TrustedCwasm, UntrustedCwasm, UntrustedWasm, is_cwasm,
+    trust_bootfs_artifact, trusted_root_public_keys, verify_signed_artifact,
 };
 pub use embedded_component::EmbeddedComponent;
 pub use embedded_init::{
@@ -119,10 +123,6 @@ pub use time::{duration_to_ticks, elapsed_millis, monotonic_nanos};
 pub use timer::{Sleep, Timer};
 pub use unsupported_host_fs::UnsupportedHostFileSystem;
 pub use wasi_rights::WasiRights;
-pub use wasmc::{
-    ArtifactTrustError, TrustedWasmc, UntrustedWasm, UntrustedWasmc, is_wasmc,
-    trust_bootfs_artifact, trusted_root_public_keys, verify_signed_artifact,
-};
 // Wasmtime-specific helpers are crate-internal only.
 // External consumers use the ComponentRuntimeFactory trait.
 

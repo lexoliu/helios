@@ -161,15 +161,6 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         self.spawn(future).detach();
     }
 
-    pub(crate) fn spawn_detached_silent<Fut>(&self, future: Fut)
-    where
-        Fut: Future + Send + 'static,
-        Fut::Output: Send + 'static,
-    {
-        self.spawn_with_progress(future, ProgressMode::Silent)
-            .detach();
-    }
-
     pub fn spawn_local<Fut>(&self, future: Fut) -> LocalJoinHandle<Fut::Output>
     where
         Fut: Future + 'static,

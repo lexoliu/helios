@@ -123,6 +123,6 @@ interface programs {
   /// Equivalent to `spawn` + drain output + `wait`.
   exec: async func(request: exec-request) -> result<exec-result, exec-error>;
 
-  /// Ahead-of-time compile a raw wasm input into a signed `wasmc` output.
+  /// Ahead-of-time compile a raw wasm input into a signed `cwasm` output.
   aot: async func(request: aot-request) -> result<aot-result, exec-error>;
 }

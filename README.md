@@ -17,7 +17,7 @@ hardware support lives in thin adaptation crates.
   over a `Cpu` implementation supplied by the backend crate. No `#[cfg(target_arch)]`
   branches leak into core logic.
 - **Trusted AOT-only program loading.** The kernel no longer JIT-compiles raw
-  wasm in place. It loads trusted `wasmc` artifacts whose payload is a native
+  wasm in place. It loads trusted `cwasm` artifacts whose payload is a native
   Wasmtime precompiled ELF blob, optionally followed by a Helios signature
   trailer that ordinary Wasmtime runtimes can ignore.
 - **Async-first runtime.** A small cooperative executor built on `async-task`
@@ -45,7 +45,7 @@ hardware support lives in thin adaptation crates.
 | --- | --- |
 | `hal/` | Architecture-neutral hardware traits (`Cpu`, `FileSystem`, `NetDriver`, …) |
 | `kernel/` | Hardware-independent runtime: executor, timer, component host, trusted artifact loading, capability resources |
-| `artifact/` | Shared `wasmc` trailer parsing, signing, and trust-boundary helpers |
+| `artifact/` | Shared `cwasm` trailer parsing, signing, and trust-boundary helpers |
 | `cli/` | CLI workspace member for offline AOT, signing, and kernel bootfs prebuilds |
 | `riscv/` | RISC-V 64 backend (boot, trap, virtio, UART) |
 | `x86/` | x86_64 backend (bootloader entry, SMP wakeup, serial, timer) |
@@ -131,7 +131,7 @@ execution model:
 - Non-core kernel functionality may depend on kernel plugins.
 
 The compiler is one such kernel plugin. It is bootfs-provisioned, loaded early,
-and trusted by the kernel to emit signed `wasmc` artifacts for raw wasm inputs.
+and trusted by the kernel to emit signed `cwasm` artifacts for raw wasm inputs.
 
 ## Status
 

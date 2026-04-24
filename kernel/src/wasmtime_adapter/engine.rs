@@ -39,7 +39,6 @@ fn build_engine_for_platform<P: CodegenPlatform + Clone>(
             config.detect_host_feature(probe);
         }
     }
-    config.cranelift_debug_verifier(false);
     config.with_custom_code_memory(Some(Arc::new(PlatformCodeMemory {
         platform: platform.clone(),
     })));

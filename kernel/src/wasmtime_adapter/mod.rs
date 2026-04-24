@@ -52,7 +52,7 @@ impl ComponentRuntimeEngine for WasmtimeEngine {
     type Error = wasmtime::Error;
 
     fn compile(&self, bytes: &[u8]) -> Result<Self::Compiled, Self::Error> {
-        let component = Component::from_binary(&self.engine, bytes)?;
+        let component = unsafe { Component::deserialize(&self.engine, bytes)? };
         Ok(WasmtimeCompiledComponent { component })
     }
 }

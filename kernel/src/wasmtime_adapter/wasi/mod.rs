@@ -166,7 +166,6 @@ pub struct P2OutgoingDatagramStream {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WasiUdpSocketFamily {
     Ipv4,
-    Ipv6,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3325,7 +3324,6 @@ fn map_p3_udp_family(
 fn format_p3_udp_family(family: WasiUdpSocketFamily) -> socket_types::IpAddressFamily {
     match family {
         WasiUdpSocketFamily::Ipv4 => socket_types::IpAddressFamily::Ipv4,
-        WasiUdpSocketFamily::Ipv6 => socket_types::IpAddressFamily::Ipv6,
     }
 }
 
@@ -3345,8 +3343,9 @@ fn parse_p3_udp_socket_address(
                 port: address.port,
             })
         }
-        (WasiUdpSocketFamily::Ipv4, socket_types::IpSocketAddress::Ipv6(_))
-        | (WasiUdpSocketFamily::Ipv6, _) => Err(WasiUdpSocketError::NotSupported),
+        (WasiUdpSocketFamily::Ipv4, socket_types::IpSocketAddress::Ipv6(_)) => {
+            Err(WasiUdpSocketError::NotSupported)
+        }
     }
 }
 

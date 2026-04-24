@@ -36,7 +36,7 @@ crates.
 - The kernel must not select runtimes, probe features, or switch behaviour
   based on `#[cfg(target_arch)]`. Capabilities are injected through separate
   adapter traits supplied by the backend (for example `CodegenPlatform` for
-  JIT code publication and ISA feature probing).
+  executable-code publication and ISA feature probing).
 - Runtime consumers in `kernel/` depend on traits (for example
   `ComponentRuntimeFactory`, `HostFileSystem`), not on concrete Wasmtime types.
   Concrete runtimes are adapters that satisfy those traits.
@@ -73,7 +73,7 @@ crates.
   provisioning and lifecycle management, not in a different runtime boundary.
 - Non-core kernel functionality may depend on kernel plugins.
 - The compiler is a kernel plugin: it is bootfs-provisioned, loaded during
-  kernel startup, and trusted by the kernel for signed `wasmc` output.
+  kernel startup, and trusted by the kernel for signed `cwasm` output.
 
 ## 3.2 Naming
 

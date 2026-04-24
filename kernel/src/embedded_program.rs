@@ -1,7 +1,7 @@
-/// Raw wasm module bytes embedded into the binary.
+/// Trusted precompiled component bytes embedded into the binary.
 ///
 /// Higher layers decide when to launch an embedded program. The kernel keeps
-/// the payload opaque and JIT-compiles it at runtime for the active target.
+/// the payload opaque and deserializes it through the trusted artifact loader.
 #[derive(Clone, Copy)]
 pub struct EmbeddedProgram {
     name: &'static str,

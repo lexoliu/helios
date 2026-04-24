@@ -8,11 +8,11 @@ anyhow = "1.0.100"
 clap = { version = "4.5.38", features = ["derive"] }
 ed25519-dalek = { version = "2.2.0", default-features = false, features = ["alloc", "rand_core", "std"] }
 helios-artifact.workspace = true
+hex = "0.4.3"
 rand = "0.8.5"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 toml = "0.8.23"
-walkdir = "2.5.0"
 wasmparser = "0.245.0"
-wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["component-model", "cranelift", "runtime", "std", "winch"] }
+wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["all-arch", "component-model", "component-model-async-compile", "cranelift", "std", "winch"] }
 wit-component = "0.245.0"

@@ -14,7 +14,9 @@ use wasmtime_wasi_io::streams::{
 };
 use wasmtime_wasi_io::{self};
 
+use super::bindings::clocks::system_clock::Instant as P3SystemInstant;
 use super::bindings::filesystem::types as p3fs;
+use super::bindings::filesystem::types::{ErrorCode as P3ErrorCode, OpenFlags as P3OpenFlags};
 use super::{
     FsDescriptor, FsNodeKind, P2IncomingDatagramStream, P2Network, P2OutgoingDatagramStream,
     TcpSocket, UdpSocket, WasiUdpSocketAddress, WasiUdpSocketError, WasiUdpSocketFamily,
@@ -996,12 +998,9 @@ where
                 Ok(meta) => Some(meta),
                 Err(err) => {
                     let code = map_host_fs_error(err);
-                    if matches!(
-                        code,
-                        crate::wasmtime_adapter::wasi::bindings::filesystem::types::ErrorCode::NoEntry
-                    ) && open_flags_p3.contains(
-                        crate::wasmtime_adapter::wasi::bindings::filesystem::types::OpenFlags::CREATE,
-                    ) {
+                    if matches!(code, P3ErrorCode::NoEntry)
+                        && open_flags_p3.contains(P3OpenFlags::CREATE)
+                    {
                         None
                     } else {
                         return Ok(Err(error_code_from_p3(code)));
@@ -1751,8 +1750,9 @@ fn parse_p2_udp_socket_address(
                 port: address.port,
             })
         }
-        (WasiUdpSocketFamily::Ipv4, p2udp::IpSocketAddress::Ipv6(_))
-        | (WasiUdpSocketFamily::Ipv6, _) => Err(WasiUdpSocketError::NotSupported),
+        (WasiUdpSocketFamily::Ipv4, p2udp::IpSocketAddress::Ipv6(_)) => {
+            Err(WasiUdpSocketError::NotSupported)
+        }
     }
 }
 
@@ -1767,7 +1767,6 @@ fn format_p2_udp_socket_address(address: WasiUdpSocketAddress) -> p2udp::IpSocke
 fn format_p2_udp_family(family: WasiUdpSocketFamily) -> p2udp::IpAddressFamily {
     match family {
         WasiUdpSocketFamily::Ipv4 => p2udp::IpAddressFamily::Ipv4,
-        WasiUdpSocketFamily::Ipv6 => p2udp::IpAddressFamily::Ipv6,
     }
 }
 
@@ -2214,9 +2213,7 @@ fn directory_entry_from_p3(entry: p3fs::DirectoryEntry) -> p2fs::DirectoryEntry 
     }
 }
 
-fn datetime_from_p3(
-    instant: crate::wasmtime_adapter::wasi::bindings::clocks::system_clock::Instant,
-) -> p2fs::Datetime {
+fn datetime_from_p3(instant: P3SystemInstant) -> p2fs::Datetime {
     p2fs::Datetime {
         seconds: instant
             .seconds

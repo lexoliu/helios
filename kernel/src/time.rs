@@ -1,5 +1,5 @@
-use helios_hal::cpu::Cpu;
 use core::time::Duration;
+use helios_hal::cpu::Cpu;
 
 pub fn monotonic_nanos<CpuImpl: Cpu>(cpu: &CpuImpl) -> u64 {
     let ticks = cpu.now().ticks();

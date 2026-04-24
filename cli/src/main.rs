@@ -1,16 +1,16 @@
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use helios_artifact::sign_payload_with_key;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use toml::Value;
-use walkdir::WalkDir;
 use wasmparser::Parser as WasmParser;
 use wasmtime::{Config, Engine, OptLevel, Strategy};
 use wit_component::ComponentEncoder;
@@ -19,6 +19,8 @@ const ROOT_SECRET_FILE: &str = "helios-root-secret.key";
 const ROOT_PUBLIC_FILE: &str = "helios-root-public.key";
 const PREBUILD_MANIFEST_FILE: &str = "kernel-prebuild.json";
 const DEFAULT_INIT_ARGV0: &str = "/init.wasm";
+const COMPILER_PLUGIN_BOOTFS_PATH: &str = "bin/compiler.cwasm";
+const COMPILER_PLUGIN_ROOT_KEY_ENV: &str = "HELIOS_COMPILER_ROOT_KEY_HEX";
 
 #[derive(Parser)]
 #[command(name = "helios-cli")]
@@ -30,6 +32,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Aot(AotCommand),
+    CompilerPlugin(CompilerPluginCommand),
     KernelPrebuild(KernelPrebuildCommand),
 }
 
@@ -55,6 +58,14 @@ struct AotCommand {
 }
 
 #[derive(Parser)]
+struct CompilerPluginCommand {
+    #[arg(long)]
+    target: String,
+    #[arg(long, default_value = "balanced")]
+    hint: Hint,
+}
+
+#[derive(Parser)]
 struct KernelPrebuildCommand {
     #[arg(long)]
     out_dir: PathBuf,
@@ -64,9 +75,9 @@ struct KernelPrebuildCommand {
     profile: String,
     #[arg(long)]
     cargo: PathBuf,
-    #[arg(long, default_value = "../programs/init/Cargo.toml")]
+    #[arg(long, default_value = "programs/init/Cargo.toml")]
     init_manifest: PathBuf,
-    #[arg(long, default_value = "../programs/init/bootfs")]
+    #[arg(long, default_value = "programs/init/bootfs")]
     bootfs_root: PathBuf,
     #[arg(long, default_value = DEFAULT_INIT_ARGV0)]
     init_argv0: String,
@@ -101,6 +112,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Aot(command) => run_aot(command),
+        Commands::CompilerPlugin(command) => run_compiler_plugin(command),
         Commands::KernelPrebuild(command) => run_kernel_prebuild(command),
     }
 }
@@ -109,11 +121,35 @@ fn run_aot(command: AotCommand) -> Result<()> {
     let root_signing_key = read_signing_key(&command.root_key)?;
     let wasm = fs::read(&command.input)
         .with_context(|| format!("failed to read {}", command.input.display()))?;
-    let payload = precompile(&wasm, &command.target, command.hint)?;
+    let component = componentize(&wasm).context("failed to componentize AOT input")?;
+    let payload = precompile_component(&component, &command.target, command.hint)?;
     let signed =
         sign_payload_with_key(&payload, &root_signing_key).context("failed to sign AOT payload")?;
     fs::write(&command.output, signed)
         .with_context(|| format!("failed to write {}", command.output.display()))?;
+    Ok(())
+}
+
+fn run_compiler_plugin(command: CompilerPluginCommand) -> Result<()> {
+    let root_key_hex = std::env::var(COMPILER_PLUGIN_ROOT_KEY_ENV)
+        .with_context(|| format!("{COMPILER_PLUGIN_ROOT_KEY_ENV} is required"))?;
+    let root_key_bytes: [u8; 32] = hex::decode(root_key_hex.trim())
+        .context("failed to decode compiler plugin root key")?
+        .try_into()
+        .map_err(|bytes: Vec<u8>| anyhow!("root key must be 32 bytes, got {}", bytes.len()))?;
+    let root_signing_key = SigningKey::from_bytes(&root_key_bytes);
+
+    let mut wasm = Vec::new();
+    io::stdin()
+        .read_to_end(&mut wasm)
+        .context("failed to read wasm from stdin")?;
+    let component = componentize(&wasm).context("failed to componentize compiler input")?;
+    let payload = precompile_component(&component, &command.target, command.hint)?;
+    let signed = sign_payload_with_key(&payload, &root_signing_key)
+        .context("failed to sign compiler plugin output")?;
+    io::stdout()
+        .write_all(&signed)
+        .context("failed to write signed cwasm to stdout")?;
     Ok(())
 }
 
@@ -125,38 +161,50 @@ fn run_kernel_prebuild(command: KernelPrebuildCommand) -> Result<()> {
     let root_public_path = command.out_dir.join(ROOT_PUBLIC_FILE);
     let root_signing_key = ensure_root_keypair(&root_secret_path, &root_public_path)?;
 
+    let init_manifest = workspace_path(&command.init_manifest);
+    let bootfs_root = workspace_path(&command.bootfs_root);
+
     let init_component = build_component_program(
         &command.cargo,
         &command.profile,
         &command.out_dir,
-        &command.init_manifest,
-        "helios-init-target",
+        &init_manifest,
+        "init-target",
         "helios_init.wasm",
     )?;
-    let init_wasmc = command.out_dir.join("helios_init_component.wasmc");
+    let init_cwasm = command.out_dir.join("init_component.cwasm");
     let init_component_bytes = encode_component(&init_component)?;
-    let init_payload = precompile(&init_component_bytes, &command.target, Hint::Balanced)?;
+    let init_payload =
+        precompile_component(&init_component_bytes, &command.target, Hint::Balanced)?;
     let init_signed = sign_payload_with_key(&init_payload, &root_signing_key)
         .context("failed to sign init AOT payload")?;
-    fs::write(&init_wasmc, init_signed)
-        .with_context(|| format!("failed to write {}", init_wasmc.display()))?;
+    fs::write(&init_cwasm, init_signed)
+        .with_context(|| format!("failed to write {}", init_cwasm.display()))?;
 
     let selected_programs = selected_boot_programs()?;
-    let bootfs_assets = build_boot_program_assets(
+    let mut bootfs_assets = Vec::new();
+    bootfs_assets.push(build_compiler_plugin_asset(
+        &command.cargo,
+        &command.profile,
+        &command.out_dir,
+        &command.target,
+        &root_signing_key,
+    )?);
+    bootfs_assets.extend(build_boot_program_assets(
         &command.cargo,
         &command.profile,
         &command.out_dir,
         &command.target,
         &root_signing_key,
         &selected_programs,
-    )?;
+    )?);
 
     let manifest = PrebuildManifest {
         target: command.target,
-        init_component: init_wasmc,
+        init_component: init_cwasm,
         init_argv0: command.init_argv0,
-        bootfs_root: fs::canonicalize(&command.bootfs_root)
-            .with_context(|| format!("failed to resolve {}", command.bootfs_root.display()))?,
+        bootfs_root: fs::canonicalize(&bootfs_root)
+            .with_context(|| format!("failed to resolve {}", bootfs_root.display()))?,
         root_public_key: root_public_path,
         root_secret_key: root_secret_path,
         bootfs_assets,
@@ -165,6 +213,36 @@ fn run_kernel_prebuild(command: KernelPrebuildCommand) -> Result<()> {
     fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)
         .with_context(|| format!("failed to write {}", manifest_path.display()))?;
     Ok(())
+}
+
+fn build_compiler_plugin_asset(
+    cargo: &Path,
+    profile: &str,
+    out_dir: &Path,
+    target: &str,
+    root_signing_key: &SigningKey,
+) -> Result<BootAsset> {
+    let wasm_path = build_component_program(
+        cargo,
+        profile,
+        out_dir,
+        &workspace_path(Path::new("cli/Cargo.toml")),
+        "compiler-plugin-target",
+        "helios-cli.wasm",
+    )?;
+    let component_bytes = encode_component(&wasm_path)?;
+    let payload = precompile_component(&component_bytes, target, Hint::Balanced)?;
+    let signed = sign_payload_with_key(&payload, root_signing_key)
+        .context("failed to sign compiler plugin AOT payload")?;
+    let output_path = out_dir.join("compiler_plugin.cwasm");
+    fs::write(&output_path, signed)
+        .with_context(|| format!("failed to write {}", output_path.display()))?;
+
+    Ok(BootAsset {
+        path: COMPILER_PLUGIN_BOOTFS_PATH.to_owned(),
+        source: fs::canonicalize(&output_path)
+            .with_context(|| format!("failed to resolve {}", output_path.display()))?,
+    })
 }
 
 fn selected_boot_programs() -> Result<Option<BTreeSet<String>>> {
@@ -193,11 +271,11 @@ fn build_boot_program_assets(
     root_signing_key: &SigningKey,
     selected_programs: &Option<BTreeSet<String>>,
 ) -> Result<Vec<BootAsset>> {
-    let programs_root = Path::new("../programs");
+    let programs_root = workspace_path(Path::new("programs"));
     let mut available_programs = BTreeSet::new();
     let mut manifests = Vec::new();
 
-    for entry in fs::read_dir(programs_root)
+    for entry in fs::read_dir(&programs_root)
         .with_context(|| format!("failed to read {}", programs_root.display()))?
     {
         let entry = entry.with_context(|| "failed to read programs directory entry")?;
@@ -246,6 +324,16 @@ fn build_boot_program_assets(
         .collect()
 }
 
+fn workspace_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap_or_else(|| panic!("cli manifest directory must have a workspace parent"))
+        .join(path)
+}
+
 fn build_boot_program_asset(
     cargo: &Path,
     profile: &str,
@@ -259,14 +347,14 @@ fn build_boot_program_asset(
         profile,
         out_dir,
         &manifest.manifest_path,
-        &format!("helios-bootfs-{}-target", manifest.command),
+        &format!("bootfs-{}-target", manifest.command),
         &manifest.artifact_name,
     )?;
     let component_bytes = encode_component(&wasm_path)?;
-    let payload = precompile(&component_bytes, target, Hint::Balanced)?;
+    let payload = precompile_component(&component_bytes, target, Hint::Balanced)?;
     let signed = sign_payload_with_key(&payload, root_signing_key)
         .context("failed to sign bootfs AOT payload")?;
-    let output_path = out_dir.join(format!("{}_bootfs_component.wasmc", manifest.command));
+    let output_path = out_dir.join(format!("{}_bootfs_component.cwasm", manifest.command));
     fs::write(&output_path, signed)
         .with_context(|| format!("failed to write {}", output_path.display()))?;
 
@@ -387,44 +475,48 @@ fn encode_component(path: &Path) -> Result<Vec<u8>> {
         .with_context(|| format!("failed to encode component {}", path.display()))
 }
 
-fn precompile(bytes: &[u8], target: &str, hint: Hint) -> Result<Vec<u8>> {
-    let engine = Engine::new(&build_engine_config(target, hint)?)
-        .with_context(|| format!("failed to create Wasmtime engine for target {target}"))?;
-    if WasmParser::is_component(bytes) {
-        return engine
-            .precompile_component(bytes)
-            .context("failed to precompile component");
+fn componentize(wasm: &[u8]) -> Result<Vec<u8>> {
+    if WasmParser::is_component(wasm) {
+        return Ok(wasm.to_vec());
     }
+    ComponentEncoder::default()
+        .module(wasm)
+        .context("failed to load core module")?
+        .validate(true)
+        .encode()
+        .context("failed to encode component")
+}
+
+fn precompile_component(bytes: &[u8], target: &str, hint: Hint) -> Result<Vec<u8>> {
+    let engine = Engine::new(&build_engine_config(target, hint)?).map_err(|error| {
+        anyhow!("failed to create Wasmtime engine for target {target}: {error:#}")
+    })?;
     engine
-        .precompile_module(bytes)
-        .context("failed to precompile module")
+        .precompile_component(bytes)
+        .map_err(|error| anyhow!("failed to precompile component: {error:#}"))
 }
 
 fn build_engine_config(target: &str, hint: Hint) -> Result<Config> {
     let mut config = Config::new();
     config
         .target(target)
-        .with_context(|| format!("Wasmtime rejected target {target}"))?;
+        .map_err(|error| anyhow!("Wasmtime rejected target {target}: {error:#}"))?;
     match hint {
         Hint::Fast => {
-            config
-                .strategy(Strategy::Winch)
-                .context("failed to enable Winch strategy")?;
+            config.strategy(Strategy::Winch);
         }
         Hint::Balanced => {
-            config
-                .strategy(Strategy::Cranelift)
-                .context("failed to enable Cranelift strategy")?;
+            config.strategy(Strategy::Cranelift);
             config.cranelift_opt_level(OptLevel::None);
         }
         Hint::Performance => {
-            config
-                .strategy(Strategy::Cranelift)
-                .context("failed to enable Cranelift strategy")?;
+            config.strategy(Strategy::Cranelift);
             config.cranelift_opt_level(OptLevel::Speed);
         }
     }
     config.wasm_component_model(true);
+    config.wasm_component_model_async(true);
+    config.concurrency_support(true);
     Ok(config)
 }
 

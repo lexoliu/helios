@@ -9,7 +9,6 @@ crossbeam-channel = "0.5.15"
 helios-hal.workspace = true
 helios-kernel = { workspace = true, default-features = false, features = ["wasmtime-host"] }
 mimalloc = "0.1.48"
-shell-words = "1.1.0"
 tracing.workspace = true
 
 [dev-dependencies]

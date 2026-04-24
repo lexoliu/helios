@@ -1,11 +1,11 @@
-/// Runtime code-generation platform support.
+/// Runtime executable-code publication support.
 ///
-/// Backends that host a JIT-compiling wasm runtime implement this trait to
+/// Backends that host precompiled wasm artifacts implement this trait to
 /// provide architecture-specific code publication and ISA feature probing.
-/// This is intentionally separate from [`helios_hal::cpu::Cpu`] because JIT
-/// support is a runtime concern, not a hardware abstraction.
+/// This is intentionally separate from [`helios_hal::cpu::Cpu`] because code
+/// publication is a runtime concern, not a hardware abstraction.
 pub trait CodegenPlatform: Send + Sync + 'static {
-    /// Publishes freshly JIT-compiled executable code so that it becomes
+    /// Publishes freshly loaded executable code so that it becomes
     /// visible to instruction fetches on all processors.
     ///
     /// Architectures that require explicit instruction-cache synchronisation
@@ -16,7 +16,7 @@ pub trait CodegenPlatform: Send + Sync + 'static {
 
     /// Returns an optional native ISA feature probe.
     ///
-    /// A JIT backend can call the returned function with feature names (e.g.
+    /// A runtime backend can call the returned function with feature names (e.g.
     /// `"avx2"`, `"bmi2"`) to discover what the current platform supports
     /// without hardcoding architecture detection logic into the kernel.
     fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {

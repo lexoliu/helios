@@ -1,8 +1,8 @@
-/// Raw WebAssembly component bytes embedded into the binary.
+/// Trusted precompiled component bytes embedded into the binary.
 ///
 /// The kernel keeps the payload opaque. Higher layers decide whether the
 /// component is launched as `init`, a driver, or some other user-mode payload,
-/// and JIT-compile it when needed.
+/// and deserialize it through the trusted artifact loader when needed.
 #[derive(Clone, Copy)]
 pub struct EmbeddedComponent {
     name: &'static str,

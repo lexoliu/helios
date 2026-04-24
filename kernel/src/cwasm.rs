@@ -3,11 +3,11 @@ extern crate alloc;
 use helios_artifact::{TrailerError, parse_signed_artifact, verify_signed_payload};
 use thiserror::Error;
 
-pub struct TrustedWasmc<'a> {
+pub struct TrustedCwasm<'a> {
     payload: &'a [u8],
 }
 
-impl<'a> TrustedWasmc<'a> {
+impl<'a> TrustedCwasm<'a> {
     pub const fn payload(&self) -> &'a [u8] {
         self.payload
     }
@@ -29,11 +29,11 @@ impl<'a> UntrustedWasm<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub struct UntrustedWasmc<'a> {
+pub struct UntrustedCwasm<'a> {
     bytes: &'a [u8],
 }
 
-impl<'a> UntrustedWasmc<'a> {
+impl<'a> UntrustedCwasm<'a> {
     pub const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes }
     }
@@ -49,24 +49,24 @@ pub enum ArtifactTrustError {
     Trailer(#[from] TrailerError),
 }
 
-pub fn is_wasmc(bytes: &[u8]) -> bool {
+pub fn is_cwasm(bytes: &[u8]) -> bool {
     parse_signed_artifact(bytes).is_ok()
 }
 
 pub fn trust_bootfs_artifact(
-    bytes: UntrustedWasmc<'_>,
-) -> Result<TrustedWasmc<'_>, ArtifactTrustError> {
+    bytes: UntrustedCwasm<'_>,
+) -> Result<TrustedCwasm<'_>, ArtifactTrustError> {
     let parsed = parse_signed_artifact(bytes.bytes())?;
-    Ok(TrustedWasmc {
+    Ok(TrustedCwasm {
         payload: parsed.payload(),
     })
 }
 
 pub fn verify_signed_artifact(
-    bytes: UntrustedWasmc<'_>,
-) -> Result<TrustedWasmc<'_>, ArtifactTrustError> {
+    bytes: UntrustedCwasm<'_>,
+) -> Result<TrustedCwasm<'_>, ArtifactTrustError> {
     let parsed = verify_signed_payload(bytes.bytes(), trusted_root_public_keys())?;
-    Ok(TrustedWasmc {
+    Ok(TrustedCwasm {
         payload: parsed.payload(),
     })
 }

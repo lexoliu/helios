@@ -914,7 +914,9 @@ mod tests {
             )
             .await
         })
-        .ok_or_else(|| anyhow::anyhow!("timed out waiting for direct CPython exec-path result"))??;
+        .ok_or_else(|| {
+            anyhow::anyhow!("timed out waiting for direct CPython exec-path result")
+        })??;
         assert_eq!(python.exit_code, 0, "CPython exited non-zero: {python:?}");
         let python_stdout = String::from_utf8_lossy(&python.output.stdout);
         assert_eq!(python_stdout.trim(), "42", "unexpected CPython stdout");
@@ -944,17 +946,23 @@ mod tests {
                     crate::programs::REMOTE_SHELL_PATH,
                     &[
                         "-c".to_owned(),
-                        "/host/artifacts/python3-root/python3.wasm -c \"print(40+2)\""
-                            .to_owned(),
+                        "/host/artifacts/python3-root/python3.wasm -c \"print(40+2)\"".to_owned(),
                     ],
                 ),
             )
             .await
         })
         .ok_or_else(|| anyhow::anyhow!("timed out waiting for shell CPython result"))??;
-        assert_eq!(python.exit_code, 0, "shell CPython exited non-zero: {python:?}");
+        assert_eq!(
+            python.exit_code, 0,
+            "shell CPython exited non-zero: {python:?}"
+        );
         let python_stdout = String::from_utf8_lossy(&python.output.stdout);
-        assert_eq!(python_stdout.trim(), "42", "unexpected shell CPython stdout");
+        assert_eq!(
+            python_stdout.trim(),
+            "42",
+            "unexpected shell CPython stdout"
+        );
 
         runtime.shutdown();
         Ok(())

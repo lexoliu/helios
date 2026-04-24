@@ -4,7 +4,7 @@
 //! returns a handle whose `stdin`/`stdout`/`stderr` are byte streams that
 //! can be piped from/into anything that speaks `wasi:io`. `exec` is the
 //! convenience "run to completion with buffered output" wrapper, and `aot`
-//! produces a signed `wasmc` artifact at a caller-chosen destination path.
+//! produces a signed `cwasm` artifact at a caller-chosen destination path.
 
 use crate::bindings::helios::system::programs as raw;
 use crate::bindings::wit_stream;
@@ -115,7 +115,7 @@ pub async fn spawn(request: SpawnRequest) -> Result<Child, SpawnError> {
     Child::spawn(request).await
 }
 
-/// Ahead-of-time compile a raw wasm program into a signed `wasmc` file.
+/// Ahead-of-time compile a raw wasm program into a signed `cwasm` file.
 pub async fn aot(request: AotRequest) -> Result<AotResult, ExecError> {
     raw::aot(request).await
 }
