@@ -7,7 +7,10 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use helios_artifact::sign_payload_with_key;
+use helios_artifact::{
+    CWASM_NO_VMEM_MEMORY_GUARD_SIZE, CWASM_NO_VMEM_MEMORY_RESERVATION,
+    CWASM_NO_VMEM_MEMORY_RESERVATION_FOR_GROWTH, sign_payload_with_key,
+};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use toml::Value;
@@ -501,6 +504,7 @@ fn build_engine_config(target: &str, hint: Hint) -> Result<Config> {
     config
         .target(target)
         .map_err(|error| anyhow!("Wasmtime rejected target {target}: {error:#}"))?;
+    configure_target_isa_flags(&mut config, target);
     match hint {
         Hint::Fast => {
             config.strategy(Strategy::Winch);
@@ -516,8 +520,54 @@ fn build_engine_config(target: &str, hint: Hint) -> Result<Config> {
     }
     config.wasm_component_model(true);
     config.wasm_component_model_async(true);
+    config.wasm_simd(true);
+    config.wasm_relaxed_simd(true);
+    config.relaxed_simd_deterministic(false);
+    config.wasm_multi_memory(true);
+    config.wasm_memory64(true);
+    config.wasm_tail_call(true);
+    config.gc_support(true);
+    config.wasm_reference_types(true);
+    config.wasm_function_references(true);
     config.concurrency_support(true);
+    config.epoch_interruption(true);
+    config.max_wasm_stack(8 * 1024 * 1024);
+    if target_requires_no_vmem_cwasm(target) {
+        config.signals_based_traps(true);
+        config.memory_guard_size(CWASM_NO_VMEM_MEMORY_GUARD_SIZE);
+        config.memory_reservation(CWASM_NO_VMEM_MEMORY_RESERVATION);
+        config.memory_reservation_for_growth(CWASM_NO_VMEM_MEMORY_RESERVATION_FOR_GROWTH);
+        config.memory_init_cow(false);
+    }
     Ok(config)
+}
+
+fn target_requires_no_vmem_cwasm(target: &str) -> bool {
+    target.contains("-unknown-none")
+}
+
+fn configure_target_isa_flags(config: &mut Config, target: &str) {
+    if !target.starts_with("x86_64-") {
+        return;
+    }
+
+    // TODO(x86-avx): add AVX/FMA/AVX512 once the x86 kernel enables OSXSAVE,
+    // configures XCR0, and preserves the full XSAVE state across execution.
+    for flag in [
+        "has_cmpxchg16b",
+        "has_sse3",
+        "has_ssse3",
+        "has_sse41",
+        "has_sse42",
+        "has_popcnt",
+        "has_bmi1",
+        "has_bmi2",
+        "has_lzcnt",
+    ] {
+        unsafe {
+            config.cranelift_flag_enable(flag);
+        }
+    }
 }
 
 fn ensure_root_keypair(root_secret_path: &Path, root_public_path: &Path) -> Result<SigningKey> {

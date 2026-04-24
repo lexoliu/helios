@@ -3,7 +3,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context as _, Result};
 use bootloader::BiosBoot;
@@ -27,6 +27,7 @@ const DEFAULT_X86_SMP: u16 = 2;
 const DEFAULT_SOCKET_WAIT: Duration = Duration::from_secs(10);
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DEFAULT_BLOCK_DEVICE_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_GDB_ENDPOINT: &str = "tcp::1234";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -134,7 +135,11 @@ pub(crate) struct VmConfigFile {
     #[serde(default)]
     pub(crate) arch: Option<VmArch>,
     #[serde(default)]
+    pub(crate) debug: Option<bool>,
+    #[serde(default)]
     pub(crate) release: Option<bool>,
+    #[serde(default)]
+    pub(crate) kernel_debug: Option<bool>,
     #[serde(default)]
     pub(crate) qemu_bin: Option<PathBuf>,
     #[serde(default)]
@@ -148,9 +153,31 @@ pub(crate) struct VmConfigFile {
     #[serde(default)]
     pub(crate) baud: Option<u32>,
     #[serde(default)]
+    pub(crate) cpu: Option<String>,
+    #[serde(default)]
+    pub(crate) accel: Vec<String>,
+    #[serde(default)]
     pub(crate) shared_dir: Option<PathBuf>,
     #[serde(default)]
     pub(crate) gdb: Option<String>,
+    #[serde(default)]
+    pub(crate) gdb_wait: Option<bool>,
+    #[serde(default)]
+    pub(crate) monitor: Option<String>,
+    #[serde(default)]
+    pub(crate) qmp: Option<String>,
+    #[serde(default)]
+    pub(crate) qemu_log: Option<PathBuf>,
+    #[serde(default)]
+    pub(crate) qemu_trace: Vec<String>,
+    #[serde(default)]
+    pub(crate) qemu_trace_log: Option<PathBuf>,
+    #[serde(default)]
+    pub(crate) qemu_arg: Vec<String>,
+    #[serde(default)]
+    pub(crate) runtime_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub(crate) keep_runtime_dir: Option<bool>,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -158,8 +185,16 @@ pub(crate) struct VmCommand {
     #[arg(long, value_enum, default_value_t = VmArch::Riscv64)]
     arch: VmArch,
 
+    /// Enable a practical kernel debugging preset.
+    #[arg(long, default_value_t = false, conflicts_with = "release")]
+    debug: bool,
+
     #[arg(long, default_value_t = false)]
     release: bool,
+
+    /// Build the kernel with debuginfo and unstripped symbols for GDB/LLDB.
+    #[arg(long, default_value_t = false, conflicts_with = "release")]
+    kernel_debug: bool,
 
     #[arg(long)]
     config: Option<PathBuf>,
@@ -188,11 +223,55 @@ pub(crate) struct VmCommand {
     #[arg(long, default_value_t = DEFAULT_BAUD)]
     baud: u32,
 
+    /// QEMU CPU model override.
+    #[arg(long)]
+    cpu: Option<String>,
+
+    /// QEMU accelerator option. Repeat to pass multiple `-accel` entries.
+    #[arg(long)]
+    accel: Vec<String>,
+
     #[arg(long)]
     shared_dir: Option<PathBuf>,
 
     #[arg(long)]
     gdb: Option<String>,
+
+    /// Start QEMU with CPUs stopped so GDB/LLDB can attach before kernel entry.
+    #[arg(long, default_value_t = false)]
+    gdb_wait: bool,
+
+    /// QEMU HMP monitor endpoint, for example `stdio` or `unix:/tmp/hmp.sock,server=on,wait=off`.
+    #[arg(long)]
+    monitor: Option<String>,
+
+    /// QEMU QMP endpoint, for example `unix:/tmp/qmp.sock,server=on,wait=off`.
+    #[arg(long)]
+    qmp: Option<String>,
+
+    /// File receiving QEMU stdout/stderr.
+    #[arg(long)]
+    qemu_log: Option<PathBuf>,
+
+    /// QEMU `-d` trace flags. Repeat the flag or pass comma-separated groups.
+    #[arg(long, value_delimiter = ',')]
+    qemu_trace: Vec<String>,
+
+    /// File receiving QEMU `-d` trace output.
+    #[arg(long)]
+    qemu_trace_log: Option<PathBuf>,
+
+    /// Extra raw QEMU argument. Repeat for multiple arguments.
+    #[arg(long, allow_hyphen_values = true)]
+    qemu_arg: Vec<String>,
+
+    /// Directory for VM sockets, logs, and generated boot artifacts.
+    #[arg(long)]
+    runtime_dir: Option<PathBuf>,
+
+    /// Keep the generated VM runtime directory after QEMU exits.
+    #[arg(long, default_value_t = false)]
+    keep_runtime_dir: bool,
 
     #[command(subcommand)]
     command: Option<VmSessionCommand>,
@@ -210,6 +289,7 @@ enum VmSessionCommand {
 struct ResolvedVmCommand {
     profile: &'static VmProfile,
     release: bool,
+    kernel_debug: bool,
     qemu_bin: PathBuf,
     kernel: PathBuf,
     socket: Option<PathBuf>,
@@ -218,8 +298,19 @@ struct ResolvedVmCommand {
     memory: String,
     bios: Option<String>,
     baud: u32,
+    cpu: Option<String>,
+    accel: Vec<String>,
     shared_dir: Option<PathBuf>,
     gdb: Option<String>,
+    gdb_wait: bool,
+    monitor: Option<String>,
+    qmp: Option<String>,
+    qemu_log: Option<PathBuf>,
+    qemu_trace: Vec<String>,
+    qemu_trace_log: Option<PathBuf>,
+    qemu_arg: Vec<String>,
+    runtime_dir: Option<PathBuf>,
+    keep_runtime_dir: bool,
     command: Option<SessionCommand>,
 }
 
@@ -231,15 +322,21 @@ pub(crate) fn run(command: VmCommand) -> Result<()> {
     }
     let mut runtime = VmRuntime::spawn(&command)?;
     let result = connect_and_run(&command, runtime.socket_path());
+    let runtime_dir = runtime.runtime_dir_path().to_path_buf();
     runtime.shutdown();
-    result
+    result.with_context(|| format!("VM runtime directory: {}", runtime_dir.display()))
 }
 
 fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
     let file = load_config_file(command.config.as_deref())?;
     let arch = file.arch.unwrap_or(command.arch);
     let profile = arch.profile();
+    let debug = command.debug || file.debug.unwrap_or(false);
     let release = command.release || file.release.unwrap_or(false);
+    let kernel_debug = debug || command.kernel_debug || file.kernel_debug.unwrap_or(false);
+    if release && kernel_debug {
+        bail!("--release and --kernel-debug cannot be used together");
+    }
     let qemu_bin = command
         .qemu_bin
         .or(file.qemu_bin)
@@ -247,7 +344,7 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
     let kernel = command
         .kernel
         .or(file.kernel)
-        .unwrap_or_else(|| default_kernel_path(arch, release));
+        .unwrap_or_else(|| default_kernel_path(arch, build_profile_dir(release, kernel_debug)));
     let smp = command.smp.or(file.smp).unwrap_or(profile.default_smp);
     let memory = if command.memory != DEFAULT_MEMORY {
         command.memory
@@ -264,12 +361,34 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
     } else {
         file.baud.unwrap_or(DEFAULT_BAUD)
     };
+    let cpu = command.cpu.or(file.cpu);
+    let mut accel = file.accel;
+    accel.extend(command.accel);
     let shared_dir = command.shared_dir.or(file.shared_dir);
-    let gdb = command.gdb.or(file.gdb);
+    let gdb = command
+        .gdb
+        .or(file.gdb)
+        .or_else(|| debug.then(|| DEFAULT_GDB_ENDPOINT.to_owned()));
+    let gdb_wait = debug || command.gdb_wait || file.gdb_wait.unwrap_or(false);
+    if gdb_wait && gdb.is_none() {
+        bail!("--gdb-wait requires --gdb or --debug");
+    }
+    let monitor = command.monitor.or(file.monitor);
+    let qmp = command.qmp.or(file.qmp);
+    let qemu_log = command.qemu_log.or(file.qemu_log);
+    let mut qemu_trace = file.qemu_trace;
+    qemu_trace.extend(command.qemu_trace);
+    let qemu_trace_log = command.qemu_trace_log.or(file.qemu_trace_log);
+    let mut qemu_arg = file.qemu_arg;
+    qemu_arg.extend(command.qemu_arg);
+    let runtime_dir = command.runtime_dir.or(file.runtime_dir);
+    let keep_runtime_dir =
+        debug || command.keep_runtime_dir || file.keep_runtime_dir.unwrap_or(false);
 
     Ok(ResolvedVmCommand {
         profile,
         release,
+        kernel_debug,
         qemu_bin,
         kernel,
         socket: command.socket,
@@ -278,8 +397,19 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
         memory,
         bios,
         baud,
+        cpu,
+        accel,
         shared_dir,
         gdb,
+        gdb_wait,
+        monitor,
+        qmp,
+        qemu_log,
+        qemu_trace,
+        qemu_trace_log,
+        qemu_arg,
+        runtime_dir,
+        keep_runtime_dir,
         command: command.command.map(Into::into),
     })
 }
@@ -316,7 +446,7 @@ fn build_vm(command: &ResolvedVmCommand) -> Result<()> {
     let repo_root = repo_root();
     run_step(
         &format!("building {} kernel", arch_label(command.profile.arch)),
-        cargo_build_command(repo_root, command.release)
+        cargo_build_command(repo_root, command.release, command.kernel_debug)
             .arg("--target")
             .arg(command.profile.cargo_target)
             .arg("--bin")
@@ -324,18 +454,20 @@ fn build_vm(command: &ResolvedVmCommand) -> Result<()> {
     )?;
     run_step(
         "building inspector",
-        cargo_build_command(repo_root, command.release)
+        cargo_build_command(repo_root, command.release, false)
             .arg("-p")
             .arg("helios-inspector"),
     )?;
     Ok(())
 }
 
-fn cargo_build_command(repo_root: &Path, release: bool) -> Command {
+fn cargo_build_command(repo_root: &Path, release: bool, kernel_debug: bool) -> Command {
     let mut command = Command::new("cargo");
     command.current_dir(repo_root).arg("build");
     if release {
         command.arg("--release");
+    } else if kernel_debug {
+        command.arg("--profile").arg("kernel-debug");
     }
     command
 }
@@ -399,33 +531,80 @@ fn run_step(label: &str, command: &mut Command) -> Result<()> {
 
 struct VmRuntime {
     socket_path: PathBuf,
-    _tempdir: TempDir,
+    runtime_dir: VmRuntimeDir,
     child: Child,
+}
+
+enum VmRuntimeDir {
+    Temporary(TempDir),
+    Persistent(PathBuf),
+}
+
+impl VmRuntimeDir {
+    fn create(command: &ResolvedVmCommand) -> Result<Self> {
+        if let Some(path) = &command.runtime_dir {
+            fs::create_dir_all(path).with_context(|| {
+                format!("failed to create VM runtime directory {}", path.display())
+            })?;
+            return Ok(Self::Persistent(path.clone()));
+        }
+        if command.keep_runtime_dir {
+            let path = default_persistent_runtime_dir()?;
+            fs::create_dir_all(&path).with_context(|| {
+                format!("failed to create VM runtime directory {}", path.display())
+            })?;
+            return Ok(Self::Persistent(path));
+        }
+        tempfile::Builder::new()
+            .prefix("helios-inspector-vm.")
+            .tempdir()
+            .map(Self::Temporary)
+            .context("failed to create temporary QEMU runtime directory")
+    }
+
+    fn path(&self) -> &Path {
+        match self {
+            Self::Temporary(tempdir) => tempdir.path(),
+            Self::Persistent(path) => path,
+        }
+    }
 }
 
 impl VmRuntime {
     fn spawn(command: &ResolvedVmCommand) -> Result<Self> {
-        let tempdir = tempfile::Builder::new()
-            .prefix("helios-inspector-vm.")
-            .tempdir()
-            .context("failed to create temporary QEMU runtime directory")?;
+        let runtime_dir = VmRuntimeDir::create(command)?;
         let socket_path = command
             .socket
             .clone()
-            .unwrap_or_else(|| tempdir.path().join("debug.sock"));
-        let qemu_log = tempdir.path().join("qemu.log");
+            .unwrap_or_else(|| runtime_dir.path().join("debug.sock"));
+        let qemu_log = command
+            .qemu_log
+            .clone()
+            .unwrap_or_else(|| runtime_dir.path().join("qemu.log"));
 
         prepare_socket_path(&socket_path)?;
-        let artifact = prepare_boot_artifact(command, Some(tempdir.path()))?;
-        let block_image = prepare_block_image(command, tempdir.path())?;
+        prepare_log_path(&qemu_log)?;
+        let artifact = prepare_boot_artifact(command, Some(runtime_dir.path()))?;
+        let block_image = prepare_block_image(command, runtime_dir.path())?;
 
         let spinner = spinner(&format!(
             "starting QEMU for {}",
             arch_label(command.profile.arch)
         ));
         let mut qemu = Command::new(&command.qemu_bin);
-        qemu.arg("-display").arg("none").arg("-monitor").arg("none");
+        qemu.arg("-display").arg("none");
+        if let Some(monitor) = monitor_endpoint(command, runtime_dir.path()) {
+            qemu.arg("-monitor").arg(monitor);
+        } else {
+            qemu.arg("-monitor").arg("none");
+        }
+        if let Some(qmp) = qmp_endpoint(command, runtime_dir.path()) {
+            qemu.arg("-qmp").arg(qmp);
+        }
         qemu.arg("-machine").arg(command.profile.machine);
+        for accel in &command.accel {
+            qemu.arg("-accel").arg(accel);
+        }
         qemu.arg("-m").arg(&command.memory);
         qemu.arg("-smp").arg(command.smp.to_string());
         if command.profile.console == VmConsoleProfile::SerialUnixSocket {
@@ -434,10 +613,25 @@ impl VmRuntime {
         }
         if let Some(gdb) = &command.gdb {
             qemu.arg("-gdb").arg(gdb);
+            if command.gdb_wait {
+                qemu.arg("-S");
+            }
         }
-        if command.profile.arch == VmArch::X86_64 {
+        if !command.qemu_trace.is_empty() {
+            let trace_log = command
+                .qemu_trace_log
+                .clone()
+                .unwrap_or_else(|| runtime_dir.path().join("qemu-trace.log"));
+            prepare_log_path(&trace_log)?;
+            qemu.arg("-d").arg(command.qemu_trace.join(","));
+            qemu.arg("-D").arg(trace_log);
+        }
+        if let Some(cpu) = &command.cpu {
+            qemu.arg("-cpu").arg(cpu);
+        } else if command.profile.arch == VmArch::X86_64 {
             qemu.arg("-cpu").arg("max");
         }
+        qemu.args(&command.qemu_arg);
         qemu.process_group(0);
         qemu.stdin(Stdio::null());
         qemu.stdout(Stdio::from(fs::File::create(&qemu_log).with_context(
@@ -485,13 +679,15 @@ impl VmRuntime {
         })?;
         wait_for_socket(&socket_path, &qemu_log, &mut child)?;
         spinner.finish_with_message(format!(
-            "{} {}",
+            "{} {} runtime={} log={}",
             style("ready").green(),
-            socket_path.display()
+            socket_path.display(),
+            runtime_dir.path().display(),
+            qemu_log.display(),
         ));
         Ok(Self {
             socket_path,
-            _tempdir: tempdir,
+            runtime_dir,
             child,
         })
     }
@@ -500,12 +696,50 @@ impl VmRuntime {
         &self.socket_path
     }
 
+    fn runtime_dir_path(&self) -> &Path {
+        self.runtime_dir.path()
+    }
+
     fn shutdown(&mut self) {
         if let Ok(None) = self.child.try_wait() {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
     }
+}
+
+fn default_persistent_runtime_dir() -> Result<PathBuf> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time is earlier than UNIX_EPOCH")?
+        .as_millis();
+    Ok(repo_root()
+        .join("target")
+        .join("inspector-vm")
+        .join(format!("run-{}-{timestamp}", std::process::id())))
+}
+
+fn monitor_endpoint(command: &ResolvedVmCommand, runtime_dir: &Path) -> Option<String> {
+    command.monitor.clone().or_else(|| {
+        command
+            .keep_runtime_dir
+            .then(|| unix_endpoint(runtime_dir, "monitor.sock"))
+    })
+}
+
+fn qmp_endpoint(command: &ResolvedVmCommand, runtime_dir: &Path) -> Option<String> {
+    command.qmp.clone().or_else(|| {
+        command
+            .keep_runtime_dir
+            .then(|| unix_endpoint(runtime_dir, "qmp.sock"))
+    })
+}
+
+fn unix_endpoint(runtime_dir: &Path, name: &str) -> String {
+    format!(
+        "unix:{},server=on,wait=off",
+        runtime_dir.join(name).display()
+    )
 }
 
 impl Drop for VmRuntime {
@@ -540,6 +774,17 @@ fn prepare_socket_path(socket_path: &Path) -> Result<()> {
     }
     fs::remove_file(socket_path)
         .with_context(|| format!("failed to remove stale socket {}", socket_path.display()))?;
+    Ok(())
+}
+
+fn prepare_log_path(log_path: &Path) -> Result<()> {
+    if let Some(parent) = log_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create log directory {}", parent.display()))?;
+    }
     Ok(())
 }
 
@@ -587,12 +832,22 @@ fn repo_root() -> &'static Path {
         .expect("inspector crate must live under repo root")
 }
 
-fn default_kernel_path(arch: VmArch, release: bool) -> PathBuf {
+fn build_profile_dir(release: bool, kernel_debug: bool) -> &'static str {
+    if release {
+        "release"
+    } else if kernel_debug {
+        "kernel-debug"
+    } else {
+        "debug"
+    }
+}
+
+fn default_kernel_path(arch: VmArch, profile_dir: &str) -> PathBuf {
     let profile = arch.profile();
     repo_root()
         .join("target")
         .join(profile.cargo_target)
-        .join(if release { "release" } else { "debug" })
+        .join(profile_dir)
         .join(profile.kernel_artifact_name)
 }
 
@@ -761,7 +1016,9 @@ mod tests {
         let missing_config = tempdir.path().join("missing-vm.json");
         let command = VmCommand {
             arch: VmArch::X86_64,
+            debug: false,
             release: false,
+            kernel_debug: false,
             config: Some(missing_config),
             qemu_bin: None,
             kernel: None,
@@ -771,8 +1028,19 @@ mod tests {
             memory: DEFAULT_MEMORY.to_owned(),
             bios: None,
             baud: DEFAULT_BAUD,
+            cpu: None,
+            accel: Vec::new(),
             shared_dir: None,
             gdb: None,
+            gdb_wait: false,
+            monitor: None,
+            qmp: None,
+            qemu_log: None,
+            qemu_trace: Vec::new(),
+            qemu_trace_log: None,
+            qemu_arg: Vec::new(),
+            runtime_dir: None,
+            keep_runtime_dir: false,
             command: None,
         };
 
@@ -788,6 +1056,55 @@ mod tests {
                 .join("target")
                 .join(X86_64_VM_PROFILE.cargo_target)
                 .join("debug")
+                .join(X86_64_VM_PROFILE.kernel_artifact_name)
+        );
+    }
+
+    #[test]
+    fn resolve_debug_preset_enables_kernel_debug_workbench() {
+        let tempdir =
+            tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
+        let command = VmCommand {
+            arch: VmArch::X86_64,
+            debug: true,
+            release: false,
+            kernel_debug: false,
+            config: Some(tempdir.path().join("missing-vm.json")),
+            qemu_bin: None,
+            kernel: None,
+            socket: None,
+            no_build: true,
+            smp: None,
+            memory: DEFAULT_MEMORY.to_owned(),
+            bios: None,
+            baud: DEFAULT_BAUD,
+            cpu: None,
+            accel: Vec::new(),
+            shared_dir: None,
+            gdb: None,
+            gdb_wait: false,
+            monitor: None,
+            qmp: None,
+            qemu_log: None,
+            qemu_trace: Vec::new(),
+            qemu_trace_log: None,
+            qemu_arg: Vec::new(),
+            runtime_dir: None,
+            keep_runtime_dir: false,
+            command: None,
+        };
+
+        let resolved = resolve(command).expect("VM debug command resolution must succeed");
+        assert!(resolved.kernel_debug);
+        assert_eq!(resolved.gdb.as_deref(), Some(DEFAULT_GDB_ENDPOINT));
+        assert!(resolved.gdb_wait);
+        assert!(resolved.keep_runtime_dir);
+        assert_eq!(
+            resolved.kernel,
+            repo_root()
+                .join("target")
+                .join(X86_64_VM_PROFILE.cargo_target)
+                .join("kernel-debug")
                 .join(X86_64_VM_PROFILE.kernel_artifact_name)
         );
     }
@@ -836,8 +1153,9 @@ mod tests {
         ResolvedVmCommand {
             profile: arch.profile(),
             release: false,
+            kernel_debug: false,
             qemu_bin: PathBuf::from(arch.profile().qemu_bin),
-            kernel: default_kernel_path(arch, false),
+            kernel: default_kernel_path(arch, build_profile_dir(false, false)),
             socket: None,
             no_build: true,
             smp: arch.profile().default_smp,
@@ -847,8 +1165,19 @@ mod tests {
             },
             bios: arch.profile().default_bios.map(str::to_owned),
             baud: DEFAULT_BAUD,
+            cpu: None,
+            accel: Vec::new(),
             shared_dir: None,
             gdb: None,
+            gdb_wait: false,
+            monitor: None,
+            qmp: None,
+            qemu_log: None,
+            qemu_trace: Vec::new(),
+            qemu_trace_log: None,
+            qemu_arg: Vec::new(),
+            runtime_dir: None,
+            keep_runtime_dir: false,
             command: None,
         }
     }
@@ -973,16 +1302,28 @@ mod tests {
         ResolvedVmCommand {
             profile,
             release: true,
+            kernel_debug: false,
             qemu_bin: PathBuf::from(profile.qemu_bin),
-            kernel: default_kernel_path(arch, true),
+            kernel: default_kernel_path(arch, build_profile_dir(true, false)),
             socket: None,
             no_build: true,
             smp: profile.default_smp,
             memory: profile.default_memory.to_owned(),
             bios: profile.default_bios.map(str::to_owned),
             baud: DEFAULT_BAUD,
+            cpu: None,
+            accel: Vec::new(),
             shared_dir: Some(repo_root().to_path_buf()),
             gdb: None,
+            gdb_wait: false,
+            monitor: None,
+            qmp: None,
+            qemu_log: None,
+            qemu_trace: Vec::new(),
+            qemu_trace_log: None,
+            qemu_arg: Vec::new(),
+            runtime_dir: None,
+            keep_runtime_dir: false,
             command: None,
         }
     }

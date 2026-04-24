@@ -218,6 +218,31 @@ mod tests {
             _ => panic!("expected vm command"),
         }
     }
+
+    #[test]
+    fn parses_vm_debug_diagnostics_flags() {
+        let args = Args::try_parse_from([
+            "helios-inspector",
+            "vm",
+            "--arch",
+            "x86-64",
+            "--debug",
+            "--cpu",
+            "max",
+            "--accel",
+            "tcg,thread=multi",
+            "--qemu-trace",
+            "int,exec",
+            "--qemu-arg",
+            "-no-reboot",
+            "repl",
+        ])
+        .expect("vm debug diagnostics flags must parse");
+        match args.command.expect("subcommand must be present") {
+            Command::Vm(_) => {}
+            _ => panic!("expected vm command"),
+        }
+    }
 }
 
 fn run_interruptible(command: impl std::future::Future<Output = Result<()>>) -> Result<()> {

@@ -298,9 +298,15 @@ macro_rules! impl_program_bindings {
                             detail: "program spawn is unavailable on this machine".to_owned(),
                         }));
                     };
-                    let source = match read_program_source(accessor, &request.path).await? {
-                        Ok(source) => source,
-                        Err(error) => return Ok(Err($convert_error(error))),
+                    let source = match read_program_source(accessor, &request.path).await {
+                        Ok(Ok(source)) => source,
+                        Ok(Err(error)) => return Ok(Err($convert_error(error))),
+                        Err(error) => {
+                            return Ok(Err($convert_error(map_program_host_error(
+                                "read spawn source",
+                                error,
+                            ))));
+                        }
                     };
                     match service
                         .spawn(
@@ -354,9 +360,15 @@ macro_rules! impl_program_bindings {
                             detail: "program exec is unavailable on this machine".to_owned(),
                         }));
                     };
-                    let source = match read_program_source(accessor, &request.path).await? {
-                        Ok(source) => source,
-                        Err(error) => return Ok(Err($convert_error(error))),
+                    let source = match read_program_source(accessor, &request.path).await {
+                        Ok(Ok(source)) => source,
+                        Ok(Err(error)) => return Ok(Err($convert_error(error))),
+                        Err(error) => {
+                            return Ok(Err($convert_error(map_program_host_error(
+                                "read exec source",
+                                error,
+                            ))));
+                        }
                     };
                     let hint = match request.hint {
                         Some($bindings::helios::system::programs::AotHint::Fast) => {
@@ -412,9 +424,15 @@ macro_rules! impl_program_bindings {
                             detail: "program AOT is unavailable on this machine".to_owned(),
                         }));
                     };
-                    let source = match read_program_source(accessor, &request.source_path).await? {
-                        Ok(source) => source,
-                        Err(error) => return Ok(Err($convert_error(error))),
+                    let source = match read_program_source(accessor, &request.source_path).await {
+                        Ok(Ok(source)) => source,
+                        Ok(Err(error)) => return Ok(Err($convert_error(error))),
+                        Err(error) => {
+                            return Ok(Err($convert_error(map_program_host_error(
+                                "read aot source",
+                                error,
+                            ))));
+                        }
                     };
                     let ProgramSource::RawWasm(wasm) = source else {
                         return Ok(Err($bindings::helios::system::programs::ExecError {
@@ -435,11 +453,17 @@ macro_rules! impl_program_bindings {
                         Ok(artifact) => artifact,
                         Err(error) => return Ok(Err($convert_error(error))),
                     };
-                    if let Err(error) =
-                        write_program_artifact(accessor, &request.destination_path, &artifact)
-                            .await?
+                    match write_program_artifact(accessor, &request.destination_path, &artifact)
+                        .await
                     {
-                        return Ok(Err($convert_error(error)));
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => return Ok(Err($convert_error(error))),
+                        Err(error) => {
+                            return Ok(Err($convert_error(map_program_host_error(
+                                "write aot artifact",
+                                error,
+                            ))));
+                        }
                     }
                     Ok(Ok($bindings::helios::system::programs::AotResult {
                         destination_path: request.destination_path,
@@ -470,7 +494,7 @@ where
     HostFs: crate::HostFileSystem,
 {
     let absolute =
-        crate::resolve_child_path("/", path).map_err(map_component_fs_path_error_to_wasmtime)?;
+        crate::resolve_guest_path("/", path).map_err(map_component_fs_path_error_to_wasmtime)?;
     let host_path = crate::guest_host_share_path(&absolute).map(str::to_owned);
     if let Some(host_path) = host_path {
         let host_service = accessor.with(|mut access| {
@@ -517,7 +541,7 @@ where
     HostFs: crate::HostFileSystem,
 {
     let absolute =
-        crate::resolve_child_path("/", path).map_err(map_component_fs_path_error_to_wasmtime)?;
+        crate::resolve_guest_path("/", path).map_err(map_component_fs_path_error_to_wasmtime)?;
     let host_path = crate::guest_host_share_path(&absolute).map(str::to_owned);
     if let Some(host_path) = host_path {
         let host_service = accessor.with(|mut access| {
@@ -594,6 +618,13 @@ fn map_fs_error_to_program_exec(error: FsErrorCode) -> crate::ProgramExecError {
 
 fn map_component_fs_path_error_to_wasmtime(error: crate::ComponentFsPathError) -> wasmtime::Error {
     wasmtime::Error::msg(error.to_string())
+}
+
+fn map_program_host_error(operation: &str, error: wasmtime::Error) -> crate::ProgramExecError {
+    crate::ProgramExecError {
+        kind: crate::ProgramExecErrorKind::Internal,
+        detail: format!("{operation} failed in program host: {error:#}"),
+    }
 }
 
 async fn run_system_component<CpuImpl, HostFs>(

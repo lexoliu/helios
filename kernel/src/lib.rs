@@ -24,6 +24,7 @@ mod executor;
 mod host_fs_client;
 mod host_share;
 mod instance;
+mod kernel_exception;
 mod log;
 mod observer;
 mod program_service;
@@ -51,7 +52,8 @@ pub use component_fs::{
     map_resource_table_error,
 };
 pub use component_fs_path::{
-    ComponentFsPathError, directory_prefix, parent_path, resolve_child_path,
+    ComponentFsPathError, directory_prefix, parent_path, resolve_absolute_path, resolve_child_path,
+    resolve_guest_path,
 };
 pub use component_host::{
     ChildExit, ChildHandle, ComponentBindingSet, ComponentHostProcessorRole, HostRuntimeState,
@@ -95,6 +97,9 @@ pub use host_share::{HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, guest_ho
 pub use instance::{
     InstanceExecutionTransition, InstanceId, InstanceRegistry, InstanceSnapshot,
     RegisteredInstance, allow_instance_resource_growth, record_instance_transition,
+};
+pub use kernel_exception::{
+    KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
 };
 pub use observer::{
     DEFAULT_TRACE_HISTORY_CAPACITY, StatsSample, TraceEvent, TraceField, TraceFilter, TraceHistory,

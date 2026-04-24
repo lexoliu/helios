@@ -40,6 +40,15 @@ pub fn build_component_engine_config(target: &str) -> Config {
     let mut config = build_target_engine_config(target);
     config.wasm_component_model(true);
     config.wasm_component_model_async(true);
+    config.wasm_simd(true);
+    config.wasm_relaxed_simd(true);
+    config.relaxed_simd_deterministic(false);
+    config.wasm_multi_memory(true);
+    config.wasm_memory64(true);
+    config.wasm_tail_call(true);
+    config.gc_support(true);
+    config.wasm_reference_types(true);
+    config.wasm_function_references(true);
     config.epoch_interruption(true);
     // CPython's class construction recurses deeply; the default
     // 512 KB stack is not enough. Give component instances an 8 MB

@@ -26,6 +26,11 @@ hal  <-  kernel  <-  {riscv, x86, hosted}  <-  inspector / programs
 - **`hosted/`** is a first-class backend that runs the same kernel on top of
   the host OS. It has the same restrictions as `riscv/` and `x86/`: adapter
   code only, no business logic.
+- **`hosted/`** exists for development and test coverage only. Do not use it
+  as a performance baseline, optimization profile, or evidence that a kernel
+  optimization is valid for real targets. Performance-sensitive runtime
+  decisions must be grounded in `riscv/`, `x86/`, or explicit target
+  capabilities.
 
 If a piece of logic could reasonably be shared between two backends, it
 belongs in `kernel/` (or `hal/` for contracts), not duplicated in the backend
@@ -53,6 +58,13 @@ crates.
   `hal/` immediately.
 - Do not leave legacy code for backwards compatibility. When a feature is
   removed, remove every related path in the same change.
+- Do not make unilateral architecture changes while debugging. If a failure
+  appears to involve a core subsystem, diagnose that subsystem directly instead
+  of replacing it with a different architecture.
+- Virtio is the current core I/O path. Do not replace virtio-backed boot,
+  block, network, host-share, or debug transport paths with IDE, emulated
+  legacy devices, ad-hoc host files, or other fallback I/O unless the user
+  explicitly approves that architectural change in the current task.
 - Prefer third-party crates over hand-rolled implementations when the crate
   is well maintained and no-std friendly.
 - Prefer generic types, `impl Trait`, and the type system over enum-based
@@ -75,7 +87,23 @@ crates.
 - The compiler is a kernel plugin: it is bootfs-provisioned, loaded during
   kernel startup, and trusted by the kernel for signed `cwasm` output.
 
-## 3.2 Naming
+## 3.2 Wasmtime runtime performance
+
+- The kernel must provide an internal exception/signal mechanism usable by
+  Wasmtime runtime code. Do not treat `Config::signals_based_traps(false)` as
+  a final solution; disabling signals-based traps removes important Wasmtime
+  performance paths such as guard-page bounds-check elimination and Winch
+  compatibility.
+- Wasmtime performance features such as typed function references, SIMD,
+  relaxed SIMD, and target ISA feature probing must remain correctly enabled
+  when the real target supports them.
+- Full x86 AVX/FMA/AVX512 enablement is an explicit TODO until the x86 kernel
+  provides OSXSAVE, XCR0 configuration, and XSAVE/XRSTOR state preservation.
+- `hosted/` must not be used as evidence for Wasmtime runtime performance
+  decisions. Runtime optimization choices must be based on real kernel targets
+  and explicit target capabilities.
+
+## 3.3 Naming
 
 - Directory names must not use the `helios` prefix. Use concise names such as
   `cli/` rather than `helios-cli/`.
@@ -125,6 +153,24 @@ paths, components).
   other input to the guest shell.
 - `vm` boots the selected architecture under QEMU, waits for the guest
   debugger component to come up, then drops into a `repl` session.
+- `helios-inspector vm --kernel-debug --gdb <endpoint>` is the supported QEMU
+  gdbstub path for symbol-level kernel debugging. Use `--gdb-wait` when the
+  debugger must attach before kernel entry. Use endpoints such as `tcp::1234`
+  with GDB (`target remote :1234`) or LLDB (`gdb-remote 1234`). Keep this path
+  working for both `riscv64` and `x86-64`.
+- `helios-inspector vm --debug` is the shortcut for local kernel debugging:
+  it enables the kernel debug profile, opens the default gdbstub, waits for
+  the debugger before kernel entry, keeps the runtime directory, and exposes
+  monitor/QMP sockets. Prefer this over hand-written QEMU invocations.
+- Inspector VM must expose practical diagnosis knobs for future work:
+  retained runtime directories, QEMU stdout/stderr logs, QEMU `-d` trace logs,
+  HMP monitor sockets, QMP sockets, CPU/accelerator overrides, and explicit
+  raw QEMU argument passthrough. Add missing shortcuts to inspector instead of
+  making developers repeat long manual QEMU commands.
+- When a QEMU VM appears stuck or silent, use the inspector/QEMU debug path
+  flexibly: inspect the QEMU process, gdbstub, kernel symbols, serial socket,
+  and QEMU logs before drawing conclusions. Do not replace real target
+  debugging with `hosted/` evidence.
 - Inspector ↔ guest communication must go through WIT RPC defined in
   `helios-inspector-protocol`, not through ad-hoc side channels.
 

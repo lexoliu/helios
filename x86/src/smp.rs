@@ -9,7 +9,7 @@ use bootloader_api::BootInfo;
 use core::arch::x86_64::__cpuid;
 use core::ops::Range;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use helios_hal::cpu::ProcessorId;
 use pci_types::ConfigRegionAccess;
 use x86::apic::x2apic::X2APIC;
@@ -27,6 +27,7 @@ use x86_64::structures::paging::{
 
 use crate::KERNEL_STACK_BYTES;
 use crate::debug_state;
+use crate::exceptions::ProcessorIdt;
 use crate::pci::LegacyPciConfigAccess;
 use crate::read_tsc;
 use crate::watchdog::X86Watchdog;
@@ -42,6 +43,8 @@ pub(crate) struct ProcessorRuntime {
     logical_id: u16,
     _reserved: u16,
     pub(crate) wasmtime_tls: AtomicPtr<u8>,
+    pub(crate) native_trap_handler: AtomicUsize,
+    pub(crate) exception_idt: ProcessorIdt,
     started: AtomicBool,
 }
 
@@ -131,6 +134,8 @@ pub(crate) fn build_boot_context(
             logical_id: 0,
             _reserved: 0,
             wasmtime_tls: AtomicPtr::new(core::ptr::null_mut()),
+            native_trap_handler: AtomicUsize::new(0),
+            exception_idt: ProcessorIdt::new(),
             started: AtomicBool::new(false),
         },
         stack_top: 0,
@@ -148,6 +153,8 @@ pub(crate) fn build_boot_context(
                 logical_id: (index + 1) as u16,
                 _reserved: 0,
                 wasmtime_tls: AtomicPtr::new(core::ptr::null_mut()),
+                native_trap_handler: AtomicUsize::new(0),
+                exception_idt: ProcessorIdt::new(),
                 started: AtomicBool::new(false),
             },
             stack_top: stack + KERNEL_STACK_BYTES,

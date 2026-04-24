@@ -31,6 +31,18 @@ pub fn resolve_child_path(base: &str, child: &str) -> Result<String, ComponentFs
     Ok(build_absolute_path(&segments))
 }
 
+pub fn resolve_guest_path(base: &str, path: &str) -> Result<String, ComponentFsPathError> {
+    if path.starts_with('/') {
+        return resolve_absolute_path(path);
+    }
+    resolve_child_path(base, path)
+}
+
+pub fn resolve_absolute_path(path: &str) -> Result<String, ComponentFsPathError> {
+    let segments = split_absolute_path(path)?;
+    Ok(build_absolute_path(&segments))
+}
+
 pub fn directory_prefix(path: &str) -> String {
     if path == "/" {
         return String::from("/");

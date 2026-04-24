@@ -12,6 +12,9 @@ use thiserror::Error;
 
 pub const TRAILER_MAGIC: &[u8; 8] = b"HLCWSG01";
 pub const TRAILER_VERSION: u8 = 1;
+pub const CWASM_NO_VMEM_MEMORY_GUARD_SIZE: u64 = 0;
+pub const CWASM_NO_VMEM_MEMORY_RESERVATION: u64 = 0;
+pub const CWASM_NO_VMEM_MEMORY_RESERVATION_FOR_GROWTH: u64 = 1 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]

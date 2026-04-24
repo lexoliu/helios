@@ -115,7 +115,9 @@ use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
 use helios_hal::{DeviceInventory, DmaModel, ProcessorStartupPolicy, ProcessorTopology};
-use helios_kernel::Timer;
+use helios_kernel::{
+    KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler, Timer,
+};
 use riscv::interrupt::Trap;
 use riscv::interrupt::supervisor::{Exception, Interrupt};
 use riscv_rt::entry;
@@ -296,6 +298,7 @@ struct HartRuntime {
     hart_id: ProcessorId,
     timer: Timer<RiscvCpu>,
     wasmtime_tls: Cell<*mut u8>,
+    native_trap_handler: Cell<Option<KernelNativeTrapHandler>>,
     debug_transport: Option<DebugTransport>,
     external_interrupts: Option<net::ExternalInterrupts>,
     program_service: Option<debug_state::ProgramService>,
@@ -604,6 +607,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         hart_id: current_hart,
         timer: kernel.timer(),
         wasmtime_tls: Cell::new(core::ptr::null_mut()),
+        native_trap_handler: Cell::new(None),
         debug_transport,
         external_interrupts,
         program_service: None,
@@ -813,6 +817,13 @@ extern "C" fn wasmtime_tls_set(ptr: *mut u8) {
     runtime.wasmtime_tls.set(ptr);
 }
 
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_init_traps(handler: KernelNativeTrapHandler) -> i32 {
+    let runtime = current_hart_runtime();
+    runtime.native_trap_handler.set(Some(handler));
+    0
+}
+
 unsafe fn configure_interrupts() {
     unsafe {
         trapframe::init();
@@ -826,11 +837,72 @@ unsafe fn configure_interrupts() {
 fn handle_exception(exception: Exception, tf: &TrapFrame) -> ! {
     let stval = riscv::register::stval::read();
     match trap_origin(tf) {
-        TrapOrigin::Kernel => panic!(
-            "kernel exception: {exception:?}, sepc={:#x}, stval={:#x}, tf={tf:#x?}",
-            tf.sepc, stval,
-        ),
+        TrapOrigin::Kernel => {
+            if dispatch_kernel_exception(exception, stval, tf) == KernelExceptionDispatch::Unhandled
+            {
+                panic!(
+                    "kernel exception: {exception:?}, sepc={:#x}, stval={:#x}, tf={tf:#x?}",
+                    tf.sepc, stval,
+                );
+            }
+            unreachable!("handled kernel exception returned to the RISC-V dispatcher")
+        }
         TrapOrigin::User => handle_user_exception(exception, stval, tf),
+    }
+}
+
+fn dispatch_kernel_exception(
+    exception: Exception,
+    stval: usize,
+    tf: &TrapFrame,
+) -> KernelExceptionDispatch {
+    let Some(handler) = current_hart_runtime().native_trap_handler.get() else {
+        return KernelExceptionDispatch::Unhandled;
+    };
+    let Some(cause) = kernel_exception_cause(exception) else {
+        return KernelExceptionDispatch::Unhandled;
+    };
+    KernelException {
+        cause,
+        instruction_pointer: tf.sepc,
+        frame_pointer: tf.general.s0,
+        faulting_address: kernel_exception_faulting_address(exception, stval),
+    }
+    .dispatch_to(handler)
+}
+
+fn kernel_exception_cause(exception: Exception) -> Option<KernelExceptionCause> {
+    match exception {
+        Exception::InstructionMisaligned
+        | Exception::InstructionFault
+        | Exception::InstructionPageFault => Some(KernelExceptionCause::InstructionFault),
+        Exception::IllegalInstruction => Some(KernelExceptionCause::IllegalInstruction),
+        Exception::Breakpoint => Some(KernelExceptionCause::Breakpoint),
+        Exception::LoadMisaligned
+        | Exception::LoadFault
+        | Exception::StoreMisaligned
+        | Exception::StoreFault
+        | Exception::LoadPageFault
+        | Exception::StorePageFault => Some(KernelExceptionCause::DataFault),
+        Exception::UserEnvCall | Exception::SupervisorEnvCall => None,
+    }
+}
+
+fn kernel_exception_faulting_address(exception: Exception, stval: usize) -> Option<usize> {
+    match exception {
+        Exception::InstructionMisaligned
+        | Exception::InstructionFault
+        | Exception::InstructionPageFault
+        | Exception::LoadMisaligned
+        | Exception::LoadFault
+        | Exception::StoreMisaligned
+        | Exception::StoreFault
+        | Exception::LoadPageFault
+        | Exception::StorePageFault => Some(stval),
+        Exception::IllegalInstruction
+        | Exception::Breakpoint
+        | Exception::UserEnvCall
+        | Exception::SupervisorEnvCall => None,
     }
 }
 

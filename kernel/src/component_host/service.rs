@@ -320,7 +320,7 @@ where
         exec_context: ProgramExecContext<CpuImpl, HostFs>,
         name: String,
         args: Vec<String>,
-        mut env: Vec<(String, String)>,
+        env: Vec<(String, String)>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
         rights: WasiRights,
@@ -329,7 +329,18 @@ where
         let component = self
             .load_component(&exec_context, &source, hint, exec_context.write_serial)
             .await?;
+        self.spawn_loaded(exec_context, name, args, env, component, rights)
+    }
 
+    fn spawn_loaded(
+        &self,
+        exec_context: ProgramExecContext<CpuImpl, HostFs>,
+        name: String,
+        args: Vec<String>,
+        mut env: Vec<(String, String)>,
+        component: Arc<crate::wasmtime_adapter::WasmtimeCompiledComponent>,
+        rights: WasiRights,
+    ) -> Result<ChildHandle, ProgramExecError> {
         // Three byte channels between parent and child.
         let (stdin_writer, stdin_reader) = crate::byte_channel();
         let (stdout_writer, stdout_reader) = crate::byte_channel();
@@ -409,9 +420,32 @@ where
         stdin: Vec<u8>,
         rights: WasiRights,
     ) -> Result<ExecResult, ProgramExecError> {
-        let mut child = self
-            .spawn(exec_context, name.into(), args, env, source, hint, rights)
+        let component = self
+            .load_component(&exec_context, &source, hint, exec_context.write_serial)
             .await?;
+        self.exec_loaded_buffered(
+            exec_context,
+            name.into(),
+            args,
+            env,
+            component,
+            stdin,
+            rights,
+        )
+        .await
+    }
+
+    async fn exec_loaded_buffered(
+        &self,
+        exec_context: ProgramExecContext<CpuImpl, HostFs>,
+        name: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        component: Arc<crate::wasmtime_adapter::WasmtimeCompiledComponent>,
+        stdin: Vec<u8>,
+        rights: WasiRights,
+    ) -> Result<ExecResult, ProgramExecError> {
+        let mut child = self.spawn_loaded(exec_context, name, args, env, component, rights)?;
 
         // Feed stdin in one shot, then close the writer to signal EOF.
         if let Some(writer) = child.take_stdin() {
@@ -506,6 +540,15 @@ where
                 Arc::from(trusted.payload().to_vec())
             }
         };
+        self.load_precompiled_component(payload, write_serial, started_at)
+    }
+
+    fn load_precompiled_component(
+        &self,
+        payload: Arc<[u8]>,
+        write_serial: fn(&[u8]),
+        started_at: u64,
+    ) -> Result<Arc<crate::wasmtime_adapter::WasmtimeCompiledComponent>, ProgramExecError> {
         if let Some(component) = self.inner.component_cache.lock().get(payload.as_ref()) {
             super::emit_stage_marker(write_serial, "program:compile-cache-hit");
             let now = monotonic_nanos(&self.inner.clock_cpu);
@@ -566,10 +609,16 @@ where
         hint: AotCompileHint,
     ) -> Result<Vec<u8>, ProgramExecError> {
         let compiler_artifact = self.read_compiler_plugin_artifact(exec_context)?;
+        let compiler_payload = trusted_bootfs_payload(&compiler_artifact)?;
+        let compiler_component = self.load_precompiled_component(
+            compiler_payload,
+            exec_context.write_serial,
+            monotonic_nanos(&self.inner.clock_cpu),
+        )?;
         let result = self
-            .exec_buffered(
+            .exec_loaded_buffered(
                 exec_context.clone(),
-                COMPILER_PLUGIN_PATH,
+                COMPILER_PLUGIN_PATH.into(),
                 Vec::from([
                     "compiler-plugin".into(),
                     "--target".into(),
@@ -581,8 +630,7 @@ where
                     COMPILER_PLUGIN_ROOT_KEY_ENV.into(),
                     trusted_root_signing_key_hex(),
                 )]),
-                ProgramSource::BootfsArtifact(compiler_artifact),
-                None,
+                compiler_component,
                 wasm.to_vec(),
                 WasiRights::empty(),
             )
@@ -737,6 +785,12 @@ fn map_artifact_trust_error(error: crate::ArtifactTrustError) -> ProgramExecErro
         kind: ProgramExecErrorKind::InvalidSignature,
         detail: error.to_string(),
     }
+}
+
+fn trusted_bootfs_payload(bytes: &[u8]) -> Result<Arc<[u8]>, ProgramExecError> {
+    let trusted = crate::trust_bootfs_artifact(crate::UntrustedCwasm::new(bytes))
+        .map_err(map_artifact_trust_error)?;
+    Ok(Arc::from(trusted.payload().to_vec()))
 }
 
 mod generated {

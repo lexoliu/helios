@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+mod exceptions;
 mod host_fs;
 mod pci;
 mod smp;
@@ -106,6 +107,7 @@ fn x86_kernel_main(boot_info: &'static mut BootInfo) -> ! {
         debug_state.clone(),
     );
     smp::activate_runtime(boot.bootstrap_runtime());
+    exceptions::install_for_current_processor();
     let mirror_to_uart = WATCHDOG_SELF_TEST_ENABLED;
     let console = serial_console(debug_state.clone(), mirror_to_uart);
     let cpu = X86Cpu::new(boot.platform());
@@ -148,6 +150,8 @@ fn enable_fpu_simd() {
 
         asm!("fninit", options(nostack, preserves_flags));
     }
+    // TODO(x86-avx): enable OSXSAVE, program XCR0, and preserve XSAVE state
+    // before advertising AVX/FMA/AVX512 to Wasmtime-generated code.
 }
 
 fn boot_physical_memory_offset(boot_info: &'static BootInfo) -> usize {
@@ -433,6 +437,7 @@ extern "C" fn secondary_start_rust(
     let boot = unsafe { &*boot };
     let runtime = unsafe { &*runtime };
     smp::activate_runtime(runtime);
+    exceptions::install_for_current_processor();
 
     let debug_state = boot.platform().debug_state();
     let console = serial_console(debug_state.clone(), WATCHDOG_SELF_TEST_ENABLED);
@@ -739,4 +744,12 @@ extern "C" fn wasmtime_tls_set(ptr: *mut u8) {
     smp::current_runtime()
         .wasmtime_tls
         .store(ptr, core::sync::atomic::Ordering::Release);
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_init_traps(handler: helios_kernel::KernelNativeTrapHandler) -> i32 {
+    smp::current_runtime()
+        .native_trap_handler
+        .store(handler as usize, core::sync::atomic::Ordering::Release);
+    0
 }

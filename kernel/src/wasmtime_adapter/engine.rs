@@ -6,7 +6,6 @@ use crate::CodegenPlatform;
 use wasmtime::component::{Component, Instance, TypedFunc};
 use wasmtime::{AsContextMut, CustomCodeMemory, Engine};
 
-const COMPONENT_MEMORY_RESERVATION_FOR_GROWTH: u64 = 1 << 20;
 const WASI_CLI_RUN_FUNC: &str = "run";
 
 struct PlatformCodeMemory<P> {
@@ -42,10 +41,12 @@ fn build_engine_for_platform<P: CodegenPlatform + Clone>(
     config.with_custom_code_memory(Some(Arc::new(PlatformCodeMemory {
         platform: platform.clone(),
     })));
-    config.signals_based_traps(false);
-    config.memory_guard_size(0);
-    config.memory_reservation(0);
-    config.memory_reservation_for_growth(COMPONENT_MEMORY_RESERVATION_FOR_GROWTH);
+    config.signals_based_traps(true);
+    config.memory_guard_size(helios_artifact::CWASM_NO_VMEM_MEMORY_GUARD_SIZE);
+    config.memory_reservation(helios_artifact::CWASM_NO_VMEM_MEMORY_RESERVATION);
+    config.memory_reservation_for_growth(
+        helios_artifact::CWASM_NO_VMEM_MEMORY_RESERVATION_FOR_GROWTH,
+    );
     config.memory_init_cow(false);
     Engine::new(&config)
 }
