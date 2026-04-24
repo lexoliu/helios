@@ -1,4 +1,11 @@
-use wasmtime::Config;
+use wasmtime::{Config, OptLevel, Strategy};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AotCompileHint {
+    Fast,
+    Balanced,
+    Performance,
+}
 
 pub fn build_target_engine_config(target: &str) -> Config {
     let mut config = Config::new();
@@ -30,5 +37,29 @@ pub fn build_component_engine_config(target: &str) -> Config {
     // Rust async frames that drive it).
     config.max_wasm_stack(8 * 1024 * 1024);
     config.async_stack_size(8 * 1024 * 1024);
+    config
+}
+
+pub fn build_component_aot_engine_config(target: &str, hint: AotCompileHint) -> Config {
+    let mut config = build_component_engine_config(target);
+    match hint {
+        AotCompileHint::Fast => {
+            config
+                .strategy(Strategy::Winch)
+                .unwrap_or_else(|error| panic!("failed to enable Winch strategy: {error:#}"));
+        }
+        AotCompileHint::Balanced => {
+            config
+                .strategy(Strategy::Cranelift)
+                .unwrap_or_else(|error| panic!("failed to enable Cranelift strategy: {error:#}"));
+            config.cranelift_opt_level(OptLevel::None);
+        }
+        AotCompileHint::Performance => {
+            config
+                .strategy(Strategy::Cranelift)
+                .unwrap_or_else(|error| panic!("failed to enable Cranelift strategy: {error:#}"));
+            config.cranelift_opt_level(OptLevel::Speed);
+        }
+    }
     config
 }

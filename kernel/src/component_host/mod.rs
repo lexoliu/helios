@@ -12,11 +12,10 @@ use core::task::{Context, Poll};
 use crate::WasiRights;
 use crate::{
     ComponentCache, ComponentNetworkService, ComponentOutputMode, ComponentOutputStreamKind,
-    ComponentStoreData, ComputePool, ComputePriority, DeadlinePollable, EmbeddedComponent,
-    ExecResult, ProgramExecError, ProgramExecErrorKind, RawMutex, RawMutexGuardResource,
-    RawMutexResource, RawRwLock, RawRwLockReadGuardResource, RawRwLockResource,
-    RawRwLockWriteGuardResource, SerialPortResource, elapsed_millis, emit_serial_stage_marker,
-    heap_stats, monotonic_nanos,
+    ComponentStoreData, DeadlinePollable, EmbeddedComponent, ExecResult, ProgramExecError,
+    ProgramExecErrorKind, RawMutex, RawMutexGuardResource, RawMutexResource, RawRwLock,
+    RawRwLockReadGuardResource, RawRwLockResource, RawRwLockWriteGuardResource, SerialPortResource,
+    elapsed_millis, emit_serial_stage_marker, heap_stats, monotonic_nanos,
 };
 use helios_hal::cpu::Cpu;
 use helios_hal::serial::ByteSerial;
@@ -27,10 +26,12 @@ use wasmtime::component::{
     ResourceType, StreamProducer, StreamReader, StreamResult,
 };
 use wasmtime::{self, Engine, Store, StoreContextMut};
-use wasmtime_wasi_io::{self};
+use wasmtime_wasi_io;
 
 use crate::wasmtime_adapter::bindings::debugger::bindings as debugger_bindings;
 use crate::wasmtime_adapter::bindings::program::bindings as program_bindings;
+use crate::wasmtime_adapter::config::AotCompileHint;
+use crate::wasmtime_adapter::wasi::bindings::filesystem::types::ErrorCode as FsErrorCode;
 use crate::{StatsSample, TraceEvent, TraceField, TraceFilter, TraceLevel, TraceValue};
 
 const SYNC_INSTANCE: &str = "helios:system/sync@0.1.0";
@@ -50,6 +51,7 @@ pub use service::{
     install_program_service_with_config, run_component_host_processor_forever,
     run_embedded_component_forever, run_program_workers_forever,
 };
+pub(crate) use service::{ProgramExecContext, ProgramSource};
 pub use topology::{
     ComponentHostProcessorRole, component_host_processor_role, component_host_processors_to_start,
     component_host_system_processor, component_host_worker_count, system_component_should_run_on,
@@ -285,9 +287,7 @@ macro_rules! impl_program_bindings {
                 let snapshot = accessor.with(|mut access| {
                     Ok::<_, wasmtime::Error>((
                         access.get().runtime_state.program_service(),
-                        crate::component_host::service::ProgramExecContext::from_store(
-                            access.get(),
-                        ),
+                        ProgramExecContext::from_store(access.get()),
                     ))
                 });
                 async move {
@@ -298,13 +298,18 @@ macro_rules! impl_program_bindings {
                             detail: "program spawn is unavailable on this machine".to_owned(),
                         }));
                     };
+                    let source = match read_program_source(accessor, &request.path).await? {
+                        Ok(source) => source,
+                        Err(error) => return Ok(Err($convert_error(error))),
+                    };
                     match service
                         .spawn(
                             context,
                             request.name,
                             request.args,
                             request.env,
-                            request.wasm,
+                            source,
+                            None,
                             WasiRights::empty(),
                         )
                         .await
@@ -338,9 +343,7 @@ macro_rules! impl_program_bindings {
                 let snapshot = accessor.with(|mut access| {
                     Ok::<_, wasmtime::Error>((
                         access.get().runtime_state.program_service(),
-                        crate::component_host::service::ProgramExecContext::from_store(
-                            access.get(),
-                        ),
+                        ProgramExecContext::from_store(access.get()),
                     ))
                 });
                 async move {
@@ -351,19 +354,95 @@ macro_rules! impl_program_bindings {
                             detail: "program exec is unavailable on this machine".to_owned(),
                         }));
                     };
+                    let source = match read_program_source(accessor, &request.path).await? {
+                        Ok(source) => source,
+                        Err(error) => return Ok(Err($convert_error(error))),
+                    };
+                    let hint = match request.hint {
+                        Some($bindings::helios::system::programs::AotHint::Fast) => {
+                            Some(AotCompileHint::Fast)
+                        }
+                        Some($bindings::helios::system::programs::AotHint::Balanced) => {
+                            Some(AotCompileHint::Balanced)
+                        }
+                        Some($bindings::helios::system::programs::AotHint::Performance) => {
+                            Some(AotCompileHint::Performance)
+                        }
+                        None => None,
+                    };
                     Ok(service
                         .exec_buffered(
                             context,
                             request.name,
                             request.args,
                             request.env,
-                            &request.wasm,
+                            source,
+                            hint,
                             request.stdin,
                             WasiRights::empty(),
                         )
                         .await
                         .map($convert_result)
                         .map_err($convert_error))
+                }
+            }
+
+            fn aot<T: Send>(
+                accessor: &Accessor<T, Self>,
+                request: $bindings::helios::system::programs::AotRequest,
+            ) -> impl core::future::Future<
+                Output = wasmtime::Result<
+                    Result<
+                        $bindings::helios::system::programs::AotResult,
+                        $bindings::helios::system::programs::ExecError,
+                    >,
+                >,
+            > + Send {
+                let snapshot = accessor.with(|mut access| {
+                    Ok::<_, wasmtime::Error>((
+                        access.get().runtime_state.program_service(),
+                        ProgramExecContext::from_store(access.get()),
+                    ))
+                });
+                async move {
+                    let (service, _context) = snapshot?;
+                    let Some(service) = service else {
+                        return Ok(Err($bindings::helios::system::programs::ExecError {
+                            kind: $bindings::helios::system::programs::ExecErrorKind::Unavailable,
+                            detail: "program AOT is unavailable on this machine".to_owned(),
+                        }));
+                    };
+                    let source = match read_program_source(accessor, &request.source_path).await? {
+                        Ok(source) => source,
+                        Err(error) => return Ok(Err($convert_error(error))),
+                    };
+                    let ProgramSource::RawWasm(wasm) = source else {
+                        return Ok(Err($bindings::helios::system::programs::ExecError {
+                            kind: $bindings::helios::system::programs::ExecErrorKind::InvalidHint,
+                            detail: "aot only accepts raw wasm inputs".to_owned(),
+                        }));
+                    };
+                    let hint = match request.hint {
+                        $bindings::helios::system::programs::AotHint::Fast => AotCompileHint::Fast,
+                        $bindings::helios::system::programs::AotHint::Balanced => {
+                            AotCompileHint::Balanced
+                        }
+                        $bindings::helios::system::programs::AotHint::Performance => {
+                            AotCompileHint::Performance
+                        }
+                    };
+                    let artifact = match service.aot(&wasm, hint) {
+                        Ok(artifact) => artifact,
+                        Err(error) => return Ok(Err($convert_error(error))),
+                    };
+                    if let Err(error) =
+                        write_program_artifact(accessor, &request.destination_path, &artifact).await?
+                    {
+                        return Ok(Err($convert_error(error)));
+                    }
+                    Ok(Ok($bindings::helios::system::programs::AotResult {
+                        destination_path: request.destination_path,
+                    }))
                 }
             }
         }
@@ -381,6 +460,141 @@ impl_program_bindings!(
     convert_program_launch_error
 );
 
+async fn read_program_source<T, CpuImpl, HostFs>(
+    accessor: &Accessor<T, HasSelf<StoreData<CpuImpl, HostFs>>>,
+    path: &str,
+) -> wasmtime::Result<Result<service::ProgramSource, crate::ProgramExecError>>
+where
+    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let absolute =
+        crate::resolve_child_path("/", path).map_err(map_component_fs_path_error_to_wasmtime)?;
+    let host_path = crate::guest_host_share_path(&absolute).map(str::to_owned);
+    if let Some(host_path) = host_path {
+        let host_service = accessor.with(|mut access| {
+            Ok::<_, wasmtime::Error>(access.get().runtime_state.host_filesystem_service())
+        })?;
+        let Some(host_service) = host_service else {
+            return Ok(Err(crate::ProgramExecError {
+                kind: crate::ProgramExecErrorKind::Unavailable,
+                detail: "host filesystem service is unavailable".into(),
+            }));
+        };
+        return Ok(host_service
+            .read_file(&host_path)
+            .await
+            .map(|bytes| classify_program_source(bytes, false))
+            .map_err(|error| crate::ProgramExecError {
+                kind: crate::ProgramExecErrorKind::InvalidPath,
+                detail: format!("failed to read {}: {error}", absolute),
+            }));
+    }
+
+    accessor.with(|mut access| {
+        let readonly = access
+            .get()
+            .filesystem()
+            .is_readonly_path(&absolute)
+            .map_err(map_fs_error_to_program_exec)?;
+        let bytes = access
+            .get()
+            .filesystem()
+            .read_program_file(&absolute)
+            .map_err(map_fs_error_to_program_exec)?;
+        Ok::<_, wasmtime::Error>(Ok(classify_program_source(bytes, readonly)))
+    })
+}
+
+async fn write_program_artifact<T, CpuImpl, HostFs>(
+    accessor: &Accessor<T, HasSelf<StoreData<CpuImpl, HostFs>>>,
+    path: &str,
+    bytes: &[u8],
+) -> wasmtime::Result<Result<(), crate::ProgramExecError>>
+where
+    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let absolute =
+        crate::resolve_child_path("/", path).map_err(map_component_fs_path_error_to_wasmtime)?;
+    let host_path = crate::guest_host_share_path(&absolute).map(str::to_owned);
+    if let Some(host_path) = host_path {
+        let host_service = accessor.with(|mut access| {
+            Ok::<_, wasmtime::Error>(access.get().runtime_state.host_filesystem_service())
+        })?;
+        let Some(host_service) = host_service else {
+            return Ok(Err(crate::ProgramExecError {
+                kind: crate::ProgramExecErrorKind::Unavailable,
+                detail: "host filesystem service is unavailable".into(),
+            }));
+        };
+        if let Err(truncate_error) = host_service.truncate_file(&host_path).await {
+            host_service
+                .create_file(&host_path)
+                .await
+                .map_err(|create_error| crate::ProgramExecError {
+                    kind: crate::ProgramExecErrorKind::InvalidPath,
+                    detail: format!(
+                        "failed to prepare {}: truncate={truncate_error}, create={create_error}",
+                        absolute
+                    ),
+                })?;
+        }
+        host_service
+            .write_file(&host_path, 0, bytes)
+            .await
+            .map_err(|error| crate::ProgramExecError {
+                kind: crate::ProgramExecErrorKind::InvalidPath,
+                detail: format!("failed to write {}: {error}", absolute),
+            })?;
+        return Ok(Ok(()));
+    }
+
+    accessor.with(|mut access| {
+        let now_nanos = access.get().now_nanos();
+        access
+            .get_mut()
+            .filesystem_mut()
+            .write_program_file(&absolute, bytes, now_nanos)
+            .map_err(map_fs_error_to_program_exec)?;
+        Ok::<_, wasmtime::Error>(Ok(()))
+    })
+}
+
+fn classify_program_source(bytes: Vec<u8>, readonly: bool) -> ProgramSource {
+    if crate::is_wasmc(&bytes) {
+        if readonly {
+            return ProgramSource::BootfsArtifact(bytes);
+        }
+        return ProgramSource::SignedArtifact(bytes);
+    }
+    ProgramSource::RawWasm(bytes)
+}
+
+fn map_fs_error_to_program_exec(error: FsErrorCode) -> crate::ProgramExecError {
+    let kind = match error {
+        FsErrorCode::NoEntry | FsErrorCode::NotDirectory | FsErrorCode::BadDescriptor => {
+            crate::ProgramExecErrorKind::InvalidPath
+        }
+        FsErrorCode::ReadOnly
+        | FsErrorCode::NotPermitted
+        | FsErrorCode::Exist
+        | FsErrorCode::IsDirectory
+        | FsErrorCode::IllegalByteSequence
+        | FsErrorCode::Invalid
+        | FsErrorCode::Overflow => crate::ProgramExecErrorKind::InvalidPath,
+        _ => crate::ProgramExecErrorKind::Internal,
+    };
+    crate::ProgramExecError {
+        kind,
+        detail: error.to_string(),
+    }
+}
+
+fn map_component_fs_path_error_to_wasmtime(error: crate::ComponentFsPathError) -> wasmtime::Error {
+    wasmtime::Error::msg(error.to_string())
+}
+
 async fn run_system_component<CpuImpl, HostFs>(
     component: EmbeddedComponent,
     world: ComponentBindingSet,
@@ -395,8 +609,8 @@ where
     HostFs: crate::HostFileSystem,
 {
     use crate::{
-        ComponentExecContext, ComponentExecutor, ComponentExitStatus, ComponentRuntimeEngine,
-        ComponentRuntimeFactory, ComponentWorld,
+        ComponentExecContext, ComponentExecutor, ComponentExitStatus, ComponentRuntimeFactory,
+        ComponentWorld,
     };
 
     let component_name = component.name();
@@ -418,11 +632,16 @@ where
 
     tracing::info!(
         component = component_name,
-        "compiling embedded system component"
+        "loading embedded system component artifact"
     );
-    let compiled = engine
-        .compile(component.bytes())
-        .map_err(DebuggerError::CompileComponent)?;
+    let trusted = crate::trust_bootfs_artifact(crate::UntrustedWasmc::new(component.bytes()))
+        .map_err(DebuggerError::TrustComponent)?;
+    let compiled = crate::wasmtime_adapter::WasmtimeCompiledComponent {
+        component: unsafe {
+            wasmtime::component::Component::deserialize(engine.raw(), trusted.payload())
+        }
+        .map_err(DebuggerError::LoadComponent)?,
+    };
     emit_stage_marker(write_serial, "component:ok");
 
     emit_stage_marker(write_serial, "instantiate:begin");
@@ -1400,8 +1619,14 @@ fn convert_launch_error(
             ProgramExecErrorKind::UnsupportedImport => {
                 debugger_bindings::helios::system::programs::ExecErrorKind::UnsupportedImport
             }
-            ProgramExecErrorKind::QueueSaturated => {
-                debugger_bindings::helios::system::programs::ExecErrorKind::QueueSaturated
+            ProgramExecErrorKind::InvalidSignature => {
+                debugger_bindings::helios::system::programs::ExecErrorKind::InvalidSignature
+            }
+            ProgramExecErrorKind::InvalidPath => {
+                debugger_bindings::helios::system::programs::ExecErrorKind::InvalidPath
+            }
+            ProgramExecErrorKind::InvalidHint => {
+                debugger_bindings::helios::system::programs::ExecErrorKind::InvalidHint
             }
             ProgramExecErrorKind::Unavailable => {
                 debugger_bindings::helios::system::programs::ExecErrorKind::Unavailable
@@ -1441,8 +1666,14 @@ fn convert_program_launch_error(
             ProgramExecErrorKind::UnsupportedImport => {
                 program_bindings::helios::system::programs::ExecErrorKind::UnsupportedImport
             }
-            ProgramExecErrorKind::QueueSaturated => {
-                program_bindings::helios::system::programs::ExecErrorKind::QueueSaturated
+            ProgramExecErrorKind::InvalidSignature => {
+                program_bindings::helios::system::programs::ExecErrorKind::InvalidSignature
+            }
+            ProgramExecErrorKind::InvalidPath => {
+                program_bindings::helios::system::programs::ExecErrorKind::InvalidPath
+            }
+            ProgramExecErrorKind::InvalidHint => {
+                program_bindings::helios::system::programs::ExecErrorKind::InvalidHint
             }
             ProgramExecErrorKind::Unavailable => {
                 program_bindings::helios::system::programs::ExecErrorKind::Unavailable
@@ -2467,8 +2698,10 @@ impl ByteSerial for MarkerSerial {
 enum DebuggerError {
     #[error("failed to initialize Wasmtime engine: {0}")]
     CreateEngine(wasmtime::Error),
-    #[error("failed to JIT-compile embedded debugger component: {0}")]
-    CompileComponent(wasmtime::Error),
+    #[error("failed to validate embedded debugger artifact: {0}")]
+    TrustComponent(crate::ArtifactTrustError),
+    #[error("failed to load embedded debugger component: {0}")]
+    LoadComponent(wasmtime::Error),
     #[error("failed to instantiate debugger component: {0}")]
     InstantiateComponent(wasmtime::Error),
     #[error("debugger component trapped: {0}")]

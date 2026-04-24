@@ -1232,6 +1232,71 @@ where
         Ok(node.contents[offset..end].to_vec())
     }
 
+    pub(crate) fn read_program_file(
+        &self,
+        path: &str,
+    ) -> core::result::Result<Vec<u8>, fs_types::ErrorCode> {
+        let node = self.get_node(path)?;
+        if node.kind != FsNodeKind::File {
+            return Err(fs_types::ErrorCode::IsDirectory);
+        }
+        Ok(node.contents.clone())
+    }
+
+    pub(crate) fn write_program_file(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        now_nanos: u64,
+    ) -> core::result::Result<(), fs_types::ErrorCode> {
+        if self.host_path(path).is_some() {
+            return Err(fs_types::ErrorCode::Unsupported);
+        }
+
+        match self.get_node_mut(path) {
+            Ok(node) => {
+                if node.kind != FsNodeKind::File {
+                    return Err(fs_types::ErrorCode::IsDirectory);
+                }
+                if node.readonly {
+                    return Err(fs_types::ErrorCode::ReadOnly);
+                }
+                node.contents.clear();
+                node.contents.extend_from_slice(bytes);
+                node.modified_nanos = now_nanos;
+                Ok(())
+            }
+            Err(fs_types::ErrorCode::NoEntry) => {
+                let parent = crate::parent_path(path);
+                let parent_node = self.get_node(parent)?;
+                if parent_node.kind != FsNodeKind::Directory {
+                    return Err(fs_types::ErrorCode::NotDirectory);
+                }
+                if parent_node.readonly {
+                    return Err(fs_types::ErrorCode::ReadOnly);
+                }
+                let inode = self.allocate_inode();
+                self.nodes.push(FsNode {
+                    path: path.to_owned(),
+                    kind: FsNodeKind::File,
+                    contents: bytes.to_vec(),
+                    inode,
+                    modified_nanos: now_nanos,
+                    readonly: false,
+                });
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn is_readonly_path(
+        &self,
+        path: &str,
+    ) -> core::result::Result<bool, fs_types::ErrorCode> {
+        Ok(self.get_node(path)?.readonly)
+    }
+
     pub(crate) fn write_at(
         &mut self,
         descriptor: &FsDescriptor,
@@ -1740,7 +1805,10 @@ impl ChannelStreamProducer {
         }
     }
 
-    pub(crate) fn new_with_completion(reader: crate::ByteReader, completion: oneshot::Sender<()>) -> Self {
+    pub(crate) fn new_with_completion(
+        reader: crate::ByteReader,
+        completion: oneshot::Sender<()>,
+    ) -> Self {
         Self {
             reader,
             pending: None,

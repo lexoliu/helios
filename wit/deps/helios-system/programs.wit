@@ -15,13 +15,19 @@ package helios:system@0.1.0;
 ///   for the RPC path where a remote inspector just wants one-shot
 ///   "run and give me the output" semantics and does not need streaming.
 ///
-/// Both end up running exactly the same component on exactly the same
-/// runtime — `exec` is just `spawn` + drain + wait, modelled at the
+/// Both end up running exactly the same executable image on exactly the
+/// same runtime. `exec` is just `spawn` + drain + wait, modelled at the
 /// interface boundary so the common case does not need to express
 /// streams in its wire format.
 interface programs {
   /// Stable identifier for a live wasm instance, used by the observer.
   type instance-id = u64;
+
+  enum aot-hint {
+    fast,
+    balanced,
+    performance,
+  }
 
   record spawn-request {
     /// User-visible instance name used for inspection and diagnostics.
@@ -31,18 +37,29 @@ interface programs {
     /// Environment variables presented to the child via
     /// `wasi:cli/environment`.
     env: list<tuple<string, string>>,
-    /// Raw wasm module bytes to JIT-compile and execute.
-    wasm: list<u8>,
+    /// Path to an executable the caller is allowed to access.
+    path: string,
   }
 
   record exec-request {
     name: string,
     args: list<string>,
     env: list<tuple<string, string>>,
-    wasm: list<u8>,
+    path: string,
     /// Bytes piped into the child's stdin. Empty means "stdin closes
     /// immediately".
     stdin: list<u8>,
+    hint: option<aot-hint>,
+  }
+
+  record aot-request {
+    source-path: string,
+    destination-path: string,
+    hint: aot-hint,
+  }
+
+  record aot-result {
+    destination-path: string,
   }
 
   record exec-output {
@@ -65,7 +82,9 @@ interface programs {
     invalid-binary,
     missing-entry,
     unsupported-import,
-    queue-saturated,
+    invalid-signature,
+    invalid-path,
+    invalid-hint,
     unavailable,
     internal,
   }
@@ -103,4 +122,7 @@ interface programs {
   /// Run a program to completion, returning its buffered stdout/stderr.
   /// Equivalent to `spawn` + drain output + `wait`.
   exec: async func(request: exec-request) -> result<exec-result, exec-error>;
+
+  /// Ahead-of-time compile a raw wasm input into a signed `wasmc` output.
+  aot: async func(request: aot-request) -> result<aot-result, exec-error>;
 }

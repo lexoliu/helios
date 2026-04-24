@@ -19,7 +19,6 @@ use crate::streams::{InputStream, OutputStream, close, pipe, shared_buffer_file,
 #[derive(Clone, Debug)]
 pub struct ResolvedProgram {
     pub path: String,
-    pub wasm: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,7 +208,7 @@ impl ShellPlatform for HeliosPlatform {
             name: request.resolved.path.clone(),
             args: request.args,
             env: request.env,
-            wasm: request.resolved.wasm,
+            path: request.resolved.path,
         })
         .await
         .map_err(|error| {

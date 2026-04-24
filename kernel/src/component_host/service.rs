@@ -1,40 +1,25 @@
 use super::*;
+use crate::wasmtime_adapter::config::AotCompileHint;
+use ed25519_dalek::SigningKey;
+use helios_artifact::sign_payload_with_key;
 use helios_hal::watchdog::Watchdog;
+use wasmparser::Parser;
+use wasmtime::Engine;
+use wasmtime::component::Component;
 
 const HELIOS_PROCESS_ID_ENV: &str = "HELIOS_PROCESS_ID";
 const PROGRAM_PHASE_HEARTBEAT_INTERVAL_NANOS: u64 = 5_000_000_000;
 
 #[derive(Clone, Copy)]
-pub struct ProgramServiceConfig {
-    compile_workers: usize,
-    drive_compile_inline: bool,
-}
+pub struct ProgramServiceConfig;
 
 impl ProgramServiceConfig {
-    pub const fn new(compile_workers: usize) -> Self {
-        Self {
-            compile_workers,
-            drive_compile_inline: true,
-        }
+    pub const fn new(_compile_workers: usize) -> Self {
+        Self
     }
 
-    pub const fn with_inline_compile_driver(mut self, drive_compile_inline: bool) -> Self {
-        self.drive_compile_inline = drive_compile_inline;
+    pub const fn with_inline_compile_driver(self, _drive_compile_inline: bool) -> Self {
         self
-    }
-
-    fn worker_count(self) -> usize {
-        self.compile_workers
-    }
-
-    fn drive_compile_inline(self) -> bool {
-        self.drive_compile_inline
-    }
-
-    fn reserved_stack_bytes(self) -> usize {
-        self.compile_workers
-            .checked_mul(WORKER_STACK_SIZE)
-            .unwrap_or_else(|| panic!("program service reserved stack bytes overflow"))
     }
 }
 
@@ -68,9 +53,6 @@ where
 {
     runtime: crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
     engine: crate::wasmtime_adapter::WasmtimeEngine,
-    compiler: ComputePool,
-    compile_priority: ComputePriority,
-    drive_compile_inline: bool,
     component_cache: Mutex<ComponentCache<crate::wasmtime_adapter::WasmtimeCompiledComponent>>,
     clock_cpu: CpuImpl,
     progress: helios_hal::watchdog::ProgressCounter,
@@ -83,6 +65,12 @@ struct ProgramSpawnRequest {
     args: Vec<String>,
     env: Vec<(String, String)>,
     rights: WasiRights,
+}
+
+pub(crate) enum ProgramSource {
+    RawWasm(Vec<u8>),
+    SignedArtifact(Vec<u8>),
+    BootfsArtifact(Vec<u8>),
 }
 
 fn spawn_program_phase_heartbeat<CpuImpl>(
@@ -238,20 +226,9 @@ where
         return service;
     }
 
-    assert!(
-        config.worker_count() != 0,
-        "program service requires at least one compile worker slot"
-    );
-
     let available_bytes = heap_stats().available_bytes();
-    let reserved_stack_bytes = config.reserved_stack_bytes();
-    let cache_budget =
-        available_bytes.saturating_sub(reserved_stack_bytes) / COMPONENT_CACHE_FRACTION;
-    let compiler_budget = available_bytes
-        .saturating_sub(cache_budget)
-        .max(reserved_stack_bytes);
-    let compiler = ComputePool::new(config.worker_count(), WORKER_STACK_SIZE, compiler_budget)
-        .unwrap_or_else(|error| panic!("failed to create launched-program compute pool: {error}"));
+    let _ = config;
+    let cache_budget = available_bytes / COMPONENT_CACHE_FRACTION;
     let runtime = crate::wasmtime_adapter::WasmtimeComponentRuntime::new(cpu.clone());
     let engine = <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as crate::ComponentRuntimeFactory<CpuImpl, HostRuntimeState<CpuImpl, HostFs>, HostFs>>::create_engine(&runtime)
         .unwrap_or_else(|error| panic!("failed to create launched-program engine: {error:#}"));
@@ -259,9 +236,6 @@ where
         inner: Arc::new(UserProgramServiceInner {
             runtime,
             engine,
-            compiler,
-            compile_priority: ComputePriority::NORMAL,
-            drive_compile_inline: config.drive_compile_inline(),
             component_cache: Mutex::new(ComponentCache::new(cache_budget)),
             clock_cpu: cpu.clone(),
             progress: kernel.spawner().progress_counter(),
@@ -315,23 +289,14 @@ where
 pub fn run_program_workers_forever<CpuImpl, HostFs, WatchdogImpl>(
     _cpu: CpuImpl,
     kernel: crate::Kernel<CpuImpl, WatchdogImpl>,
-    debug_state: HostRuntimeState<CpuImpl, HostFs>,
+    _debug_state: HostRuntimeState<CpuImpl, HostFs>,
 ) -> !
 where
     CpuImpl: Cpu + crate::CodegenPlatform + Clone,
     HostFs: crate::HostFileSystem,
     WatchdogImpl: Watchdog + Clone,
 {
-    kernel.run_local_future(async move {
-        let service = debug_state.wait_for_program_service().await;
-        loop {
-            if service.run_next_compile_job() {
-                continue;
-            }
-
-            service.wait_for_compile_work().await;
-        }
-    })
+    kernel.run()
 }
 
 pub fn run_component_host_processor_forever<CpuImpl, HostFs, WatchdogImpl>(
@@ -366,9 +331,6 @@ where
                 write_serial,
             );
         }
-        ComponentHostProcessorRole::ProgramWorker => {
-            run_program_workers_forever(cpu, kernel, debug_state);
-        }
     }
 }
 
@@ -381,14 +343,6 @@ where
         self.inner.engine.increment_epoch();
     }
 
-    fn run_next_compile_job(&self) -> bool {
-        self.inner.compiler.run_next()
-    }
-
-    async fn wait_for_compile_work(&self) {
-        self.inner.compiler.wait_for_work().await;
-    }
-
     /// Spawn a new child program. The returned handle gives the caller
     /// direct access to the child's stdin/stdout/stderr channels and a
     /// future resolving with its exit status.
@@ -398,12 +352,13 @@ where
         name: String,
         args: Vec<String>,
         mut env: Vec<(String, String)>,
-        wasm: alloc::vec::Vec<u8>,
+        source: ProgramSource,
+        hint: Option<AotCompileHint>,
         rights: WasiRights,
     ) -> Result<ChildHandle, ProgramExecError> {
         super::emit_stage_marker(exec_context.write_serial, "program:spawn-begin");
         let component = self
-            .compile_component(&wasm, exec_context.write_serial)
+            .load_component(&source, hint, exec_context.write_serial)
             .await?;
 
         // Three byte channels between parent and child.
@@ -480,12 +435,13 @@ where
         name: impl Into<String>,
         args: Vec<String>,
         env: Vec<(String, String)>,
-        wasm: &[u8],
+        source: ProgramSource,
+        hint: Option<AotCompileHint>,
         stdin: Vec<u8>,
         rights: WasiRights,
     ) -> Result<ExecResult, ProgramExecError> {
         let mut child = self
-            .spawn(exec_context, name.into(), args, env, wasm.to_vec(), rights)
+            .spawn(exec_context, name.into(), args, env, source, hint, rights)
             .await?;
 
         // Feed stdin in one shot, then close the writer to signal EOF.
@@ -530,83 +486,76 @@ where
         })
     }
 
-    async fn compile_component(
+    pub(crate) fn aot(
         &self,
         wasm: &[u8],
+        hint: AotCompileHint,
+    ) -> Result<Vec<u8>, ProgramExecError> {
+        self.compile_raw_component_to_signed_artifact(wasm, hint)
+    }
+
+    async fn load_component(
+        &self,
+        source: &ProgramSource,
+        hint: Option<AotCompileHint>,
         write_serial: fn(&[u8]),
     ) -> Result<Arc<crate::wasmtime_adapter::WasmtimeCompiledComponent>, ProgramExecError> {
         let started_at = monotonic_nanos(&self.inner.clock_cpu);
-        if let Some(component) = self.inner.component_cache.lock().get(wasm) {
+        let trusted = match source {
+            ProgramSource::SignedArtifact(bytes) => {
+                let trusted = crate::verify_signed_artifact(crate::UntrustedWasmc::new(bytes))
+                    .map_err(map_artifact_trust_error)?;
+                if hint.is_some() {
+                    return Err(ProgramExecError {
+                        kind: ProgramExecErrorKind::InvalidHint,
+                        detail: "exec hint is not allowed for signed wasmc inputs".into(),
+                    });
+                }
+                trusted
+            }
+            ProgramSource::BootfsArtifact(bytes) => {
+                let trusted = crate::trust_bootfs_artifact(crate::UntrustedWasmc::new(bytes))
+                    .map_err(map_artifact_trust_error)?;
+                if hint.is_some() {
+                    return Err(ProgramExecError {
+                        kind: ProgramExecErrorKind::InvalidHint,
+                        detail: "exec hint is not allowed for signed wasmc inputs".into(),
+                    });
+                }
+                trusted
+            }
+            ProgramSource::RawWasm(wasm) => {
+                let hint = hint.unwrap_or(AotCompileHint::Balanced);
+                let signed = self.compile_raw_component_to_signed_artifact(wasm, hint)?;
+                crate::verify_signed_artifact(crate::UntrustedWasmc::new(&signed))
+                    .map_err(map_artifact_trust_error)?
+            }
+        };
+        let payload = trusted.payload();
+        if let Some(component) = self.inner.component_cache.lock().get(payload) {
             super::emit_stage_marker(write_serial, "program:compile-cache-hit");
             let now = monotonic_nanos(&self.inner.clock_cpu);
             tracing::info!(
                 target: "helios_component_host::program_host",
                 phase = "compile-component",
                 cache = "hit",
-                wasm_bytes = wasm.len(),
+                wasm_bytes = payload.len(),
                 elapsed_ms = elapsed_millis(started_at, now),
                 "program component cache hit"
             );
             return Ok(component);
         }
 
-        let wasm = Arc::<[u8]>::from(wasm.to_vec());
+        let payload = Arc::<[u8]>::from(payload.to_vec());
         super::emit_stage_marker(write_serial, "program:compile-begin");
         tracing::info!(
             target: "helios_component_host::program_host",
             phase = "compile-component",
             cache = "miss",
-            wasm_bytes = wasm.len(),
-            "program component compilation started"
+            wasm_bytes = payload.len(),
+            "program component deserialization started"
         );
-        let compile_done = Arc::new(core::sync::atomic::AtomicBool::new(false));
-        spawn_program_phase_heartbeat(
-            &self.inner.spawner,
-            &self.inner.clock_cpu,
-            &self.inner.progress,
-            write_serial,
-            "compile",
-            started_at,
-            &compile_done,
-        );
-        let compile = self.inner.compiler.spawn(self.inner.compile_priority, {
-            let engine = self.inner.engine.clone();
-            let wasm = wasm.clone();
-            let write_serial = write_serial;
-            move || {
-                use crate::ComponentRuntimeEngine;
-                super::emit_stage_marker(write_serial, "program:compile-worker-begin");
-                let compiled = engine.compile(&wasm);
-                super::emit_stage_marker(write_serial, "program:compile-worker-end");
-                compiled
-            }
-        });
-        let compiled = if self.inner.drive_compile_inline {
-            let mut compile = core::pin::pin!(compile);
-            core::future::poll_fn(|cx| match compile.as_mut().poll(cx) {
-                core::task::Poll::Ready(result) => core::task::Poll::Ready(result),
-                core::task::Poll::Pending => {
-                    if self.inner.compiler.run_next() {
-                        cx.waker().wake_by_ref();
-                    }
-                    core::task::Poll::Pending
-                }
-            })
-            .await
-        } else {
-            compile.await
-        };
-        compile_done.store(true, core::sync::atomic::Ordering::Release);
-        let compiled = compiled
-        .map_err(|error| ProgramExecError {
-            kind: ProgramExecErrorKind::QueueSaturated,
-            detail: error.to_string(),
-        })?
-        .map_err(|error: wasmtime::Error| ProgramExecError {
-            kind: ProgramExecErrorKind::InvalidBinary,
-            detail: format!("{error:#}"),
-        })?;
-
+        let compiled = self.deserialize_component(payload.as_ref())?;
         super::emit_stage_marker(write_serial, "program:compile-end");
         let component = Arc::new(compiled);
         let now = monotonic_nanos(&self.inner.clock_cpu);
@@ -614,7 +563,7 @@ where
             target: "helios_component_host::program_host",
             phase = "compile-component",
             cache = "miss",
-            wasm_bytes = wasm.len(),
+            wasm_bytes = payload.len(),
             elapsed_ms = elapsed_millis(started_at, now),
             "program component compiled"
         );
@@ -622,7 +571,53 @@ where
             .inner
             .component_cache
             .lock()
-            .insert_if_missing(wasm, component))
+            .insert_if_missing(payload, component))
+    }
+
+    fn deserialize_component(
+        &self,
+        payload: &[u8],
+    ) -> Result<crate::wasmtime_adapter::WasmtimeCompiledComponent, ProgramExecError> {
+        let component = unsafe { Component::deserialize(self.inner.engine.raw(), payload) }
+            .map_err(|error| ProgramExecError {
+                kind: ProgramExecErrorKind::InvalidBinary,
+                detail: format!("{error:#}"),
+            })?;
+        Ok(crate::wasmtime_adapter::WasmtimeCompiledComponent { component })
+    }
+
+    fn compile_raw_component_to_signed_artifact(
+        &self,
+        wasm: &[u8],
+        hint: AotCompileHint,
+    ) -> Result<Vec<u8>, ProgramExecError> {
+        if !Parser::is_component(wasm) {
+            return Err(ProgramExecError {
+                kind: ProgramExecErrorKind::InvalidBinary,
+                detail: "raw core wasm programs are not supported on the component program service"
+                    .into(),
+            });
+        }
+        let config = crate::wasmtime_adapter::config::build_component_aot_engine_config(
+            env!("HELIOS_BUILD_TARGET"),
+            hint,
+        );
+        let engine = Engine::new(&config).map_err(|error| ProgramExecError {
+            kind: ProgramExecErrorKind::Internal,
+            detail: format!("failed to create component AOT engine: {error:#}"),
+        })?;
+        let payload = engine
+            .precompile_component(wasm)
+            .map_err(|error| ProgramExecError {
+                kind: ProgramExecErrorKind::InvalidBinary,
+                detail: format!("{error:#}"),
+            })?;
+        sign_payload_with_key(&payload, &trusted_root_signing_key()).map_err(|error| {
+            ProgramExecError {
+                kind: ProgramExecErrorKind::Internal,
+                detail: error.to_string(),
+            }
+        })
     }
 }
 
@@ -731,4 +726,19 @@ fn map_program_runtime_error(error: impl core::fmt::Display) -> ProgramExecError
         kind: ProgramExecErrorKind::Internal,
         detail: format!("{error:#}"),
     }
+}
+
+fn map_artifact_trust_error(error: crate::ArtifactTrustError) -> ProgramExecError {
+    ProgramExecError {
+        kind: ProgramExecErrorKind::InvalidSignature,
+        detail: error.to_string(),
+    }
+}
+
+fn trusted_root_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&generated::TRUSTED_ROOT_SIGNING_KEY)
+}
+
+mod generated {
+    include!(concat!(env!("OUT_DIR"), "/trusted_signing_key.rs"));
 }

@@ -41,6 +41,10 @@ impl WasmtimeEngine {
     pub(crate) fn increment_epoch(&self) {
         self.engine.increment_epoch();
     }
+
+    pub(crate) fn raw(&self) -> &Engine {
+        &self.engine
+    }
 }
 
 impl ComponentRuntimeEngine for WasmtimeEngine {

@@ -18,6 +18,7 @@ use brush_parser::word::{
 use futures::channel::oneshot;
 use glob::{MatchOptions, Pattern};
 
+use crate::HELIOS_PROCESS_ID_ENV;
 use crate::builtin;
 use crate::error::{Result, ShellError};
 use crate::ifs::{DEFAULT_IFS, IfsConfig};
@@ -25,7 +26,6 @@ use crate::options::ShellOptions;
 use crate::parser;
 use crate::platform::{ResolvedProgram, RunningProcess, ShellPlatform, SpawnRequest, WriteMode};
 use crate::streams::{InputStream, OutputStream, capture_output, close, write_all};
-use crate::HELIOS_PROCESS_ID_ENV;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Variable {
@@ -1213,10 +1213,9 @@ where
             .and_then(|variable| variable.value.as_deref())
             .unwrap_or("/bin");
         for candidate in candidate_paths(&self.working_dir, input, search_path) {
-            if let Ok(wasm) = self.platform.read_file(&candidate).await {
+            if self.platform.is_file(&candidate).await {
                 return Ok(ResolvedProgram {
                     path: display_path(&candidate),
-                    wasm,
                 });
             }
         }

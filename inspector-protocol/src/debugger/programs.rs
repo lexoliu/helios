@@ -8,8 +8,6 @@ use anyhow::Result;
 #[cfg(feature = "host")]
 use futures_io::{AsyncRead, AsyncWrite};
 #[cfg(feature = "guest")]
-use helios_api::fs;
-#[cfg(feature = "guest")]
 use helios_api::programs as host_programs;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "guest")]
@@ -68,15 +66,13 @@ pub(crate) async fn dispatch(func: &str, payload: &[u8]) -> Result<Vec<u8>> {
             let request = postcard::from_bytes::<ExecPathRequest>(payload)
                 .context("failed to decode debugger programs.exec-path request payload")?;
             let path = validate_program_path(Path::new(&request.path))?;
-            let wasm = fs::read(&request.path)
-                .await
-                .with_context(|| format!("failed to read executable {}", request.path))?;
             let response = host_programs::exec(host_programs::ExecRequest {
                 name: path.to_string_lossy().into_owned(),
                 args: request.args,
                 env: Vec::new(),
-                wasm,
+                path: request.path,
                 stdin: Vec::new(),
+                hint: None,
             })
             .await
             .map(|result| ExecResult {
@@ -104,7 +100,9 @@ fn convert_exec_error_kind(kind: host_programs::ExecErrorKind) -> ExecErrorKind 
         host_programs::ExecErrorKind::InvalidBinary => ExecErrorKind::InvalidBinary,
         host_programs::ExecErrorKind::MissingEntry => ExecErrorKind::MissingEntry,
         host_programs::ExecErrorKind::UnsupportedImport => ExecErrorKind::UnsupportedImport,
-        host_programs::ExecErrorKind::QueueSaturated => ExecErrorKind::QueueSaturated,
+        host_programs::ExecErrorKind::InvalidSignature => ExecErrorKind::InvalidSignature,
+        host_programs::ExecErrorKind::InvalidPath => ExecErrorKind::InvalidPath,
+        host_programs::ExecErrorKind::InvalidHint => ExecErrorKind::InvalidHint,
         host_programs::ExecErrorKind::Unavailable => ExecErrorKind::Unavailable,
         host_programs::ExecErrorKind::Internal => ExecErrorKind::Internal,
     }

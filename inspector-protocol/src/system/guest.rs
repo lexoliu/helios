@@ -113,8 +113,9 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>>
                 name: request.name,
                 args: request.args,
                 env: Vec::new(),
-                wasm: request.wasm,
+                path: request.path,
                 stdin: Vec::new(),
+                hint: request.hint,
             })
             .await;
             let response = response
@@ -173,7 +174,9 @@ fn convert_launch_error_kind(kind: host_programs::ExecErrorKind) -> programs::Ex
         host_programs::ExecErrorKind::UnsupportedImport => {
             programs::ExecErrorKind::UnsupportedImport
         }
-        host_programs::ExecErrorKind::QueueSaturated => programs::ExecErrorKind::QueueSaturated,
+        host_programs::ExecErrorKind::InvalidSignature => programs::ExecErrorKind::InvalidSignature,
+        host_programs::ExecErrorKind::InvalidPath => programs::ExecErrorKind::InvalidPath,
+        host_programs::ExecErrorKind::InvalidHint => programs::ExecErrorKind::InvalidHint,
         host_programs::ExecErrorKind::Unavailable => programs::ExecErrorKind::Unavailable,
         host_programs::ExecErrorKind::Internal => programs::ExecErrorKind::Internal,
     }

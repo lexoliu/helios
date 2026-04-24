@@ -16,7 +16,6 @@ mod component_resources;
 mod component_runtime;
 mod component_runtime_backend;
 mod component_types;
-mod compute_pool;
 mod embedded_component;
 mod embedded_init;
 mod embedded_program;
@@ -26,7 +25,6 @@ mod host_share;
 mod instance;
 mod log;
 mod observer;
-mod program;
 mod program_service;
 mod recording_console;
 mod runtime_state;
@@ -38,6 +36,7 @@ mod time;
 mod timer;
 mod unsupported_host_fs;
 mod wasi_rights;
+mod wasmc;
 pub(crate) mod wasmtime_adapter;
 
 pub use bootfs::{
@@ -79,7 +78,6 @@ pub use component_types::{
     RawMutexGuardResource, RawMutexResource, RawRwLockReadGuardResource, RawRwLockResource,
     RawRwLockWriteGuardResource, SerialPortResource, TcpStreamResource, UdpSocketResource,
 };
-pub use compute_pool::{ComputePool, ComputePriority, SpawnError as ComputeSpawnError};
 pub use embedded_component::EmbeddedComponent;
 pub use embedded_init::{
     EmbeddedInit, embedded_boot_component, embedded_init, embedded_system_component,
@@ -98,13 +96,7 @@ pub use observer::{
     DEFAULT_TRACE_HISTORY_CAPACITY, StatsSample, TraceEvent, TraceField, TraceFilter, TraceHistory,
     TraceLevel, TraceValue, matches_trace_filter, parse_console_text,
 };
-pub use program::{
-    Blueprint, CompileError as ProgramCompileError, ExitCode, ProgramRuntime,
-    ProgramRuntimeBackend, ProgramRuntimeConfig, ProgramRuntimeDriver, ProgramRuntimeDriverBackend,
-    ProgramRuntimeError, ProgramRuntimeInitError, ProgramTask, ResourceTable,
-    RunError as ProgramRunError, Task,
-};
-pub use program_service::{ProgramExecError, ProgramExecErrorKind, ProgramService};
+pub use program_service::{ProgramExecError, ProgramExecErrorKind};
 pub use recording_console::RecordingConsole;
 pub use runtime_state::RuntimeState;
 pub use runtime_types::{
@@ -127,6 +119,10 @@ pub use time::{duration_to_ticks, elapsed_millis, monotonic_nanos};
 pub use timer::{Sleep, Timer};
 pub use unsupported_host_fs::UnsupportedHostFileSystem;
 pub use wasi_rights::WasiRights;
+pub use wasmc::{
+    ArtifactTrustError, TrustedWasmc, UntrustedWasm, UntrustedWasmc, is_wasmc,
+    trust_bootfs_artifact, trusted_root_public_keys, verify_signed_artifact,
+};
 // Wasmtime-specific helpers are crate-internal only.
 // External consumers use the ComponentRuntimeFactory trait.
 

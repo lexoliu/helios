@@ -3,7 +3,8 @@
 //! `spawn` is the low-level entry point: it launches a wasm program and
 //! returns a handle whose `stdin`/`stdout`/`stderr` are byte streams that
 //! can be piped from/into anything that speaks `wasi:io`. `exec` is the
-//! convenience "run to completion with buffered output" wrapper.
+//! convenience "run to completion with buffered output" wrapper, and `aot`
+//! produces a signed `wasmc` artifact at a caller-chosen destination path.
 
 use crate::bindings::helios::system::programs as raw;
 use crate::bindings::wit_stream;
@@ -11,8 +12,8 @@ use crate::wit_bindgen::{FutureReader, StreamReader};
 use futures_lite::future::zip;
 
 pub use crate::bindings::helios::system::programs::{
-    ExecError, ExecErrorKind, ExecOutput, ExecRequest, ExecResult, ExitStatus, SpawnError,
-    SpawnErrorKind, SpawnRequest,
+    AotHint, AotRequest, AotResult, ExecError, ExecErrorKind, ExecOutput, ExecRequest, ExecResult,
+    ExitStatus, SpawnError, SpawnErrorKind, SpawnRequest,
 };
 
 /// Owned handle to a spawned child wasm program.
@@ -103,8 +104,8 @@ async fn drain_stream(pair: (StreamReader<u8>, FutureReader<Result<(), ()>>)) ->
     collected
 }
 
-/// Launches a pure wasm program with the kernel's default minimal rights
-/// and waits for it to finish, collecting its stdout/stderr buffers.
+/// Launch a program by path and wait for it to finish, collecting its
+/// stdout/stderr buffers.
 pub async fn exec(request: ExecRequest) -> Result<ExecResult, ExecError> {
     raw::exec(request).await
 }
@@ -112,4 +113,9 @@ pub async fn exec(request: ExecRequest) -> Result<ExecResult, ExecError> {
 /// Spawn a program and return the live handle.
 pub async fn spawn(request: SpawnRequest) -> Result<Child, SpawnError> {
     Child::spawn(request).await
+}
+
+/// Ahead-of-time compile a raw wasm program into a signed `wasmc` file.
+pub async fn aot(request: AotRequest) -> Result<AotResult, ExecError> {
+    raw::aot(request).await
 }

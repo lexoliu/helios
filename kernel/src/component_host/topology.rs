@@ -5,7 +5,6 @@ pub enum ComponentHostProcessorRole {
     Kernel,
     SharedRuntime,
     SystemComponent,
-    ProgramWorker,
 }
 
 pub fn component_host_system_processor(
@@ -52,9 +51,6 @@ pub fn component_host_processor_role(
     if system_component_should_run_on(current_processor, processor_count, bootstrap_processor) {
         return ComponentHostProcessorRole::SystemComponent;
     }
-    if processor_count > 2 {
-        return ComponentHostProcessorRole::ProgramWorker;
-    }
     ComponentHostProcessorRole::Kernel
 }
 
@@ -62,13 +58,9 @@ pub fn component_host_worker_count(
     processor_count: usize,
     bootstrap_processor: ProcessorId,
 ) -> usize {
-    (0..processor_count)
-        .map(|processor| ProcessorId::new(processor as u16))
-        .filter(|&processor| {
-            component_host_processor_role(processor, processor_count, bootstrap_processor)
-                == ComponentHostProcessorRole::ProgramWorker
-        })
-        .count()
+    let _ = processor_count;
+    let _ = bootstrap_processor;
+    0
 }
 
 /// Returns an iterator of processor IDs that need to be started for the
@@ -84,7 +76,6 @@ pub fn component_host_processors_to_start(
                 && matches!(
                     component_host_processor_role(processor, processor_count, bootstrap_processor),
                     ComponentHostProcessorRole::SystemComponent
-                        | ComponentHostProcessorRole::ProgramWorker
                 )
         })
 }
@@ -138,8 +129,8 @@ mod tests {
         );
         assert_eq!(
             component_host_processor_role(ProcessorId::new(2), 4, ProcessorId::new(0)),
-            ComponentHostProcessorRole::ProgramWorker
+            ComponentHostProcessorRole::Kernel
         );
-        assert_eq!(component_host_worker_count(4, ProcessorId::new(0)), 2);
+        assert_eq!(component_host_worker_count(4, ProcessorId::new(0)), 0);
     }
 }

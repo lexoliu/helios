@@ -17,9 +17,8 @@ hal  <-  kernel  <-  {riscv, x86, hosted}  <-  inspector / programs
   capability types, and value types. It must not contain concrete drivers or
   runtime logic.
 - **`kernel/`** contains all hardware-independent runtime logic: the executor,
-  timer, compute pool, component host, observer, capability resources,
-  host-fs client, and every WIT service implementation. It is `#![no_std]` and
-  generic over `Cpu`.
+  timer, component host, observer, capability resources, host-fs client, and
+  every WIT service implementation. It is `#![no_std]` and generic over `Cpu`.
 - **`riscv/`** and **`x86/`** are concrete hardware adaptation layers. They
   are allowed to contain boot, trap, IRQ, timer, MMIO, UART, virtio, and SMP
   wiring — nothing else. They must not contain WIT worlds, RPC protocol
@@ -39,7 +38,7 @@ crates.
   adapter traits supplied by the backend (for example `CodegenPlatform` for
   JIT code publication and ISA feature probing).
 - Runtime consumers in `kernel/` depend on traits (for example
-  `ProgramRuntimeBackend`, `HostFileSystem`), not on concrete Wasmtime types.
+  `ComponentRuntimeFactory`, `HostFileSystem`), not on concrete Wasmtime types.
   Concrete runtimes are adapters that satisfy those traits.
 - Global mutable state is not allowed. State is passed explicitly through
   `Kernel<CpuImpl>`, `RuntimeState<…>`, and similar owned structures.
@@ -59,9 +58,29 @@ crates.
 - Prefer generic types, `impl Trait`, and the type system over enum-based
   type erasure or `dyn Trait` when the set of implementations is known at
   compile time.
+- Prefer `use` imports for repeated module, enum, and type paths. Do not keep
+  spelling long fully-qualified paths inline when a local import makes the
+  code clearer.
 - Use `thiserror` for error types. Use `tracing` for diagnostics; never
   `println!`.
 - Never use `#[path = "…"]` to pull source files across crate boundaries.
+
+## 3.1 Kernel plugins
+
+- `Kernel plugin` is the authoritative term for an ordinary user-mode wasm
+  program running inside Wasmtime with the normal runtime isolation model.
+- Kernel plugins are not a separate execution class. The distinction is in
+  provisioning and lifecycle management, not in a different runtime boundary.
+- Non-core kernel functionality may depend on kernel plugins.
+- The compiler is a kernel plugin: it is bootfs-provisioned, loaded during
+  kernel startup, and trusted by the kernel for signed `wasmc` output.
+
+## 3.2 Naming
+
+- Directory names must not use the `helios` prefix. Use concise names such as
+  `cli/` rather than `helios-cli/`.
+- Package and crate names may still use the `helios-` prefix when that matches
+  workspace naming conventions.
 
 ## 4. Async-first execution
 

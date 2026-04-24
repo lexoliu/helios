@@ -16,9 +16,15 @@ hardware support lives in thin adaptation crates.
 - **Architecture-neutral kernel.** `helios-kernel` is `#![no_std]` and generic
   over a `Cpu` implementation supplied by the backend crate. No `#[cfg(target_arch)]`
   branches leak into core logic.
+- **Trusted AOT-only program loading.** The kernel no longer JIT-compiles raw
+  wasm in place. It loads trusted `wasmc` artifacts whose payload is a native
+  Wasmtime precompiled ELF blob, optionally followed by a Helios signature
+  trailer that ordinary Wasmtime runtimes can ignore.
 - **Async-first runtime.** A small cooperative executor built on `async-task`
-  drives futures across processors, with a priority-aware compute pool for
-  Wasmtime compilation work.
+  drives futures across processors without a dedicated compile-worker pool.
+- **Kernel plugins.** Non-core kernel features may depend on `kernel plugins`:
+  ordinary user-mode wasm programs running in Wasmtime, isolated by the normal
+  runtime model, but provisioned and lifecycle-managed by the kernel.
 - **Capability-based resources.** `KernelResource<T, Rights>` carries its own
   rights set; derived handles can only narrow permissions, never widen them.
 - **Three backends.**
@@ -38,7 +44,9 @@ hardware support lives in thin adaptation crates.
 | Crate | Role |
 | --- | --- |
 | `hal/` | Architecture-neutral hardware traits (`Cpu`, `FileSystem`, `NetDriver`, …) |
-| `kernel/` | Hardware-independent runtime: executor, timer, compute pool, component host, capability resources |
+| `kernel/` | Hardware-independent runtime: executor, timer, component host, trusted artifact loading, capability resources |
+| `artifact/` | Shared `wasmc` trailer parsing, signing, and trust-boundary helpers |
+| `cli/` | CLI workspace member for offline AOT, signing, and kernel bootfs prebuilds |
 | `riscv/` | RISC-V 64 backend (boot, trap, virtio, UART) |
 | `x86/` | x86_64 backend (bootloader entry, SMP wakeup, serial, timer) |
 | `hosted/` | Hosted backend that runs the same kernel on a normal OS |
@@ -81,6 +89,10 @@ workspace dependency so the kernel can track Component Model / WASI 0.3 changes
 ahead of crates.io releases. Clone Wasmtime next to this repository before
 building.
 
+`helios-cli` is part of the build pipeline. It AOT-compiles the bootfs-managed
+kernel plugins and other boot artifacts before `helios-kernel` packages them
+into the embedded boot filesystem.
+
 ## Running
 
 The inspector launches a guest under QEMU and attaches over the guest's
@@ -105,6 +117,21 @@ that guest components use internally:
 
 See `docs/wasi-tools.md` for the reproducible workflow that builds and runs
 upstream WASI tools (Python, curl) against a shared host directory.
+
+## Kernel Plugins
+
+Helios uses `kernel plugin` as an architectural term for a very specific
+execution model:
+
+- A kernel plugin is a normal user-mode wasm program.
+- It runs inside Wasmtime like any other user program.
+- It is isolated by the normal runtime model rather than by a special kernel
+  execution class.
+- The kernel provisions it and controls its lifecycle.
+- Non-core kernel functionality may depend on kernel plugins.
+
+The compiler is one such kernel plugin. It is bootfs-provisioned, loaded early,
+and trusted by the kernel to emit signed `wasmc` artifacts for raw wasm inputs.
 
 ## Status
 

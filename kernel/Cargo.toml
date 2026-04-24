@@ -21,12 +21,15 @@ event-listener = { version = "5.4.1", default-features = false, features = ["cri
 futures = { version = "0.3.31", default-features = false, features = ["alloc"] }
 nu-ansi-term = { version = "0.50.3", default-features = false }
 objectpool = { version = "0.1.0", default-features = false, features = ["alloc"] }
+helios-artifact.workspace = true
 helios-hal.workspace = true
 thiserror = { version = "2.0.17", default-features = false }
 tracing.workspace = true
 bitflags = "2.11.0"
 lru = { version = "0.16.3", default-features = false, features = ["hashbrown"] }
 spin = { version = "0.9.8", default-features = false, features = ["mutex", "spin_mutex"] }
+ed25519-dalek = { version = "2.2.0", default-features = false, features = ["alloc"] }
+wasmparser = { version = "0.245.0", default-features = false }
 
 [dev-dependencies]
 critical-section = { version = "1.2.0", features = ["std"] }
@@ -39,11 +42,13 @@ toml = "0.8.23"
 walkdir = "2.5.0"
 wit-component = "0.245.0"
 wasmparser = "0.245.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
 
 [target.'cfg(target_os = "none")'.dependencies]
-wasmtime = { path = "../../wasmtime/crates/wasmtime", optional = true, default-features = false, features = ["call-hook", "component-model", "component-model-async", "cranelift", "runtime"] }
+wasmtime = { path = "../../wasmtime/crates/wasmtime", optional = true, default-features = false, features = ["call-hook", "component-model", "component-model-async", "cranelift", "runtime", "winch"] }
 wasmtime-wasi-io = { path = "../../wasmtime/crates/wasi-io", optional = true, default-features = false }
 
 [target.'cfg(not(target_os = "none"))'.dependencies]
-wasmtime = { path = "../../wasmtime/crates/wasmtime", optional = true, default-features = false, features = ["call-hook", "component-model", "component-model-async", "cranelift", "runtime", "std"] }
+wasmtime = { path = "../../wasmtime/crates/wasmtime", optional = true, default-features = false, features = ["call-hook", "component-model", "component-model-async", "cranelift", "runtime", "std", "winch"] }
 wasmtime-wasi-io = { path = "../../wasmtime/crates/wasi-io", optional = true }
