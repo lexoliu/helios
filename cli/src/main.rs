@@ -51,7 +51,7 @@ enum Commands {
     Aot(AotCommand),
     CompilerPlugin(CompilerPluginCommand),
     KernelPrebuild(KernelPrebuildCommand),
-    X86LimineUefiImage(X86LimineUefiImageCommand),
+    LimineUefiImage(LimineUefiImageCommand),
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -102,13 +102,21 @@ struct KernelPrebuildCommand {
 }
 
 #[derive(Parser)]
-struct X86LimineUefiImageCommand {
+struct LimineUefiImageCommand {
     #[arg(long)]
     kernel: PathBuf,
     #[arg(long)]
     output: PathBuf,
     #[arg(long)]
     baud: u32,
+    #[arg(long, value_enum)]
+    efi_arch: LimineEfiArch,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum LimineEfiArch {
+    X86_64,
+    Aarch64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -142,7 +150,7 @@ fn main() -> Result<()> {
         Commands::Aot(command) => run_aot(command),
         Commands::CompilerPlugin(command) => run_compiler_plugin(command),
         Commands::KernelPrebuild(command) => run_kernel_prebuild(command),
-        Commands::X86LimineUefiImage(command) => run_x86_limine_uefi_image(command),
+        Commands::LimineUefiImage(command) => run_limine_uefi_image(command),
     }
 }
 
@@ -247,19 +255,20 @@ fn run_kernel_prebuild(command: KernelPrebuildCommand) -> Result<()> {
     Ok(())
 }
 
-fn run_x86_limine_uefi_image(command: X86LimineUefiImageCommand) -> Result<()> {
+fn run_limine_uefi_image(command: LimineUefiImageCommand) -> Result<()> {
     let kernel = fs::canonicalize(&command.kernel)
         .with_context(|| format!("failed to canonicalize kernel {}", command.kernel.display()))?;
-    let limine = LimineToolchain::discover()?;
+    let limine = LimineToolchain::discover(command.efi_arch)?;
     build_limine_uefi_image(&limine, &kernel, &command.output, command.baud)
 }
 
 struct LimineToolchain {
     efi_bootloader: PathBuf,
+    efi_bootloader_name: &'static str,
 }
 
 impl LimineToolchain {
-    fn discover() -> Result<Self> {
+    fn discover(efi_arch: LimineEfiArch) -> Result<Self> {
         let executable = std::env::var_os("HELIOS_LIMINE_BIN")
             .map(PathBuf::from)
             .or_else(|| find_executable_in_path("limine"))
@@ -269,17 +278,24 @@ impl LimineToolchain {
         let share_dir = std::env::var_os("HELIOS_LIMINE_SHARE")
             .map(PathBuf::from)
             .or_else(|| limine_datadir(&executable).ok())
-            .or_else(|| infer_limine_share_dir(&executable))
+            .or_else(|| infer_limine_share_dir(&executable, efi_arch))
             .ok_or_else(|| {
                 anyhow!("failed to locate Limine shared files; set HELIOS_LIMINE_SHARE")
             })?;
-        let efi_bootloader = share_dir.join("BOOTX64.EFI");
+        let efi_bootloader_name = match efi_arch {
+            LimineEfiArch::X86_64 => "BOOTX64.EFI",
+            LimineEfiArch::Aarch64 => "BOOTAA64.EFI",
+        };
+        let efi_bootloader = share_dir.join(efi_bootloader_name);
         ensure!(
             efi_bootloader.is_file(),
-            "Limine x86_64 EFI bootloader is missing: {}",
+            "Limine EFI bootloader is missing: {}",
             efi_bootloader.display()
         );
-        Ok(Self { efi_bootloader })
+        Ok(Self {
+            efi_bootloader,
+            efi_bootloader_name,
+        })
     }
 }
 
@@ -325,13 +341,7 @@ fn build_limine_uefi_image(
         .set_len(image_bytes)
         .with_context(|| format!("failed to size Limine image {}", image.display()))?;
     write_limine_mbr(&mut image_file, image_bytes)?;
-    write_limine_fat_volume(
-        &mut image_file,
-        image_bytes,
-        kernel,
-        &limine.efi_bootloader,
-        baud,
-    )
+    write_limine_fat_volume(&mut image_file, image_bytes, kernel, limine, baud)
 }
 
 fn limine_image_bytes(kernel: &Path, efi_bootloader: &Path) -> Result<u64> {
@@ -368,7 +378,7 @@ fn write_limine_fat_volume(
     image: &mut fs::File,
     image_bytes: u64,
     kernel: &Path,
-    efi_bootloader: &Path,
+    limine: &LimineToolchain,
     baud: u32,
 ) -> Result<()> {
     let partition_offset = u64::from(LIMINE_PARTITION_START_LBA) * LIMINE_SECTOR_BYTES;
@@ -398,7 +408,11 @@ fn write_limine_fat_volume(
     let limine_dir = boot
         .create_dir("limine")
         .context("failed to create /boot/limine")?;
-    write_file_to_fat(&efi_boot, "BOOTX64.EFI", efi_bootloader)?;
+    write_file_to_fat(
+        &efi_boot,
+        limine.efi_bootloader_name,
+        &limine.efi_bootloader,
+    )?;
     let config = LimineConfigTemplate { baud }
         .render()
         .context("failed to render Limine configuration")?;
@@ -453,15 +467,19 @@ fn find_executable_in_path(name: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-fn infer_limine_share_dir(executable: &Path) -> Option<PathBuf> {
+fn infer_limine_share_dir(executable: &Path, efi_arch: LimineEfiArch) -> Option<PathBuf> {
     let bin_dir = executable.parent()?;
     let prefix_dir = bin_dir.parent()?;
+    let efi_bootloader_name = match efi_arch {
+        LimineEfiArch::X86_64 => "BOOTX64.EFI",
+        LimineEfiArch::Aarch64 => "BOOTAA64.EFI",
+    };
     [
         prefix_dir.join("share").join("limine"),
         prefix_dir.join("share"),
     ]
     .into_iter()
-    .find(|path| path.join("BOOTX64.EFI").is_file())
+    .find(|path| path.join(efi_bootloader_name).is_file())
 }
 
 struct FileSlice<'a> {

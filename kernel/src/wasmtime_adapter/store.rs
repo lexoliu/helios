@@ -20,21 +20,41 @@ use wasmtime_wasi_io::poll::Pollable;
 use wasmtime_wasi_io::streams::{InputStream, OutputStream, StreamError, StreamResult};
 
 use crate::child_io::{ByteReader, ByteWriter};
-use crate::{ComponentRuntimeState, ComponentStoreData, allow_instance_resource_growth};
+use crate::{
+    ComponentRuntimeState, ComponentStoreData, ProgramOutOfMemory, allow_instance_resource_growth,
+    heap_stats, user_memory_kernel_reserve_bytes,
+};
 
 impl<CpuImpl, RuntimeStateImpl, FileSystem> ResourceLimiter
     for ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
     FileSystem: Send,
 {
     fn memory_growing(
         &mut self,
-        _current: usize,
+        current: usize,
         desired: usize,
         maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
+        if maximum.is_some_and(|maximum| desired > maximum) {
+            return Ok(false);
+        }
+
+        let heap = heap_stats();
+        let reserve = user_memory_kernel_reserve_bytes(heap.total_bytes);
+        let available = heap.available_bytes();
+        let growth = desired.saturating_sub(current);
+        if available.saturating_sub(growth) < reserve {
+            return Err(ProgramOutOfMemory {
+                requested_bytes: desired,
+                available_bytes: available,
+                kernel_reserve_bytes: reserve,
+            }
+            .into());
+        }
+
         Ok(allow_instance_resource_growth(
             self.instance(),
             desired,
@@ -55,7 +75,7 @@ where
 impl<CpuImpl, RuntimeStateImpl, FileSystem> IoView
     for ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
 {
     fn table(&mut self) -> &mut ResourceTable {
@@ -66,7 +86,7 @@ where
 #[wasmtime_wasi_io::async_trait]
 impl<CpuImpl, RuntimeStateImpl> Pollable for crate::DeadlinePollable<CpuImpl, RuntimeStateImpl>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
 {
     async fn ready(&mut self) {

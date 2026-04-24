@@ -1816,6 +1816,7 @@ dependencies = [
  "atomic-waker",
  "bitflags 2.11.0",
  "buddy_system_allocator",
+ "bytes",
  "concurrent-queue",
  "critical-section",
  "event-listener",

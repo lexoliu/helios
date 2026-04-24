@@ -15,6 +15,7 @@ async-lock = { version = "3.4.2", default-features = false }
 async-task = { version = "4.7.1", default-features = false }
 atomic-waker = "1.1.2"
 buddy_system_allocator = "0.12.0"
+bytes = { version = "1.10.1", default-features = false }
 concurrent-queue = { version = "2.5.0", default-features = false }
 critical-section = "1.2.0"
 event-listener = { version = "5.4.1", default-features = false, features = ["critical-section"] }

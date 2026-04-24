@@ -365,14 +365,6 @@ impl RiscvCpu {
     }
 }
 
-impl helios_kernel::CodegenPlatform for RiscvCpu {
-    fn publish_executable(&self, _ptr: *const u8, _len: usize) {
-        unsafe {
-            core::arch::asm!("fence.i", options(nostack, preserves_flags));
-        }
-    }
-}
-
 impl Cpu for RiscvCpu {
     fn current_processor(&self) -> ProcessorId {
         let runtime_ptr = read_hart_runtime();
@@ -453,6 +445,16 @@ impl Cpu for RiscvCpu {
 
     fn set_deadline(&self, deadline: Instant) {
         sbi_rt::set_timer(deadline.ticks());
+    }
+
+    fn publish_executable(&self, _ptr: *const u8, _len: usize) {
+        unsafe {
+            core::arch::asm!("fence.i", options(nostack, preserves_flags));
+        }
+    }
+
+    fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {
+        None
     }
 
     fn shutdown(&self) -> ! {

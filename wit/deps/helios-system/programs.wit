@@ -85,6 +85,7 @@ interface programs {
     invalid-signature,
     invalid-path,
     invalid-hint,
+    out-of-memory,
     unavailable,
     internal,
   }

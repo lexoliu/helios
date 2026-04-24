@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+mod boot;
 mod exceptions;
 mod host_fs;
 mod pci;
@@ -25,12 +26,6 @@ use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
 use helios_hal::watchdog::Watchdog;
 use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology};
-use limine::BaseRevision;
-use limine::memory_map::{Entry, EntryType};
-use limine::request::{
-    ExecutableAddressRequest, ExecutableFileRequest, HhdmRequest, MemoryMapRequest, RsdpRequest,
-    StackSizeRequest,
-};
 use x86_64::instructions::port::{Port, PortReadOnly, PortWriteOnly};
 use x86_64::registers::control::{Cr0, Cr0Flags, Cr3, Cr4, Cr4Flags};
 
@@ -59,22 +54,6 @@ const WATCHDOG_SELF_TEST_ENABLED: bool = option_env!("HELIOS_WATCHDOG_SELF_TEST"
 
 global_asm!(include_str!("secondary_wakeup.S"));
 
-#[used]
-static BASE_REVISION: BaseRevision = BaseRevision::new();
-#[used]
-static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
-#[used]
-static MEMORY_MAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
-#[used]
-static EXECUTABLE_ADDRESS_REQUEST: ExecutableAddressRequest = ExecutableAddressRequest::new();
-#[used]
-static EXECUTABLE_FILE_REQUEST: ExecutableFileRequest = ExecutableFileRequest::new();
-#[used]
-static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
-#[used]
-static STACK_SIZE_REQUEST: StackSizeRequest =
-    StackSizeRequest::new().with_size(KERNEL_STACK_BYTES as u64);
-
 struct X86CriticalSection;
 
 critical_section::set_impl!(X86CriticalSection);
@@ -101,22 +80,28 @@ extern "C" fn _start() -> ! {
 fn x86_kernel_main() -> ! {
     serial_uart_init();
     assert!(
-        BASE_REVISION.is_supported(),
+        boot::base_revision_supported(),
         "Limine bootloader does not support the required base protocol revision"
     );
+    let handoff = boot::limine_boot_handoff();
     enable_fpu_simd();
-    let physical_memory_offset = boot_physical_memory_offset();
-    let reserved_ranges = boot_reserved_ranges();
-    let reserved_wakeup_page = reserve_wakeup_page(&reserved_ranges);
+    let physical_memory_offset = boot::physical_memory_offset();
+    let reserved_ranges = boot_reserved_ranges(&handoff);
+    let reserved_wakeup_page = reserve_wakeup_page(&handoff, &reserved_ranges);
     helios_kernel::prime_bootstrap_allocator(boot_memory_regions(
+        &handoff,
         physical_memory_offset,
         &reserved_ranges,
         Some(reserved_wakeup_page.clone()),
     ));
-    let rsdp_address = rsdp_address();
+    let rsdp_address = handoff
+        .tables
+        .acpi_rsdp
+        .unwrap_or_else(|| panic!("Limine handoff did not include an ACPI RSDP address"));
     let processor_count = processor_count(rsdp_address, physical_memory_offset);
     let wakeup_page = (processor_count > 1).then_some(reserved_wakeup_page);
     let memory_regions = boot_memory_regions(
+        &handoff,
         physical_memory_offset,
         &reserved_ranges,
         wakeup_page.clone(),
@@ -180,20 +165,6 @@ fn enable_fpu_simd() {
     // before advertising AVX/FMA/AVX512 to Wasmtime-generated code.
 }
 
-fn boot_physical_memory_offset() -> usize {
-    HHDM_REQUEST
-        .get_response()
-        .unwrap_or_else(|| panic!("Limine did not provide an HHDM response"))
-        .offset() as usize
-}
-
-fn rsdp_address() -> usize {
-    RSDP_REQUEST
-        .get_response()
-        .unwrap_or_else(|| panic!("Limine did not provide an RSDP response"))
-        .address()
-}
-
 fn processor_count(rsdp_address: usize, physical_memory_offset: usize) -> usize {
     let handler = smp::PhysicalOffsetAcpiHandler {
         physical_memory_offset,
@@ -213,23 +184,6 @@ fn processor_count(rsdp_address: usize, physical_memory_offset: usize) -> usize 
     1 + processor_info.application_processors.len()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct BootMemoryRegion {
-    pub(crate) start: u64,
-    pub(crate) end: u64,
-    pub(crate) usable: bool,
-}
-
-impl BootMemoryRegion {
-    fn from_limine(entry: &'static Entry) -> Self {
-        Self {
-            start: entry.base,
-            end: entry.base + entry.length,
-            usable: entry.entry_type == EntryType::USABLE,
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 struct BootReservedRanges {
     ranges: [Option<Range<usize>>; 3],
@@ -241,37 +195,21 @@ impl BootReservedRanges {
     }
 }
 
-fn boot_memory_region_entries() -> impl Iterator<Item = BootMemoryRegion> {
-    MEMORY_MAP_REQUEST
-        .get_response()
-        .unwrap_or_else(|| panic!("Limine did not provide a memory map response"))
-        .entries()
-        .iter()
-        .map(|entry| BootMemoryRegion::from_limine(entry))
-}
-
-fn boot_reserved_ranges() -> BootReservedRanges {
-    let executable_address = EXECUTABLE_ADDRESS_REQUEST
-        .get_response()
-        .unwrap_or_else(|| panic!("Limine did not provide an executable address response"));
-    let executable_file = EXECUTABLE_FILE_REQUEST
-        .get_response()
-        .unwrap_or_else(|| panic!("Limine did not provide an executable file response"))
-        .file();
+fn boot_reserved_ranges(handoff: &helios_hal::boot::BootHandoff<'_>) -> BootReservedRanges {
     let executable_bytes = align_up_usize(
-        usize::try_from(executable_file.size()).unwrap_or_else(|_| {
+        usize::try_from(handoff.kernel.size).unwrap_or_else(|_| {
             panic!(
                 "Limine executable file size does not fit usize: {}",
-                executable_file.size()
+                handoff.kernel.size
             )
         }),
         PAGE_BYTES,
     );
-    let loaded_executable_start = usize::try_from(executable_address.physical_base())
-        .unwrap_or_else(|_| {
+    let loaded_executable_start =
+        usize::try_from(handoff.kernel.physical_base).unwrap_or_else(|_| {
             panic!(
                 "Limine executable physical base does not fit usize: {:#x}",
-                executable_address.physical_base()
+                handoff.kernel.physical_base
             )
         });
     let loaded_executable_end = loaded_executable_start
@@ -281,7 +219,7 @@ fn boot_reserved_ranges() -> BootReservedRanges {
                 "Limine executable loaded range overflow: start={loaded_executable_start:#x}, len={executable_bytes:#x}"
             )
         });
-    let file_start = executable_file.addr() as usize;
+    let file_start = handoff.kernel.file_address;
     let file_end = file_start.checked_add(executable_bytes).unwrap_or_else(|| {
         panic!("Limine executable file range overflow: start={file_start:#x}, len={executable_bytes:#x}")
     });
@@ -295,8 +233,14 @@ fn boot_reserved_ranges() -> BootReservedRanges {
     }
 }
 
-fn reserve_wakeup_page(reserved_ranges: &BootReservedRanges) -> Range<usize> {
-    boot_memory_region_entries()
+fn reserve_wakeup_page(
+    handoff: &helios_hal::boot::BootHandoff<'_>,
+    reserved_ranges: &BootReservedRanges,
+) -> Range<usize> {
+    handoff
+        .memory_map
+        .iter()
+        .copied()
         .flat_map(|region| usable_region_segments(region, reserved_ranges))
         .flatten()
         .find_map(|segment| {
@@ -311,13 +255,14 @@ fn reserve_wakeup_page(reserved_ranges: &BootReservedRanges) -> Range<usize> {
 }
 
 fn boot_memory_regions(
+    handoff: &helios_hal::boot::BootHandoff<'_>,
     physical_memory_offset: usize,
     reserved_ranges: &BootReservedRanges,
     excluded: Option<Range<usize>>,
 ) -> impl IntoIterator<Item = MemoryRegion> {
     let mut reserved_ranges = reserved_ranges.clone();
     reserved_ranges.ranges[2] = excluded;
-    boot_memory_region_entries().flat_map(move |region| {
+    handoff.memory_map.iter().copied().flat_map(move |region| {
         usable_region_segments(region, &reserved_ranges)
             .into_iter()
             .flatten()
@@ -333,10 +278,10 @@ fn boot_memory_regions(
 }
 
 fn usable_region_segments(
-    region: BootMemoryRegion,
+    region: helios_hal::boot::BootMemoryRegion,
     reserved_ranges: &BootReservedRanges,
 ) -> [Option<Range<usize>>; MAX_USABLE_REGION_SEGMENTS] {
-    if !region.usable || region.end <= region.start {
+    if !region.usable() || region.end <= region.start {
         return [const { None }; MAX_USABLE_REGION_SEGMENTS];
     }
 
@@ -397,8 +342,9 @@ fn align_up_usize(value: usize, align: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{BootMemoryRegion, BootReservedRanges, usable_region_segments};
+    use super::{BootReservedRanges, usable_region_segments};
     use core::ops::Range;
+    use helios_hal::boot::{BootMemoryKind, BootMemoryRegion};
 
     #[test]
     fn usable_region_without_overlap_stays_single_segment() {
@@ -423,7 +369,7 @@ mod tests {
                 BootMemoryRegion {
                     start: 0x1000,
                     end: 0x4000,
-                    usable: false,
+                    kind: BootMemoryKind::Reserved,
                 },
                 None,
             )
@@ -448,7 +394,7 @@ mod tests {
         BootMemoryRegion {
             start: range.start as u64,
             end: range.end as u64,
-            usable: true,
+            kind: BootMemoryKind::Usable,
         }
     }
 }
@@ -493,42 +439,6 @@ impl X86Cpu {
     }
 }
 
-impl helios_kernel::CodegenPlatform for X86Cpu {
-    fn publish_executable(&self, ptr: *const u8, len: usize) {
-        if len == 0 {
-            return;
-        }
-
-        let start = ptr as usize;
-        let end = start
-            .checked_add(len - 1)
-            .unwrap_or_else(|| panic!("code publish range overflow: start={start:#x}, len={len}"));
-        let first_page = start & !PAGE_MASK;
-        let last_page = end & !PAGE_MASK;
-        let mut page = first_page;
-        loop {
-            unsafe {
-                clear_no_execute_bit(page, self.state.physical_memory_offset());
-                asm!(
-                    "invlpg [{addr}]",
-                    addr = in(reg) page,
-                    options(nostack, preserves_flags),
-                );
-            }
-            if page == last_page {
-                break;
-            }
-            page = page
-                .checked_add(PAGE_BYTES)
-                .unwrap_or_else(|| panic!("code publish page iteration overflow at {page:#x}"));
-        }
-    }
-
-    fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {
-        Some(detect_x86_native_feature)
-    }
-}
-
 impl Cpu for X86Cpu {
     fn current_processor(&self) -> ProcessorId {
         self.state.current_processor()
@@ -562,6 +472,40 @@ impl Cpu for X86Cpu {
     }
 
     fn set_deadline(&self, _deadline: Instant) {}
+
+    fn publish_executable(&self, ptr: *const u8, len: usize) {
+        if len == 0 {
+            return;
+        }
+
+        let start = ptr as usize;
+        let end = start
+            .checked_add(len - 1)
+            .unwrap_or_else(|| panic!("code publish range overflow: start={start:#x}, len={len}"));
+        let first_page = start & !PAGE_MASK;
+        let last_page = end & !PAGE_MASK;
+        let mut page = first_page;
+        loop {
+            unsafe {
+                clear_no_execute_bit(page, self.state.physical_memory_offset());
+                asm!(
+                    "invlpg [{addr}]",
+                    addr = in(reg) page,
+                    options(nostack, preserves_flags),
+                );
+            }
+            if page == last_page {
+                break;
+            }
+            page = page
+                .checked_add(PAGE_BYTES)
+                .unwrap_or_else(|| panic!("code publish page iteration overflow at {page:#x}"));
+        }
+    }
+
+    fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {
+        Some(detect_x86_native_feature)
+    }
 
     fn shutdown(&self) -> ! {
         loop {

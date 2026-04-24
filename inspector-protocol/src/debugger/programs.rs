@@ -103,6 +103,7 @@ fn convert_exec_error_kind(kind: host_programs::ExecErrorKind) -> ExecErrorKind 
         host_programs::ExecErrorKind::InvalidSignature => ExecErrorKind::InvalidSignature,
         host_programs::ExecErrorKind::InvalidPath => ExecErrorKind::InvalidPath,
         host_programs::ExecErrorKind::InvalidHint => ExecErrorKind::InvalidHint,
+        host_programs::ExecErrorKind::OutOfMemory => ExecErrorKind::OutOfMemory,
         host_programs::ExecErrorKind::Unavailable => ExecErrorKind::Unavailable,
         host_programs::ExecErrorKind::Internal => ExecErrorKind::Internal,
     }

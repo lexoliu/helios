@@ -2,12 +2,13 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 
+use bytes::Bytes;
 use lru::LruCache;
 
 pub struct ComponentCache<Component> {
     budget_bytes: usize,
     resident_bytes: usize,
-    entries: LruCache<Arc<[u8]>, Arc<Component>>,
+    entries: LruCache<Bytes, Arc<Component>>,
 }
 
 impl<Component> ComponentCache<Component> {
@@ -23,11 +24,7 @@ impl<Component> ComponentCache<Component> {
         self.entries.get(wasm).cloned()
     }
 
-    pub fn insert_if_missing(
-        &mut self,
-        wasm: Arc<[u8]>,
-        component: Arc<Component>,
-    ) -> Arc<Component> {
+    pub fn insert_if_missing(&mut self, wasm: Bytes, component: Arc<Component>) -> Arc<Component> {
         if let Some(existing) = self.entries.get(wasm.as_ref()).cloned() {
             return existing;
         }

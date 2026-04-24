@@ -91,7 +91,7 @@ macro_rules! impl_program_bindings {
         impl<CpuImpl, HostFs> $bindings::helios::system::programs::Host
             for StoreData<CpuImpl, HostFs>
         where
-            CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+            CpuImpl: Cpu + Clone,
             HostFs: crate::HostFileSystem,
         {
         }
@@ -99,7 +99,7 @@ macro_rules! impl_program_bindings {
         impl<CpuImpl, HostFs> $bindings::helios::system::programs::HostChild
             for StoreData<CpuImpl, HostFs>
         where
-            CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+            CpuImpl: Cpu + Clone,
             HostFs: crate::HostFileSystem,
         {
         }
@@ -107,7 +107,7 @@ macro_rules! impl_program_bindings {
         impl<CpuImpl, HostFs> $bindings::helios::system::programs::HostChildWithStore
             for HasSelf<StoreData<CpuImpl, HostFs>>
         where
-            CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+            CpuImpl: Cpu + Clone,
             HostFs: crate::HostFileSystem,
         {
             async fn drop<T>(
@@ -270,7 +270,7 @@ macro_rules! impl_program_bindings {
         impl<CpuImpl, HostFs> $bindings::helios::system::programs::HostWithStore
             for HasSelf<StoreData<CpuImpl, HostFs>>
         where
-            CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+            CpuImpl: Cpu + Clone,
             HostFs: crate::HostFileSystem,
         {
             fn spawn<T: Send>(
@@ -490,7 +490,7 @@ async fn read_program_source<T, CpuImpl, HostFs>(
     path: &str,
 ) -> wasmtime::Result<Result<service::ProgramSource, crate::ProgramExecError>>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     let absolute =
@@ -509,7 +509,7 @@ where
         return Ok(host_service
             .read_file(&host_path)
             .await
-            .map(|bytes| classify_program_source(bytes, false))
+            .map(|bytes| classify_program_source(bytes::Bytes::from(bytes), false))
             .map_err(|error| ProgramExecError {
                 kind: ProgramExecErrorKind::InvalidPath,
                 detail: format!("failed to read {}: {error}", absolute),
@@ -525,7 +525,7 @@ where
         let bytes = access
             .get()
             .filesystem()
-            .read_program_file(&absolute)
+            .read_program_file_bytes(&absolute)
             .map_err(map_fs_error_to_program_exec)?;
         Ok::<_, wasmtime::Error>(Ok(classify_program_source(bytes, readonly)))
     })
@@ -537,7 +537,7 @@ async fn write_program_artifact<T, CpuImpl, HostFs>(
     bytes: &[u8],
 ) -> wasmtime::Result<Result<(), crate::ProgramExecError>>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     let absolute =
@@ -586,8 +586,9 @@ where
     })
 }
 
-fn classify_program_source(bytes: Vec<u8>, readonly: bool) -> ProgramSource {
-    if crate::is_cwasm(&bytes) {
+fn classify_program_source(bytes: bytes::Bytes, readonly: bool) -> ProgramSource {
+    let is_cwasm = crate::is_cwasm(&bytes);
+    if is_cwasm {
         if readonly {
             return ProgramSource::BootfsArtifact(bytes);
         }
@@ -637,7 +638,7 @@ async fn run_system_component<CpuImpl, HostFs>(
     write_serial: fn(&[u8]),
 ) -> Result<(), DebuggerError>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     use crate::{
@@ -728,7 +729,7 @@ pub(crate) fn component_linker<CpuImpl, HostFs>(
     component: Option<&Component>,
 ) -> wasmtime::Result<Linker<StoreData<CpuImpl, HostFs>>>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     let mut linker = Linker::<StoreData<CpuImpl, HostFs>>::new(engine);
@@ -753,7 +754,7 @@ pub(crate) fn store_with_state<CpuImpl, HostFs>(
     state: StoreData<CpuImpl, HostFs>,
 ) -> Store<StoreData<CpuImpl, HostFs>>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     let mut store = Store::new(engine, state);
@@ -774,7 +775,7 @@ fn add_system_to_linker<CpuImpl, HostFs>(
     linker: &mut Linker<StoreData<CpuImpl, HostFs>>,
 ) -> wasmtime::Result<()>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     add_programs_to_linker(linker)?;
@@ -789,7 +790,7 @@ pub(crate) fn add_program_world_to_linker<CpuImpl, HostFs>(
     linker: &mut Linker<StoreData<CpuImpl, HostFs>>,
 ) -> wasmtime::Result<()>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     add_programs_to_program_linker(linker)?;
@@ -803,7 +804,7 @@ pub(crate) fn add_serial_to_linker<CpuImpl, HostFs>(
     linker: &mut Linker<StoreData<CpuImpl, HostFs>>,
 ) -> wasmtime::Result<()>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     debugger_bindings::helios::system::serial::add_to_linker::<
@@ -817,7 +818,7 @@ pub(crate) fn add_sync_to_linker<CpuImpl, HostFs>(
     linker: &mut Linker<StoreData<CpuImpl, HostFs>>,
 ) -> wasmtime::Result<()>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     let mut instance = linker.instance(SYNC_INSTANCE)?;
@@ -974,7 +975,7 @@ fn add_stats_to_linker<CpuImpl, HostFs>(
     linker: &mut Linker<StoreData<CpuImpl, HostFs>>,
 ) -> wasmtime::Result<()>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     let mut instance = linker.instance(STATS_INSTANCE)?;
@@ -992,7 +993,7 @@ fn add_programs_to_linker<CpuImpl, HostFs>(
     linker: &mut Linker<StoreData<CpuImpl, HostFs>>,
 ) -> wasmtime::Result<()>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     debugger_bindings::helios::system::programs::add_to_linker::<
@@ -1006,7 +1007,7 @@ fn add_programs_to_program_linker<CpuImpl, HostFs>(
     linker: &mut Linker<StoreData<CpuImpl, HostFs>>,
 ) -> wasmtime::Result<()>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     program_bindings::helios::system::programs::add_to_linker::<
@@ -1020,7 +1021,7 @@ fn add_net_to_linker<CpuImpl, HostFs>(
     linker: &mut Linker<StoreData<CpuImpl, HostFs>>,
 ) -> wasmtime::Result<()>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     let mut instance = linker.instance(NET_INSTANCE)?;
@@ -1287,7 +1288,7 @@ fn add_net_to_program_linker<CpuImpl, HostFs>(
     linker: &mut Linker<StoreData<CpuImpl, HostFs>>,
 ) -> wasmtime::Result<()>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     let mut instance = linker.instance(NET_INSTANCE)?;
@@ -1553,7 +1554,7 @@ fn add_tracing_to_linker<CpuImpl, HostFs>(
     linker: &mut Linker<StoreData<CpuImpl, HostFs>>,
 ) -> wasmtime::Result<()>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     let mut instance = linker.instance(TRACING_INSTANCE)?;
@@ -1588,7 +1589,7 @@ fn add_stats_to_program_linker<CpuImpl, HostFs>(
     linker: &mut Linker<StoreData<CpuImpl, HostFs>>,
 ) -> wasmtime::Result<()>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     let mut instance = linker.instance(STATS_INSTANCE)?;
@@ -1606,7 +1607,7 @@ fn add_tracing_to_program_linker<CpuImpl, HostFs>(
     linker: &mut Linker<StoreData<CpuImpl, HostFs>>,
 ) -> wasmtime::Result<()>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     let mut instance = linker.instance(TRACING_INSTANCE)?;
@@ -1660,6 +1661,9 @@ fn convert_launch_error(
             ProgramExecErrorKind::InvalidHint => {
                 debugger_bindings::helios::system::programs::ExecErrorKind::InvalidHint
             }
+            ProgramExecErrorKind::OutOfMemory => {
+                debugger_bindings::helios::system::programs::ExecErrorKind::OutOfMemory
+            }
             ProgramExecErrorKind::Unavailable => {
                 debugger_bindings::helios::system::programs::ExecErrorKind::Unavailable
             }
@@ -1706,6 +1710,9 @@ fn convert_program_launch_error(
             }
             ProgramExecErrorKind::InvalidHint => {
                 program_bindings::helios::system::programs::ExecErrorKind::InvalidHint
+            }
+            ProgramExecErrorKind::OutOfMemory => {
+                program_bindings::helios::system::programs::ExecErrorKind::OutOfMemory
             }
             ProgramExecErrorKind::Unavailable => {
                 program_bindings::helios::system::programs::ExecErrorKind::Unavailable
@@ -1943,7 +1950,7 @@ fn add_instances_to_linker<CpuImpl, HostFs>(
     linker: &mut Linker<StoreData<CpuImpl, HostFs>>,
 ) -> wasmtime::Result<()>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     let mut instance = linker.instance(INSTANCES_INSTANCE)?;
@@ -1961,7 +1968,7 @@ where
 
 impl<CpuImpl, HostFs> debugger_bindings::helios::system::serial::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
@@ -1969,7 +1976,7 @@ where
 impl<CpuImpl, HostFs> debugger_bindings::helios::system::serial::HostWithStore
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     async fn debug_port<T: Send>(
@@ -1987,7 +1994,7 @@ where
 impl<CpuImpl, HostFs> debugger_bindings::helios::system::serial::HostSerialPort
     for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
@@ -1995,7 +2002,7 @@ where
 impl<CpuImpl, HostFs> debugger_bindings::helios::system::serial::HostSerialPortWithStore
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     async fn rights<T: Send>(
@@ -2070,7 +2077,7 @@ where
 
 impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
@@ -2078,7 +2085,7 @@ where
 impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawMutex
     for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
@@ -2086,7 +2093,7 @@ where
 impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawMutexWithStore
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     async fn new<T: Send>(accessor: &Accessor<T, Self>) -> wasmtime::Result<Resource<SbiRawMutex>> {
@@ -2128,7 +2135,7 @@ where
 impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawMutexGuard
     for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
@@ -2136,7 +2143,7 @@ where
 impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawMutexGuardWithStore
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     async fn drop<T>(
@@ -2153,7 +2160,7 @@ where
 impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawRwLock
     for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
@@ -2161,7 +2168,7 @@ where
 impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawRwLockWithStore
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     async fn new<T: Send>(
@@ -2220,7 +2227,7 @@ where
 impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawRwLockReadGuard
     for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
@@ -2228,7 +2235,7 @@ where
 impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawRwLockReadGuardWithStore
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     async fn drop<T>(
@@ -2245,7 +2252,7 @@ where
 impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawRwLockWriteGuard
     for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
@@ -2253,7 +2260,7 @@ where
 impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawRwLockWriteGuardWithStore
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     async fn drop<T>(
@@ -2284,7 +2291,7 @@ impl StatsStreamProducer {
 
 impl<CpuImpl, HostFs> StreamProducer<StoreData<CpuImpl, HostFs>> for StatsStreamProducer
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     type Item = debugger_bindings::helios::system::stats::Sample;
@@ -2333,7 +2340,7 @@ impl ProgramStatsStreamProducer {
 
 impl<CpuImpl, HostFs> StreamProducer<StoreData<CpuImpl, HostFs>> for ProgramStatsStreamProducer
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     type Item = program_bindings::helios::system::stats::Sample;
@@ -2378,7 +2385,7 @@ impl TracingStreamProducer {
 
 impl<CpuImpl, HostFs> StreamProducer<StoreData<CpuImpl, HostFs>> for TracingStreamProducer
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     type Item = debugger_bindings::helios::system::tracing::Event;
@@ -2423,7 +2430,7 @@ impl ProgramTracingStreamProducer {
 
 impl<CpuImpl, HostFs> StreamProducer<StoreData<CpuImpl, HostFs>> for ProgramTracingStreamProducer
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     type Item = program_bindings::helios::system::tracing::Event;
@@ -2459,7 +2466,7 @@ fn snapshot_sample<CpuImpl, HostFs>(
     store: &StoreData<CpuImpl, HostFs>,
 ) -> debugger_bindings::helios::system::stats::Sample
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     convert_sample(store.runtime_state.snapshot(store.cpu.now().ticks()))
@@ -2469,7 +2476,7 @@ fn snapshot_program_sample<CpuImpl, HostFs>(
     store: &StoreData<CpuImpl, HostFs>,
 ) -> program_bindings::helios::system::stats::Sample
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     convert_program_sample(store.runtime_state.snapshot(store.cpu.now().ticks()))

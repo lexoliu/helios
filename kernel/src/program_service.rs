@@ -18,10 +18,22 @@ pub enum ProgramExecErrorKind {
     InvalidPath,
     #[error("the requested AOT hint is invalid for this input")]
     InvalidHint,
+    #[error("the program exhausted its memory budget")]
+    OutOfMemory,
     #[error("program exec is unavailable on this platform")]
     Unavailable,
     #[error("the kernel rejected the program for an internal reason")]
     Internal,
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error(
+    "program memory request of {requested_bytes} bytes would leave {available_bytes} bytes below the kernel reserve of {kernel_reserve_bytes} bytes"
+)]
+pub struct ProgramOutOfMemory {
+    pub requested_bytes: usize,
+    pub available_bytes: usize,
+    pub kernel_reserve_bytes: usize,
 }
 
 #[derive(Debug, Error)]

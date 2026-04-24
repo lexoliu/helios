@@ -5,6 +5,7 @@ use core::fmt::Write;
 use crate::cpu::ProcessorId;
 use crate::memory::MemoryRegion;
 
+pub mod boot;
 pub mod cpu;
 pub mod device;
 pub mod fs;
@@ -253,6 +254,12 @@ mod tests {
 
         fn set_deadline(&self, _deadline: cpu::Instant) {
             panic!("test CPU should not set deadlines")
+        }
+
+        fn publish_executable(&self, _ptr: *const u8, _len: usize) {}
+
+        fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {
+            None
         }
 
         fn shutdown(&self) -> ! {

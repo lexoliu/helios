@@ -233,7 +233,7 @@ pub(crate) fn add_to_linker<CpuImpl, HostFs>(
     linker: &mut Linker<StoreData<CpuImpl, HostFs>>,
 ) -> Result<()>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     cli_bindings::cli::environment::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
@@ -388,7 +388,7 @@ impl Pollable for P2OutgoingDatagramStream {
 
 impl<CpuImpl, HostFs> cli_bindings::cli::environment::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn get_environment(&mut self) -> Result<Vec<(String, String)>> {
@@ -406,7 +406,7 @@ where
 
 impl<CpuImpl, HostFs> cli_bindings::cli::exit::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn exit(&mut self, status: core::result::Result<(), ()>) -> Result<()> {
@@ -430,7 +430,7 @@ where
 
 impl<CpuImpl, HostFs> cli_bindings::cli::stdin::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn get_stdin(&mut self) -> Result<Resource<DynInputStream>> {
@@ -448,7 +448,7 @@ where
 
 impl<CpuImpl, HostFs> cli_bindings::cli::stdout::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn get_stdout(&mut self) -> Result<Resource<DynOutputStream>> {
@@ -459,7 +459,7 @@ where
 
 impl<CpuImpl, HostFs> cli_bindings::cli::stderr::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn get_stderr(&mut self) -> Result<Resource<DynOutputStream>> {
@@ -473,7 +473,7 @@ fn build_stdio_stream<CpuImpl, HostFs>(
     kind: ComponentOutputStreamKind,
 ) -> StdioOutputStream
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     match store.output_mode() {
@@ -491,13 +491,13 @@ where
 
 impl<CpuImpl, HostFs> cli_bindings::cli::terminal_input::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
 impl<CpuImpl, HostFs> cli_bindings::cli::terminal_output::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
@@ -505,7 +505,7 @@ where
 impl<CpuImpl, HostFs> cli_bindings::cli::terminal_input::HostTerminalInput
     for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn drop(&mut self, resource: Resource<TerminalInput>) -> Result<()> {
@@ -517,7 +517,7 @@ where
 impl<CpuImpl, HostFs> cli_bindings::cli::terminal_output::HostTerminalOutput
     for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn drop(&mut self, resource: Resource<TerminalOutput>) -> Result<()> {
@@ -528,7 +528,7 @@ where
 
 impl<CpuImpl, HostFs> cli_bindings::cli::terminal_stdin::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn get_terminal_stdin(&mut self) -> Result<Option<Resource<TerminalInput>>> {
@@ -538,7 +538,7 @@ where
 
 impl<CpuImpl, HostFs> cli_bindings::cli::terminal_stdout::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn get_terminal_stdout(&mut self) -> Result<Option<Resource<TerminalOutput>>> {
@@ -548,7 +548,7 @@ where
 
 impl<CpuImpl, HostFs> cli_bindings::cli::terminal_stderr::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn get_terminal_stderr(&mut self) -> Result<Option<Resource<TerminalOutput>>> {
@@ -558,7 +558,7 @@ where
 
 impl<CpuImpl, HostFs> clocks_bindings::clocks::monotonic_clock::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn now(&mut self) -> Result<clocks_bindings::clocks::monotonic_clock::Instant> {
@@ -585,7 +585,7 @@ where
 
 impl<CpuImpl, HostFs> clocks_bindings::clocks::wall_clock::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn now(&mut self) -> Result<clocks_bindings::clocks::wall_clock::Datetime> {
@@ -602,7 +602,7 @@ where
 
 impl<CpuImpl, HostFs> filesystem_bindings::filesystem::preopens::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn get_directories(&mut self) -> Result<Vec<(Resource<FsDescriptor>, String)>> {
@@ -614,7 +614,7 @@ where
 
 impl<CpuImpl, HostFs> filesystem_bindings::filesystem::types::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn filesystem_error_code(&mut self, _: Resource<IoError>) -> Result<Option<p2fs::ErrorCode>> {
@@ -625,7 +625,7 @@ where
 impl<CpuImpl, HostFs> filesystem_bindings::filesystem::types::HostDescriptor
     for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn read_via_stream(
@@ -1295,7 +1295,7 @@ where
 impl<CpuImpl, HostFs> filesystem_bindings::filesystem::types::HostDirectoryEntryStream
     for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn read_directory_entry(
@@ -1321,7 +1321,7 @@ where
 
 impl<CpuImpl, HostFs> random_bindings::random::random::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn get_random_bytes(&mut self, len: u64) -> Result<Vec<u8>> {
@@ -1335,7 +1335,7 @@ where
 
 impl<CpuImpl, HostFs> random_bindings::random::insecure::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn get_insecure_random_bytes(&mut self, len: u64) -> Result<Vec<u8>> {
@@ -1349,7 +1349,7 @@ where
 
 impl<CpuImpl, HostFs> random_bindings::random::insecure_seed::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn insecure_seed(&mut self) -> Result<(u64, u64)> {
@@ -1375,7 +1375,7 @@ fn delete_resource<R: 'static, CpuImpl, HostFs>(
     resource: Resource<R>,
 ) -> Result<()>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     store.table.delete(resource)?;
@@ -1384,7 +1384,7 @@ where
 
 impl<CpuImpl, HostFs> p2net::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn network_error_code(
@@ -1397,7 +1397,7 @@ where
 
 impl<CpuImpl, HostFs> p2net::HostNetwork for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn drop(&mut self, resource: Resource<P2Network>) -> Result<()> {
@@ -1408,7 +1408,7 @@ where
 impl<CpuImpl, HostFs> sockets_bindings::sockets::instance_network::Host
     for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn instance_network(&mut self) -> Result<Resource<P2Network>> {
@@ -1418,14 +1418,14 @@ where
 
 impl<CpuImpl, HostFs> p2udp::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
 
 impl<CpuImpl, HostFs> p2udp::HostUdpSocket for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     async fn start_bind(
@@ -1577,7 +1577,7 @@ where
 
 impl<CpuImpl, HostFs> p2udp::HostIncomingDatagramStream for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     async fn receive(
@@ -1629,7 +1629,7 @@ where
 
 impl<CpuImpl, HostFs> p2udp::HostOutgoingDatagramStream for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn check_send(
@@ -1713,7 +1713,7 @@ where
 
 impl<CpuImpl, HostFs> p2udp_create::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn create_udp_socket(
@@ -1793,14 +1793,14 @@ fn map_p2_udp_error(error: WasiUdpSocketError) -> p2udp::ErrorCode {
 
 impl<CpuImpl, HostFs> p2tcp::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
 
 impl<CpuImpl, HostFs> p2tcp::HostTcpSocket for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn start_bind(
@@ -2024,7 +2024,7 @@ where
 
 impl<CpuImpl, HostFs> p2tcp_create::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn create_tcp_socket(
@@ -2037,7 +2037,7 @@ where
 
 impl<CpuImpl, HostFs> p2lookup::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn resolve_addresses(
@@ -2052,7 +2052,7 @@ where
 
 impl<CpuImpl, HostFs> p2lookup::HostResolveAddressStream for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn resolve_next_address(
@@ -2086,7 +2086,7 @@ fn get_fs_descriptor<CpuImpl, HostFs>(
     resource: &Resource<FsDescriptor>,
 ) -> core::result::Result<FsDescriptor, p2fs::ErrorCode>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     store

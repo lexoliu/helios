@@ -17,10 +17,13 @@ use tempfile::TempDir;
 use crate::{connect_client, run_connected, SessionCommand};
 
 const DEFAULT_BAUD: u32 = 115_200;
+const DEFAULT_AARCH64_QEMU_BIN: &str = "qemu-system-aarch64";
 const DEFAULT_RISCV_QEMU_BIN: &str = "qemu-system-riscv64";
 const DEFAULT_X86_QEMU_BIN: &str = "qemu-system-x86_64";
+const DEFAULT_AARCH64_MEMORY: &str = "2G";
 const DEFAULT_RISCV_MEMORY: &str = "2G";
 const DEFAULT_X86_MEMORY: &str = "1G";
+const DEFAULT_AARCH64_SMP: u16 = 4;
 const DEFAULT_RISCV_SMP: u16 = 4;
 const DEFAULT_X86_SMP: u16 = 2;
 const DEFAULT_SOCKET_WAIT: Duration = Duration::from_secs(10);
@@ -31,6 +34,7 @@ const DEFAULT_GDB_ENDPOINT: &str = "tcp::1234";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum VmArch {
+    Aarch64,
     Riscv64,
     X86_64,
 }
@@ -38,6 +42,7 @@ pub(crate) enum VmArch {
 impl VmArch {
     fn profile(self) -> &'static VmProfile {
         match self {
+            Self::Aarch64 => &AARCH64_VIRT_HVF_PROFILE,
             Self::Riscv64 => &RISCV64_VM_PROFILE,
             Self::X86_64 => &X86_64_VM_PROFILE,
         }
@@ -70,6 +75,7 @@ enum VmBlockProfile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VmHostShareProfile {
     Virtio9pMmio,
+    Virtio9pPci,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +93,8 @@ struct VmProfile {
     default_smp: u16,
     default_memory: &'static str,
     default_bios: Option<&'static str>,
+    default_accel: &'static [&'static str],
+    default_cpu: Option<&'static str>,
     boot_artifact: VmBootArtifactKind,
     console: VmConsoleProfile,
     network: Option<VmNetworkProfile>,
@@ -94,6 +102,45 @@ struct VmProfile {
     host_share: Option<VmHostShareProfile>,
     watchdog: Option<VmWatchdogProfile>,
 }
+
+const AARCH64_VIRT_HVF_PROFILE: VmProfile = VmProfile {
+    arch: VmArch::Aarch64,
+    qemu_bin: DEFAULT_AARCH64_QEMU_BIN,
+    cargo_target: "aarch64-unknown-none",
+    machine: "virt,gic-version=3",
+    kernel_artifact_name: "helios",
+    default_smp: DEFAULT_AARCH64_SMP,
+    default_memory: DEFAULT_AARCH64_MEMORY,
+    default_bios: None,
+    default_accel: &["hvf"],
+    default_cpu: Some("host"),
+    boot_artifact: VmBootArtifactKind::LimineUefiDiskImage,
+    console: VmConsoleProfile::SerialUnixSocket,
+    network: Some(VmNetworkProfile::VirtioPciUser),
+    block: Some(VmBlockProfile::VirtioPciBootDisk),
+    host_share: Some(VmHostShareProfile::Virtio9pPci),
+    watchdog: Some(VmWatchdogProfile::I6300Esb),
+};
+
+#[cfg(test)]
+const AARCH64_VIRT_TCG_PROFILE: VmProfile = VmProfile {
+    arch: VmArch::Aarch64,
+    qemu_bin: DEFAULT_AARCH64_QEMU_BIN,
+    cargo_target: "aarch64-unknown-none",
+    machine: "virt,gic-version=3",
+    kernel_artifact_name: "helios",
+    default_smp: DEFAULT_AARCH64_SMP,
+    default_memory: DEFAULT_AARCH64_MEMORY,
+    default_bios: None,
+    default_accel: &["tcg"],
+    default_cpu: Some("max"),
+    boot_artifact: VmBootArtifactKind::LimineUefiDiskImage,
+    console: VmConsoleProfile::SerialUnixSocket,
+    network: Some(VmNetworkProfile::VirtioPciUser),
+    block: Some(VmBlockProfile::VirtioPciBootDisk),
+    host_share: Some(VmHostShareProfile::Virtio9pPci),
+    watchdog: Some(VmWatchdogProfile::I6300Esb),
+};
 
 const RISCV64_VM_PROFILE: VmProfile = VmProfile {
     arch: VmArch::Riscv64,
@@ -104,6 +151,8 @@ const RISCV64_VM_PROFILE: VmProfile = VmProfile {
     default_smp: DEFAULT_RISCV_SMP,
     default_memory: DEFAULT_RISCV_MEMORY,
     default_bios: Some("default"),
+    default_accel: &[],
+    default_cpu: None,
     boot_artifact: VmBootArtifactKind::KernelBinary,
     console: VmConsoleProfile::SerialUnixSocket,
     network: Some(VmNetworkProfile::VirtioMmioUser),
@@ -121,6 +170,8 @@ const X86_64_VM_PROFILE: VmProfile = VmProfile {
     default_smp: DEFAULT_X86_SMP,
     default_memory: DEFAULT_X86_MEMORY,
     default_bios: None,
+    default_accel: &[],
+    default_cpu: Some("max"),
     boot_artifact: VmBootArtifactKind::LimineUefiDiskImage,
     console: VmConsoleProfile::SerialUnixSocket,
     network: Some(VmNetworkProfile::VirtioPciUser),
@@ -358,8 +409,19 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
     } else {
         file.baud.unwrap_or(DEFAULT_BAUD)
     };
-    let cpu = command.cpu.or(file.cpu);
-    let mut accel = file.accel;
+    let cpu = command
+        .cpu
+        .or(file.cpu)
+        .or_else(|| profile.default_cpu.map(str::to_owned));
+    let mut accel = if file.accel.is_empty() && command.accel.is_empty() {
+        profile
+            .default_accel
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>()
+    } else {
+        file.accel
+    };
     accel.extend(command.accel);
     let shared_dir = command.shared_dir.or(file.shared_dir);
     let gdb = command
@@ -436,6 +498,12 @@ fn ensure_qemu_command(command: &ResolvedVmCommand) -> Result<()> {
             bail!("shared directory does not exist: {}", shared_dir.display());
         }
     }
+    if command.profile.arch == VmArch::Aarch64
+        && command.accel.iter().any(|accel| accel == "hvf")
+        && std::env::consts::ARCH != "aarch64"
+    {
+        bail!("aarch64-virt-hvf requires an aarch64 host; pass --accel tcg explicitly for TCG");
+    }
     Ok(())
 }
 
@@ -490,13 +558,11 @@ fn prepare_boot_artifact(
 ) -> Result<PathBuf> {
     match command.profile.boot_artifact {
         VmBootArtifactKind::KernelBinary => Ok(command.kernel.clone()),
-        VmBootArtifactKind::LimineUefiDiskImage => {
-            prepare_x86_limine_uefi_image(command, runtime_dir)
-        }
+        VmBootArtifactKind::LimineUefiDiskImage => prepare_limine_uefi_image(command, runtime_dir),
     }
 }
 
-fn prepare_x86_limine_uefi_image(
+fn prepare_limine_uefi_image(
     command: &ResolvedVmCommand,
     runtime_dir: Option<&Path>,
 ) -> Result<PathBuf> {
@@ -506,24 +572,39 @@ fn prepare_x86_limine_uefi_image(
         Some(dir) => dir.join("kernel.uefi.img"),
         None => kernel.with_extension("uefi.img"),
     };
-    let spinner = spinner("building x86_64 Limine UEFI disk image");
+    let spinner = spinner(&format!(
+        "building {} Limine UEFI disk image",
+        arch_label(command.profile.arch)
+    ));
     let cli = discover_helios_cli()?;
     let status = Command::new(&cli)
-        .arg("x86-limine-uefi-image")
+        .arg("limine-uefi-image")
         .arg("--kernel")
         .arg(&kernel)
         .arg("--output")
         .arg(&image)
         .arg("--baud")
         .arg(command.baud.to_string())
+        .arg("--efi-arch")
+        .arg(limine_efi_arch_argument(command.profile.arch))
         .status()
         .with_context(|| format!("failed to spawn {}", cli.display()))?;
     if !status.success() {
         spinner.finish_and_clear();
-        bail!("helios-cli x86-limine-uefi-image exited with status {status}");
+        bail!("helios-cli limine-uefi-image exited with status {status}");
     }
     spinner.finish_with_message(format!("{} {}", style("built").green(), image.display()));
     Ok(image)
+}
+
+fn limine_efi_arch_argument(arch: VmArch) -> &'static str {
+    match arch {
+        VmArch::Aarch64 => "aarch64",
+        VmArch::X86_64 => "x86-64",
+        VmArch::Riscv64 => {
+            panic!("riscv64 does not use Limine UEFI boot artifacts")
+        }
+    }
 }
 
 fn discover_helios_cli() -> Result<PathBuf> {
@@ -550,6 +631,7 @@ fn discover_helios_cli() -> Result<PathBuf> {
 
 fn arch_label(arch: VmArch) -> &'static str {
     match arch {
+        VmArch::Aarch64 => "aarch64",
         VmArch::Riscv64 => "riscv64",
         VmArch::X86_64 => "x86_64",
     }
@@ -667,8 +749,6 @@ impl VmRuntime {
         }
         if let Some(cpu) = &command.cpu {
             qemu.arg("-cpu").arg(cpu);
-        } else if command.profile.arch == VmArch::X86_64 {
-            qemu.arg("-cpu").arg("max");
         }
         qemu.args(&command.qemu_arg);
         qemu.process_group(0);
@@ -913,9 +993,9 @@ fn configure_firmware(
         return Ok(());
     }
     if command.profile.boot_artifact == VmBootArtifactKind::LimineUefiDiskImage {
-        let code = discover_qemu_edk2_x86_64_code(&command.qemu_bin)?;
-        let vars_template = discover_qemu_edk2_x86_64_vars(&code)?;
-        let vars = runtime_dir.join("edk2-x86_64-vars.fd");
+        let code = discover_qemu_edk2_code(command.profile.arch, &command.qemu_bin)?;
+        let vars_template = discover_qemu_edk2_vars(command.profile.arch, &code)?;
+        let vars = runtime_dir.join(format!("edk2-{}-vars.fd", arch_label(command.profile.arch)));
         fs::copy(&vars_template, &vars).with_context(|| {
             format!(
                 "failed to prepare EDK2 variable store {} from {}",
@@ -933,15 +1013,17 @@ fn configure_firmware(
     Ok(())
 }
 
-fn discover_qemu_edk2_x86_64_code(qemu_bin: &Path) -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("HELIOS_EDK2_X86_64_CODE").map(PathBuf::from) {
+fn discover_qemu_edk2_code(arch: VmArch, qemu_bin: &Path) -> Result<PathBuf> {
+    let env_var = match arch {
+        VmArch::Aarch64 => "HELIOS_EDK2_AARCH64_CODE",
+        VmArch::X86_64 => "HELIOS_EDK2_X86_64_CODE",
+        VmArch::Riscv64 => panic!("riscv64 does not use EDK2 firmware"),
+    };
+    if let Some(path) = std::env::var_os(env_var).map(PathBuf::from) {
         if path.is_file() {
             return Ok(path);
         }
-        bail!(
-            "HELIOS_EDK2_X86_64_CODE does not point to a file: {}",
-            path.display()
-        );
+        bail!("{env_var} does not point to a file: {}", path.display());
     }
     let qemu_bin = if qemu_bin.components().count() == 1 {
         find_executable_in_path(qemu_bin.to_str().unwrap_or("")).unwrap_or_else(|| qemu_bin.into())
@@ -950,18 +1032,29 @@ fn discover_qemu_edk2_x86_64_code(qemu_bin: &Path) -> Result<PathBuf> {
     };
     let mut candidates = Vec::new();
     if let Some(prefix) = qemu_bin.parent().and_then(Path::parent) {
-        candidates.push(prefix.join("share/qemu/edk2-x86_64-code.fd"));
+        candidates.push(prefix.join("share/qemu").join(edk2_code_filename(arch)));
     }
     candidates.extend([
-        PathBuf::from("/opt/homebrew/share/qemu/edk2-x86_64-code.fd"),
-        PathBuf::from("/usr/local/share/qemu/edk2-x86_64-code.fd"),
+        PathBuf::from("/opt/homebrew/share/qemu").join(edk2_code_filename(arch)),
+        PathBuf::from("/usr/local/share/qemu").join(edk2_code_filename(arch)),
     ]);
     candidates
         .into_iter()
         .find(|path| path.is_file())
         .ok_or_else(|| {
-            anyhow::anyhow!("failed to find QEMU EDK2 x86_64 firmware; set HELIOS_EDK2_X86_64_CODE")
+            anyhow::anyhow!(
+                "failed to find QEMU EDK2 {} firmware; set {env_var}",
+                arch_label(arch)
+            )
         })
+}
+
+fn edk2_code_filename(arch: VmArch) -> &'static str {
+    match arch {
+        VmArch::Aarch64 => "edk2-aarch64-code.fd",
+        VmArch::X86_64 => "edk2-x86_64-code.fd",
+        VmArch::Riscv64 => panic!("riscv64 does not use EDK2 firmware"),
+    }
 }
 
 fn find_executable_in_path(name: &str) -> Option<PathBuf> {
@@ -971,19 +1064,25 @@ fn find_executable_in_path(name: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-fn discover_qemu_edk2_x86_64_vars(code: &Path) -> Result<PathBuf> {
-    for vars in [
-        code.with_file_name("edk2-x86_64-vars.fd"),
-        code.with_file_name("edk2-i386-vars.fd"),
-    ] {
+fn discover_qemu_edk2_vars(arch: VmArch, code: &Path) -> Result<PathBuf> {
+    for vars in edk2_vars_filenames(arch).map(|name| code.with_file_name(name)) {
         if vars.is_file() {
             return Ok(vars);
         }
     }
     bail!(
-        "failed to find QEMU EDK2 x86_64 variable store next to {}",
+        "failed to find QEMU EDK2 {} variable store next to {}",
+        arch_label(arch),
         code.display()
     )
+}
+
+fn edk2_vars_filenames(arch: VmArch) -> impl Iterator<Item = &'static str> {
+    match arch {
+        VmArch::Aarch64 => ["edk2-aarch64-vars.fd", "edk2-arm-vars.fd"].into_iter(),
+        VmArch::X86_64 => ["edk2-x86_64-vars.fd", "edk2-i386-vars.fd"].into_iter(),
+        VmArch::Riscv64 => panic!("riscv64 does not use EDK2 firmware"),
+    }
 }
 
 fn configure_network_device(qemu: &mut Command, network: VmNetworkProfile) {
@@ -1037,6 +1136,15 @@ fn configure_host_share(qemu: &mut Command, host_share: VmHostShareProfile, shar
                 "virtio-9p-device,fsdev=hostfs,mount_tag={HOST_SHARE_MOUNT_TAG}"
             ));
         }
+        VmHostShareProfile::Virtio9pPci => {
+            qemu.arg("-fsdev").arg(format!(
+                "local,id=hostfs,path={},security_model=none,multidevs=remap",
+                shared_dir.display()
+            ));
+            qemu.arg("-device").arg(format!(
+                "virtio-9p-pci,fsdev=hostfs,mount_tag={HOST_SHARE_MOUNT_TAG}"
+            ));
+        }
     }
 }
 
@@ -1080,6 +1188,35 @@ mod tests {
     const DEBUGGER_RUN_STAGE_MARKER: &[u8] = b"[KDBG run:begin]";
 
     #[test]
+    fn aarch64_profiles_are_modern_virt_only() {
+        assert_eq!(AARCH64_VIRT_HVF_PROFILE.arch, VmArch::Aarch64);
+        assert_eq!(AARCH64_VIRT_HVF_PROFILE.machine, "virt,gic-version=3");
+        assert_eq!(AARCH64_VIRT_HVF_PROFILE.default_accel, &["hvf"]);
+        assert_eq!(AARCH64_VIRT_HVF_PROFILE.default_cpu, Some("host"));
+        assert_eq!(
+            AARCH64_VIRT_HVF_PROFILE.boot_artifact,
+            VmBootArtifactKind::LimineUefiDiskImage
+        );
+        assert_eq!(
+            AARCH64_VIRT_HVF_PROFILE.network,
+            Some(VmNetworkProfile::VirtioPciUser)
+        );
+        assert_eq!(
+            AARCH64_VIRT_HVF_PROFILE.block,
+            Some(VmBlockProfile::VirtioPciBootDisk)
+        );
+        assert_eq!(
+            AARCH64_VIRT_HVF_PROFILE.host_share,
+            Some(VmHostShareProfile::Virtio9pPci)
+        );
+
+        assert_eq!(AARCH64_VIRT_TCG_PROFILE.default_accel, &["tcg"]);
+        assert_eq!(AARCH64_VIRT_TCG_PROFILE.default_cpu, Some("max"));
+        assert_ne!(AARCH64_VIRT_HVF_PROFILE.machine, "sbsa-ref");
+        assert!(!AARCH64_VIRT_HVF_PROFILE.machine.contains("raspi"));
+    }
+
+    #[test]
     fn riscv64_profile_matches_qemu_first_baseline() {
         assert_eq!(RISCV64_VM_PROFILE.arch, VmArch::Riscv64);
         assert_eq!(RISCV64_VM_PROFILE.machine, "virt");
@@ -1110,6 +1247,8 @@ mod tests {
     fn x86_64_profile_matches_qemu_first_baseline() {
         assert_eq!(X86_64_VM_PROFILE.arch, VmArch::X86_64);
         assert_eq!(X86_64_VM_PROFILE.machine, "q35");
+        assert_ne!(X86_64_VM_PROFILE.machine, "pc");
+        assert!(!X86_64_VM_PROFILE.machine.contains("i440fx"));
         assert_eq!(
             X86_64_VM_PROFILE.boot_artifact,
             VmBootArtifactKind::LimineUefiDiskImage
@@ -1270,20 +1409,25 @@ mod tests {
     }
 
     fn watchdog_test_command(arch: VmArch) -> ResolvedVmCommand {
+        let profile = arch.profile();
         ResolvedVmCommand {
-            profile: arch.profile(),
+            profile,
             release: false,
             kernel_debug: false,
-            qemu_bin: PathBuf::from(arch.profile().qemu_bin),
+            qemu_bin: PathBuf::from(profile.qemu_bin),
             kernel: default_kernel_path(arch, build_profile_dir(false, false)),
             socket: None,
             no_build: true,
-            smp: arch.profile().default_smp,
-            memory: arch.profile().default_memory.to_owned(),
-            bios: arch.profile().default_bios.map(str::to_owned),
+            smp: profile.default_smp,
+            memory: profile.default_memory.to_owned(),
+            bios: profile.default_bios.map(str::to_owned),
             baud: DEFAULT_BAUD,
-            cpu: None,
-            accel: Vec::new(),
+            cpu: profile.default_cpu.map(str::to_owned),
+            accel: profile
+                .default_accel
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
             shared_dir: None,
             gdb: None,
             gdb_wait: false,
@@ -1428,8 +1572,12 @@ mod tests {
             memory: profile.default_memory.to_owned(),
             bios: profile.default_bios.map(str::to_owned),
             baud: DEFAULT_BAUD,
-            cpu: None,
-            accel: Vec::new(),
+            cpu: profile.default_cpu.map(str::to_owned),
+            accel: profile
+                .default_accel
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
             shared_dir: Some(repo_root().to_path_buf()),
             gdb: None,
             gdb_wait: false,

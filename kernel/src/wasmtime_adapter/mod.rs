@@ -19,9 +19,9 @@ use crate::component_host::{
     ComponentBindingSet, HostRuntimeState, StoreData, component_linker, store_with_state,
 };
 use crate::{
-    CodegenPlatform, CompiledComponent, ComponentExecContext, ComponentExecutor,
-    ComponentExitStatus, ComponentRunResult, ComponentRuntimeEngine, ComponentRuntimeFactory,
-    ComponentWorld, HostFileSystem,
+    CompiledComponent, ComponentExecContext, ComponentExecutor, ComponentExitStatus,
+    ComponentRunResult, ComponentRuntimeEngine, ComponentRuntimeFactory, ComponentWorld,
+    HostFileSystem,
 };
 
 /// Wasmtime-backed compiled component artifact.
@@ -60,7 +60,7 @@ impl ComponentRuntimeEngine for WasmtimeEngine {
 /// A running Wasmtime component instance.
 pub struct WasmtimeExecutor<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: HostFileSystem,
 {
     store: wasmtime::Store<StoreData<CpuImpl, HostFs>>,
@@ -69,7 +69,7 @@ where
 
 impl<CpuImpl, HostFs> ComponentExecutor for WasmtimeExecutor<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: HostFileSystem,
 {
     type Error = wasmtime::Error;
@@ -105,7 +105,7 @@ fn interpret_run_result<CpuImpl, HostFs>(
     store_data: &mut StoreData<CpuImpl, HostFs>,
 ) -> wasmtime::Result<(ComponentExitStatus, u32)>
 where
-    CpuImpl: Cpu + CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: HostFileSystem,
 {
     match raw {
@@ -134,7 +134,7 @@ pub struct WasmtimeComponentRuntime<P> {
     platform: P,
 }
 
-impl<P: CodegenPlatform + Clone> WasmtimeComponentRuntime<P> {
+impl<P: Cpu + Clone> WasmtimeComponentRuntime<P> {
     pub fn new(platform: P) -> Self {
         Self { platform }
     }
@@ -143,9 +143,9 @@ impl<P: CodegenPlatform + Clone> WasmtimeComponentRuntime<P> {
 impl<CpuImpl, HostFs, P> ComponentRuntimeFactory<CpuImpl, HostRuntimeState<CpuImpl, HostFs>, HostFs>
     for WasmtimeComponentRuntime<P>
 where
-    CpuImpl: Cpu + CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: HostFileSystem,
-    P: CodegenPlatform + Clone,
+    P: Cpu + Clone,
 {
     type Engine = WasmtimeEngine;
     type Executor = WasmtimeExecutor<CpuImpl, HostFs>;

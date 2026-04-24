@@ -2,7 +2,7 @@ use alloc::borrow::ToOwned;
 use alloc::format;
 use alloc::sync::Arc;
 
-use crate::CodegenPlatform;
+use helios_hal::cpu::Cpu;
 use wasmtime::component::{Component, Instance, TypedFunc};
 use wasmtime::{AsContextMut, CustomCodeMemory, Engine};
 
@@ -12,7 +12,7 @@ struct PlatformCodeMemory<P> {
     platform: P,
 }
 
-impl<P: CodegenPlatform + Clone> CustomCodeMemory for PlatformCodeMemory<P> {
+impl<P: Cpu + Clone> CustomCodeMemory for PlatformCodeMemory<P> {
     fn required_alignment(&self) -> usize {
         1
     }
@@ -27,7 +27,7 @@ impl<P: CodegenPlatform + Clone> CustomCodeMemory for PlatformCodeMemory<P> {
     }
 }
 
-fn build_engine_for_platform<P: CodegenPlatform + Clone>(
+fn build_engine_for_platform<P: Cpu + Clone>(
     platform: &P,
     concurrency_support: bool,
 ) -> wasmtime::Result<Engine> {
@@ -51,7 +51,7 @@ fn build_engine_for_platform<P: CodegenPlatform + Clone>(
     Engine::new(&config)
 }
 
-pub fn build_component_engine_for_platform<P: CodegenPlatform + Clone>(
+pub fn build_component_engine_for_platform<P: Cpu + Clone>(
     platform: &P,
 ) -> wasmtime::Result<Engine> {
     build_engine_for_platform(platform, true)

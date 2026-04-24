@@ -185,6 +185,7 @@ fn convert_launch_error_kind(kind: host_programs::ExecErrorKind) -> programs::Ex
         host_programs::ExecErrorKind::InvalidSignature => programs::ExecErrorKind::InvalidSignature,
         host_programs::ExecErrorKind::InvalidPath => programs::ExecErrorKind::InvalidPath,
         host_programs::ExecErrorKind::InvalidHint => programs::ExecErrorKind::InvalidHint,
+        host_programs::ExecErrorKind::OutOfMemory => programs::ExecErrorKind::OutOfMemory,
         host_programs::ExecErrorKind::Unavailable => programs::ExecErrorKind::Unavailable,
         host_programs::ExecErrorKind::Internal => programs::ExecErrorKind::Internal,
     }

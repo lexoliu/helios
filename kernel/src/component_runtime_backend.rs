@@ -133,7 +133,7 @@ pub trait ComponentExecutor: Send + 'static {
 pub trait ComponentRuntimeFactory<CpuImpl, RuntimeStateImpl, HostFs>:
     Clone + Send + Sync + 'static
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
     HostFs: HostFileSystem,
 {

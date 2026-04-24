@@ -125,7 +125,7 @@ impl<FileSystem> ComponentExecutionContext<FileSystem> {
 impl<CpuImpl, RuntimeStateImpl, FileSystem>
     ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
     FileSystem: Send,
 {
@@ -312,7 +312,7 @@ where
 
 impl<CpuImpl, RuntimeStateImpl> DeadlinePollable<CpuImpl, RuntimeStateImpl>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
 {
     pub fn new(cpu: CpuImpl, runtime_state: RuntimeStateImpl, deadline_nanos: u64) -> Self {

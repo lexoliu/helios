@@ -39,9 +39,9 @@ crates.
 ## 2. Construction over conditional compilation
 
 - The kernel must not select runtimes, probe features, or switch behaviour
-  based on `#[cfg(target_arch)]`. Capabilities are injected through separate
-  adapter traits supplied by the backend (for example `CodegenPlatform` for
-  executable-code publication and ISA feature probing).
+  based on `#[cfg(target_arch)]`. Capabilities are injected through the backend
+  `Cpu` implementation, including executable-code publication and ISA feature
+  probing.
 - Runtime consumers in `kernel/` depend on traits (for example
   `ComponentRuntimeFactory`, `HostFileSystem`), not on concrete Wasmtime types.
   Concrete runtimes are adapters that satisfy those traits.

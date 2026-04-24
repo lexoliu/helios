@@ -1,5 +1,6 @@
 use super::*;
 use crate::wasmtime_adapter::config::AotCompileHint;
+use bytes::Bytes;
 use helios_hal::watchdog::Watchdog;
 use wasmtime::component::Component;
 
@@ -11,7 +12,7 @@ const PROGRAM_PHASE_HEARTBEAT_INTERVAL_NANOS: u64 = 5_000_000_000;
 #[derive(Clone)]
 pub struct UserProgramService<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     inner: Arc<UserProgramServiceInner<CpuImpl, HostFs>>,
@@ -20,7 +21,7 @@ where
 #[derive(Clone)]
 pub(crate) struct ProgramExecContext<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     cpu: CpuImpl,
@@ -33,7 +34,7 @@ where
 
 struct UserProgramServiceInner<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     runtime: crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
@@ -51,9 +52,9 @@ struct ProgramSpawnRequest {
 }
 
 pub(crate) enum ProgramSource {
-    RawWasm(Vec<u8>),
-    SignedArtifact(Vec<u8>),
-    BootfsArtifact(Vec<u8>),
+    RawWasm(Bytes),
+    SignedArtifact(Bytes),
+    BootfsArtifact(Bytes),
 }
 
 fn spawn_program_phase_heartbeat<CpuImpl>(
@@ -161,7 +162,7 @@ pub fn install_program_service<CpuImpl, HostFs, WatchdogImpl>(
     debug_state: &HostRuntimeState<CpuImpl, HostFs>,
 ) -> UserProgramService<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
     WatchdogImpl: Watchdog + Clone,
 {
@@ -174,7 +175,7 @@ pub fn install_component_host_program_service<CpuImpl, HostFs, WatchdogImpl>(
     debug_state: &HostRuntimeState<CpuImpl, HostFs>,
 ) -> Option<UserProgramService<CpuImpl, HostFs>>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
     WatchdogImpl: Watchdog + Clone,
 {
@@ -191,7 +192,7 @@ fn install_program_service_inner<CpuImpl, HostFs>(
     debug_state: &HostRuntimeState<CpuImpl, HostFs>,
 ) -> UserProgramService<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     if let Some(service) = debug_state.program_service() {
@@ -226,7 +227,7 @@ pub fn run_embedded_component_forever<CpuImpl, HostFs, WatchdogImpl>(
     write_serial: fn(&[u8]),
 ) -> !
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
     WatchdogImpl: Watchdog + Clone,
 {
@@ -261,7 +262,7 @@ pub fn run_program_workers_forever<CpuImpl, HostFs, WatchdogImpl>(
     _debug_state: HostRuntimeState<CpuImpl, HostFs>,
 ) -> !
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
     WatchdogImpl: Watchdog + Clone,
 {
@@ -276,7 +277,7 @@ pub fn run_component_host_processor_forever<CpuImpl, HostFs, WatchdogImpl>(
     write_serial: fn(&[u8]),
 ) -> !
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
     WatchdogImpl: Watchdog + Clone,
 {
@@ -305,7 +306,7 @@ where
 
 impl<CpuImpl, HostFs> UserProgramService<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     pub fn increment_epoch(&self) {
@@ -492,7 +493,7 @@ where
     pub(crate) async fn aot(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, HostFs>,
-        wasm: &[u8],
+        wasm: &Bytes,
         hint: AotCompileHint,
     ) -> Result<Vec<u8>, ProgramExecError> {
         self.compile_raw_component_to_signed_artifact(exec_context, wasm, hint)
@@ -507,37 +508,32 @@ where
         write_serial: fn(&[u8]),
     ) -> Result<Arc<crate::wasmtime_adapter::WasmtimeCompiledComponent>, ProgramExecError> {
         let started_at = monotonic_nanos(&self.inner.clock_cpu);
-        let payload: Arc<[u8]> = match source {
+        let payload = match source {
             ProgramSource::SignedArtifact(bytes) => {
-                let trusted = crate::verify_signed_artifact(crate::UntrustedCwasm::new(bytes))
-                    .map_err(map_artifact_trust_error)?;
                 if hint.is_some() {
                     return Err(ProgramExecError {
                         kind: ProgramExecErrorKind::InvalidHint,
                         detail: "exec hint is not allowed for signed cwasm inputs".into(),
                     });
                 }
-                Arc::from(trusted.payload().to_vec())
+                trusted_signed_payload(bytes)?
             }
             ProgramSource::BootfsArtifact(bytes) => {
-                let trusted = crate::trust_bootfs_artifact(crate::UntrustedCwasm::new(bytes))
-                    .map_err(map_artifact_trust_error)?;
                 if hint.is_some() {
                     return Err(ProgramExecError {
                         kind: ProgramExecErrorKind::InvalidHint,
                         detail: "exec hint is not allowed for signed cwasm inputs".into(),
                     });
                 }
-                Arc::from(trusted.payload().to_vec())
+                trusted_bootfs_payload(bytes)?
             }
             ProgramSource::RawWasm(wasm) => {
                 let hint = hint.unwrap_or(AotCompileHint::Balanced);
                 let signed = self
                     .compile_raw_component_to_signed_artifact(exec_context, wasm, hint)
                     .await?;
-                let trusted = crate::verify_signed_artifact(crate::UntrustedCwasm::new(&signed))
-                    .map_err(map_artifact_trust_error)?;
-                Arc::from(trusted.payload().to_vec())
+                let signed = Bytes::from(signed);
+                trusted_signed_payload(&signed)?
             }
         };
         self.load_precompiled_component(payload, write_serial, started_at)
@@ -545,7 +541,7 @@ where
 
     fn load_precompiled_component(
         &self,
-        payload: Arc<[u8]>,
+        payload: Bytes,
         write_serial: fn(&[u8]),
         started_at: u64,
     ) -> Result<Arc<crate::wasmtime_adapter::WasmtimeCompiledComponent>, ProgramExecError> {
@@ -571,7 +567,7 @@ where
             wasm_bytes = payload.len(),
             "program component deserialization started"
         );
-        let compiled = self.deserialize_component(payload.as_ref())?;
+        let compiled = self.deserialize_component(&payload)?;
         super::emit_stage_marker(write_serial, "program:compile-end");
         let component = Arc::new(compiled);
         let now = monotonic_nanos(&self.inner.clock_cpu);
@@ -605,7 +601,7 @@ where
     async fn compile_raw_component_to_signed_artifact(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, HostFs>,
-        wasm: &[u8],
+        wasm: &Bytes,
         hint: AotCompileHint,
     ) -> Result<Vec<u8>, ProgramExecError> {
         let compiler_artifact = self.read_compiler_plugin_artifact(exec_context)?;
@@ -649,17 +645,18 @@ where
     fn read_compiler_plugin_artifact(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, HostFs>,
-    ) -> Result<Vec<u8>, ProgramExecError> {
+    ) -> Result<Bytes, ProgramExecError> {
         let filesystem = crate::wasmtime_adapter::wasi::DebugFileSystem::<
             HostRuntimeState<CpuImpl, HostFs>,
             HostFs,
         >::new(exec_context.runtime_state.clone());
-        filesystem
-            .read_program_file(COMPILER_PLUGIN_PATH)
+        let bytes = filesystem
+            .read_program_file_bytes(COMPILER_PLUGIN_PATH)
             .map_err(|error| ProgramExecError {
                 kind: ProgramExecErrorKind::InvalidPath,
                 detail: format!("failed to read compiler plugin {COMPILER_PLUGIN_PATH}: {error}"),
-            })
+            })?;
+        Ok(bytes)
     }
 }
 
@@ -675,7 +672,7 @@ fn trusted_root_signing_key_hex() -> String {
 
 impl<CpuImpl, HostFs> ProgramExecContext<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     pub(crate) fn from_store(store: &StoreData<CpuImpl, HostFs>) -> Self {
@@ -708,7 +705,7 @@ async fn run_program_component<CpuImpl, HostFs>(
     stderr_writer: crate::ByteWriter,
 ) -> Result<ChildExit, ProgramExecError>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     use crate::{ComponentExecContext, ComponentExecutor, ComponentRuntimeFactory, ComponentWorld};
@@ -773,7 +770,14 @@ where
     })
 }
 
-fn map_program_runtime_error(error: impl core::fmt::Display) -> ProgramExecError {
+fn map_program_runtime_error(error: wasmtime::Error) -> ProgramExecError {
+    if error.is::<crate::ProgramOutOfMemory>() {
+        return ProgramExecError {
+            kind: ProgramExecErrorKind::OutOfMemory,
+            detail: format!("{error:#}"),
+        };
+    }
+
     ProgramExecError {
         kind: ProgramExecErrorKind::Internal,
         detail: format!("{error:#}"),
@@ -787,10 +791,16 @@ fn map_artifact_trust_error(error: crate::ArtifactTrustError) -> ProgramExecErro
     }
 }
 
-fn trusted_bootfs_payload(bytes: &[u8]) -> Result<Arc<[u8]>, ProgramExecError> {
+fn trusted_bootfs_payload(bytes: &Bytes) -> Result<Bytes, ProgramExecError> {
     let trusted = crate::trust_bootfs_artifact(crate::UntrustedCwasm::new(bytes))
         .map_err(map_artifact_trust_error)?;
-    Ok(Arc::from(trusted.payload().to_vec()))
+    Ok(bytes.slice(..trusted.payload().len()))
+}
+
+fn trusted_signed_payload(bytes: &Bytes) -> Result<Bytes, ProgramExecError> {
+    let trusted = crate::verify_signed_artifact(crate::UntrustedCwasm::new(bytes))
+        .map_err(map_artifact_trust_error)?;
+    Ok(bytes.slice(..trusted.payload().len()))
 }
 
 mod generated {

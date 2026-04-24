@@ -15,6 +15,7 @@ use crate::{
     ComponentNetworkService, EmbeddedBootFile, EmbeddedBootFs, HostFsErrorKind, embedded_init,
     yield_now,
 };
+use bytes::{Bytes, BytesMut};
 use futures::channel::oneshot;
 use helios_hal::cpu::Cpu;
 use spin::Mutex;
@@ -46,7 +47,7 @@ pub(crate) fn add_to_linker<CpuImpl, HostFs>(
     linker: &mut Linker<StoreData<CpuImpl, HostFs>>,
 ) -> Result<()>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     wasi::clocks::monotonic_clock::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
@@ -130,7 +131,7 @@ where
 struct FsNode {
     path: String,
     kind: FsNodeKind,
-    contents: Vec<u8>,
+    contents: Bytes,
     inode: u64,
     modified_nanos: u64,
     readonly: bool,
@@ -606,7 +607,7 @@ pub(crate) struct DebugFileSystem<State, HostFsService> {
 
 struct SerialStreamConsumer<T, CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     getter: fn(&mut T) -> &mut StoreData<CpuImpl, HostFs>,
@@ -616,7 +617,7 @@ where
 
 impl<T, CpuImpl, HostFs> SerialStreamConsumer<T, CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn new(
@@ -640,7 +641,7 @@ where
 
 impl<T, CpuImpl, HostFs> Drop for SerialStreamConsumer<T, CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn drop(&mut self) {
@@ -650,7 +651,7 @@ where
 
 impl<T: 'static, CpuImpl, HostFs> StreamConsumer<T> for SerialStreamConsumer<T, CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     type Item = u8;
@@ -683,7 +684,7 @@ enum FileWriteMode {
 
 struct FileWriteConsumer<T, CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     getter: fn(&mut T) -> &mut StoreData<CpuImpl, HostFs>,
@@ -694,7 +695,7 @@ where
 
 struct FileReadStreamProducer<T, CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     getter: fn(&mut T) -> &mut StoreData<CpuImpl, HostFs>,
@@ -706,7 +707,7 @@ where
 
 impl<T, CpuImpl, HostFs> FileReadStreamProducer<T, CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn new(
@@ -734,7 +735,7 @@ where
 
 impl<T, CpuImpl, HostFs> Drop for FileReadStreamProducer<T, CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn drop(&mut self) {
@@ -744,7 +745,7 @@ where
 
 impl<T: 'static, CpuImpl, HostFs> StreamProducer<T> for FileReadStreamProducer<T, CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     type Item = u8;
@@ -793,7 +794,7 @@ where
 
 impl<T, CpuImpl, HostFs> FileWriteConsumer<T, CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn new_at(
@@ -832,7 +833,7 @@ where
 
 impl<T, CpuImpl, HostFs> Drop for FileWriteConsumer<T, CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn drop(&mut self) {
@@ -842,7 +843,7 @@ where
 
 impl<T: 'static, CpuImpl, HostFs> StreamConsumer<T> for FileWriteConsumer<T, CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     type Item = u8;
@@ -905,7 +906,7 @@ where
             nodes: vec![FsNode {
                 path: String::from("/"),
                 kind: FsNodeKind::Directory,
-                contents: Vec::new(),
+                contents: Bytes::new(),
                 inode: 1,
                 modified_nanos: 0,
                 readonly: false,
@@ -955,7 +956,7 @@ where
         self.nodes.push(FsNode {
             path: absolute,
             kind: FsNodeKind::File,
-            contents: file.contents().to_vec(),
+            contents: Bytes::from_static(file.contents()),
             inode,
             modified_nanos: 0,
             readonly: true,
@@ -966,14 +967,14 @@ where
     /// reads can proceed synchronously without async 9p I/O.
     pub(crate) fn seed_host_file_content(&mut self, path: &str, content: Vec<u8>) {
         if let Some(node) = self.nodes.iter_mut().find(|n| n.path == path) {
-            node.contents = content;
+            node.contents = Bytes::from(content);
             return;
         }
         let inode = self.allocate_inode();
         self.nodes.push(FsNode {
             path: path.to_owned(),
             kind: FsNodeKind::File,
-            contents: content,
+            contents: Bytes::from(content),
             inode,
             modified_nanos: 0,
             readonly: true,
@@ -1012,7 +1013,7 @@ where
                 } else {
                     FsNodeKind::File
                 },
-                contents: Vec::new(),
+                contents: Bytes::new(),
                 inode,
                 modified_nanos: 0,
                 readonly: true,
@@ -1039,7 +1040,7 @@ where
         self.nodes.push(FsNode {
             path: path.to_owned(),
             kind: FsNodeKind::Directory,
-            contents: Vec::new(),
+            contents: Bytes::new(),
             inode,
             modified_nanos: 0,
             readonly,
@@ -1221,20 +1222,21 @@ where
         let offset: usize = offset
             .try_into()
             .map_err(|_| fs_types::ErrorCode::Overflow)?;
-        if offset >= node.contents.len() {
+        let contents = node.contents.as_ref();
+        if offset >= contents.len() {
             return Ok(Vec::new());
         }
         let end = offset
             .checked_add(max_bytes)
-            .map(|value| value.min(node.contents.len()))
+            .map(|value| value.min(contents.len()))
             .ok_or(fs_types::ErrorCode::Overflow)?;
-        Ok(node.contents[offset..end].to_vec())
+        Ok(contents[offset..end].to_vec())
     }
 
-    pub(crate) fn read_program_file(
+    pub(crate) fn read_program_file_bytes(
         &self,
         path: &str,
-    ) -> core::result::Result<Vec<u8>, fs_types::ErrorCode> {
+    ) -> core::result::Result<Bytes, fs_types::ErrorCode> {
         let node = self.get_node(path)?;
         if node.kind != FsNodeKind::File {
             return Err(fs_types::ErrorCode::IsDirectory);
@@ -1260,8 +1262,7 @@ where
                 if node.readonly {
                     return Err(fs_types::ErrorCode::ReadOnly);
                 }
-                node.contents.clear();
-                node.contents.extend_from_slice(bytes);
+                node.contents = Bytes::copy_from_slice(bytes);
                 node.modified_nanos = now_nanos;
                 Ok(())
             }
@@ -1278,7 +1279,7 @@ where
                 self.nodes.push(FsNode {
                     path: path.to_owned(),
                     kind: FsNodeKind::File,
-                    contents: bytes.to_vec(),
+                    contents: Bytes::copy_from_slice(bytes),
                     inode,
                     modified_nanos: now_nanos,
                     readonly: false,
@@ -1325,13 +1326,15 @@ where
         let end = offset
             .checked_add(bytes.len())
             .ok_or(fs_types::ErrorCode::Overflow)?;
-        if node.contents.len() < offset {
-            node.contents.resize(offset, 0);
+        let mut contents = BytesMut::from(&node.contents[..]);
+        if contents.len() < offset {
+            contents.resize(offset, 0);
         }
-        if node.contents.len() < end {
-            node.contents.resize(end, 0);
+        if contents.len() < end {
+            contents.resize(end, 0);
         }
-        node.contents[offset..end].copy_from_slice(bytes);
+        contents[offset..end].copy_from_slice(bytes);
+        node.contents = contents.freeze();
         node.modified_nanos = now_nanos;
         Ok(())
     }
@@ -1404,7 +1407,7 @@ where
                 {
                     return Err(fs_types::ErrorCode::ReadOnly);
                 }
-                existing.contents.clear();
+                existing.contents = Bytes::new();
                 existing.modified_nanos = now_nanos;
             }
             return Ok(FsDescriptor {
@@ -1440,7 +1443,7 @@ where
         let node = FsNode {
             path: absolute.clone(),
             kind: FsNodeKind::File,
-            contents: Vec::new(),
+            contents: Bytes::new(),
             inode,
             modified_nanos: now_nanos,
             readonly: false,
@@ -1526,7 +1529,7 @@ where
         self.nodes.push(FsNode {
             path: absolute,
             kind: FsNodeKind::Directory,
-            contents: Vec::new(),
+            contents: Bytes::new(),
             inode,
             modified_nanos: now_nanos,
             readonly: false,
@@ -1648,7 +1651,7 @@ where
 
 impl<CpuImpl, HostFs> wasi::clocks::monotonic_clock::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn now(&mut self) -> Result<wasi::clocks::monotonic_clock::Mark> {
@@ -1663,7 +1666,7 @@ where
 impl<CpuImpl, HostFs> wasi::clocks::monotonic_clock::HostWithStore
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     async fn wait_until<T: Send>(
@@ -1688,7 +1691,7 @@ where
 
 impl<CpuImpl, HostFs> wasi::clocks::system_clock::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn now(&mut self) -> Result<wasi::clocks::system_clock::Instant> {
@@ -1702,7 +1705,7 @@ where
 
 impl<CpuImpl, HostFs> wasi::cli::environment::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn get_arguments(&mut self) -> Result<Vec<String>> {
@@ -1720,7 +1723,7 @@ where
 
 impl<CpuImpl, HostFs> wasi::cli::exit::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn exit(&mut self, status: core::result::Result<(), ()>) -> Result<()> {
@@ -1744,14 +1747,14 @@ where
 
 impl<CpuImpl, HostFs> wasi::cli::stdin::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
 
 impl<CpuImpl, HostFs> wasi::cli::stdin::HostWithStore for HasSelf<StoreData<CpuImpl, HostFs>>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn read_via_stream<T>(
@@ -1933,14 +1936,14 @@ impl<T: 'static> StreamConsumer<T> for ChannelStreamConsumer {
 
 impl<CpuImpl, HostFs> wasi::cli::stdout::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
 
 impl<CpuImpl, HostFs> wasi::cli::stdout::HostWithStore for HasSelf<StoreData<CpuImpl, HostFs>>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn write_via_stream<T>(
@@ -1964,14 +1967,14 @@ where
 
 impl<CpuImpl, HostFs> wasi::cli::stderr::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
 
 impl<CpuImpl, HostFs> wasi::cli::stderr::HostWithStore for HasSelf<StoreData<CpuImpl, HostFs>>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn write_via_stream<T>(
@@ -1995,13 +1998,13 @@ where
 
 impl<CpuImpl, HostFs> wasi::cli::terminal_input::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
 impl<CpuImpl, HostFs> wasi::cli::terminal_input::HostTerminalInput for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn drop(&mut self, resource: Resource<TerminalInput>) -> Result<()> {
@@ -2012,13 +2015,13 @@ where
 
 impl<CpuImpl, HostFs> wasi::cli::terminal_output::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
 impl<CpuImpl, HostFs> wasi::cli::terminal_output::HostTerminalOutput for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn drop(&mut self, resource: Resource<TerminalOutput>) -> Result<()> {
@@ -2029,7 +2032,7 @@ where
 
 impl<CpuImpl, HostFs> wasi::cli::terminal_stdin::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn get_terminal_stdin(&mut self) -> Result<Option<Resource<TerminalInput>>> {
@@ -2039,7 +2042,7 @@ where
 
 impl<CpuImpl, HostFs> wasi::cli::terminal_stdout::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn get_terminal_stdout(&mut self) -> Result<Option<Resource<TerminalOutput>>> {
@@ -2049,7 +2052,7 @@ where
 
 impl<CpuImpl, HostFs> wasi::cli::terminal_stderr::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn get_terminal_stderr(&mut self) -> Result<Option<Resource<TerminalOutput>>> {
@@ -2059,7 +2062,7 @@ where
 
 impl<CpuImpl, HostFs> wasi::random::random::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn get_random_bytes(&mut self, len: u64) -> Result<Vec<u8>> {
@@ -2073,7 +2076,7 @@ where
 
 impl<CpuImpl, HostFs> wasi::random::insecure::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn get_insecure_random_bytes(&mut self, len: u64) -> Result<Vec<u8>> {
@@ -2087,7 +2090,7 @@ where
 
 impl<CpuImpl, HostFs> wasi::random::insecure_seed::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn get_insecure_seed(&mut self) -> Result<(u64, u64)> {
@@ -2097,7 +2100,7 @@ where
 
 impl<CpuImpl, HostFs> wasi::filesystem::preopens::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn get_directories(&mut self) -> Result<Vec<(Resource<FsDescriptor>, String)>> {
@@ -2109,7 +2112,7 @@ where
 
 impl<CpuImpl, HostFs> wasi::filesystem::types::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn convert_error_code(&mut self, error: FsError) -> Result<fs_types::ErrorCode> {
@@ -2118,7 +2121,7 @@ where
 }
 impl<CpuImpl, HostFs> wasi::filesystem::types::HostDescriptor for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn drop(&mut self, descriptor: Resource<FsDescriptor>) -> Result<()> {
@@ -2130,7 +2133,7 @@ where
 impl<CpuImpl, HostFs> wasi::filesystem::types::HostDescriptorWithStore
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     fn read_via_stream<T>(
@@ -2894,13 +2897,13 @@ where
 
 impl<CpuImpl, HostFs> wasi::sockets::types::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
 impl<CpuImpl, HostFs> wasi::sockets::types::HostTcpSocket for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     async fn bind(
@@ -3064,7 +3067,7 @@ where
 
 impl<CpuImpl, HostFs> wasi::sockets::types::HostUdpSocket for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     async fn bind(
@@ -3224,7 +3227,7 @@ where
 impl<CpuImpl, HostFs> wasi::sockets::types::HostTcpSocketWithStore
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     async fn connect<T>(
@@ -3265,7 +3268,7 @@ where
 impl<CpuImpl, HostFs> wasi::sockets::types::HostUdpSocketWithStore
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     async fn send<T>(
@@ -3377,7 +3380,7 @@ fn map_p3_udp_socket_error(error: WasiUdpSocketError) -> socket_types::ErrorCode
 
 impl<CpuImpl, HostFs> wasi::sockets::ip_name_lookup::Host for StoreData<CpuImpl, HostFs>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
 }
@@ -3385,7 +3388,7 @@ where
 impl<CpuImpl, HostFs> wasi::sockets::ip_name_lookup::HostWithStore
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     async fn resolve_addresses<T: Send>(
@@ -3414,7 +3417,7 @@ fn get_fs_descriptor<CpuImpl, HostFs>(
     resource: &Resource<FsDescriptor>,
 ) -> core::result::Result<FsDescriptor, fs_types::ErrorCode>
 where
-    CpuImpl: Cpu + crate::CodegenPlatform + Clone,
+    CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     store

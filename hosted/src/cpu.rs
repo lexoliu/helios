@@ -21,10 +21,6 @@ impl HostedCpu {
     }
 }
 
-impl helios_kernel::CodegenPlatform for HostedCpu {
-    fn publish_executable(&self, _ptr: *const u8, _len: usize) {}
-}
-
 impl Cpu for HostedCpu {
     fn current_processor(&self) -> ProcessorId {
         self.processor
@@ -60,6 +56,12 @@ impl Cpu for HostedCpu {
 
     fn set_deadline(&self, deadline: Instant) {
         self.machine.set_deadline(self.processor, deadline);
+    }
+
+    fn publish_executable(&self, _ptr: *const u8, _len: usize) {}
+
+    fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {
+        None
     }
 
     fn shutdown(&self) -> ! {

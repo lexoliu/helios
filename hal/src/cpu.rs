@@ -96,6 +96,16 @@ pub trait Cpu: Send + Sync + 'static {
     /// this again replaces the previous deadline.
     fn set_deadline(&self, deadline: Instant);
 
+    /// Publishes freshly loaded executable code so that it becomes visible to
+    /// instruction fetches on all processors.
+    ///
+    /// Architectures that require explicit instruction-cache synchronisation
+    /// or page-table permission updates implement the required sequence here.
+    fn publish_executable(&self, ptr: *const u8, len: usize);
+
+    /// Returns an optional native ISA feature probe for runtime codegen.
+    fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>>;
+
     /// Powers the machine off and never returns.
     fn shutdown(&self) -> !;
 

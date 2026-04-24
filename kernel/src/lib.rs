@@ -1,4 +1,5 @@
 #![no_std]
+#![cfg_attr(target_os = "none", feature(alloc_error_handler))]
 #![allow(hidden_glob_reexports)]
 extern crate alloc;
 extern crate self as helios_kernel;
@@ -7,7 +8,6 @@ extern crate std;
 
 mod bootfs;
 mod child_io;
-mod codegen_platform;
 mod component_cache;
 mod component_fs;
 mod component_fs_path;
@@ -45,7 +45,6 @@ pub use bootfs::{
     EmbeddedBootFs,
 };
 pub use child_io::{ByteReader, ByteWriter, ClosedPeer, TryRead, byte_channel};
-pub use codegen_platform::CodegenPlatform;
 pub(crate) use component_cache::ComponentCache;
 pub use component_fs::{
     ComponentFsNodeKind, ComponentFsResourceError, ComponentResourceTableError,
@@ -105,7 +104,7 @@ pub use observer::{
     DEFAULT_TRACE_HISTORY_CAPACITY, StatsSample, TraceEvent, TraceField, TraceFilter, TraceHistory,
     TraceLevel, TraceValue, matches_trace_filter, parse_console_text,
 };
-pub use program_service::{ProgramExecError, ProgramExecErrorKind};
+pub use program_service::{ProgramExecError, ProgramExecErrorKind, ProgramOutOfMemory};
 pub use recording_console::RecordingConsole;
 pub use runtime_state::RuntimeState;
 pub use runtime_types::{
@@ -168,6 +167,9 @@ impl HeapStats {
         self.total_bytes.saturating_sub(self.allocated_bytes)
     }
 }
+
+const USER_MEMORY_KERNEL_RESERVE_FRACTION: usize = 4;
+const USER_MEMORY_MIN_KERNEL_RESERVE_BYTES: usize = 32 * 1024 * 1024;
 
 pub struct Kernel<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone = NoWatchdog> {
     cpu: CpuImpl,
@@ -627,4 +629,20 @@ pub fn heap_stats() -> HeapStats {
         total_bytes: allocator.stats_total_bytes(),
         allocated_bytes: allocator.stats_alloc_actual(),
     }
+}
+
+pub fn user_memory_kernel_reserve_bytes(total_heap_bytes: usize) -> usize {
+    (total_heap_bytes / USER_MEMORY_KERNEL_RESERVE_FRACTION)
+        .max(USER_MEMORY_MIN_KERNEL_RESERVE_BYTES)
+        .min(total_heap_bytes)
+}
+
+#[cfg(target_os = "none")]
+#[alloc_error_handler]
+fn kernel_alloc_error(layout: core::alloc::Layout) -> ! {
+    panic!(
+        "kernel allocator exhausted: requested size={} align={}",
+        layout.size(),
+        layout.align()
+    )
 }
