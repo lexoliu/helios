@@ -1,8 +1,6 @@
-use alloc::vec::Vec;
-
 use helios_hal::boot::{
-    BootFirmwareTables, BootHandoff, BootKernelImage, BootMemoryKind, BootMemoryRegion, BootModule,
-    FirmwareKind,
+    BootFirmwareTables, BootHandoff, BootKernelImage, BootMemoryKind, BootMemoryMap,
+    BootMemoryRegion, BootModule, BootModules, FirmwareKind,
 };
 use limine::BaseRevision;
 use limine::firmware_type::FirmwareType;
@@ -50,14 +48,48 @@ pub(crate) fn physical_memory_offset() -> usize {
         .offset() as usize
 }
 
-pub(crate) fn limine_boot_handoff() -> BootHandoff<'static> {
-    let memory_map = MEMORY_MAP_REQUEST
-        .get_response()
-        .unwrap_or_else(|| panic!("Limine did not provide a memory map response"))
-        .entries()
-        .iter()
-        .map(|entry| convert_memory_region(*entry))
-        .collect::<Vec<_>>();
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LimineMemoryMap {
+    entries: &'static [&'static Entry],
+}
+
+impl BootMemoryMap for LimineMemoryMap {
+    type Iter = core::iter::Map<
+        core::iter::Copied<core::slice::Iter<'static, &'static Entry>>,
+        fn(&'static Entry) -> BootMemoryRegion,
+    >;
+
+    fn regions(&self) -> Self::Iter {
+        self.entries.iter().copied().map(convert_memory_region)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LimineModules {
+    files: &'static [&'static limine::file::File],
+}
+
+impl<'a> BootModules<'a> for LimineModules {
+    type Iter = core::iter::Map<
+        core::iter::Copied<core::slice::Iter<'static, &'static limine::file::File>>,
+        fn(&'static limine::file::File) -> BootModule<'static>,
+    >;
+
+    fn modules(&self) -> Self::Iter {
+        self.files.iter().copied().map(convert_module)
+    }
+}
+
+pub(crate) type LimineBootHandoff =
+    BootHandoff<'static, LimineMemoryMap, LimineModules>;
+
+pub(crate) fn limine_boot_handoff() -> LimineBootHandoff {
+    let memory_map = LimineMemoryMap {
+        entries: MEMORY_MAP_REQUEST
+            .get_response()
+            .unwrap_or_else(|| panic!("Limine did not provide a memory map response"))
+            .entries(),
+    };
     let executable_address = EXECUTABLE_ADDRESS_REQUEST
         .get_response()
         .unwrap_or_else(|| panic!("Limine did not provide an executable address response"));
@@ -95,30 +127,18 @@ pub(crate) fn limine_boot_handoff() -> BootHandoff<'static> {
             size: executable_file.size(),
         },
         command_line,
-        modules: limine_modules(),
+        modules: LimineModules {
+            files: MODULE_REQUEST
+                .get_response()
+                .map(|response| response.modules())
+                .unwrap_or(&[]),
+        },
         firmware,
         tables: BootFirmwareTables {
             acpi_rsdp: Some(acpi_rsdp),
             device_tree_blob,
         },
     }
-}
-
-fn limine_modules() -> Vec<BootModule<'static>> {
-    let Some(response) = MODULE_REQUEST.get_response() else {
-        return Vec::new();
-    };
-    response
-        .modules()
-        .iter()
-        .map(|file| BootModule {
-            address: file.addr() as usize,
-            size: usize::try_from(file.size())
-                .unwrap_or_else(|_| panic!("Limine module is too large")),
-            path: file.path().to_bytes(),
-            command_line: file.string().to_bytes(),
-        })
-        .collect()
 }
 
 fn convert_memory_region(entry: &'static Entry) -> BootMemoryRegion {
@@ -134,6 +154,15 @@ fn convert_memory_kind(entry_type: EntryType) -> BootMemoryKind {
         BootMemoryKind::Usable
     } else {
         BootMemoryKind::Reserved
+    }
+}
+
+fn convert_module(file: &'static limine::file::File) -> BootModule<'static> {
+    BootModule {
+        address: file.addr() as usize,
+        size: usize::try_from(file.size()).unwrap_or_else(|_| panic!("Limine module is too large")),
+        path: file.path().to_bytes(),
+        command_line: file.string().to_bytes(),
     }
 }
 
