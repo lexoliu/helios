@@ -12,8 +12,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use crate::{
-    ComponentNetworkService, EmbeddedBootFile, EmbeddedBootFs, HostFsErrorKind, embedded_init,
-    yield_now,
+    ComponentNetworkService, EmbeddedBootFile, EmbeddedBootFs, HostFsErrorKind, yield_now,
 };
 use bytes::{Bytes, BytesMut};
 use futures::channel::oneshot;
@@ -982,8 +981,8 @@ where
             _host_fs: PhantomData,
         };
 
-        if let Some(init) = embedded_init() {
-            filesystem.seed_bootfs(init.bootfs());
+        if let Some(bootfs) = filesystem.runtime_state.bootfs() {
+            filesystem.seed_bootfs(bootfs);
         }
 
         filesystem

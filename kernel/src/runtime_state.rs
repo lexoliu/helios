@@ -3,8 +3,8 @@ extern crate alloc;
 use alloc::sync::Arc;
 
 use crate::{
-    DEFAULT_TRACE_HISTORY_CAPACITY, InstanceRegistry, Notify, StatsSample, TraceEvent, TraceFilter,
-    TraceHistory,
+    DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedBootFs, InstanceRegistry, Notify, StatsSample,
+    TraceEvent, TraceFilter, TraceHistory, embedded_init,
 };
 use spin::Mutex;
 
@@ -25,6 +25,7 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     program_service_ready: Notify,
     network_service: Mutex<Option<NetworkService>>,
     host_fs_service: Mutex<Option<HostFsService>>,
+    bootfs: Mutex<Option<EmbeddedBootFs>>,
     tracing: Mutex<TraceHistory>,
 }
 
@@ -46,6 +47,7 @@ where
                 program_service_ready: Notify::new(),
                 network_service: Mutex::new(None),
                 host_fs_service: Mutex::new(None),
+                bootfs: Mutex::new(embedded_init().map(|init| init.bootfs())),
                 tracing: Mutex::new(TraceHistory::new(DEFAULT_TRACE_HISTORY_CAPACITY)),
             }),
         }
@@ -138,6 +140,14 @@ where
     pub fn host_fs_service(&self) -> Option<HostFsService> {
         self.inner.host_fs_service.lock().clone()
     }
+
+    pub fn bootfs(&self) -> Option<EmbeddedBootFs> {
+        *self.inner.bootfs.lock()
+    }
+
+    pub fn retire_bootfs(&self) {
+        *self.inner.bootfs.lock() = None;
+    }
 }
 
 impl<ProgramService, NetworkService, HostFsService> ComponentRuntimeState
@@ -165,5 +175,9 @@ where
 {
     fn host_filesystem_service(&self) -> Option<HostFsService> {
         self.host_fs_service()
+    }
+
+    fn bootfs(&self) -> Option<EmbeddedBootFs> {
+        RuntimeState::bootfs(self)
     }
 }

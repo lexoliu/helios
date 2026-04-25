@@ -737,7 +737,7 @@ where
         instance_registry,
         instance,
         true,
-        debug_state,
+        debug_state.clone(),
         Vec::new(),
         Vec::new(),
         OutputMode::Serial,
@@ -761,6 +761,7 @@ where
     instantiate_done.store(true, Ordering::Release);
     let executor = executor.map_err(DebuggerError::InstantiateComponent)?;
     emit_stage_marker(write_serial, "instantiate:ok");
+    debug_state.retire_bootfs();
 
     tracing::info!(component = component_name, "entering wasi:cli/run");
     emit_stage_marker(write_serial, "run:begin");

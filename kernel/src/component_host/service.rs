@@ -40,6 +40,7 @@ where
     runtime: crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
     engine: crate::wasmtime_adapter::WasmtimeEngine,
     component_cache: Mutex<ComponentCache<WasmtimeCompiledComponent>>,
+    compiler_artifact: Option<Bytes>,
     clock_cpu: CpuImpl,
     _marker: core::marker::PhantomData<fn() -> HostFs>,
 }
@@ -165,11 +166,13 @@ where
     let runtime = crate::wasmtime_adapter::WasmtimeComponentRuntime::new(cpu.clone());
     let engine = <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as crate::ComponentRuntimeFactory<CpuImpl, HostRuntimeState<CpuImpl, HostFs>, HostFs>>::create_engine(&runtime)
         .unwrap_or_else(|error| panic!("failed to create launched-program engine: {error:#}"));
+    let compiler_artifact = read_bootfs_artifact(debug_state, COMPILER_PLUGIN_PATH);
     let service = UserProgramService {
         inner: Arc::new(UserProgramServiceInner {
             runtime,
             engine,
             component_cache: Mutex::new(ComponentCache::new(cache_budget)),
+            compiler_artifact,
             clock_cpu: cpu.clone(),
             _marker: core::marker::PhantomData,
         }),
@@ -611,18 +614,30 @@ where
         &self,
         exec_context: &ProgramExecContext<CpuImpl, HostFs>,
     ) -> Result<Bytes, ProgramExecError> {
-        let filesystem = crate::wasmtime_adapter::wasi::DebugFileSystem::<
-            HostRuntimeState<CpuImpl, HostFs>,
-            HostFs,
-        >::new(exec_context.runtime_state.clone());
-        let bytes = filesystem
-            .read_program_file_bytes(COMPILER_PLUGIN_PATH)
-            .map_err(|error| ProgramExecError {
+        self.inner
+            .compiler_artifact
+            .clone()
+            .or_else(|| read_bootfs_artifact(&exec_context.runtime_state, COMPILER_PLUGIN_PATH))
+            .ok_or_else(|| ProgramExecError {
                 kind: ProgramExecErrorKind::InvalidPath,
-                detail: format!("failed to read compiler plugin {COMPILER_PLUGIN_PATH}: {error}"),
-            })?;
-        Ok(bytes)
+                detail: format!("compiler plugin {COMPILER_PLUGIN_PATH} is not provisioned"),
+            })
     }
+}
+
+fn read_bootfs_artifact<CpuImpl, HostFs>(
+    runtime_state: &HostRuntimeState<CpuImpl, HostFs>,
+    path: &str,
+) -> Option<Bytes>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let filesystem = crate::wasmtime_adapter::wasi::DebugFileSystem::<
+        HostRuntimeState<CpuImpl, HostFs>,
+        HostFs,
+    >::new(runtime_state.clone());
+    filesystem.read_program_file_bytes(path).ok()
 }
 
 fn trusted_root_signing_key_hex() -> String {

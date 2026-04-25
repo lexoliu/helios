@@ -784,4 +784,5 @@ where
     Service: HostFileSystem,
 {
     fn host_filesystem_service(&self) -> Option<Service>;
+    fn bootfs(&self) -> Option<crate::EmbeddedBootFs>;
 }
