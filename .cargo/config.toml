@@ -10,3 +10,9 @@ rustflags = [
 rustflags = [
   "-C", "target-feature=+sse,+sse2,-soft-float",
 ]
+
+[target.aarch64-unknown-none]
+rustflags = [
+  "-C", "link-arg=-Taarch64/linker.ld",
+  "-C", "link-arg=-zmax-page-size=0x1000",
+]

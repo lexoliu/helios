@@ -10,6 +10,9 @@ use clap::{Args as ClapArgs, Subcommand, ValueEnum};
 use console::style;
 use directories::ProjectDirs;
 use helios_hal::fs::HOST_SHARE_MOUNT_TAG;
+use helios_inspector_protocol::debugger::{
+    filesystem as debugger_fs, programs as debugger_programs,
+};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
@@ -23,7 +26,7 @@ const DEFAULT_X86_QEMU_BIN: &str = "qemu-system-x86_64";
 const DEFAULT_AARCH64_MEMORY: &str = "2G";
 const DEFAULT_RISCV_MEMORY: &str = "2G";
 const DEFAULT_X86_MEMORY: &str = "1G";
-const DEFAULT_AARCH64_SMP: u16 = 4;
+const DEFAULT_AARCH64_SMP: u16 = 1;
 const DEFAULT_RISCV_SMP: u16 = 4;
 const DEFAULT_X86_SMP: u16 = 2;
 const DEFAULT_SOCKET_WAIT: Duration = Duration::from_secs(10);
@@ -262,6 +265,14 @@ pub(crate) struct VmCommand {
     #[arg(long)]
     socket: Option<PathBuf>,
 
+    /// Use QEMU stdin/stdout pipes as the debug serial transport.
+    #[arg(long, default_value_t = false, conflicts_with_all = ["socket", "serial_pty"])]
+    serial_stdio: bool,
+
+    /// Use an inspector-created PTY as the debug serial transport.
+    #[arg(long, default_value_t = false, conflicts_with_all = ["socket", "serial_stdio"])]
+    serial_pty: bool,
+
     #[arg(long, default_value_t = false)]
     no_build: bool,
 
@@ -345,6 +356,25 @@ enum VmSessionCommand {
     Tracing(crate::TracingCommand),
     Stats,
     Repl,
+    AotBench(AotBenchCommand),
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+struct AotBenchCommand {
+    /// Local raw wasm component path to upload and execute inside the guest.
+    wasm: PathBuf,
+
+    /// Guest path used for the uploaded wasm sample.
+    #[arg(long, default_value = "/aot-bench-input.wasm")]
+    remote_path: String,
+
+    /// Number of AOT+exec iterations to run after upload.
+    #[arg(long, default_value_t = 1)]
+    iterations: u16,
+
+    /// Argument passed to the benchmarked wasm program.
+    #[arg(long = "program-arg")]
+    program_args: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -355,6 +385,8 @@ struct ResolvedVmCommand {
     qemu_bin: PathBuf,
     kernel: PathBuf,
     socket: Option<PathBuf>,
+    serial_stdio: bool,
+    serial_pty: bool,
     no_build: bool,
     smp: u16,
     memory: String,
@@ -375,7 +407,13 @@ struct ResolvedVmCommand {
     no_compiler_plugin: bool,
     runtime_dir: Option<PathBuf>,
     keep_runtime_dir: bool,
-    command: Option<SessionCommand>,
+    command: Option<ResolvedVmSessionCommand>,
+}
+
+#[derive(Debug, Clone)]
+enum ResolvedVmSessionCommand {
+    Session(SessionCommand),
+    AotBench(AotBenchCommand),
 }
 
 pub(crate) fn run(command: VmCommand) -> Result<()> {
@@ -385,7 +423,7 @@ pub(crate) fn run(command: VmCommand) -> Result<()> {
         build_vm(&command)?;
     }
     let mut runtime = VmRuntime::spawn(&command)?;
-    let result = connect_and_run(&command, runtime.socket_path());
+    let result = connect_and_run(&command, &mut runtime);
     let runtime_dir = runtime.runtime_dir_path().to_path_buf();
     runtime.shutdown();
     result.with_context(|| format!("VM runtime directory: {}", runtime_dir.display()))
@@ -447,6 +485,9 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
         bail!("--gdb-wait requires --gdb or --debug");
     }
     let monitor = command.monitor.or(file.monitor);
+    if command.serial_stdio && matches!(monitor.as_deref(), Some("stdio")) {
+        bail!("--serial-stdio cannot share stdio with --monitor stdio");
+    }
     let qmp = command.qmp.or(file.qmp);
     let qemu_log = command.qemu_log.or(file.qemu_log);
     let mut qemu_trace = file.qemu_trace;
@@ -468,6 +509,8 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
         qemu_bin,
         kernel,
         socket: command.socket,
+        serial_stdio: command.serial_stdio,
+        serial_pty: command.serial_pty,
         no_build: command.no_build,
         smp,
         memory,
@@ -593,13 +636,77 @@ fn run_kernel_prebuild(command: &ResolvedVmCommand) -> Result<PathBuf> {
     Ok(out_dir.join("kernel-prebuild.json"))
 }
 
-fn connect_and_run(command: &ResolvedVmCommand, socket_path: &Path) -> Result<()> {
-    let socket = socket_path.to_str().ok_or_else(|| {
-        anyhow::anyhow!("socket path must be valid UTF-8: {}", socket_path.display())
-    })?;
-    let client = connect_client(socket, command.baud, true)
-        .context("failed to connect inspector RPC client")?;
-    run_connected(client, command.command.clone())
+fn connect_and_run(command: &ResolvedVmCommand, runtime: &mut VmRuntime) -> Result<()> {
+    let client = match runtime.take_transport()? {
+        VmTransport::SerialSocket(socket_path) => {
+            let socket = socket_path.to_str().ok_or_else(|| {
+                anyhow::anyhow!("socket path must be valid UTF-8: {}", socket_path.display())
+            })?;
+            connect_client(socket, command.baud, true)
+                .context("failed to connect inspector RPC client")?
+        }
+        VmTransport::SerialIo(io) => crate::runtime::block_on(async move {
+            crate::ready::connect_after_boot(io)
+                .await
+                .context("failed to connect inspector RPC client over QEMU stdio serial")
+        })?,
+    };
+    match command.command.clone() {
+        Some(ResolvedVmSessionCommand::AotBench(command)) => run_aot_bench(client, command),
+        Some(ResolvedVmSessionCommand::Session(command)) => run_connected(client, Some(command)),
+        None => run_connected(client, None),
+    }
+}
+
+fn run_aot_bench(client: crate::serial::RpcClient, command: AotBenchCommand) -> Result<()> {
+    crate::run_interruptible(async move {
+        let wasm = fs::read(&command.wasm)
+            .with_context(|| format!("failed to read {}", command.wasm.display()))?;
+        if command.iterations == 0 {
+            bail!("aot-bench --iterations must be non-zero");
+        }
+        debugger_fs::write(&client, &command.remote_path, &wasm, false)
+            .await
+            .with_context(|| format!("failed to upload {}", command.wasm.display()))?;
+
+        use std::io::Write as _;
+        {
+            let mut stdout = std::io::stdout().lock();
+            writeln!(
+                stdout,
+                "uploaded {} bytes to {}",
+                wasm.len(),
+                command.remote_path
+            )?;
+        }
+        for iteration in 1..=command.iterations {
+            let started = std::time::Instant::now();
+            let result =
+                debugger_programs::exec_path(&client, &command.remote_path, &command.program_args)
+                    .await
+                    .with_context(|| {
+                        format!("failed to execute uploaded wasm iteration {iteration}")
+                    })?;
+            let elapsed = started.elapsed();
+            let mut stdout = std::io::stdout().lock();
+            writeln!(
+                stdout,
+                "iteration={iteration} elapsed_ms={} exit_code={} stdout_bytes={} stderr_bytes={}",
+                elapsed.as_millis(),
+                result.exit_code,
+                result.output.stdout.len(),
+                result.output.stderr.len()
+            )?;
+            if result.exit_code != 0 {
+                bail!(
+                    "uploaded wasm exited with code {}: {}",
+                    result.exit_code,
+                    String::from_utf8_lossy(&result.output.stderr)
+                );
+            }
+        }
+        Ok(())
+    })
 }
 
 fn prepare_boot_artifact(
@@ -701,9 +808,15 @@ fn run_step(label: &str, command: &mut Command) -> Result<()> {
 }
 
 struct VmRuntime {
-    socket_path: PathBuf,
+    transport: Option<VmTransport>,
+    _serial_pty_slave: Option<fs::File>,
     runtime_dir: VmRuntimeDir,
     child: Child,
+}
+
+enum VmTransport {
+    SerialSocket(PathBuf),
+    SerialIo(crate::serial::SerialIo),
 }
 
 enum VmRuntimeDir {
@@ -753,7 +866,15 @@ impl VmRuntime {
             .clone()
             .unwrap_or_else(|| runtime_dir.path().join("qemu.log"));
 
-        prepare_socket_path(&socket_path)?;
+        let serial_pty = if command.serial_pty {
+            Some(crate::serial::open_pty_transport()?)
+        } else {
+            None
+        };
+
+        if !command.serial_stdio && serial_pty.is_none() {
+            prepare_socket_path(&socket_path)?;
+        }
         prepare_log_path(&qemu_log)?;
         let artifact = prepare_boot_artifact(command, Some(runtime_dir.path()))?;
         let block_image = prepare_block_image(command, runtime_dir.path())?;
@@ -778,7 +899,11 @@ impl VmRuntime {
         }
         qemu.arg("-m").arg(&command.memory);
         qemu.arg("-smp").arg(command.smp.to_string());
-        if command.profile.console == VmConsoleProfile::SerialUnixSocket {
+        if command.serial_stdio {
+            qemu.arg("-serial").arg("stdio");
+        } else if let Some(serial_pty) = &serial_pty {
+            qemu.arg("-serial").arg(&serial_pty.slave_path);
+        } else if command.profile.console == VmConsoleProfile::SerialUnixSocket {
             qemu.arg("-serial")
                 .arg(format!("unix:{},server=on,wait=on", socket_path.display()));
         }
@@ -802,10 +927,15 @@ impl VmRuntime {
         }
         qemu.args(&command.qemu_arg);
         qemu.process_group(0);
-        qemu.stdin(Stdio::null());
-        qemu.stdout(Stdio::from(fs::File::create(&qemu_log).with_context(
-            || format!("failed to create {}", qemu_log.display()),
-        )?));
+        if command.serial_stdio {
+            qemu.stdin(Stdio::piped());
+            qemu.stdout(Stdio::piped());
+        } else {
+            qemu.stdin(Stdio::null());
+            qemu.stdout(Stdio::from(fs::File::create(&qemu_log).with_context(
+                || format!("failed to create {}", qemu_log.display()),
+            )?));
+        }
         qemu.stderr(Stdio::from(
             fs::OpenOptions::new()
                 .append(true)
@@ -844,23 +974,56 @@ impl VmRuntime {
                 command.qemu_bin.display()
             )
         })?;
-        wait_for_socket(&socket_path, &qemu_log, &mut child)?;
+        let mut serial_pty_slave = None;
+        let transport = if command.serial_stdio {
+            let stdout = child
+                .stdout
+                .take()
+                .context("QEMU stdout pipe was not available for serial stdio")?;
+            let stdin = child
+                .stdin
+                .take()
+                .context("QEMU stdin pipe was not available for serial stdio")?;
+            VmTransport::SerialIo(crate::serial::open_child_stdio(stdout, stdin)?)
+        } else if let Some(serial_pty) = serial_pty {
+            serial_pty_slave = Some(serial_pty.slave);
+            VmTransport::SerialIo(serial_pty.io)
+        } else {
+            wait_for_socket(&socket_path, &qemu_log, &mut child)?;
+            VmTransport::SerialSocket(socket_path)
+        };
         spinner.finish_with_message(format!(
-            "{} {} runtime={} log={}",
+            "{} runtime={} log={}",
             style("ready").green(),
-            socket_path.display(),
             runtime_dir.path().display(),
             qemu_log.display(),
         ));
         Ok(Self {
-            socket_path,
+            transport: Some(transport),
+            _serial_pty_slave: serial_pty_slave,
             runtime_dir,
             child,
         })
     }
 
+    #[cfg(test)]
     fn socket_path(&self) -> &Path {
-        &self.socket_path
+        match self
+            .transport
+            .as_ref()
+            .expect("VM transport was already taken")
+        {
+            VmTransport::SerialSocket(socket_path) => socket_path,
+            VmTransport::SerialIo(_) => {
+                panic!("QEMU stdio serial transport does not have a socket path")
+            }
+        }
+    }
+
+    fn take_transport(&mut self) -> Result<VmTransport> {
+        self.transport
+            .take()
+            .context("VM transport was already taken")
     }
 
     fn runtime_dir_path(&self) -> &Path {
@@ -1207,13 +1370,14 @@ fn configure_watchdog(qemu: &mut Command, watchdog: VmWatchdogProfile) {
     }
 }
 
-impl From<VmSessionCommand> for SessionCommand {
+impl From<VmSessionCommand> for ResolvedVmSessionCommand {
     fn from(value: VmSessionCommand) -> Self {
         match value {
-            VmSessionCommand::Shell(command) => Self::Shell(command),
-            VmSessionCommand::Tracing(command) => Self::Tracing(command),
-            VmSessionCommand::Stats => Self::Stats,
-            VmSessionCommand::Repl => Self::Repl,
+            VmSessionCommand::Shell(command) => Self::Session(SessionCommand::Shell(command)),
+            VmSessionCommand::Tracing(command) => Self::Session(SessionCommand::Tracing(command)),
+            VmSessionCommand::Stats => Self::Session(SessionCommand::Stats),
+            VmSessionCommand::Repl => Self::Session(SessionCommand::Repl),
+            VmSessionCommand::AotBench(command) => Self::AotBench(command),
         }
     }
 }
@@ -1241,6 +1405,7 @@ mod tests {
     fn aarch64_profiles_are_modern_virt_only() {
         assert_eq!(AARCH64_VIRT_HVF_PROFILE.arch, VmArch::Aarch64);
         assert_eq!(AARCH64_VIRT_HVF_PROFILE.machine, "virt,gic-version=3");
+        assert_eq!(AARCH64_VIRT_HVF_PROFILE.default_smp, 1);
         assert_eq!(AARCH64_VIRT_HVF_PROFILE.default_accel, &["hvf"]);
         assert_eq!(AARCH64_VIRT_HVF_PROFILE.default_cpu, Some("host"));
         assert_eq!(
@@ -1262,6 +1427,7 @@ mod tests {
 
         assert_eq!(AARCH64_VIRT_TCG_PROFILE.default_accel, &["tcg"]);
         assert_eq!(AARCH64_VIRT_TCG_PROFILE.default_cpu, Some("max"));
+        assert_eq!(AARCH64_VIRT_TCG_PROFILE.default_smp, 1);
         assert_ne!(AARCH64_VIRT_HVF_PROFILE.machine, "sbsa-ref");
         assert!(!AARCH64_VIRT_HVF_PROFILE.machine.contains("raspi"));
     }
@@ -1332,6 +1498,8 @@ mod tests {
             qemu_bin: None,
             kernel: None,
             socket: None,
+            serial_stdio: false,
+            serial_pty: false,
             no_build: true,
             smp: None,
             memory: None,
@@ -1384,6 +1552,8 @@ mod tests {
             qemu_bin: None,
             kernel: None,
             socket: None,
+            serial_stdio: false,
+            serial_pty: false,
             no_build: true,
             smp: None,
             memory: None,
@@ -1479,6 +1649,8 @@ mod tests {
             qemu_bin: PathBuf::from(profile.qemu_bin),
             kernel: default_kernel_path(arch, build_profile_dir(false, false)),
             socket: None,
+            serial_stdio: false,
+            serial_pty: false,
             no_build: true,
             smp: profile.default_smp,
             memory: profile.default_memory.to_owned(),
@@ -1631,6 +1803,8 @@ mod tests {
             qemu_bin: PathBuf::from(profile.qemu_bin),
             kernel: default_kernel_path(arch, build_profile_dir(true, false)),
             socket: None,
+            serial_stdio: false,
+            serial_pty: false,
             no_build: true,
             smp: profile.default_smp,
             memory: profile.default_memory.to_owned(),

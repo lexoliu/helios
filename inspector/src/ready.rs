@@ -71,11 +71,23 @@ async fn read_byte(read: &mut SerialReader) -> std::io::Result<Option<u8>> {
 fn parse_stage_marker(line: &[u8]) -> Result<Option<&str>> {
     let text =
         std::str::from_utf8(line).context("debug serial preamble contained non-utf8 bytes")?;
-    let Some(stage) = text.strip_prefix("[KDBG ") else {
+    let Some(start) = text.find("[KDBG ") else {
         return Ok(None);
     };
-    let Some(stage) = stage.strip_suffix(']') else {
+    let text = &text[start..];
+    let Some(end) = text.find(']') else {
         anyhow::bail!("malformed debugger stage marker {text:?}");
+    };
+    let marker = &text[..=end];
+    let rest = &text[end + 1..];
+    if rest.contains("[KDBG ") {
+        anyhow::bail!("multiple debugger stage markers appeared on one serial line: {text:?}");
+    }
+    let Some(stage) = marker.strip_prefix("[KDBG ") else {
+        unreachable!("stage marker search returned a non-marker prefix");
+    };
+    let Some(stage) = stage.strip_suffix(']') else {
+        anyhow::bail!("malformed debugger stage marker {marker:?}");
     };
     Ok(Some(stage))
 }

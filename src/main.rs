@@ -10,6 +10,8 @@ fn main() {
 
 // otherwise, the entry point is defined by the active bare-metal platform crate.
 
+#[cfg(target_arch = "aarch64")]
+use helios_aarch64 as _;
 #[cfg(target_arch = "riscv64")]
 use helios_riscv as _;
 #[cfg(target_arch = "x86_64")]

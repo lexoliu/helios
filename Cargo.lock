@@ -1655,11 +1655,12 @@ dependencies = [
 name = "helios-aarch64"
 version = "0.1.0"
 dependencies = [
+ "acpi",
  "critical-section",
  "fdt",
  "helios-hal",
  "helios-kernel",
- "limine",
+ "limine 0.6.3",
 ]
 
 [[package]]
@@ -1791,6 +1792,7 @@ dependencies = [
  "helios-hal",
  "helios-inspector-protocol",
  "indicatif",
+ "libc",
  "nu-ansi-term",
  "ratatui",
  "rustyline",
@@ -1914,7 +1916,7 @@ dependencies = [
  "helios-hal",
  "helios-kernel",
  "i6300esb",
- "limine",
+ "limine 0.5.0",
  "pci_types",
  "spin 0.9.8",
  "x86",
@@ -2180,6 +2182,12 @@ checksum = "af6d2ee42712e7bd2c787365cd1dab06ef59a61becbf87bec7b32b970bd2594b"
 dependencies = [
  "bitflags 2.11.0",
 ]
+
+[[package]]
+name = "limine"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90b240f611eba0b43bf3e97478d87f12322c6c0f540bdad885c3e8c4a0d57333"
 
 [[package]]
 name = "line-clipping"
