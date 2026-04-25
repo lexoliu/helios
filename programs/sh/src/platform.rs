@@ -91,10 +91,11 @@ impl RunningProcess for HeliosChild {
                 "child.wait failed: {:?}: {}",
                 error.kind, error.detail
             ))
-        })?;
+        });
         await_forwarder(self.stdin_done).await?;
         await_forwarder(self.stdout_done).await?;
         await_forwarder(self.stderr_done).await?;
+        let exit = exit?;
         u8::try_from(exit.code)
             .map_err(|_| ShellError::message(format!("exit code {} does not fit in u8", exit.code)))
     }
