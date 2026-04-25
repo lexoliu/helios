@@ -1,0 +1,12 @@
+pub const EMBEDDED_INIT: Option<EmbeddedInitDescriptor> = Some(EmbeddedInitDescriptor {
+    component: EmbeddedComponent::new(
+        r#"{{ name }}"#,
+        include_bytes!(r#"{{ component }}"#),
+    ),
+    argv0: r#"{{ argv0 }}"#,
+    bootfs: EmbeddedBootFs::new(&[
+{% for entry in bootfs_entries %}
+        EmbeddedBootFile::new(r#"{{ entry.path }}"#, include_bytes!(r#"{{ entry.source }}"#)),
+{% endfor %}
+    ]),
+});

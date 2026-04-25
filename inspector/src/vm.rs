@@ -225,6 +225,10 @@ pub(crate) struct VmConfigFile {
     #[serde(default)]
     pub(crate) qemu_arg: Vec<String>,
     #[serde(default)]
+    pub(crate) boot_programs: Vec<String>,
+    #[serde(default)]
+    pub(crate) no_compiler_plugin: Option<bool>,
+    #[serde(default)]
     pub(crate) runtime_dir: Option<PathBuf>,
     #[serde(default)]
     pub(crate) keep_runtime_dir: Option<bool>,
@@ -315,6 +319,14 @@ pub(crate) struct VmCommand {
     #[arg(long, allow_hyphen_values = true)]
     qemu_arg: Vec<String>,
 
+    /// Restrict bootfs program prebuilds to a named program. Repeat for multiple programs.
+    #[arg(long = "boot-program")]
+    boot_programs: Vec<String>,
+
+    /// Omit the compiler kernel plugin from bootfs.
+    #[arg(long, default_value_t = false)]
+    no_compiler_plugin: bool,
+
     /// Directory for VM sockets, logs, and generated boot artifacts.
     #[arg(long)]
     runtime_dir: Option<PathBuf>,
@@ -359,6 +371,8 @@ struct ResolvedVmCommand {
     qemu_trace: Vec<String>,
     qemu_trace_log: Option<PathBuf>,
     qemu_arg: Vec<String>,
+    boot_programs: Vec<String>,
+    no_compiler_plugin: bool,
     runtime_dir: Option<PathBuf>,
     keep_runtime_dir: bool,
     command: Option<SessionCommand>,
@@ -440,6 +454,9 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
     let qemu_trace_log = command.qemu_trace_log.or(file.qemu_trace_log);
     let mut qemu_arg = file.qemu_arg;
     qemu_arg.extend(command.qemu_arg);
+    let mut boot_programs = file.boot_programs;
+    boot_programs.extend(command.boot_programs);
+    let no_compiler_plugin = command.no_compiler_plugin || file.no_compiler_plugin.unwrap_or(false);
     let runtime_dir = command.runtime_dir.or(file.runtime_dir);
     let keep_runtime_dir =
         debug || command.keep_runtime_dir || file.keep_runtime_dir.unwrap_or(false);
@@ -467,6 +484,8 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
         qemu_trace,
         qemu_trace_log,
         qemu_arg,
+        boot_programs,
+        no_compiler_plugin,
         runtime_dir,
         keep_runtime_dir,
         command: command.command.map(Into::into),
@@ -510,8 +529,16 @@ fn ensure_qemu_command(command: &ResolvedVmCommand) -> Result<()> {
 fn build_vm(command: &ResolvedVmCommand) -> Result<()> {
     let repo_root = repo_root();
     run_step(
+        "building helios-cli",
+        cargo_build_command(repo_root, command.release, false)
+            .arg("-p")
+            .arg("helios-cli"),
+    )?;
+    let prebuild_manifest = run_kernel_prebuild(command)?;
+    run_step(
         &format!("building {} kernel", arch_label(command.profile.arch)),
         cargo_build_command(repo_root, command.release, command.kernel_debug)
+            .env("HELIOS_KERNEL_PREBUILD_MANIFEST", &prebuild_manifest)
             .arg("--target")
             .arg(command.profile.cargo_target)
             .arg("--bin")
@@ -522,12 +549,6 @@ fn build_vm(command: &ResolvedVmCommand) -> Result<()> {
         cargo_build_command(repo_root, command.release, false)
             .arg("-p")
             .arg("helios-inspector"),
-    )?;
-    run_step(
-        "building helios-cli",
-        cargo_build_command(repo_root, command.release, false)
-            .arg("-p")
-            .arg("helios-cli"),
     )?;
     Ok(())
 }
@@ -541,6 +562,35 @@ fn cargo_build_command(repo_root: &Path, release: bool, kernel_debug: bool) -> C
         command.arg("--profile").arg("kernel-debug");
     }
     command
+}
+
+fn run_kernel_prebuild(command: &ResolvedVmCommand) -> Result<PathBuf> {
+    let cli = discover_helios_cli()?;
+    let out_dir = repo_root()
+        .join("target")
+        .join("kernel-prebuild")
+        .join(command.profile.cargo_target)
+        .join(build_profile_dir(command.release, command.kernel_debug));
+    let mut prebuild = Command::new(&cli);
+    prebuild
+        .current_dir(repo_root())
+        .arg("kernel-prebuild")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg("--target")
+        .arg(command.profile.cargo_target)
+        .arg("--profile")
+        .arg(build_profile_dir(command.release, command.kernel_debug))
+        .arg("--cargo")
+        .arg("cargo");
+    for program in &command.boot_programs {
+        prebuild.arg("--boot-program").arg(program);
+    }
+    if command.no_compiler_plugin {
+        prebuild.arg("--no-compiler-plugin");
+    }
+    run_step("prebuilding kernel bootfs", &mut prebuild)?;
+    Ok(out_dir.join("kernel-prebuild.json"))
 }
 
 fn connect_and_run(command: &ResolvedVmCommand, socket_path: &Path) -> Result<()> {
@@ -1298,6 +1348,8 @@ mod tests {
             qemu_trace: Vec::new(),
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
+            boot_programs: Vec::new(),
+            no_compiler_plugin: false,
             runtime_dir: None,
             keep_runtime_dir: false,
             command: None,
@@ -1348,6 +1400,8 @@ mod tests {
             qemu_trace: Vec::new(),
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
+            boot_programs: Vec::new(),
+            no_compiler_plugin: false,
             runtime_dir: None,
             keep_runtime_dir: false,
             command: None,
@@ -1386,6 +1440,14 @@ mod tests {
     }
 
     fn build_watchdog_test_kernel(arch: VmArch) -> Result<()> {
+        let command = watchdog_test_command(arch);
+        run_step(
+            "building helios-cli",
+            cargo_build_command(repo_root(), command.release, false)
+                .arg("-p")
+                .arg("helios-cli"),
+        )?;
+        let prebuild_manifest = run_kernel_prebuild(&command)?;
         let status = std::process::Command::new("cargo")
             .current_dir(repo_root())
             .arg("build")
@@ -1393,7 +1455,7 @@ mod tests {
             .arg(arch.profile().cargo_target)
             .arg("--bin")
             .arg(arch.profile().kernel_artifact_name)
-            .env("HELIOS_BOOT_PROGRAMS", "debugger")
+            .env("HELIOS_KERNEL_PREBUILD_MANIFEST", prebuild_manifest)
             .env("HELIOS_WATCHDOG_SELF_TEST", "1")
             .env("HELIOS_WATCHDOG_TIMEOUT_SECS", WATCHDOG_TIMEOUT_SECS)
             .env(
@@ -1437,6 +1499,8 @@ mod tests {
             qemu_trace: Vec::new(),
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
+            boot_programs: vec!["debugger".to_owned()],
+            no_compiler_plugin: true,
             runtime_dir: None,
             keep_runtime_dir: false,
             command: None,
@@ -1587,6 +1651,8 @@ mod tests {
             qemu_trace: Vec::new(),
             qemu_trace_log: None,
             qemu_arg: Vec::new(),
+            boot_programs: Vec::new(),
+            no_compiler_plugin: false,
             runtime_dir: None,
             keep_runtime_dir: false,
             command: None,

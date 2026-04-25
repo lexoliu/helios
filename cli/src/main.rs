@@ -99,6 +99,10 @@ struct KernelPrebuildCommand {
     bootfs_root: PathBuf,
     #[arg(long, default_value = DEFAULT_INIT_ARGV0)]
     init_argv0: String,
+    #[arg(long = "boot-program")]
+    boot_programs: Vec<String>,
+    #[arg(long = "no-compiler-plugin", default_value_t = false)]
+    no_compiler_plugin: bool,
 }
 
 #[derive(Parser)]
@@ -218,15 +222,17 @@ fn run_kernel_prebuild(command: KernelPrebuildCommand) -> Result<()> {
     fs::write(&init_cwasm, init_signed)
         .with_context(|| format!("failed to write {}", init_cwasm.display()))?;
 
-    let selected_programs = selected_boot_programs()?;
+    let selected_programs = selected_boot_programs(command.boot_programs)?;
     let mut bootfs_assets = Vec::new();
-    bootfs_assets.push(build_compiler_plugin_asset(
-        &command.cargo,
-        &command.profile,
-        &command.out_dir,
-        &command.target,
-        &root_signing_key,
-    )?);
+    if !command.no_compiler_plugin {
+        bootfs_assets.push(build_compiler_plugin_asset(
+            &command.cargo,
+            &command.profile,
+            &command.out_dir,
+            &command.target,
+            &root_signing_key,
+        )?);
+    }
     bootfs_assets.extend(build_boot_program_assets(
         &command.cargo,
         &command.profile,
@@ -591,7 +597,16 @@ fn build_compiler_plugin_asset(
     })
 }
 
-fn selected_boot_programs() -> Result<Option<BTreeSet<String>>> {
+fn selected_boot_programs(boot_programs: Vec<String>) -> Result<Option<BTreeSet<String>>> {
+    if !boot_programs.is_empty() {
+        let selected = boot_programs.into_iter().collect::<BTreeSet<_>>();
+        ensure!(
+            !selected.is_empty(),
+            "--boot-program must name at least one boot program"
+        );
+        return Ok(Some(selected));
+    }
+
     let Some(raw) = std::env::var_os("HELIOS_BOOT_PROGRAMS") else {
         return Ok(None);
     };

@@ -10,7 +10,6 @@ REGION_ALIAS("REGION_BSS", RAM);
 REGION_ALIAS("REGION_HEAP", RAM);
 REGION_ALIAS("REGION_STACK", RAM);
 
-_stack_start = ORIGIN(RAM) + LENGTH(RAM);
 _hart_stack_size = 1M;
 _max_hart_id = 7;
 _heap_size = 0;

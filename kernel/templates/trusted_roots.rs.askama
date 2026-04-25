@@ -1,0 +1,5 @@
+pub const TRUSTED_ROOT_PUBLIC_KEYS: &[[u8; 32]] = &[[
+{% for byte in root_public_key %}
+    {{ byte }}{% if !loop.last %},{% endif %}
+{% endfor %}
+]];

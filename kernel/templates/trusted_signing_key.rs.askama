@@ -1,0 +1,5 @@
+pub const TRUSTED_ROOT_SIGNING_KEY: [u8; 32] = [
+{% for byte in root_secret_key %}
+    {{ byte }}{% if !loop.last %},{% endif %}
+{% endfor %}
+];

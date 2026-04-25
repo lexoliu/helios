@@ -657,21 +657,21 @@ fn shared_watchdog(fdt: &Fdt<'_>) -> watchdog::RiscvWatchdog {
 
 unsafe extern "C" {
     static __ebss: u8;
-    static __stack_bottom_value: usize;
+    static _stack_start: u8;
     static _secondary_start: u8;
     fn _release_mp_harts();
 }
 
 fn allocator_window() -> Range<usize> {
     let start = align_up(
-        core::ptr::addr_of!(__ebss).addr(),
+        core::ptr::addr_of!(_stack_start).addr(),
         core::mem::align_of::<usize>(),
     );
-    let stack_bottom =
-        unsafe { core::ptr::read_volatile(core::ptr::addr_of!(__stack_bottom_value)) };
-
-    assert!(start < stack_bottom, "allocator window is empty");
-    start..stack_bottom
+    assert!(
+        core::ptr::addr_of!(__ebss).addr() < start,
+        "riscv stack must be linked after kernel bss"
+    );
+    start..usize::MAX
 }
 
 fn collect_memory_regions<'fdt>(

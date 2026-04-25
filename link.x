@@ -125,7 +125,6 @@ PROVIDE(_start_MachineExternal_trap = _start_DefaultHandler_trap);
 
 
 PROVIDE(_stext = ORIGIN(REGION_TEXT));
-PROVIDE(_stack_start = ORIGIN(REGION_STACK) + LENGTH(REGION_STACK));
 PROVIDE(_max_hart_id = 0);
 PROVIDE(_hart_stack_size = SIZEOF(.stack) / (_max_hart_id + 1));
 PROVIDE(_heap_size = 0);
@@ -240,9 +239,11 @@ SECTIONS
   .stack (NOLOAD) :
   {
     __estack = .;
-    . = ABSOLUTE(_stack_start);
+    . += (_max_hart_id + 1) * _hart_stack_size;
+    . = ALIGN(16);
     __sstack = .;
   } > REGION_STACK
+  PROVIDE(_stack_start = __sstack);
 
   /* fake output .got section */
   /* Dynamic relocations are unsupported. This section is only used to detect

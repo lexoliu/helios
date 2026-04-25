@@ -38,6 +38,7 @@ helios-kernel-macro.workspace = true
 wasm-encoder = "0.245.0"
 
 [build-dependencies]
+askama = "0.15.6"
 toml = "0.8.23"
 walkdir = "2.5.0"
 wit-component = "0.245.0"

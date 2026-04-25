@@ -2,8 +2,30 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use askama::Template;
 use serde::Deserialize;
 use walkdir::WalkDir;
+
+#[derive(Template)]
+#[template(path = "embedded_init.rs.askama", escape = "none")]
+struct EmbeddedInitTemplate<'a> {
+    name: &'a str,
+    component: &'a str,
+    argv0: &'a str,
+    bootfs_entries: &'a [EmbeddedBootAsset],
+}
+
+#[derive(Template)]
+#[template(path = "trusted_roots.rs.askama", escape = "none")]
+struct TrustedRootsTemplate<'a> {
+    root_public_key: &'a [u8],
+}
+
+#[derive(Template)]
+#[template(path = "trusted_signing_key.rs.askama", escape = "none")]
+struct TrustedSigningKeyTemplate<'a> {
+    root_secret_key: &'a [u8],
+}
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(helios_watchdog_self_test)");
@@ -42,25 +64,27 @@ fn generate_embedded_init(out_dir: &Path, target: &str) -> String {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_else(|| panic!("{} has no valid UTF-8 file name", component_path.display()));
-    let bootfs = render_embedded_bootfs(
+    let bootfs_entries = embedded_bootfs_entries(
         &prebuild.bootfs_root,
         &prebuild
             .bootfs_assets
             .into_iter()
             .map(|asset| EmbeddedBootAsset {
                 path: asset.path,
-                source: asset.source,
+                source: asset.source.display().to_string(),
             })
             .collect::<Vec<_>>(),
     );
 
-    format!(
-        "pub const EMBEDDED_INIT: Option<EmbeddedInitDescriptor> = Some(EmbeddedInitDescriptor {{\n    component: EmbeddedComponent::new(\n        r#\"{name}\"#,\n        include_bytes!(r#\"{component}\"#),\n    ),\n    argv0: r#\"{argv0}\"#,\n    bootfs: {bootfs},\n}});\n",
-        name = name,
-        component = component_path.display(),
-        argv0 = prebuild.init_argv0,
-        bootfs = bootfs,
-    )
+    let component = component_path.display().to_string();
+    EmbeddedInitTemplate {
+        name,
+        component: &component,
+        argv0: &prebuild.init_argv0,
+        bootfs_entries: &bootfs_entries,
+    }
+    .render()
+    .unwrap_or_else(|error| panic!("failed to render embedded init template: {error}"))
 }
 
 #[derive(Deserialize)]
@@ -149,12 +173,11 @@ fn write_trusted_root_file(out_dir: &Path, root_public_key: &Path, root_secret_k
         bytes.len()
     );
     let destination = out_dir.join("trusted_roots.rs");
-    let values = bytes
-        .iter()
-        .map(|byte| byte.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let source = format!("pub const TRUSTED_ROOT_PUBLIC_KEYS: &[[u8; 32]] = &[[{values}]];\n");
+    let source = TrustedRootsTemplate {
+        root_public_key: &bytes,
+    }
+    .render()
+    .unwrap_or_else(|error| panic!("failed to render trusted roots template: {error}"));
     fs::write(&destination, source)
         .unwrap_or_else(|error| panic!("failed to write {}: {error}", destination.display()));
 
@@ -166,14 +189,12 @@ fn write_trusted_root_file(out_dir: &Path, root_public_key: &Path, root_secret_k
         root_secret_key.display(),
         secret_bytes.len()
     );
-    let secret_values = secret_bytes
-        .iter()
-        .map(|byte| byte.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
     let signing_destination = out_dir.join("trusted_signing_key.rs");
-    let signing_source =
-        format!("pub const TRUSTED_ROOT_SIGNING_KEY: [u8; 32] = [{secret_values}];\n");
+    let signing_source = TrustedSigningKeyTemplate {
+        root_secret_key: &secret_bytes,
+    }
+    .render()
+    .unwrap_or_else(|error| panic!("failed to render trusted signing key template: {error}"));
     fs::write(&signing_destination, signing_source).unwrap_or_else(|error| {
         panic!("failed to write {}: {error}", signing_destination.display())
     });
@@ -181,10 +202,13 @@ fn write_trusted_root_file(out_dir: &Path, root_public_key: &Path, root_secret_k
 
 struct EmbeddedBootAsset {
     path: String,
-    source: PathBuf,
+    source: String,
 }
 
-fn render_embedded_bootfs(root: &Path, extra_assets: &[EmbeddedBootAsset]) -> String {
+fn embedded_bootfs_entries(
+    root: &Path,
+    extra_assets: &[EmbeddedBootAsset],
+) -> Vec<EmbeddedBootAsset> {
     let mut entries = Vec::new();
 
     for entry in WalkDir::new(root).sort_by_file_name() {
@@ -211,24 +235,21 @@ fn render_embedded_bootfs(root: &Path, extra_assets: &[EmbeddedBootAsset]) -> St
             .to_str()
             .unwrap_or_else(|| panic!("{} is not valid UTF-8", path.display()))
             .replace('\\', "/");
-        entries.push(format!(
-            "EmbeddedBootFile::new(r#\"{relative}\"#, include_bytes!(r#\"{path}\"#))",
-            relative = relative,
-            path = path.display(),
-        ));
+        entries.push(EmbeddedBootAsset {
+            path: relative,
+            source: path.display().to_string(),
+        });
     }
 
     for asset in extra_assets {
-        entries.push(format!(
-            "EmbeddedBootFile::new(r#\"{path}\"#, include_bytes!(r#\"{source}\"#))",
-            path = asset.path,
-            source = asset.source.display(),
-        ));
+        entries.push(EmbeddedBootAsset {
+            path: asset.path.clone(),
+            source: asset.source.clone(),
+        });
     }
 
-    entries.sort();
-
-    format!("EmbeddedBootFs::new(&[{}])", entries.join(", "))
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    entries
 }
 
 fn rerun_if_changed_recursive(root: &Path) {
