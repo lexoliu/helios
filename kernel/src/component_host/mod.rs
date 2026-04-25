@@ -7,6 +7,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll};
 
 use crate::WasiRights;
@@ -42,6 +43,7 @@ const NET_INSTANCE: &str = "helios:system/net@0.1.0";
 const TRACING_INSTANCE: &str = "helios:system/tracing@0.1.0";
 const INSTANCES_INSTANCE: &str = "helios:system/instances@0.1.0";
 const COMPONENT_CACHE_FRACTION: usize = 8;
+const COMPONENT_PHASE_HEARTBEAT_INTERVAL_NANOS: u64 = 5_000_000_000;
 
 pub mod service;
 mod topology;
@@ -74,6 +76,44 @@ pub type OutputMode = ComponentOutputMode;
 pub type OutputStreamKind = ComponentOutputStreamKind;
 pub type RuntimeDeadlinePollable<CpuImpl, HostFs> =
     DeadlinePollable<CpuImpl, HostRuntimeState<CpuImpl, HostFs>>;
+
+fn spawn_component_phase_heartbeat<CpuImpl>(
+    spawner: &crate::Spawner<CpuImpl>,
+    cpu: &CpuImpl,
+    progress: &helios_hal::watchdog::ProgressCounter,
+    write_serial: fn(&[u8]),
+    phase: &'static str,
+    started_at: u64,
+    done: &Arc<AtomicBool>,
+) where
+    CpuImpl: Cpu + Clone,
+{
+    spawner.spawn_detached({
+        let done = done.clone();
+        let cpu = cpu.clone();
+        let progress = progress.clone();
+        async move {
+            let mut next_heartbeat =
+                started_at.saturating_add(COMPONENT_PHASE_HEARTBEAT_INTERVAL_NANOS);
+            loop {
+                if done.load(Ordering::Acquire) {
+                    return;
+                }
+
+                let now = monotonic_nanos(&cpu);
+                if now >= next_heartbeat {
+                    progress.record_progress();
+                    let elapsed_ms = elapsed_millis(started_at, now);
+                    let message = format!("\n[KDBG {phase}-progress elapsed_ms={elapsed_ms}]\n");
+                    write_serial(message.as_bytes());
+                    next_heartbeat = now.saturating_add(COMPONENT_PHASE_HEARTBEAT_INTERVAL_NANOS);
+                }
+
+                crate::yield_now().await;
+            }
+        }
+    });
+}
 
 #[derive(Clone, Copy)]
 pub enum ComponentBindingSet {
@@ -687,6 +727,8 @@ where
         ComponentBindingSet::System => ComponentWorld::System,
         ComponentBindingSet::Program => ComponentWorld::Program,
     };
+    let instantiate_cpu = cpu.clone();
+    let instantiate_spawner = spawner.clone();
 
     let context = ComponentExecContext::new(
         cpu,
@@ -703,10 +745,21 @@ where
         write_serial,
     );
 
-    let executor = runtime
-        .instantiate(&engine, &compiled, component_world, context)
-        .await
-        .map_err(DebuggerError::InstantiateComponent)?;
+    let executor = runtime.instantiate(&engine, &compiled, component_world, context);
+    let instantiate_done = Arc::new(AtomicBool::new(false));
+    let instantiate_started_at = monotonic_nanos(&instantiate_cpu);
+    spawn_component_phase_heartbeat(
+        &instantiate_spawner,
+        &instantiate_cpu,
+        &instantiate_spawner.progress_counter(),
+        write_serial,
+        "instantiate",
+        instantiate_started_at,
+        &instantiate_done,
+    );
+    let executor = executor.await;
+    instantiate_done.store(true, Ordering::Release);
+    let executor = executor.map_err(DebuggerError::InstantiateComponent)?;
     emit_stage_marker(write_serial, "instantiate:ok");
 
     tracing::info!(component = component_name, "entering wasi:cli/run");
@@ -726,20 +779,19 @@ where
 pub(crate) fn component_linker<CpuImpl, HostFs>(
     engine: &Engine,
     world: ComponentBindingSet,
-    component: Option<&Component>,
+    component: &Component,
 ) -> wasmtime::Result<Linker<StoreData<CpuImpl, HostFs>>>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     let mut linker = Linker::<StoreData<CpuImpl, HostFs>>::new(engine);
-    if let Some(component) = component {
-        linker.allow_shadowing(true);
-        linker.define_unknown_imports_as_traps(component)?;
-    }
+    let wasi_imports =
+        crate::wasmtime_adapter::wasi::WasiImportSet::from_component(engine, component);
+    linker.allow_shadowing(true);
     wasmtime_wasi_io::add_to_linker_async(&mut linker)?;
-    crate::wasmtime_adapter::wasi::p2::add_to_linker(&mut linker)?;
-    crate::wasmtime_adapter::wasi::add_to_linker(&mut linker)?;
+    crate::wasmtime_adapter::wasi::p2::add_to_linker(&mut linker, &wasi_imports)?;
+    crate::wasmtime_adapter::wasi::add_to_linker(&mut linker, &wasi_imports)?;
     add_serial_to_linker(&mut linker)?;
     add_sync_to_linker(&mut linker)?;
     match world {

@@ -28,12 +28,12 @@ pub enum ProgramExecErrorKind {
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[error(
-    "program memory request of {requested_bytes} bytes would leave {available_bytes} bytes below the kernel reserve of {kernel_reserve_bytes} bytes"
+    "program memory request of {requested_bytes} bytes exceeds its memory budget: available={available_bytes} reserved={reserved_bytes}"
 )]
 pub struct ProgramOutOfMemory {
     pub requested_bytes: usize,
     pub available_bytes: usize,
-    pub kernel_reserve_bytes: usize,
+    pub reserved_bytes: usize,
 }
 
 #[derive(Debug, Error)]

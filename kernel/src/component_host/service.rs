@@ -1,4 +1,5 @@
 use super::*;
+use crate::wasmtime_adapter::WasmtimeCompiledComponent;
 use crate::wasmtime_adapter::config::AotCompileHint;
 use bytes::Bytes;
 use helios_hal::watchdog::Watchdog;
@@ -7,7 +8,6 @@ use wasmtime::component::Component;
 const COMPILER_PLUGIN_PATH: &str = "/bin/compiler.cwasm";
 const COMPILER_PLUGIN_ROOT_KEY_ENV: &str = "HELIOS_COMPILER_ROOT_KEY_HEX";
 const HELIOS_PROCESS_ID_ENV: &str = "HELIOS_PROCESS_ID";
-const PROGRAM_PHASE_HEARTBEAT_INTERVAL_NANOS: u64 = 5_000_000_000;
 
 #[derive(Clone)]
 pub struct UserProgramService<CpuImpl, HostFs>
@@ -39,7 +39,7 @@ where
 {
     runtime: crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
     engine: crate::wasmtime_adapter::WasmtimeEngine,
-    component_cache: Mutex<ComponentCache<crate::wasmtime_adapter::WasmtimeCompiledComponent>>,
+    component_cache: Mutex<ComponentCache<WasmtimeCompiledComponent>>,
     clock_cpu: CpuImpl,
     _marker: core::marker::PhantomData<fn() -> HostFs>,
 }
@@ -55,45 +55,6 @@ pub(crate) enum ProgramSource {
     RawWasm(Bytes),
     SignedArtifact(Bytes),
     BootfsArtifact(Bytes),
-}
-
-fn spawn_program_phase_heartbeat<CpuImpl>(
-    spawner: &crate::Spawner<CpuImpl>,
-    cpu: &CpuImpl,
-    progress: &helios_hal::watchdog::ProgressCounter,
-    write_serial: fn(&[u8]),
-    phase: &'static str,
-    started_at: u64,
-    done: &Arc<core::sync::atomic::AtomicBool>,
-) where
-    CpuImpl: Cpu + Clone,
-{
-    spawner.spawn_detached({
-        let done = done.clone();
-        let cpu = cpu.clone();
-        let progress = progress.clone();
-        async move {
-            let mut next_heartbeat =
-                started_at.saturating_add(PROGRAM_PHASE_HEARTBEAT_INTERVAL_NANOS);
-            loop {
-                if done.load(core::sync::atomic::Ordering::Acquire) {
-                    return;
-                }
-
-                let now = monotonic_nanos(&cpu);
-                if now >= next_heartbeat {
-                    progress.record_progress();
-                    let elapsed_ms = elapsed_millis(started_at, now);
-                    let message =
-                        format!("\n[KDBG program:{phase}-progress elapsed_ms={elapsed_ms}]\n");
-                    write_serial(message.as_bytes());
-                    next_heartbeat = now.saturating_add(PROGRAM_PHASE_HEARTBEAT_INTERVAL_NANOS);
-                }
-
-                crate::yield_now().await;
-            }
-        }
-    });
 }
 
 /// Handle to a spawned child component as seen by the kernel and its
@@ -247,7 +208,11 @@ where
             read_serial,
             write_serial,
         ))
-        .unwrap_or_else(|error| panic!("failed to exec embedded system component:\n{error:#}"));
+        .unwrap_or_else(|error| {
+            let message = alloc::format!("\n[KDBG error failed-system-component {error:#}]\n");
+            write_serial(message.as_bytes());
+            panic!("failed to exec embedded system component:\n{error:#}");
+        });
     super::emit_stage_marker(write_serial, "done");
     tracing::info!(
         component = component_name,
@@ -544,40 +509,40 @@ where
         payload: Bytes,
         write_serial: fn(&[u8]),
         started_at: u64,
-    ) -> Result<Arc<crate::wasmtime_adapter::WasmtimeCompiledComponent>, ProgramExecError> {
+    ) -> Result<Arc<WasmtimeCompiledComponent>, ProgramExecError> {
         if let Some(component) = self.inner.component_cache.lock().get(payload.as_ref()) {
-            super::emit_stage_marker(write_serial, "program:compile-cache-hit");
+            super::emit_stage_marker(write_serial, "program:deserialize-cache-hit");
             let now = monotonic_nanos(&self.inner.clock_cpu);
             tracing::info!(
                 target: "helios_component_host::program_host",
-                phase = "compile-component",
+                phase = "deserialize-component",
                 cache = "hit",
-                wasm_bytes = payload.len(),
+                cwasm_bytes = payload.len(),
                 elapsed_ms = elapsed_millis(started_at, now),
-                "program component cache hit"
+                "program component deserialization cache hit"
             );
             return Ok(component);
         }
 
-        super::emit_stage_marker(write_serial, "program:compile-begin");
+        super::emit_stage_marker(write_serial, "program:deserialize-begin");
         tracing::info!(
             target: "helios_component_host::program_host",
-            phase = "compile-component",
+            phase = "deserialize-component",
             cache = "miss",
-            wasm_bytes = payload.len(),
+            cwasm_bytes = payload.len(),
             "program component deserialization started"
         );
         let compiled = self.deserialize_component(&payload)?;
-        super::emit_stage_marker(write_serial, "program:compile-end");
+        super::emit_stage_marker(write_serial, "program:deserialize-end");
         let component = Arc::new(compiled);
         let now = monotonic_nanos(&self.inner.clock_cpu);
         tracing::info!(
             target: "helios_component_host::program_host",
-            phase = "compile-component",
+            phase = "deserialize-component",
             cache = "miss",
-            wasm_bytes = payload.len(),
+            cwasm_bytes = payload.len(),
             elapsed_ms = elapsed_millis(started_at, now),
-            "program component compiled"
+            "program component deserialized"
         );
         Ok(self
             .inner
@@ -589,13 +554,13 @@ where
     fn deserialize_component(
         &self,
         payload: &[u8],
-    ) -> Result<crate::wasmtime_adapter::WasmtimeCompiledComponent, ProgramExecError> {
+    ) -> Result<WasmtimeCompiledComponent, ProgramExecError> {
         let component = unsafe { Component::deserialize(self.inner.engine.raw(), payload) }
             .map_err(|error| ProgramExecError {
                 kind: ProgramExecErrorKind::InvalidBinary,
                 detail: format!("{error:#}"),
             })?;
-        Ok(crate::wasmtime_adapter::WasmtimeCompiledComponent { component })
+        Ok(WasmtimeCompiledComponent { component })
     }
 
     async fn compile_raw_component_to_signed_artifact(
@@ -749,12 +714,12 @@ where
     super::emit_stage_marker(exec_context.write_serial, "program:instantiate-ok");
 
     let run_done = Arc::new(core::sync::atomic::AtomicBool::new(false));
-    spawn_program_phase_heartbeat(
+    super::spawn_component_phase_heartbeat(
         &spawner,
         &run_cpu,
         &progress,
         exec_context.write_serial,
-        "run",
+        "program:run",
         run_started_at,
         &run_done,
     );

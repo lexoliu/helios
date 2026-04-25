@@ -11,5 +11,6 @@ i6300esb.workspace = true
 helios-kernel = { workspace = true, default-features = false, features = ["wasmtime-x86"] }
 limine = "0.5.0"
 pci_types = "0.10.1"
+spin = { version = "0.9.8", default-features = false, features = ["once"] }
 x86 = "0.52.0"
 x86_64 = { version = "0.15.3", default-features = false, features = ["instructions"] }

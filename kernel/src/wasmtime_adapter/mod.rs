@@ -169,7 +169,7 @@ where
             ComponentWorld::Program => ComponentBindingSet::Program,
         };
 
-        let linker = component_linker(&engine.engine, binding_set, Some(&compiled.component))?;
+        let linker = component_linker(&engine.engine, binding_set, &compiled.component)?;
 
         let filesystem =
             crate::wasmtime_adapter::wasi::DebugFileSystem::new(context.host_filesystem_state);

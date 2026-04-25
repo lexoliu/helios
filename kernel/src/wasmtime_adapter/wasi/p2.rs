@@ -19,7 +19,8 @@ use super::bindings::filesystem::types as p3fs;
 use super::bindings::filesystem::types::{ErrorCode as P3ErrorCode, OpenFlags as P3OpenFlags};
 use super::{
     FsDescriptor, FsNodeKind, P2IncomingDatagramStream, P2Network, P2OutgoingDatagramStream,
-    TcpSocket, UdpSocket, WasiUdpSocketAddress, WasiUdpSocketError, WasiUdpSocketFamily,
+    TcpSocket, UdpSocket, WasiImportSet, WasiUdpSocketAddress, WasiUdpSocketError,
+    WasiUdpSocketFamily,
 };
 use crate::component_host::{RuntimeDeadlinePollable, StoreData};
 use crate::wasmtime_adapter::store::{ChannelInputStream, ChannelOutputStream, StdioOutputStream};
@@ -231,112 +232,161 @@ impl FileInputStream {
 
 pub(crate) fn add_to_linker<CpuImpl, HostFs>(
     linker: &mut Linker<StoreData<CpuImpl, HostFs>>,
+    imports: &WasiImportSet,
 ) -> Result<()>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    cli_bindings::cli::environment::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-        linker,
-        |state| state,
-    )?;
-    cli_bindings::cli::exit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-        linker,
-        &Default::default(),
-        |state| state,
-    )?;
-    cli_bindings::cli::stdin::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-        linker,
-        |state| state,
-    )?;
-    cli_bindings::cli::stdout::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-        linker,
-        |state| state,
-    )?;
-    cli_bindings::cli::stderr::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-        linker,
-        |state| state,
-    )?;
-    cli_bindings::cli::terminal_input::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-        linker,
-        |state| state,
-    )?;
-    cli_bindings::cli::terminal_output::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-        linker,
-        |state| state,
-    )?;
-    cli_bindings::cli::terminal_stdin::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-        linker,
-        |state| state,
-    )?;
-    cli_bindings::cli::terminal_stdout::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-        linker,
-        |state| state,
-    )?;
-    cli_bindings::cli::terminal_stderr::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-        linker,
-        |state| state,
-    )?;
+    if imports.has("wasi:cli/environment", "0.2") {
+        cli_bindings::cli::environment::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+            linker,
+            |state| state,
+        )?;
+    }
+    if imports.has("wasi:cli/exit", "0.2") {
+        cli_bindings::cli::exit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+            linker,
+            &Default::default(),
+            |state| state,
+        )?;
+    }
+    if imports.has("wasi:cli/stdin", "0.2") {
+        cli_bindings::cli::stdin::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+            linker,
+            |state| state,
+        )?;
+    }
+    if imports.has("wasi:cli/stdout", "0.2") {
+        cli_bindings::cli::stdout::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+            linker,
+            |state| state,
+        )?;
+    }
+    if imports.has("wasi:cli/stderr", "0.2") {
+        cli_bindings::cli::stderr::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+            linker,
+            |state| state,
+        )?;
+    }
+    if imports.has("wasi:cli/terminal-input", "0.2") {
+        cli_bindings::cli::terminal_input::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+            linker,
+            |state| state,
+        )?;
+    }
+    if imports.has("wasi:cli/terminal-output", "0.2") {
+        cli_bindings::cli::terminal_output::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+            linker,
+            |state| state,
+        )?;
+    }
+    if imports.has("wasi:cli/terminal-stdin", "0.2") {
+        cli_bindings::cli::terminal_stdin::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+            linker,
+            |state| state,
+        )?;
+    }
+    if imports.has("wasi:cli/terminal-stdout", "0.2") {
+        cli_bindings::cli::terminal_stdout::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+            linker,
+            |state| state,
+        )?;
+    }
+    if imports.has("wasi:cli/terminal-stderr", "0.2") {
+        cli_bindings::cli::terminal_stderr::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+            linker,
+            |state| state,
+        )?;
+    }
 
-    clocks_bindings::clocks::monotonic_clock::add_to_linker::<
-        _,
-        HasSelf<StoreData<CpuImpl, HostFs>>,
-    >(linker, |state| state)?;
-    clocks_bindings::clocks::wall_clock::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-        linker,
-        |state| state,
-    )?;
+    if imports.has("wasi:clocks/monotonic-clock", "0.2") {
+        clocks_bindings::clocks::monotonic_clock::add_to_linker::<
+            _,
+            HasSelf<StoreData<CpuImpl, HostFs>>,
+        >(linker, |state| state)?;
+    }
+    if imports.has("wasi:clocks/wall-clock", "0.2") {
+        clocks_bindings::clocks::wall_clock::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+            linker,
+            |state| state,
+        )?;
+    }
 
-    filesystem_bindings::filesystem::preopens::add_to_linker::<
-        _,
-        HasSelf<StoreData<CpuImpl, HostFs>>,
-    >(linker, |state| state)?;
-    filesystem_bindings::filesystem::types::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-        linker,
-        |state| state,
-    )?;
+    if imports.has("wasi:filesystem/preopens", "0.2") {
+        filesystem_bindings::filesystem::preopens::add_to_linker::<
+            _,
+            HasSelf<StoreData<CpuImpl, HostFs>>,
+        >(linker, |state| state)?;
+    }
+    if imports.has("wasi:filesystem/types", "0.2") {
+        filesystem_bindings::filesystem::types::add_to_linker::<
+            _,
+            HasSelf<StoreData<CpuImpl, HostFs>>,
+        >(linker, |state| state)?;
+    }
 
-    random_bindings::random::random::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-        linker,
-        |state| state,
-    )?;
-    random_bindings::random::insecure::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-        linker,
-        |state| state,
-    )?;
-    random_bindings::random::insecure_seed::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-        linker,
-        |state| state,
-    )?;
-    sockets_bindings::sockets::network::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-        linker,
-        &Default::default(),
-        |state| state,
-    )?;
-    sockets_bindings::sockets::instance_network::add_to_linker::<
-        _,
-        HasSelf<StoreData<CpuImpl, HostFs>>,
-    >(linker, |state| state)?;
-    sockets_bindings::sockets::udp::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-        linker,
-        |state| state,
-    )?;
-    sockets_bindings::sockets::udp_create_socket::add_to_linker::<
-        _,
-        HasSelf<StoreData<CpuImpl, HostFs>>,
-    >(linker, |state| state)?;
-    sockets_bindings::sockets::tcp::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-        linker,
-        |state| state,
-    )?;
-    sockets_bindings::sockets::tcp_create_socket::add_to_linker::<
-        _,
-        HasSelf<StoreData<CpuImpl, HostFs>>,
-    >(linker, |state| state)?;
-    sockets_bindings::sockets::ip_name_lookup::add_to_linker::<
-        _,
-        HasSelf<StoreData<CpuImpl, HostFs>>,
-    >(linker, |state| state)?;
+    if imports.has("wasi:random/random", "0.2") {
+        random_bindings::random::random::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+            linker,
+            |state| state,
+        )?;
+    }
+    if imports.has("wasi:random/insecure", "0.2") {
+        random_bindings::random::insecure::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+            linker,
+            |state| state,
+        )?;
+    }
+    if imports.has("wasi:random/insecure-seed", "0.2") {
+        random_bindings::random::insecure_seed::add_to_linker::<
+            _,
+            HasSelf<StoreData<CpuImpl, HostFs>>,
+        >(linker, |state| state)?;
+    }
+    if imports.has("wasi:sockets/network", "0.2") {
+        sockets_bindings::sockets::network::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+            linker,
+            &Default::default(),
+            |state| state,
+        )?;
+    }
+    if imports.has("wasi:sockets/instance-network", "0.2") {
+        sockets_bindings::sockets::instance_network::add_to_linker::<
+            _,
+            HasSelf<StoreData<CpuImpl, HostFs>>,
+        >(linker, |state| state)?;
+    }
+    if imports.has("wasi:sockets/udp", "0.2") {
+        sockets_bindings::sockets::udp::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+            linker,
+            |state| state,
+        )?;
+    }
+    if imports.has("wasi:sockets/udp-create-socket", "0.2") {
+        sockets_bindings::sockets::udp_create_socket::add_to_linker::<
+            _,
+            HasSelf<StoreData<CpuImpl, HostFs>>,
+        >(linker, |state| state)?;
+    }
+    if imports.has("wasi:sockets/tcp", "0.2") {
+        sockets_bindings::sockets::tcp::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+            linker,
+            |state| state,
+        )?;
+    }
+    if imports.has("wasi:sockets/tcp-create-socket", "0.2") {
+        sockets_bindings::sockets::tcp_create_socket::add_to_linker::<
+            _,
+            HasSelf<StoreData<CpuImpl, HostFs>>,
+        >(linker, |state| state)?;
+    }
+    if imports.has("wasi:sockets/ip-name-lookup", "0.2") {
+        sockets_bindings::sockets::ip_name_lookup::add_to_linker::<
+            _,
+            HasSelf<StoreData<CpuImpl, HostFs>>,
+        >(linker, |state| state)?;
+    }
     Ok(())
 }
 

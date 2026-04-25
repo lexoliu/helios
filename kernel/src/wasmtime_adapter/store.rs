@@ -22,7 +22,7 @@ use wasmtime_wasi_io::streams::{InputStream, OutputStream, StreamError, StreamRe
 use crate::child_io::{ByteReader, ByteWriter};
 use crate::{
     ComponentRuntimeState, ComponentStoreData, ProgramOutOfMemory, allow_instance_resource_growth,
-    heap_stats, user_memory_kernel_reserve_bytes,
+    heap_stats, user_heap_stats, user_memory_kernel_reserve_bytes,
 };
 
 impl<CpuImpl, RuntimeStateImpl, FileSystem> ResourceLimiter
@@ -39,18 +39,34 @@ where
         maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
         if maximum.is_some_and(|maximum| desired > maximum) {
-            return Ok(false);
+            return Err(ProgramOutOfMemory {
+                requested_bytes: desired,
+                available_bytes: 0,
+                reserved_bytes: 0,
+            }
+            .into());
+        }
+
+        let growth = desired.saturating_sub(current);
+        let user_heap = user_heap_stats();
+        let user_available = user_heap.available_bytes();
+        if user_available < growth {
+            return Err(ProgramOutOfMemory {
+                requested_bytes: desired,
+                available_bytes: user_available,
+                reserved_bytes: 0,
+            }
+            .into());
         }
 
         let heap = heap_stats();
         let reserve = user_memory_kernel_reserve_bytes(heap.total_bytes);
         let available = heap.available_bytes();
-        let growth = desired.saturating_sub(current);
         if available.saturating_sub(growth) < reserve {
             return Err(ProgramOutOfMemory {
                 requested_bytes: desired,
                 available_bytes: available,
-                kernel_reserve_bytes: reserve,
+                reserved_bytes: reserve,
             }
             .into());
         }
@@ -60,6 +76,10 @@ where
             desired,
             maximum,
         ))
+    }
+
+    fn memory_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        Err(error)
     }
 
     fn table_growing(

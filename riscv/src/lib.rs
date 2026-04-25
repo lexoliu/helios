@@ -106,6 +106,7 @@ unsafe fn read_u32(addr: usize) -> u32 {
 use core::arch::{asm, global_asm};
 use core::cell::Cell;
 use core::fmt::Write;
+use core::mem;
 use core::ops::Range;
 use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
 
@@ -133,6 +134,7 @@ const SSTATUS_SPP_BIT: usize = 1 << 8;
 static BOOT_HART_ID: AtomicUsize = AtomicUsize::new(UNINITIALIZED_BOOT_HART);
 static CRITICAL_SECTION_OWNER: AtomicUsize = AtomicUsize::new(0);
 static CRITICAL_SECTION_DEPTH: AtomicUsize = AtomicUsize::new(0);
+static WASMTIME_NATIVE_TRAP_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static DEBUG_STATE: Once<debug_state::RuntimeState> = Once::new();
 static WATCHDOG_STATE: Once<watchdog::RiscvWatchdog> = Once::new();
 
@@ -821,6 +823,7 @@ extern "C" fn wasmtime_tls_set(ptr: *mut u8) {
 
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_init_traps(handler: KernelNativeTrapHandler) -> i32 {
+    WASMTIME_NATIVE_TRAP_HANDLER.store(handler as usize, Ordering::Release);
     let runtime = current_hart_runtime();
     runtime.native_trap_handler.set(Some(handler));
     0
@@ -858,12 +861,27 @@ fn dispatch_kernel_exception(
     stval: usize,
     tf: &TrapFrame,
 ) -> KernelExceptionDispatch {
-    let Some(handler) = current_hart_runtime().native_trap_handler.get() else {
-        return KernelExceptionDispatch::Unhandled;
+    let handler = if let Some(handler) = current_hart_runtime().native_trap_handler.get() {
+        handler
+    } else {
+        let raw_handler = WASMTIME_NATIVE_TRAP_HANDLER.load(Ordering::Acquire);
+        if raw_handler == 0 {
+            return KernelExceptionDispatch::Unhandled;
+        }
+        unsafe { mem::transmute(raw_handler) }
     };
     let Some(cause) = kernel_exception_cause(exception) else {
         return KernelExceptionDispatch::Unhandled;
     };
+    write_debug_serial_bytes(
+        alloc::format!(
+            "\n[KDBG kernel-exception-dispatch cause={cause:?} pc={:#x} fp={:#x} tls={:#x}]\n",
+            tf.sepc,
+            tf.general.s0,
+            wasmtime_tls_get() as usize,
+        )
+        .as_bytes(),
+    );
     KernelException {
         cause,
         instruction_pointer: tf.sepc,

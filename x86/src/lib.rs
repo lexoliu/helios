@@ -13,6 +13,8 @@ mod watchdog;
 mod debug_state {
     pub(crate) type RuntimeState =
         helios_kernel::HostRuntimeState<crate::X86Cpu, crate::host_fs::HostFileSystemService>;
+    pub(crate) type ProgramService =
+        helios_kernel::UserProgramService<crate::X86Cpu, crate::host_fs::HostFileSystemService>;
 }
 
 use alloc::sync::Arc;
@@ -21,6 +23,7 @@ use core::arch::global_asm;
 use core::arch::x86_64::{__cpuid, __cpuid_count, _rdtsc};
 use core::fmt::{self, Write};
 use core::ops::Range;
+use helios_hal::boot::BootMemoryMap;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
@@ -51,6 +54,8 @@ const PAGE_HUGE: u64 = 1 << 7;
 const PAGE_NO_EXECUTE: u64 = 1 << 63;
 pub(crate) const KERNEL_STACK_BYTES: usize = 4 * 1024 * 1024;
 const WATCHDOG_SELF_TEST_ENABLED: bool = option_env!("HELIOS_WATCHDOG_SELF_TEST").is_some();
+pub(crate) static WASMTIME_NATIVE_TRAP_HANDLER: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 global_asm!(include_str!("secondary_wakeup.S"));
 
@@ -134,9 +139,14 @@ fn x86_kernel_main() -> ! {
             .with_dma_model(DmaModel::Translated)
             .with_devices(DeviceInventory::new().with_debug_serial()),
     );
+    smp::current_runtime().install_timer(kernel.timer());
+    x86_64::instructions::interrupts::enable();
     let debug_state = cpu.debug_state();
-    let _program_service =
+    let program_service =
         helios_kernel::install_component_host_program_service(&kernel, &cpu, &debug_state);
+    smp::current_runtime().install_program_service(
+        program_service.unwrap_or_else(|| panic!("x86 bootstrap did not install program service")),
+    );
     if cpu.current_processor() == cpu.bootstrap_processor() {
         for processor in helios_kernel::component_host_processors_to_start(
             cpu.processor_count(),
@@ -195,7 +205,7 @@ impl BootReservedRanges {
     }
 }
 
-fn boot_reserved_ranges(handoff: &helios_hal::boot::BootHandoff<'_>) -> BootReservedRanges {
+fn boot_reserved_ranges(handoff: &boot::LimineBootHandoff) -> BootReservedRanges {
     let executable_bytes = align_up_usize(
         usize::try_from(handoff.kernel.size).unwrap_or_else(|_| {
             panic!(
@@ -234,13 +244,12 @@ fn boot_reserved_ranges(handoff: &helios_hal::boot::BootHandoff<'_>) -> BootRese
 }
 
 fn reserve_wakeup_page(
-    handoff: &helios_hal::boot::BootHandoff<'_>,
+    handoff: &boot::LimineBootHandoff,
     reserved_ranges: &BootReservedRanges,
 ) -> Range<usize> {
     handoff
         .memory_map
-        .iter()
-        .copied()
+        .regions()
         .flat_map(|region| usable_region_segments(region, reserved_ranges))
         .flatten()
         .find_map(|segment| {
@@ -255,14 +264,14 @@ fn reserve_wakeup_page(
 }
 
 fn boot_memory_regions(
-    handoff: &helios_hal::boot::BootHandoff<'_>,
+    handoff: &boot::LimineBootHandoff,
     physical_memory_offset: usize,
     reserved_ranges: &BootReservedRanges,
     excluded: Option<Range<usize>>,
 ) -> impl IntoIterator<Item = MemoryRegion> {
     let mut reserved_ranges = reserved_ranges.clone();
     reserved_ranges.ranges[2] = excluded;
-    handoff.memory_map.iter().copied().flat_map(move |region| {
+    handoff.memory_map.regions().flat_map(move |region| {
         usable_region_segments(region, &reserved_ranges)
             .into_iter()
             .flatten()
@@ -471,7 +480,10 @@ impl Cpu for X86Cpu {
         self.state.tsc_hz()
     }
 
-    fn set_deadline(&self, _deadline: Instant) {}
+    fn set_deadline(&self, deadline: Instant) {
+        let _ = deadline;
+        smp::ensure_local_scheduler_timer(exceptions::TIMER_INTERRUPT_VECTOR);
+    }
 
     fn publish_executable(&self, ptr: *const u8, len: usize) {
         if len == 0 {
@@ -561,6 +573,12 @@ extern "C" fn secondary_start_rust(
         cpu.clone(),
         cpu.watchdog(),
     ));
+    smp::current_runtime().install_timer(kernel.timer());
+    x86_64::instructions::interrupts::enable();
+    let program_service = debug_state
+        .program_service()
+        .unwrap_or_else(|| panic!("x86 secondary started before program service installation"));
+    smp::current_runtime().install_program_service(program_service);
     run_current_processor(cpu, kernel, debug_state)
 }
 
@@ -861,6 +879,7 @@ extern "C" fn wasmtime_tls_set(ptr: *mut u8) {
 
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_init_traps(handler: helios_kernel::KernelNativeTrapHandler) -> i32 {
+    WASMTIME_NATIVE_TRAP_HANDLER.store(handler as usize, core::sync::atomic::Ordering::Release);
     smp::current_runtime()
         .native_trap_handler
         .store(handler as usize, core::sync::atomic::Ordering::Release);

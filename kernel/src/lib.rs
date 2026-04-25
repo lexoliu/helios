@@ -37,6 +37,7 @@ mod task;
 mod time;
 mod timer;
 mod unsupported_host_fs;
+mod user_memory;
 mod wasi_rights;
 pub(crate) mod wasmtime_adapter;
 
@@ -126,6 +127,7 @@ pub use task::{YieldNow, yield_now};
 pub use time::{duration_to_ticks, elapsed_millis, monotonic_nanos};
 pub use timer::{Sleep, Timer};
 pub use unsupported_host_fs::UnsupportedHostFileSystem;
+pub use user_memory::{UserHeapStats, UserMemoryCreator, user_heap_stats};
 pub use wasi_rights::WasiRights;
 // Wasmtime-specific helpers are crate-internal only.
 // External consumers use the ComponentRuntimeFactory trait.
@@ -170,6 +172,8 @@ impl HeapStats {
 
 const USER_MEMORY_KERNEL_RESERVE_FRACTION: usize = 4;
 const USER_MEMORY_MIN_KERNEL_RESERVE_BYTES: usize = 32 * 1024 * 1024;
+const USER_HEAP_REGION_FRACTION: usize = 2;
+const USER_HEAP_MIN_REGION_BYTES: usize = 2 * 1024 * 1024;
 
 pub struct Kernel<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone = NoWatchdog> {
     cpu: CpuImpl,
@@ -514,10 +518,32 @@ where
         let region = unsafe { region.as_mut() };
         let start = region.as_mut_ptr() as usize;
         let end = start + region.len();
+        let (kernel_end, user_start) = split_bootstrap_memory_region(start, end);
         unsafe {
-            ALLOCATOR.lock().add_to_heap(start, end);
+            ALLOCATOR.lock().add_to_heap(start, kernel_end);
+        }
+        if let Some(user_start) = user_start {
+            user_memory::add_user_heap_region(user_start, end);
         }
     }
+}
+
+fn split_bootstrap_memory_region(start: usize, end: usize) -> (usize, Option<usize>) {
+    let len = end.saturating_sub(start);
+    if len < USER_HEAP_MIN_REGION_BYTES * USER_HEAP_REGION_FRACTION {
+        return (end, None);
+    }
+
+    let user_len = len / USER_HEAP_REGION_FRACTION;
+    let user_start = align_down(end.saturating_sub(user_len), USER_HEAP_MIN_REGION_BYTES);
+    if user_start <= start || end.saturating_sub(user_start) < USER_HEAP_MIN_REGION_BYTES {
+        return (end, None);
+    }
+    (user_start, Some(user_start))
+}
+
+const fn align_down(value: usize, align: usize) -> usize {
+    value & !(align - 1)
 }
 
 pub fn prime_bootstrap_allocator<Regions>(memory_regions: Regions)

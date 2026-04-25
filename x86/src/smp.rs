@@ -10,11 +10,20 @@ use core::ops::Range;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use helios_hal::cpu::ProcessorId;
+use helios_hal::watchdog::Watchdog;
+use helios_kernel::Timer;
 use pci_types::ConfigRegionAccess;
+use spin::Once;
 use x86::apic::x2apic::X2APIC;
-use x86::apic::xapic::XAPIC;
+use x86::apic::xapic::{
+    XAPIC, XAPIC_LVT_TIMER, XAPIC_SVR, XAPIC_TIMER_CURRENT_COUNT, XAPIC_TIMER_DIV_CONF,
+    XAPIC_TIMER_INIT_COUNT,
+};
 use x86::apic::{ApicControl, ApicId};
-use x86::msr::{IA32_FS_BASE, rdmsr, wrmsr};
+use x86::msr::{
+    IA32_APIC_BASE, IA32_FS_BASE, IA32_X2APIC_CUR_COUNT, IA32_X2APIC_DIV_CONF,
+    IA32_X2APIC_INIT_COUNT, IA32_X2APIC_LVT_TIMER, rdmsr, wrmsr,
+};
 use x86_64::PhysAddr;
 use x86_64::VirtAddr;
 use x86_64::instructions::tlb;
@@ -35,15 +44,27 @@ pub(crate) const WAKEUP_PAGE_BYTES: usize = 4096;
 pub(crate) const SIPI_MAX_PHYSICAL_ADDRESS: usize = 0x10_0000;
 const AP_STARTUP_INIT_ASSERT_MICROS: u64 = 10_000;
 const AP_STARTUP_INTER_IPI_MICROS: u64 = 200;
+const APIC_TIMER_CALIBRATION_MICROS: u64 = 10_000;
+const APIC_TIMER_DIVIDE_BY_ONE: u32 = 0b1011;
+const APIC_TIMER_MASKED: u64 = 1 << 16;
+const APIC_TIMER_PERIODIC: u64 = 1 << 17;
+const APIC_TIMER_MODE_MASK: u64 = 0b11 << 17;
+const APIC_TIMER_VECTOR_MASK: u64 = 0xff;
 const PAGE_BYTES: usize = 4096;
 
 #[repr(C)]
 pub(crate) struct ProcessorRuntime {
     logical_id: u16,
     _reserved: u16,
+    physical_memory_offset: usize,
+    tsc_hz: u64,
     pub(crate) wasmtime_tls: AtomicPtr<u8>,
     pub(crate) native_trap_handler: AtomicUsize,
     pub(crate) exception_idt: ProcessorIdt,
+    watchdog: X86Watchdog,
+    timer: Once<Timer<crate::X86Cpu>>,
+    program_service: Once<debug_state::ProgramService>,
+    local_timer_ready: AtomicBool,
     started: AtomicBool,
 }
 
@@ -110,9 +131,15 @@ pub(crate) fn build_boot_context(
         runtime: ProcessorRuntime {
             logical_id: 0,
             _reserved: 0,
+            physical_memory_offset,
+            tsc_hz,
             wasmtime_tls: AtomicPtr::new(core::ptr::null_mut()),
             native_trap_handler: AtomicUsize::new(0),
             exception_idt: ProcessorIdt::new(),
+            watchdog: watchdog.clone(),
+            timer: Once::new(),
+            program_service: Once::new(),
+            local_timer_ready: AtomicBool::new(false),
             started: AtomicBool::new(false),
         },
         stack_top: 0,
@@ -129,9 +156,15 @@ pub(crate) fn build_boot_context(
             runtime: ProcessorRuntime {
                 logical_id: (index + 1) as u16,
                 _reserved: 0,
+                physical_memory_offset,
+                tsc_hz,
                 wasmtime_tls: AtomicPtr::new(core::ptr::null_mut()),
                 native_trap_handler: AtomicUsize::new(0),
                 exception_idt: ProcessorIdt::new(),
+                watchdog: watchdog.clone(),
+                timer: Once::new(),
+                program_service: Once::new(),
+                local_timer_ready: AtomicBool::new(false),
                 started: AtomicBool::new(false),
             },
             stack_top: stack + KERNEL_STACK_BYTES,
@@ -185,6 +218,38 @@ pub(crate) fn current_runtime() -> &'static ProcessorRuntime {
         "x86 processor runtime was not installed before use"
     );
     unsafe { &*runtime }
+}
+
+impl ProcessorRuntime {
+    pub(crate) fn install_timer(&self, timer: Timer<crate::X86Cpu>) {
+        assert!(
+            self.timer.get().is_none(),
+            "x86 processor timer was installed more than once"
+        );
+        self.timer.call_once(|| timer);
+    }
+
+    pub(crate) fn install_program_service(&self, service: debug_state::ProgramService) {
+        assert!(
+            self.program_service.get().is_none(),
+            "x86 processor program service was installed more than once"
+        );
+        self.program_service.call_once(|| service);
+    }
+
+    pub(crate) fn ensure_local_timer(&self, vector: u8) {
+        if self
+            .local_timer_ready
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            enable_local_scheduler_timer(vector);
+        }
+    }
+
+    fn platform_tsc_hz(&self) -> u64 {
+        self.tsc_hz
+    }
 }
 
 impl BootContext {
@@ -303,6 +368,137 @@ impl X86PlatformState {
 enum LocalApicMode {
     XApic { physical_base: usize },
     X2Apic,
+}
+
+pub(crate) fn ensure_local_scheduler_timer(vector: u8) {
+    let runtime = current_runtime();
+    runtime.ensure_local_timer(vector);
+}
+
+pub(crate) fn handle_local_timer_interrupt() {
+    let runtime = current_runtime();
+    runtime.watchdog.pet();
+    if let Some(service) = runtime.program_service.get() {
+        service.increment_epoch();
+    }
+    runtime
+        .timer
+        .get()
+        .unwrap_or_else(|| panic!("x86 local timer interrupted before kernel timer installation"))
+        .handle_interrupt();
+    local_apic_eoi();
+}
+
+fn enable_local_scheduler_timer(vector: u8) {
+    let runtime = current_runtime();
+    match local_apic_mode(0) {
+        LocalApicMode::X2Apic => {
+            let mut apic = X2APIC::new();
+            apic.attach();
+            let initial_count = calibrate_x2apic_timer(runtime.platform_tsc_hz());
+            program_x2apic_periodic_timer(vector, initial_count);
+        }
+        LocalApicMode::XApic { physical_base } => {
+            let apic_region = xapic_mmio_region(physical_base, runtime.physical_memory_offset);
+            attach_xapic(apic_region);
+            let initial_count = calibrate_xapic_timer(apic_region, runtime.platform_tsc_hz());
+            program_xapic_periodic_timer(apic_region, vector, initial_count);
+        }
+    }
+}
+
+fn attach_xapic(apic_region: &[u32]) {
+    unsafe {
+        let mut base = rdmsr(IA32_APIC_BASE);
+        base |= 1 << 11;
+        wrmsr(IA32_APIC_BASE, base);
+    }
+    write_xapic_register(apic_region, XAPIC_SVR, (1 << 8) | 15);
+}
+
+fn calibrate_x2apic_timer(tsc_hz: u64) -> u32 {
+    unsafe {
+        wrmsr(IA32_X2APIC_DIV_CONF, u64::from(APIC_TIMER_DIVIDE_BY_ONE));
+        wrmsr(
+            IA32_X2APIC_LVT_TIMER,
+            APIC_TIMER_MASKED | u64::from(crate::exceptions::TIMER_INTERRUPT_VECTOR),
+        );
+        wrmsr(IA32_X2APIC_INIT_COUNT, u64::from(u32::MAX));
+        stall_microseconds(tsc_hz, APIC_TIMER_CALIBRATION_MICROS);
+        let current = rdmsr(IA32_X2APIC_CUR_COUNT) as u32;
+        wrmsr(IA32_X2APIC_INIT_COUNT, 0);
+        timer_elapsed_count(current)
+    }
+}
+
+fn calibrate_xapic_timer(apic_region: &[u32], tsc_hz: u64) -> u32 {
+    write_xapic_register(apic_region, XAPIC_TIMER_DIV_CONF, APIC_TIMER_DIVIDE_BY_ONE);
+    write_xapic_register(
+        apic_region,
+        XAPIC_LVT_TIMER,
+        (APIC_TIMER_MASKED | u64::from(crate::exceptions::TIMER_INTERRUPT_VECTOR)) as u32,
+    );
+    write_xapic_register(apic_region, XAPIC_TIMER_INIT_COUNT, u32::MAX);
+    stall_microseconds(tsc_hz, APIC_TIMER_CALIBRATION_MICROS);
+    let current = read_xapic_register(apic_region, XAPIC_TIMER_CURRENT_COUNT);
+    write_xapic_register(apic_region, XAPIC_TIMER_INIT_COUNT, 0);
+    timer_elapsed_count(current)
+}
+
+fn timer_elapsed_count(current: u32) -> u32 {
+    let elapsed = u32::MAX.saturating_sub(current);
+    assert!(
+        elapsed != 0,
+        "x86 local APIC timer did not tick during calibration"
+    );
+    elapsed
+}
+
+fn program_x2apic_periodic_timer(vector: u8, initial_count: u32) {
+    unsafe {
+        let lvt = (rdmsr(IA32_X2APIC_LVT_TIMER)
+            & !(APIC_TIMER_VECTOR_MASK | APIC_TIMER_MASKED | APIC_TIMER_MODE_MASK))
+            | u64::from(vector)
+            | APIC_TIMER_PERIODIC;
+        wrmsr(IA32_X2APIC_LVT_TIMER, lvt);
+        wrmsr(IA32_X2APIC_INIT_COUNT, u64::from(initial_count));
+    }
+}
+
+fn program_xapic_periodic_timer(apic_region: &[u32], vector: u8, initial_count: u32) {
+    let lvt = (u64::from(read_xapic_register(apic_region, XAPIC_LVT_TIMER))
+        & !(APIC_TIMER_VECTOR_MASK | APIC_TIMER_MASKED | APIC_TIMER_MODE_MASK))
+        | u64::from(vector)
+        | APIC_TIMER_PERIODIC;
+    write_xapic_register(apic_region, XAPIC_LVT_TIMER, lvt as u32);
+    write_xapic_register(apic_region, XAPIC_TIMER_INIT_COUNT, initial_count);
+}
+
+fn read_xapic_register(apic_region: &[u32], offset: u32) -> u32 {
+    let index = (offset / 4) as usize;
+    unsafe { core::ptr::read_volatile(&apic_region[index]) }
+}
+
+fn write_xapic_register(apic_region: &[u32], offset: u32, value: u32) {
+    let index = (offset / 4) as usize;
+    unsafe {
+        core::ptr::write_volatile(apic_region.as_ptr().add(index) as *mut u32, value);
+    }
+}
+
+fn local_apic_eoi() {
+    let runtime = current_runtime();
+    match local_apic_mode(0) {
+        LocalApicMode::X2Apic => {
+            let mut apic = X2APIC::new();
+            apic.eoi();
+        }
+        LocalApicMode::XApic { physical_base } => {
+            let apic_region = xapic_mmio_region(physical_base, runtime.physical_memory_offset);
+            let mut apic = XAPIC::new(apic_region);
+            apic.eoi();
+        }
+    }
 }
 
 unsafe fn wake_application_processor(

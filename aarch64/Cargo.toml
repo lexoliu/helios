@@ -1,0 +1,11 @@
+[package]
+name = "helios-aarch64"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+critical-section = { version = "1.2.0", features = ["restore-state-bool"] }
+fdt = { version = "0.1.5", default-features = false }
+helios-hal.workspace = true
+helios-kernel = { workspace = true, default-features = false, features = ["wasmtime-aarch64"] }
+limine = "0.5.0"

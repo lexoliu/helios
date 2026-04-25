@@ -13,6 +13,7 @@ use x86_64::structures::idt::InterruptDescriptorTable;
 use crate::smp;
 
 const PAGE_FAULT_INSTRUCTION_FETCH: u64 = 1 << 4;
+pub(crate) const TIMER_INTERRUPT_VECTOR: u8 = 0x20;
 
 global_asm!(include_str!("exceptions.S"));
 
@@ -24,6 +25,7 @@ unsafe extern "C" {
     fn helios_x86_exception_page_fault();
     fn helios_x86_exception_x87_floating_point();
     fn helios_x86_exception_simd_floating_point();
+    fn helios_x86_interrupt_timer();
 }
 
 pub(crate) struct ProcessorIdt {
@@ -64,6 +66,8 @@ impl ProcessorIdt {
             table
                 .simd_floating_point
                 .set_handler_addr(handler_address(helios_x86_exception_simd_floating_point));
+            table[TIMER_INTERRUPT_VECTOR]
+                .set_handler_addr(handler_address(helios_x86_interrupt_timer));
             table.load_unsafe();
         }
     }
@@ -114,10 +118,28 @@ extern "C" fn helios_x86_exception_dispatch(frame: &mut ExceptionFrame) -> ! {
     );
 }
 
+#[unsafe(no_mangle)]
+extern "C" fn helios_x86_interrupt_dispatch(frame: &mut ExceptionFrame) {
+    match u8::try_from(frame.vector) {
+        Ok(TIMER_INTERRUPT_VECTOR) => {
+            smp::handle_local_timer_interrupt();
+        }
+        _ => panic!(
+            "unhandled x86 interrupt vector={} rip={:#x}",
+            frame.vector, frame.rip
+        ),
+    }
+}
+
 fn dispatch_to_wasmtime(exception: KernelException) -> KernelExceptionDispatch {
-    let raw_handler = smp::current_runtime()
+    let per_processor_handler = smp::current_runtime()
         .native_trap_handler
         .load(Ordering::Acquire);
+    let raw_handler = if per_processor_handler != 0 {
+        per_processor_handler
+    } else {
+        crate::WASMTIME_NATIVE_TRAP_HANDLER.load(Ordering::Acquire)
+    };
     if raw_handler == 0 {
         return KernelExceptionDispatch::Unhandled;
     }

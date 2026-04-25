@@ -2,6 +2,7 @@ use alloc::borrow::ToOwned;
 use alloc::format;
 use alloc::sync::Arc;
 
+use crate::UserMemoryCreator;
 use helios_hal::cpu::Cpu;
 use wasmtime::component::{Component, Instance, TypedFunc};
 use wasmtime::{AsContextMut, CustomCodeMemory, Engine};
@@ -41,6 +42,7 @@ fn build_engine_for_platform<P: Cpu + Clone>(
     config.with_custom_code_memory(Some(Arc::new(PlatformCodeMemory {
         platform: platform.clone(),
     })));
+    config.with_host_memory(Arc::new(UserMemoryCreator));
     config.signals_based_traps(true);
     config.memory_guard_size(helios_artifact::CWASM_NO_VMEM_MEMORY_GUARD_SIZE);
     config.memory_reservation(helios_artifact::CWASM_NO_VMEM_MEMORY_RESERVATION);

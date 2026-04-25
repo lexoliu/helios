@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "api", "api-macro", "artifact", "cli", "hal", "i6300esb", "hosted", "kernel", "kernel-macro", "programs/debugger", "programs/init", "programs/sh", "riscv", "x86", "inspector", "inspector-protocol", "virtio",
+    "aarch64", "api", "api-macro", "artifact", "cli", "hal", "i6300esb", "hosted", "kernel", "kernel-macro", "programs/debugger", "programs/init", "programs/sh", "riscv", "x86", "inspector", "inspector-protocol", "virtio",
 ]
 resolver = "2"
 
@@ -15,6 +15,7 @@ helios-hal = { path = "hal" }
 helios-api = { path = "api" }
 helios-artifact = { path = "artifact" }
 helios-hosted = { path = "hosted" }
+helios-aarch64 = { path = "aarch64" }
 helios-kernel-macro = { path = "kernel-macro" }
 helios-inspector-protocol = { path = "inspector-protocol" }
 helios-riscv = { path = "riscv" }
@@ -31,6 +32,9 @@ helios-hosted.workspace = true
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 helios-riscv.workspace = true
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+helios-aarch64.workspace = true
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 helios-x86.workspace = true

@@ -48,7 +48,7 @@ pub(crate) fn physical_memory_offset() -> usize {
         .offset() as usize
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 pub(crate) struct LimineMemoryMap {
     entries: &'static [&'static Entry],
 }
@@ -64,12 +64,12 @@ impl BootMemoryMap for LimineMemoryMap {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 pub(crate) struct LimineModules {
     files: &'static [&'static limine::file::File],
 }
 
-impl<'a> BootModules<'a> for LimineModules {
+impl BootModules<'static> for LimineModules {
     type Iter = core::iter::Map<
         core::iter::Copied<core::slice::Iter<'static, &'static limine::file::File>>,
         fn(&'static limine::file::File) -> BootModule<'static>,
@@ -80,8 +80,7 @@ impl<'a> BootModules<'a> for LimineModules {
     }
 }
 
-pub(crate) type LimineBootHandoff =
-    BootHandoff<'static, LimineMemoryMap, LimineModules>;
+pub(crate) type LimineBootHandoff = BootHandoff<'static, LimineMemoryMap, LimineModules>;
 
 pub(crate) fn limine_boot_handoff() -> LimineBootHandoff {
     let memory_map = LimineMemoryMap {
@@ -196,7 +195,6 @@ mod tests {
         );
     }
 
-    #[test]
     #[test]
     #[should_panic(expected = "Limine BIOS boot is not supported")]
     fn rejects_limine_bios_firmware() {

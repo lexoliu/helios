@@ -1643,11 +1643,23 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 name = "helios"
 version = "0.1.0"
 dependencies = [
+ "helios-aarch64",
  "helios-hosted",
  "helios-inspector-protocol",
  "helios-riscv",
  "helios-x86",
  "wasmtime",
+]
+
+[[package]]
+name = "helios-aarch64"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+ "fdt",
+ "helios-hal",
+ "helios-kernel",
+ "limine",
 ]
 
 [[package]]
@@ -1903,6 +1915,7 @@ dependencies = [
  "i6300esb",
  "limine",
  "pci_types",
+ "spin 0.9.8",
  "x86",
  "x86_64",
 ]
