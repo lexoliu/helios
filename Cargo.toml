@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "aarch64", "api", "api-macro", "artifact", "cli", "hal", "i6300esb", "hosted", "kernel", "kernel-macro", "programs/debugger", "programs/init", "programs/sh", "riscv", "x86", "inspector", "inspector-protocol", "virtio",
+    "aarch64", "api", "api-macro", "artifact", "cli", "compiler-abi", "compiler-plugin", "compiler-support", "hal", "i6300esb", "hosted", "kernel", "kernel-macro", "programs/debugger", "programs/init", "programs/sh", "riscv", "x86", "inspector", "inspector-protocol", "virtio",
 ]
 resolver = "2"
 
@@ -14,6 +14,8 @@ edition = "2024"
 helios-hal = { path = "hal" }
 helios-api = { path = "api" }
 helios-artifact = { path = "artifact" }
+helios-compiler-abi = { path = "compiler-abi" }
+helios-compiler-support = { path = "compiler-support" }
 helios-hosted = { path = "hosted" }
 helios-aarch64 = { path = "aarch64" }
 helios-kernel-macro = { path = "kernel-macro" }

@@ -1023,3 +1023,11 @@ fn write_hart_runtime(runtime: *const HartRuntime) {
 fn clear_hart_runtime() {
     write_hart_runtime(core::ptr::null());
 }
+
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_parking_wait(_timeout_nanos: u64) {
+    riscv::asm::wfi();
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_parking_unpark() {}

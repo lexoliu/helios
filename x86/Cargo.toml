@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 acpi = "6.1.1"
-critical-section = { version = "1.2.0", features = ["restore-state-bool"] }
+critical-section = { version = "1.2.0", features = ["restore-state-usize"] }
 helios-hal.workspace = true
 i6300esb.workspace = true
 helios-kernel = { workspace = true, default-features = false, features = ["wasmtime-x86"] }

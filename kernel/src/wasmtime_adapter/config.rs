@@ -7,16 +7,6 @@ pub enum AotCompileHint {
     Performance,
 }
 
-impl AotCompileHint {
-    pub const fn as_cli_argument(self) -> &'static str {
-        match self {
-            Self::Fast => "fast",
-            Self::Balanced => "balanced",
-            Self::Performance => "performance",
-        }
-    }
-}
-
 pub fn build_target_engine_config(target: &str) -> Config {
     let mut config = Config::new();
     config
@@ -46,6 +36,8 @@ pub fn build_component_engine_config(target: &str) -> Config {
     config.wasm_multi_memory(true);
     config.wasm_memory64(true);
     config.wasm_tail_call(true);
+    config.wasm_threads(true);
+    config.shared_memory(true);
     config.gc_support(true);
     config.wasm_reference_types(true);
     config.wasm_function_references(true);

@@ -212,12 +212,16 @@ pub(crate) fn activate_runtime(runtime: &ProcessorRuntime) {
 }
 
 pub(crate) fn current_runtime() -> &'static ProcessorRuntime {
-    let runtime = unsafe { rdmsr(IA32_FS_BASE) as *const ProcessorRuntime };
+    let runtime = current_runtime_address() as *const ProcessorRuntime;
     assert!(
         !runtime.is_null(),
         "x86 processor runtime was not installed before use"
     );
     unsafe { &*runtime }
+}
+
+pub(crate) fn current_runtime_address() -> usize {
+    unsafe { rdmsr(IA32_FS_BASE) as usize }
 }
 
 impl ProcessorRuntime {

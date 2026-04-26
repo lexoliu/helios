@@ -1,0 +1,10 @@
+[package]
+name = "helios-compiler-support"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+helios-artifact.workspace = true
+thiserror = "2.0.17"
+wasmparser = "0.245.0"
+wasmtime = { path = "../../wasmtime/crates/wasmtime", default-features = false, features = ["all-arch", "component-model", "component-model-async-compile", "cranelift", "gc-null", "parallel-compilation", "std", "threads", "winch"] }

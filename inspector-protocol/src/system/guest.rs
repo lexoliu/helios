@@ -11,8 +11,8 @@ use crate::wire::{Frame, read_frame, write_frame};
 
 use super::bindings::helios::system::{instances, programs, stats, tracing};
 use super::methods::{
-    INSTANCES_INSTANCE, INSTANCES_SNAPSHOT, PROGRAMS_EXEC, PROGRAMS_INSTANCE, STATS_INSTANCE,
-    STATS_SNAPSHOT, TRACING_INSTANCE, TRACING_RECENT,
+    INSTANCES_INSTANCE, INSTANCES_SNAPSHOT, PROGRAMS_AOT, PROGRAMS_EXEC, PROGRAMS_INSTANCE,
+    STATS_INSTANCE, STATS_SNAPSHOT, TRACING_INSTANCE, TRACING_RECENT,
 };
 use crate::debugger::{filesystem, programs as debugger_programs};
 
@@ -97,6 +97,7 @@ fn supports_request(instance: &str, func: &str) -> bool {
     matches!(
         (instance, func),
         (PROGRAMS_INSTANCE, PROGRAMS_EXEC)
+            | (PROGRAMS_INSTANCE, PROGRAMS_AOT)
             | (STATS_INSTANCE, STATS_SNAPSHOT)
             | (INSTANCES_INSTANCE, INSTANCES_SNAPSHOT)
             | (TRACING_INSTANCE, TRACING_RECENT)
@@ -132,6 +133,25 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>>
                     detail: error.detail,
                 });
             postcard::to_allocvec(&response).context("failed to encode programs.exec response")
+        }
+        (PROGRAMS_INSTANCE, PROGRAMS_AOT) => {
+            let request = postcard::from_bytes::<programs::AotRequest>(payload)
+                .context("failed to decode programs.aot request payload")?;
+            let response = host_programs::aot(host_programs::AotRequest {
+                source_path: request.source_path,
+                destination_path: request.destination_path,
+                hint: map_aot_hint_to_host(request.hint),
+            })
+            .await;
+            let response = response
+                .map(|result| programs::AotResult {
+                    destination_path: result.destination_path,
+                })
+                .map_err(|error| programs::ExecError {
+                    kind: convert_launch_error_kind(error.kind),
+                    detail: error.detail,
+                });
+            postcard::to_allocvec(&response).context("failed to encode programs.aot response")
         }
         (STATS_INSTANCE, STATS_SNAPSHOT) => {
             if !payload.is_empty() {

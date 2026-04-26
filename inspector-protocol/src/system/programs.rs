@@ -6,10 +6,10 @@ use anyhow::{Context as _, Result};
 use futures_io::{AsyncRead, AsyncWrite};
 
 #[cfg(feature = "host")]
-use super::methods::{PROGRAMS_EXEC, PROGRAMS_INSTANCE};
+use super::methods::{PROGRAMS_AOT, PROGRAMS_EXEC, PROGRAMS_INSTANCE};
 
 pub use super::bindings::helios::system::programs::{
-    ExecError, ExecErrorKind, ExecOutput, ExecRequest, ExecResult,
+    AotHint, AotRequest, AotResult, ExecError, ExecErrorKind, ExecOutput, ExecRequest, ExecResult,
 };
 
 #[cfg(feature = "host")]
@@ -26,5 +26,22 @@ where
         .context("failed to invoke remote programs.exec")?;
     let response = postcard::from_bytes::<Result<ExecResult, ExecError>>(&bytes)
         .context("failed to decode remote programs.exec response")?;
+    response.map_err(|error| anyhow::anyhow!("{:?}: {}", error.kind, error.detail))
+}
+
+#[cfg(feature = "host")]
+pub async fn aot<R, W>(client: &Client<R, W>, request: &AotRequest) -> Result<AotResult>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    let bytes =
+        postcard::to_allocvec(request).context("failed to encode remote programs.aot request")?;
+    let bytes = client
+        .invoke_raw_streaming(PROGRAMS_INSTANCE, PROGRAMS_AOT, bytes)
+        .await
+        .context("failed to invoke remote programs.aot")?;
+    let response = postcard::from_bytes::<Result<AotResult, ExecError>>(&bytes)
+        .context("failed to decode remote programs.aot response")?;
     response.map_err(|error| anyhow::anyhow!("{:?}: {}", error.kind, error.detail))
 }

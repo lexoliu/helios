@@ -52,9 +52,9 @@ pub fn user_heap_stats() -> UserHeapStats {
 unsafe impl MemoryCreator for UserMemoryCreator {
     fn new_memory(
         &self,
-        _ty: MemoryType,
+        ty: MemoryType,
         minimum: usize,
-        _maximum: Option<usize>,
+        maximum: Option<usize>,
         reserved_size_in_bytes: Option<usize>,
         guard_size_in_bytes: usize,
     ) -> Result<Box<dyn LinearMemory>, String> {
@@ -71,7 +71,17 @@ unsafe impl MemoryCreator for UserMemoryCreator {
             ));
         }
 
-        UserLinearMemory::new(minimum).map(|memory| Box::new(memory) as Box<dyn LinearMemory>)
+        let (capacity, relocatable) = if ty.is_shared() {
+            let maximum = maximum.ok_or_else(|| {
+                "shared user linear memory must declare a maximum size".to_string()
+            })?;
+            (maximum, false)
+        } else {
+            (minimum, true)
+        };
+
+        UserLinearMemory::new(minimum, capacity, relocatable)
+            .map(|memory| Box::new(memory) as Box<dyn LinearMemory>)
     }
 }
 
@@ -79,28 +89,37 @@ struct UserLinearMemory {
     ptr: NonNull<u8>,
     byte_len: usize,
     byte_capacity: usize,
+    relocatable: bool,
 }
 
 unsafe impl Send for UserLinearMemory {}
 unsafe impl Sync for UserLinearMemory {}
 
 impl UserLinearMemory {
-    fn new(minimum: usize) -> Result<Self, String> {
-        if minimum == 0 {
+    fn new(minimum: usize, capacity: usize, relocatable: bool) -> Result<Self, String> {
+        if capacity < minimum {
+            return Err(format!(
+                "user linear memory capacity {capacity} is smaller than minimum {minimum}"
+            ));
+        }
+
+        if capacity == 0 {
             return Ok(Self {
                 ptr: NonNull::dangling(),
                 byte_len: 0,
                 byte_capacity: 0,
+                relocatable,
             });
         }
 
-        let layout = linear_memory_layout(minimum)?;
+        let layout = linear_memory_layout(capacity)?;
         let ptr = allocate_user_zeroed(layout).map_err(|error| error.to_string())?;
         let byte_capacity = buddy_allocation_size(layout);
         Ok(Self {
             ptr,
             byte_len: minimum,
             byte_capacity,
+            relocatable,
         })
     }
 }
@@ -118,6 +137,13 @@ unsafe impl LinearMemory for UserLinearMemory {
         if new_size <= self.byte_capacity {
             self.byte_len = new_size;
             return Ok(());
+        }
+        if !self.relocatable {
+            return Err(wasmtime::Error::from(ProgramOutOfMemory {
+                requested_bytes: new_size,
+                available_bytes: 0,
+                reserved_bytes: self.byte_capacity,
+            }));
         }
 
         let new_layout =

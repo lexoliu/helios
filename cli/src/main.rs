@@ -9,16 +9,13 @@ use askama::Template;
 use clap::{Parser, Subcommand, ValueEnum};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions};
-use helios_artifact::{
-    CWASM_NO_VMEM_MEMORY_GUARD_SIZE, CWASM_NO_VMEM_MEMORY_RESERVATION,
-    CWASM_NO_VMEM_MEMORY_RESERVATION_FOR_GROWTH, sign_payload_with_key,
-};
+use helios_artifact::sign_payload_with_key;
+use helios_compiler_support::{AotCompileHint, precompile_artifact};
 use mbrman::{BOOT_ACTIVE, CHS, MBR, MBRPartitionEntry};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use toml::Value;
 use wasmparser::Parser as WasmParser;
-use wasmtime::{Config, Engine, OptLevel, Strategy};
 use wit_component::ComponentEncoder;
 
 const ROOT_SECRET_FILE: &str = "helios-root-secret.key";
@@ -27,6 +24,7 @@ const PREBUILD_MANIFEST_FILE: &str = "kernel-prebuild.json";
 const DEFAULT_INIT_ARGV0: &str = "/init.wasm";
 const COMPILER_PLUGIN_BOOTFS_PATH: &str = "bin/compiler.cwasm";
 const COMPILER_PLUGIN_ROOT_KEY_ENV: &str = "HELIOS_COMPILER_ROOT_KEY_HEX";
+const COMPILER_PLUGIN_SHARED_MEMORY_MAX_BYTES: usize = 512 * 1024 * 1024;
 const LIMINE_IMAGE_BYTES: u64 = 768 * 1024 * 1024;
 const LIMINE_PARTITION_START_LBA: u32 = 2048;
 const LIMINE_SECTOR_BYTES: u64 = 512;
@@ -59,6 +57,16 @@ enum Hint {
     Fast,
     Balanced,
     Performance,
+}
+
+impl From<Hint> for AotCompileHint {
+    fn from(value: Hint) -> Self {
+        match value {
+            Hint::Fast => Self::Fast,
+            Hint::Balanced => Self::Balanced,
+            Hint::Performance => Self::Performance,
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -162,8 +170,7 @@ fn run_aot(command: AotCommand) -> Result<()> {
     let root_signing_key = read_signing_key(&command.root_key)?;
     let wasm = fs::read(&command.input)
         .with_context(|| format!("failed to read {}", command.input.display()))?;
-    let component = componentize(&wasm).context("failed to componentize AOT input")?;
-    let payload = precompile_component(&component, &command.target, command.hint)?;
+    let payload = precompile_artifact(&wasm, &command.target, command.hint.into())?.bytes;
     let signed =
         sign_payload_with_key(&payload, &root_signing_key).context("failed to sign AOT payload")?;
     fs::write(&command.output, signed)
@@ -184,8 +191,7 @@ fn run_compiler_plugin(command: CompilerPluginCommand) -> Result<()> {
     io::stdin()
         .read_to_end(&mut wasm)
         .context("failed to read wasm from stdin")?;
-    let component = componentize(&wasm).context("failed to componentize compiler input")?;
-    let payload = precompile_component(&component, &command.target, command.hint)?;
+    let payload = precompile_artifact(&wasm, &command.target, command.hint.into())?.bytes;
     let signed = sign_payload_with_key(&payload, &root_signing_key)
         .context("failed to sign compiler plugin output")?;
     io::stdout()
@@ -215,8 +221,12 @@ fn run_kernel_prebuild(command: KernelPrebuildCommand) -> Result<()> {
     )?;
     let init_cwasm = command.out_dir.join("init_component.cwasm");
     let init_component_bytes = encode_component(&init_component)?;
-    let init_payload =
-        precompile_component(&init_component_bytes, &command.target, Hint::Balanced)?;
+    let init_payload = precompile_artifact(
+        &init_component_bytes,
+        &command.target,
+        Hint::Balanced.into(),
+    )?
+    .bytes;
     let init_signed = sign_payload_with_key(&init_payload, &root_signing_key)
         .context("failed to sign init AOT payload")?;
     fs::write(&init_cwasm, init_signed)
@@ -574,16 +584,18 @@ fn build_compiler_plugin_asset(
     target: &str,
     root_signing_key: &SigningKey,
 ) -> Result<BootAsset> {
-    let wasm_path = build_component_program(
+    let wasm_path = build_wasm_program(
         cargo,
         profile,
         out_dir,
-        &workspace_path(Path::new("cli/Cargo.toml")),
+        &workspace_path(Path::new("compiler-plugin/Cargo.toml")),
         "compiler-plugin-target",
-        "helios-cli.wasm",
+        "wasm32-wasip1-threads",
+        "helios_compiler_plugin.wasm",
     )?;
-    let component_bytes = encode_component(&wasm_path)?;
-    let payload = precompile_component(&component_bytes, target, Hint::Balanced)?;
+    let wasm =
+        fs::read(&wasm_path).with_context(|| format!("failed to read {}", wasm_path.display()))?;
+    let payload = precompile_artifact(&wasm, target, Hint::Balanced.into())?.bytes;
     let signed = sign_payload_with_key(&payload, root_signing_key)
         .context("failed to sign compiler plugin AOT payload")?;
     let output_path = out_dir.join("compiler_plugin.cwasm");
@@ -712,7 +724,7 @@ fn build_boot_program_asset(
         &manifest.artifact_name,
     )?;
     let component_bytes = encode_component(&wasm_path)?;
-    let payload = precompile_component(&component_bytes, target, Hint::Balanced)?;
+    let payload = precompile_artifact(&component_bytes, target, Hint::Balanced.into())?.bytes;
     let signed = sign_payload_with_key(&payload, root_signing_key)
         .context("failed to sign bootfs AOT payload")?;
     let output_path = out_dir.join(format!("{}_bootfs_component.cwasm", manifest.command));
@@ -774,6 +786,26 @@ fn build_component_program(
     target_dir_name: &str,
     artifact_name: &str,
 ) -> Result<PathBuf> {
+    build_wasm_program(
+        cargo,
+        profile,
+        out_dir,
+        manifest_path,
+        target_dir_name,
+        "wasm32-wasip2",
+        artifact_name,
+    )
+}
+
+fn build_wasm_program(
+    cargo: &Path,
+    profile: &str,
+    out_dir: &Path,
+    manifest_path: &Path,
+    target_dir_name: &str,
+    target_triple: &str,
+    artifact_name: &str,
+) -> Result<PathBuf> {
     ensure!(
         manifest_path.is_file(),
         "crate manifest {} is missing",
@@ -786,7 +818,7 @@ fn build_component_program(
         .arg("--manifest-path")
         .arg(manifest_path)
         .arg("--target")
-        .arg("wasm32-wasip2")
+        .arg(target_triple)
         .arg("--target-dir")
         .arg(&target_dir);
     if profile == "release" {
@@ -798,14 +830,15 @@ fn build_component_program(
         command.env("CARGO_PROFILE_DEV_PANIC", "abort");
     }
     command.env_remove("CARGO_ENCODED_RUSTFLAGS");
-    command.env("RUSTFLAGS", "-C debuginfo=0 -C strip=debuginfo");
+    command.env("RUSTFLAGS", wasm_rustflags(target_triple));
     let status = command
         .status()
         .with_context(|| format!("failed to invoke cargo for {}", manifest_path.display()))?;
     ensure!(
         status.success(),
-        "component build for {} failed with status {}",
+        "wasm build for {} target {} failed with status {}",
         manifest_path.display(),
+        target_triple,
         status
     );
 
@@ -816,11 +849,20 @@ fn build_component_program(
     };
     fs::canonicalize(
         target_dir
-            .join("wasm32-wasip2")
+            .join(target_triple)
             .join(profile_dir)
             .join(artifact_name),
     )
     .with_context(|| format!("failed to resolve generated artifact {}", artifact_name))
+}
+
+fn wasm_rustflags(target_triple: &str) -> String {
+    match target_triple {
+        "wasm32-wasip1-threads" => format!(
+            "-C debuginfo=0 -C strip=debuginfo -C link-arg=--no-entry -C link-arg=--export=__tls_base -C link-arg=--max-memory={COMPILER_PLUGIN_SHARED_MEMORY_MAX_BYTES}"
+        ),
+        _ => "-C debuginfo=0 -C strip=debuginfo".to_owned(),
+    }
 }
 
 fn encode_component(path: &Path) -> Result<Vec<u8>> {
@@ -834,98 +876,6 @@ fn encode_component(path: &Path) -> Result<Vec<u8>> {
         .validate(true)
         .encode()
         .with_context(|| format!("failed to encode component {}", path.display()))
-}
-
-fn componentize(wasm: &[u8]) -> Result<Vec<u8>> {
-    if WasmParser::is_component(wasm) {
-        return Ok(wasm.to_vec());
-    }
-    ComponentEncoder::default()
-        .module(wasm)
-        .context("failed to load core module")?
-        .validate(true)
-        .encode()
-        .context("failed to encode component")
-}
-
-fn precompile_component(bytes: &[u8], target: &str, hint: Hint) -> Result<Vec<u8>> {
-    let engine = Engine::new(&build_engine_config(target, hint)?).map_err(|error| {
-        anyhow!("failed to create Wasmtime engine for target {target}: {error:#}")
-    })?;
-    engine
-        .precompile_component(bytes)
-        .map_err(|error| anyhow!("failed to precompile component: {error:#}"))
-}
-
-fn build_engine_config(target: &str, hint: Hint) -> Result<Config> {
-    let mut config = Config::new();
-    config
-        .target(target)
-        .map_err(|error| anyhow!("Wasmtime rejected target {target}: {error:#}"))?;
-    configure_target_isa_flags(&mut config, target);
-    match hint {
-        Hint::Fast => {
-            config.strategy(Strategy::Winch);
-        }
-        Hint::Balanced => {
-            config.strategy(Strategy::Cranelift);
-            config.cranelift_opt_level(OptLevel::None);
-        }
-        Hint::Performance => {
-            config.strategy(Strategy::Cranelift);
-            config.cranelift_opt_level(OptLevel::Speed);
-        }
-    }
-    config.wasm_component_model(true);
-    config.wasm_component_model_async(true);
-    config.wasm_simd(true);
-    config.wasm_relaxed_simd(true);
-    config.relaxed_simd_deterministic(false);
-    config.wasm_multi_memory(true);
-    config.wasm_memory64(true);
-    config.wasm_tail_call(true);
-    config.gc_support(true);
-    config.wasm_reference_types(true);
-    config.wasm_function_references(true);
-    config.concurrency_support(true);
-    config.epoch_interruption(true);
-    config.max_wasm_stack(8 * 1024 * 1024);
-    if target_requires_no_vmem_cwasm(target) {
-        config.signals_based_traps(true);
-        config.memory_guard_size(CWASM_NO_VMEM_MEMORY_GUARD_SIZE);
-        config.memory_reservation(CWASM_NO_VMEM_MEMORY_RESERVATION);
-        config.memory_reservation_for_growth(CWASM_NO_VMEM_MEMORY_RESERVATION_FOR_GROWTH);
-        config.memory_init_cow(false);
-    }
-    Ok(config)
-}
-
-fn target_requires_no_vmem_cwasm(target: &str) -> bool {
-    target.contains("-unknown-none")
-}
-
-fn configure_target_isa_flags(config: &mut Config, target: &str) {
-    if !target.starts_with("x86_64-") {
-        return;
-    }
-
-    // TODO(x86-avx): add AVX/FMA/AVX512 once the x86 kernel enables OSXSAVE,
-    // configures XCR0, and preserves the full XSAVE state across execution.
-    for flag in [
-        "has_cmpxchg16b",
-        "has_sse3",
-        "has_ssse3",
-        "has_sse41",
-        "has_sse42",
-        "has_popcnt",
-        "has_bmi1",
-        "has_bmi2",
-        "has_lzcnt",
-    ] {
-        unsafe {
-            config.cranelift_flag_enable(flag);
-        }
-    }
 }
 
 fn ensure_root_keypair(root_secret_path: &Path, root_public_path: &Path) -> Result<SigningKey> {

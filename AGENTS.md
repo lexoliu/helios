@@ -56,11 +56,22 @@ crates.
   not fit, fix the abstraction rather than bypassing it.
 - No duplicated code across backends. Move shared logic into `kernel/` or
   `hal/` immediately.
+- Do not create a new crate just to organize local implementation detail. A
+  crate must represent a real shared boundary used by multiple owners or an
+  externally meaningful contract. Otherwise place the code in the owning layer
+  as a module, usually `kernel/` for hardware-independent runtime logic or
+  `hal/` for cross-backend contracts.
 - Do not leave legacy code for backwards compatibility. When a feature is
   removed, remove every related path in the same change.
 - Do not make unilateral architecture changes while debugging. If a failure
   appears to involve a core subsystem, diagnose that subsystem directly instead
   of replacing it with a different architecture.
+- Do not mask runtime, allocator, or scheduler bugs by inflating memory sizes,
+  widening budgets, disabling limits, lowering optimization, or adding
+  component-specific allocation tricks. If a program, component, or kernel
+  plugin unexpectedly exhausts memory, diagnose the real ownership boundary,
+  allocator initialization, grow path, and lifecycle semantics. Fix the shared
+  abstraction instead of making the failing artifact unusually large.
 - Virtio is the current core I/O path. Do not replace virtio-backed boot,
   block, network, host-share, or debug transport paths with IDE, emulated
   legacy devices, ad-hoc host files, or other fallback I/O unless the user
@@ -70,11 +81,29 @@ crates.
 - Prefer generic types, `impl Trait`, and the type system over enum-based
   type erasure or `dyn Trait` when the set of implementations is known at
   compile time.
+- Avoid heap allocation in kernel-facing code. Use stack storage, static
+  capacity, caller-owned buffers, arenas, or explicit ownership passed through
+  typed APIs whenever the size/lifetime is known. Allocating containers such as
+  `Vec`, `String`, `Box`, `Arc`, and map types require a concrete reason tied
+  to variable-sized guest data, kernel plugin payloads, or runtime ownership.
+- Kernel memory and user memory are separate ownership domains. The kernel
+  itself should be as close to zero-allocation as practical and allocate only
+  from kernel-owned pools when allocation is unavoidable. User-mode wasm
+  instances, including kernel plugins, use separate user-memory allocation and
+  resource accounting; user OOM is handled by killing/dropping the affected
+  wasm instance and reclaiming its user-memory pool, not by growing kernel
+  budgets or adding per-plugin memory policy. Kernel OOM is fatal and must
+  panic rather than attempting recovery.
+- Avoid dynamic dispatch in kernel-facing code. Do not introduce `dyn Trait`,
+  `Box<dyn ...>`, `Arc<dyn ...>`, or type-erased callback surfaces when a
+  generic type, associated type, or concrete adapter can express the boundary.
 - Prefer `use` imports for repeated module, enum, and type paths. Do not keep
   spelling long fully-qualified paths inline when a local import makes the
   code clearer.
-- Use `thiserror` for error types. Use `tracing` for diagnostics; never
-  `println!`.
+- `anyhow` is not allowed in this repository. Use typed error enums with
+  `thiserror`; callers may translate those errors at external CLI or test
+  boundaries, but repository crates must preserve structured error provenance.
+- Use `tracing` for diagnostics; never `println!`.
 - Never use `#[path = "…"]` to pull source files across crate boundaries.
 
 ## 3.1 Kernel plugins
@@ -86,6 +115,11 @@ crates.
 - Non-core kernel functionality may depend on kernel plugins.
 - The compiler is a kernel plugin: it is bootfs-provisioned, loaded during
   kernel startup, and trusted by the kernel for signed `cwasm` output.
+- Kernel plugins and ordinary user-mode programs share the same user-memory
+  and allocation contracts. Do not add plugin-private allocator policy, custom
+  memory floors, or oversized linker memory settings to work around OOM. A
+  kernel plugin may fail with a typed OOM result and be discarded/restarted by
+  its owner; that lifecycle belongs in the shared runtime contract.
 
 ## 3.2 Wasmtime runtime performance
 
@@ -102,6 +136,9 @@ crates.
 - `hosted/` must not be used as evidence for Wasmtime runtime performance
   decisions. Runtime optimization choices must be based on real kernel targets
   and explicit target capabilities.
+- Any performance test, benchmark, or acceptance measurement must run with
+  optimized `--release` artifacts. Debug builds are acceptable for functional
+  checks and diagnosis only; do not use them as performance evidence.
 
 ## 3.3 Naming
 

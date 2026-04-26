@@ -169,6 +169,13 @@ pub fn sign_payload_with_key(
     )
 }
 
+pub fn sign_payload_with_secret_key_bytes(
+    payload: &[u8],
+    secret_key: &[u8; 32],
+) -> Result<Vec<u8>, TrailerError> {
+    sign_payload_with_key(payload, &SigningKey::from_bytes(secret_key))
+}
+
 pub fn verify_signed_payload<'a>(
     bytes: &'a [u8],
     trusted_root_public_keys: &[[u8; 32]],

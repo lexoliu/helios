@@ -5,8 +5,9 @@ edition = "2024"
 
 [dependencies]
 acpi = "6.1.1"
-critical-section = { version = "1.2.0", features = ["restore-state-bool"] }
+critical-section = { version = "1.2.0", features = ["restore-state-usize"] }
 fdt = { version = "0.1.5", default-features = false }
 helios-hal.workspace = true
 helios-kernel = { workspace = true, default-features = false, features = ["wasmtime-aarch64"] }
 limine = "0.6.3"
+spin = "0.10.0"

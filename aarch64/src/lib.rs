@@ -4,7 +4,6 @@
 extern crate alloc;
 
 use acpi::address::AddressSpace;
-use acpi::sdt::madt::{Madt, MadtEntry};
 use acpi::sdt::spcr::{Spcr, SpcrInterfaceType};
 use acpi::{AcpiTables, Handler, PciAddress, PhysicalMapping};
 use core::arch::{asm, global_asm};
@@ -12,9 +11,10 @@ use core::cell::UnsafeCell;
 use core::fmt::{self, Write};
 use core::ops::Range;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use fdt::Fdt;
 use helios_hal::boot::{
     BootFirmwareTables, BootHandoff, BootKernelImage, BootMemoryKind, BootMemoryMap,
@@ -23,17 +23,20 @@ use helios_hal::boot::{
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
-use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology};
+use helios_hal::{DeviceInventory, DmaModel, Platform};
 use limine::BaseRevision;
 use limine::file::File;
 use limine::firmware::{
     FIRMWARE_TYPE_EFI32, FIRMWARE_TYPE_EFI64, FIRMWARE_TYPE_SBI, FIRMWARE_TYPE_X86BIOS,
 };
 use limine::memmap::{Entry, MEMMAP_USABLE};
+use limine::mp::MpInfo;
 use limine::request::{
     DtbRequest, ExecutableAddressRequest, ExecutableCmdlineRequest, ExecutableFileRequest,
-    FirmwareTypeRequest, HhdmRequest, MemmapRequest, ModulesRequest, RsdpRequest, StackSizeRequest,
+    FirmwareTypeRequest, HhdmRequest, MemmapRequest, ModulesRequest, MpRequest, RsdpRequest,
+    StackSizeRequest,
 };
+use spin::Once;
 
 const KERNEL_STACK_BYTES: usize = 4 * 1024 * 1024;
 const PAGE_BYTES: usize = 4096;
@@ -81,6 +84,8 @@ static EXECUTABLE_CMDLINE_REQUEST: ExecutableCmdlineRequest = ExecutableCmdlineR
 #[used]
 static MODULE_REQUEST: ModulesRequest = ModulesRequest::new();
 #[used]
+static MP_REQUEST: MpRequest = MpRequest::new(0);
+#[used]
 static FIRMWARE_TYPE_REQUEST: FirmwareTypeRequest = FirmwareTypeRequest::new();
 #[used]
 static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
@@ -89,6 +94,12 @@ static DEVICE_TREE_BLOB_REQUEST: DtbRequest = DtbRequest::new();
 #[used]
 static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new(KERNEL_STACK_BYTES as u64);
 static DEBUG_SERIAL_BASE: AtomicUsize = AtomicUsize::new(0);
+static DEBUG_SERIAL_WRITER_HELD: AtomicBool = AtomicBool::new(false);
+static CRITICAL_SECTION_OWNER: AtomicUsize = AtomicUsize::new(0);
+static CRITICAL_SECTION_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+const CRITICAL_SECTION_RESTORE_INTERRUPTS_BIT: usize = 1;
+const CRITICAL_SECTION_OUTERMOST_BIT: usize = 1 << 1;
 
 #[repr(align(4096))]
 struct PageTable(UnsafeCell<[u64; PAGE_TABLE_ENTRIES]>);
@@ -125,15 +136,137 @@ struct ProcessorRuntime {
     _reserved: u16,
     wasmtime_tls: AtomicPtr<u8>,
     native_trap_handler: AtomicUsize,
+    started: AtomicBool,
 }
 
 impl ProcessorRuntime {
-    fn bootstrap() -> Self {
+    fn new(logical_id: u16) -> Self {
         Self {
-            logical_id: 0,
+            logical_id,
             _reserved: 0,
             wasmtime_tls: AtomicPtr::new(core::ptr::null_mut()),
             native_trap_handler: AtomicUsize::new(0),
+            started: AtomicBool::new(false),
+        }
+    }
+}
+
+struct Aarch64ProcessorSlot {
+    mp_info: &'static MpInfo,
+    runtime: ProcessorRuntime,
+}
+
+struct Aarch64PlatformState {
+    processors: Box<[Aarch64ProcessorSlot]>,
+    timer_frequency: u64,
+    debug_state: Once<debug_state::RuntimeState>,
+}
+
+impl Aarch64PlatformState {
+    fn from_limine_mp(timer_frequency: u64) -> &'static Self {
+        let response = MP_REQUEST
+            .response()
+            .unwrap_or_else(|| panic!("Limine did not provide an AArch64 MP response"));
+        let cpus = response.cpus();
+        assert!(
+            !cpus.is_empty(),
+            "Limine AArch64 MP response did not describe any CPU"
+        );
+        let bootstrap_mpidr = response.bsp_mpidr;
+        let bootstrap = cpus
+            .iter()
+            .copied()
+            .find(|cpu| cpu.mpidr == bootstrap_mpidr)
+            .unwrap_or_else(|| {
+                panic!("Limine AArch64 MP response omitted bootstrap MPIDR {bootstrap_mpidr:#x}")
+            });
+        let mut ordered = Vec::with_capacity(cpus.len());
+        ordered.push(bootstrap);
+        for &cpu in cpus {
+            if cpu.mpidr != bootstrap_mpidr {
+                ordered.push(cpu);
+            }
+        }
+        let processors = ordered
+            .into_iter()
+            .enumerate()
+            .map(|(index, mp_info)| {
+                let logical_id = u16::try_from(index)
+                    .unwrap_or_else(|_| panic!("AArch64 processor index {index} exceeds u16"));
+                Aarch64ProcessorSlot {
+                    mp_info,
+                    runtime: ProcessorRuntime::new(logical_id),
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Box::leak(Box::new(Self {
+            processors,
+            timer_frequency,
+            debug_state: Once::new(),
+        }))
+    }
+
+    fn install_debug_state(&self, debug_state: debug_state::RuntimeState) {
+        assert!(
+            self.debug_state.get().is_none(),
+            "AArch64 debug state was installed more than once"
+        );
+        self.debug_state.call_once(|| debug_state);
+    }
+
+    fn debug_state(&self) -> debug_state::RuntimeState {
+        self.debug_state
+            .get()
+            .unwrap_or_else(|| panic!("AArch64 secondary processor started before debug state"))
+            .clone()
+    }
+
+    fn bootstrap_runtime(&'static self) -> &'static ProcessorRuntime {
+        &self.processors[0].runtime
+    }
+
+    fn processor_count(&self) -> usize {
+        self.processors.len()
+    }
+
+    fn processor_slot(&self, processor: ProcessorId) -> &Aarch64ProcessorSlot {
+        self.processors
+            .get(processor.id() as usize)
+            .unwrap_or_else(|| panic!("AArch64 processor {} is out of range", processor.id()))
+    }
+
+    fn processor_slot_by_mpidr(&self, mpidr: u64) -> &Aarch64ProcessorSlot {
+        self.processors
+            .iter()
+            .find(|slot| slot.mp_info.mpidr == mpidr)
+            .unwrap_or_else(|| panic!("AArch64 processor MPIDR {mpidr:#x} is unknown"))
+    }
+
+    fn start_processor(&'static self, processor: ProcessorId) {
+        assert!(
+            processor.id() != 0,
+            "AArch64 bootstrap processor cannot be started twice"
+        );
+        let slot = self.processor_slot(processor);
+        assert!(
+            !slot.runtime.started.load(Ordering::Acquire),
+            "AArch64 processor {} was started more than once",
+            processor.id()
+        );
+        slot.mp_info
+            .bootstrap(aarch64_secondary_main, self as *const _ as u64);
+        let deadline = read_counter()
+            .checked_add(self.timer_frequency / 2)
+            .unwrap_or_else(|| panic!("AArch64 secondary startup deadline overflow"));
+        while !slot.runtime.started.load(Ordering::Acquire) {
+            assert!(
+                read_counter() <= deadline,
+                "AArch64 processor {} MPIDR {:#x} did not reach Rust startup",
+                processor.id(),
+                slot.mp_info.mpidr
+            );
+            core::hint::spin_loop();
         }
     }
 }
@@ -149,7 +282,7 @@ struct Aarch64AcpiHandler {
 }
 
 unsafe impl critical_section::Impl for Aarch64CriticalSection {
-    unsafe fn acquire() -> bool {
+    unsafe fn acquire() -> usize {
         let daif: u64;
         unsafe {
             asm!("mrs {daif}, daif", daif = out(reg) daif, options(nomem, nostack, preserves_flags));
@@ -158,11 +291,44 @@ unsafe impl critical_section::Impl for Aarch64CriticalSection {
                 options(nomem, nostack, preserves_flags)
             );
         }
-        daif & (1 << 7) == 0
+        let interrupts_were_enabled = daif & (1 << 7) == 0;
+        let owner = critical_section_owner();
+        loop {
+            match CRITICAL_SECTION_OWNER.compare_exchange(
+                0,
+                owner,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    CRITICAL_SECTION_DEPTH.store(1, Ordering::Relaxed);
+                    return critical_section_token(interrupts_were_enabled, true);
+                }
+                Err(current) if current == owner => {
+                    let depth = CRITICAL_SECTION_DEPTH.fetch_add(1, Ordering::Relaxed);
+                    assert!(depth != usize::MAX, "critical section nesting overflowed");
+                    return critical_section_token(interrupts_were_enabled, false);
+                }
+                Err(_) => core::hint::spin_loop(),
+            }
+        }
     }
 
-    unsafe fn release(restore_interrupts: bool) {
-        if restore_interrupts {
+    unsafe fn release(restore_state: usize) {
+        let interrupts_were_enabled = critical_section_restore_interrupts(restore_state);
+        let outermost = critical_section_is_outermost(restore_state);
+        let previous_depth = CRITICAL_SECTION_DEPTH.fetch_sub(1, Ordering::Relaxed);
+        assert!(previous_depth != 0, "critical section depth underflowed");
+
+        if outermost {
+            assert!(
+                previous_depth == 1,
+                "outermost critical section release observed nested depth {previous_depth}"
+            );
+            CRITICAL_SECTION_OWNER.store(0, Ordering::Release);
+        }
+
+        if interrupts_were_enabled {
             unsafe {
                 asm!(
                     "msr daifclr, #0xf",
@@ -171,6 +337,27 @@ unsafe impl critical_section::Impl for Aarch64CriticalSection {
             }
         }
     }
+}
+
+const fn critical_section_token(interrupts_were_enabled: bool, outermost: bool) -> usize {
+    (interrupts_were_enabled as usize) | ((outermost as usize) << 1)
+}
+
+const fn critical_section_restore_interrupts(token: usize) -> bool {
+    token & CRITICAL_SECTION_RESTORE_INTERRUPTS_BIT != 0
+}
+
+const fn critical_section_is_outermost(token: usize) -> bool {
+    token & CRITICAL_SECTION_OUTERMOST_BIT != 0
+}
+
+fn critical_section_owner() -> usize {
+    let runtime = read_processor_runtime();
+    if runtime != 0 {
+        return runtime;
+    }
+
+    1
 }
 
 #[unsafe(no_mangle)]
@@ -187,17 +374,18 @@ extern "C" fn aarch64_kernel_main() -> ! {
     let reserved_ranges = boot_reserved_ranges(&handoff);
     let memory_regions = boot_memory_regions(&handoff, physical_memory_offset, &reserved_ranges);
     helios_kernel::prime_bootstrap_allocator(memory_regions);
-    let runtime = Box::leak(Box::new(ProcessorRuntime::bootstrap()));
-    activate_processor_runtime(runtime);
+    let platform_state = Aarch64PlatformState::from_limine_mp(timer_frequency());
+    activate_processor_runtime(platform_state.bootstrap_runtime());
 
-    let processor_count = cpu_count(&handoff, physical_memory_offset);
-    let timer_frequency = timer_frequency();
     let cpu = Aarch64Cpu {
-        processor_count,
-        timer_frequency,
+        state: platform_state,
     };
-    let debug_state =
-        debug_state::RuntimeState::new(timer_frequency, processor_count, cpu.now().ticks());
+    let debug_state = debug_state::RuntimeState::new(
+        cpu.timer_frequency(),
+        cpu.processor_count(),
+        cpu.now().ticks(),
+    );
+    platform_state.install_debug_state(debug_state.clone());
     let console = helios_kernel::RecordingConsole::new(
         debug_state.clone(),
         || read_counter(),
@@ -205,11 +393,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
     );
     let kernel = helios_kernel::init(
         Platform::new(console, core::iter::empty::<MemoryRegion>(), cpu.clone())
-            .with_topology(
-                ProcessorTopology::bootstrap_only(cpu.bootstrap_processor())
-                    .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
-            )
-            .with_timer_frequency_hz(timer_frequency)
+            .with_timer_frequency_hz(cpu.timer_frequency())
             .with_dma_model(DmaModel::Translated)
             .with_devices(DeviceInventory::new().with_debug_serial()),
     );
@@ -226,8 +410,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
 
 #[derive(Clone, Copy)]
 pub struct Aarch64Cpu {
-    processor_count: usize,
-    timer_frequency: u64,
+    state: &'static Aarch64PlatformState,
 }
 
 impl Cpu for Aarch64Cpu {
@@ -236,7 +419,7 @@ impl Cpu for Aarch64Cpu {
     }
 
     fn processor_count(&self) -> usize {
-        self.processor_count
+        self.state.processor_count()
     }
 
     fn bootstrap_processor(&self) -> ProcessorId {
@@ -245,25 +428,26 @@ impl Cpu for Aarch64Cpu {
 
     fn park_current(&self) {
         unsafe {
-            asm!("wfi", options(nomem, nostack, preserves_flags));
+            asm!("wfe", options(nomem, nostack, preserves_flags));
         }
     }
 
     fn start_processor(&self, processor: ProcessorId) {
-        panic!(
-            "AArch64 secondary processor startup is not wired yet for processor {}",
-            processor.id()
-        )
+        self.state.start_processor(processor);
     }
 
-    fn wake_processor(&self, _processor: ProcessorId) {}
+    fn wake_processor(&self, _processor: ProcessorId) {
+        unsafe {
+            asm!("sev", options(nomem, nostack, preserves_flags));
+        }
+    }
 
     fn now(&self) -> Instant {
         Instant::new(read_counter())
     }
 
     fn timer_frequency(&self) -> u64 {
-        self.timer_frequency
+        self.state.timer_frequency
     }
 
     fn set_deadline(&self, deadline: Instant) {
@@ -333,6 +517,56 @@ fn activate_processor_runtime(runtime: &'static ProcessorRuntime) {
     let ptr = runtime as *const _ as usize;
     unsafe {
         asm!("msr tpidr_el1, {ptr}", ptr = in(reg) ptr, options(nomem, nostack, preserves_flags));
+    }
+    runtime.started.store(true, Ordering::Release);
+}
+
+unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
+    prepare_current_processor();
+    let state = mp_info.extra_argument() as *const Aarch64PlatformState;
+    assert!(
+        !state.is_null(),
+        "AArch64 secondary processor started without a platform state pointer"
+    );
+    let state = unsafe { &*state };
+    let slot = state.processor_slot_by_mpidr(mp_info.mpidr);
+    activate_processor_runtime(&slot.runtime);
+
+    let cpu = Aarch64Cpu { state };
+    let debug_state = state.debug_state();
+    let console = helios_kernel::RecordingConsole::new(
+        debug_state.clone(),
+        || read_counter(),
+        Some(write_debug_serial_bytes),
+    );
+    let kernel = helios_kernel::init(
+        Platform::new(console, core::iter::empty::<MemoryRegion>(), cpu.clone())
+            .with_timer_frequency_hz(cpu.timer_frequency())
+            .with_dma_model(DmaModel::Translated)
+            .with_devices(DeviceInventory::new().with_debug_serial()),
+    );
+    let _program_service =
+        helios_kernel::install_component_host_program_service(&kernel, &cpu, &debug_state);
+    helios_kernel::run_component_host_processor_forever(
+        cpu,
+        kernel,
+        debug_state,
+        read_debug_serial,
+        write_debug_serial_bytes,
+    );
+}
+
+fn prepare_current_processor() {
+    unsafe {
+        asm!(
+            "msr daifset, #0xf",
+            options(nomem, nostack, preserves_flags)
+        );
+        let cpacr: u64;
+        asm!("mrs {cpacr}, cpacr_el1", cpacr = out(reg) cpacr, options(nomem, nostack, preserves_flags));
+        let cpacr = cpacr | (0x3 << 20);
+        asm!("msr cpacr_el1, {cpacr}", cpacr = in(reg) cpacr, options(nomem, nostack, preserves_flags));
+        asm!("isb", options(nostack, preserves_flags));
     }
 }
 
@@ -798,7 +1032,14 @@ fn read_debug_serial(max_bytes: u32) -> alloc::vec::Vec<u8> {
 }
 
 fn write_debug_serial_bytes(bytes: &[u8]) {
+    while DEBUG_SERIAL_WRITER_HELD
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
     active_debug_serial().write_bytes(bytes);
+    DEBUG_SERIAL_WRITER_HELD.store(false, Ordering::Release);
 }
 
 fn try_write_panic_serial_bytes(bytes: &[u8]) {
@@ -836,34 +1077,6 @@ fn physical_memory_offset() -> usize {
         .response()
         .unwrap_or_else(|| panic!("Limine did not provide an HHDM response"))
         .offset as usize
-}
-
-fn cpu_count(handoff: &LimineBootHandoff, physical_memory_offset: usize) -> usize {
-    let count = if let Some(fdt) = boot_fdt(handoff) {
-        fdt.cpus().count()
-    } else {
-        acpi_cpu_count(required_acpi_rsdp(handoff), physical_memory_offset)
-    };
-    assert!(
-        count != 0,
-        "AArch64 firmware tables did not describe any CPU"
-    );
-    assert!(
-        count == 1,
-        "AArch64 PSCI SMP startup is not wired yet; boot with --smp 1 until secondary processor startup is implemented"
-    );
-    count
-}
-
-fn acpi_cpu_count(rsdp_address: usize, physical_memory_offset: usize) -> usize {
-    let tables = acpi_tables(rsdp_address, physical_memory_offset);
-    let madt = tables
-        .find_table::<Madt>()
-        .unwrap_or_else(|| panic!("AArch64 ACPI platform did not expose a MADT table"));
-    let madt = madt.get();
-    madt.entries()
-        .filter(|entry| matches!(entry, MadtEntry::Gicc(gicc) if gicc.flags & 1 != 0))
-        .count()
 }
 
 #[derive(Clone, Copy)]
@@ -1151,4 +1364,40 @@ extern "C" fn wasmtime_init_traps(handler: helios_kernel::KernelNativeTrapHandle
         .native_trap_handler
         .store(handler as usize, Ordering::Release);
     0
+}
+
+#[cfg(target_os = "none")]
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_parking_wait(timeout_nanos: u64) {
+    if timeout_nanos == 0 {
+        return;
+    }
+    if timeout_nanos == u64::MAX {
+        unsafe {
+            asm!("wfe", options(nomem, nostack, preserves_flags));
+        }
+        return;
+    }
+
+    let ticks = ((u128::from(timeout_nanos) * u128::from(timer_frequency())) / 1_000_000_000)
+        .clamp(1, u128::from(u64::MAX)) as u64;
+    let deadline = read_counter().saturating_add(ticks);
+    while read_counter() < deadline {
+        unsafe {
+            asm!("wfe", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
+#[inline]
+fn signal_waiting_processors() {
+    unsafe {
+        asm!("sev", options(nomem, nostack, preserves_flags));
+    }
+}
+
+#[cfg(target_os = "none")]
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_parking_unpark() {
+    signal_waiting_processors();
 }

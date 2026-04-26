@@ -6,6 +6,7 @@ extern crate self as helios_kernel;
 #[cfg(not(target_os = "none"))]
 extern crate std;
 
+mod artifact_profile;
 mod bootfs;
 mod child_io;
 mod component_cache;
@@ -40,7 +41,20 @@ mod unsupported_host_fs;
 mod user_memory;
 mod wasi_rights;
 pub(crate) mod wasmtime_adapter;
+#[cfg(all(
+    target_os = "none",
+    any(
+        feature = "wasmtime-aarch64",
+        feature = "wasmtime-riscv64",
+        feature = "wasmtime-x86"
+    )
+))]
+mod wasmtime_sync;
 
+pub use artifact_profile::{
+    ArtifactImport, ArtifactKind, ArtifactProfile, ArtifactProfileError, ArtifactProfileReport,
+    classify_raw_wasm, validate_component_import_name,
+};
 pub use bootfs::{
     BootDirectory, BootDirectoryEntry, BootDirectoryHandleExt, BootFile, EmbeddedBootFile,
     EmbeddedBootFs,
@@ -82,7 +96,8 @@ pub use component_types::{
 };
 pub use cwasm::{
     ArtifactTrustError, TrustedCwasm, UntrustedCwasm, UntrustedWasm, is_cwasm,
-    trust_bootfs_artifact, trusted_root_public_keys, verify_signed_artifact,
+    sign_trusted_artifact_payload, trust_bootfs_artifact, trusted_root_public_keys,
+    verify_signed_artifact,
 };
 pub use embedded_component::EmbeddedComponent;
 pub use embedded_init::{
@@ -487,7 +502,7 @@ where
     let kernel = Kernel {
         timer: Timer::new(cpu.clone()),
         cpu,
-        executor: Executor::new(progress),
+        executor: Executor::new(progress, topology.configured_processors, current_processor),
         watchdog,
         topology,
         dma_model,

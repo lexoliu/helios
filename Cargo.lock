@@ -1661,6 +1661,7 @@ dependencies = [
  "helios-hal",
  "helios-kernel",
  "limine 0.6.3",
+ "spin 0.10.0",
 ]
 
 [[package]]
@@ -1705,6 +1706,7 @@ dependencies = [
  "ed25519-dalek",
  "fatfs",
  "helios-artifact",
+ "helios-compiler-support",
  "hex",
  "mbrman",
  "rand",
@@ -1715,6 +1717,28 @@ dependencies = [
  "wasmtime",
  "winch-codegen",
  "wit-component 0.245.1",
+]
+
+[[package]]
+name = "helios-compiler-abi"
+version = "0.1.0"
+
+[[package]]
+name = "helios-compiler-plugin"
+version = "0.1.0"
+dependencies = [
+ "helios-compiler-abi",
+ "helios-compiler-support",
+]
+
+[[package]]
+name = "helios-compiler-support"
+version = "0.1.0"
+dependencies = [
+ "helios-artifact",
+ "thiserror 2.0.18",
+ "wasmparser 0.245.1",
+ "wasmtime",
 ]
 
 [[package]]
@@ -1838,6 +1862,7 @@ dependencies = [
  "futures",
  "futures-lite",
  "helios-artifact",
+ "helios-compiler-abi",
  "helios-hal",
  "helios-kernel-macro",
  "lru",
@@ -3420,6 +3445,9 @@ name = "spin"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d5fe4ccb98d9c292d56fec89a5e07da7fc4cf0dc11e156b41793132775d3e591"
+dependencies = [
+ "lock_api",
+]
 
 [[package]]
 name = "spinning_top"

@@ -1,6 +1,9 @@
 extern crate alloc;
 
-use helios_artifact::{TrailerError, parse_signed_artifact, verify_signed_payload};
+use alloc::vec::Vec;
+use helios_artifact::{
+    TrailerError, parse_signed_artifact, sign_payload_with_secret_key_bytes, verify_signed_payload,
+};
 use thiserror::Error;
 
 pub struct TrustedCwasm<'a> {
@@ -75,6 +78,12 @@ pub fn trusted_root_public_keys() -> &'static [[u8; 32]] {
     generated::TRUSTED_ROOT_PUBLIC_KEYS
 }
 
+pub fn sign_trusted_artifact_payload(payload: &[u8]) -> Result<Vec<u8>, ArtifactTrustError> {
+    sign_payload_with_secret_key_bytes(payload, &generated::TRUSTED_ROOT_SIGNING_KEY)
+        .map_err(ArtifactTrustError::Trailer)
+}
+
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/trusted_roots.rs"));
+    include!(concat!(env!("OUT_DIR"), "/trusted_signing_key.rs"));
 }

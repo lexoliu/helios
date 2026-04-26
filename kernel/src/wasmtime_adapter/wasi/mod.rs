@@ -54,6 +54,10 @@ impl WasiImportSet {
                 .is_some_and(|version| version.starts_with(version_prefix))
         })
     }
+
+    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
+        self.names.iter().map(String::as_str)
+    }
 }
 
 pub(crate) mod p2;

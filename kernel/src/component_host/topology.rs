@@ -58,9 +58,13 @@ pub fn component_host_worker_count(
     processor_count: usize,
     bootstrap_processor: ProcessorId,
 ) -> usize {
-    let _ = processor_count;
-    let _ = bootstrap_processor;
-    0
+    assert!(
+        usize::from(bootstrap_processor.id()) < processor_count,
+        "bootstrap processor {} is outside detected processor count {}",
+        bootstrap_processor.id(),
+        processor_count,
+    );
+    processor_count.saturating_sub(2)
 }
 
 /// Returns an iterator of processor IDs that need to be started for the
@@ -71,13 +75,7 @@ pub fn component_host_processors_to_start(
 ) -> impl Iterator<Item = ProcessorId> {
     (0..processor_count)
         .map(|id| ProcessorId::new(id as u16))
-        .filter(move |&processor| {
-            processor != bootstrap_processor
-                && matches!(
-                    component_host_processor_role(processor, processor_count, bootstrap_processor),
-                    ComponentHostProcessorRole::SystemComponent
-                )
-        })
+        .filter(move |&processor| processor != bootstrap_processor)
 }
 
 #[cfg(test)]
@@ -118,7 +116,7 @@ mod tests {
     }
 
     #[test]
-    fn assigns_manual_worker_roles_after_bootstrap_and_system_processors() {
+    fn assigns_worker_roles_after_bootstrap_and_system_processors() {
         assert_eq!(
             component_host_processor_role(ProcessorId::new(0), 4, ProcessorId::new(0)),
             ComponentHostProcessorRole::Kernel
@@ -131,6 +129,14 @@ mod tests {
             component_host_processor_role(ProcessorId::new(2), 4, ProcessorId::new(0)),
             ComponentHostProcessorRole::Kernel
         );
-        assert_eq!(component_host_worker_count(4, ProcessorId::new(0)), 0);
+        assert_eq!(
+            component_host_processor_role(ProcessorId::new(2), 4, ProcessorId::new(0)),
+            ComponentHostProcessorRole::Kernel
+        );
+        assert_eq!(
+            component_host_processor_role(ProcessorId::new(3), 4, ProcessorId::new(0)),
+            ComponentHostProcessorRole::Kernel
+        );
+        assert_eq!(component_host_worker_count(4, ProcessorId::new(0)), 2);
     }
 }

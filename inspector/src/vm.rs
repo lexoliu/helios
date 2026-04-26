@@ -10,9 +10,8 @@ use clap::{Args as ClapArgs, Subcommand, ValueEnum};
 use console::style;
 use directories::ProjectDirs;
 use helios_hal::fs::HOST_SHARE_MOUNT_TAG;
-use helios_inspector_protocol::debugger::{
-    filesystem as debugger_fs, programs as debugger_programs,
-};
+use helios_inspector_protocol::debugger::filesystem as debugger_fs;
+use helios_inspector_protocol::system::programs as system_programs;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
@@ -26,7 +25,7 @@ const DEFAULT_X86_QEMU_BIN: &str = "qemu-system-x86_64";
 const DEFAULT_AARCH64_MEMORY: &str = "2G";
 const DEFAULT_RISCV_MEMORY: &str = "2G";
 const DEFAULT_X86_MEMORY: &str = "1G";
-const DEFAULT_AARCH64_SMP: u16 = 1;
+const DEFAULT_AARCH64_SMP: u16 = 4;
 const DEFAULT_RISCV_SMP: u16 = 4;
 const DEFAULT_X86_SMP: u16 = 2;
 const DEFAULT_SOCKET_WAIT: Duration = Duration::from_secs(10);
@@ -368,13 +367,13 @@ struct AotBenchCommand {
     #[arg(long, default_value = "/aot-bench-input.wasm")]
     remote_path: String,
 
+    /// Guest path used for the generated signed cwasm artifact.
+    #[arg(long, default_value = "/aot-bench-output.cwasm")]
+    destination_path: String,
+
     /// Number of AOT+exec iterations to run after upload.
     #[arg(long, default_value_t = 1)]
     iterations: u16,
-
-    /// Argument passed to the benchmarked wasm program.
-    #[arg(long = "program-arg")]
-    program_args: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -681,29 +680,26 @@ fn run_aot_bench(client: crate::serial::RpcClient, command: AotBenchCommand) -> 
         }
         for iteration in 1..=command.iterations {
             let started = std::time::Instant::now();
-            let result =
-                debugger_programs::exec_path(&client, &command.remote_path, &command.program_args)
-                    .await
-                    .with_context(|| {
-                        format!("failed to execute uploaded wasm iteration {iteration}")
-                    })?;
+            let result = system_programs::aot(
+                &client,
+                &system_programs::AotRequest {
+                    source_path: command.remote_path.clone(),
+                    destination_path: command.destination_path.clone(),
+                    hint: system_programs::AotHint::Performance,
+                },
+            )
+            .await
+            .with_context(|| {
+                format!("failed to AOT compile uploaded wasm iteration {iteration}")
+            })?;
             let elapsed = started.elapsed();
             let mut stdout = std::io::stdout().lock();
             writeln!(
                 stdout,
-                "iteration={iteration} elapsed_ms={} exit_code={} stdout_bytes={} stderr_bytes={}",
+                "iteration={iteration} elapsed_ms={} destination_path={}",
                 elapsed.as_millis(),
-                result.exit_code,
-                result.output.stdout.len(),
-                result.output.stderr.len()
+                result.destination_path
             )?;
-            if result.exit_code != 0 {
-                bail!(
-                    "uploaded wasm exited with code {}: {}",
-                    result.exit_code,
-                    String::from_utf8_lossy(&result.output.stderr)
-                );
-            }
         }
         Ok(())
     })
@@ -1405,7 +1401,7 @@ mod tests {
     fn aarch64_profiles_are_modern_virt_only() {
         assert_eq!(AARCH64_VIRT_HVF_PROFILE.arch, VmArch::Aarch64);
         assert_eq!(AARCH64_VIRT_HVF_PROFILE.machine, "virt,gic-version=3");
-        assert_eq!(AARCH64_VIRT_HVF_PROFILE.default_smp, 1);
+        assert_eq!(AARCH64_VIRT_HVF_PROFILE.default_smp, 4);
         assert_eq!(AARCH64_VIRT_HVF_PROFILE.default_accel, &["hvf"]);
         assert_eq!(AARCH64_VIRT_HVF_PROFILE.default_cpu, Some("host"));
         assert_eq!(
@@ -1427,7 +1423,7 @@ mod tests {
 
         assert_eq!(AARCH64_VIRT_TCG_PROFILE.default_accel, &["tcg"]);
         assert_eq!(AARCH64_VIRT_TCG_PROFILE.default_cpu, Some("max"));
-        assert_eq!(AARCH64_VIRT_TCG_PROFILE.default_smp, 1);
+        assert_eq!(AARCH64_VIRT_TCG_PROFILE.default_smp, 4);
         assert_ne!(AARCH64_VIRT_HVF_PROFILE.machine, "sbsa-ref");
         assert!(!AARCH64_VIRT_HVF_PROFILE.machine.contains("raspi"));
     }

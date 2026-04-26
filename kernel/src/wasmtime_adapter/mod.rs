@@ -12,8 +12,8 @@ pub mod store;
 pub mod wasi;
 
 use helios_hal::cpu::Cpu;
-use wasmtime::Engine;
 use wasmtime::component::Component;
+use wasmtime::{Engine, Precompiled};
 
 use crate::component_host::{
     ComponentBindingSet, HostRuntimeState, StoreData, component_linker, store_with_state,
@@ -30,6 +30,21 @@ pub struct WasmtimeCompiledComponent {
 }
 
 impl CompiledComponent for WasmtimeCompiledComponent {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WasmtimePrecompiledKind {
+    CoreModule,
+    Component,
+}
+
+impl WasmtimePrecompiledKind {
+    pub fn detect(bytes: &[u8]) -> Option<Self> {
+        match Engine::detect_precompiled(bytes)? {
+            Precompiled::Module => Some(Self::CoreModule),
+            Precompiled::Component => Some(Self::Component),
+        }
+    }
+}
 
 /// Wasmtime component runtime engine.
 #[derive(Clone)]
