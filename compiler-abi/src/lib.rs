@@ -7,6 +7,7 @@ pub const HELIOS_COMPILER_FREE: &str = "helios_compiler_free";
 pub const HELIOS_COMPILER_COMPILE: &str = "helios_compiler_compile";
 pub const HELIOS_COMPILER_INITIALIZE: &str = "helios_compiler_initialize";
 pub const HELIOS_COMPILER_PTHREAD_SELF_OFFSET: &str = "helios_compiler_pthread_self_offset";
+pub const HELIOS_COMPILER_REQUEST_PROFILE: u32 = 1 << 0;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +42,7 @@ pub struct CompilerRequestHeader {
     pub wasm_len: u32,
     pub target_ptr: u32,
     pub target_len: u32,
+    pub flags: u32,
 }
 
 #[repr(C)]

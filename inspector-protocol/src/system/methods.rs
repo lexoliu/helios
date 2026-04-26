@@ -10,3 +10,8 @@ pub const INSTANCES_SNAPSHOT: &str = "snapshot";
 
 pub const TRACING_INSTANCE: &str = "helios:system/tracing@0.1.0";
 pub const TRACING_RECENT: &str = "recent";
+
+pub const PROFILING_INSTANCE: &str = "helios:system/profiling@0.1.0";
+pub const PROFILING_SET_ENABLED: &str = "set-enabled";
+pub const PROFILING_CLEAR: &str = "clear";
+pub const PROFILING_FOLDED: &str = "folded";

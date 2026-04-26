@@ -14,6 +14,8 @@ pub mod io;
 #[cfg(feature = "net")]
 pub mod net;
 pub mod prelude;
+#[cfg(feature = "profiling")]
+pub mod profiling;
 #[cfg(feature = "programs")]
 pub mod programs;
 #[cfg(feature = "serial")]

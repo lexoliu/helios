@@ -7,6 +7,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 pub const DEFAULT_TRACE_HISTORY_CAPACITY: usize = 512;
+pub const DEFAULT_PROFILE_STACK_CAPACITY: usize = 1024;
 
 #[derive(Clone, Debug)]
 pub struct TraceFilter {
@@ -55,11 +56,36 @@ pub struct StatsSample {
     pub online_processors: u32,
 }
 
+#[derive(Clone, Debug)]
+pub struct ProfileFilter {
+    pub scope: Option<ProfileScope>,
+    pub stack_prefixes: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoldedProfileSample {
+    pub scope: ProfileScope,
+    pub stack: String,
+    pub weight: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProfileScope {
+    Kernel,
+    User,
+}
+
 #[derive(Debug)]
 pub struct TraceHistory {
     next_seq: u64,
     capacity: usize,
     events: VecDeque<(u64, TraceEvent)>,
+}
+
+#[derive(Debug)]
+pub struct ProfileHistory {
+    capacity: usize,
+    samples: Vec<FoldedProfileSample>,
 }
 
 impl TraceHistory {
@@ -111,6 +137,81 @@ impl TraceHistory {
     }
 }
 
+impl ProfileHistory {
+    pub fn new(capacity: usize) -> Self {
+        assert!(capacity != 0, "profile stack capacity must be non-zero");
+        Self {
+            capacity,
+            samples: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.samples.clear();
+    }
+
+    pub fn record(&mut self, scope: ProfileScope, stack: String, weight: u64) {
+        if weight == 0 {
+            return;
+        }
+
+        if let Some(sample) = self
+            .samples
+            .iter_mut()
+            .find(|sample| sample.scope == scope && sample.stack == stack)
+        {
+            sample.weight = sample.weight.saturating_add(weight);
+            return;
+        }
+
+        if self.samples.len() == self.capacity {
+            let lightest_index = self
+                .samples
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, sample)| sample.weight)
+                .map(|(index, _)| index)
+                .expect("non-empty profile samples should have a lightest entry");
+            if self.samples[lightest_index].weight >= weight {
+                return;
+            }
+            self.samples.swap_remove(lightest_index);
+        }
+
+        self.samples.push(FoldedProfileSample {
+            scope,
+            stack,
+            weight,
+        });
+    }
+
+    pub fn folded(
+        &self,
+        filter: &ProfileFilter,
+        additional: impl IntoIterator<Item = FoldedProfileSample>,
+        limit: u32,
+    ) -> Vec<FoldedProfileSample> {
+        let mut samples = self
+            .samples
+            .iter()
+            .cloned()
+            .chain(additional)
+            .filter(|sample| matches_profile_filter(sample, filter))
+            .collect::<Vec<_>>();
+        samples.sort_by(|left, right| {
+            right
+                .weight
+                .cmp(&left.weight)
+                .then_with(|| left.stack.cmp(&right.stack))
+        });
+        let keep = limit as usize;
+        if keep != 0 && samples.len() > keep {
+            samples.truncate(keep);
+        }
+        samples
+    }
+}
+
 pub fn parse_console_text(timestamp: u64, text: &str) -> Vec<TraceEvent> {
     let stripped = strip_ansi(text);
     stripped
@@ -137,6 +238,21 @@ pub fn matches_trace_filter(event: &TraceEvent, filter: &TraceFilter) -> bool {
         .target_prefixes
         .iter()
         .any(|prefix| event.target.starts_with(prefix))
+}
+
+pub fn matches_profile_filter(sample: &FoldedProfileSample, filter: &ProfileFilter) -> bool {
+    if filter.scope.is_some_and(|scope| sample.scope != scope) {
+        return false;
+    }
+
+    if filter.stack_prefixes.is_empty() {
+        return true;
+    }
+
+    filter
+        .stack_prefixes
+        .iter()
+        .any(|prefix| sample.stack.starts_with(prefix))
 }
 
 fn parse_console_line(timestamp: u64, line: &str) -> TraceEvent {

@@ -64,7 +64,7 @@ pub fn component_host_worker_count(
         bootstrap_processor.id(),
         processor_count,
     );
-    processor_count.saturating_sub(2)
+    processor_count
 }
 
 /// Returns an iterator of processor IDs that need to be started for the
@@ -112,7 +112,7 @@ mod tests {
             component_host_processor_role(ProcessorId::new(0), 1, ProcessorId::new(0)),
             ComponentHostProcessorRole::SharedRuntime
         );
-        assert_eq!(component_host_worker_count(1, ProcessorId::new(0)), 0);
+        assert_eq!(component_host_worker_count(1, ProcessorId::new(0)), 1);
     }
 
     #[test]
@@ -137,6 +137,6 @@ mod tests {
             component_host_processor_role(ProcessorId::new(3), 4, ProcessorId::new(0)),
             ComponentHostProcessorRole::Kernel
         );
-        assert_eq!(component_host_worker_count(4, ProcessorId::new(0)), 2);
+        assert_eq!(component_host_worker_count(4, ProcessorId::new(0)), 4);
     }
 }

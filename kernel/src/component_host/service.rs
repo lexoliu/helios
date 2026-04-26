@@ -3,7 +3,10 @@ use crate::wasmtime_adapter::WasmtimeCompiledComponent;
 use crate::wasmtime_adapter::config::AotCompileHint;
 use crate::wasmtime_adapter::{WasmtimePrecompiledKind, wasi::WasiImportSet};
 use bytes::Bytes;
+use core::future::Future;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicI32, Ordering as AtomicOrdering};
+use core::task::{Context, Poll};
 use helios_compiler_abi::{
     CompileHint as CompilerAbiHint, CompilerRequestHeader, CompilerResponseHeader, CompilerStatus,
     HELIOS_COMPILER_ABI_VERSION, HELIOS_COMPILER_ALLOC, HELIOS_COMPILER_COMPILE,
@@ -230,15 +233,21 @@ where
         "launching embedded system component"
     );
     super::emit_stage_marker(write_serial, "component-host:run-local-begin");
+    let stack = format!("kernel;system-component;{component_name};poll");
     kernel
-        .run_local_future(run_system_component(
-            component,
-            world,
+        .run_local_future(ProfiledSystemComponentFuture::new(
+            run_system_component(
+                component,
+                world,
+                cpu.clone(),
+                kernel.spawner(),
+                debug_state.clone(),
+                read_serial,
+                write_serial,
+            ),
             cpu.clone(),
-            kernel.spawner(),
             debug_state,
-            read_serial,
-            write_serial,
+            stack,
         ))
         .unwrap_or_else(|error| {
             let message = alloc::format!("\n[KDBG error failed-system-component {error:#}]\n");
@@ -251,6 +260,62 @@ where
         "embedded system component exited cleanly"
     );
     cpu.shutdown()
+}
+
+struct ProfiledSystemComponentFuture<CpuImpl, HostFs, Fut>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    inner: Fut,
+    cpu: CpuImpl,
+    debug_state: HostRuntimeState<CpuImpl, HostFs>,
+    stack: String,
+}
+
+impl<CpuImpl, HostFs, Fut> ProfiledSystemComponentFuture<CpuImpl, HostFs, Fut>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    fn new(
+        inner: Fut,
+        cpu: CpuImpl,
+        debug_state: HostRuntimeState<CpuImpl, HostFs>,
+        stack: String,
+    ) -> Self {
+        Self {
+            inner,
+            cpu,
+            debug_state,
+            stack,
+        }
+    }
+}
+
+impl<CpuImpl, HostFs, Fut> Future for ProfiledSystemComponentFuture<CpuImpl, HostFs, Fut>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+    Fut: Future,
+{
+    type Output = Fut::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: `inner` is pinned in place with `Self`; this projection never moves it.
+        let this = unsafe { self.get_unchecked_mut() };
+        let started = this.cpu.now().ticks();
+        // SAFETY: `inner` has not been moved after `Self` was pinned.
+        let result = unsafe { Pin::new_unchecked(&mut this.inner) }.poll(cx);
+        if this.debug_state.profiling_enabled() {
+            this.debug_state.record_profile_stack(
+                ProfileScope::Kernel,
+                this.stack.clone(),
+                this.cpu.now().ticks().saturating_sub(started),
+            );
+        }
+        result
+    }
 }
 
 pub fn run_program_workers_forever<CpuImpl, HostFs, WatchdogImpl>(
@@ -284,7 +349,9 @@ where
         topology.configured_processors,
         topology.bootstrap_processor,
     ) {
-        ComponentHostProcessorRole::Kernel => kernel.run(),
+        ComponentHostProcessorRole::Kernel => {
+            run_kernel_processor_forever(cpu, kernel, debug_state);
+        }
         ComponentHostProcessorRole::SharedRuntime | ComponentHostProcessorRole::SystemComponent => {
             let component = crate::embedded_system_component()
                 .unwrap_or_else(|| panic!("embedded init bootfs is missing the system component"));
@@ -298,6 +365,31 @@ where
                 write_serial,
             );
         }
+    }
+}
+
+fn run_kernel_processor_forever<CpuImpl, HostFs, WatchdogImpl>(
+    cpu: CpuImpl,
+    kernel: crate::Kernel<CpuImpl, WatchdogImpl>,
+    debug_state: HostRuntimeState<CpuImpl, HostFs>,
+) -> !
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+    WatchdogImpl: Watchdog + Clone,
+{
+    let processor = cpu.current_processor().id();
+    let stack = format!("kernel;executor;processor-{processor}");
+    loop {
+        let started = cpu.now().ticks();
+        let progress = kernel.run_until_stalled();
+        let elapsed = cpu.now().ticks().saturating_sub(started);
+        if progress != 0 && debug_state.profiling_enabled() {
+            debug_state.record_profile_stack(ProfileScope::Kernel, stack.clone(), elapsed);
+            continue;
+        }
+
+        cpu.park_current();
     }
 }
 
@@ -492,8 +584,9 @@ where
         exec_context: &ProgramExecContext<CpuImpl, HostFs>,
         wasm: &Bytes,
         hint: AotCompileHint,
+        profile: bool,
     ) -> Result<Vec<u8>, ProgramExecError> {
-        self.compile_raw_component_to_signed_artifact(exec_context, wasm, hint)
+        self.compile_raw_component_to_signed_artifact(exec_context, wasm, hint, profile)
             .await
     }
 
@@ -537,7 +630,7 @@ where
                 }
                 let hint = hint.unwrap_or(AotCompileHint::Balanced);
                 let signed = self
-                    .compile_raw_component_to_signed_artifact(exec_context, wasm, hint)
+                    .compile_raw_component_to_signed_artifact(exec_context, wasm, hint, false)
                     .await?;
                 let signed = Bytes::from(signed);
                 trusted_signed_payload(&signed)?
@@ -630,11 +723,12 @@ where
         exec_context: &ProgramExecContext<CpuImpl, HostFs>,
         wasm: &Bytes,
         hint: AotCompileHint,
+        profile: bool,
     ) -> Result<Vec<u8>, ProgramExecError> {
         let compiler_artifact = self.read_compiler_plugin_artifact(exec_context)?;
         let compiler_payload = trusted_bootfs_payload(&compiler_artifact)?;
         let payload =
-            self.invoke_compiler_core_module(exec_context, compiler_payload, wasm, hint)?;
+            self.invoke_compiler_core_module(exec_context, compiler_payload, wasm, hint, profile)?;
         let signed =
             crate::sign_trusted_artifact_payload(&payload).map_err(map_artifact_trust_error)?;
         crate::verify_signed_artifact(crate::UntrustedCwasm::new(&signed))
@@ -648,6 +742,7 @@ where
         compiler_payload: Bytes,
         wasm: &Bytes,
         hint: AotCompileHint,
+        profile: bool,
     ) -> Result<Vec<u8>, ProgramExecError> {
         match WasmtimePrecompiledKind::detect(&compiler_payload) {
             Some(WasmtimePrecompiledKind::CoreModule) => {}
@@ -666,6 +761,11 @@ where
                 });
             }
         }
+        let worker_threads = compiler_plugin_worker_threads(&exec_context.cpu);
+        tracing::info!(
+            worker_threads,
+            "invoking compiler plugin with Rayon worker threads"
+        );
         let engine = self.inner.engine.raw();
         let module = unsafe { Module::deserialize(engine, compiler_payload.as_ref()) }
             .map_err(map_program_runtime_error)?;
@@ -745,6 +845,11 @@ where
             wasm_len: wasm.len() as u32,
             target_ptr,
             target_len: target.len() as u32,
+            flags: if profile {
+                helios_compiler_abi::HELIOS_COMPILER_REQUEST_PROFILE
+            } else {
+                0
+            },
         };
         write_shared_memory(store.data().memory(), request_ptr, unsafe {
             core::slice::from_raw_parts(
@@ -781,6 +886,9 @@ where
                 kind: ProgramExecErrorKind::InvalidBinary,
                 detail: String::from_utf8_lossy(&diagnostic).into_owned(),
             });
+        }
+        if !diagnostic.is_empty() {
+            (store.data().write_serial)(&diagnostic);
         }
         read_shared_memory(
             store.data().memory(),

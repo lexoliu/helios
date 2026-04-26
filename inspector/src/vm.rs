@@ -11,6 +11,7 @@ use console::style;
 use directories::ProjectDirs;
 use helios_hal::fs::HOST_SHARE_MOUNT_TAG;
 use helios_inspector_protocol::debugger::filesystem as debugger_fs;
+use helios_inspector_protocol::system::profiling as system_profiling;
 use helios_inspector_protocol::system::programs as system_programs;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
@@ -374,6 +375,14 @@ struct AotBenchCommand {
     /// Number of AOT+exec iterations to run after upload.
     #[arg(long, default_value_t = 1)]
     iterations: u16,
+
+    /// Ask the guest compiler plugin to emit Wasmtime/Cranelift timing diagnostics.
+    #[arg(long, default_value_t = false)]
+    compiler_timing: bool,
+
+    /// Write folded kernel/user profile samples collected during the AOT run.
+    #[arg(long)]
+    profile_output: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -667,6 +676,23 @@ fn run_aot_bench(client: crate::serial::RpcClient, command: AotBenchCommand) -> 
         debugger_fs::write(&client, &command.remote_path, &wasm, false)
             .await
             .with_context(|| format!("failed to upload {}", command.wasm.display()))?;
+        let profile_filter = system_profiling::Filter {
+            scope: None,
+            stack_prefixes: Vec::new(),
+        };
+        let before_profile = if command.profile_output.is_some() {
+            system_profiling::clear(&client)
+                .await
+                .context("failed to clear remote profile samples")?;
+            system_profiling::set_enabled(&client, true)
+                .await
+                .context("failed to enable remote profiling")?;
+            system_profiling::folded(&client, &profile_filter, 0)
+                .await
+                .context("failed to read initial remote profile samples")?
+        } else {
+            Vec::new()
+        };
 
         use std::io::Write as _;
         {
@@ -686,6 +712,7 @@ fn run_aot_bench(client: crate::serial::RpcClient, command: AotBenchCommand) -> 
                     source_path: command.remote_path.clone(),
                     destination_path: command.destination_path.clone(),
                     hint: system_programs::AotHint::Performance,
+                    profile: command.compiler_timing,
                 },
             )
             .await
@@ -701,8 +728,48 @@ fn run_aot_bench(client: crate::serial::RpcClient, command: AotBenchCommand) -> 
                 result.destination_path
             )?;
         }
+        if let Some(output) = command.profile_output {
+            system_profiling::set_enabled(&client, false)
+                .await
+                .context("failed to disable remote profiling")?;
+            let after_profile = system_profiling::folded(&client, &profile_filter, 0)
+                .await
+                .context("failed to read final remote profile samples")?;
+            let folded = diff_folded_profile(before_profile, after_profile);
+            fs::write(&output, folded)
+                .with_context(|| format!("failed to write {}", output.display()))?;
+            let mut stdout = std::io::stdout().lock();
+            writeln!(stdout, "profile_output={}", output.display())?;
+        }
         Ok(())
     })
+}
+
+fn diff_folded_profile(
+    before: Vec<system_profiling::FoldedSample>,
+    after: Vec<system_profiling::FoldedSample>,
+) -> String {
+    let mut lines = after
+        .into_iter()
+        .filter_map(|sample| {
+            let previous = before
+                .iter()
+                .find(|before| before.scope == sample.scope && before.stack == sample.stack)
+                .map(|before| before.weight)
+                .unwrap_or(0);
+            let weight = sample.weight.saturating_sub(previous);
+            (weight != 0).then_some((sample.stack, weight))
+        })
+        .collect::<Vec<_>>();
+    lines.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut output = String::new();
+    for (stack, weight) in lines {
+        output.push_str(&stack);
+        output.push(' ');
+        output.push_str(&weight.to_string());
+        output.push('\n');
+    }
+    output
 }
 
 fn prepare_boot_artifact(

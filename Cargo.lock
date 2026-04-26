@@ -1727,8 +1727,10 @@ version = "0.1.0"
 name = "helios-compiler-plugin"
 version = "0.1.0"
 dependencies = [
+ "cranelift-codegen",
  "helios-compiler-abi",
  "helios-compiler-support",
+ "log",
 ]
 
 [[package]]

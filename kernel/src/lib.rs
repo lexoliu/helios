@@ -110,15 +110,18 @@ pub use helios_hal::Platform;
 pub use host_fs_client::{HostFsClient, HostFsFuture, HostFsTransport};
 pub use host_share::{HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, guest_host_share_path};
 pub use instance::{
-    InstanceExecutionTransition, InstanceId, InstanceRegistry, InstanceSnapshot,
-    RegisteredInstance, allow_instance_resource_growth, record_instance_transition,
+    InstanceExecutionTransition, InstanceId, InstanceProfileTotal, InstanceRegistry,
+    InstanceSnapshot, RegisteredInstance, allow_instance_resource_growth,
+    record_instance_transition,
 };
 pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
 };
 pub use observer::{
-    DEFAULT_TRACE_HISTORY_CAPACITY, StatsSample, TraceEvent, TraceField, TraceFilter, TraceHistory,
-    TraceLevel, TraceValue, matches_trace_filter, parse_console_text,
+    DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY, FoldedProfileSample,
+    ProfileFilter, ProfileHistory, ProfileScope, StatsSample, TraceEvent, TraceField, TraceFilter,
+    TraceHistory, TraceLevel, TraceValue, matches_profile_filter, matches_trace_filter,
+    parse_console_text,
 };
 pub use program_service::{ProgramExecError, ProgramExecErrorKind, ProgramOutOfMemory};
 pub use recording_console::RecordingConsole;

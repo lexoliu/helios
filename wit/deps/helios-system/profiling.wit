@@ -1,0 +1,25 @@
+package helios:system@0.1.0;
+
+interface profiling {
+  type mono-nanos = u64;
+
+  enum scope {
+    kernel,
+    user,
+  }
+
+  record filter {
+    scope: option<scope>,
+    stack-prefixes: list<string>,
+  }
+
+  record folded-sample {
+    scope: scope,
+    stack: string,
+    weight: mono-nanos,
+  }
+
+  set-enabled: func(enabled: bool);
+  clear: func();
+  folded: func(filter: filter, limit: u32) -> list<folded-sample>;
+}

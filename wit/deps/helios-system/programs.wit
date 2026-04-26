@@ -56,6 +56,8 @@ interface programs {
     source-path: string,
     destination-path: string,
     hint: aot-hint,
+    /// Emit compiler-internal timing diagnostics for this request.
+    profile: bool,
   }
 
   record aot-result {

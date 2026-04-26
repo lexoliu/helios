@@ -1,10 +1,13 @@
 extern crate alloc;
 
+use alloc::format;
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
-    DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedBootFs, InstanceRegistry, Notify, StatsSample,
-    TraceEvent, TraceFilter, TraceHistory, embedded_init,
+    DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedBootFs,
+    FoldedProfileSample, InstanceRegistry, Notify, ProfileFilter, ProfileHistory, ProfileScope,
+    StatsSample, TraceEvent, TraceFilter, TraceHistory, embedded_init,
 };
 use spin::Mutex;
 
@@ -27,6 +30,8 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     host_fs_service: Mutex<Option<HostFsService>>,
     bootfs: Mutex<Option<EmbeddedBootFs>>,
     tracing: Mutex<TraceHistory>,
+    profiling_enabled: AtomicBool,
+    profiling: Mutex<ProfileHistory>,
 }
 
 impl<ProgramService, NetworkService, HostFsService>
@@ -49,6 +54,8 @@ where
                 host_fs_service: Mutex::new(None),
                 bootfs: Mutex::new(embedded_init().map(|init| init.bootfs())),
                 tracing: Mutex::new(TraceHistory::new(DEFAULT_TRACE_HISTORY_CAPACITY)),
+                profiling_enabled: AtomicBool::new(false),
+                profiling: Mutex::new(ProfileHistory::new(DEFAULT_PROFILE_STACK_CAPACITY)),
             }),
         }
     }
@@ -77,6 +84,56 @@ where
 
     pub fn next_after(&self, cursor: u64, filter: &TraceFilter) -> Option<(u64, TraceEvent)> {
         self.inner.tracing.lock().next_after(cursor, filter)
+    }
+
+    pub fn set_profiling_enabled(&self, enabled: bool) {
+        self.inner
+            .profiling_enabled
+            .store(enabled, Ordering::Release);
+    }
+
+    pub fn profiling_enabled(&self) -> bool {
+        self.inner.profiling_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn clear_profile(&self) {
+        self.inner.profiling.lock().clear();
+    }
+
+    pub fn record_profile_stack(
+        &self,
+        scope: ProfileScope,
+        stack: alloc::string::String,
+        weight_ticks: u64,
+    ) {
+        if !self.inner.profiling_enabled.load(Ordering::Acquire) {
+            return;
+        }
+        let weight = self.ticks_to_nanos(weight_ticks);
+        self.inner.profiling.lock().record(scope, stack, weight);
+    }
+
+    pub fn folded_profile(
+        &self,
+        current_ticks: u64,
+        filter: &ProfileFilter,
+        limit: u32,
+    ) -> alloc::vec::Vec<FoldedProfileSample> {
+        let now_nanos = self.uptime_nanos(current_ticks);
+        let user_samples = self
+            .inner
+            .instance_registry
+            .active_totals(now_nanos)
+            .into_iter()
+            .map(|total| FoldedProfileSample {
+                scope: ProfileScope::User,
+                stack: format!("user;{}", total.name),
+                weight: total.active_nanos,
+            });
+        self.inner
+            .profiling
+            .lock()
+            .folded(filter, user_samples, limit)
     }
 
     pub fn ticks_to_nanos(&self, ticks: u64) -> u64 {

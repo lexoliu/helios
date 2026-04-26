@@ -35,12 +35,16 @@ use crate::wasmtime_adapter::bindings::program::bindings as program_bindings;
 use crate::wasmtime_adapter::config::AotCompileHint;
 use crate::wasmtime_adapter::wasi::ChannelStreamProducer;
 use crate::wasmtime_adapter::wasi::bindings::filesystem::types::ErrorCode as FsErrorCode;
-use crate::{StatsSample, TraceEvent, TraceField, TraceFilter, TraceLevel, TraceValue};
+use crate::{
+    ProfileFilter, ProfileScope, StatsSample, TraceEvent, TraceField, TraceFilter, TraceLevel,
+    TraceValue,
+};
 
 const SYNC_INSTANCE: &str = "helios:system/sync@0.1.0";
 const STATS_INSTANCE: &str = "helios:system/stats@0.1.0";
 const NET_INSTANCE: &str = "helios:system/net@0.1.0";
 const TRACING_INSTANCE: &str = "helios:system/tracing@0.1.0";
+const PROFILING_INSTANCE: &str = "helios:system/profiling@0.1.0";
 const INSTANCES_INSTANCE: &str = "helios:system/instances@0.1.0";
 const COMPONENT_CACHE_FRACTION: usize = 8;
 const COMPONENT_PHASE_HEARTBEAT_INTERVAL_NANOS: u64 = 5_000_000_000;
@@ -489,7 +493,7 @@ macro_rules! impl_program_bindings {
                             AotCompileHint::Performance
                         }
                     };
-                    let artifact = match service.aot(&context, &wasm, hint).await {
+                    let artifact = match service.aot(&context, &wasm, hint, request.profile).await {
                         Ok(artifact) => artifact,
                         Err(error) => return Ok(Err($convert_error(error))),
                     };
@@ -836,6 +840,7 @@ where
     add_stats_to_linker(linker)?;
     add_instances_to_linker(linker)?;
     add_tracing_to_linker(linker)?;
+    add_profiling_to_linker(linker)?;
     Ok(())
 }
 
@@ -1633,6 +1638,39 @@ where
                 TracingStreamProducer::new(convert_filter(filter)),
             )?;
             Ok((reader,))
+        },
+    )?;
+    Ok(())
+}
+
+fn add_profiling_to_linker<CpuImpl, HostFs>(
+    linker: &mut Linker<StoreData<CpuImpl, HostFs>>,
+) -> wasmtime::Result<()>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let mut instance = linker.instance(PROFILING_INSTANCE)?;
+    instance.func_wrap("set-enabled", |caller, (enabled,): (bool,)| {
+        caller.data().runtime_state.set_profiling_enabled(enabled);
+        Ok(())
+    })?;
+    instance.func_wrap("clear", |caller, (): ()| {
+        caller.data().runtime_state.clear_profile();
+        Ok(())
+    })?;
+    instance.func_wrap(
+        "folded",
+        |caller, (filter, limit): (debugger_bindings::helios::system::profiling::Filter, u32)| {
+            let filter = convert_profile_filter(filter);
+            let samples = caller
+                .data()
+                .runtime_state
+                .folded_profile(caller.data().cpu.now().ticks(), &filter, limit)
+                .into_iter()
+                .map(convert_profile_sample)
+                .collect::<Vec<_>>();
+            Ok((samples,))
         },
     )?;
     Ok(())
@@ -2650,6 +2688,25 @@ fn convert_program_filter(
     }
 }
 
+fn convert_profile_filter(
+    filter: debugger_bindings::helios::system::profiling::Filter,
+) -> ProfileFilter {
+    ProfileFilter {
+        scope: filter.scope.map(convert_profile_scope_to_local),
+        stack_prefixes: filter.stack_prefixes,
+    }
+}
+
+fn convert_profile_sample(
+    sample: crate::FoldedProfileSample,
+) -> debugger_bindings::helios::system::profiling::FoldedSample {
+    debugger_bindings::helios::system::profiling::FoldedSample {
+        scope: convert_profile_scope_from_local(sample.scope),
+        stack: sample.stack,
+        weight: sample.weight,
+    }
+}
+
 fn convert_event(event: TraceEvent) -> debugger_bindings::helios::system::tracing::Event {
     debugger_bindings::helios::system::tracing::Event {
         timestamp: event.timestamp,
@@ -2721,6 +2778,24 @@ fn convert_program_value(value: TraceValue) -> program_bindings::helios::system:
         }
         TraceValue::Text(value) => program_bindings::helios::system::tracing::Value::Text(value),
         TraceValue::Blob(value) => program_bindings::helios::system::tracing::Value::Blob(value),
+    }
+}
+
+fn convert_profile_scope_from_local(
+    scope: ProfileScope,
+) -> debugger_bindings::helios::system::profiling::Scope {
+    match scope {
+        ProfileScope::Kernel => debugger_bindings::helios::system::profiling::Scope::Kernel,
+        ProfileScope::User => debugger_bindings::helios::system::profiling::Scope::User,
+    }
+}
+
+fn convert_profile_scope_to_local(
+    scope: debugger_bindings::helios::system::profiling::Scope,
+) -> ProfileScope {
+    match scope {
+        debugger_bindings::helios::system::profiling::Scope::Kernel => ProfileScope::Kernel,
+        debugger_bindings::helios::system::profiling::Scope::User => ProfileScope::User,
     }
 }
 

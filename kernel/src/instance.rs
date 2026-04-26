@@ -28,6 +28,12 @@ pub struct InstanceSnapshot {
     pub cpu_busy: u16,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstanceProfileTotal {
+    pub name: String,
+    pub active_nanos: u64,
+}
+
 #[derive(Clone)]
 pub struct InstanceRegistry {
     inner: Arc<InstanceRegistryInner>,
@@ -144,6 +150,21 @@ impl InstanceRegistry {
         snapshots.sort_by_key(|snapshot| snapshot.id);
         sampling.totals = next_totals;
         snapshots
+    }
+
+    pub fn active_totals(&self, now_nanos: u64) -> Vec<InstanceProfileTotal> {
+        let mut totals = self
+            .inner
+            .entries
+            .lock()
+            .iter()
+            .map(|entry| InstanceProfileTotal {
+                name: entry.name.clone(),
+                active_nanos: entry.total_active_nanos(now_nanos),
+            })
+            .collect::<Vec<_>>();
+        totals.sort_by(|left, right| left.name.cmp(&right.name));
+        totals
     }
 }
 

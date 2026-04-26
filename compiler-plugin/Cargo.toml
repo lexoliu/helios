@@ -7,5 +7,7 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
+cranelift-codegen = { path = "../../wasmtime/cranelift/codegen", features = ["host-arch", "timing"] }
 helios-compiler-abi.workspace = true
 helios-compiler-support.workspace = true
+log = { version = "0.4.29", features = ["std"] }

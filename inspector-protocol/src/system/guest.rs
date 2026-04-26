@@ -3,16 +3,17 @@ use std::io;
 use anyhow::{Context as _, Result, bail};
 use futures_io::{AsyncRead, AsyncWrite};
 use helios_api::{
-    instances as host_instances, programs as host_programs, stats as host_stats,
-    tracing as host_tracing,
+    instances as host_instances, profiling as host_profiling, programs as host_programs,
+    stats as host_stats, tracing as host_tracing,
 };
 
 use crate::wire::{Frame, read_frame, write_frame};
 
-use super::bindings::helios::system::{instances, programs, stats, tracing};
+use super::bindings::helios::system::{instances, profiling, programs, stats, tracing};
 use super::methods::{
-    INSTANCES_INSTANCE, INSTANCES_SNAPSHOT, PROGRAMS_AOT, PROGRAMS_EXEC, PROGRAMS_INSTANCE,
-    STATS_INSTANCE, STATS_SNAPSHOT, TRACING_INSTANCE, TRACING_RECENT,
+    INSTANCES_INSTANCE, INSTANCES_SNAPSHOT, PROFILING_CLEAR, PROFILING_FOLDED, PROFILING_INSTANCE,
+    PROFILING_SET_ENABLED, PROGRAMS_AOT, PROGRAMS_EXEC, PROGRAMS_INSTANCE, STATS_INSTANCE,
+    STATS_SNAPSHOT, TRACING_INSTANCE, TRACING_RECENT,
 };
 use crate::debugger::{filesystem, programs as debugger_programs};
 
@@ -101,6 +102,9 @@ fn supports_request(instance: &str, func: &str) -> bool {
             | (STATS_INSTANCE, STATS_SNAPSHOT)
             | (INSTANCES_INSTANCE, INSTANCES_SNAPSHOT)
             | (TRACING_INSTANCE, TRACING_RECENT)
+            | (PROFILING_INSTANCE, PROFILING_SET_ENABLED)
+            | (PROFILING_INSTANCE, PROFILING_CLEAR)
+            | (PROFILING_INSTANCE, PROFILING_FOLDED)
     ) || filesystem::supports(instance, func)
         || debugger_programs::supports(instance, func)
 }
@@ -141,6 +145,7 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>>
                 source_path: request.source_path,
                 destination_path: request.destination_path,
                 hint: map_aot_hint_to_host(request.hint),
+                profile: request.profile,
             })
             .await;
             let response = response
@@ -178,6 +183,28 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>>
                 .map(convert_event)
                 .collect::<Vec<_>>();
             postcard::to_allocvec(&events).context("failed to encode tracing.recent response")
+        }
+        (PROFILING_INSTANCE, PROFILING_SET_ENABLED) => {
+            let enabled = postcard::from_bytes::<bool>(payload)
+                .context("failed to decode profiling.set-enabled request payload")?;
+            host_profiling::set_enabled(enabled);
+            postcard::to_allocvec(&()).context("failed to encode profiling.set-enabled response")
+        }
+        (PROFILING_INSTANCE, PROFILING_CLEAR) => {
+            if !payload.is_empty() {
+                bail!("profiling.clear does not accept request payload bytes");
+            }
+            host_profiling::clear();
+            postcard::to_allocvec(&()).context("failed to encode profiling.clear response")
+        }
+        (PROFILING_INSTANCE, PROFILING_FOLDED) => {
+            let (filter, limit): (profiling::Filter, u32) = postcard::from_bytes(payload)
+                .context("failed to decode profiling.folded request payload")?;
+            let samples = host_profiling::folded(&convert_profile_filter(filter), limit)
+                .into_iter()
+                .map(convert_profile_sample)
+                .collect::<Vec<_>>();
+            postcard::to_allocvec(&samples).context("failed to encode profiling.folded response")
         }
         _ if filesystem::supports(instance, func) => filesystem::dispatch(func, payload).await,
         _ if debugger_programs::supports(instance, func) => {
@@ -324,6 +351,21 @@ fn convert_filter(filter: tracing::Filter) -> host_tracing::Filter {
     }
 }
 
+fn convert_profile_filter(filter: profiling::Filter) -> host_profiling::Filter {
+    host_profiling::Filter {
+        scope: filter.scope.map(convert_profile_scope_to_local),
+        stack_prefixes: filter.stack_prefixes,
+    }
+}
+
+fn convert_profile_sample(sample: host_profiling::FoldedSample) -> profiling::FoldedSample {
+    profiling::FoldedSample {
+        scope: convert_profile_scope_from_local(sample.scope),
+        stack: sample.stack,
+        weight: sample.weight,
+    }
+}
+
 fn convert_event(event: host_tracing::Event) -> tracing::Event {
     tracing::Event {
         timestamp: event.timestamp,
@@ -348,6 +390,20 @@ fn convert_value(value: host_tracing::Value) -> tracing::Value {
         host_tracing::Value::Float64(value) => tracing::Value::Float64(value),
         host_tracing::Value::Text(value) => tracing::Value::Text(value),
         host_tracing::Value::Blob(value) => tracing::Value::Blob(value),
+    }
+}
+
+fn convert_profile_scope_from_local(scope: host_profiling::Scope) -> profiling::Scope {
+    match scope {
+        host_profiling::Scope::Kernel => profiling::Scope::Kernel,
+        host_profiling::Scope::User => profiling::Scope::User,
+    }
+}
+
+fn convert_profile_scope_to_local(scope: profiling::Scope) -> host_profiling::Scope {
+    match scope {
+        profiling::Scope::Kernel => host_profiling::Scope::Kernel,
+        profiling::Scope::User => host_profiling::Scope::User,
     }
 }
 

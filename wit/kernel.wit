@@ -16,6 +16,7 @@ world debugger {
   import helios:system/net@0.1.0;
   import helios:system/stats@0.1.0;
   import helios:system/tracing@0.1.0;
+  import helios:system/profiling@0.1.0;
   import helios:system/sync@0.1.0;
   import helios:system/serial@0.1.0;
   import helios:system/instances@0.1.0;
@@ -26,6 +27,7 @@ world remote-system {
   export helios:system/net@0.1.0;
   export helios:system/stats@0.1.0;
   export helios:system/tracing@0.1.0;
+  export helios:system/profiling@0.1.0;
   export helios:system/sync@0.1.0;
   export helios:system/serial@0.1.0;
   export helios:system/instances@0.1.0;

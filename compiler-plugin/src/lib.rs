@@ -1,9 +1,11 @@
 use core::mem::{align_of, size_of};
 use core::ptr;
+use std::io::Write;
+use std::time::Instant;
 
 use helios_compiler_abi::{
     CompileHint, CompilerRequestHeader, CompilerResponseHeader, CompilerStatus,
-    HELIOS_COMPILER_ABI_VERSION, OutputKind,
+    HELIOS_COMPILER_ABI_VERSION, HELIOS_COMPILER_REQUEST_PROFILE, OutputKind,
 };
 use helios_compiler_support::{AotCompileHint, PrecompiledArtifactKind, precompile_artifact};
 
@@ -62,6 +64,7 @@ struct CompileRequest<'a> {
     wasm: &'a [u8],
     target: &'a str,
     hint: AotCompileHint,
+    profile: bool,
 }
 
 unsafe fn read_request<'a>(
@@ -91,7 +94,12 @@ unsafe fn read_request<'a>(
         CompileHint::Balanced => AotCompileHint::Balanced,
         CompileHint::Performance => AotCompileHint::Performance,
     };
-    Ok(CompileRequest { wasm, target, hint })
+    Ok(CompileRequest {
+        wasm,
+        target,
+        hint,
+        profile: header.flags & HELIOS_COMPILER_REQUEST_PROFILE != 0,
+    })
 }
 
 unsafe fn slice_from_abi<'a>(ptr: u32, len: u32) -> &'a [u8] {
@@ -99,16 +107,23 @@ unsafe fn slice_from_abi<'a>(ptr: u32, len: u32) -> &'a [u8] {
 }
 
 fn compile(request: CompileRequest<'_>) -> u32 {
+    if request.profile {
+        enable_compiler_timing_log();
+    }
+    let started = request.profile.then(Instant::now);
     match precompile_artifact(request.wasm, request.target, request.hint) {
-        Ok(artifact) => response(
-            CompilerStatus::Ok,
-            match artifact.kind {
+        Ok(artifact) => {
+            let output_kind = match artifact.kind {
                 PrecompiledArtifactKind::CoreModule => OutputKind::CoreModule,
                 PrecompiledArtifactKind::Component => OutputKind::Component,
-            },
-            artifact.bytes,
-            Vec::new(),
-        ),
+            };
+            let diagnostic = started
+                .map(|started| {
+                    compiler_timing_report(started, output_kind, artifact.bytes.len()).into_bytes()
+                })
+                .unwrap_or_default();
+            response(CompilerStatus::Ok, output_kind, artifact.bytes, diagnostic)
+        }
         Err(error) => response(
             CompilerStatus::CompileFailed,
             OutputKind::CoreModule,
@@ -116,6 +131,45 @@ fn compile(request: CompileRequest<'_>) -> u32 {
             format!("{error:#}").into_bytes(),
         ),
     }
+}
+
+fn enable_compiler_timing_log() {
+    if log::set_boxed_logger(Box::new(CompilerLogger)).is_ok() {
+        log::set_max_level(log::LevelFilter::Info);
+    }
+}
+
+fn compiler_timing_report(started: Instant, output_kind: OutputKind, output_len: usize) -> String {
+    let elapsed = started.elapsed();
+    let pass_times = cranelift_codegen::timing::take_global();
+    format!(
+        "INFO [helios_compiler_plugin] profile total_ms={} output_kind={output_kind:?} output_len={output_len}\n{pass_times}",
+        elapsed.as_millis()
+    )
+}
+
+struct CompilerLogger;
+
+impl log::Log for CompilerLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Info
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(
+            stderr,
+            "{} [{}] {}",
+            record.level(),
+            record.target(),
+            record.args()
+        );
+    }
+
+    fn flush(&self) {}
 }
 
 fn response(
