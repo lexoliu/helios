@@ -1,6 +1,6 @@
 use core::mem::{align_of, size_of};
 use core::ptr;
-use std::io::Write;
+use std::sync::Once;
 use std::time::Instant;
 
 use helios_compiler_abi::{
@@ -8,6 +8,8 @@ use helios_compiler_abi::{
     HELIOS_COMPILER_ABI_VERSION, HELIOS_COMPILER_REQUEST_PROFILE, OutputKind,
 };
 use helios_compiler_support::{AotCompileHint, PrecompiledArtifactKind, precompile_artifact};
+use tracing_log::LogTracer;
+use tracing_subscriber::fmt::Subscriber;
 
 unsafe extern "C" {
     static mut __wasilibc_pthread_self: u8;
@@ -135,9 +137,19 @@ fn compile(request: CompileRequest<'_>) -> u32 {
 }
 
 fn enable_compiler_timing_log() {
-    if log::set_boxed_logger(Box::new(CompilerLogger)).is_ok() {
-        log::set_max_level(log::LevelFilter::Info);
-    }
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let subscriber = Subscriber::builder()
+            .with_writer(std::io::stderr)
+            .with_target(true)
+            .with_level(true)
+            .without_time()
+            .finish();
+        if tracing::subscriber::set_global_default(subscriber).is_err() {
+            return;
+        }
+        let _ = LogTracer::init();
+    });
 }
 
 fn compiler_timing_report(started: Instant, output_kind: OutputKind, output_len: usize) -> String {
@@ -148,30 +160,6 @@ fn compiler_timing_report(started: Instant, output_kind: OutputKind, output_len:
         "INFO [helios_compiler_plugin] profile total_ms={} output_kind={output_kind:?} output_len={output_len}\n{pass_times}",
         elapsed.as_millis()
     )
-}
-
-struct CompilerLogger;
-
-impl log::Log for CompilerLogger {
-    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Info
-    }
-
-    fn log(&self, record: &log::Record<'_>) {
-        if !self.enabled(record.metadata()) {
-            return;
-        }
-        let mut stderr = std::io::stderr().lock();
-        let _ = writeln!(
-            stderr,
-            "{} [{}] {}",
-            record.level(),
-            record.target(),
-            record.args()
-        );
-    }
-
-    fn flush(&self) {}
 }
 
 fn response(
