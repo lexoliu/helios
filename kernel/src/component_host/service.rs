@@ -1427,8 +1427,11 @@ fn read_shared_memory(
         });
     }
     let mut bytes = Vec::with_capacity(len);
-    for cell in &data[start..end] {
-        bytes.push(unsafe { *cell.get() });
+    unsafe {
+        bytes.extend_from_slice(core::slice::from_raw_parts(
+            data.as_ptr().cast::<u8>().add(start),
+            len,
+        ));
     }
     Ok(bytes)
 }
@@ -1457,10 +1460,12 @@ fn write_shared_memory(
             ),
         });
     }
-    for (cell, byte) in data[start..end].iter().zip(bytes.iter().copied()) {
-        unsafe {
-            *cell.get() = byte;
-        }
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            data.as_ptr().cast::<u8>().add(start).cast_mut(),
+            bytes.len(),
+        );
     }
     Ok(())
 }

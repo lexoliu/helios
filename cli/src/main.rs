@@ -595,7 +595,7 @@ fn build_compiler_plugin_asset(
     )?;
     let wasm =
         fs::read(&wasm_path).with_context(|| format!("failed to read {}", wasm_path.display()))?;
-    let payload = precompile_artifact(&wasm, target, Hint::Balanced.into())?.bytes;
+    let payload = precompile_artifact(&wasm, target, Hint::Performance.into())?.bytes;
     let signed = sign_payload_with_key(&payload, root_signing_key)
         .context("failed to sign compiler plugin AOT payload")?;
     let output_path = out_dir.join("compiler_plugin.cwasm");
@@ -823,6 +823,10 @@ fn build_wasm_program(
         .arg(&target_dir);
     if profile == "release" {
         command.arg("--release");
+        if target_triple == "wasm32-wasip1-threads" {
+            command.env("CARGO_PROFILE_RELEASE_LTO", "fat");
+            command.env("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "1");
+        }
     } else {
         command.env("CARGO_PROFILE_DEV_OPT_LEVEL", "z");
         command.env("CARGO_PROFILE_DEV_DEBUG", "0");
@@ -859,7 +863,7 @@ fn build_wasm_program(
 fn wasm_rustflags(target_triple: &str) -> String {
     match target_triple {
         "wasm32-wasip1-threads" => format!(
-            "-C debuginfo=0 -C strip=debuginfo -C link-arg=--no-entry -C link-arg=--export=__tls_base -C link-arg=--max-memory={COMPILER_PLUGIN_SHARED_MEMORY_MAX_BYTES}"
+            "-C debuginfo=0 -C strip=symbols -C link-arg=--no-entry -C link-arg=--export=__tls_base -C link-arg=--max-memory={COMPILER_PLUGIN_SHARED_MEMORY_MAX_BYTES}"
         ),
         _ => "-C debuginfo=0 -C strip=debuginfo".to_owned(),
     }
