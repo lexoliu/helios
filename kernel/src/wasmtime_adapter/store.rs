@@ -7,11 +7,9 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use helios_hal::cpu::Cpu;
-use spin::Mutex;
 use wasmtime::component::ResourceTable;
 use wasmtime::{CallHook, ResourceLimiter};
 use wasmtime_wasi_io::IoView;
@@ -117,16 +115,20 @@ where
 }
 
 /// WASI P2 adapter: exposes a kernel `ByteReader` as an `InputStream`.
+///
+/// Wasmtime drives `Pollable::ready` and `InputStream::read` through `&mut
+/// self`, so the carry buffer is owned outright rather than wrapped in
+/// `Arc<Mutex<_>>`.
 pub struct ChannelInputStream {
     reader: ByteReader,
-    carry: Arc<Mutex<Vec<u8>>>,
+    carry: Vec<u8>,
 }
 
 impl ChannelInputStream {
     pub fn new(reader: ByteReader) -> Self {
         Self {
             reader,
-            carry: Arc::new(Mutex::new(Vec::new())),
+            carry: Vec::new(),
         }
     }
 }
@@ -134,11 +136,11 @@ impl ChannelInputStream {
 #[wasmtime_wasi_io::async_trait]
 impl Pollable for ChannelInputStream {
     async fn ready(&mut self) {
-        if !self.carry.lock().is_empty() {
+        if !self.carry.is_empty() {
             return;
         }
         if let Some(bytes) = self.reader.read().await {
-            self.carry.lock().extend_from_slice(&bytes);
+            self.carry.extend_from_slice(&bytes);
         }
     }
 }
@@ -146,18 +148,17 @@ impl Pollable for ChannelInputStream {
 #[wasmtime_wasi_io::async_trait]
 impl InputStream for ChannelInputStream {
     fn read(&mut self, size: usize) -> StreamResult<Bytes> {
-        let mut carry = self.carry.lock();
-        if !carry.is_empty() {
-            let take = carry.len().min(size);
-            let remainder = carry.split_off(take);
-            let taken = core::mem::replace(&mut *carry, remainder);
+        if !self.carry.is_empty() {
+            let take = self.carry.len().min(size);
+            let remainder = self.carry.split_off(take);
+            let taken = core::mem::replace(&mut self.carry, remainder);
             return Ok(Bytes::from(taken));
         }
         match self.reader.try_read() {
             crate::child_io::TryRead::Ready(mut bytes) => {
                 if bytes.len() > size {
                     let tail = bytes.split_off(size);
-                    *carry = tail;
+                    self.carry = tail;
                 }
                 Ok(Bytes::from(bytes))
             }
