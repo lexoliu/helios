@@ -95,11 +95,8 @@ static DEVICE_TREE_BLOB_REQUEST: DtbRequest = DtbRequest::new();
 static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new(KERNEL_STACK_BYTES as u64);
 static DEBUG_SERIAL_BASE: AtomicUsize = AtomicUsize::new(0);
 static DEBUG_SERIAL_WRITER_HELD: AtomicBool = AtomicBool::new(false);
-static CRITICAL_SECTION_OWNER: AtomicUsize = AtomicUsize::new(0);
-static CRITICAL_SECTION_DEPTH: AtomicUsize = AtomicUsize::new(0);
-
-const CRITICAL_SECTION_RESTORE_INTERRUPTS_BIT: usize = 1;
-const CRITICAL_SECTION_OUTERMOST_BIT: usize = 1 << 1;
+static CRITICAL_SECTION_STATE: helios_hal::critical_section::CriticalSectionState =
+    helios_hal::critical_section::CriticalSectionState::new();
 
 #[repr(align(4096))]
 struct PageTable(UnsafeCell<[u64; PAGE_TABLE_ENTRIES]>);
@@ -271,9 +268,44 @@ impl Aarch64PlatformState {
     }
 }
 
-struct Aarch64CriticalSection;
+struct Aarch64InterruptOps;
 
-critical_section::set_impl!(Aarch64CriticalSection);
+impl helios_hal::critical_section::InterruptOps for Aarch64InterruptOps {
+    fn interrupts_enabled() -> bool {
+        let daif: u64;
+        unsafe {
+            asm!("mrs {daif}, daif", daif = out(reg) daif, options(nomem, nostack, preserves_flags));
+        }
+        daif & (1 << 7) == 0
+    }
+
+    fn disable_interrupts() {
+        unsafe {
+            asm!(
+                "msr daifset, #0xf",
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+    }
+
+    unsafe fn enable_interrupts() {
+        unsafe {
+            asm!(
+                "msr daifclr, #0xf",
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+    }
+
+    fn current_owner() -> usize {
+        let runtime = read_processor_runtime();
+        if runtime != 0 {
+            return runtime;
+        }
+
+        1
+    }
+}
 
 #[derive(Clone)]
 struct Aarch64AcpiHandler {
@@ -281,83 +313,18 @@ struct Aarch64AcpiHandler {
     timer_frequency: u64,
 }
 
+struct Aarch64CriticalSection;
+
+critical_section::set_impl!(Aarch64CriticalSection);
+
 unsafe impl critical_section::Impl for Aarch64CriticalSection {
     unsafe fn acquire() -> usize {
-        let daif: u64;
-        unsafe {
-            asm!("mrs {daif}, daif", daif = out(reg) daif, options(nomem, nostack, preserves_flags));
-            asm!(
-                "msr daifset, #0xf",
-                options(nomem, nostack, preserves_flags)
-            );
-        }
-        let interrupts_were_enabled = daif & (1 << 7) == 0;
-        let owner = critical_section_owner();
-        loop {
-            match CRITICAL_SECTION_OWNER.compare_exchange(
-                0,
-                owner,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    CRITICAL_SECTION_DEPTH.store(1, Ordering::Relaxed);
-                    return critical_section_token(interrupts_were_enabled, true);
-                }
-                Err(current) if current == owner => {
-                    let depth = CRITICAL_SECTION_DEPTH.fetch_add(1, Ordering::Relaxed);
-                    assert!(depth != usize::MAX, "critical section nesting overflowed");
-                    return critical_section_token(interrupts_were_enabled, false);
-                }
-                Err(_) => core::hint::spin_loop(),
-            }
-        }
+        unsafe { CRITICAL_SECTION_STATE.acquire::<Aarch64InterruptOps>() }
     }
 
     unsafe fn release(restore_state: usize) {
-        let interrupts_were_enabled = critical_section_restore_interrupts(restore_state);
-        let outermost = critical_section_is_outermost(restore_state);
-        let previous_depth = CRITICAL_SECTION_DEPTH.fetch_sub(1, Ordering::Relaxed);
-        assert!(previous_depth != 0, "critical section depth underflowed");
-
-        if outermost {
-            assert!(
-                previous_depth == 1,
-                "outermost critical section release observed nested depth {previous_depth}"
-            );
-            CRITICAL_SECTION_OWNER.store(0, Ordering::Release);
-        }
-
-        if interrupts_were_enabled {
-            unsafe {
-                asm!(
-                    "msr daifclr, #0xf",
-                    options(nomem, nostack, preserves_flags)
-                );
-            }
-        }
+        unsafe { CRITICAL_SECTION_STATE.release::<Aarch64InterruptOps>(restore_state) }
     }
-}
-
-const fn critical_section_token(interrupts_were_enabled: bool, outermost: bool) -> usize {
-    (interrupts_were_enabled as usize) | ((outermost as usize) << 1)
-}
-
-const fn critical_section_restore_interrupts(token: usize) -> bool {
-    token & CRITICAL_SECTION_RESTORE_INTERRUPTS_BIT != 0
-}
-
-const fn critical_section_is_outermost(token: usize) -> bool {
-    token & CRITICAL_SECTION_OUTERMOST_BIT != 0
-}
-
-fn critical_section_owner() -> usize {
-    let runtime = read_processor_runtime();
-    if runtime != 0 {
-        return runtime;
-    }
-
-    1
 }
 
 #[unsafe(no_mangle)]

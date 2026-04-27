@@ -56,13 +56,35 @@ const PAGE_NO_EXECUTE: u64 = 1 << 63;
 pub(crate) const KERNEL_STACK_BYTES: usize = 4 * 1024 * 1024;
 const WATCHDOG_SELF_TEST_ENABLED: bool = option_env!("HELIOS_WATCHDOG_SELF_TEST").is_some();
 pub(crate) static WASMTIME_NATIVE_TRAP_HANDLER: AtomicUsize = AtomicUsize::new(0);
-static CRITICAL_SECTION_OWNER: AtomicUsize = AtomicUsize::new(0);
-static CRITICAL_SECTION_DEPTH: AtomicUsize = AtomicUsize::new(0);
-
-const CRITICAL_SECTION_RESTORE_INTERRUPTS_BIT: usize = 1;
-const CRITICAL_SECTION_OUTERMOST_BIT: usize = 1 << 1;
+static CRITICAL_SECTION_STATE: helios_hal::critical_section::CriticalSectionState =
+    helios_hal::critical_section::CriticalSectionState::new();
 
 global_asm!(include_str!("secondary_wakeup.S"));
+
+struct X86InterruptOps;
+
+impl helios_hal::critical_section::InterruptOps for X86InterruptOps {
+    fn interrupts_enabled() -> bool {
+        x86_64::instructions::interrupts::are_enabled()
+    }
+
+    fn disable_interrupts() {
+        x86_64::instructions::interrupts::disable();
+    }
+
+    unsafe fn enable_interrupts() {
+        x86_64::instructions::interrupts::enable();
+    }
+
+    fn current_owner() -> usize {
+        let runtime = smp::current_runtime_address();
+        if runtime != 0 {
+            return runtime;
+        }
+
+        1
+    }
+}
 
 struct X86CriticalSection;
 
@@ -70,69 +92,12 @@ critical_section::set_impl!(X86CriticalSection);
 
 unsafe impl critical_section::Impl for X86CriticalSection {
     unsafe fn acquire() -> usize {
-        let interrupts_were_enabled = x86_64::instructions::interrupts::are_enabled();
-        x86_64::instructions::interrupts::disable();
-        let owner = critical_section_owner();
-        loop {
-            match CRITICAL_SECTION_OWNER.compare_exchange(
-                0,
-                owner,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    CRITICAL_SECTION_DEPTH.store(1, Ordering::Relaxed);
-                    return critical_section_token(interrupts_were_enabled, true);
-                }
-                Err(current) if current == owner => {
-                    let depth = CRITICAL_SECTION_DEPTH.fetch_add(1, Ordering::Relaxed);
-                    assert!(depth != usize::MAX, "critical section nesting overflowed");
-                    return critical_section_token(interrupts_were_enabled, false);
-                }
-                Err(_) => core::hint::spin_loop(),
-            }
-        }
+        unsafe { CRITICAL_SECTION_STATE.acquire::<X86InterruptOps>() }
     }
 
     unsafe fn release(restore_state: usize) {
-        let interrupts_were_enabled = critical_section_restore_interrupts(restore_state);
-        let outermost = critical_section_is_outermost(restore_state);
-        let previous_depth = CRITICAL_SECTION_DEPTH.fetch_sub(1, Ordering::Relaxed);
-        assert!(previous_depth != 0, "critical section depth underflowed");
-
-        if outermost {
-            assert!(
-                previous_depth == 1,
-                "outermost critical section release observed nested depth {previous_depth}"
-            );
-            CRITICAL_SECTION_OWNER.store(0, Ordering::Release);
-        }
-
-        if interrupts_were_enabled {
-            x86_64::instructions::interrupts::enable();
-        }
+        unsafe { CRITICAL_SECTION_STATE.release::<X86InterruptOps>(restore_state) }
     }
-}
-
-const fn critical_section_token(interrupts_were_enabled: bool, outermost: bool) -> usize {
-    (interrupts_were_enabled as usize) | ((outermost as usize) << 1)
-}
-
-const fn critical_section_restore_interrupts(token: usize) -> bool {
-    token & CRITICAL_SECTION_RESTORE_INTERRUPTS_BIT != 0
-}
-
-const fn critical_section_is_outermost(token: usize) -> bool {
-    token & CRITICAL_SECTION_OUTERMOST_BIT != 0
-}
-
-fn critical_section_owner() -> usize {
-    let runtime = smp::current_runtime_address();
-    if runtime != 0 {
-        return runtime;
-    }
-
-    1
 }
 
 #[unsafe(no_mangle)]
@@ -925,22 +890,22 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 extern "C" fn wasmtime_tls_get() -> *mut u8 {
     smp::current_runtime()
         .wasmtime_tls
-        .load(core::sync::atomic::Ordering::Acquire)
+        .load(Ordering::Acquire)
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_tls_set(ptr: *mut u8) {
     smp::current_runtime()
         .wasmtime_tls
-        .store(ptr, core::sync::atomic::Ordering::Release);
+        .store(ptr, Ordering::Release);
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_init_traps(handler: helios_kernel::KernelNativeTrapHandler) -> i32 {
-    WASMTIME_NATIVE_TRAP_HANDLER.store(handler as usize, core::sync::atomic::Ordering::Release);
+    WASMTIME_NATIVE_TRAP_HANDLER.store(handler as usize, Ordering::Release);
     smp::current_runtime()
         .native_trap_handler
-        .store(handler as usize, core::sync::atomic::Ordering::Release);
+        .store(handler as usize, Ordering::Release);
     0
 }
 

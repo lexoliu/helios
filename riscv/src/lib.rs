@@ -132,8 +132,8 @@ const UNINITIALIZED_BOOT_HART: usize = usize::MAX;
 const SSTATUS_SPP_BIT: usize = 1 << 8;
 
 static BOOT_HART_ID: AtomicUsize = AtomicUsize::new(UNINITIALIZED_BOOT_HART);
-static CRITICAL_SECTION_OWNER: AtomicUsize = AtomicUsize::new(0);
-static CRITICAL_SECTION_DEPTH: AtomicUsize = AtomicUsize::new(0);
+static CRITICAL_SECTION_STATE: helios_hal::critical_section::CriticalSectionState =
+    helios_hal::critical_section::CriticalSectionState::new();
 static WASMTIME_NATIVE_TRAP_HANDLER: AtomicUsize = AtomicUsize::new(0);
 static DEBUG_STATE: Once<debug_state::RuntimeState> = Once::new();
 static WATCHDOG_STATE: Once<watchdog::RiscvWatchdog> = Once::new();
@@ -241,58 +241,46 @@ extern "C" fn compute_task_returned() -> ! {
     panic!("compute task returned unexpectedly");
 }
 
+struct SupervisorInterruptOps;
+
+impl helios_hal::critical_section::InterruptOps for SupervisorInterruptOps {
+    fn interrupts_enabled() -> bool {
+        riscv::register::sstatus::read().sie()
+    }
+
+    fn disable_interrupts() {
+        riscv::interrupt::supervisor::disable();
+    }
+
+    unsafe fn enable_interrupts() {
+        unsafe { riscv::interrupt::supervisor::enable() };
+    }
+
+    fn current_owner() -> usize {
+        let runtime = read_hart_runtime();
+        if runtime != 0 {
+            return runtime;
+        }
+
+        // Before hart-local runtime state is installed, the kernel has not yet
+        // started using any shared async synchronization primitives. Use a stable
+        // bootstrap sentinel in that narrow window so early critical sections still
+        // function without requiring M-mode-only hart-id registers.
+        1
+    }
+}
+
 struct SupervisorCriticalSection;
 
 critical_section::set_impl!(SupervisorCriticalSection);
 
 unsafe impl critical_section::Impl for SupervisorCriticalSection {
     unsafe fn acquire() -> usize {
-        let interrupts_were_enabled = riscv::register::sstatus::read().sie();
-        riscv::interrupt::supervisor::disable();
-        compiler_fence(Ordering::SeqCst);
-
-        let owner = critical_section_owner();
-        loop {
-            match CRITICAL_SECTION_OWNER.compare_exchange(
-                0,
-                owner,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    CRITICAL_SECTION_DEPTH.store(1, Ordering::Relaxed);
-                    return critical_section_token(interrupts_were_enabled, true);
-                }
-                Err(current) if current == owner => {
-                    let depth = CRITICAL_SECTION_DEPTH.fetch_add(1, Ordering::Relaxed);
-                    assert!(depth != usize::MAX, "critical section nesting overflowed");
-                    return critical_section_token(interrupts_were_enabled, false);
-                }
-                Err(_) => core::hint::spin_loop(),
-            }
-        }
+        unsafe { CRITICAL_SECTION_STATE.acquire::<SupervisorInterruptOps>() }
     }
 
     unsafe fn release(restore_state: usize) {
-        compiler_fence(Ordering::SeqCst);
-        let interrupts_were_enabled = critical_section_restore_interrupts(restore_state);
-        let outermost = critical_section_is_outermost(restore_state);
-        let previous_depth = CRITICAL_SECTION_DEPTH.fetch_sub(1, Ordering::Relaxed);
-        assert!(previous_depth != 0, "critical section depth underflowed");
-
-        if outermost {
-            assert!(
-                previous_depth == 1,
-                "outermost critical section release observed nested depth {previous_depth}"
-            );
-            CRITICAL_SECTION_OWNER.store(0, Ordering::Release);
-        }
-
-        if interrupts_were_enabled {
-            unsafe {
-                riscv::interrupt::supervisor::enable();
-            }
-        }
+        unsafe { CRITICAL_SECTION_STATE.release::<SupervisorInterruptOps>(restore_state) }
     }
 }
 
@@ -727,34 +715,6 @@ fn remember_bootstrap_hart(current_hart: usize) -> ProcessorId {
         Ok(_) => ProcessorId::new(current_hart as u16),
         Err(bootstrap_hart) => ProcessorId::new(bootstrap_hart as u16),
     }
-}
-
-const CRITICAL_SECTION_RESTORE_INTERRUPTS_BIT: usize = 1;
-const CRITICAL_SECTION_OUTERMOST_BIT: usize = 1 << 1;
-
-const fn critical_section_token(interrupts_were_enabled: bool, outermost: bool) -> usize {
-    (interrupts_were_enabled as usize) | ((outermost as usize) << 1)
-}
-
-const fn critical_section_restore_interrupts(token: usize) -> bool {
-    token & CRITICAL_SECTION_RESTORE_INTERRUPTS_BIT != 0
-}
-
-const fn critical_section_is_outermost(token: usize) -> bool {
-    token & CRITICAL_SECTION_OUTERMOST_BIT != 0
-}
-
-fn critical_section_owner() -> usize {
-    let runtime = read_hart_runtime();
-    if runtime != 0 {
-        return runtime;
-    }
-
-    // Before hart-local runtime state is installed, the kernel has not yet
-    // started using any shared async synchronization primitives. Use a stable
-    // bootstrap sentinel in that narrow window so early critical sections still
-    // function without requiring M-mode-only hart-id registers.
-    1
 }
 
 fn release_early_boot_harts() {
