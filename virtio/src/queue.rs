@@ -1,5 +1,4 @@
 use alloc::boxed::Box;
-use alloc::vec;
 use core::alloc::Layout;
 use core::mem::size_of;
 use core::sync::atomic::{Ordering, fence};
@@ -59,7 +58,7 @@ impl<T: VirtioTransport> VirtQueue<T> {
         let descriptors = dma.allocate_zeroed(descriptor_layout)?;
         let driver_area = dma.allocate_zeroed(driver_layout)?;
         let device_area = dma.allocate_zeroed(device_layout)?;
-        let mut desc_shadow = vec![Descriptor::default(); usize::from(size)].into_boxed_slice();
+        let mut desc_shadow: Box<[Descriptor]> = (0..size).map(|_| Descriptor::default()).collect();
 
         for index in 0..(size - 1) {
             desc_shadow[usize::from(index)].next = index + 1;
