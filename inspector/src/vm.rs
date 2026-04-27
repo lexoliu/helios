@@ -6,6 +6,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context as _, Result};
+use askama::Template;
 use clap::{Args as ClapArgs, Subcommand, ValueEnum};
 use console::style;
 use directories::ProjectDirs;
@@ -717,7 +718,7 @@ fn run_aot_bench(client: crate::serial::RpcClient, command: AotBenchCommand) -> 
         }
         for iteration in 1..=command.iterations {
             let started = std::time::Instant::now();
-            let result = system_programs::aot(
+            let outcome = system_programs::aot(
                 &client,
                 &system_programs::AotRequest {
                     source_path: command.remote_path.clone(),
@@ -729,6 +730,13 @@ fn run_aot_bench(client: crate::serial::RpcClient, command: AotBenchCommand) -> 
             .await
             .with_context(|| {
                 format!("failed to AOT compile uploaded wasm iteration {iteration}")
+            })?;
+            let result = outcome.map_err(|error| {
+                anyhow::anyhow!(
+                    "remote AOT iteration {iteration} failed: {:?}: {}",
+                    error.kind,
+                    error.detail
+                )
             })?;
             let elapsed = started.elapsed();
             let mut stdout = std::io::stdout().lock();
@@ -789,12 +797,23 @@ fn write_profile_output(
     Ok(())
 }
 
+#[derive(Template)]
+#[template(path = "folded_profile.txt", escape = "none")]
+struct FoldedProfileTemplate {
+    lines: Vec<FoldedProfileLine>,
+}
+
+struct FoldedProfileLine {
+    stack: String,
+    weight: u64,
+}
+
 fn diff_folded_profile(
     before: &[system_profiling::FoldedSample],
     after: &[system_profiling::FoldedSample],
     scope: Option<system_profiling::Scope>,
 ) -> String {
-    let mut lines = after
+    let mut lines: Vec<FoldedProfileLine> = after
         .iter()
         .filter(|sample| scope.is_none_or(|scope| sample.scope == scope))
         .filter_map(|sample| {
@@ -804,18 +823,16 @@ fn diff_folded_profile(
                 .map(|before| before.weight)
                 .unwrap_or(0);
             let weight = sample.weight.saturating_sub(previous);
-            (weight != 0).then_some((sample.stack.clone(), weight))
+            (weight != 0).then_some(FoldedProfileLine {
+                stack: sample.stack.clone(),
+                weight,
+            })
         })
-        .collect::<Vec<_>>();
-    lines.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut output = String::new();
-    for (stack, weight) in lines {
-        output.push_str(&stack);
-        output.push(' ');
-        output.push_str(&weight.to_string());
-        output.push('\n');
-    }
-    output
+        .collect();
+    lines.sort_by(|left, right| left.stack.cmp(&right.stack));
+    FoldedProfileTemplate { lines }
+        .render()
+        .expect("folded profile template rendering is infallible")
 }
 
 fn prepare_boot_artifact(

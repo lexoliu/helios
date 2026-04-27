@@ -1,6 +1,6 @@
 use std::path::{Component, Path};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context as _, Result};
 use helios_inspector_protocol::debugger::programs as debugger_programs;
 use helios_inspector_protocol::system::programs::ExecResult;
 
@@ -10,7 +10,10 @@ pub(crate) const REMOTE_SHELL_PATH: &str = "/bin/dash";
 
 pub async fn exec(client: &mut RpcClient, path: &str, args: &[String]) -> Result<ExecResult> {
     let path = normalize_absolute(path)?;
-    debugger_programs::exec_path(&*client, &path, args).await
+    let outcome = debugger_programs::exec_path(&*client, &path, args)
+        .await
+        .context("failed to invoke remote programs.exec-path")?;
+    outcome.map_err(|error| anyhow::anyhow!("{:?}: {}", error.kind, error.detail))
 }
 
 fn normalize_absolute(input: &str) -> Result<String> {

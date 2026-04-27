@@ -1,14 +1,14 @@
 [package]
 name = "helios-debugger"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
 autobins = false
 
 [dependencies]
-anyhow = "1.0.100"
 futures-io = "0.3.31"
 helios-api = { path = "../../api", default-features = false, features = ["instances", "profiling", "programs", "serial", "stats", "tracing"] }
 helios-inspector-protocol = { path = "../../inspector-protocol", default-features = false, features = ["guest"] }
+thiserror = "2.0.17"
 
 [lib]
 name = "helios_debugger"
