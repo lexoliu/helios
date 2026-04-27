@@ -7,6 +7,7 @@ use crate::memory::MemoryRegion;
 
 pub mod boot;
 pub mod cpu;
+pub mod critical_section;
 pub mod device;
 pub mod fs;
 pub mod interrupt;
