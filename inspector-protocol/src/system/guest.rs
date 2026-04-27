@@ -1,12 +1,12 @@
 use std::io;
 
-use anyhow::{Context as _, Result, bail};
 use futures_io::{AsyncRead, AsyncWrite};
 use helios_api::{
     instances as host_instances, profiling as host_profiling, programs as host_programs,
     stats as host_stats, tracing as host_tracing,
 };
 
+use crate::error::DispatchError;
 use crate::wire::{Frame, read_frame, write_frame};
 
 use super::bindings::helios::system::{instances, profiling, programs, stats, tracing};
@@ -19,7 +19,7 @@ use crate::debugger::{filesystem, programs as debugger_programs};
 
 const RESPONSE_CHUNK_BYTES: usize = 64 * 1024;
 
-pub async fn serve<R, W>(mut read: R, mut write: W) -> Result<()>
+pub async fn serve<R, W>(mut read: R, mut write: W) -> Result<(), DispatchError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -31,7 +31,10 @@ where
             func,
         }) = read_frame(&mut read)
             .await
-            .context("failed to read debugger request frame")?
+            .map_err(|source| DispatchError::Io {
+                operation: "read debugger request frame",
+                source,
+            })?
         else {
             return Ok(());
         };
@@ -47,13 +50,19 @@ where
                 },
             )
             .await
-            .context("failed to reject unsupported debugger request")?;
+            .map_err(|source| DispatchError::Io {
+                operation: "reject unsupported debugger request",
+                source,
+            })?;
             continue;
         }
 
         write_frame(&mut write, &Frame::Accept { invocation })
             .await
-            .context("failed to accept debugger request stream")?;
+            .map_err(|source| DispatchError::Io {
+                operation: "accept debugger request stream",
+                source,
+            })?;
         let payload = read_root_payload(&mut read, invocation).await?;
         let response = match dispatch(&instance, &func, &payload).await {
             Ok(response) => response,
@@ -62,11 +71,14 @@ where
                     &mut write,
                     &Frame::Reject {
                         invocation,
-                        message: format!("{error:#}"),
+                        message: format!("{error}"),
                     },
                 )
                 .await
-                .context("failed to report debugger request failure")?;
+                .map_err(|source| DispatchError::Io {
+                    operation: "report debugger request failure",
+                    source,
+                })?;
                 continue;
             }
         };
@@ -80,7 +92,10 @@ where
                 },
             )
             .await
-            .context("failed to write debugger response payload")?;
+            .map_err(|source| DispatchError::Io {
+                operation: "write debugger response payload",
+                source,
+            })?;
         }
         write_frame(
             &mut write,
@@ -90,7 +105,10 @@ where
             },
         )
         .await
-        .context("failed to close debugger response stream")?;
+        .map_err(|source| DispatchError::Io {
+            operation: "close debugger response stream",
+            source,
+        })?;
     }
 }
 
@@ -109,11 +127,19 @@ fn supports_request(instance: &str, func: &str) -> bool {
         || debugger_programs::supports(instance, func)
 }
 
-async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>> {
+async fn dispatch(
+    instance: &str,
+    func: &str,
+    payload: &[u8],
+) -> Result<Vec<u8>, DispatchError> {
     match (instance, func) {
         (PROGRAMS_INSTANCE, PROGRAMS_EXEC) => {
-            let request = postcard::from_bytes::<programs::ExecRequest>(payload)
-                .context("failed to decode programs.exec request payload")?;
+            let request = postcard::from_bytes::<programs::ExecRequest>(payload).map_err(
+                |source| DispatchError::Decode {
+                    operation: "programs.exec",
+                    source,
+                },
+            )?;
             let response = host_programs::exec(host_programs::ExecRequest {
                 name: request.name,
                 args: request.args,
@@ -136,11 +162,18 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>>
                     kind: convert_launch_error_kind(error.kind),
                     detail: error.detail,
                 });
-            postcard::to_allocvec(&response).context("failed to encode programs.exec response")
+            postcard::to_allocvec(&response).map_err(|source| DispatchError::Encode {
+                operation: "programs.exec",
+                source,
+            })
         }
         (PROGRAMS_INSTANCE, PROGRAMS_AOT) => {
-            let request = postcard::from_bytes::<programs::AotRequest>(payload)
-                .context("failed to decode programs.aot request payload")?;
+            let request = postcard::from_bytes::<programs::AotRequest>(payload).map_err(
+                |source| DispatchError::Decode {
+                    operation: "programs.aot",
+                    source,
+                },
+            )?;
             let response = host_programs::aot(host_programs::AotRequest {
                 source_path: request.source_path,
                 destination_path: request.destination_path,
@@ -156,55 +189,92 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>>
                     kind: convert_launch_error_kind(error.kind),
                     detail: error.detail,
                 });
-            postcard::to_allocvec(&response).context("failed to encode programs.aot response")
+            postcard::to_allocvec(&response).map_err(|source| DispatchError::Encode {
+                operation: "programs.aot",
+                source,
+            })
         }
         (STATS_INSTANCE, STATS_SNAPSHOT) => {
             if !payload.is_empty() {
-                bail!("stats.snapshot does not accept request payload bytes");
+                return Err(DispatchError::UnexpectedPayload {
+                    operation: "stats.snapshot",
+                });
             }
             let snapshot = convert_sample(host_stats::snapshot());
-            postcard::to_allocvec(&snapshot).context("failed to encode stats snapshot response")
+            postcard::to_allocvec(&snapshot).map_err(|source| DispatchError::Encode {
+                operation: "stats.snapshot",
+                source,
+            })
         }
         (INSTANCES_INSTANCE, INSTANCES_SNAPSHOT) => {
             if !payload.is_empty() {
-                bail!("instances.snapshot does not accept request payload bytes");
+                return Err(DispatchError::UnexpectedPayload {
+                    operation: "instances.snapshot",
+                });
             }
             let snapshot = host_instances::snapshot()
                 .into_iter()
                 .map(convert_instance)
                 .collect::<Vec<_>>();
-            postcard::to_allocvec(&snapshot).context("failed to encode instances snapshot response")
+            postcard::to_allocvec(&snapshot).map_err(|source| DispatchError::Encode {
+                operation: "instances.snapshot",
+                source,
+            })
         }
         (TRACING_INSTANCE, TRACING_RECENT) => {
             let (filter, limit): (tracing::Filter, u32) = postcard::from_bytes(payload)
-                .context("failed to decode tracing.recent request payload")?;
+                .map_err(|source| DispatchError::Decode {
+                    operation: "tracing.recent",
+                    source,
+                })?;
             let events = host_tracing::recent(&convert_filter(filter), limit)
                 .into_iter()
                 .map(convert_event)
                 .collect::<Vec<_>>();
-            postcard::to_allocvec(&events).context("failed to encode tracing.recent response")
+            postcard::to_allocvec(&events).map_err(|source| DispatchError::Encode {
+                operation: "tracing.recent",
+                source,
+            })
         }
         (PROFILING_INSTANCE, PROFILING_SET_ENABLED) => {
-            let enabled = postcard::from_bytes::<bool>(payload)
-                .context("failed to decode profiling.set-enabled request payload")?;
+            let enabled = postcard::from_bytes::<bool>(payload).map_err(|source| {
+                DispatchError::Decode {
+                    operation: "profiling.set-enabled",
+                    source,
+                }
+            })?;
             host_profiling::set_enabled(enabled);
-            postcard::to_allocvec(&()).context("failed to encode profiling.set-enabled response")
+            postcard::to_allocvec(&()).map_err(|source| DispatchError::Encode {
+                operation: "profiling.set-enabled",
+                source,
+            })
         }
         (PROFILING_INSTANCE, PROFILING_CLEAR) => {
             if !payload.is_empty() {
-                bail!("profiling.clear does not accept request payload bytes");
+                return Err(DispatchError::UnexpectedPayload {
+                    operation: "profiling.clear",
+                });
             }
             host_profiling::clear();
-            postcard::to_allocvec(&()).context("failed to encode profiling.clear response")
+            postcard::to_allocvec(&()).map_err(|source| DispatchError::Encode {
+                operation: "profiling.clear",
+                source,
+            })
         }
         (PROFILING_INSTANCE, PROFILING_FOLDED) => {
             let (filter, limit): (profiling::Filter, u32) = postcard::from_bytes(payload)
-                .context("failed to decode profiling.folded request payload")?;
+                .map_err(|source| DispatchError::Decode {
+                    operation: "profiling.folded",
+                    source,
+                })?;
             let samples = host_profiling::folded(&convert_profile_filter(filter), limit)
                 .into_iter()
                 .map(convert_profile_sample)
                 .collect::<Vec<_>>();
-            postcard::to_allocvec(&samples).context("failed to encode profiling.folded response")
+            postcard::to_allocvec(&samples).map_err(|source| DispatchError::Encode {
+                operation: "profiling.folded",
+                source,
+            })
         }
         _ if filesystem::supports(instance, func) => filesystem::dispatch(func, payload).await,
         _ if debugger_programs::supports(instance, func) => {
@@ -238,30 +308,30 @@ fn convert_launch_error_kind(kind: host_programs::ExecErrorKind) -> programs::Ex
     }
 }
 
-async fn read_root_payload<R>(read: &mut R, invocation: u32) -> Result<Vec<u8>>
+async fn read_root_payload<R>(read: &mut R, invocation: u32) -> Result<Vec<u8>, DispatchError>
 where
     R: AsyncRead + Unpin,
 {
     let mut payload = Vec::new();
     loop {
-        match read_frame(read)
-            .await
-            .context("failed to read request payload frame")?
-        {
+        match read_frame(read).await.map_err(|source| DispatchError::Io {
+            operation: "read request payload frame",
+            source,
+        })? {
             Some(Frame::Data {
                 invocation: frame_invocation,
                 path,
                 payload: chunk,
             }) => {
                 if frame_invocation != invocation {
-                    bail!(
-                        "received payload for invocation {} while reading {}",
-                        frame_invocation,
-                        invocation
-                    );
+                    return Err(DispatchError::protocol(format!(
+                        "received payload for invocation {frame_invocation} while reading {invocation}"
+                    )));
                 }
                 if !path.is_empty() {
-                    bail!("nested request stream paths are unsupported in the guest debugger");
+                    return Err(DispatchError::protocol(
+                        "nested request stream paths are unsupported in the guest debugger",
+                    ));
                 }
                 payload.extend_from_slice(&chunk);
             }
@@ -270,26 +340,30 @@ where
                 path,
             }) => {
                 if frame_invocation != invocation {
-                    bail!(
-                        "received close for invocation {} while reading {}",
-                        frame_invocation,
-                        invocation
-                    );
+                    return Err(DispatchError::protocol(format!(
+                        "received close for invocation {frame_invocation} while reading {invocation}"
+                    )));
                 }
                 if !path.is_empty() {
-                    bail!("nested request stream paths are unsupported in the guest debugger");
+                    return Err(DispatchError::protocol(
+                        "nested request stream paths are unsupported in the guest debugger",
+                    ));
                 }
                 return Ok(payload);
             }
             Some(Frame::Reject { .. } | Frame::Accept { .. } | Frame::Open { .. }) => {
-                bail!("unexpected control frame while reading debugger request payload");
+                return Err(DispatchError::protocol(
+                    "unexpected control frame while reading debugger request payload",
+                ));
             }
             None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "transport closed while reading debugger request payload",
-                )
-                .into());
+                return Err(DispatchError::Io {
+                    operation: "read debugger request payload",
+                    source: io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "transport closed while reading debugger request payload",
+                    ),
+                });
             }
         }
     }

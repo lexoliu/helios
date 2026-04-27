@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::task::{Context, Poll};
 
-use anyhow::{Context as _, Result, anyhow, bail};
 use bytes::Bytes;
 use futures_core::Stream;
 use futures_io::{AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite};
@@ -14,11 +13,20 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, Re
 use tokio::sync::{Mutex, mpsc};
 use wrpc_transport::{Index, Invoke, Serve};
 
+use crate::error::TransportError;
 use crate::wire::{Frame, read_frame, write_frame};
 
+/// Transport-level result with structured error provenance.
+///
+/// `wrpc_transport::{Invoke, Serve, Index}` are upstream contracts that
+/// return `anyhow::Result`; those impls remain spelled with `anyhow::Result`
+/// while every internal helper and the inherent `Client` API uses
+/// [`TransportError`] for typed propagation.
+pub type Result<T> = core::result::Result<T, TransportError>;
+
 type IoFuture<T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send + 'static>>;
-type ServeFuture = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
-type InvocationAccept<R, W> = Result<((), Outgoing<R, W>, Incoming<R, W>)>;
+type ServeFuture = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'static>>;
+type InvocationAccept<R, W> = anyhow::Result<((), Outgoing<R, W>, Incoming<R, W>)>;
 const RAW_UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Default)]
@@ -150,21 +158,24 @@ where
         let chunk_bytes = chunk_bytes.max(1);
         let paths: [Box<[Option<usize>]>; 0] = [];
         let (mut outgoing, mut incoming) =
-            Invoke::invoke(self, (), instance, func, Bytes::new(), paths).await?;
+            Invoke::invoke(self, (), instance, func, Bytes::new(), paths)
+                .await
+                .map_err(extract_transport_error)?;
         for chunk in payload.chunks(chunk_bytes) {
-            outgoing.write_all(chunk).await.with_context(|| {
-                format!("failed to stream raw request payload for {instance}.{func}")
-            })?;
+            outgoing
+                .write_all(chunk)
+                .await
+                .map_err(|source| TransportError::io("stream raw request payload", source))?;
         }
         outgoing
             .shutdown()
             .await
-            .context("failed to close raw request channel")?;
+            .map_err(|source| TransportError::io("close raw request channel", source))?;
         let mut response = Vec::new();
         incoming
             .read_to_end(&mut response)
             .await
-            .context("failed to read raw response channel")?;
+            .map_err(|source| TransportError::io("read raw response channel", source))?;
         Ok(response)
     }
 
@@ -218,7 +229,7 @@ where
         func: &str,
         params: Bytes,
         _paths: impl AsRef<[P]> + Send,
-    ) -> Result<(Self::Outgoing, Self::Incoming)>
+    ) -> anyhow::Result<(Self::Outgoing, Self::Incoming)>
     where
         P: AsRef<[Option<usize>]> + Send + Sync,
     {
@@ -235,24 +246,24 @@ where
                 },
             )
             .await
-            .with_context(|| format!("failed to open remote invocation {instance}.{func}"))?;
+            .map_err(|source| TransportError::io("open remote invocation", source))?;
         }
 
         loop {
             if let Some(reply) = take_reply(&self.inner.replies, id) {
                 match reply {
                     Reply::Accept => break,
-                    Reply::Reject(message) => return Err(anyhow!(message)),
+                    Reply::Reject(message) => {
+                        return Err(TransportError::Rejected(message).into());
+                    }
                 }
             }
             if is_closed(&self.inner.closed) {
-                bail!("transport closed unexpectedly");
+                return Err(TransportError::Closed.into());
             }
             pump_client_once(self.inner.clone())
                 .await
-                .with_context(|| {
-                    format!("failed to read remote invocation reply for {instance}.{func}")
-                })?;
+                .map_err(|source| TransportError::io("read remote invocation reply", source))?;
         }
 
         if !params.is_empty() {
@@ -260,8 +271,8 @@ where
                 .clone()
                 .write_data(Vec::new(), params)
                 .await
-                .with_context(|| {
-                    format!("failed to transmit synchronous parameters for {instance}.{func}")
+                .map_err(|source| {
+                    TransportError::io("transmit synchronous parameters", source)
                 })?;
         }
 
@@ -286,8 +297,10 @@ where
         instance: &str,
         func: &str,
         _paths: impl Into<Arc<[Box<[Option<usize>]>]>> + Send,
-    ) -> Result<impl Stream<Item = Result<(Self::Context, Self::Outgoing, Self::Incoming)>> + 'static>
-    {
+    ) -> anyhow::Result<
+        impl Stream<Item = anyhow::Result<(Self::Context, Self::Outgoing, Self::Incoming)>>
+            + 'static,
+    > {
         let key = (instance.to_owned(), func.to_owned());
         let (tx, rx) = mpsc::channel(8);
         let previous = self
@@ -511,7 +524,7 @@ impl<R, W> Outgoing<R, W> {
 }
 
 impl<R, W> Index<Self> for Incoming<R, W> {
-    fn index(&self, path: &[usize]) -> Result<Self> {
+    fn index(&self, path: &[usize]) -> anyhow::Result<Self> {
         assert!(!path.is_empty(), "incoming indexed path must not be empty");
         Ok(Self {
             invocation: self.invocation.clone(),
@@ -522,7 +535,7 @@ impl<R, W> Index<Self> for Incoming<R, W> {
 }
 
 impl<R, W> Index<Self> for Outgoing<R, W> {
-    fn index(&self, path: &[usize]) -> Result<Self> {
+    fn index(&self, path: &[usize]) -> anyhow::Result<Self> {
         assert!(!path.is_empty(), "outgoing indexed path must not be empty");
         Ok(Self {
             invocation: self.invocation.clone(),
@@ -719,7 +732,7 @@ where
     R: FuturesAsyncRead + Send + Unpin + 'static,
     W: FuturesAsyncWrite + Send + Unpin + 'static,
 {
-    type Item = Result<((), Outgoing<R, W>, Incoming<R, W>)>;
+    type Item = anyhow::Result<((), Outgoing<R, W>, Incoming<R, W>)>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -932,7 +945,7 @@ where
     Ok(())
 }
 
-async fn pump_server_once<R, W>(server: Arc<ServerInner<R, W>>) -> Result<()>
+async fn pump_server_once<R, W>(server: Arc<ServerInner<R, W>>) -> anyhow::Result<()>
 where
     R: FuturesAsyncRead + Send + Unpin + 'static,
     W: FuturesAsyncWrite + Send + Unpin + 'static,
@@ -975,8 +988,8 @@ where
                             let mut io = server.write.lock().await;
                             write_frame(&mut *io, &Frame::Accept { invocation })
                                 .await
-                                .with_context(|| {
-                                    format!("failed to accept remote invocation {instance}.{func}")
+                                .map_err(|source| {
+                                    TransportError::io("accept remote invocation", source)
                                 })?;
                         }
 
@@ -1002,8 +1015,8 @@ where
                             },
                         )
                         .await
-                        .with_context(|| {
-                            format!("failed to reject remote invocation {instance}.{func}")
+                        .map_err(|source| {
+                            TransportError::io("reject remote invocation", source)
                         })?;
                         None
                     }
@@ -1027,7 +1040,7 @@ where
                 None
             }
             Frame::Accept { .. } | Frame::Reject { .. } => {
-                bail!("server transport received unexpected reply frame");
+                return Err(TransportError::UnexpectedReply.into());
             }
         }
     };
@@ -1037,7 +1050,7 @@ where
             .tx
             .send(invocation)
             .await
-            .with_context(|| format!("handler queue for {instance}.{func} was closed"))?;
+            .map_err(|_| TransportError::HandoffClosed { instance, func })?;
     }
 
     Ok(())
@@ -1086,6 +1099,21 @@ impl<R, W> FrameWriter<W> for ClientInner<R, W> {
 impl<R, W> FrameWriter<W> for ServerInner<R, W> {
     fn write(&self) -> &Arc<Mutex<W>> {
         &self.write
+    }
+}
+
+/// Strip the wrpc-coupled `anyhow::Error` back into a typed `TransportError`.
+///
+/// `wrpc_transport::Invoke::invoke` returns `anyhow::Result` upstream, so our
+/// own impl wraps `TransportError` into `anyhow::Error` and inherent helpers
+/// downcast back to recover the typed contract.
+fn extract_transport_error(error: anyhow::Error) -> TransportError {
+    match error.downcast::<TransportError>() {
+        Ok(transport) => transport,
+        Err(other) => TransportError::Io {
+            operation: "wrpc invoke",
+            source: io::Error::other(other.to_string()),
+        },
     }
 }
 
