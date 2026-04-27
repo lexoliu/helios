@@ -66,6 +66,15 @@ pub trait ComponentRuntimeState: Clone + Send + 'static {
     fn uptime_nanos(&self, current_ticks: u64) -> u64;
 
     fn record_console_text(&self, current_ticks: u64, text: &str);
+
+    fn profiling_enabled(&self) -> bool;
+
+    fn record_profile_stack_nanos(
+        &self,
+        scope: crate::ProfileScope,
+        stack: String,
+        weight_nanos: u64,
+    );
 }
 
 pub(crate) struct ComponentExecutionContext<FileSystem> {
@@ -306,7 +315,17 @@ where
     }
 
     pub fn record_transition(&mut self, transition: InstanceExecutionTransition) {
-        record_instance_transition(self.instance(), transition, self.now_nanos());
+        let now_nanos = self.now_nanos();
+        let elapsed = record_instance_transition(self.instance(), transition, now_nanos);
+        if let Some(elapsed) = elapsed
+            && self.runtime_state.profiling_enabled()
+        {
+            self.runtime_state.record_profile_stack_nanos(
+                crate::ProfileScope::User,
+                alloc::format!("user;{}", self.instance().name()),
+                elapsed,
+            );
+        }
     }
 }
 

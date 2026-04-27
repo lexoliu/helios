@@ -111,7 +111,8 @@ fn compile(request: CompileRequest<'_>) -> u32 {
         enable_compiler_timing_log();
     }
     let started = request.profile.then(Instant::now);
-    match precompile_artifact(request.wasm, request.target, request.hint) {
+    let result = precompile_artifact(request.wasm, request.target, request.hint);
+    match result {
         Ok(artifact) => {
             let output_kind = match artifact.kind {
                 PrecompiledArtifactKind::CoreModule => OutputKind::CoreModule,
@@ -141,6 +142,7 @@ fn enable_compiler_timing_log() {
 
 fn compiler_timing_report(started: Instant, output_kind: OutputKind, output_len: usize) -> String {
     let elapsed = started.elapsed();
+    let _ = cranelift_codegen::timing::publish_current();
     let pass_times = cranelift_codegen::timing::take_global();
     format!(
         "INFO [helios_compiler_plugin] profile total_ms={} output_kind={output_kind:?} output_len={output_len}\n{pass_times}",

@@ -178,8 +178,8 @@ pub fn record_instance_transition(
     instance: &RegisteredInstance,
     transition: InstanceExecutionTransition,
     now_nanos: u64,
-) {
-    instance.transition(transition, now_nanos);
+) -> Option<u64> {
+    instance.transition(transition, now_nanos)
 }
 
 pub fn allow_instance_resource_growth(
@@ -213,9 +213,16 @@ impl RegisteredInstance {
             .store(memory_bytes, Ordering::Release);
     }
 
-    pub fn transition(&self, transition: InstanceExecutionTransition, now_nanos: u64) {
+    pub fn transition(
+        &self,
+        transition: InstanceExecutionTransition,
+        now_nanos: u64,
+    ) -> Option<u64> {
         match transition {
-            InstanceExecutionTransition::Resume => self.entry.resume(now_nanos),
+            InstanceExecutionTransition::Resume => {
+                self.entry.resume(now_nanos);
+                None
+            }
             InstanceExecutionTransition::Pause => self.entry.pause(now_nanos),
         }
     }
@@ -260,7 +267,7 @@ impl InstanceEntry {
         }
     }
 
-    fn pause(&self, now_nanos: u64) {
+    fn pause(&self, now_nanos: u64) -> Option<u64> {
         let previous_depth = self.active_depth.fetch_sub(1, Ordering::AcqRel);
         assert!(
             previous_depth != 0,
@@ -277,9 +284,11 @@ impl InstanceEntry {
                 "instance {} lost its resume timestamp",
                 self.name
             );
-            self.active_nanos
-                .fetch_add(now_nanos.saturating_sub(resumed_at), Ordering::AcqRel);
+            let elapsed = now_nanos.saturating_sub(resumed_at);
+            self.active_nanos.fetch_add(elapsed, Ordering::AcqRel);
+            return Some(elapsed);
         }
+        None
     }
 }
 

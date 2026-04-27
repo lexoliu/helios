@@ -383,6 +383,14 @@ struct AotBenchCommand {
     /// Write folded kernel/user profile samples collected during the AOT run.
     #[arg(long)]
     profile_output: Option<PathBuf>,
+
+    /// Write folded kernel-only profile samples collected during the AOT run.
+    #[arg(long)]
+    kernel_profile_output: Option<PathBuf>,
+
+    /// Write folded user-only profile samples collected during the AOT run.
+    #[arg(long)]
+    user_profile_output: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -680,7 +688,10 @@ fn run_aot_bench(client: crate::serial::RpcClient, command: AotBenchCommand) -> 
             scope: None,
             stack_prefixes: Vec::new(),
         };
-        let before_profile = if command.profile_output.is_some() {
+        let collect_profile = command.profile_output.is_some()
+            || command.kernel_profile_output.is_some()
+            || command.user_profile_output.is_some();
+        let before_profile = if collect_profile {
             system_profiling::clear(&client)
                 .await
                 .context("failed to clear remote profile samples")?;
@@ -728,29 +739,64 @@ fn run_aot_bench(client: crate::serial::RpcClient, command: AotBenchCommand) -> 
                 result.destination_path
             )?;
         }
-        if let Some(output) = command.profile_output {
+        if collect_profile {
             system_profiling::set_enabled(&client, false)
                 .await
                 .context("failed to disable remote profiling")?;
             let after_profile = system_profiling::folded(&client, &profile_filter, 0)
                 .await
                 .context("failed to read final remote profile samples")?;
-            let folded = diff_folded_profile(before_profile, after_profile);
-            fs::write(&output, folded)
+            if let Some(output) = command.profile_output {
+                write_profile_output(&output, &before_profile, &after_profile, None)
+                    .with_context(|| format!("failed to write {}", output.display()))?;
+                let mut stdout = std::io::stdout().lock();
+                writeln!(stdout, "profile_output={}", output.display())?;
+            }
+            if let Some(output) = command.kernel_profile_output {
+                write_profile_output(
+                    &output,
+                    &before_profile,
+                    &after_profile,
+                    Some(system_profiling::Scope::Kernel),
+                )
                 .with_context(|| format!("failed to write {}", output.display()))?;
-            let mut stdout = std::io::stdout().lock();
-            writeln!(stdout, "profile_output={}", output.display())?;
+                let mut stdout = std::io::stdout().lock();
+                writeln!(stdout, "kernel_profile_output={}", output.display())?;
+            }
+            if let Some(output) = command.user_profile_output {
+                write_profile_output(
+                    &output,
+                    &before_profile,
+                    &after_profile,
+                    Some(system_profiling::Scope::User),
+                )
+                .with_context(|| format!("failed to write {}", output.display()))?;
+                let mut stdout = std::io::stdout().lock();
+                writeln!(stdout, "user_profile_output={}", output.display())?;
+            }
         }
         Ok(())
     })
 }
 
+fn write_profile_output(
+    output: &Path,
+    before: &[system_profiling::FoldedSample],
+    after: &[system_profiling::FoldedSample],
+    scope: Option<system_profiling::Scope>,
+) -> Result<()> {
+    fs::write(output, diff_folded_profile(before, after, scope))?;
+    Ok(())
+}
+
 fn diff_folded_profile(
-    before: Vec<system_profiling::FoldedSample>,
-    after: Vec<system_profiling::FoldedSample>,
+    before: &[system_profiling::FoldedSample],
+    after: &[system_profiling::FoldedSample],
+    scope: Option<system_profiling::Scope>,
 ) -> String {
     let mut lines = after
-        .into_iter()
+        .iter()
+        .filter(|sample| scope.is_none_or(|scope| sample.scope == scope))
         .filter_map(|sample| {
             let previous = before
                 .iter()
@@ -758,7 +804,7 @@ fn diff_folded_profile(
                 .map(|before| before.weight)
                 .unwrap_or(0);
             let weight = sample.weight.saturating_sub(previous);
-            (weight != 0).then_some((sample.stack, weight))
+            (weight != 0).then_some((sample.stack.clone(), weight))
         })
         .collect::<Vec<_>>();
     lines.sort_by(|left, right| left.0.cmp(&right.0));

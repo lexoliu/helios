@@ -77,6 +77,8 @@ where
 {
     cpu: CpuImpl,
     spawner: crate::Spawner<CpuImpl>,
+    runtime_state: HostRuntimeState<CpuImpl, HostFs>,
+    instance: Arc<crate::RegisteredInstance>,
     shared: Arc<CompilerCoreShared<CompilerCoreStore<CpuImpl, HostFs>>>,
     write_serial: fn(&[u8]),
     _marker: core::marker::PhantomData<fn() -> HostFs>,
@@ -777,9 +779,17 @@ where
             next_thread_id: AtomicI32::new(0),
         });
         add_compiler_core_imports(&mut linker, shared_memory.clone())?;
+        let started_at = exec_context
+            .runtime_state
+            .uptime_nanos(exec_context.cpu.now().ticks());
+        let compiler_instance = exec_context
+            .instance_registry
+            .register("compiler-plugin", started_at);
         let store_data = CompilerCoreStore {
             cpu: exec_context.cpu.clone(),
             spawner: exec_context.spawner.clone(),
+            runtime_state: exec_context.runtime_state.clone(),
+            instance: Arc::new(compiler_instance),
             shared: shared.clone(),
             write_serial: exec_context.write_serial,
             _marker: core::marker::PhantomData,
@@ -857,15 +867,22 @@ where
                 core::mem::size_of::<CompilerRequestHeader>(),
             )
         })?;
-        let response_ptr = compile
-            .call(
-                &mut store,
-                (
-                    request_ptr as i32,
-                    core::mem::size_of::<CompilerRequestHeader>() as i32,
-                ),
-            )
-            .map_err(map_program_runtime_error)? as u32;
+        let compile_started = store.data().cpu.now().ticks();
+        let response_ptr = compile.call(
+            &mut store,
+            (
+                request_ptr as i32,
+                core::mem::size_of::<CompilerRequestHeader>() as i32,
+            ),
+        );
+        let compile_elapsed = store
+            .data()
+            .cpu
+            .now()
+            .ticks()
+            .saturating_sub(compile_started);
+        store.data().record_user_ticks(compile_elapsed);
+        let response_ptr = response_ptr.map_err(map_program_runtime_error)? as u32;
         let response = read_compiler_response(store.data().memory(), response_ptr)?;
         if response.abi_version != HELIOS_COMPILER_ABI_VERSION {
             return Err(ProgramExecError {
@@ -934,6 +951,16 @@ where
 {
     fn memory(&self) -> &SharedMemory {
         &self.shared.memory
+    }
+
+    fn record_user_ticks(&self, ticks: u64) {
+        if self.runtime_state.profiling_enabled() {
+            self.runtime_state.record_profile_stack(
+                ProfileScope::User,
+                format!("user;{}", self.instance.name()),
+                ticks,
+            );
+        }
     }
 }
 
@@ -1221,11 +1248,19 @@ where
                     let mut store =
                         wasmtime::Store::new(instance_pre.module().engine(), store_data);
                     configure_compiler_core_store(&mut store);
+                    let thread_started = store.data().cpu.now().ticks();
                     let result = instance_pre.instantiate(&mut store).and_then(|instance| {
                         let start = instance
                             .get_typed_func::<(i32, i32), ()>(&mut store, "wasi_thread_start")?;
                         start.call(&mut store, (thread_id, start_arg))
                     });
+                    let thread_elapsed = store
+                        .data()
+                        .cpu
+                        .now()
+                        .ticks()
+                        .saturating_sub(thread_started);
+                    store.data().record_user_ticks(thread_elapsed);
                     if let Err(error) = result {
                         tracing::error!(thread_id, "compiler plugin thread failed: {error:#}");
                     }

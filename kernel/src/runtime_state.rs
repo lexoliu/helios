@@ -1,6 +1,5 @@
 extern crate alloc;
 
-use alloc::format;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -113,27 +112,32 @@ where
         self.inner.profiling.lock().record(scope, stack, weight);
     }
 
+    pub fn record_profile_stack_nanos(
+        &self,
+        scope: ProfileScope,
+        stack: alloc::string::String,
+        weight_nanos: u64,
+    ) {
+        if !self.inner.profiling_enabled.load(Ordering::Acquire) {
+            return;
+        }
+        self.inner
+            .profiling
+            .lock()
+            .record(scope, stack, weight_nanos);
+    }
+
     pub fn folded_profile(
         &self,
         current_ticks: u64,
         filter: &ProfileFilter,
         limit: u32,
     ) -> alloc::vec::Vec<FoldedProfileSample> {
-        let now_nanos = self.uptime_nanos(current_ticks);
-        let user_samples = self
-            .inner
-            .instance_registry
-            .active_totals(now_nanos)
-            .into_iter()
-            .map(|total| FoldedProfileSample {
-                scope: ProfileScope::User,
-                stack: format!("user;{}", total.name),
-                weight: total.active_nanos,
-            });
+        let _ = current_ticks;
         self.inner
             .profiling
             .lock()
-            .folded(filter, user_samples, limit)
+            .folded(filter, core::iter::empty(), limit)
     }
 
     pub fn ticks_to_nanos(&self, ticks: u64) -> u64 {
@@ -220,6 +224,19 @@ where
 
     fn record_console_text(&self, current_ticks: u64, text: &str) {
         RuntimeState::record_console_text(self, current_ticks, text);
+    }
+
+    fn profiling_enabled(&self) -> bool {
+        RuntimeState::profiling_enabled(self)
+    }
+
+    fn record_profile_stack_nanos(
+        &self,
+        scope: ProfileScope,
+        stack: alloc::string::String,
+        weight_nanos: u64,
+    ) {
+        RuntimeState::record_profile_stack_nanos(self, scope, stack, weight_nanos);
     }
 }
 

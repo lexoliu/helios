@@ -10,6 +10,7 @@ use crate::serial::{RpcClient, SerialIo, SerialReader};
 
 const BOOT_SYNC_TIMEOUT: Duration = Duration::from_secs(900);
 const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+const READY_DRAIN_QUIET_PERIOD: Duration = Duration::from_millis(100);
 const DEBUGGER_RUN_STAGE: &str = "run:begin";
 
 pub(crate) async fn connect_after_boot(io: SerialIo) -> Result<RpcClient> {
@@ -51,6 +52,7 @@ async fn wait_for_debugger_stage(read: &mut SerialReader) -> Result<()> {
                 if let Some(stage) = parse_stage_marker(&line)? {
                     report_stage(stage)?;
                     if stage == DEBUGGER_RUN_STAGE {
+                        drain_boot_preamble(read).await?;
                         return Ok(());
                     }
                 }
@@ -58,6 +60,21 @@ async fn wait_for_debugger_stage(read: &mut SerialReader) -> Result<()> {
             }
             b'\r' => {}
             other => line.push(other),
+        }
+    }
+}
+
+async fn drain_boot_preamble(read: &mut SerialReader) -> Result<()> {
+    loop {
+        match runtime::timeout(READY_DRAIN_QUIET_PERIOD, read_byte(read)).await {
+            Some(Ok(Some(_))) => {}
+            Some(Ok(None)) => {
+                anyhow::bail!("debug serial link closed while draining boot preamble");
+            }
+            Some(Err(error)) => {
+                return Err(error).context("failed to drain debugger boot preamble");
+            }
+            None => return Ok(()),
         }
     }
 }
