@@ -1,7 +1,7 @@
 [package]
 name = "helios-virtio"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
 
 [dependencies]
 async-lock = { version = "3.4.2", default-features = false }

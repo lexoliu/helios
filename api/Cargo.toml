@@ -1,7 +1,7 @@
 [package]
 name = "helios-api"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
 
 [features]
 default = ["channel", "fs", "io", "net", "serial", "stats", "sync", "task", "tracing"]

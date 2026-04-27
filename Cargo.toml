@@ -4,11 +4,14 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+edition = "2024"
+
 
 [package]
 name = "helios"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
 
 [workspace.dependencies]
 helios-hal = { path = "hal" }
