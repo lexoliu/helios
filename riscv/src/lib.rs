@@ -521,6 +521,21 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     let memory_regions = collect_memory_regions(fdt.memory(), allocator_window.clone());
     let current_hart = ProcessorId::new(hart_id as u16);
     let bootstrap_processor = remember_bootstrap_hart(hart_id);
+    // Bring up Sv39 paging on every hart before any allocator or
+    // driver work. The bootstrap hart populates the root table once
+    // (identity-mapping the kernel's 16 GiB physical window), then
+    // every hart writes its own `satp` to switch into paged
+    // execution. Identity mapping makes the transition transparent
+    // for kernel addresses; the user-VA window above the identity
+    // map is owned by `RiscvUserAddressSpace` for dynamic mappings.
+    if current_hart == bootstrap_processor {
+        unsafe {
+            vmm::install_kernel_paging();
+        }
+    }
+    unsafe {
+        vmm::activate_paging();
+    }
     if current_hart == bootstrap_processor {
         release_early_boot_harts();
     }
