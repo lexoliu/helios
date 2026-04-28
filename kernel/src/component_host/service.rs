@@ -52,8 +52,35 @@ where
     engine: crate::wasmtime_adapter::WasmtimeEngine,
     component_cache: Mutex<ComponentCache<WasmtimeCompiledComponent>>,
     compiler_artifact: Option<Bytes>,
+    /// Lazily-built compiler kernel-plugin runtime. The plugin's
+    /// `wasmtime::Module`, `InstancePre`, and 512 MiB `SharedMemory` are
+    /// allocated on first compile and reused for every subsequent call,
+    /// turning the plugin into a long-lived kernel resident — no more
+    /// per-call buddy-heap churn that previously OOM'd after one compile.
+    compiler_plugin: Mutex<Option<Arc<CompilerPluginRuntime<CpuImpl, HostFs>>>>,
+    /// Serialises compile calls. The cached `SharedMemory` is the
+    /// plugin's only scratch surface; concurrent calls would race on
+    /// the bump allocator and corrupt each other's request/response
+    /// buffers. The lock is held only on the kernel side; the rayon
+    /// worker pool inside the plugin still parallelises a single
+    /// compile across all cores.
+    compile_lock: Mutex<()>,
     clock_cpu: CpuImpl,
     _marker: core::marker::PhantomData<fn() -> HostFs>,
+}
+
+/// Cached state of the compiler kernel plugin. Building it costs one
+/// `Module::deserialize` + one `SharedMemory::new(8192 pages)` + one
+/// `Linker::instantiate_pre`; the result is reused across compile
+/// calls. Per-call work is reduced to a fresh `wasmtime::Store`,
+/// `instance_pre.instantiate`, then `initialize` / `alloc` / `compile`.
+struct CompilerPluginRuntime<CpuImpl, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    instance_pre: Arc<InstancePre<CompilerCoreStore<CpuImpl, HostFs>>>,
+    shared: Arc<CompilerCoreShared<CompilerCoreStore<CpuImpl, HostFs>>>,
 }
 
 struct ProgramSpawnRequest {
@@ -205,6 +232,8 @@ where
             engine,
             component_cache: Mutex::new(ComponentCache::new(cache_budget)),
             compiler_artifact,
+            compiler_plugin: Mutex::new(None),
+            compile_lock: Mutex::new(()),
             clock_cpu: cpu.clone(),
             _marker: core::marker::PhantomData,
         }),
@@ -746,39 +775,9 @@ where
         hint: AotCompileHint,
         profile: bool,
     ) -> Result<Vec<u8>, ProgramExecError> {
-        match WasmtimePrecompiledKind::detect(&compiler_payload) {
-            Some(WasmtimePrecompiledKind::CoreModule) => {}
-            Some(WasmtimePrecompiledKind::Component) => {
-                return Err(ProgramExecError {
-                    kind: ProgramExecErrorKind::InvalidBinary,
-                    detail:
-                        "compiler plugin is a Preview2 component; expected a Preview1 core module"
-                            .into(),
-                });
-            }
-            None => {
-                return Err(ProgramExecError {
-                    kind: ProgramExecErrorKind::InvalidBinary,
-                    detail: "compiler plugin is not a Wasmtime cwasm core module".into(),
-                });
-            }
-        }
-        let worker_threads = compiler_plugin_worker_threads(&exec_context.cpu);
-        tracing::info!(
-            worker_threads,
-            "invoking compiler plugin with Rayon worker threads"
-        );
+        let _compile_guard = self.inner.compile_lock.lock();
+        let plugin = self.ensure_compiler_plugin(exec_context, &compiler_payload)?;
         let engine = self.inner.engine.raw();
-        let module = unsafe { Module::deserialize(engine, compiler_payload.as_ref()) }
-            .map_err(map_program_runtime_error)?;
-        let mut linker: CoreLinker<CompilerCoreStore<CpuImpl, HostFs>> = CoreLinker::new(engine);
-        let shared_memory = compiler_shared_memory(engine, &module)?;
-        let shared = Arc::new(CompilerCoreShared {
-            memory: shared_memory.clone(),
-            instance_pre: spin::Once::new(),
-            next_thread_id: AtomicI32::new(0),
-        });
-        add_compiler_core_imports(&mut linker, shared_memory.clone())?;
         let started_at = exec_context
             .runtime_state
             .uptime_nanos(exec_context.cpu.now().ticks());
@@ -790,20 +789,14 @@ where
             spawner: exec_context.spawner.clone(),
             runtime_state: exec_context.runtime_state.clone(),
             instance: Arc::new(compiler_instance),
-            shared: shared.clone(),
+            shared: plugin.shared.clone(),
             write_serial: exec_context.write_serial,
             _marker: core::marker::PhantomData,
         };
         let mut store = wasmtime::Store::new(engine, store_data);
         configure_compiler_core_store(&mut store);
-        define_compiler_shared_memory(&mut linker, &store, &module, shared_memory)?;
-        let instance_pre = Arc::new(
-            linker
-                .instantiate_pre(&module)
-                .map_err(map_program_runtime_error)?,
-        );
-        shared.instance_pre.call_once(|| instance_pre.clone());
-        let instance = instance_pre
+        let instance = plugin
+            .instance_pre
             .instantiate(&mut store)
             .map_err(map_program_runtime_error)?;
         let tls_base = compiler_tls_base(&mut store, &instance)?;
@@ -926,6 +919,96 @@ where
                 kind: ProgramExecErrorKind::InvalidPath,
                 detail: format!("compiler plugin {COMPILER_PLUGIN_PATH} is not provisioned"),
             })
+    }
+
+    /// Build the compiler kernel-plugin runtime on first compile, reuse
+    /// it forever after. The cached `wasmtime::Module` + `InstancePre`
+    /// + 512 MiB `SharedMemory` are stable across calls; per-call work
+    /// drops to a fresh `wasmtime::Store` and `instance_pre.instantiate`.
+    fn ensure_compiler_plugin(
+        &self,
+        exec_context: &ProgramExecContext<CpuImpl, HostFs>,
+        compiler_payload: &Bytes,
+    ) -> Result<Arc<CompilerPluginRuntime<CpuImpl, HostFs>>, ProgramExecError> {
+        let mut slot = self.inner.compiler_plugin.lock();
+        if let Some(plugin) = slot.as_ref() {
+            return Ok(plugin.clone());
+        }
+
+        match WasmtimePrecompiledKind::detect(compiler_payload) {
+            Some(WasmtimePrecompiledKind::CoreModule) => {}
+            Some(WasmtimePrecompiledKind::Component) => {
+                return Err(ProgramExecError {
+                    kind: ProgramExecErrorKind::InvalidBinary,
+                    detail:
+                        "compiler plugin is a Preview2 component; expected a Preview1 core module"
+                            .into(),
+                });
+            }
+            None => {
+                return Err(ProgramExecError {
+                    kind: ProgramExecErrorKind::InvalidBinary,
+                    detail: "compiler plugin is not a Wasmtime cwasm core module".into(),
+                });
+            }
+        }
+
+        let worker_threads = compiler_plugin_worker_threads(&exec_context.cpu);
+        tracing::info!(
+            worker_threads,
+            "building cached compiler plugin runtime (one-time per kernel boot)"
+        );
+
+        let engine = self.inner.engine.raw();
+        let module = unsafe { Module::deserialize(engine, compiler_payload.as_ref()) }
+            .map_err(map_program_runtime_error)?;
+        let shared_memory = compiler_shared_memory(engine, &module)?;
+        let shared = Arc::new(CompilerCoreShared {
+            memory: shared_memory.clone(),
+            instance_pre: spin::Once::new(),
+            next_thread_id: AtomicI32::new(0),
+        });
+        let mut linker: CoreLinker<CompilerCoreStore<CpuImpl, HostFs>> = CoreLinker::new(engine);
+        add_compiler_core_imports(&mut linker, shared_memory.clone())?;
+
+        // `linker.define` requires an `AsContext<Data = T>`; build a
+        // throwaway store solely to satisfy that bound. The store has no
+        // role beyond `define_compiler_shared_memory`; its transient
+        // `RegisteredInstance` (named "compiler-plugin-init") deregisters
+        // on drop at the end of this method.
+        let scratch_started_at = exec_context
+            .runtime_state
+            .uptime_nanos(exec_context.cpu.now().ticks());
+        let scratch_instance = exec_context
+            .instance_registry
+            .register("compiler-plugin-init", scratch_started_at);
+        let scratch_store_data = CompilerCoreStore {
+            cpu: exec_context.cpu.clone(),
+            spawner: exec_context.spawner.clone(),
+            runtime_state: exec_context.runtime_state.clone(),
+            instance: Arc::new(scratch_instance),
+            shared: shared.clone(),
+            write_serial: exec_context.write_serial,
+            _marker: core::marker::PhantomData,
+        };
+        let scratch_store = wasmtime::Store::new(engine, scratch_store_data);
+        define_compiler_shared_memory(&mut linker, &scratch_store, &module, shared_memory)?;
+        drop(scratch_store);
+
+        let instance_pre = Arc::new(
+            linker
+                .instantiate_pre(&module)
+                .map_err(map_program_runtime_error)?,
+        );
+        shared.instance_pre.call_once(|| instance_pre.clone());
+
+        let _ = module; // InstancePre holds the Module via Arc internally.
+        let plugin = Arc::new(CompilerPluginRuntime {
+            instance_pre,
+            shared,
+        });
+        *slot = Some(plugin.clone());
+        Ok(plugin)
     }
 }
 
