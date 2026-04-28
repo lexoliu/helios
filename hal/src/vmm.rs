@@ -220,6 +220,46 @@ pub trait AddressSpace: Send + Sync + 'static {
 
     /// Look up the current state of `addr`. Lock-free.
     fn translate(&self, addr: VirtAddr) -> Translation;
+
+    /// Relocate the physical backing of an already-committed range
+    /// without changing its virtual base address.
+    ///
+    /// A complete bare-metal implementation must:
+    ///
+    /// 1. Walk the page table and snapshot the current PTE flags
+    ///    plus physical frame for every committed page in `virt`.
+    /// 2. Allocate a fresh contiguous physical run from the
+    ///    backend's PMM (not the kernel global allocator — those
+    ///    frames are unconstrained by the user-pool free list and
+    ///    may not even be reachable through the HHDM the backend
+    ///    expects). The required primitive is a per-platform
+    ///    `PhysFrameAllocator::allocate(count, zero_first_use=false)`
+    ///    that returns a contiguous `PhysFrameRange`.
+    /// 3. Copy bytes through the kernel data view of both the source
+    ///    and destination frames (HHDM on x86/aarch64,
+    ///    identity-map on riscv).
+    /// 4. Atomically swap each PTE's PPN field, preserving the
+    ///    flags captured in step 1.
+    /// 5. Issue a TLB shootdown for every covered virtual page on
+    ///    every processor that may have run in this AS — the SMP-
+    ///    correctness requirement in AGENTS §3.4. AArch64 broadcast
+    ///    `tlbi vaale1is` already fans out via the inner-shareable
+    ///    domain; x86 needs an IPI shootdown protocol on top of the
+    ///    wake-IPI infrastructure that landed in `e1fad4d`; riscv
+    ///    needs `remote_sfence_vma` SBI calls.
+    /// 6. Return the old `PhysFrameRange` to the PMM.
+    /// 7. Roll back partial work on failure: every successfully
+    ///    relocated page in this call must be reverted (rare
+    ///    error path, but `OutOfFrames` mid-range is recoverable).
+    ///
+    /// The default impl reports unsupported. Backends opt in only
+    /// after the listed prerequisites are met; today none do, and
+    /// surface that honestly rather than ship a half-correct version
+    /// that races TLBs or hands wasmtime a frame the page-fault
+    /// handler does not own.
+    fn relocate(&self, _virt: VirtRange) -> Result<(), AddressSpaceError> {
+        Err(AddressSpaceError::InvalidFlags)
+    }
 }
 
 /// Outcome of a kernel-supplied page-fault handler.

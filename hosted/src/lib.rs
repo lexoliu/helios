@@ -1,3 +1,4 @@
+mod compaction_tests;
 mod config;
 mod console;
 mod cpu;

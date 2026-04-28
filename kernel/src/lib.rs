@@ -27,6 +27,7 @@ mod host_share;
 mod instance;
 mod kernel_exception;
 mod log;
+mod compaction;
 mod observer;
 mod pmm;
 mod program_service;
@@ -137,6 +138,10 @@ pub use instance::{
 };
 pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
+};
+pub use compaction::{
+    CompactionBudget, CompactionPolicy, CompactionReport, CompactionTarget, Compactor,
+    PressureLevel,
 };
 pub use observer::{
     DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY, FoldedProfileSample,
