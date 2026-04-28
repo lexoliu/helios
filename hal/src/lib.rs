@@ -18,6 +18,7 @@ pub mod pmm;
 pub mod resource;
 pub mod serial;
 pub mod vmm;
+pub mod vmm_test_harness;
 pub mod watchdog;
 
 /// Aligns `value` up to the next multiple of `align`.

@@ -116,6 +116,13 @@ impl AddressSpace for HostedAddressSpace {
         validate_range(virt)?;
         let mut reservations = self.reservations.lock().unwrap();
         let reservation = find_reservation_mut(&mut reservations, virt)?;
+        if !reservation
+            .committed
+            .iter()
+            .any(|region| ranges_overlap(region.range, virt))
+        {
+            return Err(AddressSpaceError::NotCommitted);
+        }
         unsafe {
             #[cfg(target_os = "linux")]
             libc::madvise(virt.start.raw() as *mut _, virt.byte_len, libc::MADV_DONTNEED);
@@ -283,5 +290,14 @@ mod tests {
             address_space.release(bogus),
             Err(AddressSpaceError::NotReserved)
         );
+    }
+
+    #[test]
+    fn passes_hal_conformance_suite() {
+        use helios_hal::vmm_test_harness::{AddressSpaceFixture, run_conformance};
+        run_conformance(AddressSpaceFixture {
+            fresh: HostedAddressSpace::new,
+            verify_writes: true,
+        });
     }
 }
