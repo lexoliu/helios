@@ -1787,6 +1787,7 @@ dependencies = [
  "helios-hal",
  "helios-inspector-protocol",
  "helios-kernel",
+ "libc",
  "mimalloc",
  "tokio",
  "tokio-util",

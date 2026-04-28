@@ -3,6 +3,9 @@ mod console;
 mod cpu;
 mod host_fs;
 mod runtime;
+mod vmm;
+
+pub use vmm::HostedAddressSpace;
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
