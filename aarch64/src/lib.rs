@@ -62,6 +62,9 @@ const PL011_FLAG_TXFF: u32 = 1 << 5;
 #[cfg(target_os = "none")]
 global_asm!(include_str!("entry.S"), boot_stack_bytes = const KERNEL_STACK_BYTES);
 
+mod vmm;
+pub use vmm::Aarch64UserAddressSpace;
+
 mod debug_state {
     pub(crate) type RuntimeState = helios_kernel::HostRuntimeState<
         crate::Aarch64Cpu,
