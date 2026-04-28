@@ -295,6 +295,15 @@ impl X86PlatformState {
         ProcessorId::new(0)
     }
 
+    /// Look up the local-APIC id of the processor with the given
+    /// logical id. Used by the wake / TLB-shootdown IPI dispatch path
+    /// to address a remote core through the local APIC ICR.
+    pub(crate) fn apic_id_of(&self, processor: ProcessorId) -> Option<u32> {
+        self.processors
+            .get(processor.id() as usize)
+            .map(|slot| slot.apic_id)
+    }
+
     pub(crate) fn current_processor(&self) -> ProcessorId {
         ProcessorId::new(current_runtime().logical_id)
     }
@@ -391,6 +400,63 @@ pub(crate) fn handle_local_timer_interrupt() {
         .unwrap_or_else(|| panic!("x86 local timer interrupted before kernel timer installation"))
         .handle_interrupt();
     local_apic_eoi();
+}
+
+pub(crate) fn handle_wake_interrupt() {
+    // Wake IPI carries no payload; receiving it is sufficient to
+    // bring the processor out of HLT and back into the kernel
+    // run loop. Just ack and return.
+    local_apic_eoi();
+}
+
+/// Send a wake IPI to the processor with the given local-APIC id.
+///
+/// The receiver runs the wake interrupt handler (`local_apic_eoi`-only)
+/// and falls out of HLT in `Cpu::park_current`, ready to pick up
+/// newly runnable kernel tasks. The function picks the appropriate
+/// APIC mode (X2APIC / XAPIC) and constructs the corresponding ICR
+/// internally.
+pub(crate) fn send_wake_ipi(target_apic_id: u32) {
+    use x86::apic::{
+        ApicControl, ApicId, DeliveryMode, DeliveryStatus, DestinationMode,
+        DestinationShorthand, Icr, Level, TriggerMode,
+    };
+    let runtime = current_runtime();
+    match local_apic_mode(target_apic_id) {
+        LocalApicMode::X2Apic => {
+            let mut apic = X2APIC::new();
+            apic.attach();
+            let icr = Icr::for_x2apic(
+                crate::exceptions::WAKE_INTERRUPT_VECTOR,
+                ApicId::X2Apic(target_apic_id),
+                DestinationShorthand::NoShorthand,
+                DeliveryMode::Fixed,
+                DestinationMode::Physical,
+                DeliveryStatus::Idle,
+                Level::Assert,
+                TriggerMode::Edge,
+            );
+            unsafe { apic.send_ipi(icr) };
+        }
+        LocalApicMode::XApic { physical_base } => {
+            let apic_region = xapic_mmio_region(physical_base, runtime.physical_memory_offset);
+            let mut apic = XAPIC::new(apic_region);
+            apic.attach();
+            let target = u8::try_from(target_apic_id)
+                .unwrap_or_else(|_| panic!("xAPIC wake target id {target_apic_id} exceeds 8 bits"));
+            let icr = Icr::for_xapic(
+                crate::exceptions::WAKE_INTERRUPT_VECTOR,
+                ApicId::XApic(target),
+                DestinationShorthand::NoShorthand,
+                DeliveryMode::Fixed,
+                DestinationMode::Physical,
+                DeliveryStatus::Idle,
+                Level::Assert,
+                TriggerMode::Edge,
+            );
+            unsafe { apic.send_ipi(icr) };
+        }
+    }
 }
 
 fn enable_local_scheduler_timer(vector: u8) {

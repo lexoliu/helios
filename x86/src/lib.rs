@@ -485,7 +485,16 @@ impl Cpu for X86Cpu {
     }
 
     fn park_current(&self) {
-        core::hint::spin_loop();
+        // HLT halts the CPU until any unmasked interrupt fires. The
+        // local APIC timer always ticks at our scheduler frequency,
+        // and a remote core can drag this one out of HLT immediately
+        // by sending the wake IPI through `wake_processor`. Inside a
+        // critical section IRQs are masked and HLT would deadlock,
+        // but `park_current` is only called from the kernel run loop
+        // which never holds a critical section across the call.
+        unsafe {
+            core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
+        }
     }
 
     fn start_processor(&self, processor: ProcessorId) {
@@ -493,7 +502,11 @@ impl Cpu for X86Cpu {
             .start_processor(processor, secondary_start_rust as *const () as usize);
     }
 
-    fn wake_processor(&self, _processor: ProcessorId) {}
+    fn wake_processor(&self, processor: ProcessorId) {
+        if let Some(apic_id) = self.state.apic_id_of(processor) {
+            smp::send_wake_ipi(apic_id);
+        }
+    }
 
     fn now(&self) -> Instant {
         Instant::new(read_tsc().saturating_sub(self.state.tsc_base()))
