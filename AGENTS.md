@@ -164,6 +164,13 @@ crates.
 - Any performance test, benchmark, or acceptance measurement must run with
   optimized `--release` artifacts. Debug builds are acceptable for functional
   checks and diagnosis only; do not use them as performance evidence.
+- Every Wasmtime perf opt-in the kernel can support must stay enabled:
+  pooling instance allocation, signals-based traps, epoch interruption,
+  SIMD/threads/component-model, `async_stack_zeroing(false)`. Once the user
+  VM is real, `memory_reservation` and `memory_guard_size` must eliminate
+  wasm32 bounds checks, with `memory_init_cow(true)` and
+  `memory_may_move(false)`. Disabling any of these requires a same-PR
+  justification of the alternative semantic path.
 
 ## 3.3 Naming
 
@@ -171,6 +178,45 @@ crates.
   `cli/` rather than `helios-cli/`.
 - Package and crate names may still use the `helios-` prefix when that matches
   workspace naming conventions.
+
+## 3.4 Modern hardware and SMP-first
+
+Helios targets modern multi-core hardware. SMP correctness is a day-one
+property of every kernel and `hal/` subsystem, never a follow-up.
+
+- New abstractions state their concurrency contract before their API: which
+  ops are lock-free, which take an async mutex, which fan out to remote
+  processors. "Add SMP later" is not an acceptable design note.
+- Any address-space mutation invalidates the local TLB and dispatches an IPI
+  shootdown to every other processor that has run in that space. Skipping
+  the IPI is a regression.
+- Hot paths use per-CPU storage indexed by `Cpu::current_processor()`, and
+  cross-processor queues prefer atomics or lock-free channels over `Mutex`.
+- Hardware features that already exist on the target (XSAVE/AVX, MWAIT,
+  cache-coherent I/O, gicv3) must be brought up properly rather than
+  avoided because they need SMP-aware setup.
+
+## 3.5 Performance baselines
+
+Capture a baseline before any change that affects kernel-side runtime
+performance, then compare after. Baseline logs and reports live in
+`target/perf-baselines/` and are not committed; cite the median
+`elapsed_ms` and any regression directly in the PR description.
+
+The canonical workload is the in-kernel compiler plugin compiling a fixed
+wasm input under arm64+HVF (fastest supported surface, no TCG noise):
+
+```bash
+./target/release/helios-inspector vm --arch aarch64 --release \
+    aot-bench artifacts/wasi-tools/curl.wasm --iterations 5 \
+    | tee target/perf-baselines/aarch64-hvf-curl-<short-sha>.log
+```
+
+The regression target is the median `elapsed_ms` across iterations
+2..N — iteration 1 is the cold cache-build cost and excluded from
+steady-state comparisons. `--compiler-timing` adds a cranelift pass
+breakdown to the log; use it for diagnosis when a regression appears,
+not for the canonical baseline.
 
 ## 4. Async-first execution
 
