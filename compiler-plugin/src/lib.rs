@@ -154,7 +154,17 @@ fn enable_compiler_timing_log() {
 
 fn compiler_timing_report(started: Instant, output_kind: OutputKind, output_len: usize) -> String {
     let elapsed = started.elapsed();
-    let _ = cranelift_codegen::timing::publish_current();
+    // Intentionally skip `publish_current()`: the kernel caches this
+    // plugin's wasmtime Module + SharedMemory across compile()
+    // invocations, which makes the main thread's cranelift TLS region
+    // stable across calls. `publish_current` asserts that
+    // `CURRENT_PASS == Pass::None` and aborts (panic = "abort" in this
+    // workspace) when stale state is left behind from a previous
+    // compile. Worker-thread contributions are already published into
+    // the cranelift global by their Drop guards; `take_global` reads
+    // those without touching the main thread's TLS, which is enough
+    // for the diagnostic breakdown — main-thread passes (Translate
+    // WASM function, etc.) are a small fraction of total compile time.
     let pass_times = cranelift_codegen::timing::take_global();
     format!(
         "INFO [helios_compiler_plugin] profile total_ms={} output_kind={output_kind:?} output_len={output_len}\n{pass_times}",
