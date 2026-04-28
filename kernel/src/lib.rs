@@ -28,6 +28,7 @@ mod instance;
 mod kernel_exception;
 mod log;
 mod observer;
+mod pmm;
 mod program_service;
 mod recording_console;
 mod runtime_state;
@@ -124,6 +125,7 @@ pub use observer::{
     TraceHistory, TraceLevel, TraceValue, matches_profile_filter, matches_trace_filter,
     parse_console_text,
 };
+pub use pmm::KernelPhysFrameAllocator;
 pub use program_service::{ProgramExecError, ProgramExecErrorKind, ProgramOutOfMemory};
 pub use recording_console::RecordingConsole;
 pub use runtime_state::RuntimeState;
