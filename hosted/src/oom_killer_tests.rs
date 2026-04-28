@@ -10,6 +10,7 @@
 
 #![cfg(test)]
 
+use helios_hal::vmm::{NoSwap, SwapBackend};
 use helios_kernel::{
     DEFAULT_RESTART_COST, InstanceRegistry, KillReason, PLUGIN_RESTART_COST,
     SYSTEM_COMPONENT_RESTART_COST,
@@ -128,4 +129,14 @@ fn kill_supervisor_restart_decodes_correctly() {
         instance.pending_kill(),
         Some(KillReason::SupervisorRestart)
     );
+}
+
+#[test]
+fn no_swap_reports_unsupported() {
+    let backend = NoSwap;
+    let result = backend.swap_out(b"some bytes");
+    assert!(result.is_err(), "NoSwap must refuse swap_out");
+    let mut buffer = [0u8; 16];
+    let result = backend.swap_in((), &mut buffer);
+    assert!(result.is_err(), "NoSwap must refuse swap_in");
 }

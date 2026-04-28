@@ -142,6 +142,58 @@ pub enum AddressSpaceError {
     InvalidFlags,
 }
 
+/// Backend that can store decommitted user memory away from RAM and
+/// reinstate it on demand. Implementations exist on top of any
+/// persistent block-device-shaped resource: virtio-blk for the live
+/// kernel, host files for `hosted/`, ramdisks for tests. The kernel
+/// page-fault handler routes [`PageFaultOutcome::Resolved`] through
+/// this trait when the faulting address lies in a swap-out region.
+pub trait SwapBackend: Send + Sync + 'static {
+    /// Token returned from a successful `swap_out`; opaque to
+    /// callers, owned by the implementation. Backing the same range
+    /// in again uses the token to find the data.
+    type Token: Copy + Send + Sync + 'static;
+
+    /// Reasons a swap operation can fail.
+    type Error: core::fmt::Display + core::fmt::Debug + Send + Sync + 'static;
+
+    /// Persist `bytes` away from RAM and return a token that can
+    /// later resurrect them via `swap_in`. The implementation owns
+    /// the lifecycle of the storage and decides eviction order on
+    /// its own.
+    fn swap_out(&self, bytes: &[u8]) -> Result<Self::Token, Self::Error>;
+
+    /// Restore previously swapped-out bytes into `dst`. After this
+    /// returns successfully, the token is no longer valid (the
+    /// storage may be reclaimed).
+    fn swap_in(&self, token: Self::Token, dst: &mut [u8]) -> Result<(), Self::Error>;
+}
+
+/// Sentinel `SwapBackend` impl for kernels that do not yet expose a
+/// persistent swap surface. Every operation reports
+/// [`NoSwap::Unsupported`]; callers should short-circuit to the OOM
+/// killer instead. Provided so kernel code can be generic over a
+/// `SwapBackend` even before virtio-blk swap lands.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoSwap;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("swap backend is not configured on this platform")]
+pub struct NoSwapError;
+
+impl SwapBackend for NoSwap {
+    type Token = ();
+    type Error = NoSwapError;
+
+    fn swap_out(&self, _bytes: &[u8]) -> Result<Self::Token, Self::Error> {
+        Err(NoSwapError)
+    }
+
+    fn swap_in(&self, _token: Self::Token, _dst: &mut [u8]) -> Result<(), Self::Error> {
+        Err(NoSwapError)
+    }
+}
+
 /// Per-platform virtual address space. See module docs for semantics.
 pub trait AddressSpace: Send + Sync + 'static {
     /// Carve out a fresh reservation of `byte_len` bytes. Pages in the
