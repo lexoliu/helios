@@ -62,6 +62,28 @@ impl WasmtimeEngine {
     }
 }
 
+/// Stash of the program-service engine used by the OOM killer to wake
+/// CPU-bound victims. `crate::instance::request_kill` calls
+/// `bump_user_engine_epoch` so the next `epoch_deadline_async_yield`
+/// boundary on any executing wasm fires; that yield forces `call_hook`
+/// to observe the kill flag and trap, even when the victim is in pure
+/// wasm without WASI calls.
+///
+/// Wasmtime `Engine` is internally an `Arc`, so storing a clone here
+/// is cheap. The static is initialised once, in
+/// `install_program_service_inner`.
+static OOM_KICK_ENGINE: spin::Once<Engine> = spin::Once::new();
+
+pub(crate) fn register_oom_kick_engine(engine: Engine) {
+    OOM_KICK_ENGINE.call_once(|| engine);
+}
+
+pub(crate) fn bump_user_engine_epoch() {
+    if let Some(engine) = OOM_KICK_ENGINE.get() {
+        engine.increment_epoch();
+    }
+}
+
 impl ComponentRuntimeEngine for WasmtimeEngine {
     type Compiled = WasmtimeCompiledComponent;
     type Error = wasmtime::Error;

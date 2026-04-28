@@ -228,16 +228,28 @@ impl InstanceRegistry {
     /// instance returns the recorded `KillReason` instead of resuming
     /// the guest. Returns true if the kill flag was actually flipped
     /// (i.e. the instance existed and was not already condemned).
+    ///
+    /// On a successful flip, the wasmtime engine epoch is bumped so
+    /// any guest currently in pure-wasm (no WASI host calls) hits its
+    /// next `epoch_deadline_async_yield` boundary quickly and exposes
+    /// the kill flag to `call_hook`. Without this kick a CPU-bound
+    /// victim could run until its next host call, which on adversarial
+    /// workloads is "indefinitely".
     pub fn request_kill(&self, id: InstanceId, reason: KillReason) -> bool {
         let entries = self.inner.entries.lock();
         let Some(entry) = entries.iter().find(|entry| entry.id == id) else {
             return false;
         };
         let encoded = encode_kill_reason(reason);
-        entry
+        let flipped = entry
             .kill_flag
             .compare_exchange(KILL_FLAG_NONE, encoded, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+            .is_ok();
+        drop(entries);
+        if flipped {
+            crate::wasmtime_adapter::bump_user_engine_epoch();
+        }
+        flipped
     }
 
     pub fn snapshot(&self, now_nanos: u64) -> Vec<InstanceSnapshot> {

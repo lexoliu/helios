@@ -226,6 +226,7 @@ where
     let engine = <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as crate::ComponentRuntimeFactory<CpuImpl, HostRuntimeState<CpuImpl, HostFs>, HostFs>>::create_engine(&runtime)
         .unwrap_or_else(|error| panic!("failed to create launched-program engine: {error:#}"));
     let compiler_artifact = read_bootfs_artifact(debug_state, COMPILER_PLUGIN_PATH);
+    crate::wasmtime_adapter::register_oom_kick_engine(engine.raw().clone());
     let service = UserProgramService {
         inner: Arc::new(UserProgramServiceInner {
             runtime,
