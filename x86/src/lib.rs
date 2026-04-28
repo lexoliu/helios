@@ -153,6 +153,7 @@ fn x86_kernel_main() -> ! {
     let mirror_to_uart = WATCHDOG_SELF_TEST_ENABLED;
     let console = serial_console(debug_state.clone(), mirror_to_uart);
     let cpu = X86Cpu::new(boot.platform());
+    vmm::install_user_address_space(physical_memory_offset, cpu.processor_count());
     let kernel = helios_kernel::init_with_watchdog(
         Platform::with_watchdog(console, memory_regions, cpu.clone(), cpu.watchdog())
             .with_topology(

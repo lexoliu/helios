@@ -24,6 +24,7 @@ extern crate alloc;
 use alloc::alloc::{Layout, alloc_zeroed};
 use alloc::vec::Vec;
 use core::arch::asm;
+use core::ffi::c_int;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -31,7 +32,11 @@ use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{
     AddressSpace, AddressSpaceError, PageFlags, Translation, VirtAddr, VirtRange,
 };
-use spin::Mutex;
+use helios_kernel::custom_vm::{
+    self, CustomVmHooks, WasmtimeMemoryImage, default_memory_image_free,
+    default_memory_image_map_at, default_memory_image_new, default_page_size,
+};
+use spin::{Mutex, Once};
 
 const PAGE: usize = 4096;
 
@@ -487,3 +492,131 @@ unsafe fn invalidate_tlb_one(virt: usize) {
         asm!("tlbi vaale1is, {va_page}", va_page = in(reg) va_page, options(nostack, preserves_flags));
     }
 }
+
+/// Boot-time singleton holding the live `Aarch64UserAddressSpace`.
+/// `install_user_address_space` is the only writer; the wasmtime
+/// custom-virtual-memory hooks are the only readers. The Once means
+/// the AS is in BSS until the first `call_once`, after which every
+/// access is a single atomic load.
+static USER_AS: Once<Aarch64UserAddressSpace> = Once::new();
+
+/// Initialise the boot-time user address space and register its
+/// wasmtime custom-virtual-memory hooks. Must be called once on the
+/// bootstrap hart, before any wasmtime engine is constructed —
+/// wasmtime's first `Mmap::accessible_reserved` call resolves to
+/// `wasmtime_mmap_new`, which dispatches through the kernel's
+/// `custom_vm::install_hooks` table to the function pointers below.
+pub fn install_user_address_space(physical_memory_offset: usize) {
+    USER_AS.call_once(|| Aarch64UserAddressSpace::new(physical_memory_offset));
+    custom_vm::install_hooks(&AARCH64_VMM_HOOKS);
+}
+
+fn user_as() -> &'static Aarch64UserAddressSpace {
+    USER_AS
+        .get()
+        .expect("Aarch64UserAddressSpace accessed before install_user_address_space")
+}
+
+const ENOMEM: c_int = 12;
+const EINVAL: c_int = 22;
+
+const PROT_READ: u32 = 1 << 0;
+const PROT_WRITE: u32 = 1 << 1;
+const PROT_EXEC: u32 = 1 << 2;
+
+fn prot_to_flags(prot: u32) -> PageFlags {
+    let mut flags = PageFlags::empty();
+    if prot & PROT_READ != 0 {
+        flags |= PageFlags::READ;
+    }
+    if prot & PROT_WRITE != 0 {
+        flags |= PageFlags::WRITE;
+    }
+    if prot & PROT_EXEC != 0 {
+        flags |= PageFlags::EXECUTE;
+    }
+    flags
+}
+
+extern "C" fn aarch64_mmap_new(size: usize, prot_flags: u32, ret: &mut *mut u8) -> c_int {
+    let address_space = user_as();
+    let range = match address_space.reserve(size) {
+        Ok(range) => range,
+        Err(_) => return ENOMEM,
+    };
+    if prot_flags != 0 {
+        let flags = prot_to_flags(prot_flags);
+        if address_space.commit(range, flags).is_err() {
+            let _ = address_space.release(range);
+            return ENOMEM;
+        }
+    }
+    *ret = range.start.raw() as *mut u8;
+    0
+}
+
+extern "C" fn aarch64_mmap_remap(addr: *mut u8, size: usize, prot_flags: u32) -> c_int {
+    let address_space = user_as();
+    let range = VirtRange::new(VirtAddr::new(addr as usize), size);
+    let _ = address_space.decommit(range);
+    if prot_flags != 0 {
+        let flags = prot_to_flags(prot_flags);
+        if address_space.commit(range, flags).is_err() {
+            return ENOMEM;
+        }
+    }
+    0
+}
+
+extern "C" fn aarch64_munmap(ptr: *mut u8, size: usize) -> c_int {
+    let address_space = user_as();
+    let range = VirtRange::new(VirtAddr::new(ptr as usize), size);
+    match address_space.release(range) {
+        Ok(()) => 0,
+        Err(_) => EINVAL,
+    }
+}
+
+extern "C" fn aarch64_mprotect(ptr: *mut u8, size: usize, prot_flags: u32) -> c_int {
+    let address_space = user_as();
+    let range = VirtRange::new(VirtAddr::new(ptr as usize), size);
+    if prot_flags == 0 {
+        return match address_space.decommit(range) {
+            Ok(()) => 0,
+            Err(_) => EINVAL,
+        };
+    }
+    let flags = prot_to_flags(prot_flags);
+    match address_space.protect(range, flags) {
+        Ok(()) => 0,
+        Err(AddressSpaceError::NotCommitted) => match address_space.commit(range, flags) {
+            Ok(()) => 0,
+            Err(_) => ENOMEM,
+        },
+        Err(_) => EINVAL,
+    }
+}
+
+/// Wasmtime custom-virtual-memory hook table for the aarch64
+/// backend. Address-space mutations route through the singleton
+/// `Aarch64UserAddressSpace`; COW image creation is opted out of
+/// (`default_memory_image_new` returns `NULL`), so wasmtime falls
+/// back to per-instance memcpy initialization for now.
+pub static AARCH64_VMM_HOOKS: CustomVmHooks = CustomVmHooks {
+    mmap_new: aarch64_mmap_new,
+    mmap_remap: aarch64_mmap_remap,
+    munmap: aarch64_munmap,
+    mprotect: aarch64_mprotect,
+    page_size: default_page_size,
+    memory_image_new: default_memory_image_new,
+    memory_image_free: default_memory_image_free,
+    memory_image_map_at: default_memory_image_map_at,
+};
+
+const _: () = {
+    // Pin the C ABI so a wasmtime ABI revision that changes the
+    // `WasmtimeMemoryImage` opaque ptr type fails the build instead
+    // of mismatching at link time.
+    let _: extern "C" fn(*const u8, usize, &mut *mut WasmtimeMemoryImage) -> c_int =
+        default_memory_image_new;
+};

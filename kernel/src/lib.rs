@@ -42,6 +42,25 @@ mod unsupported_host_fs;
 mod user_memory;
 mod wasi_rights;
 pub(crate) mod wasmtime_adapter;
+
+#[cfg(all(
+    target_os = "none",
+    any(
+        feature = "wasmtime-aarch64",
+        feature = "wasmtime-riscv64",
+        feature = "wasmtime-x86"
+    )
+))]
+pub mod custom_vm {
+    //! Re-export of the wasmtime custom-virtual-memory dispatcher
+    //! so bare-metal backends can install their `CustomVmHooks`
+    //! tables without reaching into kernel-private modules.
+    pub use crate::wasmtime_adapter::custom_vm::{
+        CustomVmHooks, WasmtimeMemoryImage, default_memory_image_free,
+        default_memory_image_map_at, default_memory_image_new, default_page_size,
+        install_hooks,
+    };
+}
 #[cfg(all(
     target_os = "none",
     any(

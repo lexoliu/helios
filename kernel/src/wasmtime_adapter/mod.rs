@@ -7,6 +7,8 @@
 
 pub mod bindings;
 pub mod config;
+#[cfg(target_os = "none")]
+pub mod custom_vm;
 pub mod engine;
 pub mod store;
 pub mod wasi;

@@ -344,6 +344,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
     let reserved_ranges = boot_reserved_ranges(&handoff);
     let memory_regions = boot_memory_regions(&handoff, physical_memory_offset, &reserved_ranges);
     helios_kernel::prime_bootstrap_allocator(memory_regions);
+    vmm::install_user_address_space(physical_memory_offset);
     let platform_state = Aarch64PlatformState::from_limine_mp(timer_frequency());
     activate_processor_runtime(platform_state.bootstrap_runtime());
 

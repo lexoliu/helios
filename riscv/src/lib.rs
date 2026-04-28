@@ -532,6 +532,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         unsafe {
             vmm::install_kernel_paging();
         }
+        vmm::install_wasmtime_hooks();
     }
     unsafe {
         vmm::activate_paging();

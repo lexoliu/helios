@@ -42,6 +42,7 @@ extern crate alloc;
 use alloc::alloc::{Layout, alloc_zeroed};
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
+use core::ffi::c_int;
 use core::ops::Range;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -49,6 +50,10 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{
     AddressSpace, AddressSpaceError, PageFlags, Translation, VirtAddr, VirtRange,
+};
+use helios_kernel::custom_vm::{
+    self, CustomVmHooks, default_memory_image_free, default_memory_image_map_at,
+    default_memory_image_new, default_page_size,
 };
 use spin::{Mutex, Once};
 
@@ -593,3 +598,109 @@ const _: () = {
 pub fn identity_map_range() -> Range<usize> {
     0..(KERNEL_IDENTITY_GIB * GIB)
 }
+
+/// Register the boot-time `RiscvUserAddressSpace` as the active
+/// wasmtime custom-virtual-memory backend. Must be called once on
+/// the bootstrap hart, after `install_kernel_paging`, before any
+/// wasmtime engine is constructed.
+pub fn install_wasmtime_hooks() {
+    custom_vm::install_hooks(&RISCV_VMM_HOOKS);
+}
+
+fn user_as() -> &'static RiscvUserAddressSpace {
+    user_address_space().expect(
+        "RiscvUserAddressSpace accessed before install_kernel_paging",
+    )
+}
+
+const ENOMEM: c_int = 12;
+const EINVAL: c_int = 22;
+
+const PROT_READ: u32 = 1 << 0;
+const PROT_WRITE: u32 = 1 << 1;
+const PROT_EXEC: u32 = 1 << 2;
+
+fn prot_to_flags(prot: u32) -> PageFlags {
+    let mut flags = PageFlags::empty();
+    if prot & PROT_READ != 0 {
+        flags |= PageFlags::READ;
+    }
+    if prot & PROT_WRITE != 0 {
+        flags |= PageFlags::WRITE;
+    }
+    if prot & PROT_EXEC != 0 {
+        flags |= PageFlags::EXECUTE;
+    }
+    flags
+}
+
+extern "C" fn riscv_mmap_new(size: usize, prot_flags: u32, ret: &mut *mut u8) -> c_int {
+    let address_space = user_as();
+    let range = match address_space.reserve(size) {
+        Ok(range) => range,
+        Err(_) => return ENOMEM,
+    };
+    if prot_flags != 0 {
+        let flags = prot_to_flags(prot_flags);
+        if address_space.commit(range, flags).is_err() {
+            let _ = address_space.release(range);
+            return ENOMEM;
+        }
+    }
+    *ret = range.start.raw() as *mut u8;
+    0
+}
+
+extern "C" fn riscv_mmap_remap(addr: *mut u8, size: usize, prot_flags: u32) -> c_int {
+    let address_space = user_as();
+    let range = VirtRange::new(VirtAddr::new(addr as usize), size);
+    let _ = address_space.decommit(range);
+    if prot_flags != 0 {
+        let flags = prot_to_flags(prot_flags);
+        if address_space.commit(range, flags).is_err() {
+            return ENOMEM;
+        }
+    }
+    0
+}
+
+extern "C" fn riscv_munmap(ptr: *mut u8, size: usize) -> c_int {
+    let address_space = user_as();
+    let range = VirtRange::new(VirtAddr::new(ptr as usize), size);
+    match address_space.release(range) {
+        Ok(()) => 0,
+        Err(_) => EINVAL,
+    }
+}
+
+extern "C" fn riscv_mprotect(ptr: *mut u8, size: usize, prot_flags: u32) -> c_int {
+    let address_space = user_as();
+    let range = VirtRange::new(VirtAddr::new(ptr as usize), size);
+    if prot_flags == 0 {
+        return match address_space.decommit(range) {
+            Ok(()) => 0,
+            Err(_) => EINVAL,
+        };
+    }
+    let flags = prot_to_flags(prot_flags);
+    match address_space.protect(range, flags) {
+        Ok(()) => 0,
+        Err(AddressSpaceError::NotCommitted) => match address_space.commit(range, flags) {
+            Ok(()) => 0,
+            Err(_) => ENOMEM,
+        },
+        Err(_) => EINVAL,
+    }
+}
+
+/// Wasmtime custom-virtual-memory hook table for the riscv backend.
+pub static RISCV_VMM_HOOKS: CustomVmHooks = CustomVmHooks {
+    mmap_new: riscv_mmap_new,
+    mmap_remap: riscv_mmap_remap,
+    munmap: riscv_munmap,
+    mprotect: riscv_mprotect,
+    page_size: default_page_size,
+    memory_image_new: default_memory_image_new,
+    memory_image_free: default_memory_image_free,
+    memory_image_map_at: default_memory_image_map_at,
+};
