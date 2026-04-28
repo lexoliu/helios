@@ -84,7 +84,7 @@ pub use component_resources::{
 };
 pub use component_runtime::{
     ComponentOutputMode, ComponentOutputStreamKind, ComponentRuntimeState, ComponentStoreData,
-    DeadlinePollable,
+    DeadlinePollable, InstanceKilled,
 };
 pub use component_runtime_backend::{
     CompiledComponent, ComponentExecContext, ComponentExecutor, ComponentExitStatus,
@@ -110,8 +110,9 @@ pub use helios_hal::Platform;
 pub use host_fs_client::{HostFsClient, HostFsFuture, HostFsTransport};
 pub use host_share::{HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, guest_host_share_path};
 pub use instance::{
-    InstanceExecutionTransition, InstanceId, InstanceProfileTotal, InstanceRegistry,
-    InstanceSnapshot, RegisteredInstance, allow_instance_resource_growth,
+    DEFAULT_RESTART_COST, InstanceExecutionTransition, InstanceId, InstanceProfileTotal,
+    InstanceRegistry, InstanceSnapshot, KillReason, OomVictim, PLUGIN_RESTART_COST,
+    RegisteredInstance, SYSTEM_COMPONENT_RESTART_COST, allow_instance_resource_growth,
     record_instance_transition,
 };
 pub use kernel_exception::{

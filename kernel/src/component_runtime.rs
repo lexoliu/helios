@@ -5,10 +5,22 @@ use alloc::vec::Vec;
 
 use crate::child_io::{ByteReader, ByteWriter, ClosedPeer, TryRead};
 use crate::{
-    InstanceExecutionTransition, InstanceRegistry, RegisteredInstance, record_instance_transition,
+    InstanceExecutionTransition, InstanceRegistry, KillReason, RegisteredInstance,
+    record_instance_transition,
 };
 use helios_hal::cpu::Cpu;
+use thiserror::Error;
 use wasmtime::component::ResourceTable;
+
+/// Error returned through wasmtime's call_hook when a kill was
+/// requested for the running instance — by the OOM killer or by a
+/// kernel-plugin supervisor. Wasmtime turns this into a trap and the
+/// component executor surfaces it as a typed `ProgramExecError`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+#[error("instance terminated: {reason:?}")]
+pub struct InstanceKilled {
+    pub reason: KillReason,
+}
 
 /// Where `wasi:cli/{stdin,stdout,stderr}` traffic flows for a component.
 ///
@@ -326,6 +338,14 @@ where
                 elapsed,
             );
         }
+    }
+
+    /// Returns the recorded kill reason if the OOM killer or a
+    /// supervisor flagged this instance for termination since the last
+    /// host-call boundary. The component executor calls this from
+    /// `call_hook` and surfaces the value as an `InstanceKilled` trap.
+    pub fn check_pending_kill(&self) -> Option<KillReason> {
+        self.instance().pending_kill()
     }
 }
 

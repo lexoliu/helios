@@ -776,14 +776,46 @@ where
         profile: bool,
     ) -> Result<Vec<u8>, ProgramExecError> {
         let _compile_guard = self.inner.compile_lock.lock();
-        let plugin = self.ensure_compiler_plugin(exec_context, &compiler_payload)?;
+        let result =
+            self.invoke_compiler_inner(exec_context, &compiler_payload, wasm, hint, profile);
+        // Plugin supervisor: on a kill or fatal-state error, drop the
+        // cached runtime so the next call rebuilds the Module +
+        // SharedMemory + InstancePre from scratch. This is the
+        // auto-restart path the user-spec calls for ("内核插件需要有
+        // 自动重启的功能").
+        if let Err(error) = &result
+            && plugin_runtime_should_be_recycled(error)
+        {
+            tracing::warn!(
+                target: "helios_kernel::supervisor",
+                detail = %error.detail,
+                "compiler plugin runtime invalidated; next compile rebuilds from scratch"
+            );
+            *self.inner.compiler_plugin.lock() = None;
+        }
+        result
+    }
+
+    fn invoke_compiler_inner(
+        &self,
+        exec_context: &ProgramExecContext<CpuImpl, HostFs>,
+        compiler_payload: &Bytes,
+        wasm: &Bytes,
+        hint: AotCompileHint,
+        profile: bool,
+    ) -> Result<Vec<u8>, ProgramExecError> {
+        let plugin = self.ensure_compiler_plugin(exec_context, compiler_payload)?;
         let engine = self.inner.engine.raw();
         let started_at = exec_context
             .runtime_state
             .uptime_nanos(exec_context.cpu.now().ticks());
         let compiler_instance = exec_context
             .instance_registry
-            .register("compiler-plugin", started_at);
+            .register_with_cost(
+                "compiler-plugin",
+                started_at,
+                crate::PLUGIN_RESTART_COST,
+            );
         let store_data = CompilerCoreStore {
             cpu: exec_context.cpu.clone(),
             spawner: exec_context.spawner.clone(),
@@ -981,7 +1013,11 @@ where
             .uptime_nanos(exec_context.cpu.now().ticks());
         let scratch_instance = exec_context
             .instance_registry
-            .register("compiler-plugin-init", scratch_started_at);
+            .register_with_cost(
+                "compiler-plugin-init",
+                scratch_started_at,
+                crate::PLUGIN_RESTART_COST,
+            );
         let scratch_store_data = CompilerCoreStore {
             cpu: exec_context.cpu.clone(),
             spawner: exec_context.spawner.clone(),
@@ -1653,10 +1689,32 @@ where
     })
 }
 
+/// Decide whether a compile failure means the cached compiler-plugin
+/// runtime is no longer usable. OOM kills come with non-deterministic
+/// SharedMemory state because a worker thread may have aborted
+/// mid-write; rebuilding from scratch is the safe path. Plain compile
+/// errors (invalid input wasm, ABI mismatch) leave the plugin healthy.
+fn plugin_runtime_should_be_recycled(error: &ProgramExecError) -> bool {
+    matches!(
+        error.kind,
+        ProgramExecErrorKind::OutOfMemory | ProgramExecErrorKind::Internal
+    )
+}
+
 fn map_program_runtime_error(error: wasmtime::Error) -> ProgramExecError {
     if error.is::<crate::ProgramOutOfMemory>() {
         return ProgramExecError {
             kind: ProgramExecErrorKind::OutOfMemory,
+            detail: format!("{error:#}"),
+        };
+    }
+    if let Some(killed) = error.downcast_ref::<crate::InstanceKilled>() {
+        let kind = match killed.reason {
+            crate::KillReason::OutOfMemory => ProgramExecErrorKind::OutOfMemory,
+            crate::KillReason::SupervisorRestart => ProgramExecErrorKind::Internal,
+        };
+        return ProgramExecError {
+            kind,
             detail: format!("{error:#}"),
         };
     }

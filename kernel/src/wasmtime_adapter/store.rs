@@ -19,8 +19,9 @@ use wasmtime_wasi_io::streams::{InputStream, OutputStream, StreamError, StreamRe
 
 use crate::child_io::{ByteReader, ByteWriter};
 use crate::{
-    ComponentRuntimeState, ComponentStoreData, ProgramOutOfMemory, allow_instance_resource_growth,
-    heap_stats, user_heap_stats, user_memory_kernel_reserve_bytes,
+    ComponentRuntimeState, ComponentStoreData, KillReason, ProgramOutOfMemory,
+    allow_instance_resource_growth, heap_stats, user_heap_stats,
+    user_memory_kernel_reserve_bytes,
 };
 
 impl<CpuImpl, RuntimeStateImpl, FileSystem> ResourceLimiter
@@ -46,27 +47,9 @@ where
         }
 
         let growth = desired.saturating_sub(current);
-        let user_heap = user_heap_stats();
-        let user_available = user_heap.available_bytes();
-        if user_available < growth {
-            return Err(ProgramOutOfMemory {
-                requested_bytes: desired,
-                available_bytes: user_available,
-                reserved_bytes: 0,
-            }
-            .into());
-        }
 
-        let heap = heap_stats();
-        let reserve = user_memory_kernel_reserve_bytes(heap.total_bytes);
-        let available = heap.available_bytes();
-        if available.saturating_sub(growth) < reserve {
-            return Err(ProgramOutOfMemory {
-                requested_bytes: desired,
-                available_bytes: available,
-                reserved_bytes: reserve,
-            }
-            .into());
+        if let Some(error) = self.try_satisfy_or_kill(desired, growth) {
+            return Err(error);
         }
 
         Ok(allow_instance_resource_growth(
@@ -87,6 +70,97 @@ where
         maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
         Ok(maximum.is_none_or(|maximum| desired <= maximum))
+    }
+}
+
+impl<CpuImpl, RuntimeStateImpl, FileSystem> ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem>
+where
+    CpuImpl: Cpu + Clone,
+    RuntimeStateImpl: ComponentRuntimeState,
+    FileSystem: Send,
+{
+    /// Decide whether `growth` extra bytes of user memory can be granted.
+    ///
+    /// On insufficient user heap or kernel reserve breach, the OOM
+    /// killer is asked to mark the largest non-self victim for
+    /// termination (so the next host-call boundary on that instance
+    /// traps with [`crate::InstanceKilled`] and frees its memory). The
+    /// growing request itself still returns `ProgramOutOfMemory` —
+    /// reclamation happens asynchronously and the requester retries on
+    /// the next allocation attempt or surfaces the error to its caller.
+    fn try_satisfy_or_kill(&self, desired: usize, growth: usize) -> Option<wasmtime::Error> {
+        let user_heap = user_heap_stats();
+        let user_available = user_heap.available_bytes();
+        if user_available < growth {
+            self.request_oom_kill_for_growth(growth);
+            return Some(
+                ProgramOutOfMemory {
+                    requested_bytes: desired,
+                    available_bytes: user_available,
+                    reserved_bytes: 0,
+                }
+                .into(),
+            );
+        }
+
+        let heap = heap_stats();
+        let reserve = user_memory_kernel_reserve_bytes(heap.total_bytes);
+        let available = heap.available_bytes();
+        if available.saturating_sub(growth) < reserve {
+            self.request_oom_kill_for_growth(growth);
+            return Some(
+                ProgramOutOfMemory {
+                    requested_bytes: desired,
+                    available_bytes: available,
+                    reserved_bytes: reserve,
+                }
+                .into(),
+            );
+        }
+
+        None
+    }
+
+    /// Pick the highest-scoring OOM victim that is not the requesting
+    /// instance and flag it for kill. Logged at warn level so post-mortem
+    /// analysis can trace which instance was sacrificed for which grow
+    /// request.
+    fn request_oom_kill_for_growth(&self, requested_bytes: usize) {
+        let registry = &self.instance_registry;
+        let requester = self.instance().id();
+        let mut victim = registry.pick_oom_victim();
+        // Avoid suiciding: if the highest-scoring victim is the requester
+        // itself, the OOM killer hands a grow failure back to that
+        // instance instead of marking the killer to terminate. Other
+        // instances may still be picked on subsequent grow attempts as
+        // they accumulate memory.
+        if let Some(candidate) = &victim
+            && candidate.id == requester
+        {
+            victim = None;
+        }
+        let Some(victim) = victim else {
+            tracing::warn!(
+                target: "helios_kernel::oom",
+                requester = ?requester,
+                requested_bytes,
+                "OOM killer found no eligible victim — requester takes the grow failure"
+            );
+            return;
+        };
+        let killed = registry.request_kill(victim.id, KillReason::OutOfMemory);
+        tracing::warn!(
+            target: "helios_kernel::oom",
+            requester = ?requester,
+            requested_bytes,
+            victim_id = ?victim.id,
+            victim_name = %victim.name,
+            victim_memory_bytes = victim.memory_bytes,
+            victim_restart_cost = victim.restart_cost,
+            score = victim.score,
+            killed,
+            "OOM killer condemned victim to free user memory"
+        );
     }
 }
 

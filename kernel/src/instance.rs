@@ -3,11 +3,26 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use spin::Mutex;
 
 const INACTIVE_RESUME_AT: u64 = u64::MAX;
+
+/// Default OOM-killer cost score for plain user-mode wasm programs.
+pub const DEFAULT_RESTART_COST: u32 = 1;
+/// Cost score for kernel plugins (e.g. compiler). Higher than user
+/// programs because restarting is expensive (plugin runtime cache
+/// rebuild, in-flight compile request loss), but finite so the OOM
+/// killer can still pick them when they are the dominant memory
+/// consumer.
+pub const PLUGIN_RESTART_COST: u32 = 100;
+/// Cost score for embedded system components (debugger). Highest of
+/// all, so the OOM killer only picks them when there is no other
+/// viable victim — an absolute last resort that nonetheless does
+/// terminate when memory pressure forces it, since system components
+/// are restartable.
+pub const SYSTEM_COMPONENT_RESTART_COST: u32 = 1_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct InstanceId(u64);
@@ -16,6 +31,50 @@ impl InstanceId {
     pub const fn raw(self) -> u64 {
         self.0
     }
+}
+
+/// Reason an instance was marked for termination by the OOM killer
+/// or the kernel-plugin supervisor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KillReason {
+    /// Picked by the OOM killer to free user memory for the system.
+    OutOfMemory,
+    /// Supervisor restart after a fault or quarantine breach.
+    SupervisorRestart,
+}
+
+const KILL_FLAG_NONE: u8 = 0;
+const KILL_FLAG_OOM: u8 = 1;
+const KILL_FLAG_SUPERVISOR: u8 = 2;
+
+const fn encode_kill_reason(reason: KillReason) -> u8 {
+    match reason {
+        KillReason::OutOfMemory => KILL_FLAG_OOM,
+        KillReason::SupervisorRestart => KILL_FLAG_SUPERVISOR,
+    }
+}
+
+const fn decode_kill_flag(value: u8) -> Option<KillReason> {
+    match value {
+        KILL_FLAG_OOM => Some(KillReason::OutOfMemory),
+        KILL_FLAG_SUPERVISOR => Some(KillReason::SupervisorRestart),
+        _ => None,
+    }
+}
+
+/// Snapshot of an OOM victim selected by [`InstanceRegistry::pick_oom_victim`].
+///
+/// `score` is the ranking metric (`memory_bytes / restart_cost`) — the
+/// higher the score, the more attractive the victim. Callers do not
+/// need to interpret it; it is exposed so the kernel can log victim
+/// selection decisions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OomVictim {
+    pub id: InstanceId,
+    pub name: String,
+    pub memory_bytes: u64,
+    pub restart_cost: u32,
+    pub score: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,6 +123,13 @@ struct InstanceEntry {
     active_nanos: AtomicU64,
     active_depth: AtomicU32,
     last_resume_at: AtomicU64,
+    /// Cost weight for OOM victim selection. Higher = harder to kill.
+    /// See `DEFAULT_RESTART_COST` and friends.
+    restart_cost: u32,
+    /// Set by the OOM killer / supervisor; checked on each call_hook
+    /// transition. When set, the next host-call boundary returns
+    /// `Killed { reason }` instead of resuming the guest.
+    kill_flag: AtomicU8,
 }
 
 #[derive(Default)]
@@ -89,6 +155,19 @@ impl InstanceRegistry {
     }
 
     pub fn register(&self, name: impl Into<String>, started_at: u64) -> RegisteredInstance {
+        self.register_with_cost(name, started_at, DEFAULT_RESTART_COST)
+    }
+
+    /// Register with an explicit OOM-killer restart cost. Callers that
+    /// run system components or kernel plugins use the higher
+    /// constants (`PLUGIN_RESTART_COST`, `SYSTEM_COMPONENT_RESTART_COST`)
+    /// so the OOM killer prefers cheaper victims.
+    pub fn register_with_cost(
+        &self,
+        name: impl Into<String>,
+        started_at: u64,
+        restart_cost: u32,
+    ) -> RegisteredInstance {
         let id = InstanceId(self.inner.next_id.fetch_add(1, Ordering::AcqRel));
         let entry = Arc::new(InstanceEntry {
             id,
@@ -98,12 +177,67 @@ impl InstanceRegistry {
             active_nanos: AtomicU64::new(0),
             active_depth: AtomicU32::new(0),
             last_resume_at: AtomicU64::new(INACTIVE_RESUME_AT),
+            restart_cost,
+            kill_flag: AtomicU8::new(KILL_FLAG_NONE),
         });
         self.inner.entries.lock().push(entry.clone());
         RegisteredInstance {
             registry: self.clone(),
             entry,
         }
+    }
+
+    /// Pick a victim instance using the standard `memory / restart_cost`
+    /// heuristic: large memory consumers with low restart cost are
+    /// chosen first, system components last. Returns `None` when no
+    /// instance has any memory attributed to it.
+    ///
+    /// The caller must follow up with [`RegisteredInstance::request_kill`]
+    /// or use the registry-level helper that does both.
+    pub fn pick_oom_victim(&self) -> Option<OomVictim> {
+        let entries = self.inner.entries.lock();
+        let mut best: Option<OomVictim> = None;
+        for entry in entries.iter() {
+            let memory_bytes = entry.memory_bytes.load(Ordering::Acquire);
+            if memory_bytes == 0 {
+                continue;
+            }
+            if entry.kill_flag.load(Ordering::Acquire) != KILL_FLAG_NONE {
+                // Already condemned; do not re-pick.
+                continue;
+            }
+            let cost = entry.restart_cost.max(1) as u64;
+            let score = memory_bytes / cost;
+            match &best {
+                Some(current) if current.score >= score => {}
+                _ => {
+                    best = Some(OomVictim {
+                        id: entry.id,
+                        name: entry.name.clone(),
+                        memory_bytes,
+                        restart_cost: entry.restart_cost,
+                        score,
+                    });
+                }
+            }
+        }
+        best
+    }
+
+    /// Mark `id` for termination. The next host-call boundary in that
+    /// instance returns the recorded `KillReason` instead of resuming
+    /// the guest. Returns true if the kill flag was actually flipped
+    /// (i.e. the instance existed and was not already condemned).
+    pub fn request_kill(&self, id: InstanceId, reason: KillReason) -> bool {
+        let entries = self.inner.entries.lock();
+        let Some(entry) = entries.iter().find(|entry| entry.id == id) else {
+            return false;
+        };
+        let encoded = encode_kill_reason(reason);
+        entry
+            .kill_flag
+            .compare_exchange(KILL_FLAG_NONE, encoded, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     pub fn snapshot(&self, now_nanos: u64) -> Vec<InstanceSnapshot> {
@@ -207,10 +341,38 @@ impl RegisteredInstance {
         self.entry.started_at
     }
 
+    pub fn restart_cost(&self) -> u32 {
+        self.entry.restart_cost
+    }
+
+    pub fn memory_bytes(&self) -> u64 {
+        self.entry.memory_bytes.load(Ordering::Acquire)
+    }
+
     pub fn set_memory_bytes(&self, memory_bytes: u64) {
         self.entry
             .memory_bytes
             .store(memory_bytes, Ordering::Release);
+    }
+
+    /// Returns `Some(reason)` when the instance has been condemned by
+    /// the OOM killer or a supervisor and the runtime should trap on
+    /// the next host-call boundary instead of resuming the guest.
+    pub fn pending_kill(&self) -> Option<KillReason> {
+        decode_kill_flag(self.entry.kill_flag.load(Ordering::Acquire))
+    }
+
+    /// Mark this instance for termination. The next call_hook
+    /// transition observes the flag and the executor returns the
+    /// recorded reason rather than resuming the guest.
+    pub fn request_kill(&self, reason: KillReason) {
+        let encoded = encode_kill_reason(reason);
+        let _ = self.entry.kill_flag.compare_exchange(
+            KILL_FLAG_NONE,
+            encoded,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     pub fn transition(

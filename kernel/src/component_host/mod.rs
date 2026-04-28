@@ -724,8 +724,11 @@ where
     emit_stage_marker(write_serial, "instantiate:begin");
     tracing::info!(component = component_name, "instantiating system component");
     let instance_registry = debug_state.instance_registry();
-    let instance =
-        instance_registry.register(component_name, debug_state.uptime_nanos(cpu.now().ticks()));
+    let instance = instance_registry.register_with_cost(
+        component_name,
+        debug_state.uptime_nanos(cpu.now().ticks()),
+        crate::SYSTEM_COMPONENT_RESTART_COST,
+    );
 
     let component_world = match world {
         ComponentBindingSet::System => ComponentWorld::System,
@@ -820,6 +823,9 @@ where
         |mut caller: StoreContextMut<'_, StoreData<CpuImpl, HostFs>>, hook| {
             let transition = crate::wasmtime_adapter::store::translate_call_hook(hook);
             caller.data_mut().record_transition(transition);
+            if let Some(reason) = caller.data().check_pending_kill() {
+                return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
+            }
             Ok(())
         },
     );

@@ -5,3 +5,4 @@
 /tools/wasi-apps/python/target
 /tools/wasi-apps/curl/target
 *.wasm
+/.claude/
