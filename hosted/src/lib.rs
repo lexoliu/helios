@@ -2,6 +2,7 @@ mod config;
 mod console;
 mod cpu;
 mod host_fs;
+mod oom_killer_tests;
 mod runtime;
 mod vmm;
 
