@@ -11,3 +11,4 @@ helios-hal.workspace = true
 helios-kernel = { workspace = true, default-features = false, features = ["wasmtime-aarch64"] }
 limine = "0.6.3"
 spin = "0.10.0"
+tracing.workspace = true

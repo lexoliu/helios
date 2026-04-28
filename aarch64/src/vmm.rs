@@ -556,16 +556,39 @@ extern "C" fn aarch64_mmap_new(size: usize, prot_flags: u32, ret: &mut *mut u8) 
     let address_space = user_as();
     let range = match address_space.reserve(size) {
         Ok(range) => range,
-        Err(_) => return ENOMEM,
+        Err(error) => {
+            tracing::error!(
+                target: "helios_aarch64::vmm",
+                size,
+                prot_flags,
+                ?error,
+                "mmap_new reserve failed"
+            );
+            return ENOMEM;
+        }
     };
     if prot_flags != 0 {
         let flags = prot_to_flags(prot_flags);
-        if address_space.commit(range, flags).is_err() {
+        if let Err(error) = address_space.commit(range, flags) {
+            tracing::error!(
+                target: "helios_aarch64::vmm",
+                size,
+                prot_flags,
+                ?error,
+                "mmap_new commit failed"
+            );
             let _ = address_space.release(range);
             return ENOMEM;
         }
     }
     *ret = range.start.raw() as *mut u8;
+    tracing::trace!(
+        target: "helios_aarch64::vmm",
+        size,
+        prot_flags,
+        addr = range.start.raw(),
+        "mmap_new ok"
+    );
     0
 }
 
@@ -600,8 +623,20 @@ extern "C" fn aarch64_munmap(ptr: *mut u8, size: usize) -> c_int {
     let address_space = user_as();
     let range = VirtRange::new(VirtAddr::new(ptr as usize), size);
     match address_space.release(range) {
-        Ok(()) => 0,
-        Err(_) => EINVAL,
+        Ok(()) => {
+            tracing::trace!(target: "helios_aarch64::vmm", addr = ptr as usize, size, "munmap ok");
+            0
+        }
+        Err(error) => {
+            tracing::error!(
+                target: "helios_aarch64::vmm",
+                addr = ptr as usize,
+                size,
+                ?error,
+                "munmap failed"
+            );
+            EINVAL
+        }
     }
 }
 
@@ -612,7 +647,16 @@ extern "C" fn aarch64_mprotect(ptr: *mut u8, size: usize, prot_flags: u32) -> c_
     if prot_flags == 0 {
         return match address_space.decommit(range) {
             Ok(()) => 0,
-            Err(_) => EINVAL,
+            Err(error) => {
+                tracing::error!(
+                    target: "helios_aarch64::vmm",
+                    addr = ptr as usize,
+                    size,
+                    ?error,
+                    "mprotect(prot=0) decommit failed"
+                );
+                EINVAL
+            }
         };
     }
     let flags = prot_to_flags(prot_flags);
@@ -620,9 +664,29 @@ extern "C" fn aarch64_mprotect(ptr: *mut u8, size: usize, prot_flags: u32) -> c_
         Ok(()) => 0,
         Err(AddressSpaceError::NotCommitted) => match address_space.commit(range, flags) {
             Ok(()) => 0,
-            Err(_) => ENOMEM,
+            Err(error) => {
+                tracing::error!(
+                    target: "helios_aarch64::vmm",
+                    addr = ptr as usize,
+                    size,
+                    prot_flags,
+                    ?error,
+                    "mprotect commit-fallback failed"
+                );
+                ENOMEM
+            }
         },
-        Err(_) => EINVAL,
+        Err(error) => {
+            tracing::error!(
+                target: "helios_aarch64::vmm",
+                addr = ptr as usize,
+                size,
+                prot_flags,
+                ?error,
+                "mprotect failed"
+            );
+            EINVAL
+        }
     }
 }
 
