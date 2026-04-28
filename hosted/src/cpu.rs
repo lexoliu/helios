@@ -64,6 +64,17 @@ impl Cpu for HostedCpu {
         None
     }
 
+    fn has_lazy_commit_virtual_memory(&self) -> bool {
+        // Hosted runs as a regular host process: libc `mmap(PROT_
+        // NONE)` reserves arbitrary virtual ranges with no physical
+        // commit until the host kernel page-faults a touched page
+        // back in. That is the exact "petabyte-scale lazy-commit"
+        // capability the trait talks about — kernel-side runtimes
+        // such as the Wasmtime pooling allocator can pre-reserve
+        // 4 GiB+ per instance without burning RAM.
+        true
+    }
+
     fn shutdown(&self) -> ! {
         std::process::exit(0)
     }

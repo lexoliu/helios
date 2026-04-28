@@ -30,7 +30,15 @@ hal  <-  kernel  <-  {riscv, x86, hosted}  <-  inspector / programs
 
 - **`hal/`** contains architecture-neutral hardware contracts only: traits,
   capability types, and value types. It must not contain concrete drivers or
-  runtime logic.
+  runtime logic. `hal/` must also not name any specific runtime or higher-
+  layer consumer in its API surface — Wasmtime, Cranelift, the kernel's
+  WIT interfaces, the inspector protocol, etc. are all upward-layer concepts
+  that leak abstractions if they appear in `hal/`. Capabilities express the
+  underlying *hardware* property (e.g. "supports lazy-commit virtual
+  memory") and the kernel translates that into runtime knobs (e.g.
+  enabling Wasmtime's pooling instance allocator). A trait method named
+  after its caller is a code smell that warrants renaming or relocating to
+  `kernel/`.
 - **`kernel/`** contains all hardware-independent runtime logic: the executor,
   timer, component host, observer, capability resources, host-fs client, and
   every WIT service implementation. It is `#![no_std]` and generic over `Cpu`.

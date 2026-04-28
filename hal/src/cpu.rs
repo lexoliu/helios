@@ -106,6 +106,21 @@ pub trait Cpu: Send + Sync + 'static {
     /// Returns an optional native ISA feature probe for runtime codegen.
     fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>>;
 
+    /// Whether this backend's virtual-memory subsystem supports
+    /// petabyte-scale lazy-commit reservations — the architectural
+    /// capability that lets runtimes pre-reserve very large virtual
+    /// ranges and only materialise physical backing on access.
+    /// Hosted satisfies this through `mmap(PROT_NONE)`. Bare-metal
+    /// targets satisfy it once their `hal::vmm::AddressSpace`
+    /// implementation reaches a full reserve/commit/decommit
+    /// surface and the kernel routes runtime allocations through
+    /// it. The default `false` keeps backends that have not yet
+    /// wired this up on a conservative "every byte allocated up
+    /// front" allocation strategy.
+    fn has_lazy_commit_virtual_memory(&self) -> bool {
+        false
+    }
+
     /// Powers the machine off and never returns.
     fn shutdown(&self) -> !;
 

@@ -42,15 +42,53 @@ fn build_engine_for_platform<P: Cpu + Clone>(
     config.with_custom_code_memory(Some(Arc::new(PlatformCodeMemory {
         platform: platform.clone(),
     })));
-    config.with_host_memory(Arc::new(UserMemoryCreator));
     config.signals_based_traps(true);
-    config.memory_guard_size(helios_artifact::CWASM_NO_VMEM_MEMORY_GUARD_SIZE);
-    config.memory_reservation(helios_artifact::CWASM_NO_VMEM_MEMORY_RESERVATION);
-    config.memory_reservation_for_growth(
-        helios_artifact::CWASM_NO_VMEM_MEMORY_RESERVATION_FOR_GROWTH,
-    );
-    config.memory_init_cow(false);
+    if platform.has_lazy_commit_virtual_memory() && configure_pooling(&mut config) {
+        // Pooling path took ownership of the linear-memory
+        // configuration. UserMemoryCreator must not be installed —
+        // it uses the kernel buddy heap which cannot satisfy
+        // wasmtime's per-slot pre-reservations.
+    } else {
+        // Backends without a real VM stack (or builds without
+        // `pooling-allocator`) rely on the kernel-side buddy heap;
+        // preserve the historical OnDemand path with explicit
+        // "no reservation, allocate exactly the wasm module's
+        // declared minimum" tuning so SharedMemory requests never
+        // grow physical RAM beyond what the wasm guest actually
+        // needs.
+        config.with_host_memory(Arc::new(UserMemoryCreator));
+        config.memory_guard_size(helios_artifact::CWASM_NO_VMEM_MEMORY_GUARD_SIZE);
+        config.memory_reservation(helios_artifact::CWASM_NO_VMEM_MEMORY_RESERVATION);
+        config.memory_reservation_for_growth(
+            helios_artifact::CWASM_NO_VMEM_MEMORY_RESERVATION_FOR_GROWTH,
+        );
+        config.memory_init_cow(false);
+    }
     Engine::new(&config)
+}
+
+/// Apply Wasmtime's pooling instance allocator to `config` if this
+/// build links a wasmtime variant that ships the pooling-allocator
+/// feature (currently the hosted target — wasmtime upstream still
+/// gates pooling on `std`, which is unavailable on bare-metal targets
+/// that link the `custom-virtual-memory` ABI instead).
+///
+/// Returns `true` when the pooling path was actually applied so the
+/// caller can skip the `OnDemand`-tuned host-memory wiring; returns
+/// `false` on bare-metal where the function is a structural no-op.
+#[cfg(target_os = "none")]
+fn configure_pooling(_config: &mut wasmtime::Config) -> bool {
+    false
+}
+
+#[cfg(not(target_os = "none"))]
+fn configure_pooling(config: &mut wasmtime::Config) -> bool {
+    use wasmtime::{InstanceAllocationStrategy, PoolingAllocationConfig};
+    config.allocation_strategy(InstanceAllocationStrategy::Pooling(
+        PoolingAllocationConfig::default(),
+    ));
+    config.async_stack_zeroing(false);
+    true
 }
 
 pub fn build_component_engine_for_platform<P: Cpu + Clone>(
