@@ -473,23 +473,20 @@ impl AddressSpace for RiscvUserAddressSpace {
     fn protect(&self, virt: VirtRange, flags: PageFlags) -> Result<(), AddressSpaceError> {
         validate_range(virt)?;
         let pte_flags = page_flags_to_pte(flags)?;
-        let mut state = self.state.lock();
-        let reservation = find_reservation_mut(&mut state.reservations, virt)?;
-        if !reservation
-            .committed
-            .iter()
-            .any(|region| range_contains(region.range, virt))
-        {
-            return Err(AddressSpaceError::NotCommitted);
-        }
-        for region in reservation.committed.iter_mut() {
-            if region.range == virt {
-                region.flags = flags;
-            }
-        }
-        drop(state);
         for offset in (0..virt.byte_len).step_by(PAGE_SIZE) {
             self.protect_4k(virt.start.raw() + offset, pte_flags)?;
+        }
+        let mut state = self.state.lock();
+        if let Some(reservation) = state
+            .reservations
+            .iter_mut()
+            .find(|reservation| range_contains(reservation.range, virt))
+        {
+            for region in reservation.committed.iter_mut() {
+                if region.range == virt {
+                    region.flags = flags;
+                }
+            }
         }
         Ok(())
     }
@@ -634,7 +631,12 @@ fn prot_to_flags(prot: u32) -> PageFlags {
     flags
 }
 
+fn round_up_to_page(size: usize) -> usize {
+    (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+}
+
 extern "C" fn riscv_mmap_new(size: usize, prot_flags: u32, ret: &mut *mut u8) -> c_int {
+    let size = round_up_to_page(size);
     let address_space = user_as();
     let range = match address_space.reserve(size) {
         Ok(range) => range,
@@ -652,6 +654,7 @@ extern "C" fn riscv_mmap_new(size: usize, prot_flags: u32, ret: &mut *mut u8) ->
 }
 
 extern "C" fn riscv_mmap_remap(addr: *mut u8, size: usize, prot_flags: u32) -> c_int {
+    let size = round_up_to_page(size);
     let address_space = user_as();
     let range = VirtRange::new(VirtAddr::new(addr as usize), size);
     let _ = address_space.decommit(range);
@@ -665,6 +668,7 @@ extern "C" fn riscv_mmap_remap(addr: *mut u8, size: usize, prot_flags: u32) -> c
 }
 
 extern "C" fn riscv_munmap(ptr: *mut u8, size: usize) -> c_int {
+    let size = round_up_to_page(size);
     let address_space = user_as();
     let range = VirtRange::new(VirtAddr::new(ptr as usize), size);
     match address_space.release(range) {
@@ -674,6 +678,7 @@ extern "C" fn riscv_munmap(ptr: *mut u8, size: usize) -> c_int {
 }
 
 extern "C" fn riscv_mprotect(ptr: *mut u8, size: usize, prot_flags: u32) -> c_int {
+    let size = round_up_to_page(size);
     let address_space = user_as();
     let range = VirtRange::new(VirtAddr::new(ptr as usize), size);
     if prot_flags == 0 {

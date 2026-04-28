@@ -317,24 +317,25 @@ impl AddressSpace for X86UserAddressSpace {
         self.assert_smp_safe();
         validate_range(virt)?;
         let pt_flags = page_flags_to_pt(flags)?;
-        let mut state = self.state.lock();
-        let reservation = find_reservation_mut(&mut state.reservations, virt)?;
-        if !reservation
-            .committed
-            .iter()
-            .any(|region| range_contains(region.range, virt))
-        {
-            return Err(AddressSpaceError::NotCommitted);
-        }
-        for region in reservation.committed.iter_mut() {
-            if region.range == virt {
-                region.flags = flags;
-            }
-        }
-        drop(state);
-
+        // PT is the source of truth — update entries first, treat
+        // bookkeeping as cache. Wasmtime's mprotect call patterns
+        // routinely span what we recorded as separate commits, so a
+        // single-`CommittedRegion`-must-contain-virt gate refuses
+        // valid requests.
         let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
         self.protect_pages(&mut mapper, virt, pt_flags)?;
+        let mut state = self.state.lock();
+        if let Some(reservation) = state
+            .reservations
+            .iter_mut()
+            .find(|reservation| range_contains(reservation.range, virt))
+        {
+            for region in reservation.committed.iter_mut() {
+                if region.range == virt {
+                    region.flags = flags;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -475,7 +476,12 @@ fn prot_to_flags(prot: u32) -> PageFlags {
     flags
 }
 
+fn round_up_to_page(size: usize) -> usize {
+    (size + PAGE - 1) & !(PAGE - 1)
+}
+
 extern "C" fn x86_mmap_new(size: usize, prot_flags: u32, ret: &mut *mut u8) -> c_int {
+    let size = round_up_to_page(size);
     let address_space = user_as();
     let range = match address_space.reserve(size) {
         Ok(range) => range,
@@ -493,6 +499,7 @@ extern "C" fn x86_mmap_new(size: usize, prot_flags: u32, ret: &mut *mut u8) -> c
 }
 
 extern "C" fn x86_mmap_remap(addr: *mut u8, size: usize, prot_flags: u32) -> c_int {
+    let size = round_up_to_page(size);
     let address_space = user_as();
     let range = VirtRange::new(VirtAddr::new(addr as usize), size);
     let _ = address_space.decommit(range);
@@ -506,6 +513,7 @@ extern "C" fn x86_mmap_remap(addr: *mut u8, size: usize, prot_flags: u32) -> c_i
 }
 
 extern "C" fn x86_munmap(ptr: *mut u8, size: usize) -> c_int {
+    let size = round_up_to_page(size);
     let address_space = user_as();
     let range = VirtRange::new(VirtAddr::new(ptr as usize), size);
     match address_space.release(range) {
@@ -515,6 +523,7 @@ extern "C" fn x86_munmap(ptr: *mut u8, size: usize) -> c_int {
 }
 
 extern "C" fn x86_mprotect(ptr: *mut u8, size: usize, prot_flags: u32) -> c_int {
+    let size = round_up_to_page(size);
     let address_space = user_as();
     let range = VirtRange::new(VirtAddr::new(ptr as usize), size);
     if prot_flags == 0 {

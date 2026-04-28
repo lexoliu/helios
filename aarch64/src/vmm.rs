@@ -377,23 +377,32 @@ impl AddressSpace for Aarch64UserAddressSpace {
     fn protect(&self, virt: VirtRange, flags: PageFlags) -> Result<(), AddressSpaceError> {
         validate_range(virt)?;
         let pte_flags = page_flags_to_pte(flags)?;
-        let mut state = self.state.lock();
-        let reservation = find_reservation_mut(&mut state.reservations, virt)?;
-        if !reservation
-            .committed
-            .iter()
-            .any(|region| range_contains(region.range, virt))
-        {
-            return Err(AddressSpaceError::NotCommitted);
-        }
-        for region in reservation.committed.iter_mut() {
-            if region.range == virt {
-                region.flags = flags;
-            }
-        }
-        drop(state);
+        // Walk the page table directly rather than constraining the
+        // call to a single bookkeeping `CommittedRegion`. Wasmtime's
+        // `make_readonly` / `make_executable` routinely span what
+        // we recorded as separate commits (e.g. when a code memory
+        // is committed in halves and then protected as a single
+        // span); updating per-page PTEs and rejecting only on
+        // genuinely missing mappings keeps the semantic at "the PT
+        // is the source of truth".
         for offset in (0..virt.byte_len).step_by(PAGE) {
             self.protect_4k(virt.start.raw() + offset, pte_flags)?;
+        }
+        // Best-effort bookkeeping update — flag changes on
+        // exact-match committed regions stay accurate, partial
+        // overlaps lose the recorded flags and fall back to
+        // re-querying the PT through `translate`.
+        let mut state = self.state.lock();
+        if let Some(reservation) = state
+            .reservations
+            .iter_mut()
+            .find(|reservation| range_contains(reservation.range, virt))
+        {
+            for region in reservation.committed.iter_mut() {
+                if region.range == virt {
+                    region.flags = flags;
+                }
+            }
         }
         Ok(())
     }
@@ -538,7 +547,12 @@ fn prot_to_flags(prot: u32) -> PageFlags {
     flags
 }
 
+fn round_up_to_page(size: usize) -> usize {
+    (size + PAGE - 1) & !(PAGE - 1)
+}
+
 extern "C" fn aarch64_mmap_new(size: usize, prot_flags: u32, ret: &mut *mut u8) -> c_int {
+    let size = round_up_to_page(size);
     let address_space = user_as();
     let range = match address_space.reserve(size) {
         Ok(range) => range,
@@ -556,6 +570,7 @@ extern "C" fn aarch64_mmap_new(size: usize, prot_flags: u32, ret: &mut *mut u8) 
 }
 
 extern "C" fn aarch64_mmap_remap(addr: *mut u8, size: usize, prot_flags: u32) -> c_int {
+    let size = round_up_to_page(size);
     let address_space = user_as();
     let range = VirtRange::new(VirtAddr::new(addr as usize), size);
     let _ = address_space.decommit(range);
@@ -569,6 +584,7 @@ extern "C" fn aarch64_mmap_remap(addr: *mut u8, size: usize, prot_flags: u32) ->
 }
 
 extern "C" fn aarch64_munmap(ptr: *mut u8, size: usize) -> c_int {
+    let size = round_up_to_page(size);
     let address_space = user_as();
     let range = VirtRange::new(VirtAddr::new(ptr as usize), size);
     match address_space.release(range) {
@@ -578,6 +594,7 @@ extern "C" fn aarch64_munmap(ptr: *mut u8, size: usize) -> c_int {
 }
 
 extern "C" fn aarch64_mprotect(ptr: *mut u8, size: usize, prot_flags: u32) -> c_int {
+    let size = round_up_to_page(size);
     let address_space = user_as();
     let range = VirtRange::new(VirtAddr::new(ptr as usize), size);
     if prot_flags == 0 {

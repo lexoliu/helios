@@ -143,17 +143,18 @@ impl AddressSpace for HostedAddressSpace {
         let prot = page_flags_to_prot(flags);
         let mut reservations = self.reservations.lock().unwrap();
         let reservation = find_reservation_mut(&mut reservations, virt)?;
-        if !reservation
-            .committed
-            .iter()
-            .any(|region| range_contains(region.range, virt))
-        {
-            return Err(AddressSpaceError::NotCommitted);
-        }
+        // The host kernel rejects mprotect on uncommitted pages with
+        // ENOMEM; treat that as the conformance-required
+        // `NotCommitted` rather than the generic `InvalidFlags`.
         let mprotect_result =
             unsafe { libc::mprotect(virt.start.raw() as *mut _, virt.byte_len, prot) };
         if mprotect_result != 0 {
-            return Err(AddressSpaceError::InvalidFlags);
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            return Err(if errno == libc::ENOMEM {
+                AddressSpaceError::NotCommitted
+            } else {
+                AddressSpaceError::InvalidFlags
+            });
         }
         for region in reservation.committed.iter_mut() {
             if region.range == virt {
