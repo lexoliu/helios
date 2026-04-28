@@ -465,6 +465,9 @@ fn main(hart_id: usize, fdt_addr: usize, opaque: usize) -> ! {
 }
 
 #[unsafe(no_mangle)]
+mod vmm;
+pub use vmm::RiscvUserAddressSpace;
+
 extern "C" fn secondary_start_rust(hart_id: usize, fdt_addr: usize) -> ! {
     run_hart(hart_id, fdt_addr)
 }
