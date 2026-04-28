@@ -1154,7 +1154,7 @@ fn parent_table_flags(flags: PageTableFlags) -> PageTableFlags {
     parent
 }
 
-unsafe fn current_mapper(physical_memory_offset: usize) -> OffsetPageTable<'static> {
+pub(crate) unsafe fn current_mapper(physical_memory_offset: usize) -> OffsetPageTable<'static> {
     let (level_4, _) = Cr3::read();
     let virtual_address = level_4
         .start_address()
@@ -1165,8 +1165,8 @@ unsafe fn current_mapper(physical_memory_offset: usize) -> OffsetPageTable<'stat
     unsafe { OffsetPageTable::new(table, VirtAddr::new(physical_memory_offset as u64)) }
 }
 
-struct DirectMappedFrameAllocator {
-    physical_memory_offset: usize,
+pub(crate) struct DirectMappedFrameAllocator {
+    pub(crate) physical_memory_offset: usize,
 }
 
 unsafe impl FrameAllocator<Size4KiB> for DirectMappedFrameAllocator {

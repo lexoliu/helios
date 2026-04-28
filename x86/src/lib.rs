@@ -61,6 +61,9 @@ static CRITICAL_SECTION_STATE: helios_hal::critical_section::CriticalSectionStat
 
 global_asm!(include_str!("secondary_wakeup.S"));
 
+mod vmm;
+pub use vmm::X86UserAddressSpace;
+
 struct X86InterruptOps;
 
 impl helios_hal::critical_section::InterruptOps for X86InterruptOps {
