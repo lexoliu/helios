@@ -570,6 +570,18 @@ extern "C" fn aarch64_mmap_new(size: usize, prot_flags: u32, ret: &mut *mut u8) 
 }
 
 extern "C" fn aarch64_mmap_remap(addr: *mut u8, size: usize, prot_flags: u32) -> c_int {
+    // wasmtime's `mmap_remap` semantically rebinds an existing
+    // mapping to fresh anonymous-zero pages with `prot_flags`. Our
+    // AddressSpace cannot atomically swap to brand-new frames in a
+    // single transaction (that's what `relocate` will eventually
+    // do), so the closest faithful sequence is decommit→commit:
+    // decommit releases the old frames back to the kernel
+    // allocator, commit grabs fresh `alloc_zeroed` frames and maps
+    // them at the same virtual range with the requested flags. The
+    // intermediate window where the range is uncommitted is
+    // invisible to wasmtime because remap is called between
+    // instances on a slot the runtime guarantees no thread is
+    // touching.
     let size = round_up_to_page(size);
     let address_space = user_as();
     let range = VirtRange::new(VirtAddr::new(addr as usize), size);

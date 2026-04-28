@@ -164,6 +164,76 @@ impl AddressSpace for HostedAddressSpace {
         Ok(())
     }
 
+    fn relocate(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
+        validate_range(virt)?;
+        let mut reservations = self.reservations.lock().unwrap();
+        let reservation = find_reservation_mut(&mut reservations, virt)?;
+        // Snapshot every committed sub-region that lies inside
+        // `virt` so we can restore it after the in-place "reseat".
+        // Hosted has no concept of "physical frame allocation" —
+        // libc owns the page-level placement under our mmap. The
+        // only behaviour we can faithfully reproduce is to
+        // round-trip the bytes through a temporary buffer, keeping
+        // the virtual base stable. For workloads that care about
+        // physical contiguity (the bare-metal compactor's real
+        // motivation), hosted is by definition a "no-op success" —
+        // the host kernel has already placed the bytes wherever it
+        // wants and a kernel-level remap cannot change that.
+        let snapshots: Vec<_> = reservation
+            .committed
+            .iter()
+            .filter(|region| ranges_overlap(region.range, virt))
+            .copied()
+            .collect();
+        if snapshots.is_empty() {
+            return Err(AddressSpaceError::NotCommitted);
+        }
+        for region in &snapshots {
+            // Read the live bytes through the existing mapping.
+            let live: Vec<u8> = unsafe {
+                core::slice::from_raw_parts(
+                    region.range.start.raw() as *const u8,
+                    region.range.byte_len,
+                )
+                .to_vec()
+            };
+            // Reset the host kernel's view: drop the pages, then
+            // mprotect the same range back to the same flags. The
+            // host returns fresh zeroed pages on the next access;
+            // we restore the captured bytes immediately so callers
+            // see the data unchanged.
+            unsafe {
+                #[cfg(target_os = "linux")]
+                libc::madvise(
+                    region.range.start.raw() as *mut _,
+                    region.range.byte_len,
+                    libc::MADV_DONTNEED,
+                );
+                #[cfg(target_os = "macos")]
+                libc::madvise(
+                    region.range.start.raw() as *mut _,
+                    region.range.byte_len,
+                    libc::MADV_FREE,
+                );
+                let prot = page_flags_to_prot(region.flags);
+                if libc::mprotect(
+                    region.range.start.raw() as *mut _,
+                    region.range.byte_len,
+                    prot,
+                ) != 0
+                {
+                    return Err(AddressSpaceError::InvalidFlags);
+                }
+                core::ptr::copy_nonoverlapping(
+                    live.as_ptr(),
+                    region.range.start.raw() as *mut u8,
+                    region.range.byte_len,
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn translate(&self, addr: VirtAddr) -> Translation {
         let reservations = self.reservations.lock().unwrap();
         for reservation in reservations.iter() {
@@ -300,5 +370,28 @@ mod tests {
             fresh: HostedAddressSpace::new,
             verify_writes: true,
         });
+    }
+
+    #[test]
+    fn relocate_preserves_committed_bytes() {
+        use helios_hal::vmm::AddressSpace;
+        let address_space = HostedAddressSpace::new();
+        let range = address_space.reserve(page_aligned_len(2)).unwrap();
+        address_space
+            .commit(range, PageFlags::READ | PageFlags::WRITE)
+            .unwrap();
+        let pointer = range.start.raw() as *mut u8;
+        unsafe {
+            for byte in 0..(range.byte_len.min(256)) {
+                pointer.add(byte).write_volatile((byte & 0xff) as u8);
+            }
+        }
+        address_space.relocate(range).expect("relocate succeeds");
+        unsafe {
+            for byte in 0..(range.byte_len.min(256)) {
+                assert_eq!(pointer.add(byte).read_volatile(), (byte & 0xff) as u8);
+            }
+        }
+        address_space.release(range).unwrap();
     }
 }
