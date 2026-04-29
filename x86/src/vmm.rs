@@ -19,6 +19,8 @@
 
 use alloc::vec::Vec;
 use core::ffi::c_int;
+use core::ptr;
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use helios_hal::pmm::PhysFrame;
@@ -29,7 +31,9 @@ use helios_kernel::custom_vm::{
     self, CustomVmHooks, default_memory_image_free, default_memory_image_map_at,
     default_memory_image_new, default_page_size,
 };
+use helios_kernel::{allocate_user_frame_zeroed, deallocate_user_frame};
 use spin::{Mutex, Once};
+use x86_64::PhysAddr;
 use x86_64::VirtAddr as X86VirtAddr;
 use x86_64::instructions::tlb::flush as invalidate_local_tlb;
 use x86_64::structures::paging::mapper::TranslateResult;
@@ -83,6 +87,15 @@ struct Reservation {
 struct CommittedRegion {
     range: VirtRange,
     flags: PageFlags,
+}
+
+#[derive(Clone, Copy)]
+struct RelocationPage {
+    page: Page<Size4KiB>,
+    virt: usize,
+    old_phys: usize,
+    old_flags: PageTableFlags,
+    new_phys: usize,
 }
 
 impl X86UserAddressSpace {
@@ -159,16 +172,21 @@ impl X86UserAddressSpace {
     ) -> Result<(), AddressSpaceError> {
         for offset in (0..virt.byte_len).step_by(PAGE) {
             let virt_addr = virt.start.raw() + offset;
-            let frame = frame_allocator
-                .allocate_frame_for_user()
-                .ok_or(AddressSpaceError::OutOfFrames)?;
+            let phys = self.alloc_user_frame()?;
+            let frame = x86_64::structures::paging::PhysFrame::from_start_address(PhysAddr::new(
+                phys as u64,
+            ))
+            .map_err(|_| AddressSpaceError::Misaligned)?;
             let page =
                 Page::<Size4KiB>::from_start_address(X86VirtAddr::new(virt_addr as u64))
                     .map_err(|_| AddressSpaceError::Misaligned)?;
             unsafe {
                 mapper
                     .map_to(page, frame, flags, frame_allocator)
-                    .map_err(|_| AddressSpaceError::PageTableExhausted)?
+                    .map_err(|_| {
+                        self.dealloc_user_phys(phys);
+                        AddressSpaceError::PageTableExhausted
+                    })?
                     .flush();
             }
         }
@@ -186,14 +204,9 @@ impl X86UserAddressSpace {
                 Page::<Size4KiB>::from_start_address(X86VirtAddr::new(virt_addr as u64))
                     .map_err(|_| AddressSpaceError::Misaligned)?;
             match mapper.unmap(page) {
-                Ok((_frame, flush)) => {
+                Ok((frame, flush)) => {
                     flush.flush();
-                    // Frame is leaked — the buddy heap underneath
-                    // `DirectMappedFrameAllocator` does not yet expose a
-                    // dealloc hook; once the user-memory pool wires
-                    // through the allocator-api this becomes a real
-                    // free. For now releasing the reservation is the
-                    // visible effect.
+                    self.dealloc_user_phys(frame.start_address().as_u64() as usize);
                 }
                 Err(_) => {
                     // Page was never committed. Skip.
@@ -220,6 +233,132 @@ impl X86UserAddressSpace {
             }
         }
         Ok(())
+    }
+
+    fn alloc_user_frame(&self) -> Result<usize, AddressSpaceError> {
+        let raw = allocate_user_frame_zeroed().map_err(|_| AddressSpaceError::OutOfFrames)?;
+        Ok(raw.as_ptr() as usize - self.physical_memory_offset)
+    }
+
+    fn hhdm_ptr(&self, phys: usize) -> *mut u8 {
+        let virt = phys
+            .checked_add(self.physical_memory_offset)
+            .unwrap_or_else(|| panic!("x86 user-frame HHDM address overflow"));
+        virt as *mut u8
+    }
+
+    fn dealloc_user_phys(&self, phys: usize) {
+        let ptr = NonNull::new(self.hhdm_ptr(phys))
+            .unwrap_or_else(|| panic!("x86 user-frame dealloc received null HHDM pointer"));
+        deallocate_user_frame(ptr);
+    }
+
+    fn build_relocation_plan(
+        &self,
+        mapper: &OffsetPageTable<'static>,
+        virt: VirtRange,
+    ) -> Result<Vec<RelocationPage>, AddressSpaceError> {
+        let mut pages: Vec<RelocationPage> = Vec::new();
+        for offset in (0..virt.byte_len).step_by(PAGE) {
+            let virt_addr = virt.start.raw() + offset;
+            let page = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(virt_addr as u64))
+                .map_err(|_| AddressSpaceError::Misaligned)?;
+            let (old_phys, old_flags) = match mapper.translate(X86VirtAddr::new(virt_addr as u64))
+            {
+                TranslateResult::Mapped { frame, flags, .. } => {
+                    (frame.start_address().as_u64() as usize, flags)
+                }
+                _ => {
+                    for page in pages {
+                        self.dealloc_user_phys(page.new_phys);
+                    }
+                    return Err(AddressSpaceError::NotCommitted);
+                }
+            };
+            let new_phys = match self.alloc_user_frame() {
+                Ok(phys) => phys,
+                Err(error) => {
+                    for page in pages {
+                        self.dealloc_user_phys(page.new_phys);
+                    }
+                    return Err(error);
+                }
+            };
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    self.hhdm_ptr(old_phys) as *const u8,
+                    self.hhdm_ptr(new_phys),
+                    PAGE,
+                );
+            }
+            pages.push(RelocationPage {
+                page,
+                virt: virt_addr,
+                old_phys,
+                old_flags,
+                new_phys,
+            });
+        }
+        Ok(pages)
+    }
+
+    fn remap_page(
+        &self,
+        mapper: &mut OffsetPageTable<'static>,
+        frame_allocator: &mut DirectMappedFrameAllocator,
+        page: RelocationPage,
+        phys: usize,
+        flags: PageTableFlags,
+    ) -> Result<(), AddressSpaceError> {
+        let (old_frame, flush) = mapper
+            .unmap(page.page)
+            .map_err(|_| AddressSpaceError::NotCommitted)?;
+        flush.flush();
+        let new_frame = x86_64::structures::paging::PhysFrame::from_start_address(PhysAddr::new(
+            phys as u64,
+        ))
+        .map_err(|_| AddressSpaceError::Misaligned)?;
+        match unsafe { mapper.map_to(page.page, new_frame, flags, frame_allocator) } {
+            Ok(flush) => {
+                flush.flush();
+                Ok(())
+            }
+            Err(_) => {
+                unsafe {
+                    mapper
+                        .map_to(page.page, old_frame, page.old_flags, frame_allocator)
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "x86 AddressSpace::relocate failed to restore page {:#x}: {error:?}",
+                                page.virt
+                            )
+                        })
+                        .flush();
+                }
+                Err(AddressSpaceError::PageTableExhausted)
+            }
+        }
+    }
+
+    fn rollback_relocation(
+        &self,
+        mapper: &mut OffsetPageTable<'static>,
+        frame_allocator: &mut DirectMappedFrameAllocator,
+        pages: &[RelocationPage],
+        installed: usize,
+    ) {
+        for page in pages[..installed].iter().rev().copied() {
+            self.remap_page(mapper, frame_allocator, page, page.old_phys, page.old_flags)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "x86 AddressSpace::relocate rollback failed at {:#x}: {error}",
+                        page.virt
+                    )
+                });
+        }
+        for page in pages {
+            self.dealloc_user_phys(page.new_phys);
+        }
     }
 }
 
@@ -296,16 +435,10 @@ impl AddressSpace for X86UserAddressSpace {
         validate_range(virt)?;
         let mut state = self.state.lock();
         let reservation = find_reservation_mut(&mut state.reservations, virt)?;
-        if !reservation
-            .committed
-            .iter()
-            .any(|region| range_contains(region.range, virt))
-        {
+        if !committed_regions_cover(&reservation.committed, virt) {
             return Err(AddressSpaceError::NotCommitted);
         }
-        reservation
-            .committed
-            .retain(|region| !ranges_overlap(region.range, virt));
+        remove_committed_range(&mut reservation.committed, virt);
         drop(state);
 
         let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
@@ -374,18 +507,42 @@ impl AddressSpace for X86UserAddressSpace {
             _ => Translation::Reserved,
         }
     }
-}
 
-impl DirectMappedFrameAllocator {
-    /// Wrapper around `FrameAllocator::allocate_frame` that returns a
-    /// strongly-typed `Size4KiB` frame for the user AS commit path.
-    /// The underlying allocator is identical to the one the existing
-    /// page-table walker uses.
-    fn allocate_frame_for_user(
-        &mut self,
-    ) -> Option<x86_64::structures::paging::PhysFrame<Size4KiB>> {
-        use x86_64::structures::paging::FrameAllocator;
-        FrameAllocator::<Size4KiB>::allocate_frame(self)
+    fn relocate(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
+        self.assert_smp_safe();
+        validate_range(virt)?;
+        let state = self.state.lock();
+        let reservation = state
+            .reservations
+            .iter()
+            .find(|reservation| range_contains(reservation.range, virt))
+            .ok_or(AddressSpaceError::NotReserved)?;
+        if !committed_regions_cover(&reservation.committed, virt) {
+            return Err(AddressSpaceError::NotCommitted);
+        }
+        drop(state);
+
+        let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
+        let mut frame_allocator = DirectMappedFrameAllocator {
+            physical_memory_offset: self.physical_memory_offset,
+        };
+        let pages = self.build_relocation_plan(&mapper, virt)?;
+        for (index, page) in pages.iter().copied().enumerate() {
+            if let Err(error) = self.remap_page(
+                &mut mapper,
+                &mut frame_allocator,
+                page,
+                page.new_phys,
+                page.old_flags,
+            ) {
+                self.rollback_relocation(&mut mapper, &mut frame_allocator, &pages, index);
+                return Err(error);
+            }
+        }
+        for page in &pages {
+            self.dealloc_user_phys(page.old_phys);
+        }
+        Ok(())
     }
 }
 
@@ -415,6 +572,52 @@ fn range_contains(outer: VirtRange, inner: VirtRange) -> bool {
 
 fn ranges_overlap(a: VirtRange, b: VirtRange) -> bool {
     a.start.raw() < b.end().raw() && b.start.raw() < a.end().raw()
+}
+
+fn committed_regions_cover(regions: &[CommittedRegion], range: VirtRange) -> bool {
+    let mut cursor = range.start.raw();
+    let end = range.end().raw();
+    while cursor < end {
+        let Some(region) = regions
+            .iter()
+            .find(|region| region.range.contains(VirtAddr::new(cursor)))
+        else {
+            return false;
+        };
+        cursor = region.range.end().raw().min(end);
+    }
+    true
+}
+
+fn remove_committed_range(regions: &mut Vec<CommittedRegion>, range: VirtRange) {
+    let mut index = 0;
+    while index < regions.len() {
+        let region = regions[index];
+        if !ranges_overlap(region.range, range) {
+            index += 1;
+            continue;
+        }
+
+        regions.swap_remove(index);
+        if region.range.start.raw() < range.start.raw() {
+            regions.push(CommittedRegion {
+                range: VirtRange::new(
+                    region.range.start,
+                    range.start.raw() - region.range.start.raw(),
+                ),
+                flags: region.flags,
+            });
+        }
+        if range.end().raw() < region.range.end().raw() {
+            regions.push(CommittedRegion {
+                range: VirtRange::new(
+                    range.end(),
+                    region.range.end().raw() - range.end().raw(),
+                ),
+                flags: region.flags,
+            });
+        }
+    }
 }
 
 fn page_flags_to_pt(flags: PageFlags) -> Result<PageTableFlags, AddressSpaceError> {

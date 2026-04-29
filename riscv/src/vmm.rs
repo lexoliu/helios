@@ -44,6 +44,7 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::ffi::c_int;
 use core::ops::Range;
+use core::ptr;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -55,6 +56,7 @@ use helios_kernel::custom_vm::{
     self, CustomVmHooks, default_memory_image_free, default_memory_image_map_at,
     default_memory_image_new, default_page_size,
 };
+use helios_kernel::{allocate_user_frame_zeroed, deallocate_user_frame};
 use spin::{Mutex, Once};
 
 const PAGE_SHIFT: u32 = 12;
@@ -74,6 +76,7 @@ const PTE_GLOBAL: u64 = 1 << 5;
 const PTE_ACCESSED: u64 = 1 << 6;
 const PTE_DIRTY: u64 = 1 << 7;
 const PTE_PPN_SHIFT: u32 = 10;
+const PTE_FLAGS_MASK: u64 = (1 << PTE_PPN_SHIFT) - 1;
 
 const SATP_MODE_SV39: u64 = 8 << 60;
 
@@ -206,6 +209,14 @@ struct Reservation {
 struct CommittedRegion {
     range: VirtRange,
     flags: PageFlags,
+}
+
+#[derive(Clone, Copy)]
+struct RelocationPage {
+    virt: usize,
+    old_phys: usize,
+    old_entry: u64,
+    new_phys: usize,
 }
 
 impl RiscvUserAddressSpace {
@@ -376,6 +387,94 @@ impl RiscvUserAddressSpace {
         let ppn = entry >> PTE_PPN_SHIFT;
         Some(((ppn as usize) << PAGE_SHIFT, entry))
     }
+
+    fn replace_4k(&self, virt: usize, new_entry: u64) -> Result<u64, AddressSpaceError> {
+        let l2 = self.root_table();
+        let l2_index = (virt >> 30) & 0x1ff;
+        if l2[l2_index] & PTE_VALID == 0 {
+            return Err(AddressSpaceError::NotCommitted);
+        }
+        let l1_phys = ((l2[l2_index] >> PTE_PPN_SHIFT) << PAGE_SHIFT) as usize;
+        let l1 = unsafe { &mut *(l1_phys as *mut [u64; PTE_COUNT]) };
+        let l1_index = (virt >> 21) & 0x1ff;
+        if l1[l1_index] & PTE_VALID == 0 {
+            return Err(AddressSpaceError::NotCommitted);
+        }
+        let l0_phys = ((l1[l1_index] >> PTE_PPN_SHIFT) << PAGE_SHIFT) as usize;
+        let l0 = unsafe { &mut *(l0_phys as *mut [u64; PTE_COUNT]) };
+        let l0_index = (virt >> 12) & 0x1ff;
+        let old_entry = l0[l0_index];
+        if old_entry & PTE_VALID == 0 {
+            return Err(AddressSpaceError::NotCommitted);
+        }
+        l0[l0_index] = new_entry;
+        sfence_vma_addr(virt);
+        Ok(old_entry)
+    }
+
+    fn alloc_user_frame(&self) -> Result<usize, AddressSpaceError> {
+        let raw = allocate_user_frame_zeroed().map_err(|_| AddressSpaceError::OutOfFrames)?;
+        Ok(raw.as_ptr() as usize)
+    }
+
+    fn dealloc_user_phys(&self, phys: usize) {
+        let ptr = NonNull::new(phys as *mut u8)
+            .unwrap_or_else(|| panic!("RISC-V user-frame dealloc received null pointer"));
+        deallocate_user_frame(ptr);
+    }
+
+    fn build_relocation_plan(
+        &self,
+        virt: VirtRange,
+    ) -> Result<Vec<RelocationPage>, AddressSpaceError> {
+        let mut pages: Vec<RelocationPage> = Vec::new();
+        for offset in (0..virt.byte_len).step_by(PAGE_SIZE) {
+            let virt_addr = virt.start.raw() + offset;
+            let (old_phys, old_entry) = match self.translate_4k(virt_addr) {
+                Some(translation) => translation,
+                None => {
+                    for page in pages {
+                        self.dealloc_user_phys(page.new_phys);
+                    }
+                    return Err(AddressSpaceError::NotCommitted);
+                }
+            };
+            let new_phys = match self.alloc_user_frame() {
+                Ok(phys) => phys,
+                Err(error) => {
+                    for page in pages {
+                        self.dealloc_user_phys(page.new_phys);
+                    }
+                    return Err(error);
+                }
+            };
+            unsafe {
+                ptr::copy_nonoverlapping(old_phys as *const u8, new_phys as *mut u8, PAGE_SIZE);
+            }
+            pages.push(RelocationPage {
+                virt: virt_addr,
+                old_phys,
+                old_entry,
+                new_phys,
+            });
+        }
+        Ok(pages)
+    }
+
+    fn rollback_relocation(&self, pages: &[RelocationPage], installed: usize) {
+        for page in pages[..installed].iter().rev() {
+            self.replace_4k(page.virt, page.old_entry)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "RISC-V AddressSpace::relocate rollback failed at {:#x}: {error}",
+                        page.virt
+                    )
+                });
+        }
+        for page in pages {
+            self.dealloc_user_phys(page.new_phys);
+        }
+    }
 }
 
 impl AddressSpace for RiscvUserAddressSpace {
@@ -407,7 +506,10 @@ impl AddressSpace for RiscvUserAddressSpace {
         drop(state);
         for region in &reservation.committed {
             for offset in (0..region.range.byte_len).step_by(PAGE_SIZE) {
-                let _ = self.unmap_4k(region.range.start.raw() + offset);
+                if let Ok(entry) = self.unmap_4k(region.range.start.raw() + offset) {
+                    let phys = ((entry >> PTE_PPN_SHIFT) << PAGE_SHIFT) as usize;
+                    self.dealloc_user_phys(phys);
+                }
             }
         }
         self.state.lock().free_list.push(reservation.range);
@@ -431,13 +533,7 @@ impl AddressSpace for RiscvUserAddressSpace {
 
         for offset in (0..virt.byte_len).step_by(PAGE_SIZE) {
             let virt_addr = virt.start.raw() + offset;
-            let layout = Layout::from_size_align(PAGE_SIZE, PAGE_SIZE)
-                .expect("Sv39 page layout is well-formed");
-            let frame_ptr = unsafe { alloc_zeroed(layout) };
-            if frame_ptr.is_null() {
-                return Err(AddressSpaceError::OutOfFrames);
-            }
-            let phys = frame_ptr as usize;
+            let phys = self.alloc_user_frame()?;
             self.map_4k(virt_addr, phys, pte_flags)?;
         }
 
@@ -453,19 +549,15 @@ impl AddressSpace for RiscvUserAddressSpace {
         validate_range(virt)?;
         let mut state = self.state.lock();
         let reservation = find_reservation_mut(&mut state.reservations, virt)?;
-        if !reservation
-            .committed
-            .iter()
-            .any(|region| range_contains(region.range, virt))
-        {
+        if !committed_regions_cover(&reservation.committed, virt) {
             return Err(AddressSpaceError::NotCommitted);
         }
-        reservation
-            .committed
-            .retain(|region| !ranges_overlap(region.range, virt));
+        remove_committed_range(&mut reservation.committed, virt);
         drop(state);
         for offset in (0..virt.byte_len).step_by(PAGE_SIZE) {
-            let _ = self.unmap_4k(virt.start.raw() + offset);
+            let entry = self.unmap_4k(virt.start.raw() + offset)?;
+            let phys = ((entry >> PTE_PPN_SHIFT) << PAGE_SHIFT) as usize;
+            self.dealloc_user_phys(phys);
         }
         Ok(())
     }
@@ -523,6 +615,34 @@ impl AddressSpace for RiscvUserAddressSpace {
             None => Translation::Reserved,
         }
     }
+
+    fn relocate(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
+        validate_range(virt)?;
+        let state = self.state.lock();
+        let reservation = state
+            .reservations
+            .iter()
+            .find(|reservation| range_contains(reservation.range, virt))
+            .ok_or(AddressSpaceError::NotReserved)?;
+        if !committed_regions_cover(&reservation.committed, virt) {
+            return Err(AddressSpaceError::NotCommitted);
+        }
+        drop(state);
+
+        let pages = self.build_relocation_plan(virt)?;
+        for (index, page) in pages.iter().enumerate() {
+            let new_entry = (((page.new_phys as u64) >> PAGE_SHIFT) << PTE_PPN_SHIFT)
+                | (page.old_entry & PTE_FLAGS_MASK);
+            if let Err(error) = self.replace_4k(page.virt, new_entry) {
+                self.rollback_relocation(&pages, index);
+                return Err(error);
+            }
+        }
+        for page in &pages {
+            self.dealloc_user_phys(page.old_phys);
+        }
+        Ok(())
+    }
 }
 
 fn sfence_vma_addr(virt: usize) {
@@ -533,6 +653,17 @@ fn sfence_vma_addr(virt: usize) {
             options(nostack, preserves_flags),
         );
     }
+    let ret = sbi_rt::remote_sfence_vma(
+        sbi_rt::HartMask::from_mask_base(0, usize::MAX),
+        virt,
+        PAGE_SIZE,
+    );
+    assert!(
+        ret.is_ok(),
+        "SBI remote_sfence_vma failed for user VA {virt:#x}: error={} value={}",
+        ret.error,
+        ret.value
+    );
 }
 
 fn validate_range(virt: VirtRange) -> Result<(), AddressSpaceError> {
@@ -561,6 +692,52 @@ fn range_contains(outer: VirtRange, inner: VirtRange) -> bool {
 
 fn ranges_overlap(a: VirtRange, b: VirtRange) -> bool {
     a.start.raw() < b.end().raw() && b.start.raw() < a.end().raw()
+}
+
+fn committed_regions_cover(regions: &[CommittedRegion], range: VirtRange) -> bool {
+    let mut cursor = range.start.raw();
+    let end = range.end().raw();
+    while cursor < end {
+        let Some(region) = regions
+            .iter()
+            .find(|region| region.range.contains(VirtAddr::new(cursor)))
+        else {
+            return false;
+        };
+        cursor = region.range.end().raw().min(end);
+    }
+    true
+}
+
+fn remove_committed_range(regions: &mut Vec<CommittedRegion>, range: VirtRange) {
+    let mut index = 0;
+    while index < regions.len() {
+        let region = regions[index];
+        if !ranges_overlap(region.range, range) {
+            index += 1;
+            continue;
+        }
+
+        regions.swap_remove(index);
+        if region.range.start.raw() < range.start.raw() {
+            regions.push(CommittedRegion {
+                range: VirtRange::new(
+                    region.range.start,
+                    range.start.raw() - region.range.start.raw(),
+                ),
+                flags: region.flags,
+            });
+        }
+        if range.end().raw() < region.range.end().raw() {
+            regions.push(CommittedRegion {
+                range: VirtRange::new(
+                    range.end(),
+                    region.range.end().raw() - range.end().raw(),
+                ),
+                flags: region.flags,
+            });
+        }
+    }
 }
 
 fn page_flags_to_pte(flags: PageFlags) -> Result<u64, AddressSpaceError> {
