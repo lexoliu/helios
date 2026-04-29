@@ -25,7 +25,7 @@ use alloc::alloc::{Layout, alloc_zeroed};
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::ffi::c_int;
-use core::ptr::NonNull;
+use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use helios_hal::pmm::PhysFrame;
@@ -79,6 +79,13 @@ struct Reservation {
 struct CommittedRegion {
     range: VirtRange,
     flags: PageFlags,
+}
+
+#[derive(Clone, Copy)]
+struct RelocationPage {
+    virt: usize,
+    old_entry: u64,
+    new_phys: usize,
 }
 
 impl Aarch64UserAddressSpace {
@@ -278,20 +285,116 @@ impl Aarch64UserAddressSpace {
         Some(entry)
     }
 
+    fn replace_4k(&self, virt: usize, new_entry: u64) -> Result<u64, AddressSpaceError> {
+        let l0 = self.root();
+        let l0_entry = unsafe { l0.add((virt >> 39) & 0x1ff).read_volatile() };
+        if l0_entry & 0b11 != TABLE_DESCRIPTOR {
+            return Err(AddressSpaceError::NotCommitted);
+        }
+        let l1 = ((l0_entry & PT_ADDR_MASK) as usize + self.physical_memory_offset) as *mut u64;
+        let l1_entry = unsafe { l1.add((virt >> 30) & 0x1ff).read_volatile() };
+        if l1_entry & 0b11 != TABLE_DESCRIPTOR {
+            return Err(AddressSpaceError::NotCommitted);
+        }
+        let l2 = ((l1_entry & PT_ADDR_MASK) as usize + self.physical_memory_offset) as *mut u64;
+        let l2_entry = unsafe { l2.add((virt >> 21) & 0x1ff).read_volatile() };
+        if l2_entry & 0b11 != TABLE_DESCRIPTOR {
+            return Err(AddressSpaceError::NotCommitted);
+        }
+        let l3 = ((l2_entry & PT_ADDR_MASK) as usize + self.physical_memory_offset) as *mut u64;
+        let entry_ptr = unsafe { l3.add((virt >> 12) & 0x1ff) };
+        let old_entry = unsafe { entry_ptr.read_volatile() };
+        if old_entry & VALID == 0 {
+            return Err(AddressSpaceError::NotCommitted);
+        }
+        unsafe {
+            entry_ptr.write_volatile(new_entry);
+            asm!("dsb ishst", options(nostack, preserves_flags));
+            invalidate_tlb_one(virt);
+            asm!("dsb ish", options(nostack, preserves_flags));
+            asm!("isb", options(nostack, preserves_flags));
+        }
+        Ok(old_entry)
+    }
+
     fn alloc_user_frame(&self) -> Result<usize, AddressSpaceError> {
         let raw = allocate_user_frame_zeroed().map_err(|_| AddressSpaceError::OutOfFrames)?;
         let virt = raw.as_ptr() as usize;
         Ok(virt - self.physical_memory_offset)
     }
 
-    fn dealloc_user_frame(&self, entry: u64) {
-        let phys = (entry & PT_ADDR_MASK) as usize;
+    fn hhdm_ptr(&self, phys: usize) -> *mut u8 {
         let virt = phys
             .checked_add(self.physical_memory_offset)
             .unwrap_or_else(|| panic!("Aarch64 user-frame HHDM address overflow"));
-        let ptr = NonNull::new(virt as *mut u8)
+        virt as *mut u8
+    }
+
+    fn dealloc_user_phys(&self, phys: usize) {
+        let ptr = NonNull::new(self.hhdm_ptr(phys))
             .unwrap_or_else(|| panic!("Aarch64 user-frame dealloc received null HHDM pointer"));
         deallocate_user_frame(ptr);
+    }
+
+    fn dealloc_user_frame(&self, entry: u64) {
+        let phys = (entry & PT_ADDR_MASK) as usize;
+        self.dealloc_user_phys(phys);
+    }
+
+    fn build_relocation_plan(
+        &self,
+        virt: VirtRange,
+    ) -> Result<Vec<RelocationPage>, AddressSpaceError> {
+        let mut pages = Vec::new();
+        for offset in (0..virt.byte_len).step_by(PAGE) {
+            let virt_addr = virt.start.raw() + offset;
+            let old_entry = match self.translate_4k(virt_addr) {
+                Some(entry) => entry,
+                None => {
+                    for page in pages {
+                        self.dealloc_user_phys(page.new_phys);
+                    }
+                    return Err(AddressSpaceError::NotCommitted);
+                }
+            };
+            let new_phys = match self.alloc_user_frame() {
+                Ok(phys) => phys,
+                Err(error) => {
+                    for page in pages {
+                        self.dealloc_user_phys(page.new_phys);
+                    }
+                    return Err(error);
+                }
+            };
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    self.hhdm_ptr((old_entry & PT_ADDR_MASK) as usize) as *const u8,
+                    self.hhdm_ptr(new_phys),
+                    PAGE,
+                );
+            }
+            pages.push(RelocationPage {
+                virt: virt_addr,
+                old_entry,
+                new_phys,
+            });
+        }
+        Ok(pages)
+    }
+
+    fn rollback_relocation(&self, pages: &[RelocationPage], installed: usize) {
+        for page in pages[..installed].iter().rev() {
+            self.replace_4k(page.virt, page.old_entry)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "Aarch64 AddressSpace::relocate rollback failed at {:#x}: {error}",
+                        page.virt
+                    )
+                });
+        }
+        for page in pages {
+            self.dealloc_user_phys(page.new_phys);
+        }
     }
 }
 
@@ -443,6 +546,34 @@ impl AddressSpace for Aarch64UserAddressSpace {
             }
             None => Translation::Reserved,
         }
+    }
+
+    fn relocate(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
+        validate_range(virt)?;
+        let state = self.state.lock();
+        let reservation = state
+            .reservations
+            .iter()
+            .find(|reservation| range_contains(reservation.range, virt))
+            .ok_or(AddressSpaceError::NotReserved)?;
+        if !committed_regions_cover(&reservation.committed, virt) {
+            return Err(AddressSpaceError::NotCommitted);
+        }
+        drop(state);
+
+        let pages = self.build_relocation_plan(virt)?;
+        for (index, page) in pages.iter().enumerate() {
+            let new_entry = (page.new_phys as u64) | (page.old_entry & !PT_ADDR_MASK);
+            if let Err(error) = self.replace_4k(page.virt, new_entry) {
+                self.rollback_relocation(&pages, index);
+                return Err(error);
+            }
+        }
+
+        for page in &pages {
+            self.dealloc_user_frame(page.old_entry);
+        }
+        Ok(())
     }
 }
 
