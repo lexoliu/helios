@@ -561,10 +561,11 @@ where
     kernel
 }
 
-fn init_allocator<Regions>(memory_regions: Regions)
+fn init_allocator<Regions>(memory_regions: Regions) -> &'static user_memory::UserMemoryPool
 where
     Regions: IntoIterator<Item = MemoryRegion>,
 {
+    let mut user_pool = None;
     for mut region in memory_regions {
         let region = unsafe { region.as_mut() };
         let start = region.as_mut_ptr() as usize;
@@ -573,10 +574,14 @@ where
         unsafe {
             ALLOCATOR.lock().add_to_heap(start, kernel_end);
         }
+        let pool = *user_pool.get_or_insert_with(|| {
+            user_memory::install_user_memory_pool(user_memory::allocate_user_memory_pool())
+        });
         if let Some(user_start) = user_start {
-            user_memory::add_user_heap_region(user_start, end);
+            pool.add_region(user_start, end);
         }
     }
+    user_pool.unwrap_or_else(|| panic!("bootstrap did not provide memory for user pool"))
 }
 
 fn split_bootstrap_memory_region(start: usize, end: usize) -> (usize, Option<usize>) {
@@ -597,7 +602,9 @@ const fn align_down(value: usize, align: usize) -> usize {
     value & !(align - 1)
 }
 
-pub fn prime_bootstrap_allocator<Regions>(memory_regions: Regions)
+pub fn prime_bootstrap_allocator<Regions>(
+    memory_regions: Regions,
+) -> &'static user_memory::UserMemoryPool
 where
     Regions: IntoIterator<Item = MemoryRegion>,
 {

@@ -6,6 +6,7 @@ use alloc::string::{String, ToString};
 use core::alloc::Layout;
 use core::mem::size_of;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 use buddy_system_allocator::LockedHeap;
 use helios_hal::pmm::PhysFrame;
@@ -71,7 +72,7 @@ impl UserMemoryPool {
     }
 }
 
-static USER_MEMORY_POOL: UserMemoryPool = UserMemoryPool::empty();
+static USER_MEMORY_POOL: AtomicPtr<UserMemoryPool> = AtomicPtr::new(core::ptr::null_mut());
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UserHeapStats {
@@ -88,24 +89,50 @@ impl UserHeapStats {
 #[derive(Clone)]
 pub struct UserMemoryCreator;
 
-pub fn add_user_heap_region(start: usize, end: usize) {
-    USER_MEMORY_POOL.add_region(start, end);
+pub fn install_user_memory_pool(pool: &'static UserMemoryPool) -> &'static UserMemoryPool {
+    USER_MEMORY_POOL
+        .compare_exchange(
+            core::ptr::null_mut(),
+            pool as *const _ as *mut _,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .unwrap_or_else(|_| panic!("user memory pool was installed more than once"));
+    pool
+}
+
+pub fn allocate_user_memory_pool() -> &'static UserMemoryPool {
+    Box::leak(Box::new(UserMemoryPool::empty()))
+}
+
+pub fn installed_user_memory_pool() -> Option<&'static UserMemoryPool> {
+    let ptr = USER_MEMORY_POOL.load(Ordering::Acquire);
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { &*ptr })
+    }
+}
+
+fn user_memory_pool() -> &'static UserMemoryPool {
+    installed_user_memory_pool()
+        .unwrap_or_else(|| panic!("user memory pool accessed before bootstrap installation"))
 }
 
 pub fn user_heap_stats() -> UserHeapStats {
-    USER_MEMORY_POOL.stats()
+    user_memory_pool().stats()
 }
 
 pub fn allocate_user_frame_zeroed() -> Result<NonNull<u8>, ProgramOutOfMemory> {
     let layout = Layout::from_size_align(PhysFrame::SIZE, PhysFrame::SIZE)
         .unwrap_or_else(|_| panic!("invalid user-frame layout"));
-    USER_MEMORY_POOL.allocate_zeroed(layout)
+    user_memory_pool().allocate_zeroed(layout)
 }
 
 pub fn deallocate_user_frame(ptr: NonNull<u8>) {
     let layout = Layout::from_size_align(PhysFrame::SIZE, PhysFrame::SIZE)
         .unwrap_or_else(|_| panic!("invalid user-frame layout"));
-    USER_MEMORY_POOL.deallocate(ptr, layout);
+    user_memory_pool().deallocate(ptr, layout);
 }
 
 unsafe impl MemoryCreator for UserMemoryCreator {
@@ -235,14 +262,14 @@ impl Drop for UserLinearMemory {
 }
 
 fn allocate_user_zeroed(layout: Layout) -> Result<NonNull<u8>, ProgramOutOfMemory> {
-    USER_MEMORY_POOL.allocate_zeroed(layout)
+    user_memory_pool().allocate_zeroed(layout)
 }
 
 fn deallocate_user(ptr: NonNull<u8>, size: usize) {
     let layout = linear_memory_layout(size).unwrap_or_else(|error| {
         panic!("invalid user linear memory layout during dealloc: {error}")
     });
-    USER_MEMORY_POOL.deallocate(ptr, layout);
+    user_memory_pool().deallocate(ptr, layout);
 }
 
 fn linear_memory_layout(size: usize) -> Result<Layout, String> {
