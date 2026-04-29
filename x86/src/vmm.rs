@@ -9,13 +9,10 @@
 //! Reservations are tracked in software in `Reservations` ; commit /
 //! decommit / protect / release operate by walking the live CR3 and
 //! mutating leaf entries through `OffsetPageTable`. Local TLB
-//! invalidation uses `INVLPG`. Cross-core TLB shootdown is enforced
-//! by asserting that only one processor is active — x86 currently
-//! boots with `ProcessorStartupPolicy::BootstrapOnly`, so AS mutating
-//! ops on a multi-core configuration will panic clearly until the
-//! shootdown protocol lands. AGENTS §3.4 SMP-first is satisfied by
-//! making the precondition explicit at the API boundary rather than
-//! racing TLBs in silence.
+//! invalidation uses `INVLPG`; cross-core TLB shootdown uses a
+//! dedicated local-APIC IPI vector and waits for every online
+//! processor to acknowledge the invalidation before old frames are
+//! returned to the user-memory pool.
 
 use alloc::vec::Vec;
 use core::ffi::c_int;
@@ -109,19 +106,16 @@ impl X86UserAddressSpace {
     }
 
     fn assert_smp_safe(&self) {
-        // x86 is currently single-core in `ProcessorStartupPolicy::
-        // BootstrapOnly`. Cross-core TLB shootdown is not yet
-        // implemented, so AS mutating ops are only safe with one
-        // running processor. Panic loudly rather than race TLBs in
-        // production once AP startup is enabled — the operator will
-        // see a clear diagnostic pointing at the missing shootdown
-        // protocol instead of debugging silent memory corruption.
         assert!(
-            self.processor_count == 1,
-            "X86UserAddressSpace mutating op called with {} active processors; \
-             cross-core TLB shootdown is not yet implemented",
+            self.processor_count <= usize::BITS as usize,
+            "X86UserAddressSpace supports at most {} processors in its TLB shootdown ack mask; got {}",
+            usize::BITS,
             self.processor_count
         );
+    }
+
+    fn shootdown_range(&self, virt: VirtRange) {
+        smp::shootdown_tlb_range(virt.start.raw(), virt.byte_len);
     }
 
     fn carve_reservation(&self, byte_len: usize) -> Option<VirtRange> {
@@ -394,6 +388,7 @@ impl AddressSpace for X86UserAddressSpace {
         let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
         for region in &reservation.committed {
             self.unmap_pages(&mut mapper, region.range)?;
+            self.shootdown_range(region.range);
         }
 
         self.state.lock().free_list.push(reservation.range);
@@ -421,6 +416,7 @@ impl AddressSpace for X86UserAddressSpace {
             physical_memory_offset: self.physical_memory_offset,
         };
         self.map_pages(&mut mapper, &mut frame_allocator, virt, pt_flags)?;
+        self.shootdown_range(virt);
 
         let mut state = self.state.lock();
         let reservation = find_reservation_mut(&mut state.reservations, virt)?;
@@ -443,6 +439,7 @@ impl AddressSpace for X86UserAddressSpace {
 
         let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
         self.unmap_pages(&mut mapper, virt)?;
+        self.shootdown_range(virt);
         Ok(())
     }
 
@@ -457,6 +454,7 @@ impl AddressSpace for X86UserAddressSpace {
         // valid requests.
         let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
         self.protect_pages(&mut mapper, virt, pt_flags)?;
+        self.shootdown_range(virt);
         let mut state = self.state.lock();
         if let Some(reservation) = state
             .reservations
@@ -539,6 +537,7 @@ impl AddressSpace for X86UserAddressSpace {
                 return Err(error);
             }
         }
+        self.shootdown_range(virt);
         for page in &pages {
             self.dealloc_user_phys(page.old_phys);
         }

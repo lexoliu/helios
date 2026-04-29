@@ -52,6 +52,11 @@ const APIC_TIMER_MODE_MASK: u64 = 0b11 << 17;
 const APIC_TIMER_VECTOR_MASK: u64 = 0xff;
 const PAGE_BYTES: usize = 4096;
 
+static ONLINE_PROCESSOR_MASK: AtomicUsize = AtomicUsize::new(0);
+static TLB_SHOOTDOWN_START: AtomicUsize = AtomicUsize::new(0);
+static TLB_SHOOTDOWN_LEN: AtomicUsize = AtomicUsize::new(0);
+static TLB_SHOOTDOWN_ACK_MASK: AtomicUsize = AtomicUsize::new(0);
+
 #[repr(C)]
 pub(crate) struct ProcessorRuntime {
     logical_id: u16,
@@ -208,6 +213,8 @@ pub(crate) fn activate_runtime(runtime: &ProcessorRuntime) {
     unsafe {
         wrmsr(IA32_FS_BASE, runtime as *const _ as u64);
     }
+    let bit = processor_bit(usize::from(runtime.logical_id));
+    ONLINE_PROCESSOR_MASK.fetch_or(bit, Ordering::AcqRel);
     runtime.started.store(true, Ordering::Release);
 }
 
@@ -409,6 +416,39 @@ pub(crate) fn handle_wake_interrupt() {
     local_apic_eoi();
 }
 
+pub(crate) fn shootdown_tlb_range(start: usize, byte_len: usize) {
+    if byte_len == 0 {
+        return;
+    }
+    let online = ONLINE_PROCESSOR_MASK.load(Ordering::Acquire);
+    let current = usize::from(current_runtime().logical_id);
+    let current_bit = processor_bit(current);
+    let targets = online & !current_bit;
+    if targets == 0 {
+        return;
+    }
+
+    TLB_SHOOTDOWN_START.store(start, Ordering::Release);
+    TLB_SHOOTDOWN_LEN.store(byte_len, Ordering::Release);
+    TLB_SHOOTDOWN_ACK_MASK.store(current_bit, Ordering::Release);
+    send_tlb_shootdown_ipi_all_excluding_self();
+    let expected = online;
+    while TLB_SHOOTDOWN_ACK_MASK.load(Ordering::Acquire) & expected != expected {
+        core::hint::spin_loop();
+    }
+}
+
+pub(crate) fn handle_tlb_shootdown_interrupt() {
+    let start = TLB_SHOOTDOWN_START.load(Ordering::Acquire);
+    let byte_len = TLB_SHOOTDOWN_LEN.load(Ordering::Acquire);
+    for offset in (0..byte_len).step_by(PAGE_BYTES) {
+        tlb::flush(VirtAddr::new((start + offset) as u64));
+    }
+    let bit = processor_bit(usize::from(current_runtime().logical_id));
+    TLB_SHOOTDOWN_ACK_MASK.fetch_or(bit, Ordering::AcqRel);
+    local_apic_eoi();
+}
+
 /// Send a wake IPI to the processor with the given local-APIC id.
 ///
 /// The receiver runs the wake interrupt handler (`local_apic_eoi`-only)
@@ -457,6 +497,57 @@ pub(crate) fn send_wake_ipi(target_apic_id: u32) {
             unsafe { apic.send_ipi(icr) };
         }
     }
+}
+
+fn send_tlb_shootdown_ipi_all_excluding_self() {
+    use x86::apic::{
+        ApicControl, ApicId, DeliveryMode, DeliveryStatus, DestinationMode,
+        DestinationShorthand, Icr, Level, TriggerMode,
+    };
+    let runtime = current_runtime();
+    match local_apic_mode(0) {
+        LocalApicMode::X2Apic => {
+            let mut apic = X2APIC::new();
+            apic.attach();
+            let icr = Icr::for_x2apic(
+                crate::exceptions::TLB_SHOOTDOWN_INTERRUPT_VECTOR,
+                ApicId::X2Apic(0),
+                DestinationShorthand::AllExcludingSelf,
+                DeliveryMode::Fixed,
+                DestinationMode::Physical,
+                DeliveryStatus::Idle,
+                Level::Assert,
+                TriggerMode::Edge,
+            );
+            unsafe { apic.send_ipi(icr) };
+        }
+        LocalApicMode::XApic { physical_base } => {
+            let apic_region = xapic_mmio_region(physical_base, runtime.physical_memory_offset);
+            let mut apic = XAPIC::new(apic_region);
+            apic.attach();
+            let icr = Icr::for_xapic(
+                crate::exceptions::TLB_SHOOTDOWN_INTERRUPT_VECTOR,
+                ApicId::XApic(0),
+                DestinationShorthand::AllExcludingSelf,
+                DeliveryMode::Fixed,
+                DestinationMode::Physical,
+                DeliveryStatus::Idle,
+                Level::Assert,
+                TriggerMode::Edge,
+            );
+            unsafe { apic.send_ipi(icr) };
+        }
+    }
+}
+
+fn processor_bit(processor: usize) -> usize {
+    assert!(
+        processor < usize::BITS as usize,
+        "x86 TLB shootdown supports at most {} online processors; got processor {}",
+        usize::BITS,
+        processor
+    );
+    1usize << processor
 }
 
 fn enable_local_scheduler_timer(vector: u8) {

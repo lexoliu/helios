@@ -180,7 +180,7 @@ pub trait SwapBackend: Send + Sync + 'static {
 
 /// Sentinel `SwapBackend` impl for kernels that do not yet expose a
 /// persistent swap surface. Every operation reports
-/// [`NoSwap::Unsupported`]; callers should short-circuit to the OOM
+/// [`NoSwapError`]; callers should short-circuit to the OOM
 /// killer instead. Provided so kernel code can be generic over a
 /// `SwapBackend` even before virtio-blk swap lands.
 #[derive(Clone, Copy, Debug, Default)]
@@ -269,10 +269,10 @@ pub trait AddressSpace: Send + Sync + 'static {
     ///    error path, but `OutOfFrames` mid-range is recoverable).
     ///
     /// The default impl reports unsupported. Backends opt in only
-    /// after the listed prerequisites are met; today none do, and
-    /// surface that honestly rather than ship a half-correct version
-    /// that races TLBs or hands wasmtime a frame the page-fault
-    /// handler does not own.
+    /// after the listed prerequisites are met, surfacing unsupported
+    /// honestly rather than shipping a half-correct version that
+    /// races TLBs or hands Wasmtime a frame the page-fault handler
+    /// does not own.
     fn relocate(&self, _virt: VirtRange) -> Result<(), AddressSpaceError> {
         Err(AddressSpaceError::InvalidFlags)
     }

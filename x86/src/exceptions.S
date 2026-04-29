@@ -35,6 +35,12 @@ helios_x86_interrupt_wake:
     push 0x21
     jmp helios_x86_interrupt_common
 
+.global helios_x86_interrupt_tlb_shootdown
+helios_x86_interrupt_tlb_shootdown:
+    push 0
+    push 0x22
+    jmp helios_x86_interrupt_common
+
 helios_x86_exception_common:
     push rax
     push rcx

@@ -15,6 +15,7 @@ use crate::smp;
 const PAGE_FAULT_INSTRUCTION_FETCH: u64 = 1 << 4;
 pub(crate) const TIMER_INTERRUPT_VECTOR: u8 = 0x20;
 pub(crate) const WAKE_INTERRUPT_VECTOR: u8 = 0x21;
+pub(crate) const TLB_SHOOTDOWN_INTERRUPT_VECTOR: u8 = 0x22;
 
 global_asm!(include_str!("exceptions.S"));
 
@@ -28,6 +29,7 @@ unsafe extern "C" {
     fn helios_x86_exception_simd_floating_point();
     fn helios_x86_interrupt_timer();
     fn helios_x86_interrupt_wake();
+    fn helios_x86_interrupt_tlb_shootdown();
 }
 
 pub(crate) struct ProcessorIdt {
@@ -72,6 +74,8 @@ impl ProcessorIdt {
                 .set_handler_addr(handler_address(helios_x86_interrupt_timer));
             table[WAKE_INTERRUPT_VECTOR]
                 .set_handler_addr(handler_address(helios_x86_interrupt_wake));
+            table[TLB_SHOOTDOWN_INTERRUPT_VECTOR]
+                .set_handler_addr(handler_address(helios_x86_interrupt_tlb_shootdown));
             table.load_unsafe();
         }
     }
@@ -133,6 +137,9 @@ extern "C" fn helios_x86_interrupt_dispatch(frame: &mut ExceptionFrame) {
             // back into the kernel run loop; receiving it is enough,
             // no work to do beyond ack.
             smp::handle_wake_interrupt();
+        }
+        Ok(TLB_SHOOTDOWN_INTERRUPT_VECTOR) => {
+            smp::handle_tlb_shootdown_interrupt();
         }
         _ => panic!(
             "unhandled x86 interrupt vector={} rip={:#x}",
