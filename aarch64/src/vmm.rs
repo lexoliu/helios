@@ -345,7 +345,7 @@ impl Aarch64UserAddressSpace {
         &self,
         virt: VirtRange,
     ) -> Result<Vec<RelocationPage>, AddressSpaceError> {
-        let mut pages = Vec::new();
+        let mut pages: Vec<RelocationPage> = Vec::new();
         for offset in (0..virt.byte_len).step_by(PAGE) {
             let virt_addr = virt.start.raw() + offset;
             let old_entry = match self.translate_4k(virt_addr) {
