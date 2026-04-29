@@ -1,6 +1,6 @@
 use helios_artifact::{
     CWASM_NO_VMEM_MEMORY_GUARD_SIZE, CWASM_NO_VMEM_MEMORY_RESERVATION,
-    CWASM_NO_VMEM_MEMORY_RESERVATION_FOR_GROWTH,
+    CWASM_NO_VMEM_MEMORY_RESERVATION_FOR_GROWTH, cwasm_target_uses_lazy_commit_virtual_memory,
 };
 use std::env;
 use std::num::NonZeroUsize;
@@ -151,7 +151,7 @@ fn build_engine_config(target: &str, hint: AotCompileHint, worker_count: usize) 
     config.parallel_compilation(worker_count > 1);
     config.epoch_interruption(true);
     config.max_wasm_stack(8 * 1024 * 1024);
-    if target_requires_no_vmem_cwasm(target) {
+    if !cwasm_target_uses_lazy_commit_virtual_memory(target) {
         config.signals_based_traps(true);
         config.memory_guard_size(CWASM_NO_VMEM_MEMORY_GUARD_SIZE);
         config.memory_reservation(CWASM_NO_VMEM_MEMORY_RESERVATION);
@@ -159,10 +159,6 @@ fn build_engine_config(target: &str, hint: AotCompileHint, worker_count: usize) 
         config.memory_init_cow(false);
     }
     Ok(config)
-}
-
-fn target_requires_no_vmem_cwasm(target: &str) -> bool {
-    target.contains("-unknown-none")
 }
 
 fn configure_target_isa_flags(config: &mut Config, target: &str) {

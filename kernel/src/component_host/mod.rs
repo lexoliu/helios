@@ -676,6 +676,7 @@ async fn run_system_component<CpuImpl, HostFs>(
     component: EmbeddedComponent,
     world: ComponentBindingSet,
     cpu: CpuImpl,
+    timer: crate::Timer<CpuImpl>,
     spawner: crate::Spawner<CpuImpl>,
     debug_state: HostRuntimeState<CpuImpl, HostFs>,
     read_serial: fn(u32) -> Vec<u8>,
@@ -739,6 +740,7 @@ where
 
     let context = ComponentExecContext::new(
         cpu,
+        timer,
         spawner,
         debug_state.clone(),
         instance_registry,

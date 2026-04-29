@@ -105,7 +105,7 @@ pub use component_resources::{
 };
 pub use component_runtime::{
     ComponentOutputMode, ComponentOutputStreamKind, ComponentRuntimeState, ComponentStoreData,
-    DeadlinePollable, InstanceKilled,
+    DeadlinePollable, InstanceKilled, wait_until_runtime_deadline,
 };
 pub use component_runtime_backend::{
     CompiledComponent, ComponentExecContext, ComponentExecutor, ComponentExitStatus,
@@ -169,10 +169,15 @@ pub use sync::{
     RawRwLockWriteLease, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
 pub use task::{YieldNow, yield_now};
-pub use time::{duration_to_ticks, elapsed_millis, monotonic_nanos};
+pub use time::{
+    duration_to_ticks, elapsed_millis, monotonic_nanos, nanos_to_ticks_ceil_saturating,
+};
 pub use timer::{Sleep, Timer};
 pub use unsupported_host_fs::UnsupportedHostFileSystem;
-pub use user_memory::{UserHeapStats, UserMemoryCreator, user_heap_stats};
+pub use user_memory::{
+    UserHeapStats, UserMemoryCreator, allocate_user_frame_zeroed, deallocate_user_frame,
+    user_heap_stats,
+};
 pub use wasi_rights::WasiRights;
 // Wasmtime-specific helpers are crate-internal only.
 // External consumers use the ComponentRuntimeFactory trait.
@@ -303,16 +308,17 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
             }
 
             progress += fired + ran;
+            if ran == executor::READY_BATCH_TASKS || progress >= executor::READY_BATCH_TASKS {
+                return progress;
+            }
         }
     }
 
     pub fn run(&self) -> ! {
         loop {
-            if self.run_until_stalled() != 0 {
-                continue;
+            if self.run_until_stalled() == 0 {
+                self.cpu.park_current();
             }
-
-            self.cpu.park_current();
         }
     }
 

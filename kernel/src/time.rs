@@ -19,3 +19,9 @@ pub fn duration_to_ticks(duration: Duration, frequency: u64) -> u64 {
 
     u64::try_from(ticks).expect("timer duration does not fit into u64 ticks")
 }
+
+pub fn nanos_to_ticks_ceil_saturating(nanos: u64, frequency: u64) -> u64 {
+    let numerator = (nanos as u128) * (frequency as u128);
+    let ticks = numerator.saturating_add(999_999_999) / 1_000_000_000u128;
+    u64::try_from(ticks).unwrap_or(u64::MAX)
+}

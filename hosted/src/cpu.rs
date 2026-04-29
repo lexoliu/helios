@@ -60,6 +60,8 @@ impl Cpu for HostedCpu {
 
     fn publish_executable(&self, _ptr: *const u8, _len: usize) {}
 
+    fn unpublish_executable(&self, _ptr: *const u8, _len: usize) {}
+
     fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {
         None
     }

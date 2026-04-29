@@ -7,7 +7,14 @@
 
 pub mod bindings;
 pub mod config;
-#[cfg(target_os = "none")]
+#[cfg(all(
+    target_os = "none",
+    any(
+        feature = "wasmtime-aarch64",
+        feature = "wasmtime-riscv64",
+        feature = "wasmtime-x86"
+    )
+))]
 pub mod custom_vm;
 pub mod engine;
 pub mod store;
@@ -222,6 +229,7 @@ where
             &engine.engine,
             StoreData::<CpuImpl, HostFs>::new(
                 context.cpu,
+                context.timer,
                 context.spawner,
                 context.runtime_state,
                 context.instance_registry,

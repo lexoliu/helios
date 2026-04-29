@@ -11,9 +11,7 @@ use core::marker::PhantomData;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use crate::{
-    ComponentNetworkService, EmbeddedBootFile, EmbeddedBootFs, HostFsErrorKind, yield_now,
-};
+use crate::{ComponentNetworkService, EmbeddedBootFile, EmbeddedBootFs, HostFsErrorKind};
 use bytes::{Bytes, BytesMut};
 use futures::channel::oneshot;
 use helios_hal::cpu::Cpu;
@@ -1742,9 +1740,15 @@ where
         accessor: &Accessor<T, Self>,
         when: wasi::clocks::monotonic_clock::Mark,
     ) -> Result<()> {
-        while accessor.with(|mut access| access.get().now_nanos()) < when {
-            yield_now().await;
-        }
+        let (timer, cpu, runtime_state) = accessor.with(|mut access| {
+            let store = access.get();
+            (
+                store.timer(),
+                store.cpu.clone(),
+                store.runtime_state.clone(),
+            )
+        });
+        crate::wait_until_runtime_deadline(timer, cpu, runtime_state, when).await;
         Ok(())
     }
 

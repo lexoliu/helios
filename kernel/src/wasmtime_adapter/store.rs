@@ -182,9 +182,7 @@ where
     RuntimeStateImpl: ComponentRuntimeState,
 {
     async fn ready(&mut self) {
-        while self.uptime_nanos() < self.deadline_nanos() {
-            crate::yield_now().await;
-        }
+        crate::DeadlinePollable::ready(self).await;
     }
 }
 

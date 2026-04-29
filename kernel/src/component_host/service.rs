@@ -36,6 +36,7 @@ where
     HostFs: crate::HostFileSystem,
 {
     cpu: CpuImpl,
+    timer: crate::Timer<CpuImpl>,
     spawner: crate::Spawner<CpuImpl>,
     runtime_state: HostRuntimeState<CpuImpl, HostFs>,
     instance_registry: crate::InstanceRegistry,
@@ -272,6 +273,7 @@ where
                 component,
                 world,
                 cpu.clone(),
+                kernel.timer(),
                 kernel.spawner(),
                 debug_state.clone(),
                 read_serial,
@@ -418,6 +420,8 @@ where
         let elapsed = cpu.now().ticks().saturating_sub(started);
         if progress != 0 && debug_state.profiling_enabled() {
             debug_state.record_profile_stack(ProfileScope::Kernel, stack.clone(), elapsed);
+        }
+        if progress != 0 {
             continue;
         }
 
@@ -1598,6 +1602,7 @@ where
     pub(crate) fn from_store(store: &StoreData<CpuImpl, HostFs>) -> Self {
         Self {
             cpu: store.cpu.clone(),
+            timer: store.timer(),
             spawner: store.spawner().clone(),
             runtime_state: store.runtime_state.clone(),
             instance_registry: store.instance_registry.clone(),
@@ -1638,6 +1643,7 @@ where
 
     let context = ComponentExecContext::new(
         exec_context.cpu,
+        exec_context.timer,
         exec_context.spawner.clone(),
         exec_context.runtime_state.clone(),
         exec_context.instance_registry,

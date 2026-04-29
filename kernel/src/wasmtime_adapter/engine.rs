@@ -4,18 +4,24 @@ use alloc::sync::Arc;
 
 use crate::UserMemoryCreator;
 use helios_hal::cpu::Cpu;
+#[cfg(target_os = "none")]
+use helios_hal::pmm::PhysFrame;
 use wasmtime::component::{Component, Instance, TypedFunc};
-use wasmtime::{AsContextMut, CustomCodeMemory, Engine};
+use wasmtime::{AsContextMut, Engine};
+#[cfg(target_os = "none")]
+use wasmtime::CustomCodeMemory;
 
 const WASI_CLI_RUN_FUNC: &str = "run";
 
+#[cfg(target_os = "none")]
 struct PlatformCodeMemory<P> {
     platform: P,
 }
 
+#[cfg(target_os = "none")]
 impl<P: Cpu + Clone> CustomCodeMemory for PlatformCodeMemory<P> {
     fn required_alignment(&self) -> usize {
-        1
+        PhysFrame::SIZE
     }
 
     fn publish_executable(&self, ptr: *const u8, len: usize) -> wasmtime::Result<()> {
@@ -23,7 +29,8 @@ impl<P: Cpu + Clone> CustomCodeMemory for PlatformCodeMemory<P> {
         Ok(())
     }
 
-    fn unpublish_executable(&self, _ptr: *const u8, _len: usize) -> wasmtime::Result<()> {
+    fn unpublish_executable(&self, ptr: *const u8, len: usize) -> wasmtime::Result<()> {
+        self.platform.unpublish_executable(ptr, len);
         Ok(())
     }
 }
@@ -39,15 +46,30 @@ fn build_engine_for_platform<P: Cpu + Clone>(
             config.detect_host_feature(probe);
         }
     }
+    #[cfg(target_os = "none")]
     config.with_custom_code_memory(Some(Arc::new(PlatformCodeMemory {
         platform: platform.clone(),
     })));
     config.signals_based_traps(true);
-    if platform.has_lazy_commit_virtual_memory() && configure_pooling(&mut config) {
+    let target_uses_lazy_commit =
+        helios_artifact::cwasm_target_uses_lazy_commit_virtual_memory(env!("HELIOS_BUILD_TARGET"));
+    assert!(
+        platform.has_lazy_commit_virtual_memory() == target_uses_lazy_commit,
+        "platform lazy-commit virtual-memory capability does not match cwasm target profile"
+    );
+    if configure_pooling(&mut config) {
         // Pooling path took ownership of the linear-memory
         // configuration. UserMemoryCreator must not be installed —
         // it uses the kernel buddy heap which cannot satisfy
         // wasmtime's per-slot pre-reservations.
+    } else if platform.has_lazy_commit_virtual_memory() {
+        // Bare-metal custom-vm builds route Wasmtime's default memory
+        // creator through the backend-installed `wasmtime_mmap_*`
+        // hooks. Do not install `UserMemoryCreator` here: combining
+        // `has_virtual_memory=true` with the buddy-heap host-memory
+        // creator drives Wasmtime through a mismatched upper/lower
+        // memory stack and is the #16 RPC-stall failure mode.
+        config.memory_init_cow(true);
     } else {
         // Backends without a real VM stack (or builds without
         // `pooling-allocator`) rely on the kernel-side buddy heap;

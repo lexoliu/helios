@@ -7,7 +7,7 @@ build = "build.rs"
 [features]
 default = ["wasmtime-host"]
 wasmtime-host = ["dep:wasmtime", "dep:wasmtime-wasi-io"]
-wasmtime-aarch64 = ["dep:wasmtime", "dep:wasmtime-wasi-io"]
+wasmtime-aarch64 = ["dep:wasmtime", "dep:wasmtime-wasi-io", "wasmtime/custom-virtual-memory"]
 wasmtime-x86 = ["dep:wasmtime", "dep:wasmtime-wasi-io"]
 wasmtime-riscv64 = ["dep:wasmtime", "dep:wasmtime-wasi-io"]
 

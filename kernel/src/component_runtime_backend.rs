@@ -5,7 +5,7 @@ use core::future::Future;
 
 use crate::{
     ComponentOutputMode, ComponentRuntimeState, HostFileSystem, InstanceId, InstanceRegistry,
-    RegisteredInstance,
+    RegisteredInstance, Timer,
 };
 use helios_hal::cpu::Cpu;
 
@@ -37,6 +37,7 @@ where
     HostFs: HostFileSystem,
 {
     pub cpu: CpuImpl,
+    pub timer: Timer<CpuImpl>,
     pub spawner: crate::Spawner<CpuImpl>,
     pub runtime_state: RuntimeStateImpl,
     pub instance_registry: InstanceRegistry,
@@ -60,6 +61,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cpu: CpuImpl,
+        timer: Timer<CpuImpl>,
         spawner: crate::Spawner<CpuImpl>,
         runtime_state: RuntimeStateImpl,
         instance_registry: InstanceRegistry,
@@ -74,6 +76,7 @@ where
     ) -> Self {
         Self {
             cpu,
+            timer,
             spawner,
             runtime_state,
             instance_registry,

@@ -6,9 +6,9 @@ use alloc::vec::Vec;
 use crate::child_io::{ByteReader, ByteWriter, ClosedPeer, TryRead};
 use crate::{
     InstanceExecutionTransition, InstanceRegistry, KillReason, RegisteredInstance,
-    record_instance_transition,
+    Timer, nanos_to_ticks_ceil_saturating, record_instance_transition,
 };
-use helios_hal::cpu::Cpu;
+use helios_hal::cpu::{Cpu, Instant};
 use thiserror::Error;
 use wasmtime::component::ResourceTable;
 
@@ -104,6 +104,7 @@ where
 {
     pub table: ResourceTable,
     pub cpu: CpuImpl,
+    timer: Timer<CpuImpl>,
     spawner: crate::Spawner<CpuImpl>,
     pub runtime_state: RuntimeStateImpl,
     pub instance_registry: InstanceRegistry,
@@ -116,8 +117,13 @@ where
     requested_exit: Option<u8>,
 }
 
-pub struct DeadlinePollable<CpuImpl, RuntimeStateImpl> {
+pub struct DeadlinePollable<CpuImpl, RuntimeStateImpl>
+where
+    CpuImpl: Cpu + Clone,
+    RuntimeStateImpl: ComponentRuntimeState,
+{
     cpu: CpuImpl,
+    timer: Timer<CpuImpl>,
     runtime_state: RuntimeStateImpl,
     deadline_nanos: u64,
 }
@@ -153,6 +159,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cpu: CpuImpl,
+        timer: Timer<CpuImpl>,
         spawner: crate::Spawner<CpuImpl>,
         runtime_state: RuntimeStateImpl,
         instance_registry: InstanceRegistry,
@@ -168,6 +175,7 @@ where
         Self {
             table: ResourceTable::new(),
             cpu,
+            timer,
             spawner,
             runtime_state,
             instance_registry,
@@ -234,6 +242,10 @@ where
 
     pub fn now_nanos(&self) -> u64 {
         self.runtime_state.uptime_nanos(self.cpu.now().ticks())
+    }
+
+    pub fn timer(&self) -> Timer<CpuImpl> {
+        self.timer.clone()
     }
 
     pub fn spawner(&self) -> &crate::Spawner<CpuImpl> {
@@ -354,9 +366,15 @@ where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
 {
-    pub fn new(cpu: CpuImpl, runtime_state: RuntimeStateImpl, deadline_nanos: u64) -> Self {
+    pub fn new(
+        cpu: CpuImpl,
+        timer: Timer<CpuImpl>,
+        runtime_state: RuntimeStateImpl,
+        deadline_nanos: u64,
+    ) -> Self {
         Self {
             cpu,
+            timer,
             runtime_state,
             deadline_nanos,
         }
@@ -368,6 +386,38 @@ where
 
     pub fn deadline_nanos(&self) -> u64 {
         self.deadline_nanos
+    }
+
+    pub async fn ready(&mut self) {
+        let timer = self.timer.clone();
+        let cpu = self.cpu.clone();
+        let runtime_state = self.runtime_state.clone();
+        wait_until_runtime_deadline(timer, cpu, runtime_state, self.deadline_nanos).await;
+    }
+}
+
+pub async fn wait_until_runtime_deadline<CpuImpl, RuntimeStateImpl>(
+    timer: Timer<CpuImpl>,
+    cpu: CpuImpl,
+    runtime_state: RuntimeStateImpl,
+    deadline_nanos: u64,
+) where
+    CpuImpl: Cpu + Clone,
+    RuntimeStateImpl: ComponentRuntimeState,
+{
+    loop {
+        let now_ticks = cpu.now().ticks();
+        let now_nanos = runtime_state.uptime_nanos(now_ticks);
+        if now_nanos >= deadline_nanos {
+            return;
+        }
+
+        let remaining_nanos = deadline_nanos.saturating_sub(now_nanos);
+        let remaining_ticks = nanos_to_ticks_ceil_saturating(remaining_nanos, cpu.timer_frequency())
+            .max(1);
+        timer
+            .sleep_until(Instant::new(now_ticks.saturating_add(remaining_ticks)))
+            .await;
     }
 }
 

@@ -24,6 +24,7 @@ use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
 use helios_hal::{DeviceInventory, DmaModel, Platform};
+use helios_kernel::{KernelException, KernelExceptionCause, KernelNativeTrapHandler};
 use limine::BaseRevision;
 use limine::file::File;
 use limine::firmware::{
@@ -39,6 +40,7 @@ use limine::request::{
 use spin::Once;
 
 const KERNEL_STACK_BYTES: usize = 4 * 1024 * 1024;
+const EXCEPTION_STACK_BYTES: usize = 64 * 1024;
 const PAGE_BYTES: usize = 4096;
 const MAX_USABLE_REGION_SEGMENTS: usize = 6;
 const PAGE_TABLE_ENTRIES: usize = 512;
@@ -60,7 +62,15 @@ const PL011_FLAG_RXFE: u32 = 1 << 4;
 const PL011_FLAG_TXFF: u32 = 1 << 5;
 
 #[cfg(target_os = "none")]
-global_asm!(include_str!("entry.S"), boot_stack_bytes = const KERNEL_STACK_BYTES);
+global_asm!(
+    include_str!("entry.S"),
+    boot_stack_bytes = const KERNEL_STACK_BYTES,
+    exception_stack_bytes = const EXCEPTION_STACK_BYTES,
+);
+
+unsafe extern "C" {
+    static __helios_aarch64_exception_vectors: u8;
+}
 
 mod vmm;
 pub use vmm::Aarch64UserAddressSpace;
@@ -132,6 +142,7 @@ static MMIO_PAGE_TABLE_2: PageTable = PageTable::new();
 
 #[repr(C)]
 struct ProcessorRuntime {
+    exception_stack: ExceptionStack,
     logical_id: u16,
     _reserved: u16,
     wasmtime_tls: AtomicPtr<u8>,
@@ -142,12 +153,22 @@ struct ProcessorRuntime {
 impl ProcessorRuntime {
     fn new(logical_id: u16) -> Self {
         Self {
+            exception_stack: ExceptionStack::new(),
             logical_id,
             _reserved: 0,
             wasmtime_tls: AtomicPtr::new(core::ptr::null_mut()),
             native_trap_handler: AtomicUsize::new(0),
             started: AtomicBool::new(false),
         }
+    }
+}
+
+#[repr(C, align(16))]
+struct ExceptionStack([u8; EXCEPTION_STACK_BYTES]);
+
+impl ExceptionStack {
+    const fn new() -> Self {
+        Self([0; EXCEPTION_STACK_BYTES])
     }
 }
 
@@ -336,6 +357,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         BASE_REVISION.is_supported() || BASE_REVISION.actual_revision() == Some(6),
         "Limine bootloader does not support the required base protocol revision"
     );
+    install_exception_vectors();
     let handoff = limine_boot_handoff();
     let physical_memory_offset = physical_memory_offset();
     let debug_serial = DebugSerial::discover(&handoff, physical_memory_offset);
@@ -461,10 +483,19 @@ impl Cpu for Aarch64Cpu {
             asm!("dsb ish", options(nostack, preserves_flags));
             asm!("isb", options(nostack, preserves_flags));
         }
+        vmm::publish_code_memory(ptr, len);
+    }
+
+    fn unpublish_executable(&self, ptr: *const u8, len: usize) {
+        vmm::unpublish_code_memory(ptr, len);
     }
 
     fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {
         Some(detect_aarch64_native_feature)
+    }
+
+    fn has_lazy_commit_virtual_memory(&self) -> bool {
+        true
     }
 
     fn shutdown(&self) -> ! {
@@ -539,6 +570,51 @@ fn prepare_current_processor() {
         asm!("msr cpacr_el1, {cpacr}", cpacr = in(reg) cpacr, options(nomem, nostack, preserves_flags));
         asm!("isb", options(nostack, preserves_flags));
     }
+    install_exception_vectors();
+}
+
+fn install_exception_vectors() {
+    let vectors = &raw const __helios_aarch64_exception_vectors as usize;
+    unsafe {
+        asm!("msr vbar_el1, {vectors}", vectors = in(reg) vectors, options(nomem, nostack, preserves_flags));
+        asm!("isb", options(nostack, preserves_flags));
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn aarch64_handle_sync_exception(
+    esr_el1: usize,
+    elr_el1: usize,
+    frame_pointer: usize,
+    far_el1: usize,
+) -> ! {
+    let exception_class = (esr_el1 >> 26) & 0x3f;
+    let (cause, faulting_address) = match exception_class {
+        0b100000 | 0b100001 => (KernelExceptionCause::InstructionFault, Some(far_el1)),
+        0b100100 | 0b100101 => (KernelExceptionCause::DataFault, Some(far_el1)),
+        0b111100 => (KernelExceptionCause::Breakpoint, None),
+        0b001110 => (KernelExceptionCause::IllegalInstruction, None),
+        _ => (KernelExceptionCause::IllegalInstruction, None),
+    };
+
+    let runtime = read_processor_runtime();
+    if runtime != 0 {
+        let handler = unsafe { (*(runtime as *const ProcessorRuntime)).native_trap_handler.load(Ordering::Acquire) };
+        if handler != 0 {
+            let handler: KernelNativeTrapHandler = unsafe { core::mem::transmute(handler) };
+            let exception = KernelException {
+                cause,
+                instruction_pointer: elr_el1,
+                frame_pointer,
+                faulting_address,
+            };
+            let _ = exception.dispatch_to(handler);
+        }
+    }
+
+    panic!(
+        "unhandled AArch64 synchronous exception ec={exception_class:#x} esr={esr_el1:#x} elr={elr_el1:#x} far={far_el1:#x}"
+    )
 }
 
 fn read_processor_runtime() -> usize {

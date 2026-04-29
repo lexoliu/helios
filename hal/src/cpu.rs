@@ -103,6 +103,10 @@ pub trait Cpu: Send + Sync + 'static {
     /// or page-table permission updates implement the required sequence here.
     fn publish_executable(&self, ptr: *const u8, len: usize);
 
+    /// Reverts executable code back to writable code-memory storage after all
+    /// processors have stopped executing from the range.
+    fn unpublish_executable(&self, ptr: *const u8, len: usize);
+
     /// Returns an optional native ISA feature probe for runtime codegen.
     fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>>;
 

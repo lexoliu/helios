@@ -466,6 +466,36 @@ impl X86Cpu {
         Self { state }
     }
 
+    fn update_executable_range(&self, ptr: *const u8, len: usize, executable: bool) {
+        if len == 0 {
+            return;
+        }
+
+        let start = ptr as usize;
+        let end = start
+            .checked_add(len - 1)
+            .unwrap_or_else(|| panic!("code executable range overflow: start={start:#x}, len={len}"));
+        let first_page = start & !PAGE_MASK;
+        let last_page = end & !PAGE_MASK;
+        let mut page = first_page;
+        loop {
+            unsafe {
+                update_no_execute_bit(page, self.state.physical_memory_offset(), executable);
+                asm!(
+                    "invlpg [{addr}]",
+                    addr = in(reg) page,
+                    options(nostack, preserves_flags),
+                );
+            }
+            if page == last_page {
+                break;
+            }
+            page = page
+                .checked_add(PAGE_BYTES)
+                .unwrap_or_else(|| panic!("code executable page iteration overflow at {page:#x}"));
+        }
+    }
+
     pub(crate) fn debug_state(&self) -> debug_state::RuntimeState {
         self.state.debug_state()
     }
@@ -526,33 +556,11 @@ impl Cpu for X86Cpu {
     }
 
     fn publish_executable(&self, ptr: *const u8, len: usize) {
-        if len == 0 {
-            return;
-        }
+        self.update_executable_range(ptr, len, true);
+    }
 
-        let start = ptr as usize;
-        let end = start
-            .checked_add(len - 1)
-            .unwrap_or_else(|| panic!("code publish range overflow: start={start:#x}, len={len}"));
-        let first_page = start & !PAGE_MASK;
-        let last_page = end & !PAGE_MASK;
-        let mut page = first_page;
-        loop {
-            unsafe {
-                clear_no_execute_bit(page, self.state.physical_memory_offset());
-                asm!(
-                    "invlpg [{addr}]",
-                    addr = in(reg) page,
-                    options(nostack, preserves_flags),
-                );
-            }
-            if page == last_page {
-                break;
-            }
-            page = page
-                .checked_add(PAGE_BYTES)
-                .unwrap_or_else(|| panic!("code publish page iteration overflow at {page:#x}"));
-        }
+    fn unpublish_executable(&self, ptr: *const u8, len: usize) {
+        self.update_executable_range(ptr, len, false);
     }
 
     fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {
@@ -677,7 +685,11 @@ fn detect_x86_native_feature(feature: &str) -> Option<bool> {
     }
 }
 
-unsafe fn clear_no_execute_bit(virtual_addr: usize, physical_memory_offset: usize) {
+unsafe fn update_no_execute_bit(
+    virtual_addr: usize,
+    physical_memory_offset: usize,
+    executable: bool,
+) {
     let (level_4_frame, _) = Cr3::read();
     let level_4 = unsafe {
         page_table_from_physical(
@@ -705,7 +717,7 @@ unsafe fn clear_no_execute_bit(virtual_addr: usize, physical_memory_offset: usiz
         "missing level-3 page-table entry for virtual address {virtual_addr:#x}"
     );
     if level_3_entry & PAGE_HUGE != 0 {
-        level_3[level_3_index] = level_3_entry & !PAGE_NO_EXECUTE;
+        level_3[level_3_index] = no_execute_entry(level_3_entry, executable);
         return;
     }
 
@@ -718,7 +730,7 @@ unsafe fn clear_no_execute_bit(virtual_addr: usize, physical_memory_offset: usiz
         "missing level-2 page-table entry for virtual address {virtual_addr:#x}"
     );
     if level_2_entry & PAGE_HUGE != 0 {
-        level_2[level_2_index] = level_2_entry & !PAGE_NO_EXECUTE;
+        level_2[level_2_index] = no_execute_entry(level_2_entry, executable);
         return;
     }
 
@@ -730,7 +742,15 @@ unsafe fn clear_no_execute_bit(virtual_addr: usize, physical_memory_offset: usiz
         level_1_entry & PAGE_PRESENT != 0,
         "missing level-1 page-table entry for virtual address {virtual_addr:#x}"
     );
-    level_1[level_1_index] = level_1_entry & !PAGE_NO_EXECUTE;
+    level_1[level_1_index] = no_execute_entry(level_1_entry, executable);
+}
+
+fn no_execute_entry(entry: u64, executable: bool) -> u64 {
+    if executable {
+        entry & !PAGE_NO_EXECUTE
+    } else {
+        entry | PAGE_NO_EXECUTE
+    }
 }
 
 unsafe fn page_table_from_physical(

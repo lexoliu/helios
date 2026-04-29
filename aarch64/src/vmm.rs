@@ -36,6 +36,7 @@ use helios_kernel::custom_vm::{
     self, CustomVmHooks, WasmtimeMemoryImage, default_memory_image_free,
     default_memory_image_map_at, default_memory_image_new, default_page_size,
 };
+use helios_kernel::{allocate_user_frame_zeroed, deallocate_user_frame};
 use spin::{Mutex, Once};
 
 const PAGE: usize = 4096;
@@ -278,13 +279,19 @@ impl Aarch64UserAddressSpace {
     }
 
     fn alloc_user_frame(&self) -> Result<usize, AddressSpaceError> {
-        let layout = Layout::from_size_align(PAGE, PAGE).expect("frame layout");
-        let raw = unsafe { alloc_zeroed(layout) };
-        if raw.is_null() {
-            return Err(AddressSpaceError::OutOfFrames);
-        }
-        let virt = raw as usize;
+        let raw = allocate_user_frame_zeroed().map_err(|_| AddressSpaceError::OutOfFrames)?;
+        let virt = raw.as_ptr() as usize;
         Ok(virt - self.physical_memory_offset)
+    }
+
+    fn dealloc_user_frame(&self, entry: u64) {
+        let phys = (entry & PT_ADDR_MASK) as usize;
+        let virt = phys
+            .checked_add(self.physical_memory_offset)
+            .unwrap_or_else(|| panic!("Aarch64 user-frame HHDM address overflow"));
+        let ptr = NonNull::new(virt as *mut u8)
+            .unwrap_or_else(|| panic!("Aarch64 user-frame dealloc received null HHDM pointer"));
+        deallocate_user_frame(ptr);
     }
 }
 
@@ -317,7 +324,9 @@ impl AddressSpace for Aarch64UserAddressSpace {
         drop(state);
         for region in &reservation.committed {
             for offset in (0..region.range.byte_len).step_by(PAGE) {
-                let _ = self.unmap_4k(region.range.start.raw() + offset);
+                if let Ok(entry) = self.unmap_4k(region.range.start.raw() + offset) {
+                    self.dealloc_user_frame(entry);
+                }
             }
         }
         self.state.lock().free_list.push(reservation.range);
@@ -357,19 +366,14 @@ impl AddressSpace for Aarch64UserAddressSpace {
         validate_range(virt)?;
         let mut state = self.state.lock();
         let reservation = find_reservation_mut(&mut state.reservations, virt)?;
-        if !reservation
-            .committed
-            .iter()
-            .any(|region| range_contains(region.range, virt))
-        {
+        if !committed_regions_cover(&reservation.committed, virt) {
             return Err(AddressSpaceError::NotCommitted);
         }
-        reservation
-            .committed
-            .retain(|region| !ranges_overlap(region.range, virt));
+        remove_committed_range(&mut reservation.committed, virt);
         drop(state);
         for offset in (0..virt.byte_len).step_by(PAGE) {
-            let _ = self.unmap_4k(virt.start.raw() + offset);
+            let entry = self.unmap_4k(virt.start.raw() + offset)?;
+            self.dealloc_user_frame(entry);
         }
         Ok(())
     }
@@ -398,11 +402,10 @@ impl AddressSpace for Aarch64UserAddressSpace {
             .iter_mut()
             .find(|reservation| range_contains(reservation.range, virt))
         {
-            for region in reservation.committed.iter_mut() {
-                if region.range == virt {
-                    region.flags = flags;
-                }
-            }
+            remove_committed_range(&mut reservation.committed, virt);
+            reservation
+                .committed
+                .push(CommittedRegion { range: virt, flags });
         }
         Ok(())
     }
@@ -469,6 +472,52 @@ fn range_contains(outer: VirtRange, inner: VirtRange) -> bool {
 
 fn ranges_overlap(a: VirtRange, b: VirtRange) -> bool {
     a.start.raw() < b.end().raw() && b.start.raw() < a.end().raw()
+}
+
+fn committed_regions_cover(regions: &[CommittedRegion], range: VirtRange) -> bool {
+    let mut cursor = range.start.raw();
+    let end = range.end().raw();
+    while cursor < end {
+        let Some(region) = regions
+            .iter()
+            .find(|region| region.range.contains(VirtAddr::new(cursor)))
+        else {
+            return false;
+        };
+        cursor = region.range.end().raw().min(end);
+    }
+    true
+}
+
+fn remove_committed_range(regions: &mut Vec<CommittedRegion>, range: VirtRange) {
+    let mut index = 0;
+    while index < regions.len() {
+        let region = regions[index];
+        if !ranges_overlap(region.range, range) {
+            index += 1;
+            continue;
+        }
+
+        regions.swap_remove(index);
+        if region.range.start.raw() < range.start.raw() {
+            regions.push(CommittedRegion {
+                range: VirtRange::new(
+                    region.range.start,
+                    range.start.raw() - region.range.start.raw(),
+                ),
+                flags: region.flags,
+            });
+        }
+        if range.end().raw() < region.range.end().raw() {
+            regions.push(CommittedRegion {
+                range: VirtRange::new(
+                    range.end(),
+                    region.range.end().raw() - range.end().raw(),
+                ),
+                flags: region.flags,
+            });
+        }
+    }
 }
 
 fn page_flags_to_pte(flags: PageFlags) -> Result<u64, AddressSpaceError> {
@@ -599,8 +648,8 @@ extern "C" fn aarch64_mmap_remap(addr: *mut u8, size: usize, prot_flags: u32) ->
     // single transaction (that's what `relocate` will eventually
     // do), so the closest faithful sequence is decommit→commit:
     // decommit releases the old frames back to the kernel
-    // allocator, commit grabs fresh `alloc_zeroed` frames and maps
-    // them at the same virtual range with the requested flags. The
+    // allocator, commit grabs fresh frames from the unified user-memory
+    // pool and maps them at the same virtual range with the requested flags. The
     // intermediate window where the range is uncommitted is
     // invisible to wasmtime because remap is called between
     // instances on a slot the runtime guarantees no thread is
@@ -608,7 +657,19 @@ extern "C" fn aarch64_mmap_remap(addr: *mut u8, size: usize, prot_flags: u32) ->
     let size = round_up_to_page(size);
     let address_space = user_as();
     let range = VirtRange::new(VirtAddr::new(addr as usize), size);
-    let _ = address_space.decommit(range);
+    match decommit_committed_pages(address_space, range) {
+        Ok(()) => {}
+        Err(error) => {
+            tracing::error!(
+                target: "helios_aarch64::vmm",
+                addr = addr as usize,
+                size,
+                ?error,
+                "mmap_remap decommit failed"
+            );
+            return EINVAL;
+        }
+    }
     if prot_flags != 0 {
         let flags = prot_to_flags(prot_flags);
         if address_space.commit(range, flags).is_err() {
@@ -645,7 +706,7 @@ extern "C" fn aarch64_mprotect(ptr: *mut u8, size: usize, prot_flags: u32) -> c_
     let address_space = user_as();
     let range = VirtRange::new(VirtAddr::new(ptr as usize), size);
     if prot_flags == 0 {
-        return match address_space.decommit(range) {
+        return match decommit_committed_pages(address_space, range) {
             Ok(()) => 0,
             Err(error) => {
                 tracing::error!(
@@ -660,22 +721,8 @@ extern "C" fn aarch64_mprotect(ptr: *mut u8, size: usize, prot_flags: u32) -> c_
         };
     }
     let flags = prot_to_flags(prot_flags);
-    match address_space.protect(range, flags) {
+    match ensure_accessible(address_space, range, flags) {
         Ok(()) => 0,
-        Err(AddressSpaceError::NotCommitted) => match address_space.commit(range, flags) {
-            Ok(()) => 0,
-            Err(error) => {
-                tracing::error!(
-                    target: "helios_aarch64::vmm",
-                    addr = ptr as usize,
-                    size,
-                    prot_flags,
-                    ?error,
-                    "mprotect commit-fallback failed"
-                );
-                ENOMEM
-            }
-        },
         Err(error) => {
             tracing::error!(
                 target: "helios_aarch64::vmm",
@@ -688,6 +735,37 @@ extern "C" fn aarch64_mprotect(ptr: *mut u8, size: usize, prot_flags: u32) -> c_
             EINVAL
         }
     }
+}
+
+fn decommit_committed_pages(
+    address_space: &Aarch64UserAddressSpace,
+    range: VirtRange,
+) -> Result<(), AddressSpaceError> {
+    for offset in (0..range.byte_len).step_by(PAGE) {
+        let page = VirtRange::new(VirtAddr::new(range.start.raw() + offset), PAGE);
+        match address_space.translate(page.start) {
+            Translation::Committed { .. } => address_space.decommit(page)?,
+            Translation::Reserved => {}
+            Translation::Unmapped => return Err(AddressSpaceError::NotReserved),
+        }
+    }
+    Ok(())
+}
+
+fn ensure_accessible(
+    address_space: &Aarch64UserAddressSpace,
+    range: VirtRange,
+    flags: PageFlags,
+) -> Result<(), AddressSpaceError> {
+    for offset in (0..range.byte_len).step_by(PAGE) {
+        let page = VirtRange::new(VirtAddr::new(range.start.raw() + offset), PAGE);
+        match address_space.translate(page.start) {
+            Translation::Committed { .. } => address_space.protect(page, flags)?,
+            Translation::Reserved => address_space.commit(page, flags)?,
+            Translation::Unmapped => return Err(AddressSpaceError::NotReserved),
+        }
+    }
+    Ok(())
 }
 
 /// Wasmtime custom-virtual-memory hook table for the aarch64
@@ -713,3 +791,30 @@ const _: () = {
     let _: extern "C" fn(*const u8, usize, &mut *mut WasmtimeMemoryImage) -> c_int =
         default_memory_image_new;
 };
+
+pub fn publish_code_memory(ptr: *const u8, len: usize) {
+    protect_code_memory(ptr, len, PageFlags::READ | PageFlags::EXECUTE);
+}
+
+pub fn unpublish_code_memory(ptr: *const u8, len: usize) {
+    protect_code_memory(ptr, len, PageFlags::READ | PageFlags::WRITE);
+}
+
+fn protect_code_memory(ptr: *const u8, len: usize, flags: PageFlags) {
+    if len == 0 {
+        return;
+    }
+    let start = ptr as usize;
+    assert!(
+        start.is_multiple_of(PAGE),
+        "AArch64 code-memory range start {start:#x} is not page-aligned"
+    );
+    assert!(
+        len.is_multiple_of(PAGE),
+        "AArch64 code-memory range len {len:#x} is not page-aligned"
+    );
+    let range = VirtRange::new(VirtAddr::new(start), len);
+    user_as()
+        .protect(range, flags)
+        .unwrap_or_else(|error| panic!("AArch64 code-memory protect failed: {error:?}"));
+}

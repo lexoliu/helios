@@ -622,6 +622,7 @@ where
     fn subscribe_instant(&mut self, when: u64) -> Result<Resource<DynPollable>> {
         let resource = self.table.push(RuntimeDeadlinePollable::new(
             self.cpu.clone(),
+            self.timer(),
             self.runtime_state.clone(),
             when,
         ))?;

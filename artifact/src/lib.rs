@@ -16,6 +16,10 @@ pub const CWASM_NO_VMEM_MEMORY_GUARD_SIZE: u64 = 0;
 pub const CWASM_NO_VMEM_MEMORY_RESERVATION: u64 = 0;
 pub const CWASM_NO_VMEM_MEMORY_RESERVATION_FOR_GROWTH: u64 = 1 << 20;
 
+pub fn cwasm_target_uses_lazy_commit_virtual_memory(target: &str) -> bool {
+    matches!(target, "aarch64-unknown-none")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum SignatureAlgorithm {

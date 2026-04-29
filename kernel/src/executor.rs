@@ -18,6 +18,7 @@ use crate::sync::Notify;
 
 type ReadyQueue = ConcurrentQueue<Runnable>;
 pub type JoinHandle<T> = Task<T>;
+pub const READY_BATCH_TASKS: usize = 1024;
 static EXECUTOR_GROUP: Once<Arc<ExecutorGroup>> = Once::new();
 
 struct ExecutorGroup {
@@ -103,7 +104,7 @@ impl Executor {
     pub fn run_until_stalled(&self) -> usize {
         let mut runnable_count = 0;
 
-        loop {
+        while runnable_count < READY_BATCH_TASKS {
             let runnable = match self.local_queue.pop() {
                 Ok(runnable) => runnable,
                 Err(PopError::Empty | PopError::Closed) => match self.global_queue.pop() {
@@ -115,6 +116,8 @@ impl Executor {
             runnable.run();
             runnable_count += 1;
         }
+
+        runnable_count
     }
 }
 
