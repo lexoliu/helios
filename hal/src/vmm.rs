@@ -37,6 +37,8 @@
 //! `translate` is lock-free; the answer is a snapshot.
 
 use bitflags::bitflags;
+use core::future::Future;
+
 use thiserror::Error;
 
 use crate::cpu::ProcessorId;
@@ -161,12 +163,19 @@ pub trait SwapBackend: Send + Sync + 'static {
     /// later resurrect them via `swap_in`. The implementation owns
     /// the lifecycle of the storage and decides eviction order on
     /// its own.
-    fn swap_out(&self, bytes: &[u8]) -> Result<Self::Token, Self::Error>;
+    fn swap_out<'a>(
+        &'a self,
+        bytes: &'a [u8],
+    ) -> impl Future<Output = Result<Self::Token, Self::Error>> + Send + 'a;
 
     /// Restore previously swapped-out bytes into `dst`. After this
     /// returns successfully, the token is no longer valid (the
     /// storage may be reclaimed).
-    fn swap_in(&self, token: Self::Token, dst: &mut [u8]) -> Result<(), Self::Error>;
+    fn swap_in<'a>(
+        &'a self,
+        token: Self::Token,
+        dst: &'a mut [u8],
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
 }
 
 /// Sentinel `SwapBackend` impl for kernels that do not yet expose a
@@ -185,12 +194,19 @@ impl SwapBackend for NoSwap {
     type Token = ();
     type Error = NoSwapError;
 
-    fn swap_out(&self, _bytes: &[u8]) -> Result<Self::Token, Self::Error> {
-        Err(NoSwapError)
+    fn swap_out<'a>(
+        &'a self,
+        _bytes: &'a [u8],
+    ) -> impl Future<Output = Result<Self::Token, Self::Error>> + Send + 'a {
+        async { Err(NoSwapError) }
     }
 
-    fn swap_in(&self, _token: Self::Token, _dst: &mut [u8]) -> Result<(), Self::Error> {
-        Err(NoSwapError)
+    fn swap_in<'a>(
+        &'a self,
+        _token: Self::Token,
+        _dst: &'a mut [u8],
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a {
+        async { Err(NoSwapError) }
     }
 }
 

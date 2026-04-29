@@ -9,6 +9,7 @@ bitflags = "2.11.0"
 event-listener = { version = "5.4.1", default-features = false, features = ["critical-section"] }
 helios-hal.workspace = true
 spin = { version = "0.9.8", default-features = false, features = ["mutex", "spin_mutex"] }
+thiserror = { version = "2.0.17", default-features = false }
 
 [dev-dependencies]
 futures-lite = "2.6.1"

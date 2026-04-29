@@ -1,9 +1,12 @@
+use alloc::vec::Vec;
 use async_lock::Mutex;
+use core::cmp;
 use core::mem::size_of;
 
 use helios_hal::fs::{BlockDevice, BlockDeviceRights};
 use helios_hal::io::{IoError, IoResult};
 use helios_hal::resource::KernelResource;
+use helios_hal::vmm::SwapBackend;
 
 use crate::notify::Notify;
 use crate::queue::VirtQueue;
@@ -24,6 +27,54 @@ pub struct VirtioBlockDevice<T: VirtioTransport> {
 
 pub struct VirtioBlockResource<T: VirtioTransport> {
     resource: KernelResource<VirtioBlockDevice<T>, BlockDeviceRights>,
+}
+
+pub struct VirtioBlockSwapBackend<D: BlockDevice> {
+    device: D,
+    state: Mutex<VirtioBlockSwapState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VirtioBlockSwapToken {
+    start_block: usize,
+    block_count: usize,
+    byte_len: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum VirtioBlockSwapError {
+    #[error("swap payload is empty")]
+    EmptyPayload,
+    #[error("swap device reports zero-sized blocks")]
+    InvalidBlockSize,
+    #[error("swap extent is empty")]
+    EmptyExtent,
+    #[error("swap extent [{start_block}, +{block_count}) exceeds device block count {device_blocks}")]
+    ExtentOutOfBounds {
+        start_block: usize,
+        block_count: usize,
+        device_blocks: usize,
+    },
+    #[error("swap device has {available_blocks} free blocks, requested {requested_blocks}")]
+    OutOfSwap {
+        requested_blocks: usize,
+        available_blocks: usize,
+    },
+    #[error("swap-in destination length {actual} does not match token byte length {expected}")]
+    InvalidDestination { expected: usize, actual: usize },
+    #[error("swap block I/O failed: {0}")]
+    Io(#[from] IoError),
+}
+
+#[derive(Default)]
+struct VirtioBlockSwapState {
+    free: Vec<SwapExtent>,
+}
+
+#[derive(Clone, Copy)]
+struct SwapExtent {
+    start_block: usize,
+    block_count: usize,
 }
 
 #[repr(C)]
@@ -172,6 +223,129 @@ impl<T: VirtioTransport> VirtioBlockDevice<T> {
     }
 }
 
+impl<D: BlockDevice> VirtioBlockSwapBackend<D> {
+    pub fn new(
+        device: D,
+        start_block: usize,
+        block_count: usize,
+    ) -> Result<Self, VirtioBlockSwapError> {
+        let device_blocks = device.block_count();
+        if device.block_size() == 0 {
+            return Err(VirtioBlockSwapError::InvalidBlockSize);
+        }
+        if block_count == 0 {
+            return Err(VirtioBlockSwapError::EmptyExtent);
+        }
+        let end_block =
+            start_block
+                .checked_add(block_count)
+                .ok_or(VirtioBlockSwapError::ExtentOutOfBounds {
+                    start_block,
+                    block_count,
+                    device_blocks,
+                })?;
+        if end_block > device_blocks {
+            return Err(VirtioBlockSwapError::ExtentOutOfBounds {
+                start_block,
+                block_count,
+                device_blocks,
+            });
+        }
+
+        Ok(Self {
+            device,
+            state: Mutex::new(VirtioBlockSwapState {
+                free: Vec::from([SwapExtent {
+                    start_block,
+                    block_count,
+                }]),
+            }),
+        })
+    }
+
+    pub fn from_entire_device(device: D) -> Result<Self, VirtioBlockSwapError> {
+        let block_count = device.block_count();
+        Self::new(device, 0, block_count)
+    }
+
+    async fn allocate_token(
+        &self,
+        byte_len: usize,
+    ) -> Result<VirtioBlockSwapToken, VirtioBlockSwapError> {
+        if byte_len == 0 {
+            return Err(VirtioBlockSwapError::EmptyPayload);
+        }
+        let block_size = self.device.block_size();
+        if block_size == 0 {
+            return Err(VirtioBlockSwapError::InvalidBlockSize);
+        }
+        let block_count = byte_len.div_ceil(block_size);
+        let mut state = self.state.lock().await;
+        let start_block = state
+            .allocate(block_count)
+            .ok_or_else(|| VirtioBlockSwapError::OutOfSwap {
+                requested_blocks: block_count,
+                available_blocks: state.available_blocks(),
+            })?;
+        Ok(VirtioBlockSwapToken {
+            start_block,
+            block_count,
+            byte_len,
+        })
+    }
+
+    async fn release_token(&self, token: VirtioBlockSwapToken) {
+        self.state.lock().await.release(SwapExtent {
+            start_block: token.start_block,
+            block_count: token.block_count,
+        });
+    }
+}
+
+impl VirtioBlockSwapState {
+    fn allocate(&mut self, requested_blocks: usize) -> Option<usize> {
+        let index = self
+            .free
+            .iter()
+            .position(|extent| extent.block_count >= requested_blocks)?;
+        let extent = &mut self.free[index];
+        let start_block = extent.start_block;
+        extent.start_block += requested_blocks;
+        extent.block_count -= requested_blocks;
+        if extent.block_count == 0 {
+            self.free.swap_remove(index);
+        }
+        Some(start_block)
+    }
+
+    fn release(&mut self, extent: SwapExtent) {
+        if extent.block_count == 0 {
+            return;
+        }
+        self.free.push(extent);
+        self.free.sort_by_key(|extent| extent.start_block);
+
+        let mut index = 0;
+        while index + 1 < self.free.len() {
+            let current = self.free[index];
+            let next = self.free[index + 1];
+            let current_end = current.start_block + current.block_count;
+            if current_end >= next.start_block {
+                let next_end = next.start_block + next.block_count;
+                self.free[index].block_count =
+                    cmp::max(current_end, next_end) - current.start_block;
+                self.free.remove(index + 1);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    fn available_blocks(&self) -> usize {
+        self.free.iter().map(|extent| extent.block_count).sum()
+    }
+}
+
 impl<T: VirtioTransport> VirtioBlockResource<T> {
     pub fn rights(&self) -> BlockDeviceRights {
         self.resource.rights()
@@ -231,6 +405,51 @@ impl<T: VirtioTransport> BlockDevice for VirtioBlockResource<T> {
 
     fn block_size(&self) -> usize {
         SECTOR_SIZE
+    }
+
+    fn block_count(&self) -> usize {
+        self.object().capacity_blocks
+    }
+}
+
+impl<D: BlockDevice + 'static> SwapBackend for VirtioBlockSwapBackend<D> {
+    type Token = VirtioBlockSwapToken;
+    type Error = VirtioBlockSwapError;
+
+    async fn swap_out(&self, bytes: &[u8]) -> Result<Self::Token, Self::Error> {
+        let token = self.allocate_token(bytes.len()).await?;
+        let block_size = self.device.block_size();
+        let mut padded = Vec::from(bytes);
+        padded.resize(token.block_count * block_size, 0);
+
+        if let Err(error) = self.device.write_block(token.start_block, &padded).await {
+            self.release_token(token).await;
+            return Err(error.into());
+        }
+        Ok(token)
+    }
+
+    async fn swap_in(&self, token: Self::Token, dst: &mut [u8]) -> Result<(), Self::Error> {
+        if dst.len() != token.byte_len {
+            return Err(VirtioBlockSwapError::InvalidDestination {
+                expected: token.byte_len,
+                actual: dst.len(),
+            });
+        }
+
+        let block_size = self.device.block_size();
+        if block_size == 0 {
+            return Err(VirtioBlockSwapError::InvalidBlockSize);
+        }
+        let mut padded = Vec::new();
+        padded.resize(token.block_count * block_size, 0);
+        self.device
+            .read_block(token.start_block, &mut padded)
+            .await
+            .map_err(VirtioBlockSwapError::Io)?;
+        dst.copy_from_slice(&padded[..token.byte_len]);
+        self.release_token(token).await;
+        Ok(())
     }
 }
 

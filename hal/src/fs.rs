@@ -151,4 +151,6 @@ pub trait BlockDevice: Send + Sync {
     -> impl Future<Output = IoResult<()>> + Send;
 
     fn block_size(&self) -> usize;
+
+    fn block_count(&self) -> usize;
 }

@@ -13,8 +13,10 @@ mod p9;
 mod queue;
 mod transport;
 
-pub use block::VirtioBlockDevice;
-pub use block::VirtioBlockResource;
+pub use block::{
+    VirtioBlockDevice, VirtioBlockResource, VirtioBlockSwapBackend, VirtioBlockSwapError,
+    VirtioBlockSwapToken,
+};
 pub use bus::{DeviceBus, DmaBuffer, DmaPool, IdentityDmaBuffer, IdentityDmaPool, MmioBus};
 pub use console::VirtioConsoleDevice;
 pub use mmio::{

@@ -134,9 +134,12 @@ fn kill_supervisor_restart_decodes_correctly() {
 #[test]
 fn no_swap_reports_unsupported() {
     let backend = NoSwap;
-    let result = backend.swap_out(b"some bytes");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("tokio runtime");
+    let result = runtime.block_on(backend.swap_out(b"some bytes"));
     assert!(result.is_err(), "NoSwap must refuse swap_out");
     let mut buffer = [0u8; 16];
-    let result = backend.swap_in((), &mut buffer);
+    let result = runtime.block_on(backend.swap_in((), &mut buffer));
     assert!(result.is_err(), "NoSwap must refuse swap_in");
 }
