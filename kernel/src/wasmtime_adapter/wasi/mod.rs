@@ -2,7 +2,6 @@ extern crate alloc;
 
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
-use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
@@ -553,9 +552,12 @@ impl TcpSocket {
             }
             state.service.clone()
         };
+        let mut host_buffer = [0; 15];
         let stream = service
             .tcp_connect(
-                &format_ipv4_host(remote_address.address),
+                remote_address
+                    .address
+                    .write_dotted_decimal(&mut host_buffer),
                 remote_address.port,
                 u64::MAX,
             )
@@ -1028,9 +1030,10 @@ impl UdpSocket {
         };
         let bound = self.ensure_bound(0).await?;
         let service = self.inner.lock().service.clone();
-        let host = format_ipv4_address(target.address);
+        let mut host_buffer = [0; 15];
+        let host = target.address.write_dotted_decimal(&mut host_buffer);
         let written = service
-            .udp_send(bound.socket, &host, target.port, bytes, timeout_nanos)
+            .udp_send(bound.socket, host, target.port, bytes, timeout_nanos)
             .await
             .map_err(WasiUdpSocketError::Backend)?;
         assert!(
@@ -1184,11 +1187,6 @@ fn validate_udp_remote_address(
         return Err(WasiUdpSocketError::InvalidArgument);
     }
     Ok(())
-}
-
-fn format_ipv4_address(address: crate::Ipv4Address) -> String {
-    let [a, b, c, d] = address.octets();
-    format!("{a}.{b}.{c}.{d}")
 }
 
 fn embedded_absolute_path(relative: &str) -> String {
@@ -4134,9 +4132,7 @@ where
             }
         };
         let Some(service) = self.runtime_state.network_service() else {
-            return Ok(Err(socket_types::ErrorCode::Other(Some(String::from(
-                "network service is unavailable on this machine",
-            )))));
+            return Ok(Err(socket_types::ErrorCode::Other(None)));
         };
         let resource = self.table.push(TcpSocket::new(service, family))?;
         Ok(Ok(resource))
@@ -4360,9 +4356,7 @@ where
             Err(error) => return Ok(Err(map_p3_udp_socket_error(error))),
         };
         let Some(service) = self.runtime_state.network_service() else {
-            return Ok(Err(socket_types::ErrorCode::Other(Some(String::from(
-                "network service is unavailable on this machine",
-            )))));
+            return Ok(Err(socket_types::ErrorCode::Other(None)));
         };
         let resource = self.table.push(UdpSocket::new(service, family))?;
         Ok(Ok(resource))
@@ -4667,20 +4661,13 @@ fn format_p3_tcp_socket_address(address: WasiTcpSocketAddress) -> socket_types::
     })
 }
 
-fn format_ipv4_host(address: crate::Ipv4Address) -> String {
-    let [a, b, c, d] = address.octets();
-    format!("{a}.{b}.{c}.{d}")
-}
-
 fn map_p3_tcp_error(error: crate::TcpError) -> socket_types::ErrorCode {
     match error.kind {
         crate::TcpErrorKind::UnresolvedHost | crate::TcpErrorKind::Unavailable => {
             socket_types::ErrorCode::RemoteUnreachable
         }
         crate::TcpErrorKind::Timeout => socket_types::ErrorCode::Timeout,
-        crate::TcpErrorKind::Internal => {
-            socket_types::ErrorCode::Other(Some(error.detail.to_string()))
-        }
+        crate::TcpErrorKind::Internal => socket_types::ErrorCode::Other(None),
     }
 }
 
@@ -4743,9 +4730,7 @@ fn map_p3_udp_socket_error(error: WasiUdpSocketError) -> socket_types::ErrorCode
             kind: crate::UdpErrorKind::Timeout,
             ..
         }) => socket_types::ErrorCode::Timeout,
-        WasiUdpSocketError::Backend(error) => {
-            socket_types::ErrorCode::Other(Some(error.detail.to_string()))
-        }
+        WasiUdpSocketError::Backend(_) => socket_types::ErrorCode::Other(None),
     }
 }
 
@@ -4801,9 +4786,7 @@ fn map_p3_dns_error(error: crate::DnsError) -> ip_name_lookup::ErrorCode {
         crate::DnsErrorKind::Timeout | crate::DnsErrorKind::Unavailable => {
             ip_name_lookup::ErrorCode::TemporaryResolverFailure
         }
-        crate::DnsErrorKind::Internal => {
-            ip_name_lookup::ErrorCode::Other(Some(error.detail.to_string()))
-        }
+        crate::DnsErrorKind::Internal => ip_name_lookup::ErrorCode::Other(None),
     }
 }
 
@@ -4922,7 +4905,9 @@ mod tests {
     use super::{
         ComponentHostNetworkService, DebugFileSystem, FsDescriptor, FsNodeKind,
         P2ResolveAddressStream, PREVIEW3_LINKED_INTERFACES, TcpSocket, WasiTcpSocketAddress,
-        WasiTcpSocketFamily, fs_types, has_wasi_network_rights, wasi_udp_bind_rights,
+        WasiTcpSocketFamily, WasiUdpSocketError, fs_types, has_wasi_network_rights, ip_name_lookup,
+        map_p3_dns_error, map_p3_tcp_error, map_p3_udp_socket_error, socket_types,
+        wasi_udp_bind_rights,
     };
 
     const PREVIEW3_WIT_PACKAGES: &[(&str, &str)] = &[
@@ -5679,6 +5664,31 @@ mod tests {
         assert!(!has_wasi_network_rights(
             &authority,
             crate::NetworkAuthorityRights::UDP | crate::NetworkAuthorityRights::PRIVILEGED_BIND
+        ));
+    }
+
+    #[test]
+    fn p3_network_error_mapping_does_not_allocate_detail_strings() {
+        assert!(matches!(
+            map_p3_tcp_error(crate::TcpError {
+                kind: crate::TcpErrorKind::Internal,
+                detail: crate::NetworkErrorDetail::InternalInvariant,
+            }),
+            socket_types::ErrorCode::Other(None)
+        ));
+        assert!(matches!(
+            map_p3_udp_socket_error(WasiUdpSocketError::Backend(crate::UdpError {
+                kind: crate::UdpErrorKind::Internal,
+                detail: crate::NetworkErrorDetail::InternalInvariant,
+            })),
+            socket_types::ErrorCode::Other(None)
+        ));
+        assert!(matches!(
+            map_p3_dns_error(crate::DnsError {
+                kind: crate::DnsErrorKind::Internal,
+                detail: crate::NetworkErrorDetail::InternalInvariant,
+            }),
+            ip_name_lookup::ErrorCode::Other(None)
         ));
     }
 

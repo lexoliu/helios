@@ -2338,9 +2338,12 @@ where
             )
         };
         self.spawner().spawn_detached(async move {
+            let mut host_buffer = [0; 15];
             let result = service
                 .tcp_connect(
-                    &super::format_ipv4_host(remote_address.address),
+                    remote_address
+                        .address
+                        .write_dotted_decimal(&mut host_buffer),
                     remote_address.port,
                     u64::MAX,
                 )

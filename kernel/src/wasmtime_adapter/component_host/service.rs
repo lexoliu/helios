@@ -9420,8 +9420,9 @@ where
     let Some(service) = caller.data().runtime_state.network_service() else {
         return p1::errno::NETDOWN;
     };
-    let host = wasix_format_ipv4_host(address);
-    let stream = match service.tcp_connect(&host, port, u64::MAX).await {
+    let mut host_buffer = [0; 15];
+    let host = address.write_dotted_decimal(&mut host_buffer);
+    let stream = match service.tcp_connect(host, port, u64::MAX).await {
         Ok(stream) => stream,
         Err(error) => return p1_errno_from_tcp_error(error),
     };
@@ -9601,11 +9602,9 @@ where
             let Some(service) = caller.data().runtime_state.network_service() else {
                 return p1::errno::NETDOWN;
             };
-            let host = wasix_format_ipv4_host(address);
-            let sent = match service
-                .udp_send(socket, &host, port, &bytes, u64::MAX)
-                .await
-            {
+            let mut host_buffer = [0; 15];
+            let host = address.write_dotted_decimal(&mut host_buffer);
+            let sent = match service.udp_send(socket, host, port, &bytes, u64::MAX).await {
                 Ok(sent) => sent,
                 Err(error) => return p1_errno_from_udp_error(error),
             };
@@ -9975,11 +9974,6 @@ fn write_wasix_addr_port_unspec<T>(
             ptr + WASIX_ADDR_PORT_IP4_ADDRESS_OFFSET,
             &[0, 0, 0, 0],
         ))
-}
-
-fn wasix_format_ipv4_host(address: crate::Ipv4Address) -> String {
-    let [a, b, c, d] = address.octets();
-    format!("{a}.{b}.{c}.{d}")
 }
 
 fn p1_sock_accept<CpuImpl, HostFs>(

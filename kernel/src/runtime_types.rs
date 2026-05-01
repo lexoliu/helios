@@ -82,6 +82,36 @@ impl Ipv4Address {
     pub const fn octets(self) -> [u8; 4] {
         self.octets
     }
+
+    pub fn write_dotted_decimal<'a>(self, buffer: &'a mut [u8; 15]) -> &'a str {
+        let mut cursor = 0;
+        for (index, octet) in self.octets.into_iter().enumerate() {
+            if index != 0 {
+                buffer[cursor] = b'.';
+                cursor += 1;
+            }
+            cursor += write_decimal_u8(octet, &mut buffer[cursor..]);
+        }
+        // SAFETY: all bytes written by `write_decimal_u8` and the separators
+        // above are ASCII digits or dots.
+        unsafe { core::str::from_utf8_unchecked(&buffer[..cursor]) }
+    }
+}
+
+fn write_decimal_u8(value: u8, buffer: &mut [u8]) -> usize {
+    if value >= 100 {
+        buffer[0] = b'0' + (value / 100);
+        buffer[1] = b'0' + ((value / 10) % 10);
+        buffer[2] = b'0' + (value % 10);
+        3
+    } else if value >= 10 {
+        buffer[0] = b'0' + (value / 10);
+        buffer[1] = b'0' + (value % 10);
+        2
+    } else {
+        buffer[0] = b'0' + value;
+        1
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -568,4 +598,30 @@ where
 {
     fn host_filesystem_service(&self) -> Option<Service>;
     fn bootfs(&self) -> Option<crate::EmbeddedBootFs>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Ipv4Address;
+
+    #[test]
+    fn ipv4_dotted_decimal_uses_caller_buffer() {
+        let mut buffer = [0; 15];
+        assert_eq!(
+            Ipv4Address::new([192, 168, 0, 1]).write_dotted_decimal(&mut buffer),
+            "192.168.0.1"
+        );
+
+        let mut buffer = [0; 15];
+        assert_eq!(
+            Ipv4Address::new([255, 255, 255, 255]).write_dotted_decimal(&mut buffer),
+            "255.255.255.255"
+        );
+
+        let mut buffer = [0; 15];
+        assert_eq!(
+            Ipv4Address::new([0, 0, 0, 0]).write_dotted_decimal(&mut buffer),
+            "0.0.0.0"
+        );
+    }
 }
