@@ -6,7 +6,7 @@ repo_root := justfile_directory()
 default_profile := "debug"
 
 # Generate the kernel-prebuild manifest for `target` and run `cargo check` against it.
-# Usage: just check-target riscv64gc-unknown-none-elf
+# Usage: just check-target aarch64-unknown-none
 check-target target:
     cargo run -p helios-cli --quiet -- kernel-prebuild \
         --out-dir "{{repo_root}}/target/kernel-prebuild/{{target}}/{{default_profile}}" \
@@ -21,6 +21,7 @@ check-all:
     cargo check -p helios-kernel
     cargo check -p helios-hosted
     cargo check -p helios-inspector
+    just check-target aarch64-unknown-none
     just check-target riscv64gc-unknown-none-elf
     just check-target x86_64-unknown-none
     cargo test -p helios-hosted init_program::tests::embedded_debugger_ -- --nocapture

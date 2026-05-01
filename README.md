@@ -98,6 +98,9 @@ The inspector launches a guest under QEMU and attaches over the guest's
 debugger component:
 
 ```bash
+# Boot the arm64 guest with hardware virtualization on Apple Silicon
+cargo run -p helios-inspector -- vm --arch aarch64
+
 # Boot the RISC-V guest
 cargo run -p helios-inspector -- vm --arch riscv64
 
