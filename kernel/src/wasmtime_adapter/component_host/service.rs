@@ -2143,9 +2143,6 @@ impl Preview1DescriptorTable {
     }
 
     fn renumber(&mut self, from: i32, to: i32) -> i32 {
-        if matches!(from, 0..=2) || matches!(to, 0..=2) {
-            return p1::errno::BADF;
-        }
         let Ok(from) = usize::try_from(from) else {
             return p1::errno::BADF;
         };
@@ -12040,6 +12037,46 @@ mod tests {
             validate_preview1_program_import(WASIX_MODULE, import)
                 .expect("linked WASIX imports should validate");
         }
+    }
+
+    #[test]
+    fn fd_renumber_replaces_stdio_descriptor() {
+        let file = Preview1Descriptor::File {
+            descriptor: FsDescriptor {
+                path: "/redirected".into(),
+                kind: FsNodeKind::File,
+                flags: fs_types::DescriptorFlags::WRITE,
+                identity: None,
+            },
+            offset: 0,
+            fdflags: 0,
+        };
+        let mut table = Preview1DescriptorTable {
+            entries: vec![
+                Some(Preview1DescriptorEntry::new(
+                    Preview1Descriptor::Stdin { carry: Vec::new() },
+                    false,
+                )),
+                Some(Preview1DescriptorEntry::new(
+                    Preview1Descriptor::Stdout,
+                    false,
+                )),
+                Some(Preview1DescriptorEntry::new(
+                    Preview1Descriptor::Stderr,
+                    false,
+                )),
+                Some(Preview1DescriptorEntry::new(file, false)),
+            ],
+        };
+
+        assert_eq!(table.renumber(3, 1), p1::errno::SUCCESS);
+        match table.get(1) {
+            Some(Preview1Descriptor::File { descriptor, .. }) => {
+                assert_eq!(descriptor.path, "/redirected");
+            }
+            _ => panic!("fd 1 should be redirected to the file descriptor"),
+        }
+        assert!(table.get(3).is_none());
     }
 
     #[test]
