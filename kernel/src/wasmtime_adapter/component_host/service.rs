@@ -5493,24 +5493,22 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "path_filestat_get",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             flags: i32,
-             path: i32,
-             path_len: i32,
-             stat: i32|
-             -> i32 {
-                wasix_path_filestat_get(
-                    &mut caller,
-                    fd,
-                    flags as u32,
-                    path as u32,
-                    path_len as u32,
-                    stat as u32,
-                )
+             (fd, flags, path, path_len, stat): (i32, i32, i32, i32, i32)| {
+                Box::new(async move {
+                    wasix_path_filestat_get(
+                        &mut caller,
+                        fd,
+                        flags as u32,
+                        path as u32,
+                        path_len as u32,
+                        stat as u32,
+                    )
+                    .await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -5582,37 +5580,34 @@ where
     HostFs: crate::HostFileSystem,
 {
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "path_create_directory",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             path: i32,
-             path_len: i32|
-             -> i32 {
-                p1_path_create_directory(&mut caller, fd, path as u32, path_len as u32)
+             (fd, path, path_len): (i32, i32, i32)| {
+                Box::new(async move {
+                    p1_path_create_directory(&mut caller, fd, path as u32, path_len as u32).await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "path_filestat_get",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             flags: i32,
-             path: i32,
-             path_len: i32,
-             stat: i32|
-             -> i32 {
-                p1_path_filestat_get(
-                    &mut caller,
-                    fd,
-                    flags as u32,
-                    path as u32,
-                    path_len as u32,
-                    stat as u32,
-                )
+             (fd, flags, path, path_len, stat): (i32, i32, i32, i32, i32)| {
+                Box::new(async move {
+                    p1_path_filestat_get(
+                        &mut caller,
+                        fd,
+                        flags as u32,
+                        path as u32,
+                        path_len as u32,
+                        stat as u32,
+                    )
+                    .await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -5701,39 +5696,42 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "path_remove_directory",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             path: i32,
-             path_len: i32|
-             -> i32 {
-                p1_path_remove_directory(&mut caller, fd, path as u32, path_len as u32)
+             (fd, path, path_len): (i32, i32, i32)| {
+                Box::new(async move {
+                    p1_path_remove_directory(&mut caller, fd, path as u32, path_len as u32).await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "path_rename",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             old_fd: i32,
-             old_path: i32,
-             old_path_len: i32,
-             new_fd: i32,
-             new_path: i32,
-             new_path_len: i32|
-             -> i32 {
-                p1_path_rename(
-                    &mut caller,
-                    old_fd,
-                    old_path as u32,
-                    old_path_len as u32,
-                    new_fd,
-                    new_path as u32,
-                    new_path_len as u32,
-                )
+             (old_fd, old_path, old_path_len, new_fd, new_path, new_path_len): (
+                i32,
+                i32,
+                i32,
+                i32,
+                i32,
+                i32,
+            )| {
+                Box::new(async move {
+                    p1_path_rename(
+                        &mut caller,
+                        old_fd,
+                        old_path as u32,
+                        old_path_len as u32,
+                        new_fd,
+                        new_path as u32,
+                        new_path_len as u32,
+                    )
+                    .await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -5764,15 +5762,14 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "path_unlink_file",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             path: i32,
-             path_len: i32|
-             -> i32 {
-                p1_path_unlink_file(&mut caller, fd, path as u32, path_len as u32)
+             (fd, path, path_len): (i32, i32, i32)| {
+                Box::new(async move {
+                    p1_path_unlink_file(&mut caller, fd, path as u32, path_len as u32).await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -6919,7 +6916,7 @@ fn p1_read_path<T>(
     })
 }
 
-fn p1_path_create_directory<CpuImpl, HostFs>(
+async fn p1_path_create_directory<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     path: u32,
@@ -6942,6 +6939,36 @@ where
         return p1::errno::BADF;
     };
     let descriptor = descriptor.clone();
+    let absolute = match crate::resolve_child_path(&descriptor.path, &path) {
+        Ok(path) => path,
+        Err(error) => return p1_errno_from_component_path(error),
+    };
+    if let Some(host_path) = crate::guest_host_share_path(&absolute) {
+        if descriptor.kind != FsNodeKind::Directory {
+            return p1::errno::NOTDIR;
+        }
+        if !descriptor
+            .flags
+            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
+        {
+            return p1::errno::ROFS;
+        }
+        let service = match caller.data().filesystem.host_service() {
+            Ok(service) => service,
+            Err(error) => return p1_errno_from_fs(error),
+        };
+        return service
+            .create_directory(host_path)
+            .await
+            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
+            .map_or_else(p1_errno_from_fs, |_| {
+                caller
+                    .data_mut()
+                    .filesystem
+                    .invalidate_host_subtree(&absolute);
+                p1::errno::SUCCESS
+            });
+    }
     let now_nanos = caller.data().now_nanos();
     caller
         .data_mut()
@@ -6950,7 +6977,7 @@ where
         .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
 }
 
-fn p1_path_filestat_get<CpuImpl, HostFs>(
+async fn p1_path_filestat_get<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     _flags: u32,
@@ -6976,9 +7003,22 @@ where
         Ok(absolute) => absolute,
         Err(error) => return p1_errno_from_component_path(error),
     };
-    let stat_value = match caller.data().filesystem.stat(&absolute) {
-        Ok(stat) => stat,
-        Err(error) => return p1_errno_from_fs(error),
+    let stat_value = if let Some(host_path) = crate::guest_host_share_path(&absolute) {
+        let service = match caller.data().filesystem.host_service() {
+            Ok(service) => service,
+            Err(error) => return p1_errno_from_fs(error),
+        };
+        match service.stat_path(host_path).await {
+            Ok(metadata) => p1_descriptor_stat_from_host_metadata(metadata),
+            Err(error) => {
+                return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
+            }
+        }
+    } else {
+        match caller.data().filesystem.stat(&absolute) {
+            Ok(stat) => stat,
+            Err(error) => return p1_errno_from_fs(error),
+        }
     };
     p1_write_filestat(caller, stat, stat_value)
 }
@@ -7011,6 +7051,9 @@ where
         Ok(absolute) => absolute,
         Err(error) => return p1_errno_from_component_path(error),
     };
+    if crate::guest_host_share_path(&absolute).is_some() {
+        return p1::errno::NOTSUP;
+    }
     let now_nanos = caller.data().system_time_nanos();
     let access = p1_timestamp_from_fstflags(
         fstflags,
@@ -7033,7 +7076,7 @@ where
         .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
 }
 
-fn wasix_path_filestat_get<CpuImpl, HostFs>(
+async fn wasix_path_filestat_get<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     _flags: u32,
@@ -7060,9 +7103,22 @@ where
         Ok(absolute) => absolute,
         Err(error) => return p1_errno_from_component_path(error),
     };
-    let stat_value = match caller.data().filesystem.stat(&absolute) {
-        Ok(stat) => stat,
-        Err(error) => return p1_errno_from_fs(error),
+    let stat_value = if let Some(host_path) = crate::guest_host_share_path(&absolute) {
+        let service = match caller.data().filesystem.host_service() {
+            Ok(service) => service,
+            Err(error) => return p1_errno_from_fs(error),
+        };
+        match service.stat_path(host_path).await {
+            Ok(metadata) => p1_descriptor_stat_from_host_metadata(metadata),
+            Err(error) => {
+                return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
+            }
+        }
+    } else {
+        match caller.data().filesystem.stat(&absolute) {
+            Ok(stat) => stat,
+            Err(error) => return p1_errno_from_fs(error),
+        }
     };
     p1_write_filestat(caller, stat, stat_value)
 }
@@ -7109,9 +7165,8 @@ where
         Ok(path) => path,
         Err(error) => return p1_errno_from_component_path(error),
     };
-    let source_host = crate::guest_host_share_path(&source_absolute).map(ToOwned::to_owned);
-    let destination_host =
-        crate::guest_host_share_path(&destination_absolute).map(ToOwned::to_owned);
+    let source_host = crate::guest_host_share_path(&source_absolute);
+    let destination_host = crate::guest_host_share_path(&destination_absolute);
     if source_host.is_some() || destination_host.is_some() {
         if source_base.kind != FsNodeKind::Directory
             || destination_base.kind != FsNodeKind::Directory
@@ -7227,7 +7282,7 @@ where
     p1_write_u32(caller, memory, bufused, copied)
 }
 
-fn p1_path_remove_directory<CpuImpl, HostFs>(
+async fn p1_path_remove_directory<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     path: u32,
@@ -7248,6 +7303,33 @@ where
         return p1::errno::BADF;
     };
     let base = base.clone();
+    let absolute = match crate::resolve_child_path(&base.path, &path) {
+        Ok(path) => path,
+        Err(error) => return p1_errno_from_component_path(error),
+    };
+    if let Some(host_path) = crate::guest_host_share_path(&absolute) {
+        if !base
+            .flags
+            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
+        {
+            return p1::errno::ROFS;
+        }
+        let service = match caller.data().filesystem.host_service() {
+            Ok(service) => service,
+            Err(error) => return p1_errno_from_fs(error),
+        };
+        return service
+            .remove(host_path, true)
+            .await
+            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
+            .map_or_else(p1_errno_from_fs, |_| {
+                caller
+                    .data_mut()
+                    .filesystem
+                    .invalidate_host_subtree(&absolute);
+                p1::errno::SUCCESS
+            });
+    }
     caller
         .data_mut()
         .filesystem
@@ -7255,7 +7337,7 @@ where
         .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
 }
 
-fn p1_path_rename<CpuImpl, HostFs>(
+async fn p1_path_rename<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     old_fd: i32,
     old_path: u32,
@@ -7288,6 +7370,48 @@ where
     };
     let source_base = source_base.clone();
     let destination_base = destination_base.clone();
+    let source_absolute = match crate::resolve_child_path(&source_base.path, &old_path) {
+        Ok(path) => path,
+        Err(error) => return p1_errno_from_component_path(error),
+    };
+    let destination_absolute = match crate::resolve_child_path(&destination_base.path, &new_path) {
+        Ok(path) => path,
+        Err(error) => return p1_errno_from_component_path(error),
+    };
+    let source_host = crate::guest_host_share_path(&source_absolute).map(ToOwned::to_owned);
+    let destination_host =
+        crate::guest_host_share_path(&destination_absolute).map(ToOwned::to_owned);
+    if source_host.is_some() || destination_host.is_some() {
+        if !source_base
+            .flags
+            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
+            || !destination_base
+                .flags
+                .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
+        {
+            return p1::errno::ROFS;
+        }
+        let Some(source_host) = source_host else {
+            return p1::errno::XDEV;
+        };
+        let Some(destination_host) = destination_host else {
+            return p1::errno::XDEV;
+        };
+        let service = match caller.data().filesystem.host_service() {
+            Ok(service) => service,
+            Err(error) => return p1_errno_from_fs(error),
+        };
+        return service
+            .rename(&source_host, &destination_host)
+            .await
+            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
+            .map_or_else(p1_errno_from_fs, |_| {
+                let filesystem = &mut caller.data_mut().filesystem;
+                filesystem.invalidate_host_subtree(&source_absolute);
+                filesystem.invalidate_host_subtree(&destination_absolute);
+                p1::errno::SUCCESS
+            });
+    }
     let now_nanos = caller.data().now_nanos();
     caller
         .data_mut()
@@ -7371,7 +7495,7 @@ where
         .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
 }
 
-fn p1_path_unlink_file<CpuImpl, HostFs>(
+async fn p1_path_unlink_file<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     path: u32,
@@ -7392,6 +7516,33 @@ where
         return p1::errno::BADF;
     };
     let base = base.clone();
+    let absolute = match crate::resolve_child_path(&base.path, &path) {
+        Ok(path) => path,
+        Err(error) => return p1_errno_from_component_path(error),
+    };
+    if let Some(host_path) = crate::guest_host_share_path(&absolute) {
+        if !base
+            .flags
+            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
+        {
+            return p1::errno::ROFS;
+        }
+        let service = match caller.data().filesystem.host_service() {
+            Ok(service) => service,
+            Err(error) => return p1_errno_from_fs(error),
+        };
+        return service
+            .remove(host_path, false)
+            .await
+            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
+            .map_or_else(p1_errno_from_fs, |_| {
+                caller
+                    .data_mut()
+                    .filesystem
+                    .invalidate_host_subtree(&absolute);
+                p1::errno::SUCCESS
+            });
+    }
     caller
         .data_mut()
         .filesystem
@@ -11210,6 +11361,23 @@ fn p1_poll_descriptor(descriptor: Option<&Preview1Descriptor>, event_type: u8) -
         ) => Ok(0),
         (Some(_), _) => Err(p1::errno::INVAL),
         (None, _) => Err(p1::errno::BADF),
+    }
+}
+
+fn p1_descriptor_stat_from_host_metadata(
+    metadata: crate::HostMetadata,
+) -> fs_types::DescriptorStat {
+    fs_types::DescriptorStat {
+        type_: if metadata.qid_type & 0x80 != 0 {
+            fs_types::DescriptorType::Directory
+        } else {
+            fs_types::DescriptorType::RegularFile
+        },
+        link_count: 1,
+        size: metadata.size,
+        data_access_timestamp: None,
+        data_modification_timestamp: None,
+        status_change_timestamp: None,
     }
 }
 
