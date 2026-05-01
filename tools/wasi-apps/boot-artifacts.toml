@@ -17,3 +17,12 @@ source = "artifacts/python3-root/python3.wasm"
 sha256_file = "artifacts/python3-root/python3.wasm.sha256"
 support_root = "artifacts/python3-root/lib/python3.14"
 support_bootfs_prefix = "usr/local/lib/python3.14"
+
+[[artifact]]
+command = "curl"
+package = "helios-curl-wasi"
+version = "0.1.0"
+source_url = "tools/wasi-apps/curl"
+bootfs_path = "bin/curl"
+source = "artifacts/wasi-tools/curl.wasm"
+sha256_file = "artifacts/wasi-tools/curl.wasm.sha256"

@@ -253,6 +253,7 @@ fn is_supported_component_import(name: &str) -> bool {
         || name.starts_with("wasi:random/")
         || name.starts_with("wasi:sockets/")
         || name.starts_with("helios:system/")
+        || name.starts_with("import-func-")
 }
 
 #[cfg(test)]
@@ -348,6 +349,7 @@ mod tests {
         let report = classify_component(alloc::vec![
             "wasi:cli/environment@0.2.6".to_string(),
             "wasi:filesystem/types@0.2.6".to_string(),
+            "import-func-run".to_string(),
         ])
         .expect("Preview2 imports must classify");
 

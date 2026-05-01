@@ -155,8 +155,5 @@ async fn run() -> Result<()> {
 
 #[helios_api::main]
 async fn main() -> Result<()> {
-    if let Err(error) = run().await {
-        let _ = writeln!(io::stderr(), "{error}");
-    }
-    Ok(())
+    run().await
 }

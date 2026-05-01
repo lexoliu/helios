@@ -104,8 +104,10 @@ env "${build_env[@]}" cargo build \
 cp -f \
   "$repo_root/tools/wasi-apps/curl/target/wasm32-wasip2/debug/helios_curl_wasi.wasm" \
   "$out_dir/curl.wasm"
+sha256sum "$out_dir/curl.wasm" > "$out_dir/curl.wasm.sha256"
 
 wasm-tools strip "$out_dir/curl.wasm" -o "$out_dir/curl-stripped.wasm"
+sha256sum "$out_dir/curl-stripped.wasm" > "$out_dir/curl-stripped.wasm.sha256"
 
 echo "wasi artifacts written to: $out_dir and $python_root"
 ls -lh "$out_dir"/curl*.wasm
