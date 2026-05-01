@@ -1736,7 +1736,7 @@ where
         crate::guest_host_share_path(path)
     }
 
-    fn host_service(&self) -> core::result::Result<HostFsService, fs_types::ErrorCode> {
+    pub(crate) fn host_service(&self) -> core::result::Result<HostFsService, fs_types::ErrorCode> {
         self.runtime_state
             .host_filesystem_service()
             .ok_or(fs_types::ErrorCode::NoEntry)

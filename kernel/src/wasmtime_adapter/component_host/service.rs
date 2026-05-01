@@ -4893,31 +4893,35 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "path_open",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             dirflags: i32,
-             path: i32,
-             path_len: i32,
-             oflags: i32,
-             fs_rights_base: i64,
-             _fs_rights_inheriting: i64,
-             fdflags: i32,
-             opened_fd: i32|
-             -> i32 {
-                p1_path_open(
-                    &mut caller,
-                    fd,
-                    dirflags as u32,
-                    path as u32,
-                    path_len as u32,
-                    oflags as u16,
-                    fs_rights_base as u64,
-                    fdflags as u16,
-                    opened_fd as u32,
-                )
+             (
+                fd,
+                dirflags,
+                path,
+                path_len,
+                oflags,
+                fs_rights_base,
+                _fs_rights_inheriting,
+                fdflags,
+                opened_fd,
+            ): (i32, i32, i32, i32, i32, i64, i64, i32, i32)| {
+                Box::new(async move {
+                    p1_path_open(
+                        &mut caller,
+                        fd,
+                        dirflags as u32,
+                        path as u32,
+                        path_len as u32,
+                        oflags as u16,
+                        fs_rights_base as u64,
+                        fdflags as u16,
+                        opened_fd as u32,
+                    )
+                    .await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -5046,33 +5050,37 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "path_open2",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             dirflags: i32,
-             path: i32,
-             path_len: i32,
-             oflags: i32,
-             fs_rights_base: i64,
-             _fs_rights_inheriting: i64,
-             fdflags: i32,
-             fdflagsext: i32,
-             opened_fd: i32|
-             -> i32 {
-                wasix_path_open2(
-                    &mut caller,
-                    fd,
-                    dirflags as u32,
-                    path as u32,
-                    path_len as u32,
-                    oflags as u16,
-                    fs_rights_base as u64,
-                    fdflags as u16,
-                    fdflagsext as u16,
-                    opened_fd as u32,
-                )
+             (
+                fd,
+                dirflags,
+                path,
+                path_len,
+                oflags,
+                fs_rights_base,
+                _fs_rights_inheriting,
+                fdflags,
+                fdflagsext,
+                opened_fd,
+            ): (i32, i32, i32, i32, i32, i64, i64, i32, i32, i32)| {
+                Box::new(async move {
+                    wasix_path_open2(
+                        &mut caller,
+                        fd,
+                        dirflags as u32,
+                        path as u32,
+                        path_len as u32,
+                        oflags as u16,
+                        fs_rights_base as u64,
+                        fdflags as u16,
+                        fdflagsext as u16,
+                        opened_fd as u32,
+                    )
+                    .await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -5509,31 +5517,35 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "path_open",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             dirflags: i32,
-             path: i32,
-             path_len: i32,
-             oflags: i32,
-             fs_rights_base: i64,
-             _fs_rights_inheriting: i64,
-             fdflags: i32,
-             opened_fd: i32|
-             -> i32 {
-                wasix_path_open(
-                    &mut caller,
-                    fd,
-                    dirflags as u32,
-                    path as u32,
-                    path_len as u32,
-                    oflags as u16,
-                    fs_rights_base as u64,
-                    fdflags as u16,
-                    opened_fd as u32,
-                )
+             (
+                fd,
+                dirflags,
+                path,
+                path_len,
+                oflags,
+                fs_rights_base,
+                _fs_rights_inheriting,
+                fdflags,
+                opened_fd,
+            ): (i32, i32, i32, i32, i32, i64, i64, i32, i32)| {
+                Box::new(async move {
+                    wasix_path_open(
+                        &mut caller,
+                        fd,
+                        dirflags as u32,
+                        path as u32,
+                        path_len as u32,
+                        oflags as u16,
+                        fs_rights_base as u64,
+                        fdflags as u16,
+                        opened_fd as u32,
+                    )
+                    .await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -6611,7 +6623,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn p1_path_open<CpuImpl, HostFs>(
+async fn p1_path_open<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     dirflags: u32,
@@ -6646,6 +6658,173 @@ where
     let path_flags = p1_path_flags(dirflags);
     let open_flags = p1_open_flags(oflags);
     let descriptor_flags = p1_descriptor_flags(rights, fdflags);
+    p1_path_open_resolved(
+        caller,
+        memory,
+        base,
+        path,
+        path_flags,
+        open_flags,
+        descriptor_flags,
+        fdflags,
+        opened_fd,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn p1_path_open_resolved<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    memory: Preview1Memory,
+    base: FsDescriptor,
+    path: String,
+    path_flags: fs_types::PathFlags,
+    open_flags: fs_types::OpenFlags,
+    descriptor_flags: fs_types::DescriptorFlags,
+    fdflags: u16,
+    opened_fd: u32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    if base.kind != FsNodeKind::Directory {
+        return p1::errno::NOTDIR;
+    }
+    if let Err(error) = crate::wasmtime_adapter::wasi::validate_descriptor_flags_within_base(
+        base.flags,
+        descriptor_flags,
+    ) {
+        return p1_errno_from_fs(error);
+    }
+    let absolute = match crate::resolve_child_path(&base.path, &path) {
+        Ok(absolute) => absolute,
+        Err(error) => return p1_errno_from_component_path(error),
+    };
+    if let Some(host_path) = crate::guest_host_share_path(&absolute).map(ToOwned::to_owned) {
+        let service = match caller.data().filesystem.host_service() {
+            Ok(service) => service,
+            Err(error) => return p1_errno_from_fs(error),
+        };
+        let metadata = service.stat_path(&host_path).await;
+        let (kind, identity, contents) = match metadata {
+            Ok(metadata) => {
+                let kind = if metadata.qid_type & 0x80 != 0 {
+                    FsNodeKind::Directory
+                } else {
+                    FsNodeKind::File
+                };
+                if open_flags.contains(fs_types::OpenFlags::EXCLUSIVE)
+                    && open_flags.contains(fs_types::OpenFlags::CREATE)
+                {
+                    return p1::errno::EXIST;
+                }
+                if open_flags.contains(fs_types::OpenFlags::DIRECTORY)
+                    && kind != FsNodeKind::Directory
+                {
+                    return p1::errno::NOTDIR;
+                }
+                if !open_flags.contains(fs_types::OpenFlags::DIRECTORY)
+                    && kind == FsNodeKind::Directory
+                {
+                    return p1::errno::ISDIR;
+                }
+                if open_flags.contains(fs_types::OpenFlags::TRUNCATE) {
+                    if kind != FsNodeKind::File {
+                        return p1::errno::ISDIR;
+                    }
+                    if !base
+                        .flags
+                        .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
+                    {
+                        return p1::errno::ROFS;
+                    }
+                    if let Err(error) = service.truncate_file(&host_path).await {
+                        return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(
+                            error,
+                        ));
+                    }
+                }
+                if kind == FsNodeKind::File {
+                    let contents = match service.read_file(&host_path).await {
+                        Ok(contents) => contents,
+                        Err(error) => {
+                            return p1_errno_from_fs(
+                                crate::wasmtime_adapter::wasi::map_host_fs_error(error),
+                            );
+                        }
+                    };
+                    (kind, metadata.identity, Some(contents))
+                } else {
+                    let entries = match service.read_dir(&host_path).await {
+                        Ok(entries) => entries,
+                        Err(error) => {
+                            return p1_errno_from_fs(
+                                crate::wasmtime_adapter::wasi::map_host_fs_error(error),
+                            );
+                        }
+                    };
+                    caller
+                        .data_mut()
+                        .filesystem
+                        .seed_host_directory_entries(&absolute, entries);
+                    (kind, metadata.identity, None)
+                }
+            }
+            Err(error) => {
+                let error = crate::wasmtime_adapter::wasi::map_host_fs_error(error);
+                if !matches!(error, fs_types::ErrorCode::NoEntry)
+                    || !open_flags.contains(fs_types::OpenFlags::CREATE)
+                {
+                    return p1_errno_from_fs(error);
+                }
+                if !base
+                    .flags
+                    .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
+                {
+                    return p1::errno::ROFS;
+                }
+                if let Err(error) = service.create_file(&host_path).await {
+                    return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(
+                        error,
+                    ));
+                }
+                let metadata = match service.stat_path(&host_path).await {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(
+                            error,
+                        ));
+                    }
+                };
+                (FsNodeKind::File, metadata.identity, Some(Vec::new()))
+            }
+        };
+        if let Some(contents) = contents {
+            caller
+                .data_mut()
+                .filesystem
+                .seed_host_file_content(&absolute, identity, contents);
+        }
+        let descriptor = FsDescriptor {
+            path: absolute,
+            kind,
+            flags: descriptor_flags,
+            identity: Some(identity),
+        };
+        let fd = match caller
+            .data_mut()
+            .descriptors
+            .insert(Preview1Descriptor::File {
+                descriptor,
+                offset: 0,
+                fdflags,
+            }) {
+            Ok(fd) => fd,
+            Err(errno) => return errno,
+        };
+        return p1_write_u32(caller, memory, opened_fd, fd);
+    }
     let now_nanos = caller.data().now_nanos();
     let opened = match caller.data_mut().filesystem.open_at(
         &base,
@@ -6673,7 +6852,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn wasix_path_open<CpuImpl, HostFs>(
+async fn wasix_path_open<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     dirflags: u32,
@@ -6702,30 +6881,18 @@ where
     let path_flags = p1_path_flags(dirflags);
     let open_flags = p1_open_flags(oflags);
     let descriptor_flags = p1_descriptor_flags(rights, fdflags);
-    let now_nanos = caller.data().now_nanos();
-    let opened = match caller.data_mut().filesystem.open_at(
-        &base,
+    p1_path_open_resolved(
+        caller,
+        memory,
+        base,
+        path,
         path_flags,
-        &path,
         open_flags,
         descriptor_flags,
-        now_nanos,
-    ) {
-        Ok(descriptor) => descriptor,
-        Err(error) => return p1_errno_from_fs(error),
-    };
-    let fd = match caller
-        .data_mut()
-        .descriptors
-        .insert(Preview1Descriptor::File {
-            descriptor: opened,
-            offset: 0,
-            fdflags,
-        }) {
-        Ok(fd) => fd,
-        Err(errno) => return errno,
-    };
-    p1_write_u32(caller, memory, opened_fd, fd)
+        fdflags,
+        opened_fd,
+    )
+    .await
 }
 
 fn p1_read_path<T>(
@@ -7410,7 +7577,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn wasix_path_open2<CpuImpl, HostFs>(
+async fn wasix_path_open2<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     dirflags: u32,
@@ -7432,7 +7599,8 @@ where
     };
     let status = wasix_path_open(
         caller, fd, dirflags, path, path_len, oflags, rights, fdflags, opened_fd,
-    );
+    )
+    .await;
     if status != p1::errno::SUCCESS {
         return status;
     }
