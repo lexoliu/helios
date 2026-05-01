@@ -98,6 +98,12 @@ mod guest {
                     path: request.path,
                     stdin: Vec::new(),
                     hint: None,
+                    capability_grants: vec![
+                        host_programs::root_directory_grant(),
+                        host_programs::root_link_grant(),
+                        host_programs::root_terminal_grant(),
+                        host_programs::root_process_grant(),
+                    ],
                 })
                 .await
                 .map(|result| ExecResult {
@@ -110,7 +116,7 @@ mod guest {
                 })
                 .map_err(|error| ExecError {
                     kind: convert_exec_error_kind(error.kind),
-                    detail: error.detail,
+                    detail: error.detail.to_string(),
                 });
                 postcard::to_allocvec(&response).map_err(|source| DispatchError::Encode {
                     operation: "debugger programs.exec-path",
@@ -128,6 +134,7 @@ mod guest {
             host_programs::ExecErrorKind::UnsupportedImport => ExecErrorKind::UnsupportedImport,
             host_programs::ExecErrorKind::InvalidSignature => ExecErrorKind::InvalidSignature,
             host_programs::ExecErrorKind::InvalidPath => ExecErrorKind::InvalidPath,
+            host_programs::ExecErrorKind::PermissionDenied => ExecErrorKind::PermissionDenied,
             host_programs::ExecErrorKind::InvalidHint => ExecErrorKind::InvalidHint,
             host_programs::ExecErrorKind::OutOfMemory => ExecErrorKind::OutOfMemory,
             host_programs::ExecErrorKind::Unavailable => ExecErrorKind::Unavailable,

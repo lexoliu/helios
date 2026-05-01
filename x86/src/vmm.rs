@@ -24,8 +24,8 @@ use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{
     AddressSpace, AddressSpaceError, PageFlags, Translation, VirtAddr, VirtRange,
 };
-use helios_kernel::custom_vm::{
-    self, CustomVmHooks, default_memory_image_free, default_memory_image_map_at,
+use helios_kernel::runtime_memory::{
+    self, RuntimeMemoryHooks, default_memory_image_free, default_memory_image_map_at,
     default_memory_image_new, default_page_size,
 };
 use helios_kernel::{allocate_user_frame_zeroed, deallocate_user_frame};
@@ -60,7 +60,7 @@ pub struct X86UserAddressSpace {
     /// Reservations released via `release` are returned to a free
     /// list rather than to the bump pointer; the simple bump path
     /// covers the steady-state allocate-and-release-much-later
-    /// pattern that wasmtime drives, while the free list catches
+    /// pattern that the runtime drives, while the free list catches
     /// tight reservation churn.
     next_va: AtomicUsize,
     state: Mutex<State>,
@@ -143,12 +143,10 @@ impl X86UserAddressSpace {
             if next > USER_VA_END {
                 return None;
             }
-            match self.next_va.compare_exchange(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
+            match self
+                .next_va
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => {
                     return Some(VirtRange::new(VirtAddr::new(current), byte_len));
                 }
@@ -171,9 +169,8 @@ impl X86UserAddressSpace {
                 phys as u64,
             ))
             .map_err(|_| AddressSpaceError::Misaligned)?;
-            let page =
-                Page::<Size4KiB>::from_start_address(X86VirtAddr::new(virt_addr as u64))
-                    .map_err(|_| AddressSpaceError::Misaligned)?;
+            let page = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(virt_addr as u64))
+                .map_err(|_| AddressSpaceError::Misaligned)?;
             unsafe {
                 mapper
                     .map_to(page, frame, flags, frame_allocator)
@@ -194,9 +191,8 @@ impl X86UserAddressSpace {
     ) -> Result<(), AddressSpaceError> {
         for offset in (0..virt.byte_len).step_by(PAGE) {
             let virt_addr = virt.start.raw() + offset;
-            let page =
-                Page::<Size4KiB>::from_start_address(X86VirtAddr::new(virt_addr as u64))
-                    .map_err(|_| AddressSpaceError::Misaligned)?;
+            let page = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(virt_addr as u64))
+                .map_err(|_| AddressSpaceError::Misaligned)?;
             match mapper.unmap(page) {
                 Ok((frame, flush)) => {
                     flush.flush();
@@ -218,9 +214,8 @@ impl X86UserAddressSpace {
     ) -> Result<(), AddressSpaceError> {
         for offset in (0..virt.byte_len).step_by(PAGE) {
             let virt_addr = virt.start.raw() + offset;
-            let page =
-                Page::<Size4KiB>::from_start_address(X86VirtAddr::new(virt_addr as u64))
-                    .map_err(|_| AddressSpaceError::Misaligned)?;
+            let page = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(virt_addr as u64))
+                .map_err(|_| AddressSpaceError::Misaligned)?;
             match unsafe { mapper.update_flags(page, flags) } {
                 Ok(flush) => flush.flush(),
                 Err(_) => return Err(AddressSpaceError::NotCommitted),
@@ -257,8 +252,7 @@ impl X86UserAddressSpace {
             let virt_addr = virt.start.raw() + offset;
             let page = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(virt_addr as u64))
                 .map_err(|_| AddressSpaceError::Misaligned)?;
-            let (old_phys, old_flags) = match mapper.translate(X86VirtAddr::new(virt_addr as u64))
-            {
+            let (old_phys, old_flags) = match mapper.translate(X86VirtAddr::new(virt_addr as u64)) {
                 TranslateResult::Mapped { frame, flags, .. } => {
                     (frame.start_address().as_u64() as usize, flags)
                 }
@@ -308,10 +302,9 @@ impl X86UserAddressSpace {
             .unmap(page.page)
             .map_err(|_| AddressSpaceError::NotCommitted)?;
         flush.flush();
-        let new_frame = x86_64::structures::paging::PhysFrame::from_start_address(PhysAddr::new(
-            phys as u64,
-        ))
-        .map_err(|_| AddressSpaceError::Misaligned)?;
+        let new_frame =
+            x86_64::structures::paging::PhysFrame::from_start_address(PhysAddr::new(phys as u64))
+                .map_err(|_| AddressSpaceError::Misaligned)?;
         match unsafe { mapper.map_to(page.page, new_frame, flags, frame_allocator) } {
             Ok(flush) => {
                 flush.flush();
@@ -448,7 +441,7 @@ impl AddressSpace for X86UserAddressSpace {
         validate_range(virt)?;
         let pt_flags = page_flags_to_pt(flags)?;
         // PT is the source of truth — update entries first, treat
-        // bookkeeping as cache. Wasmtime's mprotect call patterns
+        // bookkeeping as cache. The runtime's mprotect call patterns
         // routinely span what we recorded as separate commits, so a
         // single-`CommittedRegion`-must-contain-virt gate refuses
         // valid requests.
@@ -609,10 +602,7 @@ fn remove_committed_range(regions: &mut Vec<CommittedRegion>, range: VirtRange) 
         }
         if range.end().raw() < region.range.end().raw() {
             regions.push(CommittedRegion {
-                range: VirtRange::new(
-                    range.end(),
-                    region.range.end().raw() - range.end().raw(),
-                ),
+                range: VirtRange::new(range.end(), region.range.end().raw() - range.end().raw()),
                 flags: region.flags,
             });
         }
@@ -643,12 +633,12 @@ fn invlpg_range(virt: VirtRange) {
 static USER_AS: Once<X86UserAddressSpace> = Once::new();
 
 /// Initialise the boot-time user address space and install the
-/// wasmtime custom-virtual-memory hooks. Must be called once on the
+/// runtime custom-virtual-memory hooks. Must be called once on the
 /// bootstrap CPU after Limine handoff is processed and before any
-/// wasmtime engine is constructed.
+/// runtime engine is constructed.
 pub fn install_user_address_space(physical_memory_offset: usize, processor_count: usize) {
     USER_AS.call_once(|| X86UserAddressSpace::new(physical_memory_offset, processor_count));
-    custom_vm::install_hooks(&X86_VMM_HOOKS);
+    runtime_memory::install_hooks(&X86_VMM_HOOKS);
 }
 
 fn user_as() -> &'static X86UserAddressSpace {
@@ -745,8 +735,8 @@ extern "C" fn x86_mprotect(ptr: *mut u8, size: usize, prot_flags: u32) -> c_int 
     }
 }
 
-/// Wasmtime custom-virtual-memory hook table for the x86 backend.
-pub static X86_VMM_HOOKS: CustomVmHooks = CustomVmHooks {
+/// Runtime custom-virtual-memory hook table for the x86 backend.
+pub static X86_VMM_HOOKS: RuntimeMemoryHooks = RuntimeMemoryHooks {
     mmap_new: x86_mmap_new,
     mmap_remap: x86_mmap_remap,
     munmap: x86_munmap,

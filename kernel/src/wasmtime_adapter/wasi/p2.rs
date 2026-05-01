@@ -5,12 +5,13 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use helios_hal::cpu::Cpu;
+use thiserror::Error;
 use wasmtime::component::{HasSelf, Linker, Resource};
 use wasmtime::{self, Result};
 use wasmtime_wasi_io::bytes::Bytes;
 use wasmtime_wasi_io::poll::{DynPollable, Pollable, subscribe};
 use wasmtime_wasi_io::streams::{
-    DynInputStream, DynOutputStream, Error as IoError, InputStream, StreamError,
+    DynInputStream, DynOutputStream, Error as IoError, InputStream, OutputStream, StreamError,
 };
 use wasmtime_wasi_io::{self};
 
@@ -18,14 +19,70 @@ use super::bindings::clocks::system_clock::Instant as P3SystemInstant;
 use super::bindings::filesystem::types as p3fs;
 use super::bindings::filesystem::types::{ErrorCode as P3ErrorCode, OpenFlags as P3OpenFlags};
 use super::{
-    FsDescriptor, FsNodeKind, P2IncomingDatagramStream, P2Network, P2OutgoingDatagramStream,
-    TcpSocket, UdpSocket, WasiImportSet, WasiUdpSocketAddress, WasiUdpSocketError,
-    WasiUdpSocketFamily,
+    DebugFileSystem, FsDescriptor, FsNodeKind, P2IncomingDatagramStream, P2Network,
+    P2OutgoingDatagramStream, P2ResolveAddressStream, Preview2GuestExit, TcpSocket, UdpSocket,
+    WasiAdapterTrap, WasiImportSet, WasiTcpSocketAddress, WasiTcpSocketFamily,
+    WasiUdpSocketAddress, WasiUdpSocketError, WasiUdpSocketFamily, has_wasi_network_rights,
+    metadata_hash_value, wasi_udp_bind_rights,
 };
-use crate::component_host::{RuntimeDeadlinePollable, StoreData};
+use crate::wasmtime_adapter::component_host::{
+    HostRuntimeState, RuntimeDeadlinePollable, StoreData,
+};
 use crate::wasmtime_adapter::store::{ChannelInputStream, ChannelOutputStream, StdioOutputStream};
 use crate::wasmtime_adapter::wasi::map_host_fs_error;
-use crate::{ComponentOutputMode, ComponentOutputStreamKind};
+use crate::{ComponentNetworkService, ComponentOutputMode, ComponentOutputStreamKind};
+
+#[cfg(test)]
+pub(crate) const PREVIEW2_LINKED_INTERFACES: &[&str] = &[
+    "wasi:cli/environment",
+    "wasi:cli/exit",
+    "wasi:cli/stdin",
+    "wasi:cli/stdout",
+    "wasi:cli/stderr",
+    "wasi:cli/terminal-input",
+    "wasi:cli/terminal-output",
+    "wasi:cli/terminal-stdin",
+    "wasi:cli/terminal-stdout",
+    "wasi:cli/terminal-stderr",
+    "wasi:clocks/monotonic-clock",
+    "wasi:clocks/system-clock",
+    "wasi:filesystem/preopens",
+    "wasi:filesystem/types",
+    "wasi:random/random",
+    "wasi:random/insecure",
+    "wasi:random/insecure-seed",
+    "wasi:sockets/network",
+    "wasi:sockets/instance-network",
+    "wasi:sockets/udp",
+    "wasi:sockets/udp-create-socket",
+    "wasi:sockets/tcp",
+    "wasi:sockets/tcp-create-socket",
+    "wasi:sockets/ip-name-lookup",
+];
+
+#[cfg(test)]
+pub(crate) const PREVIEW2_WIT_PACKAGES: &[(&str, &str)] = &[
+    (
+        "wasi:cli",
+        include_str!("../../../../../wasmtime/crates/wasi/src/p2/wit/deps/cli.wit"),
+    ),
+    (
+        "wasi:clocks",
+        include_str!("../../../../../wasmtime/crates/wasi/src/p2/wit/deps/clocks.wit"),
+    ),
+    (
+        "wasi:filesystem",
+        include_str!("../../../../../wasmtime/crates/wasi/src/p2/wit/deps/filesystem.wit"),
+    ),
+    (
+        "wasi:random",
+        include_str!("../../../../../wasmtime/crates/wasi/src/p2/wit/deps/random.wit"),
+    ),
+    (
+        "wasi:sockets",
+        include_str!("../../../../../wasmtime/crates/wasi/src/p2/wit/deps/sockets.wit"),
+    ),
+];
 
 pub(crate) mod cli_bindings {
     mod generated {
@@ -193,6 +250,7 @@ pub(crate) mod sockets_bindings {
                 "wasi:sockets/udp.udp-socket": crate::wasmtime_adapter::wasi::UdpSocket,
                 "wasi:sockets/udp.incoming-datagram-stream": crate::wasmtime_adapter::wasi::P2IncomingDatagramStream,
                 "wasi:sockets/udp.outgoing-datagram-stream": crate::wasmtime_adapter::wasi::P2OutgoingDatagramStream,
+                "wasi:sockets/ip-name-lookup.resolve-address-stream": crate::wasmtime_adapter::wasi::P2ResolveAddressStream,
             },
             require_store_data_send: true,
         });
@@ -224,9 +282,55 @@ struct FileInputStream {
     cursor: usize,
 }
 
+struct FileOutputStream<CpuImpl, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    cpu: CpuImpl,
+    runtime_state: HostRuntimeState<CpuImpl, HostFs>,
+    filesystem: DebugFileSystem<HostRuntimeState<CpuImpl, HostFs>, HostFs>,
+    descriptor: FsDescriptor,
+    offset: u64,
+    append: bool,
+}
+
+#[derive(Debug, Error)]
+enum P2FileStreamError {
+    #[error("preview2 file stream write failed: {0:?}")]
+    WriteFailed(p2fs::ErrorCode),
+}
+
 impl FileInputStream {
     fn new(bytes: Vec<u8>) -> Self {
         Self { bytes, cursor: 0 }
+    }
+}
+
+impl<CpuImpl, HostFs> FileOutputStream<CpuImpl, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    fn new(
+        cpu: CpuImpl,
+        runtime_state: HostRuntimeState<CpuImpl, HostFs>,
+        descriptor: FsDescriptor,
+        offset: u64,
+        append: bool,
+    ) -> Self {
+        Self {
+            cpu,
+            runtime_state: runtime_state.clone(),
+            filesystem: DebugFileSystem::new(runtime_state),
+            descriptor,
+            offset,
+            append,
+        }
+    }
+
+    fn now_nanos(&self) -> u64 {
+        self.runtime_state.uptime_nanos(self.cpu.now().ticks())
     }
 }
 
@@ -422,6 +526,62 @@ impl InputStream for FileInputStream {
 }
 
 #[wasmtime_wasi_io::async_trait]
+impl<CpuImpl, HostFs> Pollable for FileOutputStream<CpuImpl, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    async fn ready(&mut self) {}
+}
+
+#[wasmtime_wasi_io::async_trait]
+impl<CpuImpl, HostFs> OutputStream for FileOutputStream<CpuImpl, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    fn write(&mut self, bytes: Bytes) -> core::result::Result<(), StreamError> {
+        let now_nanos = self.now_nanos();
+        if self.append {
+            self.filesystem
+                .append(&self.descriptor, bytes.as_ref(), now_nanos)
+                .map_err(|error| p2_stream_error(error_code_from_p3(error)))?;
+        } else {
+            let offset = usize::try_from(self.offset)
+                .map_err(|_| p2_stream_error(p2fs::ErrorCode::Overflow))?;
+            self.filesystem
+                .write_at(&self.descriptor, offset, bytes.as_ref(), now_nanos)
+                .map_err(|error| p2_stream_error(error_code_from_p3(error)))?;
+            self.offset = self.offset.saturating_add(bytes.len() as u64);
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> core::result::Result<(), StreamError> {
+        Ok(())
+    }
+
+    fn check_write(&mut self) -> core::result::Result<usize, StreamError> {
+        if !self.descriptor.flags.contains(p3fs::DescriptorFlags::WRITE) {
+            return Err(p2_stream_error(p2fs::ErrorCode::NotPermitted));
+        }
+        Ok(64 * 1024)
+    }
+}
+
+#[wasmtime_wasi_io::async_trait]
+impl Pollable for TcpSocket {
+    async fn ready(&mut self) {
+        loop {
+            if !self.inner.lock().connect_in_progress {
+                return;
+            }
+            self.ready.notified().await;
+        }
+    }
+}
+
+#[wasmtime_wasi_io::async_trait]
 impl Pollable for UdpSocket {
     async fn ready(&mut self) {}
 }
@@ -434,6 +594,13 @@ impl Pollable for P2IncomingDatagramStream {
 #[wasmtime_wasi_io::async_trait]
 impl Pollable for P2OutgoingDatagramStream {
     async fn ready(&mut self) {}
+}
+
+#[wasmtime_wasi_io::async_trait]
+impl Pollable for P2ResolveAddressStream {
+    async fn ready(&mut self) {
+        self.wait_ready().await;
+    }
 }
 
 impl<CpuImpl, HostFs> cli_bindings::cli::environment::Host for StoreData<CpuImpl, HostFs>
@@ -450,7 +617,10 @@ where
     }
 
     fn initial_cwd(&mut self) -> Result<Option<String>> {
-        Ok(Some(String::from("/")))
+        Ok(self
+            .process_authority()
+            .cwd()
+            .map(|cwd| cwd.guest_name().to_owned()))
     }
 }
 
@@ -465,16 +635,16 @@ where
             Err(()) => 1,
         };
         self.request_exit(code);
-        Err(wasmtime::Error::msg(alloc::format!(
-            "guest requested wasi p2 exit code {code}"
-        )))
+        Err(wasmtime::Error::new(Preview2GuestExit::new(u32::from(
+            code,
+        ))))
     }
 
     fn exit_with_code(&mut self, status_code: u8) -> Result<()> {
         self.request_exit(status_code);
-        Err(wasmtime::Error::msg(alloc::format!(
-            "guest requested wasi p2 exit code {status_code}"
-        )))
+        Err(wasmtime::Error::new(Preview2GuestExit::new(u32::from(
+            status_code,
+        ))))
     }
 }
 
@@ -640,7 +810,7 @@ where
     HostFs: crate::HostFileSystem,
 {
     fn now(&mut self) -> Result<clocks_bindings::clocks::wall_clock::Datetime> {
-        Ok(system_time_from_nanos(self.now_nanos()))
+        Ok(system_time_from_nanos(self.system_time_nanos()))
     }
 
     fn resolution(&mut self) -> Result<clocks_bindings::clocks::wall_clock::Datetime> {
@@ -657,9 +827,15 @@ where
     HostFs: crate::HostFileSystem,
 {
     fn get_directories(&mut self) -> Result<Vec<(Resource<FsDescriptor>, String)>> {
-        let descriptor = self.filesystem().root_descriptor();
-        let resource = self.table.push(descriptor)?;
-        Ok(vec![(resource, String::from("/"))])
+        let preopens = self.process_authority().directory_preopens().to_vec();
+        preopens
+            .iter()
+            .map(|preopen| {
+                let descriptor = super::preopen_descriptor(preopen);
+                let resource = self.table.push(descriptor)?;
+                Ok((resource, preopen.guest_name().to_owned()))
+            })
+            .collect()
     }
 }
 
@@ -718,27 +894,58 @@ where
 
     fn write_via_stream(
         &mut self,
-        _: Resource<FsDescriptor>,
-        _: u64,
+        descriptor: Resource<FsDescriptor>,
+        offset: u64,
     ) -> Result<core::result::Result<Resource<DynOutputStream>, p2fs::ErrorCode>> {
-        Ok(Err(p2fs::ErrorCode::Unsupported))
+        let descriptor = match get_fs_descriptor(self, &descriptor) {
+            Ok(descriptor) => descriptor,
+            Err(error) => return Ok(Err(error)),
+        };
+        if !descriptor.flags.contains(p3fs::DescriptorFlags::WRITE) {
+            return Ok(Err(p2fs::ErrorCode::NotPermitted));
+        }
+        let stream = FileOutputStream::new(
+            self.cpu.clone(),
+            self.runtime_state.clone(),
+            descriptor,
+            offset,
+            false,
+        );
+        Ok(Ok(self.table.push(Box::new(stream) as DynOutputStream)?))
     }
 
     fn append_via_stream(
         &mut self,
-        _: Resource<FsDescriptor>,
+        descriptor: Resource<FsDescriptor>,
     ) -> Result<core::result::Result<Resource<DynOutputStream>, p2fs::ErrorCode>> {
-        Ok(Err(p2fs::ErrorCode::Unsupported))
+        let descriptor = match get_fs_descriptor(self, &descriptor) {
+            Ok(descriptor) => descriptor,
+            Err(error) => return Ok(Err(error)),
+        };
+        if !descriptor.flags.contains(p3fs::DescriptorFlags::WRITE) {
+            return Ok(Err(p2fs::ErrorCode::NotPermitted));
+        }
+        let stream = FileOutputStream::new(
+            self.cpu.clone(),
+            self.runtime_state.clone(),
+            descriptor,
+            0,
+            true,
+        );
+        Ok(Ok(self.table.push(Box::new(stream) as DynOutputStream)?))
     }
 
     fn advise(
         &mut self,
-        _: Resource<FsDescriptor>,
+        descriptor: Resource<FsDescriptor>,
         _: u64,
         _: u64,
         _: p2fs::Advice,
     ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
-        Ok(Err(p2fs::ErrorCode::Unsupported))
+        match get_fs_descriptor(self, &descriptor) {
+            Ok(_) => Ok(Ok(())),
+            Err(error) => Ok(Err(error)),
+        }
     }
 
     fn sync_data(
@@ -772,19 +979,46 @@ where
 
     fn set_size(
         &mut self,
-        _: Resource<FsDescriptor>,
-        _: u64,
+        descriptor: Resource<FsDescriptor>,
+        size: u64,
     ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
-        Ok(Err(p2fs::ErrorCode::Unsupported))
+        let descriptor = match get_fs_descriptor(self, &descriptor) {
+            Ok(descriptor) => descriptor,
+            Err(error) => return Ok(Err(error)),
+        };
+        let now_nanos = self.now_nanos();
+        match self.filesystem_mut().set_size(&descriptor, size, now_nanos) {
+            Ok(()) => Ok(Ok(())),
+            Err(error) => Ok(Err(error_code_from_p3(error))),
+        }
     }
 
     fn set_times(
         &mut self,
-        _: Resource<FsDescriptor>,
-        _: p2fs::NewTimestamp,
-        _: p2fs::NewTimestamp,
+        descriptor: Resource<FsDescriptor>,
+        data_access_timestamp: p2fs::NewTimestamp,
+        data_modification_timestamp: p2fs::NewTimestamp,
     ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
-        Ok(Err(p2fs::ErrorCode::Unsupported))
+        let now_nanos = self.system_time_nanos();
+        let access_nanos = match p2_new_timestamp_nanos(data_access_timestamp, now_nanos) {
+            Ok(value) => value,
+            Err(error) => return Ok(Err(error)),
+        };
+        let modified_nanos = match p2_new_timestamp_nanos(data_modification_timestamp, now_nanos) {
+            Ok(value) => value,
+            Err(error) => return Ok(Err(error)),
+        };
+        let descriptor = match get_fs_descriptor(self, &descriptor) {
+            Ok(descriptor) => descriptor,
+            Err(error) => return Ok(Err(error)),
+        };
+        match self
+            .filesystem_mut()
+            .set_times(&descriptor, access_nanos, modified_nanos, now_nanos)
+        {
+            Ok(()) => Ok(Ok(())),
+            Err(error) => Ok(Err(error_code_from_p3(error))),
+        }
     }
 
     fn read(
@@ -997,24 +1231,90 @@ where
 
     fn set_times_at(
         &mut self,
-        _: Resource<FsDescriptor>,
+        descriptor: Resource<FsDescriptor>,
         _: p2fs::PathFlags,
-        _: String,
-        _: p2fs::NewTimestamp,
-        _: p2fs::NewTimestamp,
+        path: String,
+        data_access_timestamp: p2fs::NewTimestamp,
+        data_modification_timestamp: p2fs::NewTimestamp,
     ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
-        Ok(Err(p2fs::ErrorCode::Unsupported))
+        let now_nanos = self.system_time_nanos();
+        let access_nanos = match p2_new_timestamp_nanos(data_access_timestamp, now_nanos) {
+            Ok(value) => value,
+            Err(error) => return Ok(Err(error)),
+        };
+        let modified_nanos = match p2_new_timestamp_nanos(data_modification_timestamp, now_nanos) {
+            Ok(value) => value,
+            Err(error) => return Ok(Err(error)),
+        };
+        let descriptor = match get_fs_descriptor(self, &descriptor) {
+            Ok(descriptor) => descriptor,
+            Err(error) => return Ok(Err(error)),
+        };
+        let absolute = match crate::resolve_child_path(&descriptor.path, &path) {
+            Ok(path) => path,
+            Err(error) => return Ok(Err(error_code_from_path(error))),
+        };
+        match self.filesystem_mut().set_times_at_path(
+            &absolute,
+            access_nanos,
+            modified_nanos,
+            now_nanos,
+        ) {
+            Ok(()) => Ok(Ok(())),
+            Err(error) => Ok(Err(error_code_from_p3(error))),
+        }
     }
 
     fn link_at(
         &mut self,
-        _: Resource<FsDescriptor>,
+        source_descriptor: Resource<FsDescriptor>,
         _: p2fs::PathFlags,
-        _: String,
-        _: Resource<FsDescriptor>,
-        _: String,
+        source_path: String,
+        destination_descriptor: Resource<FsDescriptor>,
+        destination_path: String,
     ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
-        Ok(Err(p2fs::ErrorCode::Unsupported))
+        if self.process_authority().derive_link_source_cap().is_err()
+            || self
+                .process_authority()
+                .derive_link_target_directory_cap()
+                .is_err()
+        {
+            return Ok(Err(p2fs::ErrorCode::NotPermitted));
+        }
+        let source_descriptor = match get_fs_descriptor(self, &source_descriptor) {
+            Ok(descriptor) => descriptor,
+            Err(error) => return Ok(Err(error)),
+        };
+        let destination_descriptor = match get_fs_descriptor(self, &destination_descriptor) {
+            Ok(descriptor) => descriptor,
+            Err(error) => return Ok(Err(error)),
+        };
+        let source_absolute = match crate::resolve_child_path(&source_descriptor.path, &source_path)
+        {
+            Ok(path) => path,
+            Err(error) => return Ok(Err(error_code_from_path(error))),
+        };
+        let destination_absolute =
+            match crate::resolve_child_path(&destination_descriptor.path, &destination_path) {
+                Ok(path) => path,
+                Err(error) => return Ok(Err(error_code_from_path(error))),
+            };
+        if crate::guest_host_share_path(&source_absolute).is_some()
+            || crate::guest_host_share_path(&destination_absolute).is_some()
+        {
+            return Ok(Err(p2fs::ErrorCode::Unsupported));
+        }
+        let now_nanos = self.now_nanos();
+        match self.filesystem_mut().link_at(
+            &source_descriptor,
+            &source_path,
+            &destination_descriptor,
+            &destination_path,
+            now_nanos,
+        ) {
+            Ok(()) => Ok(Ok(())),
+            Err(error) => Ok(Err(error_code_from_p3(error))),
+        }
     }
 
     async fn open_at(
@@ -1033,12 +1333,17 @@ where
         if base.kind != crate::wasmtime_adapter::wasi::FsNodeKind::Directory {
             return Ok(Err(p2fs::ErrorCode::NotDirectory));
         }
+        let open_flags_p3 = open_flags_to_p3(open_flags);
+        let descriptor_flags_p3 = descriptor_flags_to_p3(flags);
+        if let Err(error) =
+            super::validate_descriptor_flags_within_base(base.flags, descriptor_flags_p3)
+        {
+            return Ok(Err(error_code_from_p3(error)));
+        }
         let absolute = match crate::resolve_child_path(&base.path, &path) {
             Ok(path) => path,
             Err(error) => return Ok(Err(error_code_from_path(error))),
         };
-        let open_flags_p3 = open_flags_to_p3(open_flags);
-        let descriptor_flags_p3 = descriptor_flags_to_p3(flags);
         if let Some(host_path) = crate::guest_host_share_path(&absolute) {
             let service = match self.filesystem().host_service() {
                 Ok(service) => service,
@@ -1058,7 +1363,7 @@ where
                     }
                 }
             };
-            let (kind, contents) = if let Some(meta) = metadata {
+            let (kind, identity, contents) = if let Some(meta) = metadata {
                 let is_dir = meta.qid_type & 0x80 != 0;
                 let kind = if is_dir {
                     crate::wasmtime_adapter::wasi::FsNodeKind::Directory
@@ -1067,7 +1372,7 @@ where
                 };
                 if !is_dir {
                     match service.read_file(&host_path).await {
-                        Ok(bytes) => (kind, Some(bytes)),
+                        Ok(bytes) => (kind, meta.identity, Some(bytes)),
                         Err(err) => {
                             return Ok(Err(error_code_from_p3(map_host_fs_error(err))));
                         }
@@ -1081,14 +1386,20 @@ where
                     };
                     self.filesystem_mut()
                         .seed_host_directory_entries(&absolute, entries);
-                    (kind, None)
+                    (kind, meta.identity, None)
                 }
             } else {
                 match service.create_file(&host_path).await {
-                    Ok(()) => (
-                        crate::wasmtime_adapter::wasi::FsNodeKind::File,
-                        Some(Vec::new()),
-                    ),
+                    Ok(()) => match service.stat_path(&host_path).await {
+                        Ok(metadata) => (
+                            crate::wasmtime_adapter::wasi::FsNodeKind::File,
+                            metadata.identity,
+                            Some(Vec::new()),
+                        ),
+                        Err(err) => {
+                            return Ok(Err(error_code_from_p3(map_host_fs_error(err))));
+                        }
+                    },
                     Err(err) => {
                         return Ok(Err(error_code_from_p3(map_host_fs_error(err))));
                     }
@@ -1096,12 +1407,13 @@ where
             };
             if let Some(bytes) = contents {
                 self.filesystem_mut()
-                    .seed_host_file_content(&absolute, bytes);
+                    .seed_host_file_content(&absolute, identity, bytes);
             }
             let opened = crate::wasmtime_adapter::wasi::FsDescriptor {
                 path: absolute,
                 kind,
                 flags: descriptor_flags_p3,
+                identity: Some(identity),
             };
             return Ok(Ok(self.table.push(opened)?));
         }
@@ -1121,10 +1433,27 @@ where
 
     fn readlink_at(
         &mut self,
-        _: Resource<FsDescriptor>,
-        _: String,
+        descriptor: Resource<FsDescriptor>,
+        path: String,
     ) -> Result<core::result::Result<String, p2fs::ErrorCode>> {
-        Ok(Err(p2fs::ErrorCode::Unsupported))
+        if self.process_authority().derive_symlink_read_cap().is_err() {
+            return Ok(Err(p2fs::ErrorCode::NotPermitted));
+        }
+        let descriptor = match get_fs_descriptor(self, &descriptor) {
+            Ok(descriptor) => descriptor,
+            Err(error) => return Ok(Err(error)),
+        };
+        let absolute = match crate::resolve_child_path(&descriptor.path, &path) {
+            Ok(path) => path,
+            Err(error) => return Ok(Err(error_code_from_path(error))),
+        };
+        if crate::guest_host_share_path(&absolute).is_some() {
+            return Ok(Err(p2fs::ErrorCode::Unsupported));
+        }
+        match self.filesystem().readlink_at(&descriptor, &path) {
+            Ok(payload) => Ok(Ok(payload)),
+            Err(error) => Ok(Err(error_code_from_p3(error))),
+        }
     }
 
     async fn remove_directory_at(
@@ -1224,11 +1553,36 @@ where
 
     fn symlink_at(
         &mut self,
-        _: Resource<FsDescriptor>,
-        _: String,
-        _: String,
+        descriptor: Resource<FsDescriptor>,
+        old_path: String,
+        new_path: String,
     ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
-        Ok(Err(p2fs::ErrorCode::Unsupported))
+        if self
+            .process_authority()
+            .derive_symlink_create_cap()
+            .is_err()
+        {
+            return Ok(Err(p2fs::ErrorCode::NotPermitted));
+        }
+        let descriptor = match get_fs_descriptor(self, &descriptor) {
+            Ok(descriptor) => descriptor,
+            Err(error) => return Ok(Err(error)),
+        };
+        let absolute = match crate::resolve_child_path(&descriptor.path, &new_path) {
+            Ok(path) => path,
+            Err(error) => return Ok(Err(error_code_from_path(error))),
+        };
+        if crate::guest_host_share_path(&absolute).is_some() {
+            return Ok(Err(p2fs::ErrorCode::Unsupported));
+        }
+        let now_nanos = self.now_nanos();
+        match self
+            .filesystem_mut()
+            .symlink_at(&descriptor, &new_path, &old_path, now_nanos)
+        {
+            Ok(()) => Ok(Ok(())),
+            Err(error) => Ok(Err(error_code_from_p3(error))),
+        }
     }
 
     async fn unlink_file_at(
@@ -1271,7 +1625,10 @@ where
     ) -> Result<bool> {
         let left = self.table.get(&a).map_err(wasmtime::Error::from)?.clone();
         let right = self.table.get(&b).map_err(wasmtime::Error::from)?.clone();
-        Ok(left.path == right.path && left.kind == right.kind)
+        Ok(left
+            .identity
+            .zip(right.identity)
+            .is_some_and(|(left, right)| left == right))
     }
 
     async fn metadata_hash(
@@ -1289,10 +1646,10 @@ where
             };
             let host_path = host_path.to_owned();
             return match service.stat_path(&host_path).await {
-                Ok(metadata) => Ok(Ok(p2fs::MetadataHashValue {
-                    lower: metadata.qid_path,
-                    upper: u64::from(metadata.mode) << 32 ^ metadata.size,
-                })),
+                Ok(metadata) => Ok(Ok(metadata_hash_from_p3(metadata_hash_value(
+                    metadata.identity,
+                    u64::from(metadata.mode) << 32 ^ metadata.size,
+                )))),
                 Err(err) => Ok(Err(error_code_from_p3(map_host_fs_error(err)))),
             };
         }
@@ -1324,10 +1681,10 @@ where
             };
             let host_path = host_path.to_owned();
             return match service.stat_path(&host_path).await {
-                Ok(metadata) => Ok(Ok(p2fs::MetadataHashValue {
-                    lower: metadata.qid_path,
-                    upper: u64::from(metadata.mode) << 32 ^ metadata.size,
-                })),
+                Ok(metadata) => Ok(Ok(metadata_hash_from_p3(metadata_hash_value(
+                    metadata.identity,
+                    u64::from(metadata.mode) << 32 ^ metadata.size,
+                )))),
                 Err(err) => Ok(Err(error_code_from_p3(map_host_fs_error(err)))),
             };
         }
@@ -1376,11 +1733,15 @@ where
     HostFs: crate::HostFileSystem,
 {
     fn get_random_bytes(&mut self, len: u64) -> Result<Vec<u8>> {
-        Ok(vec![0; len as usize])
+        let len = super::random_len(len)?;
+        let mut bytes = vec![0_u8; len];
+        self.fill_secure_random(&mut bytes)
+            .map_err(super::entropy_error)?;
+        Ok(bytes)
     }
 
     fn get_random_u64(&mut self) -> Result<u64> {
-        Ok(0)
+        self.secure_random_u64().map_err(super::entropy_error)
     }
 }
 
@@ -1390,11 +1751,11 @@ where
     HostFs: crate::HostFileSystem,
 {
     fn get_insecure_random_bytes(&mut self, len: u64) -> Result<Vec<u8>> {
-        Ok(vec![0; len as usize])
+        Ok(self.insecure_random_bytes(super::random_len(len)?))
     }
 
     fn get_insecure_random_u64(&mut self) -> Result<u64> {
-        Ok(0)
+        Ok(self.insecure_random_u64())
     }
 }
 
@@ -1404,7 +1765,7 @@ where
     HostFs: crate::HostFileSystem,
 {
     fn insecure_seed(&mut self) -> Result<(u64, u64)> {
-        Ok((0, 0))
+        Ok(self.insecure_seed())
     }
 }
 
@@ -1413,12 +1774,6 @@ type P2SocketResult<T> = core::result::Result<T, P2SocketErrorCode>;
 
 fn socket_not_supported<T>() -> Result<P2SocketResult<T>> {
     Ok(Err(P2SocketErrorCode::NotSupported))
-}
-
-fn socket_unavailable<T>() -> Result<T> {
-    Err(wasmtime::Error::msg(
-        "sockets are unsupported on the embedded debugger host",
-    ))
 }
 
 fn delete_resource<R: 'static, CpuImpl, HostFs>(
@@ -1485,12 +1840,21 @@ where
         network: Resource<p2udp::Network>,
         local_address: p2udp::IpSocketAddress,
     ) -> Result<core::result::Result<(), p2udp::ErrorCode>> {
+        if !has_wasi_network_rights(self.process_authority(), crate::NetworkAuthorityRights::UDP) {
+            return Ok(Err(p2udp::ErrorCode::AccessDenied));
+        }
         let _ = self.table.get(&network)?;
         let socket = self.table.get(&socket)?.clone();
         let local_address = match parse_p2_udp_socket_address(local_address, socket.family()) {
             Ok(address) => address,
             Err(error) => return Ok(Err(map_p2_udp_error(error))),
         };
+        if !has_wasi_network_rights(
+            self.process_authority(),
+            wasi_udp_bind_rights(local_address.port),
+        ) {
+            return Ok(Err(p2udp::ErrorCode::AccessDenied));
+        }
         Ok(socket
             .start_bind_p2(local_address)
             .await
@@ -1703,9 +2067,7 @@ where
         let (socket, connected_remote) = {
             let stream = self.table.get_mut(&resource)?;
             if datagrams.len() > stream.check_send_permit_count as usize {
-                return Err(wasmtime::Error::msg(
-                    "udp send exceeded the permit returned by check-send",
-                ));
+                return Err(wasmtime::Error::new(WasiAdapterTrap::UdpSendPermitExceeded));
             }
             stream.check_send_permit_count -= datagrams.len() as u64;
             (stream.socket.clone(), stream.remote_address)
@@ -1771,6 +2133,9 @@ where
         &mut self,
         address_family: p2udp_create::IpAddressFamily,
     ) -> Result<core::result::Result<Resource<UdpSocket>, p2udp_create::ErrorCode>> {
+        if !has_wasi_network_rights(self.process_authority(), crate::NetworkAuthorityRights::UDP) {
+            return Ok(Err(p2udp_create::ErrorCode::AccessDenied));
+        }
         let family = match address_family {
             p2udp_create::IpAddressFamily::Ipv4 => WasiUdpSocketFamily::Ipv4,
             p2udp_create::IpAddressFamily::Ipv6 => {
@@ -1842,6 +2207,80 @@ fn map_p2_udp_error(error: WasiUdpSocketError) -> p2udp::ErrorCode {
     }
 }
 
+fn parse_p2_tcp_socket_address(
+    address: p2tcp::IpSocketAddress,
+    family: WasiTcpSocketFamily,
+) -> core::result::Result<WasiTcpSocketAddress, p2tcp::ErrorCode> {
+    match (family, address) {
+        (WasiTcpSocketFamily::Ipv4, p2tcp::IpSocketAddress::Ipv4(address)) => {
+            Ok(WasiTcpSocketAddress {
+                address: crate::Ipv4Address::new([
+                    address.address.0,
+                    address.address.1,
+                    address.address.2,
+                    address.address.3,
+                ]),
+                port: address.port,
+            })
+        }
+        (WasiTcpSocketFamily::Ipv4, p2tcp::IpSocketAddress::Ipv6(_)) => {
+            Err(p2tcp::ErrorCode::NotSupported)
+        }
+    }
+}
+
+fn format_p2_tcp_socket_address(address: WasiTcpSocketAddress) -> p2tcp::IpSocketAddress {
+    let [a, b, c, d] = address.address.octets();
+    p2tcp::IpSocketAddress::Ipv4(p2net::Ipv4SocketAddress {
+        port: address.port,
+        address: (a, b, c, d),
+    })
+}
+
+fn map_p2_tcp_family(
+    family: p2tcp_create::IpAddressFamily,
+) -> core::result::Result<WasiTcpSocketFamily, p2tcp_create::ErrorCode> {
+    match family {
+        p2tcp_create::IpAddressFamily::Ipv4 => Ok(WasiTcpSocketFamily::Ipv4),
+        p2tcp_create::IpAddressFamily::Ipv6 => Err(p2tcp_create::ErrorCode::NotSupported),
+    }
+}
+
+fn format_p2_tcp_family(family: WasiTcpSocketFamily) -> p2tcp::IpAddressFamily {
+    match family {
+        WasiTcpSocketFamily::Ipv4 => p2tcp::IpAddressFamily::Ipv4,
+    }
+}
+
+fn map_p2_tcp_core_error(error: crate::TcpError) -> p2tcp::ErrorCode {
+    match error.kind {
+        crate::TcpErrorKind::UnresolvedHost => p2tcp::ErrorCode::NameUnresolvable,
+        crate::TcpErrorKind::Timeout => p2tcp::ErrorCode::Timeout,
+        crate::TcpErrorKind::Unavailable => p2tcp::ErrorCode::RemoteUnreachable,
+        crate::TcpErrorKind::Internal => p2tcp::ErrorCode::Unknown,
+    }
+}
+
+fn map_p2_tcp_socket_error(error: super::socket_types::ErrorCode) -> p2tcp::ErrorCode {
+    match error {
+        super::socket_types::ErrorCode::AccessDenied => p2tcp::ErrorCode::AccessDenied,
+        super::socket_types::ErrorCode::NotSupported => p2tcp::ErrorCode::NotSupported,
+        super::socket_types::ErrorCode::InvalidArgument => p2tcp::ErrorCode::InvalidArgument,
+        super::socket_types::ErrorCode::OutOfMemory => p2tcp::ErrorCode::OutOfMemory,
+        super::socket_types::ErrorCode::Timeout => p2tcp::ErrorCode::Timeout,
+        super::socket_types::ErrorCode::InvalidState => p2tcp::ErrorCode::InvalidState,
+        super::socket_types::ErrorCode::AddressNotBindable => p2tcp::ErrorCode::AddressNotBindable,
+        super::socket_types::ErrorCode::AddressInUse => p2tcp::ErrorCode::AddressInUse,
+        super::socket_types::ErrorCode::RemoteUnreachable => p2tcp::ErrorCode::RemoteUnreachable,
+        super::socket_types::ErrorCode::ConnectionRefused => p2tcp::ErrorCode::ConnectionRefused,
+        super::socket_types::ErrorCode::ConnectionBroken => p2tcp::ErrorCode::ConnectionReset,
+        super::socket_types::ErrorCode::ConnectionReset => p2tcp::ErrorCode::ConnectionReset,
+        super::socket_types::ErrorCode::ConnectionAborted => p2tcp::ErrorCode::ConnectionAborted,
+        super::socket_types::ErrorCode::DatagramTooLarge => p2tcp::ErrorCode::DatagramTooLarge,
+        super::socket_types::ErrorCode::Other(_) => p2tcp::ErrorCode::Unknown,
+    }
+}
+
 impl<CpuImpl, HostFs> p2tcp::Host for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
@@ -1872,23 +2311,121 @@ where
 
     fn start_connect(
         &mut self,
-        _: Resource<TcpSocket>,
-        _: Resource<p2tcp::Network>,
-        _: p2tcp::IpSocketAddress,
+        socket: Resource<TcpSocket>,
+        network: Resource<p2tcp::Network>,
+        remote_address: p2tcp::IpSocketAddress,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
-        socket_not_supported()
+        if !has_wasi_network_rights(self.process_authority(), crate::NetworkAuthorityRights::TCP) {
+            return Ok(Err(p2tcp::ErrorCode::AccessDenied));
+        }
+        let _ = self.table.get(&network)?;
+        let socket = self.table.get(&socket)?.clone();
+        let remote_address = match parse_p2_tcp_socket_address(remote_address, socket.family()) {
+            Ok(address) => address,
+            Err(error) => return Ok(Err(error)),
+        };
+        let (service, inner, ready) = {
+            let mut state = socket.inner.lock();
+            if state.stream.is_some() || state.connect_in_progress || state.connect_result.is_some()
+            {
+                return Ok(Err(p2tcp::ErrorCode::InvalidState));
+            }
+            state.connect_in_progress = true;
+            (
+                state.service.clone(),
+                socket.inner.clone(),
+                socket.ready.clone(),
+            )
+        };
+        self.spawner().spawn_detached(async move {
+            let result = service
+                .tcp_connect(
+                    &super::format_ipv4_host(remote_address.address),
+                    remote_address.port,
+                    u64::MAX,
+                )
+                .await;
+            let mut state = inner.lock();
+            state.connect_in_progress = false;
+            state.connect_result = Some(match result {
+                Ok(stream) => {
+                    state.stream = Some(stream);
+                    state.remote_address = Some(remote_address);
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            });
+            ready.notify_all();
+        });
+        Ok(Ok(()))
     }
 
     fn finish_connect(
         &mut self,
-        _: Resource<TcpSocket>,
+        socket_resource: Resource<TcpSocket>,
     ) -> Result<
         core::result::Result<
             (Resource<p2tcp::InputStream>, Resource<p2tcp::OutputStream>),
             p2tcp::ErrorCode,
         >,
     > {
-        socket_not_supported()
+        let socket = self.table.get(&socket_resource)?.clone();
+        {
+            let mut state = socket.inner.lock();
+            if state.connect_in_progress {
+                return Ok(Err(p2tcp::ErrorCode::WouldBlock));
+            }
+            let Some(result) = state.connect_result.take() else {
+                return Ok(Err(p2tcp::ErrorCode::NotInProgress));
+            };
+            if let Err(error) = result {
+                return Ok(Err(map_p2_tcp_core_error(error)));
+            }
+        }
+        let (network_writer, guest_reader) = crate::byte_channel();
+        let (guest_writer, network_reader) = crate::byte_channel();
+        let input = self.table.push_child(
+            Box::new(ChannelInputStream::new(guest_reader)) as DynInputStream,
+            &socket_resource,
+        )?;
+        let output = self.table.push_child(
+            Box::new(ChannelOutputStream::new(guest_writer)) as DynOutputStream,
+            &socket_resource,
+        )?;
+        let read_socket = socket.clone();
+        self.spawner().spawn_detached(async move {
+            loop {
+                match read_socket.read(super::FILE_READ_CHUNK_BYTES as u32).await {
+                    Ok(Some(bytes)) => {
+                        if network_writer.write(bytes).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "helios_kernel::wasi::p2::tcp",
+                            ?error,
+                            "tcp input stream bridge stopped after backend read error"
+                        );
+                        break;
+                    }
+                }
+            }
+        });
+        self.spawner().spawn_detached(async move {
+            while let Some(bytes) = network_reader.read().await {
+                if let Err(error) = socket.write_all(&bytes).await {
+                    tracing::warn!(
+                        target: "helios_kernel::wasi::p2::tcp",
+                        ?error,
+                        "tcp output stream bridge stopped after backend write error"
+                    );
+                    break;
+                }
+            }
+        });
+        Ok(Ok((input, output)))
     }
 
     fn start_listen(
@@ -1930,17 +2467,23 @@ where
 
     fn remote_address(
         &mut self,
-        _: Resource<TcpSocket>,
+        socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<p2tcp::IpSocketAddress, p2tcp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket
+            .remote_address()
+            .map(format_p2_tcp_socket_address)
+            .map_err(map_p2_tcp_socket_error))
     }
 
-    fn is_listening(&mut self, _: Resource<TcpSocket>) -> Result<bool> {
-        socket_unavailable()
+    fn is_listening(&mut self, socket: Resource<TcpSocket>) -> Result<bool> {
+        let _ = self.table.get(&socket)?;
+        Ok(false)
     }
 
-    fn address_family(&mut self, _: Resource<TcpSocket>) -> Result<p2tcp::IpAddressFamily> {
-        socket_unavailable()
+    fn address_family(&mut self, socket: Resource<TcpSocket>) -> Result<p2tcp::IpAddressFamily> {
+        let socket = self.table.get(&socket)?.clone();
+        Ok(format_p2_tcp_family(socket.family()))
     }
 
     fn set_listen_backlog_size(
@@ -2028,36 +2571,46 @@ where
 
     fn receive_buffer_size(
         &mut self,
-        _: Resource<TcpSocket>,
+        socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<u64, p2tcp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket
+            .receive_buffer_size()
+            .map_err(map_p2_tcp_socket_error))
     }
 
     fn set_receive_buffer_size(
         &mut self,
-        _: Resource<TcpSocket>,
-        _: u64,
+        socket: Resource<TcpSocket>,
+        value: u64,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket
+            .set_receive_buffer_size(value)
+            .map_err(map_p2_tcp_socket_error))
     }
 
     fn send_buffer_size(
         &mut self,
-        _: Resource<TcpSocket>,
+        socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<u64, p2tcp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.send_buffer_size().map_err(map_p2_tcp_socket_error))
     }
 
     fn set_send_buffer_size(
         &mut self,
-        _: Resource<TcpSocket>,
-        _: u64,
+        socket: Resource<TcpSocket>,
+        value: u64,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket
+            .set_send_buffer_size(value)
+            .map_err(map_p2_tcp_socket_error))
     }
 
-    fn subscribe(&mut self, _: Resource<TcpSocket>) -> Result<Resource<p2tcp::Pollable>> {
-        socket_unavailable()
+    fn subscribe(&mut self, socket: Resource<TcpSocket>) -> Result<Resource<p2tcp::Pollable>> {
+        subscribe(&mut self.table, socket)
     }
 
     fn shutdown(
@@ -2069,7 +2622,13 @@ where
     }
 
     fn drop(&mut self, resource: Resource<TcpSocket>) -> Result<()> {
-        delete_resource(self, resource)
+        let socket = self.table.delete(resource)?;
+        if let Some((service, stream)) = socket.take_connected_stream() {
+            self.spawner().spawn_detached(async move {
+                service.tcp_close(stream).await;
+            });
+        }
+        Ok(())
     }
 }
 
@@ -2080,9 +2639,20 @@ where
 {
     fn create_tcp_socket(
         &mut self,
-        _: p2tcp_create::IpAddressFamily,
+        address_family: p2tcp_create::IpAddressFamily,
     ) -> Result<core::result::Result<Resource<TcpSocket>, p2tcp_create::ErrorCode>> {
-        socket_not_supported()
+        if !has_wasi_network_rights(self.process_authority(), crate::NetworkAuthorityRights::TCP) {
+            return Ok(Err(p2tcp_create::ErrorCode::AccessDenied));
+        }
+        let family = match map_p2_tcp_family(address_family) {
+            Ok(family) => family,
+            Err(error) => return Ok(Err(error)),
+        };
+        let Some(service) = self.runtime_state.network_service() else {
+            return Ok(Err(p2tcp_create::ErrorCode::Unknown));
+        };
+        let resource = self.table.push(TcpSocket::new(service, family))?;
+        Ok(Ok(resource))
     }
 }
 
@@ -2094,10 +2664,22 @@ where
     fn resolve_addresses(
         &mut self,
         _: Resource<p2lookup::Network>,
-        _: String,
+        name: String,
     ) -> Result<core::result::Result<Resource<p2lookup::ResolveAddressStream>, p2lookup::ErrorCode>>
     {
-        socket_not_supported()
+        if !has_wasi_network_rights(self.process_authority(), crate::NetworkAuthorityRights::DNS) {
+            return Ok(Err(p2lookup::ErrorCode::AccessDenied));
+        }
+        let Some(service) = self.runtime_state.network_service() else {
+            return Ok(Err(p2lookup::ErrorCode::TemporaryResolverFailure));
+        };
+        let stream = P2ResolveAddressStream::pending();
+        let task_stream = stream.clone();
+        self.spawner().spawn_detached(async move {
+            task_stream.complete(service.dns_resolve(&name, u64::MAX).await);
+        });
+        let resource = self.table.push(stream)?;
+        Ok(Ok(resource))
     }
 }
 
@@ -2108,20 +2690,42 @@ where
 {
     fn resolve_next_address(
         &mut self,
-        _: Resource<p2lookup::ResolveAddressStream>,
+        resource: Resource<p2lookup::ResolveAddressStream>,
     ) -> Result<core::result::Result<Option<p2lookup::IpAddress>, p2lookup::ErrorCode>> {
-        socket_not_supported()
+        let stream = self.table.get_mut(&resource)?;
+        if !stream.is_ready() {
+            return Ok(Err(p2lookup::ErrorCode::WouldBlock));
+        }
+        Ok(stream
+            .next_address()
+            .map(|address| address.map(format_p2_ip_address))
+            .map_err(map_p2_dns_error))
     }
 
     fn subscribe(
         &mut self,
-        _: Resource<p2lookup::ResolveAddressStream>,
+        resource: Resource<p2lookup::ResolveAddressStream>,
     ) -> Result<Resource<p2lookup::Pollable>> {
-        socket_unavailable()
+        subscribe(&mut self.table, resource)
     }
 
     fn drop(&mut self, resource: Resource<p2lookup::ResolveAddressStream>) -> Result<()> {
         delete_resource(self, resource)
+    }
+}
+
+fn format_p2_ip_address(address: crate::Ipv4Address) -> p2lookup::IpAddress {
+    let [a, b, c, d] = address.octets();
+    p2lookup::IpAddress::Ipv4((a, b, c, d))
+}
+
+fn map_p2_dns_error(error: crate::DnsError) -> p2lookup::ErrorCode {
+    match error.kind {
+        crate::DnsErrorKind::UnresolvedHost => p2lookup::ErrorCode::NameUnresolvable,
+        crate::DnsErrorKind::Timeout | crate::DnsErrorKind::Unavailable => {
+            p2lookup::ErrorCode::TemporaryResolverFailure
+        }
+        crate::DnsErrorKind::Internal => p2lookup::ErrorCode::PermanentResolverFailure,
     }
 }
 
@@ -2152,6 +2756,7 @@ fn descriptor_type_from_kind(kind: FsNodeKind) -> p2fs::DescriptorType {
     match kind {
         FsNodeKind::Directory => p2fs::DescriptorType::Directory,
         FsNodeKind::File => p2fs::DescriptorType::RegularFile,
+        FsNodeKind::Symlink => p2fs::DescriptorType::SymbolicLink,
     }
 }
 
@@ -2274,11 +2879,33 @@ fn datetime_from_p3(instant: P3SystemInstant) -> p2fs::Datetime {
     }
 }
 
+fn p2_new_timestamp_nanos(
+    timestamp: p2fs::NewTimestamp,
+    now_nanos: u64,
+) -> core::result::Result<Option<u64>, p2fs::ErrorCode> {
+    match timestamp {
+        p2fs::NewTimestamp::NoChange => Ok(None),
+        p2fs::NewTimestamp::Now => Ok(Some(now_nanos)),
+        p2fs::NewTimestamp::Timestamp(datetime) => {
+            let nanos = datetime
+                .seconds
+                .checked_mul(1_000_000_000)
+                .and_then(|value| value.checked_add(u64::from(datetime.nanoseconds)))
+                .ok_or(p2fs::ErrorCode::Overflow)?;
+            Ok(Some(nanos))
+        }
+    }
+}
+
 fn error_code_from_path(error: crate::ComponentFsPathError) -> p2fs::ErrorCode {
     match error {
         crate::ComponentFsPathError::InvalidBasePath => p2fs::ErrorCode::Invalid,
         crate::ComponentFsPathError::NotPermitted => p2fs::ErrorCode::NotPermitted,
     }
+}
+
+fn p2_stream_error(error: p2fs::ErrorCode) -> StreamError {
+    StreamError::LastOperationFailed(wasmtime::Error::new(P2FileStreamError::WriteFailed(error)))
 }
 
 fn error_code_from_p3(error: p3fs::ErrorCode) -> p2fs::ErrorCode {
@@ -2322,5 +2949,60 @@ fn error_code_from_p3(error: p3fs::ErrorCode) -> p2fs::ErrorCode {
         p3fs::ErrorCode::Other(_) => {
             panic!("preview2 filesystem cannot represent preview3 error-code::other")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        WasiTcpSocketFamily, map_p2_tcp_core_error, map_p2_tcp_socket_error, p2net, p2tcp,
+        parse_p2_tcp_socket_address,
+    };
+
+    #[test]
+    fn p2_tcp_maps_core_network_errors_without_preview3_intermediate() {
+        assert_eq!(
+            map_p2_tcp_core_error(crate::TcpError {
+                kind: crate::TcpErrorKind::UnresolvedHost,
+                detail: crate::NetworkErrorDetail::DnsLookupFailed,
+            }),
+            p2tcp::ErrorCode::NameUnresolvable
+        );
+        assert_eq!(
+            map_p2_tcp_core_error(crate::TcpError {
+                kind: crate::TcpErrorKind::Timeout,
+                detail: crate::NetworkErrorDetail::TcpConnectTimeout,
+            }),
+            p2tcp::ErrorCode::Timeout
+        );
+        assert_eq!(
+            map_p2_tcp_socket_error(super::super::socket_types::ErrorCode::InvalidState),
+            p2tcp::ErrorCode::InvalidState
+        );
+    }
+
+    #[test]
+    fn p2_tcp_ipv4_socket_rejects_ipv6_addresses() {
+        let ipv4 = parse_p2_tcp_socket_address(
+            p2tcp::IpSocketAddress::Ipv4(p2net::Ipv4SocketAddress {
+                port: 80,
+                address: (127, 0, 0, 1),
+            }),
+            WasiTcpSocketFamily::Ipv4,
+        )
+        .expect("IPv4 address should parse for IPv4 socket");
+        assert_eq!(ipv4.port, 80);
+
+        let ipv6 = parse_p2_tcp_socket_address(
+            p2tcp::IpSocketAddress::Ipv6(p2net::Ipv6SocketAddress {
+                port: 80,
+                flow_info: 0,
+                address: (0, 0, 0, 0, 0, 0, 0, 1),
+                scope_id: 0,
+            }),
+            WasiTcpSocketFamily::Ipv4,
+        )
+        .expect_err("IPv6 address must not be accepted by IPv4 socket");
+        assert_eq!(ipv6, p2tcp::ErrorCode::NotSupported);
     }
 }

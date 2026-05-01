@@ -4,10 +4,11 @@ use std::fs;
 use std::io::Write as _;
 use std::rc::Rc;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use clap::{ColorChoice, Parser};
 use helios_inspector_protocol::system::programs::{ExecOutput, ExecResult};
 use nu_ansi_term::{Color, Style as AnsiStyle};
+use rustyline::Cmd;
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::{Highlighter, MatchingBracketHighlighter};
@@ -16,7 +17,6 @@ use rustyline::history::DefaultHistory;
 use rustyline::validate::{
     MatchingBracketValidator, ValidationContext, ValidationResult, Validator,
 };
-use rustyline::Cmd;
 use rustyline::{
     CompletionType, Config, Context as RustyContext, EditMode, Editor, Event as RustyEvent, Helper,
     KeyCode as RustyKeyCode, KeyEvent as RustyKeyEvent, Modifiers as RustyModifiers,

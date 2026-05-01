@@ -65,7 +65,10 @@ where
     let range = address_space
         .reserve(pages(4))
         .expect("reserve(4 pages) must succeed in a fresh address space");
-    assert!(range.is_page_aligned(), "reserved range must be page-aligned: {range:?}");
+    assert!(
+        range.is_page_aligned(),
+        "reserved range must be page-aligned: {range:?}"
+    );
     assert_eq!(range.byte_len, pages(4));
     assert_eq!(
         address_space.translate(range.start),
@@ -81,10 +84,7 @@ where
     A: AddressSpace,
 {
     let address_space = fresh();
-    assert_eq!(
-        address_space.reserve(0),
-        Err(AddressSpaceError::EmptyRange)
-    );
+    assert_eq!(address_space.reserve(0), Err(AddressSpaceError::EmptyRange));
 }
 
 fn reserve_rejects_misaligned_length<F, A>(fresh: F)
@@ -141,7 +141,9 @@ where
 
     address_space.decommit(range).expect("decommit");
     assert_eq!(address_space.translate(range.start), Translation::Reserved);
-    address_space.release(range).expect("release after decommit");
+    address_space
+        .release(range)
+        .expect("release after decommit");
 }
 
 fn decommit_uncommitted_range_errors<F, A>(fresh: F)

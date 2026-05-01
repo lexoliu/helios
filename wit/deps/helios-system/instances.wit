@@ -1,7 +1,7 @@
 package helios:system@0.1.0;
 
 interface instances {
-  /// Stable identifier for a live wasm instance.
+  /// Stable identifier for a live program instance.
   type instance-id = u64;
 
   /// Monotonic nanoseconds since system boot.
@@ -19,6 +19,6 @@ interface instances {
     cpu-busy: permille,
   }
 
-  /// Returns the current live wasm instances visible to the privileged caller.
+  /// Returns the current live program instances visible to the privileged caller.
   snapshot: func() -> list<instance>;
 }

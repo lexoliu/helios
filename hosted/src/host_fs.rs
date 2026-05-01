@@ -1,8 +1,11 @@
 use std::fs;
 use std::io;
+use std::os::unix::fs::{self as unix_fs, MetadataExt};
 use std::path::{Path, PathBuf};
 
-use helios_kernel::{HostDirEntry, HostFileSystem, HostFsError, HostMetadata};
+use helios_kernel::{
+    AuthorityDomain, HostDirEntry, HostFileSystem, HostFsError, HostMetadata, ObjectIdentity,
+};
 
 /// Host-OS backed filesystem for the hosted backend.
 ///
@@ -38,26 +41,25 @@ fn map_io_error(error: io::Error) -> HostFsError {
 }
 
 impl HostFileSystem for HostedFileSystem {
-    type StatFuture<'a> = core::future::Ready<Result<HostMetadata, HostFsError>>;
-    type ReadDirFuture<'a> = core::future::Ready<Result<Vec<HostDirEntry>, HostFsError>>;
-    type ReadFileFuture<'a> = core::future::Ready<Result<Vec<u8>, HostFsError>>;
-    type ReadFileRangeFuture<'a> = core::future::Ready<Result<Vec<u8>, HostFsError>>;
-    type WriteFileFuture<'a> = core::future::Ready<Result<(), HostFsError>>;
-    type TruncateFileFuture<'a> = core::future::Ready<Result<(), HostFsError>>;
-    type CreateFileFuture<'a> = core::future::Ready<Result<(), HostFsError>>;
-    type CreateDirectoryFuture<'a> = core::future::Ready<Result<(), HostFsError>>;
-    type RemoveFuture<'a> = core::future::Ready<Result<(), HostFsError>>;
-    type RenameFuture<'a> = core::future::Ready<Result<(), HostFsError>>;
-
-    fn stat_path(&self, path: &str) -> Self::StatFuture<'_> {
+    fn stat_path(
+        &self,
+        path: &str,
+    ) -> impl core::future::Future<Output = Result<HostMetadata, HostFsError>> + Send + '_ {
         core::future::ready(stat_impl(&self.resolve(path)))
     }
 
-    fn read_dir(&self, path: &str) -> Self::ReadDirFuture<'_> {
+    fn read_dir(
+        &self,
+        path: &str,
+    ) -> impl core::future::Future<Output = Result<Vec<HostDirEntry>, HostFsError>> + Send + '_
+    {
         core::future::ready(read_dir_impl(&self.resolve(path)))
     }
 
-    fn read_file(&self, path: &str) -> Self::ReadFileFuture<'_> {
+    fn read_file(
+        &self,
+        path: &str,
+    ) -> impl core::future::Future<Output = Result<Vec<u8>, HostFsError>> + Send + '_ {
         core::future::ready(fs::read(self.resolve(path)).map_err(map_io_error))
     }
 
@@ -66,19 +68,30 @@ impl HostFileSystem for HostedFileSystem {
         path: &str,
         offset: u64,
         max_bytes: u32,
-    ) -> Self::ReadFileRangeFuture<'_> {
+    ) -> impl core::future::Future<Output = Result<Vec<u8>, HostFsError>> + Send + '_ {
         core::future::ready(read_file_range_impl(&self.resolve(path), offset, max_bytes))
     }
 
-    fn write_file(&self, path: &str, offset: u64, bytes: &[u8]) -> Self::WriteFileFuture<'_> {
+    fn write_file(
+        &self,
+        path: &str,
+        offset: u64,
+        bytes: &[u8],
+    ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
         core::future::ready(write_file_impl(&self.resolve(path), offset, bytes))
     }
 
-    fn truncate_file(&self, path: &str) -> Self::TruncateFileFuture<'_> {
+    fn truncate_file(
+        &self,
+        path: &str,
+    ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
         core::future::ready(truncate_impl(&self.resolve(path)))
     }
 
-    fn create_file(&self, path: &str) -> Self::CreateFileFuture<'_> {
+    fn create_file(
+        &self,
+        path: &str,
+    ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
         core::future::ready(
             fs::File::create_new(self.resolve(path))
                 .map(|_| ())
@@ -86,11 +99,18 @@ impl HostFileSystem for HostedFileSystem {
         )
     }
 
-    fn create_directory(&self, path: &str) -> Self::CreateDirectoryFuture<'_> {
+    fn create_directory(
+        &self,
+        path: &str,
+    ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
         core::future::ready(fs::create_dir(self.resolve(path)).map_err(map_io_error))
     }
 
-    fn remove(&self, path: &str, directory: bool) -> Self::RemoveFuture<'_> {
+    fn remove(
+        &self,
+        path: &str,
+        directory: bool,
+    ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
         let resolved = self.resolve(path);
         core::future::ready(if directory {
             fs::remove_dir(resolved).map_err(map_io_error)
@@ -99,10 +119,39 @@ impl HostFileSystem for HostedFileSystem {
         })
     }
 
-    fn rename(&self, source: &str, destination: &str) -> Self::RenameFuture<'_> {
+    fn rename(
+        &self,
+        source: &str,
+        destination: &str,
+    ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
         core::future::ready(
             fs::rename(self.resolve(source), self.resolve(destination)).map_err(map_io_error),
         )
+    }
+
+    fn hard_link(
+        &self,
+        source: &str,
+        destination: &str,
+    ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
+        core::future::ready(
+            fs::hard_link(self.resolve(source), self.resolve(destination)).map_err(map_io_error),
+        )
+    }
+
+    fn symlink(
+        &self,
+        target: &str,
+        link_path: &str,
+    ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
+        core::future::ready(unix_fs::symlink(target, self.resolve(link_path)).map_err(map_io_error))
+    }
+
+    fn read_link(
+        &self,
+        path: &str,
+    ) -> impl core::future::Future<Output = Result<String, HostFsError>> + Send + '_ {
+        core::future::ready(read_link_impl(&self.resolve(path)))
     }
 }
 
@@ -110,8 +159,10 @@ fn stat_impl(path: &Path) -> Result<HostMetadata, HostFsError> {
     let meta = fs::metadata(path).map_err(map_io_error)?;
     let qid_type = if meta.is_dir() { 0x80 } else { 0x00 };
     let mode = if meta.is_dir() { 0o040755 } else { 0o100644 };
+    let inode = meta.ino();
     Ok(HostMetadata {
-        qid_path: 0,
+        identity: ObjectIdentity::new(AuthorityDomain::host_device(meta.dev()), inode),
+        qid_path: inode,
         qid_type,
         mode,
         size: meta.len(),
@@ -161,4 +212,83 @@ fn truncate_impl(path: &Path) -> Result<(), HostFsError> {
         .map_err(map_io_error)?;
     file.set_len(0).map_err(map_io_error)?;
     Ok(())
+}
+
+fn read_link_impl(path: &Path) -> Result<String, HostFsError> {
+    fs::read_link(path)
+        .map_err(map_io_error)?
+        .into_os_string()
+        .into_string()
+        .map_err(|_| HostFsError::Utf8)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use helios_kernel::HostFileSystem;
+
+    use super::HostedFileSystem;
+
+    struct TestRoot {
+        path: PathBuf,
+    }
+
+    impl TestRoot {
+        fn new() -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock must be after the Unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir()
+                .join(format!("helios-hosted-fs-{}-{nanos}", std::process::id()));
+            std::fs::create_dir(&path).expect("test root must be created");
+            Self { path }
+        }
+
+        fn filesystem(&self) -> HostedFileSystem {
+            HostedFileSystem::new(self.path.clone())
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_dir_all(&self.path) {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    ?error,
+                    "failed to remove hosted filesystem test root"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_filesystem_supports_links() {
+        let root = TestRoot::new();
+        std::fs::write(root.path.join("source"), b"payload").expect("source file must be written");
+        let filesystem = root.filesystem();
+
+        filesystem
+            .hard_link("source", "hard")
+            .await
+            .expect("hard link must be created");
+        filesystem
+            .symlink("source", "sym")
+            .await
+            .expect("symlink must be created");
+
+        let hard = filesystem
+            .read_file("hard")
+            .await
+            .expect("hard link must be readable");
+        let payload = filesystem
+            .read_link("sym")
+            .await
+            .expect("symlink payload must be readable");
+
+        assert_eq!(&hard, b"payload");
+        assert_eq!(payload, "source");
+    }
 }

@@ -1,14 +1,14 @@
 use crate::{
-    ComponentNetworkService, DynamicNetworkService, RawMutexGuardResource, RawMutexResource,
-    RawRwLockReadGuardResource, RawRwLockResource, RawRwLockWriteGuardResource, SerialPortResource,
-    TcpStreamResource, UdpSocketResource,
+    ComponentNetworkService, RawMutexGuardResource, RawMutexResource, RawRwLockReadGuardResource,
+    RawRwLockResource, RawRwLockWriteGuardResource, SerialPortResource, TcpStreamResource,
+    UdpSocketResource,
 };
 
 pub struct ComponentSerialPort {
     pub _resource: SerialPortResource,
 }
 
-pub struct ComponentTcpStream<Backend = ComponentTcpBackend> {
+pub struct ComponentTcpStream<Backend> {
     pub resource: TcpStreamResource<Backend>,
 }
 
@@ -20,7 +20,7 @@ impl<Backend> ComponentTcpStream<Backend> {
     }
 }
 
-pub struct ComponentUdpSocket<Backend = ComponentUdpBackend> {
+pub struct ComponentUdpSocket<Backend> {
     pub resource: UdpSocketResource<Backend>,
 }
 
@@ -33,7 +33,7 @@ impl<Backend> ComponentUdpSocket<Backend> {
 }
 
 #[derive(Clone)]
-pub struct ComponentTcpBackend<Service = DynamicNetworkService>
+pub struct ComponentTcpBackend<Service>
 where
     Service: ComponentNetworkService,
 {
@@ -42,7 +42,7 @@ where
 }
 
 #[derive(Clone)]
-pub struct ComponentUdpBackend<Service = DynamicNetworkService>
+pub struct ComponentUdpBackend<Service>
 where
     Service: ComponentNetworkService,
 {

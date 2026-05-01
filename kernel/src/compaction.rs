@@ -166,8 +166,14 @@ mod tests {
     fn pressure_classifies_around_thresholds() {
         assert_eq!(PressureLevel::from_free_fraction(0.9), PressureLevel::Green);
         assert_eq!(PressureLevel::from_free_fraction(0.5), PressureLevel::Green);
-        assert_eq!(PressureLevel::from_free_fraction(0.4), PressureLevel::Yellow);
-        assert_eq!(PressureLevel::from_free_fraction(0.25), PressureLevel::Yellow);
+        assert_eq!(
+            PressureLevel::from_free_fraction(0.4),
+            PressureLevel::Yellow
+        );
+        assert_eq!(
+            PressureLevel::from_free_fraction(0.25),
+            PressureLevel::Yellow
+        );
         assert_eq!(PressureLevel::from_free_fraction(0.1), PressureLevel::Red);
         assert_eq!(PressureLevel::from_free_fraction(0.0), PressureLevel::Red);
     }

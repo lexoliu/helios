@@ -1,8 +1,8 @@
-//! User-program exec & spawn syscalls.
+//! User-program exec and spawn interfaces.
 //!
-//! `spawn` is the low-level entry point: it launches a wasm program and
+//! `spawn` is the low-level entry point: it launches a program artifact and
 //! returns a handle whose `stdin`/`stdout`/`stderr` are byte streams that
-//! can be piped from/into anything that speaks `wasi:io`. `exec` is the
+//! can be piped from/into another stream endpoint. `exec` is the
 //! convenience "run to completion with buffered output" wrapper, and `aot`
 //! produces a signed `cwasm` artifact at a caller-chosen destination path.
 
@@ -12,11 +12,87 @@ use crate::wit_bindgen::{FutureReader, StreamReader};
 use futures_lite::future::zip;
 
 pub use crate::bindings::helios::system::programs::{
-    AotHint, AotRequest, AotResult, ExecError, ExecErrorKind, ExecOutput, ExecRequest, ExecResult,
-    ExitStatus, SpawnError, SpawnErrorKind, SpawnRequest,
+    AotHint, AotRequest, AotResult, CapabilityGrant, ClockGrant, ClockRight, DirectoryGrant,
+    ExecError, ExecErrorKind, ExecOutput, ExecRequest, ExecResult, ExitStatus, FilesystemRight,
+    LinkGrant, LinkRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight, SpawnError,
+    SpawnErrorKind, SpawnRequest, TerminalGrant, TerminalRight,
 };
 
-/// Owned handle to a spawned child wasm program.
+/// Build a directory capability grant for `helios:system/programs`.
+pub fn directory_grant(
+    source_path: impl Into<String>,
+    guest_name: impl Into<String>,
+    rights: Vec<FilesystemRight>,
+) -> CapabilityGrant {
+    CapabilityGrant::Directory(DirectoryGrant {
+        source_path: source_path.into(),
+        guest_name: guest_name.into(),
+        rights,
+    })
+}
+
+/// Full root preopen grant for trusted system programs such as the shell.
+pub fn root_directory_grant() -> CapabilityGrant {
+    directory_grant(
+        "/",
+        "/",
+        vec![
+            FilesystemRight::Read,
+            FilesystemRight::Write,
+            FilesystemRight::MutateDirectory,
+            FilesystemRight::Execute,
+        ],
+    )
+}
+
+pub fn network_grant(rights: Vec<NetworkRight>) -> CapabilityGrant {
+    CapabilityGrant::Network(NetworkGrant { rights })
+}
+
+pub fn clock_grant(rights: Vec<ClockRight>) -> CapabilityGrant {
+    CapabilityGrant::Clock(ClockGrant { rights })
+}
+
+pub fn terminal_grant(rights: Vec<TerminalRight>) -> CapabilityGrant {
+    CapabilityGrant::Terminal(TerminalGrant { rights })
+}
+
+pub fn root_terminal_grant() -> CapabilityGrant {
+    terminal_grant(vec![
+        TerminalRight::Input,
+        TerminalRight::Output,
+        TerminalRight::Control,
+    ])
+}
+
+pub fn process_grant(rights: Vec<ProcessRight>) -> CapabilityGrant {
+    CapabilityGrant::Process(ProcessGrant { rights })
+}
+
+pub fn link_grant(rights: Vec<LinkRight>) -> CapabilityGrant {
+    CapabilityGrant::Link(LinkGrant { rights })
+}
+
+pub fn root_link_grant() -> CapabilityGrant {
+    link_grant(vec![
+        LinkRight::Source,
+        LinkRight::TargetDirectory,
+        LinkRight::SymlinkCreate,
+        LinkRight::SymlinkRead,
+    ])
+}
+
+pub fn root_process_grant() -> CapabilityGrant {
+    process_grant(vec![
+        ProcessRight::Spawn,
+        ProcessRight::Exec,
+        ProcessRight::Fork,
+        ProcessRight::Join,
+        ProcessRight::Signal,
+    ])
+}
+
+/// Owned handle to a spawned child program.
 ///
 /// The handle is the userland wrapper around the `helios:system/programs.child`
 /// WIT resource. It exposes ergonomic Rust APIs for reading the child's
@@ -115,7 +191,7 @@ pub async fn spawn(request: SpawnRequest) -> Result<Child, SpawnError> {
     Child::spawn(request).await
 }
 
-/// Ahead-of-time compile a raw wasm program into a signed `cwasm` file.
+/// Ahead-of-time compile a raw program artifact into a signed `cwasm` file.
 pub async fn aot(request: AotRequest) -> Result<AotResult, ExecError> {
     raw::aot(request).await
 }

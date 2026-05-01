@@ -11,6 +11,7 @@ mod net;
 mod notify;
 mod p9;
 mod queue;
+mod rng;
 mod transport;
 
 pub use block::{
@@ -21,10 +22,12 @@ pub use bus::{DeviceBus, DmaBuffer, DmaPool, IdentityDmaBuffer, IdentityDmaPool,
 pub use console::VirtioConsoleDevice;
 pub use mmio::{
     VirtioMmio9pDevice, VirtioMmioBlockDevice, VirtioMmioConsoleDevice, VirtioMmioNetDevice,
-    block_from_mmio, console_from_mmio, net_from_mmio, p9_from_mmio,
+    VirtioMmioRngDevice, block_from_mmio, console_from_mmio, net_from_mmio, p9_from_mmio,
+    rng_from_mmio,
 };
 pub use net::VirtioNetDevice;
 pub use p9::Virtio9pDevice;
+pub use rng::VirtioRngDevice;
 pub use transport::{
     DeviceStatus, DeviceType, VirtioFeatures, VirtioMmioTransport, VirtioTransport,
 };

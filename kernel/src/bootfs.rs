@@ -1,7 +1,6 @@
 extern crate alloc;
 
 use alloc::borrow::ToOwned;
-use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -314,7 +313,12 @@ impl Directory for BootDirectory {
                         let next_path = if directory.path.is_empty() {
                             name.to_owned()
                         } else {
-                            format!("{}/{}", directory.path, name)
+                            let mut path =
+                                String::with_capacity(directory.path.len() + 1 + name.len());
+                            path.push_str(&directory.path);
+                            path.push('/');
+                            path.push_str(name);
+                            path
                         };
                         if entries.iter().any(|entry| match entry {
                             DirectoryEntry::Directory(existing) => existing.path == next_path,
@@ -438,8 +442,8 @@ mod tests {
     use helios_hal::io::IoError;
 
     const IMAGE: EmbeddedBootFs = EmbeddedBootFs::new(&[
-        EmbeddedBootFile::new("bin/init.wasm", b"init"),
-        EmbeddedBootFile::new("lib/runtime.wasm", b"runtime"),
+        EmbeddedBootFile::new("bin/init.program", b"init"),
+        EmbeddedBootFile::new("lib/runtime.component", b"runtime"),
         EmbeddedBootFile::new("etc/config.txt", b"config"),
     ]);
     const MACRO_IMAGE: EmbeddedBootFs = bootfs!("src/bootfs_test_data");
@@ -474,10 +478,10 @@ mod tests {
             .open_directory("lib", DirectoryRights::READ)
             .expect("embedded lib directory must exist");
         let runtime = lib
-            .open_file("runtime.wasm", FileRights::READ)
-            .expect("embedded runtime.wasm must exist");
+            .open_file("runtime.component", FileRights::READ)
+            .expect("embedded runtime.component must exist");
 
-        assert_eq!(runtime.object().path(), "lib/runtime.wasm");
+        assert_eq!(runtime.object().path(), "lib/runtime.component");
         assert_eq!(runtime.object().contents(), b"runtime");
     }
 

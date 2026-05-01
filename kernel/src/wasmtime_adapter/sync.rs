@@ -5,13 +5,13 @@ const MUTEX_UNLOCKED: usize = 0;
 const MUTEX_LOCKED: usize = 1;
 const RWLOCK_WRITER: usize = usize::MAX;
 
-/// Iteration cap for kernel-side wasmtime synchronisation primitives.
+/// Iteration cap for adapter synchronisation primitives.
 ///
 /// Genuine contention on these locks is single-digit-microsecond
 /// territory because callers do nothing but flip a flag and continue.
 /// A spin that stretches into seconds is always a bug — typically a
-/// PTE / cache-coherence mismatch under the `custom-virtual-memory`
-/// path or a deadlock in upper-layer wasmtime code. Crashing with a
+/// PTE / cache-coherence mismatch under the custom virtual-memory
+/// path or a deadlock in upper-layer runtime code. Crashing with a
 /// clear panic is strictly better than the silent 4-core CPU burn the
 /// previous unbounded-spin form produced; AGENTS §3 demands explicit
 /// failure over silent deadlock.
@@ -24,7 +24,7 @@ const SYNC_SPIN_LIMIT: u64 = 1u64 << 32;
 #[cold]
 #[inline(never)]
 fn sync_deadlock(primitive: &'static str) -> ! {
-    panic!("kernel wasmtime {primitive} spin lock exceeded SYNC_SPIN_LIMIT — deadlock detected");
+    panic!("runtime adapter {primitive} spin lock exceeded SYNC_SPIN_LIMIT — deadlock detected");
 }
 
 #[inline]

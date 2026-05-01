@@ -9,7 +9,7 @@ mod system;
 mod tui;
 mod vm;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use std::io::Write as _;
 

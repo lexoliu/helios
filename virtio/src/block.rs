@@ -49,7 +49,9 @@ pub enum VirtioBlockSwapError {
     InvalidBlockSize,
     #[error("swap extent is empty")]
     EmptyExtent,
-    #[error("swap extent [{start_block}, +{block_count}) exceeds device block count {device_blocks}")]
+    #[error(
+        "swap extent [{start_block}, +{block_count}) exceeds device block count {device_blocks}"
+    )]
     ExtentOutOfBounds {
         start_block: usize,
         block_count: usize,
@@ -236,14 +238,13 @@ impl<D: BlockDevice> VirtioBlockSwapBackend<D> {
         if block_count == 0 {
             return Err(VirtioBlockSwapError::EmptyExtent);
         }
-        let end_block =
-            start_block
-                .checked_add(block_count)
-                .ok_or(VirtioBlockSwapError::ExtentOutOfBounds {
-                    start_block,
-                    block_count,
-                    device_blocks,
-                })?;
+        let end_block = start_block.checked_add(block_count).ok_or(
+            VirtioBlockSwapError::ExtentOutOfBounds {
+                start_block,
+                block_count,
+                device_blocks,
+            },
+        )?;
         if end_block > device_blocks {
             return Err(VirtioBlockSwapError::ExtentOutOfBounds {
                 start_block,
@@ -281,12 +282,13 @@ impl<D: BlockDevice> VirtioBlockSwapBackend<D> {
         }
         let block_count = byte_len.div_ceil(block_size);
         let mut state = self.state.lock().await;
-        let start_block = state
-            .allocate(block_count)
-            .ok_or_else(|| VirtioBlockSwapError::OutOfSwap {
-                requested_blocks: block_count,
-                available_blocks: state.available_blocks(),
-            })?;
+        let start_block =
+            state
+                .allocate(block_count)
+                .ok_or_else(|| VirtioBlockSwapError::OutOfSwap {
+                    requested_blocks: block_count,
+                    available_blocks: state.available_blocks(),
+                })?;
         Ok(VirtioBlockSwapToken {
             start_block,
             block_count,

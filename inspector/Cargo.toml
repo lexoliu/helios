@@ -22,6 +22,7 @@ tempfile = "3.23.0"
 futures-io = "0.3.31"
 futures-lite = "2.6.1"
 futures-util = { version = "0.3.31", default-features = false, features = ["io"] }
+getrandom = "0.3.4"
 helios-inspector-protocol.workspace = true
 helios-hal.workspace = true
 nu-ansi-term = "0.50.3"

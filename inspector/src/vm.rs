@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use askama::Template;
 use clap::{Args as ClapArgs, Subcommand, ValueEnum};
 use console::style;
@@ -18,7 +18,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
-use crate::{connect_client, run_connected, SessionCommand};
+use crate::{SessionCommand, connect_client, run_connected};
 
 const DEFAULT_BAUD: u32 = 115_200;
 const DEFAULT_AARCH64_QEMU_BIN: &str = "qemu-system-aarch64";
@@ -83,6 +83,11 @@ enum VmHostShareProfile {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VmEntropyProfile {
+    FwCfgSeed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VmWatchdogProfile {
     I6300Esb,
 }
@@ -104,6 +109,7 @@ struct VmProfile {
     network: Option<VmNetworkProfile>,
     block: Option<VmBlockProfile>,
     host_share: Option<VmHostShareProfile>,
+    entropy: Option<VmEntropyProfile>,
     watchdog: Option<VmWatchdogProfile>,
 }
 
@@ -123,6 +129,7 @@ const AARCH64_VIRT_HVF_PROFILE: VmProfile = VmProfile {
     network: Some(VmNetworkProfile::VirtioPciUser),
     block: Some(VmBlockProfile::VirtioPciBootDisk),
     host_share: Some(VmHostShareProfile::Virtio9pPci),
+    entropy: Some(VmEntropyProfile::FwCfgSeed),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
 };
 
@@ -143,6 +150,7 @@ const AARCH64_VIRT_TCG_PROFILE: VmProfile = VmProfile {
     network: Some(VmNetworkProfile::VirtioPciUser),
     block: Some(VmBlockProfile::VirtioPciBootDisk),
     host_share: Some(VmHostShareProfile::Virtio9pPci),
+    entropy: Some(VmEntropyProfile::FwCfgSeed),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
 };
 
@@ -162,6 +170,7 @@ const RISCV64_VM_PROFILE: VmProfile = VmProfile {
     network: Some(VmNetworkProfile::VirtioMmioUser),
     block: Some(VmBlockProfile::VirtioMmioDataDisk),
     host_share: Some(VmHostShareProfile::Virtio9pMmio),
+    entropy: None,
     watchdog: Some(VmWatchdogProfile::I6300Esb),
 };
 
@@ -181,6 +190,7 @@ const X86_64_VM_PROFILE: VmProfile = VmProfile {
     network: Some(VmNetworkProfile::VirtioPciUser),
     block: Some(VmBlockProfile::VirtioPciBootDisk),
     host_share: None,
+    entropy: None,
     watchdog: Some(VmWatchdogProfile::I6300Esb),
 };
 
@@ -1069,7 +1079,7 @@ impl VmRuntime {
                 .open(&qemu_log)
                 .with_context(|| format!("failed to open {} for append", qemu_log.display()))?,
         ));
-        if command.profile.arch == VmArch::Riscv64 {
+        if matches!(command.profile.arch, VmArch::Aarch64 | VmArch::Riscv64) {
             qemu.arg("-global").arg("virtio-mmio.force-legacy=false");
         }
         configure_firmware(&mut qemu, command, runtime_dir.path())?;
@@ -1089,6 +1099,9 @@ impl VmRuntime {
             if let Some(shared_dir) = &command.shared_dir {
                 configure_host_share(&mut qemu, host_share, shared_dir);
             }
+        }
+        if let Some(entropy) = command.profile.entropy {
+            configure_entropy_device(&mut qemu, entropy, runtime_dir.path())?;
         }
         if let Some(watchdog) = command.profile.watchdog {
             configure_watchdog(&mut qemu, watchdog);
@@ -1487,6 +1500,29 @@ fn configure_host_share(qemu: &mut Command, host_share: VmHostShareProfile, shar
     }
 }
 
+fn configure_entropy_device(
+    qemu: &mut Command,
+    entropy: VmEntropyProfile,
+    runtime_dir: &Path,
+) -> Result<()> {
+    match entropy {
+        VmEntropyProfile::FwCfgSeed => {
+            let seed_path = runtime_dir.join("rng-seed.bin");
+            let mut seed = [0_u8; 32];
+            getrandom::fill(&mut seed).map_err(|error| {
+                anyhow::anyhow!("failed to read host entropy for VM seed: {error:?}")
+            })?;
+            fs::write(&seed_path, seed)
+                .with_context(|| format!("failed to write {}", seed_path.display()))?;
+            qemu.arg("-fw_cfg").arg(format!(
+                "name=opt/org.helios/rng-seed,file={}",
+                seed_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn configure_watchdog(qemu: &mut Command, watchdog: VmWatchdogProfile) {
     match watchdog {
         VmWatchdogProfile::I6300Esb => {
@@ -1514,7 +1550,7 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant};
 
-    use anyhow::{bail, Context as _, Result};
+    use anyhow::{Context as _, Result, bail};
     use helios_inspector_protocol::debugger::programs as debugger_programs;
 
     use super::*;
@@ -1550,9 +1586,17 @@ mod tests {
             AARCH64_VIRT_HVF_PROFILE.host_share,
             Some(VmHostShareProfile::Virtio9pPci)
         );
+        assert_eq!(
+            AARCH64_VIRT_HVF_PROFILE.entropy,
+            Some(VmEntropyProfile::FwCfgSeed)
+        );
 
         assert_eq!(AARCH64_VIRT_TCG_PROFILE.default_accel, &["tcg"]);
         assert_eq!(AARCH64_VIRT_TCG_PROFILE.default_cpu, Some("max"));
+        assert_eq!(
+            AARCH64_VIRT_TCG_PROFILE.entropy,
+            Some(VmEntropyProfile::FwCfgSeed)
+        );
         assert_eq!(AARCH64_VIRT_TCG_PROFILE.default_smp, 4);
         assert_ne!(AARCH64_VIRT_HVF_PROFILE.machine, "sbsa-ref");
         assert!(!AARCH64_VIRT_HVF_PROFILE.machine.contains("raspi"));

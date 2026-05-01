@@ -5,8 +5,8 @@ edition = "2024"
 autobins = false
 
 [dependencies]
-anyhow = "1.0.100"
 helios-api = { path = "../../../api", default-features = false, features = ["net"] }
+thiserror = "2.0.17"
 url = "2.5.8"
 
 [lib]

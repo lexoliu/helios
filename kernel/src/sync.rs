@@ -37,7 +37,7 @@ pub struct Notified<'a> {
 /// Raw async mutex state without protected payload storage.
 ///
 /// This is the scheduling primitive used by both kernel-internal mutexes and
-/// hosted WIT resources. Acquisition never spins. Interrupt handlers must not
+/// hosted component resources. Acquisition never spins. Interrupt handlers must not
 /// await this lock directly; instead they should record work and wake a task
 /// through [`Notify`].
 pub struct RawMutex {

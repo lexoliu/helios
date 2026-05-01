@@ -6,42 +6,48 @@ extern crate self as helios_kernel;
 #[cfg(not(target_os = "none"))]
 extern crate std;
 
-mod artifact_profile;
 mod bootfs;
 mod child_io;
+mod compaction;
 mod component_cache;
 mod component_fs;
 mod component_fs_path;
-mod component_host;
 mod component_resources;
 mod component_runtime;
 mod component_runtime_backend;
 mod component_types;
-mod cwasm;
+mod descriptor_table;
 mod embedded_component;
 mod embedded_init;
 mod embedded_program;
+mod entropy_pool;
 mod executor;
+mod futex_table;
 mod host_fs_client;
 mod host_share;
 mod instance;
 mod kernel_exception;
 mod log;
-mod compaction;
+mod network_control;
 mod observer;
 mod pmm;
+mod poll_registry;
+mod process_authority;
+mod process_table;
 mod program_service;
 mod recording_console;
 mod runtime_state;
 mod runtime_types;
 mod serial_transport;
+mod socket_stack;
 mod sync;
 mod task;
+mod thread_table;
 mod time;
 mod timer;
 mod unsupported_host_fs;
 mod user_memory;
-mod wasi_rights;
+#[cfg(feature = "wasmtime-runtime")]
 pub(crate) mod wasmtime_adapter;
 
 #[cfg(all(
@@ -52,35 +58,24 @@ pub(crate) mod wasmtime_adapter;
         feature = "wasmtime-x86"
     )
 ))]
-pub mod custom_vm {
-    //! Re-export of the wasmtime custom-virtual-memory dispatcher
-    //! so bare-metal backends can install their `CustomVmHooks`
+pub mod runtime_memory {
+    //! Re-export of the runtime custom-virtual-memory dispatcher
+    //! so bare-metal backends can install their `RuntimeMemoryHooks`
     //! tables without reaching into kernel-private modules.
     pub use crate::wasmtime_adapter::custom_vm::{
-        CustomVmHooks, WasmtimeMemoryImage, default_memory_image_free,
-        default_memory_image_map_at, default_memory_image_new, default_page_size,
-        install_hooks,
+        RuntimeMemoryHooks, RuntimeMemoryImage, default_memory_image_free,
+        default_memory_image_map_at, default_memory_image_new, default_page_size, install_hooks,
     };
 }
-#[cfg(all(
-    target_os = "none",
-    any(
-        feature = "wasmtime-aarch64",
-        feature = "wasmtime-riscv64",
-        feature = "wasmtime-x86"
-    )
-))]
-mod wasmtime_sync;
-
-pub use artifact_profile::{
-    ArtifactImport, ArtifactKind, ArtifactProfile, ArtifactProfileError, ArtifactProfileReport,
-    classify_raw_wasm, validate_component_import_name,
-};
 pub use bootfs::{
     BootDirectory, BootDirectoryEntry, BootDirectoryHandleExt, BootFile, EmbeddedBootFile,
     EmbeddedBootFs,
 };
 pub use child_io::{ByteReader, ByteWriter, ClosedPeer, TryRead, byte_channel};
+pub use compaction::{
+    CompactionBudget, CompactionPolicy, CompactionReport, CompactionTarget, Compactor,
+    PressureLevel,
+};
 pub(crate) use component_cache::ComponentCache;
 pub use component_fs::{
     ComponentFsNodeKind, ComponentFsResourceError, ComponentResourceTableError,
@@ -89,14 +84,6 @@ pub use component_fs::{
 pub use component_fs_path::{
     ComponentFsPathError, directory_prefix, parent_path, resolve_absolute_path, resolve_child_path,
     resolve_guest_path,
-};
-pub use component_host::{
-    ChildExit, ChildHandle, ComponentBindingSet, ComponentHostProcessorRole, HostRuntimeState,
-    UserProgramService, component_host_processor_role, component_host_processors_to_start,
-    component_host_system_processor, component_host_worker_count,
-    install_component_host_program_service, install_program_service,
-    run_component_host_processor_forever, run_embedded_component_forever,
-    run_program_workers_forever, system_component_should_run_on,
 };
 pub use component_resources::{
     ComponentRawMutex, ComponentRawMutexGuard, ComponentRawRwLock, ComponentRawRwLockReadGuard,
@@ -115,20 +102,20 @@ pub use component_types::{
     RawMutexGuardResource, RawMutexResource, RawRwLockReadGuardResource, RawRwLockResource,
     RawRwLockWriteGuardResource, SerialPortResource, TcpStreamResource, UdpSocketResource,
 };
-pub use cwasm::{
-    ArtifactTrustError, TrustedCwasm, UntrustedCwasm, UntrustedWasm, is_cwasm,
-    sign_trusted_artifact_payload, trust_bootfs_artifact, trusted_root_public_keys,
-    verify_signed_artifact,
-};
+pub use descriptor_table::{DescriptorEntry, DescriptorId, DescriptorTable, DescriptorTableError};
 pub use embedded_component::EmbeddedComponent;
 pub use embedded_init::{
     EmbeddedInit, embedded_boot_component, embedded_init, embedded_system_component,
     has_embedded_system_component,
 };
 pub use embedded_program::EmbeddedProgram;
+pub use entropy_pool::{EntropyError, EntropyPool};
 pub use executor::{JoinHandle, LocalJoinHandle, Spawner};
+pub use futex_table::{
+    FutexKey, FutexTable, FutexWaitRegistration, GuestAddress, ProcessMemoryIdentity,
+};
 pub use helios_hal::Platform;
-pub use host_fs_client::{HostFsClient, HostFsFuture, HostFsTransport};
+pub use host_fs_client::{HostFsClient, HostFsTransport};
 pub use host_share::{HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, guest_host_share_path};
 pub use instance::{
     DEFAULT_RESTART_COST, InstanceExecutionTransition, InstanceId, InstanceProfileTotal,
@@ -139,9 +126,9 @@ pub use instance::{
 pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
 };
-pub use compaction::{
-    CompactionBudget, CompactionPolicy, CompactionReport, CompactionTarget, Compactor,
-    PressureLevel,
+pub use network_control::{
+    Ipv4Cidr, Ipv4Route, MacAddress, NetworkAdminBackend, NetworkBridgeId, NetworkControl,
+    NetworkControlError, NetworkPortId,
 };
 pub use observer::{
     DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY, FoldedProfileSample,
@@ -150,36 +137,60 @@ pub use observer::{
     parse_console_text,
 };
 pub use pmm::KernelPhysFrameAllocator;
-pub use program_service::{ProgramExecError, ProgramExecErrorKind, ProgramOutOfMemory};
+pub use poll_registry::{
+    PollKey, PollRegistration, PollRegistry, PollRegistryError, PollSourceKind,
+};
+pub use process_authority::{
+    ClockAuthorityRights, DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DnsCap,
+    ExecAuthority, ForkAuthority, JoinAuthority, LinkAuthorityRights, LinkSourceCap,
+    LinkTargetDirectoryCap, MulticastCap, NetworkAdminCap, NetworkAuthorityRights, NetworkCap,
+    PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights,
+    SetWallClockCap, SignalAuthority, SpawnAuthority, SymlinkCreateCap, SymlinkReadCap, TcpCap,
+    TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, TtyControlCap, UdpCap,
+};
+pub use process_table::{ProcessId, ProcessRecord, ProcessState, ProcessTable, ProcessTableError};
+pub use program_service::{
+    ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, ProgramOutOfMemory,
+};
 pub use recording_console::RecordingConsole;
 pub use runtime_state::RuntimeState;
 pub use runtime_types::{
-    ComponentHostFilesystemState, ComponentNetworkService, ComponentNetworkState,
-    DynComponentNetworkService, DynamicNetworkService, ExecOutput, ExecResult, HostDirEntry,
-    HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata, Ipv4Address, PingError,
-    PingErrorKind, PingReply, TcpError, TcpErrorKind, TcpStreamToken, UdpBinding, UdpDatagram,
-    UdpError, UdpErrorKind, UdpSocketToken,
+    AuthorityDomain, ComponentHostFilesystemState, ComponentNetworkService, ComponentNetworkState,
+    DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry, HostFileSystem, HostFsError,
+    HostFsErrorKind, HostMetadata, Ipv4Address, NetworkErrorDetail, ObjectIdentity, PingError,
+    PingErrorKind, PingReply, TcpError, TcpErrorKind, UdpBinding, UdpDatagram, UdpError,
+    UdpErrorKind,
 };
 pub use serial_transport::{
     emit_serial_error_marker, emit_serial_stage_marker, read_serial, try_read_serial, write_serial,
 };
+pub use socket_stack::SocketStack;
 pub use sync::{
     Mutex, MutexGuard, Notified, Notify, OwnedRawMutexLease, OwnedRawRwLockReadLease,
     OwnedRawRwLockWriteLease, RawMutex, RawMutexLease, RawRwLock, RawRwLockReadLease,
     RawRwLockWriteLease, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
 pub use task::{YieldNow, yield_now};
+pub use thread_table::{ThreadId, ThreadRecord, ThreadState, ThreadTable, ThreadTableError};
 pub use time::{
-    duration_to_ticks, elapsed_millis, monotonic_nanos, nanos_to_ticks_ceil_saturating,
+    KernelClock, duration_to_ticks, elapsed_millis, monotonic_nanos, nanos_to_ticks_ceil_saturating,
 };
 pub use timer::{Sleep, Timer};
 pub use unsupported_host_fs::UnsupportedHostFileSystem;
 pub use user_memory::{
-    UserHeapStats, UserMemoryCreator, allocate_user_frame_zeroed, deallocate_user_frame,
-    user_heap_stats,
+    UserHeapStats, allocate_user_frame_zeroed, deallocate_user_frame, user_heap_stats,
 };
-pub use wasi_rights::WasiRights;
-// Wasmtime-specific helpers are crate-internal only.
+#[cfg(feature = "wasmtime-runtime")]
+pub use wasmtime_adapter::component_host::{
+    ChildExit, ChildHandle, ComponentBindingSet, ComponentHostNetworkService,
+    ComponentHostProcessorRole, ComponentHostTcpStreamToken, ComponentHostUdpSocketToken,
+    HostRuntimeState, UserProgramService, component_host_processor_role,
+    component_host_processors_to_start, component_host_system_processor,
+    component_host_worker_count, install_component_host_program_service, install_program_service,
+    run_component_host_processor_forever, run_embedded_component_forever,
+    run_program_workers_forever, system_component_should_run_on,
+};
+// Concrete runtime helpers are crate-internal only.
 // External consumers use the ComponentRuntimeFactory trait.
 
 use alloc::sync::Arc;

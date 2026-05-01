@@ -1,5 +1,5 @@
 use async_signal::{Signal, Signals};
-use futures_lite::{future, StreamExt as _};
+use futures_lite::{StreamExt as _, future};
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -9,9 +9,9 @@ use anyhow::{Context as _, Result};
 use helios_inspector_protocol::system::{instances, stats, tracing};
 use nu_ansi_term::{Color, Style as AnsiStyle};
 
+use crate::TracingCommand;
 use crate::remote;
 use crate::serial::RpcClient;
-use crate::TracingCommand;
 
 const LIVE_TRACING_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -288,7 +288,7 @@ impl EmittedEvents {
 mod tests {
     use helios_inspector_protocol::system::tracing::{Event, Field, Level, Value};
 
-    use super::{render_tracing_event, tracing_event_key, EmittedEvents};
+    use super::{EmittedEvents, render_tracing_event, tracing_event_key};
 
     #[test]
     fn tracing_render_omits_timestamp_and_message_prefix() {

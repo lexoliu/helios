@@ -30,8 +30,6 @@
 
 .section .text.helios_x86_secondary_wakeup, "ax"
 .balign 4096
-.intel_syntax noprefix
-
 .code16
 helios_x86_secondary_wakeup_start:
     cli
@@ -167,4 +165,3 @@ helios_x86_secondary_wakeup_runtime:
 helios_x86_secondary_wakeup_entry:
     .quad 0
 helios_x86_secondary_wakeup_end:
-.att_syntax

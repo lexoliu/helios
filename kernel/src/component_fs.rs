@@ -2,6 +2,7 @@
 pub enum ComponentFsNodeKind {
     Directory,
     File,
+    Symlink,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -5,8 +5,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
     DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedBootFs,
-    FoldedProfileSample, InstanceRegistry, Notify, ProfileFilter, ProfileHistory, ProfileScope,
-    StatsSample, TraceEvent, TraceFilter, TraceHistory, embedded_init,
+    FoldedProfileSample, FutexKey, FutexTable, FutexWaitRegistration, InstanceRegistry, Notify,
+    ProfileFilter, ProfileHistory, ProfileScope, StatsSample, TraceEvent, TraceFilter,
+    TraceHistory, embedded_init,
 };
 use spin::Mutex;
 
@@ -27,6 +28,7 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     program_service_ready: Notify,
     network_service: Mutex<Option<NetworkService>>,
     host_fs_service: Mutex<Option<HostFsService>>,
+    futex_table: Mutex<FutexTable>,
     bootfs: Mutex<Option<EmbeddedBootFs>>,
     tracing: Mutex<TraceHistory>,
     profiling_enabled: AtomicBool,
@@ -51,6 +53,7 @@ where
                 program_service_ready: Notify::new(),
                 network_service: Mutex::new(None),
                 host_fs_service: Mutex::new(None),
+                futex_table: Mutex::new(FutexTable::new()),
                 bootfs: Mutex::new(embedded_init().map(|init| init.bootfs())),
                 tracing: Mutex::new(TraceHistory::new(DEFAULT_TRACE_HISTORY_CAPACITY)),
                 profiling_enabled: AtomicBool::new(false),
@@ -200,6 +203,22 @@ where
 
     pub fn host_fs_service(&self) -> Option<HostFsService> {
         self.inner.host_fs_service.lock().clone()
+    }
+
+    pub fn prepare_futex_wait(&self, key: FutexKey) -> FutexWaitRegistration {
+        self.inner.futex_table.lock().prepare_wait(key)
+    }
+
+    pub fn complete_futex_wait(&self, registration: FutexWaitRegistration) {
+        self.inner.futex_table.lock().complete_wait(registration);
+    }
+
+    pub fn wake_futex(&self, key: FutexKey, count: usize) -> usize {
+        self.inner.futex_table.lock().wake(key, count)
+    }
+
+    pub fn wake_all_futex(&self, key: FutexKey) -> usize {
+        self.inner.futex_table.lock().wake_all(key)
     }
 
     pub fn bootfs(&self) -> Option<EmbeddedBootFs> {

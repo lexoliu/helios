@@ -1,8 +1,13 @@
 /target
 /shell-protocol/wrpc-wit
 .DS_Store
-/artifacts/
+/artifacts/*
+!/artifacts/wasix/
+/artifacts/wasix/*
+!/artifacts/wasix/dash/
+!/artifacts/wasix/dash/*
 /tools/wasi-apps/python/target
 /tools/wasi-apps/curl/target
 *.wasm
+!/artifacts/wasix/dash/dash.wasm
 /.claude/

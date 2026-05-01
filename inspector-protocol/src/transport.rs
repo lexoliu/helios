@@ -271,9 +271,7 @@ where
                 .clone()
                 .write_data(Vec::new(), params)
                 .await
-                .map_err(|source| {
-                    TransportError::io("transmit synchronous parameters", source)
-                })?;
+                .map_err(|source| TransportError::io("transmit synchronous parameters", source))?;
         }
 
         Ok((
@@ -298,8 +296,7 @@ where
         func: &str,
         _paths: impl Into<Arc<[Box<[Option<usize>]>]>> + Send,
     ) -> anyhow::Result<
-        impl Stream<Item = anyhow::Result<(Self::Context, Self::Outgoing, Self::Incoming)>>
-            + 'static,
+        impl Stream<Item = anyhow::Result<(Self::Context, Self::Outgoing, Self::Incoming)>> + 'static,
     > {
         let key = (instance.to_owned(), func.to_owned());
         let (tx, rx) = mpsc::channel(8);
@@ -1015,9 +1012,7 @@ where
                             },
                         )
                         .await
-                        .map_err(|source| {
-                            TransportError::io("reject remote invocation", source)
-                        })?;
+                        .map_err(|source| TransportError::io("reject remote invocation", source))?;
                         None
                     }
                 }

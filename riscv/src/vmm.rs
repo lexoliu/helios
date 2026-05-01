@@ -52,8 +52,8 @@ use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{
     AddressSpace, AddressSpaceError, PageFlags, Translation, VirtAddr, VirtRange,
 };
-use helios_kernel::custom_vm::{
-    self, CustomVmHooks, default_memory_image_free, default_memory_image_map_at,
+use helios_kernel::runtime_memory::{
+    self, RuntimeMemoryHooks, default_memory_image_free, default_memory_image_map_at,
     default_memory_image_new, default_page_size,
 };
 use helios_kernel::{allocate_user_frame_zeroed, deallocate_user_frame};
@@ -253,12 +253,10 @@ impl RiscvUserAddressSpace {
             if next > USER_VA_END {
                 return None;
             }
-            match self.next_va.compare_exchange(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
+            match self
+                .next_va
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => return Some(VirtRange::new(VirtAddr::new(current), byte_len)),
                 Err(observed) => current = observed,
             }
@@ -288,12 +286,7 @@ impl RiscvUserAddressSpace {
         unsafe { &mut *(phys as *mut [u64; PTE_COUNT]) }
     }
 
-    fn map_4k(
-        &self,
-        virt: usize,
-        phys: usize,
-        flags: u64,
-    ) -> Result<(), AddressSpaceError> {
+    fn map_4k(&self, virt: usize, phys: usize, flags: u64) -> Result<(), AddressSpaceError> {
         let l2 = self.root_table();
         let l2_index = (virt >> 30) & 0x1ff;
         let l1 = Self::ensure_intermediate(l2, l2_index);
@@ -305,8 +298,7 @@ impl RiscvUserAddressSpace {
             return Err(AddressSpaceError::Overlap);
         }
         let ppn = (phys as u64) >> PAGE_SHIFT;
-        *entry =
-            (ppn << PTE_PPN_SHIFT) | flags | PTE_VALID | PTE_USER | PTE_ACCESSED | PTE_DIRTY;
+        *entry = (ppn << PTE_PPN_SHIFT) | flags | PTE_VALID | PTE_USER | PTE_ACCESSED | PTE_DIRTY;
         sfence_vma_addr(virt);
         Ok(())
     }
@@ -355,8 +347,7 @@ impl RiscvUserAddressSpace {
             return Err(AddressSpaceError::NotCommitted);
         }
         let ppn = *entry >> PTE_PPN_SHIFT;
-        *entry =
-            (ppn << PTE_PPN_SHIFT) | flags | PTE_VALID | PTE_USER | PTE_ACCESSED | PTE_DIRTY;
+        *entry = (ppn << PTE_PPN_SHIFT) | flags | PTE_VALID | PTE_USER | PTE_ACCESSED | PTE_DIRTY;
         sfence_vma_addr(virt);
         Ok(())
     }
@@ -730,10 +721,7 @@ fn remove_committed_range(regions: &mut Vec<CommittedRegion>, range: VirtRange) 
         }
         if range.end().raw() < region.range.end().raw() {
             regions.push(CommittedRegion {
-                range: VirtRange::new(
-                    range.end(),
-                    region.range.end().raw() - range.end().raw(),
-                ),
+                range: VirtRange::new(range.end(), region.range.end().raw() - range.end().raw()),
                 flags: region.flags,
             });
         }
@@ -774,17 +762,15 @@ pub fn identity_map_range() -> Range<usize> {
 }
 
 /// Register the boot-time `RiscvUserAddressSpace` as the active
-/// wasmtime custom-virtual-memory backend. Must be called once on
+/// runtime custom-virtual-memory backend. Must be called once on
 /// the bootstrap hart, after `install_kernel_paging`, before any
-/// wasmtime engine is constructed.
-pub fn install_wasmtime_hooks() {
-    custom_vm::install_hooks(&RISCV_VMM_HOOKS);
+/// runtime engine is constructed.
+pub fn install_runtime_memory_hooks() {
+    runtime_memory::install_hooks(&RISCV_VMM_HOOKS);
 }
 
 fn user_as() -> &'static RiscvUserAddressSpace {
-    user_address_space().expect(
-        "RiscvUserAddressSpace accessed before install_kernel_paging",
-    )
+    user_address_space().expect("RiscvUserAddressSpace accessed before install_kernel_paging")
 }
 
 const ENOMEM: c_int = 12;
@@ -875,8 +861,8 @@ extern "C" fn riscv_mprotect(ptr: *mut u8, size: usize, prot_flags: u32) -> c_in
     }
 }
 
-/// Wasmtime custom-virtual-memory hook table for the riscv backend.
-pub static RISCV_VMM_HOOKS: CustomVmHooks = CustomVmHooks {
+/// Runtime custom-virtual-memory hook table for the riscv backend.
+pub static RISCV_VMM_HOOKS: RuntimeMemoryHooks = RuntimeMemoryHooks {
     mmap_new: riscv_mmap_new,
     mmap_remap: riscv_mmap_remap,
     munmap: riscv_munmap,

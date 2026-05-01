@@ -5,7 +5,9 @@
 //! the runtime through the traits defined in
 //! [`crate::component_runtime_backend`].
 
+pub(crate) mod artifact_profile;
 pub mod bindings;
+pub(crate) mod component_host;
 pub mod config;
 #[cfg(all(
     target_os = "none",
@@ -16,15 +18,27 @@ pub mod config;
     )
 ))]
 pub mod custom_vm;
+pub(crate) mod cwasm;
 pub mod engine;
 pub mod store;
+#[cfg(all(
+    target_os = "none",
+    any(
+        feature = "wasmtime-aarch64",
+        feature = "wasmtime-riscv64",
+        feature = "wasmtime-x86"
+    )
+))]
+mod sync;
+pub(crate) mod user_memory;
 pub mod wasi;
+pub(crate) mod wasix;
 
 use helios_hal::cpu::Cpu;
 use wasmtime::component::Component;
-use wasmtime::{Engine, Precompiled};
+use wasmtime::{Engine, Module, Precompiled};
 
-use crate::component_host::{
+use self::component_host::{
     ComponentBindingSet, HostRuntimeState, StoreData, component_linker, store_with_state,
 };
 use crate::{
@@ -33,12 +47,19 @@ use crate::{
     HostFileSystem,
 };
 
+const _: fn() -> bool = wasix::manifest_is_mapped;
+
 /// Wasmtime-backed compiled component artifact.
 pub struct WasmtimeCompiledComponent {
     pub(crate) component: Component,
 }
 
 impl CompiledComponent for WasmtimeCompiledComponent {}
+
+/// Wasmtime-backed compiled Preview1 core-module artifact.
+pub(crate) struct WasmtimeCompiledCoreModule {
+    pub(crate) module: Module,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WasmtimePrecompiledKind {
@@ -228,6 +249,7 @@ where
         let mut store = store_with_state(
             &engine.engine,
             StoreData::<CpuImpl, HostFs>::new(
+                wasmtime::component::ResourceTable::new(),
                 context.cpu,
                 context.timer,
                 context.spawner,
@@ -238,6 +260,7 @@ where
                 filesystem,
                 context.arguments,
                 context.environment,
+                context.process_authority,
                 context.output_mode,
                 context.serial_reader,
                 context.serial_writer,

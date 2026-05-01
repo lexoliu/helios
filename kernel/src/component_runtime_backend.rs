@@ -5,7 +5,7 @@ use core::future::Future;
 
 use crate::{
     ComponentOutputMode, ComponentRuntimeState, HostFileSystem, InstanceId, InstanceRegistry,
-    RegisteredInstance, Timer,
+    ProcessAuthority, RegisteredInstance, Timer,
 };
 use helios_hal::cpu::Cpu;
 
@@ -46,6 +46,7 @@ where
     pub host_filesystem_state: RuntimeStateImpl,
     pub arguments: Vec<alloc::string::String>,
     pub environment: Vec<(alloc::string::String, alloc::string::String)>,
+    pub process_authority: ProcessAuthority,
     pub output_mode: ComponentOutputMode,
     pub serial_reader: fn(u32) -> Vec<u8>,
     pub serial_writer: fn(&[u8]),
@@ -70,6 +71,7 @@ where
         host_filesystem_state: RuntimeStateImpl,
         arguments: Vec<alloc::string::String>,
         environment: Vec<(alloc::string::String, alloc::string::String)>,
+        process_authority: ProcessAuthority,
         output_mode: ComponentOutputMode,
         serial_reader: fn(u32) -> Vec<u8>,
         serial_writer: fn(&[u8]),
@@ -85,6 +87,7 @@ where
             host_filesystem_state,
             arguments,
             environment,
+            process_authority,
             output_mode,
             serial_reader,
             serial_writer,
@@ -112,8 +115,8 @@ pub trait ComponentRuntimeEngine: Clone + Send + Sync + 'static {
 pub struct ComponentRunResult {
     pub status: ComponentExitStatus,
     pub instance_id: InstanceId,
-    /// Exit code the guest requested via `wasi:cli/exit`, or 0/1
-    /// derived from the `wasi:cli/run.run` return value.
+    /// Exit code the guest requested via the runtime exit interface,
+    /// or 0/1 derived from the component run result.
     pub exit_code: u32,
 }
 
@@ -128,8 +131,7 @@ pub trait ComponentExecutor: Send + 'static {
 /// Factory that builds engines and executors from kernel-owned state.
 ///
 /// This is the top-level runtime abstraction: the kernel orchestration layer
-/// calls methods on this trait without knowing whether the backing runtime is
-/// Wasmtime, Wasmer, or anything else.
+/// calls methods on this trait without knowing which concrete runtime backs it.
 ///
 /// Each associated error type is runtime-specific and avoids heap-allocated
 /// strings.
@@ -151,7 +153,7 @@ where
     /// Instantiate a compiled component with the given world and execution
     /// context, producing an executor ready to be driven. Instantiation is
     /// async because backends typically resolve imports and run component
-    /// start functions that may await WASI host calls.
+    /// start functions that may await host calls.
     fn instantiate(
         &self,
         engine: &Self::Engine,

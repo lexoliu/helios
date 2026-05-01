@@ -127,26 +127,24 @@ fn supports_request(instance: &str, func: &str) -> bool {
         || debugger_programs::supports(instance, func)
 }
 
-async fn dispatch(
-    instance: &str,
-    func: &str,
-    payload: &[u8],
-) -> Result<Vec<u8>, DispatchError> {
+async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>, DispatchError> {
     match (instance, func) {
         (PROGRAMS_INSTANCE, PROGRAMS_EXEC) => {
-            let request = postcard::from_bytes::<programs::ExecRequest>(payload).map_err(
-                |source| DispatchError::Decode {
-                    operation: "programs.exec",
-                    source,
-                },
-            )?;
+            let request =
+                postcard::from_bytes::<programs::ExecRequest>(payload).map_err(|source| {
+                    DispatchError::Decode {
+                        operation: "programs.exec",
+                        source,
+                    }
+                })?;
             let response = host_programs::exec(host_programs::ExecRequest {
                 name: request.name,
                 args: request.args,
-                env: Vec::new(),
+                env: request.env,
                 path: request.path,
-                stdin: Vec::new(),
+                stdin: request.stdin,
                 hint: request.hint.map(map_aot_hint_to_host),
+                capability_grants: map_capability_grants_to_host(request.capability_grants),
             })
             .await;
             let response = response
@@ -160,7 +158,7 @@ async fn dispatch(
                 })
                 .map_err(|error| programs::ExecError {
                     kind: convert_launch_error_kind(error.kind),
-                    detail: error.detail,
+                    detail: error.detail.to_string(),
                 });
             postcard::to_allocvec(&response).map_err(|source| DispatchError::Encode {
                 operation: "programs.exec",
@@ -168,12 +166,13 @@ async fn dispatch(
             })
         }
         (PROGRAMS_INSTANCE, PROGRAMS_AOT) => {
-            let request = postcard::from_bytes::<programs::AotRequest>(payload).map_err(
-                |source| DispatchError::Decode {
-                    operation: "programs.aot",
-                    source,
-                },
-            )?;
+            let request =
+                postcard::from_bytes::<programs::AotRequest>(payload).map_err(|source| {
+                    DispatchError::Decode {
+                        operation: "programs.aot",
+                        source,
+                    }
+                })?;
             let response = host_programs::aot(host_programs::AotRequest {
                 source_path: request.source_path,
                 destination_path: request.destination_path,
@@ -187,7 +186,7 @@ async fn dispatch(
                 })
                 .map_err(|error| programs::ExecError {
                     kind: convert_launch_error_kind(error.kind),
-                    detail: error.detail,
+                    detail: error.detail.to_string(),
                 });
             postcard::to_allocvec(&response).map_err(|source| DispatchError::Encode {
                 operation: "programs.aot",
@@ -222,8 +221,8 @@ async fn dispatch(
             })
         }
         (TRACING_INSTANCE, TRACING_RECENT) => {
-            let (filter, limit): (tracing::Filter, u32) = postcard::from_bytes(payload)
-                .map_err(|source| DispatchError::Decode {
+            let (filter, limit): (tracing::Filter, u32) =
+                postcard::from_bytes(payload).map_err(|source| DispatchError::Decode {
                     operation: "tracing.recent",
                     source,
                 })?;
@@ -237,12 +236,11 @@ async fn dispatch(
             })
         }
         (PROFILING_INSTANCE, PROFILING_SET_ENABLED) => {
-            let enabled = postcard::from_bytes::<bool>(payload).map_err(|source| {
-                DispatchError::Decode {
+            let enabled =
+                postcard::from_bytes::<bool>(payload).map_err(|source| DispatchError::Decode {
                     operation: "profiling.set-enabled",
                     source,
-                }
-            })?;
+                })?;
             host_profiling::set_enabled(enabled);
             postcard::to_allocvec(&()).map_err(|source| DispatchError::Encode {
                 operation: "profiling.set-enabled",
@@ -262,8 +260,8 @@ async fn dispatch(
             })
         }
         (PROFILING_INSTANCE, PROFILING_FOLDED) => {
-            let (filter, limit): (profiling::Filter, u32) = postcard::from_bytes(payload)
-                .map_err(|source| DispatchError::Decode {
+            let (filter, limit): (profiling::Filter, u32) =
+                postcard::from_bytes(payload).map_err(|source| DispatchError::Decode {
                     operation: "profiling.folded",
                     source,
                 })?;
@@ -292,6 +290,129 @@ fn map_aot_hint_to_host(hint: programs::AotHint) -> host_programs::AotHint {
     }
 }
 
+fn map_capability_grants_to_host(
+    grants: Vec<programs::CapabilityGrant>,
+) -> Vec<host_programs::CapabilityGrant> {
+    grants
+        .into_iter()
+        .map(|grant| match grant {
+            programs::CapabilityGrant::Directory(grant) => {
+                host_programs::CapabilityGrant::Directory(host_programs::DirectoryGrant {
+                    source_path: grant.source_path,
+                    guest_name: grant.guest_name,
+                    rights: grant
+                        .rights
+                        .into_iter()
+                        .map(map_filesystem_right_to_host)
+                        .collect(),
+                })
+            }
+            programs::CapabilityGrant::Network(grant) => {
+                host_programs::CapabilityGrant::Network(host_programs::NetworkGrant {
+                    rights: grant
+                        .rights
+                        .into_iter()
+                        .map(map_network_right_to_host)
+                        .collect(),
+                })
+            }
+            programs::CapabilityGrant::Clock(grant) => {
+                host_programs::CapabilityGrant::Clock(host_programs::ClockGrant {
+                    rights: grant
+                        .rights
+                        .into_iter()
+                        .map(map_clock_right_to_host)
+                        .collect(),
+                })
+            }
+            programs::CapabilityGrant::Terminal(grant) => {
+                host_programs::CapabilityGrant::Terminal(host_programs::TerminalGrant {
+                    rights: grant
+                        .rights
+                        .into_iter()
+                        .map(map_terminal_right_to_host)
+                        .collect(),
+                })
+            }
+            programs::CapabilityGrant::Process(grant) => {
+                host_programs::CapabilityGrant::Process(host_programs::ProcessGrant {
+                    rights: grant
+                        .rights
+                        .into_iter()
+                        .map(map_process_right_to_host)
+                        .collect(),
+                })
+            }
+            programs::CapabilityGrant::Link(grant) => {
+                host_programs::CapabilityGrant::Link(host_programs::LinkGrant {
+                    rights: grant
+                        .rights
+                        .into_iter()
+                        .map(map_link_right_to_host)
+                        .collect(),
+                })
+            }
+        })
+        .collect()
+}
+
+fn map_filesystem_right_to_host(
+    right: programs::FilesystemRight,
+) -> host_programs::FilesystemRight {
+    match right {
+        programs::FilesystemRight::Read => host_programs::FilesystemRight::Read,
+        programs::FilesystemRight::Write => host_programs::FilesystemRight::Write,
+        programs::FilesystemRight::MutateDirectory => {
+            host_programs::FilesystemRight::MutateDirectory
+        }
+        programs::FilesystemRight::Execute => host_programs::FilesystemRight::Execute,
+    }
+}
+
+fn map_network_right_to_host(right: programs::NetworkRight) -> host_programs::NetworkRight {
+    match right {
+        programs::NetworkRight::Tcp => host_programs::NetworkRight::Tcp,
+        programs::NetworkRight::Udp => host_programs::NetworkRight::Udp,
+        programs::NetworkRight::Dns => host_programs::NetworkRight::Dns,
+        programs::NetworkRight::PrivilegedBind => host_programs::NetworkRight::PrivilegedBind,
+        programs::NetworkRight::Multicast => host_programs::NetworkRight::Multicast,
+        programs::NetworkRight::Admin => host_programs::NetworkRight::Admin,
+    }
+}
+
+fn map_clock_right_to_host(right: programs::ClockRight) -> host_programs::ClockRight {
+    match right {
+        programs::ClockRight::SetWallClock => host_programs::ClockRight::SetWallClock,
+    }
+}
+
+fn map_terminal_right_to_host(right: programs::TerminalRight) -> host_programs::TerminalRight {
+    match right {
+        programs::TerminalRight::Input => host_programs::TerminalRight::Input,
+        programs::TerminalRight::Output => host_programs::TerminalRight::Output,
+        programs::TerminalRight::Control => host_programs::TerminalRight::Control,
+    }
+}
+
+fn map_process_right_to_host(right: programs::ProcessRight) -> host_programs::ProcessRight {
+    match right {
+        programs::ProcessRight::Spawn => host_programs::ProcessRight::Spawn,
+        programs::ProcessRight::Exec => host_programs::ProcessRight::Exec,
+        programs::ProcessRight::Fork => host_programs::ProcessRight::Fork,
+        programs::ProcessRight::Join => host_programs::ProcessRight::Join,
+        programs::ProcessRight::Signal => host_programs::ProcessRight::Signal,
+    }
+}
+
+fn map_link_right_to_host(right: programs::LinkRight) -> host_programs::LinkRight {
+    match right {
+        programs::LinkRight::Source => host_programs::LinkRight::Source,
+        programs::LinkRight::TargetDirectory => host_programs::LinkRight::TargetDirectory,
+        programs::LinkRight::SymlinkCreate => host_programs::LinkRight::SymlinkCreate,
+        programs::LinkRight::SymlinkRead => host_programs::LinkRight::SymlinkRead,
+    }
+}
+
 fn convert_launch_error_kind(kind: host_programs::ExecErrorKind) -> programs::ExecErrorKind {
     match kind {
         host_programs::ExecErrorKind::InvalidBinary => programs::ExecErrorKind::InvalidBinary,
@@ -301,6 +422,7 @@ fn convert_launch_error_kind(kind: host_programs::ExecErrorKind) -> programs::Ex
         }
         host_programs::ExecErrorKind::InvalidSignature => programs::ExecErrorKind::InvalidSignature,
         host_programs::ExecErrorKind::InvalidPath => programs::ExecErrorKind::InvalidPath,
+        host_programs::ExecErrorKind::PermissionDenied => programs::ExecErrorKind::PermissionDenied,
         host_programs::ExecErrorKind::InvalidHint => programs::ExecErrorKind::InvalidHint,
         host_programs::ExecErrorKind::OutOfMemory => programs::ExecErrorKind::OutOfMemory,
         host_programs::ExecErrorKind::Unavailable => programs::ExecErrorKind::Unavailable,

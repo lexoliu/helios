@@ -1,6 +1,6 @@
 package helios:system@0.1.0;
 
-/// Spawn user wasm programs.
+/// Spawn user program artifacts.
 ///
 /// Two entry points are exposed:
 ///
@@ -20,13 +20,103 @@ package helios:system@0.1.0;
 /// interface boundary so the common case does not need to express
 /// streams in its wire format.
 interface programs {
-  /// Stable identifier for a live wasm instance, used by the observer.
+  /// Stable identifier for a live program instance, used by the observer.
   type instance-id = u64;
 
   enum aot-hint {
     fast,
     balanced,
     performance,
+  }
+
+  enum filesystem-right {
+    read,
+    write,
+    mutate-directory,
+    execute,
+  }
+
+  record directory-grant {
+    /// Directory path in the caller authority to derive from.
+    source-path: string,
+    /// Guest-visible preopen name in the child.
+    guest-name: string,
+    /// Rights granted to the child. These must be a subset of the
+    /// caller's rights for `source-path`.
+    rights: list<filesystem-right>,
+  }
+
+  enum network-right {
+    tcp,
+    udp,
+    dns,
+    privileged-bind,
+    multicast,
+    admin,
+  }
+
+  record network-grant {
+    /// Network rights granted to the child. These must be a subset of
+    /// the caller's network authority.
+    rights: list<network-right>,
+  }
+
+  enum clock-right {
+    set-wall-clock,
+  }
+
+  record clock-grant {
+    /// Clock rights granted to the child. These must be a subset of
+    /// the caller's clock authority.
+    rights: list<clock-right>,
+  }
+
+  enum terminal-right {
+    input,
+    output,
+    control,
+  }
+
+  record terminal-grant {
+    /// Terminal rights granted to the child. These must be a subset of
+    /// the caller's terminal authority.
+    rights: list<terminal-right>,
+  }
+
+  enum process-right {
+    spawn,
+    exec,
+    fork,
+    join,
+    signal,
+  }
+
+  record process-grant {
+    /// Process-control rights granted to the child. These must be a
+    /// subset of the caller's process authority.
+    rights: list<process-right>,
+  }
+
+  enum link-right {
+    source,
+    target-directory,
+    symlink-create,
+    symlink-read,
+  }
+
+  record link-grant {
+    /// Link rights granted to the child. These must be a subset of the
+    /// caller's link authority and are separate from directory write.
+    rights: list<link-right>,
+  }
+
+  variant capability-grant {
+    directory(directory-grant),
+    network(network-grant),
+    clock(clock-grant),
+    terminal(terminal-grant),
+    process(process-grant),
+    link(link-grant),
   }
 
   record spawn-request {
@@ -39,6 +129,10 @@ interface programs {
     env: list<tuple<string, string>>,
     /// Path to an executable the caller is allowed to access.
     path: string,
+    /// Explicit capabilities granted to the child. Empty means the
+    /// child starts with no filesystem authority beyond its private
+    /// stdio pipes.
+    capability-grants: list<capability-grant>,
   }
 
   record exec-request {
@@ -50,6 +144,10 @@ interface programs {
     /// immediately".
     stdin: list<u8>,
     hint: option<aot-hint>,
+    /// Explicit capabilities granted to the child. Empty means the
+    /// child starts with no filesystem authority beyond its private
+    /// stdio pipes.
+    capability-grants: list<capability-grant>,
   }
 
   record aot-request {
@@ -86,6 +184,7 @@ interface programs {
     unsupported-import,
     invalid-signature,
     invalid-path,
+    permission-denied,
     invalid-hint,
     out-of-memory,
     unavailable,
@@ -97,7 +196,7 @@ interface programs {
     detail: string,
   }
 
-  /// Back-compat alias — old callers still use `exec-error`.
+  /// `exec` and `spawn` share the same error shape.
   type exec-error-kind = spawn-error-kind;
   type exec-error = spawn-error;
 

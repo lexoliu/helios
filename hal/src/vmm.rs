@@ -1,16 +1,16 @@
 //! Virtual address-space contract.
 //!
-//! The kernel and every user-mode wasm guest share a single virtual
-//! address space today: kernel text and data are statically mapped at
-//! boot, MMIO is direct-mapped, and user memory lives in a high virtual
-//! window managed dynamically. WebAssembly sandboxing is enforced at the
-//! bytecode layer, not at the page-table layer, so a per-guest ASID is
+//! The kernel and user address regions share a single virtual address
+//! space today: kernel text and data are statically mapped at boot, MMIO
+//! is direct-mapped, and user memory lives in a high virtual window
+//! managed dynamically. Higher layers enforce their own
+//! isolation above this page-table contract, so a per-user ASID is
 //! intentionally not part of this contract.
 //!
 //! # Reservation / commit model
 //!
-//! The trait mirrors the same two-step model that POSIX `mmap` and
-//! Wasmtime's custom virtual-memory ABI both expose:
+//! The trait mirrors the same two-step reserve/commit model exposed by
+//! conventional virtual-memory APIs:
 //!
 //! 1. `reserve(size)` carves out a contiguous virtual range with no
 //!    physical backing. Accessing a reserved-but-uncommitted page
@@ -271,8 +271,8 @@ pub trait AddressSpace: Send + Sync + 'static {
     /// The default impl reports unsupported. Backends opt in only
     /// after the listed prerequisites are met, surfacing unsupported
     /// honestly rather than shipping a half-correct version that
-    /// races TLBs or hands Wasmtime a frame the page-fault handler
-    /// does not own.
+    /// races TLBs or hands an upper layer a frame the page-fault
+    /// handler does not own.
     fn relocate(&self, _virt: VirtRange) -> Result<(), AddressSpaceError> {
         Err(AddressSpaceError::InvalidFlags)
     }
@@ -284,9 +284,8 @@ pub enum PageFaultOutcome {
     /// Kernel installed (or restored) a mapping covering the faulting
     /// address. The faulting instruction should be retried.
     Resolved,
-    /// Fault is not the kernel VM's responsibility — for example a
-    /// wasm bounds-check trap into a guard region. The backend should
-    /// fall through to its language-runtime trap handler (Wasmtime).
+    /// Fault is not the kernel VM's responsibility; the backend should
+    /// report it to the next higher fault owner.
     NotOurs,
     /// Fault is fatal: no reservation, no policy. The backend should
     /// terminate the offending instance, or panic the kernel if no

@@ -10,13 +10,17 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll};
 
-use crate::WasiRights;
+use crate::{
+    ClockAuthorityRights, DirectoryAuthorityRights, LinkAuthorityRights, NetworkAuthorityRights,
+    ProcessAuthority, ProcessAuthorityError, TerminalAuthorityRights,
+};
 use crate::{
     ComponentCache, ComponentNetworkService, ComponentOutputMode, ComponentOutputStreamKind,
     ComponentStoreData, DeadlinePollable, EmbeddedComponent, ExecResult, ProgramExecError,
-    ProgramExecErrorKind, RawMutex, RawMutexGuardResource, RawMutexResource, RawRwLock,
-    RawRwLockReadGuardResource, RawRwLockResource, RawRwLockWriteGuardResource, SerialPortResource,
-    elapsed_millis, emit_serial_stage_marker, heap_stats, monotonic_nanos,
+    ProgramExecErrorDetail, ProgramExecErrorKind, RawMutex, RawMutexGuardResource,
+    RawMutexResource, RawRwLock, RawRwLockReadGuardResource, RawRwLockResource,
+    RawRwLockWriteGuardResource, SerialPortResource, elapsed_millis, emit_serial_stage_marker,
+    heap_stats, monotonic_nanos, user_heap_stats,
 };
 use helios_hal::cpu::Cpu;
 use helios_hal::serial::ByteSerial;
@@ -24,7 +28,7 @@ use spin::Mutex;
 use thiserror::Error;
 use wasmtime::component::{
     Access, Accessor, Component, Destination, FutureReader, HasSelf, Linker, Resource,
-    ResourceType, StreamProducer, StreamReader, StreamResult,
+    ResourceTable, ResourceType, StreamProducer, StreamReader, StreamResult,
 };
 use wasmtime::{self, Engine, Store, StoreContextMut};
 use wasmtime_wasi_io;
@@ -33,6 +37,7 @@ use crate::runtime_types::ComponentHostFilesystemState;
 use crate::wasmtime_adapter::bindings::debugger::bindings as debugger_bindings;
 use crate::wasmtime_adapter::bindings::program::bindings as program_bindings;
 use crate::wasmtime_adapter::config::AotCompileHint;
+use crate::wasmtime_adapter::cwasm::{self, ArtifactTrustError, UntrustedCwasm};
 use crate::wasmtime_adapter::wasi::ChannelStreamProducer;
 use crate::wasmtime_adapter::wasi::bindings::filesystem::types::ErrorCode as FsErrorCode;
 use crate::{
@@ -49,9 +54,14 @@ const INSTANCES_INSTANCE: &str = "helios:system/instances@0.1.0";
 const COMPONENT_CACHE_FRACTION: usize = 8;
 const COMPONENT_PHASE_HEARTBEAT_INTERVAL_NANOS: u64 = 5_000_000_000;
 
+mod network;
 pub mod service;
 mod topology;
 
+pub use network::{
+    ComponentHostNetworkService, ComponentHostTcpStreamToken, ComponentHostUdpSocketToken,
+    DynComponentHostNetworkService,
+};
 pub use service::{
     ChildExit, ChildHandle, UserProgramService, install_component_host_program_service,
     install_program_service, run_component_host_processor_forever, run_embedded_component_forever,
@@ -65,16 +75,17 @@ pub use topology::{
 
 pub type SbiSerialPort = crate::ComponentSerialPort;
 
-pub type NetworkTcpBackend = crate::ComponentTcpBackend<crate::DynamicNetworkService>;
-pub type NetworkUdpBackend = crate::ComponentUdpBackend<crate::DynamicNetworkService>;
+pub type NetworkTcpBackend = crate::ComponentTcpBackend<ComponentHostNetworkService>;
+pub type NetworkUdpBackend = crate::ComponentUdpBackend<ComponentHostNetworkService>;
 pub type SbiTcpStream = crate::ComponentTcpStream<NetworkTcpBackend>;
 pub type SbiUdpSocket = crate::ComponentUdpSocket<NetworkUdpBackend>;
 pub type HostRuntimeState<CpuImpl, HostFs> =
-    crate::RuntimeState<UserProgramService<CpuImpl, HostFs>, crate::DynamicNetworkService, HostFs>;
+    crate::RuntimeState<UserProgramService<CpuImpl, HostFs>, ComponentHostNetworkService, HostFs>;
 pub type StoreData<CpuImpl, HostFs> = ComponentStoreData<
     CpuImpl,
     HostRuntimeState<CpuImpl, HostFs>,
     crate::wasmtime_adapter::wasi::DebugFileSystem<HostRuntimeState<CpuImpl, HostFs>, HostFs>,
+    ResourceTable,
 >;
 pub type OutputMode = ComponentOutputMode;
 pub type OutputStreamKind = ComponentOutputStreamKind;
@@ -131,7 +142,7 @@ pub type SbiRawRwLockReadGuard = crate::ComponentRawRwLockReadGuard;
 pub type SbiRawRwLockWriteGuard = crate::ComponentRawRwLockWriteGuard;
 
 macro_rules! impl_program_bindings {
-    ($bindings:ident, $convert_result:ident, $convert_error:ident) => {
+    ($bindings:ident, $convert_result:ident, $convert_error:ident, $build_authority:ident) => {
         impl<CpuImpl, HostFs> $bindings::helios::system::programs::Host
             for StoreData<CpuImpl, HostFs>
         where
@@ -332,26 +343,37 @@ macro_rules! impl_program_bindings {
                     Ok::<_, wasmtime::Error>((
                         access.get().runtime_state.program_service(),
                         ProgramExecContext::from_store(access.get()),
+                        access.get().process_authority().clone(),
                     ))
                 });
                 async move {
-                    let (service, context) = snapshot?;
+                    let (service, context, caller_authority) = snapshot?;
                     let Some(service) = service else {
                         return Ok(Err($bindings::helios::system::programs::SpawnError {
                             kind: $bindings::helios::system::programs::SpawnErrorKind::Unavailable,
                             detail: "program spawn is unavailable on this machine".to_owned(),
                         }));
                     };
-                    let source = match read_program_source(accessor, &request.path).await {
-                        Ok(Ok(source)) => source,
-                        Ok(Err(error)) => return Ok(Err($convert_error(error))),
-                        Err(error) => {
-                            return Ok(Err($convert_error(map_program_host_error(
-                                "read spawn source",
-                                error,
-                            ))));
-                        }
-                    };
+                    if let Err(error) = require_spawn_authority(&caller_authority) {
+                        return Ok(Err($convert_error(error)));
+                    }
+                    let child_authority =
+                        match $build_authority(&caller_authority, request.capability_grants) {
+                            Ok(authority) => authority,
+                            Err(error) => return Ok(Err($convert_error(error))),
+                        };
+                    let source =
+                        match read_program_source(accessor, &request.path, &caller_authority).await
+                        {
+                            Ok(Ok(source)) => source,
+                            Ok(Err(error)) => return Ok(Err($convert_error(error))),
+                            Err(error) => {
+                                return Ok(Err($convert_error(map_program_host_error(
+                                    ProgramHostOperation::ReadSpawnSource,
+                                    error,
+                                ))));
+                            }
+                        };
                     match service
                         .spawn(
                             context,
@@ -360,7 +382,7 @@ macro_rules! impl_program_bindings {
                             request.env,
                             source,
                             None,
-                            WasiRights::empty(),
+                            child_authority,
                         )
                         .await
                     {
@@ -394,26 +416,37 @@ macro_rules! impl_program_bindings {
                     Ok::<_, wasmtime::Error>((
                         access.get().runtime_state.program_service(),
                         ProgramExecContext::from_store(access.get()),
+                        access.get().process_authority().clone(),
                     ))
                 });
                 async move {
-                    let (service, context) = snapshot?;
+                    let (service, context, caller_authority) = snapshot?;
                     let Some(service) = service else {
                         return Ok(Err($bindings::helios::system::programs::ExecError {
                             kind: $bindings::helios::system::programs::ExecErrorKind::Unavailable,
                             detail: "program exec is unavailable on this machine".to_owned(),
                         }));
                     };
-                    let source = match read_program_source(accessor, &request.path).await {
-                        Ok(Ok(source)) => source,
-                        Ok(Err(error)) => return Ok(Err($convert_error(error))),
-                        Err(error) => {
-                            return Ok(Err($convert_error(map_program_host_error(
-                                "read exec source",
-                                error,
-                            ))));
-                        }
-                    };
+                    if let Err(error) = require_exec_authority(&caller_authority) {
+                        return Ok(Err($convert_error(error)));
+                    }
+                    let child_authority =
+                        match $build_authority(&caller_authority, request.capability_grants) {
+                            Ok(authority) => authority,
+                            Err(error) => return Ok(Err($convert_error(error))),
+                        };
+                    let source =
+                        match read_program_source(accessor, &request.path, &caller_authority).await
+                        {
+                            Ok(Ok(source)) => source,
+                            Ok(Err(error)) => return Ok(Err($convert_error(error))),
+                            Err(error) => {
+                                return Ok(Err($convert_error(map_program_host_error(
+                                    ProgramHostOperation::ReadExecSource,
+                                    error,
+                                ))));
+                            }
+                        };
                     let hint = match request.hint {
                         Some($bindings::helios::system::programs::AotHint::Fast) => {
                             Some(AotCompileHint::Fast)
@@ -435,7 +468,7 @@ macro_rules! impl_program_bindings {
                             source,
                             hint,
                             request.stdin,
-                            WasiRights::empty(),
+                            child_authority,
                         )
                         .await
                         .map($convert_result)
@@ -458,22 +491,29 @@ macro_rules! impl_program_bindings {
                     Ok::<_, wasmtime::Error>((
                         access.get().runtime_state.program_service(),
                         ProgramExecContext::from_store(access.get()),
+                        access.get().process_authority().clone(),
                     ))
                 });
                 async move {
-                    let (service, context) = snapshot?;
+                    let (service, context, caller_authority) = snapshot?;
                     let Some(service) = service else {
                         return Ok(Err($bindings::helios::system::programs::ExecError {
                             kind: $bindings::helios::system::programs::ExecErrorKind::Unavailable,
                             detail: "program AOT is unavailable on this machine".to_owned(),
                         }));
                     };
-                    let source = match read_program_source(accessor, &request.source_path).await {
+                    let source = match read_program_source(
+                        accessor,
+                        &request.source_path,
+                        &caller_authority,
+                    )
+                    .await
+                    {
                         Ok(Ok(source)) => source,
                         Ok(Err(error)) => return Ok(Err($convert_error(error))),
                         Err(error) => {
                             return Ok(Err($convert_error(map_program_host_error(
-                                "read aot source",
+                                ProgramHostOperation::ReadAotSource,
                                 error,
                             ))));
                         }
@@ -497,14 +537,19 @@ macro_rules! impl_program_bindings {
                         Ok(artifact) => artifact,
                         Err(error) => return Ok(Err($convert_error(error))),
                     };
-                    match write_program_artifact(accessor, &request.destination_path, &artifact)
-                        .await
+                    match write_program_artifact(
+                        accessor,
+                        &request.destination_path,
+                        &artifact,
+                        &caller_authority,
+                    )
+                    .await
                     {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => return Ok(Err($convert_error(error))),
                         Err(error) => {
                             return Ok(Err($convert_error(map_program_host_error(
-                                "write aot artifact",
+                                ProgramHostOperation::WriteAotArtifact,
                                 error,
                             ))));
                         }
@@ -518,20 +563,508 @@ macro_rules! impl_program_bindings {
     };
 }
 
+macro_rules! impl_authority_conversion {
+    ($name:ident, $bindings:ident) => {
+        fn $name(
+            caller_authority: &ProcessAuthority,
+            grants: Vec<$bindings::helios::system::programs::CapabilityGrant>,
+        ) -> Result<ProcessAuthority, ProgramExecError> {
+            let mut authority = ProcessAuthority::empty();
+            for grant in grants {
+                match grant {
+                    $bindings::helios::system::programs::CapabilityGrant::Directory(
+                        directory,
+                    ) => {
+                        let mut rights = DirectoryAuthorityRights::empty();
+                        for right in directory.rights {
+                            rights |= match right {
+                                $bindings::helios::system::programs::FilesystemRight::Read => {
+                                    DirectoryAuthorityRights::READ
+                                }
+                                $bindings::helios::system::programs::FilesystemRight::Write => {
+                                    DirectoryAuthorityRights::WRITE
+                                }
+                                $bindings::helios::system::programs::FilesystemRight::MutateDirectory => {
+                                    DirectoryAuthorityRights::MUTATE_DIRECTORY
+                                }
+                                $bindings::helios::system::programs::FilesystemRight::Execute => {
+                                    DirectoryAuthorityRights::EXECUTE
+                                }
+                            };
+                        }
+                        let preopen = caller_authority
+                            .derive_directory_preopen(
+                                directory.source_path,
+                                directory.guest_name,
+                                rights,
+                            )
+                            .map_err(map_process_authority_error)?;
+                        if authority.cwd().is_none()
+                            && preopen.guest_name() == "/"
+                            && preopen.rights().contains(DirectoryAuthorityRights::READ)
+                        {
+                            let cwd = caller_authority
+                                .derive_directory_cap(
+                                    preopen.source_path(),
+                                    preopen.guest_name(),
+                                    DirectoryAuthorityRights::READ,
+                                )
+                                .map_err(map_process_authority_error)?;
+                            authority.chdir(cwd);
+                        }
+                        authority.insert_directory_preopen(preopen);
+                    }
+                    $bindings::helios::system::programs::CapabilityGrant::Network(network) => {
+                        let mut rights = NetworkAuthorityRights::empty();
+                        for right in network.rights {
+                            rights |= match right {
+                                $bindings::helios::system::programs::NetworkRight::Tcp => {
+                                    NetworkAuthorityRights::TCP
+                                }
+                                $bindings::helios::system::programs::NetworkRight::Udp => {
+                                    NetworkAuthorityRights::UDP
+                                }
+                                $bindings::helios::system::programs::NetworkRight::Dns => {
+                                    NetworkAuthorityRights::DNS
+                                }
+                                $bindings::helios::system::programs::NetworkRight::PrivilegedBind => {
+                                    NetworkAuthorityRights::PRIVILEGED_BIND
+                                }
+                                $bindings::helios::system::programs::NetworkRight::Multicast => {
+                                    NetworkAuthorityRights::MULTICAST
+                                }
+                                $bindings::helios::system::programs::NetworkRight::Admin => {
+                                    NetworkAuthorityRights::ADMIN
+                                }
+                            };
+                        }
+                        let rights = caller_authority
+                            .derive_network_rights(rights)
+                            .map_err(map_process_authority_error)?;
+                        authority.grant_network_rights(rights);
+                    }
+                    $bindings::helios::system::programs::CapabilityGrant::Clock(clock) => {
+                        let mut rights = ClockAuthorityRights::empty();
+                        for right in clock.rights {
+                            rights |= match right {
+                                $bindings::helios::system::programs::ClockRight::SetWallClock => {
+                                    ClockAuthorityRights::SET_WALL_CLOCK
+                                }
+                            };
+                        }
+                        let rights = caller_authority
+                            .derive_clock_rights(rights)
+                            .map_err(map_process_authority_error)?;
+                        authority.grant_clock_rights(rights);
+                    }
+                    $bindings::helios::system::programs::CapabilityGrant::Terminal(terminal) => {
+                        let mut rights = TerminalAuthorityRights::empty();
+                        for right in terminal.rights {
+                            rights |= match right {
+                                $bindings::helios::system::programs::TerminalRight::Input => {
+                                    TerminalAuthorityRights::INPUT
+                                }
+                                $bindings::helios::system::programs::TerminalRight::Output => {
+                                    TerminalAuthorityRights::OUTPUT
+                                }
+                                $bindings::helios::system::programs::TerminalRight::Control => {
+                                    TerminalAuthorityRights::CONTROL
+                                }
+                            };
+                        }
+                        let rights = caller_authority
+                            .derive_terminal_rights(rights)
+                            .map_err(map_process_authority_error)?;
+                        authority.grant_terminal_rights(rights);
+                    }
+                    $bindings::helios::system::programs::CapabilityGrant::Process(process) => {
+                        let mut rights = crate::ProcessAuthorityRights::empty();
+                        for right in process.rights {
+                            rights |= match right {
+                                $bindings::helios::system::programs::ProcessRight::Spawn => {
+                                    crate::ProcessAuthorityRights::SPAWN
+                                }
+                                $bindings::helios::system::programs::ProcessRight::Exec => {
+                                    crate::ProcessAuthorityRights::EXEC
+                                }
+                                $bindings::helios::system::programs::ProcessRight::Fork => {
+                                    crate::ProcessAuthorityRights::FORK
+                                }
+                                $bindings::helios::system::programs::ProcessRight::Join => {
+                                    crate::ProcessAuthorityRights::JOIN
+                                }
+                                $bindings::helios::system::programs::ProcessRight::Signal => {
+                                    crate::ProcessAuthorityRights::SIGNAL
+                                }
+                            };
+                        }
+                        let rights = caller_authority
+                            .derive_process_rights(rights)
+                            .map_err(map_process_authority_error)?;
+                        authority.grant_process_rights(rights);
+                    }
+                    $bindings::helios::system::programs::CapabilityGrant::Link(link) => {
+                        let mut rights = LinkAuthorityRights::empty();
+                        for right in link.rights {
+                            rights |= match right {
+                                $bindings::helios::system::programs::LinkRight::Source => {
+                                    LinkAuthorityRights::SOURCE
+                                }
+                                $bindings::helios::system::programs::LinkRight::TargetDirectory => {
+                                    LinkAuthorityRights::TARGET_DIRECTORY
+                                }
+                                $bindings::helios::system::programs::LinkRight::SymlinkCreate => {
+                                    LinkAuthorityRights::SYMLINK_CREATE
+                                }
+                                $bindings::helios::system::programs::LinkRight::SymlinkRead => {
+                                    LinkAuthorityRights::SYMLINK_READ
+                                }
+                            };
+                        }
+                        let rights = caller_authority
+                            .derive_link_rights(rights)
+                            .map_err(map_process_authority_error)?;
+                        authority.grant_link_rights(rights);
+                    }
+                }
+            }
+            Ok(authority)
+        }
+    };
+}
+
+impl_authority_conversion!(build_debugger_child_authority, debugger_bindings);
+impl_authority_conversion!(build_program_child_authority, program_bindings);
+
+fn require_spawn_authority(
+    caller_authority: &ProcessAuthority,
+) -> Result<(), crate::ProgramExecError> {
+    caller_authority
+        .derive_spawn_authority()
+        .map(drop)
+        .map_err(map_process_authority_error)
+}
+
+fn require_exec_authority(
+    caller_authority: &ProcessAuthority,
+) -> Result<(), crate::ProgramExecError> {
+    caller_authority
+        .derive_exec_authority()
+        .map(drop)
+        .map_err(map_process_authority_error)
+}
+
 impl_program_bindings!(
     debugger_bindings,
     convert_launch_result,
-    convert_launch_error
+    convert_launch_error,
+    build_debugger_child_authority
 );
 impl_program_bindings!(
     program_bindings,
     convert_program_launch_result,
-    convert_program_launch_error
+    convert_program_launch_error,
+    build_program_child_authority
 );
+
+#[cfg(test)]
+mod authority_tests {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use super::{
+        build_program_child_authority, dns_network_rights, program_bindings,
+        require_exec_authority, require_spawn_authority, tcp_connect_network_rights,
+        udp_bind_network_rights,
+    };
+    use crate::{
+        ClockAuthorityRights, DirectoryAuthorityRights, DirectoryPreopen, LinkAuthorityRights,
+        NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityRights, TerminalAuthorityRights,
+    };
+
+    use program_bindings::helios::system::programs::{
+        CapabilityGrant, ClockGrant, ClockRight, DirectoryGrant, FilesystemRight, LinkGrant,
+        LinkRight, NetworkGrant, NetworkRight, ProcessGrant, ProcessRight, TerminalGrant,
+        TerminalRight,
+    };
+
+    fn directory_grant(
+        source_path: &str,
+        guest_name: &str,
+        rights: Vec<FilesystemRight>,
+    ) -> CapabilityGrant {
+        CapabilityGrant::Directory(DirectoryGrant {
+            source_path: source_path.into(),
+            guest_name: guest_name.into(),
+            rights,
+        })
+    }
+
+    fn network_grant(rights: Vec<NetworkRight>) -> CapabilityGrant {
+        CapabilityGrant::Network(NetworkGrant { rights })
+    }
+
+    fn clock_grant(rights: Vec<ClockRight>) -> CapabilityGrant {
+        CapabilityGrant::Clock(ClockGrant { rights })
+    }
+
+    fn terminal_grant(rights: Vec<TerminalRight>) -> CapabilityGrant {
+        CapabilityGrant::Terminal(TerminalGrant { rights })
+    }
+
+    fn process_grant(rights: Vec<ProcessRight>) -> CapabilityGrant {
+        CapabilityGrant::Process(ProcessGrant { rights })
+    }
+
+    fn link_grant(rights: Vec<LinkRight>) -> CapabilityGrant {
+        CapabilityGrant::Link(LinkGrant { rights })
+    }
+
+    #[test]
+    fn empty_grants_create_zero_child_authority() {
+        let child = build_program_child_authority(&ProcessAuthority::root(), Vec::new())
+            .expect("empty grants must be a valid zero-authority child");
+
+        assert!(child.directory_preopens().is_empty());
+        assert!(child.network_rights().is_empty());
+        assert!(child.clock_rights().is_empty());
+        assert!(child.terminal_rights().is_empty());
+        assert!(child.process_rights().is_empty());
+        assert!(child.link_rights().is_empty());
+        assert!(child.cwd().is_none());
+    }
+
+    #[test]
+    fn explicit_grant_derives_subset_from_caller_authority() {
+        let child = build_program_child_authority(
+            &ProcessAuthority::root(),
+            vec![directory_grant(
+                "/bin",
+                "/tools",
+                vec![FilesystemRight::Read, FilesystemRight::Execute],
+            )],
+        )
+        .expect("root authority may derive a narrower executable directory");
+
+        let [preopen] = child.directory_preopens() else {
+            panic!("expected exactly one derived preopen");
+        };
+        assert_eq!(preopen.source_path(), "/bin");
+        assert_eq!(preopen.guest_name(), "/tools");
+        assert_eq!(
+            preopen.rights(),
+            DirectoryAuthorityRights::READ | DirectoryAuthorityRights::EXECUTE
+        );
+        assert!(child.cwd().is_none());
+    }
+
+    #[test]
+    fn explicit_root_directory_grant_sets_child_cwd_from_capability() {
+        let child = build_program_child_authority(
+            &ProcessAuthority::root(),
+            vec![directory_grant("/", "/", vec![FilesystemRight::Read])],
+        )
+        .expect("explicit root directory grant may establish initial cwd");
+
+        assert_eq!(
+            child.cwd().expect("root directory grant should set cwd"),
+            &DirectoryPreopen::new("/", "/", DirectoryAuthorityRights::READ)
+                .expect("expected cwd should be valid")
+        );
+    }
+
+    #[test]
+    fn non_read_root_directory_grant_does_not_create_cwd() {
+        let child = build_program_child_authority(
+            &ProcessAuthority::root(),
+            vec![directory_grant("/", "/", vec![FilesystemRight::Execute])],
+        )
+        .expect("executable root directory grant is valid");
+
+        assert!(child.cwd().is_none());
+    }
+
+    #[test]
+    fn explicit_grant_rejects_right_widening() {
+        let mut caller = ProcessAuthority::empty();
+        caller.insert_directory_preopen(
+            DirectoryPreopen::new("/bin", "/", DirectoryAuthorityRights::READ)
+                .expect("test authority must be valid"),
+        );
+
+        let error = build_program_child_authority(
+            &caller,
+            vec![directory_grant(
+                "/bin",
+                "/",
+                vec![FilesystemRight::Read, FilesystemRight::Write],
+            )],
+        )
+        .expect_err("write must not be derived from read-only caller authority");
+
+        assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn explicit_grant_rejects_path_escape() {
+        let error = build_program_child_authority(
+            &ProcessAuthority::root(),
+            vec![directory_grant("../bin", "/", vec![FilesystemRight::Read])],
+        )
+        .expect_err("relative escape must not be accepted as a grant source");
+
+        assert_eq!(error.kind, crate::ProgramExecErrorKind::InvalidPath);
+    }
+
+    #[test]
+    fn network_grant_derives_subset_from_caller_authority() {
+        let mut caller = ProcessAuthority::empty();
+        caller.grant_network_rights(NetworkAuthorityRights::TCP | NetworkAuthorityRights::DNS);
+
+        let child =
+            build_program_child_authority(&caller, vec![network_grant(vec![NetworkRight::Tcp])])
+                .expect("network child grant may derive a subset");
+
+        assert_eq!(child.network_rights(), NetworkAuthorityRights::TCP);
+    }
+
+    #[test]
+    fn network_grant_rejects_right_widening() {
+        let mut caller = ProcessAuthority::empty();
+        caller.grant_network_rights(NetworkAuthorityRights::DNS);
+
+        let error =
+            build_program_child_authority(&caller, vec![network_grant(vec![NetworkRight::Tcp])])
+                .expect_err("TCP must not be created from DNS-only authority");
+
+        assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn clock_grant_derives_subset_from_caller_authority() {
+        let mut caller = ProcessAuthority::empty();
+        caller.grant_clock_rights(ClockAuthorityRights::SET_WALL_CLOCK);
+
+        let child = build_program_child_authority(
+            &caller,
+            vec![clock_grant(vec![ClockRight::SetWallClock])],
+        )
+        .expect("clock child grant may derive a subset");
+
+        assert_eq!(child.clock_rights(), ClockAuthorityRights::SET_WALL_CLOCK);
+    }
+
+    #[test]
+    fn terminal_grant_derives_subset_from_caller_authority() {
+        let mut caller = ProcessAuthority::empty();
+        caller.grant_terminal_rights(TerminalAuthorityRights::OUTPUT);
+
+        let child = build_program_child_authority(
+            &caller,
+            vec![terminal_grant(vec![TerminalRight::Output])],
+        )
+        .expect("terminal child grant may derive a subset");
+
+        assert_eq!(child.terminal_rights(), TerminalAuthorityRights::OUTPUT);
+    }
+
+    #[test]
+    fn process_grant_derives_subset_from_caller_authority() {
+        let mut caller = ProcessAuthority::empty();
+        caller.grant_process_rights(ProcessAuthorityRights::SPAWN | ProcessAuthorityRights::JOIN);
+
+        let child =
+            build_program_child_authority(&caller, vec![process_grant(vec![ProcessRight::Spawn])])
+                .expect("process child grant may derive a subset");
+
+        assert_eq!(child.process_rights(), ProcessAuthorityRights::SPAWN);
+    }
+
+    #[test]
+    fn process_grant_rejects_right_widening() {
+        let mut caller = ProcessAuthority::empty();
+        caller.grant_process_rights(ProcessAuthorityRights::JOIN);
+
+        let error =
+            build_program_child_authority(&caller, vec![process_grant(vec![ProcessRight::Spawn])])
+                .expect_err("spawn must not be created from join-only authority");
+
+        assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn link_grant_derives_subset_from_caller_authority() {
+        let mut caller = ProcessAuthority::empty();
+        caller.grant_link_rights(LinkAuthorityRights::SOURCE | LinkAuthorityRights::SYMLINK_READ);
+
+        let child = build_program_child_authority(
+            &caller,
+            vec![link_grant(vec![LinkRight::Source, LinkRight::SymlinkRead])],
+        )
+        .expect("link child grant may derive a subset");
+
+        assert_eq!(
+            child.link_rights(),
+            LinkAuthorityRights::SOURCE | LinkAuthorityRights::SYMLINK_READ
+        );
+    }
+
+    #[test]
+    fn link_grant_rejects_right_widening() {
+        let mut caller = ProcessAuthority::empty();
+        caller.grant_link_rights(LinkAuthorityRights::SYMLINK_READ);
+
+        let error = build_program_child_authority(
+            &caller,
+            vec![link_grant(vec![LinkRight::SymlinkCreate])],
+        )
+        .expect_err("symlink-create must not be created from readlink-only authority");
+
+        assert_eq!(error.kind, crate::ProgramExecErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn network_operations_require_typed_capability_sets() {
+        assert_eq!(dns_network_rights(), NetworkAuthorityRights::DNS);
+        assert_eq!(
+            tcp_connect_network_rights(),
+            NetworkAuthorityRights::TCP | NetworkAuthorityRights::DNS
+        );
+        assert_eq!(udp_bind_network_rights(0), NetworkAuthorityRights::UDP);
+        assert_eq!(udp_bind_network_rights(1024), NetworkAuthorityRights::UDP);
+        assert_eq!(
+            udp_bind_network_rights(80),
+            NetworkAuthorityRights::UDP | NetworkAuthorityRights::PRIVILEGED_BIND
+        );
+    }
+
+    #[test]
+    fn program_spawn_and_exec_require_process_authority() {
+        let caller = ProcessAuthority::empty();
+        assert_eq!(
+            require_spawn_authority(&caller)
+                .expect_err("spawn authority must be explicit")
+                .kind,
+            crate::ProgramExecErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            require_exec_authority(&caller)
+                .expect_err("exec authority must be explicit")
+                .kind,
+            crate::ProgramExecErrorKind::PermissionDenied
+        );
+
+        let mut caller = ProcessAuthority::empty();
+        caller.grant_process_rights(ProcessAuthorityRights::SPAWN | ProcessAuthorityRights::EXEC);
+        require_spawn_authority(&caller).expect("spawn authority should be accepted");
+        require_exec_authority(&caller).expect("exec authority should be accepted");
+    }
+}
 
 async fn read_program_source<T, CpuImpl, HostFs>(
     accessor: &Accessor<T, HasSelf<StoreData<CpuImpl, HostFs>>>,
     path: &str,
+    authority: &ProcessAuthority,
 ) -> wasmtime::Result<Result<service::ProgramSource, crate::ProgramExecError>>
 where
     CpuImpl: Cpu + Clone,
@@ -539,6 +1072,12 @@ where
 {
     let absolute =
         crate::resolve_guest_path("/", path).map_err(map_component_fs_path_error_to_wasmtime)?;
+    if !authority.can_load_program(&absolute) {
+        return Ok(Err(ProgramExecError {
+            kind: ProgramExecErrorKind::PermissionDenied,
+            detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
+        }));
+    }
     let host_path = crate::guest_host_share_path(&absolute).map(str::to_owned);
     if let Some(host_path) = host_path {
         let host_service = accessor.with(|mut access| {
@@ -547,16 +1086,19 @@ where
         let Some(host_service) = host_service else {
             return Ok(Err(ProgramExecError {
                 kind: ProgramExecErrorKind::Unavailable,
-                detail: "host filesystem service is unavailable".into(),
+                detail: ProgramExecErrorDetail::HostFilesystemUnavailable,
             }));
         };
         return Ok(host_service
             .read_file(&host_path)
             .await
             .map(|bytes| classify_program_source(bytes::Bytes::from(bytes), false))
-            .map_err(|error| ProgramExecError {
-                kind: ProgramExecErrorKind::InvalidPath,
-                detail: format!("failed to read {}: {error}", absolute),
+            .map_err(|error| {
+                tracing::error!(path = %absolute, ?error, "failed to read program source");
+                ProgramExecError {
+                    kind: ProgramExecErrorKind::InvalidPath,
+                    detail: ProgramExecErrorDetail::FilesystemOperationFailed,
+                }
             }));
     }
 
@@ -579,6 +1121,7 @@ async fn write_program_artifact<T, CpuImpl, HostFs>(
     accessor: &Accessor<T, HasSelf<StoreData<CpuImpl, HostFs>>>,
     path: &str,
     bytes: &[u8],
+    authority: &ProcessAuthority,
 ) -> wasmtime::Result<Result<(), crate::ProgramExecError>>
 where
     CpuImpl: Cpu + Clone,
@@ -586,6 +1129,12 @@ where
 {
     let absolute =
         crate::resolve_guest_path("/", path).map_err(map_component_fs_path_error_to_wasmtime)?;
+    if !authority.can_create_or_replace_path(&absolute) {
+        return Ok(Err(ProgramExecError {
+            kind: ProgramExecErrorKind::PermissionDenied,
+            detail: ProgramExecErrorDetail::ProgramArtifactDestinationNotGranted,
+        }));
+    }
     let host_path = crate::guest_host_share_path(&absolute).map(str::to_owned);
     if let Some(host_path) = host_path {
         let host_service = accessor.with(|mut access| {
@@ -594,27 +1143,35 @@ where
         let Some(host_service) = host_service else {
             return Ok(Err(ProgramExecError {
                 kind: ProgramExecErrorKind::Unavailable,
-                detail: "host filesystem service is unavailable".into(),
+                detail: ProgramExecErrorDetail::HostFilesystemUnavailable,
             }));
         };
         if let Err(truncate_error) = host_service.truncate_file(&host_path).await {
             host_service
                 .create_file(&host_path)
                 .await
-                .map_err(|create_error| ProgramExecError {
-                    kind: ProgramExecErrorKind::InvalidPath,
-                    detail: format!(
-                        "failed to prepare {}: truncate={truncate_error}, create={create_error}",
-                        absolute
-                    ),
+                .map_err(|create_error| {
+                    tracing::error!(
+                        path = %absolute,
+                        ?truncate_error,
+                        ?create_error,
+                        "failed to prepare program artifact destination"
+                    );
+                    ProgramExecError {
+                        kind: ProgramExecErrorKind::InvalidPath,
+                        detail: ProgramExecErrorDetail::FilesystemOperationFailed,
+                    }
                 })?;
         }
         host_service
             .write_file(&host_path, 0, bytes)
             .await
-            .map_err(|error| ProgramExecError {
-                kind: ProgramExecErrorKind::InvalidPath,
-                detail: format!("failed to write {}: {error}", absolute),
+            .map_err(|error| {
+                tracing::error!(path = %absolute, ?error, "failed to write program artifact");
+                ProgramExecError {
+                    kind: ProgramExecErrorKind::InvalidPath,
+                    detail: ProgramExecErrorDetail::FilesystemOperationFailed,
+                }
             })?;
         return Ok(Ok(()));
     }
@@ -631,7 +1188,7 @@ where
 }
 
 fn classify_program_source(bytes: bytes::Bytes, readonly: bool) -> ProgramSource {
-    let is_cwasm = crate::is_cwasm(&bytes);
+    let is_cwasm = cwasm::is_cwasm(&bytes);
     if is_cwasm {
         if readonly {
             return ProgramSource::BootfsArtifact(bytes);
@@ -642,6 +1199,7 @@ fn classify_program_source(bytes: bytes::Bytes, readonly: bool) -> ProgramSource
 }
 
 fn map_fs_error_to_program_exec(error: FsErrorCode) -> crate::ProgramExecError {
+    tracing::error!(?error, "filesystem operation failed during program exec");
     let kind = match error {
         FsErrorCode::NoEntry | FsErrorCode::NotDirectory | FsErrorCode::BadDescriptor => {
             crate::ProgramExecErrorKind::InvalidPath
@@ -657,18 +1215,56 @@ fn map_fs_error_to_program_exec(error: FsErrorCode) -> crate::ProgramExecError {
     };
     crate::ProgramExecError {
         kind,
-        detail: error.to_string(),
+        detail: ProgramExecErrorDetail::FilesystemOperationFailed,
     }
 }
 
 fn map_component_fs_path_error_to_wasmtime(error: crate::ComponentFsPathError) -> wasmtime::Error {
-    wasmtime::Error::msg(error.to_string())
+    wasmtime::Error::new(error)
 }
 
-fn map_program_host_error(operation: &str, error: wasmtime::Error) -> crate::ProgramExecError {
+fn map_process_authority_error(error: ProcessAuthorityError) -> crate::ProgramExecError {
+    tracing::error!(?error, "process authority rejected program operation");
+    let kind = match error {
+        ProcessAuthorityError::InvalidPath(_) | ProcessAuthorityError::EmptyRights => {
+            crate::ProgramExecErrorKind::InvalidPath
+        }
+        ProcessAuthorityError::EmptyNetworkRights
+        | ProcessAuthorityError::EmptyClockRights
+        | ProcessAuthorityError::EmptyTerminalRights
+        | ProcessAuthorityError::EmptyProcessRights
+        | ProcessAuthorityError::DirectoryGrantExceedsAuthority(_)
+        | ProcessAuthorityError::NetworkGrantExceedsAuthority(_)
+        | ProcessAuthorityError::ClockGrantExceedsAuthority(_)
+        | ProcessAuthorityError::TerminalGrantExceedsAuthority(_)
+        | ProcessAuthorityError::ProcessGrantExceedsAuthority(_)
+        | ProcessAuthorityError::EmptyLinkRights
+        | ProcessAuthorityError::LinkGrantExceedsAuthority(_) => {
+            crate::ProgramExecErrorKind::PermissionDenied
+        }
+    };
+    crate::ProgramExecError {
+        kind,
+        detail: ProgramExecErrorDetail::ProcessAuthorityDenied,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProgramHostOperation {
+    ReadSpawnSource,
+    ReadExecSource,
+    ReadAotSource,
+    WriteAotArtifact,
+}
+
+fn map_program_host_error(
+    operation: ProgramHostOperation,
+    error: wasmtime::Error,
+) -> crate::ProgramExecError {
+    tracing::error!(?operation, ?error, "program host operation failed");
     crate::ProgramExecError {
         kind: crate::ProgramExecErrorKind::Internal,
-        detail: format!("{operation} failed in program host: {error:#}"),
+        detail: ProgramExecErrorDetail::HostOperationFailed,
     }
 }
 
@@ -712,7 +1308,7 @@ where
         component = component_name,
         "loading embedded system component artifact"
     );
-    let trusted = crate::trust_bootfs_artifact(crate::UntrustedCwasm::new(component.bytes()))
+    let trusted = cwasm::trust_bootfs_artifact(UntrustedCwasm::new(component.bytes()))
         .map_err(DebuggerError::TrustComponent)?;
     let compiled = crate::wasmtime_adapter::WasmtimeCompiledComponent {
         component: unsafe {
@@ -749,6 +1345,7 @@ where
         debug_state.clone(),
         Vec::new(),
         Vec::new(),
+        ProcessAuthority::root(),
         OutputMode::Serial,
         read_serial,
         write_serial,
@@ -770,7 +1367,6 @@ where
     instantiate_done.store(true, Ordering::Release);
     let executor = executor.map_err(DebuggerError::InstantiateComponent)?;
     emit_stage_marker(write_serial, "instantiate:ok");
-    debug_state.retire_bootfs();
 
     tracing::info!(component = component_name, "entering wasi:cli/run");
     emit_stage_marker(write_serial, "run:begin");
@@ -1083,6 +1679,22 @@ where
     Ok(())
 }
 
+fn dns_network_rights() -> NetworkAuthorityRights {
+    NetworkAuthorityRights::DNS
+}
+
+fn tcp_connect_network_rights() -> NetworkAuthorityRights {
+    NetworkAuthorityRights::TCP | NetworkAuthorityRights::DNS
+}
+
+fn udp_bind_network_rights(local_port: u16) -> NetworkAuthorityRights {
+    if local_port != 0 && local_port < 1024 {
+        NetworkAuthorityRights::UDP | NetworkAuthorityRights::PRIVILEGED_BIND
+    } else {
+        NetworkAuthorityRights::UDP
+    }
+}
+
 fn add_net_to_linker<CpuImpl, HostFs>(
     linker: &mut Linker<StoreData<CpuImpl, HostFs>>,
 ) -> wasmtime::Result<()>
@@ -1135,6 +1747,24 @@ where
         "ping",
         |accessor: &Accessor<StoreData<CpuImpl, HostFs>>, (host, timeout): (String, u64)| {
             Box::pin(async move {
+                let has_authority = accessor.with(|mut access| {
+                    Ok::<_, wasmtime::Error>(
+                        access
+                            .get()
+                            .process_authority()
+                            .network_rights()
+                            .contains(dns_network_rights()),
+                    )
+                })?;
+                if !has_authority {
+                    return Ok::<_, wasmtime::Error>((Err(
+                        debugger_bindings::helios::system::net::PingError {
+                            kind:
+                                debugger_bindings::helios::system::net::PingErrorKind::Unavailable,
+                            detail: "network authority is missing DNS rights".to_owned(),
+                        },
+                    ),));
+                }
                 let service = accessor.with(|mut access| {
                     Ok::<_, wasmtime::Error>(access.get().runtime_state.network_service())
                 })?;
@@ -1161,6 +1791,18 @@ where
         |accessor: &Accessor<StoreData<CpuImpl, HostFs>>,
          (host, port, timeout): (String, u16, u64)| {
             Box::pin(async move {
+                let has_authority = accessor.with(|mut access| {
+                    Ok::<_, wasmtime::Error>(
+                        access
+                            .get()
+                            .process_authority()
+                            .network_rights()
+                            .contains(tcp_connect_network_rights()),
+                    )
+                })?;
+                if !has_authority {
+                    return Ok::<_, wasmtime::Error>((Err(unavailable_tcp_authority_error()),));
+                }
                 let service = accessor.with(|mut access| {
                     Ok::<_, wasmtime::Error>(access.get().runtime_state.network_service())
                 })?;
@@ -1191,6 +1833,19 @@ where
         "udp-bind",
         |accessor: &Accessor<StoreData<CpuImpl, HostFs>>, (local_port,): (u16,)| {
             Box::pin(async move {
+                let required = udp_bind_network_rights(local_port);
+                let has_authority = accessor.with(|mut access| {
+                    Ok::<_, wasmtime::Error>(
+                        access
+                            .get()
+                            .process_authority()
+                            .network_rights()
+                            .contains(required),
+                    )
+                })?;
+                if !has_authority {
+                    return Ok::<_, wasmtime::Error>((Err(unavailable_udp_authority_error()),));
+                }
                 let service = accessor.with(|mut access| {
                     Ok::<_, wasmtime::Error>(access.get().runtime_state.network_service())
                 })?;
@@ -1402,6 +2057,23 @@ where
         "ping",
         |accessor: &Accessor<StoreData<CpuImpl, HostFs>>, (host, timeout): (String, u64)| {
             Box::pin(async move {
+                let has_authority = accessor.with(|mut access| {
+                    Ok::<_, wasmtime::Error>(
+                        access
+                            .get()
+                            .process_authority()
+                            .network_rights()
+                            .contains(dns_network_rights()),
+                    )
+                })?;
+                if !has_authority {
+                    return Ok::<_, wasmtime::Error>((Err(
+                        program_bindings::helios::system::net::PingError {
+                            kind: program_bindings::helios::system::net::PingErrorKind::Unavailable,
+                            detail: "network authority is missing DNS rights".to_owned(),
+                        },
+                    ),));
+                }
                 let service = accessor.with(|mut access| {
                     Ok::<_, wasmtime::Error>(access.get().runtime_state.network_service())
                 })?;
@@ -1427,6 +2099,20 @@ where
         |accessor: &Accessor<StoreData<CpuImpl, HostFs>>,
          (host, port, timeout): (String, u16, u64)| {
             Box::pin(async move {
+                let has_authority = accessor.with(|mut access| {
+                    Ok::<_, wasmtime::Error>(
+                        access
+                            .get()
+                            .process_authority()
+                            .network_rights()
+                            .contains(tcp_connect_network_rights()),
+                    )
+                })?;
+                if !has_authority {
+                    return Ok::<_, wasmtime::Error>((Err(
+                        unavailable_program_tcp_authority_error(),
+                    ),));
+                }
                 let service = accessor.with(|mut access| {
                     Ok::<_, wasmtime::Error>(access.get().runtime_state.network_service())
                 })?;
@@ -1457,6 +2143,21 @@ where
         "udp-bind",
         |accessor: &Accessor<StoreData<CpuImpl, HostFs>>, (local_port,): (u16,)| {
             Box::pin(async move {
+                let required = udp_bind_network_rights(local_port);
+                let has_authority = accessor.with(|mut access| {
+                    Ok::<_, wasmtime::Error>(
+                        access
+                            .get()
+                            .process_authority()
+                            .network_rights()
+                            .contains(required),
+                    )
+                })?;
+                if !has_authority {
+                    return Ok::<_, wasmtime::Error>((Err(
+                        unavailable_program_udp_authority_error(),
+                    ),));
+                }
                 let service = accessor.with(|mut access| {
                     Ok::<_, wasmtime::Error>(access.get().runtime_state.network_service())
                 })?;
@@ -1757,6 +2458,9 @@ fn convert_launch_error(
             ProgramExecErrorKind::InvalidPath => {
                 debugger_bindings::helios::system::programs::ExecErrorKind::InvalidPath
             }
+            ProgramExecErrorKind::PermissionDenied => {
+                debugger_bindings::helios::system::programs::ExecErrorKind::PermissionDenied
+            }
             ProgramExecErrorKind::InvalidHint => {
                 debugger_bindings::helios::system::programs::ExecErrorKind::InvalidHint
             }
@@ -1770,7 +2474,7 @@ fn convert_launch_error(
                 debugger_bindings::helios::system::programs::ExecErrorKind::Internal
             }
         },
-        detail: error.detail,
+        detail: error.detail.to_string(),
     }
 }
 
@@ -1807,6 +2511,9 @@ fn convert_program_launch_error(
             ProgramExecErrorKind::InvalidPath => {
                 program_bindings::helios::system::programs::ExecErrorKind::InvalidPath
             }
+            ProgramExecErrorKind::PermissionDenied => {
+                program_bindings::helios::system::programs::ExecErrorKind::PermissionDenied
+            }
             ProgramExecErrorKind::InvalidHint => {
                 program_bindings::helios::system::programs::ExecErrorKind::InvalidHint
             }
@@ -1820,7 +2527,7 @@ fn convert_program_launch_error(
                 program_bindings::helios::system::programs::ExecErrorKind::Internal
             }
         },
-        detail: error.detail,
+        detail: error.detail.to_string(),
     }
 }
 
@@ -1881,7 +2588,7 @@ fn convert_ping_error(
                 debugger_bindings::helios::system::net::PingErrorKind::Internal
             }
         },
-        detail: error.detail,
+        detail: error.detail.to_string(),
     }
 }
 
@@ -1903,7 +2610,7 @@ fn convert_program_ping_error(
                 program_bindings::helios::system::net::PingErrorKind::Internal
             }
         },
-        detail: error.detail,
+        detail: error.detail.to_string(),
     }
 }
 
@@ -1914,10 +2621,24 @@ fn unavailable_tcp_error() -> debugger_bindings::helios::system::net::TcpError {
     }
 }
 
+fn unavailable_tcp_authority_error() -> debugger_bindings::helios::system::net::TcpError {
+    debugger_bindings::helios::system::net::TcpError {
+        kind: debugger_bindings::helios::system::net::TcpErrorKind::Unavailable,
+        detail: "network authority is missing TCP or DNS rights".to_owned(),
+    }
+}
+
 fn unavailable_program_tcp_error() -> program_bindings::helios::system::net::TcpError {
     program_bindings::helios::system::net::TcpError {
         kind: program_bindings::helios::system::net::TcpErrorKind::Unavailable,
         detail: "network service is unavailable on this machine".to_owned(),
+    }
+}
+
+fn unavailable_program_tcp_authority_error() -> program_bindings::helios::system::net::TcpError {
+    program_bindings::helios::system::net::TcpError {
+        kind: program_bindings::helios::system::net::TcpErrorKind::Unavailable,
+        detail: "network authority is missing TCP or DNS rights".to_owned(),
     }
 }
 
@@ -1928,10 +2649,24 @@ fn unavailable_udp_error() -> debugger_bindings::helios::system::net::UdpError {
     }
 }
 
+fn unavailable_udp_authority_error() -> debugger_bindings::helios::system::net::UdpError {
+    debugger_bindings::helios::system::net::UdpError {
+        kind: debugger_bindings::helios::system::net::UdpErrorKind::Unavailable,
+        detail: "network authority is missing UDP or privileged-bind rights".to_owned(),
+    }
+}
+
 fn unavailable_program_udp_error() -> program_bindings::helios::system::net::UdpError {
     program_bindings::helios::system::net::UdpError {
         kind: program_bindings::helios::system::net::UdpErrorKind::Unavailable,
         detail: "network service is unavailable on this machine".to_owned(),
+    }
+}
+
+fn unavailable_program_udp_authority_error() -> program_bindings::helios::system::net::UdpError {
+    program_bindings::helios::system::net::UdpError {
+        kind: program_bindings::helios::system::net::UdpErrorKind::Unavailable,
+        detail: "network authority is missing UDP or privileged-bind rights".to_owned(),
     }
 }
 
@@ -1951,7 +2686,7 @@ fn convert_tcp_error(error: crate::TcpError) -> debugger_bindings::helios::syste
                 debugger_bindings::helios::system::net::TcpErrorKind::Internal
             }
         },
-        detail: error.detail,
+        detail: error.detail.to_string(),
     }
 }
 
@@ -1973,7 +2708,7 @@ fn convert_program_tcp_error(
                 program_bindings::helios::system::net::TcpErrorKind::Internal
             }
         },
-        detail: error.detail,
+        detail: error.detail.to_string(),
     }
 }
 
@@ -2012,6 +2747,9 @@ fn convert_udp_error(error: crate::UdpError) -> debugger_bindings::helios::syste
             crate::UdpErrorKind::Timeout => {
                 debugger_bindings::helios::system::net::UdpErrorKind::Timeout
             }
+            crate::UdpErrorKind::PermissionDenied => {
+                debugger_bindings::helios::system::net::UdpErrorKind::PermissionDenied
+            }
             crate::UdpErrorKind::Unavailable => {
                 debugger_bindings::helios::system::net::UdpErrorKind::Unavailable
             }
@@ -2019,7 +2757,7 @@ fn convert_udp_error(error: crate::UdpError) -> debugger_bindings::helios::syste
                 debugger_bindings::helios::system::net::UdpErrorKind::Internal
             }
         },
-        detail: error.detail,
+        detail: error.detail.to_string(),
     }
 }
 
@@ -2034,6 +2772,9 @@ fn convert_program_udp_error(
             crate::UdpErrorKind::Timeout => {
                 program_bindings::helios::system::net::UdpErrorKind::Timeout
             }
+            crate::UdpErrorKind::PermissionDenied => {
+                program_bindings::helios::system::net::UdpErrorKind::PermissionDenied
+            }
             crate::UdpErrorKind::Unavailable => {
                 program_bindings::helios::system::net::UdpErrorKind::Unavailable
             }
@@ -2041,7 +2782,7 @@ fn convert_program_udp_error(
                 program_bindings::helios::system::net::UdpErrorKind::Internal
             }
         },
-        detail: error.detail,
+        detail: error.detail.to_string(),
     }
 }
 
@@ -2874,7 +3615,7 @@ enum DebuggerError {
     #[error("failed to initialize Wasmtime engine: {0}")]
     CreateEngine(wasmtime::Error),
     #[error("failed to validate embedded debugger artifact: {0}")]
-    TrustComponent(crate::ArtifactTrustError),
+    TrustComponent(ArtifactTrustError),
     #[error("failed to load embedded debugger component: {0}")]
     LoadComponent(wasmtime::Error),
     #[error("failed to instantiate debugger component: {0}")]

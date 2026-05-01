@@ -1,0 +1,19 @@
+[[artifact]]
+command = "dash"
+package = "sharrattj/dash"
+version = "1.0.19"
+source_url = "https://wasmer.io/sharrattj/dash"
+bootfs_path = "bin/dash"
+source = "artifacts/wasix/dash/dash.wasm"
+sha256_file = "artifacts/wasix/dash/dash.wasm.sha256"
+
+[[artifact]]
+command = "python3"
+package = "brettcannon/cpython-wasi-build"
+version = "3.14.4"
+source_url = "https://github.com/brettcannon/cpython-wasi-build"
+bootfs_path = "bin/python3"
+source = "artifacts/python3-root/python3.wasm"
+sha256_file = "artifacts/python3-root/python3.wasm.sha256"
+support_root = "artifacts/python3-root/lib/python3.14"
+support_bootfs_prefix = "usr/local/lib/python3.14"

@@ -191,6 +191,7 @@ fn map_udp_error(error: raw::UdpError) -> io::Error {
     let kind = match error.kind {
         UdpErrorKind::Timeout => io::ErrorKind::TimedOut,
         UdpErrorKind::UnresolvedHost => io::ErrorKind::NotFound,
+        UdpErrorKind::PermissionDenied => io::ErrorKind::PermissionDenied,
         UdpErrorKind::Unavailable => io::ErrorKind::ConnectionAborted,
         UdpErrorKind::Internal => io::ErrorKind::Other,
     };

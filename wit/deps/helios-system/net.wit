@@ -43,6 +43,7 @@ interface net {
   enum udp-error-kind {
     unresolved-host,
     timeout,
+    permission-denied,
     unavailable,
     internal,
   }

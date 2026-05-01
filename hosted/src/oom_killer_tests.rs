@@ -52,11 +52,7 @@ fn pick_prefers_low_restart_cost_per_byte() {
 #[test]
 fn system_components_are_picked_only_as_last_resort() {
     let registry = InstanceRegistry::new();
-    let system = registry.register_with_cost(
-        "debugger",
-        0,
-        SYSTEM_COMPONENT_RESTART_COST,
-    );
+    let system = registry.register_with_cost("debugger", 0, SYSTEM_COMPONENT_RESTART_COST);
     system.set_memory_bytes(1024 * 1024 * 1024);
 
     // No other candidate: the system component is the only one with
@@ -125,10 +121,7 @@ fn kill_supervisor_restart_decodes_correctly() {
     let instance = registry.register("plugin", 0);
     instance.set_memory_bytes(1);
     assert!(registry.request_kill(instance.id(), KillReason::SupervisorRestart));
-    assert_eq!(
-        instance.pending_kill(),
-        Some(KillReason::SupervisorRestart)
-    );
+    assert_eq!(instance.pending_kill(), Some(KillReason::SupervisorRestart));
 }
 
 #[test]

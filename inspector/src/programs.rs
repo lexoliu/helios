@@ -1,6 +1,6 @@
 use std::path::{Component, Path};
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use helios_inspector_protocol::debugger::programs as debugger_programs;
 use helios_inspector_protocol::system::programs::ExecResult;
 

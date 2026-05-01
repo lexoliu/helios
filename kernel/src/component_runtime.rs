@@ -5,16 +5,16 @@ use alloc::vec::Vec;
 
 use crate::child_io::{ByteReader, ByteWriter, ClosedPeer, TryRead};
 use crate::{
-    InstanceExecutionTransition, InstanceRegistry, KillReason, RegisteredInstance,
-    Timer, nanos_to_ticks_ceil_saturating, record_instance_transition,
+    EntropyError, EntropyPool, InstanceExecutionTransition, InstanceRegistry, KernelClock,
+    KillReason, ProcessAuthority, RegisteredInstance, SetWallClockCap, Timer,
+    nanos_to_ticks_ceil_saturating, record_instance_transition,
 };
 use helios_hal::cpu::{Cpu, Instant};
 use thiserror::Error;
-use wasmtime::component::ResourceTable;
 
-/// Error returned through wasmtime's call_hook when a kill was
+/// Error returned through the runtime call hook when a kill was
 /// requested for the running instance — by the OOM killer or by a
-/// kernel-plugin supervisor. Wasmtime turns this into a trap and the
+/// kernel-plugin supervisor. The runtime adapter turns this into a trap and the
 /// component executor surfaces it as a typed `ProgramExecError`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 #[error("instance terminated: {reason:?}")]
@@ -22,7 +22,7 @@ pub struct InstanceKilled {
     pub reason: KillReason,
 }
 
-/// Where `wasi:cli/{stdin,stdout,stderr}` traffic flows for a component.
+/// Where stdin/stdout/stderr traffic flows for a component.
 ///
 /// Three concrete routings are supported:
 ///
@@ -95,23 +95,27 @@ pub(crate) struct ComponentExecutionContext<FileSystem> {
     filesystem: FileSystem,
     arguments: Vec<String>,
     environment: Vec<(String, String)>,
+    process_authority: ProcessAuthority,
     output_mode: ComponentOutputMode,
 }
 
-pub struct ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem>
+pub struct ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl>
 where
     CpuImpl: Cpu + Clone,
+    RuntimeStateImpl: ComponentRuntimeState,
 {
-    pub table: ResourceTable,
+    pub table: ResourceTableImpl,
     pub cpu: CpuImpl,
     timer: Timer<CpuImpl>,
     spawner: crate::Spawner<CpuImpl>,
     pub runtime_state: RuntimeStateImpl,
     pub instance_registry: InstanceRegistry,
+    entropy: EntropyPool,
+    clock: KernelClock<CpuImpl, RuntimeStateImpl>,
     execution_context: ComponentExecutionContext<FileSystem>,
     serial_reader: fn(u32) -> Vec<u8>,
     serial_writer: fn(&[u8]),
-    /// Set by `wasi:cli/exit.{exit,exit-with-code}` before the guest
+    /// Set by the runtime exit interface before the guest
     /// traps; the executor reads it to distinguish a clean requested
     /// exit (turn into an exit code) from an actual runtime error.
     requested_exit: Option<u8>,
@@ -136,6 +140,7 @@ impl<FileSystem> ComponentExecutionContext<FileSystem> {
         filesystem: FileSystem,
         arguments: Vec<String>,
         environment: Vec<(String, String)>,
+        process_authority: ProcessAuthority,
         output_mode: ComponentOutputMode,
     ) -> Self {
         Self {
@@ -144,13 +149,14 @@ impl<FileSystem> ComponentExecutionContext<FileSystem> {
             filesystem,
             arguments,
             environment,
+            process_authority,
             output_mode,
         }
     }
 }
 
-impl<CpuImpl, RuntimeStateImpl, FileSystem>
-    ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem>
+impl<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl>
+    ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTableImpl>
 where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
@@ -158,6 +164,7 @@ where
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        table: ResourceTableImpl,
         cpu: CpuImpl,
         timer: Timer<CpuImpl>,
         spawner: crate::Spawner<CpuImpl>,
@@ -168,23 +175,29 @@ where
         filesystem: FileSystem,
         arguments: Vec<String>,
         environment: Vec<(String, String)>,
+        process_authority: ProcessAuthority,
         output_mode: ComponentOutputMode,
         serial_reader: fn(u32) -> Vec<u8>,
         serial_writer: fn(&[u8]),
     ) -> Self {
+        let entropy = EntropyPool::from_cpu(&cpu, instance.id().raw());
+        let clock = KernelClock::new(cpu.clone(), runtime_state.clone());
         Self {
-            table: ResourceTable::new(),
+            table,
             cpu,
             timer,
             spawner,
             runtime_state,
             instance_registry,
+            entropy,
+            clock,
             execution_context: ComponentExecutionContext::new(
                 instance,
                 debug_port,
                 filesystem,
                 arguments,
                 environment,
+                process_authority,
                 output_mode,
             ),
             serial_reader,
@@ -193,7 +206,7 @@ where
         }
     }
 
-    /// Record the exit code requested by `wasi:cli/exit` so the
+    /// Record the exit code requested by the runtime exit interface so the
     /// executor can report it cleanly after the guest trap.
     pub fn request_exit(&mut self, code: u8) {
         self.requested_exit = Some(code);
@@ -228,6 +241,10 @@ where
         &self.execution_context.environment
     }
 
+    pub(crate) fn process_authority(&self) -> &ProcessAuthority {
+        &self.execution_context.process_authority
+    }
+
     pub fn output_mode(&self) -> &ComponentOutputMode {
         &self.execution_context.output_mode
     }
@@ -241,7 +258,15 @@ where
     }
 
     pub fn now_nanos(&self) -> u64 {
-        self.runtime_state.uptime_nanos(self.cpu.now().ticks())
+        self.clock.monotonic_nanos()
+    }
+
+    pub fn system_time_nanos(&self) -> u64 {
+        self.clock.system_time_nanos()
+    }
+
+    pub fn set_system_time_nanos(&mut self, cap: &SetWallClockCap, nanos: u64) {
+        self.clock.set_system_time_nanos(cap, nanos);
     }
 
     pub fn timer(&self) -> Timer<CpuImpl> {
@@ -250,6 +275,26 @@ where
 
     pub fn spawner(&self) -> &crate::Spawner<CpuImpl> {
         &self.spawner
+    }
+
+    pub(crate) fn fill_secure_random(&mut self, buffer: &mut [u8]) -> Result<(), EntropyError> {
+        self.entropy.fill_secure(buffer)
+    }
+
+    pub(crate) fn secure_random_u64(&mut self) -> Result<u64, EntropyError> {
+        self.entropy.secure_u64()
+    }
+
+    pub(crate) fn insecure_random_bytes(&mut self, len: usize) -> Vec<u8> {
+        self.entropy.insecure_bytes(len)
+    }
+
+    pub(crate) fn insecure_random_u64(&mut self) -> u64 {
+        self.entropy.insecure_u64()
+    }
+
+    pub(crate) fn insecure_seed(&mut self) -> (u64, u64) {
+        self.entropy.insecure_seed()
     }
 
     /// Deliver a chunk of stdout/stderr bytes to whatever sink is
@@ -344,9 +389,12 @@ where
         if let Some(elapsed) = elapsed
             && self.runtime_state.profiling_enabled()
         {
+            let mut stack = String::with_capacity(5 + self.instance().name().len());
+            stack.push_str("user;");
+            stack.push_str(self.instance().name());
             self.runtime_state.record_profile_stack_nanos(
                 crate::ProfileScope::User,
-                alloc::format!("user;{}", self.instance().name()),
+                stack,
                 elapsed,
             );
         }
@@ -413,13 +461,12 @@ pub async fn wait_until_runtime_deadline<CpuImpl, RuntimeStateImpl>(
         }
 
         let remaining_nanos = deadline_nanos.saturating_sub(now_nanos);
-        let remaining_ticks = nanos_to_ticks_ceil_saturating(remaining_nanos, cpu.timer_frequency())
-            .max(1);
+        let remaining_ticks =
+            nanos_to_ticks_ceil_saturating(remaining_nanos, cpu.timer_frequency()).max(1);
         timer
             .sleep_until(Instant::new(now_ticks.saturating_add(remaining_ticks)))
             .await;
     }
 }
 
-// Wasmtime trait impls (Pollable, OutputStream, ResourceLimiter, IoView)
-// live in wasmtime_adapter/store.rs.
+// Runtime-adapter trait impls live in the concrete adapter module.

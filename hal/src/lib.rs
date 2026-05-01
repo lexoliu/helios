@@ -9,6 +9,7 @@ pub mod boot;
 pub mod cpu;
 pub mod critical_section;
 pub mod device;
+pub mod entropy;
 pub mod fs;
 pub mod interrupt;
 pub mod io;

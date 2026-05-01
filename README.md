@@ -54,7 +54,6 @@ hardware support lives in thin adaptation crates.
 | `api-macro/` | `#[helios_api::main]` proc macro |
 | `kernel-macro/` | Kernel-side proc macros |
 | `programs/init/` | Embedded init component |
-| `programs/sh/` | Minimal shell component |
 | `programs/debugger/` | Debugger component that exports `helios:system/*` back over RPC |
 | `inspector/` | Host-side CLI (`shell`, `stats`, `tracing`, `repl`, `vm`) |
 | `inspector-protocol/` | Shared RPC types between inspector and guest debugger |
@@ -115,8 +114,9 @@ that guest components use internally:
 - `repl` — combined shell + stats + tracing session
 - `vm` — boot a QEMU guest and drop into a `repl` automatically
 
-See `docs/wasi-tools.md` for the reproducible workflow that builds and runs
-upstream WASI tools (Python, curl) against a shared host directory.
+See `docs/wasi-tools.md` for the reproducible workflow that stages the
+standard WASIX `/bin/dash` boot artifact, boots CPython with its upstream
+stdlib, and runs upstream WASI tools such as Python and curl.
 
 ## Kernel Plugins
 

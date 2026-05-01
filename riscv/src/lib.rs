@@ -466,10 +466,10 @@ fn main(hart_id: usize, fdt_addr: usize, opaque: usize) -> ! {
     run_hart(hart_id, fdt_addr)
 }
 
-#[unsafe(no_mangle)]
 mod vmm;
 pub use vmm::RiscvUserAddressSpace;
 
+#[unsafe(no_mangle)]
 extern "C" fn secondary_start_rust(hart_id: usize, fdt_addr: usize) -> ! {
     run_hart(hart_id, fdt_addr)
 }
@@ -534,7 +534,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         unsafe {
             vmm::install_kernel_paging();
         }
-        vmm::install_wasmtime_hooks();
+        vmm::install_runtime_memory_hooks();
     }
     unsafe {
         vmm::activate_paging();

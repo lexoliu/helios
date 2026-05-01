@@ -20,20 +20,24 @@ impl<Component> ComponentCache<Component> {
         }
     }
 
-    pub fn get(&mut self, wasm: &[u8]) -> Option<Arc<Component>> {
-        self.entries.get(wasm).cloned()
+    pub fn get(&mut self, artifact: &[u8]) -> Option<Arc<Component>> {
+        self.entries.get(artifact).cloned()
     }
 
-    pub fn insert_if_missing(&mut self, wasm: Bytes, component: Arc<Component>) -> Arc<Component> {
-        if let Some(existing) = self.entries.get(wasm.as_ref()).cloned() {
+    pub fn insert_if_missing(
+        &mut self,
+        artifact: Bytes,
+        component: Arc<Component>,
+    ) -> Arc<Component> {
+        if let Some(existing) = self.entries.get(artifact.as_ref()).cloned() {
             return existing;
         }
 
         self.resident_bytes = self
             .resident_bytes
-            .checked_add(wasm.len())
+            .checked_add(artifact.len())
             .expect("component cache byte accounting overflow");
-        let replaced = self.entries.put(wasm, component.clone());
+        let replaced = self.entries.put(artifact, component.clone());
         assert!(
             replaced.is_none(),
             "component cache replaced an entry after miss revalidation"
@@ -44,12 +48,12 @@ impl<Component> ComponentCache<Component> {
 
     fn evict_to_budget(&mut self) {
         while self.resident_bytes > self.budget_bytes {
-            let Some((wasm, _component)) = self.entries.pop_lru() else {
+            let Some((artifact, _component)) = self.entries.pop_lru() else {
                 panic!("component cache accounting lost track of resident bytes");
             };
             self.resident_bytes = self
                 .resident_bytes
-                .checked_sub(wasm.len())
+                .checked_sub(artifact.len())
                 .expect("component cache byte accounting underflow");
         }
     }

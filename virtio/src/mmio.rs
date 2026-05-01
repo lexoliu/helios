@@ -8,12 +8,14 @@ use crate::bus::{IdentityDmaPool, MmioBus};
 use crate::console::VirtioConsoleDevice;
 use crate::net::VirtioNetDevice;
 use crate::p9::Virtio9pDevice;
+use crate::rng::VirtioRngDevice;
 use crate::transport::VirtioMmioTransport;
 
 pub type VirtioMmioBlockDevice = VirtioBlockResource<VirtioMmioTransport<MmioBus>>;
 pub type VirtioMmioConsoleDevice = VirtioConsoleDevice<VirtioMmioTransport<MmioBus>>;
 pub type VirtioMmioNetDevice = VirtioNetDevice<VirtioMmioTransport<MmioBus>>;
 pub type VirtioMmio9pDevice = Virtio9pDevice<VirtioMmioTransport<MmioBus>>;
+pub type VirtioMmioRngDevice = VirtioRngDevice<VirtioMmioTransport<MmioBus>>;
 
 /// Builds a VirtIO block resource from a permanently mapped MMIO header.
 ///
@@ -80,4 +82,20 @@ pub unsafe fn p9_from_mmio(header: NonNull<u8>, mmio_size: usize) -> IoResult<Vi
     let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     Virtio9pDevice::new(transport)
+}
+
+/// Builds a VirtIO entropy device from a permanently mapped MMIO header.
+///
+/// # Safety
+///
+/// `header..header+mmio_size` must refer to a valid, permanently mapped VirtIO
+/// MMIO register block for an entropy device, and no other code may violate the
+/// transport's register access invariants while the returned driver is alive.
+pub unsafe fn rng_from_mmio(
+    header: NonNull<u8>,
+    mmio_size: usize,
+) -> IoResult<VirtioMmioRngDevice> {
+    let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
+    let transport = VirtioMmioTransport::new(bus)?;
+    VirtioRngDevice::new(transport)
 }

@@ -1,5 +1,5 @@
 //! Async byte-stream channels used to connect a spawned child component's
-//! WASI stdio to the parent that spawned it.
+//! stdio streams to the parent that spawned it.
 //!
 //! These channels are single-producer-ish multiple-consumer-ish only on
 //! the live-object level: writers can be cloned freely, and EOF is

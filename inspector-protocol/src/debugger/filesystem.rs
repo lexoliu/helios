@@ -137,8 +137,7 @@ mod host {
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
-        let response =
-            invoke(client, "copy", &PathPairRequest::new(source, destination)).await?;
+        let response = invoke(client, "copy", &PathPairRequest::new(source, destination)).await?;
         decode_response::<()>("copy", &response)
     }
 
@@ -151,8 +150,7 @@ mod host {
         R: AsyncRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
-        let response =
-            invoke(client, "move", &PathPairRequest::new(source, destination)).await?;
+        let response = invoke(client, "move", &PathPairRequest::new(source, destination)).await?;
         decode_response::<()>("move", &response)
     }
 
@@ -204,8 +202,8 @@ mod guest {
     use futures_lite::future::zip;
     use helios_api::bindings::wasi::filesystem::preopens;
     use helios_api::bindings::wasi::filesystem::types::{
-        Descriptor, DescriptorFlags, DescriptorType,
-        DirectoryEntry as WasiDirectoryEntry, ErrorCode, OpenFlags, PathFlags,
+        Descriptor, DescriptorFlags, DescriptorType, DirectoryEntry as WasiDirectoryEntry,
+        ErrorCode, OpenFlags, PathFlags,
     };
     use std::path::Path;
 
@@ -229,10 +227,7 @@ mod guest {
         )
     }
 
-    pub(crate) async fn dispatch(
-        func: &str,
-        payload: &[u8],
-    ) -> Result<Vec<u8>, DispatchError> {
+    pub(crate) async fn dispatch(func: &str, payload: &[u8]) -> Result<Vec<u8>, DispatchError> {
         match func {
             "list" => {
                 let path = decode_path_request(payload, "filesystem.list")?;
@@ -258,13 +253,12 @@ mod guest {
                 encode_response("filesystem.touch", &())
             }
             "write" => {
-                let request =
-                    postcard::from_bytes::<WriteRequest>(payload).map_err(|source| {
-                        DispatchError::Decode {
-                            operation: "filesystem.write",
-                            source,
-                        }
-                    })?;
+                let request = postcard::from_bytes::<WriteRequest>(payload).map_err(|source| {
+                    DispatchError::Decode {
+                        operation: "filesystem.write",
+                        source,
+                    }
+                })?;
                 write_file(&request.path, &request.bytes, request.append).await?;
                 encode_response("filesystem.write", &())
             }
@@ -295,12 +289,8 @@ mod guest {
         payload: &[u8],
         operation: &'static str,
     ) -> Result<String, DispatchError> {
-        let request = postcard::from_bytes::<PathRequest>(payload).map_err(|source| {
-            DispatchError::Decode {
-                operation,
-                source,
-            }
-        })?;
+        let request = postcard::from_bytes::<PathRequest>(payload)
+            .map_err(|source| DispatchError::Decode { operation, source })?;
         Ok(request.into_path())
     }
 
@@ -308,12 +298,8 @@ mod guest {
         payload: &[u8],
         operation: &'static str,
     ) -> Result<PathPairRequest, DispatchError> {
-        postcard::from_bytes::<PathPairRequest>(payload).map_err(|source| {
-            DispatchError::Decode {
-                operation,
-                source,
-            }
-        })
+        postcard::from_bytes::<PathPairRequest>(payload)
+            .map_err(|source| DispatchError::Decode { operation, source })
     }
 
     async fn list_directory(path: &str) -> Result<Vec<DirectoryEntry>, DispatchError> {
@@ -588,9 +574,7 @@ mod guest {
         Ok(descriptor)
     }
 
-    async fn open_parent_directory(
-        path: &str,
-    ) -> Result<(Descriptor, String), DispatchError> {
+    async fn open_parent_directory(path: &str) -> Result<(Descriptor, String), DispatchError> {
         let mut components = normalized_components(path)?;
         let name = components.pop().ok_or_else(|| {
             DispatchError::protocol(format!("path {path:?} does not refer to a removable entry"))

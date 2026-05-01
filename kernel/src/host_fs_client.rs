@@ -1,14 +1,14 @@
 extern crate alloc;
 
 use alloc::borrow::ToOwned;
-use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::future::Future;
-use core::pin::Pin;
 use helios_hal::io::IoError;
 
-use crate::{HostDirEntry, HostFileSystem, HostFsError, HostMetadata};
+use crate::{
+    AuthorityDomain, HostDirEntry, HostFileSystem, HostFsError, HostMetadata, ObjectIdentity,
+};
 
 const DEFAULT_MSIZE: u32 = (1024 * 1024) + 24;
 const P9_NOTAG: u16 = u16::MAX;
@@ -22,8 +22,11 @@ const P9_TWRITE: u8 = 118;
 const P9_TCLUNK: u8 = 120;
 const P9_TLOPEN: u8 = 12;
 const P9_TLCREATE: u8 = 14;
+const P9_TSYMLINK: u8 = 16;
+const P9_TREADLINK: u8 = 22;
 const P9_TGETATTR: u8 = 24;
 const P9_TREADDIR: u8 = 40;
+const P9_TLINK: u8 = 70;
 const P9_TMKDIR: u8 = 72;
 const P9_TRENAMEAT: u8 = 74;
 const P9_TUNLINKAT: u8 = 76;
@@ -37,37 +40,14 @@ const P9_STATS_BASIC: u64 = 0x0000_07ff;
 const P9_QTDIR: u8 = 0x80;
 const P9_WRITE_CHUNK: usize = (DEFAULT_MSIZE as usize) - 24;
 
-pub struct HostFsFuture<'a, T> {
-    inner: Pin<Box<dyn Future<Output = T> + Send + 'a>>,
-}
-
-impl<'a, T> HostFsFuture<'a, T> {
-    fn new(inner: impl Future<Output = T> + Send + 'a) -> Self {
-        Self {
-            inner: Box::pin(inner),
-        }
-    }
-}
-
-impl<T> Future for HostFsFuture<'_, T> {
-    type Output = T;
-
-    fn poll(
-        mut self: Pin<&mut Self>,
-        cx: &mut core::task::Context<'_>,
-    ) -> core::task::Poll<Self::Output> {
-        self.inner.as_mut().poll(cx)
-    }
-}
-
 pub trait HostFsTransport: Clone + Send + Sync + 'static {
-    type RequestFuture<'a>: Future<Output = Result<Vec<u8>, IoError>> + Send + 'a
-    where
-        Self: 'a;
-
     fn mount_tag(&self) -> &str;
 
-    fn request(&self, bytes: Vec<u8>, response_len: usize) -> Self::RequestFuture<'_>;
+    fn request(
+        &self,
+        bytes: Vec<u8>,
+        response_len: usize,
+    ) -> impl Future<Output = Result<Vec<u8>, IoError>> + Send + '_;
 }
 
 #[derive(Clone)]
@@ -216,6 +196,7 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
         cursor += 8;
         let size = read_u64_le(&response, cursor)?;
         Ok(HostMetadata {
+            identity: ObjectIdentity::new(AuthorityDomain::HOST_SHARE_9P, qid_path),
             qid_path,
             qid_type,
             mode,
@@ -557,117 +538,166 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
         let _ = self.clunk(root).await;
         result
     }
+
+    async fn hard_link_impl(&self, source: &str, destination: &str) -> Result<(), HostFsError> {
+        let (destination_parent, destination_name) = split_parent_name(destination)?;
+        let root = self.attach_root().await?;
+        let source_fid = self.walk(root, 1, source).await?;
+        let destination_dir = self.walk(root, 2, destination_parent).await?;
+        let result = self
+            .transact(
+                P9_TLINK,
+                |body| {
+                    push_u32(body, destination_dir);
+                    push_u32(body, source_fid);
+                    push_string(body, destination_name);
+                },
+                64,
+            )
+            .await
+            .map(|_| ());
+        let _ = self.clunk(destination_dir).await;
+        let _ = self.clunk(source_fid).await;
+        let _ = self.clunk(root).await;
+        result
+    }
+
+    async fn symlink_impl(&self, target: &str, link_path: &str) -> Result<(), HostFsError> {
+        let (parent, name) = split_parent_name(link_path)?;
+        let root = self.attach_root().await?;
+        let directory = self.walk(root, 1, parent).await?;
+        let result = self
+            .transact(
+                P9_TSYMLINK,
+                |body| {
+                    push_u32(body, directory);
+                    push_string(body, name);
+                    push_string(body, target);
+                    push_u32(body, P9_NOUID);
+                },
+                64,
+            )
+            .await
+            .map(|_| ());
+        let _ = self.clunk(directory).await;
+        let _ = self.clunk(root).await;
+        result
+    }
+
+    async fn read_link_impl(&self, path: &str) -> Result<String, HostFsError> {
+        let root = self.attach_root().await?;
+        let target = self.walk(root, 1, path).await?;
+        let result = self
+            .transact(P9_TREADLINK, |body| push_u32(body, target), 4096)
+            .await
+            .and_then(|response| {
+                let mut cursor = 7;
+                read_string(&response, &mut cursor)
+            });
+        let _ = self.clunk(target).await;
+        let _ = self.clunk(root).await;
+        result
+    }
 }
 
 impl<Transport: HostFsTransport> HostFileSystem for HostFsClient<Transport> {
-    type StatFuture<'a>
-        = HostFsFuture<'a, Result<HostMetadata, HostFsError>>
-    where
-        Self: 'a;
-    type ReadDirFuture<'a>
-        = HostFsFuture<'a, Result<Vec<HostDirEntry>, HostFsError>>
-    where
-        Self: 'a;
-    type ReadFileFuture<'a>
-        = HostFsFuture<'a, Result<Vec<u8>, HostFsError>>
-    where
-        Self: 'a;
-    type ReadFileRangeFuture<'a>
-        = HostFsFuture<'a, Result<Vec<u8>, HostFsError>>
-    where
-        Self: 'a;
-    type WriteFileFuture<'a>
-        = HostFsFuture<'a, Result<(), HostFsError>>
-    where
-        Self: 'a;
-    type TruncateFileFuture<'a>
-        = HostFsFuture<'a, Result<(), HostFsError>>
-    where
-        Self: 'a;
-    type CreateFileFuture<'a>
-        = HostFsFuture<'a, Result<(), HostFsError>>
-    where
-        Self: 'a;
-    type CreateDirectoryFuture<'a>
-        = HostFsFuture<'a, Result<(), HostFsError>>
-    where
-        Self: 'a;
-    type RemoveFuture<'a>
-        = HostFsFuture<'a, Result<(), HostFsError>>
-    where
-        Self: 'a;
-    type RenameFuture<'a>
-        = HostFsFuture<'a, Result<(), HostFsError>>
-    where
-        Self: 'a;
-
-    fn stat_path(&self, path: &str) -> Self::StatFuture<'_> {
-        let path = path.to_owned();
-        let client = self.clone();
-        HostFsFuture::new(async move { client.stat_path_impl(&path).await })
+    fn stat_path<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> impl Future<Output = Result<HostMetadata, HostFsError>> + Send + 'a {
+        async move { self.stat_path_impl(path).await }
     }
 
-    fn read_dir(&self, path: &str) -> Self::ReadDirFuture<'_> {
-        let path = path.to_owned();
-        let client = self.clone();
-        HostFsFuture::new(async move { client.read_dir_impl(&path).await })
+    fn read_dir<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> impl Future<Output = Result<Vec<HostDirEntry>, HostFsError>> + Send + 'a {
+        async move { self.read_dir_impl(path).await }
     }
 
-    fn read_file(&self, path: &str) -> Self::ReadFileFuture<'_> {
-        let path = path.to_owned();
-        let client = self.clone();
-        HostFsFuture::new(async move { client.read_file_impl(&path).await })
+    fn read_file<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> impl Future<Output = Result<Vec<u8>, HostFsError>> + Send + 'a {
+        async move { self.read_file_impl(path).await }
     }
 
-    fn read_file_range(
-        &self,
-        path: &str,
+    fn read_file_range<'a>(
+        &'a self,
+        path: &'a str,
         offset: u64,
         max_bytes: u32,
-    ) -> Self::ReadFileRangeFuture<'_> {
-        let path = path.to_owned();
-        let client = self.clone();
-        HostFsFuture::new(
-            async move { client.read_file_range_impl(&path, offset, max_bytes).await },
-        )
+    ) -> impl Future<Output = Result<Vec<u8>, HostFsError>> + Send + 'a {
+        async move { self.read_file_range_impl(path, offset, max_bytes).await }
     }
 
-    fn write_file(&self, path: &str, offset: u64, bytes: &[u8]) -> Self::WriteFileFuture<'_> {
-        let path = path.to_owned();
-        let bytes = bytes.to_vec();
-        let client = self.clone();
-        HostFsFuture::new(async move { client.write_file_impl(&path, offset, &bytes).await })
+    fn write_file<'a>(
+        &'a self,
+        path: &'a str,
+        offset: u64,
+        bytes: &'a [u8],
+    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a {
+        async move { self.write_file_impl(path, offset, bytes).await }
     }
 
-    fn truncate_file(&self, path: &str) -> Self::TruncateFileFuture<'_> {
-        let path = path.to_owned();
-        let client = self.clone();
-        HostFsFuture::new(async move { client.truncate_file_impl(&path).await })
+    fn truncate_file<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a {
+        async move { self.truncate_file_impl(path).await }
     }
 
-    fn create_file(&self, path: &str) -> Self::CreateFileFuture<'_> {
-        let path = path.to_owned();
-        let client = self.clone();
-        HostFsFuture::new(async move { client.create_file_impl(&path).await })
+    fn create_file<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a {
+        async move { self.create_file_impl(path).await }
     }
 
-    fn create_directory(&self, path: &str) -> Self::CreateDirectoryFuture<'_> {
-        let path = path.to_owned();
-        let client = self.clone();
-        HostFsFuture::new(async move { client.create_directory_impl(&path).await })
+    fn create_directory<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a {
+        async move { self.create_directory_impl(path).await }
     }
 
-    fn remove(&self, path: &str, directory: bool) -> Self::RemoveFuture<'_> {
-        let path = path.to_owned();
-        let client = self.clone();
-        HostFsFuture::new(async move { client.remove_impl(&path, directory).await })
+    fn remove<'a>(
+        &'a self,
+        path: &'a str,
+        directory: bool,
+    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a {
+        async move { self.remove_impl(path, directory).await }
     }
 
-    fn rename(&self, source: &str, destination: &str) -> Self::RenameFuture<'_> {
-        let source = source.to_owned();
-        let destination = destination.to_owned();
-        let client = self.clone();
-        HostFsFuture::new(async move { client.rename_impl(&source, &destination).await })
+    fn rename<'a>(
+        &'a self,
+        source: &'a str,
+        destination: &'a str,
+    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a {
+        async move { self.rename_impl(source, destination).await }
+    }
+
+    fn hard_link<'a>(
+        &'a self,
+        source: &'a str,
+        destination: &'a str,
+    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a {
+        async move { self.hard_link_impl(source, destination).await }
+    }
+
+    fn symlink<'a>(
+        &'a self,
+        target: &'a str,
+        link_path: &'a str,
+    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a {
+        async move { self.symlink_impl(target, link_path).await }
+    }
+
+    fn read_link<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> impl Future<Output = Result<String, HostFsError>> + Send + 'a {
+        async move { self.read_link_impl(path).await }
     }
 }
 

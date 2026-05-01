@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::thread;
 
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
+use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 
 use crate::runtime::HostedMachine;
 
@@ -64,6 +65,12 @@ impl Cpu for HostedCpu {
 
     fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {
         None
+    }
+
+    fn fill_entropy(&self, buffer: &mut [u8]) -> Result<EntropyQuality, EntropyUnavailable> {
+        getrandom::fill(buffer)
+            .unwrap_or_else(|error| panic!("host entropy source failed: {error}"));
+        Ok(EntropyQuality::Cryptographic)
     }
 
     fn has_lazy_commit_virtual_memory(&self) -> bool {

@@ -161,13 +161,11 @@ fn pass_respects_page_budget() {
 
 #[test]
 fn unsupported_short_circuits_pass() {
-    let address_space: &'static _ = Box::leak(Box::new(FakeAddressSpace::with_outcomes(vec![
-        Err(AddressSpaceError::InvalidFlags),
-    ])));
-    let policy = ScriptedPolicy::new(vec![
-        target(0x1_0000, 1),
-        target(0x2_0000, 1),
-    ]);
+    let address_space: &'static _ =
+        Box::leak(Box::new(FakeAddressSpace::with_outcomes(vec![Err(
+            AddressSpaceError::InvalidFlags,
+        )])));
+    let policy = ScriptedPolicy::new(vec![target(0x1_0000, 1), target(0x2_0000, 1)]);
     let mut compactor = Compactor::new(
         address_space,
         policy,
@@ -217,10 +215,7 @@ fn other_errors_continue_pass_but_count_failures() {
         Err(AddressSpaceError::Misaligned),
         Ok(()),
     ])));
-    let policy = ScriptedPolicy::new(vec![
-        target(0x1_0000, 1),
-        target(0x2_0000, 1),
-    ]);
+    let policy = ScriptedPolicy::new(vec![target(0x1_0000, 1), target(0x2_0000, 1)]);
     let mut compactor = Compactor::new(
         address_space,
         policy,

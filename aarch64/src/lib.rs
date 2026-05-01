@@ -21,6 +21,7 @@ use helios_hal::boot::{
     BootMemoryRegion, BootModule, BootModules, FirmwareKind,
 };
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
+use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
 use helios_hal::{DeviceInventory, DmaModel, Platform};
@@ -37,16 +38,19 @@ use limine::request::{
     FirmwareTypeRequest, HhdmRequest, MemmapRequest, ModulesRequest, MpRequest, RsdpRequest,
     StackSizeRequest,
 };
-use spin::Once;
+use rand_chacha::ChaCha20Rng;
+use rand_core::{RngCore, SeedableRng};
+use spin::{Mutex, Once};
 
 const KERNEL_STACK_BYTES: usize = 4 * 1024 * 1024;
 const EXCEPTION_STACK_BYTES: usize = 64 * 1024;
 const PAGE_BYTES: usize = 4096;
+const MMIO_BLOCK_BYTES: usize = 2 * 1024 * 1024;
 const MAX_USABLE_REGION_SEGMENTS: usize = 6;
 const PAGE_TABLE_ENTRIES: usize = 512;
 const PAGE_TABLE_INDEX_MASK: usize = PAGE_TABLE_ENTRIES - 1;
 const PAGE_TABLE_DESCRIPTOR: u64 = 0b11;
-const PAGE_DESCRIPTOR: u64 = 0b11;
+const BLOCK_DESCRIPTOR: u64 = 0b01;
 const PAGE_VALID: u64 = 1;
 const PAGE_ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
 const PAGE_AF: u64 = 1 << 10;
@@ -60,6 +64,15 @@ const PL011_DATA: usize = 0x000;
 const PL011_FLAG: usize = 0x018;
 const PL011_FLAG_RXFE: u32 = 1 << 4;
 const PL011_FLAG_TXFF: u32 = 1 << 5;
+const QEMU_FW_CFG_MMIO_BASE: usize = 0x0902_0000;
+const QEMU_FW_CFG_MMIO_SIZE: usize = 0x18;
+const FW_CFG_DATA: usize = 0x000;
+const FW_CFG_SELECTOR: usize = 0x008;
+const FW_CFG_SIGNATURE: u16 = 0x0000;
+const FW_CFG_FILE_DIR: u16 = 0x0019;
+const FW_CFG_FILE_ENTRY_BYTES: usize = 64;
+const FW_CFG_FILE_NAME_BYTES: usize = 56;
+const FW_CFG_HELIOS_RNG_SEED: &[u8] = b"opt/org.helios/rng-seed";
 
 #[cfg(target_os = "none")]
 global_asm!(
@@ -180,11 +193,15 @@ struct Aarch64ProcessorSlot {
 struct Aarch64PlatformState {
     processors: Box<[Aarch64ProcessorSlot]>,
     timer_frequency: u64,
+    boot_entropy: Option<Aarch64BootEntropy>,
     debug_state: Once<debug_state::RuntimeState>,
 }
 
 impl Aarch64PlatformState {
-    fn from_limine_mp(timer_frequency: u64) -> &'static Self {
+    fn from_limine_mp(
+        timer_frequency: u64,
+        boot_entropy: Option<Aarch64BootEntropy>,
+    ) -> &'static Self {
         let response = MP_REQUEST
             .response()
             .unwrap_or_else(|| panic!("Limine did not provide an AArch64 MP response"));
@@ -224,6 +241,7 @@ impl Aarch64PlatformState {
         Box::leak(Box::new(Self {
             processors,
             timer_frequency,
+            boot_entropy,
             debug_state: Once::new(),
         }))
     }
@@ -289,6 +307,30 @@ impl Aarch64PlatformState {
             );
             core::hint::spin_loop();
         }
+    }
+
+    fn fill_entropy(&self, buffer: &mut [u8]) -> Result<(), EntropyUnavailable> {
+        if let Some(boot_entropy) = &self.boot_entropy {
+            boot_entropy.fill(buffer);
+            return Ok(());
+        }
+        fill_with_rndr(buffer)
+    }
+}
+
+struct Aarch64BootEntropy {
+    rng: Mutex<ChaCha20Rng>,
+}
+
+impl Aarch64BootEntropy {
+    fn new(seed: [u8; 32]) -> Self {
+        Self {
+            rng: Mutex::new(ChaCha20Rng::from_seed(seed)),
+        }
+    }
+
+    fn fill(&self, buffer: &mut [u8]) {
+        self.rng.lock().fill_bytes(buffer);
     }
 }
 
@@ -367,7 +409,8 @@ extern "C" fn aarch64_kernel_main() -> ! {
     let memory_regions = boot_memory_regions(&handoff, physical_memory_offset, &reserved_ranges);
     helios_kernel::prime_bootstrap_allocator(memory_regions);
     vmm::install_user_address_space(physical_memory_offset);
-    let platform_state = Aarch64PlatformState::from_limine_mp(timer_frequency());
+    let boot_entropy = discover_boot_entropy(&handoff, physical_memory_offset);
+    let platform_state = Aarch64PlatformState::from_limine_mp(timer_frequency(), boot_entropy);
     activate_processor_runtime(platform_state.bootstrap_runtime());
 
     let cpu = Aarch64Cpu {
@@ -498,6 +541,11 @@ impl Cpu for Aarch64Cpu {
         true
     }
 
+    fn fill_entropy(&self, buffer: &mut [u8]) -> Result<EntropyQuality, EntropyUnavailable> {
+        self.state.fill_entropy(buffer)?;
+        Ok(EntropyQuality::Cryptographic)
+    }
+
     fn shutdown(&self) -> ! {
         loop {
             self.park_current();
@@ -599,7 +647,11 @@ extern "C" fn aarch64_handle_sync_exception(
 
     let runtime = read_processor_runtime();
     if runtime != 0 {
-        let handler = unsafe { (*(runtime as *const ProcessorRuntime)).native_trap_handler.load(Ordering::Acquire) };
+        let handler = unsafe {
+            (*(runtime as *const ProcessorRuntime))
+                .native_trap_handler
+                .load(Ordering::Acquire)
+        };
         if handler != 0 {
             let handler: KernelNativeTrapHandler = unsafe { core::mem::transmute(handler) };
             let exception = KernelException {
@@ -648,6 +700,38 @@ fn read_id_aa64isar0_el1() -> u64 {
         asm!("mrs {value}, id_aa64isar0_el1", value = out(reg) value, options(nomem, nostack, preserves_flags));
     }
     value
+}
+
+fn fill_with_rndr(buffer: &mut [u8]) -> Result<(), EntropyUnavailable> {
+    if (read_id_aa64isar0_el1() >> 60) & 0xf == 0 {
+        return Err(EntropyUnavailable);
+    }
+
+    for chunk in buffer.chunks_mut(core::mem::size_of::<u64>()) {
+        let value = read_rndr()?;
+        let bytes = value.to_le_bytes();
+        chunk.copy_from_slice(&bytes[..chunk.len()]);
+    }
+    Ok(())
+}
+
+fn read_rndr() -> Result<u64, EntropyUnavailable> {
+    let value: u64;
+    let failed: u64;
+    unsafe {
+        asm!(
+            "mrs {value}, S3_3_C2_C4_0",
+            "cset {failed}, eq",
+            value = out(reg) value,
+            failed = out(reg) failed,
+            options(nomem, nostack)
+        );
+    }
+    if failed == 0 {
+        Ok(value)
+    } else {
+        Err(EntropyUnavailable)
+    }
 }
 
 fn read_counter() -> u64 {
@@ -861,19 +945,18 @@ fn map_mmio_page(
 ) {
     install_device_memory_attribute();
     let virtual_address = mmio_virtual_base(physical_address, physical_memory_offset);
-    let page_virtual = virtual_address & !(PAGE_BYTES - 1);
-    let page_physical = physical_address & !(PAGE_BYTES - 1);
+    let block_virtual = virtual_address & !(MMIO_BLOCK_BYTES - 1);
+    let block_physical = physical_address & !(MMIO_BLOCK_BYTES - 1);
     let root = table_from_physical(read_ttbr1_el1(), physical_memory_offset);
     let backing_tables = [&MMIO_PAGE_TABLE_0, &MMIO_PAGE_TABLE_1, &MMIO_PAGE_TABLE_2];
     let mut next_backing_table = 0usize;
     let mut table = root;
     let indexes = [
-        (page_virtual >> 39) & PAGE_TABLE_INDEX_MASK,
-        (page_virtual >> 30) & PAGE_TABLE_INDEX_MASK,
-        (page_virtual >> 21) & PAGE_TABLE_INDEX_MASK,
-        (page_virtual >> 12) & PAGE_TABLE_INDEX_MASK,
+        (block_virtual >> 39) & PAGE_TABLE_INDEX_MASK,
+        (block_virtual >> 30) & PAGE_TABLE_INDEX_MASK,
+        (block_virtual >> 21) & PAGE_TABLE_INDEX_MASK,
     ];
-    for &index in &indexes[..3] {
+    for &index in &indexes[..2] {
         table = ensure_next_page_table(
             table,
             index,
@@ -883,19 +966,50 @@ fn map_mmio_page(
             physical_memory_offset,
         );
     }
-    let descriptor = page_physical as u64
+    let entry = unsafe { table.add(indexes[2]).read_volatile() };
+    if entry & PAGE_VALID != 0 {
+        assert!(
+            entry & PAGE_TABLE_DESCRIPTOR != PAGE_TABLE_DESCRIPTOR,
+            "AArch64 early MMIO mapper found a page table where a block mapping was required"
+        );
+        assert!(
+            (entry & PAGE_ADDRESS_MASK) as usize == block_physical,
+            "AArch64 early MMIO mapper found a conflicting block mapping"
+        );
+        return;
+    }
+    let descriptor = block_physical as u64
         | (PAGE_ATTR_DEVICE_INDEX << PAGE_ATTR_INDEX_SHIFT)
         | PAGE_AF
         | PAGE_PXN
         | PAGE_UXN
-        | PAGE_DESCRIPTOR;
+        | BLOCK_DESCRIPTOR;
     unsafe {
-        table.add(indexes[3]).write_volatile(descriptor);
+        table.add(indexes[2]).write_volatile(descriptor);
         asm!("dsb ishst", options(nostack, preserves_flags));
-        let va_page = page_virtual >> 12;
+        let va_page = block_virtual >> 12;
         asm!("tlbi vae1is, {va_page}", va_page = in(reg) va_page, options(nostack, preserves_flags));
         asm!("dsb ish", options(nostack, preserves_flags));
         asm!("isb", options(nostack, preserves_flags));
+    }
+}
+
+fn map_mmio_range(
+    physical_base: usize,
+    size: usize,
+    physical_memory_offset: usize,
+    handoff: &LimineBootHandoff,
+) {
+    assert!(size != 0, "AArch64 MMIO range has zero size");
+    let end = physical_base
+        .checked_add(size)
+        .unwrap_or_else(|| panic!("AArch64 MMIO range overflow"));
+    let mut block = physical_base & !(MMIO_BLOCK_BYTES - 1);
+    while block < end {
+        map_mmio_page(block, physical_memory_offset, handoff);
+        block = block
+            .checked_add(MMIO_BLOCK_BYTES)
+            .unwrap_or_else(|| panic!("AArch64 MMIO mapping iteration overflow"));
     }
 }
 
@@ -959,6 +1073,122 @@ fn mmio_virtual_base(physical_base: usize, physical_memory_offset: usize) -> usi
     physical_base
         .checked_add(physical_memory_offset)
         .unwrap_or_else(|| panic!("AArch64 MMIO virtual address overflow"))
+}
+
+fn discover_boot_entropy(
+    handoff: &LimineBootHandoff,
+    physical_memory_offset: usize,
+) -> Option<Aarch64BootEntropy> {
+    if let Some(fdt) = boot_fdt(handoff) {
+        if let Some(chosen) = fdt.find_node("/chosen") {
+            if let Some(seed) = chosen.property("rng-seed") {
+                return Some(Aarch64BootEntropy::new(seed_from_slice(
+                    seed.value,
+                    "AArch64 FDT /chosen/rng-seed",
+                )));
+            }
+        }
+    }
+    if handoff.tables.acpi_rsdp.is_some() {
+        return discover_fw_cfg_boot_entropy(physical_memory_offset, handoff);
+    }
+    None
+}
+
+fn discover_fw_cfg_boot_entropy(
+    physical_memory_offset: usize,
+    handoff: &LimineBootHandoff,
+) -> Option<Aarch64BootEntropy> {
+    map_mmio_range(
+        QEMU_FW_CFG_MMIO_BASE,
+        QEMU_FW_CFG_MMIO_SIZE,
+        physical_memory_offset,
+        handoff,
+    );
+    let base = mmio_virtual_base(QEMU_FW_CFG_MMIO_BASE, physical_memory_offset);
+    let signature = fw_cfg_read_signature(base);
+    if signature != *b"QEMU" {
+        return None;
+    }
+    fw_cfg_read_seed_file(base).map(Aarch64BootEntropy::new)
+}
+
+fn fw_cfg_read_signature(base: usize) -> [u8; 4] {
+    fw_cfg_select(base, FW_CFG_SIGNATURE);
+    let mut signature = [0_u8; 4];
+    fw_cfg_read_exact(base, &mut signature);
+    signature
+}
+
+fn fw_cfg_read_seed_file(base: usize) -> Option<[u8; 32]> {
+    fw_cfg_select(base, FW_CFG_FILE_DIR);
+    let count = fw_cfg_read_be_u32(base);
+    assert!(
+        count <= 1024,
+        "AArch64 fw_cfg file directory has an implausible entry count"
+    );
+    let mut entry = [0_u8; FW_CFG_FILE_ENTRY_BYTES];
+    for _ in 0..count {
+        fw_cfg_read_exact(base, &mut entry);
+        let size = u32::from_be_bytes(
+            entry[0..4]
+                .try_into()
+                .unwrap_or_else(|_| panic!("fw_cfg size field had invalid width")),
+        );
+        let selector = u16::from_be_bytes(
+            entry[4..6]
+                .try_into()
+                .unwrap_or_else(|_| panic!("fw_cfg selector field had invalid width")),
+        );
+        let name = &entry[8..8 + FW_CFG_FILE_NAME_BYTES];
+        if fw_cfg_name_matches(name, FW_CFG_HELIOS_RNG_SEED) {
+            assert!(
+                size >= 32,
+                "AArch64 fw_cfg rng seed is shorter than 32 bytes"
+            );
+            fw_cfg_select(base, selector);
+            let mut seed = [0_u8; 32];
+            fw_cfg_read_exact(base, &mut seed);
+            return Some(seed);
+        }
+    }
+    None
+}
+
+fn seed_from_slice(seed: &[u8], source: &str) -> [u8; 32] {
+    assert!(seed.len() >= 32, "{source} must contain at least 32 bytes");
+    let mut key = [0_u8; 32];
+    key.copy_from_slice(&seed[..32]);
+    key
+}
+
+fn fw_cfg_name_matches(name_field: &[u8], expected: &[u8]) -> bool {
+    if name_field.len() < expected.len() {
+        return false;
+    }
+    name_field[..expected.len()] == *expected
+        && name_field[expected.len()..]
+            .iter()
+            .copied()
+            .all(|byte| byte == 0)
+}
+
+fn fw_cfg_select(base: usize, selector: u16) {
+    unsafe {
+        ((base + FW_CFG_SELECTOR) as *mut u16).write_volatile(selector.to_be());
+    }
+}
+
+fn fw_cfg_read_be_u32(base: usize) -> u32 {
+    let mut bytes = [0_u8; 4];
+    fw_cfg_read_exact(base, &mut bytes);
+    u32::from_be_bytes(bytes)
+}
+
+fn fw_cfg_read_exact(base: usize, buffer: &mut [u8]) {
+    for byte in buffer {
+        *byte = unsafe { ((base + FW_CFG_DATA) as *const u8).read_volatile() };
+    }
 }
 
 #[derive(Clone, Copy)]

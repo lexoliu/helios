@@ -1,6 +1,5 @@
 extern crate alloc;
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -167,19 +166,16 @@ impl HostFsTransportService {
 }
 
 impl HostFsTransport for HostFsTransportService {
-    type RequestFuture<'a>
-        =
-        core::pin::Pin<Box<dyn core::future::Future<Output = Result<Vec<u8>, IoError>> + Send + 'a>>
-    where
-        Self: 'a;
-
     fn mount_tag(&self) -> &str {
         self.inner.device.mount_tag()
     }
 
-    fn request(&self, bytes: Vec<u8>, response_len: usize) -> Self::RequestFuture<'_> {
-        let transport = self.clone();
-        Box::pin(async move { transport.raw_request(bytes, response_len).await })
+    fn request(
+        &self,
+        bytes: Vec<u8>,
+        response_len: usize,
+    ) -> impl core::future::Future<Output = Result<Vec<u8>, IoError>> + Send + '_ {
+        async move { self.raw_request(bytes, response_len).await }
     }
 }
 

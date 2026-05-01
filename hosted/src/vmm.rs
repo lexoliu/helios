@@ -91,7 +91,12 @@ impl AddressSpace for HostedAddressSpace {
             .ok_or(AddressSpaceError::NotReserved)?;
         let reservation = reservations.swap_remove(index);
         drop(reservations);
-        let result = unsafe { libc::munmap(reservation.range.start.raw() as *mut _, reservation.range.byte_len) };
+        let result = unsafe {
+            libc::munmap(
+                reservation.range.start.raw() as *mut _,
+                reservation.range.byte_len,
+            )
+        };
         if result != 0 {
             return Err(AddressSpaceError::NotReserved);
         }
@@ -108,7 +113,9 @@ impl AddressSpace for HostedAddressSpace {
         if mprotect_result != 0 {
             return Err(AddressSpaceError::InvalidFlags);
         }
-        reservation.committed.push(CommittedRegion { range: virt, flags });
+        reservation
+            .committed
+            .push(CommittedRegion { range: virt, flags });
         Ok(())
     }
 
@@ -125,7 +132,11 @@ impl AddressSpace for HostedAddressSpace {
         }
         unsafe {
             #[cfg(target_os = "linux")]
-            libc::madvise(virt.start.raw() as *mut _, virt.byte_len, libc::MADV_DONTNEED);
+            libc::madvise(
+                virt.start.raw() as *mut _,
+                virt.byte_len,
+                libc::MADV_DONTNEED,
+            );
             #[cfg(target_os = "macos")]
             libc::madvise(virt.start.raw() as *mut _, virt.byte_len, libc::MADV_FREE);
             if libc::mprotect(virt.start.raw() as *mut _, virt.byte_len, libc::PROT_NONE) != 0 {

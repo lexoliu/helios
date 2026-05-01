@@ -14,7 +14,9 @@ use helios_compiler_support::{AotCompileHint, precompile_artifact};
 use mbrman::{BOOT_ACTIVE, CHS, MBR, MBRPartitionEntry};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use toml::Value;
+use walkdir::WalkDir;
 use wasmparser::Parser as WasmParser;
 use wit_component::ComponentEncoder;
 
@@ -22,6 +24,7 @@ const ROOT_SECRET_FILE: &str = "helios-root-secret.key";
 const ROOT_PUBLIC_FILE: &str = "helios-root-public.key";
 const PREBUILD_MANIFEST_FILE: &str = "kernel-prebuild.json";
 const DEFAULT_INIT_ARGV0: &str = "/init.wasm";
+const DEFAULT_BOOT_ARTIFACTS_MANIFEST: &str = "tools/wasi-apps/boot-artifacts.toml";
 const COMPILER_PLUGIN_BOOTFS_PATH: &str = "bin/compiler.cwasm";
 const COMPILER_PLUGIN_ROOT_KEY_ENV: &str = "HELIOS_COMPILER_ROOT_KEY_HEX";
 const COMPILER_PLUGIN_SHARED_MEMORY_MAX_BYTES: usize = 512 * 1024 * 1024;
@@ -109,6 +112,8 @@ struct KernelPrebuildCommand {
     init_argv0: String,
     #[arg(long = "boot-program")]
     boot_programs: Vec<String>,
+    #[arg(long, default_value = DEFAULT_BOOT_ARTIFACTS_MANIFEST)]
+    boot_artifacts_manifest: PathBuf,
     #[arg(long = "no-compiler-plugin", default_value_t = false)]
     no_compiler_plugin: bool,
 }
@@ -148,10 +153,28 @@ struct BootAsset {
     source: PathBuf,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct BootArtifactsManifest {
+    #[serde(default)]
+    artifact: Vec<ExternalBootArtifact>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ExternalBootArtifact {
+    command: String,
+    package: String,
+    version: String,
+    source_url: String,
+    bootfs_path: String,
+    source: PathBuf,
+    sha256_file: PathBuf,
+    support_root: Option<PathBuf>,
+    support_bootfs_prefix: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 struct ProgramManifest {
     command: String,
-    bootfs_name: String,
     manifest_path: PathBuf,
     artifact_name: String,
 }
@@ -211,6 +234,10 @@ fn run_kernel_prebuild(command: KernelPrebuildCommand) -> Result<()> {
     let init_manifest = workspace_path(&command.init_manifest);
     let bootfs_root = workspace_path(&command.bootfs_root);
 
+    let selected_programs = selected_boot_programs(command.boot_programs)?;
+    let boot_artifacts_manifest = workspace_path(&command.boot_artifacts_manifest);
+    validate_external_boot_artifact_sources(&boot_artifacts_manifest, &selected_programs)?;
+
     let init_component = build_component_program(
         &command.cargo,
         &command.profile,
@@ -232,7 +259,6 @@ fn run_kernel_prebuild(command: KernelPrebuildCommand) -> Result<()> {
     fs::write(&init_cwasm, init_signed)
         .with_context(|| format!("failed to write {}", init_cwasm.display()))?;
 
-    let selected_programs = selected_boot_programs(command.boot_programs)?;
     let mut bootfs_assets = Vec::new();
     if !command.no_compiler_plugin {
         bootfs_assets.push(build_compiler_plugin_asset(
@@ -250,6 +276,7 @@ fn run_kernel_prebuild(command: KernelPrebuildCommand) -> Result<()> {
         &command.target,
         &root_signing_key,
         &selected_programs,
+        &boot_artifacts_manifest,
     )?);
 
     let manifest = PrebuildManifest {
@@ -643,10 +670,12 @@ fn build_boot_program_assets(
     target: &str,
     root_signing_key: &SigningKey,
     selected_programs: &Option<BTreeSet<String>>,
+    boot_artifacts_manifest: &Path,
 ) -> Result<Vec<BootAsset>> {
     let programs_root = workspace_path(Path::new("programs"));
     let mut available_programs = BTreeSet::new();
     let mut manifests = Vec::new();
+    let mut external_artifacts = read_external_boot_artifacts(boot_artifacts_manifest)?;
 
     for entry in fs::read_dir(&programs_root)
         .with_context(|| format!("failed to read {}", programs_root.display()))?
@@ -674,6 +703,18 @@ fn build_boot_program_assets(
         }
         manifests.push(read_program_manifest(command, &path.join("Cargo.toml"))?);
     }
+    for artifact in &external_artifacts {
+        ensure!(
+            available_programs.insert(artifact.command.clone()),
+            "boot program command {} is declared more than once",
+            artifact.command
+        );
+    }
+    external_artifacts.retain(|artifact| {
+        selected_programs
+            .as_ref()
+            .is_none_or(|selected| selected.contains(&artifact.command))
+    });
 
     if let Some(selected_programs) = selected_programs {
         let missing_programs = selected_programs
@@ -689,12 +730,127 @@ fn build_boot_program_assets(
     }
 
     manifests.sort_by(|left, right| left.command.cmp(&right.command));
-    manifests
+    external_artifacts.sort_by(|left, right| left.command.cmp(&right.command));
+    let mut assets = manifests
         .into_iter()
         .map(|manifest| {
             build_boot_program_asset(cargo, profile, out_dir, target, root_signing_key, manifest)
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    for artifact in external_artifacts {
+        assets.extend(build_external_boot_artifact_assets(
+            out_dir,
+            target,
+            root_signing_key,
+            artifact,
+        )?);
+    }
+    Ok(assets)
+}
+
+fn read_external_boot_artifacts(path: &Path) -> Result<Vec<ExternalBootArtifact>> {
+    ensure!(
+        path.is_file(),
+        "boot artifacts manifest {} is missing",
+        path.display()
+    );
+    let manifest = fs::read_to_string(path)
+        .with_context(|| format!("failed to read boot artifacts manifest {}", path.display()))?;
+    let manifest = toml::from_str::<BootArtifactsManifest>(&manifest)
+        .with_context(|| format!("failed to parse boot artifacts manifest {}", path.display()))?;
+    for artifact in &manifest.artifact {
+        ensure!(
+            !artifact.command.is_empty(),
+            "boot artifact in {} has an empty command",
+            path.display()
+        );
+        ensure!(
+            !artifact.package.is_empty(),
+            "boot artifact {} in {} has an empty package",
+            artifact.command,
+            path.display()
+        );
+        ensure!(
+            !artifact.version.is_empty(),
+            "boot artifact {} in {} has an empty version",
+            artifact.command,
+            path.display()
+        );
+        ensure!(
+            !artifact.source_url.is_empty(),
+            "boot artifact {} in {} has an empty source URL",
+            artifact.command,
+            path.display()
+        );
+        ensure!(
+            !artifact.bootfs_path.is_empty(),
+            "boot artifact {} in {} has an empty bootfs path",
+            artifact.command,
+            path.display()
+        );
+        ensure!(
+            artifact.bootfs_path.starts_with("bin/"),
+            "boot artifact {} must install under bin/",
+            artifact.command
+        );
+        ensure!(
+            artifact.source.is_relative(),
+            "boot artifact {} source must be workspace-relative",
+            artifact.command
+        );
+        ensure!(
+            artifact.sha256_file.is_relative(),
+            "boot artifact {} checksum path must be workspace-relative",
+            artifact.command
+        );
+        if let Some(support_root) = &artifact.support_root {
+            ensure!(
+                support_root.is_relative(),
+                "boot artifact {} support root must be workspace-relative",
+                artifact.command
+            );
+        }
+        ensure!(
+            artifact.support_root.is_some() == artifact.support_bootfs_prefix.is_some(),
+            "boot artifact {} support_root and support_bootfs_prefix must be specified together",
+            artifact.command
+        );
+        if let Some(prefix) = &artifact.support_bootfs_prefix {
+            ensure!(
+                !prefix.is_empty() && !prefix.starts_with('/'),
+                "boot artifact {} support bootfs prefix must be relative",
+                artifact.command
+            );
+        }
+    }
+    Ok(manifest.artifact)
+}
+
+fn validate_external_boot_artifact_sources(
+    path: &Path,
+    selected_programs: &Option<BTreeSet<String>>,
+) -> Result<()> {
+    for artifact in read_external_boot_artifacts(path)? {
+        if selected_programs
+            .as_ref()
+            .is_some_and(|selected| !selected.contains(&artifact.command))
+        {
+            continue;
+        }
+        verify_sha256_file(
+            &workspace_path(&artifact.source),
+            &workspace_path(&artifact.sha256_file),
+        )?;
+        if let Some(support_root) = &artifact.support_root {
+            let support_root = workspace_path(support_root);
+            ensure!(
+                support_root.is_dir(),
+                "boot artifact support root {} is missing",
+                support_root.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn workspace_path(path: &Path) -> PathBuf {
@@ -732,10 +888,118 @@ fn build_boot_program_asset(
         .with_context(|| format!("failed to write {}", output_path.display()))?;
 
     Ok(BootAsset {
-        path: format!("bin/{}", manifest.bootfs_name),
+        path: format!("bin/{}", manifest.command),
         source: fs::canonicalize(&output_path)
             .with_context(|| format!("failed to resolve {}", output_path.display()))?,
     })
+}
+
+fn build_external_boot_artifact_assets(
+    out_dir: &Path,
+    target: &str,
+    root_signing_key: &SigningKey,
+    artifact: ExternalBootArtifact,
+) -> Result<Vec<BootAsset>> {
+    let source = workspace_path(&artifact.source);
+    let sha256_file = workspace_path(&artifact.sha256_file);
+    verify_sha256_file(&source, &sha256_file)?;
+    let wasm = fs::read(&source).with_context(|| format!("failed to read {}", source.display()))?;
+    let payload = precompile_artifact(&wasm, target, Hint::Balanced.into())?.bytes;
+    let signed = sign_payload_with_key(&payload, root_signing_key).with_context(|| {
+        format!(
+            "failed to sign external bootfs AOT payload for {}",
+            artifact.command
+        )
+    })?;
+    let output_path = out_dir.join(format!("{}_bootfs_component.cwasm", artifact.command));
+    fs::write(&output_path, signed)
+        .with_context(|| format!("failed to write {}", output_path.display()))?;
+
+    let mut assets = vec![BootAsset {
+        path: artifact.bootfs_path,
+        source: fs::canonicalize(&output_path)
+            .with_context(|| format!("failed to resolve {}", output_path.display()))?,
+    }];
+    if let (Some(support_root), Some(prefix)) =
+        (&artifact.support_root, &artifact.support_bootfs_prefix)
+    {
+        assets.extend(build_external_support_assets(
+            &workspace_path(support_root),
+            prefix,
+        )?);
+    }
+    Ok(assets)
+}
+
+fn build_external_support_assets(root: &Path, bootfs_prefix: &str) -> Result<Vec<BootAsset>> {
+    ensure!(
+        root.is_dir(),
+        "boot artifact support root {} is missing",
+        root.display()
+    );
+    let mut assets = Vec::new();
+    for entry in WalkDir::new(root).sort_by_file_name() {
+        let entry =
+            entry.with_context(|| format!("failed to walk support root {}", root.display()))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let source = entry.into_path();
+        let relative = source
+            .strip_prefix(root)
+            .with_context(|| {
+                format!(
+                    "failed to strip support root {} from {}",
+                    root.display(),
+                    source.display()
+                )
+            })?
+            .to_str()
+            .with_context(|| format!("{} is not valid UTF-8", source.display()))?
+            .replace('\\', "/");
+        assets.push(BootAsset {
+            path: format!("{}/{}", bootfs_prefix.trim_end_matches('/'), relative),
+            source: fs::canonicalize(&source)
+                .with_context(|| format!("failed to resolve {}", source.display()))?,
+        });
+    }
+    Ok(assets)
+}
+
+fn verify_sha256_file(source: &Path, sha256_file: &Path) -> Result<()> {
+    ensure!(
+        source.is_file(),
+        "boot artifact source {} is missing",
+        source.display()
+    );
+    ensure!(
+        sha256_file.is_file(),
+        "boot artifact checksum {} is missing",
+        sha256_file.display()
+    );
+    let expected = fs::read_to_string(sha256_file)
+        .with_context(|| format!("failed to read {}", sha256_file.display()))?;
+    let expected = expected
+        .split_whitespace()
+        .next()
+        .with_context(|| format!("{} does not contain a checksum", sha256_file.display()))?;
+    ensure!(
+        expected.len() == 64 && expected.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "{} must start with a SHA-256 hex digest",
+        sha256_file.display()
+    );
+    let mut hasher = Sha256::new();
+    hasher
+        .update(fs::read(source).with_context(|| format!("failed to read {}", source.display()))?);
+    let actual = hex::encode(hasher.finalize());
+    ensure!(
+        actual == expected,
+        "boot artifact checksum mismatch for {}: expected {}, got {}",
+        source.display(),
+        expected,
+        actual
+    );
+    Ok(())
 }
 
 fn read_program_manifest(command: &str, manifest_path: &Path) -> Result<ProgramManifest> {
@@ -769,10 +1033,6 @@ fn read_program_manifest(command: &str, manifest_path: &Path) -> Result<ProgramM
         })?;
     Ok(ProgramManifest {
         command: command.to_owned(),
-        bootfs_name: match command {
-            "sh" => "dash".to_owned(),
-            other => other.to_owned(),
-        },
         manifest_path: manifest_path.to_path_buf(),
         artifact_name: format!("{artifact_stem}.wasm"),
     })

@@ -17,21 +17,6 @@ impl<'a> TrustedCwasm<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub struct UntrustedWasm<'a> {
-    bytes: &'a [u8],
-}
-
-impl<'a> UntrustedWasm<'a> {
-    pub const fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes }
-    }
-
-    pub const fn bytes(&self) -> &'a [u8] {
-        self.bytes
-    }
-}
-
-#[derive(Clone, Copy)]
 pub struct UntrustedCwasm<'a> {
     bytes: &'a [u8],
 }

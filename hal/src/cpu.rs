@@ -1,3 +1,5 @@
+use crate::entropy::{EntropyQuality, EntropyUnavailable};
+
 /// Logical processor identifier.
 ///
 /// This is the architecture-neutral execution slot identifier exposed to the
@@ -107,20 +109,28 @@ pub trait Cpu: Send + Sync + 'static {
     /// processors have stopped executing from the range.
     fn unpublish_executable(&self, ptr: *const u8, len: usize);
 
-    /// Returns an optional native ISA feature probe for runtime codegen.
+    /// Returns an optional native ISA feature probe for consumers that need
+    /// target-feature decisions.
     fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>>;
 
+    /// Fills `buffer` from a platform entropy source.
+    ///
+    /// Backends that expose a hardware or host operating-system source return
+    /// the quality of the provided bytes. Backends without such a source return
+    /// `EntropyUnavailable`; higher layers decide whether a caller can proceed
+    /// without cryptographic entropy.
+    fn fill_entropy(&self, _buffer: &mut [u8]) -> Result<EntropyQuality, EntropyUnavailable> {
+        Err(EntropyUnavailable)
+    }
+
     /// Whether this backend's virtual-memory subsystem supports
-    /// petabyte-scale lazy-commit reservations — the architectural
-    /// capability that lets runtimes pre-reserve very large virtual
-    /// ranges and only materialise physical backing on access.
+    /// petabyte-scale lazy-commit reservations: reserving a large
+    /// virtual range and only materialising physical backing on access.
     /// Hosted satisfies this through `mmap(PROT_NONE)`. Bare-metal
     /// targets satisfy it once their `hal::vmm::AddressSpace`
     /// implementation reaches a full reserve/commit/decommit
-    /// surface and the kernel routes runtime allocations through
-    /// it. The default `false` keeps backends that have not yet
-    /// wired this up on a conservative "every byte allocated up
-    /// front" allocation strategy.
+    /// surface. The default `false` keeps backends that have not yet
+    /// wired this up on a conservative eager-backing strategy.
     fn has_lazy_commit_virtual_memory(&self) -> bool {
         false
     }

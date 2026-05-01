@@ -20,12 +20,11 @@ use wasmtime_wasi_io::streams::{InputStream, OutputStream, StreamError, StreamRe
 use crate::child_io::{ByteReader, ByteWriter};
 use crate::{
     ComponentRuntimeState, ComponentStoreData, KillReason, ProgramOutOfMemory,
-    allow_instance_resource_growth, heap_stats, user_heap_stats,
-    user_memory_kernel_reserve_bytes,
+    allow_instance_resource_growth, heap_stats, user_heap_stats, user_memory_kernel_reserve_bytes,
 };
 
 impl<CpuImpl, RuntimeStateImpl, FileSystem> ResourceLimiter
-    for ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem>
+    for ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTable>
 where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
@@ -73,7 +72,8 @@ where
     }
 }
 
-impl<CpuImpl, RuntimeStateImpl, FileSystem> ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem>
+impl<CpuImpl, RuntimeStateImpl, FileSystem>
+    ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTable>
 where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
@@ -165,7 +165,7 @@ where
 }
 
 impl<CpuImpl, RuntimeStateImpl, FileSystem> IoView
-    for ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem>
+    for ComponentStoreData<CpuImpl, RuntimeStateImpl, FileSystem, ResourceTable>
 where
     CpuImpl: Cpu + Clone,
     RuntimeStateImpl: ComponentRuntimeState,
@@ -253,10 +253,7 @@ impl ChannelOutputStream {
 
 #[wasmtime_wasi_io::async_trait]
 impl Pollable for ChannelOutputStream {
-    async fn ready(&mut self) {
-        // Always ready to accept writes; back-pressure is not modelled on
-        // the unbounded child IO channel.
-    }
+    async fn ready(&mut self) {}
 }
 
 #[wasmtime_wasi_io::async_trait]

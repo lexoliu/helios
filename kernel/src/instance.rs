@@ -3,13 +3,13 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use spin::Mutex;
 
 const INACTIVE_RESUME_AT: u64 = u64::MAX;
 
-/// Default OOM-killer cost score for plain user-mode wasm programs.
+/// Default OOM-killer cost score for plain user-mode programs.
 pub const DEFAULT_RESTART_COST: u32 = 1;
 /// Cost score for kernel plugins (e.g. compiler). Higher than user
 /// programs because restarting is expensive (plugin runtime cache
@@ -113,6 +113,7 @@ struct InstanceRegistryInner {
     next_id: AtomicU64,
     entries: Mutex<Vec<Arc<InstanceEntry>>>,
     sampling: Mutex<SamplingState>,
+    kill_notifier: Mutex<fn()>,
 }
 
 struct InstanceEntry {
@@ -150,8 +151,13 @@ impl InstanceRegistry {
                 next_id: AtomicU64::new(1),
                 entries: Mutex::new(Vec::new()),
                 sampling: Mutex::new(SamplingState::default()),
+                kill_notifier: Mutex::new(noop_kill_notifier),
             }),
         }
+    }
+
+    pub fn set_kill_notifier(&self, notifier: fn()) {
+        *self.inner.kill_notifier.lock() = notifier;
     }
 
     pub fn register(&self, name: impl Into<String>, started_at: u64) -> RegisteredInstance {
@@ -229,8 +235,8 @@ impl InstanceRegistry {
     /// the guest. Returns true if the kill flag was actually flipped
     /// (i.e. the instance existed and was not already condemned).
     ///
-    /// On a successful flip, the wasmtime engine epoch is bumped so
-    /// any guest currently in pure-wasm (no WASI host calls) hits its
+    /// On a successful flip, the runtime engine epoch is bumped so
+    /// any guest currently running without host calls hits its
     /// next `epoch_deadline_async_yield` boundary quickly and exposes
     /// the kill flag to `call_hook`. Without this kick a CPU-bound
     /// victim could run until its next host call, which on adversarial
@@ -247,7 +253,8 @@ impl InstanceRegistry {
             .is_ok();
         drop(entries);
         if flipped {
-            crate::wasmtime_adapter::bump_user_engine_epoch();
+            let notify = *self.inner.kill_notifier.lock();
+            notify();
         }
         flipped
     }
@@ -319,6 +326,8 @@ impl Default for InstanceRegistry {
         Self::new()
     }
 }
+
+fn noop_kill_notifier() {}
 
 pub fn record_instance_transition(
     instance: &RegisteredInstance,

@@ -458,8 +458,8 @@ pub(crate) fn handle_tlb_shootdown_interrupt() {
 /// internally.
 pub(crate) fn send_wake_ipi(target_apic_id: u32) {
     use x86::apic::{
-        ApicControl, ApicId, DeliveryMode, DeliveryStatus, DestinationMode,
-        DestinationShorthand, Icr, Level, TriggerMode,
+        ApicControl, ApicId, DeliveryMode, DeliveryStatus, DestinationMode, DestinationShorthand,
+        Icr, Level, TriggerMode,
     };
     let runtime = current_runtime();
     match local_apic_mode(target_apic_id) {
@@ -501,8 +501,8 @@ pub(crate) fn send_wake_ipi(target_apic_id: u32) {
 
 fn send_tlb_shootdown_ipi_all_excluding_self() {
     use x86::apic::{
-        ApicControl, ApicId, DeliveryMode, DeliveryStatus, DestinationMode,
-        DestinationShorthand, Icr, Level, TriggerMode,
+        ApicControl, ApicId, DeliveryMode, DeliveryStatus, DestinationMode, DestinationShorthand,
+        Icr, Level, TriggerMode,
     };
     let runtime = current_runtime();
     match local_apic_mode(0) {

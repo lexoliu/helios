@@ -3,7 +3,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use async_io::Timer;
-use futures_lite::{future, StreamExt as _};
+use futures_lite::{StreamExt as _, future};
 
 pub(crate) enum CommandRun<T> {
     Completed(T),

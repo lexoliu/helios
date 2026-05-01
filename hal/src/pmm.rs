@@ -96,10 +96,7 @@ impl PhysFrameRange {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub enum FrameAllocError {
     #[error("requested {requested} frames but pool has only {available} free")]
-    OutOfFrames {
-        requested: usize,
-        available: usize,
-    },
+    OutOfFrames { requested: usize, available: usize },
     #[error("requested {requested} contiguous frames; largest free run is {largest}")]
     Fragmented { requested: usize, largest: usize },
 }

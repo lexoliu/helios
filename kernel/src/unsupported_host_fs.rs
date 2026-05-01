@@ -1,5 +1,6 @@
 extern crate alloc;
 
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::{HostDirEntry, HostFileSystem, HostFsError, HostMetadata};
@@ -20,24 +21,23 @@ fn unsupported<T>() -> core::future::Ready<Result<T, HostFsError>> {
 }
 
 impl HostFileSystem for UnsupportedHostFileSystem {
-    type StatFuture<'a> = core::future::Ready<Result<HostMetadata, HostFsError>>;
-    type ReadDirFuture<'a> = core::future::Ready<Result<Vec<HostDirEntry>, HostFsError>>;
-    type ReadFileFuture<'a> = core::future::Ready<Result<Vec<u8>, HostFsError>>;
-    type ReadFileRangeFuture<'a> = core::future::Ready<Result<Vec<u8>, HostFsError>>;
-    type WriteFileFuture<'a> = core::future::Ready<Result<(), HostFsError>>;
-    type TruncateFileFuture<'a> = core::future::Ready<Result<(), HostFsError>>;
-    type CreateFileFuture<'a> = core::future::Ready<Result<(), HostFsError>>;
-    type CreateDirectoryFuture<'a> = core::future::Ready<Result<(), HostFsError>>;
-    type RemoveFuture<'a> = core::future::Ready<Result<(), HostFsError>>;
-    type RenameFuture<'a> = core::future::Ready<Result<(), HostFsError>>;
-
-    fn stat_path(&self, _path: &str) -> Self::StatFuture<'_> {
+    fn stat_path(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = Result<HostMetadata, HostFsError>> + Send + '_ {
         unsupported()
     }
-    fn read_dir(&self, _path: &str) -> Self::ReadDirFuture<'_> {
+    fn read_dir(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = Result<Vec<HostDirEntry>, HostFsError>> + Send + '_
+    {
         unsupported()
     }
-    fn read_file(&self, _path: &str) -> Self::ReadFileFuture<'_> {
+    fn read_file(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = Result<Vec<u8>, HostFsError>> + Send + '_ {
         unsupported()
     }
     fn read_file_range(
@@ -45,25 +45,67 @@ impl HostFileSystem for UnsupportedHostFileSystem {
         _path: &str,
         _offset: u64,
         _max_bytes: u32,
-    ) -> Self::ReadFileRangeFuture<'_> {
+    ) -> impl core::future::Future<Output = Result<Vec<u8>, HostFsError>> + Send + '_ {
         unsupported()
     }
-    fn write_file(&self, _path: &str, _offset: u64, _bytes: &[u8]) -> Self::WriteFileFuture<'_> {
+    fn write_file(
+        &self,
+        _path: &str,
+        _offset: u64,
+        _bytes: &[u8],
+    ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
         unsupported()
     }
-    fn truncate_file(&self, _path: &str) -> Self::TruncateFileFuture<'_> {
+    fn truncate_file(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
         unsupported()
     }
-    fn create_file(&self, _path: &str) -> Self::CreateFileFuture<'_> {
+    fn create_file(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
         unsupported()
     }
-    fn create_directory(&self, _path: &str) -> Self::CreateDirectoryFuture<'_> {
+    fn create_directory(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
         unsupported()
     }
-    fn remove(&self, _path: &str, _directory: bool) -> Self::RemoveFuture<'_> {
+    fn remove(
+        &self,
+        _path: &str,
+        _directory: bool,
+    ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
         unsupported()
     }
-    fn rename(&self, _source: &str, _destination: &str) -> Self::RenameFuture<'_> {
+    fn rename(
+        &self,
+        _source: &str,
+        _destination: &str,
+    ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
+        unsupported()
+    }
+    fn hard_link(
+        &self,
+        _source: &str,
+        _destination: &str,
+    ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
+        unsupported()
+    }
+    fn symlink(
+        &self,
+        _target: &str,
+        _link_path: &str,
+    ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
+        unsupported()
+    }
+    fn read_link(
+        &self,
+        _path: &str,
+    ) -> impl core::future::Future<Output = Result<String, HostFsError>> + Send + '_ {
         unsupported()
     }
 }

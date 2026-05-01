@@ -32,8 +32,8 @@ use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{
     AddressSpace, AddressSpaceError, PageFlags, Translation, VirtAddr, VirtRange,
 };
-use helios_kernel::custom_vm::{
-    self, CustomVmHooks, WasmtimeMemoryImage, default_memory_image_free,
+use helios_kernel::runtime_memory::{
+    self, RuntimeMemoryHooks, RuntimeMemoryImage, default_memory_image_free,
     default_memory_image_map_at, default_memory_image_new, default_page_size,
 };
 use helios_kernel::{allocate_user_frame_zeroed, deallocate_user_frame};
@@ -145,9 +145,7 @@ impl Aarch64UserAddressSpace {
             return (phys + self.physical_memory_offset) as *mut u64;
         }
         if entry & VALID != 0 {
-            panic!(
-                "Aarch64 user-VA L? index {index:#x} collides with a non-table descriptor"
-            );
+            panic!("Aarch64 user-VA L? index {index:#x} collides with a non-table descriptor");
         }
         let layout = Layout::from_size_align(PAGE, PAGE).expect("PT layout");
         let raw = unsafe { alloc_zeroed(layout) };
@@ -485,7 +483,7 @@ impl AddressSpace for Aarch64UserAddressSpace {
         validate_range(virt)?;
         let pte_flags = page_flags_to_pte(flags)?;
         // Walk the page table directly rather than constraining the
-        // call to a single bookkeeping `CommittedRegion`. Wasmtime's
+        // call to a single bookkeeping `CommittedRegion`. The runtime's
         // `make_readonly` / `make_executable` routinely span what
         // we recorded as separate commits (e.g. when a code memory
         // is committed in halves and then protected as a single
@@ -641,10 +639,7 @@ fn remove_committed_range(regions: &mut Vec<CommittedRegion>, range: VirtRange) 
         }
         if range.end().raw() < region.range.end().raw() {
             regions.push(CommittedRegion {
-                range: VirtRange::new(
-                    range.end(),
-                    region.range.end().raw() - range.end().raw(),
-                ),
+                range: VirtRange::new(range.end(), region.range.end().raw() - range.end().raw()),
                 flags: region.flags,
             });
         }
@@ -683,21 +678,20 @@ unsafe fn invalidate_tlb_one(virt: usize) {
 }
 
 /// Boot-time singleton holding the live `Aarch64UserAddressSpace`.
-/// `install_user_address_space` is the only writer; the wasmtime
+/// `install_user_address_space` is the only writer; the runtime
 /// custom-virtual-memory hooks are the only readers. The Once means
 /// the AS is in BSS until the first `call_once`, after which every
 /// access is a single atomic load.
 static USER_AS: Once<Aarch64UserAddressSpace> = Once::new();
 
 /// Initialise the boot-time user address space and register its
-/// wasmtime custom-virtual-memory hooks. Must be called once on the
-/// bootstrap hart, before any wasmtime engine is constructed —
-/// wasmtime's first `Mmap::accessible_reserved` call resolves to
-/// `wasmtime_mmap_new`, which dispatches through the kernel's
-/// `custom_vm::install_hooks` table to the function pointers below.
+/// runtime custom-virtual-memory hooks. Must be called once on the
+/// bootstrap hart, before any runtime engine is constructed. The
+/// runtime's first reserved-memory call dispatches through the kernel's
+/// `runtime_memory::install_hooks` table to the function pointers below.
 pub fn install_user_address_space(physical_memory_offset: usize) {
     USER_AS.call_once(|| Aarch64UserAddressSpace::new(physical_memory_offset));
-    custom_vm::install_hooks(&AARCH64_VMM_HOOKS);
+    runtime_memory::install_hooks(&AARCH64_VMM_HOOKS);
 }
 
 fn user_as() -> &'static Aarch64UserAddressSpace {
@@ -773,7 +767,7 @@ extern "C" fn aarch64_mmap_new(size: usize, prot_flags: u32, ret: &mut *mut u8) 
 }
 
 extern "C" fn aarch64_mmap_remap(addr: *mut u8, size: usize, prot_flags: u32) -> c_int {
-    // wasmtime's `mmap_remap` semantically rebinds an existing
+    // The runtime's `mmap_remap` semantically rebinds an existing
     // mapping to fresh anonymous-zero pages with `prot_flags`. Our
     // AddressSpace cannot atomically swap to brand-new frames in a
     // single transaction (that's what `relocate` will eventually
@@ -782,7 +776,7 @@ extern "C" fn aarch64_mmap_remap(addr: *mut u8, size: usize, prot_flags: u32) ->
     // allocator, commit grabs fresh frames from the unified user-memory
     // pool and maps them at the same virtual range with the requested flags. The
     // intermediate window where the range is uncommitted is
-    // invisible to wasmtime because remap is called between
+    // invisible to the runtime because remap is called between
     // instances on a slot the runtime guarantees no thread is
     // touching.
     let size = round_up_to_page(size);
@@ -899,12 +893,12 @@ fn ensure_accessible(
     Ok(())
 }
 
-/// Wasmtime custom-virtual-memory hook table for the aarch64
+/// Runtime custom-virtual-memory hook table for the aarch64
 /// backend. Address-space mutations route through the singleton
 /// `Aarch64UserAddressSpace`; COW image creation is opted out of
-/// (`default_memory_image_new` returns `NULL`), so wasmtime falls
+/// (`default_memory_image_new` returns `NULL`), so the runtime falls
 /// back to per-instance memcpy initialization for now.
-pub static AARCH64_VMM_HOOKS: CustomVmHooks = CustomVmHooks {
+pub static AARCH64_VMM_HOOKS: RuntimeMemoryHooks = RuntimeMemoryHooks {
     mmap_new: aarch64_mmap_new,
     mmap_remap: aarch64_mmap_remap,
     munmap: aarch64_munmap,
@@ -916,10 +910,10 @@ pub static AARCH64_VMM_HOOKS: CustomVmHooks = CustomVmHooks {
 };
 
 const _: () = {
-    // Pin the C ABI so a wasmtime ABI revision that changes the
-    // `WasmtimeMemoryImage` opaque ptr type fails the build instead
+    // Pin the C ABI so a runtime ABI revision that changes the
+    // `RuntimeMemoryImage` opaque ptr type fails the build instead
     // of mismatching at link time.
-    let _: extern "C" fn(*const u8, usize, &mut *mut WasmtimeMemoryImage) -> c_int =
+    let _: extern "C" fn(*const u8, usize, &mut *mut RuntimeMemoryImage) -> c_int =
         default_memory_image_new;
 };
 

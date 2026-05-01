@@ -20,12 +20,13 @@ mod debug_state {
 use alloc::sync::Arc;
 use core::arch::asm;
 use core::arch::global_asm;
-use core::arch::x86_64::{__cpuid, __cpuid_count, _rdtsc};
+use core::arch::x86_64::{__cpuid, __cpuid_count, _rdrand64_step, _rdtsc};
 use core::fmt::{self, Write};
 use core::ops::Range;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use helios_hal::boot::BootMemoryMap;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
+use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
 use helios_hal::watchdog::Watchdog;
@@ -472,9 +473,9 @@ impl X86Cpu {
         }
 
         let start = ptr as usize;
-        let end = start
-            .checked_add(len - 1)
-            .unwrap_or_else(|| panic!("code executable range overflow: start={start:#x}, len={len}"));
+        let end = start.checked_add(len - 1).unwrap_or_else(|| {
+            panic!("code executable range overflow: start={start:#x}, len={len}")
+        });
         let first_page = start & !PAGE_MASK;
         let last_page = end & !PAGE_MASK;
         let mut page = first_page;
@@ -567,6 +568,14 @@ impl Cpu for X86Cpu {
         Some(detect_x86_native_feature)
     }
 
+    fn fill_entropy(&self, buffer: &mut [u8]) -> Result<EntropyQuality, EntropyUnavailable> {
+        if !x86_has_rdrand() {
+            return Err(EntropyUnavailable);
+        }
+        fill_with_rdrand(buffer);
+        Ok(EntropyQuality::Cryptographic)
+    }
+
     fn shutdown(&self) -> ! {
         loop {
             core::hint::spin_loop();
@@ -581,6 +590,38 @@ impl Cpu for X86Cpu {
             core::hint::spin_loop();
         }
     }
+}
+
+fn x86_has_rdrand() -> bool {
+    unsafe { __cpuid(1) }.ecx & (1 << 30) != 0
+}
+
+fn fill_with_rdrand(buffer: &mut [u8]) {
+    let mut chunks = buffer.chunks_exact_mut(core::mem::size_of::<u64>());
+    for chunk in chunks.by_ref() {
+        chunk.copy_from_slice(&rdrand64().to_le_bytes());
+    }
+
+    let remainder = chunks.into_remainder();
+    if !remainder.is_empty() {
+        let word = rdrand64().to_le_bytes();
+        remainder.copy_from_slice(&word[..remainder.len()]);
+    }
+}
+
+#[target_feature(enable = "rdrand")]
+unsafe fn rdrand64_enabled() -> Option<u64> {
+    let mut value = 0_u64;
+    for _ in 0..10 {
+        if _rdrand64_step(&mut value) == 1 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn rdrand64() -> u64 {
+    unsafe { rdrand64_enabled() }.expect("x86 RDRAND failed after retries")
 }
 
 fn run_current_processor<WatchdogImpl>(
@@ -925,9 +966,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_tls_get() -> *mut u8 {
-    smp::current_runtime()
-        .wasmtime_tls
-        .load(Ordering::Acquire)
+    smp::current_runtime().wasmtime_tls.load(Ordering::Acquire)
 }
 
 #[unsafe(no_mangle)]

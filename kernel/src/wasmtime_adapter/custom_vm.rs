@@ -39,15 +39,15 @@ pub struct CustomVmHooks {
     pub munmap: extern "C" fn(ptr: *mut u8, size: usize) -> c_int,
     pub mprotect: extern "C" fn(ptr: *mut u8, size: usize, prot_flags: u32) -> c_int,
     pub page_size: extern "C" fn() -> usize,
-    pub memory_image_new: extern "C" fn(
-        ptr: *const u8,
-        len: usize,
-        ret: &mut *mut WasmtimeMemoryImage,
-    ) -> c_int,
+    pub memory_image_new:
+        extern "C" fn(ptr: *const u8, len: usize, ret: &mut *mut WasmtimeMemoryImage) -> c_int,
     pub memory_image_free: extern "C" fn(image: *mut WasmtimeMemoryImage),
     pub memory_image_map_at:
         extern "C" fn(image: *mut WasmtimeMemoryImage, addr: *mut u8, len: usize) -> c_int,
 }
+
+pub type RuntimeMemoryHooks = CustomVmHooks;
+pub type RuntimeMemoryImage = WasmtimeMemoryImage;
 
 static HOOKS: AtomicPtr<CustomVmHooks> = AtomicPtr::new(ptr::null_mut());
 
@@ -110,20 +110,12 @@ pub extern "C" fn default_page_size() -> usize {
 }
 
 #[unsafe(no_mangle)]
-unsafe extern "C" fn wasmtime_mmap_new(
-    size: usize,
-    prot_flags: u32,
-    ret: &mut *mut u8,
-) -> c_int {
+unsafe extern "C" fn wasmtime_mmap_new(size: usize, prot_flags: u32, ret: &mut *mut u8) -> c_int {
     (hooks().mmap_new)(size, prot_flags, ret)
 }
 
 #[unsafe(no_mangle)]
-unsafe extern "C" fn wasmtime_mmap_remap(
-    addr: *mut u8,
-    size: usize,
-    prot_flags: u32,
-) -> c_int {
+unsafe extern "C" fn wasmtime_mmap_remap(addr: *mut u8, size: usize, prot_flags: u32) -> c_int {
     (hooks().mmap_remap)(addr, size, prot_flags)
 }
 
@@ -133,11 +125,7 @@ unsafe extern "C" fn wasmtime_munmap(ptr: *mut u8, size: usize) -> c_int {
 }
 
 #[unsafe(no_mangle)]
-unsafe extern "C" fn wasmtime_mprotect(
-    ptr: *mut u8,
-    size: usize,
-    prot_flags: u32,
-) -> c_int {
+unsafe extern "C" fn wasmtime_mprotect(ptr: *mut u8, size: usize, prot_flags: u32) -> c_int {
     (hooks().mprotect)(ptr, size, prot_flags)
 }
 

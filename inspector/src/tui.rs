@@ -7,10 +7,10 @@ use async_channel::Receiver;
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 
 pub(crate) type ShellTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
@@ -59,17 +59,19 @@ impl Drop for Session {
 
 pub(crate) fn spawn_events() -> Receiver<CrosstermEvent> {
     let (tx, rx) = async_channel::unbounded();
-    thread::spawn(move || loop {
-        match event::poll(Duration::from_millis(100)) {
-            Ok(false) => {}
-            Ok(true) => {
-                let event = event::read()
-                    .unwrap_or_else(|error| panic!("failed to read TUI event: {error}"));
-                if tx.send_blocking(event).is_err() {
-                    break;
+    thread::spawn(move || {
+        loop {
+            match event::poll(Duration::from_millis(100)) {
+                Ok(false) => {}
+                Ok(true) => {
+                    let event = event::read()
+                        .unwrap_or_else(|error| panic!("failed to read TUI event: {error}"));
+                    if tx.send_blocking(event).is_err() {
+                        break;
+                    }
                 }
+                Err(error) => panic!("failed to poll TUI events: {error}"),
             }
-            Err(error) => panic!("failed to poll TUI events: {error}"),
         }
     });
     rx

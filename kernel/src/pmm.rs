@@ -65,8 +65,7 @@ impl KernelPhysFrameAllocator {
         unsafe {
             self.heap.lock().add_to_heap(start, end);
         }
-        self.added_bytes
-            .fetch_add(end - start, Ordering::Release);
+        self.added_bytes.fetch_add(end - start, Ordering::Release);
     }
 }
 

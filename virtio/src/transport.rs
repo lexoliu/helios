@@ -35,6 +35,7 @@ pub enum DeviceType {
     Network = 1,
     Block = 2,
     Console = 3,
+    Entropy = 4,
     _9P = 9,
 }
 
@@ -107,6 +108,7 @@ impl<B: DeviceBus> VirtioMmioTransport<B> {
             1 => DeviceType::Network,
             2 => DeviceType::Block,
             3 => DeviceType::Console,
+            4 => DeviceType::Entropy,
             9 => DeviceType::_9P,
             _ => return Err(IoError::Unsupported),
         };

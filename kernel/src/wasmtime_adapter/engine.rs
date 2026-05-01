@@ -1,17 +1,29 @@
 use alloc::borrow::ToOwned;
-use alloc::format;
 use alloc::sync::Arc;
 
-use crate::UserMemoryCreator;
+use crate::wasmtime_adapter::user_memory::UserMemoryCreator;
 use helios_hal::cpu::Cpu;
 #[cfg(target_os = "none")]
 use helios_hal::pmm::PhysFrame;
-use wasmtime::component::{Component, Instance, TypedFunc};
-use wasmtime::{AsContextMut, Engine};
+use thiserror::Error;
 #[cfg(target_os = "none")]
 use wasmtime::CustomCodeMemory;
+use wasmtime::component::{Component, Instance, TypedFunc};
+use wasmtime::{AsContextMut, Engine};
 
 const WASI_CLI_RUN_FUNC: &str = "run";
+
+#[derive(Debug, Error)]
+enum WasiCliRunResolveError {
+    #[error("component export interface starting with `wasi:cli/run` was not found")]
+    RunInterfaceMissing,
+    #[error("component run interface was not found on instance")]
+    RunInterfaceExportMissing,
+    #[error("component run interface does not expose `run`")]
+    RunFunctionMissing,
+    #[error("component run function has an invalid type")]
+    RunFunctionTypeMismatch(#[source] wasmtime::Error),
+}
 
 #[cfg(target_os = "none")]
 struct PlatformCodeMemory<P> {
@@ -135,32 +147,18 @@ pub fn resolve_wasi_cli_run<T: 'static>(
                 ))
             .then(|| name.to_owned())
         })
-        .ok_or_else(|| {
-            wasmtime::Error::msg(format!(
-                "component export interface starting with `wasi:cli/run` was not found"
-            ))
-        })?;
+        .ok_or_else(|| wasmtime::Error::new(WasiCliRunResolveError::RunInterfaceMissing))?;
     let mut store = store.as_context_mut();
     let run_interface = instance
         .get_export_index(&mut store, None, &run_interface_name)
-        .ok_or_else(|| {
-            wasmtime::Error::msg(format!(
-                "component export interface `{run_interface_name}` was not found on instance"
-            ))
-        })?;
+        .ok_or_else(|| wasmtime::Error::new(WasiCliRunResolveError::RunInterfaceExportMissing))?;
     let run = instance
         .get_export_index(&mut store, Some(&run_interface), WASI_CLI_RUN_FUNC)
-        .ok_or_else(|| {
-            wasmtime::Error::msg(format!(
-                "component export `{run_interface_name}` does not expose `{WASI_CLI_RUN_FUNC}`"
-            ))
-        })?;
+        .ok_or_else(|| wasmtime::Error::new(WasiCliRunResolveError::RunFunctionMissing))?;
     instance
         .get_typed_func::<(), (core::result::Result<(), ()>,)>(&mut store, &run)
         .map_err(|error| {
-            wasmtime::Error::msg(format!(
-                "failed to type-check `{run_interface_name}.{WASI_CLI_RUN_FUNC}`: {error:#}"
-            ))
+            wasmtime::Error::new(WasiCliRunResolveError::RunFunctionTypeMismatch(error))
         })
 }
 
