@@ -422,6 +422,13 @@ enum WasixUdpSocket {
     Bound { socket: u64, local_port: u16 },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WasixSocketAuthority {
+    LocalOnly,
+    Tcp,
+    Udp,
+}
+
 #[derive(Clone)]
 struct EventFd {
     state: Arc<Mutex<EventFdState>>,
@@ -1555,6 +1562,14 @@ where
         self.authority
             .derive_udp_cap()
             .map_or(p1::errno::NOTCAPABLE, |_| p1::errno::SUCCESS)
+    }
+
+    fn require_socket_authority(&self, authority: WasixSocketAuthority) -> i32 {
+        match authority {
+            WasixSocketAuthority::LocalOnly => p1::errno::SUCCESS,
+            WasixSocketAuthority::Tcp => self.require_tcp_authority(),
+            WasixSocketAuthority::Udp => self.require_udp_authority(),
+        }
     }
 
     fn require_multicast_authority(&self) -> i32 {
@@ -9246,6 +9261,67 @@ where
     }
 }
 
+fn wasix_sock_recv_authority(
+    descriptor: Option<&Preview1Descriptor>,
+) -> Result<WasixSocketAuthority, i32> {
+    match descriptor {
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
+            ..
+        }))) => Ok(WasixSocketAuthority::Udp),
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound))) => {
+            Err(p1::errno::INVAL)
+        }
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
+            WasixTcpSocket::Connected { .. },
+        ))) => Ok(WasixSocketAuthority::Tcp),
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
+            WasixTcpSocket::Unconnected,
+        ))) => Err(p1::errno::INVAL),
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { .. })) => {
+            Ok(WasixSocketAuthority::LocalOnly)
+        }
+        Some(_) => Err(p1::errno::NOTSOCK),
+        None => Err(p1::errno::BADF),
+    }
+}
+
+fn wasix_sock_send_authority(
+    descriptor: Option<&Preview1Descriptor>,
+) -> Result<WasixSocketAuthority, i32> {
+    match descriptor {
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(_))) => {
+            Ok(WasixSocketAuthority::Udp)
+        }
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
+            WasixTcpSocket::Connected { .. },
+        ))) => Ok(WasixSocketAuthority::Tcp),
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
+            WasixTcpSocket::Unconnected,
+        ))) => Err(p1::errno::INVAL),
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { .. })) => {
+            Ok(WasixSocketAuthority::LocalOnly)
+        }
+        Some(_) => Err(p1::errno::NOTSOCK),
+        None => Err(p1::errno::BADF),
+    }
+}
+
+fn wasix_sock_bind_authority(
+    descriptor: Option<&Preview1Descriptor>,
+) -> Result<WasixSocketAuthority, i32> {
+    match descriptor {
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound))) => {
+            Ok(WasixSocketAuthority::Udp)
+        }
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
+            ..
+        }))) => Err(p1::errno::INVAL),
+        Some(Preview1Descriptor::Socket(_)) => Err(p1::errno::INVAL),
+        Some(_) => Err(p1::errno::NOTSOCK),
+        None => Err(p1::errno::BADF),
+    }
+}
+
 fn wasix_sock_get_opt_flag<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
@@ -9335,14 +9411,13 @@ where
         Err(errno) => return errno,
     };
     let descriptor = caller.data().descriptors.get(fd).cloned();
-    let socket = match descriptor {
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(socket))) => socket,
-        Some(Preview1Descriptor::Socket(_)) => return p1::errno::INVAL,
-        Some(_) => return p1::errno::NOTSOCK,
-        None => return p1::errno::BADF,
+    let authority = match wasix_sock_bind_authority(descriptor.as_ref()) {
+        Ok(authority) => authority,
+        Err(errno) => return errno,
     };
-    if matches!(socket, WasixUdpSocket::Bound { .. }) {
-        return p1::errno::INVAL;
+    let status = caller.data().require_socket_authority(authority);
+    if status != p1::errno::SUCCESS {
+        return status;
     }
     if port < 1024 {
         let status = caller.data().require_privileged_bind_authority();
@@ -9467,6 +9542,14 @@ where
         return p1::errno::OVERFLOW;
     };
     let descriptor = caller.data().descriptors.get(fd).cloned();
+    let authority = match wasix_sock_recv_authority(descriptor.as_ref()) {
+        Ok(authority) => authority,
+        Err(errno) => return errno,
+    };
+    let status = caller.data().require_socket_authority(authority);
+    if status != p1::errno::SUCCESS {
+        return status;
+    }
     match descriptor {
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
             socket,
@@ -9563,6 +9646,14 @@ where
         Err(errno) => return errno,
     };
     let descriptor = caller.data().descriptors.get(fd).cloned();
+    let authority = match wasix_sock_send_authority(descriptor.as_ref()) {
+        Ok(authority) => authority,
+        Err(errno) => return errno,
+    };
+    let status = caller.data().require_socket_authority(authority);
+    if status != p1::errno::SUCCESS {
+        return status;
+    }
     match descriptor {
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(socket))) => {
             let (Some(address), port) = (match wasix_read_addr_port(caller, memory, addr) {
@@ -9696,6 +9787,12 @@ where
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
             WasixTcpSocket::Connected { stream, .. },
         ))) => {
+            let status = caller
+                .data()
+                .require_socket_authority(WasixSocketAuthority::Tcp);
+            if status != p1::errno::SUCCESS {
+                return status;
+            }
             let Some(service) = caller.data().runtime_state.network_service() else {
                 return p1::errno::NETDOWN;
             };
@@ -11283,5 +11380,75 @@ mod tests {
             validate_preview1_program_import(WASIX_MODULE, import)
                 .expect("linked WASIX imports should validate");
         }
+    }
+
+    #[test]
+    fn wasix_socket_operations_select_network_authority_by_socket_kind() {
+        let tcp =
+            Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
+                stream: 1,
+                peer_address: crate::Ipv4Address::new([127, 0, 0, 1]),
+                peer_port: 80,
+            }));
+        let udp_bound =
+            Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
+                socket: 2,
+                local_port: 5353,
+            }));
+        let udp_unbound =
+            Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound));
+        let (left_writer, right_reader) = crate::byte_channel();
+        let pair = Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
+            reader: right_reader,
+            writer: left_writer,
+            carry: Vec::new(),
+        });
+        let nonsocket = Preview1Descriptor::Stdout;
+
+        assert_eq!(
+            wasix_sock_recv_authority(Some(&tcp)),
+            Ok(WasixSocketAuthority::Tcp)
+        );
+        assert_eq!(
+            wasix_sock_send_authority(Some(&tcp)),
+            Ok(WasixSocketAuthority::Tcp)
+        );
+        assert_eq!(
+            wasix_sock_recv_authority(Some(&udp_bound)),
+            Ok(WasixSocketAuthority::Udp)
+        );
+        assert_eq!(
+            wasix_sock_send_authority(Some(&udp_bound)),
+            Ok(WasixSocketAuthority::Udp)
+        );
+        assert_eq!(
+            wasix_sock_send_authority(Some(&udp_unbound)),
+            Ok(WasixSocketAuthority::Udp)
+        );
+        assert_eq!(
+            wasix_sock_bind_authority(Some(&udp_unbound)),
+            Ok(WasixSocketAuthority::Udp)
+        );
+        assert_eq!(
+            wasix_sock_recv_authority(Some(&pair)),
+            Ok(WasixSocketAuthority::LocalOnly)
+        );
+        assert_eq!(
+            wasix_sock_send_authority(Some(&pair)),
+            Ok(WasixSocketAuthority::LocalOnly)
+        );
+        assert_eq!(
+            wasix_sock_bind_authority(Some(&udp_bound)),
+            Err(p1::errno::INVAL)
+        );
+        assert_eq!(
+            wasix_sock_recv_authority(Some(&udp_unbound)),
+            Err(p1::errno::INVAL)
+        );
+        assert_eq!(
+            wasix_sock_send_authority(Some(&nonsocket)),
+            Err(p1::errno::NOTSOCK)
+        );
+        assert_eq!(wasix_sock_send_authority(None), Err(p1::errno::BADF));
     }
 }
