@@ -98,6 +98,7 @@ pub(crate) mod errno {
     pub(crate) const SPIPE: i32 = 70;
     pub(crate) const SRCH: i32 = 71;
     pub(crate) const TIMEDOUT: i32 = 73;
+    pub(crate) const XDEV: i32 = 75;
     pub(crate) const NOTCAPABLE: i32 = 76;
 }
 

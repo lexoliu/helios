@@ -5643,52 +5643,60 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "path_link",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             old_fd: i32,
-             old_flags: i32,
-             old_path: i32,
-             old_path_len: i32,
-             new_fd: i32,
-             new_path: i32,
-             new_path_len: i32|
-             -> i32 {
-                p1_path_link(
-                    &mut caller,
-                    old_fd,
-                    old_flags as u32,
-                    old_path as u32,
-                    old_path_len as u32,
-                    new_fd,
-                    new_path as u32,
-                    new_path_len as u32,
-                )
+             (old_fd, old_flags, old_path, old_path_len, new_fd, new_path, new_path_len): (
+                i32,
+                i32,
+                i32,
+                i32,
+                i32,
+                i32,
+                i32,
+            )| {
+                Box::new(async move {
+                    p1_path_link(
+                        &mut caller,
+                        old_fd,
+                        old_flags as u32,
+                        old_path as u32,
+                        old_path_len as u32,
+                        new_fd,
+                        new_path as u32,
+                        new_path_len as u32,
+                    )
+                    .await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "path_readlink",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             path: i32,
-             path_len: i32,
-             buf: i32,
-             buf_len: i32,
-             bufused: i32|
-             -> i32 {
-                p1_path_readlink(
-                    &mut caller,
-                    fd,
-                    path as u32,
-                    path_len as u32,
-                    buf as u32,
-                    buf_len as u32,
-                    bufused as u32,
-                )
+             (fd, path, path_len, buf, buf_len, bufused): (
+                i32,
+                i32,
+                i32,
+                i32,
+                i32,
+                i32,
+            )| {
+                Box::new(async move {
+                    p1_path_readlink(
+                        &mut caller,
+                        fd,
+                        path as u32,
+                        path_len as u32,
+                        buf as u32,
+                        buf_len as u32,
+                        bufused as u32,
+                    )
+                    .await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -5730,24 +5738,28 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "path_symlink",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             old_path: i32,
-             old_path_len: i32,
-             fd: i32,
-             new_path: i32,
-             new_path_len: i32|
-             -> i32 {
-                p1_path_symlink(
-                    &mut caller,
-                    old_path as u32,
-                    old_path_len as u32,
-                    fd,
-                    new_path as u32,
-                    new_path_len as u32,
-                )
+             (old_path, old_path_len, fd, new_path, new_path_len): (
+                i32,
+                i32,
+                i32,
+                i32,
+                i32,
+            )| {
+                Box::new(async move {
+                    p1_path_symlink(
+                        &mut caller,
+                        old_path as u32,
+                        old_path_len as u32,
+                        fd,
+                        new_path as u32,
+                        new_path_len as u32,
+                    )
+                    .await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -7055,7 +7067,7 @@ where
     p1_write_filestat(caller, stat, stat_value)
 }
 
-fn p1_path_link<CpuImpl, HostFs>(
+async fn p1_path_link<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     old_fd: i32,
     _old_flags: u32,
@@ -7089,6 +7101,51 @@ where
     };
     let source_base = source_base.clone();
     let destination_base = destination_base.clone();
+    let source_absolute = match crate::resolve_child_path(&source_base.path, &old_path) {
+        Ok(path) => path,
+        Err(error) => return p1_errno_from_component_path(error),
+    };
+    let destination_absolute = match crate::resolve_child_path(&destination_base.path, &new_path) {
+        Ok(path) => path,
+        Err(error) => return p1_errno_from_component_path(error),
+    };
+    let source_host = crate::guest_host_share_path(&source_absolute).map(ToOwned::to_owned);
+    let destination_host =
+        crate::guest_host_share_path(&destination_absolute).map(ToOwned::to_owned);
+    if source_host.is_some() || destination_host.is_some() {
+        if source_base.kind != FsNodeKind::Directory
+            || destination_base.kind != FsNodeKind::Directory
+        {
+            return p1::errno::NOTDIR;
+        }
+        if !destination_base
+            .flags
+            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
+        {
+            return p1::errno::ROFS;
+        }
+        let Some(source_host) = source_host else {
+            return p1::errno::XDEV;
+        };
+        let Some(destination_host) = destination_host else {
+            return p1::errno::XDEV;
+        };
+        let service = match caller.data().filesystem.host_service() {
+            Ok(service) => service,
+            Err(error) => return p1_errno_from_fs(error),
+        };
+        return service
+            .hard_link(&source_host, &destination_host)
+            .await
+            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
+            .map_or_else(p1_errno_from_fs, |_| {
+                caller
+                    .data_mut()
+                    .filesystem
+                    .invalidate_host_subtree(&destination_absolute);
+                p1::errno::SUCCESS
+            });
+    }
     let now_nanos = caller.data().now_nanos();
     caller
         .data_mut()
@@ -7103,7 +7160,7 @@ where
         .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
 }
 
-fn p1_path_readlink<CpuImpl, HostFs>(
+async fn p1_path_readlink<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     path: u32,
@@ -7127,9 +7184,35 @@ where
         return p1::errno::BADF;
     };
     let base = base.clone();
-    let payload = match caller.data().filesystem.readlink_at(&base, &path) {
-        Ok(payload) => payload,
-        Err(error) => return p1_errno_from_fs(error),
+    let absolute = match crate::resolve_child_path(&base.path, &path) {
+        Ok(path) => path,
+        Err(error) => return p1_errno_from_component_path(error),
+    };
+    let payload = if let Some(host_path) = crate::guest_host_share_path(&absolute) {
+        if base.kind != FsNodeKind::Directory {
+            return p1::errno::NOTDIR;
+        }
+        let service = match caller.data().filesystem.host_service() {
+            Ok(service) => service,
+            Err(error) => return p1_errno_from_fs(error),
+        };
+        let payload = match service.read_link(host_path).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
+            }
+        };
+        if let Err(error) =
+            crate::wasmtime_adapter::wasi::resolve_symlink_payload(&absolute, &payload)
+        {
+            return p1_errno_from_fs(error);
+        }
+        payload
+    } else {
+        match caller.data().filesystem.readlink_at(&base, &path) {
+            Ok(payload) => payload,
+            Err(error) => return p1_errno_from_fs(error),
+        }
     };
     let bytes = payload.as_bytes();
     let copied = (buf_len as usize).min(bytes.len());
@@ -7219,7 +7302,7 @@ where
         .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
 }
 
-fn p1_path_symlink<CpuImpl, HostFs>(
+async fn p1_path_symlink<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     old_path: u32,
     old_path_len: u32,
@@ -7246,6 +7329,40 @@ where
         return p1::errno::BADF;
     };
     let base = base.clone();
+    let absolute = match crate::resolve_child_path(&base.path, &new_path) {
+        Ok(path) => path,
+        Err(error) => return p1_errno_from_component_path(error),
+    };
+    if let Err(error) = crate::wasmtime_adapter::wasi::resolve_symlink_payload(&absolute, &old_path)
+    {
+        return p1_errno_from_fs(error);
+    }
+    if let Some(host_path) = crate::guest_host_share_path(&absolute) {
+        if base.kind != FsNodeKind::Directory {
+            return p1::errno::NOTDIR;
+        }
+        if !base
+            .flags
+            .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
+        {
+            return p1::errno::ROFS;
+        }
+        let service = match caller.data().filesystem.host_service() {
+            Ok(service) => service,
+            Err(error) => return p1_errno_from_fs(error),
+        };
+        return service
+            .symlink(&old_path, host_path)
+            .await
+            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
+            .map_or_else(p1_errno_from_fs, |_| {
+                caller
+                    .data_mut()
+                    .filesystem
+                    .invalidate_host_subtree(&absolute);
+                p1::errno::SUCCESS
+            });
+    }
     let now_nanos = caller.data().now_nanos();
     caller
         .data_mut()
@@ -11214,6 +11331,7 @@ fn p1_errno_from_fs(error: fs_types::ErrorCode) -> i32 {
         fs_types::ErrorCode::Overflow => p1::errno::OVERFLOW,
         fs_types::ErrorCode::NotPermitted => p1::errno::PERM,
         fs_types::ErrorCode::ReadOnly => p1::errno::ROFS,
+        fs_types::ErrorCode::CrossDevice => p1::errno::XDEV,
         _ => p1::errno::IO,
     }
 }

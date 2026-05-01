@@ -1214,7 +1214,7 @@ fn append_path_suffix(path: &str, suffix: &str) -> String {
     combined
 }
 
-fn resolve_symlink_payload(
+pub(crate) fn resolve_symlink_payload(
     link_path: &str,
     payload: &str,
 ) -> core::result::Result<String, fs_types::ErrorCode> {
