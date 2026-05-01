@@ -79,7 +79,6 @@ enum VmBlockProfile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VmHostShareProfile {
     Virtio9pMmio,
-    Virtio9pPci,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,9 +125,9 @@ const AARCH64_VIRT_HVF_PROFILE: VmProfile = VmProfile {
     default_cpu: Some("host"),
     boot_artifact: VmBootArtifactKind::LimineUefiDiskImage,
     console: VmConsoleProfile::SerialUnixSocket,
-    network: Some(VmNetworkProfile::VirtioPciUser),
+    network: Some(VmNetworkProfile::VirtioMmioUser),
     block: Some(VmBlockProfile::VirtioPciBootDisk),
-    host_share: Some(VmHostShareProfile::Virtio9pPci),
+    host_share: Some(VmHostShareProfile::Virtio9pMmio),
     entropy: Some(VmEntropyProfile::FwCfgSeed),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
 };
@@ -147,9 +146,9 @@ const AARCH64_VIRT_TCG_PROFILE: VmProfile = VmProfile {
     default_cpu: Some("max"),
     boot_artifact: VmBootArtifactKind::LimineUefiDiskImage,
     console: VmConsoleProfile::SerialUnixSocket,
-    network: Some(VmNetworkProfile::VirtioPciUser),
+    network: Some(VmNetworkProfile::VirtioMmioUser),
     block: Some(VmBlockProfile::VirtioPciBootDisk),
-    host_share: Some(VmHostShareProfile::Virtio9pPci),
+    host_share: Some(VmHostShareProfile::Virtio9pMmio),
     entropy: Some(VmEntropyProfile::FwCfgSeed),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
 };
@@ -1488,15 +1487,6 @@ fn configure_host_share(qemu: &mut Command, host_share: VmHostShareProfile, shar
                 "virtio-9p-device,fsdev=hostfs,mount_tag={HOST_SHARE_MOUNT_TAG}"
             ));
         }
-        VmHostShareProfile::Virtio9pPci => {
-            qemu.arg("-fsdev").arg(format!(
-                "local,id=hostfs,path={},security_model=none,multidevs=remap",
-                shared_dir.display()
-            ));
-            qemu.arg("-device").arg(format!(
-                "virtio-9p-pci,fsdev=hostfs,mount_tag={HOST_SHARE_MOUNT_TAG}"
-            ));
-        }
     }
 }
 
@@ -1576,7 +1566,7 @@ mod tests {
         );
         assert_eq!(
             AARCH64_VIRT_HVF_PROFILE.network,
-            Some(VmNetworkProfile::VirtioPciUser)
+            Some(VmNetworkProfile::VirtioMmioUser)
         );
         assert_eq!(
             AARCH64_VIRT_HVF_PROFILE.block,
@@ -1584,7 +1574,7 @@ mod tests {
         );
         assert_eq!(
             AARCH64_VIRT_HVF_PROFILE.host_share,
-            Some(VmHostShareProfile::Virtio9pPci)
+            Some(VmHostShareProfile::Virtio9pMmio)
         );
         assert_eq!(
             AARCH64_VIRT_HVF_PROFILE.entropy,

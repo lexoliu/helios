@@ -2,6 +2,7 @@ use alloc::string::String;
 use alloc::vec;
 
 use async_lock::Mutex;
+use core::future::Future;
 use helios_hal::io::{IoError, IoResult};
 
 use crate::notify::Notify;
@@ -85,6 +86,20 @@ impl<T: VirtioTransport> Virtio9pDevice<T> {
     }
 
     pub async fn request(&self, request: &[u8], response: &mut [u8]) -> IoResult<u32> {
+        self.request_with_wait(request, response, || self.interrupts.notified())
+            .await
+    }
+
+    pub async fn request_with_wait<Wait, WaitFuture>(
+        &self,
+        request: &[u8],
+        response: &mut [u8],
+        mut wait: Wait,
+    ) -> IoResult<u32>
+    where
+        Wait: FnMut() -> WaitFuture,
+        WaitFuture: Future<Output = ()>,
+    {
         if request.is_empty() || response.len() < HEADER_SIZE {
             return Err(IoError::InvalidBufferLength {
                 required_multiple: HEADER_SIZE,
@@ -93,7 +108,7 @@ impl<T: VirtioTransport> Virtio9pDevice<T> {
         }
 
         let mut queue = self.queue.lock().await;
-        let token = queue.submit(&[request], &mut [response])?;
+        let token = queue.submit(&self.transport, &[request], &mut [response])?;
         queue.notify(&self.transport);
 
         let used_len = loop {
@@ -102,7 +117,7 @@ impl<T: VirtioTransport> Virtio9pDevice<T> {
                 break len;
             }
 
-            self.interrupts.notified().await;
+            wait().await;
         };
 
         let header_len = u32::from_le_bytes([response[0], response[1], response[2], response[3]]);

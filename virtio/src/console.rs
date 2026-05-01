@@ -96,7 +96,7 @@ impl<T: VirtioTransport> VirtioConsoleDevice<T> {
         let mut queue = self.transmit.lock();
         for chunk in bytes.chunks(TRANSMIT_CHUNK_SIZE) {
             let mut outputs: [&mut [u8]; 0] = [];
-            let token = queue.submit(&[chunk], &mut outputs)?;
+            let token = queue.submit(&self.transport, &[chunk], &mut outputs)?;
             queue.notify(&self.transport);
             loop {
                 if let Some((used, _len)) = queue.pop_used_with_len() {
@@ -185,7 +185,7 @@ impl<T: VirtioTransport> ReceiveState<T> {
         }
 
         let mut outputs = [self.buffer.as_mut()];
-        let token = self.queue.submit(&[], &mut outputs)?;
+        let token = self.queue.submit(transport, &[], &mut outputs)?;
         self.queue.notify(transport);
         self.token = Some(token);
         Ok(())

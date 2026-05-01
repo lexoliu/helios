@@ -86,7 +86,12 @@ impl<T: VirtioTransport> VirtQueue<T> {
         })
     }
 
-    pub fn submit(&mut self, inputs: &[&[u8]], outputs: &mut [&mut [u8]]) -> IoResult<u16> {
+    pub fn submit(
+        &mut self,
+        transport: &T,
+        inputs: &[&[u8]],
+        outputs: &mut [&mut [u8]],
+    ) -> IoResult<u16> {
         if inputs.is_empty() && outputs.is_empty() {
             return Err(IoError::DeviceFault);
         }
@@ -100,11 +105,11 @@ impl<T: VirtioTransport> VirtQueue<T> {
         let mut last = self.free_head;
 
         for buffer in inputs {
-            last = self.push_descriptor(buffer, false);
+            last = self.push_descriptor(transport, buffer, false)?;
         }
 
         for output in outputs.iter_mut() {
-            last = self.push_descriptor(output, true);
+            last = self.push_descriptor(transport, output, true)?;
         }
 
         self.desc_shadow[usize::from(last)].flags &= !DESC_FLAG_NEXT;
@@ -143,25 +148,26 @@ impl<T: VirtioTransport> VirtQueue<T> {
         transport.notify_queue(self.index);
     }
 
-    fn push_descriptor(&mut self, buffer: &[u8], writable: bool) -> u16 {
+    fn push_descriptor(&mut self, transport: &T, buffer: &[u8], writable: bool) -> IoResult<u16> {
         assert!(!buffer.is_empty(), "virtqueue buffers must not be empty");
 
         let desc_index = self.free_head;
         let desc = &mut self.desc_shadow[usize::from(desc_index)];
+        let addr = transport.bus().dma().dma_addr(buffer.as_ptr())?;
         let mut flags = DESC_FLAG_NEXT;
         if writable {
             flags |= DESC_FLAG_WRITE;
         }
 
         *desc = Descriptor {
-            addr: buffer.as_ptr() as usize as u64,
+            addr,
             len: buffer.len() as u32,
             flags,
             next: desc.next,
         };
         self.free_head = desc.next;
         self.write_desc(desc_index);
-        desc_index
+        Ok(desc_index)
     }
 
     fn recycle_chain(&mut self, head: u16) {
@@ -281,6 +287,10 @@ mod tests {
             let ptr = NonNull::new(ptr).ok_or(IoError::DeviceFault)?;
             Ok(FakeDmaBuffer { ptr, layout })
         }
+
+        fn dma_addr(&self, ptr: *const u8) -> IoResult<u64> {
+            Ok(ptr as usize as u64)
+        }
     }
 
     impl DmaBuffer for FakeDmaBuffer {
@@ -382,7 +392,7 @@ mod tests {
         let input = [1u8; 16];
         let mut output = [0u8; 16];
         let token = queue
-            .submit(&[&input], &mut [&mut output])
+            .submit(&transport, &[&input], &mut [&mut output])
             .expect("submission should succeed");
         assert_eq!(token, 0);
 

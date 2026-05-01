@@ -184,7 +184,7 @@ impl<T: VirtioTransport> VirtioBlockDevice<T> {
         let mut outputs = [buf, response_bytes];
 
         let mut queue = self.queue.lock().await;
-        let token = queue.submit(&[request_bytes], &mut outputs)?;
+        let token = queue.submit(&self.transport, &[request_bytes], &mut outputs)?;
         queue.notify(&self.transport);
 
         loop {
@@ -210,7 +210,7 @@ impl<T: VirtioTransport> VirtioBlockDevice<T> {
         let mut outputs = [response_bytes];
 
         let mut queue = self.queue.lock().await;
-        let token = queue.submit(&[request_bytes, buf], &mut outputs)?;
+        let token = queue.submit(&self.transport, &[request_bytes, buf], &mut outputs)?;
         queue.notify(&self.transport);
 
         loop {

@@ -22,6 +22,7 @@ pub trait DmaPool: Send + Sync + 'static {
     type Buffer: DmaBuffer;
 
     fn allocate_zeroed(&self, layout: Layout) -> IoResult<Self::Buffer>;
+    fn dma_addr(&self, ptr: *const u8) -> IoResult<u64>;
 }
 
 pub trait DmaBuffer: Send + Sync + 'static {
@@ -40,6 +41,33 @@ pub struct IdentityDmaPool;
 pub struct IdentityDmaBuffer {
     ptr: NonNull<u8>,
     layout: Layout,
+}
+
+#[derive(Clone, Copy)]
+pub struct OffsetDmaPool {
+    virtual_to_physical_offset: usize,
+}
+
+pub struct OffsetDmaBuffer {
+    ptr: NonNull<u8>,
+    layout: Layout,
+    physical_address: u64,
+}
+
+impl OffsetDmaPool {
+    pub const fn new(virtual_to_physical_offset: usize) -> Self {
+        Self {
+            virtual_to_physical_offset,
+        }
+    }
+
+    fn translate(self, ptr: *const u8) -> IoResult<u64> {
+        let virtual_address = ptr as usize;
+        let physical_address = virtual_address
+            .checked_sub(self.virtual_to_physical_offset)
+            .ok_or(IoError::OutOfBounds)?;
+        Ok(physical_address as u64)
+    }
 }
 
 #[derive(Clone)]
@@ -91,6 +119,29 @@ impl DmaPool for IdentityDmaPool {
         let ptr = NonNull::new(ptr).ok_or(IoError::DeviceFault)?;
         Ok(IdentityDmaBuffer { ptr, layout })
     }
+
+    fn dma_addr(&self, ptr: *const u8) -> IoResult<u64> {
+        Ok(ptr as usize as u64)
+    }
+}
+
+impl DmaPool for OffsetDmaPool {
+    type Buffer = OffsetDmaBuffer;
+
+    fn allocate_zeroed(&self, layout: Layout) -> IoResult<Self::Buffer> {
+        let ptr = unsafe { alloc_zeroed(layout) };
+        let ptr = NonNull::new(ptr).ok_or(IoError::DeviceFault)?;
+        let physical_address = self.translate(ptr.as_ptr())?;
+        Ok(OffsetDmaBuffer {
+            ptr,
+            layout,
+            physical_address,
+        })
+    }
+
+    fn dma_addr(&self, ptr: *const u8) -> IoResult<u64> {
+        self.translate(ptr)
+    }
 }
 
 impl DmaBuffer for IdentityDmaBuffer {
@@ -107,7 +158,29 @@ impl DmaBuffer for IdentityDmaBuffer {
     }
 }
 
+impl DmaBuffer for OffsetDmaBuffer {
+    fn phys_addr(&self) -> u64 {
+        self.physical_address
+    }
+
+    fn as_ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+
+    fn len(&self) -> usize {
+        self.layout.size()
+    }
+}
+
 impl Drop for IdentityDmaBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            dealloc(self.ptr.as_ptr(), self.layout);
+        }
+    }
+}
+
+impl Drop for OffsetDmaBuffer {
     fn drop(&mut self) {
         unsafe {
             dealloc(self.ptr.as_ptr(), self.layout);
@@ -139,6 +212,8 @@ impl<P: DmaPool> DeviceBus for MmioBus<P> {
 
 unsafe impl Send for IdentityDmaBuffer {}
 unsafe impl Sync for IdentityDmaBuffer {}
+unsafe impl Send for OffsetDmaBuffer {}
+unsafe impl Sync for OffsetDmaBuffer {}
 
 unsafe impl<P: Send> Send for MmioBus<P> {}
 unsafe impl<P: Sync> Sync for MmioBus<P> {}

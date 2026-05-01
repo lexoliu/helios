@@ -75,7 +75,7 @@ impl<T: VirtioTransport> VirtioRngDevice<T> {
 
     fn fill_chunk(&self, buffer: &mut [u8]) -> IoResult<(u16, usize)> {
         let mut queue = self.queue.lock();
-        let token = queue.submit(&[], &mut [buffer])?;
+        let token = queue.submit(&self.transport, &[], &mut [buffer])?;
         queue.notify(&self.transport);
         loop {
             if let Some((used, len)) = queue.pop_used_with_len() {

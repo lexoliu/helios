@@ -68,6 +68,15 @@ const QEMU_FW_CFG_MMIO_BASE: usize = 0x0902_0000;
 const QEMU_FW_CFG_MMIO_SIZE: usize = 0x18;
 const FW_CFG_DATA: usize = 0x000;
 const FW_CFG_SELECTOR: usize = 0x008;
+const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976;
+const VIRTIO_MMIO_MODERN_VERSION: u32 = 2;
+const VIRTIO_MMIO_MAGIC_OFFSET: usize = 0x000;
+const VIRTIO_MMIO_VERSION_OFFSET: usize = 0x004;
+const VIRTIO_MMIO_DEVICE_ID_OFFSET: usize = 0x008;
+const QEMU_VIRT_MMIO_BASE: usize = 0x0a00_0000;
+const QEMU_VIRT_MMIO_STRIDE: usize = 0x200;
+const QEMU_VIRT_MMIO_SLOTS: usize = 32;
+const QEMU_VIRT_MMIO_SIZE: usize = 0x200;
 const FW_CFG_SIGNATURE: u16 = 0x0000;
 const FW_CFG_FILE_DIR: u16 = 0x0019;
 const FW_CFG_FILE_ENTRY_BYTES: usize = 64;
@@ -87,12 +96,11 @@ unsafe extern "C" {
 
 mod vmm;
 pub use vmm::Aarch64UserAddressSpace;
+mod host_fs;
 
 mod debug_state {
-    pub(crate) type RuntimeState = helios_kernel::HostRuntimeState<
-        crate::Aarch64Cpu,
-        helios_kernel::UnsupportedHostFileSystem,
-    >;
+    pub(crate) type RuntimeState =
+        helios_kernel::HostRuntimeState<crate::Aarch64Cpu, crate::host_fs::HostFileSystemService>;
 }
 
 #[used]
@@ -402,6 +410,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
     install_exception_vectors();
     let handoff = limine_boot_handoff();
     let physical_memory_offset = physical_memory_offset();
+    let boot_fdt = boot_fdt(&handoff);
     let debug_serial = DebugSerial::discover(&handoff, physical_memory_offset);
     debug_serial.init();
     DEBUG_SERIAL_BASE.store(debug_serial.base, Ordering::Release);
@@ -427,11 +436,21 @@ extern "C" fn aarch64_kernel_main() -> ! {
         || read_counter(),
         Some(write_debug_serial_bytes),
     );
+    let mut devices = DeviceInventory::new().with_debug_serial();
+    if host_fs::has_9p_device(boot_fdt.as_ref(), physical_memory_offset, &handoff) {
+        devices = devices.with_host_share();
+    }
     let kernel = helios_kernel::init(
         Platform::new(console, core::iter::empty::<MemoryRegion>(), cpu.clone())
             .with_timer_frequency_hz(cpu.timer_frequency())
             .with_dma_model(DmaModel::Translated)
-            .with_devices(DeviceInventory::new().with_debug_serial()),
+            .with_devices(devices),
+    );
+    host_fs::install(
+        boot_fdt.as_ref(),
+        physical_memory_offset,
+        &handoff,
+        &debug_state,
     );
     let _program_service =
         helios_kernel::install_component_host_program_service(&kernel, &cpu, &debug_state);
@@ -1073,6 +1092,43 @@ fn mmio_virtual_base(physical_base: usize, physical_memory_offset: usize) -> usi
     physical_base
         .checked_add(physical_memory_offset)
         .unwrap_or_else(|| panic!("AArch64 MMIO virtual address overflow"))
+}
+
+fn matches_virtio_mmio_device(
+    physical_base: usize,
+    physical_memory_offset: usize,
+    handoff: &LimineBootHandoff,
+    expected: helios_virtio::DeviceType,
+) -> bool {
+    map_mmio_page(physical_base, physical_memory_offset, handoff);
+    let virtual_base = mmio_virtual_base(physical_base, physical_memory_offset);
+    unsafe {
+        read_mmio_u32(virtual_base + VIRTIO_MMIO_MAGIC_OFFSET) == VIRTIO_MMIO_MAGIC
+            && read_mmio_u32(virtual_base + VIRTIO_MMIO_VERSION_OFFSET)
+                == VIRTIO_MMIO_MODERN_VERSION
+            && read_mmio_u32(virtual_base + VIRTIO_MMIO_DEVICE_ID_OFFSET) == expected as u32
+    }
+}
+
+unsafe fn read_mmio_u32(address: usize) -> u32 {
+    unsafe { (address as *const u32).read_volatile() }
+}
+
+fn count_virtio_mmio_devices(fdt: &Fdt<'_>, expected: helios_virtio::DeviceType) -> usize {
+    let handoff = limine_boot_handoff();
+    let physical_memory_offset = physical_memory_offset();
+    fdt.all_nodes()
+        .filter(|node| {
+            node.compatible()
+                .is_some_and(|compatible| compatible.all().any(|entry| entry == "virtio,mmio"))
+        })
+        .filter_map(|node| node.raw_reg().and_then(|mut regions| regions.next()))
+        .filter(|region| {
+            let physical_base =
+                fdt_cells_to_usize(region.address, "AArch64 virtio MMIO reg address");
+            matches_virtio_mmio_device(physical_base, physical_memory_offset, &handoff, expected)
+        })
+        .count()
 }
 
 fn discover_boot_entropy(

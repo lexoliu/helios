@@ -97,7 +97,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let mut rx_buffers = vec![None; usize::from(rx_queue_size)].into_boxed_slice();
         for _ in 0..usize::from(rx_queue_size) {
             let mut buffer = vec![0_u8; rx_buffer_len].into_boxed_slice();
-            let token = rx_queue.submit(&[], &mut [buffer.as_mut()])?;
+            let token = rx_queue.submit(&transport, &[], &mut [buffer.as_mut()])?;
             assert!(
                 rx_buffers[usize::from(token)].is_none(),
                 "virtio net RX token was allocated twice during initialization"
@@ -165,7 +165,9 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let frame = buffer[self.header_len..used_len]
             .to_vec()
             .into_boxed_slice();
-        let new_token = state.rx_queue.submit(&[], &mut [buffer.as_mut()])?;
+        let new_token = state
+            .rx_queue
+            .submit(&self.transport, &[], &mut [buffer.as_mut()])?;
         assert!(
             state.rx_buffers[usize::from(new_token)].is_none(),
             "virtio net RX buffer was reposted into an occupied token slot"
@@ -185,7 +187,9 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let header = VirtioNetHeader::default();
         let header_bytes = as_bytes(&header);
         let mut state = self.state.lock().await;
-        let token = state.tx_queue.submit(&[header_bytes, frame], &mut [])?;
+        let token = state
+            .tx_queue
+            .submit(&self.transport, &[header_bytes, frame], &mut [])?;
         state.tx_queue.notify(&self.transport);
 
         loop {

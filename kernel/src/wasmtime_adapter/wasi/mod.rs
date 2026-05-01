@@ -1549,6 +1549,9 @@ where
         if let Some(bootfs) = filesystem.runtime_state.bootfs() {
             filesystem.seed_bootfs(bootfs);
         }
+        if filesystem.runtime_state.host_filesystem_service().is_some() {
+            filesystem.ensure_directory(crate::HOST_SHARE_GUEST_MOUNT_PATH, true);
+        }
 
         filesystem
     }

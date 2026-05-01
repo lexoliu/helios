@@ -4,7 +4,7 @@ use helios_hal::fs::BlockDeviceRights;
 use helios_hal::io::IoResult;
 
 use crate::block::{VirtioBlockDevice, VirtioBlockResource};
-use crate::bus::{IdentityDmaPool, MmioBus};
+use crate::bus::{DmaPool, IdentityDmaPool, MmioBus};
 use crate::console::VirtioConsoleDevice;
 use crate::net::VirtioNetDevice;
 use crate::p9::Virtio9pDevice;
@@ -80,6 +80,19 @@ pub unsafe fn net_from_mmio(
 /// transport's register access invariants while the returned driver is alive.
 pub unsafe fn p9_from_mmio(header: NonNull<u8>, mmio_size: usize) -> IoResult<VirtioMmio9pDevice> {
     let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
+    let transport = VirtioMmioTransport::new(bus)?;
+    Virtio9pDevice::new(transport)
+}
+
+pub unsafe fn p9_from_mmio_with_dma<P>(
+    header: NonNull<u8>,
+    mmio_size: usize,
+    dma: P,
+) -> IoResult<Virtio9pDevice<VirtioMmioTransport<MmioBus<P>>>>
+where
+    P: DmaPool,
+{
+    let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     Virtio9pDevice::new(transport)
 }
