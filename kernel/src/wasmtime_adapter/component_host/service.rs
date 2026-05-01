@@ -4616,22 +4616,21 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_write",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             iovs: i32,
-             iovs_len: i32,
-             nwritten: i32|
-             -> i32 {
-                p1_fd_write(
-                    &mut caller,
-                    fd,
-                    iovs as u32,
-                    iovs_len as u32,
-                    nwritten as u32,
-                )
+             (fd, iovs, iovs_len, nwritten): (i32, i32, i32, i32)| {
+                Box::new(async move {
+                    p1_fd_write(
+                        &mut caller,
+                        fd,
+                        iovs as u32,
+                        iovs_len as u32,
+                        nwritten as u32,
+                    )
+                    .await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -5475,22 +5474,21 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "fd_write",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             iovs: i32,
-             iovs_len: i32,
-             nwritten: i32|
-             -> i32 {
-                p1_fd_write(
-                    &mut caller,
-                    fd,
-                    iovs as u32,
-                    iovs_len as u32,
-                    nwritten as u32,
-                )
+             (fd, iovs, iovs_len, nwritten): (i32, i32, i32, i32)| {
+                Box::new(async move {
+                    p1_fd_write(
+                        &mut caller,
+                        fd,
+                        iovs as u32,
+                        iovs_len as u32,
+                        nwritten as u32,
+                    )
+                    .await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -6004,7 +6002,7 @@ where
     p1_write_memory(caller, memory, ptr, &bytes)
 }
 
-fn p1_fd_write<CpuImpl, HostFs>(
+async fn p1_fd_write<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     iovs: u32,
@@ -6033,7 +6031,7 @@ where
         };
         bytes.extend_from_slice(&chunk);
     }
-    let written = match p1_write_descriptor(caller, fd, &bytes) {
+    let written = match p1_write_descriptor(caller, fd, &bytes).await {
         Ok(written) => written,
         Err(errno) => return errno,
     };
@@ -10768,7 +10766,7 @@ fn p1_write_u64<T>(
     p1_write_memory(caller, memory, ptr, &value.to_le_bytes())
 }
 
-fn p1_write_descriptor<CpuImpl, HostFs>(
+async fn p1_write_descriptor<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     bytes: &[u8],
@@ -10816,9 +10814,57 @@ where
             else {
                 return Err(p1::errno::BADF);
             };
-            let write_offset: usize = (*offset).try_into().map_err(|_| p1::errno::OVERFLOW)?;
+            let current_offset = *offset;
+            let write_offset: usize = current_offset.try_into().map_err(|_| p1::errno::OVERFLOW)?;
             let descriptor = descriptor.clone();
-            let next_offset = offset.saturating_add(bytes.len() as u64);
+            let next_offset = current_offset.saturating_add(bytes.len() as u64);
+            if let Some(host_path) =
+                crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned)
+            {
+                if !descriptor.flags.contains(fs_types::DescriptorFlags::WRITE) {
+                    return Err(p1::errno::NOTCAPABLE);
+                }
+                let service = caller
+                    .data()
+                    .filesystem
+                    .host_service()
+                    .map_err(p1_errno_from_fs)?;
+                let host_offset = if fdflags & P1_FDFLAG_APPEND != 0 {
+                    service
+                        .stat_path(&host_path)
+                        .await
+                        .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
+                        .map_err(p1_errno_from_fs)?
+                        .size
+                } else {
+                    current_offset
+                };
+                service
+                    .write_file(&host_path, host_offset, bytes)
+                    .await
+                    .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
+                    .map_err(p1_errno_from_fs)?;
+                if fdflags & P1_FDFLAG_APPEND != 0 {
+                    caller
+                        .data_mut()
+                        .filesystem
+                        .append(&descriptor, bytes, now_nanos)
+                        .map_err(p1_errno_from_fs)?;
+                } else {
+                    caller
+                        .data_mut()
+                        .filesystem
+                        .write_at(&descriptor, write_offset, bytes, now_nanos)
+                        .map_err(p1_errno_from_fs)?;
+                }
+                let Some(Preview1Descriptor::File { offset, .. }) =
+                    caller.data_mut().descriptors.get_mut(fd)
+                else {
+                    panic!("Preview1 descriptor disappeared during host write");
+                };
+                *offset = next_offset;
+                return u32::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW);
+            }
             if fdflags & P1_FDFLAG_APPEND != 0 {
                 caller
                     .data_mut()
@@ -10870,11 +10916,27 @@ where
         }) => {
             let descriptor = descriptor.clone();
             let offset = *offset;
-            let bytes = caller
-                .data()
-                .filesystem
-                .read_file_chunk(&descriptor, offset, capacity)
-                .map_err(p1_errno_from_fs)?;
+            let bytes = if let Some(host_path) =
+                crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned)
+            {
+                let service = caller
+                    .data()
+                    .filesystem
+                    .host_service()
+                    .map_err(p1_errno_from_fs)?;
+                let max_bytes = u32::try_from(capacity).map_err(|_| p1::errno::OVERFLOW)?;
+                service
+                    .read_file_range(&host_path, offset, max_bytes)
+                    .await
+                    .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
+                    .map_err(p1_errno_from_fs)?
+            } else {
+                caller
+                    .data()
+                    .filesystem
+                    .read_file_chunk(&descriptor, offset, capacity)
+                    .map_err(p1_errno_from_fs)?
+            };
             if let Some(Preview1Descriptor::File { offset, .. }) =
                 caller.data_mut().descriptors.get_mut(fd)
             {
