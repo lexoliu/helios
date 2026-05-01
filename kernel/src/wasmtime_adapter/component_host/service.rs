@@ -6106,18 +6106,18 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
+    let Some(memory) = p1_memory(caller) else {
+        return p1::errno::FAULT;
+    };
     let Some(Preview1Descriptor::Preopen { guest_name, .. }) = caller.data().descriptors.get(fd)
     else {
         return p1::errno::BADF;
     };
-    let bytes = guest_name.as_bytes().to_vec();
+    let bytes = guest_name.as_bytes();
     if bytes.len() != len as usize {
         return p1::errno::INVAL;
     }
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
-    };
-    p1_write_memory(caller, memory, path, &bytes)
+    preview1_write_memory(memory, path, bytes)
 }
 
 fn p1_fd_fdstat_get<CpuImpl, HostFs>(
@@ -7516,21 +7516,21 @@ where
         Err(_) => return p1::errno::FAULT,
     };
     let cwd = match caller.data().getcwd() {
-        Ok(cwd) => cwd.as_bytes().to_vec(),
+        Ok(cwd) => cwd,
         Err(errno) => return errno,
     };
     let needed = match u32::try_from(cwd.len()) {
         Ok(needed) => needed,
         Err(_) => return p1::errno::OVERFLOW,
     };
-    let status = p1_write_u32(caller, memory, path_len, needed);
+    let status = preview1_write_u32(memory, path_len, needed);
     if status != p1::errno::SUCCESS {
         return status;
     }
     if capacity < needed {
         return p1::errno::RANGE;
     }
-    p1_write_memory(caller, memory, path, &cwd)
+    preview1_write_memory(memory, path, cwd.as_bytes())
 }
 
 fn wasix_chdir<CpuImpl, HostFs>(
