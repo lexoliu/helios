@@ -167,7 +167,10 @@ pub(crate) mod filesystem_bindings {
                 "wasi:filesystem/types.[method]descriptor.stat": async | tracing | trappable,
                 "wasi:filesystem/types.[method]descriptor.stat-at": async | tracing | trappable,
                 "wasi:filesystem/types.[method]descriptor.open-at": async | tracing | trappable,
+                "wasi:filesystem/types.[method]descriptor.read": async | tracing | trappable,
+                "wasi:filesystem/types.[method]descriptor.write": async | tracing | trappable,
                 "wasi:filesystem/types.[method]descriptor.read-directory": async | tracing | trappable,
+                "wasi:filesystem/types.[method]descriptor.set-size": async | tracing | trappable,
                 "wasi:filesystem/types.[method]descriptor.create-directory-at": async | tracing | trappable,
                 "wasi:filesystem/types.[method]descriptor.link-at": async | tracing | trappable,
                 "wasi:filesystem/types.[method]descriptor.readlink-at": async | tracing | trappable,
@@ -980,7 +983,7 @@ where
         Ok(Ok(descriptor_type_from_kind(descriptor.kind)))
     }
 
-    fn set_size(
+    async fn set_size(
         &mut self,
         descriptor: Resource<FsDescriptor>,
         size: u64,
@@ -989,6 +992,24 @@ where
             Ok(descriptor) => descriptor,
             Err(error) => return Ok(Err(error)),
         };
+        if let Some(host_path) = crate::guest_host_share_path(&descriptor.path) {
+            if !descriptor.flags.contains(p3fs::DescriptorFlags::WRITE) {
+                return Ok(Err(p2fs::ErrorCode::NotPermitted));
+            }
+            let service = match self.filesystem().host_service() {
+                Ok(service) => service,
+                Err(error) => return Ok(Err(error_code_from_p3(error))),
+            };
+            let host_path = host_path.to_owned();
+            return match service.set_file_size(&host_path, size).await {
+                Ok(()) => {
+                    self.filesystem_mut()
+                        .invalidate_host_subtree(&descriptor.path);
+                    Ok(Ok(()))
+                }
+                Err(err) => Ok(Err(error_code_from_p3(map_host_fs_error(err)))),
+            };
+        }
         let now_nanos = self.now_nanos();
         match self.filesystem_mut().set_size(&descriptor, size, now_nanos) {
             Ok(()) => Ok(Ok(())),
@@ -1024,7 +1045,7 @@ where
         }
     }
 
-    fn read(
+    async fn read(
         &mut self,
         descriptor: Resource<FsDescriptor>,
         length: u64,
@@ -1038,6 +1059,24 @@ where
             Ok(length) => length,
             Err(_) => return Ok(Err(p2fs::ErrorCode::Overflow)),
         };
+        if let Some(host_path) = crate::guest_host_share_path(&descriptor.path) {
+            let service = match self.filesystem().host_service() {
+                Ok(service) => service,
+                Err(error) => return Ok(Err(error_code_from_p3(error))),
+            };
+            let max_bytes = match u32::try_from(length) {
+                Ok(max_bytes) => max_bytes,
+                Err(_) => return Ok(Err(p2fs::ErrorCode::Overflow)),
+            };
+            let host_path = host_path.to_owned();
+            return match service.read_file_range(&host_path, offset, max_bytes).await {
+                Ok(bytes) => {
+                    let eof = bytes.len() < length;
+                    Ok(Ok((bytes, eof)))
+                }
+                Err(err) => Ok(Err(error_code_from_p3(map_host_fs_error(err)))),
+            };
+        }
         match self
             .filesystem_mut()
             .read_file_chunk(&descriptor, offset, length)
@@ -1050,7 +1089,7 @@ where
         }
     }
 
-    fn write(
+    async fn write(
         &mut self,
         descriptor: Resource<FsDescriptor>,
         buffer: Vec<u8>,
@@ -1064,6 +1103,24 @@ where
             Ok(offset) => offset,
             Err(_) => return Ok(Err(p2fs::ErrorCode::Overflow)),
         };
+        if let Some(host_path) = crate::guest_host_share_path(&descriptor.path) {
+            if !descriptor.flags.contains(p3fs::DescriptorFlags::WRITE) {
+                return Ok(Err(p2fs::ErrorCode::NotPermitted));
+            }
+            let service = match self.filesystem().host_service() {
+                Ok(service) => service,
+                Err(error) => return Ok(Err(error_code_from_p3(error))),
+            };
+            let host_path = host_path.to_owned();
+            return match service.write_file(&host_path, offset as u64, &buffer).await {
+                Ok(()) => {
+                    self.filesystem_mut()
+                        .invalidate_host_subtree(&descriptor.path);
+                    Ok(Ok(buffer.len() as u64))
+                }
+                Err(err) => Ok(Err(error_code_from_p3(map_host_fs_error(err)))),
+            };
+        }
         let now_nanos = self.now_nanos();
         match self
             .filesystem_mut()

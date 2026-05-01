@@ -3239,6 +3239,32 @@ where
         descriptor: Resource<FsDescriptor>,
         size: u64,
     ) -> Result<(), FsError> {
+        let (path, flags) = accessor
+            .with(|mut access| {
+                let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
+                Ok::<_, FsError>((descriptor.path.clone(), descriptor.flags))
+            })
+            .map_err(FsError::trap)?;
+        if let Some(host_path) = crate::guest_host_share_path(&path).map(|p| p.to_owned()) {
+            if !flags.contains(fs_types::DescriptorFlags::WRITE) {
+                return Err(fs_types::ErrorCode::NotPermitted.into());
+            }
+            let service = accessor.with(|mut access| {
+                access
+                    .get()
+                    .filesystem()
+                    .host_service()
+                    .map_err(FsError::from)
+            })?;
+            service
+                .set_file_size(&host_path, size)
+                .await
+                .map_err(map_host_fs_error)?;
+            accessor.with(|mut access| {
+                access.get().filesystem_mut().invalidate_host_subtree(&path);
+            });
+            return Ok(());
+        }
         accessor.with(|mut access| {
             let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
             let now_nanos = access.get().now_nanos();
