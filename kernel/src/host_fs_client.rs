@@ -25,6 +25,7 @@ const P9_TLCREATE: u8 = 14;
 const P9_TSYMLINK: u8 = 16;
 const P9_TREADLINK: u8 = 22;
 const P9_TGETATTR: u8 = 24;
+const P9_TSETATTR: u8 = 26;
 const P9_TREADDIR: u8 = 40;
 const P9_TLINK: u8 = 70;
 const P9_TMKDIR: u8 = 72;
@@ -33,10 +34,10 @@ const P9_TUNLINKAT: u8 = 76;
 const P9_RLERROR: u8 = 7;
 const P9_DOTL_RDONLY: u32 = 0;
 const P9_DOTL_WRONLY: u32 = 1;
-const P9_DOTL_TRUNC: u32 = 0o1000;
 const P9_DOTL_DIRECTORY: u32 = 0o200000;
 const P9_DOTL_AT_REMOVEDIR: u32 = 0x200;
 const P9_STATS_BASIC: u64 = 0x0000_07ff;
+const P9_SETATTR_SIZE: u32 = 0x0000_0008;
 const P9_QTDIR: u8 = 0x80;
 const P9_WRITE_CHUNK: usize = (DEFAULT_MSIZE as usize) - 24;
 
@@ -469,9 +470,31 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
     }
 
     async fn truncate_file_impl(&self, path: &str) -> Result<(), HostFsError> {
+        self.set_file_size_impl(path, 0).await
+    }
+
+    async fn set_file_size_impl(&self, path: &str, size: u64) -> Result<(), HostFsError> {
         let root = self.attach_root().await?;
         let file = self.walk(root, 1, path).await?;
-        let result = self.open(file, P9_DOTL_WRONLY | P9_DOTL_TRUNC).await;
+        let result = self
+            .transact(
+                P9_TSETATTR,
+                |body| {
+                    push_u32(body, file);
+                    push_u32(body, P9_SETATTR_SIZE);
+                    push_u32(body, 0);
+                    push_u32(body, P9_NOUID);
+                    push_u32(body, P9_NOUID);
+                    push_u64(body, size);
+                    push_u64(body, 0);
+                    push_u64(body, 0);
+                    push_u64(body, 0);
+                    push_u64(body, 0);
+                },
+                7,
+            )
+            .await
+            .map(|_| ());
         let _ = self.clunk(file).await;
         let _ = self.clunk(root).await;
         result
@@ -645,6 +668,14 @@ impl<Transport: HostFsTransport> HostFileSystem for HostFsClient<Transport> {
         path: &'a str,
     ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a {
         async move { self.truncate_file_impl(path).await }
+    }
+
+    fn set_file_size<'a>(
+        &'a self,
+        path: &'a str,
+        size: u64,
+    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a {
+        async move { self.set_file_size_impl(path, size).await }
     }
 
     fn create_file<'a>(

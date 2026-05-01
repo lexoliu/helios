@@ -88,6 +88,14 @@ impl HostFileSystem for HostedFileSystem {
         core::future::ready(truncate_impl(&self.resolve(path)))
     }
 
+    fn set_file_size(
+        &self,
+        path: &str,
+        size: u64,
+    ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
+        core::future::ready(set_file_size_impl(&self.resolve(path), size))
+    }
+
     fn create_file(
         &self,
         path: &str,
@@ -206,11 +214,15 @@ fn write_file_impl(path: &Path, offset: u64, bytes: &[u8]) -> Result<(), HostFsE
 }
 
 fn truncate_impl(path: &Path) -> Result<(), HostFsError> {
+    set_file_size_impl(path, 0)
+}
+
+fn set_file_size_impl(path: &Path, size: u64) -> Result<(), HostFsError> {
     let file = fs::OpenOptions::new()
         .write(true)
         .open(path)
         .map_err(map_io_error)?;
-    file.set_len(0).map_err(map_io_error)?;
+    file.set_len(size).map_err(map_io_error)?;
     Ok(())
 }
 

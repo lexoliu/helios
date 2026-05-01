@@ -558,6 +558,11 @@ pub trait HostFileSystem: Clone + Send + 'static {
         &'a self,
         path: &'a str,
     ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a;
+    fn set_file_size<'a>(
+        &'a self,
+        path: &'a str,
+        size: u64,
+    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a;
     fn create_file<'a>(
         &'a self,
         path: &'a str,

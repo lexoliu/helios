@@ -11,6 +11,7 @@ use crate::wasmtime_adapter::{
         bindings::filesystem::types as fs_types, p1,
     },
 };
+use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::vec;
 use bytes::Bytes;
@@ -4717,23 +4718,23 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_filestat_get",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             stat: i32|
-             -> i32 { p1_fd_filestat_get(&mut caller, fd, stat as u32) },
+             (fd, stat): (i32, i32)| {
+                Box::new(async move { p1_fd_filestat_get(&mut caller, fd, stat as u32).await })
+            },
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_filestat_set_size",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             size: i64|
-             -> i32 { p1_fd_filestat_set_size(&mut caller, fd, size as u64) },
+             (fd, size): (i32, i64)| {
+                Box::new(async move { p1_fd_filestat_set_size(&mut caller, fd, size as u64).await })
+            },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -4763,14 +4764,15 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_allocate",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             offset: i64,
-             len: i64|
-             -> i32 { p1_fd_allocate(&mut caller, fd, offset as u64, len as u64) },
+             (fd, offset, len): (i32, i64, i64)| {
+                Box::new(
+                    async move { p1_fd_allocate(&mut caller, fd, offset as u64, len as u64).await },
+                )
+            },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -4792,68 +4794,62 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_pread",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             iovs: i32,
-             iovs_len: i32,
-             offset: i64,
-             nread: i32|
-             -> i32 {
-                p1_fd_pread(
-                    &mut caller,
-                    fd,
-                    iovs as u32,
-                    iovs_len as u32,
-                    offset as u64,
-                    nread as u32,
-                )
+             (fd, iovs, iovs_len, offset, nread): (i32, i32, i32, i64, i32)| {
+                Box::new(async move {
+                    p1_fd_pread(
+                        &mut caller,
+                        fd,
+                        iovs as u32,
+                        iovs_len as u32,
+                        offset as u64,
+                        nread as u32,
+                    )
+                    .await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_pwrite",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             iovs: i32,
-             iovs_len: i32,
-             offset: i64,
-             nwritten: i32|
-             -> i32 {
-                p1_fd_pwrite(
-                    &mut caller,
-                    fd,
-                    iovs as u32,
-                    iovs_len as u32,
-                    offset as u64,
-                    nwritten as u32,
-                )
+             (fd, iovs, iovs_len, offset, nwritten): (i32, i32, i32, i64, i32)| {
+                Box::new(async move {
+                    p1_fd_pwrite(
+                        &mut caller,
+                        fd,
+                        iovs as u32,
+                        iovs_len as u32,
+                        offset as u64,
+                        nwritten as u32,
+                    )
+                    .await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_readdir",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             buf: i32,
-             buf_len: i32,
-             cookie: i64,
-             bufused: i32|
-             -> i32 {
-                p1_fd_readdir(
-                    &mut caller,
-                    fd,
-                    buf as u32,
-                    buf_len as u32,
-                    cookie as u64,
-                    bufused as u32,
-                )
+             (fd, buf, buf_len, cookie, bufused): (i32, i32, i32, i64, i32)| {
+                Box::new(async move {
+                    p1_fd_readdir(
+                        &mut caller,
+                        fd,
+                        buf as u32,
+                        buf_len as u32,
+                        cookie as u64,
+                        bufused as u32,
+                    )
+                    .await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -4868,16 +4864,14 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_seek",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             offset: i64,
-             whence: i32,
-             new_offset: i32|
-             -> i32 {
-                p1_fd_seek(&mut caller, fd, offset, whence as u8, new_offset as u32)
+             (fd, offset, whence, new_offset): (i32, i64, i32, i32)| {
+                Box::new(async move {
+                    p1_fd_seek(&mut caller, fd, offset, whence as u8, new_offset as u32).await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -5383,13 +5377,13 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "fd_filestat_get",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             stat: i32|
-             -> i32 { p1_fd_filestat_get(&mut caller, fd, stat as u32) },
+             (fd, stat): (i32, i32)| {
+                Box::new(async move { p1_fd_filestat_get(&mut caller, fd, stat as u32).await })
+            },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -5428,24 +5422,22 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "fd_readdir",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             buf: i32,
-             buf_len: i32,
-             cookie: i64,
-             bufused: i32|
-             -> i32 {
-                p1_fd_readdir(
-                    &mut caller,
-                    fd,
-                    buf as u32,
-                    buf_len as u32,
-                    cookie as u64,
-                    bufused as u32,
-                )
+             (fd, buf, buf_len, cookie, bufused): (i32, i32, i32, i64, i32)| {
+                Box::new(async move {
+                    p1_fd_readdir(
+                        &mut caller,
+                        fd,
+                        buf as u32,
+                        buf_len as u32,
+                        cookie as u64,
+                        bufused as u32,
+                    )
+                    .await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -5460,16 +5452,14 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "fd_seek",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             offset: i64,
-             whence: i32,
-             new_offset: i32|
-             -> i32 {
-                p1_fd_seek(&mut caller, fd, offset, whence as u8, new_offset as u32)
+             (fd, offset, whence, new_offset): (i32, i64, i32, i32)| {
+                Box::new(async move {
+                    p1_fd_seek(&mut caller, fd, offset, whence as u8, new_offset as u32).await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -6226,7 +6216,7 @@ where
     }
 }
 
-fn p1_fd_filestat_get<CpuImpl, HostFs>(
+async fn p1_fd_filestat_get<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     stat: u32,
@@ -6238,14 +6228,29 @@ where
     let Some(path) = p1_descriptor_path(caller.data().descriptors.get(fd)) else {
         return p1::errno::BADF;
     };
-    let stat_value = match caller.data().filesystem.stat(path) {
-        Ok(stat) => stat,
-        Err(error) => return p1_errno_from_fs(error),
+    let stat_value = if let Some(host_path) =
+        crate::guest_host_share_path(path).map(ToOwned::to_owned)
+    {
+        let service = match caller.data().filesystem.host_service() {
+            Ok(service) => service,
+            Err(error) => return p1_errno_from_fs(error),
+        };
+        match service.stat_path(&host_path).await {
+            Ok(metadata) => p1_descriptor_stat_from_host_metadata(metadata),
+            Err(error) => {
+                return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
+            }
+        }
+    } else {
+        match caller.data().filesystem.stat(path) {
+            Ok(stat) => stat,
+            Err(error) => return p1_errno_from_fs(error),
+        }
     };
     p1_write_filestat(caller, stat, stat_value)
 }
 
-fn p1_fd_filestat_set_size<CpuImpl, HostFs>(
+async fn p1_fd_filestat_set_size<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     size: u64,
@@ -6259,6 +6264,26 @@ where
         return p1::errno::BADF;
     };
     let descriptor = descriptor.clone();
+    if let Some(host_path) = crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned) {
+        if !descriptor.flags.contains(fs_types::DescriptorFlags::WRITE) {
+            return p1::errno::NOTCAPABLE;
+        }
+        let service = match caller.data().filesystem.host_service() {
+            Ok(service) => service,
+            Err(error) => return p1_errno_from_fs(error),
+        };
+        return service
+            .set_file_size(&host_path, size)
+            .await
+            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
+            .map_or_else(p1_errno_from_fs, |_| {
+                caller
+                    .data_mut()
+                    .filesystem
+                    .invalidate_host_subtree(&descriptor.path);
+                p1::errno::SUCCESS
+            });
+    }
     let now_nanos = caller.data().now_nanos();
     caller
         .data_mut()
@@ -6284,6 +6309,9 @@ where
         return p1::errno::BADF;
     };
     let descriptor = descriptor.clone();
+    if crate::guest_host_share_path(&descriptor.path).is_some() {
+        return p1::errno::NOTSUP;
+    }
     let now_nanos = caller.data().system_time_nanos();
     let access = p1_timestamp_from_fstflags(
         fstflags,
@@ -6321,7 +6349,7 @@ where
         .map_or(p1::errno::BADF, |_| p1::errno::SUCCESS)
 }
 
-fn p1_fd_allocate<CpuImpl, HostFs>(
+async fn p1_fd_allocate<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     offset: u64,
@@ -6340,6 +6368,35 @@ where
         return p1::errno::BADF;
     };
     let descriptor = descriptor.clone();
+    if let Some(host_path) = crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned) {
+        if !descriptor.flags.contains(fs_types::DescriptorFlags::WRITE) {
+            return p1::errno::NOTCAPABLE;
+        }
+        let service = match caller.data().filesystem.host_service() {
+            Ok(service) => service,
+            Err(error) => return p1_errno_from_fs(error),
+        };
+        let current = match service.stat_path(&host_path).await {
+            Ok(metadata) => metadata.size,
+            Err(error) => {
+                return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
+            }
+        };
+        if end <= current {
+            return p1::errno::SUCCESS;
+        }
+        return service
+            .set_file_size(&host_path, end)
+            .await
+            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
+            .map_or_else(p1_errno_from_fs, |_| {
+                caller
+                    .data_mut()
+                    .filesystem
+                    .invalidate_host_subtree(&descriptor.path);
+                p1::errno::SUCCESS
+            });
+    }
     let current = match caller.data().filesystem.stat(&descriptor.path) {
         Ok(stat) => stat.size,
         Err(error) => return p1_errno_from_fs(error),
@@ -6377,7 +6434,7 @@ where
     p1_fd_advise(caller, fd)
 }
 
-fn p1_fd_pread<CpuImpl, HostFs>(
+async fn p1_fd_pread<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     iovs: u32,
@@ -6404,18 +6461,37 @@ where
     else {
         return p1::errno::BADF;
     };
-    let bytes = match caller
-        .data()
-        .filesystem
-        .read_file_chunk(descriptor, offset, capacity)
+    let bytes = if let Some(host_path) =
+        crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned)
     {
-        Ok(bytes) => bytes,
-        Err(error) => return p1_errno_from_fs(error),
+        let service = match caller.data().filesystem.host_service() {
+            Ok(service) => service,
+            Err(error) => return p1_errno_from_fs(error),
+        };
+        let max_bytes = match u32::try_from(capacity) {
+            Ok(max_bytes) => max_bytes,
+            Err(_) => return p1::errno::OVERFLOW,
+        };
+        match service.read_file_range(&host_path, offset, max_bytes).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
+            }
+        }
+    } else {
+        match caller
+            .data()
+            .filesystem
+            .read_file_chunk(descriptor, offset, capacity)
+        {
+            Ok(bytes) => bytes,
+            Err(error) => return p1_errno_from_fs(error),
+        }
     };
     p1_write_iovs_from_bytes(caller, memory, iovs, &bytes, nread)
 }
 
-fn p1_fd_pwrite<CpuImpl, HostFs>(
+async fn p1_fd_pwrite<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     iovs: u32,
@@ -6450,6 +6526,27 @@ where
         Err(_) => return p1::errno::OVERFLOW,
     };
     let descriptor = descriptor.clone();
+    if let Some(host_path) = crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned) {
+        if !descriptor.flags.contains(fs_types::DescriptorFlags::WRITE) {
+            return p1::errno::NOTCAPABLE;
+        }
+        let service = match caller.data().filesystem.host_service() {
+            Ok(service) => service,
+            Err(error) => return p1_errno_from_fs(error),
+        };
+        if let Err(error) = service.write_file(&host_path, offset as u64, &bytes).await {
+            return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
+        }
+        caller
+            .data_mut()
+            .filesystem
+            .invalidate_host_subtree(&descriptor.path);
+        let written = match u32::try_from(bytes.len()) {
+            Ok(written) => written,
+            Err(_) => return p1::errno::OVERFLOW,
+        };
+        return p1_write_u32(caller, memory, nwritten, written);
+    }
     let now_nanos = caller.data().now_nanos();
     if let Err(error) =
         caller
@@ -6466,7 +6563,7 @@ where
     p1_write_u32(caller, memory, nwritten, written)
 }
 
-fn p1_fd_readdir<CpuImpl, HostFs>(
+async fn p1_fd_readdir<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     buf: u32,
@@ -6481,10 +6578,47 @@ where
     let Some(path) = p1_descriptor_path(caller.data().descriptors.get(fd)) else {
         return p1::errno::BADF;
     };
+    if let Some(host_path) = crate::guest_host_share_path(path).map(ToOwned::to_owned) {
+        let directory_path = path.to_owned();
+        let service = match caller.data().filesystem.host_service() {
+            Ok(service) => service,
+            Err(error) => return p1_errno_from_fs(error),
+        };
+        let entries = match service.read_dir(&host_path).await {
+            Ok(entries) => entries,
+            Err(error) => {
+                return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
+            }
+        };
+        caller
+            .data_mut()
+            .filesystem
+            .seed_host_directory_entries(&directory_path, entries);
+        let entries = match caller.data().filesystem.read_directory(&directory_path) {
+            Ok(entries) => entries,
+            Err(error) => return p1_errno_from_fs(error),
+        };
+        return p1_fd_readdir_entries(caller, entries, buf, buf_len, cookie, bufused);
+    }
     let entries = match caller.data().filesystem.read_directory(path) {
         Ok(entries) => entries,
         Err(error) => return p1_errno_from_fs(error),
     };
+    p1_fd_readdir_entries(caller, entries, buf, buf_len, cookie, bufused)
+}
+
+fn p1_fd_readdir_entries<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    entries: Vec<fs_types::DirectoryEntry>,
+    buf: u32,
+    buf_len: u32,
+    cookie: u64,
+    bufused: u32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
@@ -6563,7 +6697,7 @@ where
     caller.data_mut().descriptors.renumber(from, to)
 }
 
-fn p1_fd_seek<CpuImpl, HostFs>(
+async fn p1_fd_seek<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     offset: i64,
@@ -6584,10 +6718,29 @@ where
     let base = match whence {
         0 => 0,
         1 => current,
-        2 => match caller.data().filesystem.stat(&descriptor.path) {
-            Ok(stat) => stat.size,
-            Err(error) => return p1_errno_from_fs(error),
-        },
+        2 => {
+            if let Some(host_path) =
+                crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned)
+            {
+                let service = match caller.data().filesystem.host_service() {
+                    Ok(service) => service,
+                    Err(error) => return p1_errno_from_fs(error),
+                };
+                match service.stat_path(&host_path).await {
+                    Ok(metadata) => metadata.size,
+                    Err(error) => {
+                        return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(
+                            error,
+                        ));
+                    }
+                }
+            } else {
+                match caller.data().filesystem.stat(&descriptor.path) {
+                    Ok(stat) => stat.size,
+                    Err(error) => return p1_errno_from_fs(error),
+                }
+            }
+        }
         _ => return p1::errno::INVAL,
     };
     let next = if offset >= 0 {
@@ -11073,7 +11226,6 @@ where
             Ok(8)
         }
         Some(Preview1Descriptor::File { .. }) => {
-            let now_nanos = caller.data().now_nanos();
             let Some(Preview1Descriptor::File {
                 descriptor,
                 offset,
@@ -11083,7 +11235,6 @@ where
                 return Err(p1::errno::BADF);
             };
             let current_offset = *offset;
-            let write_offset: usize = current_offset.try_into().map_err(|_| p1::errno::OVERFLOW)?;
             let descriptor = descriptor.clone();
             let next_offset = current_offset.saturating_add(bytes.len() as u64);
             if let Some(host_path) =
@@ -11112,19 +11263,10 @@ where
                     .await
                     .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
                     .map_err(p1_errno_from_fs)?;
-                if fdflags & P1_FDFLAG_APPEND != 0 {
-                    caller
-                        .data_mut()
-                        .filesystem
-                        .append(&descriptor, bytes, now_nanos)
-                        .map_err(p1_errno_from_fs)?;
-                } else {
-                    caller
-                        .data_mut()
-                        .filesystem
-                        .write_at(&descriptor, write_offset, bytes, now_nanos)
-                        .map_err(p1_errno_from_fs)?;
-                }
+                caller
+                    .data_mut()
+                    .filesystem
+                    .invalidate_host_subtree(&descriptor.path);
                 let Some(Preview1Descriptor::File { offset, .. }) =
                     caller.data_mut().descriptors.get_mut(fd)
                 else {
@@ -11133,6 +11275,8 @@ where
                 *offset = next_offset;
                 return u32::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW);
             }
+            let now_nanos = caller.data().now_nanos();
+            let write_offset: usize = current_offset.try_into().map_err(|_| p1::errno::OVERFLOW)?;
             if fdflags & P1_FDFLAG_APPEND != 0 {
                 caller
                     .data_mut()

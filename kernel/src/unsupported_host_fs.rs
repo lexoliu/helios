@@ -62,6 +62,13 @@ impl HostFileSystem for UnsupportedHostFileSystem {
     ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
         unsupported()
     }
+    fn set_file_size(
+        &self,
+        _path: &str,
+        _size: u64,
+    ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
+        unsupported()
+    }
     fn create_file(
         &self,
         _path: &str,
