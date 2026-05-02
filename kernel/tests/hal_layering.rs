@@ -99,6 +99,35 @@ fn wasix_names_stay_inside_wasmtime_adapter() {
     );
 }
 
+#[test]
+fn wasi_protocol_names_stay_inside_wasmtime_adapter() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    collect_files(&manifest_dir.join("src"), &mut files);
+
+    let mut leaks = Vec::new();
+    for path in files {
+        if path
+            .components()
+            .any(|component| component.as_os_str() == "wasmtime_adapter")
+        {
+            continue;
+        }
+        let content = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let lowered = content.to_ascii_lowercase();
+        if lowered.contains("wasi") || lowered.contains("wit:") || lowered.contains("wit/") {
+            leaks.push(path.display().to_string());
+        }
+    }
+
+    assert!(
+        leaks.is_empty(),
+        "WASI/WIT protocol names are adapter-only details:\n{}",
+        leaks.join("\n")
+    );
+}
+
 fn collect_files(path: &Path, files: &mut Vec<PathBuf>) {
     let metadata = fs::metadata(path)
         .unwrap_or_else(|error| panic!("failed to inspect {}: {error}", path.display()));
