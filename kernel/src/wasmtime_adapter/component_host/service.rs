@@ -424,6 +424,27 @@ enum Preview1Descriptor {
         fdflags: u16,
     },
     Socket(WasixSocketDescriptor),
+    Epoll(EpollDescriptor),
+}
+
+#[derive(Clone)]
+struct EpollDescriptor {
+    interests: Vec<EpollInterest>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EpollInterest {
+    fd: i32,
+    events: u32,
+    data: EpollUserData,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EpollUserData {
+    ptr: u32,
+    fd: u32,
+    data1: u32,
+    data2: u64,
 }
 
 #[derive(Clone)]
@@ -3760,10 +3781,10 @@ where
             "epoll_ctl",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
              epfd: i32,
-             _op: i32,
-             _fd: i32,
-             _event: i32|
-             -> i32 { wasix_epoll_ctl(&mut caller, epfd) },
+             op: i32,
+             fd: i32,
+             event: i32|
+             -> i32 { wasix_epoll_ctl(&mut caller, epfd, op, fd, event as u32) },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -3771,8 +3792,18 @@ where
             WASIX_MODULE,
             "epoll_wait",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             (epfd, _event, _maxevents, timeout): (i32, i32, i32, i64)| {
-                Box::new(async move { wasix_epoll_wait(&mut caller, epfd, timeout).await })
+             (epfd, events, maxevents, timeout, ret_nevents): (i32, i32, i32, i64, i32)| {
+                Box::new(async move {
+                    wasix_epoll_wait(
+                        &mut caller,
+                        epfd,
+                        events as u32,
+                        maxevents,
+                        timeout,
+                        ret_nevents as u32,
+                    )
+                    .await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -6603,7 +6634,7 @@ where
         Preview1Descriptor::Stdin { .. } => 2,
         Preview1Descriptor::Stdout | Preview1Descriptor::Stderr => 2,
         Preview1Descriptor::PipeRead { .. } | Preview1Descriptor::PipeWrite { .. } => 2,
-        Preview1Descriptor::Event(_) => 2,
+        Preview1Descriptor::Event(_) | Preview1Descriptor::Epoll(_) => 2,
         Preview1Descriptor::Preopen { .. } => 3,
         Preview1Descriptor::File { descriptor, .. } => p1_filetype(descriptor.kind),
         Preview1Descriptor::Socket(_) => 6,
@@ -11083,52 +11114,276 @@ where
 }
 
 fn wasix_epoll_create<CpuImpl, HostFs>(
-    _caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-    _ret_fd: u32,
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    ret_fd: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    p1::errno::NOTSUP
+    let Some(memory) = p1_memory(caller) else {
+        return p1::errno::FAULT;
+    };
+    let fd = match caller
+        .data_mut()
+        .descriptors
+        .insert(Preview1Descriptor::Epoll(EpollDescriptor {
+            interests: Vec::new(),
+        })) {
+        Ok(fd) => fd,
+        Err(errno) => return errno,
+    };
+    p1_write_u32(caller, memory, ret_fd, fd)
 }
 
 fn wasix_epoll_ctl<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     epfd: i32,
+    op: i32,
+    fd: i32,
+    event: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    if caller.data().descriptors.get(epfd).is_some() {
-        p1::errno::INVAL
+    match caller.data().descriptors.get(epfd) {
+        Some(Preview1Descriptor::Epoll(_)) => {}
+        Some(_) => return p1::errno::INVAL,
+        None => return p1::errno::BADF,
+    }
+    if caller.data().descriptors.get(fd).is_none() {
+        return p1::errno::BADF;
+    }
+    let interest = if op == WASIX_EPOLL_CTL_DEL {
+        None
     } else {
-        p1::errno::BADF
+        let Some(memory) = p1_memory(caller) else {
+            return p1::errno::FAULT;
+        };
+        match wasix_read_epoll_event(caller, memory, event, fd) {
+            Ok(event) => Some(event),
+            Err(errno) => return errno,
+        }
+    };
+    let Some(Preview1Descriptor::Epoll(epoll)) = caller.data_mut().descriptors.get_mut(epfd) else {
+        return p1::errno::BADF;
+    };
+    let existing = epoll
+        .interests
+        .iter()
+        .position(|registered| registered.fd == fd);
+    match (op, existing, interest) {
+        (WASIX_EPOLL_CTL_ADD, Some(_), _) => p1::errno::EXIST,
+        (WASIX_EPOLL_CTL_ADD, None, Some(interest)) => {
+            epoll.interests.push(interest);
+            p1::errno::SUCCESS
+        }
+        (WASIX_EPOLL_CTL_MOD, Some(index), Some(interest)) => {
+            epoll.interests[index] = interest;
+            p1::errno::SUCCESS
+        }
+        (WASIX_EPOLL_CTL_MOD, None, _) | (WASIX_EPOLL_CTL_DEL, None, _) => p1::errno::NOENT,
+        (WASIX_EPOLL_CTL_DEL, Some(index), None) => {
+            epoll.interests.remove(index);
+            p1::errno::SUCCESS
+        }
+        _ => p1::errno::INVAL,
     }
 }
 
 async fn wasix_epoll_wait<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     epfd: i32,
+    events: u32,
+    maxevents: i32,
     timeout: i64,
+    ret_nevents: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    let status = wasix_epoll_ctl(caller, epfd);
-    if status != p1::errno::SUCCESS {
-        return status;
+    if maxevents <= 0 {
+        return p1::errno::INVAL;
     }
+    let Some(memory) = p1_memory(caller) else {
+        return p1::errno::FAULT;
+    };
+    let maxevents = match u32::try_from(maxevents) {
+        Ok(maxevents) => maxevents,
+        Err(_) => return p1::errno::INVAL,
+    };
+    match caller.data().descriptors.get(epfd) {
+        Some(Preview1Descriptor::Epoll(_)) => {}
+        Some(_) => return p1::errno::INVAL,
+        None => return p1::errno::BADF,
+    }
+    let mut ready = wasix_collect_epoll_events(caller, epfd, maxevents);
     if timeout > 0 {
         caller
             .data()
             .timer
             .sleep_for(Duration::from_nanos(timeout as u64))
             .await;
+        ready = wasix_collect_epoll_events(caller, epfd, maxevents);
+    } else if timeout < 0 {
+        while ready.is_empty() {
+            crate::yield_now().await;
+            ready = wasix_collect_epoll_events(caller, epfd, maxevents);
+        }
     }
-    p1::errno::NOTSUP
+    for (index, event) in ready.iter().enumerate() {
+        let offset = match (index as u32).checked_mul(WASIX_EPOLL_EVENT_SIZE) {
+            Some(offset) => offset,
+            None => return p1::errno::OVERFLOW,
+        };
+        let event_ptr = match events.checked_add(offset) {
+            Some(event_ptr) => event_ptr,
+            None => return p1::errno::OVERFLOW,
+        };
+        let status = wasix_write_epoll_event(caller, memory, event_ptr, event);
+        if status != p1::errno::SUCCESS {
+            return status;
+        }
+    }
+    let returned = match u32::try_from(ready.len()) {
+        Ok(returned) => returned,
+        Err(_) => return p1::errno::OVERFLOW,
+    };
+    p1_write_u32(caller, memory, ret_nevents, returned)
+}
+
+fn wasix_read_epoll_event<T>(
+    caller: &mut Caller<'_, T>,
+    memory: Preview1Memory,
+    ptr: u32,
+    fd: i32,
+) -> Result<EpollInterest, i32> {
+    let events = p1_try_read_u32(caller, memory, ptr).map_err(|_| p1::errno::FAULT)?;
+    let user_data = EpollUserData {
+        ptr: p1_try_read_u32(caller, memory, ptr + WASIX_EPOLL_EVENT_DATA_OFFSET)
+            .map_err(|_| p1::errno::FAULT)?,
+        fd: p1_try_read_u32(caller, memory, ptr + WASIX_EPOLL_EVENT_DATA_FD_OFFSET)
+            .map_err(|_| p1::errno::FAULT)?,
+        data1: p1_try_read_u32(caller, memory, ptr + WASIX_EPOLL_EVENT_DATA1_OFFSET)
+            .map_err(|_| p1::errno::FAULT)?,
+        data2: p1_try_read_u64(caller, memory, ptr + WASIX_EPOLL_EVENT_DATA2_OFFSET)
+            .map_err(|_| p1::errno::FAULT)?,
+    };
+    Ok(EpollInterest {
+        fd,
+        events,
+        data: user_data,
+    })
+}
+
+fn wasix_write_epoll_event<T>(
+    caller: &mut Caller<'_, T>,
+    memory: Preview1Memory,
+    ptr: u32,
+    event: &EpollInterest,
+) -> i32 {
+    p1_write_u32(caller, memory, ptr, event.events)
+        .max(p1_write_u32(
+            caller,
+            memory,
+            ptr + WASIX_EPOLL_EVENT_PADDING_OFFSET,
+            0,
+        ))
+        .max(p1_write_u32(
+            caller,
+            memory,
+            ptr + WASIX_EPOLL_EVENT_DATA_OFFSET,
+            event.data.ptr,
+        ))
+        .max(p1_write_u32(
+            caller,
+            memory,
+            ptr + WASIX_EPOLL_EVENT_DATA_FD_OFFSET,
+            event.data.fd,
+        ))
+        .max(p1_write_u32(
+            caller,
+            memory,
+            ptr + WASIX_EPOLL_EVENT_DATA1_OFFSET,
+            event.data.data1,
+        ))
+        .max(p1_write_u32(
+            caller,
+            memory,
+            ptr + WASIX_EPOLL_EVENT_DATA_PADDING_OFFSET,
+            0,
+        ))
+        .max(p1_write_u64(
+            caller,
+            memory,
+            ptr + WASIX_EPOLL_EVENT_DATA2_OFFSET,
+            event.data.data2,
+        ))
+}
+
+fn wasix_collect_epoll_events<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    epfd: i32,
+    maxevents: u32,
+) -> Vec<EpollInterest>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let interests = match caller.data().descriptors.get(epfd) {
+        Some(Preview1Descriptor::Epoll(epoll)) => epoll.interests.clone(),
+        _ => return Vec::new(),
+    };
+    let mut ready = Vec::new();
+    let mut oneshot_fds = Vec::new();
+    for mut interest in interests {
+        if ready.len() >= maxevents as usize {
+            break;
+        }
+        let events =
+            wasix_epoll_ready_mask(caller.data().descriptors.get(interest.fd), interest.events);
+        if events == 0 {
+            continue;
+        }
+        let oneshot = interest.events & WASIX_EPOLL_TYPE_EPOLLONESHOT != 0;
+        interest.events = events;
+        if oneshot {
+            oneshot_fds.push(interest.fd);
+        }
+        ready.push(interest);
+    }
+    if !oneshot_fds.is_empty() {
+        if let Some(Preview1Descriptor::Epoll(epoll)) = caller.data_mut().descriptors.get_mut(epfd)
+        {
+            epoll
+                .interests
+                .retain(|interest| !oneshot_fds.contains(&interest.fd));
+        }
+    }
+    ready
+}
+
+fn wasix_epoll_ready_mask(descriptor: Option<&Preview1Descriptor>, interest: u32) -> u32 {
+    let Some(descriptor) = descriptor else {
+        return WASIX_EPOLL_TYPE_EPOLLERR | WASIX_EPOLL_TYPE_EPOLLHUP;
+    };
+    let mut ready = 0;
+    if interest & WASIX_EPOLL_TYPE_EPOLLIN != 0 {
+        match p1_poll_descriptor(Some(descriptor), P1_EVENTTYPE_FD_READ) {
+            Ok(bytes) if bytes != 0 => ready |= WASIX_EPOLL_TYPE_EPOLLIN,
+            Err(_) => ready |= WASIX_EPOLL_TYPE_EPOLLERR,
+            _ => {}
+        }
+    }
+    if interest & WASIX_EPOLL_TYPE_EPOLLOUT != 0 {
+        match p1_poll_descriptor(Some(descriptor), P1_EVENTTYPE_FD_WRITE) {
+            Ok(_) => ready |= WASIX_EPOLL_TYPE_EPOLLOUT,
+            Err(_) => ready |= WASIX_EPOLL_TYPE_EPOLLERR,
+        }
+    }
+    ready
 }
 
 fn wasix_read_addr_port<T>(
@@ -12132,6 +12387,7 @@ fn p1_descriptor_rights(descriptor: &Preview1Descriptor) -> u64 {
         Preview1Descriptor::Event(_) => {
             P1_RIGHT_FD_READ | P1_RIGHT_FD_WRITE | P1_RIGHT_POLL_FD_READWRITE
         }
+        Preview1Descriptor::Epoll(_) => P1_RIGHT_FD_READ | P1_RIGHT_POLL_FD_READWRITE,
         Preview1Descriptor::Socket(_) => {
             P1_RIGHT_FD_READ | P1_RIGHT_FD_WRITE | P1_RIGHT_POLL_FD_READWRITE
         }
@@ -12529,6 +12785,21 @@ const WASIX_ADDR_IP_UNION_OFFSET: u32 = 2;
 const WASIX_ADDR_IP_SIZE: u32 = 18;
 const WASIX_ADDR_PORT_UNION_OFFSET: u32 = 2;
 const WASIX_ADDR_PORT_IP4_ADDRESS_OFFSET: u32 = 4;
+const WASIX_EPOLL_TYPE_EPOLLIN: u32 = 1 << 0;
+const WASIX_EPOLL_TYPE_EPOLLOUT: u32 = 1 << 1;
+const WASIX_EPOLL_TYPE_EPOLLERR: u32 = 1 << 4;
+const WASIX_EPOLL_TYPE_EPOLLHUP: u32 = 1 << 5;
+const WASIX_EPOLL_TYPE_EPOLLONESHOT: u32 = 1 << 7;
+const WASIX_EPOLL_CTL_ADD: i32 = 0;
+const WASIX_EPOLL_CTL_MOD: i32 = 1;
+const WASIX_EPOLL_CTL_DEL: i32 = 2;
+const WASIX_EPOLL_EVENT_SIZE: u32 = 32;
+const WASIX_EPOLL_EVENT_PADDING_OFFSET: u32 = 4;
+const WASIX_EPOLL_EVENT_DATA_OFFSET: u32 = 8;
+const WASIX_EPOLL_EVENT_DATA_FD_OFFSET: u32 = 12;
+const WASIX_EPOLL_EVENT_DATA1_OFFSET: u32 = 16;
+const WASIX_EPOLL_EVENT_DATA_PADDING_OFFSET: u32 = 20;
+const WASIX_EPOLL_EVENT_DATA2_OFFSET: u32 = 24;
 const P1_FSTFLAG_ATIM: u16 = 1 << 0;
 const P1_FSTFLAG_ATIM_NOW: u16 = 1 << 1;
 const P1_FSTFLAG_MTIM: u16 = 1 << 2;
@@ -12998,6 +13269,32 @@ mod tests {
                 WASIX_IPPROTO_UDP_I32,
             ),
             Err(p1::errno::INVAL)
+        );
+    }
+
+    #[test]
+    fn wasix_epoll_ready_mask_reports_supported_descriptor_readiness() {
+        let stdout = Preview1Descriptor::Stdout;
+        assert_eq!(
+            wasix_epoll_ready_mask(Some(&stdout), WASIX_EPOLL_TYPE_EPOLLOUT),
+            WASIX_EPOLL_TYPE_EPOLLOUT
+        );
+
+        let event = Preview1Descriptor::Event(EventFd::new(1, false));
+        assert_eq!(
+            wasix_epoll_ready_mask(Some(&event), WASIX_EPOLL_TYPE_EPOLLIN),
+            WASIX_EPOLL_TYPE_EPOLLIN
+        );
+
+        let empty_event = Preview1Descriptor::Event(EventFd::new(0, false));
+        assert_eq!(
+            wasix_epoll_ready_mask(Some(&empty_event), WASIX_EPOLL_TYPE_EPOLLIN),
+            0
+        );
+
+        assert_eq!(
+            wasix_epoll_ready_mask(None, WASIX_EPOLL_TYPE_EPOLLIN),
+            WASIX_EPOLL_TYPE_EPOLLERR | WASIX_EPOLL_TYPE_EPOLLHUP
         );
     }
 
