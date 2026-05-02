@@ -10742,11 +10742,8 @@ where
     }
     let mut environment = environment.unwrap_or_else(|| caller.data().environment.clone());
     environment.retain(|(name, _)| name.as_str() != HELIOS_PROCESS_ID_ENV);
-    let service = caller
-        .data()
-        .runtime_state
-        .program_service()
-        .ok_or(p1::errno::NOTSUP)?;
+    let runtime_state = caller.data().runtime_state.clone();
+    let service = runtime_state.wait_for_program_service().await;
     let exec_context = caller.data().exec_context();
     let authority = authority.unwrap_or_else(|| caller.data().authority.clone());
     let filesystem = Some(caller.data().filesystem.snapshot());
