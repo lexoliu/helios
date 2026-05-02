@@ -11827,7 +11827,7 @@ fn validate_preview1_program_import(module_name: &str, name: &str) -> Result<(),
             }
         }
         WASIX_MODULE => {
-            if WASIX_PROGRAM_LINKED_IMPORTS.contains(&name) {
+            if crate::wasmtime_adapter::wasix::LINKED_IMPORTS.contains(&name) {
                 return Ok(());
             }
         }
@@ -11959,107 +11959,6 @@ const PREVIEW1_PROGRAM_LINKED_IMPORTS: &[&str] = &[
     "sock_send",
     "sock_shutdown",
 ];
-const WASIX_PROGRAM_LINKED_IMPORTS: &[&str] = &[
-    "args_sizes_get",
-    "args_get",
-    "environ_sizes_get",
-    "environ_get",
-    "clock_time_get",
-    "fd_close",
-    "fd_fdstat_get",
-    "fd_fdstat_set_flags",
-    "fd_filestat_get",
-    "fd_prestat_get",
-    "fd_prestat_dir_name",
-    "fd_read",
-    "fd_readdir",
-    "fd_renumber",
-    "fd_seek",
-    "fd_write",
-    "path_filestat_get",
-    "path_open",
-    "sched_yield",
-    "proc_exit",
-    "proc_exit2",
-    "clock_time_set",
-    "fd_dup",
-    "fd_dup2",
-    "fd_event",
-    "fd_pipe",
-    "tty_get",
-    "tty_set",
-    "getcwd",
-    "chdir",
-    "callback_signal",
-    "thread_spawn_v2",
-    "thread_sleep",
-    "thread_id",
-    "thread_join",
-    "thread_parallelism",
-    "thread_signal",
-    "futex_wait",
-    "futex_wake",
-    "futex_wake_all",
-    "thread_exit",
-    "stack_checkpoint",
-    "stack_restore",
-    "path_open2",
-    "fd_fdflags_get",
-    "fd_fdflags_set",
-    "proc_raise_interval",
-    "proc_fork",
-    "proc_exec",
-    "proc_exec2",
-    "proc_exec3",
-    "proc_spawn",
-    "proc_spawn2",
-    "proc_id",
-    "proc_parent",
-    "proc_join",
-    "proc_signal",
-    "proc_signals_get",
-    "proc_signals_sizes_get",
-    "proc_snapshot",
-    "port_bridge",
-    "port_unbridge",
-    "port_dhcp_acquire",
-    "port_addr_add",
-    "port_addr_remove",
-    "port_addr_clear",
-    "port_mac",
-    "port_addr_list",
-    "port_gateway_set",
-    "port_route_add",
-    "port_route_remove",
-    "port_route_clear",
-    "port_route_list",
-    "sock_status",
-    "sock_addr_local",
-    "sock_addr_peer",
-    "sock_open",
-    "sock_pair",
-    "sock_set_opt_flag",
-    "sock_get_opt_flag",
-    "sock_set_opt_time",
-    "sock_get_opt_time",
-    "sock_set_opt_size",
-    "sock_get_opt_size",
-    "sock_join_multicast_v4",
-    "sock_leave_multicast_v4",
-    "sock_join_multicast_v6",
-    "sock_leave_multicast_v6",
-    "sock_bind",
-    "sock_listen",
-    "sock_accept_v2",
-    "sock_connect",
-    "sock_recv_from",
-    "sock_send_to",
-    "sock_send_file",
-    "resolve",
-    "epoll_create",
-    "epoll_ctl",
-    "epoll_wait",
-];
 const P1_RIGHT_PATH_READ_MASK: u64 =
     P1_RIGHT_PATH_OPEN | P1_RIGHT_FD_READDIR | P1_RIGHT_PATH_READLINK | P1_RIGHT_PATH_FILESTAT_GET;
 const P1_RIGHT_PATH_FILE_WRITE_MASK: u64 =
@@ -12152,7 +12051,7 @@ mod tests {
 
     #[test]
     fn wasix_program_linked_imports_have_authority_mapping() {
-        for import in WASIX_PROGRAM_LINKED_IMPORTS {
+        for import in crate::wasmtime_adapter::wasix::LINKED_IMPORTS {
             assert!(
                 crate::wasmtime_adapter::wasix::authority_for(import).is_some(),
                 "WASIX linked import {import} has no capability mapping"
@@ -12163,14 +12062,14 @@ mod tests {
     #[test]
     fn wasix_manifest_is_linked_by_core_adapter() {
         assert_eq!(
-            WASIX_PROGRAM_LINKED_IMPORTS,
+            crate::wasmtime_adapter::wasix::LINKED_IMPORTS,
             crate::wasmtime_adapter::wasix::manifest().collect::<Vec<_>>()
         );
     }
 
     #[test]
     fn wasix_linked_imports_are_accepted_by_core_validator() {
-        for import in WASIX_PROGRAM_LINKED_IMPORTS {
+        for import in crate::wasmtime_adapter::wasix::LINKED_IMPORTS {
             validate_preview1_program_import(WASIX_MODULE, import)
                 .expect("linked WASIX imports should validate");
         }
