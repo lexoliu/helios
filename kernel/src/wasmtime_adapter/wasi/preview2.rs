@@ -3266,10 +3266,28 @@ fn error_code_from_p3(error: p3fs::ErrorCode) -> p2fs::ErrorCode {
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::String;
+
     use super::{
-        WasiTcpSocketFamily, map_p2_tcp_core_error, map_p2_tcp_socket_error, p2net, p2tcp,
-        parse_p2_tcp_socket_address,
+        PREVIEW2_WIT_PACKAGES, WasiTcpSocketFamily, map_p2_tcp_core_error, map_p2_tcp_socket_error,
+        p2net, p2tcp, parse_p2_tcp_socket_address,
     };
+
+    #[test]
+    fn preview2_wit_packages_use_expected_version() {
+        for (package, wit) in PREVIEW2_WIT_PACKAGES {
+            let expected = {
+                let mut expected = String::from("package ");
+                expected.push_str(package);
+                expected.push_str("@0.2.6;");
+                expected
+            };
+            assert!(
+                wit.lines().any(|line| line.trim() == expected),
+                "preview2 WIT package {package} does not declare @0.2.6"
+            );
+        }
+    }
 
     #[test]
     fn p2_tcp_maps_core_network_errors_without_preview3_intermediate() {

@@ -175,3 +175,26 @@ where
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use alloc::string::String;
+
+    use super::WIT_PACKAGES;
+
+    #[test]
+    fn preview3_wit_packages_use_expected_rc_version() {
+        for (package, wit) in WIT_PACKAGES {
+            let expected = {
+                let mut expected = String::from("package ");
+                expected.push_str(package);
+                expected.push_str("@0.3.0-rc-2026-03-15;");
+                expected
+            };
+            assert!(
+                wit.lines().any(|line| line.trim() == expected),
+                "preview3 WIT package {package} does not declare @0.3.0-rc-2026-03-15"
+            );
+        }
+    }
+}
