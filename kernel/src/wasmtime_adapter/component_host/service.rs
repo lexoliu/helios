@@ -8207,9 +8207,9 @@ where
         Ok(cwd) => cwd,
         Err(errno) => return errno,
     };
-    let needed = match u32::try_from(cwd.len()) {
+    let needed = match wasix_getcwd_required_len(cwd) {
         Ok(needed) => needed,
-        Err(_) => return p1::errno::OVERFLOW,
+        Err(errno) => return errno,
     };
     let status = preview1_write_u32(memory, path_len, needed);
     if status != p1::errno::SUCCESS {
@@ -8226,6 +8226,10 @@ where
         return preview1_write_memory(memory, path.saturating_add(needed), &[0]);
     }
     p1::errno::SUCCESS
+}
+
+fn wasix_getcwd_required_len(cwd: &str) -> Result<u32, i32> {
+    u32::try_from(cwd.len()).map_err(|_| p1::errno::OVERFLOW)
 }
 
 fn wasix_chdir<CpuImpl, HostFs>(
@@ -12084,6 +12088,12 @@ mod tests {
             validate_preview1_program_import("wasi_unstable", import)
                 .expect("wasi_unstable imports should validate as preview1");
         }
+    }
+
+    #[test]
+    fn wasix_getcwd_reports_path_length_without_trailing_nul() {
+        assert_eq!(wasix_getcwd_required_len("/"), Ok(1));
+        assert_eq!(wasix_getcwd_required_len("/tmp/work"), Ok(9));
     }
 
     #[test]
