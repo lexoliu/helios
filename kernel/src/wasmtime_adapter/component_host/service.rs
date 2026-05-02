@@ -6694,7 +6694,7 @@ where
             Err(_) => return p1::errno::OVERFLOW,
         };
         match service.read_file_range(&host_path, offset, max_bytes).await {
-            Ok(bytes) => bytes,
+            Ok(bytes) => Bytes::from(bytes),
             Err(error) => {
                 return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
             }
@@ -11564,6 +11564,7 @@ where
                     .filesystem
                     .read_file_chunk(&descriptor, offset, capacity)
                     .map_err(p1_errno_from_fs)?
+                    .to_vec()
             };
             if let Some(Preview1Descriptor::File { offset, .. }) =
                 caller.data_mut().descriptors.get_mut(fd)

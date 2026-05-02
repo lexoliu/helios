@@ -1280,7 +1280,7 @@ where
                         u64::try_from(bytes.len()).expect("read chunk size overflowed u64"),
                     )
                     .ok_or_else(|| wasmtime::Error::new(WasiAdapterTrap::FileReadOffsetOverflow))?;
-                destination.set_buffer(bytes.into());
+                destination.set_buffer(VecBuffer::from(bytes.to_vec()));
                 Poll::Ready(Ok(StreamResult::Completed))
             }
             Err(error) => {
@@ -1797,7 +1797,7 @@ where
         descriptor: &FsDescriptor,
         offset: u64,
         max_bytes: usize,
-    ) -> core::result::Result<Vec<u8>, fs_types::ErrorCode> {
+    ) -> core::result::Result<Bytes, fs_types::ErrorCode> {
         // Host file contents are eagerly cached during `open_at`, so
         // stream reads always fall through to the embedded node list.
         // If the node is missing, return NoEntry.
@@ -1814,13 +1814,13 @@ where
             .map_err(|_| fs_types::ErrorCode::Overflow)?;
         let contents = node.contents.as_ref();
         if offset >= contents.len() {
-            return Ok(Vec::new());
+            return Ok(Bytes::new());
         }
         let end = offset
             .checked_add(max_bytes)
             .map(|value| value.min(contents.len()))
             .ok_or(fs_types::ErrorCode::Overflow)?;
-        Ok(contents[offset..end].to_vec())
+        Ok(node.contents.slice(offset..end))
     }
 
     pub(crate) fn read_program_file_bytes(
@@ -5385,7 +5385,8 @@ mod tests {
         assert_eq!(
             filesystem
                 .read_file_chunk(&alias, 0, 4)
-                .expect("alias read must succeed"),
+                .expect("alias read must succeed")
+                .as_ref(),
             b"bolt"
         );
     }
@@ -5464,7 +5465,8 @@ mod tests {
         assert_eq!(
             filesystem
                 .read_file_chunk(&alias, 0, 6)
-                .expect("alias read must succeed"),
+                .expect("alias read must succeed")
+                .as_ref(),
             b"data\0\0"
         );
         assert_eq!(filesystem.stat("/tmp").expect("stat must succeed").size, 6);
@@ -5655,7 +5657,8 @@ mod tests {
         assert_eq!(
             filesystem
                 .read_file_chunk(&opened, 0, 4)
-                .expect("target read must succeed"),
+                .expect("target read must succeed")
+                .as_ref(),
             b"tool"
         );
 

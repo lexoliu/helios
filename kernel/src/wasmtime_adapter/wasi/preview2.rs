@@ -284,7 +284,7 @@ pub struct DirectoryEntryStream {
 struct EmptyInputStream;
 
 struct FileInputStream {
-    bytes: Vec<u8>,
+    bytes: Bytes,
     cursor: usize,
 }
 
@@ -308,7 +308,7 @@ enum P2FileStreamError {
 }
 
 impl FileInputStream {
-    fn new(bytes: Vec<u8>) -> Self {
+    fn new(bytes: Bytes) -> Self {
         Self { bytes, cursor: 0 }
     }
 }
@@ -525,7 +525,7 @@ impl InputStream for FileInputStream {
         }
 
         let end = self.cursor.saturating_add(size).min(self.bytes.len());
-        let chunk = Bytes::copy_from_slice(&self.bytes[self.cursor..end]);
+        let chunk = self.bytes.slice(self.cursor..end);
         self.cursor = end;
         Ok(chunk)
     }
@@ -1083,7 +1083,7 @@ where
         {
             Ok(bytes) => {
                 let eof = bytes.len() < length;
-                Ok(Ok((bytes, eof)))
+                Ok(Ok((bytes.to_vec(), eof)))
             }
             Err(error) => Ok(Err(error_code_from_p3(error))),
         }
