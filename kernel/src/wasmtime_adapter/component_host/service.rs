@@ -2917,14 +2917,11 @@ impl Preview1DescriptorTable {
     }
 
     fn close(&mut self, fd: i32) -> i32 {
-        match fd {
-            0..=2 => p1::errno::BADF,
-            _ => usize::try_from(fd)
-                .ok()
-                .and_then(|index| self.entries.get_mut(index))
-                .and_then(Option::take)
-                .map_or(p1::errno::BADF, |_| p1::errno::SUCCESS),
-        }
+        usize::try_from(fd)
+            .ok()
+            .and_then(|index| self.entries.get_mut(index))
+            .and_then(Option::take)
+            .map_or(p1::errno::BADF, |_| p1::errno::SUCCESS)
     }
 
     fn renumber(&mut self, from: i32, to: i32) -> i32 {
@@ -15758,6 +15755,32 @@ mod tests {
         }
         assert_eq!(table.close_on_exec(1), Ok(false));
         assert!(table.get(3).is_none());
+    }
+
+    #[test]
+    fn fd_close_can_close_stdio_slots() {
+        let mut table = Preview1DescriptorTable {
+            entries: vec![
+                Some(Preview1DescriptorEntry::new(
+                    Preview1Descriptor::Stdin {
+                        carry: Bytes::new(),
+                    },
+                    false,
+                )),
+                Some(Preview1DescriptorEntry::new(
+                    Preview1Descriptor::Stdout,
+                    false,
+                )),
+                Some(Preview1DescriptorEntry::new(
+                    Preview1Descriptor::Stderr,
+                    false,
+                )),
+            ],
+        };
+
+        assert_eq!(table.close(1), p1::errno::SUCCESS);
+        assert!(table.get(1).is_none());
+        assert_eq!(table.close(1), p1::errno::BADF);
     }
 
     #[test]
