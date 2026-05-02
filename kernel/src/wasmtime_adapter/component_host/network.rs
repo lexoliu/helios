@@ -7,8 +7,9 @@ use core::future::Future;
 use core::pin::Pin;
 
 use crate::{
-    ComponentNetworkService, DnsError, Ipv4Address, PingError, PingReply, TcpAccepted, TcpError,
-    TcpListener, UdpBinding, UdpDatagram, UdpError,
+    ComponentNetworkService, DnsError, Ipv4Address, Ipv4Cidr, Ipv4Route, MacAddress,
+    NetworkAdminBackend, NetworkBridgeId, NetworkControlError, NetworkPortId, PingError, PingReply,
+    TcpAccepted, TcpError, TcpListener, UdpBinding, UdpDatagram, UdpError,
 };
 
 pub trait ComponentHostTcpStreamToken: Copy + Send + 'static {
@@ -158,6 +159,77 @@ trait DynComponentHostNetworkService: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<(), UdpError>> + Send + 'a>>;
 
     fn udp_close<'a>(&'a self, socket: u64) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+    fn bridge_port<'a>(
+        &'a self,
+        port: NetworkPortId,
+        bridge: NetworkBridgeId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>>;
+
+    fn unbridge_port<'a>(
+        &'a self,
+        port: NetworkPortId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>>;
+
+    fn acquire_dhcp<'a>(
+        &'a self,
+        port: NetworkPortId,
+    ) -> Pin<Box<dyn Future<Output = Result<Ipv4Cidr, NetworkControlError>> + Send + 'a>>;
+
+    fn add_address<'a>(
+        &'a self,
+        port: NetworkPortId,
+        address: Ipv4Cidr,
+    ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>>;
+
+    fn remove_address<'a>(
+        &'a self,
+        port: NetworkPortId,
+        address: Ipv4Cidr,
+    ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>>;
+
+    fn clear_addresses<'a>(
+        &'a self,
+        port: NetworkPortId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>>;
+
+    fn list_addresses<'a>(
+        &'a self,
+        port: NetworkPortId,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Ipv4Cidr>, NetworkControlError>> + Send + 'a>>;
+
+    fn mac_address<'a>(
+        &'a self,
+        port: NetworkPortId,
+    ) -> Pin<Box<dyn Future<Output = Result<MacAddress, NetworkControlError>> + Send + 'a>>;
+
+    fn set_gateway<'a>(
+        &'a self,
+        port: NetworkPortId,
+        gateway: Ipv4Address,
+    ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>>;
+
+    fn add_route<'a>(
+        &'a self,
+        port: NetworkPortId,
+        route: Ipv4Route,
+    ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>>;
+
+    fn remove_route<'a>(
+        &'a self,
+        port: NetworkPortId,
+        route: Ipv4Route,
+    ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>>;
+
+    fn clear_routes<'a>(
+        &'a self,
+        port: NetworkPortId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>>;
+
+    fn list_routes<'a>(
+        &'a self,
+        port: NetworkPortId,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Ipv4Route>, NetworkControlError>> + Send + 'a>>;
 }
 
 #[derive(Clone)]
@@ -168,7 +240,7 @@ pub struct ComponentHostNetworkService {
 impl ComponentHostNetworkService {
     pub fn from_service<Service>(service: Service) -> Self
     where
-        Service: ComponentNetworkService + Sync,
+        Service: ComponentNetworkService + NetworkAdminBackend + Sync,
         Service::TcpStream: ComponentHostTcpStreamToken,
         Service::TcpListener: ComponentHostTcpListenerToken,
         Service::UdpSocket: ComponentHostUdpSocketToken,
@@ -322,13 +394,112 @@ impl ComponentNetworkService for ComponentHostNetworkService {
     }
 }
 
+impl NetworkAdminBackend for ComponentHostNetworkService {
+    fn bridge_port(
+        &self,
+        port: NetworkPortId,
+        bridge: NetworkBridgeId,
+    ) -> impl Future<Output = Result<(), NetworkControlError>> + Send {
+        self.inner.bridge_port(port, bridge)
+    }
+
+    fn unbridge_port(
+        &self,
+        port: NetworkPortId,
+    ) -> impl Future<Output = Result<(), NetworkControlError>> + Send {
+        self.inner.unbridge_port(port)
+    }
+
+    fn acquire_dhcp(
+        &self,
+        port: NetworkPortId,
+    ) -> impl Future<Output = Result<Ipv4Cidr, NetworkControlError>> + Send {
+        self.inner.acquire_dhcp(port)
+    }
+
+    fn add_address(
+        &self,
+        port: NetworkPortId,
+        address: Ipv4Cidr,
+    ) -> impl Future<Output = Result<(), NetworkControlError>> + Send {
+        self.inner.add_address(port, address)
+    }
+
+    fn remove_address(
+        &self,
+        port: NetworkPortId,
+        address: Ipv4Cidr,
+    ) -> impl Future<Output = Result<(), NetworkControlError>> + Send {
+        self.inner.remove_address(port, address)
+    }
+
+    fn clear_addresses(
+        &self,
+        port: NetworkPortId,
+    ) -> impl Future<Output = Result<(), NetworkControlError>> + Send {
+        self.inner.clear_addresses(port)
+    }
+
+    fn list_addresses(
+        &self,
+        port: NetworkPortId,
+    ) -> impl Future<Output = Result<Vec<Ipv4Cidr>, NetworkControlError>> + Send {
+        self.inner.list_addresses(port)
+    }
+
+    fn mac_address(
+        &self,
+        port: NetworkPortId,
+    ) -> impl Future<Output = Result<MacAddress, NetworkControlError>> + Send {
+        self.inner.mac_address(port)
+    }
+
+    fn set_gateway(
+        &self,
+        port: NetworkPortId,
+        gateway: Ipv4Address,
+    ) -> impl Future<Output = Result<(), NetworkControlError>> + Send {
+        self.inner.set_gateway(port, gateway)
+    }
+
+    fn add_route(
+        &self,
+        port: NetworkPortId,
+        route: Ipv4Route,
+    ) -> impl Future<Output = Result<(), NetworkControlError>> + Send {
+        self.inner.add_route(port, route)
+    }
+
+    fn remove_route(
+        &self,
+        port: NetworkPortId,
+        route: Ipv4Route,
+    ) -> impl Future<Output = Result<(), NetworkControlError>> + Send {
+        self.inner.remove_route(port, route)
+    }
+
+    fn clear_routes(
+        &self,
+        port: NetworkPortId,
+    ) -> impl Future<Output = Result<(), NetworkControlError>> + Send {
+        self.inner.clear_routes(port)
+    }
+
+    fn list_routes(
+        &self,
+        port: NetworkPortId,
+    ) -> impl Future<Output = Result<Vec<Ipv4Route>, NetworkControlError>> + Send {
+        self.inner.list_routes(port)
+    }
+}
+
 struct TypedNetworkService<Service> {
     service: Service,
 }
 
 impl<Service> DynComponentHostNetworkService for TypedNetworkService<Service>
 where
-    Service: ComponentNetworkService + Sync,
+    Service: ComponentNetworkService + NetworkAdminBackend + Sync,
     Service::TcpStream: ComponentHostTcpStreamToken,
     Service::TcpListener: ComponentHostTcpListenerToken,
     Service::UdpSocket: ComponentHostUdpSocketToken,
@@ -548,5 +719,103 @@ where
                 .udp_close(<Service::UdpSocket as ComponentHostUdpSocketToken>::from_raw(socket))
                 .await
         })
+    }
+
+    fn bridge_port<'a>(
+        &'a self,
+        port: NetworkPortId,
+        bridge: NetworkBridgeId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>> {
+        Box::pin(async move { self.service.bridge_port(port, bridge).await })
+    }
+
+    fn unbridge_port<'a>(
+        &'a self,
+        port: NetworkPortId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>> {
+        Box::pin(async move { self.service.unbridge_port(port).await })
+    }
+
+    fn acquire_dhcp<'a>(
+        &'a self,
+        port: NetworkPortId,
+    ) -> Pin<Box<dyn Future<Output = Result<Ipv4Cidr, NetworkControlError>> + Send + 'a>> {
+        Box::pin(async move { self.service.acquire_dhcp(port).await })
+    }
+
+    fn add_address<'a>(
+        &'a self,
+        port: NetworkPortId,
+        address: Ipv4Cidr,
+    ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>> {
+        Box::pin(async move { self.service.add_address(port, address).await })
+    }
+
+    fn remove_address<'a>(
+        &'a self,
+        port: NetworkPortId,
+        address: Ipv4Cidr,
+    ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>> {
+        Box::pin(async move { self.service.remove_address(port, address).await })
+    }
+
+    fn clear_addresses<'a>(
+        &'a self,
+        port: NetworkPortId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>> {
+        Box::pin(async move { self.service.clear_addresses(port).await })
+    }
+
+    fn list_addresses<'a>(
+        &'a self,
+        port: NetworkPortId,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Ipv4Cidr>, NetworkControlError>> + Send + 'a>> {
+        Box::pin(async move { self.service.list_addresses(port).await })
+    }
+
+    fn mac_address<'a>(
+        &'a self,
+        port: NetworkPortId,
+    ) -> Pin<Box<dyn Future<Output = Result<MacAddress, NetworkControlError>> + Send + 'a>> {
+        Box::pin(async move { self.service.mac_address(port).await })
+    }
+
+    fn set_gateway<'a>(
+        &'a self,
+        port: NetworkPortId,
+        gateway: Ipv4Address,
+    ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>> {
+        Box::pin(async move { self.service.set_gateway(port, gateway).await })
+    }
+
+    fn add_route<'a>(
+        &'a self,
+        port: NetworkPortId,
+        route: Ipv4Route,
+    ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>> {
+        Box::pin(async move { self.service.add_route(port, route).await })
+    }
+
+    fn remove_route<'a>(
+        &'a self,
+        port: NetworkPortId,
+        route: Ipv4Route,
+    ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>> {
+        Box::pin(async move { self.service.remove_route(port, route).await })
+    }
+
+    fn clear_routes<'a>(
+        &'a self,
+        port: NetworkPortId,
+    ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>> {
+        Box::pin(async move { self.service.clear_routes(port).await })
+    }
+
+    fn list_routes<'a>(
+        &'a self,
+        port: NetworkPortId,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Ipv4Route>, NetworkControlError>> + Send + 'a>>
+    {
+        Box::pin(async move { self.service.list_routes(port).await })
     }
 }

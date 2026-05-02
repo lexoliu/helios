@@ -16,7 +16,7 @@ use core::time::Duration;
 use helios_hal::cpu::Cpu;
 use helios_hal::io::IoError;
 use smoltcp::iface::{
-    Config as InterfaceConfig, Interface, MulticastError, SocketHandle, SocketSet,
+    Config as InterfaceConfig, Interface, MulticastError, Route, SocketHandle, SocketSet,
 };
 use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::{dhcpv4, dns, icmp, tcp, udp};
@@ -28,9 +28,10 @@ use smoltcp::wire::{
 
 use crate::{
     ComponentNetworkService, ComponentRuntimeState, DnsError, DnsErrorKind,
-    Ipv4Address as KernelIpv4Address, NetworkErrorDetail, Notify, PingError, PingErrorKind,
-    PingReply, TcpAccepted, TcpError, TcpErrorKind, TcpListener, Timer, UdpBinding, UdpDatagram,
-    UdpError, UdpErrorKind,
+    Ipv4Address as KernelIpv4Address, Ipv4Cidr as KernelIpv4Cidr, Ipv4Route as KernelIpv4Route,
+    MacAddress, NetworkAdminBackend, NetworkBridgeId, NetworkControlError, NetworkErrorDetail,
+    NetworkPortId, Notify, PingError, PingErrorKind, PingReply, TcpAccepted, TcpError,
+    TcpErrorKind, TcpListener, Timer, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
 };
 
 const DHCP_PARAMETERS: &[u8] = &[1, 3, 6];
@@ -43,6 +44,7 @@ const UDP_BUFFER_BYTES: usize = 8 * 1024;
 const UDP_BUFFER_PACKETS: usize = 16;
 const EPHEMERAL_PORT_START: u16 = 49_152;
 const EPHEMERAL_PORT_END: u16 = 65_535;
+const LOCAL_NETWORK_PORT: NetworkPortId = NetworkPortId::new(0);
 
 pub trait NetworkDevice: Clone + Send + Sync + 'static {
     fn mac_address(&self) -> [u8; 6];
@@ -353,6 +355,26 @@ enum UdpReceiveProgress {
 
 fn map_ipv4_address(address: Ipv4Address) -> KernelIpv4Address {
     KernelIpv4Address::new(address.octets())
+}
+
+fn map_kernel_ipv4_address(address: KernelIpv4Address) -> Ipv4Address {
+    Ipv4Address::from_octets(address.octets())
+}
+
+fn map_kernel_ipv4_cidr(cidr: KernelIpv4Cidr) -> Ipv4Cidr {
+    Ipv4Cidr::new(map_kernel_ipv4_address(cidr.address()), cidr.prefix_len())
+}
+
+fn map_ipv4_cidr(cidr: Ipv4Cidr) -> KernelIpv4Cidr {
+    KernelIpv4Cidr::new(map_ipv4_address(cidr.address()), cidr.prefix_len())
+}
+
+fn require_local_network_port(port: NetworkPortId) -> Result<(), NetworkControlError> {
+    if port == LOCAL_NETWORK_PORT {
+        Ok(())
+    } else {
+        Err(NetworkControlError::PortUnavailable)
+    }
 }
 
 impl<CpuImpl, Runtime, DeviceImpl> NetworkService<CpuImpl, Runtime, DeviceImpl>
@@ -1355,6 +1377,29 @@ where
             .ipv4_address
             .map(|cidr| crate::Ipv4Cidr::new(map_ipv4_address(cidr.address()), cidr.prefix_len()))
     }
+
+    async fn acquire_dhcp_address(&self) -> Result<KernelIpv4Cidr, NetworkControlError> {
+        loop {
+            self.drive_network()
+                .await
+                .map_err(|_| NetworkControlError::BackendFault)?;
+            let next_wait = {
+                let mut state = self.inner.state.lock().await;
+                if let Some(cidr) = state.ipv4_address {
+                    return Ok(map_ipv4_cidr(cidr));
+                }
+                state.next_poll_duration(self.now_nanos())
+            };
+            self.wait_for_next_network_progress(next_wait).await;
+        }
+    }
+
+    async fn wait_for_next_network_progress(&self, duration: Option<Duration>) {
+        match duration {
+            Some(duration) => self.wait_for_progress(duration).await,
+            None => self.inner.device.wait_for_event().await,
+        }
+    }
 }
 
 impl<CpuImpl, Runtime, DeviceImpl> ComponentNetworkService
@@ -1513,6 +1558,125 @@ where
         socket: Self::UdpSocket,
     ) -> impl core::future::Future<Output = ()> + Send + '_ {
         async move { NetworkService::udp_close(self, socket).await }
+    }
+}
+
+impl<CpuImpl, Runtime, DeviceImpl> NetworkAdminBackend
+    for NetworkService<CpuImpl, Runtime, DeviceImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Runtime: ComponentRuntimeState + Sync,
+    DeviceImpl: NetworkDevice,
+{
+    async fn bridge_port(
+        &self,
+        port: NetworkPortId,
+        _: NetworkBridgeId,
+    ) -> Result<(), NetworkControlError> {
+        require_local_network_port(port)?;
+        Err(NetworkControlError::BridgeUnavailable)
+    }
+
+    async fn unbridge_port(&self, port: NetworkPortId) -> Result<(), NetworkControlError> {
+        require_local_network_port(port)?;
+        Err(NetworkControlError::BridgeUnavailable)
+    }
+
+    async fn acquire_dhcp(
+        &self,
+        port: NetworkPortId,
+    ) -> Result<KernelIpv4Cidr, NetworkControlError> {
+        require_local_network_port(port)?;
+        self.acquire_dhcp_address().await
+    }
+
+    async fn add_address(
+        &self,
+        port: NetworkPortId,
+        address: KernelIpv4Cidr,
+    ) -> Result<(), NetworkControlError> {
+        require_local_network_port(port)?;
+        let mut state = self.inner.state.lock().await;
+        state.add_ipv4_address(address)
+    }
+
+    async fn remove_address(
+        &self,
+        port: NetworkPortId,
+        address: KernelIpv4Cidr,
+    ) -> Result<(), NetworkControlError> {
+        require_local_network_port(port)?;
+        let mut state = self.inner.state.lock().await;
+        state.remove_ipv4_address(address);
+        Ok(())
+    }
+
+    async fn clear_addresses(&self, port: NetworkPortId) -> Result<(), NetworkControlError> {
+        require_local_network_port(port)?;
+        let mut state = self.inner.state.lock().await;
+        state.clear_ipv4_addresses();
+        Ok(())
+    }
+
+    async fn list_addresses(
+        &self,
+        port: NetworkPortId,
+    ) -> Result<Vec<KernelIpv4Cidr>, NetworkControlError> {
+        require_local_network_port(port)?;
+        let state = self.inner.state.lock().await;
+        Ok(state.list_ipv4_addresses())
+    }
+
+    async fn mac_address(&self, port: NetworkPortId) -> Result<MacAddress, NetworkControlError> {
+        require_local_network_port(port)?;
+        Ok(MacAddress::new(self.hardware_address()))
+    }
+
+    async fn set_gateway(
+        &self,
+        port: NetworkPortId,
+        gateway: KernelIpv4Address,
+    ) -> Result<(), NetworkControlError> {
+        require_local_network_port(port)?;
+        let mut state = self.inner.state.lock().await;
+        state.set_default_ipv4_gateway(gateway)
+    }
+
+    async fn add_route(
+        &self,
+        port: NetworkPortId,
+        route: KernelIpv4Route,
+    ) -> Result<(), NetworkControlError> {
+        require_local_network_port(port)?;
+        let mut state = self.inner.state.lock().await;
+        state.add_ipv4_route(route)
+    }
+
+    async fn remove_route(
+        &self,
+        port: NetworkPortId,
+        route: KernelIpv4Route,
+    ) -> Result<(), NetworkControlError> {
+        require_local_network_port(port)?;
+        let mut state = self.inner.state.lock().await;
+        state.remove_ipv4_route(route);
+        Ok(())
+    }
+
+    async fn clear_routes(&self, port: NetworkPortId) -> Result<(), NetworkControlError> {
+        require_local_network_port(port)?;
+        let mut state = self.inner.state.lock().await;
+        state.clear_ipv4_routes();
+        Ok(())
+    }
+
+    async fn list_routes(
+        &self,
+        port: NetworkPortId,
+    ) -> Result<Vec<KernelIpv4Route>, NetworkControlError> {
+        require_local_network_port(port)?;
+        let mut state = self.inner.state.lock().await;
+        Ok(state.list_ipv4_routes())
     }
 }
 
@@ -2404,6 +2568,130 @@ impl NetworkState {
         Ok(())
     }
 
+    fn add_ipv4_address(&mut self, cidr: KernelIpv4Cidr) -> Result<(), NetworkControlError> {
+        let cidr = map_kernel_ipv4_cidr(cidr);
+        let mut result = Ok(());
+        self.iface.update_ip_addrs(|addresses| {
+            if addresses
+                .iter()
+                .any(|address| *address == IpCidr::Ipv4(cidr))
+            {
+                return;
+            }
+            result = addresses
+                .push(IpCidr::Ipv4(cidr))
+                .map_err(|_| NetworkControlError::InvalidAddress);
+        });
+        result?;
+        self.sync_primary_ipv4_address();
+        Ok(())
+    }
+
+    fn remove_ipv4_address(&mut self, cidr: KernelIpv4Cidr) {
+        let cidr = map_kernel_ipv4_cidr(cidr);
+        self.iface.update_ip_addrs(|addresses| {
+            if let Some((index, _)) = addresses
+                .iter()
+                .enumerate()
+                .find(|(_, address)| **address == IpCidr::Ipv4(cidr))
+            {
+                addresses.remove(index);
+            }
+        });
+        self.sync_primary_ipv4_address();
+    }
+
+    fn clear_ipv4_addresses(&mut self) {
+        self.iface.update_ip_addrs(|addresses| {
+            addresses.retain(|address| !matches!(address, IpCidr::Ipv4(_)));
+        });
+        self.sync_primary_ipv4_address();
+    }
+
+    fn list_ipv4_addresses(&self) -> Vec<KernelIpv4Cidr> {
+        self.iface
+            .ip_addrs()
+            .iter()
+            .map(|address| {
+                let IpCidr::Ipv4(cidr) = *address;
+                map_ipv4_cidr(cidr)
+            })
+            .collect()
+    }
+
+    fn sync_primary_ipv4_address(&mut self) {
+        self.ipv4_address = self.iface.ip_addrs().iter().next().map(|address| {
+            let IpCidr::Ipv4(cidr) = *address;
+            cidr
+        });
+    }
+
+    fn set_default_ipv4_gateway(
+        &mut self,
+        gateway: KernelIpv4Address,
+    ) -> Result<(), NetworkControlError> {
+        self.iface
+            .routes_mut()
+            .add_default_ipv4_route(map_kernel_ipv4_address(gateway))
+            .map(|_| ())
+            .map_err(|_| NetworkControlError::InvalidRoute)
+    }
+
+    fn add_ipv4_route(&mut self, route: KernelIpv4Route) -> Result<(), NetworkControlError> {
+        let cidr = IpCidr::Ipv4(map_kernel_ipv4_cidr(route.destination()));
+        let gateway = IpAddress::Ipv4(map_kernel_ipv4_address(route.gateway()));
+        let route = Route {
+            cidr,
+            via_router: gateway,
+            preferred_until: None,
+            expires_at: None,
+        };
+        let mut result = Ok(());
+        self.iface.routes_mut().update(|routes| {
+            if routes.iter().any(|existing| {
+                existing.cidr == route.cidr && existing.via_router == route.via_router
+            }) {
+                return;
+            }
+            result = routes
+                .push(route)
+                .map_err(|_| NetworkControlError::InvalidRoute);
+        });
+        result
+    }
+
+    fn remove_ipv4_route(&mut self, route: KernelIpv4Route) {
+        let cidr = IpCidr::Ipv4(map_kernel_ipv4_cidr(route.destination()));
+        let gateway = IpAddress::Ipv4(map_kernel_ipv4_address(route.gateway()));
+        self.iface.routes_mut().update(|routes| {
+            if let Some((index, _)) = routes
+                .iter()
+                .enumerate()
+                .find(|(_, existing)| existing.cidr == cidr && existing.via_router == gateway)
+            {
+                routes.remove(index);
+            }
+        });
+    }
+
+    fn clear_ipv4_routes(&mut self) {
+        self.iface.routes_mut().update(|routes| {
+            routes.retain(|route| !matches!(route.cidr, IpCidr::Ipv4(_)));
+        });
+    }
+
+    fn list_ipv4_routes(&mut self) -> Vec<KernelIpv4Route> {
+        let mut result = Vec::new();
+        self.iface.routes_mut().update(|routes| {
+            result.extend(routes.iter().map(|route| {
+                let IpCidr::Ipv4(cidr) = route.cidr;
+                let IpAddress::Ipv4(gateway) = route.via_router;
+                KernelIpv4Route::new(map_ipv4_cidr(cidr), map_ipv4_address(gateway))
+            }));
+        });
+        result
+    }
+
     fn next_wait_duration(&mut self, now_nanos: u64, deadline_nanos: u64) -> Duration {
         let remaining_nanos = deadline_nanos.saturating_sub(now_nanos);
         let stack_wait = self
@@ -2414,6 +2702,12 @@ impl NetworkState {
             Some(wait) => wait.min(Duration::from_nanos(remaining_nanos)),
             None => Duration::from_nanos(remaining_nanos),
         }
+    }
+
+    fn next_poll_duration(&mut self, now_nanos: u64) -> Option<Duration> {
+        self.iface
+            .poll_delay(smol_now(now_nanos), &self.sockets)
+            .map(|delay| Duration::from_micros(delay.total_micros()))
     }
 
     fn take_outbound(&mut self) -> Vec<Vec<u8>> {

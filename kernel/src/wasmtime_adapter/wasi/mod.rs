@@ -5614,6 +5614,130 @@ mod tests {
         }
     }
 
+    impl crate::NetworkAdminBackend for TestNetworkService {
+        fn bridge_port(
+            &self,
+            _: crate::NetworkPortId,
+            _: crate::NetworkBridgeId,
+        ) -> impl core::future::Future<Output = Result<(), crate::NetworkControlError>> + Send
+        {
+            core::future::ready(Err(crate::NetworkControlError::BridgeUnavailable))
+        }
+
+        fn unbridge_port(
+            &self,
+            _: crate::NetworkPortId,
+        ) -> impl core::future::Future<Output = Result<(), crate::NetworkControlError>> + Send
+        {
+            core::future::ready(Err(crate::NetworkControlError::BridgeUnavailable))
+        }
+
+        fn acquire_dhcp(
+            &self,
+            _: crate::NetworkPortId,
+        ) -> impl core::future::Future<Output = Result<crate::Ipv4Cidr, crate::NetworkControlError>> + Send
+        {
+            core::future::ready(Ok(crate::Ipv4Cidr::new(
+                crate::Ipv4Address::new([127, 0, 0, 1]),
+                8,
+            )))
+        }
+
+        fn add_address(
+            &self,
+            _: crate::NetworkPortId,
+            _: crate::Ipv4Cidr,
+        ) -> impl core::future::Future<Output = Result<(), crate::NetworkControlError>> + Send
+        {
+            core::future::ready(Ok(()))
+        }
+
+        fn remove_address(
+            &self,
+            _: crate::NetworkPortId,
+            _: crate::Ipv4Cidr,
+        ) -> impl core::future::Future<Output = Result<(), crate::NetworkControlError>> + Send
+        {
+            core::future::ready(Ok(()))
+        }
+
+        fn clear_addresses(
+            &self,
+            _: crate::NetworkPortId,
+        ) -> impl core::future::Future<Output = Result<(), crate::NetworkControlError>> + Send
+        {
+            core::future::ready(Ok(()))
+        }
+
+        fn list_addresses(
+            &self,
+            _: crate::NetworkPortId,
+        ) -> impl core::future::Future<
+            Output = Result<Vec<crate::Ipv4Cidr>, crate::NetworkControlError>,
+        > + Send {
+            core::future::ready(Ok(vec![crate::Ipv4Cidr::new(
+                crate::Ipv4Address::new([127, 0, 0, 1]),
+                8,
+            )]))
+        }
+
+        fn mac_address(
+            &self,
+            _: crate::NetworkPortId,
+        ) -> impl core::future::Future<
+            Output = Result<crate::MacAddress, crate::NetworkControlError>,
+        > + Send {
+            core::future::ready(Ok(crate::MacAddress::new([2, 0, 0, 0, 0, 1])))
+        }
+
+        fn set_gateway(
+            &self,
+            _: crate::NetworkPortId,
+            _: crate::Ipv4Address,
+        ) -> impl core::future::Future<Output = Result<(), crate::NetworkControlError>> + Send
+        {
+            core::future::ready(Ok(()))
+        }
+
+        fn add_route(
+            &self,
+            _: crate::NetworkPortId,
+            _: crate::Ipv4Route,
+        ) -> impl core::future::Future<Output = Result<(), crate::NetworkControlError>> + Send
+        {
+            core::future::ready(Ok(()))
+        }
+
+        fn remove_route(
+            &self,
+            _: crate::NetworkPortId,
+            _: crate::Ipv4Route,
+        ) -> impl core::future::Future<Output = Result<(), crate::NetworkControlError>> + Send
+        {
+            core::future::ready(Ok(()))
+        }
+
+        fn clear_routes(
+            &self,
+            _: crate::NetworkPortId,
+        ) -> impl core::future::Future<Output = Result<(), crate::NetworkControlError>> + Send
+        {
+            core::future::ready(Ok(()))
+        }
+
+        fn list_routes(
+            &self,
+            _: crate::NetworkPortId,
+        ) -> impl core::future::Future<
+            Output = Result<Vec<crate::Ipv4Route>, crate::NetworkControlError>,
+        > + Send {
+            core::future::ready(Ok(vec![crate::Ipv4Route::new(
+                crate::Ipv4Cidr::new(crate::Ipv4Address::new([0, 0, 0, 0]), 0),
+                crate::Ipv4Address::new([127, 0, 0, 1]),
+            )]))
+        }
+    }
+
     type TestFileSystem = DebugFileSystem<TestRuntimeState, UnsupportedHostFileSystem>;
 
     fn test_filesystem() -> TestFileSystem {

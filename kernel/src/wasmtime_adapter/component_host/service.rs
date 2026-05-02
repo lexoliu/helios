@@ -3752,47 +3752,47 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "port_dhcp_acquire",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>| -> i32 {
-                wasix_network_admin_unavailable(&mut caller)
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>, ()| {
+                Box::new(async move { wasix_port_dhcp_acquire(&mut caller).await })
             },
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "port_addr_add",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>, _addr: i32| -> i32 {
-                wasix_network_admin_unavailable(&mut caller)
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>, (addr,): (i32,)| {
+                Box::new(async move { wasix_port_addr_add(&mut caller, addr as u32).await })
             },
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "port_addr_remove",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>, _addr: i32| -> i32 {
-                wasix_network_admin_unavailable(&mut caller)
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>, (addr,): (i32,)| {
+                Box::new(async move { wasix_port_addr_remove(&mut caller, addr as u32).await })
             },
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "port_addr_clear",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>| -> i32 {
-                wasix_network_admin_unavailable(&mut caller)
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>, ()| {
+                Box::new(async move { wasix_port_addr_clear(&mut caller).await })
             },
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "port_mac",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>, ret_mac: i32| -> i32 {
-                wasix_port_mac(&mut caller, ret_mac as u32)
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>, (ret_mac,): (i32,)| {
+                Box::new(async move { wasix_port_mac(&mut caller, ret_mac as u32).await })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -3809,52 +3809,61 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "port_gateway_set",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>, _addr: i32| -> i32 {
-                wasix_network_admin_unavailable(&mut caller)
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>, (addr,): (i32,)| {
+                Box::new(async move { wasix_port_gateway_set(&mut caller, addr as u32).await })
             },
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "port_route_add",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             _cidr: i32,
-             _router: i32,
-             _preferred: i32,
-             _expires: i32|
-             -> i32 { wasix_network_admin_unavailable(&mut caller) },
+             (cidr, router, preferred, expires): (i32, i32, i32, i32)| {
+                Box::new(async move {
+                    wasix_port_route_add(
+                        &mut caller,
+                        cidr as u32,
+                        router as u32,
+                        preferred as u32,
+                        expires as u32,
+                    )
+                    .await
+                })
+            },
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "port_route_remove",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>, _cidr: i32| -> i32 {
-                wasix_network_admin_unavailable(&mut caller)
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>, (cidr,): (i32,)| {
+                Box::new(async move { wasix_port_route_remove(&mut caller, cidr as u32).await })
             },
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "port_route_clear",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>| -> i32 {
-                wasix_network_admin_unavailable(&mut caller)
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>, ()| {
+                Box::new(async move { wasix_port_route_clear(&mut caller).await })
             },
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "port_route_list",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             _routes: i32,
-             nroutes: i32|
-             -> i32 { wasix_port_empty_list(&mut caller, nroutes as u32) },
+             (routes, nroutes): (i32, i32)| {
+                Box::new(async move {
+                    wasix_port_route_list(&mut caller, routes as u32, nroutes as u32).await
+                })
+            },
         )
         .map_err(map_program_runtime_error)?;
     Ok(())
@@ -11654,7 +11663,139 @@ where
     p1::errno::NOTSUP
 }
 
-fn wasix_port_mac<CpuImpl, HostFs>(
+fn wasix_network_admin_service<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+) -> Result<(crate::NetworkAdminCap, ComponentHostNetworkService), i32>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let cap = caller
+        .data()
+        .authority
+        .derive_network_admin_cap()
+        .map_err(|_| p1::errno::NOTCAPABLE)?;
+    let service = caller
+        .data()
+        .runtime_state
+        .network_service()
+        .ok_or(p1::errno::NETDOWN)?;
+    Ok((cap, service))
+}
+
+fn p1_errno_from_network_control_error(error: crate::NetworkControlError) -> i32 {
+    match error {
+        crate::NetworkControlError::PortUnavailable => p1::errno::NETDOWN,
+        crate::NetworkControlError::BridgeUnavailable => p1::errno::NOTSUP,
+        crate::NetworkControlError::InvalidAddress | crate::NetworkControlError::InvalidRoute => {
+            p1::errno::INVAL
+        }
+        crate::NetworkControlError::BackendFault => p1::errno::IO,
+    }
+}
+
+async fn wasix_port_dhcp_acquire<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let (cap, service) = match wasix_network_admin_service(caller) {
+        Ok(parts) => parts,
+        Err(status) => return status,
+    };
+    let control = crate::NetworkControl::new(service);
+    match control
+        .acquire_dhcp(cap, crate::NetworkPortId::new(0))
+        .await
+    {
+        Ok(_) => p1::errno::SUCCESS,
+        Err(error) => p1_errno_from_network_control_error(error),
+    }
+}
+
+async fn wasix_port_addr_add<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    addr: u32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let Some(memory) = p1_memory(caller) else {
+        return p1::errno::FAULT;
+    };
+    let cidr = match wasix_read_addr_cidr_ip4(caller, memory, addr) {
+        Ok(cidr) => cidr,
+        Err(status) => return status,
+    };
+    let (cap, service) = match wasix_network_admin_service(caller) {
+        Ok(parts) => parts,
+        Err(status) => return status,
+    };
+    let control = crate::NetworkControl::new(service);
+    match control
+        .add_address(cap, crate::NetworkPortId::new(0), cidr)
+        .await
+    {
+        Ok(()) => p1::errno::SUCCESS,
+        Err(error) => p1_errno_from_network_control_error(error),
+    }
+}
+
+async fn wasix_port_addr_remove<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    addr: u32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let Some(memory) = p1_memory(caller) else {
+        return p1::errno::FAULT;
+    };
+    let address = match wasix_read_addr_ip4(caller, memory, addr) {
+        Ok(address) => address,
+        Err(status) => return status,
+    };
+    let (cap, service) = match wasix_network_admin_service(caller) {
+        Ok(parts) => parts,
+        Err(status) => return status,
+    };
+    let control = crate::NetworkControl::new(service);
+    let cidr = crate::Ipv4Cidr::new(address, 32);
+    match control
+        .remove_address(cap, crate::NetworkPortId::new(0), cidr)
+        .await
+    {
+        Ok(()) => p1::errno::SUCCESS,
+        Err(error) => p1_errno_from_network_control_error(error),
+    }
+}
+
+async fn wasix_port_addr_clear<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let (cap, service) = match wasix_network_admin_service(caller) {
+        Ok(parts) => parts,
+        Err(status) => return status,
+    };
+    let control = crate::NetworkControl::new(service);
+    match control
+        .clear_addresses(cap, crate::NetworkPortId::new(0))
+        .await
+    {
+        Ok(()) => p1::errno::SUCCESS,
+        Err(error) => p1_errno_from_network_control_error(error),
+    }
+}
+
+async fn wasix_port_mac<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     ret_mac: u32,
 ) -> i32
@@ -11662,38 +11803,19 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    let status = caller.data().require_network_admin_authority();
-    if status != p1::errno::SUCCESS {
-        return status;
-    }
-    let Some(service) = caller.data().runtime_state.network_service() else {
-        return p1::errno::NETDOWN;
+    let (cap, service) = match wasix_network_admin_service(caller) {
+        Ok(parts) => parts,
+        Err(status) => return status,
+    };
+    let control = crate::NetworkControl::new(service);
+    let mac = match control.mac_address(cap, crate::NetworkPortId::new(0)).await {
+        Ok(mac) => mac,
+        Err(error) => return p1_errno_from_network_control_error(error),
     };
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    p1_write_memory(caller, memory, ret_mac, &service.hardware_address())
-}
-
-fn wasix_port_empty_list<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-    ret_len: u32,
-) -> i32
-where
-    CpuImpl: Cpu + Clone,
-    HostFs: crate::HostFileSystem,
-{
-    let status = caller.data().require_network_admin_authority();
-    if status != p1::errno::SUCCESS {
-        return status;
-    }
-    if caller.data().runtime_state.network_service().is_none() {
-        return p1::errno::NETDOWN;
-    }
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
-    };
-    p1_write_u32(caller, memory, ret_len, 0)
+    p1_write_memory(caller, memory, ret_mac, &mac.octets())
 }
 
 async fn wasix_port_addr_list<CpuImpl, HostFs>(
@@ -11705,13 +11827,6 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    let status = caller.data().require_network_admin_authority();
-    if status != p1::errno::SUCCESS {
-        return status;
-    }
-    let Some(service) = caller.data().runtime_state.network_service() else {
-        return p1::errno::NETDOWN;
-    };
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
@@ -11719,21 +11834,232 @@ where
         Ok(capacity) => capacity,
         Err(_) => return p1::errno::FAULT,
     };
-    let Some(cidr) = service.ipv4_cidr().await else {
-        return p1_write_u32(caller, memory, naddrs, 0);
+    let (cap, service) = match wasix_network_admin_service(caller) {
+        Ok(parts) => parts,
+        Err(status) => return status,
     };
-    if capacity == 0 {
-        let status = p1_write_u32(caller, memory, naddrs, 1);
+    let control = crate::NetworkControl::new(service);
+    let addresses = match control
+        .list_addresses(cap, crate::NetworkPortId::new(0))
+        .await
+    {
+        Ok(addresses) => addresses,
+        Err(error) => return p1_errno_from_network_control_error(error),
+    };
+    let needed = match u32::try_from(addresses.len()) {
+        Ok(needed) => needed,
+        Err(_) => return p1::errno::OVERFLOW,
+    };
+    if needed > capacity {
+        let status = p1_write_u32(caller, memory, naddrs, needed);
+        if status != p1::errno::SUCCESS {
+            return status;
+        }
+        return p1::errno::OVERFLOW;
+    };
+    for (index, cidr) in addresses.iter().enumerate() {
+        let offset = match (index as u32).checked_mul(WASIX_ADDR_CIDR_SIZE) {
+            Some(offset) => offset,
+            None => return p1::errno::OVERFLOW,
+        };
+        let entry = match addrs.checked_add(offset) {
+            Some(entry) => entry,
+            None => return p1::errno::OVERFLOW,
+        };
+        let status = write_wasix_addr_cidr_ip4(caller, memory, entry, *cidr);
+        if status != p1::errno::SUCCESS {
+            return status;
+        }
+    }
+    p1_write_u32(caller, memory, naddrs, needed)
+}
+
+async fn wasix_port_gateway_set<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    addr: u32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let Some(memory) = p1_memory(caller) else {
+        return p1::errno::FAULT;
+    };
+    let gateway = match wasix_read_addr_ip4(caller, memory, addr) {
+        Ok(gateway) => gateway,
+        Err(status) => return status,
+    };
+    let (cap, service) = match wasix_network_admin_service(caller) {
+        Ok(parts) => parts,
+        Err(status) => return status,
+    };
+    let control = crate::NetworkControl::new(service);
+    match control
+        .set_gateway(cap, crate::NetworkPortId::new(0), gateway)
+        .await
+    {
+        Ok(()) => p1::errno::SUCCESS,
+        Err(error) => p1_errno_from_network_control_error(error),
+    }
+}
+
+async fn wasix_port_route_add<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    cidr: u32,
+    router: u32,
+    preferred: u32,
+    expires: u32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let Some(memory) = p1_memory(caller) else {
+        return p1::errno::FAULT;
+    };
+    let destination = match wasix_read_addr_cidr_ip4(caller, memory, cidr) {
+        Ok(destination) => destination,
+        Err(status) => return status,
+    };
+    let gateway = match wasix_read_addr_ip4(caller, memory, router) {
+        Ok(gateway) => gateway,
+        Err(status) => return status,
+    };
+    match wasix_read_optional_timestamp(caller, memory, preferred) {
+        Ok(None) => {}
+        Ok(Some(_)) => return p1::errno::NOTSUP,
+        Err(status) => return status,
+    }
+    match wasix_read_optional_timestamp(caller, memory, expires) {
+        Ok(None) => {}
+        Ok(Some(_)) => return p1::errno::NOTSUP,
+        Err(status) => return status,
+    }
+    let (cap, service) = match wasix_network_admin_service(caller) {
+        Ok(parts) => parts,
+        Err(status) => return status,
+    };
+    let control = crate::NetworkControl::new(service);
+    let route = crate::Ipv4Route::new(destination, gateway);
+    match control
+        .add_route(cap, crate::NetworkPortId::new(0), route)
+        .await
+    {
+        Ok(()) => p1::errno::SUCCESS,
+        Err(error) => p1_errno_from_network_control_error(error),
+    }
+}
+
+async fn wasix_port_route_remove<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    cidr: u32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let Some(memory) = p1_memory(caller) else {
+        return p1::errno::FAULT;
+    };
+    let destination = match wasix_read_addr_ip4(caller, memory, cidr) {
+        Ok(destination) => destination,
+        Err(status) => return status,
+    };
+    let (cap, service) = match wasix_network_admin_service(caller) {
+        Ok(parts) => parts,
+        Err(status) => return status,
+    };
+    let control = crate::NetworkControl::new(service);
+    let routes = match control.list_routes(cap, crate::NetworkPortId::new(0)).await {
+        Ok(routes) => routes,
+        Err(error) => return p1_errno_from_network_control_error(error),
+    };
+    for route in routes {
+        if route.destination().address() == destination {
+            match control
+                .remove_route(cap, crate::NetworkPortId::new(0), route)
+                .await
+            {
+                Ok(()) => return p1::errno::SUCCESS,
+                Err(error) => return p1_errno_from_network_control_error(error),
+            }
+        }
+    }
+    p1::errno::NOENT
+}
+
+async fn wasix_port_route_clear<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let (cap, service) = match wasix_network_admin_service(caller) {
+        Ok(parts) => parts,
+        Err(status) => return status,
+    };
+    let control = crate::NetworkControl::new(service);
+    match control
+        .clear_routes(cap, crate::NetworkPortId::new(0))
+        .await
+    {
+        Ok(()) => p1::errno::SUCCESS,
+        Err(error) => p1_errno_from_network_control_error(error),
+    }
+}
+
+async fn wasix_port_route_list<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    routes: u32,
+    nroutes: u32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let Some(memory) = p1_memory(caller) else {
+        return p1::errno::FAULT;
+    };
+    let capacity = match p1_try_read_u32(caller, memory, nroutes) {
+        Ok(capacity) => capacity,
+        Err(_) => return p1::errno::FAULT,
+    };
+    let (cap, service) = match wasix_network_admin_service(caller) {
+        Ok(parts) => parts,
+        Err(status) => return status,
+    };
+    let control = crate::NetworkControl::new(service);
+    let route_entries = match control.list_routes(cap, crate::NetworkPortId::new(0)).await {
+        Ok(route_entries) => route_entries,
+        Err(error) => return p1_errno_from_network_control_error(error),
+    };
+    let needed = match u32::try_from(route_entries.len()) {
+        Ok(needed) => needed,
+        Err(_) => return p1::errno::OVERFLOW,
+    };
+    if needed > capacity {
+        let status = p1_write_u32(caller, memory, nroutes, needed);
         if status != p1::errno::SUCCESS {
             return status;
         }
         return p1::errno::OVERFLOW;
     }
-    let status = write_wasix_addr_cidr_ip4(caller, memory, addrs, cidr);
-    if status != p1::errno::SUCCESS {
-        return status;
+    for (index, route) in route_entries.iter().enumerate() {
+        let offset = match (index as u32).checked_mul(WASIX_ROUTE_SIZE) {
+            Some(offset) => offset,
+            None => return p1::errno::OVERFLOW,
+        };
+        let entry = match routes.checked_add(offset) {
+            Some(entry) => entry,
+            None => return p1::errno::OVERFLOW,
+        };
+        let status = write_wasix_route_ip4(caller, memory, entry, *route);
+        if status != p1::errno::SUCCESS {
+            return status;
+        }
     }
-    p1_write_u32(caller, memory, naddrs, 1)
+    p1_write_u32(caller, memory, nroutes, needed)
 }
 
 fn wasix_sock_status<CpuImpl, HostFs>(
@@ -13295,6 +13621,33 @@ fn wasix_read_addr_ip4<T>(
     }
 }
 
+fn wasix_read_addr_cidr_ip4<T>(
+    caller: &mut Caller<'_, T>,
+    memory: Preview1Memory,
+    ptr: u32,
+) -> Result<crate::Ipv4Cidr, i32> {
+    let tag = p1_try_read_u8(caller, memory, ptr).map_err(|_| p1::errno::FAULT)?;
+    match tag {
+        WASIX_ADDRESS_FAMILY_IP_INET4 => {
+            let octets =
+                p1_read_memory(caller, memory, ptr + WASIX_ADDR_CIDR_IP4_ADDRESS_OFFSET, 4)
+                    .map_err(|_| p1::errno::FAULT)?;
+            let prefix = p1_try_read_u8(caller, memory, ptr + WASIX_ADDR_CIDR_IP4_PREFIX_OFFSET)
+                .map_err(|_| p1::errno::FAULT)?;
+            if prefix > 32 {
+                return Err(p1::errno::INVAL);
+            }
+            Ok(crate::Ipv4Cidr::new(
+                crate::Ipv4Address::new([octets[0], octets[1], octets[2], octets[3]]),
+                prefix,
+            ))
+        }
+        WASIX_ADDRESS_FAMILY_IP_INET6 | WASIX_ADDRESS_FAMILY_UNIX => Err(p1::errno::NOTSUP),
+        WASIX_ADDRESS_FAMILY_UNSPEC => Err(p1::errno::INVAL),
+        _ => Err(p1::errno::INVAL),
+    }
+}
+
 fn wasix_read_option_pid<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
@@ -13482,6 +13835,44 @@ fn write_wasix_addr_cidr_ip4<T>(
         .copy_from_slice(&cidr.address().octets());
     bytes[WASIX_ADDR_CIDR_IP4_PREFIX_OFFSET as usize] = cidr.prefix_len();
     p1_write_memory(caller, memory, ptr, &bytes)
+}
+
+fn write_wasix_route_ip4<T>(
+    caller: &mut Caller<'_, T>,
+    memory: Preview1Memory,
+    ptr: u32,
+    route: crate::Ipv4Route,
+) -> i32 {
+    let status = write_wasix_addr_cidr_ip4(
+        caller,
+        memory,
+        ptr + WASIX_ROUTE_CIDR_OFFSET,
+        route.destination(),
+    );
+    if status != p1::errno::SUCCESS {
+        return status;
+    }
+    let status = write_wasix_addr_ip4(
+        caller,
+        memory,
+        ptr + WASIX_ROUTE_ROUTER_OFFSET,
+        route.gateway(),
+    );
+    if status != p1::errno::SUCCESS {
+        return status;
+    }
+    p1_write_wasix_optional_timestamp(
+        caller,
+        memory,
+        ptr + WASIX_ROUTE_PREFERRED_UNTIL_OFFSET,
+        None,
+    )
+    .max(p1_write_wasix_optional_timestamp(
+        caller,
+        memory,
+        ptr + WASIX_ROUTE_EXPIRES_AT_OFFSET,
+        None,
+    ))
 }
 
 fn write_wasix_addr_port_ip4<T>(
@@ -14849,6 +15240,11 @@ const WASIX_ADDR_CIDR_IP4_ADDRESS_OFFSET: u32 = WASIX_ADDR_CIDR_UNION_OFFSET;
 const WASIX_ADDR_CIDR_IP4_PREFIX_OFFSET: u32 = WASIX_ADDR_CIDR_IP4_ADDRESS_OFFSET + 4;
 const WASIX_ADDR_PORT_UNION_OFFSET: u32 = 2;
 const WASIX_ADDR_PORT_IP4_ADDRESS_OFFSET: u32 = 4;
+const WASIX_ROUTE_SIZE: u32 = 176;
+const WASIX_ROUTE_CIDR_OFFSET: u32 = 0;
+const WASIX_ROUTE_ROUTER_OFFSET: u32 = 28;
+const WASIX_ROUTE_PREFERRED_UNTIL_OFFSET: u32 = 144;
+const WASIX_ROUTE_EXPIRES_AT_OFFSET: u32 = 160;
 const WASIX_EPOLL_TYPE_EPOLLIN: u32 = 1 << 0;
 const WASIX_EPOLL_TYPE_EPOLLOUT: u32 = 1 << 1;
 const WASIX_EPOLL_TYPE_EPOLLERR: u32 = 1 << 4;
