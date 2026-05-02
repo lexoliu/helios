@@ -32,6 +32,7 @@ pub(crate) type FsNodeKind = crate::ComponentFsNodeKind;
 const FILE_READ_CHUNK_BYTES: usize = 1024 * 1024;
 const DEFAULT_WASI_UDP_BUFFER_BYTES: u64 = 64 * 1024;
 const DEFAULT_WASI_UDP_HOP_LIMIT: u8 = 64;
+const DEFAULT_WASI_TCP_HOP_LIMIT: u8 = 64;
 const MAX_WASI_UDP_DATAGRAM_BYTES: usize = u16::MAX as usize;
 const MAX_SYMLINK_DEPTH: usize = 16;
 
@@ -247,6 +248,7 @@ struct TcpSocketState {
     remote_address: Option<WasiTcpSocketAddress>,
     connect_in_progress: bool,
     connect_result: Option<core::result::Result<(), crate::TcpError>>,
+    hop_limit: u8,
     receive_buffer_size: u64,
     send_buffer_size: u64,
 }
@@ -355,6 +357,7 @@ impl TcpSocket {
                 remote_address: None,
                 connect_in_progress: false,
                 connect_result: None,
+                hop_limit: DEFAULT_WASI_TCP_HOP_LIMIT,
                 receive_buffer_size: DEFAULT_WASI_UDP_BUFFER_BYTES,
                 send_buffer_size: DEFAULT_WASI_UDP_BUFFER_BYTES,
             })),
@@ -408,6 +411,18 @@ impl TcpSocket {
             return Err(socket_types::ErrorCode::InvalidArgument);
         }
         self.inner.lock().send_buffer_size = value;
+        Ok(())
+    }
+
+    fn hop_limit(&self) -> core::result::Result<u8, socket_types::ErrorCode> {
+        Ok(self.inner.lock().hop_limit)
+    }
+
+    fn set_hop_limit(&self, value: u8) -> core::result::Result<(), socket_types::ErrorCode> {
+        if value == 0 {
+            return Err(socket_types::ErrorCode::InvalidArgument);
+        }
+        self.inner.lock().hop_limit = value;
         Ok(())
     }
 
@@ -4246,17 +4261,19 @@ where
 
     fn get_hop_limit(
         &mut self,
-        _: Resource<TcpSocket>,
+        socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<u8, socket_types::ErrorCode>> {
-        Ok(Err(socket_types::ErrorCode::NotSupported))
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.hop_limit())
     }
 
     fn set_hop_limit(
         &mut self,
-        _: Resource<TcpSocket>,
-        _: u8,
+        socket: Resource<TcpSocket>,
+        value: u8,
     ) -> Result<core::result::Result<(), socket_types::ErrorCode>> {
-        Ok(Err(socket_types::ErrorCode::NotSupported))
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.set_hop_limit(value))
     }
 
     fn get_receive_buffer_size(
@@ -4915,8 +4932,8 @@ mod tests {
     use futures_lite::future::block_on;
 
     use super::{
-        ComponentHostNetworkService, DebugFileSystem, FsDescriptor, FsNodeKind,
-        P2ResolveAddressStream, TcpSocket, WasiTcpSocketAddress, WasiTcpSocketFamily,
+        ComponentHostNetworkService, DEFAULT_WASI_TCP_HOP_LIMIT, DebugFileSystem, FsDescriptor,
+        FsNodeKind, P2ResolveAddressStream, TcpSocket, WasiTcpSocketAddress, WasiTcpSocketFamily,
         WasiUdpSocketError, fs_types, has_wasi_network_rights, ip_name_lookup, map_p3_dns_error,
         map_p3_tcp_error, map_p3_udp_socket_error, preview3, socket_types, wasi_udp_bind_rights,
     };
@@ -5864,6 +5881,23 @@ mod tests {
         assert!(stream.is_ready());
         assert_eq!(stream.next_address().unwrap(), Some(address));
         assert_eq!(stream.next_address().unwrap(), None);
+    }
+
+    #[test]
+    fn p3_tcp_socket_hop_limit_is_descriptor_local_state() {
+        let service = ComponentHostNetworkService::from_service(TestNetworkService);
+        let socket = TcpSocket::new(service, WasiTcpSocketFamily::Ipv4);
+
+        assert_eq!(socket.hop_limit().unwrap(), DEFAULT_WASI_TCP_HOP_LIMIT);
+        socket
+            .set_hop_limit(127)
+            .expect("nonzero hop limit must be accepted");
+        assert_eq!(socket.hop_limit().unwrap(), 127);
+        assert!(matches!(
+            socket.set_hop_limit(0),
+            Err(socket_types::ErrorCode::InvalidArgument)
+        ));
+        assert_eq!(socket.hop_limit().unwrap(), 127);
     }
 
     #[test]
