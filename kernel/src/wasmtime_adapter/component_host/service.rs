@@ -67,6 +67,11 @@ const WASIX_PROC_SPAWN_FD_OP_DUP2: u8 = 1;
 const WASIX_PROC_SPAWN_FD_OP_OPEN: u8 = 2;
 const WASIX_PROC_SPAWN_FD_OP_CHDIR: u8 = 3;
 const WASIX_PROC_SPAWN_FD_OP_FCHDIR: u8 = 4;
+const WASIX_SIGNAL_DISPOSITION_SIZE: u32 = 2;
+const WASIX_SIGNAL_DISPOSITION_SIGNAL_OFFSET: u32 = 0;
+const WASIX_SIGNAL_DISPOSITION_ACTION_OFFSET: u32 = 1;
+const WASIX_SIGNAL_DISPOSITION_DEFAULT: u8 = 0;
+const WASIX_SIGNAL_DISPOSITION_IGNORE: u8 = 1;
 
 fn system_component_profile_stack(component_name: &str) -> String {
     let mut stack = String::with_capacity(
@@ -157,6 +162,7 @@ struct ProgramSpawnRequest {
     authority: ProcessAuthority,
     filesystem: Option<DebugFileSystemSnapshot>,
     descriptors: Option<Preview1DescriptorTable>,
+    signal_dispositions: Vec<WasixSignalDisposition>,
 }
 
 enum ProgramExecutable {
@@ -262,6 +268,7 @@ where
     tty_state: WasixTtyState,
     signal_callback: Option<String>,
     signal_state: WasixSignalState,
+    signal_dispositions: Vec<WasixSignalDisposition>,
     descriptors: Preview1DescriptorTable,
     asyncify: WasixAsyncifyState,
     children: Vec<WasixChildProcess>,
@@ -281,6 +288,18 @@ struct WasixThread {
     tid: u32,
     exit: Option<futures::channel::oneshot::Receiver<u32>>,
     completed: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WasixSignalDisposition {
+    signal: u8,
+    action: WasixSignalDispositionAction,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WasixSignalDispositionAction {
+    Default,
+    Ignore,
 }
 
 #[derive(Clone)]
@@ -347,6 +366,7 @@ enum WasixExecSearchPath<'a> {
 struct CoreModuleRestore {
     memory: SharedMemory,
     descriptors: Preview1DescriptorTable,
+    signal_dispositions: Vec<WasixSignalDisposition>,
     stack_lower: u32,
     stack_upper: u32,
     stack_pointer: u32,
@@ -1134,6 +1154,33 @@ where
         authority: ProcessAuthority,
         filesystem: Option<DebugFileSystemSnapshot>,
     ) -> Result<ChildHandle, ProgramExecError> {
+        self.spawn_with_signal_dispositions(
+            exec_context,
+            name,
+            args,
+            env,
+            source,
+            hint,
+            authority,
+            filesystem,
+            Vec::new(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_with_signal_dispositions(
+        &self,
+        exec_context: ProgramExecContext<CpuImpl, HostFs>,
+        name: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        source: ProgramSource,
+        hint: Option<AotCompileHint>,
+        authority: ProcessAuthority,
+        filesystem: Option<DebugFileSystemSnapshot>,
+        signal_dispositions: Vec<WasixSignalDisposition>,
+    ) -> Result<ChildHandle, ProgramExecError> {
         super::emit_stage_marker(exec_context.write_serial, "program:spawn-begin");
         let executable = self
             .load_executable(&exec_context, &source, hint, exec_context.write_serial)
@@ -1147,6 +1194,7 @@ where
             authority,
             filesystem,
             None,
+            signal_dispositions,
         )
     }
 
@@ -1162,6 +1210,7 @@ where
         authority: ProcessAuthority,
         filesystem: Option<DebugFileSystemSnapshot>,
         descriptors: Preview1DescriptorTable,
+        signal_dispositions: Vec<WasixSignalDisposition>,
     ) -> Result<ChildHandle, ProgramExecError> {
         super::emit_stage_marker(exec_context.write_serial, "program:spawn-begin");
         let executable = self
@@ -1182,6 +1231,7 @@ where
             authority,
             filesystem,
             descriptors,
+            signal_dispositions,
         )
     }
 
@@ -1196,6 +1246,7 @@ where
         authority: ProcessAuthority,
         filesystem: Option<DebugFileSystemSnapshot>,
         descriptors: Option<Preview1DescriptorTable>,
+        signal_dispositions: Vec<WasixSignalDisposition>,
     ) -> Result<ChildHandle, ProgramExecError> {
         // Three byte channels between parent and child.
         let (stdin_writer, stdin_reader) = crate::byte_channel();
@@ -1224,6 +1275,7 @@ where
             authority,
             filesystem,
             descriptors,
+            signal_dispositions,
         };
 
         let (exit_tx, exit_rx) = futures::channel::oneshot::channel();
@@ -1242,6 +1294,7 @@ where
                 request.authority,
                 request.filesystem,
                 request.descriptors,
+                request.signal_dispositions,
                 run_spawner,
                 progress,
                 executable,
@@ -1322,6 +1375,7 @@ where
             authority,
             filesystem,
             None,
+            Vec::new(),
         )
         .await
     }
@@ -1339,6 +1393,7 @@ where
         authority: ProcessAuthority,
         filesystem: Option<DebugFileSystemSnapshot>,
         descriptors: Option<Preview1DescriptorTable>,
+        signal_dispositions: Vec<WasixSignalDisposition>,
     ) -> Result<(ExecResult, Option<DebugFileSystemSnapshot>), ProgramExecError> {
         let executable = self
             .load_executable(&exec_context, &source, hint, exec_context.write_serial)
@@ -1359,6 +1414,7 @@ where
             authority,
             filesystem,
             descriptors,
+            signal_dispositions,
         )
         .await
     }
@@ -1374,6 +1430,7 @@ where
         authority: ProcessAuthority,
         filesystem: Option<DebugFileSystemSnapshot>,
         descriptors: Option<Preview1DescriptorTable>,
+        signal_dispositions: Vec<WasixSignalDisposition>,
     ) -> Result<(ExecResult, Option<DebugFileSystemSnapshot>), ProgramExecError> {
         let mut child = self.spawn_loaded(
             exec_context,
@@ -1384,6 +1441,7 @@ where
             authority,
             filesystem,
             descriptors,
+            signal_dispositions,
         )?;
 
         // Feed stdin in one shot, then close the writer to signal EOF.
@@ -1959,6 +2017,7 @@ where
         imported_memory: Option<SharedMemory>,
         filesystem: Option<DebugFileSystemSnapshot>,
         descriptors: Option<Preview1DescriptorTable>,
+        signal_dispositions: Vec<WasixSignalDisposition>,
         current_core_module: Option<Arc<WasmtimeCompiledCoreModule>>,
         wasix_abi: bool,
     ) -> Self {
@@ -1997,6 +2056,7 @@ where
             tty_state,
             signal_callback: None,
             signal_state: WasixSignalState::new(),
+            signal_dispositions,
             descriptors,
             asyncify: WasixAsyncifyState::new(),
             children: Vec::new(),
@@ -4327,6 +4387,7 @@ async fn run_program_executable<CpuImpl, HostFs>(
     authority: ProcessAuthority,
     filesystem: Option<DebugFileSystemSnapshot>,
     descriptors: Option<Preview1DescriptorTable>,
+    signal_dispositions: Vec<WasixSignalDisposition>,
     spawner: crate::Spawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
     executable: ProgramExecutable,
@@ -4371,6 +4432,7 @@ where
                 authority,
                 filesystem,
                 descriptors,
+                signal_dispositions,
                 spawner,
                 progress,
                 compiled,
@@ -4414,6 +4476,7 @@ async fn run_program_core_module<CpuImpl, HostFs>(
     authority: ProcessAuthority,
     filesystem: Option<DebugFileSystemSnapshot>,
     descriptors: Option<Preview1DescriptorTable>,
+    signal_dispositions: Vec<WasixSignalDisposition>,
     spawner: crate::Spawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
     compiled: Arc<WasmtimeCompiledCoreModule>,
@@ -4457,6 +4520,7 @@ where
             imported_memory.clone(),
             filesystem,
             descriptors,
+            signal_dispositions,
             Some(compiled.clone()),
             wasix_abi,
         ),
@@ -4573,6 +4637,7 @@ where
             imported_memory.clone(),
             filesystem,
             Some(restore.descriptors),
+            restore.signal_dispositions,
             Some(compiled.clone()),
             wasix_abi,
         ),
@@ -5081,6 +5146,7 @@ where
     let restore = CoreModuleRestore {
         memory: fork_memory,
         descriptors: store.data().descriptors.clone(),
+        signal_dispositions: store.data().signal_dispositions.clone(),
         stack_lower,
         stack_upper,
         stack_pointer,
@@ -5105,6 +5171,7 @@ where
         store.data().authority.clone(),
         Some(store.data().filesystem.snapshot()),
         None,
+        Vec::new(),
     )?;
     let pid = u32::try_from(child.instance_id.raw()).map_err(|_| ProgramExecError {
         kind: ProgramExecErrorKind::Internal,
@@ -9054,13 +9121,47 @@ where
 }
 
 fn wasix_proc_signals_get<CpuImpl, HostFs>(
-    _caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-    _buf: u32,
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    buf: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
+    let Some(memory) = p1_memory(caller) else {
+        return p1::errno::FAULT;
+    };
+    let dispositions = caller.data().signal_dispositions.clone();
+    for (index, disposition) in dispositions.iter().enumerate() {
+        let Ok(index) = u32::try_from(index) else {
+            return p1::errno::OVERFLOW;
+        };
+        let Some(offset) = index
+            .checked_mul(WASIX_SIGNAL_DISPOSITION_SIZE)
+            .and_then(|offset| buf.checked_add(offset))
+        else {
+            return p1::errno::OVERFLOW;
+        };
+        let action = match disposition.action {
+            WasixSignalDispositionAction::Default => WASIX_SIGNAL_DISPOSITION_DEFAULT,
+            WasixSignalDispositionAction::Ignore => WASIX_SIGNAL_DISPOSITION_IGNORE,
+        };
+        let status = p1_write_u8(
+            caller,
+            memory,
+            offset + WASIX_SIGNAL_DISPOSITION_SIGNAL_OFFSET,
+            disposition.signal,
+        )
+        .max(p1_write_u8(
+            caller,
+            memory,
+            offset + WASIX_SIGNAL_DISPOSITION_ACTION_OFFSET,
+            action,
+        ));
+        if status != p1::errno::SUCCESS {
+            return status;
+        }
+    }
     p1::errno::SUCCESS
 }
 
@@ -9075,7 +9176,10 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    p1_write_u32(caller, memory, ret_size, 0)
+    let Ok(len) = u32::try_from(caller.data().signal_dispositions.len()) else {
+        return p1::errno::OVERFLOW;
+    };
+    p1_write_u32(caller, memory, ret_size, len)
 }
 
 fn wasix_proc_raise_interval<CpuImpl, HostFs>(
@@ -9284,6 +9388,7 @@ where
             authority,
             Some(caller.data().filesystem.snapshot()),
             Some(descriptors),
+            caller.data().signal_dispositions.clone(),
         )
         .await
         .map_err(wasmtime::Error::new)?;
@@ -9443,6 +9548,7 @@ where
         WasixSpawnIo::from_modes(stdin, stdout, stderr),
         authority,
         None,
+        Vec::new(),
     )
     .await
     {
@@ -9481,9 +9587,6 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    if signals != 0 || signals_len != 0 {
-        return p1::errno::NOTSUP;
-    }
     let argv = match wasix_read_exec_string(caller, memory, args, args_len) {
         Ok(value) => wasix_split_lines(&value),
         Err(_) => return p1::errno::FAULT,
@@ -9522,6 +9625,11 @@ where
         Some(snapshot) => (Some(snapshot.authority), Some(snapshot.descriptors)),
         None => (None, None),
     };
+    let signal_dispositions =
+        match wasix_read_signal_dispositions(caller, memory, signals, signals_len) {
+            Ok(dispositions) => dispositions,
+            Err(errno) => return errno,
+        };
     let result = match wasix_spawn_child(
         caller,
         prepared,
@@ -9530,6 +9638,7 @@ where
         WasixSpawnIo::inherit(),
         authority,
         descriptors,
+        signal_dispositions,
     )
     .await
     {
@@ -10347,6 +10456,7 @@ async fn wasix_spawn_child<CpuImpl, HostFs>(
     io: WasixSpawnIo,
     authority: Option<ProcessAuthority>,
     descriptors: Option<Preview1DescriptorTable>,
+    signal_dispositions: Vec<WasixSignalDisposition>,
 ) -> Result<WasixSpawnResult, i32>
 where
     CpuImpl: Cpu + Clone,
@@ -10388,11 +10498,12 @@ where
                 authority,
                 filesystem,
                 descriptors,
+                signal_dispositions,
             )
             .await
     } else {
         service
-            .spawn(
+            .spawn_with_signal_dispositions(
                 exec_context,
                 prepared.guest_name,
                 argv,
@@ -10401,6 +10512,7 @@ where
                 None,
                 authority,
                 filesystem,
+                signal_dispositions,
             )
             .await
     }
@@ -10684,6 +10796,59 @@ fn wasix_split_environment(value: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+fn wasix_read_signal_dispositions<T>(
+    caller: &mut Caller<'_, T>,
+    memory: Preview1Memory,
+    ptr: u32,
+    len: u32,
+) -> Result<Vec<WasixSignalDisposition>, i32> {
+    if len == 0 {
+        if ptr == 0 {
+            return Ok(Vec::new());
+        }
+        return Err(p1::errno::INVAL);
+    }
+    if ptr == 0 {
+        return Err(p1::errno::FAULT);
+    }
+    let mut dispositions = Vec::new();
+    for index in 0..len {
+        let offset = index
+            .checked_mul(WASIX_SIGNAL_DISPOSITION_SIZE)
+            .and_then(|offset| ptr.checked_add(offset))
+            .ok_or(p1::errno::OVERFLOW)?;
+        let signal = p1_try_read_u8(
+            caller,
+            memory,
+            offset + WASIX_SIGNAL_DISPOSITION_SIGNAL_OFFSET,
+        )
+        .map_err(|_| p1::errno::FAULT)?;
+        let action = p1_try_read_u8(
+            caller,
+            memory,
+            offset + WASIX_SIGNAL_DISPOSITION_ACTION_OFFSET,
+        )
+        .map_err(|_| p1::errno::FAULT)?;
+        dispositions.push(wasix_signal_disposition_from_raw(signal, action)?);
+    }
+    Ok(dispositions)
+}
+
+fn wasix_signal_disposition_from_raw(
+    signal: u8,
+    action: u8,
+) -> Result<WasixSignalDisposition, i32> {
+    if !(1..=31).contains(&signal) {
+        return Err(p1::errno::INVAL);
+    }
+    let action = match action {
+        WASIX_SIGNAL_DISPOSITION_DEFAULT => WasixSignalDispositionAction::Default,
+        WASIX_SIGNAL_DISPOSITION_IGNORE => WasixSignalDispositionAction::Ignore,
+        _ => return Err(p1::errno::INVAL),
+    };
+    Ok(WasixSignalDisposition { signal, action })
+}
+
 async fn wasix_thread_sleep<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     duration: i64,
@@ -10788,6 +10953,7 @@ where
         Some(imported_memory.clone()),
         Some(filesystem),
         Some(descriptors),
+        caller.data().signal_dispositions.clone(),
         Some(compiled.clone()),
         wasix_abi,
     );
@@ -14879,6 +15045,32 @@ mod tests {
 
         assert_eq!(base.path, "/source/workspace");
         assert_eq!(path, "logs/out");
+    }
+
+    #[test]
+    fn wasix_signal_disposition_validation_accepts_default_and_ignore() {
+        assert_eq!(
+            wasix_signal_disposition_from_raw(2, WASIX_SIGNAL_DISPOSITION_DEFAULT),
+            Ok(WasixSignalDisposition {
+                signal: 2,
+                action: WasixSignalDispositionAction::Default,
+            })
+        );
+        assert_eq!(
+            wasix_signal_disposition_from_raw(15, WASIX_SIGNAL_DISPOSITION_IGNORE),
+            Ok(WasixSignalDisposition {
+                signal: 15,
+                action: WasixSignalDispositionAction::Ignore,
+            })
+        );
+        assert_eq!(
+            wasix_signal_disposition_from_raw(0, WASIX_SIGNAL_DISPOSITION_DEFAULT),
+            Err(p1::errno::INVAL)
+        );
+        assert_eq!(
+            wasix_signal_disposition_from_raw(1, 2),
+            Err(p1::errno::INVAL)
+        );
     }
 
     #[test]
