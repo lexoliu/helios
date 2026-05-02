@@ -2408,6 +2408,21 @@ where
         p1::errno::SUCCESS
     }
 
+    fn authority_with_cwd(&self, path: &str) -> Result<ProcessAuthority, i32> {
+        let cwd = self.resolve_cwd_target(path)?;
+        let cap = self
+            .authority
+            .derive_directory_cap(
+                &cwd.descriptor.path,
+                &cwd.guest_name,
+                descriptor_flags_to_directory_authority(cwd.descriptor.flags),
+            )
+            .map_err(|_| p1::errno::NOTCAPABLE)?;
+        let mut authority = self.authority.clone();
+        authority.chdir(cap);
+        Ok(authority)
+    }
+
     fn resolve_cwd_target(&self, path: &str) -> Result<Preview1Cwd, i32> {
         let (guest_name, source_path, flags) = if path.starts_with('/') {
             let guest_name =
@@ -9334,24 +9349,23 @@ where
     if chroot != 0 || preopen_len != 0 {
         return p1::errno::NOTSUP;
     }
-    if working_dir_len != 0 {
+    let authority = if working_dir_len == 0 {
+        None
+    } else {
         let working_dir = match wasix_read_exec_string(caller, memory, working_dir, working_dir_len)
         {
             Ok(working_dir) => working_dir,
             Err(_) => return p1::errno::FAULT,
         };
-        if !working_dir.is_empty()
-            && working_dir != "."
-            && Some(working_dir.as_str())
-                != caller
-                    .data()
-                    .cwd
-                    .as_ref()
-                    .map(|cwd| cwd.guest_name.as_str())
-        {
-            return p1::errno::NOTSUP;
+        if working_dir.is_empty() || working_dir == "." {
+            None
+        } else {
+            match caller.data().authority_with_cwd(&working_dir) {
+                Ok(authority) => Some(authority),
+                Err(errno) => return errno,
+            }
         }
-    }
+    };
     let argv = match wasix_read_exec_string(caller, memory, args, args_len) {
         Ok(value) => wasix_split_lines(&value),
         Err(_) => return p1::errno::FAULT,
@@ -9366,6 +9380,7 @@ where
         argv,
         None,
         WasixSpawnIo::from_modes(stdin, stdout, stderr),
+        authority,
         None,
     )
     .await
@@ -9448,6 +9463,7 @@ where
         argv,
         environment,
         WasixSpawnIo::inherit(),
+        None,
         descriptors,
     )
     .await
@@ -9932,6 +9948,7 @@ async fn wasix_spawn_child<CpuImpl, HostFs>(
     mut argv: Vec<String>,
     environment: Option<Vec<(String, String)>>,
     io: WasixSpawnIo,
+    authority: Option<ProcessAuthority>,
     descriptors: Option<Preview1DescriptorTable>,
 ) -> Result<WasixSpawnResult, i32>
 where
@@ -9960,7 +9977,7 @@ where
         .program_service()
         .ok_or(p1::errno::NOTSUP)?;
     let exec_context = caller.data().exec_context();
-    let authority = caller.data().authority.clone();
+    let authority = authority.unwrap_or_else(|| caller.data().authority.clone());
     let filesystem = Some(caller.data().filesystem.snapshot());
     let mut child = if let Some(descriptors) = descriptors {
         service
