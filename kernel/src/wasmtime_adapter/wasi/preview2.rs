@@ -2748,10 +2748,22 @@ where
 
     fn shutdown(
         &mut self,
-        _: Resource<TcpSocket>,
-        _: p2tcp::ShutdownType,
+        socket: Resource<TcpSocket>,
+        shutdown_type: p2tcp::ShutdownType,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
-        socket_not_supported()
+        match shutdown_type {
+            p2tcp::ShutdownType::Both => {
+                let socket = self.table.get(&socket)?.clone();
+                let Some((service, stream)) = socket.take_connected_stream() else {
+                    return Ok(Err(p2tcp::ErrorCode::InvalidState));
+                };
+                self.spawner().spawn_detached(async move {
+                    service.tcp_close(stream).await;
+                });
+                Ok(Ok(()))
+            }
+            p2tcp::ShutdownType::Receive | p2tcp::ShutdownType::Send => socket_not_supported(),
+        }
     }
 
     fn drop(&mut self, resource: Resource<TcpSocket>) -> Result<()> {
