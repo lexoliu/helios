@@ -16,6 +16,28 @@ cleanup() {
 
 trap cleanup EXIT
 
+build_wasix_conformance_artifact() {
+    local name="$1"
+    local wat="tools/wasi-apps/wasix-tests/${name}.wat"
+    local artifact_dir="artifacts/wasix/${name}"
+    local wasm="${artifact_dir}/${name}.wasm"
+
+    if [[ ! -f "${wat}" ]]; then
+        printf 'WASIX conformance source is missing: %s\n' "${wat}" >&2
+        return 1
+    fi
+    mkdir -p "${artifact_dir}"
+    wasm-tools parse "${wat}" -o "${wasm}"
+    wasm-tools validate "${wasm}"
+    shasum -a 256 "${wasm}" >"${wasm}.sha256"
+    {
+        printf 'package=%s\n' 'helios-wasix-conformance'
+        printf 'version=%s\n' '0.1.0'
+        printf 'source=%s\n' 'tools/wasi-apps/wasix-tests'
+        printf 'sha256=%s\n' "$(cut -d' ' -f1 "${wasm}.sha256")"
+    } > "${artifact_dir}/SOURCE.txt"
+}
+
 check_wasm_imports() {
     local name="$1"
     local artifact="$2"
@@ -94,6 +116,9 @@ check_wasm_imports \
     '(import "wasix_32v1" "proc_fork"' \
     '(import "wasix_32v1" "proc_exec3"' \
     '(export "wasi_thread_start"'
+
+build_wasix_conformance_artifact thread-futex
+build_wasix_conformance_artifact continuation
 
 run_smoke() {
     local name="$1"
@@ -196,6 +221,30 @@ run_smoke \
     shell \
     -c \
     '/bin/qjs -e "console.log(40+2)"'
+
+run_smoke \
+    wasix-thread-futex \
+    thread-futex:ok \
+    -- \
+    --boot-program dash \
+    --boot-program debugger \
+    --boot-program wasix-thread-futex \
+    --no-compiler-plugin \
+    shell \
+    -c \
+    '/bin/wasix-thread-futex'
+
+run_smoke \
+    wasix-continuation \
+    continuation:ok \
+    -- \
+    --boot-program dash \
+    --boot-program debugger \
+    --boot-program wasix-continuation \
+    --no-compiler-plugin \
+    shell \
+    -c \
+    '/bin/wasix-continuation'
 
 run_smoke \
     cpython \

@@ -61,6 +61,9 @@ coreutils_wasm_sha256="${COREUTILS_WASM_SHA256:-586489a3aca13cb69855f9f92e655acd
 curl_package="${HELIOS_CURL_PACKAGE:-helios-curl-wasi}"
 curl_version="${HELIOS_CURL_VERSION:-0.1.0}"
 curl_source_url="${HELIOS_CURL_SOURCE_URL:-tools/wasi-apps/curl}"
+wasix_tests_package="${HELIOS_WASIX_TESTS_PACKAGE:-helios-wasix-conformance}"
+wasix_tests_version="${HELIOS_WASIX_TESTS_VERSION:-0.1.0}"
+wasix_tests_source_url="${HELIOS_WASIX_TESTS_SOURCE_URL:-tools/wasi-apps/wasix-tests}"
 
 staging="$(mktemp -d)"
 trap 'rm -rf "$staging"' EXIT
@@ -248,6 +251,27 @@ write_source_record \
 
 echo "coreutils installed at: $coreutils_root/coreutils.wasm"
 ls -lh "$coreutils_root/coreutils.wasm" "$coreutils_root/coreutils.wasm.sha256"
+
+echo "Building Helios WASIX conformance artifacts..."
+for test_name in thread-futex continuation; do
+  test_root="$artifacts_root/wasix/$test_name"
+  mkdir -p "$test_root"
+  wasm-tools parse \
+    "$repo_root/tools/wasi-apps/wasix-tests/$test_name.wat" \
+    -o "$test_root/$test_name.wasm"
+  wasm-tools validate "$test_root/$test_name.wasm"
+  sha256sum "$test_root/$test_name.wasm" > "$test_root/$test_name.wasm.sha256"
+  test_wasm_sha256="$(sha256_hex "$test_root/$test_name.wasm")"
+  write_source_record \
+    "$test_root/SOURCE.txt" \
+    "$wasix_tests_package" \
+    "$wasix_tests_version" \
+    "$wasix_tests_source_url" \
+    "$test_wasm_sha256"
+done
+
+echo "WASIX conformance artifacts installed at: $artifacts_root/wasix"
+ls -lh "$artifacts_root"/wasix/{thread-futex,continuation}/*.wasm
 
 build_env=(
   CARGO_PROFILE_DEV_OPT_LEVEL=z
