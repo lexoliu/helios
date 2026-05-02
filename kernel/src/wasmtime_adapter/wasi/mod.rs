@@ -1609,6 +1609,27 @@ where
             .count() as u64
     }
 
+    fn descriptor_identity(
+        &self,
+        descriptor: &FsDescriptor,
+    ) -> core::result::Result<ObjectIdentity, fs_types::ErrorCode> {
+        descriptor.identity.map_or_else(
+            || self.get_node(&descriptor.path).map(|node| node.identity),
+            Ok,
+        )
+    }
+
+    fn require_same_authority_domain(
+        &self,
+        left: &FsDescriptor,
+        right: &FsDescriptor,
+    ) -> core::result::Result<(), fs_types::ErrorCode> {
+        if self.descriptor_identity(left)?.domain() != self.descriptor_identity(right)?.domain() {
+            return Err(fs_types::ErrorCode::NotPermitted);
+        }
+        Ok(())
+    }
+
     fn resolve_symlink_payload(
         link_path: &str,
         payload: &str,
@@ -2287,13 +2308,7 @@ where
         {
             return Err(fs_types::ErrorCode::ReadOnly);
         }
-        if source_base
-            .identity
-            .zip(destination_base.identity)
-            .is_some_and(|(source, destination)| source.domain() != destination.domain())
-        {
-            return Err(fs_types::ErrorCode::NotPermitted);
-        }
+        self.require_same_authority_domain(source_base, destination_base)?;
 
         let source_absolute = crate::resolve_child_path(&source_base.path, source_path)
             .map_err(map_component_fs_path_error)?;
@@ -2410,13 +2425,7 @@ where
         {
             return Err(fs_types::ErrorCode::ReadOnly);
         }
-        if source_base
-            .identity
-            .zip(destination_base.identity)
-            .is_some_and(|(source, destination)| source.domain() != destination.domain())
-        {
-            return Err(fs_types::ErrorCode::NotPermitted);
-        }
+        self.require_same_authority_domain(source_base, destination_base)?;
         let source_absolute = crate::resolve_child_path(&source_base.path, source_path)
             .map_err(map_component_fs_path_error)?;
         let destination_absolute =
@@ -5326,6 +5335,39 @@ mod tests {
     }
 
     #[test]
+    fn rename_rejects_unresolvable_authority_domain() {
+        let mut filesystem = test_filesystem();
+        let root = filesystem.root_descriptor();
+        let stale = FsDescriptor {
+            path: "/stale".into(),
+            kind: FsNodeKind::Directory,
+            flags: fs_types::DescriptorFlags::READ
+                | fs_types::DescriptorFlags::WRITE
+                | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+            identity: None,
+        };
+        let descriptor = filesystem
+            .open_at(
+                &root,
+                fs_types::PathFlags::empty(),
+                "tmp",
+                fs_types::OpenFlags::CREATE,
+                fs_types::DescriptorFlags::WRITE,
+                1,
+            )
+            .expect("file creation must succeed");
+        filesystem
+            .write_at(&descriptor, 0, b"data", 1)
+            .expect("file write must succeed");
+
+        let error = filesystem
+            .rename_at(&root, "tmp", &stale, "tmp", 2)
+            .expect_err("rename through an unresolvable domain must fail");
+
+        assert!(matches!(error, fs_types::ErrorCode::NoEntry));
+    }
+
+    #[test]
     fn hardlink_preserves_identity_and_shared_contents() {
         let mut filesystem = test_filesystem();
         let root = filesystem.root_descriptor();
@@ -5374,6 +5416,43 @@ mod tests {
                 .expect("alias read must succeed"),
             b"bolt"
         );
+    }
+
+    #[test]
+    fn hardlink_resolves_preopen_identity_without_widening_rights() {
+        let mut filesystem = test_filesystem();
+        let mut root = filesystem.root_descriptor();
+        root.identity = None;
+        let original = filesystem
+            .open_at(
+                &root,
+                fs_types::PathFlags::empty(),
+                "tmp",
+                fs_types::OpenFlags::CREATE,
+                fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
+                1,
+            )
+            .expect("file creation must succeed");
+        filesystem
+            .write_at(&original, 0, b"data", 1)
+            .expect("write must succeed");
+
+        filesystem
+            .link_at(&root, "tmp", &root, "alias", 2)
+            .expect("preopen-like root descriptor must resolve to its stable identity");
+        let alias = filesystem
+            .open_at(
+                &root,
+                fs_types::PathFlags::empty(),
+                "alias",
+                fs_types::OpenFlags::empty(),
+                fs_types::DescriptorFlags::READ,
+                2,
+            )
+            .expect("alias open must succeed");
+
+        assert_eq!(original.identity, alias.identity);
+        assert!(!alias.flags.contains(fs_types::DescriptorFlags::WRITE));
     }
 
     #[test]
@@ -5511,6 +5590,36 @@ mod tests {
             .link_at(&root, "tmp", &other_domain, "tool", 1)
             .expect_err("hardlink across authority domains must fail");
         assert!(matches!(file_error, fs_types::ErrorCode::NotPermitted));
+    }
+
+    #[test]
+    fn hardlink_rejects_unresolvable_authority_domain() {
+        let mut filesystem = test_filesystem();
+        let root = filesystem.root_descriptor();
+        let stale = FsDescriptor {
+            path: "/stale".into(),
+            kind: FsNodeKind::Directory,
+            flags: fs_types::DescriptorFlags::READ
+                | fs_types::DescriptorFlags::WRITE
+                | fs_types::DescriptorFlags::MUTATE_DIRECTORY,
+            identity: None,
+        };
+        filesystem
+            .open_at(
+                &root,
+                fs_types::PathFlags::empty(),
+                "tmp",
+                fs_types::OpenFlags::CREATE,
+                fs_types::DescriptorFlags::READ,
+                1,
+            )
+            .expect("file creation must succeed");
+
+        let error = filesystem
+            .link_at(&root, "tmp", &stale, "alias", 1)
+            .expect_err("hardlink through an unresolvable domain must fail");
+
+        assert!(matches!(error, fs_types::ErrorCode::NoEntry));
     }
 
     #[test]
