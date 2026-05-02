@@ -2858,9 +2858,11 @@ where
             "proc_raise_interval",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
              signal: i32,
-             _interval: i64,
-             _repeat: i32|
-             -> i32 { wasix_proc_raise_interval(&mut caller, signal) },
+             interval: i64,
+             repeat: i32|
+             -> i32 {
+                wasix_proc_raise_interval(&mut caller, signal, interval, repeat)
+            },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -8496,6 +8498,8 @@ where
 fn wasix_proc_raise_interval<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     signal: i32,
+    interval: i64,
+    repeat: i32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
@@ -8507,6 +8511,12 @@ where
     }
     if !(0..=31).contains(&signal) {
         return p1::errno::INVAL;
+    }
+    if interval < 0 || !matches!(repeat, 0 | 1) {
+        return p1::errno::INVAL;
+    }
+    if interval == 0 {
+        return p1::errno::SUCCESS;
     }
     p1::errno::NOTSUP
 }
