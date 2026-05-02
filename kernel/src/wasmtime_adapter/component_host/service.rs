@@ -501,6 +501,7 @@ struct WasixStackSnapshot {
 struct Preview1DescriptorEntry {
     descriptor: Preview1Descriptor,
     close_on_exec: bool,
+    fdflags: u16,
 }
 
 #[derive(Clone)]
@@ -2463,6 +2464,29 @@ where
         Ok(take_preview1_carry(carry, max_bytes))
     }
 
+    fn try_read_socket_pair(&mut self, fd: i32, max_bytes: usize) -> Result<Option<Vec<u8>>, i32> {
+        let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { reader, carry, .. })) =
+            self.descriptors.get_mut(fd)
+        else {
+            return match self.descriptors.get(fd) {
+                Some(Preview1Descriptor::Socket(_)) => Err(p1::errno::INVAL),
+                Some(_) => Err(p1::errno::NOTSOCK),
+                None => Err(p1::errno::BADF),
+            };
+        };
+        if !carry.is_empty() {
+            return Ok(Some(take_preview1_carry(carry, max_bytes)));
+        }
+        match reader.try_read() {
+            crate::TryRead::Ready(bytes) => {
+                *carry = bytes;
+                Ok(Some(take_preview1_carry(carry, max_bytes)))
+            }
+            crate::TryRead::Eof => Ok(Some(Vec::new())),
+            crate::TryRead::Pending => Ok(None),
+        }
+    }
+
     fn getcwd(&self) -> Result<&str, i32> {
         self.cwd
             .as_ref()
@@ -2755,31 +2779,47 @@ impl Preview1DescriptorTable {
         descriptor: Preview1Descriptor,
         close_on_exec: bool,
     ) -> Result<u32, i32> {
+        self.insert_entry(Preview1DescriptorEntry::new(descriptor, close_on_exec))
+    }
+
+    fn insert_with_fdflags(
+        &mut self,
+        descriptor: Preview1Descriptor,
+        close_on_exec: bool,
+        fdflags: u16,
+    ) -> Result<u32, i32> {
+        self.insert_entry(Preview1DescriptorEntry {
+            descriptor,
+            close_on_exec,
+            fdflags,
+        })
+    }
+
+    fn insert_entry(&mut self, entry: Preview1DescriptorEntry) -> Result<u32, i32> {
         if let Some((index, slot)) = self
             .entries
             .iter_mut()
             .enumerate()
             .find(|(_, slot)| slot.is_none())
         {
-            *slot = Some(Preview1DescriptorEntry::new(descriptor, close_on_exec));
+            *slot = Some(entry);
             return u32::try_from(index).map_err(|_| p1::errno::OVERFLOW);
         }
         let index = self.entries.len();
-        self.entries.push(Some(Preview1DescriptorEntry::new(
-            descriptor,
-            close_on_exec,
-        )));
+        self.entries.push(Some(entry));
         u32::try_from(index).map_err(|_| p1::errno::OVERFLOW)
     }
 
     fn dup(&mut self, fd: i32) -> Result<u32, i32> {
-        let descriptor = self.get(fd).cloned().ok_or(p1::errno::BADF)?;
-        self.insert(descriptor)
+        let mut entry = self.get_entry(fd).cloned().ok_or(p1::errno::BADF)?;
+        entry.close_on_exec = false;
+        self.insert_entry(entry)
     }
 
     fn dup_to(&mut self, fd: i32, to_fd: i32, close_on_exec: bool) -> Result<u32, i32> {
-        let descriptor = self.get(fd).cloned().ok_or(p1::errno::BADF)?;
-        self.insert_at(to_fd, descriptor, close_on_exec)
+        let mut entry = self.get_entry(fd).cloned().ok_or(p1::errno::BADF)?;
+        entry.close_on_exec = close_on_exec;
+        self.insert_entry_at(to_fd, entry)
     }
 
     fn insert_at(
@@ -2788,12 +2828,51 @@ impl Preview1DescriptorTable {
         descriptor: Preview1Descriptor,
         close_on_exec: bool,
     ) -> Result<u32, i32> {
+        self.insert_entry_at(fd, Preview1DescriptorEntry::new(descriptor, close_on_exec))
+    }
+
+    fn insert_entry_at(&mut self, fd: i32, entry: Preview1DescriptorEntry) -> Result<u32, i32> {
         let to = usize::try_from(fd).map_err(|_| p1::errno::BADF)?;
         if self.entries.len() <= to {
             self.entries.resize_with(to + 1, || None);
         }
-        self.entries[to] = Some(Preview1DescriptorEntry::new(descriptor, close_on_exec));
+        self.entries[to] = Some(entry);
         u32::try_from(to).map_err(|_| p1::errno::OVERFLOW)
+    }
+
+    fn get_entry(&self, fd: i32) -> Option<&Preview1DescriptorEntry> {
+        usize::try_from(fd)
+            .ok()
+            .and_then(|index| self.entries.get(index))
+            .and_then(Option::as_ref)
+    }
+
+    fn get_entry_mut(&mut self, fd: i32) -> Option<&mut Preview1DescriptorEntry> {
+        usize::try_from(fd)
+            .ok()
+            .and_then(|index| self.entries.get_mut(index))
+            .and_then(Option::as_mut)
+    }
+
+    fn fdflags(&self, fd: i32) -> Result<u16, i32> {
+        self.get_entry(fd)
+            .map(|entry| entry.fdflags)
+            .ok_or(p1::errno::BADF)
+    }
+
+    fn set_fdflags(&mut self, fd: i32, fdflags: u16) -> i32 {
+        let Some(entry) = self.get_entry_mut(fd) else {
+            return p1::errno::BADF;
+        };
+        entry.fdflags = fdflags;
+        if let Preview1Descriptor::File {
+            fdflags: file_flags,
+            ..
+        } = &mut entry.descriptor
+        {
+            *file_flags = fdflags;
+        }
+        p1::errno::SUCCESS
     }
 
     fn close_on_exec(&self, fd: i32) -> Result<bool, i32> {
@@ -2862,11 +2941,20 @@ impl Preview1DescriptorTable {
 }
 
 impl Preview1DescriptorEntry {
-    const fn new(descriptor: Preview1Descriptor, close_on_exec: bool) -> Self {
+    fn new(descriptor: Preview1Descriptor, close_on_exec: bool) -> Self {
+        let fdflags = preview1_descriptor_initial_fdflags(&descriptor);
         Self {
             descriptor,
             close_on_exec,
+            fdflags,
         }
+    }
+}
+
+fn preview1_descriptor_initial_fdflags(descriptor: &Preview1Descriptor) -> u16 {
+    match descriptor {
+        Preview1Descriptor::File { fdflags, .. } => *fdflags,
+        _ => 0,
     }
 }
 
@@ -6994,10 +7082,7 @@ where
         Preview1Descriptor::File { descriptor, .. } => p1_filetype(descriptor.kind),
         Preview1Descriptor::Socket(_) => 6,
     };
-    let fdflags = match descriptor {
-        Preview1Descriptor::File { fdflags, .. } => *fdflags,
-        _ => 0,
-    };
+    let fdflags = caller.data().descriptors.fdflags(fd).unwrap_or(0);
     let rights = p1_descriptor_rights(descriptor);
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
@@ -7017,14 +7102,14 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    match caller.data_mut().descriptors.get_mut(fd) {
-        Some(Preview1Descriptor::File {
-            fdflags: current, ..
-        }) => {
-            *current = fdflags;
-            p1::errno::SUCCESS
+    match caller.data().descriptors.get(fd) {
+        Some(Preview1Descriptor::File { .. }) if p1_file_fdflags_supported(fdflags) => {
+            caller.data_mut().descriptors.set_fdflags(fd, fdflags)
         }
-        Some(_) if fdflags == 0 => p1::errno::SUCCESS,
+        Some(Preview1Descriptor::Socket(_)) if p1_socket_fdflags_supported(fdflags) => {
+            caller.data_mut().descriptors.set_fdflags(fd, fdflags)
+        }
+        Some(_) if fdflags == 0 => caller.data_mut().descriptors.set_fdflags(fd, fdflags),
         Some(_) => p1::errno::INVAL,
         None => p1::errno::BADF,
     }
@@ -7683,6 +7768,9 @@ where
     };
     let path_flags = p1_path_flags(dirflags);
     let open_flags = p1_open_flags(oflags);
+    if !p1_file_fdflags_supported(fdflags) {
+        return p1::errno::INVAL;
+    }
     let descriptor_flags = p1_descriptor_flags(rights, fdflags);
     p1_path_open_resolved(
         caller,
@@ -7933,6 +8021,9 @@ where
     };
     let path_flags = p1_path_flags(dirflags);
     let open_flags = p1_open_flags(oflags);
+    if !p1_file_fdflags_supported(fdflags) {
+        return p1::errno::INVAL;
+    }
     let descriptor_flags = p1_descriptor_flags(rights, fdflags);
     p1_path_open_resolved(
         caller,
@@ -10046,6 +10137,9 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
+    if !p1_file_fdflags_supported(fdflags) {
+        return Err(p1::errno::INVAL);
+    }
     let (base, relative_path) = wasix_spawn_resolve_open_base(snapshot, source_fd, path)?;
     let descriptor = p1_open_descriptor_resolved(
         caller,
@@ -13331,9 +13425,10 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    if fdflags != 0 {
-        return p1::errno::NOTSUP;
-    }
+    let fdflags = match u16::try_from(fdflags) {
+        Ok(fdflags) if p1_socket_fdflags_supported(fdflags) => fdflags,
+        _ => return p1::errno::INVAL,
+    };
     let status = caller.data().require_tcp_authority();
     if status != p1::errno::SUCCESS {
         return status;
@@ -13352,9 +13447,14 @@ where
     let Some(service) = caller.data().runtime_state.network_service() else {
         return p1::errno::NETDOWN;
     };
-    let accepted = match service.tcp_accept(listener, u64::MAX).await {
+    let timeout = if p1_fdflags_nonblocking(fdflags) {
+        0
+    } else {
+        u64::MAX
+    };
+    let accepted = match service.tcp_accept(listener, timeout).await {
         Ok(accepted) => accepted,
-        Err(error) => return p1_errno_from_tcp_error(error),
+        Err(error) => return p1_errno_from_tcp_error_for_fdflags(error, fdflags),
     };
     let descriptor =
         Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
@@ -13363,7 +13463,11 @@ where
             peer_port: accepted.port,
             options: WasixSocketOptions::default(),
         }));
-    let accepted_fd = match caller.data_mut().descriptors.insert(descriptor) {
+    let accepted_fd = match caller
+        .data_mut()
+        .descriptors
+        .insert_with_fdflags(descriptor, false, fdflags)
+    {
         Ok(fd) => fd,
         Err(errno) => return errno,
     };
@@ -13423,8 +13527,34 @@ where
     let Some(capacity) = capacity else {
         return p1::errno::OVERFLOW;
     };
+    let fdflags = match caller.data().descriptors.fdflags(fd) {
+        Ok(fdflags) => fdflags,
+        Err(errno) => return errno,
+    };
     let descriptor = caller.data().descriptors.get(fd).cloned();
     if let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { .. })) = descriptor {
+        if capacity == 0 {
+            let status = p1_write_iovs_from_bytes(caller, memory, iovs, &[], ro_datalen);
+            if status != p1::errno::SUCCESS {
+                return status;
+            }
+            return p1_write_u16(caller, memory, ro_flags, 0);
+        }
+        if p1_fdflags_nonblocking(fdflags) {
+            let bytes = match caller
+                .data_mut()
+                .try_read_socket_pair(fd, capacity as usize)
+            {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => return p1::errno::AGAIN,
+                Err(errno) => return errno,
+            };
+            let status = p1_write_iovs_from_bytes(caller, memory, iovs, &bytes, ro_datalen);
+            if status != p1::errno::SUCCESS {
+                return status;
+            }
+            return p1_write_u16(caller, memory, ro_flags, 0);
+        }
         let bytes = match caller
             .data_mut()
             .read_socket_pair(fd, capacity as usize)
@@ -13455,10 +13585,15 @@ where
     let Some(service) = caller.data().runtime_state.network_service() else {
         return p1::errno::NETDOWN;
     };
-    let bytes = match service.tcp_read(stream, capacity, u64::MAX).await {
+    let timeout = if p1_fdflags_nonblocking(fdflags) {
+        0
+    } else {
+        u64::MAX
+    };
+    let bytes = match service.tcp_read(stream, capacity, timeout).await {
         Ok(Some(bytes)) => bytes,
         Ok(None) => Vec::new(),
-        Err(error) => return p1_errno_from_tcp_error(error),
+        Err(error) => return p1_errno_from_tcp_error_for_fdflags(error, fdflags),
     };
     let status = p1_write_iovs_from_bytes(caller, memory, iovs, &bytes, ro_datalen);
     if status != p1::errno::SUCCESS {
@@ -13514,8 +13649,17 @@ where
     let Some(service) = caller.data().runtime_state.network_service() else {
         return p1::errno::NETDOWN;
     };
-    if let Err(error) = service.tcp_write_all(stream, &bytes, u64::MAX).await {
-        return p1_errno_from_tcp_error(error);
+    let fdflags = match caller.data().descriptors.fdflags(fd) {
+        Ok(fdflags) => fdflags,
+        Err(errno) => return errno,
+    };
+    let timeout = if p1_fdflags_nonblocking(fdflags) {
+        0
+    } else {
+        u64::MAX
+    };
+    if let Err(error) = service.tcp_write_all(stream, &bytes, timeout).await {
+        return p1_errno_from_tcp_error_for_fdflags(error, fdflags);
     }
     let written = match u32::try_from(bytes.len()) {
         Ok(written) => written,
@@ -14124,6 +14268,18 @@ fn p1_descriptor_flags(rights: u64, fdflags: u16) -> fs_types::DescriptorFlags {
     flags
 }
 
+fn p1_file_fdflags_supported(fdflags: u16) -> bool {
+    fdflags & !P1_FILE_FDFLAGS == 0
+}
+
+fn p1_socket_fdflags_supported(fdflags: u16) -> bool {
+    fdflags & !P1_SOCKET_FDFLAGS == 0
+}
+
+fn p1_fdflags_nonblocking(fdflags: u16) -> bool {
+    fdflags & P1_FDFLAG_NONBLOCK != 0
+}
+
 fn p1_descriptor_rights(descriptor: &Preview1Descriptor) -> u64 {
     match descriptor {
         Preview1Descriptor::Stdin { .. } => P1_RIGHT_FD_READ | P1_RIGHT_POLL_FD_READWRITE,
@@ -14405,6 +14561,13 @@ fn p1_errno_from_tcp_error(error: crate::TcpError) -> i32 {
     }
 }
 
+fn p1_errno_from_tcp_error_for_fdflags(error: crate::TcpError, fdflags: u16) -> i32 {
+    if p1_fdflags_nonblocking(fdflags) && matches!(error.kind, crate::TcpErrorKind::Timeout) {
+        return p1::errno::AGAIN;
+    }
+    p1_errno_from_tcp_error(error)
+}
+
 fn p1_errno_from_udp_error(error: crate::UdpError) -> i32 {
     match error.kind {
         crate::UdpErrorKind::UnresolvedHost => p1::errno::HOSTUNREACH,
@@ -14489,6 +14652,13 @@ const P1_RIGHT_PATH_REMOVE_DIRECTORY: u64 = 1 << 24;
 const P1_RIGHT_PATH_UNLINK_FILE: u64 = 1 << 25;
 const P1_RIGHT_POLL_FD_READWRITE: u64 = 1 << 26;
 const P1_FDFLAG_APPEND: u16 = 1 << 0;
+const P1_FDFLAG_DSYNC: u16 = 1 << 1;
+const P1_FDFLAG_NONBLOCK: u16 = 1 << 2;
+const P1_FDFLAG_RSYNC: u16 = 1 << 3;
+const P1_FDFLAG_SYNC: u16 = 1 << 4;
+const P1_FILE_FDFLAGS: u16 =
+    P1_FDFLAG_APPEND | P1_FDFLAG_DSYNC | P1_FDFLAG_NONBLOCK | P1_FDFLAG_RSYNC | P1_FDFLAG_SYNC;
+const P1_SOCKET_FDFLAGS: u16 = P1_FDFLAG_NONBLOCK;
 const WASIX_FDFLAGSEXT_CLOEXEC: u16 = 1 << 0;
 const WASIX_EVENTFDFLAG_SEMAPHORE: u32 = 1 << 0;
 const WASIX_OPTION_NONE: u8 = 0;
@@ -14865,6 +15035,59 @@ mod tests {
             _ => panic!("fd 1 should be duplicated to the file descriptor"),
         }
         assert_eq!(table.close_on_exec(1), Ok(true));
+    }
+
+    #[test]
+    fn descriptor_table_preserves_fdflags_across_dup_and_exec_snapshot() {
+        let file = Preview1Descriptor::File {
+            descriptor: FsDescriptor {
+                path: "/nonblock".into(),
+                kind: FsNodeKind::File,
+                flags: fs_types::DescriptorFlags::READ,
+                identity: None,
+            },
+            offset: 0,
+            fdflags: P1_FDFLAG_NONBLOCK,
+        };
+        let mut table = Preview1DescriptorTable {
+            entries: vec![Some(Preview1DescriptorEntry::new(file, false))],
+        };
+
+        assert_eq!(table.fdflags(0), Ok(P1_FDFLAG_NONBLOCK));
+        assert_eq!(table.dup(0), Ok(1));
+        assert_eq!(table.fdflags(1), Ok(P1_FDFLAG_NONBLOCK));
+        assert_eq!(table.close_on_exec(1), Ok(false));
+        assert_eq!(
+            table.set_fdflags(1, P1_FDFLAG_NONBLOCK | P1_FDFLAG_APPEND),
+            p1::errno::SUCCESS
+        );
+
+        let exec_table = table.clone_for_exec();
+
+        assert_eq!(
+            exec_table.fdflags(1),
+            Ok(P1_FDFLAG_NONBLOCK | P1_FDFLAG_APPEND)
+        );
+    }
+
+    #[test]
+    fn socket_descriptor_accepts_only_nonblock_fdflag() {
+        let (writer, reader) = crate::byte_channel();
+        let socket = Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
+            reader,
+            writer,
+            carry: Bytes::new(),
+            options: WasixSocketOptions::default(),
+            socket_type: WASIX_SOCK_TYPE_STREAM,
+        });
+        let mut table = Preview1DescriptorTable {
+            entries: vec![Some(Preview1DescriptorEntry::new(socket, false))],
+        };
+
+        assert_eq!(table.set_fdflags(0, P1_FDFLAG_NONBLOCK), p1::errno::SUCCESS);
+        assert_eq!(table.fdflags(0), Ok(P1_FDFLAG_NONBLOCK));
+        assert!(p1_socket_fdflags_supported(P1_FDFLAG_NONBLOCK));
+        assert!(!p1_socket_fdflags_supported(P1_FDFLAG_APPEND));
     }
 
     #[test]
