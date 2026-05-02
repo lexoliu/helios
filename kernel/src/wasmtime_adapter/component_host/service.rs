@@ -12772,7 +12772,11 @@ where
     if status != p1::errno::SUCCESS {
         return status;
     }
-    let status = wasix_sock_descriptor_unavailable(caller, fd);
+    let status = caller.data().require_udp_authority();
+    if status != p1::errno::SUCCESS {
+        return status;
+    }
+    let status = wasix_udp_socket_descriptor_status(caller.data().descriptors.get(fd));
     if status != p1::errno::SUCCESS {
         return status;
     }
@@ -12798,11 +12802,9 @@ where
     if status != p1::errno::SUCCESS {
         return status;
     }
-    match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(_))) => {}
-        Some(Preview1Descriptor::Socket(_)) => return p1::errno::INVAL,
-        Some(_) => return p1::errno::NOTSOCK,
-        None => return p1::errno::BADF,
+    let status = wasix_udp_socket_descriptor_status(caller.data().descriptors.get(fd));
+    if status != p1::errno::SUCCESS {
+        return status;
     }
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
@@ -12826,6 +12828,15 @@ where
     match result {
         Ok(()) => p1::errno::SUCCESS,
         Err(error) => p1_errno_from_udp_error(error),
+    }
+}
+
+fn wasix_udp_socket_descriptor_status(descriptor: Option<&Preview1Descriptor>) -> i32 {
+    match descriptor {
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(_))) => p1::errno::SUCCESS,
+        Some(Preview1Descriptor::Socket(_)) => p1::errno::INVAL,
+        Some(_) => p1::errno::NOTSOCK,
+        None => p1::errno::BADF,
     }
 }
 
@@ -16323,6 +16334,32 @@ mod tests {
         assert_eq!(wasix_sock_recv_authority(None), Err(p1::errno::BADF));
         assert_eq!(wasix_sock_send_authority(None), Err(p1::errno::BADF));
         assert_eq!(wasix_sock_listen_authority(None), Err(p1::errno::BADF));
+    }
+
+    #[test]
+    fn wasix_multicast_preflight_accepts_udp_sockets_only() {
+        let udp = Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
+            options: WasixSocketOptions::default(),
+        }));
+        let tcp =
+            Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
+                options: WasixSocketOptions::default(),
+            }));
+        let file = Preview1Descriptor::Stdout;
+
+        assert_eq!(
+            wasix_udp_socket_descriptor_status(Some(&udp)),
+            p1::errno::SUCCESS
+        );
+        assert_eq!(
+            wasix_udp_socket_descriptor_status(Some(&tcp)),
+            p1::errno::INVAL
+        );
+        assert_eq!(
+            wasix_udp_socket_descriptor_status(Some(&file)),
+            p1::errno::NOTSOCK
+        );
+        assert_eq!(wasix_udp_socket_descriptor_status(None), p1::errno::BADF);
     }
 
     #[test]
