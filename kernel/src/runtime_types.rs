@@ -335,6 +335,12 @@ pub enum NetworkErrorDetail {
     UdpReceiveFailed,
     #[error("no ephemeral UDP ports are available")]
     UdpNoEphemeralPorts,
+    #[error("UDP multicast interface is unavailable")]
+    UdpMulticastInterfaceUnavailable,
+    #[error("UDP multicast group could not be joined")]
+    UdpMulticastJoinFailed,
+    #[error("UDP multicast group could not be left")]
+    UdpMulticastLeaveFailed,
     #[error("unknown TCP stream")]
     UnknownTcpStream,
     #[error("unknown UDP socket")]
@@ -380,6 +386,9 @@ impl NetworkErrorDetail {
             Self::UdpQueueFailed => "UDP datagram could not be queued",
             Self::UdpReceiveFailed => "UDP receive failed",
             Self::UdpNoEphemeralPorts => "no ephemeral UDP ports are available",
+            Self::UdpMulticastInterfaceUnavailable => "UDP multicast interface is unavailable",
+            Self::UdpMulticastJoinFailed => "UDP multicast group could not be joined",
+            Self::UdpMulticastLeaveFailed => "UDP multicast group could not be left",
             Self::UnknownTcpStream => "unknown TCP stream",
             Self::UnknownUdpSocket => "unknown UDP socket",
             Self::InternalInvariant => "internal network invariant failed",
@@ -489,6 +498,18 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         max_bytes: u32,
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Option<UdpDatagram>, UdpError>> + Send + 'a;
+
+    fn udp_join_multicast_v4(
+        &self,
+        group: Ipv4Address,
+        interface: Ipv4Address,
+    ) -> impl Future<Output = Result<(), UdpError>> + Send + '_;
+
+    fn udp_leave_multicast_v4(
+        &self,
+        group: Ipv4Address,
+        interface: Ipv4Address,
+    ) -> impl Future<Output = Result<(), UdpError>> + Send + '_;
 
     fn udp_close(&self, socket: Self::UdpSocket) -> impl Future<Output = ()> + Send + '_;
 }

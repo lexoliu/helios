@@ -3,8 +3,9 @@ extern crate alloc;
 use core::future::Future;
 
 use crate::{
-    ComponentNetworkService, DnsCap, NetworkErrorDetail, PrivilegedBindCap, TcpAccepted, TcpCap,
-    TcpError, TcpErrorKind, TcpListener, UdpBinding, UdpCap, UdpError, UdpErrorKind,
+    ComponentNetworkService, DnsCap, MulticastCap, NetworkErrorDetail, PrivilegedBindCap,
+    TcpAccepted, TcpCap, TcpError, TcpErrorKind, TcpListener, UdpBinding, UdpCap, UdpError,
+    UdpErrorKind,
 };
 
 #[derive(Clone)]
@@ -134,6 +135,26 @@ where
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Option<crate::UdpDatagram>, UdpError>> + Send + '_ {
         self.service.udp_receive(socket, max_bytes, timeout_nanos)
+    }
+
+    pub fn udp_join_multicast_v4(
+        &self,
+        _: UdpCap,
+        _: MulticastCap,
+        group: crate::Ipv4Address,
+        interface: crate::Ipv4Address,
+    ) -> impl Future<Output = Result<(), UdpError>> + Send + '_ {
+        self.service.udp_join_multicast_v4(group, interface)
+    }
+
+    pub fn udp_leave_multicast_v4(
+        &self,
+        _: UdpCap,
+        _: MulticastCap,
+        group: crate::Ipv4Address,
+        interface: crate::Ipv4Address,
+    ) -> impl Future<Output = Result<(), UdpError>> + Send + '_ {
+        self.service.udp_leave_multicast_v4(group, interface)
     }
 
     pub fn udp_close(
@@ -283,6 +304,22 @@ mod tests {
             core::future::ready(Ok(None))
         }
 
+        fn udp_join_multicast_v4(
+            &self,
+            _: Ipv4Address,
+            _: Ipv4Address,
+        ) -> impl Future<Output = Result<(), UdpError>> + Send + '_ {
+            core::future::ready(Ok(()))
+        }
+
+        fn udp_leave_multicast_v4(
+            &self,
+            _: Ipv4Address,
+            _: Ipv4Address,
+        ) -> impl Future<Output = Result<(), UdpError>> + Send + '_ {
+            core::future::ready(Ok(()))
+        }
+
         fn udp_close(&self, _: Self::UdpSocket) -> impl Future<Output = ()> + Send + '_ {
             core::future::ready(())
         }
@@ -295,11 +332,13 @@ mod tests {
             NetworkAuthorityRights::TCP
                 | NetworkAuthorityRights::UDP
                 | NetworkAuthorityRights::DNS
+                | NetworkAuthorityRights::MULTICAST
                 | NetworkAuthorityRights::PRIVILEGED_BIND,
         );
         let tcp = authority.derive_tcp_cap().unwrap();
         let udp = authority.derive_udp_cap().unwrap();
         let dns = authority.derive_dns_cap().unwrap();
+        let multicast = authority.derive_multicast_cap().unwrap();
         let privileged = authority.derive_privileged_bind_cap().unwrap();
         let stack = SocketStack::new(TestNetworkService);
 
@@ -325,6 +364,10 @@ mod tests {
                 .local_port,
             53
         );
+        let group = Ipv4Address::new([224, 0, 0, 251]);
+        let interface = Ipv4Address::new([0, 0, 0, 0]);
+        block_on(stack.udp_join_multicast_v4(udp, multicast, group, interface)).unwrap();
+        block_on(stack.udp_leave_multicast_v4(udp, multicast, group, interface)).unwrap();
     }
 
     #[test]

@@ -132,6 +132,18 @@ trait DynComponentHostNetworkService: Send + Sync + 'static {
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<Option<UdpDatagram>, UdpError>> + Send + 'a>>;
 
+    fn udp_join_multicast_v4<'a>(
+        &'a self,
+        group: Ipv4Address,
+        interface: Ipv4Address,
+    ) -> Pin<Box<dyn Future<Output = Result<(), UdpError>> + Send + 'a>>;
+
+    fn udp_leave_multicast_v4<'a>(
+        &'a self,
+        group: Ipv4Address,
+        interface: Ipv4Address,
+    ) -> Pin<Box<dyn Future<Output = Result<(), UdpError>> + Send + 'a>>;
+
     fn udp_close<'a>(&'a self, socket: u64) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
@@ -256,6 +268,22 @@ impl ComponentNetworkService for ComponentHostNetworkService {
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Option<UdpDatagram>, UdpError>> + Send + '_ {
         self.inner.udp_receive(socket, max_bytes, timeout_nanos)
+    }
+
+    fn udp_join_multicast_v4(
+        &self,
+        group: Ipv4Address,
+        interface: Ipv4Address,
+    ) -> impl Future<Output = Result<(), UdpError>> + Send + '_ {
+        self.inner.udp_join_multicast_v4(group, interface)
+    }
+
+    fn udp_leave_multicast_v4(
+        &self,
+        group: Ipv4Address,
+        interface: Ipv4Address,
+    ) -> impl Future<Output = Result<(), UdpError>> + Send + '_ {
+        self.inner.udp_leave_multicast_v4(group, interface)
     }
 
     fn udp_close(&self, socket: Self::UdpSocket) -> impl Future<Output = ()> + Send + '_ {
@@ -436,6 +464,22 @@ where
                 )
                 .await
         })
+    }
+
+    fn udp_join_multicast_v4<'a>(
+        &'a self,
+        group: Ipv4Address,
+        interface: Ipv4Address,
+    ) -> Pin<Box<dyn Future<Output = Result<(), UdpError>> + Send + 'a>> {
+        Box::pin(async move { self.service.udp_join_multicast_v4(group, interface).await })
+    }
+
+    fn udp_leave_multicast_v4<'a>(
+        &'a self,
+        group: Ipv4Address,
+        interface: Ipv4Address,
+    ) -> Pin<Box<dyn Future<Output = Result<(), UdpError>> + Send + 'a>> {
+        Box::pin(async move { self.service.udp_leave_multicast_v4(group, interface).await })
     }
 
     fn udp_close<'a>(&'a self, socket: u64) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {

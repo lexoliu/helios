@@ -5079,6 +5079,22 @@ mod tests {
             core::future::ready(Ok(None))
         }
 
+        fn udp_join_multicast_v4(
+            &self,
+            _: crate::Ipv4Address,
+            _: crate::Ipv4Address,
+        ) -> impl core::future::Future<Output = Result<(), crate::UdpError>> + Send + '_ {
+            core::future::ready(Ok(()))
+        }
+
+        fn udp_leave_multicast_v4(
+            &self,
+            _: crate::Ipv4Address,
+            _: crate::Ipv4Address,
+        ) -> impl core::future::Future<Output = Result<(), crate::UdpError>> + Send + '_ {
+            core::future::ready(Ok(()))
+        }
+
         fn udp_close(
             &self,
             _: Self::UdpSocket,

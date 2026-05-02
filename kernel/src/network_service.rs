@@ -15,7 +15,9 @@ use core::time::Duration;
 
 use helios_hal::cpu::Cpu;
 use helios_hal::io::IoError;
-use smoltcp::iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet};
+use smoltcp::iface::{
+    Config as InterfaceConfig, Interface, MulticastError, SocketHandle, SocketSet,
+};
 use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::{dhcpv4, dns, icmp, tcp, udp};
 use smoltcp::time::Instant as SmolInstant;
@@ -148,6 +150,8 @@ enum NetworkRequest {
     UdpBind(UdpBindRequest),
     UdpSend(UdpSendRequest),
     UdpReceive(UdpReceiveRequest),
+    UdpJoinMulticastV4(UdpMulticastV4Request),
+    UdpLeaveMulticastV4(UdpMulticastV4Request),
     UdpClose(UdpCloseRequest),
 }
 
@@ -220,6 +224,12 @@ struct UdpReceiveRequest {
     max_bytes: u32,
     timeout_nanos: u64,
     response: RequestResponse<Result<Option<UdpDatagram>, UdpError>>,
+}
+
+struct UdpMulticastV4Request {
+    group: KernelIpv4Address,
+    interface: KernelIpv4Address,
+    response: RequestResponse<Result<(), UdpError>>,
 }
 
 struct UdpCloseRequest {
@@ -522,6 +532,34 @@ where
         response.wait().await
     }
 
+    pub async fn udp_join_multicast_v4(
+        &self,
+        group: KernelIpv4Address,
+        interface: KernelIpv4Address,
+    ) -> Result<(), UdpError> {
+        let response = RequestResponse::new();
+        self.enqueue_request(NetworkRequest::UdpJoinMulticastV4(UdpMulticastV4Request {
+            group,
+            interface,
+            response: response.clone(),
+        }));
+        response.wait().await
+    }
+
+    pub async fn udp_leave_multicast_v4(
+        &self,
+        group: KernelIpv4Address,
+        interface: KernelIpv4Address,
+    ) -> Result<(), UdpError> {
+        let response = RequestResponse::new();
+        self.enqueue_request(NetworkRequest::UdpLeaveMulticastV4(UdpMulticastV4Request {
+            group,
+            interface,
+            response: response.clone(),
+        }));
+        response.wait().await
+    }
+
     pub async fn udp_close(&self, socket: UdpSocketId) {
         let response = RequestResponse::new();
         self.enqueue_request(NetworkRequest::UdpClose(UdpCloseRequest {
@@ -620,6 +658,18 @@ where
                             request.max_bytes,
                             request.timeout_nanos,
                         )
+                        .await;
+                    request.response.complete(result).await;
+                }
+                NetworkRequest::UdpJoinMulticastV4(request) => {
+                    let result = self
+                        .execute_udp_join_multicast_v4(request.group, request.interface)
+                        .await;
+                    request.response.complete(result).await;
+                }
+                NetworkRequest::UdpLeaveMulticastV4(request) => {
+                    let result = self
+                        .execute_udp_leave_multicast_v4(request.group, request.interface)
                         .await;
                     request.response.complete(result).await;
                 }
@@ -902,6 +952,24 @@ where
             };
             self.wait_for_progress(next_wait).await;
         }
+    }
+
+    async fn execute_udp_join_multicast_v4(
+        &self,
+        group: KernelIpv4Address,
+        interface: KernelIpv4Address,
+    ) -> Result<(), UdpError> {
+        let mut state = self.inner.state.lock().await;
+        state.join_multicast_v4(group, interface)
+    }
+
+    async fn execute_udp_leave_multicast_v4(
+        &self,
+        group: KernelIpv4Address,
+        interface: KernelIpv4Address,
+    ) -> Result<(), UdpError> {
+        let mut state = self.inner.state.lock().await;
+        state.leave_multicast_v4(group, interface)
     }
 
     async fn wait_for_ipv4_ping(&self, deadline_nanos: u64) -> Result<(), PingError> {
@@ -1358,6 +1426,22 @@ where
         timeout_nanos: u64,
     ) -> impl core::future::Future<Output = Result<Option<UdpDatagram>, UdpError>> + Send + 'a {
         async move { NetworkService::udp_receive(self, socket, max_bytes, timeout_nanos).await }
+    }
+
+    fn udp_join_multicast_v4(
+        &self,
+        group: KernelIpv4Address,
+        interface: KernelIpv4Address,
+    ) -> impl core::future::Future<Output = Result<(), UdpError>> + Send + '_ {
+        async move { NetworkService::udp_join_multicast_v4(self, group, interface).await }
+    }
+
+    fn udp_leave_multicast_v4(
+        &self,
+        group: KernelIpv4Address,
+        interface: KernelIpv4Address,
+    ) -> impl core::future::Future<Output = Result<(), UdpError>> + Send + '_ {
+        async move { NetworkService::udp_leave_multicast_v4(self, group, interface).await }
     }
 
     fn udp_close(
@@ -2197,6 +2281,49 @@ impl NetworkState {
         })
     }
 
+    fn join_multicast_v4(
+        &mut self,
+        group: KernelIpv4Address,
+        interface: KernelIpv4Address,
+    ) -> Result<(), UdpError> {
+        self.require_multicast_interface(interface)?;
+        self.iface
+            .join_multicast_group(Ipv4Address::from_octets(group.octets()))
+            .map_err(|error| udp_multicast_error(error, NetworkErrorDetail::UdpMulticastJoinFailed))
+    }
+
+    fn leave_multicast_v4(
+        &mut self,
+        group: KernelIpv4Address,
+        interface: KernelIpv4Address,
+    ) -> Result<(), UdpError> {
+        self.require_multicast_interface(interface)?;
+        self.iface
+            .leave_multicast_group(Ipv4Address::from_octets(group.octets()))
+            .map_err(|error| {
+                udp_multicast_error(error, NetworkErrorDetail::UdpMulticastLeaveFailed)
+            })
+    }
+
+    fn require_multicast_interface(&self, interface: KernelIpv4Address) -> Result<(), UdpError> {
+        if interface.octets() == [0, 0, 0, 0] {
+            return Ok(());
+        }
+        let Some(cidr) = self.ipv4_address else {
+            return Err(UdpError {
+                kind: UdpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::UdpMulticastInterfaceUnavailable,
+            });
+        };
+        if cidr.address() != Ipv4Address::from_octets(interface.octets()) {
+            return Err(UdpError {
+                kind: UdpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::UdpMulticastInterfaceUnavailable,
+            });
+        }
+        Ok(())
+    }
+
     fn next_wait_duration(&mut self, now_nanos: u64, deadline_nanos: u64) -> Duration {
         let remaining_nanos = deadline_nanos.saturating_sub(now_nanos);
         let stack_wait = self
@@ -2297,6 +2424,13 @@ fn parse_ipv4(input: &str) -> Option<Ipv4Address> {
         return None;
     }
     Some(Ipv4Address::from_octets(octets))
+}
+
+fn udp_multicast_error(error: MulticastError, detail: NetworkErrorDetail) -> UdpError {
+    let kind = match error {
+        MulticastError::GroupTableFull | MulticastError::Unaddressable => UdpErrorKind::Unavailable,
+    };
+    UdpError { kind, detail }
 }
 
 fn tcp_stream_id(index: usize) -> TcpStreamId {

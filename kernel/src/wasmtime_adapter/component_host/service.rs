@@ -3658,25 +3658,41 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "sock_join_multicast_v4",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             _multiaddr: i32,
-             _interface: i32|
-             -> i32 { wasix_sock_multicast(&mut caller, fd) },
+             (fd, multiaddr, interface): (i32, i32, i32)| {
+                Box::new(async move {
+                    wasix_sock_multicast_v4(
+                        &mut caller,
+                        fd,
+                        multiaddr as u32,
+                        interface as u32,
+                        true,
+                    )
+                    .await
+                })
+            },
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "sock_leave_multicast_v4",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             _multiaddr: i32,
-             _interface: i32|
-             -> i32 { wasix_sock_multicast(&mut caller, fd) },
+             (fd, multiaddr, interface): (i32, i32, i32)| {
+                Box::new(async move {
+                    wasix_sock_multicast_v4(
+                        &mut caller,
+                        fd,
+                        multiaddr as u32,
+                        interface as u32,
+                        false,
+                    )
+                    .await
+                })
+            },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -10794,6 +10810,56 @@ where
     p1::errno::NOTSUP
 }
 
+async fn wasix_sock_multicast_v4<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    fd: i32,
+    multiaddr: u32,
+    interface: u32,
+    join: bool,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let status = caller.data().require_multicast_authority();
+    if status != p1::errno::SUCCESS {
+        return status;
+    }
+    let status = caller.data().require_udp_authority();
+    if status != p1::errno::SUCCESS {
+        return status;
+    }
+    match caller.data().descriptors.get(fd) {
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(_))) => {}
+        Some(Preview1Descriptor::Socket(_)) => return p1::errno::INVAL,
+        Some(_) => return p1::errno::NOTSOCK,
+        None => return p1::errno::BADF,
+    }
+    let Some(memory) = p1_memory(caller) else {
+        return p1::errno::FAULT;
+    };
+    let group = match wasix_read_addr_ip4(caller, memory, multiaddr) {
+        Ok(group) => group,
+        Err(errno) => return errno,
+    };
+    let interface = match wasix_read_addr_ip4(caller, memory, interface) {
+        Ok(interface) => interface,
+        Err(errno) => return errno,
+    };
+    let Some(service) = caller.data().runtime_state.network_service() else {
+        return p1::errno::NETDOWN;
+    };
+    let result = if join {
+        service.udp_join_multicast_v4(group, interface).await
+    } else {
+        service.udp_leave_multicast_v4(group, interface).await
+    };
+    match result {
+        Ok(()) => p1::errno::SUCCESS,
+        Err(error) => p1_errno_from_udp_error(error),
+    }
+}
+
 async fn wasix_sock_bind<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
@@ -11740,6 +11806,26 @@ fn wasix_read_addr_port<T>(
         }
         WASIX_ADDRESS_FAMILY_IP_INET6 => Err(p1::errno::NOTSUP),
         WASIX_ADDRESS_FAMILY_UNIX => Err(p1::errno::NOTSUP),
+        _ => Err(p1::errno::INVAL),
+    }
+}
+
+fn wasix_read_addr_ip4<T>(
+    caller: &mut Caller<'_, T>,
+    memory: Preview1Memory,
+    ptr: u32,
+) -> Result<crate::Ipv4Address, i32> {
+    let tag = p1_try_read_u8(caller, memory, ptr).map_err(|_| p1::errno::FAULT)?;
+    match tag {
+        WASIX_ADDRESS_FAMILY_IP_INET4 => {
+            let octets = p1_read_memory(caller, memory, ptr + WASIX_ADDR_IP_UNION_OFFSET, 4)
+                .map_err(|_| p1::errno::FAULT)?;
+            Ok(crate::Ipv4Address::new([
+                octets[0], octets[1], octets[2], octets[3],
+            ]))
+        }
+        WASIX_ADDRESS_FAMILY_IP_INET6 | WASIX_ADDRESS_FAMILY_UNIX => Err(p1::errno::NOTSUP),
+        WASIX_ADDRESS_FAMILY_UNSPEC => Err(p1::errno::INVAL),
         _ => Err(p1::errno::INVAL),
     }
 }
