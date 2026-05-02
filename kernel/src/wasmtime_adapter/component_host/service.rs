@@ -39,6 +39,7 @@ const WASM_PAGE_SIZE: usize = 64 * 1024;
 const PROGRAM_SHARED_MEMORY_MAX_PAGES: u32 = 8192;
 const WASIX_ASYNCIFY_DATA_SIZE: u32 = 8;
 const WASIX_STACK_SNAPSHOT_SIZE: usize = 24;
+const WASIX_THREAD_START_SIZE: usize = 64;
 const WASIX_MODULE: &str = "wasix_32v1";
 const DEFAULT_WASIX_SOCKET_BUFFER_BYTES: u64 = 64 * 1024;
 const DEFAULT_WASIX_SOCKET_LOW_WATER_BYTES: u64 = 1;
@@ -245,12 +246,21 @@ where
     descriptors: Preview1DescriptorTable,
     asyncify: WasixAsyncifyState,
     children: Vec<WasixChildProcess>,
+    thread_id: u32,
+    next_thread_id: u32,
+    threads: Vec<WasixThread>,
     requested_exit: Option<u32>,
 }
 
 struct WasixChildProcess {
     pid: u32,
     exit: Option<futures::channel::oneshot::Receiver<Result<ChildExit, ProgramExecError>>>,
+    completed: Option<u32>,
+}
+
+struct WasixThread {
+    tid: u32,
+    exit: Option<futures::channel::oneshot::Receiver<u32>>,
     completed: Option<u32>,
 }
 
@@ -1880,6 +1890,9 @@ where
             descriptors,
             asyncify: WasixAsyncifyState::new(),
             children: Vec::new(),
+            thread_id: 0,
+            next_thread_id: 1,
+            threads: Vec::new(),
             requested_exit: None,
         }
     }
@@ -2010,6 +2023,20 @@ where
 
     fn request_exit(&mut self, code: u32) {
         self.requested_exit = Some(code);
+    }
+
+    fn set_thread_id(&mut self, thread_id: u32) {
+        self.thread_id = thread_id;
+        self.next_thread_id = thread_id.saturating_add(1);
+    }
+
+    fn allocate_thread_id(&mut self) -> Result<u32, i32> {
+        let tid = self.next_thread_id;
+        self.next_thread_id = self
+            .next_thread_id
+            .checked_add(1)
+            .ok_or(p1::errno::OVERFLOW)?;
+        Ok(tid)
     }
 
     fn take_requested_exit(&mut self) -> Option<u32> {
@@ -2148,6 +2175,43 @@ where
                 (!self.children.is_empty()).then_some(0)
             }
         }
+    }
+
+    fn insert_thread(&mut self, tid: u32, exit: futures::channel::oneshot::Receiver<u32>) {
+        self.threads.push(WasixThread {
+            tid,
+            exit: Some(exit),
+            completed: None,
+        });
+    }
+
+    fn poll_thread_exit(&mut self, index: usize) -> Option<u32> {
+        if let Some(code) = self.threads[index].completed {
+            return Some(code);
+        }
+        let Some(exit) = self.threads[index].exit.as_mut() else {
+            return self.threads[index].completed;
+        };
+        let waker = futures::task::noop_waker_ref();
+        let mut context = Context::from_waker(waker);
+        match Pin::new(exit).poll(&mut context) {
+            Poll::Pending => None,
+            Poll::Ready(Ok(code)) => {
+                self.threads[index].completed = Some(code);
+                self.threads[index].exit = None;
+                Some(code)
+            }
+            Poll::Ready(Err(_)) => {
+                let code = u32::from(p1::errno::IO as u16);
+                self.threads[index].completed = Some(code);
+                self.threads[index].exit = None;
+                Some(code)
+            }
+        }
+    }
+
+    fn find_thread_index(&self, tid: u32) -> Option<usize> {
+        self.threads.iter().position(|thread| thread.tid == tid)
     }
 
     async fn read_stdin(&mut self, max_bytes: usize) -> Vec<u8> {
@@ -3102,13 +3166,15 @@ where
     HostFs: crate::HostFileSystem,
 {
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "thread_spawn_v2",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             _args: i32,
-             ret_tid: i32|
-             -> i32 { wasix_thread_spawn_v2(&mut caller, ret_tid as u32) },
+             (args, ret_tid): (i32, i32)| {
+                Box::new(async move {
+                    wasix_thread_spawn_v2(&mut caller, args as u32, ret_tid as u32).await
+                })
+            },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -5745,11 +5811,11 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "thread_join",
-            |_caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>, tid: i32| -> i32 {
-                wasix_thread_join(tid as u32)
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>, (tid,): (i32,)| {
+                Box::new(async move { wasix_thread_join(&mut caller, tid as u32).await })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -9787,25 +9853,193 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    p1_write_u32(caller, memory, ret_tid, 0)
+    p1_write_u32(caller, memory, ret_tid, caller.data().thread_id)
 }
 
-fn wasix_thread_spawn_v2<CpuImpl, HostFs>(
-    _caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-    _ret_tid: u32,
+async fn wasix_thread_spawn_v2<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    args: u32,
+    ret_tid: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    p1::errno::NOTSUP
+    let Some(memory) = p1_memory(caller) else {
+        return p1::errno::FAULT;
+    };
+    if p1_read_memory(caller, memory, args, WASIX_THREAD_START_SIZE).is_err() {
+        return p1::errno::FAULT;
+    }
+    let Some(imported_memory) = caller.data().imported_memory.clone() else {
+        return p1::errno::NOTSUP;
+    };
+    let Some(compiled) = caller.data().current_core_module.clone() else {
+        return p1::errno::NOTSUP;
+    };
+    if !compiled
+        .module
+        .exports()
+        .any(|export| export.name() == "wasi_thread_start")
+    {
+        return p1::errno::NOTCAPABLE;
+    }
+    let tid = match caller.data_mut().allocate_thread_id() {
+        Ok(tid) => tid,
+        Err(errno) => return errno,
+    };
+    let status = p1_write_u32(caller, memory, ret_tid, tid);
+    if status != p1::errno::SUCCESS {
+        return status;
+    }
+
+    let (exit_tx, exit_rx) = futures::channel::oneshot::channel();
+    let cpu = caller.data().cpu.clone();
+    let timer = caller.data().timer.clone();
+    let spawner = caller.data().spawner.clone();
+    let runtime_state = caller.data().runtime_state.clone();
+    let instance = caller.data().instance.clone();
+    let parent_instance_id = caller.data().parent_instance_id;
+    let arguments = caller.data().arguments.clone();
+    let environment = caller.data().environment.clone();
+    let authority = caller.data().authority.clone();
+    let output_mode = caller.data().output_mode.clone();
+    let read_serial = caller.data().read_serial;
+    let write_serial = caller.data().write_serial;
+    let filesystem = caller.data().filesystem.snapshot();
+    let descriptors = caller.data().descriptors.clone();
+    let wasix_abi = caller.data().wasix_abi;
+    let engine = compiled.module.engine().clone();
+
+    let mut store_data = Preview1ProgramStore::new(
+        cpu,
+        timer,
+        spawner.clone(),
+        runtime_state,
+        instance,
+        parent_instance_id,
+        arguments,
+        environment,
+        authority,
+        output_mode,
+        read_serial,
+        write_serial,
+        Some(imported_memory.clone()),
+        Some(filesystem),
+        Some(descriptors),
+        Some(compiled.clone()),
+        wasix_abi,
+    );
+    store_data.set_thread_id(tid);
+    caller.data_mut().insert_thread(tid, exit_rx);
+    spawner.spawn_detached(async move {
+        let code = run_wasix_thread(engine, compiled, imported_memory, store_data, tid, args).await;
+        let _ = exit_tx.send(code);
+    });
+    p1::errno::SUCCESS
 }
 
-fn wasix_thread_join(tid: u32) -> i32 {
-    if tid == 0 {
-        p1::errno::INVAL
+async fn run_wasix_thread<CpuImpl, HostFs>(
+    engine: wasmtime::Engine,
+    compiled: Arc<WasmtimeCompiledCoreModule>,
+    imported_memory: SharedMemory,
+    store_data: Preview1ProgramStore<CpuImpl, HostFs>,
+    tid: u32,
+    args: u32,
+) -> u32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let mut store = wasmtime::Store::new(&engine, store_data);
+    configure_preview1_program_store(&mut store);
+
+    let mut linker = CoreLinker::new(&engine);
+    if add_preview1_program_imports(&mut linker).is_err() {
+        return u32::from(p1::errno::IO as u16);
+    }
+    if define_imported_shared_memory(&mut linker, &store, &compiled.module, imported_memory)
+        .is_err()
+    {
+        return u32::from(p1::errno::IO as u16);
+    }
+    let instance = match linker.instantiate_async(&mut store, &compiled.module).await {
+        Ok(instance) => instance,
+        Err(error) => {
+            tracing::error!(tid, "wasix thread instantiate failed: {error:#}");
+            return u32::from(p1::errno::IO as u16);
+        }
+    };
+    let start = match instance.get_typed_func::<(i32, i32), ()>(&mut store, "wasi_thread_start") {
+        Ok(start) => start,
+        Err(error) => {
+            tracing::error!(tid, "wasix thread start export lookup failed: {error:#}");
+            return u32::from(p1::errno::NOTCAPABLE as u16);
+        }
+    };
+    let tid_i32 = match i32::try_from(tid) {
+        Ok(tid) => tid,
+        Err(_) => return u32::from(p1::errno::OVERFLOW as u16),
+    };
+    let args_i32 = i32::from_ne_bytes(args.to_ne_bytes());
+    let result = loop {
+        let result = start.call_async(&mut store, (tid_i32, args_i32)).await;
+        match handle_wasix_asyncify_completion(&mut store, &instance).await {
+            Ok(true) => continue,
+            Ok(false) => break result,
+            Err(error) => {
+                tracing::error!(tid, "wasix thread asyncify completion failed: {error}");
+                return u32::from(p1::errno::IO as u16);
+            }
+        }
+    };
+    match result {
+        Ok(()) => store.data_mut().take_requested_exit().unwrap_or(0),
+        Err(error) => match store.data_mut().take_requested_exit() {
+            Some(code) => code,
+            None => {
+                tracing::error!(tid, "wasix thread failed: {error:#}");
+                u32::from(p1::errno::IO as u16)
+            }
+        },
+    }
+}
+
+async fn wasix_thread_join<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    tid: u32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    if tid == caller.data().thread_id {
+        return p1::errno::INVAL;
+    }
+    let Some(index) = caller.data().find_thread_index(tid) else {
+        return p1::errno::SRCH;
+    };
+    if caller.data_mut().poll_thread_exit(index).is_some() {
+        caller.data_mut().threads.swap_remove(index);
+        return p1::errno::SUCCESS;
+    }
+    let Some(exit) = caller.data_mut().threads[index].exit.take() else {
+        caller.data_mut().threads.swap_remove(index);
+        return p1::errno::SUCCESS;
+    };
+    let code = match exit.await {
+        Ok(code) => code,
+        Err(_) => u32::from(p1::errno::IO as u16),
+    };
+    let Some(index) = caller.data().find_thread_index(tid) else {
+        return p1::errno::SUCCESS;
+    };
+    if code == 0 {
+        caller.data_mut().threads.swap_remove(index);
+        p1::errno::SUCCESS
     } else {
-        p1::errno::SRCH
+        caller.data_mut().threads[index].completed = Some(code);
+        p1::errno::SUCCESS
     }
 }
 

@@ -98,6 +98,7 @@ pub struct InstanceRegistry {
     inner: Arc<InstanceRegistryInner>,
 }
 
+#[derive(Clone)]
 pub struct RegisteredInstance {
     registry: InstanceRegistry,
     entry: Arc<InstanceEntry>,
@@ -413,6 +414,9 @@ impl RegisteredInstance {
 
 impl Drop for RegisteredInstance {
     fn drop(&mut self) {
+        if Arc::strong_count(&self.entry) != 2 {
+            return;
+        }
         let id = self.entry.id;
         self.registry
             .inner

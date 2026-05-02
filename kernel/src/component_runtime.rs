@@ -34,6 +34,7 @@ pub struct InstanceKilled {
 ///   observer console text; stdin is always empty.
 /// - `Child { … }`: spawned-child path — stdin, stdout, and stderr are
 ///   connected to byte channels the parent controls.
+#[derive(Clone)]
 pub enum ComponentOutputMode {
     Serial,
     Trace,
