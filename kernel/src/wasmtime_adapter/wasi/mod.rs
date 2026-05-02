@@ -4036,7 +4036,6 @@ where
         if base_kind != FsNodeKind::Directory {
             return Err(fs_types::ErrorCode::NotDirectory.into());
         }
-        validate_descriptor_flags_within_base(base_flags, flags)?;
 
         let absolute =
             crate::resolve_child_path(&base_path, &path).map_err(map_component_fs_path_error)?;
@@ -4075,6 +4074,8 @@ where
                     {
                         return Err(fs_types::ErrorCode::IsDirectory.into());
                     }
+                    let descriptor_flags =
+                        effective_open_descriptor_flags(base_flags, flags, kind)?;
                     if open_flags.contains(fs_types::OpenFlags::TRUNCATE) {
                         if kind != FsNodeKind::File {
                             return Err(fs_types::ErrorCode::IsDirectory.into());
@@ -4098,7 +4099,7 @@ where
                         let opened = FsDescriptor {
                             path: absolute.clone(),
                             kind,
-                            flags,
+                            flags: descriptor_flags,
                             identity: Some(metadata.identity),
                         };
                         return accessor.with(|mut access| {
@@ -4120,7 +4121,7 @@ where
                     let opened = FsDescriptor {
                         path: absolute.clone(),
                         kind,
-                        flags,
+                        flags: descriptor_flags,
                         identity: Some(metadata.identity),
                     };
                     return accessor.with(|mut access| {
@@ -4147,10 +4148,12 @@ where
                             .stat_path(&host_path)
                             .await
                             .map_err(map_host_fs_error)?;
+                        let descriptor_flags =
+                            effective_open_descriptor_flags(base_flags, flags, FsNodeKind::File)?;
                         let opened = FsDescriptor {
                             path: absolute,
                             kind: FsNodeKind::File,
-                            flags,
+                            flags: descriptor_flags,
                             identity: Some(metadata.identity),
                         };
                         return accessor.with(|mut access| {
