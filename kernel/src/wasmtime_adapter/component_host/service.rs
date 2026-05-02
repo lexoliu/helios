@@ -11281,7 +11281,11 @@ where
         ready = wasix_collect_epoll_events(caller, epfd, maxevents);
     } else if timeout < 0 {
         while ready.is_empty() {
-            crate::yield_now().await;
+            caller
+                .data()
+                .timer
+                .sleep_for(Duration::from_millis(1))
+                .await;
             ready = wasix_collect_epoll_events(caller, epfd, maxevents);
         }
     }
