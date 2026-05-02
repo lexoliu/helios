@@ -55,6 +55,8 @@ const WASIX_PROC_SPAWN_FD_OP_SIZE: u32 = 56;
 const WASIX_PROC_SPAWN_FD_OP_CMD_OFFSET: u32 = 0;
 const WASIX_PROC_SPAWN_FD_OP_FD_OFFSET: u32 = 4;
 const WASIX_PROC_SPAWN_FD_OP_SRC_FD_OFFSET: u32 = 8;
+const WASIX_PROC_SPAWN_FD_OP_PATH_OFFSET: u32 = 12;
+const WASIX_PROC_SPAWN_FD_OP_PATH_LEN_OFFSET: u32 = 16;
 const WASIX_PROC_SPAWN_FD_OP_FDFLAGSEXT_OFFSET: u32 = 50;
 const WASIX_PROC_SPAWN_FD_OP_CLOSE: u8 = 0;
 const WASIX_PROC_SPAWN_FD_OP_DUP2: u8 = 1;
@@ -325,6 +327,12 @@ struct WasixPreparedProgram {
     guest_name: String,
     source_path: String,
     source: ProgramSource,
+}
+
+struct WasixSpawnFdSnapshot {
+    descriptors: Preview1DescriptorTable,
+    authority: ProcessAuthority,
+    cwd: Option<Preview1Cwd>,
 }
 
 enum WasixExecSearchPath<'a> {
@@ -2395,11 +2403,7 @@ where
             Ok(cwd) => cwd,
             Err(errno) => return errno,
         };
-        let cap = match self.authority.derive_directory_cap(
-            &cwd.descriptor.path,
-            &cwd.guest_name,
-            descriptor_flags_to_directory_authority(cwd.descriptor.flags),
-        ) {
+        let cap = match self.derive_cwd_cap(&cwd) {
             Ok(cap) => cap,
             Err(_) => return p1::errno::NOTCAPABLE,
         };
@@ -2410,17 +2414,27 @@ where
 
     fn authority_with_cwd(&self, path: &str) -> Result<ProcessAuthority, i32> {
         let cwd = self.resolve_cwd_target(path)?;
+        self.authority_with_resolved_cwd(&cwd)
+    }
+
+    fn authority_with_resolved_cwd(&self, cwd: &Preview1Cwd) -> Result<ProcessAuthority, i32> {
         let cap = self
-            .authority
-            .derive_directory_cap(
-                &cwd.descriptor.path,
-                &cwd.guest_name,
-                descriptor_flags_to_directory_authority(cwd.descriptor.flags),
-            )
+            .derive_cwd_cap(cwd)
             .map_err(|_| p1::errno::NOTCAPABLE)?;
         let mut authority = self.authority.clone();
         authority.chdir(cap);
         Ok(authority)
+    }
+
+    fn derive_cwd_cap(
+        &self,
+        cwd: &Preview1Cwd,
+    ) -> Result<crate::DirectoryCap, crate::ProcessAuthorityError> {
+        self.authority.derive_directory_cap(
+            &cwd.descriptor.path,
+            &cwd.guest_name,
+            descriptor_flags_to_directory_authority(cwd.descriptor.flags),
+        )
     }
 
     fn resolve_cwd_target(&self, path: &str) -> Result<Preview1Cwd, i32> {
@@ -9449,13 +9463,17 @@ where
         Ok(prepared) => prepared,
         Err(error) => return p1_errno_from_wasmtime_error(&error),
     };
-    let descriptors = if fd_ops == 0 && fd_ops_len == 0 {
+    let snapshot = if fd_ops == 0 && fd_ops_len == 0 {
         None
     } else {
         match wasix_spawn_descriptor_snapshot(caller, memory, fd_ops, fd_ops_len) {
-            Ok(descriptors) => Some(descriptors),
+            Ok(snapshot) => Some(snapshot),
             Err(errno) => return errno,
         }
+    };
+    let (authority, descriptors) = match snapshot {
+        Some(snapshot) => (Some(snapshot.authority), Some(snapshot.descriptors)),
+        None => (None, None),
     };
     let result = match wasix_spawn_child(
         caller,
@@ -9463,7 +9481,7 @@ where
         argv,
         environment,
         WasixSpawnIo::inherit(),
-        None,
+        authority,
         descriptors,
     )
     .await
@@ -9729,7 +9747,7 @@ fn wasix_spawn_descriptor_snapshot<CpuImpl, HostFs>(
     memory: Preview1Memory,
     fd_ops: u32,
     fd_ops_len: u32,
-) -> Result<Preview1DescriptorTable, i32>
+) -> Result<WasixSpawnFdSnapshot, i32>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
@@ -9737,21 +9755,25 @@ where
     if fd_ops == 0 {
         return Err(p1::errno::FAULT);
     }
-    let mut descriptors = caller.data().descriptors.clone();
+    let mut snapshot = WasixSpawnFdSnapshot {
+        descriptors: caller.data().descriptors.clone(),
+        authority: caller.data().authority.clone(),
+        cwd: caller.data().cwd.clone(),
+    };
     for index in 0..fd_ops_len {
         let offset = index
             .checked_mul(WASIX_PROC_SPAWN_FD_OP_SIZE)
             .and_then(|offset| fd_ops.checked_add(offset))
             .ok_or(p1::errno::OVERFLOW)?;
-        wasix_apply_spawn_fd_op(caller, memory, &mut descriptors, offset)?;
+        wasix_apply_spawn_fd_op(caller, memory, &mut snapshot, offset)?;
     }
-    Ok(descriptors)
+    Ok(snapshot)
 }
 
 fn wasix_apply_spawn_fd_op<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     memory: Preview1Memory,
-    descriptors: &mut Preview1DescriptorTable,
+    snapshot: &mut WasixSpawnFdSnapshot,
     op: u32,
 ) -> Result<(), i32>
 where
@@ -9765,7 +9787,7 @@ where
     let fd = i32::try_from(fd).map_err(|_| p1::errno::OVERFLOW)?;
     match cmd {
         WASIX_PROC_SPAWN_FD_OP_CLOSE => {
-            let status = descriptors.close(fd);
+            let status = snapshot.descriptors.close(fd);
             if status == p1::errno::SUCCESS {
                 Ok(())
             } else {
@@ -9784,13 +9806,228 @@ where
             )
             .map_err(|_| p1::errno::FAULT)?;
             let close_on_exec = wasix_close_on_exec_flag(fdflagsext)?;
-            descriptors.dup_to(source_fd, fd, close_on_exec).map(drop)
+            snapshot
+                .descriptors
+                .dup_to(source_fd, fd, close_on_exec)
+                .map(drop)
         }
-        WASIX_PROC_SPAWN_FD_OP_OPEN
-        | WASIX_PROC_SPAWN_FD_OP_CHDIR
-        | WASIX_PROC_SPAWN_FD_OP_FCHDIR => Err(p1::errno::NOTSUP),
+        WASIX_PROC_SPAWN_FD_OP_CHDIR => {
+            let path_ptr = p1_try_read_u32(caller, memory, op + WASIX_PROC_SPAWN_FD_OP_PATH_OFFSET)
+                .map_err(|_| p1::errno::FAULT)?;
+            let path_len =
+                p1_try_read_u32(caller, memory, op + WASIX_PROC_SPAWN_FD_OP_PATH_LEN_OFFSET)
+                    .map_err(|_| p1::errno::FAULT)?;
+            let path = wasix_read_exec_string(caller, memory, path_ptr, path_len)
+                .map_err(|_| p1::errno::FAULT)?;
+            wasix_apply_spawn_chdir(caller.data(), snapshot, fd, &path)
+        }
+        WASIX_PROC_SPAWN_FD_OP_FCHDIR => wasix_apply_spawn_fchdir(snapshot, fd),
+        WASIX_PROC_SPAWN_FD_OP_OPEN => Err(p1::errno::NOTSUP),
         _ => Err(p1::errno::INVAL),
     }
+}
+
+fn wasix_apply_spawn_chdir<CpuImpl, HostFs>(
+    store: &Preview1ProgramStore<CpuImpl, HostFs>,
+    snapshot: &mut WasixSpawnFdSnapshot,
+    fd: i32,
+    path: &str,
+) -> Result<(), i32>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let cwd = wasix_spawn_resolve_cwd_target(store, snapshot, fd, path)?;
+    let cap = snapshot
+        .authority
+        .derive_directory_cap(
+            &cwd.descriptor.path,
+            &cwd.guest_name,
+            descriptor_flags_to_directory_authority(cwd.descriptor.flags),
+        )
+        .map_err(|_| p1::errno::NOTCAPABLE)?;
+    snapshot.authority.chdir(cap);
+    snapshot.cwd = Some(cwd);
+    Ok(())
+}
+
+fn wasix_apply_spawn_fchdir(snapshot: &mut WasixSpawnFdSnapshot, fd: i32) -> Result<(), i32> {
+    let descriptor = match snapshot.descriptors.get(fd) {
+        Some(Preview1Descriptor::Preopen {
+            guest_name,
+            descriptor,
+        }) if descriptor.kind == FsNodeKind::Directory => Preview1Cwd {
+            guest_name: guest_name.clone(),
+            descriptor: descriptor.clone(),
+        },
+        Some(Preview1Descriptor::File { descriptor, .. })
+            if descriptor.kind == FsNodeKind::Directory =>
+        {
+            let guest_name = wasix_spawn_guest_name_for_source(snapshot, &descriptor.path)?;
+            Preview1Cwd {
+                guest_name,
+                descriptor: descriptor.clone(),
+            }
+        }
+        Some(_) => return Err(p1::errno::NOTDIR),
+        None => return Err(p1::errno::BADF),
+    };
+    let cap = snapshot
+        .authority
+        .derive_directory_cap(
+            &descriptor.descriptor.path,
+            &descriptor.guest_name,
+            descriptor_flags_to_directory_authority(descriptor.descriptor.flags),
+        )
+        .map_err(|_| p1::errno::NOTCAPABLE)?;
+    snapshot.authority.chdir(cap);
+    snapshot.cwd = Some(descriptor);
+    Ok(())
+}
+
+fn wasix_spawn_resolve_cwd_target<CpuImpl, HostFs>(
+    store: &Preview1ProgramStore<CpuImpl, HostFs>,
+    snapshot: &WasixSpawnFdSnapshot,
+    fd: i32,
+    path: &str,
+) -> Result<Preview1Cwd, i32>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let (guest_name, source_path, flags) = if path.starts_with('/') {
+        let guest_name =
+            crate::resolve_absolute_path(path).map_err(p1_errno_from_component_path)?;
+        let (descriptor, suffix) = wasix_spawn_resolve_absolute_guest_base(snapshot, &guest_name)?;
+        let source_path = if suffix.is_empty() {
+            descriptor.path
+        } else {
+            crate::resolve_child_path(&descriptor.path, &suffix)
+                .map_err(p1_errno_from_component_path)?
+        };
+        (guest_name, source_path, descriptor.flags)
+    } else {
+        let base = match snapshot.descriptors.get(fd) {
+            Some(Preview1Descriptor::Preopen { descriptor, .. })
+            | Some(Preview1Descriptor::File { descriptor, .. })
+                if descriptor.kind == FsNodeKind::Directory =>
+            {
+                descriptor.clone()
+            }
+            Some(_) => return Err(p1::errno::NOTDIR),
+            None => return Err(p1::errno::BADF),
+        };
+        let base_guest = wasix_spawn_guest_name_for_source(snapshot, &base.path)?;
+        let guest_name =
+            crate::resolve_child_path(&base_guest, path).map_err(p1_errno_from_component_path)?;
+        let source_path =
+            crate::resolve_child_path(&base.path, path).map_err(p1_errno_from_component_path)?;
+        (guest_name, source_path, base.flags)
+    };
+
+    if !flags.contains(fs_types::DescriptorFlags::READ) {
+        return Err(p1::errno::NOTCAPABLE);
+    }
+    let stat = store
+        .filesystem
+        .stat(&source_path)
+        .map_err(p1_errno_from_fs)?;
+    if !matches!(stat.type_, fs_types::DescriptorType::Directory) {
+        return Err(p1::errno::NOTDIR);
+    }
+    Ok(Preview1Cwd {
+        guest_name,
+        descriptor: FsDescriptor {
+            path: source_path,
+            kind: FsNodeKind::Directory,
+            flags,
+            identity: None,
+        },
+    })
+}
+
+fn wasix_spawn_guest_name_for_source(
+    snapshot: &WasixSpawnFdSnapshot,
+    source_path: &str,
+) -> Result<String, i32> {
+    let mut best: Option<(&str, &str)> = None;
+    for entry in &snapshot.descriptors.entries {
+        let Some(entry) = entry else {
+            continue;
+        };
+        let Preview1Descriptor::Preopen {
+            guest_name,
+            descriptor,
+        } = &entry.descriptor
+        else {
+            continue;
+        };
+        if !guest_path_is_within_preopen(source_path, &descriptor.path) {
+            continue;
+        }
+        if best.is_none_or(|(_, best_source)| descriptor.path.len() > best_source.len()) {
+            best = Some((guest_name.as_str(), descriptor.path.as_str()));
+        }
+    }
+
+    let cwd_source;
+    if let Some(cwd) = snapshot.cwd.as_ref()
+        && guest_path_is_within_preopen(source_path, &cwd.descriptor.path)
+        && best.is_none_or(|(_, best_source)| cwd.descriptor.path.len() > best_source.len())
+    {
+        cwd_source = cwd.descriptor.path.clone();
+        best = Some((cwd.guest_name.as_str(), cwd_source.as_str()));
+    }
+
+    let Some((guest_base, source_base)) = best else {
+        return Err(p1::errno::NOTCAPABLE);
+    };
+    let suffix = guest_path_suffix(source_path, source_base);
+    if suffix.is_empty() {
+        Ok(guest_base.to_owned())
+    } else {
+        crate::resolve_child_path(guest_base, suffix).map_err(p1_errno_from_component_path)
+    }
+}
+
+fn wasix_spawn_resolve_absolute_guest_base(
+    snapshot: &WasixSpawnFdSnapshot,
+    guest_name: &str,
+) -> Result<(FsDescriptor, String), i32> {
+    let mut best: Option<(&str, &FsDescriptor)> = None;
+    for entry in &snapshot.descriptors.entries {
+        let Some(entry) = entry else {
+            continue;
+        };
+        let Preview1Descriptor::Preopen {
+            guest_name: preopen_guest,
+            descriptor,
+        } = &entry.descriptor
+        else {
+            continue;
+        };
+        if !guest_path_is_within_preopen(guest_name, preopen_guest) {
+            continue;
+        }
+        if best.is_none_or(|(best_guest, _)| preopen_guest.len() > best_guest.len()) {
+            best = Some((preopen_guest.as_str(), descriptor));
+        }
+    }
+
+    let cwd_descriptor;
+    if let Some(cwd) = snapshot.cwd.as_ref()
+        && guest_path_is_within_preopen(guest_name, &cwd.guest_name)
+        && best.is_none_or(|(best_guest, _)| cwd.guest_name.len() > best_guest.len())
+    {
+        cwd_descriptor = cwd.descriptor.clone();
+        best = Some((cwd.guest_name.as_str(), &cwd_descriptor));
+    }
+
+    let Some((preopen_guest, descriptor)) = best else {
+        return Err(p1::errno::NOTCAPABLE);
+    };
+    let suffix = guest_path_suffix(guest_name, preopen_guest);
+    Ok((descriptor.clone(), suffix.to_owned()))
 }
 
 async fn wasix_prepare_program_from_name<CpuImpl, HostFs>(
@@ -14352,6 +14589,76 @@ mod tests {
             }
             _ => panic!("fd 2 should be retained across exec"),
         }
+    }
+
+    #[test]
+    fn spawn_fd_snapshot_maps_directory_source_to_guest_path() {
+        let snapshot = WasixSpawnFdSnapshot {
+            descriptors: Preview1DescriptorTable {
+                entries: vec![Some(Preview1DescriptorEntry::new(
+                    Preview1Descriptor::Preopen {
+                        guest_name: "/workspace".into(),
+                        descriptor: FsDescriptor {
+                            path: "/mnt/workspace".into(),
+                            kind: FsNodeKind::Directory,
+                            flags: fs_types::DescriptorFlags::READ,
+                            identity: None,
+                        },
+                    },
+                    false,
+                ))],
+            },
+            authority: ProcessAuthority::root(),
+            cwd: None,
+        };
+
+        assert_eq!(
+            wasix_spawn_guest_name_for_source(&snapshot, "/mnt/workspace/tools").unwrap(),
+            "/workspace/tools"
+        );
+        assert_eq!(
+            wasix_spawn_guest_name_for_source(&snapshot, "/outside"),
+            Err(p1::errno::NOTCAPABLE)
+        );
+    }
+
+    #[test]
+    fn spawn_fd_fchdir_updates_child_authority_cwd() {
+        let preopen = Preview1Descriptor::Preopen {
+            guest_name: "/workspace".into(),
+            descriptor: FsDescriptor {
+                path: "/mnt/workspace".into(),
+                kind: FsNodeKind::Directory,
+                flags: fs_types::DescriptorFlags::READ,
+                identity: None,
+            },
+        };
+        let mut authority = ProcessAuthority::empty();
+        authority.insert_directory_preopen(
+            crate::DirectoryPreopen::new(
+                "/mnt/workspace",
+                "/workspace",
+                DirectoryAuthorityRights::READ,
+            )
+            .expect("test preopen must be valid"),
+        );
+        let mut snapshot = WasixSpawnFdSnapshot {
+            descriptors: Preview1DescriptorTable {
+                entries: vec![Some(Preview1DescriptorEntry::new(preopen, false))],
+            },
+            authority,
+            cwd: None,
+        };
+
+        wasix_apply_spawn_fchdir(&mut snapshot, 0).expect("preopen fchdir must succeed");
+        assert_eq!(
+            snapshot
+                .authority
+                .cwd()
+                .expect("fchdir should set child cwd")
+                .guest_name(),
+            "/workspace"
+        );
     }
 
     #[test]
