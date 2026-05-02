@@ -2,8 +2,8 @@
 
 This document captures the exact workflow to stage and run `python`,
 `curl`, the shell artifacts, QuickJS, and the shared coreutils binary.
-`dash`, `bash`, CPython, QuickJS, coreutils commands, and `curl` are
-boot filesystem artifacts recorded in
+`dash`, `bash`, CPython, QuickJS, coreutils commands, `curl`, and the
+Helios WASIX conformance modules are boot filesystem artifacts recorded in
 `tools/wasi-apps/boot-artifacts.toml`.
 
 ## Build Artifacts
@@ -31,6 +31,8 @@ This script:
    checksum plus `SOURCE.txt` provenance files under `artifacts/wasix/`.
 5. Builds the helios `curl-wasi` program from source into
    `artifacts/wasi-tools/`.
+6. Builds the Helios WASIX conformance WAT modules for thread/futex and
+   stack continuation execution into `artifacts/wasix/`.
 
 Artifacts produced:
 
@@ -57,6 +59,16 @@ Artifacts produced:
   `/bin/mkdir`, and `/bin/pwd`.
 - `artifacts/wasix/coreutils/coreutils.wasm.sha256`
 - `artifacts/wasix/coreutils/SOURCE.txt`
+- `artifacts/wasix/thread-futex/thread-futex.wasm` — Helios WASIX
+  conformance module covering `thread_spawn_v2`, `thread_join`,
+  `futex_wait`, `futex_wake`, and `thread_exit`.
+- `artifacts/wasix/thread-futex/thread-futex.wasm.sha256`
+- `artifacts/wasix/thread-futex/SOURCE.txt`
+- `artifacts/wasix/continuation/continuation.wasm` — Helios WASIX
+  conformance module covering `stack_checkpoint`, `stack_restore`, and
+  the asyncify unwind/rewind exports expected by the adapter.
+- `artifacts/wasix/continuation/continuation.wasm.sha256`
+- `artifacts/wasix/continuation/SOURCE.txt`
 - `artifacts/wasi-tools/curl.wasm`
 - `artifacts/wasi-tools/SOURCE.txt`
 - `artifacts/wasi-tools/curl-stripped.wasm`
@@ -259,13 +271,17 @@ Expected output contains:
 - `wasmer/coreutils` is a multi-call WASIX module. Helios records each
   exposed command as its own bootfs path while preserving one source
   artifact and one provenance record.
+- `tools/wasi-apps/wasix-tests/*.wat` are intentionally small Helios-owned
+  conformance modules. They do not replace the real dash/bash/QuickJS/CPython
+  smoke tests; they pin adapter execution behavior for WASIX threads,
+  futexes, and stack continuations.
 
 ## Contract For Future Agents
 
 - Do not remove `tools/wasi-apps/build.sh` or rename output paths
   (`artifacts/python3-root/…`, `artifacts/wasix/dash/…`,
-  `artifacts/wasi-tools/…`) without updating this document and
-  `README.md`.
+  `artifacts/wasix/thread-futex/…`, `artifacts/wasix/continuation/…`,
+  `artifacts/wasi-tools/…`) without updating this document and `README.md`.
 - Keep runtime behavior verified with the inspector `vm` commands above.
 - Do not reintroduce repo-local shell, coreutils, or language stubs. The
   boot shells, coreutils, and QuickJS are standard Wasmer artifacts
