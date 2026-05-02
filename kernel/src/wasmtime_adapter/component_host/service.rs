@@ -2508,20 +2508,6 @@ where
         p1::errno::SUCCESS
     }
 
-    fn authority_with_cwd(&self, path: &str) -> Result<ProcessAuthority, i32> {
-        let cwd = self.resolve_cwd_target(path)?;
-        self.authority_with_resolved_cwd(&cwd)
-    }
-
-    fn authority_with_resolved_cwd(&self, cwd: &Preview1Cwd) -> Result<ProcessAuthority, i32> {
-        let cap = self
-            .derive_cwd_cap(cwd)
-            .map_err(|_| p1::errno::NOTCAPABLE)?;
-        let mut authority = self.authority.clone();
-        authority.chdir(cap);
-        Ok(authority)
-    }
-
     fn derive_cwd_cap(
         &self,
         cwd: &Preview1Cwd,
@@ -9583,7 +9569,7 @@ async fn wasix_proc_spawn<CpuImpl, HostFs>(
     chroot: i32,
     args: u32,
     args_len: u32,
-    _preopen: u32,
+    preopen: u32,
     preopen_len: u32,
     stdin: i32,
     stdout: i32,
@@ -9603,26 +9589,43 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    if chroot != 0 || preopen_len != 0 {
+    if chroot != 0 {
         return p1::errno::NOTSUP;
     }
-    let authority = if working_dir_len == 0 {
-        None
+    let mut authority = if preopen_len == 0 {
+        caller.data().authority.clone()
     } else {
+        let preopen = match wasix_read_exec_string(caller, memory, preopen, preopen_len) {
+            Ok(preopen) => preopen,
+            Err(_) => return p1::errno::FAULT,
+        };
+        match wasix_proc_spawn_preopen_authority(caller.data(), &preopen) {
+            Ok(authority) => authority,
+            Err(errno) => return errno,
+        }
+    };
+    if working_dir_len != 0 {
         let working_dir = match wasix_read_exec_string(caller, memory, working_dir, working_dir_len)
         {
             Ok(working_dir) => working_dir,
             Err(_) => return p1::errno::FAULT,
         };
-        if working_dir.is_empty() || working_dir == "." {
-            None
-        } else {
-            match caller.data().authority_with_cwd(&working_dir) {
-                Ok(authority) => Some(authority),
+        if !working_dir.is_empty() && working_dir != "." {
+            let cwd = match caller.data().resolve_cwd_target(&working_dir) {
+                Ok(cwd) => cwd,
                 Err(errno) => return errno,
-            }
+            };
+            let cap = match authority.derive_directory_cap(
+                &cwd.descriptor.path,
+                &cwd.guest_name,
+                descriptor_flags_to_directory_authority(cwd.descriptor.flags),
+            ) {
+                Ok(cap) => cap,
+                Err(_) => return p1::errno::NOTCAPABLE,
+            };
+            authority.chdir(cap);
         }
-    };
+    }
     let argv = match wasix_read_exec_string(caller, memory, args, args_len) {
         Ok(value) => wasix_split_lines(&value),
         Err(_) => return p1::errno::FAULT,
@@ -9637,7 +9640,7 @@ where
         argv,
         None,
         WasixSpawnIo::from_modes(stdin, stdout, stderr),
-        authority,
+        Some(authority),
         None,
         Vec::new(),
     )
@@ -9647,6 +9650,59 @@ where
         Err(errno) => return errno,
     };
     wasix_write_process_handles(caller, memory, ret_handles, result)
+}
+
+fn wasix_proc_spawn_preopen_authority<CpuImpl, HostFs>(
+    store: &Preview1ProgramStore<CpuImpl, HostFs>,
+    preopen: &str,
+) -> Result<ProcessAuthority, i32>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let mut authority = wasix_proc_spawn_inherited_non_directory_authority(&store.authority);
+    for entry in wasix_split_lines(preopen) {
+        let guest_name = wasix_proc_spawn_preopen_guest_name(store.cwd.as_ref(), &entry)?;
+        let (source_path, flags) = store.resolve_absolute_guest_path(&guest_name)?;
+        let stat = store
+            .filesystem
+            .stat(&source_path)
+            .map_err(p1_errno_from_fs)?;
+        if !matches!(stat.type_, fs_types::DescriptorType::Directory) {
+            return Err(p1::errno::NOTDIR);
+        }
+        let rights = descriptor_flags_to_directory_authority(flags);
+        let preopen = store
+            .authority
+            .derive_directory_preopen(&source_path, &guest_name, rights)
+            .map_err(|_| p1::errno::NOTCAPABLE)?;
+        authority.insert_directory_preopen(preopen);
+    }
+    Ok(authority)
+}
+
+fn wasix_proc_spawn_inherited_non_directory_authority(
+    parent: &ProcessAuthority,
+) -> ProcessAuthority {
+    let mut authority = ProcessAuthority::empty();
+    authority.grant_network_rights(parent.network_rights());
+    authority.grant_clock_rights(parent.clock_rights());
+    authority.grant_terminal_rights(parent.terminal_rights());
+    authority.grant_process_rights(parent.process_rights());
+    authority.grant_link_rights(parent.link_rights());
+    authority
+}
+
+fn wasix_proc_spawn_preopen_guest_name(
+    cwd: Option<&Preview1Cwd>,
+    entry: &str,
+) -> Result<String, i32> {
+    if entry.starts_with('/') {
+        crate::resolve_absolute_path(entry).map_err(p1_errno_from_component_path)
+    } else {
+        let cwd = cwd.ok_or(p1::errno::NOTCAPABLE)?;
+        crate::resolve_child_path(&cwd.guest_name, entry).map_err(p1_errno_from_component_path)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -15088,6 +15144,73 @@ mod tests {
         assert_eq!(table.fdflags(0), Ok(P1_FDFLAG_NONBLOCK));
         assert!(p1_socket_fdflags_supported(P1_FDFLAG_NONBLOCK));
         assert!(!p1_socket_fdflags_supported(P1_FDFLAG_APPEND));
+    }
+
+    #[test]
+    fn proc_spawn_preopen_guest_name_resolves_relative_to_cwd() {
+        let cwd = Preview1Cwd {
+            guest_name: "/workspace".into(),
+            descriptor: FsDescriptor {
+                path: "/mnt/workspace".into(),
+                kind: FsNodeKind::Directory,
+                flags: fs_types::DescriptorFlags::READ,
+                identity: None,
+            },
+        };
+
+        assert_eq!(
+            wasix_proc_spawn_preopen_guest_name(Some(&cwd), "tools").unwrap(),
+            "/workspace/tools"
+        );
+        assert_eq!(
+            wasix_proc_spawn_preopen_guest_name(Some(&cwd), "/bin").unwrap(),
+            "/bin"
+        );
+        assert_eq!(
+            wasix_proc_spawn_preopen_guest_name(Some(&cwd), "../escape"),
+            Err(p1::errno::PERM)
+        );
+        assert_eq!(
+            wasix_proc_spawn_preopen_guest_name(None, "relative"),
+            Err(p1::errno::NOTCAPABLE)
+        );
+    }
+
+    #[test]
+    fn proc_spawn_preopen_authority_inherits_only_non_directory_rights() {
+        let mut parent = ProcessAuthority::empty();
+        parent.insert_directory_preopen(
+            crate::DirectoryPreopen::new(
+                "/workspace",
+                "/workspace",
+                crate::DirectoryAuthorityRights::READ,
+            )
+            .expect("test preopen should be valid"),
+        );
+        parent.grant_network_rights(crate::NetworkAuthorityRights::TCP);
+        parent.grant_clock_rights(crate::ClockAuthorityRights::SET_WALL_CLOCK);
+        parent.grant_terminal_rights(crate::TerminalAuthorityRights::OUTPUT);
+        parent.grant_process_rights(crate::ProcessAuthorityRights::SPAWN);
+        parent.grant_link_rights(crate::LinkAuthorityRights::SYMLINK_READ);
+
+        let child = wasix_proc_spawn_inherited_non_directory_authority(&parent);
+
+        assert!(child.directory_preopens().is_empty());
+        assert_eq!(child.network_rights(), crate::NetworkAuthorityRights::TCP);
+        assert_eq!(
+            child.clock_rights(),
+            crate::ClockAuthorityRights::SET_WALL_CLOCK
+        );
+        assert_eq!(
+            child.terminal_rights(),
+            crate::TerminalAuthorityRights::OUTPUT
+        );
+        assert_eq!(child.process_rights(), crate::ProcessAuthorityRights::SPAWN);
+        assert_eq!(
+            child.link_rights(),
+            crate::LinkAuthorityRights::SYMLINK_READ
+        );
+        assert!(parent.contains_authority(&child));
     }
 
     #[test]
