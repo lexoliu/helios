@@ -12982,7 +12982,8 @@ where
 {
     if timeout < 0 {
         if targets.is_empty() {
-            return Err(p1::errno::NOTSUP);
+            core::future::pending::<()>().await;
+            return Ok(());
         }
         core::future::poll_fn(|cx| poll_epoll_wait_targets(&mut targets, cx)).await;
         return Ok(());
