@@ -46,6 +46,8 @@ const DEFAULT_WASIX_SOCKET_TTL: u64 = 64;
 const DEFAULT_WASIX_SOCKET_MULTICAST_TTL: u64 = 1;
 const WASIX_IPPROTO_TCP: u64 = 6;
 const WASIX_IPPROTO_UDP: u64 = 17;
+const WASIX_IPPROTO_TCP_I32: i32 = 6;
+const WASIX_IPPROTO_UDP_I32: i32 = 17;
 
 fn system_component_profile_stack(component_name: &str) -> String {
     let mut stack = String::with_capacity(
@@ -3478,11 +3480,13 @@ where
             WASIX_MODULE,
             "sock_open",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             _af: i32,
+             af: i32,
              socktype: i32,
-             _proto: i32,
+             proto: i32,
              ret_fd: i32|
-             -> i32 { wasix_sock_open(&mut caller, socktype, ret_fd as u32) },
+             -> i32 {
+                wasix_sock_open(&mut caller, af, socktype, proto, ret_fd as u32)
+            },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -3490,13 +3494,20 @@ where
             WASIX_MODULE,
             "sock_pair",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             _af: i32,
+             af: i32,
              socktype: i32,
-             _proto: i32,
+             proto: i32,
              ret_fd0: i32,
              ret_fd1: i32|
              -> i32 {
-                wasix_sock_pair(&mut caller, socktype, ret_fd0 as u32, ret_fd1 as u32)
+                wasix_sock_pair(
+                    &mut caller,
+                    af,
+                    socktype,
+                    proto,
+                    ret_fd0 as u32,
+                    ret_fd1 as u32,
+                )
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -10231,15 +10242,51 @@ where
     }
 }
 
+fn wasix_validate_network_socket_request(af: i32, socktype: i32, proto: i32) -> Result<(), i32> {
+    match af {
+        WASIX_ADDRESS_FAMILY_UNSPEC_I32 | WASIX_ADDRESS_FAMILY_IP_INET4_I32 => {}
+        WASIX_ADDRESS_FAMILY_IP_INET6_I32 | WASIX_ADDRESS_FAMILY_UNIX_I32 => {
+            return Err(p1::errno::NOTSUP);
+        }
+        _ => return Err(p1::errno::INVAL),
+    }
+    match socktype {
+        WASIX_SOCK_TYPE_STREAM if proto == 0 || proto == WASIX_IPPROTO_TCP_I32 => Ok(()),
+        WASIX_SOCK_TYPE_DGRAM if proto == 0 || proto == WASIX_IPPROTO_UDP_I32 => Ok(()),
+        WASIX_SOCK_TYPE_STREAM | WASIX_SOCK_TYPE_DGRAM => Err(p1::errno::INVAL),
+        _ => Err(p1::errno::INVAL),
+    }
+}
+
+fn wasix_validate_socket_pair_request(af: i32, socktype: i32, proto: i32) -> Result<(), i32> {
+    match af {
+        WASIX_ADDRESS_FAMILY_UNSPEC_I32 | WASIX_ADDRESS_FAMILY_UNIX_I32 => {}
+        WASIX_ADDRESS_FAMILY_IP_INET4_I32 | WASIX_ADDRESS_FAMILY_IP_INET6_I32 => {
+            return Err(p1::errno::NOTSUP);
+        }
+        _ => return Err(p1::errno::INVAL),
+    }
+    match socktype {
+        WASIX_SOCK_TYPE_STREAM | WASIX_SOCK_TYPE_DGRAM if proto == 0 => Ok(()),
+        WASIX_SOCK_TYPE_STREAM | WASIX_SOCK_TYPE_DGRAM => Err(p1::errno::INVAL),
+        _ => Err(p1::errno::INVAL),
+    }
+}
+
 fn wasix_sock_open<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    af: i32,
     socktype: i32,
+    proto: i32,
     ret_fd: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
+    if let Err(errno) = wasix_validate_network_socket_request(af, socktype, proto) {
+        return errno;
+    }
     let status = match socktype {
         WASIX_SOCK_TYPE_STREAM => caller.data().require_tcp_authority(),
         WASIX_SOCK_TYPE_DGRAM => caller.data().require_udp_authority(),
@@ -10276,7 +10323,9 @@ where
 
 fn wasix_sock_pair<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    af: i32,
     socktype: i32,
+    proto: i32,
     ret_fd0: u32,
     ret_fd1: u32,
 ) -> i32
@@ -10284,13 +10333,8 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    let status = match socktype {
-        WASIX_SOCK_TYPE_STREAM => caller.data().require_tcp_authority(),
-        WASIX_SOCK_TYPE_DGRAM => caller.data().require_udp_authority(),
-        _ => return p1::errno::INVAL,
-    };
-    if status != p1::errno::SUCCESS {
-        return status;
+    if let Err(errno) = wasix_validate_socket_pair_request(af, socktype, proto) {
+        return errno;
     }
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
@@ -12495,6 +12539,10 @@ const WASIX_ADDRESS_FAMILY_UNSPEC: u8 = 0;
 const WASIX_ADDRESS_FAMILY_IP_INET4: u8 = 1;
 const WASIX_ADDRESS_FAMILY_IP_INET6: u8 = 2;
 const WASIX_ADDRESS_FAMILY_UNIX: u8 = 3;
+const WASIX_ADDRESS_FAMILY_UNSPEC_I32: i32 = 0;
+const WASIX_ADDRESS_FAMILY_IP_INET4_I32: i32 = 1;
+const WASIX_ADDRESS_FAMILY_IP_INET6_I32: i32 = 2;
+const WASIX_ADDRESS_FAMILY_UNIX_I32: i32 = 3;
 const WASIX_ADDR_IP_UNION_OFFSET: u32 = 2;
 const WASIX_ADDR_IP_SIZE: u32 = 18;
 const WASIX_ADDR_PORT_UNION_OFFSET: u32 = 2;
@@ -12909,6 +12957,66 @@ mod tests {
         assert_eq!(wasix_sock_recv_authority(None), Err(p1::errno::BADF));
         assert_eq!(wasix_sock_send_authority(None), Err(p1::errno::BADF));
         assert_eq!(wasix_sock_listen_authority(None), Err(p1::errno::BADF));
+    }
+
+    #[test]
+    fn wasix_socket_creation_validates_family_and_protocol() {
+        assert_eq!(
+            wasix_validate_network_socket_request(
+                WASIX_ADDRESS_FAMILY_IP_INET4_I32,
+                WASIX_SOCK_TYPE_STREAM,
+                WASIX_IPPROTO_TCP_I32,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            wasix_validate_network_socket_request(
+                WASIX_ADDRESS_FAMILY_UNSPEC_I32,
+                WASIX_SOCK_TYPE_DGRAM,
+                0,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            wasix_validate_network_socket_request(
+                WASIX_ADDRESS_FAMILY_UNIX_I32,
+                WASIX_SOCK_TYPE_STREAM,
+                0,
+            ),
+            Err(p1::errno::NOTSUP)
+        );
+        assert_eq!(
+            wasix_validate_network_socket_request(
+                WASIX_ADDRESS_FAMILY_IP_INET4_I32,
+                WASIX_SOCK_TYPE_STREAM,
+                WASIX_IPPROTO_UDP_I32,
+            ),
+            Err(p1::errno::INVAL)
+        );
+        assert_eq!(
+            wasix_validate_socket_pair_request(
+                WASIX_ADDRESS_FAMILY_UNIX_I32,
+                WASIX_SOCK_TYPE_STREAM,
+                0,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            wasix_validate_socket_pair_request(
+                WASIX_ADDRESS_FAMILY_IP_INET4_I32,
+                WASIX_SOCK_TYPE_STREAM,
+                0,
+            ),
+            Err(p1::errno::NOTSUP)
+        );
+        assert_eq!(
+            wasix_validate_socket_pair_request(
+                WASIX_ADDRESS_FAMILY_UNIX_I32,
+                WASIX_SOCK_TYPE_DGRAM,
+                WASIX_IPPROTO_UDP_I32,
+            ),
+            Err(p1::errno::INVAL)
+        );
     }
 
     #[test]
