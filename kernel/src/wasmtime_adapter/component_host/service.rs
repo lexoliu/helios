@@ -12432,9 +12432,18 @@ where
     let Some(service) = caller.data().runtime_state.network_service() else {
         return p1::errno::NETDOWN;
     };
-    let accepted = match service.tcp_accept(listener, u64::MAX).await {
+    let fdflags = match caller.data().descriptors.fdflags(fd) {
+        Ok(fdflags) => fdflags,
+        Err(errno) => return errno,
+    };
+    let timeout = if p1_fdflags_nonblocking(fdflags) {
+        0
+    } else {
+        u64::MAX
+    };
+    let accepted = match service.tcp_accept(listener, timeout).await {
         Ok(accepted) => accepted,
-        Err(error) => return p1_errno_from_tcp_error(error),
+        Err(error) => return p1_errno_from_tcp_error_for_fdflags(error, fdflags),
     };
     let descriptor =
         Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
