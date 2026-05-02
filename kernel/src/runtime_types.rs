@@ -476,6 +476,11 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Option<Vec<u8>>, TcpError>> + Send + 'a;
 
+    fn tcp_shutdown_send(
+        &self,
+        stream: Self::TcpStream,
+    ) -> impl Future<Output = Result<(), TcpError>> + Send + '_;
+
     fn tcp_close(&self, stream: Self::TcpStream) -> impl Future<Output = ()> + Send + '_;
 
     fn udp_bind(

@@ -89,6 +89,14 @@ where
         self.service.tcp_read(stream, max_bytes, timeout_nanos)
     }
 
+    pub fn tcp_shutdown_send(
+        &self,
+        _: TcpCap,
+        stream: Service::TcpStream,
+    ) -> impl Future<Output = Result<(), crate::TcpError>> + Send + '_ {
+        self.service.tcp_shutdown_send(stream)
+    }
+
     pub fn tcp_close(
         &self,
         _: TcpCap,
@@ -267,6 +275,13 @@ mod tests {
             _: u64,
         ) -> impl Future<Output = Result<Option<Vec<u8>>, TcpError>> + Send + '_ {
             core::future::ready(Ok(None))
+        }
+
+        fn tcp_shutdown_send(
+            &self,
+            _: Self::TcpStream,
+        ) -> impl Future<Output = Result<(), TcpError>> + Send + '_ {
+            core::future::ready(Ok(()))
         }
 
         fn tcp_close(&self, _: Self::TcpStream) -> impl Future<Output = ()> + Send + '_ {

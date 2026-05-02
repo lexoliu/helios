@@ -1896,13 +1896,6 @@ where
     }
 }
 
-type P2SocketErrorCode = p2net::ErrorCode;
-type P2SocketResult<T> = core::result::Result<T, P2SocketErrorCode>;
-
-fn socket_not_supported<T>() -> Result<P2SocketResult<T>> {
-    Ok(Err(P2SocketErrorCode::NotSupported))
-}
-
 fn delete_resource<R: 'static, CpuImpl, HostFs>(
     store: &mut StoreData<CpuImpl, HostFs>,
     resource: Resource<R>,
@@ -2908,17 +2901,35 @@ where
         shutdown_type: p2tcp::ShutdownType,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
         match shutdown_type {
-            p2tcp::ShutdownType::Both => {
+            p2tcp::ShutdownType::Receive => {
                 let socket = self.table.get(&socket)?.clone();
-                let Some((service, stream)) = socket.take_connected_stream() else {
-                    return Ok(Err(p2tcp::ErrorCode::InvalidState));
+                Ok(socket.shutdown_receive().map_err(map_p2_tcp_socket_error))
+            }
+            p2tcp::ShutdownType::Send => {
+                let socket = self.table.get(&socket)?.clone();
+                let (service, stream) = match socket.shutdown_send_state() {
+                    Ok(value) => value,
+                    Err(error) => return Ok(Err(map_p2_tcp_socket_error(error))),
                 };
                 self.spawner().spawn_detached(async move {
-                    service.tcp_close(stream).await;
+                    let _ = service.tcp_shutdown_send(stream).await;
                 });
                 Ok(Ok(()))
             }
-            p2tcp::ShutdownType::Receive | p2tcp::ShutdownType::Send => socket_not_supported(),
+            p2tcp::ShutdownType::Both => {
+                let socket = self.table.get(&socket)?.clone();
+                if let Err(error) = socket.shutdown_receive() {
+                    return Ok(Err(map_p2_tcp_socket_error(error)));
+                }
+                let (service, stream) = match socket.shutdown_send_state() {
+                    Ok(value) => value,
+                    Err(error) => return Ok(Err(map_p2_tcp_socket_error(error))),
+                };
+                self.spawner().spawn_detached(async move {
+                    let _ = service.tcp_shutdown_send(stream).await;
+                });
+                Ok(Ok(()))
+            }
         }
     }
 

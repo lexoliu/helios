@@ -146,6 +146,7 @@ enum NetworkRequest {
     TcpAccept(TcpAcceptRequest),
     TcpWrite(TcpWriteRequest),
     TcpRead(TcpReadRequest),
+    TcpShutdownSend(TcpShutdownSendRequest),
     TcpClose(TcpCloseRequest),
     UdpBind(UdpBindRequest),
     UdpSend(UdpSendRequest),
@@ -198,6 +199,11 @@ struct TcpReadRequest {
     max_bytes: u32,
     timeout_nanos: u64,
     response: RequestResponse<Result<Option<Vec<u8>>, TcpError>>,
+}
+
+struct TcpShutdownSendRequest {
+    stream: TcpStreamId,
+    response: RequestResponse<Result<(), TcpError>>,
 }
 
 struct TcpCloseRequest {
@@ -478,6 +484,15 @@ where
         response.wait().await
     }
 
+    pub async fn tcp_shutdown_send(&self, stream: TcpStreamId) -> Result<(), TcpError> {
+        let response = RequestResponse::new();
+        self.enqueue_request(NetworkRequest::TcpShutdownSend(TcpShutdownSendRequest {
+            stream,
+            response: response.clone(),
+        }));
+        response.wait().await
+    }
+
     pub async fn tcp_close(&self, stream: TcpStreamId) {
         let response = RequestResponse::new();
         self.enqueue_request(NetworkRequest::TcpClose(TcpCloseRequest {
@@ -625,6 +640,10 @@ where
                     let result = self
                         .execute_tcp_read(request.stream, request.max_bytes, request.timeout_nanos)
                         .await;
+                    request.response.complete(result).await;
+                }
+                NetworkRequest::TcpShutdownSend(request) => {
+                    let result = self.execute_tcp_shutdown_send(request.stream).await;
                     request.response.complete(result).await;
                 }
                 NetworkRequest::TcpClose(request) => {
@@ -881,6 +900,14 @@ where
             };
             self.wait_for_progress(next_wait).await;
         }
+    }
+
+    async fn execute_tcp_shutdown_send(&self, stream: TcpStreamId) -> Result<(), TcpError> {
+        {
+            let mut state = self.inner.state.lock().await;
+            state.shutdown_tcp_send(stream)?;
+        }
+        self.drive_tcp().await
     }
 
     async fn execute_udp_bind(&self, local_port: u16) -> Result<UdpBinding<UdpSocketId>, UdpError> {
@@ -1391,6 +1418,13 @@ where
         timeout_nanos: u64,
     ) -> impl core::future::Future<Output = Result<Option<Vec<u8>>, TcpError>> + Send + 'a {
         async move { NetworkService::tcp_read(self, stream, max_bytes, timeout_nanos).await }
+    }
+
+    fn tcp_shutdown_send(
+        &self,
+        stream: Self::TcpStream,
+    ) -> impl core::future::Future<Output = Result<(), TcpError>> + Send + '_ {
+        async move { NetworkService::tcp_shutdown_send(self, stream).await }
     }
 
     fn tcp_close(
@@ -2005,6 +2039,12 @@ impl NetworkState {
             }),
             _ => Ok(TcpReadProgress::Eof),
         }
+    }
+
+    fn shutdown_tcp_send(&mut self, stream: TcpStreamId) -> Result<(), TcpError> {
+        let socket = self.tcp_socket_mut(stream)?;
+        socket.close();
+        Ok(())
     }
 
     fn start_udp_bind(&mut self, local_port: u16) -> Result<UdpBinding<UdpSocketId>, UdpError> {

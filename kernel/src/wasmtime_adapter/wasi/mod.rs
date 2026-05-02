@@ -260,6 +260,8 @@ struct TcpSocketState {
     listener: Option<u64>,
     local_address: Option<WasiTcpSocketAddress>,
     remote_address: Option<WasiTcpSocketAddress>,
+    receive_shutdown: bool,
+    send_shutdown: bool,
     connect_in_progress: bool,
     connect_result: Option<core::result::Result<(), crate::TcpError>>,
     listen_in_progress: bool,
@@ -414,6 +416,8 @@ impl TcpSocket {
                 listener: None,
                 local_address: None,
                 remote_address: None,
+                receive_shutdown: false,
+                send_shutdown: false,
                 connect_in_progress: false,
                 connect_result: None,
                 listen_in_progress: false,
@@ -448,6 +452,8 @@ impl TcpSocket {
                 listener: None,
                 local_address: Some(local_address),
                 remote_address: Some(remote_address),
+                receive_shutdown: false,
+                send_shutdown: false,
                 connect_in_progress: false,
                 connect_result: None,
                 listen_in_progress: false,
@@ -666,12 +672,17 @@ impl TcpSocket {
         let mut state = self.inner.lock();
         state.stream = Some(stream);
         state.remote_address = Some(remote_address);
+        state.receive_shutdown = false;
+        state.send_shutdown = false;
         Ok(())
     }
 
     async fn write_all(&self, bytes: &[u8]) -> core::result::Result<(), socket_types::ErrorCode> {
         if bytes.is_empty() {
             return Ok(());
+        }
+        if self.inner.lock().send_shutdown {
+            return Err(socket_types::ErrorCode::InvalidState);
         }
         let (service, stream) = self.connected_stream()?;
         service
@@ -684,6 +695,9 @@ impl TcpSocket {
         &self,
         max_bytes: u32,
     ) -> core::result::Result<Option<Vec<u8>>, socket_types::ErrorCode> {
+        if self.inner.lock().receive_shutdown {
+            return Ok(None);
+        }
         let (service, stream) = self.connected_stream()?;
         service
             .tcp_read(stream, max_bytes, u64::MAX)
@@ -705,6 +719,27 @@ impl TcpSocket {
             .stream
             .take()
             .map(|stream| (state.service.clone(), stream))
+    }
+
+    fn shutdown_receive(&self) -> core::result::Result<(), socket_types::ErrorCode> {
+        let mut state = self.inner.lock();
+        if state.stream.is_none() {
+            return Err(socket_types::ErrorCode::InvalidState);
+        }
+        state.receive_shutdown = true;
+        Ok(())
+    }
+
+    fn shutdown_send_state(
+        &self,
+    ) -> core::result::Result<(ComponentHostNetworkService, u64), socket_types::ErrorCode> {
+        let mut state = self.inner.lock();
+        let stream = state.stream.ok_or(socket_types::ErrorCode::InvalidState)?;
+        if state.send_shutdown {
+            return Ok((state.service.clone(), stream));
+        }
+        state.send_shutdown = true;
+        Ok((state.service.clone(), stream))
     }
 }
 
@@ -5494,6 +5529,13 @@ mod tests {
             core::future::ready(Ok(Some(vec![4, 2])))
         }
 
+        fn tcp_shutdown_send(
+            &self,
+            _: Self::TcpStream,
+        ) -> impl core::future::Future<Output = Result<(), crate::TcpError>> + Send + '_ {
+            core::future::ready(Ok(()))
+        }
+
         fn tcp_close(
             &self,
             _: Self::TcpStream,
@@ -6405,6 +6447,48 @@ mod tests {
         assert_eq!(socket.keep_alive_idle_time().unwrap(), 11);
         assert_eq!(socket.keep_alive_interval().unwrap(), 13);
         assert_eq!(socket.keep_alive_count().unwrap(), 3);
+    }
+
+    #[test]
+    fn tcp_socket_shutdown_directions_are_idempotent_local_state() {
+        let service = ComponentHostNetworkService::from_service(TestNetworkService);
+        let socket = TcpSocket::accepted(
+            service,
+            WasiTcpSocketFamily::Ipv4,
+            7,
+            WasiTcpSocketAddress {
+                address: crate::Ipv4Address::new([127, 0, 0, 1]),
+                port: 8080,
+            },
+            WasiTcpSocketAddress {
+                address: crate::Ipv4Address::new([127, 0, 0, 1]),
+                port: 4040,
+            },
+        );
+
+        socket
+            .shutdown_receive()
+            .expect("connected receive shutdown must be accepted");
+        socket
+            .shutdown_receive()
+            .expect("receive shutdown must be idempotent");
+        assert_eq!(
+            block_on(socket.read(8)).expect("receive shutdown read must succeed"),
+            None
+        );
+
+        let (_, stream) = socket
+            .shutdown_send_state()
+            .expect("connected send shutdown must be accepted");
+        assert_eq!(stream, 7);
+        let (_, stream) = socket
+            .shutdown_send_state()
+            .expect("send shutdown must be idempotent");
+        assert_eq!(stream, 7);
+        assert!(matches!(
+            block_on(socket.write_all(b"x")),
+            Err(socket_types::ErrorCode::InvalidState)
+        ));
     }
 
     #[test]

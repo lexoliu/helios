@@ -109,6 +109,11 @@ trait DynComponentHostNetworkService: Send + Sync + 'static {
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, TcpError>> + Send + 'a>>;
 
+    fn tcp_shutdown_send<'a>(
+        &'a self,
+        stream: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TcpError>> + Send + 'a>>;
+
     fn tcp_close<'a>(&'a self, stream: u64) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
     fn udp_bind<'a>(
@@ -236,6 +241,13 @@ impl ComponentNetworkService for ComponentHostNetworkService {
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Option<Vec<u8>>, TcpError>> + Send + '_ {
         self.inner.tcp_read(stream, max_bytes, timeout_nanos)
+    }
+
+    fn tcp_shutdown_send(
+        &self,
+        stream: Self::TcpStream,
+    ) -> impl Future<Output = Result<(), TcpError>> + Send + '_ {
+        self.inner.tcp_shutdown_send(stream)
     }
 
     fn tcp_close(&self, stream: Self::TcpStream) -> impl Future<Output = ()> + Send + '_ {
@@ -402,6 +414,19 @@ where
                     <Service::TcpStream as ComponentHostTcpStreamToken>::from_raw(stream),
                     max_bytes,
                     timeout_nanos,
+                )
+                .await
+        })
+    }
+
+    fn tcp_shutdown_send<'a>(
+        &'a self,
+        stream: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TcpError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.service
+                .tcp_shutdown_send(
+                    <Service::TcpStream as ComponentHostTcpStreamToken>::from_raw(stream),
                 )
                 .await
         })
