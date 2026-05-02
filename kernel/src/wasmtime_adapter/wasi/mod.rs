@@ -6837,6 +6837,23 @@ mod tests {
     }
 
     #[test]
+    fn readlink_payload_validation_rejects_host_absolute_and_parent_escape() {
+        assert!(matches!(
+            super::resolve_symlink_payload("/host/link", "/Users/lexoliu/private"),
+            Err(fs_types::ErrorCode::NotPermitted)
+        ));
+        assert!(matches!(
+            super::resolve_symlink_payload("/host/link", "share/../../private"),
+            Err(fs_types::ErrorCode::NotPermitted)
+        ));
+        assert_eq!(
+            super::resolve_symlink_payload("/host/link", "share/target")
+                .expect("confined relative payload should resolve"),
+            "/host/share/target"
+        );
+    }
+
+    #[test]
     fn symlink_rejects_rooted_and_parent_escape_payloads() {
         let mut filesystem = test_filesystem();
         let root = filesystem.root_descriptor();
