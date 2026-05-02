@@ -42,6 +42,7 @@ const WASIX_STACK_SNAPSHOT_SIZE: usize = 24;
 const WASIX_THREAD_START_SIZE: usize = 64;
 const WASIX_NO_PENDING_SIGNAL: u32 = u32::MAX;
 const WASIX_MODULE: &str = "wasix_32v1";
+const WASIX_NULL_DEVICE_PATH: &str = "/dev/null";
 const DEFAULT_WASIX_SOCKET_BUFFER_BYTES: u64 = 64 * 1024;
 const DEFAULT_WASIX_SOCKET_LOW_WATER_BYTES: u64 = 1;
 const DEFAULT_WASIX_SOCKET_TTL: u64 = 64;
@@ -562,6 +563,7 @@ enum Preview1Descriptor {
         offset: u64,
         fdflags: u16,
     },
+    NullDevice,
     Socket(WasixSocketDescriptor),
     Epoll(EpollDescriptor),
 }
@@ -7278,6 +7280,7 @@ where
         Preview1Descriptor::Event(_) | Preview1Descriptor::Epoll(_) => 2,
         Preview1Descriptor::Preopen { .. } => 3,
         Preview1Descriptor::File { descriptor, .. } => p1_filetype(descriptor.kind),
+        Preview1Descriptor::NullDevice => 2,
         Preview1Descriptor::Socket(_) => 6,
     };
     let fdflags = caller.data().descriptors.fdflags(fd).unwrap_or(0);
@@ -7301,7 +7304,9 @@ where
     HostFs: crate::HostFileSystem,
 {
     match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::File { .. }) if p1_file_fdflags_supported(fdflags) => {
+        Some(Preview1Descriptor::File { .. } | Preview1Descriptor::NullDevice)
+            if p1_file_fdflags_supported(fdflags) =>
+        {
             caller.data_mut().descriptors.set_fdflags(fd, fdflags)
         }
         Some(Preview1Descriptor::Socket(_)) if p1_socket_fdflags_supported(fdflags) => {
@@ -7352,6 +7357,12 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
+    if matches!(
+        caller.data().descriptors.get(fd),
+        Some(Preview1Descriptor::NullDevice)
+    ) {
+        return p1_write_filestat(caller, stat, p1_null_device_stat());
+    }
     let Some(path) = p1_descriptor_path(caller.data().descriptors.get(fd)) else {
         return p1::errno::BADF;
     };
@@ -8003,6 +8014,21 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
+    match p1_open_null_device(&base, &path, open_flags) {
+        Ok(true) => {
+            let fd = match caller
+                .data_mut()
+                .descriptors
+                .insert(Preview1Descriptor::NullDevice)
+            {
+                Ok(fd) => fd,
+                Err(errno) => return errno,
+            };
+            return p1_write_u32(caller, memory, opened_fd, fd);
+        }
+        Ok(false) => {}
+        Err(errno) => return errno,
+    }
     let opened = match p1_open_descriptor_resolved(
         caller,
         &base,
@@ -8028,6 +8054,27 @@ where
         Err(errno) => return errno,
     };
     p1_write_u32(caller, memory, opened_fd, fd)
+}
+
+fn p1_open_null_device(
+    base: &FsDescriptor,
+    path: &str,
+    open_flags: fs_types::OpenFlags,
+) -> Result<bool, i32> {
+    let absolute =
+        crate::resolve_child_path(&base.path, path).map_err(p1_errno_from_component_path)?;
+    if absolute != WASIX_NULL_DEVICE_PATH {
+        return Ok(false);
+    }
+    if open_flags.contains(fs_types::OpenFlags::DIRECTORY) {
+        return Err(p1::errno::NOTDIR);
+    }
+    if open_flags.contains(fs_types::OpenFlags::CREATE)
+        && open_flags.contains(fs_types::OpenFlags::EXCLUSIVE)
+    {
+        return Err(p1::errno::EXIST);
+    }
+    Ok(true)
 }
 
 async fn p1_open_descriptor_resolved<CpuImpl, HostFs>(
@@ -8346,6 +8393,9 @@ where
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
+    if absolute == WASIX_NULL_DEVICE_PATH {
+        return p1_write_filestat(caller, stat, p1_null_device_stat());
+    }
     let stat_value = if let Some(host_path) = crate::guest_host_share_path(&absolute) {
         let service = match caller.data().filesystem.host_service() {
             Ok(service) => service,
@@ -8457,6 +8507,9 @@ where
         Ok(absolute) => absolute,
         Err(error) => return p1_errno_from_component_path(error),
     };
+    if absolute == WASIX_NULL_DEVICE_PATH {
+        return p1_write_filestat(caller, stat, p1_null_device_stat());
+    }
     let stat_value = if let Some(host_path) = crate::guest_host_share_path(&absolute) {
         let service = match caller.data().filesystem.host_service() {
             Ok(service) => service,
@@ -10170,7 +10223,10 @@ where
                 let child = caller.data_mut().children.swap_remove(index);
                 wasix_write_join_exit(caller, memory, pid, ret_status, child.pid, code)
             }
-            Ok(None) => wasix_write_join_nothing(caller, memory, ret_status),
+            Ok(None) => {
+                crate::yield_now().await;
+                wasix_write_join_nothing(caller, memory, ret_status)
+            }
             Err(errno) => errno,
         }
     } else {
@@ -15136,6 +15192,9 @@ where
             event.write(increment)?;
             Ok(8)
         }
+        Some(Preview1Descriptor::NullDevice) => {
+            u32::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW)
+        }
         Some(Preview1Descriptor::File { .. }) => {
             let Some(Preview1Descriptor::File {
                 descriptor,
@@ -15234,6 +15293,7 @@ where
             }
             Ok(event.read().await.to_le_bytes().to_vec())
         }
+        Some(Preview1Descriptor::NullDevice) => Ok(Vec::new()),
         Some(Preview1Descriptor::File {
             descriptor, offset, ..
         }) => {
@@ -15346,6 +15406,13 @@ fn p1_descriptor_rights(descriptor: &Preview1Descriptor) -> u64 {
         Preview1Descriptor::Event(_) => {
             P1_RIGHT_FD_READ | P1_RIGHT_FD_WRITE | P1_RIGHT_POLL_FD_READWRITE
         }
+        Preview1Descriptor::NullDevice => {
+            P1_RIGHT_FD_READ
+                | P1_RIGHT_FD_WRITE
+                | P1_RIGHT_FD_FDSTAT_SET_FLAGS
+                | P1_RIGHT_FD_FILESTAT_GET
+                | P1_RIGHT_POLL_FD_READWRITE
+        }
         Preview1Descriptor::Epoll(_) => P1_RIGHT_FD_READ | P1_RIGHT_POLL_FD_READWRITE,
         Preview1Descriptor::Socket(_) => {
             P1_RIGHT_FD_READ | P1_RIGHT_FD_WRITE | P1_RIGHT_POLL_FD_READWRITE
@@ -15409,6 +15476,17 @@ fn p1_descriptor_path(descriptor: Option<&Preview1Descriptor>) -> Option<&str> {
     }
 }
 
+fn p1_null_device_stat() -> fs_types::DescriptorStat {
+    fs_types::DescriptorStat {
+        type_: fs_types::DescriptorType::CharacterDevice,
+        link_count: 1,
+        size: 0,
+        data_access_timestamp: None,
+        data_modification_timestamp: None,
+        status_change_timestamp: None,
+    }
+}
+
 fn p1_directory_descriptor(descriptor: Option<&Preview1Descriptor>) -> Option<&FsDescriptor> {
     match descriptor {
         Some(Preview1Descriptor::Preopen { descriptor, .. })
@@ -15434,6 +15512,7 @@ fn p1_poll_descriptor(descriptor: Option<&Preview1Descriptor>, event_type: u8) -
         (Some(Preview1Descriptor::Event(event)), P1_EVENTTYPE_FD_READ) => {
             Ok(u64::from(event.is_readable()) * 8)
         }
+        (Some(Preview1Descriptor::NullDevice), P1_EVENTTYPE_FD_READ) => Ok(0),
         (
             Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { reader, carry, .. })),
             P1_EVENTTYPE_FD_READ,
@@ -15448,6 +15527,7 @@ fn p1_poll_descriptor(descriptor: Option<&Preview1Descriptor>, event_type: u8) -
         | (Some(Preview1Descriptor::Stderr), P1_EVENTTYPE_FD_WRITE)
         | (Some(Preview1Descriptor::PipeWrite { .. }), P1_EVENTTYPE_FD_WRITE)
         | (Some(Preview1Descriptor::Event(_)), P1_EVENTTYPE_FD_WRITE)
+        | (Some(Preview1Descriptor::NullDevice), P1_EVENTTYPE_FD_WRITE)
         | (Some(Preview1Descriptor::Socket(_)), P1_EVENTTYPE_FD_WRITE) => Ok(usize::MAX as u64),
         (
             Some(Preview1Descriptor::File { .. }) | Some(Preview1Descriptor::Socket(_)),
@@ -16020,6 +16100,59 @@ mod tests {
             None
         );
         assert_eq!(wasix_search_path_candidate(None, "bin", "dash"), None);
+    }
+
+    #[test]
+    fn null_device_open_is_confined_to_authorized_path_resolution() {
+        let root = FsDescriptor {
+            path: "/".into(),
+            kind: FsNodeKind::Directory,
+            flags: fs_types::DescriptorFlags::READ,
+            identity: None,
+        };
+        let work = FsDescriptor {
+            path: "/work".into(),
+            kind: FsNodeKind::Directory,
+            flags: fs_types::DescriptorFlags::READ,
+            identity: None,
+        };
+
+        assert_eq!(
+            p1_open_null_device(&root, "dev/null", fs_types::OpenFlags::empty()),
+            Ok(true)
+        );
+        assert_eq!(
+            p1_open_null_device(&work, "dev/null", fs_types::OpenFlags::empty()),
+            Ok(false)
+        );
+        assert_eq!(
+            p1_open_null_device(&root, "dev/null", fs_types::OpenFlags::DIRECTORY),
+            Err(p1::errno::NOTDIR)
+        );
+        assert_eq!(
+            p1_open_null_device(
+                &root,
+                "dev/null",
+                fs_types::OpenFlags::CREATE | fs_types::OpenFlags::EXCLUSIVE
+            ),
+            Err(p1::errno::EXIST)
+        );
+    }
+
+    #[test]
+    fn null_device_rights_and_stat_match_character_device_semantics() {
+        let rights = p1_descriptor_rights(&Preview1Descriptor::NullDevice);
+        assert_ne!(rights & P1_RIGHT_FD_READ, 0);
+        assert_ne!(rights & P1_RIGHT_FD_WRITE, 0);
+        assert_ne!(rights & P1_RIGHT_POLL_FD_READWRITE, 0);
+        assert!(matches!(
+            p1_null_device_stat().type_,
+            fs_types::DescriptorType::CharacterDevice
+        ));
+        assert_eq!(
+            p1_poll_descriptor(Some(&Preview1Descriptor::NullDevice), P1_EVENTTYPE_FD_WRITE),
+            Ok(usize::MAX as u64)
+        );
     }
 
     #[test]

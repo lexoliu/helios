@@ -141,6 +141,8 @@ run_smoke \
 
 run_smoke \
     dash-process \
+    bg:ok \
+    done:ok \
     sub:ok \
     pipe:ok \
     -- \
@@ -151,7 +153,7 @@ run_smoke \
     --no-compiler-plugin \
     shell \
     -c \
-    '/bin/mkdir /dp; echo pipe:ok > /dp/in; /bin/dash -c "(echo sub:ok); /bin/cat /dp/in | /bin/cat"'
+    '/bin/mkdir /dp; echo pipe:ok > /dp/in; /bin/dash -c "echo bg:ok & wait; echo done:ok; (echo sub:ok); /bin/cat /dp/in | /bin/cat"'
 
 run_smoke \
     bash-coreutils \
