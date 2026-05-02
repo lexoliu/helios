@@ -18,7 +18,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use bytes::Bytes;
 use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 
-use crate::Notify;
+use crate::{Notify, NotifyWaiter};
 
 /// A single byte-stream channel, closable from both ends. Producers push
 /// reference-counted byte chunks; consumers await and receive the same chunks
@@ -91,6 +91,10 @@ pub struct ByteReader {
     _liveness: Arc<ReaderLiveness>,
 }
 
+pub struct ByteReadWait {
+    readable: NotifyWaiter,
+}
+
 pub fn byte_channel() -> (ByteWriter, ByteReader) {
     let channel = ByteChannel::new();
     (
@@ -142,6 +146,12 @@ impl ByteWriter {
 }
 
 impl ByteReader {
+    pub fn wait_state(&self) -> ByteReadWait {
+        ByteReadWait {
+            readable: self.channel.readable.waiter(),
+        }
+    }
+
     /// Await the next chunk. Returns `None` when every writer has been
     /// dropped and the queue is drained (EOF).
     pub async fn read(&self) -> Option<Bytes> {
@@ -176,6 +186,28 @@ impl ByteReader {
             }
         }
     }
+
+    pub fn poll_read(
+        &self,
+        cx: &mut core::task::Context<'_>,
+        wait: &mut ByteReadWait,
+    ) -> core::task::Poll<Option<Bytes>> {
+        loop {
+            match self.channel.queue.pop() {
+                Ok(bytes) => return core::task::Poll::Ready(Some(bytes)),
+                Err(PopError::Closed) => return core::task::Poll::Ready(None),
+                Err(PopError::Empty) => {
+                    if self.channel.writer_closed.load(Ordering::Acquire) {
+                        return core::task::Poll::Ready(self.channel.queue.pop().ok());
+                    }
+                    match self.channel.readable.poll_notified(cx, &mut wait.readable) {
+                        core::task::Poll::Ready(()) => continue,
+                        core::task::Poll::Pending => return core::task::Poll::Pending,
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub enum TryRead {
@@ -203,5 +235,23 @@ mod tests {
             .expect("queued bytes should be delivered before EOF");
         assert_eq!(received.as_ref(), b"helios");
         assert_eq!(received.as_ptr(), ptr);
+    }
+
+    #[test]
+    fn byte_channel_poll_read_uses_reusable_wait_state() {
+        let (writer, reader) = byte_channel();
+        let mut wait = reader.wait_state();
+
+        writer
+            .write(Bytes::from_static(b"poll"))
+            .expect("reader is still open");
+        drop(writer);
+
+        let received = futures_lite::future::block_on(futures_lite::future::poll_fn(|cx| {
+            reader.poll_read(cx, &mut wait)
+        }))
+        .expect("queued bytes should be delivered before EOF");
+
+        assert_eq!(received.as_ref(), b"poll");
     }
 }

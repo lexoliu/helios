@@ -72,7 +72,7 @@ pub use bootfs::{
     BootDirectory, BootDirectoryEntry, BootDirectoryHandleExt, BootFile, EmbeddedBootFile,
     EmbeddedBootFs,
 };
-pub use child_io::{ByteReader, ByteWriter, ClosedPeer, TryRead, byte_channel};
+pub use child_io::{ByteReadWait, ByteReader, ByteWriter, ClosedPeer, TryRead, byte_channel};
 pub use compaction::{
     CompactionBudget, CompactionPolicy, CompactionReport, CompactionTarget, Compactor,
     PressureLevel,
@@ -168,7 +168,7 @@ pub use serial_transport::{
 };
 pub use socket_stack::SocketStack;
 pub use sync::{
-    Mutex, MutexGuard, Notified, Notify, OwnedRawMutexLease, OwnedRawRwLockReadLease,
+    Mutex, MutexGuard, Notified, Notify, NotifyWaiter, OwnedRawMutexLease, OwnedRawRwLockReadLease,
     OwnedRawRwLockWriteLease, RawMutex, RawMutexLease, RawRwLock, RawRwLockReadLease,
     RawRwLockWriteLease, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };

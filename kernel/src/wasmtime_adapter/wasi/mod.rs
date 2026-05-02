@@ -2692,15 +2692,16 @@ where
 /// poll drives it until a chunk is produced.
 pub(crate) struct ChannelStreamProducer {
     reader: crate::ByteReader,
-    pending: Option<Pin<Box<dyn core::future::Future<Output = Option<Bytes>> + Send>>>,
+    read_wait: crate::ByteReadWait,
     completion: Option<oneshot::Sender<()>>,
 }
 
 impl ChannelStreamProducer {
     pub(crate) fn new(reader: crate::ByteReader) -> Self {
+        let read_wait = reader.wait_state();
         Self {
             reader,
-            pending: None,
+            read_wait,
             completion: None,
         }
     }
@@ -2709,9 +2710,10 @@ impl ChannelStreamProducer {
         reader: crate::ByteReader,
         completion: oneshot::Sender<()>,
     ) -> Self {
+        let read_wait = reader.wait_state();
         Self {
             reader,
-            pending: None,
+            read_wait,
             completion: Some(completion),
         }
     }
@@ -2746,25 +2748,16 @@ impl<T> StreamProducer<T> for ChannelStreamProducer {
         }
 
         loop {
-            if self.pending.is_none() {
-                let reader = self.reader.clone();
-                self.pending = Some(Box::pin(async move { reader.read().await }));
-            }
-            let fut = self
-                .pending
-                .as_mut()
-                .expect("pending future was just installed");
-            match fut.as_mut().poll(cx) {
+            let reader = self.reader.clone();
+            match reader.poll_read(cx, &mut self.read_wait) {
                 Poll::Pending => {
                     return Poll::Pending;
                 }
                 Poll::Ready(None) => {
-                    self.pending = None;
                     self.finish();
                     return Poll::Ready(Ok(StreamResult::Dropped));
                 }
                 Poll::Ready(Some(bytes)) => {
-                    self.pending = None;
                     if bytes.is_empty() {
                         continue;
                     }

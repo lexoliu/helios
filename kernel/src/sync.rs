@@ -34,6 +34,11 @@ pub struct Notified<'a> {
     listener: Option<EventListener>,
 }
 
+/// Reusable state for polling a [`Notify`] without allocating a Future.
+pub struct NotifyWaiter {
+    listener: Option<EventListener>,
+}
+
 /// Raw async mutex state without protected payload storage.
 ///
 /// This is the scheduling primitive used by both kernel-internal mutexes and
@@ -129,6 +134,38 @@ impl Notify {
         }
     }
 
+    pub const fn waiter(&self) -> NotifyWaiter {
+        NotifyWaiter { listener: None }
+    }
+
+    pub fn poll_notified(&self, cx: &mut Context<'_>, waiter: &mut NotifyWaiter) -> Poll<()> {
+        loop {
+            if self.try_claim_permit() {
+                waiter.listener = None;
+                return Poll::Ready(());
+            }
+
+            if waiter.listener.is_none() {
+                waiter.listener = Some(self.event.listen());
+                continue;
+            }
+
+            let listener = waiter
+                .listener
+                .as_mut()
+                .expect("notification listener disappeared unexpectedly");
+            let mut listener = core::pin::pin!(listener);
+
+            match listener.as_mut().poll(cx) {
+                Poll::Ready(()) => {
+                    waiter.listener = None;
+                    continue;
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+
     /// Signals a single waiter.
     ///
     /// This operation is non-blocking and suitable for interrupt context.
@@ -193,31 +230,12 @@ impl Future for Notified<'_> {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        loop {
-            if self.notify.try_claim_permit() {
-                self.listener = None;
-                return Poll::Ready(());
-            }
-
-            if self.listener.is_none() {
-                self.listener = Some(self.notify.event.listen());
-                continue;
-            }
-
-            let listener = self
-                .listener
-                .as_mut()
-                .expect("notification listener disappeared unexpectedly");
-            let mut listener = core::pin::pin!(listener);
-
-            match listener.as_mut().poll(cx) {
-                Poll::Ready(()) => {
-                    self.listener = None;
-                    continue;
-                }
-                Poll::Pending => return Poll::Pending,
-            }
-        }
+        let mut waiter = NotifyWaiter {
+            listener: self.listener.take(),
+        };
+        let result = self.notify.poll_notified(cx, &mut waiter);
+        self.listener = waiter.listener;
+        result
     }
 }
 
