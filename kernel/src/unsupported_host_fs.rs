@@ -69,6 +69,14 @@ impl HostFileSystem for UnsupportedHostFileSystem {
     ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
         unsupported()
     }
+    fn set_times(
+        &self,
+        _path: &str,
+        _access_nanos: Option<u64>,
+        _modified_nanos: Option<u64>,
+    ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
+        unsupported()
+    }
     fn create_file(
         &self,
         _path: &str,

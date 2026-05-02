@@ -3217,15 +3217,39 @@ where
         data_access_timestamp: fs_types::NewTimestamp,
         data_modification_timestamp: fs_types::NewTimestamp,
     ) -> Result<(), FsError> {
+        let (path, access_nanos, modified_nanos) = accessor
+            .with(|mut access| {
+                let now_nanos = access.get().system_time_nanos();
+                let access_nanos = p3_new_timestamp_nanos(data_access_timestamp, now_nanos)?;
+                let modified_nanos =
+                    p3_new_timestamp_nanos(data_modification_timestamp, now_nanos)?;
+                let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
+                Ok::<_, FsError>((descriptor.path.clone(), access_nanos, modified_nanos))
+            })
+            .map_err(FsError::trap)?;
+        if let Some(host_path) = crate::guest_host_share_path(&path).map(|p| p.to_owned()) {
+            let service = accessor.with(|mut access| {
+                access
+                    .get()
+                    .filesystem()
+                    .host_service()
+                    .map_err(FsError::from)
+            })?;
+            service
+                .set_times(&host_path, access_nanos, modified_nanos)
+                .await
+                .map_err(map_host_fs_error)?;
+            accessor.with(|mut access| {
+                access.get().filesystem_mut().invalidate_host_subtree(&path);
+            });
+            return Ok(());
+        }
         accessor.with(|mut access| {
             let now_nanos = access.get().system_time_nanos();
-            let access_nanos = p3_new_timestamp_nanos(data_access_timestamp, now_nanos)?;
-            let modified_nanos = p3_new_timestamp_nanos(data_modification_timestamp, now_nanos)?;
-            let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
             access
                 .get()
                 .filesystem_mut()
-                .set_times(&descriptor, access_nanos, modified_nanos, now_nanos)
+                .set_times_at_path(&path, access_nanos, modified_nanos, now_nanos)
                 .map_err(Into::into)
         })
     }
@@ -3418,13 +3442,39 @@ where
         data_access_timestamp: fs_types::NewTimestamp,
         data_modification_timestamp: fs_types::NewTimestamp,
     ) -> Result<(), FsError> {
+        let (absolute, access_nanos, modified_nanos, now_nanos) = accessor
+            .with(|mut access| {
+                let now_nanos = access.get().system_time_nanos();
+                let access_nanos = p3_new_timestamp_nanos(data_access_timestamp, now_nanos)?;
+                let modified_nanos =
+                    p3_new_timestamp_nanos(data_modification_timestamp, now_nanos)?;
+                let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
+                let absolute = crate::resolve_child_path(&descriptor.path, &path)
+                    .map_err(map_component_fs_path_error)?;
+                Ok::<_, FsError>((absolute, access_nanos, modified_nanos, now_nanos))
+            })
+            .map_err(FsError::trap)?;
+        if let Some(host_path) = crate::guest_host_share_path(&absolute).map(|p| p.to_owned()) {
+            let service = accessor.with(|mut access| {
+                access
+                    .get()
+                    .filesystem()
+                    .host_service()
+                    .map_err(FsError::from)
+            })?;
+            service
+                .set_times(&host_path, access_nanos, modified_nanos)
+                .await
+                .map_err(map_host_fs_error)?;
+            accessor.with(|mut access| {
+                access
+                    .get()
+                    .filesystem_mut()
+                    .invalidate_host_subtree(&absolute);
+            });
+            return Ok(());
+        }
         accessor.with(|mut access| {
-            let now_nanos = access.get().system_time_nanos();
-            let access_nanos = p3_new_timestamp_nanos(data_access_timestamp, now_nanos)?;
-            let modified_nanos = p3_new_timestamp_nanos(data_modification_timestamp, now_nanos)?;
-            let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
-            let absolute = crate::resolve_child_path(&descriptor.path, &path)
-                .map_err(map_component_fs_path_error)?;
             access
                 .get()
                 .filesystem_mut()

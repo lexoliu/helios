@@ -38,6 +38,8 @@ const P9_DOTL_DIRECTORY: u32 = 0o200000;
 const P9_DOTL_AT_REMOVEDIR: u32 = 0x200;
 const P9_STATS_BASIC: u64 = 0x0000_07ff;
 const P9_SETATTR_SIZE: u32 = 0x0000_0008;
+const P9_SETATTR_ATIME_SET: u32 = 0x0000_0080;
+const P9_SETATTR_MTIME_SET: u32 = 0x0000_0100;
 const P9_QTDIR: u8 = 0x80;
 const P9_WRITE_CHUNK: usize = (DEFAULT_MSIZE as usize) - 24;
 
@@ -500,6 +502,45 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
         result
     }
 
+    async fn set_times_impl(
+        &self,
+        path: &str,
+        access_nanos: Option<u64>,
+        modified_nanos: Option<u64>,
+    ) -> Result<(), HostFsError> {
+        let (
+            valid,
+            access_seconds,
+            access_subnanoseconds,
+            modified_seconds,
+            modified_subnanoseconds,
+        ) = p9_setattr_times(access_nanos, modified_nanos);
+        let root = self.attach_root().await?;
+        let file = self.walk(root, 1, path).await?;
+        let result = self
+            .transact(
+                P9_TSETATTR,
+                |body| {
+                    push_u32(body, file);
+                    push_u32(body, valid);
+                    push_u32(body, 0);
+                    push_u32(body, P9_NOUID);
+                    push_u32(body, P9_NOUID);
+                    push_u64(body, 0);
+                    push_u64(body, access_seconds);
+                    push_u64(body, access_subnanoseconds);
+                    push_u64(body, modified_seconds);
+                    push_u64(body, modified_subnanoseconds);
+                },
+                7,
+            )
+            .await
+            .map(|_| ());
+        let _ = self.clunk(file).await;
+        let _ = self.clunk(root).await;
+        result
+    }
+
     async fn write_file_impl(
         &self,
         path: &str,
@@ -678,6 +719,18 @@ impl<Transport: HostFsTransport> HostFileSystem for HostFsClient<Transport> {
         async move { self.set_file_size_impl(path, size).await }
     }
 
+    fn set_times<'a>(
+        &'a self,
+        path: &'a str,
+        access_nanos: Option<u64>,
+        modified_nanos: Option<u64>,
+    ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a {
+        async move {
+            self.set_times_impl(path, access_nanos, modified_nanos)
+                .await
+        }
+    }
+
     fn create_file<'a>(
         &'a self,
         path: &'a str,
@@ -754,6 +807,30 @@ fn split_parent_name(path: &str) -> Result<(&str, &str), HostFsError> {
     Ok((parent, name))
 }
 
+fn p9_setattr_times(
+    access_nanos: Option<u64>,
+    modified_nanos: Option<u64>,
+) -> (u32, u64, u64, u64, u64) {
+    let (access_valid, access_seconds, access_subnanoseconds) =
+        p9_optional_timestamp(P9_SETATTR_ATIME_SET, access_nanos);
+    let (modified_valid, modified_seconds, modified_subnanoseconds) =
+        p9_optional_timestamp(P9_SETATTR_MTIME_SET, modified_nanos);
+    (
+        access_valid | modified_valid,
+        access_seconds,
+        access_subnanoseconds,
+        modified_seconds,
+        modified_subnanoseconds,
+    )
+}
+
+fn p9_optional_timestamp(flag: u32, nanos: Option<u64>) -> (u32, u64, u64) {
+    let Some(nanos) = nanos else {
+        return (0, 0, 0);
+    };
+    (flag, nanos / 1_000_000_000, nanos % 1_000_000_000)
+}
+
 fn push_u16(buf: &mut Vec<u8>, value: u16) {
     buf.extend_from_slice(&value.to_le_bytes());
 }
@@ -806,4 +883,25 @@ fn read_string(buf: &[u8], cursor: &mut usize) -> Result<String, HostFsError> {
     let bytes = read_slice(buf, *cursor, len)?;
     *cursor += len;
     String::from_utf8(bytes.to_vec()).map_err(|_| HostFsError::Utf8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn p9_setattr_times_uses_specific_timestamp_flags() {
+        assert_eq!(
+            p9_setattr_times(Some(1_500_000_002), None),
+            (P9_SETATTR_ATIME_SET, 1, 500_000_002, 0, 0)
+        );
+        assert_eq!(
+            p9_setattr_times(None, Some(2_000_000_003)),
+            (P9_SETATTR_MTIME_SET, 0, 0, 2, 3)
+        );
+        assert_eq!(
+            p9_setattr_times(Some(4), Some(5)),
+            (P9_SETATTR_ATIME_SET | P9_SETATTR_MTIME_SET, 0, 4, 0, 5)
+        );
+    }
 }

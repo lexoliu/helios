@@ -1,5 +1,7 @@
+use std::ffi::CString;
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{self as unix_fs, MetadataExt};
 use std::path::{Path, PathBuf};
 
@@ -94,6 +96,19 @@ impl HostFileSystem for HostedFileSystem {
         size: u64,
     ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
         core::future::ready(set_file_size_impl(&self.resolve(path), size))
+    }
+
+    fn set_times(
+        &self,
+        path: &str,
+        access_nanos: Option<u64>,
+        modified_nanos: Option<u64>,
+    ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
+        core::future::ready(set_times_impl(
+            &self.resolve(path),
+            access_nanos,
+            modified_nanos,
+        ))
     }
 
     fn create_file(
@@ -226,6 +241,41 @@ fn set_file_size_impl(path: &Path, size: u64) -> Result<(), HostFsError> {
     Ok(())
 }
 
+fn set_times_impl(
+    path: &Path,
+    access_nanos: Option<u64>,
+    modified_nanos: Option<u64>,
+) -> Result<(), HostFsError> {
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| HostFsError::Utf8)?;
+    let times = [
+        timespec_from_optional_nanos(access_nanos)?,
+        timespec_from_optional_nanos(modified_nanos)?,
+    ];
+    let result = unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(map_io_error(io::Error::last_os_error()))
+    }
+}
+
+fn timespec_from_optional_nanos(nanos: Option<u64>) -> Result<libc::timespec, HostFsError> {
+    let Some(nanos) = nanos else {
+        return Ok(libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        });
+    };
+    let seconds = libc::time_t::try_from(nanos / 1_000_000_000)
+        .map_err(|_| HostFsError::Transport(helios_hal::io::IoError::OutOfBounds))?;
+    let nanoseconds = libc::c_long::try_from(nanos % 1_000_000_000)
+        .map_err(|_| HostFsError::Transport(helios_hal::io::IoError::OutOfBounds))?;
+    Ok(libc::timespec {
+        tv_sec: seconds,
+        tv_nsec: nanoseconds,
+    })
+}
+
 fn read_link_impl(path: &Path) -> Result<String, HostFsError> {
     fs::read_link(path)
         .map_err(map_io_error)?
@@ -302,5 +352,25 @@ mod tests {
 
         assert_eq!(&hard, b"payload");
         assert_eq!(payload, "source");
+    }
+
+    #[tokio::test]
+    async fn hosted_filesystem_sets_access_and_modification_times() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = TestRoot::new();
+        std::fs::write(root.path.join("source"), b"payload").expect("source file must be written");
+        let filesystem = root.filesystem();
+
+        filesystem
+            .set_times("source", Some(1_500_000_002), Some(2_000_000_003))
+            .await
+            .expect("times must be set");
+
+        let metadata = std::fs::metadata(root.path.join("source")).expect("metadata must be read");
+        assert_eq!(metadata.atime(), 1);
+        assert_eq!(metadata.atime_nsec(), 500_000_002);
+        assert_eq!(metadata.mtime(), 2);
+        assert_eq!(metadata.mtime_nsec(), 3);
     }
 }

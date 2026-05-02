@@ -4944,16 +4944,21 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_filestat_set_times",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             atim: i64,
-             mtim: i64,
-             fstflags: i32|
-             -> i32 {
-                p1_fd_filestat_set_times(&mut caller, fd, atim as u64, mtim as u64, fstflags as u16)
+             (fd, atim, mtim, fstflags): (i32, i64, i64, i32)| {
+                Box::new(async move {
+                    p1_fd_filestat_set_times(
+                        &mut caller,
+                        fd,
+                        atim as u64,
+                        mtim as u64,
+                        fstflags as u16,
+                    )
+                    .await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -5823,28 +5828,32 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "path_filestat_set_times",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             flags: i32,
-             path: i32,
-             path_len: i32,
-             atim: i64,
-             mtim: i64,
-             fstflags: i32|
-             -> i32 {
-                p1_path_filestat_set_times(
-                    &mut caller,
-                    fd,
-                    flags as u32,
-                    path as u32,
-                    path_len as u32,
-                    atim as u64,
-                    mtim as u64,
-                    fstflags as u16,
-                )
+             (fd, flags, path, path_len, atim, mtim, fstflags): (
+                i32,
+                i32,
+                i32,
+                i32,
+                i64,
+                i64,
+                i32,
+            )| {
+                Box::new(async move {
+                    p1_path_filestat_set_times(
+                        &mut caller,
+                        fd,
+                        flags as u32,
+                        path as u32,
+                        path_len as u32,
+                        atim as u64,
+                        mtim as u64,
+                        fstflags as u16,
+                    )
+                    .await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -6513,7 +6522,7 @@ where
         .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
 }
 
-fn p1_fd_filestat_set_times<CpuImpl, HostFs>(
+async fn p1_fd_filestat_set_times<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     atim: u64,
@@ -6530,9 +6539,6 @@ where
         return p1::errno::BADF;
     };
     let descriptor = descriptor.clone();
-    if crate::guest_host_share_path(&descriptor.path).is_some() {
-        return p1::errno::NOTSUP;
-    }
     let now_nanos = caller.data().system_time_nanos();
     let access = p1_timestamp_from_fstflags(
         fstflags,
@@ -6548,6 +6554,23 @@ where
         mtim,
         now_nanos,
     );
+    if let Some(host_path) = crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned) {
+        let service = match caller.data().filesystem.host_service() {
+            Ok(service) => service,
+            Err(error) => return p1_errno_from_fs(error),
+        };
+        return service
+            .set_times(&host_path, access, modified)
+            .await
+            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
+            .map_or_else(p1_errno_from_fs, |_| {
+                caller
+                    .data_mut()
+                    .filesystem
+                    .invalidate_host_subtree(&descriptor.path);
+                p1::errno::SUCCESS
+            });
+    }
     caller
         .data_mut()
         .filesystem
@@ -7396,7 +7419,7 @@ where
     p1_write_filestat(caller, stat, stat_value)
 }
 
-fn p1_path_filestat_set_times<CpuImpl, HostFs>(
+async fn p1_path_filestat_set_times<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     _flags: u32,
@@ -7421,9 +7444,6 @@ where
         Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
-    if crate::guest_host_share_path(&absolute).is_some() {
-        return p1::errno::NOTSUP;
-    }
     let now_nanos = caller.data().system_time_nanos();
     let access = p1_timestamp_from_fstflags(
         fstflags,
@@ -7439,6 +7459,23 @@ where
         mtim,
         now_nanos,
     );
+    if let Some(host_path) = crate::guest_host_share_path(&absolute).map(ToOwned::to_owned) {
+        let service = match caller.data().filesystem.host_service() {
+            Ok(service) => service,
+            Err(error) => return p1_errno_from_fs(error),
+        };
+        return service
+            .set_times(&host_path, access, modified)
+            .await
+            .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
+            .map_or_else(p1_errno_from_fs, |_| {
+                caller
+                    .data_mut()
+                    .filesystem
+                    .invalidate_host_subtree(&absolute);
+                p1::errno::SUCCESS
+            });
+    }
     caller
         .data_mut()
         .filesystem
