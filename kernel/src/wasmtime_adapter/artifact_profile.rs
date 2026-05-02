@@ -7,6 +7,7 @@ use thiserror::Error;
 use wasmparser::{Encoding, Import, Imports, Parser, Payload, TypeRef};
 
 const WASI_PREVIEW1_MODULE: &str = "wasi_snapshot_preview1";
+const WASI_UNSTABLE_MODULE: &str = "wasi_unstable";
 const WASI_THREADS_MODULE: &str = "wasi";
 const WASI_THREAD_SPAWN: &str = "thread-spawn";
 const WASIX_MODULE: &str = "wasix_32v1";
@@ -158,7 +159,7 @@ fn classify_core_module(
 
     for import in &imports {
         match (import.module.as_str(), import.name.as_str()) {
-            (WASI_PREVIEW1_MODULE, _) => uses_preview1 = true,
+            (WASI_PREVIEW1_MODULE | WASI_UNSTABLE_MODULE, _) => uses_preview1 = true,
             (WASI_THREADS_MODULE, WASI_THREAD_SPAWN) => uses_threads = true,
             (WASIX_MODULE, name) if super::wasix::authority_for(name).is_some() => {
                 uses_wasix = true;
@@ -277,6 +278,19 @@ mod tests {
             "args_sizes_get",
             EntityType::Function(0),
         );
+        let mut module = Module::new();
+        module.section(&wasm_encoder::TypeSection::new());
+        module.section(&imports);
+
+        let report = classify_raw_wasm(&module.finish()).unwrap();
+        assert_eq!(report.kind, ArtifactKind::CoreModule);
+        assert_eq!(report.profile, ArtifactProfile::CorePreview1);
+    }
+
+    #[test]
+    fn classifies_wasi_unstable_core_module_as_preview1() {
+        let mut imports = ImportSection::new();
+        imports.import("wasi_unstable", "args_sizes_get", EntityType::Function(0));
         let mut module = Module::new();
         module.section(&wasm_encoder::TypeSection::new());
         module.section(&imports);

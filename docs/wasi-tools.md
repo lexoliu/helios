@@ -1,8 +1,8 @@
-# WASI/WASIX Python, Curl, And Dash On Helios
+# WASI/WASIX Python, Curl, Shells, And QuickJS On Helios
 
 This document captures the exact workflow to stage and run `python`,
-`curl`, and the default `/bin/dash` shell artifact. `dash`, CPython, and
-`curl` are boot filesystem artifacts recorded in
+`curl`, the shell artifacts, and QuickJS. `dash`, `bash`, CPython,
+QuickJS, and `curl` are boot filesystem artifacts recorded in
 `tools/wasi-apps/boot-artifacts.toml`.
 
 ## Build Artifacts
@@ -22,11 +22,11 @@ This script:
    `wasm-tools component new --adapt …`.
 3. Installs `python3.wasm` plus `lib/python3.14/` (the CPython stdlib)
    under `artifacts/python3-root/`.
-4. Stages the standard WASIX dash package `sharrattj/dash` version
-   `1.0.19` from <https://wasmer.io/sharrattj/dash> as
-   `artifacts/wasix/dash/dash.wasm`, validates it with `wasm-tools`,
-   and records `artifacts/wasix/dash/dash.wasm.sha256` plus
-   `artifacts/wasix/dash/SOURCE.txt`.
+4. Downloads and extracts the pinned official Wasmer WEBc images for
+   `sharrattj/dash` `1.0.19`, `wasmer/bash` `1.0.25`, and
+   `saghul/quickjs` `0.0.3`; validates their raw wasm atoms with
+   `wasm-tools`; and records checksum plus `SOURCE.txt` provenance files
+   under `artifacts/wasix/`.
 5. Builds the helios `curl-wasi` program from source into
    `artifacts/wasi-tools/`.
 
@@ -39,6 +39,12 @@ Artifacts produced:
   `helios-cli kernel-prebuild`.
 - `artifacts/wasix/dash/SOURCE.txt` — source package, version, URL, and
   checksum record.
+- `artifacts/wasix/bash/bash.wasm` — standard Wasmer WASIX Bash raw module.
+- `artifacts/wasix/bash/bash.wasm.sha256`
+- `artifacts/wasix/bash/SOURCE.txt`
+- `artifacts/wasix/quickjs/qjs.wasm` — standard QuickJS WASI raw module.
+- `artifacts/wasix/quickjs/qjs.wasm.sha256`
+- `artifacts/wasix/quickjs/SOURCE.txt`
 - `artifacts/wasi-tools/curl.wasm`
 - `artifacts/wasi-tools/curl-stripped.wasm`
 
@@ -47,17 +53,30 @@ environment, place a pre-downloaded
 `python-${VERSION}-wasi_sdk-24.zip` somewhere and pass its path via
 `CPYTHON_WASI_ZIP=/path/to/zip tools/wasi-apps/build.sh`.
 
-The dash artifact must be the official Wasmer package payload, not a
-repo-local shell. In an offline environment, extract the raw module from
-`sharrattj/dash` version `1.0.19` once and pass it explicitly:
+The shell and QuickJS artifacts must be official Wasmer package payloads,
+not repo-local stubs. In an offline environment, either pass the raw
+modules:
 
 ```bash
-WASIX_DASH_WASM=/path/to/official/dash.wasm tools/wasi-apps/build.sh
+WASIX_DASH_WASM=/path/to/official/dash.wasm \
+WASIX_BASH_WASM=/path/to/official/bash.wasm \
+QUICKJS_WASM=/path/to/official/qjs.wasm \
+tools/wasi-apps/build.sh
+```
+
+or pass the pinned WEBc images:
+
+```bash
+WASIX_DASH_WEBC=/path/to/dash.webc \
+WASIX_BASH_WEBC=/path/to/bash.webc \
+QUICKJS_WEBC=/path/to/quickjs.webc \
+tools/wasi-apps/build.sh
 ```
 
 `helios-cli kernel-prebuild` verifies the checksum sidecar before adding
-the artifact to bootfs. A missing or mismatched dash artifact is a hard
-error; there is no repo-local fallback.
+the artifact to bootfs and checks every external artifact's `SOURCE.txt`
+against `tools/wasi-apps/boot-artifacts.toml`. A missing or mismatched
+artifact is a hard error; there is no repo-local fallback.
 
 ## Run In Helios (AArch64 HVF VM)
 
@@ -93,6 +112,36 @@ Expected output contains:
 
 - `<!doctype html>`
 - `<title>Example Domain</title>`
+
+The same path runs the standard Bash artifact:
+
+```bash
+cargo run -p helios-inspector -- vm --arch aarch64 --release \
+  --boot-program dash --boot-program debugger --boot-program bash \
+  --no-compiler-plugin \
+  shell -c '/bin/bash -c "echo bash:$((20+22))"'
+```
+
+Expected output includes:
+
+```text
+bash:42
+```
+
+QuickJS can execute JavaScript from the boot filesystem:
+
+```bash
+cargo run -p helios-inspector -- vm --arch aarch64 --release \
+  --boot-program dash --boot-program debugger --boot-program quickjs \
+  --no-compiler-plugin \
+  shell -c '/bin/qjs -e "console.log(40+2)"'
+```
+
+Expected output includes:
+
+```text
+42
+```
 
 ## Run In Helios (RISC-V VM)
 
@@ -135,6 +184,9 @@ Expected output contains:
 - `tools/wasi-apps/curl` uses `helios-api::net::TcpStream` (WIT syscall
   surface) instead of host libc sockets, so it runs correctly inside
   helios. It currently supports `http://` URLs only.
+- `tools/wasi-apps/extract-webc-wasm.pl` extracts the single raw wasm atom
+  from the pinned Wasmer WEBc images. The build script validates both WEBc
+  and raw wasm SHA-256 digests before staging.
 
 ## Contract For Future Agents
 
@@ -143,8 +195,8 @@ Expected output contains:
   `artifacts/wasi-tools/…`) without updating this document and
   `README.md`.
 - Keep runtime behavior verified with the inspector `vm` commands above.
-- Do not reintroduce a repo-local dash crate or shell stub. The boot
-  shell is the standard WASIX dash artifact declared in
+- Do not reintroduce repo-local shell or language stubs. The boot shells
+  and QuickJS are standard Wasmer artifacts declared in
   `tools/wasi-apps/boot-artifacts.toml`.
 - Do not reintroduce the old `tools/wasi-apps/python` stub — it was a
   Rust-level evalexpr toy masquerading as Python and caused real

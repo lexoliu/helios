@@ -56,7 +56,7 @@ pub(crate) fn authority_for(syscall: &str) -> Option<WasixAuthority> {
             WasixAuthority::DescriptorMutate
         }
         "path_filestat_get" => WasixAuthority::PathMetadata,
-        "proc_exit" => WasixAuthority::ProcessExit,
+        "proc_exit" | "proc_exit2" => WasixAuthority::ProcessExit,
         "clock_time_set" => WasixAuthority::SetWallClock,
         "fd_dup" | "fd_dup2" | "fd_event" | "fd_pipe" | "path_open2" | "fd_fdflags_get"
         | "fd_fdflags_set" | "getcwd" | "chdir" => WasixAuthority::DescriptorTable,

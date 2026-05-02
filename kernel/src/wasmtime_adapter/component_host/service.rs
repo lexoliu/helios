@@ -235,6 +235,7 @@ struct WasixPreparedProgram {
 
 struct CoreModuleRestore {
     memory: SharedMemory,
+    descriptors: Preview1DescriptorTable,
     stack_lower: u32,
     stack_upper: u32,
     stack_pointer: u32,
@@ -313,6 +314,7 @@ struct Preview1Cwd {
     descriptor: FsDescriptor,
 }
 
+#[derive(Clone)]
 struct Preview1DescriptorTable {
     entries: Vec<Option<Preview1DescriptorEntry>>,
 }
@@ -2084,28 +2086,14 @@ impl Preview1DescriptorTable {
         self.insert(descriptor)
     }
 
-    fn dup_from(&mut self, fd: i32, min_fd: i32, close_on_exec: bool) -> Result<u32, i32> {
+    fn dup_to(&mut self, fd: i32, to_fd: i32, close_on_exec: bool) -> Result<u32, i32> {
         let descriptor = self.get(fd).cloned().ok_or(p1::errno::BADF)?;
-        let min = usize::try_from(min_fd).map_err(|_| p1::errno::BADF)?;
-        if self.entries.len() <= min {
-            self.entries.resize_with(min + 1, || None);
+        let to = usize::try_from(to_fd).map_err(|_| p1::errno::BADF)?;
+        if self.entries.len() <= to {
+            self.entries.resize_with(to + 1, || None);
         }
-        if let Some((index, slot)) = self
-            .entries
-            .iter_mut()
-            .enumerate()
-            .skip(min)
-            .find(|(_, slot)| slot.is_none())
-        {
-            *slot = Some(Preview1DescriptorEntry::new(descriptor, close_on_exec));
-            return u32::try_from(index).map_err(|_| p1::errno::OVERFLOW);
-        }
-        let index = self.entries.len();
-        self.entries.push(Some(Preview1DescriptorEntry::new(
-            descriptor,
-            close_on_exec,
-        )));
-        u32::try_from(index).map_err(|_| p1::errno::OVERFLOW)
+        self.entries[to] = Some(Preview1DescriptorEntry::new(descriptor, close_on_exec));
+        u32::try_from(to).map_err(|_| p1::errno::OVERFLOW)
     }
 
     fn close_on_exec(&self, fd: i32) -> Result<bool, i32> {
@@ -3835,6 +3823,7 @@ where
             Some(compiled.clone()),
         ),
     );
+    store.data_mut().descriptors = restore.descriptors;
     configure_preview1_program_store(&mut store);
 
     let mut linker = CoreLinker::new(engine.raw());
@@ -4334,6 +4323,7 @@ where
         })?;
     let restore = CoreModuleRestore {
         memory: fork_memory,
+        descriptors: store.data().descriptors.clone(),
         stack_lower,
         stack_upper,
         stack_pointer,
@@ -4928,6 +4918,9 @@ where
                 Err(wasmtime::Error::new(Preview1Exit))
             },
         )
+        .map_err(map_program_runtime_error)?;
+    linker
+        .alias_module("wasi_snapshot_preview1", "wasi_unstable")
         .map_err(map_program_runtime_error)?;
     Ok(())
 }
@@ -5548,6 +5541,18 @@ where
         .func_wrap(
             WASIX_MODULE,
             "proc_exit",
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+             code: i32|
+             -> wasmtime::Result<()> {
+                caller.data_mut().request_exit(code as u32);
+                Err(wasmtime::Error::new(Preview1Exit))
+            },
+        )
+        .map_err(map_program_runtime_error)?;
+    linker
+        .func_wrap(
+            WASIX_MODULE,
+            "proc_exit2",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
              code: i32|
              -> wasmtime::Result<()> {
@@ -7858,7 +7863,7 @@ where
 fn wasix_fd_dup2<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
-    min_result_fd: i32,
+    target_fd: i32,
     cloexec: bool,
     ret_fd: u32,
 ) -> i32
@@ -7869,11 +7874,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let duplicated = match caller
-        .data_mut()
-        .descriptors
-        .dup_from(fd, min_result_fd, cloexec)
-    {
+    let duplicated = match caller.data_mut().descriptors.dup_to(fd, target_fd, cloexec) {
         Ok(fd) => fd,
         Err(errno) => return errno,
     };
@@ -8441,18 +8442,17 @@ async fn wasix_proc_exec3<CpuImpl, HostFs>(
     search_path: i32,
     path: u32,
     path_len: u32,
-) -> wasmtime::Result<()>
+) -> wasmtime::Result<i32>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     if search_path != 0 || path != 0 || path_len != 0 {
-        return Err(wasmtime::Error::new(ProgramExecError {
-            kind: ProgramExecErrorKind::Unavailable,
-            detail: ProgramExecErrorDetail::HostOperationFailed,
-        }));
+        return Ok(p1::errno::NOTSUP);
     }
-    wasix_proc_exec(caller, name, name_len, args, args_len, Some((env, env_len))).await
+    wasix_proc_exec(caller, name, name_len, args, args_len, Some((env, env_len)))
+        .await
+        .map(|()| p1::errno::SUCCESS)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11688,7 +11688,7 @@ fn validate_preview1_program_module_imports(module: &Module) -> Result<(), Progr
 
 fn validate_preview1_program_import(module_name: &str, name: &str) -> Result<(), ProgramExecError> {
     match module_name {
-        "wasi_snapshot_preview1" => {
+        "wasi_snapshot_preview1" | "wasi_unstable" => {
             if p1::PREVIEW1_FUNCTIONS.contains(&name)
                 && PREVIEW1_PROGRAM_LINKED_IMPORTS.contains(&name)
             {
@@ -11702,6 +11702,11 @@ fn validate_preview1_program_import(module_name: &str, name: &str) -> Result<(),
         }
         _ => {}
     }
+    tracing::error!(
+        module = module_name,
+        import = name,
+        "program core module imports unsupported host function"
+    );
     Err(ProgramExecError {
         kind: ProgramExecErrorKind::InvalidBinary,
         detail: ProgramExecErrorDetail::UnsupportedImport,
@@ -11844,6 +11849,7 @@ const WASIX_PROGRAM_LINKED_IMPORTS: &[&str] = &[
     "path_open",
     "sched_yield",
     "proc_exit",
+    "proc_exit2",
     "clock_time_set",
     "fd_dup",
     "fd_dup2",
@@ -12040,6 +12046,14 @@ mod tests {
     }
 
     #[test]
+    fn wasi_unstable_imports_are_accepted_as_preview1() {
+        for import in PREVIEW1_PROGRAM_LINKED_IMPORTS {
+            validate_preview1_program_import("wasi_unstable", import)
+                .expect("wasi_unstable imports should validate as preview1");
+        }
+    }
+
+    #[test]
     fn fd_renumber_replaces_stdio_descriptor() {
         let file = Preview1Descriptor::File {
             descriptor: FsDescriptor {
@@ -12077,6 +12091,46 @@ mod tests {
             _ => panic!("fd 1 should be redirected to the file descriptor"),
         }
         assert!(table.get(3).is_none());
+    }
+
+    #[test]
+    fn fd_dup2_replaces_exact_target_descriptor() {
+        let file = Preview1Descriptor::File {
+            descriptor: FsDescriptor {
+                path: "/redirected".into(),
+                kind: FsNodeKind::File,
+                flags: fs_types::DescriptorFlags::WRITE,
+                identity: None,
+            },
+            offset: 0,
+            fdflags: 0,
+        };
+        let mut table = Preview1DescriptorTable {
+            entries: vec![
+                Some(Preview1DescriptorEntry::new(
+                    Preview1Descriptor::Stdin { carry: Vec::new() },
+                    false,
+                )),
+                Some(Preview1DescriptorEntry::new(
+                    Preview1Descriptor::Stdout,
+                    false,
+                )),
+                Some(Preview1DescriptorEntry::new(
+                    Preview1Descriptor::Stderr,
+                    false,
+                )),
+                Some(Preview1DescriptorEntry::new(file, false)),
+            ],
+        };
+
+        assert_eq!(table.dup_to(3, 1, true), Ok(1));
+        match table.get(1) {
+            Some(Preview1Descriptor::File { descriptor, .. }) => {
+                assert_eq!(descriptor.path, "/redirected");
+            }
+            _ => panic!("fd 1 should be duplicated to the file descriptor"),
+        }
+        assert_eq!(table.close_on_exec(1), Ok(true));
     }
 
     #[test]

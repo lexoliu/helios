@@ -994,9 +994,6 @@ fn verify_sha256_file(source: &Path, sha256_file: &Path) -> Result<()> {
 }
 
 fn validate_external_boot_artifact_provenance(artifact: &ExternalBootArtifact) -> Result<()> {
-    if artifact.command != "dash" {
-        return Ok(());
-    }
     let source = workspace_path(&artifact.source);
     let sha256_file = workspace_path(&artifact.sha256_file);
     let source_txt = source
@@ -1005,7 +1002,7 @@ fn validate_external_boot_artifact_provenance(artifact: &ExternalBootArtifact) -
         .join("SOURCE.txt");
     ensure!(
         source_txt.is_file(),
-        "WASIX dash provenance file {} is missing",
+        "boot artifact provenance file {} is missing",
         source_txt.display()
     );
     let provenance = fs::read_to_string(&source_txt)
@@ -1237,53 +1234,67 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn dash_provenance_must_match_manifest_and_checksum() {
-        let root = test_temp_dir("dash-provenance-ok");
-        let dash_dir = root.join("wasix").join("dash");
-        fs::create_dir_all(&dash_dir).expect("test dash dir must be created");
-        let wasm = dash_dir.join("dash.wasm");
-        fs::write(&wasm, b"dash").expect("test wasm must be written");
-        let digest = sha256_hex(b"dash");
-        let checksum = dash_dir.join("dash.wasm.sha256");
+    fn external_artifact_provenance_must_match_manifest_and_checksum() {
+        let root = test_temp_dir("artifact-provenance-ok");
+        let artifact_dir = root.join("wasix").join("bash");
+        fs::create_dir_all(&artifact_dir).expect("test artifact dir must be created");
+        let wasm = artifact_dir.join("bash.wasm");
+        fs::write(&wasm, b"bash").expect("test wasm must be written");
+        let digest = sha256_hex(b"bash");
+        let checksum = artifact_dir.join("bash.wasm.sha256");
         fs::write(&checksum, format!("{digest}  {}\n", wasm.display()))
             .expect("test checksum must be written");
         fs::write(
-            dash_dir.join("SOURCE.txt"),
+            artifact_dir.join("SOURCE.txt"),
             format!(
-                "package=sharrattj/dash\nversion=1.0.19\nsource=https://wasmer.io/sharrattj/dash\nsha256={digest}\n"
+                "package=wasmer/bash\nversion=1.0.25\nsource=https://wasmer.io/wasmer/bash\nsha256={digest}\n"
             ),
         )
         .expect("test provenance must be written");
 
-        let artifact = test_dash_artifact(&wasm, &checksum);
+        let artifact = test_artifact(
+            "bash",
+            "wasmer/bash",
+            "1.0.25",
+            "https://wasmer.io/wasmer/bash",
+            &wasm,
+            &checksum,
+        );
         validate_external_boot_artifact_provenance(&artifact)
-            .expect("matching dash provenance must validate");
+            .expect("matching artifact provenance must validate");
 
         fs::remove_dir_all(root).expect("test temp dir must be removed");
     }
 
     #[test]
-    fn dash_provenance_rejects_mismatched_source_metadata() {
-        let root = test_temp_dir("dash-provenance-bad");
-        let dash_dir = root.join("wasix").join("dash");
-        fs::create_dir_all(&dash_dir).expect("test dash dir must be created");
-        let wasm = dash_dir.join("dash.wasm");
-        fs::write(&wasm, b"dash").expect("test wasm must be written");
-        let digest = sha256_hex(b"dash");
-        let checksum = dash_dir.join("dash.wasm.sha256");
+    fn external_artifact_provenance_rejects_mismatched_source_metadata() {
+        let root = test_temp_dir("artifact-provenance-bad");
+        let artifact_dir = root.join("wasix").join("bash");
+        fs::create_dir_all(&artifact_dir).expect("test artifact dir must be created");
+        let wasm = artifact_dir.join("bash.wasm");
+        fs::write(&wasm, b"bash").expect("test wasm must be written");
+        let digest = sha256_hex(b"bash");
+        let checksum = artifact_dir.join("bash.wasm.sha256");
         fs::write(&checksum, format!("{digest}  {}\n", wasm.display()))
             .expect("test checksum must be written");
         fs::write(
-            dash_dir.join("SOURCE.txt"),
+            artifact_dir.join("SOURCE.txt"),
             format!(
-                "package=local/stub\nversion=1.0.19\nsource=https://wasmer.io/sharrattj/dash\nsha256={digest}\n"
+                "package=local/stub\nversion=1.0.25\nsource=https://wasmer.io/wasmer/bash\nsha256={digest}\n"
             ),
         )
         .expect("test provenance must be written");
 
-        let artifact = test_dash_artifact(&wasm, &checksum);
+        let artifact = test_artifact(
+            "bash",
+            "wasmer/bash",
+            "1.0.25",
+            "https://wasmer.io/wasmer/bash",
+            &wasm,
+            &checksum,
+        );
         let error = validate_external_boot_artifact_provenance(&artifact)
-            .expect_err("mismatched dash package must be rejected");
+            .expect_err("mismatched artifact package must be rejected");
         assert!(
             error.to_string().contains("package=local/stub"),
             "unexpected error: {error:#}"
@@ -1292,13 +1303,20 @@ mod tests {
         fs::remove_dir_all(root).expect("test temp dir must be removed");
     }
 
-    fn test_dash_artifact(source: &Path, sha256_file: &Path) -> ExternalBootArtifact {
+    fn test_artifact(
+        command: &str,
+        package: &str,
+        version: &str,
+        source_url: &str,
+        source: &Path,
+        sha256_file: &Path,
+    ) -> ExternalBootArtifact {
         ExternalBootArtifact {
-            command: "dash".to_owned(),
-            package: "sharrattj/dash".to_owned(),
-            version: "1.0.19".to_owned(),
-            source_url: "https://wasmer.io/sharrattj/dash".to_owned(),
-            bootfs_path: "bin/dash".to_owned(),
+            command: command.to_owned(),
+            package: package.to_owned(),
+            version: version.to_owned(),
+            source_url: source_url.to_owned(),
+            bootfs_path: format!("bin/{command}"),
             source: source.to_owned(),
             sha256_file: sha256_file.to_owned(),
             support_root: None,

@@ -18,6 +18,7 @@ path_filestat_get
 path_open
 sched_yield
 proc_exit
+proc_exit2
 clock_time_set
 fd_dup
 fd_dup2

@@ -19,6 +19,24 @@ support_root = "artifacts/python3-root/lib/python3.14"
 support_bootfs_prefix = "usr/local/lib/python3.14"
 
 [[artifact]]
+command = "bash"
+package = "wasmer/bash"
+version = "1.0.25"
+source_url = "https://wasmer.io/wasmer/bash"
+bootfs_path = "bin/bash"
+source = "artifacts/wasix/bash/bash.wasm"
+sha256_file = "artifacts/wasix/bash/bash.wasm.sha256"
+
+[[artifact]]
+command = "quickjs"
+package = "saghul/quickjs"
+version = "0.0.3"
+source_url = "https://wasmer.io/_/quickjs"
+bootfs_path = "bin/qjs"
+source = "artifacts/wasix/quickjs/qjs.wasm"
+sha256_file = "artifacts/wasix/quickjs/qjs.wasm.sha256"
+
+[[artifact]]
 command = "curl"
 package = "helios-curl-wasi"
 version = "0.1.0"
