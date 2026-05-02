@@ -75,6 +75,7 @@ run_smoke \
     bash-coreutils \
     ok \
     HELIOS_SMOKE=pass \
+    script:ok \
     cwd:/ \
     -- \
     --boot-program dash \
@@ -86,7 +87,7 @@ run_smoke \
     --no-compiler-plugin \
     shell \
     -c \
-    '/bin/bash -c "cd /; /bin/mkdir d; echo ok > /d/f; /bin/cat /d/f | /bin/cat; /bin/env HELIOS_SMOKE=pass; echo cwd:$PWD"'
+    '/bin/bash -c "cd /; /bin/mkdir d; echo ok > /d/f; /bin/cat /d/f | /bin/cat; echo \"echo script:ok\" > /d/s; /bin/bash /d/s; /bin/env HELIOS_SMOKE=pass; echo cwd:$PWD"'
 
 run_smoke \
     bash-exit-status \
