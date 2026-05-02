@@ -2763,62 +2763,82 @@ where
 
     fn keep_alive_enabled(
         &mut self,
-        _: Resource<TcpSocket>,
+        socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<bool, p2tcp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.keep_alive_enabled().map_err(map_p2_tcp_socket_error))
     }
 
     fn set_keep_alive_enabled(
         &mut self,
-        _: Resource<TcpSocket>,
-        _: bool,
+        socket: Resource<TcpSocket>,
+        value: bool,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket
+            .set_keep_alive_enabled(value)
+            .map_err(map_p2_tcp_socket_error))
     }
 
     fn keep_alive_idle_time(
         &mut self,
-        _: Resource<TcpSocket>,
+        socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<p2tcp::Duration, p2tcp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket
+            .keep_alive_idle_time()
+            .map_err(map_p2_tcp_socket_error))
     }
 
     fn set_keep_alive_idle_time(
         &mut self,
-        _: Resource<TcpSocket>,
-        _: p2tcp::Duration,
+        socket: Resource<TcpSocket>,
+        value: p2tcp::Duration,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket
+            .set_keep_alive_idle_time(value)
+            .map_err(map_p2_tcp_socket_error))
     }
 
     fn keep_alive_interval(
         &mut self,
-        _: Resource<TcpSocket>,
+        socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<p2tcp::Duration, p2tcp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket
+            .keep_alive_interval()
+            .map_err(map_p2_tcp_socket_error))
     }
 
     fn set_keep_alive_interval(
         &mut self,
-        _: Resource<TcpSocket>,
-        _: p2tcp::Duration,
+        socket: Resource<TcpSocket>,
+        value: p2tcp::Duration,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket
+            .set_keep_alive_interval(value)
+            .map_err(map_p2_tcp_socket_error))
     }
 
     fn keep_alive_count(
         &mut self,
-        _: Resource<TcpSocket>,
+        socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<u32, p2tcp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.keep_alive_count().map_err(map_p2_tcp_socket_error))
     }
 
     fn set_keep_alive_count(
         &mut self,
-        _: Resource<TcpSocket>,
-        _: u32,
+        socket: Resource<TcpSocket>,
+        value: u32,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket
+            .set_keep_alive_count(value)
+            .map_err(map_p2_tcp_socket_error))
     }
 
     fn hop_limit(

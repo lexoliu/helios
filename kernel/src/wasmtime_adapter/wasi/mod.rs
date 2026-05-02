@@ -34,6 +34,9 @@ const DEFAULT_WASI_UDP_BUFFER_BYTES: u64 = 64 * 1024;
 const DEFAULT_WASI_UDP_HOP_LIMIT: u8 = 64;
 const DEFAULT_WASI_TCP_HOP_LIMIT: u8 = 64;
 const DEFAULT_WASI_TCP_LISTEN_BACKLOG: u16 = 128;
+const DEFAULT_WASI_TCP_KEEP_ALIVE_IDLE_NANOS: u64 = 7_200_000_000_000;
+const DEFAULT_WASI_TCP_KEEP_ALIVE_INTERVAL_NANOS: u64 = 75_000_000_000;
+const DEFAULT_WASI_TCP_KEEP_ALIVE_COUNT: u32 = 9;
 const MAX_WASI_UDP_DATAGRAM_BYTES: usize = u16::MAX as usize;
 const MAX_SYMLINK_DEPTH: usize = 16;
 
@@ -264,6 +267,10 @@ struct TcpSocketState {
     listen_backlog: u16,
     accept_in_progress: bool,
     accept_result: Option<core::result::Result<crate::TcpAccepted<u64>, crate::TcpError>>,
+    keep_alive_enabled: bool,
+    keep_alive_idle_time: u64,
+    keep_alive_interval: u64,
+    keep_alive_count: u32,
     hop_limit: u8,
     receive_buffer_size: u64,
     send_buffer_size: u64,
@@ -414,6 +421,10 @@ impl TcpSocket {
                 listen_backlog: DEFAULT_WASI_TCP_LISTEN_BACKLOG,
                 accept_in_progress: false,
                 accept_result: None,
+                keep_alive_enabled: false,
+                keep_alive_idle_time: DEFAULT_WASI_TCP_KEEP_ALIVE_IDLE_NANOS,
+                keep_alive_interval: DEFAULT_WASI_TCP_KEEP_ALIVE_INTERVAL_NANOS,
+                keep_alive_count: DEFAULT_WASI_TCP_KEEP_ALIVE_COUNT,
                 hop_limit: DEFAULT_WASI_TCP_HOP_LIMIT,
                 receive_buffer_size: DEFAULT_WASI_UDP_BUFFER_BYTES,
                 send_buffer_size: DEFAULT_WASI_UDP_BUFFER_BYTES,
@@ -444,6 +455,10 @@ impl TcpSocket {
                 listen_backlog: DEFAULT_WASI_TCP_LISTEN_BACKLOG,
                 accept_in_progress: false,
                 accept_result: None,
+                keep_alive_enabled: false,
+                keep_alive_idle_time: DEFAULT_WASI_TCP_KEEP_ALIVE_IDLE_NANOS,
+                keep_alive_interval: DEFAULT_WASI_TCP_KEEP_ALIVE_INTERVAL_NANOS,
+                keep_alive_count: DEFAULT_WASI_TCP_KEEP_ALIVE_COUNT,
                 hop_limit: DEFAULT_WASI_TCP_HOP_LIMIT,
                 receive_buffer_size: DEFAULT_WASI_UDP_BUFFER_BYTES,
                 send_buffer_size: DEFAULT_WASI_UDP_BUFFER_BYTES,
@@ -524,6 +539,63 @@ impl TcpSocket {
             return Err(socket_types::ErrorCode::InvalidState);
         }
         state.listen_backlog = backlog;
+        Ok(())
+    }
+
+    fn keep_alive_enabled(&self) -> core::result::Result<bool, socket_types::ErrorCode> {
+        Ok(self.inner.lock().keep_alive_enabled)
+    }
+
+    fn set_keep_alive_enabled(
+        &self,
+        value: bool,
+    ) -> core::result::Result<(), socket_types::ErrorCode> {
+        self.inner.lock().keep_alive_enabled = value;
+        Ok(())
+    }
+
+    fn keep_alive_idle_time(&self) -> core::result::Result<u64, socket_types::ErrorCode> {
+        Ok(self.inner.lock().keep_alive_idle_time)
+    }
+
+    fn set_keep_alive_idle_time(
+        &self,
+        value: u64,
+    ) -> core::result::Result<(), socket_types::ErrorCode> {
+        if value == 0 {
+            return Err(socket_types::ErrorCode::InvalidArgument);
+        }
+        self.inner.lock().keep_alive_idle_time = value;
+        Ok(())
+    }
+
+    fn keep_alive_interval(&self) -> core::result::Result<u64, socket_types::ErrorCode> {
+        Ok(self.inner.lock().keep_alive_interval)
+    }
+
+    fn set_keep_alive_interval(
+        &self,
+        value: u64,
+    ) -> core::result::Result<(), socket_types::ErrorCode> {
+        if value == 0 {
+            return Err(socket_types::ErrorCode::InvalidArgument);
+        }
+        self.inner.lock().keep_alive_interval = value;
+        Ok(())
+    }
+
+    fn keep_alive_count(&self) -> core::result::Result<u32, socket_types::ErrorCode> {
+        Ok(self.inner.lock().keep_alive_count)
+    }
+
+    fn set_keep_alive_count(
+        &self,
+        value: u32,
+    ) -> core::result::Result<(), socket_types::ErrorCode> {
+        if value == 0 {
+            return Err(socket_types::ErrorCode::InvalidArgument);
+        }
+        self.inner.lock().keep_alive_count = value;
         Ok(())
     }
 
@@ -4507,62 +4579,70 @@ where
 
     fn get_keep_alive_enabled(
         &mut self,
-        _: Resource<TcpSocket>,
+        socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<bool, socket_types::ErrorCode>> {
-        Ok(Err(socket_types::ErrorCode::NotSupported))
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.keep_alive_enabled())
     }
 
     fn set_keep_alive_enabled(
         &mut self,
-        _: Resource<TcpSocket>,
-        _: bool,
+        socket: Resource<TcpSocket>,
+        value: bool,
     ) -> Result<core::result::Result<(), socket_types::ErrorCode>> {
-        Ok(Err(socket_types::ErrorCode::NotSupported))
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.set_keep_alive_enabled(value))
     }
 
     fn get_keep_alive_idle_time(
         &mut self,
-        _: Resource<TcpSocket>,
+        socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<wasi::clocks::types::Duration, socket_types::ErrorCode>> {
-        Ok(Err(socket_types::ErrorCode::NotSupported))
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.keep_alive_idle_time())
     }
 
     fn set_keep_alive_idle_time(
         &mut self,
-        _: Resource<TcpSocket>,
-        _: wasi::clocks::types::Duration,
+        socket: Resource<TcpSocket>,
+        value: wasi::clocks::types::Duration,
     ) -> Result<core::result::Result<(), socket_types::ErrorCode>> {
-        Ok(Err(socket_types::ErrorCode::NotSupported))
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.set_keep_alive_idle_time(value))
     }
 
     fn get_keep_alive_interval(
         &mut self,
-        _: Resource<TcpSocket>,
+        socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<wasi::clocks::types::Duration, socket_types::ErrorCode>> {
-        Ok(Err(socket_types::ErrorCode::NotSupported))
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.keep_alive_interval())
     }
 
     fn set_keep_alive_interval(
         &mut self,
-        _: Resource<TcpSocket>,
-        _: wasi::clocks::types::Duration,
+        socket: Resource<TcpSocket>,
+        value: wasi::clocks::types::Duration,
     ) -> Result<core::result::Result<(), socket_types::ErrorCode>> {
-        Ok(Err(socket_types::ErrorCode::NotSupported))
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.set_keep_alive_interval(value))
     }
 
     fn get_keep_alive_count(
         &mut self,
-        _: Resource<TcpSocket>,
+        socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<u32, socket_types::ErrorCode>> {
-        Ok(Err(socket_types::ErrorCode::NotSupported))
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.keep_alive_count())
     }
 
     fn set_keep_alive_count(
         &mut self,
-        _: Resource<TcpSocket>,
-        _: u32,
+        socket: Resource<TcpSocket>,
+        value: u32,
     ) -> Result<core::result::Result<(), socket_types::ErrorCode>> {
-        Ok(Err(socket_types::ErrorCode::NotSupported))
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.set_keep_alive_count(value))
     }
 
     fn get_hop_limit(
@@ -5290,11 +5370,12 @@ mod tests {
     use futures_lite::future::block_on;
 
     use super::{
-        ComponentHostNetworkService, DEFAULT_WASI_TCP_HOP_LIMIT, DEFAULT_WASI_TCP_LISTEN_BACKLOG,
-        DebugFileSystem, FsDescriptor, FsNodeKind, P2ResolveAddressStream, TcpSocket,
-        WasiTcpSocketAddress, WasiTcpSocketFamily, WasiUdpSocketError, fs_types,
-        has_wasi_network_rights, ip_name_lookup, map_p3_dns_error, map_p3_tcp_error,
-        map_p3_udp_socket_error, preview3, socket_types, wasi_tcp_bind_rights,
+        ComponentHostNetworkService, DEFAULT_WASI_TCP_HOP_LIMIT, DEFAULT_WASI_TCP_KEEP_ALIVE_COUNT,
+        DEFAULT_WASI_TCP_KEEP_ALIVE_IDLE_NANOS, DEFAULT_WASI_TCP_KEEP_ALIVE_INTERVAL_NANOS,
+        DEFAULT_WASI_TCP_LISTEN_BACKLOG, DebugFileSystem, FsDescriptor, FsNodeKind,
+        P2ResolveAddressStream, TcpSocket, WasiTcpSocketAddress, WasiTcpSocketFamily,
+        WasiUdpSocketError, fs_types, has_wasi_network_rights, ip_name_lookup, map_p3_dns_error,
+        map_p3_tcp_error, map_p3_udp_socket_error, preview3, socket_types, wasi_tcp_bind_rights,
         wasi_udp_bind_rights,
     };
 
@@ -6271,6 +6352,59 @@ mod tests {
             Err(socket_types::ErrorCode::InvalidArgument)
         ));
         assert_eq!(socket.hop_limit().unwrap(), 127);
+    }
+
+    #[test]
+    fn tcp_socket_keep_alive_options_are_descriptor_local_state() {
+        let service = ComponentHostNetworkService::from_service(TestNetworkService);
+        let socket = TcpSocket::new(service, WasiTcpSocketFamily::Ipv4);
+
+        assert!(!socket.keep_alive_enabled().unwrap());
+        assert_eq!(
+            socket.keep_alive_idle_time().unwrap(),
+            DEFAULT_WASI_TCP_KEEP_ALIVE_IDLE_NANOS
+        );
+        assert_eq!(
+            socket.keep_alive_interval().unwrap(),
+            DEFAULT_WASI_TCP_KEEP_ALIVE_INTERVAL_NANOS
+        );
+        assert_eq!(
+            socket.keep_alive_count().unwrap(),
+            DEFAULT_WASI_TCP_KEEP_ALIVE_COUNT
+        );
+
+        socket
+            .set_keep_alive_enabled(true)
+            .expect("keepalive enable must be accepted");
+        socket
+            .set_keep_alive_idle_time(11)
+            .expect("nonzero idle time must be accepted");
+        socket
+            .set_keep_alive_interval(13)
+            .expect("nonzero interval must be accepted");
+        socket
+            .set_keep_alive_count(3)
+            .expect("nonzero count must be accepted");
+
+        assert!(socket.keep_alive_enabled().unwrap());
+        assert_eq!(socket.keep_alive_idle_time().unwrap(), 11);
+        assert_eq!(socket.keep_alive_interval().unwrap(), 13);
+        assert_eq!(socket.keep_alive_count().unwrap(), 3);
+        assert!(matches!(
+            socket.set_keep_alive_idle_time(0),
+            Err(socket_types::ErrorCode::InvalidArgument)
+        ));
+        assert!(matches!(
+            socket.set_keep_alive_interval(0),
+            Err(socket_types::ErrorCode::InvalidArgument)
+        ));
+        assert!(matches!(
+            socket.set_keep_alive_count(0),
+            Err(socket_types::ErrorCode::InvalidArgument)
+        ));
+        assert_eq!(socket.keep_alive_idle_time().unwrap(), 11);
+        assert_eq!(socket.keep_alive_interval().unwrap(), 13);
+        assert_eq!(socket.keep_alive_count().unwrap(), 3);
     }
 
     #[test]
