@@ -981,6 +981,12 @@ where
         let executable = self
             .load_executable(&exec_context, &source, hint, exec_context.write_serial)
             .await?;
+        let descriptors = match &executable {
+            ProgramExecutable::Component(_) => None,
+            ProgramExecutable::CoreModule(_) | ProgramExecutable::ForkedCoreModule { .. } => {
+                descriptors
+            }
+        };
         self.exec_loaded_buffered(
             exec_context,
             name.into(),
@@ -3799,10 +3805,6 @@ where
     HostFs: crate::HostFileSystem,
 {
     match executable {
-        ProgramExecutable::Component(_) if descriptors.is_some() => Err(ProgramExecError {
-            kind: ProgramExecErrorKind::Unavailable,
-            detail: ProgramExecErrorDetail::ImageReplacementUnavailable,
-        }),
         ProgramExecutable::Component(compiled) => {
             run_program_component(
                 exec_context,
