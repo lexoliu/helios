@@ -120,7 +120,9 @@ impl ByteWriter {
     /// Push a chunk of bytes to the consumer. Succeeds as long as the
     /// reader half is alive. Never blocks.
     pub fn write(&self, bytes: impl Into<Bytes>) -> Result<(), ClosedPeer> {
-        if self.channel.reader_closed.load(Ordering::Acquire) {
+        if self.channel.reader_closed.load(Ordering::Acquire)
+            || self.channel.writer_closed.load(Ordering::Acquire)
+        {
             return Err(ClosedPeer);
         }
         let bytes = bytes.into();
@@ -143,6 +145,11 @@ impl ByteWriter {
     pub fn is_reader_closed(&self) -> bool {
         self.channel.reader_closed.load(Ordering::Acquire)
     }
+
+    pub fn close(&self) {
+        self.channel.writer_closed.store(true, Ordering::Release);
+        self.channel.readable.notify_one();
+    }
 }
 
 impl ByteReader {
@@ -153,7 +160,9 @@ impl ByteReader {
     }
 
     pub fn is_readable(&self) -> bool {
-        !self.channel.queue.is_empty() || self.channel.writer_closed.load(Ordering::Acquire)
+        !self.channel.queue.is_empty()
+            || self.channel.writer_closed.load(Ordering::Acquire)
+            || self.channel.reader_closed.load(Ordering::Acquire)
     }
 
     pub fn poll_readable(
@@ -180,7 +189,9 @@ impl ByteReader {
                 Ok(bytes) => return Some(bytes),
                 Err(PopError::Closed) => return None,
                 Err(PopError::Empty) => {
-                    if self.channel.writer_closed.load(Ordering::Acquire) {
+                    if self.channel.writer_closed.load(Ordering::Acquire)
+                        || self.channel.reader_closed.load(Ordering::Acquire)
+                    {
                         // Drain races: a writer might have enqueued right
                         // before the last liveness guard dropped.
                         return self.channel.queue.pop().ok();
@@ -198,7 +209,9 @@ impl ByteReader {
             Ok(bytes) => TryRead::Ready(bytes),
             Err(PopError::Closed) => TryRead::Eof,
             Err(PopError::Empty) => {
-                if self.channel.writer_closed.load(Ordering::Acquire) {
+                if self.channel.writer_closed.load(Ordering::Acquire)
+                    || self.channel.reader_closed.load(Ordering::Acquire)
+                {
                     TryRead::Eof
                 } else {
                     TryRead::Pending
@@ -217,7 +230,9 @@ impl ByteReader {
                 Ok(bytes) => return core::task::Poll::Ready(Some(bytes)),
                 Err(PopError::Closed) => return core::task::Poll::Ready(None),
                 Err(PopError::Empty) => {
-                    if self.channel.writer_closed.load(Ordering::Acquire) {
+                    if self.channel.writer_closed.load(Ordering::Acquire)
+                        || self.channel.reader_closed.load(Ordering::Acquire)
+                    {
                         return core::task::Poll::Ready(self.channel.queue.pop().ok());
                     }
                     match self.channel.readable.poll_notified(cx, &mut wait.readable) {
@@ -227,6 +242,12 @@ impl ByteReader {
                 }
             }
         }
+    }
+
+    pub fn close(&self) {
+        self.channel.reader_closed.store(true, Ordering::Release);
+        self.channel.queue.close();
+        self.channel.readable.notify_one();
     }
 }
 
@@ -291,6 +312,40 @@ mod tests {
         assert!(!reader.is_readable());
 
         drop(writer);
+        assert!(reader.is_readable());
+        assert!(futures_lite::future::block_on(reader.read()).is_none());
+    }
+
+    #[test]
+    fn byte_writer_close_reports_eof_after_queued_bytes() {
+        let (writer, reader) = byte_channel();
+
+        writer
+            .write(Bytes::from_static(b"before-close"))
+            .expect("reader is still open");
+        writer.close();
+        assert_eq!(
+            writer.write(Bytes::from_static(b"after-close")),
+            Err(super::ClosedPeer)
+        );
+
+        let received = futures_lite::future::block_on(reader.read())
+            .expect("queued bytes should be delivered before EOF");
+        assert_eq!(received.as_ref(), b"before-close");
+        assert!(futures_lite::future::block_on(reader.read()).is_none());
+    }
+
+    #[test]
+    fn byte_reader_close_rejects_future_writes() {
+        let (writer, reader) = byte_channel();
+
+        reader.close();
+
+        assert!(writer.is_reader_closed());
+        assert_eq!(
+            writer.write(Bytes::from_static(b"closed")),
+            Err(super::ClosedPeer)
+        );
         assert!(reader.is_readable());
         assert!(futures_lite::future::block_on(reader.read()).is_none());
     }

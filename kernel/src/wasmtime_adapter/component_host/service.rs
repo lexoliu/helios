@@ -11987,12 +11987,15 @@ where
 async fn p1_sock_shutdown<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
-    _how: u8,
+    how: u8,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
+    if how == 0 || how & !P1_SDFLAGS_SUPPORTED != 0 {
+        return p1::errno::INVAL;
+    }
     let descriptor = caller.data().descriptors.get(fd).cloned();
     match descriptor {
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
@@ -12042,7 +12045,17 @@ where
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
             ..
         }))) => p1::errno::INVAL,
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { .. })) => p1::errno::NOTSUP,
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
+            reader, writer, ..
+        })) => {
+            if how & P1_SDFLAGS_RD != 0 {
+                reader.close();
+            }
+            if how & P1_SDFLAGS_WR != 0 {
+                writer.close();
+            }
+            p1::errno::SUCCESS
+        }
         Some(_) => p1::errno::NOTSOCK,
         None => p1::errno::BADF,
     }
@@ -13019,6 +13032,9 @@ const P1_FSTFLAG_MTIM_NOW: u16 = 1 << 3;
 const P1_EVENTTYPE_CLOCK: u8 = 0;
 const P1_EVENTTYPE_FD_READ: u8 = 1;
 const P1_EVENTTYPE_FD_WRITE: u8 = 2;
+const P1_SDFLAGS_RD: u8 = 1 << 0;
+const P1_SDFLAGS_WR: u8 = 1 << 1;
+const P1_SDFLAGS_SUPPORTED: u8 = P1_SDFLAGS_RD | P1_SDFLAGS_WR;
 const P1_SUBSCRIPTION_CLOCK_ABSTIME: u16 = 1;
 const P1_SUBSCRIPTION_SIZE: u32 = 48;
 const P1_EVENT_SIZE: u32 = 32;
