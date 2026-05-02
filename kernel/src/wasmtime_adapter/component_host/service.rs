@@ -40,6 +40,7 @@ const PROGRAM_SHARED_MEMORY_MAX_PAGES: u32 = 8192;
 const WASIX_ASYNCIFY_DATA_SIZE: u32 = 8;
 const WASIX_STACK_SNAPSHOT_SIZE: usize = 24;
 const WASIX_MODULE: &str = "wasix_32v1";
+const DEFAULT_WASIX_SOCKET_BUFFER_BYTES: u64 = 64 * 1024;
 
 fn system_component_profile_stack(component_name: &str) -> String {
     let mut stack = String::with_capacity(
@@ -426,23 +427,98 @@ enum WasixSocketDescriptor {
         reader: crate::ByteReader,
         writer: crate::ByteWriter,
         carry: Bytes,
+        options: WasixSocketOptions,
     },
 }
 
 #[derive(Clone)]
 enum WasixTcpSocket {
-    Unconnected,
+    Unconnected {
+        options: WasixSocketOptions,
+    },
     Connected {
         stream: u64,
         peer_address: crate::Ipv4Address,
         peer_port: u16,
+        options: WasixSocketOptions,
     },
 }
 
 #[derive(Clone)]
 enum WasixUdpSocket {
-    Unbound,
-    Bound { socket: u64, local_port: u16 },
+    Unbound {
+        options: WasixSocketOptions,
+    },
+    Bound {
+        socket: u64,
+        local_port: u16,
+        options: WasixSocketOptions,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WasixSocketOptions {
+    receive_buffer_size: u64,
+    send_buffer_size: u64,
+}
+
+impl Default for WasixSocketOptions {
+    fn default() -> Self {
+        Self {
+            receive_buffer_size: DEFAULT_WASIX_SOCKET_BUFFER_BYTES,
+            send_buffer_size: DEFAULT_WASIX_SOCKET_BUFFER_BYTES,
+        }
+    }
+}
+
+impl WasixSocketDescriptor {
+    fn options(&self) -> &WasixSocketOptions {
+        match self {
+            WasixSocketDescriptor::Tcp(socket) => socket.options(),
+            WasixSocketDescriptor::Udp(socket) => socket.options(),
+            WasixSocketDescriptor::Pair { options, .. } => options,
+        }
+    }
+
+    fn options_mut(&mut self) -> &mut WasixSocketOptions {
+        match self {
+            WasixSocketDescriptor::Tcp(socket) => socket.options_mut(),
+            WasixSocketDescriptor::Udp(socket) => socket.options_mut(),
+            WasixSocketDescriptor::Pair { options, .. } => options,
+        }
+    }
+}
+
+impl WasixTcpSocket {
+    fn options(&self) -> &WasixSocketOptions {
+        match self {
+            WasixTcpSocket::Unconnected { options } | WasixTcpSocket::Connected { options, .. } => {
+                options
+            }
+        }
+    }
+
+    fn options_mut(&mut self) -> &mut WasixSocketOptions {
+        match self {
+            WasixTcpSocket::Unconnected { options } | WasixTcpSocket::Connected { options, .. } => {
+                options
+            }
+        }
+    }
+}
+
+impl WasixUdpSocket {
+    fn options(&self) -> &WasixSocketOptions {
+        match self {
+            WasixUdpSocket::Unbound { options } | WasixUdpSocket::Bound { options, .. } => options,
+        }
+    }
+
+    fn options_mut(&mut self) -> &mut WasixSocketOptions {
+        match self {
+            WasixUdpSocket::Unbound { options } | WasixUdpSocket::Bound { options, .. } => options,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3341,9 +3417,9 @@ where
             "sock_set_opt_size",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
              fd: i32,
-             _option: i32,
-             _size: i64|
-             -> i32 { wasix_sock_descriptor_unavailable(&mut caller, fd) },
+             option: i32,
+             size: i64|
+             -> i32 { wasix_sock_set_opt_size(&mut caller, fd, option, size) },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -3352,9 +3428,11 @@ where
             "sock_get_opt_size",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
              fd: i32,
-             _option: i32,
+             option: i32,
              ret_size: i32|
-             -> i32 { wasix_sock_get_opt_size(&mut caller, fd, ret_size as u32) },
+             -> i32 {
+                wasix_sock_get_opt_size(&mut caller, fd, option, ret_size as u32)
+            },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -10029,10 +10107,14 @@ where
     };
     let descriptor = match socktype {
         WASIX_SOCK_TYPE_STREAM => {
-            Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected))
+            Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
+                options: WasixSocketOptions::default(),
+            }))
         }
         WASIX_SOCK_TYPE_DGRAM => {
-            Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound))
+            Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
+                options: WasixSocketOptions::default(),
+            }))
         }
         _ => return p1::errno::INVAL,
     };
@@ -10070,11 +10152,13 @@ where
         reader: left_reader,
         writer: left_writer,
         carry: Bytes::new(),
+        options: WasixSocketOptions::default(),
     });
     let second = Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
         reader: right_reader,
         writer: right_writer,
         carry: Bytes::new(),
+        options: WasixSocketOptions::default(),
     });
     let fd0 = match caller.data_mut().descriptors.insert(first) {
         Ok(fd) => fd,
@@ -10116,14 +10200,14 @@ fn wasix_sock_recv_authority(
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
             ..
         }))) => Ok(WasixSocketAuthority::Udp),
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound))) => {
-            Err(p1::errno::INVAL)
-        }
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
+            ..
+        }))) => Err(p1::errno::INVAL),
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
             WasixTcpSocket::Connected { .. },
         ))) => Ok(WasixSocketAuthority::Tcp),
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Unconnected,
+            WasixTcpSocket::Unconnected { .. },
         ))) => Err(p1::errno::INVAL),
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { .. })) => {
             Ok(WasixSocketAuthority::LocalOnly)
@@ -10144,7 +10228,7 @@ fn wasix_sock_send_authority(
             WasixTcpSocket::Connected { .. },
         ))) => Ok(WasixSocketAuthority::Tcp),
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Unconnected,
+            WasixTcpSocket::Unconnected { .. },
         ))) => Err(p1::errno::INVAL),
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { .. })) => {
             Ok(WasixSocketAuthority::LocalOnly)
@@ -10158,9 +10242,9 @@ fn wasix_sock_bind_authority(
     descriptor: Option<&Preview1Descriptor>,
 ) -> Result<WasixSocketAuthority, i32> {
     match descriptor {
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound))) => {
-            Ok(WasixSocketAuthority::Udp)
-        }
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
+            ..
+        }))) => Ok(WasixSocketAuthority::Udp),
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
             ..
         }))) => Err(p1::errno::INVAL),
@@ -10208,23 +10292,65 @@ where
     p1_write_u8(caller, memory, ret_time, WASIX_OPTION_NONE)
 }
 
+fn wasix_sock_set_opt_size<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    fd: i32,
+    option: i32,
+    size: i64,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let size = match u64::try_from(size) {
+        Ok(size) => size,
+        Err(_) => return p1::errno::INVAL,
+    };
+    let Some(Preview1Descriptor::Socket(descriptor)) = caller.data_mut().descriptors.get_mut(fd)
+    else {
+        return match caller.data().descriptors.get(fd) {
+            Some(_) => p1::errno::NOTSOCK,
+            None => p1::errno::BADF,
+        };
+    };
+    match option {
+        WASIX_SOCK_OPTION_RECV_BUF_SIZE => {
+            descriptor.options_mut().receive_buffer_size = size;
+            p1::errno::SUCCESS
+        }
+        WASIX_SOCK_OPTION_SEND_BUF_SIZE => {
+            descriptor.options_mut().send_buffer_size = size;
+            p1::errno::SUCCESS
+        }
+        _ => p1::errno::INVAL,
+    }
+}
+
 fn wasix_sock_get_opt_size<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
+    option: i32,
     ret_size: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    let status = wasix_sock_descriptor_unavailable(caller, fd);
-    if status != p1::errno::SUCCESS {
-        return status;
-    }
+    let Some(Preview1Descriptor::Socket(descriptor)) = caller.data().descriptors.get(fd) else {
+        return match caller.data().descriptors.get(fd) {
+            Some(_) => p1::errno::NOTSOCK,
+            None => p1::errno::BADF,
+        };
+    };
+    let size = match option {
+        WASIX_SOCK_OPTION_RECV_BUF_SIZE => descriptor.options().receive_buffer_size,
+        WASIX_SOCK_OPTION_SEND_BUF_SIZE => descriptor.options().send_buffer_size,
+        _ => return p1::errno::INVAL,
+    };
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    p1_write_u64(caller, memory, ret_size, 0)
+    p1_write_u64(caller, memory, ret_size, size)
 }
 
 fn wasix_sock_multicast<CpuImpl, HostFs>(
@@ -10285,9 +10411,11 @@ where
     else {
         return p1::errno::BADF;
     };
+    let options = *slot.options();
     *slot = WasixUdpSocket::Bound {
         socket: binding.socket,
         local_port: binding.local_port,
+        options,
     };
     p1::errno::SUCCESS
 }
@@ -10329,7 +10457,7 @@ where
     }
     match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Unconnected,
+            WasixTcpSocket::Unconnected { .. },
         ))) => {}
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
             WasixTcpSocket::Connected { .. },
@@ -10354,10 +10482,12 @@ where
     else {
         return p1::errno::BADF;
     };
+    let options = *slot.options();
     *slot = WasixTcpSocket::Connected {
         stream,
         peer_address: address,
         peer_port: port,
+        options,
     };
     p1::errno::SUCCESS
 }
@@ -10426,9 +10556,9 @@ where
             }
             write_wasix_addr_port_ip4(caller, memory, ret_addr, datagram.address, datagram.port)
         }
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound))) => {
-            p1::errno::INVAL
-        }
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
+            ..
+        }))) => p1::errno::INVAL,
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { .. })) => {
             let bytes = match caller
                 .data_mut()
@@ -10466,7 +10596,7 @@ where
             p1_write_u16(caller, memory, ret_flags, 0)
         }
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Unconnected,
+            WasixTcpSocket::Unconnected { .. },
         ))) => p1::errno::INVAL,
         Some(_) => p1::errno::NOTSOCK,
         None => p1::errno::BADF,
@@ -10512,7 +10642,7 @@ where
             };
             let socket = match socket {
                 WasixUdpSocket::Bound { socket, .. } => socket,
-                WasixUdpSocket::Unbound => {
+                WasixUdpSocket::Unbound { options } => {
                     let Some(service) = caller.data().runtime_state.network_service() else {
                         return p1::errno::NETDOWN;
                     };
@@ -10528,6 +10658,7 @@ where
                     *slot = WasixUdpSocket::Bound {
                         socket: binding.socket,
                         local_port: binding.local_port,
+                        options,
                     };
                     let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(
                         WasixUdpSocket::Bound { socket, .. },
@@ -10569,7 +10700,7 @@ where
             p1_write_u32(caller, memory, ret_size, written)
         }
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Unconnected,
+            WasixTcpSocket::Unconnected { .. },
         ))) => p1::errno::INVAL,
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { writer, .. })) => {
             let written = match u32::try_from(bytes.len()) {
@@ -11108,11 +11239,12 @@ where
             else {
                 return p1::errno::BADF;
             };
-            *slot = WasixTcpSocket::Unconnected;
+            let options = *slot.options();
+            *slot = WasixTcpSocket::Unconnected { options };
             p1::errno::SUCCESS
         }
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Unconnected,
+            WasixTcpSocket::Unconnected { .. },
         ))) => p1::errno::INVAL,
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
             socket,
@@ -11131,12 +11263,13 @@ where
             else {
                 return p1::errno::BADF;
             };
-            *slot = WasixUdpSocket::Unbound;
+            let options = *slot.options();
+            *slot = WasixUdpSocket::Unbound { options };
             p1::errno::SUCCESS
         }
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound))) => {
-            p1::errno::INVAL
-        }
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
+            ..
+        }))) => p1::errno::INVAL,
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { .. })) => p1::errno::NOTSUP,
         Some(_) => p1::errno::NOTSOCK,
         None => p1::errno::BADF,
@@ -12034,6 +12167,8 @@ const WASIX_JOIN_STATUS_UNION_OFFSET: u32 = 2;
 const WASIX_SOCK_TYPE_STREAM: i32 = 1;
 const WASIX_SOCK_TYPE_DGRAM: i32 = 2;
 const WASIX_SOCK_STATUS_OPENED: u8 = 1;
+const WASIX_SOCK_OPTION_RECV_BUF_SIZE: i32 = 15;
+const WASIX_SOCK_OPTION_SEND_BUF_SIZE: i32 = 16;
 const WASIX_RIFLAGS_DATA_TRUNCATED: u16 = 1 << 2;
 const WASIX_ADDRESS_FAMILY_UNSPEC: u8 = 0;
 const WASIX_ADDRESS_FAMILY_IP_INET4: u8 = 1;
@@ -12368,19 +12503,24 @@ mod tests {
                 stream: 1,
                 peer_address: crate::Ipv4Address::new([127, 0, 0, 1]),
                 peer_port: 80,
+                options: WasixSocketOptions::default(),
             }));
         let udp_bound =
             Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
                 socket: 2,
                 local_port: 5353,
+                options: WasixSocketOptions::default(),
             }));
         let udp_unbound =
-            Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound));
+            Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
+                options: WasixSocketOptions::default(),
+            }));
         let (left_writer, right_reader) = crate::byte_channel();
         let pair = Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
             reader: right_reader,
             writer: left_writer,
             carry: Bytes::new(),
+            options: WasixSocketOptions::default(),
         });
         let nonsocket = Preview1Descriptor::Stdout;
 
@@ -12429,5 +12569,27 @@ mod tests {
             Err(p1::errno::NOTSOCK)
         );
         assert_eq!(wasix_sock_send_authority(None), Err(p1::errno::BADF));
+    }
+
+    #[test]
+    fn wasix_socket_size_options_are_descriptor_local_state() {
+        let mut descriptor = WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
+            options: WasixSocketOptions::default(),
+        });
+
+        assert_eq!(
+            descriptor.options().receive_buffer_size,
+            DEFAULT_WASIX_SOCKET_BUFFER_BYTES
+        );
+        assert_eq!(
+            descriptor.options().send_buffer_size,
+            DEFAULT_WASIX_SOCKET_BUFFER_BYTES
+        );
+
+        descriptor.options_mut().receive_buffer_size = 4096;
+        descriptor.options_mut().send_buffer_size = 8192;
+
+        assert_eq!(descriptor.options().receive_buffer_size, 4096);
+        assert_eq!(descriptor.options().send_buffer_size, 8192);
     }
 }
