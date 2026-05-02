@@ -9194,19 +9194,38 @@ where
         }
     } else {
         let child_pid = caller.data().children[index].pid;
-        loop {
-            match caller.data_mut().poll_child_exit(index) {
-                Ok(Some(code)) => {
-                    let child = caller.data_mut().children.swap_remove(index);
-                    return wasix_write_join_exit(caller, memory, pid, ret_status, child.pid, code);
-                }
-                Ok(None) => crate::yield_now().await,
-                Err(errno) => return errno,
+        match caller.data_mut().poll_child_exit(index) {
+            Ok(Some(code)) => {
+                let child = caller.data_mut().children.swap_remove(index);
+                return wasix_write_join_exit(caller, memory, pid, ret_status, child.pid, code);
             }
-            if caller.data().find_child_index(Some(child_pid)).is_none() {
-                return wasix_write_join_nothing(caller, memory, ret_status);
-            }
+            Ok(None) => {}
+            Err(errno) => return errno,
         }
+        let Some(exit) = caller.data_mut().children[index].exit.take() else {
+            return wasix_write_join_nothing(caller, memory, ret_status);
+        };
+        let (code, filesystem) = wasix_child_exit_result(exit.await);
+        if let Some(filesystem) = filesystem {
+            caller
+                .data_mut()
+                .filesystem
+                .replace_with_snapshot(filesystem);
+        }
+        let Some(index) = caller.data().find_child_index(Some(child_pid)) else {
+            return wasix_write_join_nothing(caller, memory, ret_status);
+        };
+        let child = caller.data_mut().children.swap_remove(index);
+        wasix_write_join_exit(caller, memory, pid, ret_status, child.pid, code)
+    }
+}
+
+fn wasix_child_exit_result(
+    result: Result<Result<ChildExit, ProgramExecError>, futures::channel::oneshot::Canceled>,
+) -> (u32, Option<DebugFileSystemSnapshot>) {
+    match result {
+        Ok(Ok(exit)) => (exit.exit_code, exit.filesystem),
+        Ok(Err(_)) | Err(_) => (u32::from(p1::errno::IO as u16), None),
     }
 }
 
