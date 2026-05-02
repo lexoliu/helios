@@ -2692,7 +2692,7 @@ where
 /// poll drives it until a chunk is produced.
 pub(crate) struct ChannelStreamProducer {
     reader: crate::ByteReader,
-    pending: Option<Pin<Box<dyn core::future::Future<Output = Option<Vec<u8>>> + Send>>>,
+    pending: Option<Pin<Box<dyn core::future::Future<Output = Option<Bytes>> + Send>>>,
     completion: Option<oneshot::Sender<()>>,
 }
 
@@ -2765,11 +2765,10 @@ impl<T> StreamProducer<T> for ChannelStreamProducer {
                 }
                 Poll::Ready(Some(bytes)) => {
                     self.pending = None;
-                    let bytes: Vec<u8> = bytes;
                     if bytes.is_empty() {
                         continue;
                     }
-                    destination.set_buffer(VecBuffer::from(bytes));
+                    destination.set_buffer(VecBuffer::from(bytes.to_vec()));
                     return Poll::Ready(Ok(StreamResult::Completed));
                 }
             }

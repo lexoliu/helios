@@ -3,6 +3,8 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use bytes::Bytes;
+
 use crate::child_io::{ByteReader, ByteWriter, ClosedPeer, TryRead};
 use crate::{
     EntropyError, EntropyPool, InstanceExecutionTransition, InstanceRegistry, KernelClock,
@@ -333,7 +335,7 @@ where
                 // further writes are simply discarded. This matches POSIX
                 // behavior when writing to a closed pipe with SIGPIPE
                 // suppressed.
-                let _: Result<(), ClosedPeer> = writer.write(bytes.to_vec());
+                let _: Result<(), ClosedPeer> = writer.write(Bytes::copy_from_slice(bytes));
             }
         }
     }
@@ -350,9 +352,9 @@ where
                 TryRead::Ready(mut bytes) => {
                     let cap = max_bytes as usize;
                     if bytes.len() > cap {
-                        bytes.truncate(cap);
+                        bytes = bytes.slice(..cap);
                     }
-                    bytes
+                    bytes.to_vec()
                 }
                 TryRead::Pending | TryRead::Eof => Vec::new(),
             },
@@ -376,7 +378,9 @@ where
                 }
             }
             ComponentOutputMode::Trace => None,
-            ComponentOutputMode::Child { stdin_rx, .. } => stdin_rx.read().await,
+            ComponentOutputMode::Child { stdin_rx, .. } => {
+                stdin_rx.read().await.map(|bytes| bytes.to_vec())
+            }
         }
     }
 

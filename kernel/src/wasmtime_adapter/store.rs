@@ -7,7 +7,6 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 
 use helios_hal::cpu::Cpu;
 use wasmtime::component::ResourceTable;
@@ -193,14 +192,14 @@ where
 /// `Arc<Mutex<_>>`.
 pub struct ChannelInputStream {
     reader: ByteReader,
-    carry: Vec<u8>,
+    carry: Bytes,
 }
 
 impl ChannelInputStream {
     pub fn new(reader: ByteReader) -> Self {
         Self {
             reader,
-            carry: Vec::new(),
+            carry: Bytes::new(),
         }
     }
 }
@@ -212,7 +211,7 @@ impl Pollable for ChannelInputStream {
             return;
         }
         if let Some(bytes) = self.reader.read().await {
-            self.carry.extend_from_slice(&bytes);
+            self.carry = bytes;
         }
     }
 }
@@ -222,17 +221,16 @@ impl InputStream for ChannelInputStream {
     fn read(&mut self, size: usize) -> StreamResult<Bytes> {
         if !self.carry.is_empty() {
             let take = self.carry.len().min(size);
-            let remainder = self.carry.split_off(take);
-            let taken = core::mem::replace(&mut self.carry, remainder);
-            return Ok(Bytes::from(taken));
+            return Ok(self.carry.split_to(take));
         }
         match self.reader.try_read() {
             crate::child_io::TryRead::Ready(mut bytes) => {
                 if bytes.len() > size {
-                    let tail = bytes.split_off(size);
-                    self.carry = tail;
+                    let taken = bytes.split_to(size);
+                    self.carry = bytes;
+                    return Ok(taken);
                 }
-                Ok(Bytes::from(bytes))
+                Ok(bytes)
             }
             crate::child_io::TryRead::Pending => Ok(Bytes::new()),
             crate::child_io::TryRead::Eof => Err(StreamError::Closed),
@@ -262,9 +260,7 @@ impl OutputStream for ChannelOutputStream {
         if self.writer.is_reader_closed() {
             return Err(StreamError::Closed);
         }
-        self.writer
-            .write(bytes.to_vec())
-            .map_err(|_| StreamError::Closed)
+        self.writer.write(bytes).map_err(|_| StreamError::Closed)
     }
 
     fn flush(&mut self) -> StreamResult<()> {

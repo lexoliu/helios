@@ -13,17 +13,18 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use bytes::Bytes;
 use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 
 use crate::Notify;
 
 /// A single byte-stream channel, closable from both ends. Producers push
-/// `Vec<u8>` chunks; consumers await and receive the same chunks back.
+/// reference-counted byte chunks; consumers await and receive the same chunks
+/// back without forcing an extra copy at adapter boundaries.
 struct ByteChannel {
-    queue: ConcurrentQueue<Vec<u8>>,
+    queue: ConcurrentQueue<Bytes>,
     /// Notifies consumers when new bytes or a close event are available.
     readable: Notify,
     /// Set to `true` once every `ByteWriter` cloneable handle has been
@@ -114,10 +115,11 @@ pub struct ClosedPeer;
 impl ByteWriter {
     /// Push a chunk of bytes to the consumer. Succeeds as long as the
     /// reader half is alive. Never blocks.
-    pub fn write(&self, bytes: Vec<u8>) -> Result<(), ClosedPeer> {
+    pub fn write(&self, bytes: impl Into<Bytes>) -> Result<(), ClosedPeer> {
         if self.channel.reader_closed.load(Ordering::Acquire) {
             return Err(ClosedPeer);
         }
+        let bytes = bytes.into();
         if bytes.is_empty() {
             return Ok(());
         }
@@ -142,7 +144,7 @@ impl ByteWriter {
 impl ByteReader {
     /// Await the next chunk. Returns `None` when every writer has been
     /// dropped and the queue is drained (EOF).
-    pub async fn read(&self) -> Option<Vec<u8>> {
+    pub async fn read(&self) -> Option<Bytes> {
         loop {
             match self.channel.queue.pop() {
                 Ok(bytes) => return Some(bytes),
@@ -177,7 +179,29 @@ impl ByteReader {
 }
 
 pub enum TryRead {
-    Ready(Vec<u8>),
+    Ready(Bytes),
     Pending,
     Eof,
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use super::byte_channel;
+
+    #[test]
+    fn byte_channel_preserves_bytes_chunks_without_copying() {
+        let (writer, reader) = byte_channel();
+        let bytes = Bytes::from_static(b"helios");
+        let ptr = bytes.as_ptr();
+
+        writer.write(bytes).expect("reader is still open");
+        drop(writer);
+
+        let received = futures_lite::future::block_on(reader.read())
+            .expect("queued bytes should be delivered before EOF");
+        assert_eq!(received.as_ref(), b"helios");
+        assert_eq!(received.as_ptr(), ptr);
+    }
 }

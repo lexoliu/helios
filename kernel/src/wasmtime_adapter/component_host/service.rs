@@ -286,7 +286,8 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    fn write(&self, stream: crate::ComponentOutputStreamKind, bytes: Vec<u8>) {
+    fn write(&self, stream: crate::ComponentOutputStreamKind, bytes: impl Into<Bytes>) {
+        let bytes = bytes.into();
         if bytes.is_empty() {
             return;
         }
@@ -393,13 +394,13 @@ struct Preview1DescriptorEntry {
 #[derive(Clone)]
 enum Preview1Descriptor {
     Stdin {
-        carry: Vec<u8>,
+        carry: Bytes,
     },
     Stdout,
     Stderr,
     PipeRead {
         reader: crate::ByteReader,
-        carry: Vec<u8>,
+        carry: Bytes,
     },
     PipeWrite {
         writer: crate::ByteWriter,
@@ -424,7 +425,7 @@ enum WasixSocketDescriptor {
     Pair {
         reader: crate::ByteReader,
         writer: crate::ByteWriter,
-        carry: Vec<u8>,
+        carry: Bytes,
     },
 }
 
@@ -1806,7 +1807,7 @@ where
                     crate::ComponentOutputStreamKind::Stdout => stdout_tx,
                     crate::ComponentOutputStreamKind::Stderr => stderr_tx,
                 };
-                let _ = writer.write(bytes.to_vec());
+                let _ = writer.write(Bytes::copy_from_slice(bytes));
             }
         }
     }
@@ -1896,7 +1897,7 @@ where
                 OutputMode::Serial => loop {
                     let bytes = (self.read_serial)(u32::MAX);
                     if !bytes.is_empty() {
-                        *carry = bytes;
+                        *carry = bytes.into();
                         break;
                     }
                     crate::yield_now().await;
@@ -1909,12 +1910,7 @@ where
                 }
             }
         }
-        if carry.len() <= max_bytes {
-            core::mem::take(carry)
-        } else {
-            let tail = carry.split_off(max_bytes);
-            core::mem::replace(carry, tail)
-        }
+        take_preview1_carry(carry, max_bytes)
     }
 
     async fn read_pipe(&mut self, fd: i32, max_bytes: usize) -> Result<Vec<u8>, i32> {
@@ -2144,12 +2140,11 @@ fn preview1_cwd_from_authority(authority: &ProcessAuthority) -> Option<Preview1C
     })
 }
 
-fn take_preview1_carry(carry: &mut Vec<u8>, max_bytes: usize) -> Vec<u8> {
+fn take_preview1_carry(carry: &mut Bytes, max_bytes: usize) -> Vec<u8> {
     if carry.len() <= max_bytes {
-        core::mem::take(carry)
+        core::mem::take(carry).to_vec()
     } else {
-        let tail = carry.split_off(max_bytes);
-        core::mem::replace(carry, tail)
+        carry.split_to(max_bytes).to_vec()
     }
 }
 
@@ -2176,7 +2171,9 @@ impl Preview1DescriptorTable {
         let mut table = Self {
             entries: vec![
                 Some(Preview1DescriptorEntry::new(
-                    Preview1Descriptor::Stdin { carry: Vec::new() },
+                    Preview1Descriptor::Stdin {
+                        carry: Bytes::new(),
+                    },
                     false,
                 )),
                 Some(Preview1DescriptorEntry::new(
@@ -8088,7 +8085,7 @@ where
         .descriptors
         .insert(Preview1Descriptor::PipeRead {
             reader,
-            carry: Vec::new(),
+            carry: Bytes::new(),
         }) {
         Ok(fd) => fd,
         Err(errno) => return errno,
@@ -9098,7 +9095,7 @@ where
             .descriptors
             .insert(Preview1Descriptor::PipeRead {
                 reader,
-                carry: Vec::new(),
+                carry: Bytes::new(),
             })
             .map(Some),
         WasixStdioMode::Inherit | WasixStdioMode::Log => {
@@ -10025,12 +10022,12 @@ where
     let first = Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
         reader: left_reader,
         writer: left_writer,
-        carry: Vec::new(),
+        carry: Bytes::new(),
     });
     let second = Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
         reader: right_reader,
         writer: right_writer,
-        carry: Vec::new(),
+        carry: Bytes::new(),
     });
     let fd0 = match caller.data_mut().descriptors.insert(first) {
         Ok(fd) => fd,
@@ -11427,7 +11424,9 @@ where
             u32::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW)
         }
         Some(Preview1Descriptor::PipeWrite { writer }) => {
-            writer.write(bytes.to_vec()).map_err(|_| p1::errno::IO)?;
+            writer
+                .write(Bytes::copy_from_slice(bytes))
+                .map_err(|_| p1::errno::IO)?;
             u32::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW)
         }
         Some(Preview1Descriptor::Event(event)) => {
@@ -12199,7 +12198,9 @@ mod tests {
         let mut table = Preview1DescriptorTable {
             entries: vec![
                 Some(Preview1DescriptorEntry::new(
-                    Preview1Descriptor::Stdin { carry: Vec::new() },
+                    Preview1Descriptor::Stdin {
+                        carry: Bytes::new(),
+                    },
                     false,
                 )),
                 Some(Preview1DescriptorEntry::new(
@@ -12239,7 +12240,9 @@ mod tests {
         let mut table = Preview1DescriptorTable {
             entries: vec![
                 Some(Preview1DescriptorEntry::new(
-                    Preview1Descriptor::Stdin { carry: Vec::new() },
+                    Preview1Descriptor::Stdin {
+                        carry: Bytes::new(),
+                    },
                     false,
                 )),
                 Some(Preview1DescriptorEntry::new(
@@ -12289,7 +12292,9 @@ mod tests {
         let table = Preview1DescriptorTable {
             entries: vec![
                 Some(Preview1DescriptorEntry::new(
-                    Preview1Descriptor::Stdin { carry: Vec::new() },
+                    Preview1Descriptor::Stdin {
+                        carry: Bytes::new(),
+                    },
                     false,
                 )),
                 Some(Preview1DescriptorEntry::new(closed, true)),
@@ -12327,7 +12332,7 @@ mod tests {
         let pair = Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
             reader: right_reader,
             writer: left_writer,
-            carry: Vec::new(),
+            carry: Bytes::new(),
         });
         let nonsocket = Preview1Descriptor::Stdout;
 
