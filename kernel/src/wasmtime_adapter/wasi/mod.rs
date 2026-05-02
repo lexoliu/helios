@@ -5421,6 +5421,7 @@ pub(crate) fn map_host_fs_error(error: crate::HostFsError) -> fs_types::ErrorCod
 mod tests {
     use alloc::boxed::Box;
     use alloc::collections::BTreeSet;
+    use alloc::string::String;
     use alloc::vec;
     use alloc::vec::Vec;
 
@@ -5826,6 +5827,105 @@ mod tests {
     }
 
     #[test]
+    fn preview3_linked_functions_cover_required_subsystems() {
+        assert_function_set_eq(
+            &wit_function_names(preview3::WIT_PACKAGES, preview3::LINKED_INTERFACES),
+            &[
+                "wasi:cli/environment.get-arguments",
+                "wasi:cli/environment.get-environment",
+                "wasi:cli/environment.get-initial-cwd",
+                "wasi:cli/exit.exit",
+                "wasi:cli/exit.exit-with-code",
+                "wasi:cli/stderr.write-via-stream",
+                "wasi:cli/stdin.read-via-stream",
+                "wasi:cli/stdout.write-via-stream",
+                "wasi:cli/terminal-stderr.get-terminal-stderr",
+                "wasi:cli/terminal-stdin.get-terminal-stdin",
+                "wasi:cli/terminal-stdout.get-terminal-stdout",
+                "wasi:clocks/monotonic-clock.get-resolution",
+                "wasi:clocks/monotonic-clock.now",
+                "wasi:clocks/monotonic-clock.wait-for",
+                "wasi:clocks/monotonic-clock.wait-until",
+                "wasi:clocks/system-clock.get-resolution",
+                "wasi:clocks/system-clock.now",
+                "wasi:filesystem/preopens.get-directories",
+                "wasi:filesystem/types.descriptor.advise",
+                "wasi:filesystem/types.descriptor.append-via-stream",
+                "wasi:filesystem/types.descriptor.create-directory-at",
+                "wasi:filesystem/types.descriptor.get-flags",
+                "wasi:filesystem/types.descriptor.get-type",
+                "wasi:filesystem/types.descriptor.is-same-object",
+                "wasi:filesystem/types.descriptor.link-at",
+                "wasi:filesystem/types.descriptor.metadata-hash",
+                "wasi:filesystem/types.descriptor.metadata-hash-at",
+                "wasi:filesystem/types.descriptor.open-at",
+                "wasi:filesystem/types.descriptor.read-directory",
+                "wasi:filesystem/types.descriptor.read-via-stream",
+                "wasi:filesystem/types.descriptor.readlink-at",
+                "wasi:filesystem/types.descriptor.remove-directory-at",
+                "wasi:filesystem/types.descriptor.rename-at",
+                "wasi:filesystem/types.descriptor.set-size",
+                "wasi:filesystem/types.descriptor.set-times",
+                "wasi:filesystem/types.descriptor.set-times-at",
+                "wasi:filesystem/types.descriptor.stat",
+                "wasi:filesystem/types.descriptor.stat-at",
+                "wasi:filesystem/types.descriptor.symlink-at",
+                "wasi:filesystem/types.descriptor.sync",
+                "wasi:filesystem/types.descriptor.sync-data",
+                "wasi:filesystem/types.descriptor.unlink-file-at",
+                "wasi:filesystem/types.descriptor.write-via-stream",
+                "wasi:random/insecure-seed.get-insecure-seed",
+                "wasi:random/insecure.get-insecure-random-bytes",
+                "wasi:random/insecure.get-insecure-random-u64",
+                "wasi:random/random.get-random-bytes",
+                "wasi:random/random.get-random-u64",
+                "wasi:sockets/ip-name-lookup.resolve-addresses",
+                "wasi:sockets/types.tcp-socket.bind",
+                "wasi:sockets/types.tcp-socket.connect",
+                "wasi:sockets/types.tcp-socket.create",
+                "wasi:sockets/types.tcp-socket.get-address-family",
+                "wasi:sockets/types.tcp-socket.get-hop-limit",
+                "wasi:sockets/types.tcp-socket.get-is-listening",
+                "wasi:sockets/types.tcp-socket.get-keep-alive-count",
+                "wasi:sockets/types.tcp-socket.get-keep-alive-enabled",
+                "wasi:sockets/types.tcp-socket.get-keep-alive-idle-time",
+                "wasi:sockets/types.tcp-socket.get-keep-alive-interval",
+                "wasi:sockets/types.tcp-socket.get-local-address",
+                "wasi:sockets/types.tcp-socket.get-receive-buffer-size",
+                "wasi:sockets/types.tcp-socket.get-remote-address",
+                "wasi:sockets/types.tcp-socket.get-send-buffer-size",
+                "wasi:sockets/types.tcp-socket.listen",
+                "wasi:sockets/types.tcp-socket.receive",
+                "wasi:sockets/types.tcp-socket.send",
+                "wasi:sockets/types.tcp-socket.set-hop-limit",
+                "wasi:sockets/types.tcp-socket.set-keep-alive-count",
+                "wasi:sockets/types.tcp-socket.set-keep-alive-enabled",
+                "wasi:sockets/types.tcp-socket.set-keep-alive-idle-time",
+                "wasi:sockets/types.tcp-socket.set-keep-alive-interval",
+                "wasi:sockets/types.tcp-socket.set-listen-backlog-size",
+                "wasi:sockets/types.tcp-socket.set-receive-buffer-size",
+                "wasi:sockets/types.tcp-socket.set-send-buffer-size",
+                "wasi:sockets/types.udp-socket.bind",
+                "wasi:sockets/types.udp-socket.connect",
+                "wasi:sockets/types.udp-socket.create",
+                "wasi:sockets/types.udp-socket.disconnect",
+                "wasi:sockets/types.udp-socket.get-address-family",
+                "wasi:sockets/types.udp-socket.get-local-address",
+                "wasi:sockets/types.udp-socket.get-receive-buffer-size",
+                "wasi:sockets/types.udp-socket.get-remote-address",
+                "wasi:sockets/types.udp-socket.get-send-buffer-size",
+                "wasi:sockets/types.udp-socket.get-unicast-hop-limit",
+                "wasi:sockets/types.udp-socket.receive",
+                "wasi:sockets/types.udp-socket.send",
+                "wasi:sockets/types.udp-socket.set-receive-buffer-size",
+                "wasi:sockets/types.udp-socket.set-send-buffer-size",
+                "wasi:sockets/types.udp-socket.set-unicast-hop-limit",
+            ],
+            "Preview3",
+        );
+    }
+
+    #[test]
     fn preview2_linked_interfaces_exist_in_wasmtime_wit() {
         let wit_interfaces =
             wit_interface_names(crate::wasmtime_adapter::wasi::preview2::PREVIEW2_WIT_PACKAGES);
@@ -5871,12 +5971,141 @@ mod tests {
         );
     }
 
+    #[test]
+    fn preview2_linked_functions_cover_required_subsystems() {
+        assert_function_set_eq(
+            &wit_function_names(
+                crate::wasmtime_adapter::wasi::preview2::PREVIEW2_WIT_PACKAGES,
+                crate::wasmtime_adapter::wasi::preview2::PREVIEW2_LINKED_INTERFACES,
+            ),
+            &[
+                "wasi:cli/environment.get-arguments",
+                "wasi:cli/environment.get-environment",
+                "wasi:cli/environment.initial-cwd",
+                "wasi:cli/exit.exit",
+                "wasi:cli/exit.exit-with-code",
+                "wasi:cli/stderr.get-stderr",
+                "wasi:cli/stdin.get-stdin",
+                "wasi:cli/stdout.get-stdout",
+                "wasi:cli/terminal-stderr.get-terminal-stderr",
+                "wasi:cli/terminal-stdin.get-terminal-stdin",
+                "wasi:cli/terminal-stdout.get-terminal-stdout",
+                "wasi:clocks/monotonic-clock.now",
+                "wasi:clocks/monotonic-clock.resolution",
+                "wasi:clocks/monotonic-clock.subscribe-duration",
+                "wasi:clocks/monotonic-clock.subscribe-instant",
+                "wasi:clocks/system-clock.now",
+                "wasi:clocks/system-clock.resolution",
+                "wasi:filesystem/preopens.get-directories",
+                "wasi:filesystem/types.descriptor.advise",
+                "wasi:filesystem/types.descriptor.append-via-stream",
+                "wasi:filesystem/types.descriptor.create-directory-at",
+                "wasi:filesystem/types.descriptor.get-flags",
+                "wasi:filesystem/types.descriptor.get-type",
+                "wasi:filesystem/types.descriptor.is-same-object",
+                "wasi:filesystem/types.descriptor.link-at",
+                "wasi:filesystem/types.descriptor.metadata-hash",
+                "wasi:filesystem/types.descriptor.metadata-hash-at",
+                "wasi:filesystem/types.descriptor.open-at",
+                "wasi:filesystem/types.descriptor.read",
+                "wasi:filesystem/types.descriptor.read-directory",
+                "wasi:filesystem/types.descriptor.read-via-stream",
+                "wasi:filesystem/types.descriptor.readlink-at",
+                "wasi:filesystem/types.descriptor.remove-directory-at",
+                "wasi:filesystem/types.descriptor.rename-at",
+                "wasi:filesystem/types.descriptor.set-size",
+                "wasi:filesystem/types.descriptor.set-times",
+                "wasi:filesystem/types.descriptor.set-times-at",
+                "wasi:filesystem/types.descriptor.stat",
+                "wasi:filesystem/types.descriptor.stat-at",
+                "wasi:filesystem/types.descriptor.symlink-at",
+                "wasi:filesystem/types.descriptor.sync",
+                "wasi:filesystem/types.descriptor.sync-data",
+                "wasi:filesystem/types.descriptor.unlink-file-at",
+                "wasi:filesystem/types.descriptor.write",
+                "wasi:filesystem/types.descriptor.write-via-stream",
+                "wasi:filesystem/types.directory-entry-stream.read-directory-entry",
+                "wasi:filesystem/types.filesystem-error-code",
+                "wasi:random/insecure-seed.insecure-seed",
+                "wasi:random/insecure.get-insecure-random-bytes",
+                "wasi:random/insecure.get-insecure-random-u64",
+                "wasi:random/random.get-random-bytes",
+                "wasi:random/random.get-random-u64",
+                "wasi:sockets/instance-network.instance-network",
+                "wasi:sockets/ip-name-lookup.resolve-address-stream.resolve-next-address",
+                "wasi:sockets/ip-name-lookup.resolve-address-stream.subscribe",
+                "wasi:sockets/ip-name-lookup.resolve-addresses",
+                "wasi:sockets/network.network-error-code",
+                "wasi:sockets/tcp-create-socket.create-tcp-socket",
+                "wasi:sockets/tcp.tcp-socket.accept",
+                "wasi:sockets/tcp.tcp-socket.address-family",
+                "wasi:sockets/tcp.tcp-socket.finish-bind",
+                "wasi:sockets/tcp.tcp-socket.finish-connect",
+                "wasi:sockets/tcp.tcp-socket.finish-listen",
+                "wasi:sockets/tcp.tcp-socket.hop-limit",
+                "wasi:sockets/tcp.tcp-socket.is-listening",
+                "wasi:sockets/tcp.tcp-socket.keep-alive-count",
+                "wasi:sockets/tcp.tcp-socket.keep-alive-enabled",
+                "wasi:sockets/tcp.tcp-socket.keep-alive-idle-time",
+                "wasi:sockets/tcp.tcp-socket.keep-alive-interval",
+                "wasi:sockets/tcp.tcp-socket.local-address",
+                "wasi:sockets/tcp.tcp-socket.receive-buffer-size",
+                "wasi:sockets/tcp.tcp-socket.remote-address",
+                "wasi:sockets/tcp.tcp-socket.send-buffer-size",
+                "wasi:sockets/tcp.tcp-socket.set-hop-limit",
+                "wasi:sockets/tcp.tcp-socket.set-keep-alive-count",
+                "wasi:sockets/tcp.tcp-socket.set-keep-alive-enabled",
+                "wasi:sockets/tcp.tcp-socket.set-keep-alive-idle-time",
+                "wasi:sockets/tcp.tcp-socket.set-keep-alive-interval",
+                "wasi:sockets/tcp.tcp-socket.set-listen-backlog-size",
+                "wasi:sockets/tcp.tcp-socket.set-receive-buffer-size",
+                "wasi:sockets/tcp.tcp-socket.set-send-buffer-size",
+                "wasi:sockets/tcp.tcp-socket.shutdown",
+                "wasi:sockets/tcp.tcp-socket.start-bind",
+                "wasi:sockets/tcp.tcp-socket.start-connect",
+                "wasi:sockets/tcp.tcp-socket.start-listen",
+                "wasi:sockets/tcp.tcp-socket.subscribe",
+                "wasi:sockets/udp-create-socket.create-udp-socket",
+                "wasi:sockets/udp.incoming-datagram-stream.receive",
+                "wasi:sockets/udp.incoming-datagram-stream.subscribe",
+                "wasi:sockets/udp.outgoing-datagram-stream.check-send",
+                "wasi:sockets/udp.outgoing-datagram-stream.send",
+                "wasi:sockets/udp.outgoing-datagram-stream.subscribe",
+                "wasi:sockets/udp.udp-socket.address-family",
+                "wasi:sockets/udp.udp-socket.finish-bind",
+                "wasi:sockets/udp.udp-socket.local-address",
+                "wasi:sockets/udp.udp-socket.receive-buffer-size",
+                "wasi:sockets/udp.udp-socket.remote-address",
+                "wasi:sockets/udp.udp-socket.send-buffer-size",
+                "wasi:sockets/udp.udp-socket.set-receive-buffer-size",
+                "wasi:sockets/udp.udp-socket.set-send-buffer-size",
+                "wasi:sockets/udp.udp-socket.set-unicast-hop-limit",
+                "wasi:sockets/udp.udp-socket.start-bind",
+                "wasi:sockets/udp.udp-socket.stream",
+                "wasi:sockets/udp.udp-socket.subscribe",
+                "wasi:sockets/udp.udp-socket.unicast-hop-limit",
+            ],
+            "Preview2",
+        );
+    }
+
     fn assert_interface_set_eq(actual: &[&'static str], expected: &[&'static str], label: &str) {
         let actual = actual.iter().copied().collect::<BTreeSet<_>>();
         let expected = expected.iter().copied().collect::<BTreeSet<_>>();
         assert_eq!(
             actual, expected,
             "{label} linked interface coverage changed"
+        );
+    }
+
+    fn assert_function_set_eq(actual: &BTreeSet<String>, expected: &[&'static str], label: &str) {
+        let expected = expected
+            .iter()
+            .map(|function| String::from(*function))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            actual, &expected,
+            "{label} linked function coverage changed"
         );
     }
 
@@ -5890,55 +6119,170 @@ mod tests {
                     let name = rest
                         .split(|byte: char| byte.is_whitespace() || byte == '{')
                         .next()?;
-                    Some(match *package {
-                        "wasi:cli" => match name {
-                            "environment" => "wasi:cli/environment",
-                            "exit" => "wasi:cli/exit",
-                            "run" => "wasi:cli/run",
-                            "types" => "wasi:cli/types",
-                            "stdin" => "wasi:cli/stdin",
-                            "stdout" => "wasi:cli/stdout",
-                            "stderr" => "wasi:cli/stderr",
-                            "terminal-input" => "wasi:cli/terminal-input",
-                            "terminal-output" => "wasi:cli/terminal-output",
-                            "terminal-stdin" => "wasi:cli/terminal-stdin",
-                            "terminal-stdout" => "wasi:cli/terminal-stdout",
-                            "terminal-stderr" => "wasi:cli/terminal-stderr",
-                            _ => return None,
-                        },
-                        "wasi:clocks" => match name {
-                            "types" => "wasi:clocks/types",
-                            "monotonic-clock" => "wasi:clocks/monotonic-clock",
-                            "system-clock" | "wall-clock" => "wasi:clocks/system-clock",
-                            _ => return None,
-                        },
-                        "wasi:filesystem" => match name {
-                            "types" => "wasi:filesystem/types",
-                            "preopens" => "wasi:filesystem/preopens",
-                            _ => return None,
-                        },
-                        "wasi:random" => match name {
-                            "random" => "wasi:random/random",
-                            "insecure" => "wasi:random/insecure",
-                            "insecure-seed" => "wasi:random/insecure-seed",
-                            _ => return None,
-                        },
-                        "wasi:sockets" => match name {
-                            "types" => "wasi:sockets/types",
-                            "network" => "wasi:sockets/network",
-                            "instance-network" => "wasi:sockets/instance-network",
-                            "udp" => "wasi:sockets/udp",
-                            "udp-create-socket" => "wasi:sockets/udp-create-socket",
-                            "tcp" => "wasi:sockets/tcp",
-                            "tcp-create-socket" => "wasi:sockets/tcp-create-socket",
-                            "ip-name-lookup" => "wasi:sockets/ip-name-lookup",
-                            _ => return None,
-                        },
-                        _ => return None,
-                    })
+                    wit_interface_name(package, name)
                 })
             })
             .collect()
+    }
+
+    fn wit_function_names(
+        packages: &[(&'static str, &'static str)],
+        linked_interfaces: &[&'static str],
+    ) -> BTreeSet<String> {
+        let linked_interfaces = linked_interfaces.iter().copied().collect::<BTreeSet<_>>();
+        let mut functions = BTreeSet::new();
+        for (package, wit) in packages {
+            let mut interface = None;
+            let mut interface_depth = 0_i32;
+            let mut resource = None;
+            let mut resource_depth = 0_i32;
+
+            for line in wit.lines() {
+                let trimmed = line.trim_start();
+                if interface.is_none() {
+                    if let Some(rest) = trimmed.strip_prefix("interface ") {
+                        let Some(name) = rest
+                            .split(|byte: char| byte.is_whitespace() || byte == '{')
+                            .next()
+                        else {
+                            continue;
+                        };
+                        let Some(mapped) = wit_interface_name(package, name) else {
+                            continue;
+                        };
+                        if !linked_interfaces.contains(mapped) {
+                            continue;
+                        }
+                        interface = Some(mapped);
+                        interface_depth = wit_brace_delta(line);
+                    }
+                    continue;
+                }
+
+                if resource_depth > 0 {
+                    if let Some(method) = wit_func_name(trimmed) {
+                        let interface = interface.expect("resource methods require an interface");
+                        let resource = resource.expect("resource method requires resource context");
+                        functions.insert(wit_scoped_resource_function(interface, resource, method));
+                    }
+                    resource_depth += wit_brace_delta(line);
+                    if resource_depth <= 0 {
+                        resource = None;
+                        resource_depth = 0;
+                    }
+                } else if let Some(rest) = trimmed.strip_prefix("resource ") {
+                    let Some(name) = rest
+                        .split(|byte: char| byte.is_whitespace() || byte == '{' || byte == ';')
+                        .next()
+                    else {
+                        continue;
+                    };
+                    resource = Some(name);
+                    resource_depth = wit_brace_delta(line);
+                    if resource_depth <= 0 {
+                        resource = None;
+                        resource_depth = 0;
+                    }
+                } else if let Some(function) = wit_func_name(trimmed) {
+                    let interface = interface.expect("functions require an interface");
+                    functions.insert(wit_scoped_function(interface, function));
+                }
+
+                interface_depth += wit_brace_delta(line);
+                if interface_depth <= 0 {
+                    interface = None;
+                    interface_depth = 0;
+                    resource = None;
+                    resource_depth = 0;
+                }
+            }
+        }
+        functions
+    }
+
+    fn wit_interface_name(package: &str, name: &str) -> Option<&'static str> {
+        Some(match package {
+            "wasi:cli" => match name {
+                "environment" => "wasi:cli/environment",
+                "exit" => "wasi:cli/exit",
+                "run" => "wasi:cli/run",
+                "types" => "wasi:cli/types",
+                "stdin" => "wasi:cli/stdin",
+                "stdout" => "wasi:cli/stdout",
+                "stderr" => "wasi:cli/stderr",
+                "terminal-input" => "wasi:cli/terminal-input",
+                "terminal-output" => "wasi:cli/terminal-output",
+                "terminal-stdin" => "wasi:cli/terminal-stdin",
+                "terminal-stdout" => "wasi:cli/terminal-stdout",
+                "terminal-stderr" => "wasi:cli/terminal-stderr",
+                _ => return None,
+            },
+            "wasi:clocks" => match name {
+                "types" => "wasi:clocks/types",
+                "monotonic-clock" => "wasi:clocks/monotonic-clock",
+                "system-clock" | "wall-clock" => "wasi:clocks/system-clock",
+                _ => return None,
+            },
+            "wasi:filesystem" => match name {
+                "types" => "wasi:filesystem/types",
+                "preopens" => "wasi:filesystem/preopens",
+                _ => return None,
+            },
+            "wasi:random" => match name {
+                "random" => "wasi:random/random",
+                "insecure" => "wasi:random/insecure",
+                "insecure-seed" => "wasi:random/insecure-seed",
+                _ => return None,
+            },
+            "wasi:sockets" => match name {
+                "types" => "wasi:sockets/types",
+                "network" => "wasi:sockets/network",
+                "instance-network" => "wasi:sockets/instance-network",
+                "udp" => "wasi:sockets/udp",
+                "udp-create-socket" => "wasi:sockets/udp-create-socket",
+                "tcp" => "wasi:sockets/tcp",
+                "tcp-create-socket" => "wasi:sockets/tcp-create-socket",
+                "ip-name-lookup" => "wasi:sockets/ip-name-lookup",
+                _ => return None,
+            },
+            _ => return None,
+        })
+    }
+
+    fn wit_func_name(line: &str) -> Option<&str> {
+        if !line.contains("func(") && !line.contains("func()") {
+            return None;
+        }
+        let (name, signature) = line.split_once(':')?;
+        if !signature.contains("func") {
+            return None;
+        }
+        name.strip_prefix('%').or(Some(name))
+    }
+
+    fn wit_scoped_function(interface: &str, function: &str) -> String {
+        let mut scoped = String::from(interface);
+        scoped.push('.');
+        scoped.push_str(function);
+        scoped
+    }
+
+    fn wit_scoped_resource_function(interface: &str, resource: &str, function: &str) -> String {
+        let mut scoped = String::from(interface);
+        scoped.push('.');
+        scoped.push_str(resource);
+        scoped.push('.');
+        scoped.push_str(function);
+        scoped
+    }
+
+    fn wit_brace_delta(line: &str) -> i32 {
+        if line.trim_start().starts_with("///") {
+            return 0;
+        }
+        let opens = line.bytes().filter(|byte| *byte == b'{').count() as i32;
+        let closes = line.bytes().filter(|byte| *byte == b'}').count() as i32;
+        opens - closes
     }
 
     #[test]
