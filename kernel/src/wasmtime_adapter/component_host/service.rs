@@ -17,7 +17,7 @@ use alloc::vec;
 use bytes::Bytes;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicI32, Ordering as AtomicOrdering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use core::task::{Context, Poll};
 use core::time::Duration;
 use helios_compiler_abi::{
@@ -40,6 +40,7 @@ const PROGRAM_SHARED_MEMORY_MAX_PAGES: u32 = 8192;
 const WASIX_ASYNCIFY_DATA_SIZE: u32 = 8;
 const WASIX_STACK_SNAPSHOT_SIZE: usize = 24;
 const WASIX_THREAD_START_SIZE: usize = 64;
+const WASIX_NO_PENDING_SIGNAL: u32 = u32::MAX;
 const WASIX_MODULE: &str = "wasix_32v1";
 const DEFAULT_WASIX_SOCKET_BUFFER_BYTES: u64 = 64 * 1024;
 const DEFAULT_WASIX_SOCKET_LOW_WATER_BYTES: u64 = 1;
@@ -243,6 +244,7 @@ where
     authority: ProcessAuthority,
     tty_state: WasixTtyState,
     signal_callback: Option<String>,
+    signal_state: WasixSignalState,
     descriptors: Preview1DescriptorTable,
     asyncify: WasixAsyncifyState,
     children: Vec<WasixChildProcess>,
@@ -262,6 +264,50 @@ struct WasixThread {
     tid: u32,
     exit: Option<futures::channel::oneshot::Receiver<u32>>,
     completed: Option<u32>,
+}
+
+#[derive(Clone)]
+struct WasixSignalState {
+    pending: Arc<AtomicU32>,
+    interval_generation: Arc<AtomicU64>,
+}
+
+impl WasixSignalState {
+    fn new() -> Self {
+        Self {
+            pending: Arc::new(AtomicU32::new(WASIX_NO_PENDING_SIGNAL)),
+            interval_generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn raise(&self, signal: u32) {
+        self.pending.store(signal, AtomicOrdering::Release);
+        crate::wasmtime_adapter::bump_user_engine_epoch();
+    }
+
+    fn take_pending(&self) -> Option<u32> {
+        match self
+            .pending
+            .swap(WASIX_NO_PENDING_SIGNAL, AtomicOrdering::AcqRel)
+        {
+            WASIX_NO_PENDING_SIGNAL => None,
+            signal => Some(signal),
+        }
+    }
+
+    fn next_interval_generation(&self) -> u64 {
+        self.interval_generation
+            .fetch_add(1, AtomicOrdering::AcqRel)
+            .saturating_add(1)
+    }
+
+    fn cancel_interval(&self) {
+        let _ = self.next_interval_generation();
+    }
+
+    fn interval_generation_is_current(&self, generation: u64) -> bool {
+        self.interval_generation.load(AtomicOrdering::Acquire) == generation
+    }
 }
 
 struct WasixPreparedProgram {
@@ -1887,6 +1933,7 @@ where
             authority,
             tty_state,
             signal_callback: None,
+            signal_state: WasixSignalState::new(),
             descriptors,
             asyncify: WasixAsyncifyState::new(),
             children: Vec::new(),
@@ -5109,9 +5156,15 @@ fn configure_preview1_program_store<CpuImpl, HostFs>(
     HostFs: crate::HostFileSystem,
 {
     store.call_hook(
-        |caller: StoreContextMut<'_, Preview1ProgramStore<CpuImpl, HostFs>>, hook| {
+        |mut caller: StoreContextMut<'_, Preview1ProgramStore<CpuImpl, HostFs>>, hook| {
             let transition = crate::wasmtime_adapter::store::translate_call_hook(hook);
             caller.data().record_transition(transition);
+            if let Some(signal) = caller.data().signal_state.take_pending() {
+                caller
+                    .data_mut()
+                    .request_exit(128u32.saturating_add(signal));
+                return Err(wasmtime::Error::new(Preview1Exit));
+            }
             if let Some(reason) = caller.data().check_pending_kill() {
                 return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
             }
@@ -8918,10 +8971,35 @@ where
     if interval < 0 || !matches!(repeat, 0 | 1) {
         return p1::errno::INVAL;
     }
+    let signal = match u32::try_from(signal) {
+        Ok(signal) => signal,
+        Err(_) => return p1::errno::INVAL,
+    };
     if interval == 0 {
+        caller.data().signal_state.cancel_interval();
         return p1::errno::SUCCESS;
     }
-    p1::errno::NOTSUP
+    let interval = match u64::try_from(interval) {
+        Ok(interval) => interval,
+        Err(_) => return p1::errno::INVAL,
+    };
+    let repeat = repeat != 0;
+    let signal_state = caller.data().signal_state.clone();
+    let generation = signal_state.next_interval_generation();
+    let timer = caller.data().timer.clone();
+    caller.data().spawner.spawn_detached(async move {
+        loop {
+            timer.sleep_for(Duration::from_nanos(interval)).await;
+            if !signal_state.interval_generation_is_current(generation) {
+                break;
+            }
+            signal_state.raise(signal);
+            if !repeat {
+                break;
+            }
+        }
+    });
+    p1::errno::SUCCESS
 }
 
 async fn wasix_proc_fork<CpuImpl, HostFs>(
@@ -9908,6 +9986,7 @@ where
     let write_serial = caller.data().write_serial;
     let filesystem = caller.data().filesystem.snapshot();
     let descriptors = caller.data().descriptors.clone();
+    let signal_state = caller.data().signal_state.clone();
     let wasix_abi = caller.data().wasix_abi;
     let engine = compiled.module.engine().clone();
 
@@ -9931,6 +10010,7 @@ where
         wasix_abi,
     );
     store_data.set_thread_id(tid);
+    store_data.signal_state = signal_state;
     caller.data_mut().insert_thread(tid, exit_rx);
     spawner.spawn_detached(async move {
         let code = run_wasix_thread(engine, compiled, imported_memory, store_data, tid, args).await;
