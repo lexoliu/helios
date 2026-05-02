@@ -2595,7 +2595,7 @@ where
         socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
         let socket = self.table.get(&socket)?.clone();
-        let (service, inner, ready, local_port) = {
+        let (service, inner, ready, local_port, listen_backlog) = {
             let mut state = socket.inner.lock();
             if state.stream.is_some()
                 || state.listener.is_some()
@@ -2616,12 +2616,11 @@ where
                 socket.inner.clone(),
                 socket.ready.clone(),
                 local_port,
+                state.listen_backlog,
             )
         };
         self.spawner().spawn_detached(async move {
-            let result = service
-                .tcp_listen(local_port, super::DEFAULT_WASI_TCP_LISTEN_BACKLOG)
-                .await;
+            let result = service.tcp_listen(local_port, listen_backlog).await;
             let mut state = inner.lock();
             state.listen_in_progress = false;
             state.listen_result = Some(result);
@@ -2753,10 +2752,13 @@ where
 
     fn set_listen_backlog_size(
         &mut self,
-        _: Resource<TcpSocket>,
-        _: u64,
+        socket: Resource<TcpSocket>,
+        value: u64,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket
+            .set_listen_backlog_size(value)
+            .map_err(map_p2_tcp_socket_error))
     }
 
     fn keep_alive_enabled(

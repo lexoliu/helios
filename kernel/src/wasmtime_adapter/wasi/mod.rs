@@ -261,6 +261,7 @@ struct TcpSocketState {
     connect_result: Option<core::result::Result<(), crate::TcpError>>,
     listen_in_progress: bool,
     listen_result: Option<core::result::Result<crate::TcpListener<u64>, crate::TcpError>>,
+    listen_backlog: u16,
     accept_in_progress: bool,
     accept_result: Option<core::result::Result<crate::TcpAccepted<u64>, crate::TcpError>>,
     hop_limit: u8,
@@ -376,6 +377,7 @@ impl TcpSocket {
                 connect_result: None,
                 listen_in_progress: false,
                 listen_result: None,
+                listen_backlog: DEFAULT_WASI_TCP_LISTEN_BACKLOG,
                 accept_in_progress: false,
                 accept_result: None,
                 hop_limit: DEFAULT_WASI_TCP_HOP_LIMIT,
@@ -405,6 +407,7 @@ impl TcpSocket {
                 connect_result: None,
                 listen_in_progress: false,
                 listen_result: None,
+                listen_backlog: DEFAULT_WASI_TCP_LISTEN_BACKLOG,
                 accept_in_progress: false,
                 accept_result: None,
                 hop_limit: DEFAULT_WASI_TCP_HOP_LIMIT,
@@ -460,6 +463,34 @@ impl TcpSocket {
 
     fn is_listening(&self) -> bool {
         self.inner.lock().listener.is_some()
+    }
+
+    #[cfg(test)]
+    fn listen_backlog(&self) -> u16 {
+        self.inner.lock().listen_backlog
+    }
+
+    fn set_listen_backlog_size(
+        &self,
+        value: u64,
+    ) -> core::result::Result<(), socket_types::ErrorCode> {
+        let backlog = u16::try_from(value).map_err(|_| socket_types::ErrorCode::InvalidArgument)?;
+        if backlog == 0 {
+            return Err(socket_types::ErrorCode::InvalidArgument);
+        }
+        let mut state = self.inner.lock();
+        if state.stream.is_some()
+            || state.connect_in_progress
+            || state.connect_result.is_some()
+            || state.listener.is_some()
+            || state.listen_in_progress
+            || state.listen_result.is_some()
+            || state.accept_in_progress
+        {
+            return Err(socket_types::ErrorCode::InvalidState);
+        }
+        state.listen_backlog = backlog;
+        Ok(())
     }
 
     fn receive_buffer_size(&self) -> core::result::Result<u64, socket_types::ErrorCode> {
@@ -4244,9 +4275,10 @@ where
 
     fn get_local_address(
         &mut self,
-        _: Resource<TcpSocket>,
+        socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<socket_types::IpSocketAddress, socket_types::ErrorCode>> {
-        Ok(Err(socket_types::ErrorCode::NotSupported))
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.local_address().map(format_p3_tcp_socket_address))
     }
 
     fn get_remote_address(
@@ -4257,8 +4289,9 @@ where
         Ok(socket.remote_address().map(format_p3_tcp_socket_address))
     }
 
-    fn get_is_listening(&mut self, _: Resource<TcpSocket>) -> Result<bool> {
-        Ok(false)
+    fn get_is_listening(&mut self, socket: Resource<TcpSocket>) -> Result<bool> {
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.is_listening())
     }
 
     fn get_address_family(
@@ -4271,10 +4304,11 @@ where
 
     fn set_listen_backlog_size(
         &mut self,
-        _: Resource<TcpSocket>,
-        _: u64,
+        socket: Resource<TcpSocket>,
+        value: u64,
     ) -> Result<core::result::Result<(), socket_types::ErrorCode>> {
-        Ok(Err(socket_types::ErrorCode::NotSupported))
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.set_listen_backlog_size(value))
     }
 
     fn get_keep_alive_enabled(
@@ -5010,10 +5044,11 @@ mod tests {
     use futures_lite::future::block_on;
 
     use super::{
-        ComponentHostNetworkService, DEFAULT_WASI_TCP_HOP_LIMIT, DebugFileSystem, FsDescriptor,
-        FsNodeKind, P2ResolveAddressStream, TcpSocket, WasiTcpSocketAddress, WasiTcpSocketFamily,
-        WasiUdpSocketError, fs_types, has_wasi_network_rights, ip_name_lookup, map_p3_dns_error,
-        map_p3_tcp_error, map_p3_udp_socket_error, preview3, socket_types, wasi_tcp_bind_rights,
+        ComponentHostNetworkService, DEFAULT_WASI_TCP_HOP_LIMIT, DEFAULT_WASI_TCP_LISTEN_BACKLOG,
+        DebugFileSystem, FsDescriptor, FsNodeKind, P2ResolveAddressStream, TcpSocket,
+        WasiTcpSocketAddress, WasiTcpSocketFamily, WasiUdpSocketError, fs_types,
+        has_wasi_network_rights, ip_name_lookup, map_p3_dns_error, map_p3_tcp_error,
+        map_p3_udp_socket_error, preview3, socket_types, wasi_tcp_bind_rights,
         wasi_udp_bind_rights,
     };
 
@@ -6006,6 +6041,27 @@ mod tests {
             .expect("unconnected socket must accept a local bind");
         assert_eq!(socket.local_address().unwrap(), local);
         assert!(!socket.is_listening());
+    }
+
+    #[test]
+    fn tcp_socket_listen_backlog_is_descriptor_local_state() {
+        let service = ComponentHostNetworkService::from_service(TestNetworkService);
+        let socket = TcpSocket::new(service, WasiTcpSocketFamily::Ipv4);
+
+        assert_eq!(socket.listen_backlog(), DEFAULT_WASI_TCP_LISTEN_BACKLOG);
+        socket
+            .set_listen_backlog_size(64)
+            .expect("positive u16 backlog must be accepted");
+        assert_eq!(socket.listen_backlog(), 64);
+        assert!(matches!(
+            socket.set_listen_backlog_size(0),
+            Err(socket_types::ErrorCode::InvalidArgument)
+        ));
+        assert!(matches!(
+            socket.set_listen_backlog_size(u64::from(u16::MAX) + 1),
+            Err(socket_types::ErrorCode::InvalidArgument)
+        ));
+        assert_eq!(socket.listen_backlog(), 64);
     }
 
     #[test]
