@@ -34,6 +34,9 @@ use crate::{ComponentNetworkService, ComponentOutputMode, ComponentOutputStreamK
 
 #[cfg(test)]
 pub(crate) const PREVIEW2_LINKED_INTERFACES: &[&str] = &[
+    "wasi:io/error",
+    "wasi:io/poll",
+    "wasi:io/streams",
     "wasi:cli/environment",
     "wasi:cli/exit",
     "wasi:cli/stdin",
@@ -62,6 +65,10 @@ pub(crate) const PREVIEW2_LINKED_INTERFACES: &[&str] = &[
 
 #[cfg(test)]
 pub(crate) const PREVIEW2_WIT_PACKAGES: &[(&str, &str)] = &[
+    (
+        "wasi:io",
+        include_str!("../../../../../wasmtime/crates/wasi/src/p2/wit/deps/io.wit"),
+    ),
     (
         "wasi:cli",
         include_str!("../../../../../wasmtime/crates/wasi/src/p2/wit/deps/cli.wit"),
