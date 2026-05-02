@@ -2940,7 +2940,10 @@ impl Preview1DescriptorTable {
         if to >= self.entries.len() {
             self.entries.resize_with(to + 1, || None);
         }
-        self.entries[to] = self.entries[from].take();
+        self.entries[to] = self.entries[from].take().map(|mut entry| {
+            entry.close_on_exec = false;
+            entry
+        });
         p1::errno::SUCCESS
     }
 }
@@ -7802,7 +7805,10 @@ where
     if !p1_file_fdflags_supported(fdflags) {
         return p1::errno::INVAL;
     }
-    let descriptor_flags = p1_descriptor_flags(rights, fdflags);
+    let mut descriptor_flags = p1_descriptor_flags(rights, fdflags);
+    if open_flags.intersects(fs_types::OpenFlags::CREATE | fs_types::OpenFlags::TRUNCATE) {
+        descriptor_flags |= fs_types::DescriptorFlags::WRITE;
+    }
     p1_path_open_resolved(
         caller,
         memory,
@@ -7875,12 +7881,6 @@ where
     if base.kind != FsNodeKind::Directory {
         return Err(p1::errno::NOTDIR);
     }
-    if let Err(error) = crate::wasmtime_adapter::wasi::validate_descriptor_flags_within_base(
-        base.flags,
-        descriptor_flags,
-    ) {
-        return Err(p1_errno_from_fs(error));
-    }
     let absolute =
         crate::resolve_child_path(&base.path, path).map_err(p1_errno_from_component_path)?;
     if let Some(host_path) = crate::guest_host_share_path(&absolute).map(ToOwned::to_owned) {
@@ -7927,7 +7927,7 @@ where
         .host_service()
         .map_err(p1_errno_from_fs)?;
     let metadata = service.stat_path(&host_path).await;
-    let (kind, identity, contents) = match metadata {
+    let (kind, identity, contents, descriptor_flags) = match metadata {
         Ok(metadata) => {
             let kind = if metadata.qid_type & 0x80 != 0 {
                 FsNodeKind::Directory
@@ -7947,6 +7947,12 @@ where
             {
                 return Err(p1::errno::ISDIR);
             }
+            let descriptor_flags = crate::wasmtime_adapter::wasi::effective_open_descriptor_flags(
+                base.flags,
+                descriptor_flags,
+                kind,
+            )
+            .map_err(p1_errno_from_fs)?;
             if open_flags.contains(fs_types::OpenFlags::TRUNCATE) {
                 if kind != FsNodeKind::File {
                     return Err(p1::errno::ISDIR);
@@ -7969,7 +7975,7 @@ where
                     .await
                     .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
                     .map_err(p1_errno_from_fs)?;
-                (kind, metadata.identity, Some(contents))
+                (kind, metadata.identity, Some(contents), descriptor_flags)
             } else {
                 let entries = service
                     .read_dir(&host_path)
@@ -7980,7 +7986,7 @@ where
                     .data_mut()
                     .filesystem
                     .seed_host_directory_entries(&absolute, entries);
-                (kind, metadata.identity, None)
+                (kind, metadata.identity, None, descriptor_flags)
             }
         }
         Err(error) => {
@@ -8006,7 +8012,18 @@ where
                 .await
                 .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
                 .map_err(p1_errno_from_fs)?;
-            (FsNodeKind::File, metadata.identity, Some(Vec::new()))
+            let descriptor_flags = crate::wasmtime_adapter::wasi::effective_open_descriptor_flags(
+                base.flags,
+                descriptor_flags,
+                FsNodeKind::File,
+            )
+            .map_err(p1_errno_from_fs)?;
+            (
+                FsNodeKind::File,
+                metadata.identity,
+                Some(Vec::new()),
+                descriptor_flags,
+            )
         }
     };
     if let Some(contents) = contents {
@@ -8055,7 +8072,10 @@ where
     if !p1_file_fdflags_supported(fdflags) {
         return p1::errno::INVAL;
     }
-    let descriptor_flags = p1_descriptor_flags(rights, fdflags);
+    let mut descriptor_flags = p1_descriptor_flags(rights, fdflags);
+    if open_flags.intersects(fs_types::OpenFlags::CREATE | fs_types::OpenFlags::TRUNCATE) {
+        descriptor_flags |= fs_types::DescriptorFlags::WRITE;
+    }
     p1_path_open_resolved(
         caller,
         memory,
@@ -14978,7 +14998,9 @@ fn p1_descriptor_flags(rights: u64, fdflags: u16) -> fs_types::DescriptorFlags {
     if rights & P1_RIGHT_FD_READ != 0 || rights & P1_RIGHT_FD_READDIR != 0 {
         flags |= fs_types::DescriptorFlags::READ;
     }
-    if rights & P1_RIGHT_FD_WRITE != 0 {
+    if rights & (P1_RIGHT_FD_WRITE | P1_RIGHT_FD_FILESTAT_SET_SIZE | P1_RIGHT_FD_FILESTAT_SET_TIMES)
+        != 0
+    {
         flags |= fs_types::DescriptorFlags::WRITE;
     }
     if rights & P1_RIGHT_PATH_MUTATE_MASK != 0 {
@@ -15041,6 +15063,7 @@ fn p1_descriptor_rights(descriptor: &Preview1Descriptor) -> u64 {
                     | P1_RIGHT_FD_ALLOCATE
                     | P1_RIGHT_FD_FDSTAT_SET_FLAGS
                     | P1_RIGHT_FD_FILESTAT_SET_SIZE
+                    | P1_RIGHT_FD_FILESTAT_SET_TIMES
                     | P1_RIGHT_PATH_FILE_WRITE_MASK;
             }
             if descriptor
@@ -15382,10 +15405,11 @@ const P1_RIGHT_PATH_FILESTAT_SET_SIZE: u64 = 1 << 19;
 const P1_RIGHT_PATH_FILESTAT_SET_TIMES: u64 = 1 << 20;
 const P1_RIGHT_FD_FILESTAT_GET: u64 = 1 << 21;
 const P1_RIGHT_FD_FILESTAT_SET_SIZE: u64 = 1 << 22;
-const P1_RIGHT_PATH_SYMLINK: u64 = 1 << 23;
-const P1_RIGHT_PATH_REMOVE_DIRECTORY: u64 = 1 << 24;
-const P1_RIGHT_PATH_UNLINK_FILE: u64 = 1 << 25;
-const P1_RIGHT_POLL_FD_READWRITE: u64 = 1 << 26;
+const P1_RIGHT_FD_FILESTAT_SET_TIMES: u64 = 1 << 23;
+const P1_RIGHT_PATH_SYMLINK: u64 = 1 << 24;
+const P1_RIGHT_PATH_REMOVE_DIRECTORY: u64 = 1 << 25;
+const P1_RIGHT_PATH_UNLINK_FILE: u64 = 1 << 26;
+const P1_RIGHT_POLL_FD_READWRITE: u64 = 1 << 27;
 const P1_FDFLAG_APPEND: u16 = 1 << 0;
 const P1_FDFLAG_DSYNC: u16 = 1 << 1;
 const P1_FDFLAG_NONBLOCK: u16 = 1 << 2;
@@ -15721,7 +15745,7 @@ mod tests {
                     Preview1Descriptor::Stderr,
                     false,
                 )),
-                Some(Preview1DescriptorEntry::new(file, false)),
+                Some(Preview1DescriptorEntry::new(file, true)),
             ],
         };
 
@@ -15732,6 +15756,7 @@ mod tests {
             }
             _ => panic!("fd 1 should be redirected to the file descriptor"),
         }
+        assert_eq!(table.close_on_exec(1), Ok(false));
         assert!(table.get(3).is_none());
     }
 

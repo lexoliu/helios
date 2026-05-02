@@ -2472,8 +2472,6 @@ where
         if base.kind != FsNodeKind::Directory {
             return Err(fs_types::ErrorCode::NotDirectory);
         }
-        validate_descriptor_flags_within_base(base.flags, descriptor_flags)?;
-
         let absolute =
             crate::resolve_child_path(&base.path, path).map_err(map_component_fs_path_error)?;
         let follow_symlink = path_flags.contains(fs_types::PathFlags::SYMLINK_FOLLOW);
@@ -2513,6 +2511,8 @@ where
             if existing.kind == FsNodeKind::Symlink && follow_symlink {
                 return Err(fs_types::ErrorCode::Loop);
             }
+            let descriptor_flags =
+                effective_open_descriptor_flags(base.flags, descriptor_flags, existing.kind)?;
             if open_flags.contains(fs_types::OpenFlags::TRUNCATE) {
                 if existing.kind != FsNodeKind::File {
                     return Err(fs_types::ErrorCode::IsDirectory);
@@ -2562,6 +2562,8 @@ where
         {
             return Err(fs_types::ErrorCode::ReadOnly);
         }
+        let descriptor_flags =
+            effective_open_descriptor_flags(base.flags, descriptor_flags, FsNodeKind::File)?;
 
         let parent = crate::parent_path(&absolute);
         let parent_node = self.get_node(parent)?;
@@ -2949,6 +2951,27 @@ pub(crate) fn validate_descriptor_flags_within_base(
         return Err(fs_types::ErrorCode::ReadOnly);
     }
     Ok(())
+}
+
+pub(crate) fn effective_open_descriptor_flags(
+    base_flags: fs_types::DescriptorFlags,
+    requested: fs_types::DescriptorFlags,
+    kind: FsNodeKind,
+) -> core::result::Result<fs_types::DescriptorFlags, fs_types::ErrorCode> {
+    let mut effective = fs_types::DescriptorFlags::empty();
+    if requested.contains(fs_types::DescriptorFlags::READ) {
+        effective |= fs_types::DescriptorFlags::READ;
+    }
+    if requested.contains(fs_types::DescriptorFlags::WRITE) {
+        effective |= fs_types::DescriptorFlags::WRITE;
+    }
+    if kind == FsNodeKind::Directory
+        && requested.contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
+    {
+        effective |= fs_types::DescriptorFlags::MUTATE_DIRECTORY;
+    }
+    validate_descriptor_flags_within_base(base_flags, effective)?;
+    Ok(effective)
 }
 
 impl<CpuImpl, HostFs> wasi::clocks::monotonic_clock::Host for StoreData<CpuImpl, HostFs>
