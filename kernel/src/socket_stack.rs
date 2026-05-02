@@ -41,6 +41,18 @@ where
         self.service.tcp_connect(host, port, timeout_nanos)
     }
 
+    pub fn tcp_connect_from<'a>(
+        &'a self,
+        _: TcpCap,
+        host: &'a str,
+        port: u16,
+        local_port: u16,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<Service::TcpStream, crate::TcpError>> + Send + 'a {
+        self.service
+            .tcp_connect_from(host, port, local_port, timeout_nanos)
+    }
+
     pub fn tcp_listen(
         &self,
         _: TcpCap,
@@ -234,6 +246,16 @@ mod tests {
             core::future::ready(Ok(7))
         }
 
+        fn tcp_connect_from(
+            &self,
+            _: &str,
+            _: u16,
+            local_port: u16,
+            _: u64,
+        ) -> impl Future<Output = Result<Self::TcpStream, TcpError>> + Send + '_ {
+            core::future::ready(Ok(u64::from(local_port)))
+        }
+
         fn tcp_listen(
             &self,
             local_port: u16,
@@ -364,6 +386,10 @@ mod tests {
         assert_eq!(
             block_on(stack.tcp_connect(tcp, "localhost", 80, 1)).unwrap(),
             7
+        );
+        assert_eq!(
+            block_on(stack.tcp_connect_from(tcp, "localhost", 80, 4040, 1)).unwrap(),
+            4040
         );
         let listener = block_on(stack.tcp_listen(tcp, Some(privileged), 53, 1)).unwrap();
         assert_eq!(listener.local_port, 53);

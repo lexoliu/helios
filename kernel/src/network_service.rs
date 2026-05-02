@@ -171,6 +171,7 @@ struct DnsResolveRequest {
 struct TcpConnectRequest {
     host: String,
     port: u16,
+    local_port: u16,
     timeout_nanos: u64,
     response: RequestResponse<Result<TcpStreamId, TcpError>>,
 }
@@ -414,10 +415,21 @@ where
         port: u16,
         timeout_nanos: u64,
     ) -> Result<TcpStreamId, TcpError> {
+        self.tcp_connect_from(host, port, 0, timeout_nanos).await
+    }
+
+    pub async fn tcp_connect_from(
+        &self,
+        host: &str,
+        port: u16,
+        local_port: u16,
+        timeout_nanos: u64,
+    ) -> Result<TcpStreamId, TcpError> {
         let response = RequestResponse::new();
         self.enqueue_request(NetworkRequest::TcpConnect(TcpConnectRequest {
             host: host.to_owned(),
             port,
+            local_port,
             timeout_nanos,
             response: response.clone(),
         }));
@@ -610,7 +622,12 @@ where
                 }
                 NetworkRequest::TcpConnect(request) => {
                     let result = self
-                        .execute_tcp_connect(&request.host, request.port, request.timeout_nanos)
+                        .execute_tcp_connect(
+                            &request.host,
+                            request.port,
+                            request.local_port,
+                            request.timeout_nanos,
+                        )
                         .await;
                     request.response.complete(result).await;
                 }
@@ -755,6 +772,7 @@ where
         &self,
         host: &str,
         port: u16,
+        local_port: u16,
         timeout_nanos: u64,
     ) -> Result<TcpStreamId, TcpError> {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
@@ -762,7 +780,7 @@ where
         let destination = self.resolve_host_tcp(host, deadline_nanos).await?;
         let stream = {
             let mut state = self.inner.state.lock().await;
-            state.start_tcp_connect(destination, port)?
+            state.start_tcp_connect(destination, port, local_port)?
         };
 
         loop {
@@ -1384,6 +1402,18 @@ where
         async move { NetworkService::tcp_connect(self, host, port, timeout_nanos).await }
     }
 
+    fn tcp_connect_from<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+        local_port: u16,
+        timeout_nanos: u64,
+    ) -> impl core::future::Future<Output = Result<Self::TcpStream, TcpError>> + Send + 'a {
+        async move {
+            NetworkService::tcp_connect_from(self, host, port, local_port, timeout_nanos).await
+        }
+    }
+
     fn tcp_listen(
         &self,
         local_port: u16,
@@ -1851,8 +1881,18 @@ impl NetworkState {
         &mut self,
         destination: Ipv4Address,
         port: u16,
+        local_port: u16,
     ) -> Result<TcpStreamId, TcpError> {
-        let local_port = self.allocate_tcp_local_port()?;
+        let local_port = if local_port == 0 {
+            self.allocate_tcp_local_port()?
+        } else if self.is_tcp_local_port_free(local_port) {
+            local_port
+        } else {
+            return Err(TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::TcpConnectStartFailed,
+            });
+        };
         let socket = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]),
             tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]),

@@ -450,6 +450,14 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Self::TcpStream, TcpError>> + Send + 'a;
 
+    fn tcp_connect_from<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+        local_port: u16,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<Self::TcpStream, TcpError>> + Send + 'a;
+
     fn tcp_listen(
         &self,
         local_port: u16,

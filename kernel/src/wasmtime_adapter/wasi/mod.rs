@@ -5481,6 +5481,17 @@ mod tests {
             core::future::ready(Ok(7))
         }
 
+        fn tcp_connect_from(
+            &self,
+            _: &str,
+            _: u16,
+            local_port: u16,
+            _: u64,
+        ) -> impl core::future::Future<Output = Result<Self::TcpStream, crate::TcpError>> + Send + '_
+        {
+            core::future::ready(Ok(u64::from(local_port)))
+        }
+
         fn tcp_listen(
             &self,
             local_port: u16,

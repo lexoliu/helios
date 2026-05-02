@@ -12497,16 +12497,20 @@ where
     if status != p1::errno::SUCCESS {
         return status;
     }
-    let connect_timeout = match caller.data().descriptors.get(fd) {
+    let (local_port, connect_timeout) = match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
             WasixTcpSocket::Unconnected { options },
-        ))) => options.connect_timeout,
+        ))) => (0, options.connect_timeout),
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Bound {
+            local_port,
+            options,
+        }))) => (*local_port, options.connect_timeout),
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
             WasixTcpSocket::Connected { .. },
         ))) => return p1::errno::INVAL,
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Bound { .. } | WasixTcpSocket::Listening { .. },
-        ))) => return p1::errno::NOTSUP,
+            WasixTcpSocket::Listening { .. },
+        ))) => return p1::errno::INVAL,
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(_))) => {
             return p1::errno::NOTSOCK;
         }
@@ -12523,7 +12527,10 @@ where
         Err(errno) => return errno,
     };
     let timeout = wasix_effective_socket_timeout(connect_timeout, fdflags);
-    let stream = match service.tcp_connect(host, port, timeout).await {
+    let stream = match service
+        .tcp_connect_from(host, port, local_port, timeout)
+        .await
+    {
         Ok(stream) => stream,
         Err(error) => return p1_errno_from_tcp_error_for_fdflags(error, fdflags),
     };
