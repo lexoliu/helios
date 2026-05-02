@@ -1,7 +1,6 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::future::Future;
@@ -47,19 +46,19 @@ impl ComponentHostUdpSocketToken for u64 {
 pub trait DynComponentHostNetworkService: Send + Sync + 'static {
     fn ping<'a>(
         &'a self,
-        host: String,
+        host: &'a str,
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<PingReply, PingError>> + Send + 'a>>;
 
     fn dns_resolve<'a>(
         &'a self,
-        host: String,
+        host: &'a str,
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Ipv4Address>, DnsError>> + Send + 'a>>;
 
     fn tcp_connect<'a>(
         &'a self,
-        host: String,
+        host: &'a str,
         port: u16,
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<u64, TcpError>> + Send + 'a>>;
@@ -67,7 +66,7 @@ pub trait DynComponentHostNetworkService: Send + Sync + 'static {
     fn tcp_write_all<'a>(
         &'a self,
         stream: u64,
-        bytes: Vec<u8>,
+        bytes: &'a [u8],
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<(), TcpError>> + Send + 'a>>;
 
@@ -88,9 +87,9 @@ pub trait DynComponentHostNetworkService: Send + Sync + 'static {
     fn udp_send<'a>(
         &'a self,
         socket: u64,
-        host: String,
+        host: &'a str,
         port: u16,
-        bytes: Vec<u8>,
+        bytes: &'a [u8],
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<u64, UdpError>> + Send + 'a>>;
 
@@ -126,40 +125,38 @@ impl ComponentNetworkService for ComponentHostNetworkService {
     type TcpStream = u64;
     type UdpSocket = u64;
 
-    fn ping(
-        &self,
-        host: &str,
+    fn ping<'a>(
+        &'a self,
+        host: &'a str,
         timeout_nanos: u64,
-    ) -> impl Future<Output = Result<PingReply, PingError>> + Send + '_ {
-        self.inner.ping(String::from(host), timeout_nanos)
+    ) -> impl Future<Output = Result<PingReply, PingError>> + Send + 'a {
+        self.inner.ping(host, timeout_nanos)
     }
 
-    fn dns_resolve(
-        &self,
-        host: &str,
+    fn dns_resolve<'a>(
+        &'a self,
+        host: &'a str,
         timeout_nanos: u64,
-    ) -> impl Future<Output = Result<Vec<Ipv4Address>, DnsError>> + Send + '_ {
-        self.inner.dns_resolve(String::from(host), timeout_nanos)
+    ) -> impl Future<Output = Result<Vec<Ipv4Address>, DnsError>> + Send + 'a {
+        self.inner.dns_resolve(host, timeout_nanos)
     }
 
-    fn tcp_connect(
-        &self,
-        host: &str,
+    fn tcp_connect<'a>(
+        &'a self,
+        host: &'a str,
         port: u16,
         timeout_nanos: u64,
-    ) -> impl Future<Output = Result<Self::TcpStream, TcpError>> + Send + '_ {
-        self.inner
-            .tcp_connect(String::from(host), port, timeout_nanos)
+    ) -> impl Future<Output = Result<Self::TcpStream, TcpError>> + Send + 'a {
+        self.inner.tcp_connect(host, port, timeout_nanos)
     }
 
-    fn tcp_write_all(
-        &self,
+    fn tcp_write_all<'a>(
+        &'a self,
         stream: Self::TcpStream,
-        bytes: &[u8],
+        bytes: &'a [u8],
         timeout_nanos: u64,
-    ) -> impl Future<Output = Result<(), TcpError>> + Send + '_ {
-        self.inner
-            .tcp_write_all(stream, bytes.to_vec(), timeout_nanos)
+    ) -> impl Future<Output = Result<(), TcpError>> + Send + 'a {
+        self.inner.tcp_write_all(stream, bytes, timeout_nanos)
     }
 
     fn tcp_read(
@@ -182,21 +179,16 @@ impl ComponentNetworkService for ComponentHostNetworkService {
         self.inner.udp_bind(local_port)
     }
 
-    fn udp_send(
-        &self,
+    fn udp_send<'a>(
+        &'a self,
         socket: Self::UdpSocket,
-        host: &str,
+        host: &'a str,
         port: u16,
-        bytes: &[u8],
+        bytes: &'a [u8],
         timeout_nanos: u64,
-    ) -> impl Future<Output = Result<u64, UdpError>> + Send + '_ {
-        self.inner.udp_send(
-            socket,
-            String::from(host),
-            port,
-            bytes.to_vec(),
-            timeout_nanos,
-        )
+    ) -> impl Future<Output = Result<u64, UdpError>> + Send + 'a {
+        self.inner
+            .udp_send(socket, host, port, bytes, timeout_nanos)
     }
 
     fn udp_receive(
@@ -225,31 +217,28 @@ where
 {
     fn ping<'a>(
         &'a self,
-        host: String,
+        host: &'a str,
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<PingReply, PingError>> + Send + 'a>> {
-        let service = self.service.clone();
-        Box::pin(async move { service.ping(&host, timeout_nanos).await })
+        Box::pin(async move { self.service.ping(host, timeout_nanos).await })
     }
 
     fn dns_resolve<'a>(
         &'a self,
-        host: String,
+        host: &'a str,
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Ipv4Address>, DnsError>> + Send + 'a>> {
-        let service = self.service.clone();
-        Box::pin(async move { service.dns_resolve(&host, timeout_nanos).await })
+        Box::pin(async move { self.service.dns_resolve(host, timeout_nanos).await })
     }
 
     fn tcp_connect<'a>(
         &'a self,
-        host: String,
+        host: &'a str,
         port: u16,
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<u64, TcpError>> + Send + 'a>> {
-        let service = self.service.clone();
         Box::pin(async move {
-            let stream = service.tcp_connect(&host, port, timeout_nanos).await?;
+            let stream = self.service.tcp_connect(host, port, timeout_nanos).await?;
             Ok(stream.into_raw())
         })
     }
@@ -257,15 +246,14 @@ where
     fn tcp_write_all<'a>(
         &'a self,
         stream: u64,
-        bytes: Vec<u8>,
+        bytes: &'a [u8],
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<(), TcpError>> + Send + 'a>> {
-        let service = self.service.clone();
         Box::pin(async move {
-            service
+            self.service
                 .tcp_write_all(
                     <Service::TcpStream as ComponentHostTcpStreamToken>::from_raw(stream),
-                    &bytes,
+                    bytes,
                     timeout_nanos,
                 )
                 .await
@@ -278,9 +266,8 @@ where
         max_bytes: u32,
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, TcpError>> + Send + 'a>> {
-        let service = self.service.clone();
         Box::pin(async move {
-            service
+            self.service
                 .tcp_read(
                     <Service::TcpStream as ComponentHostTcpStreamToken>::from_raw(stream),
                     max_bytes,
@@ -291,9 +278,8 @@ where
     }
 
     fn tcp_close<'a>(&'a self, stream: u64) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        let service = self.service.clone();
         Box::pin(async move {
-            service
+            self.service
                 .tcp_close(<Service::TcpStream as ComponentHostTcpStreamToken>::from_raw(stream))
                 .await
         })
@@ -303,9 +289,8 @@ where
         &'a self,
         local_port: u16,
     ) -> Pin<Box<dyn Future<Output = Result<UdpBinding<u64>, UdpError>> + Send + 'a>> {
-        let service = self.service.clone();
         Box::pin(async move {
-            let binding = service.udp_bind(local_port).await?;
+            let binding = self.service.udp_bind(local_port).await?;
             Ok(UdpBinding {
                 socket: binding.socket.into_raw(),
                 local_port: binding.local_port,
@@ -316,19 +301,18 @@ where
     fn udp_send<'a>(
         &'a self,
         socket: u64,
-        host: String,
+        host: &'a str,
         port: u16,
-        bytes: Vec<u8>,
+        bytes: &'a [u8],
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<u64, UdpError>> + Send + 'a>> {
-        let service = self.service.clone();
         Box::pin(async move {
-            service
+            self.service
                 .udp_send(
                     <Service::UdpSocket as ComponentHostUdpSocketToken>::from_raw(socket),
-                    &host,
+                    host,
                     port,
-                    &bytes,
+                    bytes,
                     timeout_nanos,
                 )
                 .await
@@ -341,9 +325,8 @@ where
         max_bytes: u32,
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<Option<UdpDatagram>, UdpError>> + Send + 'a>> {
-        let service = self.service.clone();
         Box::pin(async move {
-            service
+            self.service
                 .udp_receive(
                     <Service::UdpSocket as ComponentHostUdpSocketToken>::from_raw(socket),
                     max_bytes,
@@ -354,9 +337,8 @@ where
     }
 
     fn udp_close<'a>(&'a self, socket: u64) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        let service = self.service.clone();
         Box::pin(async move {
-            service
+            self.service
                 .udp_close(<Service::UdpSocket as ComponentHostUdpSocketToken>::from_raw(socket))
                 .await
         })
