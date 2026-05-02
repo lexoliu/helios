@@ -12419,10 +12419,12 @@ where
     if status != p1::errno::SUCCESS {
         return status;
     }
-    let listener = match caller.data().descriptors.get(fd) {
+    let (listener, accept_timeout) = match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Listening { listener, .. },
-        ))) => *listener,
+            WasixTcpSocket::Listening {
+                listener, options, ..
+            },
+        ))) => (*listener, options.accept_timeout),
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => {
             return p1::errno::INVAL;
         }
@@ -12436,11 +12438,7 @@ where
         Ok(fdflags) => fdflags,
         Err(errno) => return errno,
     };
-    let timeout = if p1_fdflags_nonblocking(fdflags) {
-        0
-    } else {
-        u64::MAX
-    };
+    let timeout = wasix_effective_socket_timeout(accept_timeout, fdflags);
     let accepted = match service.tcp_accept(listener, timeout).await {
         Ok(accepted) => accepted,
         Err(error) => return p1_errno_from_tcp_error_for_fdflags(error, fdflags),
@@ -12499,10 +12497,10 @@ where
     if status != p1::errno::SUCCESS {
         return status;
     }
-    match caller.data().descriptors.get(fd) {
+    let connect_timeout = match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Unconnected { .. },
-        ))) => {}
+            WasixTcpSocket::Unconnected { options },
+        ))) => options.connect_timeout,
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
             WasixTcpSocket::Connected { .. },
         ))) => return p1::errno::INVAL,
@@ -12514,15 +12512,20 @@ where
         }
         Some(_) => return p1::errno::NOTSOCK,
         None => return p1::errno::BADF,
-    }
+    };
     let Some(service) = caller.data().runtime_state.network_service() else {
         return p1::errno::NETDOWN;
     };
     let mut host_buffer = [0; 15];
     let host = address.write_dotted_decimal(&mut host_buffer);
-    let stream = match service.tcp_connect(host, port, u64::MAX).await {
+    let fdflags = match caller.data().descriptors.fdflags(fd) {
+        Ok(fdflags) => fdflags,
+        Err(errno) => return errno,
+    };
+    let timeout = wasix_effective_socket_timeout(connect_timeout, fdflags);
+    let stream = match service.tcp_connect(host, port, timeout).await {
         Ok(stream) => stream,
-        Err(error) => return p1_errno_from_tcp_error(error),
+        Err(error) => return p1_errno_from_tcp_error_for_fdflags(error, fdflags),
     };
     let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(slot))) =
         caller.data_mut().descriptors.get_mut(fd)
@@ -12578,15 +12581,21 @@ where
     match descriptor {
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
             socket,
+            options,
             ..
         }))) => {
             let Some(service) = caller.data().runtime_state.network_service() else {
                 return p1::errno::NETDOWN;
             };
-            let datagram = match service.udp_receive(socket, capacity, u64::MAX).await {
+            let fdflags = match caller.data().descriptors.fdflags(fd) {
+                Ok(fdflags) => fdflags,
+                Err(errno) => return errno,
+            };
+            let timeout = wasix_effective_socket_timeout(options.receive_timeout, fdflags);
+            let datagram = match service.udp_receive(socket, capacity, timeout).await {
                 Ok(Some(datagram)) => datagram,
                 Ok(None) => return p1::errno::AGAIN,
-                Err(error) => return p1_errno_from_udp_error(error),
+                Err(error) => return p1_errno_from_udp_error_for_fdflags(error, fdflags),
             };
             let status = p1_write_iovs_from_bytes(caller, memory, iovs, &datagram.bytes, ret_size);
             if status != p1::errno::SUCCESS {
@@ -12626,15 +12635,22 @@ where
             write_wasix_addr_port_unspec(caller, memory, ret_addr)
         }
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Connected { stream, .. },
+            WasixTcpSocket::Connected {
+                stream, options, ..
+            },
         ))) => {
             let Some(service) = caller.data().runtime_state.network_service() else {
                 return p1::errno::NETDOWN;
             };
-            let bytes = match service.tcp_read(stream, capacity, u64::MAX).await {
+            let fdflags = match caller.data().descriptors.fdflags(fd) {
+                Ok(fdflags) => fdflags,
+                Err(errno) => return errno,
+            };
+            let timeout = wasix_effective_socket_timeout(options.receive_timeout, fdflags);
+            let bytes = match service.tcp_read(stream, capacity, timeout).await {
                 Ok(Some(bytes)) => bytes,
                 Ok(None) => Vec::new(),
-                Err(error) => return p1_errno_from_tcp_error(error),
+                Err(error) => return p1_errno_from_tcp_error_for_fdflags(error, fdflags),
             };
             let status = p1_write_iovs_from_bytes(caller, memory, iovs, &bytes, ret_size);
             if status != p1::errno::SUCCESS {
@@ -12688,8 +12704,10 @@ where
             }) else {
                 return p1::errno::INVAL;
             };
-            let socket = match socket {
-                WasixUdpSocket::Bound { socket, .. } => socket,
+            let (socket, send_timeout) = match socket {
+                WasixUdpSocket::Bound {
+                    socket, options, ..
+                } => (socket, options.send_timeout),
                 WasixUdpSocket::Unbound { options } => {
                     let Some(service) = caller.data().runtime_state.network_service() else {
                         return p1::errno::NETDOWN;
@@ -12709,12 +12727,14 @@ where
                         options,
                     };
                     let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(
-                        WasixUdpSocket::Bound { socket, .. },
+                        WasixUdpSocket::Bound {
+                            socket, options, ..
+                        },
                     ))) = caller.data().descriptors.get(fd)
                     else {
                         return p1::errno::BADF;
                     };
-                    *socket
+                    (*socket, options.send_timeout)
                 }
             };
             let Some(service) = caller.data().runtime_state.network_service() else {
@@ -12722,9 +12742,14 @@ where
             };
             let mut host_buffer = [0; 15];
             let host = address.write_dotted_decimal(&mut host_buffer);
-            let sent = match service.udp_send(socket, host, port, &bytes, u64::MAX).await {
+            let fdflags = match caller.data().descriptors.fdflags(fd) {
+                Ok(fdflags) => fdflags,
+                Err(errno) => return errno,
+            };
+            let timeout = wasix_effective_socket_timeout(send_timeout, fdflags);
+            let sent = match service.udp_send(socket, host, port, &bytes, timeout).await {
                 Ok(sent) => sent,
-                Err(error) => return p1_errno_from_udp_error(error),
+                Err(error) => return p1_errno_from_udp_error_for_fdflags(error, fdflags),
             };
             let sent = match u32::try_from(sent) {
                 Ok(sent) => sent,
@@ -12733,13 +12758,20 @@ where
             p1_write_u32(caller, memory, ret_size, sent)
         }
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Connected { stream, .. },
+            WasixTcpSocket::Connected {
+                stream, options, ..
+            },
         ))) => {
             let Some(service) = caller.data().runtime_state.network_service() else {
                 return p1::errno::NETDOWN;
             };
-            if let Err(error) = service.tcp_write_all(stream, &bytes, u64::MAX).await {
-                return p1_errno_from_tcp_error(error);
+            let fdflags = match caller.data().descriptors.fdflags(fd) {
+                Ok(fdflags) => fdflags,
+                Err(errno) => return errno,
+            };
+            let timeout = wasix_effective_socket_timeout(options.send_timeout, fdflags);
+            if let Err(error) = service.tcp_write_all(stream, &bytes, timeout).await {
+                return p1_errno_from_tcp_error_for_fdflags(error, fdflags);
             }
             let written = match u32::try_from(bytes.len()) {
                 Ok(written) => written,
@@ -12813,7 +12845,9 @@ where
     };
     match caller.data().descriptors.get(out_fd).cloned() {
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Connected { stream, .. },
+            WasixTcpSocket::Connected {
+                stream, options, ..
+            },
         ))) => {
             let status = caller
                 .data()
@@ -12824,8 +12858,13 @@ where
             let Some(service) = caller.data().runtime_state.network_service() else {
                 return p1::errno::NETDOWN;
             };
-            if let Err(error) = service.tcp_write_all(stream, &bytes, u64::MAX).await {
-                return p1_errno_from_tcp_error(error);
+            let fdflags = match caller.data().descriptors.fdflags(out_fd) {
+                Ok(fdflags) => fdflags,
+                Err(errno) => return errno,
+            };
+            let timeout = wasix_effective_socket_timeout(options.send_timeout, fdflags);
+            if let Err(error) = service.tcp_write_all(stream, &bytes, timeout).await {
+                return p1_errno_from_tcp_error_for_fdflags(error, fdflags);
             }
             p1_write_u64(caller, memory, ret_size, written)
         }
@@ -14346,6 +14385,14 @@ fn p1_fdflags_nonblocking(fdflags: u16) -> bool {
     fdflags & P1_FDFLAG_NONBLOCK != 0
 }
 
+fn wasix_effective_socket_timeout(option_timeout: Option<u64>, fdflags: u16) -> u64 {
+    if p1_fdflags_nonblocking(fdflags) {
+        0
+    } else {
+        option_timeout.unwrap_or(u64::MAX)
+    }
+}
+
 fn p1_descriptor_rights(descriptor: &Preview1Descriptor) -> u64 {
     match descriptor {
         Preview1Descriptor::Stdin { .. } => P1_RIGHT_FD_READ | P1_RIGHT_POLL_FD_READWRITE,
@@ -14642,6 +14689,13 @@ fn p1_errno_from_udp_error(error: crate::UdpError) -> i32 {
         crate::UdpErrorKind::Unavailable => p1::errno::NETDOWN,
         crate::UdpErrorKind::Internal => p1::errno::IO,
     }
+}
+
+fn p1_errno_from_udp_error_for_fdflags(error: crate::UdpError, fdflags: u16) -> i32 {
+    if p1_fdflags_nonblocking(fdflags) && matches!(error.kind, crate::UdpErrorKind::Timeout) {
+        return p1::errno::AGAIN;
+    }
+    p1_errno_from_udp_error(error)
 }
 
 fn validate_preview1_program_module_imports(module: &Module) -> Result<(), ProgramExecError> {
@@ -15154,6 +15208,36 @@ mod tests {
         assert_eq!(table.fdflags(0), Ok(P1_FDFLAG_NONBLOCK));
         assert!(p1_socket_fdflags_supported(P1_FDFLAG_NONBLOCK));
         assert!(!p1_socket_fdflags_supported(P1_FDFLAG_APPEND));
+    }
+
+    #[test]
+    fn wasix_socket_timeout_respects_nonblocking_fdflag() {
+        assert_eq!(wasix_effective_socket_timeout(Some(99), 0), 99);
+        assert_eq!(wasix_effective_socket_timeout(None, 0), u64::MAX);
+        assert_eq!(
+            wasix_effective_socket_timeout(Some(99), P1_FDFLAG_NONBLOCK),
+            0
+        );
+        assert_eq!(
+            p1_errno_from_tcp_error_for_fdflags(
+                crate::TcpError {
+                    kind: crate::TcpErrorKind::Timeout,
+                    detail: crate::NetworkErrorDetail::TcpConnectTimeout,
+                },
+                P1_FDFLAG_NONBLOCK,
+            ),
+            p1::errno::AGAIN
+        );
+        assert_eq!(
+            p1_errno_from_udp_error_for_fdflags(
+                crate::UdpError {
+                    kind: crate::UdpErrorKind::Timeout,
+                    detail: crate::NetworkErrorDetail::UdpReceiveTimeout,
+                },
+                P1_FDFLAG_NONBLOCK,
+            ),
+            p1::errno::AGAIN
+        );
     }
 
     #[test]
