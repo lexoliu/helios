@@ -9673,20 +9673,13 @@ where
 }
 
 fn wasix_thread_spawn_v2<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-    ret_tid: u32,
+    _caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    _ret_tid: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
-    };
-    let status = p1_write_u32(caller, memory, ret_tid, 0);
-    if status != p1::errno::SUCCESS {
-        return status;
-    }
     p1::errno::NOTSUP
 }
 
