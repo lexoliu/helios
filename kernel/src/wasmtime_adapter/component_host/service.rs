@@ -10213,7 +10213,10 @@ where
     if status != p1::errno::SUCCESS {
         return status;
     }
-    p1::errno::NETDOWN
+    if caller.data().runtime_state.network_service().is_none() {
+        return p1::errno::NETDOWN;
+    }
+    p1::errno::NOTSUP
 }
 
 fn wasix_port_mac<CpuImpl, HostFs>(
@@ -10239,13 +10242,23 @@ where
 
 fn wasix_port_empty_list<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-    _ret_len: u32,
+    ret_len: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    wasix_network_admin_unavailable(caller)
+    let status = caller.data().require_network_admin_authority();
+    if status != p1::errno::SUCCESS {
+        return status;
+    }
+    if caller.data().runtime_state.network_service().is_none() {
+        return p1::errno::NETDOWN;
+    }
+    let Some(memory) = p1_memory(caller) else {
+        return p1::errno::FAULT;
+    };
+    p1_write_u32(caller, memory, ret_len, 0)
 }
 
 async fn wasix_port_addr_list<CpuImpl, HostFs>(
