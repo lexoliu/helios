@@ -2029,17 +2029,29 @@ where
         Ok((base, path.to_owned()))
     }
 
-    fn resolve_preview1_path(&self, fd: i32, path: &str) -> Result<String, i32> {
-        if self.wasix_abi && path.starts_with('/') {
-            let guest_name =
-                crate::resolve_absolute_path(path).map_err(p1_errno_from_component_path)?;
-            let (absolute, _) = self.resolve_absolute_guest_path(&guest_name)?;
-            return Ok(absolute);
+    fn resolve_preview1_path_base(
+        &self,
+        fd: i32,
+        path: &str,
+    ) -> Result<(FsDescriptor, String), i32> {
+        if self.wasix_abi {
+            return self.resolve_wasix_path_base(fd, path);
         }
         let Some(base) = p1_directory_descriptor(self.descriptors.get(fd)) else {
             return Err(p1::errno::BADF);
         };
-        crate::resolve_child_path(&base.path, path).map_err(p1_errno_from_component_path)
+        Ok((base.clone(), path.to_owned()))
+    }
+
+    fn resolve_preview1_path(
+        &self,
+        fd: i32,
+        path: &str,
+    ) -> Result<(FsDescriptor, String, String), i32> {
+        let (base, path) = self.resolve_preview1_path_base(fd, path)?;
+        let absolute =
+            crate::resolve_child_path(&base.path, &path).map_err(p1_errno_from_component_path)?;
+        Ok((base, path, absolute))
     }
 }
 
@@ -7220,15 +7232,9 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let (Some(Preview1Descriptor::Preopen { descriptor, .. })
-    | Some(Preview1Descriptor::File { descriptor, .. })) = caller.data().descriptors.get(fd)
-    else {
-        return p1::errno::BADF;
-    };
-    let descriptor = descriptor.clone();
-    let absolute = match crate::resolve_child_path(&descriptor.path, &path) {
-        Ok(path) => path,
-        Err(error) => return p1_errno_from_component_path(error),
+    let (descriptor, path, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
+        Ok(resolved) => resolved,
+        Err(errno) => return errno,
     };
     if let Some(host_path) = crate::guest_host_share_path(&absolute) {
         if descriptor.kind != FsNodeKind::Directory {
@@ -7283,8 +7289,8 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let absolute = match caller.data().resolve_preview1_path(fd, &path) {
-        Ok(absolute) => absolute,
+    let (_, _, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
+        Ok(resolved) => resolved,
         Err(errno) => return errno,
     };
     let stat_value = if let Some(host_path) = crate::guest_host_share_path(&absolute) {
@@ -7328,12 +7334,9 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let Some(base) = p1_directory_descriptor(caller.data().descriptors.get(fd)) else {
-        return p1::errno::BADF;
-    };
-    let absolute = match crate::resolve_child_path(&base.path, &path) {
-        Ok(absolute) => absolute,
-        Err(error) => return p1_errno_from_component_path(error),
+    let (_, _, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
+        Ok(resolved) => resolved,
+        Err(errno) => return errno,
     };
     if crate::guest_host_share_path(&absolute).is_some() {
         return p1::errno::NOTSUP;
@@ -7432,31 +7435,22 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let Some(source_base) = p1_directory_descriptor(caller.data().descriptors.get(old_fd)) else {
-        return p1::errno::BADF;
-    };
-    let Some(destination_base) = p1_directory_descriptor(caller.data().descriptors.get(new_fd))
-    else {
-        return p1::errno::BADF;
-    };
-    let source_base = source_base.clone();
-    let destination_base = destination_base.clone();
-    let source_absolute = match crate::resolve_child_path(&source_base.path, &old_path) {
-        Ok(path) => path,
-        Err(error) => return p1_errno_from_component_path(error),
-    };
-    let destination_absolute = match crate::resolve_child_path(&destination_base.path, &new_path) {
-        Ok(path) => path,
-        Err(error) => return p1_errno_from_component_path(error),
-    };
+    let (source_base, old_path, source_absolute) =
+        match caller.data().resolve_preview1_path(old_fd, &old_path) {
+            Ok(resolved) => resolved,
+            Err(errno) => return errno,
+        };
+    let (destination_base, new_path, destination_absolute) =
+        match caller.data().resolve_preview1_path(new_fd, &new_path) {
+            Ok(resolved) => resolved,
+            Err(errno) => return errno,
+        };
+    if source_base.kind != FsNodeKind::Directory || destination_base.kind != FsNodeKind::Directory {
+        return p1::errno::NOTDIR;
+    }
     let source_host = crate::guest_host_share_path(&source_absolute);
     let destination_host = crate::guest_host_share_path(&destination_absolute);
     if source_host.is_some() || destination_host.is_some() {
-        if source_base.kind != FsNodeKind::Directory
-            || destination_base.kind != FsNodeKind::Directory
-        {
-            return p1::errno::NOTDIR;
-        }
         if !destination_base
             .flags
             .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
@@ -7519,13 +7513,9 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let Some(base) = p1_directory_descriptor(caller.data().descriptors.get(fd)) else {
-        return p1::errno::BADF;
-    };
-    let base = base.clone();
-    let absolute = match crate::resolve_child_path(&base.path, &path) {
-        Ok(path) => path,
-        Err(error) => return p1_errno_from_component_path(error),
+    let (base, path, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
+        Ok(resolved) => resolved,
+        Err(errno) => return errno,
     };
     let payload = if let Some(host_path) = crate::guest_host_share_path(&absolute) {
         if base.kind != FsNodeKind::Directory {
@@ -7583,13 +7573,9 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let Some(base) = p1_directory_descriptor(caller.data().descriptors.get(fd)) else {
-        return p1::errno::BADF;
-    };
-    let base = base.clone();
-    let absolute = match crate::resolve_child_path(&base.path, &path) {
-        Ok(path) => path,
-        Err(error) => return p1_errno_from_component_path(error),
+    let (base, path, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
+        Ok(resolved) => resolved,
+        Err(errno) => return errno,
     };
     if let Some(host_path) = crate::guest_host_share_path(&absolute) {
         if !base
@@ -7645,23 +7631,19 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let Some(source_base) = p1_directory_descriptor(caller.data().descriptors.get(old_fd)) else {
-        return p1::errno::BADF;
-    };
-    let Some(destination_base) = p1_directory_descriptor(caller.data().descriptors.get(new_fd))
-    else {
-        return p1::errno::BADF;
-    };
-    let source_base = source_base.clone();
-    let destination_base = destination_base.clone();
-    let source_absolute = match crate::resolve_child_path(&source_base.path, &old_path) {
-        Ok(path) => path,
-        Err(error) => return p1_errno_from_component_path(error),
-    };
-    let destination_absolute = match crate::resolve_child_path(&destination_base.path, &new_path) {
-        Ok(path) => path,
-        Err(error) => return p1_errno_from_component_path(error),
-    };
+    let (source_base, old_path, source_absolute) =
+        match caller.data().resolve_preview1_path(old_fd, &old_path) {
+            Ok(resolved) => resolved,
+            Err(errno) => return errno,
+        };
+    let (destination_base, new_path, destination_absolute) =
+        match caller.data().resolve_preview1_path(new_fd, &new_path) {
+            Ok(resolved) => resolved,
+            Err(errno) => return errno,
+        };
+    if source_base.kind != FsNodeKind::Directory || destination_base.kind != FsNodeKind::Directory {
+        return p1::errno::NOTDIR;
+    }
     let source_host = crate::guest_host_share_path(&source_absolute).map(ToOwned::to_owned);
     let destination_host =
         crate::guest_host_share_path(&destination_absolute).map(ToOwned::to_owned);
@@ -7733,13 +7715,9 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let Some(base) = p1_directory_descriptor(caller.data().descriptors.get(fd)) else {
-        return p1::errno::BADF;
-    };
-    let base = base.clone();
-    let absolute = match crate::resolve_child_path(&base.path, &new_path) {
-        Ok(path) => path,
-        Err(error) => return p1_errno_from_component_path(error),
+    let (base, new_path, absolute) = match caller.data().resolve_preview1_path(fd, &new_path) {
+        Ok(resolved) => resolved,
+        Err(errno) => return errno,
     };
     if let Err(error) = crate::wasmtime_adapter::wasi::resolve_symlink_payload(&absolute, &old_path)
     {
@@ -7796,13 +7774,9 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let Some(base) = p1_directory_descriptor(caller.data().descriptors.get(fd)) else {
-        return p1::errno::BADF;
-    };
-    let base = base.clone();
-    let absolute = match crate::resolve_child_path(&base.path, &path) {
-        Ok(path) => path,
-        Err(error) => return p1_errno_from_component_path(error),
+    let (base, path, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
+        Ok(resolved) => resolved,
+        Err(errno) => return errno,
     };
     if let Some(host_path) = crate::guest_host_share_path(&absolute) {
         if !base
