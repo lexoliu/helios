@@ -5618,7 +5618,7 @@ mod tests {
         fn bridge_port(
             &self,
             _: crate::NetworkPortId,
-            _: crate::NetworkBridgeId,
+            _: crate::NetworkBridgeRequest,
         ) -> impl core::future::Future<Output = Result<(), crate::NetworkControlError>> + Send
         {
             core::future::ready(Err(crate::NetworkControlError::BridgeUnavailable))

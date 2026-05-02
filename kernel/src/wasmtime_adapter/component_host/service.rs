@@ -50,6 +50,10 @@ const WASIX_IPPROTO_TCP: u64 = 6;
 const WASIX_IPPROTO_UDP: u64 = 17;
 const WASIX_IPPROTO_TCP_I32: i32 = 6;
 const WASIX_IPPROTO_UDP_I32: i32 = 17;
+const WASIX_STREAM_SECURITY_UNENCRYPTED: u8 = 1 << 0;
+const WASIX_STREAM_SECURITY_ANY_ENCRYPTION: u8 = 1 << 1;
+const WASIX_STREAM_SECURITY_CLASSIC_ENCRYPTION: u8 = 1 << 2;
+const WASIX_STREAM_SECURITY_DOUBLE_ENCRYPTION: u8 = 1 << 3;
 const DEFAULT_WASIX_EXEC_SEARCH_PATHS: &[&str] = &["/usr/local/bin", "/bin", "/usr/bin"];
 const WASIX_PROC_SPAWN_FD_OP_SIZE: u32 = 56;
 const WASIX_PROC_SPAWN_FD_OP_CMD_OFFSET: u32 = 0;
@@ -2143,12 +2147,6 @@ where
             .map_or(p1::errno::NOTCAPABLE, |_| p1::errno::SUCCESS)
     }
 
-    fn require_network_admin_authority(&self) -> i32 {
-        self.authority
-            .derive_network_admin_cap()
-            .map_or(p1::errno::NOTCAPABLE, |_| p1::errno::SUCCESS)
-    }
-
     fn require_hardlink_authority(&self) -> i32 {
         if self.authority.derive_link_source_cap().is_err()
             || self.authority.derive_link_target_directory_cap().is_err()
@@ -3730,24 +3728,31 @@ where
     HostFs: crate::HostFileSystem,
 {
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "port_bridge",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             _network: i32,
-             _network_len: i32,
-             _token: i32,
-             _token_len: i32,
-             _security: i32|
-             -> i32 { wasix_network_admin_unavailable(&mut caller) },
+             (network, network_len, token, token_len, security): (i32, i32, i32, i32, i32)| {
+                Box::new(async move {
+                    wasix_port_bridge(
+                        &mut caller,
+                        network as u32,
+                        network_len as u32,
+                        token as u32,
+                        token_len as u32,
+                        security,
+                    )
+                    .await
+                })
+            },
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "port_unbridge",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>| -> i32 {
-                wasix_network_admin_unavailable(&mut caller)
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>, ()| {
+                Box::new(async move { wasix_port_unbridge(&mut caller).await })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -11748,23 +11753,6 @@ where
     p1_write_u32(caller, memory, ret_naddrs, returned)
 }
 
-fn wasix_network_admin_unavailable<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-) -> i32
-where
-    CpuImpl: Cpu + Clone,
-    HostFs: crate::HostFileSystem,
-{
-    let status = caller.data().require_network_admin_authority();
-    if status != p1::errno::SUCCESS {
-        return status;
-    }
-    if caller.data().runtime_state.network_service().is_none() {
-        return p1::errno::NETDOWN;
-    }
-    p1::errno::NOTSUP
-}
-
 fn wasix_network_admin_service<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
 ) -> Result<(crate::NetworkAdminCap, ComponentHostNetworkService), i32>
@@ -11789,10 +11777,87 @@ fn p1_errno_from_network_control_error(error: crate::NetworkControlError) -> i32
     match error {
         crate::NetworkControlError::PortUnavailable => p1::errno::NETDOWN,
         crate::NetworkControlError::BridgeUnavailable => p1::errno::NOTSUP,
+        crate::NetworkControlError::InvalidBridgeRequest => p1::errno::INVAL,
         crate::NetworkControlError::InvalidAddress
         | crate::NetworkControlError::InvalidRoute
         | crate::NetworkControlError::RouteTimestampOutOfRange => p1::errno::INVAL,
         crate::NetworkControlError::BackendFault => p1::errno::IO,
+    }
+}
+
+fn wasix_bridge_security(raw: i32) -> Result<crate::NetworkBridgeSecurity, i32> {
+    let raw = u8::try_from(raw).map_err(|_| p1::errno::INVAL)?;
+    match raw {
+        WASIX_STREAM_SECURITY_UNENCRYPTED
+        | WASIX_STREAM_SECURITY_ANY_ENCRYPTION
+        | WASIX_STREAM_SECURITY_CLASSIC_ENCRYPTION
+        | WASIX_STREAM_SECURITY_DOUBLE_ENCRYPTION => {
+            crate::NetworkBridgeSecurity::new(raw).map_err(p1_errno_from_network_control_error)
+        }
+        _ => Err(p1::errno::INVAL),
+    }
+}
+
+async fn wasix_port_bridge<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    network: u32,
+    network_len: u32,
+    token: u32,
+    token_len: u32,
+    security: i32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let security = match wasix_bridge_security(security) {
+        Ok(security) => security,
+        Err(status) => return status,
+    };
+    let Some(memory) = p1_memory(caller) else {
+        return p1::errno::FAULT;
+    };
+    let network = match wasix_read_exec_string(caller, memory, network, network_len) {
+        Ok(network) => network,
+        Err(_) => return p1::errno::FAULT,
+    };
+    let token = match wasix_read_exec_string(caller, memory, token, token_len) {
+        Ok(token) => token,
+        Err(_) => return p1::errno::FAULT,
+    };
+    let (cap, service) = match wasix_network_admin_service(caller) {
+        Ok(parts) => parts,
+        Err(status) => return status,
+    };
+    let request = crate::NetworkBridgeRequest::new(network, token, security);
+    let control = crate::NetworkControl::new(service);
+    match control
+        .bridge_port(cap, crate::NetworkPortId::new(0), request)
+        .await
+    {
+        Ok(()) => p1::errno::SUCCESS,
+        Err(error) => p1_errno_from_network_control_error(error),
+    }
+}
+
+async fn wasix_port_unbridge<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let (cap, service) = match wasix_network_admin_service(caller) {
+        Ok(parts) => parts,
+        Err(status) => return status,
+    };
+    let control = crate::NetworkControl::new(service);
+    match control
+        .unbridge_port(cap, crate::NetworkPortId::new(0))
+        .await
+    {
+        Ok(()) => p1::errno::SUCCESS,
+        Err(error) => p1_errno_from_network_control_error(error),
     }
 }
 
@@ -16040,6 +16105,28 @@ mod tests {
         );
         assert_eq!(
             wasix_signal_disposition_from_raw(1, 2),
+            Err(p1::errno::INVAL)
+        );
+    }
+
+    #[test]
+    fn wasix_bridge_security_accepts_documented_values_only() {
+        assert_eq!(
+            wasix_bridge_security(i32::from(WASIX_STREAM_SECURITY_UNENCRYPTED))
+                .map(crate::NetworkBridgeSecurity::raw),
+            Ok(WASIX_STREAM_SECURITY_UNENCRYPTED)
+        );
+        assert_eq!(
+            wasix_bridge_security(i32::from(WASIX_STREAM_SECURITY_ANY_ENCRYPTION))
+                .map(crate::NetworkBridgeSecurity::raw),
+            Ok(WASIX_STREAM_SECURITY_ANY_ENCRYPTION)
+        );
+        assert_eq!(wasix_bridge_security(0), Err(p1::errno::INVAL));
+        assert_eq!(
+            wasix_bridge_security(
+                i32::from(WASIX_STREAM_SECURITY_CLASSIC_ENCRYPTION)
+                    | i32::from(WASIX_STREAM_SECURITY_DOUBLE_ENCRYPTION)
+            ),
             Err(p1::errno::INVAL)
         );
     }

@@ -8,8 +8,8 @@ use core::pin::Pin;
 
 use crate::{
     ComponentNetworkService, DnsError, Ipv4Address, Ipv4Cidr, Ipv4Route, MacAddress,
-    NetworkAdminBackend, NetworkBridgeId, NetworkControlError, NetworkPortId, PingError, PingReply,
-    TcpAccepted, TcpError, TcpListener, UdpBinding, UdpDatagram, UdpError,
+    NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkPortId, PingError,
+    PingReply, TcpAccepted, TcpError, TcpListener, UdpBinding, UdpDatagram, UdpError,
 };
 
 pub trait ComponentHostTcpStreamToken: Copy + Send + 'static {
@@ -163,7 +163,7 @@ trait DynComponentHostNetworkService: Send + Sync + 'static {
     fn bridge_port<'a>(
         &'a self,
         port: NetworkPortId,
-        bridge: NetworkBridgeId,
+        bridge: NetworkBridgeRequest,
     ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>>;
 
     fn unbridge_port<'a>(
@@ -398,7 +398,7 @@ impl NetworkAdminBackend for ComponentHostNetworkService {
     fn bridge_port(
         &self,
         port: NetworkPortId,
-        bridge: NetworkBridgeId,
+        bridge: NetworkBridgeRequest,
     ) -> impl Future<Output = Result<(), NetworkControlError>> + Send {
         self.inner.bridge_port(port, bridge)
     }
@@ -724,7 +724,7 @@ where
     fn bridge_port<'a>(
         &'a self,
         port: NetworkPortId,
-        bridge: NetworkBridgeId,
+        bridge: NetworkBridgeRequest,
     ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>> {
         Box::pin(async move { self.service.bridge_port(port, bridge).await })
     }

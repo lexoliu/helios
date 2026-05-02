@@ -128,8 +128,8 @@ pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
 };
 pub use network_control::{
-    Ipv4Cidr, Ipv4Route, MacAddress, NetworkAdminBackend, NetworkBridgeId, NetworkControl,
-    NetworkControlError, NetworkPortId,
+    Ipv4Cidr, Ipv4Route, MacAddress, NetworkAdminBackend, NetworkBridgeRequest,
+    NetworkBridgeSecurity, NetworkControl, NetworkControlError, NetworkPortId,
 };
 pub use network_service::{NetworkDevice, NetworkService, TcpListenerId, TcpStreamId, UdpSocketId};
 pub use observer::{

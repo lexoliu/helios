@@ -1,5 +1,6 @@
 extern crate alloc;
 
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::future::Future;
 use thiserror::Error;
@@ -20,15 +21,52 @@ impl NetworkPortId {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct NetworkBridgeId(u32);
+pub struct NetworkBridgeSecurity(u8);
 
-impl NetworkBridgeId {
-    pub const fn new(raw: u32) -> Self {
-        Self(raw)
+impl NetworkBridgeSecurity {
+    pub const UNENCRYPTED: Self = Self(1 << 0);
+    pub const ANY_ENCRYPTION: Self = Self(1 << 1);
+    pub const CLASSIC_ENCRYPTION: Self = Self(1 << 2);
+    pub const DOUBLE_ENCRYPTION: Self = Self(1 << 3);
+
+    pub const fn new(raw: u8) -> Result<Self, NetworkControlError> {
+        match raw {
+            1 | 2 | 4 | 8 => Ok(Self(raw)),
+            _ => Err(NetworkControlError::InvalidBridgeRequest),
+        }
     }
 
-    pub const fn raw(self) -> u32 {
+    pub const fn raw(self) -> u8 {
         self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetworkBridgeRequest {
+    network: String,
+    token: String,
+    security: NetworkBridgeSecurity,
+}
+
+impl NetworkBridgeRequest {
+    pub const fn new(network: String, token: String, security: NetworkBridgeSecurity) -> Self {
+        Self {
+            network,
+            token,
+            security,
+        }
+    }
+
+    pub fn network(&self) -> &str {
+        &self.network
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    pub const fn security(&self) -> NetworkBridgeSecurity {
+        self.security
     }
 }
 
@@ -126,6 +164,8 @@ pub enum NetworkControlError {
     PortUnavailable,
     #[error("network bridge is unavailable")]
     BridgeUnavailable,
+    #[error("network bridge request is invalid")]
+    InvalidBridgeRequest,
     #[error("address is invalid for this port")]
     InvalidAddress,
     #[error("route is invalid for this port")]
@@ -140,7 +180,7 @@ pub trait NetworkAdminBackend: Clone + Send + 'static {
     fn bridge_port(
         &self,
         port: NetworkPortId,
-        bridge: NetworkBridgeId,
+        bridge: NetworkBridgeRequest,
     ) -> impl Future<Output = Result<(), NetworkControlError>> + Send;
 
     fn unbridge_port(
@@ -226,7 +266,7 @@ where
         &self,
         _: NetworkAdminCap,
         port: NetworkPortId,
-        bridge: NetworkBridgeId,
+        bridge: NetworkBridgeRequest,
     ) -> impl Future<Output = Result<(), NetworkControlError>> + Send {
         self.backend.bridge_port(port, bridge)
     }
@@ -340,8 +380,8 @@ mod tests {
     use futures_lite::future::block_on;
 
     use super::{
-        Ipv4Cidr, Ipv4Route, MacAddress, NetworkAdminBackend, NetworkBridgeId, NetworkControl,
-        NetworkControlError, NetworkPortId,
+        Ipv4Cidr, Ipv4Route, MacAddress, NetworkAdminBackend, NetworkBridgeRequest,
+        NetworkBridgeSecurity, NetworkControl, NetworkControlError, NetworkPortId,
     };
     use crate::{Ipv4Address, NetworkAuthorityRights, ProcessAuthority};
 
@@ -352,7 +392,7 @@ mod tests {
         async fn bridge_port(
             &self,
             _: NetworkPortId,
-            _: NetworkBridgeId,
+            _: NetworkBridgeRequest,
         ) -> Result<(), NetworkControlError> {
             Ok(())
         }
@@ -444,8 +484,13 @@ mod tests {
             .expect("network admin cap must derive from ADMIN right");
         let control = NetworkControl::new(TestBackend);
         let port = NetworkPortId::new(1);
+        let bridge = NetworkBridgeRequest::new(
+            "edge.example".into(),
+            "token".into(),
+            NetworkBridgeSecurity::ANY_ENCRYPTION,
+        );
 
-        block_on(control.bridge_port(cap, port, NetworkBridgeId::new(7)))
+        block_on(control.bridge_port(cap, port, bridge))
             .expect("bridge should succeed with admin cap");
         let route = Ipv4Route::new(
             Ipv4Cidr::new(Ipv4Address::new([0, 0, 0, 0]), 0),

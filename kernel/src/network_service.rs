@@ -29,7 +29,7 @@ use smoltcp::wire::{
 use crate::{
     ComponentNetworkService, ComponentRuntimeState, DnsError, DnsErrorKind,
     Ipv4Address as KernelIpv4Address, Ipv4Cidr as KernelIpv4Cidr, Ipv4Route as KernelIpv4Route,
-    MacAddress, NetworkAdminBackend, NetworkBridgeId, NetworkControlError, NetworkErrorDetail,
+    MacAddress, NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
     NetworkPortId, Notify, PingError, PingErrorKind, PingReply, TcpAccepted, TcpError,
     TcpErrorKind, TcpListener, Timer, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
 };
@@ -1585,7 +1585,7 @@ where
     async fn bridge_port(
         &self,
         port: NetworkPortId,
-        _: NetworkBridgeId,
+        _: NetworkBridgeRequest,
     ) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
         Err(NetworkControlError::BridgeUnavailable)
