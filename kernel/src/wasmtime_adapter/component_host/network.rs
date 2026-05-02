@@ -43,7 +43,7 @@ impl ComponentHostUdpSocketToken for u64 {
     }
 }
 
-pub trait DynComponentHostNetworkService: Send + Sync + 'static {
+trait DynComponentHostNetworkService: Send + Sync + 'static {
     fn ping<'a>(
         &'a self,
         host: &'a str,

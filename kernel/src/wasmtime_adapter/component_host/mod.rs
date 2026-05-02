@@ -60,7 +60,6 @@ mod topology;
 
 pub use network::{
     ComponentHostNetworkService, ComponentHostTcpStreamToken, ComponentHostUdpSocketToken,
-    DynComponentHostNetworkService,
 };
 pub use service::{
     ChildExit, ChildHandle, UserProgramService, install_component_host_program_service,
