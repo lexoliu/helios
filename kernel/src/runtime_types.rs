@@ -336,6 +336,47 @@ pub enum NetworkErrorDetail {
     InternalInvariant,
 }
 
+impl NetworkErrorDetail {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NetworkConfigurationTimeout => "network configuration timed out",
+            Self::NetworkServiceUnavailable => "network service is unavailable",
+            Self::NetworkAuthorityMissing => "network authority is missing required rights",
+            Self::PrivilegedBindDenied => "privileged bind authority is required for this port",
+            Self::VirtioAdvanceFailed => "virtio network device advance failed",
+            Self::DnsServersUnavailable => "DNS servers are not configured",
+            Self::DnsQueryStartFailed => "DNS query could not be started",
+            Self::DnsLookupTimeout => "DNS lookup timed out",
+            Self::DnsLookupFailed => "DNS lookup failed",
+            Self::DnsNoIpv4Address => "DNS lookup returned no IPv4 address",
+            Self::DnsResultNotReady => "DNS result is not ready",
+            Self::IcmpEchoTimeout => "ICMP echo request timed out",
+            Self::IcmpQueueFailed => "ICMP echo request could not be queued",
+            Self::TcpConnectTimeout => "TCP connect timed out",
+            Self::TcpConnectStartFailed => "TCP connect could not be started",
+            Self::TcpClosedDuringConnect => "TCP stream closed during connect",
+            Self::TcpWriteTimeout => "TCP write timed out",
+            Self::TcpWriteQueueFailed => "TCP write could not be queued",
+            Self::TcpNoLongerWritable => "TCP stream is no longer writable",
+            Self::TcpReadTimeout => "TCP read timed out",
+            Self::TcpReceiveFailed => "TCP receive failed",
+            Self::TcpClosedUnexpectedly => "TCP stream closed unexpectedly",
+            Self::TcpNoEphemeralPorts => "no ephemeral TCP ports are available",
+            Self::UdpSendTimeout => "UDP send timed out",
+            Self::UdpReceiveTimeout => "UDP receive timed out",
+            Self::UdpPortInUse => "UDP local port is already in use",
+            Self::UdpBindFailed => "UDP bind failed",
+            Self::UdpDatagramTooLarge => "UDP datagram exceeds transmit capacity",
+            Self::UdpQueueFailed => "UDP datagram could not be queued",
+            Self::UdpReceiveFailed => "UDP receive failed",
+            Self::UdpNoEphemeralPorts => "no ephemeral UDP ports are available",
+            Self::UnknownTcpStream => "unknown TCP stream",
+            Self::UnknownUdpSocket => "unknown UDP socket",
+            Self::InternalInvariant => "internal network invariant failed",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct UdpDatagram {
     pub address: Ipv4Address,

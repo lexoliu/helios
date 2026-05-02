@@ -110,6 +110,61 @@ pub enum ProgramExecErrorDetail {
     InternalInvariant,
 }
 
+impl ProgramExecErrorDetail {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ChildExitChannelDropped => "child exit channel closed before completion",
+            Self::ChildExitAlreadyConsumed => "child exit result was already consumed",
+            Self::HintNotAllowedForPrecompiledArtifact => {
+                "compile hint is not allowed for precompiled artifacts"
+            }
+            Self::MissingArtifactPayload => "artifact payload is missing",
+            Self::InvalidRuntimeArtifact => "artifact is not executable by the selected runtime",
+            Self::InvalidEntryPoint => "program entry point is missing or has an invalid type",
+            Self::UnsupportedImport => "program imports an unsupported host function",
+            Self::InvalidProgramPath => "program path is invalid",
+            Self::InvalidProgramPathEncoding => "program path is not valid UTF-8",
+            Self::ProgramSourceNotGranted => "program source is not granted by process authority",
+            Self::ProgramArtifactDestinationNotGranted => {
+                "program artifact destination is not granted by process authority"
+            }
+            Self::ProcessAuthorityDenied => "process authority rejected the requested grant",
+            Self::FilesystemOperationFailed => "filesystem operation failed",
+            Self::HostFilesystemUnavailable => "host filesystem service is unavailable",
+            Self::ArtifactSignatureInvalid => "artifact signature verification failed",
+            Self::ArtifactProfileInvalid => "artifact profile is unsupported",
+            Self::RuntimeFailure => "runtime operation failed",
+            Self::ImageReplacementUnavailable => {
+                "program image replacement is not available for this runtime"
+            }
+            Self::StackRestoreUnavailable => {
+                "program stack restoration is not available for this runtime"
+            }
+            Self::UnwindExportInvalid => "program unwind export is missing or has an invalid type",
+            Self::StackSnapshotMissing => "program stack snapshot does not exist",
+            Self::StackBoundsInvalid => "program stack bounds are invalid",
+            Self::HostOperationFailed => "host operation failed",
+            Self::CompilerUnavailable => "compiler plugin is unavailable",
+            Self::CompilerPluginInvalid => "compiler plugin artifact has the wrong shape",
+            Self::CompilerMemoryContractInvalid => "compiler plugin memory contract is invalid",
+            Self::ImportedSharedMemoryContractInvalid => {
+                "imported shared memory contract is invalid"
+            }
+            Self::ImportedSharedMemoryBudgetExceeded => {
+                "imported shared memory exceeds the user-memory budget"
+            }
+            Self::CompilerAbiMismatch => "compiler plugin ABI version mismatch",
+            Self::CompilerRejectedInput => "compiler plugin rejected the input",
+            Self::CompilerAllocationFailed => "compiler plugin allocation failed",
+            Self::CompilerThreadPointerOverflow => "compiler plugin thread pointer overflowed",
+            Self::GuestMemoryAccessOverflow => "guest memory access overflowed",
+            Self::GuestMemoryAccessOutOfBounds => "guest memory access is out of bounds",
+            Self::GuestMemoryTypeMismatch => "guest memory value has an invalid type",
+            Self::InternalInvariant => "internal invariant was violated",
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 #[error("{kind}: {detail}")]
 pub struct ProgramExecError {

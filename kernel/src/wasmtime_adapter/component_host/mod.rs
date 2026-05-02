@@ -2475,7 +2475,7 @@ fn convert_launch_error(
                 debugger_bindings::helios::system::programs::ExecErrorKind::Internal
             }
         },
-        detail: error.detail.to_string(),
+        detail: error.detail.as_str().to_owned(),
     }
 }
 
@@ -2528,7 +2528,7 @@ fn convert_program_launch_error(
                 program_bindings::helios::system::programs::ExecErrorKind::Internal
             }
         },
-        detail: error.detail.to_string(),
+        detail: error.detail.as_str().to_owned(),
     }
 }
 
@@ -2589,7 +2589,7 @@ fn convert_ping_error(
                 debugger_bindings::helios::system::net::PingErrorKind::Internal
             }
         },
-        detail: error.detail.to_string(),
+        detail: error.detail.as_str().to_owned(),
     }
 }
 
@@ -2611,7 +2611,7 @@ fn convert_program_ping_error(
                 program_bindings::helios::system::net::PingErrorKind::Internal
             }
         },
-        detail: error.detail.to_string(),
+        detail: error.detail.as_str().to_owned(),
     }
 }
 
@@ -2687,7 +2687,7 @@ fn convert_tcp_error(error: crate::TcpError) -> debugger_bindings::helios::syste
                 debugger_bindings::helios::system::net::TcpErrorKind::Internal
             }
         },
-        detail: error.detail.to_string(),
+        detail: error.detail.as_str().to_owned(),
     }
 }
 
@@ -2709,7 +2709,7 @@ fn convert_program_tcp_error(
                 program_bindings::helios::system::net::TcpErrorKind::Internal
             }
         },
-        detail: error.detail.to_string(),
+        detail: error.detail.as_str().to_owned(),
     }
 }
 
@@ -2758,7 +2758,7 @@ fn convert_udp_error(error: crate::UdpError) -> debugger_bindings::helios::syste
                 debugger_bindings::helios::system::net::UdpErrorKind::Internal
             }
         },
-        detail: error.detail.to_string(),
+        detail: error.detail.as_str().to_owned(),
     }
 }
 
@@ -2783,7 +2783,7 @@ fn convert_program_udp_error(
                 program_bindings::helios::system::net::UdpErrorKind::Internal
             }
         },
-        detail: error.detail.to_string(),
+        detail: error.detail.as_str().to_owned(),
     }
 }
 
