@@ -23,7 +23,7 @@ use wasmtime::component::{
     Access, Accessor, Component, Destination, FutureReader, HasSelf, Resource, Source,
     StreamConsumer, StreamProducer, StreamReader, StreamResult, VecBuffer,
 };
-use wasmtime::{self, Result};
+use wasmtime::{self, Result, StoreContextMut};
 
 use crate::wasmtime_adapter::component_host::ComponentHostNetworkService;
 use crate::wasmtime_adapter::component_host::{OutputStreamKind, StoreData};
@@ -300,6 +300,40 @@ struct TcpWriteConsumer {
 }
 
 type TcpWriteResult = core::result::Result<(), socket_types::ErrorCode>;
+
+struct TcpListenStreamProducer<T, CpuImpl, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    socket: TcpSocket,
+    get_store_data: for<'a> fn(&'a mut T) -> &'a mut StoreData<CpuImpl, HostFs>,
+    spawner: crate::Spawner<CpuImpl>,
+    waiter: crate::NotifyWaiter,
+}
+
+impl<T, CpuImpl, HostFs> Unpin for TcpListenStreamProducer<T, CpuImpl, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum P3TcpListenStreamOperation {
+    Listen,
+    Accept,
+    LocalAddress,
+    InvalidState,
+}
+
+#[derive(Clone, Debug, Error)]
+#[error("preview3 TCP listener stream {operation:?} failed")]
+struct P3TcpListenStreamError {
+    operation: P3TcpListenStreamOperation,
+    #[source]
+    source: Option<crate::TcpError>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WasiTcpSocketFamily {
@@ -599,6 +633,155 @@ impl TcpSocket {
             .stream
             .take()
             .map(|stream| (state.service.clone(), stream))
+    }
+}
+
+impl<T, CpuImpl, HostFs> TcpListenStreamProducer<T, CpuImpl, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    fn new(
+        socket: TcpSocket,
+        get_store_data: for<'a> fn(&'a mut T) -> &'a mut StoreData<CpuImpl, HostFs>,
+        spawner: crate::Spawner<CpuImpl>,
+    ) -> Self {
+        let waiter = socket.ready.waiter();
+        Self {
+            socket,
+            get_store_data,
+            spawner,
+            waiter,
+        }
+    }
+}
+
+impl<T, CpuImpl, HostFs> StreamProducer<T> for TcpListenStreamProducer<T, CpuImpl, HostFs>
+where
+    T: 'static,
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    type Item = Resource<TcpSocket>;
+    type Buffer = Option<Self::Item>;
+
+    fn poll_produce<'a>(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut store: StoreContextMut<'a, T>,
+        mut destination: Destination<'a, Self::Item, Self::Buffer>,
+        finish: bool,
+    ) -> Poll<Result<StreamResult>> {
+        if finish {
+            return Poll::Ready(Ok(StreamResult::Cancelled));
+        }
+        if destination.remaining(&mut store) == Some(0) {
+            return Poll::Ready(Ok(StreamResult::Completed));
+        }
+        let this = self.as_mut().get_mut();
+
+        loop {
+            let mut start_accept = None;
+            let mut accepted_socket = None;
+            let mut wait_for_socket = false;
+            {
+                let mut state = this.socket.inner.lock();
+                if let Some(result) = state.listen_result.take() {
+                    match result {
+                        Ok(listener) => {
+                            state.listener = Some(listener.listener);
+                            state.local_address.get_or_insert(WasiTcpSocketAddress {
+                                address: crate::Ipv4Address::new([0, 0, 0, 0]),
+                                port: listener.local_port,
+                            });
+                        }
+                        Err(error) => {
+                            return Poll::Ready(Err(wasmtime::Error::new(
+                                P3TcpListenStreamError {
+                                    operation: P3TcpListenStreamOperation::Listen,
+                                    source: Some(error),
+                                },
+                            )));
+                        }
+                    }
+                }
+
+                if state.listen_in_progress {
+                    wait_for_socket = true;
+                } else if let Some(result) = state.accept_result.take() {
+                    match result {
+                        Ok(accepted) => {
+                            let Some(local_address) = state.local_address else {
+                                return Poll::Ready(Err(wasmtime::Error::new(
+                                    P3TcpListenStreamError {
+                                        operation: P3TcpListenStreamOperation::LocalAddress,
+                                        source: None,
+                                    },
+                                )));
+                            };
+                            accepted_socket = Some(TcpSocket::accepted(
+                                state.service.clone(),
+                                state.family,
+                                accepted.stream,
+                                local_address,
+                                WasiTcpSocketAddress {
+                                    address: accepted.address,
+                                    port: accepted.port,
+                                },
+                            ));
+                        }
+                        Err(error) => {
+                            return Poll::Ready(Err(wasmtime::Error::new(
+                                P3TcpListenStreamError {
+                                    operation: P3TcpListenStreamOperation::Accept,
+                                    source: Some(error),
+                                },
+                            )));
+                        }
+                    }
+                } else if state.accept_in_progress {
+                    wait_for_socket = true;
+                } else if let Some(listener) = state.listener {
+                    state.accept_in_progress = true;
+                    start_accept = Some((
+                        state.service.clone(),
+                        this.socket.inner.clone(),
+                        this.socket.ready.clone(),
+                        listener,
+                    ));
+                } else {
+                    return Poll::Ready(Err(wasmtime::Error::new(P3TcpListenStreamError {
+                        operation: P3TcpListenStreamOperation::InvalidState,
+                        source: None,
+                    })));
+                }
+            }
+
+            if let Some(accepted_socket) = accepted_socket {
+                let store_data = (this.get_store_data)(store.data_mut());
+                let resource = store_data.table.push(accepted_socket)?;
+                destination.set_buffer(Some(resource));
+                return Poll::Ready(Ok(StreamResult::Completed));
+            }
+
+            if let Some((service, inner, ready, listener)) = start_accept {
+                this.spawner.spawn_detached(async move {
+                    let result = service.tcp_accept(listener, u64::MAX).await;
+                    let mut state = inner.lock();
+                    state.accept_in_progress = false;
+                    state.accept_result = Some(result);
+                    ready.notify_all();
+                });
+                wait_for_socket = true;
+            }
+
+            if wait_for_socket {
+                match this.socket.ready.poll_notified(cx, &mut this.waiter) {
+                    Poll::Ready(()) => continue,
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        }
     }
 }
 
@@ -4647,12 +4830,64 @@ where
         Ok(socket.connect(remote_address).await)
     }
 
-    fn listen<T>(
-        _access: Access<'_, T, Self>,
-        _: Resource<TcpSocket>,
+    fn listen<T: 'static>(
+        mut access: Access<'_, T, Self>,
+        socket_resource: Resource<TcpSocket>,
     ) -> Result<core::result::Result<StreamReader<Resource<TcpSocket>>, socket_types::ErrorCode>>
     {
-        Ok(Err(socket_types::ErrorCode::NotSupported))
+        let socket = access.get().table.get(&socket_resource)?.clone();
+        let (local_port, listen_backlog) = {
+            let state = socket.inner.lock();
+            if state.stream.is_some()
+                || state.listener.is_some()
+                || state.connect_in_progress
+                || state.listen_in_progress
+                || state.listen_result.is_some()
+            {
+                return Ok(Err(socket_types::ErrorCode::InvalidState));
+            }
+            (
+                state.local_address.map_or(0, |address| address.port),
+                state.listen_backlog,
+            )
+        };
+        if !has_wasi_network_rights(
+            access.get().process_authority(),
+            wasi_tcp_bind_rights(local_port),
+        ) {
+            return Ok(Err(socket_types::ErrorCode::AccessDenied));
+        }
+        let spawner = access.get().spawner().clone();
+        let getter = access.getter();
+        let stream = StreamReader::new(
+            &mut access,
+            TcpListenStreamProducer::new(socket.clone(), getter, spawner.clone()),
+        )?;
+        let (service, inner, ready) = {
+            let mut state = socket.inner.lock();
+            if state.stream.is_some()
+                || state.listener.is_some()
+                || state.connect_in_progress
+                || state.listen_in_progress
+                || state.listen_result.is_some()
+            {
+                return Ok(Err(socket_types::ErrorCode::InvalidState));
+            }
+            state.listen_in_progress = true;
+            (
+                state.service.clone(),
+                socket.inner.clone(),
+                socket.ready.clone(),
+            )
+        };
+        spawner.spawn_detached(async move {
+            let result = service.tcp_listen(local_port, listen_backlog).await;
+            let mut state = inner.lock();
+            state.listen_in_progress = false;
+            state.listen_result = Some(result);
+            ready.notify_all();
+        });
+        Ok(Ok(stream))
     }
 
     fn send<T>(
