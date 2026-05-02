@@ -47,26 +47,61 @@ unsafe impl MemoryCreator for UserMemoryCreator {
         reserved_size_in_bytes: Option<usize>,
         guard_size_in_bytes: usize,
     ) -> Result<Box<dyn LinearMemory>, String> {
-        if guard_size_in_bytes != 0 {
-            return Err(UserLinearMemoryError::GuardPagesUnsupported.to_string());
-        }
-
-        if reserved_size_in_bytes.is_some_and(|reserved| reserved != 0) {
-            return Err(UserLinearMemoryError::ReservationUnsupported.to_string());
-        }
-
-        let (capacity, relocatable) = if ty.is_shared() {
-            let maximum =
-                maximum.ok_or_else(|| UserLinearMemoryError::SharedMaximumMissing.to_string())?;
-            (maximum, false)
-        } else {
-            (minimum, true)
-        };
-
-        UserLinearMemory::new(minimum, capacity, relocatable)
-            .map(|memory| Box::new(memory) as Box<dyn LinearMemory>)
-            .map_err(|error| error.to_string())
+        plan_user_linear_memory(
+            ty,
+            minimum,
+            maximum,
+            reserved_size_in_bytes,
+            guard_size_in_bytes,
+        )
+        .and_then(UserLinearMemoryPlan::allocate)
+        .map(|memory| Box::new(memory) as Box<dyn LinearMemory>)
+        .map_err(|error| error.to_string())
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UserLinearMemoryPlan {
+    minimum: usize,
+    capacity: usize,
+    relocatable: bool,
+}
+
+impl UserLinearMemoryPlan {
+    fn allocate(self) -> Result<UserLinearMemory, UserLinearMemoryError> {
+        UserLinearMemory::new(self.minimum, self.capacity, self.relocatable)
+    }
+}
+
+fn plan_user_linear_memory(
+    ty: MemoryType,
+    minimum: usize,
+    maximum: Option<usize>,
+    reserved_size_in_bytes: Option<usize>,
+    guard_size_in_bytes: usize,
+) -> Result<UserLinearMemoryPlan, UserLinearMemoryError> {
+    if guard_size_in_bytes != 0 {
+        return Err(UserLinearMemoryError::GuardPagesUnsupported);
+    }
+
+    if reserved_size_in_bytes.is_some_and(|reserved| reserved != 0) {
+        return Err(UserLinearMemoryError::ReservationUnsupported);
+    }
+
+    let (capacity, relocatable) = if ty.is_shared() {
+        (
+            maximum.ok_or(UserLinearMemoryError::SharedMaximumMissing)?,
+            false,
+        )
+    } else {
+        (minimum, true)
+    };
+
+    Ok(UserLinearMemoryPlan {
+        minimum,
+        capacity,
+        relocatable,
+    })
 }
 
 struct UserLinearMemory {
@@ -173,4 +208,46 @@ impl Drop for UserLinearMemory {
 fn linear_memory_layout(size: usize) -> Result<Layout, UserLinearMemoryError> {
     Layout::from_size_align(size, LINEAR_MEMORY_ALIGNMENT)
         .map_err(|_| UserLinearMemoryError::InvalidLayout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_memory_planning_preserves_structured_errors() {
+        let memory = MemoryType::new(1, None);
+
+        assert_eq!(
+            plan_user_linear_memory(memory.clone(), 1, None, None, LINEAR_MEMORY_ALIGNMENT),
+            Err(UserLinearMemoryError::GuardPagesUnsupported)
+        );
+        assert_eq!(
+            plan_user_linear_memory(memory, 1, None, Some(LINEAR_MEMORY_ALIGNMENT), 0),
+            Err(UserLinearMemoryError::ReservationUnsupported)
+        );
+        assert_eq!(
+            plan_user_linear_memory(MemoryType::shared(1, 1), 1, None, None, 0),
+            Err(UserLinearMemoryError::SharedMaximumMissing)
+        );
+    }
+
+    #[test]
+    fn user_memory_plan_keeps_shared_memory_fixed_capacity() {
+        assert_eq!(
+            plan_user_linear_memory(
+                MemoryType::shared(1, 2),
+                LINEAR_MEMORY_ALIGNMENT,
+                Some(LINEAR_MEMORY_ALIGNMENT * 2),
+                None,
+                0,
+            )
+            .expect("shared memory plan must be valid"),
+            UserLinearMemoryPlan {
+                minimum: LINEAR_MEMORY_ALIGNMENT,
+                capacity: LINEAR_MEMORY_ALIGNMENT * 2,
+                relocatable: false,
+            }
+        );
+    }
 }
