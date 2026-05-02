@@ -29,8 +29,17 @@ fi
 
 run_smoke() {
     local name="$1"
-    local expected="$2"
-    shift 2
+    shift
+    local expected=()
+    while [[ "$#" -gt 0 && "$1" != "--" ]]; do
+        expected+=("$1")
+        shift
+    done
+    if [[ "$#" -eq 0 ]]; then
+        printf 'smoke %s is missing command separator\n' "${name}" >&2
+        return 1
+    fi
+    shift
 
     printf '==> %s\n' "${name}" >&2
 
@@ -41,16 +50,20 @@ run_smoke() {
         return 1
     fi
 
-    if ! grep -Fq -- "${expected}" <<<"${output}"; then
-        printf '%s\n' "${output}" >&2
-        printf 'smoke %s did not produce expected output: %s\n' "${name}" "${expected}" >&2
-        return 1
-    fi
+    local item
+    for item in "${expected[@]}"; do
+        if ! grep -Fq -- "${item}" <<<"${output}"; then
+            printf '%s\n' "${output}" >&2
+            printf 'smoke %s did not produce expected output: %s\n' "${name}" "${item}" >&2
+            return 1
+        fi
+    done
 }
 
 run_smoke \
     dash \
     dash:42 \
+    -- \
     --boot-program dash \
     --boot-program debugger \
     --no-compiler-plugin \
@@ -61,19 +74,36 @@ run_smoke \
 run_smoke \
     bash-coreutils \
     ok \
+    HELIOS_SMOKE=pass \
+    cwd:/ \
+    -- \
     --boot-program dash \
     --boot-program debugger \
     --boot-program bash \
     --boot-program mkdir \
     --boot-program cat \
+    --boot-program env \
     --no-compiler-plugin \
     shell \
     -c \
-    '/bin/bash -c "cd /; /bin/mkdir d; echo ok > /d/f; /bin/cat /d/f"'
+    '/bin/bash -c "cd /; /bin/mkdir d; echo ok > /d/f; /bin/cat /d/f | /bin/cat; /bin/env HELIOS_SMOKE=pass; echo cwd:$PWD"'
+
+run_smoke \
+    bash-exit-status \
+    status:7 \
+    -- \
+    --boot-program dash \
+    --boot-program debugger \
+    --boot-program bash \
+    --no-compiler-plugin \
+    shell \
+    -c \
+    '/bin/bash -c "exit 7"; echo status:$?'
 
 run_smoke \
     quickjs \
     42 \
+    -- \
     --boot-program dash \
     --boot-program debugger \
     --boot-program quickjs \
@@ -85,6 +115,7 @@ run_smoke \
 run_smoke \
     cpython \
     '{"ok":"a"}' \
+    -- \
     --boot-program dash \
     --boot-program debugger \
     --boot-program python3 \
@@ -97,6 +128,7 @@ if [[ "${HELIOS_WASI_SMOKE_CURL:-0}" == "1" ]]; then
     run_smoke \
         curl \
         '<title>Example Domain</title>' \
+        -- \
         --boot-program dash \
         --boot-program debugger \
         --boot-program curl \
