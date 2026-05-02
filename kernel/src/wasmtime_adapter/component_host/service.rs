@@ -10555,7 +10555,11 @@ where
     if status != p1::errno::SUCCESS {
         return status;
     }
-    wasix_sock_descriptor_unavailable(caller, fd)
+    let status = wasix_sock_descriptor_unavailable(caller, fd);
+    if status != p1::errno::SUCCESS {
+        return status;
+    }
+    p1::errno::NOTSUP
 }
 
 async fn wasix_sock_bind<CpuImpl, HostFs>(
