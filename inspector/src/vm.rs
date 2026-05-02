@@ -367,6 +367,7 @@ enum VmSessionCommand {
     Stats,
     Repl,
     AotBench(AotBenchCommand),
+    WorkloadBench(WorkloadBenchCommand),
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -401,6 +402,17 @@ struct AotBenchCommand {
     /// Write folded user-only profile samples collected during the AOT run.
     #[arg(long)]
     user_profile_output: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+struct WorkloadBenchCommand {
+    /// Number of measured executions per workload.
+    #[arg(long, default_value_t = 3)]
+    iterations: u16,
+
+    /// Restrict the run to named workloads. Repeat for multiple workloads.
+    #[arg(long = "workload")]
+    workloads: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -440,6 +452,7 @@ struct ResolvedVmCommand {
 enum ResolvedVmSessionCommand {
     Session(SessionCommand),
     AotBench(AotBenchCommand),
+    WorkloadBench(WorkloadBenchCommand),
 }
 
 pub(crate) fn run(command: VmCommand) -> Result<()> {
@@ -521,8 +534,20 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
     let qemu_trace_log = command.qemu_trace_log.or(file.qemu_trace_log);
     let mut qemu_arg = file.qemu_arg;
     qemu_arg.extend(command.qemu_arg);
+    let session_command = command.command.map(Into::into);
     let mut boot_programs = file.boot_programs;
     boot_programs.extend(command.boot_programs);
+    if matches!(
+        &session_command,
+        Some(ResolvedVmSessionCommand::WorkloadBench(_))
+    ) {
+        extend_unique_boot_programs(
+            &mut boot_programs,
+            &[
+                "dash", "debugger", "bash", "cat", "mkdir", "env", "python3", "quickjs",
+            ],
+        );
+    }
     let no_compiler_plugin = command.no_compiler_plugin || file.no_compiler_plugin.unwrap_or(false);
     let runtime_dir = command.runtime_dir.or(file.runtime_dir);
     let keep_runtime_dir =
@@ -557,8 +582,16 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
         no_compiler_plugin,
         runtime_dir,
         keep_runtime_dir,
-        command: command.command.map(Into::into),
+        command: session_command,
     })
+}
+
+fn extend_unique_boot_programs(programs: &mut Vec<String>, required: &[&str]) {
+    for program in required {
+        if !programs.iter().any(|existing| existing == program) {
+            programs.push((*program).to_owned());
+        }
+    }
 }
 
 fn load_config_file(path: Option<&Path>) -> Result<VmConfigFile> {
@@ -679,9 +712,114 @@ fn connect_and_run(command: &ResolvedVmCommand, runtime: &mut VmRuntime) -> Resu
     };
     match command.command.clone() {
         Some(ResolvedVmSessionCommand::AotBench(command)) => run_aot_bench(client, command),
+        Some(ResolvedVmSessionCommand::WorkloadBench(command)) => {
+            run_workload_bench(client, command)
+        }
         Some(ResolvedVmSessionCommand::Session(command)) => run_connected(client, Some(command)),
         None => run_connected(client, None),
     }
+}
+
+fn run_workload_bench(
+    mut client: crate::serial::RpcClient,
+    command: WorkloadBenchCommand,
+) -> Result<()> {
+    crate::run_interruptible(async move {
+        if command.iterations == 0 {
+            bail!("workload-bench --iterations must be non-zero");
+        }
+        let workloads = selected_workloads(&command.workloads)?;
+        use std::io::Write as _;
+        for workload in workloads {
+            let mut elapsed_ms = Vec::new();
+            for iteration in 1..=command.iterations {
+                let started = std::time::Instant::now();
+                let output = crate::programs::exec(
+                    &mut client,
+                    crate::programs::REMOTE_SHELL_PATH,
+                    &["-c".to_owned(), workload.script.to_owned()],
+                )
+                .await
+                .with_context(|| format!("failed to run workload {}", workload.name))?;
+                let elapsed = started.elapsed().as_millis();
+                if output.exit_code != 0 {
+                    std::io::stdout().write_all(&output.output.stdout)?;
+                    std::io::stderr().write_all(&output.output.stderr)?;
+                    bail!(
+                        "workload {} iteration {} exited with code {}",
+                        workload.name,
+                        iteration,
+                        output.exit_code
+                    );
+                }
+                writeln!(
+                    std::io::stdout().lock(),
+                    "workload={} iteration={} elapsed_ms={} stdout_bytes={} stderr_bytes={}",
+                    workload.name,
+                    iteration,
+                    elapsed,
+                    output.output.stdout.len(),
+                    output.output.stderr.len()
+                )?;
+                elapsed_ms.push(elapsed);
+            }
+            elapsed_ms.sort_unstable();
+            let median = elapsed_ms[elapsed_ms.len() / 2];
+            writeln!(
+                std::io::stdout().lock(),
+                "workload={} median_elapsed_ms={} iterations={}",
+                workload.name,
+                median,
+                command.iterations
+            )?;
+        }
+        Ok(())
+    })
+}
+
+#[derive(Clone, Copy)]
+struct Workload {
+    name: &'static str,
+    script: &'static str,
+}
+
+const WORKLOADS: &[Workload] = &[
+    Workload {
+        name: "process-startup",
+        script: "i=0; while [ $i -lt 10 ]; do /bin/bash -c true; i=$((i+1)); done",
+    },
+    Workload {
+        name: "stdio-pipe",
+        script: "out=/pipe-$HELIOS_PROCESS_ID.out; copy=/pipe-$HELIOS_PROCESS_ID.copy; i=0; while [ $i -lt 2048 ]; do echo 0123456789abcdef0123456789abcdef; i=$((i+1)); done | /bin/cat > $out; /bin/cat $out > $copy",
+    },
+    Workload {
+        name: "fs-heavy",
+        script: "dir=/bench-$HELIOS_PROCESS_ID; /bin/mkdir $dir; i=0; while [ $i -lt 64 ]; do echo data > $dir/f$i; /bin/cat $dir/f$i > $dir/c$i; i=$((i+1)); done",
+    },
+    Workload {
+        name: "cpython-import",
+        script: "/bin/python3 -c \"import json, pathlib, email, urllib.parse; print('pyimport:ok')\"",
+    },
+    Workload {
+        name: "quickjs-loop",
+        script: "/bin/qjs -e \"let s=0; for (let i=0; i<10000; i++) s += i; console.log(s)\"",
+    },
+];
+
+fn selected_workloads(requested: &[String]) -> Result<Vec<Workload>> {
+    if requested.is_empty() {
+        return Ok(WORKLOADS.to_vec());
+    }
+    requested
+        .iter()
+        .map(|name| {
+            WORKLOADS
+                .iter()
+                .find(|workload| workload.name == name)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("unknown workload {name}"))
+        })
+        .collect()
 }
 
 fn run_aot_bench(client: crate::serial::RpcClient, command: AotBenchCommand) -> Result<()> {
@@ -1530,6 +1668,7 @@ impl From<VmSessionCommand> for ResolvedVmSessionCommand {
             VmSessionCommand::Stats => Self::Session(SessionCommand::Stats),
             VmSessionCommand::Repl => Self::Session(SessionCommand::Repl),
             VmSessionCommand::AotBench(command) => Self::AotBench(command),
+            VmSessionCommand::WorkloadBench(command) => Self::WorkloadBench(command),
         }
     }
 }

@@ -200,6 +200,18 @@ It runs the release AArch64/HVF `aot-bench` workload for
 iterations 2..N. Set `HELIOS_AOT_BENCH_COMPILER_TIMING=1` to include the
 compiler pass breakdown when diagnosing a regression.
 
+The real-software workload performance gate is:
+
+```bash
+tools/wasi-apps/workload-bench.sh
+```
+
+It boots one release AArch64/HVF VM and measures repeated guest executions
+for process startup, stdio pipe throughput, filesystem-heavy shell work,
+CPython import-heavy startup, and QuickJS execution. Logs are written under
+`target/perf-baselines/`. Set `HELIOS_WORKLOAD_BENCH_WORKLOADS` to a
+comma-separated workload list when narrowing a run.
+
 ## Run In Helios (RISC-V VM)
 
 Use inspector `vm` mode when checking RISC-V-specific behavior. Use

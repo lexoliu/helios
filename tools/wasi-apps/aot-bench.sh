@@ -22,9 +22,7 @@ if [[ ! -f "${input}" ]]; then
     exit 1
 fi
 
-if [[ ! -x "${inspector}" ]]; then
-    "${cargo_bin}" build --release -p helios-inspector
-fi
+"${cargo_bin}" build --release -p helios-inspector
 
 mkdir -p target/perf-baselines
 short_sha="$(git rev-parse --short HEAD)"

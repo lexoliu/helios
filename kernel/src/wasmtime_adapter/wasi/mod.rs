@@ -5873,7 +5873,10 @@ mod tests {
     fn assert_interface_set_eq(actual: &[&'static str], expected: &[&'static str], label: &str) {
         let actual = actual.iter().copied().collect::<BTreeSet<_>>();
         let expected = expected.iter().copied().collect::<BTreeSet<_>>();
-        assert_eq!(actual, expected, "{label} linked interface coverage changed");
+        assert_eq!(
+            actual, expected,
+            "{label} linked interface coverage changed"
+        );
     }
 
     fn wit_interface_names(packages: &[(&'static str, &'static str)]) -> BTreeSet<&'static str> {
