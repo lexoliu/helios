@@ -20,7 +20,7 @@ use helios_hal::cpu::Cpu;
 use spin::Mutex;
 use thiserror::Error;
 use wasmtime::component::{
-    Access, Accessor, Component, Destination, FutureReader, HasSelf, Linker, Resource, Source,
+    Access, Accessor, Component, Destination, FutureReader, HasSelf, Resource, Source,
     StreamConsumer, StreamProducer, StreamReader, StreamResult, VecBuffer,
 };
 use wasmtime::{self, Result};
@@ -34,29 +34,6 @@ const DEFAULT_WASI_UDP_BUFFER_BYTES: u64 = 64 * 1024;
 const DEFAULT_WASI_UDP_HOP_LIMIT: u8 = 64;
 const MAX_WASI_UDP_DATAGRAM_BYTES: usize = u16::MAX as usize;
 const MAX_SYMLINK_DEPTH: usize = 16;
-
-#[cfg(test)]
-pub(crate) const PREVIEW3_LINKED_INTERFACES: &[&str] = &[
-    "wasi:clocks/monotonic-clock",
-    "wasi:clocks/system-clock",
-    "wasi:cli/environment",
-    "wasi:cli/exit",
-    "wasi:cli/stdin",
-    "wasi:cli/stdout",
-    "wasi:cli/stderr",
-    "wasi:cli/terminal-input",
-    "wasi:cli/terminal-output",
-    "wasi:cli/terminal-stdin",
-    "wasi:cli/terminal-stdout",
-    "wasi:cli/terminal-stderr",
-    "wasi:random/random",
-    "wasi:random/insecure",
-    "wasi:random/insecure-seed",
-    "wasi:filesystem/types",
-    "wasi:filesystem/preopens",
-    "wasi:sockets/types",
-    "wasi:sockets/ip-name-lookup",
-];
 
 pub(crate) fn has_wasi_network_rights(
     authority: &crate::ProcessAuthority,
@@ -147,6 +124,7 @@ impl WasiImportSet {
 
 pub(crate) mod preview1;
 pub(crate) mod preview2;
+pub(crate) mod preview3;
 
 pub(crate) mod bindings;
 
@@ -155,132 +133,6 @@ use wasi::cli::types as cli_types;
 use wasi::filesystem::types as fs_types;
 use wasi::sockets::ip_name_lookup;
 use wasi::sockets::types as socket_types;
-
-pub(crate) fn add_to_linker<CpuImpl, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, HostFs>>,
-    imports: &WasiImportSet,
-) -> Result<()>
-where
-    CpuImpl: Cpu + Clone,
-    HostFs: crate::HostFileSystem,
-{
-    if imports.has("wasi:clocks/monotonic-clock", "0.3") {
-        wasi::clocks::monotonic_clock::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
-    }
-    if imports.has("wasi:clocks/system-clock", "0.3") {
-        wasi::clocks::system_clock::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
-    }
-    if imports.has("wasi:cli/environment", "0.3") {
-        wasi::cli::environment::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
-    }
-    if imports.has("wasi:cli/exit", "0.3") {
-        wasi::cli::exit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-            linker,
-            &Default::default(),
-            |state| state,
-        )?;
-    }
-    if imports.has("wasi:cli/stdin", "0.3") {
-        wasi::cli::stdin::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
-    }
-    if imports.has("wasi:cli/stdout", "0.3") {
-        wasi::cli::stdout::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
-    }
-    if imports.has("wasi:cli/stderr", "0.3") {
-        wasi::cli::stderr::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
-    }
-    if imports.has("wasi:cli/terminal-input", "0.3") {
-        wasi::cli::terminal_input::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
-    }
-    if imports.has("wasi:cli/terminal-output", "0.3") {
-        wasi::cli::terminal_output::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
-    }
-    if imports.has("wasi:cli/terminal-stdin", "0.3") {
-        wasi::cli::terminal_stdin::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
-    }
-    if imports.has("wasi:cli/terminal-stdout", "0.3") {
-        wasi::cli::terminal_stdout::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
-    }
-    if imports.has("wasi:cli/terminal-stderr", "0.3") {
-        wasi::cli::terminal_stderr::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
-    }
-    if imports.has("wasi:random/random", "0.3") {
-        wasi::random::random::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
-    }
-    if imports.has("wasi:random/insecure", "0.3") {
-        wasi::random::insecure::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
-    }
-    if imports.has("wasi:random/insecure-seed", "0.3") {
-        wasi::random::insecure_seed::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
-    }
-    if imports.has("wasi:filesystem/types", "0.3") {
-        wasi::filesystem::types::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
-    }
-    if imports.has("wasi:filesystem/preopens", "0.3") {
-        wasi::filesystem::preopens::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
-    }
-    if imports.has("wasi:sockets/types", "0.3") {
-        wasi::sockets::types::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
-    }
-    if imports.has("wasi:sockets/ip-name-lookup", "0.3") {
-        wasi::sockets::ip_name_lookup::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
-            linker,
-            |state| state,
-        )?;
-    }
-    Ok(())
-}
 
 #[derive(Clone, Debug)]
 struct FsNode {
@@ -5012,10 +4864,9 @@ mod tests {
 
     use super::{
         ComponentHostNetworkService, DebugFileSystem, FsDescriptor, FsNodeKind,
-        P2ResolveAddressStream, PREVIEW3_LINKED_INTERFACES, TcpSocket, WasiTcpSocketAddress,
-        WasiTcpSocketFamily, WasiUdpSocketError, fs_types, has_wasi_network_rights, ip_name_lookup,
-        map_p3_dns_error, map_p3_tcp_error, map_p3_udp_socket_error, socket_types,
-        wasi_udp_bind_rights,
+        P2ResolveAddressStream, TcpSocket, WasiTcpSocketAddress, WasiTcpSocketFamily,
+        WasiUdpSocketError, fs_types, has_wasi_network_rights, ip_name_lookup, map_p3_dns_error,
+        map_p3_tcp_error, map_p3_udp_socket_error, preview3, socket_types, wasi_udp_bind_rights,
     };
 
     const PREVIEW3_WIT_PACKAGES: &[(&str, &str)] = &[
@@ -5184,7 +5035,7 @@ mod tests {
     #[test]
     fn preview3_linked_interfaces_exist_in_checked_in_wit() {
         let wit_interfaces = wit_interface_names(PREVIEW3_WIT_PACKAGES);
-        for interface in PREVIEW3_LINKED_INTERFACES {
+        for interface in preview3::LINKED_INTERFACES {
             assert!(
                 wit_interfaces.contains(interface),
                 "Preview3 adapter maps {interface}, but checked-in WIT does not declare it"
