@@ -112,8 +112,8 @@ pub(crate) mod cli_bindings {
                 "wasi:io/poll.pollable": wasmtime_wasi_io::poll::DynPollable,
                 "wasi:io/streams.input-stream": wasmtime_wasi_io::streams::DynInputStream,
                 "wasi:io/streams.output-stream": wasmtime_wasi_io::streams::DynOutputStream,
-                "wasi:cli/terminal-input.terminal-input": crate::wasmtime_adapter::wasi::p2::TerminalInput,
-                "wasi:cli/terminal-output.terminal-output": crate::wasmtime_adapter::wasi::p2::TerminalOutput,
+                "wasi:cli/terminal-input.terminal-input": crate::wasmtime_adapter::wasi::preview2::TerminalInput,
+                "wasi:cli/terminal-output.terminal-output": crate::wasmtime_adapter::wasi::preview2::TerminalOutput,
             },
             require_store_data_send: true,
         });
@@ -188,7 +188,7 @@ pub(crate) mod filesystem_bindings {
                 "wasi:io/streams.input-stream": wasmtime_wasi_io::streams::DynInputStream,
                 "wasi:io/streams.output-stream": wasmtime_wasi_io::streams::DynOutputStream,
                 "wasi:filesystem/types.descriptor": crate::wasmtime_adapter::wasi::FsDescriptor,
-                "wasi:filesystem/types.directory-entry-stream": crate::wasmtime_adapter::wasi::p2::DirectoryEntryStream,
+                "wasi:filesystem/types.directory-entry-stream": crate::wasmtime_adapter::wasi::preview2::DirectoryEntryStream,
             },
             require_store_data_send: true,
         });
@@ -2534,7 +2534,7 @@ where
                     Ok(None) => break,
                     Err(error) => {
                         tracing::warn!(
-                            target: "helios_kernel::wasi::p2::tcp",
+                            target: "helios_kernel::wasi::preview2::tcp",
                             ?error,
                             "tcp input stream bridge stopped after backend read error"
                         );
@@ -2547,7 +2547,7 @@ where
             while let Some(bytes) = network_reader.read().await {
                 if let Err(error) = socket.write_all(&bytes).await {
                     tracing::warn!(
-                        target: "helios_kernel::wasi::p2::tcp",
+                        target: "helios_kernel::wasi::preview2::tcp",
                         ?error,
                         "tcp output stream bridge stopped after backend write error"
                     );

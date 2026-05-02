@@ -145,8 +145,8 @@ impl WasiImportSet {
     }
 }
 
-pub(crate) mod p1;
-pub(crate) mod p2;
+pub(crate) mod preview1;
+pub(crate) mod preview2;
 
 pub(crate) mod bindings;
 
@@ -5195,8 +5195,8 @@ mod tests {
     #[test]
     fn preview2_linked_interfaces_exist_in_wasmtime_wit() {
         let wit_interfaces =
-            wit_interface_names(crate::wasmtime_adapter::wasi::p2::PREVIEW2_WIT_PACKAGES);
-        for interface in crate::wasmtime_adapter::wasi::p2::PREVIEW2_LINKED_INTERFACES {
+            wit_interface_names(crate::wasmtime_adapter::wasi::preview2::PREVIEW2_WIT_PACKAGES);
+        for interface in crate::wasmtime_adapter::wasi::preview2::PREVIEW2_LINKED_INTERFACES {
             assert!(
                 wit_interfaces.contains(interface),
                 "Preview2 adapter maps {interface}, but Wasmtime WIT does not declare it"

@@ -8,7 +8,7 @@ use crate::wasmtime_adapter::{
     WasmtimePrecompiledKind,
     wasi::{
         DebugFileSystem, DebugFileSystemSnapshot, FsDescriptor, FsNodeKind, WasiImportSet,
-        bindings::filesystem::types as fs_types, p1,
+        bindings::filesystem::types as fs_types, preview1 as p1,
     },
 };
 use alloc::borrow::ToOwned;
