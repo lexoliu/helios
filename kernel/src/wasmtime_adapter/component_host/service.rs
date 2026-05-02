@@ -4113,9 +4113,11 @@ where
             "sock_join_multicast_v6",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
              fd: i32,
-             _multiaddr: i32,
-             _interface: i32|
-             -> i32 { wasix_sock_multicast(&mut caller, fd) },
+             multiaddr: i32,
+             interface: i32|
+             -> i32 {
+                wasix_sock_multicast_v6(&mut caller, fd, multiaddr as u32, interface as u32)
+            },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -4124,9 +4126,11 @@ where
             "sock_leave_multicast_v6",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
              fd: i32,
-             _multiaddr: i32,
-             _interface: i32|
-             -> i32 { wasix_sock_multicast(&mut caller, fd) },
+             multiaddr: i32,
+             interface: i32|
+             -> i32 {
+                wasix_sock_multicast_v6(&mut caller, fd, multiaddr as u32, interface as u32)
+            },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -12972,9 +12976,11 @@ where
     p1_write_u64(caller, memory, ret_size, size)
 }
 
-fn wasix_sock_multicast<CpuImpl, HostFs>(
+fn wasix_sock_multicast_v6<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
+    multiaddr: u32,
+    interface: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
@@ -12991,6 +12997,15 @@ where
     let status = wasix_udp_socket_descriptor_status(caller.data().descriptors.get(fd));
     if status != p1::errno::SUCCESS {
         return status;
+    }
+    let Some(memory) = p1_memory(caller) else {
+        return p1::errno::FAULT;
+    };
+    if let Err(errno) = wasix_validate_addr_ip6(caller, memory, multiaddr) {
+        return errno;
+    }
+    if let Err(errno) = wasix_validate_addr_ip6(caller, memory, interface) {
+        return errno;
     }
     p1::errno::NOTSUP
 }
@@ -14042,15 +14057,15 @@ fn wasix_read_addr_port<T>(
         WASIX_ADDRESS_FAMILY_IP_INET4 => {
             let port = p1_try_read_u16(caller, memory, ptr + WASIX_ADDR_PORT_UNION_OFFSET)
                 .map_err(|_| p1::errno::FAULT)?;
-            let octets =
-                p1_read_memory(caller, memory, ptr + WASIX_ADDR_PORT_IP4_ADDRESS_OFFSET, 4)
-                    .map_err(|_| p1::errno::FAULT)?;
-            Ok((
-                Some(crate::Ipv4Address::new([
-                    octets[0], octets[1], octets[2], octets[3],
-                ])),
-                port,
-            ))
+            let mut octets = [0_u8; 4];
+            p1_read_memory_into(
+                caller,
+                memory,
+                ptr + WASIX_ADDR_PORT_IP4_ADDRESS_OFFSET,
+                &mut octets,
+            )
+            .map_err(|_| p1::errno::FAULT)?;
+            Ok((Some(crate::Ipv4Address::new(octets)), port))
         }
         WASIX_ADDRESS_FAMILY_IP_INET6 => Err(p1::errno::NOTSUP),
         WASIX_ADDRESS_FAMILY_UNIX => Err(p1::errno::NOTSUP),
@@ -14066,14 +14081,44 @@ fn wasix_read_addr_ip4<T>(
     let tag = p1_try_read_u8(caller, memory, ptr).map_err(|_| p1::errno::FAULT)?;
     match tag {
         WASIX_ADDRESS_FAMILY_IP_INET4 => {
-            let octets = p1_read_memory(caller, memory, ptr + WASIX_ADDR_IP_UNION_OFFSET, 4)
-                .map_err(|_| p1::errno::FAULT)?;
-            Ok(crate::Ipv4Address::new([
-                octets[0], octets[1], octets[2], octets[3],
-            ]))
+            let mut octets = [0_u8; 4];
+            p1_read_memory_into(
+                caller,
+                memory,
+                ptr + WASIX_ADDR_IP_UNION_OFFSET,
+                &mut octets,
+            )
+            .map_err(|_| p1::errno::FAULT)?;
+            Ok(crate::Ipv4Address::new(octets))
         }
         WASIX_ADDRESS_FAMILY_IP_INET6 | WASIX_ADDRESS_FAMILY_UNIX => Err(p1::errno::NOTSUP),
         WASIX_ADDRESS_FAMILY_UNSPEC => Err(p1::errno::INVAL),
+        _ => Err(p1::errno::INVAL),
+    }
+}
+
+fn wasix_validate_addr_ip6<T>(
+    caller: &mut Caller<'_, T>,
+    memory: Preview1Memory,
+    ptr: u32,
+) -> Result<(), i32> {
+    let tag = p1_try_read_u8(caller, memory, ptr).map_err(|_| p1::errno::FAULT)?;
+    wasix_addr_ip6_family_status(tag)?;
+    let mut octets = [0_u8; 16];
+    p1_read_memory_into(
+        caller,
+        memory,
+        ptr + WASIX_ADDR_IP_UNION_OFFSET,
+        &mut octets,
+    )
+    .map_err(|_| p1::errno::FAULT)
+}
+
+fn wasix_addr_ip6_family_status(tag: u8) -> Result<(), i32> {
+    match tag {
+        WASIX_ADDRESS_FAMILY_IP_INET6 => Ok(()),
+        WASIX_ADDRESS_FAMILY_UNIX => Err(p1::errno::NOTSUP),
+        WASIX_ADDRESS_FAMILY_UNSPEC | WASIX_ADDRESS_FAMILY_IP_INET4 => Err(p1::errno::INVAL),
         _ => Err(p1::errno::INVAL),
     }
 }
@@ -14086,16 +14131,21 @@ fn wasix_read_addr_cidr_ip4<T>(
     let tag = p1_try_read_u8(caller, memory, ptr).map_err(|_| p1::errno::FAULT)?;
     match tag {
         WASIX_ADDRESS_FAMILY_IP_INET4 => {
-            let octets =
-                p1_read_memory(caller, memory, ptr + WASIX_ADDR_CIDR_IP4_ADDRESS_OFFSET, 4)
-                    .map_err(|_| p1::errno::FAULT)?;
+            let mut octets = [0_u8; 4];
+            p1_read_memory_into(
+                caller,
+                memory,
+                ptr + WASIX_ADDR_CIDR_IP4_ADDRESS_OFFSET,
+                &mut octets,
+            )
+            .map_err(|_| p1::errno::FAULT)?;
             let prefix = p1_try_read_u8(caller, memory, ptr + WASIX_ADDR_CIDR_IP4_PREFIX_OFFSET)
                 .map_err(|_| p1::errno::FAULT)?;
             if prefix > 32 {
                 return Err(p1::errno::INVAL);
             }
             Ok(crate::Ipv4Cidr::new(
-                crate::Ipv4Address::new([octets[0], octets[1], octets[2], octets[3]]),
+                crate::Ipv4Address::new(octets),
                 prefix,
             ))
         }
@@ -14824,6 +14874,45 @@ fn preview1_read_memory(
     ptr: u32,
     len: usize,
 ) -> Result<Vec<u8>, ProgramExecError> {
+    let start = preview1_memory_start(memory, ptr, len)?;
+    let mut bytes = Vec::with_capacity(len);
+    // SAFETY: the vector has enough capacity for `len` bytes, and the bounds
+    // check above proves the source range lies inside guest memory.
+    unsafe {
+        bytes.set_len(len);
+        core::ptr::copy_nonoverlapping(
+            (memory.base as *const u8).add(start),
+            bytes.as_mut_ptr(),
+            len,
+        );
+    }
+    Ok(bytes)
+}
+
+fn preview1_read_memory_into(
+    memory: Preview1Memory,
+    ptr: u32,
+    bytes: &mut [u8],
+) -> Result<(), ProgramExecError> {
+    let start = preview1_memory_start(memory, ptr, bytes.len())?;
+    // SAFETY: preview1/WASIX host calls run synchronously on the owning
+    // store task. The bounds check above proves the source range lies inside
+    // the guest memory view captured for this host call.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            (memory.base as *const u8).add(start),
+            bytes.as_mut_ptr(),
+            bytes.len(),
+        );
+    }
+    Ok(())
+}
+
+fn preview1_memory_start(
+    memory: Preview1Memory,
+    ptr: u32,
+    len: usize,
+) -> Result<usize, ProgramExecError> {
     let start = ptr as usize;
     let end = start.checked_add(len).ok_or_else(|| ProgramExecError {
         kind: ProgramExecErrorKind::InvalidBinary,
@@ -14835,19 +14924,7 @@ fn preview1_read_memory(
             detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
         });
     }
-    let mut bytes = Vec::with_capacity(len);
-    // SAFETY: preview1/WASIX host calls run synchronously on the owning
-    // store task. The bounds check above proves the source range lies inside
-    // the guest memory view captured for this host call.
-    unsafe {
-        bytes.set_len(len);
-        core::ptr::copy_nonoverlapping(
-            (memory.base as *const u8).add(start),
-            bytes.as_mut_ptr(),
-            len,
-        );
-    }
-    Ok(bytes)
+    Ok(start)
 }
 
 fn preview1_write_memory(memory: Preview1Memory, ptr: u32, bytes: &[u8]) -> i32 {
@@ -14929,6 +15006,15 @@ fn p1_read_memory<T>(
     preview1_read_memory(memory, ptr, len)
 }
 
+fn p1_read_memory_into<T>(
+    _caller: &mut Caller<'_, T>,
+    memory: Preview1Memory,
+    ptr: u32,
+    bytes: &mut [u8],
+) -> Result<(), ProgramExecError> {
+    preview1_read_memory_into(memory, ptr, bytes)
+}
+
 fn p1_write_memory<T>(
     _caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
@@ -14943,10 +15029,9 @@ fn p1_try_read_u32<T>(
     memory: Preview1Memory,
     ptr: u32,
 ) -> Result<u32, ProgramExecError> {
-    let bytes = p1_read_memory(caller, memory, ptr, 4)?;
-    Ok(u32::from_le_bytes(bytes.try_into().unwrap_or_else(|_| {
-        panic!("Preview1 u32 read must return exactly 4 bytes")
-    })))
+    let mut bytes = [0_u8; 4];
+    p1_read_memory_into(caller, memory, ptr, &mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
 }
 
 fn p1_try_read_u8<T>(
@@ -14954,7 +15039,8 @@ fn p1_try_read_u8<T>(
     memory: Preview1Memory,
     ptr: u32,
 ) -> Result<u8, ProgramExecError> {
-    let bytes = p1_read_memory(caller, memory, ptr, 1)?;
+    let mut bytes = [0_u8; 1];
+    p1_read_memory_into(caller, memory, ptr, &mut bytes)?;
     Ok(bytes[0])
 }
 
@@ -14963,10 +15049,9 @@ fn p1_try_read_u16<T>(
     memory: Preview1Memory,
     ptr: u32,
 ) -> Result<u16, ProgramExecError> {
-    let bytes = p1_read_memory(caller, memory, ptr, 2)?;
-    Ok(u16::from_le_bytes(bytes.try_into().unwrap_or_else(|_| {
-        panic!("Preview1 u16 read must return exactly 2 bytes")
-    })))
+    let mut bytes = [0_u8; 2];
+    p1_read_memory_into(caller, memory, ptr, &mut bytes)?;
+    Ok(u16::from_le_bytes(bytes))
 }
 
 fn p1_try_read_u64<T>(
@@ -14974,10 +15059,9 @@ fn p1_try_read_u64<T>(
     memory: Preview1Memory,
     ptr: u32,
 ) -> Result<u64, ProgramExecError> {
-    let bytes = p1_read_memory(caller, memory, ptr, 8)?;
-    Ok(u64::from_le_bytes(bytes.try_into().unwrap_or_else(|_| {
-        panic!("Preview1 u64 read must return exactly 8 bytes")
-    })))
+    let mut bytes = [0_u8; 8];
+    p1_read_memory_into(caller, memory, ptr, &mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 fn p1_write_u8<T>(caller: &mut Caller<'_, T>, memory: Preview1Memory, ptr: u32, value: u8) -> i32 {
@@ -16572,6 +16656,48 @@ mod tests {
             p1::errno::NOTSOCK
         );
         assert_eq!(wasix_udp_socket_descriptor_status(None), p1::errno::BADF);
+    }
+
+    #[test]
+    fn wasix_multicast_v6_accepts_only_ipv6_address_tags() {
+        assert_eq!(
+            wasix_addr_ip6_family_status(WASIX_ADDRESS_FAMILY_IP_INET6),
+            Ok(())
+        );
+        assert_eq!(
+            wasix_addr_ip6_family_status(WASIX_ADDRESS_FAMILY_IP_INET4),
+            Err(p1::errno::INVAL)
+        );
+        assert_eq!(
+            wasix_addr_ip6_family_status(WASIX_ADDRESS_FAMILY_UNSPEC),
+            Err(p1::errno::INVAL)
+        );
+        assert_eq!(
+            wasix_addr_ip6_family_status(WASIX_ADDRESS_FAMILY_UNIX),
+            Err(p1::errno::NOTSUP)
+        );
+        assert_eq!(wasix_addr_ip6_family_status(0xff), Err(p1::errno::INVAL));
+    }
+
+    #[test]
+    fn preview1_fixed_memory_reads_copy_into_caller_buffer() {
+        let guest = [1_u8, 2, 3, 4, 5, 6];
+        let memory = Preview1Memory {
+            base: guest.as_ptr() as usize,
+            len: guest.len(),
+        };
+        let mut bytes = [0_u8; 4];
+
+        preview1_read_memory_into(memory, 1, &mut bytes).expect("fixed read should fit");
+
+        assert_eq!(bytes, [2, 3, 4, 5]);
+        let error =
+            preview1_read_memory_into(memory, 4, &mut bytes).expect_err("read should overflow");
+        assert_eq!(error.kind, crate::ProgramExecErrorKind::InvalidBinary);
+        assert_eq!(
+            error.detail,
+            ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds
+        );
     }
 
     #[test]
