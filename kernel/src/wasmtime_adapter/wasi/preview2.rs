@@ -1425,11 +1425,6 @@ where
         }
         let open_flags_p3 = open_flags_to_p3(open_flags);
         let descriptor_flags_p3 = descriptor_flags_to_p3(flags);
-        if let Err(error) =
-            super::validate_descriptor_flags_within_base(base.flags, descriptor_flags_p3)
-        {
-            return Ok(Err(error_code_from_p3(error)));
-        }
         let absolute = match crate::resolve_child_path(&base.path, &path) {
             Ok(path) => path,
             Err(error) => return Ok(Err(error_code_from_path(error))),
@@ -1453,16 +1448,24 @@ where
                     }
                 }
             };
-            let (kind, identity, contents) = if let Some(meta) = metadata {
+            let (kind, identity, contents, descriptor_flags_p3) = if let Some(meta) = metadata {
                 let is_dir = meta.qid_type & 0x80 != 0;
                 let kind = if is_dir {
                     crate::wasmtime_adapter::wasi::FsNodeKind::Directory
                 } else {
                     crate::wasmtime_adapter::wasi::FsNodeKind::File
                 };
+                let descriptor_flags_p3 = match super::effective_open_descriptor_flags(
+                    base.flags,
+                    descriptor_flags_p3,
+                    kind,
+                ) {
+                    Ok(flags) => flags,
+                    Err(error) => return Ok(Err(error_code_from_p3(error))),
+                };
                 if !is_dir {
                     match service.read_file(&host_path).await {
-                        Ok(bytes) => (kind, meta.identity, Some(bytes)),
+                        Ok(bytes) => (kind, meta.identity, Some(bytes), descriptor_flags_p3),
                         Err(err) => {
                             return Ok(Err(error_code_from_p3(map_host_fs_error(err))));
                         }
@@ -1476,16 +1479,28 @@ where
                     };
                     self.filesystem_mut()
                         .seed_host_directory_entries(&absolute, entries);
-                    (kind, meta.identity, None)
+                    (kind, meta.identity, None, descriptor_flags_p3)
                 }
             } else {
                 match service.create_file(&host_path).await {
                     Ok(()) => match service.stat_path(&host_path).await {
-                        Ok(metadata) => (
-                            crate::wasmtime_adapter::wasi::FsNodeKind::File,
-                            metadata.identity,
-                            Some(Vec::new()),
-                        ),
+                        Ok(metadata) => {
+                            let kind = crate::wasmtime_adapter::wasi::FsNodeKind::File;
+                            let descriptor_flags_p3 = match super::effective_open_descriptor_flags(
+                                base.flags,
+                                descriptor_flags_p3,
+                                kind,
+                            ) {
+                                Ok(flags) => flags,
+                                Err(error) => return Ok(Err(error_code_from_p3(error))),
+                            };
+                            (
+                                kind,
+                                metadata.identity,
+                                Some(Vec::new()),
+                                descriptor_flags_p3,
+                            )
+                        }
                         Err(err) => {
                             return Ok(Err(error_code_from_p3(map_host_fs_error(err))));
                         }
