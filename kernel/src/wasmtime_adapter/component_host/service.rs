@@ -4148,14 +4148,14 @@ where
             if unwind_stack_finish < unwind_stack_begin || unwind_stack_finish > stack_pointer {
                 return Err(ProgramExecError {
                     kind: ProgramExecErrorKind::InvalidBinary,
-                    detail: ProgramExecErrorDetail::WasixStackBoundsInvalid,
+                    detail: ProgramExecErrorDetail::StackBoundsInvalid,
                 });
             }
             let unwind_len =
                 usize::try_from(unwind_stack_finish - unwind_stack_begin).map_err(|_| {
                     ProgramExecError {
                         kind: ProgramExecErrorKind::InvalidBinary,
-                        detail: ProgramExecErrorDetail::WasixStackBoundsInvalid,
+                        detail: ProgramExecErrorDetail::StackBoundsInvalid,
                     }
                 })?;
             let rewind_stack = preview1_read_memory(memory, unwind_stack_begin, unwind_len)?;
@@ -4169,7 +4169,7 @@ where
                 let offset =
                     usize::try_from(snapshot - stack_pointer).map_err(|_| ProgramExecError {
                         kind: ProgramExecErrorKind::InvalidBinary,
-                        detail: ProgramExecErrorDetail::WasixStackBoundsInvalid,
+                        detail: ProgramExecErrorDetail::StackBoundsInvalid,
                     })?;
                 let end = offset + snapshot_bytes.len();
                 if end <= memory_stack.len() {
@@ -4226,7 +4226,7 @@ where
                 .cloned()
                 .ok_or(ProgramExecError {
                     kind: ProgramExecErrorKind::InvalidBinary,
-                    detail: ProgramExecErrorDetail::WasixStackSnapshotMissing,
+                    detail: ProgramExecErrorDetail::StackSnapshotMissing,
                 })?;
             let stack_upper = wasix_global_u32_from_instance(store, instance, "__heap_base")?;
             wasix_begin_rewind(
@@ -4258,14 +4258,14 @@ where
             if unwind_stack_finish < unwind_stack_begin || unwind_stack_finish > stack_pointer {
                 return Err(ProgramExecError {
                     kind: ProgramExecErrorKind::InvalidBinary,
-                    detail: ProgramExecErrorDetail::WasixStackBoundsInvalid,
+                    detail: ProgramExecErrorDetail::StackBoundsInvalid,
                 });
             }
             let unwind_len =
                 usize::try_from(unwind_stack_finish - unwind_stack_begin).map_err(|_| {
                     ProgramExecError {
                         kind: ProgramExecErrorKind::InvalidBinary,
-                        detail: ProgramExecErrorDetail::WasixStackBoundsInvalid,
+                        detail: ProgramExecErrorDetail::StackBoundsInvalid,
                     }
                 })?;
             let rewind_stack = preview1_read_memory(memory, unwind_stack_begin, unwind_len)?;
@@ -4283,7 +4283,7 @@ where
                 let offset =
                     usize::try_from(ret_pid - stack_pointer).map_err(|_| ProgramExecError {
                         kind: ProgramExecErrorKind::InvalidBinary,
-                        detail: ProgramExecErrorDetail::WasixStackBoundsInvalid,
+                        detail: ProgramExecErrorDetail::StackBoundsInvalid,
                     })?;
                 let end = offset + snapshot_bytes.len();
                 if end <= memory_stack.len() {
@@ -4334,7 +4334,7 @@ where
     if stack_lower >= stack_pointer || stack_pointer > stack_upper {
         return Err(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
-            detail: ProgramExecErrorDetail::WasixStackBoundsInvalid,
+            detail: ProgramExecErrorDetail::StackBoundsInvalid,
         });
     }
     let memory = p1_memory_from_instance(store, instance).ok_or(ProgramExecError {
@@ -4354,22 +4354,22 @@ where
             .checked_add(WASIX_ASYNCIFY_DATA_SIZE)
             .ok_or(ProgramExecError {
                 kind: ProgramExecErrorKind::InvalidBinary,
-                detail: ProgramExecErrorDetail::WasixStackBoundsInvalid,
+                detail: ProgramExecErrorDetail::StackBoundsInvalid,
             })?;
     let rewind_len = u32::try_from(rewind_stack.len()).map_err(|_| ProgramExecError {
         kind: ProgramExecErrorKind::InvalidBinary,
-        detail: ProgramExecErrorDetail::WasixStackBoundsInvalid,
+        detail: ProgramExecErrorDetail::StackBoundsInvalid,
     })?;
     let rewind_stack_end = rewind_stack_begin
         .checked_add(rewind_len)
         .ok_or(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
-            detail: ProgramExecErrorDetail::WasixStackBoundsInvalid,
+            detail: ProgramExecErrorDetail::StackBoundsInvalid,
         })?;
     if rewind_stack_end > stack_upper {
         return Err(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
-            detail: ProgramExecErrorDetail::WasixStackBoundsInvalid,
+            detail: ProgramExecErrorDetail::StackBoundsInvalid,
         });
     }
     let memory = p1_memory_from_instance(store, instance).ok_or(ProgramExecError {
@@ -4454,7 +4454,7 @@ where
         .clone()
         .ok_or(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
-            detail: ProgramExecErrorDetail::WasixExecReplacementUnavailable,
+            detail: ProgramExecErrorDetail::ImageReplacementUnavailable,
         })?;
     let restore = CoreModuleRestore {
         memory: fork_memory,
@@ -4552,7 +4552,7 @@ where
         .get_typed_func::<(), ()>(&mut *store, name)
         .map_err(|_| ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
-            detail: ProgramExecErrorDetail::WasixAsyncifyExportInvalid,
+            detail: ProgramExecErrorDetail::UnwindExportInvalid,
         })?;
     function
         .call_async(&mut *store, ())
@@ -4574,7 +4574,7 @@ where
         .get_typed_func::<i32, ()>(&mut *store, name)
         .map_err(|_| ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
-            detail: ProgramExecErrorDetail::WasixAsyncifyExportInvalid,
+            detail: ProgramExecErrorDetail::UnwindExportInvalid,
         })?;
     function
         .call_async(&mut *store, value as i32)
@@ -4595,7 +4595,7 @@ where
         .get_global(&mut *store, name)
         .ok_or(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
-            detail: ProgramExecErrorDetail::WasixAsyncifyExportInvalid,
+            detail: ProgramExecErrorDetail::UnwindExportInvalid,
         })?;
     match global.get(&mut *store) {
         Val::I32(value) => Ok(value as u32),
@@ -4620,7 +4620,7 @@ where
         .get_global(&mut *store, name)
         .ok_or(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
-            detail: ProgramExecErrorDetail::WasixAsyncifyExportInvalid,
+            detail: ProgramExecErrorDetail::UnwindExportInvalid,
         })?;
     global
         .set(&mut *store, Val::I32(value as i32))
@@ -9405,7 +9405,7 @@ where
         .and_then(|export| export.into_global())
         .ok_or(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
-            detail: ProgramExecErrorDetail::WasixAsyncifyExportInvalid,
+            detail: ProgramExecErrorDetail::UnwindExportInvalid,
         })?;
     match global.get(&mut *caller) {
         Val::I32(value) => Ok(value as u32),
@@ -9542,13 +9542,13 @@ where
     else {
         return Err(wasmtime::Error::new(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
-            detail: ProgramExecErrorDetail::WasixStackBoundsInvalid,
+            detail: ProgramExecErrorDetail::StackBoundsInvalid,
         }));
     };
     if stack_lower >= stack_pointer || stack_pointer > stack_upper {
         return Err(wasmtime::Error::new(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
-            detail: ProgramExecErrorDetail::WasixStackBoundsInvalid,
+            detail: ProgramExecErrorDetail::StackBoundsInvalid,
         }));
     }
     let unwind_stack_begin = stack_lower
@@ -9556,7 +9556,7 @@ where
         .ok_or_else(|| {
             wasmtime::Error::new(ProgramExecError {
                 kind: ProgramExecErrorKind::InvalidBinary,
-                detail: ProgramExecErrorDetail::WasixStackBoundsInvalid,
+                detail: ProgramExecErrorDetail::StackBoundsInvalid,
             })
         })?;
     let status = p1_write_u32(caller, memory, stack_lower, unwind_stack_begin).max(p1_write_u32(
@@ -9579,7 +9579,7 @@ where
     if wasix_call_asyncify_start_unwind(caller, stack_lower).await != p1::errno::SUCCESS {
         return Err(wasmtime::Error::new(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
-            detail: ProgramExecErrorDetail::WasixAsyncifyExportInvalid,
+            detail: ProgramExecErrorDetail::UnwindExportInvalid,
         }));
     }
     Ok(())

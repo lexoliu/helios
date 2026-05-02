@@ -70,16 +70,16 @@ pub enum ProgramExecErrorDetail {
     ArtifactProfileInvalid,
     #[error("runtime operation failed")]
     RuntimeFailure,
-    #[error("WASIX exec image replacement is not available for this runtime")]
-    WasixExecReplacementUnavailable,
-    #[error("WASIX stack restoration is not available for this runtime")]
-    WasixStackRestoreUnavailable,
-    #[error("WASIX asyncify export is missing or has an invalid type")]
-    WasixAsyncifyExportInvalid,
-    #[error("WASIX stack snapshot does not exist")]
-    WasixStackSnapshotMissing,
-    #[error("WASIX stack bounds are invalid")]
-    WasixStackBoundsInvalid,
+    #[error("program image replacement is not available for this runtime")]
+    ImageReplacementUnavailable,
+    #[error("program stack restoration is not available for this runtime")]
+    StackRestoreUnavailable,
+    #[error("program unwind export is missing or has an invalid type")]
+    UnwindExportInvalid,
+    #[error("program stack snapshot does not exist")]
+    StackSnapshotMissing,
+    #[error("program stack bounds are invalid")]
+    StackBoundsInvalid,
     #[error("host operation failed")]
     HostOperationFailed,
     #[error("compiler plugin is unavailable")]
