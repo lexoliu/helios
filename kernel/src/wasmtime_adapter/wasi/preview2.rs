@@ -2687,17 +2687,19 @@ where
 
     fn hop_limit(
         &mut self,
-        _: Resource<TcpSocket>,
+        socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<u8, p2tcp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.hop_limit().map_err(map_p2_tcp_socket_error))
     }
 
     fn set_hop_limit(
         &mut self,
-        _: Resource<TcpSocket>,
-        _: u8,
+        socket: Resource<TcpSocket>,
+        value: u8,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.set_hop_limit(value).map_err(map_p2_tcp_socket_error))
     }
 
     fn receive_buffer_size(
