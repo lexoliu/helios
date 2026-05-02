@@ -57,6 +57,10 @@ const WASIX_PROC_SPAWN_FD_OP_FD_OFFSET: u32 = 4;
 const WASIX_PROC_SPAWN_FD_OP_SRC_FD_OFFSET: u32 = 8;
 const WASIX_PROC_SPAWN_FD_OP_PATH_OFFSET: u32 = 12;
 const WASIX_PROC_SPAWN_FD_OP_PATH_LEN_OFFSET: u32 = 16;
+const WASIX_PROC_SPAWN_FD_OP_DIRFLAGS_OFFSET: u32 = 20;
+const WASIX_PROC_SPAWN_FD_OP_OFLAGS_OFFSET: u32 = 24;
+const WASIX_PROC_SPAWN_FD_OP_RIGHTS_BASE_OFFSET: u32 = 32;
+const WASIX_PROC_SPAWN_FD_OP_FDFLAGS_OFFSET: u32 = 48;
 const WASIX_PROC_SPAWN_FD_OP_FDFLAGSEXT_OFFSET: u32 = 50;
 const WASIX_PROC_SPAWN_FD_OP_CLOSE: u8 = 0;
 const WASIX_PROC_SPAWN_FD_OP_DUP2: u8 = 1;
@@ -2715,7 +2719,16 @@ impl Preview1DescriptorTable {
 
     fn dup_to(&mut self, fd: i32, to_fd: i32, close_on_exec: bool) -> Result<u32, i32> {
         let descriptor = self.get(fd).cloned().ok_or(p1::errno::BADF)?;
-        let to = usize::try_from(to_fd).map_err(|_| p1::errno::BADF)?;
+        self.insert_at(to_fd, descriptor, close_on_exec)
+    }
+
+    fn insert_at(
+        &mut self,
+        fd: i32,
+        descriptor: Preview1Descriptor,
+        close_on_exec: bool,
+    ) -> Result<u32, i32> {
+        let to = usize::try_from(fd).map_err(|_| p1::errno::BADF)?;
         if self.entries.len() <= to {
             self.entries.resize_with(to + 1, || None);
         }
@@ -7634,154 +7647,18 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    if base.kind != FsNodeKind::Directory {
-        return p1::errno::NOTDIR;
-    }
-    if let Err(error) = crate::wasmtime_adapter::wasi::validate_descriptor_flags_within_base(
-        base.flags,
-        descriptor_flags,
-    ) {
-        return p1_errno_from_fs(error);
-    }
-    let absolute = match crate::resolve_child_path(&base.path, &path) {
-        Ok(absolute) => absolute,
-        Err(error) => return p1_errno_from_component_path(error),
-    };
-    if let Some(host_path) = crate::guest_host_share_path(&absolute).map(ToOwned::to_owned) {
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        let metadata = service.stat_path(&host_path).await;
-        let (kind, identity, contents) = match metadata {
-            Ok(metadata) => {
-                let kind = if metadata.qid_type & 0x80 != 0 {
-                    FsNodeKind::Directory
-                } else {
-                    FsNodeKind::File
-                };
-                if open_flags.contains(fs_types::OpenFlags::EXCLUSIVE)
-                    && open_flags.contains(fs_types::OpenFlags::CREATE)
-                {
-                    return p1::errno::EXIST;
-                }
-                if open_flags.contains(fs_types::OpenFlags::DIRECTORY)
-                    && kind != FsNodeKind::Directory
-                {
-                    return p1::errno::NOTDIR;
-                }
-                if !open_flags.contains(fs_types::OpenFlags::DIRECTORY)
-                    && kind == FsNodeKind::Directory
-                {
-                    return p1::errno::ISDIR;
-                }
-                if open_flags.contains(fs_types::OpenFlags::TRUNCATE) {
-                    if kind != FsNodeKind::File {
-                        return p1::errno::ISDIR;
-                    }
-                    if !base
-                        .flags
-                        .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-                    {
-                        return p1::errno::ROFS;
-                    }
-                    if let Err(error) = service.truncate_file(&host_path).await {
-                        return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(
-                            error,
-                        ));
-                    }
-                }
-                if kind == FsNodeKind::File {
-                    let contents = match service.read_file(&host_path).await {
-                        Ok(contents) => contents,
-                        Err(error) => {
-                            return p1_errno_from_fs(
-                                crate::wasmtime_adapter::wasi::map_host_fs_error(error),
-                            );
-                        }
-                    };
-                    (kind, metadata.identity, Some(contents))
-                } else {
-                    let entries = match service.read_dir(&host_path).await {
-                        Ok(entries) => entries,
-                        Err(error) => {
-                            return p1_errno_from_fs(
-                                crate::wasmtime_adapter::wasi::map_host_fs_error(error),
-                            );
-                        }
-                    };
-                    caller
-                        .data_mut()
-                        .filesystem
-                        .seed_host_directory_entries(&absolute, entries);
-                    (kind, metadata.identity, None)
-                }
-            }
-            Err(error) => {
-                let error = crate::wasmtime_adapter::wasi::map_host_fs_error(error);
-                if !matches!(error, fs_types::ErrorCode::NoEntry)
-                    || !open_flags.contains(fs_types::OpenFlags::CREATE)
-                {
-                    return p1_errno_from_fs(error);
-                }
-                if !base
-                    .flags
-                    .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
-                {
-                    return p1::errno::ROFS;
-                }
-                if let Err(error) = service.create_file(&host_path).await {
-                    return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(
-                        error,
-                    ));
-                }
-                let metadata = match service.stat_path(&host_path).await {
-                    Ok(metadata) => metadata,
-                    Err(error) => {
-                        return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(
-                            error,
-                        ));
-                    }
-                };
-                (FsNodeKind::File, metadata.identity, Some(Vec::new()))
-            }
-        };
-        if let Some(contents) = contents {
-            caller
-                .data_mut()
-                .filesystem
-                .seed_host_file_content(&absolute, identity, contents);
-        }
-        let descriptor = FsDescriptor {
-            path: absolute,
-            kind,
-            flags: descriptor_flags,
-            identity: Some(identity),
-        };
-        let fd = match caller
-            .data_mut()
-            .descriptors
-            .insert(Preview1Descriptor::File {
-                descriptor,
-                offset: 0,
-                fdflags,
-            }) {
-            Ok(fd) => fd,
-            Err(errno) => return errno,
-        };
-        return p1_write_u32(caller, memory, opened_fd, fd);
-    }
-    let now_nanos = caller.data().now_nanos();
-    let opened = match caller.data_mut().filesystem.open_at(
+    let opened = match p1_open_descriptor_resolved(
+        caller,
         &base,
         path_flags,
         &path,
         open_flags,
         descriptor_flags,
-        now_nanos,
-    ) {
+    )
+    .await
+    {
         Ok(descriptor) => descriptor,
-        Err(error) => return p1_errno_from_fs(error),
+        Err(errno) => return errno,
     };
     let fd = match caller
         .data_mut()
@@ -7795,6 +7672,169 @@ where
         Err(errno) => return errno,
     };
     p1_write_u32(caller, memory, opened_fd, fd)
+}
+
+async fn p1_open_descriptor_resolved<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    base: &FsDescriptor,
+    path_flags: fs_types::PathFlags,
+    path: &str,
+    open_flags: fs_types::OpenFlags,
+    descriptor_flags: fs_types::DescriptorFlags,
+) -> Result<FsDescriptor, i32>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    if base.kind != FsNodeKind::Directory {
+        return Err(p1::errno::NOTDIR);
+    }
+    if let Err(error) = crate::wasmtime_adapter::wasi::validate_descriptor_flags_within_base(
+        base.flags,
+        descriptor_flags,
+    ) {
+        return Err(p1_errno_from_fs(error));
+    }
+    let absolute =
+        crate::resolve_child_path(&base.path, path).map_err(p1_errno_from_component_path)?;
+    if let Some(host_path) = crate::guest_host_share_path(&absolute).map(ToOwned::to_owned) {
+        return p1_open_host_descriptor_resolved(
+            caller,
+            base,
+            absolute,
+            host_path,
+            open_flags,
+            descriptor_flags,
+        )
+        .await;
+    }
+    let now_nanos = caller.data().now_nanos();
+    caller
+        .data_mut()
+        .filesystem
+        .open_at(
+            base,
+            path_flags,
+            path,
+            open_flags,
+            descriptor_flags,
+            now_nanos,
+        )
+        .map_err(p1_errno_from_fs)
+}
+
+async fn p1_open_host_descriptor_resolved<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    base: &FsDescriptor,
+    absolute: String,
+    host_path: String,
+    open_flags: fs_types::OpenFlags,
+    descriptor_flags: fs_types::DescriptorFlags,
+) -> Result<FsDescriptor, i32>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let service = caller
+        .data()
+        .filesystem
+        .host_service()
+        .map_err(p1_errno_from_fs)?;
+    let metadata = service.stat_path(&host_path).await;
+    let (kind, identity, contents) = match metadata {
+        Ok(metadata) => {
+            let kind = if metadata.qid_type & 0x80 != 0 {
+                FsNodeKind::Directory
+            } else {
+                FsNodeKind::File
+            };
+            if open_flags.contains(fs_types::OpenFlags::EXCLUSIVE)
+                && open_flags.contains(fs_types::OpenFlags::CREATE)
+            {
+                return Err(p1::errno::EXIST);
+            }
+            if open_flags.contains(fs_types::OpenFlags::DIRECTORY) && kind != FsNodeKind::Directory
+            {
+                return Err(p1::errno::NOTDIR);
+            }
+            if !open_flags.contains(fs_types::OpenFlags::DIRECTORY) && kind == FsNodeKind::Directory
+            {
+                return Err(p1::errno::ISDIR);
+            }
+            if open_flags.contains(fs_types::OpenFlags::TRUNCATE) {
+                if kind != FsNodeKind::File {
+                    return Err(p1::errno::ISDIR);
+                }
+                if !base
+                    .flags
+                    .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
+                {
+                    return Err(p1::errno::ROFS);
+                }
+                service
+                    .truncate_file(&host_path)
+                    .await
+                    .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
+                    .map_err(p1_errno_from_fs)?;
+            }
+            if kind == FsNodeKind::File {
+                let contents = service
+                    .read_file(&host_path)
+                    .await
+                    .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
+                    .map_err(p1_errno_from_fs)?;
+                (kind, metadata.identity, Some(contents))
+            } else {
+                let entries = service
+                    .read_dir(&host_path)
+                    .await
+                    .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
+                    .map_err(p1_errno_from_fs)?;
+                caller
+                    .data_mut()
+                    .filesystem
+                    .seed_host_directory_entries(&absolute, entries);
+                (kind, metadata.identity, None)
+            }
+        }
+        Err(error) => {
+            let error = crate::wasmtime_adapter::wasi::map_host_fs_error(error);
+            if !matches!(error, fs_types::ErrorCode::NoEntry)
+                || !open_flags.contains(fs_types::OpenFlags::CREATE)
+            {
+                return Err(p1_errno_from_fs(error));
+            }
+            if !base
+                .flags
+                .contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY)
+            {
+                return Err(p1::errno::ROFS);
+            }
+            service
+                .create_file(&host_path)
+                .await
+                .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
+                .map_err(p1_errno_from_fs)?;
+            let metadata = service
+                .stat_path(&host_path)
+                .await
+                .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
+                .map_err(p1_errno_from_fs)?;
+            (FsNodeKind::File, metadata.identity, Some(Vec::new()))
+        }
+    };
+    if let Some(contents) = contents {
+        caller
+            .data_mut()
+            .filesystem
+            .seed_host_file_content(&absolute, identity, contents);
+    }
+    Ok(FsDescriptor {
+        path: absolute,
+        kind,
+        flags: descriptor_flags,
+        identity: Some(identity),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9473,7 +9513,7 @@ where
     let snapshot = if fd_ops == 0 && fd_ops_len == 0 {
         None
     } else {
-        match wasix_spawn_descriptor_snapshot(caller, memory, fd_ops, fd_ops_len) {
+        match wasix_spawn_descriptor_snapshot(caller, memory, fd_ops, fd_ops_len).await {
             Ok(snapshot) => Some(snapshot),
             Err(errno) => return errno,
         }
@@ -9749,7 +9789,7 @@ where
         .ok()
 }
 
-fn wasix_spawn_descriptor_snapshot<CpuImpl, HostFs>(
+async fn wasix_spawn_descriptor_snapshot<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     memory: Preview1Memory,
     fd_ops: u32,
@@ -9772,12 +9812,12 @@ where
             .checked_mul(WASIX_PROC_SPAWN_FD_OP_SIZE)
             .and_then(|offset| fd_ops.checked_add(offset))
             .ok_or(p1::errno::OVERFLOW)?;
-        wasix_apply_spawn_fd_op(caller, memory, &mut snapshot, offset)?;
+        wasix_apply_spawn_fd_op(caller, memory, &mut snapshot, offset).await?;
     }
     Ok(snapshot)
 }
 
-fn wasix_apply_spawn_fd_op<CpuImpl, HostFs>(
+async fn wasix_apply_spawn_fd_op<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     memory: Preview1Memory,
     snapshot: &mut WasixSpawnFdSnapshot,
@@ -9829,9 +9869,122 @@ where
             wasix_apply_spawn_chdir(caller.data(), snapshot, fd, &path)
         }
         WASIX_PROC_SPAWN_FD_OP_FCHDIR => wasix_apply_spawn_fchdir(snapshot, fd),
-        WASIX_PROC_SPAWN_FD_OP_OPEN => Err(p1::errno::NOTSUP),
+        WASIX_PROC_SPAWN_FD_OP_OPEN => {
+            let source_fd =
+                p1_try_read_u32(caller, memory, op + WASIX_PROC_SPAWN_FD_OP_SRC_FD_OFFSET)
+                    .map_err(|_| p1::errno::FAULT)?;
+            let source_fd = i32::try_from(source_fd).map_err(|_| p1::errno::OVERFLOW)?;
+            let path_ptr = p1_try_read_u32(caller, memory, op + WASIX_PROC_SPAWN_FD_OP_PATH_OFFSET)
+                .map_err(|_| p1::errno::FAULT)?;
+            let path_len =
+                p1_try_read_u32(caller, memory, op + WASIX_PROC_SPAWN_FD_OP_PATH_LEN_OFFSET)
+                    .map_err(|_| p1::errno::FAULT)?;
+            let dirflags =
+                p1_try_read_u32(caller, memory, op + WASIX_PROC_SPAWN_FD_OP_DIRFLAGS_OFFSET)
+                    .map_err(|_| p1::errno::FAULT)?;
+            let oflags = p1_try_read_u16(caller, memory, op + WASIX_PROC_SPAWN_FD_OP_OFLAGS_OFFSET)
+                .map_err(|_| p1::errno::FAULT)?;
+            let rights = p1_try_read_u64(
+                caller,
+                memory,
+                op + WASIX_PROC_SPAWN_FD_OP_RIGHTS_BASE_OFFSET,
+            )
+            .map_err(|_| p1::errno::FAULT)?;
+            let fdflags =
+                p1_try_read_u16(caller, memory, op + WASIX_PROC_SPAWN_FD_OP_FDFLAGS_OFFSET)
+                    .map_err(|_| p1::errno::FAULT)?;
+            let fdflagsext = p1_try_read_u16(
+                caller,
+                memory,
+                op + WASIX_PROC_SPAWN_FD_OP_FDFLAGSEXT_OFFSET,
+            )
+            .map_err(|_| p1::errno::FAULT)?;
+            let close_on_exec = wasix_close_on_exec_flag(fdflagsext)?;
+            let path =
+                p1_read_path(caller, memory, path_ptr, path_len).map_err(|_| p1::errno::FAULT)?;
+            wasix_apply_spawn_open(
+                caller,
+                snapshot,
+                fd,
+                source_fd,
+                &path,
+                dirflags,
+                oflags,
+                rights,
+                fdflags,
+                close_on_exec,
+            )
+            .await
+        }
         _ => Err(p1::errno::INVAL),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wasix_apply_spawn_open<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    snapshot: &mut WasixSpawnFdSnapshot,
+    fd: i32,
+    source_fd: i32,
+    path: &str,
+    dirflags: u32,
+    oflags: u16,
+    rights: u64,
+    fdflags: u16,
+    close_on_exec: bool,
+) -> Result<(), i32>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let (base, relative_path) = wasix_spawn_resolve_open_base(snapshot, source_fd, path)?;
+    let descriptor = p1_open_descriptor_resolved(
+        caller,
+        &base,
+        p1_path_flags(dirflags),
+        &relative_path,
+        p1_open_flags(oflags),
+        p1_descriptor_flags(rights, fdflags),
+    )
+    .await?;
+    snapshot
+        .descriptors
+        .insert_at(
+            fd,
+            Preview1Descriptor::File {
+                descriptor,
+                offset: 0,
+                fdflags,
+            },
+            close_on_exec,
+        )
+        .map(drop)
+}
+
+fn wasix_spawn_resolve_open_base(
+    snapshot: &WasixSpawnFdSnapshot,
+    source_fd: i32,
+    path: &str,
+) -> Result<(FsDescriptor, String), i32> {
+    if path.starts_with('/') {
+        let guest_name =
+            crate::resolve_absolute_path(path).map_err(p1_errno_from_component_path)?;
+        return wasix_spawn_resolve_absolute_guest_base(snapshot, &guest_name);
+    }
+    if let Some(cwd) = snapshot.cwd.as_ref() {
+        return Ok((cwd.descriptor.clone(), path.to_owned()));
+    }
+    let base = match snapshot.descriptors.get(source_fd) {
+        Some(Preview1Descriptor::Preopen { descriptor, .. })
+        | Some(Preview1Descriptor::File { descriptor, .. })
+            if descriptor.kind == FsNodeKind::Directory =>
+        {
+            descriptor.clone()
+        }
+        Some(_) => return Err(p1::errno::NOTDIR),
+        None => return Err(p1::errno::BADF),
+    };
+    Ok((base, path.to_owned()))
 }
 
 fn wasix_apply_spawn_chdir<CpuImpl, HostFs>(
@@ -14662,6 +14815,70 @@ mod tests {
                 .guest_name(),
             "/workspace"
         );
+    }
+
+    #[test]
+    fn spawn_fd_open_base_uses_child_cwd_for_relative_paths() {
+        let snapshot = WasixSpawnFdSnapshot {
+            descriptors: Preview1DescriptorTable {
+                entries: vec![Some(Preview1DescriptorEntry::new(
+                    Preview1Descriptor::Preopen {
+                        guest_name: "/root".into(),
+                        descriptor: FsDescriptor {
+                            path: "/source/root".into(),
+                            kind: FsNodeKind::Directory,
+                            flags: fs_types::DescriptorFlags::READ,
+                            identity: None,
+                        },
+                    },
+                    false,
+                ))],
+            },
+            authority: ProcessAuthority::root(),
+            cwd: Some(Preview1Cwd {
+                guest_name: "/workspace".into(),
+                descriptor: FsDescriptor {
+                    path: "/source/workspace".into(),
+                    kind: FsNodeKind::Directory,
+                    flags: fs_types::DescriptorFlags::READ,
+                    identity: None,
+                },
+            }),
+        };
+
+        let (base, path) =
+            wasix_spawn_resolve_open_base(&snapshot, 0, "out.log").expect("cwd should resolve");
+
+        assert_eq!(base.path, "/source/workspace");
+        assert_eq!(path, "out.log");
+    }
+
+    #[test]
+    fn spawn_fd_open_base_resolves_absolute_guest_path_through_preopen() {
+        let snapshot = WasixSpawnFdSnapshot {
+            descriptors: Preview1DescriptorTable {
+                entries: vec![Some(Preview1DescriptorEntry::new(
+                    Preview1Descriptor::Preopen {
+                        guest_name: "/workspace".into(),
+                        descriptor: FsDescriptor {
+                            path: "/source/workspace".into(),
+                            kind: FsNodeKind::Directory,
+                            flags: fs_types::DescriptorFlags::READ,
+                            identity: None,
+                        },
+                    },
+                    false,
+                ))],
+            },
+            authority: ProcessAuthority::root(),
+            cwd: None,
+        };
+
+        let (base, path) = wasix_spawn_resolve_open_base(&snapshot, 0, "/workspace/logs/out")
+            .expect("absolute preopen path should resolve");
+
+        assert_eq!(base.path, "/source/workspace");
+        assert_eq!(path, "logs/out");
     }
 
     #[test]
