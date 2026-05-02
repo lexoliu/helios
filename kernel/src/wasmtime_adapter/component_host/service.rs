@@ -16390,6 +16390,22 @@ mod tests {
         );
         assert_eq!(
             wasix_validate_network_socket_request(
+                WASIX_ADDRESS_FAMILY_IP_INET6_I32,
+                WASIX_SOCK_TYPE_STREAM,
+                WASIX_IPPROTO_TCP_I32,
+            ),
+            Err(p1::errno::NOTSUP)
+        );
+        assert_eq!(
+            wasix_validate_network_socket_request(
+                WASIX_ADDRESS_FAMILY_IP_INET6_I32,
+                WASIX_SOCK_TYPE_DGRAM,
+                WASIX_IPPROTO_UDP_I32,
+            ),
+            Err(p1::errno::NOTSUP)
+        );
+        assert_eq!(
+            wasix_validate_network_socket_request(
                 WASIX_ADDRESS_FAMILY_IP_INET4_I32,
                 WASIX_SOCK_TYPE_STREAM,
                 WASIX_IPPROTO_UDP_I32,
@@ -16407,6 +16423,14 @@ mod tests {
         assert_eq!(
             wasix_validate_socket_pair_request(
                 WASIX_ADDRESS_FAMILY_IP_INET4_I32,
+                WASIX_SOCK_TYPE_STREAM,
+                0,
+            ),
+            Err(p1::errno::NOTSUP)
+        );
+        assert_eq!(
+            wasix_validate_socket_pair_request(
+                WASIX_ADDRESS_FAMILY_IP_INET6_I32,
                 WASIX_SOCK_TYPE_STREAM,
                 0,
             ),
