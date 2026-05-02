@@ -214,6 +214,26 @@ mod tests {
     }
 
     #[test]
+    fn spawn_with_empty_child_authority_has_zero_ambient_rights() {
+        let mut table = ProcessTable::new();
+        let parent_authority = ProcessAuthority::root();
+        let spawn = parent_authority
+            .derive_spawn_authority()
+            .expect("root should derive spawn authority");
+        let parent = table
+            .register_root(parent_authority)
+            .expect("root registration should succeed");
+
+        let child = table
+            .spawn(&spawn, parent, ProcessAuthority::empty())
+            .expect("empty child authority should be a valid subset");
+        assert_eq!(
+            table.record(child).unwrap().authority(),
+            &ProcessAuthority::empty()
+        );
+    }
+
+    #[test]
     fn fork_inherits_and_exec_preserves_authority() {
         let mut table = ProcessTable::new();
         let authority = authority_with(ProcessAuthorityRights::FORK | ProcessAuthorityRights::EXEC);
