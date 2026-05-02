@@ -8207,7 +8207,7 @@ where
         Ok(cwd) => cwd,
         Err(errno) => return errno,
     };
-    let needed = match u32::try_from(cwd.len().saturating_add(1)) {
+    let needed = match u32::try_from(cwd.len()) {
         Ok(needed) => needed,
         Err(_) => return p1::errno::OVERFLOW,
     };
@@ -8222,7 +8222,10 @@ where
     if status != p1::errno::SUCCESS {
         return status;
     }
-    preview1_write_memory(memory, path.saturating_add(needed - 1), &[0])
+    if capacity > needed {
+        return preview1_write_memory(memory, path.saturating_add(needed), &[0]);
+    }
+    p1::errno::SUCCESS
 }
 
 fn wasix_chdir<CpuImpl, HostFs>(
