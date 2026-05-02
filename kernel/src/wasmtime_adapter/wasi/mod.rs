@@ -4247,10 +4247,21 @@ where
 {
     async fn bind(
         &mut self,
-        _: Resource<TcpSocket>,
-        _: socket_types::IpSocketAddress,
+        socket: Resource<TcpSocket>,
+        local_address: socket_types::IpSocketAddress,
     ) -> Result<core::result::Result<(), socket_types::ErrorCode>> {
-        Ok(Err(socket_types::ErrorCode::NotSupported))
+        let socket = self.table.get(&socket)?.clone();
+        let local_address = match parse_p3_tcp_socket_address(local_address, socket.family()) {
+            Ok(address) => address,
+            Err(error) => return Ok(Err(error)),
+        };
+        if !has_wasi_network_rights(
+            self.process_authority(),
+            wasi_tcp_bind_rights(local_address.port),
+        ) {
+            return Ok(Err(socket_types::ErrorCode::AccessDenied));
+        }
+        Ok(socket.bind_local(local_address))
     }
 
     fn create(
