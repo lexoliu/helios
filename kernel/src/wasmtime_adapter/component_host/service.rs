@@ -51,6 +51,16 @@ const WASIX_IPPROTO_UDP: u64 = 17;
 const WASIX_IPPROTO_TCP_I32: i32 = 6;
 const WASIX_IPPROTO_UDP_I32: i32 = 17;
 const DEFAULT_WASIX_EXEC_SEARCH_PATHS: &[&str] = &["/usr/local/bin", "/bin", "/usr/bin"];
+const WASIX_PROC_SPAWN_FD_OP_SIZE: u32 = 56;
+const WASIX_PROC_SPAWN_FD_OP_CMD_OFFSET: u32 = 0;
+const WASIX_PROC_SPAWN_FD_OP_FD_OFFSET: u32 = 4;
+const WASIX_PROC_SPAWN_FD_OP_SRC_FD_OFFSET: u32 = 8;
+const WASIX_PROC_SPAWN_FD_OP_FDFLAGSEXT_OFFSET: u32 = 50;
+const WASIX_PROC_SPAWN_FD_OP_CLOSE: u8 = 0;
+const WASIX_PROC_SPAWN_FD_OP_DUP2: u8 = 1;
+const WASIX_PROC_SPAWN_FD_OP_OPEN: u8 = 2;
+const WASIX_PROC_SPAWN_FD_OP_CHDIR: u8 = 3;
+const WASIX_PROC_SPAWN_FD_OP_FCHDIR: u8 = 4;
 
 fn system_component_profile_stack(component_name: &str) -> String {
     let mut stack = String::with_capacity(
@@ -1125,6 +1135,41 @@ where
             authority,
             filesystem,
             None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_with_descriptors(
+        &self,
+        exec_context: ProgramExecContext<CpuImpl, HostFs>,
+        name: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        source: ProgramSource,
+        hint: Option<AotCompileHint>,
+        authority: ProcessAuthority,
+        filesystem: Option<DebugFileSystemSnapshot>,
+        descriptors: Preview1DescriptorTable,
+    ) -> Result<ChildHandle, ProgramExecError> {
+        super::emit_stage_marker(exec_context.write_serial, "program:spawn-begin");
+        let executable = self
+            .load_executable(&exec_context, &source, hint, exec_context.write_serial)
+            .await?;
+        let descriptors = match &executable {
+            ProgramExecutable::Component(_) => None,
+            ProgramExecutable::CoreModule(_) | ProgramExecutable::ForkedCoreModule { .. } => {
+                Some(descriptors)
+            }
+        };
+        self.spawn_loaded(
+            exec_context,
+            name,
+            args,
+            env,
+            executable,
+            authority,
+            filesystem,
+            descriptors,
         )
     }
 
@@ -9321,6 +9366,7 @@ where
         argv,
         None,
         WasixSpawnIo::from_modes(stdin, stdout, stderr),
+        None,
     )
     .await
     {
@@ -9359,7 +9405,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    if fd_ops != 0 || fd_ops_len != 0 || signals != 0 || signals_len != 0 {
+    if signals != 0 || signals_len != 0 {
         return p1::errno::NOTSUP;
     }
     let argv = match wasix_read_exec_string(caller, memory, args, args_len) {
@@ -9388,12 +9434,27 @@ where
         Ok(prepared) => prepared,
         Err(error) => return p1_errno_from_wasmtime_error(&error),
     };
-    let result =
-        match wasix_spawn_child(caller, prepared, argv, environment, WasixSpawnIo::inherit()).await
-        {
-            Ok(result) => result,
+    let descriptors = if fd_ops == 0 && fd_ops_len == 0 {
+        None
+    } else {
+        match wasix_spawn_descriptor_snapshot(caller, memory, fd_ops, fd_ops_len) {
+            Ok(descriptors) => Some(descriptors),
             Err(errno) => return errno,
-        };
+        }
+    };
+    let result = match wasix_spawn_child(
+        caller,
+        prepared,
+        argv,
+        environment,
+        WasixSpawnIo::inherit(),
+        descriptors,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(errno) => return errno,
+    };
     p1_write_u32(caller, memory, ret_pid, result.pid)
 }
 
@@ -9647,6 +9708,75 @@ where
         .ok()
 }
 
+fn wasix_spawn_descriptor_snapshot<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    memory: Preview1Memory,
+    fd_ops: u32,
+    fd_ops_len: u32,
+) -> Result<Preview1DescriptorTable, i32>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    if fd_ops == 0 {
+        return Err(p1::errno::FAULT);
+    }
+    let mut descriptors = caller.data().descriptors.clone();
+    for index in 0..fd_ops_len {
+        let offset = index
+            .checked_mul(WASIX_PROC_SPAWN_FD_OP_SIZE)
+            .and_then(|offset| fd_ops.checked_add(offset))
+            .ok_or(p1::errno::OVERFLOW)?;
+        wasix_apply_spawn_fd_op(caller, memory, &mut descriptors, offset)?;
+    }
+    Ok(descriptors)
+}
+
+fn wasix_apply_spawn_fd_op<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    memory: Preview1Memory,
+    descriptors: &mut Preview1DescriptorTable,
+    op: u32,
+) -> Result<(), i32>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let cmd = p1_try_read_u8(caller, memory, op + WASIX_PROC_SPAWN_FD_OP_CMD_OFFSET)
+        .map_err(|_| p1::errno::FAULT)?;
+    let fd = p1_try_read_u32(caller, memory, op + WASIX_PROC_SPAWN_FD_OP_FD_OFFSET)
+        .map_err(|_| p1::errno::FAULT)?;
+    let fd = i32::try_from(fd).map_err(|_| p1::errno::OVERFLOW)?;
+    match cmd {
+        WASIX_PROC_SPAWN_FD_OP_CLOSE => {
+            let status = descriptors.close(fd);
+            if status == p1::errno::SUCCESS {
+                Ok(())
+            } else {
+                Err(status)
+            }
+        }
+        WASIX_PROC_SPAWN_FD_OP_DUP2 => {
+            let source_fd =
+                p1_try_read_u32(caller, memory, op + WASIX_PROC_SPAWN_FD_OP_SRC_FD_OFFSET)
+                    .map_err(|_| p1::errno::FAULT)?;
+            let source_fd = i32::try_from(source_fd).map_err(|_| p1::errno::OVERFLOW)?;
+            let fdflagsext = p1_try_read_u16(
+                caller,
+                memory,
+                op + WASIX_PROC_SPAWN_FD_OP_FDFLAGSEXT_OFFSET,
+            )
+            .map_err(|_| p1::errno::FAULT)?;
+            let close_on_exec = wasix_close_on_exec_flag(fdflagsext)?;
+            descriptors.dup_to(source_fd, fd, close_on_exec).map(drop)
+        }
+        WASIX_PROC_SPAWN_FD_OP_OPEN
+        | WASIX_PROC_SPAWN_FD_OP_CHDIR
+        | WASIX_PROC_SPAWN_FD_OP_FCHDIR => Err(p1::errno::NOTSUP),
+        _ => Err(p1::errno::INVAL),
+    }
+}
+
 async fn wasix_prepare_program_from_name<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     name: &str,
@@ -9802,6 +9932,7 @@ async fn wasix_spawn_child<CpuImpl, HostFs>(
     mut argv: Vec<String>,
     environment: Option<Vec<(String, String)>>,
     io: WasixSpawnIo,
+    descriptors: Option<Preview1DescriptorTable>,
 ) -> Result<WasixSpawnResult, i32>
 where
     CpuImpl: Cpu + Clone,
@@ -9830,19 +9961,36 @@ where
         .ok_or(p1::errno::NOTSUP)?;
     let exec_context = caller.data().exec_context();
     let authority = caller.data().authority.clone();
-    let mut child = service
-        .spawn(
-            exec_context,
-            prepared.guest_name,
-            argv,
-            environment,
-            prepared.source,
-            None,
-            authority,
-            Some(caller.data().filesystem.snapshot()),
-        )
-        .await
-        .map_err(|error| p1_errno_from_program_exec_error(&error))?;
+    let filesystem = Some(caller.data().filesystem.snapshot());
+    let mut child = if let Some(descriptors) = descriptors {
+        service
+            .spawn_with_descriptors(
+                exec_context,
+                prepared.guest_name,
+                argv,
+                environment,
+                prepared.source,
+                None,
+                authority,
+                filesystem,
+                descriptors,
+            )
+            .await
+    } else {
+        service
+            .spawn(
+                exec_context,
+                prepared.guest_name,
+                argv,
+                environment,
+                prepared.source,
+                None,
+                authority,
+                filesystem,
+            )
+            .await
+    }
+    .map_err(|error| p1_errno_from_program_exec_error(&error))?;
     let pid = u32::try_from(child.instance_id.raw()).map_err(|_| p1::errno::OVERFLOW)?;
     let stdin_fd = wasix_configure_child_stdin(caller, &mut child, io.stdin)?;
     let stdout_fd = wasix_configure_child_output(
