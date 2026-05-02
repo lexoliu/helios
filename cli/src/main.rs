@@ -1280,7 +1280,7 @@ mod tests {
         fs::write(
             artifact_dir.join("SOURCE.txt"),
             format!(
-                "package=local/stub\nversion=1.0.25\nsource=https://wasmer.io/wasmer/bash\nsha256={digest}\n"
+                "package=local/mismatch\nversion=1.0.25\nsource=https://wasmer.io/wasmer/bash\nsha256={digest}\n"
             ),
         )
         .expect("test provenance must be written");
@@ -1296,7 +1296,7 @@ mod tests {
         let error = validate_external_boot_artifact_provenance(&artifact)
             .expect_err("mismatched artifact package must be rejected");
         assert!(
-            error.to_string().contains("package=local/stub"),
+            error.to_string().contains("package=local/mismatch"),
             "unexpected error: {error:#}"
         );
 
