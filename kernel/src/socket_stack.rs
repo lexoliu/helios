@@ -137,6 +137,10 @@ mod tests {
         type TcpStream = u64;
         type UdpSocket = u64;
 
+        fn hardware_address(&self) -> [u8; 6] {
+            [2, 0, 0, 0, 0, 1]
+        }
+
         fn ping(
             &self,
             _: &str,

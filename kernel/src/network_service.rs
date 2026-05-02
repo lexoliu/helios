@@ -1109,6 +1109,10 @@ where
             .runtime_state
             .uptime_nanos(self.inner.cpu.now().ticks())
     }
+
+    pub fn hardware_address(&self) -> [u8; 6] {
+        self.inner.device.mac_address()
+    }
 }
 
 impl<CpuImpl, Runtime, DeviceImpl> ComponentNetworkService
@@ -1120,6 +1124,10 @@ where
 {
     type TcpStream = TcpStreamId;
     type UdpSocket = UdpSocketId;
+
+    fn hardware_address(&self) -> [u8; 6] {
+        NetworkService::hardware_address(self)
+    }
 
     fn ping<'a>(
         &'a self,

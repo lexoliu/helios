@@ -44,6 +44,8 @@ impl ComponentHostUdpSocketToken for u64 {
 }
 
 trait DynComponentHostNetworkService: Send + Sync + 'static {
+    fn hardware_address(&self) -> [u8; 6];
+
     fn ping<'a>(
         &'a self,
         host: &'a str,
@@ -124,6 +126,10 @@ impl ComponentHostNetworkService {
 impl ComponentNetworkService for ComponentHostNetworkService {
     type TcpStream = u64;
     type UdpSocket = u64;
+
+    fn hardware_address(&self) -> [u8; 6] {
+        self.inner.hardware_address()
+    }
 
     fn ping<'a>(
         &'a self,
@@ -215,6 +221,10 @@ where
     Service::TcpStream: ComponentHostTcpStreamToken,
     Service::UdpSocket: ComponentHostUdpSocketToken,
 {
+    fn hardware_address(&self) -> [u8; 6] {
+        self.service.hardware_address()
+    }
+
     fn ping<'a>(
         &'a self,
         host: &'a str,

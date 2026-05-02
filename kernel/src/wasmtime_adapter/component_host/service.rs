@@ -10157,13 +10157,23 @@ where
 
 fn wasix_port_mac<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-    _ret_mac: u32,
+    ret_mac: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    wasix_network_admin_unavailable(caller)
+    let status = caller.data().require_network_admin_authority();
+    if status != p1::errno::SUCCESS {
+        return status;
+    }
+    let Some(service) = caller.data().runtime_state.network_service() else {
+        return p1::errno::NETDOWN;
+    };
+    let Some(memory) = p1_memory(caller) else {
+        return p1::errno::FAULT;
+    };
+    p1_write_memory(caller, memory, ret_mac, &service.hardware_address())
 }
 
 fn wasix_port_empty_list<CpuImpl, HostFs>(

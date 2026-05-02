@@ -394,6 +394,8 @@ pub trait ComponentNetworkService: Clone + Send + 'static {
     type TcpStream: Copy + Send + 'static;
     type UdpSocket: Copy + Send + 'static;
 
+    fn hardware_address(&self) -> [u8; 6];
+
     fn ping<'a>(
         &'a self,
         host: &'a str,
