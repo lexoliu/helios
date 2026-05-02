@@ -129,6 +129,7 @@ struct ProgramSpawnRequest {
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
     filesystem: Option<DebugFileSystemSnapshot>,
+    descriptors: Option<Preview1DescriptorTable>,
 }
 
 enum ProgramExecutable {
@@ -818,9 +819,11 @@ where
             executable,
             authority,
             filesystem,
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_loaded(
         &self,
         exec_context: ProgramExecContext<CpuImpl, HostFs>,
@@ -830,6 +833,7 @@ where
         executable: ProgramExecutable,
         authority: ProcessAuthority,
         filesystem: Option<DebugFileSystemSnapshot>,
+        descriptors: Option<Preview1DescriptorTable>,
     ) -> Result<ChildHandle, ProgramExecError> {
         // Three byte channels between parent and child.
         let (stdin_writer, stdin_reader) = crate::byte_channel();
@@ -857,6 +861,7 @@ where
             env,
             authority,
             filesystem,
+            descriptors,
         };
 
         let (exit_tx, exit_rx) = futures::channel::oneshot::channel();
@@ -874,6 +879,7 @@ where
                 request.env,
                 request.authority,
                 request.filesystem,
+                request.descriptors,
                 run_spawner,
                 progress,
                 executable,
@@ -953,6 +959,38 @@ where
             stdin,
             authority,
             filesystem,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn exec_buffered_with_snapshot_and_descriptors(
+        &self,
+        exec_context: ProgramExecContext<CpuImpl, HostFs>,
+        name: impl Into<String>,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        source: ProgramSource,
+        hint: Option<AotCompileHint>,
+        stdin: Vec<u8>,
+        authority: ProcessAuthority,
+        filesystem: Option<DebugFileSystemSnapshot>,
+        descriptors: Option<Preview1DescriptorTable>,
+    ) -> Result<(ExecResult, Option<DebugFileSystemSnapshot>), ProgramExecError> {
+        let executable = self
+            .load_executable(&exec_context, &source, hint, exec_context.write_serial)
+            .await?;
+        self.exec_loaded_buffered(
+            exec_context,
+            name.into(),
+            args,
+            env,
+            executable,
+            stdin,
+            authority,
+            filesystem,
+            descriptors,
         )
         .await
     }
@@ -967,6 +1005,7 @@ where
         stdin: Vec<u8>,
         authority: ProcessAuthority,
         filesystem: Option<DebugFileSystemSnapshot>,
+        descriptors: Option<Preview1DescriptorTable>,
     ) -> Result<(ExecResult, Option<DebugFileSystemSnapshot>), ProgramExecError> {
         let mut child = self.spawn_loaded(
             exec_context,
@@ -976,6 +1015,7 @@ where
             executable,
             authority,
             filesystem,
+            descriptors,
         )?;
 
         // Feed stdin in one shot, then close the writer to signal EOF.
@@ -1550,6 +1590,7 @@ where
         write_serial: fn(&[u8]),
         imported_memory: Option<SharedMemory>,
         filesystem: Option<DebugFileSystemSnapshot>,
+        descriptors: Option<Preview1DescriptorTable>,
         current_core_module: Option<Arc<WasmtimeCompiledCoreModule>>,
         wasix_abi: bool,
     ) -> Self {
@@ -1558,7 +1599,8 @@ where
             |snapshot| DebugFileSystem::from_snapshot(runtime_state.clone(), snapshot),
         );
         let entropy = crate::EntropyPool::from_cpu(&cpu, instance.id().raw());
-        let descriptors = Preview1DescriptorTable::from_authority(&authority);
+        let descriptors =
+            descriptors.unwrap_or_else(|| Preview1DescriptorTable::from_authority(&authority));
         let clock = crate::KernelClock::new(cpu.clone(), runtime_state.clone());
         let wall_clock_cap = authority.derive_set_wall_clock_cap().ok();
         let cwd = preview1_cwd_from_authority(&authority);
@@ -2236,6 +2278,19 @@ impl Preview1DescriptorTable {
                 p1::errno::SUCCESS
             }
             None => p1::errno::BADF,
+        }
+    }
+
+    fn clone_for_exec(&self) -> Self {
+        Self {
+            entries: self
+                .entries
+                .iter()
+                .map(|entry| match entry {
+                    Some(entry) if entry.close_on_exec => None,
+                    _ => entry.clone(),
+                })
+                .collect(),
         }
     }
 
@@ -3728,6 +3783,7 @@ async fn run_program_executable<CpuImpl, HostFs>(
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
     filesystem: Option<DebugFileSystemSnapshot>,
+    descriptors: Option<Preview1DescriptorTable>,
     spawner: crate::Spawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
     executable: ProgramExecutable,
@@ -3743,6 +3799,10 @@ where
     HostFs: crate::HostFileSystem,
 {
     match executable {
+        ProgramExecutable::Component(_) if descriptors.is_some() => Err(ProgramExecError {
+            kind: ProgramExecErrorKind::Unavailable,
+            detail: ProgramExecErrorDetail::ImageReplacementUnavailable,
+        }),
         ProgramExecutable::Component(compiled) => {
             run_program_component(
                 exec_context,
@@ -3771,6 +3831,7 @@ where
                 env,
                 authority,
                 filesystem,
+                descriptors,
                 spawner,
                 progress,
                 compiled,
@@ -3813,6 +3874,7 @@ async fn run_program_core_module<CpuImpl, HostFs>(
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
     filesystem: Option<DebugFileSystemSnapshot>,
+    descriptors: Option<Preview1DescriptorTable>,
     spawner: crate::Spawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
     compiled: Arc<WasmtimeCompiledCoreModule>,
@@ -3855,6 +3917,7 @@ where
             exec_context.write_serial,
             imported_memory.clone(),
             filesystem,
+            descriptors,
             Some(compiled.clone()),
             wasix_abi,
         ),
@@ -3970,11 +4033,11 @@ where
             exec_context.write_serial,
             imported_memory.clone(),
             filesystem,
+            Some(restore.descriptors),
             Some(compiled.clone()),
             wasix_abi,
         ),
     );
-    store.data_mut().descriptors = restore.descriptors;
     configure_preview1_program_store(&mut store);
 
     let mut linker = CoreLinker::new(engine.raw());
@@ -4502,6 +4565,7 @@ where
         ProgramExecutable::ForkedCoreModule { compiled, restore },
         store.data().authority.clone(),
         Some(store.data().filesystem.snapshot()),
+        None,
     )?;
     let pid = u32::try_from(child.instance_id.raw()).map_err(|_| ProgramExecError {
         kind: ProgramExecErrorKind::Internal,
@@ -8540,8 +8604,9 @@ where
         })?;
     let exec_context = caller.data().exec_context();
     let authority = caller.data().authority.clone();
+    let descriptors = caller.data().descriptors.clone_for_exec();
     let result = service
-        .exec_buffered_with_snapshot(
+        .exec_buffered_with_snapshot_and_descriptors(
             exec_context,
             guest_name,
             argv,
@@ -8551,6 +8616,7 @@ where
             Vec::new(),
             authority,
             Some(caller.data().filesystem.snapshot()),
+            Some(descriptors),
         )
         .await
         .map_err(wasmtime::Error::new)?;
@@ -12194,6 +12260,50 @@ mod tests {
             _ => panic!("fd 1 should be duplicated to the file descriptor"),
         }
         assert_eq!(table.close_on_exec(1), Ok(true));
+    }
+
+    #[test]
+    fn exec_descriptor_snapshot_drops_close_on_exec_entries() {
+        let closed = Preview1Descriptor::File {
+            descriptor: FsDescriptor {
+                path: "/closed-on-exec".into(),
+                kind: FsNodeKind::File,
+                flags: fs_types::DescriptorFlags::READ,
+                identity: None,
+            },
+            offset: 0,
+            fdflags: 0,
+        };
+        let retained = Preview1Descriptor::File {
+            descriptor: FsDescriptor {
+                path: "/retained".into(),
+                kind: FsNodeKind::File,
+                flags: fs_types::DescriptorFlags::READ,
+                identity: None,
+            },
+            offset: 0,
+            fdflags: 0,
+        };
+        let table = Preview1DescriptorTable {
+            entries: vec![
+                Some(Preview1DescriptorEntry::new(
+                    Preview1Descriptor::Stdin { carry: Vec::new() },
+                    false,
+                )),
+                Some(Preview1DescriptorEntry::new(closed, true)),
+                Some(Preview1DescriptorEntry::new(retained, false)),
+            ],
+        };
+
+        let exec_table = table.clone_for_exec();
+
+        assert!(exec_table.get(1).is_none());
+        match exec_table.get(2) {
+            Some(Preview1Descriptor::File { descriptor, .. }) => {
+                assert_eq!(descriptor.path, "/retained");
+            }
+            _ => panic!("fd 2 should be retained across exec"),
+        }
     }
 
     #[test]
