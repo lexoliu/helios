@@ -33,6 +33,7 @@ const FILE_READ_CHUNK_BYTES: usize = 1024 * 1024;
 const DEFAULT_WASI_UDP_BUFFER_BYTES: u64 = 64 * 1024;
 const DEFAULT_WASI_UDP_HOP_LIMIT: u8 = 64;
 const DEFAULT_WASI_TCP_HOP_LIMIT: u8 = 64;
+const DEFAULT_WASI_TCP_LISTEN_BACKLOG: u16 = 128;
 const MAX_WASI_UDP_DATAGRAM_BYTES: usize = u16::MAX as usize;
 const MAX_SYMLINK_DEPTH: usize = 16;
 
@@ -48,6 +49,14 @@ pub(crate) fn wasi_udp_bind_rights(local_port: u16) -> crate::NetworkAuthorityRi
         crate::NetworkAuthorityRights::UDP | crate::NetworkAuthorityRights::PRIVILEGED_BIND
     } else {
         crate::NetworkAuthorityRights::UDP
+    }
+}
+
+pub(crate) fn wasi_tcp_bind_rights(local_port: u16) -> crate::NetworkAuthorityRights {
+    if local_port != 0 && local_port < 1024 {
+        crate::NetworkAuthorityRights::TCP | crate::NetworkAuthorityRights::PRIVILEGED_BIND
+    } else {
+        crate::NetworkAuthorityRights::TCP
     }
 }
 
@@ -245,9 +254,15 @@ struct TcpSocketState {
     service: ComponentHostNetworkService,
     family: WasiTcpSocketFamily,
     stream: Option<u64>,
+    listener: Option<u64>,
+    local_address: Option<WasiTcpSocketAddress>,
     remote_address: Option<WasiTcpSocketAddress>,
     connect_in_progress: bool,
     connect_result: Option<core::result::Result<(), crate::TcpError>>,
+    listen_in_progress: bool,
+    listen_result: Option<core::result::Result<crate::TcpListener<u64>, crate::TcpError>>,
+    accept_in_progress: bool,
+    accept_result: Option<core::result::Result<crate::TcpAccepted<u64>, crate::TcpError>>,
     hop_limit: u8,
     receive_buffer_size: u64,
     send_buffer_size: u64,
@@ -354,9 +369,44 @@ impl TcpSocket {
                 service,
                 family,
                 stream: None,
+                listener: None,
+                local_address: None,
                 remote_address: None,
                 connect_in_progress: false,
                 connect_result: None,
+                listen_in_progress: false,
+                listen_result: None,
+                accept_in_progress: false,
+                accept_result: None,
+                hop_limit: DEFAULT_WASI_TCP_HOP_LIMIT,
+                receive_buffer_size: DEFAULT_WASI_UDP_BUFFER_BYTES,
+                send_buffer_size: DEFAULT_WASI_UDP_BUFFER_BYTES,
+            })),
+            ready: Arc::new(crate::Notify::new()),
+        }
+    }
+
+    fn accepted(
+        service: ComponentHostNetworkService,
+        family: WasiTcpSocketFamily,
+        stream: u64,
+        local_address: WasiTcpSocketAddress,
+        remote_address: WasiTcpSocketAddress,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(TcpSocketState {
+                service,
+                family,
+                stream: Some(stream),
+                listener: None,
+                local_address: Some(local_address),
+                remote_address: Some(remote_address),
+                connect_in_progress: false,
+                connect_result: None,
+                listen_in_progress: false,
+                listen_result: None,
+                accept_in_progress: false,
+                accept_result: None,
                 hop_limit: DEFAULT_WASI_TCP_HOP_LIMIT,
                 receive_buffer_size: DEFAULT_WASI_UDP_BUFFER_BYTES,
                 send_buffer_size: DEFAULT_WASI_UDP_BUFFER_BYTES,
@@ -382,6 +432,34 @@ impl TcpSocket {
             .lock()
             .remote_address
             .ok_or(socket_types::ErrorCode::InvalidState)
+    }
+
+    fn local_address(&self) -> core::result::Result<WasiTcpSocketAddress, socket_types::ErrorCode> {
+        self.inner
+            .lock()
+            .local_address
+            .ok_or(socket_types::ErrorCode::InvalidState)
+    }
+
+    fn bind_local(
+        &self,
+        local_address: WasiTcpSocketAddress,
+    ) -> core::result::Result<(), socket_types::ErrorCode> {
+        let mut state = self.inner.lock();
+        if state.stream.is_some()
+            || state.listener.is_some()
+            || state.connect_in_progress
+            || state.listen_in_progress
+            || state.accept_in_progress
+        {
+            return Err(socket_types::ErrorCode::InvalidState);
+        }
+        state.local_address = Some(local_address);
+        Ok(())
+    }
+
+    fn is_listening(&self) -> bool {
+        self.inner.lock().listener.is_some()
     }
 
     fn receive_buffer_size(&self) -> core::result::Result<u64, socket_types::ErrorCode> {
@@ -4935,7 +5013,8 @@ mod tests {
         ComponentHostNetworkService, DEFAULT_WASI_TCP_HOP_LIMIT, DebugFileSystem, FsDescriptor,
         FsNodeKind, P2ResolveAddressStream, TcpSocket, WasiTcpSocketAddress, WasiTcpSocketFamily,
         WasiUdpSocketError, fs_types, has_wasi_network_rights, ip_name_lookup, map_p3_dns_error,
-        map_p3_tcp_error, map_p3_udp_socket_error, preview3, socket_types, wasi_udp_bind_rights,
+        map_p3_tcp_error, map_p3_udp_socket_error, preview3, socket_types, wasi_tcp_bind_rights,
+        wasi_udp_bind_rights,
     };
 
     #[derive(Clone)]
@@ -5823,6 +5902,19 @@ mod tests {
     }
 
     #[test]
+    fn wasi_tcp_bind_rights_require_privileged_bind_for_low_ports() {
+        assert_eq!(wasi_tcp_bind_rights(0), crate::NetworkAuthorityRights::TCP);
+        assert_eq!(
+            wasi_tcp_bind_rights(1024),
+            crate::NetworkAuthorityRights::TCP
+        );
+        assert_eq!(
+            wasi_tcp_bind_rights(443),
+            crate::NetworkAuthorityRights::TCP | crate::NetworkAuthorityRights::PRIVILEGED_BIND
+        );
+    }
+
+    #[test]
     fn wasi_network_right_check_never_widens_authority() {
         let mut authority = crate::ProcessAuthority::empty();
         authority.grant_network_rights(crate::NetworkAuthorityRights::UDP);
@@ -5898,6 +5990,22 @@ mod tests {
             Err(socket_types::ErrorCode::InvalidArgument)
         ));
         assert_eq!(socket.hop_limit().unwrap(), 127);
+    }
+
+    #[test]
+    fn tcp_socket_bind_local_tracks_authorized_local_address() {
+        let service = ComponentHostNetworkService::from_service(TestNetworkService);
+        let socket = TcpSocket::new(service, WasiTcpSocketFamily::Ipv4);
+        let local = WasiTcpSocketAddress {
+            address: crate::Ipv4Address::new([127, 0, 0, 1]),
+            port: 8080,
+        };
+
+        socket
+            .bind_local(local)
+            .expect("unconnected socket must accept a local bind");
+        assert_eq!(socket.local_address().unwrap(), local);
+        assert!(!socket.is_listening());
     }
 
     #[test]

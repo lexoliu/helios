@@ -23,7 +23,7 @@ use super::{
     P2OutgoingDatagramStream, P2ResolveAddressStream, Preview2GuestExit, TcpSocket, UdpSocket,
     WasiAdapterTrap, WasiImportSet, WasiTcpSocketAddress, WasiTcpSocketFamily,
     WasiUdpSocketAddress, WasiUdpSocketError, WasiUdpSocketFamily, has_wasi_network_rights,
-    metadata_hash_value, wasi_udp_bind_rights,
+    metadata_hash_value, wasi_tcp_bind_rights, wasi_udp_bind_rights,
 };
 use crate::wasmtime_adapter::component_host::{
     HostRuntimeState, RuntimeDeadlinePollable, StoreData,
@@ -2409,6 +2409,61 @@ fn map_p2_tcp_socket_error(error: super::socket_types::ErrorCode) -> p2tcp::Erro
     }
 }
 
+fn p2_tcp_stream_pair<CpuImpl, HostFs>(
+    store: &mut StoreData<CpuImpl, HostFs>,
+    socket_resource: &Resource<TcpSocket>,
+    socket: TcpSocket,
+) -> Result<(Resource<p2tcp::InputStream>, Resource<p2tcp::OutputStream>)>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let (network_writer, guest_reader) = crate::byte_channel();
+    let (guest_writer, network_reader) = crate::byte_channel();
+    let input = store.table.push_child(
+        Box::new(ChannelInputStream::new(guest_reader)) as DynInputStream,
+        socket_resource,
+    )?;
+    let output = store.table.push_child(
+        Box::new(ChannelOutputStream::new(guest_writer)) as DynOutputStream,
+        socket_resource,
+    )?;
+    let read_socket = socket.clone();
+    store.spawner().spawn_detached(async move {
+        loop {
+            match read_socket.read(super::FILE_READ_CHUNK_BYTES as u32).await {
+                Ok(Some(bytes)) => {
+                    if network_writer.write(bytes).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "helios_kernel::wasi::preview2::tcp",
+                        ?error,
+                        "tcp input stream bridge stopped after backend read error"
+                    );
+                    break;
+                }
+            }
+        }
+    });
+    store.spawner().spawn_detached(async move {
+        while let Some(bytes) = network_reader.read().await {
+            if let Err(error) = socket.write_all(&bytes).await {
+                tracing::warn!(
+                    target: "helios_kernel::wasi::preview2::tcp",
+                    ?error,
+                    "tcp output stream bridge stopped after backend write error"
+                );
+                break;
+            }
+        }
+    });
+    Ok((input, output))
+}
+
 impl<CpuImpl, HostFs> p2tcp::Host for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
@@ -2423,18 +2478,36 @@ where
 {
     fn start_bind(
         &mut self,
-        _: Resource<TcpSocket>,
-        _: Resource<p2tcp::Network>,
-        _: p2tcp::IpSocketAddress,
+        socket: Resource<TcpSocket>,
+        network: Resource<p2tcp::Network>,
+        local_address: p2tcp::IpSocketAddress,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
-        socket_not_supported()
+        let _ = self.table.get(&network)?;
+        let socket = self.table.get(&socket)?.clone();
+        let local_address = match parse_p2_tcp_socket_address(local_address, socket.family()) {
+            Ok(address) => address,
+            Err(error) => return Ok(Err(error)),
+        };
+        if !has_wasi_network_rights(
+            self.process_authority(),
+            wasi_tcp_bind_rights(local_address.port),
+        ) {
+            return Ok(Err(p2tcp::ErrorCode::AccessDenied));
+        }
+        Ok(socket
+            .bind_local(local_address)
+            .map_err(map_p2_tcp_socket_error))
     }
 
     fn finish_bind(
         &mut self,
-        _: Resource<TcpSocket>,
+        socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket
+            .local_address()
+            .map(drop)
+            .map_err(map_p2_tcp_socket_error))
     }
 
     fn start_connect(
@@ -2513,69 +2586,77 @@ where
                 return Ok(Err(map_p2_tcp_core_error(error)));
             }
         }
-        let (network_writer, guest_reader) = crate::byte_channel();
-        let (guest_writer, network_reader) = crate::byte_channel();
-        let input = self.table.push_child(
-            Box::new(ChannelInputStream::new(guest_reader)) as DynInputStream,
-            &socket_resource,
-        )?;
-        let output = self.table.push_child(
-            Box::new(ChannelOutputStream::new(guest_writer)) as DynOutputStream,
-            &socket_resource,
-        )?;
-        let read_socket = socket.clone();
-        self.spawner().spawn_detached(async move {
-            loop {
-                match read_socket.read(super::FILE_READ_CHUNK_BYTES as u32).await {
-                    Ok(Some(bytes)) => {
-                        if network_writer.write(bytes).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(error) => {
-                        tracing::warn!(
-                            target: "helios_kernel::wasi::preview2::tcp",
-                            ?error,
-                            "tcp input stream bridge stopped after backend read error"
-                        );
-                        break;
-                    }
-                }
-            }
-        });
-        self.spawner().spawn_detached(async move {
-            while let Some(bytes) = network_reader.read().await {
-                if let Err(error) = socket.write_all(&bytes).await {
-                    tracing::warn!(
-                        target: "helios_kernel::wasi::preview2::tcp",
-                        ?error,
-                        "tcp output stream bridge stopped after backend write error"
-                    );
-                    break;
-                }
-            }
-        });
+        let (input, output) = p2_tcp_stream_pair(self, &socket_resource, socket)?;
         Ok(Ok((input, output)))
     }
 
     fn start_listen(
         &mut self,
-        _: Resource<TcpSocket>,
+        socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        let (service, inner, ready, local_port) = {
+            let mut state = socket.inner.lock();
+            if state.stream.is_some()
+                || state.listener.is_some()
+                || state.connect_in_progress
+                || state.listen_in_progress
+                || state.listen_result.is_some()
+            {
+                return Ok(Err(p2tcp::ErrorCode::InvalidState));
+            }
+            let local_port = state.local_address.map_or(0, |address| address.port);
+            if !has_wasi_network_rights(self.process_authority(), wasi_tcp_bind_rights(local_port))
+            {
+                return Ok(Err(p2tcp::ErrorCode::AccessDenied));
+            }
+            state.listen_in_progress = true;
+            (
+                state.service.clone(),
+                socket.inner.clone(),
+                socket.ready.clone(),
+                local_port,
+            )
+        };
+        self.spawner().spawn_detached(async move {
+            let result = service
+                .tcp_listen(local_port, super::DEFAULT_WASI_TCP_LISTEN_BACKLOG)
+                .await;
+            let mut state = inner.lock();
+            state.listen_in_progress = false;
+            state.listen_result = Some(result);
+            ready.notify_all();
+        });
+        Ok(Ok(()))
     }
 
     fn finish_listen(
         &mut self,
-        _: Resource<TcpSocket>,
+        socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        let mut state = socket.inner.lock();
+        if state.listen_in_progress {
+            return Ok(Err(p2tcp::ErrorCode::WouldBlock));
+        }
+        let Some(result) = state.listen_result.take() else {
+            return Ok(Err(p2tcp::ErrorCode::NotInProgress));
+        };
+        let listener = match result {
+            Ok(listener) => listener,
+            Err(error) => return Ok(Err(map_p2_tcp_core_error(error))),
+        };
+        state.listener = Some(listener.listener);
+        state.local_address.get_or_insert(WasiTcpSocketAddress {
+            address: crate::Ipv4Address::new([0, 0, 0, 0]),
+            port: listener.local_port,
+        });
+        Ok(Ok(()))
     }
 
     fn accept(
         &mut self,
-        _: Resource<TcpSocket>,
+        socket_resource: Resource<TcpSocket>,
     ) -> Result<
         core::result::Result<
             (
@@ -2586,14 +2667,67 @@ where
             p2tcp::ErrorCode,
         >,
     > {
-        socket_not_supported()
+        let socket = self.table.get(&socket_resource)?.clone();
+        {
+            let mut state = socket.inner.lock();
+            if let Some(result) = state.accept_result.take() {
+                let accepted = match result {
+                    Ok(accepted) => accepted,
+                    Err(error) => return Ok(Err(map_p2_tcp_core_error(error))),
+                };
+                let Some(local_address) = state.local_address else {
+                    return Err(wasmtime::Error::new(crate::ProgramExecError {
+                        kind: crate::ProgramExecErrorKind::Internal,
+                        detail: crate::ProgramExecErrorDetail::InternalInvariant,
+                    }));
+                };
+                let accepted_socket = TcpSocket::accepted(
+                    state.service.clone(),
+                    state.family,
+                    accepted.stream,
+                    local_address,
+                    WasiTcpSocketAddress {
+                        address: accepted.address,
+                        port: accepted.port,
+                    },
+                );
+                drop(state);
+                let accepted_resource = self.table.push_child(accepted_socket, &socket_resource)?;
+                let accepted_socket = self.table.get(&accepted_resource)?.clone();
+                let (input, output) =
+                    p2_tcp_stream_pair(self, &accepted_resource, accepted_socket)?;
+                return Ok(Ok((accepted_resource, input, output)));
+            }
+            if state.accept_in_progress {
+                return Ok(Err(p2tcp::ErrorCode::WouldBlock));
+            }
+            let Some(listener) = state.listener else {
+                return Ok(Err(p2tcp::ErrorCode::InvalidState));
+            };
+            state.accept_in_progress = true;
+            let service = state.service.clone();
+            let inner = socket.inner.clone();
+            let ready = socket.ready.clone();
+            self.spawner().spawn_detached(async move {
+                let result = service.tcp_accept(listener, u64::MAX).await;
+                let mut state = inner.lock();
+                state.accept_in_progress = false;
+                state.accept_result = Some(result);
+                ready.notify_all();
+            });
+        }
+        Ok(Err(p2tcp::ErrorCode::WouldBlock))
     }
 
     fn local_address(
         &mut self,
-        _: Resource<TcpSocket>,
+        socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<p2tcp::IpSocketAddress, p2tcp::ErrorCode>> {
-        socket_not_supported()
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket
+            .local_address()
+            .map(format_p2_tcp_socket_address)
+            .map_err(map_p2_tcp_socket_error))
     }
 
     fn remote_address(
@@ -2608,8 +2742,8 @@ where
     }
 
     fn is_listening(&mut self, socket: Resource<TcpSocket>) -> Result<bool> {
-        let _ = self.table.get(&socket)?;
-        Ok(false)
+        let socket = self.table.get(&socket)?.clone();
+        Ok(socket.is_listening())
     }
 
     fn address_family(&mut self, socket: Resource<TcpSocket>) -> Result<p2tcp::IpAddressFamily> {
