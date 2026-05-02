@@ -3611,8 +3611,8 @@ where
             "sock_listen",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
              fd: i32,
-             _backlog: i32|
-             -> i32 { wasix_sock_descriptor_unavailable(&mut caller, fd) },
+             backlog: i32|
+             -> i32 { wasix_sock_listen(&mut caller, fd, backlog) },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -10372,6 +10372,19 @@ fn wasix_sock_bind_authority(
     }
 }
 
+fn wasix_sock_listen_authority(
+    descriptor: Option<&Preview1Descriptor>,
+) -> Result<WasixSocketAuthority, i32> {
+    match descriptor {
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => {
+            Ok(WasixSocketAuthority::Tcp)
+        }
+        Some(Preview1Descriptor::Socket(_)) => Err(p1::errno::INVAL),
+        Some(_) => Err(p1::errno::NOTSOCK),
+        None => Err(p1::errno::BADF),
+    }
+}
+
 fn wasix_sock_set_opt_flag<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
@@ -10597,6 +10610,32 @@ where
     p1::errno::SUCCESS
 }
 
+fn wasix_sock_listen<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    fd: i32,
+    backlog: i32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    if backlog < 0 {
+        return p1::errno::INVAL;
+    }
+    let authority = match wasix_sock_listen_authority(caller.data().descriptors.get(fd)) {
+        Ok(authority) => authority,
+        Err(errno) => return errno,
+    };
+    let status = caller.data().require_socket_authority(authority);
+    if status != p1::errno::SUCCESS {
+        return status;
+    }
+    if caller.data().runtime_state.network_service().is_none() {
+        return p1::errno::NETDOWN;
+    }
+    p1::errno::NOTSUP
+}
+
 fn wasix_sock_accept_v2<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
@@ -10607,7 +10646,18 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    wasix_sock_descriptor_unavailable(caller, fd)
+    let authority = match wasix_sock_listen_authority(caller.data().descriptors.get(fd)) {
+        Ok(authority) => authority,
+        Err(errno) => return errno,
+    };
+    let status = caller.data().require_socket_authority(authority);
+    if status != p1::errno::SUCCESS {
+        return status;
+    }
+    if caller.data().runtime_state.network_service().is_none() {
+        return p1::errno::NETDOWN;
+    }
+    p1::errno::NOTSUP
 }
 
 async fn wasix_sock_connect<CpuImpl, HostFs>(
@@ -12803,6 +12853,18 @@ mod tests {
             Err(p1::errno::INVAL)
         );
         assert_eq!(
+            wasix_sock_listen_authority(Some(&tcp)),
+            Ok(WasixSocketAuthority::Tcp)
+        );
+        assert_eq!(
+            wasix_sock_listen_authority(Some(&udp_bound)),
+            Err(p1::errno::INVAL)
+        );
+        assert_eq!(
+            wasix_sock_listen_authority(Some(&pair)),
+            Err(p1::errno::INVAL)
+        );
+        assert_eq!(
             wasix_sock_recv_authority(Some(&udp_unbound)),
             Err(p1::errno::INVAL)
         );
@@ -12810,7 +12872,13 @@ mod tests {
             wasix_sock_send_authority(Some(&nonsocket)),
             Err(p1::errno::NOTSOCK)
         );
+        assert_eq!(
+            wasix_sock_listen_authority(Some(&nonsocket)),
+            Err(p1::errno::NOTSOCK)
+        );
+        assert_eq!(wasix_sock_recv_authority(None), Err(p1::errno::BADF));
         assert_eq!(wasix_sock_send_authority(None), Err(p1::errno::BADF));
+        assert_eq!(wasix_sock_listen_authority(None), Err(p1::errno::BADF));
     }
 
     #[test]
