@@ -9598,17 +9598,22 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    if chroot != 0 {
-        return p1::errno::NOTSUP;
-    }
+    let chroot = match chroot {
+        0 => false,
+        1 => true,
+        _ => return p1::errno::INVAL,
+    };
     let mut authority = if preopen_len == 0 {
+        if chroot {
+            return p1::errno::INVAL;
+        }
         caller.data().authority.clone()
     } else {
         let preopen = match wasix_read_exec_string(caller, memory, preopen, preopen_len) {
             Ok(preopen) => preopen,
             Err(_) => return p1::errno::FAULT,
         };
-        match wasix_proc_spawn_preopen_authority(caller.data(), &preopen) {
+        match wasix_proc_spawn_preopen_authority(caller.data(), &preopen, chroot) {
             Ok(authority) => authority,
             Err(errno) => return errno,
         }
@@ -9620,10 +9625,11 @@ where
             Err(_) => return p1::errno::FAULT,
         };
         if !working_dir.is_empty() && working_dir != "." {
-            let cwd = match caller.data().resolve_cwd_target(&working_dir) {
-                Ok(cwd) => cwd,
-                Err(errno) => return errno,
-            };
+            let cwd =
+                match wasix_proc_spawn_resolve_child_cwd(caller.data(), &authority, &working_dir) {
+                    Ok(cwd) => cwd,
+                    Err(errno) => return errno,
+                };
             let cap = match authority.derive_directory_cap(
                 &cwd.descriptor.path,
                 &cwd.guest_name,
@@ -9664,12 +9670,14 @@ where
 fn wasix_proc_spawn_preopen_authority<CpuImpl, HostFs>(
     store: &Preview1ProgramStore<CpuImpl, HostFs>,
     preopen: &str,
+    chroot: bool,
 ) -> Result<ProcessAuthority, i32>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     let mut authority = wasix_proc_spawn_inherited_non_directory_authority(&store.authority);
+    let mut chroot_entry = None;
     for entry in wasix_split_lines(preopen) {
         let guest_name = wasix_proc_spawn_preopen_guest_name(store.cwd.as_ref(), &entry)?;
         let (source_path, flags) = store.resolve_absolute_guest_path(&guest_name)?;
@@ -9681,11 +9689,32 @@ where
             return Err(p1::errno::NOTDIR);
         }
         let rights = descriptor_flags_to_directory_authority(flags);
+        if chroot {
+            if chroot_entry.is_some() {
+                return Err(p1::errno::INVAL);
+            }
+            chroot_entry = Some((source_path, rights));
+            continue;
+        }
         let preopen = store
             .authority
             .derive_directory_preopen(&source_path, &guest_name, rights)
             .map_err(|_| p1::errno::NOTCAPABLE)?;
         authority.insert_directory_preopen(preopen);
+    }
+    if chroot {
+        let Some((source_path, rights)) = chroot_entry else {
+            return Err(p1::errno::INVAL);
+        };
+        let preopen = store
+            .authority
+            .derive_directory_preopen(&source_path, "/", rights)
+            .map_err(|_| p1::errno::NOTCAPABLE)?;
+        authority.insert_directory_preopen(preopen);
+        let cwd = authority
+            .derive_directory_cap(&source_path, "/", rights)
+            .map_err(|_| p1::errno::NOTCAPABLE)?;
+        authority.chdir(cwd);
     }
     Ok(authority)
 }
@@ -9712,6 +9741,82 @@ fn wasix_proc_spawn_preopen_guest_name(
         let cwd = cwd.ok_or(p1::errno::NOTCAPABLE)?;
         crate::resolve_child_path(&cwd.guest_name, entry).map_err(p1_errno_from_component_path)
     }
+}
+
+fn wasix_proc_spawn_resolve_child_cwd<CpuImpl, HostFs>(
+    store: &Preview1ProgramStore<CpuImpl, HostFs>,
+    authority: &ProcessAuthority,
+    path: &str,
+) -> Result<Preview1Cwd, i32>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let (guest_name, source_path, flags) = if path.starts_with('/') {
+        let guest_name =
+            crate::resolve_absolute_path(path).map_err(p1_errno_from_component_path)?;
+        let (source_path, flags) =
+            wasix_authority_resolve_absolute_guest_path(authority, &guest_name)?;
+        (guest_name, source_path, flags)
+    } else {
+        let cwd = preview1_cwd_from_authority(authority).ok_or(p1::errno::NOTCAPABLE)?;
+        let guest_name = crate::resolve_child_path(&cwd.guest_name, path)
+            .map_err(p1_errno_from_component_path)?;
+        let source_path = crate::resolve_child_path(&cwd.descriptor.path, path)
+            .map_err(p1_errno_from_component_path)?;
+        (guest_name, source_path, cwd.descriptor.flags)
+    };
+    if !flags.contains(fs_types::DescriptorFlags::READ) {
+        return Err(p1::errno::NOTCAPABLE);
+    }
+    let stat = store
+        .filesystem
+        .stat(&source_path)
+        .map_err(p1_errno_from_fs)?;
+    if !matches!(stat.type_, fs_types::DescriptorType::Directory) {
+        return Err(p1::errno::NOTDIR);
+    }
+    Ok(Preview1Cwd {
+        guest_name,
+        descriptor: FsDescriptor {
+            path: source_path,
+            kind: FsNodeKind::Directory,
+            flags,
+            identity: None,
+        },
+    })
+}
+
+fn wasix_authority_resolve_absolute_guest_path(
+    authority: &ProcessAuthority,
+    guest_name: &str,
+) -> Result<(String, fs_types::DescriptorFlags), i32> {
+    let mut best: Option<(&str, &str, DirectoryAuthorityRights)> = None;
+    for preopen in authority.directory_preopens() {
+        let preopen_guest = preopen.guest_name();
+        if !guest_path_is_within_preopen(guest_name, preopen_guest) {
+            continue;
+        }
+        if best.is_none_or(|(best_guest, _, _)| preopen_guest.len() > best_guest.len()) {
+            best = Some((preopen_guest, preopen.source_path(), preopen.rights()));
+        }
+    }
+    if let Some(cwd) = authority.cwd()
+        && guest_path_is_within_preopen(guest_name, cwd.guest_name())
+        && best.is_none_or(|(best_guest, _, _)| cwd.guest_name().len() > best_guest.len())
+    {
+        best = Some((cwd.guest_name(), cwd.source_path(), cwd.rights()));
+    }
+    let Some((preopen_guest, source_path, rights)) = best else {
+        return Err(p1::errno::NOTCAPABLE);
+    };
+    let suffix = guest_path_suffix(guest_name, preopen_guest);
+    let source_path = if suffix.is_empty() {
+        source_path.to_owned()
+    } else {
+        crate::resolve_child_path(source_path, suffix).map_err(p1_errno_from_component_path)?
+    };
+    Ok((source_path, directory_authority_to_descriptor_flags(rights)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -15708,6 +15813,34 @@ mod tests {
             crate::LinkAuthorityRights::SYMLINK_READ
         );
         assert!(parent.contains_authority(&child));
+    }
+
+    #[test]
+    fn chroot_authority_resolution_maps_guest_root_to_derived_source() {
+        let mut authority = ProcessAuthority::empty();
+        authority.insert_directory_preopen(
+            crate::DirectoryPreopen::new(
+                "/mnt/workspace/app",
+                "/",
+                crate::DirectoryAuthorityRights::READ | crate::DirectoryAuthorityRights::WRITE,
+            )
+            .expect("test preopen should be valid"),
+        );
+        let cwd = authority
+            .derive_directory_cap(
+                "/mnt/workspace/app",
+                "/",
+                crate::DirectoryAuthorityRights::READ,
+            )
+            .expect("cwd cap should derive from chroot root");
+        authority.chdir(cwd);
+
+        let (source, flags) = wasix_authority_resolve_absolute_guest_path(&authority, "/bin/tool")
+            .expect("guest path should resolve inside chroot root");
+
+        assert_eq!(source, "/mnt/workspace/app/bin/tool");
+        assert!(flags.contains(fs_types::DescriptorFlags::READ));
+        assert!(flags.contains(fs_types::DescriptorFlags::WRITE));
     }
 
     #[test]
