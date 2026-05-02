@@ -11024,20 +11024,13 @@ where
 }
 
 fn wasix_epoll_create<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-    ret_fd: u32,
+    _caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    _ret_fd: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
-    };
-    let status = p1_write_u32(caller, memory, ret_fd, 0);
-    if status != p1::errno::SUCCESS {
-        return status;
-    }
     p1::errno::NOTSUP
 }
 
