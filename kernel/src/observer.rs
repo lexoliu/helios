@@ -88,6 +88,52 @@ pub struct ProfileHistory {
     samples: Vec<FoldedProfileSample>,
 }
 
+struct ProfileStackParts<'a> {
+    prefix: &'a str,
+    suffix: &'a str,
+}
+
+trait ProfileStackInput {
+    fn matches(&self, stack: &str) -> bool;
+
+    fn into_string(self) -> String;
+}
+
+impl ProfileStackInput for String {
+    fn matches(&self, stack: &str) -> bool {
+        stack == self
+    }
+
+    fn into_string(self) -> String {
+        self
+    }
+}
+
+impl ProfileStackInput for &str {
+    fn matches(&self, stack: &str) -> bool {
+        stack == *self
+    }
+
+    fn into_string(self) -> String {
+        self.to_owned()
+    }
+}
+
+impl ProfileStackInput for ProfileStackParts<'_> {
+    fn matches(&self, stack: &str) -> bool {
+        stack.len() == self.prefix.len().saturating_add(self.suffix.len())
+            && stack.starts_with(self.prefix)
+            && stack[self.prefix.len()..] == *self.suffix
+    }
+
+    fn into_string(self) -> String {
+        let mut stack = String::with_capacity(self.prefix.len().saturating_add(self.suffix.len()));
+        stack.push_str(self.prefix);
+        stack.push_str(self.suffix);
+        stack
+    }
+}
+
 impl TraceHistory {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity != 0, "trace history capacity must be non-zero");
@@ -151,6 +197,21 @@ impl ProfileHistory {
     }
 
     pub fn record(&mut self, scope: ProfileScope, stack: String, weight: u64) {
+        self.record_input(scope, stack, weight);
+    }
+
+    pub fn record_str(&mut self, scope: ProfileScope, stack: &str, weight: u64) {
+        self.record_input(scope, stack, weight);
+    }
+
+    pub fn record_parts(&mut self, scope: ProfileScope, prefix: &str, suffix: &str, weight: u64) {
+        self.record_input(scope, ProfileStackParts { prefix, suffix }, weight);
+    }
+
+    fn record_input<Stack>(&mut self, scope: ProfileScope, stack: Stack, weight: u64)
+    where
+        Stack: ProfileStackInput,
+    {
         if weight == 0 {
             return;
         }
@@ -158,7 +219,7 @@ impl ProfileHistory {
         if let Some(sample) = self
             .samples
             .iter_mut()
-            .find(|sample| sample.scope == scope && sample.stack == stack)
+            .find(|sample| sample.scope == scope && stack.matches(&sample.stack))
         {
             sample.weight = sample.weight.saturating_add(weight);
             return;
@@ -180,7 +241,7 @@ impl ProfileHistory {
 
         self.samples.push(FoldedProfileSample {
             scope,
-            stack,
+            stack: stack.into_string(),
             weight,
         });
     }
@@ -346,8 +407,8 @@ mod tests {
     use alloc::vec;
 
     use super::{
-        TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceValue,
-        matches_trace_filter, parse_console_text,
+        ProfileFilter, ProfileHistory, ProfileScope, TraceEvent, TraceField, TraceFilter,
+        TraceHistory, TraceLevel, TraceValue, matches_trace_filter, parse_console_text,
     };
 
     #[test]
@@ -400,5 +461,45 @@ mod tests {
         };
 
         assert!(matches_trace_filter(&event, &filter));
+    }
+
+    #[test]
+    fn profile_history_aggregates_borrowed_stack_names() {
+        let mut history = ProfileHistory::new(4);
+        history.record_str(ProfileScope::Kernel, "kernel;executor;processor-0", 5);
+        history.record_str(ProfileScope::Kernel, "kernel;executor;processor-0", 7);
+
+        let samples = history.folded(
+            &ProfileFilter {
+                scope: Some(ProfileScope::Kernel),
+                stack_prefixes: vec![],
+            },
+            [],
+            4,
+        );
+
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].stack, "kernel;executor;processor-0");
+        assert_eq!(samples[0].weight, 12);
+    }
+
+    #[test]
+    fn profile_history_aggregates_stack_parts() {
+        let mut history = ProfileHistory::new(4);
+        history.record_parts(ProfileScope::User, "user;", "dash", 3);
+        history.record_parts(ProfileScope::User, "user;", "dash", 9);
+
+        let samples = history.folded(
+            &ProfileFilter {
+                scope: Some(ProfileScope::User),
+                stack_prefixes: vec!["user;".to_owned()],
+            },
+            [],
+            4,
+        );
+
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].stack, "user;dash");
+        assert_eq!(samples[0].weight, 12);
     }
 }

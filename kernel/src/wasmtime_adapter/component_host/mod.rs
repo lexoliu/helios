@@ -2,10 +2,10 @@ extern crate alloc;
 
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
-use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::fmt::{self, Write};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll};
@@ -57,6 +57,24 @@ const COMPONENT_PHASE_HEARTBEAT_INTERVAL_NANOS: u64 = 5_000_000_000;
 mod network;
 pub mod service;
 mod topology;
+
+struct SerialFmtWriter {
+    write_serial: fn(&[u8]),
+}
+
+impl Write for SerialFmtWriter {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        (self.write_serial)(text.as_bytes());
+        Ok(())
+    }
+}
+
+fn write_serial_fmt(write_serial: fn(&[u8]), arguments: fmt::Arguments<'_>) {
+    let mut writer = SerialFmtWriter { write_serial };
+    writer
+        .write_fmt(arguments)
+        .expect("serial formatting should not fail");
+}
 
 pub use network::{
     ComponentHostNetworkService, ComponentHostTcpStreamToken, ComponentHostUdpSocketToken,
@@ -118,8 +136,10 @@ fn spawn_component_phase_heartbeat<CpuImpl>(
                 if now >= next_heartbeat {
                     progress.record_progress();
                     let elapsed_ms = elapsed_millis(started_at, now);
-                    let message = format!("\n[KDBG {phase}-progress elapsed_ms={elapsed_ms}]\n");
-                    write_serial(message.as_bytes());
+                    write_serial_fmt(
+                        write_serial,
+                        format_args!("\n[KDBG {phase}-progress elapsed_ms={elapsed_ms}]\n"),
+                    );
                     next_heartbeat = now.saturating_add(COMPONENT_PHASE_HEARTBEAT_INTERVAL_NANOS);
                 }
 

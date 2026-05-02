@@ -151,6 +151,8 @@ mod tests {
         }
 
         fn record_profile_stack_nanos(&self, _: ProfileScope, _: String, _: u64) {}
+
+        fn record_profile_stack_parts_nanos(&self, _: ProfileScope, _: &str, _: &str, _: u64) {}
     }
 
     #[test]

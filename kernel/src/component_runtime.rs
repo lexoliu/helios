@@ -87,6 +87,14 @@ pub trait ComponentRuntimeState: Clone + Send + 'static {
         stack: String,
         weight_nanos: u64,
     );
+
+    fn record_profile_stack_parts_nanos(
+        &self,
+        scope: crate::ProfileScope,
+        prefix: &str,
+        suffix: &str,
+        weight_nanos: u64,
+    );
 }
 
 pub(crate) struct ComponentExecutionContext<FileSystem> {
@@ -389,12 +397,10 @@ where
         if let Some(elapsed) = elapsed
             && self.runtime_state.profiling_enabled()
         {
-            let mut stack = String::with_capacity(5 + self.instance().name().len());
-            stack.push_str("user;");
-            stack.push_str(self.instance().name());
-            self.runtime_state.record_profile_stack_nanos(
+            self.runtime_state.record_profile_stack_parts_nanos(
                 crate::ProfileScope::User,
-                stack,
+                "user;",
+                self.instance().name(),
                 elapsed,
             );
         }

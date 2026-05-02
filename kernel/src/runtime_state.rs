@@ -115,6 +115,31 @@ where
         self.inner.profiling.lock().record(scope, stack, weight);
     }
 
+    pub fn record_profile_stack_str(&self, scope: ProfileScope, stack: &str, weight_ticks: u64) {
+        if !self.inner.profiling_enabled.load(Ordering::Acquire) {
+            return;
+        }
+        let weight = self.ticks_to_nanos(weight_ticks);
+        self.inner.profiling.lock().record_str(scope, stack, weight);
+    }
+
+    pub fn record_profile_stack_parts(
+        &self,
+        scope: ProfileScope,
+        prefix: &str,
+        suffix: &str,
+        weight_ticks: u64,
+    ) {
+        if !self.inner.profiling_enabled.load(Ordering::Acquire) {
+            return;
+        }
+        let weight = self.ticks_to_nanos(weight_ticks);
+        self.inner
+            .profiling
+            .lock()
+            .record_parts(scope, prefix, suffix, weight);
+    }
+
     pub fn record_profile_stack_nanos(
         &self,
         scope: ProfileScope,
@@ -128,6 +153,37 @@ where
             .profiling
             .lock()
             .record(scope, stack, weight_nanos);
+    }
+
+    pub fn record_profile_stack_str_nanos(
+        &self,
+        scope: ProfileScope,
+        stack: &str,
+        weight_nanos: u64,
+    ) {
+        if !self.inner.profiling_enabled.load(Ordering::Acquire) {
+            return;
+        }
+        self.inner
+            .profiling
+            .lock()
+            .record_str(scope, stack, weight_nanos);
+    }
+
+    pub fn record_profile_stack_parts_nanos(
+        &self,
+        scope: ProfileScope,
+        prefix: &str,
+        suffix: &str,
+        weight_nanos: u64,
+    ) {
+        if !self.inner.profiling_enabled.load(Ordering::Acquire) {
+            return;
+        }
+        self.inner
+            .profiling
+            .lock()
+            .record_parts(scope, prefix, suffix, weight_nanos);
     }
 
     pub fn folded_profile(
@@ -256,6 +312,16 @@ where
         weight_nanos: u64,
     ) {
         RuntimeState::record_profile_stack_nanos(self, scope, stack, weight_nanos);
+    }
+
+    fn record_profile_stack_parts_nanos(
+        &self,
+        scope: ProfileScope,
+        prefix: &str,
+        suffix: &str,
+        weight_nanos: u64,
+    ) {
+        RuntimeState::record_profile_stack_parts_nanos(self, scope, prefix, suffix, weight_nanos);
     }
 }
 

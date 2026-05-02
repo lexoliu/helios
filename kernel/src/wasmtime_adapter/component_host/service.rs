@@ -41,6 +41,22 @@ const WASIX_ASYNCIFY_DATA_SIZE: u32 = 8;
 const WASIX_STACK_SNAPSHOT_SIZE: usize = 24;
 const WASIX_MODULE: &str = "wasix_32v1";
 
+fn system_component_profile_stack(component_name: &str) -> String {
+    let mut stack = String::with_capacity(
+        "kernel;system-component;".len() + component_name.len() + ";poll".len(),
+    );
+    stack.push_str("kernel;system-component;");
+    stack.push_str(component_name);
+    stack.push_str(";poll");
+    stack
+}
+
+fn kernel_processor_profile_stack(processor: u16) -> String {
+    let mut stack = String::from("kernel;executor;processor-");
+    write!(stack, "{processor}").expect("profile stack formatting should not fail");
+    stack
+}
+
 #[derive(Clone)]
 pub struct UserProgramService<CpuImpl, HostFs>
 where
@@ -602,7 +618,7 @@ where
         "launching embedded system component"
     );
     super::emit_stage_marker(write_serial, "component-host:run-local-begin");
-    let stack = format!("kernel;system-component;{component_name};poll");
+    let stack = system_component_profile_stack(component_name);
     kernel
         .run_local_future(ProfiledSystemComponentFuture::new(
             run_system_component(
@@ -620,8 +636,10 @@ where
             stack,
         ))
         .unwrap_or_else(|error| {
-            let message = alloc::format!("\n[KDBG error failed-system-component {error:#}]\n");
-            write_serial(message.as_bytes());
+            super::write_serial_fmt(
+                write_serial,
+                format_args!("\n[KDBG error failed-system-component {error:#}]\n"),
+            );
             panic!("failed to exec embedded system component:\n{error:#}");
         });
     super::emit_stage_marker(write_serial, "done");
@@ -678,9 +696,9 @@ where
         // SAFETY: `inner` has not been moved after `Self` was pinned.
         let result = unsafe { Pin::new_unchecked(&mut this.inner) }.poll(cx);
         if this.debug_state.profiling_enabled() {
-            this.debug_state.record_profile_stack(
+            this.debug_state.record_profile_stack_str(
                 ProfileScope::Kernel,
-                this.stack.clone(),
+                &this.stack,
                 this.cpu.now().ticks().saturating_sub(started),
             );
         }
@@ -749,13 +767,13 @@ where
     WatchdogImpl: Watchdog + Clone,
 {
     let processor = cpu.current_processor().id();
-    let stack = format!("kernel;executor;processor-{processor}");
+    let stack = kernel_processor_profile_stack(processor);
     loop {
         let started = cpu.now().ticks();
         let progress = kernel.run_until_stalled();
         let elapsed = cpu.now().ticks().saturating_sub(started);
         if progress != 0 && debug_state.profiling_enabled() {
-            debug_state.record_profile_stack(ProfileScope::Kernel, stack.clone(), elapsed);
+            debug_state.record_profile_stack_str(ProfileScope::Kernel, &stack, elapsed);
         }
         if progress != 0 {
             continue;
@@ -1705,9 +1723,10 @@ where
         if let Some(elapsed) = elapsed
             && self.runtime_state.profiling_enabled()
         {
-            self.runtime_state.record_profile_stack_nanos(
+            self.runtime_state.record_profile_stack_parts_nanos(
                 crate::ProfileScope::User,
-                format!("user;{}", self.instance.name()),
+                "user;",
+                self.instance.name(),
                 elapsed,
             );
         }
@@ -2363,9 +2382,10 @@ where
 
     fn record_user_ticks(&self, ticks: u64) {
         if self.runtime_state.profiling_enabled() {
-            self.runtime_state.record_profile_stack(
+            self.runtime_state.record_profile_stack_parts(
                 ProfileScope::User,
-                format!("user;{}", self.instance.name()),
+                "user;",
+                self.instance.name(),
                 ticks,
             );
         }
