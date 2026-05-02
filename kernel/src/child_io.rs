@@ -152,6 +152,26 @@ impl ByteReader {
         }
     }
 
+    pub fn is_readable(&self) -> bool {
+        !self.channel.queue.is_empty() || self.channel.writer_closed.load(Ordering::Acquire)
+    }
+
+    pub fn poll_readable(
+        &self,
+        cx: &mut core::task::Context<'_>,
+        wait: &mut ByteReadWait,
+    ) -> core::task::Poll<()> {
+        loop {
+            if self.is_readable() {
+                return core::task::Poll::Ready(());
+            }
+            match self.channel.readable.poll_notified(cx, &mut wait.readable) {
+                core::task::Poll::Ready(()) => continue,
+                core::task::Poll::Pending => return core::task::Poll::Pending,
+            }
+        }
+    }
+
     /// Await the next chunk. Returns `None` when every writer has been
     /// dropped and the queue is drained (EOF).
     pub async fn read(&self) -> Option<Bytes> {
@@ -253,5 +273,25 @@ mod tests {
         .expect("queued bytes should be delivered before EOF");
 
         assert_eq!(received.as_ref(), b"poll");
+    }
+
+    #[test]
+    fn byte_channel_reports_readability_for_data_and_eof() {
+        let (writer, reader) = byte_channel();
+
+        assert!(!reader.is_readable());
+        writer
+            .write(Bytes::from_static(b"ready"))
+            .expect("reader is still open");
+        assert!(reader.is_readable());
+
+        let received = futures_lite::future::block_on(reader.read())
+            .expect("queued bytes should be delivered before EOF");
+        assert_eq!(received.as_ref(), b"ready");
+        assert!(!reader.is_readable());
+
+        drop(writer);
+        assert!(reader.is_readable());
+        assert!(futures_lite::future::block_on(reader.read()).is_none());
     }
 }

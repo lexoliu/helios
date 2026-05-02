@@ -447,6 +447,26 @@ struct EpollUserData {
     data2: u64,
 }
 
+enum EpollWaitTarget {
+    ByteReader {
+        reader: crate::ByteReader,
+        wait: crate::ByteReadWait,
+    },
+    Event {
+        event: EventFd,
+        wait: crate::NotifyWaiter,
+    },
+}
+
+impl EpollWaitTarget {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        match self {
+            Self::ByteReader { reader, wait } => reader.poll_readable(cx, wait),
+            Self::Event { event, wait } => event.poll_readable(cx, wait),
+        }
+    }
+}
+
 #[derive(Clone)]
 enum WasixSocketDescriptor {
     Tcp(WasixTcpSocket),
@@ -2590,6 +2610,26 @@ impl EventFd {
         drop(state);
         self.notify.notify_all();
         Ok(())
+    }
+
+    fn is_readable(&self) -> bool {
+        self.state.lock().value != 0
+    }
+
+    fn wait_state(&self) -> crate::NotifyWaiter {
+        self.notify.waiter()
+    }
+
+    fn poll_readable(&self, cx: &mut Context<'_>, wait: &mut crate::NotifyWaiter) -> Poll<()> {
+        loop {
+            if self.is_readable() {
+                return Poll::Ready(());
+            }
+            match self.notify.poll_notified(cx, wait) {
+                Poll::Ready(()) => continue,
+                Poll::Pending => return Poll::Pending,
+            }
+        }
     }
 
     async fn read(&self) -> u64 {
@@ -11272,22 +11312,17 @@ where
         None => return p1::errno::BADF,
     }
     let mut ready = wasix_collect_epoll_events(caller, epfd, maxevents);
-    if timeout > 0 {
-        caller
-            .data()
-            .timer
-            .sleep_for(Duration::from_nanos(timeout as u64))
-            .await;
-        ready = wasix_collect_epoll_events(caller, epfd, maxevents);
-    } else if timeout < 0 {
-        while ready.is_empty() {
-            caller
-                .data()
-                .timer
-                .sleep_for(Duration::from_millis(1))
-                .await;
-            ready = wasix_collect_epoll_events(caller, epfd, maxevents);
+    if ready.is_empty() && timeout != 0 {
+        let targets = match wasix_epoll_wait_targets(caller, epfd) {
+            Ok(targets) => targets,
+            Err(errno) => return errno,
+        };
+        if let Err(errno) =
+            wasix_wait_epoll_readiness(caller.data().timer.clone(), targets, timeout).await
+        {
+            return errno;
         }
+        ready = wasix_collect_epoll_events(caller, epfd, maxevents);
     }
     for (index, event) in ready.iter().enumerate() {
         let offset = match (index as u32).checked_mul(WASIX_EPOLL_EVENT_SIZE) {
@@ -11308,6 +11343,94 @@ where
         Err(_) => return p1::errno::OVERFLOW,
     };
     p1_write_u32(caller, memory, ret_nevents, returned)
+}
+
+async fn wasix_wait_epoll_readiness<CpuImpl>(
+    timer: crate::Timer<CpuImpl>,
+    mut targets: Vec<EpollWaitTarget>,
+    timeout: i64,
+) -> Result<(), i32>
+where
+    CpuImpl: Cpu + Clone,
+{
+    if timeout < 0 {
+        if targets.is_empty() {
+            return Err(p1::errno::NOTSUP);
+        }
+        core::future::poll_fn(|cx| poll_epoll_wait_targets(&mut targets, cx)).await;
+        return Ok(());
+    }
+
+    let mut timer = core::pin::pin!(timer.sleep_for(Duration::from_nanos(timeout as u64)));
+    if targets.is_empty() {
+        timer.await;
+        return Ok(());
+    }
+    core::future::poll_fn(|cx| {
+        if poll_epoll_wait_targets(&mut targets, cx).is_ready() {
+            return Poll::Ready(());
+        }
+        if timer.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(());
+        }
+        Poll::Pending
+    })
+    .await;
+    Ok(())
+}
+
+fn poll_epoll_wait_targets(targets: &mut [EpollWaitTarget], cx: &mut Context<'_>) -> Poll<()> {
+    for target in targets {
+        if target.poll(cx).is_ready() {
+            return Poll::Ready(());
+        }
+    }
+    Poll::Pending
+}
+
+fn wasix_epoll_wait_targets<CpuImpl, HostFs>(
+    caller: &Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    epfd: i32,
+) -> Result<Vec<EpollWaitTarget>, i32>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let interests = match caller.data().descriptors.get(epfd) {
+        Some(Preview1Descriptor::Epoll(epoll)) => epoll.interests.clone(),
+        Some(_) => return Err(p1::errno::INVAL),
+        None => return Err(p1::errno::BADF),
+    };
+    let mut targets = Vec::new();
+    for interest in interests {
+        if interest.events & WASIX_EPOLL_TYPE_EPOLLIN == 0 {
+            continue;
+        }
+        match caller.data().descriptors.get(interest.fd) {
+            Some(Preview1Descriptor::PipeRead { reader, carry }) if carry.is_empty() => {
+                targets.push(EpollWaitTarget::ByteReader {
+                    reader: reader.clone(),
+                    wait: reader.wait_state(),
+                });
+            }
+            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
+                reader, carry, ..
+            })) if carry.is_empty() => {
+                targets.push(EpollWaitTarget::ByteReader {
+                    reader: reader.clone(),
+                    wait: reader.wait_state(),
+                });
+            }
+            Some(Preview1Descriptor::Event(event)) if !event.is_readable() => {
+                targets.push(EpollWaitTarget::Event {
+                    event: event.clone(),
+                    wait: event.wait_state(),
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(targets)
 }
 
 fn wasix_read_epoll_event<T>(
@@ -12535,11 +12658,25 @@ fn p1_directory_descriptor(descriptor: Option<&Preview1Descriptor>) -> Option<&F
 fn p1_poll_descriptor(descriptor: Option<&Preview1Descriptor>, event_type: u8) -> Result<u64, i32> {
     match (descriptor, event_type) {
         (Some(Preview1Descriptor::Stdin { carry }), P1_EVENTTYPE_FD_READ) => Ok(carry.len() as u64),
-        (Some(Preview1Descriptor::PipeRead { carry, .. }), P1_EVENTTYPE_FD_READ) => {
-            Ok(carry.len() as u64)
+        (Some(Preview1Descriptor::PipeRead { reader, carry }), P1_EVENTTYPE_FD_READ) => {
+            if carry.is_empty() {
+                Ok(u64::from(reader.is_readable()))
+            } else {
+                Ok(carry.len() as u64)
+            }
         }
         (Some(Preview1Descriptor::Event(event)), P1_EVENTTYPE_FD_READ) => {
-            Ok(u64::from(event.state.lock().value != 0) * 8)
+            Ok(u64::from(event.is_readable()) * 8)
+        }
+        (
+            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { reader, carry, .. })),
+            P1_EVENTTYPE_FD_READ,
+        ) => {
+            if carry.is_empty() {
+                Ok(u64::from(reader.is_readable()))
+            } else {
+                Ok(carry.len() as u64)
+            }
         }
         (Some(Preview1Descriptor::Stdout), P1_EVENTTYPE_FD_WRITE)
         | (Some(Preview1Descriptor::Stderr), P1_EVENTTYPE_FD_WRITE)
@@ -13365,6 +13502,43 @@ mod tests {
         assert_eq!(
             wasix_epoll_ready_mask(Some(&empty_event), WASIX_EPOLL_TYPE_EPOLLIN),
             0
+        );
+
+        let (pipe_writer, pipe_reader) = crate::byte_channel();
+        let pipe = Preview1Descriptor::PipeRead {
+            reader: pipe_reader,
+            carry: Bytes::new(),
+        };
+        assert_eq!(
+            wasix_epoll_ready_mask(Some(&pipe), WASIX_EPOLL_TYPE_EPOLLIN),
+            0
+        );
+        pipe_writer
+            .write(Bytes::from_static(b"pipe"))
+            .expect("pipe reader is still open");
+        assert_eq!(
+            wasix_epoll_ready_mask(Some(&pipe), WASIX_EPOLL_TYPE_EPOLLIN),
+            WASIX_EPOLL_TYPE_EPOLLIN
+        );
+
+        let (pair_writer, pair_reader) = crate::byte_channel();
+        let pair = Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
+            reader: pair_reader,
+            writer: pair_writer.clone(),
+            carry: Bytes::new(),
+            options: WasixSocketOptions::default(),
+            socket_type: WASIX_SOCK_TYPE_STREAM,
+        });
+        assert_eq!(
+            wasix_epoll_ready_mask(Some(&pair), WASIX_EPOLL_TYPE_EPOLLIN),
+            0
+        );
+        pair_writer
+            .write(Bytes::from_static(b"pair"))
+            .expect("socket-pair reader is still open");
+        assert_eq!(
+            wasix_epoll_ready_mask(Some(&pair), WASIX_EPOLL_TYPE_EPOLLIN),
+            WASIX_EPOLL_TYPE_EPOLLIN
         );
 
         assert_eq!(
