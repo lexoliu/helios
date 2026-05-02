@@ -1303,6 +1303,25 @@ mod tests {
         fs::remove_dir_all(root).expect("test temp dir must be removed");
     }
 
+    #[test]
+    fn checked_in_external_artifacts_have_matching_provenance() {
+        let manifest = workspace_path(Path::new(DEFAULT_BOOT_ARTIFACTS_MANIFEST));
+        let artifacts =
+            read_external_boot_artifacts(&manifest).expect("checked-in manifest must parse");
+        assert!(
+            !artifacts.is_empty(),
+            "checked-in boot artifact manifest must declare external artifacts"
+        );
+        for artifact in artifacts {
+            validate_external_boot_artifact_provenance(&artifact).unwrap_or_else(|error| {
+                panic!(
+                    "checked-in artifact {} has invalid provenance: {error:#}",
+                    artifact.command
+                )
+            });
+        }
+    }
+
     fn test_artifact(
         command: &str,
         package: &str,

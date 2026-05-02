@@ -58,6 +58,9 @@ coreutils_source_url="${COREUTILS_SOURCE_URL:-https://wasmer.io/wasmer/coreutils
 coreutils_webc_url="${COREUTILS_WEBC_URL:-https://cdn.wasmer.io/webcimages/6b2fd4494bd198f60859987608a7633f807a05147e4d8398ec061639d047ce75.webc}"
 coreutils_webc_sha256="${COREUTILS_WEBC_SHA256:-6b2fd4494bd198f60859987608a7633f807a05147e4d8398ec061639d047ce75}"
 coreutils_wasm_sha256="${COREUTILS_WASM_SHA256:-586489a3aca13cb69855f9f92e655acdb1598934b24ceb9450628d0ab34d0b95}"
+curl_package="${HELIOS_CURL_PACKAGE:-helios-curl-wasi}"
+curl_version="${HELIOS_CURL_VERSION:-0.1.0}"
+curl_source_url="${HELIOS_CURL_SOURCE_URL:-tools/wasi-apps/curl}"
 
 staging="$(mktemp -d)"
 trap 'rm -rf "$staging"' EXIT
@@ -261,6 +264,13 @@ cp -f \
   "$repo_root/tools/wasi-apps/curl/target/wasm32-wasip2/debug/helios_curl_wasi.wasm" \
   "$out_dir/curl.wasm"
 sha256sum "$out_dir/curl.wasm" > "$out_dir/curl.wasm.sha256"
+curl_wasm_sha256="$(sha256_hex "$out_dir/curl.wasm")"
+write_source_record \
+  "$out_dir/SOURCE.txt" \
+  "$curl_package" \
+  "$curl_version" \
+  "$curl_source_url" \
+  "$curl_wasm_sha256"
 
 wasm-tools strip "$out_dir/curl.wasm" -o "$out_dir/curl-stripped.wasm"
 sha256sum "$out_dir/curl-stripped.wasm" > "$out_dir/curl-stripped.wasm.sha256"

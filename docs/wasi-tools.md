@@ -58,6 +58,7 @@ Artifacts produced:
 - `artifacts/wasix/coreutils/coreutils.wasm.sha256`
 - `artifacts/wasix/coreutils/SOURCE.txt`
 - `artifacts/wasi-tools/curl.wasm`
+- `artifacts/wasi-tools/SOURCE.txt`
 - `artifacts/wasi-tools/curl-stripped.wasm`
 
 The CPython download requires network. To re-stage in an offline
