@@ -50,6 +50,7 @@ const WASIX_IPPROTO_TCP: u64 = 6;
 const WASIX_IPPROTO_UDP: u64 = 17;
 const WASIX_IPPROTO_TCP_I32: i32 = 6;
 const WASIX_IPPROTO_UDP_I32: i32 = 17;
+const DEFAULT_WASIX_EXEC_SEARCH_PATHS: &[&str] = &["/usr/local/bin", "/bin", "/usr/bin"];
 
 fn system_component_profile_stack(component_name: &str) -> String {
     let mut stack = String::with_capacity(
@@ -314,6 +315,11 @@ struct WasixPreparedProgram {
     guest_name: String,
     source_path: String,
     source: ProgramSource,
+}
+
+enum WasixExecSearchPath<'a> {
+    Default,
+    Guest(&'a str),
 }
 
 struct CoreModuleRestore {
@@ -9101,14 +9107,27 @@ where
         }));
     };
     let prepared = wasix_prepare_program(caller, memory, name, name_len).await?;
-    let guest_name = prepared.guest_name;
-    let source_path = prepared.source_path;
+    wasix_exec_prepared_program(caller, memory, prepared, args, args_len, env).await
+}
+
+async fn wasix_exec_prepared_program<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    memory: Preview1Memory,
+    prepared: WasixPreparedProgram,
+    args: u32,
+    args_len: u32,
+    env: Option<(u32, u32)>,
+) -> wasmtime::Result<()>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
     let mut argv = wasix_read_exec_string(caller, memory, args, args_len)
         .map(|value| wasix_split_lines(&value))
         .unwrap_or_default();
     if argv
         .first()
-        .is_some_and(|arg| arg == &guest_name || arg == &source_path)
+        .is_some_and(|arg| arg == &prepared.guest_name || arg == &prepared.source_path)
     {
         argv.remove(0);
     }
@@ -9135,7 +9154,7 @@ where
     let result = service
         .exec_buffered_with_snapshot_and_descriptors(
             exec_context,
-            guest_name,
+            prepared.guest_name,
             argv,
             environment,
             prepared.source,
@@ -9182,12 +9201,61 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    if search_path != 0 || path != 0 || path_len != 0 {
-        return Ok(p1::errno::NOTSUP);
+    wasix_proc_exec_with_search(
+        caller,
+        name,
+        name_len,
+        args,
+        args_len,
+        Some((env, env_len)),
+        search_path,
+        path,
+        path_len,
+    )
+    .await
+    .map(|()| p1::errno::SUCCESS)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wasix_proc_exec_with_search<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    name: u32,
+    name_len: u32,
+    args: u32,
+    args_len: u32,
+    env: Option<(u32, u32)>,
+    search_path: i32,
+    path: u32,
+    path_len: u32,
+) -> wasmtime::Result<()>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let status = caller.data().require_exec_authority();
+    if status != p1::errno::SUCCESS {
+        return Err(wasmtime::Error::new(ProgramExecError {
+            kind: ProgramExecErrorKind::PermissionDenied,
+            detail: ProgramExecErrorDetail::ProcessAuthorityDenied,
+        }));
     }
-    wasix_proc_exec(caller, name, name_len, args, args_len, Some((env, env_len)))
-        .await
-        .map(|()| p1::errno::SUCCESS)
+    let Some(memory) = p1_memory(caller) else {
+        return Err(wasmtime::Error::new(ProgramExecError {
+            kind: ProgramExecErrorKind::InvalidBinary,
+            detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
+        }));
+    };
+    let prepared = wasix_prepare_program_with_search(
+        caller,
+        memory,
+        name,
+        name_len,
+        search_path,
+        path,
+        path_len,
+    )
+    .await?;
+    wasix_exec_prepared_program(caller, memory, prepared, args, args_len, env).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9291,14 +9359,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    if fd_ops != 0
-        || fd_ops_len != 0
-        || signals != 0
-        || signals_len != 0
-        || search_path != 0
-        || path != 0
-        || path_len != 0
-    {
+    if fd_ops != 0 || fd_ops_len != 0 || signals != 0 || signals_len != 0 {
         return p1::errno::NOTSUP;
     }
     let argv = match wasix_read_exec_string(caller, memory, args, args_len) {
@@ -9313,7 +9374,17 @@ where
             Err(_) => return p1::errno::FAULT,
         }
     };
-    let prepared = match wasix_prepare_program(caller, memory, name, name_len).await {
+    let prepared = match wasix_prepare_program_with_search(
+        caller,
+        memory,
+        name,
+        name_len,
+        search_path,
+        path,
+        path_len,
+    )
+    .await
+    {
         Ok(prepared) => prepared,
         Err(error) => return p1_errno_from_wasmtime_error(&error),
     };
@@ -9472,7 +9543,147 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    let (guest_name, source_path) = wasix_resolve_exec_path(caller, memory, name, name_len)?;
+    let name =
+        wasix_read_exec_string(caller, memory, name, name_len).map_err(wasmtime::Error::new)?;
+    wasix_prepare_program_from_name(caller, &name).await
+}
+
+async fn wasix_prepare_program_with_search<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    memory: Preview1Memory,
+    name: u32,
+    name_len: u32,
+    search_path: i32,
+    path: u32,
+    path_len: u32,
+) -> wasmtime::Result<WasixPreparedProgram>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let name =
+        wasix_read_exec_string(caller, memory, name, name_len).map_err(wasmtime::Error::new)?;
+    let search_path = match search_path {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(wasmtime::Error::new(ProgramExecError {
+                kind: ProgramExecErrorKind::InvalidPath,
+                detail: ProgramExecErrorDetail::InvalidProgramPath,
+            }));
+        }
+    };
+    if !search_path || name.contains('/') {
+        return wasix_prepare_program_from_name(caller, &name).await;
+    }
+
+    if path == 0 && path_len == 0 {
+        return wasix_prepare_program_from_search_paths(
+            caller,
+            &name,
+            WasixExecSearchPath::Default,
+        )
+        .await;
+    }
+
+    let path =
+        wasix_read_exec_string(caller, memory, path, path_len).map_err(wasmtime::Error::new)?;
+    wasix_prepare_program_from_search_paths(caller, &name, WasixExecSearchPath::Guest(&path)).await
+}
+
+async fn wasix_prepare_program_from_search_paths<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    name: &str,
+    search_path: WasixExecSearchPath<'_>,
+) -> wasmtime::Result<WasixPreparedProgram>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    match search_path {
+        WasixExecSearchPath::Default => {
+            for directory in DEFAULT_WASIX_EXEC_SEARCH_PATHS {
+                if let Some(prepared) =
+                    wasix_prepare_program_from_search_directory(caller, name, directory).await
+                {
+                    return Ok(prepared);
+                }
+            }
+        }
+        WasixExecSearchPath::Guest(path) => {
+            for directory in path.split(':') {
+                if let Some(prepared) =
+                    wasix_prepare_program_from_search_directory(caller, name, directory).await
+                {
+                    return Ok(prepared);
+                }
+            }
+        }
+    }
+
+    Err(wasmtime::Error::new(ProgramExecError {
+        kind: ProgramExecErrorKind::MissingEntry,
+        detail: ProgramExecErrorDetail::MissingArtifactPayload,
+    }))
+}
+
+async fn wasix_prepare_program_from_search_directory<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    name: &str,
+    directory: &str,
+) -> Option<WasixPreparedProgram>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let cwd = caller
+        .data()
+        .cwd
+        .as_ref()
+        .map(|cwd| cwd.guest_name.as_str());
+    let candidate = wasix_search_path_candidate(cwd, directory, name)?;
+    wasix_prepare_program_from_guest_name(caller, candidate)
+        .await
+        .ok()
+}
+
+async fn wasix_prepare_program_from_name<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    name: &str,
+) -> wasmtime::Result<WasixPreparedProgram>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let guest_name = wasix_resolve_exec_guest_name(caller.data(), name)?;
+    wasix_prepare_program_from_guest_name(caller, guest_name).await
+}
+
+async fn wasix_prepare_program_from_guest_name<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    guest_name: String,
+) -> wasmtime::Result<WasixPreparedProgram>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let source_path = wasix_resolve_exec_source_path(caller.data(), &guest_name)?;
+    let source = wasix_read_program_source(caller, &source_path).await?;
+    Ok(WasixPreparedProgram {
+        guest_name,
+        source_path,
+        source,
+    })
+}
+
+async fn wasix_read_program_source<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    source_path: &str,
+) -> wasmtime::Result<ProgramSource>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
     let host_path = crate::guest_host_share_path(&source_path).map(ToOwned::to_owned);
     let source_is_host = host_path.is_some();
     let source = if let Some(host_path) = host_path {
@@ -9517,11 +9728,72 @@ where
     } else {
         ProgramSource::RawWasm(source)
     };
-    Ok(WasixPreparedProgram {
-        guest_name,
-        source_path,
-        source,
+    Ok(source)
+}
+
+fn wasix_resolve_exec_guest_name<CpuImpl, HostFs>(
+    store: &Preview1ProgramStore<CpuImpl, HostFs>,
+    name: &str,
+) -> wasmtime::Result<String>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    if name.starts_with('/') {
+        return crate::resolve_absolute_path(name).map_err(|_| {
+            wasmtime::Error::new(ProgramExecError {
+                kind: ProgramExecErrorKind::InvalidPath,
+                detail: ProgramExecErrorDetail::InvalidProgramPath,
+            })
+        });
+    }
+
+    let Some(cwd) = store.cwd.as_ref() else {
+        return Err(wasmtime::Error::new(ProgramExecError {
+            kind: ProgramExecErrorKind::PermissionDenied,
+            detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
+        }));
+    };
+    crate::resolve_child_path(&cwd.guest_name, name).map_err(|_| {
+        wasmtime::Error::new(ProgramExecError {
+            kind: ProgramExecErrorKind::InvalidPath,
+            detail: ProgramExecErrorDetail::InvalidProgramPath,
+        })
     })
+}
+
+fn wasix_resolve_exec_source_path<CpuImpl, HostFs>(
+    store: &Preview1ProgramStore<CpuImpl, HostFs>,
+    guest_name: &str,
+) -> wasmtime::Result<String>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let (path, _) = store.resolve_absolute_guest_path(guest_name).map_err(|_| {
+        wasmtime::Error::new(ProgramExecError {
+            kind: ProgramExecErrorKind::PermissionDenied,
+            detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
+        })
+    })?;
+    if !store.authority.can_load_program(&path) {
+        return Err(wasmtime::Error::new(ProgramExecError {
+            kind: ProgramExecErrorKind::PermissionDenied,
+            detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
+        }));
+    }
+    Ok(path)
+}
+
+fn wasix_search_path_candidate(cwd: Option<&str>, directory: &str, name: &str) -> Option<String> {
+    let directory = if directory.is_empty() {
+        cwd?.to_owned()
+    } else if directory.starts_with('/') {
+        crate::resolve_absolute_path(directory).ok()?
+    } else {
+        crate::resolve_child_path(cwd?, directory).ok()?
+    };
+    crate::resolve_child_path(&directory, name).ok()
 }
 
 async fn wasix_spawn_child<CpuImpl, HostFs>(
@@ -9807,57 +10079,6 @@ fn p1_errno_from_program_exec_error(error: &ProgramExecError) -> i32 {
         ProgramExecErrorKind::Unavailable => p1::errno::NOTSUP,
         ProgramExecErrorKind::Internal => p1::errno::IO,
     }
-}
-
-fn wasix_resolve_exec_path<CpuImpl, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-    memory: Preview1Memory,
-    name: u32,
-    name_len: u32,
-) -> wasmtime::Result<(String, String)>
-where
-    CpuImpl: Cpu + Clone,
-    HostFs: crate::HostFileSystem,
-{
-    let name =
-        wasix_read_exec_string(caller, memory, name, name_len).map_err(wasmtime::Error::new)?;
-    let guest_name = if name.starts_with('/') {
-        crate::resolve_absolute_path(&name).map_err(|_| {
-            wasmtime::Error::new(ProgramExecError {
-                kind: ProgramExecErrorKind::InvalidPath,
-                detail: ProgramExecErrorDetail::InvalidProgramPath,
-            })
-        })?
-    } else {
-        let Some(cwd) = caller.data().cwd.as_ref() else {
-            return Err(wasmtime::Error::new(ProgramExecError {
-                kind: ProgramExecErrorKind::PermissionDenied,
-                detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
-            }));
-        };
-        crate::resolve_child_path(&cwd.guest_name, &name).map_err(|_| {
-            wasmtime::Error::new(ProgramExecError {
-                kind: ProgramExecErrorKind::InvalidPath,
-                detail: ProgramExecErrorDetail::InvalidProgramPath,
-            })
-        })?
-    };
-    let (path, _) = caller
-        .data()
-        .resolve_absolute_guest_path(&guest_name)
-        .map_err(|_| {
-            wasmtime::Error::new(ProgramExecError {
-                kind: ProgramExecErrorKind::PermissionDenied,
-                detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
-            })
-        })?;
-    if !caller.data().authority.can_load_program(&path) {
-        return Err(wasmtime::Error::new(ProgramExecError {
-            kind: ProgramExecErrorKind::PermissionDenied,
-            detail: ProgramExecErrorDetail::ProgramSourceNotGranted,
-        }));
-    }
-    Ok((guest_name, path))
 }
 
 fn wasix_read_exec_string<T>(
@@ -13811,6 +14032,31 @@ mod tests {
     fn wasix_getcwd_reports_path_length_without_trailing_nul() {
         assert_eq!(wasix_getcwd_required_len("/"), Ok(1));
         assert_eq!(wasix_getcwd_required_len("/tmp/work"), Ok(9));
+    }
+
+    #[test]
+    fn wasix_exec_search_path_builds_confined_candidates() {
+        assert_eq!(
+            wasix_search_path_candidate(Some("/work"), "/bin", "dash"),
+            Some(String::from("/bin/dash"))
+        );
+        assert_eq!(
+            wasix_search_path_candidate(Some("/work"), "tools", "qjs"),
+            Some(String::from("/work/tools/qjs"))
+        );
+        assert_eq!(
+            wasix_search_path_candidate(Some("/work"), "", "local"),
+            Some(String::from("/work/local"))
+        );
+        assert_eq!(
+            wasix_search_path_candidate(Some("/work"), "../escape", "bad"),
+            None
+        );
+        assert_eq!(
+            wasix_search_path_candidate(Some("/work"), "/bin", "../bad"),
+            None
+        );
+        assert_eq!(wasix_search_path_candidate(None, "bin", "dash"), None);
     }
 
     #[test]
