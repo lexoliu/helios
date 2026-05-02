@@ -166,6 +166,7 @@ struct ProgramSpawnRequest {
     authority: ProcessAuthority,
     filesystem: Option<DebugFileSystemSnapshot>,
     descriptors: Option<Preview1DescriptorTable>,
+    signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
 }
 
@@ -284,12 +285,14 @@ where
 
 struct WasixChildProcess {
     pid: u32,
+    signal_state: WasixSignalState,
     exit: Option<futures::channel::oneshot::Receiver<Result<ChildExit, ProgramExecError>>>,
     completed: Option<u32>,
 }
 
 struct WasixThread {
     tid: u32,
+    signal_state: WasixSignalState,
     exit: Option<futures::channel::oneshot::Receiver<u32>>,
     completed: Option<u32>,
 }
@@ -822,6 +825,7 @@ struct Preview1Exit;
 /// direct Rust callers. WIT `child` resources wrap one of these.
 pub struct ChildHandle {
     pub instance_id: crate::InstanceId,
+    signal_state: WasixSignalState,
     stdin: Option<crate::ByteWriter>,
     stdout: Option<crate::ByteReader>,
     stderr: Option<crate::ByteReader>,
@@ -829,6 +833,10 @@ pub struct ChildHandle {
 }
 
 impl ChildHandle {
+    fn signal_state(&self) -> WasixSignalState {
+        self.signal_state.clone()
+    }
+
     /// Take the writer end of the child's stdin. Dropping it delivers
     /// EOF to the child.
     pub fn take_stdin(&mut self) -> Option<crate::ByteWriter> {
@@ -1273,6 +1281,7 @@ where
             "{HELIOS_PROCESS_ID_ENV} is reserved for the kernel program launcher"
         );
         env.push((HELIOS_PROCESS_ID_ENV.into(), instance_id.raw().to_string()));
+        let signal_state = WasixSignalState::new();
         let request = ProgramSpawnRequest {
             name,
             args,
@@ -1280,6 +1289,7 @@ where
             authority,
             filesystem,
             descriptors,
+            signal_state: signal_state.clone(),
             signal_dispositions,
         };
 
@@ -1299,6 +1309,7 @@ where
                 request.authority,
                 request.filesystem,
                 request.descriptors,
+                request.signal_state,
                 request.signal_dispositions,
                 run_spawner,
                 progress,
@@ -1316,6 +1327,7 @@ where
 
         let child = ChildHandle {
             instance_id,
+            signal_state,
             stdin: Some(stdin_writer),
             stdout: Some(stdout_reader),
             stderr: Some(stderr_reader),
@@ -2022,6 +2034,7 @@ where
         imported_memory: Option<SharedMemory>,
         filesystem: Option<DebugFileSystemSnapshot>,
         descriptors: Option<Preview1DescriptorTable>,
+        signal_state: WasixSignalState,
         signal_dispositions: Vec<WasixSignalDisposition>,
         current_core_module: Option<Arc<WasmtimeCompiledCoreModule>>,
         wasix_abi: bool,
@@ -2060,7 +2073,7 @@ where
             authority,
             tty_state,
             signal_callback: None,
-            signal_state: WasixSignalState::new(),
+            signal_state,
             signal_dispositions,
             descriptors,
             asyncify: WasixAsyncifyState::new(),
@@ -2300,10 +2313,12 @@ where
     fn insert_child(
         &mut self,
         pid: u32,
+        signal_state: WasixSignalState,
         exit: futures::channel::oneshot::Receiver<Result<ChildExit, ProgramExecError>>,
     ) {
         self.children.push(WasixChildProcess {
             pid,
+            signal_state,
             exit: Some(exit),
             completed: None,
         });
@@ -2354,9 +2369,15 @@ where
         }
     }
 
-    fn insert_thread(&mut self, tid: u32, exit: futures::channel::oneshot::Receiver<u32>) {
+    fn insert_thread(
+        &mut self,
+        tid: u32,
+        signal_state: WasixSignalState,
+        exit: futures::channel::oneshot::Receiver<u32>,
+    ) {
         self.threads.push(WasixThread {
             tid,
+            signal_state,
             exit: Some(exit),
             completed: None,
         });
@@ -4475,6 +4496,7 @@ async fn run_program_executable<CpuImpl, HostFs>(
     authority: ProcessAuthority,
     filesystem: Option<DebugFileSystemSnapshot>,
     descriptors: Option<Preview1DescriptorTable>,
+    signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
     spawner: crate::Spawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
@@ -4499,6 +4521,7 @@ where
                 env,
                 authority,
                 filesystem,
+                signal_state,
                 spawner,
                 progress,
                 compiled,
@@ -4520,6 +4543,7 @@ where
                 authority,
                 filesystem,
                 descriptors,
+                signal_state,
                 signal_dispositions,
                 spawner,
                 progress,
@@ -4540,6 +4564,7 @@ where
                 env,
                 authority,
                 filesystem,
+                signal_state,
                 spawner,
                 progress,
                 compiled,
@@ -4564,6 +4589,7 @@ async fn run_program_core_module<CpuImpl, HostFs>(
     authority: ProcessAuthority,
     filesystem: Option<DebugFileSystemSnapshot>,
     descriptors: Option<Preview1DescriptorTable>,
+    signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
     spawner: crate::Spawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
@@ -4608,6 +4634,7 @@ where
             imported_memory.clone(),
             filesystem,
             descriptors,
+            signal_state,
             signal_dispositions,
             Some(compiled.clone()),
             wasix_abi,
@@ -4681,6 +4708,7 @@ async fn run_program_core_module_with_restore<CpuImpl, HostFs>(
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
     filesystem: Option<DebugFileSystemSnapshot>,
+    signal_state: WasixSignalState,
     spawner: crate::Spawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
     compiled: Arc<WasmtimeCompiledCoreModule>,
@@ -4725,6 +4753,7 @@ where
             imported_memory.clone(),
             filesystem,
             Some(restore.descriptors),
+            signal_state,
             restore.signal_dispositions,
             Some(compiled.clone()),
             wasix_abi,
@@ -4813,6 +4842,7 @@ async fn run_program_component<CpuImpl, HostFs>(
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
     _filesystem: Option<DebugFileSystemSnapshot>,
+    _signal_state: WasixSignalState,
     spawner: crate::Spawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
     compiled: Arc<WasmtimeCompiledComponent>,
@@ -5269,6 +5299,7 @@ where
     drop(child.take_stdin());
     let stdout = child.take_stdout();
     let stderr = child.take_stderr();
+    let child_signal_state = child.signal_state();
     let stdout_sink = store.data().output_sink();
     let stderr_sink = store.data().output_sink();
     let (exit_tx, exit) = futures::channel::oneshot::channel();
@@ -5292,7 +5323,7 @@ where
             futures::future::join(stdout_task, futures::future::join(stderr_task, wait_task)).await;
         let _ = exit_tx.send(exit);
     });
-    store.data_mut().insert_child(pid, exit);
+    store.data_mut().insert_child(pid, child_signal_state, exit);
     Ok(pid)
 }
 
@@ -9199,16 +9230,24 @@ where
         Ok(pid) => pid,
         Err(_) => return Ok(p1::errno::OVERFLOW),
     };
-    if pid != current {
-        return Ok(p1::errno::SRCH);
-    }
-    let Ok(signal) = u32::try_from(signal) else {
+    if !(0..=31).contains(&signal) {
         return Ok(p1::errno::INVAL);
     };
-    caller
-        .data_mut()
-        .request_exit(128u32.saturating_add(signal));
-    Err(wasmtime::Error::new(Preview1Exit))
+    let signal = signal as u32;
+    if pid == current {
+        caller
+            .data_mut()
+            .request_exit(128u32.saturating_add(signal));
+        return Err(wasmtime::Error::new(Preview1Exit));
+    }
+    let Some(index) = caller.data().find_child_index(Some(pid)) else {
+        return Ok(p1::errno::SRCH);
+    };
+    if caller.data().children[index].completed.is_some() {
+        return Ok(p1::errno::SRCH);
+    }
+    caller.data().children[index].signal_state.raise(signal);
+    Ok(p1::errno::SUCCESS)
 }
 
 fn wasix_proc_signals_get<CpuImpl, HostFs>(
@@ -10798,7 +10837,9 @@ where
         crate::ComponentOutputStreamKind::Stderr,
     )?;
     let exit = child.take_wait().ok_or(p1::errno::IO)?;
-    caller.data_mut().insert_child(pid, exit);
+    caller
+        .data_mut()
+        .insert_child(pid, child.signal_state(), exit);
     Ok(WasixSpawnResult {
         pid,
         stdin_fd,
@@ -11219,13 +11260,13 @@ where
         Some(imported_memory.clone()),
         Some(filesystem),
         Some(descriptors),
+        signal_state.clone(),
         caller.data().signal_dispositions.clone(),
         Some(compiled.clone()),
         wasix_abi,
     );
     store_data.set_thread_id(tid);
-    store_data.signal_state = signal_state;
-    caller.data_mut().insert_thread(tid, exit_rx);
+    caller.data_mut().insert_thread(tid, signal_state, exit_rx);
     spawner.spawn_detached(async move {
         let code = run_wasix_thread(engine, compiled, imported_memory, store_data, tid, args).await;
         let _ = exit_tx.send(code);
@@ -11364,16 +11405,27 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    if tid != 0 {
-        return Ok(p1::errno::SRCH);
-    }
-    let Ok(signal) = u32::try_from(signal) else {
+    if !(0..=31).contains(&signal) {
         return Ok(p1::errno::INVAL);
     };
-    caller
-        .data_mut()
-        .request_exit(128u32.saturating_add(signal));
-    Err(wasmtime::Error::new(Preview1Exit))
+    let signal = signal as u32;
+    if tid == 0 || u32::try_from(tid).ok() == Some(caller.data().thread_id) {
+        caller
+            .data_mut()
+            .request_exit(128u32.saturating_add(signal));
+        return Err(wasmtime::Error::new(Preview1Exit));
+    }
+    let Ok(tid) = u32::try_from(tid) else {
+        return Ok(p1::errno::INVAL);
+    };
+    let Some(index) = caller.data().find_thread_index(tid) else {
+        return Ok(p1::errno::SRCH);
+    };
+    if caller.data().threads[index].completed.is_some() {
+        return Ok(p1::errno::SRCH);
+    }
+    caller.data().threads[index].signal_state.raise(signal);
+    Ok(p1::errno::SUCCESS)
 }
 
 fn wasix_thread_exit<CpuImpl, HostFs>(
