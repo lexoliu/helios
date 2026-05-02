@@ -466,8 +466,10 @@ struct Preview1Memory {
 
 struct WasixAsyncifyState {
     snapshots: Vec<WasixStackSnapshot>,
+    process_snapshots: Vec<WasixProcessSnapshot>,
     phase: WasixAsyncifyPhase,
     rewind_value: Option<u64>,
+    process_snapshot_rewinding: bool,
 }
 
 enum WasixAsyncifyPhase {
@@ -494,6 +496,13 @@ enum WasixAsyncifyPhase {
         memory_stack: Vec<u8>,
         stack_pointer: u32,
     },
+    ProcessSnapshot {
+        stack_lower: u32,
+        stack_upper: u32,
+        unwind_stack_begin: u32,
+        memory_stack: Vec<u8>,
+        stack_pointer: u32,
+    },
 }
 
 #[derive(Clone)]
@@ -502,6 +511,24 @@ struct WasixStackSnapshot {
     memory_stack: Vec<u8>,
     rewind_stack: Vec<u8>,
     stack_pointer: u32,
+}
+
+#[derive(Clone)]
+struct WasixProcessSnapshot {
+    memory: Vec<u8>,
+    memory_pages: u32,
+    descriptors: Preview1DescriptorTable,
+    filesystem: DebugFileSystemSnapshot,
+    authority: ProcessAuthority,
+    cwd: Option<Preview1Cwd>,
+    arguments: Vec<String>,
+    environment: Vec<(String, String)>,
+    signal_dispositions: Vec<WasixSignalDisposition>,
+    stack_lower: u32,
+    stack_upper: u32,
+    stack_pointer: u32,
+    memory_stack: Vec<u8>,
+    rewind_stack: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -2677,8 +2704,10 @@ impl WasixAsyncifyState {
     const fn new() -> Self {
         Self {
             snapshots: Vec::new(),
+            process_snapshots: Vec::new(),
             phase: WasixAsyncifyPhase::Idle,
             rewind_value: None,
+            process_snapshot_rewinding: false,
         }
     }
 }
@@ -3727,11 +3756,11 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "proc_snapshot",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>| -> i32 {
-                wasix_proc_snapshot(&mut caller)
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>, (): ()| {
+                Box::new(async move { wasix_proc_snapshot(&mut caller).await })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -4785,7 +4814,7 @@ where
         restore.stack_pointer,
         restore.memory_stack,
         restore.rewind_stack,
-        restore.value,
+        Some(restore.value),
     )
     .await?;
 
@@ -5011,7 +5040,7 @@ where
                 stack_pointer,
                 memory_stack,
                 rewind_stack,
-                0,
+                Some(0),
             )
             .await?;
             Ok(true)
@@ -5042,7 +5071,7 @@ where
                 snapshot.stack_pointer,
                 snapshot.memory_stack,
                 snapshot.rewind_stack,
-                value,
+                Some(value),
             )
             .await?;
             Ok(true)
@@ -5114,7 +5143,61 @@ where
                 stack_pointer,
                 memory_stack,
                 rewind_stack,
-                u64::from(child_pid),
+                Some(u64::from(child_pid)),
+            )
+            .await?;
+            Ok(true)
+        }
+        WasixAsyncifyPhase::ProcessSnapshot {
+            stack_lower,
+            stack_upper,
+            unwind_stack_begin,
+            memory_stack,
+            stack_pointer,
+        } => {
+            let memory = p1_memory_from_instance(store, instance).ok_or(ProgramExecError {
+                kind: ProgramExecErrorKind::InvalidBinary,
+                detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
+            })?;
+            let unwind_stack_finish = preview1_read_u32(memory, stack_lower)?;
+            if unwind_stack_finish < unwind_stack_begin || unwind_stack_finish > stack_pointer {
+                return Err(ProgramExecError {
+                    kind: ProgramExecErrorKind::InvalidBinary,
+                    detail: ProgramExecErrorDetail::StackBoundsInvalid,
+                });
+            }
+            let unwind_len =
+                usize::try_from(unwind_stack_finish - unwind_stack_begin).map_err(|_| {
+                    ProgramExecError {
+                        kind: ProgramExecErrorKind::InvalidBinary,
+                        detail: ProgramExecErrorDetail::StackBoundsInvalid,
+                    }
+                })?;
+            let rewind_stack = preview1_read_memory(memory, unwind_stack_begin, unwind_len)?;
+            wasix_call_instance_func0(store, instance, "asyncify_stop_unwind").await?;
+            let snapshot = wasix_capture_process_snapshot(
+                store,
+                stack_lower,
+                stack_upper,
+                stack_pointer,
+                memory_stack.clone(),
+                rewind_stack.clone(),
+            )?;
+            store.data_mut().asyncify.process_snapshots.push(snapshot);
+            let snapshot_count = store.data().asyncify.process_snapshots.len();
+            if let Some(snapshot) = store.data().asyncify.process_snapshots.last() {
+                trace_wasix_process_snapshot(snapshot, snapshot_count);
+            }
+            store.data_mut().asyncify.process_snapshot_rewinding = true;
+            wasix_begin_rewind(
+                store,
+                instance,
+                stack_lower,
+                stack_upper,
+                stack_pointer,
+                memory_stack,
+                rewind_stack,
+                None,
             )
             .await?;
             Ok(true)
@@ -5130,7 +5213,7 @@ async fn wasix_begin_rewind<CpuImpl, HostFs>(
     stack_pointer: u32,
     memory_stack: Vec<u8>,
     rewind_stack: Vec<u8>,
-    value: u64,
+    value: Option<u64>,
 ) -> Result<(), ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
@@ -5194,9 +5277,89 @@ where
             detail: ProgramExecErrorDetail::GuestMemoryAccessOutOfBounds,
         });
     }
-    store.data_mut().asyncify.rewind_value = Some(value);
+    store.data_mut().asyncify.rewind_value = value;
     wasix_call_instance_func1(store, instance, "asyncify_start_rewind", stack_lower).await?;
     Ok(())
+}
+
+fn wasix_capture_process_snapshot<CpuImpl, HostFs>(
+    store: &wasmtime::Store<Preview1ProgramStore<CpuImpl, HostFs>>,
+    stack_lower: u32,
+    stack_upper: u32,
+    stack_pointer: u32,
+    memory_stack: Vec<u8>,
+    rewind_stack: Vec<u8>,
+) -> Result<WasixProcessSnapshot, ProgramExecError>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let memory = store
+        .data()
+        .imported_memory
+        .as_ref()
+        .ok_or(ProgramExecError {
+            kind: ProgramExecErrorKind::InvalidBinary,
+            detail: ProgramExecErrorDetail::ImportedSharedMemoryContractInvalid,
+        })?;
+    let memory = memory.data();
+    let memory_len = memory.len();
+    let memory_pages = memory_len.div_ceil(WASM_PAGE_SIZE);
+    let memory_pages = u32::try_from(memory_pages).map_err(|_| ProgramExecError {
+        kind: ProgramExecErrorKind::OutOfMemory,
+        detail: ProgramExecErrorDetail::ImportedSharedMemoryBudgetExceeded,
+    })?;
+    let mut memory_bytes = Vec::with_capacity(memory_len);
+    unsafe {
+        memory_bytes.set_len(memory_len);
+        core::ptr::copy_nonoverlapping(
+            memory.as_ptr().cast::<u8>(),
+            memory_bytes.as_mut_ptr(),
+            memory_len,
+        );
+    }
+    Ok(WasixProcessSnapshot {
+        memory: memory_bytes,
+        memory_pages,
+        descriptors: store.data().descriptors.clone(),
+        filesystem: store.data().filesystem.snapshot(),
+        authority: store.data().authority.clone(),
+        cwd: store.data().cwd.clone(),
+        arguments: store.data().arguments.clone(),
+        environment: store.data().environment.clone(),
+        signal_dispositions: store.data().signal_dispositions.clone(),
+        stack_lower,
+        stack_upper,
+        stack_pointer,
+        memory_stack,
+        rewind_stack,
+    })
+}
+
+fn trace_wasix_process_snapshot(snapshot: &WasixProcessSnapshot, snapshot_count: usize) {
+    let cwd = snapshot
+        .cwd
+        .as_ref()
+        .map(|cwd| cwd.guest_name.as_str())
+        .unwrap_or("");
+    let _filesystem = &snapshot.filesystem;
+    tracing::debug!(
+        snapshot_count,
+        memory_bytes = snapshot.memory.len(),
+        memory_pages = snapshot.memory_pages,
+        descriptors = snapshot.descriptors.entries.len(),
+        directory_preopens = snapshot.authority.directory_preopens().len(),
+        cwd,
+        args = snapshot.arguments.len(),
+        env = snapshot.environment.len(),
+        signal_dispositions = snapshot.signal_dispositions.len(),
+        stack_lower = snapshot.stack_lower,
+        stack_upper = snapshot.stack_upper,
+        stack_pointer = snapshot.stack_pointer,
+        memory_stack_bytes = snapshot.memory_stack.len(),
+        rewind_stack_bytes = snapshot.rewind_stack.len(),
+        "captured explicit WASIX process snapshot"
+    );
 }
 
 fn spawn_wasix_fork_child<CpuImpl, HostFs>(
@@ -10043,14 +10206,63 @@ fn wasix_child_exit_result(
     }
 }
 
-fn wasix_proc_snapshot<CpuImpl, HostFs>(
-    _caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+async fn wasix_proc_snapshot<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    p1::errno::NOTSUP
+    if caller.data_mut().asyncify.process_snapshot_rewinding {
+        caller.data_mut().asyncify.process_snapshot_rewinding = false;
+        if wasix_call_asyncify_stop_rewind(caller).await != p1::errno::SUCCESS {
+            return p1::errno::NOTSUP;
+        }
+        return p1::errno::SUCCESS;
+    }
+
+    let Some(memory) = p1_memory(caller) else {
+        return p1::errno::FAULT;
+    };
+    if caller.data().current_core_module.is_none() {
+        return p1::errno::NOTSUP;
+    }
+    let Ok((stack_lower, stack_upper, stack_pointer)) = wasix_stack_bounds_from_caller(caller)
+    else {
+        return p1::errno::NOTSUP;
+    };
+    if stack_lower >= stack_pointer || stack_pointer > stack_upper {
+        return p1::errno::INVAL;
+    }
+    let memory_stack_len = match usize::try_from(stack_upper - stack_pointer) {
+        Ok(len) => len,
+        Err(_) => return p1::errno::OVERFLOW,
+    };
+    let memory_stack = match p1_read_memory(caller, memory, stack_pointer, memory_stack_len) {
+        Ok(stack) => stack,
+        Err(_) => return p1::errno::FAULT,
+    };
+    let unwind_stack_begin = match stack_lower.checked_add(WASIX_ASYNCIFY_DATA_SIZE) {
+        Some(begin) if begin <= stack_pointer => begin,
+        _ => return p1::errno::OVERFLOW,
+    };
+    let status = p1_write_u32(caller, memory, stack_lower, unwind_stack_begin).max(p1_write_u32(
+        caller,
+        memory,
+        stack_lower + 4,
+        stack_pointer,
+    ));
+    if status != p1::errno::SUCCESS {
+        return status;
+    }
+    caller.data_mut().asyncify.phase = WasixAsyncifyPhase::ProcessSnapshot {
+        stack_lower,
+        stack_upper,
+        unwind_stack_begin,
+        memory_stack,
+        stack_pointer,
+    };
+    wasix_call_asyncify_start_unwind(caller, stack_lower).await
 }
 
 #[derive(Clone, Copy)]
