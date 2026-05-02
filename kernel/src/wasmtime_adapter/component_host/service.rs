@@ -11433,7 +11433,8 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    if p1_read_memory(caller, memory, args, WASIX_THREAD_START_SIZE).is_err() {
+    let mut thread_start = [0_u8; WASIX_THREAD_START_SIZE];
+    if p1_read_memory_into(caller, memory, args, &mut thread_start).is_err() {
         return p1::errno::FAULT;
     }
     let Some(imported_memory) = caller.data().imported_memory.clone() else {
