@@ -282,7 +282,7 @@ where
     Ok(())
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct FsNode {
     path: String,
     kind: FsNodeKind,
@@ -292,6 +292,24 @@ struct FsNode {
     modified_nanos: u64,
     status_nanos: u64,
     readonly: bool,
+}
+
+#[derive(Debug)]
+struct DebugFileSystemState {
+    nodes: Vec<FsNode>,
+    next_inode: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct DebugFileSystemSnapshot {
+    inner: Arc<Mutex<DebugFileSystemState>>,
+}
+
+impl core::fmt::Debug for DebugFileSystemSnapshot {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DebugFileSystemSnapshot")
+            .finish_non_exhaustive()
+    }
 }
 
 impl FsNode {
@@ -1229,8 +1247,7 @@ pub(crate) fn resolve_symlink_payload(
 }
 
 pub(crate) struct DebugFileSystem<State, HostFsService> {
-    nodes: Vec<FsNode>,
-    next_inode: u64,
+    snapshot: DebugFileSystemSnapshot,
     runtime_state: State,
     _host_fs: PhantomData<HostFsService>,
 }
@@ -1533,15 +1550,19 @@ where
 {
     pub(crate) fn new(runtime_state: State) -> Self {
         let mut filesystem = Self {
-            nodes: vec![FsNode::new(
-                String::from("/"),
-                FsNodeKind::Directory,
-                Bytes::new(),
-                ObjectIdentity::new(AuthorityDomain::GUEST_BOOTFS, 1),
-                0,
-                false,
-            )],
-            next_inode: 2,
+            snapshot: DebugFileSystemSnapshot {
+                inner: Arc::new(Mutex::new(DebugFileSystemState {
+                    nodes: vec![FsNode::new(
+                        String::from("/"),
+                        FsNodeKind::Directory,
+                        Bytes::new(),
+                        ObjectIdentity::new(AuthorityDomain::GUEST_BOOTFS, 1),
+                        0,
+                        false,
+                    )],
+                    next_inode: 2,
+                })),
+            },
             runtime_state,
             _host_fs: PhantomData,
         };
@@ -1554,6 +1575,22 @@ where
         }
 
         filesystem
+    }
+
+    pub(crate) fn from_snapshot(runtime_state: State, snapshot: DebugFileSystemSnapshot) -> Self {
+        Self {
+            snapshot,
+            runtime_state,
+            _host_fs: PhantomData,
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> DebugFileSystemSnapshot {
+        self.snapshot.clone()
+    }
+
+    pub(crate) fn replace_with_snapshot(&mut self, snapshot: DebugFileSystemSnapshot) {
+        self.snapshot = snapshot;
     }
 
     fn seed_bootfs(&mut self, image: EmbeddedBootFs) {
@@ -1582,7 +1619,7 @@ where
         }
 
         let identity = self.allocate_identity();
-        self.nodes.push(FsNode::new(
+        self.snapshot.inner.lock().nodes.push(FsNode::new(
             absolute,
             FsNodeKind::File,
             Bytes::from_static(file.contents()),
@@ -1600,12 +1637,13 @@ where
         identity: ObjectIdentity,
         content: Vec<u8>,
     ) {
-        if let Some(node) = self.nodes.iter_mut().find(|n| n.path == path) {
+        let mut state = self.snapshot.inner.lock();
+        if let Some(node) = state.nodes.iter_mut().find(|n| n.path == path) {
             node.identity = identity;
             node.contents = Bytes::from(content);
             return;
         }
-        self.nodes.push(FsNode::new(
+        state.nodes.push(FsNode::new(
             path.to_owned(),
             FsNodeKind::File,
             Bytes::from(content),
@@ -1620,7 +1658,10 @@ where
     /// not linger.
     pub(crate) fn invalidate_host_subtree(&mut self, path: &str) {
         let prefix = crate::directory_prefix(path);
-        self.nodes
+        self.snapshot
+            .inner
+            .lock()
+            .nodes
             .retain(|node| node.path != path && !node.path.starts_with(&prefix));
     }
 
@@ -1636,11 +1677,11 @@ where
         let prefix = crate::directory_prefix(path);
         for entry in entries {
             let child_path = append_path_suffix(&prefix, &entry.name);
-            if self.nodes.iter().any(|node| node.path == child_path) {
+            if self.get_node(&child_path).is_ok() {
                 continue;
             }
             let identity = self.allocate_identity();
-            self.nodes.push(FsNode::new(
+            self.snapshot.inner.lock().nodes.push(FsNode::new(
                 child_path,
                 if entry.is_directory {
                     FsNodeKind::Directory
@@ -1660,7 +1701,8 @@ where
             return;
         }
 
-        if let Some(existing) = self.nodes.iter_mut().find(|node| node.path == path) {
+        let mut state = self.snapshot.inner.lock();
+        if let Some(existing) = state.nodes.iter_mut().find(|node| node.path == path) {
             assert!(
                 existing.kind == FsNodeKind::Directory,
                 "bootfs directory path {} collided with an existing file",
@@ -1670,8 +1712,10 @@ where
             return;
         }
 
-        let identity = self.allocate_identity();
-        self.nodes.push(FsNode::new(
+        let local = state.next_inode;
+        state.next_inode += 1;
+        let identity = ObjectIdentity::new(AuthorityDomain::GUEST_BOOTFS, local);
+        state.nodes.push(FsNode::new(
             path.to_owned(),
             FsNodeKind::Directory,
             Bytes::new(),
@@ -1681,9 +1725,10 @@ where
         ));
     }
 
-    fn allocate_identity(&mut self) -> ObjectIdentity {
-        let local = self.next_inode;
-        self.next_inode += 1;
+    fn allocate_identity(&self) -> ObjectIdentity {
+        let mut state = self.snapshot.inner.lock();
+        let local = state.next_inode;
+        state.next_inode += 1;
         ObjectIdentity::new(AuthorityDomain::GUEST_BOOTFS, local)
     }
 
@@ -1703,7 +1748,10 @@ where
     }
 
     fn link_count(&self, identity: ObjectIdentity) -> u64 {
-        self.nodes
+        self.snapshot
+            .inner
+            .lock()
+            .nodes
             .iter()
             .filter(|node| node.identity == identity)
             .count() as u64
@@ -1760,20 +1808,14 @@ where
         }
     }
 
-    fn get_node(&self, path: &str) -> core::result::Result<&FsNode, fs_types::ErrorCode> {
-        self.nodes
+    fn get_node(&self, path: &str) -> core::result::Result<FsNode, fs_types::ErrorCode> {
+        self.snapshot
+            .inner
+            .lock()
+            .nodes
             .iter()
             .find(|node| node.path == path)
-            .ok_or(fs_types::ErrorCode::NoEntry)
-    }
-
-    fn get_node_mut(
-        &mut self,
-        path: &str,
-    ) -> core::result::Result<&mut FsNode, fs_types::ErrorCode> {
-        self.nodes
-            .iter_mut()
-            .find(|node| node.path == path)
+            .cloned()
             .ok_or(fs_types::ErrorCode::NoEntry)
     }
 
@@ -1788,7 +1830,7 @@ where
         // instead of panicking so programs see a proper filesystem
         // error.
         let node = self.get_node(path)?;
-        let size = Self::node_size(node);
+        let size = Self::node_size(&node);
         Ok(fs_types::DescriptorStat {
             type_: Self::descriptor_type(node.kind),
             link_count: self.link_count(node.identity),
@@ -1807,7 +1849,7 @@ where
         // trait impl, but fall through to the embedded view when the
         // node has already been seeded.
         let node = self.get_node(path)?;
-        let size = Self::node_size(node);
+        let size = Self::node_size(&node);
         Ok(metadata_hash_value(
             node.identity,
             node.modified_nanos ^ size,
@@ -1829,7 +1871,8 @@ where
 
         let prefix = crate::directory_prefix(path);
         let mut entries = Vec::new();
-        for child in &self.nodes {
+        let nodes = self.snapshot.inner.lock().nodes.clone();
+        for child in &nodes {
             if child.path == path {
                 continue;
             }
@@ -1928,36 +1971,43 @@ where
             return Err(fs_types::ErrorCode::Unsupported);
         }
 
-        match self.get_node_mut(path) {
-            Ok(node) => {
+        let mut state = self.snapshot.inner.lock();
+        match state.nodes.iter().find(|node| node.path == path).cloned() {
+            Some(node) => {
                 if node.kind != FsNodeKind::File {
                     return Err(fs_types::ErrorCode::IsDirectory);
                 }
                 if node.readonly {
                     return Err(fs_types::ErrorCode::ReadOnly);
                 }
-                let identity = node.identity;
-                for linked in self
+                let contents = Bytes::copy_from_slice(bytes);
+                for linked in state
                     .nodes
                     .iter_mut()
-                    .filter(|node| node.identity == identity)
+                    .filter(|linked| linked.identity == node.identity)
                 {
-                    linked.contents = Bytes::copy_from_slice(bytes);
+                    linked.contents = contents.clone();
                     linked.touch_modified(now_nanos);
                 }
                 Ok(())
             }
-            Err(fs_types::ErrorCode::NoEntry) => {
+            None => {
                 let parent = crate::parent_path(path);
-                let parent_node = self.get_node(parent)?;
+                let parent_node = state
+                    .nodes
+                    .iter()
+                    .find(|node| node.path == parent)
+                    .ok_or(fs_types::ErrorCode::NoEntry)?;
                 if parent_node.kind != FsNodeKind::Directory {
                     return Err(fs_types::ErrorCode::NotDirectory);
                 }
                 if parent_node.readonly {
                     return Err(fs_types::ErrorCode::ReadOnly);
                 }
-                let identity = self.allocate_identity();
-                self.nodes.push(FsNode::new(
+                let local = state.next_inode;
+                state.next_inode += 1;
+                let identity = ObjectIdentity::new(AuthorityDomain::GUEST_BOOTFS, local);
+                state.nodes.push(FsNode::new(
                     path.to_owned(),
                     FsNodeKind::File,
                     Bytes::copy_from_slice(bytes),
@@ -1967,7 +2017,6 @@ where
                 ));
                 Ok(())
             }
-            Err(error) => Err(error),
         }
     }
 
@@ -2018,6 +2067,9 @@ where
         let identity = node.identity;
         let contents = contents.freeze();
         for linked in self
+            .snapshot
+            .inner
+            .lock()
             .nodes
             .iter_mut()
             .filter(|node| node.identity == identity)
@@ -2070,6 +2122,9 @@ where
         let identity = node.identity;
         let contents = contents.freeze();
         for linked in self
+            .snapshot
+            .inner
+            .lock()
             .nodes
             .iter_mut()
             .filter(|node| node.identity == identity)
@@ -2096,6 +2151,9 @@ where
         }
         let identity = node.identity;
         for linked in self
+            .snapshot
+            .inner
+            .lock()
             .nodes
             .iter_mut()
             .filter(|node| node.identity == identity)
@@ -2141,8 +2199,15 @@ where
         // this embedded path only handles paths that already have a
         // node (either genuinely local or previously seeded from the
         // host mount).
-        if let Some(existing_index) = self.nodes.iter().position(|node| node.path == absolute) {
-            let existing = &self.nodes[existing_index];
+        if let Some(existing) = self
+            .snapshot
+            .inner
+            .lock()
+            .nodes
+            .iter()
+            .find(|node| node.path == absolute)
+            .cloned()
+        {
             if open_flags.contains(fs_types::OpenFlags::EXCLUSIVE)
                 && open_flags.contains(fs_types::OpenFlags::CREATE)
             {
@@ -2176,6 +2241,9 @@ where
                 }
                 let identity = existing.identity;
                 for linked in self
+                    .snapshot
+                    .inner
+                    .lock()
                     .nodes
                     .iter_mut()
                     .filter(|node| node.identity == identity)
@@ -2186,9 +2254,9 @@ where
             }
             return Ok(FsDescriptor {
                 path: absolute,
-                kind: self.nodes[existing_index].kind,
+                kind: existing.kind,
                 flags: descriptor_flags,
-                identity: Some(self.nodes[existing_index].identity),
+                identity: Some(existing.identity),
             });
         }
 
@@ -2223,7 +2291,7 @@ where
             now_nanos,
             false,
         );
-        self.nodes.push(node);
+        self.snapshot.inner.lock().nodes.push(node);
         Ok(FsDescriptor {
             path: absolute,
             kind: FsNodeKind::File,
@@ -2257,13 +2325,20 @@ where
         }
         let prefix = crate::directory_prefix(&absolute);
         if self
+            .snapshot
+            .inner
+            .lock()
             .nodes
             .iter()
             .any(|child| child.path != absolute && child.path.starts_with(&prefix))
         {
             return Err(fs_types::ErrorCode::NotEmpty);
         }
-        self.nodes.retain(|node| node.path != absolute);
+        self.snapshot
+            .inner
+            .lock()
+            .nodes
+            .retain(|node| node.path != absolute);
         Ok(())
     }
 
@@ -2302,7 +2377,7 @@ where
         }
 
         let identity = self.allocate_identity();
-        self.nodes.push(FsNode::new(
+        self.snapshot.inner.lock().nodes.push(FsNode::new(
             absolute,
             FsNodeKind::Directory,
             Bytes::new(),
@@ -2333,7 +2408,11 @@ where
         if node.kind == FsNodeKind::Directory {
             return Err(fs_types::ErrorCode::IsDirectory);
         }
-        self.nodes.retain(|node| node.path != absolute);
+        self.snapshot
+            .inner
+            .lock()
+            .nodes
+            .retain(|node| node.path != absolute);
         Ok(())
     }
 
@@ -2392,7 +2471,7 @@ where
         let mut linked = source_node.clone();
         linked.path = destination_absolute;
         linked.touch_status(now_nanos);
-        self.nodes.push(linked);
+        self.snapshot.inner.lock().nodes.push(linked);
         Ok(())
     }
 
@@ -2427,7 +2506,7 @@ where
             return Err(fs_types::ErrorCode::ReadOnly);
         }
         let identity = self.allocate_identity();
-        self.nodes.push(FsNode::new(
+        self.snapshot.inner.lock().nodes.push(FsNode::new(
             absolute,
             FsNodeKind::Symlink,
             Bytes::copy_from_slice(payload.as_bytes()),
@@ -2531,7 +2610,7 @@ where
         }
 
         let source_prefix = crate::directory_prefix(&source_absolute);
-        for node in &mut self.nodes {
+        for node in &mut self.snapshot.inner.lock().nodes {
             if node.path == source_absolute {
                 node.path = destination_absolute.clone();
                 node.touch_status(now_nanos);

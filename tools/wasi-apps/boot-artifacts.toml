@@ -37,6 +37,60 @@ source = "artifacts/wasix/quickjs/qjs.wasm"
 sha256_file = "artifacts/wasix/quickjs/qjs.wasm.sha256"
 
 [[artifact]]
+command = "cat"
+package = "wasmer/coreutils"
+version = "1.0.19"
+source_url = "https://wasmer.io/wasmer/coreutils"
+bootfs_path = "bin/cat"
+source = "artifacts/wasix/coreutils/coreutils.wasm"
+sha256_file = "artifacts/wasix/coreutils/coreutils.wasm.sha256"
+
+[[artifact]]
+command = "env"
+package = "wasmer/coreutils"
+version = "1.0.19"
+source_url = "https://wasmer.io/wasmer/coreutils"
+bootfs_path = "bin/env"
+source = "artifacts/wasix/coreutils/coreutils.wasm"
+sha256_file = "artifacts/wasix/coreutils/coreutils.wasm.sha256"
+
+[[artifact]]
+command = "head"
+package = "wasmer/coreutils"
+version = "1.0.19"
+source_url = "https://wasmer.io/wasmer/coreutils"
+bootfs_path = "bin/head"
+source = "artifacts/wasix/coreutils/coreutils.wasm"
+sha256_file = "artifacts/wasix/coreutils/coreutils.wasm.sha256"
+
+[[artifact]]
+command = "ls"
+package = "wasmer/coreutils"
+version = "1.0.19"
+source_url = "https://wasmer.io/wasmer/coreutils"
+bootfs_path = "bin/ls"
+source = "artifacts/wasix/coreutils/coreutils.wasm"
+sha256_file = "artifacts/wasix/coreutils/coreutils.wasm.sha256"
+
+[[artifact]]
+command = "mkdir"
+package = "wasmer/coreutils"
+version = "1.0.19"
+source_url = "https://wasmer.io/wasmer/coreutils"
+bootfs_path = "bin/mkdir"
+source = "artifacts/wasix/coreutils/coreutils.wasm"
+sha256_file = "artifacts/wasix/coreutils/coreutils.wasm.sha256"
+
+[[artifact]]
+command = "pwd"
+package = "wasmer/coreutils"
+version = "1.0.19"
+source_url = "https://wasmer.io/wasmer/coreutils"
+bootfs_path = "bin/pwd"
+source = "artifacts/wasix/coreutils/coreutils.wasm"
+sha256_file = "artifacts/wasix/coreutils/coreutils.wasm.sha256"
+
+[[artifact]]
 command = "curl"
 package = "helios-curl-wasi"
 version = "0.1.0"

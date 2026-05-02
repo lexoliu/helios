@@ -25,8 +25,9 @@ python_root="$artifacts_root/python3-root"
 dash_root="$artifacts_root/wasix/dash"
 bash_root="$artifacts_root/wasix/bash"
 quickjs_root="$artifacts_root/wasix/quickjs"
+coreutils_root="$artifacts_root/wasix/coreutils"
 
-mkdir -p "$out_dir" "$python_root" "$dash_root" "$bash_root" "$quickjs_root"
+mkdir -p "$out_dir" "$python_root" "$dash_root" "$bash_root" "$quickjs_root" "$coreutils_root"
 
 cpython_version="${CPYTHON_VERSION:-3.14.4}"
 wasmtime_version="${WASMTIME_ADAPTER_VERSION:-43.0.1}"
@@ -50,6 +51,13 @@ quickjs_source_url="${QUICKJS_SOURCE_URL:-https://wasmer.io/_/quickjs}"
 quickjs_webc_url="${QUICKJS_WEBC_URL:-https://cdn.wasmer.io/webcimages/db5822e7db5e982ac387a588649d260f64d20d89e6feecfcc1ef7acbccafe9d6.webc}"
 quickjs_webc_sha256="${QUICKJS_WEBC_SHA256:-db5822e7db5e982ac387a588649d260f64d20d89e6feecfcc1ef7acbccafe9d6}"
 quickjs_wasm_sha256="${QUICKJS_WASM_SHA256:-6f62a6bc5c8f8e3e12a54e2ecbc5674ccfe1c75f91d8e4dd6ebb3fec422a4d6c}"
+
+coreutils_package="${COREUTILS_PACKAGE:-wasmer/coreutils}"
+coreutils_version="${COREUTILS_VERSION:-1.0.19}"
+coreutils_source_url="${COREUTILS_SOURCE_URL:-https://wasmer.io/wasmer/coreutils}"
+coreutils_webc_url="${COREUTILS_WEBC_URL:-https://cdn.wasmer.io/webcimages/6b2fd4494bd198f60859987608a7633f807a05147e4d8398ec061639d047ce75.webc}"
+coreutils_webc_sha256="${COREUTILS_WEBC_SHA256:-6b2fd4494bd198f60859987608a7633f807a05147e4d8398ec061639d047ce75}"
+coreutils_wasm_sha256="${COREUTILS_WASM_SHA256:-586489a3aca13cb69855f9f92e655acdb1598934b24ceb9450628d0ab34d0b95}"
 
 staging="$(mktemp -d)"
 trap 'rm -rf "$staging"' EXIT
@@ -209,6 +217,27 @@ write_source_record \
 
 echo "QuickJS installed at: $quickjs_root/qjs.wasm"
 ls -lh "$quickjs_root/qjs.wasm" "$quickjs_root/qjs.wasm.sha256"
+
+echo "Staging coreutils $coreutils_package@$coreutils_version..."
+stage_wasmer_webc_atom \
+  "coreutils-$coreutils_version" \
+  "${COREUTILS_WASM:-}" \
+  "${COREUTILS_WEBC:-}" \
+  "$coreutils_webc_url" \
+  "$coreutils_webc_sha256" \
+  "$coreutils_wasm_sha256" \
+  "$coreutils_root/coreutils.wasm"
+sha256sum "$coreutils_root/coreutils.wasm" > "$coreutils_root/coreutils.wasm.sha256"
+write_source_record \
+  "$coreutils_root/SOURCE.txt" \
+  "$coreutils_package" \
+  "$coreutils_version" \
+  "$coreutils_source_url" \
+  "$coreutils_wasm_sha256" \
+  "$coreutils_webc_sha256"
+
+echo "coreutils installed at: $coreutils_root/coreutils.wasm"
+ls -lh "$coreutils_root/coreutils.wasm" "$coreutils_root/coreutils.wasm.sha256"
 
 build_env=(
   CARGO_PROFILE_DEV_OPT_LEVEL=z

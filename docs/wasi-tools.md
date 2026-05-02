@@ -1,8 +1,9 @@
 # WASI/WASIX Python, Curl, Shells, And QuickJS On Helios
 
 This document captures the exact workflow to stage and run `python`,
-`curl`, the shell artifacts, and QuickJS. `dash`, `bash`, CPython,
-QuickJS, and `curl` are boot filesystem artifacts recorded in
+`curl`, the shell artifacts, QuickJS, and the shared coreutils binary.
+`dash`, `bash`, CPython, QuickJS, coreutils commands, and `curl` are
+boot filesystem artifacts recorded in
 `tools/wasi-apps/boot-artifacts.toml`.
 
 ## Build Artifacts
@@ -23,10 +24,10 @@ This script:
 3. Installs `python3.wasm` plus `lib/python3.14/` (the CPython stdlib)
    under `artifacts/python3-root/`.
 4. Downloads and extracts the pinned official Wasmer WEBc images for
-   `sharrattj/dash` `1.0.19`, `wasmer/bash` `1.0.25`, and
-   `saghul/quickjs` `0.0.3`; validates their raw wasm atoms with
-   `wasm-tools`; and records checksum plus `SOURCE.txt` provenance files
-   under `artifacts/wasix/`.
+   `sharrattj/dash` `1.0.19`, `wasmer/bash` `1.0.25`,
+   `saghul/quickjs` `0.0.3`, and `wasmer/coreutils` `1.0.19`;
+   validates their raw wasm atoms with `wasm-tools`; and records
+   checksum plus `SOURCE.txt` provenance files under `artifacts/wasix/`.
 5. Builds the helios `curl-wasi` program from source into
    `artifacts/wasi-tools/`.
 
@@ -45,6 +46,12 @@ Artifacts produced:
 - `artifacts/wasix/quickjs/qjs.wasm` — standard QuickJS WASI raw module.
 - `artifacts/wasix/quickjs/qjs.wasm.sha256`
 - `artifacts/wasix/quickjs/SOURCE.txt`
+- `artifacts/wasix/coreutils/coreutils.wasm` — standard Wasmer
+  coreutils WASIX raw module. `boot-artifacts.toml` exposes the same
+  module as `/bin/cat`, `/bin/env`, `/bin/head`, `/bin/ls`,
+  `/bin/mkdir`, and `/bin/pwd`.
+- `artifacts/wasix/coreutils/coreutils.wasm.sha256`
+- `artifacts/wasix/coreutils/SOURCE.txt`
 - `artifacts/wasi-tools/curl.wasm`
 - `artifacts/wasi-tools/curl-stripped.wasm`
 
@@ -61,6 +68,7 @@ modules:
 WASIX_DASH_WASM=/path/to/official/dash.wasm \
 WASIX_BASH_WASM=/path/to/official/bash.wasm \
 QUICKJS_WASM=/path/to/official/qjs.wasm \
+COREUTILS_WASM=/path/to/official/coreutils.wasm \
 tools/wasi-apps/build.sh
 ```
 
@@ -70,6 +78,7 @@ or pass the pinned WEBc images:
 WASIX_DASH_WEBC=/path/to/dash.webc \
 WASIX_BASH_WEBC=/path/to/bash.webc \
 QUICKJS_WEBC=/path/to/quickjs.webc \
+COREUTILS_WEBC=/path/to/coreutils.webc \
 tools/wasi-apps/build.sh
 ```
 
@@ -143,6 +152,23 @@ Expected output includes:
 42
 ```
 
+The staged coreutils module provides ordinary shell helpers used by the
+WASIX shell smoke tests:
+
+```bash
+cargo run -p helios-inspector -- vm --arch aarch64 --release \
+  --boot-program dash --boot-program debugger --boot-program bash \
+  --boot-program mkdir --boot-program cat \
+  --no-compiler-plugin \
+  shell -c '/bin/bash -c "cd /; /bin/mkdir d; echo ok > /d/f; /bin/cat /d/f"'
+```
+
+Expected output includes:
+
+```text
+ok
+```
+
 ## Run In Helios (RISC-V VM)
 
 Use inspector `vm` mode when checking RISC-V-specific behavior. Use
@@ -187,6 +213,9 @@ Expected output contains:
 - `tools/wasi-apps/extract-webc-wasm.pl` extracts the single raw wasm atom
   from the pinned Wasmer WEBc images. The build script validates both WEBc
   and raw wasm SHA-256 digests before staging.
+- `wasmer/coreutils` is a multi-call WASIX module. Helios records each
+  exposed command as its own bootfs path while preserving one source
+  artifact and one provenance record.
 
 ## Contract For Future Agents
 
@@ -195,8 +224,9 @@ Expected output contains:
   `artifacts/wasi-tools/…`) without updating this document and
   `README.md`.
 - Keep runtime behavior verified with the inspector `vm` commands above.
-- Do not reintroduce repo-local shell or language stubs. The boot shells
-  and QuickJS are standard Wasmer artifacts declared in
+- Do not reintroduce repo-local shell, coreutils, or language stubs. The
+  boot shells, coreutils, and QuickJS are standard Wasmer artifacts
+  declared in
   `tools/wasi-apps/boot-artifacts.toml`.
 - Do not reintroduce the old `tools/wasi-apps/python` stub — it was a
   Rust-level evalexpr toy masquerading as Python and caused real

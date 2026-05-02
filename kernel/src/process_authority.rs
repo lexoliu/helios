@@ -658,6 +658,8 @@ impl ProcessAuthority {
     fn has_directory_authority(&self, path: &str, rights: DirectoryAuthorityRights) -> bool {
         self.directory_preopens.iter().any(|preopen| {
             directory_contains(preopen.source_path(), path) && preopen.rights().contains(rights)
+        }) || self.cwd.as_ref().is_some_and(|cwd| {
+            directory_contains(cwd.source_path(), path) && cwd.rights().contains(rights)
         })
     }
 }

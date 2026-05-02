@@ -383,6 +383,7 @@ macro_rules! impl_program_bindings {
                             source,
                             None,
                             child_authority,
+                            None,
                         )
                         .await
                     {
@@ -469,6 +470,7 @@ macro_rules! impl_program_bindings {
                             hint,
                             request.stdin,
                             child_authority,
+                            None,
                         )
                         .await
                         .map($convert_result)

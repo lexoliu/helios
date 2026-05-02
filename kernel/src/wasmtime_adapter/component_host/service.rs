@@ -7,7 +7,7 @@ use crate::wasmtime_adapter::{WasmtimeCompiledComponent, WasmtimeCompiledCoreMod
 use crate::wasmtime_adapter::{
     WasmtimePrecompiledKind,
     wasi::{
-        DebugFileSystem, FsDescriptor, FsNodeKind, WasiImportSet,
+        DebugFileSystem, DebugFileSystemSnapshot, FsDescriptor, FsNodeKind, WasiImportSet,
         bindings::filesystem::types as fs_types, p1,
     },
 };
@@ -112,6 +112,7 @@ struct ProgramSpawnRequest {
     args: Vec<String>,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
+    filesystem: Option<DebugFileSystemSnapshot>,
 }
 
 enum ProgramExecutable {
@@ -211,6 +212,7 @@ where
     write_serial: fn(&[u8]),
     imported_memory: Option<SharedMemory>,
     current_core_module: Option<Arc<WasmtimeCompiledCoreModule>>,
+    wasix_abi: bool,
     entropy: crate::EntropyPool,
     authority: ProcessAuthority,
     tty_state: WasixTtyState,
@@ -505,6 +507,7 @@ impl ChildHandle {
 pub struct ChildExit {
     pub instance_id: crate::InstanceId,
     pub exit_code: u32,
+    filesystem: Option<DebugFileSystemSnapshot>,
 }
 
 pub fn install_program_service<CpuImpl, HostFs, WatchdogImpl>(
@@ -783,12 +786,21 @@ where
         source: ProgramSource,
         hint: Option<AotCompileHint>,
         authority: ProcessAuthority,
+        filesystem: Option<DebugFileSystemSnapshot>,
     ) -> Result<ChildHandle, ProgramExecError> {
         super::emit_stage_marker(exec_context.write_serial, "program:spawn-begin");
         let executable = self
             .load_executable(&exec_context, &source, hint, exec_context.write_serial)
             .await?;
-        self.spawn_loaded(exec_context, name, args, env, executable, authority)
+        self.spawn_loaded(
+            exec_context,
+            name,
+            args,
+            env,
+            executable,
+            authority,
+            filesystem,
+        )
     }
 
     fn spawn_loaded(
@@ -799,6 +811,7 @@ where
         mut env: Vec<(String, String)>,
         executable: ProgramExecutable,
         authority: ProcessAuthority,
+        filesystem: Option<DebugFileSystemSnapshot>,
     ) -> Result<ChildHandle, ProgramExecError> {
         // Three byte channels between parent and child.
         let (stdin_writer, stdin_reader) = crate::byte_channel();
@@ -825,6 +838,7 @@ where
             args,
             env,
             authority,
+            filesystem,
         };
 
         let (exit_tx, exit_rx) = futures::channel::oneshot::channel();
@@ -841,6 +855,7 @@ where
                 request.args,
                 request.env,
                 request.authority,
+                request.filesystem,
                 run_spawner,
                 progress,
                 executable,
@@ -878,7 +893,36 @@ where
         hint: Option<AotCompileHint>,
         stdin: Vec<u8>,
         authority: ProcessAuthority,
+        filesystem: Option<DebugFileSystemSnapshot>,
     ) -> Result<ExecResult, ProgramExecError> {
+        self.exec_buffered_with_snapshot(
+            exec_context,
+            name,
+            args,
+            env,
+            source,
+            hint,
+            stdin,
+            authority,
+            filesystem,
+        )
+        .await
+        .map(|(result, _)| result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn exec_buffered_with_snapshot(
+        &self,
+        exec_context: ProgramExecContext<CpuImpl, HostFs>,
+        name: impl Into<String>,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        source: ProgramSource,
+        hint: Option<AotCompileHint>,
+        stdin: Vec<u8>,
+        authority: ProcessAuthority,
+        filesystem: Option<DebugFileSystemSnapshot>,
+    ) -> Result<(ExecResult, Option<DebugFileSystemSnapshot>), ProgramExecError> {
         let executable = self
             .load_executable(&exec_context, &source, hint, exec_context.write_serial)
             .await?;
@@ -890,6 +934,7 @@ where
             executable,
             stdin,
             authority,
+            filesystem,
         )
         .await
     }
@@ -903,8 +948,17 @@ where
         executable: ProgramExecutable,
         stdin: Vec<u8>,
         authority: ProcessAuthority,
-    ) -> Result<ExecResult, ProgramExecError> {
-        let mut child = self.spawn_loaded(exec_context, name, args, env, executable, authority)?;
+        filesystem: Option<DebugFileSystemSnapshot>,
+    ) -> Result<(ExecResult, Option<DebugFileSystemSnapshot>), ProgramExecError> {
+        let mut child = self.spawn_loaded(
+            exec_context,
+            name,
+            args,
+            env,
+            executable,
+            authority,
+            filesystem,
+        )?;
 
         // Feed stdin in one shot, then close the writer to signal EOF.
         if let Some(writer) = child.take_stdin() {
@@ -946,6 +1000,7 @@ where
             exit_code: exit.exit_code,
             output: crate::ExecOutput { stdout, stderr },
         })
+        .map(|result| (result, exit.filesystem))
     }
 
     pub(crate) async fn aot(
@@ -1476,9 +1531,14 @@ where
         read_serial: fn(u32) -> Vec<u8>,
         write_serial: fn(&[u8]),
         imported_memory: Option<SharedMemory>,
+        filesystem: Option<DebugFileSystemSnapshot>,
         current_core_module: Option<Arc<WasmtimeCompiledCoreModule>>,
+        wasix_abi: bool,
     ) -> Self {
-        let filesystem = DebugFileSystem::new(runtime_state.clone());
+        let filesystem = filesystem.map_or_else(
+            || DebugFileSystem::new(runtime_state.clone()),
+            |snapshot| DebugFileSystem::from_snapshot(runtime_state.clone(), snapshot),
+        );
         let entropy = crate::EntropyPool::from_cpu(&cpu, instance.id().raw());
         let descriptors = Preview1DescriptorTable::from_authority(&authority);
         let clock = crate::KernelClock::new(cpu.clone(), runtime_state.clone());
@@ -1503,6 +1563,7 @@ where
             write_serial,
             imported_memory,
             current_core_module,
+            wasix_abi,
             entropy,
             authority,
             tty_state,
@@ -1726,6 +1787,9 @@ where
             Poll::Pending => Ok(None),
             Poll::Ready(Ok(Ok(exit))) => {
                 let code = exit.exit_code;
+                if let Some(filesystem) = exit.filesystem {
+                    self.filesystem.replace_with_snapshot(filesystem);
+                }
                 self.children[index].completed = Some(code);
                 self.children[index].exit = None;
                 Ok(Some(code))
@@ -1846,7 +1910,7 @@ where
         let cap = match self.authority.derive_directory_cap(
             &cwd.descriptor.path,
             &cwd.guest_name,
-            DirectoryAuthorityRights::READ,
+            descriptor_flags_to_directory_authority(cwd.descriptor.flags),
         ) {
             Ok(cap) => cap,
             Err(_) => return p1::errno::NOTCAPABLE,
@@ -1927,6 +1991,15 @@ where
             }
         }
 
+        let cwd_descriptor;
+        if let Some(cwd) = self.cwd.as_ref()
+            && guest_path_is_within_preopen(guest_name, &cwd.guest_name)
+            && best.is_none_or(|(best_guest, _)| cwd.guest_name.len() > best_guest.len())
+        {
+            cwd_descriptor = cwd.descriptor.clone();
+            best = Some((cwd.guest_name.as_str(), &cwd_descriptor));
+        }
+
         let Some((preopen_guest, descriptor)) = best else {
             return Err(p1::errno::NOTCAPABLE);
         };
@@ -1940,6 +2013,9 @@ where
                 crate::resolve_absolute_path(path).map_err(p1_errno_from_component_path)?;
             return self.resolve_absolute_guest_base(&guest_name);
         }
+        if let Some(cwd) = self.cwd.as_ref() {
+            return Ok((cwd.descriptor.clone(), path.to_owned()));
+        }
         let base = match self.descriptors.get(fd) {
             Some(Preview1Descriptor::Preopen { descriptor, .. })
             | Some(Preview1Descriptor::File { descriptor, .. })
@@ -1951,6 +2027,19 @@ where
             None => return Err(p1::errno::BADF),
         };
         Ok((base, path.to_owned()))
+    }
+
+    fn resolve_preview1_path(&self, fd: i32, path: &str) -> Result<String, i32> {
+        if self.wasix_abi && path.starts_with('/') {
+            let guest_name =
+                crate::resolve_absolute_path(path).map_err(p1_errno_from_component_path)?;
+            let (absolute, _) = self.resolve_absolute_guest_path(&guest_name)?;
+            return Ok(absolute);
+        }
+        let Some(base) = p1_directory_descriptor(self.descriptors.get(fd)) else {
+            return Err(p1::errno::BADF);
+        };
+        crate::resolve_child_path(&base.path, path).map_err(p1_errno_from_component_path)
     }
 }
 
@@ -2233,6 +2322,22 @@ fn directory_authority_to_descriptor_flags(
         flags |= fs_types::DescriptorFlags::MUTATE_DIRECTORY;
     }
     flags
+}
+
+fn descriptor_flags_to_directory_authority(
+    flags: fs_types::DescriptorFlags,
+) -> DirectoryAuthorityRights {
+    let mut rights = DirectoryAuthorityRights::empty();
+    if flags.contains(fs_types::DescriptorFlags::READ) {
+        rights |= DirectoryAuthorityRights::READ;
+    }
+    if flags.contains(fs_types::DescriptorFlags::WRITE) {
+        rights |= DirectoryAuthorityRights::WRITE;
+    }
+    if flags.contains(fs_types::DescriptorFlags::MUTATE_DIRECTORY) {
+        rights |= DirectoryAuthorityRights::MUTATE_DIRECTORY;
+    }
+    rights
 }
 
 impl<CpuImpl, HostFs> CompilerCoreStore<CpuImpl, HostFs>
@@ -3590,6 +3695,7 @@ async fn run_program_executable<CpuImpl, HostFs>(
     args: Vec<String>,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
+    filesystem: Option<DebugFileSystemSnapshot>,
     spawner: crate::Spawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
     executable: ProgramExecutable,
@@ -3612,6 +3718,7 @@ where
                 args,
                 env,
                 authority,
+                filesystem,
                 spawner,
                 progress,
                 compiled,
@@ -3631,6 +3738,7 @@ where
                 args,
                 env,
                 authority,
+                filesystem,
                 spawner,
                 progress,
                 compiled,
@@ -3649,6 +3757,7 @@ where
                 args,
                 env,
                 authority,
+                filesystem,
                 spawner,
                 progress,
                 compiled,
@@ -3671,6 +3780,7 @@ async fn run_program_core_module<CpuImpl, HostFs>(
     args: Vec<String>,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
+    filesystem: Option<DebugFileSystemSnapshot>,
     spawner: crate::Spawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
     compiled: Arc<WasmtimeCompiledCoreModule>,
@@ -3691,6 +3801,7 @@ where
     let run_cpu = exec_context.cpu.clone();
     let instance_id = launched_instance.id();
     let imported_memory = imported_shared_memory_with_user_budget(engine.raw(), &compiled.module)?;
+    let wasix_abi = core_module_imports_wasix(&compiled.module);
     let mut store = wasmtime::Store::new(
         engine.raw(),
         Preview1ProgramStore::<CpuImpl, HostFs>::new(
@@ -3711,7 +3822,9 @@ where
             exec_context.read_serial,
             exec_context.write_serial,
             imported_memory.clone(),
+            filesystem,
             Some(compiled.clone()),
+            wasix_abi,
         ),
     );
     configure_preview1_program_store(&mut store);
@@ -3761,11 +3874,13 @@ where
         Ok(()) => Ok(ChildExit {
             instance_id,
             exit_code: 0,
+            filesystem: Some(store.data().filesystem.snapshot()),
         }),
         Err(error) => match store.data_mut().take_requested_exit() {
             Some(code) => Ok(ChildExit {
                 instance_id,
                 exit_code: code,
+                filesystem: Some(store.data().filesystem.snapshot()),
             }),
             None => Err(map_program_runtime_error(error)),
         },
@@ -3779,6 +3894,7 @@ async fn run_program_core_module_with_restore<CpuImpl, HostFs>(
     args: Vec<String>,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
+    filesystem: Option<DebugFileSystemSnapshot>,
     spawner: crate::Spawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
     compiled: Arc<WasmtimeCompiledCoreModule>,
@@ -3800,6 +3916,7 @@ where
     let run_cpu = exec_context.cpu.clone();
     let instance_id = launched_instance.id();
     let imported_memory = Some(restore.memory.clone());
+    let wasix_abi = core_module_imports_wasix(&compiled.module);
     let mut store = wasmtime::Store::new(
         engine.raw(),
         Preview1ProgramStore::<CpuImpl, HostFs>::new(
@@ -3820,7 +3937,9 @@ where
             exec_context.read_serial,
             exec_context.write_serial,
             imported_memory.clone(),
+            filesystem,
             Some(compiled.clone()),
+            wasix_abi,
         ),
     );
     store.data_mut().descriptors = restore.descriptors;
@@ -3886,11 +4005,13 @@ where
         Ok(()) => Ok(ChildExit {
             instance_id,
             exit_code: 0,
+            filesystem: Some(store.data().filesystem.snapshot()),
         }),
         Err(error) => match store.data_mut().take_requested_exit() {
             Some(code) => Ok(ChildExit {
                 instance_id,
                 exit_code: code,
+                filesystem: Some(store.data().filesystem.snapshot()),
             }),
             None => Err(map_program_runtime_error(error)),
         },
@@ -3904,6 +4025,7 @@ async fn run_program_component<CpuImpl, HostFs>(
     args: Vec<String>,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
+    _filesystem: Option<DebugFileSystemSnapshot>,
     spawner: crate::Spawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
     compiled: Arc<WasmtimeCompiledComponent>,
@@ -3979,6 +4101,7 @@ where
     Ok(ChildExit {
         instance_id: result.instance_id,
         exit_code: result.exit_code,
+        filesystem: None,
     })
 }
 
@@ -4346,6 +4469,7 @@ where
         environment,
         ProgramExecutable::ForkedCoreModule { compiled, restore },
         store.data().authority.clone(),
+        Some(store.data().filesystem.snapshot()),
     )?;
     let pid = u32::try_from(child.instance_id.raw()).map_err(|_| ProgramExecError {
         kind: ProgramExecErrorKind::Internal,
@@ -6807,15 +6931,23 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let base = match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Preopen { descriptor, .. })
-        | Some(Preview1Descriptor::File { descriptor, .. })
-            if descriptor.kind == FsNodeKind::Directory =>
-        {
-            descriptor.clone()
+    let (base, path) = if caller.data().wasix_abi {
+        match caller.data().resolve_wasix_path_base(fd, &path) {
+            Ok(resolved) => resolved,
+            Err(errno) => return errno,
         }
-        Some(_) => return p1::errno::NOTDIR,
-        None => return p1::errno::BADF,
+    } else {
+        let base = match caller.data().descriptors.get(fd) {
+            Some(Preview1Descriptor::Preopen { descriptor, .. })
+            | Some(Preview1Descriptor::File { descriptor, .. })
+                if descriptor.kind == FsNodeKind::Directory =>
+            {
+                descriptor.clone()
+            }
+            Some(_) => return p1::errno::NOTDIR,
+            None => return p1::errno::BADF,
+        };
+        (base, path)
     };
     let path_flags = p1_path_flags(dirflags);
     let open_flags = p1_open_flags(oflags);
@@ -7032,7 +7164,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let path = match p1_read_path(caller, memory, path, path_len) {
+    let path = match wasix_read_exec_string(caller, memory, path, path_len) {
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
@@ -7151,12 +7283,9 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
-    let Some(base) = p1_directory_descriptor(caller.data().descriptors.get(fd)) else {
-        return p1::errno::BADF;
-    };
-    let absolute = match crate::resolve_child_path(&base.path, &path) {
+    let absolute = match caller.data().resolve_preview1_path(fd, &path) {
         Ok(absolute) => absolute,
-        Err(error) => return p1_errno_from_component_path(error),
+        Err(errno) => return errno,
     };
     let stat_value = if let Some(host_path) = crate::guest_host_share_path(&absolute) {
         let service = match caller.data().filesystem.host_service() {
@@ -8104,7 +8233,7 @@ where
         Ok(cwd) => cwd,
         Err(errno) => return errno,
     };
-    let needed = match u32::try_from(cwd.len()) {
+    let needed = match u32::try_from(cwd.len().saturating_add(1)) {
         Ok(needed) => needed,
         Err(_) => return p1::errno::OVERFLOW,
     };
@@ -8115,7 +8244,11 @@ where
     if capacity < needed {
         return p1::errno::RANGE;
     }
-    preview1_write_memory(memory, path, cwd.as_bytes())
+    let status = preview1_write_memory(memory, path, cwd.as_bytes());
+    if status != p1::errno::SUCCESS {
+        return status;
+    }
+    preview1_write_memory(memory, path.saturating_add(needed - 1), &[0])
 }
 
 fn wasix_chdir<CpuImpl, HostFs>(
@@ -8130,7 +8263,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let path = match p1_read_path(caller, memory, path, path_len) {
+    let path = match wasix_read_exec_string(caller, memory, path, path_len) {
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
@@ -8407,7 +8540,7 @@ where
     let exec_context = caller.data().exec_context();
     let authority = caller.data().authority.clone();
     let result = service
-        .exec_buffered(
+        .exec_buffered_with_snapshot(
             exec_context,
             guest_name,
             argv,
@@ -8416,9 +8549,17 @@ where
             None,
             Vec::new(),
             authority,
+            Some(caller.data().filesystem.snapshot()),
         )
         .await
         .map_err(wasmtime::Error::new)?;
+    let (result, filesystem) = result;
+    if let Some(filesystem) = filesystem {
+        caller
+            .data_mut()
+            .filesystem
+            .replace_with_snapshot(filesystem);
+    }
     caller.data().write_output(
         crate::ComponentOutputStreamKind::Stdout,
         &result.output.stdout,
@@ -8813,6 +8954,7 @@ where
             prepared.source,
             None,
             authority,
+            Some(caller.data().filesystem.snapshot()),
         )
         .await
         .map_err(|error| p1_errno_from_program_exec_error(&error))?;
@@ -9064,7 +9206,8 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    let name = p1_read_path(caller, memory, name, name_len).map_err(wasmtime::Error::new)?;
+    let name =
+        wasix_read_exec_string(caller, memory, name, name_len).map_err(wasmtime::Error::new)?;
     let guest_name = if name.starts_with('/') {
         crate::resolve_absolute_path(&name).map_err(|_| {
             wasmtime::Error::new(ProgramExecError {
@@ -9113,7 +9256,15 @@ fn wasix_read_exec_string<T>(
     if len == 0 {
         return Ok(String::new());
     }
-    p1_read_path(caller, memory, ptr, len)
+    p1_read_memory(caller, memory, ptr, len as usize).and_then(|mut bytes| {
+        while bytes.last().is_some_and(|byte| *byte == 0) {
+            bytes.pop();
+        }
+        String::from_utf8(bytes).map_err(|_| ProgramExecError {
+            kind: ProgramExecErrorKind::InvalidPath,
+            detail: ProgramExecErrorDetail::InvalidProgramPathEncoding,
+        })
+    })
 }
 
 fn wasix_split_lines(value: &str) -> Vec<String> {
@@ -11684,6 +11835,12 @@ fn validate_preview1_program_module_imports(module: &Module) -> Result<(), Progr
         validate_preview1_program_import(import.module(), import.name())?;
     }
     Ok(())
+}
+
+fn core_module_imports_wasix(module: &Module) -> bool {
+    module
+        .imports()
+        .any(|import| import.module() == WASIX_MODULE)
 }
 
 fn validate_preview1_program_import(module_name: &str, name: &str) -> Result<(), ProgramExecError> {
