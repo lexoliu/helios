@@ -1903,6 +1903,27 @@ where
             .map_or(p1::errno::NOTCAPABLE, |_| p1::errno::SUCCESS)
     }
 
+    fn require_hardlink_authority(&self) -> i32 {
+        if self.authority.derive_link_source_cap().is_err()
+            || self.authority.derive_link_target_directory_cap().is_err()
+        {
+            return p1::errno::NOTCAPABLE;
+        }
+        p1::errno::SUCCESS
+    }
+
+    fn require_symlink_create_authority(&self) -> i32 {
+        self.authority
+            .derive_symlink_create_cap()
+            .map_or(p1::errno::NOTCAPABLE, |_| p1::errno::SUCCESS)
+    }
+
+    fn require_symlink_read_authority(&self) -> i32 {
+        self.authority
+            .derive_symlink_read_cap()
+            .map_or(p1::errno::NOTCAPABLE, |_| p1::errno::SUCCESS)
+    }
+
     fn require_privileged_bind_authority(&self) -> i32 {
         self.authority
             .derive_privileged_bind_cap()
@@ -7751,6 +7772,10 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
+    let status = caller.data().require_hardlink_authority();
+    if status != p1::errno::SUCCESS {
+        return status;
+    }
     let (source_base, old_path, source_absolute) =
         match caller.data().resolve_preview1_path(old_fd, &old_path) {
             Ok(resolved) => resolved,
@@ -7829,6 +7854,10 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
+    let status = caller.data().require_symlink_read_authority();
+    if status != p1::errno::SUCCESS {
+        return status;
+    }
     let (base, path, absolute) = match caller.data().resolve_preview1_path(fd, &path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
@@ -8031,6 +8060,10 @@ where
         Ok(path) => path,
         Err(_) => return p1::errno::FAULT,
     };
+    let status = caller.data().require_symlink_create_authority();
+    if status != p1::errno::SUCCESS {
+        return status;
+    }
     let (base, new_path, absolute) = match caller.data().resolve_preview1_path(fd, &new_path) {
         Ok(resolved) => resolved,
         Err(errno) => return errno,
