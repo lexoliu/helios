@@ -5435,9 +5435,10 @@ mod tests {
         DEFAULT_WASI_TCP_KEEP_ALIVE_IDLE_NANOS, DEFAULT_WASI_TCP_KEEP_ALIVE_INTERVAL_NANOS,
         DEFAULT_WASI_TCP_LISTEN_BACKLOG, DebugFileSystem, FsDescriptor, FsNodeKind,
         P2ResolveAddressStream, TcpSocket, WasiTcpSocketAddress, WasiTcpSocketFamily,
-        WasiUdpSocketError, fs_types, has_wasi_network_rights, ip_name_lookup, map_p3_dns_error,
-        map_p3_tcp_error, map_p3_udp_socket_error, preview3, socket_types, wasi_tcp_bind_rights,
-        wasi_udp_bind_rights,
+        WasiUdpSocketError, WasiUdpSocketFamily, fs_types, has_wasi_network_rights, ip_name_lookup,
+        map_p3_dns_error, map_p3_tcp_error, map_p3_udp_family, map_p3_udp_socket_error,
+        parse_p3_tcp_socket_address, parse_p3_udp_socket_address, preview3, socket_types,
+        wasi_tcp_bind_rights, wasi_udp_bind_rights,
     };
 
     #[derive(Clone)]
@@ -6588,6 +6589,38 @@ mod tests {
                 detail: crate::NetworkErrorDetail::InternalInvariant,
             }),
             ip_name_lookup::ErrorCode::Other(None)
+        ));
+    }
+
+    #[test]
+    fn p3_ipv4_sockets_reject_ipv6_addresses_and_families() {
+        assert!(matches!(
+            map_p3_udp_family(socket_types::IpAddressFamily::Ipv6),
+            Err(WasiUdpSocketError::NotSupported)
+        ));
+        assert!(matches!(
+            parse_p3_tcp_socket_address(
+                socket_types::IpSocketAddress::Ipv6(socket_types::Ipv6SocketAddress {
+                    port: 80,
+                    flow_info: 0,
+                    address: (0, 0, 0, 0, 0, 0, 0, 1),
+                    scope_id: 0,
+                }),
+                WasiTcpSocketFamily::Ipv4,
+            ),
+            Err(socket_types::ErrorCode::NotSupported)
+        ));
+        assert!(matches!(
+            parse_p3_udp_socket_address(
+                socket_types::IpSocketAddress::Ipv6(socket_types::Ipv6SocketAddress {
+                    port: 53,
+                    flow_info: 0,
+                    address: (0, 0, 0, 0, 0, 0, 0, 1),
+                    scope_id: 0,
+                }),
+                WasiUdpSocketFamily::Ipv4,
+            ),
+            Err(WasiUdpSocketError::NotSupported)
         ));
     }
 

@@ -3284,8 +3284,9 @@ mod tests {
     use alloc::string::String;
 
     use super::{
-        PREVIEW2_WIT_PACKAGES, WasiTcpSocketFamily, map_p2_tcp_core_error, map_p2_tcp_socket_error,
-        p2net, p2tcp, parse_p2_tcp_socket_address,
+        PREVIEW2_WIT_PACKAGES, WasiTcpSocketFamily, WasiUdpSocketError, WasiUdpSocketFamily,
+        map_p2_tcp_core_error, map_p2_tcp_socket_error, p2net, p2tcp, p2udp,
+        parse_p2_tcp_socket_address, parse_p2_udp_socket_address,
     };
 
     #[test]
@@ -3349,5 +3350,30 @@ mod tests {
         )
         .expect_err("IPv6 address must not be accepted by IPv4 socket");
         assert_eq!(ipv6, p2tcp::ErrorCode::NotSupported);
+    }
+
+    #[test]
+    fn p2_udp_ipv4_socket_rejects_ipv6_addresses_and_family() {
+        let ipv4 = parse_p2_udp_socket_address(
+            p2udp::IpSocketAddress::Ipv4(p2net::Ipv4SocketAddress {
+                port: 53,
+                address: (127, 0, 0, 1),
+            }),
+            WasiUdpSocketFamily::Ipv4,
+        )
+        .expect("IPv4 address should parse for IPv4 socket");
+        assert_eq!(ipv4.port, 53);
+
+        let ipv6 = parse_p2_udp_socket_address(
+            p2udp::IpSocketAddress::Ipv6(p2net::Ipv6SocketAddress {
+                port: 53,
+                flow_info: 0,
+                address: (0, 0, 0, 0, 0, 0, 0, 1),
+                scope_id: 0,
+            }),
+            WasiUdpSocketFamily::Ipv4,
+        )
+        .expect_err("IPv6 address must not be accepted by IPv4 socket");
+        assert!(matches!(ipv6, WasiUdpSocketError::NotSupported));
     }
 }
