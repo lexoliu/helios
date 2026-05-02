@@ -41,6 +41,11 @@ const WASIX_ASYNCIFY_DATA_SIZE: u32 = 8;
 const WASIX_STACK_SNAPSHOT_SIZE: usize = 24;
 const WASIX_MODULE: &str = "wasix_32v1";
 const DEFAULT_WASIX_SOCKET_BUFFER_BYTES: u64 = 64 * 1024;
+const DEFAULT_WASIX_SOCKET_LOW_WATER_BYTES: u64 = 1;
+const DEFAULT_WASIX_SOCKET_TTL: u64 = 64;
+const DEFAULT_WASIX_SOCKET_MULTICAST_TTL: u64 = 1;
+const WASIX_IPPROTO_TCP: u64 = 6;
+const WASIX_IPPROTO_UDP: u64 = 17;
 
 fn system_component_profile_stack(component_name: &str) -> String {
     let mut stack = String::with_capacity(
@@ -428,6 +433,7 @@ enum WasixSocketDescriptor {
         writer: crate::ByteWriter,
         carry: Bytes,
         options: WasixSocketOptions,
+        socket_type: i32,
     },
 }
 
@@ -461,6 +467,10 @@ struct WasixSocketOptions {
     flag_bits: u32,
     receive_buffer_size: u64,
     send_buffer_size: u64,
+    receive_low_water: u64,
+    send_low_water: u64,
+    ttl: u64,
+    multicast_ttl_v4: u64,
     receive_timeout: Option<u64>,
     send_timeout: Option<u64>,
     connect_timeout: Option<u64>,
@@ -474,6 +484,10 @@ impl Default for WasixSocketOptions {
             flag_bits: 0,
             receive_buffer_size: DEFAULT_WASIX_SOCKET_BUFFER_BYTES,
             send_buffer_size: DEFAULT_WASIX_SOCKET_BUFFER_BYTES,
+            receive_low_water: DEFAULT_WASIX_SOCKET_LOW_WATER_BYTES,
+            send_low_water: DEFAULT_WASIX_SOCKET_LOW_WATER_BYTES,
+            ttl: DEFAULT_WASIX_SOCKET_TTL,
+            multicast_ttl_v4: DEFAULT_WASIX_SOCKET_MULTICAST_TTL,
             receive_timeout: None,
             send_timeout: None,
             connect_timeout: None,
@@ -495,6 +509,33 @@ impl WasixSocketOptions {
             self.flag_bits &= !bit;
         }
         p1::errno::SUCCESS
+    }
+
+    fn set_size(&mut self, option: i32, size: u64) -> i32 {
+        match option {
+            WASIX_SOCK_OPTION_RECV_BUF_SIZE => self.receive_buffer_size = size,
+            WASIX_SOCK_OPTION_SEND_BUF_SIZE => self.send_buffer_size = size,
+            WASIX_SOCK_OPTION_RECV_LOWAT => self.receive_low_water = size,
+            WASIX_SOCK_OPTION_SEND_LOWAT => self.send_low_water = size,
+            WASIX_SOCK_OPTION_TTL => self.ttl = size,
+            WASIX_SOCK_OPTION_MULTICAST_TTL_V4 => self.multicast_ttl_v4 = size,
+            WASIX_SOCK_OPTION_TYPE | WASIX_SOCK_OPTION_PROTO => return p1::errno::INVAL,
+            _ => return p1::errno::INVAL,
+        }
+        p1::errno::SUCCESS
+    }
+
+    fn size(self, option: i32) -> Result<u64, i32> {
+        match option {
+            WASIX_SOCK_OPTION_RECV_BUF_SIZE => Ok(self.receive_buffer_size),
+            WASIX_SOCK_OPTION_SEND_BUF_SIZE => Ok(self.send_buffer_size),
+            WASIX_SOCK_OPTION_RECV_LOWAT => Ok(self.receive_low_water),
+            WASIX_SOCK_OPTION_SEND_LOWAT => Ok(self.send_low_water),
+            WASIX_SOCK_OPTION_TTL => Ok(self.ttl),
+            WASIX_SOCK_OPTION_MULTICAST_TTL_V4 => Ok(self.multicast_ttl_v4),
+            WASIX_SOCK_OPTION_TYPE | WASIX_SOCK_OPTION_PROTO => Err(p1::errno::INVAL),
+            _ => Err(p1::errno::INVAL),
+        }
     }
 
     fn flag(self, option: i32) -> Result<bool, i32> {
@@ -540,6 +581,22 @@ impl WasixSocketDescriptor {
             WasixSocketDescriptor::Tcp(socket) => socket.options_mut(),
             WasixSocketDescriptor::Udp(socket) => socket.options_mut(),
             WasixSocketDescriptor::Pair { options, .. } => options,
+        }
+    }
+
+    fn socket_type(&self) -> i32 {
+        match self {
+            WasixSocketDescriptor::Tcp(_) => WASIX_SOCK_TYPE_STREAM,
+            WasixSocketDescriptor::Udp(_) => WASIX_SOCK_TYPE_DGRAM,
+            WasixSocketDescriptor::Pair { socket_type, .. } => *socket_type,
+        }
+    }
+
+    fn protocol(&self) -> u64 {
+        match self {
+            WasixSocketDescriptor::Tcp(_) => WASIX_IPPROTO_TCP,
+            WasixSocketDescriptor::Udp(_) => WASIX_IPPROTO_UDP,
+            WasixSocketDescriptor::Pair { .. } => 0,
         }
     }
 }
@@ -10212,12 +10269,14 @@ where
         writer: left_writer,
         carry: Bytes::new(),
         options: WasixSocketOptions::default(),
+        socket_type: socktype,
     });
     let second = Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
         reader: right_reader,
         writer: right_writer,
         carry: Bytes::new(),
         options: WasixSocketOptions::default(),
+        socket_type: socktype,
     });
     let fd0 = match caller.data_mut().descriptors.insert(first) {
         Ok(fd) => fd,
@@ -10438,17 +10497,7 @@ where
             None => p1::errno::BADF,
         };
     };
-    match option {
-        WASIX_SOCK_OPTION_RECV_BUF_SIZE => {
-            descriptor.options_mut().receive_buffer_size = size;
-            p1::errno::SUCCESS
-        }
-        WASIX_SOCK_OPTION_SEND_BUF_SIZE => {
-            descriptor.options_mut().send_buffer_size = size;
-            p1::errno::SUCCESS
-        }
-        _ => p1::errno::INVAL,
-    }
+    descriptor.options_mut().set_size(option, size)
 }
 
 fn wasix_sock_get_opt_size<CpuImpl, HostFs>(
@@ -10468,9 +10517,12 @@ where
         };
     };
     let size = match option {
-        WASIX_SOCK_OPTION_RECV_BUF_SIZE => descriptor.options().receive_buffer_size,
-        WASIX_SOCK_OPTION_SEND_BUF_SIZE => descriptor.options().send_buffer_size,
-        _ => return p1::errno::INVAL,
+        WASIX_SOCK_OPTION_TYPE => descriptor.socket_type() as u64,
+        WASIX_SOCK_OPTION_PROTO => descriptor.protocol(),
+        _ => match descriptor.options().size(option) {
+            Ok(size) => size,
+            Err(errno) => return errno,
+        },
     };
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
@@ -12348,10 +12400,16 @@ const WASIX_SOCK_OPTION_LINGER: i32 = 13;
 const WASIX_SOCK_OPTION_OOB_INLINE: i32 = 14;
 const WASIX_SOCK_OPTION_RECV_BUF_SIZE: i32 = 15;
 const WASIX_SOCK_OPTION_SEND_BUF_SIZE: i32 = 16;
+const WASIX_SOCK_OPTION_RECV_LOWAT: i32 = 17;
+const WASIX_SOCK_OPTION_SEND_LOWAT: i32 = 18;
 const WASIX_SOCK_OPTION_RECV_TIMEOUT: i32 = 19;
 const WASIX_SOCK_OPTION_SEND_TIMEOUT: i32 = 20;
 const WASIX_SOCK_OPTION_CONNECT_TIMEOUT: i32 = 21;
 const WASIX_SOCK_OPTION_ACCEPT_TIMEOUT: i32 = 22;
+const WASIX_SOCK_OPTION_TTL: i32 = 23;
+const WASIX_SOCK_OPTION_MULTICAST_TTL_V4: i32 = 24;
+const WASIX_SOCK_OPTION_TYPE: i32 = 25;
+const WASIX_SOCK_OPTION_PROTO: i32 = 26;
 const WASIX_RIFLAGS_DATA_TRUNCATED: u16 = 1 << 2;
 const WASIX_ADDRESS_FAMILY_UNSPEC: u8 = 0;
 const WASIX_ADDRESS_FAMILY_IP_INET4: u8 = 1;
@@ -12704,6 +12762,7 @@ mod tests {
             writer: left_writer,
             carry: Bytes::new(),
             options: WasixSocketOptions::default(),
+            socket_type: WASIX_SOCK_TYPE_STREAM,
         });
         let nonsocket = Preview1Descriptor::Stdout;
 
@@ -12768,12 +12827,57 @@ mod tests {
             descriptor.options().send_buffer_size,
             DEFAULT_WASIX_SOCKET_BUFFER_BYTES
         );
+        assert_eq!(
+            descriptor.options().size(WASIX_SOCK_OPTION_RECV_LOWAT),
+            Ok(DEFAULT_WASIX_SOCKET_LOW_WATER_BYTES)
+        );
+        assert_eq!(
+            descriptor.options().size(WASIX_SOCK_OPTION_TTL),
+            Ok(DEFAULT_WASIX_SOCKET_TTL)
+        );
 
-        descriptor.options_mut().receive_buffer_size = 4096;
-        descriptor.options_mut().send_buffer_size = 8192;
+        assert_eq!(
+            descriptor
+                .options_mut()
+                .set_size(WASIX_SOCK_OPTION_RECV_BUF_SIZE, 4096),
+            p1::errno::SUCCESS
+        );
+        assert_eq!(
+            descriptor
+                .options_mut()
+                .set_size(WASIX_SOCK_OPTION_SEND_BUF_SIZE, 8192),
+            p1::errno::SUCCESS
+        );
+        assert_eq!(
+            descriptor
+                .options_mut()
+                .set_size(WASIX_SOCK_OPTION_RECV_LOWAT, 2),
+            p1::errno::SUCCESS
+        );
+        assert_eq!(
+            descriptor
+                .options_mut()
+                .set_size(WASIX_SOCK_OPTION_TTL, 128),
+            p1::errno::SUCCESS
+        );
 
         assert_eq!(descriptor.options().receive_buffer_size, 4096);
         assert_eq!(descriptor.options().send_buffer_size, 8192);
+        assert_eq!(
+            descriptor.options().size(WASIX_SOCK_OPTION_RECV_LOWAT),
+            Ok(2)
+        );
+        assert_eq!(descriptor.options().size(WASIX_SOCK_OPTION_TTL), Ok(128));
+        assert_eq!(
+            descriptor
+                .options_mut()
+                .set_size(WASIX_SOCK_OPTION_TYPE, WASIX_SOCK_TYPE_STREAM as u64),
+            p1::errno::INVAL
+        );
+        assert_eq!(
+            descriptor.options().size(WASIX_SOCK_OPTION_RECV_TIMEOUT),
+            Err(p1::errno::INVAL)
+        );
     }
 
     #[test]
