@@ -4944,6 +4944,15 @@ mod tests {
             [2, 0, 0, 0, 0, 1]
         }
 
+        fn ipv4_cidr(
+            &self,
+        ) -> impl core::future::Future<Output = Option<crate::Ipv4Cidr>> + Send + '_ {
+            core::future::ready(Some(crate::Ipv4Cidr::new(
+                crate::Ipv4Address::new([127, 0, 0, 1]),
+                8,
+            )))
+        }
+
         fn ping(
             &self,
             _: &str,

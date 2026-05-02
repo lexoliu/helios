@@ -46,6 +46,8 @@ impl ComponentHostUdpSocketToken for u64 {
 trait DynComponentHostNetworkService: Send + Sync + 'static {
     fn hardware_address(&self) -> [u8; 6];
 
+    fn ipv4_cidr(&self) -> Pin<Box<dyn Future<Output = Option<crate::Ipv4Cidr>> + Send + '_>>;
+
     fn ping<'a>(
         &'a self,
         host: &'a str,
@@ -129,6 +131,10 @@ impl ComponentNetworkService for ComponentHostNetworkService {
 
     fn hardware_address(&self) -> [u8; 6] {
         self.inner.hardware_address()
+    }
+
+    fn ipv4_cidr(&self) -> impl Future<Output = Option<crate::Ipv4Cidr>> + Send + '_ {
+        self.inner.ipv4_cidr()
     }
 
     fn ping<'a>(
@@ -223,6 +229,10 @@ where
 {
     fn hardware_address(&self) -> [u8; 6] {
         self.service.hardware_address()
+    }
+
+    fn ipv4_cidr(&self) -> Pin<Box<dyn Future<Output = Option<crate::Ipv4Cidr>> + Send + '_>> {
+        Box::pin(async move { self.service.ipv4_cidr().await })
     }
 
     fn ping<'a>(

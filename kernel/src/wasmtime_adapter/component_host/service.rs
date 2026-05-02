@@ -3398,13 +3398,15 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "port_addr_list",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             _addrs: i32,
-             naddrs: i32|
-             -> i32 { wasix_port_empty_list(&mut caller, naddrs as u32) },
+             (addrs, naddrs): (i32, i32)| {
+                Box::new(async move {
+                    wasix_port_addr_list(&mut caller, addrs as u32, naddrs as u32).await
+                })
+            },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -10187,6 +10189,46 @@ where
     wasix_network_admin_unavailable(caller)
 }
 
+async fn wasix_port_addr_list<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    addrs: u32,
+    naddrs: u32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let status = caller.data().require_network_admin_authority();
+    if status != p1::errno::SUCCESS {
+        return status;
+    }
+    let Some(service) = caller.data().runtime_state.network_service() else {
+        return p1::errno::NETDOWN;
+    };
+    let Some(memory) = p1_memory(caller) else {
+        return p1::errno::FAULT;
+    };
+    let capacity = match p1_try_read_u32(caller, memory, naddrs) {
+        Ok(capacity) => capacity,
+        Err(_) => return p1::errno::FAULT,
+    };
+    let Some(cidr) = service.ipv4_cidr().await else {
+        return p1_write_u32(caller, memory, naddrs, 0);
+    };
+    if capacity == 0 {
+        let status = p1_write_u32(caller, memory, naddrs, 1);
+        if status != p1::errno::SUCCESS {
+            return status;
+        }
+        return p1::errno::OVERFLOW;
+    }
+    let status = write_wasix_addr_cidr_ip4(caller, memory, addrs, cidr);
+    if status != p1::errno::SUCCESS {
+        return status;
+    }
+    p1_write_u32(caller, memory, naddrs, 1)
+}
+
 fn wasix_sock_status<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
@@ -11597,6 +11639,21 @@ fn write_wasix_addr_ip4<T>(
     ))
 }
 
+fn write_wasix_addr_cidr_ip4<T>(
+    caller: &mut Caller<'_, T>,
+    memory: Preview1Memory,
+    ptr: u32,
+    cidr: crate::Ipv4Cidr,
+) -> i32 {
+    let mut bytes = [0_u8; WASIX_ADDR_CIDR_SIZE as usize];
+    bytes[0] = WASIX_ADDRESS_FAMILY_IP_INET4;
+    bytes[WASIX_ADDR_CIDR_IP4_ADDRESS_OFFSET as usize
+        ..WASIX_ADDR_CIDR_IP4_ADDRESS_OFFSET as usize + 4]
+        .copy_from_slice(&cidr.address().octets());
+    bytes[WASIX_ADDR_CIDR_IP4_PREFIX_OFFSET as usize] = cidr.prefix_len();
+    p1_write_memory(caller, memory, ptr, &bytes)
+}
+
 fn write_wasix_addr_port_ip4<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
@@ -12793,6 +12850,10 @@ const WASIX_ADDRESS_FAMILY_IP_INET6_I32: i32 = 2;
 const WASIX_ADDRESS_FAMILY_UNIX_I32: i32 = 3;
 const WASIX_ADDR_IP_UNION_OFFSET: u32 = 2;
 const WASIX_ADDR_IP_SIZE: u32 = 18;
+const WASIX_ADDR_CIDR_SIZE: u32 = 28;
+const WASIX_ADDR_CIDR_UNION_OFFSET: u32 = 2;
+const WASIX_ADDR_CIDR_IP4_ADDRESS_OFFSET: u32 = WASIX_ADDR_CIDR_UNION_OFFSET;
+const WASIX_ADDR_CIDR_IP4_PREFIX_OFFSET: u32 = WASIX_ADDR_CIDR_IP4_ADDRESS_OFFSET + 4;
 const WASIX_ADDR_PORT_UNION_OFFSET: u32 = 2;
 const WASIX_ADDR_PORT_IP4_ADDRESS_OFFSET: u32 = 4;
 const WASIX_EPOLL_TYPE_EPOLLIN: u32 = 1 << 0;

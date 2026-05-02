@@ -396,6 +396,8 @@ pub trait ComponentNetworkService: Clone + Send + 'static {
 
     fn hardware_address(&self) -> [u8; 6];
 
+    fn ipv4_cidr(&self) -> impl Future<Output = Option<crate::Ipv4Cidr>> + Send + '_;
+
     fn ping<'a>(
         &'a self,
         host: &'a str,

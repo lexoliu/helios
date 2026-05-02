@@ -1113,6 +1113,13 @@ where
     pub fn hardware_address(&self) -> [u8; 6] {
         self.inner.device.mac_address()
     }
+
+    pub async fn ipv4_cidr(&self) -> Option<crate::Ipv4Cidr> {
+        let state = self.inner.state.lock().await;
+        state
+            .ipv4_address
+            .map(|cidr| crate::Ipv4Cidr::new(map_ipv4_address(cidr.address()), cidr.prefix_len()))
+    }
 }
 
 impl<CpuImpl, Runtime, DeviceImpl> ComponentNetworkService
@@ -1127,6 +1134,10 @@ where
 
     fn hardware_address(&self) -> [u8; 6] {
         NetworkService::hardware_address(self)
+    }
+
+    fn ipv4_cidr(&self) -> impl core::future::Future<Output = Option<crate::Ipv4Cidr>> + Send + '_ {
+        async move { NetworkService::ipv4_cidr(self).await }
     }
 
     fn ping<'a>(
