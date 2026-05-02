@@ -21,8 +21,9 @@ This script:
    `wasi_snapshot_preview1.command.wasm` adapter.
 2. Wraps the preview1 core module into a WASI P2 component via
    `wasm-tools component new --adapt …`.
-3. Installs `python3.wasm` plus `lib/python3.14/` (the CPython stdlib)
-   under `artifacts/python3-root/`.
+3. Installs `python3.wasm`, checksum/provenance sidecars, and
+   `lib/python3.14/` (the CPython stdlib) under
+   `artifacts/python3-root/`.
 4. Downloads and extracts the pinned official Wasmer WEBc images for
    `sharrattj/dash` `1.0.19`, `wasmer/bash` `1.0.25`,
    `saghul/quickjs` `0.0.3`, and `wasmer/coreutils` `1.0.19`;
@@ -34,6 +35,10 @@ This script:
 Artifacts produced:
 
 - `artifacts/python3-root/python3.wasm` — real CPython 3.14 component.
+- `artifacts/python3-root/python3.wasm.sha256` — checksum consumed by
+  `helios-cli kernel-prebuild`.
+- `artifacts/python3-root/SOURCE.txt` — source package, version, URL, and
+  checksum record.
 - `artifacts/python3-root/lib/python3.14/` — CPython standard library.
 - `artifacts/wasix/dash/dash.wasm` — standard WASIX dash raw module.
 - `artifacts/wasix/dash/dash.wasm.sha256` — checksum consumed by

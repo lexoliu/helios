@@ -149,6 +149,13 @@ wasm-tools component new \
   -o "$python_component_raw"
 wasm-tools strip "$python_component_raw" -o "$python_root/python3.wasm"
 sha256sum "$python_root/python3.wasm" > "$python_root/python3.wasm.sha256"
+python_wasm_sha256="$(sha256_hex "$python_root/python3.wasm")"
+write_source_record \
+  "$python_root/SOURCE.txt" \
+  "brettcannon/cpython-wasi-build" \
+  "$cpython_version" \
+  "https://github.com/brettcannon/cpython-wasi-build" \
+  "$python_wasm_sha256"
 
 cp -r "$staging/cpython/lib" "$python_root/"
 
