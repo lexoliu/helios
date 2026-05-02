@@ -187,6 +187,18 @@ redirection, QuickJS, and CPython stdlib imports. Set
 release artifacts. Set `HELIOS_WASI_SMOKE_CURL=1` to include the networked
 curl smoke.
 
+The compiler-plugin performance gate for the staged curl artifact is:
+
+```bash
+tools/wasi-apps/aot-bench.sh
+```
+
+It runs the release AArch64/HVF `aot-bench` workload for
+`artifacts/wasi-tools/curl.wasm`, writes the full log under
+`target/perf-baselines/`, and prints the median `elapsed_ms` across
+iterations 2..N. Set `HELIOS_AOT_BENCH_COMPILER_TIMING=1` to include the
+compiler pass breakdown when diagnosing a regression.
+
 ## Run In Helios (RISC-V VM)
 
 Use inspector `vm` mode when checking RISC-V-specific behavior. Use
