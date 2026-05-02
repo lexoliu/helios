@@ -29,6 +29,7 @@ mod instance;
 mod kernel_exception;
 mod log;
 mod network_control;
+mod network_service;
 mod observer;
 mod pmm;
 mod poll_registry;
@@ -130,6 +131,7 @@ pub use network_control::{
     Ipv4Cidr, Ipv4Route, MacAddress, NetworkAdminBackend, NetworkBridgeId, NetworkControl,
     NetworkControlError, NetworkPortId,
 };
+pub use network_service::{NetworkDevice, NetworkService, TcpStreamId, UdpSocketId};
 pub use observer::{
     DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY, FoldedProfileSample,
     ProfileFilter, ProfileHistory, ProfileScope, StatsSample, TraceEvent, TraceField, TraceFilter,

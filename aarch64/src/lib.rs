@@ -97,6 +97,7 @@ unsafe extern "C" {
 mod vmm;
 pub use vmm::Aarch64UserAddressSpace;
 mod host_fs;
+mod net;
 
 mod debug_state {
     pub(crate) type RuntimeState =
@@ -440,6 +441,9 @@ extern "C" fn aarch64_kernel_main() -> ! {
     if host_fs::has_9p_device(boot_fdt.as_ref(), physical_memory_offset, &handoff) {
         devices = devices.with_host_share();
     }
+    if net::has_network_device(boot_fdt.as_ref(), physical_memory_offset, &handoff) {
+        devices = devices.with_network();
+    }
     let kernel = helios_kernel::init(
         Platform::new(console, core::iter::empty::<MemoryRegion>(), cpu.clone())
             .with_timer_frequency_hz(cpu.timer_frequency())
@@ -447,6 +451,14 @@ extern "C" fn aarch64_kernel_main() -> ! {
             .with_devices(devices),
     );
     host_fs::install(
+        boot_fdt.as_ref(),
+        physical_memory_offset,
+        &handoff,
+        &debug_state,
+    );
+    net::install(
+        &cpu,
+        &kernel,
         boot_fdt.as_ref(),
         physical_memory_offset,
         &handoff,

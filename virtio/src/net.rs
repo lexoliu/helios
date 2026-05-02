@@ -1,6 +1,7 @@
 use alloc::boxed::Box;
 use alloc::vec;
 use async_lock::Mutex;
+use core::future::Future;
 use core::mem::size_of;
 
 use helios_hal::io::{IoError, IoResult};
@@ -104,7 +105,6 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             );
             rx_buffers[usize::from(token)] = Some(buffer);
         }
-        rx_queue.notify(&transport);
 
         transport.set_status(
             DeviceStatus::ACKNOWLEDGE
@@ -112,6 +112,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 | DeviceStatus::FEATURES_OK
                 | DeviceStatus::DRIVER_OK,
         );
+        rx_queue.notify(&transport);
 
         Ok(Self {
             transport,
@@ -177,6 +178,15 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     }
 
     pub async fn transmit(&self, frame: &[u8]) -> IoResult<()> {
+        self.transmit_with_wait(frame, || self.interrupts.notified())
+            .await
+    }
+
+    pub async fn transmit_with_wait<Wait, Fut>(&self, frame: &[u8], mut wait: Wait) -> IoResult<()>
+    where
+        Wait: FnMut() -> Fut,
+        Fut: Future<Output = ()>,
+    {
         if frame.is_empty() || frame.len() > self.max_frame_len {
             return Err(IoError::InvalidBufferLength {
                 required_multiple: 1,
@@ -197,7 +207,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 assert_eq!(completed, token, "virtio net TX completion token mismatch");
                 return Ok(());
             }
-            self.interrupts.notified().await;
+            wait().await;
         }
     }
 

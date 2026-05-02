@@ -16,7 +16,6 @@ riscv = "0.16.0"
 riscv-rt = { version = "0.17.1", features = ["s-mode"] }
 sbi-rt = { version = "0.0.3", features = ["legacy"]}
 sbi-spec = { version = "0.0.7", default-features = false }
-smoltcp = { version = "0.13.0", default-features = false, features = ["alloc", "medium-ethernet", "proto-ipv4", "proto-dhcpv4", "proto-dns", "socket-dhcpv4", "socket-dns", "socket-icmp", "socket-tcp", "socket-udp"] }
 spin = { version = "0.9.8", default-features = false, features = ["mutex", "once", "spin_mutex"] }
 trapframe = { version = "0.10.1", default-features = false }
 helios-hal.workspace = true

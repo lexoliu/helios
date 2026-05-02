@@ -1,0 +1,171 @@
+extern crate alloc;
+
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use core::future::Future;
+
+use fdt::Fdt;
+use helios_hal::io::IoError;
+use helios_hal::watchdog::Watchdog;
+use helios_kernel::{Kernel, NetworkDevice, NetworkService};
+
+type Aarch64VirtioNetDevice = helios_virtio::VirtioNetDevice<
+    helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<helios_virtio::OffsetDmaPool>>,
+>;
+
+#[derive(Clone)]
+struct VirtioNetworkDevice {
+    inner: Arc<Aarch64VirtioNetDevice>,
+}
+
+pub(crate) fn install<WatchdogImpl>(
+    cpu: &crate::Aarch64Cpu,
+    kernel: &Kernel<crate::Aarch64Cpu, WatchdogImpl>,
+    fdt: Option<&Fdt<'_>>,
+    physical_memory_offset: usize,
+    handoff: &crate::LimineBootHandoff,
+    debug_state: &crate::debug_state::RuntimeState,
+) where
+    WatchdogImpl: Watchdog + Clone,
+{
+    let Some(device) = discover_network_device(fdt, physical_memory_offset, handoff) else {
+        tracing::warn!("virtio network device was not discovered on the platform bus");
+        return;
+    };
+    let service = NetworkService::new(cpu.clone(), debug_state.clone(), kernel.timer(), device);
+    debug_state.install_network_service(helios_kernel::ComponentHostNetworkService::from_service(
+        service.clone(),
+    ));
+    kernel.spawn_local_detached(async move {
+        service.run_requests().await;
+    });
+    tracing::info!("virtio network online");
+}
+
+pub(crate) fn has_network_device(
+    fdt: Option<&Fdt<'_>>,
+    physical_memory_offset: usize,
+    handoff: &crate::LimineBootHandoff,
+) -> bool {
+    if fdt.is_some_and(|fdt| {
+        crate::count_virtio_mmio_devices(fdt, helios_virtio::DeviceType::Network) != 0
+    }) {
+        return true;
+    }
+    scan_qemu_virt_mmio().any(|physical_base| {
+        crate::matches_virtio_mmio_device(
+            physical_base,
+            physical_memory_offset,
+            handoff,
+            helios_virtio::DeviceType::Network,
+        )
+    })
+}
+
+impl NetworkDevice for VirtioNetworkDevice {
+    fn mac_address(&self) -> [u8; 6] {
+        self.inner.mac_address()
+    }
+
+    fn max_frame_len(&self) -> usize {
+        self.inner.max_frame_len()
+    }
+
+    fn try_receive(&self) -> impl Future<Output = Result<Option<Box<[u8]>>, IoError>> + Send + '_ {
+        self.inner.try_receive()
+    }
+
+    fn transmit<'a>(
+        &'a self,
+        frame: &'a [u8],
+    ) -> impl Future<Output = Result<(), IoError>> + Send + 'a {
+        self.inner
+            .transmit_with_wait(frame, helios_kernel::yield_now)
+    }
+
+    fn wait_for_event(&self) -> impl Future<Output = ()> + Send + '_ {
+        helios_kernel::yield_now()
+    }
+}
+
+fn discover_network_device(
+    fdt: Option<&Fdt<'_>>,
+    physical_memory_offset: usize,
+    handoff: &crate::LimineBootHandoff,
+) -> Option<VirtioNetworkDevice> {
+    if let Some(fdt) = fdt {
+        for node in fdt.all_nodes() {
+            if !node
+                .compatible()
+                .is_some_and(|compatible| compatible.all().any(|entry| entry == "virtio,mmio"))
+            {
+                continue;
+            }
+
+            let Some(region) = node.raw_reg().and_then(|mut regs| regs.next()) else {
+                continue;
+            };
+            let physical_base =
+                crate::fdt_cells_to_usize(region.address, "AArch64 virtio MMIO base");
+            if !crate::matches_virtio_mmio_device(
+                physical_base,
+                physical_memory_offset,
+                handoff,
+                helios_virtio::DeviceType::Network,
+            ) {
+                continue;
+            }
+            let size = crate::fdt_cells_to_usize(region.size, "AArch64 virtio MMIO size");
+            return Some(init_network_device(
+                physical_base,
+                size,
+                physical_memory_offset,
+                handoff,
+            ));
+        }
+    }
+
+    scan_qemu_virt_mmio()
+        .find(|physical_base| {
+            crate::matches_virtio_mmio_device(
+                *physical_base,
+                physical_memory_offset,
+                handoff,
+                helios_virtio::DeviceType::Network,
+            )
+        })
+        .map(|physical_base| {
+            init_network_device(
+                physical_base,
+                crate::QEMU_VIRT_MMIO_SIZE,
+                physical_memory_offset,
+                handoff,
+            )
+        })
+}
+
+fn init_network_device(
+    physical_base: usize,
+    size: usize,
+    physical_memory_offset: usize,
+    handoff: &crate::LimineBootHandoff,
+) -> VirtioNetworkDevice {
+    assert!(size != 0, "AArch64 virtio-net node has zero MMIO size");
+    crate::map_mmio_page(physical_base, physical_memory_offset, handoff);
+    let virtual_base = crate::mmio_virtual_base(physical_base, physical_memory_offset);
+    let header = core::ptr::NonNull::new(virtual_base as *mut u8)
+        .unwrap_or_else(|| panic!("virtio MMIO base {virtual_base:#x} was unexpectedly null"));
+    let dma = helios_virtio::OffsetDmaPool::new(physical_memory_offset);
+    let device = unsafe { helios_virtio::net_from_mmio_with_dma(header, size, dma) }
+        .unwrap_or_else(|error| {
+            panic!("failed to initialize virtio-net device at {physical_base:#x}: {error}")
+        });
+    VirtioNetworkDevice {
+        inner: Arc::new(device),
+    }
+}
+
+fn scan_qemu_virt_mmio() -> impl Iterator<Item = usize> {
+    (0..crate::QEMU_VIRT_MMIO_SLOTS)
+        .map(|slot| crate::QEMU_VIRT_MMIO_BASE + slot * crate::QEMU_VIRT_MMIO_STRIDE)
+}

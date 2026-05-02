@@ -22,7 +22,7 @@ enum CurlError {
     MissingHost,
     #[error("URL must include a port")]
     MissingPort,
-    #[error("tcp connect failed for {host}:{port}")]
+    #[error("tcp connect failed for {host}:{port}: {source}")]
     TcpConnect {
         host: String,
         port: u16,

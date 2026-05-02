@@ -71,6 +71,19 @@ pub unsafe fn net_from_mmio(
     VirtioNetDevice::new(transport)
 }
 
+pub unsafe fn net_from_mmio_with_dma<P>(
+    header: NonNull<u8>,
+    mmio_size: usize,
+    dma: P,
+) -> IoResult<VirtioNetDevice<VirtioMmioTransport<MmioBus<P>>>>
+where
+    P: DmaPool,
+{
+    let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
+    let transport = VirtioMmioTransport::new(bus)?;
+    VirtioNetDevice::new(transport)
+}
+
 /// Builds a VirtIO 9P device from a permanently mapped MMIO header.
 ///
 /// # Safety

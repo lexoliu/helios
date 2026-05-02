@@ -101,6 +101,13 @@ mod guest {
                     capability_grants: vec![
                         host_programs::root_directory_grant(),
                         host_programs::root_link_grant(),
+                        host_programs::network_grant(vec![
+                            host_programs::NetworkRight::Tcp,
+                            host_programs::NetworkRight::Udp,
+                            host_programs::NetworkRight::Dns,
+                            host_programs::NetworkRight::PrivilegedBind,
+                            host_programs::NetworkRight::Multicast,
+                        ]),
                         host_programs::root_terminal_grant(),
                         host_programs::root_process_grant(),
                     ],
