@@ -458,15 +458,70 @@ enum WasixUdpSocket {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WasixSocketOptions {
+    flag_bits: u32,
     receive_buffer_size: u64,
     send_buffer_size: u64,
+    receive_timeout: Option<u64>,
+    send_timeout: Option<u64>,
+    connect_timeout: Option<u64>,
+    accept_timeout: Option<u64>,
+    linger: Option<u64>,
 }
 
 impl Default for WasixSocketOptions {
     fn default() -> Self {
         Self {
+            flag_bits: 0,
             receive_buffer_size: DEFAULT_WASIX_SOCKET_BUFFER_BYTES,
             send_buffer_size: DEFAULT_WASIX_SOCKET_BUFFER_BYTES,
+            receive_timeout: None,
+            send_timeout: None,
+            connect_timeout: None,
+            accept_timeout: None,
+            linger: None,
+        }
+    }
+}
+
+impl WasixSocketOptions {
+    fn set_flag(&mut self, option: i32, flag: bool) -> i32 {
+        let bit = match wasix_socket_flag_bit(option) {
+            Ok(bit) => bit,
+            Err(errno) => return errno,
+        };
+        if flag {
+            self.flag_bits |= bit;
+        } else {
+            self.flag_bits &= !bit;
+        }
+        p1::errno::SUCCESS
+    }
+
+    fn flag(self, option: i32) -> Result<bool, i32> {
+        let bit = wasix_socket_flag_bit(option)?;
+        Ok(self.flag_bits & bit != 0)
+    }
+
+    fn set_time(&mut self, option: i32, time: Option<u64>) -> i32 {
+        match option {
+            WASIX_SOCK_OPTION_RECV_TIMEOUT => self.receive_timeout = time,
+            WASIX_SOCK_OPTION_SEND_TIMEOUT => self.send_timeout = time,
+            WASIX_SOCK_OPTION_CONNECT_TIMEOUT => self.connect_timeout = time,
+            WASIX_SOCK_OPTION_ACCEPT_TIMEOUT => self.accept_timeout = time,
+            WASIX_SOCK_OPTION_LINGER => self.linger = time,
+            _ => return p1::errno::INVAL,
+        }
+        p1::errno::SUCCESS
+    }
+
+    fn time(self, option: i32) -> Result<Option<u64>, i32> {
+        match option {
+            WASIX_SOCK_OPTION_RECV_TIMEOUT => Ok(self.receive_timeout),
+            WASIX_SOCK_OPTION_SEND_TIMEOUT => Ok(self.send_timeout),
+            WASIX_SOCK_OPTION_CONNECT_TIMEOUT => Ok(self.connect_timeout),
+            WASIX_SOCK_OPTION_ACCEPT_TIMEOUT => Ok(self.accept_timeout),
+            WASIX_SOCK_OPTION_LINGER => Ok(self.linger),
+            _ => Err(p1::errno::INVAL),
         }
     }
 }
@@ -3373,9 +3428,9 @@ where
             "sock_set_opt_flag",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
              fd: i32,
-             _option: i32,
-             _flag: i32|
-             -> i32 { wasix_sock_descriptor_unavailable(&mut caller, fd) },
+             option: i32,
+             flag: i32|
+             -> i32 { wasix_sock_set_opt_flag(&mut caller, fd, option, flag) },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -3384,9 +3439,11 @@ where
             "sock_get_opt_flag",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
              fd: i32,
-             _option: i32,
+             option: i32,
              ret_flag: i32|
-             -> i32 { wasix_sock_get_opt_flag(&mut caller, fd, ret_flag as u32) },
+             -> i32 {
+                wasix_sock_get_opt_flag(&mut caller, fd, option, ret_flag as u32)
+            },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -3395,9 +3452,9 @@ where
             "sock_set_opt_time",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
              fd: i32,
-             _option: i32,
-             _time: i32|
-             -> i32 { wasix_sock_descriptor_unavailable(&mut caller, fd) },
+             option: i32,
+             time: i32|
+             -> i32 { wasix_sock_set_opt_time(&mut caller, fd, option, time as u32) },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -3406,9 +3463,11 @@ where
             "sock_get_opt_time",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
              fd: i32,
-             _option: i32,
+             option: i32,
              ret_time: i32|
-             -> i32 { wasix_sock_get_opt_time(&mut caller, fd, ret_time as u32) },
+             -> i32 {
+                wasix_sock_get_opt_time(&mut caller, fd, option, ret_time as u32)
+            },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -10254,42 +10313,108 @@ fn wasix_sock_bind_authority(
     }
 }
 
+fn wasix_sock_set_opt_flag<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    fd: i32,
+    option: i32,
+    flag: i32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let flag = match flag {
+        0 => false,
+        1 => true,
+        _ => return p1::errno::INVAL,
+    };
+    let Some(Preview1Descriptor::Socket(descriptor)) = caller.data_mut().descriptors.get_mut(fd)
+    else {
+        return match caller.data().descriptors.get(fd) {
+            Some(_) => p1::errno::NOTSOCK,
+            None => p1::errno::BADF,
+        };
+    };
+    descriptor.options_mut().set_flag(option, flag)
+}
+
 fn wasix_sock_get_opt_flag<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
+    option: i32,
     ret_flag: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    let status = wasix_sock_descriptor_unavailable(caller, fd);
-    if status != p1::errno::SUCCESS {
-        return status;
-    }
+    let Some(Preview1Descriptor::Socket(descriptor)) = caller.data().descriptors.get(fd) else {
+        return match caller.data().descriptors.get(fd) {
+            Some(_) => p1::errno::NOTSOCK,
+            None => p1::errno::BADF,
+        };
+    };
+    let flag = match descriptor.options().flag(option) {
+        Ok(flag) => flag,
+        Err(errno) => return errno,
+    };
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    p1_write_wasix_bool(caller, memory, ret_flag, false)
+    p1_write_wasix_bool(caller, memory, ret_flag, flag)
+}
+
+fn wasix_sock_set_opt_time<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    fd: i32,
+    option: i32,
+    time: u32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let Some(memory) = p1_memory(caller) else {
+        return p1::errno::FAULT;
+    };
+    let time = match wasix_read_optional_timestamp(caller, memory, time) {
+        Ok(time) => time,
+        Err(errno) => return errno,
+    };
+    let Some(Preview1Descriptor::Socket(descriptor)) = caller.data_mut().descriptors.get_mut(fd)
+    else {
+        return match caller.data().descriptors.get(fd) {
+            Some(_) => p1::errno::NOTSOCK,
+            None => p1::errno::BADF,
+        };
+    };
+    descriptor.options_mut().set_time(option, time)
 }
 
 fn wasix_sock_get_opt_time<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
+    option: i32,
     ret_time: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    let status = wasix_sock_descriptor_unavailable(caller, fd);
-    if status != p1::errno::SUCCESS {
-        return status;
-    }
+    let Some(Preview1Descriptor::Socket(descriptor)) = caller.data().descriptors.get(fd) else {
+        return match caller.data().descriptors.get(fd) {
+            Some(_) => p1::errno::NOTSOCK,
+            None => p1::errno::BADF,
+        };
+    };
+    let time = match descriptor.options().time(option) {
+        Ok(time) => time,
+        Err(errno) => return errno,
+    };
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    p1_write_u8(caller, memory, ret_time, WASIX_OPTION_NONE)
+    p1_write_wasix_optional_timestamp(caller, memory, ret_time, time)
 }
 
 fn wasix_sock_set_opt_size<CpuImpl, HostFs>(
@@ -10907,6 +11032,46 @@ fn wasix_read_optional_timestamp<T>(
                 .map(Some)
                 .map_err(|_| p1::errno::FAULT)
         }
+        _ => Err(p1::errno::INVAL),
+    }
+}
+
+fn p1_write_wasix_optional_timestamp<T>(
+    caller: &mut Caller<'_, T>,
+    memory: Preview1Memory,
+    ptr: u32,
+    value: Option<u64>,
+) -> i32 {
+    match value {
+        Some(value) => p1_write_u8(caller, memory, ptr, WASIX_OPTION_SOME).max(p1_write_u64(
+            caller,
+            memory,
+            ptr + WASIX_OPTION_UNION_U64_OFFSET,
+            value,
+        )),
+        None => p1_write_u8(caller, memory, ptr, WASIX_OPTION_NONE).max(p1_write_u64(
+            caller,
+            memory,
+            ptr + WASIX_OPTION_UNION_U64_OFFSET,
+            0,
+        )),
+    }
+}
+
+fn wasix_socket_flag_bit(option: i32) -> Result<u32, i32> {
+    match option {
+        WASIX_SOCK_OPTION_REUSE_PORT
+        | WASIX_SOCK_OPTION_REUSE_ADDR
+        | WASIX_SOCK_OPTION_NO_DELAY
+        | WASIX_SOCK_OPTION_DONT_ROUTE
+        | WASIX_SOCK_OPTION_ONLY_V6
+        | WASIX_SOCK_OPTION_BROADCAST
+        | WASIX_SOCK_OPTION_MULTICAST_LOOP_V4
+        | WASIX_SOCK_OPTION_MULTICAST_LOOP_V6
+        | WASIX_SOCK_OPTION_PROMISCUOUS
+        | WASIX_SOCK_OPTION_LISTENING
+        | WASIX_SOCK_OPTION_KEEP_ALIVE
+        | WASIX_SOCK_OPTION_OOB_INLINE => Ok(1_u32 << option),
         _ => Err(p1::errno::INVAL),
     }
 }
@@ -12152,6 +12317,7 @@ const WASIX_EVENTFDFLAG_SEMAPHORE: u32 = 1 << 0;
 const WASIX_OPTION_NONE: u8 = 0;
 const WASIX_OPTION_SOME: u8 = 1;
 const WASIX_OPTION_UNION_U32_OFFSET: u32 = 4;
+const WASIX_OPTION_UNION_U64_OFFSET: u32 = 8;
 const WASIX_STDIO_MODE_PIPED: i32 = 0;
 const WASIX_STDIO_MODE_INHERIT: i32 = 1;
 const WASIX_STDIO_MODE_NULL: i32 = 2;
@@ -12167,8 +12333,25 @@ const WASIX_JOIN_STATUS_UNION_OFFSET: u32 = 2;
 const WASIX_SOCK_TYPE_STREAM: i32 = 1;
 const WASIX_SOCK_TYPE_DGRAM: i32 = 2;
 const WASIX_SOCK_STATUS_OPENED: u8 = 1;
+const WASIX_SOCK_OPTION_REUSE_PORT: i32 = 1;
+const WASIX_SOCK_OPTION_REUSE_ADDR: i32 = 2;
+const WASIX_SOCK_OPTION_NO_DELAY: i32 = 3;
+const WASIX_SOCK_OPTION_DONT_ROUTE: i32 = 4;
+const WASIX_SOCK_OPTION_ONLY_V6: i32 = 5;
+const WASIX_SOCK_OPTION_BROADCAST: i32 = 6;
+const WASIX_SOCK_OPTION_MULTICAST_LOOP_V4: i32 = 7;
+const WASIX_SOCK_OPTION_MULTICAST_LOOP_V6: i32 = 8;
+const WASIX_SOCK_OPTION_PROMISCUOUS: i32 = 9;
+const WASIX_SOCK_OPTION_LISTENING: i32 = 10;
+const WASIX_SOCK_OPTION_KEEP_ALIVE: i32 = 12;
+const WASIX_SOCK_OPTION_LINGER: i32 = 13;
+const WASIX_SOCK_OPTION_OOB_INLINE: i32 = 14;
 const WASIX_SOCK_OPTION_RECV_BUF_SIZE: i32 = 15;
 const WASIX_SOCK_OPTION_SEND_BUF_SIZE: i32 = 16;
+const WASIX_SOCK_OPTION_RECV_TIMEOUT: i32 = 19;
+const WASIX_SOCK_OPTION_SEND_TIMEOUT: i32 = 20;
+const WASIX_SOCK_OPTION_CONNECT_TIMEOUT: i32 = 21;
+const WASIX_SOCK_OPTION_ACCEPT_TIMEOUT: i32 = 22;
 const WASIX_RIFLAGS_DATA_TRUNCATED: u16 = 1 << 2;
 const WASIX_ADDRESS_FAMILY_UNSPEC: u8 = 0;
 const WASIX_ADDRESS_FAMILY_IP_INET4: u8 = 1;
@@ -12591,5 +12774,90 @@ mod tests {
 
         assert_eq!(descriptor.options().receive_buffer_size, 4096);
         assert_eq!(descriptor.options().send_buffer_size, 8192);
+    }
+
+    #[test]
+    fn wasix_socket_flag_options_are_descriptor_local_state() {
+        let mut descriptor = WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
+            options: WasixSocketOptions::default(),
+        });
+
+        assert_eq!(
+            descriptor
+                .options_mut()
+                .set_flag(WASIX_SOCK_OPTION_BROADCAST, true),
+            p1::errno::SUCCESS
+        );
+        assert_eq!(
+            descriptor
+                .options_mut()
+                .set_flag(WASIX_SOCK_OPTION_REUSE_ADDR, true),
+            p1::errno::SUCCESS
+        );
+        assert_eq!(
+            descriptor.options().flag(WASIX_SOCK_OPTION_BROADCAST),
+            Ok(true)
+        );
+        assert_eq!(
+            descriptor.options().flag(WASIX_SOCK_OPTION_REUSE_ADDR),
+            Ok(true)
+        );
+        assert_eq!(
+            descriptor.options().flag(WASIX_SOCK_OPTION_KEEP_ALIVE),
+            Ok(false)
+        );
+
+        assert_eq!(
+            descriptor
+                .options_mut()
+                .set_flag(WASIX_SOCK_OPTION_BROADCAST, false),
+            p1::errno::SUCCESS
+        );
+        assert_eq!(
+            descriptor.options().flag(WASIX_SOCK_OPTION_BROADCAST),
+            Ok(false)
+        );
+        assert_eq!(
+            descriptor.options().flag(WASIX_SOCK_OPTION_RECV_BUF_SIZE),
+            Err(p1::errno::INVAL)
+        );
+    }
+
+    #[test]
+    fn wasix_socket_time_options_are_descriptor_local_state() {
+        let mut descriptor = WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
+            options: WasixSocketOptions::default(),
+        });
+
+        assert_eq!(
+            descriptor.options().time(WASIX_SOCK_OPTION_RECV_TIMEOUT),
+            Ok(None)
+        );
+        assert_eq!(
+            descriptor
+                .options_mut()
+                .set_time(WASIX_SOCK_OPTION_RECV_TIMEOUT, Some(1_000)),
+            p1::errno::SUCCESS
+        );
+        assert_eq!(
+            descriptor.options().time(WASIX_SOCK_OPTION_RECV_TIMEOUT),
+            Ok(Some(1_000))
+        );
+        assert_eq!(
+            descriptor
+                .options_mut()
+                .set_time(WASIX_SOCK_OPTION_LINGER, Some(2_000)),
+            p1::errno::SUCCESS
+        );
+        assert_eq!(
+            descriptor.options().time(WASIX_SOCK_OPTION_LINGER),
+            Ok(Some(2_000))
+        );
+        assert_eq!(
+            descriptor
+                .options_mut()
+                .set_time(WASIX_SOCK_OPTION_SEND_BUF_SIZE, None),
+            p1::errno::INVAL
+        );
     }
 }
