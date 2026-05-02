@@ -5796,6 +5796,35 @@ mod tests {
     }
 
     #[test]
+    fn preview3_linked_interfaces_cover_required_subsystems() {
+        assert_interface_set_eq(
+            preview3::LINKED_INTERFACES,
+            &[
+                "wasi:clocks/monotonic-clock",
+                "wasi:clocks/system-clock",
+                "wasi:cli/environment",
+                "wasi:cli/exit",
+                "wasi:cli/stdin",
+                "wasi:cli/stdout",
+                "wasi:cli/stderr",
+                "wasi:cli/terminal-input",
+                "wasi:cli/terminal-output",
+                "wasi:cli/terminal-stdin",
+                "wasi:cli/terminal-stdout",
+                "wasi:cli/terminal-stderr",
+                "wasi:random/random",
+                "wasi:random/insecure",
+                "wasi:random/insecure-seed",
+                "wasi:filesystem/types",
+                "wasi:filesystem/preopens",
+                "wasi:sockets/types",
+                "wasi:sockets/ip-name-lookup",
+            ],
+            "Preview3",
+        );
+    }
+
+    #[test]
     fn preview2_linked_interfaces_exist_in_wasmtime_wit() {
         let wit_interfaces =
             wit_interface_names(crate::wasmtime_adapter::wasi::preview2::PREVIEW2_WIT_PACKAGES);
@@ -5805,6 +5834,46 @@ mod tests {
                 "Preview2 adapter maps {interface}, but Wasmtime WIT does not declare it"
             );
         }
+    }
+
+    #[test]
+    fn preview2_linked_interfaces_cover_required_subsystems() {
+        assert_interface_set_eq(
+            crate::wasmtime_adapter::wasi::preview2::PREVIEW2_LINKED_INTERFACES,
+            &[
+                "wasi:cli/environment",
+                "wasi:cli/exit",
+                "wasi:cli/stdin",
+                "wasi:cli/stdout",
+                "wasi:cli/stderr",
+                "wasi:cli/terminal-input",
+                "wasi:cli/terminal-output",
+                "wasi:cli/terminal-stdin",
+                "wasi:cli/terminal-stdout",
+                "wasi:cli/terminal-stderr",
+                "wasi:clocks/monotonic-clock",
+                "wasi:clocks/system-clock",
+                "wasi:filesystem/preopens",
+                "wasi:filesystem/types",
+                "wasi:random/random",
+                "wasi:random/insecure",
+                "wasi:random/insecure-seed",
+                "wasi:sockets/network",
+                "wasi:sockets/instance-network",
+                "wasi:sockets/udp",
+                "wasi:sockets/udp-create-socket",
+                "wasi:sockets/tcp",
+                "wasi:sockets/tcp-create-socket",
+                "wasi:sockets/ip-name-lookup",
+            ],
+            "Preview2",
+        );
+    }
+
+    fn assert_interface_set_eq(actual: &[&'static str], expected: &[&'static str], label: &str) {
+        let actual = actual.iter().copied().collect::<BTreeSet<_>>();
+        let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected, "{label} linked interface coverage changed");
     }
 
     fn wit_interface_names(packages: &[(&'static str, &'static str)]) -> BTreeSet<&'static str> {
