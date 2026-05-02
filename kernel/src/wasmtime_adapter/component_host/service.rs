@@ -11789,9 +11789,9 @@ fn p1_errno_from_network_control_error(error: crate::NetworkControlError) -> i32
     match error {
         crate::NetworkControlError::PortUnavailable => p1::errno::NETDOWN,
         crate::NetworkControlError::BridgeUnavailable => p1::errno::NOTSUP,
-        crate::NetworkControlError::InvalidAddress | crate::NetworkControlError::InvalidRoute => {
-            p1::errno::INVAL
-        }
+        crate::NetworkControlError::InvalidAddress
+        | crate::NetworkControlError::InvalidRoute
+        | crate::NetworkControlError::RouteTimestampOutOfRange => p1::errno::INVAL,
         crate::NetworkControlError::BackendFault => p1::errno::IO,
     }
 }
@@ -12027,22 +12027,20 @@ where
         Ok(gateway) => gateway,
         Err(status) => return status,
     };
-    match wasix_read_optional_timestamp(caller, memory, preferred) {
-        Ok(None) => {}
-        Ok(Some(_)) => return p1::errno::NOTSUP,
+    let preferred = match wasix_read_optional_timestamp(caller, memory, preferred) {
+        Ok(value) => value,
         Err(status) => return status,
-    }
-    match wasix_read_optional_timestamp(caller, memory, expires) {
-        Ok(None) => {}
-        Ok(Some(_)) => return p1::errno::NOTSUP,
+    };
+    let expires = match wasix_read_optional_timestamp(caller, memory, expires) {
+        Ok(value) => value,
         Err(status) => return status,
-    }
+    };
     let (cap, service) = match wasix_network_admin_service(caller) {
         Ok(parts) => parts,
         Err(status) => return status,
     };
     let control = crate::NetworkControl::new(service);
-    let route = crate::Ipv4Route::new(destination, gateway);
+    let route = crate::Ipv4Route::with_lifetimes(destination, gateway, preferred, expires);
     match control
         .add_route(cap, crate::NetworkPortId::new(0), route)
         .await
@@ -13967,13 +13965,13 @@ fn write_wasix_route_ip4<T>(
         caller,
         memory,
         ptr + WASIX_ROUTE_PREFERRED_UNTIL_OFFSET,
-        None,
+        route.preferred_until_nanos(),
     )
     .max(p1_write_wasix_optional_timestamp(
         caller,
         memory,
         ptr + WASIX_ROUTE_EXPIRES_AT_OFFSET,
-        None,
+        route.expires_at_nanos(),
     ))
 }
 

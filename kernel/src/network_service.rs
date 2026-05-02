@@ -369,6 +369,20 @@ fn map_ipv4_cidr(cidr: Ipv4Cidr) -> KernelIpv4Cidr {
     KernelIpv4Cidr::new(map_ipv4_address(cidr.address()), cidr.prefix_len())
 }
 
+fn route_timestamp(nanos: u64) -> Result<SmolInstant, NetworkControlError> {
+    let micros = nanos / 1_000;
+    let micros =
+        i64::try_from(micros).map_err(|_| NetworkControlError::RouteTimestampOutOfRange)?;
+    Ok(SmolInstant::from_micros(micros))
+}
+
+fn route_timestamp_nanos(timestamp: SmolInstant) -> Result<u64, NetworkControlError> {
+    let micros = timestamp.total_micros();
+    let micros =
+        u64::try_from(micros).map_err(|_| NetworkControlError::RouteTimestampOutOfRange)?;
+    Ok(micros.saturating_mul(1_000))
+}
+
 fn require_local_network_port(port: NetworkPortId) -> Result<(), NetworkControlError> {
     if port == LOCAL_NETWORK_PORT {
         Ok(())
@@ -1676,7 +1690,7 @@ where
     ) -> Result<Vec<KernelIpv4Route>, NetworkControlError> {
         require_local_network_port(port)?;
         let mut state = self.inner.state.lock().await;
-        Ok(state.list_ipv4_routes())
+        state.list_ipv4_routes()
     }
 }
 
@@ -2640,11 +2654,16 @@ impl NetworkState {
     fn add_ipv4_route(&mut self, route: KernelIpv4Route) -> Result<(), NetworkControlError> {
         let cidr = IpCidr::Ipv4(map_kernel_ipv4_cidr(route.destination()));
         let gateway = IpAddress::Ipv4(map_kernel_ipv4_address(route.gateway()));
+        let preferred_until = route
+            .preferred_until_nanos()
+            .map(route_timestamp)
+            .transpose()?;
+        let expires_at = route.expires_at_nanos().map(route_timestamp).transpose()?;
         let route = Route {
             cidr,
             via_router: gateway,
-            preferred_until: None,
-            expires_at: None,
+            preferred_until,
+            expires_at,
         };
         let mut result = Ok(());
         self.iface.routes_mut().update(|routes| {
@@ -2680,16 +2699,39 @@ impl NetworkState {
         });
     }
 
-    fn list_ipv4_routes(&mut self) -> Vec<KernelIpv4Route> {
+    fn list_ipv4_routes(&mut self) -> Result<Vec<KernelIpv4Route>, NetworkControlError> {
         let mut result = Vec::new();
+        let mut list_result = Ok(());
         self.iface.routes_mut().update(|routes| {
-            result.extend(routes.iter().map(|route| {
+            for route in routes.iter() {
                 let IpCidr::Ipv4(cidr) = route.cidr;
                 let IpAddress::Ipv4(gateway) = route.via_router;
-                KernelIpv4Route::new(map_ipv4_cidr(cidr), map_ipv4_address(gateway))
-            }));
+                let preferred_until = match route.preferred_until.map(route_timestamp_nanos) {
+                    Some(Ok(timestamp)) => Some(timestamp),
+                    Some(Err(error)) => {
+                        list_result = Err(error);
+                        return;
+                    }
+                    None => None,
+                };
+                let expires_at = match route.expires_at.map(route_timestamp_nanos) {
+                    Some(Ok(timestamp)) => Some(timestamp),
+                    Some(Err(error)) => {
+                        list_result = Err(error);
+                        return;
+                    }
+                    None => None,
+                };
+                result.push(KernelIpv4Route::with_lifetimes(
+                    map_ipv4_cidr(cidr),
+                    map_ipv4_address(gateway),
+                    preferred_until,
+                    expires_at,
+                ));
+            }
         });
-        result
+        list_result?;
+        Ok(result)
     }
 
     fn next_wait_duration(&mut self, now_nanos: u64, deadline_nanos: u64) -> Duration {

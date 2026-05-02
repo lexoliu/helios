@@ -75,6 +75,8 @@ impl Ipv4Cidr {
 pub struct Ipv4Route {
     destination: Ipv4Cidr,
     gateway: crate::Ipv4Address,
+    preferred_until_nanos: Option<u64>,
+    expires_at_nanos: Option<u64>,
 }
 
 impl Ipv4Route {
@@ -82,6 +84,22 @@ impl Ipv4Route {
         Self {
             destination,
             gateway,
+            preferred_until_nanos: None,
+            expires_at_nanos: None,
+        }
+    }
+
+    pub const fn with_lifetimes(
+        destination: Ipv4Cidr,
+        gateway: crate::Ipv4Address,
+        preferred_until_nanos: Option<u64>,
+        expires_at_nanos: Option<u64>,
+    ) -> Self {
+        Self {
+            destination,
+            gateway,
+            preferred_until_nanos,
+            expires_at_nanos,
         }
     }
 
@@ -91,6 +109,14 @@ impl Ipv4Route {
 
     pub const fn gateway(self) -> crate::Ipv4Address {
         self.gateway
+    }
+
+    pub const fn preferred_until_nanos(self) -> Option<u64> {
+        self.preferred_until_nanos
+    }
+
+    pub const fn expires_at_nanos(self) -> Option<u64> {
+        self.expires_at_nanos
     }
 }
 
@@ -104,6 +130,8 @@ pub enum NetworkControlError {
     InvalidAddress,
     #[error("route is invalid for this port")]
     InvalidRoute,
+    #[error("route timestamp is outside backend range")]
+    RouteTimestampOutOfRange,
     #[error("network control backend failed")]
     BackendFault,
 }
@@ -430,5 +458,18 @@ mod tests {
                 .octets(),
             [2, 0, 0, 0, 0, 1]
         );
+    }
+
+    #[test]
+    fn ipv4_route_preserves_lifetime_metadata() {
+        let route = Ipv4Route::with_lifetimes(
+            Ipv4Cidr::new(Ipv4Address::new([192, 0, 2, 0]), 24),
+            Ipv4Address::new([192, 0, 2, 1]),
+            Some(1_000),
+            Some(2_000),
+        );
+
+        assert_eq!(route.preferred_until_nanos(), Some(1_000));
+        assert_eq!(route.expires_at_nanos(), Some(2_000));
     }
 }
