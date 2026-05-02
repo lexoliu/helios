@@ -2011,6 +2011,14 @@ where
         self.clock.system_time_nanos()
     }
 
+    fn timer(&self) -> crate::Timer<CpuImpl> {
+        self.timer.clone()
+    }
+
+    fn sleep_for(&self, duration: Duration) -> crate::Sleep<CpuImpl> {
+        self.timer.sleep_for(duration)
+    }
+
     fn futex_key(&self, address: u32) -> crate::FutexKey {
         crate::FutexKey::new(
             crate::ProcessMemoryIdentity::new(self.instance.id().raw()),
@@ -8532,7 +8540,6 @@ where
                     if duration != 0 {
                         caller
                             .data()
-                            .timer
                             .sleep_for(Duration::from_nanos(duration))
                             .await;
                     }
@@ -9066,7 +9073,7 @@ where
     let repeat = repeat != 0;
     let signal_state = caller.data().signal_state.clone();
     let generation = signal_state.next_interval_generation();
-    let timer = caller.data().timer.clone();
+    let timer = caller.data().timer();
     caller.data().spawner.spawn_detached(async move {
         loop {
             timer.sleep_for(Duration::from_nanos(interval)).await;
@@ -10537,7 +10544,6 @@ where
     };
     caller
         .data()
-        .timer
         .sleep_for(Duration::from_nanos(duration))
         .await;
     p1::errno::SUCCESS
@@ -10596,7 +10602,7 @@ where
 
     let (exit_tx, exit_rx) = futures::channel::oneshot::channel();
     let cpu = caller.data().cpu.clone();
-    let timer = caller.data().timer.clone();
+    let timer = caller.data().timer();
     let spawner = caller.data().spawner.clone();
     let runtime_state = caller.data().runtime_state.clone();
     let instance = caller.data().instance.clone();
@@ -11046,10 +11052,7 @@ where
         Some(0) => false,
         Some(timeout_nanos) => {
             let wake = notify.notified();
-            let sleep = caller
-                .data()
-                .timer
-                .sleep_for(Duration::from_nanos(timeout_nanos));
+            let sleep = caller.data().sleep_for(Duration::from_nanos(timeout_nanos));
             futures::pin_mut!(wake);
             futures::pin_mut!(sleep);
             matches!(
@@ -12473,7 +12476,7 @@ where
             Err(errno) => return errno,
         };
         if let Err(errno) =
-            wasix_wait_epoll_readiness(caller.data().timer.clone(), targets, timeout).await
+            wasix_wait_epoll_readiness(caller.data().timer(), targets, timeout).await
         {
             return errno;
         }

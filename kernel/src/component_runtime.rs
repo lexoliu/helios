@@ -8,7 +8,7 @@ use bytes::Bytes;
 use crate::child_io::{ByteReader, ByteWriter, ClosedPeer, TryRead};
 use crate::{
     EntropyError, EntropyPool, InstanceExecutionTransition, InstanceRegistry, KernelClock,
-    KillReason, ProcessAuthority, RegisteredInstance, SetWallClockCap, Timer,
+    KillReason, ProcessAuthority, RegisteredInstance, SetWallClockCap, Sleep, Timer,
     nanos_to_ticks_ceil_saturating, record_instance_transition,
 };
 use helios_hal::cpu::{Cpu, Instant};
@@ -282,6 +282,10 @@ where
 
     pub fn timer(&self) -> Timer<CpuImpl> {
         self.timer.clone()
+    }
+
+    pub fn sleep_for(&self, duration: core::time::Duration) -> Sleep<CpuImpl> {
+        self.timer.sleep_for(duration)
     }
 
     pub fn spawner(&self) -> &crate::Spawner<CpuImpl> {
