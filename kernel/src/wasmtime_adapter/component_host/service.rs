@@ -10137,24 +10137,13 @@ where
 
 fn wasix_port_empty_list<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-    ret_len: u32,
+    _ret_len: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    let status = caller.data().require_network_admin_authority();
-    if status != p1::errno::SUCCESS {
-        return status;
-    }
-    let Some(memory) = p1_memory(caller) else {
-        return p1::errno::FAULT;
-    };
-    let status = p1_write_u32(caller, memory, ret_len, 0);
-    if status != p1::errno::SUCCESS {
-        return status;
-    }
-    p1::errno::NETDOWN
+    wasix_network_admin_unavailable(caller)
 }
 
 fn wasix_sock_status<CpuImpl, HostFs>(
