@@ -1,10 +1,9 @@
 # WASI/WASIX Python, Curl, And Dash On Helios
 
 This document captures the exact workflow to stage and run `python`,
-`curl`, and the default `/bin/dash` shell artifact. `dash` and CPython
-are boot filesystem artifacts recorded in
-`tools/wasi-apps/boot-artifacts.toml`; `curl` runs from the shared
-filesystem.
+`curl`, and the default `/bin/dash` shell artifact. `dash`, CPython, and
+`curl` are boot filesystem artifacts recorded in
+`tools/wasi-apps/boot-artifacts.toml`.
 
 ## Build Artifacts
 
@@ -80,17 +79,33 @@ Expected output includes:
 42
 ```
 
+The same AArch64/HVF path is the preferred smoke test for the bootfs
+`curl` artifact and kernel socket stack:
+
+```bash
+cargo run -p helios-inspector -- vm --arch aarch64 --release \
+  --boot-program dash --boot-program debugger --boot-program curl \
+  --no-compiler-plugin \
+  shell -c '/bin/curl http://example.com/'
+```
+
+Expected output contains:
+
+- `<!doctype html>`
+- `<title>Example Domain</title>`
+
 ## Run In Helios (RISC-V VM)
 
-Use inspector `vm` mode with repository root as the shared directory.
-Use `--release` when the VM command should rebuild the guest kernel plus
+Use inspector `vm` mode when checking RISC-V-specific behavior. Use
+`--release` when the VM command should rebuild the guest kernel plus
 embedded user-space programs (`init`, `debugger`) in release mode before
 boot. CPython needs substantial guest memory; pass `--memory 2G`.
 
 ```bash
 cargo run -p helios-inspector -- vm --arch riscv64 --memory 2G \
-  --shared-dir "$PWD" \
-  shell -c '/host/artifacts/python3-root/python3.wasm -c "print(40+2)"'
+  --boot-program dash --boot-program debugger --boot-program python3 \
+  --no-compiler-plugin \
+  shell -c '/bin/python3 -c "print(40+2)"'
 ```
 
 Expected output includes:
@@ -101,8 +116,9 @@ Expected output includes:
 
 ```bash
 cargo run -p helios-inspector -- vm --arch riscv64 --memory 2G \
-  --shared-dir "$PWD" \
-  shell -c '/host/artifacts/wasi-tools/curl-stripped.wasm http://example.com'
+  --boot-program dash --boot-program debugger --boot-program curl \
+  --no-compiler-plugin \
+  shell -c '/bin/curl http://example.com/'
 ```
 
 Expected output contains:
@@ -126,8 +142,7 @@ Expected output contains:
   (`artifacts/python3-root/…`, `artifacts/wasix/dash/…`,
   `artifacts/wasi-tools/…`) without updating this document and
   `README.md`.
-- Keep runtime behavior verified with inspector `vm --shared-dir`
-  commands above.
+- Keep runtime behavior verified with the inspector `vm` commands above.
 - Do not reintroduce a repo-local dash crate or shell stub. The boot
   shell is the standard WASIX dash artifact declared in
   `tools/wasi-apps/boot-artifacts.toml`.
