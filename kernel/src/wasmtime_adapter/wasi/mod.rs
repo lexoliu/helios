@@ -4878,26 +4878,6 @@ mod tests {
         map_p3_tcp_error, map_p3_udp_socket_error, preview3, socket_types, wasi_udp_bind_rights,
     };
 
-    const PREVIEW3_WIT_PACKAGES: &[(&str, &str)] = &[
-        ("wasi:cli", include_str!("../../../../wit/deps/cli.wit")),
-        (
-            "wasi:clocks",
-            include_str!("../../../../wit/deps/clocks.wit"),
-        ),
-        (
-            "wasi:filesystem",
-            include_str!("../../../../wit/deps/filesystem.wit"),
-        ),
-        (
-            "wasi:random",
-            include_str!("../../../../wit/deps/random.wit"),
-        ),
-        (
-            "wasi:sockets",
-            include_str!("../../../../wit/deps/sockets.wit"),
-        ),
-    ];
-
     #[derive(Clone)]
     struct TestRuntimeState;
 
@@ -5043,7 +5023,7 @@ mod tests {
 
     #[test]
     fn preview3_linked_interfaces_exist_in_checked_in_wit() {
-        let wit_interfaces = wit_interface_names(PREVIEW3_WIT_PACKAGES);
+        let wit_interfaces = wit_interface_names(preview3::WIT_PACKAGES);
         for interface in preview3::LINKED_INTERFACES {
             assert!(
                 wit_interfaces.contains(interface),

@@ -29,6 +29,27 @@ pub(crate) const LINKED_INTERFACES: &[&str] = &[
     "wasi:sockets/ip-name-lookup",
 ];
 
+#[cfg(test)]
+pub(crate) const WIT_PACKAGES: &[(&str, &str)] = &[
+    ("wasi:cli", include_str!("../../../../wit/deps/cli.wit")),
+    (
+        "wasi:clocks",
+        include_str!("../../../../wit/deps/clocks.wit"),
+    ),
+    (
+        "wasi:filesystem",
+        include_str!("../../../../wit/deps/filesystem.wit"),
+    ),
+    (
+        "wasi:random",
+        include_str!("../../../../wit/deps/random.wit"),
+    ),
+    (
+        "wasi:sockets",
+        include_str!("../../../../wit/deps/sockets.wit"),
+    ),
+];
+
 pub(crate) fn add_to_linker<CpuImpl, HostFs>(
     linker: &mut Linker<StoreData<CpuImpl, HostFs>>,
     imports: &WasiImportSet,
