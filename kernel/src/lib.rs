@@ -131,7 +131,7 @@ pub use network_control::{
     Ipv4Cidr, Ipv4Route, MacAddress, NetworkAdminBackend, NetworkBridgeId, NetworkControl,
     NetworkControlError, NetworkPortId,
 };
-pub use network_service::{NetworkDevice, NetworkService, TcpStreamId, UdpSocketId};
+pub use network_service::{NetworkDevice, NetworkService, TcpListenerId, TcpStreamId, UdpSocketId};
 pub use observer::{
     DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY, FoldedProfileSample,
     ProfileFilter, ProfileHistory, ProfileScope, StatsSample, TraceEvent, TraceField, TraceFilter,
@@ -160,8 +160,8 @@ pub use runtime_types::{
     AuthorityDomain, ComponentHostFilesystemState, ComponentNetworkService, ComponentNetworkState,
     DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry, HostFileSystem, HostFsError,
     HostFsErrorKind, HostMetadata, Ipv4Address, NetworkErrorDetail, ObjectIdentity, PingError,
-    PingErrorKind, PingReply, TcpError, TcpErrorKind, UdpBinding, UdpDatagram, UdpError,
-    UdpErrorKind,
+    PingErrorKind, PingReply, TcpAccepted, TcpError, TcpErrorKind, TcpListener, UdpBinding,
+    UdpDatagram, UdpError, UdpErrorKind,
 };
 pub use serial_transport::{
     emit_serial_error_marker, emit_serial_stage_marker, read_serial, try_read_serial, write_serial,
@@ -185,10 +185,11 @@ pub use user_memory::{
 #[cfg(feature = "wasmtime-runtime")]
 pub use wasmtime_adapter::component_host::{
     ChildExit, ChildHandle, ComponentBindingSet, ComponentHostNetworkService,
-    ComponentHostProcessorRole, ComponentHostTcpStreamToken, ComponentHostUdpSocketToken,
-    HostRuntimeState, UserProgramService, component_host_processor_role,
-    component_host_processors_to_start, component_host_system_processor,
-    component_host_worker_count, install_component_host_program_service, install_program_service,
+    ComponentHostProcessorRole, ComponentHostTcpListenerToken, ComponentHostTcpStreamToken,
+    ComponentHostUdpSocketToken, HostRuntimeState, UserProgramService,
+    component_host_processor_role, component_host_processors_to_start,
+    component_host_system_processor, component_host_worker_count,
+    install_component_host_program_service, install_program_service,
     run_component_host_processor_forever, run_embedded_component_forever,
     run_program_workers_forever, system_component_should_run_on,
 };

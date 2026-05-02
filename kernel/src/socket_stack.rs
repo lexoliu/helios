@@ -3,8 +3,8 @@ extern crate alloc;
 use core::future::Future;
 
 use crate::{
-    ComponentNetworkService, DnsCap, NetworkErrorDetail, PrivilegedBindCap, TcpCap, UdpBinding,
-    UdpCap, UdpError, UdpErrorKind,
+    ComponentNetworkService, DnsCap, NetworkErrorDetail, PrivilegedBindCap, TcpAccepted, TcpCap,
+    TcpError, TcpErrorKind, TcpListener, UdpBinding, UdpCap, UdpError, UdpErrorKind,
 };
 
 #[derive(Clone)]
@@ -38,6 +38,33 @@ where
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Service::TcpStream, crate::TcpError>> + Send + 'a {
         self.service.tcp_connect(host, port, timeout_nanos)
+    }
+
+    pub fn tcp_listen(
+        &self,
+        _: TcpCap,
+        privileged_bind: Option<PrivilegedBindCap>,
+        local_port: u16,
+        backlog: u16,
+    ) -> impl Future<Output = Result<TcpListener<Service::TcpListener>, TcpError>> + Send + '_ {
+        async move {
+            if local_port < 1024 && privileged_bind.is_none() {
+                return Err(TcpError {
+                    kind: TcpErrorKind::PermissionDenied,
+                    detail: NetworkErrorDetail::PrivilegedBindDenied,
+                });
+            }
+            self.service.tcp_listen(local_port, backlog).await
+        }
+    }
+
+    pub fn tcp_accept(
+        &self,
+        _: TcpCap,
+        listener: Service::TcpListener,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<TcpAccepted<Service::TcpStream>, TcpError>> + Send + '_ {
+        self.service.tcp_accept(listener, timeout_nanos)
     }
 
     pub fn tcp_write_all<'a>(
@@ -127,7 +154,8 @@ mod tests {
     use super::SocketStack;
     use crate::{
         ComponentNetworkService, DnsError, Ipv4Address, NetworkAuthorityRights, NetworkErrorDetail,
-        PingError, PingReply, ProcessAuthority, TcpError, UdpBinding, UdpDatagram, UdpError,
+        PingError, PingReply, ProcessAuthority, TcpAccepted, TcpError, TcpListener, UdpBinding,
+        UdpDatagram, UdpError,
     };
 
     #[derive(Clone, Copy)]
@@ -135,6 +163,7 @@ mod tests {
 
     impl ComponentNetworkService for TestNetworkService {
         type TcpStream = u64;
+        type TcpListener = u64;
         type UdpSocket = u64;
 
         fn hardware_address(&self) -> [u8; 6] {
@@ -174,6 +203,31 @@ mod tests {
             _: u64,
         ) -> impl Future<Output = Result<Self::TcpStream, TcpError>> + Send + '_ {
             core::future::ready(Ok(7))
+        }
+
+        fn tcp_listen(
+            &self,
+            local_port: u16,
+            _: u16,
+        ) -> impl Future<Output = Result<TcpListener<Self::TcpListener>, TcpError>> + Send + '_
+        {
+            core::future::ready(Ok(TcpListener {
+                listener: 8,
+                local_port,
+            }))
+        }
+
+        fn tcp_accept(
+            &self,
+            listener: Self::TcpListener,
+            _: u64,
+        ) -> impl Future<Output = Result<TcpAccepted<Self::TcpStream>, TcpError>> + Send + '_
+        {
+            core::future::ready(Ok(TcpAccepted {
+                stream: listener + 1,
+                address: Ipv4Address::new([127, 0, 0, 1]),
+                port: 4040,
+            }))
         }
 
         fn tcp_write_all(
@@ -257,6 +311,14 @@ mod tests {
             block_on(stack.tcp_connect(tcp, "localhost", 80, 1)).unwrap(),
             7
         );
+        let listener = block_on(stack.tcp_listen(tcp, Some(privileged), 53, 1)).unwrap();
+        assert_eq!(listener.local_port, 53);
+        assert_eq!(
+            block_on(stack.tcp_accept(tcp, listener.listener, 1))
+                .unwrap()
+                .stream,
+            9
+        );
         assert_eq!(
             block_on(stack.udp_bind(udp, Some(privileged), 53))
                 .unwrap()
@@ -278,6 +340,18 @@ mod tests {
     }
 
     #[test]
+    fn low_tcp_listen_requires_privileged_bind_cap() {
+        let mut authority = ProcessAuthority::empty();
+        authority.grant_network_rights(NetworkAuthorityRights::TCP);
+        let tcp = authority.derive_tcp_cap().unwrap();
+        let stack = SocketStack::new(TestNetworkService);
+
+        let error = block_on(stack.tcp_listen(tcp, None, 53, 1)).unwrap_err();
+        assert_eq!(error.kind, crate::TcpErrorKind::PermissionDenied);
+        assert_eq!(error.detail, NetworkErrorDetail::PrivilegedBindDenied);
+    }
+
+    #[test]
     fn high_udp_bind_does_not_require_privileged_bind_cap() {
         let mut authority = ProcessAuthority::empty();
         authority.grant_network_rights(NetworkAuthorityRights::UDP);
@@ -286,6 +360,21 @@ mod tests {
 
         assert_eq!(
             block_on(stack.udp_bind(udp, None, 8080))
+                .unwrap()
+                .local_port,
+            8080
+        );
+    }
+
+    #[test]
+    fn high_tcp_listen_does_not_require_privileged_bind_cap() {
+        let mut authority = ProcessAuthority::empty();
+        authority.grant_network_rights(NetworkAuthorityRights::TCP);
+        let tcp = authority.derive_tcp_cap().unwrap();
+        let stack = SocketStack::new(TestNetworkService);
+
+        assert_eq!(
+            block_on(stack.tcp_listen(tcp, None, 8080, 1))
                 .unwrap()
                 .local_port,
             8080

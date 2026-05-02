@@ -7,8 +7,8 @@ use core::future::Future;
 use core::pin::Pin;
 
 use crate::{
-    ComponentNetworkService, DnsError, Ipv4Address, PingError, PingReply, TcpError, UdpBinding,
-    UdpDatagram, UdpError,
+    ComponentNetworkService, DnsError, Ipv4Address, PingError, PingReply, TcpAccepted, TcpError,
+    TcpListener, UdpBinding, UdpDatagram, UdpError,
 };
 
 pub trait ComponentHostTcpStreamToken: Copy + Send + 'static {
@@ -18,6 +18,22 @@ pub trait ComponentHostTcpStreamToken: Copy + Send + 'static {
 }
 
 impl ComponentHostTcpStreamToken for u64 {
+    fn into_raw(self) -> u64 {
+        self
+    }
+
+    fn from_raw(raw: u64) -> Self {
+        raw
+    }
+}
+
+pub trait ComponentHostTcpListenerToken: Copy + Send + 'static {
+    fn into_raw(self) -> u64;
+
+    fn from_raw(raw: u64) -> Self;
+}
+
+impl ComponentHostTcpListenerToken for u64 {
     fn into_raw(self) -> u64 {
         self
     }
@@ -66,6 +82,18 @@ trait DynComponentHostNetworkService: Send + Sync + 'static {
         port: u16,
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<u64, TcpError>> + Send + 'a>>;
+
+    fn tcp_listen<'a>(
+        &'a self,
+        local_port: u16,
+        backlog: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<TcpListener<u64>, TcpError>> + Send + 'a>>;
+
+    fn tcp_accept<'a>(
+        &'a self,
+        listener: u64,
+        timeout_nanos: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<TcpAccepted<u64>, TcpError>> + Send + 'a>>;
 
     fn tcp_write_all<'a>(
         &'a self,
@@ -117,6 +145,7 @@ impl ComponentHostNetworkService {
     where
         Service: ComponentNetworkService + Sync,
         Service::TcpStream: ComponentHostTcpStreamToken,
+        Service::TcpListener: ComponentHostTcpListenerToken,
         Service::UdpSocket: ComponentHostUdpSocketToken,
     {
         Self {
@@ -127,6 +156,7 @@ impl ComponentHostNetworkService {
 
 impl ComponentNetworkService for ComponentHostNetworkService {
     type TcpStream = u64;
+    type TcpListener = u64;
     type UdpSocket = u64;
 
     fn hardware_address(&self) -> [u8; 6] {
@@ -160,6 +190,22 @@ impl ComponentNetworkService for ComponentHostNetworkService {
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Self::TcpStream, TcpError>> + Send + 'a {
         self.inner.tcp_connect(host, port, timeout_nanos)
+    }
+
+    fn tcp_listen(
+        &self,
+        local_port: u16,
+        backlog: u16,
+    ) -> impl Future<Output = Result<TcpListener<Self::TcpListener>, TcpError>> + Send + '_ {
+        self.inner.tcp_listen(local_port, backlog)
+    }
+
+    fn tcp_accept(
+        &self,
+        listener: Self::TcpListener,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<TcpAccepted<Self::TcpStream>, TcpError>> + Send + '_ {
+        self.inner.tcp_accept(listener, timeout_nanos)
     }
 
     fn tcp_write_all<'a>(
@@ -225,6 +271,7 @@ impl<Service> DynComponentHostNetworkService for TypedNetworkService<Service>
 where
     Service: ComponentNetworkService + Sync,
     Service::TcpStream: ComponentHostTcpStreamToken,
+    Service::TcpListener: ComponentHostTcpListenerToken,
     Service::UdpSocket: ComponentHostUdpSocketToken,
 {
     fn hardware_address(&self) -> [u8; 6] {
@@ -260,6 +307,41 @@ where
         Box::pin(async move {
             let stream = self.service.tcp_connect(host, port, timeout_nanos).await?;
             Ok(stream.into_raw())
+        })
+    }
+
+    fn tcp_listen<'a>(
+        &'a self,
+        local_port: u16,
+        backlog: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<TcpListener<u64>, TcpError>> + Send + 'a>> {
+        Box::pin(async move {
+            let listener = self.service.tcp_listen(local_port, backlog).await?;
+            Ok(TcpListener {
+                listener: listener.listener.into_raw(),
+                local_port: listener.local_port,
+            })
+        })
+    }
+
+    fn tcp_accept<'a>(
+        &'a self,
+        listener: u64,
+        timeout_nanos: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<TcpAccepted<u64>, TcpError>> + Send + 'a>> {
+        Box::pin(async move {
+            let accepted = self
+                .service
+                .tcp_accept(
+                    <Service::TcpListener as ComponentHostTcpListenerToken>::from_raw(listener),
+                    timeout_nanos,
+                )
+                .await?;
+            Ok(TcpAccepted {
+                stream: accepted.stream.into_raw(),
+                address: accepted.address,
+                port: accepted.port,
+            })
         })
     }
 

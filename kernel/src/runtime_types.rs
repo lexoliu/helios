@@ -174,6 +174,8 @@ pub enum TcpErrorKind {
     UnresolvedHost,
     #[error("operation timed out")]
     Timeout,
+    #[error("permission denied")]
+    PermissionDenied,
     #[error("TCP service is unavailable")]
     Unavailable,
     #[error("internal TCP error")]
@@ -183,9 +185,8 @@ pub enum TcpErrorKind {
 impl TcpErrorKind {
     pub const fn from_io(error: IoError) -> Self {
         match error {
-            IoError::Unsupported | IoError::PermissionDenied | IoError::ReadOnly => {
-                TcpErrorKind::Unavailable
-            }
+            IoError::PermissionDenied | IoError::ReadOnly => TcpErrorKind::PermissionDenied,
+            IoError::Unsupported => TcpErrorKind::Unavailable,
             IoError::NotFound
             | IoError::AlreadyExists
             | IoError::NotDirectory
@@ -298,6 +299,12 @@ pub enum NetworkErrorDetail {
     TcpConnectStartFailed,
     #[error("TCP stream closed during connect")]
     TcpClosedDuringConnect,
+    #[error("TCP listen could not be started")]
+    TcpListenStartFailed,
+    #[error("TCP accept timed out")]
+    TcpAcceptTimeout,
+    #[error("TCP listener closed unexpectedly")]
+    TcpListenerClosedUnexpectedly,
     #[error("TCP write timed out")]
     TcpWriteTimeout,
     #[error("TCP write could not be queued")]
@@ -355,6 +362,9 @@ impl NetworkErrorDetail {
             Self::TcpConnectTimeout => "TCP connect timed out",
             Self::TcpConnectStartFailed => "TCP connect could not be started",
             Self::TcpClosedDuringConnect => "TCP stream closed during connect",
+            Self::TcpListenStartFailed => "TCP listen could not be started",
+            Self::TcpAcceptTimeout => "TCP accept timed out",
+            Self::TcpListenerClosedUnexpectedly => "TCP listener closed unexpectedly",
             Self::TcpWriteTimeout => "TCP write timed out",
             Self::TcpWriteQueueFailed => "TCP write could not be queued",
             Self::TcpNoLongerWritable => "TCP stream is no longer writable",
@@ -390,8 +400,22 @@ pub struct UdpBinding<Socket> {
     pub local_port: u16,
 }
 
-pub trait ComponentNetworkService: Clone + Send + 'static {
+#[derive(Clone, Debug)]
+pub struct TcpListener<Listener> {
+    pub listener: Listener,
+    pub local_port: u16,
+}
+
+#[derive(Clone, Debug)]
+pub struct TcpAccepted<Stream> {
+    pub stream: Stream,
+    pub address: Ipv4Address,
+    pub port: u16,
+}
+
+pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
     type TcpStream: Copy + Send + 'static;
+    type TcpListener: Copy + Send + 'static;
     type UdpSocket: Copy + Send + 'static;
 
     fn hardware_address(&self) -> [u8; 6];
@@ -416,6 +440,18 @@ pub trait ComponentNetworkService: Clone + Send + 'static {
         port: u16,
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Self::TcpStream, TcpError>> + Send + 'a;
+
+    fn tcp_listen(
+        &self,
+        local_port: u16,
+        backlog: u16,
+    ) -> impl Future<Output = Result<TcpListener<Self::TcpListener>, TcpError>> + Send + '_;
+
+    fn tcp_accept(
+        &self,
+        listener: Self::TcpListener,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<TcpAccepted<Self::TcpStream>, TcpError>> + Send + '_;
 
     fn tcp_write_all<'a>(
         &'a self,

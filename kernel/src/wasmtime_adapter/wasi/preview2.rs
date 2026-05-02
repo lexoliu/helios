@@ -2383,6 +2383,7 @@ fn map_p2_tcp_core_error(error: crate::TcpError) -> p2tcp::ErrorCode {
     match error.kind {
         crate::TcpErrorKind::UnresolvedHost => p2tcp::ErrorCode::NameUnresolvable,
         crate::TcpErrorKind::Timeout => p2tcp::ErrorCode::Timeout,
+        crate::TcpErrorKind::PermissionDenied => p2tcp::ErrorCode::AccessDenied,
         crate::TcpErrorKind::Unavailable => p2tcp::ErrorCode::RemoteUnreachable,
         crate::TcpErrorKind::Internal => p2tcp::ErrorCode::Unknown,
     }

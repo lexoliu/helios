@@ -4678,6 +4678,7 @@ fn map_p3_tcp_error(error: crate::TcpError) -> socket_types::ErrorCode {
             socket_types::ErrorCode::RemoteUnreachable
         }
         crate::TcpErrorKind::Timeout => socket_types::ErrorCode::Timeout,
+        crate::TcpErrorKind::PermissionDenied => socket_types::ErrorCode::AccessDenied,
         crate::TcpErrorKind::Internal => socket_types::ErrorCode::Other(None),
     }
 }
@@ -4938,6 +4939,7 @@ mod tests {
 
     impl ComponentNetworkService for TestNetworkService {
         type TcpStream = u64;
+        type TcpListener = u64;
         type UdpSocket = u64;
 
         fn hardware_address(&self) -> [u8; 6] {
@@ -4984,6 +4986,35 @@ mod tests {
         ) -> impl core::future::Future<Output = Result<Self::TcpStream, crate::TcpError>> + Send + '_
         {
             core::future::ready(Ok(7))
+        }
+
+        fn tcp_listen(
+            &self,
+            local_port: u16,
+            _: u16,
+        ) -> impl core::future::Future<
+            Output = Result<crate::TcpListener<Self::TcpListener>, crate::TcpError>,
+        > + Send
+        + '_ {
+            core::future::ready(Ok(crate::TcpListener {
+                listener: 8,
+                local_port,
+            }))
+        }
+
+        fn tcp_accept(
+            &self,
+            listener: Self::TcpListener,
+            _: u64,
+        ) -> impl core::future::Future<
+            Output = Result<crate::TcpAccepted<Self::TcpStream>, crate::TcpError>,
+        > + Send
+        + '_ {
+            core::future::ready(Ok(crate::TcpAccepted {
+                stream: listener + 1,
+                address: crate::Ipv4Address::new([127, 0, 0, 1]),
+                port: 4040,
+            }))
         }
 
         fn tcp_write_all(

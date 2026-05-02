@@ -485,6 +485,15 @@ enum WasixTcpSocket {
     Unconnected {
         options: WasixSocketOptions,
     },
+    Bound {
+        local_port: u16,
+        options: WasixSocketOptions,
+    },
+    Listening {
+        listener: u64,
+        local_port: u16,
+        options: WasixSocketOptions,
+    },
     Connected {
         stream: u64,
         peer_address: crate::Ipv4Address,
@@ -647,17 +656,19 @@ impl WasixSocketDescriptor {
 impl WasixTcpSocket {
     fn options(&self) -> &WasixSocketOptions {
         match self {
-            WasixTcpSocket::Unconnected { options } | WasixTcpSocket::Connected { options, .. } => {
-                options
-            }
+            WasixTcpSocket::Unconnected { options }
+            | WasixTcpSocket::Bound { options, .. }
+            | WasixTcpSocket::Listening { options, .. }
+            | WasixTcpSocket::Connected { options, .. } => options,
         }
     }
 
     fn options_mut(&mut self) -> &mut WasixSocketOptions {
         match self {
-            WasixTcpSocket::Unconnected { options } | WasixTcpSocket::Connected { options, .. } => {
-                options
-            }
+            WasixTcpSocket::Unconnected { options }
+            | WasixTcpSocket::Bound { options, .. }
+            | WasixTcpSocket::Listening { options, .. }
+            | WasixTcpSocket::Connected { options, .. } => options,
         }
     }
 }
@@ -3701,26 +3712,24 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "sock_listen",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             backlog: i32|
-             -> i32 { wasix_sock_listen(&mut caller, fd, backlog) },
+             (fd, backlog): (i32, i32)| {
+                Box::new(async move { wasix_sock_listen(&mut caller, fd, backlog).await })
+            },
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             WASIX_MODULE,
             "sock_accept_v2",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             _flags: i32,
-             ret_fd: i32,
-             ret_addr: i32|
-             -> i32 {
-                wasix_sock_accept_v2(&mut caller, fd, ret_fd as u32, ret_addr as u32)
+             (fd, _flags, ret_fd, ret_addr): (i32, i32, i32, i32)| {
+                Box::new(async move {
+                    wasix_sock_accept_v2(&mut caller, fd, ret_fd as u32, ret_addr as u32).await
+                })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -6323,14 +6332,15 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "sock_accept",
             |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
-             fd: i32,
-             _flags: i32,
-             _fd_out: i32|
-             -> i32 { p1_sock_accept(&mut caller, fd) },
+             (fd, fdflags, fd_out): (i32, i32, i32)| {
+                Box::new(
+                    async move { p1_sock_accept(&mut caller, fd, fdflags, fd_out as u32).await },
+                )
+            },
         )
         .map_err(map_program_runtime_error)?;
     linker
@@ -10343,6 +10353,15 @@ where
             crate::Ipv4Address::new([0, 0, 0, 0]),
             *local_port,
         ),
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
+            WasixTcpSocket::Bound { local_port, .. } | WasixTcpSocket::Listening { local_port, .. },
+        ))) => write_wasix_addr_port_ip4(
+            caller,
+            memory,
+            ret_addr,
+            crate::Ipv4Address::new([0, 0, 0, 0]),
+            *local_port,
+        ),
         Some(Preview1Descriptor::Socket(_)) => {
             write_wasix_addr_port_unspec(caller, memory, ret_addr)
         }
@@ -10538,9 +10557,7 @@ fn wasix_sock_recv_authority(
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
             WasixTcpSocket::Connected { .. },
         ))) => Ok(WasixSocketAuthority::Tcp),
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Unconnected { .. },
-        ))) => Err(p1::errno::INVAL),
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => Err(p1::errno::INVAL),
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { .. })) => {
             Ok(WasixSocketAuthority::LocalOnly)
         }
@@ -10559,9 +10576,7 @@ fn wasix_sock_send_authority(
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
             WasixTcpSocket::Connected { .. },
         ))) => Ok(WasixSocketAuthority::Tcp),
-        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Unconnected { .. },
-        ))) => Err(p1::errno::INVAL),
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => Err(p1::errno::INVAL),
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { .. })) => {
             Ok(WasixSocketAuthority::LocalOnly)
         }
@@ -10577,6 +10592,9 @@ fn wasix_sock_bind_authority(
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
             ..
         }))) => Ok(WasixSocketAuthority::Udp),
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
+            WasixTcpSocket::Unconnected { .. },
+        ))) => Ok(WasixSocketAuthority::Tcp),
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
             ..
         }))) => Err(p1::errno::INVAL),
@@ -10807,28 +10825,49 @@ where
             return status;
         }
     }
-    let Some(service) = caller.data().runtime_state.network_service() else {
-        return p1::errno::NETDOWN;
-    };
-    let binding = match service.udp_bind(port).await {
-        Ok(binding) => binding,
-        Err(error) => return p1_errno_from_udp_error(error),
-    };
-    let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(slot))) =
-        caller.data_mut().descriptors.get_mut(fd)
-    else {
-        return p1::errno::BADF;
-    };
-    let options = *slot.options();
-    *slot = WasixUdpSocket::Bound {
-        socket: binding.socket,
-        local_port: binding.local_port,
-        options,
-    };
-    p1::errno::SUCCESS
+    match descriptor {
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(_))) => {
+            let Some(service) = caller.data().runtime_state.network_service() else {
+                return p1::errno::NETDOWN;
+            };
+            let binding = match service.udp_bind(port).await {
+                Ok(binding) => binding,
+                Err(error) => return p1_errno_from_udp_error(error),
+            };
+            let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(slot))) =
+                caller.data_mut().descriptors.get_mut(fd)
+            else {
+                return p1::errno::BADF;
+            };
+            let options = *slot.options();
+            *slot = WasixUdpSocket::Bound {
+                socket: binding.socket,
+                local_port: binding.local_port,
+                options,
+            };
+            p1::errno::SUCCESS
+        }
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => {
+            if caller.data().runtime_state.network_service().is_none() {
+                return p1::errno::NETDOWN;
+            }
+            let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(slot))) =
+                caller.data_mut().descriptors.get_mut(fd)
+            else {
+                return p1::errno::BADF;
+            };
+            let options = *slot.options();
+            *slot = WasixTcpSocket::Bound {
+                local_port: port,
+                options,
+            };
+            p1::errno::SUCCESS
+        }
+        _ => p1::errno::BADF,
+    }
 }
 
-fn wasix_sock_listen<CpuImpl, HostFs>(
+async fn wasix_sock_listen<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     backlog: i32,
@@ -10848,17 +10887,50 @@ where
     if status != p1::errno::SUCCESS {
         return status;
     }
-    if caller.data().runtime_state.network_service().is_none() {
+    let Some(service) = caller.data().runtime_state.network_service() else {
         return p1::errno::NETDOWN;
-    }
-    p1::errno::NOTSUP
+    };
+    let backlog = match u16::try_from(backlog) {
+        Ok(backlog) => backlog,
+        Err(_) => return p1::errno::OVERFLOW,
+    };
+    let local_port = match caller.data().descriptors.get(fd) {
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
+            WasixTcpSocket::Unconnected { .. },
+        ))) => 0,
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Bound {
+            local_port,
+            ..
+        }))) => *local_port,
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => {
+            return p1::errno::INVAL;
+        }
+        Some(_) => return p1::errno::NOTSOCK,
+        None => return p1::errno::BADF,
+    };
+    let listener = match service.tcp_listen(local_port, backlog).await {
+        Ok(listener) => listener,
+        Err(error) => return p1_errno_from_tcp_error(error),
+    };
+    let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(slot))) =
+        caller.data_mut().descriptors.get_mut(fd)
+    else {
+        return p1::errno::BADF;
+    };
+    let options = *slot.options();
+    *slot = WasixTcpSocket::Listening {
+        listener: listener.listener,
+        local_port: listener.local_port,
+        options,
+    };
+    p1::errno::SUCCESS
 }
 
-fn wasix_sock_accept_v2<CpuImpl, HostFs>(
+async fn wasix_sock_accept_v2<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
-    _ret_fd: u32,
-    _ret_addr: u32,
+    ret_fd: u32,
+    ret_addr: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
@@ -10872,10 +10944,53 @@ where
     if status != p1::errno::SUCCESS {
         return status;
     }
-    if caller.data().runtime_state.network_service().is_none() {
+    let listener = match caller.data().descriptors.get(fd) {
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
+            WasixTcpSocket::Listening { listener, .. },
+        ))) => *listener,
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => {
+            return p1::errno::INVAL;
+        }
+        Some(_) => return p1::errno::NOTSOCK,
+        None => return p1::errno::BADF,
+    };
+    let Some(service) = caller.data().runtime_state.network_service() else {
         return p1::errno::NETDOWN;
+    };
+    let accepted = match service.tcp_accept(listener, u64::MAX).await {
+        Ok(accepted) => accepted,
+        Err(error) => return p1_errno_from_tcp_error(error),
+    };
+    let descriptor =
+        Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
+            stream: accepted.stream,
+            peer_address: accepted.address,
+            peer_port: accepted.port,
+            options: WasixSocketOptions::default(),
+        }));
+    let accepted_fd = match caller.data_mut().descriptors.insert(descriptor) {
+        Ok(fd) => fd,
+        Err(errno) => return errno,
+    };
+    let Some(memory) = p1_memory(caller) else {
+        let _ = caller.data_mut().descriptors.close(accepted_fd as i32);
+        return p1::errno::FAULT;
+    };
+    let status = p1_write_u32(caller, memory, ret_fd, accepted_fd);
+    if status != p1::errno::SUCCESS {
+        let _ = caller.data_mut().descriptors.close(accepted_fd as i32);
+        return status;
     }
-    p1::errno::NOTSUP
+    if ret_addr != 0 {
+        return write_wasix_addr_port_ip4(
+            caller,
+            memory,
+            ret_addr,
+            accepted.address,
+            accepted.port,
+        );
+    }
+    p1::errno::SUCCESS
 }
 
 async fn wasix_sock_connect<CpuImpl, HostFs>(
@@ -10907,6 +11022,9 @@ where
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
             WasixTcpSocket::Connected { .. },
         ))) => return p1::errno::INVAL,
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
+            WasixTcpSocket::Bound { .. } | WasixTcpSocket::Listening { .. },
+        ))) => return p1::errno::NOTSUP,
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(_))) => {
             return p1::errno::NOTSOCK;
         }
@@ -11043,6 +11161,7 @@ where
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
             WasixTcpSocket::Unconnected { .. },
         ))) => p1::errno::INVAL,
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => p1::errno::INVAL,
         Some(_) => p1::errno::NOTSOCK,
         None => p1::errno::BADF,
     }
@@ -11147,6 +11266,7 @@ where
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
             WasixTcpSocket::Unconnected { .. },
         ))) => p1::errno::INVAL,
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => p1::errno::INVAL,
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { writer, .. })) => {
             let written = match u32::try_from(bytes.len()) {
                 Ok(written) => written,
@@ -11856,19 +11976,62 @@ fn write_wasix_addr_port_unspec<T>(
         ))
 }
 
-fn p1_sock_accept<CpuImpl, HostFs>(
+async fn p1_sock_accept<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
+    fdflags: i32,
+    fd_out: u32,
 ) -> i32
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Socket(_)) => p1::errno::NOTSUP,
-        Some(_) => p1::errno::NOTSOCK,
-        None => p1::errno::BADF,
+    if fdflags != 0 {
+        return p1::errno::NOTSUP;
     }
+    let status = caller.data().require_tcp_authority();
+    if status != p1::errno::SUCCESS {
+        return status;
+    }
+    let listener = match caller.data().descriptors.get(fd) {
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
+            WasixTcpSocket::Listening { listener, .. },
+        ))) => *listener,
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => {
+            return p1::errno::INVAL;
+        }
+        Some(Preview1Descriptor::Socket(_)) => return p1::errno::INVAL,
+        Some(_) => return p1::errno::NOTSOCK,
+        None => return p1::errno::BADF,
+    };
+    let Some(service) = caller.data().runtime_state.network_service() else {
+        return p1::errno::NETDOWN;
+    };
+    let accepted = match service.tcp_accept(listener, u64::MAX).await {
+        Ok(accepted) => accepted,
+        Err(error) => return p1_errno_from_tcp_error(error),
+    };
+    let descriptor =
+        Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
+            stream: accepted.stream,
+            peer_address: accepted.address,
+            peer_port: accepted.port,
+            options: WasixSocketOptions::default(),
+        }));
+    let accepted_fd = match caller.data_mut().descriptors.insert(descriptor) {
+        Ok(fd) => fd,
+        Err(errno) => return errno,
+    };
+    let Some(memory) = p1_memory(caller) else {
+        let _ = caller.data_mut().descriptors.close(accepted_fd as i32);
+        return p1::errno::FAULT;
+    };
+    let status = p1_write_u32(caller, memory, fd_out, accepted_fd);
+    if status != p1::errno::SUCCESS {
+        let _ = caller.data_mut().descriptors.close(accepted_fd as i32);
+        return status;
+    }
+    p1::errno::SUCCESS
 }
 
 fn p1_connected_tcp_stream<CpuImpl, HostFs>(
@@ -12053,6 +12216,7 @@ where
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
             WasixTcpSocket::Unconnected { .. },
         ))) => p1::errno::INVAL,
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => p1::errno::INVAL,
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
             socket,
             ..
@@ -12890,6 +13054,7 @@ fn p1_errno_from_tcp_error(error: crate::TcpError) -> i32 {
     match error.kind {
         crate::TcpErrorKind::UnresolvedHost => p1::errno::HOSTUNREACH,
         crate::TcpErrorKind::Timeout => p1::errno::TIMEDOUT,
+        crate::TcpErrorKind::PermissionDenied => p1::errno::NOTCAPABLE,
         crate::TcpErrorKind::Unavailable => p1::errno::NETDOWN,
         crate::TcpErrorKind::Internal => p1::errno::IO,
     }

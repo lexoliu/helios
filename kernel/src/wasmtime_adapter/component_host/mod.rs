@@ -77,7 +77,8 @@ fn write_serial_fmt(write_serial: fn(&[u8]), arguments: fmt::Arguments<'_>) {
 }
 
 pub use network::{
-    ComponentHostNetworkService, ComponentHostTcpStreamToken, ComponentHostUdpSocketToken,
+    ComponentHostNetworkService, ComponentHostTcpListenerToken, ComponentHostTcpStreamToken,
+    ComponentHostUdpSocketToken,
 };
 pub use service::{
     ChildExit, ChildHandle, UserProgramService, install_component_host_program_service,
@@ -2700,6 +2701,9 @@ fn convert_tcp_error(error: crate::TcpError) -> debugger_bindings::helios::syste
             crate::TcpErrorKind::Timeout => {
                 debugger_bindings::helios::system::net::TcpErrorKind::Timeout
             }
+            crate::TcpErrorKind::PermissionDenied => {
+                debugger_bindings::helios::system::net::TcpErrorKind::Unavailable
+            }
             crate::TcpErrorKind::Unavailable => {
                 debugger_bindings::helios::system::net::TcpErrorKind::Unavailable
             }
@@ -2721,6 +2725,9 @@ fn convert_program_tcp_error(
             }
             crate::TcpErrorKind::Timeout => {
                 program_bindings::helios::system::net::TcpErrorKind::Timeout
+            }
+            crate::TcpErrorKind::PermissionDenied => {
+                program_bindings::helios::system::net::TcpErrorKind::Unavailable
             }
             crate::TcpErrorKind::Unavailable => {
                 program_bindings::helios::system::net::TcpErrorKind::Unavailable

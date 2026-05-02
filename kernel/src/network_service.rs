@@ -27,7 +27,8 @@ use smoltcp::wire::{
 use crate::{
     ComponentNetworkService, ComponentRuntimeState, DnsError, DnsErrorKind,
     Ipv4Address as KernelIpv4Address, NetworkErrorDetail, Notify, PingError, PingErrorKind,
-    PingReply, TcpError, TcpErrorKind, Timer, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+    PingReply, TcpAccepted, TcpError, TcpErrorKind, TcpListener, Timer, UdpBinding, UdpDatagram,
+    UdpError, UdpErrorKind,
 };
 
 const DHCP_PARAMETERS: &[u8] = &[1, 3, 6];
@@ -100,6 +101,24 @@ impl crate::ComponentHostTcpStreamToken for TcpStreamId {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+pub struct TcpListenerId(NonZeroU32);
+
+#[cfg(feature = "wasmtime-runtime")]
+impl crate::ComponentHostTcpListenerToken for TcpListenerId {
+    fn into_raw(self) -> u64 {
+        u64::from(self.0.get())
+    }
+
+    fn from_raw(raw: u64) -> Self {
+        let raw = u32::try_from(raw)
+            .unwrap_or_else(|_| panic!("tcp listener handle {raw} does not fit in u32"));
+        let raw =
+            NonZeroU32::new(raw).unwrap_or_else(|| panic!("tcp listener handle must be non-zero"));
+        Self(raw)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct UdpSocketId(NonZeroU32);
 
 #[cfg(feature = "wasmtime-runtime")]
@@ -121,6 +140,8 @@ enum NetworkRequest {
     Ping(PingRequest),
     DnsResolve(DnsResolveRequest),
     TcpConnect(TcpConnectRequest),
+    TcpListen(TcpListenRequest),
+    TcpAccept(TcpAcceptRequest),
     TcpWrite(TcpWriteRequest),
     TcpRead(TcpReadRequest),
     TcpClose(TcpCloseRequest),
@@ -147,6 +168,18 @@ struct TcpConnectRequest {
     port: u16,
     timeout_nanos: u64,
     response: RequestResponse<Result<TcpStreamId, TcpError>>,
+}
+
+struct TcpListenRequest {
+    local_port: u16,
+    backlog: u16,
+    response: RequestResponse<Result<TcpListener<TcpListenerId>, TcpError>>,
+}
+
+struct TcpAcceptRequest {
+    listener: TcpListenerId,
+    timeout_nanos: u64,
+    response: RequestResponse<Result<TcpAccepted<TcpStreamId>, TcpError>>,
 }
 
 struct TcpWriteRequest {
@@ -252,12 +285,18 @@ struct NetworkState {
     next_tcp_local_port: u16,
     next_udp_local_port: u16,
     tcp_streams: Vec<Option<TcpStreamState>>,
+    tcp_listeners: Vec<Option<TcpListenerState>>,
     udp_sockets: Vec<Option<UdpSocketState>>,
     max_frame_len: usize,
 }
 
 struct TcpStreamState {
     handle: SocketHandle,
+}
+
+struct TcpListenerState {
+    handle: SocketHandle,
+    local_port: u16,
 }
 
 struct UdpSocketState {
@@ -363,6 +402,34 @@ where
         self.enqueue_request(NetworkRequest::TcpConnect(TcpConnectRequest {
             host: host.to_owned(),
             port,
+            timeout_nanos,
+            response: response.clone(),
+        }));
+        response.wait().await
+    }
+
+    pub async fn tcp_listen(
+        &self,
+        local_port: u16,
+        backlog: u16,
+    ) -> Result<TcpListener<TcpListenerId>, TcpError> {
+        let response = RequestResponse::new();
+        self.enqueue_request(NetworkRequest::TcpListen(TcpListenRequest {
+            local_port,
+            backlog,
+            response: response.clone(),
+        }));
+        response.wait().await
+    }
+
+    pub async fn tcp_accept(
+        &self,
+        listener: TcpListenerId,
+        timeout_nanos: u64,
+    ) -> Result<TcpAccepted<TcpStreamId>, TcpError> {
+        let response = RequestResponse::new();
+        self.enqueue_request(NetworkRequest::TcpAccept(TcpAcceptRequest {
+            listener,
             timeout_nanos,
             response: response.clone(),
         }));
@@ -491,6 +558,18 @@ where
                 NetworkRequest::TcpConnect(request) => {
                     let result = self
                         .execute_tcp_connect(&request.host, request.port, request.timeout_nanos)
+                        .await;
+                    request.response.complete(result).await;
+                }
+                NetworkRequest::TcpListen(request) => {
+                    let result = self
+                        .execute_tcp_listen(request.local_port, request.backlog)
+                        .await;
+                    request.response.complete(result).await;
+                }
+                NetworkRequest::TcpAccept(request) => {
+                    let result = self
+                        .execute_tcp_accept(request.listener, request.timeout_nanos)
                         .await;
                     request.response.complete(result).await;
                 }
@@ -637,6 +716,49 @@ where
                     Err(error) => {
                         state.remove_tcp_stream(stream);
                         return Err(error);
+                    }
+                }
+            };
+            self.wait_for_progress(next_wait).await;
+        }
+    }
+
+    async fn execute_tcp_listen(
+        &self,
+        local_port: u16,
+        backlog: u16,
+    ) -> Result<TcpListener<TcpListenerId>, TcpError> {
+        let local_port = if local_port == 0 {
+            let mut state = self.inner.state.lock().await;
+            state.allocate_tcp_local_port()?
+        } else {
+            local_port
+        };
+        let mut state = self.inner.state.lock().await;
+        state.start_tcp_listen(local_port, backlog)
+    }
+
+    async fn execute_tcp_accept(
+        &self,
+        listener: TcpListenerId,
+        timeout_nanos: u64,
+    ) -> Result<TcpAccepted<TcpStreamId>, TcpError> {
+        let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
+        loop {
+            self.drive_tcp().await?;
+            let now_nanos = self.now_nanos();
+            let next_wait = {
+                let mut state = self.inner.state.lock().await;
+                match state.poll_tcp_accept(listener)? {
+                    Some(accepted) => return Ok(accepted),
+                    None => {
+                        if now_nanos >= deadline_nanos {
+                            return Err(TcpError {
+                                kind: TcpErrorKind::Timeout,
+                                detail: NetworkErrorDetail::TcpAcceptTimeout,
+                            });
+                        }
+                        state.next_wait_duration(now_nanos, deadline_nanos)
                     }
                 }
             };
@@ -1130,6 +1252,7 @@ where
     DeviceImpl: NetworkDevice,
 {
     type TcpStream = TcpStreamId;
+    type TcpListener = TcpListenerId;
     type UdpSocket = UdpSocketId;
 
     fn hardware_address(&self) -> [u8; 6] {
@@ -1164,6 +1287,24 @@ where
         timeout_nanos: u64,
     ) -> impl core::future::Future<Output = Result<Self::TcpStream, TcpError>> + Send + 'a {
         async move { NetworkService::tcp_connect(self, host, port, timeout_nanos).await }
+    }
+
+    fn tcp_listen(
+        &self,
+        local_port: u16,
+        backlog: u16,
+    ) -> impl core::future::Future<Output = Result<TcpListener<Self::TcpListener>, TcpError>> + Send + '_
+    {
+        async move { NetworkService::tcp_listen(self, local_port, backlog).await }
+    }
+
+    fn tcp_accept(
+        &self,
+        listener: Self::TcpListener,
+        timeout_nanos: u64,
+    ) -> impl core::future::Future<Output = Result<TcpAccepted<Self::TcpStream>, TcpError>> + Send + '_
+    {
+        async move { NetworkService::tcp_accept(self, listener, timeout_nanos).await }
     }
 
     fn tcp_write_all<'a>(
@@ -1275,6 +1416,7 @@ impl NetworkState {
             next_tcp_local_port: EPHEMERAL_PORT_START,
             next_udp_local_port: EPHEMERAL_PORT_START,
             tcp_streams: Vec::new(),
+            tcp_listeners: Vec::new(),
             udp_sockets: Vec::new(),
             max_frame_len,
         }
@@ -1620,6 +1762,93 @@ impl NetworkState {
         Ok(self.insert_tcp_stream(handle))
     }
 
+    fn start_tcp_listen(
+        &mut self,
+        local_port: u16,
+        _backlog: u16,
+    ) -> Result<TcpListener<TcpListenerId>, TcpError> {
+        if !self.is_tcp_local_port_free(local_port) {
+            return Err(TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::TcpListenStartFailed,
+            });
+        }
+        let handle = self.create_tcp_listener_socket(local_port)?;
+        Ok(TcpListener {
+            listener: self.insert_tcp_listener(handle, local_port),
+            local_port,
+        })
+    }
+
+    fn create_tcp_listener_socket(&mut self, local_port: u16) -> Result<SocketHandle, TcpError> {
+        let socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]),
+            tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]),
+        );
+        let handle = self.sockets.add(socket);
+        let listen_result = self
+            .sockets
+            .get_mut::<tcp::Socket>(handle)
+            .listen(IpListenEndpoint {
+                addr: None,
+                port: local_port,
+            });
+        if let Err(error) = listen_result {
+            let _ = self.sockets.remove(handle);
+            tracing::error!(local_port, ?error, "failed to start TCP listen");
+            return Err(TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::TcpListenStartFailed,
+            });
+        }
+        Ok(handle)
+    }
+
+    fn poll_tcp_accept(
+        &mut self,
+        listener: TcpListenerId,
+    ) -> Result<Option<TcpAccepted<TcpStreamId>>, TcpError> {
+        let index = tcp_listener_index(listener);
+        let (handle, local_port) = self
+            .tcp_listeners
+            .get(index)
+            .and_then(|slot| slot.as_ref())
+            .map(|state| (state.handle, state.local_port))
+            .ok_or_else(|| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::UnknownTcpStream,
+            })?;
+        let remote = {
+            let socket = self.sockets.get_mut::<tcp::Socket>(handle);
+            if matches!(socket.state(), tcp::State::Listen) {
+                return Ok(None);
+            }
+            if matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait) {
+                return Err(TcpError {
+                    kind: TcpErrorKind::Unavailable,
+                    detail: NetworkErrorDetail::TcpListenerClosedUnexpectedly,
+                });
+            }
+            let Some(remote) = socket.remote_endpoint() else {
+                return Ok(None);
+            };
+            remote
+        };
+        let IpAddress::Ipv4(address) = remote.addr;
+        let replacement = self.create_tcp_listener_socket(local_port)?;
+        let slot = self
+            .tcp_listeners
+            .get_mut(index)
+            .and_then(Option::as_mut)
+            .expect("tcp listener disappeared while accepting");
+        slot.handle = replacement;
+        Ok(Some(TcpAccepted {
+            stream: self.insert_tcp_stream(handle),
+            address: map_ipv4_address(address),
+            port: remote.port,
+        }))
+    }
+
     fn poll_tcp_connect(&mut self, stream: TcpStreamId) -> Result<TcpConnectProgress, TcpError> {
         let socket = self.tcp_socket_mut(stream)?;
         if socket.may_send() || socket.can_recv() {
@@ -1842,6 +2071,22 @@ impl NetworkState {
         tcp_stream_id(self.tcp_streams.len() - 1)
     }
 
+    fn insert_tcp_listener(&mut self, handle: SocketHandle, local_port: u16) -> TcpListenerId {
+        if let Some((index, slot)) = self
+            .tcp_listeners
+            .iter_mut()
+            .enumerate()
+            .find(|(_, slot)| slot.is_none())
+        {
+            *slot = Some(TcpListenerState { handle, local_port });
+            return tcp_listener_id(index);
+        }
+
+        self.tcp_listeners
+            .push(Some(TcpListenerState { handle, local_port }));
+        tcp_listener_id(self.tcp_listeners.len() - 1)
+    }
+
     fn insert_udp_socket(&mut self, handle: SocketHandle) -> UdpSocketId {
         if let Some((index, slot)) = self
             .udp_sockets
@@ -1935,7 +2180,11 @@ impl NetworkState {
                 .get::<tcp::Socket>(state.handle)
                 .local_endpoint()
                 .is_none_or(|endpoint| endpoint.port != port)
-        })
+        }) && self
+            .tcp_listeners
+            .iter()
+            .flatten()
+            .all(|state| state.local_port != port)
     }
 
     fn is_udp_local_port_free(&self, port: u16) -> bool {
@@ -2059,6 +2308,23 @@ fn tcp_stream_id(index: usize) -> TcpStreamId {
 fn stream_index(stream: TcpStreamId) -> usize {
     usize::try_from(stream.0.get() - 1)
         .unwrap_or_else(|_| panic!("tcp stream id {} does not fit into usize", stream.0.get()))
+}
+
+fn tcp_listener_id(index: usize) -> TcpListenerId {
+    let raw = u32::try_from(index + 1)
+        .unwrap_or_else(|_| panic!("tcp listener index {index} exceeds u32"));
+    TcpListenerId(
+        NonZeroU32::new(raw).unwrap_or_else(|| panic!("tcp listener ids must never be zero")),
+    )
+}
+
+fn tcp_listener_index(listener: TcpListenerId) -> usize {
+    usize::try_from(listener.0.get() - 1).unwrap_or_else(|_| {
+        panic!(
+            "tcp listener id {} does not fit into usize",
+            listener.0.get()
+        )
+    })
 }
 
 fn udp_socket_id(index: usize) -> UdpSocketId {
