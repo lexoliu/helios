@@ -18,6 +18,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
+use crate::workload_bench::{VmProvenance, WorkloadBenchCommand};
 use crate::{SessionCommand, connect_client, run_connected};
 
 const DEFAULT_BAUD: u32 = 115_200;
@@ -404,17 +405,6 @@ struct AotBenchCommand {
     user_profile_output: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, ClapArgs)]
-struct WorkloadBenchCommand {
-    /// Number of measured executions per workload.
-    #[arg(long, default_value_t = 3)]
-    iterations: u16,
-
-    /// Restrict the run to named workloads. Repeat for multiple workloads.
-    #[arg(long = "workload")]
-    workloads: Vec<String>,
-}
-
 #[derive(Debug)]
 struct ResolvedVmCommand {
     profile: &'static VmProfile,
@@ -541,11 +531,13 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
         &session_command,
         Some(ResolvedVmSessionCommand::WorkloadBench(_))
     ) {
+        let Some(ResolvedVmSessionCommand::WorkloadBench(command)) = &session_command else {
+            unreachable!("workload-bench session command was already matched")
+        };
+        let required = crate::workload_bench::required_boot_programs(command)?;
         extend_unique_boot_programs(
             &mut boot_programs,
-            &[
-                "dash", "debugger", "bash", "cat", "mkdir", "env", "python3", "quickjs",
-            ],
+            &required.iter().map(String::as_str).collect::<Vec<_>>(),
         );
     }
     let no_compiler_plugin = command.no_compiler_plugin || file.no_compiler_plugin.unwrap_or(false);
@@ -712,114 +704,23 @@ fn connect_and_run(command: &ResolvedVmCommand, runtime: &mut VmRuntime) -> Resu
     };
     match command.command.clone() {
         Some(ResolvedVmSessionCommand::AotBench(command)) => run_aot_bench(client, command),
-        Some(ResolvedVmSessionCommand::WorkloadBench(command)) => {
-            run_workload_bench(client, command)
+        Some(ResolvedVmSessionCommand::WorkloadBench(workload_command)) => {
+            crate::workload_bench::run(
+                client,
+                workload_command,
+                VmProvenance {
+                    arch: arch_label(command.profile.arch),
+                    release: command.release,
+                    smp: command.smp,
+                    memory: command.memory.clone(),
+                    cpu: command.cpu.clone(),
+                    accel: command.accel.clone(),
+                },
+            )
         }
         Some(ResolvedVmSessionCommand::Session(command)) => run_connected(client, Some(command)),
         None => run_connected(client, None),
     }
-}
-
-fn run_workload_bench(
-    mut client: crate::serial::RpcClient,
-    command: WorkloadBenchCommand,
-) -> Result<()> {
-    crate::run_interruptible(async move {
-        if command.iterations == 0 {
-            bail!("workload-bench --iterations must be non-zero");
-        }
-        let workloads = selected_workloads(&command.workloads)?;
-        use std::io::Write as _;
-        for workload in workloads {
-            let mut elapsed_ms = Vec::new();
-            for iteration in 1..=command.iterations {
-                let started = std::time::Instant::now();
-                let output = crate::programs::exec(
-                    &mut client,
-                    crate::programs::REMOTE_SHELL_PATH,
-                    &["-c".to_owned(), workload.script.to_owned()],
-                )
-                .await
-                .with_context(|| format!("failed to run workload {}", workload.name))?;
-                let elapsed = started.elapsed().as_millis();
-                if output.exit_code != 0 {
-                    std::io::stdout().write_all(&output.output.stdout)?;
-                    std::io::stderr().write_all(&output.output.stderr)?;
-                    bail!(
-                        "workload {} iteration {} exited with code {}",
-                        workload.name,
-                        iteration,
-                        output.exit_code
-                    );
-                }
-                writeln!(
-                    std::io::stdout().lock(),
-                    "workload={} iteration={} elapsed_ms={} stdout_bytes={} stderr_bytes={}",
-                    workload.name,
-                    iteration,
-                    elapsed,
-                    output.output.stdout.len(),
-                    output.output.stderr.len()
-                )?;
-                elapsed_ms.push(elapsed);
-            }
-            elapsed_ms.sort_unstable();
-            let median = elapsed_ms[elapsed_ms.len() / 2];
-            writeln!(
-                std::io::stdout().lock(),
-                "workload={} median_elapsed_ms={} iterations={}",
-                workload.name,
-                median,
-                command.iterations
-            )?;
-        }
-        Ok(())
-    })
-}
-
-#[derive(Clone, Copy)]
-struct Workload {
-    name: &'static str,
-    script: &'static str,
-}
-
-const WORKLOADS: &[Workload] = &[
-    Workload {
-        name: "process-startup",
-        script: "i=0; while [ $i -lt 10 ]; do /bin/bash -c true; i=$((i+1)); done",
-    },
-    Workload {
-        name: "stdio-pipe",
-        script: "out=/pipe-$HELIOS_PROCESS_ID.out; copy=/pipe-$HELIOS_PROCESS_ID.copy; i=0; while [ $i -lt 2048 ]; do echo 0123456789abcdef0123456789abcdef; i=$((i+1)); done | /bin/cat > $out; /bin/cat $out > $copy",
-    },
-    Workload {
-        name: "fs-heavy",
-        script: "dir=/bench-$HELIOS_PROCESS_ID; /bin/mkdir $dir; i=0; while [ $i -lt 64 ]; do echo data > $dir/f$i; /bin/cat $dir/f$i > $dir/c$i; i=$((i+1)); done",
-    },
-    Workload {
-        name: "cpython-import",
-        script: "/bin/python3 -c \"import json, pathlib, email, urllib.parse; print('pyimport:ok')\"",
-    },
-    Workload {
-        name: "quickjs-loop",
-        script: "/bin/qjs -e \"let s=0; for (let i=0; i<10000; i++) s += i; console.log(s)\"",
-    },
-];
-
-fn selected_workloads(requested: &[String]) -> Result<Vec<Workload>> {
-    if requested.is_empty() {
-        return Ok(WORKLOADS.to_vec());
-    }
-    requested
-        .iter()
-        .map(|name| {
-            WORKLOADS
-                .iter()
-                .find(|workload| workload.name == name)
-                .copied()
-                .ok_or_else(|| anyhow::anyhow!("unknown workload {name}"))
-        })
-        .collect()
 }
 
 fn run_aot_bench(client: crate::serial::RpcClient, command: AotBenchCommand) -> Result<()> {
@@ -2002,7 +1903,8 @@ mod tests {
             )
             .await
         })
-        .ok_or_else(|| anyhow::anyhow!("timed out waiting for direct curl exec-path result"))??;
+        .ok_or_else(|| anyhow::anyhow!("timed out waiting for direct curl exec-path result"))??
+        .map_err(|error| anyhow::anyhow!("direct curl exec-path failed: {error:?}"))?;
         assert_eq!(curl.exit_code, 0, "curl exited non-zero: {curl:?}");
         let curl_stdout = String::from_utf8_lossy(&curl.output.stdout).to_ascii_lowercase();
         assert!(
@@ -2039,9 +1941,8 @@ mod tests {
             )
             .await
         })
-        .ok_or_else(|| {
-            anyhow::anyhow!("timed out waiting for direct CPython exec-path result")
-        })??;
+        .ok_or_else(|| anyhow::anyhow!("timed out waiting for direct CPython exec-path result"))??
+        .map_err(|error| anyhow::anyhow!("direct CPython exec-path failed: {error:?}"))?;
         assert_eq!(python.exit_code, 0, "CPython exited non-zero: {python:?}");
         let python_stdout = String::from_utf8_lossy(&python.output.stdout);
         assert_eq!(python_stdout.trim(), "42", "unexpected CPython stdout");

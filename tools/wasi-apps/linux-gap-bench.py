@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+import argparse
+import http.server
+import json
+import os
+import platform
+import shlex
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+import tomllib
+from pathlib import Path
+
+
+DEFAULT_IMAGE = "debian:trixie"
+HTTP_PAYLOAD = b"helios-linux-gap:ok\n"
+
+
+class QuietHttpHandler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def run(command: list[str], env: dict[str, str] | None = None) -> None:
+    subprocess.run(command, cwd=repo_root(), env=env, check=True)
+
+
+def output(command: list[str]) -> str:
+    completed = subprocess.run(
+        command,
+        cwd=repo_root(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=True,
+    )
+    return completed.stdout.strip()
+
+
+def load_manifest(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if manifest.get("schema_version") != 1:
+        raise SystemExit(f"unsupported workload manifest schema_version {manifest.get('schema_version')}")
+    return manifest
+
+
+def selected_workloads(manifest: dict, classes: list[str], names: list[str]) -> list[dict]:
+    selected = []
+    for workload in manifest["workloads"]:
+        if names and workload["name"] not in names:
+            continue
+        if classes and workload["class"] not in classes:
+            continue
+        selected.append(workload)
+    if not selected:
+        raise SystemExit("workload selection matched no manifest entries")
+    for name in names:
+        if not any(workload["name"] == name for workload in selected):
+            raise SystemExit(f"unknown or filtered workload {name}")
+    return selected
+
+
+def git_short_sha() -> str:
+    return output(["git", "rev-parse", "--short", "HEAD"])
+
+
+def git_sha() -> str:
+    return output(["git", "rev-parse", "HEAD"])
+
+
+def host_memory() -> str:
+    if sys.platform == "darwin":
+        try:
+            bytes_total = int(output(["sysctl", "-n", "hw.memsize"]))
+            return f"{bytes_total // (1024 * 1024)} MiB"
+        except subprocess.CalledProcessError:
+            return "unknown"
+    meminfo = Path("/proc/meminfo")
+    if meminfo.exists():
+        for line in meminfo.read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemTotal:"):
+                return " ".join(line.split()[1:])
+    return "unknown"
+
+
+def host_cpu() -> str:
+    if sys.platform == "darwin":
+        try:
+            return output(["sysctl", "-n", "machdep.cpu.brand_string"])
+        except subprocess.CalledProcessError:
+            pass
+    return platform.processor() or platform.machine()
+
+
+def start_host_http(root: Path) -> tuple[socketserver.TCPServer, int]:
+    handler = lambda *args, **kwargs: QuietHttpHandler(*args, directory=str(root), **kwargs)
+    server = socketserver.TCPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, int(server.server_address[1])
+
+
+def docker_image_digest(image: str) -> str:
+    run(["docker", "pull", image])
+    raw = output(["docker", "image", "inspect", image, "--format", "{{json .RepoDigests}} {{.Id}}"])
+    digests_raw, image_id = raw.split(" ", 1)
+    digests = json.loads(digests_raw)
+    return digests[0] if digests else image_id
+
+
+def run_helios(
+    manifest: Path,
+    out_dir: Path,
+    iterations: int,
+    classes: list[str],
+    names: list[str],
+    arch: str,
+    host_http_url: str | None,
+) -> Path:
+    log = out_dir / "helios.jsonl"
+    env = os.environ.copy()
+    env["HELIOS_WORKLOAD_BENCH_ARCH"] = arch
+    env["HELIOS_WORKLOAD_BENCH_ITERATIONS"] = str(iterations)
+    env["HELIOS_WORKLOAD_BENCH_MANIFEST"] = str(manifest)
+    env["HELIOS_WORKLOAD_BENCH_LOG"] = str(log)
+    if classes:
+        env["HELIOS_WORKLOAD_BENCH_CLASSES"] = ",".join(classes)
+    if names:
+        env["HELIOS_WORKLOAD_BENCH_WORKLOADS"] = ",".join(names)
+    if host_http_url:
+        env["HELIOS_WORKLOAD_BENCH_HOST_HTTP_URL"] = host_http_url
+    run(["tools/wasi-apps/workload-bench.sh"], env=env)
+    return log
+
+
+def run_linux(
+    manifest: Path,
+    out_dir: Path,
+    iterations: int,
+    workloads: list[dict],
+    image: str,
+    host_http_url: str | None,
+    linux_http_port: int,
+) -> tuple[Path | None, str]:
+    shell_workloads = [workload for workload in workloads if workload["runner"] == "shell"]
+    digest = docker_image_digest(image)
+    if not shell_workloads:
+        return None, digest
+
+    hyperfine_json = out_dir / "linux-hyperfine.json"
+    command = [
+        "apt-get update",
+        "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 quickjs bash dash coreutils curl hyperfine ca-certificates",
+        "mkdir -p /bench",
+        "cd /bench",
+    ]
+    if host_http_url:
+        command.extend(
+            [
+                f"python3 -m http.server {linux_http_port} --bind 127.0.0.1 --directory /out/http-root >/tmp/helios-gap-http.log 2>&1 &",
+                "server_pid=$!",
+                "trap 'kill ${server_pid}' EXIT",
+                "sleep 0.2",
+            ]
+        )
+
+    hyperfine = [
+        "hyperfine",
+        "--runs",
+        str(iterations),
+        "--export-json",
+        "/out/linux-hyperfine.json",
+    ]
+    linux_http_url = f"http://127.0.0.1:{linux_http_port}/payload.txt" if host_http_url else None
+    for workload in shell_workloads:
+        runner = [
+            "python3",
+            "/repo/tools/wasi-apps/linux-workload-runner.py",
+            "--manifest",
+            "/repo/tools/wasi-apps/workloads.json",
+            "--workload",
+            workload["name"],
+        ]
+        if linux_http_url:
+            runner.extend(["--host-http-url", linux_http_url])
+        hyperfine.extend(["--command-name", workload["name"], " ".join(shlex.quote(part) for part in runner)])
+    command.append(" ".join(shlex.quote(part) for part in hyperfine))
+    docker_script = "\n".join(command)
+    run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--mount",
+            f"type=bind,source={repo_root()},target=/repo,readonly",
+            "--mount",
+            f"type=bind,source={out_dir},target=/out",
+            "-w",
+            "/bench",
+            image,
+            "bash",
+            "-lc",
+            docker_script,
+        ]
+    )
+    return hyperfine_json, digest
+
+
+def parse_jsonl(path: Path | None) -> tuple[dict, dict[str, dict]]:
+    if path is None or not path.exists():
+        return {}, {}
+    run_record = {}
+    summaries = {}
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if record["type"] == "run":
+                run_record = record
+            if record["type"] == "summary":
+                summaries[record["workload"]] = record
+    return run_record, summaries
+
+
+def parse_hyperfine(path: Path | None) -> dict[str, dict]:
+    if path is None or not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    return {entry["command"]: entry for entry in data.get("results", [])}
+
+
+def artifact_provenance(manifest: dict, workloads: list[dict]) -> list[dict]:
+    boot_path = repo_root() / "tools/wasi-apps/boot-artifacts.toml"
+    with boot_path.open("rb") as handle:
+        boot = tomllib.load(handle)
+    needed = {"dash"}
+    for workload in workloads:
+        needed.update(workload.get("boot_programs", []))
+        if workload["runner"] == "helios-aot":
+            needed.add("curl")
+    artifacts = []
+    for artifact in boot.get("artifact", []):
+        if artifact["command"] not in needed:
+            continue
+        sha_path = repo_root() / artifact["sha256_file"]
+        artifacts.append(
+            {
+                "command": artifact["command"],
+                "package": artifact["package"],
+                "version": artifact["version"],
+                "source": artifact["source_url"],
+                "wasm": artifact["source"],
+                "sha256": sha_path.read_text(encoding="utf-8").split()[0],
+            }
+        )
+    return artifacts
+
+
+def ratio(helios_ms: int | None, linux_seconds: float | None) -> str:
+    if helios_ms is None or linux_seconds is None:
+        return "n/a"
+    linux_ms = linux_seconds * 1000.0
+    if linux_ms == 0:
+        return "n/a"
+    return f"{helios_ms / linux_ms:.2f}x"
+
+
+def write_report(
+    path: Path,
+    manifest: dict,
+    workloads: list[dict],
+    helios_jsonl: Path | None,
+    linux_json: Path | None,
+    docker_digest: str | None,
+) -> None:
+    run_record, helios = parse_jsonl(helios_jsonl)
+    linux = parse_hyperfine(linux_json)
+    lines = [
+        "# Helios vs Native Linux Benchmark",
+        "",
+        f"- Helios JSONL: `{helios_jsonl}`",
+        f"- Linux Hyperfine JSON: `{linux_json}`",
+        f"- Helios git SHA: `{run_record.get('git_sha', git_sha())}`",
+        f"- Docker image digest: `{docker_digest or 'not-run'}`",
+        f"- Host CPU: `{host_cpu()}`",
+        f"- Host logical CPUs: `{os.cpu_count()}`",
+        f"- Host memory: `{host_memory()}`",
+        "",
+    ]
+    vm = run_record.get("vm")
+    if vm:
+        lines.extend(
+            [
+                "## Helios VM",
+                "",
+                f"- Arch: `{vm['arch']}`",
+                f"- Release: `{str(vm['release']).lower()}`",
+                f"- QEMU accel: `{', '.join(vm['accel']) or 'none'}`",
+                f"- CPU: `{vm.get('cpu') or 'default'}`",
+                f"- SMP: `{vm['smp']}`",
+                f"- Memory: `{vm['memory']}`",
+                "",
+            ]
+        )
+
+    for workload_class, title in [("cpu-bound", "CPU-Bound"), ("io-bound", "IO-Bound")]:
+        class_workloads = [workload for workload in workloads if workload["class"] == workload_class]
+        if not class_workloads:
+            continue
+        lines.extend(
+            [
+                f"## {title}",
+                "",
+                "| Workload | Helios median | Linux median | Ratio | Validation |",
+                "| --- | ---: | ---: | ---: | --- |",
+            ]
+        )
+        for workload in class_workloads:
+            helios_summary = helios.get(workload["name"])
+            linux_summary = linux.get(workload["name"])
+            helios_ms = helios_summary.get("median_elapsed_ms") if helios_summary else None
+            linux_seconds = linux_summary.get("median") if linux_summary else None
+            helios_text = f"{helios_ms} ms" if helios_ms is not None else "n/a"
+            linux_text = f"{linux_seconds * 1000.0:.2f} ms" if linux_seconds is not None else "n/a"
+            validation = "ok" if helios_summary and helios_summary["validation"]["ok"] else "missing"
+            if workload["runner"] == "helios-aot":
+                validation = "helios-aot"
+            lines.append(
+                f"| `{workload['name']}` | {helios_text} | {linux_text} | {ratio(helios_ms, linux_seconds)} | {validation} |"
+            )
+        lines.append("")
+
+    lines.extend(["## Artifact Provenance", ""])
+    for artifact in artifact_provenance(manifest, workloads):
+        lines.append(
+            f"- `{artifact['command']}`: `{artifact['package']}@{artifact['version']}`, sha256 `{artifact['sha256']}`, source `{artifact['source']}`"
+        )
+    lines.extend(
+        [
+            "",
+            "## Raw Iterations",
+            "",
+            f"- Helios raw iteration timings are in `{helios_jsonl}`.",
+            f"- Linux raw hyperfine timings are in `{linux_json}`.",
+            "",
+        ]
+    )
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--manifest", type=Path, default=repo_root() / "tools/wasi-apps/workloads.json")
+    parser.add_argument("--iterations", type=int, default=5)
+    parser.add_argument("--class", dest="classes", action="append", choices=["cpu-bound", "io-bound"], default=[])
+    parser.add_argument("--workload", dest="workloads", action="append", default=[])
+    parser.add_argument("--arch", default="aarch64")
+    parser.add_argument("--docker-image", default=DEFAULT_IMAGE)
+    parser.add_argument("--helios-host-http-host", default="10.0.2.2")
+    parser.add_argument("--linux-http-port", type=int, default=18080)
+    parser.add_argument("--out-dir", type=Path)
+    parser.add_argument("--skip-helios", action="store_true")
+    parser.add_argument("--skip-linux", action="store_true")
+    args = parser.parse_args()
+
+    if args.iterations <= 0:
+        raise SystemExit("--iterations must be a positive integer")
+
+    manifest = load_manifest(args.manifest)
+    workloads = selected_workloads(manifest, args.classes, args.workloads)
+    out_dir = args.out_dir or repo_root() / "target/perf-baselines" / f"linux-gap-{git_short_sha()}-{int(time.time())}"
+    if not out_dir.is_absolute():
+        out_dir = repo_root() / out_dir
+    out_dir = out_dir.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    http_root = out_dir / "http-root"
+    http_root.mkdir(exist_ok=True)
+    (http_root / "payload.txt").write_bytes(HTTP_PAYLOAD)
+
+    needs_http = any(workload.get("requires_host_http", False) for workload in workloads)
+    server = None
+    host_http_url = None
+    if needs_http:
+        server, port = start_host_http(http_root)
+        host_http_url = f"http://{args.helios_host_http_host}:{port}/payload.txt"
+
+    try:
+        helios_jsonl = None
+        linux_json = None
+        docker_digest = None
+        if not args.skip_helios:
+            helios_jsonl = run_helios(
+                args.manifest,
+                out_dir,
+                args.iterations,
+                args.classes,
+                args.workloads,
+                args.arch,
+                host_http_url,
+            )
+        if not args.skip_linux:
+            linux_json, docker_digest = run_linux(
+                args.manifest,
+                out_dir,
+                args.iterations,
+                workloads,
+                args.docker_image,
+                host_http_url,
+                args.linux_http_port,
+            )
+        report = out_dir / "report.md"
+        write_report(report, manifest, workloads, helios_jsonl, linux_json, docker_digest)
+        print(report)
+    finally:
+        if server:
+            server.shutdown()
+            server.server_close()
+
+
+if __name__ == "__main__":
+    main()

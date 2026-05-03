@@ -1,0 +1,545 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use anyhow::{Context as _, Result, bail};
+use clap::{Args as ClapArgs, ValueEnum};
+use helios_inspector_protocol::debugger::filesystem as debugger_fs;
+use helios_inspector_protocol::system::programs as system_programs;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, ClapArgs)]
+pub(crate) struct WorkloadBenchCommand {
+    /// Workload manifest shared with the Linux runner.
+    #[arg(long, default_value = "tools/wasi-apps/workloads.json")]
+    manifest: PathBuf,
+
+    /// Number of measured executions per workload.
+    #[arg(long, default_value_t = 5)]
+    iterations: u16,
+
+    /// Restrict the run to named workloads. Repeat for multiple workloads.
+    #[arg(long = "workload")]
+    workloads: Vec<String>,
+
+    /// Restrict the run to workload classes. Repeat for multiple classes.
+    #[arg(long = "class", value_enum)]
+    classes: Vec<WorkloadClass>,
+
+    /// Host HTTP URL visible from inside the VM for workloads requiring host networking.
+    #[arg(long)]
+    host_http_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum WorkloadClass {
+    CpuBound,
+    IoBound,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum WorkloadRunner {
+    Shell,
+    HeliosAot,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkloadManifest {
+    schema_version: u16,
+    workloads: Vec<Workload>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct Workload {
+    name: String,
+    class: WorkloadClass,
+    runner: WorkloadRunner,
+    #[serde(rename = "description")]
+    _description: String,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    boot_programs: Vec<String>,
+    #[serde(default)]
+    stdout_contains: Vec<String>,
+    #[serde(default)]
+    stderr_empty: bool,
+    #[serde(default)]
+    requires_host_http: bool,
+    #[serde(default)]
+    wasm_path: Option<PathBuf>,
+    #[serde(default)]
+    remote_path: Option<String>,
+    #[serde(default)]
+    destination_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct VmProvenance {
+    pub(crate) arch: &'static str,
+    pub(crate) release: bool,
+    pub(crate) smp: u16,
+    pub(crate) memory: String,
+    pub(crate) cpu: Option<String>,
+    pub(crate) accel: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum JsonlRecord<'a> {
+    Run {
+        schema_version: u16,
+        git_sha: String,
+        vm: &'a VmProvenance,
+        manifest: String,
+        iterations: u16,
+        selected_workloads: Vec<String>,
+    },
+    Iteration {
+        workload: &'a str,
+        class: WorkloadClass,
+        runner: WorkloadRunner,
+        iteration: u16,
+        elapsed_ms: u128,
+        stdout: StreamValidation<'a>,
+        stderr: StreamValidation<'a>,
+        validation: ValidationSummary,
+    },
+    Summary {
+        workload: &'a str,
+        class: WorkloadClass,
+        runner: WorkloadRunner,
+        median_elapsed_ms: u128,
+        iterations: u16,
+        elapsed_ms: Vec<u128>,
+        validation: ValidationSummary,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct StreamValidation<'a> {
+    bytes: usize,
+    contains: &'a [String],
+    contains_ok: bool,
+    empty_required: bool,
+    empty_ok: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct ValidationSummary {
+    ok: bool,
+}
+
+pub(crate) fn required_boot_programs(command: &WorkloadBenchCommand) -> Result<Vec<String>> {
+    let workloads = select_workloads(command)?;
+    let mut programs = vec!["dash".to_owned(), "debugger".to_owned()];
+    for workload in workloads {
+        if workload.runner == WorkloadRunner::Shell {
+            extend_unique(&mut programs, &workload.boot_programs);
+        }
+    }
+    Ok(programs)
+}
+
+pub(crate) fn run(
+    mut client: crate::serial::RpcClient,
+    command: WorkloadBenchCommand,
+    provenance: VmProvenance,
+) -> Result<()> {
+    crate::run_interruptible(async move {
+        if command.iterations == 0 {
+            bail!("workload-bench --iterations must be non-zero");
+        }
+        let manifest_path = command.manifest.clone();
+        let workloads = select_workloads(&command)?;
+        let selected_workloads = workloads
+            .iter()
+            .map(|workload| workload.name.clone())
+            .collect::<Vec<_>>();
+        write_record(&JsonlRecord::Run {
+            schema_version: 1,
+            git_sha: git_sha().unwrap_or_else(|_| "unknown".to_owned()),
+            vm: &provenance,
+            manifest: manifest_path.display().to_string(),
+            iterations: command.iterations,
+            selected_workloads,
+        })?;
+
+        for workload in workloads {
+            let mut elapsed_ms = Vec::new();
+            for iteration in 1..=command.iterations {
+                let output = match workload.runner {
+                    WorkloadRunner::Shell => {
+                        run_shell_workload(&mut client, &workload, &command).await?
+                    }
+                    WorkloadRunner::HeliosAot => {
+                        run_aot_workload(&client, &workload, iteration).await?
+                    }
+                };
+                let validation = validate_output(&workload, &output.stdout, &output.stderr)
+                    .with_context(|| {
+                        format!(
+                            "workload {} iteration {} failed validation",
+                            workload.name, iteration
+                        )
+                    })?;
+                elapsed_ms.push(output.elapsed_ms);
+                write_record(&JsonlRecord::Iteration {
+                    workload: &workload.name,
+                    class: workload.class,
+                    runner: workload.runner,
+                    iteration,
+                    elapsed_ms: output.elapsed_ms,
+                    stdout: stream_validation(&workload, &output.stdout, false),
+                    stderr: stream_validation(&workload, &output.stderr, workload.stderr_empty),
+                    validation,
+                })?;
+            }
+            let median = median(&elapsed_ms)?;
+            write_record(&JsonlRecord::Summary {
+                workload: &workload.name,
+                class: workload.class,
+                runner: workload.runner,
+                median_elapsed_ms: median,
+                iterations: command.iterations,
+                elapsed_ms,
+                validation: ValidationSummary { ok: true },
+            })?;
+        }
+        Ok(())
+    })
+}
+
+struct WorkloadOutput {
+    elapsed_ms: u128,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+async fn run_shell_workload(
+    client: &mut crate::serial::RpcClient,
+    workload: &Workload,
+    command: &WorkloadBenchCommand,
+) -> Result<WorkloadOutput> {
+    let script = render_helios_script(workload, command)?;
+    let started = Instant::now();
+    let output = crate::programs::exec(
+        client,
+        crate::programs::REMOTE_SHELL_PATH,
+        &["-c".to_owned(), script],
+    )
+    .await
+    .with_context(|| format!("failed to run workload {}", workload.name))?;
+    let elapsed_ms = started.elapsed().as_millis();
+    if output.exit_code != 0 {
+        write_guest_output(&output.output.stdout, &output.output.stderr)?;
+        bail!(
+            "workload {} exited with code {}",
+            workload.name,
+            output.exit_code
+        );
+    }
+    Ok(WorkloadOutput {
+        elapsed_ms,
+        stdout: output.output.stdout,
+        stderr: output.output.stderr,
+    })
+}
+
+async fn run_aot_workload(
+    client: &crate::serial::RpcClient,
+    workload: &Workload,
+    iteration: u16,
+) -> Result<WorkloadOutput> {
+    let wasm_path = workload
+        .wasm_path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("AOT workload {} is missing wasm_path", workload.name))?;
+    let remote_path = workload
+        .remote_path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("AOT workload {} is missing remote_path", workload.name))?;
+    let destination_path = workload.destination_path.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("AOT workload {} is missing destination_path", workload.name)
+    })?;
+    let wasm = fs::read(wasm_path)
+        .with_context(|| format!("failed to read AOT workload wasm {}", wasm_path.display()))?;
+    if iteration == 1 {
+        debugger_fs::write(client, remote_path, &wasm, false)
+            .await
+            .with_context(|| format!("failed to upload {}", wasm_path.display()))?;
+    }
+
+    let started = Instant::now();
+    let outcome = system_programs::aot(
+        client,
+        &system_programs::AotRequest {
+            source_path: remote_path.clone(),
+            destination_path: destination_path.clone(),
+            hint: system_programs::AotHint::Performance,
+            profile: false,
+        },
+    )
+    .await
+    .with_context(|| format!("failed to AOT compile workload {}", workload.name))?;
+    outcome.map_err(|error| {
+        anyhow::anyhow!(
+            "remote AOT workload {} failed: {:?}: {}",
+            workload.name,
+            error.kind,
+            error.detail
+        )
+    })?;
+    Ok(WorkloadOutput {
+        elapsed_ms: started.elapsed().as_millis(),
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    })
+}
+
+fn select_workloads(command: &WorkloadBenchCommand) -> Result<Vec<Workload>> {
+    let manifest = load_manifest(&command.manifest)?;
+    let mut selected = Vec::new();
+    for workload in manifest.workloads {
+        if !command.workloads.is_empty()
+            && !command.workloads.iter().any(|name| name == &workload.name)
+        {
+            continue;
+        }
+        if !command.classes.is_empty()
+            && !command.classes.iter().any(|class| *class == workload.class)
+        {
+            continue;
+        }
+        validate_workload_shape(&workload)?;
+        selected.push(workload);
+    }
+
+    if selected.is_empty() {
+        bail!("workload selection matched no manifest entries");
+    }
+    if !command.workloads.is_empty() {
+        for requested in &command.workloads {
+            if !selected.iter().any(|workload| &workload.name == requested) {
+                bail!("unknown or filtered workload {requested}");
+            }
+        }
+    }
+    Ok(selected)
+}
+
+fn load_manifest(path: &Path) -> Result<WorkloadManifest> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("failed to read workload manifest {}", path.display()))?;
+    let manifest: WorkloadManifest = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to decode workload manifest {}", path.display()))?;
+    if manifest.schema_version != 1 {
+        bail!(
+            "unsupported workload manifest schema_version {}",
+            manifest.schema_version
+        );
+    }
+    Ok(manifest)
+}
+
+fn validate_workload_shape(workload: &Workload) -> Result<()> {
+    match workload.runner {
+        WorkloadRunner::Shell => {
+            if workload.command.is_none() {
+                bail!("shell workload {} is missing command", workload.name);
+            }
+        }
+        WorkloadRunner::HeliosAot => {
+            if workload.wasm_path.is_none()
+                || workload.remote_path.is_none()
+                || workload.destination_path.is_none()
+            {
+                bail!("AOT workload {} is missing AOT paths", workload.name);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn render_helios_script(workload: &Workload, command: &WorkloadBenchCommand) -> Result<String> {
+    let script = workload
+        .command
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("workload {} is missing command", workload.name))?;
+    let mut rendered = script.clone();
+    for (placeholder, value) in [
+        ("{bash}", "/bin/bash"),
+        ("{cat}", "/bin/cat"),
+        ("{curl}", "/bin/curl"),
+        ("{mkdir}", "/bin/mkdir"),
+        ("{python3}", "/bin/python3"),
+        ("{quickjs}", "/bin/qjs"),
+    ] {
+        rendered = rendered.replace(placeholder, value);
+    }
+    if workload.requires_host_http && command.host_http_url.is_none() {
+        bail!(
+            "workload {} requires --host-http-url for VM-visible host HTTP",
+            workload.name
+        );
+    }
+    if rendered.contains("{host_http_url}") {
+        let url = command.host_http_url.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "workload {} requires --host-http-url for VM-visible host HTTP",
+                workload.name
+            )
+        })?;
+        rendered = rendered.replace("{host_http_url}", url);
+    }
+    Ok(rendered)
+}
+
+fn validate_output(workload: &Workload, stdout: &[u8], stderr: &[u8]) -> Result<ValidationSummary> {
+    let stdout_text = String::from_utf8_lossy(stdout);
+    for expected in &workload.stdout_contains {
+        if !stdout_text.contains(expected) {
+            write_guest_output(stdout, stderr)?;
+            bail!(
+                "workload {} stdout did not contain expected text {:?}",
+                workload.name,
+                expected
+            );
+        }
+    }
+    if workload.stderr_empty && !stderr.is_empty() {
+        write_guest_output(stdout, stderr)?;
+        bail!("workload {} wrote stderr", workload.name);
+    }
+    Ok(ValidationSummary { ok: true })
+}
+
+fn stream_validation<'a>(
+    workload: &'a Workload,
+    bytes: &[u8],
+    empty_required: bool,
+) -> StreamValidation<'a> {
+    let text = String::from_utf8_lossy(bytes);
+    let contains_ok = empty_required
+        || workload
+            .stdout_contains
+            .iter()
+            .all(|expected| text.contains(expected));
+    StreamValidation {
+        bytes: bytes.len(),
+        contains: if empty_required {
+            &[]
+        } else {
+            &workload.stdout_contains
+        },
+        contains_ok,
+        empty_required,
+        empty_ok: !empty_required || bytes.is_empty(),
+    }
+}
+
+fn median(values: &[u128]) -> Result<u128> {
+    if values.is_empty() {
+        bail!("cannot compute median for empty sample set");
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let lower = (sorted.len() - 1) / 2;
+    let upper = sorted.len() / 2;
+    Ok((sorted[lower] + sorted[upper]) / 2)
+}
+
+fn extend_unique(programs: &mut Vec<String>, required: &[String]) {
+    for program in required {
+        if !programs.iter().any(|existing| existing == program) {
+            programs.push(program.clone());
+        }
+    }
+}
+
+fn write_record(record: &JsonlRecord<'_>) -> Result<()> {
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(&mut stdout, record)?;
+    writeln!(stdout)?;
+    Ok(())
+}
+
+fn write_guest_output(stdout: &[u8], stderr: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    std::io::stdout().write_all(stdout)?;
+    std::io::stderr().write_all(stderr)?;
+    Ok(())
+}
+
+fn git_sha() -> Result<String> {
+    let output = std::process::Command::new("git")
+        .arg("rev-parse")
+        .arg("HEAD")
+        .output()
+        .context("failed to spawn git rev-parse HEAD")?;
+    if !output.status.success() {
+        bail!("git rev-parse HEAD exited with status {}", output.status);
+    }
+    Ok(String::from_utf8(output.stdout)
+        .context("git rev-parse HEAD output was not UTF-8")?
+        .trim()
+        .to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_contains_expected_workload_classes() {
+        let command = WorkloadBenchCommand {
+            manifest: Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("inspector crate must live under repo root")
+                .join("tools/wasi-apps/workloads.json"),
+            iterations: 5,
+            workloads: Vec::new(),
+            classes: Vec::new(),
+            host_http_url: None,
+        };
+        let workloads = select_workloads(&command).expect("manifest must parse");
+        assert!(
+            workloads
+                .iter()
+                .any(|workload| workload.name == "quickjs-loop")
+        );
+        assert!(
+            workloads
+                .iter()
+                .any(|workload| workload.name == "curl-local-http")
+        );
+        assert!(
+            workloads
+                .iter()
+                .any(|workload| workload.runner == WorkloadRunner::HeliosAot)
+        );
+    }
+
+    #[test]
+    fn io_class_filter_excludes_cpu_workloads() {
+        let command = WorkloadBenchCommand {
+            manifest: Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("inspector crate must live under repo root")
+                .join("tools/wasi-apps/workloads.json"),
+            iterations: 5,
+            workloads: Vec::new(),
+            classes: vec![WorkloadClass::IoBound],
+            host_http_url: None,
+        };
+        let workloads = select_workloads(&command).expect("manifest must parse");
+        assert!(
+            workloads
+                .iter()
+                .all(|workload| workload.class == WorkloadClass::IoBound)
+        );
+    }
+}

@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "workloads": [
+    {
+      "name": "quickjs-loop",
+      "class": "cpu-bound",
+      "runner": "shell",
+      "description": "Arithmetic loop in QuickJS.",
+      "command": "{quickjs} -e 'let s = 0; for (let i = 0; i < 250000; i++) s = (s + ((i * 17) % 97)) | 0; console.log(\"quickjs-loop:\" + s);'",
+      "boot_programs": ["quickjs"],
+      "stdout_contains": ["quickjs-loop:"],
+      "stderr_empty": true
+    },
+    {
+      "name": "cpython-json",
+      "class": "cpu-bound",
+      "runner": "shell",
+      "description": "Parse and serialize JSON repeatedly in CPython.",
+      "command": "{python3} -c 'import json; data=[{\"i\":i,\"s\":str(i)} for i in range(800)]; total=sum(len(json.loads(json.dumps(data,separators=(\",\",\":\")))) for _ in range(40)); print(f\"cpython-json:{total}\")'",
+      "boot_programs": ["python3"],
+      "stdout_contains": ["cpython-json:32000"]
+    },
+    {
+      "name": "cpython-regex",
+      "class": "cpu-bound",
+      "runner": "shell",
+      "description": "Regex and text processing loop in CPython.",
+      "command": "{python3} -c 'import re; text=(\"alpha123 beta456 gamma789 delta000\\n\"*2000); total=sum(len(re.findall(r\"[a-z]+\\d+\", text)) for _ in range(80)); print(f\"cpython-regex:{total}\")'",
+      "boot_programs": ["python3"],
+      "stdout_contains": ["cpython-regex:640000"]
+    },
+    {
+      "name": "aot-curl",
+      "class": "cpu-bound",
+      "runner": "helios-aot",
+      "description": "Compiler-plugin AOT timing for the curl wasm artifact.",
+      "wasm_path": "artifacts/wasi-tools/curl.wasm",
+      "remote_path": "/aot-bench-curl-input.wasm",
+      "destination_path": "/aot-bench-curl-output.cwasm"
+    },
+    {
+      "name": "process-startup",
+      "class": "io-bound",
+      "runner": "shell",
+      "description": "Repeated shell command startup.",
+      "command": "i=0; while [ $i -lt 20 ]; do {bash} -c true; i=$((i+1)); done; echo process-startup:ok",
+      "boot_programs": ["bash"],
+      "stdout_contains": ["process-startup:ok"],
+      "stderr_empty": true
+    },
+    {
+      "name": "stdio-pipe",
+      "class": "io-bound",
+      "runner": "shell",
+      "description": "Generate text, pipe through cat, write and read the result.",
+      "command": "out=/pipe-$HELIOS_PROCESS_ID.out; copy=/pipe-$HELIOS_PROCESS_ID.copy; i=0; while [ $i -lt 4096 ]; do echo 0123456789abcdef0123456789abcdef; i=$((i+1)); done | {cat} > $out; {cat} $out > $copy; {cat} $copy >/dev/null; echo stdio-pipe:ok",
+      "boot_programs": ["cat"],
+      "stdout_contains": ["stdio-pipe:ok"],
+      "stderr_empty": true
+    },
+    {
+      "name": "fs-smallfiles",
+      "class": "io-bound",
+      "runner": "shell",
+      "description": "Create, read, and copy many small files.",
+      "command": "dir=/bench-smallfiles-$HELIOS_PROCESS_ID; {mkdir} $dir; i=0; while [ $i -lt 64 ]; do echo data-$i > $dir/f$i; {cat} $dir/f$i > $dir/c$i; i=$((i+1)); done; echo fs-smallfiles:ok",
+      "boot_programs": ["mkdir", "cat"],
+      "stdout_contains": ["fs-smallfiles:ok"],
+      "stderr_empty": true
+    },
+    {
+      "name": "fs-readstream",
+      "class": "io-bound",
+      "runner": "shell",
+      "description": "Sequential read of a larger generated file.",
+      "command": "file=/bench-readstream-$HELIOS_PROCESS_ID.in; copy=/bench-readstream-$HELIOS_PROCESS_ID.out; i=0; while [ $i -lt 16384 ]; do echo 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef; i=$((i+1)); done > $file; {cat} $file > $copy; {cat} $copy >/dev/null; echo fs-readstream:ok",
+      "boot_programs": ["cat"],
+      "stdout_contains": ["fs-readstream:ok"],
+      "stderr_empty": true
+    },
+    {
+      "name": "curl-local-http",
+      "class": "io-bound",
+      "runner": "shell",
+      "description": "Fetch from a deterministic local HTTP server.",
+      "command": "{curl} {host_http_url}; echo curl-local-http:ok",
+      "boot_programs": ["curl"],
+      "stdout_contains": ["helios-linux-gap:ok", "curl-local-http:ok"],
+      "stderr_empty": true,
+      "requires_host_http": true
+    }
+  ]
+}

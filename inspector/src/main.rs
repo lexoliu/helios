@@ -8,6 +8,7 @@ mod stats_tui;
 mod system;
 mod tui;
 mod vm;
+mod workload_bench;
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Args as ClapArgs, Parser, Subcommand};
