@@ -39,6 +39,16 @@
       "destination_path": "/aot-bench-curl-output.cwasm"
     },
     {
+      "name": "wasm-simd-lanes",
+      "class": "cpu-bound",
+      "runner": "shell",
+      "description": "Execute a deterministic wasm SIMD lane computation.",
+      "command": "{simd_lanes}",
+      "boot_programs": ["simd-lanes"],
+      "stdout_contains": ["simd-lanes:17"],
+      "stderr_empty": true
+    },
+    {
       "name": "process-startup",
       "class": "io-bound",
       "runner": "shell",

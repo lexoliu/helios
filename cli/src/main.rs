@@ -165,6 +165,8 @@ struct ExternalBootArtifact {
     package: String,
     version: String,
     source_url: String,
+    #[serde(default)]
+    targets: Vec<String>,
     bootfs_path: String,
     source: PathBuf,
     sha256_file: PathBuf,
@@ -236,7 +238,11 @@ fn run_kernel_prebuild(command: KernelPrebuildCommand) -> Result<()> {
 
     let selected_programs = selected_boot_programs(command.boot_programs)?;
     let boot_artifacts_manifest = workspace_path(&command.boot_artifacts_manifest);
-    validate_external_boot_artifact_sources(&boot_artifacts_manifest, &selected_programs)?;
+    validate_external_boot_artifact_sources(
+        &boot_artifacts_manifest,
+        &command.target,
+        &selected_programs,
+    )?;
 
     let init_component = build_component_program(
         &command.cargo,
@@ -710,10 +716,12 @@ fn build_boot_program_assets(
             artifact.command
         );
     }
+    reject_selected_target_mismatches(&external_artifacts, target, selected_programs)?;
     external_artifacts.retain(|artifact| {
-        selected_programs
-            .as_ref()
-            .is_none_or(|selected| selected.contains(&artifact.command))
+        artifact.supports_target(target)
+            && selected_programs
+                .as_ref()
+                .is_none_or(|selected| selected.contains(&artifact.command))
     });
 
     if let Some(selected_programs) = selected_programs {
@@ -822,15 +830,26 @@ fn read_external_boot_artifacts(path: &Path) -> Result<Vec<ExternalBootArtifact>
                 artifact.command
             );
         }
+        for target in &artifact.targets {
+            ensure!(
+                !target.is_empty(),
+                "boot artifact {} declares an empty target",
+                artifact.command
+            );
+        }
     }
     Ok(manifest.artifact)
 }
 
 fn validate_external_boot_artifact_sources(
     path: &Path,
+    target: &str,
     selected_programs: &Option<BTreeSet<String>>,
 ) -> Result<()> {
     for artifact in read_external_boot_artifacts(path)? {
+        if !artifact.supports_target(target) {
+            continue;
+        }
         if selected_programs
             .as_ref()
             .is_some_and(|selected| !selected.contains(&artifact.command))
@@ -852,6 +871,40 @@ fn validate_external_boot_artifact_sources(
         }
     }
     Ok(())
+}
+
+fn reject_selected_target_mismatches(
+    artifacts: &[ExternalBootArtifact],
+    target: &str,
+    selected_programs: &Option<BTreeSet<String>>,
+) -> Result<()> {
+    let Some(selected_programs) = selected_programs else {
+        return Ok(());
+    };
+    let mismatches = artifacts
+        .iter()
+        .filter(|artifact| selected_programs.contains(&artifact.command))
+        .filter(|artifact| !artifact.supports_target(target))
+        .map(|artifact| {
+            format!(
+                "{} supports {}",
+                artifact.command,
+                artifact.targets.join(", ")
+            )
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        mismatches.is_empty(),
+        "boot program(s) are not available for target {target}: {}",
+        mismatches.join("; ")
+    );
+    Ok(())
+}
+
+impl ExternalBootArtifact {
+    fn supports_target(&self, target: &str) -> bool {
+        self.targets.is_empty() || self.targets.iter().any(|candidate| candidate == target)
+    }
 }
 
 fn workspace_path(path: &Path) -> PathBuf {
@@ -1322,6 +1375,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn selected_target_mismatches_fail_fast() {
+        let mut artifact = test_artifact(
+            "simd-lanes",
+            "helios-wasix-conformance",
+            "0.1.0",
+            "tools/wasi-apps/wasix-tests",
+            Path::new("simd-lanes.wasm"),
+            Path::new("simd-lanes.wasm.sha256"),
+        );
+        artifact.targets.push("aarch64-unknown-none".to_owned());
+        let selected = Some(BTreeSet::from(["simd-lanes".to_owned()]));
+
+        let error =
+            reject_selected_target_mismatches(&[artifact], "riscv64gc-unknown-none-elf", &selected)
+                .expect_err("target-specific artifact must reject unsupported selected target");
+        assert!(
+            error.to_string().contains("simd-lanes supports"),
+            "unexpected error: {error:#}"
+        );
+    }
+
     fn test_artifact(
         command: &str,
         package: &str,
@@ -1335,6 +1410,7 @@ mod tests {
             package: package.to_owned(),
             version: version.to_owned(),
             source_url: source_url.to_owned(),
+            targets: Vec::new(),
             bootfs_path: format!("bin/{command}"),
             source: source.to_owned(),
             sha256_file: sha256_file.to_owned(),

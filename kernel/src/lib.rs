@@ -22,6 +22,7 @@ mod embedded_init;
 mod embedded_program;
 mod entropy_pool;
 mod executor;
+mod frame_slab;
 mod futex_table;
 mod host_fs_client;
 mod host_share;

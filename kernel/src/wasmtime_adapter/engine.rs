@@ -69,7 +69,7 @@ fn build_engine_for_platform<P: Cpu + Clone>(
         platform.has_lazy_commit_virtual_memory() == target_uses_lazy_commit,
         "platform lazy-commit virtual-memory capability does not match cwasm target profile"
     );
-    if configure_pooling(&mut config) {
+    if configure_pooling(&mut config).applied {
         // Pooling path took ownership of the linear-memory
         // configuration. UserMemoryCreator must not be installed —
         // it uses the kernel buddy heap which cannot satisfy
@@ -82,6 +82,7 @@ fn build_engine_for_platform<P: Cpu + Clone>(
         // creator drives Wasmtime through a mismatched upper/lower
         // memory stack and is the #16 RPC-stall failure mode.
         config.memory_init_cow(true);
+        config.memory_may_move(false);
     } else {
         // Backends without a real VM stack (or builds without
         // `pooling-allocator`) rely on the kernel-side buddy heap;
@@ -101,28 +102,30 @@ fn build_engine_for_platform<P: Cpu + Clone>(
     Engine::new(&config)
 }
 
-/// Apply Wasmtime's pooling instance allocator to `config` if this
+struct PoolingConfiguration {
+    applied: bool,
+}
+
+/// Apply Wasmtime's pooling instance allocator to `config` when this
 /// build links a wasmtime variant that ships the pooling-allocator
-/// feature (currently the hosted target — wasmtime upstream still
-/// gates pooling on `std`, which is unavailable on bare-metal targets
-/// that link the `custom-virtual-memory` ABI instead).
-///
-/// Returns `true` when the pooling path was actually applied so the
-/// caller can skip the `OnDemand`-tuned host-memory wiring; returns
-/// `false` on bare-metal where the function is a structural no-op.
+/// feature. Bare-metal builds still configure the pooling-adjacent
+/// async-stack policy here, but cannot select
+/// `InstanceAllocationStrategy::Pooling` until the vendored Wasmtime
+/// pooling allocator is ported off its current `std` feature dependency.
 #[cfg(target_os = "none")]
-fn configure_pooling(_config: &mut wasmtime::Config) -> bool {
-    false
+fn configure_pooling(config: &mut wasmtime::Config) -> PoolingConfiguration {
+    config.async_stack_zeroing(false);
+    PoolingConfiguration { applied: false }
 }
 
 #[cfg(not(target_os = "none"))]
-fn configure_pooling(config: &mut wasmtime::Config) -> bool {
+fn configure_pooling(config: &mut wasmtime::Config) -> PoolingConfiguration {
     use wasmtime::{InstanceAllocationStrategy, PoolingAllocationConfig};
     config.allocation_strategy(InstanceAllocationStrategy::Pooling(
         PoolingAllocationConfig::default(),
     ));
     config.async_stack_zeroing(false);
-    true
+    PoolingConfiguration { applied: true }
 }
 
 pub fn build_component_engine_for_platform<P: Cpu + Clone>(

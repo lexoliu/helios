@@ -376,6 +376,7 @@ fn render_helios_script(workload: &Workload, command: &WorkloadBenchCommand) -> 
         ("{mkdir}", "/bin/mkdir"),
         ("{python3}", "/bin/python3"),
         ("{quickjs}", "/bin/qjs"),
+        ("{simd_lanes}", "/bin/simd-lanes"),
     ] {
         rendered = rendered.replace(placeholder, value);
     }

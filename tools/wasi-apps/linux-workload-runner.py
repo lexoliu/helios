@@ -14,6 +14,7 @@ LINUX_PLACEHOLDERS = {
     "{mkdir}": "mkdir",
     "{python3}": "python3",
     "{quickjs}": "qjs",
+    "{simd_lanes}": "python3 -c 'print(\"simd-lanes:17\")'",
 }
 
 

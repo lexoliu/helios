@@ -10,17 +10,20 @@ use buddy_system_allocator::LockedHeap;
 use helios_hal::pmm::PhysFrame;
 
 use crate::ProgramOutOfMemory;
+use crate::frame_slab::FrameSlabCache;
 
 const USER_HEAP_ORDER: usize = 32;
 
 pub struct UserMemoryPool {
     heap: LockedHeap<USER_HEAP_ORDER>,
+    frame_slab: FrameSlabCache,
 }
 
 impl UserMemoryPool {
     pub const fn empty() -> Self {
         Self {
             heap: LockedHeap::empty(),
+            frame_slab: FrameSlabCache::new(),
         }
     }
 
@@ -35,26 +38,46 @@ impl UserMemoryPool {
 
     pub fn stats(&self) -> UserHeapStats {
         let allocator = self.heap.lock();
+        let cached = self.frame_slab.cached_bytes();
         UserHeapStats {
             total_bytes: allocator.stats_total_bytes(),
-            allocated_bytes: allocator.stats_alloc_actual(),
+            allocated_bytes: allocator.stats_alloc_actual().saturating_sub(cached),
         }
     }
 
     pub fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<u8>, ProgramOutOfMemory> {
         let allocation_size = buddy_allocation_size(layout);
-        let mut allocator = self.heap.lock();
-        let ptr = allocator.alloc(layout).map_err(|_| {
-            let stats = UserHeapStats {
-                total_bytes: allocator.stats_total_bytes(),
-                allocated_bytes: allocator.stats_alloc_actual(),
-            };
-            ProgramOutOfMemory {
-                requested_bytes: allocation_size,
-                available_bytes: stats.available_bytes(),
-                reserved_bytes: 0,
+        if is_single_frame_layout(layout) {
+            if let Some(ptr) = self.frame_slab.allocate() {
+                unsafe {
+                    core::ptr::write_bytes(ptr.as_ptr(), 0, PhysFrame::SIZE);
+                }
+                return Ok(ptr);
             }
-        })?;
+        }
+
+        let mut allocator = self.heap.lock();
+        let ptr = allocator
+            .alloc(layout)
+            .or_else(|_| {
+                self.frame_slab.drain(|ptr| unsafe {
+                    allocator.dealloc(ptr, single_frame_layout());
+                });
+                allocator.alloc(layout)
+            })
+            .map_err(|_| {
+                let stats = UserHeapStats {
+                    total_bytes: allocator.stats_total_bytes(),
+                    allocated_bytes: allocator
+                        .stats_alloc_actual()
+                        .saturating_sub(self.frame_slab.cached_bytes()),
+                };
+                ProgramOutOfMemory {
+                    requested_bytes: allocation_size,
+                    available_bytes: stats.available_bytes(),
+                    reserved_bytes: 0,
+                }
+            })?;
         unsafe {
             core::ptr::write_bytes(ptr.as_ptr(), 0, allocation_size);
         }
@@ -62,6 +85,12 @@ impl UserMemoryPool {
     }
 
     pub fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        if is_single_frame_layout(layout) {
+            let total_frames = self.heap.lock().stats_total_bytes() / PhysFrame::SIZE;
+            if self.frame_slab.deallocate(ptr, total_frames) {
+                return;
+            }
+        }
         unsafe {
             self.heap.lock().dealloc(ptr, layout);
         }
@@ -146,4 +175,13 @@ fn buddy_allocation_size(layout: Layout) -> usize {
         .next_power_of_two()
         .max(layout.align())
         .max(size_of::<usize>())
+}
+
+fn is_single_frame_layout(layout: Layout) -> bool {
+    layout.size() == PhysFrame::SIZE && layout.align() == PhysFrame::SIZE
+}
+
+fn single_frame_layout() -> Layout {
+    Layout::from_size_align(PhysFrame::SIZE, PhysFrame::SIZE)
+        .unwrap_or_else(|_| panic!("invalid user-frame layout"))
 }

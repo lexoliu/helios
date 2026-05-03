@@ -253,7 +253,7 @@ echo "coreutils installed at: $coreutils_root/coreutils.wasm"
 ls -lh "$coreutils_root/coreutils.wasm" "$coreutils_root/coreutils.wasm.sha256"
 
 echo "Building Helios WASIX conformance artifacts..."
-for test_name in thread-futex continuation; do
+for test_name in thread-futex continuation simd-lanes; do
   test_root="$artifacts_root/wasix/$test_name"
   mkdir -p "$test_root"
   wasm-tools parse \
@@ -271,7 +271,7 @@ for test_name in thread-futex continuation; do
 done
 
 echo "WASIX conformance artifacts installed at: $artifacts_root/wasix"
-ls -lh "$artifacts_root"/wasix/{thread-futex,continuation}/*.wasm
+ls -lh "$artifacts_root"/wasix/{thread-futex,continuation,simd-lanes}/*.wasm
 
 build_env=(
   CARGO_PROFILE_DEV_OPT_LEVEL=z

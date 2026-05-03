@@ -116,3 +116,13 @@ source_url = "tools/wasi-apps/wasix-tests"
 bootfs_path = "bin/wasix-continuation"
 source = "artifacts/wasix/continuation/continuation.wasm"
 sha256_file = "artifacts/wasix/continuation/continuation.wasm.sha256"
+
+[[artifact]]
+command = "simd-lanes"
+package = "helios-wasix-conformance"
+version = "0.1.0"
+source_url = "tools/wasi-apps/wasix-tests"
+targets = ["aarch64-unknown-none"]
+bootfs_path = "bin/simd-lanes"
+source = "artifacts/wasix/simd-lanes/simd-lanes.wasm"
+sha256_file = "artifacts/wasix/simd-lanes/simd-lanes.wasm.sha256"
