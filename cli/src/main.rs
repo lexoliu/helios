@@ -80,7 +80,7 @@ struct AotCommand {
     output: PathBuf,
     #[arg(long)]
     target: String,
-    #[arg(long, default_value = "balanced")]
+    #[arg(long, default_value = "performance")]
     hint: Hint,
     #[arg(long)]
     root_key: PathBuf,
@@ -90,7 +90,7 @@ struct AotCommand {
 struct CompilerPluginCommand {
     #[arg(long)]
     target: String,
-    #[arg(long, default_value = "balanced")]
+    #[arg(long, default_value = "performance")]
     hint: Hint,
 }
 
@@ -251,7 +251,7 @@ fn run_kernel_prebuild(command: KernelPrebuildCommand) -> Result<()> {
     let init_payload = precompile_artifact(
         &init_component_bytes,
         &command.target,
-        Hint::Balanced.into(),
+        Hint::Performance.into(),
     )?
     .bytes;
     let init_signed = sign_payload_with_key(&init_payload, &root_signing_key)
@@ -881,7 +881,7 @@ fn build_boot_program_asset(
         &manifest.artifact_name,
     )?;
     let component_bytes = encode_component(&wasm_path)?;
-    let payload = precompile_artifact(&component_bytes, target, Hint::Balanced.into())?.bytes;
+    let payload = precompile_artifact(&component_bytes, target, Hint::Performance.into())?.bytes;
     let signed = sign_payload_with_key(&payload, root_signing_key)
         .context("failed to sign bootfs AOT payload")?;
     let output_path = out_dir.join(format!("{}_bootfs_component.cwasm", manifest.command));
@@ -905,7 +905,7 @@ fn build_external_boot_artifact_assets(
     let sha256_file = workspace_path(&artifact.sha256_file);
     verify_sha256_file(&source, &sha256_file)?;
     let wasm = fs::read(&source).with_context(|| format!("failed to read {}", source.display()))?;
-    let payload = precompile_artifact(&wasm, target, Hint::Balanced.into())?.bytes;
+    let payload = precompile_artifact(&wasm, target, Hint::Performance.into())?.bytes;
     let signed = sign_payload_with_key(&payload, root_signing_key).with_context(|| {
         format!(
             "failed to sign external bootfs AOT payload for {}",
