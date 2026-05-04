@@ -1691,7 +1691,7 @@ where
             ProgramSource::RawWasm(wasm) => {
                 let _profile = artifact_profile::classify_raw_wasm(wasm)
                     .map_err(map_artifact_profile_error)?;
-                let hint = hint.unwrap_or(AotCompileHint::Balanced);
+                let hint = hint.unwrap_or(AotCompileHint::Performance);
                 let signed = self
                     .compile_raw_component_to_signed_artifact(exec_context, wasm, hint, false)
                     .await?;
