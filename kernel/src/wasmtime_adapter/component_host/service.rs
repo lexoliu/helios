@@ -1267,6 +1267,25 @@ where
     }
 }
 
+fn record_program_kernel_profile<CpuImpl, HostFs>(
+    runtime_state: &HostRuntimeState<CpuImpl, HostFs>,
+    cpu: &CpuImpl,
+    phase: &'static str,
+    started_ticks: u64,
+) where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    if runtime_state.profiling_enabled() {
+        runtime_state.record_profile_stack_parts(
+            ProfileScope::Kernel,
+            "kernel;program;",
+            phase,
+            cpu.now().ticks().saturating_sub(started_ticks),
+        );
+    }
+}
+
 impl<CpuImpl, HostFs> UserProgramService<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
@@ -4763,6 +4782,8 @@ where
     argv.extend(args);
     let run_started_at = monotonic_nanos(&exec_context.cpu);
     let run_cpu = exec_context.cpu.clone();
+    let profile_cpu = exec_context.cpu.clone();
+    let profile_runtime_state = exec_context.runtime_state.clone();
     let instance_id = launched_instance.id();
     let imported_memory_spec = imported_shared_memory_spec_with_user_budget(&compiled.module)?;
     let imported_memory = match imported_memory_spec {
@@ -4811,10 +4832,15 @@ where
             exec_context.write_serial,
             "program:instantiate-core-begin",
         );
-        let instance = linker
-            .instantiate_async(&mut store, &compiled.module)
-            .await
-            .map_err(map_program_runtime_error)?;
+        let instantiate_started = profile_cpu.now().ticks();
+        let instance = linker.instantiate_async(&mut store, &compiled.module).await;
+        record_program_kernel_profile(
+            &profile_runtime_state,
+            &profile_cpu,
+            "instantiate-core",
+            instantiate_started,
+        );
+        let instance = instance.map_err(map_program_runtime_error)?;
         super::emit_program_stage_marker(exec_context.write_serial, "program:instantiate-core-ok");
 
         let start = instance
@@ -4835,6 +4861,7 @@ where
             &run_done,
         );
         super::emit_program_stage_marker(exec_context.write_serial, "program:run-core-begin");
+        let run_phase_started = profile_cpu.now().ticks();
         let result = loop {
             let result = start.call_async(&mut store, ()).await;
             if handle_wasix_asyncify_completion(&mut store, &instance).await? {
@@ -4842,6 +4869,12 @@ where
             }
             break result;
         };
+        record_program_kernel_profile(
+            &profile_runtime_state,
+            &profile_cpu,
+            "run-core",
+            run_phase_started,
+        );
         run_done.store(true, core::sync::atomic::Ordering::Release);
         super::emit_program_stage_marker(exec_context.write_serial, "program:run-core-end");
 
@@ -4900,6 +4933,8 @@ where
     argv.extend(args);
     let run_started_at = monotonic_nanos(&exec_context.cpu);
     let run_cpu = exec_context.cpu.clone();
+    let profile_cpu = exec_context.cpu.clone();
+    let profile_runtime_state = exec_context.runtime_state.clone();
     let instance_id = launched_instance.id();
     let imported_memory = Some(restore.memory.clone());
     let wasix_abi = core_module_imports_wasix(&compiled.module);
@@ -4942,10 +4977,15 @@ where
     )?;
 
     super::emit_program_stage_marker(exec_context.write_serial, "program:instantiate-core-begin");
-    let instance = linker
-        .instantiate_async(&mut store, &compiled.module)
-        .await
-        .map_err(map_program_runtime_error)?;
+    let instantiate_started = profile_cpu.now().ticks();
+    let instance = linker.instantiate_async(&mut store, &compiled.module).await;
+    record_program_kernel_profile(
+        &profile_runtime_state,
+        &profile_cpu,
+        "instantiate-core-rewind",
+        instantiate_started,
+    );
+    let instance = instance.map_err(map_program_runtime_error)?;
     super::emit_program_stage_marker(exec_context.write_serial, "program:instantiate-core-ok");
 
     wasix_begin_rewind(
@@ -4978,6 +5018,7 @@ where
         &run_done,
     );
     super::emit_program_stage_marker(exec_context.write_serial, "program:run-core-begin");
+    let run_phase_started = profile_cpu.now().ticks();
     let result = loop {
         let result = start.call_async(&mut store, ()).await;
         if handle_wasix_asyncify_completion(&mut store, &instance).await? {
@@ -4985,6 +5026,12 @@ where
         }
         break result;
     };
+    record_program_kernel_profile(
+        &profile_runtime_state,
+        &profile_cpu,
+        "run-core-rewind",
+        run_phase_started,
+    );
     run_done.store(true, core::sync::atomic::Ordering::Release);
     super::emit_program_stage_marker(exec_context.write_serial, "program:run-core-end");
 
@@ -5035,6 +5082,8 @@ where
     argv.extend(args);
     let run_started_at = monotonic_nanos(&exec_context.cpu);
     let run_cpu = exec_context.cpu.clone();
+    let profile_cpu = exec_context.cpu.clone();
+    let profile_runtime_state = exec_context.runtime_state.clone();
 
     let context = ComponentExecContext::new(
         exec_context.cpu,
@@ -5060,14 +5109,21 @@ where
     // Use the engine that compiled the component — Wasmtime requires
     // component and store to share the same engine instance.
     super::emit_program_stage_marker(exec_context.write_serial, "program:instantiate-begin");
+    let instantiate_started = profile_cpu.now().ticks();
     let executor =
         <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as ComponentRuntimeFactory<
             CpuImpl,
             HostRuntimeState<CpuImpl, HostFs>,
             HostFs,
         >>::instantiate(runtime, engine, &compiled, ComponentWorld::Program, context)
-        .await
-        .map_err(map_program_runtime_error)?;
+        .await;
+    record_program_kernel_profile(
+        &profile_runtime_state,
+        &profile_cpu,
+        "instantiate-component",
+        instantiate_started,
+    );
+    let executor = executor.map_err(map_program_runtime_error)?;
     super::emit_program_stage_marker(exec_context.write_serial, "program:instantiate-ok");
 
     let run_done = Arc::new(core::sync::atomic::AtomicBool::new(false));
@@ -5081,7 +5137,14 @@ where
         &run_done,
     );
     super::emit_program_stage_marker(exec_context.write_serial, "program:run-begin");
+    let run_phase_started = profile_cpu.now().ticks();
     let result = executor.run().await;
+    record_program_kernel_profile(
+        &profile_runtime_state,
+        &profile_cpu,
+        "run-component",
+        run_phase_started,
+    );
     run_done.store(true, core::sync::atomic::Ordering::Release);
     let result = result.map_err(map_program_runtime_error)?;
     super::emit_program_stage_marker(exec_context.write_serial, "program:run-end");
@@ -7281,7 +7344,42 @@ where
     p1_write_memory(caller, memory, ptr, &bytes)
 }
 
+fn p1_record_kernel_profile<CpuImpl, HostFs>(
+    store: &Preview1ProgramStore<CpuImpl, HostFs>,
+    syscall: &'static str,
+    started_ticks: u64,
+) where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    if store.runtime_state.profiling_enabled() {
+        store.runtime_state.record_profile_stack_parts(
+            ProfileScope::Kernel,
+            "kernel;preview1;",
+            syscall,
+            store.cpu.now().ticks().saturating_sub(started_ticks),
+        );
+    }
+}
+
 async fn p1_fd_write<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    fd: i32,
+    iovs: u32,
+    iovs_len: u32,
+    nwritten: u32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let started = caller.data().cpu.now().ticks();
+    let result = p1_fd_write_inner(caller, fd, iovs, iovs_len, nwritten).await;
+    p1_record_kernel_profile(caller.data(), "fd_write", started);
+    result
+}
+
+async fn p1_fd_write_inner<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     iovs: u32,
@@ -7371,6 +7469,23 @@ where
 }
 
 async fn p1_fd_read<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    fd: i32,
+    iovs: u32,
+    iovs_len: u32,
+    nread: u32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let started = caller.data().cpu.now().ticks();
+    let result = p1_fd_read_inner(caller, fd, iovs, iovs_len, nread).await;
+    p1_record_kernel_profile(caller.data(), "fd_read", started);
+    result
+}
+
+async fn p1_fd_read_inner<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     iovs: u32,
