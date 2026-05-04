@@ -3375,7 +3375,9 @@ where
 
 fn compiler_plugin_worker_threads<CpuImpl: Cpu>(cpu: &CpuImpl) -> u32 {
     let worker_count =
-        super::component_host_worker_count(cpu.processor_count(), cpu.bootstrap_processor()).max(1);
+        super::component_host_worker_count(cpu.processor_count(), cpu.bootstrap_processor())
+            .saturating_sub(1)
+            .max(1);
     u32::try_from(worker_count)
         .unwrap_or_else(|_| panic!("compiler plugin processor count exceeds u32"))
 }
