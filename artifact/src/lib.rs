@@ -20,6 +20,26 @@ pub fn cwasm_target_uses_lazy_commit_virtual_memory(target: &str) -> bool {
     matches!(target, "aarch64-unknown-none")
 }
 
+pub fn cwasm_target_cranelift_flags(target: &str) -> &'static [&'static str] {
+    if target.starts_with("aarch64-") {
+        return &["has_lse", "has_fp16"];
+    }
+    if target.starts_with("x86_64-") {
+        return &[
+            "has_cmpxchg16b",
+            "has_sse3",
+            "has_ssse3",
+            "has_sse41",
+            "has_sse42",
+            "has_popcnt",
+            "has_bmi1",
+            "has_bmi2",
+            "has_lzcnt",
+        ];
+    }
+    &[]
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum SignatureAlgorithm {

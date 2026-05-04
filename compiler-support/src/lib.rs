@@ -174,29 +174,7 @@ fn build_engine_config(target: &str, hint: AotCompileHint, worker_count: usize) 
 }
 
 fn configure_target_isa_flags(config: &mut Config, target: &str) {
-    if target.starts_with("aarch64-") {
-        for flag in ["has_lse", "has_fp16"] {
-            unsafe {
-                config.cranelift_flag_enable(flag);
-            }
-        }
-        return;
-    }
-    if !target.starts_with("x86_64-") {
-        return;
-    }
-
-    for flag in [
-        "has_cmpxchg16b",
-        "has_sse3",
-        "has_ssse3",
-        "has_sse41",
-        "has_sse42",
-        "has_popcnt",
-        "has_bmi1",
-        "has_bmi2",
-        "has_lzcnt",
-    ] {
+    for flag in helios_artifact::cwasm_target_cranelift_flags(target) {
         unsafe {
             config.cranelift_flag_enable(flag);
         }
