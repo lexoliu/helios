@@ -62,9 +62,9 @@
       "name": "stdio-pipe",
       "class": "io-bound",
       "runner": "shell",
-      "description": "Generate text, pipe through cat, write and read the result.",
-      "command": "out=/pipe-$HELIOS_PROCESS_ID.out; copy=/pipe-$HELIOS_PROCESS_ID.copy; i=0; while [ $i -lt 4096 ]; do echo 0123456789abcdef0123456789abcdef; i=$((i+1)); done | {cat} > $out; {cat} $out > $copy; {cat} $copy >/dev/null; echo stdio-pipe:ok",
-      "boot_programs": ["cat"],
+      "description": "Generate bytes, pipe through cat, write and read the result.",
+      "command": "out=/pipe-$HELIOS_PROCESS_ID.out; copy=/pipe-$HELIOS_PROCESS_ID.copy; {head} --bytes=131072 /bin/bash | {cat} > $out; {cat} $out > $copy; {cat} $copy >/dev/null; echo stdio-pipe:ok",
+      "boot_programs": ["bash", "cat", "head"],
       "stdout_contains": ["stdio-pipe:ok"],
       "stderr_empty": true
     },
@@ -83,8 +83,8 @@
       "class": "io-bound",
       "runner": "shell",
       "description": "Sequential read of a larger generated file.",
-      "command": "file=/bench-readstream-$HELIOS_PROCESS_ID.in; copy=/bench-readstream-$HELIOS_PROCESS_ID.out; i=0; while [ $i -lt 16384 ]; do echo 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef; i=$((i+1)); done > $file; {cat} $file > $copy; {cat} $copy >/dev/null; echo fs-readstream:ok",
-      "boot_programs": ["cat"],
+      "command": "file=/bench-readstream-$HELIOS_PROCESS_ID.in; copy=/bench-readstream-$HELIOS_PROCESS_ID.out; {head} --bytes=1048576 /bin/bash > $file; {cat} $file > $copy; {cat} $copy >/dev/null; echo fs-readstream:ok",
+      "boot_programs": ["bash", "cat", "head"],
       "stdout_contains": ["fs-readstream:ok"],
       "stderr_empty": true
     },

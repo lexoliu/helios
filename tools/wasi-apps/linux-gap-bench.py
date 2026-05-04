@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import html
 import http.server
 import json
 import os
@@ -274,6 +275,95 @@ def ratio(helios_ms: int | None, linux_seconds: float | None) -> str:
     return f"{helios_ms / linux_ms:.2f}x"
 
 
+def comparison_rows(workloads: list[dict], helios: dict[str, dict], linux: dict[str, dict]) -> list[dict]:
+    rows = []
+    for workload in workloads:
+        helios_summary = helios.get(workload["name"])
+        linux_summary = linux.get(workload["name"])
+        helios_ms = helios_summary.get("median_elapsed_ms") if helios_summary else None
+        linux_seconds = linux_summary.get("median") if linux_summary else None
+        rows.append(
+            {
+                "name": workload["name"],
+                "class": workload["class"],
+                "helios_ms": helios_ms,
+                "linux_ms": linux_seconds * 1000.0 if linux_seconds is not None else None,
+            }
+        )
+    return rows
+
+
+def write_svg(path: Path, rows: list[dict]) -> None:
+    drawable_rows = [
+        row for row in rows if row["helios_ms"] is not None or row["linux_ms"] is not None
+    ]
+    if not drawable_rows:
+        return
+    width = 1040
+    left = 180
+    right = 140
+    top = 70
+    row_height = 54
+    bar_height = 15
+    gap = 4
+    max_ms = max(
+        value
+        for row in drawable_rows
+        for value in [row["helios_ms"], row["linux_ms"]]
+        if value is not None
+    )
+    max_ms = max(max_ms, 1.0)
+    height = top + row_height * len(drawable_rows) + 70
+    chart_width = width - left - right
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        '<text x="32" y="34" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="22" font-weight="700" fill="#111827">Helios vs Native Linux Median Timing</text>',
+        '<text x="32" y="58" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#4b5563">Lower is better. Ratio below 1.00x means Helios is faster.</text>',
+        f'<line x1="{left}" y1="{top - 14}" x2="{left + chart_width}" y2="{top - 14}" stroke="#d1d5db" stroke-width="1"/>',
+        f'<text x="{left}" y="{top - 22}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="12" fill="#6b7280">0 ms</text>',
+        f'<text x="{left + chart_width - 64}" y="{top - 22}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="12" fill="#6b7280">{max_ms:.1f} ms</text>',
+        f'<rect x="{width - 250}" y="28" width="14" height="14" fill="#2563eb" rx="2"/>',
+        f'<text x="{width - 230}" y="40" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#374151">Helios</text>',
+        f'<rect x="{width - 160}" y="28" width="14" height="14" fill="#f97316" rx="2"/>',
+        f'<text x="{width - 140}" y="40" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#374151">Linux</text>',
+    ]
+    previous_class = None
+    for index, row in enumerate(drawable_rows):
+        y = top + index * row_height
+        if row["class"] != previous_class:
+            lines.append(
+                f'<text x="32" y="{y + 2}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="11" font-weight="700" fill="#6b7280">{html.escape(row["class"].upper())}</text>'
+            )
+            previous_class = row["class"]
+        name = html.escape(row["name"])
+        lines.append(
+            f'<text x="32" y="{y + 26}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="14" fill="#111827">{name}</text>'
+        )
+        for offset, key, color in [
+            (12, "helios_ms", "#2563eb"),
+            (12 + bar_height + gap, "linux_ms", "#f97316"),
+        ]:
+            value = row[key]
+            label = "n/a" if value is None else f"{value:.2f} ms"
+            bar_width = 0 if value is None else max(1, value / max_ms * chart_width)
+            lines.append(
+                f'<rect x="{left}" y="{y + offset}" width="{bar_width:.1f}" height="{bar_height}" fill="{color}" rx="3"/>'
+            )
+            lines.append(
+                f'<text x="{left + bar_width + 8:.1f}" y="{y + offset + 12}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="12" fill="#374151">{label}</text>'
+            )
+        helios_ms = row["helios_ms"]
+        linux_ms = row["linux_ms"]
+        ratio_text = "n/a" if helios_ms is None or linux_ms in (None, 0) else f"{helios_ms / linux_ms:.2f}x"
+        lines.append(
+            f'<text x="{width - 94}" y="{y + 31}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" font-weight="700" fill="#111827">{ratio_text}</text>'
+        )
+    lines.append("</svg>")
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def write_report(
     path: Path,
     manifest: dict,
@@ -284,8 +374,13 @@ def write_report(
 ) -> None:
     run_record, helios = parse_jsonl(helios_jsonl)
     linux = parse_hyperfine(linux_json)
+    rows = comparison_rows(workloads, helios, linux)
+    svg_path = path.with_name("helios-vs-linux.svg")
+    write_svg(svg_path, rows)
     lines = [
         "# Helios vs Native Linux Benchmark",
+        "",
+        "![Helios vs Linux median timings](helios-vs-linux.svg)",
         "",
         f"- Helios JSONL: `{helios_jsonl}`",
         f"- Linux Hyperfine JSON: `{linux_json}`",

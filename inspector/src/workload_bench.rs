@@ -379,6 +379,7 @@ fn render_helios_script(workload: &Workload, command: &WorkloadBenchCommand) -> 
         ("{bash}", "/bin/bash"),
         ("{cat}", "/bin/cat"),
         ("{curl}", "/bin/curl"),
+        ("{head}", "/bin/head"),
         ("{mkdir}", "/bin/mkdir"),
         ("{python3}", "/bin/python3"),
         ("{quickjs}", "/bin/qjs"),

@@ -11,6 +11,7 @@ LINUX_PLACEHOLDERS = {
     "{bash}": "bash",
     "{cat}": "cat",
     "{curl}": "curl --fail --silent --show-error",
+    "{head}": "head",
     "{mkdir}": "mkdir",
     "{python3}": "python3",
     "{quickjs}": "qjs",
