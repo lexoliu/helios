@@ -9,6 +9,7 @@ use core::fmt::{self, Write};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll};
+use core::time::Duration;
 
 use crate::{
     ClockAuthorityRights, DirectoryAuthorityRights, LinkAuthorityRights, NetworkAuthorityRights,
@@ -114,6 +115,7 @@ pub type RuntimeDeadlinePollable<CpuImpl, HostFs> =
 fn spawn_component_phase_heartbeat<CpuImpl>(
     spawner: &crate::Spawner<CpuImpl>,
     cpu: &CpuImpl,
+    timer: &crate::Timer<CpuImpl>,
     progress: &helios_hal::watchdog::ProgressCounter,
     write_serial: fn(&[u8]),
     phase: &'static str,
@@ -125,29 +127,29 @@ fn spawn_component_phase_heartbeat<CpuImpl>(
     spawner.spawn_detached({
         let done = done.clone();
         let cpu = cpu.clone();
+        let timer = timer.clone();
         let progress = progress.clone();
         async move {
-            let mut next_heartbeat =
-                started_at.saturating_add(COMPONENT_PHASE_HEARTBEAT_INTERVAL_NANOS);
+            let interval = Duration::from_nanos(COMPONENT_PHASE_HEARTBEAT_INTERVAL_NANOS);
             loop {
                 if done.load(Ordering::Acquire) {
                     return;
                 }
 
-                let now = monotonic_nanos(&cpu);
-                if now >= next_heartbeat {
-                    progress.record_progress();
-                    if cfg!(debug_assertions) {
-                        let elapsed_ms = elapsed_millis(started_at, now);
-                        write_serial_fmt(
-                            write_serial,
-                            format_args!("\n[KDBG {phase}-progress elapsed_ms={elapsed_ms}]\n"),
-                        );
-                    }
-                    next_heartbeat = now.saturating_add(COMPONENT_PHASE_HEARTBEAT_INTERVAL_NANOS);
+                timer.sleep_for(interval).await;
+                if done.load(Ordering::Acquire) {
+                    return;
                 }
 
-                crate::yield_now().await;
+                let now = monotonic_nanos(&cpu);
+                progress.record_progress();
+                if cfg!(debug_assertions) {
+                    let elapsed_ms = elapsed_millis(started_at, now);
+                    write_serial_fmt(
+                        write_serial,
+                        format_args!("\n[KDBG {phase}-progress elapsed_ms={elapsed_ms}]\n"),
+                    );
+                }
             }
         }
     });
@@ -1375,6 +1377,7 @@ where
         ComponentBindingSet::Program => ComponentWorld::Program,
     };
     let instantiate_cpu = cpu.clone();
+    let instantiate_timer = timer.clone();
     let instantiate_spawner = spawner.clone();
 
     let context = ComponentExecContext::new(
@@ -1400,6 +1403,7 @@ where
     spawn_component_phase_heartbeat(
         &instantiate_spawner,
         &instantiate_cpu,
+        &instantiate_timer,
         &instantiate_spawner.progress_counter(),
         write_serial,
         "instantiate",

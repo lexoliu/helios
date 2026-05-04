@@ -4879,6 +4879,7 @@ where
     argv.extend(args);
     let run_started_at = monotonic_nanos(&exec_context.cpu);
     let run_cpu = exec_context.cpu.clone();
+    let run_timer = exec_context.timer.clone();
     let profile_cpu = exec_context.cpu.clone();
     let profile_runtime_state = exec_context.runtime_state.clone();
     let instance_id = launched_instance.id();
@@ -4957,6 +4958,7 @@ where
         super::spawn_component_phase_heartbeat(
             &spawner,
             &run_cpu,
+            &run_timer,
             &progress,
             exec_context.write_serial,
             "program:run-core",
@@ -5071,6 +5073,7 @@ where
     argv.extend(args);
     let run_started_at = monotonic_nanos(&exec_context.cpu);
     let run_cpu = exec_context.cpu.clone();
+    let run_timer = exec_context.timer.clone();
     let profile_cpu = exec_context.cpu.clone();
     let profile_runtime_state = exec_context.runtime_state.clone();
     let instance_id = launched_instance.id();
@@ -5161,6 +5164,7 @@ where
         super::spawn_component_phase_heartbeat(
             &spawner,
             &run_cpu,
+            &run_timer,
             &progress,
             exec_context.write_serial,
             "program:run-core",
@@ -5274,6 +5278,7 @@ where
     argv.extend(args);
     let run_started_at = monotonic_nanos(&exec_context.cpu);
     let run_cpu = exec_context.cpu.clone();
+    let run_timer = exec_context.timer.clone();
     let profile_cpu = exec_context.cpu.clone();
     let profile_runtime_state = exec_context.runtime_state.clone();
 
@@ -5330,6 +5335,7 @@ where
     super::spawn_component_phase_heartbeat(
         &spawner,
         &run_cpu,
+        &run_timer,
         &progress,
         exec_context.write_serial,
         "program:run",
