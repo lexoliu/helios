@@ -136,11 +136,13 @@ fn spawn_component_phase_heartbeat<CpuImpl>(
                 let now = monotonic_nanos(&cpu);
                 if now >= next_heartbeat {
                     progress.record_progress();
-                    let elapsed_ms = elapsed_millis(started_at, now);
-                    write_serial_fmt(
-                        write_serial,
-                        format_args!("\n[KDBG {phase}-progress elapsed_ms={elapsed_ms}]\n"),
-                    );
+                    if cfg!(debug_assertions) {
+                        let elapsed_ms = elapsed_millis(started_at, now);
+                        write_serial_fmt(
+                            write_serial,
+                            format_args!("\n[KDBG {phase}-progress elapsed_ms={elapsed_ms}]\n"),
+                        );
+                    }
                     next_heartbeat = now.saturating_add(COMPONENT_PHASE_HEARTBEAT_INTERVAL_NANOS);
                 }
 
@@ -3624,6 +3626,12 @@ fn convert_program_level_to_local(
 
 fn emit_stage_marker(write_serial: fn(&[u8]), stage: &str) {
     emit_serial_stage_marker(&MarkerSerial(write_serial), stage);
+}
+
+fn emit_program_stage_marker(write_serial: fn(&[u8]), stage: &str) {
+    if cfg!(debug_assertions) {
+        emit_stage_marker(write_serial, stage);
+    }
 }
 
 struct MarkerSerial(fn(&[u8]));

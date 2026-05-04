@@ -1317,7 +1317,7 @@ where
         filesystem: Option<DebugFileSystemSnapshot>,
         signal_dispositions: Vec<WasixSignalDisposition>,
     ) -> Result<ChildHandle, ProgramExecError> {
-        super::emit_stage_marker(exec_context.write_serial, "program:spawn-begin");
+        super::emit_program_stage_marker(exec_context.write_serial, "program:spawn-begin");
         let executable = self
             .load_executable(&exec_context, &source, hint, exec_context.write_serial)
             .await?;
@@ -1348,7 +1348,7 @@ where
         descriptors: Preview1DescriptorTable,
         signal_dispositions: Vec<WasixSignalDisposition>,
     ) -> Result<ChildHandle, ProgramExecError> {
-        super::emit_stage_marker(exec_context.write_serial, "program:spawn-begin");
+        super::emit_program_stage_marker(exec_context.write_serial, "program:spawn-begin");
         let executable = self
             .load_executable(&exec_context, &source, hint, exec_context.write_serial)
             .await?;
@@ -1710,7 +1710,7 @@ where
         started_at: u64,
     ) -> Result<Arc<WasmtimeCompiledComponent>, ProgramExecError> {
         if let Some(component) = self.inner.component_cache.lock().get(&payload) {
-            super::emit_stage_marker(write_serial, "program:deserialize-cache-hit");
+            super::emit_program_stage_marker(write_serial, "program:deserialize-cache-hit");
             let now = monotonic_nanos(&self.inner.clock_cpu);
             tracing::info!(
                 target: "helios_component_host::program_host",
@@ -1723,7 +1723,7 @@ where
             return Ok(component);
         }
 
-        super::emit_stage_marker(write_serial, "program:deserialize-begin");
+        super::emit_program_stage_marker(write_serial, "program:deserialize-begin");
         tracing::info!(
             target: "helios_component_host::program_host",
             phase = "deserialize-component",
@@ -1747,7 +1747,7 @@ where
             }
         }
         let compiled = self.deserialize_component(&payload)?;
-        super::emit_stage_marker(write_serial, "program:deserialize-end");
+        super::emit_program_stage_marker(write_serial, "program:deserialize-end");
         let component = Arc::new(compiled);
         let now = monotonic_nanos(&self.inner.clock_cpu);
         tracing::info!(
@@ -1772,7 +1772,7 @@ where
         started_at: u64,
     ) -> Result<Arc<WasmtimeCompiledCoreModule>, ProgramExecError> {
         if let Some(module) = self.inner.core_module_cache.lock().get(&payload) {
-            super::emit_stage_marker(write_serial, "program:deserialize-core-cache-hit");
+            super::emit_program_stage_marker(write_serial, "program:deserialize-core-cache-hit");
             let now = monotonic_nanos(&self.inner.clock_cpu);
             tracing::info!(
                 target: "helios_component_host::program_host",
@@ -1785,11 +1785,11 @@ where
             return Ok(module);
         }
 
-        super::emit_stage_marker(write_serial, "program:deserialize-core-begin");
+        super::emit_program_stage_marker(write_serial, "program:deserialize-core-begin");
         let module = unsafe { Module::deserialize(self.inner.engine.raw(), payload.as_ref()) }
             .map_err(map_program_runtime_error)?;
         validate_preview1_program_module_imports(&module)?;
-        super::emit_stage_marker(write_serial, "program:deserialize-core-end");
+        super::emit_program_stage_marker(write_serial, "program:deserialize-core-end");
         let compiled = Arc::new(WasmtimeCompiledCoreModule { module });
         let now = monotonic_nanos(&self.inner.clock_cpu);
         tracing::info!(
@@ -4807,12 +4807,15 @@ where
             define_imported_shared_memory(&mut linker, &store, &compiled.module, memory)?;
         }
 
-        super::emit_stage_marker(exec_context.write_serial, "program:instantiate-core-begin");
+        super::emit_program_stage_marker(
+            exec_context.write_serial,
+            "program:instantiate-core-begin",
+        );
         let instance = linker
             .instantiate_async(&mut store, &compiled.module)
             .await
             .map_err(map_program_runtime_error)?;
-        super::emit_stage_marker(exec_context.write_serial, "program:instantiate-core-ok");
+        super::emit_program_stage_marker(exec_context.write_serial, "program:instantiate-core-ok");
 
         let start = instance
             .get_typed_func::<(), ()>(&mut store, "_start")
@@ -4831,7 +4834,7 @@ where
             run_started_at,
             &run_done,
         );
-        super::emit_stage_marker(exec_context.write_serial, "program:run-core-begin");
+        super::emit_program_stage_marker(exec_context.write_serial, "program:run-core-begin");
         let result = loop {
             let result = start.call_async(&mut store, ()).await;
             if handle_wasix_asyncify_completion(&mut store, &instance).await? {
@@ -4840,7 +4843,7 @@ where
             break result;
         };
         run_done.store(true, core::sync::atomic::Ordering::Release);
-        super::emit_stage_marker(exec_context.write_serial, "program:run-core-end");
+        super::emit_program_stage_marker(exec_context.write_serial, "program:run-core-end");
 
         let child_exit = match result {
             Ok(()) => Ok(ChildExit {
@@ -4938,12 +4941,12 @@ where
         restore.memory.clone(),
     )?;
 
-    super::emit_stage_marker(exec_context.write_serial, "program:instantiate-core-begin");
+    super::emit_program_stage_marker(exec_context.write_serial, "program:instantiate-core-begin");
     let instance = linker
         .instantiate_async(&mut store, &compiled.module)
         .await
         .map_err(map_program_runtime_error)?;
-    super::emit_stage_marker(exec_context.write_serial, "program:instantiate-core-ok");
+    super::emit_program_stage_marker(exec_context.write_serial, "program:instantiate-core-ok");
 
     wasix_begin_rewind(
         &mut store,
@@ -4974,7 +4977,7 @@ where
         run_started_at,
         &run_done,
     );
-    super::emit_stage_marker(exec_context.write_serial, "program:run-core-begin");
+    super::emit_program_stage_marker(exec_context.write_serial, "program:run-core-begin");
     let result = loop {
         let result = start.call_async(&mut store, ()).await;
         if handle_wasix_asyncify_completion(&mut store, &instance).await? {
@@ -4983,7 +4986,7 @@ where
         break result;
     };
     run_done.store(true, core::sync::atomic::Ordering::Release);
-    super::emit_stage_marker(exec_context.write_serial, "program:run-core-end");
+    super::emit_program_stage_marker(exec_context.write_serial, "program:run-core-end");
 
     match result {
         Ok(()) => Ok(ChildExit {
@@ -5056,7 +5059,7 @@ where
 
     // Use the engine that compiled the component — Wasmtime requires
     // component and store to share the same engine instance.
-    super::emit_stage_marker(exec_context.write_serial, "program:instantiate-begin");
+    super::emit_program_stage_marker(exec_context.write_serial, "program:instantiate-begin");
     let executor =
         <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as ComponentRuntimeFactory<
             CpuImpl,
@@ -5065,7 +5068,7 @@ where
         >>::instantiate(runtime, engine, &compiled, ComponentWorld::Program, context)
         .await
         .map_err(map_program_runtime_error)?;
-    super::emit_stage_marker(exec_context.write_serial, "program:instantiate-ok");
+    super::emit_program_stage_marker(exec_context.write_serial, "program:instantiate-ok");
 
     let run_done = Arc::new(core::sync::atomic::AtomicBool::new(false));
     super::spawn_component_phase_heartbeat(
@@ -5077,11 +5080,11 @@ where
         run_started_at,
         &run_done,
     );
-    super::emit_stage_marker(exec_context.write_serial, "program:run-begin");
+    super::emit_program_stage_marker(exec_context.write_serial, "program:run-begin");
     let result = executor.run().await;
     run_done.store(true, core::sync::atomic::Ordering::Release);
     let result = result.map_err(map_program_runtime_error)?;
-    super::emit_stage_marker(exec_context.write_serial, "program:run-end");
+    super::emit_program_stage_marker(exec_context.write_serial, "program:run-end");
 
     Ok(ChildExit {
         instance_id: result.instance_id,
