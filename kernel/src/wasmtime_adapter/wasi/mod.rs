@@ -25,8 +25,9 @@ use wasmtime::component::{
 };
 use wasmtime::{self, Result, StoreContextMut};
 
-use crate::wasmtime_adapter::component_host::ComponentHostNetworkService;
-use crate::wasmtime_adapter::component_host::{OutputStreamKind, StoreData};
+use crate::wasmtime_adapter::component_host::{
+    ComponentHostNetworkService, HostRuntimeState, OutputStreamKind, StoreData,
+};
 
 pub(crate) type FsNodeKind = crate::ComponentFsNodeKind;
 const FILE_READ_CHUNK_BYTES: usize = 1024 * 1024;
@@ -39,6 +40,54 @@ const DEFAULT_WASI_TCP_KEEP_ALIVE_INTERVAL_NANOS: u64 = 75_000_000_000;
 const DEFAULT_WASI_TCP_KEEP_ALIVE_COUNT: u32 = 9;
 const MAX_WASI_UDP_DATAGRAM_BYTES: usize = u16::MAX as usize;
 const MAX_SYMLINK_DEPTH: usize = 16;
+
+struct ComponentFsProfile<CpuImpl, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    runtime_state: HostRuntimeState<CpuImpl, HostFs>,
+    cpu: CpuImpl,
+    started_ticks: u64,
+}
+
+fn component_fs_profile<CpuImpl, HostFs>(
+    store: &StoreData<CpuImpl, HostFs>,
+) -> Option<ComponentFsProfile<CpuImpl, HostFs>>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    store
+        .runtime_state
+        .profiling_enabled()
+        .then(|| ComponentFsProfile {
+            runtime_state: store.runtime_state.clone(),
+            cpu: store.cpu.clone(),
+            started_ticks: store.cpu.now().ticks(),
+        })
+}
+
+fn record_component_fs_profile<CpuImpl, HostFs>(
+    profile: Option<ComponentFsProfile<CpuImpl, HostFs>>,
+    operation: &'static str,
+) where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    if let Some(profile) = profile {
+        profile.runtime_state.record_profile_stack_parts(
+            crate::ProfileScope::Kernel,
+            "kernel;component-fs;",
+            operation,
+            profile
+                .cpu
+                .now()
+                .ticks()
+                .saturating_sub(profile.started_ticks),
+        );
+    }
+}
 
 pub(crate) fn has_wasi_network_rights(
     authority: &crate::ProcessAuthority,
@@ -3797,7 +3846,8 @@ where
         accessor: &Accessor<T, Self>,
         descriptor: Resource<FsDescriptor>,
     ) -> Result<fs_types::DescriptorType, FsError> {
-        accessor.with(|mut access| {
+        let profile = accessor.with(|mut access| component_fs_profile(access.get()));
+        let result = accessor.with(|mut access| {
             let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
             let kind = match descriptor.kind {
                 FsNodeKind::Directory => fs_types::DescriptorType::Directory,
@@ -3805,7 +3855,9 @@ where
                 FsNodeKind::Symlink => fs_types::DescriptorType::SymbolicLink,
             };
             Ok(kind)
-        })
+        });
+        record_component_fs_profile(profile, "get-type");
+        result
     }
 
     async fn set_size<T: Send>(
@@ -3900,10 +3952,12 @@ where
         StreamReader<fs_types::DirectoryEntry>,
         FutureReader<core::result::Result<(), fs_types::ErrorCode>>,
     )> {
+        let profile = component_fs_profile(accessor.get());
         let entries = {
             let descriptor = get_fs_descriptor(accessor.get(), &descriptor)?;
             accessor.get().filesystem().read_directory(&descriptor.path)
         };
+        record_component_fs_profile(profile, "read-directory");
         match entries {
             Ok(entries) => {
                 let stream = StreamReader::new(&mut accessor, entries)?;
@@ -3984,6 +4038,7 @@ where
         accessor: &Accessor<T, Self>,
         descriptor: Resource<FsDescriptor>,
     ) -> Result<fs_types::DescriptorStat, FsError> {
+        let profile = accessor.with(|mut access| component_fs_profile(access.get()));
         // Extract path from the descriptor synchronously, then do the
         // (potentially async) FS operation outside the accessor so the
         // kernel executor can drive the 9p transport concurrently.
@@ -4006,7 +4061,7 @@ where
                 .stat_path(&host_path)
                 .await
                 .map_err(map_host_fs_error)?;
-            return Ok(fs_types::DescriptorStat {
+            let result = fs_types::DescriptorStat {
                 type_: if metadata.qid_type & 0x80 != 0 {
                     fs_types::DescriptorType::Directory
                 } else {
@@ -4017,9 +4072,14 @@ where
                 data_access_timestamp: None,
                 data_modification_timestamp: None,
                 status_change_timestamp: None,
-            });
+            };
+            record_component_fs_profile(profile, "stat");
+            return Ok(result);
         }
-        accessor.with(|mut access| access.get().filesystem().stat(&path).map_err(Into::into))
+        let result =
+            accessor.with(|mut access| access.get().filesystem().stat(&path).map_err(Into::into));
+        record_component_fs_profile(profile, "stat");
+        result
     }
 
     async fn stat_at<T: Send>(
@@ -4028,6 +4088,7 @@ where
         path_flags: fs_types::PathFlags,
         path: String,
     ) -> Result<fs_types::DescriptorStat, FsError> {
+        let profile = accessor.with(|mut access| component_fs_profile(access.get()));
         // Guest filesystem has no symlinks; SYMLINK_FOLLOW is a no-op.
         let _ = path_flags;
         let absolute = accessor
@@ -4051,7 +4112,7 @@ where
                 .stat_path(&host_path)
                 .await
                 .map_err(map_host_fs_error)?;
-            return Ok(fs_types::DescriptorStat {
+            let result = fs_types::DescriptorStat {
                 type_: if metadata.qid_type & 0x80 != 0 {
                     fs_types::DescriptorType::Directory
                 } else {
@@ -4062,15 +4123,19 @@ where
                 data_access_timestamp: None,
                 data_modification_timestamp: None,
                 status_change_timestamp: None,
-            });
+            };
+            record_component_fs_profile(profile, "stat-at");
+            return Ok(result);
         }
-        accessor.with(|mut access| {
+        let result = accessor.with(|mut access| {
             access
                 .get()
                 .filesystem()
                 .stat(&absolute)
                 .map_err(Into::into)
-        })
+        });
+        record_component_fs_profile(profile, "stat-at");
+        result
     }
 
     async fn set_times_at<T: Send>(
@@ -4227,6 +4292,7 @@ where
         open_flags: fs_types::OpenFlags,
         flags: fs_types::DescriptorFlags,
     ) -> Result<Resource<FsDescriptor>, FsError> {
+        let profile = accessor.with(|mut access| component_fs_profile(access.get()));
         // Extract base descriptor data and resolve absolute path synchronously.
         let (base_path, base_kind, base_flags) = accessor.with(|mut access| {
             let base = get_fs_descriptor(access.get(), &descriptor)?;
@@ -4304,7 +4370,7 @@ where
                             flags: descriptor_flags,
                             identity: Some(metadata.identity),
                         };
-                        return accessor.with(|mut access| {
+                        let result = accessor.with(|mut access| {
                             access.get().filesystem_mut().seed_host_file_content(
                                 &absolute,
                                 metadata.identity,
@@ -4312,6 +4378,8 @@ where
                             );
                             access.get().table.push(opened).map_err(FsError::trap)
                         });
+                        record_component_fs_profile(profile, "open-at");
+                        return result;
                     }
                     // Directory — eagerly seed its direct children into the
                     // embedded FS so read_directory can walk them without
@@ -4326,13 +4394,15 @@ where
                         flags: descriptor_flags,
                         identity: Some(metadata.identity),
                     };
-                    return accessor.with(|mut access| {
+                    let result = accessor.with(|mut access| {
                         access
                             .get()
                             .filesystem_mut()
                             .seed_host_directory_entries(&absolute, entries);
                         access.get().table.push(opened).map_err(FsError::trap)
                     });
+                    record_component_fs_profile(profile, "open-at");
+                    return result;
                 }
                 Err(err) => {
                     let err = map_host_fs_error(err);
@@ -4358,9 +4428,11 @@ where
                             flags: descriptor_flags,
                             identity: Some(metadata.identity),
                         };
-                        return accessor.with(|mut access| {
+                        let result = accessor.with(|mut access| {
                             access.get().table.push(opened).map_err(FsError::trap)
                         });
+                        record_component_fs_profile(profile, "open-at");
+                        return result;
                     }
                     return Err(err.into());
                 }
@@ -4368,7 +4440,7 @@ where
         }
 
         // Embedded filesystem path — fully synchronous.
-        accessor.with(|mut access| {
+        let result = accessor.with(|mut access| {
             let base = get_fs_descriptor(access.get(), &descriptor)?;
             let now_nanos = access.get().now_nanos();
             let opened = access
@@ -4378,7 +4450,9 @@ where
                 .map_err(FsError::from)?;
             let resource = access.get().table.push(opened).map_err(FsError::trap)?;
             Ok(resource)
-        })
+        });
+        record_component_fs_profile(profile, "open-at");
+        result
     }
 
     async fn readlink_at<T: Send>(
@@ -4681,6 +4755,7 @@ where
         accessor: &Accessor<T, Self>,
         descriptor: Resource<FsDescriptor>,
     ) -> Result<fs_types::MetadataHashValue, FsError> {
+        let profile = accessor.with(|mut access| component_fs_profile(access.get()));
         let path = accessor.with(|mut access| {
             let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
             Ok::<_, FsError>(descriptor.path.clone())
@@ -4697,18 +4772,22 @@ where
                 .stat_path(&host_path)
                 .await
                 .map_err(map_host_fs_error)?;
-            return Ok(metadata_hash_value(
+            let result = metadata_hash_value(
                 metadata.identity,
                 u64::from(metadata.mode) << 32 ^ metadata.size,
-            ));
+            );
+            record_component_fs_profile(profile, "metadata-hash");
+            return Ok(result);
         }
-        accessor.with(|mut access| {
+        let result = accessor.with(|mut access| {
             access
                 .get()
                 .filesystem_mut()
                 .metadata_hash(&path)
                 .map_err(Into::into)
-        })
+        });
+        record_component_fs_profile(profile, "metadata-hash");
+        result
     }
 
     async fn metadata_hash_at<T: Send>(
@@ -4717,6 +4796,7 @@ where
         path_flags: fs_types::PathFlags,
         path: String,
     ) -> Result<fs_types::MetadataHashValue, FsError> {
+        let profile = accessor.with(|mut access| component_fs_profile(access.get()));
         // No symlinks in our guest FS — SYMLINK_FOLLOW is a no-op.
         let _ = path_flags;
         let absolute = accessor.with(|mut access| {
@@ -4737,18 +4817,22 @@ where
                 .stat_path(&host_path)
                 .await
                 .map_err(map_host_fs_error)?;
-            return Ok(metadata_hash_value(
+            let result = metadata_hash_value(
                 metadata.identity,
                 u64::from(metadata.mode) << 32 ^ metadata.size,
-            ));
+            );
+            record_component_fs_profile(profile, "metadata-hash-at");
+            return Ok(result);
         }
-        accessor.with(|mut access| {
+        let result = accessor.with(|mut access| {
             access
                 .get()
                 .filesystem_mut()
                 .metadata_hash(&absolute)
                 .map_err(Into::into)
-        })
+        });
+        record_component_fs_profile(profile, "metadata-hash-at");
+        result
     }
 }
 
