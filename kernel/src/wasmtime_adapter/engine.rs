@@ -12,6 +12,11 @@ use wasmtime::component::{Component, Instance, TypedFunc};
 use wasmtime::{AsContextMut, Engine};
 
 const WASI_CLI_RUN_FUNC: &str = "run";
+#[cfg(any(
+    not(target_os = "none"),
+    all(target_os = "none", feature = "wasmtime-aarch64")
+))]
+const POOLING_MAX_UNUSED_WARM_SLOTS: u32 = 100;
 
 #[derive(Debug, Error)]
 enum WasiCliRunResolveError {
@@ -115,11 +120,7 @@ struct PoolingConfiguration {
 /// feature.
 #[cfg(all(target_os = "none", feature = "wasmtime-aarch64"))]
 fn configure_pooling(config: &mut wasmtime::Config) -> PoolingConfiguration {
-    use wasmtime::{InstanceAllocationStrategy, PoolingAllocationConfig};
-    let mut pooling = PoolingAllocationConfig::default();
-    pooling.max_unused_warm_slots(0);
-    config.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling));
-    config.async_stack_zeroing(false);
+    apply_pooling_config(config);
     PoolingConfiguration { applied: true }
 }
 
@@ -131,12 +132,21 @@ fn configure_pooling(config: &mut wasmtime::Config) -> PoolingConfiguration {
 
 #[cfg(not(target_os = "none"))]
 fn configure_pooling(config: &mut wasmtime::Config) -> PoolingConfiguration {
+    apply_pooling_config(config);
+    PoolingConfiguration { applied: true }
+}
+
+#[cfg(any(
+    not(target_os = "none"),
+    all(target_os = "none", feature = "wasmtime-aarch64")
+))]
+fn apply_pooling_config(config: &mut wasmtime::Config) {
     use wasmtime::{InstanceAllocationStrategy, PoolingAllocationConfig};
     let mut pooling = PoolingAllocationConfig::default();
-    pooling.max_unused_warm_slots(0);
+    pooling.max_unused_warm_slots(POOLING_MAX_UNUSED_WARM_SLOTS);
+    pooling.async_stack_keep_resident(super::config::COMPONENT_ASYNC_STACK_SIZE);
     config.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling));
     config.async_stack_zeroing(false);
-    PoolingConfiguration { applied: true }
 }
 
 pub fn build_component_engine_for_platform<P: Cpu + Clone>(
