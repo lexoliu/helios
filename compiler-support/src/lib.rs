@@ -145,6 +145,9 @@ fn build_engine_config(target: &str, hint: AotCompileHint, worker_count: usize) 
     }
     config.wasm_component_model(true);
     config.wasm_component_model_async(true);
+    config.wasm_component_model_async_builtins(true);
+    config.wasm_component_model_async_stackful(true);
+    config.wasm_component_model_threading(true);
     config.wasm_simd(true);
     config.wasm_relaxed_simd(true);
     config.relaxed_simd_deterministic(false);
