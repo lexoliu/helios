@@ -704,23 +704,63 @@ fn connect_and_run(command: &ResolvedVmCommand, runtime: &mut VmRuntime) -> Resu
     };
     match command.command.clone() {
         Some(ResolvedVmSessionCommand::AotBench(command)) => run_aot_bench(client, command),
-        Some(ResolvedVmSessionCommand::WorkloadBench(workload_command)) => {
-            crate::workload_bench::run(
-                client,
-                workload_command,
-                VmProvenance {
-                    arch: arch_label(command.profile.arch),
-                    release: command.release,
-                    smp: command.smp,
-                    memory: command.memory.clone(),
-                    cpu: command.cpu.clone(),
-                    accel: command.accel.clone(),
-                },
-            )
-        }
+        Some(ResolvedVmSessionCommand::WorkloadBench(workload_command)) => run_workload_bench(
+            client,
+            workload_command,
+            VmProvenance {
+                arch: arch_label(command.profile.arch),
+                release: command.release,
+                smp: command.smp,
+                memory: command.memory.clone(),
+                cpu: command.cpu.clone(),
+                accel: command.accel.clone(),
+            },
+        ),
         Some(ResolvedVmSessionCommand::Session(command)) => run_connected(client, Some(command)),
         None => run_connected(client, None),
     }
+}
+
+fn run_workload_bench(
+    mut client: crate::serial::RpcClient,
+    command: WorkloadBenchCommand,
+    provenance: VmProvenance,
+) -> Result<()> {
+    crate::run_interruptible(async move {
+        let profile_filter = system_profiling::Filter {
+            scope: None,
+            stack_prefixes: Vec::new(),
+        };
+        let collect_profile = command.profile_output.is_some()
+            || command.kernel_profile_output.is_some()
+            || command.user_profile_output.is_some();
+        let before_profile = if collect_profile {
+            system_profiling::clear(&client)
+                .await
+                .context("failed to clear remote profile samples")?;
+            system_profiling::set_enabled(&client, true)
+                .await
+                .context("failed to enable remote profiling")?;
+            system_profiling::folded(&client, &profile_filter, 0)
+                .await
+                .context("failed to read initial remote profile samples")?
+        } else {
+            Vec::new()
+        };
+
+        crate::workload_bench::run_inner(&mut client, &command, &provenance).await?;
+
+        if collect_profile {
+            system_profiling::set_enabled(&client, false)
+                .await
+                .context("failed to disable remote profiling")?;
+            let after_profile = system_profiling::folded(&client, &profile_filter, 0)
+                .await
+                .context("failed to read final remote profile samples")?;
+            write_requested_profile_outputs(&command, &before_profile, &after_profile)?;
+        }
+        Ok(())
+    })
 }
 
 fn run_aot_bench(client: crate::serial::RpcClient, command: AotBenchCommand) -> Result<()> {
@@ -802,37 +842,82 @@ fn run_aot_bench(client: crate::serial::RpcClient, command: AotBenchCommand) -> 
             let after_profile = system_profiling::folded(&client, &profile_filter, 0)
                 .await
                 .context("failed to read final remote profile samples")?;
-            if let Some(output) = command.profile_output {
-                write_profile_output(&output, &before_profile, &after_profile, None)
-                    .with_context(|| format!("failed to write {}", output.display()))?;
-                let mut stdout = std::io::stdout().lock();
-                writeln!(stdout, "profile_output={}", output.display())?;
-            }
-            if let Some(output) = command.kernel_profile_output {
-                write_profile_output(
-                    &output,
-                    &before_profile,
-                    &after_profile,
-                    Some(system_profiling::Scope::Kernel),
-                )
-                .with_context(|| format!("failed to write {}", output.display()))?;
-                let mut stdout = std::io::stdout().lock();
-                writeln!(stdout, "kernel_profile_output={}", output.display())?;
-            }
-            if let Some(output) = command.user_profile_output {
-                write_profile_output(
-                    &output,
-                    &before_profile,
-                    &after_profile,
-                    Some(system_profiling::Scope::User),
-                )
-                .with_context(|| format!("failed to write {}", output.display()))?;
-                let mut stdout = std::io::stdout().lock();
-                writeln!(stdout, "user_profile_output={}", output.display())?;
-            }
+            write_requested_profile_outputs(&command, &before_profile, &after_profile)?;
         }
         Ok(())
     })
+}
+
+trait ProfileOutputRequest {
+    fn profile_output(&self) -> Option<&Path>;
+    fn kernel_profile_output(&self) -> Option<&Path>;
+    fn user_profile_output(&self) -> Option<&Path>;
+}
+
+impl ProfileOutputRequest for AotBenchCommand {
+    fn profile_output(&self) -> Option<&Path> {
+        self.profile_output.as_deref()
+    }
+
+    fn kernel_profile_output(&self) -> Option<&Path> {
+        self.kernel_profile_output.as_deref()
+    }
+
+    fn user_profile_output(&self) -> Option<&Path> {
+        self.user_profile_output.as_deref()
+    }
+}
+
+impl ProfileOutputRequest for WorkloadBenchCommand {
+    fn profile_output(&self) -> Option<&Path> {
+        self.profile_output.as_deref()
+    }
+
+    fn kernel_profile_output(&self) -> Option<&Path> {
+        self.kernel_profile_output.as_deref()
+    }
+
+    fn user_profile_output(&self) -> Option<&Path> {
+        self.user_profile_output.as_deref()
+    }
+}
+
+fn write_requested_profile_outputs(
+    command: &impl ProfileOutputRequest,
+    before_profile: &[system_profiling::FoldedSample],
+    after_profile: &[system_profiling::FoldedSample],
+) -> Result<()> {
+    use std::io::Write as _;
+
+    if let Some(output) = command.profile_output() {
+        write_profile_output(output, before_profile, after_profile, None)
+            .with_context(|| format!("failed to write {}", output.display()))?;
+        let mut stderr = std::io::stderr().lock();
+        writeln!(stderr, "profile_output={}", output.display())?;
+    }
+    if let Some(output) = command.kernel_profile_output() {
+        write_profile_output(
+            output,
+            before_profile,
+            after_profile,
+            Some(system_profiling::Scope::Kernel),
+        )
+        .with_context(|| format!("failed to write {}", output.display()))?;
+        let mut stderr = std::io::stderr().lock();
+        writeln!(stderr, "kernel_profile_output={}", output.display())?;
+    }
+    if let Some(output) = command.user_profile_output() {
+        write_profile_output(
+            output,
+            before_profile,
+            after_profile,
+            Some(system_profiling::Scope::User),
+        )
+        .with_context(|| format!("failed to write {}", output.display()))?;
+        let mut stderr = std::io::stderr().lock();
+        writeln!(stderr, "user_profile_output={}", output.display())?;
+    }
+    Ok(())
 }
 
 fn write_profile_output(

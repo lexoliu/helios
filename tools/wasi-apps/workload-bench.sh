@@ -53,5 +53,17 @@ if [[ -n "${HELIOS_WORKLOAD_BENCH_HOST_HTTP_URL:-}" ]]; then
     command+=(--host-http-url "${HELIOS_WORKLOAD_BENCH_HOST_HTTP_URL}")
 fi
 
+if [[ -n "${HELIOS_WORKLOAD_BENCH_PROFILE_OUTPUT:-}" ]]; then
+    command+=(--profile-output "${HELIOS_WORKLOAD_BENCH_PROFILE_OUTPUT}")
+fi
+
+if [[ -n "${HELIOS_WORKLOAD_BENCH_KERNEL_PROFILE_OUTPUT:-}" ]]; then
+    command+=(--kernel-profile-output "${HELIOS_WORKLOAD_BENCH_KERNEL_PROFILE_OUTPUT}")
+fi
+
+if [[ -n "${HELIOS_WORKLOAD_BENCH_USER_PROFILE_OUTPUT:-}" ]]; then
+    command+=(--user-profile-output "${HELIOS_WORKLOAD_BENCH_USER_PROFILE_OUTPUT}")
+fi
+
 printf 'writing WASI workload benchmark JSONL to %s\n' "${log}" >&2
 "${command[@]}" | tee "${log}"

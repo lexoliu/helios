@@ -29,6 +29,18 @@ pub(crate) struct WorkloadBenchCommand {
     /// Host HTTP URL visible from inside the VM for workloads requiring host networking.
     #[arg(long)]
     host_http_url: Option<String>,
+
+    /// Write folded kernel/user profile samples collected during the workload run.
+    #[arg(long)]
+    pub(crate) profile_output: Option<PathBuf>,
+
+    /// Write folded kernel-only profile samples collected during the workload run.
+    #[arg(long)]
+    pub(crate) kernel_profile_output: Option<PathBuf>,
+
+    /// Write folded user-only profile samples collected during the workload run.
+    #[arg(long)]
+    pub(crate) user_profile_output: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
@@ -143,73 +155,67 @@ pub(crate) fn required_boot_programs(command: &WorkloadBenchCommand) -> Result<V
     Ok(programs)
 }
 
-pub(crate) fn run(
-    mut client: crate::serial::RpcClient,
-    command: WorkloadBenchCommand,
-    provenance: VmProvenance,
+pub(crate) async fn run_inner(
+    client: &mut crate::serial::RpcClient,
+    command: &WorkloadBenchCommand,
+    provenance: &VmProvenance,
 ) -> Result<()> {
-    crate::run_interruptible(async move {
-        if command.iterations == 0 {
-            bail!("workload-bench --iterations must be non-zero");
-        }
-        let manifest_path = command.manifest.clone();
-        let workloads = select_workloads(&command)?;
-        let selected_workloads = workloads
-            .iter()
-            .map(|workload| workload.name.clone())
-            .collect::<Vec<_>>();
-        write_record(&JsonlRecord::Run {
-            schema_version: 1,
-            git_sha: git_sha().unwrap_or_else(|_| "unknown".to_owned()),
-            vm: &provenance,
-            manifest: manifest_path.display().to_string(),
-            iterations: command.iterations,
-            selected_workloads,
-        })?;
+    if command.iterations == 0 {
+        bail!("workload-bench --iterations must be non-zero");
+    }
+    let manifest_path = command.manifest.clone();
+    let workloads = select_workloads(command)?;
+    let selected_workloads = workloads
+        .iter()
+        .map(|workload| workload.name.clone())
+        .collect::<Vec<_>>();
+    write_record(&JsonlRecord::Run {
+        schema_version: 1,
+        git_sha: git_sha().unwrap_or_else(|_| "unknown".to_owned()),
+        vm: provenance,
+        manifest: manifest_path.display().to_string(),
+        iterations: command.iterations,
+        selected_workloads,
+    })?;
 
-        for workload in workloads {
-            let mut elapsed_ms = Vec::new();
-            for iteration in 1..=command.iterations {
-                let output = match workload.runner {
-                    WorkloadRunner::Shell => {
-                        run_shell_workload(&mut client, &workload, &command).await?
-                    }
-                    WorkloadRunner::HeliosAot => {
-                        run_aot_workload(&client, &workload, iteration).await?
-                    }
-                };
-                let validation = validate_output(&workload, &output.stdout, &output.stderr)
-                    .with_context(|| {
-                        format!(
-                            "workload {} iteration {} failed validation",
-                            workload.name, iteration
-                        )
-                    })?;
-                elapsed_ms.push(output.elapsed_ms);
-                write_record(&JsonlRecord::Iteration {
-                    workload: &workload.name,
-                    class: workload.class,
-                    runner: workload.runner,
-                    iteration,
-                    elapsed_ms: output.elapsed_ms,
-                    stdout: stream_validation(&workload, &output.stdout, false),
-                    stderr: stream_validation(&workload, &output.stderr, workload.stderr_empty),
-                    validation,
+    for workload in workloads {
+        let mut elapsed_ms = Vec::new();
+        for iteration in 1..=command.iterations {
+            let output = match workload.runner {
+                WorkloadRunner::Shell => run_shell_workload(client, &workload, command).await?,
+                WorkloadRunner::HeliosAot => run_aot_workload(client, &workload, iteration).await?,
+            };
+            let validation = validate_output(&workload, &output.stdout, &output.stderr)
+                .with_context(|| {
+                    format!(
+                        "workload {} iteration {} failed validation",
+                        workload.name, iteration
+                    )
                 })?;
-            }
-            let median = median(&elapsed_ms)?;
-            write_record(&JsonlRecord::Summary {
+            elapsed_ms.push(output.elapsed_ms);
+            write_record(&JsonlRecord::Iteration {
                 workload: &workload.name,
                 class: workload.class,
                 runner: workload.runner,
-                median_elapsed_ms: median,
-                iterations: command.iterations,
-                elapsed_ms,
-                validation: ValidationSummary { ok: true },
+                iteration,
+                elapsed_ms: output.elapsed_ms,
+                stdout: stream_validation(&workload, &output.stdout, false),
+                stderr: stream_validation(&workload, &output.stderr, workload.stderr_empty),
+                validation,
             })?;
         }
-        Ok(())
-    })
+        let median = median(&elapsed_ms)?;
+        write_record(&JsonlRecord::Summary {
+            workload: &workload.name,
+            class: workload.class,
+            runner: workload.runner,
+            median_elapsed_ms: median,
+            iterations: command.iterations,
+            elapsed_ms,
+            validation: ValidationSummary { ok: true },
+        })?;
+    }
+    Ok(())
 }
 
 struct WorkloadOutput {
@@ -505,6 +511,9 @@ mod tests {
             workloads: Vec::new(),
             classes: Vec::new(),
             host_http_url: None,
+            profile_output: None,
+            kernel_profile_output: None,
+            user_profile_output: None,
         };
         let workloads = select_workloads(&command).expect("manifest must parse");
         assert!(
@@ -535,6 +544,9 @@ mod tests {
             workloads: Vec::new(),
             classes: vec![WorkloadClass::IoBound],
             host_http_url: None,
+            profile_output: None,
+            kernel_profile_output: None,
+            user_profile_output: None,
         };
         let workloads = select_workloads(&command).expect("manifest must parse");
         assert!(
