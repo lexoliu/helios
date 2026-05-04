@@ -27,6 +27,7 @@ use helios_compiler_abi::{
     HELIOS_COMPILER_INITIALIZE, HELIOS_COMPILER_PTHREAD_SELF_OFFSET,
 };
 use helios_hal::watchdog::Watchdog;
+use smallvec::SmallVec;
 use thiserror::Error;
 use wasmtime::component::{Component, InstancePre as ComponentInstancePre};
 use wasmtime::{
@@ -58,6 +59,8 @@ const WASIX_STREAM_SECURITY_ANY_ENCRYPTION: u8 = 1 << 1;
 const WASIX_STREAM_SECURITY_CLASSIC_ENCRYPTION: u8 = 1 << 2;
 const WASIX_STREAM_SECURITY_DOUBLE_ENCRYPTION: u8 = 1 << 3;
 const DEFAULT_WASIX_EXEC_SEARCH_PATHS: &[&str] = &["/usr/local/bin", "/bin", "/usr/bin"];
+type Preview1Iovs = SmallVec<[(u32, u32); 8]>;
+type Preview1IovRanges = SmallVec<[(usize, usize); 8]>;
 const WASIX_PROC_SPAWN_FD_OP_SIZE: u32 = 56;
 const WASIX_PROC_SPAWN_FD_OP_CMD_OFFSET: u32 = 0;
 const WASIX_PROC_SPAWN_FD_OP_FD_OFFSET: u32 = 4;
@@ -15982,8 +15985,8 @@ fn p1_read_iovs<T>(
     memory: Preview1Memory,
     iovs: u32,
     iovs_len: u32,
-) -> Result<Vec<(u32, u32)>, i32> {
-    let mut result = Vec::new();
+) -> Result<Preview1Iovs, i32> {
+    let mut result = Preview1Iovs::new();
     for index in 0..iovs_len {
         let offset = index.checked_mul(8).ok_or(p1::errno::OVERFLOW)?;
         let iov = iovs.checked_add(offset).ok_or(p1::errno::OVERFLOW)?;
@@ -16038,8 +16041,8 @@ fn p1_iovs_byte_len(iovs: &[(u32, u32)]) -> Result<usize, i32> {
 fn p1_iovs_memory_ranges(
     memory: Preview1Memory,
     iovs: &[(u32, u32)],
-) -> Result<Vec<(usize, usize)>, i32> {
-    let mut ranges = Vec::with_capacity(iovs.len());
+) -> Result<Preview1IovRanges, i32> {
+    let mut ranges = Preview1IovRanges::with_capacity(iovs.len());
     for (ptr, len) in iovs {
         let len = usize::try_from(*len).map_err(|_| p1::errno::OVERFLOW)?;
         let start = preview1_memory_start(memory, *ptr, len).map_err(|_| p1::errno::FAULT)?;
@@ -16655,7 +16658,7 @@ fn p1_timestamp_from_fstflags(
 fn p1_write_iovs_from_bytes<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
-    iovs: Vec<(u32, u32)>,
+    iovs: Preview1Iovs,
     bytes: &[u8],
     written_out: u32,
 ) -> i32 {

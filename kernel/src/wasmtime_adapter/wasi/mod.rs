@@ -2246,8 +2246,8 @@ where
 
         let prefix = crate::directory_prefix(path);
         let mut entries = Vec::new();
-        let nodes = self.snapshot.inner.lock().nodes.clone();
-        for child in &nodes {
+        let state = self.snapshot.inner.lock();
+        for child in &state.nodes {
             if child.path == path {
                 continue;
             }
@@ -2258,16 +2258,11 @@ where
                 continue;
             }
             if let Some((name, _)) = remainder.split_once('/') {
-                if entries
-                    .iter()
-                    .any(|entry: &fs_types::DirectoryEntry| entry.name == name)
-                {
-                    continue;
-                }
-                entries.push(fs_types::DirectoryEntry {
-                    type_: fs_types::DescriptorType::Directory,
-                    name: name.to_string(),
-                });
+                push_directory_entry_if_absent(
+                    &mut entries,
+                    fs_types::DescriptorType::Directory,
+                    name,
+                );
                 continue;
             }
             entries.push(fs_types::DirectoryEntry {
@@ -2275,6 +2270,7 @@ where
                 name: remainder.to_string(),
             });
         }
+        drop(state);
 
         if path == "/" && self.runtime_state.host_filesystem_service().is_some() {
             let has_host_mount = entries.iter().any(|entry| entry.name == "host");
@@ -3129,6 +3125,20 @@ fn descriptor_flags_from_authority(
         flags |= fs_types::DescriptorFlags::MUTATE_DIRECTORY;
     }
     flags
+}
+
+fn push_directory_entry_if_absent(
+    entries: &mut Vec<fs_types::DirectoryEntry>,
+    type_: fs_types::DescriptorType,
+    name: &str,
+) {
+    if entries.iter().any(|entry| entry.name == name) {
+        return;
+    }
+    entries.push(fs_types::DirectoryEntry {
+        type_,
+        name: name.to_string(),
+    });
 }
 
 pub(crate) fn validate_descriptor_flags_within_base(
