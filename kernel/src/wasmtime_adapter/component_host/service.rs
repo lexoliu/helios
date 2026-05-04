@@ -5499,6 +5499,11 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
+    let snapshot_started = store
+        .data()
+        .runtime_state
+        .profiling_enabled()
+        .then(|| store.data().cpu.now().ticks());
     let memory = store
         .data()
         .imported_memory
@@ -5521,6 +5526,14 @@ where
             memory.as_ptr().cast::<u8>(),
             memory_bytes.as_mut_ptr(),
             memory_len,
+        );
+    }
+    if let Some(snapshot_started) = snapshot_started {
+        record_program_kernel_profile(
+            &store.data().runtime_state,
+            &store.data().cpu,
+            "asyncify-process-snapshot-memory-copy",
+            snapshot_started,
         );
     }
     Ok(WasixProcessSnapshot {
@@ -5614,11 +5627,24 @@ where
             detail: ProgramExecErrorDetail::ImportedSharedMemoryBudgetExceeded,
         });
     }
+    let copy_started = store
+        .data()
+        .runtime_state
+        .profiling_enabled()
+        .then(|| store.data().cpu.now().ticks());
     unsafe {
         core::ptr::copy_nonoverlapping(
             data.as_ptr().cast::<u8>(),
             fork_data.as_ptr().cast::<u8>().cast_mut(),
             current_bytes,
+        );
+    }
+    if let Some(copy_started) = copy_started {
+        record_program_kernel_profile(
+            &store.data().runtime_state,
+            &store.data().cpu,
+            "asyncify-fork-memory-copy",
+            copy_started,
         );
     }
     let compiled = store
