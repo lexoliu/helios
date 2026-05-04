@@ -3253,7 +3253,8 @@ where
         // immediately empty stream (serial stdin is polled through the
         // dedicated `helios:system/serial` interface instead).
         let stream = match access.get().output_mode() {
-            ComponentOutputMode::Child { stdin_rx, .. } => {
+            ComponentOutputMode::Child { stdin_rx, .. }
+            | ComponentOutputMode::RoutedChild { stdin_rx, .. } => {
                 let reader = stdin_rx.clone();
                 StreamReader::new(&mut access, ChannelStreamProducer::new(reader))?
             }

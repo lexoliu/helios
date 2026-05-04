@@ -16,12 +16,12 @@ use crate::{
     ProcessAuthority, ProcessAuthorityError, TerminalAuthorityRights,
 };
 use crate::{
-    ComponentCache, ComponentNetworkService, ComponentOutputMode, ComponentOutputStreamKind,
-    ComponentStoreData, DeadlinePollable, EmbeddedComponent, ExecResult, ProgramExecError,
-    ProgramExecErrorDetail, ProgramExecErrorKind, RawMutex, RawMutexGuardResource,
-    RawMutexResource, RawRwLock, RawRwLockReadGuardResource, RawRwLockResource,
-    RawRwLockWriteGuardResource, SerialPortResource, elapsed_millis, emit_serial_stage_marker,
-    heap_stats, monotonic_nanos, user_heap_stats,
+    ComponentCache, ComponentNetworkService, ComponentOutputMode, ComponentOutputRoute,
+    ComponentOutputStreamKind, ComponentStoreData, DeadlinePollable, EmbeddedComponent, ExecResult,
+    ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, RawMutex,
+    RawMutexGuardResource, RawMutexResource, RawRwLock, RawRwLockReadGuardResource,
+    RawRwLockResource, RawRwLockWriteGuardResource, SerialPortResource, elapsed_millis,
+    emit_serial_stage_marker, heap_stats, monotonic_nanos, user_heap_stats,
 };
 use helios_hal::cpu::Cpu;
 use helios_hal::serial::ByteSerial;
@@ -108,6 +108,7 @@ pub type StoreData<CpuImpl, HostFs> = ComponentStoreData<
     ResourceTable,
 >;
 pub type OutputMode = ComponentOutputMode;
+pub type OutputRoute = ComponentOutputRoute;
 pub type OutputStreamKind = ComponentOutputStreamKind;
 pub type RuntimeDeadlinePollable<CpuImpl, HostFs> =
     DeadlinePollable<CpuImpl, HostRuntimeState<CpuImpl, HostFs>>;

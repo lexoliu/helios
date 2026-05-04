@@ -35,6 +35,41 @@ pub struct InstanceKilled {
 /// - `Child { … }`: spawned-child path — stdin, stdout, and stderr are
 ///   connected to byte channels the parent controls.
 #[derive(Clone)]
+pub enum ComponentOutputRoute {
+    Serial,
+    Trace,
+    Child(ByteWriter),
+    Discard,
+}
+
+impl ComponentOutputRoute {
+    pub(crate) fn write<CpuImpl, RuntimeStateImpl>(
+        &self,
+        cpu: &CpuImpl,
+        runtime_state: &RuntimeStateImpl,
+        serial_writer: fn(&[u8]),
+        bytes: &[u8],
+    ) where
+        CpuImpl: Cpu + Clone,
+        RuntimeStateImpl: ComponentRuntimeState,
+    {
+        match self {
+            Self::Serial => serial_writer(bytes),
+            Self::Trace => {
+                let text = core::str::from_utf8(bytes).unwrap_or_else(|error| {
+                    panic!("guest attempted to write non-utf8 stdout/stderr bytes: {error}")
+                });
+                runtime_state.record_console_text(cpu.now().ticks(), text);
+            }
+            Self::Child(writer) => {
+                let _: Result<(), ClosedPeer> = writer.write(Bytes::copy_from_slice(bytes));
+            }
+            Self::Discard => {}
+        }
+    }
+}
+
+#[derive(Clone)]
 pub enum ComponentOutputMode {
     Serial,
     Trace,
@@ -42,6 +77,11 @@ pub enum ComponentOutputMode {
         stdin_rx: ByteReader,
         stdout_tx: ByteWriter,
         stderr_tx: ByteWriter,
+    },
+    RoutedChild {
+        stdin_rx: ByteReader,
+        stdout: ComponentOutputRoute,
+        stderr: ComponentOutputRoute,
     },
 }
 
@@ -58,6 +98,20 @@ impl ComponentOutputMode {
             (ComponentOutputMode::Child { stderr_tx, .. }, ComponentOutputStreamKind::Stderr) => {
                 Some(stderr_tx.clone())
             }
+            (
+                ComponentOutputMode::RoutedChild {
+                    stdout: ComponentOutputRoute::Child(writer),
+                    ..
+                },
+                ComponentOutputStreamKind::Stdout,
+            )
+            | (
+                ComponentOutputMode::RoutedChild {
+                    stderr: ComponentOutputRoute::Child(writer),
+                    ..
+                },
+                ComponentOutputStreamKind::Stderr,
+            ) => Some(writer.clone()),
             _ => None,
         }
     }
@@ -65,7 +119,8 @@ impl ComponentOutputMode {
     /// Obtain a reference to the child-stdin reader, when this mode has one.
     pub fn child_stdin(&self) -> Option<&ByteReader> {
         match self {
-            ComponentOutputMode::Child { stdin_rx, .. } => Some(stdin_rx),
+            ComponentOutputMode::Child { stdin_rx, .. }
+            | ComponentOutputMode::RoutedChild { stdin_rx, .. } => Some(stdin_rx),
             _ => None,
         }
     }
@@ -342,6 +397,13 @@ where
                 // suppressed.
                 let _: Result<(), ClosedPeer> = writer.write(Bytes::copy_from_slice(bytes));
             }
+            ComponentOutputMode::RoutedChild { stdout, stderr, .. } => {
+                let route = match stream {
+                    ComponentOutputStreamKind::Stdout => stdout,
+                    ComponentOutputStreamKind::Stderr => stderr,
+                };
+                route.write(&self.cpu, &self.runtime_state, self.serial_writer, bytes);
+            }
         }
     }
 
@@ -353,7 +415,8 @@ where
         match &self.execution_context.output_mode {
             ComponentOutputMode::Serial => (self.serial_reader)(max_bytes),
             ComponentOutputMode::Trace => Vec::new(),
-            ComponentOutputMode::Child { stdin_rx, .. } => match stdin_rx.try_read() {
+            ComponentOutputMode::Child { stdin_rx, .. }
+            | ComponentOutputMode::RoutedChild { stdin_rx, .. } => match stdin_rx.try_read() {
                 TryRead::Ready(mut bytes) => {
                     let cap = max_bytes as usize;
                     if bytes.len() > cap {
@@ -383,7 +446,8 @@ where
                 }
             }
             ComponentOutputMode::Trace => None,
-            ComponentOutputMode::Child { stdin_rx, .. } => {
+            ComponentOutputMode::Child { stdin_rx, .. }
+            | ComponentOutputMode::RoutedChild { stdin_rx, .. } => {
                 stdin_rx.read().await.map(|bytes| bytes.to_vec())
             }
         }

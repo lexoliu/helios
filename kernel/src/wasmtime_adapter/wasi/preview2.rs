@@ -31,7 +31,8 @@ use crate::wasmtime_adapter::component_host::{
 use crate::wasmtime_adapter::store::{ChannelInputStream, ChannelOutputStream, StdioOutputStream};
 use crate::wasmtime_adapter::wasi::map_host_fs_error;
 use crate::{
-    ComponentNetworkService, ComponentOutputMode, ComponentOutputStreamKind, ProfileScope,
+    ComponentNetworkService, ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind,
+    ProfileScope,
 };
 
 #[cfg(test)]
@@ -670,7 +671,8 @@ where
 {
     fn get_stdin(&mut self) -> Result<Resource<DynInputStream>> {
         let stream: DynInputStream = match self.output_mode() {
-            ComponentOutputMode::Child { stdin_rx, .. } => {
+            ComponentOutputMode::Child { stdin_rx, .. }
+            | ComponentOutputMode::RoutedChild { stdin_rx, .. } => {
                 Box::new(ChannelInputStream::new(stdin_rx.clone())) as DynInputStream
             }
             ComponentOutputMode::Serial | ComponentOutputMode::Trace => {
@@ -718,6 +720,21 @@ where
                 .child_writer(kind)
                 .expect("child mode always has stdout/stderr writers");
             StdioOutputStream::Child(ChannelOutputStream::new(writer))
+        }
+        ComponentOutputMode::RoutedChild { stdout, stderr, .. } => {
+            let route = match kind {
+                ComponentOutputStreamKind::Stdout => stdout,
+                ComponentOutputStreamKind::Stderr => stderr,
+            };
+            match route {
+                ComponentOutputRoute::Child(writer) => {
+                    StdioOutputStream::Child(ChannelOutputStream::new(writer.clone()))
+                }
+                ComponentOutputRoute::Serial => StdioOutputStream::Serial(store.serial_writer_fn()),
+                ComponentOutputRoute::Trace | ComponentOutputRoute::Discard => {
+                    StdioOutputStream::Trace
+                }
+            }
         }
         ComponentOutputMode::Serial => StdioOutputStream::Serial(store.serial_writer_fn()),
         ComponentOutputMode::Trace => StdioOutputStream::Trace,

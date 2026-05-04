@@ -13,6 +13,7 @@ use crate::wasmtime_adapter::{
 };
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec;
 use bytes::Bytes;
 use core::future::Future;
@@ -521,57 +522,6 @@ where
 {
     Exit(Result<ChildExit, ProgramExecError>),
     Exec(WasixExecReplacement<CpuImpl, HostFs>),
-}
-
-#[derive(Clone)]
-enum WasixOutputSink<CpuImpl, HostFs>
-where
-    CpuImpl: Cpu + Clone,
-    HostFs: crate::HostFileSystem,
-{
-    Serial(fn(&[u8])),
-    Trace {
-        cpu: CpuImpl,
-        runtime_state: HostRuntimeState<CpuImpl, HostFs>,
-    },
-    Child {
-        stdout_tx: crate::ByteWriter,
-        stderr_tx: crate::ByteWriter,
-    },
-    Discard,
-}
-
-impl<CpuImpl, HostFs> WasixOutputSink<CpuImpl, HostFs>
-where
-    CpuImpl: Cpu + Clone,
-    HostFs: crate::HostFileSystem,
-{
-    fn write(&self, stream: crate::ComponentOutputStreamKind, bytes: impl Into<Bytes>) {
-        let bytes = bytes.into();
-        if bytes.is_empty() {
-            return;
-        }
-        match self {
-            Self::Serial(write_serial) => write_serial(&bytes),
-            Self::Trace { cpu, runtime_state } => {
-                let text = core::str::from_utf8(&bytes).unwrap_or_else(|error| {
-                    panic!("WASIX child wrote non-utf8 stdout/stderr bytes: {error}")
-                });
-                runtime_state.record_console_text(cpu.now().ticks(), text);
-            }
-            Self::Child {
-                stdout_tx,
-                stderr_tx,
-            } => {
-                let writer = match stream {
-                    crate::ComponentOutputStreamKind::Stdout => stdout_tx,
-                    crate::ComponentOutputStreamKind::Stderr => stderr_tx,
-                };
-                let _ = writer.write(bytes);
-            }
-            Self::Discard => {}
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -1341,6 +1291,30 @@ fn record_program_kernel_profile<CpuImpl, HostFs>(
     }
 }
 
+fn record_named_program_kernel_profile<CpuImpl, HostFs>(
+    runtime_state: &HostRuntimeState<CpuImpl, HostFs>,
+    cpu: &CpuImpl,
+    phase: &'static str,
+    name: &str,
+    started_ticks: u64,
+) where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    if runtime_state.profiling_enabled() {
+        let mut stack = String::with_capacity("kernel;program;;".len() + phase.len() + name.len());
+        stack.push_str("kernel;program;");
+        stack.push_str(phase);
+        stack.push(';');
+        stack.push_str(name);
+        runtime_state.record_profile_stack_str(
+            ProfileScope::Kernel,
+            &stack,
+            cpu.now().ticks().saturating_sub(started_ticks),
+        );
+    }
+}
+
 impl<CpuImpl, HostFs> UserProgramService<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
@@ -1409,7 +1383,45 @@ where
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn spawn_with_descriptors(
+    async fn spawn_with_signal_dispositions_and_output_mode(
+        &self,
+        exec_context: ProgramExecContext<CpuImpl, HostFs>,
+        name: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        source: ProgramSource,
+        hint: Option<AotCompileHint>,
+        authority: ProcessAuthority,
+        filesystem: Option<DebugFileSystemSnapshot>,
+        signal_dispositions: Vec<WasixSignalDisposition>,
+        output_mode: OutputMode,
+        stdin: Option<crate::ByteWriter>,
+        stdout: Option<crate::ByteReader>,
+        stderr: Option<crate::ByteReader>,
+    ) -> Result<ChildHandle, ProgramExecError> {
+        super::emit_program_stage_marker(exec_context.write_serial, "program:spawn-begin");
+        let executable = self
+            .load_executable(&exec_context, &source, hint, exec_context.write_serial)
+            .await?;
+        self.spawn_loaded_with_output_mode(
+            exec_context,
+            name,
+            args,
+            env,
+            executable,
+            authority,
+            filesystem,
+            None,
+            signal_dispositions,
+            output_mode,
+            stdin,
+            stdout,
+            stderr,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_with_descriptors_and_output_mode(
         &self,
         exec_context: ProgramExecContext<CpuImpl, HostFs>,
         name: String,
@@ -1421,6 +1433,10 @@ where
         filesystem: Option<DebugFileSystemSnapshot>,
         descriptors: Preview1DescriptorTable,
         signal_dispositions: Vec<WasixSignalDisposition>,
+        output_mode: OutputMode,
+        stdin: Option<crate::ByteWriter>,
+        stdout: Option<crate::ByteReader>,
+        stderr: Option<crate::ByteReader>,
     ) -> Result<ChildHandle, ProgramExecError> {
         super::emit_program_stage_marker(exec_context.write_serial, "program:spawn-begin");
         let executable = self
@@ -1432,7 +1448,7 @@ where
                 Some(descriptors)
             }
         };
-        self.spawn_loaded(
+        self.spawn_loaded_with_output_mode(
             exec_context,
             name,
             args,
@@ -1442,11 +1458,52 @@ where
             filesystem,
             descriptors,
             signal_dispositions,
+            output_mode,
+            stdin,
+            stdout,
+            stderr,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     fn spawn_loaded(
+        &self,
+        exec_context: ProgramExecContext<CpuImpl, HostFs>,
+        name: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        executable: ProgramExecutable<CpuImpl, HostFs>,
+        authority: ProcessAuthority,
+        filesystem: Option<DebugFileSystemSnapshot>,
+        descriptors: Option<Preview1DescriptorTable>,
+        signal_dispositions: Vec<WasixSignalDisposition>,
+    ) -> Result<ChildHandle, ProgramExecError> {
+        let (stdin_writer, stdin_reader) = crate::byte_channel();
+        let (stdout_writer, stdout_reader) = crate::byte_channel();
+        let (stderr_writer, stderr_reader) = crate::byte_channel();
+        self.spawn_loaded_with_output_mode(
+            exec_context,
+            name,
+            args,
+            env,
+            executable,
+            authority,
+            filesystem,
+            descriptors,
+            signal_dispositions,
+            OutputMode::Child {
+                stdin_rx: stdin_reader,
+                stdout_tx: stdout_writer,
+                stderr_tx: stderr_writer,
+            },
+            Some(stdin_writer),
+            Some(stdout_reader),
+            Some(stderr_reader),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_loaded_with_output_mode(
         &self,
         exec_context: ProgramExecContext<CpuImpl, HostFs>,
         name: String,
@@ -1457,14 +1514,11 @@ where
         filesystem: Option<DebugFileSystemSnapshot>,
         descriptors: Option<Preview1DescriptorTable>,
         signal_dispositions: Vec<WasixSignalDisposition>,
+        output_mode: OutputMode,
+        stdin: Option<crate::ByteWriter>,
+        stdout: Option<crate::ByteReader>,
+        stderr: Option<crate::ByteReader>,
     ) -> Result<ChildHandle, ProgramExecError> {
-        // Three byte channels between parent and child.
-        let (stdin_writer, stdin_reader) = crate::byte_channel();
-        let (stdout_writer, stdout_reader) = crate::byte_channel();
-        let (stderr_writer, stderr_reader) = crate::byte_channel();
-
-        // Register the child instance synchronously on the parent
-        // thread so we can return its id in the handle immediately.
         let started_at = exec_context
             .runtime_state
             .uptime_nanos(exec_context.cpu.now().ticks());
@@ -1518,9 +1572,7 @@ where
                 preview1_core_linker,
                 shared_memory_pool,
                 launched_instance,
-                stdin_reader,
-                stdout_writer,
-                stderr_writer,
+                output_mode,
             )
             .await;
             let _ = exit_tx.send(result);
@@ -1529,9 +1581,9 @@ where
         let child = ChildHandle {
             instance_id,
             signal_state,
-            stdin: Some(stdin_writer),
-            stdout: Some(stdout_reader),
-            stderr: Some(stderr_reader),
+            stdin,
+            stdout,
+            stderr,
             exit: Some(exit_rx),
         };
         Ok(child)
@@ -2525,23 +2577,31 @@ where
                 };
                 let _ = writer.write(Bytes::copy_from_slice(bytes));
             }
+            OutputMode::RoutedChild { stdout, stderr, .. } => {
+                let route = match stream {
+                    crate::ComponentOutputStreamKind::Stdout => stdout,
+                    crate::ComponentOutputStreamKind::Stderr => stderr,
+                };
+                route.write(&self.cpu, &self.runtime_state, self.write_serial, bytes);
+            }
         }
     }
 
-    fn output_sink(&self) -> WasixOutputSink<CpuImpl, HostFs> {
+    fn output_route(&self, stream: crate::ComponentOutputStreamKind) -> OutputRoute {
         match &self.output_mode {
-            OutputMode::Serial => WasixOutputSink::Serial(self.write_serial),
-            OutputMode::Trace => WasixOutputSink::Trace {
-                cpu: self.cpu.clone(),
-                runtime_state: self.runtime_state.clone(),
-            },
+            OutputMode::Serial => OutputRoute::Serial,
+            OutputMode::Trace => OutputRoute::Trace,
             OutputMode::Child {
                 stdout_tx,
                 stderr_tx,
                 ..
-            } => WasixOutputSink::Child {
-                stdout_tx: stdout_tx.clone(),
-                stderr_tx: stderr_tx.clone(),
+            } => match stream {
+                crate::ComponentOutputStreamKind::Stdout => OutputRoute::Child(stdout_tx.clone()),
+                crate::ComponentOutputStreamKind::Stderr => OutputRoute::Child(stderr_tx.clone()),
+            },
+            OutputMode::RoutedChild { stdout, stderr, .. } => match stream {
+                crate::ComponentOutputStreamKind::Stdout => stdout.clone(),
+                crate::ComponentOutputStreamKind::Stderr => stderr.clone(),
             },
         }
     }
@@ -2664,7 +2724,7 @@ where
                     crate::yield_now().await;
                 },
                 OutputMode::Trace => {}
-                OutputMode::Child { stdin_rx, .. } => {
+                OutputMode::Child { stdin_rx, .. } | OutputMode::RoutedChild { stdin_rx, .. } => {
                     if let Some(bytes) = stdin_rx.read().await {
                         *carry = bytes;
                     }
@@ -4765,9 +4825,7 @@ async fn run_program_executable<CpuImpl, HostFs>(
     preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
     shared_memory_pool: Arc<Mutex<SharedMemoryPool>>,
     launched_instance: crate::RegisteredInstance,
-    stdin_reader: crate::ByteReader,
-    stdout_writer: crate::ByteWriter,
-    stderr_writer: crate::ByteWriter,
+    output_mode: OutputMode,
 ) -> Result<ChildExit, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
@@ -4789,9 +4847,7 @@ where
                 engine,
                 runtime,
                 launched_instance,
-                stdin_reader,
-                stdout_writer,
-                stderr_writer,
+                output_mode,
             )
             .await
         }
@@ -4814,9 +4870,7 @@ where
                 preview1_core_linker,
                 shared_memory_pool,
                 launched_instance,
-                stdin_reader,
-                stdout_writer,
-                stderr_writer,
+                output_mode,
             )
             .await
         }
@@ -4838,9 +4892,7 @@ where
                 preview1_core_linker,
                 shared_memory_pool,
                 launched_instance,
-                stdin_reader,
-                stdout_writer,
-                stderr_writer,
+                output_mode,
             )
             .await
         }
@@ -4866,14 +4918,13 @@ async fn run_program_core_module<CpuImpl, HostFs>(
     preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
     shared_memory_pool: Arc<Mutex<SharedMemoryPool>>,
     launched_instance: crate::RegisteredInstance,
-    stdin_reader: crate::ByteReader,
-    stdout_writer: crate::ByteWriter,
-    stderr_writer: crate::ByteWriter,
+    output_mode: OutputMode,
 ) -> Result<ChildExit, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
+    let profile_name = name.clone();
     let mut argv = Vec::with_capacity(args.len() + 1);
     argv.push(name);
     argv.extend(args);
@@ -4885,9 +4936,7 @@ where
     let instance_id = launched_instance.id();
     let replacement_exec_context = exec_context.clone();
     let replacement_instance = launched_instance.clone();
-    let replacement_stdin = stdin_reader.clone();
-    let replacement_stdout = stdout_writer.clone();
-    let replacement_stderr = stderr_writer.clone();
+    let replacement_output_mode = output_mode.clone();
     let replacement_core_linker = preview1_core_linker.clone();
     let imported_memory_spec = imported_shared_memory_spec_with_user_budget(&compiled.module)?;
     let imported_memory = match imported_memory_spec {
@@ -4909,11 +4958,7 @@ where
                 argv,
                 env,
                 authority,
-                OutputMode::Child {
-                    stdin_rx: stdin_reader,
-                    stdout_tx: stdout_writer,
-                    stderr_tx: stderr_writer,
-                },
+                output_mode,
                 exec_context.read_serial,
                 exec_context.write_serial,
                 imported_memory.clone(),
@@ -4938,6 +4983,13 @@ where
         );
         let instantiate_started = profile_cpu.now().ticks();
         let instance = linker.instantiate_async(&mut store, &compiled.module).await;
+        record_named_program_kernel_profile(
+            &profile_runtime_state,
+            &profile_cpu,
+            "instantiate-core",
+            &profile_name,
+            instantiate_started,
+        );
         record_program_kernel_profile(
             &profile_runtime_state,
             &profile_cpu,
@@ -4974,6 +5026,13 @@ where
             }
             break result;
         };
+        record_named_program_kernel_profile(
+            &profile_runtime_state,
+            &profile_cpu,
+            "run-core",
+            &profile_name,
+            run_phase_started,
+        );
         record_program_kernel_profile(
             &profile_runtime_state,
             &profile_cpu,
@@ -5033,9 +5092,7 @@ where
                 replacement_core_linker,
                 shared_memory_pool,
                 replacement_instance,
-                replacement_stdin,
-                replacement_stdout,
-                replacement_stderr,
+                replacement_output_mode,
             ))
             .await
         }
@@ -5060,14 +5117,13 @@ async fn run_program_core_module_with_restore<CpuImpl, HostFs>(
     preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
     shared_memory_pool: Arc<Mutex<SharedMemoryPool>>,
     launched_instance: crate::RegisteredInstance,
-    stdin_reader: crate::ByteReader,
-    stdout_writer: crate::ByteWriter,
-    stderr_writer: crate::ByteWriter,
+    output_mode: OutputMode,
 ) -> Result<ChildExit, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
+    let profile_name = name.clone();
     let mut argv = Vec::with_capacity(args.len() + 1);
     argv.push(name);
     argv.extend(args);
@@ -5079,9 +5135,7 @@ where
     let instance_id = launched_instance.id();
     let replacement_exec_context = exec_context.clone();
     let replacement_instance = launched_instance.clone();
-    let replacement_stdin = stdin_reader.clone();
-    let replacement_stdout = stdout_writer.clone();
-    let replacement_stderr = stderr_writer.clone();
+    let replacement_output_mode = output_mode.clone();
     let replacement_core_linker = preview1_core_linker.clone();
     let imported_memory = Some(restore.memory.clone());
     let recycle_memory = restore.memory.clone();
@@ -5100,11 +5154,7 @@ where
                 argv,
                 env,
                 authority,
-                OutputMode::Child {
-                    stdin_rx: stdin_reader,
-                    stdout_tx: stdout_writer,
-                    stderr_tx: stderr_writer,
-                },
+                output_mode,
                 exec_context.read_serial,
                 exec_context.write_serial,
                 imported_memory.clone(),
@@ -5132,6 +5182,13 @@ where
         );
         let instantiate_started = profile_cpu.now().ticks();
         let instance = linker.instantiate_async(&mut store, &compiled.module).await;
+        record_named_program_kernel_profile(
+            &profile_runtime_state,
+            &profile_cpu,
+            "instantiate-core-rewind",
+            &profile_name,
+            instantiate_started,
+        );
         record_program_kernel_profile(
             &profile_runtime_state,
             &profile_cpu,
@@ -5180,6 +5237,13 @@ where
             }
             break result;
         };
+        record_named_program_kernel_profile(
+            &profile_runtime_state,
+            &profile_cpu,
+            "run-core-rewind",
+            &profile_name,
+            run_phase_started,
+        );
         record_program_kernel_profile(
             &profile_runtime_state,
             &profile_cpu,
@@ -5239,9 +5303,7 @@ where
                 replacement_core_linker,
                 shared_memory_pool,
                 replacement_instance,
-                replacement_stdin,
-                replacement_stdout,
-                replacement_stderr,
+                replacement_output_mode,
             ))
             .await
         }
@@ -5263,9 +5325,7 @@ async fn run_program_component<CpuImpl, HostFs>(
     engine: &crate::wasmtime_adapter::WasmtimeEngine,
     _runtime: &crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
     launched_instance: crate::RegisteredInstance,
-    stdin_reader: crate::ByteReader,
-    stdout_writer: crate::ByteWriter,
-    stderr_writer: crate::ByteWriter,
+    output_mode: OutputMode,
 ) -> Result<ChildExit, ProgramExecError>
 where
     CpuImpl: Cpu + Clone,
@@ -5305,11 +5365,7 @@ where
             argv,
             env,
             authority,
-            OutputMode::Child {
-                stdin_rx: stdin_reader,
-                stdout_tx: stdout_writer,
-                stderr_tx: stderr_writer,
-            },
+            output_mode,
             exec_context.read_serial,
             exec_context.write_serial,
         ),
@@ -5916,7 +5972,17 @@ where
     let args = argv.into_iter().skip(1).collect();
     let mut environment = store.data().environment.clone();
     environment.retain(|(name, _)| name.as_str() != HELIOS_PROCESS_ID_ENV);
-    let child = service.spawn_loaded(
+    let (_, stdin_reader) = crate::byte_channel();
+    let output_mode = OutputMode::RoutedChild {
+        stdin_rx: stdin_reader,
+        stdout: store
+            .data()
+            .output_route(crate::ComponentOutputStreamKind::Stdout),
+        stderr: store
+            .data()
+            .output_route(crate::ComponentOutputStreamKind::Stderr),
+    };
+    let mut child = service.spawn_loaded_with_output_mode(
         store.data().exec_context(),
         name,
         args,
@@ -5926,39 +5992,20 @@ where
         Some(store.data().filesystem.snapshot()),
         None,
         Vec::new(),
+        output_mode,
+        None,
+        None,
+        None,
     )?;
     let pid = u32::try_from(child.instance_id.raw()).map_err(|_| ProgramExecError {
         kind: ProgramExecErrorKind::Internal,
         detail: ProgramExecErrorDetail::InternalInvariant,
     })?;
-    let mut child = child;
-    drop(child.take_stdin());
-    let stdout = child.take_stdout();
-    let stderr = child.take_stderr();
     let child_signal_state = child.signal_state();
-    let stdout_sink = store.data().output_sink();
-    let stderr_sink = store.data().output_sink();
-    let (exit_tx, exit) = futures::channel::oneshot::channel();
-    store.data().spawner.spawn_detached(async move {
-        let stdout_task = async move {
-            if let Some(reader) = stdout {
-                while let Some(bytes) = reader.read().await {
-                    stdout_sink.write(crate::ComponentOutputStreamKind::Stdout, bytes);
-                }
-            }
-        };
-        let stderr_task = async move {
-            if let Some(reader) = stderr {
-                while let Some(bytes) = reader.read().await {
-                    stderr_sink.write(crate::ComponentOutputStreamKind::Stderr, bytes);
-                }
-            }
-        };
-        let wait_task = child.wait();
-        let (_, (_, exit)) =
-            futures::future::join(stdout_task, futures::future::join(stderr_task, wait_task)).await;
-        let _ = exit_tx.send(exit);
-    });
+    let exit = child.take_wait().ok_or(ProgramExecError {
+        kind: ProgramExecErrorKind::Internal,
+        detail: ProgramExecErrorDetail::ChildExitAlreadyConsumed,
+    })?;
     store.data_mut().insert_child(pid, child_signal_state, exit);
     Ok(pid)
 }
@@ -7627,6 +7674,32 @@ fn p1_record_kernel_profile<CpuImpl, HostFs>(
             syscall,
             store.cpu.now().ticks().saturating_sub(started_ticks),
         );
+    }
+}
+
+fn p1_kernel_profile_start<CpuImpl, HostFs>(
+    store: &Preview1ProgramStore<CpuImpl, HostFs>,
+) -> Option<u64>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    store
+        .runtime_state
+        .profiling_enabled()
+        .then(|| store.cpu.now().ticks())
+}
+
+fn p1_record_optional_kernel_profile<CpuImpl, HostFs>(
+    store: &Preview1ProgramStore<CpuImpl, HostFs>,
+    syscall: &'static str,
+    started_ticks: Option<u64>,
+) where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    if let Some(started_ticks) = started_ticks {
+        p1_record_kernel_profile(store, syscall, started_ticks);
     }
 }
 
@@ -10495,6 +10568,49 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
+    let started = p1_kernel_profile_start(caller.data());
+    let result = wasix_proc_spawn_inner(
+        caller,
+        name,
+        name_len,
+        chroot,
+        args,
+        args_len,
+        preopen,
+        preopen_len,
+        stdin,
+        stdout,
+        stderr,
+        working_dir,
+        working_dir_len,
+        ret_handles,
+    )
+    .await;
+    p1_record_optional_kernel_profile(caller.data(), "proc_spawn", started);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wasix_proc_spawn_inner<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    name: u32,
+    name_len: u32,
+    chroot: i32,
+    args: u32,
+    args_len: u32,
+    preopen: u32,
+    preopen_len: u32,
+    stdin: i32,
+    stdout: i32,
+    stderr: i32,
+    working_dir: u32,
+    working_dir_len: u32,
+    ret_handles: u32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
     let status = caller.data().require_spawn_authority();
     if status != p1::errno::SUCCESS {
         return status;
@@ -10745,6 +10861,51 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
+    let started = p1_kernel_profile_start(caller.data());
+    let result = wasix_proc_spawn2_inner(
+        caller,
+        name,
+        name_len,
+        args,
+        args_len,
+        env,
+        env_len,
+        fd_ops,
+        fd_ops_len,
+        signals,
+        signals_len,
+        search_path,
+        path,
+        path_len,
+        ret_pid,
+    )
+    .await;
+    p1_record_optional_kernel_profile(caller.data(), "proc_spawn2", started);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wasix_proc_spawn2_inner<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    name: u32,
+    name_len: u32,
+    args: u32,
+    args_len: u32,
+    env: u32,
+    env_len: u32,
+    fd_ops: u32,
+    fd_ops_len: u32,
+    signals: u32,
+    signals_len: u32,
+    search_path: i32,
+    path: u32,
+    path_len: u32,
+    ret_pid: u32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
     let status = caller.data().require_spawn_authority();
     if status != p1::errno::SUCCESS {
         return status;
@@ -10814,6 +10975,22 @@ where
 }
 
 async fn wasix_proc_join<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    pid: u32,
+    flags: u32,
+    ret_status: u32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let started = p1_kernel_profile_start(caller.data());
+    let result = wasix_proc_join_inner(caller, pid, flags, ret_status).await;
+    p1_record_optional_kernel_profile(caller.data(), "proc_join", started);
+    result
+}
+
+async fn wasix_proc_join_inner<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     pid: u32,
     flags: u32,
@@ -10971,6 +11148,13 @@ struct WasixSpawnResult {
     stderr_fd: Option<u32>,
 }
 
+struct WasixSpawnPreparedIo {
+    output_mode: OutputMode,
+    stdin_writer: Option<crate::ByteWriter>,
+    stdout_reader: Option<crate::ByteReader>,
+    stderr_reader: Option<crate::ByteReader>,
+}
+
 impl WasixSpawnIo {
     const fn inherit() -> Self {
         Self {
@@ -10986,6 +11170,71 @@ impl WasixSpawnIo {
             stdout: WasixStdioMode::from_raw(stdout),
             stderr: WasixStdioMode::from_raw(stderr),
         }
+    }
+}
+
+fn wasix_prepare_child_io<CpuImpl, HostFs>(
+    store: &Preview1ProgramStore<CpuImpl, HostFs>,
+    io: WasixSpawnIo,
+) -> Result<WasixSpawnPreparedIo, i32>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    if matches!(
+        (io.stdin, io.stdout, io.stderr),
+        (WasixStdioMode::Invalid, _, _)
+            | (_, WasixStdioMode::Invalid, _)
+            | (_, _, WasixStdioMode::Invalid)
+    ) {
+        return Err(p1::errno::INVAL);
+    }
+
+    let (stdin_writer, stdin_reader) = crate::byte_channel();
+    let stdin_writer = match io.stdin {
+        WasixStdioMode::Piped => Some(stdin_writer),
+        WasixStdioMode::Inherit | WasixStdioMode::Null | WasixStdioMode::Log => None,
+        WasixStdioMode::Invalid => unreachable!("invalid stdio mode already rejected"),
+    };
+    let (stdout, stdout_reader) = wasix_prepare_child_output_route(
+        store,
+        io.stdout,
+        crate::ComponentOutputStreamKind::Stdout,
+    )?;
+    let (stderr, stderr_reader) = wasix_prepare_child_output_route(
+        store,
+        io.stderr,
+        crate::ComponentOutputStreamKind::Stderr,
+    )?;
+    Ok(WasixSpawnPreparedIo {
+        output_mode: OutputMode::RoutedChild {
+            stdin_rx: stdin_reader,
+            stdout,
+            stderr,
+        },
+        stdin_writer,
+        stdout_reader,
+        stderr_reader,
+    })
+}
+
+fn wasix_prepare_child_output_route<CpuImpl, HostFs>(
+    store: &Preview1ProgramStore<CpuImpl, HostFs>,
+    mode: WasixStdioMode,
+    stream: crate::ComponentOutputStreamKind,
+) -> Result<(OutputRoute, Option<crate::ByteReader>), i32>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    match mode {
+        WasixStdioMode::Piped => {
+            let (writer, reader) = crate::byte_channel();
+            Ok((OutputRoute::Child(writer), Some(reader)))
+        }
+        WasixStdioMode::Inherit | WasixStdioMode::Log => Ok((store.output_route(stream), None)),
+        WasixStdioMode::Null => Ok((OutputRoute::Discard, None)),
+        WasixStdioMode::Invalid => Err(p1::errno::INVAL),
     }
 }
 
@@ -11682,14 +11931,7 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    if matches!(
-        (io.stdin, io.stdout, io.stderr),
-        (WasixStdioMode::Invalid, _, _)
-            | (_, WasixStdioMode::Invalid, _)
-            | (_, _, WasixStdioMode::Invalid)
-    ) {
-        return Err(p1::errno::INVAL);
-    }
+    let prepared_io = wasix_prepare_child_io(caller.data(), io)?;
     if argv
         .first()
         .is_some_and(|arg| arg == &prepared.guest_name || arg == &prepared.source_path)
@@ -11703,9 +11945,10 @@ where
     let exec_context = caller.data().exec_context();
     let authority = authority.unwrap_or_else(|| caller.data().authority.clone());
     let filesystem = Some(caller.data().filesystem.snapshot());
+    let launch_started = p1_kernel_profile_start(caller.data());
     let mut child = if let Some(descriptors) = descriptors {
         service
-            .spawn_with_descriptors(
+            .spawn_with_descriptors_and_output_mode(
                 exec_context,
                 prepared.guest_name,
                 argv,
@@ -11716,11 +11959,15 @@ where
                 filesystem,
                 descriptors,
                 signal_dispositions,
+                prepared_io.output_mode,
+                prepared_io.stdin_writer,
+                prepared_io.stdout_reader,
+                prepared_io.stderr_reader,
             )
             .await
     } else {
         service
-            .spawn_with_signal_dispositions(
+            .spawn_with_signal_dispositions_and_output_mode(
                 exec_context,
                 prepared.guest_name,
                 argv,
@@ -11730,24 +11977,23 @@ where
                 authority,
                 filesystem,
                 signal_dispositions,
+                prepared_io.output_mode,
+                prepared_io.stdin_writer,
+                prepared_io.stdout_reader,
+                prepared_io.stderr_reader,
             )
             .await
     }
     .map_err(|error| p1_errno_from_program_exec_error(&error))?;
+    p1_record_optional_kernel_profile(caller.data(), "proc_spawn_child_launch", launch_started);
     let pid = u32::try_from(child.instance_id.raw()).map_err(|_| p1::errno::OVERFLOW)?;
-    let stdin_fd = wasix_configure_child_stdin(caller, &mut child, io.stdin)?;
-    let stdout_fd = wasix_configure_child_output(
-        caller,
-        &mut child,
-        io.stdout,
-        crate::ComponentOutputStreamKind::Stdout,
-    )?;
-    let stderr_fd = wasix_configure_child_output(
-        caller,
-        &mut child,
-        io.stderr,
-        crate::ComponentOutputStreamKind::Stderr,
-    )?;
+    let configure_started = p1_kernel_profile_start(caller.data());
+    let stdin_fd = wasix_insert_child_stdin(caller, &mut child)?;
+    let stdout_fd =
+        wasix_insert_child_output(caller, &mut child, crate::ComponentOutputStreamKind::Stdout)?;
+    let stderr_fd =
+        wasix_insert_child_output(caller, &mut child, crate::ComponentOutputStreamKind::Stderr)?;
+    p1_record_optional_kernel_profile(caller.data(), "proc_spawn_configure_io", configure_started);
     let exit = child.take_wait().ok_or(p1::errno::IO)?;
     caller
         .data_mut()
@@ -11760,36 +12006,27 @@ where
     })
 }
 
-fn wasix_configure_child_stdin<CpuImpl, HostFs>(
+fn wasix_insert_child_stdin<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     child: &mut ChildHandle,
-    mode: WasixStdioMode,
 ) -> Result<Option<u32>, i32>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    match mode {
-        WasixStdioMode::Piped => {
-            let writer = child.take_stdin().ok_or(p1::errno::IO)?;
-            caller
-                .data_mut()
-                .descriptors
-                .insert(Preview1Descriptor::PipeWrite { writer })
-                .map(Some)
-        }
-        WasixStdioMode::Inherit | WasixStdioMode::Null | WasixStdioMode::Log => {
-            drop(child.take_stdin());
-            Ok(None)
-        }
-        WasixStdioMode::Invalid => Err(p1::errno::INVAL),
-    }
+    let Some(writer) = child.take_stdin() else {
+        return Ok(None);
+    };
+    caller
+        .data_mut()
+        .descriptors
+        .insert(Preview1Descriptor::PipeWrite { writer })
+        .map(Some)
 }
 
-fn wasix_configure_child_output<CpuImpl, HostFs>(
+fn wasix_insert_child_output<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     child: &mut ChildHandle,
-    mode: WasixStdioMode,
     stream: crate::ComponentOutputStreamKind,
 ) -> Result<Option<u32>, i32>
 where
@@ -11799,49 +12036,18 @@ where
     let reader = match stream {
         crate::ComponentOutputStreamKind::Stdout => child.take_stdout(),
         crate::ComponentOutputStreamKind::Stderr => child.take_stderr(),
-    }
-    .ok_or(p1::errno::IO)?;
-    match mode {
-        WasixStdioMode::Piped => caller
-            .data_mut()
-            .descriptors
-            .insert(Preview1Descriptor::PipeRead {
-                reader,
-                carry: Bytes::new(),
-            })
-            .map(Some),
-        WasixStdioMode::Inherit | WasixStdioMode::Log => {
-            let sink = caller.data().output_sink();
-            wasix_spawn_output_drain(&caller.data().spawner, reader, sink, stream);
-            Ok(None)
-        }
-        WasixStdioMode::Null => {
-            wasix_spawn_output_drain(
-                &caller.data().spawner,
-                reader,
-                WasixOutputSink::<CpuImpl, HostFs>::Discard,
-                stream,
-            );
-            Ok(None)
-        }
-        WasixStdioMode::Invalid => Err(p1::errno::INVAL),
-    }
-}
-
-fn wasix_spawn_output_drain<CpuImpl, HostFs>(
-    spawner: &crate::Spawner<CpuImpl>,
-    reader: crate::ByteReader,
-    sink: WasixOutputSink<CpuImpl, HostFs>,
-    stream: crate::ComponentOutputStreamKind,
-) where
-    CpuImpl: Cpu + Clone,
-    HostFs: crate::HostFileSystem,
-{
-    spawner.spawn_detached(async move {
-        while let Some(bytes) = reader.read().await {
-            sink.write(stream, bytes);
-        }
-    });
+    };
+    let Some(reader) = reader else {
+        return Ok(None);
+    };
+    caller
+        .data_mut()
+        .descriptors
+        .insert(Preview1Descriptor::PipeRead {
+            reader,
+            carry: Bytes::new(),
+        })
+        .map(Some)
 }
 
 fn wasix_write_process_handles<CpuImpl, HostFs>(
