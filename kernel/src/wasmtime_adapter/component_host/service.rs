@@ -13925,6 +13925,27 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
+    let started = caller
+        .data()
+        .runtime_state
+        .profiling_enabled()
+        .then(|| caller.data().cpu.now().ticks());
+    let result = wasix_sock_connect_inner(caller, fd, addr).await;
+    if let Some(started) = started {
+        p1_record_kernel_profile(caller.data(), "wasix_sock_connect", started);
+    }
+    result
+}
+
+async fn wasix_sock_connect_inner<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    fd: i32,
+    addr: u32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
@@ -13991,6 +14012,35 @@ where
 }
 
 async fn wasix_sock_recv_from<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    fd: i32,
+    iovs: u32,
+    iovs_len: u32,
+    flags: u16,
+    ret_size: u32,
+    ret_flags: u32,
+    ret_addr: u32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let started = caller
+        .data()
+        .runtime_state
+        .profiling_enabled()
+        .then(|| caller.data().cpu.now().ticks());
+    let result = wasix_sock_recv_from_inner(
+        caller, fd, iovs, iovs_len, flags, ret_size, ret_flags, ret_addr,
+    )
+    .await;
+    if let Some(started) = started {
+        p1_record_kernel_profile(caller.data(), "wasix_sock_recv_from", started);
+    }
+    result
+}
+
+async fn wasix_sock_recv_from_inner<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     iovs: u32,
@@ -14116,6 +14166,31 @@ where
 }
 
 async fn wasix_sock_send_to<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    fd: i32,
+    iovs: u32,
+    iovs_len: u32,
+    _flags: u16,
+    addr: u32,
+    ret_size: u32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let started = caller
+        .data()
+        .runtime_state
+        .profiling_enabled()
+        .then(|| caller.data().cpu.now().ticks());
+    let result = wasix_sock_send_to_inner(caller, fd, iovs, iovs_len, _flags, addr, ret_size).await;
+    if let Some(started) = started {
+        p1_record_kernel_profile(caller.data(), "wasix_sock_send_to", started);
+    }
+    result
+}
+
+async fn wasix_sock_send_to_inner<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     iovs: u32,
@@ -15167,6 +15242,40 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
+    let started = caller
+        .data()
+        .runtime_state
+        .profiling_enabled()
+        .then(|| caller.data().cpu.now().ticks());
+    let result = p1_sock_recv_inner(
+        caller,
+        fd,
+        ri_data,
+        ri_data_len,
+        _ri_flags,
+        ro_datalen,
+        ro_flags,
+    )
+    .await;
+    if let Some(started) = started {
+        p1_record_kernel_profile(caller.data(), "sock_recv", started);
+    }
+    result
+}
+
+async fn p1_sock_recv_inner<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    fd: i32,
+    ri_data: u32,
+    ri_data_len: u32,
+    _ri_flags: u16,
+    ro_datalen: u32,
+    ro_flags: u32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
@@ -15256,6 +15365,30 @@ where
 }
 
 async fn p1_sock_send<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    fd: i32,
+    si_data: u32,
+    si_data_len: u32,
+    _si_flags: u16,
+    so_datalen: u32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let started = caller
+        .data()
+        .runtime_state
+        .profiling_enabled()
+        .then(|| caller.data().cpu.now().ticks());
+    let result = p1_sock_send_inner(caller, fd, si_data, si_data_len, _si_flags, so_datalen).await;
+    if let Some(started) = started {
+        p1_record_kernel_profile(caller.data(), "sock_send", started);
+    }
+    result
+}
+
+async fn p1_sock_send_inner<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     si_data: u32,

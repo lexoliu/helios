@@ -29,8 +29,8 @@ This script:
    `saghul/quickjs` `0.0.3`, and `wasmer/coreutils` `1.0.19`;
    validates their raw wasm atoms with `wasm-tools`; and records
    checksum plus `SOURCE.txt` provenance files under `artifacts/wasix/`.
-5. Builds the helios `curl-wasi` program from source into
-   `artifacts/wasi-tools/`.
+5. Builds the helios `curl-wasi` program from source with the optimized
+   release profile into `artifacts/wasi-tools/`.
 6. Builds the Helios WASIX conformance WAT modules for thread/futex and
    stack continuation execution into `artifacts/wasix/`.
 

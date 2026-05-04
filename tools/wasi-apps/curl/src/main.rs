@@ -1,8 +1,8 @@
 use std::io::{self, Write};
 
 use helios_api::net::TcpStream;
+use http::Uri;
 use thiserror::Error;
-use url::Url;
 
 type Result<T> = core::result::Result<T, CurlError>;
 
@@ -14,14 +14,12 @@ enum CurlError {
     InvalidUrl {
         raw: String,
         #[source]
-        source: url::ParseError,
+        source: http::uri::InvalidUri,
     },
     #[error("only http:// is supported")]
     UnsupportedScheme,
     #[error("URL must include a host")]
     MissingHost,
-    #[error("URL must include a port")]
-    MissingPort,
     #[error("tcp connect failed for {host}:{port}: {source}")]
     TcpConnect {
         host: String,
@@ -57,8 +55,12 @@ fn split_headers(response: &[u8]) -> Option<(&[u8], &[u8])> {
 }
 
 fn chunked_transfer(headers: &[u8]) -> bool {
-    let lower = String::from_utf8_lossy(headers).to_ascii_lowercase();
-    lower.contains("transfer-encoding: chunked")
+    headers.windows(b"transfer-encoding: chunked".len()).any(|window| {
+        window
+            .iter()
+            .zip(b"transfer-encoding: chunked")
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+    })
 }
 
 fn decode_chunked(mut body: &[u8]) -> Result<Vec<u8>> {
@@ -99,23 +101,18 @@ fn decode_chunked(mut body: &[u8]) -> Result<Vec<u8>> {
 
 async fn run() -> Result<()> {
     let raw = std::env::args().nth(1).ok_or(CurlError::Usage)?;
-    let url = Url::parse(&raw).map_err(|source| CurlError::InvalidUrl {
+    let uri: Uri = raw.parse().map_err(|source| CurlError::InvalidUrl {
         raw: raw.clone(),
         source,
     })?;
-    if url.scheme() != "http" {
+    if uri.scheme_str() != Some("http") {
         return Err(CurlError::UnsupportedScheme);
     }
-    let host = url.host_str().ok_or(CurlError::MissingHost)?;
-    let port = url.port_or_known_default().ok_or(CurlError::MissingPort)?;
-    let mut target = url.path().to_owned();
-    if target.is_empty() {
-        target.push('/');
-    }
-    if let Some(query) = url.query() {
-        target.push('?');
-        target.push_str(query);
-    }
+    let authority = uri.authority().ok_or(CurlError::MissingHost)?;
+    let host = authority.host();
+    let port = authority.port_u16().unwrap_or(80);
+    let target = uri.path_and_query().map_or("/", |path| path.as_str());
+    let host_header = authority.as_str();
 
     let stream = TcpStream::connect(host, port)
         .await
@@ -125,7 +122,7 @@ async fn run() -> Result<()> {
             source,
         })?;
     let request = format!(
-        "GET {target} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: helios-curl/0.1\r\nConnection: close\r\n\r\n"
+        "GET {target} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: helios-curl/0.1\r\nConnection: close\r\n\r\n"
     );
     stream
         .write_all(request.as_bytes())

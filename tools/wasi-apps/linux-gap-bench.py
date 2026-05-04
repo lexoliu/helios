@@ -109,8 +109,11 @@ def start_host_http(root: Path) -> tuple[socketserver.TCPServer, int]:
 
 
 def docker_image_digest(image: str) -> str:
-    run(["docker", "pull", image])
-    raw = output(["docker", "image", "inspect", image, "--format", "{{json .RepoDigests}} {{.Id}}"])
+    try:
+        raw = output(["docker", "image", "inspect", image, "--format", "{{json .RepoDigests}} {{.Id}}"])
+    except subprocess.CalledProcessError:
+        run(["docker", "pull", image])
+        raw = output(["docker", "image", "inspect", image, "--format", "{{json .RepoDigests}} {{.Id}}"])
     digests_raw, image_id = raw.split(" ", 1)
     digests = json.loads(digests_raw)
     return digests[0] if digests else image_id
@@ -150,9 +153,11 @@ def run_linux(
     host_http_url: str | None,
     linux_http_port: int,
 ) -> tuple[Path | None, str]:
-    shell_workloads = [workload for workload in workloads if workload["runner"] == "shell"]
+    native_workloads = [
+        workload for workload in workloads if workload["runner"] in ("shell", "program")
+    ]
     digest = docker_image_digest(image)
-    if not shell_workloads:
+    if not native_workloads:
         return None, digest
 
     hyperfine_json = out_dir / "linux-hyperfine.json"
@@ -180,7 +185,7 @@ def run_linux(
         "/out/linux-hyperfine.json",
     ]
     linux_http_url = f"http://127.0.0.1:{linux_http_port}/payload.txt" if host_http_url else None
-    for workload in shell_workloads:
+    for workload in native_workloads:
         runner = [
             "python3",
             "/repo/tools/wasi-apps/linux-workload-runner.py",

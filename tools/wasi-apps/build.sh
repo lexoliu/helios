@@ -274,18 +274,20 @@ echo "WASIX conformance artifacts installed at: $artifacts_root/wasix"
 ls -lh "$artifacts_root"/wasix/{thread-futex,continuation,simd-lanes}/*.wasm
 
 build_env=(
-  CARGO_PROFILE_DEV_OPT_LEVEL=z
-  CARGO_PROFILE_DEV_DEBUG=0
-  CARGO_PROFILE_DEV_CODEGEN_UNITS=1
+  CARGO_PROFILE_RELEASE_OPT_LEVEL=3
+  CARGO_PROFILE_RELEASE_DEBUG=0
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+  CARGO_PROFILE_RELEASE_LTO=fat
   RUSTFLAGS='-C debuginfo=0 -C strip=debuginfo'
 )
 
 env "${build_env[@]}" cargo build \
   --manifest-path "$repo_root/tools/wasi-apps/curl/Cargo.toml" \
-  --target wasm32-wasip2
+  --target wasm32-wasip2 \
+  --release
 
 cp -f \
-  "$repo_root/tools/wasi-apps/curl/target/wasm32-wasip2/debug/helios_curl_wasi.wasm" \
+  "$repo_root/tools/wasi-apps/curl/target/wasm32-wasip2/release/helios_curl_wasi.wasm" \
   "$out_dir/curl.wasm"
 sha256sum "$out_dir/curl.wasm" > "$out_dir/curl.wasm.sha256"
 curl_wasm_sha256="$(sha256_hex "$out_dir/curl.wasm")"

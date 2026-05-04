@@ -91,11 +91,12 @@
     {
       "name": "curl-local-http",
       "class": "io-bound",
-      "runner": "shell",
+      "runner": "program",
       "description": "Fetch from a deterministic local HTTP server.",
-      "command": "{curl} {host_http_url}; echo curl-local-http:ok",
+      "program": "{curl}",
+      "args": ["{host_http_url}"],
       "boot_programs": ["curl"],
-      "stdout_contains": ["helios-linux-gap:ok", "curl-local-http:ok"],
+      "stdout_contains": ["helios-linux-gap:ok"],
       "stderr_empty": true,
       "requires_host_http": true
     }

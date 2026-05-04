@@ -54,6 +54,7 @@ pub(crate) enum WorkloadClass {
 #[serde(rename_all = "kebab-case")]
 enum WorkloadRunner {
     Shell,
+    Program,
     HeliosAot,
 }
 
@@ -72,6 +73,10 @@ struct Workload {
     _description: String,
     #[serde(default)]
     command: Option<String>,
+    #[serde(default)]
+    program: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
     #[serde(default)]
     boot_programs: Vec<String>,
     #[serde(default)]
@@ -148,7 +153,10 @@ pub(crate) fn required_boot_programs(command: &WorkloadBenchCommand) -> Result<V
     let workloads = select_workloads(command)?;
     let mut programs = vec!["dash".to_owned(), "debugger".to_owned()];
     for workload in workloads {
-        if workload.runner == WorkloadRunner::Shell {
+        if matches!(
+            workload.runner,
+            WorkloadRunner::Shell | WorkloadRunner::Program
+        ) {
             extend_unique(&mut programs, &workload.boot_programs);
         }
     }
@@ -183,6 +191,7 @@ pub(crate) async fn run_inner(
         for iteration in 1..=command.iterations {
             let output = match workload.runner {
                 WorkloadRunner::Shell => run_shell_workload(client, &workload, command).await?,
+                WorkloadRunner::Program => run_program_workload(client, &workload, command).await?,
                 WorkloadRunner::HeliosAot => run_aot_workload(client, &workload, iteration).await?,
             };
             let validation = validate_output(&workload, &output.stdout, &output.stderr)
@@ -238,6 +247,43 @@ async fn run_shell_workload(
     )
     .await
     .with_context(|| format!("failed to run workload {}", workload.name))?;
+    let elapsed_ms = started.elapsed().as_millis();
+    if output.exit_code != 0 {
+        write_guest_output(&output.output.stdout, &output.output.stderr)?;
+        bail!(
+            "workload {} exited with code {}",
+            workload.name,
+            output.exit_code
+        );
+    }
+    Ok(WorkloadOutput {
+        elapsed_ms,
+        stdout: output.output.stdout,
+        stderr: output.output.stderr,
+    })
+}
+
+async fn run_program_workload(
+    client: &mut crate::serial::RpcClient,
+    workload: &Workload,
+    command: &WorkloadBenchCommand,
+) -> Result<WorkloadOutput> {
+    let program = render_helios_template(
+        workload.program.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("program workload {} is missing program", workload.name)
+        })?,
+        workload,
+        command,
+    )?;
+    let args = workload
+        .args
+        .iter()
+        .map(|arg| render_helios_template(arg, workload, command))
+        .collect::<Result<Vec<_>>>()?;
+    let started = Instant::now();
+    let output = crate::programs::exec(client, &program, &args)
+        .await
+        .with_context(|| format!("failed to run workload {}", workload.name))?;
     let elapsed_ms = started.elapsed().as_millis();
     if output.exit_code != 0 {
         write_guest_output(&output.output.stdout, &output.output.stderr)?;
@@ -357,6 +403,11 @@ fn validate_workload_shape(workload: &Workload) -> Result<()> {
                 bail!("shell workload {} is missing command", workload.name);
             }
         }
+        WorkloadRunner::Program => {
+            if workload.program.is_none() {
+                bail!("program workload {} is missing program", workload.name);
+            }
+        }
         WorkloadRunner::HeliosAot => {
             if workload.wasm_path.is_none()
                 || workload.remote_path.is_none()
@@ -374,7 +425,15 @@ fn render_helios_script(workload: &Workload, command: &WorkloadBenchCommand) -> 
         .command
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("workload {} is missing command", workload.name))?;
-    let mut rendered = script.clone();
+    render_helios_template(script, workload, command)
+}
+
+fn render_helios_template(
+    template: &str,
+    workload: &Workload,
+    command: &WorkloadBenchCommand,
+) -> Result<String> {
+    let mut rendered = template.to_owned();
     for (placeholder, value) in [
         ("{bash}", "/bin/bash"),
         ("{cat}", "/bin/cat"),

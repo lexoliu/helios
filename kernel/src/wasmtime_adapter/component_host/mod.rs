@@ -1491,6 +1491,54 @@ where
     Ok(())
 }
 
+struct ComponentHostProfile<CpuImpl, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    runtime_state: HostRuntimeState<CpuImpl, HostFs>,
+    cpu: CpuImpl,
+    started_ticks: u64,
+}
+
+fn component_host_profile<CpuImpl, HostFs>(
+    store: &StoreData<CpuImpl, HostFs>,
+) -> Option<ComponentHostProfile<CpuImpl, HostFs>>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    store
+        .runtime_state
+        .profiling_enabled()
+        .then(|| ComponentHostProfile {
+            runtime_state: store.runtime_state.clone(),
+            cpu: store.cpu.clone(),
+            started_ticks: store.cpu.now().ticks(),
+        })
+}
+
+fn record_component_host_kernel_profile<CpuImpl, HostFs>(
+    profile: Option<ComponentHostProfile<CpuImpl, HostFs>>,
+    phase: &'static str,
+) where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    if let Some(profile) = profile {
+        profile.runtime_state.record_profile_stack_parts(
+            ProfileScope::Kernel,
+            "kernel;component-host;",
+            phase,
+            profile
+                .cpu
+                .now()
+                .ticks()
+                .saturating_sub(profile.started_ticks),
+        );
+    }
+}
+
 pub(crate) fn add_program_world_to_linker<CpuImpl, HostFs>(
     linker: &mut Linker<StoreData<CpuImpl, HostFs>>,
 ) -> wasmtime::Result<()>
@@ -1846,13 +1894,18 @@ where
                 if !has_authority {
                     return Ok::<_, wasmtime::Error>((Err(unavailable_tcp_authority_error()),));
                 }
-                let service = accessor.with(|mut access| {
-                    Ok::<_, wasmtime::Error>(access.get().runtime_state.network_service())
+                let (service, profile) = accessor.with(|mut access| {
+                    let store = access.get();
+                    Ok::<_, wasmtime::Error>((
+                        store.runtime_state.network_service(),
+                        component_host_profile(store),
+                    ))
                 })?;
                 let Some(service) = service else {
                     return Ok::<_, wasmtime::Error>((Err(unavailable_tcp_error()),));
                 };
                 let connected = service.tcp_connect(&host, port, timeout).await;
+                record_component_host_kernel_profile(profile, "system-net-tcp-connect");
                 let response = match connected {
                     Ok(stream) => {
                         let resource = accessor.with(|mut access| {
@@ -1920,11 +1973,14 @@ where
         |accessor: &Accessor<StoreData<CpuImpl, HostFs>>,
          (resource, max_bytes, timeout): (Resource<SbiTcpStream>, u32, u64)| {
             Box::pin(async move {
-                let socket = accessor.with(|mut access| {
+                let (socket, profile) = accessor.with(|mut access| {
                     let socket = access.get().table.get(&resource)?;
                     Ok::<_, wasmtime::Error>((
-                        socket.resource.backend.service.clone(),
-                        socket.resource.backend.stream,
+                        (
+                            socket.resource.backend.service.clone(),
+                            socket.resource.backend.stream,
+                        ),
+                        component_host_profile(access.get()),
                     ))
                 })?;
                 let response = socket
@@ -1932,6 +1988,7 @@ where
                     .tcp_read(socket.1, max_bytes, timeout)
                     .await
                     .map_err(convert_tcp_error);
+                record_component_host_kernel_profile(profile, "system-net-tcp-read");
                 Ok::<_, wasmtime::Error>((response,))
             })
         },
@@ -1941,11 +1998,14 @@ where
         |accessor: &Accessor<StoreData<CpuImpl, HostFs>>,
          (resource, bytes, timeout): (Resource<SbiTcpStream>, Vec<u8>, u64)| {
             Box::pin(async move {
-                let socket = accessor.with(|mut access| {
+                let (socket, profile) = accessor.with(|mut access| {
                     let socket = access.get().table.get(&resource)?;
                     Ok::<_, wasmtime::Error>((
-                        socket.resource.backend.service.clone(),
-                        socket.resource.backend.stream,
+                        (
+                            socket.resource.backend.service.clone(),
+                            socket.resource.backend.stream,
+                        ),
+                        component_host_profile(access.get()),
                     ))
                 })?;
                 let response = socket
@@ -1954,6 +2014,7 @@ where
                     .await
                     .map(|()| bytes.len() as u64)
                     .map_err(convert_tcp_error);
+                record_component_host_kernel_profile(profile, "system-net-tcp-write");
                 Ok::<_, wasmtime::Error>((response,))
             })
         },
@@ -2156,13 +2217,18 @@ where
                         unavailable_program_tcp_authority_error(),
                     ),));
                 }
-                let service = accessor.with(|mut access| {
-                    Ok::<_, wasmtime::Error>(access.get().runtime_state.network_service())
+                let (service, profile) = accessor.with(|mut access| {
+                    let store = access.get();
+                    Ok::<_, wasmtime::Error>((
+                        store.runtime_state.network_service(),
+                        component_host_profile(store),
+                    ))
                 })?;
                 let Some(service) = service else {
                     return Ok::<_, wasmtime::Error>((Err(unavailable_program_tcp_error()),));
                 };
                 let connected = service.tcp_connect(&host, port, timeout).await;
+                record_component_host_kernel_profile(profile, "program-net-tcp-connect");
                 let response = match connected {
                     Ok(stream) => {
                         let resource = accessor.with(|mut access| {
@@ -2232,11 +2298,14 @@ where
         |accessor: &Accessor<StoreData<CpuImpl, HostFs>>,
          (resource, max_bytes, timeout): (Resource<SbiTcpStream>, u32, u64)| {
             Box::pin(async move {
-                let socket = accessor.with(|mut access| {
+                let (socket, profile) = accessor.with(|mut access| {
                     let socket = access.get().table.get(&resource)?;
                     Ok::<_, wasmtime::Error>((
-                        socket.resource.backend.service.clone(),
-                        socket.resource.backend.stream,
+                        (
+                            socket.resource.backend.service.clone(),
+                            socket.resource.backend.stream,
+                        ),
+                        component_host_profile(access.get()),
                     ))
                 })?;
                 let response = socket
@@ -2244,6 +2313,7 @@ where
                     .tcp_read(socket.1, max_bytes, timeout)
                     .await
                     .map_err(convert_program_tcp_error);
+                record_component_host_kernel_profile(profile, "program-net-tcp-read");
                 Ok::<_, wasmtime::Error>((response,))
             })
         },
@@ -2253,11 +2323,14 @@ where
         |accessor: &Accessor<StoreData<CpuImpl, HostFs>>,
          (resource, bytes, timeout): (Resource<SbiTcpStream>, Vec<u8>, u64)| {
             Box::pin(async move {
-                let socket = accessor.with(|mut access| {
+                let (socket, profile) = accessor.with(|mut access| {
                     let socket = access.get().table.get(&resource)?;
                     Ok::<_, wasmtime::Error>((
-                        socket.resource.backend.service.clone(),
-                        socket.resource.backend.stream,
+                        (
+                            socket.resource.backend.service.clone(),
+                            socket.resource.backend.stream,
+                        ),
+                        component_host_profile(access.get()),
                     ))
                 })?;
                 let response = socket
@@ -2266,6 +2339,7 @@ where
                     .await
                     .map(|()| bytes.len() as u64)
                     .map_err(convert_program_tcp_error);
+                record_component_host_kernel_profile(profile, "program-net-tcp-write");
                 Ok::<_, wasmtime::Error>((response,))
             })
         },

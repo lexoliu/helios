@@ -116,9 +116,9 @@ struct PoolingConfiguration {
 #[cfg(all(target_os = "none", feature = "wasmtime-aarch64"))]
 fn configure_pooling(config: &mut wasmtime::Config) -> PoolingConfiguration {
     use wasmtime::{InstanceAllocationStrategy, PoolingAllocationConfig};
-    config.allocation_strategy(InstanceAllocationStrategy::Pooling(
-        PoolingAllocationConfig::default(),
-    ));
+    let mut pooling = PoolingAllocationConfig::default();
+    pooling.max_unused_warm_slots(0);
+    config.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling));
     config.async_stack_zeroing(false);
     PoolingConfiguration { applied: true }
 }
@@ -132,9 +132,9 @@ fn configure_pooling(config: &mut wasmtime::Config) -> PoolingConfiguration {
 #[cfg(not(target_os = "none"))]
 fn configure_pooling(config: &mut wasmtime::Config) -> PoolingConfiguration {
     use wasmtime::{InstanceAllocationStrategy, PoolingAllocationConfig};
-    config.allocation_strategy(InstanceAllocationStrategy::Pooling(
-        PoolingAllocationConfig::default(),
-    ));
+    let mut pooling = PoolingAllocationConfig::default();
+    pooling.max_unused_warm_slots(0);
+    config.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling));
     config.async_stack_zeroing(false);
     PoolingConfiguration { applied: true }
 }

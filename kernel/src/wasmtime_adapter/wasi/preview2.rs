@@ -30,7 +30,9 @@ use crate::wasmtime_adapter::component_host::{
 };
 use crate::wasmtime_adapter::store::{ChannelInputStream, ChannelOutputStream, StdioOutputStream};
 use crate::wasmtime_adapter::wasi::map_host_fs_error;
-use crate::{ComponentNetworkService, ComponentOutputMode, ComponentOutputStreamKind};
+use crate::{
+    ComponentNetworkService, ComponentOutputMode, ComponentOutputStreamKind, ProfileScope,
+};
 
 #[cfg(test)]
 pub(crate) const PREVIEW2_LINKED_INTERFACES: &[&str] = &[
@@ -2424,6 +2426,25 @@ fn map_p2_tcp_socket_error(error: super::socket_types::ErrorCode) -> p2tcp::Erro
     }
 }
 
+fn p2_record_kernel_profile<CpuImpl, HostFs>(
+    runtime_state: &HostRuntimeState<CpuImpl, HostFs>,
+    cpu: &CpuImpl,
+    phase: &'static str,
+    started_ticks: u64,
+) where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    if runtime_state.profiling_enabled() {
+        runtime_state.record_profile_stack_parts(
+            ProfileScope::Kernel,
+            "kernel;preview2;",
+            phase,
+            cpu.now().ticks().saturating_sub(started_ticks),
+        );
+    }
+}
+
 fn p2_tcp_stream_pair<CpuImpl, HostFs>(
     store: &mut StoreData<CpuImpl, HostFs>,
     socket_resource: &Resource<TcpSocket>,
@@ -2433,6 +2454,7 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
+    let started = store.cpu.now().ticks();
     let (network_writer, guest_reader) = crate::byte_channel();
     let (guest_writer, network_reader) = crate::byte_channel();
     let input = store.table.push_child(
@@ -2444,16 +2466,39 @@ where
         socket_resource,
     )?;
     let read_socket = socket.clone();
+    let read_cpu = store.cpu.clone();
+    let read_runtime_state = store.runtime_state.clone();
     store.spawner().spawn_detached(async move {
         loop {
+            let started = read_cpu.now().ticks();
             match read_socket.read(super::FILE_READ_CHUNK_BYTES as u32).await {
                 Ok(Some(bytes)) => {
+                    p2_record_kernel_profile(
+                        &read_runtime_state,
+                        &read_cpu,
+                        "tcp-bridge-read",
+                        started,
+                    );
                     if network_writer.write(bytes).is_err() {
                         break;
                     }
                 }
-                Ok(None) => break,
+                Ok(None) => {
+                    p2_record_kernel_profile(
+                        &read_runtime_state,
+                        &read_cpu,
+                        "tcp-bridge-read-eof",
+                        started,
+                    );
+                    break;
+                }
                 Err(error) => {
+                    p2_record_kernel_profile(
+                        &read_runtime_state,
+                        &read_cpu,
+                        "tcp-bridge-read-error",
+                        started,
+                    );
                     tracing::warn!(
                         target: "helios_kernel::wasi::preview2::tcp",
                         ?error,
@@ -2464,9 +2509,18 @@ where
             }
         }
     });
+    let write_cpu = store.cpu.clone();
+    let write_runtime_state = store.runtime_state.clone();
     store.spawner().spawn_detached(async move {
         while let Some(bytes) = network_reader.read().await {
+            let started = write_cpu.now().ticks();
             if let Err(error) = socket.write_all(&bytes).await {
+                p2_record_kernel_profile(
+                    &write_runtime_state,
+                    &write_cpu,
+                    "tcp-bridge-write-error",
+                    started,
+                );
                 tracing::warn!(
                     target: "helios_kernel::wasi::preview2::tcp",
                     ?error,
@@ -2474,8 +2528,15 @@ where
                 );
                 break;
             }
+            p2_record_kernel_profile(
+                &write_runtime_state,
+                &write_cpu,
+                "tcp-bridge-write",
+                started,
+            );
         }
     });
+    p2_record_kernel_profile(&store.runtime_state, &store.cpu, "tcp-stream-pair", started);
     Ok((input, output))
 }
 
@@ -2553,7 +2614,10 @@ where
                 socket.ready.clone(),
             )
         };
+        let profile_cpu = self.cpu.clone();
+        let profile_runtime_state = self.runtime_state.clone();
         self.spawner().spawn_detached(async move {
+            let started = profile_cpu.now().ticks();
             let mut host_buffer = [0; 15];
             let result = service
                 .tcp_connect(
@@ -2564,6 +2628,7 @@ where
                     u64::MAX,
                 )
                 .await;
+            p2_record_kernel_profile(&profile_runtime_state, &profile_cpu, "tcp-connect", started);
             let mut state = inner.lock();
             state.connect_in_progress = false;
             state.connect_result = Some(match result {
@@ -2590,16 +2655,41 @@ where
     > {
         let socket = self.table.get(&socket_resource)?.clone();
         {
+            let started = self.cpu.now().ticks();
             let mut state = socket.inner.lock();
             if state.connect_in_progress {
+                p2_record_kernel_profile(
+                    &self.runtime_state,
+                    &self.cpu,
+                    "tcp-finish-connect-would-block",
+                    started,
+                );
                 return Ok(Err(p2tcp::ErrorCode::WouldBlock));
             }
             let Some(result) = state.connect_result.take() else {
+                p2_record_kernel_profile(
+                    &self.runtime_state,
+                    &self.cpu,
+                    "tcp-finish-connect-not-in-progress",
+                    started,
+                );
                 return Ok(Err(p2tcp::ErrorCode::NotInProgress));
             };
             if let Err(error) = result {
+                p2_record_kernel_profile(
+                    &self.runtime_state,
+                    &self.cpu,
+                    "tcp-finish-connect-error",
+                    started,
+                );
                 return Ok(Err(map_p2_tcp_core_error(error)));
             }
+            p2_record_kernel_profile(
+                &self.runtime_state,
+                &self.cpu,
+                "tcp-finish-connect",
+                started,
+            );
         }
         let (input, output) = p2_tcp_stream_pair(self, &socket_resource, socket)?;
         Ok(Ok((input, output)))
