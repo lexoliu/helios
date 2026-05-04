@@ -53,8 +53,8 @@
       "class": "io-bound",
       "runner": "shell",
       "description": "Repeated shell command startup.",
-      "command": "i=0; while [ $i -lt 20 ]; do {bash} -c true; i=$((i+1)); done; echo process-startup:ok",
-      "boot_programs": ["bash"],
+      "command": "i=0; while [ $i -lt 20 ]; do {dash} -c true; i=$((i+1)); done; echo process-startup:ok",
+      "boot_programs": ["dash"],
       "stdout_contains": ["process-startup:ok"],
       "stderr_empty": true
     },

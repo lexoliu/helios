@@ -438,6 +438,7 @@ fn render_helios_template(
         ("{bash}", "/bin/bash"),
         ("{cat}", "/bin/cat"),
         ("{curl}", "/bin/curl"),
+        ("{dash}", "/bin/dash"),
         ("{head}", "/bin/head"),
         ("{mkdir}", "/bin/mkdir"),
         ("{python3}", "/bin/python3"),
