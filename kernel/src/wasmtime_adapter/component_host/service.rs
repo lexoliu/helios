@@ -5286,6 +5286,9 @@ where
     // component and store to share the same engine instance.
     super::emit_program_stage_marker(exec_context.write_serial, "program:instantiate-begin");
     let instantiate_started = profile_cpu.now().ticks();
+    let store_prepare_started = profile_runtime_state
+        .profiling_enabled()
+        .then(|| profile_cpu.now().ticks());
     let filesystem = DebugFileSystem::new(exec_context.runtime_state.clone());
     let mut store = crate::wasmtime_adapter::store_with_state(
         engine.raw(),
@@ -5311,17 +5314,45 @@ where
             exec_context.write_serial,
         ),
     );
-    let executor = instance_pre
-        .instantiate_async(&mut store)
-        .await
-        .and_then(|instance| {
-            crate::wasmtime_adapter::engine::resolve_wasi_cli_run(
-                instance_pre.component(),
-                &instance,
-                &mut store,
-            )
-            .map(|run_func| crate::wasmtime_adapter::WasmtimeExecutor { store, run_func })
-        });
+    if let Some(store_prepare_started) = store_prepare_started {
+        record_program_kernel_profile(
+            &profile_runtime_state,
+            &profile_cpu,
+            "component-store-prepare",
+            store_prepare_started,
+        );
+    }
+    let instantiate_instance_started = profile_runtime_state
+        .profiling_enabled()
+        .then(|| profile_cpu.now().ticks());
+    let instance = instance_pre.instantiate_async(&mut store).await;
+    if let Some(instantiate_instance_started) = instantiate_instance_started {
+        record_program_kernel_profile(
+            &profile_runtime_state,
+            &profile_cpu,
+            "instantiate-component-instance",
+            instantiate_instance_started,
+        );
+    }
+    let executor = instance.and_then(|instance| {
+        let resolve_started = profile_runtime_state
+            .profiling_enabled()
+            .then(|| profile_cpu.now().ticks());
+        let resolved = crate::wasmtime_adapter::engine::resolve_wasi_cli_run(
+            instance_pre.component(),
+            &instance,
+            &mut store,
+        );
+        if let Some(resolve_started) = resolve_started {
+            record_program_kernel_profile(
+                &profile_runtime_state,
+                &profile_cpu,
+                "resolve-component-run",
+                resolve_started,
+            );
+        }
+        resolved.map(|run_func| crate::wasmtime_adapter::WasmtimeExecutor { store, run_func })
+    });
     record_program_kernel_profile(
         &profile_runtime_state,
         &profile_cpu,

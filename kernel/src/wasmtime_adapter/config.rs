@@ -1,5 +1,7 @@
 use wasmtime::Config;
 
+pub const COMPONENT_ASYNC_STACK_SIZE: usize = 8 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AotCompileHint {
     Fast,
@@ -46,7 +48,7 @@ pub fn build_component_engine_config(target: &str) -> Config {
     // 512 KB stack is not enough. Give component instances an 8 MB
     // stack (both for the guest wasm call stack and for the host
     // Rust async frames that drive it).
-    config.max_wasm_stack(8 * 1024 * 1024);
-    config.async_stack_size(8 * 1024 * 1024);
+    config.max_wasm_stack(COMPONENT_ASYNC_STACK_SIZE);
+    config.async_stack_size(COMPONENT_ASYNC_STACK_SIZE);
     config
 }
