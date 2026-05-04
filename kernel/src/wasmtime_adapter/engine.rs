@@ -74,6 +74,10 @@ fn build_engine_for_platform<P: Cpu + Clone>(
         // configuration. UserMemoryCreator must not be installed —
         // it uses the kernel buddy heap which cannot satisfy
         // wasmtime's per-slot pre-reservations.
+        if platform.has_lazy_commit_virtual_memory() {
+            config.memory_init_cow(true);
+            config.memory_may_move(false);
+        }
     } else if platform.has_lazy_commit_virtual_memory() {
         // Bare-metal custom-vm builds route Wasmtime's default memory
         // creator through the backend-installed `wasmtime_mmap_*`
@@ -108,11 +112,18 @@ struct PoolingConfiguration {
 
 /// Apply Wasmtime's pooling instance allocator to `config` when this
 /// build links a wasmtime variant that ships the pooling-allocator
-/// feature. Bare-metal builds still configure the pooling-adjacent
-/// async-stack policy here, but cannot select
-/// `InstanceAllocationStrategy::Pooling` until the vendored Wasmtime
-/// pooling allocator is ported off its current `std` feature dependency.
-#[cfg(target_os = "none")]
+/// feature.
+#[cfg(all(target_os = "none", feature = "wasmtime-aarch64"))]
+fn configure_pooling(config: &mut wasmtime::Config) -> PoolingConfiguration {
+    use wasmtime::{InstanceAllocationStrategy, PoolingAllocationConfig};
+    config.allocation_strategy(InstanceAllocationStrategy::Pooling(
+        PoolingAllocationConfig::default(),
+    ));
+    config.async_stack_zeroing(false);
+    PoolingConfiguration { applied: true }
+}
+
+#[cfg(all(target_os = "none", not(feature = "wasmtime-aarch64")))]
 fn configure_pooling(config: &mut wasmtime::Config) -> PoolingConfiguration {
     config.async_stack_zeroing(false);
     PoolingConfiguration { applied: false }

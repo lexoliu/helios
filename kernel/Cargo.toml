@@ -10,7 +10,7 @@ default = ["wasmtime-host"]
 # feature; the core kernel and HAL no-default path must not depend on it.
 wasmtime-runtime = ["dep:wasmtime", "dep:wasmtime-wasi-io"]
 wasmtime-host = ["wasmtime-runtime"]
-wasmtime-aarch64 = ["wasmtime-runtime", "wasmtime/custom-virtual-memory"]
+wasmtime-aarch64 = ["wasmtime-runtime", "wasmtime/custom-virtual-memory", "wasmtime/pooling-allocator"]
 wasmtime-x86 = ["wasmtime-runtime"]
 wasmtime-riscv64 = ["wasmtime-runtime"]
 

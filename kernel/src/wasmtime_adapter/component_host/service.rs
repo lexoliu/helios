@@ -27,7 +27,7 @@ use helios_compiler_abi::{
 };
 use helios_hal::watchdog::Watchdog;
 use thiserror::Error;
-use wasmtime::component::Component;
+use wasmtime::component::{Component, InstancePre as ComponentInstancePre};
 use wasmtime::{
     Caller, ExternType, InstancePre, Linker as CoreLinker, MemoryType, Module, SharedMemory, Val,
 };
@@ -140,6 +140,8 @@ where
     preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
     shared_memory_pool: Arc<Mutex<SharedMemoryPool>>,
     component_cache: Mutex<ComponentCache<WasmtimeCompiledComponent>>,
+    component_instance_pre_cache:
+        Mutex<ComponentCache<ComponentInstancePre<StoreData<CpuImpl, HostFs>>>>,
     core_module_cache: Mutex<ComponentCache<WasmtimeCompiledCoreModule>>,
     compiler_artifact: Option<Bytes>,
     /// Lazily-built compiler kernel-plugin runtime. The plugin's
@@ -277,8 +279,12 @@ fn zero_shared_memory(memory: &SharedMemory) {
     }
 }
 
-enum ProgramExecutable {
-    Component(Arc<WasmtimeCompiledComponent>),
+enum ProgramExecutable<CpuImpl, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    Component(Arc<ComponentInstancePre<StoreData<CpuImpl, HostFs>>>),
     CoreModule(Arc<WasmtimeCompiledCoreModule>),
     ForkedCoreModule {
         compiled: Arc<WasmtimeCompiledCoreModule>,
@@ -389,7 +395,7 @@ where
     next_thread_id: u32,
     threads: Vec<WasixThread>,
     requested_exit: Option<u32>,
-    exec_replacement: Option<WasixExecReplacement>,
+    exec_replacement: Option<WasixExecReplacement<CpuImpl, HostFs>>,
 }
 
 struct WasixChildProcess {
@@ -492,11 +498,15 @@ struct CoreModuleRestore {
     value: u64,
 }
 
-struct WasixExecReplacement {
+struct WasixExecReplacement<CpuImpl, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
     name: String,
     args: Vec<String>,
     env: Vec<(String, String)>,
-    executable: ProgramExecutable,
+    executable: ProgramExecutable<CpuImpl, HostFs>,
     authority: ProcessAuthority,
     filesystem: Option<DebugFileSystemSnapshot>,
     descriptors: Option<Preview1DescriptorTable>,
@@ -504,9 +514,13 @@ struct WasixExecReplacement {
     signal_dispositions: Vec<WasixSignalDisposition>,
 }
 
-enum CoreModuleRunCompletion {
+enum CoreModuleRunCompletion<CpuImpl, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
     Exit(Result<ChildExit, ProgramExecError>),
-    Exec(WasixExecReplacement),
+    Exec(WasixExecReplacement<CpuImpl, HostFs>),
 }
 
 #[derive(Clone)]
@@ -1108,6 +1122,7 @@ where
                 shared_memory_pool_budget,
             ))),
             component_cache: Mutex::new(ComponentCache::new(cache_budget)),
+            component_instance_pre_cache: Mutex::new(ComponentCache::new(cache_budget)),
             core_module_cache: Mutex::new(ComponentCache::new(cache_budget)),
             compiler_artifact,
             compiler_plugin: Mutex::new(None),
@@ -1437,7 +1452,7 @@ where
         name: String,
         args: Vec<String>,
         mut env: Vec<(String, String)>,
-        executable: ProgramExecutable,
+        executable: ProgramExecutable<CpuImpl, HostFs>,
         authority: ProcessAuthority,
         filesystem: Option<DebugFileSystemSnapshot>,
         descriptors: Option<Preview1DescriptorTable>,
@@ -1589,7 +1604,7 @@ where
         name: String,
         args: Vec<String>,
         env: Vec<(String, String)>,
-        executable: ProgramExecutable,
+        executable: ProgramExecutable<CpuImpl, HostFs>,
         stdin: Vec<u8>,
         authority: ProcessAuthority,
         filesystem: Option<DebugFileSystemSnapshot>,
@@ -1668,7 +1683,7 @@ where
         source: &ProgramSource,
         hint: Option<AotCompileHint>,
         write_serial: fn(&[u8]),
-    ) -> Result<ProgramExecutable, ProgramExecError> {
+    ) -> Result<ProgramExecutable<CpuImpl, HostFs>, ProgramExecError> {
         let started_at = monotonic_nanos(&self.inner.clock_cpu);
         let payload = match source {
             ProgramSource::SignedArtifact(bytes) => {
@@ -1708,7 +1723,7 @@ where
         payload: Bytes,
         write_serial: fn(&[u8]),
         started_at: u64,
-    ) -> Result<ProgramExecutable, ProgramExecError> {
+    ) -> Result<ProgramExecutable<CpuImpl, HostFs>, ProgramExecError> {
         match WasmtimePrecompiledKind::detect(&payload) {
             Some(WasmtimePrecompiledKind::Component) => self
                 .load_precompiled_component(payload, write_serial, started_at)
@@ -1728,8 +1743,8 @@ where
         payload: Bytes,
         write_serial: fn(&[u8]),
         started_at: u64,
-    ) -> Result<Arc<WasmtimeCompiledComponent>, ProgramExecError> {
-        if let Some(component) = self.inner.component_cache.lock().get(&payload) {
+    ) -> Result<Arc<ComponentInstancePre<StoreData<CpuImpl, HostFs>>>, ProgramExecError> {
+        let component = if let Some(component) = self.inner.component_cache.lock().get(&payload) {
             super::emit_program_stage_marker(write_serial, "program:deserialize-cache-hit");
             let now = monotonic_nanos(&self.inner.clock_cpu);
             tracing::debug!(
@@ -1740,49 +1755,72 @@ where
                 elapsed_ms = elapsed_millis(started_at, now),
                 "program component deserialization cache hit"
             );
-            return Ok(component);
+            component
+        } else {
+            super::emit_program_stage_marker(write_serial, "program:deserialize-begin");
+            tracing::debug!(
+                target: "helios_component_host::program_host",
+                phase = "deserialize-component",
+                cache = "miss",
+                cwasm_bytes = payload.len(),
+                "program component deserialization started"
+            );
+            match WasmtimePrecompiledKind::detect(&payload) {
+                Some(WasmtimePrecompiledKind::Component) => {}
+                Some(WasmtimePrecompiledKind::CoreModule) => {
+                    return Err(ProgramExecError {
+                        kind: ProgramExecErrorKind::InvalidBinary,
+                        detail: ProgramExecErrorDetail::InvalidRuntimeArtifact,
+                    });
+                }
+                None => {
+                    return Err(ProgramExecError {
+                        kind: ProgramExecErrorKind::InvalidBinary,
+                        detail: ProgramExecErrorDetail::InvalidRuntimeArtifact,
+                    });
+                }
+            }
+            let compiled = self.deserialize_component(&payload)?;
+            super::emit_program_stage_marker(write_serial, "program:deserialize-end");
+            let component = Arc::new(compiled);
+            let now = monotonic_nanos(&self.inner.clock_cpu);
+            tracing::debug!(
+                target: "helios_component_host::program_host",
+                phase = "deserialize-component",
+                cache = "miss",
+                cwasm_bytes = payload.len(),
+                elapsed_ms = elapsed_millis(started_at, now),
+                "program component deserialized"
+            );
+            self.inner
+                .component_cache
+                .lock()
+                .insert_if_missing(payload.clone(), component)
+        };
+
+        if let Some(instance_pre) = self.inner.component_instance_pre_cache.lock().get(&payload) {
+            super::emit_program_stage_marker(write_serial, "program:instantiate-pre-cache-hit");
+            return Ok(instance_pre);
         }
 
-        super::emit_program_stage_marker(write_serial, "program:deserialize-begin");
-        tracing::debug!(
-            target: "helios_component_host::program_host",
-            phase = "deserialize-component",
-            cache = "miss",
-            cwasm_bytes = payload.len(),
-            "program component deserialization started"
+        super::emit_program_stage_marker(write_serial, "program:instantiate-pre-begin");
+        let linker = super::component_linker(
+            self.inner.engine.raw(),
+            ComponentBindingSet::Program,
+            &component.component,
+        )
+        .map_err(map_program_runtime_error)?;
+        let instance_pre = Arc::new(
+            linker
+                .instantiate_pre(&component.component)
+                .map_err(map_program_runtime_error)?,
         );
-        match WasmtimePrecompiledKind::detect(&payload) {
-            Some(WasmtimePrecompiledKind::Component) => {}
-            Some(WasmtimePrecompiledKind::CoreModule) => {
-                return Err(ProgramExecError {
-                    kind: ProgramExecErrorKind::InvalidBinary,
-                    detail: ProgramExecErrorDetail::InvalidRuntimeArtifact,
-                });
-            }
-            None => {
-                return Err(ProgramExecError {
-                    kind: ProgramExecErrorKind::InvalidBinary,
-                    detail: ProgramExecErrorDetail::InvalidRuntimeArtifact,
-                });
-            }
-        }
-        let compiled = self.deserialize_component(&payload)?;
-        super::emit_program_stage_marker(write_serial, "program:deserialize-end");
-        let component = Arc::new(compiled);
-        let now = monotonic_nanos(&self.inner.clock_cpu);
-        tracing::debug!(
-            target: "helios_component_host::program_host",
-            phase = "deserialize-component",
-            cache = "miss",
-            cwasm_bytes = payload.len(),
-            elapsed_ms = elapsed_millis(started_at, now),
-            "program component deserialized"
-        );
+        super::emit_program_stage_marker(write_serial, "program:instantiate-pre-end");
         Ok(self
             .inner
-            .component_cache
+            .component_instance_pre_cache
             .lock()
-            .insert_if_missing(payload, component))
+            .insert_if_missing(payload, instance_pre))
     }
 
     fn load_precompiled_core_module(
@@ -2405,11 +2443,11 @@ where
         self.requested_exit = Some(code);
     }
 
-    fn request_exec_replacement(&mut self, replacement: WasixExecReplacement) {
+    fn request_exec_replacement(&mut self, replacement: WasixExecReplacement<CpuImpl, HostFs>) {
         self.exec_replacement = Some(replacement);
     }
 
-    fn take_exec_replacement(&mut self) -> Option<WasixExecReplacement> {
+    fn take_exec_replacement(&mut self) -> Option<WasixExecReplacement<CpuImpl, HostFs>> {
         self.exec_replacement.take()
     }
 
@@ -4721,7 +4759,7 @@ async fn run_program_executable<CpuImpl, HostFs>(
     signal_dispositions: Vec<WasixSignalDisposition>,
     spawner: crate::Spawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
-    executable: ProgramExecutable,
+    executable: ProgramExecutable<CpuImpl, HostFs>,
     engine: &crate::wasmtime_adapter::WasmtimeEngine,
     runtime: &crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
     preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
@@ -5217,9 +5255,9 @@ async fn run_program_component<CpuImpl, HostFs>(
     _signal_state: WasixSignalState,
     spawner: crate::Spawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
-    compiled: Arc<WasmtimeCompiledComponent>,
+    instance_pre: Arc<ComponentInstancePre<StoreData<CpuImpl, HostFs>>>,
     engine: &crate::wasmtime_adapter::WasmtimeEngine,
-    runtime: &crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
+    _runtime: &crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
     launched_instance: crate::RegisteredInstance,
     stdin_reader: crate::ByteReader,
     stdout_writer: crate::ByteWriter,
@@ -5229,7 +5267,7 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    use crate::{ComponentExecContext, ComponentExecutor, ComponentRuntimeFactory, ComponentWorld};
+    use crate::ComponentExecutor;
 
     let mut argv = Vec::with_capacity(args.len() + 1);
     argv.push(name);
@@ -5239,38 +5277,46 @@ where
     let profile_cpu = exec_context.cpu.clone();
     let profile_runtime_state = exec_context.runtime_state.clone();
 
-    let context = ComponentExecContext::new(
-        exec_context.cpu,
-        exec_context.timer,
-        exec_context.spawner.clone(),
-        exec_context.runtime_state.clone(),
-        exec_context.instance_registry,
-        launched_instance,
-        false,
-        exec_context.runtime_state,
-        argv,
-        env,
-        authority,
-        OutputMode::Child {
-            stdin_rx: stdin_reader,
-            stdout_tx: stdout_writer,
-            stderr_tx: stderr_writer,
-        },
-        exec_context.read_serial,
-        exec_context.write_serial,
-    );
-
     // Use the engine that compiled the component — Wasmtime requires
     // component and store to share the same engine instance.
     super::emit_program_stage_marker(exec_context.write_serial, "program:instantiate-begin");
     let instantiate_started = profile_cpu.now().ticks();
-    let executor =
-        <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as ComponentRuntimeFactory<
-            CpuImpl,
-            HostRuntimeState<CpuImpl, HostFs>,
-            HostFs,
-        >>::instantiate(runtime, engine, &compiled, ComponentWorld::Program, context)
-        .await;
+    let filesystem = DebugFileSystem::new(exec_context.runtime_state.clone());
+    let mut store = crate::wasmtime_adapter::store_with_state(
+        engine.raw(),
+        StoreData::<CpuImpl, HostFs>::new(
+            wasmtime::component::ResourceTable::new(),
+            exec_context.cpu,
+            exec_context.timer,
+            exec_context.spawner.clone(),
+            exec_context.runtime_state.clone(),
+            exec_context.instance_registry,
+            launched_instance,
+            None,
+            filesystem,
+            argv,
+            env,
+            authority,
+            OutputMode::Child {
+                stdin_rx: stdin_reader,
+                stdout_tx: stdout_writer,
+                stderr_tx: stderr_writer,
+            },
+            exec_context.read_serial,
+            exec_context.write_serial,
+        ),
+    );
+    let executor = instance_pre
+        .instantiate_async(&mut store)
+        .await
+        .and_then(|instance| {
+            crate::wasmtime_adapter::engine::resolve_wasi_cli_run(
+                instance_pre.component(),
+                &instance,
+                &mut store,
+            )
+            .map(|run_func| crate::wasmtime_adapter::WasmtimeExecutor { store, run_func })
+        });
     record_program_kernel_profile(
         &profile_runtime_state,
         &profile_cpu,
