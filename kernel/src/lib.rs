@@ -475,12 +475,16 @@ impl<CpuImpl: Cpu + Clone> LocalFutureParker<CpuImpl> {
 impl<CpuImpl: Cpu + Clone> Wake for LocalFutureParker<CpuImpl> {
     fn wake(self: Arc<Self>) {
         self.notified.store(true, Ordering::Release);
-        self.cpu.wake_processor(self.owner_processor);
+        if self.cpu.current_processor() != self.owner_processor {
+            self.cpu.wake_processor(self.owner_processor);
+        }
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
         self.notified.store(true, Ordering::Release);
-        self.cpu.wake_processor(self.owner_processor);
+        if self.cpu.current_processor() != self.owner_processor {
+            self.cpu.wake_processor(self.owner_processor);
+        }
     }
 }
 

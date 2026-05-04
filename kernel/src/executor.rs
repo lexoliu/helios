@@ -135,7 +135,7 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         queue: &Arc<ReadyQueue>,
         runnable: Runnable,
         progress_mode: ProgressMode,
-        wake_all_processors: bool,
+        wake: WakeTarget,
     ) {
         if progress_mode == ProgressMode::Counted {
             self.progress.record_progress();
@@ -148,21 +148,40 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
             Err(PushError::Closed(_)) => panic!("executor ready queue was closed unexpectedly"),
         }
 
-        if wake_all_processors {
-            for processor in 0..self.processor_count {
-                self.cpu.wake_processor(ProcessorId::new(processor as u16));
+        match wake {
+            WakeTarget::AllProcessors => {
+                let current_processor = self.cpu.current_processor();
+                for processor in 0..self.processor_count {
+                    let processor = ProcessorId::new(processor as u16);
+                    if processor != current_processor {
+                        self.cpu.wake_processor(processor);
+                    }
+                }
             }
-        } else {
-            self.cpu.wake_processor(self.owner_processor);
+            WakeTarget::OwnerProcessor => {
+                if self.cpu.current_processor() != self.owner_processor {
+                    self.cpu.wake_processor(self.owner_processor);
+                }
+            }
         }
     }
 
     fn schedule_local(&self, runnable: Runnable, progress_mode: ProgressMode) {
-        self.schedule_on_queue(&self.local_queue, runnable, progress_mode, false);
+        self.schedule_on_queue(
+            &self.local_queue,
+            runnable,
+            progress_mode,
+            WakeTarget::OwnerProcessor,
+        );
     }
 
     fn schedule_global(&self, runnable: Runnable, progress_mode: ProgressMode) {
-        self.schedule_on_queue(&self.global_queue, runnable, progress_mode, true);
+        self.schedule_on_queue(
+            &self.global_queue,
+            runnable,
+            progress_mode,
+            WakeTarget::AllProcessors,
+        );
     }
 
     fn spawn_with_progress<Fut>(
@@ -244,6 +263,12 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         self.spawn_local_with_progress(future, ProgressMode::Silent)
             .detach();
     }
+}
+
+#[derive(Clone, Copy)]
+enum WakeTarget {
+    AllProcessors,
+    OwnerProcessor,
 }
 
 fn executor_group(configured_processors: usize) -> Arc<ExecutorGroup> {
