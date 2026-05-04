@@ -1712,7 +1712,7 @@ where
         if let Some(component) = self.inner.component_cache.lock().get(&payload) {
             super::emit_program_stage_marker(write_serial, "program:deserialize-cache-hit");
             let now = monotonic_nanos(&self.inner.clock_cpu);
-            tracing::info!(
+            tracing::debug!(
                 target: "helios_component_host::program_host",
                 phase = "deserialize-component",
                 cache = "hit",
@@ -1724,7 +1724,7 @@ where
         }
 
         super::emit_program_stage_marker(write_serial, "program:deserialize-begin");
-        tracing::info!(
+        tracing::debug!(
             target: "helios_component_host::program_host",
             phase = "deserialize-component",
             cache = "miss",
@@ -1750,7 +1750,7 @@ where
         super::emit_program_stage_marker(write_serial, "program:deserialize-end");
         let component = Arc::new(compiled);
         let now = monotonic_nanos(&self.inner.clock_cpu);
-        tracing::info!(
+        tracing::debug!(
             target: "helios_component_host::program_host",
             phase = "deserialize-component",
             cache = "miss",
@@ -1774,7 +1774,7 @@ where
         if let Some(module) = self.inner.core_module_cache.lock().get(&payload) {
             super::emit_program_stage_marker(write_serial, "program:deserialize-core-cache-hit");
             let now = monotonic_nanos(&self.inner.clock_cpu);
-            tracing::info!(
+            tracing::debug!(
                 target: "helios_component_host::program_host",
                 phase = "deserialize-core-module",
                 cache = "hit",
@@ -1792,7 +1792,7 @@ where
         super::emit_program_stage_marker(write_serial, "program:deserialize-core-end");
         let compiled = Arc::new(WasmtimeCompiledCoreModule { module });
         let now = monotonic_nanos(&self.inner.clock_cpu);
-        tracing::info!(
+        tracing::debug!(
             target: "helios_component_host::program_host",
             phase = "deserialize-core-module",
             cache = "miss",
