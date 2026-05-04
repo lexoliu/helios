@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use askama::Template;
 use serde::Deserialize;
@@ -72,6 +73,7 @@ fn generate_embedded_init(out_dir: &Path, target: &str) -> String {
             .map(|asset| EmbeddedBootAsset {
                 path: asset.path,
                 source: asset.source.display().to_string(),
+                modified_nanos: file_modified_nanos(&asset.source),
             })
             .collect::<Vec<_>>(),
     );
@@ -203,6 +205,7 @@ fn write_trusted_root_file(out_dir: &Path, root_public_key: &Path, root_secret_k
 struct EmbeddedBootAsset {
     path: String,
     source: String,
+    modified_nanos: u64,
 }
 
 fn embedded_bootfs_entries(
@@ -238,6 +241,7 @@ fn embedded_bootfs_entries(
         entries.push(EmbeddedBootAsset {
             path: relative,
             source: path.display().to_string(),
+            modified_nanos: file_modified_nanos(&path),
         });
     }
 
@@ -245,11 +249,35 @@ fn embedded_bootfs_entries(
         entries.push(EmbeddedBootAsset {
             path: asset.path.clone(),
             source: asset.source.clone(),
+            modified_nanos: asset.modified_nanos,
         });
     }
 
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     entries
+}
+
+fn file_modified_nanos(path: &Path) -> u64 {
+    let modified = fs::metadata(path)
+        .unwrap_or_else(|error| panic!("failed to read metadata for {}: {error}", path.display()))
+        .modified()
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to read modification time for {}: {error}",
+                path.display()
+            )
+        });
+    let duration = modified.duration_since(UNIX_EPOCH).unwrap_or_else(|error| {
+        panic!(
+            "modification time for {} is before the Unix epoch: {error}",
+            path.display()
+        )
+    });
+    duration
+        .as_secs()
+        .checked_mul(1_000_000_000)
+        .and_then(|seconds| seconds.checked_add(u64::from(duration.subsec_nanos())))
+        .unwrap_or_else(|| panic!("modification time for {} overflowed u64", path.display()))
 }
 
 fn rerun_if_changed_recursive(root: &Path) {

@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::time::UNIX_EPOCH;
 
 use proc_macro::TokenStream;
 use proc_macro2::Literal;
@@ -95,15 +96,17 @@ fn expand_bootfs(input: BootFsMacroInput) -> std::result::Result<TokenStream, St
             .replace('\\', "/");
         let contents = fs::read(&path)
             .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+        let modified_nanos = file_modified_nanos(&path)?;
         files.push((
             LitStr::new(&relative, input.root.span()),
             Literal::byte_string(&contents),
+            modified_nanos,
         ));
     }
 
-    let entries = files.iter().map(|(path, contents)| {
+    let entries = files.iter().map(|(path, contents, modified_nanos)| {
         quote! {
-            ::helios_kernel::EmbeddedBootFile::new(#path, #contents)
+            ::helios_kernel::EmbeddedBootFile::new(#path, #contents, #modified_nanos)
         }
     });
 
@@ -119,4 +122,27 @@ fn resolve_input_path(path: &LitStr) -> std::result::Result<PathBuf, String> {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR")
         .map_err(|error| format!("CARGO_MANIFEST_DIR is missing: {error}"))?;
     Ok(PathBuf::from(manifest_dir).join(path.value()))
+}
+
+fn file_modified_nanos(path: &std::path::Path) -> std::result::Result<u64, String> {
+    let modified = fs::metadata(path)
+        .map_err(|error| format!("failed to read metadata for {}: {error}", path.display()))?
+        .modified()
+        .map_err(|error| {
+            format!(
+                "failed to read modification time for {}: {error}",
+                path.display()
+            )
+        })?;
+    let duration = modified.duration_since(UNIX_EPOCH).map_err(|error| {
+        format!(
+            "modification time for {} is before the Unix epoch: {error}",
+            path.display()
+        )
+    })?;
+    duration
+        .as_secs()
+        .checked_mul(1_000_000_000)
+        .and_then(|seconds| seconds.checked_add(u64::from(duration.subsec_nanos())))
+        .ok_or_else(|| format!("modification time for {} overflowed u64", path.display()))
 }

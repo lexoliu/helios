@@ -1925,12 +1925,13 @@ where
         }
 
         let identity = self.allocate_identity();
+        let modified_nanos = file.modified_nanos();
         self.snapshot.inner.lock().nodes.push(FsNode::new(
             absolute,
             FsNodeKind::File,
             Bytes::from_static(file.contents()),
             identity,
-            0,
+            modified_nanos,
             true,
         ));
     }
@@ -5924,7 +5925,7 @@ mod tests {
     }
 
     fn test_bootfs() -> EmbeddedBootFs {
-        let files = Box::leak(Box::new([EmbeddedBootFile::new("bin/tool", b"tool")]));
+        let files = Box::leak(Box::new([EmbeddedBootFile::new("bin/tool", b"tool", 42)]));
         EmbeddedBootFs::new(files)
     }
 
@@ -6505,6 +6506,7 @@ mod tests {
             .expect("bootfs program must be present");
         assert_eq!(program.kind, FsNodeKind::File);
         assert!(program.readonly);
+        assert_eq!(program.modified_nanos, 42);
 
         let directory = filesystem
             .get_node("/bin")

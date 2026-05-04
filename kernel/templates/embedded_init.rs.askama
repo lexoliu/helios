@@ -6,7 +6,7 @@ pub const EMBEDDED_INIT: Option<EmbeddedInitDescriptor> = Some(EmbeddedInitDescr
     argv0: r#"{{ argv0 }}"#,
     bootfs: EmbeddedBootFs::new(&[
 {% for entry in bootfs_entries %}
-        EmbeddedBootFile::new(r#"{{ entry.path }}"#, include_bytes!(r#"{{ entry.source }}"#)),
+        EmbeddedBootFile::new(r#"{{ entry.path }}"#, include_bytes!(r#"{{ entry.source }}"#), {{ entry.modified_nanos }}),
 {% endfor %}
     ]),
 });

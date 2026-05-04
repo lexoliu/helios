@@ -15,6 +15,7 @@ use helios_hal::resource::KernelResource;
 pub struct EmbeddedBootFile {
     path: &'static str,
     contents: &'static [u8],
+    modified_nanos: u64,
 }
 
 /// Immutable read-only boot filesystem image.
@@ -60,8 +61,12 @@ pub trait BootDirectoryHandleExt {
 }
 
 impl EmbeddedBootFile {
-    pub const fn new(path: &'static str, contents: &'static [u8]) -> Self {
-        Self { path, contents }
+    pub const fn new(path: &'static str, contents: &'static [u8], modified_nanos: u64) -> Self {
+        Self {
+            path,
+            contents,
+            modified_nanos,
+        }
     }
 
     pub const fn path(&self) -> &'static str {
@@ -70,6 +75,10 @@ impl EmbeddedBootFile {
 
     pub const fn contents(&self) -> &'static [u8] {
         self.contents
+    }
+
+    pub const fn modified_nanos(&self) -> u64 {
+        self.modified_nanos
     }
 }
 
@@ -442,9 +451,9 @@ mod tests {
     use helios_hal::io::IoError;
 
     const IMAGE: EmbeddedBootFs = EmbeddedBootFs::new(&[
-        EmbeddedBootFile::new("bin/init.program", b"init"),
-        EmbeddedBootFile::new("lib/runtime.component", b"runtime"),
-        EmbeddedBootFile::new("etc/config.txt", b"config"),
+        EmbeddedBootFile::new("bin/init.program", b"init", 0),
+        EmbeddedBootFile::new("lib/runtime.component", b"runtime", 0),
+        EmbeddedBootFile::new("etc/config.txt", b"config", 0),
     ]);
     const MACRO_IMAGE: EmbeddedBootFs = bootfs!("src/bootfs_test_data");
 
