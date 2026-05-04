@@ -151,6 +151,14 @@ struct PrebuildManifest {
 struct BootAsset {
     path: String,
     source: PathBuf,
+    kind: BootAssetKind,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum BootAssetKind {
+    Directory,
+    File,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -639,6 +647,7 @@ fn build_compiler_plugin_asset(
         path: COMPILER_PLUGIN_BOOTFS_PATH.to_owned(),
         source: fs::canonicalize(&output_path)
             .with_context(|| format!("failed to resolve {}", output_path.display()))?,
+        kind: BootAssetKind::File,
     })
 }
 
@@ -945,6 +954,7 @@ fn build_boot_program_asset(
         path: format!("bin/{}", manifest.command),
         source: fs::canonicalize(&output_path)
             .with_context(|| format!("failed to resolve {}", output_path.display()))?,
+        kind: BootAssetKind::File,
     })
 }
 
@@ -973,6 +983,7 @@ fn build_external_boot_artifact_assets(
         path: artifact.bootfs_path,
         source: fs::canonicalize(&output_path)
             .with_context(|| format!("failed to resolve {}", output_path.display()))?,
+        kind: BootAssetKind::File,
     }];
     if let (Some(support_root), Some(prefix)) =
         (&artifact.support_root, &artifact.support_bootfs_prefix)
@@ -995,7 +1006,7 @@ fn build_external_support_assets(root: &Path, bootfs_prefix: &str) -> Result<Vec
     for entry in WalkDir::new(root).sort_by_file_name() {
         let entry =
             entry.with_context(|| format!("failed to walk support root {}", root.display()))?;
-        if !entry.file_type().is_file() {
+        if entry.path() == root {
             continue;
         }
         let source = entry.into_path();
@@ -1011,13 +1022,31 @@ fn build_external_support_assets(root: &Path, bootfs_prefix: &str) -> Result<Vec
             .to_str()
             .with_context(|| format!("{} is not valid UTF-8", source.display()))?
             .replace('\\', "/");
+        let kind = if source.is_dir() {
+            if !is_empty_directory(&source)? {
+                continue;
+            }
+            BootAssetKind::Directory
+        } else if source.is_file() {
+            BootAssetKind::File
+        } else {
+            continue;
+        };
         assets.push(BootAsset {
             path: format!("{}/{}", bootfs_prefix.trim_end_matches('/'), relative),
             source: fs::canonicalize(&source)
                 .with_context(|| format!("failed to resolve {}", source.display()))?,
+            kind,
         });
     }
     Ok(assets)
+}
+
+fn is_empty_directory(path: &Path) -> Result<bool> {
+    Ok(fs::read_dir(path)
+        .with_context(|| format!("failed to read directory {}", path.display()))?
+        .next()
+        .is_none())
 }
 
 fn verify_sha256_file(source: &Path, sha256_file: &Path) -> Result<()> {

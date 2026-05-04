@@ -61,7 +61,7 @@ mod generated {
     #[allow(unused_imports)]
     use super::{EmbeddedBootFs, EmbeddedComponent, EmbeddedInitDescriptor};
     #[allow(unused_imports)]
-    use crate::EmbeddedBootFile;
+    use crate::{EmbeddedBootDirectory, EmbeddedBootFile};
 
     include!(concat!(env!("OUT_DIR"), "/embedded_init.rs"));
 }

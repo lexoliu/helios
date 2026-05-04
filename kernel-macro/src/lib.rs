@@ -75,13 +75,13 @@ fn expand_bootfs(input: BootFsMacroInput) -> std::result::Result<TokenStream, St
         return Err(format!("{} is not a directory", root.display()));
     }
 
+    let mut directories = Vec::new();
     let mut files = Vec::new();
     for entry in WalkDir::new(&root).sort_by_file_name() {
         let entry = entry.map_err(|error| format!("failed to walk {}: {error}", root.display()))?;
-        if !entry.file_type().is_file() {
+        if entry.path() == root {
             continue;
         }
-
         let path = entry.into_path();
         let relative = path.strip_prefix(&root).map_err(|error| {
             format!(
@@ -94,9 +94,19 @@ fn expand_bootfs(input: BootFsMacroInput) -> std::result::Result<TokenStream, St
             .to_str()
             .ok_or_else(|| format!("{} has non-UTF8 relative path", path.display()))?
             .replace('\\', "/");
+        let modified_nanos = file_modified_nanos(&path)?;
+        if path.is_dir() {
+            if !is_empty_directory(&path)? {
+                continue;
+            }
+            directories.push((LitStr::new(&relative, input.root.span()), modified_nanos));
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
         let contents = fs::read(&path)
             .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-        let modified_nanos = file_modified_nanos(&path)?;
         files.push((
             LitStr::new(&relative, input.root.span()),
             Literal::byte_string(&contents),
@@ -104,6 +114,11 @@ fn expand_bootfs(input: BootFsMacroInput) -> std::result::Result<TokenStream, St
         ));
     }
 
+    let directories = directories.iter().map(|(path, modified_nanos)| {
+        quote! {
+            ::helios_kernel::EmbeddedBootDirectory::new(#path, #modified_nanos)
+        }
+    });
     let entries = files.iter().map(|(path, contents, modified_nanos)| {
         quote! {
             ::helios_kernel::EmbeddedBootFile::new(#path, #contents, #modified_nanos)
@@ -112,6 +127,8 @@ fn expand_bootfs(input: BootFsMacroInput) -> std::result::Result<TokenStream, St
 
     Ok(quote! {
         ::helios_kernel::EmbeddedBootFs::new(&[
+            #(#directories),*
+        ], &[
             #(#entries),*
         ])
     }
@@ -145,4 +162,10 @@ fn file_modified_nanos(path: &std::path::Path) -> std::result::Result<u64, Strin
         .checked_mul(1_000_000_000)
         .and_then(|seconds| seconds.checked_add(u64::from(duration.subsec_nanos())))
         .ok_or_else(|| format!("modification time for {} overflowed u64", path.display()))
+}
+
+fn is_empty_directory(path: &std::path::Path) -> std::result::Result<bool, String> {
+    let mut entries = fs::read_dir(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    Ok(entries.next().is_none())
 }

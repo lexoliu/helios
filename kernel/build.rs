@@ -13,7 +13,8 @@ struct EmbeddedInitTemplate<'a> {
     name: &'a str,
     component: &'a str,
     argv0: &'a str,
-    bootfs_entries: &'a [EmbeddedBootAsset],
+    bootfs_directories: &'a [EmbeddedBootDirectoryAsset],
+    bootfs_files: &'a [EmbeddedBootFileAsset],
 }
 
 #[derive(Template)]
@@ -65,7 +66,7 @@ fn generate_embedded_init(out_dir: &Path, target: &str) -> String {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_else(|| panic!("{} has no valid UTF-8 file name", component_path.display()));
-    let bootfs_entries = embedded_bootfs_entries(
+    let (bootfs_directories, bootfs_files) = embedded_bootfs_entries(
         &prebuild.bootfs_root,
         &prebuild
             .bootfs_assets
@@ -73,6 +74,7 @@ fn generate_embedded_init(out_dir: &Path, target: &str) -> String {
             .map(|asset| EmbeddedBootAsset {
                 path: asset.path,
                 source: asset.source.display().to_string(),
+                kind: asset.kind,
                 modified_nanos: file_modified_nanos(&asset.source),
             })
             .collect::<Vec<_>>(),
@@ -83,7 +85,8 @@ fn generate_embedded_init(out_dir: &Path, target: &str) -> String {
         name,
         component: &component,
         argv0: &prebuild.init_argv0,
-        bootfs_entries: &bootfs_entries,
+        bootfs_directories: &bootfs_directories,
+        bootfs_files: &bootfs_files,
     }
     .render()
     .unwrap_or_else(|error| panic!("failed to render embedded init template: {error}"))
@@ -104,6 +107,14 @@ struct PrebuildManifest {
 struct BootAssetManifest {
     path: String,
     source: PathBuf,
+    kind: BootAssetKind,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum BootAssetKind {
+    Directory,
+    File,
 }
 
 fn read_kernel_prebuild_manifest(target: &str) -> PrebuildManifest {
@@ -205,14 +216,27 @@ fn write_trusted_root_file(out_dir: &Path, root_public_key: &Path, root_secret_k
 struct EmbeddedBootAsset {
     path: String,
     source: String,
+    kind: BootAssetKind,
+    modified_nanos: u64,
+}
+
+struct EmbeddedBootDirectoryAsset {
+    path: String,
+    modified_nanos: u64,
+}
+
+struct EmbeddedBootFileAsset {
+    path: String,
+    source: String,
     modified_nanos: u64,
 }
 
 fn embedded_bootfs_entries(
     root: &Path,
     extra_assets: &[EmbeddedBootAsset],
-) -> Vec<EmbeddedBootAsset> {
-    let mut entries = Vec::new();
+) -> (Vec<EmbeddedBootDirectoryAsset>, Vec<EmbeddedBootFileAsset>) {
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
 
     for entry in WalkDir::new(root).sort_by_file_name() {
         let entry = entry.unwrap_or_else(|error| {
@@ -221,7 +245,7 @@ fn embedded_bootfs_entries(
                 root.display()
             )
         });
-        if !entry.file_type().is_file() {
+        if entry.path() == root {
             continue;
         }
 
@@ -238,23 +262,41 @@ fn embedded_bootfs_entries(
             .to_str()
             .unwrap_or_else(|| panic!("{} is not valid UTF-8", path.display()))
             .replace('\\', "/");
-        entries.push(EmbeddedBootAsset {
-            path: relative,
-            source: path.display().to_string(),
-            modified_nanos: file_modified_nanos(&path),
-        });
+        let modified_nanos = file_modified_nanos(&path);
+        if path.is_dir() {
+            if !is_empty_directory(&path) {
+                continue;
+            }
+            directories.push(EmbeddedBootDirectoryAsset {
+                path: relative,
+                modified_nanos,
+            });
+        } else if path.is_file() {
+            files.push(EmbeddedBootFileAsset {
+                path: relative,
+                source: path.display().to_string(),
+                modified_nanos,
+            });
+        }
     }
 
     for asset in extra_assets {
-        entries.push(EmbeddedBootAsset {
-            path: asset.path.clone(),
-            source: asset.source.clone(),
-            modified_nanos: asset.modified_nanos,
-        });
+        match asset.kind {
+            BootAssetKind::Directory => directories.push(EmbeddedBootDirectoryAsset {
+                path: asset.path.clone(),
+                modified_nanos: asset.modified_nanos,
+            }),
+            BootAssetKind::File => files.push(EmbeddedBootFileAsset {
+                path: asset.path.clone(),
+                source: asset.source.clone(),
+                modified_nanos: asset.modified_nanos,
+            }),
+        }
     }
 
-    entries.sort_by(|left, right| left.path.cmp(&right.path));
-    entries
+    directories.sort_by(|left, right| left.path.cmp(&right.path));
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    (directories, files)
 }
 
 fn file_modified_nanos(path: &Path) -> u64 {
@@ -278,6 +320,13 @@ fn file_modified_nanos(path: &Path) -> u64 {
         .checked_mul(1_000_000_000)
         .and_then(|seconds| seconds.checked_add(u64::from(duration.subsec_nanos())))
         .unwrap_or_else(|| panic!("modification time for {} overflowed u64", path.display()))
+}
+
+fn is_empty_directory(path: &Path) -> bool {
+    fs::read_dir(path)
+        .unwrap_or_else(|error| panic!("failed to read directory {}: {error}", path.display()))
+        .next()
+        .is_none()
 }
 
 fn rerun_if_changed_recursive(root: &Path) {

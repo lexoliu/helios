@@ -12,8 +12,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use crate::{
-    AuthorityDomain, ComponentNetworkService, EmbeddedBootFile, EmbeddedBootFs, HostFsErrorKind,
-    ObjectIdentity,
+    AuthorityDomain, ComponentNetworkService, EmbeddedBootFs, HostFsErrorKind, ObjectIdentity,
 };
 use bytes::{Bytes, BytesMut};
 use futures::channel::oneshot;
@@ -224,6 +223,22 @@ impl FsNode {
         }
         if access_nanos.is_some() || modified_nanos.is_some() {
             self.status_nanos = status_nanos;
+        }
+    }
+}
+
+impl DebugFileSystemState {
+    fn with_root() -> Self {
+        Self {
+            nodes: vec![FsNode::new(
+                String::from("/"),
+                FsNodeKind::Directory,
+                Bytes::new(),
+                ObjectIdentity::new(AuthorityDomain::GUEST_BOOTFS, 1),
+                0,
+                false,
+            )],
+            next_inode: 2,
         }
     }
 }
@@ -1857,17 +1872,7 @@ where
     pub(crate) fn new(runtime_state: State) -> Self {
         let mut filesystem = Self {
             snapshot: DebugFileSystemSnapshot {
-                inner: Arc::new(Mutex::new(DebugFileSystemState {
-                    nodes: vec![FsNode::new(
-                        String::from("/"),
-                        FsNodeKind::Directory,
-                        Bytes::new(),
-                        ObjectIdentity::new(AuthorityDomain::GUEST_BOOTFS, 1),
-                        0,
-                        false,
-                    )],
-                    next_inode: 2,
-                })),
+                inner: Arc::new(Mutex::new(DebugFileSystemState::with_root())),
             },
             runtime_state,
             _host_fs: PhantomData,
@@ -1900,12 +1905,36 @@ where
     }
 
     fn seed_bootfs(&mut self, image: EmbeddedBootFs) {
+        for directory in image.directories() {
+            self.insert_bootfs_directory(directory);
+        }
         for file in image.files() {
             self.insert_bootfs_file(file);
         }
     }
 
-    fn insert_bootfs_file(&mut self, file: &EmbeddedBootFile) {
+    fn insert_bootfs_directory(&mut self, directory: &crate::EmbeddedBootDirectory) {
+        let absolute = embedded_absolute_path(directory.path());
+        let mut current = String::from("/");
+
+        for segment in directory
+            .path()
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+        {
+            let next = join_embedded_child(&current, segment);
+            if next == absolute {
+                break;
+            }
+
+            self.ensure_directory(&next, true);
+            current = next;
+        }
+
+        self.ensure_bootfs_directory(&absolute, directory.modified_nanos());
+    }
+
+    fn insert_bootfs_file(&mut self, file: &crate::EmbeddedBootFile) {
         let absolute = embedded_absolute_path(file.path());
         let mut current = String::from("/");
 
@@ -1965,9 +1994,8 @@ where
     /// not linger.
     pub(crate) fn invalidate_host_subtree(&mut self, path: &str) {
         let prefix = crate::directory_prefix(path);
-        self.snapshot
-            .inner
-            .lock()
+        let mut state = self.snapshot.inner.lock();
+        state
             .nodes
             .retain(|node| node.path != path && !node.path.starts_with(&prefix));
     }
@@ -2004,6 +2032,19 @@ where
     }
 
     fn ensure_directory(&mut self, path: &str, readonly: bool) {
+        self.ensure_directory_with_timestamp(path, readonly, 0);
+    }
+
+    fn ensure_bootfs_directory(&mut self, path: &str, modified_nanos: u64) {
+        self.ensure_directory_with_timestamp(path, true, modified_nanos);
+    }
+
+    fn ensure_directory_with_timestamp(
+        &mut self,
+        path: &str,
+        readonly: bool,
+        timestamp_nanos: u64,
+    ) {
         if path == "/" {
             return;
         }
@@ -2016,6 +2057,11 @@ where
                 path
             );
             existing.readonly |= readonly;
+            if timestamp_nanos != 0 {
+                existing.access_nanos = timestamp_nanos;
+                existing.modified_nanos = timestamp_nanos;
+                existing.status_nanos = timestamp_nanos;
+            }
             return;
         }
 
@@ -2027,7 +2073,7 @@ where
             FsNodeKind::Directory,
             Bytes::new(),
             identity,
-            0,
+            timestamp_nanos,
             readonly,
         ));
     }
@@ -2609,14 +2655,7 @@ where
         // this embedded path only handles paths that already have a
         // node (either genuinely local or previously seeded from the
         // host mount).
-        let existing = self
-            .snapshot
-            .inner
-            .lock()
-            .nodes
-            .iter()
-            .find(|node| node.path == absolute)
-            .cloned();
+        let existing = self.get_node(&absolute).ok();
         if let Some(existing) = existing {
             if open_flags.contains(fs_types::OpenFlags::EXCLUSIVE)
                 && open_flags.contains(fs_types::OpenFlags::CREATE)
@@ -3038,7 +3077,8 @@ where
         }
 
         let source_prefix = crate::directory_prefix(&source_absolute);
-        for node in &mut self.snapshot.inner.lock().nodes {
+        let mut state = self.snapshot.inner.lock();
+        for node in &mut state.nodes {
             if node.path == source_absolute {
                 node.path = destination_absolute.clone();
                 node.touch_status(now_nanos);
@@ -5578,8 +5618,9 @@ mod tests {
     use alloc::vec::Vec;
 
     use crate::{
-        AuthorityDomain, ComponentHostFilesystemState, ComponentNetworkService, EmbeddedBootFile,
-        EmbeddedBootFs, ObjectIdentity, UnsupportedHostFileSystem,
+        AuthorityDomain, ComponentHostFilesystemState, ComponentNetworkService,
+        EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs, ObjectIdentity,
+        UnsupportedHostFileSystem,
     };
     use futures_lite::future::block_on;
 
@@ -5925,8 +5966,9 @@ mod tests {
     }
 
     fn test_bootfs() -> EmbeddedBootFs {
+        let directories = Box::leak(Box::new([EmbeddedBootDirectory::new("bin/empty", 43)]));
         let files = Box::leak(Box::new([EmbeddedBootFile::new("bin/tool", b"tool", 42)]));
-        EmbeddedBootFs::new(files)
+        EmbeddedBootFs::new(directories, files)
     }
 
     fn readonly_root_descriptor() -> FsDescriptor {
@@ -6513,6 +6555,13 @@ mod tests {
             .expect("bootfs program directory must be present");
         assert_eq!(directory.kind, FsNodeKind::Directory);
         assert!(directory.readonly);
+
+        let empty = filesystem
+            .get_node("/bin/empty")
+            .expect("bootfs empty directory must be present");
+        assert_eq!(empty.kind, FsNodeKind::Directory);
+        assert!(empty.readonly);
+        assert_eq!(empty.modified_nanos, 43);
     }
 
     #[test]

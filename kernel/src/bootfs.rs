@@ -18,13 +18,17 @@ pub struct EmbeddedBootFile {
     modified_nanos: u64,
 }
 
+/// Single immutable directory embedded into the kernel image at compile time.
+#[derive(Clone, Copy)]
+pub struct EmbeddedBootDirectory {
+    path: &'static str,
+    modified_nanos: u64,
+}
+
 /// Immutable read-only boot filesystem image.
-///
-/// The image is intentionally simple: a sorted flat file list. Directories are
-/// derived from path prefixes, which keeps the compiled representation compact
-/// and architecture-neutral.
 #[derive(Clone, Copy)]
 pub struct EmbeddedBootFs {
+    directories: &'static [EmbeddedBootDirectory],
     files: &'static [EmbeddedBootFile],
 }
 
@@ -82,9 +86,33 @@ impl EmbeddedBootFile {
     }
 }
 
+impl EmbeddedBootDirectory {
+    pub const fn new(path: &'static str, modified_nanos: u64) -> Self {
+        Self {
+            path,
+            modified_nanos,
+        }
+    }
+
+    pub const fn path(&self) -> &'static str {
+        self.path
+    }
+
+    pub const fn modified_nanos(&self) -> u64 {
+        self.modified_nanos
+    }
+}
+
 impl EmbeddedBootFs {
-    pub const fn new(files: &'static [EmbeddedBootFile]) -> Self {
-        Self { files }
+    pub const fn new(
+        directories: &'static [EmbeddedBootDirectory],
+        files: &'static [EmbeddedBootFile],
+    ) -> Self {
+        Self { directories, files }
+    }
+
+    pub const fn directories(&self) -> &'static [EmbeddedBootDirectory] {
+        self.directories
     }
 
     pub const fn files(&self) -> &'static [EmbeddedBootFile] {
@@ -92,7 +120,7 @@ impl EmbeddedBootFs {
     }
 
     pub const fn is_empty(&self) -> bool {
-        self.files.is_empty()
+        self.directories.is_empty() && self.files.is_empty()
     }
 
     /// Creates the root directory capability for this boot filesystem.
@@ -108,6 +136,14 @@ impl EmbeddedBootFs {
 
     fn directory_exists(&self, path: &str) -> bool {
         if path.is_empty() {
+            return true;
+        }
+
+        if self
+            .directories
+            .iter()
+            .any(|directory| directory.path == path)
+        {
             return true;
         }
 
@@ -183,30 +219,8 @@ impl BootDirectoryHandleExt for DirectoryHandle<BootDirectory> {
         };
         let mut entries = Vec::new();
 
-        for file in directory.image.files() {
-            let Some(remainder) = file.path.strip_prefix(&prefix) else {
-                continue;
-            };
-            if remainder.is_empty() {
-                continue;
-            }
-
-            let (name, is_directory) = match remainder.split_once('/') {
-                Some((name, _)) => (name, true),
-                None => (remainder, false),
-            };
-
-            if entries
-                .iter()
-                .any(|entry: &BootDirectoryEntry| entry.name == name)
-            {
-                continue;
-            }
-
-            entries.push(BootDirectoryEntry {
-                name: name.to_owned(),
-                is_directory,
-            });
+        for child in directory_child_entries(&directory.image, &prefix) {
+            push_boot_directory_entry(&mut entries, child.name, child.is_directory);
         }
 
         entries
@@ -250,6 +264,57 @@ impl BootDirectoryHandleExt for DirectoryHandle<BootDirectory> {
             .file(&path)
             .map(|file| KernelResource::new(file, rights))
     }
+}
+
+struct DirectoryChildEntry<'a> {
+    name: &'a str,
+    is_directory: bool,
+}
+
+fn directory_child_entries<'a>(
+    image: &'a EmbeddedBootFs,
+    prefix: &'a str,
+) -> impl Iterator<Item = DirectoryChildEntry<'a>> {
+    let directories = image.directories().iter().filter_map(move |directory| {
+        let remainder = directory.path.strip_prefix(prefix)?;
+        if remainder.is_empty() {
+            return None;
+        }
+        let name = remainder
+            .split_once('/')
+            .map_or(remainder, |(name, _)| name);
+        Some(DirectoryChildEntry {
+            name,
+            is_directory: true,
+        })
+    });
+    let files = image.files().iter().filter_map(move |file| {
+        let remainder = file.path.strip_prefix(prefix)?;
+        if remainder.is_empty() {
+            return None;
+        }
+        let (name, is_directory) = match remainder.split_once('/') {
+            Some((name, _)) => (name, true),
+            None => (remainder, false),
+        };
+        Some(DirectoryChildEntry { name, is_directory })
+    });
+    directories.chain(files)
+}
+
+fn push_boot_directory_entry(
+    entries: &mut Vec<BootDirectoryEntry>,
+    name: &str,
+    is_directory: bool,
+) {
+    if entries.iter().any(|entry| entry.name == name) {
+        return;
+    }
+
+    entries.push(BootDirectoryEntry {
+        name: name.to_owned(),
+        is_directory,
+    });
 }
 
 impl FileSystem for EmbeddedBootFs {
@@ -309,45 +374,19 @@ impl Directory for BootDirectory {
             };
             let mut entries: Vec<DirectoryEntry<BootDirectory, BootFile>> = Vec::new();
 
-            for file in directory.image.files() {
-                let Some(remainder) = file.path.strip_prefix(&prefix) else {
+            for child in directory_child_entries(&directory.image, &prefix) {
+                let next_path = directory_child_path(&directory.path, child.name);
+                if directory_entry_exists(&entries, &next_path) {
                     continue;
                 };
-                if remainder.is_empty() {
-                    continue;
-                }
 
-                match remainder.split_once('/') {
-                    Some((name, _)) => {
-                        let next_path = if directory.path.is_empty() {
-                            name.to_owned()
-                        } else {
-                            let mut path =
-                                String::with_capacity(directory.path.len() + 1 + name.len());
-                            path.push_str(&directory.path);
-                            path.push('/');
-                            path.push_str(name);
-                            path
-                        };
-                        if entries.iter().any(|entry| match entry {
-                            DirectoryEntry::Directory(existing) => existing.path == next_path,
-                            DirectoryEntry::File(existing) => existing.path == next_path,
-                        }) {
-                            continue;
-                        }
-
-                        entries.push(DirectoryEntry::Directory(BootDirectory {
-                            image: directory.image,
-                            path: next_path,
-                        }));
-                    }
-                    None => {
-                        entries.push(DirectoryEntry::File(BootFile {
-                            path: file.path,
-                            contents: file.contents,
-                            offset: 0,
-                        }));
-                    }
+                if child.is_directory {
+                    entries.push(DirectoryEntry::Directory(BootDirectory {
+                        image: directory.image,
+                        path: next_path,
+                    }));
+                } else if let Some(file) = directory.image.file(&next_path) {
+                    entries.push(DirectoryEntry::File(file));
                 }
             }
 
@@ -379,6 +418,25 @@ impl Directory for BootDirectory {
     async fn rename(&self, _source: &str, _destination: &str) -> IoResult<()> {
         Err(IoError::ReadOnly)
     }
+}
+
+fn directory_child_path(directory: &str, child: &str) -> String {
+    if directory.is_empty() {
+        child.to_owned()
+    } else {
+        let mut path = String::with_capacity(directory.len() + 1 + child.len());
+        path.push_str(directory);
+        path.push('/');
+        path.push_str(child);
+        path
+    }
+}
+
+fn directory_entry_exists(entries: &[DirectoryEntry<BootDirectory, BootFile>], path: &str) -> bool {
+    entries.iter().any(|entry| match entry {
+        DirectoryEntry::Directory(existing) => existing.path == path,
+        DirectoryEntry::File(existing) => existing.path == path,
+    })
 }
 
 impl File for BootFile {
@@ -444,17 +502,20 @@ mod tests {
     use futures_lite::future::block_on;
     use helios_kernel_macro::bootfs;
 
-    use super::{BootDirectoryHandleExt, EmbeddedBootFile, EmbeddedBootFs};
+    use super::{BootDirectoryHandleExt, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs};
     use helios_hal::fs::{
         Directory, DirectoryEntry, DirectoryRights, File, FileRights, FileSystem,
     };
     use helios_hal::io::IoError;
 
-    const IMAGE: EmbeddedBootFs = EmbeddedBootFs::new(&[
-        EmbeddedBootFile::new("bin/init.program", b"init", 0),
-        EmbeddedBootFile::new("lib/runtime.component", b"runtime", 0),
-        EmbeddedBootFile::new("etc/config.txt", b"config", 0),
-    ]);
+    const IMAGE: EmbeddedBootFs = EmbeddedBootFs::new(
+        &[EmbeddedBootDirectory::new("empty", 0)],
+        &[
+            EmbeddedBootFile::new("bin/init.program", b"init", 0),
+            EmbeddedBootFile::new("lib/runtime.component", b"runtime", 0),
+            EmbeddedBootFile::new("etc/config.txt", b"config", 0),
+        ],
+    );
     const MACRO_IMAGE: EmbeddedBootFs = bootfs!("src/bootfs_test_data");
 
     #[test]
@@ -462,7 +523,7 @@ mod tests {
         let root = IMAGE.root_directory(DirectoryRights::READ);
         let entries = root.list();
 
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 4);
         assert!(
             entries
                 .iter()
@@ -477,6 +538,11 @@ mod tests {
             entries
                 .iter()
                 .any(|entry| entry.name() == "etc" && entry.is_directory())
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.name() == "empty" && entry.is_directory())
         );
     }
 

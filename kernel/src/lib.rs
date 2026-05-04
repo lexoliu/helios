@@ -70,8 +70,8 @@ pub mod runtime_memory {
     };
 }
 pub use bootfs::{
-    BootDirectory, BootDirectoryEntry, BootDirectoryHandleExt, BootFile, EmbeddedBootFile,
-    EmbeddedBootFs,
+    BootDirectory, BootDirectoryEntry, BootDirectoryHandleExt, BootFile, EmbeddedBootDirectory,
+    EmbeddedBootFile, EmbeddedBootFs,
 };
 pub use child_io::{ByteReadWait, ByteReader, ByteWriter, ClosedPeer, TryRead, byte_channel};
 pub use compaction::{
