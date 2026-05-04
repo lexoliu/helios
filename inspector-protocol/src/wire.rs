@@ -41,9 +41,12 @@ where
     let payload = encode_frame(frame)?;
     let len = u32::try_from(payload.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame payload is too large"))?;
-    write_all(io, &FRAME_MAGIC).await?;
-    write_all(io, &len.to_le_bytes()).await?;
-    write_all(io, &payload).await?;
+    let mut frame =
+        Vec::with_capacity(FRAME_MAGIC.len() + core::mem::size_of::<u32>() + payload.len());
+    frame.extend_from_slice(&FRAME_MAGIC);
+    frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(&payload);
+    write_all(io, &frame).await?;
     flush(io).await
 }
 
