@@ -5320,7 +5320,7 @@ async fn run_program_component<CpuImpl, HostFs>(
     args: Vec<String>,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
-    _filesystem: Option<DebugFileSystemSnapshot>,
+    filesystem: Option<DebugFileSystemSnapshot>,
     _signal_state: WasixSignalState,
     spawner: crate::Spawner<CpuImpl>,
     progress: helios_hal::watchdog::ProgressCounter,
@@ -5352,7 +5352,12 @@ where
     let store_prepare_started = profile_runtime_state
         .profiling_enabled()
         .then(|| profile_cpu.now().ticks());
-    let filesystem = DebugFileSystem::new(exec_context.runtime_state.clone());
+    let filesystem = match filesystem {
+        Some(snapshot) => {
+            DebugFileSystem::from_snapshot(exec_context.runtime_state.clone(), snapshot)
+        }
+        None => DebugFileSystem::new(exec_context.runtime_state.clone()),
+    };
     let mut store = crate::wasmtime_adapter::store_with_state(
         engine.raw(),
         StoreData::<CpuImpl, HostFs>::new(
