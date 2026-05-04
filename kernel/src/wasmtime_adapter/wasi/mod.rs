@@ -1597,6 +1597,11 @@ enum FileWriteMode {
     Append,
 }
 
+enum FsWriteOffset {
+    At(usize),
+    Append,
+}
+
 struct FileWriteConsumer<T, CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
@@ -2324,6 +2329,16 @@ where
         bytes: &[u8],
         now_nanos: u64,
     ) -> core::result::Result<(), fs_types::ErrorCode> {
+        self.write_at_or_append(descriptor, FsWriteOffset::At(offset), bytes, now_nanos)
+    }
+
+    fn write_at_or_append(
+        &mut self,
+        descriptor: &FsDescriptor,
+        offset: FsWriteOffset,
+        bytes: &[u8],
+        now_nanos: u64,
+    ) -> core::result::Result<(), fs_types::ErrorCode> {
         // Host-backed writes would require an async flush path; stream
         // consumers run in sync poll contexts, so we must not block here.
         // Writing to host files is not yet supported; callers see a clean
@@ -2332,9 +2347,6 @@ where
             return Err(fs_types::ErrorCode::Unsupported);
         }
 
-        let end = offset
-            .checked_add(bytes.len())
-            .ok_or(fs_types::ErrorCode::Overflow)?;
         let mut state = self.snapshot.inner.lock();
         let Some(index) = state
             .nodes
@@ -2355,6 +2367,13 @@ where
         }
         let identity = node.identity;
         let linked_count = node.link_count;
+        let offset = match offset {
+            FsWriteOffset::At(offset) => offset,
+            FsWriteOffset::Append => node.contents.len(),
+        };
+        let end = offset
+            .checked_add(bytes.len())
+            .ok_or(fs_types::ErrorCode::Overflow)?;
         let contents = core::mem::take(&mut state.nodes[index].contents);
         let mut contents = if linked_count == 1 {
             match contents.try_into_mut() {
@@ -2389,13 +2408,7 @@ where
         bytes: &[u8],
         now_nanos: u64,
     ) -> core::result::Result<(), fs_types::ErrorCode> {
-        // Host-backed appends would require async I/O in a sync stream
-        // consumer context; not supported without an async flush path.
-        if self.host_path(&descriptor.path).is_some() {
-            return Err(fs_types::ErrorCode::Unsupported);
-        }
-        let offset = self.get_node(&descriptor.path)?.contents.len();
-        self.write_at(descriptor, offset, bytes, now_nanos)
+        self.write_at_or_append(descriptor, FsWriteOffset::Append, bytes, now_nanos)
     }
 
     pub(crate) fn set_size(
