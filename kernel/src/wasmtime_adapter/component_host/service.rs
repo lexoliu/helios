@@ -389,6 +389,7 @@ where
     next_thread_id: u32,
     threads: Vec<WasixThread>,
     requested_exit: Option<u32>,
+    exec_replacement: Option<WasixExecReplacement>,
 }
 
 struct WasixChildProcess {
@@ -480,6 +481,7 @@ enum WasixExecSearchPath<'a> {
 
 struct CoreModuleRestore {
     memory: SharedMemory,
+    memory_spec: SharedMemorySpec,
     descriptors: Preview1DescriptorTable,
     signal_dispositions: Vec<WasixSignalDisposition>,
     stack_lower: u32,
@@ -488,6 +490,23 @@ struct CoreModuleRestore {
     memory_stack: Vec<u8>,
     rewind_stack: Vec<u8>,
     value: u64,
+}
+
+struct WasixExecReplacement {
+    name: String,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+    executable: ProgramExecutable,
+    authority: ProcessAuthority,
+    filesystem: Option<DebugFileSystemSnapshot>,
+    descriptors: Option<Preview1DescriptorTable>,
+    signal_state: WasixSignalState,
+    signal_dispositions: Vec<WasixSignalDisposition>,
+}
+
+enum CoreModuleRunCompletion {
+    Exit(Result<ChildExit, ProgramExecError>),
+    Exec(WasixExecReplacement),
 }
 
 #[derive(Clone)]
@@ -1465,7 +1484,7 @@ where
         let run_spawner = spawner.clone();
         let progress = spawner.progress_counter();
 
-        spawner.spawn_detached(async move {
+        spawner.spawn_local_detached(async move {
             let result = run_program_executable(
                 exec_context,
                 request.name,
@@ -1560,45 +1579,6 @@ where
             filesystem,
             None,
             Vec::new(),
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn exec_buffered_with_snapshot_and_descriptors(
-        &self,
-        exec_context: ProgramExecContext<CpuImpl, HostFs>,
-        name: impl Into<String>,
-        args: Vec<String>,
-        env: Vec<(String, String)>,
-        source: ProgramSource,
-        hint: Option<AotCompileHint>,
-        stdin: Vec<u8>,
-        authority: ProcessAuthority,
-        filesystem: Option<DebugFileSystemSnapshot>,
-        descriptors: Option<Preview1DescriptorTable>,
-        signal_dispositions: Vec<WasixSignalDisposition>,
-    ) -> Result<(ExecResult, Option<DebugFileSystemSnapshot>), ProgramExecError> {
-        let executable = self
-            .load_executable(&exec_context, &source, hint, exec_context.write_serial)
-            .await?;
-        let descriptors = match &executable {
-            ProgramExecutable::Component(_) => None,
-            ProgramExecutable::CoreModule(_) | ProgramExecutable::ForkedCoreModule { .. } => {
-                descriptors
-            }
-        };
-        self.exec_loaded_buffered(
-            exec_context,
-            name.into(),
-            args,
-            env,
-            executable,
-            stdin,
-            authority,
-            filesystem,
-            descriptors,
-            signal_dispositions,
         )
         .await
     }
@@ -2291,6 +2271,7 @@ where
             next_thread_id: 1,
             threads: Vec::new(),
             requested_exit: None,
+            exec_replacement: None,
         }
     }
 
@@ -2422,6 +2403,14 @@ where
 
     fn request_exit(&mut self, code: u32) {
         self.requested_exit = Some(code);
+    }
+
+    fn request_exec_replacement(&mut self, replacement: WasixExecReplacement) {
+        self.exec_replacement = Some(replacement);
+    }
+
+    fn take_exec_replacement(&mut self) -> Option<WasixExecReplacement> {
+        self.exec_replacement.take()
     }
 
     fn set_thread_id(&mut self, thread_id: u32) {
@@ -4783,6 +4772,7 @@ where
                 progress,
                 compiled,
                 engine,
+                runtime,
                 preview1_core_linker,
                 shared_memory_pool,
                 launched_instance,
@@ -4806,7 +4796,9 @@ where
                 compiled,
                 restore,
                 engine,
+                runtime,
                 preview1_core_linker,
+                shared_memory_pool,
                 launched_instance,
                 stdin_reader,
                 stdout_writer,
@@ -4832,6 +4824,7 @@ async fn run_program_core_module<CpuImpl, HostFs>(
     progress: helios_hal::watchdog::ProgressCounter,
     compiled: Arc<WasmtimeCompiledCoreModule>,
     engine: &crate::wasmtime_adapter::WasmtimeEngine,
+    runtime: &crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
     preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
     shared_memory_pool: Arc<Mutex<SharedMemoryPool>>,
     launched_instance: crate::RegisteredInstance,
@@ -4851,6 +4844,12 @@ where
     let profile_cpu = exec_context.cpu.clone();
     let profile_runtime_state = exec_context.runtime_state.clone();
     let instance_id = launched_instance.id();
+    let replacement_exec_context = exec_context.clone();
+    let replacement_instance = launched_instance.clone();
+    let replacement_stdin = stdin_reader.clone();
+    let replacement_stdout = stdout_writer.clone();
+    let replacement_stderr = stderr_writer.clone();
+    let replacement_core_linker = preview1_core_linker.clone();
     let imported_memory_spec = imported_shared_memory_spec_with_user_budget(&compiled.module)?;
     let imported_memory = match imported_memory_spec {
         Some(spec) => Some(shared_memory_pool.lock().acquire(engine.raw(), spec)?),
@@ -4858,7 +4857,7 @@ where
     };
     let recycle_memory = imported_memory.clone();
     let wasix_abi = core_module_imports_wasix(&compiled.module);
-    let (result, recycle_allowed) = {
+    let (completion, recycle_allowed) = {
         let mut store = wasmtime::Store::new(
             engine.raw(),
             Preview1ProgramStore::<CpuImpl, HostFs>::new(
@@ -4944,22 +4943,28 @@ where
         run_done.store(true, core::sync::atomic::Ordering::Release);
         super::emit_program_stage_marker(exec_context.write_serial, "program:run-core-end");
 
-        let child_exit = match result {
-            Ok(()) => Ok(ChildExit {
+        let completion = match result {
+            Ok(()) => CoreModuleRunCompletion::Exit(Ok(ChildExit {
                 instance_id,
                 exit_code: 0,
                 filesystem: Some(store.data().filesystem.snapshot()),
-            }),
-            Err(error) => match store.data_mut().take_requested_exit() {
-                Some(code) => Ok(ChildExit {
-                    instance_id,
-                    exit_code: code,
-                    filesystem: Some(store.data().filesystem.snapshot()),
-                }),
-                None => Err(map_program_runtime_error(error)),
-            },
+            })),
+            Err(error) => {
+                if let Some(replacement) = store.data_mut().take_exec_replacement() {
+                    CoreModuleRunCompletion::Exec(replacement)
+                } else {
+                    CoreModuleRunCompletion::Exit(match store.data_mut().take_requested_exit() {
+                        Some(code) => Ok(ChildExit {
+                            instance_id,
+                            exit_code: code,
+                            filesystem: Some(store.data().filesystem.snapshot()),
+                        }),
+                        None => Err(map_program_runtime_error(error)),
+                    })
+                }
+            }
         };
-        (child_exit, store.data().threads.is_empty())
+        (completion, store.data().threads.is_empty())
     };
 
     if recycle_allowed {
@@ -4967,7 +4972,34 @@ where
             shared_memory_pool.lock().recycle(spec, memory);
         }
     }
-    result
+    match completion {
+        CoreModuleRunCompletion::Exit(result) => result,
+        CoreModuleRunCompletion::Exec(replacement) => {
+            Box::pin(run_program_executable(
+                replacement_exec_context,
+                replacement.name,
+                replacement.args,
+                replacement.env,
+                replacement.authority,
+                replacement.filesystem,
+                replacement.descriptors,
+                replacement.signal_state,
+                replacement.signal_dispositions,
+                spawner,
+                progress,
+                replacement.executable,
+                engine,
+                runtime,
+                replacement_core_linker,
+                shared_memory_pool,
+                replacement_instance,
+                replacement_stdin,
+                replacement_stdout,
+                replacement_stderr,
+            ))
+            .await
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4984,7 +5016,9 @@ async fn run_program_core_module_with_restore<CpuImpl, HostFs>(
     compiled: Arc<WasmtimeCompiledCoreModule>,
     restore: CoreModuleRestore,
     engine: &crate::wasmtime_adapter::WasmtimeEngine,
+    runtime: &crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
     preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
+    shared_memory_pool: Arc<Mutex<SharedMemoryPool>>,
     launched_instance: crate::RegisteredInstance,
     stdin_reader: crate::ByteReader,
     stdout_writer: crate::ByteWriter,
@@ -5002,119 +5036,173 @@ where
     let profile_cpu = exec_context.cpu.clone();
     let profile_runtime_state = exec_context.runtime_state.clone();
     let instance_id = launched_instance.id();
+    let replacement_exec_context = exec_context.clone();
+    let replacement_instance = launched_instance.clone();
+    let replacement_stdin = stdin_reader.clone();
+    let replacement_stdout = stdout_writer.clone();
+    let replacement_stderr = stderr_writer.clone();
+    let replacement_core_linker = preview1_core_linker.clone();
     let imported_memory = Some(restore.memory.clone());
+    let recycle_memory = restore.memory.clone();
+    let memory_spec = restore.memory_spec;
     let wasix_abi = core_module_imports_wasix(&compiled.module);
-    let mut store = wasmtime::Store::new(
-        engine.raw(),
-        Preview1ProgramStore::<CpuImpl, HostFs>::new(
-            exec_context.cpu,
-            exec_context.timer,
-            exec_context.spawner.clone(),
-            exec_context.runtime_state,
-            launched_instance,
-            exec_context.parent_instance_id,
-            argv,
-            env,
-            authority,
-            OutputMode::Child {
-                stdin_rx: stdin_reader,
-                stdout_tx: stdout_writer,
-                stderr_tx: stderr_writer,
-            },
-            exec_context.read_serial,
+    let (completion, recycle_allowed) = {
+        let mut store = wasmtime::Store::new(
+            engine.raw(),
+            Preview1ProgramStore::<CpuImpl, HostFs>::new(
+                exec_context.cpu,
+                exec_context.timer,
+                exec_context.spawner.clone(),
+                exec_context.runtime_state,
+                launched_instance,
+                exec_context.parent_instance_id,
+                argv,
+                env,
+                authority,
+                OutputMode::Child {
+                    stdin_rx: stdin_reader,
+                    stdout_tx: stdout_writer,
+                    stderr_tx: stderr_writer,
+                },
+                exec_context.read_serial,
+                exec_context.write_serial,
+                imported_memory.clone(),
+                filesystem,
+                Some(restore.descriptors),
+                signal_state,
+                restore.signal_dispositions,
+                Some(compiled.clone()),
+                wasix_abi,
+            ),
+        );
+        configure_preview1_program_store(&mut store);
+
+        let mut linker = preview1_core_linker;
+        define_imported_shared_memory(
+            &mut linker,
+            &store,
+            &compiled.module,
+            restore.memory.clone(),
+        )?;
+
+        super::emit_program_stage_marker(
             exec_context.write_serial,
-            imported_memory.clone(),
-            filesystem,
-            Some(restore.descriptors),
-            signal_state,
-            restore.signal_dispositions,
-            Some(compiled.clone()),
-            wasix_abi,
-        ),
-    );
-    configure_preview1_program_store(&mut store);
+            "program:instantiate-core-begin",
+        );
+        let instantiate_started = profile_cpu.now().ticks();
+        let instance = linker.instantiate_async(&mut store, &compiled.module).await;
+        record_program_kernel_profile(
+            &profile_runtime_state,
+            &profile_cpu,
+            "instantiate-core-rewind",
+            instantiate_started,
+        );
+        let instance = instance.map_err(map_program_runtime_error)?;
+        super::emit_program_stage_marker(exec_context.write_serial, "program:instantiate-core-ok");
 
-    let mut linker = preview1_core_linker;
-    define_imported_shared_memory(
-        &mut linker,
-        &store,
-        &compiled.module,
-        restore.memory.clone(),
-    )?;
+        wasix_begin_rewind(
+            &mut store,
+            &instance,
+            restore.stack_lower,
+            restore.stack_upper,
+            restore.stack_pointer,
+            restore.memory_stack,
+            restore.rewind_stack,
+            Some(restore.value),
+        )
+        .await?;
 
-    super::emit_program_stage_marker(exec_context.write_serial, "program:instantiate-core-begin");
-    let instantiate_started = profile_cpu.now().ticks();
-    let instance = linker.instantiate_async(&mut store, &compiled.module).await;
-    record_program_kernel_profile(
-        &profile_runtime_state,
-        &profile_cpu,
-        "instantiate-core-rewind",
-        instantiate_started,
-    );
-    let instance = instance.map_err(map_program_runtime_error)?;
-    super::emit_program_stage_marker(exec_context.write_serial, "program:instantiate-core-ok");
+        let start = instance
+            .get_typed_func::<(), ()>(&mut store, "_start")
+            .map_err(|_| ProgramExecError {
+                kind: ProgramExecErrorKind::InvalidBinary,
+                detail: ProgramExecErrorDetail::InvalidEntryPoint,
+            })?;
 
-    wasix_begin_rewind(
-        &mut store,
-        &instance,
-        restore.stack_lower,
-        restore.stack_upper,
-        restore.stack_pointer,
-        restore.memory_stack,
-        restore.rewind_stack,
-        Some(restore.value),
-    )
-    .await?;
+        let run_done = Arc::new(core::sync::atomic::AtomicBool::new(false));
+        super::spawn_component_phase_heartbeat(
+            &spawner,
+            &run_cpu,
+            &progress,
+            exec_context.write_serial,
+            "program:run-core",
+            run_started_at,
+            &run_done,
+        );
+        super::emit_program_stage_marker(exec_context.write_serial, "program:run-core-begin");
+        let run_phase_started = profile_cpu.now().ticks();
+        let result = loop {
+            let result = start.call_async(&mut store, ()).await;
+            if handle_wasix_asyncify_completion(&mut store, &instance).await? {
+                continue;
+            }
+            break result;
+        };
+        record_program_kernel_profile(
+            &profile_runtime_state,
+            &profile_cpu,
+            "run-core-rewind",
+            run_phase_started,
+        );
+        run_done.store(true, core::sync::atomic::Ordering::Release);
+        super::emit_program_stage_marker(exec_context.write_serial, "program:run-core-end");
 
-    let start = instance
-        .get_typed_func::<(), ()>(&mut store, "_start")
-        .map_err(|_| ProgramExecError {
-            kind: ProgramExecErrorKind::InvalidBinary,
-            detail: ProgramExecErrorDetail::InvalidEntryPoint,
-        })?;
-
-    let run_done = Arc::new(core::sync::atomic::AtomicBool::new(false));
-    super::spawn_component_phase_heartbeat(
-        &spawner,
-        &run_cpu,
-        &progress,
-        exec_context.write_serial,
-        "program:run-core",
-        run_started_at,
-        &run_done,
-    );
-    super::emit_program_stage_marker(exec_context.write_serial, "program:run-core-begin");
-    let run_phase_started = profile_cpu.now().ticks();
-    let result = loop {
-        let result = start.call_async(&mut store, ()).await;
-        if handle_wasix_asyncify_completion(&mut store, &instance).await? {
-            continue;
-        }
-        break result;
-    };
-    record_program_kernel_profile(
-        &profile_runtime_state,
-        &profile_cpu,
-        "run-core-rewind",
-        run_phase_started,
-    );
-    run_done.store(true, core::sync::atomic::Ordering::Release);
-    super::emit_program_stage_marker(exec_context.write_serial, "program:run-core-end");
-
-    match result {
-        Ok(()) => Ok(ChildExit {
-            instance_id,
-            exit_code: 0,
-            filesystem: Some(store.data().filesystem.snapshot()),
-        }),
-        Err(error) => match store.data_mut().take_requested_exit() {
-            Some(code) => Ok(ChildExit {
+        let completion = match result {
+            Ok(()) => CoreModuleRunCompletion::Exit(Ok(ChildExit {
                 instance_id,
-                exit_code: code,
+                exit_code: 0,
                 filesystem: Some(store.data().filesystem.snapshot()),
-            }),
-            None => Err(map_program_runtime_error(error)),
-        },
+            })),
+            Err(error) => {
+                if let Some(replacement) = store.data_mut().take_exec_replacement() {
+                    CoreModuleRunCompletion::Exec(replacement)
+                } else {
+                    CoreModuleRunCompletion::Exit(match store.data_mut().take_requested_exit() {
+                        Some(code) => Ok(ChildExit {
+                            instance_id,
+                            exit_code: code,
+                            filesystem: Some(store.data().filesystem.snapshot()),
+                        }),
+                        None => Err(map_program_runtime_error(error)),
+                    })
+                }
+            }
+        };
+        (completion, store.data().threads.is_empty())
+    };
+
+    if recycle_allowed {
+        shared_memory_pool
+            .lock()
+            .recycle(memory_spec, recycle_memory);
+    }
+    match completion {
+        CoreModuleRunCompletion::Exit(result) => result,
+        CoreModuleRunCompletion::Exec(replacement) => {
+            Box::pin(run_program_executable(
+                replacement_exec_context,
+                replacement.name,
+                replacement.args,
+                replacement.env,
+                replacement.authority,
+                replacement.filesystem,
+                replacement.descriptors,
+                replacement.signal_state,
+                replacement.signal_dispositions,
+                spawner,
+                progress,
+                replacement.executable,
+                engine,
+                runtime,
+                replacement_core_linker,
+                shared_memory_pool,
+                replacement_instance,
+                replacement_stdin,
+                replacement_stdout,
+                replacement_stderr,
+            ))
+            .await
+        }
     }
 }
 
@@ -5681,11 +5769,15 @@ where
             kind: ProgramExecErrorKind::Unavailable,
             detail: ProgramExecErrorDetail::HostOperationFailed,
         })?;
-    let fork_memory = SharedMemory::new(
-        service.inner.engine.raw(),
-        MemoryType::shared(current_pages, PROGRAM_SHARED_MEMORY_MAX_PAGES),
-    )
-    .map_err(map_program_runtime_error)?;
+    let memory_spec = SharedMemorySpec {
+        initial_pages: current_pages,
+        maximum_pages: PROGRAM_SHARED_MEMORY_MAX_PAGES,
+    };
+    let fork_memory = service
+        .inner
+        .shared_memory_pool
+        .lock()
+        .acquire(service.inner.engine.raw(), memory_spec)?;
     let fork_data = fork_memory.data();
     if fork_data.len() < current_bytes {
         return Err(ProgramExecError {
@@ -5723,6 +5815,7 @@ where
         })?;
     let restore = CoreModuleRestore {
         memory: fork_memory,
+        memory_spec,
         descriptors: store.data().descriptors.clone(),
         signal_dispositions: store.data().signal_dispositions.clone(),
         stack_lower,
@@ -10185,7 +10278,9 @@ where
             .unwrap_or_default(),
         None => caller.data().environment.clone(),
     };
+    let process_id = caller.data().instance.id().raw().to_string();
     environment.retain(|(name, _)| name.as_str() != HELIOS_PROCESS_ID_ENV);
+    environment.push((HELIOS_PROCESS_ID_ENV.into(), process_id));
     let service = caller
         .data()
         .runtime_state
@@ -10199,38 +10294,27 @@ where
     let exec_context = caller.data().exec_context();
     let authority = caller.data().authority.clone();
     let descriptors = caller.data().descriptors.clone_for_exec();
-    let result = service
-        .exec_buffered_with_snapshot_and_descriptors(
-            exec_context,
-            prepared.guest_name,
-            argv,
-            environment,
-            prepared.source,
-            None,
-            Vec::new(),
-            authority,
-            Some(caller.data().filesystem.snapshot()),
-            Some(descriptors),
-            caller.data().signal_dispositions.clone(),
-        )
+    let filesystem = Some(caller.data().filesystem.snapshot());
+    let signal_state = caller.data().signal_state.clone();
+    let signal_dispositions = caller.data().signal_dispositions.clone();
+    let write_serial = caller.data().write_serial;
+    let executable = service
+        .load_executable(&exec_context, &prepared.source, None, write_serial)
         .await
         .map_err(wasmtime::Error::new)?;
-    let (result, filesystem) = result;
-    if let Some(filesystem) = filesystem {
-        caller
-            .data_mut()
-            .filesystem
-            .replace_with_snapshot(filesystem);
-    }
-    caller.data().write_output(
-        crate::ComponentOutputStreamKind::Stdout,
-        &result.output.stdout,
-    );
-    caller.data().write_output(
-        crate::ComponentOutputStreamKind::Stderr,
-        &result.output.stderr,
-    );
-    caller.data_mut().request_exit(result.exit_code);
+    caller
+        .data_mut()
+        .request_exec_replacement(WasixExecReplacement {
+            name: prepared.guest_name,
+            args: argv,
+            env: environment,
+            executable,
+            authority,
+            filesystem,
+            descriptors: Some(descriptors),
+            signal_state,
+            signal_dispositions,
+        });
     Err(wasmtime::Error::new(Preview1Exit))
 }
 
