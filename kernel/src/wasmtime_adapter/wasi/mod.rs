@@ -7,6 +7,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
@@ -21,7 +22,7 @@ use spin::Mutex;
 use thiserror::Error;
 use wasmtime::component::{
     Access, Accessor, Component, Destination, FutureReader, HasSelf, Resource, Source,
-    StreamConsumer, StreamProducer, StreamReader, StreamResult, VecBuffer,
+    StreamConsumer, StreamProducer, StreamReader, StreamResult, VecBuffer, WriteBuffer,
 };
 use wasmtime::{self, Result, StoreContextMut};
 
@@ -1602,6 +1603,38 @@ enum FsWriteOffset {
     Append,
 }
 
+#[derive(Default)]
+pub struct BytesStreamBuffer {
+    bytes: Bytes,
+    offset: usize,
+}
+
+impl BytesStreamBuffer {
+    fn new(bytes: Bytes) -> Self {
+        Self { bytes, offset: 0 }
+    }
+}
+
+unsafe impl WriteBuffer<u8> for BytesStreamBuffer {
+    fn remaining(&self) -> &[u8] {
+        &self.bytes[self.offset..]
+    }
+
+    fn skip(&mut self, count: usize) {
+        assert!(count <= self.remaining().len());
+        self.offset += count;
+    }
+
+    fn take(&mut self, count: usize, fun: &mut dyn FnMut(&[MaybeUninit<u8>])) {
+        assert!(count <= self.remaining().len());
+        let slice = &self.remaining()[..count];
+        // SAFETY: `u8` has no invalid bit patterns and the input slice is
+        // fully initialized for every byte Wasmtime is allowed to take.
+        fun(unsafe { core::mem::transmute::<&[u8], &[MaybeUninit<u8>]>(slice) });
+        self.skip(count);
+    }
+}
+
 struct FileWriteConsumer<T, CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
@@ -1669,7 +1702,7 @@ where
     HostFs: crate::HostFileSystem,
 {
     type Item = u8;
-    type Buffer = VecBuffer<u8>;
+    type Buffer = BytesStreamBuffer;
 
     fn poll_produce<'a>(
         mut self: Pin<&mut Self>,
@@ -1701,7 +1734,7 @@ where
                         u64::try_from(bytes.len()).expect("read chunk size overflowed u64"),
                     )
                     .ok_or_else(|| wasmtime::Error::new(WasiAdapterTrap::FileReadOffsetOverflow))?;
-                destination.set_buffer(VecBuffer::from(bytes.to_vec()));
+                destination.set_buffer(BytesStreamBuffer::new(bytes));
                 Poll::Ready(Ok(StreamResult::Completed))
             }
             Err(error) => {
@@ -3238,7 +3271,7 @@ impl Drop for ChannelStreamProducer {
 
 impl<T> StreamProducer<T> for ChannelStreamProducer {
     type Item = u8;
-    type Buffer = VecBuffer<u8>;
+    type Buffer = BytesStreamBuffer;
 
     fn poll_produce(
         mut self: Pin<&mut Self>,
@@ -3266,7 +3299,7 @@ impl<T> StreamProducer<T> for ChannelStreamProducer {
                     if bytes.is_empty() {
                         continue;
                     }
-                    destination.set_buffer(VecBuffer::from(bytes.to_vec()));
+                    destination.set_buffer(BytesStreamBuffer::new(bytes));
                     return Poll::Ready(Ok(StreamResult::Completed));
                 }
             }
