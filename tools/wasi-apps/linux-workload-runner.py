@@ -20,6 +20,15 @@ LINUX_PLACEHOLDERS = {
     "{simd_lanes}": "python3 -c 'print(\"simd-lanes:17\")'",
 }
 
+HTTP_LARGE_PAYLOAD_FILE = "payload-64m.bin"
+
+
+def large_http_url(host_http_url: str) -> str:
+    prefix, separator, _ = host_http_url.rpartition("/")
+    if not separator:
+        raise SystemExit(f"host HTTP URL has no path segment: {host_http_url}")
+    return f"{prefix}/{HTTP_LARGE_PAYLOAD_FILE}"
+
 
 def render_template(template: str, host_http_url: str | None, workload: dict) -> str:
     rendered = template
@@ -29,6 +38,10 @@ def render_template(template: str, host_http_url: str | None, workload: dict) ->
         if not host_http_url:
             raise SystemExit(f"workload {workload['name']} requires --host-http-url")
         rendered = rendered.replace("{host_http_url}", host_http_url)
+    if "{host_http_large_url}" in rendered:
+        if not host_http_url:
+            raise SystemExit(f"workload {workload['name']} requires --host-http-url")
+        rendered = rendered.replace("{host_http_large_url}", large_http_url(host_http_url))
     return rendered
 
 

@@ -8,6 +8,8 @@ use helios_inspector_protocol::debugger::filesystem as debugger_fs;
 use helios_inspector_protocol::system::programs as system_programs;
 use serde::{Deserialize, Serialize};
 
+const HOST_HTTP_LARGE_PAYLOAD_FILE: &str = "payload-64m.bin";
+
 #[derive(Debug, Clone, ClapArgs)]
 pub(crate) struct WorkloadBenchCommand {
     /// Workload manifest shared with the Linux runner.
@@ -462,7 +464,23 @@ fn render_helios_template(
         })?;
         rendered = rendered.replace("{host_http_url}", url);
     }
+    if rendered.contains("{host_http_large_url}") {
+        let url = command.host_http_url.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "workload {} requires --host-http-url for VM-visible host HTTP",
+                workload.name
+            )
+        })?;
+        rendered = rendered.replace("{host_http_large_url}", &large_host_http_url(url)?);
+    }
     Ok(rendered)
+}
+
+fn large_host_http_url(host_http_url: &str) -> Result<String> {
+    let (prefix, _) = host_http_url
+        .rsplit_once('/')
+        .ok_or_else(|| anyhow::anyhow!("host HTTP URL has no path segment: {host_http_url}"))?;
+    Ok(format!("{prefix}/{HOST_HTTP_LARGE_PAYLOAD_FILE}"))
 }
 
 fn validate_output(workload: &Workload, stdout: &[u8], stderr: &[u8]) -> Result<ValidationSummary> {

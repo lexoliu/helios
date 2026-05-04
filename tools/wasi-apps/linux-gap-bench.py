@@ -16,7 +16,11 @@ from pathlib import Path
 
 
 DEFAULT_IMAGE = "debian:trixie"
+HTTP_PAYLOAD_FILE = "payload.txt"
+HTTP_LARGE_PAYLOAD_FILE = "payload-64m.bin"
 HTTP_PAYLOAD = b"helios-linux-gap:ok\n"
+HTTP_LARGE_PAYLOAD_BYTES = 64 * 1024 * 1024
+HTTP_LARGE_PAYLOAD_CHUNK = bytes(range(251))
 
 
 class QuietHttpHandler(http.server.SimpleHTTPRequestHandler):
@@ -106,6 +110,17 @@ def start_host_http(root: Path) -> tuple[socketserver.TCPServer, int]:
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, int(server.server_address[1])
+
+
+def write_http_payloads(root: Path) -> None:
+    (root / HTTP_PAYLOAD_FILE).write_bytes(HTTP_PAYLOAD)
+    large_path = root / HTTP_LARGE_PAYLOAD_FILE
+    remaining = HTTP_LARGE_PAYLOAD_BYTES
+    with large_path.open("wb") as handle:
+        while remaining:
+            chunk = HTTP_LARGE_PAYLOAD_CHUNK[: min(remaining, len(HTTP_LARGE_PAYLOAD_CHUNK))]
+            handle.write(chunk)
+            remaining -= len(chunk)
 
 
 def docker_image_digest(image: str) -> str:
@@ -226,7 +241,7 @@ def run_linux(
         "--export-json",
         "/out/linux-hyperfine.json",
     ]
-    linux_http_url = f"http://127.0.0.1:{linux_http_port}/payload.txt" if host_http_url else None
+    linux_http_url = f"http://127.0.0.1:{linux_http_port}/{HTTP_PAYLOAD_FILE}" if host_http_url else None
     for workload in native_workloads:
         runner = [
             "python3",
@@ -329,15 +344,37 @@ def comparison_rows(workloads: list[dict], helios: dict[str, dict], linux: dict[
         linux_summary = linux.get(workload["name"])
         helios_ms = helios_summary.get("median_elapsed_ms") if helios_summary else None
         linux_seconds = linux_summary.get("median") if linux_summary else None
+        throughput_bytes = workload.get("throughput_bytes")
         rows.append(
             {
                 "name": workload["name"],
                 "class": workload["class"],
                 "helios_ms": helios_ms,
                 "linux_ms": linux_seconds * 1000.0 if linux_seconds is not None else None,
+                "throughput_bytes": throughput_bytes,
             }
         )
     return rows
+
+
+def throughput_mib_s(byte_count: int | None, elapsed_ms: float | int | None) -> float | None:
+    if byte_count is None or elapsed_ms is None or elapsed_ms == 0:
+        return None
+    return (byte_count / (1024.0 * 1024.0)) / (elapsed_ms / 1000.0)
+
+
+def throughput_pair(workload: dict, helios_ms: int | None, linux_seconds: float | None) -> str:
+    byte_count = workload.get("throughput_bytes")
+    helios_rate = throughput_mib_s(byte_count, helios_ms)
+    linux_rate = throughput_mib_s(
+        byte_count,
+        linux_seconds * 1000.0 if linux_seconds is not None else None,
+    )
+    helios_text = "n/a" if helios_rate is None else f"{helios_rate:.1f} MiB/s"
+    linux_text = "n/a" if linux_rate is None else f"{linux_rate:.1f} MiB/s"
+    if byte_count is None:
+        return "n/a"
+    return f"H {helios_text} / L {linux_text}"
 
 
 def write_svg(path: Path, rows: list[dict]) -> None:
@@ -411,6 +448,81 @@ def write_svg(path: Path, rows: list[dict]) -> None:
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def write_throughput_svg(path: Path, rows: list[dict]) -> bool:
+    drawable_rows = []
+    for row in rows:
+        helios_rate = throughput_mib_s(row["throughput_bytes"], row["helios_ms"])
+        linux_rate = throughput_mib_s(row["throughput_bytes"], row["linux_ms"])
+        if helios_rate is None and linux_rate is None:
+            continue
+        drawable_rows.append({**row, "helios_rate": helios_rate, "linux_rate": linux_rate})
+    if not drawable_rows:
+        return False
+
+    width = 1040
+    left = 220
+    right = 150
+    top = 74
+    row_height = 58
+    bar_height = 16
+    gap = 5
+    max_rate = max(
+        value
+        for row in drawable_rows
+        for value in [row["helios_rate"], row["linux_rate"]]
+        if value is not None
+    )
+    max_rate = max(max_rate, 1.0)
+    height = top + row_height * len(drawable_rows) + 70
+    chart_width = width - left - right
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        '<text x="32" y="34" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="22" font-weight="700" fill="#111827">Local HTTP Throughput</text>',
+        '<text x="32" y="58" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#4b5563">Higher is better. Payloads are generated locally; no external network is used.</text>',
+        f'<line x1="{left}" y1="{top - 14}" x2="{left + chart_width}" y2="{top - 14}" stroke="#d1d5db" stroke-width="1"/>',
+        f'<text x="{left}" y="{top - 22}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="12" fill="#6b7280">0 MiB/s</text>',
+        f'<text x="{left + chart_width - 86}" y="{top - 22}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="12" fill="#6b7280">{max_rate:.1f} MiB/s</text>',
+        f'<rect x="{width - 250}" y="28" width="14" height="14" fill="#2563eb" rx="2"/>',
+        f'<text x="{width - 230}" y="40" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#374151">Helios</text>',
+        f'<rect x="{width - 160}" y="28" width="14" height="14" fill="#f97316" rx="2"/>',
+        f'<text x="{width - 140}" y="40" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#374151">Linux</text>',
+    ]
+    for index, row in enumerate(drawable_rows):
+        y = top + index * row_height
+        name = html.escape(row["name"])
+        payload_mib = row["throughput_bytes"] / (1024 * 1024)
+        lines.append(
+            f'<text x="32" y="{y + 28}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="14" fill="#111827">{name}</text>'
+        )
+        lines.append(
+            f'<text x="32" y="{y + 45}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="11" fill="#6b7280">{payload_mib:.0f} MiB local payload</text>'
+        )
+        for offset, key, color in [
+            (12, "helios_rate", "#2563eb"),
+            (12 + bar_height + gap, "linux_rate", "#f97316"),
+        ]:
+            value = row[key]
+            label = "n/a" if value is None else f"{value:.1f} MiB/s"
+            bar_width = 0 if value is None else max(1, value / max_rate * chart_width)
+            lines.append(
+                f'<rect x="{left}" y="{y + offset}" width="{bar_width:.1f}" height="{bar_height}" fill="{color}" rx="3"/>'
+            )
+            lines.append(
+                f'<text x="{left + bar_width + 8:.1f}" y="{y + offset + 13}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="12" fill="#374151">{label}</text>'
+            )
+        helios_rate = row["helios_rate"]
+        linux_rate = row["linux_rate"]
+        ratio_text = "n/a" if helios_rate is None or linux_rate in (None, 0) else f"{helios_rate / linux_rate:.2f}x"
+        lines.append(
+            f'<text x="{width - 98}" y="{y + 34}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" font-weight="700" fill="#111827">{ratio_text}</text>'
+        )
+    lines.append("</svg>")
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return True
+
+
 def write_report(
     path: Path,
     manifest: dict,
@@ -424,6 +536,8 @@ def write_report(
     rows = comparison_rows(workloads, helios, linux)
     svg_path = path.with_name("helios-vs-linux.svg")
     write_svg(svg_path, rows)
+    throughput_svg_path = path.with_name("network-throughput.svg")
+    has_throughput_svg = write_throughput_svg(throughput_svg_path, rows)
     lines = [
         "# Helios vs Native Linux Benchmark",
         "",
@@ -451,6 +565,16 @@ def write_report(
                 f"- SMP: `{vm['smp']}`",
                 f"- Memory: `{vm['memory']}`",
                 "",
+        ]
+    )
+    if has_throughput_svg:
+        lines.extend(
+            [
+                "",
+                "## Network Throughput",
+                "",
+                "![Local HTTP throughput](network-throughput.svg)",
+                "",
             ]
         )
 
@@ -462,8 +586,8 @@ def write_report(
             [
                 f"## {title}",
                 "",
-                "| Workload | Helios median | Linux median | Ratio | Validation |",
-                "| --- | ---: | ---: | ---: | --- |",
+                "| Workload | Helios median | Linux median | Ratio | Throughput | Validation |",
+                "| --- | ---: | ---: | ---: | ---: | --- |",
             ]
         )
         for workload in class_workloads:
@@ -477,7 +601,7 @@ def write_report(
             if workload["runner"] == "helios-aot":
                 validation = "helios-aot"
             lines.append(
-                f"| `{workload['name']}` | {helios_text} | {linux_text} | {ratio(helios_ms, linux_seconds)} | {validation} |"
+                f"| `{workload['name']}` | {helios_text} | {linux_text} | {ratio(helios_ms, linux_seconds)} | {throughput_pair(workload, helios_ms, linux_seconds)} | {validation} |"
             )
         lines.append("")
 
@@ -526,14 +650,14 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     http_root = out_dir / "http-root"
     http_root.mkdir(exist_ok=True)
-    (http_root / "payload.txt").write_bytes(HTTP_PAYLOAD)
+    write_http_payloads(http_root)
 
     needs_http = any(workload.get("requires_host_http", False) for workload in workloads)
     server = None
     host_http_url = None
     if needs_http:
         server, port = start_host_http(http_root)
-        host_http_url = f"http://{args.helios_host_http_host}:{port}/payload.txt"
+        host_http_url = f"http://{args.helios_host_http_host}:{port}/{HTTP_PAYLOAD_FILE}"
 
     try:
         helios_jsonl = None

@@ -111,6 +111,25 @@
       "stdout_contains": ["helios-linux-gap:ok"],
       "stderr_empty": true,
       "requires_host_http": true
+    },
+    {
+      "name": "curl-http-throughput",
+      "class": "io-bound",
+      "runner": "program",
+      "description": "Fetch and discard a deterministic 64 MiB local HTTP payload.",
+      "program": "{curl}",
+      "args": [
+        "--output",
+        "/dev/null",
+        "--write-out",
+        "curl-http-throughput:%{size_download}\\n",
+        "{host_http_large_url}"
+      ],
+      "boot_programs": ["curl"],
+      "stdout_contains": ["curl-http-throughput:67108864"],
+      "stderr_empty": true,
+      "requires_host_http": true,
+      "throughput_bytes": 67108864
     }
   ]
 }

@@ -12,6 +12,7 @@ use core::future::Future;
 use core::num::NonZeroU32;
 use core::task::Poll;
 use core::time::Duration;
+use smallvec::SmallVec;
 
 use helios_hal::cpu::Cpu;
 use helios_hal::io::IoError;
@@ -45,13 +46,21 @@ const UDP_BUFFER_PACKETS: usize = 16;
 const EPHEMERAL_PORT_START: u16 = 49_152;
 const EPHEMERAL_PORT_END: u16 = 65_535;
 const LOCAL_NETWORK_PORT: NetworkPortId = NetworkPortId::new(0);
+const NETWORK_FRAME_BURST: usize = 8;
+
+type InboundFrame = Box<[u8]>;
+type OutboundFrame = Vec<u8>;
+type InboundFrameBurst = SmallVec<[InboundFrame; NETWORK_FRAME_BURST]>;
+type OutboundFrameBurst = SmallVec<[OutboundFrame; NETWORK_FRAME_BURST]>;
 
 pub trait NetworkDevice: Clone + Send + Sync + 'static {
     fn mac_address(&self) -> [u8; 6];
 
     fn max_frame_len(&self) -> usize;
 
-    fn try_receive(&self) -> impl Future<Output = Result<Option<Box<[u8]>>, IoError>> + Send + '_;
+    fn try_receive(
+        &self,
+    ) -> impl Future<Output = Result<Option<InboundFrame>, IoError>> + Send + '_;
 
     fn transmit<'a>(
         &'a self,
@@ -296,8 +305,8 @@ struct NetworkState {
     dhcp_handle: SocketHandle,
     dns_handle: SocketHandle,
     icmp_handle: SocketHandle,
-    inbound: VecDeque<Box<[u8]>>,
-    outbound: VecDeque<Vec<u8>>,
+    inbound: VecDeque<InboundFrame>,
+    outbound: VecDeque<OutboundFrame>,
     ipv4_address: Option<Ipv4Cidr>,
     dns_servers: Vec<IpAddress>,
     next_echo_sequence: u16,
@@ -323,17 +332,17 @@ struct UdpSocketState {
 }
 
 struct QueueDevice<'a> {
-    inbound: &'a mut VecDeque<Box<[u8]>>,
-    outbound: &'a mut VecDeque<Vec<u8>>,
+    inbound: &'a mut VecDeque<InboundFrame>,
+    outbound: &'a mut VecDeque<OutboundFrame>,
     max_frame_len: usize,
 }
 
 struct QueueRxToken {
-    frame: Box<[u8]>,
+    frame: InboundFrame,
 }
 
 struct QueueTxToken<'a> {
-    outbound: &'a mut VecDeque<Vec<u8>>,
+    outbound: &'a mut VecDeque<OutboundFrame>,
     max_frame_len: usize,
 }
 
@@ -1323,7 +1332,8 @@ where
 
     async fn drive_network(&self) -> Result<(), IoError> {
         loop {
-            let mut received = Vec::new();
+            let mut received = InboundFrameBurst::new();
+            let receive_started = self.profile_start();
             loop {
                 match self.inner.device.try_receive().await {
                     Ok(Some(frame)) => received.push(frame),
@@ -1331,14 +1341,25 @@ where
                     Err(error) => return Err(error),
                 }
             }
-            let outbound = {
+            self.record_network_profile("rx-drain", receive_started);
+
+            let mut outbound = OutboundFrameBurst::new();
+            let poll_elapsed;
+            let drain_elapsed;
+            {
+                let poll_started = self.profile_start();
                 let mut state = self.inner.state.lock().await;
                 for frame in received {
                     state.inbound.push_back(frame);
                 }
                 state.poll(smol_now(self.now_nanos()));
-                state.take_outbound()
-            };
+                poll_elapsed = self.profile_elapsed(poll_started);
+                let drain_started = self.profile_start();
+                state.take_outbound(&mut outbound);
+                drain_elapsed = self.profile_elapsed(drain_started);
+            }
+            self.record_network_profile_elapsed("smoltcp-poll", poll_elapsed);
+            self.record_network_profile_elapsed("tx-drain", drain_elapsed);
 
             if outbound.is_empty() {
                 return Ok(());
@@ -1347,9 +1368,11 @@ where
             // A TX completion and RX readiness can be observed in the same device event. Loop
             // back after every burst so inbound packets that arrived while transmitting are
             // drained before we sleep again.
+            let transmit_started = self.profile_start();
             for frame in outbound {
                 self.inner.device.transmit(&frame).await?;
             }
+            self.record_network_profile("tx-submit", transmit_started);
         }
     }
 
@@ -1379,6 +1402,37 @@ where
         self.inner
             .runtime_state
             .uptime_nanos(self.inner.cpu.now().ticks())
+    }
+
+    fn profile_start(&self) -> Option<u64> {
+        self.inner
+            .runtime_state
+            .profiling_enabled()
+            .then(|| self.now_nanos())
+    }
+
+    fn record_network_profile(&self, phase: &'static str, started_nanos: Option<u64>) {
+        if let Some(started_nanos) = started_nanos {
+            self.record_network_profile_elapsed(
+                phase,
+                Some(self.now_nanos().saturating_sub(started_nanos)),
+            );
+        }
+    }
+
+    fn profile_elapsed(&self, started_nanos: Option<u64>) -> Option<u64> {
+        started_nanos.map(|started_nanos| self.now_nanos().saturating_sub(started_nanos))
+    }
+
+    fn record_network_profile_elapsed(&self, phase: &'static str, elapsed_nanos: Option<u64>) {
+        if let Some(elapsed_nanos) = elapsed_nanos {
+            self.inner.runtime_state.record_profile_stack_parts_nanos(
+                crate::ProfileScope::Kernel,
+                "kernel;network;",
+                phase,
+                elapsed_nanos,
+            );
+        }
     }
 
     pub fn hardware_address(&self) -> [u8; 6] {
@@ -2752,8 +2806,8 @@ impl NetworkState {
             .map(|delay| Duration::from_micros(delay.total_micros()))
     }
 
-    fn take_outbound(&mut self) -> Vec<Vec<u8>> {
-        self.outbound.drain(..).collect()
+    fn take_outbound(&mut self, outbound: &mut OutboundFrameBurst) {
+        outbound.extend(self.outbound.drain(..));
     }
 }
 
