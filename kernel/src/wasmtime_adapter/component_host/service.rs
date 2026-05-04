@@ -15045,11 +15045,22 @@ fn p1_read_iovs_to_bytes<T>(
     let Some(capacity) = capacity else {
         return Err(p1::errno::OVERFLOW);
     };
-    let mut bytes = Vec::with_capacity(capacity);
+    let mut bytes: Vec<u8> = Vec::with_capacity(capacity);
+    let mut written = 0usize;
     for (ptr, len) in iovs {
         let len = usize::try_from(len).map_err(|_| p1::errno::OVERFLOW)?;
-        let chunk = p1_read_memory(caller, memory, ptr, len).map_err(|_| p1::errno::FAULT)?;
-        bytes.extend_from_slice(&chunk);
+        let start = preview1_memory_start(memory, ptr, len).map_err(|_| p1::errno::FAULT)?;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (memory.base as *const u8).add(start),
+                bytes.as_mut_ptr().add(written),
+                len,
+            );
+        }
+        written = written.checked_add(len).ok_or(p1::errno::OVERFLOW)?;
+    }
+    unsafe {
+        bytes.set_len(written);
     }
     Ok(bytes)
 }
