@@ -1604,6 +1604,7 @@ name = "helios-compiler-support"
 version = "0.1.0"
 dependencies = [
  "helios-artifact",
+ "rayon",
  "thiserror 2.0.18",
  "wasmparser 0.245.1",
  "wasmtime",

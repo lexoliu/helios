@@ -980,6 +980,20 @@ extern "C" fn wasmtime_tls_set(ptr: *mut u8) {
 }
 
 #[unsafe(no_mangle)]
+extern "C" fn wasmtime_component_tls_get() -> *mut u8 {
+    smp::current_runtime()
+        .wasmtime_component_tls
+        .load(Ordering::Acquire)
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_component_tls_set(ptr: *mut u8) {
+    smp::current_runtime()
+        .wasmtime_component_tls
+        .store(ptr, Ordering::Release);
+}
+
+#[unsafe(no_mangle)]
 extern "C" fn wasmtime_init_traps(handler: helios_kernel::KernelNativeTrapHandler) -> i32 {
     WASMTIME_NATIVE_TRAP_HANDLER.store(handler as usize, Ordering::Release);
     smp::current_runtime()

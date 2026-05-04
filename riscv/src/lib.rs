@@ -288,6 +288,7 @@ struct HartRuntime {
     hart_id: ProcessorId,
     timer: Timer<RiscvCpu>,
     wasmtime_tls: Cell<*mut u8>,
+    wasmtime_component_tls: Cell<*mut u8>,
     native_trap_handler: Cell<Option<KernelNativeTrapHandler>>,
     debug_transport: Option<DebugTransport>,
     external_interrupts: Option<net::ExternalInterrupts>,
@@ -620,6 +621,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         hart_id: current_hart,
         timer: kernel.timer(),
         wasmtime_tls: Cell::new(core::ptr::null_mut()),
+        wasmtime_component_tls: Cell::new(core::ptr::null_mut()),
         native_trap_handler: Cell::new(None),
         debug_transport,
         external_interrupts,
@@ -804,6 +806,26 @@ extern "C" fn wasmtime_tls_get() -> *mut u8 {
 extern "C" fn wasmtime_tls_set(ptr: *mut u8) {
     let runtime = current_hart_runtime();
     runtime.wasmtime_tls.set(ptr);
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_component_tls_get() -> *mut u8 {
+    let runtime = read_hart_runtime();
+    if runtime == 0 {
+        return core::ptr::null_mut();
+    }
+
+    unsafe {
+        (*(runtime as *const HartRuntime))
+            .wasmtime_component_tls
+            .get()
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_component_tls_set(ptr: *mut u8) {
+    let runtime = current_hart_runtime();
+    runtime.wasmtime_component_tls.set(ptr);
 }
 
 #[unsafe(no_mangle)]

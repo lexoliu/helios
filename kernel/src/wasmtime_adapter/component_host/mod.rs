@@ -87,7 +87,8 @@ pub use service::{
 };
 pub(crate) use service::{ProgramExecContext, ProgramSource};
 pub use topology::{
-    ComponentHostProcessorRole, component_host_processor_role, component_host_processors_to_start,
+    ComponentHostProcessorRole, component_host_kernel_processor_count,
+    component_host_processor_role, component_host_processors_to_start,
     component_host_system_processor, component_host_worker_count, system_component_should_run_on,
 };
 
@@ -557,9 +558,27 @@ macro_rules! impl_program_bindings {
                             AotCompileHint::Performance
                         }
                     };
-                    let artifact = match service.aot(&context, &wasm, hint, request.profile).await {
-                        Ok(artifact) => artifact,
-                        Err(error) => return Ok(Err($convert_error(error))),
+                    let spawner = context.spawner();
+                    let (artifact_tx, artifact_rx) = futures::channel::oneshot::channel();
+                    spawner.spawn_detached({
+                        let service = service.clone();
+                        let context = context.clone();
+                        let profile = request.profile;
+                        async move {
+                            let result = service.aot(&context, &wasm, hint, profile).await;
+                            let _ = artifact_tx.send(result);
+                        }
+                    });
+                    let artifact = match artifact_rx.await {
+                        Ok(Ok(artifact)) => artifact,
+                        Ok(Err(error)) => return Ok(Err($convert_error(error))),
+                        Err(_) => {
+                            return Ok(Err($bindings::helios::system::programs::ExecError {
+                                kind: $bindings::helios::system::programs::ExecErrorKind::Internal,
+                                detail: "program AOT worker dropped before producing an artifact"
+                                    .to_owned(),
+                            }));
+                        }
                     };
                     match write_program_artifact(
                         accessor,

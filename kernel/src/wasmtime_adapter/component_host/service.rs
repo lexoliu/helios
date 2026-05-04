@@ -17,7 +17,7 @@ use alloc::vec;
 use bytes::Bytes;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering as AtomicOrdering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use core::task::{Context, Poll};
 use core::time::Duration;
 use helios_compiler_abi::{
@@ -120,6 +120,16 @@ where
     write_serial: fn(&[u8]),
 }
 
+impl<CpuImpl, HostFs> ProgramExecContext<CpuImpl, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    pub(crate) fn spawner(&self) -> crate::Spawner<CpuImpl> {
+        self.spawner.clone()
+    }
+}
+
 struct UserProgramServiceInner<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
@@ -144,7 +154,7 @@ where
     /// buffers. The lock is held only on the kernel side; the rayon
     /// worker pool inside the plugin still parallelises a single
     /// compile across all cores.
-    compile_lock: Mutex<()>,
+    compile_in_progress: AtomicBool,
     clock_cpu: CpuImpl,
     _marker: core::marker::PhantomData<fn() -> HostFs>,
 }
@@ -161,6 +171,16 @@ where
 {
     instance_pre: Arc<InstancePre<CompilerCoreStore<CpuImpl, HostFs>>>,
     shared: Arc<CompilerCoreShared<CompilerCoreStore<CpuImpl, HostFs>>>,
+}
+
+struct CompilerCompileSlot<'a> {
+    occupied: &'a AtomicBool,
+}
+
+impl Drop for CompilerCompileSlot<'_> {
+    fn drop(&mut self) {
+        self.occupied.store(false, AtomicOrdering::Release);
+    }
 }
 
 struct ProgramSpawnRequest {
@@ -330,6 +350,7 @@ struct CompilerCoreShared<T> {
     entropy: Mutex<crate::EntropyPool>,
     instance_pre: spin::Once<Arc<InstancePre<T>>>,
     next_thread_id: AtomicI32,
+    thread_tasks: Mutex<Vec<crate::JoinHandle<()>>>,
 }
 
 struct Preview1ProgramStore<CpuImpl, HostFs>
@@ -1071,7 +1092,7 @@ where
             core_module_cache: Mutex::new(ComponentCache::new(cache_budget)),
             compiler_artifact,
             compiler_plugin: Mutex::new(None),
-            compile_lock: Mutex::new(()),
+            compile_in_progress: AtomicBool::new(false),
             clock_cpu: cpu.clone(),
             _marker: core::marker::PhantomData,
         }),
@@ -1855,8 +1876,9 @@ where
     ) -> Result<Vec<u8>, ProgramExecError> {
         let compiler_artifact = self.read_compiler_plugin_artifact(exec_context)?;
         let compiler_payload = trusted_bootfs_payload(&compiler_artifact)?;
-        let payload =
-            self.invoke_compiler_core_module(exec_context, compiler_payload, wasm, hint, profile)?;
+        let payload = self
+            .invoke_compiler_core_module(exec_context, compiler_payload, wasm, hint, profile)
+            .await?;
         let signed =
             cwasm::sign_trusted_artifact_payload(&payload).map_err(map_artifact_trust_error)?;
         cwasm::verify_signed_artifact(UntrustedCwasm::new(&signed))
@@ -1864,7 +1886,7 @@ where
         Ok(signed)
     }
 
-    fn invoke_compiler_core_module(
+    async fn invoke_compiler_core_module(
         &self,
         exec_context: &ProgramExecContext<CpuImpl, HostFs>,
         compiler_payload: Bytes,
@@ -1872,9 +1894,10 @@ where
         hint: AotCompileHint,
         profile: bool,
     ) -> Result<Vec<u8>, ProgramExecError> {
-        let _compile_guard = self.inner.compile_lock.lock();
+        let _compile_guard = self.acquire_compiler_compile_slot().await;
         let result =
             self.invoke_compiler_inner(exec_context, &compiler_payload, wasm, hint, profile);
+        self.await_compiler_thread_tasks().await;
         // Plugin supervisor: on a kill or fatal-state error, drop the
         // cached runtime so the next call rebuilds the Module +
         // SharedMemory + InstancePre from scratch. This is the
@@ -1891,6 +1914,45 @@ where
             *self.inner.compiler_plugin.lock() = None;
         }
         result
+    }
+
+    async fn acquire_compiler_compile_slot(&self) -> CompilerCompileSlot<'_> {
+        loop {
+            if self
+                .inner
+                .compile_in_progress
+                .compare_exchange(
+                    false,
+                    true,
+                    AtomicOrdering::Acquire,
+                    AtomicOrdering::Relaxed,
+                )
+                .is_ok()
+            {
+                return CompilerCompileSlot {
+                    occupied: &self.inner.compile_in_progress,
+                };
+            }
+            crate::yield_now().await;
+        }
+    }
+
+    async fn await_compiler_thread_tasks(&self) {
+        loop {
+            let tasks = self
+                .inner
+                .compiler_plugin
+                .lock()
+                .as_ref()
+                .map(|plugin| core::mem::take(&mut *plugin.shared.thread_tasks.lock()))
+                .unwrap_or_default();
+            if tasks.is_empty() {
+                break;
+            }
+            for task in tasks {
+                task.await;
+            }
+        }
     }
 
     fn invoke_compiler_inner(
@@ -2095,6 +2157,7 @@ where
             entropy: Mutex::new(crate::EntropyPool::from_cpu(&exec_context.cpu, 0)),
             instance_pre: spin::Once::new(),
             next_thread_id: AtomicI32::new(0),
+            thread_tasks: Mutex::new(Vec::new()),
         });
         let mut linker: CoreLinker<CompilerCoreStore<CpuImpl, HostFs>> = CoreLinker::new(engine);
         add_compiler_core_imports(&mut linker, shared_memory.clone())?;
@@ -3503,10 +3566,11 @@ where
 }
 
 fn compiler_plugin_worker_threads<CpuImpl: Cpu>(cpu: &CpuImpl) -> u32 {
-    let worker_count =
-        super::component_host_worker_count(cpu.processor_count(), cpu.bootstrap_processor())
-            .saturating_sub(1)
-            .max(1);
+    let kernel_processors = super::component_host_kernel_processor_count(
+        cpu.processor_count(),
+        cpu.bootstrap_processor(),
+    );
+    let worker_count = kernel_processors.max(1);
     u32::try_from(worker_count)
         .unwrap_or_else(|_| panic!("compiler plugin processor count exceeds u32"))
 }
@@ -3593,7 +3657,8 @@ where
                     .unwrap_or_else(|| panic!("compiler thread-spawn called before instance pre"))
                     .clone();
                 let spawner = store_data.spawner.clone();
-                spawner.spawn_detached(async move {
+                let shared = store_data.shared.clone();
+                let task = spawner.spawn(async move {
                     let mut store =
                         wasmtime::Store::new(instance_pre.module().engine(), store_data);
                     configure_compiler_core_store(&mut store);
@@ -3614,6 +3679,7 @@ where
                         tracing::error!(thread_id, "compiler plugin thread failed: {error:#}");
                     }
                 });
+                shared.thread_tasks.lock().push(task);
                 thread_id
             },
         )

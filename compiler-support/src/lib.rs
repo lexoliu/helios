@@ -42,6 +42,8 @@ pub enum CompileError {
     CoreModule(wasmtime::Error),
     #[error("failed to precompile component: {0}")]
     Component(wasmtime::Error),
+    #[error("failed to build compiler worker pool: {0}")]
+    WorkerPool(rayon::ThreadPoolBuildError),
     #[error("failed to parse wasm artifact header: {0}")]
     WasmHeader(wasmparser::BinaryReaderError),
     #[error("wasm artifact did not contain a module or component header")]
@@ -63,7 +65,14 @@ pub fn precompile_artifact(
                 source,
             }
         })?;
-    precompile_artifact_with_engine(bytes, &engine)
+    if worker_count <= 1 {
+        return precompile_artifact_with_engine(bytes, &engine);
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_count)
+        .build()
+        .map_err(CompileError::WorkerPool)?;
+    pool.install(|| precompile_artifact_with_engine(bytes, &engine))
 }
 
 fn precompile_artifact_with_engine(bytes: &[u8], engine: &Engine) -> Result<PrecompiledArtifact> {
@@ -166,8 +175,10 @@ fn build_engine_config(target: &str, hint: AotCompileHint, worker_count: usize) 
 
 fn configure_target_isa_flags(config: &mut Config, target: &str) {
     if target.starts_with("aarch64-") {
-        unsafe {
-            config.cranelift_flag_enable("has_lse");
+        for flag in ["has_lse", "has_fp16"] {
+            unsafe {
+                config.cranelift_flag_enable(flag);
+            }
         }
         return;
     }

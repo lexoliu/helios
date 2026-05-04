@@ -168,6 +168,7 @@ struct ProcessorRuntime {
     logical_id: u16,
     _reserved: u16,
     wasmtime_tls: AtomicPtr<u8>,
+    wasmtime_component_tls: AtomicPtr<u8>,
     native_trap_handler: AtomicUsize,
     started: AtomicBool,
 }
@@ -179,6 +180,7 @@ impl ProcessorRuntime {
             logical_id,
             _reserved: 0,
             wasmtime_tls: AtomicPtr::new(core::ptr::null_mut()),
+            wasmtime_component_tls: AtomicPtr::new(core::ptr::null_mut()),
             native_trap_handler: AtomicUsize::new(0),
             started: AtomicBool::new(false),
         }
@@ -733,15 +735,28 @@ fn current_processor_runtime() -> &'static ProcessorRuntime {
 fn detect_aarch64_native_feature(feature: &str) -> Option<bool> {
     match feature {
         "lse" => Some(read_id_aa64isar0_el1() & 0xf00_000 != 0),
+        "fp16" => Some(aarch64_id_field(read_id_aa64pfr0_el1(), 16) == 1),
         "neon" => Some(true),
         _ => None,
     }
+}
+
+fn aarch64_id_field(register: u64, shift: u8) -> u64 {
+    (register >> shift) & 0xf
 }
 
 fn read_id_aa64isar0_el1() -> u64 {
     let value: u64;
     unsafe {
         asm!("mrs {value}, id_aa64isar0_el1", value = out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+fn read_id_aa64pfr0_el1() -> u64 {
+    let value: u64;
+    unsafe {
+        asm!("mrs {value}, id_aa64pfr0_el1", value = out(reg) value, options(nomem, nostack, preserves_flags));
     }
     value
 }
@@ -1712,6 +1727,28 @@ extern "C" fn wasmtime_tls_get() -> *mut u8 {
 extern "C" fn wasmtime_tls_set(ptr: *mut u8) {
     current_processor_runtime()
         .wasmtime_tls
+        .store(ptr, Ordering::Release);
+}
+
+#[cfg(target_os = "none")]
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_component_tls_get() -> *mut u8 {
+    let runtime = read_processor_runtime();
+    if runtime == 0 {
+        return core::ptr::null_mut();
+    }
+    unsafe {
+        (*(runtime as *const ProcessorRuntime))
+            .wasmtime_component_tls
+            .load(Ordering::Acquire)
+    }
+}
+
+#[cfg(target_os = "none")]
+#[unsafe(no_mangle)]
+extern "C" fn wasmtime_component_tls_set(ptr: *mut u8) {
+    current_processor_runtime()
+        .wasmtime_component_tls
         .store(ptr, Ordering::Release);
 }
 

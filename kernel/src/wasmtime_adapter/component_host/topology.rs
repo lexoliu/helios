@@ -67,6 +67,19 @@ pub fn component_host_worker_count(
     processor_count
 }
 
+pub fn component_host_kernel_processor_count(
+    processor_count: usize,
+    bootstrap_processor: ProcessorId,
+) -> usize {
+    (0..processor_count)
+        .map(|processor| ProcessorId::new(processor as u16))
+        .filter(|processor| {
+            component_host_processor_role(*processor, processor_count, bootstrap_processor)
+                == ComponentHostProcessorRole::Kernel
+        })
+        .count()
+}
+
 /// Returns an iterator of processor IDs that need to be started for the
 /// component-host topology. This excludes the bootstrap processor itself.
 pub fn component_host_processors_to_start(
@@ -81,7 +94,8 @@ pub fn component_host_processors_to_start(
 #[cfg(test)]
 mod tests {
     use super::{
-        ComponentHostProcessorRole, component_host_processor_role, component_host_system_processor,
+        ComponentHostProcessorRole, component_host_kernel_processor_count,
+        component_host_processor_role, component_host_system_processor,
         component_host_worker_count,
     };
     use helios_hal::cpu::ProcessorId;
@@ -113,6 +127,10 @@ mod tests {
             ComponentHostProcessorRole::SharedRuntime
         );
         assert_eq!(component_host_worker_count(1, ProcessorId::new(0)), 1);
+        assert_eq!(
+            component_host_kernel_processor_count(1, ProcessorId::new(0)),
+            0
+        );
     }
 
     #[test]
@@ -138,5 +156,9 @@ mod tests {
             ComponentHostProcessorRole::Kernel
         );
         assert_eq!(component_host_worker_count(4, ProcessorId::new(0)), 4);
+        assert_eq!(
+            component_host_kernel_processor_count(4, ProcessorId::new(0)),
+            3
+        );
     }
 }
