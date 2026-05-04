@@ -126,6 +126,7 @@ where
 {
     runtime: crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
     engine: crate::wasmtime_adapter::WasmtimeEngine,
+    preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
     component_cache: Mutex<ComponentCache<WasmtimeCompiledComponent>>,
     core_module_cache: Mutex<ComponentCache<WasmtimeCompiledCoreModule>>,
     compiler_artifact: Option<Bytes>,
@@ -964,6 +965,8 @@ where
     let runtime = crate::wasmtime_adapter::WasmtimeComponentRuntime::new(cpu.clone());
     let engine = <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as crate::ComponentRuntimeFactory<CpuImpl, HostRuntimeState<CpuImpl, HostFs>, HostFs>>::create_engine(&runtime)
         .unwrap_or_else(|error| panic!("failed to create launched-program engine: {error:#}"));
+    let preview1_core_linker = preview1_program_linker(engine.raw())
+        .unwrap_or_else(|error| panic!("failed to create preview1 program linker: {error:#}"));
     let compiler_artifact = read_bootfs_artifact(debug_state, COMPILER_PLUGIN_PATH);
     crate::wasmtime_adapter::register_oom_kick_engine(engine.raw().clone());
     debug_state
@@ -973,6 +976,7 @@ where
         inner: Arc::new(UserProgramServiceInner {
             runtime,
             engine,
+            preview1_core_linker,
             component_cache: Mutex::new(ComponentCache::new(cache_budget)),
             core_module_cache: Mutex::new(ComponentCache::new(cache_budget)),
             compiler_artifact,
@@ -1325,6 +1329,7 @@ where
         let (exit_tx, exit_rx) = futures::channel::oneshot::channel();
         let runtime = self.inner.runtime.clone();
         let engine = self.inner.engine.clone();
+        let preview1_core_linker = self.inner.preview1_core_linker.clone();
         let spawner = exec_context.spawner.clone();
         let run_spawner = spawner.clone();
         let progress = spawner.progress_counter();
@@ -1345,6 +1350,7 @@ where
                 executable,
                 &engine,
                 &runtime,
+                preview1_core_linker,
                 launched_instance,
                 stdin_reader,
                 stdout_writer,
@@ -1611,7 +1617,7 @@ where
         write_serial: fn(&[u8]),
         started_at: u64,
     ) -> Result<Arc<WasmtimeCompiledComponent>, ProgramExecError> {
-        if let Some(component) = self.inner.component_cache.lock().get(payload.as_ref()) {
+        if let Some(component) = self.inner.component_cache.lock().get(&payload) {
             super::emit_stage_marker(write_serial, "program:deserialize-cache-hit");
             let now = monotonic_nanos(&self.inner.clock_cpu);
             tracing::info!(
@@ -1673,7 +1679,7 @@ where
         write_serial: fn(&[u8]),
         started_at: u64,
     ) -> Result<Arc<WasmtimeCompiledCoreModule>, ProgramExecError> {
-        if let Some(module) = self.inner.core_module_cache.lock().get(payload.as_ref()) {
+        if let Some(module) = self.inner.core_module_cache.lock().get(&payload) {
             super::emit_stage_marker(write_serial, "program:deserialize-core-cache-hit");
             let now = monotonic_nanos(&self.inner.clock_cpu);
             tracing::info!(
@@ -2441,17 +2447,17 @@ where
         self.threads.iter().position(|thread| thread.tid == tid)
     }
 
-    async fn read_stdin(&mut self, max_bytes: usize) -> Vec<u8> {
+    async fn read_stdin(&mut self, max_bytes: usize) -> Bytes {
         let descriptor = self.descriptors.get_mut(0);
         let Some(Preview1Descriptor::Stdin { carry }) = descriptor else {
-            return Vec::new();
+            return Bytes::new();
         };
         if carry.is_empty() {
             match &self.output_mode {
                 OutputMode::Serial => loop {
                     let bytes = (self.read_serial)(u32::MAX);
                     if !bytes.is_empty() {
-                        *carry = bytes.into();
+                        *carry = Bytes::from(bytes);
                         break;
                     }
                     crate::yield_now().await;
@@ -2467,7 +2473,7 @@ where
         take_preview1_carry(carry, max_bytes)
     }
 
-    async fn read_pipe(&mut self, fd: i32, max_bytes: usize) -> Result<Vec<u8>, i32> {
+    async fn read_pipe(&mut self, fd: i32, max_bytes: usize) -> Result<Bytes, i32> {
         let reader = match self.descriptors.get_mut(fd) {
             Some(Preview1Descriptor::PipeRead { reader, carry }) => {
                 if !carry.is_empty() {
@@ -2487,7 +2493,7 @@ where
         Ok(take_preview1_carry(carry, max_bytes))
     }
 
-    async fn read_socket_pair(&mut self, fd: i32, max_bytes: usize) -> Result<Vec<u8>, i32> {
+    async fn read_socket_pair(&mut self, fd: i32, max_bytes: usize) -> Result<Bytes, i32> {
         let reader = match self.descriptors.get_mut(fd) {
             Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair {
                 reader, carry, ..
@@ -2512,7 +2518,7 @@ where
         Ok(take_preview1_carry(carry, max_bytes))
     }
 
-    fn try_read_socket_pair(&mut self, fd: i32, max_bytes: usize) -> Result<Option<Vec<u8>>, i32> {
+    fn try_read_socket_pair(&mut self, fd: i32, max_bytes: usize) -> Result<Option<Bytes>, i32> {
         let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { reader, carry, .. })) =
             self.descriptors.get_mut(fd)
         else {
@@ -2530,7 +2536,7 @@ where
                 *carry = bytes;
                 Ok(Some(take_preview1_carry(carry, max_bytes)))
             }
-            crate::TryRead::Eof => Ok(Some(Vec::new())),
+            crate::TryRead::Eof => Ok(Some(Bytes::new())),
             crate::TryRead::Pending => Ok(None),
         }
     }
@@ -2726,11 +2732,11 @@ fn preview1_cwd_from_authority(authority: &ProcessAuthority) -> Option<Preview1C
     })
 }
 
-fn take_preview1_carry(carry: &mut Bytes, max_bytes: usize) -> Vec<u8> {
+fn take_preview1_carry(carry: &mut Bytes, max_bytes: usize) -> Bytes {
     if carry.len() <= max_bytes {
-        core::mem::take(carry).to_vec()
+        core::mem::take(carry)
     } else {
-        carry.split_to(max_bytes).to_vec()
+        carry.split_to(max_bytes)
     }
 }
 
@@ -4540,6 +4546,7 @@ async fn run_program_executable<CpuImpl, HostFs>(
     executable: ProgramExecutable,
     engine: &crate::wasmtime_adapter::WasmtimeEngine,
     runtime: &crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
+    preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
     launched_instance: crate::RegisteredInstance,
     stdin_reader: crate::ByteReader,
     stdout_writer: crate::ByteWriter,
@@ -4586,6 +4593,7 @@ where
                 progress,
                 compiled,
                 engine,
+                preview1_core_linker,
                 launched_instance,
                 stdin_reader,
                 stdout_writer,
@@ -4607,6 +4615,7 @@ where
                 compiled,
                 restore,
                 engine,
+                preview1_core_linker,
                 launched_instance,
                 stdin_reader,
                 stdout_writer,
@@ -4632,6 +4641,7 @@ async fn run_program_core_module<CpuImpl, HostFs>(
     progress: helios_hal::watchdog::ProgressCounter,
     compiled: Arc<WasmtimeCompiledCoreModule>,
     engine: &crate::wasmtime_adapter::WasmtimeEngine,
+    preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
     launched_instance: crate::RegisteredInstance,
     stdin_reader: crate::ByteReader,
     stdout_writer: crate::ByteWriter,
@@ -4679,8 +4689,7 @@ where
     );
     configure_preview1_program_store(&mut store);
 
-    let mut linker = CoreLinker::new(engine.raw());
-    add_preview1_program_imports(&mut linker)?;
+    let mut linker = preview1_core_linker;
     if let Some(memory) = imported_memory {
         define_imported_shared_memory(&mut linker, &store, &compiled.module, memory)?;
     }
@@ -4751,6 +4760,7 @@ async fn run_program_core_module_with_restore<CpuImpl, HostFs>(
     compiled: Arc<WasmtimeCompiledCoreModule>,
     restore: CoreModuleRestore,
     engine: &crate::wasmtime_adapter::WasmtimeEngine,
+    preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
     launched_instance: crate::RegisteredInstance,
     stdin_reader: crate::ByteReader,
     stdout_writer: crate::ByteWriter,
@@ -4798,8 +4808,7 @@ where
     );
     configure_preview1_program_store(&mut store);
 
-    let mut linker = CoreLinker::new(engine.raw());
-    add_preview1_program_imports(&mut linker)?;
+    let mut linker = preview1_core_linker;
     define_imported_shared_memory(
         &mut linker,
         &store,
@@ -5631,6 +5640,18 @@ fn configure_preview1_program_store<CpuImpl, HostFs>(
     );
     store.set_epoch_deadline(1);
     store.epoch_deadline_async_yield_and_update(1);
+}
+
+fn preview1_program_linker<CpuImpl, HostFs>(
+    engine: &wasmtime::Engine,
+) -> Result<CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>, ProgramExecError>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let mut linker = CoreLinker::new(engine);
+    add_preview1_program_imports(&mut linker)?;
+    Ok(linker)
 }
 
 fn add_preview1_program_imports<CpuImpl, HostFs>(
@@ -7149,21 +7170,10 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let iovs = match p1_read_iovs(caller, memory, iovs, iovs_len) {
-        Ok(iovs) => iovs,
+    let bytes = match p1_read_iovs_to_bytes(caller, memory, iovs, iovs_len) {
+        Ok(bytes) => bytes,
         Err(errno) => return errno,
     };
-    let mut bytes = Vec::new();
-    for (ptr, len) in iovs {
-        let len = match usize::try_from(len) {
-            Ok(len) => len,
-            Err(_) => return p1::errno::OVERFLOW,
-        };
-        let Ok(chunk) = p1_read_memory(caller, memory, ptr, len) else {
-            return p1::errno::FAULT;
-        };
-        bytes.extend_from_slice(&chunk);
-    }
     let written = match p1_write_descriptor(caller, fd, &bytes).await {
         Ok(written) => written,
         Err(errno) => return errno,
@@ -7193,6 +7203,61 @@ where
         .iter()
         .try_fold(0usize, |acc, (_, len)| acc.checked_add(*len as usize))
         .unwrap_or(usize::MAX);
+    match caller.data().descriptors.get(fd) {
+        Some(Preview1Descriptor::Stdin { .. }) => {
+            let bytes = caller.data_mut().read_stdin(capacity).await;
+            return p1_write_iovs_from_bytes(caller, memory, iovs, &bytes, nread);
+        }
+        Some(Preview1Descriptor::PipeRead { .. }) => {
+            let bytes = match caller.data_mut().read_pipe(fd, capacity).await {
+                Ok(bytes) => bytes,
+                Err(errno) => return errno,
+            };
+            return p1_write_iovs_from_bytes(caller, memory, iovs, &bytes, nread);
+        }
+        Some(Preview1Descriptor::File {
+            descriptor, offset, ..
+        }) => {
+            let descriptor = descriptor.clone();
+            let offset = *offset;
+            let bytes = if let Some(host_path) =
+                crate::guest_host_share_path(&descriptor.path).map(ToOwned::to_owned)
+            {
+                let service = match caller.data().filesystem.host_service() {
+                    Ok(service) => service,
+                    Err(error) => return p1_errno_from_fs(error),
+                };
+                let max_bytes = match u32::try_from(capacity) {
+                    Ok(max_bytes) => max_bytes,
+                    Err(_) => return p1::errno::OVERFLOW,
+                };
+                match service.read_file_range(&host_path, offset, max_bytes).await {
+                    Ok(bytes) => Bytes::from(bytes),
+                    Err(error) => {
+                        return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(
+                            error,
+                        ));
+                    }
+                }
+            } else {
+                match caller
+                    .data()
+                    .filesystem
+                    .read_file_chunk(&descriptor, offset, capacity)
+                {
+                    Ok(bytes) => bytes,
+                    Err(error) => return p1_errno_from_fs(error),
+                }
+            };
+            if let Some(Preview1Descriptor::File { offset, .. }) =
+                caller.data_mut().descriptors.get_mut(fd)
+            {
+                *offset = offset.saturating_add(bytes.len() as u64);
+            }
+            return p1_write_iovs_from_bytes(caller, memory, iovs, &bytes, nread);
+        }
+        _ => {}
+    }
     let bytes = match p1_read_descriptor(caller, fd, capacity).await {
         Ok(bytes) => bytes,
         Err(errno) => return errno,
@@ -7660,17 +7725,10 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let iovs = match p1_read_iovs(caller, memory, iovs, iovs_len) {
-        Ok(iovs) => iovs,
+    let bytes = match p1_read_iovs_to_bytes(caller, memory, iovs, iovs_len) {
+        Ok(bytes) => bytes,
         Err(errno) => return errno,
     };
-    let mut bytes = Vec::new();
-    for (ptr, len) in iovs {
-        let Ok(chunk) = p1_read_memory(caller, memory, ptr, len as usize) else {
-            return p1::errno::FAULT;
-        };
-        bytes.extend_from_slice(&chunk);
-    }
     let Some(Preview1Descriptor::File { descriptor, .. }) = caller.data().descriptors.get(fd)
     else {
         return p1::errno::BADF;
@@ -15296,10 +15354,14 @@ where
     HostFs: crate::HostFileSystem,
 {
     match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Stdin { .. }) => Ok(caller.data_mut().read_stdin(capacity).await),
-        Some(Preview1Descriptor::PipeRead { .. }) => {
-            caller.data_mut().read_pipe(fd, capacity).await
+        Some(Preview1Descriptor::Stdin { .. }) => {
+            Ok(caller.data_mut().read_stdin(capacity).await.to_vec())
         }
+        Some(Preview1Descriptor::PipeRead { .. }) => caller
+            .data_mut()
+            .read_pipe(fd, capacity)
+            .await
+            .map(|bytes| bytes.to_vec()),
         Some(Preview1Descriptor::Event(event)) => {
             if capacity < 8 {
                 return Err(p1::errno::INVAL);

@@ -157,6 +157,7 @@ struct FsNode {
     modified_nanos: u64,
     status_nanos: u64,
     readonly: bool,
+    link_count: u64,
 }
 
 #[derive(Debug)]
@@ -195,6 +196,7 @@ impl FsNode {
             modified_nanos: timestamp_nanos,
             status_nanos: timestamp_nanos,
             readonly,
+            link_count: 1,
         }
     }
 
@@ -2019,8 +2021,9 @@ where
             .lock()
             .nodes
             .iter()
-            .filter(|node| node.identity == identity)
-            .count() as u64
+            .find(|node| node.identity == identity)
+            .map(|node| node.link_count)
+            .unwrap_or(0)
     }
 
     fn descriptor_identity(
@@ -2329,7 +2332,18 @@ where
             return Err(fs_types::ErrorCode::Unsupported);
         }
 
-        let node = self.get_node(&descriptor.path)?;
+        let end = offset
+            .checked_add(bytes.len())
+            .ok_or(fs_types::ErrorCode::Overflow)?;
+        let mut state = self.snapshot.inner.lock();
+        let Some(index) = state
+            .nodes
+            .iter()
+            .position(|node| node.path == descriptor.path)
+        else {
+            return Err(fs_types::ErrorCode::NoEntry);
+        };
+        let node = &state.nodes[index];
         if node.kind != FsNodeKind::File {
             return Err(fs_types::ErrorCode::IsDirectory);
         }
@@ -2339,11 +2353,17 @@ where
         if !descriptor.flags.contains(fs_types::DescriptorFlags::WRITE) {
             return Err(fs_types::ErrorCode::ReadOnly);
         }
-
-        let end = offset
-            .checked_add(bytes.len())
-            .ok_or(fs_types::ErrorCode::Overflow)?;
-        let mut contents = BytesMut::from(&node.contents[..]);
+        let identity = node.identity;
+        let linked_count = node.link_count;
+        let contents = core::mem::take(&mut state.nodes[index].contents);
+        let mut contents = if linked_count == 1 {
+            match contents.try_into_mut() {
+                Ok(contents) => contents,
+                Err(contents) => BytesMut::from(contents.as_ref()),
+            }
+        } else {
+            BytesMut::from(contents.as_ref())
+        };
         if contents.len() < offset {
             contents.resize(offset, 0);
         }
@@ -2351,12 +2371,8 @@ where
             contents.resize(end, 0);
         }
         contents[offset..end].copy_from_slice(bytes);
-        let identity = node.identity;
         let contents = contents.freeze();
-        for linked in self
-            .snapshot
-            .inner
-            .lock()
+        for linked in state
             .nodes
             .iter_mut()
             .filter(|node| node.identity == identity)
@@ -2396,22 +2412,35 @@ where
         }
 
         let size: usize = size.try_into().map_err(|_| fs_types::ErrorCode::Overflow)?;
-        let node = self.get_node(&descriptor.path)?;
+        let mut state = self.snapshot.inner.lock();
+        let Some(index) = state
+            .nodes
+            .iter()
+            .position(|node| node.path == descriptor.path)
+        else {
+            return Err(fs_types::ErrorCode::NoEntry);
+        };
+        let node = &state.nodes[index];
         if node.kind != FsNodeKind::File {
             return Err(fs_types::ErrorCode::IsDirectory);
         }
         if node.readonly {
             return Err(fs_types::ErrorCode::ReadOnly);
         }
-
-        let mut contents = BytesMut::from(&node.contents[..]);
-        contents.resize(size, 0);
         let identity = node.identity;
+        let linked_count = node.link_count;
+        let contents = core::mem::take(&mut state.nodes[index].contents);
+        let mut contents = if linked_count == 1 {
+            match contents.try_into_mut() {
+                Ok(contents) => contents,
+                Err(contents) => BytesMut::from(contents.as_ref()),
+            }
+        } else {
+            BytesMut::from(contents.as_ref())
+        };
+        contents.resize(size, 0);
         let contents = contents.freeze();
-        for linked in self
-            .snapshot
-            .inner
-            .lock()
+        for linked in state
             .nodes
             .iter_mut()
             .filter(|node| node.identity == identity)
@@ -2484,15 +2513,15 @@ where
         // this embedded path only handles paths that already have a
         // node (either genuinely local or previously seeded from the
         // host mount).
-        if let Some(existing) = self
+        let existing = self
             .snapshot
             .inner
             .lock()
             .nodes
             .iter()
             .find(|node| node.path == absolute)
-            .cloned()
-        {
+            .cloned();
+        if let Some(existing) = existing {
             if open_flags.contains(fs_types::OpenFlags::EXCLUSIVE)
                 && open_flags.contains(fs_types::OpenFlags::CREATE)
             {
@@ -2623,11 +2652,22 @@ where
         {
             return Err(fs_types::ErrorCode::NotEmpty);
         }
-        self.snapshot
-            .inner
-            .lock()
-            .nodes
-            .retain(|node| node.path != absolute);
+        let identity = node.identity;
+        let mut state = self.snapshot.inner.lock();
+        let before = state.nodes.len();
+        state.nodes.retain(|node| node.path != absolute);
+        if state.nodes.len() != before {
+            for linked in state
+                .nodes
+                .iter_mut()
+                .filter(|node| node.identity == identity)
+            {
+                linked.link_count = linked
+                    .link_count
+                    .checked_sub(1)
+                    .expect("filesystem hardlink count underflow");
+            }
+        }
         Ok(())
     }
 
@@ -2751,10 +2791,25 @@ where
             return Err(fs_types::ErrorCode::ReadOnly);
         }
 
+        let identity = source_node.identity;
+        let link_count = source_node
+            .link_count
+            .checked_add(1)
+            .expect("filesystem hardlink count overflow");
         let mut linked = source_node.clone();
         linked.path = destination_absolute;
+        linked.link_count = link_count;
         linked.touch_status(now_nanos);
-        self.snapshot.inner.lock().nodes.push(linked);
+        let mut state = self.snapshot.inner.lock();
+        for node in state
+            .nodes
+            .iter_mut()
+            .filter(|node| node.identity == identity)
+        {
+            node.link_count = link_count;
+            node.touch_status(now_nanos);
+        }
+        state.nodes.push(linked);
         Ok(())
     }
 
