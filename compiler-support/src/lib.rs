@@ -151,7 +151,10 @@ fn build_engine_config(target: &str, hint: AotCompileHint, worker_count: usize) 
     config.parallel_compilation(worker_count > 1);
     config.epoch_interruption(true);
     config.max_wasm_stack(8 * 1024 * 1024);
-    if !cwasm_target_uses_lazy_commit_virtual_memory(target) {
+    if cwasm_target_uses_lazy_commit_virtual_memory(target) {
+        config.memory_init_cow(true);
+        config.memory_may_move(false);
+    } else {
         config.signals_based_traps(true);
         config.memory_guard_size(CWASM_NO_VMEM_MEMORY_GUARD_SIZE);
         config.memory_reservation(CWASM_NO_VMEM_MEMORY_RESERVATION);
