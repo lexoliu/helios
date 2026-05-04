@@ -123,12 +123,55 @@ def run_helios(
     manifest: Path,
     out_dir: Path,
     iterations: int,
-    classes: list[str],
-    names: list[str],
+    workloads: list[dict],
     arch: str,
     host_http_url: str | None,
 ) -> Path:
     log = out_dir / "helios.jsonl"
+    workloads_by_class: dict[str, list[str]] = {}
+    for workload in workloads:
+        workloads_by_class.setdefault(workload["class"], []).append(workload["name"])
+
+    if len(workloads_by_class) > 1:
+        class_logs = []
+        for workload_class, workload_names in workloads_by_class.items():
+            class_log = out_dir / f"helios-{workload_class}.jsonl"
+            run_helios_once(
+                manifest,
+                class_log,
+                iterations,
+                [workload_class],
+                workload_names,
+                arch,
+                host_http_url,
+            )
+            class_logs.append(class_log)
+        with log.open("w", encoding="utf-8") as output_handle:
+            for class_log in class_logs:
+                output_handle.write(class_log.read_text(encoding="utf-8"))
+        return log
+
+    run_helios_once(
+        manifest,
+        log,
+        iterations,
+        list(workloads_by_class),
+        [workload["name"] for workload in workloads],
+        arch,
+        host_http_url,
+    )
+    return log
+
+
+def run_helios_once(
+    manifest: Path,
+    log: Path,
+    iterations: int,
+    classes: list[str],
+    names: list[str],
+    arch: str,
+    host_http_url: str | None,
+) -> None:
     env = os.environ.copy()
     env["HELIOS_WORKLOAD_BENCH_ARCH"] = arch
     env["HELIOS_WORKLOAD_BENCH_ITERATIONS"] = str(iterations)
@@ -141,7 +184,6 @@ def run_helios(
     if host_http_url:
         env["HELIOS_WORKLOAD_BENCH_HOST_HTTP_URL"] = host_http_url
     run(["tools/wasi-apps/workload-bench.sh"], env=env)
-    return log
 
 
 def run_linux(
@@ -502,8 +544,7 @@ def main() -> None:
                 args.manifest,
                 out_dir,
                 args.iterations,
-                args.classes,
-                args.workloads,
+                workloads,
                 args.arch,
                 host_http_url,
             )
