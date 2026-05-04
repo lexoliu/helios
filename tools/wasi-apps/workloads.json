@@ -4,9 +4,13 @@
     {
       "name": "quickjs-loop",
       "class": "cpu-bound",
-      "runner": "shell",
+      "runner": "program",
       "description": "Arithmetic loop in QuickJS.",
-      "command": "{quickjs} -e 'let s = 0; for (let i = 0; i < 250000; i++) s = (s + ((i * 17) % 97)) | 0; console.log(\"quickjs-loop:\" + s);'",
+      "program": "{quickjs}",
+      "args": [
+        "-e",
+        "let s = 0; for (let i = 0; i < 250000; i++) s = (s + ((i * 17) % 97)) | 0; console.log(\"quickjs-loop:\" + s);"
+      ],
       "boot_programs": ["quickjs"],
       "stdout_contains": ["quickjs-loop:"],
       "stderr_empty": true
@@ -14,18 +18,26 @@
     {
       "name": "cpython-json",
       "class": "cpu-bound",
-      "runner": "shell",
+      "runner": "program",
       "description": "Parse and serialize JSON repeatedly in CPython.",
-      "command": "{python3} -c 'import json; data=[{\"i\":i,\"s\":str(i)} for i in range(800)]; total=sum(len(json.loads(json.dumps(data,separators=(\",\",\":\")))) for _ in range(40)); print(f\"cpython-json:{total}\")'",
+      "program": "{python3}",
+      "args": [
+        "-c",
+        "import json; data=[{\"i\":i,\"s\":str(i)} for i in range(800)]; total=sum(len(json.loads(json.dumps(data,separators=(\",\",\":\")))) for _ in range(40)); print(f\"cpython-json:{total}\")"
+      ],
       "boot_programs": ["python3"],
       "stdout_contains": ["cpython-json:32000"]
     },
     {
       "name": "cpython-regex",
       "class": "cpu-bound",
-      "runner": "shell",
+      "runner": "program",
       "description": "Regex and text processing loop in CPython.",
-      "command": "{python3} -c 'import re; text=(\"alpha123 beta456 gamma789 delta000\\n\"*2000); total=sum(len(re.findall(r\"[a-z]+\\d+\", text)) for _ in range(80)); print(f\"cpython-regex:{total}\")'",
+      "program": "{python3}",
+      "args": [
+        "-c",
+        "import re; text=(\"alpha123 beta456 gamma789 delta000\\n\"*2000); total=sum(len(re.findall(r\"[a-z]+\\d+\", text)) for _ in range(80)); print(f\"cpython-regex:{total}\")"
+      ],
       "boot_programs": ["python3"],
       "stdout_contains": ["cpython-regex:640000"]
     },
@@ -41,9 +53,9 @@
     {
       "name": "wasm-simd-lanes",
       "class": "cpu-bound",
-      "runner": "shell",
+      "runner": "program",
       "description": "Execute a deterministic wasm SIMD lane computation.",
-      "command": "{simd_lanes}",
+      "program": "{simd_lanes}",
       "boot_programs": ["simd-lanes"],
       "stdout_contains": ["simd-lanes:17"],
       "stderr_empty": true
