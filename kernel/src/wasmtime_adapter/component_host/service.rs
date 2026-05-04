@@ -37,6 +37,7 @@ const HELIOS_PROCESS_ID_ENV: &str = "HELIOS_PROCESS_ID";
 const RAYON_NUM_THREADS_ENV: &[u8] = b"RAYON_NUM_THREADS=";
 const WASM_PAGE_SIZE: usize = 64 * 1024;
 const PROGRAM_SHARED_MEMORY_MAX_PAGES: u32 = 8192;
+const SHARED_MEMORY_POOL_FRACTION: usize = 16;
 const WASIX_ASYNCIFY_DATA_SIZE: u32 = 8;
 const WASIX_STACK_SNAPSHOT_SIZE: usize = 24;
 const WASIX_THREAD_START_SIZE: usize = 64;
@@ -127,6 +128,7 @@ where
     runtime: crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
     engine: crate::wasmtime_adapter::WasmtimeEngine,
     preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
+    shared_memory_pool: Arc<Mutex<SharedMemoryPool>>,
     component_cache: Mutex<ComponentCache<WasmtimeCompiledComponent>>,
     core_module_cache: Mutex<ComponentCache<WasmtimeCompiledCoreModule>>,
     compiler_artifact: Option<Bytes>,
@@ -170,6 +172,89 @@ struct ProgramSpawnRequest {
     descriptors: Option<Preview1DescriptorTable>,
     signal_state: WasixSignalState,
     signal_dispositions: Vec<WasixSignalDisposition>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SharedMemorySpec {
+    initial_pages: u32,
+    maximum_pages: u32,
+}
+
+impl SharedMemorySpec {
+    fn byte_size(self) -> usize {
+        usize::try_from(self.initial_pages)
+            .expect("shared-memory page count must fit usize")
+            .checked_mul(WASM_PAGE_SIZE)
+            .expect("shared-memory byte size overflow")
+    }
+
+    fn memory_type(self) -> MemoryType {
+        MemoryType::shared(self.initial_pages, self.maximum_pages)
+    }
+}
+
+struct SharedMemoryPool {
+    budget_bytes: usize,
+    resident_bytes: usize,
+    entries: Vec<SharedMemoryPoolEntry>,
+}
+
+struct SharedMemoryPoolEntry {
+    spec: SharedMemorySpec,
+    memory: SharedMemory,
+}
+
+impl SharedMemoryPool {
+    fn new(budget_bytes: usize) -> Self {
+        Self {
+            budget_bytes,
+            resident_bytes: 0,
+            entries: Vec::new(),
+        }
+    }
+
+    fn acquire(
+        &mut self,
+        engine: &wasmtime::Engine,
+        spec: SharedMemorySpec,
+    ) -> Result<SharedMemory, ProgramExecError> {
+        if let Some(index) = self.entries.iter().position(|entry| entry.spec == spec) {
+            let entry = self.entries.swap_remove(index);
+            self.resident_bytes = self
+                .resident_bytes
+                .checked_sub(spec.byte_size())
+                .expect("shared-memory pool byte accounting underflow");
+            zero_shared_memory(&entry.memory);
+            return Ok(entry.memory);
+        }
+
+        SharedMemory::new(engine, spec.memory_type()).map_err(map_program_runtime_error)
+    }
+
+    fn recycle(&mut self, spec: SharedMemorySpec, memory: SharedMemory) {
+        if memory.size() != u64::from(spec.initial_pages) {
+            return;
+        }
+        let bytes = spec.byte_size();
+        if self.resident_bytes.saturating_add(bytes) > self.budget_bytes {
+            return;
+        }
+        self.resident_bytes = self
+            .resident_bytes
+            .checked_add(bytes)
+            .expect("shared-memory pool byte accounting overflow");
+        self.entries.push(SharedMemoryPoolEntry { spec, memory });
+    }
+}
+
+fn zero_shared_memory(memory: &SharedMemory) {
+    let data = memory.data();
+    let ptr = data.as_ptr().cast::<u8>() as *mut u8;
+    // The pool only calls this after the previous Store/Instance holders have
+    // been dropped, before handing the memory to a new guest.
+    unsafe {
+        core::ptr::write_bytes(ptr, 0, memory.data_size());
+    }
 }
 
 enum ProgramExecutable {
@@ -962,6 +1047,8 @@ where
 
     let available_bytes = heap_stats().available_bytes();
     let cache_budget = available_bytes / COMPONENT_CACHE_FRACTION;
+    let shared_memory_pool_budget =
+        user_heap_stats().available_bytes() / SHARED_MEMORY_POOL_FRACTION;
     let runtime = crate::wasmtime_adapter::WasmtimeComponentRuntime::new(cpu.clone());
     let engine = <crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl> as crate::ComponentRuntimeFactory<CpuImpl, HostRuntimeState<CpuImpl, HostFs>, HostFs>>::create_engine(&runtime)
         .unwrap_or_else(|error| panic!("failed to create launched-program engine: {error:#}"));
@@ -977,6 +1064,9 @@ where
             runtime,
             engine,
             preview1_core_linker,
+            shared_memory_pool: Arc::new(Mutex::new(SharedMemoryPool::new(
+                shared_memory_pool_budget,
+            ))),
             component_cache: Mutex::new(ComponentCache::new(cache_budget)),
             core_module_cache: Mutex::new(ComponentCache::new(cache_budget)),
             compiler_artifact,
@@ -1330,6 +1420,7 @@ where
         let runtime = self.inner.runtime.clone();
         let engine = self.inner.engine.clone();
         let preview1_core_linker = self.inner.preview1_core_linker.clone();
+        let shared_memory_pool = self.inner.shared_memory_pool.clone();
         let spawner = exec_context.spawner.clone();
         let run_spawner = spawner.clone();
         let progress = spawner.progress_counter();
@@ -1351,6 +1442,7 @@ where
                 &engine,
                 &runtime,
                 preview1_core_linker,
+                shared_memory_pool,
                 launched_instance,
                 stdin_reader,
                 stdout_writer,
@@ -3142,14 +3234,13 @@ fn imported_shared_memory_with_declared_maximum(
     imported_shared_memory(engine, module, None)
 }
 
-fn imported_shared_memory_with_user_budget(
-    engine: &wasmtime::Engine,
+fn imported_shared_memory_spec_with_user_budget(
     module: &Module,
-) -> Result<Option<SharedMemory>, ProgramExecError> {
+) -> Result<Option<SharedMemorySpec>, ProgramExecError> {
     let available_pages = user_heap_stats().available_bytes() / WASM_PAGE_SIZE;
     let available_pages = u32::try_from(available_pages).unwrap_or(u32::MAX);
     let budget_pages = available_pages.min(PROGRAM_SHARED_MEMORY_MAX_PAGES);
-    imported_shared_memory(engine, module, Some(budget_pages))
+    imported_shared_memory_spec(module, Some(budget_pages))
 }
 
 fn imported_shared_memory(
@@ -3157,6 +3248,18 @@ fn imported_shared_memory(
     module: &Module,
     maximum_pages_budget: Option<u32>,
 ) -> Result<Option<SharedMemory>, ProgramExecError> {
+    let Some(spec) = imported_shared_memory_spec(module, maximum_pages_budget)? else {
+        return Ok(None);
+    };
+    SharedMemory::new(engine, spec.memory_type())
+        .map(Some)
+        .map_err(map_program_runtime_error)
+}
+
+fn imported_shared_memory_spec(
+    module: &Module,
+    maximum_pages_budget: Option<u32>,
+) -> Result<Option<SharedMemorySpec>, ProgramExecError> {
     let mut memory_type = None;
     for import in module.imports() {
         if import.module() == "env" && import.name() == "memory" {
@@ -3194,9 +3297,10 @@ fn imported_shared_memory(
             detail: ProgramExecErrorDetail::ImportedSharedMemoryBudgetExceeded,
         });
     }
-    SharedMemory::new(engine, MemoryType::shared(initial_pages, maximum_pages))
-        .map(Some)
-        .map_err(map_program_runtime_error)
+    Ok(Some(SharedMemorySpec {
+        initial_pages,
+        maximum_pages,
+    }))
 }
 
 fn compiler_shared_memory(
@@ -4547,6 +4651,7 @@ async fn run_program_executable<CpuImpl, HostFs>(
     engine: &crate::wasmtime_adapter::WasmtimeEngine,
     runtime: &crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
     preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
+    shared_memory_pool: Arc<Mutex<SharedMemoryPool>>,
     launched_instance: crate::RegisteredInstance,
     stdin_reader: crate::ByteReader,
     stdout_writer: crate::ByteWriter,
@@ -4594,6 +4699,7 @@ where
                 compiled,
                 engine,
                 preview1_core_linker,
+                shared_memory_pool,
                 launched_instance,
                 stdin_reader,
                 stdout_writer,
@@ -4642,6 +4748,7 @@ async fn run_program_core_module<CpuImpl, HostFs>(
     compiled: Arc<WasmtimeCompiledCoreModule>,
     engine: &crate::wasmtime_adapter::WasmtimeEngine,
     preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
+    shared_memory_pool: Arc<Mutex<SharedMemoryPool>>,
     launched_instance: crate::RegisteredInstance,
     stdin_reader: crate::ByteReader,
     stdout_writer: crate::ByteWriter,
@@ -4657,93 +4764,108 @@ where
     let run_started_at = monotonic_nanos(&exec_context.cpu);
     let run_cpu = exec_context.cpu.clone();
     let instance_id = launched_instance.id();
-    let imported_memory = imported_shared_memory_with_user_budget(engine.raw(), &compiled.module)?;
-    let wasix_abi = core_module_imports_wasix(&compiled.module);
-    let mut store = wasmtime::Store::new(
-        engine.raw(),
-        Preview1ProgramStore::<CpuImpl, HostFs>::new(
-            exec_context.cpu,
-            exec_context.timer,
-            exec_context.spawner.clone(),
-            exec_context.runtime_state,
-            launched_instance,
-            exec_context.parent_instance_id,
-            argv,
-            env,
-            authority,
-            OutputMode::Child {
-                stdin_rx: stdin_reader,
-                stdout_tx: stdout_writer,
-                stderr_tx: stderr_writer,
-            },
-            exec_context.read_serial,
-            exec_context.write_serial,
-            imported_memory.clone(),
-            filesystem,
-            descriptors,
-            signal_state,
-            signal_dispositions,
-            Some(compiled.clone()),
-            wasix_abi,
-        ),
-    );
-    configure_preview1_program_store(&mut store);
-
-    let mut linker = preview1_core_linker;
-    if let Some(memory) = imported_memory {
-        define_imported_shared_memory(&mut linker, &store, &compiled.module, memory)?;
-    }
-
-    super::emit_stage_marker(exec_context.write_serial, "program:instantiate-core-begin");
-    let instance = linker
-        .instantiate_async(&mut store, &compiled.module)
-        .await
-        .map_err(map_program_runtime_error)?;
-    super::emit_stage_marker(exec_context.write_serial, "program:instantiate-core-ok");
-
-    let start = instance
-        .get_typed_func::<(), ()>(&mut store, "_start")
-        .map_err(|_| ProgramExecError {
-            kind: ProgramExecErrorKind::InvalidBinary,
-            detail: ProgramExecErrorDetail::InvalidEntryPoint,
-        })?;
-
-    let run_done = Arc::new(core::sync::atomic::AtomicBool::new(false));
-    super::spawn_component_phase_heartbeat(
-        &spawner,
-        &run_cpu,
-        &progress,
-        exec_context.write_serial,
-        "program:run-core",
-        run_started_at,
-        &run_done,
-    );
-    super::emit_stage_marker(exec_context.write_serial, "program:run-core-begin");
-    let result = loop {
-        let result = start.call_async(&mut store, ()).await;
-        if handle_wasix_asyncify_completion(&mut store, &instance).await? {
-            continue;
-        }
-        break result;
+    let imported_memory_spec = imported_shared_memory_spec_with_user_budget(&compiled.module)?;
+    let imported_memory = match imported_memory_spec {
+        Some(spec) => Some(shared_memory_pool.lock().acquire(engine.raw(), spec)?),
+        None => None,
     };
-    run_done.store(true, core::sync::atomic::Ordering::Release);
-    super::emit_stage_marker(exec_context.write_serial, "program:run-core-end");
+    let recycle_memory = imported_memory.clone();
+    let wasix_abi = core_module_imports_wasix(&compiled.module);
+    let (result, recycle_allowed) = {
+        let mut store = wasmtime::Store::new(
+            engine.raw(),
+            Preview1ProgramStore::<CpuImpl, HostFs>::new(
+                exec_context.cpu,
+                exec_context.timer,
+                exec_context.spawner.clone(),
+                exec_context.runtime_state,
+                launched_instance,
+                exec_context.parent_instance_id,
+                argv,
+                env,
+                authority,
+                OutputMode::Child {
+                    stdin_rx: stdin_reader,
+                    stdout_tx: stdout_writer,
+                    stderr_tx: stderr_writer,
+                },
+                exec_context.read_serial,
+                exec_context.write_serial,
+                imported_memory.clone(),
+                filesystem,
+                descriptors,
+                signal_state,
+                signal_dispositions,
+                Some(compiled.clone()),
+                wasix_abi,
+            ),
+        );
+        configure_preview1_program_store(&mut store);
 
-    match result {
-        Ok(()) => Ok(ChildExit {
-            instance_id,
-            exit_code: 0,
-            filesystem: Some(store.data().filesystem.snapshot()),
-        }),
-        Err(error) => match store.data_mut().take_requested_exit() {
-            Some(code) => Ok(ChildExit {
+        let mut linker = preview1_core_linker;
+        if let Some(memory) = imported_memory {
+            define_imported_shared_memory(&mut linker, &store, &compiled.module, memory)?;
+        }
+
+        super::emit_stage_marker(exec_context.write_serial, "program:instantiate-core-begin");
+        let instance = linker
+            .instantiate_async(&mut store, &compiled.module)
+            .await
+            .map_err(map_program_runtime_error)?;
+        super::emit_stage_marker(exec_context.write_serial, "program:instantiate-core-ok");
+
+        let start = instance
+            .get_typed_func::<(), ()>(&mut store, "_start")
+            .map_err(|_| ProgramExecError {
+                kind: ProgramExecErrorKind::InvalidBinary,
+                detail: ProgramExecErrorDetail::InvalidEntryPoint,
+            })?;
+
+        let run_done = Arc::new(core::sync::atomic::AtomicBool::new(false));
+        super::spawn_component_phase_heartbeat(
+            &spawner,
+            &run_cpu,
+            &progress,
+            exec_context.write_serial,
+            "program:run-core",
+            run_started_at,
+            &run_done,
+        );
+        super::emit_stage_marker(exec_context.write_serial, "program:run-core-begin");
+        let result = loop {
+            let result = start.call_async(&mut store, ()).await;
+            if handle_wasix_asyncify_completion(&mut store, &instance).await? {
+                continue;
+            }
+            break result;
+        };
+        run_done.store(true, core::sync::atomic::Ordering::Release);
+        super::emit_stage_marker(exec_context.write_serial, "program:run-core-end");
+
+        let child_exit = match result {
+            Ok(()) => Ok(ChildExit {
                 instance_id,
-                exit_code: code,
+                exit_code: 0,
                 filesystem: Some(store.data().filesystem.snapshot()),
             }),
-            None => Err(map_program_runtime_error(error)),
-        },
+            Err(error) => match store.data_mut().take_requested_exit() {
+                Some(code) => Ok(ChildExit {
+                    instance_id,
+                    exit_code: code,
+                    filesystem: Some(store.data().filesystem.snapshot()),
+                }),
+                None => Err(map_program_runtime_error(error)),
+            },
+        };
+        (child_exit, store.data().threads.is_empty())
+    };
+
+    if recycle_allowed {
+        if let (Some(spec), Some(memory)) = (imported_memory_spec, recycle_memory) {
+            shared_memory_pool.lock().recycle(spec, memory);
+        }
     }
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
