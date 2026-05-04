@@ -56,7 +56,7 @@ use helios_kernel::runtime_memory::{
     self, RuntimeMemoryHooks, default_memory_image_free, default_memory_image_map_at,
     default_memory_image_new, default_page_size,
 };
-use helios_kernel::{allocate_user_frame_zeroed, deallocate_user_frame};
+use helios_kernel::{allocate_user_frame_zeroed_on, deallocate_user_frame_on};
 use spin::{Mutex, Once};
 
 const PAGE_SHIFT: u32 = 12;
@@ -404,14 +404,15 @@ impl RiscvUserAddressSpace {
     }
 
     fn alloc_user_frame(&self) -> Result<usize, AddressSpaceError> {
-        let raw = allocate_user_frame_zeroed().map_err(|_| AddressSpaceError::OutOfFrames)?;
+        let raw = allocate_user_frame_zeroed_on(crate::current_hart_id())
+            .map_err(|_| AddressSpaceError::OutOfFrames)?;
         Ok(raw.as_ptr() as usize)
     }
 
     fn dealloc_user_phys(&self, phys: usize) {
         let ptr = NonNull::new(phys as *mut u8)
             .unwrap_or_else(|| panic!("RISC-V user-frame dealloc received null pointer"));
-        deallocate_user_frame(ptr);
+        deallocate_user_frame_on(crate::current_hart_id(), ptr);
     }
 
     fn build_relocation_plan(

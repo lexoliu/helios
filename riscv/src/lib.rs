@@ -543,7 +543,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         release_early_boot_harts();
     }
     if current_hart == bootstrap_processor {
-        helios_kernel::prime_bootstrap_allocator(memory_regions.iter().copied());
+        helios_kernel::prime_bootstrap_allocator(memory_regions.iter().copied(), hart_count);
     }
 
     let debug_state = shared_debug_state(timebase_frequency, hart_count);
@@ -768,6 +768,10 @@ fn current_hart_runtime() -> &'static HartRuntime {
     assert!(ptr != 0, "hart runtime is not installed");
 
     unsafe { &*(ptr as *const HartRuntime) }
+}
+
+pub(crate) fn current_hart_id() -> ProcessorId {
+    current_hart_runtime().hart_id
 }
 
 fn current_debug_transport() -> &'static DebugTransport {

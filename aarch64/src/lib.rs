@@ -327,6 +327,18 @@ impl Aarch64PlatformState {
     }
 }
 
+fn aarch64_processor_count() -> usize {
+    let response = MP_REQUEST
+        .response()
+        .unwrap_or_else(|| panic!("Limine did not provide an AArch64 MP response"));
+    let processor_count = response.cpus().len();
+    assert!(
+        processor_count != 0,
+        "Limine AArch64 MP response did not describe any CPU"
+    );
+    processor_count
+}
+
 struct Aarch64BootEntropy {
     rng: Mutex<ChaCha20Rng>,
 }
@@ -415,9 +427,10 @@ extern "C" fn aarch64_kernel_main() -> ! {
     let debug_serial = DebugSerial::discover(&handoff, physical_memory_offset);
     debug_serial.init();
     DEBUG_SERIAL_BASE.store(debug_serial.base, Ordering::Release);
+    let processor_count = aarch64_processor_count();
     let reserved_ranges = boot_reserved_ranges(&handoff);
     let memory_regions = boot_memory_regions(&handoff, physical_memory_offset, &reserved_ranges);
-    helios_kernel::prime_bootstrap_allocator(memory_regions);
+    helios_kernel::prime_bootstrap_allocator(memory_regions, processor_count);
     vmm::install_user_address_space(physical_memory_offset);
     let boot_entropy = discover_boot_entropy(&handoff, physical_memory_offset);
     let platform_state = Aarch64PlatformState::from_limine_mp(timer_frequency(), boot_entropy);

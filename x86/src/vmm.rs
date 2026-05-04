@@ -28,7 +28,7 @@ use helios_kernel::runtime_memory::{
     self, RuntimeMemoryHooks, default_memory_image_free, default_memory_image_map_at,
     default_memory_image_new, default_page_size,
 };
-use helios_kernel::{allocate_user_frame_zeroed, deallocate_user_frame};
+use helios_kernel::{allocate_user_frame_zeroed_on, deallocate_user_frame_on};
 use spin::{Mutex, Once};
 use x86_64::PhysAddr;
 use x86_64::VirtAddr as X86VirtAddr;
@@ -225,7 +225,8 @@ impl X86UserAddressSpace {
     }
 
     fn alloc_user_frame(&self) -> Result<usize, AddressSpaceError> {
-        let raw = allocate_user_frame_zeroed().map_err(|_| AddressSpaceError::OutOfFrames)?;
+        let raw = allocate_user_frame_zeroed_on(smp::current_processor())
+            .map_err(|_| AddressSpaceError::OutOfFrames)?;
         Ok(raw.as_ptr() as usize - self.physical_memory_offset)
     }
 
@@ -239,7 +240,7 @@ impl X86UserAddressSpace {
     fn dealloc_user_phys(&self, phys: usize) {
         let ptr = NonNull::new(self.hhdm_ptr(phys))
             .unwrap_or_else(|| panic!("x86 user-frame dealloc received null HHDM pointer"));
-        deallocate_user_frame(ptr);
+        deallocate_user_frame_on(smp::current_processor(), ptr);
     }
 
     fn build_relocation_plan(

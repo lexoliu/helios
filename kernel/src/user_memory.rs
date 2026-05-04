@@ -7,6 +7,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use buddy_system_allocator::LockedHeap;
+use helios_hal::cpu::ProcessorId;
 use helios_hal::pmm::PhysFrame;
 
 use crate::ProgramOutOfMemory;
@@ -36,6 +37,10 @@ impl UserMemoryPool {
         }
     }
 
+    pub fn configure_processors(&self, processor_count: usize) {
+        self.frame_slab.configure_processors(processor_count);
+    }
+
     pub fn stats(&self) -> UserHeapStats {
         let allocator = self.heap.lock();
         let cached = self.frame_slab.cached_bytes();
@@ -46,9 +51,29 @@ impl UserMemoryPool {
     }
 
     pub fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<u8>, ProgramOutOfMemory> {
+        self.allocate_zeroed_with_processor(layout, None)
+    }
+
+    pub fn allocate_zeroed_on(
+        &self,
+        processor: ProcessorId,
+        layout: Layout,
+    ) -> Result<NonNull<u8>, ProgramOutOfMemory> {
+        self.allocate_zeroed_with_processor(layout, Some(processor))
+    }
+
+    fn allocate_zeroed_with_processor(
+        &self,
+        layout: Layout,
+        processor: Option<ProcessorId>,
+    ) -> Result<NonNull<u8>, ProgramOutOfMemory> {
         let allocation_size = buddy_allocation_size(layout);
         if is_single_frame_layout(layout) {
-            if let Some(ptr) = self.frame_slab.allocate() {
+            let ptr = match processor {
+                Some(processor) => self.frame_slab.allocate_on(processor),
+                None => self.frame_slab.allocate(),
+            };
+            if let Some(ptr) = ptr {
                 unsafe {
                     core::ptr::write_bytes(ptr.as_ptr(), 0, PhysFrame::SIZE);
                 }
@@ -85,9 +110,26 @@ impl UserMemoryPool {
     }
 
     pub fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        self.deallocate_with_processor(ptr, layout, None);
+    }
+
+    pub fn deallocate_on(&self, processor: ProcessorId, ptr: NonNull<u8>, layout: Layout) {
+        self.deallocate_with_processor(ptr, layout, Some(processor));
+    }
+
+    fn deallocate_with_processor(
+        &self,
+        ptr: NonNull<u8>,
+        layout: Layout,
+        processor: Option<ProcessorId>,
+    ) {
         if is_single_frame_layout(layout) {
             let total_frames = self.heap.lock().stats_total_bytes() / PhysFrame::SIZE;
-            if self.frame_slab.deallocate(ptr, total_frames) {
+            let cached = match processor {
+                Some(processor) => self.frame_slab.deallocate_on(processor, ptr, total_frames),
+                None => self.frame_slab.deallocate(ptr, total_frames),
+            };
+            if cached {
                 return;
             }
         }
@@ -151,10 +193,24 @@ pub fn allocate_user_frame_zeroed() -> Result<NonNull<u8>, ProgramOutOfMemory> {
     user_memory_pool().allocate_zeroed(layout)
 }
 
+pub fn allocate_user_frame_zeroed_on(
+    processor: ProcessorId,
+) -> Result<NonNull<u8>, ProgramOutOfMemory> {
+    let layout = Layout::from_size_align(PhysFrame::SIZE, PhysFrame::SIZE)
+        .unwrap_or_else(|_| panic!("invalid user-frame layout"));
+    user_memory_pool().allocate_zeroed_on(processor, layout)
+}
+
 pub fn deallocate_user_frame(ptr: NonNull<u8>) {
     let layout = Layout::from_size_align(PhysFrame::SIZE, PhysFrame::SIZE)
         .unwrap_or_else(|_| panic!("invalid user-frame layout"));
     user_memory_pool().deallocate(ptr, layout);
+}
+
+pub fn deallocate_user_frame_on(processor: ProcessorId, ptr: NonNull<u8>) {
+    let layout = Layout::from_size_align(PhysFrame::SIZE, PhysFrame::SIZE)
+        .unwrap_or_else(|_| panic!("invalid user-frame layout"));
+    user_memory_pool().deallocate_on(processor, ptr, layout);
 }
 
 pub(crate) fn allocate_user_zeroed(layout: Layout) -> Result<NonNull<u8>, ProgramOutOfMemory> {

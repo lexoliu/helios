@@ -36,7 +36,7 @@ use helios_kernel::runtime_memory::{
     self, RuntimeMemoryHooks, RuntimeMemoryImage, default_memory_image_free,
     default_memory_image_map_at, default_memory_image_new, default_page_size,
 };
-use helios_kernel::{allocate_user_frame_zeroed, deallocate_user_frame};
+use helios_kernel::{allocate_user_frame_zeroed_on, deallocate_user_frame_on};
 use spin::{Mutex, Once};
 
 const PAGE: usize = 4096;
@@ -316,7 +316,8 @@ impl Aarch64UserAddressSpace {
     }
 
     fn alloc_user_frame(&self) -> Result<usize, AddressSpaceError> {
-        let raw = allocate_user_frame_zeroed().map_err(|_| AddressSpaceError::OutOfFrames)?;
+        let raw = allocate_user_frame_zeroed_on(crate::current_processor_runtime().logical_id())
+            .map_err(|_| AddressSpaceError::OutOfFrames)?;
         let virt = raw.as_ptr() as usize;
         Ok(virt - self.physical_memory_offset)
     }
@@ -331,7 +332,7 @@ impl Aarch64UserAddressSpace {
     fn dealloc_user_phys(&self, phys: usize) {
         let ptr = NonNull::new(self.hhdm_ptr(phys))
             .unwrap_or_else(|| panic!("Aarch64 user-frame dealloc received null HHDM pointer"));
-        deallocate_user_frame(ptr);
+        deallocate_user_frame_on(crate::current_processor_runtime().logical_id(), ptr);
     }
 
     fn dealloc_user_frame(&self, entry: u64) {

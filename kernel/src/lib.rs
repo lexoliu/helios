@@ -181,7 +181,8 @@ pub use time::{
 pub use timer::{Sleep, Timer};
 pub use unsupported_host_fs::UnsupportedHostFileSystem;
 pub use user_memory::{
-    UserHeapStats, allocate_user_frame_zeroed, deallocate_user_frame, user_heap_stats,
+    UserHeapStats, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
+    deallocate_user_frame, deallocate_user_frame_on, user_heap_stats,
 };
 #[cfg(feature = "wasmtime-runtime")]
 pub use wasmtime_adapter::component_host::{
@@ -576,7 +577,10 @@ where
     kernel
 }
 
-fn init_allocator<Regions>(memory_regions: Regions) -> &'static user_memory::UserMemoryPool
+fn init_allocator<Regions>(
+    memory_regions: Regions,
+    processor_count: usize,
+) -> &'static user_memory::UserMemoryPool
 where
     Regions: IntoIterator<Item = MemoryRegion>,
 {
@@ -590,7 +594,10 @@ where
             ALLOCATOR.lock().add_to_heap(start, kernel_end);
         }
         let pool = *user_pool.get_or_insert_with(|| {
-            user_memory::install_user_memory_pool(user_memory::allocate_user_memory_pool())
+            let pool =
+                user_memory::install_user_memory_pool(user_memory::allocate_user_memory_pool());
+            pool.configure_processors(processor_count);
+            pool
         });
         if let Some(user_start) = user_start {
             pool.add_region(user_start, end);
@@ -619,6 +626,7 @@ const fn align_down(value: usize, align: usize) -> usize {
 
 pub fn prime_bootstrap_allocator<Regions>(
     memory_regions: Regions,
+    processor_count: usize,
 ) -> &'static user_memory::UserMemoryPool
 where
     Regions: IntoIterator<Item = MemoryRegion>,
@@ -629,7 +637,7 @@ where
         Ordering::AcqRel,
         Ordering::Acquire,
     ) {
-        Ok(_) => init_allocator(memory_regions),
+        Ok(_) => init_allocator(memory_regions, processor_count),
         Err(state) => panic!("bootstrap allocator observed invalid boot state {state}"),
     }
 }
@@ -646,7 +654,7 @@ fn bootstrap_init<Console, CpuImpl, Regions>(
     CpuImpl: Cpu,
     Regions: IntoIterator<Item = MemoryRegion>,
 {
-    prime_bootstrap_allocator(memory_regions);
+    prime_bootstrap_allocator(memory_regions, topology.configured_processors);
     finish_bootstrap(console, cpu, topology, dma_model, devices);
 }
 

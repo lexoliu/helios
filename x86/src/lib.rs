@@ -120,17 +120,20 @@ fn x86_kernel_main() -> ! {
     let physical_memory_offset = boot::physical_memory_offset();
     let reserved_ranges = boot_reserved_ranges(&handoff);
     let reserved_wakeup_page = reserve_wakeup_page(&handoff, &reserved_ranges);
-    helios_kernel::prime_bootstrap_allocator(boot_memory_regions(
-        &handoff,
-        physical_memory_offset,
-        &reserved_ranges,
-        Some(reserved_wakeup_page.clone()),
-    ));
     let rsdp_address = handoff
         .tables
         .acpi_rsdp
         .unwrap_or_else(|| panic!("Limine handoff did not include an ACPI RSDP address"));
     let processor_count = processor_count(rsdp_address, physical_memory_offset);
+    helios_kernel::prime_bootstrap_allocator(
+        boot_memory_regions(
+            &handoff,
+            physical_memory_offset,
+            &reserved_ranges,
+            Some(reserved_wakeup_page.clone()),
+        ),
+        processor_count,
+    );
     let wakeup_page = (processor_count > 1).then_some(reserved_wakeup_page);
     let memory_regions = boot_memory_regions(
         &handoff,

@@ -227,6 +227,10 @@ pub(crate) fn current_runtime() -> &'static ProcessorRuntime {
     unsafe { &*runtime }
 }
 
+pub(crate) fn current_processor() -> ProcessorId {
+    ProcessorId::new(current_runtime().logical_id)
+}
+
 pub(crate) fn current_runtime_address() -> usize {
     unsafe { rdmsr(IA32_FS_BASE) as usize }
 }
