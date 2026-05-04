@@ -7295,6 +7295,70 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
+    if let Some(Preview1Descriptor::File {
+        descriptor,
+        offset,
+        fdflags,
+    }) = caller.data().descriptors.get(fd)
+    {
+        let descriptor = descriptor.clone();
+        if crate::guest_host_share_path(&descriptor.path).is_none() {
+            let current_offset = *offset;
+            let fdflags = *fdflags;
+            let iovs = match p1_read_iovs(caller, memory, iovs, iovs_len) {
+                Ok(iovs) => iovs,
+                Err(errno) => return errno,
+            };
+            let byte_len = match p1_iovs_byte_len(&iovs) {
+                Ok(byte_len) => byte_len,
+                Err(errno) => return errno,
+            };
+            let written = match u32::try_from(byte_len) {
+                Ok(written) => written,
+                Err(_) => return p1::errno::OVERFLOW,
+            };
+            let ranges = match p1_iovs_memory_ranges(memory, &iovs) {
+                Ok(ranges) => ranges,
+                Err(errno) => return errno,
+            };
+            let memory_base = memory.base as *const u8;
+            let now_nanos = caller.data().now_nanos();
+            let write_result = if fdflags & P1_FDFLAG_APPEND != 0 {
+                caller.data_mut().filesystem.append_with(
+                    &descriptor,
+                    byte_len,
+                    now_nanos,
+                    |destination| {
+                        copy_preview1_ranges_to_slice(memory_base, &ranges, destination);
+                    },
+                )
+            } else {
+                let write_offset: usize = match current_offset.try_into() {
+                    Ok(offset) => offset,
+                    Err(_) => return p1::errno::OVERFLOW,
+                };
+                caller.data_mut().filesystem.write_at_with(
+                    &descriptor,
+                    write_offset,
+                    byte_len,
+                    now_nanos,
+                    |destination| {
+                        copy_preview1_ranges_to_slice(memory_base, &ranges, destination);
+                    },
+                )
+            };
+            if let Err(error) = write_result {
+                return p1_errno_from_fs(error);
+            }
+            let Some(Preview1Descriptor::File { offset, .. }) =
+                caller.data_mut().descriptors.get_mut(fd)
+            else {
+                panic!("Preview1 descriptor disappeared during direct file write");
+            };
+            *offset = current_offset.saturating_add(byte_len as u64);
+            return p1_write_u32(caller, memory, nwritten, written);
+        }
+    }
     let bytes = match p1_read_iovs_to_bytes(caller, memory, iovs, iovs_len) {
         Ok(bytes) => bytes,
         Err(errno) => return errno,
@@ -15248,6 +15312,56 @@ fn p1_read_iovs_to_bytes<T>(
         bytes.set_len(written);
     }
     Ok(bytes)
+}
+
+fn p1_iovs_byte_len(iovs: &[(u32, u32)]) -> Result<usize, i32> {
+    iovs.iter()
+        .try_fold(0usize, |sum, (_, len)| {
+            sum.checked_add(usize::try_from(*len).ok()?)
+        })
+        .ok_or(p1::errno::OVERFLOW)
+}
+
+fn p1_iovs_memory_ranges(
+    memory: Preview1Memory,
+    iovs: &[(u32, u32)],
+) -> Result<Vec<(usize, usize)>, i32> {
+    let mut ranges = Vec::with_capacity(iovs.len());
+    for (ptr, len) in iovs {
+        let len = usize::try_from(*len).map_err(|_| p1::errno::OVERFLOW)?;
+        let start = preview1_memory_start(memory, *ptr, len).map_err(|_| p1::errno::FAULT)?;
+        ranges.push((start, len));
+    }
+    Ok(ranges)
+}
+
+fn copy_preview1_ranges_to_slice(
+    memory_base: *const u8,
+    ranges: &[(usize, usize)],
+    destination: &mut [u8],
+) {
+    let mut copied = 0usize;
+    for (start, len) in ranges {
+        let next = copied
+            .checked_add(*len)
+            .expect("validated preview1 iov ranges overflowed while copying");
+        // SAFETY: `p1_iovs_memory_ranges` validated every source range
+        // against the live guest memory, and `destination` was allocated
+        // to the exact summed iov length before this copy.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                memory_base.add(*start),
+                destination.as_mut_ptr().add(copied),
+                *len,
+            );
+        }
+        copied = next;
+    }
+    assert_eq!(
+        copied,
+        destination.len(),
+        "validated preview1 iov ranges did not fill destination"
+    );
 }
 
 fn p1_read_memory<T>(

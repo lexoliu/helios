@@ -2365,6 +2365,26 @@ where
         self.write_at_or_append(descriptor, FsWriteOffset::At(offset), bytes, now_nanos)
     }
 
+    pub(crate) fn write_at_with<Fill>(
+        &mut self,
+        descriptor: &FsDescriptor,
+        offset: usize,
+        byte_len: usize,
+        now_nanos: u64,
+        fill: Fill,
+    ) -> core::result::Result<(), fs_types::ErrorCode>
+    where
+        Fill: FnOnce(&mut [u8]),
+    {
+        self.write_at_or_append_with(
+            descriptor,
+            FsWriteOffset::At(offset),
+            byte_len,
+            now_nanos,
+            fill,
+        )
+    }
+
     fn write_at_or_append(
         &mut self,
         descriptor: &FsDescriptor,
@@ -2372,6 +2392,22 @@ where
         bytes: &[u8],
         now_nanos: u64,
     ) -> core::result::Result<(), fs_types::ErrorCode> {
+        self.write_at_or_append_with(descriptor, offset, bytes.len(), now_nanos, |destination| {
+            destination.copy_from_slice(bytes)
+        })
+    }
+
+    fn write_at_or_append_with<Fill>(
+        &mut self,
+        descriptor: &FsDescriptor,
+        offset: FsWriteOffset,
+        byte_len: usize,
+        now_nanos: u64,
+        fill: Fill,
+    ) -> core::result::Result<(), fs_types::ErrorCode>
+    where
+        Fill: FnOnce(&mut [u8]),
+    {
         // Host-backed writes would require an async flush path; stream
         // consumers run in sync poll contexts, so we must not block here.
         // Writing to host files is not yet supported; callers see a clean
@@ -2405,7 +2441,7 @@ where
             FsWriteOffset::Append => node.contents.len(),
         };
         let end = offset
-            .checked_add(bytes.len())
+            .checked_add(byte_len)
             .ok_or(fs_types::ErrorCode::Overflow)?;
         let contents = core::mem::take(&mut state.nodes[index].contents);
         let mut contents = if linked_count == 1 {
@@ -2422,7 +2458,7 @@ where
         if contents.len() < end {
             contents.resize(end, 0);
         }
-        contents[offset..end].copy_from_slice(bytes);
+        fill(&mut contents[offset..end]);
         let contents = contents.freeze();
         for linked in state
             .nodes
@@ -2442,6 +2478,19 @@ where
         now_nanos: u64,
     ) -> core::result::Result<(), fs_types::ErrorCode> {
         self.write_at_or_append(descriptor, FsWriteOffset::Append, bytes, now_nanos)
+    }
+
+    pub(crate) fn append_with<Fill>(
+        &mut self,
+        descriptor: &FsDescriptor,
+        byte_len: usize,
+        now_nanos: u64,
+        fill: Fill,
+    ) -> core::result::Result<(), fs_types::ErrorCode>
+    where
+        Fill: FnOnce(&mut [u8]),
+    {
+        self.write_at_or_append_with(descriptor, FsWriteOffset::Append, byte_len, now_nanos, fill)
     }
 
     pub(crate) fn set_size(
