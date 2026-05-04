@@ -165,6 +165,12 @@ fn build_engine_config(target: &str, hint: AotCompileHint, worker_count: usize) 
 }
 
 fn configure_target_isa_flags(config: &mut Config, target: &str) {
+    if target.starts_with("aarch64-") {
+        unsafe {
+            config.cranelift_flag_enable("has_lse");
+        }
+        return;
+    }
     if !target.starts_with("x86_64-") {
         return;
     }
