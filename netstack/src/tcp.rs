@@ -11,6 +11,7 @@ use crate::{
 };
 
 pub const MAX_TCP_QUEUED_SEGMENTS: usize = 32;
+const TCP_RECEIVE_SEGMENT_BYTES: usize = 1460;
 pub const TCP_INITIAL_RTO_NANOS: u64 = 1_000_000_000;
 pub const TCP_MAX_RETRANSMISSIONS: u8 = 5;
 
@@ -90,7 +91,7 @@ where
             send_next: 0,
             send_unacknowledged: 0,
             receive_next: 0,
-            advertised_window: u16::MAX,
+            advertised_window: receive_window_size(0),
             receive_queue: Deque::new(),
             transmit_queue: Deque::new(),
             in_flight: Deque::new(),
@@ -387,6 +388,8 @@ where
                 .push_front(tail)
                 .unwrap_or_else(|_| panic!("TCP receive queue lost capacity while splitting"));
         }
+        self.refresh_advertised_window();
+        self.ack_pending = true;
         Some(bytes.to_vec())
     }
 
@@ -461,11 +464,14 @@ where
                         .push_back(Bytes::copy_from_slice(packet.payload))
                         .is_err()
                     {
+                        self.refresh_advertised_window();
+                        self.ack_pending = true;
                         return action;
                     }
                     self.receive_next = self
                         .receive_next
                         .wrapping_add(u32::try_from(packet.payload.len()).unwrap_or(u32::MAX));
+                    self.refresh_advertised_window();
                     self.ack_pending = true;
                 }
                 if packet.flags.contains(TcpFlags::FIN) {
@@ -503,6 +509,16 @@ where
             let _ = self.in_flight.pop_front();
         }
     }
+
+    fn refresh_advertised_window(&mut self) {
+        self.advertised_window = receive_window_size(self.receive_queue.len());
+    }
+}
+
+fn receive_window_size(queued_segments: usize) -> u16 {
+    let free_segments = MAX_TCP_QUEUED_SEGMENTS.saturating_sub(queued_segments);
+    let bytes = free_segments.saturating_mul(TCP_RECEIVE_SEGMENT_BYTES);
+    bytes.min(u16::MAX as usize) as u16
 }
 
 fn segment_end(segment: &TcpInFlightSegment) -> u32 {
@@ -593,5 +609,40 @@ mod tests {
             socket.pending_retransmission(TCP_INITIAL_RTO_NANOS * 4),
             None
         );
+    }
+
+    #[test]
+    fn receive_window_tracks_queued_payload_segments() {
+        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+        socket.mark_syn_queued(0);
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS,
+        );
+        let open_window = socket.advertised_window();
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                payload: b"hello",
+            },
+            TCP_INITIAL_RTO_NANOS + 1,
+        );
+
+        assert!(socket.advertised_window() < open_window);
+        assert_eq!(socket.receive(8), Some(b"hello".to_vec()));
+        assert_eq!(socket.advertised_window(), open_window);
     }
 }

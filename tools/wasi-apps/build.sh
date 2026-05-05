@@ -84,6 +84,14 @@ verify_expected_sha256() {
   fi
 }
 
+verify_wasm_uses_simd() {
+  local path="$1"
+  if ! wasm-tools print "$path" | grep -Eq '(^|[[:space:]()])(v128|i8x16|i16x8|i32x4|i64x2|f32x4|f64x2)\.'; then
+    printf 'wasm SIMD instructions missing from %s\n' "$path" >&2
+    exit 1
+  fi
+}
+
 stage_wasmer_webc_atom() {
   local label="$1"
   local raw_wasm_source="$2"
@@ -260,6 +268,9 @@ for test_name in thread-futex continuation simd-lanes; do
     "$repo_root/tools/wasi-apps/wasix-tests/$test_name.wat" \
     -o "$test_root/$test_name.wasm"
   wasm-tools validate "$test_root/$test_name.wasm"
+  if [[ "$test_name" == "simd-lanes" ]]; then
+    verify_wasm_uses_simd "$test_root/$test_name.wasm"
+  fi
   sha256sum "$test_root/$test_name.wasm" > "$test_root/$test_name.wasm.sha256"
   test_wasm_sha256="$(sha256_hex "$test_root/$test_name.wasm")"
   write_source_record \

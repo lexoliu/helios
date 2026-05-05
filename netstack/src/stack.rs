@@ -315,9 +315,7 @@ impl Stack {
                 .try_push(entry)
                 .unwrap_or_else(|_| panic!("neighbor table is full"));
         }
-        self.events
-            .push_back(StackEvent::NeighborUpdated(entry))
-            .unwrap_or_else(|_| panic!("stack event queue is full"));
+        Self::push_event_into(&mut self.events, StackEvent::NeighborUpdated(entry));
     }
 
     pub fn add_ipv4_address(&mut self, address: Ipv4Cidr) {
@@ -409,6 +407,39 @@ impl Stack {
 
     pub fn take_event(&mut self) -> Option<StackEvent> {
         self.events.pop_front()
+    }
+
+    fn push_event_into(events: &mut Deque<StackEvent, MAX_STACK_EVENTS>, event: StackEvent) {
+        match event {
+            StackEvent::NeighborUpdated(entry) => {
+                if let Some(existing) = events.iter_mut().find_map(|event| match event {
+                    StackEvent::NeighborUpdated(existing) if existing.ip == entry.ip => {
+                        Some(existing)
+                    }
+                    _ => None,
+                }) {
+                    *existing = entry;
+                    return;
+                }
+                events
+                    .push_back(StackEvent::NeighborUpdated(entry))
+                    .unwrap_or_else(|_| panic!("stack event queue is full"));
+            }
+            StackEvent::TcpReadable { socket } => {
+                if events
+                    .iter()
+                    .any(|event| matches!(event, StackEvent::TcpReadable { socket: queued } if *queued == socket))
+                {
+                    return;
+                }
+                events
+                    .push_back(StackEvent::TcpReadable { socket })
+                    .unwrap_or_else(|_| panic!("stack event queue is full"));
+            }
+            event => events
+                .push_back(event)
+                .unwrap_or_else(|_| panic!("stack event queue is full")),
+        }
     }
 
     pub fn take_udp(&mut self, local_port: u16) -> Option<UdpReceive> {
@@ -611,6 +642,7 @@ impl Stack {
         let socket = self.tcp_socket_mut(socket)?;
         Ok(match socket.receive(max_bytes) {
             Some(bytes) => TcpReadState::Data(bytes),
+            None if socket.state() == crate::TcpState::CloseWait => TcpReadState::Eof,
             None => TcpReadState::Pending,
         })
     }
@@ -1245,11 +1277,12 @@ impl Stack {
                         .unwrap_or_else(|_| panic!("TCP accept queue is full"));
                 }
                 if socket.state() == crate::TcpState::Established {
-                    self.events
-                        .push_back(StackEvent::TcpReadable {
+                    Self::push_event_into(
+                        &mut self.events,
+                        StackEvent::TcpReadable {
                             socket: socket_id(index),
-                        })
-                        .unwrap_or_else(|_| panic!("stack event queue is full"));
+                        },
+                    );
                 }
                 return Ok(());
             }
@@ -1406,13 +1439,22 @@ mod tests {
         destination: Ipv4Address,
         header: TcpHeader,
     ) -> ([u8; 64], usize) {
+        tcp_segment_with_payload(source, destination, header, &[])
+    }
+
+    fn tcp_segment_with_payload(
+        source: Ipv4Address,
+        destination: Ipv4Address,
+        header: TcpHeader,
+        payload: &[u8],
+    ) -> ([u8; 64], usize) {
         let mut segment = [0u8; 64];
         let len = TcpPacket::encode(
             &mut segment,
             IpAddress::Ipv4(source),
             IpAddress::Ipv4(destination),
             header,
-            &[],
+            payload,
         )
         .expect("test TCP segment should fit");
         (segment, len)
@@ -1498,6 +1540,72 @@ mod tests {
                 port: 49152,
             }
         );
+    }
+
+    #[test]
+    fn tcp_read_reports_eof_after_fin_and_drained_payload() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let socket = stack.open_tcp_connect(
+            TcpEndpoint {
+                address: IpAddress::Ipv4(local),
+                port: 49152,
+            },
+            TcpEndpoint {
+                address: IpAddress::Ipv4(peer),
+                port: 80,
+            },
+            7,
+        );
+        let (syn_ack, syn_ack_len) = tcp_segment(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+            },
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &syn_ack[..syn_ack_len],
+                StackInstant::from_nanos(1),
+            )
+            .expect("SYN-ACK should establish the socket");
+
+        let (data_fin, data_fin_len) = tcp_segment_with_payload(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK.union(TcpFlags::FIN),
+                window_size: u16::MAX,
+            },
+            b"ok",
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &data_fin[..data_fin_len],
+                StackInstant::from_nanos(2),
+            )
+            .expect("data FIN should be accepted");
+
+        assert_eq!(
+            stack.tcp_read(socket, 8).unwrap(),
+            TcpReadState::Data(b"ok".to_vec())
+        );
+        assert_eq!(stack.tcp_read(socket, 8).unwrap(), TcpReadState::Eof);
     }
 
     #[test]

@@ -32,6 +32,7 @@ const DHCP_RETRANSMIT_NANOS: u64 = 1_000_000_000;
 const MAX_TCP_STREAM_HANDLES: usize = 256;
 const MAX_TCP_LISTENER_HANDLES: usize = 64;
 const MAX_UDP_SOCKET_HANDLES: usize = 256;
+const NETWORK_PROGRESS_WAIT: Duration = Duration::from_micros(50);
 
 #[derive(Clone)]
 pub struct NetworkService<CpuImpl, Runtime, Device>
@@ -196,6 +197,11 @@ enum TcpReadProgress {
     Eof,
 }
 
+enum NetworkConfigurationError {
+    Device(IoError),
+    Control(NetworkControlError),
+}
+
 fn map_ipv4_address(address: Ipv4Address) -> KernelIpv4Address {
     KernelIpv4Address::new(address.octets())
 }
@@ -232,6 +238,94 @@ fn ipv4_mask_prefix_len(mask: Ipv4Address) -> Result<u8, NetworkControlError> {
         Ok(prefix_len)
     } else {
         Err(NetworkControlError::InvalidAddress)
+    }
+}
+
+fn ping_configuration_timeout() -> PingError {
+    PingError {
+        kind: PingErrorKind::Timeout,
+        detail: NetworkErrorDetail::NetworkConfigurationTimeout,
+    }
+}
+
+fn ping_configuration_error(error: NetworkConfigurationError) -> PingError {
+    match error {
+        NetworkConfigurationError::Device(error) => {
+            PingError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed)
+        }
+        NetworkConfigurationError::Control(error) => PingError {
+            kind: PingErrorKind::Unavailable,
+            detail: network_configuration_control_detail(error),
+        },
+    }
+}
+
+fn dns_configuration_timeout() -> DnsError {
+    DnsError {
+        kind: DnsErrorKind::Timeout,
+        detail: NetworkErrorDetail::NetworkConfigurationTimeout,
+    }
+}
+
+fn dns_configuration_error(error: NetworkConfigurationError) -> DnsError {
+    match error {
+        NetworkConfigurationError::Device(error) => {
+            DnsError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed)
+        }
+        NetworkConfigurationError::Control(error) => DnsError {
+            kind: DnsErrorKind::Unavailable,
+            detail: network_configuration_control_detail(error),
+        },
+    }
+}
+
+fn tcp_configuration_timeout() -> TcpError {
+    TcpError {
+        kind: TcpErrorKind::Timeout,
+        detail: NetworkErrorDetail::NetworkConfigurationTimeout,
+    }
+}
+
+fn tcp_configuration_error(error: NetworkConfigurationError) -> TcpError {
+    match error {
+        NetworkConfigurationError::Device(error) => {
+            TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed)
+        }
+        NetworkConfigurationError::Control(error) => TcpError {
+            kind: TcpErrorKind::Unavailable,
+            detail: network_configuration_control_detail(error),
+        },
+    }
+}
+
+fn udp_configuration_timeout() -> UdpError {
+    UdpError {
+        kind: UdpErrorKind::Timeout,
+        detail: NetworkErrorDetail::NetworkConfigurationTimeout,
+    }
+}
+
+fn udp_configuration_error(error: NetworkConfigurationError) -> UdpError {
+    match error {
+        NetworkConfigurationError::Device(error) => {
+            UdpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed)
+        }
+        NetworkConfigurationError::Control(error) => UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: network_configuration_control_detail(error),
+        },
+    }
+}
+
+fn network_configuration_control_detail(error: NetworkControlError) -> NetworkErrorDetail {
+    match error {
+        NetworkControlError::PortUnavailable
+        | NetworkControlError::BridgeUnavailable
+        | NetworkControlError::InvalidBridgeRequest
+        | NetworkControlError::InvalidAddress
+        | NetworkControlError::InvalidRoute
+        | NetworkControlError::RouteTimestampOutOfRange
+        | NetworkControlError::BackendFault => NetworkErrorDetail::NetworkServiceUnavailable,
     }
 }
 
@@ -402,7 +496,7 @@ where
                     detail: NetworkErrorDetail::IcmpEchoTimeout,
                 });
             }
-            self.wait_for_progress(Duration::from_millis(1)).await;
+            self.wait_for_progress(NETWORK_PROGRESS_WAIT).await;
             let _ = destination;
         }
     }
@@ -440,7 +534,7 @@ where
                 });
             }
             self.drive_dns().await?;
-            self.wait_for_progress(Duration::from_millis(1)).await;
+            self.wait_for_progress(NETWORK_PROGRESS_WAIT).await;
         }
     }
 
@@ -474,7 +568,7 @@ where
                                 detail: NetworkErrorDetail::TcpConnectTimeout,
                             });
                         }
-                        Duration::from_millis(1)
+                        NETWORK_PROGRESS_WAIT
                     }
                     Err(error) => {
                         state.remove_tcp_stream(stream);
@@ -516,7 +610,7 @@ where
                     detail: NetworkErrorDetail::TcpAcceptTimeout,
                 });
             }
-            self.wait_for_progress(Duration::from_millis(1)).await;
+            self.wait_for_progress(NETWORK_PROGRESS_WAIT).await;
         }
     }
 
@@ -546,7 +640,7 @@ where
                     detail: NetworkErrorDetail::TcpWriteTimeout,
                 });
             }
-            self.wait_for_progress(Duration::from_millis(1)).await;
+            self.wait_for_progress(NETWORK_PROGRESS_WAIT).await;
         }
         Ok(())
     }
@@ -574,7 +668,7 @@ where
                             detail: NetworkErrorDetail::TcpReadTimeout,
                         });
                     }
-                    self.wait_for_progress(Duration::from_millis(1)).await;
+                    self.wait_for_progress(NETWORK_PROGRESS_WAIT).await;
                 }
             }
         }
@@ -627,7 +721,7 @@ where
                             detail: NetworkErrorDetail::UdpReceiveTimeout,
                         });
                     }
-                    self.wait_for_progress(Duration::from_millis(1)).await;
+                    self.wait_for_progress(NETWORK_PROGRESS_WAIT).await;
                 }
             }
         }
@@ -658,67 +752,78 @@ where
     }
 
     async fn wait_for_ipv4_ping(&self, deadline_nanos: u64) -> Result<(), PingError> {
-        loop {
-            self.drive_ping().await?;
-            if self.inner.state.lock().await.is_configured() {
-                return Ok(());
-            }
-            if self.now_nanos() >= deadline_nanos {
-                return Err(PingError {
-                    kind: PingErrorKind::Timeout,
-                    detail: NetworkErrorDetail::NetworkConfigurationTimeout,
-                });
-            }
-            self.wait_for_progress(Duration::from_millis(1)).await;
-        }
+        self.wait_for_ipv4_configured(
+            deadline_nanos,
+            ping_configuration_timeout,
+            ping_configuration_error,
+        )
+        .await
     }
 
     async fn wait_for_ipv4_dns(&self, deadline_nanos: u64) -> Result<(), DnsError> {
-        loop {
-            self.drive_dns().await?;
-            if self.inner.state.lock().await.is_configured() {
-                return Ok(());
-            }
-            if self.now_nanos() >= deadline_nanos {
-                return Err(DnsError {
-                    kind: DnsErrorKind::Timeout,
-                    detail: NetworkErrorDetail::NetworkConfigurationTimeout,
-                });
-            }
-            self.wait_for_progress(Duration::from_millis(1)).await;
-        }
+        self.wait_for_ipv4_configured(
+            deadline_nanos,
+            dns_configuration_timeout,
+            dns_configuration_error,
+        )
+        .await
     }
 
     async fn wait_for_ipv4_tcp(&self, deadline_nanos: u64) -> Result<(), TcpError> {
-        loop {
-            self.drive_tcp().await?;
-            if self.inner.state.lock().await.is_configured() {
-                return Ok(());
-            }
-            if self.now_nanos() >= deadline_nanos {
-                return Err(TcpError {
-                    kind: TcpErrorKind::Timeout,
-                    detail: NetworkErrorDetail::NetworkConfigurationTimeout,
-                });
-            }
-            self.wait_for_progress(Duration::from_millis(1)).await;
-        }
+        self.wait_for_ipv4_configured(
+            deadline_nanos,
+            tcp_configuration_timeout,
+            tcp_configuration_error,
+        )
+        .await
     }
 
     async fn wait_for_ipv4_udp(&self, deadline_nanos: u64) -> Result<(), UdpError> {
+        self.wait_for_ipv4_configured(
+            deadline_nanos,
+            udp_configuration_timeout,
+            udp_configuration_error,
+        )
+        .await
+    }
+
+    async fn wait_for_ipv4_configured<Error>(
+        &self,
+        deadline_nanos: u64,
+        timeout_error: fn() -> Error,
+        configuration_error: fn(NetworkConfigurationError) -> Error,
+    ) -> Result<(), Error> {
         loop {
-            self.drive_udp().await?;
-            if self.inner.state.lock().await.is_configured() {
+            if self
+                .drive_ipv4_configuration()
+                .await
+                .map_err(configuration_error)?
+            {
                 return Ok(());
             }
             if self.now_nanos() >= deadline_nanos {
-                return Err(UdpError {
-                    kind: UdpErrorKind::Timeout,
-                    detail: NetworkErrorDetail::NetworkConfigurationTimeout,
-                });
+                return Err(timeout_error());
             }
-            self.wait_for_progress(Duration::from_millis(1)).await;
+            self.wait_for_progress(NETWORK_PROGRESS_WAIT).await;
         }
+    }
+
+    async fn drive_ipv4_configuration(&self) -> Result<bool, NetworkConfigurationError> {
+        self.drive_network()
+            .await
+            .map_err(NetworkConfigurationError::Device)?;
+        let now = StackInstant::from_nanos(self.now_nanos());
+        let configured = {
+            let mut state = self.inner.state.lock().await;
+            state
+                .drive_dhcp(now)
+                .map_err(NetworkConfigurationError::Control)?;
+            state.is_configured()
+        };
+        self.drive_network()
+            .await
+            .map_err(NetworkConfigurationError::Device)?;
+        Ok(configured)
     }
 
     async fn resolve_host_ping(
@@ -894,6 +999,11 @@ where
             return;
         }
 
+        if !self.inner.device.capabilities().events.interrupts {
+            self.inner.timer.sleep_for(duration).await;
+            return;
+        }
+
         let event = self.inner.device.wait_for_event();
         let timer = self.inner.timer.sleep_for(duration);
         let mut event = core::pin::pin!(event);
@@ -966,7 +1076,7 @@ where
             self.drive_network()
                 .await
                 .map_err(|_| NetworkControlError::BackendFault)?;
-            self.wait_for_progress(Duration::from_millis(1)).await;
+            self.wait_for_progress(NETWORK_PROGRESS_WAIT).await;
         }
     }
 }
