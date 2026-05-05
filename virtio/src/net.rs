@@ -1,6 +1,5 @@
 use alloc::boxed::Box;
 use alloc::vec;
-use alloc::vec::Vec;
 use async_lock::{Mutex, MutexGuard};
 use core::future::Future;
 use core::mem::size_of;
@@ -39,7 +38,8 @@ struct NetRxState<T: VirtioTransport> {
 
 struct NetTxState<T: VirtioTransport> {
     tx_queue: VirtQueue<T>,
-    tx_buffers: Box<[Box<[u8]>]>,
+    tx_buffers: Box<[u8]>,
+    tx_buffer_len: usize,
     tx_in_flight: Box<[bool]>,
 }
 
@@ -142,11 +142,15 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             );
             rx_buffers[usize::from(token)] = Some(buffer);
         }
-        let tx_buffers = (0..usize::from(tx_queue_size))
-            .map(|_| vec![0_u8; tx_buffer_len].into_boxed_slice())
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        let tx_in_flight = vec![false; usize::from(tx_queue_size)].into_boxed_slice();
+        let tx_buffer_count = usize::from(tx_queue_size);
+        let tx_buffers = vec![
+            0_u8;
+            tx_buffer_len
+                .checked_mul(tx_buffer_count)
+                .ok_or(IoError::DeviceFault)?
+        ]
+        .into_boxed_slice();
+        let tx_in_flight = vec![false; tx_buffer_count].into_boxed_slice();
 
         transport.set_status(
             DeviceStatus::ACKNOWLEDGE
@@ -165,6 +169,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             tx_state: Mutex::new(NetTxState {
                 tx_queue,
                 tx_buffers,
+                tx_buffer_len,
                 tx_in_flight,
             }),
             tx_gate: Mutex::new(()),
@@ -318,6 +323,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 let NetTxState {
                     tx_queue,
                     tx_buffers,
+                    tx_buffer_len,
                     tx_in_flight,
                 } = &mut *state;
                 while next_frame < frames.len() && tx_queue.available_descriptors() != 0 {
@@ -328,11 +334,11 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                         "virtio net TX descriptor {token} is still in flight"
                     );
                     let payload_len = write_tx_payload(
-                        &mut tx_buffers[token_index],
+                        tx_buffer_mut(tx_buffers, *tx_buffer_len, token_index),
                         self.header_len,
                         frames[next_frame],
                     )?;
-                    let payload = &tx_buffers[token_index][..payload_len];
+                    let payload = tx_buffer(tx_buffers, *tx_buffer_len, token_index, payload_len);
                     let submitted_token = tx_queue.submit(&self.transport, &[payload], &mut [])?;
                     assert_eq!(
                         submitted_token, token,
@@ -427,6 +433,34 @@ fn read_mtu<T: VirtioTransport>(transport: &T, accepted_features: u64) -> usize 
 
 fn as_bytes<T>(value: &T) -> &[u8] {
     unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
+}
+
+fn tx_buffer_mut(buffers: &mut [u8], buffer_len: usize, token_index: usize) -> &mut [u8] {
+    let start = token_index
+        .checked_mul(buffer_len)
+        .unwrap_or_else(|| panic!("virtio net TX token {token_index} buffer offset overflowed"));
+    let end = start
+        .checked_add(buffer_len)
+        .unwrap_or_else(|| panic!("virtio net TX token {token_index} buffer end overflowed"));
+    buffers
+        .get_mut(start..end)
+        .unwrap_or_else(|| panic!("virtio net TX token {token_index} is outside the TX slab"))
+}
+
+fn tx_buffer(buffers: &[u8], buffer_len: usize, token_index: usize, payload_len: usize) -> &[u8] {
+    assert!(
+        payload_len <= buffer_len,
+        "virtio net TX payload length exceeds slot capacity"
+    );
+    let start = token_index
+        .checked_mul(buffer_len)
+        .unwrap_or_else(|| panic!("virtio net TX token {token_index} buffer offset overflowed"));
+    let end = start
+        .checked_add(payload_len)
+        .unwrap_or_else(|| panic!("virtio net TX token {token_index} payload end overflowed"));
+    buffers
+        .get(start..end)
+        .unwrap_or_else(|| panic!("virtio net TX token {token_index} is outside the TX slab"))
 }
 
 fn write_tx_payload(buffer: &mut [u8], header_len: usize, frame: &[u8]) -> IoResult<usize> {
