@@ -17,7 +17,7 @@ use helios_hal::io::IoResult;
 use thiserror::Error;
 
 pub use checksum::{
-    internet_checksum, ipv4_checksum, tcpv4_checksum, tcpv6_checksum, udp_checksum,
+    icmpv6_checksum, internet_checksum, ipv4_checksum, tcpv4_checksum, tcpv6_checksum, udp_checksum,
 };
 pub use congestion::{
     AckSample, BbrV3, CongestionControl, CongestionEvent, CongestionWindow, Cubic, NewReno,

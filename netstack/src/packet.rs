@@ -1,6 +1,6 @@
 use crate::{
-    EthernetAddress, IpAddress, Ipv4Address, Ipv6Address, internet_checksum, ipv4_checksum,
-    tcpv4_checksum, tcpv6_checksum, udp_checksum,
+    EthernetAddress, IpAddress, Ipv4Address, Ipv6Address, icmpv6_checksum, internet_checksum,
+    ipv4_checksum, tcpv4_checksum, tcpv6_checksum, udp_checksum,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -498,6 +498,7 @@ pub enum Icmpv6Packet<'a> {
 
 impl<'a> Icmpv6Packet<'a> {
     pub const ECHO_HEADER_LEN: usize = 8;
+    pub const NEIGHBOR_MESSAGE_LEN: usize = 32;
 
     pub fn parse(bytes: &'a [u8]) -> Option<Self> {
         if bytes.len() < Self::ECHO_HEADER_LEN {
@@ -522,6 +523,49 @@ impl<'a> Icmpv6Packet<'a> {
             }),
             _ => None,
         }
+    }
+
+    pub fn encode_neighbor_solicitation(
+        output: &mut [u8],
+        source: Ipv6Address,
+        destination: Ipv6Address,
+        target: Ipv6Address,
+        source_mac: EthernetAddress,
+    ) -> Option<usize> {
+        if output.len() < Self::NEIGHBOR_MESSAGE_LEN {
+            return None;
+        }
+        output[..Self::NEIGHBOR_MESSAGE_LEN].fill(0);
+        output[0] = 135;
+        output[8..24].copy_from_slice(&target.octets());
+        output[24] = 1;
+        output[25] = 1;
+        output[26..32].copy_from_slice(&source_mac);
+        let checksum = icmpv6_checksum(source, destination, &output[..Self::NEIGHBOR_MESSAGE_LEN]);
+        write_u16(output, 2, checksum)?;
+        Some(Self::NEIGHBOR_MESSAGE_LEN)
+    }
+
+    pub fn encode_neighbor_advertisement(
+        output: &mut [u8],
+        source: Ipv6Address,
+        destination: Ipv6Address,
+        target: Ipv6Address,
+        target_mac: EthernetAddress,
+    ) -> Option<usize> {
+        if output.len() < Self::NEIGHBOR_MESSAGE_LEN {
+            return None;
+        }
+        output[..Self::NEIGHBOR_MESSAGE_LEN].fill(0);
+        output[0] = 136;
+        output[4] = 0x60;
+        output[8..24].copy_from_slice(&target.octets());
+        output[24] = 2;
+        output[25] = 1;
+        output[26..32].copy_from_slice(&target_mac);
+        let checksum = icmpv6_checksum(source, destination, &output[..Self::NEIGHBOR_MESSAGE_LEN]);
+        write_u16(output, 2, checksum)?;
+        Some(Self::NEIGHBOR_MESSAGE_LEN)
     }
 }
 

@@ -38,6 +38,13 @@ pub fn tcpv6_checksum(source: Ipv6Address, destination: Ipv6Address, segment: &[
     )
 }
 
+pub fn icmpv6_checksum(source: Ipv6Address, destination: Ipv6Address, message: &[u8]) -> u16 {
+    finish_checksum(
+        ipv6_pseudo_sum(source, destination, IpProtocol::Icmpv6, message.len())
+            + sum_words(message),
+    )
+}
+
 fn ipv4_pseudo_sum(
     source: Ipv4Address,
     destination: Ipv4Address,

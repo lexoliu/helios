@@ -7,9 +7,9 @@ use arrayvec::ArrayVec;
 
 use crate::{
     ArpOperation, ArpPacket, BbrV3, DEFAULT_POLL_BUDGET, EthernetAddress, EthernetFrame,
-    EthernetProtocol, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Cidr, Ipv6Packet,
-    PacketBuffer, StackError, TcpEndpoint, TcpHeader, TcpPacket, TcpSocket, TcpTransmitSegment,
-    UdpPacket,
+    EthernetProtocol, Icmpv6Packet, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr, Ipv4Packet,
+    Ipv6Address, Ipv6Cidr, Ipv6Packet, PacketBuffer, StackError, TcpEndpoint, TcpHeader, TcpPacket,
+    TcpSocket, TcpTransmitSegment, UdpPacket,
 };
 
 pub const MAX_ROUTES: usize = 32;
@@ -346,7 +346,7 @@ impl Stack {
         let frame = EthernetFrame::parse(frame).ok_or(StackError::MalformedPacket)?;
         match frame.protocol {
             EthernetProtocol::Ipv4 => self.receive_ipv4(frame.payload, now),
-            EthernetProtocol::Ipv6 => self.receive_ipv6(frame.payload, now),
+            EthernetProtocol::Ipv6 => self.receive_ipv6(frame.source, frame.payload, now),
             EthernetProtocol::Arp => self.receive_arp(frame.source, frame.payload, now),
         }
     }
@@ -527,6 +527,42 @@ impl Stack {
         )
     }
 
+    pub fn send_udp_ipv6(
+        &mut self,
+        source_port: u16,
+        destination: Ipv6Address,
+        destination_port: u16,
+        payload: &[u8],
+        now: StackInstant,
+    ) -> Result<usize, StackError> {
+        let source = self
+            .source_ipv6_for(destination)
+            .ok_or(StackError::Unroutable)?;
+        let next_hop = self.next_hop(IpAddress::Ipv6(destination));
+        let next_hop = match next_hop {
+            Some(IpAddress::Ipv6(next_hop)) => next_hop,
+            Some(IpAddress::Ipv4(_)) => panic!("IPv6 route resolved to IPv4 next hop"),
+            None => destination,
+        };
+        let destination_mac = if destination.is_multicast() {
+            ipv6_multicast_mac(destination)
+        } else {
+            let Some(destination_mac) = self.neighbor_mac(IpAddress::Ipv6(next_hop)) else {
+                self.queue_ndp_solicitation(source, next_hop, now)?;
+                return Ok(0);
+            };
+            destination_mac
+        };
+        self.queue_udp_ipv6(
+            source,
+            source_port,
+            destination,
+            destination_port,
+            destination_mac,
+            payload,
+        )
+    }
+
     fn queue_udp_ipv4(
         &mut self,
         source: Ipv4Address,
@@ -570,6 +606,47 @@ impl Stack {
         Ok(payload.len())
     }
 
+    fn queue_udp_ipv6(
+        &mut self,
+        source: Ipv6Address,
+        source_port: u16,
+        destination: Ipv6Address,
+        destination_port: u16,
+        destination_mac: EthernetAddress,
+        payload: &[u8],
+    ) -> Result<usize, StackError> {
+        let mut frame = PacketBuffer::new();
+        let storage = frame.storage_mut();
+        let mut offset = EthernetFrame::encode_header(
+            storage,
+            destination_mac,
+            self.config.mac,
+            EthernetProtocol::Ipv6,
+        )
+        .ok_or(StackError::OutputQueueFull)?;
+        offset += Ipv6Packet::encode_header(
+            &mut storage[offset..],
+            source,
+            destination,
+            crate::IpProtocol::Udp,
+            UdpPacket::HEADER_LEN + payload.len(),
+            64,
+        )
+        .ok_or(StackError::OutputQueueFull)?;
+        offset += UdpPacket::encode(
+            &mut storage[offset..],
+            IpAddress::Ipv6(source),
+            IpAddress::Ipv6(destination),
+            source_port,
+            destination_port,
+            payload,
+        )
+        .ok_or(StackError::OutputQueueFull)?;
+        frame.set_len(offset);
+        self.outbound.push_back(frame);
+        Ok(payload.len())
+    }
+
     fn queue_tcp(
         &mut self,
         local: TcpEndpoint,
@@ -583,7 +660,9 @@ impl Stack {
             (IpAddress::Ipv4(source), IpAddress::Ipv4(destination)) => {
                 self.queue_tcp_ipv4(source, destination, header, payload, identification, now)
             }
-            (IpAddress::Ipv6(_), IpAddress::Ipv6(_)) => Ok(false),
+            (IpAddress::Ipv6(source), IpAddress::Ipv6(destination)) => {
+                self.queue_tcp_ipv6(source, destination, header, payload, now)
+            }
             _ => panic!("TCP endpoint address families must match"),
         }
     }
@@ -640,6 +719,56 @@ impl Stack {
         Ok(true)
     }
 
+    fn queue_tcp_ipv6(
+        &mut self,
+        source: Ipv6Address,
+        destination: Ipv6Address,
+        header: TcpHeader,
+        payload: &[u8],
+        now: StackInstant,
+    ) -> Result<bool, StackError> {
+        let next_hop = self.next_hop(IpAddress::Ipv6(destination));
+        let next_hop = match next_hop {
+            Some(IpAddress::Ipv6(next_hop)) => next_hop,
+            Some(IpAddress::Ipv4(_)) => panic!("IPv6 route resolved to IPv4 next hop"),
+            None => destination,
+        };
+        let Some(destination_mac) = self.neighbor_mac(IpAddress::Ipv6(next_hop)) else {
+            self.queue_ndp_solicitation(source, next_hop, now)?;
+            return Ok(false);
+        };
+
+        let mut frame = PacketBuffer::new();
+        let storage = frame.storage_mut();
+        let mut offset = EthernetFrame::encode_header(
+            storage,
+            destination_mac,
+            self.config.mac,
+            EthernetProtocol::Ipv6,
+        )
+        .ok_or(StackError::OutputQueueFull)?;
+        offset += Ipv6Packet::encode_header(
+            &mut storage[offset..],
+            source,
+            destination,
+            crate::IpProtocol::Tcp,
+            TcpPacket::MIN_HEADER_LEN + payload.len(),
+            64,
+        )
+        .ok_or(StackError::OutputQueueFull)?;
+        offset += TcpPacket::encode(
+            &mut storage[offset..],
+            IpAddress::Ipv6(source),
+            IpAddress::Ipv6(destination),
+            header,
+            payload,
+        )
+        .ok_or(StackError::OutputQueueFull)?;
+        frame.set_len(offset);
+        self.outbound.push_back(frame);
+        Ok(true)
+    }
+
     fn receive_arp(
         &mut self,
         source_mac: EthernetAddress,
@@ -685,8 +814,21 @@ impl Stack {
         }
     }
 
-    fn receive_ipv6(&mut self, bytes: &[u8], now: StackInstant) -> Result<(), StackError> {
+    fn receive_ipv6(
+        &mut self,
+        source_mac: EthernetAddress,
+        bytes: &[u8],
+        now: StackInstant,
+    ) -> Result<(), StackError> {
         let packet = Ipv6Packet::parse(bytes).ok_or(StackError::MalformedPacket)?;
+        if !packet.source.is_unspecified() {
+            self.learn_neighbor(NeighborEntry {
+                ip: IpAddress::Ipv6(packet.source),
+                mac: source_mac,
+                state: NeighborState::Reachable,
+                updated_at: now,
+            });
+        }
         match packet.next_header {
             crate::IpProtocol::Tcp => self.receive_tcp(
                 IpAddress::Ipv6(packet.source),
@@ -702,7 +844,8 @@ impl Stack {
                 )?;
                 Ok(())
             }
-            crate::IpProtocol::Icmp | crate::IpProtocol::Icmpv6 => Ok(()),
+            crate::IpProtocol::Icmpv6 => self.receive_icmpv6(source_mac, packet, now),
+            crate::IpProtocol::Icmp => Ok(()),
         }
     }
 
@@ -713,6 +856,108 @@ impl Stack {
             .find(|cidr| cidr.contains(destination))
             .or_else(|| self.ipv4_addresses.first().copied())
             .map(Ipv4Cidr::address)
+    }
+
+    fn source_ipv6_for(&self, destination: Ipv6Address) -> Option<Ipv6Address> {
+        self.ipv6_addresses
+            .iter()
+            .copied()
+            .find(|cidr| cidr.contains(destination))
+            .or_else(|| self.ipv6_addresses.first().copied())
+            .map(Ipv6Cidr::address)
+    }
+
+    fn queue_ndp_solicitation(
+        &mut self,
+        source: Ipv6Address,
+        target: Ipv6Address,
+        now: StackInstant,
+    ) -> Result<(), StackError> {
+        self.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv6(target),
+            mac: [0; 6],
+            state: NeighborState::Incomplete,
+            updated_at: now,
+        });
+        let destination = target.solicited_node_multicast();
+        let destination_mac = ipv6_multicast_mac(destination);
+        self.queue_icmpv6_neighbor_solicitation(source, destination, target, destination_mac)
+    }
+
+    fn queue_icmpv6_neighbor_solicitation(
+        &mut self,
+        source: Ipv6Address,
+        destination: Ipv6Address,
+        target: Ipv6Address,
+        destination_mac: EthernetAddress,
+    ) -> Result<(), StackError> {
+        let mut frame = PacketBuffer::new();
+        let storage = frame.storage_mut();
+        let mut offset = EthernetFrame::encode_header(
+            storage,
+            destination_mac,
+            self.config.mac,
+            EthernetProtocol::Ipv6,
+        )
+        .ok_or(StackError::OutputQueueFull)?;
+        offset += Ipv6Packet::encode_header(
+            &mut storage[offset..],
+            source,
+            destination,
+            crate::IpProtocol::Icmpv6,
+            Icmpv6Packet::NEIGHBOR_MESSAGE_LEN,
+            255,
+        )
+        .ok_or(StackError::OutputQueueFull)?;
+        offset += Icmpv6Packet::encode_neighbor_solicitation(
+            &mut storage[offset..],
+            source,
+            destination,
+            target,
+            self.config.mac,
+        )
+        .ok_or(StackError::OutputQueueFull)?;
+        frame.set_len(offset);
+        self.outbound.push_back(frame);
+        Ok(())
+    }
+
+    fn queue_icmpv6_neighbor_advertisement(
+        &mut self,
+        source: Ipv6Address,
+        destination: Ipv6Address,
+        target: Ipv6Address,
+        destination_mac: EthernetAddress,
+    ) -> Result<(), StackError> {
+        let mut frame = PacketBuffer::new();
+        let storage = frame.storage_mut();
+        let mut offset = EthernetFrame::encode_header(
+            storage,
+            destination_mac,
+            self.config.mac,
+            EthernetProtocol::Ipv6,
+        )
+        .ok_or(StackError::OutputQueueFull)?;
+        offset += Ipv6Packet::encode_header(
+            &mut storage[offset..],
+            source,
+            destination,
+            crate::IpProtocol::Icmpv6,
+            Icmpv6Packet::NEIGHBOR_MESSAGE_LEN,
+            255,
+        )
+        .ok_or(StackError::OutputQueueFull)?;
+        offset += Icmpv6Packet::encode_neighbor_advertisement(
+            &mut storage[offset..],
+            source,
+            destination,
+            target,
+            self.config.mac,
+        )
+        .ok_or(StackError::OutputQueueFull)?;
+        frame.set_len(offset);
+        self.outbound.push_back(frame);
+        Ok(())
     }
 
     fn next_hop(&self, destination: IpAddress) -> Option<IpAddress> {
@@ -835,6 +1080,43 @@ impl Stack {
         Ok(())
     }
 
+    fn receive_icmpv6(
+        &mut self,
+        source_mac: EthernetAddress,
+        packet: Ipv6Packet<'_>,
+        now: StackInstant,
+    ) -> Result<(), StackError> {
+        match Icmpv6Packet::parse(packet.payload).ok_or(StackError::MalformedPacket)? {
+            Icmpv6Packet::NeighborSolicitation { target } => {
+                if packet.source.is_unspecified() {
+                    return Ok(());
+                }
+                if self
+                    .ipv6_addresses
+                    .iter()
+                    .any(|address| address.address() == target)
+                {
+                    self.queue_icmpv6_neighbor_advertisement(
+                        target,
+                        packet.source,
+                        target,
+                        source_mac,
+                    )?;
+                }
+            }
+            Icmpv6Packet::NeighborAdvertisement { target } => {
+                self.learn_neighbor(NeighborEntry {
+                    ip: IpAddress::Ipv6(target),
+                    mac: source_mac,
+                    state: NeighborState::Reachable,
+                    updated_at: now,
+                });
+            }
+            Icmpv6Packet::EchoRequest(_) | Icmpv6Packet::EchoReply(_) => {}
+        }
+        Ok(())
+    }
+
     fn receive_udp(
         &mut self,
         source: IpAddress,
@@ -889,4 +1171,9 @@ fn socket_id(index: usize) -> SocketId {
 fn socket_index(socket: SocketId) -> usize {
     usize::try_from(socket.raw() - 1)
         .unwrap_or_else(|_| panic!("socket id does not fit into usize"))
+}
+
+fn ipv6_multicast_mac(address: Ipv6Address) -> EthernetAddress {
+    let octets = address.octets();
+    [0x33, 0x33, octets[12], octets[13], octets[14], octets[15]]
 }
