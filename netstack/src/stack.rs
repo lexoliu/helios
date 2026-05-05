@@ -21,6 +21,7 @@ pub const MAX_STACK_EVENTS: usize = 64;
 pub const MAX_UDP_RX: usize = 64;
 pub const MAX_TCP_ACCEPT: usize = 64;
 pub const MAX_TCP_SOCKETS: usize = 256;
+const TCP_ENDPOINT_INDEX_SLOTS: usize = MAX_TCP_SOCKETS * 2;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StackInstant {
@@ -226,6 +227,30 @@ struct TcpSocketSlab {
     slots: Box<[Option<TcpSocket<BbrV3>>]>,
     free: [usize; MAX_TCP_SOCKETS],
     free_len: usize,
+    endpoint_index: TcpEndpointIndex,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TcpEndpointKey {
+    local: TcpEndpoint,
+    remote: TcpEndpoint,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TcpEndpointIndexEntry {
+    key: TcpEndpointKey,
+    socket_index: usize,
+}
+
+#[derive(Clone, Debug)]
+struct TcpEndpointIndex {
+    entries: [Option<TcpEndpointIndexEntry>; TCP_ENDPOINT_INDEX_SLOTS],
+}
+
+impl TcpEndpointKey {
+    const fn new(local: TcpEndpoint, remote: TcpEndpoint) -> Self {
+        Self { local, remote }
+    }
 }
 
 impl TcpSocketSlab {
@@ -236,6 +261,7 @@ impl TcpSocketSlab {
             slots: slots.into_boxed_slice(),
             free: core::array::from_fn(|index| MAX_TCP_SOCKETS - 1 - index),
             free_len: MAX_TCP_SOCKETS,
+            endpoint_index: TcpEndpointIndex::new(),
         }
     }
 
@@ -263,15 +289,94 @@ impl TcpSocketSlab {
         let index = self.free[self.free_len];
         let slot = &mut self.slots[index];
         assert!(slot.is_none(), "TCP socket slab free list is corrupt");
+        let endpoint_key = socket
+            .local_endpoint()
+            .zip(socket.remote_endpoint())
+            .map(|(local, remote)| TcpEndpointKey::new(local, remote));
         *slot = Some(socket);
+        if let Some(key) = endpoint_key {
+            self.endpoint_index.insert(key, index);
+        }
         socket_id(index)
     }
 
     fn remove(&mut self, index: usize) -> Option<TcpSocket<BbrV3>> {
         let socket = self.slots.get_mut(index).and_then(Option::take)?;
+        if let Some((local, remote)) = socket.local_endpoint().zip(socket.remote_endpoint()) {
+            self.endpoint_index
+                .remove(TcpEndpointKey::new(local, remote));
+        }
         self.free[self.free_len] = index;
         self.free_len += 1;
         Some(socket)
+    }
+
+    fn find_endpoint(&self, local: TcpEndpoint, remote: TcpEndpoint) -> Option<usize> {
+        self.endpoint_index
+            .lookup(TcpEndpointKey::new(local, remote))
+    }
+}
+
+impl TcpEndpointIndex {
+    fn new() -> Self {
+        Self {
+            entries: [None; TCP_ENDPOINT_INDEX_SLOTS],
+        }
+    }
+
+    fn insert(&mut self, key: TcpEndpointKey, socket_index: usize) {
+        for index in Self::probe_indices(key) {
+            match self.entries[index] {
+                Some(entry) if entry.key == key => {
+                    self.entries[index] = Some(TcpEndpointIndexEntry { key, socket_index });
+                    return;
+                }
+                Some(_) => {}
+                None => {
+                    self.entries[index] = Some(TcpEndpointIndexEntry { key, socket_index });
+                    return;
+                }
+            }
+        }
+        panic!("TCP endpoint index is full");
+    }
+
+    fn remove(&mut self, key: TcpEndpointKey) {
+        for index in Self::probe_indices(key) {
+            match self.entries[index] {
+                Some(entry) if entry.key == key => {
+                    self.entries[index] = None;
+                    self.reinsert_probe_cluster_after(index);
+                    return;
+                }
+                Some(_) => {}
+                None => return,
+            }
+        }
+    }
+
+    fn lookup(&self, key: TcpEndpointKey) -> Option<usize> {
+        for index in Self::probe_indices(key) {
+            match self.entries[index] {
+                Some(entry) if entry.key == key => return Some(entry.socket_index),
+                Some(_) => {}
+                None => return None,
+            }
+        }
+        None
+    }
+
+    fn reinsert_probe_cluster_after(&mut self, removed_index: usize) {
+        let mut index = (removed_index + 1) % TCP_ENDPOINT_INDEX_SLOTS;
+        while let Some(entry) = self.entries[index].take() {
+            self.insert(entry.key, entry.socket_index);
+            index = (index + 1) % TCP_ENDPOINT_INDEX_SLOTS;
+        }
+    }
+
+    fn probe_indices(key: TcpEndpointKey) -> impl Iterator<Item = usize> {
+        let start = endpoint_hash(key) % TCP_ENDPOINT_INDEX_SLOTS;
+        (0..TCP_ENDPOINT_INDEX_SLOTS).map(move |offset| (start + offset) % TCP_ENDPOINT_INDEX_SLOTS)
     }
 }
 
@@ -1345,51 +1450,44 @@ impl Stack {
         now: StackInstant,
     ) -> Result<bool, StackError> {
         let packet = crate::TcpPacket::parse(bytes).ok_or(StackError::MalformedPacket)?;
-        for (index, socket) in self.tcp.iter_mut().enumerate() {
-            let Some(socket) = socket else {
-                continue;
-            };
-            let local = socket.local_endpoint();
-            let remote = socket.remote_endpoint();
-            if local
-                == Some(TcpEndpoint {
-                    address: destination,
-                    port: packet.destination_port,
-                })
-                && remote
-                    == Some(TcpEndpoint {
-                        address: source,
-                        port: packet.source_port,
-                    })
+        let local_endpoint = TcpEndpoint {
+            address: destination,
+            port: packet.destination_port,
+        };
+        let remote_endpoint = TcpEndpoint {
+            address: source,
+            port: packet.source_port,
+        };
+        if let Some(index) = self.tcp.find_endpoint(local_endpoint, remote_endpoint) {
+            let socket = self
+                .tcp
+                .get_mut(index)
+                .and_then(Option::as_mut)
+                .expect("TCP endpoint index referenced a missing socket");
+            let previous_state = socket.state();
+            let outcome = socket.on_segment(packet, now.nanos());
+            if previous_state == crate::TcpState::SynReceived
+                && socket.state() == crate::TcpState::Established
             {
-                let previous_state = socket.state();
-                let outcome = socket.on_segment(packet, now.nanos());
-                if previous_state == crate::TcpState::SynReceived
-                    && socket.state() == crate::TcpState::Established
-                {
-                    self.tcp_accept
-                        .push_back(TcpAccept {
-                            socket: socket_id(index),
-                            remote: TcpEndpoint {
-                                address: source,
-                                port: packet.source_port,
-                            },
-                        })
-                        .unwrap_or_else(|_| panic!("TCP accept queue is full"));
-                }
-                if socket.state() == crate::TcpState::Established {
-                    Self::push_event_into(
-                        &mut self.events,
-                        StackEvent::TcpReadable {
-                            socket: socket_id(index),
-                        },
-                    );
-                }
-                if outcome.receive_backpressure {
-                    return Err(StackError::ReceiveBackpressure);
-                }
-                return Ok(socket.receive_backpressured());
+                self.tcp_accept
+                    .push_back(TcpAccept {
+                        socket: socket_id(index),
+                        remote: remote_endpoint,
+                    })
+                    .unwrap_or_else(|_| panic!("TCP accept queue is full"));
             }
+            if socket.state() == crate::TcpState::Established {
+                Self::push_event_into(
+                    &mut self.events,
+                    StackEvent::TcpReadable {
+                        socket: socket_id(index),
+                    },
+                );
+            }
+            if outcome.receive_backpressure {
+                return Err(StackError::ReceiveBackpressure);
+            }
+            return Ok(socket.receive_backpressured());
         }
         if packet.flags.contains(crate::TcpFlags::SYN)
             && !packet.flags.contains(crate::TcpFlags::ACK)
@@ -1406,16 +1504,12 @@ impl Stack {
                 address: destination,
                 port: packet.destination_port,
             };
-            let remote = TcpEndpoint {
-                address: source,
-                port: packet.source_port,
-            };
             let initial_sequence = (now.nanos() as u32)
                 .wrapping_add(u32::from(packet.destination_port))
                 .wrapping_add(u32::from(packet.source_port));
             let child = TcpSocket::accept(
                 local,
-                remote,
+                remote_endpoint,
                 packet.sequence.wrapping_add(1),
                 initial_sequence,
                 BbrV3::new(1460),
@@ -1523,6 +1617,37 @@ fn socket_id(index: usize) -> SocketId {
 fn socket_index(socket: SocketId) -> usize {
     usize::try_from(socket.raw() - 1)
         .unwrap_or_else(|_| panic!("socket id does not fit into usize"))
+}
+
+fn endpoint_hash(key: TcpEndpointKey) -> usize {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    hash = mix_endpoint(hash, key.local);
+    hash = mix_endpoint(hash, key.remote);
+    hash as usize
+}
+
+fn mix_endpoint(mut hash: u64, endpoint: TcpEndpoint) -> u64 {
+    hash = mix_ip_address(hash, endpoint.address);
+    mix_u16(hash, endpoint.port)
+}
+
+fn mix_ip_address(hash: u64, address: IpAddress) -> u64 {
+    match address {
+        IpAddress::Ipv4(address) => mix_bytes(hash, &address.octets()),
+        IpAddress::Ipv6(address) => mix_bytes(hash, &address.octets()),
+    }
+}
+
+fn mix_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn mix_u16(hash: u64, value: u16) -> u64 {
+    mix_bytes(hash, &value.to_be_bytes())
 }
 
 fn ipv6_multicast_mac(address: Ipv6Address) -> EthernetAddress {
