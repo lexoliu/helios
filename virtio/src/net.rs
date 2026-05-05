@@ -33,7 +33,9 @@ struct VirtioNetHeader {
 
 struct NetRxState<T: VirtioTransport> {
     rx_queue: VirtQueue<T>,
-    rx_buffers: Box<[Option<Box<[u8]>>]>,
+    rx_buffers: Box<[u8]>,
+    rx_buffer_len: usize,
+    rx_in_device: Box<[bool]>,
 }
 
 struct NetTxState<T: VirtioTransport> {
@@ -56,25 +58,33 @@ pub struct VirtioNetDevice<T: VirtioTransport> {
 
 pub struct BorrowedRxFrame<'a, T: VirtioTransport> {
     state: MutexGuard<'a, NetRxState<T>>,
-    buffer: Option<Box<[u8]>>,
+    token: u16,
     frame_start: usize,
     frame_end: usize,
+    reposted: bool,
 }
 
 impl<T: VirtioTransport> AsRef<[u8]> for BorrowedRxFrame<'_, T> {
     fn as_ref(&self) -> &[u8] {
-        let buffer = self
-            .buffer
-            .as_ref()
-            .expect("borrowed virtio RX frame was already reposted");
-        &buffer[self.frame_start..self.frame_end]
+        assert!(
+            !self.reposted,
+            "borrowed virtio RX frame was already reposted"
+        );
+        let token_index = usize::from(self.token);
+        &slot_buffer(
+            &self.state.rx_buffers,
+            self.state.rx_buffer_len,
+            token_index,
+            self.frame_end,
+            "RX",
+        )[self.frame_start..self.frame_end]
     }
 }
 
 impl<T: VirtioTransport> Drop for BorrowedRxFrame<'_, T> {
     fn drop(&mut self) {
         assert!(
-            self.buffer.is_none(),
+            self.reposted,
             "borrowed virtio RX frame was dropped without reposting"
         );
     }
@@ -132,15 +142,37 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
 
         let mut rx_queue = VirtQueue::new(&transport, RX_QUEUE_INDEX, rx_queue_size)?;
         let tx_queue = VirtQueue::new(&transport, TX_QUEUE_INDEX, tx_queue_size)?;
-        let mut rx_buffers = vec![None; usize::from(rx_queue_size)].into_boxed_slice();
+        let rx_buffer_count = usize::from(rx_queue_size);
+        let mut rx_buffers = vec![
+            0_u8;
+            rx_buffer_len
+                .checked_mul(rx_buffer_count)
+                .ok_or(IoError::DeviceFault)?
+        ]
+        .into_boxed_slice();
+        let mut rx_in_device = vec![false; rx_buffer_count].into_boxed_slice();
         for _ in 0..usize::from(rx_queue_size) {
-            let mut buffer = vec![0_u8; rx_buffer_len].into_boxed_slice();
-            let token = rx_queue.submit(&transport, &[], &mut [buffer.as_mut()])?;
+            let token = rx_queue.next_free_descriptor();
+            let token_index = usize::from(token);
+            let submitted_token = rx_queue.submit(
+                &transport,
+                &[],
+                &mut [slot_buffer_mut(
+                    &mut rx_buffers,
+                    rx_buffer_len,
+                    token_index,
+                    "RX",
+                )],
+            )?;
+            assert_eq!(
+                submitted_token, token,
+                "virtio net RX descriptor allocation moved while buffer was prepared"
+            );
             assert!(
-                rx_buffers[usize::from(token)].is_none(),
+                !rx_in_device[token_index],
                 "virtio net RX token was allocated twice during initialization"
             );
-            rx_buffers[usize::from(token)] = Some(buffer);
+            rx_in_device[token_index] = true;
         }
         let tx_buffer_count = usize::from(tx_queue_size);
         let tx_buffers = vec![
@@ -165,6 +197,8 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             rx_state: Mutex::new(NetRxState {
                 rx_queue,
                 rx_buffers,
+                rx_buffer_len,
+                rx_in_device,
             }),
             tx_state: Mutex::new(NetTxState {
                 tx_queue,
@@ -207,19 +241,24 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
             return Ok(None);
         };
-        let Some(buffer) = state.rx_buffers[usize::from(token)].take() else {
-            panic!("virtio net RX completion referenced an unknown token {token}");
-        };
+        let token_index = usize::from(token);
+        Self::mark_rx_completed(&mut state, token);
         let used_len = used_len as usize;
-        if used_len < self.header_len || used_len > buffer.len() {
-            Self::repost_rx_buffer(&mut state, &self.transport, buffer)?;
+        if used_len < self.header_len || used_len > state.rx_buffer_len {
+            Self::repost_rx_buffer(&mut state, &self.transport, token)?;
             return Err(IoError::DeviceFault);
         }
 
-        let frame = buffer[self.header_len..used_len]
+        let frame = slot_buffer(
+            &state.rx_buffers,
+            state.rx_buffer_len,
+            token_index,
+            used_len,
+            "RX",
+        )[self.header_len..used_len]
             .to_vec()
             .into_boxed_slice();
-        Self::repost_rx_buffer(&mut state, &self.transport, buffer)?;
+        Self::repost_rx_buffer(&mut state, &self.transport, token)?;
         Ok(Some(frame))
     }
 
@@ -228,22 +267,29 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
             return Ok(None);
         };
-        let Some(buffer) = state.rx_buffers[usize::from(token)].take() else {
-            panic!("virtio net RX completion referenced an unknown token {token}");
-        };
+        let token_index = usize::from(token);
+        Self::mark_rx_completed(&mut state, token);
         let used_len = used_len as usize;
-        if used_len < self.header_len || used_len > buffer.len() {
-            Self::repost_rx_buffer(&mut state, &self.transport, buffer)?;
+        if used_len < self.header_len || used_len > state.rx_buffer_len {
+            Self::repost_rx_buffer(&mut state, &self.transport, token)?;
             return Err(IoError::DeviceFault);
         }
 
         let frame_len = used_len - self.header_len;
         if frame_len > output.len() {
-            Self::repost_rx_buffer(&mut state, &self.transport, buffer)?;
+            Self::repost_rx_buffer(&mut state, &self.transport, token)?;
             return Err(IoError::OutOfBounds);
         }
-        output[..frame_len].copy_from_slice(&buffer[self.header_len..used_len]);
-        Self::repost_rx_buffer(&mut state, &self.transport, buffer)?;
+        output[..frame_len].copy_from_slice(
+            &slot_buffer(
+                &state.rx_buffers,
+                state.rx_buffer_len,
+                token_index,
+                used_len,
+                "RX",
+            )[self.header_len..used_len],
+        );
+        Self::repost_rx_buffer(&mut state, &self.transport, token)?;
         Ok(Some(frame_len))
     }
 
@@ -252,29 +298,29 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
             return Ok(None);
         };
-        let Some(buffer) = state.rx_buffers[usize::from(token)].take() else {
-            panic!("virtio net RX completion referenced an unknown token {token}");
-        };
+        Self::mark_rx_completed(&mut state, token);
         let used_len = used_len as usize;
-        if used_len < self.header_len || used_len > buffer.len() {
-            Self::repost_rx_buffer(&mut state, &self.transport, buffer)?;
+        if used_len < self.header_len || used_len > state.rx_buffer_len {
+            Self::repost_rx_buffer(&mut state, &self.transport, token)?;
             return Err(IoError::DeviceFault);
         }
 
         Ok(Some(BorrowedRxFrame {
             state,
-            buffer: Some(buffer),
+            token,
             frame_start: self.header_len,
             frame_end: used_len,
+            reposted: false,
         }))
     }
 
     pub async fn repost_rx_frame(&self, mut frame: BorrowedRxFrame<'_, T>) -> IoResult<()> {
-        let buffer = frame
-            .buffer
-            .take()
-            .expect("borrowed virtio RX frame was reposted twice");
-        Self::repost_rx_buffer(&mut frame.state, &self.transport, buffer)
+        assert!(
+            !frame.reposted,
+            "borrowed virtio RX frame was reposted twice"
+        );
+        frame.reposted = true;
+        Self::repost_rx_buffer(&mut frame.state, &self.transport, frame.token)
     }
 
     pub async fn transmit(&self, frame: &[u8]) -> IoResult<()> {
@@ -334,11 +380,12 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                         "virtio net TX descriptor {token} is still in flight"
                     );
                     let payload_len = write_tx_payload(
-                        tx_buffer_mut(tx_buffers, *tx_buffer_len, token_index),
+                        slot_buffer_mut(tx_buffers, *tx_buffer_len, token_index, "TX"),
                         self.header_len,
                         frames[next_frame],
                     )?;
-                    let payload = tx_buffer(tx_buffers, *tx_buffer_len, token_index, payload_len);
+                    let payload =
+                        slot_buffer(tx_buffers, *tx_buffer_len, token_index, payload_len, "TX");
                     let submitted_token = tx_queue.submit(&self.transport, &[payload], &mut [])?;
                     assert_eq!(
                         submitted_token, token,
@@ -378,20 +425,37 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         self.interrupts.notified().await;
     }
 
-    fn repost_rx_buffer(
-        state: &mut NetRxState<T>,
-        transport: &T,
-        mut buffer: Box<[u8]>,
-    ) -> IoResult<()> {
-        let token = state
-            .rx_queue
-            .submit(transport, &[], &mut [buffer.as_mut()])?;
+    fn repost_rx_buffer(state: &mut NetRxState<T>, transport: &T, token: u16) -> IoResult<()> {
+        let token_index = usize::from(token);
         assert!(
-            state.rx_buffers[usize::from(token)].is_none(),
-            "virtio net RX buffer was reposted into an occupied token slot"
+            !state.rx_in_device[token_index],
+            "virtio net RX buffer was reposted while still owned by the device"
         );
-        state.rx_buffers[usize::from(token)] = Some(buffer);
+        let submitted_token = state.rx_queue.submit(
+            transport,
+            &[],
+            &mut [slot_buffer_mut(
+                &mut state.rx_buffers,
+                state.rx_buffer_len,
+                token_index,
+                "RX",
+            )],
+        )?;
+        assert_eq!(
+            submitted_token, token,
+            "virtio net RX descriptor allocation moved while buffer was reposted"
+        );
+        state.rx_in_device[token_index] = true;
         Ok(())
+    }
+
+    fn mark_rx_completed(state: &mut NetRxState<T>, token: u16) {
+        let token_index = usize::from(token);
+        assert!(
+            state.rx_in_device[token_index],
+            "virtio net RX completion referenced an idle token {token}"
+        );
+        state.rx_in_device[token_index] = false;
     }
 
     fn drain_tx_completions(state: &mut NetTxState<T>, budget: usize) -> usize {
@@ -435,32 +499,43 @@ fn as_bytes<T>(value: &T) -> &[u8] {
     unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
 }
 
-fn tx_buffer_mut(buffers: &mut [u8], buffer_len: usize, token_index: usize) -> &mut [u8] {
-    let start = token_index
-        .checked_mul(buffer_len)
-        .unwrap_or_else(|| panic!("virtio net TX token {token_index} buffer offset overflowed"));
+fn slot_buffer_mut<'a>(
+    buffers: &'a mut [u8],
+    buffer_len: usize,
+    token_index: usize,
+    queue: &str,
+) -> &'a mut [u8] {
+    let start = token_index.checked_mul(buffer_len).unwrap_or_else(|| {
+        panic!("virtio net {queue} token {token_index} buffer offset overflowed")
+    });
     let end = start
         .checked_add(buffer_len)
-        .unwrap_or_else(|| panic!("virtio net TX token {token_index} buffer end overflowed"));
-    buffers
-        .get_mut(start..end)
-        .unwrap_or_else(|| panic!("virtio net TX token {token_index} is outside the TX slab"))
+        .unwrap_or_else(|| panic!("virtio net {queue} token {token_index} buffer end overflowed"));
+    buffers.get_mut(start..end).unwrap_or_else(|| {
+        panic!("virtio net {queue} token {token_index} is outside the buffer slab")
+    })
 }
 
-fn tx_buffer(buffers: &[u8], buffer_len: usize, token_index: usize, payload_len: usize) -> &[u8] {
+fn slot_buffer<'a>(
+    buffers: &'a [u8],
+    buffer_len: usize,
+    token_index: usize,
+    payload_len: usize,
+    queue: &str,
+) -> &'a [u8] {
     assert!(
         payload_len <= buffer_len,
-        "virtio net TX payload length exceeds slot capacity"
+        "virtio net payload length exceeds slot capacity"
     );
-    let start = token_index
-        .checked_mul(buffer_len)
-        .unwrap_or_else(|| panic!("virtio net TX token {token_index} buffer offset overflowed"));
+    let start = token_index.checked_mul(buffer_len).unwrap_or_else(|| {
+        panic!("virtio net {queue} token {token_index} buffer offset overflowed")
+    });
     let end = start
         .checked_add(payload_len)
-        .unwrap_or_else(|| panic!("virtio net TX token {token_index} payload end overflowed"));
-    buffers
-        .get(start..end)
-        .unwrap_or_else(|| panic!("virtio net TX token {token_index} is outside the TX slab"))
+        .unwrap_or_else(|| panic!("virtio net {queue} token {token_index} payload end overflowed"));
+    buffers.get(start..end).unwrap_or_else(|| {
+        panic!("virtio net {queue} token {token_index} is outside the buffer slab")
+    })
 }
 
 fn write_tx_payload(buffer: &mut [u8], header_len: usize, frame: &[u8]) -> IoResult<usize> {
