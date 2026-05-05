@@ -1711,7 +1711,7 @@ impl NetworkState {
                     detail: NetworkErrorDetail::DnsNoIpv4Address,
                 });
             }
-            return Ok(Some(message.addresses));
+            return Ok(Some(message.addresses.into_iter().collect()));
         }
         Ok(None)
     }

@@ -1,10 +1,10 @@
 extern crate alloc;
 
-use alloc::vec::Vec;
-
 use crate::Ipv4Address;
+use arrayvec::ArrayVec;
 
 pub const DNS_PORT: u16 = 53;
+pub const DNS_MAX_A_RECORDS: usize = 32;
 
 const TYPE_A: u16 = 1;
 const CLASS_IN: u16 = 1;
@@ -12,7 +12,7 @@ const CLASS_IN: u16 = 1;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DnsMessage {
     pub id: u16,
-    pub addresses: Vec<Ipv4Address>,
+    pub addresses: ArrayVec<Ipv4Address, DNS_MAX_A_RECORDS>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,7 +45,7 @@ impl<'a> DnsResponse<'a> {
             }
         }
 
-        let mut addresses = Vec::new();
+        let mut addresses = ArrayVec::new();
         for _ in 0..answer_count {
             offset = skip_name(self.bytes, offset)?;
             let record_type = read_u16(self.bytes, offset)?;
@@ -55,7 +55,9 @@ impl<'a> DnsResponse<'a> {
             let data_end = offset.checked_add(data_len)?;
             let data = self.bytes.get(offset..data_end)?;
             if record_type == TYPE_A && record_class == CLASS_IN && data.len() == 4 {
-                addresses.push(Ipv4Address::new(data.try_into().ok()?));
+                addresses
+                    .try_push(Ipv4Address::new(data.try_into().ok()?))
+                    .ok()?;
             }
             offset = data_end;
         }
