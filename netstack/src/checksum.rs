@@ -91,7 +91,7 @@ fn sum_words(bytes: &[u8]) -> u32 {
     }
 }
 
-#[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+#[cfg(any(test, not(all(target_arch = "aarch64", target_feature = "neon"))))]
 fn sum_words_scalar(bytes: &[u8]) -> u32 {
     let mut chunks = bytes.chunks_exact(2);
     let mut sum = chunks
@@ -106,23 +106,29 @@ fn sum_words_scalar(bytes: &[u8]) -> u32 {
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 fn sum_words_neon(bytes: &[u8]) -> u32 {
-    use core::arch::aarch64::{vaddlvq_u16, vaddq_u16, vld1q_u8, vreinterpretq_u16_u8, vrev16q_u8};
+    use core::arch::aarch64::{
+        vaddq_u32, vaddvq_u32, vget_high_u16, vget_low_u16, vld1q_u8, vmovl_u16,
+        vreinterpretq_u16_u8, vrev16q_u8,
+    };
 
     let mut offset = 0usize;
-    let mut lanes;
+    let mut low_lanes;
+    let mut high_lanes;
     unsafe {
-        lanes = core::mem::zeroed();
+        low_lanes = core::mem::zeroed();
+        high_lanes = core::mem::zeroed();
     }
     while offset + 16 <= bytes.len() {
         unsafe {
             let vector = vld1q_u8(bytes.as_ptr().add(offset));
             let words = vreinterpretq_u16_u8(vrev16q_u8(vector));
-            lanes = vaddq_u16(lanes, words);
+            low_lanes = vaddq_u32(low_lanes, vmovl_u16(vget_low_u16(words)));
+            high_lanes = vaddq_u32(high_lanes, vmovl_u16(vget_high_u16(words)));
         }
         offset += 16;
     }
 
-    let mut sum = unsafe { u32::from(vaddlvq_u16(lanes)) };
+    let mut sum = unsafe { vaddvq_u32(low_lanes) + vaddvq_u32(high_lanes) };
     let mut chunks = bytes[offset..].chunks_exact(2);
     for chunk in chunks.by_ref() {
         sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
@@ -138,4 +144,20 @@ fn finish_checksum(mut sum: u32) -> u16 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
     !(sum as u16)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn checksum_matches_scalar_reference_for_large_payload() {
+        let mut bytes = [0u8; 4097];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = index.wrapping_mul(37).wrapping_add(19) as u8;
+        }
+
+        assert_eq!(
+            super::finish_checksum(super::sum_words(&bytes)),
+            super::finish_checksum(super::sum_words_scalar(&bytes))
+        );
+    }
 }
