@@ -1679,6 +1679,7 @@ dependencies = [
  "thiserror 2.0.18",
  "toml",
  "tracing",
+ "triomphe",
  "walkdir",
  "wasm-encoder 0.245.1",
  "wasmparser 0.245.1",

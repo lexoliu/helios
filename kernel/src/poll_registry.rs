@@ -1,9 +1,9 @@
 extern crate alloc;
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use thiserror::Error;
+use triomphe::Arc;
 
 use crate::Notify;
 

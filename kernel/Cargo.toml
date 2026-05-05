@@ -31,6 +31,7 @@ helios-compiler-abi.workspace = true
 helios-hal.workspace = true
 helios-netstack.workspace = true
 thiserror = { version = "2.0.17", default-features = false }
+triomphe = { version = "0.1.15", default-features = false }
 tracing.workspace = true
 bitflags = "2.11.0"
 lru = { version = "0.16.3", default-features = false, features = ["hashbrown"] }

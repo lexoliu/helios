@@ -1,7 +1,6 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::future::Future;
@@ -14,6 +13,7 @@ use atomic_waker::AtomicWaker;
 use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 use helios_hal::cpu::{Cpu, Instant};
 use objectpool::Pool;
+use triomphe::Arc;
 
 use crate::time::duration_to_ticks;
 
@@ -439,12 +439,12 @@ unsafe impl Sync for TimerShared {}
 
 #[cfg(test)]
 mod tests {
-    use alloc::sync::Arc;
     use alloc::vec::Vec;
     use core::sync::atomic::AtomicBool;
 
     use atomic_waker::AtomicWaker;
     use helios_hal::cpu::Instant;
+    use triomphe::Arc;
 
     use super::{
         AtomicOrdering, SleepState, TimerEntry, TimingWheel, wheel_tick_ceil, wheel_tick_floor,
