@@ -1140,6 +1140,7 @@ where
         }
         self.record_network_profile("rx-drain", receive_started);
 
+        let tcp_started = self.profile_start();
         {
             let mut state = self.inner.state.lock().await;
             state
@@ -1147,6 +1148,7 @@ where
                 .drive_tcp(StackInstant::from_nanos(self.now_nanos()))
                 .unwrap_or_else(|error| tracing::debug!(?error, "failed to drive TCP control"));
         }
+        self.record_network_profile("tcp-drive", tcp_started);
 
         let mut transmitted = 0usize;
         let transmit_started = self.profile_start();
