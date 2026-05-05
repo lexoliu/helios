@@ -227,41 +227,6 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         self.max_frame_len
     }
 
-    pub async fn next_frame(&self) -> IoResult<Box<[u8]>> {
-        loop {
-            if let Some(frame) = self.try_receive().await? {
-                return Ok(frame);
-            }
-            self.interrupts.notified().await;
-        }
-    }
-
-    pub async fn try_receive(&self) -> IoResult<Option<Box<[u8]>>> {
-        let mut state = self.rx_state.lock().await;
-        let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
-            return Ok(None);
-        };
-        let token_index = usize::from(token);
-        Self::mark_rx_completed(&mut state, token);
-        let used_len = used_len as usize;
-        if used_len < self.header_len || used_len > state.rx_buffer_len {
-            Self::repost_rx_buffer(&mut state, &self.transport, token)?;
-            return Err(IoError::DeviceFault);
-        }
-
-        let frame = slot_buffer(
-            &state.rx_buffers,
-            state.rx_buffer_len,
-            token_index,
-            used_len,
-            "RX",
-        )[self.header_len..used_len]
-            .to_vec()
-            .into_boxed_slice();
-        Self::repost_rx_buffer(&mut state, &self.transport, token)?;
-        Ok(Some(frame))
-    }
-
     pub async fn try_receive_into(&self, output: &mut [u8]) -> IoResult<Option<usize>> {
         let mut state = self.rx_state.lock().await;
         let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
