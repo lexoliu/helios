@@ -1149,14 +1149,10 @@ where
         if now_nanos >= operation_deadline_nanos {
             return;
         }
-        let next_tcp_deadline = self
-            .inner
-            .state
-            .lock()
-            .await
-            .stack
-            .next_tcp_deadline()
-            .map(StackInstant::nanos);
+        let next_tcp_deadline = {
+            let mut state = self.inner.state.lock().await;
+            state.stack.next_tcp_deadline().map(StackInstant::nanos)
+        };
         let next_deadline = next_tcp_deadline
             .unwrap_or(operation_deadline_nanos)
             .min(operation_deadline_nanos);

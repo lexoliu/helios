@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 use arrayvec::ArrayVec;
 use bytes::Bytes;
 use heapless::Deque;
+use heapless::binary_heap::{BinaryHeap, Min};
 
 use crate::{
     ArpOperation, ArpPacket, BbrV3, DEFAULT_POLL_BUDGET, DhcpDnsServers, EthernetAddress,
@@ -23,6 +24,7 @@ pub const MAX_TCP_ACCEPT: usize = 64;
 pub const MAX_TCP_SOCKETS: usize = 256;
 const TCP_ENDPOINT_INDEX_SLOTS: usize = MAX_TCP_SOCKETS * 2;
 const TCP_LISTENER_INDEX_SLOTS: usize = MAX_TCP_SOCKETS * 2;
+const MAX_TCP_TIMER_ENTRIES: usize = MAX_TCP_SOCKETS * 4;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StackInstant {
@@ -249,6 +251,13 @@ struct TcpSocketIndexEntry<Key: Copy + Eq> {
     socket_index: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TcpTimerEntry {
+    deadline_nanos: u64,
+    generation: u32,
+    socket_index: usize,
+}
+
 trait TcpIndexKey: Copy + Eq {
     fn hash(self) -> usize;
 }
@@ -271,10 +280,6 @@ impl TcpSocketSlab {
 
     fn iter(&self) -> impl Iterator<Item = &Option<TcpSocket<BbrV3>>> {
         self.slots.iter()
-    }
-
-    fn iter_mut(&mut self) -> impl Iterator<Item = &mut Option<TcpSocket<BbrV3>>> {
-        self.slots.iter_mut()
     }
 
     fn get(&self, index: usize) -> Option<&Option<TcpSocket<BbrV3>>> {
@@ -431,6 +436,9 @@ pub struct Stack {
     udp_rx: Deque<UdpReceive, MAX_UDP_RX>,
     tcp_accept: Deque<TcpAccept, MAX_TCP_ACCEPT>,
     tcp: TcpSocketSlab,
+    tcp_timers: BinaryHeap<TcpTimerEntry, Min, MAX_TCP_TIMER_ENTRIES>,
+    tcp_timer_generations: [u32; MAX_TCP_SOCKETS],
+    tcp_timer_deadlines: [Option<u64>; MAX_TCP_SOCKETS],
 }
 
 #[derive(Clone, Debug)]
@@ -500,6 +508,9 @@ impl Stack {
             udp_rx: Deque::new(),
             tcp_accept: Deque::new(),
             tcp: TcpSocketSlab::new(),
+            tcp_timers: BinaryHeap::new(),
+            tcp_timer_generations: [0; MAX_TCP_SOCKETS],
+            tcp_timer_deadlines: [None; MAX_TCP_SOCKETS],
         }
     }
 
@@ -731,13 +742,14 @@ impl Stack {
         })
     }
 
-    pub fn next_tcp_deadline(&self) -> Option<StackInstant> {
-        self.tcp
-            .iter()
-            .flatten()
-            .filter_map(TcpSocket::next_deadline_nanos)
-            .min()
-            .map(StackInstant::from_nanos)
+    pub fn next_tcp_deadline(&mut self) -> Option<StackInstant> {
+        loop {
+            let entry = self.tcp_timers.peek().copied()?;
+            if self.tcp_timer_entry_current(entry) {
+                return Some(StackInstant::from_nanos(entry.deadline_nanos));
+            }
+            let _ = self.tcp_timers.pop();
+        }
     }
 
     pub fn drive_tcp(&mut self, now: StackInstant) -> Result<(), StackError> {
@@ -746,9 +758,13 @@ impl Stack {
             ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader), 16>::new();
         let mut pending_ack = ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader), 16>::new();
         let mut pending_retransmit = ArrayVec::<(usize, TcpTransmitSegment), 16>::new();
-        let mut pending_data = ArrayVec::<TcpTransmitSegment, 16>::new();
-        for socket in self.tcp.iter_mut().flatten() {
+        let mut pending_data = ArrayVec::<(usize, TcpTransmitSegment), 16>::new();
+        for index in 0..MAX_TCP_SOCKETS {
+            let Some(socket) = self.tcp.get_mut(index).and_then(Option::as_mut) else {
+                continue;
+            };
             socket.expire_timers(now.nanos());
+            self.schedule_tcp_timer(index);
         }
         for (index, socket) in self.tcp.iter().enumerate() {
             let Some(socket) = socket else {
@@ -776,14 +792,18 @@ impl Stack {
             }
         }
 
-        for socket in self.tcp.iter_mut().flatten() {
+        for index in 0..MAX_TCP_SOCKETS {
+            let Some(socket) = self.tcp.get_mut(index).and_then(Option::as_mut) else {
+                continue;
+            };
             if socket.pending_retransmission(now.nanos()).is_some() {
                 continue;
             }
             if let Some(segment) = socket.take_transmit_segment(now.nanos()) {
                 pending_data
-                    .try_push(segment)
+                    .try_push((index, segment))
                     .unwrap_or_else(|_| panic!("TCP data transmit burst overflowed"));
+                self.schedule_tcp_timer(index);
             }
         }
 
@@ -810,6 +830,7 @@ impl Stack {
                     .and_then(Option::as_mut)
                     .expect("TCP socket disappeared while queuing SYN");
                 socket.mark_syn_queued(now.nanos());
+                self.schedule_tcp_timer(index);
             }
         }
         for (index, local, remote, header) in pending_syn_ack {
@@ -820,6 +841,7 @@ impl Stack {
                     .and_then(Option::as_mut)
                     .expect("TCP socket disappeared while queuing SYN-ACK");
                 socket.mark_syn_ack_queued(now.nanos());
+                self.schedule_tcp_timer(index);
             }
         }
         for (index, local, remote, header) in pending_ack {
@@ -830,6 +852,7 @@ impl Stack {
                     .and_then(Option::as_mut)
                     .expect("TCP socket disappeared while queuing ACK");
                 socket.mark_ack_queued();
+                self.schedule_tcp_timer(index);
             }
         }
         for (index, segment) in pending_retransmit {
@@ -849,9 +872,10 @@ impl Stack {
                     .and_then(Option::as_mut)
                     .expect("TCP socket disappeared while queuing retransmission");
                 socket.mark_retransmission_queued(sequence, now.nanos());
+                self.schedule_tcp_timer(index);
             }
         }
-        for segment in pending_data {
+        for (index, segment) in pending_data {
             let identification = segment.sequence_len as u16;
             self.queue_tcp(
                 segment.local,
@@ -861,6 +885,7 @@ impl Stack {
                 identification,
                 now,
             )?;
+            self.schedule_tcp_timer(index);
         }
         Ok(())
     }
@@ -889,9 +914,9 @@ impl Stack {
     }
 
     pub fn remove_tcp_socket(&mut self, socket: SocketId) -> Result<(), StackError> {
-        self.tcp
-            .remove(socket_index(socket))
-            .ok_or(StackError::UnknownSocket)?;
+        let index = socket_index(socket);
+        self.tcp.remove(index).ok_or(StackError::UnknownSocket)?;
+        self.clear_tcp_timer(index);
         self.remove_tcp_accepts_for(socket);
         Ok(())
     }
@@ -909,7 +934,9 @@ impl Stack {
     }
 
     pub fn tcp_shutdown_send(&mut self, socket: SocketId) -> Result<(), StackError> {
+        let index = socket_index(socket);
         self.tcp_socket_mut(socket)?.close_send();
+        self.schedule_tcp_timer(index);
         Ok(())
     }
 
@@ -918,12 +945,15 @@ impl Stack {
         socket: SocketId,
         max_bytes: usize,
     ) -> Result<TcpReadState, StackError> {
+        let index = socket_index(socket);
         let socket = self.tcp_socket_mut(socket)?;
-        Ok(match socket.receive(max_bytes) {
+        let state = match socket.receive(max_bytes) {
             Some(bytes) => TcpReadState::Data(bytes),
             None if socket.state() == crate::TcpState::CloseWait => TcpReadState::Eof,
             None => TcpReadState::Pending,
-        })
+        };
+        self.schedule_tcp_timer(index);
+        Ok(state)
     }
 
     pub fn send_udp_ipv4(
@@ -1525,15 +1555,24 @@ impl Stack {
             port: packet.source_port,
         };
         if let Some(index) = self.tcp.find_endpoint(local_endpoint, remote_endpoint) {
-            let socket = self
-                .tcp
-                .get_mut(index)
-                .and_then(Option::as_mut)
-                .expect("TCP endpoint index referenced a missing socket");
-            let previous_state = socket.state();
-            let outcome = socket.on_segment(packet, now.nanos());
+            let (previous_state, current_state, outcome, receive_backpressured) = {
+                let socket = self
+                    .tcp
+                    .get_mut(index)
+                    .and_then(Option::as_mut)
+                    .expect("TCP endpoint index referenced a missing socket");
+                let previous_state = socket.state();
+                let outcome = socket.on_segment(packet, now.nanos());
+                (
+                    previous_state,
+                    socket.state(),
+                    outcome,
+                    socket.receive_backpressured(),
+                )
+            };
+            self.schedule_tcp_timer(index);
             if previous_state == crate::TcpState::SynReceived
-                && socket.state() == crate::TcpState::Established
+                && current_state == crate::TcpState::Established
             {
                 self.tcp_accept
                     .push_back(TcpAccept {
@@ -1542,7 +1581,7 @@ impl Stack {
                     })
                     .unwrap_or_else(|_| panic!("TCP accept queue is full"));
             }
-            if socket.state() == crate::TcpState::Established {
+            if current_state == crate::TcpState::Established {
                 Self::push_event_into(
                     &mut self.events,
                     StackEvent::TcpReadable {
@@ -1553,7 +1592,7 @@ impl Stack {
             if outcome.receive_backpressure {
                 return Err(StackError::ReceiveBackpressure);
             }
-            return Ok(socket.receive_backpressured());
+            return Ok(receive_backpressured);
         }
         if packet.flags.contains(crate::TcpFlags::SYN)
             && !packet.flags.contains(crate::TcpFlags::ACK)
@@ -1646,7 +1685,63 @@ impl Stack {
     }
 
     fn insert_tcp(&mut self, socket: TcpSocket<BbrV3>) -> SocketId {
-        self.tcp.insert(socket)
+        let id = self.tcp.insert(socket);
+        self.schedule_tcp_timer(socket_index(id));
+        id
+    }
+
+    fn schedule_tcp_timer(&mut self, index: usize) {
+        let deadline = self
+            .tcp
+            .get(index)
+            .and_then(Option::as_ref)
+            .and_then(TcpSocket::next_deadline_nanos);
+        if self.tcp_timer_deadlines[index] == deadline {
+            return;
+        }
+        self.tcp_timer_generations[index] = self.tcp_timer_generations[index].wrapping_add(1);
+        self.tcp_timer_deadlines[index] = deadline;
+        if let Some(deadline_nanos) = deadline {
+            let entry = TcpTimerEntry {
+                deadline_nanos,
+                generation: self.tcp_timer_generations[index],
+                socket_index: index,
+            };
+            if self.tcp_timers.push(entry).is_err() {
+                self.rebuild_tcp_timer_heap();
+            }
+        }
+    }
+
+    fn clear_tcp_timer(&mut self, index: usize) {
+        self.tcp_timer_generations[index] = self.tcp_timer_generations[index].wrapping_add(1);
+        self.tcp_timer_deadlines[index] = None;
+    }
+
+    fn tcp_timer_entry_current(&self, entry: TcpTimerEntry) -> bool {
+        self.tcp_timer_generations[entry.socket_index] == entry.generation
+            && self.tcp_timer_deadlines[entry.socket_index] == Some(entry.deadline_nanos)
+            && self
+                .tcp
+                .get(entry.socket_index)
+                .and_then(Option::as_ref)
+                .is_some_and(|socket| socket.next_deadline_nanos() == Some(entry.deadline_nanos))
+    }
+
+    fn rebuild_tcp_timer_heap(&mut self) {
+        self.tcp_timers.clear();
+        for index in 0..MAX_TCP_SOCKETS {
+            let Some(deadline_nanos) = self.tcp_timer_deadlines[index] else {
+                continue;
+            };
+            self.tcp_timers
+                .push(TcpTimerEntry {
+                    deadline_nanos,
+                    generation: self.tcp_timer_generations[index],
+                    socket_index: index,
+                })
+                .unwrap_or_else(|_| panic!("TCP timer heap is full during rebuild"));
+        }
     }
 
     fn tcp_socket(&self, id: SocketId) -> Result<&TcpSocket<BbrV3>, StackError> {
