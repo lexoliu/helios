@@ -68,6 +68,9 @@ struct SleepState {
 struct TimingWheel {
     levels: [WheelLevel; TIMER_WHEEL_LEVELS],
     current_tick: u64,
+    next_deadline: Option<Instant>,
+    next_deadline_tick: Option<u64>,
+    next_deadline_dirty: bool,
 }
 
 struct WheelLevel {
@@ -292,10 +295,16 @@ impl TimingWheel {
         Self {
             levels: core::array::from_fn(|_| WheelLevel::new()),
             current_tick,
+            next_deadline: None,
+            next_deadline_tick: None,
+            next_deadline_dirty: false,
         }
     }
 
     fn insert(&mut self, entry: TimerEntry) {
+        if !entry.is_dead() {
+            self.observe_deadline(entry.deadline, entry.deadline_tick);
+        }
         let target_tick = entry.deadline_tick.max(self.current_tick);
         let delay = target_tick.saturating_sub(self.current_tick);
         let level = wheel_level(delay);
@@ -312,14 +321,38 @@ impl TimingWheel {
         self.drain_current_slot(ready);
     }
 
-    fn next_live_deadline(&self) -> Option<Instant> {
-        self.levels
+    fn next_live_deadline(&mut self) -> Option<Instant> {
+        if self.next_deadline_dirty
+            || self
+                .next_deadline_tick
+                .is_some_and(|deadline_tick| deadline_tick <= self.current_tick)
+        {
+            self.rebuild_next_deadline();
+        }
+        self.next_deadline
+    }
+
+    fn observe_deadline(&mut self, deadline: Instant, deadline_tick: u64) {
+        if self
+            .next_deadline
+            .is_none_or(|current_deadline| deadline < current_deadline)
+        {
+            self.next_deadline = Some(deadline);
+            self.next_deadline_tick = Some(deadline_tick);
+        }
+    }
+
+    fn rebuild_next_deadline(&mut self) {
+        let next = self
+            .levels
             .iter()
             .flat_map(|level| level.buckets.iter())
             .flat_map(|bucket| bucket.iter())
             .filter(|entry| !entry.is_dead())
-            .map(|entry| entry.deadline)
-            .min()
+            .min_by_key(|entry| entry.deadline);
+        self.next_deadline = next.map(|entry| entry.deadline);
+        self.next_deadline_tick = next.map(|entry| entry.deadline_tick);
+        self.next_deadline_dirty = false;
     }
 
     fn cascade(&mut self) {
@@ -335,6 +368,7 @@ impl TimingWheel {
         let slot = wheel_slot(self.current_tick, level);
         let entries = core::mem::take(&mut self.levels[level].buckets[slot]);
         for entry in entries {
+            self.next_deadline_dirty = true;
             self.insert(entry);
         }
     }
@@ -343,6 +377,7 @@ impl TimingWheel {
         let slot = wheel_slot(self.current_tick, 0);
         let entries = core::mem::take(&mut self.levels[0].buckets[slot]);
         for entry in entries {
+            self.next_deadline_dirty = true;
             if entry.is_dead() {
                 continue;
             }
@@ -480,5 +515,25 @@ mod tests {
         let mut ready = Vec::new();
         wheel.drain_expired(2, &mut ready);
         assert!(ready.is_empty());
+    }
+
+    #[test]
+    fn timing_wheel_rebuilds_cached_deadline_after_cancelled_front_entry() {
+        let mut wheel = TimingWheel::new(0);
+        let cancelled = timer_entry(100, 50);
+        cancelled
+            .state
+            .cancelled
+            .store(true, AtomicOrdering::Release);
+        wheel.insert(cancelled);
+        wheel.insert(timer_entry(200, 50));
+
+        let mut ready = Vec::new();
+        wheel.drain_expired(2, &mut ready);
+        assert!(ready.is_empty());
+        assert_eq!(
+            wheel.next_live_deadline().map(|deadline| deadline.ticks()),
+            Some(200)
+        );
     }
 }
