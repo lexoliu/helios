@@ -92,6 +92,17 @@ where
         self.service.tcp_write_all(stream, bytes, timeout_nanos)
     }
 
+    pub fn tcp_write_all_bytes(
+        &self,
+        _: TcpCap,
+        stream: Service::TcpStream,
+        bytes: Bytes,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<(), crate::TcpError>> + Send + '_ {
+        self.service
+            .tcp_write_all_bytes(stream, bytes, timeout_nanos)
+    }
+
     pub fn tcp_read(
         &self,
         _: TcpCap,

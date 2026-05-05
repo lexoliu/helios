@@ -291,6 +291,10 @@ where
     }
 
     pub fn queue_send(&mut self, bytes: &[u8]) -> usize {
+        self.queue_send_bytes(Bytes::copy_from_slice(bytes))
+    }
+
+    pub fn queue_send_bytes(&mut self, bytes: Bytes) -> usize {
         let window = self
             .congestion
             .congestion_window()
@@ -298,11 +302,12 @@ where
             .saturating_sub(self.bytes_in_flight) as usize;
         let writable = bytes.len().min(window);
         if writable != 0 {
-            if self
-                .transmit_queue
-                .push_back(Bytes::copy_from_slice(&bytes[..writable]))
-                .is_err()
-            {
+            let segment = if writable == bytes.len() {
+                bytes
+            } else {
+                bytes.slice(..writable)
+            };
+            if self.transmit_queue.push_back(segment).is_err() {
                 return 0;
             }
         }
@@ -709,6 +714,33 @@ mod tests {
             socket.pending_retransmission(TCP_INITIAL_RTO_NANOS * 4),
             None
         );
+    }
+
+    #[test]
+    fn queue_send_bytes_reuses_payload_storage() {
+        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+        socket.mark_syn_queued(0);
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS,
+        );
+
+        let payload = Bytes::from_static(b"hello");
+        let payload_ptr = payload.as_ptr();
+        assert_eq!(socket.queue_send_bytes(payload), 5);
+        let segment = socket
+            .take_transmit_segment(TCP_INITIAL_RTO_NANOS)
+            .expect("established socket should transmit queued bytes");
+        assert_eq!(segment.payload.as_ref(), b"hello");
+        assert_eq!(segment.payload.as_ptr(), payload_ptr);
     }
 
     #[test]

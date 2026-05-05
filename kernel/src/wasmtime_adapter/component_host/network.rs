@@ -113,6 +113,13 @@ trait DynComponentHostNetworkService: Send + Sync + 'static {
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<(), TcpError>> + Send + 'a>>;
 
+    fn tcp_write_all_bytes<'a>(
+        &'a self,
+        stream: u64,
+        bytes: Bytes,
+        timeout_nanos: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TcpError>> + Send + 'a>>;
+
     fn tcp_read<'a>(
         &'a self,
         stream: u64,
@@ -325,6 +332,15 @@ impl ComponentNetworkService for ComponentHostNetworkService {
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<(), TcpError>> + Send + 'a {
         self.inner.tcp_write_all(stream, bytes, timeout_nanos)
+    }
+
+    fn tcp_write_all_bytes<'a>(
+        &'a self,
+        stream: Self::TcpStream,
+        bytes: Bytes,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<(), TcpError>> + Send + 'a {
+        self.inner.tcp_write_all_bytes(stream, bytes, timeout_nanos)
     }
 
     fn tcp_read(
@@ -602,6 +618,23 @@ where
         Box::pin(async move {
             self.service
                 .tcp_write_all(
+                    <Service::TcpStream as ComponentHostTcpStreamToken>::from_raw(stream),
+                    bytes,
+                    timeout_nanos,
+                )
+                .await
+        })
+    }
+
+    fn tcp_write_all_bytes<'a>(
+        &'a self,
+        stream: u64,
+        bytes: Bytes,
+        timeout_nanos: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TcpError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.service
+                .tcp_write_all_bytes(
                     <Service::TcpStream as ComponentHostTcpStreamToken>::from_raw(stream),
                     bytes,
                     timeout_nanos,

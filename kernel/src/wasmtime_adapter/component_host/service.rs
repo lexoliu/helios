@@ -14544,13 +14544,16 @@ where
                 Err(errno) => return errno,
             };
             let timeout = wasix_effective_socket_timeout(options.send_timeout, fdflags);
-            if let Err(error) = service.tcp_write_all(stream, &bytes, timeout).await {
-                return p1_errno_from_tcp_error_for_fdflags(error, fdflags);
-            }
             let written = match u32::try_from(bytes.len()) {
                 Ok(written) => written,
                 Err(_) => return p1::errno::OVERFLOW,
             };
+            if let Err(error) = service
+                .tcp_write_all_bytes(stream, Bytes::from(bytes), timeout)
+                .await
+            {
+                return p1_errno_from_tcp_error_for_fdflags(error, fdflags);
+            }
             p1_write_u32(caller, memory, ret_size, written)
         }
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
@@ -14637,7 +14640,7 @@ where
                 Err(errno) => return errno,
             };
             let timeout = wasix_effective_socket_timeout(options.send_timeout, fdflags);
-            if let Err(error) = service.tcp_write_all(stream, &bytes, timeout).await {
+            if let Err(error) = service.tcp_write_all_bytes(stream, bytes, timeout).await {
                 return p1_errno_from_tcp_error_for_fdflags(error, fdflags);
             }
             p1_write_u64(caller, memory, ret_size, written)
@@ -15695,13 +15698,16 @@ where
     } else {
         u64::MAX
     };
-    if let Err(error) = service.tcp_write_all(stream, &bytes, timeout).await {
-        return p1_errno_from_tcp_error_for_fdflags(error, fdflags);
-    }
     let written = match u32::try_from(bytes.len()) {
         Ok(written) => written,
         Err(_) => return p1::errno::OVERFLOW,
     };
+    if let Err(error) = service
+        .tcp_write_all_bytes(stream, Bytes::from(bytes), timeout)
+        .await
+    {
+        return p1_errno_from_tcp_error_for_fdflags(error, fdflags);
+    }
     p1_write_u32(caller, memory, so_datalen, written)
 }
 

@@ -454,7 +454,17 @@ where
         bytes: &[u8],
         timeout_nanos: u64,
     ) -> Result<(), TcpError> {
-        self.execute_tcp_write_all(stream, bytes, timeout_nanos)
+        self.execute_tcp_write_all_bytes(stream, Bytes::copy_from_slice(bytes), timeout_nanos)
+            .await
+    }
+
+    pub async fn tcp_write_all_bytes(
+        &self,
+        stream: TcpStreamId,
+        bytes: Bytes,
+        timeout_nanos: u64,
+    ) -> Result<(), TcpError> {
+        self.execute_tcp_write_all_bytes(stream, bytes, timeout_nanos)
             .await
     }
 
@@ -667,24 +677,21 @@ where
         }
     }
 
-    async fn execute_tcp_write_all(
+    async fn execute_tcp_write_all_bytes(
         &self,
         stream: TcpStreamId,
-        bytes: &[u8],
+        mut bytes: Bytes,
         timeout_nanos: u64,
     ) -> Result<(), TcpError> {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
-        let mut offset = 0usize;
-        while offset < bytes.len() {
+        while !bytes.is_empty() {
             self.drive_tcp().await?;
             let written = {
                 let mut state = self.inner.state.lock().await;
-                state.try_write_tcp(stream, &bytes[offset..])?
+                state.try_write_tcp_bytes(stream, bytes.clone())?
             };
             if written != 0 {
-                offset = offset
-                    .checked_add(written)
-                    .expect("tcp write offset overflowed usize");
+                let _ = bytes.split_to(written);
                 continue;
             }
             if self.now_nanos() >= deadline_nanos {
@@ -1268,6 +1275,15 @@ where
         async move { NetworkService::tcp_write_all(self, stream, bytes, timeout_nanos).await }
     }
 
+    fn tcp_write_all_bytes<'a>(
+        &'a self,
+        stream: Self::TcpStream,
+        bytes: Bytes,
+        timeout_nanos: u64,
+    ) -> impl core::future::Future<Output = Result<(), TcpError>> + Send + 'a {
+        async move { NetworkService::tcp_write_all_bytes(self, stream, bytes, timeout_nanos).await }
+    }
+
     fn tcp_read<'a>(
         &'a self,
         stream: Self::TcpStream,
@@ -1783,12 +1799,18 @@ impl NetworkState {
         }
     }
 
-    fn try_write_tcp(&mut self, stream: TcpStreamId, bytes: &[u8]) -> Result<usize, TcpError> {
+    fn try_write_tcp_bytes(
+        &mut self,
+        stream: TcpStreamId,
+        bytes: Bytes,
+    ) -> Result<usize, TcpError> {
         let socket = self.tcp_socket(stream)?;
-        self.stack.tcp_send(socket, bytes).map_err(|_| TcpError {
-            kind: TcpErrorKind::Unavailable,
-            detail: NetworkErrorDetail::TcpWriteQueueFailed,
-        })
+        self.stack
+            .tcp_send_bytes(socket, bytes)
+            .map_err(|_| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::TcpWriteQueueFailed,
+            })
     }
 
     fn poll_tcp_read(

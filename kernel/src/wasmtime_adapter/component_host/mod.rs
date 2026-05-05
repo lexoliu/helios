@@ -11,6 +11,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
 
+use bytes::Bytes;
+
 use crate::{
     ClockAuthorityRights, DirectoryAuthorityRights, LinkAuthorityRights, NetworkAuthorityRights,
     ProcessAuthority, ProcessAuthorityError, TerminalAuthorityRights,
@@ -2014,11 +2016,12 @@ where
                         component_host_profile(access.get()),
                     ))
                 })?;
+                let written = bytes.len() as u64;
                 let response = socket
                     .0
-                    .tcp_write_all(socket.1, &bytes, timeout)
+                    .tcp_write_all_bytes(socket.1, Bytes::from(bytes), timeout)
                     .await
-                    .map(|()| bytes.len() as u64)
+                    .map(|()| written)
                     .map_err(convert_tcp_error);
                 record_component_host_kernel_profile(profile, "system-net-tcp-write");
                 Ok::<_, wasmtime::Error>((response,))
@@ -2340,11 +2343,12 @@ where
                         component_host_profile(access.get()),
                     ))
                 })?;
+                let written = bytes.len() as u64;
                 let response = socket
                     .0
-                    .tcp_write_all(socket.1, &bytes, timeout)
+                    .tcp_write_all_bytes(socket.1, Bytes::from(bytes), timeout)
                     .await
-                    .map(|()| bytes.len() as u64)
+                    .map(|()| written)
                     .map_err(convert_program_tcp_error);
                 record_component_host_kernel_profile(profile, "program-net-tcp-write");
                 Ok::<_, wasmtime::Error>((response,))

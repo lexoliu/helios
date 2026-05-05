@@ -478,6 +478,15 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<(), TcpError>> + Send + 'a;
 
+    fn tcp_write_all_bytes<'a>(
+        &'a self,
+        stream: Self::TcpStream,
+        bytes: Bytes,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<(), TcpError>> + Send + 'a {
+        async move { self.tcp_write_all(stream, &bytes, timeout_nanos).await }
+    }
+
     fn tcp_read<'a>(
         &'a self,
         stream: Self::TcpStream,
