@@ -1,7 +1,5 @@
 extern crate alloc;
 
-use alloc::vec::Vec;
-
 use bytes::Bytes;
 use heapless::Deque;
 
@@ -380,7 +378,7 @@ where
             .on_congestion_event(CongestionEvent::RetransmissionTimeout { now_nanos });
     }
 
-    pub fn receive(&mut self, max_bytes: usize) -> Option<Vec<u8>> {
+    pub fn receive(&mut self, max_bytes: usize) -> Option<Bytes> {
         let mut bytes = self.receive_queue.pop_front()?;
         if bytes.len() > max_bytes {
             let tail = bytes.split_off(max_bytes);
@@ -390,7 +388,7 @@ where
         }
         self.refresh_advertised_window();
         self.ack_pending = true;
-        Some(bytes.to_vec())
+        Some(bytes)
     }
 
     pub fn on_segment(&mut self, packet: TcpPacket<'_>, now_nanos: u64) -> Option<RecoveryAction> {
@@ -642,7 +640,7 @@ mod tests {
         );
 
         assert!(socket.advertised_window() < open_window);
-        assert_eq!(socket.receive(8), Some(b"hello".to_vec()));
+        assert_eq!(socket.receive(8), Some(Bytes::from_static(b"hello")));
         assert_eq!(socket.advertised_window(), open_window);
     }
 }

@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 use core::future::Future;
 
 use crate::InstanceId;
+use bytes::Bytes;
 use helios_hal::io::IoError;
 use thiserror::Error;
 
@@ -482,7 +483,7 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         stream: Self::TcpStream,
         max_bytes: u32,
         timeout_nanos: u64,
-    ) -> impl Future<Output = Result<Option<Vec<u8>>, TcpError>> + Send + 'a;
+    ) -> impl Future<Output = Result<Option<Bytes>, TcpError>> + Send + 'a;
 
     fn tcp_shutdown_send(
         &self,

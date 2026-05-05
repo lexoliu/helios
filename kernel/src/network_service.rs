@@ -7,6 +7,7 @@ use core::num::NonZeroU32;
 use core::task::Poll;
 use core::time::Duration;
 
+use bytes::Bytes;
 use helios_hal::cpu::Cpu;
 use helios_hal::io::IoError;
 use helios_netstack::{
@@ -193,7 +194,7 @@ enum TcpConnectProgress {
 
 enum TcpReadProgress {
     Pending,
-    Data(Vec<u8>),
+    Data(Bytes),
     Eof,
 }
 
@@ -425,7 +426,7 @@ where
         stream: TcpStreamId,
         max_bytes: u32,
         timeout_nanos: u64,
-    ) -> Result<Option<Vec<u8>>, TcpError> {
+    ) -> Result<Option<Bytes>, TcpError> {
         self.execute_tcp_read(stream, max_bytes, timeout_nanos)
             .await
     }
@@ -650,7 +651,7 @@ where
         stream: TcpStreamId,
         max_bytes: u32,
         timeout_nanos: u64,
-    ) -> Result<Option<Vec<u8>>, TcpError> {
+    ) -> Result<Option<Bytes>, TcpError> {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         loop {
             self.drive_tcp().await?;
@@ -1170,7 +1171,7 @@ where
         stream: Self::TcpStream,
         max_bytes: u32,
         timeout_nanos: u64,
-    ) -> impl core::future::Future<Output = Result<Option<Vec<u8>>, TcpError>> + Send + 'a {
+    ) -> impl core::future::Future<Output = Result<Option<Bytes>, TcpError>> + Send + 'a {
         async move { NetworkService::tcp_read(self, stream, max_bytes, timeout_nanos).await }
     }
 

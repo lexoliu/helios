@@ -14398,7 +14398,7 @@ where
             let timeout = wasix_effective_socket_timeout(options.receive_timeout, fdflags);
             let bytes = match service.tcp_read(stream, capacity, timeout).await {
                 Ok(Some(bytes)) => bytes,
-                Ok(None) => Vec::new(),
+                Ok(None) => Bytes::new(),
                 Err(error) => return p1_errno_from_tcp_error_for_fdflags(error, fdflags),
             };
             let status = p1_write_iovs_from_bytes(caller, memory, iovs, &bytes, ret_size);
@@ -15605,7 +15605,7 @@ where
     };
     let bytes = match service.tcp_read(stream, capacity, timeout).await {
         Ok(Some(bytes)) => bytes,
-        Ok(None) => Vec::new(),
+        Ok(None) => Bytes::new(),
         Err(error) => return p1_errno_from_tcp_error_for_fdflags(error, fdflags),
     };
     let status = p1_write_iovs_from_bytes(caller, memory, iovs, &bytes, ro_datalen);

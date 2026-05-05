@@ -2,6 +2,8 @@ extern crate alloc;
 
 use core::future::Future;
 
+use bytes::Bytes;
+
 use crate::{
     ComponentNetworkService, DnsCap, MulticastCap, NetworkErrorDetail, PrivilegedBindCap,
     TcpAccepted, TcpCap, TcpError, TcpErrorKind, TcpListener, UdpBinding, UdpCap, UdpError,
@@ -96,8 +98,7 @@ where
         stream: Service::TcpStream,
         max_bytes: u32,
         timeout_nanos: u64,
-    ) -> impl Future<Output = Result<Option<alloc::vec::Vec<u8>>, crate::TcpError>> + Send + '_
-    {
+    ) -> impl Future<Output = Result<Option<Bytes>, crate::TcpError>> + Send + '_ {
         self.service.tcp_read(stream, max_bytes, timeout_nanos)
     }
 
@@ -295,7 +296,7 @@ mod tests {
             _: Self::TcpStream,
             _: u32,
             _: u64,
-        ) -> impl Future<Output = Result<Option<Vec<u8>>, TcpError>> + Send + '_ {
+        ) -> impl Future<Output = Result<Option<Bytes>, TcpError>> + Send + '_ {
             core::future::ready(Ok(None))
         }
 

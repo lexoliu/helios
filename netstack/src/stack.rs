@@ -201,7 +201,7 @@ pub enum TcpConnectState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TcpReadState {
     Pending,
-    Data(Vec<u8>),
+    Data(Bytes),
     Eof,
 }
 
@@ -1603,7 +1603,7 @@ mod tests {
 
         assert_eq!(
             stack.tcp_read(socket, 8).unwrap(),
-            TcpReadState::Data(b"ok".to_vec())
+            TcpReadState::Data(Bytes::from_static(b"ok"))
         );
         assert_eq!(stack.tcp_read(socket, 8).unwrap(), TcpReadState::Eof);
     }

@@ -769,6 +769,7 @@ impl TcpSocket {
         service
             .tcp_read(stream, max_bytes, u64::MAX)
             .await
+            .map(|bytes| bytes.map(|bytes| bytes.to_vec()))
             .map_err(map_p3_tcp_error)
     }
 
@@ -5850,9 +5851,9 @@ mod tests {
             _: Self::TcpStream,
             _: u32,
             _: u64,
-        ) -> impl core::future::Future<Output = Result<Option<Vec<u8>>, crate::TcpError>> + Send + '_
+        ) -> impl core::future::Future<Output = Result<Option<Bytes>, crate::TcpError>> + Send + '_
         {
-            core::future::ready(Ok(Some(vec![4, 2])))
+            core::future::ready(Ok(Some(Bytes::from_static(&[4, 2]))))
         }
 
         fn tcp_shutdown_send(

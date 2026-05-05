@@ -6,6 +6,8 @@ use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 
+use bytes::Bytes;
+
 use crate::{
     ComponentNetworkService, DnsError, Ipv4Address, Ipv4Cidr, Ipv4Route, MacAddress,
     NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkPortId, PingError,
@@ -116,7 +118,7 @@ trait DynComponentHostNetworkService: Send + Sync + 'static {
         stream: u64,
         max_bytes: u32,
         timeout_nanos: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, TcpError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, TcpError>> + Send + 'a>>;
 
     fn tcp_shutdown_send<'a>(
         &'a self,
@@ -330,7 +332,7 @@ impl ComponentNetworkService for ComponentHostNetworkService {
         stream: Self::TcpStream,
         max_bytes: u32,
         timeout_nanos: u64,
-    ) -> impl Future<Output = Result<Option<Vec<u8>>, TcpError>> + Send + '_ {
+    ) -> impl Future<Output = Result<Option<Bytes>, TcpError>> + Send + '_ {
         self.inner.tcp_read(stream, max_bytes, timeout_nanos)
     }
 
@@ -613,7 +615,7 @@ where
         stream: u64,
         max_bytes: u32,
         timeout_nanos: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, TcpError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, TcpError>> + Send + 'a>> {
         Box::pin(async move {
             self.service
                 .tcp_read(

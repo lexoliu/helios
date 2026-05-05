@@ -1992,6 +1992,7 @@ where
                     .0
                     .tcp_read(socket.1, max_bytes, timeout)
                     .await
+                    .map(|bytes| bytes.map(|bytes| bytes.to_vec()))
                     .map_err(convert_tcp_error);
                 record_component_host_kernel_profile(profile, "system-net-tcp-read");
                 Ok::<_, wasmtime::Error>((response,))
@@ -2317,6 +2318,7 @@ where
                     .0
                     .tcp_read(socket.1, max_bytes, timeout)
                     .await
+                    .map(|bytes| bytes.map(|bytes| bytes.to_vec()))
                     .map_err(convert_program_tcp_error);
                 record_component_host_kernel_profile(profile, "program-net-tcp-read");
                 Ok::<_, wasmtime::Error>((response,))
