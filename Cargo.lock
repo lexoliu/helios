@@ -1702,6 +1702,7 @@ name = "helios-netstack"
 version = "0.1.0"
 dependencies = [
  "arrayvec",
+ "heapless",
  "helios-hal",
  "thiserror 2.0.18",
 ]

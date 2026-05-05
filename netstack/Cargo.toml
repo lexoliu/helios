@@ -6,4 +6,5 @@ edition.workspace = true
 [dependencies]
 arrayvec = { version = "0.7.6", default-features = false }
 helios-hal.workspace = true
+heapless = { version = "0.7.17", default-features = false }
 thiserror = { version = "2.0.17", default-features = false }

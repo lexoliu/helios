@@ -1,9 +1,9 @@
 extern crate alloc;
 
-use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use arrayvec::ArrayVec;
+use heapless::Deque;
 
 use crate::{
     ArpOperation, ArpPacket, BbrV3, DEFAULT_POLL_BUDGET, EthernetAddress, EthernetFrame,
@@ -14,6 +14,9 @@ use crate::{
 
 pub const MAX_ROUTES: usize = 32;
 pub const MAX_NEIGHBORS: usize = 128;
+pub const MAX_OUTBOUND_FRAMES: usize = 32;
+pub const MAX_STACK_EVENTS: usize = 64;
+pub const MAX_UDP_RX: usize = 64;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StackInstant {
@@ -216,9 +219,9 @@ pub struct Stack {
     ipv4_addresses: ArrayVec<Ipv4Cidr, 8>,
     ipv6_addresses: ArrayVec<Ipv6Cidr, 16>,
     neighbors: ArrayVec<NeighborEntry, MAX_NEIGHBORS>,
-    outbound: VecDeque<PacketBuffer>,
-    events: VecDeque<StackEvent>,
-    udp_rx: VecDeque<UdpReceive>,
+    outbound: Deque<PacketBuffer, MAX_OUTBOUND_FRAMES>,
+    events: Deque<StackEvent, MAX_STACK_EVENTS>,
+    udp_rx: Deque<UdpReceive, MAX_UDP_RX>,
     tcp: Vec<Option<TcpSocket<BbrV3>>>,
 }
 
@@ -230,9 +233,9 @@ impl Stack {
             ipv4_addresses: ArrayVec::new(),
             ipv6_addresses: ArrayVec::new(),
             neighbors: ArrayVec::new(),
-            outbound: VecDeque::new(),
-            events: VecDeque::new(),
-            udp_rx: VecDeque::new(),
+            outbound: Deque::new(),
+            events: Deque::new(),
+            udp_rx: Deque::new(),
             tcp: Vec::new(),
         }
     }
@@ -265,7 +268,9 @@ impl Stack {
                 .try_push(entry)
                 .unwrap_or_else(|_| panic!("neighbor table is full"));
         }
-        self.events.push_back(StackEvent::NeighborUpdated(entry));
+        self.events
+            .push_back(StackEvent::NeighborUpdated(entry))
+            .unwrap_or_else(|_| panic!("stack event queue is full"));
     }
 
     pub fn add_ipv4_address(&mut self, address: Ipv4Cidr) {
@@ -360,11 +365,20 @@ impl Stack {
     }
 
     pub fn take_udp(&mut self, local_port: u16) -> Option<UdpReceive> {
-        let index = self
-            .udp_rx
-            .iter()
-            .position(|datagram| datagram.destination_port == local_port)?;
-        self.udp_rx.remove(index)
+        let len = self.udp_rx.len();
+        for _ in 0..len {
+            let datagram = self
+                .udp_rx
+                .pop_front()
+                .expect("UDP receive queue length changed while rotating");
+            if datagram.destination_port == local_port {
+                return Some(datagram);
+            }
+            self.udp_rx
+                .push_back(datagram)
+                .unwrap_or_else(|_| panic!("UDP receive queue lost capacity while rotating"));
+        }
+        None
     }
 
     pub fn open_tcp_connect(
@@ -602,7 +616,9 @@ impl Stack {
         )
         .ok_or(StackError::OutputQueueFull)?;
         frame.set_len(offset);
-        self.outbound.push_back(frame);
+        self.outbound
+            .push_back(frame)
+            .map_err(|_| StackError::OutputQueueFull)?;
         Ok(payload.len())
     }
 
@@ -643,7 +659,9 @@ impl Stack {
         )
         .ok_or(StackError::OutputQueueFull)?;
         frame.set_len(offset);
-        self.outbound.push_back(frame);
+        self.outbound
+            .push_back(frame)
+            .map_err(|_| StackError::OutputQueueFull)?;
         Ok(payload.len())
     }
 
@@ -715,7 +733,9 @@ impl Stack {
         )
         .ok_or(StackError::OutputQueueFull)?;
         frame.set_len(offset);
-        self.outbound.push_back(frame);
+        self.outbound
+            .push_back(frame)
+            .map_err(|_| StackError::OutputQueueFull)?;
         Ok(true)
     }
 
@@ -765,7 +785,9 @@ impl Stack {
         )
         .ok_or(StackError::OutputQueueFull)?;
         frame.set_len(offset);
-        self.outbound.push_back(frame);
+        self.outbound
+            .push_back(frame)
+            .map_err(|_| StackError::OutputQueueFull)?;
         Ok(true)
     }
 
@@ -918,7 +940,9 @@ impl Stack {
         )
         .ok_or(StackError::OutputQueueFull)?;
         frame.set_len(offset);
-        self.outbound.push_back(frame);
+        self.outbound
+            .push_back(frame)
+            .map_err(|_| StackError::OutputQueueFull)?;
         Ok(())
     }
 
@@ -956,7 +980,9 @@ impl Stack {
         )
         .ok_or(StackError::OutputQueueFull)?;
         frame.set_len(offset);
-        self.outbound.push_back(frame);
+        self.outbound
+            .push_back(frame)
+            .map_err(|_| StackError::OutputQueueFull)?;
         Ok(())
     }
 
@@ -1039,7 +1065,9 @@ impl Stack {
             .encode(&mut storage[offset..])
             .ok_or(StackError::OutputQueueFull)?;
         frame.set_len(offset);
-        self.outbound.push_back(frame);
+        self.outbound
+            .push_back(frame)
+            .map_err(|_| StackError::OutputQueueFull)?;
         Ok(())
     }
 
@@ -1070,9 +1098,11 @@ impl Stack {
             {
                 socket.on_segment(packet, now.nanos());
                 if socket.state() == crate::TcpState::Established {
-                    self.events.push_back(StackEvent::TcpReadable {
-                        socket: socket_id(index),
-                    });
+                    self.events
+                        .push_back(StackEvent::TcpReadable {
+                            socket: socket_id(index),
+                        })
+                        .unwrap_or_else(|_| panic!("stack event queue is full"));
                 }
                 return Ok(());
             }
@@ -1124,13 +1154,15 @@ impl Stack {
         bytes: &[u8],
     ) -> Result<(), StackError> {
         let packet = UdpPacket::parse(bytes).ok_or(StackError::MalformedPacket)?;
-        self.udp_rx.push_back(UdpReceive {
-            source,
-            destination,
-            source_port: packet.source_port,
-            destination_port: packet.destination_port,
-            bytes: packet.payload.to_vec(),
-        });
+        self.udp_rx
+            .push_back(UdpReceive {
+                source,
+                destination,
+                source_port: packet.source_port,
+                destination_port: packet.destination_port,
+                bytes: packet.payload.to_vec(),
+            })
+            .map_err(|_| StackError::OutputQueueFull)?;
         Ok(())
     }
 
