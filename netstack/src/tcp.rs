@@ -11,6 +11,7 @@ use crate::{
 pub const MAX_TCP_RECEIVE_SEGMENTS: usize = 128;
 pub const MAX_TCP_QUEUED_SEGMENTS: usize = 32;
 pub(crate) const TCP_RECEIVE_SEGMENT_BYTES: usize = 1460;
+const TCP_RECEIVE_BYTES: usize = MAX_TCP_RECEIVE_SEGMENTS * TCP_RECEIVE_SEGMENT_BYTES;
 const TCP_SMALL_PAYLOAD_ACK_BYTES: usize = TCP_RECEIVE_SEGMENT_BYTES / 2;
 const TCP_DELAYED_ACK_SEGMENTS: u8 = 2;
 const TCP_WINDOW_UPDATE_BYTES: u16 = (TCP_RECEIVE_SEGMENT_BYTES * 4) as u16;
@@ -80,6 +81,7 @@ where
     receive_next: u32,
     advertised_window: u16,
     receive_queue: Deque<Bytes, MAX_TCP_RECEIVE_SEGMENTS>,
+    receive_queued_bytes: usize,
     transmit_queue: Deque<Bytes, MAX_TCP_QUEUED_SEGMENTS>,
     in_flight: Deque<TcpInFlightSegment, MAX_TCP_QUEUED_SEGMENTS>,
     bytes_in_flight: u32,
@@ -109,6 +111,7 @@ where
             receive_next: 0,
             advertised_window: receive_window_size(0),
             receive_queue: Deque::new(),
+            receive_queued_bytes: 0,
             transmit_queue: Deque::new(),
             in_flight: Deque::new(),
             bytes_in_flight: 0,
@@ -497,20 +500,15 @@ where
     }
 
     pub fn receive(&mut self, max_bytes: usize) -> Option<Bytes> {
-        let previous_window = self.advertised_window;
-        let mut bytes = self.receive_queue.pop_front()?;
         if max_bytes == 0 {
-            self.receive_queue
-                .push_front(bytes)
-                .unwrap_or_else(|_| panic!("TCP receive queue lost capacity while peeking"));
-            return Some(Bytes::new());
+            return (!self.receive_queue.is_empty()).then(Bytes::new);
         }
+        let previous_window = self.advertised_window;
+        let mut bytes = self.pop_receive_segment()?;
         if bytes.len() >= max_bytes {
             if bytes.len() > max_bytes {
                 let tail = bytes.split_off(max_bytes);
-                self.receive_queue
-                    .push_front(tail)
-                    .unwrap_or_else(|_| panic!("TCP receive queue lost capacity while splitting"));
+                self.push_front_receive_segment(tail);
             }
             self.refresh_advertised_window();
             if self.should_advertise_window_update(previous_window) {
@@ -531,16 +529,14 @@ where
         let mut merged = BytesMut::with_capacity(merge_len);
         merged.extend_from_slice(&bytes);
         while merged.len() < merge_len {
-            let Some(mut next) = self.receive_queue.pop_front() else {
+            let Some(mut next) = self.pop_receive_segment() else {
                 break;
             };
             let remaining = merge_len - merged.len();
             if next.len() > remaining {
                 let tail = next.split_off(remaining);
                 merged.extend_from_slice(&next);
-                self.receive_queue
-                    .push_front(tail)
-                    .unwrap_or_else(|_| panic!("TCP receive queue lost capacity while splitting"));
+                self.push_front_receive_segment(tail);
                 break;
             }
             merged.extend_from_slice(&next);
@@ -554,14 +550,9 @@ where
     }
 
     fn receive_merge_len(&self, first_len: usize, max_bytes: usize) -> usize {
-        let mut len = first_len;
-        for segment in &self.receive_queue {
-            if len >= max_bytes {
-                return max_bytes;
-            }
-            len = len.saturating_add(segment.len().min(max_bytes - len));
-        }
-        len
+        first_len
+            .saturating_add(self.receive_queued_bytes)
+            .min(max_bytes)
     }
 
     pub fn on_segment(&mut self, packet: TcpPacket<'_>, now_nanos: u64) -> TcpSegmentOutcome {
@@ -624,8 +615,7 @@ where
                 {
                     if packet.sequence == self.receive_next {
                         if self
-                            .receive_queue
-                            .push_back(Bytes::copy_from_slice(packet.payload))
+                            .push_receive_segment(Bytes::copy_from_slice(packet.payload))
                             .is_err()
                         {
                             self.refresh_advertised_window();
@@ -722,7 +712,38 @@ where
     }
 
     fn refresh_advertised_window(&mut self) {
-        self.advertised_window = receive_window_size(self.receive_queue.len());
+        self.advertised_window = receive_window_size(self.receive_queued_bytes);
+    }
+
+    fn push_receive_segment(&mut self, bytes: Bytes) -> Result<(), Bytes> {
+        let len = bytes.len();
+        self.receive_queue.push_back(bytes)?;
+        self.receive_queued_bytes = self
+            .receive_queued_bytes
+            .checked_add(len)
+            .expect("TCP receive queued byte count overflowed");
+        Ok(())
+    }
+
+    fn push_front_receive_segment(&mut self, bytes: Bytes) {
+        let len = bytes.len();
+        self.receive_queue
+            .push_front(bytes)
+            .unwrap_or_else(|_| panic!("TCP receive queue lost capacity while splitting"));
+        self.receive_queued_bytes = self
+            .receive_queued_bytes
+            .checked_add(len)
+            .expect("TCP receive queued byte count overflowed");
+    }
+
+    fn pop_receive_segment(&mut self) -> Option<Bytes> {
+        let bytes = self.receive_queue.pop_front()?;
+        assert!(
+            self.receive_queued_bytes >= bytes.len(),
+            "TCP receive queued byte count is corrupt"
+        );
+        self.receive_queued_bytes -= bytes.len();
+        Some(bytes)
     }
 
     fn note_inbound_payload(&mut self, payload_len: usize, now_nanos: u64) {
@@ -762,9 +783,8 @@ where
     }
 }
 
-fn receive_window_size(queued_segments: usize) -> u16 {
-    let free_segments = MAX_TCP_RECEIVE_SEGMENTS.saturating_sub(queued_segments);
-    let bytes = free_segments.saturating_mul(TCP_RECEIVE_SEGMENT_BYTES);
+fn receive_window_size(queued_bytes: usize) -> u16 {
+    let bytes = TCP_RECEIVE_BYTES.saturating_sub(queued_bytes);
     bytes.min(u16::MAX as usize) as u16
 }
 
