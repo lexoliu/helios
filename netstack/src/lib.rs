@@ -183,6 +183,10 @@ impl Default for PacketBuffer {
 
 /// Multi-core aware network interface contract used by packet stacks.
 pub trait NetworkInterface: Clone + Send + Sync + 'static {
+    type RxFrame<'a>: AsRef<[u8]> + Send + 'a
+    where
+        Self: 'a;
+
     /// Returns the hardware MAC address programmed for this interface.
     fn mac_address(&self) -> EthernetAddress;
 
@@ -202,6 +206,16 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
         &'a self,
         buffer: &'a mut PacketBuffer,
     ) -> impl Future<Output = IoResult<bool>> + Send + 'a;
+
+    /// Attempts to receive one frame as a borrowed device buffer.
+    fn try_receive_frame(&self)
+    -> impl Future<Output = IoResult<Option<Self::RxFrame<'_>>>> + Send;
+
+    /// Returns a borrowed device RX frame to the interface receive queue.
+    fn repost_rx_frame<'a>(
+        &'a self,
+        frame: Self::RxFrame<'a>,
+    ) -> impl Future<Output = IoResult<()>> + Send + 'a;
 
     /// Transmits one borrowed frame and waits until the device accepts ownership.
     fn transmit<'a>(&'a self, frame: &'a [u8]) -> impl Future<Output = IoResult<()>> + Send + 'a;

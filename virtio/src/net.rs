@@ -1,6 +1,6 @@
 use alloc::boxed::Box;
 use alloc::vec;
-use async_lock::Mutex;
+use async_lock::{Mutex, MutexGuard};
 use core::future::Future;
 use core::mem::size_of;
 
@@ -50,6 +50,32 @@ pub struct VirtioNetDevice<T: VirtioTransport> {
     mac_address: [u8; 6],
     max_frame_len: usize,
     header_len: usize,
+}
+
+pub struct BorrowedRxFrame<'a, T: VirtioTransport> {
+    state: MutexGuard<'a, NetRxState<T>>,
+    buffer: Option<Box<[u8]>>,
+    frame_start: usize,
+    frame_end: usize,
+}
+
+impl<T: VirtioTransport> AsRef<[u8]> for BorrowedRxFrame<'_, T> {
+    fn as_ref(&self) -> &[u8] {
+        let buffer = self
+            .buffer
+            .as_ref()
+            .expect("borrowed virtio RX frame was already reposted");
+        &buffer[self.frame_start..self.frame_end]
+    }
+}
+
+impl<T: VirtioTransport> Drop for BorrowedRxFrame<'_, T> {
+    fn drop(&mut self) {
+        assert!(
+            self.buffer.is_none(),
+            "borrowed virtio RX frame was dropped without reposting"
+        );
+    }
 }
 
 impl<T: VirtioTransport> VirtioNetDevice<T> {
@@ -200,6 +226,36 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         output[..frame_len].copy_from_slice(&buffer[self.header_len..used_len]);
         Self::repost_rx_buffer(&mut state, &self.transport, buffer)?;
         Ok(Some(frame_len))
+    }
+
+    pub async fn try_receive_frame(&self) -> IoResult<Option<BorrowedRxFrame<'_, T>>> {
+        let mut state = self.rx_state.lock().await;
+        let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
+            return Ok(None);
+        };
+        let Some(buffer) = state.rx_buffers[usize::from(token)].take() else {
+            panic!("virtio net RX completion referenced an unknown token {token}");
+        };
+        let used_len = used_len as usize;
+        if used_len < self.header_len || used_len > buffer.len() {
+            Self::repost_rx_buffer(&mut state, &self.transport, buffer)?;
+            return Err(IoError::DeviceFault);
+        }
+
+        Ok(Some(BorrowedRxFrame {
+            state,
+            buffer: Some(buffer),
+            frame_start: self.header_len,
+            frame_end: used_len,
+        }))
+    }
+
+    pub async fn repost_rx_frame(&self, mut frame: BorrowedRxFrame<'_, T>) -> IoResult<()> {
+        let buffer = frame
+            .buffer
+            .take()
+            .expect("borrowed virtio RX frame was reposted twice");
+        Self::repost_rx_buffer(&mut frame.state, &self.transport, buffer)
     }
 
     pub async fn transmit(&self, frame: &[u8]) -> IoResult<()> {

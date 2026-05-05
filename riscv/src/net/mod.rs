@@ -19,9 +19,12 @@ use crate::debug_state::RuntimeState;
 
 const SUPERVISOR_EXTERNAL_INTERRUPT: u32 = 9;
 
+type RiscvVirtioNetTransport = helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus>;
+type RiscvVirtioNetDevice = helios_virtio::VirtioNetDevice<RiscvVirtioNetTransport>;
+
 #[derive(Clone)]
 struct VirtioNetworkDevice {
-    inner: Arc<helios_virtio::VirtioMmioNetDevice>,
+    inner: Arc<RiscvVirtioNetDevice>,
 }
 
 pub(crate) struct ExternalInterrupts {
@@ -167,6 +170,8 @@ pub(crate) fn has_network_device(fdt: &Fdt<'_>) -> bool {
 }
 
 impl NetworkDevice for VirtioNetworkDevice {
+    type RxFrame<'a> = helios_virtio::BorrowedRxFrame<'a, RiscvVirtioNetTransport>;
+
     fn mac_address(&self) -> [u8; 6] {
         self.inner.mac_address()
     }
@@ -202,6 +207,14 @@ impl NetworkDevice for VirtioNetworkDevice {
         };
         buffer.set_len(frame_len);
         Ok(true)
+    }
+
+    async fn try_receive_frame(&self) -> Result<Option<Self::RxFrame<'_>>, IoError> {
+        self.inner.try_receive_frame().await
+    }
+
+    async fn repost_rx_frame<'a>(&'a self, frame: Self::RxFrame<'a>) -> Result<(), IoError> {
+        self.inner.repost_rx_frame(frame).await
     }
 
     async fn transmit(&self, frame: &[u8]) -> Result<(), IoError> {

@@ -15,8 +15,8 @@ use helios_hal::io::IoError;
 use helios_netstack::{
     DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage, DhcpMessageType, DhcpPacket,
     DnsQuestionWriter, DnsResponse, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr,
-    NetworkInterface as NetworkDevice, PacketBuffer, Route, Stack, StackConfig, StackInstant,
-    TcpConnectState, TcpEndpoint, TcpReadState,
+    NetworkInterface as NetworkDevice, Route, Stack, StackConfig, StackInstant, TcpConnectState,
+    TcpEndpoint, TcpReadState,
 };
 
 use crate::{
@@ -1117,25 +1117,25 @@ where
     async fn drive_network(&self) -> Result<(), IoError> {
         let mut received = 0usize;
         let receive_started = self.profile_start();
-        let mut frame = PacketBuffer::new();
         loop {
-            frame.clear();
-            match self.inner.device.try_receive(&mut frame).await {
-                Ok(true) => {
-                    let mut state = self.inner.state.lock().await;
-                    state
-                        .stack
-                        .receive_frame(frame.as_slice(), StackInstant::from_nanos(self.now_nanos()))
-                        .unwrap_or_else(|error| {
-                            tracing::debug!(?error, "dropped malformed network frame");
-                        });
-                    received += 1;
-                    if received >= state.stack.config().rx_budget {
-                        break;
-                    }
-                }
-                Ok(false) => break,
-                Err(error) => return Err(error),
+            let Some(frame) = self.inner.device.try_receive_frame().await? else {
+                break;
+            };
+            let rx_budget = {
+                let mut state = self.inner.state.lock().await;
+                let rx_budget = state.stack.config().rx_budget;
+                state
+                    .stack
+                    .receive_frame(frame.as_ref(), StackInstant::from_nanos(self.now_nanos()))
+                    .unwrap_or_else(|error| {
+                        tracing::debug!(?error, "dropped malformed network frame");
+                    });
+                rx_budget
+            };
+            self.inner.device.repost_rx_frame(frame).await?;
+            received += 1;
+            if received >= rx_budget {
+                break;
             }
         }
         self.record_network_profile("rx-drain", receive_started);

@@ -10,9 +10,9 @@ use helios_kernel::{
     NetworkService, PacketBuffer,
 };
 
-type Aarch64VirtioNetDevice = helios_virtio::VirtioNetDevice<
-    helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<helios_virtio::OffsetDmaPool>>,
->;
+type Aarch64VirtioNetTransport =
+    helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<helios_virtio::OffsetDmaPool>>;
+type Aarch64VirtioNetDevice = helios_virtio::VirtioNetDevice<Aarch64VirtioNetTransport>;
 
 #[derive(Clone)]
 struct VirtioNetworkDevice {
@@ -64,6 +64,8 @@ pub(crate) fn has_network_device(
 }
 
 impl NetworkDevice for VirtioNetworkDevice {
+    type RxFrame<'a> = helios_virtio::BorrowedRxFrame<'a, Aarch64VirtioNetTransport>;
+
     fn mac_address(&self) -> [u8; 6] {
         self.inner.mac_address()
     }
@@ -99,6 +101,14 @@ impl NetworkDevice for VirtioNetworkDevice {
         };
         buffer.set_len(frame_len);
         Ok(true)
+    }
+
+    async fn try_receive_frame(&self) -> Result<Option<Self::RxFrame<'_>>, IoError> {
+        self.inner.try_receive_frame().await
+    }
+
+    async fn repost_rx_frame<'a>(&'a self, frame: Self::RxFrame<'a>) -> Result<(), IoError> {
+        self.inner.repost_rx_frame(frame).await
     }
 
     async fn transmit(&self, frame: &[u8]) -> Result<(), IoError> {
