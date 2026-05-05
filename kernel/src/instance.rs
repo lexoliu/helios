@@ -1,8 +1,10 @@
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use slab::Slab;
 use spin::Mutex;
@@ -99,11 +101,10 @@ pub struct InstanceRegistry {
     inner: Arc<InstanceRegistryInner>,
 }
 
-#[derive(Clone)]
 pub struct RegisteredInstance {
     registry: InstanceRegistry,
     entry_slot: usize,
-    entry: Arc<InstanceEntry>,
+    entry: NonNull<InstanceEntry>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,7 +115,7 @@ pub enum InstanceExecutionTransition {
 
 struct InstanceRegistryInner {
     next_id: AtomicU64,
-    entries: Mutex<Slab<Arc<InstanceEntry>>>,
+    entries: Mutex<Slab<Box<InstanceEntry>>>,
     sampling: Mutex<SamplingState>,
     kill_notifier: Mutex<fn()>,
 }
@@ -134,6 +135,7 @@ struct InstanceEntry {
     /// transition. When set, the next host-call boundary returns
     /// `Killed { reason }` instead of resuming the guest.
     kill_flag: AtomicU8,
+    handle_count: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -178,7 +180,7 @@ impl InstanceRegistry {
         restart_cost: u32,
     ) -> RegisteredInstance {
         let id = InstanceId(self.inner.next_id.fetch_add(1, Ordering::AcqRel));
-        let entry = Arc::new(InstanceEntry {
+        let entry = Box::new(InstanceEntry {
             id,
             name: name.into(),
             started_at,
@@ -188,12 +190,14 @@ impl InstanceRegistry {
             last_resume_at: AtomicU64::new(INACTIVE_RESUME_AT),
             restart_cost,
             kill_flag: AtomicU8::new(KILL_FLAG_NONE),
+            handle_count: AtomicUsize::new(1),
         });
-        let entry_slot = self.inner.entries.lock().insert(entry.clone());
+        let entry_ptr = NonNull::from(entry.as_ref());
+        let entry_slot = self.inner.entries.lock().insert(entry);
         RegisteredInstance {
             registry: self.clone(),
             entry_slot,
-            entry,
+            entry: entry_ptr,
         }
     }
 
@@ -357,28 +361,34 @@ pub fn allow_instance_resource_growth(
 }
 
 impl RegisteredInstance {
+    fn entry(&self) -> &InstanceEntry {
+        // SAFETY: each live handle increments `handle_count`; the registry
+        // removes the boxed entry only when the final handle drops.
+        unsafe { self.entry.as_ref() }
+    }
+
     pub fn id(&self) -> InstanceId {
-        self.entry.id
+        self.entry().id
     }
 
     pub fn name(&self) -> &str {
-        &self.entry.name
+        &self.entry().name
     }
 
     pub fn started_at(&self) -> u64 {
-        self.entry.started_at
+        self.entry().started_at
     }
 
     pub fn restart_cost(&self) -> u32 {
-        self.entry.restart_cost
+        self.entry().restart_cost
     }
 
     pub fn memory_bytes(&self) -> u64 {
-        self.entry.memory_bytes.load(Ordering::Acquire)
+        self.entry().memory_bytes.load(Ordering::Acquire)
     }
 
     pub fn set_memory_bytes(&self, memory_bytes: u64) {
-        self.entry
+        self.entry()
             .memory_bytes
             .store(memory_bytes, Ordering::Release);
     }
@@ -387,7 +397,7 @@ impl RegisteredInstance {
     /// the OOM killer or a supervisor and the runtime should trap on
     /// the next host-call boundary instead of resuming the guest.
     pub fn pending_kill(&self) -> Option<KillReason> {
-        decode_kill_flag(self.entry.kill_flag.load(Ordering::Acquire))
+        decode_kill_flag(self.entry().kill_flag.load(Ordering::Acquire))
     }
 
     /// Mark this instance for termination. The next call_hook
@@ -395,7 +405,7 @@ impl RegisteredInstance {
     /// recorded reason rather than resuming the guest.
     pub fn request_kill(&self, reason: KillReason) {
         let encoded = encode_kill_reason(reason);
-        let _ = self.entry.kill_flag.compare_exchange(
+        let _ = self.entry().kill_flag.compare_exchange(
             KILL_FLAG_NONE,
             encoded,
             Ordering::AcqRel,
@@ -410,26 +420,48 @@ impl RegisteredInstance {
     ) -> Option<u64> {
         match transition {
             InstanceExecutionTransition::Resume => {
-                self.entry.resume(now_nanos);
+                self.entry().resume(now_nanos);
                 None
             }
-            InstanceExecutionTransition::Pause => self.entry.pause(now_nanos),
+            InstanceExecutionTransition::Pause => self.entry().pause(now_nanos),
         }
     }
 }
 
+impl Clone for RegisteredInstance {
+    fn clone(&self) -> Self {
+        self.entry().handle_count.fetch_add(1, Ordering::AcqRel);
+        Self {
+            registry: self.registry.clone(),
+            entry_slot: self.entry_slot,
+            entry: self.entry,
+        }
+    }
+}
+
+unsafe impl Send for RegisteredInstance {}
+unsafe impl Sync for RegisteredInstance {}
+
 impl Drop for RegisteredInstance {
     fn drop(&mut self) {
-        if Arc::strong_count(&self.entry) != 2 {
+        let entry = self.entry();
+        let previous_handles = entry.handle_count.fetch_sub(1, Ordering::AcqRel);
+        assert!(
+            previous_handles != 0,
+            "registered instance handle count underflow"
+        );
+        if previous_handles != 1 {
             return;
         }
-        let id = self.entry.id;
+        let id = entry.id;
         let mut entries = self.registry.inner.entries.lock();
         if entries
             .get(self.entry_slot)
             .is_some_and(|entry| entry.id == id)
         {
             let _ = entries.remove(self.entry_slot);
+        } else {
+            panic!("registered instance entry disappeared before final handle drop");
         }
         drop(entries);
         self.registry
@@ -528,6 +560,21 @@ mod tests {
         let instance = registry.register("init", 0);
         assert_eq!(registry.snapshot(1).len(), 1);
         drop(instance);
+        assert!(registry.snapshot(2).is_empty());
+    }
+
+    #[test]
+    fn cloned_instance_handle_keeps_registry_entry_alive() {
+        let registry = InstanceRegistry::new();
+        let instance = registry.register("worker", 0);
+        let clone = instance.clone();
+        drop(instance);
+
+        let snapshots = registry.snapshot(1);
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].name, "worker");
+
+        drop(clone);
         assert!(registry.snapshot(2).is_empty());
     }
 }
