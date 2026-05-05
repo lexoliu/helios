@@ -22,6 +22,7 @@ pub const MAX_UDP_RX: usize = 64;
 pub const MAX_TCP_ACCEPT: usize = 64;
 pub const MAX_TCP_SOCKETS: usize = 256;
 const TCP_ENDPOINT_INDEX_SLOTS: usize = MAX_TCP_SOCKETS * 2;
+const TCP_LISTENER_INDEX_SLOTS: usize = MAX_TCP_SOCKETS * 2;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StackInstant {
@@ -228,6 +229,7 @@ struct TcpSocketSlab {
     free: [usize; MAX_TCP_SOCKETS],
     free_len: usize,
     endpoint_index: TcpEndpointIndex,
+    listener_index: TcpListenerIndex,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -236,22 +238,23 @@ struct TcpEndpointKey {
     remote: TcpEndpoint,
 }
 
+#[derive(Clone, Debug)]
+struct TcpSocketIndex<Key: Copy + Eq, const SLOTS: usize> {
+    entries: [Option<TcpSocketIndexEntry<Key>>; SLOTS],
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TcpEndpointIndexEntry {
-    key: TcpEndpointKey,
+struct TcpSocketIndexEntry<Key: Copy + Eq> {
+    key: Key,
     socket_index: usize,
 }
 
-#[derive(Clone, Debug)]
-struct TcpEndpointIndex {
-    entries: [Option<TcpEndpointIndexEntry>; TCP_ENDPOINT_INDEX_SLOTS],
+trait TcpIndexKey: Copy + Eq {
+    fn hash(self) -> usize;
 }
 
-impl TcpEndpointKey {
-    const fn new(local: TcpEndpoint, remote: TcpEndpoint) -> Self {
-        Self { local, remote }
-    }
-}
+type TcpEndpointIndex = TcpSocketIndex<TcpEndpointKey, TCP_ENDPOINT_INDEX_SLOTS>;
+type TcpListenerIndex = TcpSocketIndex<TcpEndpoint, TCP_LISTENER_INDEX_SLOTS>;
 
 impl TcpSocketSlab {
     fn new() -> Self {
@@ -262,6 +265,7 @@ impl TcpSocketSlab {
             free: core::array::from_fn(|index| MAX_TCP_SOCKETS - 1 - index),
             free_len: MAX_TCP_SOCKETS,
             endpoint_index: TcpEndpointIndex::new(),
+            listener_index: TcpListenerIndex::new(),
         }
     }
 
@@ -293,9 +297,15 @@ impl TcpSocketSlab {
             .local_endpoint()
             .zip(socket.remote_endpoint())
             .map(|(local, remote)| TcpEndpointKey::new(local, remote));
+        let listener_key = socket
+            .local_endpoint()
+            .filter(|_| socket.remote_endpoint().is_none());
         *slot = Some(socket);
         if let Some(key) = endpoint_key {
             self.endpoint_index.insert(key, index);
+        }
+        if let Some(key) = listener_key {
+            self.listener_index.insert(key, index);
         }
         socket_id(index)
     }
@@ -305,6 +315,8 @@ impl TcpSocketSlab {
         if let Some((local, remote)) = socket.local_endpoint().zip(socket.remote_endpoint()) {
             self.endpoint_index
                 .remove(TcpEndpointKey::new(local, remote));
+        } else if let Some(local) = socket.local_endpoint() {
+            self.listener_index.remove(local);
         }
         self.free[self.free_len] = index;
         self.free_len += 1;
@@ -315,33 +327,60 @@ impl TcpSocketSlab {
         self.endpoint_index
             .lookup(TcpEndpointKey::new(local, remote))
     }
+
+    fn find_listener(&self, local: TcpEndpoint) -> Option<usize> {
+        self.listener_index
+            .lookup(local)
+            .or_else(|| self.listener_index.lookup(wildcard_endpoint(local)))
+    }
 }
 
-impl TcpEndpointIndex {
+impl TcpEndpointKey {
+    const fn new(local: TcpEndpoint, remote: TcpEndpoint) -> Self {
+        Self { local, remote }
+    }
+}
+
+impl TcpIndexKey for TcpEndpointKey {
+    fn hash(self) -> usize {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        hash = mix_endpoint(hash, self.local);
+        hash = mix_endpoint(hash, self.remote);
+        hash as usize
+    }
+}
+
+impl TcpIndexKey for TcpEndpoint {
+    fn hash(self) -> usize {
+        mix_endpoint(0xcbf2_9ce4_8422_2325u64, self) as usize
+    }
+}
+
+impl<Key: TcpIndexKey, const SLOTS: usize> TcpSocketIndex<Key, SLOTS> {
     fn new() -> Self {
+        assert!(SLOTS != 0, "TCP socket index capacity must be non-zero");
         Self {
-            entries: [None; TCP_ENDPOINT_INDEX_SLOTS],
+            entries: [None; SLOTS],
         }
     }
 
-    fn insert(&mut self, key: TcpEndpointKey, socket_index: usize) {
+    fn insert(&mut self, key: Key, socket_index: usize) {
         for index in Self::probe_indices(key) {
             match self.entries[index] {
                 Some(entry) if entry.key == key => {
-                    self.entries[index] = Some(TcpEndpointIndexEntry { key, socket_index });
-                    return;
+                    panic!("TCP socket index duplicate key");
                 }
                 Some(_) => {}
                 None => {
-                    self.entries[index] = Some(TcpEndpointIndexEntry { key, socket_index });
+                    self.entries[index] = Some(TcpSocketIndexEntry { key, socket_index });
                     return;
                 }
             }
         }
-        panic!("TCP endpoint index is full");
+        panic!("TCP socket index is full");
     }
 
-    fn remove(&mut self, key: TcpEndpointKey) {
+    fn remove(&mut self, key: Key) {
         for index in Self::probe_indices(key) {
             match self.entries[index] {
                 Some(entry) if entry.key == key => {
@@ -355,7 +394,7 @@ impl TcpEndpointIndex {
         }
     }
 
-    fn lookup(&self, key: TcpEndpointKey) -> Option<usize> {
+    fn lookup(&self, key: Key) -> Option<usize> {
         for index in Self::probe_indices(key) {
             match self.entries[index] {
                 Some(entry) if entry.key == key => return Some(entry.socket_index),
@@ -374,9 +413,9 @@ impl TcpEndpointIndex {
         }
     }
 
-    fn probe_indices(key: TcpEndpointKey) -> impl Iterator<Item = usize> {
-        let start = endpoint_hash(key) % TCP_ENDPOINT_INDEX_SLOTS;
-        (0..TCP_ENDPOINT_INDEX_SLOTS).map(move |offset| (start + offset) % TCP_ENDPOINT_INDEX_SLOTS)
+    fn probe_indices(key: Key) -> impl Iterator<Item = usize> {
+        let start = key.hash() % SLOTS;
+        (0..SLOTS).map(move |offset| (start + offset) % SLOTS)
     }
 }
 
@@ -1492,14 +1531,18 @@ impl Stack {
         if packet.flags.contains(crate::TcpFlags::SYN)
             && !packet.flags.contains(crate::TcpFlags::ACK)
         {
-            let Some(_) = self
-                .tcp
-                .iter()
-                .flatten()
-                .find(|socket| socket.is_listening_on(destination, packet.destination_port))
-            else {
+            let Some(listener_index) = self.tcp.find_listener(local_endpoint) else {
                 return Ok(false);
             };
+            let listener = self
+                .tcp
+                .get(listener_index)
+                .and_then(Option::as_ref)
+                .expect("TCP listener index referenced a missing socket");
+            assert!(
+                listener.is_listening_on(destination, packet.destination_port),
+                "TCP listener index resolved a non-listening socket"
+            );
             let local = TcpEndpoint {
                 address: destination,
                 port: packet.destination_port,
@@ -1619,16 +1662,19 @@ fn socket_index(socket: SocketId) -> usize {
         .unwrap_or_else(|_| panic!("socket id does not fit into usize"))
 }
 
-fn endpoint_hash(key: TcpEndpointKey) -> usize {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    hash = mix_endpoint(hash, key.local);
-    hash = mix_endpoint(hash, key.remote);
-    hash as usize
-}
-
 fn mix_endpoint(mut hash: u64, endpoint: TcpEndpoint) -> u64 {
     hash = mix_ip_address(hash, endpoint.address);
     mix_u16(hash, endpoint.port)
+}
+
+fn wildcard_endpoint(endpoint: TcpEndpoint) -> TcpEndpoint {
+    TcpEndpoint {
+        address: match endpoint.address {
+            IpAddress::Ipv4(_) => IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+            IpAddress::Ipv6(_) => IpAddress::Ipv6(Ipv6Address::UNSPECIFIED),
+        },
+        port: endpoint.port,
+    }
 }
 
 fn mix_ip_address(hash: u64, address: IpAddress) -> u64 {
@@ -1769,6 +1815,55 @@ mod tests {
                 port: 49152,
             }
         );
+    }
+
+    #[test]
+    fn tcp_exact_listener_accepts_syn() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(peer),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        stack.open_tcp_listen(TcpEndpoint {
+            address: IpAddress::Ipv4(local),
+            port: 8080,
+        });
+
+        let (syn, syn_len) = tcp_segment(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 49152,
+                destination_port: 8080,
+                sequence: 10,
+                acknowledgement: 0,
+                flags: TcpFlags::SYN,
+                window_size: u16::MAX,
+            },
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &syn[..syn_len],
+                StackInstant::from_nanos(1),
+            )
+            .expect("SYN should be accepted by exact listener");
+        stack
+            .drive_tcp(StackInstant::from_nanos(1))
+            .expect("SYN-ACK should be queued");
+
+        let frame = stack
+            .take_outbound()
+            .expect("SYN-ACK frame should be queued");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
+        let syn_ack = TcpPacket::parse(ipv4.payload).expect("TCP packet should parse");
+        assert!(syn_ack.flags.contains(TcpFlags::SYN.union(TcpFlags::ACK)));
     }
 
     #[test]
