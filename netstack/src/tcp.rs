@@ -1,12 +1,15 @@
 extern crate alloc;
 
-use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+
+use heapless::Deque;
 
 use crate::{
     AckSample, CongestionControl, CongestionEvent, IpAddress, RecoveryAction, TcpFlags, TcpHeader,
     TcpPacket,
 };
+
+pub const MAX_TCP_QUEUED_SEGMENTS: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TcpEndpoint {
@@ -51,8 +54,8 @@ where
     send_unacknowledged: u32,
     receive_next: u32,
     advertised_window: u16,
-    receive_queue: VecDeque<Vec<u8>>,
-    transmit_queue: VecDeque<Vec<u8>>,
+    receive_queue: Deque<Vec<u8>, MAX_TCP_QUEUED_SEGMENTS>,
+    transmit_queue: Deque<Vec<u8>, MAX_TCP_QUEUED_SEGMENTS>,
     bytes_in_flight: u32,
     delivered_bytes: u64,
     syn_queued: bool,
@@ -73,8 +76,8 @@ where
             send_unacknowledged: 0,
             receive_next: 0,
             advertised_window: u16::MAX,
-            receive_queue: VecDeque::new(),
-            transmit_queue: VecDeque::new(),
+            receive_queue: Deque::new(),
+            transmit_queue: Deque::new(),
             bytes_in_flight: 0,
             delivered_bytes: 0,
             syn_queued: false,
@@ -179,7 +182,13 @@ where
             .saturating_sub(self.bytes_in_flight) as usize;
         let writable = bytes.len().min(window);
         if writable != 0 {
-            self.transmit_queue.push_back(bytes[..writable].to_vec());
+            if self
+                .transmit_queue
+                .push_back(bytes[..writable].to_vec())
+                .is_err()
+            {
+                return 0;
+            }
         }
         writable
     }
@@ -198,7 +207,9 @@ where
         let available = usize::try_from(cwnd - self.bytes_in_flight).unwrap_or(usize::MAX);
         if payload.len() > available {
             let tail = payload.split_off(available);
-            self.transmit_queue.push_front(tail);
+            self.transmit_queue
+                .push_front(tail)
+                .unwrap_or_else(|_| panic!("TCP transmit queue lost capacity while splitting"));
         }
         let sequence_len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
         let header = TcpHeader {
@@ -271,10 +282,16 @@ where
                     }));
                 }
                 if packet.sequence == self.receive_next && !packet.payload.is_empty() {
+                    if self
+                        .receive_queue
+                        .push_back(packet.payload.to_vec())
+                        .is_err()
+                    {
+                        return action;
+                    }
                     self.receive_next = self
                         .receive_next
                         .wrapping_add(u32::try_from(packet.payload.len()).unwrap_or(u32::MAX));
-                    self.receive_queue.push_back(packet.payload.to_vec());
                     self.ack_pending = true;
                 }
                 if packet.flags.contains(TcpFlags::FIN) {
