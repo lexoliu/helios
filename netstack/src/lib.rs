@@ -233,6 +233,19 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
         }
     }
 
+    /// Transmits stack-owned packet buffers in order.
+    fn transmit_packet_batch<'a>(
+        &'a self,
+        frames: &'a [PacketBuffer],
+    ) -> impl Future<Output = IoResult<()>> + Send + 'a {
+        async move {
+            for frame in frames {
+                self.transmit(frame.as_slice()).await?;
+            }
+            Ok(())
+        }
+    }
+
     /// Reclaims completed transmit slots without waiting for new device events.
     fn reclaim_transmit_completions(
         &self,

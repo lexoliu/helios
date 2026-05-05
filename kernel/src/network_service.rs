@@ -16,7 +16,6 @@ use helios_netstack::{
     NetworkInterface as NetworkDevice, PacketBuffer, Route, Stack, StackConfig, StackError,
     StackInstant, TcpConnectState, TcpEndpoint, TcpReadState,
 };
-use smallvec::SmallVec;
 
 use crate::{
     ComponentNetworkService, ComponentRuntimeState, DnsError, DnsErrorKind,
@@ -1087,7 +1086,7 @@ where
         let mut transmitted = 0usize;
         let transmit_started = self.profile_start();
         loop {
-            let mut frames = SmallVec::<[PacketBuffer; NETWORK_TX_BATCH_FRAMES]>::new();
+            let mut frames = smallvec::SmallVec::<[PacketBuffer; NETWORK_TX_BATCH_FRAMES]>::new();
             {
                 let mut state = self.inner.state.lock().await;
                 while frames.len() < NETWORK_TX_BATCH_FRAMES {
@@ -1100,12 +1099,8 @@ where
             if frames.is_empty() {
                 break;
             }
-            let frame_refs = frames
-                .iter()
-                .map(PacketBuffer::as_slice)
-                .collect::<SmallVec<[&[u8]; NETWORK_TX_BATCH_FRAMES]>>();
-            self.inner.device.transmit_batch(&frame_refs).await?;
-            transmitted += frame_refs.len();
+            self.inner.device.transmit_packet_batch(&frames).await?;
+            transmitted += frames.len();
         }
         if transmitted != 0 {
             self.record_network_profile("tx-submit", transmit_started);

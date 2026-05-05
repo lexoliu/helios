@@ -125,6 +125,22 @@ impl NetworkDevice for VirtioNetworkDevice {
             .await
     }
 
+    async fn transmit_packet_batch<'a>(
+        &'a self,
+        frames: &'a [PacketBuffer],
+    ) -> Result<(), IoError> {
+        for chunk in frames.chunks(VIRTIO_POLLING_RX_BUDGET) {
+            let mut frame_refs = [&[][..]; VIRTIO_POLLING_RX_BUDGET];
+            for (index, frame) in chunk.iter().enumerate() {
+                frame_refs[index] = frame.as_slice();
+            }
+            self.inner
+                .transmit_batch_with_wait(&frame_refs[..chunk.len()], helios_kernel::yield_now)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn reclaim_transmit_completions(&self, budget: usize) -> Result<usize, IoError> {
         self.inner.reclaim_transmit_completions(budget).await
     }
