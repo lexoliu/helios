@@ -439,6 +439,8 @@ pub struct Stack {
     tcp_timers: BinaryHeap<TcpTimerEntry, Min, MAX_TCP_TIMER_ENTRIES>,
     tcp_timer_generations: [u32; MAX_TCP_SOCKETS],
     tcp_timer_deadlines: [Option<u64>; MAX_TCP_SOCKETS],
+    tcp_receive_backpressured: [bool; MAX_TCP_SOCKETS],
+    tcp_receive_backpressured_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -511,6 +513,8 @@ impl Stack {
             tcp_timers: BinaryHeap::new(),
             tcp_timer_generations: [0; MAX_TCP_SOCKETS],
             tcp_timer_deadlines: [None; MAX_TCP_SOCKETS],
+            tcp_receive_backpressured: [false; MAX_TCP_SOCKETS],
+            tcp_receive_backpressured_count: 0,
         }
     }
 
@@ -519,10 +523,7 @@ impl Stack {
     }
 
     pub fn receive_backpressured(&self) -> bool {
-        self.tcp
-            .iter()
-            .flatten()
-            .any(TcpSocket::receive_backpressured)
+        self.tcp_receive_backpressured_count != 0
     }
 
     pub fn routes(&self) -> &RouteTable {
@@ -917,6 +918,7 @@ impl Stack {
         let index = socket_index(socket);
         self.tcp.remove(index).ok_or(StackError::UnknownSocket)?;
         self.clear_tcp_timer(index);
+        self.clear_tcp_receive_backpressure(index);
         self.remove_tcp_accepts_for(socket);
         Ok(())
     }
@@ -953,6 +955,7 @@ impl Stack {
             None => TcpReadState::Pending,
         };
         self.schedule_tcp_timer(index);
+        self.update_tcp_receive_backpressure(index);
         Ok(state)
     }
 
@@ -1571,6 +1574,7 @@ impl Stack {
                 )
             };
             self.schedule_tcp_timer(index);
+            self.update_tcp_receive_backpressure(index);
             if previous_state == crate::TcpState::SynReceived
                 && current_state == crate::TcpState::Established
             {
@@ -1716,6 +1720,40 @@ impl Stack {
     fn clear_tcp_timer(&mut self, index: usize) {
         self.tcp_timer_generations[index] = self.tcp_timer_generations[index].wrapping_add(1);
         self.tcp_timer_deadlines[index] = None;
+    }
+
+    fn update_tcp_receive_backpressure(&mut self, index: usize) {
+        let backpressured = self
+            .tcp
+            .get(index)
+            .and_then(Option::as_ref)
+            .is_some_and(TcpSocket::receive_backpressured);
+        match (self.tcp_receive_backpressured[index], backpressured) {
+            (false, true) => {
+                self.tcp_receive_backpressured[index] = true;
+                self.tcp_receive_backpressured_count += 1;
+            }
+            (true, false) => {
+                self.tcp_receive_backpressured[index] = false;
+                assert!(
+                    self.tcp_receive_backpressured_count != 0,
+                    "TCP receive backpressure count is corrupt"
+                );
+                self.tcp_receive_backpressured_count -= 1;
+            }
+            _ => {}
+        }
+    }
+
+    fn clear_tcp_receive_backpressure(&mut self, index: usize) {
+        if self.tcp_receive_backpressured[index] {
+            self.tcp_receive_backpressured[index] = false;
+            assert!(
+                self.tcp_receive_backpressured_count != 0,
+                "TCP receive backpressure count is corrupt"
+            );
+            self.tcp_receive_backpressured_count -= 1;
+        }
     }
 
     fn tcp_timer_entry_current(&self, entry: TcpTimerEntry) -> bool {
@@ -2231,6 +2269,76 @@ mod tests {
         assert!(ack.flags.contains(TcpFlags::ACK));
         assert!(ack.payload.is_empty());
         assert!(stack.next_tcp_deadline().is_none());
+    }
+
+    #[test]
+    fn tcp_receive_backpressure_is_indexed() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let socket = stack.open_tcp_connect(
+            TcpEndpoint {
+                address: IpAddress::Ipv4(local),
+                port: 49152,
+            },
+            TcpEndpoint {
+                address: IpAddress::Ipv4(peer),
+                port: 80,
+            },
+            7,
+        );
+        let (syn_ack, syn_ack_len) = tcp_segment(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+            },
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &syn_ack[..syn_ack_len],
+                StackInstant::from_nanos(1),
+            )
+            .expect("SYN-ACK should establish the socket");
+
+        let payload = [0u8; crate::tcp::TCP_RECEIVE_SEGMENT_BYTES];
+        for index in 0..crate::tcp::TCP_RECEIVE_BACKPRESSURE_SEGMENTS {
+            let (segment, segment_len) = tcp_segment_with_payload(
+                peer,
+                local,
+                TcpHeader {
+                    source_port: 80,
+                    destination_port: 49152,
+                    sequence: 101 + index as u32 * crate::tcp::TCP_RECEIVE_SEGMENT_BYTES as u32,
+                    acknowledgement: 8,
+                    flags: TcpFlags::ACK,
+                    window_size: u16::MAX,
+                },
+                &payload,
+            );
+            stack
+                .receive_tcp(
+                    IpAddress::Ipv4(peer),
+                    IpAddress::Ipv4(local),
+                    &segment[..segment_len],
+                    StackInstant::from_nanos(index as u64 + 2),
+                )
+                .expect("payload should be accepted");
+        }
+        assert!(stack.receive_backpressured());
+
+        assert!(matches!(
+            stack.tcp_read(socket, crate::tcp::TCP_RECEIVE_SEGMENT_BYTES),
+            Ok(TcpReadState::Data(_))
+        ));
+        assert!(!stack.receive_backpressured());
     }
 
     #[test]
