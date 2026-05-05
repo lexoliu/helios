@@ -1,7 +1,6 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::marker::PhantomData;
@@ -53,7 +52,7 @@ pub struct Spawner<CpuImpl: Cpu + Clone> {
     local_queue_index: usize,
     processor_count: usize,
     progress: ProgressCounter,
-    progress_notify: Arc<Notify>,
+    progress_notify: NoWeakArc<Notify>,
 }
 
 pub struct Executor {
@@ -62,7 +61,7 @@ pub struct Executor {
     local_queue_index: usize,
     processor_count: usize,
     progress: ProgressCounter,
-    progress_notify: Arc<Notify>,
+    progress_notify: NoWeakArc<Notify>,
 }
 
 impl Executor {
@@ -90,7 +89,7 @@ impl Executor {
             local_queue_index,
             processor_count,
             progress,
-            progress_notify: Arc::new(Notify::new()),
+            progress_notify: NoWeakArc::new(Notify::new()),
         }
     }
 
@@ -132,7 +131,7 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         self.progress.clone()
     }
 
-    pub(crate) fn progress_notify(&self) -> Arc<Notify> {
+    pub(crate) fn progress_notify(&self) -> NoWeakArc<Notify> {
         self.progress_notify.clone()
     }
 
