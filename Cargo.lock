@@ -1661,6 +1661,7 @@ dependencies = [
  "event-listener",
  "futures",
  "futures-lite",
+ "hashbrown 0.16.1",
  "helios-artifact",
  "helios-compiler-abi",
  "helios-hal",

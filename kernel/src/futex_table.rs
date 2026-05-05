@@ -1,7 +1,6 @@
 extern crate alloc;
 
-use alloc::vec::Vec;
-
+use hashbrown::HashMap;
 use triomphe::Arc;
 
 use crate::Notify;
@@ -70,25 +69,24 @@ impl FutexWaitRegistration {
 }
 
 struct FutexEntry {
-    key: FutexKey,
     notify: Arc<Notify>,
     waiters: usize,
 }
 
 #[derive(Default)]
 pub struct FutexTable {
-    entries: Vec<FutexEntry>,
+    entries: HashMap<FutexKey, FutexEntry>,
 }
 
 impl FutexTable {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: HashMap::new(),
         }
     }
 
     pub fn prepare_wait(&mut self, key: FutexKey) -> FutexWaitRegistration {
-        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.key == key) {
+        if let Some(entry) = self.entries.get_mut(&key) {
             entry.waiters = entry.waiters.saturating_add(1);
             return FutexWaitRegistration {
                 key,
@@ -97,31 +95,29 @@ impl FutexTable {
         }
 
         let notify = Arc::new(Notify::new());
-        self.entries.push(FutexEntry {
+        self.entries.insert(
             key,
-            notify: notify.clone(),
-            waiters: 1,
-        });
+            FutexEntry {
+                notify: notify.clone(),
+                waiters: 1,
+            },
+        );
         FutexWaitRegistration { key, notify }
     }
 
     pub fn complete_wait(&mut self, registration: FutexWaitRegistration) {
-        let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.key == registration.key)
-        else {
+        let Some(entry) = self.entries.get_mut(&registration.key) else {
             panic!("futex wait completion referenced an unknown key");
         };
         assert!(entry.waiters > 0, "futex wait completion underflow");
         entry.waiters -= 1;
         if entry.waiters == 0 {
-            self.entries.retain(|entry| entry.key != registration.key);
+            self.entries.remove(&registration.key);
         }
     }
 
     pub fn wake(&self, key: FutexKey, count: usize) -> usize {
-        let Some(entry) = self.entries.iter().find(|entry| entry.key == key) else {
+        let Some(entry) = self.entries.get(&key) else {
             return 0;
         };
         let wake_count = count.min(entry.waiters);
@@ -132,7 +128,7 @@ impl FutexTable {
     }
 
     pub fn wake_all(&self, key: FutexKey) -> usize {
-        let Some(entry) = self.entries.iter().find(|entry| entry.key == key) else {
+        let Some(entry) = self.entries.get(&key) else {
             return 0;
         };
         entry.notify.notify_all();

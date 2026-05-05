@@ -24,6 +24,7 @@ concurrent-queue = { version = "2.5.0", default-features = false }
 critical-section = "1.2.0"
 event-listener = { version = "5.4.1", default-features = false, features = ["critical-section"] }
 futures = { version = "0.3.31", default-features = false, features = ["alloc"] }
+hashbrown = { version = "0.16.1", default-features = false, features = ["allocator-api2", "default-hasher", "equivalent", "inline-more"] }
 nu-ansi-term = { version = "0.50.3", default-features = false }
 objectpool = { version = "0.1.0", default-features = false, features = ["alloc"] }
 helios-artifact.workspace = true
