@@ -1025,22 +1025,27 @@ where
 
         let mut received = 0usize;
         let receive_started = self.profile_start();
-        loop {
-            let stack_rx_budget = {
-                let state = self.inner.state.lock().await;
-                if state.stack.receive_backpressured() {
-                    break;
-                }
+        let stack_rx_budget = {
+            let state = self.inner.state.lock().await;
+            if state.stack.receive_backpressured() {
+                0
+            } else {
                 state.stack.config().rx_budget
-            };
+            }
+        };
+        loop {
+            if stack_rx_budget == 0 {
+                break;
+            }
             let Some(frame) = self.inner.device.try_receive_frame().await? else {
                 break;
             };
-            let result = {
+            let (result, receive_backpressured) = {
                 let mut state = self.inner.state.lock().await;
-                state
+                let result = state
                     .stack
-                    .receive_frame(frame.as_ref(), StackInstant::from_nanos(self.now_nanos()))
+                    .receive_frame(frame.as_ref(), StackInstant::from_nanos(self.now_nanos()));
+                (result, state.stack.receive_backpressured())
             };
             self.inner.device.repost_rx_frame(frame).await?;
             if let Err(error) = result {
@@ -1050,7 +1055,7 @@ where
                 tracing::debug!(?error, "dropped malformed network frame");
             }
             received += 1;
-            if received >= budget.rx_frames.min(stack_rx_budget) {
+            if receive_backpressured || received >= budget.rx_frames.min(stack_rx_budget) {
                 break;
             }
         }
