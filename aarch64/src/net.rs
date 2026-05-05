@@ -1,13 +1,14 @@
 extern crate alloc;
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
-use core::future::Future;
 
 use fdt::Fdt;
 use helios_hal::io::IoError;
 use helios_hal::watchdog::Watchdog;
-use helios_kernel::{Kernel, NetworkDevice, NetworkService};
+use helios_kernel::{
+    DEFAULT_POLL_BUDGET, EventDeliveryCapabilities, InterfaceCapabilities, Kernel, NetworkDevice,
+    NetworkService, PacketBuffer,
+};
 
 type Aarch64VirtioNetDevice = helios_virtio::VirtioNetDevice<
     helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<helios_virtio::OffsetDmaPool>>,
@@ -71,20 +72,43 @@ impl NetworkDevice for VirtioNetworkDevice {
         self.inner.max_frame_len()
     }
 
-    fn try_receive(&self) -> impl Future<Output = Result<Option<Box<[u8]>>, IoError>> + Send + '_ {
-        self.inner.try_receive()
+    fn capabilities(&self) -> InterfaceCapabilities {
+        InterfaceCapabilities {
+            max_frame_len: self.max_frame_len(),
+            events: EventDeliveryCapabilities {
+                polling: true,
+                interrupts: false,
+                adaptive_moderation: false,
+                rx_coalescing: false,
+                tx_coalescing: false,
+                rx_poll_budget: DEFAULT_POLL_BUDGET,
+                tx_completion_budget: DEFAULT_POLL_BUDGET,
+            },
+            ..InterfaceCapabilities::default()
+        }
     }
 
-    fn transmit<'a>(
-        &'a self,
-        frame: &'a [u8],
-    ) -> impl Future<Output = Result<(), IoError>> + Send + 'a {
+    async fn try_receive(&self, buffer: &mut PacketBuffer) -> Result<bool, IoError> {
+        let Some(frame) = self.inner.try_receive().await? else {
+            return Ok(false);
+        };
+        if frame.len() > buffer.spare_capacity_mut().len() {
+            return Err(IoError::OutOfBounds);
+        }
+        buffer.clear();
+        buffer.spare_capacity_mut()[..frame.len()].copy_from_slice(&frame);
+        buffer.set_len(frame.len());
+        Ok(true)
+    }
+
+    async fn transmit(&self, frame: &[u8]) -> Result<(), IoError> {
         self.inner
             .transmit_with_wait(frame, helios_kernel::yield_now)
+            .await
     }
 
-    fn wait_for_event(&self) -> impl Future<Output = ()> + Send + '_ {
-        helios_kernel::yield_now()
+    async fn wait_for_event(&self) {
+        helios_kernel::yield_now().await;
     }
 }
 

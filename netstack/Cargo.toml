@@ -1,0 +1,8 @@
+[package]
+name = "helios-netstack"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+helios-hal.workspace = true
+thiserror = { version = "2.0.17", default-features = false }

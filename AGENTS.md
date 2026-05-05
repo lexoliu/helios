@@ -104,6 +104,11 @@ crates.
 - Prefer generic types, `impl Trait`, and the type system over enum-based
   type erasure or `dyn Trait` when the set of implementations is known at
   compile time.
+- Async trait definitions must spell out the returned future and bounds
+  explicitly, for example
+  `fn op(&self) -> impl Future<Output = Result<T, E>> + Send + '_`; do not use
+  `async fn` in trait definitions. Trait implementations may use direct
+  `async fn` implementations when the compiler accepts them.
 - Avoid heap allocation in kernel-facing code. Use stack storage, static
   capacity, caller-owned buffers, arenas, or explicit ownership passed through
   typed APIs whenever the size/lifetime is known. Allocating containers such as

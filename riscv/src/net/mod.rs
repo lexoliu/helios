@@ -1,8 +1,6 @@
 extern crate alloc;
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
-use core::future::Future;
 use core::num::NonZeroU32;
 
 use fdt::Fdt;
@@ -10,7 +8,10 @@ use fdt::node::FdtNode;
 use helios_hal::cpu::Cpu;
 use helios_hal::io::IoError;
 use helios_hal::watchdog::Watchdog;
-use helios_kernel::{Kernel, NetworkDevice, NetworkService};
+use helios_kernel::{
+    DEFAULT_POLL_BUDGET, EventDeliveryCapabilities, InterfaceCapabilities, Kernel, NetworkDevice,
+    NetworkService, PacketBuffer,
+};
 use plic::Plic;
 
 use crate::RiscvCpu;
@@ -174,19 +175,41 @@ impl NetworkDevice for VirtioNetworkDevice {
         self.inner.max_frame_len()
     }
 
-    fn try_receive(&self) -> impl Future<Output = Result<Option<Box<[u8]>>, IoError>> + Send + '_ {
-        self.inner.try_receive()
+    fn capabilities(&self) -> InterfaceCapabilities {
+        InterfaceCapabilities {
+            max_frame_len: self.max_frame_len(),
+            events: EventDeliveryCapabilities {
+                polling: true,
+                interrupts: true,
+                adaptive_moderation: false,
+                rx_coalescing: false,
+                tx_coalescing: false,
+                rx_poll_budget: DEFAULT_POLL_BUDGET,
+                tx_completion_budget: DEFAULT_POLL_BUDGET,
+            },
+            ..InterfaceCapabilities::default()
+        }
     }
 
-    fn transmit<'a>(
-        &'a self,
-        frame: &'a [u8],
-    ) -> impl Future<Output = Result<(), IoError>> + Send + 'a {
-        self.inner.transmit(frame)
+    async fn try_receive(&self, buffer: &mut PacketBuffer) -> Result<bool, IoError> {
+        let Some(frame) = self.inner.try_receive().await? else {
+            return Ok(false);
+        };
+        if frame.len() > buffer.spare_capacity_mut().len() {
+            return Err(IoError::OutOfBounds);
+        }
+        buffer.clear();
+        buffer.spare_capacity_mut()[..frame.len()].copy_from_slice(&frame);
+        buffer.set_len(frame.len());
+        Ok(true)
     }
 
-    fn wait_for_event(&self) -> impl Future<Output = ()> + Send + '_ {
-        self.inner.wait_for_interrupt()
+    async fn transmit(&self, frame: &[u8]) -> Result<(), IoError> {
+        self.inner.transmit(frame).await
+    }
+
+    async fn wait_for_event(&self) {
+        self.inner.wait_for_interrupt().await;
     }
 }
 

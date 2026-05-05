@@ -8,7 +8,6 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use concurrent_queue::{ConcurrentQueue, PopError, PushError};
-use core::future::Future;
 use core::num::NonZeroU32;
 use core::task::Poll;
 use core::time::Duration;
@@ -16,6 +15,7 @@ use smallvec::SmallVec;
 
 use helios_hal::cpu::Cpu;
 use helios_hal::io::IoError;
+use helios_netstack::{NetworkInterface as NetworkDevice, PacketBuffer};
 use smoltcp::iface::{
     Config as InterfaceConfig, Interface, MulticastError, Route, SocketHandle, SocketSet,
 };
@@ -52,23 +52,6 @@ type InboundFrame = Box<[u8]>;
 type OutboundFrame = Vec<u8>;
 type InboundFrameBurst = SmallVec<[InboundFrame; NETWORK_FRAME_BURST]>;
 type OutboundFrameBurst = SmallVec<[OutboundFrame; NETWORK_FRAME_BURST]>;
-
-pub trait NetworkDevice: Clone + Send + Sync + 'static {
-    fn mac_address(&self) -> [u8; 6];
-
-    fn max_frame_len(&self) -> usize;
-
-    fn try_receive(
-        &self,
-    ) -> impl Future<Output = Result<Option<InboundFrame>, IoError>> + Send + '_;
-
-    fn transmit<'a>(
-        &'a self,
-        frame: &'a [u8],
-    ) -> impl Future<Output = Result<(), IoError>> + Send + 'a;
-
-    fn wait_for_event(&self) -> impl Future<Output = ()> + Send + '_;
-}
 
 #[derive(Clone)]
 pub struct NetworkService<CpuImpl, Runtime, Device>
@@ -1229,10 +1212,17 @@ where
         loop {
             let mut received = InboundFrameBurst::new();
             let receive_started = self.profile_start();
+            let mut frame = PacketBuffer::new();
             loop {
-                match self.inner.device.try_receive().await {
-                    Ok(Some(frame)) => received.push(frame),
-                    Ok(None) => break,
+                frame.clear();
+                match self.inner.device.try_receive(&mut frame).await {
+                    Ok(true) => {
+                        // Legacy smoltcp ownership boundary: its `Device` adapter currently
+                        // consumes owned boxed frames. The new netstack data path must keep the
+                        // caller-owned packet buffer and remove this copy.
+                        received.push(frame.as_slice().into());
+                    }
+                    Ok(false) => break,
                     Err(error) => return Err(error),
                 }
             }

@@ -1725,6 +1725,7 @@ dependencies = [
  "helios-compiler-abi",
  "helios-hal",
  "helios-kernel-macro",
+ "helios-netstack",
  "lru",
  "nu-ansi-term",
  "objectpool",
@@ -1755,6 +1756,14 @@ dependencies = [
  "syn 2.0.117",
  "walkdir",
  "wat",
+]
+
+[[package]]
+name = "helios-netstack"
+version = "0.1.0"
+dependencies = [
+ "helios-hal",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

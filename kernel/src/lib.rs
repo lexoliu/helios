@@ -117,6 +117,10 @@ pub use futex_table::{
     FutexKey, FutexTable, FutexWaitRegistration, GuestAddress, ProcessMemoryIdentity,
 };
 pub use helios_hal::Platform;
+pub use helios_netstack::{
+    DEFAULT_POLL_BUDGET, EventDeliveryCapabilities, InterfaceCapabilities,
+    NetworkInterface as NetworkDevice, PacketBuffer,
+};
 pub use host_fs_client::{HostFsClient, HostFsTransport};
 pub use host_share::{HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, guest_host_share_path};
 pub use instance::{
@@ -132,7 +136,7 @@ pub use network_control::{
     Ipv4Cidr, Ipv4Route, MacAddress, NetworkAdminBackend, NetworkBridgeRequest,
     NetworkBridgeSecurity, NetworkControl, NetworkControlError, NetworkPortId,
 };
-pub use network_service::{NetworkDevice, NetworkService, TcpListenerId, TcpStreamId, UdpSocketId};
+pub use network_service::{NetworkService, TcpListenerId, TcpStreamId, UdpSocketId};
 pub use observer::{
     DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY, FoldedProfileSample,
     ProfileFilter, ProfileHistory, ProfileScope, StatsSample, TraceEvent, TraceField, TraceFilter,
