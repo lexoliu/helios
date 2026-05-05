@@ -6,11 +6,9 @@ use fdt::Fdt;
 use helios_hal::io::IoError;
 use helios_hal::watchdog::Watchdog;
 use helios_kernel::{
-    EventDeliveryCapabilities, InterfaceCapabilities, Kernel, NetworkDevice, NetworkService,
-    PacketBuffer,
+    DEFAULT_POLL_BUDGET, EventDeliveryCapabilities, InterfaceCapabilities, Kernel, NetworkDevice,
+    NetworkService, PacketBuffer,
 };
-
-const AARCH64_NET_POLL_BUDGET: usize = 64;
 
 type Aarch64VirtioNetTransport =
     helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<helios_virtio::OffsetDmaPool>>;
@@ -82,8 +80,8 @@ impl NetworkDevice for VirtioNetworkDevice {
                 adaptive_moderation: false,
                 rx_coalescing: false,
                 tx_coalescing: false,
-                rx_poll_budget: AARCH64_NET_POLL_BUDGET,
-                tx_completion_budget: AARCH64_NET_POLL_BUDGET,
+                rx_poll_budget: DEFAULT_POLL_BUDGET,
+                tx_completion_budget: DEFAULT_POLL_BUDGET,
             },
             ..InterfaceCapabilities::default()
         }

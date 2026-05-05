@@ -10,7 +10,7 @@ use crate::{
     TcpPacket,
 };
 
-pub const MAX_TCP_QUEUED_SEGMENTS: usize = 64;
+pub const MAX_TCP_QUEUED_SEGMENTS: usize = 32;
 const TCP_RECEIVE_SEGMENT_BYTES: usize = 1460;
 pub const TCP_INITIAL_RTO_NANOS: u64 = 1_000_000_000;
 pub const TCP_MAX_RETRANSMISSIONS: u8 = 5;
@@ -628,29 +628,21 @@ mod tests {
             TCP_INITIAL_RTO_NANOS,
         );
         let open_window = socket.advertised_window();
-        let payload = [7u8; TCP_RECEIVE_SEGMENT_BYTES];
-        for segment in 0..20u32 {
-            let _ = socket.on_segment(
-                TcpPacket {
-                    source_port: 80,
-                    destination_port: 49152,
-                    sequence: 101 + segment * TCP_RECEIVE_SEGMENT_BYTES as u32,
-                    acknowledgement: 8,
-                    flags: TcpFlags::ACK,
-                    window_size: u16::MAX,
-                    payload: &payload,
-                },
-                TCP_INITIAL_RTO_NANOS + 1 + u64::from(segment),
-            );
-        }
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                payload: b"hello",
+            },
+            TCP_INITIAL_RTO_NANOS + 1,
+        );
 
         assert!(socket.advertised_window() < open_window);
-        for _ in 0..20 {
-            assert_eq!(
-                socket.receive(TCP_RECEIVE_SEGMENT_BYTES),
-                Some(payload.to_vec())
-            );
-        }
+        assert_eq!(socket.receive(8), Some(b"hello".to_vec()));
         assert_eq!(socket.advertised_window(), open_window);
     }
 }

@@ -10,10 +10,10 @@ use core::time::Duration;
 use helios_hal::cpu::Cpu;
 use helios_hal::io::IoError;
 use helios_netstack::{
-    DEFAULT_POLL_BUDGET, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage,
-    DhcpMessageType, DhcpPacket, DnsQuestionWriter, DnsResponse, IpAddress, IpCidr, Ipv4Address,
-    Ipv4Cidr, NetworkInterface as NetworkDevice, Route, Stack, StackConfig, StackInstant,
-    TcpConnectState, TcpEndpoint, TcpReadState,
+    DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage, DhcpMessageType, DhcpPacket,
+    DnsQuestionWriter, DnsResponse, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr,
+    NetworkInterface as NetworkDevice, Route, Stack, StackConfig, StackInstant, TcpConnectState,
+    TcpEndpoint, TcpReadState,
 };
 
 use crate::{
@@ -347,12 +347,6 @@ where
         device: DeviceImpl,
     ) -> Self {
         let transaction_id = cpu.now().ticks() as u32;
-        let capabilities = device.capabilities();
-        let rx_budget = if capabilities.events.rx_poll_budget == 0 {
-            DEFAULT_POLL_BUDGET
-        } else {
-            capabilities.events.rx_poll_budget
-        };
         Self {
             inner: Arc::new(NetworkServiceInner {
                 cpu,
@@ -361,7 +355,6 @@ where
                 state: crate::Mutex::new(NetworkState::new(
                     device.mac_address(),
                     device.max_frame_len(),
-                    rx_budget,
                     transaction_id,
                 )),
                 device,
@@ -1362,9 +1355,9 @@ where
 }
 
 impl NetworkState {
-    fn new(mac: [u8; 6], max_frame_len: usize, rx_budget: usize, transaction_id: u32) -> Self {
+    fn new(mac: [u8; 6], max_frame_len: usize, transaction_id: u32) -> Self {
         Self {
-            stack: Stack::new(StackConfig::new(mac, max_frame_len).with_rx_budget(rx_budget)),
+            stack: Stack::new(StackConfig::new(mac, max_frame_len)),
             next_tcp_local_port: EPHEMERAL_PORT_START,
             next_udp_local_port: EPHEMERAL_PORT_START,
             tcp_streams: HandleSlab::new(),
