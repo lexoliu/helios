@@ -36,7 +36,7 @@ pub use stack::{
     DhcpLease, DnsQueryId, IcmpEchoKey, NeighborState, Route, RouteTable, SocketId, Stack,
     StackConfig, StackEvent, StackInstant, TcpAccept, TcpConnectState, TcpReadState, UdpReceive,
 };
-pub use tcp::{TcpEndpoint, TcpSocket, TcpState};
+pub use tcp::{TcpEndpoint, TcpSocket, TcpState, TcpTransmitSegment};
 pub use types::{
     EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr, Ipv6Scope,
 };

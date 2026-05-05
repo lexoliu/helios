@@ -14,6 +14,15 @@ pub struct TcpEndpoint {
     pub port: u16,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TcpTransmitSegment {
+    pub local: TcpEndpoint,
+    pub remote: TcpEndpoint,
+    pub header: TcpHeader,
+    pub payload: Vec<u8>,
+    pub sequence_len: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TcpState {
     Closed,
@@ -47,6 +56,7 @@ where
     bytes_in_flight: u32,
     delivered_bytes: u64,
     syn_queued: bool,
+    ack_pending: bool,
 }
 
 impl<C> TcpSocket<C>
@@ -68,6 +78,7 @@ where
             bytes_in_flight: 0,
             delivered_bytes: 0,
             syn_queued: false,
+            ack_pending: false,
         }
     }
 
@@ -136,6 +147,26 @@ where
             .on_packet_sent(1, self.bytes_in_flight, now_nanos);
     }
 
+    pub fn pending_ack(&self) -> Option<TcpHeader> {
+        if !self.ack_pending {
+            return None;
+        }
+        let local = self.local?;
+        let remote = self.remote?;
+        Some(TcpHeader {
+            source_port: local.port,
+            destination_port: remote.port,
+            sequence: self.send_next,
+            acknowledgement: self.receive_next,
+            flags: TcpFlags::ACK,
+            window_size: self.advertised_window,
+        })
+    }
+
+    pub fn mark_ack_queued(&mut self) {
+        self.ack_pending = false;
+    }
+
     pub const fn advertised_window(&self) -> u16 {
         self.advertised_window
     }
@@ -151,6 +182,44 @@ where
             self.transmit_queue.push_back(bytes[..writable].to_vec());
         }
         writable
+    }
+
+    pub fn take_transmit_segment(&mut self, now_nanos: u64) -> Option<TcpTransmitSegment> {
+        if self.state != TcpState::Established {
+            return None;
+        }
+        let local = self.local?;
+        let remote = self.remote?;
+        let cwnd = self.congestion.congestion_window().bytes();
+        if self.bytes_in_flight >= cwnd {
+            return None;
+        }
+        let mut payload = self.transmit_queue.pop_front()?;
+        let available = usize::try_from(cwnd - self.bytes_in_flight).unwrap_or(usize::MAX);
+        if payload.len() > available {
+            let tail = payload.split_off(available);
+            self.transmit_queue.push_front(tail);
+        }
+        let sequence_len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+        let header = TcpHeader {
+            source_port: local.port,
+            destination_port: remote.port,
+            sequence: self.send_next,
+            acknowledgement: self.receive_next,
+            flags: TcpFlags::ACK.union(TcpFlags::PSH),
+            window_size: self.advertised_window,
+        };
+        self.send_next = self.send_next.wrapping_add(sequence_len);
+        self.bytes_in_flight = self.bytes_in_flight.saturating_add(sequence_len);
+        self.congestion
+            .on_packet_sent(sequence_len, self.bytes_in_flight, now_nanos);
+        Some(TcpTransmitSegment {
+            local,
+            remote,
+            header,
+            payload,
+            sequence_len,
+        })
     }
 
     pub fn receive(&mut self, max_bytes: usize) -> Option<Vec<u8>> {
@@ -169,6 +238,7 @@ where
                 self.receive_next = packet.sequence.wrapping_add(1);
                 self.send_unacknowledged = packet.acknowledgement;
                 self.state = TcpState::Established;
+                self.ack_pending = true;
                 Some(self.congestion.on_ack(AckSample {
                     acked_bytes: 1,
                     delivered_bytes: self.delivered_bytes,
@@ -205,10 +275,12 @@ where
                         .receive_next
                         .wrapping_add(u32::try_from(packet.payload.len()).unwrap_or(u32::MAX));
                     self.receive_queue.push_back(packet.payload.to_vec());
+                    self.ack_pending = true;
                 }
                 if packet.flags.contains(TcpFlags::FIN) {
                     self.receive_next = self.receive_next.wrapping_add(1);
                     self.state = TcpState::CloseWait;
+                    self.ack_pending = true;
                 }
                 action
             }

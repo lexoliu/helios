@@ -8,7 +8,8 @@ use arrayvec::ArrayVec;
 use crate::{
     ArpOperation, ArpPacket, BbrV3, DEFAULT_POLL_BUDGET, EthernetAddress, EthernetFrame,
     EthernetProtocol, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Cidr, Ipv6Packet,
-    PacketBuffer, StackError, TcpEndpoint, TcpHeader, TcpPacket, TcpSocket, UdpPacket,
+    PacketBuffer, StackError, TcpEndpoint, TcpHeader, TcpPacket, TcpSocket, TcpTransmitSegment,
+    UdpPacket,
 };
 
 pub const MAX_ROUTES: usize = 32;
@@ -386,24 +387,38 @@ impl Stack {
     }
 
     pub fn drive_tcp(&mut self, now: StackInstant) -> Result<(), StackError> {
-        let mut pending = ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader), 16>::new();
+        let mut pending_syn = ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader), 16>::new();
+        let mut pending_ack = ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader), 16>::new();
+        let mut pending_data = ArrayVec::<TcpTransmitSegment, 16>::new();
         for (index, socket) in self.tcp.iter().enumerate() {
             let Some(socket) = socket else {
                 continue;
             };
-            let Some(header) = socket.pending_syn() else {
-                continue;
-            };
             let (Some(local), Some(remote)) = (socket.local_endpoint(), socket.remote_endpoint())
             else {
-                panic!("connecting TCP socket must have local and remote endpoints");
+                continue;
             };
-            pending
-                .try_push((index, local, remote, header))
-                .unwrap_or_else(|_| panic!("TCP control transmit burst overflowed"));
+            if let Some(header) = socket.pending_syn() {
+                pending_syn
+                    .try_push((index, local, remote, header))
+                    .unwrap_or_else(|_| panic!("TCP control transmit burst overflowed"));
+            }
+            if let Some(header) = socket.pending_ack() {
+                pending_ack
+                    .try_push((index, local, remote, header))
+                    .unwrap_or_else(|_| panic!("TCP ACK transmit burst overflowed"));
+            }
         }
 
-        for (index, local, remote, header) in pending {
+        for socket in self.tcp.iter_mut().flatten() {
+            if let Some(segment) = socket.take_transmit_segment(now.nanos()) {
+                pending_data
+                    .try_push(segment)
+                    .unwrap_or_else(|_| panic!("TCP data transmit burst overflowed"));
+            }
+        }
+
+        for (index, local, remote, header) in pending_syn {
             if self.queue_tcp(local, remote, header, &[], index as u16, now)? {
                 let socket = self
                     .tcp
@@ -412,6 +427,27 @@ impl Stack {
                     .expect("TCP socket disappeared while queuing SYN");
                 socket.mark_syn_queued(now.nanos());
             }
+        }
+        for (index, local, remote, header) in pending_ack {
+            if self.queue_tcp(local, remote, header, &[], index as u16, now)? {
+                let socket = self
+                    .tcp
+                    .get_mut(index)
+                    .and_then(Option::as_mut)
+                    .expect("TCP socket disappeared while queuing ACK");
+                socket.mark_ack_queued();
+            }
+        }
+        for segment in pending_data {
+            let identification = segment.sequence_len as u16;
+            self.queue_tcp(
+                segment.local,
+                segment.remote,
+                segment.header,
+                &segment.payload,
+                identification,
+                now,
+            )?;
         }
         Ok(())
     }
