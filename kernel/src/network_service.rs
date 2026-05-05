@@ -11,10 +11,10 @@ use bytes::Bytes;
 use helios_hal::cpu::Cpu;
 use helios_hal::io::IoError;
 use helios_netstack::{
-    DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage, DhcpMessageType, DhcpPacket,
-    DnsQuestionWriter, DnsResponse, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr,
-    NetworkInterface as NetworkDevice, PacketBuffer, Route, Stack, StackConfig, StackError,
-    StackInstant, TcpConnectState, TcpEndpoint, TcpReadState,
+    DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage, DhcpDnsServers,
+    DhcpMessageType, DhcpPacket, DnsQuestionWriter, DnsResponse, IpAddress, IpCidr, Ipv4Address,
+    Ipv4Cidr, NetworkInterface as NetworkDevice, PacketBuffer, Route, Stack, StackConfig,
+    StackError, StackInstant, TcpConnectState, TcpEndpoint, TcpReadState,
 };
 
 use crate::{
@@ -124,7 +124,7 @@ struct NetworkState {
     udp_sockets: HandleSlab<UdpSocketState, MAX_UDP_SOCKET_HANDLES>,
     poll: NetworkPollState,
     dhcp: DhcpClientState,
-    dns_servers: Vec<Ipv4Address>,
+    dns_servers: DhcpDnsServers,
     next_dns_query_id: u16,
 }
 
@@ -1497,7 +1497,7 @@ impl NetworkState {
             udp_sockets: HandleSlab::new(),
             poll: NetworkPollState::new(rx_poll_budget, rx_poll_budget),
             dhcp: DhcpClientState::Init { transaction_id },
-            dns_servers: Vec::new(),
+            dns_servers: DhcpDnsServers::new(),
             next_dns_query_id: 1,
         }
     }

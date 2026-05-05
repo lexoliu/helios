@@ -24,8 +24,8 @@ pub use congestion::{
     PacingRate, RecoveryAction,
 };
 pub use dhcp::{
-    DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DhcpClientMessage, DhcpMessageType, DhcpOptionBuffer,
-    DhcpOptionWriter, DhcpPacket, DhcpServerMessage,
+    DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DhcpClientMessage, DhcpDnsServers, DhcpMessageType,
+    DhcpOptionBuffer, DhcpOptionWriter, DhcpPacket, DhcpServerMessage, MAX_DHCP_DNS_SERVERS,
 };
 pub use dns::{DNS_PORT, DnsMessage, DnsQuestionWriter, DnsResponse};
 pub use packet::{

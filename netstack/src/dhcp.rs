@@ -4,6 +4,7 @@ use crate::{EthernetAddress, Ipv4Address};
 
 pub const DHCP_CLIENT_PORT: u16 = 68;
 pub const DHCP_SERVER_PORT: u16 = 67;
+pub const MAX_DHCP_DNS_SERVERS: usize = 4;
 
 const BOOTP_HEADER_LEN: usize = 236;
 const DHCP_MAGIC_COOKIE: [u8; 4] = [99, 130, 83, 99];
@@ -19,6 +20,7 @@ const OPTION_CLIENT_IDENTIFIER: u8 = 61;
 const OPTION_END: u8 = 255;
 
 pub type DhcpOptionBuffer = ArrayVec<u8, 312>;
+pub type DhcpDnsServers = ArrayVec<Ipv4Address, MAX_DHCP_DNS_SERVERS>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DhcpMessageType {
@@ -138,7 +140,7 @@ pub struct DhcpServerMessage {
     pub server_identifier: Option<Ipv4Address>,
     pub subnet_mask: Option<Ipv4Address>,
     pub router: Option<Ipv4Address>,
-    pub dns_servers: ArrayVec<Ipv4Address, 4>,
+    pub dns_servers: DhcpDnsServers,
     pub lease_seconds: Option<u32>,
 }
 
@@ -186,7 +188,7 @@ impl<'a> DhcpPacket<'a> {
                     router = Some(Ipv4Address::new(option.value[..4].try_into().ok()?));
                 }
                 OPTION_DNS_SERVER => {
-                    for chunk in option.value.chunks_exact(4).take(4) {
+                    for chunk in option.value.chunks_exact(4).take(MAX_DHCP_DNS_SERVERS) {
                         dns_servers
                             .try_push(Ipv4Address::new(chunk.try_into().ok()?))
                             .ok()?;

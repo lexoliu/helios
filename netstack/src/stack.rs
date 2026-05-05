@@ -8,10 +8,10 @@ use bytes::Bytes;
 use heapless::Deque;
 
 use crate::{
-    ArpOperation, ArpPacket, BbrV3, DEFAULT_POLL_BUDGET, EthernetAddress, EthernetFrame,
-    EthernetProtocol, Icmpv6Packet, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr, Ipv4Packet,
-    Ipv6Address, Ipv6Cidr, Ipv6Packet, PacketBuffer, StackError, TcpEndpoint, TcpHeader, TcpPacket,
-    TcpSocket, TcpTransmitSegment, UdpPacket,
+    ArpOperation, ArpPacket, BbrV3, DEFAULT_POLL_BUDGET, DhcpDnsServers, EthernetAddress,
+    EthernetFrame, EthernetProtocol, Icmpv6Packet, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr,
+    Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, PacketBuffer, StackError, TcpEndpoint,
+    TcpHeader, TcpPacket, TcpSocket, TcpTransmitSegment, UdpPacket,
 };
 
 pub const MAX_ROUTES: usize = 32;
@@ -180,7 +180,7 @@ impl Default for RouteTable {
 pub struct DhcpLease {
     pub address: Ipv4Cidr,
     pub router: Option<Ipv4Address>,
-    pub dns_servers: Vec<Ipv4Address>,
+    pub dns_servers: DhcpDnsServers,
     pub expires_at: Option<StackInstant>,
 }
 
