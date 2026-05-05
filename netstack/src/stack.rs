@@ -646,7 +646,11 @@ impl Stack {
         Ok(self.tcp_socket_mut(socket)?.queue_send(bytes))
     }
 
-    pub fn tcp_send_bytes(&mut self, socket: SocketId, bytes: Bytes) -> Result<usize, StackError> {
+    pub fn tcp_send_bytes(
+        &mut self,
+        socket: SocketId,
+        bytes: &mut Bytes,
+    ) -> Result<usize, StackError> {
         Ok(self.tcp_socket_mut(socket)?.queue_send_bytes(bytes))
     }
 

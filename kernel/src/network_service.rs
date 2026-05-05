@@ -688,10 +688,9 @@ where
             self.drive_tcp().await?;
             let written = {
                 let mut state = self.inner.state.lock().await;
-                state.try_write_tcp_bytes(stream, bytes.clone())?
+                state.try_write_tcp_bytes(stream, &mut bytes)?
             };
             if written != 0 {
-                let _ = bytes.split_to(written);
                 continue;
             }
             if self.now_nanos() >= deadline_nanos {
@@ -1807,7 +1806,7 @@ impl NetworkState {
     fn try_write_tcp_bytes(
         &mut self,
         stream: TcpStreamId,
-        bytes: Bytes,
+        bytes: &mut Bytes,
     ) -> Result<usize, TcpError> {
         let socket = self.tcp_socket(stream)?;
         self.stack

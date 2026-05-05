@@ -291,10 +291,14 @@ where
     }
 
     pub fn queue_send(&mut self, bytes: &[u8]) -> usize {
-        self.queue_send_bytes(Bytes::copy_from_slice(bytes))
+        let mut bytes = Bytes::copy_from_slice(bytes);
+        self.queue_send_bytes(&mut bytes)
     }
 
-    pub fn queue_send_bytes(&mut self, bytes: Bytes) -> usize {
+    pub fn queue_send_bytes(&mut self, bytes: &mut Bytes) -> usize {
+        if self.transmit_queue.is_full() {
+            return 0;
+        }
         let window = self
             .congestion
             .congestion_window()
@@ -302,14 +306,10 @@ where
             .saturating_sub(self.bytes_in_flight) as usize;
         let writable = bytes.len().min(window);
         if writable != 0 {
-            let segment = if writable == bytes.len() {
-                bytes
-            } else {
-                bytes.slice(..writable)
-            };
-            if self.transmit_queue.push_back(segment).is_err() {
-                return 0;
-            }
+            let segment = bytes.split_to(writable);
+            self.transmit_queue.push_back(segment).unwrap_or_else(|_| {
+                panic!("TCP transmit queue reported full after capacity check")
+            });
         }
         writable
     }
@@ -733,9 +733,10 @@ mod tests {
             TCP_INITIAL_RTO_NANOS,
         );
 
-        let payload = Bytes::from_static(b"hello");
+        let mut payload = Bytes::from_static(b"hello");
         let payload_ptr = payload.as_ptr();
-        assert_eq!(socket.queue_send_bytes(payload), 5);
+        assert_eq!(socket.queue_send_bytes(&mut payload), 5);
+        assert!(payload.is_empty());
         let segment = socket
             .take_transmit_segment(TCP_INITIAL_RTO_NANOS)
             .expect("established socket should transmit queued bytes");
