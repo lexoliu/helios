@@ -23,6 +23,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use core::task::{Context, Poll};
 use core::time::Duration;
+use hashbrown::HashMap;
 use helios_compiler_abi::{
     CompileHint as CompilerAbiHint, CompilerRequestHeader, CompilerResponseHeader, CompilerStatus,
     HELIOS_COMPILER_ABI_VERSION, HELIOS_COMPILER_ALLOC, HELIOS_COMPILER_COMPILE,
@@ -202,7 +203,7 @@ struct ProgramSpawnRequest {
     signal_dispositions: Vec<WasixSignalDisposition>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct SharedMemorySpec {
     initial_pages: u32,
     maximum_pages: u32,
@@ -224,12 +225,7 @@ impl SharedMemorySpec {
 struct SharedMemoryPool {
     budget_bytes: usize,
     resident_bytes: usize,
-    entries: Vec<SharedMemoryPoolEntry>,
-}
-
-struct SharedMemoryPoolEntry {
-    spec: SharedMemorySpec,
-    memory: SharedMemory,
+    buckets: HashMap<SharedMemorySpec, Vec<SharedMemory>>,
 }
 
 impl SharedMemoryPool {
@@ -237,7 +233,7 @@ impl SharedMemoryPool {
         Self {
             budget_bytes,
             resident_bytes: 0,
-            entries: Vec::new(),
+            buckets: HashMap::new(),
         }
     }
 
@@ -246,14 +242,21 @@ impl SharedMemoryPool {
         engine: &wasmtime::Engine,
         spec: SharedMemorySpec,
     ) -> Result<SharedMemory, ProgramExecError> {
-        if let Some(index) = self.entries.iter().position(|entry| entry.spec == spec) {
-            let entry = self.entries.swap_remove(index);
+        if let Some((memory, bucket_empty)) = self.buckets.get_mut(&spec).map(|bucket| {
+            let memory = bucket
+                .pop()
+                .expect("shared-memory pool retained an empty bucket");
+            (memory, bucket.is_empty())
+        }) {
+            if bucket_empty {
+                self.buckets.remove(&spec);
+            }
             self.resident_bytes = self
                 .resident_bytes
                 .checked_sub(spec.byte_size())
                 .expect("shared-memory pool byte accounting underflow");
-            zero_shared_memory(&entry.memory);
-            return Ok(entry.memory);
+            zero_shared_memory(&memory);
+            return Ok(memory);
         }
 
         SharedMemory::new(engine, spec.memory_type()).map_err(map_program_runtime_error)
@@ -271,7 +274,7 @@ impl SharedMemoryPool {
             .resident_bytes
             .checked_add(bytes)
             .expect("shared-memory pool byte accounting overflow");
-        self.entries.push(SharedMemoryPoolEntry { spec, memory });
+        self.buckets.entry(spec).or_default().push(memory);
     }
 }
 
@@ -18074,6 +18077,33 @@ mod tests {
             wasix_epoll_ready_mask(None, WASIX_EPOLL_TYPE_EPOLLIN),
             WASIX_EPOLL_TYPE_EPOLLERR | WASIX_EPOLL_TYPE_EPOLLHUP
         );
+    }
+
+    #[test]
+    fn shared_memory_pool_reuses_matching_spec_bucket() {
+        let mut config = wasmtime::Config::new();
+        config.wasm_threads(true);
+        config.shared_memory(true);
+        let engine = wasmtime::Engine::new(&config).unwrap();
+        let spec = SharedMemorySpec {
+            initial_pages: 1,
+            maximum_pages: 1,
+        };
+        let mut pool = SharedMemoryPool::new(spec.byte_size() * 2);
+        let memory = SharedMemory::new(&engine, spec.memory_type()).unwrap();
+        let ptr = memory.data().as_ptr().cast::<u8>() as *mut u8;
+        unsafe {
+            ptr.write(0xa5);
+        }
+
+        pool.recycle(spec, memory);
+        assert_eq!(pool.resident_bytes, spec.byte_size());
+
+        let reused = pool.acquire(&engine, spec).unwrap();
+        assert_eq!(pool.resident_bytes, 0);
+        assert!(!pool.buckets.contains_key(&spec));
+        let zeroed = unsafe { reused.data()[0].get().read() };
+        assert_eq!(zeroed, 0);
     }
 
     #[test]
