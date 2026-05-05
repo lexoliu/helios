@@ -13,9 +13,11 @@ use crate::wasmtime_adapter::{
 };
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
+use alloc::collections::BinaryHeap;
 use alloc::string::String;
 use alloc::vec;
 use bytes::Bytes;
+use core::cmp::Reverse;
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering as AtomicOrdering};
@@ -550,6 +552,7 @@ struct Preview1Cwd {
 #[derive(Clone)]
 struct Preview1DescriptorTable {
     entries: Vec<Option<Preview1DescriptorEntry>>,
+    free: BinaryHeap<Reverse<usize>>,
 }
 
 #[derive(Clone, Copy)]
@@ -3024,24 +3027,22 @@ fn guest_path_suffix<'a>(path: &'a str, preopen: &str) -> &'a str {
 
 impl Preview1DescriptorTable {
     fn from_authority(authority: &ProcessAuthority) -> Self {
-        let mut table = Self {
-            entries: vec![
-                Some(Preview1DescriptorEntry::new(
-                    Preview1Descriptor::Stdin {
-                        carry: Bytes::new(),
-                    },
-                    false,
-                )),
-                Some(Preview1DescriptorEntry::new(
-                    Preview1Descriptor::Stdout,
-                    false,
-                )),
-                Some(Preview1DescriptorEntry::new(
-                    Preview1Descriptor::Stderr,
-                    false,
-                )),
-            ],
-        };
+        let mut table = Self::from_entries(vec![
+            Some(Preview1DescriptorEntry::new(
+                Preview1Descriptor::Stdin {
+                    carry: Bytes::new(),
+                },
+                false,
+            )),
+            Some(Preview1DescriptorEntry::new(
+                Preview1Descriptor::Stdout,
+                false,
+            )),
+            Some(Preview1DescriptorEntry::new(
+                Preview1Descriptor::Stderr,
+                false,
+            )),
+        ]);
         for preopen in authority.directory_preopens() {
             let descriptor = FsDescriptor {
                 path: preopen.source_path().to_owned(),
@@ -3058,6 +3059,16 @@ impl Preview1DescriptorTable {
             )));
         }
         table
+    }
+
+    fn from_entries(entries: Vec<Option<Preview1DescriptorEntry>>) -> Self {
+        let mut free = BinaryHeap::new();
+        for (index, entry) in entries.iter().enumerate() {
+            if entry.is_none() {
+                free.push(Reverse(index));
+            }
+        }
+        Self { entries, free }
     }
 
     fn get(&self, fd: i32) -> Option<&Preview1Descriptor> {
@@ -3102,17 +3113,8 @@ impl Preview1DescriptorTable {
     }
 
     fn insert_entry(&mut self, entry: Preview1DescriptorEntry) -> Result<u32, i32> {
-        if let Some((index, slot)) = self
-            .entries
-            .iter_mut()
-            .enumerate()
-            .find(|(_, slot)| slot.is_none())
-        {
-            *slot = Some(entry);
-            return u32::try_from(index).map_err(|_| p1::errno::OVERFLOW);
-        }
-        let index = self.entries.len();
-        self.entries.push(Some(entry));
+        let index = self.allocate_slot_index();
+        self.entries[index] = Some(entry);
         u32::try_from(index).map_err(|_| p1::errno::OVERFLOW)
     }
 
@@ -3140,7 +3142,11 @@ impl Preview1DescriptorTable {
     fn insert_entry_at(&mut self, fd: i32, entry: Preview1DescriptorEntry) -> Result<u32, i32> {
         let to = usize::try_from(fd).map_err(|_| p1::errno::BADF)?;
         if self.entries.len() <= to {
+            let previous_len = self.entries.len();
             self.entries.resize_with(to + 1, || None);
+            for index in previous_len..to {
+                self.free.push(Reverse(index));
+            }
         }
         self.entries[to] = Some(entry);
         u32::try_from(to).map_err(|_| p1::errno::OVERFLOW)
@@ -3205,43 +3211,75 @@ impl Preview1DescriptorTable {
     }
 
     fn clone_for_exec(&self) -> Self {
-        Self {
-            entries: self
-                .entries
+        Self::from_entries(
+            self.entries
                 .iter()
                 .map(|entry| match entry {
                     Some(entry) if entry.close_on_exec => None,
                     _ => entry.clone(),
                 })
                 .collect(),
-        }
+        )
     }
 
     fn close(&mut self, fd: i32) -> i32 {
-        usize::try_from(fd)
-            .ok()
-            .and_then(|index| self.entries.get_mut(index))
+        let Some(index) = usize::try_from(fd).ok() else {
+            return p1::errno::BADF;
+        };
+        self.entries
+            .get_mut(index)
             .and_then(Option::take)
+            .map(|_| self.free.push(Reverse(index)))
             .map_or(p1::errno::BADF, |_| p1::errno::SUCCESS)
     }
 
+    fn allocate_slot_index(&mut self) -> usize {
+        while let Some(Reverse(index)) = self.free.pop() {
+            if self.entries.get(index).is_some_and(Option::is_none) {
+                return index;
+            }
+        }
+        let index = self.entries.len();
+        self.entries.push(None);
+        index
+    }
+
+    fn get_owned_entry(&mut self, fd: i32) -> Result<(usize, Preview1DescriptorEntry), i32> {
+        let index = usize::try_from(fd).map_err(|_| p1::errno::BADF)?;
+        let entry = self
+            .entries
+            .get_mut(index)
+            .and_then(Option::take)
+            .ok_or(p1::errno::BADF)?;
+        Ok((index, entry))
+    }
+
+    fn close_slot(&mut self, index: usize) {
+        self.entries[index] = None;
+        self.free.push(Reverse(index));
+    }
+
     fn renumber(&mut self, from: i32, to: i32) -> i32 {
-        let Ok(from) = usize::try_from(from) else {
-            return p1::errno::BADF;
-        };
         let Ok(to) = usize::try_from(to) else {
             return p1::errno::BADF;
         };
-        if from >= self.entries.len() || self.entries[from].is_none() {
+        let Ok((from, mut entry)) = self.get_owned_entry(from) else {
             return p1::errno::BADF;
+        };
+        entry.close_on_exec = false;
+        if from == to {
+            self.entries[from] = Some(entry);
+            return p1::errno::SUCCESS;
         }
-        if to >= self.entries.len() {
+        if self.entries.len() <= to {
+            let previous_len = self.entries.len();
             self.entries.resize_with(to + 1, || None);
+            for index in previous_len..to {
+                self.free.push(Reverse(index));
+            }
         }
-        self.entries[to] = self.entries[from].take().map(|mut entry| {
-            entry.close_on_exec = false;
-            entry
-        });
+        self.close_slot(from);
+        self.entries[to] = Some(entry);
         p1::errno::SUCCESS
     }
 }
@@ -17208,25 +17246,23 @@ mod tests {
             offset: 0,
             fdflags: 0,
         };
-        let mut table = Preview1DescriptorTable {
-            entries: vec![
-                Some(Preview1DescriptorEntry::new(
-                    Preview1Descriptor::Stdin {
-                        carry: Bytes::new(),
-                    },
-                    false,
-                )),
-                Some(Preview1DescriptorEntry::new(
-                    Preview1Descriptor::Stdout,
-                    false,
-                )),
-                Some(Preview1DescriptorEntry::new(
-                    Preview1Descriptor::Stderr,
-                    false,
-                )),
-                Some(Preview1DescriptorEntry::new(file, true)),
-            ],
-        };
+        let mut table = Preview1DescriptorTable::from_entries(vec![
+            Some(Preview1DescriptorEntry::new(
+                Preview1Descriptor::Stdin {
+                    carry: Bytes::new(),
+                },
+                false,
+            )),
+            Some(Preview1DescriptorEntry::new(
+                Preview1Descriptor::Stdout,
+                false,
+            )),
+            Some(Preview1DescriptorEntry::new(
+                Preview1Descriptor::Stderr,
+                false,
+            )),
+            Some(Preview1DescriptorEntry::new(file, true)),
+        ]);
 
         assert_eq!(table.renumber(3, 1), p1::errno::SUCCESS);
         match table.get(1) {
@@ -17241,28 +17277,50 @@ mod tests {
 
     #[test]
     fn fd_close_can_close_stdio_slots() {
-        let mut table = Preview1DescriptorTable {
-            entries: vec![
-                Some(Preview1DescriptorEntry::new(
-                    Preview1Descriptor::Stdin {
-                        carry: Bytes::new(),
-                    },
-                    false,
-                )),
-                Some(Preview1DescriptorEntry::new(
-                    Preview1Descriptor::Stdout,
-                    false,
-                )),
-                Some(Preview1DescriptorEntry::new(
-                    Preview1Descriptor::Stderr,
-                    false,
-                )),
-            ],
-        };
+        let mut table = Preview1DescriptorTable::from_entries(vec![
+            Some(Preview1DescriptorEntry::new(
+                Preview1Descriptor::Stdin {
+                    carry: Bytes::new(),
+                },
+                false,
+            )),
+            Some(Preview1DescriptorEntry::new(
+                Preview1Descriptor::Stdout,
+                false,
+            )),
+            Some(Preview1DescriptorEntry::new(
+                Preview1Descriptor::Stderr,
+                false,
+            )),
+        ]);
 
         assert_eq!(table.close(1), p1::errno::SUCCESS);
         assert!(table.get(1).is_none());
         assert_eq!(table.close(1), p1::errno::BADF);
+    }
+
+    #[test]
+    fn descriptor_insert_reuses_lowest_closed_slot() {
+        let mut table = Preview1DescriptorTable::from_entries(vec![
+            Some(Preview1DescriptorEntry::new(
+                Preview1Descriptor::Stdin {
+                    carry: Bytes::new(),
+                },
+                false,
+            )),
+            Some(Preview1DescriptorEntry::new(
+                Preview1Descriptor::Stdout,
+                false,
+            )),
+            Some(Preview1DescriptorEntry::new(
+                Preview1Descriptor::Stderr,
+                false,
+            )),
+        ]);
+
+        assert_eq!(table.close(2), p1::errno::SUCCESS);
+        assert_eq!(table.close(0), p1::errno::SUCCESS);
+        assert_eq!(table.insert(Preview1Descriptor::NullDevice), Ok(0));
     }
 
     #[test]
@@ -17277,25 +17335,23 @@ mod tests {
             offset: 0,
             fdflags: 0,
         };
-        let mut table = Preview1DescriptorTable {
-            entries: vec![
-                Some(Preview1DescriptorEntry::new(
-                    Preview1Descriptor::Stdin {
-                        carry: Bytes::new(),
-                    },
-                    false,
-                )),
-                Some(Preview1DescriptorEntry::new(
-                    Preview1Descriptor::Stdout,
-                    false,
-                )),
-                Some(Preview1DescriptorEntry::new(
-                    Preview1Descriptor::Stderr,
-                    false,
-                )),
-                Some(Preview1DescriptorEntry::new(file, false)),
-            ],
-        };
+        let mut table = Preview1DescriptorTable::from_entries(vec![
+            Some(Preview1DescriptorEntry::new(
+                Preview1Descriptor::Stdin {
+                    carry: Bytes::new(),
+                },
+                false,
+            )),
+            Some(Preview1DescriptorEntry::new(
+                Preview1Descriptor::Stdout,
+                false,
+            )),
+            Some(Preview1DescriptorEntry::new(
+                Preview1Descriptor::Stderr,
+                false,
+            )),
+            Some(Preview1DescriptorEntry::new(file, false)),
+        ]);
 
         assert_eq!(table.dup_to(3, 1, true), Ok(1));
         match table.get(1) {
@@ -17319,9 +17375,9 @@ mod tests {
             offset: 0,
             fdflags: P1_FDFLAG_NONBLOCK,
         };
-        let mut table = Preview1DescriptorTable {
-            entries: vec![Some(Preview1DescriptorEntry::new(file, false))],
-        };
+        let mut table = Preview1DescriptorTable::from_entries(vec![Some(
+            Preview1DescriptorEntry::new(file, false),
+        )]);
 
         assert_eq!(table.fdflags(0), Ok(P1_FDFLAG_NONBLOCK));
         assert_eq!(table.dup(0), Ok(1));
@@ -17350,9 +17406,9 @@ mod tests {
             options: WasixSocketOptions::default(),
             socket_type: WASIX_SOCK_TYPE_STREAM,
         });
-        let mut table = Preview1DescriptorTable {
-            entries: vec![Some(Preview1DescriptorEntry::new(socket, false))],
-        };
+        let mut table = Preview1DescriptorTable::from_entries(vec![Some(
+            Preview1DescriptorEntry::new(socket, false),
+        )]);
 
         assert_eq!(table.set_fdflags(0, P1_FDFLAG_NONBLOCK), p1::errno::SUCCESS);
         assert_eq!(table.fdflags(0), Ok(P1_FDFLAG_NONBLOCK));
@@ -17507,18 +17563,16 @@ mod tests {
             offset: 0,
             fdflags: 0,
         };
-        let table = Preview1DescriptorTable {
-            entries: vec![
-                Some(Preview1DescriptorEntry::new(
-                    Preview1Descriptor::Stdin {
-                        carry: Bytes::new(),
-                    },
-                    false,
-                )),
-                Some(Preview1DescriptorEntry::new(closed, true)),
-                Some(Preview1DescriptorEntry::new(retained, false)),
-            ],
-        };
+        let table = Preview1DescriptorTable::from_entries(vec![
+            Some(Preview1DescriptorEntry::new(
+                Preview1Descriptor::Stdin {
+                    carry: Bytes::new(),
+                },
+                false,
+            )),
+            Some(Preview1DescriptorEntry::new(closed, true)),
+            Some(Preview1DescriptorEntry::new(retained, false)),
+        ]);
 
         let exec_table = table.clone_for_exec();
 
@@ -17534,8 +17588,8 @@ mod tests {
     #[test]
     fn spawn_fd_snapshot_maps_directory_source_to_guest_path() {
         let snapshot = WasixSpawnFdSnapshot {
-            descriptors: Preview1DescriptorTable {
-                entries: vec![Some(Preview1DescriptorEntry::new(
+            descriptors: Preview1DescriptorTable::from_entries(vec![Some(
+                Preview1DescriptorEntry::new(
                     Preview1Descriptor::Preopen {
                         guest_name: "/workspace".into(),
                         descriptor: FsDescriptor {
@@ -17546,8 +17600,8 @@ mod tests {
                         },
                     },
                     false,
-                ))],
-            },
+                ),
+            )]),
             authority: ProcessAuthority::root(),
             cwd: None,
         };
@@ -17583,9 +17637,9 @@ mod tests {
             .expect("test preopen must be valid"),
         );
         let mut snapshot = WasixSpawnFdSnapshot {
-            descriptors: Preview1DescriptorTable {
-                entries: vec![Some(Preview1DescriptorEntry::new(preopen, false))],
-            },
+            descriptors: Preview1DescriptorTable::from_entries(vec![Some(
+                Preview1DescriptorEntry::new(preopen, false),
+            )]),
             authority,
             cwd: None,
         };
@@ -17604,8 +17658,8 @@ mod tests {
     #[test]
     fn spawn_fd_open_base_uses_child_cwd_for_relative_paths() {
         let snapshot = WasixSpawnFdSnapshot {
-            descriptors: Preview1DescriptorTable {
-                entries: vec![Some(Preview1DescriptorEntry::new(
+            descriptors: Preview1DescriptorTable::from_entries(vec![Some(
+                Preview1DescriptorEntry::new(
                     Preview1Descriptor::Preopen {
                         guest_name: "/root".into(),
                         descriptor: FsDescriptor {
@@ -17616,8 +17670,8 @@ mod tests {
                         },
                     },
                     false,
-                ))],
-            },
+                ),
+            )]),
             authority: ProcessAuthority::root(),
             cwd: Some(Preview1Cwd {
                 guest_name: "/workspace".into(),
@@ -17640,8 +17694,8 @@ mod tests {
     #[test]
     fn spawn_fd_open_base_resolves_absolute_guest_path_through_preopen() {
         let snapshot = WasixSpawnFdSnapshot {
-            descriptors: Preview1DescriptorTable {
-                entries: vec![Some(Preview1DescriptorEntry::new(
+            descriptors: Preview1DescriptorTable::from_entries(vec![Some(
+                Preview1DescriptorEntry::new(
                     Preview1Descriptor::Preopen {
                         guest_name: "/workspace".into(),
                         descriptor: FsDescriptor {
@@ -17652,8 +17706,8 @@ mod tests {
                         },
                     },
                     false,
-                ))],
-            },
+                ),
+            )]),
             authority: ProcessAuthority::root(),
             cwd: None,
         };
