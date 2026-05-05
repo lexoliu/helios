@@ -36,7 +36,6 @@ bitflags = "2.11.0"
 lru = { version = "0.16.3", default-features = false, features = ["hashbrown"] }
 rand_chacha = { version = "0.3.1", default-features = false }
 rand_core = { version = "0.6.4", default-features = false }
-smoltcp = { version = "0.13.0", default-features = false, features = ["alloc", "medium-ethernet", "multicast", "proto-ipv4", "proto-dhcpv4", "proto-dns", "socket-dhcpv4", "socket-dns", "socket-icmp", "socket-tcp", "socket-udp"] }
 smallvec = { version = "1.15.1", default-features = false }
 spin = { version = "0.9.8", default-features = false, features = ["mutex", "once", "spin_mutex"] }
 wasmparser = { version = "0.245.0", default-features = false, features = ["component-model"] }

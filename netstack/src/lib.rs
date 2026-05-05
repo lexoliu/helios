@@ -2,19 +2,43 @@
 
 extern crate alloc;
 
+mod checksum;
+mod congestion;
+mod packet;
+mod stack;
+mod tcp;
+mod types;
+
 use core::future::Future;
 
 use helios_hal::io::IoResult;
 use thiserror::Error;
+
+pub use checksum::{
+    internet_checksum, ipv4_checksum, tcpv4_checksum, tcpv6_checksum, udp_checksum,
+};
+pub use congestion::{
+    AckSample, BbrV3, CongestionControl, CongestionEvent, CongestionWindow, Cubic, NewReno,
+    PacingRate, RecoveryAction,
+};
+pub use packet::{
+    ArpOperation, ArpPacket, EthernetFrame, EthernetProtocol, Icmpv4Echo, Icmpv4Packet, Icmpv6Echo,
+    Icmpv6Packet, IpProtocol, Ipv4Packet, Ipv6Packet, TcpFlags, TcpPacket, UdpPacket,
+};
+pub use stack::{
+    DhcpLease, DnsQueryId, IcmpEchoKey, NeighborState, Route, RouteTable, SocketId, Stack,
+    StackConfig, StackEvent, StackInstant, TcpAccept, TcpConnectState, TcpReadState, UdpReceive,
+};
+pub use tcp::{TcpEndpoint, TcpSocket, TcpState};
+pub use types::{
+    EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr, Ipv6Scope,
+};
 
 /// Maximum Ethernet frame payload including the Ethernet header and FCS-free
 /// frame bytes used by virtio-net and common Ethernet NICs.
 pub const ETHERNET_FRAME_BYTES: usize = 1514;
 /// Conservative default poll budget for single-queue virtio-style devices.
 pub const DEFAULT_POLL_BUDGET: usize = 8;
-
-/// Ethernet MAC address carried by the network interface boundary.
-pub type EthernetAddress = [u8; 6];
 
 /// Hardware checksum offload capabilities exposed by a NIC.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -94,11 +118,7 @@ pub struct InterfaceCapabilities {
 }
 
 /// Caller-owned packet storage used at stack/NIC boundaries.
-///
-/// This type is intentionally fixed-capacity. Stack code may pool it, pass it
-/// between per-core queues, or lend it to NIC rings without growing heap state
-/// on the hot path.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PacketBuffer {
     bytes: [u8; ETHERNET_FRAME_BYTES],
     len: usize,
@@ -118,9 +138,19 @@ impl PacketBuffer {
         &self.bytes[..self.len]
     }
 
+    /// Returns mutable initialized frame bytes.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.bytes[..self.len]
+    }
+
     /// Returns writable frame capacity for a NIC or protocol encoder.
     pub fn spare_capacity_mut(&mut self) -> &mut [u8] {
         &mut self.bytes[self.len..]
+    }
+
+    /// Returns full mutable frame storage for encoders that fill from offset zero.
+    pub fn storage_mut(&mut self) -> &mut [u8; ETHERNET_FRAME_BYTES] {
+        &mut self.bytes
     }
 
     /// Sets the initialized byte length after a caller has filled the buffer.
@@ -145,12 +175,6 @@ impl Default for PacketBuffer {
 }
 
 /// Multi-core aware network interface contract used by packet stacks.
-///
-/// The interface is intentionally packet-oriented: device drivers expose
-/// RX/TX frame movement and progress notification, while TCP/UDP policy lives
-/// behind a replaceable stack implementation. The API permits direct DMA and
-/// copy-based paths; the stack selects whichever path produces better measured
-/// throughput for the packet size, queue topology, and hardware offloads.
 pub trait NetworkInterface: Clone + Send + Sync + 'static {
     /// Returns the hardware MAC address programmed for this interface.
     fn mac_address(&self) -> EthernetAddress;
@@ -256,4 +280,16 @@ pub enum StackError {
     /// Protocol state was internally inconsistent.
     #[error("network stack state is inconsistent")]
     InconsistentState,
+    /// An incoming packet was malformed.
+    #[error("malformed network packet")]
+    MalformedPacket,
+    /// Outbound packet storage was exhausted.
+    #[error("network stack output queue is full")]
+    OutputQueueFull,
+    /// The requested socket is unknown.
+    #[error("unknown network socket")]
+    UnknownSocket,
+    /// No local address can route the requested destination.
+    #[error("network destination is unroutable")]
+    Unroutable,
 }

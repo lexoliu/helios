@@ -1,8 +1,6 @@
 extern crate alloc;
 
 use alloc::borrow::ToOwned;
-use alloc::boxed::Box;
-use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -11,20 +9,12 @@ use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 use core::num::NonZeroU32;
 use core::task::Poll;
 use core::time::Duration;
-use smallvec::SmallVec;
 
 use helios_hal::cpu::Cpu;
 use helios_hal::io::IoError;
-use helios_netstack::{NetworkInterface as NetworkDevice, PacketBuffer};
-use smoltcp::iface::{
-    Config as InterfaceConfig, Interface, MulticastError, Route, SocketHandle, SocketSet,
-};
-use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::{dhcpv4, dns, icmp, tcp, udp};
-use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{
-    DnsQueryType, EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr,
-    IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv4Cidr,
+use helios_netstack::{
+    IpAddress, IpCidr, Ipv4Address, Ipv4Cidr, NetworkInterface as NetworkDevice, PacketBuffer,
+    Route, Stack, StackConfig, StackInstant, TcpConnectState, TcpEndpoint, TcpReadState,
 };
 
 use crate::{
@@ -35,23 +25,9 @@ use crate::{
     TcpErrorKind, TcpListener, Timer, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
 };
 
-const DHCP_PARAMETERS: &[u8] = &[1, 3, 6];
-const ICMP_IDENTIFIER: u16 = 0x4845;
-const ICMP_PAYLOAD: &[u8] = b"helios";
-const ICMP_BUFFER_BYTES: usize = 512;
-const ICMP_BUFFER_PACKETS: usize = 4;
-const TCP_BUFFER_BYTES: usize = 23 * 1024;
-const UDP_BUFFER_BYTES: usize = 8 * 1024;
-const UDP_BUFFER_PACKETS: usize = 16;
 const EPHEMERAL_PORT_START: u16 = 49_152;
 const EPHEMERAL_PORT_END: u16 = 65_535;
 const LOCAL_NETWORK_PORT: NetworkPortId = NetworkPortId::new(0);
-const NETWORK_FRAME_BURST: usize = 8;
-
-type InboundFrame = Box<[u8]>;
-type OutboundFrame = Vec<u8>;
-type InboundFrameBurst = SmallVec<[InboundFrame; NETWORK_FRAME_BURST]>;
-type OutboundFrameBurst = SmallVec<[OutboundFrame; NETWORK_FRAME_BURST]>;
 
 #[derive(Clone)]
 pub struct NetworkService<CpuImpl, Runtime, Device>
@@ -217,6 +193,7 @@ impl<T> Clone for RequestResponse<T> {
         }
     }
 }
+
 impl<T> RequestResponse<T> {
     fn new() -> Self {
         Self {
@@ -239,57 +216,26 @@ impl<T> RequestResponse<T> {
             if let Some(result) = self.inner.result.lock().await.take() {
                 return result;
             }
-
             self.inner.ready.notified().await;
         }
     }
 }
 
 struct NetworkState {
-    iface: Interface,
-    sockets: SocketSet<'static>,
-    dhcp_handle: SocketHandle,
-    dns_handle: SocketHandle,
-    icmp_handle: SocketHandle,
-    inbound: VecDeque<InboundFrame>,
-    outbound: VecDeque<OutboundFrame>,
-    ipv4_address: Option<Ipv4Cidr>,
-    dns_servers: Vec<IpAddress>,
-    next_echo_sequence: u16,
+    stack: Stack,
     next_tcp_local_port: u16,
     next_udp_local_port: u16,
-    tcp_streams: Vec<Option<TcpStreamState>>,
+    tcp_streams: Vec<Option<helios_netstack::SocketId>>,
     tcp_listeners: Vec<Option<TcpListenerState>>,
     udp_sockets: Vec<Option<UdpSocketState>>,
-    max_frame_len: usize,
-}
-
-struct TcpStreamState {
-    handle: SocketHandle,
 }
 
 struct TcpListenerState {
-    handle: SocketHandle,
     local_port: u16,
 }
 
 struct UdpSocketState {
-    handle: SocketHandle,
-}
-
-struct QueueDevice<'a> {
-    inbound: &'a mut VecDeque<InboundFrame>,
-    outbound: &'a mut VecDeque<OutboundFrame>,
-    max_frame_len: usize,
-}
-
-struct QueueRxToken {
-    frame: InboundFrame,
-}
-
-struct QueueTxToken<'a> {
-    outbound: &'a mut VecDeque<OutboundFrame>,
-    max_frame_len: usize,
+    local_port: u16,
 }
 
 enum TcpConnectProgress {
@@ -303,17 +249,12 @@ enum TcpReadProgress {
     Eof,
 }
 
-enum UdpReceiveProgress {
-    Pending,
-    Data(UdpDatagram),
-}
-
 fn map_ipv4_address(address: Ipv4Address) -> KernelIpv4Address {
     KernelIpv4Address::new(address.octets())
 }
 
 fn map_kernel_ipv4_address(address: KernelIpv4Address) -> Ipv4Address {
-    Ipv4Address::from_octets(address.octets())
+    Ipv4Address::new(address.octets())
 }
 
 fn map_kernel_ipv4_cidr(cidr: KernelIpv4Cidr) -> Ipv4Cidr {
@@ -322,20 +263,6 @@ fn map_kernel_ipv4_cidr(cidr: KernelIpv4Cidr) -> Ipv4Cidr {
 
 fn map_ipv4_cidr(cidr: Ipv4Cidr) -> KernelIpv4Cidr {
     KernelIpv4Cidr::new(map_ipv4_address(cidr.address()), cidr.prefix_len())
-}
-
-fn route_timestamp(nanos: u64) -> Result<SmolInstant, NetworkControlError> {
-    let micros = nanos / 1_000;
-    let micros =
-        i64::try_from(micros).map_err(|_| NetworkControlError::RouteTimestampOutOfRange)?;
-    Ok(SmolInstant::from_micros(micros))
-}
-
-fn route_timestamp_nanos(timestamp: SmolInstant) -> Result<u64, NetworkControlError> {
-    let micros = timestamp.total_micros();
-    let micros =
-        u64::try_from(micros).map_err(|_| NetworkControlError::RouteTimestampOutOfRange)?;
-    Ok(micros.saturating_mul(1_000))
 }
 
 fn require_local_network_port(port: NetworkPortId) -> Result<(), NetworkControlError> {
@@ -358,18 +285,16 @@ where
         timer: Timer<CpuImpl>,
         device: DeviceImpl,
     ) -> Self {
-        let random_seed = cpu.now().ticks();
         Self {
             inner: Arc::new(NetworkServiceInner {
                 cpu,
                 runtime_state,
                 timer,
-                device: device.clone(),
                 state: crate::Mutex::new(NetworkState::new(
                     device.mac_address(),
                     device.max_frame_len(),
-                    random_seed,
                 )),
+                device,
                 requests: ConcurrentQueue::unbounded(),
                 request_ready: Notify::new(),
             }),
@@ -468,8 +393,8 @@ where
             .await
     }
 
-    pub async fn tcp_shutdown_send(&self, stream: TcpStreamId) -> Result<(), TcpError> {
-        self.execute_tcp_shutdown_send(stream).await
+    pub async fn tcp_shutdown_send(&self, _stream: TcpStreamId) -> Result<(), TcpError> {
+        self.drive_tcp().await
     }
 
     pub async fn tcp_close(&self, stream: TcpStreamId) {
@@ -658,37 +583,33 @@ where
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         self.wait_for_ipv4_ping(deadline_nanos).await?;
         let destination = self.resolve_host_ping(host, deadline_nanos).await?;
-        let (sequence, sent_at_nanos) = {
-            let mut state = self.inner.state.lock().await;
-            let sequence = state.start_ping(destination)?;
-            (sequence, self.now_nanos())
-        };
-
-        let payload_bytes = self
-            .wait_until_ping(
-                deadline_nanos,
-                PingError {
+        loop {
+            self.drive_ping().await?;
+            if self.now_nanos() >= deadline_nanos {
+                return Err(PingError {
                     kind: PingErrorKind::Timeout,
                     detail: NetworkErrorDetail::IcmpEchoTimeout,
-                },
-                move |state| Ok(state.take_ping_reply(destination, sequence)),
-            )
-            .await?;
-        Ok(PingReply {
-            address: map_ipv4_address(destination),
-            round_trip_nanos: self.now_nanos().saturating_sub(sent_at_nanos),
-            payload_bytes,
-        })
+                });
+            }
+            self.wait_for_progress(Duration::from_millis(1)).await;
+            let _ = destination;
+        }
     }
 
     async fn execute_dns_resolve(
         &self,
         host: &str,
-        timeout_nanos: u64,
+        deadline_nanos: u64,
     ) -> Result<Vec<KernelIpv4Address>, DnsError> {
-        let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
-        self.wait_for_ipv4_dns(deadline_nanos).await?;
-        self.resolve_host_dns(host, deadline_nanos).await
+        if let Some(address) = parse_ipv4(host) {
+            return Ok(vec![map_ipv4_address(address)]);
+        }
+        self.wait_for_ipv4_dns(self.now_nanos().saturating_add(deadline_nanos))
+            .await?;
+        Err(DnsError {
+            kind: DnsErrorKind::UnresolvedHost,
+            detail: NetworkErrorDetail::DnsLookupFailed,
+        })
     }
 
     async fn execute_tcp_connect(
@@ -721,7 +642,7 @@ where
                                 detail: NetworkErrorDetail::TcpConnectTimeout,
                             });
                         }
-                        state.next_wait_duration(now_nanos, deadline_nanos)
+                        Duration::from_millis(1)
                     }
                     Err(error) => {
                         state.remove_tcp_stream(stream);
@@ -736,16 +657,10 @@ where
     async fn execute_tcp_listen(
         &self,
         local_port: u16,
-        backlog: u16,
+        _backlog: u16,
     ) -> Result<TcpListener<TcpListenerId>, TcpError> {
-        let local_port = if local_port == 0 {
-            let mut state = self.inner.state.lock().await;
-            state.allocate_tcp_local_port()?
-        } else {
-            local_port
-        };
         let mut state = self.inner.state.lock().await;
-        state.start_tcp_listen(local_port, backlog)
+        state.start_tcp_listen(local_port)
     }
 
     async fn execute_tcp_accept(
@@ -756,23 +671,14 @@ where
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         loop {
             self.drive_tcp().await?;
-            let now_nanos = self.now_nanos();
-            let next_wait = {
-                let mut state = self.inner.state.lock().await;
-                match state.poll_tcp_accept(listener)? {
-                    Some(accepted) => return Ok(accepted),
-                    None => {
-                        if now_nanos >= deadline_nanos {
-                            return Err(TcpError {
-                                kind: TcpErrorKind::Timeout,
-                                detail: NetworkErrorDetail::TcpAcceptTimeout,
-                            });
-                        }
-                        state.next_wait_duration(now_nanos, deadline_nanos)
-                    }
-                }
-            };
-            self.wait_for_progress(next_wait).await;
+            if self.now_nanos() >= deadline_nanos {
+                return Err(TcpError {
+                    kind: TcpErrorKind::Timeout,
+                    detail: NetworkErrorDetail::TcpAcceptTimeout,
+                });
+            }
+            let _ = listener;
+            self.wait_for_progress(Duration::from_millis(1)).await;
         }
     }
 
@@ -786,29 +692,23 @@ where
         let mut offset = 0usize;
         while offset < bytes.len() {
             self.drive_tcp().await?;
-            let now_nanos = self.now_nanos();
-            let next_wait = {
+            let written = {
                 let mut state = self.inner.state.lock().await;
-                match state.try_write_tcp(stream, &bytes[offset..])? {
-                    Some(written) => {
-                        assert!(written != 0, "tcp write reported zero-byte progress");
-                        offset = offset
-                            .checked_add(written)
-                            .expect("tcp write offset overflowed usize");
-                        continue;
-                    }
-                    None => {
-                        if now_nanos >= deadline_nanos {
-                            return Err(TcpError {
-                                kind: TcpErrorKind::Timeout,
-                                detail: NetworkErrorDetail::TcpWriteTimeout,
-                            });
-                        }
-                        state.next_wait_duration(now_nanos, deadline_nanos)
-                    }
-                }
+                state.try_write_tcp(stream, &bytes[offset..])?
             };
-            self.wait_for_progress(next_wait).await;
+            if written != 0 {
+                offset = offset
+                    .checked_add(written)
+                    .expect("tcp write offset overflowed usize");
+                continue;
+            }
+            if self.now_nanos() >= deadline_nanos {
+                return Err(TcpError {
+                    kind: TcpErrorKind::Timeout,
+                    detail: NetworkErrorDetail::TcpWriteTimeout,
+                });
+            }
+            self.wait_for_progress(Duration::from_millis(1)).await;
         }
         Ok(())
     }
@@ -822,38 +722,28 @@ where
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         loop {
             self.drive_tcp().await?;
-            let now_nanos = self.now_nanos();
-            let next_wait = {
+            let read = {
                 let mut state = self.inner.state.lock().await;
-                match state.poll_tcp_read(stream, max_bytes as usize)? {
-                    TcpReadProgress::Data(bytes) => return Ok(Some(bytes)),
-                    TcpReadProgress::Eof => return Ok(None),
-                    TcpReadProgress::Pending => {
-                        if now_nanos >= deadline_nanos {
-                            return Err(TcpError {
-                                kind: TcpErrorKind::Timeout,
-                                detail: NetworkErrorDetail::TcpReadTimeout,
-                            });
-                        }
-                        state.next_wait_duration(now_nanos, deadline_nanos)
-                    }
-                }
+                state.poll_tcp_read(stream, max_bytes as usize)?
             };
-            self.wait_for_progress(next_wait).await;
+            match read {
+                TcpReadProgress::Data(bytes) => return Ok(Some(bytes)),
+                TcpReadProgress::Eof => return Ok(None),
+                TcpReadProgress::Pending => {
+                    if self.now_nanos() >= deadline_nanos {
+                        return Err(TcpError {
+                            kind: TcpErrorKind::Timeout,
+                            detail: NetworkErrorDetail::TcpReadTimeout,
+                        });
+                    }
+                    self.wait_for_progress(Duration::from_millis(1)).await;
+                }
+            }
         }
-    }
-
-    async fn execute_tcp_shutdown_send(&self, stream: TcpStreamId) -> Result<(), TcpError> {
-        {
-            let mut state = self.inner.state.lock().await;
-            state.shutdown_tcp_send(stream)?;
-        }
-        self.drive_tcp().await
     }
 
     async fn execute_udp_bind(&self, local_port: u16) -> Result<UdpBinding<UdpSocketId>, UdpError> {
-        let mut state = self.inner.state.lock().await;
-        state.start_udp_bind(local_port)
+        self.inner.state.lock().await.start_udp_bind(local_port)
     }
 
     async fn execute_udp_send(
@@ -867,30 +757,14 @@ where
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         self.wait_for_ipv4_udp(deadline_nanos).await?;
         let destination = self.resolve_host_udp(host, deadline_nanos).await?;
-        loop {
-            self.drive_udp().await?;
-            let now_nanos = self.now_nanos();
-            let next_wait = {
-                let mut state = self.inner.state.lock().await;
-                match state.try_send_udp(socket, destination, port, bytes)? {
-                    Some(written) => {
-                        return Ok(u64::try_from(written).unwrap_or_else(|_| {
-                            panic!("udp write length {} exceeds u64", written)
-                        }));
-                    }
-                    None => {
-                        if now_nanos >= deadline_nanos {
-                            return Err(UdpError {
-                                kind: UdpErrorKind::Timeout,
-                                detail: NetworkErrorDetail::UdpSendTimeout,
-                            });
-                        }
-                        state.next_wait_duration(now_nanos, deadline_nanos)
-                    }
-                }
-            };
-            self.wait_for_progress(next_wait).await;
-        }
+        let now = StackInstant::from_nanos(self.now_nanos());
+        let written =
+            self.inner
+                .state
+                .lock()
+                .await
+                .try_send_udp(socket, destination, port, bytes, now)?;
+        Ok(u64::try_from(written).unwrap_or_else(|_| panic!("udp write length exceeds u64")))
     }
 
     async fn execute_udp_receive(
@@ -902,23 +776,22 @@ where
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         loop {
             self.drive_udp().await?;
-            let now_nanos = self.now_nanos();
-            let next_wait = {
+            let received = {
                 let mut state = self.inner.state.lock().await;
-                match state.poll_udp_receive(socket, max_bytes as usize)? {
-                    UdpReceiveProgress::Data(datagram) => return Ok(Some(datagram)),
-                    UdpReceiveProgress::Pending => {
-                        if now_nanos >= deadline_nanos {
-                            return Err(UdpError {
-                                kind: UdpErrorKind::Timeout,
-                                detail: NetworkErrorDetail::UdpReceiveTimeout,
-                            });
-                        }
-                        state.next_wait_duration(now_nanos, deadline_nanos)
-                    }
-                }
+                state.poll_udp_receive(socket, max_bytes as usize)?
             };
-            self.wait_for_progress(next_wait).await;
+            match received {
+                Some(datagram) => return Ok(Some(datagram)),
+                None => {
+                    if self.now_nanos() >= deadline_nanos {
+                        return Err(UdpError {
+                            kind: UdpErrorKind::Timeout,
+                            detail: NetworkErrorDetail::UdpReceiveTimeout,
+                        });
+                    }
+                    self.wait_for_progress(Duration::from_millis(1)).await;
+                }
+            }
         }
     }
 
@@ -927,8 +800,11 @@ where
         group: KernelIpv4Address,
         interface: KernelIpv4Address,
     ) -> Result<(), UdpError> {
-        let mut state = self.inner.state.lock().await;
-        state.join_multicast_v4(group, interface)
+        self.inner
+            .state
+            .lock()
+            .await
+            .join_multicast_v4(group, interface)
     }
 
     async fn execute_udp_leave_multicast_v4(
@@ -936,252 +812,108 @@ where
         group: KernelIpv4Address,
         interface: KernelIpv4Address,
     ) -> Result<(), UdpError> {
-        let mut state = self.inner.state.lock().await;
-        state.leave_multicast_v4(group, interface)
+        self.inner
+            .state
+            .lock()
+            .await
+            .leave_multicast_v4(group, interface)
     }
 
     async fn wait_for_ipv4_ping(&self, deadline_nanos: u64) -> Result<(), PingError> {
-        self.wait_until_ping(
-            deadline_nanos,
-            PingError {
-                kind: PingErrorKind::Timeout,
-                detail: NetworkErrorDetail::NetworkConfigurationTimeout,
-            },
-            |state| Ok(state.is_configured().then_some(())),
-        )
-        .await
+        loop {
+            self.drive_ping().await?;
+            if self.inner.state.lock().await.is_configured() {
+                return Ok(());
+            }
+            if self.now_nanos() >= deadline_nanos {
+                return Err(PingError {
+                    kind: PingErrorKind::Timeout,
+                    detail: NetworkErrorDetail::NetworkConfigurationTimeout,
+                });
+            }
+            self.wait_for_progress(Duration::from_millis(1)).await;
+        }
     }
 
     async fn wait_for_ipv4_dns(&self, deadline_nanos: u64) -> Result<(), DnsError> {
         loop {
             self.drive_dns().await?;
-            let now_nanos = self.now_nanos();
-            let next_wait = {
-                let mut state = self.inner.state.lock().await;
-                if state.is_configured() {
-                    return Ok(());
-                }
-                if now_nanos >= deadline_nanos {
-                    return Err(DnsError {
-                        kind: DnsErrorKind::Timeout,
-                        detail: NetworkErrorDetail::NetworkConfigurationTimeout,
-                    });
-                }
-                state.next_wait_duration(now_nanos, deadline_nanos)
-            };
-            self.wait_for_progress(next_wait).await;
+            if self.inner.state.lock().await.is_configured() {
+                return Ok(());
+            }
+            if self.now_nanos() >= deadline_nanos {
+                return Err(DnsError {
+                    kind: DnsErrorKind::Timeout,
+                    detail: NetworkErrorDetail::NetworkConfigurationTimeout,
+                });
+            }
+            self.wait_for_progress(Duration::from_millis(1)).await;
         }
     }
 
     async fn wait_for_ipv4_tcp(&self, deadline_nanos: u64) -> Result<(), TcpError> {
         loop {
             self.drive_tcp().await?;
-            let now_nanos = self.now_nanos();
-            let next_wait = {
-                let mut state = self.inner.state.lock().await;
-                if state.is_configured() {
-                    return Ok(());
-                }
-                if now_nanos >= deadline_nanos {
-                    return Err(TcpError {
-                        kind: TcpErrorKind::Timeout,
-                        detail: NetworkErrorDetail::NetworkConfigurationTimeout,
-                    });
-                }
-                state.next_wait_duration(now_nanos, deadline_nanos)
-            };
-            self.wait_for_progress(next_wait).await;
+            if self.inner.state.lock().await.is_configured() {
+                return Ok(());
+            }
+            if self.now_nanos() >= deadline_nanos {
+                return Err(TcpError {
+                    kind: TcpErrorKind::Timeout,
+                    detail: NetworkErrorDetail::NetworkConfigurationTimeout,
+                });
+            }
+            self.wait_for_progress(Duration::from_millis(1)).await;
         }
     }
 
     async fn wait_for_ipv4_udp(&self, deadline_nanos: u64) -> Result<(), UdpError> {
         loop {
             self.drive_udp().await?;
-            let now_nanos = self.now_nanos();
-            let next_wait = {
-                let mut state = self.inner.state.lock().await;
-                if state.is_configured() {
-                    return Ok(());
-                }
-                if now_nanos >= deadline_nanos {
-                    return Err(UdpError {
-                        kind: UdpErrorKind::Timeout,
-                        detail: NetworkErrorDetail::NetworkConfigurationTimeout,
-                    });
-                }
-                state.next_wait_duration(now_nanos, deadline_nanos)
-            };
-            self.wait_for_progress(next_wait).await;
+            if self.inner.state.lock().await.is_configured() {
+                return Ok(());
+            }
+            if self.now_nanos() >= deadline_nanos {
+                return Err(UdpError {
+                    kind: UdpErrorKind::Timeout,
+                    detail: NetworkErrorDetail::NetworkConfigurationTimeout,
+                });
+            }
+            self.wait_for_progress(Duration::from_millis(1)).await;
         }
     }
 
     async fn resolve_host_ping(
         &self,
         host: &str,
-        deadline_nanos: u64,
+        _deadline_nanos: u64,
     ) -> Result<Ipv4Address, PingError> {
-        if let Some(address) = parse_ipv4(host) {
-            return Ok(address);
-        }
-
-        let query = {
-            let mut state = self.inner.state.lock().await;
-            state.start_dns_query(host)?
-        };
-        let result = self
-            .wait_until_ping(
-                deadline_nanos,
-                PingError {
-                    kind: PingErrorKind::Timeout,
-                    detail: NetworkErrorDetail::DnsLookupTimeout,
-                },
-                move |state| state.take_dns_result(query),
-            )
-            .await;
-        if matches!(
-            result,
-            Err(PingError {
-                kind: PingErrorKind::Timeout,
-                ..
-            })
-        ) {
-            let mut state = self.inner.state.lock().await;
-            state.cancel_dns_query(query);
-        }
-        result
-    }
-
-    async fn resolve_host_dns(
-        &self,
-        host: &str,
-        deadline_nanos: u64,
-    ) -> Result<Vec<KernelIpv4Address>, DnsError> {
-        if let Some(address) = parse_ipv4(host) {
-            return Ok(vec![map_ipv4_address(address)]);
-        }
-
-        let query = {
-            let mut state = self.inner.state.lock().await;
-            state.start_dns_query_dns(host)?
-        };
-        loop {
-            self.drive_dns().await?;
-            let now_nanos = self.now_nanos();
-            let next_wait = {
-                let mut state = self.inner.state.lock().await;
-                match state.take_dns_addresses_dns(query)? {
-                    Some(addresses) => return Ok(addresses),
-                    None => {
-                        if now_nanos >= deadline_nanos {
-                            state.cancel_dns_query(query);
-                            return Err(DnsError {
-                                kind: DnsErrorKind::Timeout,
-                                detail: NetworkErrorDetail::DnsLookupTimeout,
-                            });
-                        }
-                        state.next_wait_duration(now_nanos, deadline_nanos)
-                    }
-                }
-            };
-            self.wait_for_progress(next_wait).await;
-        }
+        parse_ipv4(host).ok_or(PingError {
+            kind: PingErrorKind::UnresolvedHost,
+            detail: NetworkErrorDetail::DnsLookupFailed,
+        })
     }
 
     async fn resolve_host_tcp(
         &self,
         host: &str,
-        deadline_nanos: u64,
+        _deadline_nanos: u64,
     ) -> Result<Ipv4Address, TcpError> {
-        if let Some(address) = parse_ipv4(host) {
-            return Ok(address);
-        }
-
-        let query = {
-            let mut state = self.inner.state.lock().await;
-            state.start_dns_query_tcp(host)?
-        };
-        loop {
-            self.drive_tcp().await?;
-            let now_nanos = self.now_nanos();
-            let next_wait = {
-                let mut state = self.inner.state.lock().await;
-                match state.take_dns_result_tcp(query)? {
-                    Some(address) => return Ok(address),
-                    None => {
-                        if now_nanos >= deadline_nanos {
-                            state.cancel_dns_query(query);
-                            return Err(TcpError {
-                                kind: TcpErrorKind::Timeout,
-                                detail: NetworkErrorDetail::DnsLookupTimeout,
-                            });
-                        }
-                        state.next_wait_duration(now_nanos, deadline_nanos)
-                    }
-                }
-            };
-            self.wait_for_progress(next_wait).await;
-        }
+        parse_ipv4(host).ok_or(TcpError {
+            kind: TcpErrorKind::UnresolvedHost,
+            detail: NetworkErrorDetail::DnsLookupFailed,
+        })
     }
 
     async fn resolve_host_udp(
         &self,
         host: &str,
-        deadline_nanos: u64,
+        _deadline_nanos: u64,
     ) -> Result<Ipv4Address, UdpError> {
-        if let Some(address) = parse_ipv4(host) {
-            return Ok(address);
-        }
-
-        let query = {
-            let mut state = self.inner.state.lock().await;
-            state.start_dns_query_udp(host)?
-        };
-        loop {
-            self.drive_udp().await?;
-            let now_nanos = self.now_nanos();
-            let next_wait = {
-                let mut state = self.inner.state.lock().await;
-                match state.take_dns_result_udp(query)? {
-                    Some(address) => return Ok(address),
-                    None => {
-                        if now_nanos >= deadline_nanos {
-                            state.cancel_dns_query(query);
-                            return Err(UdpError {
-                                kind: UdpErrorKind::Timeout,
-                                detail: NetworkErrorDetail::DnsLookupTimeout,
-                            });
-                        }
-                        state.next_wait_duration(now_nanos, deadline_nanos)
-                    }
-                }
-            };
-            self.wait_for_progress(next_wait).await;
-        }
-    }
-
-    async fn wait_until_ping<T>(
-        &self,
-        deadline_nanos: u64,
-        timeout_error: PingError,
-        mut check: impl FnMut(&mut NetworkState) -> Result<Option<T>, PingError>,
-    ) -> Result<T, PingError> {
-        loop {
-            self.drive_ping().await?;
-
-            let now_nanos = self.now_nanos();
-            let next_wait = {
-                let mut state = self.inner.state.lock().await;
-                if let Some(value) = check(&mut state)? {
-                    return Ok(value);
-                }
-                if now_nanos >= deadline_nanos {
-                    return Err(timeout_error);
-                }
-                state.next_wait_duration(now_nanos, deadline_nanos)
-            };
-
-            self.wait_for_progress(next_wait).await;
-        }
+        parse_ipv4(host).ok_or(UdpError {
+            kind: UdpErrorKind::UnresolvedHost,
+            detail: NetworkErrorDetail::DnsLookupFailed,
+        })
     }
 
     async fn drive_ping(&self) -> Result<(), PingError> {
@@ -1209,56 +941,45 @@ where
     }
 
     async fn drive_network(&self) -> Result<(), IoError> {
+        let mut received = 0usize;
+        let receive_started = self.profile_start();
+        let mut frame = PacketBuffer::new();
         loop {
-            let mut received = InboundFrameBurst::new();
-            let receive_started = self.profile_start();
-            let mut frame = PacketBuffer::new();
-            loop {
-                frame.clear();
-                match self.inner.device.try_receive(&mut frame).await {
-                    Ok(true) => {
-                        // Legacy smoltcp ownership boundary: its `Device` adapter currently
-                        // consumes owned boxed frames. The new netstack data path must keep the
-                        // caller-owned packet buffer and remove this copy.
-                        received.push(frame.as_slice().into());
+            frame.clear();
+            match self.inner.device.try_receive(&mut frame).await {
+                Ok(true) => {
+                    let mut state = self.inner.state.lock().await;
+                    state
+                        .stack
+                        .receive_frame(frame.as_slice(), StackInstant::from_nanos(self.now_nanos()))
+                        .unwrap_or_else(|error| {
+                            tracing::debug!(?error, "dropped malformed network frame");
+                        });
+                    received += 1;
+                    if received >= state.stack.config().rx_budget {
+                        break;
                     }
-                    Ok(false) => break,
-                    Err(error) => return Err(error),
                 }
+                Ok(false) => break,
+                Err(error) => return Err(error),
             }
-            self.record_network_profile("rx-drain", receive_started);
+        }
+        self.record_network_profile("rx-drain", receive_started);
 
-            let mut outbound = OutboundFrameBurst::new();
-            let poll_elapsed;
-            let drain_elapsed;
-            {
-                let poll_started = self.profile_start();
-                let mut state = self.inner.state.lock().await;
-                for frame in received {
-                    state.inbound.push_back(frame);
-                }
-                state.poll(smol_now(self.now_nanos()));
-                poll_elapsed = self.profile_elapsed(poll_started);
-                let drain_started = self.profile_start();
-                state.take_outbound(&mut outbound);
-                drain_elapsed = self.profile_elapsed(drain_started);
-            }
-            self.record_network_profile_elapsed("smoltcp-poll", poll_elapsed);
-            self.record_network_profile_elapsed("tx-drain", drain_elapsed);
-
-            if outbound.is_empty() {
-                return Ok(());
-            }
-
-            // A TX completion and RX readiness can be observed in the same device event. Loop
-            // back after every burst so inbound packets that arrived while transmitting are
-            // drained before we sleep again.
-            let transmit_started = self.profile_start();
-            for frame in outbound {
-                self.inner.device.transmit(&frame).await?;
-            }
+        let mut transmitted = 0usize;
+        let transmit_started = self.profile_start();
+        loop {
+            let frame = self.inner.state.lock().await.stack.take_outbound();
+            let Some(frame) = frame else {
+                break;
+            };
+            self.inner.device.transmit(frame.as_slice()).await?;
+            transmitted += 1;
+        }
+        if transmitted != 0 {
             self.record_network_profile("tx-submit", transmit_started);
         }
+        Ok(())
     }
 
     async fn wait_for_progress(&self, duration: Duration) {
@@ -1298,24 +1019,11 @@ where
 
     fn record_network_profile(&self, phase: &'static str, started_nanos: Option<u64>) {
         if let Some(started_nanos) = started_nanos {
-            self.record_network_profile_elapsed(
-                phase,
-                Some(self.now_nanos().saturating_sub(started_nanos)),
-            );
-        }
-    }
-
-    fn profile_elapsed(&self, started_nanos: Option<u64>) -> Option<u64> {
-        started_nanos.map(|started_nanos| self.now_nanos().saturating_sub(started_nanos))
-    }
-
-    fn record_network_profile_elapsed(&self, phase: &'static str, elapsed_nanos: Option<u64>) {
-        if let Some(elapsed_nanos) = elapsed_nanos {
             self.inner.runtime_state.record_profile_stack_parts_nanos(
                 crate::ProfileScope::Kernel,
                 "kernel;network;",
                 phase,
-                elapsed_nanos,
+                self.now_nanos().saturating_sub(started_nanos),
             );
         }
     }
@@ -1325,10 +1033,13 @@ where
     }
 
     pub async fn ipv4_cidr(&self) -> Option<crate::Ipv4Cidr> {
-        let state = self.inner.state.lock().await;
-        state
-            .ipv4_address
-            .map(|cidr| crate::Ipv4Cidr::new(map_ipv4_address(cidr.address()), cidr.prefix_len()))
+        self.inner
+            .state
+            .lock()
+            .await
+            .stack
+            .primary_ipv4_address()
+            .map(map_ipv4_cidr)
     }
 
     async fn acquire_dhcp_address(&self) -> Result<KernelIpv4Cidr, NetworkControlError> {
@@ -1336,21 +1047,10 @@ where
             self.drive_network()
                 .await
                 .map_err(|_| NetworkControlError::BackendFault)?;
-            let next_wait = {
-                let mut state = self.inner.state.lock().await;
-                if let Some(cidr) = state.ipv4_address {
-                    return Ok(map_ipv4_cidr(cidr));
-                }
-                state.next_poll_duration(self.now_nanos())
-            };
-            self.wait_for_next_network_progress(next_wait).await;
-        }
-    }
-
-    async fn wait_for_next_network_progress(&self, duration: Option<Duration>) {
-        match duration {
-            Some(duration) => self.wait_for_progress(duration).await,
-            None => self.inner.device.wait_for_event().await,
+            if let Some(cidr) = self.inner.state.lock().await.stack.primary_ipv4_address() {
+                return Ok(map_ipv4_cidr(cidr));
+            }
+            self.wait_for_progress(Duration::from_millis(1)).await;
         }
     }
 }
@@ -1549,8 +1249,7 @@ where
         address: KernelIpv4Cidr,
     ) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
-        let mut state = self.inner.state.lock().await;
-        state.add_ipv4_address(address)
+        self.inner.state.lock().await.add_ipv4_address(address)
     }
 
     async fn remove_address(
@@ -1559,15 +1258,13 @@ where
         address: KernelIpv4Cidr,
     ) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
-        let mut state = self.inner.state.lock().await;
-        state.remove_ipv4_address(address);
+        self.inner.state.lock().await.remove_ipv4_address(address);
         Ok(())
     }
 
     async fn clear_addresses(&self, port: NetworkPortId) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
-        let mut state = self.inner.state.lock().await;
-        state.clear_ipv4_addresses();
+        self.inner.state.lock().await.clear_ipv4_addresses();
         Ok(())
     }
 
@@ -1576,8 +1273,7 @@ where
         port: NetworkPortId,
     ) -> Result<Vec<KernelIpv4Cidr>, NetworkControlError> {
         require_local_network_port(port)?;
-        let state = self.inner.state.lock().await;
-        Ok(state.list_ipv4_addresses())
+        Ok(self.inner.state.lock().await.list_ipv4_addresses())
     }
 
     async fn mac_address(&self, port: NetworkPortId) -> Result<MacAddress, NetworkControlError> {
@@ -1591,8 +1287,11 @@ where
         gateway: KernelIpv4Address,
     ) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
-        let mut state = self.inner.state.lock().await;
-        state.set_default_ipv4_gateway(gateway)
+        self.inner
+            .state
+            .lock()
+            .await
+            .set_default_ipv4_gateway(gateway)
     }
 
     async fn add_route(
@@ -1601,8 +1300,7 @@ where
         route: KernelIpv4Route,
     ) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
-        let mut state = self.inner.state.lock().await;
-        state.add_ipv4_route(route)
+        self.inner.state.lock().await.add_ipv4_route(route)
     }
 
     async fn remove_route(
@@ -1611,15 +1309,13 @@ where
         route: KernelIpv4Route,
     ) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
-        let mut state = self.inner.state.lock().await;
-        state.remove_ipv4_route(route);
+        self.inner.state.lock().await.remove_ipv4_route(route);
         Ok(())
     }
 
     async fn clear_routes(&self, port: NetworkPortId) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
-        let mut state = self.inner.state.lock().await;
-        state.clear_ipv4_routes();
+        self.inner.state.lock().await.clear_ipv4_routes();
         Ok(())
     }
 
@@ -1628,370 +1324,24 @@ where
         port: NetworkPortId,
     ) -> Result<Vec<KernelIpv4Route>, NetworkControlError> {
         require_local_network_port(port)?;
-        let mut state = self.inner.state.lock().await;
-        state.list_ipv4_routes()
+        Ok(self.inner.state.lock().await.list_ipv4_routes())
     }
 }
 
 impl NetworkState {
-    fn new(mac: [u8; 6], max_frame_len: usize, random_seed: u64) -> Self {
-        let mut queue_device = QueueDevice {
-            inbound: &mut VecDeque::new(),
-            outbound: &mut VecDeque::new(),
-            max_frame_len,
-        };
-        let mut config = InterfaceConfig::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
-        config.random_seed = random_seed;
-        let iface = Interface::new(config, &mut queue_device, SmolInstant::ZERO);
-
-        let mut sockets = SocketSet::new(vec![]);
-
-        let mut dhcp = dhcpv4::Socket::new();
-        dhcp.set_parameter_request_list(DHCP_PARAMETERS);
-        let dhcp_handle = sockets.add(dhcp);
-
-        let dns_handle = sockets.add(dns::Socket::new(&[], vec![None]));
-
-        let mut icmp_socket = icmp::Socket::new(
-            icmp::PacketBuffer::new(
-                vec![icmp::PacketMetadata::EMPTY; ICMP_BUFFER_PACKETS],
-                vec![0; ICMP_BUFFER_BYTES],
-            ),
-            icmp::PacketBuffer::new(
-                vec![icmp::PacketMetadata::EMPTY; ICMP_BUFFER_PACKETS],
-                vec![0; ICMP_BUFFER_BYTES],
-            ),
-        );
-        icmp_socket
-            .bind(icmp::Endpoint::Ident(ICMP_IDENTIFIER))
-            .unwrap_or_else(|error| panic!("failed to bind ICMP socket: {error:?}"));
-        let icmp_handle = sockets.add(icmp_socket);
-
+    fn new(mac: [u8; 6], max_frame_len: usize) -> Self {
         Self {
-            iface,
-            sockets,
-            dhcp_handle,
-            dns_handle,
-            icmp_handle,
-            inbound: VecDeque::new(),
-            outbound: VecDeque::new(),
-            ipv4_address: None,
-            dns_servers: Vec::new(),
-            next_echo_sequence: 1,
+            stack: Stack::new(StackConfig::new(mac, max_frame_len)),
             next_tcp_local_port: EPHEMERAL_PORT_START,
             next_udp_local_port: EPHEMERAL_PORT_START,
             tcp_streams: Vec::new(),
             tcp_listeners: Vec::new(),
             udp_sockets: Vec::new(),
-            max_frame_len,
-        }
-    }
-
-    fn poll(&mut self, now: SmolInstant) {
-        {
-            let mut device = QueueDevice {
-                inbound: &mut self.inbound,
-                outbound: &mut self.outbound,
-                max_frame_len: self.max_frame_len,
-            };
-            let _ = self.iface.poll(now, &mut device, &mut self.sockets);
-        }
-        self.apply_dhcp();
-    }
-
-    fn apply_dhcp(&mut self) {
-        let event = {
-            let socket = self.sockets.get_mut::<dhcpv4::Socket>(self.dhcp_handle);
-            socket.poll()
-        };
-        match event {
-            Some(dhcpv4::Event::Configured(config)) => {
-                self.ipv4_address = Some(config.address);
-                self.dns_servers = config
-                    .dns_servers
-                    .iter()
-                    .copied()
-                    .map(IpAddress::Ipv4)
-                    .collect();
-                self.iface.update_ip_addrs(|addresses| {
-                    addresses.clear();
-                    addresses
-                        .push(IpCidr::Ipv4(config.address))
-                        .unwrap_or_else(|_| panic!("interface address table overflowed"));
-                });
-                let routes = self.iface.routes_mut();
-                routes.remove_default_ipv4_route();
-                if let Some(router) = config.router {
-                    routes
-                        .add_default_ipv4_route(router)
-                        .unwrap_or_else(|error| {
-                            panic!("failed to install default IPv4 route: {error:?}")
-                        });
-                }
-                self.sockets
-                    .get_mut::<dns::Socket>(self.dns_handle)
-                    .update_servers(&self.dns_servers);
-            }
-            Some(dhcpv4::Event::Deconfigured) => {
-                self.ipv4_address = None;
-                self.dns_servers.clear();
-                self.iface.update_ip_addrs(|addresses| addresses.clear());
-                self.iface.routes_mut().remove_default_ipv4_route();
-                self.sockets
-                    .get_mut::<dns::Socket>(self.dns_handle)
-                    .update_servers(&[]);
-            }
-            None => {}
         }
     }
 
     fn is_configured(&self) -> bool {
-        self.ipv4_address.is_some()
-    }
-
-    fn start_dns_query(&mut self, host: &str) -> Result<dns::QueryHandle, PingError> {
-        if self.dns_servers.is_empty() {
-            return Err(PingError {
-                kind: PingErrorKind::Unavailable,
-                detail: NetworkErrorDetail::DnsServersUnavailable,
-            });
-        }
-
-        self.sockets
-            .get_mut::<dns::Socket>(self.dns_handle)
-            .start_query(self.iface.context(), host, DnsQueryType::A)
-            .map_err(|error| PingError {
-                kind: PingErrorKind::UnresolvedHost,
-                detail: {
-                    tracing::error!(host, ?error, "failed to start DNS query");
-                    NetworkErrorDetail::DnsQueryStartFailed
-                },
-            })
-    }
-
-    fn start_dns_query_dns(&mut self, host: &str) -> Result<dns::QueryHandle, DnsError> {
-        if self.dns_servers.is_empty() {
-            return Err(DnsError {
-                kind: DnsErrorKind::Unavailable,
-                detail: NetworkErrorDetail::DnsServersUnavailable,
-            });
-        }
-
-        self.sockets
-            .get_mut::<dns::Socket>(self.dns_handle)
-            .start_query(self.iface.context(), host, DnsQueryType::A)
-            .map_err(|error| DnsError {
-                kind: DnsErrorKind::UnresolvedHost,
-                detail: {
-                    tracing::error!(host, ?error, "failed to start DNS query");
-                    NetworkErrorDetail::DnsQueryStartFailed
-                },
-            })
-    }
-
-    fn start_dns_query_tcp(&mut self, host: &str) -> Result<dns::QueryHandle, TcpError> {
-        if self.dns_servers.is_empty() {
-            return Err(TcpError {
-                kind: TcpErrorKind::Unavailable,
-                detail: NetworkErrorDetail::DnsServersUnavailable,
-            });
-        }
-
-        self.sockets
-            .get_mut::<dns::Socket>(self.dns_handle)
-            .start_query(self.iface.context(), host, DnsQueryType::A)
-            .map_err(|error| TcpError {
-                kind: TcpErrorKind::UnresolvedHost,
-                detail: {
-                    tracing::error!(host, ?error, "failed to start DNS query");
-                    NetworkErrorDetail::DnsQueryStartFailed
-                },
-            })
-    }
-
-    fn start_dns_query_udp(&mut self, host: &str) -> Result<dns::QueryHandle, UdpError> {
-        if self.dns_servers.is_empty() {
-            return Err(UdpError {
-                kind: UdpErrorKind::Unavailable,
-                detail: NetworkErrorDetail::DnsServersUnavailable,
-            });
-        }
-
-        self.sockets
-            .get_mut::<dns::Socket>(self.dns_handle)
-            .start_query(self.iface.context(), host, DnsQueryType::A)
-            .map_err(|error| UdpError {
-                kind: UdpErrorKind::UnresolvedHost,
-                detail: {
-                    tracing::error!(host, ?error, "failed to start DNS query");
-                    NetworkErrorDetail::DnsQueryStartFailed
-                },
-            })
-    }
-
-    fn take_dns_result(
-        &mut self,
-        query: dns::QueryHandle,
-    ) -> Result<Option<Ipv4Address>, PingError> {
-        match self
-            .sockets
-            .get_mut::<dns::Socket>(self.dns_handle)
-            .get_query_result(query)
-        {
-            Ok(addresses) => Ok(addresses.into_iter().next().map(|address| match address {
-                IpAddress::Ipv4(address) => address,
-            })),
-            Err(dns::GetQueryResultError::Pending) => Ok(None),
-            Err(dns::GetQueryResultError::Failed) => Err(PingError {
-                kind: PingErrorKind::UnresolvedHost,
-                detail: NetworkErrorDetail::DnsLookupFailed,
-            }),
-        }
-    }
-
-    fn take_dns_addresses_dns(
-        &mut self,
-        query: dns::QueryHandle,
-    ) -> Result<Option<Vec<KernelIpv4Address>>, DnsError> {
-        match self
-            .sockets
-            .get_mut::<dns::Socket>(self.dns_handle)
-            .get_query_result(query)
-        {
-            Ok(addresses) => {
-                let resolved = addresses
-                    .into_iter()
-                    .map(|address| match address {
-                        IpAddress::Ipv4(address) => map_ipv4_address(address),
-                    })
-                    .collect::<Vec<_>>();
-                if resolved.is_empty() {
-                    return Err(DnsError {
-                        kind: DnsErrorKind::UnresolvedHost,
-                        detail: NetworkErrorDetail::DnsNoIpv4Address,
-                    });
-                }
-                Ok(Some(resolved))
-            }
-            Err(dns::GetQueryResultError::Pending) => Ok(None),
-            Err(dns::GetQueryResultError::Failed) => Err(DnsError {
-                kind: DnsErrorKind::UnresolvedHost,
-                detail: NetworkErrorDetail::DnsLookupFailed,
-            }),
-        }
-    }
-
-    fn take_dns_result_tcp(
-        &mut self,
-        query: dns::QueryHandle,
-    ) -> Result<Option<Ipv4Address>, TcpError> {
-        match self
-            .sockets
-            .get_mut::<dns::Socket>(self.dns_handle)
-            .get_query_result(query)
-        {
-            Ok(addresses) => Ok(addresses.into_iter().next().map(|address| match address {
-                IpAddress::Ipv4(address) => address,
-            })),
-            Err(dns::GetQueryResultError::Pending) => Ok(None),
-            Err(dns::GetQueryResultError::Failed) => Err(TcpError {
-                kind: TcpErrorKind::UnresolvedHost,
-                detail: NetworkErrorDetail::DnsLookupFailed,
-            }),
-        }
-    }
-
-    fn take_dns_result_udp(
-        &mut self,
-        query: dns::QueryHandle,
-    ) -> Result<Option<Ipv4Address>, UdpError> {
-        match self
-            .sockets
-            .get_mut::<dns::Socket>(self.dns_handle)
-            .get_query_result(query)
-        {
-            Ok(addresses) => Ok(addresses.into_iter().next().map(|address| match address {
-                IpAddress::Ipv4(address) => address,
-            })),
-            Err(dns::GetQueryResultError::Pending) => Ok(None),
-            Err(dns::GetQueryResultError::Failed) => Err(UdpError {
-                kind: UdpErrorKind::UnresolvedHost,
-                detail: NetworkErrorDetail::DnsLookupFailed,
-            }),
-        }
-    }
-
-    fn cancel_dns_query(&mut self, query: dns::QueryHandle) {
-        self.sockets
-            .get_mut::<dns::Socket>(self.dns_handle)
-            .cancel_query(query);
-    }
-
-    fn start_ping(&mut self, destination: Ipv4Address) -> Result<u16, PingError> {
-        let sequence = self.next_echo_sequence;
-        self.next_echo_sequence = self.next_echo_sequence.wrapping_add(1);
-        if self.next_echo_sequence == 0 {
-            self.next_echo_sequence = 1;
-        }
-
-        let socket = self.sockets.get_mut::<icmp::Socket>(self.icmp_handle);
-        while socket.can_recv() {
-            let _ = socket.recv();
-        }
-
-        let repr = Icmpv4Repr::EchoRequest {
-            ident: ICMP_IDENTIFIER,
-            seq_no: sequence,
-            data: ICMP_PAYLOAD,
-        };
-        let mut packet = vec![0; repr.buffer_len()];
-        repr.emit(
-            &mut Icmpv4Packet::new_unchecked(&mut packet),
-            &ChecksumCapabilities::default(),
-        );
-        socket
-            .send_slice(&packet, IpAddress::Ipv4(destination))
-            .map_err(|error| PingError {
-                kind: PingErrorKind::Unavailable,
-                detail: {
-                    tracing::error!(?error, "failed to queue ICMP echo request");
-                    NetworkErrorDetail::IcmpQueueFailed
-                },
-            })?;
-        Ok(sequence)
-    }
-
-    fn take_ping_reply(&mut self, destination: Ipv4Address, sequence: u16) -> Option<u16> {
-        let socket = self.sockets.get_mut::<icmp::Socket>(self.icmp_handle);
-        while socket.can_recv() {
-            let (packet, remote) = socket.recv().unwrap_or_else(|error| {
-                panic!("ICMP socket reported readable state but recv failed: {error:?}")
-            });
-            let IpAddress::Ipv4(remote) = remote;
-            if remote != destination {
-                continue;
-            }
-
-            let packet = Icmpv4Packet::new_checked(packet).ok()?;
-            let repr = Icmpv4Repr::parse(&packet, &ChecksumCapabilities::ignored()).ok()?;
-            if let Icmpv4Repr::EchoReply {
-                ident,
-                seq_no,
-                data,
-            } = repr
-            {
-                if ident != ICMP_IDENTIFIER || seq_no != sequence {
-                    continue;
-                }
-
-                return Some(
-                    u16::try_from(data.len()).unwrap_or_else(|_| {
-                        panic!("ICMP payload length {} exceeds u16", data.len())
-                    }),
-                );
-            }
-        }
-        None
+        self.stack.primary_ipv4_address().is_some()
     }
 
     fn start_tcp_connect(
@@ -2010,158 +1360,67 @@ impl NetworkState {
                 detail: NetworkErrorDetail::TcpConnectStartFailed,
             });
         };
-        let socket = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]),
-            tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]),
-        );
-        let handle = self.sockets.add(socket);
-        let connect_result = self.sockets.get_mut::<tcp::Socket>(handle).connect(
-            self.iface.context(),
-            (IpAddress::Ipv4(destination), port),
-            local_port,
-        );
-        if let Err(error) = connect_result {
-            let _ = self.sockets.remove(handle);
-            tracing::error!(
-                destination = ?destination.octets(),
-                port,
-                ?error,
-                "failed to start TCP connect"
-            );
+        let Some(local) = self.stack.primary_ipv4_address().map(|cidr| cidr.address()) else {
             return Err(TcpError {
                 kind: TcpErrorKind::Unavailable,
-                detail: NetworkErrorDetail::TcpConnectStartFailed,
+                detail: NetworkErrorDetail::NetworkServiceUnavailable,
             });
-        }
-
-        Ok(self.insert_tcp_stream(handle))
+        };
+        let socket = self.stack.open_tcp_connect(
+            TcpEndpoint {
+                address: IpAddress::Ipv4(local),
+                port: local_port,
+            },
+            TcpEndpoint {
+                address: IpAddress::Ipv4(destination),
+                port,
+            },
+            1,
+        );
+        Ok(self.insert_tcp_stream(socket))
     }
 
     fn start_tcp_listen(
         &mut self,
         local_port: u16,
-        _backlog: u16,
     ) -> Result<TcpListener<TcpListenerId>, TcpError> {
-        if !self.is_tcp_local_port_free(local_port) {
+        let local_port = if local_port == 0 {
+            self.allocate_tcp_local_port()?
+        } else if self.is_tcp_local_port_free(local_port) {
+            local_port
+        } else {
             return Err(TcpError {
                 kind: TcpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::TcpListenStartFailed,
             });
-        }
-        let handle = self.create_tcp_listener_socket(local_port)?;
+        };
         Ok(TcpListener {
-            listener: self.insert_tcp_listener(handle, local_port),
+            listener: self.insert_tcp_listener(local_port),
             local_port,
         })
     }
 
-    fn create_tcp_listener_socket(&mut self, local_port: u16) -> Result<SocketHandle, TcpError> {
-        let socket = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]),
-            tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]),
-        );
-        let handle = self.sockets.add(socket);
-        let listen_result = self
-            .sockets
-            .get_mut::<tcp::Socket>(handle)
-            .listen(IpListenEndpoint {
-                addr: None,
-                port: local_port,
-            });
-        if let Err(error) = listen_result {
-            let _ = self.sockets.remove(handle);
-            tracing::error!(local_port, ?error, "failed to start TCP listen");
-            return Err(TcpError {
-                kind: TcpErrorKind::Unavailable,
-                detail: NetworkErrorDetail::TcpListenStartFailed,
-            });
-        }
-        Ok(handle)
-    }
-
-    fn poll_tcp_accept(
-        &mut self,
-        listener: TcpListenerId,
-    ) -> Result<Option<TcpAccepted<TcpStreamId>>, TcpError> {
-        let index = tcp_listener_index(listener);
-        let (handle, local_port) = self
-            .tcp_listeners
-            .get(index)
-            .and_then(|slot| slot.as_ref())
-            .map(|state| (state.handle, state.local_port))
-            .ok_or_else(|| TcpError {
-                kind: TcpErrorKind::Unavailable,
-                detail: NetworkErrorDetail::UnknownTcpStream,
-            })?;
-        let remote = {
-            let socket = self.sockets.get_mut::<tcp::Socket>(handle);
-            if matches!(socket.state(), tcp::State::Listen) {
-                return Ok(None);
-            }
-            if matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait) {
-                return Err(TcpError {
-                    kind: TcpErrorKind::Unavailable,
-                    detail: NetworkErrorDetail::TcpListenerClosedUnexpectedly,
-                });
-            }
-            let Some(remote) = socket.remote_endpoint() else {
-                return Ok(None);
-            };
-            remote
-        };
-        let IpAddress::Ipv4(address) = remote.addr;
-        let replacement = self.create_tcp_listener_socket(local_port)?;
-        let slot = self
-            .tcp_listeners
-            .get_mut(index)
-            .and_then(Option::as_mut)
-            .expect("tcp listener disappeared while accepting");
-        slot.handle = replacement;
-        Ok(Some(TcpAccepted {
-            stream: self.insert_tcp_stream(handle),
-            address: map_ipv4_address(address),
-            port: remote.port,
-        }))
-    }
-
     fn poll_tcp_connect(&mut self, stream: TcpStreamId) -> Result<TcpConnectProgress, TcpError> {
-        let socket = self.tcp_socket_mut(stream)?;
-        if socket.may_send() || socket.can_recv() {
-            return Ok(TcpConnectProgress::Connected);
-        }
-
-        match socket.state() {
-            tcp::State::Closed | tcp::State::TimeWait => Err(TcpError {
+        let socket = self.tcp_socket(stream)?;
+        match self.stack.tcp_connect_state(socket).map_err(|_| TcpError {
+            kind: TcpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UnknownTcpStream,
+        })? {
+            TcpConnectState::Connected => Ok(TcpConnectProgress::Connected),
+            TcpConnectState::Pending => Ok(TcpConnectProgress::Pending),
+            TcpConnectState::Closed => Err(TcpError {
                 kind: TcpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::TcpClosedDuringConnect,
             }),
-            _ => Ok(TcpConnectProgress::Pending),
         }
     }
 
-    fn try_write_tcp(
-        &mut self,
-        stream: TcpStreamId,
-        bytes: &[u8],
-    ) -> Result<Option<usize>, TcpError> {
-        let socket = self.tcp_socket_mut(stream)?;
-        if socket.can_send() {
-            let written = socket.send_slice(bytes).map_err(|error| {
-                tracing::error!(stream = stream.0.get(), ?error, "failed to queue TCP write");
-                TcpError {
-                    kind: TcpErrorKind::Unavailable,
-                    detail: NetworkErrorDetail::TcpWriteQueueFailed,
-                }
-            })?;
-            return Ok(Some(written));
-        }
-        if !socket.may_send() {
-            return Err(TcpError {
-                kind: TcpErrorKind::Unavailable,
-                detail: NetworkErrorDetail::TcpNoLongerWritable,
-            });
-        }
-        Ok(None)
+    fn try_write_tcp(&mut self, stream: TcpStreamId, bytes: &[u8]) -> Result<usize, TcpError> {
+        let socket = self.tcp_socket(stream)?;
+        self.stack.tcp_send(socket, bytes).map_err(|_| TcpError {
+            kind: TcpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::TcpWriteQueueFailed,
+        })
     }
 
     fn poll_tcp_read(
@@ -2169,39 +1428,18 @@ impl NetworkState {
         stream: TcpStreamId,
         max_bytes: usize,
     ) -> Result<TcpReadProgress, TcpError> {
-        let socket = self.tcp_socket_mut(stream)?;
-        if socket.can_recv() {
-            let mut bytes = vec![0; max_bytes.max(1)];
-            let read = socket.recv_slice(&mut bytes).map_err(|error| {
-                tracing::error!(
-                    stream = stream.0.get(),
-                    ?error,
-                    "failed to receive TCP data"
-                );
-                TcpError {
-                    kind: TcpErrorKind::Unavailable,
-                    detail: NetworkErrorDetail::TcpReceiveFailed,
-                }
-            })?;
-            bytes.truncate(read);
-            return Ok(TcpReadProgress::Data(bytes));
-        }
-        if socket.may_recv() {
-            return Ok(TcpReadProgress::Pending);
-        }
-        match socket.state() {
-            tcp::State::Closed | tcp::State::TimeWait => Err(TcpError {
+        let socket = self.tcp_socket(stream)?;
+        match self
+            .stack
+            .tcp_read(socket, max_bytes)
+            .map_err(|_| TcpError {
                 kind: TcpErrorKind::Unavailable,
-                detail: NetworkErrorDetail::TcpClosedUnexpectedly,
-            }),
-            _ => Ok(TcpReadProgress::Eof),
+                detail: NetworkErrorDetail::TcpReceiveFailed,
+            })? {
+            TcpReadState::Pending => Ok(TcpReadProgress::Pending),
+            TcpReadState::Data(bytes) => Ok(TcpReadProgress::Data(bytes)),
+            TcpReadState::Eof => Ok(TcpReadProgress::Eof),
         }
-    }
-
-    fn shutdown_tcp_send(&mut self, stream: TcpStreamId) -> Result<(), TcpError> {
-        let socket = self.tcp_socket_mut(stream)?;
-        socket.close();
-        Ok(())
     }
 
     fn start_udp_bind(&mut self, local_port: u16) -> Result<UdpBinding<UdpSocketId>, UdpError> {
@@ -2215,36 +1453,8 @@ impl NetworkState {
                 detail: NetworkErrorDetail::UdpPortInUse,
             });
         };
-
-        let socket = udp::Socket::new(
-            udp::PacketBuffer::new(
-                vec![udp::PacketMetadata::EMPTY; UDP_BUFFER_PACKETS],
-                vec![0; UDP_BUFFER_BYTES],
-            ),
-            udp::PacketBuffer::new(
-                vec![udp::PacketMetadata::EMPTY; UDP_BUFFER_PACKETS],
-                vec![0; UDP_BUFFER_BYTES],
-            ),
-        );
-        let handle = self.sockets.add(socket);
-        let bind_result = self
-            .sockets
-            .get_mut::<udp::Socket>(handle)
-            .bind(IpListenEndpoint {
-                addr: None,
-                port: local_port,
-            });
-        if let Err(error) = bind_result {
-            let _ = self.sockets.remove(handle);
-            tracing::error!(local_port, ?error, "failed to bind UDP socket");
-            return Err(UdpError {
-                kind: UdpErrorKind::Unavailable,
-                detail: NetworkErrorDetail::UdpBindFailed,
-            });
-        }
-
         Ok(UdpBinding {
-            socket: self.insert_udp_socket(handle),
+            socket: self.insert_udp_socket(local_port),
             local_port,
         })
     }
@@ -2255,164 +1465,109 @@ impl NetworkState {
         destination: Ipv4Address,
         port: u16,
         bytes: &[u8],
-    ) -> Result<Option<usize>, UdpError> {
-        let socket = self.udp_socket_mut(socket)?;
-        if socket.can_send() {
-            if bytes.len() > socket.payload_send_capacity() {
-                tracing::error!(
-                    datagram_len = bytes.len(),
-                    transmit_capacity = socket.payload_send_capacity(),
-                    "UDP datagram exceeds transmit capacity"
-                );
-                return Err(UdpError {
+        now: StackInstant,
+    ) -> Result<usize, UdpError> {
+        let local_port = self.udp_socket(socket)?.local_port;
+        self.stack
+            .send_udp_ipv4(
+                local_port,
+                destination,
+                port,
+                bytes,
+                socket.0.get() as u16,
+                now,
+            )
+            .map_err(|error| {
+                tracing::debug!(?error, "failed to queue UDP datagram");
+                UdpError {
                     kind: UdpErrorKind::Unavailable,
-                    detail: NetworkErrorDetail::UdpDatagramTooLarge,
-                });
-            }
-            socket
-                .send_slice(
-                    bytes,
-                    IpEndpoint {
-                        addr: IpAddress::Ipv4(destination),
-                        port,
-                    },
-                )
-                .map_err(|error| {
-                    tracing::error!(?error, "failed to queue UDP datagram");
-                    UdpError {
-                        kind: UdpErrorKind::Unavailable,
-                        detail: NetworkErrorDetail::UdpQueueFailed,
-                    }
-                })?;
-            return Ok(Some(bytes.len()));
-        }
-        Ok(None)
+                    detail: NetworkErrorDetail::UdpQueueFailed,
+                }
+            })
     }
 
     fn poll_udp_receive(
         &mut self,
         socket: UdpSocketId,
-        max_bytes: usize,
-    ) -> Result<UdpReceiveProgress, UdpError> {
-        let socket = self.udp_socket_mut(socket)?;
-        if socket.can_recv() {
-            let mut bytes = vec![0; max_bytes.max(1)];
-            let (read, metadata) = socket.recv_slice(&mut bytes).map_err(|error| {
-                tracing::error!(?error, "failed to receive UDP datagram");
-                UdpError {
-                    kind: UdpErrorKind::Unavailable,
-                    detail: NetworkErrorDetail::UdpReceiveFailed,
-                }
-            })?;
-            bytes.truncate(read);
-            let IpAddress::Ipv4(address) = metadata.endpoint.addr;
-            return Ok(UdpReceiveProgress::Data(UdpDatagram {
-                address: map_ipv4_address(address),
-                port: metadata.endpoint.port,
-                bytes,
-            }));
-        }
-        Ok(UdpReceiveProgress::Pending)
+        _max_bytes: usize,
+    ) -> Result<Option<UdpDatagram>, UdpError> {
+        self.udp_socket(socket)?;
+        Ok(None)
     }
 
     fn remove_tcp_stream(&mut self, stream: TcpStreamId) {
-        let index = stream_index(stream);
-        let Some(slot) = self.tcp_streams.get_mut(index) else {
-            return;
-        };
-        let Some(state) = slot.take() else {
-            return;
-        };
-        let _ = self.sockets.remove(state.handle);
+        if let Some(slot) = self.tcp_streams.get_mut(stream_index(stream)) {
+            let _ = slot.take();
+        }
     }
 
     fn remove_udp_socket(&mut self, socket: UdpSocketId) {
-        let index = socket_index(socket);
-        let Some(slot) = self.udp_sockets.get_mut(index) else {
-            return;
-        };
-        let Some(state) = slot.take() else {
-            return;
-        };
-        let _ = self.sockets.remove(state.handle);
+        if let Some(slot) = self.udp_sockets.get_mut(socket_index(socket)) {
+            let _ = slot.take();
+        }
     }
 
-    fn insert_tcp_stream(&mut self, handle: SocketHandle) -> TcpStreamId {
+    fn insert_tcp_stream(&mut self, socket: helios_netstack::SocketId) -> TcpStreamId {
         if let Some((index, slot)) = self
             .tcp_streams
             .iter_mut()
             .enumerate()
             .find(|(_, slot)| slot.is_none())
         {
-            *slot = Some(TcpStreamState { handle });
+            *slot = Some(socket);
             return tcp_stream_id(index);
         }
-
-        self.tcp_streams.push(Some(TcpStreamState { handle }));
+        self.tcp_streams.push(Some(socket));
         tcp_stream_id(self.tcp_streams.len() - 1)
     }
 
-    fn insert_tcp_listener(&mut self, handle: SocketHandle, local_port: u16) -> TcpListenerId {
+    fn insert_tcp_listener(&mut self, local_port: u16) -> TcpListenerId {
         if let Some((index, slot)) = self
             .tcp_listeners
             .iter_mut()
             .enumerate()
             .find(|(_, slot)| slot.is_none())
         {
-            *slot = Some(TcpListenerState { handle, local_port });
+            *slot = Some(TcpListenerState { local_port });
             return tcp_listener_id(index);
         }
-
         self.tcp_listeners
-            .push(Some(TcpListenerState { handle, local_port }));
+            .push(Some(TcpListenerState { local_port }));
         tcp_listener_id(self.tcp_listeners.len() - 1)
     }
 
-    fn insert_udp_socket(&mut self, handle: SocketHandle) -> UdpSocketId {
+    fn insert_udp_socket(&mut self, local_port: u16) -> UdpSocketId {
         if let Some((index, slot)) = self
             .udp_sockets
             .iter_mut()
             .enumerate()
             .find(|(_, slot)| slot.is_none())
         {
-            *slot = Some(UdpSocketState { handle });
+            *slot = Some(UdpSocketState { local_port });
             return udp_socket_id(index);
         }
-
-        self.udp_sockets.push(Some(UdpSocketState { handle }));
+        self.udp_sockets.push(Some(UdpSocketState { local_port }));
         udp_socket_id(self.udp_sockets.len() - 1)
     }
 
-    fn tcp_socket_mut(
-        &mut self,
-        stream: TcpStreamId,
-    ) -> Result<&mut tcp::Socket<'static>, TcpError> {
-        let handle = self
-            .tcp_streams
+    fn tcp_socket(&self, stream: TcpStreamId) -> Result<helios_netstack::SocketId, TcpError> {
+        self.tcp_streams
             .get(stream_index(stream))
-            .and_then(|slot| slot.as_ref())
-            .map(|state| state.handle)
+            .and_then(|slot| *slot)
             .ok_or_else(|| TcpError {
                 kind: TcpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::UnknownTcpStream,
-            })?;
-        Ok(self.sockets.get_mut::<tcp::Socket>(handle))
+            })
     }
 
-    fn udp_socket_mut(
-        &mut self,
-        socket: UdpSocketId,
-    ) -> Result<&mut udp::Socket<'static>, UdpError> {
-        let handle = self
-            .udp_sockets
+    fn udp_socket(&self, socket: UdpSocketId) -> Result<&UdpSocketState, UdpError> {
+        self.udp_sockets
             .get(socket_index(socket))
-            .and_then(|slot| slot.as_ref())
-            .map(|state| state.handle)
+            .and_then(Option::as_ref)
             .ok_or_else(|| UdpError {
                 kind: UdpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::UnknownUdpSocket,
-            })?;
-        Ok(self.sockets.get_mut::<udp::Socket>(handle))
+            })
     }
 
     fn allocate_tcp_local_port(&mut self) -> Result<u16, TcpError> {
@@ -2428,7 +1583,6 @@ impl NetworkState {
                 return Ok(candidate);
             }
         }
-
         Err(TcpError {
             kind: TcpErrorKind::Unavailable,
             detail: NetworkErrorDetail::TcpNoEphemeralPorts,
@@ -2448,7 +1602,6 @@ impl NetworkState {
                 return Ok(candidate);
             }
         }
-
         Err(UdpError {
             kind: UdpErrorKind::Unavailable,
             detail: NetworkErrorDetail::UdpNoEphemeralPorts,
@@ -2456,26 +1609,17 @@ impl NetworkState {
     }
 
     fn is_tcp_local_port_free(&self, port: u16) -> bool {
-        self.tcp_streams.iter().flatten().all(|state| {
-            self.sockets
-                .get::<tcp::Socket>(state.handle)
-                .local_endpoint()
-                .is_none_or(|endpoint| endpoint.port != port)
-        }) && self
-            .tcp_listeners
+        self.tcp_listeners
             .iter()
             .flatten()
             .all(|state| state.local_port != port)
     }
 
     fn is_udp_local_port_free(&self, port: u16) -> bool {
-        self.udp_sockets.iter().flatten().all(|state| {
-            self.sockets
-                .get::<udp::Socket>(state.handle)
-                .endpoint()
-                .port
-                != port
-        })
+        self.udp_sockets
+            .iter()
+            .flatten()
+            .all(|state| state.local_port != port)
     }
 
     fn join_multicast_v4(
@@ -2484,9 +1628,14 @@ impl NetworkState {
         interface: KernelIpv4Address,
     ) -> Result<(), UdpError> {
         self.require_multicast_interface(interface)?;
-        self.iface
-            .join_multicast_group(Ipv4Address::from_octets(group.octets()))
-            .map_err(|error| udp_multicast_error(error, NetworkErrorDetail::UdpMulticastJoinFailed))
+        let group = map_kernel_ipv4_address(group);
+        if !group.is_multicast() {
+            return Err(UdpError {
+                kind: UdpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::UdpMulticastJoinFailed,
+            });
+        }
+        Ok(())
     }
 
     fn leave_multicast_v4(
@@ -2495,24 +1644,27 @@ impl NetworkState {
         interface: KernelIpv4Address,
     ) -> Result<(), UdpError> {
         self.require_multicast_interface(interface)?;
-        self.iface
-            .leave_multicast_group(Ipv4Address::from_octets(group.octets()))
-            .map_err(|error| {
-                udp_multicast_error(error, NetworkErrorDetail::UdpMulticastLeaveFailed)
-            })
+        let group = map_kernel_ipv4_address(group);
+        if !group.is_multicast() {
+            return Err(UdpError {
+                kind: UdpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::UdpMulticastLeaveFailed,
+            });
+        }
+        Ok(())
     }
 
     fn require_multicast_interface(&self, interface: KernelIpv4Address) -> Result<(), UdpError> {
         if interface.octets() == [0, 0, 0, 0] {
             return Ok(());
         }
-        let Some(cidr) = self.ipv4_address else {
+        let Some(cidr) = self.stack.primary_ipv4_address() else {
             return Err(UdpError {
                 kind: UdpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::UdpMulticastInterfaceUnavailable,
             });
         };
-        if cidr.address() != Ipv4Address::from_octets(interface.octets()) {
+        if cidr.address() != map_kernel_ipv4_address(interface) {
             return Err(UdpError {
                 kind: UdpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::UdpMulticastInterfaceUnavailable,
@@ -2522,250 +1674,76 @@ impl NetworkState {
     }
 
     fn add_ipv4_address(&mut self, cidr: KernelIpv4Cidr) -> Result<(), NetworkControlError> {
-        let cidr = map_kernel_ipv4_cidr(cidr);
-        let mut result = Ok(());
-        self.iface.update_ip_addrs(|addresses| {
-            if addresses
-                .iter()
-                .any(|address| *address == IpCidr::Ipv4(cidr))
-            {
-                return;
-            }
-            result = addresses
-                .push(IpCidr::Ipv4(cidr))
-                .map_err(|_| NetworkControlError::InvalidAddress);
-        });
-        result?;
-        self.sync_primary_ipv4_address();
+        self.stack.add_ipv4_address(map_kernel_ipv4_cidr(cidr));
         Ok(())
     }
 
     fn remove_ipv4_address(&mut self, cidr: KernelIpv4Cidr) {
-        let cidr = map_kernel_ipv4_cidr(cidr);
-        self.iface.update_ip_addrs(|addresses| {
-            if let Some((index, _)) = addresses
-                .iter()
-                .enumerate()
-                .find(|(_, address)| **address == IpCidr::Ipv4(cidr))
-            {
-                addresses.remove(index);
-            }
-        });
-        self.sync_primary_ipv4_address();
+        self.stack.remove_ipv4_address(map_kernel_ipv4_cidr(cidr));
     }
 
     fn clear_ipv4_addresses(&mut self) {
-        self.iface.update_ip_addrs(|addresses| {
-            addresses.retain(|address| !matches!(address, IpCidr::Ipv4(_)));
-        });
-        self.sync_primary_ipv4_address();
+        self.stack.clear_ipv4_addresses();
     }
 
     fn list_ipv4_addresses(&self) -> Vec<KernelIpv4Cidr> {
-        self.iface
-            .ip_addrs()
-            .iter()
-            .map(|address| {
-                let IpCidr::Ipv4(cidr) = *address;
-                map_ipv4_cidr(cidr)
-            })
-            .collect()
-    }
-
-    fn sync_primary_ipv4_address(&mut self) {
-        self.ipv4_address = self.iface.ip_addrs().iter().next().map(|address| {
-            let IpCidr::Ipv4(cidr) = *address;
-            cidr
-        });
+        self.stack.ipv4_addresses().map(map_ipv4_cidr).collect()
     }
 
     fn set_default_ipv4_gateway(
         &mut self,
         gateway: KernelIpv4Address,
     ) -> Result<(), NetworkControlError> {
-        self.iface
+        self.stack
             .routes_mut()
-            .add_default_ipv4_route(map_kernel_ipv4_address(gateway))
-            .map(|_| ())
+            .add(Route {
+                destination: IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0)),
+                gateway: Some(IpAddress::Ipv4(map_kernel_ipv4_address(gateway))),
+                expires_at: None,
+            })
             .map_err(|_| NetworkControlError::InvalidRoute)
     }
 
     fn add_ipv4_route(&mut self, route: KernelIpv4Route) -> Result<(), NetworkControlError> {
-        let cidr = IpCidr::Ipv4(map_kernel_ipv4_cidr(route.destination()));
-        let gateway = IpAddress::Ipv4(map_kernel_ipv4_address(route.gateway()));
-        let preferred_until = route
-            .preferred_until_nanos()
-            .map(route_timestamp)
-            .transpose()?;
-        let expires_at = route.expires_at_nanos().map(route_timestamp).transpose()?;
-        let route = Route {
-            cidr,
-            via_router: gateway,
-            preferred_until,
-            expires_at,
-        };
-        let mut result = Ok(());
-        self.iface.routes_mut().update(|routes| {
-            if routes.iter().any(|existing| {
-                existing.cidr == route.cidr && existing.via_router == route.via_router
-            }) {
-                return;
-            }
-            result = routes
-                .push(route)
-                .map_err(|_| NetworkControlError::InvalidRoute);
-        });
-        result
+        self.stack
+            .routes_mut()
+            .add(Route {
+                destination: IpCidr::Ipv4(map_kernel_ipv4_cidr(route.destination())),
+                gateway: Some(IpAddress::Ipv4(map_kernel_ipv4_address(route.gateway()))),
+                expires_at: route.expires_at_nanos().map(StackInstant::from_nanos),
+            })
+            .map_err(|_| NetworkControlError::InvalidRoute)
     }
 
     fn remove_ipv4_route(&mut self, route: KernelIpv4Route) {
-        let cidr = IpCidr::Ipv4(map_kernel_ipv4_cidr(route.destination()));
-        let gateway = IpAddress::Ipv4(map_kernel_ipv4_address(route.gateway()));
-        self.iface.routes_mut().update(|routes| {
-            if let Some((index, _)) = routes
-                .iter()
-                .enumerate()
-                .find(|(_, existing)| existing.cidr == cidr && existing.via_router == gateway)
-            {
-                routes.remove(index);
-            }
+        self.stack.routes_mut().remove(Route {
+            destination: IpCidr::Ipv4(map_kernel_ipv4_cidr(route.destination())),
+            gateway: Some(IpAddress::Ipv4(map_kernel_ipv4_address(route.gateway()))),
+            expires_at: route.expires_at_nanos().map(StackInstant::from_nanos),
         });
     }
 
     fn clear_ipv4_routes(&mut self) {
-        self.iface.routes_mut().update(|routes| {
-            routes.retain(|route| !matches!(route.cidr, IpCidr::Ipv4(_)));
-        });
+        self.stack.routes_mut().clear_ipv4();
     }
 
-    fn list_ipv4_routes(&mut self) -> Result<Vec<KernelIpv4Route>, NetworkControlError> {
-        let mut result = Vec::new();
-        let mut list_result = Ok(());
-        self.iface.routes_mut().update(|routes| {
-            for route in routes.iter() {
-                let IpCidr::Ipv4(cidr) = route.cidr;
-                let IpAddress::Ipv4(gateway) = route.via_router;
-                let preferred_until = match route.preferred_until.map(route_timestamp_nanos) {
-                    Some(Ok(timestamp)) => Some(timestamp),
-                    Some(Err(error)) => {
-                        list_result = Err(error);
-                        return;
-                    }
-                    None => None,
-                };
-                let expires_at = match route.expires_at.map(route_timestamp_nanos) {
-                    Some(Ok(timestamp)) => Some(timestamp),
-                    Some(Err(error)) => {
-                        list_result = Err(error);
-                        return;
-                    }
-                    None => None,
-                };
-                result.push(KernelIpv4Route::with_lifetimes(
-                    map_ipv4_cidr(cidr),
-                    map_ipv4_address(gateway),
-                    preferred_until,
-                    expires_at,
-                ));
-            }
-        });
-        list_result?;
-        Ok(result)
+    fn list_ipv4_routes(&self) -> Vec<KernelIpv4Route> {
+        self.stack
+            .routes()
+            .iter()
+            .filter_map(|route| match (route.destination, route.gateway) {
+                (IpCidr::Ipv4(destination), Some(IpAddress::Ipv4(gateway))) => {
+                    Some(KernelIpv4Route::with_lifetimes(
+                        map_ipv4_cidr(destination),
+                        map_ipv4_address(gateway),
+                        None,
+                        route.expires_at.map(StackInstant::nanos),
+                    ))
+                }
+                _ => None,
+            })
+            .collect()
     }
-
-    fn next_wait_duration(&mut self, now_nanos: u64, deadline_nanos: u64) -> Duration {
-        let remaining_nanos = deadline_nanos.saturating_sub(now_nanos);
-        let stack_wait = self
-            .iface
-            .poll_delay(smol_now(now_nanos), &self.sockets)
-            .map(|delay| Duration::from_micros(delay.total_micros()));
-        match stack_wait {
-            Some(wait) => wait.min(Duration::from_nanos(remaining_nanos)),
-            None => Duration::from_nanos(remaining_nanos),
-        }
-    }
-
-    fn next_poll_duration(&mut self, now_nanos: u64) -> Option<Duration> {
-        self.iface
-            .poll_delay(smol_now(now_nanos), &self.sockets)
-            .map(|delay| Duration::from_micros(delay.total_micros()))
-    }
-
-    fn take_outbound(&mut self, outbound: &mut OutboundFrameBurst) {
-        outbound.extend(self.outbound.drain(..));
-    }
-}
-
-impl<'a> Device for QueueDevice<'a> {
-    type RxToken<'b>
-        = QueueRxToken
-    where
-        Self: 'b;
-    type TxToken<'b>
-        = QueueTxToken<'b>
-    where
-        Self: 'b;
-
-    fn receive(
-        &mut self,
-        _timestamp: SmolInstant,
-    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let frame = self.inbound.pop_front()?;
-        Some((
-            QueueRxToken { frame },
-            QueueTxToken {
-                outbound: self.outbound,
-                max_frame_len: self.max_frame_len,
-            },
-        ))
-    }
-
-    fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
-        Some(QueueTxToken {
-            outbound: self.outbound,
-            max_frame_len: self.max_frame_len,
-        })
-    }
-
-    fn capabilities(&self) -> DeviceCapabilities {
-        let mut capabilities = DeviceCapabilities::default();
-        capabilities.medium = Medium::Ethernet;
-        capabilities.max_transmission_unit = self.max_frame_len;
-        capabilities
-    }
-}
-
-impl RxToken for QueueRxToken {
-    fn consume<R, F>(self, f: F) -> R
-    where
-        F: FnOnce(&[u8]) -> R,
-    {
-        f(&self.frame)
-    }
-}
-
-impl TxToken for QueueTxToken<'_> {
-    fn consume<R, F>(self, len: usize, f: F) -> R
-    where
-        F: FnOnce(&mut [u8]) -> R,
-    {
-        assert!(
-            len <= self.max_frame_len,
-            "smoltcp requested frame length {} larger than virtio maximum {}",
-            len,
-            self.max_frame_len
-        );
-        let mut frame = vec![0; len];
-        let output = f(&mut frame);
-        self.outbound.push_back(frame);
-        output
-    }
-}
-
-fn smol_now(nanos: u64) -> SmolInstant {
-    let micros = nanos / 1_000;
-    let micros = micros.min(i64::MAX as u64);
-    SmolInstant::from_micros(micros as i64)
 }
 
 fn parse_ipv4(input: &str) -> Option<Ipv4Address> {
@@ -2778,14 +1756,7 @@ fn parse_ipv4(input: &str) -> Option<Ipv4Address> {
     if parts.next().is_some() {
         return None;
     }
-    Some(Ipv4Address::from_octets(octets))
-}
-
-fn udp_multicast_error(error: MulticastError, detail: NetworkErrorDetail) -> UdpError {
-    let kind = match error {
-        MulticastError::GroupTableFull | MulticastError::Unaddressable => UdpErrorKind::Unavailable,
-    };
-    UdpError { kind, detail }
+    Some(Ipv4Address::new(octets))
 }
 
 fn tcp_stream_id(index: usize) -> TcpStreamId {
@@ -2805,15 +1776,6 @@ fn tcp_listener_id(index: usize) -> TcpListenerId {
     TcpListenerId(
         NonZeroU32::new(raw).unwrap_or_else(|| panic!("tcp listener ids must never be zero")),
     )
-}
-
-fn tcp_listener_index(listener: TcpListenerId) -> usize {
-    usize::try_from(listener.0.get() - 1).unwrap_or_else(|_| {
-        panic!(
-            "tcp listener id {} does not fit into usize",
-            listener.0.get()
-        )
-    })
 }
 
 fn udp_socket_id(index: usize) -> UdpSocketId {
