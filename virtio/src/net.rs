@@ -41,6 +41,7 @@ struct NetState<T: VirtioTransport> {
 pub struct VirtioNetDevice<T: VirtioTransport> {
     transport: T,
     state: Mutex<NetState<T>>,
+    tx_gate: Mutex<()>,
     interrupts: Notify,
     mac_address: [u8; 6],
     max_frame_len: usize,
@@ -122,6 +123,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 tx_queue,
                 rx_buffers,
             }),
+            tx_gate: Mutex::new(()),
             interrupts: Notify::new(),
             mac_address,
             max_frame_len,
@@ -215,22 +217,29 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
 
         let header = VirtioNetHeader::default();
         let header_bytes = as_bytes(&header);
-        let mut state = self.state.lock().await;
-        let token = state
-            .tx_queue
-            .submit(&self.transport, &[header_bytes, frame], &mut [])?;
-        state.tx_queue.notify(&self.transport);
+        let _tx_turn = self.tx_gate.lock().await;
+        let token = {
+            let mut state = self.state.lock().await;
+            let token = state
+                .tx_queue
+                .submit(&self.transport, &[header_bytes, frame], &mut [])?;
+            state.tx_queue.notify(&self.transport);
+            token
+        };
 
         loop {
-            if let Some(completed) = state.tx_queue.pop_used() {
-                assert_eq!(completed, token, "virtio net TX completion token mismatch");
-                return Ok(());
-            }
-            for _ in 0..TX_COMPLETION_SPIN_POLLS {
-                core::hint::spin_loop();
+            {
+                let mut state = self.state.lock().await;
                 if let Some(completed) = state.tx_queue.pop_used() {
                     assert_eq!(completed, token, "virtio net TX completion token mismatch");
                     return Ok(());
+                }
+                for _ in 0..TX_COMPLETION_SPIN_POLLS {
+                    core::hint::spin_loop();
+                    if let Some(completed) = state.tx_queue.pop_used() {
+                        assert_eq!(completed, token, "virtio net TX completion token mismatch");
+                        return Ok(());
+                    }
                 }
             }
             wait().await;
