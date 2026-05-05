@@ -32,15 +32,19 @@ struct VirtioNetHeader {
     num_buffers: u16,
 }
 
-struct NetState<T: VirtioTransport> {
+struct NetRxState<T: VirtioTransport> {
     rx_queue: VirtQueue<T>,
-    tx_queue: VirtQueue<T>,
     rx_buffers: Box<[Option<Box<[u8]>>]>,
+}
+
+struct NetTxState<T: VirtioTransport> {
+    tx_queue: VirtQueue<T>,
 }
 
 pub struct VirtioNetDevice<T: VirtioTransport> {
     transport: T,
-    state: Mutex<NetState<T>>,
+    rx_state: Mutex<NetRxState<T>>,
+    tx_state: Mutex<NetTxState<T>>,
     tx_gate: Mutex<()>,
     interrupts: Notify,
     mac_address: [u8; 6],
@@ -118,11 +122,11 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
 
         Ok(Self {
             transport,
-            state: Mutex::new(NetState {
+            rx_state: Mutex::new(NetRxState {
                 rx_queue,
-                tx_queue,
                 rx_buffers,
             }),
+            tx_state: Mutex::new(NetTxState { tx_queue }),
             tx_gate: Mutex::new(()),
             interrupts: Notify::new(),
             mac_address,
@@ -154,7 +158,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     }
 
     pub async fn try_receive(&self) -> IoResult<Option<Box<[u8]>>> {
-        let mut state = self.state.lock().await;
+        let mut state = self.rx_state.lock().await;
         let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
             return Ok(None);
         };
@@ -175,7 +179,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     }
 
     pub async fn try_receive_into(&self, output: &mut [u8]) -> IoResult<Option<usize>> {
-        let mut state = self.state.lock().await;
+        let mut state = self.rx_state.lock().await;
         let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
             return Ok(None);
         };
@@ -219,7 +223,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let header_bytes = as_bytes(&header);
         let _tx_turn = self.tx_gate.lock().await;
         let token = {
-            let mut state = self.state.lock().await;
+            let mut state = self.tx_state.lock().await;
             let token = state
                 .tx_queue
                 .submit(&self.transport, &[header_bytes, frame], &mut [])?;
@@ -229,7 +233,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
 
         loop {
             {
-                let mut state = self.state.lock().await;
+                let mut state = self.tx_state.lock().await;
                 if let Some(completed) = state.tx_queue.pop_used() {
                     assert_eq!(completed, token, "virtio net TX completion token mismatch");
                     return Ok(());
@@ -251,7 +255,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     }
 
     fn repost_rx_buffer(
-        state: &mut NetState<T>,
+        state: &mut NetRxState<T>,
         transport: &T,
         mut buffer: Box<[u8]>,
     ) -> IoResult<()> {
