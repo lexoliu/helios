@@ -1897,7 +1897,11 @@ impl NetworkState {
 
     fn remove_tcp_stream(&mut self, stream: TcpStreamId) {
         if let Some(slot) = self.tcp_streams.get_mut(stream_index(stream)) {
-            let _ = slot.take();
+            if let Some(socket) = slot.take() {
+                self.stack
+                    .remove_tcp_socket(socket)
+                    .unwrap_or_else(|_| panic!("TCP stream referenced an unknown stack socket"));
+            }
         }
     }
 

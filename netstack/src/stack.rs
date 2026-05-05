@@ -19,6 +19,7 @@ pub const MAX_OUTBOUND_FRAMES: usize = 32;
 pub const MAX_STACK_EVENTS: usize = 64;
 pub const MAX_UDP_RX: usize = 64;
 pub const MAX_TCP_ACCEPT: usize = 64;
+pub const MAX_TCP_SOCKETS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StackInstant {
@@ -215,6 +216,48 @@ pub enum StackEvent {
 }
 
 #[derive(Clone, Debug)]
+struct TcpSocketSlab {
+    slots: Vec<Option<TcpSocket<BbrV3>>>,
+}
+
+impl TcpSocketSlab {
+    fn new() -> Self {
+        let mut slots = Vec::with_capacity(MAX_TCP_SOCKETS);
+        slots.resize_with(MAX_TCP_SOCKETS, || None);
+        Self { slots }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Option<TcpSocket<BbrV3>>> {
+        self.slots.iter()
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut Option<TcpSocket<BbrV3>>> {
+        self.slots.iter_mut()
+    }
+
+    fn get(&self, index: usize) -> Option<&Option<TcpSocket<BbrV3>>> {
+        self.slots.get(index)
+    }
+
+    fn get_mut(&mut self, index: usize) -> Option<&mut Option<TcpSocket<BbrV3>>> {
+        self.slots.get_mut(index)
+    }
+
+    fn insert(&mut self, socket: TcpSocket<BbrV3>) -> SocketId {
+        let Some((index, slot)) = self
+            .slots
+            .iter_mut()
+            .enumerate()
+            .find(|(_, slot)| slot.is_none())
+        else {
+            panic!("TCP socket slab is full");
+        };
+        *slot = Some(socket);
+        socket_id(index)
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Stack {
     config: StackConfig,
     routes: RouteTable,
@@ -225,7 +268,7 @@ pub struct Stack {
     events: Deque<StackEvent, MAX_STACK_EVENTS>,
     udp_rx: Deque<UdpReceive, MAX_UDP_RX>,
     tcp_accept: Deque<TcpAccept, MAX_TCP_ACCEPT>,
-    tcp: Vec<Option<TcpSocket<BbrV3>>>,
+    tcp: TcpSocketSlab,
 }
 
 impl Stack {
@@ -240,7 +283,7 @@ impl Stack {
             events: Deque::new(),
             udp_rx: Deque::new(),
             tcp_accept: Deque::new(),
-            tcp: Vec::new(),
+            tcp: TcpSocketSlab::new(),
         }
     }
 
@@ -542,6 +585,18 @@ impl Stack {
                 .unwrap_or_else(|_| panic!("TCP accept queue lost capacity while rotating"));
         }
         None
+    }
+
+    pub fn remove_tcp_socket(&mut self, socket: SocketId) -> Result<(), StackError> {
+        let slot = self
+            .tcp
+            .get_mut(socket_index(socket))
+            .ok_or(StackError::UnknownSocket)?;
+        if slot.take().is_none() {
+            return Err(StackError::UnknownSocket);
+        }
+        self.remove_tcp_accepts_for(socket);
+        Ok(())
     }
 
     pub fn tcp_send(&mut self, socket: SocketId, bytes: &[u8]) -> Result<usize, StackError> {
@@ -1290,17 +1345,7 @@ impl Stack {
     }
 
     fn insert_tcp(&mut self, socket: TcpSocket<BbrV3>) -> SocketId {
-        if let Some((index, slot)) = self
-            .tcp
-            .iter_mut()
-            .enumerate()
-            .find(|(_, slot)| slot.is_none())
-        {
-            *slot = Some(socket);
-            return socket_id(index);
-        }
-        self.tcp.push(Some(socket));
-        socket_id(self.tcp.len() - 1)
+        self.tcp.insert(socket)
     }
 
     fn tcp_socket(&self, id: SocketId) -> Result<&TcpSocket<BbrV3>, StackError> {
@@ -1315,6 +1360,21 @@ impl Stack {
             .get_mut(socket_index(id))
             .and_then(Option::as_mut)
             .ok_or(StackError::UnknownSocket)
+    }
+
+    fn remove_tcp_accepts_for(&mut self, socket: SocketId) {
+        let len = self.tcp_accept.len();
+        for _ in 0..len {
+            let accepted = self
+                .tcp_accept
+                .pop_front()
+                .expect("TCP accept queue length changed while pruning");
+            if accepted.socket != socket {
+                self.tcp_accept
+                    .push_back(accepted)
+                    .unwrap_or_else(|_| panic!("TCP accept queue lost capacity while pruning"));
+            }
+        }
     }
 }
 
@@ -1438,5 +1498,29 @@ mod tests {
                 port: 49152,
             }
         );
+    }
+
+    #[test]
+    fn tcp_socket_slab_reuses_removed_slot() {
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let first = stack.open_tcp_listen(TcpEndpoint {
+            address: IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+            port: 8000,
+        });
+        let second = stack.open_tcp_listen(TcpEndpoint {
+            address: IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+            port: 8001,
+        });
+
+        stack
+            .remove_tcp_socket(first)
+            .expect("allocated socket should be removable");
+        let reused = stack.open_tcp_listen(TcpEndpoint {
+            address: IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+            port: 8002,
+        });
+
+        assert_eq!(reused.raw(), first.raw());
+        assert_ne!(reused.raw(), second.raw());
     }
 }
