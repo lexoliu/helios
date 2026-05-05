@@ -739,13 +739,19 @@ where
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         loop {
             self.drive_tcp().await?;
+            let accepted = {
+                let mut state = self.inner.state.lock().await;
+                state.poll_tcp_accept(listener)?
+            };
+            if let Some(accepted) = accepted {
+                return Ok(accepted);
+            }
             if self.now_nanos() >= deadline_nanos {
                 return Err(TcpError {
                     kind: TcpErrorKind::Timeout,
                     detail: NetworkErrorDetail::TcpAcceptTimeout,
                 });
             }
-            let _ = listener;
             self.wait_for_progress(Duration::from_millis(1)).await;
         }
     }
@@ -1751,10 +1757,35 @@ impl NetworkState {
                 detail: NetworkErrorDetail::TcpListenStartFailed,
             });
         };
+        self.stack.open_tcp_listen(TcpEndpoint {
+            address: IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+            port: local_port,
+        });
         Ok(TcpListener {
             listener: self.insert_tcp_listener(local_port),
             local_port,
         })
+    }
+
+    fn poll_tcp_accept(
+        &mut self,
+        listener: TcpListenerId,
+    ) -> Result<Option<TcpAccepted<TcpStreamId>>, TcpError> {
+        let local_port = self.tcp_listener(listener)?.local_port;
+        loop {
+            let Some(accepted) = self.stack.take_tcp_accept(local_port) else {
+                return Ok(None);
+            };
+            let IpAddress::Ipv4(address) = accepted.remote.address else {
+                continue;
+            };
+            let stream = self.insert_tcp_stream(accepted.socket);
+            return Ok(Some(TcpAccepted {
+                stream,
+                address: map_ipv4_address(address),
+                port: accepted.remote.port,
+            }));
+        }
     }
 
     fn poll_tcp_connect(&mut self, stream: TcpStreamId) -> Result<TcpConnectProgress, TcpError> {
@@ -1926,6 +1957,16 @@ impl NetworkState {
             .ok_or_else(|| TcpError {
                 kind: TcpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::UnknownTcpStream,
+            })
+    }
+
+    fn tcp_listener(&self, listener: TcpListenerId) -> Result<&TcpListenerState, TcpError> {
+        self.tcp_listeners
+            .get(tcp_listener_index(listener))
+            .and_then(Option::as_ref)
+            .ok_or_else(|| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::TcpListenerClosedUnexpectedly,
             })
     }
 
@@ -2145,6 +2186,15 @@ fn tcp_listener_id(index: usize) -> TcpListenerId {
     TcpListenerId(
         NonZeroU32::new(raw).unwrap_or_else(|| panic!("tcp listener ids must never be zero")),
     )
+}
+
+fn tcp_listener_index(listener: TcpListenerId) -> usize {
+    usize::try_from(listener.0.get() - 1).unwrap_or_else(|_| {
+        panic!(
+            "tcp listener id {} does not fit into usize",
+            listener.0.get()
+        )
+    })
 }
 
 fn udp_socket_id(index: usize) -> UdpSocketId {

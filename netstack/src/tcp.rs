@@ -73,6 +73,7 @@ where
     bytes_in_flight: u32,
     delivered_bytes: u64,
     syn_queued: bool,
+    syn_ack_queued: bool,
     ack_pending: bool,
 }
 
@@ -96,6 +97,7 @@ where
             bytes_in_flight: 0,
             delivered_bytes: 0,
             syn_queued: false,
+            syn_ack_queued: false,
             ack_pending: false,
         }
     }
@@ -117,6 +119,23 @@ where
         socket.local = Some(local);
         socket.remote = Some(remote);
         socket.state = TcpState::SynSent;
+        socket.send_next = initial_sequence.wrapping_add(1);
+        socket.send_unacknowledged = initial_sequence;
+        socket
+    }
+
+    pub fn accept(
+        local: TcpEndpoint,
+        remote: TcpEndpoint,
+        receive_next: u32,
+        initial_sequence: u32,
+        congestion: C,
+    ) -> Self {
+        let mut socket = Self::closed(congestion);
+        socket.local = Some(local);
+        socket.remote = Some(remote);
+        socket.state = TcpState::SynReceived;
+        socket.receive_next = receive_next;
         socket.send_next = initial_sequence.wrapping_add(1);
         socket.send_unacknowledged = initial_sequence;
         socket
@@ -154,6 +173,22 @@ where
         })
     }
 
+    pub fn pending_syn_ack(&self) -> Option<TcpHeader> {
+        if self.state != TcpState::SynReceived || self.syn_ack_queued {
+            return None;
+        }
+        let local = self.local?;
+        let remote = self.remote?;
+        Some(TcpHeader {
+            source_port: local.port,
+            destination_port: remote.port,
+            sequence: self.send_unacknowledged,
+            acknowledgement: self.receive_next,
+            flags: TcpFlags::SYN.union(TcpFlags::ACK),
+            window_size: self.advertised_window,
+        })
+    }
+
     pub fn mark_syn_queued(&mut self, now_nanos: u64) {
         assert!(
             self.state == TcpState::SynSent,
@@ -161,6 +196,27 @@ where
         );
         let header = self.pending_syn().expect("SYN header disappeared");
         self.syn_queued = true;
+        self.bytes_in_flight = self.bytes_in_flight.saturating_add(1);
+        self.in_flight
+            .push_back(TcpInFlightSegment {
+                header,
+                payload: Bytes::new(),
+                sequence_len: 1,
+                sent_at_nanos: now_nanos,
+                retransmissions: 0,
+            })
+            .unwrap_or_else(|_| panic!("TCP in-flight queue is full"));
+        self.congestion
+            .on_packet_sent(1, self.bytes_in_flight, now_nanos);
+    }
+
+    pub fn mark_syn_ack_queued(&mut self, now_nanos: u64) {
+        assert!(
+            self.state == TcpState::SynReceived,
+            "SYN-ACK can only be queued for a half-open accepted socket"
+        );
+        let header = self.pending_syn_ack().expect("SYN-ACK header disappeared");
+        self.syn_ack_queued = true;
         self.bytes_in_flight = self.bytes_in_flight.saturating_add(1);
         self.in_flight
             .push_back(TcpInFlightSegment {
@@ -197,6 +253,23 @@ where
 
     pub const fn advertised_window(&self) -> u16 {
         self.advertised_window
+    }
+
+    pub fn is_listening_on(&self, address: IpAddress, port: u16) -> bool {
+        let Some(local) = self.local else {
+            return false;
+        };
+        self.state == TcpState::Listen
+            && local.port == port
+            && match (local.address, address) {
+                (IpAddress::Ipv4(local), IpAddress::Ipv4(address)) => {
+                    local.is_unspecified() || local == address
+                }
+                (IpAddress::Ipv6(local), IpAddress::Ipv6(address)) => {
+                    local.is_unspecified() || local == address
+                }
+                _ => false,
+            }
     }
 
     pub fn queue_send(&mut self, bytes: &[u8]) -> usize {
@@ -336,6 +409,28 @@ where
                     interval_nanos: 0,
                     now_nanos,
                     app_limited: false,
+                }))
+            }
+            TcpState::SynReceived if packet.flags.contains(TcpFlags::ACK) => {
+                if packet.acknowledgement != self.send_next {
+                    return None;
+                }
+                let acked = packet
+                    .acknowledgement
+                    .wrapping_sub(self.send_unacknowledged);
+                self.send_unacknowledged = packet.acknowledgement;
+                self.bytes_in_flight = self.bytes_in_flight.saturating_sub(acked);
+                self.discard_acked_segments(packet.acknowledgement);
+                self.delivered_bytes = self.delivered_bytes.saturating_add(u64::from(acked));
+                self.state = TcpState::Established;
+                Some(self.congestion.on_ack(AckSample {
+                    acked_bytes: acked,
+                    delivered_bytes: self.delivered_bytes,
+                    bytes_in_flight: self.bytes_in_flight,
+                    rtt_nanos: 0,
+                    interval_nanos: 0,
+                    now_nanos,
+                    app_limited: true,
                 }))
             }
             TcpState::Established => {

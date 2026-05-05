@@ -18,6 +18,7 @@ pub const MAX_NEIGHBORS: usize = 128;
 pub const MAX_OUTBOUND_FRAMES: usize = 32;
 pub const MAX_STACK_EVENTS: usize = 64;
 pub const MAX_UDP_RX: usize = 64;
+pub const MAX_TCP_ACCEPT: usize = 64;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StackInstant {
@@ -223,6 +224,7 @@ pub struct Stack {
     outbound: Deque<PacketBuffer, MAX_OUTBOUND_FRAMES>,
     events: Deque<StackEvent, MAX_STACK_EVENTS>,
     udp_rx: Deque<UdpReceive, MAX_UDP_RX>,
+    tcp_accept: Deque<TcpAccept, MAX_TCP_ACCEPT>,
     tcp: Vec<Option<TcpSocket<BbrV3>>>,
 }
 
@@ -237,6 +239,7 @@ impl Stack {
             outbound: Deque::new(),
             events: Deque::new(),
             udp_rx: Deque::new(),
+            tcp_accept: Deque::new(),
             tcp: Vec::new(),
         }
     }
@@ -392,6 +395,11 @@ impl Stack {
         self.insert_tcp(socket)
     }
 
+    pub fn open_tcp_listen(&mut self, local: TcpEndpoint) -> SocketId {
+        let socket = TcpSocket::listen(local, BbrV3::new(1460));
+        self.insert_tcp(socket)
+    }
+
     pub fn tcp_connect_state(&self, socket: SocketId) -> Result<TcpConnectState, StackError> {
         let socket = self.tcp_socket(socket)?;
         Ok(match socket.state() {
@@ -403,6 +411,8 @@ impl Stack {
 
     pub fn drive_tcp(&mut self, now: StackInstant) -> Result<(), StackError> {
         let mut pending_syn = ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader), 16>::new();
+        let mut pending_syn_ack =
+            ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader), 16>::new();
         let mut pending_ack = ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader), 16>::new();
         let mut pending_retransmit = ArrayVec::<(usize, TcpTransmitSegment), 16>::new();
         let mut pending_data = ArrayVec::<TcpTransmitSegment, 16>::new();
@@ -424,6 +434,11 @@ impl Stack {
                 pending_syn
                     .try_push((index, local, remote, header))
                     .unwrap_or_else(|_| panic!("TCP control transmit burst overflowed"));
+            }
+            if let Some(header) = socket.pending_syn_ack() {
+                pending_syn_ack
+                    .try_push((index, local, remote, header))
+                    .unwrap_or_else(|_| panic!("TCP SYN-ACK transmit burst overflowed"));
             }
             if let Some(header) = socket.pending_ack() {
                 pending_ack
@@ -451,6 +466,16 @@ impl Stack {
                     .and_then(Option::as_mut)
                     .expect("TCP socket disappeared while queuing SYN");
                 socket.mark_syn_queued(now.nanos());
+            }
+        }
+        for (index, local, remote, header) in pending_syn_ack {
+            if self.queue_tcp(local, remote, header, &[], index as u16, now)? {
+                let socket = self
+                    .tcp
+                    .get_mut(index)
+                    .and_then(Option::as_mut)
+                    .expect("TCP socket disappeared while queuing SYN-ACK");
+                socket.mark_syn_ack_queued(now.nanos());
             }
         }
         for (index, local, remote, header) in pending_ack {
@@ -494,6 +519,29 @@ impl Stack {
             )?;
         }
         Ok(())
+    }
+
+    pub fn take_tcp_accept(&mut self, local_port: u16) -> Option<TcpAccept> {
+        let len = self.tcp_accept.len();
+        for _ in 0..len {
+            let accepted = self
+                .tcp_accept
+                .pop_front()
+                .expect("TCP accept queue length changed while rotating");
+            let accepted_local_port = self
+                .tcp
+                .get(socket_index(accepted.socket))
+                .and_then(Option::as_ref)
+                .and_then(TcpSocket::local_endpoint)
+                .map(|endpoint| endpoint.port);
+            if accepted_local_port == Some(local_port) {
+                return Some(accepted);
+            }
+            self.tcp_accept
+                .push_back(accepted)
+                .unwrap_or_else(|_| panic!("TCP accept queue lost capacity while rotating"));
+        }
+        None
     }
 
     pub fn tcp_send(&mut self, socket: SocketId, bytes: &[u8]) -> Result<usize, StackError> {
@@ -1126,7 +1174,21 @@ impl Stack {
                         port: packet.source_port,
                     })
             {
+                let previous_state = socket.state();
                 socket.on_segment(packet, now.nanos());
+                if previous_state == crate::TcpState::SynReceived
+                    && socket.state() == crate::TcpState::Established
+                {
+                    self.tcp_accept
+                        .push_back(TcpAccept {
+                            socket: socket_id(index),
+                            remote: TcpEndpoint {
+                                address: source,
+                                port: packet.source_port,
+                            },
+                        })
+                        .unwrap_or_else(|_| panic!("TCP accept queue is full"));
+                }
                 if socket.state() == crate::TcpState::Established {
                     self.events
                         .push_back(StackEvent::TcpReadable {
@@ -1136,6 +1198,37 @@ impl Stack {
                 }
                 return Ok(());
             }
+        }
+        if packet.flags.contains(crate::TcpFlags::SYN)
+            && !packet.flags.contains(crate::TcpFlags::ACK)
+        {
+            let Some(_) = self
+                .tcp
+                .iter()
+                .flatten()
+                .find(|socket| socket.is_listening_on(destination, packet.destination_port))
+            else {
+                return Ok(());
+            };
+            let local = TcpEndpoint {
+                address: destination,
+                port: packet.destination_port,
+            };
+            let remote = TcpEndpoint {
+                address: source,
+                port: packet.source_port,
+            };
+            let initial_sequence = (now.nanos() as u32)
+                .wrapping_add(u32::from(packet.destination_port))
+                .wrapping_add(u32::from(packet.source_port));
+            let child = TcpSocket::accept(
+                local,
+                remote,
+                packet.sequence.wrapping_add(1),
+                initial_sequence,
+                BbrV3::new(1460),
+            );
+            self.insert_tcp(child);
         }
         Ok(())
     }
@@ -1238,4 +1331,112 @@ fn socket_index(socket: SocketId) -> usize {
 fn ipv6_multicast_mac(address: Ipv6Address) -> EthernetAddress {
     let octets = address.octets();
     [0x33, 0x33, octets[12], octets[13], octets[14], octets[15]]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TcpFlags;
+
+    const LOCAL_MAC: EthernetAddress = [0x02, 0, 0, 0, 0, 1];
+    const PEER_MAC: EthernetAddress = [0x02, 0, 0, 0, 0, 2];
+
+    fn tcp_segment(
+        source: Ipv4Address,
+        destination: Ipv4Address,
+        header: TcpHeader,
+    ) -> ([u8; 64], usize) {
+        let mut segment = [0u8; 64];
+        let len = TcpPacket::encode(
+            &mut segment,
+            IpAddress::Ipv4(source),
+            IpAddress::Ipv4(destination),
+            header,
+            &[],
+        )
+        .expect("test TCP segment should fit");
+        (segment, len)
+    }
+
+    #[test]
+    fn passive_open_queues_accepted_stream_after_handshake() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(peer),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        stack.open_tcp_listen(TcpEndpoint {
+            address: IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+            port: 8080,
+        });
+
+        let (syn, syn_len) = tcp_segment(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 49152,
+                destination_port: 8080,
+                sequence: 10,
+                acknowledgement: 0,
+                flags: TcpFlags::SYN,
+                window_size: u16::MAX,
+            },
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &syn[..syn_len],
+                StackInstant::from_nanos(1),
+            )
+            .expect("SYN should be accepted by listener");
+        stack
+            .drive_tcp(StackInstant::from_nanos(1))
+            .expect("SYN-ACK should be queued");
+
+        let frame = stack
+            .take_outbound()
+            .expect("SYN-ACK frame should be queued");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
+        let syn_ack = TcpPacket::parse(ipv4.payload).expect("TCP packet should parse");
+        assert!(syn_ack.flags.contains(TcpFlags::SYN.union(TcpFlags::ACK)));
+        assert_eq!(syn_ack.acknowledgement, 11);
+
+        let (ack, ack_len) = tcp_segment(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 49152,
+                destination_port: 8080,
+                sequence: 11,
+                acknowledgement: syn_ack.sequence.wrapping_add(1),
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &ack[..ack_len],
+                StackInstant::from_nanos(2),
+            )
+            .expect("final ACK should establish accepted socket");
+
+        let accepted = stack
+            .take_tcp_accept(8080)
+            .expect("accepted stream should be queued");
+        assert_eq!(
+            accepted.remote,
+            TcpEndpoint {
+                address: IpAddress::Ipv4(peer),
+                port: 49152,
+            }
+        );
+    }
 }
