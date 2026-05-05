@@ -405,6 +405,14 @@ impl Stack {
     }
 
     pub fn receive_frame(&mut self, frame: &[u8], now: StackInstant) -> Result<(), StackError> {
+        self.receive_frame_with_backpressure(frame, now).map(|_| ())
+    }
+
+    pub fn receive_frame_with_backpressure(
+        &mut self,
+        frame: &[u8],
+        now: StackInstant,
+    ) -> Result<bool, StackError> {
         let frame = EthernetFrame::parse(frame).ok_or(StackError::MalformedPacket)?;
         match frame.protocol {
             EthernetProtocol::Ipv4 => self.receive_ipv4(frame.payload, now),
@@ -981,7 +989,7 @@ impl Stack {
         source_mac: EthernetAddress,
         bytes: &[u8],
         now: StackInstant,
-    ) -> Result<(), StackError> {
+    ) -> Result<bool, StackError> {
         let packet = ArpPacket::parse(bytes).ok_or(StackError::MalformedPacket)?;
         self.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv4(packet.sender_protocol),
@@ -997,10 +1005,10 @@ impl Stack {
         {
             self.queue_arp_reply(packet.target_protocol, packet.sender_protocol, source_mac)?;
         }
-        Ok(())
+        Ok(false)
     }
 
-    fn receive_ipv4(&mut self, bytes: &[u8], now: StackInstant) -> Result<(), StackError> {
+    fn receive_ipv4(&mut self, bytes: &[u8], now: StackInstant) -> Result<bool, StackError> {
         let packet = Ipv4Packet::parse(bytes).ok_or(StackError::MalformedPacket)?;
         match packet.protocol {
             crate::IpProtocol::Tcp => self.receive_tcp(
@@ -1015,9 +1023,9 @@ impl Stack {
                     IpAddress::Ipv4(packet.destination),
                     packet.payload,
                 )?;
-                Ok(())
+                Ok(false)
             }
-            crate::IpProtocol::Icmp | crate::IpProtocol::Icmpv6 => Ok(()),
+            crate::IpProtocol::Icmp | crate::IpProtocol::Icmpv6 => Ok(false),
         }
     }
 
@@ -1026,7 +1034,7 @@ impl Stack {
         source_mac: EthernetAddress,
         bytes: &[u8],
         now: StackInstant,
-    ) -> Result<(), StackError> {
+    ) -> Result<bool, StackError> {
         let packet = Ipv6Packet::parse(bytes).ok_or(StackError::MalformedPacket)?;
         if !packet.source.is_unspecified() {
             self.learn_neighbor(NeighborEntry {
@@ -1049,10 +1057,10 @@ impl Stack {
                     IpAddress::Ipv6(packet.destination),
                     packet.payload,
                 )?;
-                Ok(())
+                Ok(false)
             }
             crate::IpProtocol::Icmpv6 => self.receive_icmpv6(source_mac, packet, now),
-            crate::IpProtocol::Icmp => Ok(()),
+            crate::IpProtocol::Icmp => Ok(false),
         }
     }
 
@@ -1262,7 +1270,7 @@ impl Stack {
         destination: IpAddress,
         bytes: &[u8],
         now: StackInstant,
-    ) -> Result<(), StackError> {
+    ) -> Result<bool, StackError> {
         let packet = crate::TcpPacket::parse(bytes).ok_or(StackError::MalformedPacket)?;
         for (index, socket) in self.tcp.iter_mut().enumerate() {
             let Some(socket) = socket else {
@@ -1307,7 +1315,7 @@ impl Stack {
                 if outcome.receive_backpressure {
                     return Err(StackError::ReceiveBackpressure);
                 }
-                return Ok(());
+                return Ok(socket.receive_backpressured());
             }
         }
         if packet.flags.contains(crate::TcpFlags::SYN)
@@ -1319,7 +1327,7 @@ impl Stack {
                 .flatten()
                 .find(|socket| socket.is_listening_on(destination, packet.destination_port))
             else {
-                return Ok(());
+                return Ok(false);
             };
             let local = TcpEndpoint {
                 address: destination,
@@ -1341,7 +1349,7 @@ impl Stack {
             );
             self.insert_tcp(child);
         }
-        Ok(())
+        Ok(false)
     }
 
     fn receive_icmpv6(
@@ -1349,11 +1357,11 @@ impl Stack {
         source_mac: EthernetAddress,
         packet: Ipv6Packet<'_>,
         now: StackInstant,
-    ) -> Result<(), StackError> {
+    ) -> Result<bool, StackError> {
         match Icmpv6Packet::parse(packet.payload).ok_or(StackError::MalformedPacket)? {
             Icmpv6Packet::NeighborSolicitation { target } => {
                 if packet.source.is_unspecified() {
-                    return Ok(());
+                    return Ok(false);
                 }
                 if self
                     .ipv6_addresses
@@ -1378,7 +1386,7 @@ impl Stack {
             }
             Icmpv6Packet::EchoRequest(_) | Icmpv6Packet::EchoReply(_) => {}
         }
-        Ok(())
+        Ok(false)
     }
 
     fn receive_udp(

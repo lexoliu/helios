@@ -1041,10 +1041,14 @@ where
             };
             let (result, receive_backpressured) = {
                 let mut state = self.inner.state.lock().await;
-                let result = state
-                    .stack
-                    .receive_frame(frame.as_ref(), StackInstant::from_nanos(self.now_nanos()));
-                (result, state.stack.receive_backpressured())
+                let result = state.stack.receive_frame_with_backpressure(
+                    frame.as_ref(),
+                    StackInstant::from_nanos(self.now_nanos()),
+                );
+                match result {
+                    Ok(receive_backpressured) => (Ok(()), receive_backpressured),
+                    Err(error) => (Err(error), false),
+                }
             };
             self.inner.device.repost_rx_frame(frame).await?;
             if let Err(error) = result {
