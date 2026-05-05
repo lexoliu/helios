@@ -629,7 +629,7 @@ where
         loop {
             self.drive_tcp().await?;
             let now_nanos = self.now_nanos();
-            let next_wait = {
+            {
                 let mut state = self.inner.state.lock().await;
                 match state.poll_tcp_connect(stream) {
                     Ok(TcpConnectProgress::Connected) => return Ok(stream),
@@ -641,7 +641,6 @@ where
                                 detail: NetworkErrorDetail::TcpConnectTimeout,
                             });
                         }
-                        NETWORK_PROGRESS_WAIT
                     }
                     Err(error) => {
                         state.remove_tcp_stream(stream);
@@ -649,7 +648,7 @@ where
                     }
                 }
             };
-            self.wait_for_progress(next_wait).await;
+            self.wait_for_tcp_progress(deadline_nanos).await;
         }
     }
 
@@ -683,7 +682,7 @@ where
                     detail: NetworkErrorDetail::TcpAcceptTimeout,
                 });
             }
-            self.wait_for_progress(NETWORK_PROGRESS_WAIT).await;
+            self.wait_for_tcp_progress(deadline_nanos).await;
         }
     }
 
@@ -709,7 +708,7 @@ where
                     detail: NetworkErrorDetail::TcpWriteTimeout,
                 });
             }
-            self.wait_for_progress(NETWORK_PROGRESS_WAIT).await;
+            self.wait_for_tcp_progress(deadline_nanos).await;
         }
         Ok(())
     }
@@ -737,7 +736,7 @@ where
                             detail: NetworkErrorDetail::TcpReadTimeout,
                         });
                     }
-                    self.wait_for_progress(NETWORK_PROGRESS_WAIT).await;
+                    self.wait_for_tcp_progress(deadline_nanos).await;
                 }
             }
         }
@@ -1143,6 +1142,31 @@ where
             Poll::Pending
         })
         .await;
+    }
+
+    async fn wait_for_tcp_progress(&self, operation_deadline_nanos: u64) {
+        let now_nanos = self.now_nanos();
+        if now_nanos >= operation_deadline_nanos {
+            return;
+        }
+        let next_tcp_deadline = self
+            .inner
+            .state
+            .lock()
+            .await
+            .stack
+            .next_tcp_deadline()
+            .map(StackInstant::nanos);
+        let next_deadline = next_tcp_deadline
+            .unwrap_or(operation_deadline_nanos)
+            .min(operation_deadline_nanos);
+        let timer_wait = Duration::from_nanos(next_deadline.saturating_sub(now_nanos));
+        let wait = if self.inner.device.capabilities().events.interrupts {
+            timer_wait
+        } else {
+            timer_wait.min(NETWORK_PROGRESS_WAIT)
+        };
+        self.wait_for_progress(wait).await;
     }
 
     fn now_nanos(&self) -> u64 {

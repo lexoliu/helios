@@ -10,13 +10,15 @@ use crate::{
 
 pub const MAX_TCP_RECEIVE_SEGMENTS: usize = 128;
 pub const MAX_TCP_QUEUED_SEGMENTS: usize = 32;
-const TCP_RECEIVE_SEGMENT_BYTES: usize = 1460;
+pub(crate) const TCP_RECEIVE_SEGMENT_BYTES: usize = 1460;
 const TCP_SMALL_PAYLOAD_ACK_BYTES: usize = TCP_RECEIVE_SEGMENT_BYTES / 2;
 const TCP_DELAYED_ACK_SEGMENTS: u8 = 2;
 const TCP_WINDOW_UPDATE_BYTES: u16 = (TCP_RECEIVE_SEGMENT_BYTES * 4) as u16;
 const TCP_RECEIVE_BACKPRESSURE_SEGMENTS: usize = MAX_TCP_RECEIVE_SEGMENTS - 4;
 pub const TCP_INITIAL_RTO_NANOS: u64 = 1_000_000_000;
 pub const TCP_MAX_RETRANSMISSIONS: u8 = 5;
+pub const TCP_DELAYED_ACK_NANOS: u64 = 40_000_000;
+pub const TCP_TIME_WAIT_NANOS: u64 = 60_000_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TcpEndpoint {
@@ -86,6 +88,8 @@ where
     syn_ack_queued: bool,
     fin_queued: bool,
     ack_pending: bool,
+    delayed_ack_deadline_nanos: Option<u64>,
+    time_wait_deadline_nanos: Option<u64>,
     unacked_receive_segments: u8,
     pending_window_update_bytes: u16,
 }
@@ -113,6 +117,8 @@ where
             syn_ack_queued: false,
             fin_queued: false,
             ack_pending: false,
+            delayed_ack_deadline_nanos: None,
+            time_wait_deadline_nanos: None,
             unacked_receive_segments: 0,
             pending_window_update_bytes: 0,
         }
@@ -265,6 +271,7 @@ where
 
     pub fn mark_ack_queued(&mut self) {
         self.ack_pending = false;
+        self.delayed_ack_deadline_nanos = None;
     }
 
     pub const fn advertised_window(&self) -> u16 {
@@ -373,6 +380,35 @@ where
         })
     }
 
+    pub fn expire_timers(&mut self, now_nanos: u64) {
+        if self
+            .delayed_ack_deadline_nanos
+            .is_some_and(|deadline| now_nanos >= deadline)
+        {
+            self.request_ack();
+        }
+        if self.state == TcpState::TimeWait
+            && self
+                .time_wait_deadline_nanos
+                .is_some_and(|deadline| now_nanos >= deadline)
+        {
+            self.state = TcpState::Closed;
+            self.time_wait_deadline_nanos = None;
+        }
+    }
+
+    pub fn next_deadline_nanos(&self) -> Option<u64> {
+        let rto_deadline = self.in_flight.front().map(|segment| {
+            segment
+                .sent_at_nanos
+                .saturating_add(rto_nanos(segment.retransmissions))
+        });
+        min_deadline(
+            min_deadline(rto_deadline, self.delayed_ack_deadline_nanos),
+            self.time_wait_deadline_nanos,
+        )
+    }
+
     fn take_data_segment(
         &mut self,
         local: TcpEndpoint,
@@ -411,6 +447,7 @@ where
             })
             .unwrap_or_else(|_| panic!("TCP in-flight queue is full"));
         self.ack_pending = false;
+        self.delayed_ack_deadline_nanos = None;
         Some(TcpTransmitSegment {
             local,
             remote,
@@ -582,25 +619,32 @@ where
                             .receive_next
                             .wrapping_add(u32::try_from(packet.payload.len()).unwrap_or(u32::MAX));
                         self.refresh_advertised_window();
-                        self.note_inbound_payload(packet.payload.len());
+                        self.note_inbound_payload(packet.payload.len(), now_nanos);
                     } else {
                         self.request_ack();
                     }
                 }
                 if packet.flags.contains(TcpFlags::FIN) {
                     self.receive_next = self.receive_next.wrapping_add(1);
-                    self.state = match self.state {
-                        TcpState::Established => TcpState::CloseWait,
-                        TcpState::FinWait1 => TcpState::Closing,
-                        TcpState::FinWait2 => TcpState::TimeWait,
-                        state => state,
-                    };
+                    match self.state {
+                        TcpState::Established => self.state = TcpState::CloseWait,
+                        TcpState::FinWait1 => self.state = TcpState::Closing,
+                        TcpState::FinWait2 => self.enter_time_wait(now_nanos),
+                        _ => {}
+                    }
                     self.request_ack();
                 }
                 TcpSegmentOutcome {
                     recovery: action,
                     receive_backpressure: false,
                 }
+            }
+            TcpState::TimeWait => {
+                if packet.flags.contains(TcpFlags::FIN) {
+                    self.enter_time_wait(now_nanos);
+                    self.request_ack();
+                }
+                TcpSegmentOutcome::default()
             }
             _ => TcpSegmentOutcome::default(),
         }
@@ -639,12 +683,12 @@ where
         self.discard_acked_segments(acknowledgement);
         self.delivered_bytes = self.delivered_bytes.saturating_add(u64::from(acked));
         if self.fin_queued && sequence_leq(self.send_next, acknowledgement) {
-            self.state = match self.state {
-                TcpState::FinWait1 => TcpState::FinWait2,
-                TcpState::Closing => TcpState::TimeWait,
-                TcpState::LastAck => TcpState::Closed,
-                state => state,
-            };
+            match self.state {
+                TcpState::FinWait1 => self.state = TcpState::FinWait2,
+                TcpState::Closing => self.enter_time_wait(now_nanos),
+                TcpState::LastAck => self.state = TcpState::Closed,
+                _ => {}
+            }
         }
         Some(self.congestion.on_ack(AckSample {
             acked_bytes: acked,
@@ -661,19 +705,27 @@ where
         self.advertised_window = receive_window_size(self.receive_queue.len());
     }
 
-    fn note_inbound_payload(&mut self, payload_len: usize) {
+    fn note_inbound_payload(&mut self, payload_len: usize, now_nanos: u64) {
         self.unacked_receive_segments = self.unacked_receive_segments.saturating_add(1);
         if self.unacked_receive_segments >= TCP_DELAYED_ACK_SEGMENTS
             || payload_len < TCP_SMALL_PAYLOAD_ACK_BYTES
         {
             self.request_ack();
+        } else if self.delayed_ack_deadline_nanos.is_none() {
+            self.delayed_ack_deadline_nanos = Some(now_nanos.saturating_add(TCP_DELAYED_ACK_NANOS));
         }
     }
 
     fn request_ack(&mut self) {
         self.ack_pending = true;
+        self.delayed_ack_deadline_nanos = None;
         self.unacked_receive_segments = 0;
         self.pending_window_update_bytes = 0;
+    }
+
+    fn enter_time_wait(&mut self, now_nanos: u64) {
+        self.state = TcpState::TimeWait;
+        self.time_wait_deadline_nanos = Some(now_nanos.saturating_add(TCP_TIME_WAIT_NANOS));
     }
 
     fn should_advertise_window_update(&mut self, previous_window: u16) -> bool {
@@ -707,6 +759,14 @@ fn sequence_leq(lhs: u32, rhs: u32) -> bool {
 fn rto_nanos(retransmissions: u8) -> u64 {
     let shift = retransmissions.min(6);
     TCP_INITIAL_RTO_NANOS.saturating_mul(1u64 << shift)
+}
+
+fn min_deadline(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
+    }
 }
 
 #[cfg(test)]
@@ -874,6 +934,53 @@ mod tests {
     }
 
     #[test]
+    fn time_wait_closes_after_deadline() {
+        let mut socket = established_socket();
+        socket.close_send();
+        let fin = socket
+            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 1)
+            .expect("active close must queue FIN");
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: fin.header.sequence + 1,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS + 2,
+        );
+        assert_eq!(socket.state(), TcpState::FinWait2);
+
+        let fin_received_at = TCP_INITIAL_RTO_NANOS + 3;
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: fin.header.sequence + 1,
+                flags: TcpFlags::ACK.union(TcpFlags::FIN),
+                window_size: u16::MAX,
+                payload: &[],
+            },
+            fin_received_at,
+        );
+        assert_eq!(socket.state(), TcpState::TimeWait);
+        assert_eq!(
+            socket.next_deadline_nanos(),
+            Some(fin_received_at + TCP_TIME_WAIT_NANOS)
+        );
+
+        socket.expire_timers(fin_received_at + TCP_TIME_WAIT_NANOS - 1);
+        assert_eq!(socket.state(), TcpState::TimeWait);
+        socket.expire_timers(fin_received_at + TCP_TIME_WAIT_NANOS);
+        assert_eq!(socket.state(), TcpState::Closed);
+        assert_eq!(socket.next_deadline_nanos(), None);
+    }
+
+    #[test]
     fn passive_close_sends_fin_and_closes_after_fin_ack() {
         let mut socket = established_socket();
         let _ = socket.on_segment(
@@ -1025,6 +1132,36 @@ mod tests {
             TCP_INITIAL_RTO_NANOS + 2,
         );
         assert!(socket.pending_ack().is_some());
+    }
+
+    #[test]
+    fn full_size_receive_payload_delayed_ack_expires() {
+        let mut socket = established_socket();
+        let payload = [0u8; TCP_RECEIVE_SEGMENT_BYTES];
+        let received_at = TCP_INITIAL_RTO_NANOS + 1;
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                payload: &payload,
+            },
+            received_at,
+        );
+        assert_eq!(socket.pending_ack(), None);
+        assert_eq!(
+            socket.next_deadline_nanos(),
+            Some(received_at + TCP_DELAYED_ACK_NANOS)
+        );
+
+        socket.expire_timers(received_at + TCP_DELAYED_ACK_NANOS - 1);
+        assert_eq!(socket.pending_ack(), None);
+        socket.expire_timers(received_at + TCP_DELAYED_ACK_NANOS);
+        assert!(socket.pending_ack().is_some());
+        assert_eq!(socket.next_deadline_nanos(), None);
     }
 
     #[test]

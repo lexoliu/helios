@@ -731,6 +731,15 @@ impl Stack {
         })
     }
 
+    pub fn next_tcp_deadline(&self) -> Option<StackInstant> {
+        self.tcp
+            .iter()
+            .flatten()
+            .filter_map(TcpSocket::next_deadline_nanos)
+            .min()
+            .map(StackInstant::from_nanos)
+    }
+
     pub fn drive_tcp(&mut self, now: StackInstant) -> Result<(), StackError> {
         let mut pending_syn = ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader), 16>::new();
         let mut pending_syn_ack =
@@ -738,6 +747,9 @@ impl Stack {
         let mut pending_ack = ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader), 16>::new();
         let mut pending_retransmit = ArrayVec::<(usize, TcpTransmitSegment), 16>::new();
         let mut pending_data = ArrayVec::<TcpTransmitSegment, 16>::new();
+        for socket in self.tcp.iter_mut().flatten() {
+            socket.expire_timers(now.nanos());
+        }
         for (index, socket) in self.tcp.iter().enumerate() {
             let Some(socket) = socket else {
                 continue;
@@ -1728,7 +1740,7 @@ mod tests {
         source: Ipv4Address,
         destination: Ipv4Address,
         header: TcpHeader,
-    ) -> ([u8; 64], usize) {
+    ) -> ([u8; crate::ETHERNET_FRAME_BYTES], usize) {
         tcp_segment_with_payload(source, destination, header, &[])
     }
 
@@ -1737,8 +1749,8 @@ mod tests {
         destination: Ipv4Address,
         header: TcpHeader,
         payload: &[u8],
-    ) -> ([u8; 64], usize) {
-        let mut segment = [0u8; 64];
+    ) -> ([u8; crate::ETHERNET_FRAME_BYTES], usize) {
+        let mut segment = [0u8; crate::ETHERNET_FRAME_BYTES];
         let len = TcpPacket::encode(
             &mut segment,
             IpAddress::Ipv4(source),
@@ -2023,6 +2035,107 @@ mod tests {
         assert!(data.flags.contains(TcpFlags::ACK));
         assert_eq!(data.payload, b"w");
         assert!(stack.take_outbound().is_none());
+    }
+
+    #[test]
+    fn tcp_drive_queues_delayed_ack_at_deadline() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(peer),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        stack.open_tcp_connect(
+            TcpEndpoint {
+                address: IpAddress::Ipv4(local),
+                port: 49152,
+            },
+            TcpEndpoint {
+                address: IpAddress::Ipv4(peer),
+                port: 80,
+            },
+            7,
+        );
+        let (syn_ack, syn_ack_len) = tcp_segment(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+            },
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &syn_ack[..syn_ack_len],
+                StackInstant::from_nanos(1),
+            )
+            .expect("SYN-ACK should establish the socket");
+        stack
+            .drive_tcp(StackInstant::from_nanos(1))
+            .expect("handshake ACK should be queued");
+        let _ = stack
+            .take_outbound()
+            .expect("handshake ACK frame should be queued");
+
+        let payload = [0u8; crate::tcp::TCP_RECEIVE_SEGMENT_BYTES];
+        let received_at = 2;
+        let (request, request_len) = tcp_segment_with_payload(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+            &payload,
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &request[..request_len],
+                StackInstant::from_nanos(received_at),
+            )
+            .expect("payload should be accepted");
+        assert_eq!(
+            stack.next_tcp_deadline(),
+            Some(StackInstant::from_nanos(
+                received_at + crate::tcp::TCP_DELAYED_ACK_NANOS
+            ))
+        );
+        stack
+            .drive_tcp(StackInstant::from_nanos(
+                received_at + crate::tcp::TCP_DELAYED_ACK_NANOS - 1,
+            ))
+            .expect("early TCP drive should not queue ACK");
+        assert!(stack.take_outbound().is_none());
+
+        stack
+            .drive_tcp(StackInstant::from_nanos(
+                received_at + crate::tcp::TCP_DELAYED_ACK_NANOS,
+            ))
+            .expect("delayed ACK should be queued");
+        let frame = stack
+            .take_outbound()
+            .expect("delayed ACK frame should be queued");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
+        let ack = TcpPacket::parse(ipv4.payload).expect("TCP packet should parse");
+        assert!(ack.flags.contains(TcpFlags::ACK));
+        assert!(ack.payload.is_empty());
+        assert!(stack.next_tcp_deadline().is_none());
     }
 
     #[test]
