@@ -1,7 +1,6 @@
 extern crate alloc;
 
-use alloc::vec::Vec;
-
+use hashbrown::HashMap;
 use thiserror::Error;
 use triomphe::Arc;
 
@@ -68,36 +67,37 @@ pub enum PollRegistryError {
 }
 
 struct PollEntry {
-    key: PollKey,
     ready: bool,
     notify: Arc<Notify>,
 }
 
 #[derive(Default)]
 pub struct PollRegistry {
-    entries: Vec<PollEntry>,
+    entries: HashMap<PollKey, PollEntry>,
 }
 
 impl PollRegistry {
     pub fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: HashMap::new(),
         }
     }
 
     pub fn register(&mut self, key: PollKey) -> Result<PollRegistration, PollRegistryError> {
-        if self.entries.iter().any(|entry| entry.key == key) {
+        if self.entries.contains_key(&key) {
             return Err(PollRegistryError::AlreadyRegistered {
                 kind: key.kind(),
                 id: key.id(),
             });
         }
         let notify = Arc::new(Notify::new());
-        self.entries.push(PollEntry {
+        self.entries.insert(
             key,
-            ready: false,
-            notify: notify.clone(),
-        });
+            PollEntry {
+                ready: false,
+                notify: notify.clone(),
+            },
+        );
         Ok(PollRegistration { key, notify })
     }
 
@@ -118,22 +118,18 @@ impl PollRegistry {
     }
 
     pub fn remove(&mut self, key: PollKey) -> Result<(), PollRegistryError> {
-        let index = self
-            .entries
-            .iter()
-            .position(|entry| entry.key == key)
+        self.entries
+            .remove(&key)
+            .map(|_| ())
             .ok_or(PollRegistryError::NotRegistered {
                 kind: key.kind(),
                 id: key.id(),
-            })?;
-        self.entries.swap_remove(index);
-        Ok(())
+            })
     }
 
     fn entry(&self, key: PollKey) -> Result<&PollEntry, PollRegistryError> {
         self.entries
-            .iter()
-            .find(|entry| entry.key == key)
+            .get(&key)
             .ok_or(PollRegistryError::NotRegistered {
                 kind: key.kind(),
                 id: key.id(),
@@ -142,8 +138,7 @@ impl PollRegistry {
 
     fn entry_mut(&mut self, key: PollKey) -> Result<&mut PollEntry, PollRegistryError> {
         self.entries
-            .iter_mut()
-            .find(|entry| entry.key == key)
+            .get_mut(&key)
             .ok_or(PollRegistryError::NotRegistered {
                 kind: key.kind(),
                 id: key.id(),
