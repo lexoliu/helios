@@ -1,6 +1,8 @@
 extern crate alloc;
 
+use alloc::collections::BinaryHeap;
 use alloc::vec::Vec;
+use core::cmp::Reverse;
 
 use helios_hal::resource::{KernelResource, ResourceRights};
 use thiserror::Error;
@@ -71,6 +73,7 @@ where
     Rights: ResourceRights,
 {
     entries: Vec<Option<DescriptorEntry<T, Rights>>>,
+    free: BinaryHeap<Reverse<usize>>,
 }
 
 impl<T, Rights> Default for DescriptorTable<T, Rights>
@@ -89,6 +92,7 @@ where
     pub const fn new() -> Self {
         Self {
             entries: Vec::new(),
+            free: BinaryHeap::new(),
         }
     }
 
@@ -97,21 +101,9 @@ where
         resource: KernelResource<T, Rights>,
         close_on_exec: bool,
     ) -> Result<DescriptorId, DescriptorTableError> {
-        if let Some((index, slot)) = self
-            .entries
-            .iter_mut()
-            .enumerate()
-            .find(|(_, slot)| slot.is_none())
-        {
-            *slot = Some(DescriptorEntry::new(resource, close_on_exec));
-            let id = u32::try_from(index).map_err(|_| DescriptorTableError::IndexOverflow)?;
-            return Ok(DescriptorId::new(id));
-        }
-
-        let index = self.entries.len();
+        let index = self.allocate_slot_index();
         let id = u32::try_from(index).map_err(|_| DescriptorTableError::IndexOverflow)?;
-        self.entries
-            .push(Some(DescriptorEntry::new(resource, close_on_exec)));
+        self.entries[index] = Some(DescriptorEntry::new(resource, close_on_exec));
         Ok(DescriptorId::new(id))
     }
 
@@ -139,11 +131,14 @@ where
         &mut self,
         descriptor: DescriptorId,
     ) -> Result<KernelResource<T, Rights>, DescriptorTableError> {
-        self.entries
+        let resource = self
+            .entries
             .get_mut(descriptor_index(descriptor)?)
             .and_then(Option::take)
             .map(DescriptorEntry::into_resource)
-            .ok_or(DescriptorTableError::BadDescriptor(descriptor.raw()))
+            .ok_or(DescriptorTableError::BadDescriptor(descriptor.raw()))?;
+        self.free.push(Reverse(descriptor_index(descriptor)?));
+        Ok(resource)
     }
 
     pub fn dup(
@@ -179,18 +174,35 @@ where
             .ok_or(DescriptorTableError::BadDescriptor(source.raw()))?;
 
         if self.entries.len() <= target_index {
+            let previous_len = self.entries.len();
             self.entries.resize_with(target_index + 1, || None);
+            for index in previous_len..target_index {
+                self.free.push(Reverse(index));
+            }
         }
+        self.free.push(Reverse(source_index));
         self.entries[target_index] = Some(entry);
         Ok(())
     }
 
     pub fn close_on_exec(&mut self) {
-        for slot in &mut self.entries {
+        for (index, slot) in self.entries.iter_mut().enumerate() {
             if slot.as_ref().is_some_and(DescriptorEntry::close_on_exec) {
                 *slot = None;
+                self.free.push(Reverse(index));
             }
         }
+    }
+
+    fn allocate_slot_index(&mut self) -> usize {
+        while let Some(Reverse(index)) = self.free.pop() {
+            if self.entries.get(index).is_some_and(Option::is_none) {
+                return index;
+            }
+        }
+        let index = self.entries.len();
+        self.entries.push(None);
+        index
     }
 }
 
@@ -267,6 +279,29 @@ mod tests {
             table.get(close),
             Err(DescriptorTableError::BadDescriptor(_))
         ));
+    }
+
+    #[test]
+    fn insert_reuses_lowest_closed_descriptor() {
+        let mut table = DescriptorTable::new();
+        let first = table
+            .insert(file(FileRights::READ), false)
+            .expect("first insert must succeed");
+        let second = table
+            .insert(file(FileRights::WRITE), false)
+            .expect("second insert must succeed");
+        let third = table
+            .insert(file(FileRights::READ | FileRights::WRITE), false)
+            .expect("third insert must succeed");
+
+        table.close(third).expect("third close must succeed");
+        table.close(first).expect("first close must succeed");
+
+        let reused = table
+            .insert(file(FileRights::READ), false)
+            .expect("insert must reuse a closed descriptor");
+        assert_eq!(reused.raw(), first.raw());
+        assert!(table.get(second).is_ok());
     }
 
     #[test]
