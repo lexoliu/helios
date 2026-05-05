@@ -39,8 +39,12 @@ enum CurlError {
     },
     #[error("failed to write request")]
     WriteRequest(#[source] io::Error),
-    #[error("failed to read response")]
-    ReadResponse(#[source] io::Error),
+    #[error("failed to read response after {bytes_read} bytes: {source}")]
+    ReadResponse {
+        bytes_read: usize,
+        #[source]
+        source: io::Error,
+    },
     #[error("failed to write response body")]
     WriteResponseBody(#[source] io::Error),
     #[error("failed to create output file `{path}`")]
@@ -197,7 +201,10 @@ async fn read_response_body(stream: &TcpStream, output: &mut OutputTarget) -> Re
         let Some(bytes) = stream
             .read(DEFAULT_READ_CHUNK_BYTES)
             .await
-            .map_err(CurlError::ReadResponse)?
+            .map_err(|source| CurlError::ReadResponse {
+                bytes_read: buffered.len(),
+                source,
+            })?
         else {
             output.write_body(&buffered)?;
             return Ok(buffered.len());
@@ -215,7 +222,10 @@ async fn read_response_body(stream: &TcpStream, output: &mut OutputTarget) -> Re
         while let Some(bytes) = stream
             .read(DEFAULT_READ_CHUNK_BYTES)
             .await
-            .map_err(CurlError::ReadResponse)?
+            .map_err(|source| CurlError::ReadResponse {
+                bytes_read: body.len(),
+                source,
+            })?
         {
             body.extend_from_slice(&bytes);
         }
@@ -230,7 +240,10 @@ async fn read_response_body(stream: &TcpStream, output: &mut OutputTarget) -> Re
     while let Some(bytes) = stream
         .read(DEFAULT_READ_CHUNK_BYTES)
         .await
-        .map_err(CurlError::ReadResponse)?
+        .map_err(|source| CurlError::ReadResponse {
+            bytes_read: size,
+            source,
+        })?
     {
         size += bytes.len();
         output.write_body(&bytes)?;

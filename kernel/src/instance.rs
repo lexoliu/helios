@@ -5,6 +5,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
+use slab::Slab;
 use spin::Mutex;
 
 const INACTIVE_RESUME_AT: u64 = u64::MAX;
@@ -101,6 +102,7 @@ pub struct InstanceRegistry {
 #[derive(Clone)]
 pub struct RegisteredInstance {
     registry: InstanceRegistry,
+    entry_slot: usize,
     entry: Arc<InstanceEntry>,
 }
 
@@ -112,7 +114,7 @@ pub enum InstanceExecutionTransition {
 
 struct InstanceRegistryInner {
     next_id: AtomicU64,
-    entries: Mutex<Vec<Arc<InstanceEntry>>>,
+    entries: Mutex<Slab<Arc<InstanceEntry>>>,
     sampling: Mutex<SamplingState>,
     kill_notifier: Mutex<fn()>,
 }
@@ -150,7 +152,7 @@ impl InstanceRegistry {
         Self {
             inner: Arc::new(InstanceRegistryInner {
                 next_id: AtomicU64::new(1),
-                entries: Mutex::new(Vec::new()),
+                entries: Mutex::new(Slab::new()),
                 sampling: Mutex::new(SamplingState::default()),
                 kill_notifier: Mutex::new(noop_kill_notifier),
             }),
@@ -187,9 +189,10 @@ impl InstanceRegistry {
             restart_cost,
             kill_flag: AtomicU8::new(KILL_FLAG_NONE),
         });
-        self.inner.entries.lock().push(entry.clone());
+        let entry_slot = self.inner.entries.lock().insert(entry.clone());
         RegisteredInstance {
             registry: self.clone(),
+            entry_slot,
             entry,
         }
     }
@@ -204,7 +207,7 @@ impl InstanceRegistry {
     pub fn pick_oom_victim(&self) -> Option<OomVictim> {
         let entries = self.inner.entries.lock();
         let mut best: Option<OomVictim> = None;
-        for entry in entries.iter() {
+        for (_, entry) in entries.iter() {
             let memory_bytes = entry.memory_bytes.load(Ordering::Acquire);
             if memory_bytes == 0 {
                 continue;
@@ -244,7 +247,11 @@ impl InstanceRegistry {
     /// workloads is "indefinitely".
     pub fn request_kill(&self, id: InstanceId, reason: KillReason) -> bool {
         let entries = self.inner.entries.lock();
-        let Some(entry) = entries.iter().find(|entry| entry.id == id) else {
+        let Some(entry) =
+            entries
+                .iter()
+                .find_map(|(_, entry)| if entry.id == id { Some(entry) } else { None })
+        else {
             return false;
         };
         let encoded = encode_kill_reason(reason);
@@ -261,7 +268,7 @@ impl InstanceRegistry {
     }
 
     pub fn snapshot(&self, now_nanos: u64) -> Vec<InstanceSnapshot> {
-        let entries = self.inner.entries.lock().clone();
+        let entries = self.inner.entries.lock();
         let mut sampling = self.inner.sampling.lock();
         let elapsed_nanos = sampling
             .last_at
@@ -272,7 +279,7 @@ impl InstanceRegistry {
         let mut snapshots = Vec::with_capacity(entries.len());
         let mut next_totals = Vec::with_capacity(entries.len());
 
-        for entry in entries {
+        for (_, entry) in entries.iter() {
             let total_active_nanos = entry.total_active_nanos(now_nanos);
             let previous_total = sampling
                 .totals
@@ -312,7 +319,7 @@ impl InstanceRegistry {
             .entries
             .lock()
             .iter()
-            .map(|entry| InstanceProfileTotal {
+            .map(|(_, entry)| InstanceProfileTotal {
                 name: entry.name.clone(),
                 active_nanos: entry.total_active_nanos(now_nanos),
             })
@@ -418,11 +425,14 @@ impl Drop for RegisteredInstance {
             return;
         }
         let id = self.entry.id;
-        self.registry
-            .inner
-            .entries
-            .lock()
-            .retain(|entry| entry.id != id);
+        let mut entries = self.registry.inner.entries.lock();
+        if entries
+            .get(self.entry_slot)
+            .is_some_and(|entry| entry.id == id)
+        {
+            let _ = entries.remove(self.entry_slot);
+        }
+        drop(entries);
         self.registry
             .inner
             .sampling

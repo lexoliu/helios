@@ -6,13 +6,14 @@ use fdt::Fdt;
 use helios_hal::io::IoError;
 use helios_hal::watchdog::Watchdog;
 use helios_kernel::{
-    DEFAULT_POLL_BUDGET, EventDeliveryCapabilities, InterfaceCapabilities, Kernel, NetworkDevice,
-    NetworkService, PacketBuffer,
+    EventDeliveryCapabilities, InterfaceCapabilities, Kernel, NetworkDevice, NetworkService,
+    PacketBuffer,
 };
 
 type Aarch64VirtioNetTransport =
     helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<helios_virtio::OffsetDmaPool>>;
 type Aarch64VirtioNetDevice = helios_virtio::VirtioNetDevice<Aarch64VirtioNetTransport>;
+const VIRTIO_POLLING_RX_BUDGET: usize = 32;
 
 #[derive(Clone)]
 struct VirtioNetworkDevice {
@@ -34,9 +35,13 @@ pub(crate) fn install<WatchdogImpl>(
         return;
     };
     let service = NetworkService::new(cpu.clone(), debug_state.clone(), kernel.timer(), device);
+    let packet_pump = service.clone();
     debug_state.install_network_service(helios_kernel::ComponentHostNetworkService::from_service(
         service,
     ));
+    kernel.spawn_detached(async move {
+        packet_pump.run_packet_pump().await;
+    });
     tracing::info!("virtio network online");
 }
 
@@ -80,8 +85,8 @@ impl NetworkDevice for VirtioNetworkDevice {
                 adaptive_moderation: false,
                 rx_coalescing: false,
                 tx_coalescing: false,
-                rx_poll_budget: DEFAULT_POLL_BUDGET,
-                tx_completion_budget: DEFAULT_POLL_BUDGET,
+                rx_poll_budget: VIRTIO_POLLING_RX_BUDGET,
+                tx_completion_budget: VIRTIO_POLLING_RX_BUDGET,
             },
             ..InterfaceCapabilities::default()
         }
@@ -118,6 +123,10 @@ impl NetworkDevice for VirtioNetworkDevice {
         self.inner
             .transmit_batch_with_wait(frames, helios_kernel::yield_now)
             .await
+    }
+
+    async fn reclaim_transmit_completions(&self, budget: usize) -> Result<usize, IoError> {
+        self.inner.reclaim_transmit_completions(budget).await
     }
 
     async fn wait_for_event(&self) {

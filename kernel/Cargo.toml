@@ -37,6 +37,7 @@ lru = { version = "0.16.3", default-features = false, features = ["hashbrown"] }
 rand_chacha = { version = "0.3.1", default-features = false }
 rand_core = { version = "0.6.4", default-features = false }
 smallvec = { version = "1.15.1", default-features = false }
+slab = { version = "0.4.12", default-features = false }
 spin = { version = "0.9.8", default-features = false, features = ["mutex", "once", "spin_mutex"] }
 wasmparser = { version = "0.245.0", default-features = false, features = ["component-model"] }
 

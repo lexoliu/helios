@@ -1,10 +1,9 @@
 extern crate alloc;
 
-use alloc::collections::BinaryHeap;
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
-use core::cmp::Ordering;
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
@@ -19,6 +18,9 @@ use objectpool::Pool;
 use crate::time::duration_to_ticks;
 
 const SCHEDULER_INTERRUPT_INTERVAL: Duration = Duration::from_millis(100);
+const TIMER_WHEEL_QUANTUM: Duration = Duration::from_micros(50);
+const TIMER_WHEEL_LEVELS: usize = 4;
+const TIMER_WHEEL_SLOTS: usize = 256;
 
 #[derive(Clone)]
 pub struct Timer<CpuImpl: Cpu + Clone> {
@@ -32,25 +34,26 @@ pub struct Sleep<CpuImpl: Cpu + Clone> {
 }
 
 struct TimerState {
-    sleepers: BinaryHeap<TimerEntry>,
+    wheel: TimingWheel,
 }
 
 struct TimerShared {
-    // This heap is owned by the kernel event loop running on the timer's home
-    // processor. Interrupt handlers never touch it; they only re-arm the next
-    // periodic/preemption tick so normal async/task context can finish the work.
+    // This timing wheel is owned by the kernel event loop running on the
+    // timer's home processor. Interrupt handlers never touch it; they only
+    // re-arm the next periodic/preemption tick so normal async/task context
+    // can finish the work.
     state: UnsafeCell<TimerState>,
     inbox: ConcurrentQueue<TimerEntry>,
-    next_id: AtomicU64,
     next_sleep_deadline: AtomicU64,
     armed_deadline: AtomicU64,
     interrupt_interval_ticks: u64,
-    ready_pool: Pool<Vec<Arc<SleepState>>>,
+    wheel_quantum_ticks: u64,
+    ready_pool: Pool<Vec<TimerEntry>>,
 }
 
 struct TimerEntry {
     deadline: Instant,
-    id: u64,
+    deadline_tick: u64,
     state: Arc<SleepState>,
 }
 
@@ -62,27 +65,42 @@ struct SleepState {
     waker: AtomicWaker,
 }
 
+struct TimingWheel {
+    levels: [WheelLevel; TIMER_WHEEL_LEVELS],
+    current_tick: u64,
+}
+
+struct WheelLevel {
+    buckets: Box<[Vec<TimerEntry>]>,
+}
+
 impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     pub fn new(cpu: CpuImpl) -> Self {
         let interrupt_interval_ticks =
             duration_to_ticks(SCHEDULER_INTERRUPT_INTERVAL, cpu.timer_frequency());
+        let wheel_quantum_ticks = duration_to_ticks(TIMER_WHEEL_QUANTUM, cpu.timer_frequency());
         assert!(
             interrupt_interval_ticks != 0,
             "scheduler interrupt interval {SCHEDULER_INTERRUPT_INTERVAL:?} converted to zero timer ticks"
         );
+        assert!(
+            wheel_quantum_ticks != 0,
+            "timer wheel quantum {TIMER_WHEEL_QUANTUM:?} converted to zero timer ticks"
+        );
         let initial_deadline = cpu.now().saturating_add(interrupt_interval_ticks);
         cpu.set_deadline(initial_deadline);
+        let current_tick = wheel_tick_floor(cpu.now(), wheel_quantum_ticks);
         Self {
             cpu,
             shared: Arc::new(TimerShared {
                 state: UnsafeCell::new(TimerState {
-                    sleepers: BinaryHeap::new(),
+                    wheel: TimingWheel::new(current_tick),
                 }),
                 inbox: ConcurrentQueue::unbounded(),
-                next_id: AtomicU64::new(0),
                 next_sleep_deadline: AtomicU64::new(u64::MAX),
                 armed_deadline: AtomicU64::new(initial_deadline.ticks()),
                 interrupt_interval_ticks,
+                wheel_quantum_ticks,
                 ready_pool: Pool::bounded(8, Vec::new, Vec::clear),
             }),
         }
@@ -112,38 +130,19 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
 
     pub fn fire_expired(&self) -> usize {
         let now = self.now();
-        // Timer wakeups are frequent, so keep the temporary ready list out of
-        // the allocator fast path once the pool has warmed up.
         let mut ready = self.shared.ready_pool.get_owned();
-        // SAFETY: the timer heap is owned by the kernel event loop on this
+        // SAFETY: the timing wheel is owned by the kernel event loop on this
         // processor. Sleep futures only enqueue through the lock-free inbox, and
         // interrupt handlers only disarm the hardware timer.
         let state = unsafe { &mut *self.shared.state.get() };
         self.drain_inbox(state);
 
-        while let Some(entry) = state.sleepers.peek() {
-            if entry.state.cancelled.load(AtomicOrdering::Acquire)
-                || entry.state.fired.load(AtomicOrdering::Acquire)
-            {
-                state.sleepers.pop();
-                continue;
-            }
+        let now_tick = wheel_tick_floor(now, self.shared.wheel_quantum_ticks);
+        state.wheel.drain_expired(now_tick, &mut ready);
+        let next_deadline = state.wheel.next_live_deadline();
 
-            if entry.deadline > now {
-                break;
-            }
-
-            let entry = state
-                .sleepers
-                .pop()
-                .expect("timer heap peek succeeded but pop failed");
-            ready.push(entry.state);
-        }
-
-        let next_deadline = next_live_deadline(state);
-
-        for state in ready.iter() {
-            state.fire();
+        for entry in ready.iter() {
+            entry.state.fire();
         }
 
         self.commit_deadline(next_deadline, now);
@@ -158,10 +157,9 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
 
     fn enqueue(&self, state: Arc<SleepState>) {
         let deadline = state.deadline;
-        let id = self.shared.next_id.fetch_add(1, AtomicOrdering::AcqRel);
         let entry = TimerEntry {
             deadline,
-            id,
+            deadline_tick: wheel_tick_ceil(deadline, self.shared.wheel_quantum_ticks),
             state,
         };
 
@@ -175,7 +173,7 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     fn drain_inbox(&self, state: &mut TimerState) {
         loop {
             match self.shared.inbox.pop() {
-                Ok(entry) => state.sleepers.push(entry),
+                Ok(entry) => state.wheel.insert(entry),
                 Err(PopError::Empty | PopError::Closed) => return,
             }
         }
@@ -289,43 +287,198 @@ impl SleepState {
     }
 }
 
-impl PartialEq for TimerEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.deadline == other.deadline && self.id == other.id
-    }
-}
-
-impl Eq for TimerEntry {}
-
-impl PartialOrd for TimerEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for TimerEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .deadline
-            .cmp(&self.deadline)
-            .then_with(|| other.id.cmp(&self.id))
-    }
-}
-
-fn next_live_deadline(state: &mut TimerState) -> Option<Instant> {
-    while let Some(entry) = state.sleepers.peek() {
-        if entry.state.cancelled.load(AtomicOrdering::Acquire)
-            || entry.state.fired.load(AtomicOrdering::Acquire)
-        {
-            state.sleepers.pop();
-            continue;
+impl TimingWheel {
+    fn new(current_tick: u64) -> Self {
+        Self {
+            levels: core::array::from_fn(|_| WheelLevel::new()),
+            current_tick,
         }
-
-        return Some(entry.deadline);
     }
 
-    None
+    fn insert(&mut self, entry: TimerEntry) {
+        let target_tick = entry.deadline_tick.max(self.current_tick);
+        let delay = target_tick.saturating_sub(self.current_tick);
+        let level = wheel_level(delay);
+        let slot = wheel_slot(target_tick, level);
+        self.levels[level].buckets[slot].push(entry);
+    }
+
+    fn drain_expired(&mut self, now_tick: u64, ready: &mut Vec<TimerEntry>) {
+        while self.current_tick < now_tick {
+            self.current_tick = self.current_tick.saturating_add(1);
+            self.cascade();
+            self.drain_current_slot(ready);
+        }
+        self.drain_current_slot(ready);
+    }
+
+    fn next_live_deadline(&self) -> Option<Instant> {
+        self.levels
+            .iter()
+            .flat_map(|level| level.buckets.iter())
+            .flat_map(|bucket| bucket.iter())
+            .filter(|entry| !entry.is_dead())
+            .map(|entry| entry.deadline)
+            .min()
+    }
+
+    fn cascade(&mut self) {
+        for level in (1..TIMER_WHEEL_LEVELS).rev() {
+            let lower_mask = (1_u64 << (level * 8)) - 1;
+            if self.current_tick & lower_mask == 0 {
+                self.cascade_level(level);
+            }
+        }
+    }
+
+    fn cascade_level(&mut self, level: usize) {
+        let slot = wheel_slot(self.current_tick, level);
+        let entries = core::mem::take(&mut self.levels[level].buckets[slot]);
+        for entry in entries {
+            self.insert(entry);
+        }
+    }
+
+    fn drain_current_slot(&mut self, ready: &mut Vec<TimerEntry>) {
+        let slot = wheel_slot(self.current_tick, 0);
+        let entries = core::mem::take(&mut self.levels[0].buckets[slot]);
+        for entry in entries {
+            if entry.is_dead() {
+                continue;
+            }
+            if entry.deadline_tick <= self.current_tick {
+                ready.push(entry);
+            } else {
+                self.insert(entry);
+            }
+        }
+    }
+}
+
+impl WheelLevel {
+    fn new() -> Self {
+        let buckets = (0..TIMER_WHEEL_SLOTS)
+            .map(|_| Vec::new())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self { buckets }
+    }
+}
+
+impl TimerEntry {
+    fn is_dead(&self) -> bool {
+        self.state.cancelled.load(AtomicOrdering::Acquire)
+            || self.state.fired.load(AtomicOrdering::Acquire)
+    }
+}
+
+fn wheel_level(delay: u64) -> usize {
+    if delay < TIMER_WHEEL_SLOTS as u64 {
+        0
+    } else if delay < (TIMER_WHEEL_SLOTS as u64).pow(2) {
+        1
+    } else if delay < (TIMER_WHEEL_SLOTS as u64).pow(3) {
+        2
+    } else {
+        3
+    }
+}
+
+fn wheel_slot(tick: u64, level: usize) -> usize {
+    ((tick >> (level * 8)) & (TIMER_WHEEL_SLOTS as u64 - 1)) as usize
+}
+
+fn wheel_tick_floor(deadline: Instant, quantum_ticks: u64) -> u64 {
+    deadline.ticks() / quantum_ticks
+}
+
+fn wheel_tick_ceil(deadline: Instant, quantum_ticks: u64) -> u64 {
+    deadline
+        .ticks()
+        .saturating_add(quantum_ticks.saturating_sub(1))
+        / quantum_ticks
 }
 
 unsafe impl Send for TimerShared {}
 unsafe impl Sync for TimerShared {}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use core::sync::atomic::AtomicBool;
+
+    use atomic_waker::AtomicWaker;
+    use helios_hal::cpu::Instant;
+
+    use super::{
+        AtomicOrdering, SleepState, TimerEntry, TimingWheel, wheel_tick_ceil, wheel_tick_floor,
+    };
+
+    fn sleep_state(deadline: u64) -> Arc<SleepState> {
+        Arc::new(SleepState {
+            deadline: Instant::new(deadline),
+            queued: AtomicBool::new(false),
+            fired: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+            waker: AtomicWaker::new(),
+        })
+    }
+
+    fn timer_entry(deadline: u64, quantum_ticks: u64) -> TimerEntry {
+        TimerEntry {
+            deadline: Instant::new(deadline),
+            deadline_tick: wheel_tick_ceil(Instant::new(deadline), quantum_ticks),
+            state: sleep_state(deadline),
+        }
+    }
+
+    #[test]
+    fn wheel_tick_rounding_preserves_deadline_order() {
+        assert_eq!(wheel_tick_floor(Instant::new(100), 50), 2);
+        assert_eq!(wheel_tick_ceil(Instant::new(101), 50), 3);
+        assert_eq!(wheel_tick_ceil(Instant::new(150), 50), 3);
+    }
+
+    #[test]
+    fn timing_wheel_expires_entries_after_deadline_tick() {
+        let mut wheel = TimingWheel::new(0);
+        let entry = timer_entry(150, 50);
+        let state = entry.state.clone();
+        wheel.insert(entry);
+
+        let mut ready = Vec::new();
+        wheel.drain_expired(2, &mut ready);
+        assert!(ready.is_empty());
+        wheel.drain_expired(3, &mut ready);
+        assert_eq!(ready.len(), 1);
+        assert!(Arc::ptr_eq(&ready[0].state, &state));
+    }
+
+    #[test]
+    fn timing_wheel_cascades_higher_level_entries() {
+        let mut wheel = TimingWheel::new(0);
+        let entry = timer_entry(300 * 50, 50);
+        let state = entry.state.clone();
+        wheel.insert(entry);
+
+        let mut ready = Vec::new();
+        wheel.drain_expired(255, &mut ready);
+        assert!(ready.is_empty());
+        wheel.drain_expired(300, &mut ready);
+        assert_eq!(ready.len(), 1);
+        assert!(Arc::ptr_eq(&ready[0].state, &state));
+    }
+
+    #[test]
+    fn timing_wheel_skips_cancelled_entries() {
+        let mut wheel = TimingWheel::new(0);
+        let entry = timer_entry(100, 50);
+        entry.state.cancelled.store(true, AtomicOrdering::Release);
+        wheel.insert(entry);
+
+        let mut ready = Vec::new();
+        wheel.drain_expired(2, &mut ready);
+        assert!(ready.is_empty());
+    }
+}

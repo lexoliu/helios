@@ -51,6 +51,11 @@ impl StackConfig {
             rx_budget: DEFAULT_POLL_BUDGET,
         }
     }
+
+    pub const fn with_rx_budget(mut self, rx_budget: usize) -> Self {
+        self.rx_budget = rx_budget;
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -289,6 +294,13 @@ impl Stack {
 
     pub const fn config(&self) -> StackConfig {
         self.config
+    }
+
+    pub fn receive_backpressured(&self) -> bool {
+        self.tcp
+            .iter()
+            .flatten()
+            .any(TcpSocket::receive_backpressured)
     }
 
     pub fn routes(&self) -> &RouteTable {
@@ -1262,7 +1274,7 @@ impl Stack {
                     })
             {
                 let previous_state = socket.state();
-                socket.on_segment(packet, now.nanos());
+                let outcome = socket.on_segment(packet, now.nanos());
                 if previous_state == crate::TcpState::SynReceived
                     && socket.state() == crate::TcpState::Established
                 {
@@ -1283,6 +1295,9 @@ impl Stack {
                             socket: socket_id(index),
                         },
                     );
+                }
+                if outcome.receive_backpressure {
+                    return Err(StackError::ReceiveBackpressure);
                 }
                 return Ok(());
             }

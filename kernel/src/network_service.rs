@@ -13,8 +13,8 @@ use helios_hal::io::IoError;
 use helios_netstack::{
     DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage, DhcpMessageType, DhcpPacket,
     DnsQuestionWriter, DnsResponse, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr,
-    NetworkInterface as NetworkDevice, PacketBuffer, Route, Stack, StackConfig, StackInstant,
-    TcpConnectState, TcpEndpoint, TcpReadState,
+    NetworkInterface as NetworkDevice, PacketBuffer, Route, Stack, StackConfig, StackError,
+    StackInstant, TcpConnectState, TcpEndpoint, TcpReadState,
 };
 use smallvec::SmallVec;
 
@@ -36,6 +36,8 @@ const MAX_TCP_LISTENER_HANDLES: usize = 64;
 const MAX_UDP_SOCKET_HANDLES: usize = 256;
 const NETWORK_PROGRESS_WAIT: Duration = Duration::from_micros(50);
 const NETWORK_TX_BATCH_FRAMES: usize = 8;
+const NETWORK_MIN_POLL_BUDGET: usize = 8;
+const NETWORK_MAX_POLL_BUDGET: usize = 128;
 
 #[derive(Clone)]
 pub struct NetworkService<CpuImpl, Runtime, Device>
@@ -121,9 +123,40 @@ struct NetworkState {
     tcp_streams: HandleSlab<helios_netstack::SocketId, MAX_TCP_STREAM_HANDLES>,
     tcp_listeners: HandleSlab<TcpListenerState, MAX_TCP_LISTENER_HANDLES>,
     udp_sockets: HandleSlab<UdpSocketState, MAX_UDP_SOCKET_HANDLES>,
+    poll: NetworkPollState,
     dhcp: DhcpClientState,
     dns_servers: Vec<Ipv4Address>,
     next_dns_query_id: u16,
+}
+
+#[derive(Clone, Copy)]
+struct NetworkPollBudget {
+    rx_frames: usize,
+    tx_completions: usize,
+}
+
+#[derive(Clone, Copy)]
+struct NetworkPollProgress {
+    received_frames: usize,
+    reclaimed_tx: usize,
+    transmitted_frames: usize,
+}
+
+impl NetworkPollProgress {
+    const fn is_idle(self) -> bool {
+        self.received_frames == 0 && self.reclaimed_tx == 0 && self.transmitted_frames == 0
+    }
+
+    const fn saturated(self, budget: NetworkPollBudget) -> bool {
+        self.received_frames >= budget.rx_frames || self.reclaimed_tx >= budget.tx_completions
+    }
+}
+
+struct NetworkPollState {
+    base_rx_budget: usize,
+    base_tx_completion_budget: usize,
+    rx_budget: usize,
+    tx_completion_budget: usize,
 }
 
 struct HandleSlab<T, const CAPACITY: usize> {
@@ -350,6 +383,7 @@ where
         device: DeviceImpl,
     ) -> Self {
         let transaction_id = cpu.now().ticks() as u32;
+        let capabilities = device.capabilities();
         Self {
             inner: Arc::new(NetworkServiceInner {
                 cpu,
@@ -358,6 +392,7 @@ where
                 state: crate::Mutex::new(NetworkState::new(
                     device.mac_address(),
                     device.max_frame_len(),
+                    capabilities.events.rx_poll_budget,
                     transaction_id,
                 )),
                 device,
@@ -439,6 +474,21 @@ where
 
     pub async fn tcp_close(&self, stream: TcpStreamId) {
         self.inner.state.lock().await.remove_tcp_stream(stream);
+    }
+
+    pub async fn run_packet_pump(&self) -> ! {
+        loop {
+            match self.poll_network_once().await {
+                Ok((progress, budget)) if !progress.is_idle() || progress.saturated(budget) => {
+                    crate::yield_now().await;
+                }
+                Ok(_) => self.wait_for_progress(NETWORK_PROGRESS_WAIT).await,
+                Err(error) => {
+                    tracing::debug!(?error, "network packet pump failed to drive device");
+                    self.wait_for_progress(NETWORK_PROGRESS_WAIT).await;
+                }
+            }
+        }
     }
 
     pub async fn udp_bind(&self, local_port: u16) -> Result<UdpBinding<UdpSocketId>, UdpError> {
@@ -946,26 +996,54 @@ where
     }
 
     async fn drive_network(&self) -> Result<(), IoError> {
+        let _ = self.poll_network_once().await?;
+        Ok(())
+    }
+
+    async fn poll_network_once(&self) -> Result<(NetworkPollProgress, NetworkPollBudget), IoError> {
+        let budget = {
+            let state = self.inner.state.lock().await;
+            state.poll.budget()
+        };
+
+        let reclaim_started = self.profile_start();
+        let reclaimed = self
+            .inner
+            .device
+            .reclaim_transmit_completions(budget.tx_completions)
+            .await?;
+        if reclaimed != 0 {
+            self.record_network_profile("tx-reclaim", reclaim_started);
+        }
+
         let mut received = 0usize;
         let receive_started = self.profile_start();
         loop {
+            let stack_rx_budget = {
+                let state = self.inner.state.lock().await;
+                if state.stack.receive_backpressured() {
+                    break;
+                }
+                state.stack.config().rx_budget
+            };
             let Some(frame) = self.inner.device.try_receive_frame().await? else {
                 break;
             };
-            let rx_budget = {
+            let result = {
                 let mut state = self.inner.state.lock().await;
-                let rx_budget = state.stack.config().rx_budget;
                 state
                     .stack
                     .receive_frame(frame.as_ref(), StackInstant::from_nanos(self.now_nanos()))
-                    .unwrap_or_else(|error| {
-                        tracing::debug!(?error, "dropped malformed network frame");
-                    });
-                rx_budget
             };
             self.inner.device.repost_rx_frame(frame).await?;
+            if let Err(error) = result {
+                if error == StackError::ReceiveBackpressure {
+                    break;
+                }
+                tracing::debug!(?error, "dropped malformed network frame");
+            }
             received += 1;
-            if received >= rx_budget {
+            if received >= budget.rx_frames.min(stack_rx_budget) {
                 break;
             }
         }
@@ -1007,7 +1085,16 @@ where
         if transmitted != 0 {
             self.record_network_profile("tx-submit", transmit_started);
         }
-        Ok(())
+        let progress = NetworkPollProgress {
+            received_frames: received,
+            reclaimed_tx: reclaimed,
+            transmitted_frames: transmitted,
+        };
+        {
+            let mut state = self.inner.state.lock().await;
+            state.poll.complete(progress);
+        }
+        Ok((progress, budget))
     }
 
     async fn wait_for_progress(&self, duration: Duration) {
@@ -1371,14 +1458,15 @@ where
 }
 
 impl NetworkState {
-    fn new(mac: [u8; 6], max_frame_len: usize, transaction_id: u32) -> Self {
+    fn new(mac: [u8; 6], max_frame_len: usize, rx_poll_budget: usize, transaction_id: u32) -> Self {
         Self {
-            stack: Stack::new(StackConfig::new(mac, max_frame_len)),
+            stack: Stack::new(StackConfig::new(mac, max_frame_len).with_rx_budget(rx_poll_budget)),
             next_tcp_local_port: EPHEMERAL_PORT_START,
             next_udp_local_port: EPHEMERAL_PORT_START,
             tcp_streams: HandleSlab::new(),
             tcp_listeners: HandleSlab::new(),
             udp_sockets: HandleSlab::new(),
+            poll: NetworkPollState::new(rx_poll_budget, rx_poll_budget),
             dhcp: DhcpClientState::Init { transaction_id },
             dns_servers: Vec::new(),
             next_dns_query_id: 1,
@@ -2011,6 +2099,61 @@ impl NetworkState {
             })
             .collect()
     }
+}
+
+impl NetworkPollState {
+    fn new(rx_budget: usize, tx_completion_budget: usize) -> Self {
+        let rx_budget = clamp_poll_budget(rx_budget);
+        let tx_completion_budget = clamp_poll_budget(tx_completion_budget);
+        Self {
+            base_rx_budget: rx_budget,
+            base_tx_completion_budget: tx_completion_budget,
+            rx_budget,
+            tx_completion_budget,
+        }
+    }
+
+    const fn budget(&self) -> NetworkPollBudget {
+        NetworkPollBudget {
+            rx_frames: self.rx_budget,
+            tx_completions: self.tx_completion_budget,
+        }
+    }
+
+    fn complete(&mut self, progress: NetworkPollProgress) {
+        self.rx_budget = adjust_poll_budget(
+            self.rx_budget,
+            self.base_rx_budget,
+            progress.received_frames >= self.rx_budget,
+            progress.is_idle(),
+        );
+        self.tx_completion_budget = adjust_poll_budget(
+            self.tx_completion_budget,
+            self.base_tx_completion_budget,
+            progress.reclaimed_tx >= self.tx_completion_budget,
+            progress.is_idle(),
+        );
+    }
+}
+
+const fn clamp_poll_budget(budget: usize) -> usize {
+    if budget < NETWORK_MIN_POLL_BUDGET {
+        NETWORK_MIN_POLL_BUDGET
+    } else if budget > NETWORK_MAX_POLL_BUDGET {
+        NETWORK_MAX_POLL_BUDGET
+    } else {
+        budget
+    }
+}
+
+fn adjust_poll_budget(current: usize, base: usize, saturated: bool, idle: bool) -> usize {
+    if saturated {
+        return clamp_poll_budget(current.saturating_mul(2));
+    }
+    if idle && current > base {
+        return current / 2;
+    }
+    current
 }
 
 fn parse_ipv4(input: &str) -> Option<Ipv4Address> {

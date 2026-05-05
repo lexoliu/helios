@@ -5717,6 +5717,7 @@ mod tests {
         EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs, ObjectIdentity,
         UnsupportedHostFileSystem,
     };
+    use bytes::Bytes;
     use futures_lite::future::block_on;
 
     use super::{

@@ -36,7 +36,7 @@ pub use stack::{
     DhcpLease, DnsQueryId, IcmpEchoKey, NeighborState, Route, RouteTable, SocketId, Stack,
     StackConfig, StackEvent, StackInstant, TcpAccept, TcpConnectState, TcpReadState, UdpReceive,
 };
-pub use tcp::{TcpEndpoint, TcpSocket, TcpState, TcpTransmitSegment};
+pub use tcp::{TcpEndpoint, TcpSegmentOutcome, TcpSocket, TcpState, TcpTransmitSegment};
 pub use types::{
     EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr, Ipv6Scope,
 };
@@ -233,6 +233,15 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
         }
     }
 
+    /// Reclaims completed transmit slots without waiting for new device events.
+    fn reclaim_transmit_completions(
+        &self,
+        budget: usize,
+    ) -> impl Future<Output = IoResult<usize>> + Send + '_ {
+        let _ = budget;
+        async { Ok(0) }
+    }
+
     /// Waits for interface progress, such as RX arrival or TX completion.
     fn wait_for_event(&self) -> impl Future<Output = ()> + Send + '_;
 }
@@ -307,6 +316,9 @@ pub enum StackError {
     /// Outbound packet storage was exhausted.
     #[error("network stack output queue is full")]
     OutputQueueFull,
+    /// The stack accepted the current packet but RX should stop until consumers drain sockets.
+    #[error("network receive path is backpressured")]
+    ReceiveBackpressure,
     /// The requested socket is unknown.
     #[error("unknown network socket")]
     UnknownSocket,

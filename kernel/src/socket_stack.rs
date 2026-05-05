@@ -191,6 +191,8 @@ where
 mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
+
+    use bytes::Bytes;
     use futures_lite::future::block_on;
 
     use super::SocketStack;

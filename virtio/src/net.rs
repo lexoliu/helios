@@ -13,13 +13,12 @@ use crate::transport::{DeviceStatus, DeviceType, VirtioFeatures, VirtioTransport
 
 const RX_QUEUE_INDEX: u16 = 0;
 const TX_QUEUE_INDEX: u16 = 1;
-const QUEUE_SIZE: u16 = 16;
+const NET_QUEUE_SIZE: u16 = 256;
 const ETH_HEADER_LEN: usize = 14;
 const DEFAULT_IP_MTU: usize = 1500;
 const NET_FEATURE_MAC: u64 = 1 << 5;
 const NET_FEATURE_STATUS: u64 = 1 << 16;
 const NET_FEATURE_MTU: u64 = 1 << 3;
-const TX_COMPLETION_SPIN_POLLS: usize = 256;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -121,8 +120,8 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             .checked_add(max_frame_len)
             .ok_or(IoError::DeviceFault)?;
 
-        let rx_queue_size = transport.queue_max_size(RX_QUEUE_INDEX).min(QUEUE_SIZE);
-        let tx_queue_size = transport.queue_max_size(TX_QUEUE_INDEX).min(QUEUE_SIZE);
+        let rx_queue_size = transport.queue_max_size(RX_QUEUE_INDEX).min(NET_QUEUE_SIZE);
+        let tx_queue_size = transport.queue_max_size(TX_QUEUE_INDEX).min(NET_QUEUE_SIZE);
         if rx_queue_size == 0
             || tx_queue_size == 0
             || !rx_queue_size.is_power_of_two()
@@ -315,7 +314,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             let mut submitted = 0usize;
             {
                 let mut state = self.tx_state.lock().await;
-                Self::drain_tx_completions(&mut state);
+                Self::drain_tx_completions(&mut state, usize::MAX);
                 let NetTxState {
                     tx_queue,
                     tx_buffers,
@@ -349,51 +348,24 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             }
 
             if submitted != 0 {
-                let mut remaining = submitted;
-                while remaining != 0 {
-                    let completed = {
-                        let mut state = self.tx_state.lock().await;
-                        Self::drain_tx_completions(&mut state)
-                    };
-                    assert!(
-                        completed <= remaining,
-                        "virtio net TX completed more descriptors than the current batch"
-                    );
-                    remaining -= completed;
-                    if remaining == 0 {
-                        break;
-                    }
-                    for _ in 0..TX_COMPLETION_SPIN_POLLS {
-                        core::hint::spin_loop();
-                        let completed = {
-                            let mut state = self.tx_state.lock().await;
-                            Self::drain_tx_completions(&mut state)
-                        };
-                        assert!(
-                            completed <= remaining,
-                            "virtio net TX completed more descriptors than the current batch"
-                        );
-                        remaining -= completed;
-                        if remaining == 0 {
-                            break;
-                        }
-                    }
-                    if remaining != 0 {
-                        wait().await;
-                    }
-                }
-            } else {
-                let should_wait = {
-                    let mut state = self.tx_state.lock().await;
-                    Self::drain_tx_completions(&mut state);
-                    state.tx_queue.available_descriptors() == 0
-                };
-                if should_wait {
-                    wait().await;
-                }
+                continue;
+            }
+
+            let should_wait = {
+                let mut state = self.tx_state.lock().await;
+                Self::drain_tx_completions(&mut state, usize::MAX);
+                state.tx_queue.available_descriptors() == 0
+            };
+            if should_wait {
+                wait().await;
             }
         }
         Ok(())
+    }
+
+    pub async fn reclaim_transmit_completions(&self, budget: usize) -> IoResult<usize> {
+        let mut state = self.tx_state.lock().await;
+        Ok(Self::drain_tx_completions(&mut state, budget))
     }
 
     pub async fn wait_for_interrupt(&self) {
@@ -416,9 +388,12 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         Ok(())
     }
 
-    fn drain_tx_completions(state: &mut NetTxState<T>) -> usize {
+    fn drain_tx_completions(state: &mut NetTxState<T>, budget: usize) -> usize {
         let mut completed = 0usize;
-        while let Some(token) = state.tx_queue.pop_used() {
+        while completed < budget {
+            let Some(token) = state.tx_queue.pop_used() else {
+                break;
+            };
             let token_index = usize::from(token);
             assert!(
                 state.tx_in_flight[token_index],
