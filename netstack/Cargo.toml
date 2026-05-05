@@ -9,3 +9,4 @@ bytes = { version = "1.10.1", default-features = false }
 helios-hal.workspace = true
 heapless = { version = "0.7.17", default-features = false }
 thiserror = { version = "2.0.17", default-features = false }
+wide = { version = "1.3.0", default-features = false }

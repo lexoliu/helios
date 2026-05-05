@@ -80,18 +80,10 @@ fn ipv6_pseudo_sum(
 }
 
 fn sum_words(bytes: &[u8]) -> u32 {
-    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-    {
-        return sum_words_neon(bytes);
-    }
-
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
-    {
-        sum_words_scalar(bytes)
-    }
+    sum_words_wide(bytes)
 }
 
-#[cfg(any(test, not(all(target_arch = "aarch64", target_feature = "neon"))))]
+#[cfg(test)]
 fn sum_words_scalar(bytes: &[u8]) -> u32 {
     let mut chunks = bytes.chunks_exact(2);
     let mut sum = chunks
@@ -104,31 +96,26 @@ fn sum_words_scalar(bytes: &[u8]) -> u32 {
     sum
 }
 
-#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-fn sum_words_neon(bytes: &[u8]) -> u32 {
-    use core::arch::aarch64::{
-        vaddq_u32, vaddvq_u32, vget_high_u16, vget_low_u16, vld1q_u8, vmovl_u16,
-        vreinterpretq_u16_u8, vrev16q_u8,
-    };
+fn sum_words_wide(bytes: &[u8]) -> u32 {
+    use wide::{u16x8, u32x8};
 
     let mut offset = 0usize;
-    let mut low_lanes;
-    let mut high_lanes;
-    unsafe {
-        low_lanes = core::mem::zeroed();
-        high_lanes = core::mem::zeroed();
-    }
+    let mut lanes = u32x8::default();
     while offset + 16 <= bytes.len() {
-        unsafe {
-            let vector = vld1q_u8(bytes.as_ptr().add(offset));
-            let words = vreinterpretq_u16_u8(vrev16q_u8(vector));
-            low_lanes = vaddq_u32(low_lanes, vmovl_u16(vget_low_u16(words)));
-            high_lanes = vaddq_u32(high_lanes, vmovl_u16(vget_high_u16(words)));
-        }
+        lanes += u32x8::from(u16x8::new([
+            u16::from_be_bytes([bytes[offset], bytes[offset + 1]]),
+            u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]),
+            u16::from_be_bytes([bytes[offset + 4], bytes[offset + 5]]),
+            u16::from_be_bytes([bytes[offset + 6], bytes[offset + 7]]),
+            u16::from_be_bytes([bytes[offset + 8], bytes[offset + 9]]),
+            u16::from_be_bytes([bytes[offset + 10], bytes[offset + 11]]),
+            u16::from_be_bytes([bytes[offset + 12], bytes[offset + 13]]),
+            u16::from_be_bytes([bytes[offset + 14], bytes[offset + 15]]),
+        ]));
         offset += 16;
     }
 
-    let mut sum = unsafe { vaddvq_u32(low_lanes) + vaddvq_u32(high_lanes) };
+    let mut sum = lanes.to_array().into_iter().sum::<u32>();
     let mut chunks = bytes[offset..].chunks_exact(2);
     for chunk in chunks.by_ref() {
         sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
