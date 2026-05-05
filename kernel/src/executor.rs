@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 use core::future::Future;
 use core::marker::PhantomData;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 
 use async_task::{Builder, Runnable, Task};
@@ -24,6 +25,7 @@ static EXECUTOR_GROUP: Once<Arc<ExecutorGroup>> = Once::new();
 struct ExecutorGroup {
     local_queues: Box<[Arc<ReadyQueue>]>,
     global_queue: Arc<ReadyQueue>,
+    global_wake_cursor: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -51,6 +53,7 @@ pub struct Spawner<CpuImpl: Cpu + Clone> {
     processor_count: usize,
     progress: ProgressCounter,
     progress_notify: Arc<Notify>,
+    global_wake_cursor: Arc<AtomicUsize>,
 }
 
 pub struct Executor {
@@ -59,6 +62,7 @@ pub struct Executor {
     processor_count: usize,
     progress: ProgressCounter,
     progress_notify: Arc<Notify>,
+    global_wake_cursor: Arc<AtomicUsize>,
 }
 
 impl Executor {
@@ -85,6 +89,7 @@ impl Executor {
             processor_count: group.local_queues.len(),
             progress,
             progress_notify: Arc::new(Notify::new()),
+            global_wake_cursor: group.global_wake_cursor.clone(),
         }
     }
 
@@ -98,6 +103,7 @@ impl Executor {
             processor_count: self.processor_count,
             progress: self.progress.clone(),
             progress_notify: self.progress_notify.clone(),
+            global_wake_cursor: self.global_wake_cursor.clone(),
         }
     }
 
@@ -149,15 +155,7 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         }
 
         match wake {
-            WakeTarget::AllProcessors => {
-                let current_processor = self.cpu.current_processor();
-                for processor in 0..self.processor_count {
-                    let processor = ProcessorId::new(processor as u16);
-                    if processor != current_processor {
-                        self.cpu.wake_processor(processor);
-                    }
-                }
-            }
+            WakeTarget::OneRemoteProcessor => self.wake_one_remote_processor(),
             WakeTarget::OwnerProcessor => {
                 if self.cpu.current_processor() != self.owner_processor {
                     self.cpu.wake_processor(self.owner_processor);
@@ -180,8 +178,24 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
             &self.global_queue,
             runnable,
             progress_mode,
-            WakeTarget::AllProcessors,
+            WakeTarget::OneRemoteProcessor,
         );
+    }
+
+    fn wake_one_remote_processor(&self) {
+        if self.processor_count <= 1 {
+            return;
+        }
+        let current_processor = self.cpu.current_processor();
+        let start = self.global_wake_cursor.fetch_add(1, Ordering::Relaxed);
+        for offset in 0..self.processor_count {
+            let processor = (start + offset) % self.processor_count;
+            let processor = ProcessorId::new(processor as u16);
+            if processor != current_processor {
+                self.cpu.wake_processor(processor);
+                return;
+            }
+        }
     }
 
     fn spawn_with_progress<Fut>(
@@ -267,7 +281,7 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
 
 #[derive(Clone, Copy)]
 enum WakeTarget {
-    AllProcessors,
+    OneRemoteProcessor,
     OwnerProcessor,
 }
 
@@ -285,6 +299,7 @@ fn executor_group(configured_processors: usize) -> Arc<ExecutorGroup> {
             Arc::new(ExecutorGroup {
                 local_queues: local_queues.into_boxed_slice(),
                 global_queue: Arc::new(ConcurrentQueue::unbounded()),
+                global_wake_cursor: Arc::new(AtomicUsize::new(0)),
             })
         })
         .clone()
