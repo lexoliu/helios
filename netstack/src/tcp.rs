@@ -519,13 +519,22 @@ where
             return Some(bytes);
         }
 
-        let mut merged = BytesMut::with_capacity(max_bytes);
+        if self.receive_queue.is_empty() {
+            self.refresh_advertised_window();
+            if self.should_advertise_window_update(previous_window) {
+                self.request_ack();
+            }
+            return Some(bytes);
+        }
+
+        let merge_len = self.receive_merge_len(bytes.len(), max_bytes);
+        let mut merged = BytesMut::with_capacity(merge_len);
         merged.extend_from_slice(&bytes);
-        while merged.len() < max_bytes {
+        while merged.len() < merge_len {
             let Some(mut next) = self.receive_queue.pop_front() else {
                 break;
             };
-            let remaining = max_bytes - merged.len();
+            let remaining = merge_len - merged.len();
             if next.len() > remaining {
                 let tail = next.split_off(remaining);
                 merged.extend_from_slice(&next);
@@ -542,6 +551,17 @@ where
             self.request_ack();
         }
         Some(bytes)
+    }
+
+    fn receive_merge_len(&self, first_len: usize, max_bytes: usize) -> usize {
+        let mut len = first_len;
+        for segment in &self.receive_queue {
+            if len >= max_bytes {
+                return max_bytes;
+            }
+            len = len.saturating_add(segment.len().min(max_bytes - len));
+        }
+        len
     }
 
     pub fn on_segment(&mut self, packet: TcpPacket<'_>, now_nanos: u64) -> TcpSegmentOutcome {
@@ -1235,6 +1255,53 @@ mod tests {
 
         assert_eq!(socket.receive(7).as_deref(), Some(b"abcdefg".as_slice()));
         assert_eq!(socket.receive(7).as_deref(), Some(b"hij".as_slice()));
+    }
+
+    #[test]
+    fn receive_single_segment_does_not_allocate_merge_buffer() {
+        let mut socket = established_socket();
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                payload: b"abc",
+            },
+            TCP_INITIAL_RTO_NANOS + 1,
+        );
+
+        assert_eq!(
+            socket.receive(usize::MAX).as_deref(),
+            Some(b"abc".as_slice())
+        );
+    }
+
+    #[test]
+    fn receive_merge_len_uses_available_bytes_not_read_budget() {
+        let mut socket = established_socket();
+        for (index, payload) in [b"abc".as_slice(), b"defg".as_slice()]
+            .into_iter()
+            .enumerate()
+        {
+            let _ = socket.on_segment(
+                TcpPacket {
+                    source_port: 80,
+                    destination_port: 49152,
+                    sequence: 101 + index as u32 * 3,
+                    acknowledgement: 8,
+                    flags: TcpFlags::ACK,
+                    window_size: u16::MAX,
+                    payload,
+                },
+                TCP_INITIAL_RTO_NANOS + index as u64 + 1,
+            );
+        }
+
+        assert_eq!(socket.receive_merge_len(0, usize::MAX), 7);
+        assert_eq!(socket.receive_merge_len(0, 5), 5);
     }
 
     #[test]
