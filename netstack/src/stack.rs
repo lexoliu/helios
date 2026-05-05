@@ -8,7 +8,7 @@ use arrayvec::ArrayVec;
 use crate::{
     ArpOperation, ArpPacket, BbrV3, DEFAULT_POLL_BUDGET, EthernetAddress, EthernetFrame,
     EthernetProtocol, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Cidr, Ipv6Packet,
-    PacketBuffer, StackError, TcpEndpoint, TcpSocket, UdpPacket,
+    PacketBuffer, StackError, TcpEndpoint, TcpHeader, TcpPacket, TcpSocket, UdpPacket,
 };
 
 pub const MAX_ROUTES: usize = 32;
@@ -172,7 +172,9 @@ pub struct DhcpLease {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UdpReceive {
     pub source: IpAddress,
+    pub destination: IpAddress,
     pub source_port: u16,
+    pub destination_port: u16,
     pub bytes: Vec<u8>,
 }
 
@@ -215,6 +217,7 @@ pub struct Stack {
     neighbors: ArrayVec<NeighborEntry, MAX_NEIGHBORS>,
     outbound: VecDeque<PacketBuffer>,
     events: VecDeque<StackEvent>,
+    udp_rx: VecDeque<UdpReceive>,
     tcp: Vec<Option<TcpSocket<BbrV3>>>,
 }
 
@@ -228,6 +231,7 @@ impl Stack {
             neighbors: ArrayVec::new(),
             outbound: VecDeque::new(),
             events: VecDeque::new(),
+            udp_rx: VecDeque::new(),
             tcp: Vec::new(),
         }
     }
@@ -354,6 +358,14 @@ impl Stack {
         self.events.pop_front()
     }
 
+    pub fn take_udp(&mut self, local_port: u16) -> Option<UdpReceive> {
+        let index = self
+            .udp_rx
+            .iter()
+            .position(|datagram| datagram.destination_port == local_port)?;
+        self.udp_rx.remove(index)
+    }
+
     pub fn open_tcp_connect(
         &mut self,
         local: TcpEndpoint,
@@ -371,6 +383,37 @@ impl Stack {
             crate::TcpState::Closed | crate::TcpState::TimeWait => TcpConnectState::Closed,
             _ => TcpConnectState::Pending,
         })
+    }
+
+    pub fn drive_tcp(&mut self, now: StackInstant) -> Result<(), StackError> {
+        let mut pending = ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader), 16>::new();
+        for (index, socket) in self.tcp.iter().enumerate() {
+            let Some(socket) = socket else {
+                continue;
+            };
+            let Some(header) = socket.pending_syn() else {
+                continue;
+            };
+            let (Some(local), Some(remote)) = (socket.local_endpoint(), socket.remote_endpoint())
+            else {
+                panic!("connecting TCP socket must have local and remote endpoints");
+            };
+            pending
+                .try_push((index, local, remote, header))
+                .unwrap_or_else(|_| panic!("TCP control transmit burst overflowed"));
+        }
+
+        for (index, local, remote, header) in pending {
+            if self.queue_tcp(local, remote, header, &[], index as u16, now)? {
+                let socket = self
+                    .tcp
+                    .get_mut(index)
+                    .and_then(Option::as_mut)
+                    .expect("TCP socket disappeared while queuing SYN");
+                socket.mark_syn_queued(now.nanos());
+            }
+        }
+        Ok(())
     }
 
     pub fn tcp_send(&mut self, socket: SocketId, bytes: &[u8]) -> Result<usize, StackError> {
@@ -401,17 +444,63 @@ impl Stack {
         let source = self
             .source_ipv4_for(destination)
             .ok_or(StackError::Unroutable)?;
+        self.send_udp_ipv4_from(
+            source,
+            source_port,
+            destination,
+            destination_port,
+            payload,
+            identification,
+            now,
+        )
+    }
+
+    pub fn send_udp_ipv4_from(
+        &mut self,
+        source: Ipv4Address,
+        source_port: u16,
+        destination: Ipv4Address,
+        destination_port: u16,
+        payload: &[u8],
+        identification: u16,
+        now: StackInstant,
+    ) -> Result<usize, StackError> {
         let next_hop = self.next_hop(IpAddress::Ipv4(destination));
         let next_hop = match next_hop {
             Some(IpAddress::Ipv4(next_hop)) => next_hop,
             Some(IpAddress::Ipv6(_)) => panic!("IPv4 route resolved to IPv6 next hop"),
             None => destination,
         };
-        let Some(destination_mac) = self.neighbor_mac(IpAddress::Ipv4(next_hop)) else {
-            self.queue_arp_request(source, next_hop, now)?;
-            return Ok(0);
+        let destination_mac = if destination == Ipv4Address::BROADCAST {
+            [0xff; 6]
+        } else {
+            let Some(destination_mac) = self.neighbor_mac(IpAddress::Ipv4(next_hop)) else {
+                self.queue_arp_request(source, next_hop, now)?;
+                return Ok(0);
+            };
+            destination_mac
         };
+        self.queue_udp_ipv4(
+            source,
+            source_port,
+            destination,
+            destination_port,
+            destination_mac,
+            payload,
+            identification,
+        )
+    }
 
+    fn queue_udp_ipv4(
+        &mut self,
+        source: Ipv4Address,
+        source_port: u16,
+        destination: Ipv4Address,
+        destination_port: u16,
+        destination_mac: EthernetAddress,
+        payload: &[u8],
+        identification: u16,
+    ) -> Result<usize, StackError> {
         let mut frame = PacketBuffer::new();
         let storage = frame.storage_mut();
         let mut offset = EthernetFrame::encode_header(
@@ -443,6 +532,76 @@ impl Stack {
         frame.set_len(offset);
         self.outbound.push_back(frame);
         Ok(payload.len())
+    }
+
+    fn queue_tcp(
+        &mut self,
+        local: TcpEndpoint,
+        remote: TcpEndpoint,
+        header: TcpHeader,
+        payload: &[u8],
+        identification: u16,
+        now: StackInstant,
+    ) -> Result<bool, StackError> {
+        match (local.address, remote.address) {
+            (IpAddress::Ipv4(source), IpAddress::Ipv4(destination)) => {
+                self.queue_tcp_ipv4(source, destination, header, payload, identification, now)
+            }
+            (IpAddress::Ipv6(_), IpAddress::Ipv6(_)) => Ok(false),
+            _ => panic!("TCP endpoint address families must match"),
+        }
+    }
+
+    fn queue_tcp_ipv4(
+        &mut self,
+        source: Ipv4Address,
+        destination: Ipv4Address,
+        header: TcpHeader,
+        payload: &[u8],
+        identification: u16,
+        now: StackInstant,
+    ) -> Result<bool, StackError> {
+        let next_hop = self.next_hop(IpAddress::Ipv4(destination));
+        let next_hop = match next_hop {
+            Some(IpAddress::Ipv4(next_hop)) => next_hop,
+            Some(IpAddress::Ipv6(_)) => panic!("IPv4 route resolved to IPv6 next hop"),
+            None => destination,
+        };
+        let Some(destination_mac) = self.neighbor_mac(IpAddress::Ipv4(next_hop)) else {
+            self.queue_arp_request(source, next_hop, now)?;
+            return Ok(false);
+        };
+
+        let mut frame = PacketBuffer::new();
+        let storage = frame.storage_mut();
+        let mut offset = EthernetFrame::encode_header(
+            storage,
+            destination_mac,
+            self.config.mac,
+            EthernetProtocol::Ipv4,
+        )
+        .ok_or(StackError::OutputQueueFull)?;
+        offset += Ipv4Packet::encode_header(
+            &mut storage[offset..],
+            source,
+            destination,
+            crate::IpProtocol::Tcp,
+            TcpPacket::MIN_HEADER_LEN + payload.len(),
+            identification,
+            64,
+        )
+        .ok_or(StackError::OutputQueueFull)?;
+        offset += TcpPacket::encode(
+            &mut storage[offset..],
+            IpAddress::Ipv4(source),
+            IpAddress::Ipv4(destination),
+            header,
+            payload,
+        )
+        .ok_or(StackError::OutputQueueFull)?;
+        frame.set_len(offset);
+        self.outbound.push_back(frame);
+        Ok(true)
     }
 
     fn receive_arp(
@@ -479,7 +638,11 @@ impl Stack {
                 now,
             ),
             crate::IpProtocol::Udp => {
-                let _ = UdpPacket::parse(packet.payload).ok_or(StackError::MalformedPacket)?;
+                self.receive_udp(
+                    IpAddress::Ipv4(packet.source),
+                    IpAddress::Ipv4(packet.destination),
+                    packet.payload,
+                )?;
                 Ok(())
             }
             crate::IpProtocol::Icmp | crate::IpProtocol::Icmpv6 => Ok(()),
@@ -496,7 +659,11 @@ impl Stack {
                 now,
             ),
             crate::IpProtocol::Udp => {
-                let _ = UdpPacket::parse(packet.payload).ok_or(StackError::MalformedPacket)?;
+                self.receive_udp(
+                    IpAddress::Ipv6(packet.source),
+                    IpAddress::Ipv6(packet.destination),
+                    packet.payload,
+                )?;
                 Ok(())
             }
             crate::IpProtocol::Icmp | crate::IpProtocol::Icmpv6 => Ok(()),
@@ -629,6 +796,23 @@ impl Stack {
                 return Ok(());
             }
         }
+        Ok(())
+    }
+
+    fn receive_udp(
+        &mut self,
+        source: IpAddress,
+        destination: IpAddress,
+        bytes: &[u8],
+    ) -> Result<(), StackError> {
+        let packet = UdpPacket::parse(bytes).ok_or(StackError::MalformedPacket)?;
+        self.udp_rx.push_back(UdpReceive {
+            source,
+            destination,
+            source_port: packet.source_port,
+            destination_port: packet.destination_port,
+            bytes: packet.payload.to_vec(),
+        });
         Ok(())
     }
 

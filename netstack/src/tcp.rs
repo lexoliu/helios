@@ -4,7 +4,8 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use crate::{
-    AckSample, CongestionControl, CongestionEvent, IpAddress, RecoveryAction, TcpFlags, TcpPacket,
+    AckSample, CongestionControl, CongestionEvent, IpAddress, RecoveryAction, TcpFlags, TcpHeader,
+    TcpPacket,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -45,6 +46,7 @@ where
     transmit_queue: VecDeque<Vec<u8>>,
     bytes_in_flight: u32,
     delivered_bytes: u64,
+    syn_queued: bool,
 }
 
 impl<C> TcpSocket<C>
@@ -65,6 +67,7 @@ where
             transmit_queue: VecDeque::new(),
             bytes_in_flight: 0,
             delivered_bytes: 0,
+            syn_queued: false,
         }
     }
 
@@ -104,6 +107,33 @@ where
 
     pub fn congestion(&self) -> &C {
         &self.congestion
+    }
+
+    pub fn pending_syn(&self) -> Option<TcpHeader> {
+        if self.state != TcpState::SynSent || self.syn_queued {
+            return None;
+        }
+        let local = self.local?;
+        let remote = self.remote?;
+        Some(TcpHeader {
+            source_port: local.port,
+            destination_port: remote.port,
+            sequence: self.send_unacknowledged,
+            acknowledgement: 0,
+            flags: TcpFlags::SYN,
+            window_size: self.advertised_window,
+        })
+    }
+
+    pub fn mark_syn_queued(&mut self, now_nanos: u64) {
+        assert!(
+            self.state == TcpState::SynSent,
+            "SYN can only be queued while connecting"
+        );
+        self.syn_queued = true;
+        self.bytes_in_flight = self.bytes_in_flight.saturating_add(1);
+        self.congestion
+            .on_packet_sent(1, self.bytes_in_flight, now_nanos);
     }
 
     pub const fn advertised_window(&self) -> u16 {

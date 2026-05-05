@@ -4,6 +4,8 @@ extern crate alloc;
 
 mod checksum;
 mod congestion;
+mod dhcp;
+mod dns;
 mod packet;
 mod stack;
 mod tcp;
@@ -21,9 +23,14 @@ pub use congestion::{
     AckSample, BbrV3, CongestionControl, CongestionEvent, CongestionWindow, Cubic, NewReno,
     PacingRate, RecoveryAction,
 };
+pub use dhcp::{
+    DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DhcpClientMessage, DhcpMessageType, DhcpOptionBuffer,
+    DhcpOptionWriter, DhcpPacket, DhcpServerMessage,
+};
+pub use dns::{DNS_PORT, DnsMessage, DnsQuestionWriter, DnsResponse};
 pub use packet::{
     ArpOperation, ArpPacket, EthernetFrame, EthernetProtocol, Icmpv4Echo, Icmpv4Packet, Icmpv6Echo,
-    Icmpv6Packet, IpProtocol, Ipv4Packet, Ipv6Packet, TcpFlags, TcpPacket, UdpPacket,
+    Icmpv6Packet, IpProtocol, Ipv4Packet, Ipv6Packet, TcpFlags, TcpHeader, TcpPacket, UdpPacket,
 };
 pub use stack::{
     DhcpLease, DnsQueryId, IcmpEchoKey, NeighborState, Route, RouteTable, SocketId, Stack,

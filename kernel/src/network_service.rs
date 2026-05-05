@@ -13,8 +13,10 @@ use core::time::Duration;
 use helios_hal::cpu::Cpu;
 use helios_hal::io::IoError;
 use helios_netstack::{
-    IpAddress, IpCidr, Ipv4Address, Ipv4Cidr, NetworkInterface as NetworkDevice, PacketBuffer,
-    Route, Stack, StackConfig, StackInstant, TcpConnectState, TcpEndpoint, TcpReadState,
+    DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage, DhcpMessageType, DhcpPacket,
+    DnsQuestionWriter, DnsResponse, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr,
+    NetworkInterface as NetworkDevice, PacketBuffer, Route, Stack, StackConfig, StackInstant,
+    TcpConnectState, TcpEndpoint, TcpReadState,
 };
 
 use crate::{
@@ -27,7 +29,9 @@ use crate::{
 
 const EPHEMERAL_PORT_START: u16 = 49_152;
 const EPHEMERAL_PORT_END: u16 = 65_535;
+const INTERNAL_DNS_PORT: u16 = 49_151;
 const LOCAL_NETWORK_PORT: NetworkPortId = NetworkPortId::new(0);
+const DHCP_RETRANSMIT_NANOS: u64 = 1_000_000_000;
 
 #[derive(Clone)]
 pub struct NetworkService<CpuImpl, Runtime, Device>
@@ -228,6 +232,27 @@ struct NetworkState {
     tcp_streams: Vec<Option<helios_netstack::SocketId>>,
     tcp_listeners: Vec<Option<TcpListenerState>>,
     udp_sockets: Vec<Option<UdpSocketState>>,
+    dhcp: DhcpClientState,
+    dns_servers: Vec<Ipv4Address>,
+    next_dns_query_id: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DhcpClientState {
+    Init {
+        transaction_id: u32,
+    },
+    Selecting {
+        transaction_id: u32,
+        last_sent: StackInstant,
+    },
+    Requesting {
+        transaction_id: u32,
+        requested_ip: Ipv4Address,
+        server_identifier: Ipv4Address,
+        last_sent: StackInstant,
+    },
+    Bound,
 }
 
 struct TcpListenerState {
@@ -273,6 +298,26 @@ fn require_local_network_port(port: NetworkPortId) -> Result<(), NetworkControlE
     }
 }
 
+fn ipv4_mask_prefix_len(mask: Ipv4Address) -> Result<u8, NetworkControlError> {
+    let raw = u32::from_be_bytes(mask.octets());
+    let prefix_len = raw.leading_ones() as u8;
+    let expected = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len)
+    };
+    if raw == expected {
+        Ok(prefix_len)
+    } else {
+        Err(NetworkControlError::InvalidAddress)
+    }
+}
+
+const fn next_transaction_id(current: u32) -> u32 {
+    let next = current.wrapping_add(1);
+    if next == 0 { 1 } else { next }
+}
+
 impl<CpuImpl, Runtime, DeviceImpl> NetworkService<CpuImpl, Runtime, DeviceImpl>
 where
     CpuImpl: Cpu + Clone,
@@ -285,6 +330,7 @@ where
         timer: Timer<CpuImpl>,
         device: DeviceImpl,
     ) -> Self {
+        let transaction_id = cpu.now().ticks() as u32;
         Self {
             inner: Arc::new(NetworkServiceInner {
                 cpu,
@@ -293,6 +339,7 @@ where
                 state: crate::Mutex::new(NetworkState::new(
                     device.mac_address(),
                     device.max_frame_len(),
+                    transaction_id,
                 )),
                 device,
                 requests: ConcurrentQueue::unbounded(),
@@ -599,17 +646,38 @@ where
     async fn execute_dns_resolve(
         &self,
         host: &str,
-        deadline_nanos: u64,
+        timeout_nanos: u64,
     ) -> Result<Vec<KernelIpv4Address>, DnsError> {
         if let Some(address) = parse_ipv4(host) {
             return Ok(vec![map_ipv4_address(address)]);
         }
-        self.wait_for_ipv4_dns(self.now_nanos().saturating_add(deadline_nanos))
-            .await?;
-        Err(DnsError {
-            kind: DnsErrorKind::UnresolvedHost,
-            detail: NetworkErrorDetail::DnsLookupFailed,
-        })
+        let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
+        self.wait_for_ipv4_dns(deadline_nanos).await?;
+        let query_id = {
+            let mut state = self.inner.state.lock().await;
+            state.next_dns_query_id()
+        };
+
+        loop {
+            self.drive_dns().await?;
+            let now = StackInstant::from_nanos(self.now_nanos());
+            let query = {
+                let mut state = self.inner.state.lock().await;
+                state.send_dns_query(query_id, host, now)?;
+                state.take_dns_response(query_id)?
+            };
+            if let Some(addresses) = query {
+                return Ok(addresses.into_iter().map(map_ipv4_address).collect());
+            }
+            if self.now_nanos() >= deadline_nanos {
+                return Err(DnsError {
+                    kind: DnsErrorKind::Timeout,
+                    detail: NetworkErrorDetail::DnsLookupTimeout,
+                });
+            }
+            self.drive_dns().await?;
+            self.wait_for_progress(Duration::from_millis(1)).await;
+        }
     }
 
     async fn execute_tcp_connect(
@@ -886,34 +954,93 @@ where
     async fn resolve_host_ping(
         &self,
         host: &str,
-        _deadline_nanos: u64,
+        deadline_nanos: u64,
     ) -> Result<Ipv4Address, PingError> {
-        parse_ipv4(host).ok_or(PingError {
-            kind: PingErrorKind::UnresolvedHost,
-            detail: NetworkErrorDetail::DnsLookupFailed,
-        })
+        if let Some(address) = parse_ipv4(host) {
+            return Ok(address);
+        }
+        let timeout_nanos = deadline_nanos.saturating_sub(self.now_nanos());
+        let addresses = self
+            .execute_dns_resolve(host, timeout_nanos)
+            .await
+            .map_err(|error| PingError {
+                kind: match error.kind {
+                    DnsErrorKind::Timeout => PingErrorKind::Timeout,
+                    DnsErrorKind::Unavailable | DnsErrorKind::Internal => {
+                        PingErrorKind::Unavailable
+                    }
+                    DnsErrorKind::UnresolvedHost => PingErrorKind::UnresolvedHost,
+                },
+                detail: error.detail,
+            })?;
+        addresses
+            .into_iter()
+            .next()
+            .map(map_kernel_ipv4_address)
+            .ok_or(PingError {
+                kind: PingErrorKind::UnresolvedHost,
+                detail: NetworkErrorDetail::DnsNoIpv4Address,
+            })
     }
 
     async fn resolve_host_tcp(
         &self,
         host: &str,
-        _deadline_nanos: u64,
+        deadline_nanos: u64,
     ) -> Result<Ipv4Address, TcpError> {
-        parse_ipv4(host).ok_or(TcpError {
-            kind: TcpErrorKind::UnresolvedHost,
-            detail: NetworkErrorDetail::DnsLookupFailed,
-        })
+        if let Some(address) = parse_ipv4(host) {
+            return Ok(address);
+        }
+        let timeout_nanos = deadline_nanos.saturating_sub(self.now_nanos());
+        let addresses = self
+            .execute_dns_resolve(host, timeout_nanos)
+            .await
+            .map_err(|error| TcpError {
+                kind: match error.kind {
+                    DnsErrorKind::Timeout => TcpErrorKind::Timeout,
+                    DnsErrorKind::Unavailable | DnsErrorKind::Internal => TcpErrorKind::Unavailable,
+                    DnsErrorKind::UnresolvedHost => TcpErrorKind::UnresolvedHost,
+                },
+                detail: error.detail,
+            })?;
+        addresses
+            .into_iter()
+            .next()
+            .map(map_kernel_ipv4_address)
+            .ok_or(TcpError {
+                kind: TcpErrorKind::UnresolvedHost,
+                detail: NetworkErrorDetail::DnsNoIpv4Address,
+            })
     }
 
     async fn resolve_host_udp(
         &self,
         host: &str,
-        _deadline_nanos: u64,
+        deadline_nanos: u64,
     ) -> Result<Ipv4Address, UdpError> {
-        parse_ipv4(host).ok_or(UdpError {
-            kind: UdpErrorKind::UnresolvedHost,
-            detail: NetworkErrorDetail::DnsLookupFailed,
-        })
+        if let Some(address) = parse_ipv4(host) {
+            return Ok(address);
+        }
+        let timeout_nanos = deadline_nanos.saturating_sub(self.now_nanos());
+        let addresses = self
+            .execute_dns_resolve(host, timeout_nanos)
+            .await
+            .map_err(|error| UdpError {
+                kind: match error.kind {
+                    DnsErrorKind::Timeout => UdpErrorKind::Timeout,
+                    DnsErrorKind::Unavailable | DnsErrorKind::Internal => UdpErrorKind::Unavailable,
+                    DnsErrorKind::UnresolvedHost => UdpErrorKind::UnresolvedHost,
+                },
+                detail: error.detail,
+            })?;
+        addresses
+            .into_iter()
+            .next()
+            .map(map_kernel_ipv4_address)
+            .ok_or(UdpError {
+                kind: UdpErrorKind::UnresolvedHost,
+                detail: NetworkErrorDetail::DnsNoIpv4Address,
+            })
     }
 
     async fn drive_ping(&self) -> Result<(), PingError> {
@@ -965,6 +1092,14 @@ where
             }
         }
         self.record_network_profile("rx-drain", receive_started);
+
+        {
+            let mut state = self.inner.state.lock().await;
+            state
+                .stack
+                .drive_tcp(StackInstant::from_nanos(self.now_nanos()))
+                .unwrap_or_else(|error| tracing::debug!(?error, "failed to drive TCP control"));
+        }
 
         let mut transmitted = 0usize;
         let transmit_started = self.profile_start();
@@ -1047,9 +1182,18 @@ where
             self.drive_network()
                 .await
                 .map_err(|_| NetworkControlError::BackendFault)?;
-            if let Some(cidr) = self.inner.state.lock().await.stack.primary_ipv4_address() {
-                return Ok(map_ipv4_cidr(cidr));
+            let now = StackInstant::from_nanos(self.now_nanos());
+            let next = {
+                let mut state = self.inner.state.lock().await;
+                state.drive_dhcp(now)?;
+                state.stack.primary_ipv4_address().map(map_ipv4_cidr)
+            };
+            if let Some(cidr) = next {
+                return Ok(cidr);
             }
+            self.drive_network()
+                .await
+                .map_err(|_| NetworkControlError::BackendFault)?;
             self.wait_for_progress(Duration::from_millis(1)).await;
         }
     }
@@ -1329,7 +1473,7 @@ where
 }
 
 impl NetworkState {
-    fn new(mac: [u8; 6], max_frame_len: usize) -> Self {
+    fn new(mac: [u8; 6], max_frame_len: usize, transaction_id: u32) -> Self {
         Self {
             stack: Stack::new(StackConfig::new(mac, max_frame_len)),
             next_tcp_local_port: EPHEMERAL_PORT_START,
@@ -1337,11 +1481,224 @@ impl NetworkState {
             tcp_streams: Vec::new(),
             tcp_listeners: Vec::new(),
             udp_sockets: Vec::new(),
+            dhcp: DhcpClientState::Init { transaction_id },
+            dns_servers: Vec::new(),
+            next_dns_query_id: 1,
         }
     }
 
     fn is_configured(&self) -> bool {
         self.stack.primary_ipv4_address().is_some()
+    }
+
+    fn drive_dhcp(&mut self, now: StackInstant) -> Result<(), NetworkControlError> {
+        while let Some(datagram) = self.stack.take_udp(DHCP_CLIENT_PORT) {
+            let Some(message) =
+                DhcpPacket::parse(&datagram.bytes).and_then(DhcpPacket::server_message)
+            else {
+                continue;
+            };
+            match (self.dhcp, message.message_type) {
+                (DhcpClientState::Selecting { transaction_id, .. }, DhcpMessageType::Offer)
+                    if message.transaction_id == transaction_id =>
+                {
+                    let server_identifier = message
+                        .server_identifier
+                        .ok_or(NetworkControlError::BackendFault)?;
+                    self.send_dhcp_request(
+                        transaction_id,
+                        message.your_ip,
+                        server_identifier,
+                        now,
+                    )?;
+                    self.dhcp = DhcpClientState::Requesting {
+                        transaction_id,
+                        requested_ip: message.your_ip,
+                        server_identifier,
+                        last_sent: now,
+                    };
+                }
+                (DhcpClientState::Requesting { transaction_id, .. }, DhcpMessageType::Ack)
+                    if message.transaction_id == transaction_id =>
+                {
+                    let prefix_len = message
+                        .subnet_mask
+                        .map(ipv4_mask_prefix_len)
+                        .transpose()?
+                        .ok_or(NetworkControlError::InvalidAddress)?;
+                    self.stack
+                        .add_ipv4_address(Ipv4Cidr::new(message.your_ip, prefix_len));
+                    if let Some(router) = message.router {
+                        self.set_default_ipv4_gateway(map_ipv4_address(router))?;
+                    }
+                    self.dns_servers.clear();
+                    self.dns_servers.extend(message.dns_servers);
+                    self.dhcp = DhcpClientState::Bound;
+                }
+                (_, DhcpMessageType::Nak) => {
+                    self.stack.clear_ipv4_addresses();
+                    self.dhcp = DhcpClientState::Init {
+                        transaction_id: next_transaction_id(message.transaction_id),
+                    };
+                }
+                _ => {}
+            }
+        }
+
+        if let DhcpClientState::Init { transaction_id } = self.dhcp {
+            self.send_dhcp_discover(transaction_id, now)?;
+            self.dhcp = DhcpClientState::Selecting {
+                transaction_id,
+                last_sent: now,
+            };
+        } else {
+            self.retransmit_dhcp(now)?;
+        }
+        Ok(())
+    }
+
+    fn retransmit_dhcp(&mut self, now: StackInstant) -> Result<(), NetworkControlError> {
+        match self.dhcp {
+            DhcpClientState::Selecting {
+                transaction_id,
+                last_sent,
+            } if now.nanos().saturating_sub(last_sent.nanos()) >= DHCP_RETRANSMIT_NANOS => {
+                self.send_dhcp_discover(transaction_id, now)?;
+                self.dhcp = DhcpClientState::Selecting {
+                    transaction_id,
+                    last_sent: now,
+                };
+            }
+            DhcpClientState::Requesting {
+                transaction_id,
+                requested_ip,
+                server_identifier,
+                last_sent,
+            } if now.nanos().saturating_sub(last_sent.nanos()) >= DHCP_RETRANSMIT_NANOS => {
+                self.send_dhcp_request(transaction_id, requested_ip, server_identifier, now)?;
+                self.dhcp = DhcpClientState::Requesting {
+                    transaction_id,
+                    requested_ip,
+                    server_identifier,
+                    last_sent: now,
+                };
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn send_dhcp_discover(
+        &mut self,
+        transaction_id: u32,
+        now: StackInstant,
+    ) -> Result<(), NetworkControlError> {
+        let message = DhcpClientMessage::discover(transaction_id, self.stack.config().mac);
+        self.send_dhcp_message(message, transaction_id as u16, now)
+    }
+
+    fn send_dhcp_request(
+        &mut self,
+        transaction_id: u32,
+        requested_ip: Ipv4Address,
+        server_identifier: Ipv4Address,
+        now: StackInstant,
+    ) -> Result<(), NetworkControlError> {
+        let message = DhcpClientMessage::request(
+            transaction_id,
+            self.stack.config().mac,
+            requested_ip,
+            server_identifier,
+        );
+        self.send_dhcp_message(message, transaction_id as u16, now)
+    }
+
+    fn send_dhcp_message(
+        &mut self,
+        message: DhcpClientMessage,
+        identification: u16,
+        now: StackInstant,
+    ) -> Result<(), NetworkControlError> {
+        let mut payload = [0u8; 548];
+        let len = message
+            .encode(&mut payload)
+            .ok_or(NetworkControlError::BackendFault)?;
+        self.stack
+            .send_udp_ipv4_from(
+                Ipv4Address::UNSPECIFIED,
+                DHCP_CLIENT_PORT,
+                Ipv4Address::BROADCAST,
+                DHCP_SERVER_PORT,
+                &payload[..len],
+                identification,
+                now,
+            )
+            .map(|_| ())
+            .map_err(|_| NetworkControlError::BackendFault)
+    }
+
+    fn next_dns_query_id(&mut self) -> u16 {
+        let id = self.next_dns_query_id;
+        self.next_dns_query_id = self.next_dns_query_id.wrapping_add(1);
+        if self.next_dns_query_id == 0 {
+            self.next_dns_query_id = 1;
+        }
+        id
+    }
+
+    fn send_dns_query(
+        &mut self,
+        query_id: u16,
+        host: &str,
+        now: StackInstant,
+    ) -> Result<(), DnsError> {
+        let Some(server) = self.dns_servers.first().copied() else {
+            return Err(DnsError {
+                kind: DnsErrorKind::Unavailable,
+                detail: NetworkErrorDetail::DnsServersUnavailable,
+            });
+        };
+        let mut payload = [0u8; 512];
+        let len = DnsQuestionWriter::new(&mut payload)
+            .write_a_query(query_id, host)
+            .ok_or(DnsError {
+                kind: DnsErrorKind::UnresolvedHost,
+                detail: NetworkErrorDetail::DnsQueryStartFailed,
+            })?;
+        self.stack
+            .send_udp_ipv4(
+                INTERNAL_DNS_PORT,
+                server,
+                DNS_PORT,
+                &payload[..len],
+                query_id,
+                now,
+            )
+            .map(|_| ())
+            .map_err(|_| DnsError {
+                kind: DnsErrorKind::Unavailable,
+                detail: NetworkErrorDetail::DnsQueryStartFailed,
+            })
+    }
+
+    fn take_dns_response(&mut self, query_id: u16) -> Result<Option<Vec<Ipv4Address>>, DnsError> {
+        while let Some(datagram) = self.stack.take_udp(INTERNAL_DNS_PORT) {
+            let Some(message) = DnsResponse::parse(&datagram.bytes).and_then(DnsResponse::message)
+            else {
+                continue;
+            };
+            if message.id != query_id {
+                continue;
+            }
+            if message.addresses.is_empty() {
+                return Err(DnsError {
+                    kind: DnsErrorKind::UnresolvedHost,
+                    detail: NetworkErrorDetail::DnsNoIpv4Address,
+                });
+            }
+            return Ok(Some(message.addresses));
+        }
+        Ok(None)
     }
 
     fn start_tcp_connect(
@@ -1491,8 +1848,20 @@ impl NetworkState {
         socket: UdpSocketId,
         _max_bytes: usize,
     ) -> Result<Option<UdpDatagram>, UdpError> {
-        self.udp_socket(socket)?;
-        Ok(None)
+        let local_port = self.udp_socket(socket)?.local_port;
+        loop {
+            let Some(datagram) = self.stack.take_udp(local_port) else {
+                return Ok(None);
+            };
+            let IpAddress::Ipv4(address) = datagram.source else {
+                continue;
+            };
+            return Ok(Some(UdpDatagram {
+                address: map_ipv4_address(address),
+                port: datagram.source_port,
+                bytes: datagram.bytes,
+            }));
+        }
     }
 
     fn remove_tcp_stream(&mut self, stream: TcpStreamId) {
