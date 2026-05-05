@@ -1,12 +1,12 @@
 extern crate alloc;
 
 use alloc::string::String;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use slab::Slab;
 use spin::Mutex;
+use triomphe::Arc;
 
 const INACTIVE_RESUME_AT: u64 = u64::MAX;
 
@@ -247,10 +247,9 @@ impl InstanceRegistry {
     /// workloads is "indefinitely".
     pub fn request_kill(&self, id: InstanceId, reason: KillReason) -> bool {
         let entries = self.inner.entries.lock();
-        let Some(entry) =
-            entries
-                .iter()
-                .find_map(|(_, entry)| if entry.id == id { Some(entry) } else { None })
+        let Some(entry) = entries
+            .iter()
+            .find_map(|(_, entry)| if entry.id == id { Some(entry) } else { None })
         else {
             return false;
         };
