@@ -51,6 +51,12 @@ impl StackConfig {
             rx_budget: DEFAULT_POLL_BUDGET,
         }
     }
+
+    pub const fn with_rx_budget(mut self, rx_budget: usize) -> Self {
+        assert!(rx_budget != 0, "RX poll budget must be non-zero");
+        self.rx_budget = rx_budget;
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

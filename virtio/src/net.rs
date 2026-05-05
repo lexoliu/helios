@@ -12,7 +12,7 @@ use crate::transport::{DeviceStatus, DeviceType, VirtioFeatures, VirtioTransport
 
 const RX_QUEUE_INDEX: u16 = 0;
 const TX_QUEUE_INDEX: u16 = 1;
-const QUEUE_SIZE: u16 = 16;
+const QUEUE_SIZE: u16 = 64;
 const ETH_HEADER_LEN: usize = 14;
 const DEFAULT_IP_MTU: usize = 1500;
 const NET_FEATURE_MAC: u64 = 1 << 5;
