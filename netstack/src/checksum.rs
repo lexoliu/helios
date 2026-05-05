@@ -97,21 +97,22 @@ fn sum_words_scalar(bytes: &[u8]) -> u32 {
 }
 
 fn sum_words_wide(bytes: &[u8]) -> u32 {
-    use wide::{u16x8, u32x8};
+    use wide::{u8x16, u16x8, u32x8};
 
     let mut offset = 0usize;
     let mut lanes = u32x8::default();
+    let high_byte_indices = u8x16::new([
+        0, 2, 4, 6, 8, 10, 12, 14, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+    ]);
+    let low_byte_indices = u8x16::new([
+        1, 3, 5, 7, 9, 11, 13, 15, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+    ]);
     while offset + 16 <= bytes.len() {
-        lanes += u32x8::from(u16x8::new([
-            u16::from_be_bytes([bytes[offset], bytes[offset + 1]]),
-            u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]),
-            u16::from_be_bytes([bytes[offset + 4], bytes[offset + 5]]),
-            u16::from_be_bytes([bytes[offset + 6], bytes[offset + 7]]),
-            u16::from_be_bytes([bytes[offset + 8], bytes[offset + 9]]),
-            u16::from_be_bytes([bytes[offset + 10], bytes[offset + 11]]),
-            u16::from_be_bytes([bytes[offset + 12], bytes[offset + 13]]),
-            u16::from_be_bytes([bytes[offset + 14], bytes[offset + 15]]),
-        ]));
+        let vector = u8x16::from(&bytes[offset..offset + 16]);
+        let high_bytes = vector.swizzle_relaxed(high_byte_indices);
+        let low_bytes = vector.swizzle_relaxed(low_byte_indices);
+        let words = (u16x8::from_u8x16_low(high_bytes) << 8u8) | u16x8::from_u8x16_low(low_bytes);
+        lanes += u32x8::from(words);
         offset += 16;
     }
 
