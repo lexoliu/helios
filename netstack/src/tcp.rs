@@ -11,6 +11,8 @@ use crate::{
 };
 
 pub const MAX_TCP_QUEUED_SEGMENTS: usize = 32;
+pub const TCP_INITIAL_RTO_NANOS: u64 = 1_000_000_000;
+pub const TCP_MAX_RETRANSMISSIONS: u8 = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TcpEndpoint {
@@ -25,6 +27,16 @@ pub struct TcpTransmitSegment {
     pub header: TcpHeader,
     pub payload: Bytes,
     pub sequence_len: u32,
+    pub retransmission: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TcpInFlightSegment {
+    header: TcpHeader,
+    payload: Bytes,
+    sequence_len: u32,
+    sent_at_nanos: u64,
+    retransmissions: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +69,7 @@ where
     advertised_window: u16,
     receive_queue: Deque<Bytes, MAX_TCP_QUEUED_SEGMENTS>,
     transmit_queue: Deque<Bytes, MAX_TCP_QUEUED_SEGMENTS>,
+    in_flight: Deque<TcpInFlightSegment, MAX_TCP_QUEUED_SEGMENTS>,
     bytes_in_flight: u32,
     delivered_bytes: u64,
     syn_queued: bool,
@@ -79,6 +92,7 @@ where
             advertised_window: u16::MAX,
             receive_queue: Deque::new(),
             transmit_queue: Deque::new(),
+            in_flight: Deque::new(),
             bytes_in_flight: 0,
             delivered_bytes: 0,
             syn_queued: false,
@@ -145,8 +159,18 @@ where
             self.state == TcpState::SynSent,
             "SYN can only be queued while connecting"
         );
+        let header = self.pending_syn().expect("SYN header disappeared");
         self.syn_queued = true;
         self.bytes_in_flight = self.bytes_in_flight.saturating_add(1);
+        self.in_flight
+            .push_back(TcpInFlightSegment {
+                header,
+                payload: Bytes::new(),
+                sequence_len: 1,
+                sent_at_nanos: now_nanos,
+                retransmissions: 0,
+            })
+            .unwrap_or_else(|_| panic!("TCP in-flight queue is full"));
         self.congestion
             .on_packet_sent(1, self.bytes_in_flight, now_nanos);
     }
@@ -225,13 +249,61 @@ where
         self.bytes_in_flight = self.bytes_in_flight.saturating_add(sequence_len);
         self.congestion
             .on_packet_sent(sequence_len, self.bytes_in_flight, now_nanos);
+        self.in_flight
+            .push_back(TcpInFlightSegment {
+                header,
+                payload: payload.clone(),
+                sequence_len,
+                sent_at_nanos: now_nanos,
+                retransmissions: 0,
+            })
+            .unwrap_or_else(|_| panic!("TCP in-flight queue is full"));
         Some(TcpTransmitSegment {
             local,
             remote,
             header,
             payload,
             sequence_len,
+            retransmission: false,
         })
+    }
+
+    pub fn pending_retransmission(&self, now_nanos: u64) -> Option<TcpTransmitSegment> {
+        let in_flight = self.in_flight.front()?;
+        if now_nanos.saturating_sub(in_flight.sent_at_nanos) < rto_nanos(in_flight.retransmissions)
+        {
+            return None;
+        }
+        let local = self.local?;
+        let remote = self.remote?;
+        Some(TcpTransmitSegment {
+            local,
+            remote,
+            header: in_flight.header,
+            payload: in_flight.payload.clone(),
+            sequence_len: in_flight.sequence_len,
+            retransmission: true,
+        })
+    }
+
+    pub fn mark_retransmission_queued(&mut self, sequence: u32, now_nanos: u64) {
+        let Some(in_flight) = self
+            .in_flight
+            .iter_mut()
+            .find(|segment| segment.header.sequence == sequence)
+        else {
+            return;
+        };
+        in_flight.sent_at_nanos = now_nanos;
+        in_flight.retransmissions = in_flight.retransmissions.saturating_add(1);
+        if in_flight.retransmissions > TCP_MAX_RETRANSMISSIONS {
+            self.state = TcpState::Closed;
+            self.bytes_in_flight = 0;
+            self.in_flight.clear();
+            return;
+        }
+        self.congestion
+            .on_congestion_event(CongestionEvent::RetransmissionTimeout { now_nanos });
     }
 
     pub fn receive(&mut self, max_bytes: usize) -> Option<Vec<u8>> {
@@ -276,6 +348,7 @@ where
                         .wrapping_sub(self.send_unacknowledged);
                     self.send_unacknowledged = packet.acknowledgement;
                     self.bytes_in_flight = self.bytes_in_flight.saturating_sub(acked);
+                    self.discard_acked_segments(packet.acknowledgement);
                     self.delivered_bytes = self.delivered_bytes.saturating_add(u64::from(acked));
                     action = Some(self.congestion.on_ack(AckSample {
                         acked_bytes: acked,
@@ -324,5 +397,106 @@ where
             TcpState::CloseWait => TcpState::LastAck,
             state => state,
         };
+    }
+
+    fn discard_acked_segments(&mut self, acknowledgement: u32) {
+        while self
+            .in_flight
+            .front()
+            .is_some_and(|segment| sequence_leq(segment_end(segment), acknowledgement))
+        {
+            let _ = self.in_flight.pop_front();
+        }
+    }
+}
+
+fn segment_end(segment: &TcpInFlightSegment) -> u32 {
+    segment.header.sequence.wrapping_add(segment.sequence_len)
+}
+
+fn sequence_leq(lhs: u32, rhs: u32) -> bool {
+    lhs == rhs || (rhs.wrapping_sub(lhs) as i32) >= 0
+}
+
+fn rto_nanos(retransmissions: u8) -> u64 {
+    let shift = retransmissions.min(6);
+    TCP_INITIAL_RTO_NANOS.saturating_mul(1u64 << shift)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{BbrV3, Ipv4Address};
+
+    fn endpoint(port: u16) -> TcpEndpoint {
+        TcpEndpoint {
+            address: IpAddress::Ipv4(Ipv4Address::new([192, 0, 2, 1])),
+            port,
+        }
+    }
+
+    fn peer(port: u16) -> TcpEndpoint {
+        TcpEndpoint {
+            address: IpAddress::Ipv4(Ipv4Address::new([192, 0, 2, 2])),
+            port,
+        }
+    }
+
+    #[test]
+    fn syn_is_tracked_for_rto_retransmission() {
+        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+
+        socket.mark_syn_queued(0);
+
+        assert_eq!(
+            socket.pending_retransmission(TCP_INITIAL_RTO_NANOS - 1),
+            None
+        );
+        let segment = socket
+            .pending_retransmission(TCP_INITIAL_RTO_NANOS)
+            .expect("SYN should retransmit after initial RTO");
+        assert!(segment.retransmission);
+        assert_eq!(segment.header.sequence, 7);
+        assert!(segment.header.flags.contains(TcpFlags::SYN));
+    }
+
+    #[test]
+    fn ack_discards_fully_covered_in_flight_data() {
+        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+        socket.mark_syn_queued(0);
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS,
+        );
+
+        assert_eq!(socket.queue_send(b"hello"), 5);
+        let data = socket
+            .take_transmit_segment(TCP_INITIAL_RTO_NANOS)
+            .expect("established socket should transmit queued bytes");
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: data.header.sequence + data.sequence_len,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS + 1,
+        );
+
+        assert_eq!(
+            socket.pending_retransmission(TCP_INITIAL_RTO_NANOS * 4),
+            None
+        );
     }
 }

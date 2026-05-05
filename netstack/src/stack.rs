@@ -404,6 +404,7 @@ impl Stack {
     pub fn drive_tcp(&mut self, now: StackInstant) -> Result<(), StackError> {
         let mut pending_syn = ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader), 16>::new();
         let mut pending_ack = ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader), 16>::new();
+        let mut pending_retransmit = ArrayVec::<(usize, TcpTransmitSegment), 16>::new();
         let mut pending_data = ArrayVec::<TcpTransmitSegment, 16>::new();
         for (index, socket) in self.tcp.iter().enumerate() {
             let Some(socket) = socket else {
@@ -413,6 +414,12 @@ impl Stack {
             else {
                 continue;
             };
+            if let Some(segment) = socket.pending_retransmission(now.nanos()) {
+                pending_retransmit
+                    .try_push((index, segment))
+                    .unwrap_or_else(|_| panic!("TCP retransmit burst overflowed"));
+                continue;
+            }
             if let Some(header) = socket.pending_syn() {
                 pending_syn
                     .try_push((index, local, remote, header))
@@ -426,6 +433,9 @@ impl Stack {
         }
 
         for socket in self.tcp.iter_mut().flatten() {
+            if socket.pending_retransmission(now.nanos()).is_some() {
+                continue;
+            }
             if let Some(segment) = socket.take_transmit_segment(now.nanos()) {
                 pending_data
                     .try_push(segment)
@@ -451,6 +461,25 @@ impl Stack {
                     .and_then(Option::as_mut)
                     .expect("TCP socket disappeared while queuing ACK");
                 socket.mark_ack_queued();
+            }
+        }
+        for (index, segment) in pending_retransmit {
+            let sequence = segment.header.sequence;
+            let identification = segment.sequence_len as u16;
+            if self.queue_tcp(
+                segment.local,
+                segment.remote,
+                segment.header,
+                &segment.payload,
+                identification,
+                now,
+            )? {
+                let socket = self
+                    .tcp
+                    .get_mut(index)
+                    .and_then(Option::as_mut)
+                    .expect("TCP socket disappeared while queuing retransmission");
+                socket.mark_retransmission_queued(sequence, now.nanos());
             }
         }
         for segment in pending_data {
