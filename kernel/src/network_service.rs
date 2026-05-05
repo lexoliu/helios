@@ -152,13 +152,8 @@ impl crate::ComponentHostUdpSocketToken for UdpSocketId {
 enum NetworkRequest {
     Ping(PingRequest),
     DnsResolve(DnsResolveRequest),
-    TcpConnect(TcpConnectRequest),
     TcpListen(TcpListenRequest),
     TcpAccept(TcpAcceptRequest),
-    TcpWrite(TcpWriteRequest),
-    TcpRead(TcpReadRequest),
-    TcpShutdownSend(TcpShutdownSendRequest),
-    TcpClose(TcpCloseRequest),
     UdpBind(UdpBindRequest),
     UdpSend(UdpSendRequest),
     UdpReceive(UdpReceiveRequest),
@@ -179,14 +174,6 @@ struct DnsResolveRequest {
     response: RequestResponse<Result<Vec<KernelIpv4Address>, DnsError>>,
 }
 
-struct TcpConnectRequest {
-    host: String,
-    port: u16,
-    local_port: u16,
-    timeout_nanos: u64,
-    response: RequestResponse<Result<TcpStreamId, TcpError>>,
-}
-
 struct TcpListenRequest {
     local_port: u16,
     backlog: u16,
@@ -197,30 +184,6 @@ struct TcpAcceptRequest {
     listener: TcpListenerId,
     timeout_nanos: u64,
     response: RequestResponse<Result<TcpAccepted<TcpStreamId>, TcpError>>,
-}
-
-struct TcpWriteRequest {
-    stream: TcpStreamId,
-    bytes: Vec<u8>,
-    timeout_nanos: u64,
-    response: RequestResponse<Result<(), TcpError>>,
-}
-
-struct TcpReadRequest {
-    stream: TcpStreamId,
-    max_bytes: u32,
-    timeout_nanos: u64,
-    response: RequestResponse<Result<Option<Vec<u8>>, TcpError>>,
-}
-
-struct TcpShutdownSendRequest {
-    stream: TcpStreamId,
-    response: RequestResponse<Result<(), TcpError>>,
-}
-
-struct TcpCloseRequest {
-    stream: TcpStreamId,
-    response: RequestResponse<()>,
 }
 
 struct UdpBindRequest {
@@ -470,15 +433,8 @@ where
         local_port: u16,
         timeout_nanos: u64,
     ) -> Result<TcpStreamId, TcpError> {
-        let response = RequestResponse::new();
-        self.enqueue_request(NetworkRequest::TcpConnect(TcpConnectRequest {
-            host: host.to_owned(),
-            port,
-            local_port,
-            timeout_nanos,
-            response: response.clone(),
-        }));
-        response.wait().await
+        self.execute_tcp_connect(host, port, local_port, timeout_nanos)
+            .await
     }
 
     pub async fn tcp_listen(
@@ -515,14 +471,8 @@ where
         bytes: &[u8],
         timeout_nanos: u64,
     ) -> Result<(), TcpError> {
-        let response = RequestResponse::new();
-        self.enqueue_request(NetworkRequest::TcpWrite(TcpWriteRequest {
-            stream,
-            bytes: bytes.to_vec(),
-            timeout_nanos,
-            response: response.clone(),
-        }));
-        response.wait().await
+        self.execute_tcp_write_all(stream, bytes, timeout_nanos)
+            .await
     }
 
     pub async fn tcp_read(
@@ -531,32 +481,16 @@ where
         max_bytes: u32,
         timeout_nanos: u64,
     ) -> Result<Option<Vec<u8>>, TcpError> {
-        let response = RequestResponse::new();
-        self.enqueue_request(NetworkRequest::TcpRead(TcpReadRequest {
-            stream,
-            max_bytes,
-            timeout_nanos,
-            response: response.clone(),
-        }));
-        response.wait().await
+        self.execute_tcp_read(stream, max_bytes, timeout_nanos)
+            .await
     }
 
     pub async fn tcp_shutdown_send(&self, stream: TcpStreamId) -> Result<(), TcpError> {
-        let response = RequestResponse::new();
-        self.enqueue_request(NetworkRequest::TcpShutdownSend(TcpShutdownSendRequest {
-            stream,
-            response: response.clone(),
-        }));
-        response.wait().await
+        self.execute_tcp_shutdown_send(stream).await
     }
 
     pub async fn tcp_close(&self, stream: TcpStreamId) {
-        let response = RequestResponse::new();
-        self.enqueue_request(NetworkRequest::TcpClose(TcpCloseRequest {
-            stream,
-            response: response.clone(),
-        }));
-        response.wait().await;
+        self.inner.state.lock().await.remove_tcp_stream(stream);
     }
 
     pub async fn udp_bind(&self, local_port: u16) -> Result<UdpBinding<UdpSocketId>, UdpError> {
@@ -665,17 +599,6 @@ where
                         .await;
                     request.response.complete(result).await;
                 }
-                NetworkRequest::TcpConnect(request) => {
-                    let result = self
-                        .execute_tcp_connect(
-                            &request.host,
-                            request.port,
-                            request.local_port,
-                            request.timeout_nanos,
-                        )
-                        .await;
-                    request.response.complete(result).await;
-                }
                 NetworkRequest::TcpListen(request) => {
                     let result = self
                         .execute_tcp_listen(request.local_port, request.backlog)
@@ -687,34 +610,6 @@ where
                         .execute_tcp_accept(request.listener, request.timeout_nanos)
                         .await;
                     request.response.complete(result).await;
-                }
-                NetworkRequest::TcpWrite(request) => {
-                    let result = self
-                        .execute_tcp_write_all(
-                            request.stream,
-                            &request.bytes,
-                            request.timeout_nanos,
-                        )
-                        .await;
-                    request.response.complete(result).await;
-                }
-                NetworkRequest::TcpRead(request) => {
-                    let result = self
-                        .execute_tcp_read(request.stream, request.max_bytes, request.timeout_nanos)
-                        .await;
-                    request.response.complete(result).await;
-                }
-                NetworkRequest::TcpShutdownSend(request) => {
-                    let result = self.execute_tcp_shutdown_send(request.stream).await;
-                    request.response.complete(result).await;
-                }
-                NetworkRequest::TcpClose(request) => {
-                    self.inner
-                        .state
-                        .lock()
-                        .await
-                        .remove_tcp_stream(request.stream);
-                    request.response.complete(()).await;
                 }
                 NetworkRequest::UdpBind(request) => {
                     let result = self.execute_udp_bind(request.local_port).await;

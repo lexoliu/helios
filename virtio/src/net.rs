@@ -18,6 +18,7 @@ const DEFAULT_IP_MTU: usize = 1500;
 const NET_FEATURE_MAC: u64 = 1 << 5;
 const NET_FEATURE_STATUS: u64 = 1 << 16;
 const NET_FEATURE_MTU: u64 = 1 << 3;
+const TX_COMPLETION_SPIN_POLLS: usize = 256;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -206,6 +207,13 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             if let Some(completed) = state.tx_queue.pop_used() {
                 assert_eq!(completed, token, "virtio net TX completion token mismatch");
                 return Ok(());
+            }
+            for _ in 0..TX_COMPLETION_SPIN_POLLS {
+                core::hint::spin_loop();
+                if let Some(completed) = state.tx_queue.pop_used() {
+                    assert_eq!(completed, token, "virtio net TX completion token mismatch");
+                    return Ok(());
+                }
             }
             wait().await;
         }
