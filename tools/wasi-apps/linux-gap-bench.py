@@ -21,6 +21,8 @@ HTTP_LARGE_PAYLOAD_FILE = "payload-64m.bin"
 HTTP_PAYLOAD = b"helios-linux-gap:ok\n"
 HTTP_LARGE_PAYLOAD_BYTES = 64 * 1024 * 1024
 HTTP_LARGE_PAYLOAD_CHUNK = bytes(range(251))
+DEFAULT_MAX_HOST_LOAD_PER_CPU = 0.75
+TOP_CPU_PROCESS_LIMIT = 8
 
 
 class QuietHttpHandler(http.server.SimpleHTTPRequestHandler):
@@ -102,6 +104,77 @@ def host_cpu() -> str:
         except subprocess.CalledProcessError:
             pass
     return platform.processor() or platform.machine()
+
+
+def top_cpu_processes(limit: int = TOP_CPU_PROCESS_LIMIT) -> list[dict]:
+    completed = subprocess.run(
+        ["ps", "-axo", "pid=,pcpu=,command="],
+        cwd=repo_root(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    processes = []
+    for line in completed.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pcpu = float(parts[1])
+        except ValueError:
+            continue
+        processes.append(
+            {
+                "pid": parts[0],
+                "pcpu": pcpu,
+                "command": parts[2][:160],
+            }
+        )
+    processes.sort(key=lambda process: process["pcpu"], reverse=True)
+    return processes[:limit]
+
+
+def host_load_snapshot() -> dict:
+    cpu_count = os.cpu_count() or 1
+    try:
+        load1, load5, load15 = os.getloadavg()
+        load = {
+            "one_minute": load1,
+            "five_minutes": load5,
+            "fifteen_minutes": load15,
+            "one_minute_per_cpu": load1 / cpu_count,
+        }
+    except OSError:
+        load = {
+            "one_minute": None,
+            "five_minutes": None,
+            "fifteen_minutes": None,
+            "one_minute_per_cpu": None,
+        }
+    return {
+        "cpu_count": cpu_count,
+        "load": load,
+        "top_cpu_processes": top_cpu_processes(),
+    }
+
+
+def enforce_host_load(snapshot: dict, max_load_per_cpu: float, allow_busy_host: bool) -> None:
+    load_per_cpu = snapshot["load"]["one_minute_per_cpu"]
+    if load_per_cpu is None or allow_busy_host or load_per_cpu <= max_load_per_cpu:
+        return
+    top = ", ".join(
+        f"{process['pid']}:{process['pcpu']:.1f}% {process['command']}"
+        for process in snapshot["top_cpu_processes"][:3]
+    )
+    raise SystemExit(
+        f"host is too busy for benchmark evidence: 1m load/cpu={load_per_cpu:.2f} "
+        f"> {max_load_per_cpu:.2f}; top CPU: {top}; rerun with --allow-busy-host to record noisy diagnostics"
+    )
+
+
+def format_load(value: float | None) -> str:
+    return "unknown" if value is None else f"{value:.2f}"
 
 
 def start_host_http(root: Path) -> tuple[socketserver.TCPServer, int]:
@@ -530,6 +603,7 @@ def write_report(
     helios_jsonl: Path | None,
     linux_json: Path | None,
     docker_digest: str | None,
+    host_load: dict,
 ) -> None:
     run_record, helios = parse_jsonl(helios_jsonl)
     linux = parse_hyperfine(linux_json)
@@ -543,15 +617,23 @@ def write_report(
         "",
         "![Helios vs Linux median timings](helios-vs-linux.svg)",
         "",
-        f"- Helios JSONL: `{helios_jsonl}`",
-        f"- Linux Hyperfine JSON: `{linux_json}`",
+        f"- Helios JSONL: `{helios_jsonl or 'not-run'}`",
+        f"- Linux Hyperfine JSON: `{linux_json or 'not-run'}`",
         f"- Helios git SHA: `{run_record.get('git_sha', git_sha())}`",
         f"- Docker image digest: `{docker_digest or 'not-run'}`",
         f"- Host CPU: `{host_cpu()}`",
         f"- Host logical CPUs: `{os.cpu_count()}`",
         f"- Host memory: `{host_memory()}`",
+        f"- Host load average: `1m={format_load(host_load['load']['one_minute'])}, 5m={format_load(host_load['load']['five_minutes'])}, 15m={format_load(host_load['load']['fifteen_minutes'])}`",
+        f"- Host 1m load per logical CPU: `{format_load(host_load['load']['one_minute_per_cpu'])}`",
         "",
     ]
+    if host_load["top_cpu_processes"]:
+        lines.extend(["## Host Load Provenance", ""])
+        for process in host_load["top_cpu_processes"]:
+            command = process["command"].replace("`", "'")
+            lines.append(f"- PID `{process['pid']}` CPU `{process['pcpu']:.1f}%`: `{command}`")
+        lines.append("")
     vm = run_record.get("vm")
     if vm:
         lines.extend(
@@ -615,8 +697,8 @@ def write_report(
             "",
             "## Raw Iterations",
             "",
-            f"- Helios raw iteration timings are in `{helios_jsonl}`.",
-            f"- Linux raw hyperfine timings are in `{linux_json}`.",
+            f"- Helios raw iteration timings are in `{helios_jsonl or 'not-run'}`.",
+            f"- Linux raw hyperfine timings are in `{linux_json or 'not-run'}`.",
             "",
         ]
     )
@@ -636,11 +718,17 @@ def main() -> None:
     parser.add_argument("--out-dir", type=Path)
     parser.add_argument("--skip-helios", action="store_true")
     parser.add_argument("--skip-linux", action="store_true")
+    parser.add_argument("--max-host-load-per-cpu", type=float, default=DEFAULT_MAX_HOST_LOAD_PER_CPU)
+    parser.add_argument("--allow-busy-host", action="store_true")
     args = parser.parse_args()
 
     if args.iterations <= 0:
         raise SystemExit("--iterations must be a positive integer")
+    if args.max_host_load_per_cpu <= 0:
+        raise SystemExit("--max-host-load-per-cpu must be positive")
 
+    host_load = host_load_snapshot()
+    enforce_host_load(host_load, args.max_host_load_per_cpu, args.allow_busy_host)
     manifest = load_manifest(args.manifest)
     workloads = selected_workloads(manifest, args.classes, args.workloads)
     out_dir = args.out_dir or repo_root() / "target/perf-baselines" / f"linux-gap-{git_short_sha()}-{int(time.time())}"
@@ -683,7 +771,7 @@ def main() -> None:
                 args.linux_http_port,
             )
         report = out_dir / "report.md"
-        write_report(report, manifest, workloads, helios_jsonl, linux_json, docker_digest)
+        write_report(report, manifest, workloads, helios_jsonl, linux_json, docker_digest, host_load)
         print(report)
     finally:
         if server:
