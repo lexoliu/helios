@@ -32,6 +32,9 @@ const EPHEMERAL_PORT_END: u16 = 65_535;
 const INTERNAL_DNS_PORT: u16 = 49_151;
 const LOCAL_NETWORK_PORT: NetworkPortId = NetworkPortId::new(0);
 const DHCP_RETRANSMIT_NANOS: u64 = 1_000_000_000;
+const MAX_TCP_STREAM_HANDLES: usize = 256;
+const MAX_TCP_LISTENER_HANDLES: usize = 64;
+const MAX_UDP_SOCKET_HANDLES: usize = 256;
 
 #[derive(Clone)]
 pub struct NetworkService<CpuImpl, Runtime, Device>
@@ -229,12 +232,49 @@ struct NetworkState {
     stack: Stack,
     next_tcp_local_port: u16,
     next_udp_local_port: u16,
-    tcp_streams: Vec<Option<helios_netstack::SocketId>>,
-    tcp_listeners: Vec<Option<TcpListenerState>>,
-    udp_sockets: Vec<Option<UdpSocketState>>,
+    tcp_streams: HandleSlab<helios_netstack::SocketId, MAX_TCP_STREAM_HANDLES>,
+    tcp_listeners: HandleSlab<TcpListenerState, MAX_TCP_LISTENER_HANDLES>,
+    udp_sockets: HandleSlab<UdpSocketState, MAX_UDP_SOCKET_HANDLES>,
     dhcp: DhcpClientState,
     dns_servers: Vec<Ipv4Address>,
     next_dns_query_id: u16,
+}
+
+struct HandleSlab<T, const CAPACITY: usize> {
+    slots: Vec<Option<T>>,
+}
+
+impl<T, const CAPACITY: usize> HandleSlab<T, CAPACITY> {
+    fn new() -> Self {
+        let mut slots = Vec::with_capacity(CAPACITY);
+        slots.resize_with(CAPACITY, || None);
+        Self { slots }
+    }
+
+    fn insert(&mut self, value: T) -> usize {
+        let Some((index, slot)) = self
+            .slots
+            .iter_mut()
+            .enumerate()
+            .find(|(_, slot)| slot.is_none())
+        else {
+            panic!("network handle slab is full");
+        };
+        *slot = Some(value);
+        index
+    }
+
+    fn get(&self, index: usize) -> Option<&T> {
+        self.slots.get(index).and_then(Option::as_ref)
+    }
+
+    fn remove(&mut self, index: usize) -> Option<T> {
+        self.slots.get_mut(index).and_then(Option::take)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &T> {
+        self.slots.iter().flatten()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1484,9 +1524,9 @@ impl NetworkState {
             stack: Stack::new(StackConfig::new(mac, max_frame_len)),
             next_tcp_local_port: EPHEMERAL_PORT_START,
             next_udp_local_port: EPHEMERAL_PORT_START,
-            tcp_streams: Vec::new(),
-            tcp_listeners: Vec::new(),
-            udp_sockets: Vec::new(),
+            tcp_streams: HandleSlab::new(),
+            tcp_listeners: HandleSlab::new(),
+            udp_sockets: HandleSlab::new(),
             dhcp: DhcpClientState::Init { transaction_id },
             dns_servers: Vec::new(),
             next_dns_query_id: 1,
@@ -1896,68 +1936,33 @@ impl NetworkState {
     }
 
     fn remove_tcp_stream(&mut self, stream: TcpStreamId) {
-        if let Some(slot) = self.tcp_streams.get_mut(stream_index(stream)) {
-            if let Some(socket) = slot.take() {
-                self.stack
-                    .remove_tcp_socket(socket)
-                    .unwrap_or_else(|_| panic!("TCP stream referenced an unknown stack socket"));
-            }
+        if let Some(socket) = self.tcp_streams.remove(stream_index(stream)) {
+            self.stack
+                .remove_tcp_socket(socket)
+                .unwrap_or_else(|_| panic!("TCP stream referenced an unknown stack socket"));
         }
     }
 
     fn remove_udp_socket(&mut self, socket: UdpSocketId) {
-        if let Some(slot) = self.udp_sockets.get_mut(socket_index(socket)) {
-            let _ = slot.take();
-        }
+        let _ = self.udp_sockets.remove(socket_index(socket));
     }
 
     fn insert_tcp_stream(&mut self, socket: helios_netstack::SocketId) -> TcpStreamId {
-        if let Some((index, slot)) = self
-            .tcp_streams
-            .iter_mut()
-            .enumerate()
-            .find(|(_, slot)| slot.is_none())
-        {
-            *slot = Some(socket);
-            return tcp_stream_id(index);
-        }
-        self.tcp_streams.push(Some(socket));
-        tcp_stream_id(self.tcp_streams.len() - 1)
+        tcp_stream_id(self.tcp_streams.insert(socket))
     }
 
     fn insert_tcp_listener(&mut self, local_port: u16) -> TcpListenerId {
-        if let Some((index, slot)) = self
-            .tcp_listeners
-            .iter_mut()
-            .enumerate()
-            .find(|(_, slot)| slot.is_none())
-        {
-            *slot = Some(TcpListenerState { local_port });
-            return tcp_listener_id(index);
-        }
-        self.tcp_listeners
-            .push(Some(TcpListenerState { local_port }));
-        tcp_listener_id(self.tcp_listeners.len() - 1)
+        tcp_listener_id(self.tcp_listeners.insert(TcpListenerState { local_port }))
     }
 
     fn insert_udp_socket(&mut self, local_port: u16) -> UdpSocketId {
-        if let Some((index, slot)) = self
-            .udp_sockets
-            .iter_mut()
-            .enumerate()
-            .find(|(_, slot)| slot.is_none())
-        {
-            *slot = Some(UdpSocketState { local_port });
-            return udp_socket_id(index);
-        }
-        self.udp_sockets.push(Some(UdpSocketState { local_port }));
-        udp_socket_id(self.udp_sockets.len() - 1)
+        udp_socket_id(self.udp_sockets.insert(UdpSocketState { local_port }))
     }
 
     fn tcp_socket(&self, stream: TcpStreamId) -> Result<helios_netstack::SocketId, TcpError> {
         self.tcp_streams
             .get(stream_index(stream))
-            .and_then(|slot| *slot)
+            .copied()
             .ok_or_else(|| TcpError {
                 kind: TcpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::UnknownTcpStream,
@@ -1967,7 +1972,6 @@ impl NetworkState {
     fn tcp_listener(&self, listener: TcpListenerId) -> Result<&TcpListenerState, TcpError> {
         self.tcp_listeners
             .get(tcp_listener_index(listener))
-            .and_then(Option::as_ref)
             .ok_or_else(|| TcpError {
                 kind: TcpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::TcpListenerClosedUnexpectedly,
@@ -1977,7 +1981,6 @@ impl NetworkState {
     fn udp_socket(&self, socket: UdpSocketId) -> Result<&UdpSocketState, UdpError> {
         self.udp_sockets
             .get(socket_index(socket))
-            .and_then(Option::as_ref)
             .ok_or_else(|| UdpError {
                 kind: UdpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::UnknownUdpSocket,
@@ -2025,14 +2028,12 @@ impl NetworkState {
     fn is_tcp_local_port_free(&self, port: u16) -> bool {
         self.tcp_listeners
             .iter()
-            .flatten()
             .all(|state| state.local_port != port)
     }
 
     fn is_udp_local_port_free(&self, port: u16) -> bool {
         self.udp_sockets
             .iter()
-            .flatten()
             .all(|state| state.local_port != port)
     }
 
