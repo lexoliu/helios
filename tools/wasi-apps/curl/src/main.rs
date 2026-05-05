@@ -7,7 +7,7 @@ use thiserror::Error;
 
 type Result<T> = core::result::Result<T, CurlError>;
 
-const DEFAULT_READ_CHUNK_BYTES: usize = 16 * 1024;
+const DEFAULT_READ_CHUNK_BYTES: usize = 23 * 1024;
 const NULL_DEVICE_PATH: &str = "/dev/null";
 
 #[derive(Debug, Error)]
