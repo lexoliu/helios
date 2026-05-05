@@ -192,15 +192,15 @@ impl NetworkDevice for VirtioNetworkDevice {
     }
 
     async fn try_receive(&self, buffer: &mut PacketBuffer) -> Result<bool, IoError> {
-        let Some(frame) = self.inner.try_receive().await? else {
+        buffer.clear();
+        let Some(frame_len) = self
+            .inner
+            .try_receive_into(buffer.spare_capacity_mut())
+            .await?
+        else {
             return Ok(false);
         };
-        if frame.len() > buffer.spare_capacity_mut().len() {
-            return Err(IoError::OutOfBounds);
-        }
-        buffer.clear();
-        buffer.spare_capacity_mut()[..frame.len()].copy_from_slice(&frame);
-        buffer.set_len(frame.len());
+        buffer.set_len(frame_len);
         Ok(true)
     }
 

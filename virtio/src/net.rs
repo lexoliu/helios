@@ -156,26 +156,44 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
             return Ok(None);
         };
-        let Some(mut buffer) = state.rx_buffers[usize::from(token)].take() else {
+        let Some(buffer) = state.rx_buffers[usize::from(token)].take() else {
             panic!("virtio net RX completion referenced an unknown token {token}");
         };
         let used_len = used_len as usize;
         if used_len < self.header_len || used_len > buffer.len() {
+            Self::repost_rx_buffer(&mut state, &self.transport, buffer)?;
             return Err(IoError::DeviceFault);
         }
 
         let frame = buffer[self.header_len..used_len]
             .to_vec()
             .into_boxed_slice();
-        let new_token = state
-            .rx_queue
-            .submit(&self.transport, &[], &mut [buffer.as_mut()])?;
-        assert!(
-            state.rx_buffers[usize::from(new_token)].is_none(),
-            "virtio net RX buffer was reposted into an occupied token slot"
-        );
-        state.rx_buffers[usize::from(new_token)] = Some(buffer);
+        Self::repost_rx_buffer(&mut state, &self.transport, buffer)?;
         Ok(Some(frame))
+    }
+
+    pub async fn try_receive_into(&self, output: &mut [u8]) -> IoResult<Option<usize>> {
+        let mut state = self.state.lock().await;
+        let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
+            return Ok(None);
+        };
+        let Some(buffer) = state.rx_buffers[usize::from(token)].take() else {
+            panic!("virtio net RX completion referenced an unknown token {token}");
+        };
+        let used_len = used_len as usize;
+        if used_len < self.header_len || used_len > buffer.len() {
+            Self::repost_rx_buffer(&mut state, &self.transport, buffer)?;
+            return Err(IoError::DeviceFault);
+        }
+
+        let frame_len = used_len - self.header_len;
+        if frame_len > output.len() {
+            Self::repost_rx_buffer(&mut state, &self.transport, buffer)?;
+            return Err(IoError::OutOfBounds);
+        }
+        output[..frame_len].copy_from_slice(&buffer[self.header_len..used_len]);
+        Self::repost_rx_buffer(&mut state, &self.transport, buffer)?;
+        Ok(Some(frame_len))
     }
 
     pub async fn transmit(&self, frame: &[u8]) -> IoResult<()> {
@@ -221,6 +239,22 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
 
     pub async fn wait_for_interrupt(&self) {
         self.interrupts.notified().await;
+    }
+
+    fn repost_rx_buffer(
+        state: &mut NetState<T>,
+        transport: &T,
+        mut buffer: Box<[u8]>,
+    ) -> IoResult<()> {
+        let token = state
+            .rx_queue
+            .submit(transport, &[], &mut [buffer.as_mut()])?;
+        assert!(
+            state.rx_buffers[usize::from(token)].is_none(),
+            "virtio net RX buffer was reposted into an occupied token slot"
+        );
+        state.rx_buffers[usize::from(token)] = Some(buffer);
+        Ok(())
     }
 }
 
