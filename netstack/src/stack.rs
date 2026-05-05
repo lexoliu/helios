@@ -1,5 +1,6 @@
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use arrayvec::ArrayVec;
@@ -222,14 +223,20 @@ pub enum StackEvent {
 
 #[derive(Clone, Debug)]
 struct TcpSocketSlab {
-    slots: Vec<Option<TcpSocket<BbrV3>>>,
+    slots: Box<[Option<TcpSocket<BbrV3>>]>,
+    free: [usize; MAX_TCP_SOCKETS],
+    free_len: usize,
 }
 
 impl TcpSocketSlab {
     fn new() -> Self {
         let mut slots = Vec::with_capacity(MAX_TCP_SOCKETS);
         slots.resize_with(MAX_TCP_SOCKETS, || None);
-        Self { slots }
+        Self {
+            slots: slots.into_boxed_slice(),
+            free: core::array::from_fn(|index| MAX_TCP_SOCKETS - 1 - index),
+            free_len: MAX_TCP_SOCKETS,
+        }
     }
 
     fn iter(&self) -> impl Iterator<Item = &Option<TcpSocket<BbrV3>>> {
@@ -249,16 +256,22 @@ impl TcpSocketSlab {
     }
 
     fn insert(&mut self, socket: TcpSocket<BbrV3>) -> SocketId {
-        let Some((index, slot)) = self
-            .slots
-            .iter_mut()
-            .enumerate()
-            .find(|(_, slot)| slot.is_none())
-        else {
+        if self.free_len == 0 {
             panic!("TCP socket slab is full");
         };
+        self.free_len -= 1;
+        let index = self.free[self.free_len];
+        let slot = &mut self.slots[index];
+        assert!(slot.is_none(), "TCP socket slab free list is corrupt");
         *slot = Some(socket);
         socket_id(index)
+    }
+
+    fn remove(&mut self, index: usize) -> Option<TcpSocket<BbrV3>> {
+        let socket = self.slots.get_mut(index).and_then(Option::take)?;
+        self.free[self.free_len] = index;
+        self.free_len += 1;
+        Some(socket)
     }
 }
 
@@ -710,13 +723,9 @@ impl Stack {
     }
 
     pub fn remove_tcp_socket(&mut self, socket: SocketId) -> Result<(), StackError> {
-        let slot = self
-            .tcp
-            .get_mut(socket_index(socket))
+        self.tcp
+            .remove(socket_index(socket))
             .ok_or(StackError::UnknownSocket)?;
-        if slot.take().is_none() {
-            return Err(StackError::UnknownSocket);
-        }
         self.remove_tcp_accepts_for(socket);
         Ok(())
     }
