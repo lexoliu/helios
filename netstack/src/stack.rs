@@ -269,11 +269,65 @@ pub struct Stack {
     ipv4_addresses: ArrayVec<Ipv4Cidr, 8>,
     ipv6_addresses: ArrayVec<Ipv6Cidr, 16>,
     neighbors: ArrayVec<NeighborEntry, MAX_NEIGHBORS>,
-    outbound: Deque<PacketBuffer, MAX_OUTBOUND_FRAMES>,
+    outbound: OutboundFrameQueue,
     events: Deque<StackEvent, MAX_STACK_EVENTS>,
     udp_rx: Deque<UdpReceive, MAX_UDP_RX>,
     tcp_accept: Deque<TcpAccept, MAX_TCP_ACCEPT>,
     tcp: TcpSocketSlab,
+}
+
+#[derive(Clone, Debug)]
+struct OutboundFrameQueue {
+    frames: [PacketBuffer; MAX_OUTBOUND_FRAMES],
+    ready: Deque<usize, MAX_OUTBOUND_FRAMES>,
+    free: Deque<usize, MAX_OUTBOUND_FRAMES>,
+}
+
+impl OutboundFrameQueue {
+    fn new() -> Self {
+        let mut free = Deque::new();
+        for index in 0..MAX_OUTBOUND_FRAMES {
+            free.push_back(index)
+                .unwrap_or_else(|_| panic!("outbound frame free queue overflowed during init"));
+        }
+        Self {
+            frames: core::array::from_fn(|_| PacketBuffer::new()),
+            ready: Deque::new(),
+            free,
+        }
+    }
+
+    fn reserve(&mut self) -> Result<usize, StackError> {
+        self.free.pop_front().ok_or(StackError::OutputQueueFull)
+    }
+
+    fn frame_mut(&mut self, slot: usize) -> &mut PacketBuffer {
+        self.frames
+            .get_mut(slot)
+            .unwrap_or_else(|| panic!("outbound frame slot {slot} is outside slab"))
+    }
+
+    fn commit(&mut self, slot: usize) {
+        self.ready
+            .push_back(slot)
+            .unwrap_or_else(|_| panic!("outbound ready queue overflowed after slot reserve"));
+    }
+
+    fn release(&mut self, slot: usize) {
+        self.frame_mut(slot).clear();
+        self.free
+            .push_back(slot)
+            .unwrap_or_else(|_| panic!("outbound free queue overflowed after slot release"));
+    }
+
+    fn pop(&mut self) -> Option<PacketBuffer> {
+        let slot = self.ready.pop_front()?;
+        let frame = core::mem::take(self.frame_mut(slot));
+        self.free
+            .push_back(slot)
+            .unwrap_or_else(|_| panic!("outbound free queue overflowed after frame pop"));
+        Some(frame)
+    }
 }
 
 impl Stack {
@@ -284,7 +338,7 @@ impl Stack {
             ipv4_addresses: ArrayVec::new(),
             ipv6_addresses: ArrayVec::new(),
             neighbors: ArrayVec::new(),
-            outbound: Deque::new(),
+            outbound: OutboundFrameQueue::new(),
             events: Deque::new(),
             udp_rx: Deque::new(),
             tcp_accept: Deque::new(),
@@ -422,7 +476,24 @@ impl Stack {
     }
 
     pub fn take_outbound(&mut self) -> Option<PacketBuffer> {
-        self.outbound.pop_front()
+        self.outbound.pop()
+    }
+
+    fn queue_outbound_frame<R>(
+        &mut self,
+        encode: impl FnOnce(&mut PacketBuffer) -> Result<R, StackError>,
+    ) -> Result<R, StackError> {
+        let slot = self.outbound.reserve()?;
+        match encode(self.outbound.frame_mut(slot)) {
+            Ok(result) => {
+                self.outbound.commit(slot);
+                Ok(result)
+            }
+            Err(error) => {
+                self.outbound.release(slot);
+                Err(error)
+            }
+        }
     }
 
     pub fn take_event(&mut self) -> Option<StackEvent> {
@@ -780,39 +851,38 @@ impl Stack {
         payload: &[u8],
         identification: u16,
     ) -> Result<usize, StackError> {
-        let mut frame = PacketBuffer::new();
-        let storage = frame.storage_mut();
-        let mut offset = EthernetFrame::encode_header(
-            storage,
-            destination_mac,
-            self.config.mac,
-            EthernetProtocol::Ipv4,
-        )
-        .ok_or(StackError::OutputQueueFull)?;
-        offset += Ipv4Packet::encode_header(
-            &mut storage[offset..],
-            source,
-            destination,
-            crate::IpProtocol::Udp,
-            UdpPacket::HEADER_LEN + payload.len(),
-            identification,
-            64,
-        )
-        .ok_or(StackError::OutputQueueFull)?;
-        offset += UdpPacket::encode(
-            &mut storage[offset..],
-            IpAddress::Ipv4(source),
-            IpAddress::Ipv4(destination),
-            source_port,
-            destination_port,
-            payload,
-        )
-        .ok_or(StackError::OutputQueueFull)?;
-        frame.set_len(offset);
-        self.outbound
-            .push_back(frame)
-            .map_err(|_| StackError::OutputQueueFull)?;
-        Ok(payload.len())
+        let local_mac = self.config.mac;
+        self.queue_outbound_frame(|frame| {
+            let storage = frame.storage_mut();
+            let mut offset = EthernetFrame::encode_header(
+                storage,
+                destination_mac,
+                local_mac,
+                EthernetProtocol::Ipv4,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            offset += Ipv4Packet::encode_header(
+                &mut storage[offset..],
+                source,
+                destination,
+                crate::IpProtocol::Udp,
+                UdpPacket::HEADER_LEN + payload.len(),
+                identification,
+                64,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            offset += UdpPacket::encode(
+                &mut storage[offset..],
+                IpAddress::Ipv4(source),
+                IpAddress::Ipv4(destination),
+                source_port,
+                destination_port,
+                payload,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            frame.set_len(offset);
+            Ok(payload.len())
+        })
     }
 
     fn queue_udp_ipv6(
@@ -824,38 +894,37 @@ impl Stack {
         destination_mac: EthernetAddress,
         payload: &[u8],
     ) -> Result<usize, StackError> {
-        let mut frame = PacketBuffer::new();
-        let storage = frame.storage_mut();
-        let mut offset = EthernetFrame::encode_header(
-            storage,
-            destination_mac,
-            self.config.mac,
-            EthernetProtocol::Ipv6,
-        )
-        .ok_or(StackError::OutputQueueFull)?;
-        offset += Ipv6Packet::encode_header(
-            &mut storage[offset..],
-            source,
-            destination,
-            crate::IpProtocol::Udp,
-            UdpPacket::HEADER_LEN + payload.len(),
-            64,
-        )
-        .ok_or(StackError::OutputQueueFull)?;
-        offset += UdpPacket::encode(
-            &mut storage[offset..],
-            IpAddress::Ipv6(source),
-            IpAddress::Ipv6(destination),
-            source_port,
-            destination_port,
-            payload,
-        )
-        .ok_or(StackError::OutputQueueFull)?;
-        frame.set_len(offset);
-        self.outbound
-            .push_back(frame)
-            .map_err(|_| StackError::OutputQueueFull)?;
-        Ok(payload.len())
+        let local_mac = self.config.mac;
+        self.queue_outbound_frame(|frame| {
+            let storage = frame.storage_mut();
+            let mut offset = EthernetFrame::encode_header(
+                storage,
+                destination_mac,
+                local_mac,
+                EthernetProtocol::Ipv6,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            offset += Ipv6Packet::encode_header(
+                &mut storage[offset..],
+                source,
+                destination,
+                crate::IpProtocol::Udp,
+                UdpPacket::HEADER_LEN + payload.len(),
+                64,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            offset += UdpPacket::encode(
+                &mut storage[offset..],
+                IpAddress::Ipv6(source),
+                IpAddress::Ipv6(destination),
+                source_port,
+                destination_port,
+                payload,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            frame.set_len(offset);
+            Ok(payload.len())
+        })
     }
 
     fn queue_tcp(
@@ -898,38 +967,37 @@ impl Stack {
             return Ok(false);
         };
 
-        let mut frame = PacketBuffer::new();
-        let storage = frame.storage_mut();
-        let mut offset = EthernetFrame::encode_header(
-            storage,
-            destination_mac,
-            self.config.mac,
-            EthernetProtocol::Ipv4,
-        )
-        .ok_or(StackError::OutputQueueFull)?;
-        offset += Ipv4Packet::encode_header(
-            &mut storage[offset..],
-            source,
-            destination,
-            crate::IpProtocol::Tcp,
-            TcpPacket::MIN_HEADER_LEN + payload.len(),
-            identification,
-            64,
-        )
-        .ok_or(StackError::OutputQueueFull)?;
-        offset += TcpPacket::encode(
-            &mut storage[offset..],
-            IpAddress::Ipv4(source),
-            IpAddress::Ipv4(destination),
-            header,
-            payload,
-        )
-        .ok_or(StackError::OutputQueueFull)?;
-        frame.set_len(offset);
-        self.outbound
-            .push_back(frame)
-            .map_err(|_| StackError::OutputQueueFull)?;
-        Ok(true)
+        let local_mac = self.config.mac;
+        self.queue_outbound_frame(|frame| {
+            let storage = frame.storage_mut();
+            let mut offset = EthernetFrame::encode_header(
+                storage,
+                destination_mac,
+                local_mac,
+                EthernetProtocol::Ipv4,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            offset += Ipv4Packet::encode_header(
+                &mut storage[offset..],
+                source,
+                destination,
+                crate::IpProtocol::Tcp,
+                TcpPacket::MIN_HEADER_LEN + payload.len(),
+                identification,
+                64,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            offset += TcpPacket::encode(
+                &mut storage[offset..],
+                IpAddress::Ipv4(source),
+                IpAddress::Ipv4(destination),
+                header,
+                payload,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            frame.set_len(offset);
+            Ok(true)
+        })
     }
 
     fn queue_tcp_ipv6(
@@ -951,37 +1019,36 @@ impl Stack {
             return Ok(false);
         };
 
-        let mut frame = PacketBuffer::new();
-        let storage = frame.storage_mut();
-        let mut offset = EthernetFrame::encode_header(
-            storage,
-            destination_mac,
-            self.config.mac,
-            EthernetProtocol::Ipv6,
-        )
-        .ok_or(StackError::OutputQueueFull)?;
-        offset += Ipv6Packet::encode_header(
-            &mut storage[offset..],
-            source,
-            destination,
-            crate::IpProtocol::Tcp,
-            TcpPacket::MIN_HEADER_LEN + payload.len(),
-            64,
-        )
-        .ok_or(StackError::OutputQueueFull)?;
-        offset += TcpPacket::encode(
-            &mut storage[offset..],
-            IpAddress::Ipv6(source),
-            IpAddress::Ipv6(destination),
-            header,
-            payload,
-        )
-        .ok_or(StackError::OutputQueueFull)?;
-        frame.set_len(offset);
-        self.outbound
-            .push_back(frame)
-            .map_err(|_| StackError::OutputQueueFull)?;
-        Ok(true)
+        let local_mac = self.config.mac;
+        self.queue_outbound_frame(|frame| {
+            let storage = frame.storage_mut();
+            let mut offset = EthernetFrame::encode_header(
+                storage,
+                destination_mac,
+                local_mac,
+                EthernetProtocol::Ipv6,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            offset += Ipv6Packet::encode_header(
+                &mut storage[offset..],
+                source,
+                destination,
+                crate::IpProtocol::Tcp,
+                TcpPacket::MIN_HEADER_LEN + payload.len(),
+                64,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            offset += TcpPacket::encode(
+                &mut storage[offset..],
+                IpAddress::Ipv6(source),
+                IpAddress::Ipv6(destination),
+                header,
+                payload,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            frame.set_len(offset);
+            Ok(true)
+        })
     }
 
     fn receive_arp(
@@ -1106,37 +1173,36 @@ impl Stack {
         target: Ipv6Address,
         destination_mac: EthernetAddress,
     ) -> Result<(), StackError> {
-        let mut frame = PacketBuffer::new();
-        let storage = frame.storage_mut();
-        let mut offset = EthernetFrame::encode_header(
-            storage,
-            destination_mac,
-            self.config.mac,
-            EthernetProtocol::Ipv6,
-        )
-        .ok_or(StackError::OutputQueueFull)?;
-        offset += Ipv6Packet::encode_header(
-            &mut storage[offset..],
-            source,
-            destination,
-            crate::IpProtocol::Icmpv6,
-            Icmpv6Packet::NEIGHBOR_MESSAGE_LEN,
-            255,
-        )
-        .ok_or(StackError::OutputQueueFull)?;
-        offset += Icmpv6Packet::encode_neighbor_solicitation(
-            &mut storage[offset..],
-            source,
-            destination,
-            target,
-            self.config.mac,
-        )
-        .ok_or(StackError::OutputQueueFull)?;
-        frame.set_len(offset);
-        self.outbound
-            .push_back(frame)
-            .map_err(|_| StackError::OutputQueueFull)?;
-        Ok(())
+        let local_mac = self.config.mac;
+        self.queue_outbound_frame(|frame| {
+            let storage = frame.storage_mut();
+            let mut offset = EthernetFrame::encode_header(
+                storage,
+                destination_mac,
+                local_mac,
+                EthernetProtocol::Ipv6,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            offset += Ipv6Packet::encode_header(
+                &mut storage[offset..],
+                source,
+                destination,
+                crate::IpProtocol::Icmpv6,
+                Icmpv6Packet::NEIGHBOR_MESSAGE_LEN,
+                255,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            offset += Icmpv6Packet::encode_neighbor_solicitation(
+                &mut storage[offset..],
+                source,
+                destination,
+                target,
+                local_mac,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            frame.set_len(offset);
+            Ok(())
+        })
     }
 
     fn queue_icmpv6_neighbor_advertisement(
@@ -1146,37 +1212,36 @@ impl Stack {
         target: Ipv6Address,
         destination_mac: EthernetAddress,
     ) -> Result<(), StackError> {
-        let mut frame = PacketBuffer::new();
-        let storage = frame.storage_mut();
-        let mut offset = EthernetFrame::encode_header(
-            storage,
-            destination_mac,
-            self.config.mac,
-            EthernetProtocol::Ipv6,
-        )
-        .ok_or(StackError::OutputQueueFull)?;
-        offset += Ipv6Packet::encode_header(
-            &mut storage[offset..],
-            source,
-            destination,
-            crate::IpProtocol::Icmpv6,
-            Icmpv6Packet::NEIGHBOR_MESSAGE_LEN,
-            255,
-        )
-        .ok_or(StackError::OutputQueueFull)?;
-        offset += Icmpv6Packet::encode_neighbor_advertisement(
-            &mut storage[offset..],
-            source,
-            destination,
-            target,
-            self.config.mac,
-        )
-        .ok_or(StackError::OutputQueueFull)?;
-        frame.set_len(offset);
-        self.outbound
-            .push_back(frame)
-            .map_err(|_| StackError::OutputQueueFull)?;
-        Ok(())
+        let local_mac = self.config.mac;
+        self.queue_outbound_frame(|frame| {
+            let storage = frame.storage_mut();
+            let mut offset = EthernetFrame::encode_header(
+                storage,
+                destination_mac,
+                local_mac,
+                EthernetProtocol::Ipv6,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            offset += Ipv6Packet::encode_header(
+                &mut storage[offset..],
+                source,
+                destination,
+                crate::IpProtocol::Icmpv6,
+                Icmpv6Packet::NEIGHBOR_MESSAGE_LEN,
+                255,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            offset += Icmpv6Packet::encode_neighbor_advertisement(
+                &mut storage[offset..],
+                source,
+                destination,
+                target,
+                local_mac,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            frame.set_len(offset);
+            Ok(())
+        })
     }
 
     fn next_hop(&self, destination: IpAddress) -> Option<IpAddress> {
@@ -1245,23 +1310,22 @@ impl Stack {
         destination_mac: EthernetAddress,
         packet: ArpPacket,
     ) -> Result<(), StackError> {
-        let mut frame = PacketBuffer::new();
-        let storage = frame.storage_mut();
-        let mut offset = EthernetFrame::encode_header(
-            storage,
-            destination_mac,
-            self.config.mac,
-            EthernetProtocol::Arp,
-        )
-        .ok_or(StackError::OutputQueueFull)?;
-        offset += packet
-            .encode(&mut storage[offset..])
+        let local_mac = self.config.mac;
+        self.queue_outbound_frame(|frame| {
+            let storage = frame.storage_mut();
+            let mut offset = EthernetFrame::encode_header(
+                storage,
+                destination_mac,
+                local_mac,
+                EthernetProtocol::Arp,
+            )
             .ok_or(StackError::OutputQueueFull)?;
-        frame.set_len(offset);
-        self.outbound
-            .push_back(frame)
-            .map_err(|_| StackError::OutputQueueFull)?;
-        Ok(())
+            offset += packet
+                .encode(&mut storage[offset..])
+                .ok_or(StackError::OutputQueueFull)?;
+            frame.set_len(offset);
+            Ok(())
+        })
     }
 
     fn receive_tcp(
