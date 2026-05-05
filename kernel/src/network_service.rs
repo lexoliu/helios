@@ -35,6 +35,7 @@ const DHCP_RETRANSMIT_NANOS: u64 = 1_000_000_000;
 const MAX_TCP_STREAM_HANDLES: usize = 256;
 const MAX_TCP_LISTENER_HANDLES: usize = 64;
 const MAX_UDP_SOCKET_HANDLES: usize = 256;
+const MAX_NETWORK_REQUESTS: usize = 256;
 
 #[derive(Clone)]
 pub struct NetworkService<CpuImpl, Runtime, Device>
@@ -382,7 +383,7 @@ where
                     transaction_id,
                 )),
                 device,
-                requests: ConcurrentQueue::unbounded(),
+                requests: ConcurrentQueue::bounded(MAX_NETWORK_REQUESTS),
                 request_ready: Notify::new(),
             }),
         }
@@ -573,7 +574,7 @@ where
     fn enqueue_request(&self, request: NetworkRequest) {
         match self.inner.requests.push(request) {
             Ok(()) => self.inner.request_ready.notify_one(),
-            Err(PushError::Full(_)) => unreachable!("unbounded network queue reported full"),
+            Err(PushError::Full(_)) => panic!("network request queue is full"),
             Err(PushError::Closed(_)) => panic!("network request queue was closed unexpectedly"),
         }
     }
