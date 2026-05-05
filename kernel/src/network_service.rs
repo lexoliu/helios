@@ -1,11 +1,8 @@
 extern crate alloc;
 
-use alloc::borrow::ToOwned;
-use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 use core::num::NonZeroU32;
 use core::task::Poll;
 use core::time::Duration;
@@ -23,8 +20,8 @@ use crate::{
     ComponentNetworkService, ComponentRuntimeState, DnsError, DnsErrorKind,
     Ipv4Address as KernelIpv4Address, Ipv4Cidr as KernelIpv4Cidr, Ipv4Route as KernelIpv4Route,
     MacAddress, NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
-    NetworkPortId, Notify, PingError, PingErrorKind, PingReply, TcpAccepted, TcpError,
-    TcpErrorKind, TcpListener, Timer, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+    NetworkPortId, PingError, PingErrorKind, PingReply, TcpAccepted, TcpError, TcpErrorKind,
+    TcpListener, Timer, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
 };
 
 const EPHEMERAL_PORT_START: u16 = 49_152;
@@ -35,7 +32,6 @@ const DHCP_RETRANSMIT_NANOS: u64 = 1_000_000_000;
 const MAX_TCP_STREAM_HANDLES: usize = 256;
 const MAX_TCP_LISTENER_HANDLES: usize = 64;
 const MAX_UDP_SOCKET_HANDLES: usize = 256;
-const MAX_NETWORK_REQUESTS: usize = 256;
 
 #[derive(Clone)]
 pub struct NetworkService<CpuImpl, Runtime, Device>
@@ -58,8 +54,6 @@ where
     timer: Timer<CpuImpl>,
     device: Device,
     state: crate::Mutex<NetworkState>,
-    requests: ConcurrentQueue<NetworkRequest>,
-    request_ready: Notify,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -113,119 +107,6 @@ impl crate::ComponentHostUdpSocketToken for UdpSocketId {
         let raw =
             NonZeroU32::new(raw).unwrap_or_else(|| panic!("udp socket handle must be non-zero"));
         Self(raw)
-    }
-}
-
-enum NetworkRequest {
-    Ping(PingRequest),
-    DnsResolve(DnsResolveRequest),
-    TcpListen(TcpListenRequest),
-    TcpAccept(TcpAcceptRequest),
-    UdpBind(UdpBindRequest),
-    UdpSend(UdpSendRequest),
-    UdpReceive(UdpReceiveRequest),
-    UdpJoinMulticastV4(UdpMulticastV4Request),
-    UdpLeaveMulticastV4(UdpMulticastV4Request),
-    UdpClose(UdpCloseRequest),
-}
-
-struct PingRequest {
-    host: String,
-    timeout_nanos: u64,
-    response: RequestResponse<Result<PingReply, PingError>>,
-}
-
-struct DnsResolveRequest {
-    host: String,
-    timeout_nanos: u64,
-    response: RequestResponse<Result<Vec<KernelIpv4Address>, DnsError>>,
-}
-
-struct TcpListenRequest {
-    local_port: u16,
-    backlog: u16,
-    response: RequestResponse<Result<TcpListener<TcpListenerId>, TcpError>>,
-}
-
-struct TcpAcceptRequest {
-    listener: TcpListenerId,
-    timeout_nanos: u64,
-    response: RequestResponse<Result<TcpAccepted<TcpStreamId>, TcpError>>,
-}
-
-struct UdpBindRequest {
-    local_port: u16,
-    response: RequestResponse<Result<UdpBinding<UdpSocketId>, UdpError>>,
-}
-
-struct UdpSendRequest {
-    socket: UdpSocketId,
-    host: String,
-    port: u16,
-    bytes: Vec<u8>,
-    timeout_nanos: u64,
-    response: RequestResponse<Result<u64, UdpError>>,
-}
-
-struct UdpReceiveRequest {
-    socket: UdpSocketId,
-    max_bytes: u32,
-    timeout_nanos: u64,
-    response: RequestResponse<Result<Option<UdpDatagram>, UdpError>>,
-}
-
-struct UdpMulticastV4Request {
-    group: KernelIpv4Address,
-    interface: KernelIpv4Address,
-    response: RequestResponse<Result<(), UdpError>>,
-}
-
-struct UdpCloseRequest {
-    socket: UdpSocketId,
-    response: RequestResponse<()>,
-}
-
-struct RequestResponse<T> {
-    inner: Arc<RequestResponseInner<T>>,
-}
-
-struct RequestResponseInner<T> {
-    result: crate::Mutex<Option<T>>,
-    ready: Notify,
-}
-
-impl<T> Clone for RequestResponse<T> {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-        }
-    }
-}
-
-impl<T> RequestResponse<T> {
-    fn new() -> Self {
-        Self {
-            inner: Arc::new(RequestResponseInner {
-                result: crate::Mutex::new(None),
-                ready: Notify::new(),
-            }),
-        }
-    }
-
-    async fn complete(&self, result: T) {
-        let mut slot = self.inner.result.lock().await;
-        assert!(slot.is_none(), "network request completed more than once");
-        *slot = Some(result);
-        self.inner.ready.notify_all();
-    }
-
-    async fn wait(&self) -> T {
-        loop {
-            if let Some(result) = self.inner.result.lock().await.take() {
-                return result;
-            }
-            self.inner.ready.notified().await;
-        }
     }
 }
 
@@ -383,20 +264,12 @@ where
                     transaction_id,
                 )),
                 device,
-                requests: ConcurrentQueue::bounded(MAX_NETWORK_REQUESTS),
-                request_ready: Notify::new(),
             }),
         }
     }
 
     pub async fn ping(&self, host: &str, timeout_nanos: u64) -> Result<PingReply, PingError> {
-        let response = RequestResponse::new();
-        self.enqueue_request(NetworkRequest::Ping(PingRequest {
-            host: host.to_owned(),
-            timeout_nanos,
-            response: response.clone(),
-        }));
-        response.wait().await
+        self.execute_ping(host, timeout_nanos).await
     }
 
     pub async fn dns_resolve(
@@ -404,13 +277,7 @@ where
         host: &str,
         timeout_nanos: u64,
     ) -> Result<Vec<KernelIpv4Address>, DnsError> {
-        let response = RequestResponse::new();
-        self.enqueue_request(NetworkRequest::DnsResolve(DnsResolveRequest {
-            host: host.to_owned(),
-            timeout_nanos,
-            response: response.clone(),
-        }));
-        response.wait().await
+        self.execute_dns_resolve(host, timeout_nanos).await
     }
 
     pub async fn tcp_connect(
@@ -438,13 +305,7 @@ where
         local_port: u16,
         backlog: u16,
     ) -> Result<TcpListener<TcpListenerId>, TcpError> {
-        let response = RequestResponse::new();
-        self.enqueue_request(NetworkRequest::TcpListen(TcpListenRequest {
-            local_port,
-            backlog,
-            response: response.clone(),
-        }));
-        response.wait().await
+        self.execute_tcp_listen(local_port, backlog).await
     }
 
     pub async fn tcp_accept(
@@ -452,13 +313,7 @@ where
         listener: TcpListenerId,
         timeout_nanos: u64,
     ) -> Result<TcpAccepted<TcpStreamId>, TcpError> {
-        let response = RequestResponse::new();
-        self.enqueue_request(NetworkRequest::TcpAccept(TcpAcceptRequest {
-            listener,
-            timeout_nanos,
-            response: response.clone(),
-        }));
-        response.wait().await
+        self.execute_tcp_accept(listener, timeout_nanos).await
     }
 
     pub async fn tcp_write_all(
@@ -490,12 +345,7 @@ where
     }
 
     pub async fn udp_bind(&self, local_port: u16) -> Result<UdpBinding<UdpSocketId>, UdpError> {
-        let response = RequestResponse::new();
-        self.enqueue_request(NetworkRequest::UdpBind(UdpBindRequest {
-            local_port,
-            response: response.clone(),
-        }));
-        response.wait().await
+        self.execute_udp_bind(local_port).await
     }
 
     pub async fn udp_send(
@@ -506,16 +356,8 @@ where
         bytes: &[u8],
         timeout_nanos: u64,
     ) -> Result<u64, UdpError> {
-        let response = RequestResponse::new();
-        self.enqueue_request(NetworkRequest::UdpSend(UdpSendRequest {
-            socket,
-            host: host.to_owned(),
-            port,
-            bytes: bytes.to_vec(),
-            timeout_nanos,
-            response: response.clone(),
-        }));
-        response.wait().await
+        self.execute_udp_send(socket, host, port, bytes, timeout_nanos)
+            .await
     }
 
     pub async fn udp_receive(
@@ -524,14 +366,8 @@ where
         max_bytes: u32,
         timeout_nanos: u64,
     ) -> Result<Option<UdpDatagram>, UdpError> {
-        let response = RequestResponse::new();
-        self.enqueue_request(NetworkRequest::UdpReceive(UdpReceiveRequest {
-            socket,
-            max_bytes,
-            timeout_nanos,
-            response: response.clone(),
-        }));
-        response.wait().await
+        self.execute_udp_receive(socket, max_bytes, timeout_nanos)
+            .await
     }
 
     pub async fn udp_join_multicast_v4(
@@ -539,13 +375,7 @@ where
         group: KernelIpv4Address,
         interface: KernelIpv4Address,
     ) -> Result<(), UdpError> {
-        let response = RequestResponse::new();
-        self.enqueue_request(NetworkRequest::UdpJoinMulticastV4(UdpMulticastV4Request {
-            group,
-            interface,
-            response: response.clone(),
-        }));
-        response.wait().await
+        self.execute_udp_join_multicast_v4(group, interface).await
     }
 
     pub async fn udp_leave_multicast_v4(
@@ -553,118 +383,11 @@ where
         group: KernelIpv4Address,
         interface: KernelIpv4Address,
     ) -> Result<(), UdpError> {
-        let response = RequestResponse::new();
-        self.enqueue_request(NetworkRequest::UdpLeaveMulticastV4(UdpMulticastV4Request {
-            group,
-            interface,
-            response: response.clone(),
-        }));
-        response.wait().await
+        self.execute_udp_leave_multicast_v4(group, interface).await
     }
 
     pub async fn udp_close(&self, socket: UdpSocketId) {
-        let response = RequestResponse::new();
-        self.enqueue_request(NetworkRequest::UdpClose(UdpCloseRequest {
-            socket,
-            response: response.clone(),
-        }));
-        response.wait().await;
-    }
-
-    fn enqueue_request(&self, request: NetworkRequest) {
-        match self.inner.requests.push(request) {
-            Ok(()) => self.inner.request_ready.notify_one(),
-            Err(PushError::Full(_)) => panic!("network request queue is full"),
-            Err(PushError::Closed(_)) => panic!("network request queue was closed unexpectedly"),
-        }
-    }
-
-    pub async fn run_requests(&self) {
-        loop {
-            let request = self.next_request().await;
-            match request {
-                NetworkRequest::Ping(request) => {
-                    let result = self
-                        .execute_ping(&request.host, request.timeout_nanos)
-                        .await;
-                    request.response.complete(result).await;
-                }
-                NetworkRequest::DnsResolve(request) => {
-                    let result = self
-                        .execute_dns_resolve(&request.host, request.timeout_nanos)
-                        .await;
-                    request.response.complete(result).await;
-                }
-                NetworkRequest::TcpListen(request) => {
-                    let result = self
-                        .execute_tcp_listen(request.local_port, request.backlog)
-                        .await;
-                    request.response.complete(result).await;
-                }
-                NetworkRequest::TcpAccept(request) => {
-                    let result = self
-                        .execute_tcp_accept(request.listener, request.timeout_nanos)
-                        .await;
-                    request.response.complete(result).await;
-                }
-                NetworkRequest::UdpBind(request) => {
-                    let result = self.execute_udp_bind(request.local_port).await;
-                    request.response.complete(result).await;
-                }
-                NetworkRequest::UdpSend(request) => {
-                    let result = self
-                        .execute_udp_send(
-                            request.socket,
-                            &request.host,
-                            request.port,
-                            &request.bytes,
-                            request.timeout_nanos,
-                        )
-                        .await;
-                    request.response.complete(result).await;
-                }
-                NetworkRequest::UdpReceive(request) => {
-                    let result = self
-                        .execute_udp_receive(
-                            request.socket,
-                            request.max_bytes,
-                            request.timeout_nanos,
-                        )
-                        .await;
-                    request.response.complete(result).await;
-                }
-                NetworkRequest::UdpJoinMulticastV4(request) => {
-                    let result = self
-                        .execute_udp_join_multicast_v4(request.group, request.interface)
-                        .await;
-                    request.response.complete(result).await;
-                }
-                NetworkRequest::UdpLeaveMulticastV4(request) => {
-                    let result = self
-                        .execute_udp_leave_multicast_v4(request.group, request.interface)
-                        .await;
-                    request.response.complete(result).await;
-                }
-                NetworkRequest::UdpClose(request) => {
-                    self.inner
-                        .state
-                        .lock()
-                        .await
-                        .remove_udp_socket(request.socket);
-                    request.response.complete(()).await;
-                }
-            }
-        }
-    }
-
-    async fn next_request(&self) -> NetworkRequest {
-        loop {
-            match self.inner.requests.pop() {
-                Ok(request) => return request,
-                Err(PopError::Empty) => self.inner.request_ready.notified().await,
-                Err(PopError::Closed) => panic!("network request queue was closed unexpectedly"),
-            }
-        }
+        self.inner.state.lock().await.remove_udp_socket(socket);
     }
 
     async fn execute_ping(&self, host: &str, timeout_nanos: u64) -> Result<PingReply, PingError> {

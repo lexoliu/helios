@@ -35,11 +35,8 @@ pub(crate) fn install<WatchdogImpl>(
     };
     let service = NetworkService::new(cpu.clone(), debug_state.clone(), kernel.timer(), device);
     debug_state.install_network_service(helios_kernel::ComponentHostNetworkService::from_service(
-        service.clone(),
+        service,
     ));
-    kernel.spawn_local_detached(async move {
-        service.run_requests().await;
-    });
     tracing::info!("virtio network online");
 }
 

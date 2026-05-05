@@ -69,12 +69,8 @@ where
         probe.device.clone(),
     );
     debug_state.install_network_service(helios_kernel::ComponentHostNetworkService::from_service(
-        service.clone(),
+        service,
     ));
-    let network_task = service.clone();
-    kernel.spawn_local_detached(async move {
-        network_task.run_requests().await;
-    });
     probe.enable();
     tracing::info!(
         "virtio network online irq={} context={}",
