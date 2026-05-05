@@ -10,6 +10,9 @@ use crate::{
 
 pub const MAX_TCP_QUEUED_SEGMENTS: usize = 32;
 const TCP_RECEIVE_SEGMENT_BYTES: usize = 1460;
+const TCP_SMALL_PAYLOAD_ACK_BYTES: usize = TCP_RECEIVE_SEGMENT_BYTES / 2;
+const TCP_DELAYED_ACK_SEGMENTS: u8 = 2;
+const TCP_WINDOW_UPDATE_BYTES: u16 = (TCP_RECEIVE_SEGMENT_BYTES * 4) as u16;
 pub const TCP_INITIAL_RTO_NANOS: u64 = 1_000_000_000;
 pub const TCP_MAX_RETRANSMISSIONS: u8 = 5;
 
@@ -74,6 +77,8 @@ where
     syn_queued: bool,
     syn_ack_queued: bool,
     ack_pending: bool,
+    unacked_receive_segments: u8,
+    pending_window_update_bytes: u16,
 }
 
 impl<C> TcpSocket<C>
@@ -98,6 +103,8 @@ where
             syn_queued: false,
             syn_ack_queued: false,
             ack_pending: false,
+            unacked_receive_segments: 0,
+            pending_window_update_bytes: 0,
         }
     }
 
@@ -379,6 +386,7 @@ where
     }
 
     pub fn receive(&mut self, max_bytes: usize) -> Option<Bytes> {
+        let previous_window = self.advertised_window;
         let mut bytes = self.receive_queue.pop_front()?;
         if bytes.len() > max_bytes {
             let tail = bytes.split_off(max_bytes);
@@ -387,7 +395,9 @@ where
                 .unwrap_or_else(|_| panic!("TCP receive queue lost capacity while splitting"));
         }
         self.refresh_advertised_window();
-        self.ack_pending = true;
+        if self.should_advertise_window_update(previous_window) {
+            self.request_ack();
+        }
         Some(bytes)
     }
 
@@ -463,19 +473,19 @@ where
                         .is_err()
                     {
                         self.refresh_advertised_window();
-                        self.ack_pending = true;
+                        self.request_ack();
                         return action;
                     }
                     self.receive_next = self
                         .receive_next
                         .wrapping_add(u32::try_from(packet.payload.len()).unwrap_or(u32::MAX));
                     self.refresh_advertised_window();
-                    self.ack_pending = true;
+                    self.note_inbound_payload(packet.payload.len());
                 }
                 if packet.flags.contains(TcpFlags::FIN) {
                     self.receive_next = self.receive_next.wrapping_add(1);
                     self.state = TcpState::CloseWait;
-                    self.ack_pending = true;
+                    self.request_ack();
                 }
                 action
             }
@@ -510,6 +520,34 @@ where
 
     fn refresh_advertised_window(&mut self) {
         self.advertised_window = receive_window_size(self.receive_queue.len());
+    }
+
+    fn note_inbound_payload(&mut self, payload_len: usize) {
+        self.unacked_receive_segments = self.unacked_receive_segments.saturating_add(1);
+        if self.unacked_receive_segments >= TCP_DELAYED_ACK_SEGMENTS
+            || payload_len < TCP_SMALL_PAYLOAD_ACK_BYTES
+        {
+            self.request_ack();
+        }
+    }
+
+    fn request_ack(&mut self) {
+        self.ack_pending = true;
+        self.unacked_receive_segments = 0;
+        self.pending_window_update_bytes = 0;
+    }
+
+    fn should_advertise_window_update(&mut self, previous_window: u16) -> bool {
+        if self.advertised_window <= previous_window {
+            return false;
+        }
+        if previous_window == 0 {
+            return true;
+        }
+        self.pending_window_update_bytes = self
+            .pending_window_update_bytes
+            .saturating_add(self.advertised_window - previous_window);
+        self.pending_window_update_bytes >= TCP_WINDOW_UPDATE_BYTES
     }
 }
 
@@ -642,5 +680,135 @@ mod tests {
         assert!(socket.advertised_window() < open_window);
         assert_eq!(socket.receive(8), Some(Bytes::from_static(b"hello")));
         assert_eq!(socket.advertised_window(), open_window);
+    }
+
+    #[test]
+    fn full_size_receive_payloads_ack_every_two_segments() {
+        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+        socket.mark_syn_queued(0);
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS,
+        );
+        socket.mark_ack_queued();
+
+        let payload = [0u8; TCP_RECEIVE_SEGMENT_BYTES];
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                payload: &payload,
+            },
+            TCP_INITIAL_RTO_NANOS + 1,
+        );
+        assert_eq!(socket.pending_ack(), None);
+
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101 + TCP_RECEIVE_SEGMENT_BYTES as u32,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                payload: &payload,
+            },
+            TCP_INITIAL_RTO_NANOS + 2,
+        );
+        assert!(socket.pending_ack().is_some());
+    }
+
+    #[test]
+    fn small_receive_payload_ack_is_immediate() {
+        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+        socket.mark_syn_queued(0);
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS,
+        );
+        socket.mark_ack_queued();
+
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                payload: b"ok",
+            },
+            TCP_INITIAL_RTO_NANOS + 1,
+        );
+        assert!(socket.pending_ack().is_some());
+    }
+
+    #[test]
+    fn receive_window_update_ack_is_thresholded() {
+        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+        socket.mark_syn_queued(0);
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS,
+        );
+        socket.mark_ack_queued();
+
+        let payload = [0u8; TCP_RECEIVE_SEGMENT_BYTES];
+        for index in 0..4u32 {
+            let _ = socket.on_segment(
+                TcpPacket {
+                    source_port: 80,
+                    destination_port: 49152,
+                    sequence: 101 + index * TCP_RECEIVE_SEGMENT_BYTES as u32,
+                    acknowledgement: 8,
+                    flags: TcpFlags::ACK,
+                    window_size: u16::MAX,
+                    payload: &payload,
+                },
+                TCP_INITIAL_RTO_NANOS + u64::from(index) + 1,
+            );
+        }
+        socket.mark_ack_queued();
+
+        for _ in 0..3 {
+            assert_eq!(
+                socket.receive(TCP_RECEIVE_SEGMENT_BYTES).as_deref(),
+                Some(&payload[..])
+            );
+            assert_eq!(socket.pending_ack(), None);
+        }
+        assert_eq!(
+            socket.receive(TCP_RECEIVE_SEGMENT_BYTES).as_deref(),
+            Some(&payload[..])
+        );
+        assert!(socket.pending_ack().is_some());
     }
 }

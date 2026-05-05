@@ -13,9 +13,10 @@ use helios_hal::io::IoError;
 use helios_netstack::{
     DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage, DhcpMessageType, DhcpPacket,
     DnsQuestionWriter, DnsResponse, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr,
-    NetworkInterface as NetworkDevice, Route, Stack, StackConfig, StackInstant, TcpConnectState,
-    TcpEndpoint, TcpReadState,
+    NetworkInterface as NetworkDevice, PacketBuffer, Route, Stack, StackConfig, StackInstant,
+    TcpConnectState, TcpEndpoint, TcpReadState,
 };
+use smallvec::SmallVec;
 
 use crate::{
     ComponentNetworkService, ComponentRuntimeState, DnsError, DnsErrorKind,
@@ -34,6 +35,7 @@ const MAX_TCP_STREAM_HANDLES: usize = 256;
 const MAX_TCP_LISTENER_HANDLES: usize = 64;
 const MAX_UDP_SOCKET_HANDLES: usize = 256;
 const NETWORK_PROGRESS_WAIT: Duration = Duration::from_micros(50);
+const NETWORK_TX_BATCH_FRAMES: usize = 8;
 
 #[derive(Clone)]
 pub struct NetworkService<CpuImpl, Runtime, Device>
@@ -982,12 +984,25 @@ where
         let mut transmitted = 0usize;
         let transmit_started = self.profile_start();
         loop {
-            let frame = self.inner.state.lock().await.stack.take_outbound();
-            let Some(frame) = frame else {
+            let mut frames = SmallVec::<[PacketBuffer; NETWORK_TX_BATCH_FRAMES]>::new();
+            {
+                let mut state = self.inner.state.lock().await;
+                while frames.len() < NETWORK_TX_BATCH_FRAMES {
+                    let Some(frame) = state.stack.take_outbound() else {
+                        break;
+                    };
+                    frames.push(frame);
+                }
+            }
+            if frames.is_empty() {
                 break;
-            };
-            self.inner.device.transmit(frame.as_slice()).await?;
-            transmitted += 1;
+            }
+            let frame_refs = frames
+                .iter()
+                .map(PacketBuffer::as_slice)
+                .collect::<SmallVec<[&[u8]; NETWORK_TX_BATCH_FRAMES]>>();
+            self.inner.device.transmit_batch(&frame_refs).await?;
+            transmitted += frame_refs.len();
         }
         if transmitted != 0 {
             self.record_network_profile("tx-submit", transmit_started);

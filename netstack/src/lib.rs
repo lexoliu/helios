@@ -220,6 +220,19 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
     /// Transmits one borrowed frame and waits until the device accepts ownership.
     fn transmit<'a>(&'a self, frame: &'a [u8]) -> impl Future<Output = IoResult<()>> + Send + 'a;
 
+    /// Transmits borrowed frame slices in order.
+    fn transmit_batch<'a>(
+        &'a self,
+        frames: &'a [&'a [u8]],
+    ) -> impl Future<Output = IoResult<()>> + Send + 'a {
+        async move {
+            for frame in frames {
+                self.transmit(frame).await?;
+            }
+            Ok(())
+        }
+    }
+
     /// Waits for interface progress, such as RX arrival or TX completion.
     fn wait_for_event(&self) -> impl Future<Output = ()> + Send + '_;
 }
@@ -241,19 +254,6 @@ pub trait NetworkInterfaceBatch: NetworkInterface {
                 received += 1;
             }
             Ok(received)
-        }
-    }
-
-    /// Transmits borrowed frame slices in order.
-    fn transmit_batch<'a>(
-        &'a self,
-        frames: &'a [&'a [u8]],
-    ) -> impl Future<Output = IoResult<()>> + Send + 'a {
-        async move {
-            for frame in frames {
-                self.transmit(frame).await?;
-            }
-            Ok(())
         }
     }
 }

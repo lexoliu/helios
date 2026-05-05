@@ -114,6 +114,12 @@ impl NetworkDevice for VirtioNetworkDevice {
             .await
     }
 
+    async fn transmit_batch<'a>(&'a self, frames: &'a [&'a [u8]]) -> Result<(), IoError> {
+        self.inner
+            .transmit_batch_with_wait(frames, helios_kernel::yield_now)
+            .await
+    }
+
     async fn wait_for_event(&self) {
         helios_kernel::yield_now().await;
     }

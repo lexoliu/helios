@@ -1,5 +1,6 @@
 use alloc::boxed::Box;
 use alloc::vec;
+use alloc::vec::Vec;
 use async_lock::{Mutex, MutexGuard};
 use core::future::Future;
 use core::mem::size_of;
@@ -39,6 +40,8 @@ struct NetRxState<T: VirtioTransport> {
 
 struct NetTxState<T: VirtioTransport> {
     tx_queue: VirtQueue<T>,
+    tx_buffers: Box<[Box<[u8]>]>,
+    tx_in_flight: Box<[bool]>,
 }
 
 pub struct VirtioNetDevice<T: VirtioTransport> {
@@ -114,6 +117,9 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let rx_buffer_len = header_len
             .checked_add(max_frame_len)
             .ok_or(IoError::DeviceFault)?;
+        let tx_buffer_len = header_len
+            .checked_add(max_frame_len)
+            .ok_or(IoError::DeviceFault)?;
 
         let rx_queue_size = transport.queue_max_size(RX_QUEUE_INDEX).min(QUEUE_SIZE);
         let tx_queue_size = transport.queue_max_size(TX_QUEUE_INDEX).min(QUEUE_SIZE);
@@ -137,6 +143,11 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             );
             rx_buffers[usize::from(token)] = Some(buffer);
         }
+        let tx_buffers = (0..usize::from(tx_queue_size))
+            .map(|_| vec![0_u8; tx_buffer_len].into_boxed_slice())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let tx_in_flight = vec![false; usize::from(tx_queue_size)].into_boxed_slice();
 
         transport.set_status(
             DeviceStatus::ACKNOWLEDGE
@@ -152,7 +163,11 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 rx_queue,
                 rx_buffers,
             }),
-            tx_state: Mutex::new(NetTxState { tx_queue }),
+            tx_state: Mutex::new(NetTxState {
+                tx_queue,
+                tx_buffers,
+                tx_in_flight,
+            }),
             tx_gate: Mutex::new(()),
             interrupts: Notify::new(),
             mac_address,
@@ -263,47 +278,122 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             .await
     }
 
-    pub async fn transmit_with_wait<Wait, Fut>(&self, frame: &[u8], mut wait: Wait) -> IoResult<()>
+    pub async fn transmit_with_wait<Wait, Fut>(&self, frame: &[u8], wait: Wait) -> IoResult<()>
     where
         Wait: FnMut() -> Fut,
         Fut: Future<Output = ()>,
     {
-        if frame.is_empty() || frame.len() > self.max_frame_len {
-            return Err(IoError::InvalidBufferLength {
-                required_multiple: 1,
-                actual: frame.len(),
-            });
+        self.transmit_batch_with_wait(&[frame], wait).await
+    }
+
+    pub async fn transmit_batch(&self, frames: &[&[u8]]) -> IoResult<()> {
+        self.transmit_batch_with_wait(frames, || self.interrupts.notified())
+            .await
+    }
+
+    pub async fn transmit_batch_with_wait<Wait, Fut>(
+        &self,
+        frames: &[&[u8]],
+        mut wait: Wait,
+    ) -> IoResult<()>
+    where
+        Wait: FnMut() -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        for frame in frames {
+            if frame.is_empty() || frame.len() > self.max_frame_len {
+                return Err(IoError::InvalidBufferLength {
+                    required_multiple: 1,
+                    actual: frame.len(),
+                });
+            }
         }
 
-        let header = VirtioNetHeader::default();
-        let header_bytes = as_bytes(&header);
         let _tx_turn = self.tx_gate.lock().await;
-        let token = {
-            let mut state = self.tx_state.lock().await;
-            let token = state
-                .tx_queue
-                .submit(&self.transport, &[header_bytes, frame], &mut [])?;
-            state.tx_queue.notify(&self.transport);
-            token
-        };
-
-        loop {
+        let mut next_frame = 0usize;
+        while next_frame < frames.len() {
+            let mut submitted = 0usize;
             {
                 let mut state = self.tx_state.lock().await;
-                if let Some(completed) = state.tx_queue.pop_used() {
-                    assert_eq!(completed, token, "virtio net TX completion token mismatch");
-                    return Ok(());
+                Self::drain_tx_completions(&mut state);
+                let NetTxState {
+                    tx_queue,
+                    tx_buffers,
+                    tx_in_flight,
+                } = &mut *state;
+                while next_frame < frames.len() && tx_queue.available_descriptors() != 0 {
+                    let token = tx_queue.next_free_descriptor();
+                    let token_index = usize::from(token);
+                    assert!(
+                        !tx_in_flight[token_index],
+                        "virtio net TX descriptor {token} is still in flight"
+                    );
+                    let payload_len = write_tx_payload(
+                        &mut tx_buffers[token_index],
+                        self.header_len,
+                        frames[next_frame],
+                    )?;
+                    let payload = &tx_buffers[token_index][..payload_len];
+                    let submitted_token = tx_queue.submit(&self.transport, &[payload], &mut [])?;
+                    assert_eq!(
+                        submitted_token, token,
+                        "virtio net TX descriptor allocation moved while payload was prepared"
+                    );
+                    tx_in_flight[token_index] = true;
+                    submitted += 1;
+                    next_frame += 1;
                 }
-                for _ in 0..TX_COMPLETION_SPIN_POLLS {
-                    core::hint::spin_loop();
-                    if let Some(completed) = state.tx_queue.pop_used() {
-                        assert_eq!(completed, token, "virtio net TX completion token mismatch");
-                        return Ok(());
-                    }
+                if submitted != 0 {
+                    tx_queue.notify(&self.transport);
                 }
             }
-            wait().await;
+
+            if submitted != 0 {
+                let mut remaining = submitted;
+                while remaining != 0 {
+                    let completed = {
+                        let mut state = self.tx_state.lock().await;
+                        Self::drain_tx_completions(&mut state)
+                    };
+                    assert!(
+                        completed <= remaining,
+                        "virtio net TX completed more descriptors than the current batch"
+                    );
+                    remaining -= completed;
+                    if remaining == 0 {
+                        break;
+                    }
+                    for _ in 0..TX_COMPLETION_SPIN_POLLS {
+                        core::hint::spin_loop();
+                        let completed = {
+                            let mut state = self.tx_state.lock().await;
+                            Self::drain_tx_completions(&mut state)
+                        };
+                        assert!(
+                            completed <= remaining,
+                            "virtio net TX completed more descriptors than the current batch"
+                        );
+                        remaining -= completed;
+                        if remaining == 0 {
+                            break;
+                        }
+                    }
+                    if remaining != 0 {
+                        wait().await;
+                    }
+                }
+            } else {
+                let should_wait = {
+                    let mut state = self.tx_state.lock().await;
+                    Self::drain_tx_completions(&mut state);
+                    state.tx_queue.available_descriptors() == 0
+                };
+                if should_wait {
+                    wait().await;
+                }
+            }
         }
+        Ok(())
     }
 
     pub async fn wait_for_interrupt(&self) {
@@ -324,6 +414,20 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         );
         state.rx_buffers[usize::from(token)] = Some(buffer);
         Ok(())
+    }
+
+    fn drain_tx_completions(state: &mut NetTxState<T>) -> usize {
+        let mut completed = 0usize;
+        while let Some(token) = state.tx_queue.pop_used() {
+            let token_index = usize::from(token);
+            assert!(
+                state.tx_in_flight[token_index],
+                "virtio net TX completion referenced idle descriptor {token}"
+            );
+            state.tx_in_flight[token_index] = false;
+            completed += 1;
+        }
+        completed
     }
 }
 
@@ -348,4 +452,21 @@ fn read_mtu<T: VirtioTransport>(transport: &T, accepted_features: u64) -> usize 
 
 fn as_bytes<T>(value: &T) -> &[u8] {
     unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
+}
+
+fn write_tx_payload(buffer: &mut [u8], header_len: usize, frame: &[u8]) -> IoResult<usize> {
+    let payload_len = header_len
+        .checked_add(frame.len())
+        .ok_or(IoError::DeviceFault)?;
+    if payload_len > buffer.len() {
+        return Err(IoError::InvalidBufferLength {
+            required_multiple: 1,
+            actual: frame.len(),
+        });
+    }
+
+    let header = VirtioNetHeader::default();
+    buffer[..header_len].copy_from_slice(as_bytes(&header));
+    buffer[header_len..payload_len].copy_from_slice(frame);
+    Ok(payload_len)
 }

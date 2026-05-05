@@ -129,6 +129,14 @@ impl<T: VirtioTransport> VirtQueue<T> {
         self.pop_used_with_len().map(|(head, _)| head)
     }
 
+    pub fn available_descriptors(&self) -> usize {
+        usize::from(self.size - self.num_used)
+    }
+
+    pub fn next_free_descriptor(&self) -> u16 {
+        self.free_head
+    }
+
     pub fn pop_used_with_len(&mut self) -> Option<(u16, u32)> {
         let used_idx = self.read_used_idx();
         if used_idx == self.last_used_idx {
