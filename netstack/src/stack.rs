@@ -3,6 +3,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use arrayvec::ArrayVec;
+use bytes::Bytes;
 use heapless::Deque;
 
 use crate::{
@@ -179,7 +180,7 @@ pub struct UdpReceive {
     pub destination: IpAddress,
     pub source_port: u16,
     pub destination_port: u16,
-    pub bytes: Vec<u8>,
+    pub bytes: Bytes,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1160,7 +1161,7 @@ impl Stack {
                 destination,
                 source_port: packet.source_port,
                 destination_port: packet.destination_port,
-                bytes: packet.payload.to_vec(),
+                bytes: Bytes::copy_from_slice(packet.payload),
             })
             .map_err(|_| StackError::OutputQueueFull)?;
         Ok(())

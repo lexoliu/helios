@@ -2,6 +2,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+use bytes::Bytes;
 use heapless::Deque;
 
 use crate::{
@@ -22,7 +23,7 @@ pub struct TcpTransmitSegment {
     pub local: TcpEndpoint,
     pub remote: TcpEndpoint,
     pub header: TcpHeader,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
     pub sequence_len: u32,
 }
 
@@ -54,8 +55,8 @@ where
     send_unacknowledged: u32,
     receive_next: u32,
     advertised_window: u16,
-    receive_queue: Deque<Vec<u8>, MAX_TCP_QUEUED_SEGMENTS>,
-    transmit_queue: Deque<Vec<u8>, MAX_TCP_QUEUED_SEGMENTS>,
+    receive_queue: Deque<Bytes, MAX_TCP_QUEUED_SEGMENTS>,
+    transmit_queue: Deque<Bytes, MAX_TCP_QUEUED_SEGMENTS>,
     bytes_in_flight: u32,
     delivered_bytes: u64,
     syn_queued: bool,
@@ -184,7 +185,7 @@ where
         if writable != 0 {
             if self
                 .transmit_queue
-                .push_back(bytes[..writable].to_vec())
+                .push_back(Bytes::copy_from_slice(&bytes[..writable]))
                 .is_err()
             {
                 return 0;
@@ -235,8 +236,13 @@ where
 
     pub fn receive(&mut self, max_bytes: usize) -> Option<Vec<u8>> {
         let mut bytes = self.receive_queue.pop_front()?;
-        bytes.truncate(max_bytes);
-        Some(bytes)
+        if bytes.len() > max_bytes {
+            let tail = bytes.split_off(max_bytes);
+            self.receive_queue
+                .push_front(tail)
+                .unwrap_or_else(|_| panic!("TCP receive queue lost capacity while splitting"));
+        }
+        Some(bytes.to_vec())
     }
 
     pub fn on_segment(&mut self, packet: TcpPacket<'_>, now_nanos: u64) -> Option<RecoveryAction> {
@@ -284,7 +290,7 @@ where
                 if packet.sequence == self.receive_next && !packet.payload.is_empty() {
                     if self
                         .receive_queue
-                        .push_back(packet.payload.to_vec())
+                        .push_back(Bytes::copy_from_slice(packet.payload))
                         .is_err()
                     {
                         return action;

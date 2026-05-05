@@ -1859,7 +1859,7 @@ impl NetworkState {
             return Ok(Some(UdpDatagram {
                 address: map_ipv4_address(address),
                 port: datagram.source_port,
-                bytes: datagram.bytes,
+                bytes: datagram.bytes.to_vec(),
             }));
         }
     }
