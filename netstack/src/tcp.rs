@@ -84,6 +84,7 @@ where
     delivered_bytes: u64,
     syn_queued: bool,
     syn_ack_queued: bool,
+    fin_queued: bool,
     ack_pending: bool,
     unacked_receive_segments: u8,
     pending_window_update_bytes: u16,
@@ -110,6 +111,7 @@ where
             delivered_bytes: 0,
             syn_queued: false,
             syn_ack_queued: false,
+            fin_queued: false,
             ack_pending: false,
             unacked_receive_segments: 0,
             pending_window_update_bytes: 0,
@@ -296,6 +298,9 @@ where
     }
 
     pub fn queue_send_bytes(&mut self, bytes: &mut Bytes) -> usize {
+        if !matches!(self.state, TcpState::Established | TcpState::CloseWait) {
+            return 0;
+        }
         if self.transmit_queue.is_full() {
             return 0;
         }
@@ -315,15 +320,66 @@ where
     }
 
     pub fn take_transmit_segment(&mut self, now_nanos: u64) -> Option<TcpTransmitSegment> {
-        if self.state != TcpState::Established {
-            return None;
-        }
         let local = self.local?;
         let remote = self.remote?;
         let cwnd = self.congestion.congestion_window().bytes();
         if self.bytes_in_flight >= cwnd {
             return None;
         }
+        if matches!(
+            self.state,
+            TcpState::Established | TcpState::CloseWait | TcpState::FinWait1 | TcpState::LastAck
+        ) && !self.fin_queued
+        {
+            if let Some(segment) = self.take_data_segment(local, remote, cwnd, now_nanos) {
+                return Some(segment);
+            }
+        }
+
+        if !matches!(self.state, TcpState::FinWait1 | TcpState::LastAck) || self.fin_queued {
+            return None;
+        }
+
+        let header = TcpHeader {
+            source_port: local.port,
+            destination_port: remote.port,
+            sequence: self.send_next,
+            acknowledgement: self.receive_next,
+            flags: TcpFlags::ACK.union(TcpFlags::FIN),
+            window_size: self.advertised_window,
+        };
+        self.fin_queued = true;
+        self.ack_pending = false;
+        self.send_next = self.send_next.wrapping_add(1);
+        self.bytes_in_flight = self.bytes_in_flight.saturating_add(1);
+        self.congestion
+            .on_packet_sent(1, self.bytes_in_flight, now_nanos);
+        self.in_flight
+            .push_back(TcpInFlightSegment {
+                header,
+                payload: Bytes::new(),
+                sequence_len: 1,
+                sent_at_nanos: now_nanos,
+                retransmissions: 0,
+            })
+            .unwrap_or_else(|_| panic!("TCP in-flight queue is full"));
+        Some(TcpTransmitSegment {
+            local,
+            remote,
+            header,
+            payload: Bytes::new(),
+            sequence_len: 1,
+            retransmission: false,
+        })
+    }
+
+    fn take_data_segment(
+        &mut self,
+        local: TcpEndpoint,
+        remote: TcpEndpoint,
+        cwnd: u32,
+        now_nanos: u64,
+    ) -> Option<TcpTransmitSegment> {
         let mut payload = self.transmit_queue.pop_front()?;
         let available = usize::try_from(cwnd - self.bytes_in_flight).unwrap_or(usize::MAX);
         if payload.len() > available {
@@ -354,6 +410,7 @@ where
                 retransmissions: 0,
             })
             .unwrap_or_else(|_| panic!("TCP in-flight queue is full"));
+        self.ack_pending = false;
         Some(TcpTransmitSegment {
             local,
             remote,
@@ -451,6 +508,17 @@ where
     }
 
     pub fn on_segment(&mut self, packet: TcpPacket<'_>, now_nanos: u64) -> TcpSegmentOutcome {
+        if packet.flags.contains(TcpFlags::RST) {
+            self.state = TcpState::Closed;
+            return TcpSegmentOutcome {
+                recovery: Some(
+                    self.congestion
+                        .on_congestion_event(CongestionEvent::RetransmissionTimeout { now_nanos }),
+                ),
+                receive_backpressure: false,
+            };
+        }
+
         match self.state {
             TcpState::SynSent if packet.flags.contains(TcpFlags::SYN.union(TcpFlags::ACK)) => {
                 self.remote = self.remote.map(|mut remote| {
@@ -458,19 +526,11 @@ where
                     remote
                 });
                 self.receive_next = packet.sequence.wrapping_add(1);
-                self.send_unacknowledged = packet.acknowledgement;
+                let action = self.acknowledge_sent(packet.acknowledgement, now_nanos, false);
                 self.state = TcpState::Established;
                 self.ack_pending = true;
                 TcpSegmentOutcome {
-                    recovery: Some(self.congestion.on_ack(AckSample {
-                        acked_bytes: 1,
-                        delivered_bytes: self.delivered_bytes,
-                        bytes_in_flight: self.bytes_in_flight,
-                        rtt_nanos: 0,
-                        interval_nanos: 0,
-                        now_nanos,
-                        app_limited: false,
-                    })),
+                    recovery: action,
                     receive_backpressure: false,
                 }
             }
@@ -478,50 +538,33 @@ where
                 if packet.acknowledgement != self.send_next {
                     return TcpSegmentOutcome::default();
                 }
-                let acked = packet
-                    .acknowledgement
-                    .wrapping_sub(self.send_unacknowledged);
-                self.send_unacknowledged = packet.acknowledgement;
-                self.bytes_in_flight = self.bytes_in_flight.saturating_sub(acked);
-                self.discard_acked_segments(packet.acknowledgement);
-                self.delivered_bytes = self.delivered_bytes.saturating_add(u64::from(acked));
+                let action = self.acknowledge_sent(packet.acknowledgement, now_nanos, true);
                 self.state = TcpState::Established;
                 TcpSegmentOutcome {
-                    recovery: Some(self.congestion.on_ack(AckSample {
-                        acked_bytes: acked,
-                        delivered_bytes: self.delivered_bytes,
-                        bytes_in_flight: self.bytes_in_flight,
-                        rtt_nanos: 0,
-                        interval_nanos: 0,
-                        now_nanos,
-                        app_limited: true,
-                    })),
+                    recovery: action,
                     receive_backpressure: false,
                 }
             }
-            TcpState::Established => {
+            TcpState::Established
+            | TcpState::FinWait1
+            | TcpState::FinWait2
+            | TcpState::CloseWait
+            | TcpState::Closing
+            | TcpState::LastAck => {
                 let mut action = None;
-                if packet.flags.contains(TcpFlags::ACK)
-                    && packet.acknowledgement != self.send_unacknowledged
-                {
-                    let acked = packet
-                        .acknowledgement
-                        .wrapping_sub(self.send_unacknowledged);
-                    self.send_unacknowledged = packet.acknowledgement;
-                    self.bytes_in_flight = self.bytes_in_flight.saturating_sub(acked);
-                    self.discard_acked_segments(packet.acknowledgement);
-                    self.delivered_bytes = self.delivered_bytes.saturating_add(u64::from(acked));
-                    action = Some(self.congestion.on_ack(AckSample {
-                        acked_bytes: acked,
-                        delivered_bytes: self.delivered_bytes,
-                        bytes_in_flight: self.bytes_in_flight,
-                        rtt_nanos: 0,
-                        interval_nanos: 0,
+                if packet.flags.contains(TcpFlags::ACK) {
+                    action = self.acknowledge_sent(
+                        packet.acknowledgement,
                         now_nanos,
-                        app_limited: self.transmit_queue.is_empty(),
-                    }));
+                        self.transmit_queue.is_empty(),
+                    );
                 }
-                if !packet.payload.is_empty() {
+                if !packet.payload.is_empty()
+                    && matches!(
+                        self.state,
+                        TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2
+                    )
+                {
                     if packet.sequence == self.receive_next {
                         if self
                             .receive_queue
@@ -546,22 +589,16 @@ where
                 }
                 if packet.flags.contains(TcpFlags::FIN) {
                     self.receive_next = self.receive_next.wrapping_add(1);
-                    self.state = TcpState::CloseWait;
+                    self.state = match self.state {
+                        TcpState::Established => TcpState::CloseWait,
+                        TcpState::FinWait1 => TcpState::Closing,
+                        TcpState::FinWait2 => TcpState::TimeWait,
+                        state => state,
+                    };
                     self.request_ack();
                 }
                 TcpSegmentOutcome {
                     recovery: action,
-                    receive_backpressure: false,
-                }
-            }
-            _ if packet.flags.contains(TcpFlags::RST) => {
-                self.state = TcpState::Closed;
-                TcpSegmentOutcome {
-                    recovery: Some(
-                        self.congestion.on_congestion_event(
-                            CongestionEvent::RetransmissionTimeout { now_nanos },
-                        ),
-                    ),
                     receive_backpressure: false,
                 }
             }
@@ -585,6 +622,39 @@ where
         {
             let _ = self.in_flight.pop_front();
         }
+    }
+
+    fn acknowledge_sent(
+        &mut self,
+        acknowledgement: u32,
+        now_nanos: u64,
+        app_limited: bool,
+    ) -> Option<RecoveryAction> {
+        if sequence_leq(acknowledgement, self.send_unacknowledged) {
+            return None;
+        }
+        let acked = acknowledgement.wrapping_sub(self.send_unacknowledged);
+        self.send_unacknowledged = acknowledgement;
+        self.bytes_in_flight = self.bytes_in_flight.saturating_sub(acked);
+        self.discard_acked_segments(acknowledgement);
+        self.delivered_bytes = self.delivered_bytes.saturating_add(u64::from(acked));
+        if self.fin_queued && sequence_leq(self.send_next, acknowledgement) {
+            self.state = match self.state {
+                TcpState::FinWait1 => TcpState::FinWait2,
+                TcpState::Closing => TcpState::TimeWait,
+                TcpState::LastAck => TcpState::Closed,
+                state => state,
+            };
+        }
+        Some(self.congestion.on_ack(AckSample {
+            acked_bytes: acked,
+            delivered_bytes: self.delivered_bytes,
+            bytes_in_flight: self.bytes_in_flight,
+            rtt_nanos: 0,
+            interval_nanos: 0,
+            now_nanos,
+            app_limited,
+        }))
     }
 
     fn refresh_advertised_window(&mut self) {
@@ -656,6 +726,25 @@ mod tests {
             address: IpAddress::Ipv4(Ipv4Address::new([192, 0, 2, 2])),
             port,
         }
+    }
+
+    fn established_socket() -> TcpSocket<BbrV3> {
+        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+        socket.mark_syn_queued(0);
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS,
+        );
+        socket.mark_ack_queued();
+        socket
     }
 
     #[test]
@@ -742,6 +831,110 @@ mod tests {
             .expect("established socket should transmit queued bytes");
         assert_eq!(segment.payload.as_ref(), b"hello");
         assert_eq!(segment.payload.as_ptr(), payload_ptr);
+    }
+
+    #[test]
+    fn active_close_sends_queued_data_before_fin_and_enters_fin_wait2() {
+        let mut socket = established_socket();
+        assert_eq!(socket.queue_send(b"hi"), 2);
+        socket.close_send();
+        assert_eq!(socket.state(), TcpState::FinWait1);
+
+        let data = socket
+            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 1)
+            .expect("active close must drain queued data before FIN");
+        assert_eq!(data.payload.as_ref(), b"hi");
+        assert!(data.header.flags.contains(TcpFlags::PSH));
+        assert!(!data.header.flags.contains(TcpFlags::FIN));
+
+        let fin = socket
+            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 2)
+            .expect("active close must queue FIN after data");
+        assert!(fin.payload.is_empty());
+        assert_eq!(fin.sequence_len, 1);
+        assert!(fin.header.flags.contains(TcpFlags::FIN));
+        assert_eq!(
+            fin.header.sequence,
+            data.header.sequence + data.sequence_len
+        );
+
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: fin.header.sequence + 1,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS + 3,
+        );
+        assert_eq!(socket.state(), TcpState::FinWait2);
+    }
+
+    #[test]
+    fn passive_close_sends_fin_and_closes_after_fin_ack() {
+        let mut socket = established_socket();
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK.union(TcpFlags::FIN),
+                window_size: u16::MAX,
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS + 1,
+        );
+        assert_eq!(socket.state(), TcpState::CloseWait);
+
+        socket.close_send();
+        assert_eq!(socket.state(), TcpState::LastAck);
+        let fin = socket
+            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 2)
+            .expect("passive close must queue FIN from LAST-ACK");
+        assert!(fin.header.flags.contains(TcpFlags::FIN));
+
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 102,
+                acknowledgement: fin.header.sequence + 1,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS + 3,
+        );
+        assert_eq!(socket.state(), TcpState::Closed);
+    }
+
+    #[test]
+    fn data_transmit_piggybacks_pending_ack() {
+        let mut socket = established_socket();
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                payload: b"r",
+            },
+            TCP_INITIAL_RTO_NANOS + 1,
+        );
+        assert!(socket.pending_ack().is_some());
+        assert_eq!(socket.queue_send(b"w"), 1);
+
+        let segment = socket
+            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 2)
+            .expect("queued data must transmit");
+        assert!(segment.header.flags.contains(TcpFlags::ACK));
+        assert_eq!(socket.pending_ack(), None);
     }
 
     #[test]

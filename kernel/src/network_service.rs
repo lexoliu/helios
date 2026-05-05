@@ -487,7 +487,8 @@ where
             .await
     }
 
-    pub async fn tcp_shutdown_send(&self, _stream: TcpStreamId) -> Result<(), TcpError> {
+    pub async fn tcp_shutdown_send(&self, stream: TcpStreamId) -> Result<(), TcpError> {
+        self.inner.state.lock().await.shutdown_tcp_send(stream)?;
         self.drive_tcp().await
     }
 
@@ -1824,6 +1825,14 @@ impl NetworkState {
                 kind: TcpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::TcpWriteQueueFailed,
             })
+    }
+
+    fn shutdown_tcp_send(&mut self, stream: TcpStreamId) -> Result<(), TcpError> {
+        let socket = self.tcp_socket(stream)?;
+        self.stack.tcp_shutdown_send(socket).map_err(|_| TcpError {
+            kind: TcpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UnknownTcpStream,
+        })
     }
 
     fn poll_tcp_read(

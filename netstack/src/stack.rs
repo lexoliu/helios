@@ -762,11 +762,6 @@ impl Stack {
                     .try_push((index, local, remote, header))
                     .unwrap_or_else(|_| panic!("TCP SYN-ACK transmit burst overflowed"));
             }
-            if let Some(header) = socket.pending_ack() {
-                pending_ack
-                    .try_push((index, local, remote, header))
-                    .unwrap_or_else(|_| panic!("TCP ACK transmit burst overflowed"));
-            }
         }
 
         for socket in self.tcp.iter_mut().flatten() {
@@ -777,6 +772,21 @@ impl Stack {
                 pending_data
                     .try_push(segment)
                     .unwrap_or_else(|_| panic!("TCP data transmit burst overflowed"));
+            }
+        }
+
+        for (index, socket) in self.tcp.iter().enumerate() {
+            let Some(socket) = socket else {
+                continue;
+            };
+            let (Some(local), Some(remote)) = (socket.local_endpoint(), socket.remote_endpoint())
+            else {
+                continue;
+            };
+            if let Some(header) = socket.pending_ack() {
+                pending_ack
+                    .try_push((index, local, remote, header))
+                    .unwrap_or_else(|_| panic!("TCP ACK transmit burst overflowed"));
             }
         }
 
@@ -884,6 +894,11 @@ impl Stack {
         bytes: &mut Bytes,
     ) -> Result<usize, StackError> {
         Ok(self.tcp_socket_mut(socket)?.queue_send_bytes(bytes))
+    }
+
+    pub fn tcp_shutdown_send(&mut self, socket: SocketId) -> Result<(), StackError> {
+        self.tcp_socket_mut(socket)?.close_send();
+        Ok(())
     }
 
     pub fn tcp_read(
@@ -1930,6 +1945,84 @@ mod tests {
             TcpReadState::Data(Bytes::from_static(b"ok"))
         );
         assert_eq!(stack.tcp_read(socket, 8).unwrap(), TcpReadState::Eof);
+    }
+
+    #[test]
+    fn tcp_drive_piggybacks_ack_on_data_segment() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(peer),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        let socket = stack.open_tcp_connect(
+            TcpEndpoint {
+                address: IpAddress::Ipv4(local),
+                port: 49152,
+            },
+            TcpEndpoint {
+                address: IpAddress::Ipv4(peer),
+                port: 80,
+            },
+            7,
+        );
+        let (syn_ack, syn_ack_len) = tcp_segment(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+            },
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &syn_ack[..syn_ack_len],
+                StackInstant::from_nanos(1),
+            )
+            .expect("SYN-ACK should establish the socket");
+        let (request, request_len) = tcp_segment_with_payload(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+            b"r",
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &request[..request_len],
+                StackInstant::from_nanos(2),
+            )
+            .expect("payload should request an ACK");
+        assert_eq!(stack.tcp_send(socket, b"w").unwrap(), 1);
+
+        stack
+            .drive_tcp(StackInstant::from_nanos(3))
+            .expect("data should be queued");
+
+        let frame = stack.take_outbound().expect("data frame should be queued");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
+        let data = TcpPacket::parse(ipv4.payload).expect("TCP packet should parse");
+        assert!(data.flags.contains(TcpFlags::ACK));
+        assert_eq!(data.payload, b"w");
+        assert!(stack.take_outbound().is_none());
     }
 
     #[test]
