@@ -14,18 +14,19 @@ use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 use helios_hal::cpu::{Cpu, ProcessorId};
 use helios_hal::watchdog::ProgressCounter;
 use spin::Once;
+use triomphe::Arc as NoWeakArc;
 
 use crate::sync::Notify;
 
 type ReadyQueue = ConcurrentQueue<Runnable>;
 pub type JoinHandle<T> = Task<T>;
 pub const READY_BATCH_TASKS: usize = 1024;
-static EXECUTOR_GROUP: Once<Arc<ExecutorGroup>> = Once::new();
+static EXECUTOR_GROUP: Once<NoWeakArc<ExecutorGroup>> = Once::new();
 
 struct ExecutorGroup {
-    local_queues: Box<[Arc<ReadyQueue>]>,
-    global_queue: Arc<ReadyQueue>,
-    global_wake_cursor: Arc<AtomicUsize>,
+    local_queues: Box<[ReadyQueue]>,
+    global_queue: ReadyQueue,
+    global_wake_cursor: AtomicUsize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -46,23 +47,22 @@ pub struct LocalJoinHandle<T> {
 
 #[derive(Clone)]
 pub struct Spawner<CpuImpl: Cpu + Clone> {
-    local_queue: Arc<ReadyQueue>,
-    global_queue: Arc<ReadyQueue>,
+    group: NoWeakArc<ExecutorGroup>,
     cpu: CpuImpl,
     owner_processor: ProcessorId,
+    local_queue_index: usize,
     processor_count: usize,
     progress: ProgressCounter,
     progress_notify: Arc<Notify>,
-    global_wake_cursor: Arc<AtomicUsize>,
 }
 
 pub struct Executor {
-    local_queue: Arc<ReadyQueue>,
-    global_queue: Arc<ReadyQueue>,
+    group: NoWeakArc<ExecutorGroup>,
+    owner_processor: ProcessorId,
+    local_queue_index: usize,
     processor_count: usize,
     progress: ProgressCounter,
     progress_notify: Arc<Notify>,
-    global_wake_cursor: Arc<AtomicUsize>,
 }
 
 impl Executor {
@@ -72,38 +72,37 @@ impl Executor {
         owner_processor: ProcessorId,
     ) -> Self {
         let group = executor_group(configured_processors);
-        let local_queue = group
+        let local_queue_index = owner_processor.id() as usize;
+        group
             .local_queues
-            .get(owner_processor.id() as usize)
+            .get(local_queue_index)
             .unwrap_or_else(|| {
                 panic!(
                     "executor owner processor {} is outside configured processor count {}",
                     owner_processor.id(),
                     configured_processors
                 )
-            })
-            .clone();
+            });
+        let processor_count = group.local_queues.len();
         Self {
-            local_queue,
-            global_queue: group.global_queue.clone(),
-            processor_count: group.local_queues.len(),
+            group,
+            owner_processor,
+            local_queue_index,
+            processor_count,
             progress,
             progress_notify: Arc::new(Notify::new()),
-            global_wake_cursor: group.global_wake_cursor.clone(),
         }
     }
 
     pub fn spawner<CpuImpl: Cpu + Clone>(&self, cpu: CpuImpl) -> Spawner<CpuImpl> {
-        let owner_processor = cpu.current_processor();
         Spawner {
-            local_queue: self.local_queue.clone(),
-            global_queue: self.global_queue.clone(),
+            group: self.group.clone(),
             cpu,
-            owner_processor,
+            owner_processor: self.owner_processor,
+            local_queue_index: self.local_queue_index,
             processor_count: self.processor_count,
             progress: self.progress.clone(),
             progress_notify: self.progress_notify.clone(),
-            global_wake_cursor: self.global_wake_cursor.clone(),
         }
     }
 
@@ -111,9 +110,10 @@ impl Executor {
         let mut runnable_count = 0;
 
         while runnable_count < READY_BATCH_TASKS {
-            let runnable = match self.local_queue.pop() {
+            let local_queue = &self.group.local_queues[self.local_queue_index];
+            let runnable = match local_queue.pop() {
                 Ok(runnable) => runnable,
-                Err(PopError::Empty | PopError::Closed) => match self.global_queue.pop() {
+                Err(PopError::Empty | PopError::Closed) => match self.group.global_queue.pop() {
                     Ok(runnable) => runnable,
                     Err(PopError::Empty | PopError::Closed) => return runnable_count,
                 },
@@ -138,7 +138,7 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
 
     fn schedule_on_queue(
         &self,
-        queue: &Arc<ReadyQueue>,
+        queue: &ReadyQueue,
         runnable: Runnable,
         progress_mode: ProgressMode,
         wake: WakeTarget,
@@ -165,17 +165,13 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
     }
 
     fn schedule_local(&self, runnable: Runnable, progress_mode: ProgressMode) {
-        self.schedule_on_queue(
-            &self.local_queue,
-            runnable,
-            progress_mode,
-            WakeTarget::OwnerProcessor,
-        );
+        let queue = &self.group.local_queues[self.local_queue_index];
+        self.schedule_on_queue(queue, runnable, progress_mode, WakeTarget::OwnerProcessor);
     }
 
     fn schedule_global(&self, runnable: Runnable, progress_mode: ProgressMode) {
         self.schedule_on_queue(
-            &self.global_queue,
+            &self.group.global_queue,
             runnable,
             progress_mode,
             WakeTarget::OneRemoteProcessor,
@@ -187,7 +183,10 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
             return;
         }
         let current_processor = self.cpu.current_processor();
-        let start = self.global_wake_cursor.fetch_add(1, Ordering::Relaxed);
+        let start = self
+            .group
+            .global_wake_cursor
+            .fetch_add(1, Ordering::Relaxed);
         for offset in 0..self.processor_count {
             let processor = (start + offset) % self.processor_count;
             let processor = ProcessorId::new(processor as u16);
@@ -285,7 +284,7 @@ enum WakeTarget {
     OwnerProcessor,
 }
 
-fn executor_group(configured_processors: usize) -> Arc<ExecutorGroup> {
+fn executor_group(configured_processors: usize) -> NoWeakArc<ExecutorGroup> {
     EXECUTOR_GROUP
         .call_once(|| {
             assert!(
@@ -294,12 +293,12 @@ fn executor_group(configured_processors: usize) -> Arc<ExecutorGroup> {
             );
             let mut local_queues = Vec::with_capacity(configured_processors);
             for _ in 0..configured_processors {
-                local_queues.push(Arc::new(ConcurrentQueue::unbounded()));
+                local_queues.push(ConcurrentQueue::unbounded());
             }
-            Arc::new(ExecutorGroup {
+            NoWeakArc::new(ExecutorGroup {
                 local_queues: local_queues.into_boxed_slice(),
-                global_queue: Arc::new(ConcurrentQueue::unbounded()),
-                global_wake_cursor: Arc::new(AtomicUsize::new(0)),
+                global_queue: ConcurrentQueue::unbounded(),
+                global_wake_cursor: AtomicUsize::new(0),
             })
         })
         .clone()
