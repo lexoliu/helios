@@ -160,25 +160,32 @@ struct NetworkPollState {
 }
 
 struct HandleSlab<T, const CAPACITY: usize> {
-    slots: Vec<Option<T>>,
+    slots: [Option<T>; CAPACITY],
+    free: [usize; CAPACITY],
+    free_len: usize,
 }
 
 impl<T, const CAPACITY: usize> HandleSlab<T, CAPACITY> {
     fn new() -> Self {
-        let mut slots = Vec::with_capacity(CAPACITY);
-        slots.resize_with(CAPACITY, || None);
-        Self { slots }
+        assert!(
+            CAPACITY != 0,
+            "network handle slab capacity must be non-zero"
+        );
+        Self {
+            slots: core::array::from_fn(|_| None),
+            free: core::array::from_fn(|index| CAPACITY - 1 - index),
+            free_len: CAPACITY,
+        }
     }
 
     fn insert(&mut self, value: T) -> usize {
-        let Some((index, slot)) = self
-            .slots
-            .iter_mut()
-            .enumerate()
-            .find(|(_, slot)| slot.is_none())
-        else {
+        if self.free_len == 0 {
             panic!("network handle slab is full");
         };
+        self.free_len -= 1;
+        let index = self.free[self.free_len];
+        let slot = &mut self.slots[index];
+        assert!(slot.is_none(), "network handle slab free list is corrupt");
         *slot = Some(value);
         index
     }
@@ -188,7 +195,10 @@ impl<T, const CAPACITY: usize> HandleSlab<T, CAPACITY> {
     }
 
     fn remove(&mut self, index: usize) -> Option<T> {
-        self.slots.get_mut(index).and_then(Option::take)
+        let value = self.slots.get_mut(index).and_then(Option::take)?;
+        self.free[self.free_len] = index;
+        self.free_len += 1;
+        Some(value)
     }
 
     fn iter(&self) -> impl Iterator<Item = &T> {
@@ -2236,4 +2246,29 @@ fn udp_socket_id(index: usize) -> UdpSocketId {
 fn socket_index(socket: UdpSocketId) -> usize {
     usize::try_from(socket.0.get() - 1)
         .unwrap_or_else(|_| panic!("udp socket id {} does not fit into usize", socket.0.get()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HandleSlab;
+
+    #[test]
+    fn handle_slab_reuses_removed_slot() {
+        let mut slab = HandleSlab::<u32, 3>::new();
+
+        assert_eq!(slab.insert(10), 0);
+        assert_eq!(slab.insert(20), 1);
+        assert_eq!(slab.insert(30), 2);
+        assert_eq!(slab.remove(1), Some(20));
+        assert_eq!(slab.insert(40), 1);
+        assert_eq!(slab.get(1), Some(&40));
+    }
+
+    #[test]
+    #[should_panic(expected = "network handle slab is full")]
+    fn handle_slab_panics_when_full() {
+        let mut slab = HandleSlab::<u32, 1>::new();
+        assert_eq!(slab.insert(10), 0);
+        let _ = slab.insert(20);
+    }
 }
