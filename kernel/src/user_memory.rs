@@ -4,7 +4,7 @@ use alloc::boxed::Box;
 use core::alloc::Layout;
 use core::mem::size_of;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use buddy_system_allocator::LockedHeap;
 use helios_hal::cpu::ProcessorId;
@@ -18,6 +18,7 @@ const USER_HEAP_ORDER: usize = 32;
 pub struct UserMemoryPool {
     heap: LockedHeap<USER_HEAP_ORDER>,
     frame_slab: FrameSlabCache,
+    total_bytes: AtomicUsize,
 }
 
 impl UserMemoryPool {
@@ -25,6 +26,7 @@ impl UserMemoryPool {
         Self {
             heap: LockedHeap::empty(),
             frame_slab: FrameSlabCache::new(),
+            total_bytes: AtomicUsize::new(0),
         }
     }
 
@@ -35,6 +37,7 @@ impl UserMemoryPool {
         unsafe {
             self.heap.lock().add_to_heap(start, end);
         }
+        self.total_bytes.fetch_add(end - start, Ordering::Release);
     }
 
     pub fn configure_processors(&self, processor_count: usize) {
@@ -124,7 +127,7 @@ impl UserMemoryPool {
         processor: Option<ProcessorId>,
     ) {
         if is_single_frame_layout(layout) {
-            let total_frames = self.heap.lock().stats_total_bytes() / PhysFrame::SIZE;
+            let total_frames = self.total_bytes.load(Ordering::Acquire) / PhysFrame::SIZE;
             let cached = match processor {
                 Some(processor) => self.frame_slab.deallocate_on(processor, ptr, total_frames),
                 None => self.frame_slab.deallocate(ptr, total_frames),
