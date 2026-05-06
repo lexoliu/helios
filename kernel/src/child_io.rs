@@ -15,7 +15,8 @@ extern crate alloc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bytes::Bytes;
-use concurrent_queue::{ConcurrentQueue, PopError, PushError};
+use heapless::Deque;
+use spin::Mutex;
 use triomphe::Arc;
 
 use crate::{Notify, NotifyWaiter};
@@ -26,7 +27,7 @@ const BYTE_CHANNEL_CHUNK_CAPACITY: usize = 256;
 /// reference-counted byte chunks; consumers await and receive the same chunks
 /// back without forcing an extra copy at adapter boundaries.
 struct ByteChannel {
-    queue: ConcurrentQueue<Bytes>,
+    queue: ByteQueue,
     /// Notifies consumers when new bytes or a close event are available.
     readable: Notify,
     /// Set to `true` once every `ByteWriter` cloneable handle has been
@@ -42,13 +43,70 @@ struct ByteChannel {
 impl ByteChannel {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            queue: ConcurrentQueue::bounded(BYTE_CHANNEL_CHUNK_CAPACITY),
+            queue: ByteQueue::new(),
             readable: Notify::new(),
             writer_closed: AtomicBool::new(false),
             reader_closed: AtomicBool::new(false),
             writer_handles: AtomicUsize::new(1),
             reader_handles: AtomicUsize::new(1),
         })
+    }
+
+    fn push(&self, bytes: Bytes) -> Result<(), ClosedPeer> {
+        self.queue
+            .push_if_open(bytes, &self.reader_closed, &self.writer_closed)
+    }
+
+    fn close_reader(&self) {
+        self.queue.close_reader(&self.reader_closed);
+        self.readable.notify_one();
+    }
+}
+
+struct ByteQueue {
+    chunks: Mutex<Deque<Bytes, BYTE_CHANNEL_CHUNK_CAPACITY>>,
+}
+
+impl ByteQueue {
+    const fn new() -> Self {
+        Self {
+            chunks: Mutex::new(Deque::new()),
+        }
+    }
+
+    fn push_if_open(
+        &self,
+        bytes: Bytes,
+        reader_closed: &AtomicBool,
+        writer_closed: &AtomicBool,
+    ) -> Result<(), ClosedPeer> {
+        let mut chunks = self.chunks.lock();
+        if reader_closed.load(Ordering::Acquire) || writer_closed.load(Ordering::Acquire) {
+            return Err(ClosedPeer);
+        }
+        chunks.push_back(bytes).unwrap_or_else(|_| {
+            panic!("byte channel capacity {BYTE_CHANNEL_CHUNK_CAPACITY} exhausted")
+        });
+        Ok(())
+    }
+
+    fn pop(&self) -> Option<Bytes> {
+        self.chunks.lock().pop_front()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.chunks.lock().is_empty()
+    }
+
+    fn close_reader(&self, reader_closed: &AtomicBool) {
+        let mut chunks = self.chunks.lock();
+        reader_closed.store(true, Ordering::Release);
+        chunks.clear();
+    }
+
+    #[cfg(test)]
+    const fn capacity(&self) -> usize {
+        BYTE_CHANNEL_CHUNK_CAPACITY
     }
 }
 
@@ -127,7 +185,7 @@ impl Drop for ByteReader {
         let previous = self.channel.reader_handles.fetch_sub(1, Ordering::AcqRel);
         assert!(previous != 0, "byte reader handle count underflowed");
         if previous == 1 {
-            self.channel.reader_closed.store(true, Ordering::Release);
+            self.channel.close_reader();
         }
     }
 }
@@ -145,15 +203,12 @@ impl ByteWriter {
         if bytes.is_empty() {
             return Ok(());
         }
-        match self.channel.queue.push(bytes) {
+        match self.channel.push(bytes) {
             Ok(()) => {
                 self.channel.readable.notify_one();
                 Ok(())
             }
-            Err(PushError::Closed(_)) => Err(ClosedPeer),
-            Err(PushError::Full(_)) => {
-                panic!("byte channel capacity {BYTE_CHANNEL_CHUNK_CAPACITY} exhausted")
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -202,15 +257,14 @@ impl ByteReader {
     pub async fn read(&self) -> Option<Bytes> {
         loop {
             match self.channel.queue.pop() {
-                Ok(bytes) => return Some(bytes),
-                Err(PopError::Closed) => return None,
-                Err(PopError::Empty) => {
+                Some(bytes) => return Some(bytes),
+                None => {
                     if self.channel.writer_closed.load(Ordering::Acquire)
                         || self.channel.reader_closed.load(Ordering::Acquire)
                     {
                         // Drain races: a writer might have enqueued right
                         // before the last liveness guard dropped.
-                        return self.channel.queue.pop().ok();
+                        return self.channel.queue.pop();
                     }
                     self.channel.readable.notified().await;
                 }
@@ -222,9 +276,8 @@ impl ByteReader {
     /// signals EOF / not-ready.
     pub fn try_read(&self) -> TryRead {
         match self.channel.queue.pop() {
-            Ok(bytes) => TryRead::Ready(bytes),
-            Err(PopError::Closed) => TryRead::Eof,
-            Err(PopError::Empty) => {
+            Some(bytes) => TryRead::Ready(bytes),
+            None => {
                 if self.channel.writer_closed.load(Ordering::Acquire)
                     || self.channel.reader_closed.load(Ordering::Acquire)
                 {
@@ -243,13 +296,12 @@ impl ByteReader {
     ) -> core::task::Poll<Option<Bytes>> {
         loop {
             match self.channel.queue.pop() {
-                Ok(bytes) => return core::task::Poll::Ready(Some(bytes)),
-                Err(PopError::Closed) => return core::task::Poll::Ready(None),
-                Err(PopError::Empty) => {
+                Some(bytes) => return core::task::Poll::Ready(Some(bytes)),
+                None => {
                     if self.channel.writer_closed.load(Ordering::Acquire)
                         || self.channel.reader_closed.load(Ordering::Acquire)
                     {
-                        return core::task::Poll::Ready(self.channel.queue.pop().ok());
+                        return core::task::Poll::Ready(self.channel.queue.pop());
                     }
                     match self.channel.readable.poll_notified(cx, &mut wait.readable) {
                         core::task::Poll::Ready(()) => continue,
@@ -261,9 +313,7 @@ impl ByteReader {
     }
 
     pub fn close(&self) {
-        self.channel.reader_closed.store(true, Ordering::Release);
-        self.channel.queue.close();
-        self.channel.readable.notify_one();
+        self.channel.close_reader();
     }
 }
 
@@ -298,10 +348,7 @@ mod tests {
     fn byte_channel_queue_is_bounded_to_kernel_capacity() {
         let (writer, _) = byte_channel();
 
-        assert_eq!(
-            writer.channel.queue.capacity(),
-            Some(BYTE_CHANNEL_CHUNK_CAPACITY)
-        );
+        assert_eq!(writer.channel.queue.capacity(), BYTE_CHANNEL_CHUNK_CAPACITY);
     }
 
     #[test]
