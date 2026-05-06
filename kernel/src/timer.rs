@@ -30,7 +30,7 @@ pub struct Timer<CpuImpl: Cpu + Clone> {
 
 pub struct Sleep<CpuImpl: Cpu + Clone> {
     timer: Timer<CpuImpl>,
-    state: Arc<SleepState>,
+    state: Option<Arc<SleepState>>,
 }
 
 struct TimerState {
@@ -114,15 +114,22 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
     }
 
     pub fn sleep_until(&self, deadline: Instant) -> Sleep<CpuImpl> {
+        if deadline <= self.now() {
+            return Sleep {
+                timer: self.clone(),
+                state: None,
+            };
+        }
+
         Sleep {
             timer: self.clone(),
-            state: Arc::new(SleepState {
+            state: Some(Arc::new(SleepState {
                 deadline,
                 queued: AtomicBool::new(false),
                 fired: AtomicBool::new(false),
                 cancelled: AtomicBool::new(false),
                 waker: AtomicWaker::new(),
-            }),
+            })),
         }
     }
 
@@ -250,23 +257,26 @@ impl<CpuImpl: Cpu + Clone> Future for Sleep<CpuImpl> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.as_ref().get_ref();
+        let Some(state) = this.state.as_ref() else {
+            return Poll::Ready(());
+        };
 
-        if this.state.fired.load(AtomicOrdering::Acquire) {
+        if state.fired.load(AtomicOrdering::Acquire) {
             return Poll::Ready(());
         }
 
-        if this.state.deadline <= this.timer.now() {
-            this.state.fire();
+        if state.deadline <= this.timer.now() {
+            state.fire();
             return Poll::Ready(());
         }
 
-        this.state.waker.register(cx.waker());
+        state.waker.register(cx.waker());
 
-        if !this.state.queued.swap(true, AtomicOrdering::AcqRel) {
-            this.timer.enqueue(this.state.clone());
+        if !state.queued.swap(true, AtomicOrdering::AcqRel) {
+            this.timer.enqueue(state.clone());
         }
 
-        if this.state.fired.load(AtomicOrdering::Acquire) {
+        if state.fired.load(AtomicOrdering::Acquire) {
             return Poll::Ready(());
         }
 
@@ -276,7 +286,9 @@ impl<CpuImpl: Cpu + Clone> Future for Sleep<CpuImpl> {
 
 impl<CpuImpl: Cpu + Clone> Drop for Sleep<CpuImpl> {
     fn drop(&mut self) {
-        self.state.cancelled.store(true, AtomicOrdering::Release);
+        if let Some(state) = self.state.as_ref() {
+            state.cancelled.store(true, AtomicOrdering::Release);
+        }
     }
 }
 
@@ -443,12 +455,63 @@ mod tests {
     use core::sync::atomic::AtomicBool;
 
     use atomic_waker::AtomicWaker;
-    use helios_hal::cpu::Instant;
+    use helios_hal::cpu::{Cpu, Instant, ProcessorId};
     use triomphe::Arc;
 
     use super::{
         AtomicOrdering, SleepState, TimerEntry, TimingWheel, wheel_tick_ceil, wheel_tick_floor,
     };
+
+    #[derive(Clone)]
+    struct TestCpu {
+        now: u64,
+    }
+
+    impl Cpu for TestCpu {
+        fn current_processor(&self) -> ProcessorId {
+            ProcessorId::new(0)
+        }
+
+        fn processor_count(&self) -> usize {
+            1
+        }
+
+        fn bootstrap_processor(&self) -> ProcessorId {
+            ProcessorId::new(0)
+        }
+
+        fn park_current(&self) {}
+
+        fn start_processor(&self, _processor: ProcessorId) {}
+
+        fn wake_processor(&self, _processor: ProcessorId) {}
+
+        fn now(&self) -> Instant {
+            Instant::new(self.now)
+        }
+
+        fn timer_frequency(&self) -> u64 {
+            1_000_000
+        }
+
+        fn set_deadline(&self, _deadline: Instant) {}
+
+        fn publish_executable(&self, _ptr: *const u8, _len: usize) {}
+
+        fn unpublish_executable(&self, _ptr: *const u8, _len: usize) {}
+
+        fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {
+            None
+        }
+
+        fn shutdown(&self) -> ! {
+            panic!("test CPU cannot shut down")
+        }
+
+        fn reboot(&self) -> ! {
+            panic!("test CPU cannot reboot")
+        }
+    }
 
     fn sleep_state(deadline: u64) -> Arc<SleepState> {
         Arc::new(SleepState {
@@ -535,5 +598,14 @@ mod tests {
             wheel.next_live_deadline().map(|deadline| deadline.ticks()),
             Some(200)
         );
+    }
+
+    #[test]
+    fn elapsed_sleep_does_not_allocate_state() {
+        let timer = super::Timer::new(TestCpu { now: 100 });
+        assert!(timer.sleep_until(Instant::new(100)).state.is_none());
+        assert!(timer.sleep_until(Instant::new(99)).state.is_none());
+        assert!(timer.sleep_for(core::time::Duration::ZERO).state.is_none());
+        assert!(timer.sleep_until(Instant::new(101)).state.is_some());
     }
 }
