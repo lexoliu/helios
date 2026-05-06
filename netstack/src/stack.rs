@@ -11,10 +11,9 @@ use heapless::binary_heap::{BinaryHeap, Min};
 
 use crate::{
     ArpOperation, ArpPacket, BbrV3, CongestionControl, DEFAULT_POLL_BUDGET, DhcpDnsServers,
-    EthernetAddress, EthernetFrame, EthernetProtocol, Icmpv6Packet, IpAddress, IpCidr,
-    Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, PacketBuffer,
-    StackError, TcpEndpoint, TcpHeader, TcpHeaderOptions, TcpPacket, TcpSocket, TcpTransmitSegment,
-    UdpPacket,
+    EthernetAddress, EthernetFrame, EthernetProtocol, Icmpv6Packet, IpAddress, IpCidr, Ipv4Address,
+    Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, PacketBuffer, StackError, TcpEndpoint,
+    TcpHeader, TcpHeaderOptions, TcpPacket, TcpSocket, TcpTransmitSegment, UdpPacket,
 };
 
 pub const MAX_ROUTES: usize = 32;
@@ -324,7 +323,10 @@ where
         };
         self.free_len -= 1;
         let index = self.free[self.free_len];
-        assert!(!self.occupied[index], "TCP socket slab free list is corrupt");
+        assert!(
+            !self.occupied[index],
+            "TCP socket slab free list is corrupt"
+        );
         let endpoint_key = socket
             .local_endpoint()
             .zip(socket.remote_endpoint())
@@ -1865,10 +1867,7 @@ where
     }
 
     fn schedule_tcp_timer(&mut self, index: usize) {
-        let deadline = self
-            .tcp
-            .get(index)
-            .and_then(TcpSocket::next_deadline_nanos);
+        let deadline = self.tcp.get(index).and_then(TcpSocket::next_deadline_nanos);
         self.schedule_tcp_timer_deadline(index, deadline);
     }
 

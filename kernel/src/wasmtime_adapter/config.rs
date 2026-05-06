@@ -70,7 +70,10 @@ mod tests {
         wasmtime::Engine::new(&config).expect("component engine config should build");
 
         let operators = relaxed_simd_module_operator_set();
-        assert!(operators.simd, "SIMD operator must be present in probe wasm");
+        assert!(
+            operators.simd,
+            "SIMD operator must be present in probe wasm"
+        );
         assert!(
             operators.relaxed_simd,
             "relaxed SIMD operator must be present in probe wasm"

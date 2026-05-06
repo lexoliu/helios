@@ -12,8 +12,8 @@ use helios_hal::io::IoError;
 use helios_netstack::{
     DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage, DhcpDnsServers,
     DhcpMessageType, DhcpPacket, DnsQuestionWriter, DnsResponse, IpAddress, IpCidr, Ipv4Address,
-    Ipv4Cidr, NetworkInterface as NetworkDevice, PacketBuffer, Route, Stack, StackConfig,
-    StackError, StackInstant, TcpConnectState, TcpEndpoint, TcpReadState,
+    Ipv4Cidr, Ipv6Address, NetworkInterface as NetworkDevice, PacketBuffer, Route, Stack,
+    StackConfig, StackError, StackInstant, TcpConnectState, TcpEndpoint, TcpReadState,
 };
 
 use crate::{
@@ -657,8 +657,10 @@ where
         timeout_nanos: u64,
     ) -> Result<TcpStreamId, TcpError> {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
-        self.wait_for_ipv4_tcp(deadline_nanos).await?;
         let destination = self.resolve_host_tcp(host, deadline_nanos).await?;
+        if matches!(destination, IpAddress::Ipv4(_)) {
+            self.wait_for_ipv4_tcp(deadline_nanos).await?;
+        }
         let stream = {
             let mut state = self.inner.state.lock().await;
             state.start_tcp_connect(destination, port, local_port)?
@@ -968,9 +970,12 @@ where
         &self,
         host: &str,
         deadline_nanos: u64,
-    ) -> Result<Ipv4Address, TcpError> {
+    ) -> Result<IpAddress, TcpError> {
         if let Some(address) = parse_ipv4(host) {
-            return Ok(address);
+            return Ok(IpAddress::Ipv4(address));
+        }
+        if let Some(address) = parse_ipv6(host) {
+            return Ok(IpAddress::Ipv6(address));
         }
         let timeout_nanos = deadline_nanos.saturating_sub(self.now_nanos());
         let addresses = self
@@ -988,6 +993,7 @@ where
             .into_iter()
             .next()
             .map(map_kernel_ipv4_address)
+            .map(IpAddress::Ipv4)
             .ok_or(TcpError {
                 kind: TcpErrorKind::UnresolvedHost,
                 detail: NetworkErrorDetail::DnsNoIpv4Address,
@@ -1803,7 +1809,7 @@ impl NetworkState {
 
     fn start_tcp_connect(
         &mut self,
-        destination: Ipv4Address,
+        destination: IpAddress,
         port: u16,
         local_port: u16,
     ) -> Result<TcpStreamId, TcpError> {
@@ -1817,7 +1823,17 @@ impl NetworkState {
                 detail: NetworkErrorDetail::TcpConnectStartFailed,
             });
         };
-        let Some(local) = self.stack.primary_ipv4_address().map(|cidr| cidr.address()) else {
+        let local = match destination {
+            IpAddress::Ipv4(_) => self
+                .stack
+                .primary_ipv4_address()
+                .map(|cidr| IpAddress::Ipv4(cidr.address())),
+            IpAddress::Ipv6(_) => self
+                .stack
+                .primary_ipv6_address()
+                .map(|cidr| IpAddress::Ipv6(cidr.address())),
+        };
+        let Some(local) = local else {
             return Err(TcpError {
                 kind: TcpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::NetworkServiceUnavailable,
@@ -1825,11 +1841,11 @@ impl NetworkState {
         };
         let socket = self.stack.open_tcp_connect(
             TcpEndpoint {
-                address: IpAddress::Ipv4(local),
+                address: local,
                 port: local_port,
             },
             TcpEndpoint {
-                address: IpAddress::Ipv4(destination),
+                address: destination,
                 port,
             },
             1,
@@ -2347,6 +2363,13 @@ fn parse_ipv4(input: &str) -> Option<Ipv4Address> {
     Some(Ipv4Address::new(octets))
 }
 
+fn parse_ipv6(input: &str) -> Option<Ipv6Address> {
+    input
+        .parse::<core::net::Ipv6Addr>()
+        .ok()
+        .map(|address| Ipv6Address::new(address.octets()))
+}
+
 fn tcp_stream_id(index: usize) -> TcpStreamId {
     let raw =
         u32::try_from(index + 1).unwrap_or_else(|_| panic!("tcp stream index {index} exceeds u32"));
@@ -2389,10 +2412,15 @@ fn socket_index(socket: UdpSocketId) -> usize {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use helios_netstack::{
+        ETHERNET_FRAME_BYTES, EthernetFrame, IpAddress, Ipv6Address, Ipv6Cidr, Ipv6Packet,
+        NeighborEntry, NeighborState, StackInstant, TcpFlags, TcpPacket,
+    };
 
     use super::{
         HandleSlab, NETWORK_BUSY_POLL_ROUNDS, NetworkPollBudget, NetworkPollProgress,
-        NetworkPollState, NetworkPumpAction, NetworkPumpCadence, limit_udp_datagram_bytes,
+        NetworkPollState, NetworkPumpAction, NetworkPumpCadence, NetworkState,
+        limit_udp_datagram_bytes, parse_ipv6,
     };
 
     #[test]
@@ -2424,6 +2452,51 @@ mod tests {
 
         assert_eq!(limited.as_ref(), b"abc");
         assert_eq!(limited.as_ptr(), ptr);
+    }
+
+    #[test]
+    fn parse_ipv6_accepts_compressed_numeric_hosts() {
+        assert_eq!(
+            parse_ipv6("2001:db8::1")
+                .expect("compressed IPv6 address should parse")
+                .octets(),
+            [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+        );
+        assert!(parse_ipv6("2001:db8:::1").is_none());
+    }
+
+    #[test]
+    fn tcp_connect_to_ipv6_destination_uses_ipv6_source_address() {
+        let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        let mut state = NetworkState::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 8, 1);
+        state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+        state.stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv6(remote),
+            mac: [0x02, 0, 0, 0, 0, 2],
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+
+        state
+            .start_tcp_connect(IpAddress::Ipv6(remote), 443, 0)
+            .expect("IPv6 TCP connect should allocate a socket");
+        state
+            .stack
+            .drive_tcp(StackInstant::from_nanos(1))
+            .expect("IPv6 TCP SYN should be queued");
+
+        let frame = state
+            .stack
+            .take_outbound()
+            .expect("IPv6 SYN frame should be queued");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        let ipv6 = Ipv6Packet::parse(ethernet.payload).expect("IPv6 packet should parse");
+        let tcp = TcpPacket::parse(ipv6.payload).expect("TCP packet should parse");
+        assert_eq!(ipv6.source, local);
+        assert_eq!(ipv6.destination, remote);
+        assert_eq!(tcp.destination_port, 443);
+        assert!(tcp.flags.contains(TcpFlags::SYN));
     }
 
     #[test]
