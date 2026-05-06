@@ -278,10 +278,6 @@ impl TcpSocketSlab {
         }
     }
 
-    fn iter(&self) -> impl Iterator<Item = &Option<TcpSocket<BbrV3>>> {
-        self.slots.iter()
-    }
-
     fn get(&self, index: usize) -> Option<&Option<TcpSocket<BbrV3>>> {
         self.slots.get(index)
     }
@@ -761,66 +757,53 @@ impl Stack {
         let mut pending_retransmit = ArrayVec::<(usize, TcpTransmitSegment), 16>::new();
         let mut pending_data = ArrayVec::<(usize, TcpTransmitSegment), 16>::new();
         for index in 0..MAX_TCP_SOCKETS {
-            let Some(socket) = self.tcp.get_mut(index).and_then(Option::as_mut) else {
-                continue;
+            let deadline = {
+                let Some(socket) = self.tcp.get_mut(index).and_then(Option::as_mut) else {
+                    continue;
+                };
+                socket.expire_timers(now.nanos());
+                if let (Some(local), Some(remote)) =
+                    (socket.local_endpoint(), socket.remote_endpoint())
+                {
+                    let retransmitting =
+                        if let Some(segment) = socket.pending_retransmission(now.nanos()) {
+                            pending_retransmit
+                                .try_push((index, segment))
+                                .unwrap_or_else(|_| panic!("TCP retransmit burst overflowed"));
+                            true
+                        } else {
+                            false
+                        };
+                    if !retransmitting {
+                        if let Some(header) = socket.pending_syn() {
+                            pending_syn
+                                .try_push((index, local, remote, header))
+                                .unwrap_or_else(|_| {
+                                    panic!("TCP control transmit burst overflowed")
+                                });
+                        }
+                        if let Some(header) = socket.pending_syn_ack() {
+                            pending_syn_ack
+                                .try_push((index, local, remote, header))
+                                .unwrap_or_else(|_| {
+                                    panic!("TCP SYN-ACK transmit burst overflowed")
+                                });
+                        }
+                        if let Some(segment) = socket.take_transmit_segment(now.nanos()) {
+                            pending_data
+                                .try_push((index, segment))
+                                .unwrap_or_else(|_| panic!("TCP data transmit burst overflowed"));
+                        }
+                    }
+                    if let Some(header) = socket.pending_ack() {
+                        pending_ack
+                            .try_push((index, local, remote, header))
+                            .unwrap_or_else(|_| panic!("TCP ACK transmit burst overflowed"));
+                    }
+                }
+                socket.next_deadline_nanos()
             };
-            socket.expire_timers(now.nanos());
-            self.schedule_tcp_timer(index);
-        }
-        for (index, socket) in self.tcp.iter().enumerate() {
-            let Some(socket) = socket else {
-                continue;
-            };
-            let (Some(local), Some(remote)) = (socket.local_endpoint(), socket.remote_endpoint())
-            else {
-                continue;
-            };
-            if let Some(segment) = socket.pending_retransmission(now.nanos()) {
-                pending_retransmit
-                    .try_push((index, segment))
-                    .unwrap_or_else(|_| panic!("TCP retransmit burst overflowed"));
-                continue;
-            }
-            if let Some(header) = socket.pending_syn() {
-                pending_syn
-                    .try_push((index, local, remote, header))
-                    .unwrap_or_else(|_| panic!("TCP control transmit burst overflowed"));
-            }
-            if let Some(header) = socket.pending_syn_ack() {
-                pending_syn_ack
-                    .try_push((index, local, remote, header))
-                    .unwrap_or_else(|_| panic!("TCP SYN-ACK transmit burst overflowed"));
-            }
-        }
-
-        for index in 0..MAX_TCP_SOCKETS {
-            let Some(socket) = self.tcp.get_mut(index).and_then(Option::as_mut) else {
-                continue;
-            };
-            if socket.pending_retransmission(now.nanos()).is_some() {
-                continue;
-            }
-            if let Some(segment) = socket.take_transmit_segment(now.nanos()) {
-                pending_data
-                    .try_push((index, segment))
-                    .unwrap_or_else(|_| panic!("TCP data transmit burst overflowed"));
-                self.schedule_tcp_timer(index);
-            }
-        }
-
-        for (index, socket) in self.tcp.iter().enumerate() {
-            let Some(socket) = socket else {
-                continue;
-            };
-            let (Some(local), Some(remote)) = (socket.local_endpoint(), socket.remote_endpoint())
-            else {
-                continue;
-            };
-            if let Some(header) = socket.pending_ack() {
-                pending_ack
-                    .try_push((index, local, remote, header))
-                    .unwrap_or_else(|_| panic!("TCP ACK transmit burst overflowed"));
-            }
+            self.schedule_tcp_timer_deadline(index, deadline);
         }
 
         for (index, local, remote, header) in pending_syn {
@@ -1700,6 +1683,10 @@ impl Stack {
             .get(index)
             .and_then(Option::as_ref)
             .and_then(TcpSocket::next_deadline_nanos);
+        self.schedule_tcp_timer_deadline(index, deadline);
+    }
+
+    fn schedule_tcp_timer_deadline(&mut self, index: usize, deadline: Option<u64>) {
         if self.tcp_timer_deadlines[index] == deadline {
             return;
         }
