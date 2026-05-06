@@ -143,6 +143,13 @@ struct NetworkPollProgress {
     transmitted_frames: usize,
 }
 
+#[derive(Clone, Copy)]
+enum NetworkTransmitStop {
+    Drained,
+    Budget,
+    RingFull,
+}
+
 impl NetworkPollProgress {
     const fn is_idle(self) -> bool {
         self.received_frames == 0 && self.reclaimed_tx == 0 && self.transmitted_frames == 0
@@ -152,6 +159,16 @@ impl NetworkPollProgress {
         self.received_frames >= budget.rx_frames
             || self.reclaimed_tx >= budget.tx_completions
             || self.transmitted_frames >= budget.tx_frames
+    }
+}
+
+impl NetworkTransmitStop {
+    const fn profile_phase(self) -> &'static str {
+        match self {
+            Self::Drained => "tx-submit-drained",
+            Self::Budget => "tx-submit-budget",
+            Self::RingFull => "tx-submit-ring-full",
+        }
     }
 }
 
@@ -1106,6 +1123,7 @@ where
 
         let mut transmitted = 0usize;
         let transmit_started = self.profile_start();
+        let mut transmit_stop = NetworkTransmitStop::Drained;
         while transmitted < budget.tx_frames {
             let mut frames = smallvec::SmallVec::<[PacketBuffer; NETWORK_TX_BATCH_FRAMES]>::new();
             {
@@ -1124,6 +1142,7 @@ where
             let submitted = self.inner.device.try_transmit_packet_batch(&frames).await?;
             transmitted += submitted;
             if submitted < frames.len() {
+                transmit_stop = NetworkTransmitStop::RingFull;
                 let mut state = self.inner.state.lock().await;
                 while frames.len() > submitted {
                     let frame = frames
@@ -1134,8 +1153,11 @@ where
                 break;
             }
         }
+        if transmitted >= budget.tx_frames {
+            transmit_stop = NetworkTransmitStop::Budget;
+        }
         if transmitted != 0 {
-            self.record_network_profile("tx-submit", transmit_started);
+            self.record_network_profile(transmit_stop.profile_phase(), transmit_started);
         }
         let progress = NetworkPollProgress {
             received_frames: received,
