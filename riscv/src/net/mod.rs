@@ -217,6 +217,13 @@ impl NetworkDevice for VirtioNetworkDevice {
         self.inner.transmit(frame).await
     }
 
+    async fn try_transmit_packet_batch<'a>(
+        &'a self,
+        frames: &'a [PacketBuffer],
+    ) -> Result<usize, IoError> {
+        self.inner.try_transmit_frames(frames).await
+    }
+
     async fn wait_for_event(&self) {
         self.inner.wait_for_interrupt().await;
     }
