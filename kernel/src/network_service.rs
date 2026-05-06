@@ -16,6 +16,7 @@ use helios_netstack::{
     OutboundBatchStatus, PacketBuffer, Route, Stack, StackConfig, StackError, StackInstant,
     TcpConnectState, TcpEndpoint, TcpReadState,
 };
+use spin::Mutex as SpinMutex;
 
 use crate::{
     ComponentNetworkService, ComponentRuntimeState, DnsError, DnsErrorKind,
@@ -62,7 +63,7 @@ where
     runtime_state: Runtime,
     timer: Timer<CpuImpl>,
     device: Device,
-    state: crate::Mutex<NetworkState>,
+    state: NetworkStateCell,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -130,6 +131,28 @@ struct NetworkState {
     dhcp: DhcpClientState,
     dns_servers: DhcpDnsServers,
     next_dns_query_id: u16,
+}
+
+struct NetworkStateCell {
+    state: SpinMutex<NetworkState>,
+}
+
+impl NetworkStateCell {
+    fn new(state: NetworkState) -> Self {
+        Self {
+            state: SpinMutex::new(state),
+        }
+    }
+
+    fn with<R>(&self, f: impl FnOnce(&NetworkState) -> R) -> R {
+        let state = self.state.lock();
+        f(&state)
+    }
+
+    fn with_mut<R>(&self, f: impl FnOnce(&mut NetworkState) -> R) -> R {
+        let mut state = self.state.lock();
+        f(&mut state)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -517,7 +540,7 @@ where
                 cpu,
                 runtime_state,
                 timer,
-                state: crate::Mutex::new(NetworkState::new(
+                state: NetworkStateCell::new(NetworkState::new(
                     device.mac_address(),
                     device.max_frame_len(),
                     capabilities.events.rx_poll_budget,
@@ -626,12 +649,16 @@ where
     }
 
     pub async fn tcp_shutdown_send(&self, stream: TcpStreamId) -> Result<(), TcpError> {
-        self.inner.state.lock().await.shutdown_tcp_send(stream)?;
+        self.inner
+            .state
+            .with_mut(|state| state.shutdown_tcp_send(stream))?;
         self.drive_tcp().await
     }
 
     pub async fn tcp_close(&self, stream: TcpStreamId) {
-        self.inner.state.lock().await.remove_tcp_stream(stream);
+        self.inner.state.with_mut(|state| {
+            state.remove_tcp_stream(stream);
+        });
     }
 
     pub async fn run_packet_pump(&self) -> ! {
@@ -707,7 +734,9 @@ where
     }
 
     pub async fn udp_close(&self, socket: UdpSocketId) {
-        self.inner.state.lock().await.remove_udp_socket(socket);
+        self.inner.state.with_mut(|state| {
+            state.remove_udp_socket(socket);
+        });
     }
 
     async fn execute_ping(&self, host: &str, timeout_nanos: u64) -> Result<PingReply, PingError> {
@@ -737,19 +766,17 @@ where
         }
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         self.wait_for_ipv4_dns(deadline_nanos).await?;
-        let query_id = {
-            let mut state = self.inner.state.lock().await;
-            state.next_dns_query_id()
-        };
+        let query_id = self.inner.state.with_mut(NetworkState::next_dns_query_id);
 
         loop {
             self.drive_dns().await?;
             let now = StackInstant::from_nanos(self.now_nanos());
-            let query = {
-                let mut state = self.inner.state.lock().await;
-                state.send_dns_query(query_id, host, now)?;
-                state.take_dns_response(query_id)?
-            };
+            let query = self.inner.state.with_mut(
+                |state| -> Result<Option<Vec<Ipv4Address>>, DnsError> {
+                    state.send_dns_query(query_id, host, now)?;
+                    state.take_dns_response(query_id)
+                },
+            )?;
             if let Some(addresses) = query {
                 return Ok(addresses.into_iter().map(map_ipv4_address).collect());
             }
@@ -799,33 +826,38 @@ where
         if matches!(destination, IpAddress::Ipv4(_)) {
             self.wait_for_ipv4_tcp(deadline_nanos).await?;
         }
-        let stream = {
-            let mut state = self.inner.state.lock().await;
-            state.start_tcp_connect(destination, port, local_port)?
-        };
+        let stream = self
+            .inner
+            .state
+            .with_mut(|state| state.start_tcp_connect(destination, port, local_port))?;
 
         loop {
             self.drive_tcp().await?;
             let now_nanos = self.now_nanos();
-            {
-                let mut state = self.inner.state.lock().await;
-                match state.poll_tcp_connect(stream) {
-                    Ok(TcpConnectProgress::Connected) => return Ok(stream),
-                    Ok(TcpConnectProgress::Pending) => {
-                        if now_nanos >= deadline_nanos {
-                            state.remove_tcp_stream(stream);
-                            return Err(TcpError {
-                                kind: TcpErrorKind::Timeout,
-                                detail: NetworkErrorDetail::TcpConnectTimeout,
-                            });
+            let poll_connect =
+                self.inner
+                    .state
+                    .with_mut(|state| match state.poll_tcp_connect(stream) {
+                        Ok(TcpConnectProgress::Connected) => Ok(TcpConnectProgress::Connected),
+                        Ok(TcpConnectProgress::Pending) => {
+                            if now_nanos >= deadline_nanos {
+                                state.remove_tcp_stream(stream);
+                                Err(TcpError {
+                                    kind: TcpErrorKind::Timeout,
+                                    detail: NetworkErrorDetail::TcpConnectTimeout,
+                                })
+                            } else {
+                                Ok(TcpConnectProgress::Pending)
+                            }
                         }
-                    }
-                    Err(error) => {
-                        state.remove_tcp_stream(stream);
-                        return Err(error);
-                    }
-                }
-            };
+                        Err(error) => {
+                            state.remove_tcp_stream(stream);
+                            Err(error)
+                        }
+                    })?;
+            if matches!(poll_connect, TcpConnectProgress::Connected) {
+                return Ok(stream);
+            }
             self.wait_for_tcp_progress(deadline_nanos).await;
         }
     }
@@ -836,8 +868,9 @@ where
         local_port: u16,
         _backlog: u16,
     ) -> Result<TcpListener<TcpListenerId>, TcpError> {
-        let mut state = self.inner.state.lock().await;
-        state.start_tcp_listen(local_address, local_port)
+        self.inner
+            .state
+            .with_mut(|state| state.start_tcp_listen(local_address, local_port))
     }
 
     async fn execute_tcp_accept(
@@ -848,10 +881,10 @@ where
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         loop {
             self.drive_tcp().await?;
-            let accepted = {
-                let mut state = self.inner.state.lock().await;
-                state.poll_tcp_accept(listener)?
-            };
+            let accepted = self
+                .inner
+                .state
+                .with_mut(|state| state.poll_tcp_accept(listener))?;
             if let Some(accepted) = accepted {
                 return Ok(accepted);
             }
@@ -874,10 +907,10 @@ where
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         while !bytes.is_empty() {
             self.drive_tcp().await?;
-            let written = {
-                let mut state = self.inner.state.lock().await;
-                state.try_write_tcp_bytes(stream, &mut bytes)?
-            };
+            let written = self
+                .inner
+                .state
+                .with_mut(|state| state.try_write_tcp_bytes(stream, &mut bytes))?;
             if written != 0 {
                 continue;
             }
@@ -948,14 +981,11 @@ where
         profile_prefix: &'static str,
     ) -> Result<TcpReadProgress, TcpError> {
         let started = self.profile_start();
-        let read = {
-            let mut state = self.inner.state.lock().await;
-            state.poll_tcp_read(
-                stream,
-                max_bytes,
-                StackInstant::from_nanos(self.now_nanos()),
-            )?
-        };
+        let now = StackInstant::from_nanos(self.now_nanos());
+        let read = self
+            .inner
+            .state
+            .with_mut(|state| state.poll_tcp_read(stream, max_bytes, now))?;
         self.record_tcp_read_progress(profile_prefix, started, &read);
         Ok(read)
     }
@@ -994,7 +1024,9 @@ where
     }
 
     async fn execute_udp_bind(&self, local_port: u16) -> Result<UdpBinding<UdpSocketId>, UdpError> {
-        self.inner.state.lock().await.start_udp_bind(local_port)
+        self.inner
+            .state
+            .with_mut(|state| state.start_udp_bind(local_port))
     }
 
     async fn execute_udp_send(
@@ -1059,12 +1091,10 @@ where
         bytes: &[u8],
     ) -> Result<u64, UdpError> {
         let now = StackInstant::from_nanos(self.now_nanos());
-        let written =
-            self.inner
-                .state
-                .lock()
-                .await
-                .try_send_udp(socket, destination, port, bytes, now)?;
+        let written = self
+            .inner
+            .state
+            .with_mut(|state| state.try_send_udp(socket, destination, port, bytes, now))?;
         Ok(u64::try_from(written).unwrap_or_else(|_| panic!("udp write length exceeds u64")))
     }
 
@@ -1077,10 +1107,10 @@ where
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         loop {
             self.drive_udp().await?;
-            let received = {
-                let mut state = self.inner.state.lock().await;
-                state.poll_udp_receive(socket, max_bytes as usize)?
-            };
+            let received = self
+                .inner
+                .state
+                .with_mut(|state| state.poll_udp_receive(socket, max_bytes as usize))?;
             match received {
                 Some(datagram) => return Ok(Some(datagram)),
                 None => {
@@ -1103,9 +1133,7 @@ where
     ) -> Result<(), UdpError> {
         self.inner
             .state
-            .lock()
-            .await
-            .join_multicast_v4(group, interface)
+            .with_mut(|state| state.join_multicast_v4(group, interface))
     }
 
     async fn execute_udp_leave_multicast_v4(
@@ -1115,9 +1143,7 @@ where
     ) -> Result<(), UdpError> {
         self.inner
             .state
-            .lock()
-            .await
-            .leave_multicast_v4(group, interface)
+            .with_mut(|state| state.leave_multicast_v4(group, interface))
     }
 
     async fn wait_for_ipv4_ping(&self, deadline_nanos: u64) -> Result<(), PingError> {
@@ -1182,13 +1208,12 @@ where
             .await
             .map_err(NetworkConfigurationError::Device)?;
         let now = StackInstant::from_nanos(self.now_nanos());
-        let configured = {
-            let mut state = self.inner.state.lock().await;
+        let configured = self.inner.state.with_mut(|state| {
             state
                 .drive_dhcp(now)
                 .map_err(NetworkConfigurationError::Control)?;
-            state.is_configured()
-        };
+            Ok(state.is_configured())
+        })?;
         self.drive_network(NetworkPollSource::Configuration)
             .await
             .map_err(NetworkConfigurationError::Device)?;
@@ -1324,10 +1349,7 @@ where
         &self,
         source: NetworkPollSource,
     ) -> Result<(NetworkPollProgress, NetworkPollBudget), IoError> {
-        let budget = {
-            let state = self.inner.state.lock().await;
-            state.poll.budget()
-        };
+        let budget = self.inner.state.with(|state| state.poll.budget());
 
         let reclaim_started = self.profile_start();
         let reclaimed = self
@@ -1346,14 +1368,13 @@ where
         let mut received = 0usize;
         let mut received_bytes = 0usize;
         let receive_started = self.profile_start();
-        let stack_rx_budget = {
-            let state = self.inner.state.lock().await;
+        let stack_rx_budget = self.inner.state.with(|state| {
             if state.stack.receive_backpressured() {
                 0
             } else {
                 state.stack.config().rx_budget
             }
-        };
+        });
         loop {
             let remaining_rx_budget = budget
                 .rx_frames
@@ -1391,8 +1412,7 @@ where
 
             let mut receive_backpressured = false;
             let received_at = StackInstant::from_nanos(self.now_nanos());
-            {
-                let mut state = self.inner.state.lock().await;
+            self.inner.state.with_mut(|state| {
                 for frame in frames[..received_batch].iter().flatten() {
                     let frame = frame.as_ref();
                     let frame_len = frame.len();
@@ -1419,7 +1439,7 @@ where
                         }
                     }
                 }
-            }
+            });
 
             if self
                 .inner
@@ -1446,13 +1466,13 @@ where
         );
 
         let tcp_started = self.profile_start();
-        {
-            let mut state = self.inner.state.lock().await;
+        let now = StackInstant::from_nanos(self.now_nanos());
+        self.inner.state.with_mut(|state| {
             state
                 .stack
-                .drive_tcp(StackInstant::from_nanos(self.now_nanos()))
+                .drive_tcp(now)
                 .unwrap_or_else(|error| tracing::debug!(?error, "failed to drive TCP control"));
-        }
+        });
         self.record_network_profile(source.tcp_drive_phase(), tcp_started);
 
         let mut transmitted = 0usize;
@@ -1461,13 +1481,15 @@ where
         let mut transmit_stop = NetworkTransmitStop::Drained;
         while transmitted < budget.tx_frames {
             let remaining_budget = budget.tx_frames - transmitted;
-            let immediate = {
-                let mut state = self.inner.state.lock().await;
-                state.stack.try_submit_outbound_slices(
-                    remaining_budget.min(NETWORK_TX_BATCH_FRAMES),
-                    |frames| self.inner.device.try_transmit_slices_immediate(frames),
-                )?
-            };
+            let immediate =
+                self.inner
+                    .state
+                    .with_mut(|state| -> Result<OutboundBatchStatus, IoError> {
+                        state.stack.try_submit_outbound_slices(
+                            remaining_budget.min(NETWORK_TX_BATCH_FRAMES),
+                            |frames| self.inner.device.try_transmit_slices_immediate(frames),
+                        )
+                    })?;
             match immediate {
                 OutboundBatchStatus::Empty => break,
                 OutboundBatchStatus::Deferred => {}
@@ -1487,8 +1509,7 @@ where
             }
 
             let mut frames = smallvec::SmallVec::<[PacketBuffer; NETWORK_TX_BATCH_FRAMES]>::new();
-            {
-                let mut state = self.inner.state.lock().await;
+            self.inner.state.with_mut(|state| {
                 let remaining_budget = budget.tx_frames - transmitted;
                 while frames.len() < NETWORK_TX_BATCH_FRAMES && frames.len() < remaining_budget {
                     let Some(frame) = state.stack.take_outbound() else {
@@ -1496,7 +1517,7 @@ where
                     };
                     frames.push(frame);
                 }
-            }
+            });
             if frames.is_empty() {
                 break;
             }
@@ -1511,13 +1532,14 @@ where
             );
             if submitted < frames.len() {
                 transmit_stop = NetworkTransmitStop::RingFull;
-                let mut state = self.inner.state.lock().await;
-                while frames.len() > submitted {
-                    let frame = frames
-                        .pop()
-                        .expect("TX restore lost an unsubmitted outbound frame");
-                    state.stack.push_outbound_front(frame);
-                }
+                self.inner.state.with_mut(|state| {
+                    while frames.len() > submitted {
+                        let frame = frames
+                            .pop()
+                            .expect("TX restore lost an unsubmitted outbound frame");
+                        state.stack.push_outbound_front(frame);
+                    }
+                });
                 break;
             }
         }
@@ -1537,10 +1559,9 @@ where
             reclaimed_tx: reclaimed,
             transmitted_frames: transmitted,
         };
-        {
-            let mut state = self.inner.state.lock().await;
+        self.inner.state.with_mut(|state| {
             state.poll.complete(progress);
-        }
+        });
         Ok((progress, budget))
     }
 
@@ -1580,10 +1601,10 @@ where
         if now_nanos >= operation_deadline_nanos {
             return;
         }
-        let next_tcp_deadline = {
-            let mut state = self.inner.state.lock().await;
-            state.stack.next_tcp_deadline().map(StackInstant::nanos)
-        };
+        let next_tcp_deadline = self
+            .inner
+            .state
+            .with_mut(|state| state.stack.next_tcp_deadline().map(StackInstant::nanos));
         let next_deadline = next_tcp_deadline
             .unwrap_or(operation_deadline_nanos)
             .min(operation_deadline_nanos);
@@ -1681,11 +1702,7 @@ where
     pub async fn ipv4_cidr(&self) -> Option<crate::Ipv4Cidr> {
         self.inner
             .state
-            .lock()
-            .await
-            .stack
-            .primary_ipv4_address()
-            .map(map_ipv4_cidr)
+            .with(|state| state.stack.primary_ipv4_address().map(map_ipv4_cidr))
     }
 
     async fn acquire_dhcp_address(&self) -> Result<KernelIpv4Cidr, NetworkControlError> {
@@ -1694,11 +1711,10 @@ where
                 .await
                 .map_err(|_| NetworkControlError::BackendFault)?;
             let now = StackInstant::from_nanos(self.now_nanos());
-            let next = {
-                let mut state = self.inner.state.lock().await;
+            let next = self.inner.state.with_mut(|state| {
                 state.drive_dhcp(now)?;
-                state.stack.primary_ipv4_address().map(map_ipv4_cidr)
-            };
+                Ok(state.stack.primary_ipv4_address().map(map_ipv4_cidr))
+            })?;
             if let Some(cidr) = next {
                 return Ok(cidr);
             }
@@ -1954,7 +1970,9 @@ where
         address: KernelIpv4Cidr,
     ) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
-        self.inner.state.lock().await.add_ipv4_address(address)
+        self.inner
+            .state
+            .with_mut(|state| state.add_ipv4_address(address))
     }
 
     async fn remove_address(
@@ -1963,13 +1981,17 @@ where
         address: KernelIpv4Cidr,
     ) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
-        self.inner.state.lock().await.remove_ipv4_address(address);
+        self.inner.state.with_mut(|state| {
+            state.remove_ipv4_address(address);
+        });
         Ok(())
     }
 
     async fn clear_addresses(&self, port: NetworkPortId) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
-        self.inner.state.lock().await.clear_ipv4_addresses();
+        self.inner
+            .state
+            .with_mut(NetworkState::clear_ipv4_addresses);
         Ok(())
     }
 
@@ -1978,7 +2000,7 @@ where
         port: NetworkPortId,
     ) -> Result<Vec<KernelIpv4Cidr>, NetworkControlError> {
         require_local_network_port(port)?;
-        Ok(self.inner.state.lock().await.list_ipv4_addresses())
+        Ok(self.inner.state.with(NetworkState::list_ipv4_addresses))
     }
 
     async fn mac_address(&self, port: NetworkPortId) -> Result<MacAddress, NetworkControlError> {
@@ -1994,9 +2016,7 @@ where
         require_local_network_port(port)?;
         self.inner
             .state
-            .lock()
-            .await
-            .set_default_ipv4_gateway(gateway)
+            .with_mut(|state| state.set_default_ipv4_gateway(gateway))
     }
 
     async fn add_route(
@@ -2005,7 +2025,9 @@ where
         route: KernelIpv4Route,
     ) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
-        self.inner.state.lock().await.add_ipv4_route(route)
+        self.inner
+            .state
+            .with_mut(|state| state.add_ipv4_route(route))
     }
 
     async fn remove_route(
@@ -2014,13 +2036,15 @@ where
         route: KernelIpv4Route,
     ) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
-        self.inner.state.lock().await.remove_ipv4_route(route);
+        self.inner.state.with_mut(|state| {
+            state.remove_ipv4_route(route);
+        });
         Ok(())
     }
 
     async fn clear_routes(&self, port: NetworkPortId) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
-        self.inner.state.lock().await.clear_ipv4_routes();
+        self.inner.state.with_mut(NetworkState::clear_ipv4_routes);
         Ok(())
     }
 
@@ -2029,7 +2053,7 @@ where
         port: NetworkPortId,
     ) -> Result<Vec<KernelIpv4Route>, NetworkControlError> {
         require_local_network_port(port)?;
-        Ok(self.inner.state.lock().await.list_ipv4_routes())
+        Ok(self.inner.state.with(NetworkState::list_ipv4_routes))
     }
 }
 
