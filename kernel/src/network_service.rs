@@ -37,6 +37,7 @@ const NETWORK_PROGRESS_WAIT: Duration = Duration::from_micros(50);
 const NETWORK_TX_BATCH_FRAMES: usize = 8;
 const NETWORK_MIN_POLL_BUDGET: usize = 8;
 const NETWORK_MAX_POLL_BUDGET: usize = 128;
+const NETWORK_BUSY_POLL_ROUNDS: usize = 8;
 
 #[derive(Clone)]
 pub struct NetworkService<CpuImpl, Runtime, Device>
@@ -156,6 +157,17 @@ struct NetworkPollState {
     base_tx_completion_budget: usize,
     rx_budget: usize,
     tx_completion_budget: usize,
+}
+
+struct NetworkPumpCadence {
+    busy_rounds: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NetworkPumpAction {
+    Continue,
+    Yield,
+    Wait,
 }
 
 struct HandleSlab<T, const CAPACITY: usize> {
@@ -497,13 +509,16 @@ where
     }
 
     pub async fn run_packet_pump(&self) -> ! {
+        let mut cadence = NetworkPumpCadence::new();
         loop {
             match self.poll_network_once().await {
-                Ok((progress, budget)) if !progress.is_idle() || progress.saturated(budget) => {
-                    crate::yield_now().await;
-                }
-                Ok(_) => self.wait_for_progress(NETWORK_PROGRESS_WAIT).await,
+                Ok((progress, budget)) => match cadence.complete(progress, budget) {
+                    NetworkPumpAction::Continue => {}
+                    NetworkPumpAction::Yield => crate::yield_now().await,
+                    NetworkPumpAction::Wait => self.wait_for_progress(NETWORK_PROGRESS_WAIT).await,
+                },
                 Err(error) => {
+                    cadence.reset();
                     tracing::debug!(?error, "network packet pump failed to drive device");
                     self.wait_for_progress(NETWORK_PROGRESS_WAIT).await;
                 }
@@ -2204,6 +2219,39 @@ impl NetworkPollState {
     }
 }
 
+impl NetworkPumpCadence {
+    const fn new() -> Self {
+        Self { busy_rounds: 0 }
+    }
+
+    fn complete(
+        &mut self,
+        progress: NetworkPollProgress,
+        budget: NetworkPollBudget,
+    ) -> NetworkPumpAction {
+        if progress.is_idle() {
+            self.reset();
+            return NetworkPumpAction::Wait;
+        }
+
+        self.busy_rounds = self.busy_rounds.saturating_add(1);
+        if self.busy_rounds >= NETWORK_BUSY_POLL_ROUNDS {
+            self.reset();
+            return NetworkPumpAction::Yield;
+        }
+
+        if progress.saturated(budget) {
+            return NetworkPumpAction::Continue;
+        }
+
+        NetworkPumpAction::Continue
+    }
+
+    fn reset(&mut self) {
+        self.busy_rounds = 0;
+    }
+}
+
 const fn clamp_poll_budget(budget: usize) -> usize {
     if budget < NETWORK_MIN_POLL_BUDGET {
         NETWORK_MIN_POLL_BUDGET
@@ -2287,8 +2335,10 @@ fn socket_index(socket: UdpSocketId) -> usize {
 mod tests {
     use bytes::Bytes;
 
-    use super::HandleSlab;
-    use super::limit_udp_datagram_bytes;
+    use super::{
+        HandleSlab, NETWORK_BUSY_POLL_ROUNDS, NetworkPollBudget, NetworkPollProgress,
+        NetworkPumpAction, NetworkPumpCadence, limit_udp_datagram_bytes,
+    };
 
     #[test]
     fn handle_slab_reuses_removed_slot() {
@@ -2319,5 +2369,57 @@ mod tests {
 
         assert_eq!(limited.as_ref(), b"abc");
         assert_eq!(limited.as_ptr(), ptr);
+    }
+
+    #[test]
+    fn packet_pump_continues_busy_slice_before_yielding() {
+        let mut cadence = NetworkPumpCadence::new();
+        let progress = NetworkPollProgress {
+            received_frames: 1,
+            reclaimed_tx: 0,
+            transmitted_frames: 0,
+        };
+        let budget = NetworkPollBudget {
+            rx_frames: 8,
+            tx_completions: 8,
+        };
+
+        for _ in 1..NETWORK_BUSY_POLL_ROUNDS {
+            assert_eq!(
+                cadence.complete(progress, budget),
+                NetworkPumpAction::Continue
+            );
+        }
+        assert_eq!(cadence.complete(progress, budget), NetworkPumpAction::Yield);
+        assert_eq!(
+            cadence.complete(progress, budget),
+            NetworkPumpAction::Continue
+        );
+    }
+
+    #[test]
+    fn packet_pump_idle_progress_resets_busy_slice() {
+        let mut cadence = NetworkPumpCadence::new();
+        let busy = NetworkPollProgress {
+            received_frames: 0,
+            reclaimed_tx: 1,
+            transmitted_frames: 0,
+        };
+        let idle = NetworkPollProgress {
+            received_frames: 0,
+            reclaimed_tx: 0,
+            transmitted_frames: 0,
+        };
+        let budget = NetworkPollBudget {
+            rx_frames: 8,
+            tx_completions: 8,
+        };
+
+        assert_eq!(cadence.complete(busy, budget), NetworkPumpAction::Continue);
+        assert_eq!(cadence.complete(idle, budget), NetworkPumpAction::Wait);
+        for _ in 1..NETWORK_BUSY_POLL_ROUNDS {
+            assert_eq!(cadence.complete(busy, budget), NetworkPumpAction::Continue);
+        }
+        assert_eq!(cadence.complete(busy, budget), NetworkPumpAction::Yield);
     }
 }
