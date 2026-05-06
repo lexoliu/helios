@@ -841,12 +841,22 @@ impl TcpSocket {
         if bytes.is_empty() {
             return Ok(());
         }
+        self.write_all_bytes(Bytes::copy_from_slice(bytes)).await
+    }
+
+    async fn write_all_bytes(
+        &self,
+        bytes: Bytes,
+    ) -> core::result::Result<(), socket_types::ErrorCode> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
         if self.inner.lock().send_shutdown {
             return Err(socket_types::ErrorCode::InvalidState);
         }
         let (service, stream) = self.connected_stream()?;
         service
-            .tcp_write_all(stream, bytes, u64::MAX)
+            .tcp_write_all_bytes(stream, bytes, u64::MAX)
             .await
             .map_err(map_p3_tcp_error)
     }
@@ -1195,7 +1205,9 @@ impl<T: 'static> StreamConsumer<T> for TcpWriteConsumer {
                 let mut bytes = Vec::with_capacity(available);
                 source.read(&mut store, &mut bytes)?;
                 let socket = self.socket.clone();
-                self.pending = Some(Box::pin(async move { socket.write_all(&bytes).await }));
+                self.pending = Some(Box::pin(async move {
+                    socket.write_all_bytes(Bytes::from(bytes)).await
+                }));
             }
 
             let pending = self
