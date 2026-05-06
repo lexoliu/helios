@@ -1372,6 +1372,7 @@ where
                     max_bytes,
                     profile_prefix,
                 }),
+                true,
             )
             .await
             .map_err(|error| TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed))?;
@@ -1391,15 +1392,30 @@ where
         } else {
             1
         };
-        for _ in 0..rounds {
-            let outcome = self
-                .poll_network_once(NetworkPollSource::Tcp)
-                .await
-                .map_err(|error| {
-                    TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed)
-                })?;
-            if !outcome.0.receive_saturated(outcome.1) {
-                break;
+        let outcome = self
+            .poll_network_once(NetworkPollSource::Tcp)
+            .await
+            .map_err(|error| TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed))?;
+        if rounds > 1 && outcome.0.receive_saturated(outcome.1) {
+            let mut deferred_transmit = false;
+            for _ in 1..rounds {
+                let outcome = self
+                    .poll_network_receive_once(NetworkPollSource::Tcp)
+                    .await
+                    .map_err(|error| {
+                        TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed)
+                    })?;
+                deferred_transmit |= outcome.0.received_frames != 0;
+                if !outcome.0.receive_saturated(outcome.1) {
+                    break;
+                }
+            }
+            if deferred_transmit {
+                self.drive_network(NetworkPollSource::Tcp)
+                    .await
+                    .map_err(|error| {
+                        TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed)
+                    })?;
             }
         }
         self.poll_tcp_read_once(stream, max_bytes, "tcp-read-after-drive")
@@ -1420,7 +1436,19 @@ where
         &self,
         source: NetworkPollSource,
     ) -> Result<(NetworkPollProgress, NetworkPollBudget), IoError> {
-        let outcome = self.poll_network_once_with_tcp_read(source, None).await?;
+        let outcome = self
+            .poll_network_once_with_tcp_read(source, None, true)
+            .await?;
+        Ok((outcome.progress, outcome.budget))
+    }
+
+    async fn poll_network_receive_once(
+        &self,
+        source: NetworkPollSource,
+    ) -> Result<(NetworkPollProgress, NetworkPollBudget), IoError> {
+        let outcome = self
+            .poll_network_once_with_tcp_read(source, None, false)
+            .await?;
         Ok((outcome.progress, outcome.budget))
     }
 
@@ -1428,6 +1456,7 @@ where
         &self,
         source: NetworkPollSource,
         tcp_read_probe: Option<NetworkTcpReadProbe>,
+        submit_transmit: bool,
     ) -> Result<NetworkPollOutcome, IoError> {
         let budget = self.inner.state.with(|state| state.poll.budget());
 
@@ -1577,7 +1606,7 @@ where
         let mut transmitted_bytes = 0usize;
         let transmit_started = self.profile_start();
         let mut transmit_stop = NetworkTransmitStop::Drained;
-        while transmitted < budget.tx_frames {
+        while submit_transmit && transmitted < budget.tx_frames {
             let remaining_budget = budget.tx_frames - transmitted;
             let immediate =
                 self.inner
