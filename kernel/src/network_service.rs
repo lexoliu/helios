@@ -1128,8 +1128,12 @@ where
         }
 
         let event = self.inner.device.wait_for_event();
-        let timer = self.inner.timer.sleep_for(duration);
         let mut event = core::pin::pin!(event);
+        if core::future::poll_fn(|cx| Poll::Ready(event.as_mut().poll(cx).is_ready())).await {
+            return;
+        }
+
+        let timer = self.inner.timer.sleep_for(duration);
         let mut timer = core::pin::pin!(timer);
 
         core::future::poll_fn(|cx| {
