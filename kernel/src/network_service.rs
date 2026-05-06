@@ -170,6 +170,19 @@ struct NetworkPollProgress {
 }
 
 #[derive(Clone, Copy)]
+struct NetworkTcpReadProbe {
+    stream: TcpStreamId,
+    max_bytes: usize,
+    profile_prefix: &'static str,
+}
+
+struct NetworkPollOutcome {
+    progress: NetworkPollProgress,
+    budget: NetworkPollBudget,
+    tcp_read: Option<Result<TcpReadProgress, TcpError>>,
+}
+
+#[derive(Clone, Copy)]
 enum NetworkTransmitStop {
     Drained,
     Budget,
@@ -934,22 +947,18 @@ where
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         let max_bytes = max_bytes as usize;
         loop {
-            match self
-                .poll_tcp_read_once(stream, max_bytes, "tcp-read-initial")
-                .await?
-            {
+            match self.poll_tcp_read_once(stream, max_bytes, "tcp-read-initial")? {
                 TcpReadProgress::Data(bytes) => return Ok(Some(bytes)),
                 TcpReadProgress::Eof => return Ok(None),
                 TcpReadProgress::Pending => {}
             }
 
             let drive_started = self.profile_start();
-            self.drive_tcp().await?;
+            let read = self
+                .drive_tcp_and_poll_read(stream, max_bytes, "tcp-read-after-drive")
+                .await?;
             self.record_network_profile("tcp-read-drive-network", drive_started);
-            match self
-                .poll_tcp_read_once(stream, max_bytes, "tcp-read-after-drive")
-                .await?
-            {
+            match read {
                 TcpReadProgress::Data(bytes) => return Ok(Some(bytes)),
                 TcpReadProgress::Eof => return Ok(None),
                 TcpReadProgress::Pending => {}
@@ -974,7 +983,7 @@ where
         }
     }
 
-    async fn poll_tcp_read_once(
+    fn poll_tcp_read_once(
         &self,
         stream: TcpStreamId,
         max_bytes: usize,
@@ -1010,12 +1019,11 @@ where
             self.record_network_profile("tcp-read-polling-yield", yield_started);
 
             let drive_started = self.profile_start();
-            self.drive_tcp().await?;
+            let read = self
+                .drive_tcp_and_poll_read(stream, max_bytes, "tcp-read-polling")
+                .await?;
             self.record_network_profile("tcp-read-polling-drive-network", drive_started);
-            match self
-                .poll_tcp_read_once(stream, max_bytes, "tcp-read-polling")
-                .await?
-            {
+            match read {
                 ready @ (TcpReadProgress::Data(_) | TcpReadProgress::Eof) => return Ok(ready),
                 TcpReadProgress::Pending => {}
             }
@@ -1334,6 +1342,28 @@ where
             .map_err(|error| TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed))
     }
 
+    async fn drive_tcp_and_poll_read(
+        &self,
+        stream: TcpStreamId,
+        max_bytes: usize,
+        profile_prefix: &'static str,
+    ) -> Result<TcpReadProgress, TcpError> {
+        let outcome = self
+            .poll_network_once_with_tcp_read(
+                NetworkPollSource::Tcp,
+                Some(NetworkTcpReadProbe {
+                    stream,
+                    max_bytes,
+                    profile_prefix,
+                }),
+            )
+            .await
+            .map_err(|error| TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed))?;
+        outcome
+            .tcp_read
+            .expect("TCP read probe did not produce a read result")
+    }
+
     async fn drive_udp(&self) -> Result<(), UdpError> {
         self.drive_network(NetworkPollSource::Udp)
             .await
@@ -1349,6 +1379,15 @@ where
         &self,
         source: NetworkPollSource,
     ) -> Result<(NetworkPollProgress, NetworkPollBudget), IoError> {
+        let outcome = self.poll_network_once_with_tcp_read(source, None).await?;
+        Ok((outcome.progress, outcome.budget))
+    }
+
+    async fn poll_network_once_with_tcp_read(
+        &self,
+        source: NetworkPollSource,
+        tcp_read_probe: Option<NetworkTcpReadProbe>,
+    ) -> Result<NetworkPollOutcome, IoError> {
         let budget = self.inner.state.with(|state| state.poll.budget());
 
         let reclaim_started = self.profile_start();
@@ -1467,13 +1506,31 @@ where
 
         let tcp_started = self.profile_start();
         let now = StackInstant::from_nanos(self.now_nanos());
+        let mut tcp_finished = None;
+        let mut tcp_read = None;
+        let mut tcp_read_started = None;
+        let mut tcp_read_finished = None;
         self.inner.state.with_mut(|state| {
             state
                 .stack
                 .drive_tcp(now)
                 .unwrap_or_else(|error| tracing::debug!(?error, "failed to drive TCP control"));
+            tcp_finished = self.profile_start();
+            if let Some(probe) = tcp_read_probe {
+                tcp_read_started = self.profile_start();
+                tcp_read = Some(state.poll_tcp_read(probe.stream, probe.max_bytes, now));
+                tcp_read_finished = self.profile_start();
+            }
         });
-        self.record_network_profile(source.tcp_drive_phase(), tcp_started);
+        self.record_network_profile_between(source.tcp_drive_phase(), tcp_started, tcp_finished);
+        if let (Some(probe), Some(Ok(read))) = (tcp_read_probe, tcp_read.as_ref()) {
+            self.record_tcp_read_progress_between(
+                probe.profile_prefix,
+                tcp_read_started,
+                tcp_read_finished,
+                read,
+            );
+        }
 
         let mut transmitted = 0usize;
         let mut transmitted_bytes = 0usize;
@@ -1562,7 +1619,11 @@ where
         self.inner.state.with_mut(|state| {
             state.poll.complete(progress);
         });
-        Ok((progress, budget))
+        Ok(NetworkPollOutcome {
+            progress,
+            budget,
+            tcp_read,
+        })
     }
 
     async fn wait_for_progress(&self, duration: Duration) {
@@ -1637,6 +1698,15 @@ where
         self.record_network_profile_events(phase, start, 0);
     }
 
+    fn record_network_profile_between(
+        &self,
+        phase: &'static str,
+        start: Option<NetworkPerfStart>,
+        end: Option<NetworkPerfStart>,
+    ) {
+        self.record_network_profile_events_bytes_between(phase, start, end, 0, 0);
+    }
+
     fn record_network_profile_events(
         &self,
         phase: &'static str,
@@ -1654,31 +1724,46 @@ where
         bytes: usize,
     ) {
         if let Some(start) = start {
-            let now_nanos = self.now_nanos();
-            let counters = self
-                .inner
-                .cpu
-                .hardware_perf_counters()
-                .delta_since(start.counters);
-            let elapsed_nanos = now_nanos.saturating_sub(start.nanos);
-            self.inner.runtime_state.record_profile_stack_parts_nanos(
+            self.record_network_profile_events_bytes_between(
+                phase,
+                Some(start),
+                self.profile_start(),
+                events,
+                bytes,
+            );
+        }
+    }
+
+    fn record_network_profile_events_bytes_between(
+        &self,
+        phase: &'static str,
+        start: Option<NetworkPerfStart>,
+        end: Option<NetworkPerfStart>,
+        events: usize,
+        bytes: usize,
+    ) {
+        let (Some(start), Some(end)) = (start, end) else {
+            return;
+        };
+        let counters = end.counters.delta_since(start.counters);
+        let elapsed_nanos = end.nanos.saturating_sub(start.nanos);
+        self.inner.runtime_state.record_profile_stack_parts_nanos(
+            crate::ProfileScope::Kernel,
+            "kernel;network;",
+            phase,
+            elapsed_nanos,
+        );
+        self.inner
+            .runtime_state
+            .record_perf_metric_parts_events_nanos(
                 crate::ProfileScope::Kernel,
                 "kernel;network;",
                 phase,
+                usize_to_u64(events, "network profile event count"),
                 elapsed_nanos,
+                counters,
+                usize_to_u64(bytes, "network profile byte count"),
             );
-            self.inner
-                .runtime_state
-                .record_perf_metric_parts_events_nanos(
-                    crate::ProfileScope::Kernel,
-                    "kernel;network;",
-                    phase,
-                    usize_to_u64(events, "network profile event count"),
-                    elapsed_nanos,
-                    counters,
-                    usize_to_u64(bytes, "network profile byte count"),
-                );
-        }
     }
 
     fn record_tcp_read_progress(
@@ -1693,6 +1778,21 @@ where
             TcpReadProgress::Eof => (tcp_read_profile_phase(prefix, "eof"), 0),
         };
         self.record_network_profile_events_bytes(phase, start, 1, bytes);
+    }
+
+    fn record_tcp_read_progress_between(
+        &self,
+        prefix: &'static str,
+        start: Option<NetworkPerfStart>,
+        end: Option<NetworkPerfStart>,
+        read: &TcpReadProgress,
+    ) {
+        let (phase, bytes) = match read {
+            TcpReadProgress::Pending => (tcp_read_profile_phase(prefix, "pending"), 0),
+            TcpReadProgress::Data(bytes) => (tcp_read_profile_phase(prefix, "ready"), bytes.len()),
+            TcpReadProgress::Eof => (tcp_read_profile_phase(prefix, "eof"), 0),
+        };
+        self.record_network_profile_events_bytes_between(phase, start, end, 1, bytes);
     }
 
     pub fn hardware_address(&self) -> [u8; 6] {
