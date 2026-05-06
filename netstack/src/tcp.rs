@@ -152,6 +152,43 @@ impl TcpTransmitQueue {
 }
 
 #[derive(Clone, Debug)]
+struct TcpInFlightQueue {
+    segments: Box<Deque<TcpInFlightSegment, MAX_TCP_QUEUED_SEGMENTS>>,
+}
+
+impl TcpInFlightQueue {
+    fn new() -> Self {
+        Self {
+            segments: Box::new(Deque::new()),
+        }
+    }
+
+    fn front(&self) -> Option<&TcpInFlightSegment> {
+        self.segments.front()
+    }
+
+    fn push_back(&mut self, segment: TcpInFlightSegment) -> Result<(), TcpInFlightSegment> {
+        self.segments.push_back(segment)
+    }
+
+    fn pop_front(&mut self) -> Option<TcpInFlightSegment> {
+        self.segments.pop_front()
+    }
+
+    fn clear(&mut self) {
+        self.segments.clear();
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &TcpInFlightSegment> {
+        self.segments.iter()
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut TcpInFlightSegment> {
+        self.segments.iter_mut()
+    }
+}
+
+#[derive(Clone, Debug)]
 struct TcpReceiveQueue {
     segments: Box<Deque<BytesMut, MAX_TCP_RECEIVE_SEGMENTS>>,
 }
@@ -279,7 +316,7 @@ where
     out_of_order: Option<TcpOutOfOrderQueue>,
     out_of_order_queued_bytes: usize,
     transmit_queue: Option<TcpTransmitQueue>,
-    in_flight: Deque<TcpInFlightSegment, MAX_TCP_QUEUED_SEGMENTS>,
+    in_flight: Option<TcpInFlightQueue>,
     bytes_in_flight: u32,
     delivered_bytes: u64,
     syn_queued: bool,
@@ -321,7 +358,7 @@ where
             out_of_order: None,
             out_of_order_queued_bytes: 0,
             transmit_queue: None,
-            in_flight: Deque::new(),
+            in_flight: None,
             bytes_in_flight: 0,
             delivered_bytes: 0,
             syn_queued: false,
@@ -434,7 +471,7 @@ where
         let header = self.pending_syn().expect("SYN header disappeared");
         self.syn_queued = true;
         self.bytes_in_flight = self.bytes_in_flight.saturating_add(1);
-        self.in_flight
+        self.in_flight_mut()
             .push_back(TcpInFlightSegment {
                 header,
                 options: syn_header_options(now_nanos, None),
@@ -455,15 +492,16 @@ where
             "SYN-ACK can only be queued for a half-open accepted socket"
         );
         let header = self.pending_syn_ack().expect("SYN-ACK header disappeared");
+        let options = syn_header_options(
+            now_nanos,
+            self.peer_timestamp.map(|timestamp| timestamp.value),
+        );
         self.syn_ack_queued = true;
         self.bytes_in_flight = self.bytes_in_flight.saturating_add(1);
-        self.in_flight
+        self.in_flight_mut()
             .push_back(TcpInFlightSegment {
                 header,
-                options: syn_header_options(
-                    now_nanos,
-                    self.peer_timestamp.map(|timestamp| timestamp.value),
-                ),
+                options,
                 payload: Bytes::new(),
                 sequence_len: 1,
                 sent_at_nanos: now_nanos,
@@ -632,16 +670,17 @@ where
             flags: TcpFlags::ACK.union(TcpFlags::FIN),
             window_size: self.advertised_window,
         };
+        let options = self.timestamped_options(now_nanos);
         self.fin_queued = true;
         self.ack_pending = false;
         self.send_next = self.send_next.wrapping_add(1);
         self.bytes_in_flight = self.bytes_in_flight.saturating_add(1);
         self.congestion
             .on_packet_sent(1, self.bytes_in_flight, now_nanos);
-        self.in_flight
+        self.in_flight_mut()
             .push_back(TcpInFlightSegment {
                 header,
-                options: self.timestamped_options(now_nanos),
+                options,
                 payload: Bytes::new(),
                 sequence_len: 1,
                 sent_at_nanos: now_nanos,
@@ -653,7 +692,7 @@ where
             local,
             remote,
             header,
-            options: self.timestamped_options(now_nanos),
+            options,
             payload: Bytes::new(),
             sequence_len: 1,
             retransmission: false,
@@ -678,11 +717,13 @@ where
     }
 
     pub fn next_deadline_nanos(&self) -> Option<u64> {
-        let rto_deadline = self.in_flight.front().map(|segment| {
-            segment.sent_at_nanos.saturating_add(
-                self.retransmission_timer
-                    .backed_off_timeout_nanos(segment.retransmissions),
-            )
+        let rto_deadline = self.in_flight.as_ref().and_then(|in_flight| {
+            in_flight.front().map(|segment| {
+                segment.sent_at_nanos.saturating_add(
+                    self.retransmission_timer
+                        .backed_off_timeout_nanos(segment.retransmissions),
+                )
+            })
         });
         let pacing_deadline = self
             .next_pacing_send_nanos
@@ -726,15 +767,16 @@ where
             flags: TcpFlags::ACK.union(TcpFlags::PSH),
             window_size: self.advertised_window,
         };
+        let options = self.timestamped_options(now_nanos);
         self.send_next = self.send_next.wrapping_add(sequence_len);
         self.bytes_in_flight = self.bytes_in_flight.saturating_add(sequence_len);
         self.congestion
             .on_packet_sent(sequence_len, self.bytes_in_flight, now_nanos);
         self.schedule_next_pacing_send(sequence_len, now_nanos);
-        self.in_flight
+        self.in_flight_mut()
             .push_back(TcpInFlightSegment {
                 header,
-                options: self.timestamped_options(now_nanos),
+                options,
                 payload: payload.clone(),
                 sequence_len,
                 sent_at_nanos: now_nanos,
@@ -748,7 +790,7 @@ where
             local,
             remote,
             header,
-            options: self.timestamped_options(now_nanos),
+            options,
             payload,
             sequence_len,
             retransmission: false,
@@ -759,7 +801,7 @@ where
         let in_flight = if self.fast_retransmit_pending {
             self.first_unsacked_in_flight()?
         } else {
-            let in_flight = self.in_flight.front()?;
+            let in_flight = self.in_flight.as_ref()?.front()?;
             if now_nanos.saturating_sub(in_flight.sent_at_nanos)
                 < self
                     .retransmission_timer
@@ -783,7 +825,10 @@ where
     }
 
     fn first_unsacked_in_flight(&self) -> Option<&TcpInFlightSegment> {
-        self.in_flight.iter().find(|segment| !segment.sacked)
+        self.in_flight
+            .as_ref()?
+            .iter()
+            .find(|segment| !segment.sacked)
     }
 
     pub fn mark_retransmission_queued(&mut self, sequence: u32, now_nanos: u64) {
@@ -791,8 +836,10 @@ where
         if fast_retransmit {
             self.fast_retransmit_pending = false;
         }
-        let Some(in_flight) = self
-            .in_flight
+        let Some(in_flight_queue) = self.in_flight.as_mut() else {
+            return;
+        };
+        let Some(in_flight) = in_flight_queue
             .iter_mut()
             .find(|segment| segment.header.sequence == sequence)
         else {
@@ -803,7 +850,9 @@ where
         if in_flight.retransmissions > TCP_MAX_RETRANSMISSIONS {
             self.state = TcpState::Closed;
             self.bytes_in_flight = 0;
-            self.in_flight.clear();
+            if let Some(in_flight) = self.in_flight.as_mut() {
+                in_flight.clear();
+            }
             return;
         }
         if !fast_retransmit {
@@ -989,10 +1038,14 @@ where
     fn discard_acked_segments(&mut self, acknowledgement: u32) {
         while self
             .in_flight
-            .front()
+            .as_ref()
+            .and_then(TcpInFlightQueue::front)
             .is_some_and(|segment| sequence_leq(segment_end(segment), acknowledgement))
         {
-            let _ = self.in_flight.pop_front();
+            let Some(in_flight) = self.in_flight.as_mut() else {
+                return;
+            };
+            let _ = in_flight.pop_front();
         }
     }
 
@@ -1060,7 +1113,10 @@ where
 
     fn apply_sack_blocks(&mut self, blocks: TcpSackBlocks) {
         for block in blocks.as_slice() {
-            for segment in &mut self.in_flight {
+            let Some(in_flight) = self.in_flight.as_mut() else {
+                return;
+            };
+            for segment in in_flight.iter_mut() {
                 if sequence_leq(block.left_edge, segment.header.sequence)
                     && sequence_leq(segment_end(segment), block.right_edge)
                 {
@@ -1079,16 +1135,18 @@ where
         let mut rtt_nanos = 0;
         let mut first_sent_at = None;
         let mut last_sent_at = None;
-        for segment in &self.in_flight {
-            if !sequence_leq(segment_end(segment), acknowledgement) {
-                break;
+        if let Some(in_flight) = self.in_flight.as_ref() {
+            for segment in in_flight.iter() {
+                if !sequence_leq(segment_end(segment), acknowledgement) {
+                    break;
+                }
+                if segment.retransmissions != 0 {
+                    continue;
+                }
+                first_sent_at.get_or_insert(segment.sent_at_nanos);
+                last_sent_at = Some(segment.sent_at_nanos);
+                rtt_nanos = now_nanos.saturating_sub(segment.sent_at_nanos);
             }
-            if segment.retransmissions != 0 {
-                continue;
-            }
-            first_sent_at.get_or_insert(segment.sent_at_nanos);
-            last_sent_at = Some(segment.sent_at_nanos);
-            rtt_nanos = now_nanos.saturating_sub(segment.sent_at_nanos);
         }
         let interval_nanos = first_sent_at
             .zip(last_sent_at)
@@ -1160,6 +1218,10 @@ where
     fn transmit_queue_mut(&mut self) -> &mut TcpTransmitQueue {
         self.transmit_queue
             .get_or_insert_with(TcpTransmitQueue::new)
+    }
+
+    fn in_flight_mut(&mut self) -> &mut TcpInFlightQueue {
+        self.in_flight.get_or_insert_with(TcpInFlightQueue::new)
     }
 
     fn push_receive_payload(&mut self, payload: &[u8]) -> Result<(), ()> {
