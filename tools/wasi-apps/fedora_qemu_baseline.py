@@ -401,7 +401,7 @@ def ensure_provisioned(
     command = " && ".join(
         [
             f"sudo dnf install -y {package_list}",
-            f"({quickjs_version_check} || ({quickjs_install}))",
+            f"(({quickjs_version_check} && {quickjs_policy_check}) || ({quickjs_install}))",
             f"test -x /usr/local/bin/helios-simd-lanes || ({simd_install})",
             verify_command,
             f"sudo touch {marker}",
