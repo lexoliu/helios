@@ -121,9 +121,7 @@ impl FutexTable {
             return 0;
         };
         let wake_count = count.min(entry.waiters);
-        for _ in 0..wake_count {
-            entry.notify.notify_one();
-        }
+        entry.notify.notify_count(wake_count);
         wake_count
     }
 

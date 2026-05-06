@@ -170,8 +170,18 @@ impl Notify {
     ///
     /// This operation is non-blocking and suitable for interrupt context.
     pub fn notify_one(&self) {
-        self.add_permits(1);
-        self.event.notify(1);
+        self.notify_count(1);
+    }
+
+    /// Signals up to `count` waiters with one permit update.
+    ///
+    /// This operation is non-blocking and suitable for interrupt context.
+    pub fn notify_count(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        self.add_permits(count);
+        self.event.notify(count);
     }
 
     /// Signals every current waiter.
@@ -517,6 +527,16 @@ mod tests {
         thread
             .join()
             .unwrap_or_else(|_| panic!("notify helper thread panicked unexpectedly"));
+    }
+
+    #[test]
+    fn notify_count_preserves_multiple_permits() {
+        let notify = Notify::new();
+        notify.notify_count(2);
+        block_on(async {
+            notify.notified().await;
+            notify.notified().await;
+        });
     }
 
     #[test]
