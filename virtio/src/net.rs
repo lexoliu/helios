@@ -682,9 +682,7 @@ fn write_tx_payload(buffer: &mut [u8], header_len: usize, frame: &[u8]) -> IoRes
         });
     }
 
-    // TX buffers are zero-initialized and the current net feature set does not
-    // enable offloads, so the virtio-net header remains the all-zero default.
-    // Keep the hot path to the payload copy only.
+    buffer[..header_len].fill(0);
     buffer[header_len..payload_len].copy_from_slice(frame);
     Ok(payload_len)
 }
