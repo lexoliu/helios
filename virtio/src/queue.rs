@@ -145,16 +145,13 @@ impl<T: VirtioTransport> VirtQueue<T> {
         Ok(head)
     }
 
-    pub fn commit_deferred(&mut self, heads: &[u16]) {
-        if heads.is_empty() {
-            return;
-        }
+    pub(crate) fn stage_deferred_head(&mut self, head: u16) {
+        let slot = self.avail_idx & (self.size - 1);
+        self.write_avail_ring(slot, head);
+        self.avail_idx = self.avail_idx.wrapping_add(1);
+    }
 
-        for head in heads {
-            let slot = self.avail_idx & (self.size - 1);
-            self.write_avail_ring(slot, *head);
-            self.avail_idx = self.avail_idx.wrapping_add(1);
-        }
+    pub(crate) fn publish_deferred_heads(&mut self) {
         fence(Ordering::Release);
         self.write_avail_idx(self.avail_idx);
     }
@@ -501,7 +498,9 @@ mod tests {
         };
         assert_eq!(unpublished_avail_idx, 0);
 
-        queue.commit_deferred(&[first_token, second_token]);
+        queue.stage_deferred_head(first_token);
+        queue.stage_deferred_head(second_token);
+        queue.publish_deferred_heads();
 
         let published_avail_idx = unsafe {
             queue

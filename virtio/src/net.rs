@@ -409,7 +409,6 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             tx_in_flight,
         } = state;
         let mut submitted = 0usize;
-        let mut submitted_tokens = [0u16; NET_QUEUE_SIZE as usize];
         let available_frames = tx_queue
             .available_descriptors()
             .min(frames.len().saturating_sub(*next_frame));
@@ -433,12 +432,12 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 "virtio net TX descriptor allocation moved while payload was prepared"
             );
             tx_in_flight.set(token_index);
-            submitted_tokens[submitted] = token;
+            tx_queue.stage_deferred_head(token);
             submitted += 1;
             *next_frame += 1;
         }
         if submitted != 0 {
-            tx_queue.commit_deferred(&submitted_tokens[..submitted]);
+            tx_queue.publish_deferred_heads();
             tx_queue.notify(&self.transport);
         }
         Ok(submitted)
