@@ -1495,7 +1495,7 @@ impl UdpSocket {
                 continue;
             }
             return Ok(WasiUdpSocketDatagram {
-                bytes: datagram.bytes,
+                bytes: datagram.bytes.to_vec(),
                 remote_address: remote,
             });
         }

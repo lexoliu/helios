@@ -401,7 +401,7 @@ impl NetworkErrorDetail {
 pub struct UdpDatagram {
     pub address: Ipv4Address,
     pub port: u16,
-    pub bytes: Vec<u8>,
+    pub bytes: Bytes,
 }
 
 #[derive(Clone, Debug)]

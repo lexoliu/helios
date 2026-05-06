@@ -2855,7 +2855,7 @@ fn convert_udp_datagram(
             octets[0], octets[1], octets[2], octets[3],
         )),
         port: datagram.port,
-        bytes: datagram.bytes,
+        bytes: datagram.bytes.to_vec(),
     }
 }
 
@@ -2868,7 +2868,7 @@ fn convert_program_udp_datagram(
             octets[0], octets[1], octets[2], octets[3],
         )),
         port: datagram.port,
-        bytes: datagram.bytes,
+        bytes: datagram.bytes.to_vec(),
     }
 }
 
