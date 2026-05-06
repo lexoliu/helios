@@ -22,6 +22,7 @@ const DEFAULT_IP_MTU: usize = 1500;
 const NET_FEATURE_MAC: u64 = 1 << 5;
 const NET_FEATURE_STATUS: u64 = 1 << 16;
 const NET_FEATURE_MTU: u64 = 1 << 3;
+const ZERO_NET_HEADER: [u8; size_of::<VirtioNetHeader>()] = [0; size_of::<VirtioNetHeader>()];
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -682,7 +683,7 @@ fn write_tx_payload(buffer: &mut [u8], header_len: usize, frame: &[u8]) -> IoRes
         });
     }
 
-    buffer[..header_len].fill(0);
+    buffer[..header_len].copy_from_slice(&ZERO_NET_HEADER[..header_len]);
     buffer[header_len..payload_len].copy_from_slice(frame);
     Ok(payload_len)
 }
