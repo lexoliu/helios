@@ -40,6 +40,7 @@ const NETWORK_TX_BATCH_FRAMES: usize = MAX_OUTBOUND_FRAMES;
 const NETWORK_MIN_POLL_BUDGET: usize = 8;
 const NETWORK_MAX_POLL_BUDGET: usize = 128;
 const NETWORK_BUSY_POLL_ROUNDS: usize = 8;
+const NETWORK_POLLING_TCP_READ_ROUNDS: usize = NETWORK_BUSY_POLL_ROUNDS * 2;
 
 #[derive(Clone)]
 pub struct NetworkService<CpuImpl, Runtime, Device>
@@ -898,18 +899,12 @@ where
         timeout_nanos: u64,
     ) -> Result<Option<Bytes>, TcpError> {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
+        let max_bytes = max_bytes as usize;
         loop {
-            let initial_poll_started = self.profile_start();
-            let read = {
-                let mut state = self.inner.state.lock().await;
-                state.poll_tcp_read(
-                    stream,
-                    max_bytes as usize,
-                    StackInstant::from_nanos(self.now_nanos()),
-                )?
-            };
-            self.record_tcp_read_progress("tcp-read-initial", initial_poll_started, &read);
-            match read {
+            match self
+                .poll_tcp_read_once(stream, max_bytes, "tcp-read-initial")
+                .await?
+            {
                 TcpReadProgress::Data(bytes) => return Ok(Some(bytes)),
                 TcpReadProgress::Eof => return Ok(None),
                 TcpReadProgress::Pending => {}
@@ -918,17 +913,18 @@ where
             let drive_started = self.profile_start();
             self.drive_tcp().await?;
             self.record_network_profile("tcp-read-drive-network", drive_started);
-            let after_drive_poll_started = self.profile_start();
-            let read = {
-                let mut state = self.inner.state.lock().await;
-                state.poll_tcp_read(
-                    stream,
-                    max_bytes as usize,
-                    StackInstant::from_nanos(self.now_nanos()),
-                )?
-            };
-            self.record_tcp_read_progress("tcp-read-after-drive", after_drive_poll_started, &read);
-            match read {
+            match self
+                .poll_tcp_read_once(stream, max_bytes, "tcp-read-after-drive")
+                .await?
+            {
+                TcpReadProgress::Data(bytes) => return Ok(Some(bytes)),
+                TcpReadProgress::Eof => return Ok(None),
+                TcpReadProgress::Pending => {}
+            }
+            match self
+                .poll_tcp_read_without_interrupt_sleep(stream, max_bytes, deadline_nanos)
+                .await?
+            {
                 TcpReadProgress::Data(bytes) => return Ok(Some(bytes)),
                 TcpReadProgress::Eof => return Ok(None),
                 TcpReadProgress::Pending => {}
@@ -943,6 +939,58 @@ where
             self.wait_for_tcp_progress(deadline_nanos).await;
             self.record_network_profile("tcp-read-wait", wait_started);
         }
+    }
+
+    async fn poll_tcp_read_once(
+        &self,
+        stream: TcpStreamId,
+        max_bytes: usize,
+        profile_prefix: &'static str,
+    ) -> Result<TcpReadProgress, TcpError> {
+        let started = self.profile_start();
+        let read = {
+            let mut state = self.inner.state.lock().await;
+            state.poll_tcp_read(
+                stream,
+                max_bytes,
+                StackInstant::from_nanos(self.now_nanos()),
+            )?
+        };
+        self.record_tcp_read_progress(profile_prefix, started, &read);
+        Ok(read)
+    }
+
+    async fn poll_tcp_read_without_interrupt_sleep(
+        &self,
+        stream: TcpStreamId,
+        max_bytes: usize,
+        deadline_nanos: u64,
+    ) -> Result<TcpReadProgress, TcpError> {
+        let capabilities = self.inner.device.capabilities().events;
+        if !capabilities.polling || capabilities.interrupts {
+            return Ok(TcpReadProgress::Pending);
+        }
+
+        for _ in 0..NETWORK_POLLING_TCP_READ_ROUNDS {
+            if self.now_nanos() >= deadline_nanos {
+                return Ok(TcpReadProgress::Pending);
+            }
+            let yield_started = self.profile_start();
+            crate::yield_now().await;
+            self.record_network_profile("tcp-read-polling-yield", yield_started);
+
+            let drive_started = self.profile_start();
+            self.drive_tcp().await?;
+            self.record_network_profile("tcp-read-polling-drive-network", drive_started);
+            match self
+                .poll_tcp_read_once(stream, max_bytes, "tcp-read-polling")
+                .await?
+            {
+                ready @ (TcpReadProgress::Data(_) | TcpReadProgress::Eof) => return Ok(ready),
+                TcpReadProgress::Pending => {}
+            }
+        }
+        Ok(TcpReadProgress::Pending)
     }
 
     async fn execute_udp_bind(&self, local_port: u16) -> Result<UdpBinding<UdpSocketId>, UdpError> {
@@ -2764,6 +2812,9 @@ fn tcp_read_profile_phase(prefix: &'static str, outcome: &'static str) -> &'stat
         ("tcp-read-after-drive", "pending") => "tcp-read-after-drive-pending",
         ("tcp-read-after-drive", "ready") => "tcp-read-after-drive-ready",
         ("tcp-read-after-drive", "eof") => "tcp-read-after-drive-eof",
+        ("tcp-read-polling", "pending") => "tcp-read-polling-pending",
+        ("tcp-read-polling", "ready") => "tcp-read-polling-ready",
+        ("tcp-read-polling", "eof") => "tcp-read-polling-eof",
         _ => panic!("unknown TCP read profile phase"),
     }
 }
