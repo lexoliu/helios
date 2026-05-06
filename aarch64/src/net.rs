@@ -1,7 +1,3 @@
-extern crate alloc;
-
-use alloc::sync::Arc;
-
 use fdt::Fdt;
 use helios_hal::io::IoError;
 use helios_hal::watchdog::Watchdog;
@@ -9,6 +5,7 @@ use helios_kernel::{
     EventDeliveryCapabilities, InterfaceCapabilities, Kernel, NetworkDevice, NetworkService,
     PacketBuffer,
 };
+use triomphe::Arc;
 
 type Aarch64VirtioNetTransport =
     helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<helios_virtio::OffsetDmaPool>>;

@@ -1467,6 +1467,7 @@ dependencies = [
  "rand_core",
  "spin 0.10.0",
  "tracing",
+ "triomphe",
 ]
 
 [[package]]

@@ -1,11 +1,11 @@
 extern crate alloc;
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use fdt::Fdt;
 use helios_hal::io::IoError;
 use helios_kernel::HostFsTransport;
+use triomphe::Arc;
 
 type Aarch64Virtio9pDevice = helios_virtio::Virtio9pDevice<
     helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<helios_virtio::OffsetDmaPool>>,
