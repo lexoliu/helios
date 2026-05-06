@@ -1,5 +1,7 @@
 extern crate alloc;
 
+use alloc::boxed::Box;
+
 use bytes::{Bytes, BytesMut};
 use heapless::{Deque, Vec as HeapVec};
 
@@ -69,6 +71,43 @@ struct TcpInFlightSegment {
 struct TcpOutOfOrderSegment {
     sequence: u32,
     payload: Bytes,
+}
+
+#[derive(Clone, Debug)]
+struct TcpReceiveQueue {
+    segments: Box<Deque<BytesMut, MAX_TCP_RECEIVE_SEGMENTS>>,
+}
+
+impl TcpReceiveQueue {
+    fn new() -> Self {
+        Self {
+            segments: Box::new(Deque::new()),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    fn is_full(&self) -> bool {
+        self.segments.is_full()
+    }
+
+    fn back_mut(&mut self) -> Option<&mut BytesMut> {
+        self.segments.back_mut()
+    }
+
+    fn push_back(&mut self, bytes: BytesMut) -> Result<(), BytesMut> {
+        self.segments.push_back(bytes)
+    }
+
+    fn push_front(&mut self, bytes: BytesMut) -> Result<(), BytesMut> {
+        self.segments.push_front(bytes)
+    }
+
+    fn pop_front(&mut self) -> Option<BytesMut> {
+        self.segments.pop_front()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -156,7 +195,7 @@ where
     peer_receive_window: u32,
     peer_sack_permitted: bool,
     peer_timestamp: Option<TcpTimestampOption>,
-    receive_queue: Deque<BytesMut, MAX_TCP_RECEIVE_SEGMENTS>,
+    receive_queue: Option<TcpReceiveQueue>,
     receive_queued_bytes: usize,
     receive_fin_sequence: Option<u32>,
     out_of_order: HeapVec<TcpOutOfOrderSegment, MAX_TCP_OUT_OF_ORDER_SEGMENTS>,
@@ -198,7 +237,7 @@ where
             peer_receive_window: u32::from(u16::MAX),
             peer_sack_permitted: false,
             peer_timestamp: None,
-            receive_queue: Deque::new(),
+            receive_queue: None,
             receive_queued_bytes: 0,
             receive_fin_sequence: None,
             out_of_order: HeapVec::new(),
@@ -693,7 +732,7 @@ where
 
     pub fn receive(&mut self, max_bytes: usize, now_nanos: u64) -> Option<Bytes> {
         if max_bytes == 0 {
-            return (!self.receive_queue.is_empty()).then(Bytes::new);
+            return (!self.receive_queue_is_empty()).then(Bytes::new);
         }
         self.consume_pending_receive_fin(now_nanos);
         let previous_window = self.advertised_window;
@@ -712,7 +751,7 @@ where
             return Some(bytes.freeze());
         }
 
-        if self.receive_queue.is_empty() {
+        if self.receive_queue_is_empty() {
             let drained_segments = self.drain_contiguous_out_of_order();
             self.consume_pending_receive_fin(now_nanos);
             self.refresh_advertised_window();
@@ -1003,12 +1042,29 @@ where
             .expect("TCP receive buffered byte count overflowed")
     }
 
+    fn receive_queue_is_empty(&self) -> bool {
+        self.receive_queue
+            .as_ref()
+            .is_none_or(TcpReceiveQueue::is_empty)
+    }
+
+    fn receive_queue_is_full(&self) -> bool {
+        self.receive_queue
+            .as_ref()
+            .is_some_and(TcpReceiveQueue::is_full)
+    }
+
+    fn receive_queue_mut(&mut self) -> &mut TcpReceiveQueue {
+        self.receive_queue.get_or_insert_with(TcpReceiveQueue::new)
+    }
+
     fn push_receive_payload(&mut self, payload: &[u8]) -> Result<(), ()> {
         if payload.is_empty() {
             return Ok(());
         }
 
-        if let Some(back) = self.receive_queue.back_mut()
+        if let Some(queue) = self.receive_queue.as_mut()
+            && let Some(back) = queue.back_mut()
             && back.len().saturating_add(payload.len()) <= TCP_RECEIVE_COALESCE_BYTES
         {
             back.extend_from_slice(payload);
@@ -1025,7 +1081,7 @@ where
 
     fn push_receive_segment(&mut self, bytes: BytesMut) -> Result<(), BytesMut> {
         let len = bytes.len();
-        self.receive_queue.push_back(bytes)?;
+        self.receive_queue_mut().push_back(bytes)?;
         self.receive_queued_bytes = self
             .receive_queued_bytes
             .checked_add(len)
@@ -1035,7 +1091,7 @@ where
 
     fn push_front_receive_segment(&mut self, bytes: BytesMut) {
         let len = bytes.len();
-        self.receive_queue
+        self.receive_queue_mut()
             .push_front(bytes)
             .unwrap_or_else(|_| panic!("TCP receive queue lost capacity while splitting"));
         self.receive_queued_bytes = self
@@ -1045,7 +1101,7 @@ where
     }
 
     fn pop_receive_segment(&mut self) -> Option<BytesMut> {
-        let bytes = self.receive_queue.pop_front()?;
+        let bytes = self.receive_queue.as_mut()?.pop_front()?;
         assert!(
             self.receive_queued_bytes >= bytes.len(),
             "TCP receive queued byte count is corrupt"
@@ -1112,7 +1168,7 @@ where
             if sequence_lt(self.receive_next, segment.sequence) {
                 return drained;
             }
-            if self.receive_queue.is_full() {
+            if self.receive_queue_is_full() {
                 return drained;
             }
 
