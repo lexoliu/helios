@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use divan::counter::{BytesCount, ItemsCount};
 use divan::{AllocProfiler, Bencher, black_box};
 use helios_netstack::{
@@ -18,6 +19,7 @@ const UDP_PAYLOAD: &[u8] = b"helios-netstack-divan-udp-payload";
 const TCP_PAYLOAD_BYTES: usize = 1460;
 const TCP_RECEIVE_SEGMENTS: usize = 128;
 const TCP_ACK_COALESCE_SEGMENTS: usize = 16;
+const TCP_TRANSMIT_SEGMENTS: usize = 10;
 
 fn main() {
     divan::main();
@@ -238,6 +240,32 @@ fn tcp_receive_ack_coalesces_unsubmitted_control_frames(bencher: Bencher) {
                 }
                 other => panic!("unexpected outbound status: {other:?}"),
             }
+        });
+}
+
+#[divan::bench]
+fn tcp_send_bytes_segments_without_copy(bencher: Bencher) {
+    let payload = Bytes::from(vec![0u8; TCP_TRANSMIT_SEGMENTS * TCP_PAYLOAD_BYTES]);
+
+    bencher
+        .counter(BytesCount::new(payload.len()))
+        .bench_local(|| {
+            let mut socket = established_tcp_socket();
+            let mut remaining = black_box(payload.clone());
+            let written = socket.queue_send_bytes(&mut remaining);
+            assert_eq!(written, TCP_TRANSMIT_SEGMENTS * TCP_PAYLOAD_BYTES);
+            assert!(remaining.is_empty());
+
+            let mut transmitted = 0usize;
+            for index in 0..TCP_TRANSMIT_SEGMENTS {
+                let segment = socket
+                    .take_transmit_segment(
+                        u64::try_from(index + 2).expect("TCP benchmark timestamp fits u64"),
+                    )
+                    .expect("TCP benchmark transmit segment should be queued");
+                transmitted = transmitted.saturating_add(segment.payload.len());
+            }
+            assert_eq!(transmitted, TCP_TRANSMIT_SEGMENTS * TCP_PAYLOAD_BYTES);
         });
 }
 

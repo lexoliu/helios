@@ -159,26 +159,26 @@ impl TcpTransmitQueue {
 
 #[derive(Clone, Debug)]
 struct TcpInFlightQueue {
-    segments: Box<Deque<TcpInFlightSegment, MAX_TCP_QUEUED_SEGMENTS>>,
+    segments: Box<HeapVec<TcpInFlightSegment, MAX_TCP_QUEUED_SEGMENTS>>,
 }
 
 impl TcpInFlightQueue {
     fn new() -> Self {
         Self {
-            segments: Box::new(Deque::new()),
+            segments: Box::new(HeapVec::new()),
         }
     }
 
     fn front(&self) -> Option<&TcpInFlightSegment> {
-        self.segments.front()
+        self.segments.first()
     }
 
     fn push_back(&mut self, segment: TcpInFlightSegment) -> Result<(), TcpInFlightSegment> {
-        self.segments.push_back(segment)
+        self.segments.push(segment)
     }
 
     fn pop_front(&mut self) -> Option<TcpInFlightSegment> {
-        self.segments.pop_front()
+        (!self.segments.is_empty()).then(|| self.segments.remove(0))
     }
 
     fn clear(&mut self) {
