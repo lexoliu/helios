@@ -837,13 +837,6 @@ impl TcpSocket {
         Ok(())
     }
 
-    async fn write_all(&self, bytes: &[u8]) -> core::result::Result<(), socket_types::ErrorCode> {
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        self.write_all_bytes(Bytes::copy_from_slice(bytes)).await
-    }
-
     async fn write_all_bytes(
         &self,
         bytes: Bytes,
@@ -7627,7 +7620,7 @@ mod tests {
             .expect("send shutdown must be idempotent");
         assert_eq!(stream, 7);
         assert!(matches!(
-            block_on(socket.write_all(b"x")),
+            block_on(socket.write_all_bytes(Bytes::from_static(b"x"))),
             Err(socket_types::ErrorCode::InvalidState)
         ));
     }
@@ -7674,7 +7667,8 @@ mod tests {
 
         block_on(socket.connect(remote)).expect("test TCP backend should connect");
         assert_eq!(socket.remote_address().unwrap(), remote);
-        block_on(socket.write_all(b"hello")).expect("test TCP backend should write");
+        block_on(socket.write_all_bytes(Bytes::from_static(b"hello")))
+            .expect("test TCP backend should write");
         assert_eq!(block_on(socket.read(16)).unwrap(), Some(vec![4, 2]));
     }
 }

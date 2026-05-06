@@ -2581,7 +2581,7 @@ where
     store.spawner().spawn_detached(async move {
         while let Some(bytes) = network_reader.read().await {
             let started = write_cpu.now().ticks();
-            if let Err(error) = socket.write_all(&bytes).await {
+            if let Err(error) = socket.write_all_bytes(bytes).await {
                 p2_record_kernel_profile(
                     &write_runtime_state,
                     &write_cpu,
