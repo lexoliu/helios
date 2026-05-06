@@ -5,6 +5,8 @@ use triomphe::Arc;
 
 use crate::Notify;
 
+const FUTEX_TABLE_INITIAL_CAPACITY: usize = 64;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ProcessMemoryIdentity(u64);
 
@@ -81,7 +83,7 @@ pub struct FutexTable {
 impl FutexTable {
     pub fn new() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: HashMap::with_capacity(FUTEX_TABLE_INITIAL_CAPACITY),
         }
     }
 
@@ -138,13 +140,22 @@ impl FutexTable {
 mod tests {
     use futures_lite::future::block_on;
 
-    use super::{FutexKey, FutexTable, GuestAddress, ProcessMemoryIdentity};
+    use super::{
+        FUTEX_TABLE_INITIAL_CAPACITY, FutexKey, FutexTable, GuestAddress, ProcessMemoryIdentity,
+    };
 
     fn key(memory: u64, address: u64) -> FutexKey {
         FutexKey::new(
             ProcessMemoryIdentity::new(memory),
             GuestAddress::new(address),
         )
+    }
+
+    #[test]
+    fn futex_table_preallocates_expected_wait_keys() {
+        let table = FutexTable::new();
+
+        assert!(table.entries.capacity() >= FUTEX_TABLE_INITIAL_CAPACITY);
     }
 
     #[test]
