@@ -133,6 +133,7 @@ struct NetworkState {
 struct NetworkPollBudget {
     rx_frames: usize,
     tx_completions: usize,
+    tx_frames: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -148,15 +149,19 @@ impl NetworkPollProgress {
     }
 
     const fn saturated(self, budget: NetworkPollBudget) -> bool {
-        self.received_frames >= budget.rx_frames || self.reclaimed_tx >= budget.tx_completions
+        self.received_frames >= budget.rx_frames
+            || self.reclaimed_tx >= budget.tx_completions
+            || self.transmitted_frames >= budget.tx_frames
     }
 }
 
 struct NetworkPollState {
     base_rx_budget: usize,
     base_tx_completion_budget: usize,
+    base_tx_frame_budget: usize,
     rx_budget: usize,
     tx_completion_budget: usize,
+    tx_frame_budget: usize,
 }
 
 struct NetworkPumpCadence {
@@ -414,6 +419,7 @@ where
                     device.mac_address(),
                     device.max_frame_len(),
                     capabilities.events.rx_poll_budget,
+                    capabilities.events.tx_completion_budget,
                     transaction_id,
                 )),
                 device,
@@ -1100,11 +1106,12 @@ where
 
         let mut transmitted = 0usize;
         let transmit_started = self.profile_start();
-        loop {
+        while transmitted < budget.tx_frames {
             let mut frames = smallvec::SmallVec::<[PacketBuffer; NETWORK_TX_BATCH_FRAMES]>::new();
             {
                 let mut state = self.inner.state.lock().await;
-                while frames.len() < NETWORK_TX_BATCH_FRAMES {
+                let remaining_budget = budget.tx_frames - transmitted;
+                while frames.len() < NETWORK_TX_BATCH_FRAMES && frames.len() < remaining_budget {
                     let Some(frame) = state.stack.take_outbound() else {
                         break;
                     };
@@ -1537,7 +1544,13 @@ where
 }
 
 impl NetworkState {
-    fn new(mac: [u8; 6], max_frame_len: usize, rx_poll_budget: usize, transaction_id: u32) -> Self {
+    fn new(
+        mac: [u8; 6],
+        max_frame_len: usize,
+        rx_poll_budget: usize,
+        tx_completion_budget: usize,
+        transaction_id: u32,
+    ) -> Self {
         Self {
             stack: Stack::new(StackConfig::new(mac, max_frame_len).with_rx_budget(rx_poll_budget)),
             next_tcp_local_port: EPHEMERAL_PORT_START,
@@ -1545,7 +1558,7 @@ impl NetworkState {
             tcp_streams: HandleSlab::new(),
             tcp_listeners: HandleSlab::new(),
             udp_sockets: HandleSlab::new(),
-            poll: NetworkPollState::new(rx_poll_budget, rx_poll_budget),
+            poll: NetworkPollState::new(rx_poll_budget, tx_completion_budget, rx_poll_budget),
             dhcp: DhcpClientState::Init { transaction_id },
             dns_servers: DhcpDnsServers::new(),
             next_dns_query_id: 1,
@@ -2195,14 +2208,17 @@ impl NetworkState {
 }
 
 impl NetworkPollState {
-    fn new(rx_budget: usize, tx_completion_budget: usize) -> Self {
+    fn new(rx_budget: usize, tx_completion_budget: usize, tx_frame_budget: usize) -> Self {
         let rx_budget = clamp_poll_budget(rx_budget);
         let tx_completion_budget = clamp_poll_budget(tx_completion_budget);
+        let tx_frame_budget = clamp_poll_budget(tx_frame_budget);
         Self {
             base_rx_budget: rx_budget,
             base_tx_completion_budget: tx_completion_budget,
+            base_tx_frame_budget: tx_frame_budget,
             rx_budget,
             tx_completion_budget,
+            tx_frame_budget,
         }
     }
 
@@ -2210,6 +2226,7 @@ impl NetworkPollState {
         NetworkPollBudget {
             rx_frames: self.rx_budget,
             tx_completions: self.tx_completion_budget,
+            tx_frames: self.tx_frame_budget,
         }
     }
 
@@ -2224,6 +2241,12 @@ impl NetworkPollState {
             self.tx_completion_budget,
             self.base_tx_completion_budget,
             progress.reclaimed_tx >= self.tx_completion_budget,
+            progress.is_idle(),
+        );
+        self.tx_frame_budget = adjust_poll_budget(
+            self.tx_frame_budget,
+            self.base_tx_frame_budget,
+            progress.transmitted_frames >= self.tx_frame_budget,
             progress.is_idle(),
         );
     }
@@ -2347,7 +2370,7 @@ mod tests {
 
     use super::{
         HandleSlab, NETWORK_BUSY_POLL_ROUNDS, NetworkPollBudget, NetworkPollProgress,
-        NetworkPumpAction, NetworkPumpCadence, limit_udp_datagram_bytes,
+        NetworkPollState, NetworkPumpAction, NetworkPumpCadence, limit_udp_datagram_bytes,
     };
 
     #[test]
@@ -2382,6 +2405,26 @@ mod tests {
     }
 
     #[test]
+    fn network_poll_state_adapts_tx_submit_budget() {
+        let mut poll = NetworkPollState::new(8, 8, 8);
+        assert_eq!(poll.budget().tx_frames, 8);
+
+        poll.complete(NetworkPollProgress {
+            received_frames: 0,
+            reclaimed_tx: 0,
+            transmitted_frames: 8,
+        });
+        assert_eq!(poll.budget().tx_frames, 16);
+
+        poll.complete(NetworkPollProgress {
+            received_frames: 0,
+            reclaimed_tx: 0,
+            transmitted_frames: 0,
+        });
+        assert_eq!(poll.budget().tx_frames, 8);
+    }
+
+    #[test]
     fn packet_pump_continues_busy_slice_before_yielding() {
         let mut cadence = NetworkPumpCadence::new();
         let progress = NetworkPollProgress {
@@ -2392,6 +2435,7 @@ mod tests {
         let budget = NetworkPollBudget {
             rx_frames: 8,
             tx_completions: 8,
+            tx_frames: 8,
         };
 
         for _ in 1..NETWORK_BUSY_POLL_ROUNDS {
@@ -2423,6 +2467,7 @@ mod tests {
         let budget = NetworkPollBudget {
             rx_frames: 8,
             tx_completions: 8,
+            tx_frames: 8,
         };
 
         assert_eq!(cadence.complete(busy, budget), NetworkPumpAction::Continue);
