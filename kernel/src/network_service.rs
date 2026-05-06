@@ -1,6 +1,5 @@
 extern crate alloc;
 
-use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::num::NonZeroU32;
@@ -24,6 +23,7 @@ use crate::{
     NetworkPortId, PingError, PingErrorKind, PingReply, TcpAccepted, TcpError, TcpErrorKind,
     TcpListener, Timer, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
 };
+use triomphe::Arc;
 
 const EPHEMERAL_PORT_START: u16 = 49_152;
 const EPHEMERAL_PORT_END: u16 = 65_535;
