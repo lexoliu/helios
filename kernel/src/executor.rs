@@ -24,7 +24,9 @@ static EXECUTOR_GROUP: Once<NoWeakArc<ExecutorGroup>> = Once::new();
 
 struct ExecutorGroup {
     local_queues: Box<[ReadyQueue]>,
+    local_ready_counts: Box<[AtomicUsize]>,
     global_queue: ReadyQueue,
+    global_ready_count: AtomicUsize,
     global_wake_cursor: AtomicUsize,
 }
 
@@ -110,12 +112,15 @@ impl Executor {
 
         while runnable_count < READY_BATCH_TASKS {
             let local_queue = &self.group.local_queues[self.local_queue_index];
-            let runnable = match local_queue.pop() {
+            let local_ready_count = &self.group.local_ready_counts[self.local_queue_index];
+            let runnable = match pop_ready(local_queue, local_ready_count) {
                 Ok(runnable) => runnable,
-                Err(PopError::Empty | PopError::Closed) => match self.group.global_queue.pop() {
-                    Ok(runnable) => runnable,
-                    Err(PopError::Empty | PopError::Closed) => return runnable_count,
-                },
+                Err(PopError::Empty | PopError::Closed) => {
+                    match pop_ready(&self.group.global_queue, &self.group.global_ready_count) {
+                        Ok(runnable) => runnable,
+                        Err(PopError::Empty | PopError::Closed) => return runnable_count,
+                    }
+                }
             };
 
             runnable.run();
@@ -138,6 +143,7 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
     fn schedule_on_queue(
         &self,
         queue: &ReadyQueue,
+        ready_count: &AtomicUsize,
         runnable: Runnable,
         progress_mode: ProgressMode,
         wake: WakeTarget,
@@ -147,6 +153,7 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
             Err(PushError::Full(_)) => unreachable!("unbounded ready queue reported full"),
             Err(PushError::Closed(_)) => panic!("executor ready queue was closed unexpectedly"),
         }
+        let previous_ready = ready_count.fetch_add(1, Ordering::AcqRel);
 
         if progress_mode == ProgressMode::Counted {
             self.progress.record_progress();
@@ -154,9 +161,17 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         }
 
         match wake {
-            WakeTarget::OneRemoteProcessor => self.wake_one_remote_processor(),
+            WakeTarget::OneRemoteProcessor => {
+                if should_wake_global_processor(previous_ready, self.processor_count) {
+                    self.wake_one_remote_processor();
+                }
+            }
             WakeTarget::OwnerProcessor => {
-                if self.cpu.current_processor() != self.owner_processor {
+                if should_wake_owner_processor(
+                    previous_ready,
+                    self.cpu.current_processor(),
+                    self.owner_processor,
+                ) {
                     self.cpu.wake_processor(self.owner_processor);
                 }
             }
@@ -165,12 +180,20 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
 
     fn schedule_local(&self, runnable: Runnable, progress_mode: ProgressMode) {
         let queue = &self.group.local_queues[self.local_queue_index];
-        self.schedule_on_queue(queue, runnable, progress_mode, WakeTarget::OwnerProcessor);
+        let ready_count = &self.group.local_ready_counts[self.local_queue_index];
+        self.schedule_on_queue(
+            queue,
+            ready_count,
+            runnable,
+            progress_mode,
+            WakeTarget::OwnerProcessor,
+        );
     }
 
     fn schedule_global(&self, runnable: Runnable, progress_mode: ProgressMode) {
         self.schedule_on_queue(
             &self.group.global_queue,
+            &self.group.global_ready_count,
             runnable,
             progress_mode,
             WakeTarget::OneRemoteProcessor,
@@ -291,16 +314,39 @@ fn executor_group(configured_processors: usize) -> NoWeakArc<ExecutorGroup> {
                 "executor processor count must be non-zero"
             );
             let mut local_queues = Vec::with_capacity(configured_processors);
+            let mut local_ready_counts = Vec::with_capacity(configured_processors);
             for _ in 0..configured_processors {
                 local_queues.push(ConcurrentQueue::unbounded());
+                local_ready_counts.push(AtomicUsize::new(0));
             }
             NoWeakArc::new(ExecutorGroup {
                 local_queues: local_queues.into_boxed_slice(),
+                local_ready_counts: local_ready_counts.into_boxed_slice(),
                 global_queue: ConcurrentQueue::unbounded(),
+                global_ready_count: AtomicUsize::new(0),
                 global_wake_cursor: AtomicUsize::new(0),
             })
         })
         .clone()
+}
+
+fn pop_ready(queue: &ReadyQueue, ready_count: &AtomicUsize) -> Result<Runnable, PopError> {
+    let runnable = queue.pop()?;
+    let previous = ready_count.fetch_sub(1, Ordering::AcqRel);
+    assert!(previous != 0, "executor ready count underflowed");
+    Ok(runnable)
+}
+
+const fn should_wake_global_processor(previous_ready: usize, processor_count: usize) -> bool {
+    previous_ready < processor_count.saturating_sub(1)
+}
+
+fn should_wake_owner_processor(
+    previous_ready: usize,
+    current_processor: ProcessorId,
+    owner_processor: ProcessorId,
+) -> bool {
+    previous_ready == 0 && current_processor != owner_processor
 }
 
 impl<T> LocalJoinHandle<T> {
@@ -318,5 +364,30 @@ impl<T> Future for LocalJoinHandle<T> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         Pin::new(&mut self.task).poll(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use helios_hal::cpu::ProcessorId;
+
+    use super::{should_wake_global_processor, should_wake_owner_processor};
+
+    #[test]
+    fn global_wake_scales_to_processor_count_not_enqueue_count() {
+        assert!(!should_wake_global_processor(0, 1));
+        assert!(should_wake_global_processor(0, 4));
+        assert!(should_wake_global_processor(2, 4));
+        assert!(!should_wake_global_processor(3, 4));
+    }
+
+    #[test]
+    fn local_wake_only_fires_on_empty_to_nonempty_remote_enqueue() {
+        let owner = ProcessorId::new(1);
+        let remote = ProcessorId::new(2);
+
+        assert!(should_wake_owner_processor(0, remote, owner));
+        assert!(!should_wake_owner_processor(1, remote, owner));
+        assert!(!should_wake_owner_processor(0, owner, owner));
     }
 }
