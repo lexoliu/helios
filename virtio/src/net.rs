@@ -309,13 +309,27 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     pub async fn transmit_batch_with_wait<Wait, Fut>(
         &self,
         frames: &[&[u8]],
-        mut wait: Wait,
+        wait: Wait,
     ) -> IoResult<()>
     where
         Wait: FnMut() -> Fut,
         Fut: Future<Output = ()>,
     {
+        self.transmit_frames_with_wait(frames, wait).await
+    }
+
+    pub async fn transmit_frames_with_wait<Frame, Wait, Fut>(
+        &self,
+        frames: &[Frame],
+        mut wait: Wait,
+    ) -> IoResult<()>
+    where
+        Frame: AsRef<[u8]>,
+        Wait: FnMut() -> Fut,
+        Fut: Future<Output = ()>,
+    {
         for frame in frames {
+            let frame = frame.as_ref();
             if frame.is_empty() || frame.len() > self.max_frame_len {
                 return Err(IoError::InvalidBufferLength {
                     required_multiple: 1,
@@ -338,6 +352,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                     tx_in_flight,
                 } = &mut *state;
                 while next_frame < frames.len() && tx_queue.available_descriptors() != 0 {
+                    let frame = frames[next_frame].as_ref();
                     let token = tx_queue.next_free_descriptor();
                     let token_index = usize::from(token);
                     assert!(
@@ -347,7 +362,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                     let payload_len = write_tx_payload(
                         slot_buffer_mut(tx_buffers, *tx_buffer_len, token_index, "TX"),
                         self.header_len,
-                        frames[next_frame],
+                        frame,
                     )?;
                     let payload =
                         slot_buffer(tx_buffers, *tx_buffer_len, token_index, payload_len, "TX");

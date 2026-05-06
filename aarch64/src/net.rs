@@ -130,12 +130,8 @@ impl NetworkDevice for VirtioNetworkDevice {
         frames: &'a [PacketBuffer],
     ) -> Result<(), IoError> {
         for chunk in frames.chunks(VIRTIO_POLLING_RX_BUDGET) {
-            let mut frame_refs = [&[][..]; VIRTIO_POLLING_RX_BUDGET];
-            for (index, frame) in chunk.iter().enumerate() {
-                frame_refs[index] = frame.as_slice();
-            }
             self.inner
-                .transmit_batch_with_wait(&frame_refs[..chunk.len()], helios_kernel::yield_now)
+                .transmit_frames_with_wait(chunk, helios_kernel::yield_now)
                 .await?;
         }
         Ok(())

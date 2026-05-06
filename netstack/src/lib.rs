@@ -175,6 +175,12 @@ impl PacketBuffer {
     }
 }
 
+impl AsRef<[u8]> for PacketBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
 impl Default for PacketBuffer {
     fn default() -> Self {
         Self::new()
