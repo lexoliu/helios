@@ -166,6 +166,7 @@ where
     duplicate_ack_count: u8,
     fast_retransmit_pending: bool,
     retransmission_timer: TcpRetransmissionTimer,
+    next_pacing_send_nanos: Option<u64>,
     delayed_ack_deadline_nanos: Option<u64>,
     time_wait_deadline_nanos: Option<u64>,
     unacked_receive_segments: u8,
@@ -206,6 +207,7 @@ where
             duplicate_ack_count: 0,
             fast_retransmit_pending: false,
             retransmission_timer: TcpRetransmissionTimer::new(),
+            next_pacing_send_nanos: None,
             delayed_ack_deadline_nanos: None,
             time_wait_deadline_nanos: None,
             unacked_receive_segments: 0,
@@ -486,6 +488,10 @@ where
             }
         }
 
+        if !self.transmit_queue.is_empty() {
+            return None;
+        }
+
         if !matches!(self.state, TcpState::FinWait1 | TcpState::LastAck) || self.fin_queued {
             return None;
         }
@@ -550,8 +556,14 @@ where
                     .backed_off_timeout_nanos(segment.retransmissions),
             )
         });
+        let pacing_deadline = self
+            .next_pacing_send_nanos
+            .filter(|_| !self.transmit_queue.is_empty());
         min_deadline(
-            min_deadline(rto_deadline, self.delayed_ack_deadline_nanos),
+            min_deadline(
+                min_deadline(rto_deadline, pacing_deadline),
+                self.delayed_ack_deadline_nanos,
+            ),
             self.time_wait_deadline_nanos,
         )
     }
@@ -563,6 +575,12 @@ where
         available: usize,
         now_nanos: u64,
     ) -> Option<TcpTransmitSegment> {
+        if self
+            .next_pacing_send_nanos
+            .is_some_and(|deadline| now_nanos < deadline)
+        {
+            return None;
+        }
         let mut payload = self.transmit_queue.pop_front()?;
         let maximum_segment = available.min(self.peer_max_segment_size);
         if payload.len() > maximum_segment {
@@ -584,6 +602,7 @@ where
         self.bytes_in_flight = self.bytes_in_flight.saturating_add(sequence_len);
         self.congestion
             .on_packet_sent(sequence_len, self.bytes_in_flight, now_nanos);
+        self.schedule_next_pacing_send(sequence_len, now_nanos);
         self.in_flight
             .push_back(TcpInFlightSegment {
                 header,
@@ -1213,6 +1232,13 @@ where
         congestion_window.min(receive_window) as usize
     }
 
+    fn schedule_next_pacing_send(&mut self, bytes: u32, now_nanos: u64) {
+        self.next_pacing_send_nanos = self
+            .congestion
+            .pacing_rate()
+            .map(|rate| now_nanos.saturating_add(pacing_interval_nanos(bytes, rate)));
+    }
+
     fn timestamped_options(&self, now_nanos: u64) -> TcpHeaderOptions {
         let Some(peer_timestamp) = self.peer_timestamp else {
             return TcpHeaderOptions::empty();
@@ -1289,6 +1315,10 @@ fn timestamp_echo_rtt_nanos(now_nanos: u64, timestamp: TcpTimestampOption) -> u6
     u64::from(timestamp_value(now_nanos).wrapping_sub(timestamp.echo_reply)) * 1_000_000
 }
 
+fn pacing_interval_nanos(bytes: u32, rate: crate::PacingRate) -> u64 {
+    ((u64::from(bytes) * 1_000_000_000) / rate.bytes_per_second()).max(1)
+}
+
 fn min_deadline(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     match (left, right) {
         (Some(left), Some(right)) => Some(left.min(right)),
@@ -1300,7 +1330,51 @@ fn min_deadline(left: Option<u64>, right: Option<u64>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BbrV3, Ipv4Address, TcpOptions, TcpSackBlock, TcpSackBlocks};
+    use crate::{
+        BbrV3, CongestionWindow, Ipv4Address, PacingRate, TcpOptions, TcpSackBlock, TcpSackBlocks,
+    };
+
+    #[derive(Clone, Debug)]
+    struct FixedPacing {
+        cwnd: CongestionWindow,
+        pacing_rate: Option<PacingRate>,
+    }
+
+    impl FixedPacing {
+        const fn new(cwnd: CongestionWindow, pacing_rate: Option<PacingRate>) -> Self {
+            Self { cwnd, pacing_rate }
+        }
+    }
+
+    impl CongestionControl for FixedPacing {
+        fn algorithm_name(&self) -> &'static str {
+            "fixed-pacing-test"
+        }
+
+        fn on_packet_sent(&mut self, _bytes: u32, _bytes_in_flight: u32, _now_nanos: u64) {}
+
+        fn on_ack(&mut self, _sample: AckSample) -> RecoveryAction {
+            RecoveryAction {
+                cwnd: self.cwnd,
+                pacing_rate: self.pacing_rate,
+            }
+        }
+
+        fn on_congestion_event(&mut self, _event: CongestionEvent) -> RecoveryAction {
+            RecoveryAction {
+                cwnd: self.cwnd,
+                pacing_rate: self.pacing_rate,
+            }
+        }
+
+        fn congestion_window(&self) -> CongestionWindow {
+            self.cwnd
+        }
+
+        fn pacing_rate(&self) -> Option<PacingRate> {
+            self.pacing_rate
+        }
+    }
 
     fn endpoint(port: u16) -> TcpEndpoint {
         TcpEndpoint {
@@ -1318,6 +1392,31 @@ mod tests {
 
     fn established_socket() -> TcpSocket<BbrV3> {
         let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+        socket.mark_syn_queued(0);
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS,
+        );
+        socket.mark_ack_queued();
+        socket
+    }
+
+    fn established_fixed_pacing_socket(rate: PacingRate) -> TcpSocket<FixedPacing> {
+        let mut socket = TcpSocket::connect(
+            endpoint(49152),
+            peer(80),
+            7,
+            FixedPacing::new(CongestionWindow::new(16), Some(rate)),
+        );
         socket.mark_syn_queued(0);
         let _ = socket.on_segment(
             TcpPacket {
@@ -1505,8 +1604,11 @@ mod tests {
         let first = socket
             .take_transmit_segment(sent_at)
             .expect("first segment should transmit");
+        let second_send_at = socket
+            .next_deadline_nanos()
+            .expect("paced second segment should have a deadline");
         let second = socket
-            .take_transmit_segment(sent_at + 1)
+            .take_transmit_segment(second_send_at)
             .expect("second segment should transmit");
         let mut blocks = TcpSackBlocks::empty();
         blocks
@@ -1643,6 +1745,59 @@ mod tests {
 
         assert_eq!(socket.peer_receive_window(), 4);
         assert_eq!(socket.queue_send(b"abcdefghij"), 4);
+    }
+
+    #[test]
+    fn pacing_rate_delays_next_data_segment() {
+        let mut socket = established_fixed_pacing_socket(PacingRate::from_bytes_per_second(1_000));
+        assert_eq!(socket.queue_send(b"abcdefgh"), 8);
+        let first = socket
+            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 1)
+            .expect("first paced segment should transmit immediately");
+        assert_eq!(first.payload.as_ref(), b"abcdefgh");
+        assert_eq!(socket.queue_send(b"ijkl"), 4);
+        assert_eq!(
+            socket.next_deadline_nanos(),
+            Some(TCP_INITIAL_RTO_NANOS + 1 + 8_000_000)
+        );
+        assert_eq!(
+            socket.take_transmit_segment(TCP_INITIAL_RTO_NANOS + 2),
+            None
+        );
+
+        let second = socket
+            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 1 + 8_000_000)
+            .expect("paced deadline should release the next segment");
+        assert_eq!(second.payload.as_ref(), b"ijkl");
+    }
+
+    #[test]
+    fn paced_close_waits_for_queued_data_before_fin() {
+        let mut socket = established_fixed_pacing_socket(PacingRate::from_bytes_per_second(1_000));
+        assert_eq!(socket.queue_send(b"abcdefgh"), 8);
+        let first = socket
+            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 1)
+            .expect("first paced segment should transmit immediately");
+        assert_eq!(first.payload.as_ref(), b"abcdefgh");
+        assert_eq!(socket.queue_send(b"ijkl"), 4);
+
+        socket.close_send();
+        assert_eq!(socket.state(), TcpState::FinWait1);
+        assert_eq!(
+            socket.take_transmit_segment(TCP_INITIAL_RTO_NANOS + 2),
+            None
+        );
+
+        let second = socket
+            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 1 + 8_000_000)
+            .expect("paced data must be transmitted before FIN");
+        assert_eq!(second.payload.as_ref(), b"ijkl");
+
+        let fin = socket
+            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 1 + 12_000_000)
+            .expect("FIN should follow drained queued data");
+        assert!(fin.payload.is_empty());
+        assert!(fin.header.flags.contains(TcpFlags::FIN));
     }
 
     #[test]
