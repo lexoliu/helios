@@ -827,7 +827,7 @@ impl Stack {
                                     local,
                                     remote,
                                     header,
-                                    socket.pending_syn_options(),
+                                    socket.pending_syn_options(now.nanos()),
                                 ))
                                 .unwrap_or_else(|_| {
                                     panic!("TCP control transmit burst overflowed")
@@ -840,7 +840,7 @@ impl Stack {
                                     local,
                                     remote,
                                     header,
-                                    socket.pending_syn_ack_options(),
+                                    socket.pending_syn_ack_options(now.nanos()),
                                 ))
                                 .unwrap_or_else(|_| {
                                     panic!("TCP SYN-ACK transmit burst overflowed")
@@ -854,7 +854,13 @@ impl Stack {
                     }
                     if let Some(header) = socket.pending_ack() {
                         pending_ack
-                            .try_push((index, local, remote, header, socket.pending_ack_options()))
+                            .try_push((
+                                index,
+                                local,
+                                remote,
+                                header,
+                                socket.pending_ack_options(now.nanos()),
+                            ))
                             .unwrap_or_else(|_| panic!("TCP ACK transmit burst overflowed"));
                     }
                 }
@@ -2013,6 +2019,7 @@ mod tests {
         assert_eq!(syn_ack.options.maximum_segment_size(), Some(1460));
         assert_eq!(syn_ack.options.window_scale(), Some(2));
         assert!(syn_ack.options.sack_permitted());
+        assert!(syn_ack.options.timestamp().is_some());
 
         let (ack, ack_len) = tcp_segment(
             peer,

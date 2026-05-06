@@ -261,7 +261,7 @@ where
         self.in_flight
             .push_back(TcpInFlightSegment {
                 header,
-                options: syn_header_options(),
+                options: syn_header_options(now_nanos, None),
                 payload: Bytes::new(),
                 sequence_len: 1,
                 sent_at_nanos: now_nanos,
@@ -284,7 +284,10 @@ where
         self.in_flight
             .push_back(TcpInFlightSegment {
                 header,
-                options: syn_header_options(),
+                options: syn_header_options(
+                    now_nanos,
+                    self.peer_timestamp.map(|timestamp| timestamp.value),
+                ),
                 payload: Bytes::new(),
                 sequence_len: 1,
                 sent_at_nanos: now_nanos,
@@ -317,35 +320,37 @@ where
         self.delayed_ack_deadline_nanos = None;
     }
 
-    pub fn pending_ack_options(&self) -> TcpHeaderOptions {
-        if !self.peer_sack_permitted {
-            return TcpHeaderOptions::empty();
-        }
+    pub fn pending_ack_options(&self, now_nanos: u64) -> TcpHeaderOptions {
         let mut blocks = TcpSackBlocks::empty();
-        for segment in &self.out_of_order {
-            if blocks
-                .push(TcpSackBlock {
-                    left_edge: segment.sequence,
-                    right_edge: segment_end_from_parts(segment.sequence, segment.payload.len()),
-                })
-                .is_err()
-            {
-                break;
+        if self.peer_sack_permitted {
+            for segment in &self.out_of_order {
+                if blocks
+                    .push(TcpSackBlock {
+                        left_edge: segment.sequence,
+                        right_edge: segment_end_from_parts(segment.sequence, segment.payload.len()),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
         }
-        TcpHeaderOptions::empty().with_sack_blocks(blocks)
+        self.timestamped_options(now_nanos).with_sack_blocks(blocks)
     }
 
     pub const fn advertised_window(&self) -> u16 {
         self.advertised_window
     }
 
-    pub const fn pending_syn_options(&self) -> TcpHeaderOptions {
-        syn_header_options()
+    pub fn pending_syn_options(&self, now_nanos: u64) -> TcpHeaderOptions {
+        syn_header_options(now_nanos, None)
     }
 
-    pub const fn pending_syn_ack_options(&self) -> TcpHeaderOptions {
-        syn_header_options()
+    pub fn pending_syn_ack_options(&self, now_nanos: u64) -> TcpHeaderOptions {
+        syn_header_options(
+            now_nanos,
+            self.peer_timestamp.map(|timestamp| timestamp.value),
+        )
     }
 
     pub const fn peer_max_segment_size(&self) -> usize {
@@ -452,7 +457,7 @@ where
         self.in_flight
             .push_back(TcpInFlightSegment {
                 header,
-                options: TcpHeaderOptions::empty(),
+                options: self.timestamped_options(now_nanos),
                 payload: Bytes::new(),
                 sequence_len: 1,
                 sent_at_nanos: now_nanos,
@@ -464,7 +469,7 @@ where
             local,
             remote,
             header,
-            options: TcpHeaderOptions::empty(),
+            options: self.timestamped_options(now_nanos),
             payload: Bytes::new(),
             sequence_len: 1,
             retransmission: false,
@@ -531,7 +536,7 @@ where
         self.in_flight
             .push_back(TcpInFlightSegment {
                 header,
-                options: TcpHeaderOptions::empty(),
+                options: self.timestamped_options(now_nanos),
                 payload: payload.clone(),
                 sequence_len,
                 sent_at_nanos: now_nanos,
@@ -545,7 +550,7 @@ where
             local,
             remote,
             header,
-            options: TcpHeaderOptions::empty(),
+            options: self.timestamped_options(now_nanos),
             payload,
             sequence_len,
             retransmission: false,
@@ -678,6 +683,7 @@ where
             };
         }
         self.update_peer_receive_window(packet.window_size);
+        self.record_peer_timestamp(packet.options.timestamp());
 
         match self.state {
             TcpState::SynSent if packet.flags.contains(TcpFlags::SYN.union(TcpFlags::ACK)) => {
@@ -1102,7 +1108,13 @@ where
             self.update_peer_receive_window(packet.window_size);
         }
         self.peer_sack_permitted = packet.options.sack_permitted();
-        self.peer_timestamp = packet.options.timestamp();
+        self.record_peer_timestamp(packet.options.timestamp());
+    }
+
+    fn record_peer_timestamp(&mut self, timestamp: Option<TcpTimestampOption>) {
+        if let Some(timestamp) = timestamp {
+            self.peer_timestamp = Some(timestamp);
+        }
     }
 
     fn update_peer_receive_window(&mut self, window_size: u16) {
@@ -1119,6 +1131,16 @@ where
             .peer_receive_window
             .saturating_sub(self.bytes_in_flight);
         congestion_window.min(receive_window) as usize
+    }
+
+    fn timestamped_options(&self, now_nanos: u64) -> TcpHeaderOptions {
+        let Some(peer_timestamp) = self.peer_timestamp else {
+            return TcpHeaderOptions::empty();
+        };
+        TcpHeaderOptions::empty().with_timestamp(TcpTimestampOption {
+            value: timestamp_value(now_nanos),
+            echo_reply: peer_timestamp.value,
+        })
     }
 
     fn request_ack(&mut self) {
@@ -1152,11 +1174,15 @@ fn receive_window_size(queued_bytes: usize, scale: u8) -> u16 {
     (bytes >> scale).min(u16::MAX as usize) as u16
 }
 
-const fn syn_header_options() -> TcpHeaderOptions {
+fn syn_header_options(now_nanos: u64, echo_reply: Option<u32>) -> TcpHeaderOptions {
     TcpHeaderOptions::empty()
         .with_maximum_segment_size(TCP_RECEIVE_SEGMENT_BYTES as u16)
         .with_window_scale(TCP_LOCAL_WINDOW_SCALE)
         .with_sack_permitted()
+        .with_timestamp(TcpTimestampOption {
+            value: timestamp_value(now_nanos),
+            echo_reply: echo_reply.unwrap_or(0),
+        })
 }
 
 fn segment_end(segment: &TcpInFlightSegment) -> u32 {
@@ -1173,6 +1199,10 @@ fn sequence_leq(lhs: u32, rhs: u32) -> bool {
 
 fn sequence_lt(lhs: u32, rhs: u32) -> bool {
     lhs != rhs && sequence_leq(lhs, rhs)
+}
+
+fn timestamp_value(now_nanos: u64) -> u32 {
+    (now_nanos / 1_000_000) as u32
 }
 
 fn rto_nanos(retransmissions: u8) -> u64 {
@@ -2052,11 +2082,44 @@ mod tests {
         );
 
         assert_eq!(
-            socket.pending_ack_options().sack_blocks().as_slice(),
+            socket
+                .pending_ack_options(TCP_INITIAL_RTO_NANOS + 2)
+                .sack_blocks()
+                .as_slice(),
             &[TcpSackBlock {
                 left_edge: 104,
                 right_edge: 107,
             }]
+        );
+    }
+
+    #[test]
+    fn pending_ack_options_echo_peer_timestamp() {
+        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+        socket.mark_syn_queued(0);
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+                options: TcpOptions::parse(&[8, 10, 0, 0, 0, 9, 0, 0, 0, 0])
+                    .expect("timestamp option should parse"),
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS,
+        );
+
+        assert_eq!(
+            socket
+                .pending_ack_options(TCP_INITIAL_RTO_NANOS + 2_000_000)
+                .timestamp(),
+            Some(TcpTimestampOption {
+                value: timestamp_value(TCP_INITIAL_RTO_NANOS + 2_000_000),
+                echo_reply: 9,
+            })
         );
     }
 

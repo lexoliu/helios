@@ -672,6 +672,10 @@ impl TcpHeaderOptions {
         self
     }
 
+    pub const fn timestamp(self) -> Option<TcpTimestampOption> {
+        self.timestamp
+    }
+
     pub fn encoded_len(self) -> usize {
         let maximum_segment_size_len = match self.maximum_segment_size {
             Some(_) => 4,
