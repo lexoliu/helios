@@ -1,5 +1,7 @@
 use crate::{IpProtocol, Ipv4Address, Ipv6Address};
 
+const WIDE_CHECKSUM_MIN_BYTES: usize = 64;
+
 pub fn internet_checksum(bytes: &[u8]) -> u16 {
     finish_checksum(sum_words(bytes))
 }
@@ -80,10 +82,13 @@ fn ipv6_pseudo_sum(
 }
 
 fn sum_words(bytes: &[u8]) -> u32 {
-    sum_words_wide(bytes)
+    if bytes.len() < WIDE_CHECKSUM_MIN_BYTES {
+        sum_words_scalar(bytes)
+    } else {
+        sum_words_wide(bytes)
+    }
 }
 
-#[cfg(test)]
 fn sum_words_scalar(bytes: &[u8]) -> u32 {
     let mut chunks = bytes.chunks_exact(2);
     let mut sum = chunks
