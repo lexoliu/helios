@@ -1748,6 +1748,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-perf"
+version = "0.1.0"
+dependencies = [
+ "helios-api",
+]
+
+[[package]]
 name = "helios-riscv"
 version = "0.1.0"
 dependencies = [

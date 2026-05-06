@@ -403,6 +403,10 @@ struct AotBenchCommand {
     /// Write folded user-only profile samples collected during the AOT run.
     #[arg(long)]
     user_profile_output: Option<PathBuf>,
+
+    /// Write structured kernel/user perf metrics collected during the AOT run.
+    #[arg(long)]
+    perf_metrics_output: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -731,9 +735,13 @@ fn run_workload_bench(
             scope: None,
             stack_prefixes: Vec::new(),
         };
+        let metric_filter = system_profiling::MetricFilter {
+            name_prefixes: Vec::new(),
+        };
         let collect_profile = command.profile_output.is_some()
             || command.kernel_profile_output.is_some()
-            || command.user_profile_output.is_some();
+            || command.user_profile_output.is_some()
+            || command.perf_metrics_output.is_some();
         let before_profile = if collect_profile {
             system_profiling::clear(&client)
                 .await
@@ -757,7 +765,10 @@ fn run_workload_bench(
             let after_profile = system_profiling::folded(&client, &profile_filter, 0)
                 .await
                 .context("failed to read final remote profile samples")?;
-            write_requested_profile_outputs(&command, &before_profile, &after_profile)?;
+            let metrics = system_profiling::metrics(&client, &metric_filter, 0)
+                .await
+                .context("failed to read final remote perf metrics")?;
+            write_requested_profile_outputs(&command, &before_profile, &after_profile, &metrics)?;
         }
         Ok(())
     })
@@ -777,9 +788,13 @@ fn run_aot_bench(client: crate::serial::RpcClient, command: AotBenchCommand) -> 
             scope: None,
             stack_prefixes: Vec::new(),
         };
+        let metric_filter = system_profiling::MetricFilter {
+            name_prefixes: Vec::new(),
+        };
         let collect_profile = command.profile_output.is_some()
             || command.kernel_profile_output.is_some()
-            || command.user_profile_output.is_some();
+            || command.user_profile_output.is_some()
+            || command.perf_metrics_output.is_some();
         let before_profile = if collect_profile {
             system_profiling::clear(&client)
                 .await
@@ -842,7 +857,10 @@ fn run_aot_bench(client: crate::serial::RpcClient, command: AotBenchCommand) -> 
             let after_profile = system_profiling::folded(&client, &profile_filter, 0)
                 .await
                 .context("failed to read final remote profile samples")?;
-            write_requested_profile_outputs(&command, &before_profile, &after_profile)?;
+            let metrics = system_profiling::metrics(&client, &metric_filter, 0)
+                .await
+                .context("failed to read final remote perf metrics")?;
+            write_requested_profile_outputs(&command, &before_profile, &after_profile, &metrics)?;
         }
         Ok(())
     })
@@ -852,6 +870,7 @@ trait ProfileOutputRequest {
     fn profile_output(&self) -> Option<&Path>;
     fn kernel_profile_output(&self) -> Option<&Path>;
     fn user_profile_output(&self) -> Option<&Path>;
+    fn perf_metrics_output(&self) -> Option<&Path>;
 }
 
 impl ProfileOutputRequest for AotBenchCommand {
@@ -865,6 +884,10 @@ impl ProfileOutputRequest for AotBenchCommand {
 
     fn user_profile_output(&self) -> Option<&Path> {
         self.user_profile_output.as_deref()
+    }
+
+    fn perf_metrics_output(&self) -> Option<&Path> {
+        self.perf_metrics_output.as_deref()
     }
 }
 
@@ -880,12 +903,17 @@ impl ProfileOutputRequest for WorkloadBenchCommand {
     fn user_profile_output(&self) -> Option<&Path> {
         self.user_profile_output.as_deref()
     }
+
+    fn perf_metrics_output(&self) -> Option<&Path> {
+        self.perf_metrics_output.as_deref()
+    }
 }
 
 fn write_requested_profile_outputs(
     command: &impl ProfileOutputRequest,
     before_profile: &[system_profiling::FoldedSample],
     after_profile: &[system_profiling::FoldedSample],
+    metrics: &[system_profiling::MetricSample],
 ) -> Result<()> {
     use std::io::Write as _;
 
@@ -917,6 +945,12 @@ fn write_requested_profile_outputs(
         let mut stderr = std::io::stderr().lock();
         writeln!(stderr, "user_profile_output={}", output.display())?;
     }
+    if let Some(output) = command.perf_metrics_output() {
+        write_perf_metrics_output(output, metrics)
+            .with_context(|| format!("failed to write {}", output.display()))?;
+        let mut stderr = std::io::stderr().lock();
+        writeln!(stderr, "perf_metrics_output={}", output.display())?;
+    }
     Ok(())
 }
 
@@ -927,6 +961,15 @@ fn write_profile_output(
     scope: Option<system_profiling::Scope>,
 ) -> Result<()> {
     fs::write(output, diff_folded_profile(before, after, scope))?;
+    Ok(())
+}
+
+fn write_perf_metrics_output(
+    output: &Path,
+    metrics: &[system_profiling::MetricSample],
+) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(metrics)?;
+    fs::write(output, bytes)?;
     Ok(())
 }
 

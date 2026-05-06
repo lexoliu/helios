@@ -43,6 +43,10 @@ pub(crate) struct WorkloadBenchCommand {
     /// Write folded user-only profile samples collected during the workload run.
     #[arg(long)]
     pub(crate) user_profile_output: Option<PathBuf>,
+
+    /// Write structured kernel/user perf metrics collected during the workload run.
+    #[arg(long)]
+    pub(crate) perf_metrics_output: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
@@ -593,6 +597,7 @@ mod tests {
             profile_output: None,
             kernel_profile_output: None,
             user_profile_output: None,
+            perf_metrics_output: None,
         };
         let workloads = select_workloads(&command).expect("manifest must parse");
         assert!(
@@ -626,6 +631,7 @@ mod tests {
             profile_output: None,
             kernel_profile_output: None,
             user_profile_output: None,
+            perf_metrics_output: None,
         };
         let workloads = select_workloads(&command).expect("manifest must parse");
         assert!(
