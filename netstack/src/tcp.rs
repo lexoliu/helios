@@ -110,6 +110,8 @@ where
     syn_ack_queued: bool,
     fin_queued: bool,
     ack_pending: bool,
+    duplicate_ack_count: u8,
+    fast_retransmit_pending: bool,
     delayed_ack_deadline_nanos: Option<u64>,
     time_wait_deadline_nanos: Option<u64>,
     unacked_receive_segments: u8,
@@ -145,6 +147,8 @@ where
             syn_ack_queued: false,
             fin_queued: false,
             ack_pending: false,
+            duplicate_ack_count: 0,
+            fast_retransmit_pending: false,
             delayed_ack_deadline_nanos: None,
             time_wait_deadline_nanos: None,
             unacked_receive_segments: 0,
@@ -534,7 +538,9 @@ where
 
     pub fn pending_retransmission(&self, now_nanos: u64) -> Option<TcpTransmitSegment> {
         let in_flight = self.in_flight.front()?;
-        if now_nanos.saturating_sub(in_flight.sent_at_nanos) < rto_nanos(in_flight.retransmissions)
+        if !self.fast_retransmit_pending
+            && now_nanos.saturating_sub(in_flight.sent_at_nanos)
+                < rto_nanos(in_flight.retransmissions)
         {
             return None;
         }
@@ -552,6 +558,10 @@ where
     }
 
     pub fn mark_retransmission_queued(&mut self, sequence: u32, now_nanos: u64) {
+        let fast_retransmit = self.fast_retransmit_pending;
+        if fast_retransmit {
+            self.fast_retransmit_pending = false;
+        }
         let Some(in_flight) = self
             .in_flight
             .iter_mut()
@@ -567,8 +577,10 @@ where
             self.in_flight.clear();
             return;
         }
-        self.congestion
-            .on_congestion_event(CongestionEvent::RetransmissionTimeout { now_nanos });
+        if !fast_retransmit {
+            self.congestion
+                .on_congestion_event(CongestionEvent::RetransmissionTimeout { now_nanos });
+        }
     }
 
     pub fn receive(&mut self, max_bytes: usize) -> Option<Bytes> {
@@ -752,11 +764,15 @@ where
         app_limited: bool,
     ) -> Option<RecoveryAction> {
         if sequence_leq(acknowledgement, self.send_unacknowledged) {
-            return None;
+            return (acknowledgement == self.send_unacknowledged)
+                .then(|| self.note_duplicate_ack(now_nanos))
+                .flatten();
         }
         let acked = acknowledgement.wrapping_sub(self.send_unacknowledged);
         let timing = self.ack_sample_timing(acknowledgement, now_nanos);
         self.send_unacknowledged = acknowledgement;
+        self.duplicate_ack_count = 0;
+        self.fast_retransmit_pending = false;
         self.bytes_in_flight = self.bytes_in_flight.saturating_sub(acked);
         self.discard_acked_segments(acknowledgement);
         self.delivered_bytes = self.delivered_bytes.saturating_add(u64::from(acked));
@@ -777,6 +793,25 @@ where
             now_nanos,
             app_limited,
         }))
+    }
+
+    fn note_duplicate_ack(&mut self, now_nanos: u64) -> Option<RecoveryAction> {
+        let Some(segment) = self.in_flight.front() else {
+            return None;
+        };
+        self.duplicate_ack_count = self.duplicate_ack_count.saturating_add(1);
+        if self.duplicate_ack_count < 3 || self.fast_retransmit_pending {
+            return None;
+        }
+        self.fast_retransmit_pending = true;
+        Some(
+            self.congestion
+                .on_congestion_event(CongestionEvent::PacketLoss {
+                    lost_bytes: segment.sequence_len,
+                    bytes_in_flight: self.bytes_in_flight,
+                    now_nanos,
+                }),
+        )
     }
 
     fn ack_sample_timing(&self, acknowledgement: u32, now_nanos: u64) -> TcpAckTiming {
@@ -1208,6 +1243,39 @@ mod tests {
                 interval_nanos: 123,
             }
         );
+    }
+
+    #[test]
+    fn three_duplicate_acks_queue_fast_retransmit_before_rto() {
+        let mut socket = established_socket();
+        assert_eq!(socket.queue_send(b"hello"), 5);
+        let sent_at = TCP_INITIAL_RTO_NANOS + 7;
+        let data = socket
+            .take_transmit_segment(sent_at)
+            .expect("established socket should transmit queued bytes");
+
+        for index in 0..3 {
+            let _ = socket.on_segment(
+                TcpPacket {
+                    source_port: 80,
+                    destination_port: 49152,
+                    sequence: 101,
+                    acknowledgement: data.header.sequence,
+                    flags: TcpFlags::ACK,
+                    window_size: u16::MAX,
+                    options: TcpOptions::empty(),
+                    payload: &[],
+                },
+                sent_at + index,
+            );
+        }
+
+        let retransmit = socket
+            .pending_retransmission(sent_at + 3)
+            .expect("third duplicate ACK should trigger fast retransmit");
+        assert!(retransmit.retransmission);
+        assert_eq!(retransmit.header.sequence, data.header.sequence);
+        assert_eq!(retransmit.payload, data.payload);
     }
 
     #[test]
