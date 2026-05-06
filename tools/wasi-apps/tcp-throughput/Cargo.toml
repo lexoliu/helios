@@ -1,0 +1,16 @@
+[package]
+name = "helios-tcp-throughput-wasi"
+version = "0.1.0"
+edition = "2024"
+autobins = false
+
+[dependencies]
+helios-api = { path = "../../../api", default-features = false, features = ["net"] }
+thiserror = "2.0.17"
+
+[lib]
+name = "helios_tcp_throughput_wasi"
+path = "src/main.rs"
+crate-type = ["cdylib"]
+
+[workspace]

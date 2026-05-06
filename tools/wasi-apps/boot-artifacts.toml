@@ -89,6 +89,14 @@ bootfs_path = "bin/curl"
 source = "artifacts/wasi-tools/curl.wasm"
 
 [[artifact]]
+command = "tcp-throughput"
+package = "helios-tcp-throughput-wasi"
+version = "0.1.0"
+source_url = "tools/wasi-apps/tcp-throughput"
+bootfs_path = "bin/tcp-throughput"
+source = "artifacts/wasi-tools/tcp-throughput.wasm"
+
+[[artifact]]
 command = "wasix-thread-futex"
 package = "helios-wasix-conformance"
 version = "0.1.0"

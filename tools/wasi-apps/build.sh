@@ -6,7 +6,7 @@
 #   from `brettcannon/cpython-wasi-build`, runs it through the wasi
 #   preview1→p2 adapter shipped alongside wasmtime, and stashes the
 #   component + stdlib under `$out_dir/../python3-root`.
-# - Builds our Rust `curl-wasi` from source.
+# - Builds our Rust `curl-wasi` and raw TCP throughput tool from source.
 # - Stages standard Wasmer WASIX/WASI shell and language artifacts used by
 #   the boot filesystem.
 #
@@ -190,5 +190,16 @@ cp -f \
 
 wasm-tools strip "$out_dir/curl.wasm" -o "$out_dir/curl-stripped.wasm"
 
+env "${build_env[@]}" cargo build \
+  --manifest-path "$repo_root/tools/wasi-apps/tcp-throughput/Cargo.toml" \
+  --target wasm32-wasip2 \
+  --release
+
+cp -f \
+  "$repo_root/tools/wasi-apps/tcp-throughput/target/wasm32-wasip2/release/helios_tcp_throughput_wasi.wasm" \
+  "$out_dir/tcp-throughput.wasm"
+
+wasm-tools strip "$out_dir/tcp-throughput.wasm" -o "$out_dir/tcp-throughput-stripped.wasm"
+
 echo "wasi artifacts written to: $out_dir and $python_root"
-ls -lh "$out_dir"/curl*.wasm
+ls -lh "$out_dir"/{curl,tcp-throughput}*.wasm

@@ -18,6 +18,7 @@ LINUX_PLACEHOLDERS = {
     "{python3}": "python3",
     "{quickjs}": "qjs",
     "{simd_lanes}": "python3 -c 'print(\"simd-lanes:17\")'",
+    "{tcp_throughput}": "python3 {repo_root}/tools/wasi-apps/linux_tcp_throughput_client.py",
 }
 
 HTTP_LARGE_PAYLOAD_FILE = "payload-64m.bin"
@@ -30,10 +31,17 @@ def large_http_url(host_http_url: str) -> str:
     return f"{prefix}/{HTTP_LARGE_PAYLOAD_FILE}"
 
 
-def render_template(template: str, host_http_url: str | None, workload: dict) -> str:
+def render_template(
+    template: str,
+    host_http_url: str | None,
+    host_tcp_host: str | None,
+    host_tcp_port: int | None,
+    workload: dict,
+) -> str:
     rendered = template
     for placeholder, value in LINUX_PLACEHOLDERS.items():
         rendered = rendered.replace(placeholder, value)
+    rendered = rendered.replace("{repo_root}", str(Path(__file__).resolve().parents[2]))
     if "{host_http_url}" in rendered:
         if not host_http_url:
             raise SystemExit(f"workload {workload['name']} requires --host-http-url")
@@ -42,6 +50,14 @@ def render_template(template: str, host_http_url: str | None, workload: dict) ->
         if not host_http_url:
             raise SystemExit(f"workload {workload['name']} requires --host-http-url")
         rendered = rendered.replace("{host_http_large_url}", large_http_url(host_http_url))
+    if "{host_tcp_host}" in rendered:
+        if not host_tcp_host:
+            raise SystemExit(f"workload {workload['name']} requires --host-tcp-host")
+        rendered = rendered.replace("{host_tcp_host}", host_tcp_host)
+    if "{host_tcp_port}" in rendered:
+        if host_tcp_port is None:
+            raise SystemExit(f"workload {workload['name']} requires --host-tcp-port")
+        rendered = rendered.replace("{host_tcp_port}", str(host_tcp_port))
     return rendered
 
 
@@ -60,24 +76,37 @@ def selected_workload(manifest: dict, name: str) -> dict:
     raise SystemExit(f"unknown workload {name}")
 
 
-def render_command(workload: dict, host_http_url: str | None) -> str:
+def render_command(
+    workload: dict,
+    host_http_url: str | None,
+    host_tcp_host: str | None,
+    host_tcp_port: int | None,
+) -> str:
     if workload["runner"] != "shell":
         raise SystemExit(f"workload {workload['name']} is not a native Linux shell workload")
     command = workload.get("command")
     if not command:
         raise SystemExit(f"workload {workload['name']} is missing command")
-    return render_template(command, host_http_url, workload)
+    return render_template(command, host_http_url, host_tcp_host, host_tcp_port, workload)
 
 
-def render_program(workload: dict, host_http_url: str | None) -> list[str]:
+def render_program(
+    workload: dict,
+    host_http_url: str | None,
+    host_tcp_host: str | None,
+    host_tcp_port: int | None,
+) -> list[str]:
     if workload["runner"] != "program":
         raise SystemExit(f"workload {workload['name']} is not a native Linux program workload")
     program = workload.get("program")
     if not program:
         raise SystemExit(f"workload {workload['name']} is missing program")
-    rendered = shlex.split(render_template(program, host_http_url, workload))
+    rendered = shlex.split(
+        render_template(program, host_http_url, host_tcp_host, host_tcp_port, workload)
+    )
     rendered.extend(
-        render_template(arg, host_http_url, workload) for arg in workload.get("args", [])
+        render_template(arg, host_http_url, host_tcp_host, host_tcp_port, workload)
+        for arg in workload.get("args", [])
     )
     return rendered
 
@@ -102,6 +131,8 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--workload", required=True)
     parser.add_argument("--host-http-url")
+    parser.add_argument("--host-tcp-host")
+    parser.add_argument("--host-tcp-port", type=int)
     args = parser.parse_args()
 
     manifest = load_manifest(args.manifest)
@@ -110,7 +141,16 @@ def main() -> None:
     env["HELIOS_PROCESS_ID"] = str(os.getpid())
     if workload["runner"] == "shell":
         completed = subprocess.run(
-            ["/bin/sh", "-c", render_command(workload, args.host_http_url)],
+            [
+                "/bin/sh",
+                "-c",
+                render_command(
+                    workload,
+                    args.host_http_url,
+                    args.host_tcp_host,
+                    args.host_tcp_port,
+                ),
+            ],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -118,7 +158,12 @@ def main() -> None:
         )
     elif workload["runner"] == "program":
         completed = subprocess.run(
-            render_program(workload, args.host_http_url),
+            render_program(
+                workload,
+                args.host_http_url,
+                args.host_tcp_host,
+                args.host_tcp_port,
+            ),
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

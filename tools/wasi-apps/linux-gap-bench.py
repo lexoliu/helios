@@ -14,12 +14,13 @@ import time
 import tomllib
 from pathlib import Path
 
+from tcp_throughput_server import DEFAULT_PAYLOAD_BYTES, start_tcp_throughput_server
 
 DEFAULT_IMAGE = "debian:trixie"
 HTTP_PAYLOAD_FILE = "payload.txt"
 HTTP_LARGE_PAYLOAD_FILE = "payload-64m.bin"
 HTTP_PAYLOAD = b"helios-linux-gap:ok\n"
-HTTP_LARGE_PAYLOAD_BYTES = 64 * 1024 * 1024
+HTTP_LARGE_PAYLOAD_BYTES = DEFAULT_PAYLOAD_BYTES
 HTTP_LARGE_PAYLOAD_CHUNK = bytes(range(251))
 DEFAULT_MAX_HOST_LOAD_PER_CPU = 0.75
 TOP_CPU_PROCESS_LIMIT = 8
@@ -214,6 +215,8 @@ def run_helios(
     workloads: list[dict],
     arch: str,
     host_http_url: str | None,
+    host_tcp_host: str | None,
+    host_tcp_port: int | None,
 ) -> Path:
     log = out_dir / "helios.jsonl"
     workloads_by_class: dict[str, list[str]] = {}
@@ -232,6 +235,8 @@ def run_helios(
                 workload_names,
                 arch,
                 host_http_url,
+                host_tcp_host,
+                host_tcp_port,
             )
             class_logs.append(class_log)
         with log.open("w", encoding="utf-8") as output_handle:
@@ -247,6 +252,8 @@ def run_helios(
         [workload["name"] for workload in workloads],
         arch,
         host_http_url,
+        host_tcp_host,
+        host_tcp_port,
     )
     return log
 
@@ -259,6 +266,8 @@ def run_helios_once(
     names: list[str],
     arch: str,
     host_http_url: str | None,
+    host_tcp_host: str | None,
+    host_tcp_port: int | None,
 ) -> None:
     env = os.environ.copy()
     env["HELIOS_WORKLOAD_BENCH_ARCH"] = arch
@@ -273,6 +282,10 @@ def run_helios_once(
         env["HELIOS_WORKLOAD_BENCH_WORKLOADS"] = ",".join(names)
     if host_http_url:
         env["HELIOS_WORKLOAD_BENCH_HOST_HTTP_URL"] = host_http_url
+    if host_tcp_host:
+        env["HELIOS_WORKLOAD_BENCH_HOST_TCP_HOST"] = host_tcp_host
+    if host_tcp_port is not None:
+        env["HELIOS_WORKLOAD_BENCH_HOST_TCP_PORT"] = str(host_tcp_port)
     run(["tools/wasi-apps/workload-bench.sh"], env=env)
 
 
@@ -284,6 +297,7 @@ def run_linux(
     image: str,
     host_http_url: str | None,
     linux_http_port: int,
+    linux_tcp_port: int | None,
 ) -> tuple[Path | None, str]:
     native_workloads = [
         workload for workload in workloads if workload["runner"] in ("shell", "program")
@@ -299,12 +313,27 @@ def run_linux(
         "mkdir -p /bench",
         "cd /bench",
     ]
+    needs_server_trap = host_http_url or linux_tcp_port is not None
+    if needs_server_trap:
+        command.append("server_pids=()")
+        command.append("trap 'kill ${server_pids[@]} 2>/dev/null || true' EXIT")
     if host_http_url:
         command.extend(
             [
                 f"python3 -m http.server {linux_http_port} --bind 127.0.0.1 --directory /out/http-root >/tmp/helios-gap-http.log 2>&1 &",
-                "server_pid=$!",
-                "trap 'kill ${server_pid}' EXIT",
+                "server_pids+=(\"$!\")",
+            ]
+        )
+    if linux_tcp_port is not None:
+        command.extend(
+            [
+                f"python3 /repo/tools/wasi-apps/tcp_throughput_server.py --host 127.0.0.1 --port {linux_tcp_port} --payload-bytes {HTTP_LARGE_PAYLOAD_BYTES} >/tmp/helios-gap-tcp.log 2>&1 &",
+                "server_pids+=(\"$!\")",
+            ]
+        )
+    if needs_server_trap:
+        command.extend(
+            [
                 "sleep 0.2",
             ]
         )
@@ -317,6 +346,7 @@ def run_linux(
         "/out/linux-hyperfine.json",
     ]
     linux_http_url = f"http://127.0.0.1:{linux_http_port}/{HTTP_PAYLOAD_FILE}" if host_http_url else None
+    linux_tcp_host = "127.0.0.1" if linux_tcp_port is not None else None
     for workload in native_workloads:
         runner = [
             "python3",
@@ -328,6 +358,9 @@ def run_linux(
         ]
         if linux_http_url:
             runner.extend(["--host-http-url", linux_http_url])
+        if linux_tcp_host and linux_tcp_port is not None:
+            runner.extend(["--host-tcp-host", linux_tcp_host])
+            runner.extend(["--host-tcp-port", str(linux_tcp_port)])
         hyperfine.extend(["--command-name", workload["name"], " ".join(shlex.quote(part) for part in runner)])
     command.append(" ".join(shlex.quote(part) for part in hyperfine))
     docker_script = "\n".join(command)
@@ -647,8 +680,8 @@ def write_throughput_svg(path: Path, rows: list[dict]) -> bool:
         '<?xml version="1.0" encoding="UTF-8"?>',
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#ffffff"/>',
-        '<text x="32" y="34" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="22" font-weight="700" fill="#111827">Local HTTP Throughput</text>',
-        '<text x="32" y="58" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#4b5563">Higher is better. Payloads are generated locally; no external network is used.</text>',
+        '<text x="32" y="34" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="22" font-weight="700" fill="#111827">Local Network Throughput</text>',
+        '<text x="32" y="58" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#4b5563">Higher is better. Raw TCP and HTTP payloads are generated locally; no external network is used.</text>',
         f'<line x1="{left}" y1="{top - 14}" x2="{left + chart_width}" y2="{top - 14}" stroke="#d1d5db" stroke-width="1"/>',
         f'<text x="{left}" y="{top - 22}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="12" fill="#6b7280">0 MiB/s</text>',
         f'<text x="{left + chart_width - 86}" y="{top - 22}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="12" fill="#6b7280">{max_rate:.1f} MiB/s</text>',
@@ -752,7 +785,7 @@ def write_report(
                 "",
                 "## Network Throughput",
                 "",
-                "![Local HTTP throughput](network-throughput.svg)",
+                "![Local network throughput](network-throughput.svg)",
                 "",
             ]
         )
@@ -856,7 +889,9 @@ def main() -> None:
     parser.add_argument("--arch", default="aarch64")
     parser.add_argument("--docker-image", default=DEFAULT_IMAGE)
     parser.add_argument("--helios-host-http-host", default="10.0.2.2")
+    parser.add_argument("--helios-host-tcp-host", default="10.0.2.2")
     parser.add_argument("--linux-http-port", type=int, default=18080)
+    parser.add_argument("--linux-tcp-port", type=int, default=18081)
     parser.add_argument("--out-dir", type=Path)
     parser.add_argument("--skip-helios", action="store_true")
     parser.add_argument("--skip-linux", action="store_true")
@@ -895,13 +930,22 @@ def main() -> None:
 
     profile_workloads = selected_workloads(manifest, [], args.wasmtime_profile_workload) if args.wasmtime_profile_workload else []
     needs_http = any(workload.get("requires_host_http", False) for workload in workloads + profile_workloads)
+    needs_tcp = any(workload.get("requires_host_tcp", False) for workload in workloads)
     server = None
+    tcp_server = None
     host_http_url = None
     local_http_url = None
+    host_tcp_host = None
+    host_tcp_port = None
     if needs_http:
         server, port = start_host_http(http_root)
         host_http_url = f"http://{args.helios_host_http_host}:{port}/{HTTP_PAYLOAD_FILE}"
         local_http_url = f"http://127.0.0.1:{port}/{HTTP_PAYLOAD_FILE}"
+    if needs_tcp and not args.skip_helios:
+        tcp_server, port = start_tcp_throughput_server("127.0.0.1", 0, HTTP_LARGE_PAYLOAD_BYTES)
+        host_tcp_host = args.helios_host_tcp_host
+        host_tcp_port = port
+    linux_tcp_port = args.linux_tcp_port if needs_tcp and not args.skip_linux else None
 
     try:
         helios_jsonl = None
@@ -916,6 +960,8 @@ def main() -> None:
                 workloads,
                 args.arch,
                 host_http_url,
+                host_tcp_host,
+                host_tcp_port,
             )
         if not args.skip_linux:
             linux_json, docker_digest = run_linux(
@@ -926,6 +972,7 @@ def main() -> None:
                 args.docker_image,
                 host_http_url,
                 args.linux_http_port,
+                linux_tcp_port,
             )
         if args.wasmtime_profile_workload:
             wasmtime_profiles = run_wasmtime_profiles(
@@ -955,6 +1002,9 @@ def main() -> None:
         if server:
             server.shutdown()
             server.server_close()
+        if tcp_server:
+            tcp_server.shutdown()
+            tcp_server.server_close()
 
 
 if __name__ == "__main__":

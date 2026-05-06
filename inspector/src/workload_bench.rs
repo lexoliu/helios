@@ -32,6 +32,14 @@ pub(crate) struct WorkloadBenchCommand {
     #[arg(long)]
     host_http_url: Option<String>,
 
+    /// Host TCP address visible from inside the VM for raw TCP throughput workloads.
+    #[arg(long)]
+    host_tcp_host: Option<String>,
+
+    /// Host TCP port visible from inside the VM for raw TCP throughput workloads.
+    #[arg(long)]
+    host_tcp_port: Option<u16>,
+
     /// Write folded kernel/user profile samples collected during the workload run.
     #[arg(long)]
     pub(crate) profile_output: Option<PathBuf>,
@@ -91,6 +99,8 @@ struct Workload {
     stderr_empty: bool,
     #[serde(default)]
     requires_host_http: bool,
+    #[serde(default)]
+    requires_host_tcp: bool,
     #[serde(default)]
     wasm_path: Option<PathBuf>,
     #[serde(default)]
@@ -467,6 +477,7 @@ fn render_helios_template(
         ("{python3}", "/bin/python3"),
         ("{quickjs}", "/bin/qjs"),
         ("{simd_lanes}", "/bin/simd-lanes"),
+        ("{tcp_throughput}", "/bin/tcp-throughput"),
     ] {
         rendered = rendered.replace(placeholder, value);
     }
@@ -493,6 +504,32 @@ fn render_helios_template(
             )
         })?;
         rendered = rendered.replace("{host_http_large_url}", &large_host_http_url(url)?);
+    }
+    if workload.requires_host_tcp
+        && (command.host_tcp_host.is_none() || command.host_tcp_port.is_none())
+    {
+        bail!(
+            "workload {} requires --host-tcp-host and --host-tcp-port for VM-visible host TCP",
+            workload.name
+        );
+    }
+    if rendered.contains("{host_tcp_host}") {
+        let host = command.host_tcp_host.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "workload {} requires --host-tcp-host for VM-visible host TCP",
+                workload.name
+            )
+        })?;
+        rendered = rendered.replace("{host_tcp_host}", host);
+    }
+    if rendered.contains("{host_tcp_port}") {
+        let port = command.host_tcp_port.ok_or_else(|| {
+            anyhow::anyhow!(
+                "workload {} requires --host-tcp-port for VM-visible host TCP",
+                workload.name
+            )
+        })?;
+        rendered = rendered.replace("{host_tcp_port}", &port.to_string());
     }
     Ok(rendered)
 }
@@ -619,6 +656,8 @@ mod tests {
             workloads: Vec::new(),
             classes: Vec::new(),
             host_http_url: None,
+            host_tcp_host: None,
+            host_tcp_port: None,
             profile_output: None,
             kernel_profile_output: None,
             user_profile_output: None,
@@ -645,6 +684,12 @@ mod tests {
             .find(|workload| workload.name == "curl-http-throughput")
             .expect("manifest must contain HTTP throughput workload");
         assert_eq!(throughput.throughput_bytes, Some(67_108_864));
+        let tcp_throughput = workloads
+            .iter()
+            .find(|workload| workload.name == "tcp-throughput")
+            .expect("manifest must contain raw TCP throughput workload");
+        assert!(tcp_throughput.requires_host_tcp);
+        assert_eq!(tcp_throughput.throughput_bytes, Some(67_108_864));
     }
 
     #[test]
@@ -658,6 +703,8 @@ mod tests {
             workloads: Vec::new(),
             classes: vec![WorkloadClass::IoBound],
             host_http_url: None,
+            host_tcp_host: None,
+            host_tcp_port: None,
             profile_output: None,
             kernel_profile_output: None,
             user_profile_output: None,

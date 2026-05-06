@@ -53,6 +53,14 @@ if [[ -n "${HELIOS_WORKLOAD_BENCH_HOST_HTTP_URL:-}" ]]; then
     command+=(--host-http-url "${HELIOS_WORKLOAD_BENCH_HOST_HTTP_URL}")
 fi
 
+if [[ -n "${HELIOS_WORKLOAD_BENCH_HOST_TCP_HOST:-}" ]]; then
+    command+=(--host-tcp-host "${HELIOS_WORKLOAD_BENCH_HOST_TCP_HOST}")
+fi
+
+if [[ -n "${HELIOS_WORKLOAD_BENCH_HOST_TCP_PORT:-}" ]]; then
+    command+=(--host-tcp-port "${HELIOS_WORKLOAD_BENCH_HOST_TCP_PORT}")
+fi
+
 if [[ -n "${HELIOS_WORKLOAD_BENCH_PROFILE_OUTPUT:-}" ]]; then
     command+=(--profile-output "${HELIOS_WORKLOAD_BENCH_PROFILE_OUTPUT}")
 fi

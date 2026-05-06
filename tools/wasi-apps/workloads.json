@@ -132,6 +132,23 @@
       "requires_host_http": true
     },
     {
+      "name": "tcp-throughput",
+      "class": "io-bound",
+      "runner": "program",
+      "description": "Read and discard a deterministic 64 MiB stream from a raw local TCP server.",
+      "program": "{tcp_throughput}",
+      "args": [
+        "{host_tcp_host}",
+        "{host_tcp_port}",
+        "67108864"
+      ],
+      "boot_programs": ["tcp-throughput"],
+      "stdout_contains": ["tcp-throughput:67108864"],
+      "stderr_empty": true,
+      "requires_host_tcp": true,
+      "throughput_bytes": 67108864
+    },
+    {
       "name": "curl-http-throughput",
       "class": "io-bound",
       "runner": "program",
