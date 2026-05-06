@@ -14,7 +14,6 @@ pub mod fs;
 pub mod interrupt;
 pub mod io;
 pub mod memory;
-pub mod net;
 pub mod pmm;
 pub mod resource;
 pub mod serial;
