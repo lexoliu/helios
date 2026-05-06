@@ -129,6 +129,36 @@ impl<T: VirtioTransport> VirtQueue<T> {
         self.pop_used_with_len().map(|(head, _)| head)
     }
 
+    pub fn submit_read_only_deferred(&mut self, transport: &T, input: &[u8]) -> IoResult<u16> {
+        if input.is_empty() {
+            return Err(IoError::DeviceFault);
+        }
+        if self.num_used == self.size {
+            return Err(IoError::DeviceFault);
+        }
+
+        let head = self.free_head;
+        let last = self.push_descriptor(transport, input, false)?;
+        self.desc_shadow[usize::from(last)].flags &= !DESC_FLAG_NEXT;
+        self.write_desc(last);
+        self.num_used += 1;
+        Ok(head)
+    }
+
+    pub fn commit_deferred(&mut self, heads: &[u16]) {
+        if heads.is_empty() {
+            return;
+        }
+
+        for head in heads {
+            let slot = self.avail_idx & (self.size - 1);
+            self.write_avail_ring(slot, *head);
+            self.avail_idx = self.avail_idx.wrapping_add(1);
+        }
+        fence(Ordering::Release);
+        self.write_avail_idx(self.avail_idx);
+    }
+
     pub fn available_descriptors(&self) -> usize {
         usize::from(self.size - self.num_used)
     }
@@ -443,5 +473,44 @@ mod tests {
         assert_eq!(queue.pop_used(), Some(token));
         assert_eq!(queue.num_used, 0);
         assert_eq!(queue.free_head, 1);
+    }
+
+    #[test]
+    fn deferred_submit_publishes_avail_index_once_for_batch() {
+        let transport = FakeTransport {
+            bus: FakeBus { dma: FakeDmaPool },
+        };
+        let mut queue = VirtQueue::new(&transport, 0, 8).expect("queue should initialize");
+        let first = [1u8; 16];
+        let second = [2u8; 16];
+
+        let first_token = queue
+            .submit_read_only_deferred(&transport, &first)
+            .expect("first deferred submission should succeed");
+        let second_token = queue
+            .submit_read_only_deferred(&transport, &second)
+            .expect("second deferred submission should succeed");
+
+        let unpublished_avail_idx = unsafe {
+            queue
+                .driver_area
+                .as_ptr()
+                .cast::<u16>()
+                .add(1)
+                .read_volatile()
+        };
+        assert_eq!(unpublished_avail_idx, 0);
+
+        queue.commit_deferred(&[first_token, second_token]);
+
+        let published_avail_idx = unsafe {
+            queue
+                .driver_area
+                .as_ptr()
+                .cast::<u16>()
+                .add(1)
+                .read_volatile()
+        };
+        assert_eq!(published_avail_idx, 2);
     }
 }

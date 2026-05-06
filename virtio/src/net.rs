@@ -351,6 +351,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                     tx_buffer_len,
                     tx_in_flight,
                 } = &mut *state;
+                let mut submitted_tokens = [0u16; NET_QUEUE_SIZE as usize];
                 while next_frame < frames.len() && tx_queue.available_descriptors() != 0 {
                     let frame = frames[next_frame].as_ref();
                     let token = tx_queue.next_free_descriptor();
@@ -366,16 +367,19 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                     )?;
                     let payload =
                         slot_buffer(tx_buffers, *tx_buffer_len, token_index, payload_len, "TX");
-                    let submitted_token = tx_queue.submit(&self.transport, &[payload], &mut [])?;
+                    let submitted_token =
+                        tx_queue.submit_read_only_deferred(&self.transport, payload)?;
                     assert_eq!(
                         submitted_token, token,
                         "virtio net TX descriptor allocation moved while payload was prepared"
                     );
                     tx_in_flight[token_index] = true;
+                    submitted_tokens[submitted] = token;
                     submitted += 1;
                     next_frame += 1;
                 }
                 if submitted != 0 {
+                    tx_queue.commit_deferred(&submitted_tokens[..submitted]);
                     tx_queue.notify(&self.transport);
                 }
             }
