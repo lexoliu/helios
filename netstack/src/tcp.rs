@@ -74,6 +74,51 @@ struct TcpOutOfOrderSegment {
 }
 
 #[derive(Clone, Debug)]
+struct TcpOutOfOrderQueue {
+    segments: Box<HeapVec<TcpOutOfOrderSegment, MAX_TCP_OUT_OF_ORDER_SEGMENTS>>,
+}
+
+impl TcpOutOfOrderQueue {
+    fn new() -> Self {
+        Self {
+            segments: Box::new(HeapVec::new()),
+        }
+    }
+
+    fn first(&self) -> Option<&TcpOutOfOrderSegment> {
+        self.segments.first()
+    }
+
+    fn push(&mut self, segment: TcpOutOfOrderSegment) -> Result<(), TcpOutOfOrderSegment> {
+        self.segments.push(segment)
+    }
+
+    fn remove(&mut self, index: usize) -> TcpOutOfOrderSegment {
+        self.segments.remove(index)
+    }
+
+    fn len(&self) -> usize {
+        self.segments.len()
+    }
+
+    fn swap(&mut self, left: usize, right: usize) {
+        self.segments.swap(left, right);
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &TcpOutOfOrderSegment> {
+        self.segments.iter()
+    }
+}
+
+impl core::ops::Index<usize> for TcpOutOfOrderQueue {
+    type Output = TcpOutOfOrderSegment;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.segments[index]
+    }
+}
+
+#[derive(Clone, Debug)]
 struct TcpReceiveQueue {
     segments: Box<Deque<BytesMut, MAX_TCP_RECEIVE_SEGMENTS>>,
 }
@@ -198,7 +243,7 @@ where
     receive_queue: Option<TcpReceiveQueue>,
     receive_queued_bytes: usize,
     receive_fin_sequence: Option<u32>,
-    out_of_order: HeapVec<TcpOutOfOrderSegment, MAX_TCP_OUT_OF_ORDER_SEGMENTS>,
+    out_of_order: Option<TcpOutOfOrderQueue>,
     out_of_order_queued_bytes: usize,
     transmit_queue: Deque<Bytes, MAX_TCP_QUEUED_SEGMENTS>,
     in_flight: Deque<TcpInFlightSegment, MAX_TCP_QUEUED_SEGMENTS>,
@@ -240,7 +285,7 @@ where
             receive_queue: None,
             receive_queued_bytes: 0,
             receive_fin_sequence: None,
-            out_of_order: HeapVec::new(),
+            out_of_order: None,
             out_of_order_queued_bytes: 0,
             transmit_queue: Deque::new(),
             in_flight: Deque::new(),
@@ -420,8 +465,10 @@ where
 
     pub fn pending_ack_options(&self, now_nanos: u64) -> TcpHeaderOptions {
         let mut blocks = TcpSackBlocks::empty();
-        if self.peer_sack_permitted {
-            for segment in &self.out_of_order {
+        if self.peer_sack_permitted
+            && let Some(out_of_order) = self.out_of_order.as_ref()
+        {
+            for segment in out_of_order.iter() {
                 if blocks
                     .push(TcpSackBlock {
                         left_edge: segment.sequence,
@@ -1058,6 +1105,11 @@ where
         self.receive_queue.get_or_insert_with(TcpReceiveQueue::new)
     }
 
+    fn out_of_order_mut(&mut self) -> &mut TcpOutOfOrderQueue {
+        self.out_of_order
+            .get_or_insert_with(TcpOutOfOrderQueue::new)
+    }
+
     fn push_receive_payload(&mut self, payload: &[u8]) -> Result<(), ()> {
         if payload.is_empty() {
             return Ok(());
@@ -1153,26 +1205,41 @@ where
     fn drain_contiguous_out_of_order(&mut self) -> usize {
         let mut drained = 0;
         loop {
-            let Some(segment) = self.out_of_order.first() else {
-                return drained;
+            let remove_stale = {
+                let Some(out_of_order) = self.out_of_order.as_ref() else {
+                    return drained;
+                };
+                let Some(segment) = out_of_order.first() else {
+                    return drained;
+                };
+                let segment_end = segment_end_from_parts(segment.sequence, segment.payload.len());
+                if sequence_lt(self.receive_next, segment.sequence) {
+                    return drained;
+                }
+                if !sequence_leq(segment_end, self.receive_next) && self.receive_queue_is_full() {
+                    return drained;
+                }
+                sequence_leq(segment_end, self.receive_next)
             };
-            let segment_end = segment_end_from_parts(segment.sequence, segment.payload.len());
-            if sequence_leq(segment_end, self.receive_next) {
-                let stale = self.out_of_order.remove(0);
+
+            if remove_stale {
+                let stale = self
+                    .out_of_order
+                    .as_mut()
+                    .expect("TCP out-of-order queue disappeared during stale removal")
+                    .remove(0);
                 self.out_of_order_queued_bytes = self
                     .out_of_order_queued_bytes
                     .checked_sub(stale.payload.len())
                     .expect("TCP out-of-order byte count underflowed");
                 continue;
             }
-            if sequence_lt(self.receive_next, segment.sequence) {
-                return drained;
-            }
-            if self.receive_queue_is_full() {
-                return drained;
-            }
 
-            let mut segment = self.out_of_order.remove(0);
+            let mut segment = self
+                .out_of_order
+                .as_mut()
+                .expect("TCP out-of-order queue disappeared during drain")
+                .remove(0);
             self.out_of_order_queued_bytes = self
                 .out_of_order_queued_bytes
                 .checked_sub(segment.payload.len())
@@ -1227,30 +1294,34 @@ where
         let mut cursor_offset = 0;
         let mut fragments = HeapVec::<(u32, usize, usize), MAX_TCP_OUT_OF_ORDER_SEGMENTS>::new();
 
-        for existing in &self.out_of_order {
-            let existing_end = segment_end_from_parts(existing.sequence, existing.payload.len());
-            if sequence_leq(existing_end, cursor_sequence) {
-                continue;
+        if let Some(out_of_order) = self.out_of_order.as_ref() {
+            for existing in out_of_order.iter() {
+                let existing_end =
+                    segment_end_from_parts(existing.sequence, existing.payload.len());
+                if sequence_leq(existing_end, cursor_sequence) {
+                    continue;
+                }
+                if sequence_leq(end, existing.sequence) {
+                    break;
+                }
+                if sequence_lt(cursor_sequence, existing.sequence) {
+                    let fragment_len =
+                        usize::try_from(existing.sequence.wrapping_sub(cursor_sequence))
+                            .expect("TCP out-of-order fragment length does not fit usize");
+                    fragments
+                        .push((cursor_sequence, cursor_offset, cursor_offset + fragment_len))
+                        .map_err(|_| ())?;
+                }
+                if sequence_leq(end, existing_end) {
+                    cursor_sequence = end;
+                    cursor_offset = payload.len();
+                    break;
+                }
+                let skip = usize::try_from(existing_end.wrapping_sub(cursor_sequence))
+                    .expect("TCP out-of-order overlap length does not fit usize");
+                cursor_sequence = existing_end;
+                cursor_offset += skip;
             }
-            if sequence_leq(end, existing.sequence) {
-                break;
-            }
-            if sequence_lt(cursor_sequence, existing.sequence) {
-                let fragment_len = usize::try_from(existing.sequence.wrapping_sub(cursor_sequence))
-                    .expect("TCP out-of-order fragment length does not fit usize");
-                fragments
-                    .push((cursor_sequence, cursor_offset, cursor_offset + fragment_len))
-                    .map_err(|_| ())?;
-            }
-            if sequence_leq(end, existing_end) {
-                cursor_sequence = end;
-                cursor_offset = payload.len();
-                break;
-            }
-            let skip = usize::try_from(existing_end.wrapping_sub(cursor_sequence))
-                .expect("TCP out-of-order overlap length does not fit usize");
-            cursor_sequence = existing_end;
-            cursor_offset += skip;
         }
 
         if sequence_lt(cursor_sequence, end) {
@@ -1274,20 +1345,24 @@ where
             payload: Bytes::copy_from_slice(payload),
         };
         let len = segment.payload.len();
-        self.out_of_order.push(segment).map_err(|_| ())?;
+        self.out_of_order_mut().push(segment).map_err(|_| ())?;
         self.out_of_order_queued_bytes = self
             .out_of_order_queued_bytes
             .checked_add(len)
             .expect("TCP out-of-order byte count overflowed");
 
-        let mut index = self.out_of_order.len() - 1;
+        let out_of_order = self
+            .out_of_order
+            .as_mut()
+            .expect("TCP out-of-order queue was not materialized after insert");
+        let mut index = out_of_order.len() - 1;
         while index != 0
             && sequence_lt(
-                self.out_of_order[index].sequence,
-                self.out_of_order[index - 1].sequence,
+                out_of_order[index].sequence,
+                out_of_order[index - 1].sequence,
             )
         {
-            self.out_of_order.swap(index, index - 1);
+            out_of_order.swap(index, index - 1);
             index -= 1;
         }
         Ok(())
