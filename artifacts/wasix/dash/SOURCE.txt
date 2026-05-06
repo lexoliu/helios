@@ -1,4 +1,0 @@
-package=sharrattj/dash
-version=1.0.19
-source=https://wasmer.io/sharrattj/dash
-sha256=ce4d85249665844ea9d882bda5efed67d127605735c7f5b674157804e624c9cc

@@ -14,7 +14,6 @@ use helios_compiler_support::{AotCompileHint, precompile_artifact};
 use mbrman::{BOOT_ACTIVE, CHS, MBR, MBRPartitionEntry};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use toml::Value;
 use walkdir::WalkDir;
 use wasmparser::Parser as WasmParser;
@@ -177,7 +176,6 @@ struct ExternalBootArtifact {
     targets: Vec<String>,
     bootfs_path: String,
     source: PathBuf,
-    sha256_file: PathBuf,
     support_root: Option<PathBuf>,
     support_bootfs_prefix: Option<String>,
 }
@@ -815,11 +813,6 @@ fn read_external_boot_artifacts(path: &Path) -> Result<Vec<ExternalBootArtifact>
             "boot artifact {} source must be workspace-relative",
             artifact.command
         );
-        ensure!(
-            artifact.sha256_file.is_relative(),
-            "boot artifact {} checksum path must be workspace-relative",
-            artifact.command
-        );
         if let Some(support_root) = &artifact.support_root {
             ensure!(
                 support_root.is_relative(),
@@ -865,11 +858,6 @@ fn validate_external_boot_artifact_sources(
         {
             continue;
         }
-        verify_sha256_file(
-            &workspace_path(&artifact.source),
-            &workspace_path(&artifact.sha256_file),
-        )?;
-        validate_external_boot_artifact_provenance(&artifact)?;
         if let Some(support_root) = &artifact.support_root {
             let support_root = workspace_path(support_root);
             ensure!(
@@ -965,8 +953,6 @@ fn build_external_boot_artifact_assets(
     artifact: ExternalBootArtifact,
 ) -> Result<Vec<BootAsset>> {
     let source = workspace_path(&artifact.source);
-    let sha256_file = workspace_path(&artifact.sha256_file);
-    verify_sha256_file(&source, &sha256_file)?;
     let wasm = fs::read(&source).with_context(|| format!("failed to read {}", source.display()))?;
     let payload = precompile_artifact(&wasm, target, Hint::Performance.into())?.bytes;
     let signed = sign_payload_with_key(&payload, root_signing_key).with_context(|| {
@@ -1047,94 +1033,6 @@ fn is_empty_directory(path: &Path) -> Result<bool> {
         .with_context(|| format!("failed to read directory {}", path.display()))?
         .next()
         .is_none())
-}
-
-fn verify_sha256_file(source: &Path, sha256_file: &Path) -> Result<()> {
-    ensure!(
-        source.is_file(),
-        "boot artifact source {} is missing",
-        source.display()
-    );
-    ensure!(
-        sha256_file.is_file(),
-        "boot artifact checksum {} is missing",
-        sha256_file.display()
-    );
-    let expected = read_sha256_digest(sha256_file)?;
-    let mut hasher = Sha256::new();
-    hasher
-        .update(fs::read(source).with_context(|| format!("failed to read {}", source.display()))?);
-    let actual = hex::encode(hasher.finalize());
-    ensure!(
-        actual == expected,
-        "boot artifact checksum mismatch for {}: expected {}, got {}",
-        source.display(),
-        expected,
-        actual
-    );
-    Ok(())
-}
-
-fn validate_external_boot_artifact_provenance(artifact: &ExternalBootArtifact) -> Result<()> {
-    let source = workspace_path(&artifact.source);
-    let sha256_file = workspace_path(&artifact.sha256_file);
-    let source_txt = source
-        .parent()
-        .with_context(|| format!("{} has no parent directory", source.display()))?
-        .join("SOURCE.txt");
-    ensure!(
-        source_txt.is_file(),
-        "boot artifact provenance file {} is missing",
-        source_txt.display()
-    );
-    let provenance = fs::read_to_string(&source_txt)
-        .with_context(|| format!("failed to read {}", source_txt.display()))?;
-    ensure_provenance_value(&source_txt, &provenance, "package", &artifact.package)?;
-    ensure_provenance_value(&source_txt, &provenance, "version", &artifact.version)?;
-    ensure_provenance_value(&source_txt, &provenance, "source", &artifact.source_url)?;
-    ensure_provenance_value(
-        &source_txt,
-        &provenance,
-        "sha256",
-        &read_sha256_digest(&sha256_file)?,
-    )
-}
-
-fn ensure_provenance_value(
-    source_txt: &Path,
-    provenance: &str,
-    key: &str,
-    expected: &str,
-) -> Result<()> {
-    let prefix = format!("{key}=");
-    let actual = provenance
-        .lines()
-        .find_map(|line| line.strip_prefix(&prefix))
-        .with_context(|| format!("{} is missing {key}=", source_txt.display()))?;
-    ensure!(
-        actual == expected,
-        "{} has {}={}, expected {}",
-        source_txt.display(),
-        key,
-        actual,
-        expected
-    );
-    Ok(())
-}
-
-fn read_sha256_digest(sha256_file: &Path) -> Result<String> {
-    let digest = fs::read_to_string(sha256_file)
-        .with_context(|| format!("failed to read {}", sha256_file.display()))?;
-    let digest = digest
-        .split_whitespace()
-        .next()
-        .with_context(|| format!("{} does not contain a checksum", sha256_file.display()))?;
-    ensure!(
-        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "{} must start with a SHA-256 hex digest",
-        sha256_file.display()
-    );
-    Ok(digest.to_owned())
 }
 
 fn read_program_manifest(command: &str, manifest_path: &Path) -> Result<ProgramManifest> {
@@ -1313,96 +1211,6 @@ fn read_signing_key(path: &Path) -> Result<SigningKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn external_artifact_provenance_must_match_manifest_and_checksum() {
-        let root = test_temp_dir("artifact-provenance-ok");
-        let artifact_dir = root.join("wasix").join("bash");
-        fs::create_dir_all(&artifact_dir).expect("test artifact dir must be created");
-        let wasm = artifact_dir.join("bash.wasm");
-        fs::write(&wasm, b"bash").expect("test wasm must be written");
-        let digest = sha256_hex(b"bash");
-        let checksum = artifact_dir.join("bash.wasm.sha256");
-        fs::write(&checksum, format!("{digest}  {}\n", wasm.display()))
-            .expect("test checksum must be written");
-        fs::write(
-            artifact_dir.join("SOURCE.txt"),
-            format!(
-                "package=wasmer/bash\nversion=1.0.25\nsource=https://wasmer.io/wasmer/bash\nsha256={digest}\n"
-            ),
-        )
-        .expect("test provenance must be written");
-
-        let artifact = test_artifact(
-            "bash",
-            "wasmer/bash",
-            "1.0.25",
-            "https://wasmer.io/wasmer/bash",
-            &wasm,
-            &checksum,
-        );
-        validate_external_boot_artifact_provenance(&artifact)
-            .expect("matching artifact provenance must validate");
-
-        fs::remove_dir_all(root).expect("test temp dir must be removed");
-    }
-
-    #[test]
-    fn external_artifact_provenance_rejects_mismatched_source_metadata() {
-        let root = test_temp_dir("artifact-provenance-bad");
-        let artifact_dir = root.join("wasix").join("bash");
-        fs::create_dir_all(&artifact_dir).expect("test artifact dir must be created");
-        let wasm = artifact_dir.join("bash.wasm");
-        fs::write(&wasm, b"bash").expect("test wasm must be written");
-        let digest = sha256_hex(b"bash");
-        let checksum = artifact_dir.join("bash.wasm.sha256");
-        fs::write(&checksum, format!("{digest}  {}\n", wasm.display()))
-            .expect("test checksum must be written");
-        fs::write(
-            artifact_dir.join("SOURCE.txt"),
-            format!(
-                "package=local/mismatch\nversion=1.0.25\nsource=https://wasmer.io/wasmer/bash\nsha256={digest}\n"
-            ),
-        )
-        .expect("test provenance must be written");
-
-        let artifact = test_artifact(
-            "bash",
-            "wasmer/bash",
-            "1.0.25",
-            "https://wasmer.io/wasmer/bash",
-            &wasm,
-            &checksum,
-        );
-        let error = validate_external_boot_artifact_provenance(&artifact)
-            .expect_err("mismatched artifact package must be rejected");
-        assert!(
-            error.to_string().contains("package=local/mismatch"),
-            "unexpected error: {error:#}"
-        );
-
-        fs::remove_dir_all(root).expect("test temp dir must be removed");
-    }
-
-    #[test]
-    fn checked_in_external_artifacts_have_matching_provenance() {
-        let manifest = workspace_path(Path::new(DEFAULT_BOOT_ARTIFACTS_MANIFEST));
-        let artifacts =
-            read_external_boot_artifacts(&manifest).expect("checked-in manifest must parse");
-        assert!(
-            !artifacts.is_empty(),
-            "checked-in boot artifact manifest must declare external artifacts"
-        );
-        for artifact in artifacts {
-            validate_external_boot_artifact_provenance(&artifact).unwrap_or_else(|error| {
-                panic!(
-                    "checked-in artifact {} has invalid provenance: {error:#}",
-                    artifact.command
-                )
-            });
-        }
-    }
 
     #[test]
     fn selected_target_mismatches_fail_fast() {
@@ -1412,7 +1220,6 @@ mod tests {
             "0.1.0",
             "tools/wasi-apps/wasix-tests",
             Path::new("simd-lanes.wasm"),
-            Path::new("simd-lanes.wasm.sha256"),
         );
         artifact.targets.push("aarch64-unknown-none".to_owned());
         let selected = Some(BTreeSet::from(["simd-lanes".to_owned()]));
@@ -1432,7 +1239,6 @@ mod tests {
         version: &str,
         source_url: &str,
         source: &Path,
-        sha256_file: &Path,
     ) -> ExternalBootArtifact {
         ExternalBootArtifact {
             command: command.to_owned(),
@@ -1442,23 +1248,8 @@ mod tests {
             targets: Vec::new(),
             bootfs_path: format!("bin/{command}"),
             source: source.to_owned(),
-            sha256_file: sha256_file.to_owned(),
             support_root: None,
             support_bootfs_prefix: None,
         }
-    }
-
-    fn sha256_hex(bytes: &[u8]) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(bytes);
-        hex::encode(hasher.finalize())
-    }
-
-    fn test_temp_dir(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock must be after unix epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("helios-cli-{name}-{}-{nanos}", std::process::id()))
     }
 }

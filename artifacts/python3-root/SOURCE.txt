@@ -1,4 +1,0 @@
-package=brettcannon/cpython-wasi-build
-version=3.14.4
-source=https://github.com/brettcannon/cpython-wasi-build
-sha256=a03e839be7aa7584b44a657c98a10b4c2f6f2f8d2343ca83dd20917a63b9bf23

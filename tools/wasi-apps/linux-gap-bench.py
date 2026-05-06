@@ -484,7 +484,6 @@ def artifact_provenance(manifest: dict, workloads: list[dict]) -> list[dict]:
     for artifact in boot.get("artifact", []):
         if artifact["command"] not in needed:
             continue
-        sha_path = repo_root() / artifact["sha256_file"]
         artifacts.append(
             {
                 "command": artifact["command"],
@@ -492,7 +491,6 @@ def artifact_provenance(manifest: dict, workloads: list[dict]) -> list[dict]:
                 "version": artifact["version"],
                 "source": artifact["source_url"],
                 "wasm": artifact["source"],
-                "sha256": sha_path.read_text(encoding="utf-8").split()[0],
             }
         )
     return artifacts
@@ -805,7 +803,7 @@ def write_report(
     lines.extend(["## Artifact Provenance", ""])
     for artifact in artifact_provenance(manifest, workloads):
         lines.append(
-            f"- `{artifact['command']}`: `{artifact['package']}@{artifact['version']}`, sha256 `{artifact['sha256']}`, source `{artifact['source']}`"
+            f"- `{artifact['command']}`: `{artifact['package']}@{artifact['version']}`, source `{artifact['source']}`"
         )
     lines.extend(
         [

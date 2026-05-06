@@ -21,14 +21,12 @@ This script:
    `wasi_snapshot_preview1.command.wasm` adapter.
 2. Wraps the preview1 core module into a WASI P2 component via
    `wasm-tools component new --adapt …`.
-3. Installs `python3.wasm`, checksum/provenance sidecars, and
-   `lib/python3.14/` (the CPython stdlib) under
-   `artifacts/python3-root/`.
+3. Installs `python3.wasm` and `lib/python3.14/` (the CPython stdlib)
+   under `artifacts/python3-root/`.
 4. Downloads and extracts the pinned official Wasmer WEBc images for
    `sharrattj/dash` `1.0.19`, `wasmer/bash` `1.0.25`,
    `saghul/quickjs` `0.0.3`, and `wasmer/coreutils` `1.0.19`;
-   validates their raw wasm atoms with `wasm-tools`; and records
-   checksum plus `SOURCE.txt` provenance files under `artifacts/wasix/`.
+   validates their raw wasm atoms with `wasm-tools`.
 5. Builds the helios `curl-wasi` program from source with the optimized
    release profile into `artifacts/wasi-tools/`.
 6. Builds the Helios WASIX conformance WAT modules for thread/futex and
@@ -37,40 +35,21 @@ This script:
 Artifacts produced:
 
 - `artifacts/python3-root/python3.wasm` — real CPython 3.14 component.
-- `artifacts/python3-root/python3.wasm.sha256` — checksum consumed by
-  `helios-cli kernel-prebuild`.
-- `artifacts/python3-root/SOURCE.txt` — source package, version, URL, and
-  checksum record.
 - `artifacts/python3-root/lib/python3.14/` — CPython standard library.
 - `artifacts/wasix/dash/dash.wasm` — standard WASIX dash raw module.
-- `artifacts/wasix/dash/dash.wasm.sha256` — checksum consumed by
-  `helios-cli kernel-prebuild`.
-- `artifacts/wasix/dash/SOURCE.txt` — source package, version, URL, and
-  checksum record.
 - `artifacts/wasix/bash/bash.wasm` — standard Wasmer WASIX Bash raw module.
-- `artifacts/wasix/bash/bash.wasm.sha256`
-- `artifacts/wasix/bash/SOURCE.txt`
 - `artifacts/wasix/quickjs/qjs.wasm` — standard QuickJS WASI raw module.
-- `artifacts/wasix/quickjs/qjs.wasm.sha256`
-- `artifacts/wasix/quickjs/SOURCE.txt`
 - `artifacts/wasix/coreutils/coreutils.wasm` — standard Wasmer
   coreutils WASIX raw module. `boot-artifacts.toml` exposes the same
   module as `/bin/cat`, `/bin/env`, `/bin/head`, `/bin/ls`,
   `/bin/mkdir`, and `/bin/pwd`.
-- `artifacts/wasix/coreutils/coreutils.wasm.sha256`
-- `artifacts/wasix/coreutils/SOURCE.txt`
 - `artifacts/wasix/thread-futex/thread-futex.wasm` — Helios WASIX
   conformance module covering `thread_spawn_v2`, `thread_join`,
   `futex_wait`, `futex_wake`, and `thread_exit`.
-- `artifacts/wasix/thread-futex/thread-futex.wasm.sha256`
-- `artifacts/wasix/thread-futex/SOURCE.txt`
 - `artifacts/wasix/continuation/continuation.wasm` — Helios WASIX
   conformance module covering `stack_checkpoint`, `stack_restore`, and
   the asyncify unwind/rewind exports expected by the adapter.
-- `artifacts/wasix/continuation/continuation.wasm.sha256`
-- `artifacts/wasix/continuation/SOURCE.txt`
 - `artifacts/wasi-tools/curl.wasm`
-- `artifacts/wasi-tools/SOURCE.txt`
 - `artifacts/wasi-tools/curl-stripped.wasm`
 
 The CPython download requires network. To re-stage in an offline
@@ -100,10 +79,9 @@ COREUTILS_WEBC=/path/to/coreutils.webc \
 tools/wasi-apps/build.sh
 ```
 
-`helios-cli kernel-prebuild` verifies the checksum sidecar before adding
-the artifact to bootfs and checks every external artifact's `SOURCE.txt`
-against `tools/wasi-apps/boot-artifacts.toml`. A missing or mismatched
-artifact is a hard error; there is no repo-local fallback.
+`helios-cli kernel-prebuild` compiles declared boot artifacts into signed
+`cwasm` payloads before adding them to bootfs. A missing artifact is a hard
+error; there is no repo-local fallback.
 
 ## Run In Helios (AArch64 HVF VM)
 

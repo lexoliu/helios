@@ -1,5 +1,0 @@
-package=wasmer/coreutils
-version=1.0.19
-source=https://wasmer.io/wasmer/coreutils
-webc_sha256=6b2fd4494bd198f60859987608a7633f807a05147e4d8398ec061639d047ce75
-sha256=586489a3aca13cb69855f9f92e655acdb1598934b24ceb9450628d0ab34d0b95
