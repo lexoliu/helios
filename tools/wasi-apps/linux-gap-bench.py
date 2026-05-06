@@ -26,6 +26,7 @@ HTTP_LARGE_PAYLOAD_CHUNK = bytes(range(251))
 DEFAULT_MAX_HOST_LOAD_PER_CPU = 0.75
 TOP_CPU_PROCESS_LIMIT = 8
 DEFAULT_HELIOS_TIMEOUT_SECONDS = 600
+STALE_PROCESS_COMMAND_LIMIT = 240
 
 
 class QuietHttpHandler(http.server.SimpleHTTPRequestHandler):
@@ -184,6 +185,62 @@ def top_cpu_processes(limit: int = TOP_CPU_PROCESS_LIMIT) -> list[dict]:
         )
     processes.sort(key=lambda process: process["pcpu"], reverse=True)
     return processes[:limit]
+
+
+def process_table() -> list[dict]:
+    completed = subprocess.run(
+        ["ps", "-axo", "pid=,ppid=,command="],
+        cwd=repo_root(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    processes = []
+    for line in completed.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        processes.append(
+            {
+                "pid": parts[0],
+                "ppid": parts[1],
+                "command": parts[2],
+            }
+        )
+    return processes
+
+
+def is_stale_helios_benchmark_process(command: str) -> bool:
+    argv0 = command.split(None, 1)[0] if command.strip() else ""
+    executable = Path(argv0).name
+    inspector_workload = (
+        executable == "helios-inspector"
+        and " vm " in f" {command} "
+        and " workload-bench" in f" {command} "
+    )
+    qemu_workload = executable.startswith("qemu-system-") and "helios-inspector-vm." in command
+    return inspector_workload or qemu_workload
+
+
+def enforce_no_stale_helios_benchmark_processes() -> None:
+    current_pid = str(os.getpid())
+    stale = [
+        process
+        for process in process_table()
+        if process["pid"] != current_pid
+        and is_stale_helios_benchmark_process(process["command"])
+    ]
+    if not stale:
+        return
+    details = "; ".join(
+        f"{process['pid']} ppid={process['ppid']} {process['command'][:STALE_PROCESS_COMMAND_LIMIT]}"
+        for process in stale[:5]
+    )
+    raise SystemExit(
+        "refusing to start Helios benchmark while stale Helios VM workload processes exist: "
+        f"{details}"
+    )
 
 
 def host_load_snapshot() -> dict:
@@ -977,6 +1034,8 @@ def main() -> None:
     if args.helios_timeout_seconds <= 0:
         raise SystemExit("--helios-timeout-seconds must be positive")
 
+    if not args.skip_helios:
+        enforce_no_stale_helios_benchmark_processes()
     host_load = host_load_snapshot()
     enforce_host_load(host_load, args.max_host_load_per_cpu, args.allow_busy_host)
     manifest = load_manifest(args.manifest)
