@@ -7,7 +7,7 @@ use core::task::Poll;
 use core::time::Duration;
 
 use bytes::Bytes;
-use helios_hal::cpu::Cpu;
+use helios_hal::cpu::{Cpu, HardwarePerfCounters};
 use helios_hal::io::IoError;
 use helios_netstack::{
     DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage, DhcpDnsServers,
@@ -184,6 +184,12 @@ struct NetworkPollState {
 
 struct NetworkPumpCadence {
     busy_rounds: usize,
+}
+
+#[derive(Clone, Copy)]
+struct NetworkPerfStart {
+    nanos: u64,
+    counters: HardwarePerfCounters,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1375,20 +1381,38 @@ where
             .uptime_nanos(self.inner.cpu.now().ticks())
     }
 
-    fn profile_start(&self) -> Option<u64> {
+    fn profile_start(&self) -> Option<NetworkPerfStart> {
         self.inner
             .runtime_state
             .profiling_enabled()
-            .then(|| self.now_nanos())
+            .then(|| NetworkPerfStart {
+                nanos: self.now_nanos(),
+                counters: self.inner.cpu.hardware_perf_counters(),
+            })
     }
 
-    fn record_network_profile(&self, phase: &'static str, started_nanos: Option<u64>) {
-        if let Some(started_nanos) = started_nanos {
+    fn record_network_profile(&self, phase: &'static str, start: Option<NetworkPerfStart>) {
+        if let Some(start) = start {
+            let now_nanos = self.now_nanos();
+            let counters = self
+                .inner
+                .cpu
+                .hardware_perf_counters()
+                .delta_since(start.counters);
+            let elapsed_nanos = now_nanos.saturating_sub(start.nanos);
             self.inner.runtime_state.record_profile_stack_parts_nanos(
                 crate::ProfileScope::Kernel,
                 "kernel;network;",
                 phase,
-                self.now_nanos().saturating_sub(started_nanos),
+                elapsed_nanos,
+            );
+            self.inner.runtime_state.record_perf_metric_parts_nanos(
+                crate::ProfileScope::Kernel,
+                "kernel;network;",
+                phase,
+                elapsed_nanos,
+                counters,
+                0,
             );
         }
     }

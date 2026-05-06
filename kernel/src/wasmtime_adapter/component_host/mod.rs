@@ -44,8 +44,8 @@ use crate::wasmtime_adapter::cwasm::{self, ArtifactTrustError, UntrustedCwasm};
 use crate::wasmtime_adapter::wasi::ChannelStreamProducer;
 use crate::wasmtime_adapter::wasi::bindings::filesystem::types::ErrorCode as FsErrorCode;
 use crate::{
-    ProfileFilter, ProfileScope, StatsSample, TraceEvent, TraceField, TraceFilter, TraceLevel,
-    TraceValue,
+    PerfMetricFilter, ProfileFilter, ProfileScope, StatsSample, TraceEvent, TraceField,
+    TraceFilter, TraceLevel, TraceValue,
 };
 
 const SYNC_INSTANCE: &str = "helios:system/sync@0.1.0";
@@ -2510,6 +2510,24 @@ where
             Ok((samples,))
         },
     )?;
+    instance.func_wrap(
+        "metrics",
+        |caller,
+         (filter, limit): (
+            debugger_bindings::helios::system::profiling::MetricFilter,
+            u32,
+        )| {
+            let filter = convert_perf_metric_filter(filter);
+            let samples = caller
+                .data()
+                .runtime_state
+                .perf_metrics(&filter, limit)
+                .into_iter()
+                .map(convert_perf_metric_sample)
+                .collect::<Vec<_>>();
+            Ok((samples,))
+        },
+    )?;
     Ok(())
 }
 
@@ -3609,6 +3627,31 @@ fn convert_profile_sample(
         scope: convert_profile_scope_from_local(sample.scope),
         stack: sample.stack,
         weight: sample.weight,
+    }
+}
+
+fn convert_perf_metric_filter(
+    filter: debugger_bindings::helios::system::profiling::MetricFilter,
+) -> PerfMetricFilter {
+    PerfMetricFilter {
+        name_prefixes: filter.name_prefixes,
+    }
+}
+
+fn convert_perf_metric_sample(
+    sample: crate::PerfMetricSample,
+) -> debugger_bindings::helios::system::profiling::MetricSample {
+    debugger_bindings::helios::system::profiling::MetricSample {
+        scope: convert_profile_scope_from_local(sample.scope),
+        name: sample.name,
+        count: sample.count,
+        total_nanos: sample.total_nanos,
+        min_nanos: sample.min_nanos,
+        max_nanos: sample.max_nanos,
+        total_bytes: sample.total_bytes,
+        total_reference_cycles: sample.total_reference_cycles,
+        total_cpu_cycles: sample.total_cpu_cycles,
+        total_instructions_retired: sample.total_instructions_retired,
     }
 }
 

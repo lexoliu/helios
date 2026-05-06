@@ -6,8 +6,11 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use helios_hal::cpu::HardwarePerfCounterDelta;
+
 pub const DEFAULT_TRACE_HISTORY_CAPACITY: usize = 512;
 pub const DEFAULT_PROFILE_STACK_CAPACITY: usize = 1024;
+pub const DEFAULT_PERF_METRIC_CAPACITY: usize = 512;
 
 #[derive(Clone, Debug)]
 pub struct TraceFilter {
@@ -69,6 +72,25 @@ pub struct FoldedProfileSample {
     pub weight: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct PerfMetricFilter {
+    pub name_prefixes: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PerfMetricSample {
+    pub scope: ProfileScope,
+    pub name: String,
+    pub count: u64,
+    pub total_nanos: u64,
+    pub min_nanos: u64,
+    pub max_nanos: u64,
+    pub total_bytes: u64,
+    pub total_reference_cycles: u64,
+    pub total_cpu_cycles: u64,
+    pub total_instructions_retired: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProfileScope {
     Kernel,
@@ -86,6 +108,12 @@ pub struct TraceHistory {
 pub struct ProfileHistory {
     capacity: usize,
     samples: Vec<FoldedProfileSample>,
+}
+
+#[derive(Debug)]
+pub struct PerfMetricHistory {
+    capacity: usize,
+    samples: Vec<PerfMetricSample>,
 }
 
 struct ProfileStackParts<'a> {
@@ -273,6 +301,134 @@ impl ProfileHistory {
     }
 }
 
+impl PerfMetricHistory {
+    pub fn new(capacity: usize) -> Self {
+        assert!(capacity != 0, "perf metric capacity must be non-zero");
+        Self {
+            capacity,
+            samples: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.samples.clear();
+    }
+
+    pub fn record_str(
+        &mut self,
+        scope: ProfileScope,
+        name: &str,
+        elapsed_nanos: u64,
+        counters: HardwarePerfCounterDelta,
+        bytes: u64,
+    ) {
+        self.record_input(scope, name, elapsed_nanos, counters, bytes);
+    }
+
+    pub fn record_parts(
+        &mut self,
+        scope: ProfileScope,
+        prefix: &str,
+        suffix: &str,
+        elapsed_nanos: u64,
+        counters: HardwarePerfCounterDelta,
+        bytes: u64,
+    ) {
+        self.record_input(
+            scope,
+            ProfileStackParts { prefix, suffix },
+            elapsed_nanos,
+            counters,
+            bytes,
+        );
+    }
+
+    fn record_input<Name>(
+        &mut self,
+        scope: ProfileScope,
+        name: Name,
+        elapsed_nanos: u64,
+        counters: HardwarePerfCounterDelta,
+        bytes: u64,
+    ) where
+        Name: ProfileStackInput,
+    {
+        if elapsed_nanos == 0
+            && bytes == 0
+            && counters.reference_cycles == 0
+            && counters.cpu_cycles == 0
+            && counters.instructions_retired == 0
+        {
+            return;
+        }
+
+        if let Some(sample) = self
+            .samples
+            .iter_mut()
+            .find(|sample| sample.scope == scope && name.matches(&sample.name))
+        {
+            sample.count = sample.count.saturating_add(1);
+            sample.total_nanos = sample.total_nanos.saturating_add(elapsed_nanos);
+            sample.min_nanos = sample.min_nanos.min(elapsed_nanos);
+            sample.max_nanos = sample.max_nanos.max(elapsed_nanos);
+            sample.total_bytes = sample.total_bytes.saturating_add(bytes);
+            sample.total_reference_cycles = sample
+                .total_reference_cycles
+                .saturating_add(counters.reference_cycles);
+            sample.total_cpu_cycles = sample.total_cpu_cycles.saturating_add(counters.cpu_cycles);
+            sample.total_instructions_retired = sample
+                .total_instructions_retired
+                .saturating_add(counters.instructions_retired);
+            return;
+        }
+
+        if self.samples.len() == self.capacity {
+            let coldest_index = self
+                .samples
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, sample)| sample.count)
+                .map(|(index, _)| index)
+                .expect("non-empty perf metric samples should have a coldest entry");
+            self.samples.swap_remove(coldest_index);
+        }
+
+        self.samples.push(PerfMetricSample {
+            scope,
+            name: name.into_string(),
+            count: 1,
+            total_nanos: elapsed_nanos,
+            min_nanos: elapsed_nanos,
+            max_nanos: elapsed_nanos,
+            total_bytes: bytes,
+            total_reference_cycles: counters.reference_cycles,
+            total_cpu_cycles: counters.cpu_cycles,
+            total_instructions_retired: counters.instructions_retired,
+        });
+    }
+
+    pub fn recent(&self, filter: &PerfMetricFilter, limit: u32) -> Vec<PerfMetricSample> {
+        let mut samples = self
+            .samples
+            .iter()
+            .filter(|sample| matches_perf_metric_filter(sample, filter))
+            .cloned()
+            .collect::<Vec<_>>();
+        samples.sort_by(|left, right| {
+            right
+                .total_nanos
+                .cmp(&left.total_nanos)
+                .then_with(|| right.count.cmp(&left.count))
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        let keep = limit as usize;
+        if keep != 0 && samples.len() > keep {
+            samples.truncate(keep);
+        }
+        samples
+    }
+}
+
 pub fn parse_console_text(timestamp: u64, text: &str) -> Vec<TraceEvent> {
     let stripped = strip_ansi(text);
     stripped
@@ -314,6 +470,17 @@ pub fn matches_profile_filter(sample: &FoldedProfileSample, filter: &ProfileFilt
         .stack_prefixes
         .iter()
         .any(|prefix| sample.stack.starts_with(prefix))
+}
+
+pub fn matches_perf_metric_filter(sample: &PerfMetricSample, filter: &PerfMetricFilter) -> bool {
+    if filter.name_prefixes.is_empty() {
+        return true;
+    }
+
+    filter
+        .name_prefixes
+        .iter()
+        .any(|prefix| sample.name.starts_with(prefix))
 }
 
 fn parse_console_line(timestamp: u64, line: &str) -> TraceEvent {
@@ -407,9 +574,11 @@ mod tests {
     use alloc::vec;
 
     use super::{
-        ProfileFilter, ProfileHistory, ProfileScope, TraceEvent, TraceField, TraceFilter,
-        TraceHistory, TraceLevel, TraceValue, matches_trace_filter, parse_console_text,
+        PerfMetricFilter, PerfMetricHistory, ProfileFilter, ProfileHistory, ProfileScope,
+        TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceValue,
+        matches_trace_filter, parse_console_text,
     };
+    use helios_hal::cpu::HardwarePerfCounterDelta;
 
     #[test]
     fn parses_kernel_console_prefixes() {
@@ -501,5 +670,53 @@ mod tests {
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].stack, "user;dash");
         assert_eq!(samples[0].weight, 12);
+    }
+
+    #[test]
+    fn perf_metric_history_aggregates_latency_bytes_and_hardware_counters() {
+        let mut history = PerfMetricHistory::new(4);
+        history.record_parts(
+            ProfileScope::Kernel,
+            "kernel;network;",
+            "tx-submit",
+            10,
+            HardwarePerfCounterDelta {
+                reference_cycles: 30,
+                cpu_cycles: 40,
+                instructions_retired: 50,
+            },
+            1500,
+        );
+        history.record_parts(
+            ProfileScope::Kernel,
+            "kernel;network;",
+            "tx-submit",
+            25,
+            HardwarePerfCounterDelta {
+                reference_cycles: 70,
+                cpu_cycles: 80,
+                instructions_retired: 90,
+            },
+            9000,
+        );
+
+        let samples = history.recent(
+            &PerfMetricFilter {
+                name_prefixes: vec!["kernel;network;".to_owned()],
+            },
+            4,
+        );
+
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].scope, ProfileScope::Kernel);
+        assert_eq!(samples[0].name, "kernel;network;tx-submit");
+        assert_eq!(samples[0].count, 2);
+        assert_eq!(samples[0].total_nanos, 35);
+        assert_eq!(samples[0].min_nanos, 10);
+        assert_eq!(samples[0].max_nanos, 25);
+        assert_eq!(samples[0].total_bytes, 10_500);
+        assert_eq!(samples[0].total_reference_cycles, 100);
+        assert_eq!(samples[0].total_cpu_cycles, 120);
+        assert_eq!(samples[0].total_instructions_retired, 140);
     }
 }

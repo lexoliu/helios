@@ -15,3 +15,4 @@ pub const PROFILING_INSTANCE: &str = "helios:system/profiling@0.1.0";
 pub const PROFILING_SET_ENABLED: &str = "set-enabled";
 pub const PROFILING_CLEAR: &str = "clear";
 pub const PROFILING_FOLDED: &str = "folded";
+pub const PROFILING_METRICS: &str = "metrics";

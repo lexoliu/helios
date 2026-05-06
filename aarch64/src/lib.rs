@@ -20,7 +20,7 @@ use helios_hal::boot::{
     BootFirmwareTables, BootHandoff, BootKernelImage, BootMemoryKind, BootMemoryMap,
     BootMemoryRegion, BootModule, BootModules, FirmwareKind,
 };
-use helios_hal::cpu::{Cpu, Instant, ProcessorId};
+use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId};
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
@@ -532,6 +532,14 @@ impl Cpu for Aarch64Cpu {
         self.state.timer_frequency
     }
 
+    fn hardware_perf_counters(&self) -> HardwarePerfCounters {
+        HardwarePerfCounters {
+            reference_cycles: Some(read_counter()),
+            cpu_cycles: aarch64_pmu_supported().then(read_cycle_counter),
+            instructions_retired: None,
+        }
+    }
+
     fn set_deadline(&self, deadline: Instant) {
         unsafe {
             asm!("msr cntv_cval_el0, {deadline}", deadline = in(reg) deadline.ticks(), options(nomem, nostack, preserves_flags));
@@ -664,6 +672,7 @@ fn prepare_current_processor() {
         asm!("msr cpacr_el1, {cpacr}", cpacr = in(reg) cpacr, options(nomem, nostack, preserves_flags));
         asm!("isb", options(nostack, preserves_flags));
     }
+    enable_pmu_for_current_processor();
     install_exception_vectors();
 }
 
@@ -757,6 +766,39 @@ fn read_id_aa64pfr0_el1() -> u64 {
     let value: u64;
     unsafe {
         asm!("mrs {value}, id_aa64pfr0_el1", value = out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+fn read_id_aa64dfr0_el1() -> u64 {
+    let value: u64;
+    unsafe {
+        asm!("mrs {value}, id_aa64dfr0_el1", value = out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+fn aarch64_pmu_supported() -> bool {
+    let pmuver = (read_id_aa64dfr0_el1() >> 8) & 0xf;
+    pmuver != 0 && pmuver != 0xf
+}
+
+fn enable_pmu_for_current_processor() {
+    if !aarch64_pmu_supported() {
+        return;
+    }
+    unsafe {
+        let enable_reset_and_64bit_cycle_counter = (1_u64 << 0) | (1_u64 << 2) | (1_u64 << 6);
+        asm!("msr pmcr_el0, {value}", value = in(reg) enable_reset_and_64bit_cycle_counter, options(nomem, nostack, preserves_flags));
+        asm!("msr pmcntenset_el0, {value}", value = in(reg) 1_u64 << 31, options(nomem, nostack, preserves_flags));
+        asm!("isb", options(nostack, preserves_flags));
+    }
+}
+
+fn read_cycle_counter() -> u64 {
+    let value: u64;
+    unsafe {
+        asm!("mrs {value}, pmccntr_el0", value = out(reg) value, options(nomem, nostack, preserves_flags));
     }
     value
 }

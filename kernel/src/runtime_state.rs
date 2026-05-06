@@ -1,14 +1,18 @@
 extern crate alloc;
 
+use alloc::format;
+use core::panic::Location;
 use core::sync::atomic::{AtomicBool, Ordering};
 use triomphe::Arc;
 
 use crate::{
-    DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedBootFs,
-    FoldedProfileSample, FutexKey, FutexTable, FutexWaitRegistration, InstanceRegistry, Notify,
-    ProfileFilter, ProfileHistory, ProfileScope, StatsSample, TraceEvent, TraceFilter,
-    TraceHistory, embedded_init,
+    DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,
+    EmbeddedBootFs, FoldedProfileSample, FutexKey, FutexTable, FutexWaitRegistration,
+    InstanceRegistry, Notify, PerfMetricFilter, PerfMetricHistory, PerfMetricSample, ProfileFilter,
+    ProfileHistory, ProfileScope, StatsSample, TraceEvent, TraceFilter, TraceHistory,
+    embedded_init,
 };
+use helios_hal::cpu::HardwarePerfCounterDelta;
 use spin::Mutex;
 
 use crate::component_runtime::ComponentRuntimeState;
@@ -33,6 +37,7 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     tracing: Mutex<TraceHistory>,
     profiling_enabled: AtomicBool,
     profiling: Mutex<ProfileHistory>,
+    perf_metrics: Mutex<PerfMetricHistory>,
 }
 
 impl<ProgramService, NetworkService, HostFsService>
@@ -58,6 +63,7 @@ where
                 tracing: Mutex::new(TraceHistory::new(DEFAULT_TRACE_HISTORY_CAPACITY)),
                 profiling_enabled: AtomicBool::new(false),
                 profiling: Mutex::new(ProfileHistory::new(DEFAULT_PROFILE_STACK_CAPACITY)),
+                perf_metrics: Mutex::new(PerfMetricHistory::new(DEFAULT_PERF_METRIC_CAPACITY)),
             }),
         }
     }
@@ -100,6 +106,7 @@ where
 
     pub fn clear_profile(&self) {
         self.inner.profiling.lock().clear();
+        self.inner.perf_metrics.lock().clear();
     }
 
     pub fn record_profile_stack(
@@ -197,6 +204,72 @@ where
             .profiling
             .lock()
             .folded(filter, core::iter::empty(), limit)
+    }
+
+    pub fn record_perf_metric_parts_nanos(
+        &self,
+        scope: ProfileScope,
+        prefix: &str,
+        suffix: &str,
+        elapsed_nanos: u64,
+        counters: HardwarePerfCounterDelta,
+        bytes: u64,
+    ) {
+        if !self.inner.profiling_enabled.load(Ordering::Acquire) {
+            return;
+        }
+        self.inner.perf_metrics.lock().record_parts(
+            scope,
+            prefix,
+            suffix,
+            elapsed_nanos,
+            counters,
+            bytes,
+        );
+    }
+
+    pub fn record_perf_metric_str_nanos(
+        &self,
+        scope: ProfileScope,
+        name: &str,
+        elapsed_nanos: u64,
+        counters: HardwarePerfCounterDelta,
+        bytes: u64,
+    ) {
+        if !self.inner.profiling_enabled.load(Ordering::Acquire) {
+            return;
+        }
+        self.inner
+            .perf_metrics
+            .lock()
+            .record_str(scope, name, elapsed_nanos, counters, bytes);
+    }
+
+    #[track_caller]
+    pub fn record_perf_metric_at_caller_nanos(
+        &self,
+        scope: ProfileScope,
+        elapsed_nanos: u64,
+        counters: HardwarePerfCounterDelta,
+        bytes: u64,
+    ) {
+        if !self.inner.profiling_enabled.load(Ordering::Acquire) {
+            return;
+        }
+        let caller = Location::caller();
+        let name = format!("kernel;callsite;{}:{}", caller.file(), caller.line());
+        self.inner
+            .perf_metrics
+            .lock()
+            .record_str(scope, &name, elapsed_nanos, counters, bytes);
+    }
+
+    pub fn perf_metrics(
+        &self,
+        filter: &PerfMetricFilter,
+        limit: u32,
+    ) -> alloc::vec::Vec<PerfMetricSample> {
+        self.inner.perf_metrics.lock().recent(filter, limit)
     }
 
     pub fn ticks_to_nanos(&self, ticks: u64) -> u64 {
@@ -322,6 +395,26 @@ where
         weight_nanos: u64,
     ) {
         RuntimeState::record_profile_stack_parts_nanos(self, scope, prefix, suffix, weight_nanos);
+    }
+
+    fn record_perf_metric_parts_nanos(
+        &self,
+        scope: ProfileScope,
+        prefix: &str,
+        suffix: &str,
+        elapsed_nanos: u64,
+        counters: HardwarePerfCounterDelta,
+        bytes: u64,
+    ) {
+        RuntimeState::record_perf_metric_parts_nanos(
+            self,
+            scope,
+            prefix,
+            suffix,
+            elapsed_nanos,
+            counters,
+            bytes,
+        );
     }
 }
 

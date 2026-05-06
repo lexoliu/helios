@@ -19,7 +19,25 @@ interface profiling {
     weight: mono-nanos,
   }
 
+  record metric-filter {
+    name-prefixes: list<string>,
+  }
+
+  record metric-sample {
+    scope: scope,
+    name: string,
+    count: u64,
+    total-nanos: mono-nanos,
+    min-nanos: mono-nanos,
+    max-nanos: mono-nanos,
+    total-bytes: u64,
+    total-reference-cycles: u64,
+    total-cpu-cycles: u64,
+    total-instructions-retired: u64,
+  }
+
   set-enabled: func(enabled: bool);
   clear: func();
   folded: func(filter: filter, limit: u32) -> list<folded-sample>;
+  metrics: func(filter: metric-filter, limit: u32) -> list<metric-sample>;
 }

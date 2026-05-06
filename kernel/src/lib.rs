@@ -138,10 +138,11 @@ pub use network_control::{
 };
 pub use network_service::{NetworkService, TcpListenerId, TcpStreamId, UdpSocketId};
 pub use observer::{
-    DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY, FoldedProfileSample,
-    ProfileFilter, ProfileHistory, ProfileScope, StatsSample, TraceEvent, TraceField, TraceFilter,
-    TraceHistory, TraceLevel, TraceValue, matches_profile_filter, matches_trace_filter,
-    parse_console_text,
+    DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,
+    FoldedProfileSample, PerfMetricFilter, PerfMetricHistory, PerfMetricSample, ProfileFilter,
+    ProfileHistory, ProfileScope, StatsSample, TraceEvent, TraceField, TraceFilter, TraceHistory,
+    TraceLevel, TraceValue, matches_perf_metric_filter, matches_profile_filter,
+    matches_trace_filter, parse_console_text,
 };
 pub use pmm::KernelPhysFrameAllocator;
 pub use poll_registry::{

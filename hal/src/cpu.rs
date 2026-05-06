@@ -40,6 +40,40 @@ impl Instant {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HardwarePerfCounters {
+    pub reference_cycles: Option<u64>,
+    pub cpu_cycles: Option<u64>,
+    pub instructions_retired: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HardwarePerfCounterDelta {
+    pub reference_cycles: u64,
+    pub cpu_cycles: u64,
+    pub instructions_retired: u64,
+}
+
+impl HardwarePerfCounters {
+    pub fn delta_since(self, start: Self) -> HardwarePerfCounterDelta {
+        HardwarePerfCounterDelta {
+            reference_cycles: wrapping_option_delta(self.reference_cycles, start.reference_cycles),
+            cpu_cycles: wrapping_option_delta(self.cpu_cycles, start.cpu_cycles),
+            instructions_retired: wrapping_option_delta(
+                self.instructions_retired,
+                start.instructions_retired,
+            ),
+        }
+    }
+}
+
+const fn wrapping_option_delta(end: Option<u64>, start: Option<u64>) -> u64 {
+    match (end, start) {
+        (Some(end), Some(start)) => end.wrapping_sub(start),
+        _ => 0,
+    }
+}
+
 pub trait Cpu: Send + Sync + 'static {
     /// Returns the processor currently executing this code path.
     ///
@@ -91,6 +125,17 @@ pub trait Cpu: Send + Sync + 'static {
     /// backend timer ticks without hardcoding any platform frequency in kernel
     /// code.
     fn timer_frequency(&self) -> u64;
+
+    /// Snapshots hardware performance counters visible to the current
+    /// privilege level on the current processor.
+    ///
+    /// Backends fill only counters that are genuinely backed by CPU
+    /// hardware on that target. Unsupported counters stay `None`;
+    /// the kernel records them as absent rather than inventing software
+    /// substitutes.
+    fn hardware_perf_counters(&self) -> HardwarePerfCounters {
+        HardwarePerfCounters::default()
+    }
 
     /// Programs the next wakeup deadline for the current processor.
     ///

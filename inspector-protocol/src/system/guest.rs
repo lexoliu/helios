@@ -12,8 +12,8 @@ use crate::wire::{Frame, read_frame, write_frame};
 use super::bindings::helios::system::{instances, profiling, programs, stats, tracing};
 use super::methods::{
     INSTANCES_INSTANCE, INSTANCES_SNAPSHOT, PROFILING_CLEAR, PROFILING_FOLDED, PROFILING_INSTANCE,
-    PROFILING_SET_ENABLED, PROGRAMS_AOT, PROGRAMS_EXEC, PROGRAMS_INSTANCE, STATS_INSTANCE,
-    STATS_SNAPSHOT, TRACING_INSTANCE, TRACING_RECENT,
+    PROFILING_METRICS, PROFILING_SET_ENABLED, PROGRAMS_AOT, PROGRAMS_EXEC, PROGRAMS_INSTANCE,
+    STATS_INSTANCE, STATS_SNAPSHOT, TRACING_INSTANCE, TRACING_RECENT,
 };
 use crate::debugger::{filesystem, programs as debugger_programs};
 
@@ -123,6 +123,7 @@ fn supports_request(instance: &str, func: &str) -> bool {
             | (PROFILING_INSTANCE, PROFILING_SET_ENABLED)
             | (PROFILING_INSTANCE, PROFILING_CLEAR)
             | (PROFILING_INSTANCE, PROFILING_FOLDED)
+            | (PROFILING_INSTANCE, PROFILING_METRICS)
     ) || filesystem::supports(instance, func)
         || debugger_programs::supports(instance, func)
 }
@@ -271,6 +272,18 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>,
                 .collect::<Vec<_>>();
             postcard::to_allocvec(&samples).map_err(|source| DispatchError::Encode {
                 operation: "profiling.folded",
+                source,
+            })
+        }
+        (PROFILING_INSTANCE, PROFILING_METRICS) => {
+            let (filter, limit): (profiling::MetricFilter, u32) = postcard::from_bytes(payload)
+                .map_err(|source| DispatchError::Decode {
+                    operation: "profiling.metrics",
+                    source,
+                })?;
+            let samples = host_profiling::metrics(&filter, limit);
+            postcard::to_allocvec(&samples).map_err(|source| DispatchError::Encode {
+                operation: "profiling.metrics",
                 source,
             })
         }
