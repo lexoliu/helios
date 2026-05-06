@@ -230,6 +230,9 @@ struct TcpSocketSlab {
     slots: Box<[Option<TcpSocket<BbrV3>>]>,
     free: [usize; MAX_TCP_SOCKETS],
     free_len: usize,
+    active: [usize; MAX_TCP_SOCKETS],
+    active_positions: [usize; MAX_TCP_SOCKETS],
+    active_len: usize,
     endpoint_index: TcpEndpointIndex,
     listener_index: TcpListenerIndex,
 }
@@ -273,9 +276,23 @@ impl TcpSocketSlab {
             slots: slots.into_boxed_slice(),
             free: core::array::from_fn(|index| MAX_TCP_SOCKETS - 1 - index),
             free_len: MAX_TCP_SOCKETS,
+            active: [0; MAX_TCP_SOCKETS],
+            active_positions: [0; MAX_TCP_SOCKETS],
+            active_len: 0,
             endpoint_index: TcpEndpointIndex::new(),
             listener_index: TcpListenerIndex::new(),
         }
+    }
+
+    const fn active_len(&self) -> usize {
+        self.active_len
+    }
+
+    fn active_index(&self, slot: usize) -> usize {
+        *self
+            .active
+            .get(slot)
+            .unwrap_or_else(|| panic!("TCP active socket slot {slot} is outside active set"))
     }
 
     fn get(&self, index: usize) -> Option<&Option<TcpSocket<BbrV3>>> {
@@ -308,6 +325,7 @@ impl TcpSocketSlab {
         if let Some(key) = listener_key {
             self.listener_index.insert(key, index);
         }
+        self.insert_active(index);
         socket_id(index)
     }
 
@@ -319,9 +337,33 @@ impl TcpSocketSlab {
         } else if let Some(local) = socket.local_endpoint() {
             self.listener_index.remove(local);
         }
+        self.remove_active(index);
         self.free[self.free_len] = index;
         self.free_len += 1;
         Some(socket)
+    }
+
+    fn insert_active(&mut self, index: usize) {
+        assert!(
+            self.active_len < MAX_TCP_SOCKETS,
+            "TCP active socket index is full"
+        );
+        self.active_positions[index] = self.active_len;
+        self.active[self.active_len] = index;
+        self.active_len += 1;
+    }
+
+    fn remove_active(&mut self, index: usize) {
+        assert!(self.active_len != 0, "TCP active socket index underflowed");
+        let position = self.active_positions[index];
+        assert!(
+            position < self.active_len && self.active[position] == index,
+            "TCP active socket index is corrupt"
+        );
+        self.active_len -= 1;
+        let moved = self.active[self.active_len];
+        self.active[position] = moved;
+        self.active_positions[moved] = position;
     }
 
     fn find_endpoint(&self, local: TcpEndpoint, remote: TcpEndpoint) -> Option<usize> {
@@ -756,10 +798,11 @@ impl Stack {
         let mut pending_ack = ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader), 16>::new();
         let mut pending_retransmit = ArrayVec::<(usize, TcpTransmitSegment), 16>::new();
         let mut pending_data = ArrayVec::<(usize, TcpTransmitSegment), 16>::new();
-        for index in 0..MAX_TCP_SOCKETS {
+        for active_slot in 0..self.tcp.active_len() {
+            let index = self.tcp.active_index(active_slot);
             let deadline = {
                 let Some(socket) = self.tcp.get_mut(index).and_then(Option::as_mut) else {
-                    continue;
+                    panic!("TCP active socket index referenced a missing socket");
                 };
                 socket.expire_timers(now.nanos());
                 if let (Some(local), Some(remote)) =
@@ -1755,7 +1798,8 @@ impl Stack {
 
     fn rebuild_tcp_timer_heap(&mut self) {
         self.tcp_timers.clear();
-        for index in 0..MAX_TCP_SOCKETS {
+        for active_slot in 0..self.tcp.active_len() {
+            let index = self.tcp.active_index(active_slot);
             let Some(deadline_nanos) = self.tcp_timer_deadlines[index] else {
                 continue;
             };
@@ -2339,15 +2383,22 @@ mod tests {
             address: IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
             port: 8001,
         });
+        assert_eq!(stack.tcp.active_len(), 2);
 
         stack
             .remove_tcp_socket(first)
             .expect("allocated socket should be removable");
+        assert_eq!(stack.tcp.active_len(), 1);
+        assert_eq!(stack.tcp.active_index(0), socket_index(second));
+
         let reused = stack.open_tcp_listen(TcpEndpoint {
             address: IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
             port: 8002,
         });
 
+        assert_eq!(stack.tcp.active_len(), 2);
+        assert_eq!(stack.tcp.active_index(0), socket_index(second));
+        assert_eq!(stack.tcp.active_index(1), socket_index(reused));
         assert_eq!(reused.raw(), first.raw());
         assert_ne!(reused.raw(), second.raw());
     }
