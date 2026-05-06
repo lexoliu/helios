@@ -25,6 +25,14 @@
         "-c",
         "import json; data=[{\"i\":i,\"s\":str(i)} for i in range(800)]; total=sum(len(json.loads(json.dumps(data,separators=(\",\",\":\")))) for _ in range(40)); print(f\"cpython-json:{total}\")"
       ],
+      "wasmtime_profile": {
+        "wasm_path": "artifacts/python3-root/python3.wasm",
+        "wasmtime_flags": ["--dir", "{repo_root}/artifacts/python3-root::/"],
+        "args": [
+          "-c",
+          "import json; data=[{\"i\":i,\"s\":str(i)} for i in range(800)]; total=sum(len(json.loads(json.dumps(data,separators=(\",\",\":\")))) for _ in range(40)); print(f\"cpython-json:{total}\")"
+        ]
+      },
       "boot_programs": ["python3"],
       "stdout_contains": ["cpython-json:32000"]
     },
@@ -38,6 +46,14 @@
         "-c",
         "import re; text=(\"alpha123 beta456 gamma789 delta000\\n\"*2000); total=sum(len(re.findall(r\"[a-z]+\\d+\", text)) for _ in range(80)); print(f\"cpython-regex:{total}\")"
       ],
+      "wasmtime_profile": {
+        "wasm_path": "artifacts/python3-root/python3.wasm",
+        "wasmtime_flags": ["--dir", "{repo_root}/artifacts/python3-root::/"],
+        "args": [
+          "-c",
+          "import re; text=(\"alpha123 beta456 gamma789 delta000\\n\"*2000); total=sum(len(re.findall(r\"[a-z]+\\d+\", text)) for _ in range(80)); print(f\"cpython-regex:{total}\")"
+        ]
+      },
       "boot_programs": ["python3"],
       "stdout_contains": ["cpython-regex:640000"]
     },
@@ -57,6 +73,9 @@
       "description": "Execute a deterministic wasm SIMD lane computation.",
       "program": "{simd_lanes}",
       "boot_programs": ["simd-lanes"],
+      "wasmtime_profile": {
+        "wasm_path": "artifacts/wasix/simd-lanes/simd-lanes.wasm"
+      },
       "stdout_contains": ["simd-lanes:17"],
       "stderr_empty": true
     },

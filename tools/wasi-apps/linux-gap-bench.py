@@ -350,6 +350,40 @@ def run_linux(
     return hyperfine_json, digest
 
 
+def run_wasmtime_profiles(
+    manifest: Path,
+    out_dir: Path,
+    workload_names: list[str],
+    mode: str,
+    host_http_url: str | None,
+    wasmtime_bin: str,
+    no_flamegraph: bool,
+) -> list[Path]:
+    outputs = []
+    for workload_name in workload_names:
+        profile_out = out_dir / f"wasmtime-profile-{workload_name}-{mode}"
+        command = [
+            "tools/wasi-apps/wasmtime-profile.sh",
+            "--manifest",
+            str(manifest),
+            "--workload",
+            workload_name,
+            "--mode",
+            mode,
+            "--out-dir",
+            str(profile_out),
+            "--wasmtime-bin",
+            wasmtime_bin,
+        ]
+        if host_http_url:
+            command.extend(["--host-http-url", host_http_url])
+        if no_flamegraph:
+            command.append("--no-flamegraph")
+        run(command)
+        outputs.append(profile_out / "wasmtime-profile.json")
+    return outputs
+
+
 def parse_jsonl(path: Path | None) -> tuple[dict, dict[str, dict]]:
     if path is None or not path.exists():
         return {}, {}
@@ -605,6 +639,7 @@ def write_report(
     linux_json: Path | None,
     docker_digest: str | None,
     host_load: dict,
+    wasmtime_profiles: list[Path],
 ) -> None:
     run_record, helios = parse_jsonl(helios_jsonl)
     linux = parse_hyperfine(linux_json)
@@ -705,6 +740,17 @@ def write_report(
     if helios_jsonl:
         for profile_path in sorted(helios_jsonl.parent.glob("helios*.kernel.folded")):
             lines.append(f"- Helios kernel folded profile is in `{profile_path}`.")
+    if wasmtime_profiles:
+        lines.extend(["", "## Wasmtime Profiles", ""])
+        for profile_path in wasmtime_profiles:
+            profile = json.loads(profile_path.read_text(encoding="utf-8"))
+            lines.append(f"- `{profile['workload']}` `{profile['mode']}` metadata: `{profile_path}`")
+            if "firefox_profile_json" in profile:
+                lines.append(f"- `{profile['workload']}` Firefox profiler JSON: `{profile['firefox_profile_json']}`")
+            if "svg" in profile:
+                lines.append(f"- `{profile['workload']}` flamegraph SVG: `{profile['svg']}`")
+            if "folded" in profile:
+                lines.append(f"- `{profile['workload']}` folded perf stacks: `{profile['folded']}`")
     lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -722,6 +768,10 @@ def main() -> None:
     parser.add_argument("--out-dir", type=Path)
     parser.add_argument("--skip-helios", action="store_true")
     parser.add_argument("--skip-linux", action="store_true")
+    parser.add_argument("--wasmtime-profile-workload", action="append", default=[])
+    parser.add_argument("--wasmtime-profile-mode", choices=["guest", "perfmap", "jitdump"], default="guest")
+    parser.add_argument("--wasmtime-bin", default=os.environ.get("WASMTIME_BIN", "wasmtime"))
+    parser.add_argument("--wasmtime-no-flamegraph", action="store_true")
     parser.add_argument("--max-host-load-per-cpu", type=float, default=DEFAULT_MAX_HOST_LOAD_PER_CPU)
     parser.add_argument("--allow-busy-host", action="store_true")
     args = parser.parse_args()
@@ -744,17 +794,21 @@ def main() -> None:
     http_root.mkdir(exist_ok=True)
     write_http_payloads(http_root)
 
-    needs_http = any(workload.get("requires_host_http", False) for workload in workloads)
+    profile_workloads = selected_workloads(manifest, [], args.wasmtime_profile_workload) if args.wasmtime_profile_workload else []
+    needs_http = any(workload.get("requires_host_http", False) for workload in workloads + profile_workloads)
     server = None
     host_http_url = None
+    local_http_url = None
     if needs_http:
         server, port = start_host_http(http_root)
         host_http_url = f"http://{args.helios_host_http_host}:{port}/{HTTP_PAYLOAD_FILE}"
+        local_http_url = f"http://127.0.0.1:{port}/{HTTP_PAYLOAD_FILE}"
 
     try:
         helios_jsonl = None
         linux_json = None
         docker_digest = None
+        wasmtime_profiles = []
         if not args.skip_helios:
             helios_jsonl = run_helios(
                 args.manifest,
@@ -774,8 +828,27 @@ def main() -> None:
                 host_http_url,
                 args.linux_http_port,
             )
+        if args.wasmtime_profile_workload:
+            wasmtime_profiles = run_wasmtime_profiles(
+                args.manifest,
+                out_dir,
+                args.wasmtime_profile_workload,
+                args.wasmtime_profile_mode,
+                local_http_url,
+                args.wasmtime_bin,
+                args.wasmtime_no_flamegraph,
+            )
         report = out_dir / "report.md"
-        write_report(report, manifest, workloads, helios_jsonl, linux_json, docker_digest, host_load)
+        write_report(
+            report,
+            manifest,
+            workloads,
+            helios_jsonl,
+            linux_json,
+            docker_digest,
+            host_load,
+            wasmtime_profiles,
+        )
         print(report)
     finally:
         if server:
