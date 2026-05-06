@@ -1,8 +1,9 @@
+use bytes::Bytes;
 use divan::counter::ItemsCount;
 use divan::{AllocProfiler, Bencher, black_box};
 use helios_hal::fs::FileRights;
 use helios_hal::resource::KernelResource;
-use helios_kernel::{DescriptorId, DescriptorTable};
+use helios_kernel::{DescriptorId, DescriptorTable, TryRead, byte_channel};
 
 #[global_allocator]
 static ALLOC: AllocProfiler = AllocProfiler::system();
@@ -77,6 +78,28 @@ fn descriptor_sparse_renumber_reuse_with_table(
                 .insert(file(1), false)
                 .expect("descriptor insert should reuse sparse free slot"),
         );
+    });
+}
+
+#[divan::bench(args = [16usize, 64, 256])]
+fn byte_channel_write_try_read(bencher: Bencher, count: usize) {
+    bencher.counter(ItemsCount::new(count)).bench_local(|| {
+        let (writer, reader) = byte_channel();
+        let payload = Bytes::from_static(b"helios-byte-channel");
+        for _ in 0..count {
+            writer
+                .write(payload.clone())
+                .expect("reader is alive during byte channel benchmark");
+        }
+        for _ in 0..count {
+            match reader.try_read() {
+                TryRead::Ready(bytes) => {
+                    black_box(bytes);
+                }
+                TryRead::Pending => panic!("byte channel benchmark lost queued bytes"),
+                TryRead::Eof => panic!("byte channel benchmark reached EOF before draining bytes"),
+            }
+        }
     });
 }
 
