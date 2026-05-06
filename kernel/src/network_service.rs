@@ -1454,11 +1454,26 @@ where
                 }
             }
             if deferred_transmit {
-                self.drive_network(NetworkPollSource::Tcp)
+                // Receive-only TCP bursts already drove the stack; the hot path
+                // only needs to publish generated ACK/window-update frames here.
+                // Re-entering a full network poll showed up as extra
+                // `tcp-read-drive-network` work in local AArch64/HVF profiles.
+                let budget = self.inner.state.with(|state| state.poll.budget());
+                let (transmitted, _) = self
+                    .submit_network_transmit(NetworkPollSource::Tcp, budget)
                     .await
                     .map_err(|error| {
                         TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed)
                     })?;
+                if transmitted != 0 {
+                    self.inner.state.with_mut(|state| {
+                        state.poll.complete(NetworkPollProgress {
+                            received_frames: 0,
+                            reclaimed_tx: 0,
+                            transmitted_frames: transmitted,
+                        });
+                    });
+                }
             }
         }
         self.poll_tcp_read_once(stream, max_bytes, "tcp-read-after-drive")
@@ -1645,11 +1660,36 @@ where
             );
         }
 
+        let (transmitted, _) = if submit_transmit {
+            self.submit_network_transmit(source, budget).await?
+        } else {
+            (0, 0)
+        };
+        let progress = NetworkPollProgress {
+            received_frames: received,
+            reclaimed_tx: reclaimed,
+            transmitted_frames: transmitted,
+        };
+        self.inner.state.with_mut(|state| {
+            state.poll.complete(progress);
+        });
+        Ok(NetworkPollOutcome {
+            progress,
+            budget,
+            tcp_read,
+        })
+    }
+
+    async fn submit_network_transmit(
+        &self,
+        source: NetworkPollSource,
+        budget: NetworkPollBudget,
+    ) -> Result<(usize, usize), IoError> {
         let mut transmitted = 0usize;
         let mut transmitted_bytes = 0usize;
         let transmit_started = self.profile_start();
         let mut transmit_stop = NetworkTransmitStop::Drained;
-        while submit_transmit && transmitted < budget.tx_frames {
+        while transmitted < budget.tx_frames {
             let remaining_budget = budget.tx_frames - transmitted;
             let immediate_started = self.profile_start();
             let mut immediate_device_started = None;
@@ -1762,19 +1802,7 @@ where
                 transmitted_bytes,
             );
         }
-        let progress = NetworkPollProgress {
-            received_frames: received,
-            reclaimed_tx: reclaimed,
-            transmitted_frames: transmitted,
-        };
-        self.inner.state.with_mut(|state| {
-            state.poll.complete(progress);
-        });
-        Ok(NetworkPollOutcome {
-            progress,
-            budget,
-            tcp_read,
-        })
+        Ok((transmitted, transmitted_bytes))
     }
 
     async fn wait_for_progress(&self, duration: Duration) {
