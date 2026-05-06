@@ -632,10 +632,6 @@ fn read_mtu<T: VirtioTransport>(transport: &T, accepted_features: u64) -> usize 
     mtu
 }
 
-fn as_bytes<T>(value: &T) -> &[u8] {
-    unsafe { core::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>()) }
-}
-
 fn slot_buffer_mut<'a>(
     buffers: &'a mut [u8],
     buffer_len: usize,
@@ -686,8 +682,9 @@ fn write_tx_payload(buffer: &mut [u8], header_len: usize, frame: &[u8]) -> IoRes
         });
     }
 
-    let header = VirtioNetHeader::default();
-    buffer[..header_len].copy_from_slice(as_bytes(&header));
+    // TX buffers are zero-initialized and the current net feature set does not
+    // enable offloads, so the virtio-net header remains the all-zero default.
+    // Keep the hot path to the payload copy only.
     buffer[header_len..payload_len].copy_from_slice(frame);
     Ok(payload_len)
 }
