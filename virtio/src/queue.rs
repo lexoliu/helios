@@ -138,9 +138,8 @@ impl<T: VirtioTransport> VirtQueue<T> {
         }
 
         let head = self.free_head;
-        let last = self.push_descriptor(transport, input, false)?;
-        self.desc_shadow[usize::from(last)].flags &= !DESC_FLAG_NEXT;
-        self.write_desc(last);
+        self.free_head = self.desc_shadow[usize::from(head)].next;
+        self.write_descriptor_with_flags(transport, head, input, 0)?;
         self.num_used += 1;
         Ok(head)
     }
@@ -222,12 +221,22 @@ impl<T: VirtioTransport> VirtQueue<T> {
         buffer: &[u8],
         writable: bool,
     ) -> IoResult<()> {
-        let desc = &mut self.desc_shadow[usize::from(desc_index)];
-        let addr = transport.bus().dma().dma_addr(buffer.as_ptr())?;
         let mut flags = DESC_FLAG_NEXT;
         if writable {
             flags |= DESC_FLAG_WRITE;
         }
+        self.write_descriptor_with_flags(transport, desc_index, buffer, flags)
+    }
+
+    fn write_descriptor_with_flags(
+        &mut self,
+        transport: &T,
+        desc_index: u16,
+        buffer: &[u8],
+        flags: u16,
+    ) -> IoResult<()> {
+        let desc = &mut self.desc_shadow[usize::from(desc_index)];
+        let addr = transport.bus().dma().dma_addr(buffer.as_ptr())?;
 
         *desc = Descriptor {
             addr,
@@ -553,6 +562,12 @@ mod tests {
         let second_token = queue
             .submit_read_only_deferred(&transport, &second)
             .expect("second deferred submission should succeed");
+
+        let desc_table = queue.descriptors.as_ptr().cast::<Descriptor>();
+        let first_desc = unsafe { desc_table.add(usize::from(first_token)).read() };
+        let second_desc = unsafe { desc_table.add(usize::from(second_token)).read() };
+        assert_eq!(first_desc.flags & 1, 0);
+        assert_eq!(second_desc.flags & 1, 0);
 
         let unpublished_avail_idx = unsafe {
             queue
