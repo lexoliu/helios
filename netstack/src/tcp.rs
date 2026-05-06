@@ -119,6 +119,39 @@ impl core::ops::Index<usize> for TcpOutOfOrderQueue {
 }
 
 #[derive(Clone, Debug)]
+struct TcpTransmitQueue {
+    segments: Box<Deque<Bytes, MAX_TCP_QUEUED_SEGMENTS>>,
+}
+
+impl TcpTransmitQueue {
+    fn new() -> Self {
+        Self {
+            segments: Box::new(Deque::new()),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    fn is_full(&self) -> bool {
+        self.segments.is_full()
+    }
+
+    fn push_back(&mut self, bytes: Bytes) -> Result<(), Bytes> {
+        self.segments.push_back(bytes)
+    }
+
+    fn push_front(&mut self, bytes: Bytes) -> Result<(), Bytes> {
+        self.segments.push_front(bytes)
+    }
+
+    fn pop_front(&mut self) -> Option<Bytes> {
+        self.segments.pop_front()
+    }
+}
+
+#[derive(Clone, Debug)]
 struct TcpReceiveQueue {
     segments: Box<Deque<BytesMut, MAX_TCP_RECEIVE_SEGMENTS>>,
 }
@@ -245,7 +278,7 @@ where
     receive_fin_sequence: Option<u32>,
     out_of_order: Option<TcpOutOfOrderQueue>,
     out_of_order_queued_bytes: usize,
-    transmit_queue: Deque<Bytes, MAX_TCP_QUEUED_SEGMENTS>,
+    transmit_queue: Option<TcpTransmitQueue>,
     in_flight: Deque<TcpInFlightSegment, MAX_TCP_QUEUED_SEGMENTS>,
     bytes_in_flight: u32,
     delivered_bytes: u64,
@@ -287,7 +320,7 @@ where
             receive_fin_sequence: None,
             out_of_order: None,
             out_of_order_queued_bytes: 0,
-            transmit_queue: Deque::new(),
+            transmit_queue: None,
             in_flight: Deque::new(),
             bytes_in_flight: 0,
             delivered_bytes: 0,
@@ -548,16 +581,18 @@ where
         if !matches!(self.state, TcpState::Established | TcpState::CloseWait) {
             return 0;
         }
-        if self.transmit_queue.is_full() {
+        if self.transmit_queue_is_full() {
             return 0;
         }
         let window = self.available_send_window();
         let writable = bytes.len().min(window);
         if writable != 0 {
             let segment = bytes.split_to(writable);
-            self.transmit_queue.push_back(segment).unwrap_or_else(|_| {
-                panic!("TCP transmit queue reported full after capacity check")
-            });
+            self.transmit_queue_mut()
+                .push_back(segment)
+                .unwrap_or_else(|_| {
+                    panic!("TCP transmit queue reported full after capacity check")
+                });
         }
         writable
     }
@@ -581,7 +616,7 @@ where
             }
         }
 
-        if !self.transmit_queue.is_empty() {
+        if !self.transmit_queue_is_empty() {
             return None;
         }
 
@@ -651,7 +686,7 @@ where
         });
         let pacing_deadline = self
             .next_pacing_send_nanos
-            .filter(|_| !self.transmit_queue.is_empty());
+            .filter(|_| !self.transmit_queue_is_empty());
         min_deadline(
             min_deadline(
                 min_deadline(rto_deadline, pacing_deadline),
@@ -674,11 +709,11 @@ where
         {
             return None;
         }
-        let mut payload = self.transmit_queue.pop_front()?;
+        let mut payload = self.transmit_queue.as_mut()?.pop_front()?;
         let maximum_segment = available.min(self.peer_max_segment_size);
         if payload.len() > maximum_segment {
             let tail = payload.split_off(maximum_segment);
-            self.transmit_queue
+            self.transmit_queue_mut()
                 .push_front(tail)
                 .unwrap_or_else(|_| panic!("TCP transmit queue lost capacity while splitting"));
         }
@@ -902,7 +937,7 @@ where
                     action = self.acknowledge_sent(
                         packet.acknowledgement,
                         now_nanos,
-                        self.transmit_queue.is_empty(),
+                        self.transmit_queue_is_empty(),
                         packet.options.timestamp(),
                     );
                 }
@@ -1108,6 +1143,23 @@ where
     fn out_of_order_mut(&mut self) -> &mut TcpOutOfOrderQueue {
         self.out_of_order
             .get_or_insert_with(TcpOutOfOrderQueue::new)
+    }
+
+    fn transmit_queue_is_empty(&self) -> bool {
+        self.transmit_queue
+            .as_ref()
+            .is_none_or(TcpTransmitQueue::is_empty)
+    }
+
+    fn transmit_queue_is_full(&self) -> bool {
+        self.transmit_queue
+            .as_ref()
+            .is_some_and(TcpTransmitQueue::is_full)
+    }
+
+    fn transmit_queue_mut(&mut self) -> &mut TcpTransmitQueue {
+        self.transmit_queue
+            .get_or_insert_with(TcpTransmitQueue::new)
     }
 
     fn push_receive_payload(&mut self, payload: &[u8]) -> Result<(), ()> {
