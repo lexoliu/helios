@@ -583,6 +583,28 @@ where
             bytes,
         );
     }
+
+    fn record_perf_metric_parts_events_nanos(
+        &self,
+        scope: ProfileScope,
+        prefix: &str,
+        suffix: &str,
+        events: u64,
+        elapsed_nanos: u64,
+        counters: HardwarePerfCounterDelta,
+        bytes: u64,
+    ) {
+        RuntimeState::record_perf_metric_parts_events_nanos(
+            self,
+            scope,
+            prefix,
+            suffix,
+            events,
+            elapsed_nanos,
+            counters,
+            bytes,
+        );
+    }
 }
 
 impl<ProgramService, NetworkService, HostFsService> ComponentHostFilesystemState<HostFsService>

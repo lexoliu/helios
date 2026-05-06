@@ -164,6 +164,18 @@ mod tests {
             _: u64,
         ) {
         }
+
+        fn record_perf_metric_parts_events_nanos(
+            &self,
+            _: ProfileScope,
+            _: &str,
+            _: &str,
+            _: u64,
+            _: u64,
+            _: helios_hal::cpu::HardwarePerfCounterDelta,
+            _: u64,
+        ) {
+        }
     }
 
     #[test]

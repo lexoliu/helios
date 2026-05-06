@@ -1198,7 +1198,7 @@ where
             .reclaim_transmit_completions(budget.tx_completions)
             .await?;
         if reclaimed != 0 {
-            self.record_network_profile("tx-reclaim", reclaim_started);
+            self.record_network_profile_events("tx-reclaim", reclaim_started, reclaimed);
         }
 
         let mut received = 0usize;
@@ -1268,7 +1268,7 @@ where
                 break;
             }
         }
-        self.record_network_profile("rx-drain", receive_started);
+        self.record_network_profile_events("rx-drain", receive_started, received);
 
         let tcp_started = self.profile_start();
         {
@@ -1337,7 +1337,11 @@ where
             transmit_stop = NetworkTransmitStop::Budget;
         }
         if transmitted != 0 {
-            self.record_network_profile(transmit_stop.profile_phase(), transmit_started);
+            self.record_network_profile_events(
+                transmit_stop.profile_phase(),
+                transmit_started,
+                transmitted,
+            );
         }
         let progress = NetworkPollProgress {
             received_frames: received,
@@ -1420,6 +1424,15 @@ where
     }
 
     fn record_network_profile(&self, phase: &'static str, start: Option<NetworkPerfStart>) {
+        self.record_network_profile_events(phase, start, 0);
+    }
+
+    fn record_network_profile_events(
+        &self,
+        phase: &'static str,
+        start: Option<NetworkPerfStart>,
+        events: usize,
+    ) {
         if let Some(start) = start {
             let now_nanos = self.now_nanos();
             let counters = self
@@ -1434,14 +1447,17 @@ where
                 phase,
                 elapsed_nanos,
             );
-            self.inner.runtime_state.record_perf_metric_parts_nanos(
-                crate::ProfileScope::Kernel,
-                "kernel;network;",
-                phase,
-                elapsed_nanos,
-                counters,
-                0,
-            );
+            self.inner
+                .runtime_state
+                .record_perf_metric_parts_events_nanos(
+                    crate::ProfileScope::Kernel,
+                    "kernel;network;",
+                    phase,
+                    usize_to_u64(events, "network profile event count"),
+                    elapsed_nanos,
+                    counters,
+                    0,
+                );
         }
     }
 
@@ -2638,6 +2654,10 @@ fn udp_socket_id(index: usize) -> UdpSocketId {
 fn socket_index(socket: UdpSocketId) -> usize {
     usize::try_from(socket.0.get() - 1)
         .unwrap_or_else(|_| panic!("udp socket id {} does not fit into usize", socket.0.get()))
+}
+
+fn usize_to_u64(value: usize, label: &'static str) -> u64 {
+    u64::try_from(value).unwrap_or_else(|_| panic!("{label} does not fit into u64"))
 }
 
 #[cfg(test)]
