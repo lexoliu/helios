@@ -12,11 +12,11 @@
 
 extern crate alloc;
 
-use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use concurrent_queue::{ConcurrentQueue, PopError, PushError};
+use triomphe::Arc;
 
 use crate::{Notify, NotifyWaiter};
 
