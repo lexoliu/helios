@@ -59,6 +59,12 @@ environment, place a pre-downloaded
 
 The shell and coreutils artifacts must be official Wasmer package payloads;
 QuickJS is staged from the matching official QuickJS-NG WASI release asset.
+The Fedora/QEMU native QuickJS benchmark inspects
+`artifacts/wasix/quickjs/qjs.wasm` before provisioning: if that wasm contains
+SIMD instructions, native QuickJS is built with native SIMD enabled; otherwise
+native QuickJS is built with SIMD disabled so `quickjs-loop` does not compare a
+vectorized Linux interpreter against a scalar Helios interpreter. Explicit SIMD
+throughput is measured by the separate `wasm-simd-lanes` workload.
 In an offline environment, pass the raw modules:
 
 ```bash

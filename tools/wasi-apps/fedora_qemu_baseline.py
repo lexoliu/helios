@@ -5,6 +5,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import tomllib
 import time
 from pathlib import Path
 
@@ -19,6 +20,7 @@ DEFAULT_MEMORY = "2G"
 DEFAULT_SMP = 4
 QUICKJS_SOURCE_URL = "https://github.com/quickjs-ng/quickjs/archive/refs/tags/v0.14.0.tar.gz"
 QUICKJS_VERSION = "0.14.0"
+QUICKJS_POLICY_FILE = "/var/lib/helios-fedora-qemu-bench-quickjs-policy"
 SSH_USER = "bench"
 REMOTE_ROOT = "/home/bench/helios"
 REMOTE_OUT = "/home/bench/out"
@@ -52,6 +54,67 @@ def output(command: list[str], cwd: Path, timeout: int | None = None) -> str:
         timeout=timeout,
     )
     return completed.stdout.strip()
+
+
+def quickjs_wasm_artifact(repo_root: Path) -> Path:
+    manifest_path = repo_root / "tools/wasi-apps/boot-artifacts.toml"
+    manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+    for artifact in manifest["artifact"]:
+        if artifact["command"] == "quickjs":
+            return repo_root / artifact["source"]
+    raise SystemExit(f"boot artifact manifest does not define quickjs: {manifest_path}")
+
+
+def wasm_uses_simd(repo_root: Path, path: Path) -> bool:
+    if not path.is_file():
+        raise SystemExit(f"cannot inspect missing QuickJS wasm artifact for SIMD: {path}")
+    text = output(["wasm-tools", "print", str(path)], repo_root, timeout=60)
+    simd_tokens = (
+        "v128.",
+        "i8x16.",
+        "i16x8.",
+        "i32x4.",
+        "i64x2.",
+        "f32x4.",
+        "f64x2.",
+    )
+    return any(token in text for token in simd_tokens)
+
+
+# QuickJS measures interpreter/runtime CPU cost, not vector throughput. Keep the
+# Fedora native build in SIMD lockstep with the Helios wasm artifact, and use the
+# separate simd-lanes workload when the benchmark needs explicit vector evidence.
+def quickjs_native_policy(repo_root: Path) -> dict:
+    wasm_path = quickjs_wasm_artifact(repo_root)
+    uses_simd = wasm_uses_simd(repo_root, wasm_path)
+    relative_wasm = wasm_path.relative_to(repo_root)
+    if uses_simd:
+        return {
+            "id": f"quickjs-{QUICKJS_VERSION}-native-simd",
+            "wasm_path": str(relative_wasm),
+            "wasm_uses_simd": True,
+            "cmake_c_flags_release": "-O2 -DNDEBUG -mcpu=native",
+            "baseline_strategy": (
+                "built from QuickJS-NG v0.14.0 source with native SIMD enabled "
+                "because the Helios WASI QuickJS artifact contains wasm SIMD instructions"
+            ),
+            "native_simd_policy": (
+                "enabled for QuickJS fairness; Helios and Fedora both execute SIMD-capable QuickJS"
+            ),
+        }
+    return {
+        "id": f"quickjs-{QUICKJS_VERSION}-native-nosimd",
+        "wasm_path": str(relative_wasm),
+        "wasm_uses_simd": False,
+        "cmake_c_flags_release": "-O2 -DNDEBUG -march=armv8-a+nosimd",
+        "baseline_strategy": (
+            "built from QuickJS-NG v0.14.0 source with -march=armv8-a+nosimd "
+            "because the Helios WASI QuickJS artifact does not contain wasm SIMD instructions"
+        ),
+        "native_simd_policy": (
+            "disabled for QuickJS fairness; native SIMD is measured only by the separate simd-lanes workload"
+        ),
+    }
 
 
 def free_tcp_port() -> int:
@@ -288,12 +351,22 @@ def shutdown_vm(repo_root: Path, key: Path, port: int, process: subprocess.Popen
         stop_vm(process)
 
 
-def ensure_provisioned(repo_root: Path, key: Path, port: int, timeout_seconds: int) -> None:
+def ensure_provisioned(
+    repo_root: Path,
+    key: Path,
+    port: int,
+    timeout_seconds: int,
+    quickjs_policy: dict,
+) -> None:
     marker = "/var/lib/helios-fedora-qemu-bench-provisioned"
     quickjs_version_check = f"strings /usr/local/bin/qjs | grep -q '{QUICKJS_VERSION}'"
+    quickjs_policy_check = (
+        f"test \"$(cat {QUICKJS_POLICY_FILE} 2>/dev/null)\" = {shlex.quote(quickjs_policy['id'])}"
+    )
     verify_command = " && ".join(
         [
             quickjs_version_check,
+            quickjs_policy_check,
             "/usr/local/bin/qjs -e 'console.log(\"qjs:ok\")' | grep -q 'qjs:ok'",
             "/usr/local/bin/helios-simd-lanes | grep -q 'simd-lanes:17'",
             "hyperfine --version >/dev/null",
@@ -308,9 +381,12 @@ def ensure_provisioned(repo_root: Path, key: Path, port: int, timeout_seconds: i
             f"curl --fail --location --output \"$quickjs_work/quickjs.tar.gz\" {shlex.quote(QUICKJS_SOURCE_URL)}",
             "tar -C \"$quickjs_work\" -xf \"$quickjs_work/quickjs.tar.gz\"",
             f"quickjs_src=\"$quickjs_work/quickjs-{QUICKJS_VERSION}\"",
-            "cmake -S \"$quickjs_src\" -B \"$quickjs_src/build\" -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS_RELEASE='-O2 -DNDEBUG -march=armv8-a+nosimd'",
+            "cmake -S \"$quickjs_src\" -B \"$quickjs_src/build\" "
+            "-DCMAKE_BUILD_TYPE=Release "
+            f"-DCMAKE_C_FLAGS_RELEASE={shlex.quote(quickjs_policy['cmake_c_flags_release'])}",
             "cmake --build \"$quickjs_src/build\" --target qjs_exe -j\"$(nproc)\"",
             "sudo install -m 0755 \"$quickjs_src/build/qjs\" /usr/local/bin/qjs",
+            f"printf '%s\\n' {shlex.quote(quickjs_policy['id'])} | sudo tee {QUICKJS_POLICY_FILE} >/dev/null",
             "rm -rf \"$quickjs_work\"",
         ]
     )
@@ -367,7 +443,7 @@ def copy_guest_files(repo_root: Path, key: Path, port: int) -> None:
     run([*scp_base, *(str(path) for path in guest_tools), f"{SSH_USER}@127.0.0.1:{REMOTE_ROOT}/fedora-guest-tools/"], repo_root)
 
 
-def linux_cpu_features(repo_root: Path, key: Path, port: int) -> dict:
+def linux_cpu_features(repo_root: Path, key: Path, port: int, quickjs_policy: dict) -> dict:
     cpuinfo = ssh_output(repo_root, key, port, "cat /proc/cpuinfo", timeout=20)
     features = []
     for line in cpuinfo.splitlines():
@@ -388,9 +464,13 @@ def linux_cpu_features(repo_root: Path, key: Path, port: int) -> dict:
         "asimd": "asimd" in features,
         "quickjs_native_version": qjs_version,
         "quickjs_wasm_version": f"QuickJS-ng version {QUICKJS_VERSION}",
-        "quickjs_baseline_strategy": "built from QuickJS-NG v0.14.0 source with -march=armv8-a+nosimd because the Helios WASI QuickJS artifact does not contain wasm SIMD instructions",
+        "quickjs_wasm_path": quickjs_policy["wasm_path"],
+        "quickjs_wasm_uses_simd": quickjs_policy["wasm_uses_simd"],
+        "quickjs_native_policy_id": quickjs_policy["id"],
+        "quickjs_native_c_flags_release": quickjs_policy["cmake_c_flags_release"],
+        "quickjs_baseline_strategy": quickjs_policy["baseline_strategy"],
         "quickjs_source_url": QUICKJS_SOURCE_URL,
-        "quickjs_native_simd_policy": "disabled for QuickJS fairness; native SIMD is measured only by the separate simd-lanes workload",
+        "quickjs_native_simd_policy": quickjs_policy["native_simd_policy"],
         "native_simd_probe": simd_output,
     }
 
@@ -464,6 +544,7 @@ def run_fedora_qemu_linux(
         workload for workload in workloads if workload["runner"] in ("shell", "program")
     ]
     asset_dir = resolve_asset_dir(repo_root, asset_dir)
+    quickjs_policy = quickjs_native_policy(repo_root)
     asset_dir.mkdir(parents=True, exist_ok=True)
     key = ensure_private_key(repo_root, asset_dir)
     public_key = key.with_suffix(key.suffix + ".pub").read_text(encoding="utf-8").strip()
@@ -490,8 +571,8 @@ def run_fedora_qemu_linux(
     try:
         wait_for_ssh(repo_root, key, port, setup_timeout_seconds)
         copy_guest_files(repo_root, key, port)
-        ensure_provisioned(repo_root, key, port, setup_timeout_seconds)
-        provenance.update(linux_cpu_features(repo_root, key, port))
+        ensure_provisioned(repo_root, key, port, setup_timeout_seconds, quickjs_policy)
+        provenance.update(linux_cpu_features(repo_root, key, port, quickjs_policy))
         ssh(
             repo_root,
             key,
