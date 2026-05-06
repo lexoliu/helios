@@ -20,6 +20,8 @@ const TCP_LOCAL_WINDOW_SCALE: u8 = 2;
 const TCP_MAX_WINDOW_SCALE: u8 = 14;
 pub(crate) const TCP_RECEIVE_BACKPRESSURE_SEGMENTS: usize = MAX_TCP_RECEIVE_SEGMENTS - 4;
 pub const TCP_INITIAL_RTO_NANOS: u64 = 1_000_000_000;
+pub const TCP_MIN_RTO_NANOS: u64 = 200_000_000;
+pub const TCP_MAX_RTO_NANOS: u64 = 60_000_000_000;
 pub const TCP_MAX_RETRANSMISSIONS: u8 = 5;
 pub const TCP_DELAYED_ACK_NANOS: u64 = 40_000_000;
 pub const TCP_TIME_WAIT_NANOS: u64 = 60_000_000_000;
@@ -71,6 +73,52 @@ struct TcpAckTiming {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TcpRetransmissionTimer {
+    smoothed_rtt_nanos: Option<u64>,
+    rtt_variance_nanos: u64,
+    timeout_nanos: u64,
+}
+
+impl TcpRetransmissionTimer {
+    const fn new() -> Self {
+        Self {
+            smoothed_rtt_nanos: None,
+            rtt_variance_nanos: 0,
+            timeout_nanos: TCP_INITIAL_RTO_NANOS,
+        }
+    }
+
+    const fn timeout_nanos(self) -> u64 {
+        self.timeout_nanos
+    }
+
+    fn note_rtt(&mut self, rtt_nanos: u64) {
+        if rtt_nanos == 0 {
+            return;
+        }
+        if let Some(smoothed) = self.smoothed_rtt_nanos {
+            let error = smoothed.abs_diff(rtt_nanos);
+            self.rtt_variance_nanos = (self.rtt_variance_nanos * 3 + error) / 4;
+            self.smoothed_rtt_nanos = Some((smoothed * 7 + rtt_nanos) / 8);
+        } else {
+            self.smoothed_rtt_nanos = Some(rtt_nanos);
+            self.rtt_variance_nanos = rtt_nanos / 2;
+        }
+        let smoothed = self
+            .smoothed_rtt_nanos
+            .expect("TCP RTO estimator lost initialized RTT");
+        self.timeout_nanos = smoothed
+            .saturating_add(self.rtt_variance_nanos.saturating_mul(4))
+            .clamp(TCP_MIN_RTO_NANOS, TCP_MAX_RTO_NANOS);
+    }
+
+    fn backed_off_timeout_nanos(self, retransmissions: u8) -> u64 {
+        let shift = retransmissions.min(6);
+        self.timeout_nanos().saturating_mul(1u64 << shift)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TcpState {
     Closed,
     Listen,
@@ -117,6 +165,7 @@ where
     ack_pending: bool,
     duplicate_ack_count: u8,
     fast_retransmit_pending: bool,
+    retransmission_timer: TcpRetransmissionTimer,
     delayed_ack_deadline_nanos: Option<u64>,
     time_wait_deadline_nanos: Option<u64>,
     unacked_receive_segments: u8,
@@ -156,6 +205,7 @@ where
             ack_pending: false,
             duplicate_ack_count: 0,
             fast_retransmit_pending: false,
+            retransmission_timer: TcpRetransmissionTimer::new(),
             delayed_ack_deadline_nanos: None,
             time_wait_deadline_nanos: None,
             unacked_receive_segments: 0,
@@ -495,9 +545,10 @@ where
 
     pub fn next_deadline_nanos(&self) -> Option<u64> {
         let rto_deadline = self.in_flight.front().map(|segment| {
-            segment
-                .sent_at_nanos
-                .saturating_add(rto_nanos(segment.retransmissions))
+            segment.sent_at_nanos.saturating_add(
+                self.retransmission_timer
+                    .backed_off_timeout_nanos(segment.retransmissions),
+            )
         });
         min_deadline(
             min_deadline(rto_deadline, self.delayed_ack_deadline_nanos),
@@ -563,7 +614,9 @@ where
         } else {
             let in_flight = self.in_flight.front()?;
             if now_nanos.saturating_sub(in_flight.sent_at_nanos)
-                < rto_nanos(in_flight.retransmissions)
+                < self
+                    .retransmission_timer
+                    .backed_off_timeout_nanos(in_flight.retransmissions)
             {
                 return None;
             }
@@ -814,6 +867,7 @@ where
         }
         let acked = acknowledgement.wrapping_sub(self.send_unacknowledged);
         let timing = self.ack_sample_timing(acknowledgement, now_nanos, timestamp);
+        self.retransmission_timer.note_rtt(timing.rtt_nanos);
         self.send_unacknowledged = acknowledgement;
         self.duplicate_ack_count = 0;
         self.fast_retransmit_pending = false;
@@ -1235,11 +1289,6 @@ fn timestamp_echo_rtt_nanos(now_nanos: u64, timestamp: TcpTimestampOption) -> u6
     u64::from(timestamp_value(now_nanos).wrapping_sub(timestamp.echo_reply)) * 1_000_000
 }
 
-fn rto_nanos(retransmissions: u8) -> u64 {
-    let shift = retransmissions.min(6);
-    TCP_INITIAL_RTO_NANOS.saturating_mul(1u64 << shift)
-}
-
 fn min_deadline(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     match (left, right) {
         (Some(left), Some(right)) => Some(left.min(right)),
@@ -1303,6 +1352,16 @@ mod tests {
         assert!(segment.retransmission);
         assert_eq!(segment.header.sequence, 7);
         assert!(segment.header.flags.contains(TcpFlags::SYN));
+    }
+
+    #[test]
+    fn retransmission_timer_tracks_rtt_and_clamps_timeout() {
+        let mut timer = TcpRetransmissionTimer::new();
+
+        timer.note_rtt(20_000_000);
+
+        assert_eq!(timer.timeout_nanos(), TCP_MIN_RTO_NANOS);
+        assert_eq!(timer.backed_off_timeout_nanos(2), TCP_MIN_RTO_NANOS * 4);
     }
 
     #[test]
