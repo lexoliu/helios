@@ -2668,7 +2668,7 @@ where
             Ok(address) => address,
             Err(error) => return Ok(Err(error)),
         };
-        let (service, inner, ready) = {
+        let (service, inner, ready, local_port) = {
             let mut state = socket.inner.lock();
             if state.stream.is_some() || state.connect_in_progress || state.connect_result.is_some()
             {
@@ -2679,17 +2679,18 @@ where
                 state.service.clone(),
                 socket.inner.clone(),
                 socket.ready.clone(),
+                state.local_address.map_or(0, |address| address.port),
             )
         };
         let profile_cpu = self.cpu.clone();
         let profile_runtime_state = self.runtime_state.clone();
         self.spawner().spawn_detached(async move {
             let started = profile_cpu.now().ticks();
-            let mut host_buffer = [0; 39];
             let result = service
-                .tcp_connect(
-                    remote_address.address.write_host(&mut host_buffer),
+                .tcp_connect_address(
+                    remote_address.address.network_address(),
                     remote_address.port,
+                    local_port,
                     u64::MAX,
                 )
                 .await;

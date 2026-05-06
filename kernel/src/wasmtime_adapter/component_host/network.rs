@@ -95,6 +95,14 @@ trait DynComponentHostNetworkService: Send + Sync + 'static {
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<u64, TcpError>> + Send + 'a>>;
 
+    fn tcp_connect_address<'a>(
+        &'a self,
+        remote_address: NetworkIpAddress,
+        port: u16,
+        local_port: u16,
+        timeout_nanos: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, TcpError>> + Send + 'a>>;
+
     fn tcp_listen<'a>(
         &'a self,
         local_address: NetworkIpAddress,
@@ -309,6 +317,17 @@ impl ComponentNetworkService for ComponentHostNetworkService {
     ) -> impl Future<Output = Result<Self::TcpStream, TcpError>> + Send + 'a {
         self.inner
             .tcp_connect_from(host, port, local_port, timeout_nanos)
+    }
+
+    fn tcp_connect_address(
+        &self,
+        remote_address: NetworkIpAddress,
+        port: u16,
+        local_port: u16,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<Self::TcpStream, TcpError>> + Send + '_ {
+        self.inner
+            .tcp_connect_address(remote_address, port, local_port, timeout_nanos)
     }
 
     fn tcp_listen(
@@ -572,6 +591,22 @@ where
             let stream = self
                 .service
                 .tcp_connect_from(host, port, local_port, timeout_nanos)
+                .await?;
+            Ok(stream.into_raw())
+        })
+    }
+
+    fn tcp_connect_address<'a>(
+        &'a self,
+        remote_address: NetworkIpAddress,
+        port: u16,
+        local_port: u16,
+        timeout_nanos: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, TcpError>> + Send + 'a>> {
+        Box::pin(async move {
+            let stream = self
+                .service
+                .tcp_connect_address(remote_address, port, local_port, timeout_nanos)
                 .await?;
             Ok(stream.into_raw())
         })

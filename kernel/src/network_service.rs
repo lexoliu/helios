@@ -490,6 +490,22 @@ where
             .await
     }
 
+    pub async fn tcp_connect_address(
+        &self,
+        remote_address: NetworkIpAddress,
+        port: u16,
+        local_port: u16,
+        timeout_nanos: u64,
+    ) -> Result<TcpStreamId, TcpError> {
+        self.execute_tcp_connect_address(
+            map_network_ip_address(remote_address),
+            port,
+            local_port,
+            timeout_nanos,
+        )
+        .await
+    }
+
     pub async fn tcp_listen(
         &self,
         local_address: NetworkIpAddress,
@@ -674,6 +690,29 @@ where
     ) -> Result<TcpStreamId, TcpError> {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         let destination = self.resolve_host_tcp(host, deadline_nanos).await?;
+        self.execute_tcp_connect_address_until(destination, port, local_port, deadline_nanos)
+            .await
+    }
+
+    async fn execute_tcp_connect_address(
+        &self,
+        destination: IpAddress,
+        port: u16,
+        local_port: u16,
+        timeout_nanos: u64,
+    ) -> Result<TcpStreamId, TcpError> {
+        let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
+        self.execute_tcp_connect_address_until(destination, port, local_port, deadline_nanos)
+            .await
+    }
+
+    async fn execute_tcp_connect_address_until(
+        &self,
+        destination: IpAddress,
+        port: u16,
+        local_port: u16,
+        deadline_nanos: u64,
+    ) -> Result<TcpStreamId, TcpError> {
         if matches!(destination, IpAddress::Ipv4(_)) {
             self.wait_for_ipv4_tcp(deadline_nanos).await?;
         }
@@ -1360,6 +1399,25 @@ where
     ) -> impl core::future::Future<Output = Result<Self::TcpStream, TcpError>> + Send + 'a {
         async move {
             NetworkService::tcp_connect_from(self, host, port, local_port, timeout_nanos).await
+        }
+    }
+
+    fn tcp_connect_address(
+        &self,
+        remote_address: NetworkIpAddress,
+        port: u16,
+        local_port: u16,
+        timeout_nanos: u64,
+    ) -> impl core::future::Future<Output = Result<Self::TcpStream, TcpError>> + Send + '_ {
+        async move {
+            NetworkService::tcp_connect_address(
+                self,
+                remote_address,
+                port,
+                local_port,
+                timeout_nanos,
+            )
+            .await
         }
     }
 

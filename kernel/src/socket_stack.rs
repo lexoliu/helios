@@ -275,6 +275,20 @@ mod tests {
             core::future::ready(Ok(u64::from(local_port)))
         }
 
+        fn tcp_connect_address(
+            &self,
+            _: NetworkIpAddress,
+            _: u16,
+            local_port: u16,
+            _: u64,
+        ) -> impl Future<Output = Result<Self::TcpStream, TcpError>> + Send + '_ {
+            core::future::ready(Ok(if local_port == 0 {
+                7
+            } else {
+                u64::from(local_port)
+            }))
+        }
+
         fn tcp_listen(
             &self,
             _: NetworkIpAddress,

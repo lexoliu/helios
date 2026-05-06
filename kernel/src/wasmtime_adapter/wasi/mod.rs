@@ -511,51 +511,6 @@ impl WasiTcpIpAddress {
             Self::Ipv6(address) => crate::NetworkIpAddress::Ipv6(address),
         }
     }
-
-    fn write_host<'a>(self, buffer: &'a mut [u8; 39]) -> &'a str {
-        match self {
-            Self::Ipv4(address) => {
-                let mut ipv4_buffer = [0; 15];
-                let host = address.write_dotted_decimal(&mut ipv4_buffer);
-                buffer[..host.len()].copy_from_slice(host.as_bytes());
-                core::str::from_utf8(&buffer[..host.len()])
-                    .expect("IPv4 dotted decimal writer must emit ASCII")
-            }
-            Self::Ipv6(address) => write_ipv6_full(address, buffer),
-        }
-    }
-}
-
-fn write_ipv6_full<'a>(address: Ipv6Address, buffer: &'a mut [u8; 39]) -> &'a str {
-    let octets = address.octets();
-    let mut cursor = 0;
-    for (index, chunk) in octets.chunks_exact(2).enumerate() {
-        if index != 0 {
-            buffer[cursor] = b':';
-            cursor += 1;
-        }
-        let segment = u16::from_be_bytes([chunk[0], chunk[1]]);
-        cursor += write_hex_u16(segment, &mut buffer[cursor..]);
-    }
-    core::str::from_utf8(&buffer[..cursor]).expect("IPv6 formatter must emit ASCII")
-}
-
-fn write_hex_u16(value: u16, buffer: &mut [u8]) -> usize {
-    let mut started = false;
-    let mut cursor = 0;
-    for shift in [12, 8, 4, 0] {
-        let digit = ((value >> shift) & 0x0f) as u8;
-        if digit != 0 || started || shift == 0 {
-            buffer[cursor] = if digit < 10 {
-                b'0' + digit
-            } else {
-                b'a' + (digit - 10)
-            };
-            cursor += 1;
-            started = true;
-        }
-    }
-    cursor
 }
 
 impl P2ResolveAddressStream {
@@ -855,18 +810,21 @@ impl TcpSocket {
         &self,
         remote_address: WasiTcpSocketAddress,
     ) -> core::result::Result<(), socket_types::ErrorCode> {
-        let service = {
+        let (service, local_port) = {
             let state = self.inner.lock();
             if state.stream.is_some() {
                 return Err(socket_types::ErrorCode::InvalidState);
             }
-            state.service.clone()
+            (
+                state.service.clone(),
+                state.local_address.map_or(0, |address| address.port),
+            )
         };
-        let mut host_buffer = [0; 39];
         let stream = service
-            .tcp_connect(
-                remote_address.address.write_host(&mut host_buffer),
+            .tcp_connect_address(
+                remote_address.address.network_address(),
                 remote_address.port,
+                local_port,
                 u64::MAX,
             )
             .await
@@ -5997,6 +5955,21 @@ mod tests {
         ) -> impl core::future::Future<Output = Result<Self::TcpStream, crate::TcpError>> + Send + '_
         {
             core::future::ready(Ok(u64::from(local_port)))
+        }
+
+        fn tcp_connect_address(
+            &self,
+            _: crate::NetworkIpAddress,
+            _: u16,
+            local_port: u16,
+            _: u64,
+        ) -> impl core::future::Future<Output = Result<Self::TcpStream, crate::TcpError>> + Send + '_
+        {
+            core::future::ready(Ok(if local_port == 0 {
+                7
+            } else {
+                u64::from(local_port)
+            }))
         }
 
         fn tcp_listen(

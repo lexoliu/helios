@@ -465,6 +465,14 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Self::TcpStream, TcpError>> + Send + 'a;
 
+    fn tcp_connect_address(
+        &self,
+        remote_address: NetworkIpAddress,
+        port: u16,
+        local_port: u16,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<Self::TcpStream, TcpError>> + Send + '_;
+
     fn tcp_listen(
         &self,
         local_address: NetworkIpAddress,
