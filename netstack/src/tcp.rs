@@ -21,7 +21,7 @@ const TCP_RECEIVE_BACKPRESSURE_BYTES: usize =
 const TCP_SMALL_PAYLOAD_ACK_BYTES: usize = TCP_RECEIVE_SEGMENT_BYTES / 2;
 const TCP_DELAYED_ACK_SEGMENTS: u8 = 2;
 const TCP_WINDOW_UPDATE_BYTES: u16 = (TCP_RECEIVE_SEGMENT_BYTES * 4) as u16;
-const TCP_LOCAL_WINDOW_SCALE: u8 = 4;
+pub(crate) const TCP_LOCAL_WINDOW_SCALE: u8 = 4;
 const TCP_MAX_WINDOW_SCALE: u8 = 14;
 pub(crate) const TCP_RECEIVE_BACKPRESSURE_SEGMENTS: usize = MAX_TCP_RECEIVE_SEGMENTS - 4;
 pub const TCP_INITIAL_RTO_NANOS: u64 = 1_000_000_000;
@@ -1349,7 +1349,7 @@ fn segment_end_from_parts(sequence: u32, len: usize) -> u32 {
     sequence.wrapping_add(u32::try_from(len).unwrap_or(u32::MAX))
 }
 
-fn sequence_leq(lhs: u32, rhs: u32) -> bool {
+pub(crate) fn sequence_leq(lhs: u32, rhs: u32) -> bool {
     lhs == rhs || (rhs.wrapping_sub(lhs) as i32) >= 0
 }
 

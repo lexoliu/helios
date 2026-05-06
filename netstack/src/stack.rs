@@ -13,7 +13,7 @@ use crate::{
     ArpOperation, ArpPacket, BbrV3, CongestionControl, DEFAULT_POLL_BUDGET, DhcpDnsServers,
     EthernetAddress, EthernetFrame, EthernetProtocol, Icmpv6Packet, IpAddress, IpCidr, Ipv4Address,
     Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, PacketBuffer, StackError, TcpEndpoint,
-    TcpHeader, TcpHeaderOptions, TcpPacket, TcpSocket, TcpTransmitSegment, UdpPacket,
+    TcpFlags, TcpHeader, TcpHeaderOptions, TcpPacket, TcpSocket, TcpTransmitSegment, UdpPacket,
 };
 
 pub const MAX_ROUTES: usize = 32;
@@ -622,8 +622,26 @@ where
 #[derive(Clone, Debug)]
 struct OutboundFrameQueue {
     frames: [PacketBuffer; MAX_OUTBOUND_FRAMES],
+    tcp_ack_keys: [Option<TcpAckReplaceKey>; MAX_OUTBOUND_FRAMES],
     ready: Deque<usize, MAX_OUTBOUND_FRAMES>,
     free: Deque<usize, MAX_OUTBOUND_FRAMES>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TcpAckReplaceKey {
+    local: TcpEndpoint,
+    remote: TcpEndpoint,
+    sequence: u32,
+    acknowledgement: u32,
+}
+
+impl TcpAckReplaceKey {
+    fn can_replace(self, replacement: Self) -> bool {
+        self.local == replacement.local
+            && self.remote == replacement.remote
+            && self.sequence == replacement.sequence
+            && crate::tcp::sequence_leq(self.acknowledgement, replacement.acknowledgement)
+    }
 }
 
 impl OutboundFrameQueue {
@@ -635,6 +653,7 @@ impl OutboundFrameQueue {
         }
         Self {
             frames: core::array::from_fn(|_| PacketBuffer::new()),
+            tcp_ack_keys: [None; MAX_OUTBOUND_FRAMES],
             ready: Deque::new(),
             free,
         }
@@ -658,6 +677,7 @@ impl OutboundFrameQueue {
 
     fn release(&mut self, slot: usize) {
         self.frame_mut(slot).clear();
+        self.tcp_ack_keys[slot] = None;
         self.free
             .push_back(slot)
             .unwrap_or_else(|_| panic!("outbound free queue overflowed after slot release"));
@@ -668,6 +688,7 @@ impl OutboundFrameQueue {
             .reserve()
             .unwrap_or_else(|_| panic!("outbound frame queue had no slot for restore"));
         *self.frame_mut(slot) = frame;
+        self.tcp_ack_keys[slot] = None;
         self.ready
             .push_front(slot)
             .unwrap_or_else(|_| panic!("outbound ready queue overflowed after frame restore"));
@@ -676,10 +697,37 @@ impl OutboundFrameQueue {
     fn pop(&mut self) -> Option<PacketBuffer> {
         let slot = self.ready.pop_front()?;
         let frame = core::mem::take(self.frame_mut(slot));
+        self.tcp_ack_keys[slot] = None;
         self.free
             .push_back(slot)
             .unwrap_or_else(|_| panic!("outbound free queue overflowed after frame pop"));
         Some(frame)
+    }
+
+    fn set_tcp_ack_key(&mut self, slot: usize, key: TcpAckReplaceKey) {
+        self.tcp_ack_keys[slot] = Some(key);
+    }
+
+    fn replace_ready_tcp_ack(
+        &mut self,
+        key: TcpAckReplaceKey,
+        encode: impl FnOnce(&mut PacketBuffer) -> Result<(), StackError>,
+    ) -> Result<bool, StackError> {
+        let mut replacement = None;
+        for slot in self.ready.iter().copied() {
+            if self.tcp_ack_keys[slot].is_some_and(|queued| queued.can_replace(key)) {
+                replacement = Some(slot);
+                break;
+            }
+        }
+        let Some(slot) = replacement else {
+            return Ok(false);
+        };
+        let frame = self.frame_mut(slot);
+        frame.clear();
+        encode(frame)?;
+        self.tcp_ack_keys[slot] = Some(key);
+        Ok(true)
     }
 
     fn try_submit_slices<E>(
@@ -906,6 +954,31 @@ where
             Ok(result) => {
                 self.outbound.commit(slot);
                 Ok(result)
+            }
+            Err(error) => {
+                self.outbound.release(slot);
+                Err(error)
+            }
+        }
+    }
+
+    fn queue_tcp_ack_frame(
+        &mut self,
+        key: TcpAckReplaceKey,
+        encode: impl Fn(&mut PacketBuffer) -> Result<(), StackError>,
+    ) -> Result<bool, StackError> {
+        if self
+            .outbound
+            .replace_ready_tcp_ack(key, |frame| encode(frame))?
+        {
+            return Ok(true);
+        }
+        let slot = self.outbound.reserve()?;
+        match encode(self.outbound.frame_mut(slot)) {
+            Ok(()) => {
+                self.outbound.set_tcp_ack_key(slot, key);
+                self.outbound.commit(slot);
+                Ok(true)
             }
             Err(error) => {
                 self.outbound.release(slot);
@@ -1444,39 +1517,47 @@ where
         };
 
         let local_mac = self.config.mac;
+        if is_replaceable_tcp_ack(header, payload) {
+            return self.queue_tcp_ack_frame(
+                TcpAckReplaceKey {
+                    local: TcpEndpoint {
+                        address: IpAddress::Ipv4(source),
+                        port: header.source_port,
+                    },
+                    remote: TcpEndpoint {
+                        address: IpAddress::Ipv4(destination),
+                        port: header.destination_port,
+                    },
+                    sequence: header.sequence,
+                    acknowledgement: header.acknowledgement,
+                },
+                |frame| {
+                    encode_tcp_ipv4_frame(
+                        frame,
+                        destination_mac,
+                        local_mac,
+                        source,
+                        destination,
+                        header,
+                        options,
+                        payload,
+                        identification,
+                    )
+                },
+            );
+        }
         self.queue_outbound_frame(|frame| {
-            let storage = frame.storage_mut();
-            let mut offset = EthernetFrame::encode_header(
-                storage,
+            encode_tcp_ipv4_frame(
+                frame,
                 destination_mac,
                 local_mac,
-                EthernetProtocol::Ipv4,
-            )
-            .ok_or(StackError::OutputQueueFull)?;
-            let tcp_len = TcpPacket::MIN_HEADER_LEN
-                .checked_add(options.encoded_len())
-                .and_then(|header_len| header_len.checked_add(payload.len()))
-                .ok_or(StackError::OutputQueueFull)?;
-            offset += Ipv4Packet::encode_header(
-                &mut storage[offset..],
                 source,
                 destination,
-                crate::IpProtocol::Tcp,
-                tcp_len,
-                identification,
-                64,
-            )
-            .ok_or(StackError::OutputQueueFull)?;
-            offset += TcpPacket::encode_with_options(
-                &mut storage[offset..],
-                IpAddress::Ipv4(source),
-                IpAddress::Ipv4(destination),
                 header,
                 options,
                 payload,
-            )
-            .ok_or(StackError::OutputQueueFull)?;
-            frame.set_len(offset);
+                identification,
+            )?;
             Ok(true)
         })
     }
@@ -1502,38 +1583,45 @@ where
         };
 
         let local_mac = self.config.mac;
+        if is_replaceable_tcp_ack(header, payload) {
+            return self.queue_tcp_ack_frame(
+                TcpAckReplaceKey {
+                    local: TcpEndpoint {
+                        address: IpAddress::Ipv6(source),
+                        port: header.source_port,
+                    },
+                    remote: TcpEndpoint {
+                        address: IpAddress::Ipv6(destination),
+                        port: header.destination_port,
+                    },
+                    sequence: header.sequence,
+                    acknowledgement: header.acknowledgement,
+                },
+                |frame| {
+                    encode_tcp_ipv6_frame(
+                        frame,
+                        destination_mac,
+                        local_mac,
+                        source,
+                        destination,
+                        header,
+                        options,
+                        payload,
+                    )
+                },
+            );
+        }
         self.queue_outbound_frame(|frame| {
-            let storage = frame.storage_mut();
-            let mut offset = EthernetFrame::encode_header(
-                storage,
+            encode_tcp_ipv6_frame(
+                frame,
                 destination_mac,
                 local_mac,
-                EthernetProtocol::Ipv6,
-            )
-            .ok_or(StackError::OutputQueueFull)?;
-            let tcp_len = TcpPacket::MIN_HEADER_LEN
-                .checked_add(options.encoded_len())
-                .and_then(|header_len| header_len.checked_add(payload.len()))
-                .ok_or(StackError::OutputQueueFull)?;
-            offset += Ipv6Packet::encode_header(
-                &mut storage[offset..],
                 source,
                 destination,
-                crate::IpProtocol::Tcp,
-                tcp_len,
-                64,
-            )
-            .ok_or(StackError::OutputQueueFull)?;
-            offset += TcpPacket::encode_with_options(
-                &mut storage[offset..],
-                IpAddress::Ipv6(source),
-                IpAddress::Ipv6(destination),
                 header,
                 options,
                 payload,
-            )
-            .ok_or(StackError::OutputQueueFull)?;
-            frame.set_len(offset);
+            )?;
             Ok(true)
         })
     }
@@ -2082,6 +2170,92 @@ where
     }
 }
 
+fn is_replaceable_tcp_ack(header: TcpHeader, payload: &[u8]) -> bool {
+    payload.is_empty() && header.flags == TcpFlags::ACK
+}
+
+fn encode_tcp_ipv4_frame(
+    frame: &mut PacketBuffer,
+    destination_mac: EthernetAddress,
+    local_mac: EthernetAddress,
+    source: Ipv4Address,
+    destination: Ipv4Address,
+    header: TcpHeader,
+    options: TcpHeaderOptions,
+    payload: &[u8],
+    identification: u16,
+) -> Result<(), StackError> {
+    let storage = frame.storage_mut();
+    let mut offset =
+        EthernetFrame::encode_header(storage, destination_mac, local_mac, EthernetProtocol::Ipv4)
+            .ok_or(StackError::OutputQueueFull)?;
+    let tcp_len = TcpPacket::MIN_HEADER_LEN
+        .checked_add(options.encoded_len())
+        .and_then(|header_len| header_len.checked_add(payload.len()))
+        .ok_or(StackError::OutputQueueFull)?;
+    offset += Ipv4Packet::encode_header(
+        &mut storage[offset..],
+        source,
+        destination,
+        crate::IpProtocol::Tcp,
+        tcp_len,
+        identification,
+        64,
+    )
+    .ok_or(StackError::OutputQueueFull)?;
+    offset += TcpPacket::encode_with_options(
+        &mut storage[offset..],
+        IpAddress::Ipv4(source),
+        IpAddress::Ipv4(destination),
+        header,
+        options,
+        payload,
+    )
+    .ok_or(StackError::OutputQueueFull)?;
+    frame.set_len(offset);
+    Ok(())
+}
+
+fn encode_tcp_ipv6_frame(
+    frame: &mut PacketBuffer,
+    destination_mac: EthernetAddress,
+    local_mac: EthernetAddress,
+    source: Ipv6Address,
+    destination: Ipv6Address,
+    header: TcpHeader,
+    options: TcpHeaderOptions,
+    payload: &[u8],
+) -> Result<(), StackError> {
+    let storage = frame.storage_mut();
+    let mut offset =
+        EthernetFrame::encode_header(storage, destination_mac, local_mac, EthernetProtocol::Ipv6)
+            .ok_or(StackError::OutputQueueFull)?;
+    let tcp_len = TcpPacket::MIN_HEADER_LEN
+        .checked_add(options.encoded_len())
+        .and_then(|header_len| header_len.checked_add(payload.len()))
+        .ok_or(StackError::OutputQueueFull)?;
+    offset += Ipv6Packet::encode_header(
+        &mut storage[offset..],
+        source,
+        destination,
+        crate::IpProtocol::Tcp,
+        tcp_len,
+        64,
+    )
+    .ok_or(StackError::OutputQueueFull)?;
+    offset += TcpPacket::encode_with_options(
+        &mut storage[offset..],
+        IpAddress::Ipv6(source),
+        IpAddress::Ipv6(destination),
+        header,
+        options,
+        payload,
+    )
+    .ok_or(StackError::OutputQueueFull)?;
+    frame.set_len(offset);
+    Ok(())
+}
+
 fn socket_id(index: usize) -> SocketId {
     let raw = u32::try_from(index + 1).unwrap_or_else(|_| panic!("socket index exceeds u32"));
     SocketId::new(raw)
@@ -2256,6 +2430,139 @@ mod tests {
     }
 
     #[test]
+    fn queued_tcp_ack_is_replaced_before_submission() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(peer),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+
+        let queued = TcpHeader {
+            source_port: 49152,
+            destination_port: 80,
+            sequence: 8,
+            acknowledgement: 100,
+            flags: TcpFlags::ACK,
+            window_size: u16::MAX,
+        };
+        let replacement = TcpHeader {
+            acknowledgement: 200,
+            ..queued
+        };
+        assert!(
+            stack
+                .queue_tcp_ipv4(
+                    local,
+                    peer,
+                    queued,
+                    TcpHeaderOptions::empty(),
+                    &[],
+                    1,
+                    StackInstant::from_nanos(1),
+                )
+                .expect("first ACK should queue")
+        );
+        assert!(
+            stack
+                .queue_tcp_ipv4(
+                    local,
+                    peer,
+                    replacement,
+                    TcpHeaderOptions::empty(),
+                    &[],
+                    2,
+                    StackInstant::from_nanos(2),
+                )
+                .expect("replacement ACK should queue")
+        );
+
+        let frame = stack
+            .take_outbound()
+            .expect("coalesced ACK frame should remain queued");
+        assert!(stack.take_outbound().is_none());
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
+        let ack = TcpPacket::parse(ipv4.payload).expect("TCP packet should parse");
+        assert_eq!(ack.acknowledgement, replacement.acknowledgement);
+        assert_eq!(ack.sequence, replacement.sequence);
+        assert_eq!(ack.flags, TcpFlags::ACK);
+        assert!(ack.payload.is_empty());
+    }
+
+    #[test]
+    fn queued_tcp_ack_with_different_sequence_is_not_replaced() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(peer),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+
+        let queued = TcpHeader {
+            source_port: 49152,
+            destination_port: 80,
+            sequence: 8,
+            acknowledgement: 100,
+            flags: TcpFlags::ACK,
+            window_size: u16::MAX,
+        };
+        let next_sequence = TcpHeader {
+            sequence: 9,
+            acknowledgement: 200,
+            ..queued
+        };
+        assert!(
+            stack
+                .queue_tcp_ipv4(
+                    local,
+                    peer,
+                    queued,
+                    TcpHeaderOptions::empty(),
+                    &[],
+                    1,
+                    StackInstant::from_nanos(1),
+                )
+                .expect("first ACK should queue")
+        );
+        assert!(
+            stack
+                .queue_tcp_ipv4(
+                    local,
+                    peer,
+                    next_sequence,
+                    TcpHeaderOptions::empty(),
+                    &[],
+                    2,
+                    StackInstant::from_nanos(2),
+                )
+                .expect("different sequence ACK should queue")
+        );
+
+        let first = stack
+            .take_outbound()
+            .expect("first ACK frame should remain queued");
+        let second = stack
+            .take_outbound()
+            .expect("second ACK frame should remain queued");
+        assert!(stack.take_outbound().is_none());
+        let first = EthernetFrame::parse(first.as_slice()).expect("Ethernet frame should parse");
+        let first = Ipv4Packet::parse(first.payload).expect("IPv4 packet should parse");
+        let first = TcpPacket::parse(first.payload).expect("TCP packet should parse");
+        let second = EthernetFrame::parse(second.as_slice()).expect("Ethernet frame should parse");
+        let second = Ipv4Packet::parse(second.payload).expect("IPv4 packet should parse");
+        let second = TcpPacket::parse(second.payload).expect("TCP packet should parse");
+        assert_eq!(first.sequence, queued.sequence);
+        assert_eq!(second.sequence, next_sequence.sequence);
+    }
+
+    #[test]
     fn tcp_stack_accepts_replaceable_congestion_control() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
@@ -2335,7 +2642,10 @@ mod tests {
         assert!(syn_ack.flags.contains(TcpFlags::SYN.union(TcpFlags::ACK)));
         assert_eq!(syn_ack.acknowledgement, 11);
         assert_eq!(syn_ack.options.maximum_segment_size(), Some(1460));
-        assert_eq!(syn_ack.options.window_scale(), Some(2));
+        assert_eq!(
+            syn_ack.options.window_scale(),
+            Some(crate::tcp::TCP_LOCAL_WINDOW_SCALE)
+        );
         assert!(syn_ack.options.sack_permitted());
         assert!(syn_ack.options.timestamp().is_some());
 

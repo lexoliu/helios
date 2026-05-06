@@ -1,9 +1,10 @@
 use divan::counter::{BytesCount, ItemsCount};
 use divan::{AllocProfiler, Bencher, black_box};
 use helios_netstack::{
-    BbrV3, EthernetAddress, IpAddress, Ipv4Address, Ipv4Cidr, MAX_OUTBOUND_FRAMES, NeighborEntry,
-    NeighborState, OutboundBatchStatus, Stack, StackConfig, StackInstant, TcpEndpoint, TcpFlags,
-    TcpOptions, TcpPacket, TcpSocket, TcpState, internet_checksum,
+    BbrV3, EthernetAddress, EthernetFrame, EthernetProtocol, IpAddress, IpProtocol, Ipv4Address,
+    Ipv4Cidr, Ipv4Packet, MAX_OUTBOUND_FRAMES, NeighborEntry, NeighborState, OutboundBatchStatus,
+    PacketBuffer, Stack, StackConfig, StackInstant, TcpEndpoint, TcpFlags, TcpHeader, TcpOptions,
+    TcpPacket, TcpSocket, TcpState, internet_checksum,
 };
 
 #[global_allocator]
@@ -16,6 +17,7 @@ const PEER_IP: Ipv4Address = Ipv4Address::new([192, 0, 2, 20]);
 const UDP_PAYLOAD: &[u8] = b"helios-netstack-divan-udp-payload";
 const TCP_PAYLOAD_BYTES: usize = 1460;
 const TCP_RECEIVE_SEGMENTS: usize = 128;
+const TCP_ACK_COALESCE_SEGMENTS: usize = 16;
 
 fn main() {
     divan::main();
@@ -76,6 +78,75 @@ fn established_tcp_socket() -> TcpSocket<BbrV3> {
     socket
 }
 
+fn tcp_ipv4_frame(header: TcpHeader, payload: &[u8]) -> PacketBuffer {
+    let mut frame = PacketBuffer::new();
+    let storage = frame.storage_mut();
+    let mut offset =
+        EthernetFrame::encode_header(storage, LOCAL_MAC, PEER_MAC, EthernetProtocol::Ipv4)
+            .expect("benchmark Ethernet header should fit");
+    offset += Ipv4Packet::encode_header(
+        &mut storage[offset..],
+        PEER_IP,
+        LOCAL_IP,
+        IpProtocol::Tcp,
+        TcpPacket::MIN_HEADER_LEN + payload.len(),
+        header.sequence as u16,
+        64,
+    )
+    .expect("benchmark IPv4 header should fit");
+    offset += TcpPacket::encode(
+        &mut storage[offset..],
+        IpAddress::Ipv4(PEER_IP),
+        IpAddress::Ipv4(LOCAL_IP),
+        header,
+        payload,
+    )
+    .expect("benchmark TCP packet should fit");
+    frame.set_len(offset);
+    frame
+}
+
+fn established_stack() -> Stack {
+    let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514));
+    stack.add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24));
+    stack.learn_neighbor(NeighborEntry {
+        ip: IpAddress::Ipv4(PEER_IP),
+        mac: PEER_MAC,
+        state: NeighborState::Reachable,
+        updated_at: StackInstant::from_nanos(0),
+    });
+    stack.open_tcp_connect(local_tcp_endpoint(), peer_tcp_endpoint(), 7);
+    let syn_ack = tcp_ipv4_frame(
+        TcpHeader {
+            source_port: 80,
+            destination_port: 49152,
+            sequence: 100,
+            acknowledgement: 8,
+            flags: TcpFlags::SYN.union(TcpFlags::ACK),
+            window_size: u16::MAX,
+        },
+        &[],
+    );
+    stack
+        .receive_frame(syn_ack.as_slice(), StackInstant::from_nanos(1))
+        .expect("benchmark SYN-ACK should establish the socket");
+    stack
+        .drive_tcp(StackInstant::from_nanos(1))
+        .expect("benchmark handshake ACK should queue");
+    let status = stack
+        .try_submit_outbound_slices(1, |_| Ok::<Option<usize>, ()>(Some(1)))
+        .expect("benchmark handshake ACK should submit");
+    assert!(matches!(
+        status,
+        OutboundBatchStatus::Submitted {
+            offered: 1,
+            accepted: 1,
+            ..
+        }
+    ));
+    stack
+}
+
 #[divan::bench(args = [23 * 1024, 64 * 1024, 128 * 1024])]
 fn tcp_receive_contiguous_read(bencher: Bencher, read_size: usize) {
     let payload = vec![0u8; TCP_PAYLOAD_BYTES];
@@ -115,6 +186,58 @@ fn tcp_receive_contiguous_read(bencher: Bencher, read_size: usize) {
                 received = received.saturating_add(bytes.len());
             }
             assert_eq!(received, target_bytes);
+        });
+}
+
+#[divan::bench]
+fn tcp_receive_ack_coalesces_unsubmitted_control_frames(bencher: Bencher) {
+    let payload = [0u8; TCP_PAYLOAD_BYTES];
+    let frames: [PacketBuffer; TCP_ACK_COALESCE_SEGMENTS] = core::array::from_fn(|index| {
+        tcp_ipv4_frame(
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101
+                    + u32::try_from(index * TCP_PAYLOAD_BYTES)
+                        .expect("benchmark TCP sequence fits u32"),
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+            &payload,
+        )
+    });
+
+    bencher
+        .counter(ItemsCount::new(TCP_ACK_COALESCE_SEGMENTS))
+        .bench_local(|| {
+            let mut stack = established_stack();
+            for (index, frame) in frames.iter().enumerate() {
+                let now = StackInstant::from_nanos(
+                    u64::try_from(index + 2).expect("benchmark timestamp fits u64"),
+                );
+                stack
+                    .receive_frame(black_box(frame.as_slice()), now)
+                    .expect("benchmark TCP payload should be accepted");
+                stack
+                    .drive_tcp(now)
+                    .expect("benchmark TCP drive should queue ACKs");
+            }
+            let status = stack
+                .try_submit_outbound_slices(MAX_OUTBOUND_FRAMES, |frames| {
+                    black_box(frames);
+                    Ok::<Option<usize>, ()>(Some(frames.len()))
+                })
+                .expect("benchmark outbound submit should succeed");
+            match status {
+                OutboundBatchStatus::Submitted {
+                    offered, accepted, ..
+                } => {
+                    assert_eq!(offered, 1);
+                    assert_eq!(accepted, 1);
+                }
+                other => panic!("unexpected outbound status: {other:?}"),
+            }
         });
 }
 
