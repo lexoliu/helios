@@ -1079,13 +1079,35 @@ where
             self.record_network_profile("tcp-read-polling-yield", yield_started);
 
             let drive_started = self.profile_start();
-            let read = self
-                .drive_tcp_and_poll_read(stream, max_bytes, "tcp-read-polling")
-                .await?;
+            let outcome = self
+                .poll_network_once_with_tcp_read(
+                    NetworkPollSource::Tcp,
+                    Some(NetworkTcpReadProbe {
+                        stream,
+                        max_bytes,
+                        profile_prefix: "tcp-read-polling",
+                    }),
+                    true,
+                )
+                .await
+                .map_err(|error| {
+                    TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed)
+                })?;
             self.record_network_profile("tcp-read-polling-drive-network", drive_started);
+            let read = outcome
+                .tcp_read
+                .expect("TCP read probe did not produce a read result")?;
             match read {
                 ready @ (TcpReadProgress::Data(_) | TcpReadProgress::Eof) => return Ok(ready),
                 TcpReadProgress::Pending => {}
+            }
+            // AArch64/HVF local-loopback profiling at 028b6ef showed fixed
+            // polling reads spending 121.5 ms across 8173 network drives while
+            // only 115 probes became ready. The cheap Helios syscall path is
+            // not the bottleneck there; empty device/stack drives are. Keep
+            // spinning only while RX/TX/completion work is actually moving.
+            if outcome.progress.is_idle() {
+                break;
             }
         }
         Ok(TcpReadProgress::Pending)
@@ -1400,29 +1422,6 @@ where
         self.drive_network(NetworkPollSource::Tcp)
             .await
             .map_err(|error| TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed))
-    }
-
-    async fn drive_tcp_and_poll_read(
-        &self,
-        stream: TcpStreamId,
-        max_bytes: usize,
-        profile_prefix: &'static str,
-    ) -> Result<TcpReadProgress, TcpError> {
-        let outcome = self
-            .poll_network_once_with_tcp_read(
-                NetworkPollSource::Tcp,
-                Some(NetworkTcpReadProbe {
-                    stream,
-                    max_bytes,
-                    profile_prefix,
-                }),
-                true,
-            )
-            .await
-            .map_err(|error| TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed))?;
-        outcome
-            .tcp_read
-            .expect("TCP read probe did not produce a read result")
     }
 
     async fn drive_tcp_read_burst(
@@ -3508,6 +3507,38 @@ mod tests {
         assert!(!tx_only.receive_saturated(budget));
         assert!(tx_only.saturated(budget));
         assert!(rx_full.receive_saturated(budget));
+    }
+
+    #[test]
+    fn network_poll_progress_counts_any_device_or_stack_work_as_busy() {
+        assert!(
+            NetworkPollProgress {
+                received_frames: 0,
+                reclaimed_tx: 0,
+                transmitted_frames: 0,
+            }
+            .is_idle()
+        );
+
+        for progress in [
+            NetworkPollProgress {
+                received_frames: 1,
+                reclaimed_tx: 0,
+                transmitted_frames: 0,
+            },
+            NetworkPollProgress {
+                received_frames: 0,
+                reclaimed_tx: 1,
+                transmitted_frames: 0,
+            },
+            NetworkPollProgress {
+                received_frames: 0,
+                reclaimed_tx: 0,
+                transmitted_frames: 1,
+            },
+        ] {
+            assert!(!progress.is_idle());
+        }
     }
 
     #[test]
