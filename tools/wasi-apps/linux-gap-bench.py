@@ -359,6 +359,8 @@ def run_wasmtime_profiles(
     host_http_url: str | None,
     wasmtime_bin: str,
     no_flamegraph: bool,
+    guest_interval: str,
+    perf_event: str,
 ) -> list[Path]:
     outputs = []
     for workload_name in workload_names:
@@ -375,6 +377,10 @@ def run_wasmtime_profiles(
             str(profile_out),
             "--wasmtime-bin",
             wasmtime_bin,
+            "--guest-interval",
+            guest_interval,
+            "--perf-event",
+            perf_event,
         ]
         if host_http_url:
             command.extend(["--host-http-url", host_http_url])
@@ -816,12 +822,18 @@ def write_report(
         for profile_path in sorted(helios_jsonl.parent.glob("helios*.kernel.folded")):
             lines.append(f"- Helios kernel folded profile is in `{profile_path}`.")
     if wasmtime_profiles:
-        lines.extend(["", "## Wasmtime Profiles", ""])
+        lines.extend(["", "## Wasmtime Native And Guest Profiles", ""])
         for profile_path in wasmtime_profiles:
             profile = json.loads(profile_path.read_text(encoding="utf-8"))
             lines.append(f"- `{profile['workload']}` `{profile['mode']}` metadata: `{profile_path}`")
             if "firefox_profile_json" in profile:
                 lines.append(f"- `{profile['workload']}` Firefox profiler JSON: `{profile['firefox_profile_json']}`")
+            if "perf_data" in profile:
+                lines.append(f"- `{profile['workload']}` perf data: `{profile['perf_data']}`")
+            if "perf_jit_data" in profile:
+                lines.append(f"- `{profile['workload']}` jit-injected perf data: `{profile['perf_jit_data']}`")
+            if "perf_script" in profile:
+                lines.append(f"- `{profile['workload']}` perf script: `{profile['perf_script']}`")
             if "svg" in profile:
                 lines.append(f"- `{profile['workload']}` flamegraph SVG: `{profile['svg']}`")
             if "folded" in profile:
@@ -847,6 +859,8 @@ def main() -> None:
     parser.add_argument("--wasmtime-profile-mode", choices=["guest", "perfmap", "jitdump"], default="guest")
     parser.add_argument("--wasmtime-bin", default=os.environ.get("WASMTIME_BIN", "wasmtime"))
     parser.add_argument("--wasmtime-no-flamegraph", action="store_true")
+    parser.add_argument("--wasmtime-profile-guest-interval", default="1ms")
+    parser.add_argument("--wasmtime-profile-perf-event", default="cycles:u")
     parser.add_argument("--max-host-load-per-cpu", type=float, default=DEFAULT_MAX_HOST_LOAD_PER_CPU)
     parser.add_argument("--allow-busy-host", action="store_true")
     args = parser.parse_args()
@@ -912,6 +926,8 @@ def main() -> None:
                 local_http_url,
                 args.wasmtime_bin,
                 args.wasmtime_no_flamegraph,
+                args.wasmtime_profile_guest_interval,
+                args.wasmtime_profile_perf_event,
             )
         report = out_dir / "report.md"
         write_report(

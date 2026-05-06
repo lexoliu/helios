@@ -97,6 +97,8 @@ struct Workload {
     remote_path: Option<String>,
     #[serde(default)]
     destination_path: Option<String>,
+    #[serde(default)]
+    throughput_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -126,6 +128,10 @@ enum JsonlRecord<'a> {
         runner: WorkloadRunner,
         iteration: u16,
         elapsed_ms: u128,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        throughput_bytes: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        throughput_mib_per_second: Option<f64>,
         stdout: StreamValidation<'a>,
         stderr: StreamValidation<'a>,
         validation: ValidationSummary,
@@ -135,6 +141,10 @@ enum JsonlRecord<'a> {
         class: WorkloadClass,
         runner: WorkloadRunner,
         median_elapsed_ms: u128,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        throughput_bytes: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        throughput_mib_per_second: Option<f64>,
         iterations: u16,
         elapsed_ms: Vec<u128>,
         validation: ValidationSummary,
@@ -214,6 +224,11 @@ pub(crate) async fn run_inner(
                 runner: workload.runner,
                 iteration,
                 elapsed_ms: output.elapsed_ms,
+                throughput_bytes: workload.throughput_bytes,
+                throughput_mib_per_second: throughput_mib_per_second(
+                    workload.throughput_bytes,
+                    output.elapsed_ms,
+                ),
                 stdout: stream_validation(&workload, &output.stdout, false),
                 stderr: stream_validation(&workload, &output.stderr, workload.stderr_empty),
                 validation,
@@ -225,6 +240,8 @@ pub(crate) async fn run_inner(
             class: workload.class,
             runner: workload.runner,
             median_elapsed_ms: median,
+            throughput_bytes: workload.throughput_bytes,
+            throughput_mib_per_second: throughput_mib_per_second(workload.throughput_bytes, median),
             iterations: command.iterations,
             elapsed_ms,
             validation: ValidationSummary { ok: true },
@@ -541,6 +558,14 @@ fn median(values: &[u128]) -> Result<u128> {
     Ok((sorted[lower] + sorted[upper]) / 2)
 }
 
+fn throughput_mib_per_second(bytes: Option<u64>, elapsed_ms: u128) -> Option<f64> {
+    let bytes = bytes?;
+    if elapsed_ms == 0 {
+        return None;
+    }
+    Some((bytes as f64 / (1024.0 * 1024.0)) / (elapsed_ms as f64 / 1000.0))
+}
+
 fn extend_unique(programs: &mut Vec<String>, required: &[String]) {
     for program in required {
         if !programs.iter().any(|existing| existing == program) {
@@ -615,6 +640,11 @@ mod tests {
                 .iter()
                 .any(|workload| workload.runner == WorkloadRunner::HeliosAot)
         );
+        let throughput = workloads
+            .iter()
+            .find(|workload| workload.name == "curl-http-throughput")
+            .expect("manifest must contain HTTP throughput workload");
+        assert_eq!(throughput.throughput_bytes, Some(67_108_864));
     }
 
     #[test]
@@ -639,5 +669,15 @@ mod tests {
                 .iter()
                 .all(|workload| workload.class == WorkloadClass::IoBound)
         );
+    }
+
+    #[test]
+    fn throughput_rate_uses_manifest_payload_bytes() {
+        assert_eq!(
+            throughput_mib_per_second(Some(64 * 1024 * 1024), 64),
+            Some(1000.0)
+        );
+        assert_eq!(throughput_mib_per_second(None, 64), None);
+        assert_eq!(throughput_mib_per_second(Some(64 * 1024 * 1024), 0), None);
     }
 }
