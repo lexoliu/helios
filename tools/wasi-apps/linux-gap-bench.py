@@ -5,6 +5,7 @@ import http.server
 import json
 import os
 import platform
+import signal
 import shlex
 import socketserver
 import subprocess
@@ -24,6 +25,7 @@ HTTP_LARGE_PAYLOAD_BYTES = DEFAULT_PAYLOAD_BYTES
 HTTP_LARGE_PAYLOAD_CHUNK = bytes(range(251))
 DEFAULT_MAX_HOST_LOAD_PER_CPU = 0.75
 TOP_CPU_PROCESS_LIMIT = 8
+DEFAULT_HELIOS_TIMEOUT_SECONDS = 600
 
 
 class QuietHttpHandler(http.server.SimpleHTTPRequestHandler):
@@ -37,6 +39,54 @@ def repo_root() -> Path:
 
 def run(command: list[str], env: dict[str, str] | None = None) -> None:
     subprocess.run(command, cwd=repo_root(), env=env, check=True)
+
+
+def terminate_process_group(pid: int) -> None:
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        return
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            return
+        time.sleep(0.05)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        return
+
+
+def run_isolated(
+    command: list[str],
+    env: dict[str, str] | None = None,
+    timeout_seconds: int = DEFAULT_HELIOS_TIMEOUT_SECONDS,
+) -> None:
+    process = subprocess.Popen(
+        command,
+        cwd=repo_root(),
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        returncode = process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as error:
+        terminate_process_group(process.pid)
+        raise SystemExit(
+            f"command timed out after {timeout_seconds}s: {shlex.join(command)}"
+        ) from error
+    finally:
+        terminate_process_group(process.pid)
+    if returncode != 0:
+        raise subprocess.CalledProcessError(returncode, command)
 
 
 def output(command: list[str]) -> str:
@@ -217,6 +267,7 @@ def run_helios(
     host_http_url: str | None,
     host_tcp_host: str | None,
     host_tcp_port: int | None,
+    timeout_seconds: int,
 ) -> Path:
     log = out_dir / "helios.jsonl"
     workloads_by_class: dict[str, list[str]] = {}
@@ -237,6 +288,7 @@ def run_helios(
                 host_http_url,
                 host_tcp_host,
                 host_tcp_port,
+                timeout_seconds,
             )
             class_logs.append(class_log)
         with log.open("w", encoding="utf-8") as output_handle:
@@ -254,6 +306,7 @@ def run_helios(
         host_http_url,
         host_tcp_host,
         host_tcp_port,
+        timeout_seconds,
     )
     return log
 
@@ -268,6 +321,7 @@ def run_helios_once(
     host_http_url: str | None,
     host_tcp_host: str | None,
     host_tcp_port: int | None,
+    timeout_seconds: int,
 ) -> None:
     env = os.environ.copy()
     env["HELIOS_WORKLOAD_BENCH_ARCH"] = arch
@@ -286,7 +340,7 @@ def run_helios_once(
         env["HELIOS_WORKLOAD_BENCH_HOST_TCP_HOST"] = host_tcp_host
     if host_tcp_port is not None:
         env["HELIOS_WORKLOAD_BENCH_HOST_TCP_PORT"] = str(host_tcp_port)
-    run(["tools/wasi-apps/workload-bench.sh"], env=env)
+    run_isolated(["tools/wasi-apps/workload-bench.sh"], env=env, timeout_seconds=timeout_seconds)
 
 
 def run_linux(
@@ -908,12 +962,20 @@ def main() -> None:
     parser.add_argument("--wasmtime-profile-perf-event", default="cycles:u")
     parser.add_argument("--max-host-load-per-cpu", type=float, default=DEFAULT_MAX_HOST_LOAD_PER_CPU)
     parser.add_argument("--allow-busy-host", action="store_true")
+    parser.add_argument(
+        "--helios-timeout-seconds",
+        type=int,
+        default=DEFAULT_HELIOS_TIMEOUT_SECONDS,
+        help="Maximum wall-clock seconds for each isolated Helios VM workload command.",
+    )
     args = parser.parse_args()
 
     if args.iterations <= 0:
         raise SystemExit("--iterations must be a positive integer")
     if args.max_host_load_per_cpu <= 0:
         raise SystemExit("--max-host-load-per-cpu must be positive")
+    if args.helios_timeout_seconds <= 0:
+        raise SystemExit("--helios-timeout-seconds must be positive")
 
     host_load = host_load_snapshot()
     enforce_host_load(host_load, args.max_host_load_per_cpu, args.allow_busy_host)
@@ -962,6 +1024,7 @@ def main() -> None:
                 host_http_url,
                 host_tcp_host,
                 host_tcp_port,
+                args.helios_timeout_seconds,
             )
         if not args.skip_linux:
             linux_json, docker_digest = run_linux(
