@@ -25,12 +25,13 @@ def receive_exact(host: str, port: int, expected_bytes: int) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--label", default="tcp-throughput")
     parser.add_argument("host")
     parser.add_argument("port", type=int)
     parser.add_argument("expected_bytes", type=int)
     args = parser.parse_args()
     total = receive_exact(args.host, args.port, args.expected_bytes)
-    print(f"tcp-throughput:{total}")
+    print(f"{args.label}:{total}")
 
 
 if __name__ == "__main__":

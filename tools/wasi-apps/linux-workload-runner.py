@@ -19,6 +19,7 @@ LINUX_PLACEHOLDERS = {
     "{quickjs}": "qjs",
     "{simd_lanes}": "python3 -c 'print(\"simd-lanes:17\")'",
     "{tcp_throughput}": "python3 {repo_root}/tools/wasi-apps/linux_tcp_throughput_client.py",
+    "{wasix_tcp_throughput}": "python3 {repo_root}/tools/wasi-apps/linux_tcp_throughput_client.py --label wasix-tcp-throughput",
 }
 
 HTTP_LARGE_PAYLOAD_FILE = "payload-64m.bin"

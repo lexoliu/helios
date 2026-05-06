@@ -478,6 +478,7 @@ fn render_helios_template(
         ("{quickjs}", "/bin/qjs"),
         ("{simd_lanes}", "/bin/simd-lanes"),
         ("{tcp_throughput}", "/bin/tcp-throughput"),
+        ("{wasix_tcp_throughput}", "/bin/wasix-tcp-throughput"),
     ] {
         rendered = rendered.replace(placeholder, value);
     }
@@ -690,6 +691,12 @@ mod tests {
             .expect("manifest must contain raw TCP throughput workload");
         assert!(tcp_throughput.requires_host_tcp);
         assert_eq!(tcp_throughput.throughput_bytes, Some(67_108_864));
+        let wasix_tcp_throughput = workloads
+            .iter()
+            .find(|workload| workload.name == "wasix-tcp-throughput")
+            .expect("manifest must contain WASIX TCP throughput workload");
+        assert!(wasix_tcp_throughput.requires_host_tcp);
+        assert_eq!(wasix_tcp_throughput.throughput_bytes, Some(67_108_864));
     }
 
     #[test]

@@ -52,7 +52,7 @@ trap 'rm -rf "$staging"' EXIT
 
 verify_wasm_uses_simd() {
   local path="$1"
-  if ! wasm-tools print "$path" | grep -Eq '(^|[[:space:]()])(v128|i8x16|i16x8|i32x4|i64x2|f32x4|f64x2)\.'; then
+  if ! wasm-tools print "$path" | grep -E '(^|[[:space:]()])(v128|i8x16|i16x8|i32x4|i64x2|f32x4|f64x2)\.' >/dev/null; then
     printf 'wasm SIMD instructions missing from %s\n' "$path" >&2
     exit 1
   fi
@@ -201,5 +201,16 @@ cp -f \
 
 wasm-tools strip "$out_dir/tcp-throughput.wasm" -o "$out_dir/tcp-throughput-stripped.wasm"
 
+env "${build_env[@]}" cargo build \
+  --manifest-path "$repo_root/tools/wasi-apps/wasix-tcp-throughput/Cargo.toml" \
+  --target wasm32-wasip1 \
+  --release
+
+cp -f \
+  "$repo_root/tools/wasi-apps/wasix-tcp-throughput/target/wasm32-wasip1/release/wasix-tcp-throughput.wasm" \
+  "$out_dir/wasix-tcp-throughput.wasm"
+
+wasm-tools strip "$out_dir/wasix-tcp-throughput.wasm" -o "$out_dir/wasix-tcp-throughput-stripped.wasm"
+
 echo "wasi artifacts written to: $out_dir and $python_root"
-ls -lh "$out_dir"/{curl,tcp-throughput}*.wasm
+ls -lh "$out_dir"/{curl,tcp-throughput,wasix-tcp-throughput}*.wasm
