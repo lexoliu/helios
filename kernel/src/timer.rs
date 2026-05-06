@@ -387,8 +387,7 @@ impl TimingWheel {
 
     fn cascade_level(&mut self, level: usize) {
         let slot = wheel_slot(self.current_tick, level);
-        let entries = core::mem::take(&mut self.levels[level].buckets[slot]);
-        for entry in entries {
+        while let Some(entry) = self.levels[level].buckets[slot].pop() {
             self.next_deadline_dirty = true;
             self.insert(entry);
         }
@@ -396,8 +395,7 @@ impl TimingWheel {
 
     fn drain_current_slot(&mut self, ready: &mut Vec<TimerEntry>) {
         let slot = wheel_slot(self.current_tick, 0);
-        let entries = core::mem::take(&mut self.levels[0].buckets[slot]);
-        for entry in entries {
+        while let Some(entry) = self.levels[0].buckets[slot].pop() {
             self.next_deadline_dirty = true;
             if entry.is_dead() {
                 continue;
@@ -596,6 +594,36 @@ mod tests {
         let mut ready = Vec::new();
         wheel.drain_expired(2, &mut ready);
         assert!(ready.is_empty());
+    }
+
+    #[test]
+    fn timing_wheel_drain_retains_bucket_capacity() {
+        let mut wheel = TimingWheel::new(0);
+        wheel.insert(timer_entry(100, 50));
+        let slot = super::wheel_slot(2, 0);
+        let retained_capacity = wheel.levels[0].buckets[slot].capacity();
+        assert_ne!(retained_capacity, 0);
+
+        let mut ready = Vec::new();
+        wheel.drain_expired(2, &mut ready);
+
+        assert_eq!(ready.len(), 1);
+        assert_eq!(wheel.levels[0].buckets[slot].capacity(), retained_capacity);
+    }
+
+    #[test]
+    fn timing_wheel_cascade_retains_bucket_capacity() {
+        let mut wheel = TimingWheel::new(0);
+        wheel.insert(timer_entry(300 * 50, 50));
+        let slot = super::wheel_slot(256, 1);
+        let retained_capacity = wheel.levels[1].buckets[slot].capacity();
+        assert_ne!(retained_capacity, 0);
+
+        let mut ready = Vec::new();
+        wheel.drain_expired(256, &mut ready);
+
+        assert!(ready.is_empty());
+        assert_eq!(wheel.levels[1].buckets[slot].capacity(), retained_capacity);
     }
 
     #[test]
