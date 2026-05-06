@@ -53,7 +53,6 @@ pub struct VirtioNetDevice<T: VirtioTransport> {
     transport: T,
     rx_state: Mutex<NetRxState<T>>,
     tx_state: Mutex<NetTxState<T>>,
-    tx_gate: Mutex<()>,
     interrupts: Notify,
     mac_address: [u8; 6],
     max_frame_len: usize,
@@ -210,7 +209,6 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 tx_buffer_len,
                 tx_in_flight,
             }),
-            tx_gate: Mutex::new(()),
             interrupts: Notify::new(),
             mac_address,
             max_frame_len,
@@ -327,7 +325,6 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         Frame: AsRef<[u8]>,
     {
         self.validate_tx_frames(frames)?;
-        let _tx_turn = self.tx_gate.lock().await;
         let mut state = self.tx_state.lock().await;
         Self::drain_tx_completions(&mut state, usize::MAX);
         let mut next_frame = 0usize;
@@ -349,7 +346,6 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let mut next_frame = 0usize;
         while next_frame < frames.len() {
             let submitted = {
-                let _tx_turn = self.tx_gate.lock().await;
                 let mut state = self.tx_state.lock().await;
                 Self::drain_tx_completions(&mut state, usize::MAX);
                 self.submit_available_tx_frames(&mut state, frames, &mut next_frame)?
