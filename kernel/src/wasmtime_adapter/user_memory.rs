@@ -9,12 +9,23 @@ use thiserror::Error;
 use wasmtime::{LinearMemory, MemoryCreator, MemoryType};
 
 use crate::ProgramOutOfMemory;
-use crate::user_memory::{allocate_user_zeroed, deallocate_user, user_memory_allocation_size};
+use crate::user_memory::{
+    allocate_user_zeroed_on, deallocate_user_on, user_memory_allocation_size,
+};
+use helios_hal::cpu::ProcessorId;
 
 const LINEAR_MEMORY_ALIGNMENT: usize = 64 * 1024;
 
 #[derive(Clone)]
-pub(crate) struct UserMemoryCreator;
+pub(crate) struct UserMemoryCreator {
+    processor: ProcessorId,
+}
+
+impl UserMemoryCreator {
+    pub(crate) const fn new(processor: ProcessorId) -> Self {
+        Self { processor }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 enum UserLinearMemoryError {
@@ -54,7 +65,7 @@ unsafe impl MemoryCreator for UserMemoryCreator {
             reserved_size_in_bytes,
             guard_size_in_bytes,
         )
-        .and_then(UserLinearMemoryPlan::allocate)
+        .and_then(|plan| plan.allocate(self.processor))
         .map(|memory| Box::new(memory) as Box<dyn LinearMemory>)
         .map_err(|error| error.to_string())
     }
@@ -68,8 +79,8 @@ struct UserLinearMemoryPlan {
 }
 
 impl UserLinearMemoryPlan {
-    fn allocate(self) -> Result<UserLinearMemory, UserLinearMemoryError> {
-        UserLinearMemory::new(self.minimum, self.capacity, self.relocatable)
+    fn allocate(self, processor: ProcessorId) -> Result<UserLinearMemory, UserLinearMemoryError> {
+        UserLinearMemory::new(self.minimum, self.capacity, self.relocatable, processor)
     }
 }
 
@@ -109,6 +120,7 @@ struct UserLinearMemory {
     byte_len: usize,
     byte_capacity: usize,
     relocatable: bool,
+    processor: ProcessorId,
 }
 
 unsafe impl Send for UserLinearMemory {}
@@ -119,6 +131,7 @@ impl UserLinearMemory {
         minimum: usize,
         capacity: usize,
         relocatable: bool,
+        processor: ProcessorId,
     ) -> Result<Self, UserLinearMemoryError> {
         if capacity < minimum {
             return Err(UserLinearMemoryError::CapacityBelowMinimum);
@@ -130,17 +143,19 @@ impl UserLinearMemory {
                 byte_len: 0,
                 byte_capacity: 0,
                 relocatable,
+                processor,
             });
         }
 
         let layout = linear_memory_layout(capacity)?;
-        let ptr = allocate_user_zeroed(layout)?;
+        let ptr = allocate_user_zeroed_on(processor, layout)?;
         let byte_capacity = user_memory_allocation_size(layout);
         Ok(Self {
             ptr,
             byte_len: minimum,
             byte_capacity,
             relocatable,
+            processor,
         })
     }
 }
@@ -168,13 +183,15 @@ unsafe impl LinearMemory for UserLinearMemory {
         }
 
         let new_layout = linear_memory_layout(new_size).map_err(wasmtime::Error::new)?;
-        let new_ptr = allocate_user_zeroed(new_layout).map_err(wasmtime::Error::from)?;
+        let new_ptr =
+            allocate_user_zeroed_on(self.processor, new_layout).map_err(wasmtime::Error::from)?;
         let new_capacity = user_memory_allocation_size(new_layout);
         if self.byte_len != 0 {
             unsafe {
                 core::ptr::copy_nonoverlapping(self.ptr.as_ptr(), new_ptr.as_ptr(), self.byte_len);
             }
-            deallocate_user(
+            deallocate_user_on(
+                self.processor,
                 self.ptr,
                 linear_memory_layout(self.byte_capacity).unwrap_or_else(|error| {
                     panic!("invalid user linear memory layout during grow: {error}")
@@ -195,7 +212,8 @@ unsafe impl LinearMemory for UserLinearMemory {
 impl Drop for UserLinearMemory {
     fn drop(&mut self) {
         if self.byte_capacity != 0 {
-            deallocate_user(
+            deallocate_user_on(
+                self.processor,
                 self.ptr,
                 linear_memory_layout(self.byte_capacity).unwrap_or_else(|error| {
                     panic!("invalid user linear memory layout during drop: {error}")

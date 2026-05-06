@@ -216,12 +216,15 @@ pub fn deallocate_user_frame_on(processor: ProcessorId, ptr: NonNull<u8>) {
     user_memory_pool().deallocate_on(processor, ptr, layout);
 }
 
-pub(crate) fn allocate_user_zeroed(layout: Layout) -> Result<NonNull<u8>, ProgramOutOfMemory> {
-    user_memory_pool().allocate_zeroed(layout)
+pub(crate) fn allocate_user_zeroed_on(
+    processor: ProcessorId,
+    layout: Layout,
+) -> Result<NonNull<u8>, ProgramOutOfMemory> {
+    user_memory_pool().allocate_zeroed_on(processor, layout)
 }
 
-pub(crate) fn deallocate_user(ptr: NonNull<u8>, layout: Layout) {
-    user_memory_pool().deallocate(ptr, layout);
+pub(crate) fn deallocate_user_on(processor: ProcessorId, ptr: NonNull<u8>, layout: Layout) {
+    user_memory_pool().deallocate_on(processor, ptr, layout);
 }
 
 pub(crate) fn user_memory_allocation_size(layout: Layout) -> usize {
