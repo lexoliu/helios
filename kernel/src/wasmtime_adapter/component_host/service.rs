@@ -16355,27 +16355,23 @@ async fn p1_read_descriptor<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
     capacity: usize,
-) -> Result<Vec<u8>, i32>
+) -> Result<Bytes, i32>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
     match caller.data().descriptors.get(fd) {
-        Some(Preview1Descriptor::Stdin { .. }) => {
-            Ok(caller.data_mut().read_stdin(capacity).await.to_vec())
+        Some(Preview1Descriptor::Stdin { .. }) => Ok(caller.data_mut().read_stdin(capacity).await),
+        Some(Preview1Descriptor::PipeRead { .. }) => {
+            caller.data_mut().read_pipe(fd, capacity).await
         }
-        Some(Preview1Descriptor::PipeRead { .. }) => caller
-            .data_mut()
-            .read_pipe(fd, capacity)
-            .await
-            .map(|bytes| bytes.to_vec()),
         Some(Preview1Descriptor::Event(event)) => {
             if capacity < 8 {
                 return Err(p1::errno::INVAL);
             }
-            Ok(event.read().await.to_le_bytes().to_vec())
+            Ok(Bytes::copy_from_slice(&event.read().await.to_le_bytes()))
         }
-        Some(Preview1Descriptor::NullDevice) => Ok(Vec::new()),
+        Some(Preview1Descriptor::NullDevice) => Ok(Bytes::new()),
         Some(Preview1Descriptor::File {
             descriptor, offset, ..
         }) => {
@@ -16395,13 +16391,13 @@ where
                     .await
                     .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
                     .map_err(p1_errno_from_fs)?
+                    .into()
             } else {
                 caller
                     .data()
                     .filesystem
                     .read_file_chunk(&descriptor, offset, capacity)
                     .map_err(p1_errno_from_fs)?
-                    .to_vec()
             };
             if let Some(Preview1Descriptor::File { offset, .. }) =
                 caller.data_mut().descriptors.get_mut(fd)
