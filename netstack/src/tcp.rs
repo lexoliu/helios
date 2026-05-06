@@ -693,7 +693,12 @@ where
                     remote
                 });
                 self.receive_next = packet.sequence.wrapping_add(1);
-                let action = self.acknowledge_sent(packet.acknowledgement, now_nanos, false);
+                let action = self.acknowledge_sent(
+                    packet.acknowledgement,
+                    now_nanos,
+                    false,
+                    packet.options.timestamp(),
+                );
                 self.state = TcpState::Established;
                 self.ack_pending = true;
                 TcpSegmentOutcome {
@@ -705,7 +710,12 @@ where
                 if packet.acknowledgement != self.send_next {
                     return TcpSegmentOutcome::default();
                 }
-                let action = self.acknowledge_sent(packet.acknowledgement, now_nanos, true);
+                let action = self.acknowledge_sent(
+                    packet.acknowledgement,
+                    now_nanos,
+                    true,
+                    packet.options.timestamp(),
+                );
                 self.state = TcpState::Established;
                 TcpSegmentOutcome {
                     recovery: action,
@@ -725,6 +735,7 @@ where
                         packet.acknowledgement,
                         now_nanos,
                         self.transmit_queue.is_empty(),
+                        packet.options.timestamp(),
                     );
                 }
                 if !packet.payload.is_empty()
@@ -794,6 +805,7 @@ where
         acknowledgement: u32,
         now_nanos: u64,
         app_limited: bool,
+        timestamp: Option<TcpTimestampOption>,
     ) -> Option<RecoveryAction> {
         if sequence_leq(acknowledgement, self.send_unacknowledged) {
             return (acknowledgement == self.send_unacknowledged)
@@ -801,7 +813,7 @@ where
                 .flatten();
         }
         let acked = acknowledgement.wrapping_sub(self.send_unacknowledged);
-        let timing = self.ack_sample_timing(acknowledgement, now_nanos);
+        let timing = self.ack_sample_timing(acknowledgement, now_nanos, timestamp);
         self.send_unacknowledged = acknowledgement;
         self.duplicate_ack_count = 0;
         self.fast_retransmit_pending = false;
@@ -861,7 +873,12 @@ where
         }
     }
 
-    fn ack_sample_timing(&self, acknowledgement: u32, now_nanos: u64) -> TcpAckTiming {
+    fn ack_sample_timing(
+        &self,
+        acknowledgement: u32,
+        now_nanos: u64,
+        timestamp: Option<TcpTimestampOption>,
+    ) -> TcpAckTiming {
         let mut rtt_nanos = 0;
         let mut first_sent_at = None;
         let mut last_sent_at = None;
@@ -884,6 +901,15 @@ where
                     .max(last.saturating_sub(first))
             })
             .unwrap_or(0);
+        let timestamp_rtt_nanos = timestamp.and_then(|timestamp| {
+            (timestamp.echo_reply != 0).then(|| timestamp_echo_rtt_nanos(now_nanos, timestamp))
+        });
+        let rtt_nanos = timestamp_rtt_nanos.unwrap_or(rtt_nanos);
+        let interval_nanos = if interval_nanos == 0 {
+            timestamp_rtt_nanos.unwrap_or(0)
+        } else {
+            interval_nanos
+        };
         TcpAckTiming {
             rtt_nanos,
             interval_nanos,
@@ -1205,6 +1231,10 @@ fn timestamp_value(now_nanos: u64) -> u32 {
     (now_nanos / 1_000_000) as u32
 }
 
+fn timestamp_echo_rtt_nanos(now_nanos: u64, timestamp: TcpTimestampOption) -> u64 {
+    u64::from(timestamp_value(now_nanos).wrapping_sub(timestamp.echo_reply)) * 1_000_000
+}
+
 fn rto_nanos(retransmissions: u8) -> u64 {
     let shift = retransmissions.min(6);
     TCP_INITIAL_RTO_NANOS.saturating_mul(1u64 << shift)
@@ -1327,13 +1357,35 @@ mod tests {
             .expect("established socket should transmit queued bytes");
         let acked_at = sent_at + 123;
 
-        let timing = socket.ack_sample_timing(data.header.sequence + data.sequence_len, acked_at);
+        let timing =
+            socket.ack_sample_timing(data.header.sequence + data.sequence_len, acked_at, None);
 
         assert_eq!(
             timing,
             TcpAckTiming {
                 rtt_nanos: 123,
                 interval_nanos: 123,
+            }
+        );
+    }
+
+    #[test]
+    fn ack_sample_timing_uses_timestamp_echo_when_present() {
+        let socket = established_socket();
+        let timing = socket.ack_sample_timing(
+            8,
+            TCP_INITIAL_RTO_NANOS + 7_000_000,
+            Some(TcpTimestampOption {
+                value: 0,
+                echo_reply: timestamp_value(TCP_INITIAL_RTO_NANOS),
+            }),
+        );
+
+        assert_eq!(
+            timing,
+            TcpAckTiming {
+                rtt_nanos: 7_000_000,
+                interval_nanos: 7_000_000,
             }
         );
     }
