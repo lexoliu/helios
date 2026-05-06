@@ -12,7 +12,7 @@ use crate::{
     ArpOperation, ArpPacket, BbrV3, DEFAULT_POLL_BUDGET, DhcpDnsServers, EthernetAddress,
     EthernetFrame, EthernetProtocol, Icmpv6Packet, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr,
     Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, PacketBuffer, StackError, TcpEndpoint,
-    TcpHeader, TcpPacket, TcpSocket, TcpTransmitSegment, UdpPacket,
+    TcpHeader, TcpHeaderOptions, TcpPacket, TcpSocket, TcpTransmitSegment, UdpPacket,
 };
 
 pub const MAX_ROUTES: usize = 32;
@@ -792,9 +792,10 @@ impl Stack {
     }
 
     pub fn drive_tcp(&mut self, now: StackInstant) -> Result<(), StackError> {
-        let mut pending_syn = ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader), 16>::new();
+        let mut pending_syn =
+            ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader, TcpHeaderOptions), 16>::new();
         let mut pending_syn_ack =
-            ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader), 16>::new();
+            ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader, TcpHeaderOptions), 16>::new();
         let mut pending_ack = ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader), 16>::new();
         let mut pending_retransmit = ArrayVec::<(usize, TcpTransmitSegment), 16>::new();
         let mut pending_data = ArrayVec::<(usize, TcpTransmitSegment), 16>::new();
@@ -820,14 +821,26 @@ impl Stack {
                     if !retransmitting {
                         if let Some(header) = socket.pending_syn() {
                             pending_syn
-                                .try_push((index, local, remote, header))
+                                .try_push((
+                                    index,
+                                    local,
+                                    remote,
+                                    header,
+                                    socket.pending_syn_options(),
+                                ))
                                 .unwrap_or_else(|_| {
                                     panic!("TCP control transmit burst overflowed")
                                 });
                         }
                         if let Some(header) = socket.pending_syn_ack() {
                             pending_syn_ack
-                                .try_push((index, local, remote, header))
+                                .try_push((
+                                    index,
+                                    local,
+                                    remote,
+                                    header,
+                                    socket.pending_syn_ack_options(),
+                                ))
                                 .unwrap_or_else(|_| {
                                     panic!("TCP SYN-ACK transmit burst overflowed")
                                 });
@@ -849,8 +862,8 @@ impl Stack {
             self.schedule_tcp_timer_deadline(index, deadline);
         }
 
-        for (index, local, remote, header) in pending_syn {
-            if self.queue_tcp(local, remote, header, &[], index as u16, now)? {
+        for (index, local, remote, header, options) in pending_syn {
+            if self.queue_tcp(local, remote, header, options, &[], index as u16, now)? {
                 let socket = self
                     .tcp
                     .get_mut(index)
@@ -860,8 +873,8 @@ impl Stack {
                 self.schedule_tcp_timer(index);
             }
         }
-        for (index, local, remote, header) in pending_syn_ack {
-            if self.queue_tcp(local, remote, header, &[], index as u16, now)? {
+        for (index, local, remote, header, options) in pending_syn_ack {
+            if self.queue_tcp(local, remote, header, options, &[], index as u16, now)? {
                 let socket = self
                     .tcp
                     .get_mut(index)
@@ -872,7 +885,15 @@ impl Stack {
             }
         }
         for (index, local, remote, header) in pending_ack {
-            if self.queue_tcp(local, remote, header, &[], index as u16, now)? {
+            if self.queue_tcp(
+                local,
+                remote,
+                header,
+                TcpHeaderOptions::empty(),
+                &[],
+                index as u16,
+                now,
+            )? {
                 let socket = self
                     .tcp
                     .get_mut(index)
@@ -889,6 +910,7 @@ impl Stack {
                 segment.local,
                 segment.remote,
                 segment.header,
+                segment.options,
                 &segment.payload,
                 identification,
                 now,
@@ -908,6 +930,7 @@ impl Stack {
                 segment.local,
                 segment.remote,
                 segment.header,
+                segment.options,
                 &segment.payload,
                 identification,
                 now,
@@ -1171,16 +1194,23 @@ impl Stack {
         local: TcpEndpoint,
         remote: TcpEndpoint,
         header: TcpHeader,
+        options: TcpHeaderOptions,
         payload: &[u8],
         identification: u16,
         now: StackInstant,
     ) -> Result<bool, StackError> {
         match (local.address, remote.address) {
-            (IpAddress::Ipv4(source), IpAddress::Ipv4(destination)) => {
-                self.queue_tcp_ipv4(source, destination, header, payload, identification, now)
-            }
+            (IpAddress::Ipv4(source), IpAddress::Ipv4(destination)) => self.queue_tcp_ipv4(
+                source,
+                destination,
+                header,
+                options,
+                payload,
+                identification,
+                now,
+            ),
             (IpAddress::Ipv6(source), IpAddress::Ipv6(destination)) => {
-                self.queue_tcp_ipv6(source, destination, header, payload, now)
+                self.queue_tcp_ipv6(source, destination, header, options, payload, now)
             }
             _ => panic!("TCP endpoint address families must match"),
         }
@@ -1191,6 +1221,7 @@ impl Stack {
         source: Ipv4Address,
         destination: Ipv4Address,
         header: TcpHeader,
+        options: TcpHeaderOptions,
         payload: &[u8],
         identification: u16,
         now: StackInstant,
@@ -1216,21 +1247,26 @@ impl Stack {
                 EthernetProtocol::Ipv4,
             )
             .ok_or(StackError::OutputQueueFull)?;
+            let tcp_len = TcpPacket::MIN_HEADER_LEN
+                .checked_add(options.encoded_len())
+                .and_then(|header_len| header_len.checked_add(payload.len()))
+                .ok_or(StackError::OutputQueueFull)?;
             offset += Ipv4Packet::encode_header(
                 &mut storage[offset..],
                 source,
                 destination,
                 crate::IpProtocol::Tcp,
-                TcpPacket::MIN_HEADER_LEN + payload.len(),
+                tcp_len,
                 identification,
                 64,
             )
             .ok_or(StackError::OutputQueueFull)?;
-            offset += TcpPacket::encode(
+            offset += TcpPacket::encode_with_options(
                 &mut storage[offset..],
                 IpAddress::Ipv4(source),
                 IpAddress::Ipv4(destination),
                 header,
+                options,
                 payload,
             )
             .ok_or(StackError::OutputQueueFull)?;
@@ -1244,6 +1280,7 @@ impl Stack {
         source: Ipv6Address,
         destination: Ipv6Address,
         header: TcpHeader,
+        options: TcpHeaderOptions,
         payload: &[u8],
         now: StackInstant,
     ) -> Result<bool, StackError> {
@@ -1268,20 +1305,25 @@ impl Stack {
                 EthernetProtocol::Ipv6,
             )
             .ok_or(StackError::OutputQueueFull)?;
+            let tcp_len = TcpPacket::MIN_HEADER_LEN
+                .checked_add(options.encoded_len())
+                .and_then(|header_len| header_len.checked_add(payload.len()))
+                .ok_or(StackError::OutputQueueFull)?;
             offset += Ipv6Packet::encode_header(
                 &mut storage[offset..],
                 source,
                 destination,
                 crate::IpProtocol::Tcp,
-                TcpPacket::MIN_HEADER_LEN + payload.len(),
+                tcp_len,
                 64,
             )
             .ok_or(StackError::OutputQueueFull)?;
-            offset += TcpPacket::encode(
+            offset += TcpPacket::encode_with_options(
                 &mut storage[offset..],
                 IpAddress::Ipv6(source),
                 IpAddress::Ipv6(destination),
                 header,
+                options,
                 payload,
             )
             .ok_or(StackError::OutputQueueFull)?;
@@ -1646,13 +1688,14 @@ impl Stack {
             let initial_sequence = (now.nanos() as u32)
                 .wrapping_add(u32::from(packet.destination_port))
                 .wrapping_add(u32::from(packet.source_port));
-            let child = TcpSocket::accept(
+            let mut child = TcpSocket::accept(
                 local,
                 remote_endpoint,
                 packet.sequence.wrapping_add(1),
                 initial_sequence,
                 BbrV3::new(1460),
             );
+            child.record_peer_options(packet);
             self.insert_tcp(child);
         }
         Ok(false)
@@ -1974,6 +2017,8 @@ mod tests {
         let syn_ack = TcpPacket::parse(ipv4.payload).expect("TCP packet should parse");
         assert!(syn_ack.flags.contains(TcpFlags::SYN.union(TcpFlags::ACK)));
         assert_eq!(syn_ack.acknowledgement, 11);
+        assert_eq!(syn_ack.options.maximum_segment_size(), Some(1460));
+        assert!(syn_ack.options.sack_permitted());
 
         let (ack, ack_len) = tcp_segment(
             peer,

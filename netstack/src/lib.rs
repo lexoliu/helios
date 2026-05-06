@@ -30,7 +30,8 @@ pub use dhcp::{
 pub use dns::{DNS_PORT, DnsMessage, DnsQuestionWriter, DnsResponse};
 pub use packet::{
     ArpOperation, ArpPacket, EthernetFrame, EthernetProtocol, Icmpv4Echo, Icmpv4Packet, Icmpv6Echo,
-    Icmpv6Packet, IpProtocol, Ipv4Packet, Ipv6Packet, TcpFlags, TcpHeader, TcpPacket, UdpPacket,
+    Icmpv6Packet, IpProtocol, Ipv4Packet, Ipv6Packet, TcpFlags, TcpHeader, TcpHeaderOptions,
+    TcpOptions, TcpPacket, TcpTimestampOption, UdpPacket,
 };
 pub use stack::{
     DhcpLease, DnsQueryId, IcmpEchoKey, NeighborState, Route, RouteTable, SocketId, Stack,

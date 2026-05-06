@@ -5,7 +5,7 @@ use heapless::Deque;
 
 use crate::{
     AckSample, CongestionControl, CongestionEvent, IpAddress, RecoveryAction, TcpFlags, TcpHeader,
-    TcpPacket,
+    TcpHeaderOptions, TcpPacket, TcpTimestampOption,
 };
 
 pub const MAX_TCP_RECEIVE_SEGMENTS: usize = 128;
@@ -32,6 +32,7 @@ pub struct TcpTransmitSegment {
     pub local: TcpEndpoint,
     pub remote: TcpEndpoint,
     pub header: TcpHeader,
+    pub options: TcpHeaderOptions,
     pub payload: Bytes,
     pub sequence_len: u32,
     pub retransmission: bool,
@@ -46,6 +47,7 @@ pub struct TcpSegmentOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TcpInFlightSegment {
     header: TcpHeader,
+    options: TcpHeaderOptions,
     payload: Bytes,
     sequence_len: u32,
     sent_at_nanos: u64,
@@ -80,6 +82,9 @@ where
     send_unacknowledged: u32,
     receive_next: u32,
     advertised_window: u16,
+    peer_max_segment_size: usize,
+    peer_sack_permitted: bool,
+    peer_timestamp: Option<TcpTimestampOption>,
     receive_queue: Deque<Bytes, MAX_TCP_RECEIVE_SEGMENTS>,
     receive_queued_bytes: usize,
     transmit_queue: Deque<Bytes, MAX_TCP_QUEUED_SEGMENTS>,
@@ -110,6 +115,9 @@ where
             send_unacknowledged: 0,
             receive_next: 0,
             advertised_window: receive_window_size(0),
+            peer_max_segment_size: TCP_RECEIVE_SEGMENT_BYTES,
+            peer_sack_permitted: false,
+            peer_timestamp: None,
             receive_queue: Deque::new(),
             receive_queued_bytes: 0,
             transmit_queue: Deque::new(),
@@ -225,6 +233,7 @@ where
         self.in_flight
             .push_back(TcpInFlightSegment {
                 header,
+                options: syn_header_options(),
                 payload: Bytes::new(),
                 sequence_len: 1,
                 sent_at_nanos: now_nanos,
@@ -246,6 +255,7 @@ where
         self.in_flight
             .push_back(TcpInFlightSegment {
                 header,
+                options: syn_header_options(),
                 payload: Bytes::new(),
                 sequence_len: 1,
                 sent_at_nanos: now_nanos,
@@ -279,6 +289,26 @@ where
 
     pub const fn advertised_window(&self) -> u16 {
         self.advertised_window
+    }
+
+    pub const fn pending_syn_options(&self) -> TcpHeaderOptions {
+        syn_header_options()
+    }
+
+    pub const fn pending_syn_ack_options(&self) -> TcpHeaderOptions {
+        syn_header_options()
+    }
+
+    pub const fn peer_max_segment_size(&self) -> usize {
+        self.peer_max_segment_size
+    }
+
+    pub const fn peer_sack_permitted(&self) -> bool {
+        self.peer_sack_permitted
+    }
+
+    pub const fn peer_timestamp(&self) -> Option<TcpTimestampOption> {
+        self.peer_timestamp
     }
 
     pub fn receive_backpressured(&self) -> bool {
@@ -367,6 +397,7 @@ where
         self.in_flight
             .push_back(TcpInFlightSegment {
                 header,
+                options: TcpHeaderOptions::empty(),
                 payload: Bytes::new(),
                 sequence_len: 1,
                 sent_at_nanos: now_nanos,
@@ -377,6 +408,7 @@ where
             local,
             remote,
             header,
+            options: TcpHeaderOptions::empty(),
             payload: Bytes::new(),
             sequence_len: 1,
             retransmission: false,
@@ -421,8 +453,9 @@ where
     ) -> Option<TcpTransmitSegment> {
         let mut payload = self.transmit_queue.pop_front()?;
         let available = usize::try_from(cwnd - self.bytes_in_flight).unwrap_or(usize::MAX);
-        if payload.len() > available {
-            let tail = payload.split_off(available);
+        let maximum_segment = available.min(self.peer_max_segment_size);
+        if payload.len() > maximum_segment {
+            let tail = payload.split_off(maximum_segment);
             self.transmit_queue
                 .push_front(tail)
                 .unwrap_or_else(|_| panic!("TCP transmit queue lost capacity while splitting"));
@@ -443,6 +476,7 @@ where
         self.in_flight
             .push_back(TcpInFlightSegment {
                 header,
+                options: TcpHeaderOptions::empty(),
                 payload: payload.clone(),
                 sequence_len,
                 sent_at_nanos: now_nanos,
@@ -455,6 +489,7 @@ where
             local,
             remote,
             header,
+            options: TcpHeaderOptions::empty(),
             payload,
             sequence_len,
             retransmission: false,
@@ -473,6 +508,7 @@ where
             local,
             remote,
             header: in_flight.header,
+            options: in_flight.options,
             payload: in_flight.payload.clone(),
             sequence_len: in_flight.sequence_len,
             retransmission: true,
@@ -569,6 +605,7 @@ where
 
         match self.state {
             TcpState::SynSent if packet.flags.contains(TcpFlags::SYN.union(TcpFlags::ACK)) => {
+                self.record_peer_options(packet);
                 self.remote = self.remote.map(|mut remote| {
                     remote.port = packet.source_port;
                     remote
@@ -757,6 +794,14 @@ where
         }
     }
 
+    pub(crate) fn record_peer_options(&mut self, packet: TcpPacket<'_>) {
+        if let Some(mss) = packet.options.maximum_segment_size() {
+            self.peer_max_segment_size = usize::from(mss).min(TCP_RECEIVE_SEGMENT_BYTES).max(1);
+        }
+        self.peer_sack_permitted = packet.options.sack_permitted();
+        self.peer_timestamp = packet.options.timestamp();
+    }
+
     fn request_ack(&mut self) {
         self.ack_pending = true;
         self.delayed_ack_deadline_nanos = None;
@@ -788,6 +833,12 @@ fn receive_window_size(queued_bytes: usize) -> u16 {
     bytes.min(u16::MAX as usize) as u16
 }
 
+const fn syn_header_options() -> TcpHeaderOptions {
+    TcpHeaderOptions::empty()
+        .with_maximum_segment_size(TCP_RECEIVE_SEGMENT_BYTES as u16)
+        .with_sack_permitted()
+}
+
 fn segment_end(segment: &TcpInFlightSegment) -> u32 {
     segment.header.sequence.wrapping_add(segment.sequence_len)
 }
@@ -812,7 +863,7 @@ fn min_deadline(left: Option<u64>, right: Option<u64>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BbrV3, Ipv4Address};
+    use crate::{BbrV3, Ipv4Address, TcpOptions};
 
     fn endpoint(port: u16) -> TcpEndpoint {
         TcpEndpoint {
@@ -839,6 +890,7 @@ mod tests {
                 acknowledgement: 8,
                 flags: TcpFlags::SYN.union(TcpFlags::ACK),
                 window_size: u16::MAX,
+                options: TcpOptions::empty(),
                 payload: &[],
             },
             TCP_INITIAL_RTO_NANOS,
@@ -877,6 +929,7 @@ mod tests {
                 acknowledgement: 8,
                 flags: TcpFlags::SYN.union(TcpFlags::ACK),
                 window_size: u16::MAX,
+                options: TcpOptions::empty(),
                 payload: &[],
             },
             TCP_INITIAL_RTO_NANOS,
@@ -894,6 +947,7 @@ mod tests {
                 acknowledgement: data.header.sequence + data.sequence_len,
                 flags: TcpFlags::ACK,
                 window_size: u16::MAX,
+                options: TcpOptions::empty(),
                 payload: &[],
             },
             TCP_INITIAL_RTO_NANOS + 1,
@@ -917,6 +971,7 @@ mod tests {
                 acknowledgement: 8,
                 flags: TcpFlags::SYN.union(TcpFlags::ACK),
                 window_size: u16::MAX,
+                options: TcpOptions::empty(),
                 payload: &[],
             },
             TCP_INITIAL_RTO_NANOS,
@@ -931,6 +986,33 @@ mod tests {
             .expect("established socket should transmit queued bytes");
         assert_eq!(segment.payload.as_ref(), b"hello");
         assert_eq!(segment.payload.as_ptr(), payload_ptr);
+    }
+
+    #[test]
+    fn peer_mss_option_caps_transmit_segment_size() {
+        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+        socket.mark_syn_queued(0);
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+                options: TcpOptions::parse(&[2, 4, 0, 4]).expect("MSS option should parse"),
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS,
+        );
+
+        assert_eq!(socket.peer_max_segment_size(), 4);
+        assert_eq!(socket.queue_send(b"abcdefghij"), 10);
+        let first = socket
+            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 1)
+            .expect("queued bytes should produce a capped segment");
+
+        assert_eq!(first.payload.as_ref(), b"abcd");
     }
 
     #[test]
@@ -966,6 +1048,7 @@ mod tests {
                 acknowledgement: fin.header.sequence + 1,
                 flags: TcpFlags::ACK,
                 window_size: u16::MAX,
+                options: TcpOptions::empty(),
                 payload: &[],
             },
             TCP_INITIAL_RTO_NANOS + 3,
@@ -988,6 +1071,7 @@ mod tests {
                 acknowledgement: fin.header.sequence + 1,
                 flags: TcpFlags::ACK,
                 window_size: u16::MAX,
+                options: TcpOptions::empty(),
                 payload: &[],
             },
             TCP_INITIAL_RTO_NANOS + 2,
@@ -1003,6 +1087,7 @@ mod tests {
                 acknowledgement: fin.header.sequence + 1,
                 flags: TcpFlags::ACK.union(TcpFlags::FIN),
                 window_size: u16::MAX,
+                options: TcpOptions::empty(),
                 payload: &[],
             },
             fin_received_at,
@@ -1031,6 +1116,7 @@ mod tests {
                 acknowledgement: 8,
                 flags: TcpFlags::ACK.union(TcpFlags::FIN),
                 window_size: u16::MAX,
+                options: TcpOptions::empty(),
                 payload: &[],
             },
             TCP_INITIAL_RTO_NANOS + 1,
@@ -1052,6 +1138,7 @@ mod tests {
                 acknowledgement: fin.header.sequence + 1,
                 flags: TcpFlags::ACK,
                 window_size: u16::MAX,
+                options: TcpOptions::empty(),
                 payload: &[],
             },
             TCP_INITIAL_RTO_NANOS + 3,
@@ -1070,6 +1157,7 @@ mod tests {
                 acknowledgement: 8,
                 flags: TcpFlags::ACK,
                 window_size: u16::MAX,
+                options: TcpOptions::empty(),
                 payload: b"r",
             },
             TCP_INITIAL_RTO_NANOS + 1,
@@ -1096,6 +1184,7 @@ mod tests {
                 acknowledgement: 8,
                 flags: TcpFlags::SYN.union(TcpFlags::ACK),
                 window_size: u16::MAX,
+                options: TcpOptions::empty(),
                 payload: &[],
             },
             TCP_INITIAL_RTO_NANOS,
@@ -1113,6 +1202,7 @@ mod tests {
                     acknowledgement: 8,
                     flags: TcpFlags::ACK,
                     window_size: u16::MAX,
+                    options: TcpOptions::empty(),
                     payload: &payload,
                 },
                 TCP_INITIAL_RTO_NANOS + index as u64 + 1,
@@ -1138,6 +1228,7 @@ mod tests {
                 acknowledgement: 8,
                 flags: TcpFlags::SYN.union(TcpFlags::ACK),
                 window_size: u16::MAX,
+                options: TcpOptions::empty(),
                 payload: &[],
             },
             TCP_INITIAL_RTO_NANOS,
@@ -1153,6 +1244,7 @@ mod tests {
                 acknowledgement: 8,
                 flags: TcpFlags::ACK,
                 window_size: u16::MAX,
+                options: TcpOptions::empty(),
                 payload: &payload,
             },
             TCP_INITIAL_RTO_NANOS + 1,
@@ -1167,6 +1259,7 @@ mod tests {
                 acknowledgement: 8,
                 flags: TcpFlags::ACK,
                 window_size: u16::MAX,
+                options: TcpOptions::empty(),
                 payload: &payload,
             },
             TCP_INITIAL_RTO_NANOS + 2,
@@ -1187,6 +1280,7 @@ mod tests {
                 acknowledgement: 8,
                 flags: TcpFlags::ACK,
                 window_size: u16::MAX,
+                options: TcpOptions::empty(),
                 payload: &payload,
             },
             received_at,
@@ -1216,6 +1310,7 @@ mod tests {
                 acknowledgement: 8,
                 flags: TcpFlags::SYN.union(TcpFlags::ACK),
                 window_size: u16::MAX,
+                options: TcpOptions::empty(),
                 payload: &[],
             },
             TCP_INITIAL_RTO_NANOS,
@@ -1230,6 +1325,7 @@ mod tests {
                 acknowledgement: 8,
                 flags: TcpFlags::ACK,
                 window_size: u16::MAX,
+                options: TcpOptions::empty(),
                 payload: b"ok",
             },
             TCP_INITIAL_RTO_NANOS + 1,
@@ -1249,6 +1345,7 @@ mod tests {
                 acknowledgement: 8,
                 flags: TcpFlags::SYN.union(TcpFlags::ACK),
                 window_size: u16::MAX,
+                options: TcpOptions::empty(),
                 payload: &[],
             },
             TCP_INITIAL_RTO_NANOS,
@@ -1267,6 +1364,7 @@ mod tests {
                     acknowledgement: 8,
                     flags: TcpFlags::ACK,
                     window_size: u16::MAX,
+                    options: TcpOptions::empty(),
                     payload,
                 },
                 TCP_INITIAL_RTO_NANOS + index as u64 + 1,
@@ -1288,6 +1386,7 @@ mod tests {
                 acknowledgement: 8,
                 flags: TcpFlags::ACK,
                 window_size: u16::MAX,
+                options: TcpOptions::empty(),
                 payload: b"abc",
             },
             TCP_INITIAL_RTO_NANOS + 1,
@@ -1314,6 +1413,7 @@ mod tests {
                     acknowledgement: 8,
                     flags: TcpFlags::ACK,
                     window_size: u16::MAX,
+                    options: TcpOptions::empty(),
                     payload,
                 },
                 TCP_INITIAL_RTO_NANOS + index as u64 + 1,
@@ -1336,6 +1436,7 @@ mod tests {
                 acknowledgement: 8,
                 flags: TcpFlags::SYN.union(TcpFlags::ACK),
                 window_size: u16::MAX,
+                options: TcpOptions::empty(),
                 payload: &[],
             },
             TCP_INITIAL_RTO_NANOS,
@@ -1350,6 +1451,7 @@ mod tests {
                 acknowledgement: 8,
                 flags: TcpFlags::ACK,
                 window_size: u16::MAX,
+                options: TcpOptions::empty(),
                 payload: b"future",
             },
             TCP_INITIAL_RTO_NANOS + 1,
@@ -1374,6 +1476,7 @@ mod tests {
                 acknowledgement: 8,
                 flags: TcpFlags::SYN.union(TcpFlags::ACK),
                 window_size: u16::MAX,
+                options: TcpOptions::empty(),
                 payload: &[],
             },
             TCP_INITIAL_RTO_NANOS,
@@ -1392,6 +1495,7 @@ mod tests {
                     acknowledgement: 8,
                     flags: TcpFlags::ACK,
                     window_size: u16::MAX,
+                    options: TcpOptions::empty(),
                     payload: &payload,
                 },
                 TCP_INITIAL_RTO_NANOS + index as u64 + 1,

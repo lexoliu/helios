@@ -379,6 +379,7 @@ pub struct TcpPacket<'a> {
     pub acknowledgement: u32,
     pub flags: TcpFlags,
     pub window_size: u16,
+    pub options: TcpOptions<'a>,
     pub payload: &'a [u8],
 }
 
@@ -400,6 +401,7 @@ impl<'a> TcpPacket<'a> {
             acknowledgement: read_u32(bytes, 8)?,
             flags: TcpFlags(u16::from(bytes[13]) | (u16::from(bytes[12] & 0x01) << 8)),
             window_size: read_u16(bytes, 14)?,
+            options: TcpOptions::parse(&bytes[Self::MIN_HEADER_LEN..header_len])?,
             payload: &bytes[header_len..],
         })
     }
@@ -411,19 +413,41 @@ impl<'a> TcpPacket<'a> {
         header: TcpHeader,
         payload: &[u8],
     ) -> Option<usize> {
-        let len = Self::MIN_HEADER_LEN.checked_add(payload.len())?;
+        Self::encode_with_options(
+            output,
+            source,
+            destination,
+            header,
+            TcpHeaderOptions::empty(),
+            payload,
+        )
+    }
+
+    pub fn encode_with_options(
+        output: &mut [u8],
+        source: IpAddress,
+        destination: IpAddress,
+        header: TcpHeader,
+        options: TcpHeaderOptions,
+        payload: &[u8],
+    ) -> Option<usize> {
+        let options_len = options.encoded_len();
+        let header_len = Self::MIN_HEADER_LEN.checked_add(options_len)?;
+        let data_offset_words = u8::try_from(header_len / 4).ok()?;
+        let len = header_len.checked_add(payload.len())?;
         if output.len() < len {
             return None;
         }
-        output[..Self::MIN_HEADER_LEN].fill(0);
+        output[..header_len].fill(0);
         write_u16(output, 0, header.source_port)?;
         write_u16(output, 2, header.destination_port)?;
         write_u32(output, 4, header.sequence)?;
         write_u32(output, 8, header.acknowledgement)?;
-        output[12] = 5 << 4;
+        output[12] = data_offset_words << 4;
         output[13] = header.flags.bits() as u8;
         write_u16(output, 14, header.window_size)?;
-        output[Self::MIN_HEADER_LEN..len].copy_from_slice(payload);
+        options.encode(&mut output[Self::MIN_HEADER_LEN..header_len])?;
+        output[header_len..len].copy_from_slice(payload);
         let checksum = match (source, destination) {
             (IpAddress::Ipv4(source), IpAddress::Ipv4(destination)) => {
                 tcpv4_checksum(source, destination, &output[..len])
@@ -436,6 +460,171 @@ impl<'a> TcpPacket<'a> {
         write_u16(output, 16, checksum)?;
         Some(len)
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TcpTimestampOption {
+    pub value: u32,
+    pub echo_reply: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TcpOptions<'a> {
+    raw: &'a [u8],
+    maximum_segment_size: Option<u16>,
+    window_scale: Option<u8>,
+    sack_permitted: bool,
+    timestamp: Option<TcpTimestampOption>,
+}
+
+impl<'a> TcpOptions<'a> {
+    pub const fn empty() -> Self {
+        Self {
+            raw: &[],
+            maximum_segment_size: None,
+            window_scale: None,
+            sack_permitted: false,
+            timestamp: None,
+        }
+    }
+
+    pub fn parse(raw: &'a [u8]) -> Option<Self> {
+        let mut options = Self {
+            raw,
+            ..Self::empty()
+        };
+        let mut offset = 0;
+        while offset < raw.len() {
+            match raw[offset] {
+                0 => break,
+                1 => offset += 1,
+                kind => {
+                    let len = usize::from(*raw.get(offset + 1)?);
+                    if len < 2 || offset.checked_add(len)? > raw.len() {
+                        return None;
+                    }
+                    let data = &raw[offset + 2..offset + len];
+                    match kind {
+                        2 if data.len() == 2 => {
+                            options.maximum_segment_size =
+                                Some(u16::from_be_bytes(data.try_into().ok()?));
+                        }
+                        3 if data.len() == 1 => {
+                            options.window_scale = Some(data[0]);
+                        }
+                        4 if data.is_empty() => {
+                            options.sack_permitted = true;
+                        }
+                        8 if data.len() == 8 => {
+                            options.timestamp = Some(TcpTimestampOption {
+                                value: u32::from_be_bytes(data[..4].try_into().ok()?),
+                                echo_reply: u32::from_be_bytes(data[4..].try_into().ok()?),
+                            });
+                        }
+                        _ => {}
+                    }
+                    offset += len;
+                }
+            }
+        }
+        Some(options)
+    }
+
+    pub const fn raw(self) -> &'a [u8] {
+        self.raw
+    }
+
+    pub const fn maximum_segment_size(self) -> Option<u16> {
+        self.maximum_segment_size
+    }
+
+    pub const fn window_scale(self) -> Option<u8> {
+        self.window_scale
+    }
+
+    pub const fn sack_permitted(self) -> bool {
+        self.sack_permitted
+    }
+
+    pub const fn timestamp(self) -> Option<TcpTimestampOption> {
+        self.timestamp
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TcpHeaderOptions {
+    maximum_segment_size: Option<u16>,
+    sack_permitted: bool,
+    timestamp: Option<TcpTimestampOption>,
+}
+
+impl TcpHeaderOptions {
+    pub const fn empty() -> Self {
+        Self {
+            maximum_segment_size: None,
+            sack_permitted: false,
+            timestamp: None,
+        }
+    }
+
+    pub const fn with_maximum_segment_size(mut self, value: u16) -> Self {
+        assert!(value != 0, "TCP MSS option must be non-zero");
+        self.maximum_segment_size = Some(value);
+        self
+    }
+
+    pub const fn with_sack_permitted(mut self) -> Self {
+        self.sack_permitted = true;
+        self
+    }
+
+    pub const fn with_timestamp(mut self, value: TcpTimestampOption) -> Self {
+        self.timestamp = Some(value);
+        self
+    }
+
+    pub fn encoded_len(self) -> usize {
+        let maximum_segment_size_len = match self.maximum_segment_size {
+            Some(_) => 4,
+            None => 0,
+        };
+        let sack_permitted_len = if self.sack_permitted { 2 } else { 0 };
+        let timestamp_len = match self.timestamp {
+            Some(_) => 10,
+            None => 0,
+        };
+        align_tcp_options_len(maximum_segment_size_len + sack_permitted_len + timestamp_len)
+    }
+
+    fn encode(self, output: &mut [u8]) -> Option<()> {
+        if output.len() != self.encoded_len() {
+            return None;
+        }
+        output.fill(0);
+        let mut offset = 0;
+        if let Some(mss) = self.maximum_segment_size {
+            output[offset] = 2;
+            output[offset + 1] = 4;
+            output[offset + 2..offset + 4].copy_from_slice(&mss.to_be_bytes());
+            offset += 4;
+        }
+        if self.sack_permitted {
+            output[offset] = 4;
+            output[offset + 1] = 2;
+            offset += 2;
+        }
+        if let Some(timestamp) = self.timestamp {
+            output[offset] = 8;
+            output[offset + 1] = 10;
+            output[offset + 2..offset + 6].copy_from_slice(&timestamp.value.to_be_bytes());
+            output[offset + 6..offset + 10].copy_from_slice(&timestamp.echo_reply.to_be_bytes());
+        }
+        Some(())
+    }
+}
+
+const fn align_tcp_options_len(len: usize) -> usize {
+    (len + 3) & !3
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -596,4 +785,70 @@ fn write_u32(bytes: &mut [u8], offset: usize, value: u32) -> Option<()> {
         .get_mut(offset..end)?
         .copy_from_slice(&value.to_be_bytes());
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tcp_options_parse_mss_sack_window_scale_and_timestamp() {
+        let raw = [
+            2, 4, 0x05, 0xb4, 4, 2, 3, 3, 7, 1, 8, 10, 0, 0, 0, 9, 0, 0, 0, 3, 0, 0, 0, 0,
+        ];
+
+        let options = TcpOptions::parse(&raw).expect("TCP options should parse");
+
+        assert_eq!(options.maximum_segment_size(), Some(1460));
+        assert_eq!(options.window_scale(), Some(7));
+        assert!(options.sack_permitted());
+        assert_eq!(
+            options.timestamp(),
+            Some(TcpTimestampOption {
+                value: 9,
+                echo_reply: 3,
+            })
+        );
+        assert_eq!(options.raw(), raw);
+    }
+
+    #[test]
+    fn tcp_encode_with_options_roundtrips_header_options_and_payload() {
+        let source = IpAddress::Ipv4(Ipv4Address::new([192, 0, 2, 1]));
+        let destination = IpAddress::Ipv4(Ipv4Address::new([192, 0, 2, 2]));
+        let header = TcpHeader {
+            source_port: 49152,
+            destination_port: 80,
+            sequence: 7,
+            acknowledgement: 0,
+            flags: TcpFlags::SYN,
+            window_size: u16::MAX,
+        };
+        let options = TcpHeaderOptions::empty()
+            .with_maximum_segment_size(1460)
+            .with_sack_permitted()
+            .with_timestamp(TcpTimestampOption {
+                value: 11,
+                echo_reply: 5,
+            });
+        let mut bytes = [0u8; 64];
+
+        let len =
+            TcpPacket::encode_with_options(&mut bytes, source, destination, header, options, b"x")
+                .expect("TCP segment should fit");
+        let packet = TcpPacket::parse(&bytes[..len]).expect("encoded TCP packet should parse");
+
+        assert_eq!(packet.source_port, 49152);
+        assert_eq!(packet.destination_port, 80);
+        assert_eq!(packet.payload, b"x");
+        assert_eq!(packet.options.maximum_segment_size(), Some(1460));
+        assert!(packet.options.sack_permitted());
+        assert_eq!(
+            packet.options.timestamp(),
+            Some(TcpTimestampOption {
+                value: 11,
+                echo_reply: 5,
+            })
+        );
+    }
 }
