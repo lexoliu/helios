@@ -1,6 +1,8 @@
 extern crate alloc;
 
+use alloc::collections::BinaryHeap;
 use alloc::vec::Vec;
+use core::cmp::Reverse;
 
 use helios_hal::resource::{KernelResource, ResourceRights};
 use thiserror::Error;
@@ -71,6 +73,7 @@ where
     Rights: ResourceRights,
 {
     entries: Vec<Option<DescriptorEntry<T, Rights>>>,
+    free: BinaryHeap<Reverse<usize>>,
 }
 
 impl<T, Rights> Default for DescriptorTable<T, Rights>
@@ -89,6 +92,7 @@ where
     pub const fn new() -> Self {
         Self {
             entries: Vec::new(),
+            free: BinaryHeap::new(),
         }
     }
 
@@ -133,6 +137,7 @@ where
             .and_then(Option::take)
             .map(DescriptorEntry::into_resource)
             .ok_or(DescriptorTableError::BadDescriptor(descriptor.raw()))?;
+        self.free.push(Reverse(descriptor_index(descriptor)?));
         Ok(resource)
     }
 
@@ -169,23 +174,29 @@ where
             .ok_or(DescriptorTableError::BadDescriptor(source.raw()))?;
 
         if self.entries.len() <= target_index {
+            let old_len = self.entries.len();
             self.entries.resize_with(target_index + 1, || None);
+            self.free.extend((old_len..target_index).map(Reverse));
         }
         self.entries[target_index] = Some(entry);
+        self.free.push(Reverse(source_index));
         Ok(())
     }
 
     pub fn close_on_exec(&mut self) {
-        for slot in &mut self.entries {
+        for (index, slot) in self.entries.iter_mut().enumerate() {
             if slot.as_ref().is_some_and(DescriptorEntry::close_on_exec) {
                 *slot = None;
+                self.free.push(Reverse(index));
             }
         }
     }
 
     fn allocate_slot_index(&mut self) -> usize {
-        if let Some(index) = self.entries.iter().position(Option::is_none) {
-            return index;
+        while let Some(Reverse(index)) = self.free.pop() {
+            if self.entries.get(index).is_some_and(Option::is_none) {
+                return index;
+            }
         }
         let index = self.entries.len();
         self.entries.push(None);
@@ -303,6 +314,25 @@ mod tests {
             .renumber(source, target)
             .expect("renumber to sparse target must succeed");
 
+        assert!(table.get(target).unwrap().resource().rights() == FileRights::READ);
+    }
+
+    #[test]
+    fn renumber_to_sparse_target_reuses_lowest_intermediate_slot() {
+        let mut table = DescriptorTable::new();
+        let source = table
+            .insert(file(FileRights::READ), false)
+            .expect("source insert must succeed");
+        let target = DescriptorId::new(9);
+
+        table
+            .renumber(source, target)
+            .expect("renumber to sparse target must succeed");
+        let reused = table
+            .insert(file(FileRights::WRITE), false)
+            .expect("insert should reuse a sparse free slot");
+
+        assert_eq!(reused.raw(), source.raw());
         assert!(table.get(target).unwrap().resource().rights() == FileRights::READ);
     }
 }
