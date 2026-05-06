@@ -55,3 +55,75 @@ pub fn build_component_engine_config(target: &str) -> Config {
     config.async_stack_size(COMPONENT_ASYNC_STACK_SIZE);
     config
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_encoder::{
+        CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction, Module,
+        TypeSection, ValType,
+    };
+
+    #[test]
+    fn component_engine_config_keeps_simd_and_relaxed_simd_enabled() {
+        let config = build_component_engine_config(env!("HELIOS_BUILD_TARGET"));
+        wasmtime::Engine::new(&config).expect("component engine config should build");
+
+        let operators = relaxed_simd_module_operator_set();
+        assert!(operators.simd, "SIMD operator must be present in probe wasm");
+        assert!(
+            operators.relaxed_simd,
+            "relaxed SIMD operator must be present in probe wasm"
+        );
+    }
+
+    fn relaxed_simd_module() -> alloc::vec::Vec<u8> {
+        let mut module = Module::new();
+
+        let mut types = TypeSection::new();
+        types.ty().function([], [ValType::I32]);
+        module.section(&types);
+
+        let mut functions = FunctionSection::new();
+        functions.function(0);
+        module.section(&functions);
+
+        let mut exports = ExportSection::new();
+        exports.export("relaxed-simd", ExportKind::Func, 0);
+        module.section(&exports);
+
+        let mut body = Function::new(core::iter::empty::<(u32, ValType)>());
+        body.instruction(&Instruction::V128Const(0));
+        body.instruction(&Instruction::V128Const(0));
+        body.instruction(&Instruction::I8x16RelaxedSwizzle);
+        body.instruction(&Instruction::I32x4ExtractLane(0));
+        body.instruction(&Instruction::End);
+
+        let mut code = CodeSection::new();
+        code.function(&body);
+        module.section(&code);
+
+        module.finish()
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct SimdOperatorSet {
+        simd: bool,
+        relaxed_simd: bool,
+    }
+
+    fn relaxed_simd_module_operator_set() -> SimdOperatorSet {
+        let wasm = relaxed_simd_module();
+        SimdOperatorSet {
+            simd: contains_subslice(&wasm, &[0xfd, 0x0c])
+                && contains_subslice(&wasm, &[0xfd, 0x1b, 0x00]),
+            relaxed_simd: contains_subslice(&wasm, &[0xfd, 0x80, 0x02]),
+        }
+    }
+
+    fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+}
