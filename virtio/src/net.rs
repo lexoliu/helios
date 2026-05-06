@@ -221,7 +221,12 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
 
     pub fn handle_interrupt(&self) {
         self.transport.ack_interrupt();
-        self.interrupts.notify_one();
+        // AArch64/HVF TCP reports consistently point at network TX/RX pump
+        // work, not at WIT syscall entry, as the IO-bound gap. Treat virtio
+        // interrupts as readiness edges and let the pump drain batches after
+        // waking; counting every interrupt just turns interrupt storms into
+        // stale permits that keep the cooperative executor spinning.
+        self.interrupts.notify_readiness();
     }
 
     pub fn mac_address(&self) -> [u8; 6] {

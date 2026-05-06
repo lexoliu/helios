@@ -35,6 +35,16 @@ impl Notify {
         self.event.notify(1);
     }
 
+    pub fn notify_readiness(&self) {
+        if self
+            .permits
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.event.notify(1);
+        }
+    }
+
     fn add_permits(&self, permits: usize) {
         let mut current = self.permits.load(Ordering::Acquire);
         loop {
@@ -106,5 +116,37 @@ impl Future for Notified<'_> {
                 Poll::Pending => return Poll::Pending,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures_lite::future::block_on;
+
+    use super::Notify;
+
+    #[test]
+    fn readiness_notification_coalesces_pending_permits() {
+        let notify = Notify::new();
+
+        notify.notify_readiness();
+        notify.notify_readiness();
+
+        block_on(notify.notified());
+        assert!(
+            !notify.try_claim_permit(),
+            "readiness notification should not count duplicate interrupt edges"
+        );
+    }
+
+    #[test]
+    fn readiness_notification_rearms_after_waiter_consumes_permit() {
+        let notify = Notify::new();
+
+        notify.notify_readiness();
+        block_on(notify.notified());
+        notify.notify_readiness();
+
+        block_on(notify.notified());
     }
 }
