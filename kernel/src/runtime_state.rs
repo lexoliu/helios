@@ -7,10 +7,10 @@ use triomphe::Arc;
 
 use crate::{
     DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,
-    EmbeddedBootFs, FoldedProfileSample, FutexKey, FutexTable, FutexWaitRegistration, HeapStats,
-    InstanceRegistry, Notify, PerfMetricFilter, PerfMetricHistory, PerfMetricSample, ProfileFilter,
-    ProfileHistory, ProfileScope, StatsSample, TraceEvent, TraceFilter, TraceHistory,
-    embedded_init,
+    EmbeddedBootFs, FoldedProfileSample, FutexKey, FutexTable, FutexWaitRegistration,
+    HEAP_SIZE_CLASS_COUNT, HeapStats, InstanceRegistry, Notify, PerfMetricFilter,
+    PerfMetricHistory, PerfMetricSample, ProfileFilter, ProfileHistory, ProfileScope, StatsSample,
+    TraceEvent, TraceFilter, TraceHistory, embedded_init,
 };
 use helios_hal::cpu::HardwarePerfCounterDelta;
 use spin::Mutex;
@@ -48,6 +48,12 @@ struct HeapPerfSnapshot {
     total_allocation_bytes: AtomicU64,
     total_deallocation_bytes: AtomicU64,
     total_reallocation_bytes: AtomicU64,
+    size_class_allocation_count: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
+    size_class_deallocation_count: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
+    size_class_reallocation_count: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
+    size_class_allocation_bytes: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
+    size_class_deallocation_bytes: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
+    size_class_reallocation_bytes: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
 }
 
 impl HeapPerfSnapshot {
@@ -59,6 +65,12 @@ impl HeapPerfSnapshot {
             total_allocation_bytes: AtomicU64::new(0),
             total_deallocation_bytes: AtomicU64::new(0),
             total_reallocation_bytes: AtomicU64::new(0),
+            size_class_allocation_count: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
+            size_class_deallocation_count: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
+            size_class_reallocation_count: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
+            size_class_allocation_bytes: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
+            size_class_deallocation_bytes: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
+            size_class_reallocation_bytes: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
         }
     }
 
@@ -75,6 +87,30 @@ impl HeapPerfSnapshot {
             .store(stats.total_deallocation_bytes, Ordering::Release);
         self.total_reallocation_bytes
             .store(stats.total_reallocation_bytes, Ordering::Release);
+        reset_heap_size_class_snapshot(
+            &self.size_class_allocation_count,
+            stats.size_class_allocation_count,
+        );
+        reset_heap_size_class_snapshot(
+            &self.size_class_deallocation_count,
+            stats.size_class_deallocation_count,
+        );
+        reset_heap_size_class_snapshot(
+            &self.size_class_reallocation_count,
+            stats.size_class_reallocation_count,
+        );
+        reset_heap_size_class_snapshot(
+            &self.size_class_allocation_bytes,
+            stats.size_class_allocation_bytes,
+        );
+        reset_heap_size_class_snapshot(
+            &self.size_class_deallocation_bytes,
+            stats.size_class_deallocation_bytes,
+        );
+        reset_heap_size_class_snapshot(
+            &self.size_class_reallocation_bytes,
+            stats.size_class_reallocation_bytes,
+        );
     }
 
     fn allocation_count_delta(&self, stats: HeapStats) -> u64 {
@@ -106,11 +142,81 @@ impl HeapPerfSnapshot {
             stats.total_reallocation_bytes,
         )
     }
+
+    fn allocation_size_class_count_delta(&self, stats: HeapStats) -> [u64; HEAP_SIZE_CLASS_COUNT] {
+        heap_size_class_delta(
+            &self.size_class_allocation_count,
+            stats.size_class_allocation_count,
+        )
+    }
+
+    fn deallocation_size_class_count_delta(
+        &self,
+        stats: HeapStats,
+    ) -> [u64; HEAP_SIZE_CLASS_COUNT] {
+        heap_size_class_delta(
+            &self.size_class_deallocation_count,
+            stats.size_class_deallocation_count,
+        )
+    }
+
+    fn reallocation_size_class_count_delta(
+        &self,
+        stats: HeapStats,
+    ) -> [u64; HEAP_SIZE_CLASS_COUNT] {
+        heap_size_class_delta(
+            &self.size_class_reallocation_count,
+            stats.size_class_reallocation_count,
+        )
+    }
+
+    fn allocation_size_class_bytes_delta(&self, stats: HeapStats) -> [u64; HEAP_SIZE_CLASS_COUNT] {
+        heap_size_class_delta(
+            &self.size_class_allocation_bytes,
+            stats.size_class_allocation_bytes,
+        )
+    }
+
+    fn deallocation_size_class_bytes_delta(
+        &self,
+        stats: HeapStats,
+    ) -> [u64; HEAP_SIZE_CLASS_COUNT] {
+        heap_size_class_delta(
+            &self.size_class_deallocation_bytes,
+            stats.size_class_deallocation_bytes,
+        )
+    }
+
+    fn reallocation_size_class_bytes_delta(
+        &self,
+        stats: HeapStats,
+    ) -> [u64; HEAP_SIZE_CLASS_COUNT] {
+        heap_size_class_delta(
+            &self.size_class_reallocation_bytes,
+            stats.size_class_reallocation_bytes,
+        )
+    }
 }
 
 fn swap_delta(value: &AtomicU64, current: u64) -> u64 {
     let previous = value.swap(current, Ordering::AcqRel);
     current.saturating_sub(previous)
+}
+
+fn reset_heap_size_class_snapshot(
+    snapshot: &[AtomicU64; HEAP_SIZE_CLASS_COUNT],
+    current: [u64; HEAP_SIZE_CLASS_COUNT],
+) {
+    for (slot, value) in snapshot.iter().zip(current) {
+        slot.store(value, Ordering::Release);
+    }
+}
+
+fn heap_size_class_delta(
+    snapshot: &[AtomicU64; HEAP_SIZE_CLASS_COUNT],
+    current: [u64; HEAP_SIZE_CLASS_COUNT],
+) -> [u64; HEAP_SIZE_CLASS_COUNT] {
+    core::array::from_fn(|index| swap_delta(&snapshot[index], current[index]))
 }
 
 fn record_heap_delta_metric(
@@ -131,6 +237,71 @@ fn record_heap_delta_metric(
         HardwarePerfCounterDelta::default(),
         bytes,
     );
+}
+
+#[derive(Clone, Copy)]
+enum HeapMetricKind {
+    Alloc,
+    Dealloc,
+    Realloc,
+}
+
+fn record_heap_size_class_delta_metrics(
+    metrics: &Mutex<PerfMetricHistory>,
+    kind: HeapMetricKind,
+    events: [u64; HEAP_SIZE_CLASS_COUNT],
+    bytes: [u64; HEAP_SIZE_CLASS_COUNT],
+) {
+    for index in 0..HEAP_SIZE_CLASS_COUNT {
+        record_heap_delta_metric(
+            metrics,
+            heap_size_class_metric_name(kind, index),
+            events[index],
+            bytes[index],
+        );
+    }
+}
+
+fn heap_size_class_metric_name(kind: HeapMetricKind, index: usize) -> &'static str {
+    match (kind, index) {
+        (HeapMetricKind::Alloc, 0) => "alloc-size-0008",
+        (HeapMetricKind::Alloc, 1) => "alloc-size-0016",
+        (HeapMetricKind::Alloc, 2) => "alloc-size-0032",
+        (HeapMetricKind::Alloc, 3) => "alloc-size-0064",
+        (HeapMetricKind::Alloc, 4) => "alloc-size-0128",
+        (HeapMetricKind::Alloc, 5) => "alloc-size-0256",
+        (HeapMetricKind::Alloc, 6) => "alloc-size-0512",
+        (HeapMetricKind::Alloc, 7) => "alloc-size-1024",
+        (HeapMetricKind::Alloc, 8) => "alloc-size-4096",
+        (HeapMetricKind::Alloc, 9) => "alloc-size-16k",
+        (HeapMetricKind::Alloc, 10) => "alloc-size-64k",
+        (HeapMetricKind::Alloc, 11) => "alloc-size-large",
+        (HeapMetricKind::Dealloc, 0) => "dealloc-size-0008",
+        (HeapMetricKind::Dealloc, 1) => "dealloc-size-0016",
+        (HeapMetricKind::Dealloc, 2) => "dealloc-size-0032",
+        (HeapMetricKind::Dealloc, 3) => "dealloc-size-0064",
+        (HeapMetricKind::Dealloc, 4) => "dealloc-size-0128",
+        (HeapMetricKind::Dealloc, 5) => "dealloc-size-0256",
+        (HeapMetricKind::Dealloc, 6) => "dealloc-size-0512",
+        (HeapMetricKind::Dealloc, 7) => "dealloc-size-1024",
+        (HeapMetricKind::Dealloc, 8) => "dealloc-size-4096",
+        (HeapMetricKind::Dealloc, 9) => "dealloc-size-16k",
+        (HeapMetricKind::Dealloc, 10) => "dealloc-size-64k",
+        (HeapMetricKind::Dealloc, 11) => "dealloc-size-large",
+        (HeapMetricKind::Realloc, 0) => "realloc-size-0008",
+        (HeapMetricKind::Realloc, 1) => "realloc-size-0016",
+        (HeapMetricKind::Realloc, 2) => "realloc-size-0032",
+        (HeapMetricKind::Realloc, 3) => "realloc-size-0064",
+        (HeapMetricKind::Realloc, 4) => "realloc-size-0128",
+        (HeapMetricKind::Realloc, 5) => "realloc-size-0256",
+        (HeapMetricKind::Realloc, 6) => "realloc-size-0512",
+        (HeapMetricKind::Realloc, 7) => "realloc-size-1024",
+        (HeapMetricKind::Realloc, 8) => "realloc-size-4096",
+        (HeapMetricKind::Realloc, 9) => "realloc-size-16k",
+        (HeapMetricKind::Realloc, 10) => "realloc-size-64k",
+        (HeapMetricKind::Realloc, 11) => "realloc-size-large",
+        _ => panic!("unknown kernel heap size class metric"),
+    }
 }
 
 impl<ProgramService, NetworkService, HostFsService>
@@ -189,6 +360,7 @@ where
     }
 
     pub fn set_profiling_enabled(&self, enabled: bool) {
+        crate::set_kernel_heap_size_class_metrics_enabled(enabled);
         if enabled {
             self.inner.heap_perf_snapshot.reset(crate::heap_stats());
         }
@@ -204,6 +376,9 @@ where
     pub fn clear_profile(&self) {
         self.inner.profiling.lock().clear();
         self.inner.perf_metrics.lock().clear();
+        crate::set_kernel_heap_size_class_metrics_enabled(
+            self.inner.profiling_enabled.load(Ordering::Acquire),
+        );
         self.inner.heap_perf_snapshot.reset(crate::heap_stats());
     }
 
@@ -380,6 +555,16 @@ where
             allocations,
             allocation_bytes,
         );
+        record_heap_size_class_delta_metrics(
+            &self.inner.perf_metrics,
+            HeapMetricKind::Alloc,
+            self.inner
+                .heap_perf_snapshot
+                .allocation_size_class_count_delta(stats),
+            self.inner
+                .heap_perf_snapshot
+                .allocation_size_class_bytes_delta(stats),
+        );
 
         let deallocations = self
             .inner
@@ -395,6 +580,16 @@ where
             deallocations,
             deallocation_bytes,
         );
+        record_heap_size_class_delta_metrics(
+            &self.inner.perf_metrics,
+            HeapMetricKind::Dealloc,
+            self.inner
+                .heap_perf_snapshot
+                .deallocation_size_class_count_delta(stats),
+            self.inner
+                .heap_perf_snapshot
+                .deallocation_size_class_bytes_delta(stats),
+        );
 
         let reallocations = self
             .inner
@@ -409,6 +604,16 @@ where
             "realloc",
             reallocations,
             reallocation_bytes,
+        );
+        record_heap_size_class_delta_metrics(
+            &self.inner.perf_metrics,
+            HeapMetricKind::Realloc,
+            self.inner
+                .heap_perf_snapshot
+                .reallocation_size_class_count_delta(stats),
+            self.inner
+                .heap_perf_snapshot
+                .reallocation_size_class_bytes_delta(stats),
         );
     }
 
@@ -643,6 +848,12 @@ mod tests {
         current.total_deallocation_bytes += 64;
         current.reallocation_count += 1;
         current.total_reallocation_bytes += 128;
+        current.size_class_allocation_count[3] += 2;
+        current.size_class_allocation_bytes[3] += 96;
+        current.size_class_deallocation_count[2] += 1;
+        current.size_class_deallocation_bytes[2] += 32;
+        current.size_class_reallocation_count[4] += 1;
+        current.size_class_reallocation_bytes[4] += 128;
         state.inner.heap_perf_snapshot.reset(baseline);
         state.record_kernel_heap_metrics(current);
 
@@ -673,5 +884,26 @@ mod tests {
             .expect("realloc metric should be recorded");
         assert_eq!(realloc.total_events, 1);
         assert_eq!(realloc.total_bytes, 128);
+
+        let alloc_size = samples
+            .iter()
+            .find(|sample| sample.name == "kernel;heap;alloc-size-0064")
+            .expect("alloc size class metric should be recorded");
+        assert_eq!(alloc_size.total_events, 2);
+        assert_eq!(alloc_size.total_bytes, 96);
+
+        let dealloc_size = samples
+            .iter()
+            .find(|sample| sample.name == "kernel;heap;dealloc-size-0032")
+            .expect("dealloc size class metric should be recorded");
+        assert_eq!(dealloc_size.total_events, 1);
+        assert_eq!(dealloc_size.total_bytes, 32);
+
+        let realloc_size = samples
+            .iter()
+            .find(|sample| sample.name == "kernel;heap;realloc-size-0128")
+            .expect("realloc size class metric should be recorded");
+        assert_eq!(realloc_size.total_events, 1);
+        assert_eq!(realloc_size.total_bytes, 128);
     }
 }

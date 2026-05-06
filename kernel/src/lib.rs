@@ -220,6 +220,7 @@ use helios_hal::watchdog::{NoWatchdog, ProgressCounter, Watchdog};
 use helios_hal::{DeviceInventory, DmaModel, ProcessorStartupPolicy, ProcessorTopology};
 
 const HEAP_ORDER: usize = 32;
+pub const HEAP_SIZE_CLASS_COUNT: usize = 12;
 const BOOT_UNINITIALIZED: u8 = 0;
 const BOOT_INITIALIZING: u8 = 1;
 const BOOT_READY: u8 = 2;
@@ -242,6 +243,12 @@ pub struct HeapStats {
     pub total_allocation_bytes: u64,
     pub total_deallocation_bytes: u64,
     pub total_reallocation_bytes: u64,
+    pub size_class_allocation_count: [u64; HEAP_SIZE_CLASS_COUNT],
+    pub size_class_deallocation_count: [u64; HEAP_SIZE_CLASS_COUNT],
+    pub size_class_reallocation_count: [u64; HEAP_SIZE_CLASS_COUNT],
+    pub size_class_allocation_bytes: [u64; HEAP_SIZE_CLASS_COUNT],
+    pub size_class_deallocation_bytes: [u64; HEAP_SIZE_CLASS_COUNT],
+    pub size_class_reallocation_bytes: [u64; HEAP_SIZE_CLASS_COUNT],
 }
 
 impl HeapStats {
@@ -281,7 +288,29 @@ impl<const ORDER: usize> KernelAllocator<ORDER> {
             total_allocation_bytes: self.stats.total_allocation_bytes.load(Ordering::Relaxed),
             total_deallocation_bytes: self.stats.total_deallocation_bytes.load(Ordering::Relaxed),
             total_reallocation_bytes: self.stats.total_reallocation_bytes.load(Ordering::Relaxed),
+            size_class_allocation_count: self
+                .stats
+                .size_class_counts(&self.stats.size_class_allocation_count),
+            size_class_deallocation_count: self
+                .stats
+                .size_class_counts(&self.stats.size_class_deallocation_count),
+            size_class_reallocation_count: self
+                .stats
+                .size_class_counts(&self.stats.size_class_reallocation_count),
+            size_class_allocation_bytes: self
+                .stats
+                .size_class_counts(&self.stats.size_class_allocation_bytes),
+            size_class_deallocation_bytes: self
+                .stats
+                .size_class_counts(&self.stats.size_class_deallocation_bytes),
+            size_class_reallocation_bytes: self
+                .stats
+                .size_class_counts(&self.stats.size_class_reallocation_bytes),
         }
+    }
+
+    fn set_size_class_metrics_enabled(&self, enabled: bool) {
+        self.stats.set_size_class_metrics_enabled(enabled);
     }
 }
 
@@ -333,6 +362,13 @@ struct KernelAllocationStats {
     total_allocation_bytes: AtomicU64,
     total_deallocation_bytes: AtomicU64,
     total_reallocation_bytes: AtomicU64,
+    size_class_metrics_enabled: AtomicBool,
+    size_class_allocation_count: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
+    size_class_deallocation_count: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
+    size_class_reallocation_count: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
+    size_class_allocation_bytes: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
+    size_class_deallocation_bytes: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
+    size_class_reallocation_bytes: [AtomicU64; HEAP_SIZE_CLASS_COUNT],
 }
 
 impl KernelAllocationStats {
@@ -345,28 +381,51 @@ impl KernelAllocationStats {
             total_allocation_bytes: AtomicU64::new(0),
             total_deallocation_bytes: AtomicU64::new(0),
             total_reallocation_bytes: AtomicU64::new(0),
+            size_class_metrics_enabled: AtomicBool::new(false),
+            size_class_allocation_count: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
+            size_class_deallocation_count: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
+            size_class_reallocation_count: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
+            size_class_allocation_bytes: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
+            size_class_deallocation_bytes: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
+            size_class_reallocation_bytes: [const { AtomicU64::new(0) }; HEAP_SIZE_CLASS_COUNT],
         }
     }
 
+    fn size_class_counts(
+        &self,
+        values: &[AtomicU64; HEAP_SIZE_CLASS_COUNT],
+    ) -> [u64; HEAP_SIZE_CLASS_COUNT] {
+        core::array::from_fn(|index| values[index].load(Ordering::Relaxed))
+    }
+
     fn record_alloc(&self, size: usize) {
+        let size_u64 = usize_to_u64(size, "kernel allocation size");
         self.allocation_count.fetch_add(1, Ordering::Relaxed);
         self.requested_live_bytes.fetch_add(size, Ordering::Relaxed);
-        self.total_allocation_bytes.fetch_add(
-            usize_to_u64(size, "kernel allocation size"),
-            Ordering::Relaxed,
-        );
+        self.total_allocation_bytes
+            .fetch_add(size_u64, Ordering::Relaxed);
+        if self.size_class_metrics_enabled.load(Ordering::Relaxed) {
+            let class = heap_size_class(size);
+            self.size_class_allocation_count[class].fetch_add(1, Ordering::Relaxed);
+            self.size_class_allocation_bytes[class].fetch_add(size_u64, Ordering::Relaxed);
+        }
     }
 
     fn record_dealloc(&self, size: usize) {
+        let size_u64 = usize_to_u64(size, "kernel deallocation size");
         self.deallocation_count.fetch_add(1, Ordering::Relaxed);
         self.requested_live_bytes.fetch_sub(size, Ordering::Relaxed);
-        self.total_deallocation_bytes.fetch_add(
-            usize_to_u64(size, "kernel deallocation size"),
-            Ordering::Relaxed,
-        );
+        self.total_deallocation_bytes
+            .fetch_add(size_u64, Ordering::Relaxed);
+        if self.size_class_metrics_enabled.load(Ordering::Relaxed) {
+            let class = heap_size_class(size);
+            self.size_class_deallocation_count[class].fetch_add(1, Ordering::Relaxed);
+            self.size_class_deallocation_bytes[class].fetch_add(size_u64, Ordering::Relaxed);
+        }
     }
 
     fn record_realloc(&self, old_size: usize, new_size: usize) {
+        let new_size_u64 = usize_to_u64(new_size, "kernel reallocation size");
         self.reallocation_count.fetch_add(1, Ordering::Relaxed);
         if new_size >= old_size {
             self.requested_live_bytes
@@ -375,10 +434,35 @@ impl KernelAllocationStats {
             self.requested_live_bytes
                 .fetch_sub(old_size - new_size, Ordering::Relaxed);
         }
-        self.total_reallocation_bytes.fetch_add(
-            usize_to_u64(new_size, "kernel reallocation size"),
-            Ordering::Relaxed,
-        );
+        self.total_reallocation_bytes
+            .fetch_add(new_size_u64, Ordering::Relaxed);
+        if self.size_class_metrics_enabled.load(Ordering::Relaxed) {
+            let class = heap_size_class(new_size);
+            self.size_class_reallocation_count[class].fetch_add(1, Ordering::Relaxed);
+            self.size_class_reallocation_bytes[class].fetch_add(new_size_u64, Ordering::Relaxed);
+        }
+    }
+
+    fn set_size_class_metrics_enabled(&self, enabled: bool) {
+        self.size_class_metrics_enabled
+            .store(enabled, Ordering::Release);
+    }
+}
+
+fn heap_size_class(size: usize) -> usize {
+    match size {
+        0..=8 => 0,
+        9..=16 => 1,
+        17..=32 => 2,
+        33..=64 => 3,
+        65..=128 => 4,
+        129..=256 => 5,
+        257..=512 => 6,
+        513..=1024 => 7,
+        1025..=4096 => 8,
+        4097..=16_384 => 9,
+        16_385..=65_536 => 10,
+        _ => 11,
     }
 }
 
@@ -909,6 +993,10 @@ pub fn panic_log_message(
 
 pub fn heap_stats() -> HeapStats {
     ALLOCATOR.stats()
+}
+
+pub fn set_kernel_heap_size_class_metrics_enabled(enabled: bool) {
+    ALLOCATOR.set_size_class_metrics_enabled(enabled);
 }
 
 fn usize_to_u64(value: usize, label: &'static str) -> u64 {
