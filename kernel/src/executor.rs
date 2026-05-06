@@ -67,6 +67,26 @@ pub struct Executor {
     progress_notify: NoWeakArc<Notify>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExecutorRunStats {
+    local_runnable_count: usize,
+    global_runnable_count: usize,
+}
+
+impl ExecutorRunStats {
+    pub const fn runnable_count(self) -> usize {
+        self.local_runnable_count + self.global_runnable_count
+    }
+
+    pub const fn local_runnable_count(self) -> usize {
+        self.local_runnable_count
+    }
+
+    pub const fn global_runnable_count(self) -> usize {
+        self.global_runnable_count
+    }
+}
+
 impl Executor {
     pub fn new(
         progress: ProgressCounter,
@@ -108,28 +128,37 @@ impl Executor {
         }
     }
 
-    pub fn run_until_stalled(&self) -> usize {
-        let mut runnable_count = 0;
+    pub fn run_until_stalled_with_stats(&self) -> ExecutorRunStats {
+        let mut stats = ExecutorRunStats::default();
 
-        while runnable_count < READY_BATCH_TASKS {
+        while stats.runnable_count() < READY_BATCH_TASKS {
             let local_queue = &self.group.local_queues[self.local_queue_index];
             let local_ready_count = &self.group.local_ready_counts[self.local_queue_index];
-            let runnable = match pop_ready(local_queue, local_ready_count) {
-                Ok(runnable) => runnable,
+            let (runnable, source) = match pop_ready(local_queue, local_ready_count) {
+                Ok(runnable) => (runnable, ReadySource::Local),
                 Err(PopError::Empty | PopError::Closed) => {
                     match pop_ready(&self.group.global_queue, &self.group.global_ready_count) {
-                        Ok(runnable) => runnable,
-                        Err(PopError::Empty | PopError::Closed) => return runnable_count,
+                        Ok(runnable) => (runnable, ReadySource::Global),
+                        Err(PopError::Empty | PopError::Closed) => return stats,
                     }
                 }
             };
 
             runnable.run();
-            runnable_count += 1;
+            match source {
+                ReadySource::Local => stats.local_runnable_count += 1,
+                ReadySource::Global => stats.global_runnable_count += 1,
+            }
         }
 
-        runnable_count
+        stats
     }
+}
+
+#[derive(Clone, Copy)]
+enum ReadySource {
+    Local,
+    Global,
 }
 
 impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {

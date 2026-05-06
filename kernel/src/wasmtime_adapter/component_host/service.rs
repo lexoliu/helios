@@ -1266,18 +1266,92 @@ where
     let processor = cpu.current_processor().id();
     let stack = kernel_processor_profile_stack(processor);
     loop {
-        let started = cpu.now().ticks();
-        let progress = kernel.run_until_stalled();
-        let elapsed = cpu.now().ticks().saturating_sub(started);
-        if progress != 0 && debug_state.profiling_enabled() {
-            debug_state.record_profile_stack_str(ProfileScope::Kernel, &stack, elapsed);
-        }
+        let progress = if debug_state.profiling_enabled() {
+            let started = cpu.now().ticks();
+            let counters = cpu.hardware_perf_counters();
+            let stats = kernel.run_until_stalled_with_stats();
+            let progress = stats.progress_count();
+            if progress != 0 {
+                record_executor_metrics(&cpu, &debug_state, &stack, started, counters, stats);
+            }
+            progress
+        } else {
+            kernel.run_until_stalled_with_stats().progress_count()
+        };
+
         if progress != 0 {
             continue;
         }
 
         cpu.park_current();
     }
+}
+
+fn record_executor_metrics<CpuImpl, HostFs>(
+    cpu: &CpuImpl,
+    debug_state: &HostRuntimeState<CpuImpl, HostFs>,
+    stack: &str,
+    started: u64,
+    counters: helios_hal::cpu::HardwarePerfCounters,
+    stats: crate::KernelRunStats,
+) where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let progress = stats.progress_count();
+    let ended = cpu.now().ticks();
+    let elapsed = ended.saturating_sub(started);
+    debug_state.record_profile_stack_str(ProfileScope::Kernel, stack, elapsed);
+    let elapsed_nanos = debug_state
+        .uptime_nanos(ended)
+        .saturating_sub(debug_state.uptime_nanos(started));
+    let counter_delta = cpu.hardware_perf_counters().delta_since(counters);
+    debug_state.record_perf_metric_parts_events_nanos(
+        ProfileScope::Kernel,
+        "kernel;executor;",
+        "run",
+        usize_to_u64(progress, "executor progress count"),
+        elapsed_nanos,
+        counter_delta,
+        0,
+    );
+    record_executor_event_metric(
+        debug_state,
+        "local-runnable",
+        stats.executor_local_runnable_count,
+    );
+    record_executor_event_metric(
+        debug_state,
+        "global-runnable",
+        stats.executor_global_runnable_count,
+    );
+    record_executor_event_metric(debug_state, "timer-fired", stats.timer_fired_count);
+}
+
+fn record_executor_event_metric<CpuImpl, HostFs>(
+    runtime_state: &HostRuntimeState<CpuImpl, HostFs>,
+    name: &'static str,
+    events: usize,
+) where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    if events == 0 {
+        return;
+    }
+    runtime_state.record_perf_metric_parts_events_nanos(
+        ProfileScope::Kernel,
+        "kernel;executor;",
+        name,
+        usize_to_u64(events, "executor event count"),
+        0,
+        helios_hal::cpu::HardwarePerfCounterDelta::default(),
+        0,
+    );
+}
+
+fn usize_to_u64(value: usize, label: &'static str) -> u64 {
+    u64::try_from(value).unwrap_or_else(|_| panic!("{label} does not fit into u64"))
 }
 
 fn record_program_kernel_profile<CpuImpl, HostFs>(

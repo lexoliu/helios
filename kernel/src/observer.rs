@@ -82,6 +82,7 @@ pub struct PerfMetricSample {
     pub scope: ProfileScope,
     pub name: String,
     pub count: u64,
+    pub total_events: u64,
     pub total_nanos: u64,
     pub min_nanos: u64,
     pub max_nanos: u64,
@@ -322,7 +323,7 @@ impl PerfMetricHistory {
         counters: HardwarePerfCounterDelta,
         bytes: u64,
     ) {
-        self.record_input(scope, name, elapsed_nanos, counters, bytes);
+        self.record_input(scope, name, 0, elapsed_nanos, counters, bytes);
     }
 
     pub fn record_parts(
@@ -334,9 +335,23 @@ impl PerfMetricHistory {
         counters: HardwarePerfCounterDelta,
         bytes: u64,
     ) {
+        self.record_parts_events(scope, prefix, suffix, 0, elapsed_nanos, counters, bytes);
+    }
+
+    pub fn record_parts_events(
+        &mut self,
+        scope: ProfileScope,
+        prefix: &str,
+        suffix: &str,
+        events: u64,
+        elapsed_nanos: u64,
+        counters: HardwarePerfCounterDelta,
+        bytes: u64,
+    ) {
         self.record_input(
             scope,
             ProfileStackParts { prefix, suffix },
+            events,
             elapsed_nanos,
             counters,
             bytes,
@@ -347,13 +362,15 @@ impl PerfMetricHistory {
         &mut self,
         scope: ProfileScope,
         name: Name,
+        events: u64,
         elapsed_nanos: u64,
         counters: HardwarePerfCounterDelta,
         bytes: u64,
     ) where
         Name: ProfileStackInput,
     {
-        if elapsed_nanos == 0
+        if events == 0
+            && elapsed_nanos == 0
             && bytes == 0
             && counters.reference_cycles == 0
             && counters.cpu_cycles == 0
@@ -368,6 +385,7 @@ impl PerfMetricHistory {
             .find(|sample| sample.scope == scope && name.matches(&sample.name))
         {
             sample.count = sample.count.saturating_add(1);
+            sample.total_events = sample.total_events.saturating_add(events);
             sample.total_nanos = sample.total_nanos.saturating_add(elapsed_nanos);
             sample.min_nanos = sample.min_nanos.min(elapsed_nanos);
             sample.max_nanos = sample.max_nanos.max(elapsed_nanos);
@@ -397,6 +415,7 @@ impl PerfMetricHistory {
             scope,
             name: name.into_string(),
             count: 1,
+            total_events: events,
             total_nanos: elapsed_nanos,
             min_nanos: elapsed_nanos,
             max_nanos: elapsed_nanos,
@@ -711,6 +730,7 @@ mod tests {
         assert_eq!(samples[0].scope, ProfileScope::Kernel);
         assert_eq!(samples[0].name, "kernel;network;tx-submit");
         assert_eq!(samples[0].count, 2);
+        assert_eq!(samples[0].total_events, 0);
         assert_eq!(samples[0].total_nanos, 35);
         assert_eq!(samples[0].min_nanos, 10);
         assert_eq!(samples[0].max_nanos, 25);
@@ -718,5 +738,41 @@ mod tests {
         assert_eq!(samples[0].total_reference_cycles, 100);
         assert_eq!(samples[0].total_cpu_cycles, 120);
         assert_eq!(samples[0].total_instructions_retired, 140);
+    }
+
+    #[test]
+    fn perf_metric_history_aggregates_events_without_latency() {
+        let mut history = PerfMetricHistory::new(4);
+        history.record_parts_events(
+            ProfileScope::Kernel,
+            "kernel;executor;",
+            "local-runnable",
+            7,
+            0,
+            HardwarePerfCounterDelta::default(),
+            0,
+        );
+        history.record_parts_events(
+            ProfileScope::Kernel,
+            "kernel;executor;",
+            "local-runnable",
+            11,
+            0,
+            HardwarePerfCounterDelta::default(),
+            0,
+        );
+
+        let samples = history.recent(
+            &PerfMetricFilter {
+                name_prefixes: vec!["kernel;executor;".to_owned()],
+            },
+            4,
+        );
+
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].name, "kernel;executor;local-runnable");
+        assert_eq!(samples[0].count, 2);
+        assert_eq!(samples[0].total_events, 18);
+        assert_eq!(samples[0].total_nanos, 0);
     }
 }

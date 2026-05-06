@@ -112,7 +112,7 @@ pub use embedded_init::{
 };
 pub use embedded_program::EmbeddedProgram;
 pub use entropy_pool::{EntropyError, EntropyPool};
-pub use executor::{JoinHandle, LocalJoinHandle, Spawner};
+pub use executor::{ExecutorRunStats, JoinHandle, LocalJoinHandle, Spawner};
 pub use futex_table::{
     FutexKey, FutexTable, FutexWaitRegistration, GuestAddress, ProcessMemoryIdentity,
 };
@@ -241,6 +241,23 @@ impl HeapStats {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KernelRunStats {
+    pub timer_fired_count: usize,
+    pub executor_local_runnable_count: usize,
+    pub executor_global_runnable_count: usize,
+}
+
+impl KernelRunStats {
+    pub const fn executor_runnable_count(self) -> usize {
+        self.executor_local_runnable_count + self.executor_global_runnable_count
+    }
+
+    pub const fn progress_count(self) -> usize {
+        self.timer_fired_count + self.executor_runnable_count()
+    }
+}
+
 const USER_MEMORY_KERNEL_RESERVE_FRACTION: usize = 4;
 const USER_MEMORY_MIN_KERNEL_RESERVE_BYTES: usize = 32 * 1024 * 1024;
 const USER_HEAP_REGION_FRACTION: usize = 2;
@@ -318,19 +335,29 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
     }
 
     pub fn run_until_stalled(&self) -> usize {
+        self.run_until_stalled_with_stats().progress_count()
+    }
+
+    pub fn run_until_stalled_with_stats(&self) -> KernelRunStats {
         let mut progress = 0;
+        let mut stats = KernelRunStats::default();
 
         loop {
             let fired = self.timer.fire_expired();
-            let ran = self.executor.run_until_stalled();
+            let executor_stats = self.executor.run_until_stalled_with_stats();
+            let ran = executor_stats.runnable_count();
+
+            stats.timer_fired_count += fired;
+            stats.executor_local_runnable_count += executor_stats.local_runnable_count();
+            stats.executor_global_runnable_count += executor_stats.global_runnable_count();
 
             if fired == 0 && ran == 0 {
-                return progress;
+                return stats;
             }
 
             progress += fired + ran;
             if ran == executor::READY_BATCH_TASKS || progress >= executor::READY_BATCH_TASKS {
-                return progress;
+                return stats;
             }
         }
     }

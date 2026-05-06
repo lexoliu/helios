@@ -3645,6 +3645,7 @@ fn convert_perf_metric_sample(
         scope: convert_profile_scope_from_local(sample.scope),
         name: sample.name,
         count: sample.count,
+        total_events: sample.total_events,
         total_nanos: sample.total_nanos,
         min_nanos: sample.min_nanos,
         max_nanos: sample.max_nanos,

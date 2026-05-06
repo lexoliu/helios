@@ -232,15 +232,16 @@ fn write_metrics(options: &Options) -> Result<(), PerfError> {
         OutputFormat::Text => {
             writeln!(
                 output,
-                "{:<6} {:>8} {:>14} {:>14} {:>14} {:>14} {:>14} name",
-                "scope", "count", "total_ns", "min_ns", "max_ns", "cycles", "bytes"
+                "{:<6} {:>8} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14} name",
+                "scope", "count", "events", "total_ns", "min_ns", "max_ns", "cycles", "bytes"
             )?;
             for sample in &samples {
                 writeln!(
                     output,
-                    "{:<6} {:>8} {:>14} {:>14} {:>14} {:>14} {:>14} {}",
+                    "{:<6} {:>8} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14} {}",
                     scope_name(sample.scope),
                     sample.count,
+                    sample.total_events,
                     sample.total_nanos,
                     sample.min_nanos,
                     sample.max_nanos,
@@ -258,10 +259,11 @@ fn write_metrics(options: &Options) -> Result<(), PerfError> {
                 }
                 write!(
                     output,
-                    "{{\"scope\":\"{}\",\"name\":\"{}\",\"count\":{},\"total_nanos\":{},\"min_nanos\":{},\"max_nanos\":{},\"total_bytes\":{},\"total_reference_cycles\":{},\"total_cpu_cycles\":{},\"total_instructions_retired\":{}}}",
+                    "{{\"scope\":\"{}\",\"name\":\"{}\",\"count\":{},\"total_events\":{},\"total_nanos\":{},\"min_nanos\":{},\"max_nanos\":{},\"total_bytes\":{},\"total_reference_cycles\":{},\"total_cpu_cycles\":{},\"total_instructions_retired\":{}}}",
                     scope_name(sample.scope),
                     JsonStr(&sample.name),
                     sample.count,
+                    sample.total_events,
                     sample.total_nanos,
                     sample.min_nanos,
                     sample.max_nanos,

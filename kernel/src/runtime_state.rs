@@ -228,6 +228,30 @@ where
         );
     }
 
+    pub fn record_perf_metric_parts_events_nanos(
+        &self,
+        scope: ProfileScope,
+        prefix: &str,
+        suffix: &str,
+        events: u64,
+        elapsed_nanos: u64,
+        counters: HardwarePerfCounterDelta,
+        bytes: u64,
+    ) {
+        if !self.inner.profiling_enabled.load(Ordering::Acquire) {
+            return;
+        }
+        self.inner.perf_metrics.lock().record_parts_events(
+            scope,
+            prefix,
+            suffix,
+            events,
+            elapsed_nanos,
+            counters,
+            bytes,
+        );
+    }
+
     pub fn record_perf_metric_str_nanos(
         &self,
         scope: ProfileScope,

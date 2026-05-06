@@ -27,6 +27,7 @@ interface profiling {
     scope: scope,
     name: string,
     count: u64,
+    total-events: u64,
     total-nanos: mono-nanos,
     min-nanos: mono-nanos,
     max-nanos: mono-nanos,
