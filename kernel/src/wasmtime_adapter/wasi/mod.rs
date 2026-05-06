@@ -1225,11 +1225,12 @@ impl<T: 'static> StreamConsumer<T> for TcpWriteConsumer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WasiUdpSocketFamily {
     Ipv4,
+    Ipv6,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WasiUdpSocketAddress {
-    address: crate::Ipv4Address,
+    address: crate::NetworkIpAddress,
     port: u16,
 }
 
@@ -1312,7 +1313,7 @@ impl<T> core::error::Error for TrappableError<T> {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WasiUdpSocketDatagram {
-    bytes: Vec<u8>,
+    bytes: Bytes,
     remote_address: WasiUdpSocketAddress,
 }
 
@@ -1343,7 +1344,14 @@ impl UdpSocket {
             return Err(WasiUdpSocketError::InvalidState);
         };
         Ok(WasiUdpSocketAddress {
-            address: crate::Ipv4Address::new([0, 0, 0, 0]),
+            address: match state.family {
+                WasiUdpSocketFamily::Ipv4 => {
+                    crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0]))
+                }
+                WasiUdpSocketFamily::Ipv6 => {
+                    crate::NetworkIpAddress::Ipv6(Ipv6Address::UNSPECIFIED)
+                }
+            },
             port: bound.local_port,
         })
     }
@@ -1493,10 +1501,14 @@ impl UdpSocket {
         };
         let bound = self.ensure_bound(0).await?;
         let service = self.inner.lock().service.clone();
-        let mut host_buffer = [0; 15];
-        let host = target.address.write_dotted_decimal(&mut host_buffer);
         let written = service
-            .udp_send(bound.socket, host, target.port, bytes, timeout_nanos)
+            .udp_send_address(
+                bound.socket,
+                target.address,
+                target.port,
+                bytes,
+                timeout_nanos,
+            )
             .await
             .map_err(WasiUdpSocketError::Backend)?;
         assert!(
@@ -1544,11 +1556,14 @@ impl UdpSocket {
                 address: datagram.address,
                 port: datagram.port,
             };
+            if !udp_address_matches_family(self.family(), remote.address) {
+                continue;
+            }
             if filter.is_some_and(|expected| expected != remote) {
                 continue;
             }
             return Ok(WasiUdpSocketDatagram {
-                bytes: datagram.bytes.to_vec(),
+                bytes: datagram.bytes,
                 remote_address: remote,
             });
         }
@@ -1561,9 +1576,6 @@ impl UdpSocket {
     ) -> core::result::Result<(), WasiUdpSocketError> {
         let service = {
             let state = self.inner.lock();
-            if !matches!(state.family, WasiUdpSocketFamily::Ipv4) {
-                return Err(WasiUdpSocketError::NotSupported);
-            }
             if state.pending_bind.is_some() || state.bound.is_some() {
                 return Err(WasiUdpSocketError::InvalidState);
             }
@@ -1630,10 +1642,10 @@ fn validate_udp_local_address(
     family: WasiUdpSocketFamily,
     local_address: WasiUdpSocketAddress,
 ) -> core::result::Result<(), WasiUdpSocketError> {
-    if !matches!(family, WasiUdpSocketFamily::Ipv4) {
+    if !udp_address_matches_family(family, local_address.address) {
         return Err(WasiUdpSocketError::NotSupported);
     }
-    if local_address.address.octets() != [0, 0, 0, 0] {
+    if !network_ip_address_is_unspecified(local_address.address) {
         return Err(WasiUdpSocketError::AddressNotBindable);
     }
     Ok(())
@@ -1643,13 +1655,31 @@ fn validate_udp_remote_address(
     family: WasiUdpSocketFamily,
     remote_address: WasiUdpSocketAddress,
 ) -> core::result::Result<(), WasiUdpSocketError> {
-    if !matches!(family, WasiUdpSocketFamily::Ipv4) {
+    if !udp_address_matches_family(family, remote_address.address) {
         return Err(WasiUdpSocketError::NotSupported);
     }
-    if remote_address.address.octets() == [0, 0, 0, 0] || remote_address.port == 0 {
+    if network_ip_address_is_unspecified(remote_address.address) || remote_address.port == 0 {
         return Err(WasiUdpSocketError::InvalidArgument);
     }
     Ok(())
+}
+
+fn udp_address_matches_family(
+    family: WasiUdpSocketFamily,
+    address: crate::NetworkIpAddress,
+) -> bool {
+    matches!(
+        (family, address),
+        (WasiUdpSocketFamily::Ipv4, crate::NetworkIpAddress::Ipv4(_))
+            | (WasiUdpSocketFamily::Ipv6, crate::NetworkIpAddress::Ipv6(_))
+    )
+}
+
+fn network_ip_address_is_unspecified(address: crate::NetworkIpAddress) -> bool {
+    match address {
+        crate::NetworkIpAddress::Ipv4(address) => address.octets() == [0, 0, 0, 0],
+        crate::NetworkIpAddress::Ipv6(address) => address.is_unspecified(),
+    }
 }
 
 fn embedded_absolute_path(relative: &str) -> String {
@@ -5531,7 +5561,7 @@ where
             .await
             .map(|datagram| {
                 (
-                    datagram.bytes,
+                    datagram.bytes.to_vec(),
                     format_p3_udp_socket_address(datagram.remote_address),
                 )
             })
@@ -5635,13 +5665,14 @@ fn map_p3_udp_family(
 ) -> core::result::Result<WasiUdpSocketFamily, WasiUdpSocketError> {
     match family {
         socket_types::IpAddressFamily::Ipv4 => Ok(WasiUdpSocketFamily::Ipv4),
-        socket_types::IpAddressFamily::Ipv6 => Err(WasiUdpSocketError::NotSupported),
+        socket_types::IpAddressFamily::Ipv6 => Ok(WasiUdpSocketFamily::Ipv6),
     }
 }
 
 fn format_p3_udp_family(family: WasiUdpSocketFamily) -> socket_types::IpAddressFamily {
     match family {
         WasiUdpSocketFamily::Ipv4 => socket_types::IpAddressFamily::Ipv4,
+        WasiUdpSocketFamily::Ipv6 => socket_types::IpAddressFamily::Ipv6,
     }
 }
 
@@ -5652,27 +5683,77 @@ fn parse_p3_udp_socket_address(
     match (family, address) {
         (WasiUdpSocketFamily::Ipv4, socket_types::IpSocketAddress::Ipv4(address)) => {
             Ok(WasiUdpSocketAddress {
-                address: crate::Ipv4Address::new([
+                address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([
                     address.address.0,
                     address.address.1,
                     address.address.2,
                     address.address.3,
-                ]),
+                ])),
+                port: address.port,
+            })
+        }
+        (WasiUdpSocketFamily::Ipv6, socket_types::IpSocketAddress::Ipv6(address)) => {
+            let segments = [
+                address.address.0,
+                address.address.1,
+                address.address.2,
+                address.address.3,
+                address.address.4,
+                address.address.5,
+                address.address.6,
+                address.address.7,
+            ];
+            let mut octets = [0; 16];
+            for (index, segment) in segments.into_iter().enumerate() {
+                let [high, low] = segment.to_be_bytes();
+                octets[index * 2] = high;
+                octets[index * 2 + 1] = low;
+            }
+            Ok(WasiUdpSocketAddress {
+                address: crate::NetworkIpAddress::Ipv6(Ipv6Address::new(octets)),
                 port: address.port,
             })
         }
         (WasiUdpSocketFamily::Ipv4, socket_types::IpSocketAddress::Ipv6(_)) => {
             Err(WasiUdpSocketError::NotSupported)
         }
+        (WasiUdpSocketFamily::Ipv6, socket_types::IpSocketAddress::Ipv4(_)) => {
+            Err(WasiUdpSocketError::NotSupported)
+        }
     }
 }
 
 fn format_p3_udp_socket_address(address: WasiUdpSocketAddress) -> socket_types::IpSocketAddress {
-    let [a, b, c, d] = address.address.octets();
-    socket_types::IpSocketAddress::Ipv4(socket_types::Ipv4SocketAddress {
-        port: address.port,
-        address: (a, b, c, d),
-    })
+    match address.address {
+        crate::NetworkIpAddress::Ipv4(ip) => {
+            let [a, b, c, d] = ip.octets();
+            socket_types::IpSocketAddress::Ipv4(socket_types::Ipv4SocketAddress {
+                port: address.port,
+                address: (a, b, c, d),
+            })
+        }
+        crate::NetworkIpAddress::Ipv6(ip) => {
+            let octets = ip.octets();
+            let segments: [u16; 8] = core::array::from_fn(|index| {
+                u16::from_be_bytes([octets[index * 2], octets[index * 2 + 1]])
+            });
+            socket_types::IpSocketAddress::Ipv6(socket_types::Ipv6SocketAddress {
+                port: address.port,
+                flow_info: 0,
+                address: (
+                    segments[0],
+                    segments[1],
+                    segments[2],
+                    segments[3],
+                    segments[4],
+                    segments[5],
+                    segments[6],
+                    segments[7],
+                ),
+                scope_id: 0,
+            })
+        }
+    }
 }
 
 fn map_p3_udp_socket_error(error: WasiUdpSocketError) -> socket_types::ErrorCode {
@@ -5868,9 +5949,10 @@ mod tests {
         ComponentHostNetworkService, DEFAULT_WASI_TCP_HOP_LIMIT, DEFAULT_WASI_TCP_KEEP_ALIVE_COUNT,
         DEFAULT_WASI_TCP_KEEP_ALIVE_IDLE_NANOS, DEFAULT_WASI_TCP_KEEP_ALIVE_INTERVAL_NANOS,
         DEFAULT_WASI_TCP_LISTEN_BACKLOG, DebugFileSystem, FsDescriptor, FsNodeKind,
-        P2ResolveAddressStream, TcpSocket, WasiTcpIpAddress, WasiTcpSocketAddress,
-        WasiTcpSocketFamily, WasiUdpSocketError, WasiUdpSocketFamily, format_p3_tcp_socket_address,
-        fs_types, has_wasi_network_rights, ip_name_lookup, map_p3_dns_error, map_p3_tcp_error,
+        P2ResolveAddressStream, TcpSocket, UdpSocket, WasiTcpIpAddress, WasiTcpSocketAddress,
+        WasiTcpSocketFamily, WasiUdpSocketAddress, WasiUdpSocketError, WasiUdpSocketFamily,
+        format_p3_tcp_socket_address, format_p3_udp_socket_address, fs_types,
+        has_wasi_network_rights, ip_name_lookup, map_p3_dns_error, map_p3_tcp_error,
         map_p3_udp_family, map_p3_udp_socket_error, parse_p3_tcp_socket_address,
         parse_p3_udp_socket_address, preview3, socket_types, wasi_tcp_bind_rights,
         wasi_udp_bind_rights,
@@ -5879,6 +5961,13 @@ mod tests {
     const fn tcp4(octets: [u8; 4], port: u16) -> WasiTcpSocketAddress {
         WasiTcpSocketAddress {
             address: WasiTcpIpAddress::Ipv4(crate::Ipv4Address::new(octets)),
+            port,
+        }
+    }
+
+    const fn udp4(octets: [u8; 4], port: u16) -> WasiUdpSocketAddress {
+        WasiUdpSocketAddress {
+            address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new(octets)),
             port,
         }
     }
@@ -6056,6 +6145,18 @@ mod tests {
             &self,
             _: Self::UdpSocket,
             _: &str,
+            _: u16,
+            bytes: &[u8],
+            _: u64,
+        ) -> impl core::future::Future<Output = Result<u64, crate::UdpError>> + Send + '_ {
+            let _ = bytes;
+            async { panic!("WASI UDP send must use typed address path") }
+        }
+
+        fn udp_send_address(
+            &self,
+            _: Self::UdpSocket,
+            _: crate::NetworkIpAddress,
             _: u16,
             bytes: &[u8],
             _: u64,
@@ -7449,10 +7550,11 @@ mod tests {
 
     #[test]
     fn p3_tcp_ipv6_addresses_roundtrip_while_family_mismatches_fail() {
-        assert!(matches!(
-            map_p3_udp_family(socket_types::IpAddressFamily::Ipv6),
-            Err(WasiUdpSocketError::NotSupported)
-        ));
+        assert_eq!(
+            map_p3_udp_family(socket_types::IpAddressFamily::Ipv6)
+                .expect("IPv6 UDP family must be supported"),
+            WasiUdpSocketFamily::Ipv6
+        );
         let ipv6_socket_address =
             socket_types::IpSocketAddress::Ipv6(socket_types::Ipv6SocketAddress {
                 port: 80,
@@ -7483,6 +7585,15 @@ mod tests {
             ),
             Err(socket_types::ErrorCode::NotSupported)
         ));
+        let udp = parse_p3_udp_socket_address(ipv6_socket_address, WasiUdpSocketFamily::Ipv6)
+            .expect("IPv6 UDP socket address must parse for IPv6 sockets");
+        match format_p3_udp_socket_address(udp) {
+            socket_types::IpSocketAddress::Ipv6(address) => {
+                assert_eq!(address.port, 80);
+                assert_eq!(address.address, (0x2001, 0x0db8, 0, 0, 0, 0, 0, 1));
+            }
+            socket_types::IpSocketAddress::Ipv4(_) => panic!("IPv6 UDP address formatted as IPv4"),
+        }
         assert!(matches!(
             parse_p3_udp_socket_address(
                 socket_types::IpSocketAddress::Ipv6(socket_types::Ipv6SocketAddress {
@@ -7516,6 +7627,15 @@ mod tests {
         assert!(stream.is_ready());
         assert_eq!(stream.next_address().unwrap(), Some(address));
         assert_eq!(stream.next_address().unwrap(), None);
+    }
+
+    #[test]
+    fn udp_socket_send_uses_typed_address_path() {
+        let service = ComponentHostNetworkService::from_service(TestNetworkService);
+        let socket = UdpSocket::new(service, WasiUdpSocketFamily::Ipv4);
+
+        block_on(socket.send_datagram(b"hello", Some(udp4([192, 0, 2, 4], 53)), 0))
+            .expect("UDP send should use typed backend address");
     }
 
     #[test]

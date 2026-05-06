@@ -597,6 +597,18 @@ where
             .await
     }
 
+    pub async fn udp_send_address(
+        &self,
+        socket: UdpSocketId,
+        remote_address: NetworkIpAddress,
+        port: u16,
+        bytes: &[u8],
+        timeout_nanos: u64,
+    ) -> Result<u64, UdpError> {
+        self.execute_udp_send_address(socket, remote_address, port, bytes, timeout_nanos)
+            .await
+    }
+
     pub async fn udp_receive(
         &self,
         socket: UdpSocketId,
@@ -851,8 +863,58 @@ where
         timeout_nanos: u64,
     ) -> Result<u64, UdpError> {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
-        self.wait_for_ipv4_udp(deadline_nanos).await?;
         let destination = self.resolve_host_udp(host, deadline_nanos).await?;
+        self.execute_udp_send_ipv4(socket, destination, port, bytes, deadline_nanos)
+            .await
+    }
+
+    async fn execute_udp_send_address(
+        &self,
+        socket: UdpSocketId,
+        remote_address: NetworkIpAddress,
+        port: u16,
+        bytes: &[u8],
+        timeout_nanos: u64,
+    ) -> Result<u64, UdpError> {
+        let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
+        match remote_address {
+            NetworkIpAddress::Ipv4(destination) => {
+                self.execute_udp_send_ipv4(
+                    socket,
+                    map_kernel_ipv4_address(destination),
+                    port,
+                    bytes,
+                    deadline_nanos,
+                )
+                .await
+            }
+            NetworkIpAddress::Ipv6(destination) => {
+                self.execute_udp_send_ip(socket, IpAddress::Ipv6(destination), port, bytes)
+                    .await
+            }
+        }
+    }
+
+    async fn execute_udp_send_ipv4(
+        &self,
+        socket: UdpSocketId,
+        destination: Ipv4Address,
+        port: u16,
+        bytes: &[u8],
+        deadline_nanos: u64,
+    ) -> Result<u64, UdpError> {
+        self.wait_for_ipv4_udp(deadline_nanos).await?;
+        self.execute_udp_send_ip(socket, IpAddress::Ipv4(destination), port, bytes)
+            .await
+    }
+
+    async fn execute_udp_send_ip(
+        &self,
+        socket: UdpSocketId,
+        destination: IpAddress,
+        port: u16,
+        bytes: &[u8],
+    ) -> Result<u64, UdpError> {
         let now = StackInstant::from_nanos(self.now_nanos());
         let written =
             self.inner
@@ -1500,6 +1562,27 @@ where
         async move { NetworkService::udp_send(self, socket, host, port, bytes, timeout_nanos).await }
     }
 
+    fn udp_send_address<'a>(
+        &'a self,
+        socket: Self::UdpSocket,
+        remote_address: NetworkIpAddress,
+        port: u16,
+        bytes: &'a [u8],
+        timeout_nanos: u64,
+    ) -> impl core::future::Future<Output = Result<u64, UdpError>> + Send + 'a {
+        async move {
+            NetworkService::udp_send_address(
+                self,
+                socket,
+                remote_address,
+                port,
+                bytes,
+                timeout_nanos,
+            )
+            .await
+        }
+    }
+
     fn udp_receive<'a>(
         &'a self,
         socket: Self::UdpSocket,
@@ -2046,28 +2129,33 @@ impl NetworkState {
     fn try_send_udp(
         &mut self,
         socket: UdpSocketId,
-        destination: Ipv4Address,
+        destination: IpAddress,
         port: u16,
         bytes: &[u8],
         now: StackInstant,
     ) -> Result<usize, UdpError> {
         let local_port = self.udp_socket(socket)?.local_port;
-        self.stack
-            .send_udp_ipv4(
+        match destination {
+            IpAddress::Ipv4(destination) => self.stack.send_udp_ipv4(
                 local_port,
                 destination,
                 port,
                 bytes,
                 socket.0.get() as u16,
                 now,
-            )
-            .map_err(|error| {
-                tracing::debug!(?error, "failed to queue UDP datagram");
-                UdpError {
-                    kind: UdpErrorKind::Unavailable,
-                    detail: NetworkErrorDetail::UdpQueueFailed,
-                }
-            })
+            ),
+            IpAddress::Ipv6(destination) => {
+                self.stack
+                    .send_udp_ipv6(local_port, destination, port, bytes, now)
+            }
+        }
+        .map_err(|error| {
+            tracing::debug!(?error, "failed to queue UDP datagram");
+            UdpError {
+                kind: UdpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::UdpQueueFailed,
+            }
+        })
     }
 
     fn poll_udp_receive(
@@ -2080,11 +2168,8 @@ impl NetworkState {
             let Some(datagram) = self.stack.take_udp(local_port) else {
                 return Ok(None);
             };
-            let IpAddress::Ipv4(address) = datagram.source else {
-                continue;
-            };
             return Ok(Some(UdpDatagram {
-                address: map_ipv4_address(address),
+                address: map_ip_address(datagram.source),
                 port: datagram.source_port,
                 bytes: limit_udp_datagram_bytes(datagram.bytes, max_bytes),
             }));
@@ -2487,7 +2572,7 @@ mod tests {
     use helios_netstack::{
         ETHERNET_FRAME_BYTES, EthernetFrame, EthernetProtocol, IpAddress, IpProtocol, Ipv6Address,
         Ipv6Cidr, Ipv6Packet, NeighborEntry, NeighborState, StackInstant, TcpFlags, TcpHeader,
-        TcpPacket,
+        TcpPacket, UdpPacket,
     };
 
     use super::{
@@ -2528,6 +2613,43 @@ mod tests {
         )
         .expect("test IPv6 header should fit");
         (frame, offset + tcp_len)
+    }
+
+    fn ipv6_udp_frame(
+        source: Ipv6Address,
+        source_port: u16,
+        destination: Ipv6Address,
+        destination_port: u16,
+        payload: &[u8],
+    ) -> ([u8; ETHERNET_FRAME_BYTES], usize) {
+        let mut frame = [0; ETHERNET_FRAME_BYTES];
+        let mut offset = EthernetFrame::encode_header(
+            &mut frame,
+            [0x02, 0, 0, 0, 0, 1],
+            [0x02, 0, 0, 0, 0, 2],
+            EthernetProtocol::Ipv6,
+        )
+        .expect("test Ethernet header should fit");
+        let udp_start = offset + Ipv6Packet::HEADER_LEN;
+        let udp_len = UdpPacket::encode(
+            &mut frame[udp_start..],
+            IpAddress::Ipv6(source),
+            IpAddress::Ipv6(destination),
+            source_port,
+            destination_port,
+            payload,
+        )
+        .expect("test UDP datagram should fit");
+        offset += Ipv6Packet::encode_header(
+            &mut frame[offset..],
+            source,
+            destination,
+            IpProtocol::Udp,
+            udp_len,
+            64,
+        )
+        .expect("test IPv6 header should fit");
+        (frame, offset + udp_len)
     }
 
     #[test]
@@ -2604,6 +2726,75 @@ mod tests {
         assert_eq!(ipv6.destination, remote);
         assert_eq!(tcp.destination_port, 443);
         assert!(tcp.flags.contains(TcpFlags::SYN));
+    }
+
+    #[test]
+    fn udp_send_to_ipv6_destination_uses_ipv6_source_address() {
+        let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        let mut state = NetworkState::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 8, 1);
+        state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+        state.stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv6(remote),
+            mac: [0x02, 0, 0, 0, 0, 2],
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        let socket = state
+            .start_udp_bind(4040)
+            .expect("IPv6 UDP test socket should bind")
+            .socket;
+
+        let written = state
+            .try_send_udp(
+                socket,
+                IpAddress::Ipv6(remote),
+                53,
+                b"hello",
+                StackInstant::from_nanos(1),
+            )
+            .expect("IPv6 UDP datagram should queue");
+        assert_eq!(written, 5);
+        let frame = state
+            .stack
+            .take_outbound()
+            .expect("IPv6 UDP frame should be queued");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        assert_eq!(ethernet.protocol, EthernetProtocol::Ipv6);
+        let ipv6 = Ipv6Packet::parse(ethernet.payload).expect("IPv6 packet should parse");
+        assert_eq!(ipv6.source, local);
+        assert_eq!(ipv6.destination, remote);
+        assert_eq!(ipv6.next_header, IpProtocol::Udp);
+        let udp = UdpPacket::parse(ipv6.payload).expect("UDP packet should parse");
+        assert_eq!(udp.source_port, 4040);
+        assert_eq!(udp.destination_port, 53);
+        assert_eq!(udp.payload, b"hello");
+    }
+
+    #[test]
+    fn udp_receive_from_ipv6_source_preserves_typed_peer_address() {
+        let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        let mut state = NetworkState::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 8, 1);
+        state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+        let socket = state
+            .start_udp_bind(4040)
+            .expect("IPv6 UDP test socket should bind")
+            .socket;
+        let (frame, len) = ipv6_udp_frame(remote, 53, local, 4040, b"hello");
+
+        state
+            .stack
+            .receive_frame(&frame[..len], StackInstant::from_nanos(1))
+            .expect("IPv6 UDP frame should be received");
+        let datagram = state
+            .poll_udp_receive(socket, usize::MAX)
+            .expect("IPv6 UDP receive should poll")
+            .expect("IPv6 UDP datagram should be queued");
+
+        assert_eq!(datagram.address, NetworkIpAddress::Ipv6(remote));
+        assert_eq!(datagram.port, 53);
+        assert_eq!(datagram.bytes.as_ref(), b"hello");
     }
 
     #[test]

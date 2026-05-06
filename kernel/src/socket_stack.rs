@@ -366,6 +366,17 @@ mod tests {
             core::future::ready(Ok(bytes.len() as u64))
         }
 
+        fn udp_send_address(
+            &self,
+            _: Self::UdpSocket,
+            _: NetworkIpAddress,
+            _: u16,
+            bytes: &[u8],
+            _: u64,
+        ) -> impl Future<Output = Result<u64, UdpError>> + Send + '_ {
+            core::future::ready(Ok(bytes.len() as u64))
+        }
+
         fn udp_receive(
             &self,
             _: Self::UdpSocket,

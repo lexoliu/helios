@@ -158,6 +158,15 @@ trait DynComponentHostNetworkService: Send + Sync + 'static {
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<u64, UdpError>> + Send + 'a>>;
 
+    fn udp_send_address<'a>(
+        &'a self,
+        socket: u64,
+        remote_address: NetworkIpAddress,
+        port: u16,
+        bytes: &'a [u8],
+        timeout_nanos: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, UdpError>> + Send + 'a>>;
+
     fn udp_receive<'a>(
         &'a self,
         socket: u64,
@@ -402,6 +411,18 @@ impl ComponentNetworkService for ComponentHostNetworkService {
     ) -> impl Future<Output = Result<u64, UdpError>> + Send + 'a {
         self.inner
             .udp_send(socket, host, port, bytes, timeout_nanos)
+    }
+
+    fn udp_send_address<'a>(
+        &'a self,
+        socket: Self::UdpSocket,
+        remote_address: NetworkIpAddress,
+        port: u16,
+        bytes: &'a [u8],
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<u64, UdpError>> + Send + 'a {
+        self.inner
+            .udp_send_address(socket, remote_address, port, bytes, timeout_nanos)
     }
 
     fn udp_receive(
@@ -749,6 +770,27 @@ where
                 .udp_send(
                     <Service::UdpSocket as ComponentHostUdpSocketToken>::from_raw(socket),
                     host,
+                    port,
+                    bytes,
+                    timeout_nanos,
+                )
+                .await
+        })
+    }
+
+    fn udp_send_address<'a>(
+        &'a self,
+        socket: u64,
+        remote_address: NetworkIpAddress,
+        port: u16,
+        bytes: &'a [u8],
+        timeout_nanos: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<u64, UdpError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.service
+                .udp_send_address(
+                    <Service::UdpSocket as ComponentHostUdpSocketToken>::from_raw(socket),
+                    remote_address,
                     port,
                     bytes,
                     timeout_nanos,

@@ -221,6 +221,8 @@ impl TcpError {
 pub enum UdpErrorKind {
     #[error("host could not be resolved")]
     UnresolvedHost,
+    #[error("address family is not supported")]
+    Unsupported,
     #[error("operation timed out")]
     Timeout,
     #[error("permission denied")]
@@ -288,6 +290,8 @@ pub enum NetworkErrorDetail {
     DnsLookupFailed,
     #[error("DNS lookup returned no IPv4 address")]
     DnsNoIpv4Address,
+    #[error("address family is not supported by this operation")]
+    UnsupportedAddressFamily,
     #[error("DNS result is not ready")]
     DnsResultNotReady,
     #[error("ICMP echo request timed out")]
@@ -363,6 +367,7 @@ impl NetworkErrorDetail {
             Self::DnsLookupTimeout => "DNS lookup timed out",
             Self::DnsLookupFailed => "DNS lookup failed",
             Self::DnsNoIpv4Address => "DNS lookup returned no IPv4 address",
+            Self::UnsupportedAddressFamily => "address family is not supported by this operation",
             Self::DnsResultNotReady => "DNS result is not ready",
             Self::IcmpEchoTimeout => "ICMP echo request timed out",
             Self::IcmpQueueFailed => "ICMP echo request could not be queued",
@@ -399,7 +404,7 @@ impl NetworkErrorDetail {
 
 #[derive(Clone, Debug)]
 pub struct UdpDatagram {
-    pub address: Ipv4Address,
+    pub address: NetworkIpAddress,
     pub port: u16,
     pub bytes: Bytes,
 }
@@ -525,6 +530,15 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         &'a self,
         socket: Self::UdpSocket,
         host: &'a str,
+        port: u16,
+        bytes: &'a [u8],
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<u64, UdpError>> + Send + 'a;
+
+    fn udp_send_address<'a>(
+        &'a self,
+        socket: Self::UdpSocket,
+        remote_address: NetworkIpAddress,
         port: u16,
         bytes: &'a [u8],
         timeout_nanos: u64,

@@ -14405,7 +14405,11 @@ where
             if status != p1::errno::SUCCESS {
                 return status;
             }
-            write_wasix_addr_port_ip4(caller, memory, ret_addr, datagram.address, datagram.port)
+            let peer_address = match datagram.address {
+                crate::NetworkIpAddress::Ipv4(address) => address,
+                crate::NetworkIpAddress::Ipv6(_) => return p1::errno::NOTSUP,
+            };
+            write_wasix_addr_port_ip4(caller, memory, ret_addr, peer_address, datagram.port)
         }
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
             ..
@@ -16794,6 +16798,7 @@ fn p1_errno_from_tcp_error_for_fdflags(error: crate::TcpError, fdflags: u16) -> 
 fn p1_errno_from_udp_error(error: crate::UdpError) -> i32 {
     match error.kind {
         crate::UdpErrorKind::UnresolvedHost => p1::errno::HOSTUNREACH,
+        crate::UdpErrorKind::Unsupported => p1::errno::NOTSUP,
         crate::UdpErrorKind::Timeout => p1::errno::TIMEDOUT,
         crate::UdpErrorKind::PermissionDenied => p1::errno::NOTCAPABLE,
         crate::UdpErrorKind::Unavailable => p1::errno::NETDOWN,

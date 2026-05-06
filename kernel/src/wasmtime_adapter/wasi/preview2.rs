@@ -5,6 +5,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use helios_hal::cpu::Cpu;
+use helios_netstack::Ipv6Address;
 use thiserror::Error;
 use wasmtime::component::{HasSelf, Linker, Resource};
 use wasmtime::{self, Result};
@@ -2174,7 +2175,7 @@ where
         while datagrams.len() < max_results {
             match socket.receive_datagram(remote_address, 0).await {
                 Ok(datagram) => datagrams.push(p2udp::IncomingDatagram {
-                    data: datagram.bytes,
+                    data: datagram.bytes.to_vec(),
                     remote_address: format_p2_udp_socket_address(datagram.remote_address),
                 }),
                 Err(WasiUdpSocketError::WouldBlock) => break,
@@ -2299,9 +2300,7 @@ where
         }
         let family = match address_family {
             p2udp_create::IpAddressFamily::Ipv4 => WasiUdpSocketFamily::Ipv4,
-            p2udp_create::IpAddressFamily::Ipv6 => {
-                return Ok(Err(p2udp_create::ErrorCode::NotSupported));
-            }
+            p2udp_create::IpAddressFamily::Ipv6 => WasiUdpSocketFamily::Ipv6,
         };
         let Some(service) = self.runtime_state.network_service() else {
             return Ok(Err(p2udp_create::ErrorCode::Unknown));
@@ -2318,32 +2317,83 @@ fn parse_p2_udp_socket_address(
     match (family, address) {
         (WasiUdpSocketFamily::Ipv4, p2udp::IpSocketAddress::Ipv4(address)) => {
             Ok(WasiUdpSocketAddress {
-                address: crate::Ipv4Address::new([
+                address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([
                     address.address.0,
                     address.address.1,
                     address.address.2,
                     address.address.3,
-                ]),
+                ])),
+                port: address.port,
+            })
+        }
+        (WasiUdpSocketFamily::Ipv6, p2udp::IpSocketAddress::Ipv6(address)) => {
+            let segments = [
+                address.address.0,
+                address.address.1,
+                address.address.2,
+                address.address.3,
+                address.address.4,
+                address.address.5,
+                address.address.6,
+                address.address.7,
+            ];
+            let mut octets = [0; 16];
+            for (index, segment) in segments.into_iter().enumerate() {
+                let [high, low] = segment.to_be_bytes();
+                octets[index * 2] = high;
+                octets[index * 2 + 1] = low;
+            }
+            Ok(WasiUdpSocketAddress {
+                address: crate::NetworkIpAddress::Ipv6(Ipv6Address::new(octets)),
                 port: address.port,
             })
         }
         (WasiUdpSocketFamily::Ipv4, p2udp::IpSocketAddress::Ipv6(_)) => {
             Err(WasiUdpSocketError::NotSupported)
         }
+        (WasiUdpSocketFamily::Ipv6, p2udp::IpSocketAddress::Ipv4(_)) => {
+            Err(WasiUdpSocketError::NotSupported)
+        }
     }
 }
 
 fn format_p2_udp_socket_address(address: WasiUdpSocketAddress) -> p2udp::IpSocketAddress {
-    let [a, b, c, d] = address.address.octets();
-    p2udp::IpSocketAddress::Ipv4(p2net::Ipv4SocketAddress {
-        port: address.port,
-        address: (a, b, c, d),
-    })
+    match address.address {
+        crate::NetworkIpAddress::Ipv4(ip) => {
+            let [a, b, c, d] = ip.octets();
+            p2udp::IpSocketAddress::Ipv4(p2net::Ipv4SocketAddress {
+                port: address.port,
+                address: (a, b, c, d),
+            })
+        }
+        crate::NetworkIpAddress::Ipv6(ip) => {
+            let octets = ip.octets();
+            let segments: [u16; 8] = core::array::from_fn(|index| {
+                u16::from_be_bytes([octets[index * 2], octets[index * 2 + 1]])
+            });
+            p2udp::IpSocketAddress::Ipv6(p2net::Ipv6SocketAddress {
+                port: address.port,
+                flow_info: 0,
+                address: (
+                    segments[0],
+                    segments[1],
+                    segments[2],
+                    segments[3],
+                    segments[4],
+                    segments[5],
+                    segments[6],
+                    segments[7],
+                ),
+                scope_id: 0,
+            })
+        }
+    }
 }
 
 fn format_p2_udp_family(family: WasiUdpSocketFamily) -> p2udp::IpAddressFamily {
     match family {
         WasiUdpSocketFamily::Ipv4 => p2udp::IpAddressFamily::Ipv4,
+        WasiUdpSocketFamily::Ipv6 => p2udp::IpAddressFamily::Ipv6,
     }
 }
 
@@ -3473,9 +3523,9 @@ mod tests {
 
     use super::{
         PREVIEW2_WIT_PACKAGES, WasiTcpSocketFamily, WasiUdpSocketError, WasiUdpSocketFamily,
-        format_p2_tcp_socket_address, map_p2_tcp_core_error, map_p2_tcp_family,
-        map_p2_tcp_socket_error, p2net, p2tcp, p2tcp_create, p2udp, parse_p2_tcp_socket_address,
-        parse_p2_udp_socket_address,
+        format_p2_tcp_socket_address, format_p2_udp_family, format_p2_udp_socket_address,
+        map_p2_tcp_core_error, map_p2_tcp_family, map_p2_tcp_socket_error, p2net, p2tcp,
+        p2tcp_create, p2udp, parse_p2_tcp_socket_address, parse_p2_udp_socket_address,
     };
 
     #[test]
@@ -3572,7 +3622,7 @@ mod tests {
     }
 
     #[test]
-    fn p2_udp_ipv4_socket_rejects_ipv6_addresses_and_family() {
+    fn p2_udp_ipv6_addresses_roundtrip_while_family_mismatches_fail() {
         let ipv4 = parse_p2_udp_socket_address(
             p2udp::IpSocketAddress::Ipv4(p2net::Ipv4SocketAddress {
                 port: 53,
@@ -3582,17 +3632,29 @@ mod tests {
         )
         .expect("IPv4 address should parse for IPv4 socket");
         assert_eq!(ipv4.port, 53);
+        assert_eq!(
+            format_p2_udp_family(WasiUdpSocketFamily::Ipv6),
+            p2udp::IpAddressFamily::Ipv6
+        );
 
-        let ipv6 = parse_p2_udp_socket_address(
-            p2udp::IpSocketAddress::Ipv6(p2net::Ipv6SocketAddress {
-                port: 53,
-                flow_info: 0,
-                address: (0, 0, 0, 0, 0, 0, 0, 1),
-                scope_id: 0,
-            }),
-            WasiUdpSocketFamily::Ipv4,
-        )
-        .expect_err("IPv6 address must not be accepted by IPv4 socket");
-        assert!(matches!(ipv6, WasiUdpSocketError::NotSupported));
+        let ipv6_address = p2udp::IpSocketAddress::Ipv6(p2net::Ipv6SocketAddress {
+            port: 53,
+            flow_info: 0,
+            address: (0x2001, 0x0db8, 0, 0, 0, 0, 0, 1),
+            scope_id: 0,
+        });
+        let ipv6 = parse_p2_udp_socket_address(ipv6_address, WasiUdpSocketFamily::Ipv6)
+            .expect("IPv6 address should parse for IPv6 socket");
+        match format_p2_udp_socket_address(ipv6) {
+            p2udp::IpSocketAddress::Ipv6(address) => {
+                assert_eq!(address.port, 53);
+                assert_eq!(address.address, (0x2001, 0x0db8, 0, 0, 0, 0, 0, 1));
+            }
+            p2udp::IpSocketAddress::Ipv4(_) => panic!("IPv6 UDP address formatted as IPv4"),
+        }
+
+        let mismatched_ipv6 = parse_p2_udp_socket_address(ipv6_address, WasiUdpSocketFamily::Ipv4)
+            .expect_err("IPv6 address must not be accepted by IPv4 socket");
+        assert!(matches!(mismatched_ipv6, WasiUdpSocketError::NotSupported));
     }
 }

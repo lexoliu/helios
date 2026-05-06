@@ -2063,7 +2063,7 @@ where
                     .0
                     .udp_receive(socket.1, max_bytes, timeout)
                     .await
-                    .map(|datagram| datagram.map(convert_udp_datagram))
+                    .and_then(|datagram| datagram.map(convert_udp_datagram).transpose())
                     .map_err(convert_udp_error);
                 Ok::<_, wasmtime::Error>((response,))
             })
@@ -2390,7 +2390,7 @@ where
                     .0
                     .udp_receive(socket.1, max_bytes, timeout)
                     .await
-                    .map(|datagram| datagram.map(convert_program_udp_datagram))
+                    .and_then(|datagram| datagram.map(convert_program_udp_datagram).transpose())
                     .map_err(convert_program_udp_error);
                 Ok::<_, wasmtime::Error>((response,))
             })
@@ -2848,27 +2848,43 @@ fn convert_program_tcp_error(
 
 fn convert_udp_datagram(
     datagram: crate::UdpDatagram,
-) -> debugger_bindings::helios::system::net::UdpDatagram {
-    let octets = datagram.address.octets();
-    debugger_bindings::helios::system::net::UdpDatagram {
-        address: debugger_bindings::helios::system::net::IpAddress::Ipv4((
-            octets[0], octets[1], octets[2], octets[3],
-        )),
-        port: datagram.port,
-        bytes: datagram.bytes.to_vec(),
+) -> Result<debugger_bindings::helios::system::net::UdpDatagram, crate::UdpError> {
+    match datagram.address {
+        crate::NetworkIpAddress::Ipv4(address) => {
+            let octets = address.octets();
+            Ok(debugger_bindings::helios::system::net::UdpDatagram {
+                address: debugger_bindings::helios::system::net::IpAddress::Ipv4((
+                    octets[0], octets[1], octets[2], octets[3],
+                )),
+                port: datagram.port,
+                bytes: datagram.bytes.to_vec(),
+            })
+        }
+        crate::NetworkIpAddress::Ipv6(_) => Err(crate::UdpError {
+            kind: crate::UdpErrorKind::Unsupported,
+            detail: crate::NetworkErrorDetail::UnsupportedAddressFamily,
+        }),
     }
 }
 
 fn convert_program_udp_datagram(
     datagram: crate::UdpDatagram,
-) -> program_bindings::helios::system::net::UdpDatagram {
-    let octets = datagram.address.octets();
-    program_bindings::helios::system::net::UdpDatagram {
-        address: program_bindings::helios::system::net::IpAddress::Ipv4((
-            octets[0], octets[1], octets[2], octets[3],
-        )),
-        port: datagram.port,
-        bytes: datagram.bytes.to_vec(),
+) -> Result<program_bindings::helios::system::net::UdpDatagram, crate::UdpError> {
+    match datagram.address {
+        crate::NetworkIpAddress::Ipv4(address) => {
+            let octets = address.octets();
+            Ok(program_bindings::helios::system::net::UdpDatagram {
+                address: program_bindings::helios::system::net::IpAddress::Ipv4((
+                    octets[0], octets[1], octets[2], octets[3],
+                )),
+                port: datagram.port,
+                bytes: datagram.bytes.to_vec(),
+            })
+        }
+        crate::NetworkIpAddress::Ipv6(_) => Err(crate::UdpError {
+            kind: crate::UdpErrorKind::Unsupported,
+            detail: crate::NetworkErrorDetail::UnsupportedAddressFamily,
+        }),
     }
 }
 
@@ -2877,6 +2893,9 @@ fn convert_udp_error(error: crate::UdpError) -> debugger_bindings::helios::syste
         kind: match error.kind {
             crate::UdpErrorKind::UnresolvedHost => {
                 debugger_bindings::helios::system::net::UdpErrorKind::UnresolvedHost
+            }
+            crate::UdpErrorKind::Unsupported => {
+                debugger_bindings::helios::system::net::UdpErrorKind::Unavailable
             }
             crate::UdpErrorKind::Timeout => {
                 debugger_bindings::helios::system::net::UdpErrorKind::Timeout
@@ -2902,6 +2921,9 @@ fn convert_program_udp_error(
         kind: match error.kind {
             crate::UdpErrorKind::UnresolvedHost => {
                 program_bindings::helios::system::net::UdpErrorKind::UnresolvedHost
+            }
+            crate::UdpErrorKind::Unsupported => {
+                program_bindings::helios::system::net::UdpErrorKind::Unavailable
             }
             crate::UdpErrorKind::Timeout => {
                 program_bindings::helios::system::net::UdpErrorKind::Timeout
