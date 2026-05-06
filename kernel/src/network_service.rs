@@ -1921,7 +1921,7 @@ impl NetworkState {
     fn poll_udp_receive(
         &mut self,
         socket: UdpSocketId,
-        _max_bytes: usize,
+        max_bytes: usize,
     ) -> Result<Option<UdpDatagram>, UdpError> {
         let local_port = self.udp_socket(socket)?.local_port;
         loop {
@@ -1934,7 +1934,7 @@ impl NetworkState {
             return Ok(Some(UdpDatagram {
                 address: map_ipv4_address(address),
                 port: datagram.source_port,
-                bytes: datagram.bytes,
+                bytes: limit_udp_datagram_bytes(datagram.bytes, max_bytes),
             }));
         }
     }
@@ -2220,6 +2220,13 @@ fn adjust_poll_budget(current: usize, base: usize, saturated: bool, idle: bool) 
     current
 }
 
+fn limit_udp_datagram_bytes(bytes: Bytes, max_bytes: usize) -> Bytes {
+    if bytes.len() <= max_bytes {
+        return bytes;
+    }
+    bytes.slice(..max_bytes)
+}
+
 fn parse_ipv4(input: &str) -> Option<Ipv4Address> {
     let mut octets = [0u8; 4];
     let mut parts = input.split('.');
@@ -2274,7 +2281,10 @@ fn socket_index(socket: UdpSocketId) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+
     use super::HandleSlab;
+    use super::limit_udp_datagram_bytes;
 
     #[test]
     fn handle_slab_reuses_removed_slot() {
@@ -2294,5 +2304,16 @@ mod tests {
         let mut slab = HandleSlab::<u32, 1>::new();
         assert_eq!(slab.insert(10), 0);
         let _ = slab.insert(20);
+    }
+
+    #[test]
+    fn udp_datagram_limit_slices_without_copying() {
+        let bytes = Bytes::from_static(b"abcdef");
+        let ptr = bytes.as_ptr();
+
+        let limited = limit_udp_datagram_bytes(bytes, 3);
+
+        assert_eq!(limited.as_ref(), b"abc");
+        assert_eq!(limited.as_ptr(), ptr);
     }
 }
