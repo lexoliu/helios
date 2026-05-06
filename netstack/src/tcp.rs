@@ -1,7 +1,7 @@
 extern crate alloc;
 
 use bytes::{Bytes, BytesMut};
-use heapless::Deque;
+use heapless::{Deque, Vec as HeapVec};
 
 use crate::{
     AckSample, CongestionControl, CongestionEvent, IpAddress, RecoveryAction, TcpFlags, TcpHeader,
@@ -9,6 +9,7 @@ use crate::{
 };
 
 pub const MAX_TCP_RECEIVE_SEGMENTS: usize = 128;
+pub const MAX_TCP_OUT_OF_ORDER_SEGMENTS: usize = 32;
 pub const MAX_TCP_QUEUED_SEGMENTS: usize = 32;
 pub(crate) const TCP_RECEIVE_SEGMENT_BYTES: usize = 1460;
 const TCP_RECEIVE_BYTES: usize = MAX_TCP_RECEIVE_SEGMENTS * TCP_RECEIVE_SEGMENT_BYTES;
@@ -54,6 +55,12 @@ struct TcpInFlightSegment {
     retransmissions: u8,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TcpOutOfOrderSegment {
+    sequence: u32,
+    payload: Bytes,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TcpState {
     Closed,
@@ -87,6 +94,8 @@ where
     peer_timestamp: Option<TcpTimestampOption>,
     receive_queue: Deque<Bytes, MAX_TCP_RECEIVE_SEGMENTS>,
     receive_queued_bytes: usize,
+    out_of_order: HeapVec<TcpOutOfOrderSegment, MAX_TCP_OUT_OF_ORDER_SEGMENTS>,
+    out_of_order_queued_bytes: usize,
     transmit_queue: Deque<Bytes, MAX_TCP_QUEUED_SEGMENTS>,
     in_flight: Deque<TcpInFlightSegment, MAX_TCP_QUEUED_SEGMENTS>,
     bytes_in_flight: u32,
@@ -120,6 +129,8 @@ where
             peer_timestamp: None,
             receive_queue: Deque::new(),
             receive_queued_bytes: 0,
+            out_of_order: HeapVec::new(),
+            out_of_order_queued_bytes: 0,
             transmit_queue: Deque::new(),
             in_flight: Deque::new(),
             bytes_in_flight: 0,
@@ -312,7 +323,7 @@ where
     }
 
     pub fn receive_backpressured(&self) -> bool {
-        self.receive_queue.len() >= TCP_RECEIVE_BACKPRESSURE_SEGMENTS
+        self.receive_queue.len() + self.out_of_order.len() >= TCP_RECEIVE_BACKPRESSURE_SEGMENTS
     }
 
     pub fn is_listening_on(&self, address: IpAddress, port: u16) -> bool {
@@ -546,16 +557,18 @@ where
                 let tail = bytes.split_off(max_bytes);
                 self.push_front_receive_segment(tail);
             }
+            let drained_segments = self.drain_contiguous_out_of_order();
             self.refresh_advertised_window();
-            if self.should_advertise_window_update(previous_window) {
+            if drained_segments != 0 || self.should_advertise_window_update(previous_window) {
                 self.request_ack();
             }
             return Some(bytes);
         }
 
         if self.receive_queue.is_empty() {
+            let drained_segments = self.drain_contiguous_out_of_order();
             self.refresh_advertised_window();
-            if self.should_advertise_window_update(previous_window) {
+            if drained_segments != 0 || self.should_advertise_window_update(previous_window) {
                 self.request_ack();
             }
             return Some(bytes);
@@ -578,8 +591,9 @@ where
             merged.extend_from_slice(&next);
         }
         bytes = merged.freeze();
+        let drained_segments = self.drain_contiguous_out_of_order();
         self.refresh_advertised_window();
-        if self.should_advertise_window_update(previous_window) {
+        if drained_segments != 0 || self.should_advertise_window_update(previous_window) {
             self.request_ack();
         }
         Some(bytes)
@@ -650,25 +664,16 @@ where
                         TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2
                     )
                 {
-                    if packet.sequence == self.receive_next {
-                        if self
-                            .push_receive_segment(Bytes::copy_from_slice(packet.payload))
-                            .is_err()
-                        {
-                            self.refresh_advertised_window();
-                            self.request_ack();
-                            return TcpSegmentOutcome {
-                                recovery: action,
-                                receive_backpressure: true,
-                            };
-                        }
-                        self.receive_next = self
-                            .receive_next
-                            .wrapping_add(u32::try_from(packet.payload.len()).unwrap_or(u32::MAX));
+                    if self
+                        .receive_payload(packet.sequence, packet.payload, now_nanos)
+                        .is_err()
+                    {
                         self.refresh_advertised_window();
-                        self.note_inbound_payload(packet.payload.len(), now_nanos);
-                    } else {
                         self.request_ack();
+                        return TcpSegmentOutcome {
+                            recovery: action,
+                            receive_backpressure: true,
+                        };
                     }
                 }
                 if packet.flags.contains(TcpFlags::FIN) {
@@ -749,7 +754,13 @@ where
     }
 
     fn refresh_advertised_window(&mut self) {
-        self.advertised_window = receive_window_size(self.receive_queued_bytes);
+        self.advertised_window = receive_window_size(self.receive_buffered_bytes());
+    }
+
+    fn receive_buffered_bytes(&self) -> usize {
+        self.receive_queued_bytes
+            .checked_add(self.out_of_order_queued_bytes)
+            .expect("TCP receive buffered byte count overflowed")
     }
 
     fn push_receive_segment(&mut self, bytes: Bytes) -> Result<(), Bytes> {
@@ -781,6 +792,162 @@ where
         );
         self.receive_queued_bytes -= bytes.len();
         Some(bytes)
+    }
+
+    fn receive_payload(&mut self, sequence: u32, payload: &[u8], now_nanos: u64) -> Result<(), ()> {
+        let payload_len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+        let payload_end = sequence.wrapping_add(payload_len);
+        if sequence_leq(payload_end, self.receive_next) {
+            self.request_ack();
+            return Ok(());
+        }
+
+        if sequence_lt(sequence, self.receive_next) {
+            let trim = usize::try_from(self.receive_next.wrapping_sub(sequence))
+                .expect("TCP receive overlap trim does not fit usize");
+            return self.receive_payload(self.receive_next, &payload[trim..], now_nanos);
+        }
+
+        if sequence == self.receive_next {
+            self.push_contiguous_payload(payload, now_nanos)?;
+            return Ok(());
+        }
+
+        self.insert_out_of_order_payload(sequence, payload)?;
+        self.refresh_advertised_window();
+        self.request_ack();
+        Ok(())
+    }
+
+    fn push_contiguous_payload(&mut self, payload: &[u8], now_nanos: u64) -> Result<(), ()> {
+        self.push_receive_segment(Bytes::copy_from_slice(payload))
+            .map_err(|_| ())?;
+        self.receive_next = self
+            .receive_next
+            .wrapping_add(u32::try_from(payload.len()).unwrap_or(u32::MAX));
+        let drained_segments = self.drain_contiguous_out_of_order();
+        self.refresh_advertised_window();
+        if drained_segments == 0 {
+            self.note_inbound_payload(payload.len(), now_nanos);
+        } else {
+            self.request_ack();
+        }
+        Ok(())
+    }
+
+    fn drain_contiguous_out_of_order(&mut self) -> usize {
+        let mut drained = 0;
+        loop {
+            let Some(segment) = self.out_of_order.first() else {
+                return drained;
+            };
+            let segment_end = segment_end_from_parts(segment.sequence, segment.payload.len());
+            if sequence_leq(segment_end, self.receive_next) {
+                let stale = self.out_of_order.remove(0);
+                self.out_of_order_queued_bytes = self
+                    .out_of_order_queued_bytes
+                    .checked_sub(stale.payload.len())
+                    .expect("TCP out-of-order byte count underflowed");
+                continue;
+            }
+            if sequence_lt(self.receive_next, segment.sequence) {
+                return drained;
+            }
+            if self.receive_queue.is_full() {
+                return drained;
+            }
+
+            let mut segment = self.out_of_order.remove(0);
+            self.out_of_order_queued_bytes = self
+                .out_of_order_queued_bytes
+                .checked_sub(segment.payload.len())
+                .expect("TCP out-of-order byte count underflowed");
+            if sequence_lt(segment.sequence, self.receive_next) {
+                let trim = usize::try_from(self.receive_next.wrapping_sub(segment.sequence))
+                    .expect("TCP out-of-order overlap trim does not fit usize");
+                let _ = segment.payload.split_to(trim);
+                segment.sequence = self.receive_next;
+            }
+            let len = segment.payload.len();
+            self.push_receive_segment(segment.payload)
+                .unwrap_or_else(|_| panic!("TCP receive queue reported full after capacity check"));
+            self.receive_next = self
+                .receive_next
+                .wrapping_add(u32::try_from(len).unwrap_or(u32::MAX));
+            drained += 1;
+        }
+    }
+
+    fn insert_out_of_order_payload(&mut self, sequence: u32, payload: &[u8]) -> Result<(), ()> {
+        let end = segment_end_from_parts(sequence, payload.len());
+        let mut cursor_sequence = sequence;
+        let mut cursor_offset = 0;
+        let mut fragments = HeapVec::<(u32, usize, usize), MAX_TCP_OUT_OF_ORDER_SEGMENTS>::new();
+
+        for existing in &self.out_of_order {
+            let existing_end = segment_end_from_parts(existing.sequence, existing.payload.len());
+            if sequence_leq(existing_end, cursor_sequence) {
+                continue;
+            }
+            if sequence_leq(end, existing.sequence) {
+                break;
+            }
+            if sequence_lt(cursor_sequence, existing.sequence) {
+                let fragment_len = usize::try_from(existing.sequence.wrapping_sub(cursor_sequence))
+                    .expect("TCP out-of-order fragment length does not fit usize");
+                fragments
+                    .push((cursor_sequence, cursor_offset, cursor_offset + fragment_len))
+                    .map_err(|_| ())?;
+            }
+            if sequence_leq(end, existing_end) {
+                cursor_sequence = end;
+                cursor_offset = payload.len();
+                break;
+            }
+            let skip = usize::try_from(existing_end.wrapping_sub(cursor_sequence))
+                .expect("TCP out-of-order overlap length does not fit usize");
+            cursor_sequence = existing_end;
+            cursor_offset += skip;
+        }
+
+        if sequence_lt(cursor_sequence, end) {
+            fragments
+                .push((cursor_sequence, cursor_offset, payload.len()))
+                .map_err(|_| ())?;
+        }
+
+        for (fragment_sequence, start, end) in fragments {
+            self.insert_out_of_order_fragment(fragment_sequence, &payload[start..end])?;
+        }
+        Ok(())
+    }
+
+    fn insert_out_of_order_fragment(&mut self, sequence: u32, payload: &[u8]) -> Result<(), ()> {
+        if payload.is_empty() {
+            return Ok(());
+        }
+        let segment = TcpOutOfOrderSegment {
+            sequence,
+            payload: Bytes::copy_from_slice(payload),
+        };
+        let len = segment.payload.len();
+        self.out_of_order.push(segment).map_err(|_| ())?;
+        self.out_of_order_queued_bytes = self
+            .out_of_order_queued_bytes
+            .checked_add(len)
+            .expect("TCP out-of-order byte count overflowed");
+
+        let mut index = self.out_of_order.len() - 1;
+        while index != 0
+            && sequence_lt(
+                self.out_of_order[index].sequence,
+                self.out_of_order[index - 1].sequence,
+            )
+        {
+            self.out_of_order.swap(index, index - 1);
+            index -= 1;
+        }
+        Ok(())
     }
 
     fn note_inbound_payload(&mut self, payload_len: usize, now_nanos: u64) {
@@ -843,8 +1010,16 @@ fn segment_end(segment: &TcpInFlightSegment) -> u32 {
     segment.header.sequence.wrapping_add(segment.sequence_len)
 }
 
+fn segment_end_from_parts(sequence: u32, len: usize) -> u32 {
+    sequence.wrapping_add(u32::try_from(len).unwrap_or(u32::MAX))
+}
+
 fn sequence_leq(lhs: u32, rhs: u32) -> bool {
     lhs == rhs || (rhs.wrapping_sub(lhs) as i32) >= 0
+}
+
+fn sequence_lt(lhs: u32, rhs: u32) -> bool {
+    lhs != rhs && sequence_leq(lhs, rhs)
 }
 
 fn rto_nanos(retransmissions: u8) -> u64 {
@@ -1425,7 +1600,7 @@ mod tests {
     }
 
     #[test]
-    fn out_of_order_receive_payload_requests_duplicate_ack() {
+    fn out_of_order_receive_payload_reassembles_after_gap_arrives() {
         let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
         socket.mark_syn_queued(0);
         let _ = socket.on_segment(
@@ -1447,12 +1622,12 @@ mod tests {
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
-                sequence: 200,
+                sequence: 104,
                 acknowledgement: 8,
                 flags: TcpFlags::ACK,
                 window_size: u16::MAX,
                 options: TcpOptions::empty(),
-                payload: b"future",
+                payload: b"def",
             },
             TCP_INITIAL_RTO_NANOS + 1,
         );
@@ -1462,6 +1637,65 @@ mod tests {
             .expect("out-of-order payload must request duplicate ACK");
         assert_eq!(ack.acknowledgement, 101);
         assert_eq!(socket.receive(16), None);
+
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: b"abc",
+            },
+            TCP_INITIAL_RTO_NANOS + 2,
+        );
+
+        let ack = socket
+            .pending_ack()
+            .expect("gap fill should acknowledge the reassembled range");
+        assert_eq!(ack.acknowledgement, 107);
+        assert_eq!(socket.receive(16).as_deref(), Some(b"abcdef".as_slice()));
+    }
+
+    #[test]
+    fn out_of_order_receive_payload_drains_sorted_segments() {
+        let mut socket = established_socket();
+        socket.mark_ack_queued();
+
+        for (sequence, payload) in [(107, b"ghi".as_slice()), (104, b"def".as_slice())] {
+            let _ = socket.on_segment(
+                TcpPacket {
+                    source_port: 80,
+                    destination_port: 49152,
+                    sequence,
+                    acknowledgement: 8,
+                    flags: TcpFlags::ACK,
+                    window_size: u16::MAX,
+                    options: TcpOptions::empty(),
+                    payload,
+                },
+                TCP_INITIAL_RTO_NANOS + u64::from(sequence),
+            );
+        }
+        assert_eq!(socket.receive(16), None);
+
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: b"abc",
+            },
+            TCP_INITIAL_RTO_NANOS + 3,
+        );
+
+        assert_eq!(socket.receive(16).as_deref(), Some(b"abcdefghi".as_slice()));
     }
 
     #[test]
