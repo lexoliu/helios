@@ -592,6 +592,42 @@ def render_helios_kernel_flamegraphs(helios_jsonl: Path | None) -> list[Path]:
     return outputs
 
 
+def folded_profile_top_rows(profile_path: Path, limit: int) -> list[dict]:
+    rows = []
+    total = 0
+    with profile_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            stack, raw_value = line.rsplit(" ", 1)
+            value = int(raw_value)
+            total += value
+            rows.append({"stack": stack, "nanos": value})
+    if total == 0:
+        return []
+    rows.sort(key=lambda row: row["nanos"], reverse=True)
+    return [
+        {
+            "stack": row["stack"],
+            "nanos": row["nanos"],
+            "percent": row["nanos"] * 100.0 / total,
+            "source": profile_path,
+        }
+        for row in rows[:limit]
+    ]
+
+
+def helios_kernel_profile_top_rows(helios_jsonl: Path | None, limit: int = 12) -> list[dict]:
+    if helios_jsonl is None:
+        return []
+    rows = []
+    for profile_path in sorted(helios_jsonl.parent.glob("helios*.kernel.folded")):
+        rows.extend(folded_profile_top_rows(profile_path, limit))
+    rows.sort(key=lambda row: row["nanos"], reverse=True)
+    return rows[:limit]
+
+
 def parse_perf_metrics(paths: list[Path]) -> list[dict]:
     samples = []
     for path in paths:
@@ -751,6 +787,7 @@ def write_summary_json(
     host_load: dict,
     network_perf: list[dict],
     helios_kernel_flamegraphs: list[Path],
+    helios_kernel_profile_top: list[dict],
 ) -> None:
     payload = {
         "schema_version": 1,
@@ -779,6 +816,15 @@ def write_summary_json(
             for row in network_perf[:16]
         ],
         "helios_kernel_flamegraphs": [str(path) for path in helios_kernel_flamegraphs],
+        "helios_kernel_profile_top": [
+            {
+                "stack": row["stack"],
+                "total_nanos": row["nanos"],
+                "percent": row["percent"],
+                "source": str(row["source"]),
+            }
+            for row in helios_kernel_profile_top
+        ],
     }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -964,6 +1010,7 @@ def write_report(
     rows = comparison_rows(workloads, helios, linux)
     perf_metric_paths = helios_perf_metric_paths(helios_jsonl)
     helios_kernel_flamegraphs = render_helios_kernel_flamegraphs(helios_jsonl)
+    helios_kernel_profile_top = helios_kernel_profile_top_rows(helios_jsonl)
     svg_path = path.with_name("helios-vs-linux.svg")
     write_svg(svg_path, rows)
     throughput_svg_path = path.with_name("network-throughput.svg")
@@ -980,6 +1027,7 @@ def write_report(
         host_load,
         network_perf,
         helios_kernel_flamegraphs,
+        helios_kernel_profile_top,
     )
     lines = [
         "# Helios vs Native Linux Benchmark",
@@ -1057,6 +1105,20 @@ def write_report(
         for flamegraph_path in helios_kernel_flamegraphs:
             lines.append(f"![{flamegraph_path.name}]({flamegraph_path.name})")
             lines.append("")
+    if helios_kernel_profile_top:
+        lines.extend(
+            [
+                "## Helios Kernel Profile Top Stacks",
+                "",
+                "| Stack | Total time | Share | Source |",
+                "| --- | ---: | ---: | --- |",
+            ]
+        )
+        for row in helios_kernel_profile_top:
+            lines.append(
+                f"| `{row['stack']}` | {row['nanos']} ns | {row['percent']:.2f}% | `{row['source']}` |"
+            )
+        lines.append("")
 
     for workload_class, title in [("cpu-bound", "CPU-Bound"), ("io-bound", "IO-Bound")]:
         class_workloads = [workload for workload in workloads if workload["class"] == workload_class]
