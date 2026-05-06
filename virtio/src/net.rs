@@ -35,14 +35,18 @@ struct NetRxState<T: VirtioTransport> {
     rx_queue: VirtQueue<T>,
     rx_buffers: Box<[u8]>,
     rx_buffer_len: usize,
-    rx_in_device: Box<[bool]>,
+    rx_in_device: DescriptorBitSet,
 }
 
 struct NetTxState<T: VirtioTransport> {
     tx_queue: VirtQueue<T>,
     tx_buffers: Box<[u8]>,
     tx_buffer_len: usize,
-    tx_in_flight: Box<[bool]>,
+    tx_in_flight: DescriptorBitSet,
+}
+
+struct DescriptorBitSet {
+    words: Box<[usize]>,
 }
 
 pub struct VirtioNetDevice<T: VirtioTransport> {
@@ -150,7 +154,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 .ok_or(IoError::DeviceFault)?
         ]
         .into_boxed_slice();
-        let mut rx_in_device = vec![false; rx_buffer_count].into_boxed_slice();
+        let mut rx_in_device = DescriptorBitSet::new(rx_buffer_count);
         for _ in 0..usize::from(rx_queue_size) {
             let token = rx_queue.next_free_descriptor();
             let token_index = usize::from(token);
@@ -169,10 +173,10 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 "virtio net RX descriptor allocation moved while buffer was prepared"
             );
             assert!(
-                !rx_in_device[token_index],
+                !rx_in_device.get(token_index),
                 "virtio net RX token was allocated twice during initialization"
             );
-            rx_in_device[token_index] = true;
+            rx_in_device.set(token_index);
         }
         let tx_buffer_count = usize::from(tx_queue_size);
         let tx_buffers = vec![
@@ -182,7 +186,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 .ok_or(IoError::DeviceFault)?
         ]
         .into_boxed_slice();
-        let tx_in_flight = vec![false; tx_buffer_count].into_boxed_slice();
+        let tx_in_flight = DescriptorBitSet::new(tx_buffer_count);
 
         transport.set_status(
             DeviceStatus::ACKNOWLEDGE
@@ -357,7 +361,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                     let token = tx_queue.next_free_descriptor();
                     let token_index = usize::from(token);
                     assert!(
-                        !tx_in_flight[token_index],
+                        !tx_in_flight.get(token_index),
                         "virtio net TX descriptor {token} is still in flight"
                     );
                     let payload_len = write_tx_payload(
@@ -373,7 +377,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                         submitted_token, token,
                         "virtio net TX descriptor allocation moved while payload was prepared"
                     );
-                    tx_in_flight[token_index] = true;
+                    tx_in_flight.set(token_index);
                     submitted_tokens[submitted] = token;
                     submitted += 1;
                     next_frame += 1;
@@ -412,7 +416,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     fn repost_rx_buffer(state: &mut NetRxState<T>, transport: &T, token: u16) -> IoResult<()> {
         let token_index = usize::from(token);
         assert!(
-            !state.rx_in_device[token_index],
+            !state.rx_in_device.get(token_index),
             "virtio net RX buffer was reposted while still owned by the device"
         );
         let submitted_token = state.rx_queue.submit(
@@ -429,17 +433,17 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             submitted_token, token,
             "virtio net RX descriptor allocation moved while buffer was reposted"
         );
-        state.rx_in_device[token_index] = true;
+        state.rx_in_device.set(token_index);
         Ok(())
     }
 
     fn mark_rx_completed(state: &mut NetRxState<T>, token: u16) {
         let token_index = usize::from(token);
         assert!(
-            state.rx_in_device[token_index],
+            state.rx_in_device.get(token_index),
             "virtio net RX completion referenced an idle token {token}"
         );
-        state.rx_in_device[token_index] = false;
+        state.rx_in_device.clear(token_index);
     }
 
     fn drain_tx_completions(state: &mut NetTxState<T>, budget: usize) -> usize {
@@ -450,13 +454,47 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             };
             let token_index = usize::from(token);
             assert!(
-                state.tx_in_flight[token_index],
+                state.tx_in_flight.get(token_index),
                 "virtio net TX completion referenced idle descriptor {token}"
             );
-            state.tx_in_flight[token_index] = false;
+            state.tx_in_flight.clear(token_index);
             completed += 1;
         }
         completed
+    }
+}
+
+impl DescriptorBitSet {
+    fn new(bits: usize) -> Self {
+        let words = bits.div_ceil(usize::BITS as usize);
+        Self {
+            words: vec![0; words].into_boxed_slice(),
+        }
+    }
+
+    fn get(&self, bit: usize) -> bool {
+        let (word, mask) = self.word_mask(bit);
+        self.words[word] & mask != 0
+    }
+
+    fn set(&mut self, bit: usize) {
+        let (word, mask) = self.word_mask(bit);
+        self.words[word] |= mask;
+    }
+
+    fn clear(&mut self, bit: usize) {
+        let (word, mask) = self.word_mask(bit);
+        self.words[word] &= !mask;
+    }
+
+    fn word_mask(&self, bit: usize) -> (usize, usize) {
+        let word = bit / usize::BITS as usize;
+        let shift = bit % usize::BITS as usize;
+        assert!(
+            word < self.words.len(),
+            "virtio descriptor bit {bit} is outside bitset"
+        );
+        (word, 1usize << shift)
     }
 }
 
@@ -537,4 +575,28 @@ fn write_tx_payload(buffer: &mut [u8], header_len: usize, frame: &[u8]) -> IoRes
     buffer[..header_len].copy_from_slice(as_bytes(&header));
     buffer[header_len..payload_len].copy_from_slice(frame);
     Ok(payload_len)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DescriptorBitSet;
+
+    #[test]
+    fn descriptor_bitset_tracks_sparse_tokens() {
+        let mut bits = DescriptorBitSet::new(130);
+
+        bits.set(0);
+        bits.set(65);
+        bits.set(129);
+
+        assert!(bits.get(0));
+        assert!(bits.get(65));
+        assert!(bits.get(129));
+        assert!(!bits.get(64));
+
+        bits.clear(65);
+        assert!(bits.get(0));
+        assert!(!bits.get(65));
+        assert!(bits.get(129));
+    }
 }
