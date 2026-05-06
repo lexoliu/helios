@@ -10,20 +10,20 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use helios_hal::cpu::ProcessorId;
 use helios_hal::pmm::PhysFrame;
-use spin::{Mutex, Once};
+use spin::Once;
 
 const SLAB_RETAIN_DIVISOR: usize = 64;
 
 struct FreeFrame {
-    next: Option<NonNull<FreeFrame>>,
+    next: *mut FreeFrame,
 }
 
 struct FrameSlabShard {
-    head: Mutex<Option<NonNull<FreeFrame>>>,
+    head: AtomicPtr<FreeFrame>,
 }
 
 pub(crate) struct FrameSlabCache {
@@ -40,30 +40,47 @@ unsafe impl Sync for FrameSlabCache {}
 impl FrameSlabShard {
     const fn new() -> Self {
         Self {
-            head: Mutex::new(None),
+            head: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
 
     fn allocate(&self) -> Option<NonNull<u8>> {
-        let mut head = self.head.lock();
-        let frame = head.take()?;
-        let next = unsafe { frame.as_ref().next };
-        *head = next;
-        Some(frame.cast())
+        let mut head = self.head.load(Ordering::Acquire);
+        loop {
+            let frame = NonNull::new(head)?;
+            let next = unsafe { frame.as_ref().next };
+            match self
+                .head
+                .compare_exchange_weak(head, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Some(frame.cast()),
+                Err(observed) => head = observed,
+            }
+        }
     }
 
     fn deallocate(&self, frame: NonNull<u8>) {
-        let mut head = self.head.lock();
         let mut frame = frame.cast::<FreeFrame>();
-        unsafe {
-            frame.as_mut().next = *head;
+        let mut head = self.head.load(Ordering::Acquire);
+        loop {
+            unsafe {
+                frame.as_mut().next = head;
+            }
+            match self.head.compare_exchange_weak(
+                head,
+                frame.as_ptr(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => head = observed,
+            }
         }
-        *head = Some(frame);
     }
 
     fn drain(&self, cached_frames: &AtomicUsize, mut release: impl FnMut(NonNull<u8>)) {
-        let mut head = self.head.lock().take();
-        while let Some(frame) = head {
+        let mut head = self.head.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        while let Some(frame) = NonNull::new(head) {
             let next = unsafe { frame.as_ref().next };
             head = next;
             cached_frames.fetch_sub(1, Ordering::AcqRel);
