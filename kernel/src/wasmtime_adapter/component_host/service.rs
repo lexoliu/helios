@@ -63,6 +63,7 @@ const WASIX_STREAM_SECURITY_DOUBLE_ENCRYPTION: u8 = 1 << 3;
 const DEFAULT_WASIX_EXEC_SEARCH_PATHS: &[&str] = &["/usr/local/bin", "/bin", "/usr/bin"];
 type Preview1Iovs = SmallVec<[(u32, u32); 8]>;
 type Preview1IovRanges = SmallVec<[(usize, usize); 8]>;
+type CompilerThreadTasks = SmallVec<[crate::JoinHandle<()>; 8]>;
 const WASIX_PROC_SPAWN_FD_OP_SIZE: u32 = 56;
 const WASIX_PROC_SPAWN_FD_OP_CMD_OFFSET: u32 = 0;
 const WASIX_PROC_SPAWN_FD_OP_FD_OFFSET: u32 = 4;
@@ -2097,7 +2098,14 @@ where
                 .compiler_plugin
                 .lock()
                 .as_ref()
-                .map(|plugin| core::mem::take(&mut *plugin.shared.thread_tasks.lock()))
+                .map(|plugin| {
+                    plugin
+                        .shared
+                        .thread_tasks
+                        .lock()
+                        .drain(..)
+                        .collect::<CompilerThreadTasks>()
+                })
                 .unwrap_or_default();
             if tasks.is_empty() {
                 break;
