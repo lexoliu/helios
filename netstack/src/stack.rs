@@ -233,7 +233,11 @@ pub enum StackEvent {
 pub enum OutboundBatchStatus {
     Empty,
     Deferred,
-    Submitted { offered: usize, accepted: usize },
+    Submitted {
+        offered: usize,
+        accepted: usize,
+        accepted_bytes: usize,
+    },
 }
 
 struct TcpSocketSlab<C>
@@ -703,14 +707,20 @@ impl OutboundFrameQueue {
         );
         drop(frames);
 
+        let mut accepted_bytes = 0usize;
         for _ in 0..accepted {
             let slot = self
                 .ready
                 .pop_front()
                 .expect("outbound ready queue lost submitted frame");
+            accepted_bytes = accepted_bytes.saturating_add(self.frames[slot].as_slice().len());
             self.release(slot);
         }
-        Ok(OutboundBatchStatus::Submitted { offered, accepted })
+        Ok(OutboundBatchStatus::Submitted {
+            offered,
+            accepted,
+            accepted_bytes,
+        })
     }
 }
 
@@ -2210,7 +2220,8 @@ mod tests {
             status,
             OutboundBatchStatus::Submitted {
                 offered: 3,
-                accepted: 2
+                accepted: 2,
+                accepted_bytes: b"first".len() + b"second".len()
             }
         );
         assert_eq!(

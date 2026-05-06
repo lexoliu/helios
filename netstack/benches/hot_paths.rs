@@ -82,7 +82,8 @@ fn udp_queue_and_immediate_submit(bencher: Bencher) {
             status,
             OutboundBatchStatus::Submitted {
                 offered: 1,
-                accepted: 1
+                accepted: 1,
+                accepted_bytes: _
             }
         );
     });

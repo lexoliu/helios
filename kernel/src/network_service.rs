@@ -1202,6 +1202,7 @@ where
         }
 
         let mut received = 0usize;
+        let mut received_bytes = 0usize;
         let receive_started = self.profile_start();
         let stack_rx_budget = {
             let state = self.inner.state.lock().await;
@@ -1237,12 +1238,15 @@ where
             {
                 let mut state = self.inner.state.lock().await;
                 for frame in &frames {
+                    let frame = frame.as_ref();
+                    let frame_len = frame.len();
                     match state
                         .stack
-                        .receive_frame_with_backpressure(frame.as_ref(), received_at)
+                        .receive_frame_with_backpressure(frame, received_at)
                     {
                         Ok(backpressured) => {
                             received += 1;
+                            received_bytes = received_bytes.saturating_add(frame_len);
                             if backpressured {
                                 receive_backpressured = true;
                                 break;
@@ -1255,6 +1259,7 @@ where
                         Err(error) => {
                             tracing::debug!(?error, "dropped malformed network frame");
                             received += 1;
+                            received_bytes = received_bytes.saturating_add(frame_len);
                         }
                     }
                 }
@@ -1268,7 +1273,12 @@ where
                 break;
             }
         }
-        self.record_network_profile_events("rx-drain", receive_started, received);
+        self.record_network_profile_events_bytes(
+            "rx-drain",
+            receive_started,
+            received,
+            received_bytes,
+        );
 
         let tcp_started = self.profile_start();
         {
@@ -1281,6 +1291,7 @@ where
         self.record_network_profile("tcp-drive", tcp_started);
 
         let mut transmitted = 0usize;
+        let mut transmitted_bytes = 0usize;
         let transmit_started = self.profile_start();
         let mut transmit_stop = NetworkTransmitStop::Drained;
         while transmitted < budget.tx_frames {
@@ -1295,8 +1306,13 @@ where
             match immediate {
                 OutboundBatchStatus::Empty => break,
                 OutboundBatchStatus::Deferred => {}
-                OutboundBatchStatus::Submitted { offered, accepted } => {
+                OutboundBatchStatus::Submitted {
+                    offered,
+                    accepted,
+                    accepted_bytes,
+                } => {
                     transmitted += accepted;
+                    transmitted_bytes = transmitted_bytes.saturating_add(accepted_bytes);
                     if accepted < offered {
                         transmit_stop = NetworkTransmitStop::RingFull;
                         break;
@@ -1321,6 +1337,13 @@ where
             }
             let submitted = self.inner.device.try_transmit_packet_batch(&frames).await?;
             transmitted += submitted;
+            transmitted_bytes = transmitted_bytes.saturating_add(
+                frames
+                    .iter()
+                    .take(submitted)
+                    .map(|frame| frame.as_ref().len())
+                    .sum::<usize>(),
+            );
             if submitted < frames.len() {
                 transmit_stop = NetworkTransmitStop::RingFull;
                 let mut state = self.inner.state.lock().await;
@@ -1337,10 +1360,11 @@ where
             transmit_stop = NetworkTransmitStop::Budget;
         }
         if transmitted != 0 {
-            self.record_network_profile_events(
+            self.record_network_profile_events_bytes(
                 transmit_stop.profile_phase(),
                 transmit_started,
                 transmitted,
+                transmitted_bytes,
             );
         }
         let progress = NetworkPollProgress {
@@ -1433,6 +1457,16 @@ where
         start: Option<NetworkPerfStart>,
         events: usize,
     ) {
+        self.record_network_profile_events_bytes(phase, start, events, 0);
+    }
+
+    fn record_network_profile_events_bytes(
+        &self,
+        phase: &'static str,
+        start: Option<NetworkPerfStart>,
+        events: usize,
+        bytes: usize,
+    ) {
         if let Some(start) = start {
             let now_nanos = self.now_nanos();
             let counters = self
@@ -1456,7 +1490,7 @@ where
                     usize_to_u64(events, "network profile event count"),
                     elapsed_nanos,
                     counters,
-                    0,
+                    usize_to_u64(bytes, "network profile byte count"),
                 );
         }
     }
