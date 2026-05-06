@@ -13,15 +13,15 @@
 extern crate alloc;
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::task::{Context, Poll, Waker};
 
 use bytes::Bytes;
-use heapless::Deque;
+use heapless::{Deque, Vec as HeapVec};
 use spin::Mutex;
 use triomphe::Arc;
 
-use crate::{Notify, NotifyWaiter};
-
 const BYTE_CHANNEL_CHUNK_CAPACITY: usize = 256;
+const BYTE_CHANNEL_WAKER_CAPACITY: usize = 8;
 
 /// A single byte-stream channel, closable from both ends. Producers push
 /// reference-counted byte chunks; consumers await and receive the same chunks
@@ -29,7 +29,7 @@ const BYTE_CHANNEL_CHUNK_CAPACITY: usize = 256;
 struct ByteChannel {
     queue: ByteQueue,
     /// Notifies consumers when new bytes or a close event are available.
-    readable: Notify,
+    readable: ByteSignal,
     /// Set to `true` once every `ByteWriter` cloneable handle has been
     /// dropped, signalling EOF to the reader.
     writer_closed: AtomicBool,
@@ -44,7 +44,7 @@ impl ByteChannel {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             queue: ByteQueue::new(),
-            readable: Notify::new(),
+            readable: ByteSignal::new(),
             writer_closed: AtomicBool::new(false),
             reader_closed: AtomicBool::new(false),
             writer_handles: AtomicUsize::new(1),
@@ -110,6 +110,93 @@ impl ByteQueue {
     }
 }
 
+struct ByteSignal {
+    permits: AtomicUsize,
+    wakers: Mutex<HeapVec<Waker, BYTE_CHANNEL_WAKER_CAPACITY>>,
+}
+
+impl ByteSignal {
+    const fn new() -> Self {
+        Self {
+            permits: AtomicUsize::new(0),
+            wakers: Mutex::new(HeapVec::new()),
+        }
+    }
+
+    fn notify_one(&self) {
+        self.permits.fetch_add(1, Ordering::AcqRel);
+        let waker = self.wakers.lock().pop();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn poll_notified(&self, cx: &mut Context<'_>, wait: &mut ByteReadWait) -> Poll<()> {
+        if self.try_claim_permit() {
+            self.remove_registered_waker(wait);
+            return Poll::Ready(());
+        }
+        self.register_waker(wait, cx.waker());
+        if self.try_claim_permit() {
+            self.remove_registered_waker(wait);
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn register_waker(&self, wait: &mut ByteReadWait, waker: &Waker) {
+        let new_waker = waker.clone();
+        let mut wakers = self.wakers.lock();
+        if let Some(registered) = wait.registered.as_ref() {
+            if let Some(stored) = wakers
+                .iter_mut()
+                .find(|stored| stored.will_wake(registered))
+            {
+                *stored = new_waker.clone();
+                wait.registered = Some(new_waker);
+                return;
+            }
+        }
+        wait.registered = None;
+        wakers.push(new_waker.clone()).unwrap_or_else(|_| {
+            panic!("byte channel waiter capacity {BYTE_CHANNEL_WAKER_CAPACITY} exhausted")
+        });
+        wait.registered = Some(new_waker);
+    }
+
+    fn remove_registered_waker(&self, wait: &mut ByteReadWait) {
+        if let Some(waker) = wait.registered.take() {
+            self.remove_waker(&waker);
+        }
+    }
+
+    fn remove_waker(&self, waker: &Waker) {
+        let mut wakers = self.wakers.lock();
+        if let Some(index) = wakers.iter().position(|stored| stored.will_wake(waker)) {
+            wakers.swap_remove(index);
+        }
+    }
+
+    fn try_claim_permit(&self) -> bool {
+        let mut permits = self.permits.load(Ordering::Acquire);
+        loop {
+            if permits == 0 {
+                return false;
+            }
+            match self.permits.compare_exchange_weak(
+                permits,
+                permits - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(next) => permits = next,
+            }
+        }
+    }
+}
+
 /// Producer half of a byte stream. Writers can be cloned — the channel
 /// stays open as long as any cloned writer is alive; it closes once they
 /// are all dropped.
@@ -125,7 +212,16 @@ pub struct ByteReader {
 }
 
 pub struct ByteReadWait {
-    readable: NotifyWaiter,
+    channel: Arc<ByteChannel>,
+    registered: Option<Waker>,
+}
+
+impl Drop for ByteReadWait {
+    fn drop(&mut self) {
+        if let Some(waker) = self.registered.take() {
+            self.channel.readable.remove_waker(&waker);
+        }
+    }
 }
 
 pub fn byte_channel() -> (ByteWriter, ByteReader) {
@@ -226,7 +322,8 @@ impl ByteWriter {
 impl ByteReader {
     pub fn wait_state(&self) -> ByteReadWait {
         ByteReadWait {
-            readable: self.channel.readable.waiter(),
+            channel: self.channel.clone(),
+            registered: None,
         }
     }
 
@@ -239,13 +336,13 @@ impl ByteReader {
     pub fn poll_readable(
         &self,
         cx: &mut core::task::Context<'_>,
-        wait: &mut ByteReadWait,
+        _wait: &mut ByteReadWait,
     ) -> core::task::Poll<()> {
         loop {
             if self.is_readable() {
                 return core::task::Poll::Ready(());
             }
-            match self.channel.readable.poll_notified(cx, &mut wait.readable) {
+            match self.channel.readable.poll_notified(cx, _wait) {
                 core::task::Poll::Ready(()) => continue,
                 core::task::Poll::Pending => return core::task::Poll::Pending,
             }
@@ -255,6 +352,7 @@ impl ByteReader {
     /// Await the next chunk. Returns `None` when every writer has been
     /// dropped and the queue is drained (EOF).
     pub async fn read(&self) -> Option<Bytes> {
+        let mut wait = None;
         loop {
             match self.channel.queue.pop() {
                 Some(bytes) => return Some(bytes),
@@ -266,7 +364,8 @@ impl ByteReader {
                         // before the last liveness guard dropped.
                         return self.channel.queue.pop();
                     }
-                    self.channel.readable.notified().await;
+                    let wait = wait.get_or_insert_with(|| self.wait_state());
+                    core::future::poll_fn(|cx| self.channel.readable.poll_notified(cx, wait)).await;
                 }
             }
         }
@@ -292,7 +391,7 @@ impl ByteReader {
     pub fn poll_read(
         &self,
         cx: &mut core::task::Context<'_>,
-        wait: &mut ByteReadWait,
+        _wait: &mut ByteReadWait,
     ) -> core::task::Poll<Option<Bytes>> {
         loop {
             match self.channel.queue.pop() {
@@ -303,7 +402,7 @@ impl ByteReader {
                     {
                         return core::task::Poll::Ready(self.channel.queue.pop());
                     }
-                    match self.channel.readable.poll_notified(cx, &mut wait.readable) {
+                    match self.channel.readable.poll_notified(cx, _wait) {
                         core::task::Poll::Ready(()) => continue,
                         core::task::Poll::Pending => return core::task::Poll::Pending,
                     }
