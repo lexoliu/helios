@@ -416,10 +416,16 @@ pub struct TcpListener<Listener> {
     pub local_port: u16,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetworkIpAddress {
+    Ipv4(Ipv4Address),
+    Ipv6(helios_netstack::Ipv6Address),
+}
+
 #[derive(Clone, Debug)]
 pub struct TcpAccepted<Stream> {
     pub stream: Stream,
-    pub address: Ipv4Address,
+    pub address: NetworkIpAddress,
     pub port: u16,
 }
 

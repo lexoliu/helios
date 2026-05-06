@@ -164,9 +164,9 @@ pub use runtime_state::RuntimeState;
 pub use runtime_types::{
     AuthorityDomain, ComponentHostFilesystemState, ComponentNetworkService, ComponentNetworkState,
     DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry, HostFileSystem, HostFsError,
-    HostFsErrorKind, HostMetadata, Ipv4Address, NetworkErrorDetail, ObjectIdentity, PingError,
-    PingErrorKind, PingReply, TcpAccepted, TcpError, TcpErrorKind, TcpListener, UdpBinding,
-    UdpDatagram, UdpError, UdpErrorKind,
+    HostFsErrorKind, HostMetadata, Ipv4Address, NetworkErrorDetail, NetworkIpAddress,
+    ObjectIdentity, PingError, PingErrorKind, PingReply, TcpAccepted, TcpError, TcpErrorKind,
+    TcpListener, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
 };
 pub use serial_transport::{
     emit_serial_error_marker, emit_serial_stage_marker, read_serial, try_read_serial, write_serial,

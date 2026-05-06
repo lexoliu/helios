@@ -209,8 +209,8 @@ mod tests {
     use super::SocketStack;
     use crate::{
         ComponentNetworkService, DnsError, Ipv4Address, NetworkAuthorityRights, NetworkErrorDetail,
-        PingError, PingReply, ProcessAuthority, TcpAccepted, TcpError, TcpListener, UdpBinding,
-        UdpDatagram, UdpError,
+        NetworkIpAddress, PingError, PingReply, ProcessAuthority, TcpAccepted, TcpError,
+        TcpListener, UdpBinding, UdpDatagram, UdpError,
     };
 
     #[derive(Clone, Copy)]
@@ -290,7 +290,7 @@ mod tests {
         {
             core::future::ready(Ok(TcpAccepted {
                 stream: listener + 1,
-                address: Ipv4Address::new([127, 0, 0, 1]),
+                address: NetworkIpAddress::Ipv4(Ipv4Address::new([127, 0, 0, 1])),
                 port: 4040,
             }))
         }

@@ -14176,10 +14176,14 @@ where
         Ok(accepted) => accepted,
         Err(error) => return p1_errno_from_tcp_error_for_fdflags(error, fdflags),
     };
+    let peer_address = match accepted.address {
+        crate::NetworkIpAddress::Ipv4(address) => address,
+        crate::NetworkIpAddress::Ipv6(_) => return p1::errno::NOTSUP,
+    };
     let descriptor =
         Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
             stream: accepted.stream,
-            peer_address: accepted.address,
+            peer_address,
             peer_port: accepted.port,
             options: WasixSocketOptions::default(),
         }));
@@ -14201,7 +14205,7 @@ where
             caller,
             memory,
             ret_addr,
-            accepted.address,
+            peer_address,
             accepted.port,
         );
     }
@@ -15479,10 +15483,14 @@ where
         Ok(accepted) => accepted,
         Err(error) => return p1_errno_from_tcp_error_for_fdflags(error, fdflags),
     };
+    let peer_address = match accepted.address {
+        crate::NetworkIpAddress::Ipv4(address) => address,
+        crate::NetworkIpAddress::Ipv6(_) => return p1::errno::NOTSUP,
+    };
     let descriptor =
         Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
             stream: accepted.stream,
-            peer_address: accepted.address,
+            peer_address,
             peer_port: accepted.port,
             options: WasixSocketOptions::default(),
         }));

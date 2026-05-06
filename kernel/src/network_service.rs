@@ -20,8 +20,8 @@ use crate::{
     ComponentNetworkService, ComponentRuntimeState, DnsError, DnsErrorKind,
     Ipv4Address as KernelIpv4Address, Ipv4Cidr as KernelIpv4Cidr, Ipv4Route as KernelIpv4Route,
     MacAddress, NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
-    NetworkPortId, PingError, PingErrorKind, PingReply, TcpAccepted, TcpError, TcpErrorKind,
-    TcpListener, Timer, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+    NetworkIpAddress, NetworkPortId, PingError, PingErrorKind, PingReply, TcpAccepted, TcpError,
+    TcpErrorKind, TcpListener, Timer, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
 };
 use triomphe::Arc;
 
@@ -283,6 +283,13 @@ enum NetworkConfigurationError {
 
 fn map_ipv4_address(address: Ipv4Address) -> KernelIpv4Address {
     KernelIpv4Address::new(address.octets())
+}
+
+fn map_ip_address(address: IpAddress) -> NetworkIpAddress {
+    match address {
+        IpAddress::Ipv4(address) => NetworkIpAddress::Ipv4(map_ipv4_address(address)),
+        IpAddress::Ipv6(address) => NetworkIpAddress::Ipv6(address),
+    }
 }
 
 fn map_kernel_ipv4_address(address: KernelIpv4Address) -> Ipv4Address {
@@ -1882,20 +1889,15 @@ impl NetworkState {
         listener: TcpListenerId,
     ) -> Result<Option<TcpAccepted<TcpStreamId>>, TcpError> {
         let local_port = self.tcp_listener(listener)?.local_port;
-        loop {
-            let Some(accepted) = self.stack.take_tcp_accept(local_port) else {
-                return Ok(None);
-            };
-            let IpAddress::Ipv4(address) = accepted.remote.address else {
-                continue;
-            };
-            let stream = self.insert_tcp_stream(accepted.socket);
-            return Ok(Some(TcpAccepted {
-                stream,
-                address: map_ipv4_address(address),
-                port: accepted.remote.port,
-            }));
-        }
+        let Some(accepted) = self.stack.take_tcp_accept(local_port) else {
+            return Ok(None);
+        };
+        let stream = self.insert_tcp_stream(accepted.socket);
+        Ok(Some(TcpAccepted {
+            stream,
+            address: map_ip_address(accepted.remote.address),
+            port: accepted.remote.port,
+        }))
     }
 
     fn poll_tcp_connect(&mut self, stream: TcpStreamId) -> Result<TcpConnectProgress, TcpError> {

@@ -2375,27 +2375,76 @@ fn parse_p2_tcp_socket_address(
     match (family, address) {
         (WasiTcpSocketFamily::Ipv4, p2tcp::IpSocketAddress::Ipv4(address)) => {
             Ok(WasiTcpSocketAddress {
-                address: crate::Ipv4Address::new([
+                address: super::WasiTcpIpAddress::Ipv4(crate::Ipv4Address::new([
                     address.address.0,
                     address.address.1,
                     address.address.2,
                     address.address.3,
-                ]),
+                ])),
+                port: address.port,
+            })
+        }
+        (WasiTcpSocketFamily::Ipv6, p2tcp::IpSocketAddress::Ipv6(address)) => {
+            let segments = [
+                address.address.0,
+                address.address.1,
+                address.address.2,
+                address.address.3,
+                address.address.4,
+                address.address.5,
+                address.address.6,
+                address.address.7,
+            ];
+            let mut octets = [0; 16];
+            for (index, segment) in segments.into_iter().enumerate() {
+                let [high, low] = segment.to_be_bytes();
+                octets[index * 2] = high;
+                octets[index * 2 + 1] = low;
+            }
+            Ok(WasiTcpSocketAddress {
+                address: super::WasiTcpIpAddress::Ipv6(helios_netstack::Ipv6Address::new(octets)),
                 port: address.port,
             })
         }
         (WasiTcpSocketFamily::Ipv4, p2tcp::IpSocketAddress::Ipv6(_)) => {
             Err(p2tcp::ErrorCode::NotSupported)
         }
+        (WasiTcpSocketFamily::Ipv6, p2tcp::IpSocketAddress::Ipv4(_)) => {
+            Err(p2tcp::ErrorCode::NotSupported)
+        }
     }
 }
 
 fn format_p2_tcp_socket_address(address: WasiTcpSocketAddress) -> p2tcp::IpSocketAddress {
-    let [a, b, c, d] = address.address.octets();
-    p2tcp::IpSocketAddress::Ipv4(p2net::Ipv4SocketAddress {
-        port: address.port,
-        address: (a, b, c, d),
-    })
+    match address.address {
+        super::WasiTcpIpAddress::Ipv4(ip) => {
+            let [a, b, c, d] = ip.octets();
+            p2tcp::IpSocketAddress::Ipv4(p2net::Ipv4SocketAddress {
+                port: address.port,
+                address: (a, b, c, d),
+            })
+        }
+        super::WasiTcpIpAddress::Ipv6(ip) => {
+            let octets = ip.octets();
+            let segment =
+                |index: usize| u16::from_be_bytes([octets[index * 2], octets[index * 2 + 1]]);
+            p2tcp::IpSocketAddress::Ipv6(p2net::Ipv6SocketAddress {
+                port: address.port,
+                flow_info: 0,
+                address: (
+                    segment(0),
+                    segment(1),
+                    segment(2),
+                    segment(3),
+                    segment(4),
+                    segment(5),
+                    segment(6),
+                    segment(7),
+                ),
+                scope_id: 0,
+            })
+        }
+    }
 }
 
 fn map_p2_tcp_family(
@@ -2403,13 +2452,14 @@ fn map_p2_tcp_family(
 ) -> core::result::Result<WasiTcpSocketFamily, p2tcp_create::ErrorCode> {
     match family {
         p2tcp_create::IpAddressFamily::Ipv4 => Ok(WasiTcpSocketFamily::Ipv4),
-        p2tcp_create::IpAddressFamily::Ipv6 => Err(p2tcp_create::ErrorCode::NotSupported),
+        p2tcp_create::IpAddressFamily::Ipv6 => Ok(WasiTcpSocketFamily::Ipv6),
     }
 }
 
 fn format_p2_tcp_family(family: WasiTcpSocketFamily) -> p2tcp::IpAddressFamily {
     match family {
         WasiTcpSocketFamily::Ipv4 => p2tcp::IpAddressFamily::Ipv4,
+        WasiTcpSocketFamily::Ipv6 => p2tcp::IpAddressFamily::Ipv6,
     }
 }
 
@@ -2635,12 +2685,10 @@ where
         let profile_runtime_state = self.runtime_state.clone();
         self.spawner().spawn_detached(async move {
             let started = profile_cpu.now().ticks();
-            let mut host_buffer = [0; 15];
+            let mut host_buffer = [0; 39];
             let result = service
                 .tcp_connect(
-                    remote_address
-                        .address
-                        .write_dotted_decimal(&mut host_buffer),
+                    remote_address.address.write_host(&mut host_buffer),
                     remote_address.port,
                     u64::MAX,
                 )
@@ -2727,6 +2775,9 @@ where
             {
                 return Ok(Err(p2tcp::ErrorCode::InvalidState));
             }
+            if state.family == WasiTcpSocketFamily::Ipv6 {
+                return Ok(Err(p2tcp::ErrorCode::NotSupported));
+            }
             let local_port = state.local_address.map_or(0, |address| address.port);
             if !has_wasi_network_rights(self.process_authority(), wasi_tcp_bind_rights(local_port))
             {
@@ -2768,8 +2819,9 @@ where
             Err(error) => return Ok(Err(map_p2_tcp_core_error(error))),
         };
         state.listener = Some(listener.listener);
+        let family = state.family;
         state.local_address.get_or_insert(WasiTcpSocketAddress {
-            address: crate::Ipv4Address::new([0, 0, 0, 0]),
+            address: family.unspecified_address(),
             port: listener.local_port,
         });
         Ok(Ok(()))
@@ -2802,13 +2854,26 @@ where
                         detail: crate::ProgramExecErrorDetail::InternalInvariant,
                     }));
                 };
+                let remote_address = match accepted.address {
+                    crate::NetworkIpAddress::Ipv4(address) => {
+                        super::WasiTcpIpAddress::Ipv4(address)
+                    }
+                    crate::NetworkIpAddress::Ipv6(address) => {
+                        super::WasiTcpIpAddress::Ipv6(address)
+                    }
+                };
+                assert_eq!(
+                    remote_address.family(),
+                    state.family,
+                    "tcp accept returned a peer address for the wrong socket family"
+                );
                 let accepted_socket = TcpSocket::accepted(
                     state.service.clone(),
                     state.family,
                     accepted.stream,
                     local_address,
                     WasiTcpSocketAddress {
-                        address: accepted.address,
+                        address: remote_address,
                         port: accepted.port,
                     },
                 );
@@ -3399,8 +3464,9 @@ mod tests {
 
     use super::{
         PREVIEW2_WIT_PACKAGES, WasiTcpSocketFamily, WasiUdpSocketError, WasiUdpSocketFamily,
-        map_p2_tcp_core_error, map_p2_tcp_socket_error, p2net, p2tcp, p2udp,
-        parse_p2_tcp_socket_address, parse_p2_udp_socket_address,
+        format_p2_tcp_socket_address, map_p2_tcp_core_error, map_p2_tcp_family,
+        map_p2_tcp_socket_error, p2net, p2tcp, p2tcp_create, p2udp, parse_p2_tcp_socket_address,
+        parse_p2_udp_socket_address,
     };
 
     #[test]
@@ -3442,7 +3508,12 @@ mod tests {
     }
 
     #[test]
-    fn p2_tcp_ipv4_socket_rejects_ipv6_addresses() {
+    fn p2_tcp_ipv6_addresses_roundtrip_while_family_mismatches_fail() {
+        assert_eq!(
+            map_p2_tcp_family(p2tcp_create::IpAddressFamily::Ipv6)
+                .expect("IPv6 TCP family must be supported"),
+            WasiTcpSocketFamily::Ipv6
+        );
         let ipv4 = parse_p2_tcp_socket_address(
             p2tcp::IpSocketAddress::Ipv4(p2net::Ipv4SocketAddress {
                 port: 80,
@@ -3464,6 +3535,31 @@ mod tests {
         )
         .expect_err("IPv6 address must not be accepted by IPv4 socket");
         assert_eq!(ipv6, p2tcp::ErrorCode::NotSupported);
+
+        let ipv6_address = p2tcp::IpSocketAddress::Ipv6(p2net::Ipv6SocketAddress {
+            port: 443,
+            flow_info: 0,
+            address: (0x2001, 0x0db8, 0, 0, 0, 0, 0, 1),
+            scope_id: 0,
+        });
+        let parsed = parse_p2_tcp_socket_address(ipv6_address, WasiTcpSocketFamily::Ipv6)
+            .expect("IPv6 address should parse for IPv6 socket");
+        match format_p2_tcp_socket_address(parsed) {
+            p2tcp::IpSocketAddress::Ipv6(address) => {
+                assert_eq!(address.port, 443);
+                assert_eq!(address.address, (0x2001, 0x0db8, 0, 0, 0, 0, 0, 1));
+            }
+            p2tcp::IpSocketAddress::Ipv4(_) => panic!("IPv6 TCP address formatted as IPv4"),
+        }
+        let mismatched_ipv4 = parse_p2_tcp_socket_address(
+            p2tcp::IpSocketAddress::Ipv4(p2net::Ipv4SocketAddress {
+                port: 80,
+                address: (127, 0, 0, 1),
+            }),
+            WasiTcpSocketFamily::Ipv6,
+        )
+        .expect_err("IPv4 address must not be accepted by IPv6 socket");
+        assert_eq!(mismatched_ipv4, p2tcp::ErrorCode::NotSupported);
     }
 
     #[test]

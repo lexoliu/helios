@@ -18,6 +18,7 @@ use bytes::{Bytes, BytesMut};
 use futures::channel::oneshot;
 use hashbrown::HashMap;
 use helios_hal::cpu::Cpu;
+use helios_netstack::Ipv6Address;
 use spin::Mutex;
 use thiserror::Error;
 use wasmtime::component::{
@@ -472,12 +473,82 @@ struct P3TcpListenStreamError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WasiTcpSocketFamily {
     Ipv4,
+    Ipv6,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WasiTcpIpAddress {
+    Ipv4(crate::Ipv4Address),
+    Ipv6(Ipv6Address),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WasiTcpSocketAddress {
-    address: crate::Ipv4Address,
+    address: WasiTcpIpAddress,
     port: u16,
+}
+
+impl WasiTcpSocketFamily {
+    const fn unspecified_address(self) -> WasiTcpIpAddress {
+        match self {
+            Self::Ipv4 => WasiTcpIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0])),
+            Self::Ipv6 => WasiTcpIpAddress::Ipv6(Ipv6Address::UNSPECIFIED),
+        }
+    }
+}
+
+impl WasiTcpIpAddress {
+    const fn family(self) -> WasiTcpSocketFamily {
+        match self {
+            Self::Ipv4(_) => WasiTcpSocketFamily::Ipv4,
+            Self::Ipv6(_) => WasiTcpSocketFamily::Ipv6,
+        }
+    }
+
+    fn write_host<'a>(self, buffer: &'a mut [u8; 39]) -> &'a str {
+        match self {
+            Self::Ipv4(address) => {
+                let mut ipv4_buffer = [0; 15];
+                let host = address.write_dotted_decimal(&mut ipv4_buffer);
+                buffer[..host.len()].copy_from_slice(host.as_bytes());
+                core::str::from_utf8(&buffer[..host.len()])
+                    .expect("IPv4 dotted decimal writer must emit ASCII")
+            }
+            Self::Ipv6(address) => write_ipv6_full(address, buffer),
+        }
+    }
+}
+
+fn write_ipv6_full<'a>(address: Ipv6Address, buffer: &'a mut [u8; 39]) -> &'a str {
+    let octets = address.octets();
+    let mut cursor = 0;
+    for (index, chunk) in octets.chunks_exact(2).enumerate() {
+        if index != 0 {
+            buffer[cursor] = b':';
+            cursor += 1;
+        }
+        let segment = u16::from_be_bytes([chunk[0], chunk[1]]);
+        cursor += write_hex_u16(segment, &mut buffer[cursor..]);
+    }
+    core::str::from_utf8(&buffer[..cursor]).expect("IPv6 formatter must emit ASCII")
+}
+
+fn write_hex_u16(value: u16, buffer: &mut [u8]) -> usize {
+    let mut started = false;
+    let mut cursor = 0;
+    for shift in [12, 8, 4, 0] {
+        let digit = ((value >> shift) & 0x0f) as u8;
+        if digit != 0 || started || shift == 0 {
+            buffer[cursor] = if digit < 10 {
+                b'0' + digit
+            } else {
+                b'a' + (digit - 10)
+            };
+            cursor += 1;
+            started = true;
+        }
+    }
+    cursor
 }
 
 impl P2ResolveAddressStream {
@@ -605,6 +676,7 @@ impl TcpSocket {
     fn address_family(&self) -> socket_types::IpAddressFamily {
         match self.family() {
             WasiTcpSocketFamily::Ipv4 => socket_types::IpAddressFamily::Ipv4,
+            WasiTcpSocketFamily::Ipv6 => socket_types::IpAddressFamily::Ipv6,
         }
     }
 
@@ -783,12 +855,10 @@ impl TcpSocket {
             }
             state.service.clone()
         };
-        let mut host_buffer = [0; 15];
+        let mut host_buffer = [0; 39];
         let stream = service
             .tcp_connect(
-                remote_address
-                    .address
-                    .write_dotted_decimal(&mut host_buffer),
+                remote_address.address.write_host(&mut host_buffer),
                 remote_address.port,
                 u64::MAX,
             )
@@ -923,8 +993,9 @@ where
                     match result {
                         Ok(listener) => {
                             state.listener = Some(listener.listener);
+                            let family = state.family;
                             state.local_address.get_or_insert(WasiTcpSocketAddress {
-                                address: crate::Ipv4Address::new([0, 0, 0, 0]),
+                                address: family.unspecified_address(),
                                 port: listener.local_port,
                             });
                         }
@@ -952,13 +1023,26 @@ where
                                     },
                                 )));
                             };
+                            let remote_address = match accepted.address {
+                                crate::NetworkIpAddress::Ipv4(address) => {
+                                    WasiTcpIpAddress::Ipv4(address)
+                                }
+                                crate::NetworkIpAddress::Ipv6(address) => {
+                                    WasiTcpIpAddress::Ipv6(address)
+                                }
+                            };
+                            assert_eq!(
+                                remote_address.family(),
+                                state.family,
+                                "tcp accept returned a peer address for the wrong socket family"
+                            );
                             accepted_socket = Some(TcpSocket::accepted(
                                 state.service.clone(),
                                 state.family,
                                 accepted.stream,
                                 local_address,
                                 WasiTcpSocketAddress {
-                                    address: accepted.address,
+                                    address: remote_address,
                                     port: accepted.port,
                                 },
                             ));
@@ -4913,9 +4997,7 @@ where
         }
         let family = match address_family {
             socket_types::IpAddressFamily::Ipv4 => WasiTcpSocketFamily::Ipv4,
-            socket_types::IpAddressFamily::Ipv6 => {
-                return Ok(Err(socket_types::ErrorCode::NotSupported));
-            }
+            socket_types::IpAddressFamily::Ipv6 => WasiTcpSocketFamily::Ipv6,
         };
         let Some(service) = self.runtime_state.network_service() else {
             return Ok(Err(socket_types::ErrorCode::Other(None)));
@@ -5311,6 +5393,9 @@ where
             {
                 return Ok(Err(socket_types::ErrorCode::InvalidState));
             }
+            if state.family == WasiTcpSocketFamily::Ipv6 {
+                return Ok(Err(socket_types::ErrorCode::NotSupported));
+            }
             (
                 state.local_address.map_or(0, |address| address.port),
                 state.listen_backlog,
@@ -5489,27 +5574,76 @@ fn parse_p3_tcp_socket_address(
     match (family, address) {
         (WasiTcpSocketFamily::Ipv4, socket_types::IpSocketAddress::Ipv4(address)) => {
             Ok(WasiTcpSocketAddress {
-                address: crate::Ipv4Address::new([
+                address: WasiTcpIpAddress::Ipv4(crate::Ipv4Address::new([
                     address.address.0,
                     address.address.1,
                     address.address.2,
                     address.address.3,
-                ]),
+                ])),
+                port: address.port,
+            })
+        }
+        (WasiTcpSocketFamily::Ipv6, socket_types::IpSocketAddress::Ipv6(address)) => {
+            let segments = [
+                address.address.0,
+                address.address.1,
+                address.address.2,
+                address.address.3,
+                address.address.4,
+                address.address.5,
+                address.address.6,
+                address.address.7,
+            ];
+            let mut octets = [0; 16];
+            for (index, segment) in segments.into_iter().enumerate() {
+                let [high, low] = segment.to_be_bytes();
+                octets[index * 2] = high;
+                octets[index * 2 + 1] = low;
+            }
+            Ok(WasiTcpSocketAddress {
+                address: WasiTcpIpAddress::Ipv6(Ipv6Address::new(octets)),
                 port: address.port,
             })
         }
         (WasiTcpSocketFamily::Ipv4, socket_types::IpSocketAddress::Ipv6(_)) => {
             Err(socket_types::ErrorCode::NotSupported)
         }
+        (WasiTcpSocketFamily::Ipv6, socket_types::IpSocketAddress::Ipv4(_)) => {
+            Err(socket_types::ErrorCode::NotSupported)
+        }
     }
 }
 
 fn format_p3_tcp_socket_address(address: WasiTcpSocketAddress) -> socket_types::IpSocketAddress {
-    let [a, b, c, d] = address.address.octets();
-    socket_types::IpSocketAddress::Ipv4(socket_types::Ipv4SocketAddress {
-        port: address.port,
-        address: (a, b, c, d),
-    })
+    match address.address {
+        WasiTcpIpAddress::Ipv4(ip) => {
+            let [a, b, c, d] = ip.octets();
+            socket_types::IpSocketAddress::Ipv4(socket_types::Ipv4SocketAddress {
+                port: address.port,
+                address: (a, b, c, d),
+            })
+        }
+        WasiTcpIpAddress::Ipv6(ip) => {
+            let octets = ip.octets();
+            let segment =
+                |index: usize| u16::from_be_bytes([octets[index * 2], octets[index * 2 + 1]]);
+            socket_types::IpSocketAddress::Ipv6(socket_types::Ipv6SocketAddress {
+                port: address.port,
+                flow_info: 0,
+                address: (
+                    segment(0),
+                    segment(1),
+                    segment(2),
+                    segment(3),
+                    segment(4),
+                    segment(5),
+                    segment(6),
+                    segment(7),
+                ),
+                scope_id: 0,
+            })
+        }
+    }
 }
 
 fn map_p3_tcp_error(error: crate::TcpError) -> socket_types::ErrorCode {
@@ -5761,12 +5895,20 @@ mod tests {
         ComponentHostNetworkService, DEFAULT_WASI_TCP_HOP_LIMIT, DEFAULT_WASI_TCP_KEEP_ALIVE_COUNT,
         DEFAULT_WASI_TCP_KEEP_ALIVE_IDLE_NANOS, DEFAULT_WASI_TCP_KEEP_ALIVE_INTERVAL_NANOS,
         DEFAULT_WASI_TCP_LISTEN_BACKLOG, DebugFileSystem, FsDescriptor, FsNodeKind,
-        P2ResolveAddressStream, TcpSocket, WasiTcpSocketAddress, WasiTcpSocketFamily,
-        WasiUdpSocketError, WasiUdpSocketFamily, fs_types, has_wasi_network_rights, ip_name_lookup,
-        map_p3_dns_error, map_p3_tcp_error, map_p3_udp_family, map_p3_udp_socket_error,
-        parse_p3_tcp_socket_address, parse_p3_udp_socket_address, preview3, socket_types,
-        wasi_tcp_bind_rights, wasi_udp_bind_rights,
+        P2ResolveAddressStream, TcpSocket, WasiTcpIpAddress, WasiTcpSocketAddress,
+        WasiTcpSocketFamily, WasiUdpSocketError, WasiUdpSocketFamily, format_p3_tcp_socket_address,
+        fs_types, has_wasi_network_rights, ip_name_lookup, map_p3_dns_error, map_p3_tcp_error,
+        map_p3_udp_family, map_p3_udp_socket_error, parse_p3_tcp_socket_address,
+        parse_p3_udp_socket_address, preview3, socket_types, wasi_tcp_bind_rights,
+        wasi_udp_bind_rights,
     };
+
+    const fn tcp4(octets: [u8; 4], port: u16) -> WasiTcpSocketAddress {
+        WasiTcpSocketAddress {
+            address: WasiTcpIpAddress::Ipv4(crate::Ipv4Address::new(octets)),
+            port,
+        }
+    }
 
     #[derive(Clone)]
     struct TestRuntimeState;
@@ -5870,7 +6012,7 @@ mod tests {
         + '_ {
             core::future::ready(Ok(crate::TcpAccepted {
                 stream: listener + 1,
-                address: crate::Ipv4Address::new([127, 0, 0, 1]),
+                address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1])),
                 port: 4040,
             }))
         }
@@ -7317,20 +7459,38 @@ mod tests {
     }
 
     #[test]
-    fn p3_ipv4_sockets_reject_ipv6_addresses_and_families() {
+    fn p3_tcp_ipv6_addresses_roundtrip_while_family_mismatches_fail() {
         assert!(matches!(
             map_p3_udp_family(socket_types::IpAddressFamily::Ipv6),
             Err(WasiUdpSocketError::NotSupported)
         ));
+        let ipv6_socket_address =
+            socket_types::IpSocketAddress::Ipv6(socket_types::Ipv6SocketAddress {
+                port: 80,
+                flow_info: 0,
+                address: (0x2001, 0x0db8, 0, 0, 0, 0, 0, 1),
+                scope_id: 0,
+            });
+        assert!(matches!(
+            parse_p3_tcp_socket_address(ipv6_socket_address, WasiTcpSocketFamily::Ipv4,),
+            Err(socket_types::ErrorCode::NotSupported)
+        ));
+        let parsed = parse_p3_tcp_socket_address(ipv6_socket_address, WasiTcpSocketFamily::Ipv6)
+            .expect("IPv6 TCP socket address must parse for IPv6 sockets");
+        match format_p3_tcp_socket_address(parsed) {
+            socket_types::IpSocketAddress::Ipv6(address) => {
+                assert_eq!(address.port, 80);
+                assert_eq!(address.address, (0x2001, 0x0db8, 0, 0, 0, 0, 0, 1));
+            }
+            socket_types::IpSocketAddress::Ipv4(_) => panic!("IPv6 TCP address formatted as IPv4"),
+        }
         assert!(matches!(
             parse_p3_tcp_socket_address(
-                socket_types::IpSocketAddress::Ipv6(socket_types::Ipv6SocketAddress {
+                socket_types::IpSocketAddress::Ipv4(socket_types::Ipv4SocketAddress {
                     port: 80,
-                    flow_info: 0,
-                    address: (0, 0, 0, 0, 0, 0, 0, 1),
-                    scope_id: 0,
+                    address: (127, 0, 0, 1),
                 }),
-                WasiTcpSocketFamily::Ipv4,
+                WasiTcpSocketFamily::Ipv6,
             ),
             Err(socket_types::ErrorCode::NotSupported)
         ));
@@ -7446,14 +7606,8 @@ mod tests {
             service,
             WasiTcpSocketFamily::Ipv4,
             7,
-            WasiTcpSocketAddress {
-                address: crate::Ipv4Address::new([127, 0, 0, 1]),
-                port: 8080,
-            },
-            WasiTcpSocketAddress {
-                address: crate::Ipv4Address::new([127, 0, 0, 1]),
-                port: 4040,
-            },
+            tcp4([127, 0, 0, 1], 8080),
+            tcp4([127, 0, 0, 1], 4040),
         );
 
         socket
@@ -7485,10 +7639,7 @@ mod tests {
     fn tcp_socket_bind_local_tracks_authorized_local_address() {
         let service = ComponentHostNetworkService::from_service(TestNetworkService);
         let socket = TcpSocket::new(service, WasiTcpSocketFamily::Ipv4);
-        let local = WasiTcpSocketAddress {
-            address: crate::Ipv4Address::new([127, 0, 0, 1]),
-            port: 8080,
-        };
+        let local = tcp4([127, 0, 0, 1], 8080);
 
         socket
             .bind_local(local)
@@ -7522,10 +7673,7 @@ mod tests {
     fn p3_tcp_socket_uses_network_backend_without_widening_rights() {
         let service = ComponentHostNetworkService::from_service(TestNetworkService);
         let socket = TcpSocket::new(service, WasiTcpSocketFamily::Ipv4);
-        let remote = WasiTcpSocketAddress {
-            address: crate::Ipv4Address::new([203, 0, 113, 10]),
-            port: 443,
-        };
+        let remote = tcp4([203, 0, 113, 10], 443);
 
         block_on(socket.connect(remote)).expect("test TCP backend should connect");
         assert_eq!(socket.remote_address().unwrap(), remote);
