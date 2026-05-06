@@ -607,12 +607,26 @@ def network_perf_rows(paths: list[Path]) -> list[dict]:
                 "events": metric_u64(sample, "total_events"),
                 "nanos": total_nanos,
                 "bytes": total_bytes,
+                "nanos_per_event": average_or_none(
+                    total_nanos,
+                    metric_u64(sample, "total_events"),
+                ),
+                "bytes_per_event": average_or_none(
+                    total_bytes,
+                    metric_u64(sample, "total_events"),
+                ),
                 "mib_s": throughput_mib_s(total_bytes, total_nanos / 1_000_000.0),
                 "source": sample["_source"],
             }
         )
     rows.sort(key=lambda row: row["nanos"], reverse=True)
     return rows
+
+
+def average_or_none(total: int, count: int) -> float | None:
+    if count == 0:
+        return None
+    return total / count
 
 
 def artifact_provenance(manifest: dict, workloads: list[dict]) -> list[dict]:
@@ -906,14 +920,22 @@ def write_report(
             [
                 "## Helios Network Perf Metrics",
                 "",
-                "| Metric | Events | Total bytes | Total time | Throughput | Source |",
-                "| --- | ---: | ---: | ---: | ---: | --- |",
+                "Read this table as kernel-path evidence, not as an HTTP or curl verdict: low payload bytes with high `ns/event` points at ACK/control submission cost, while high payload bytes with high total time points at RX drain or TCP receive drive cost.",
+                "",
+                "| Metric | Events | Total bytes | Total time | ns/event | bytes/event | Throughput | Source |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
             ]
         )
         for row in network_perf[:16]:
             throughput = "n/a" if row["mib_s"] is None else f"{row['mib_s']:.1f} MiB/s"
+            nanos_per_event = (
+                "n/a" if row["nanos_per_event"] is None else f"{row['nanos_per_event']:.1f}"
+            )
+            bytes_per_event = (
+                "n/a" if row["bytes_per_event"] is None else f"{row['bytes_per_event']:.1f}"
+            )
             lines.append(
-                f"| `{row['name']}` | {row['events']} | {row['bytes']} | {row['nanos']} ns | {throughput} | `{row['source']}` |"
+                f"| `{row['name']}` | {row['events']} | {row['bytes']} | {row['nanos']} ns | {nanos_per_event} | {bytes_per_event} | {throughput} | `{row['source']}` |"
             )
         lines.append("")
 
