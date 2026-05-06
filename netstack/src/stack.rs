@@ -237,7 +237,7 @@ struct TcpSocketSlab<C>
 where
     C: CongestionControl,
 {
-    slots: Box<[MaybeUninit<TcpSocket<C>>]>,
+    slots: Option<Box<[MaybeUninit<TcpSocket<C>>]>>,
     occupied: [bool; MAX_TCP_SOCKETS],
     free: [usize; MAX_TCP_SOCKETS],
     free_len: usize,
@@ -285,7 +285,7 @@ where
 {
     fn new() -> Self {
         Self {
-            slots: Box::<[TcpSocket<C>]>::new_uninit_slice(MAX_TCP_SOCKETS),
+            slots: None,
             occupied: [false; MAX_TCP_SOCKETS],
             free: core::array::from_fn(|index| MAX_TCP_SOCKETS - 1 - index),
             free_len: MAX_TCP_SOCKETS,
@@ -328,6 +328,7 @@ where
         if self.free_len == 0 {
             panic!("TCP socket slab is full");
         };
+        self.materialize_slots();
         self.free_len -= 1;
         let index = self.free[self.free_len];
         assert!(
@@ -341,7 +342,7 @@ where
         let listener_key = socket
             .local_endpoint()
             .filter(|_| socket.remote_endpoint().is_none());
-        self.slots[index].write(socket);
+        self.slots_mut()[index].write(socket);
         self.occupied[index] = true;
         if let Some(key) = endpoint_key {
             self.endpoint_index.insert(key, index);
@@ -357,7 +358,7 @@ where
         if !self.occupied.get(index).copied().unwrap_or(false) {
             return None;
         }
-        let socket = unsafe { self.slots[index].assume_init_read() };
+        let socket = unsafe { self.slots_mut()[index].assume_init_read() };
         self.occupied[index] = false;
         if let Some((local, remote)) = socket.local_endpoint().zip(socket.remote_endpoint()) {
             self.endpoint_index
@@ -406,11 +407,29 @@ where
     }
 
     fn slot_ref(&self, index: usize) -> &TcpSocket<C> {
-        unsafe { self.slots[index].assume_init_ref() }
+        unsafe { self.slots_ref()[index].assume_init_ref() }
     }
 
     fn slot_mut(&mut self, index: usize) -> &mut TcpSocket<C> {
-        unsafe { self.slots[index].assume_init_mut() }
+        unsafe { self.slots_mut()[index].assume_init_mut() }
+    }
+
+    fn materialize_slots(&mut self) {
+        if self.slots.is_none() {
+            self.slots = Some(Box::<[TcpSocket<C>]>::new_uninit_slice(MAX_TCP_SOCKETS));
+        }
+    }
+
+    fn slots_ref(&self) -> &[MaybeUninit<TcpSocket<C>>] {
+        self.slots
+            .as_deref()
+            .expect("TCP socket storage is not materialized")
+    }
+
+    fn slots_mut(&mut self) -> &mut [MaybeUninit<TcpSocket<C>>] {
+        self.slots
+            .as_deref_mut()
+            .expect("TCP socket storage is not materialized")
     }
 }
 
@@ -420,7 +439,10 @@ where
 {
     fn clone(&self) -> Self {
         let mut cloned = Self {
-            slots: Box::<[TcpSocket<C>]>::new_uninit_slice(MAX_TCP_SOCKETS),
+            slots: self
+                .slots
+                .as_ref()
+                .map(|_| Box::<[TcpSocket<C>]>::new_uninit_slice(MAX_TCP_SOCKETS)),
             occupied: self.occupied,
             free: self.free,
             free_len: self.free_len,
@@ -432,7 +454,7 @@ where
         };
         for active_slot in 0..self.active_len {
             let index = self.active[active_slot];
-            cloned.slots[index].write(self.slot_ref(index).clone());
+            cloned.slots_mut()[index].write(self.slot_ref(index).clone());
         }
         cloned
     }
@@ -460,7 +482,7 @@ where
             let index = self.active[active_slot];
             if self.occupied[index] {
                 unsafe {
-                    self.slots[index].assume_init_drop();
+                    self.slots_mut()[index].assume_init_drop();
                 }
                 self.occupied[index] = false;
             }
