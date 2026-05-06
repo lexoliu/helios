@@ -55,6 +55,7 @@ struct TcpInFlightSegment {
     sequence_len: u32,
     sent_at_nanos: u64,
     retransmissions: u8,
+    sacked: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -265,6 +266,7 @@ where
                 sequence_len: 1,
                 sent_at_nanos: now_nanos,
                 retransmissions: 0,
+                sacked: false,
             })
             .unwrap_or_else(|_| panic!("TCP in-flight queue is full"));
         self.congestion
@@ -287,6 +289,7 @@ where
                 sequence_len: 1,
                 sent_at_nanos: now_nanos,
                 retransmissions: 0,
+                sacked: false,
             })
             .unwrap_or_else(|_| panic!("TCP in-flight queue is full"));
         self.congestion
@@ -454,6 +457,7 @@ where
                 sequence_len: 1,
                 sent_at_nanos: now_nanos,
                 retransmissions: 0,
+                sacked: false,
             })
             .unwrap_or_else(|_| panic!("TCP in-flight queue is full"));
         Some(TcpTransmitSegment {
@@ -532,6 +536,7 @@ where
                 sequence_len,
                 sent_at_nanos: now_nanos,
                 retransmissions: 0,
+                sacked: false,
             })
             .unwrap_or_else(|_| panic!("TCP in-flight queue is full"));
         self.ack_pending = false;
@@ -548,13 +553,17 @@ where
     }
 
     pub fn pending_retransmission(&self, now_nanos: u64) -> Option<TcpTransmitSegment> {
-        let in_flight = self.in_flight.front()?;
-        if !self.fast_retransmit_pending
-            && now_nanos.saturating_sub(in_flight.sent_at_nanos)
+        let in_flight = if self.fast_retransmit_pending {
+            self.first_unsacked_in_flight()?
+        } else {
+            let in_flight = self.in_flight.front()?;
+            if now_nanos.saturating_sub(in_flight.sent_at_nanos)
                 < rto_nanos(in_flight.retransmissions)
-        {
-            return None;
-        }
+            {
+                return None;
+            }
+            in_flight
+        };
         let local = self.local?;
         let remote = self.remote?;
         Some(TcpTransmitSegment {
@@ -566,6 +575,10 @@ where
             sequence_len: in_flight.sequence_len,
             retransmission: true,
         })
+    }
+
+    fn first_unsacked_in_flight(&self) -> Option<&TcpInFlightSegment> {
+        self.in_flight.iter().find(|segment| !segment.sacked)
     }
 
     pub fn mark_retransmission_queued(&mut self, sequence: u32, now_nanos: u64) {
@@ -701,6 +714,7 @@ where
             | TcpState::LastAck => {
                 let mut action = None;
                 if packet.flags.contains(TcpFlags::ACK) {
+                    self.apply_sack_blocks(packet.options.sack_blocks());
                     action = self.acknowledge_sent(
                         packet.acknowledgement,
                         now_nanos,
@@ -808,7 +822,10 @@ where
     }
 
     fn note_duplicate_ack(&mut self, now_nanos: u64) -> Option<RecoveryAction> {
-        let Some(segment) = self.in_flight.front() else {
+        let Some(lost_bytes) = self
+            .first_unsacked_in_flight()
+            .map(|segment| segment.sequence_len)
+        else {
             return None;
         };
         self.duplicate_ack_count = self.duplicate_ack_count.saturating_add(1);
@@ -819,11 +836,23 @@ where
         Some(
             self.congestion
                 .on_congestion_event(CongestionEvent::PacketLoss {
-                    lost_bytes: segment.sequence_len,
+                    lost_bytes,
                     bytes_in_flight: self.bytes_in_flight,
                     now_nanos,
                 }),
         )
+    }
+
+    fn apply_sack_blocks(&mut self, blocks: TcpSackBlocks) {
+        for block in blocks.as_slice() {
+            for segment in &mut self.in_flight {
+                if sequence_leq(block.left_edge, segment.header.sequence)
+                    && sequence_leq(segment_end(segment), block.right_edge)
+                {
+                    segment.sacked = true;
+                }
+            }
+        }
     }
 
     fn ack_sample_timing(&self, acknowledgement: u32, now_nanos: u64) -> TcpAckTiming {
@@ -1162,7 +1191,7 @@ fn min_deadline(left: Option<u64>, right: Option<u64>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BbrV3, Ipv4Address, TcpOptions, TcpSackBlock};
+    use crate::{BbrV3, Ipv4Address, TcpOptions, TcpSackBlock, TcpSackBlocks};
 
     fn endpoint(port: u16) -> TcpEndpoint {
         TcpEndpoint {
@@ -1310,6 +1339,64 @@ mod tests {
         assert!(retransmit.retransmission);
         assert_eq!(retransmit.header.sequence, data.header.sequence);
         assert_eq!(retransmit.payload, data.payload);
+    }
+
+    #[test]
+    fn fast_retransmit_skips_sacked_in_flight_segments() {
+        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+        socket.mark_syn_queued(0);
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+                options: TcpOptions::parse(&[2, 4, 0, 4]).expect("MSS option should parse"),
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS,
+        );
+        socket.mark_ack_queued();
+        assert_eq!(socket.queue_send(b"abcdefgh"), 8);
+        let sent_at = TCP_INITIAL_RTO_NANOS + 7;
+        let first = socket
+            .take_transmit_segment(sent_at)
+            .expect("first segment should transmit");
+        let second = socket
+            .take_transmit_segment(sent_at + 1)
+            .expect("second segment should transmit");
+        let mut blocks = TcpSackBlocks::empty();
+        blocks
+            .push(TcpSackBlock {
+                left_edge: first.header.sequence,
+                right_edge: first.header.sequence + first.sequence_len,
+            })
+            .expect("single SACK block should fit");
+        socket.apply_sack_blocks(blocks);
+
+        for index in 0..3 {
+            let _ = socket.on_segment(
+                TcpPacket {
+                    source_port: 80,
+                    destination_port: 49152,
+                    sequence: 101,
+                    acknowledgement: first.header.sequence,
+                    flags: TcpFlags::ACK,
+                    window_size: u16::MAX,
+                    options: TcpOptions::empty(),
+                    payload: &[],
+                },
+                sent_at + 2 + index,
+            );
+        }
+
+        let retransmit = socket
+            .pending_retransmission(sent_at + 5)
+            .expect("fast retransmit should choose unsacked data");
+        assert_eq!(retransmit.header.sequence, second.header.sequence);
+        assert_eq!(retransmit.payload, second.payload);
     }
 
     #[test]
