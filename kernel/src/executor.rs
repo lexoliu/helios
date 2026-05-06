@@ -178,14 +178,18 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         progress_mode: ProgressMode,
         wake: WakeTarget,
     ) {
+        let previous_ready = ready_count.fetch_add(1, Ordering::AcqRel);
         match queue.push(runnable) {
             Ok(()) => {}
             Err(PushError::Full(_)) => {
+                rollback_ready_count(ready_count);
                 panic!("executor ready queue capacity {READY_QUEUE_CAPACITY} exhausted")
             }
-            Err(PushError::Closed(_)) => panic!("executor ready queue was closed unexpectedly"),
+            Err(PushError::Closed(_)) => {
+                rollback_ready_count(ready_count);
+                panic!("executor ready queue was closed unexpectedly")
+            }
         }
-        let previous_ready = ready_count.fetch_add(1, Ordering::AcqRel);
 
         if progress_mode == ProgressMode::Counted {
             self.progress.record_progress();
@@ -369,6 +373,14 @@ fn pop_ready(queue: &ReadyQueue, ready_count: &AtomicUsize) -> Result<Runnable, 
     let previous = ready_count.fetch_sub(1, Ordering::AcqRel);
     assert!(previous != 0, "executor ready count underflowed");
     Ok(runnable)
+}
+
+fn rollback_ready_count(ready_count: &AtomicUsize) {
+    let previous = ready_count.fetch_sub(1, Ordering::AcqRel);
+    assert!(
+        previous != 0,
+        "executor ready count underflowed while rolling back failed enqueue"
+    );
 }
 
 const fn should_wake_global_processor(previous_ready: usize, processor_count: usize) -> bool {

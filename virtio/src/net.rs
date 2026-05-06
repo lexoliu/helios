@@ -468,10 +468,11 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             !state.rx_in_device.get(token_index),
             "virtio net RX buffer was reposted while still owned by the device"
         );
-        let submitted_token =
-            state
-                .rx_queue
-                .submit(&self.transport, &[], &mut [self.rx_slot_mut(token_index)])?;
+        let submitted_token = state.rx_queue.submit_output_at(
+            &self.transport,
+            token,
+            self.rx_slot_mut(token_index),
+        )?;
         assert_eq!(
             submitted_token, token,
             "virtio net RX descriptor allocation moved while buffer was reposted"

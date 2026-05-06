@@ -1265,7 +1265,7 @@ where
                 }
             }
 
-            for frame in frames {
+            while let Some(frame) = frames.pop() {
                 self.inner.device.repost_rx_frame(frame).await?;
             }
 

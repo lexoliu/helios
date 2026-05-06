@@ -145,6 +145,29 @@ impl<T: VirtioTransport> VirtQueue<T> {
         Ok(head)
     }
 
+    pub(crate) fn submit_output_at(
+        &mut self,
+        transport: &T,
+        token: u16,
+        output: &mut [u8],
+    ) -> IoResult<u16> {
+        if output.is_empty() {
+            return Err(IoError::DeviceFault);
+        }
+        if self.num_used == self.size {
+            return Err(IoError::DeviceFault);
+        }
+
+        self.remove_free_descriptor(token);
+        self.write_descriptor(transport, token, output, true)?;
+        self.desc_shadow[usize::from(token)].flags &= !DESC_FLAG_NEXT;
+        self.write_desc(token);
+        self.stage_deferred_head(token);
+        self.publish_deferred_heads();
+        self.num_used += 1;
+        Ok(token)
+    }
+
     pub(crate) fn stage_deferred_head(&mut self, head: u16) {
         let slot = self.avail_idx & (self.size - 1);
         self.write_avail_ring(slot, head);
@@ -187,6 +210,18 @@ impl<T: VirtioTransport> VirtQueue<T> {
         assert!(!buffer.is_empty(), "virtqueue buffers must not be empty");
 
         let desc_index = self.free_head;
+        self.free_head = self.desc_shadow[usize::from(desc_index)].next;
+        self.write_descriptor(transport, desc_index, buffer, writable)?;
+        Ok(desc_index)
+    }
+
+    fn write_descriptor(
+        &mut self,
+        transport: &T,
+        desc_index: u16,
+        buffer: &[u8],
+        writable: bool,
+    ) -> IoResult<()> {
         let desc = &mut self.desc_shadow[usize::from(desc_index)];
         let addr = transport.bus().dma().dma_addr(buffer.as_ptr())?;
         let mut flags = DESC_FLAG_NEXT;
@@ -200,9 +235,39 @@ impl<T: VirtioTransport> VirtQueue<T> {
             flags,
             next: desc.next,
         };
-        self.free_head = desc.next;
         self.write_desc(desc_index);
-        Ok(desc_index)
+        Ok(())
+    }
+
+    fn remove_free_descriptor(&mut self, token: u16) {
+        assert!(
+            token < self.size,
+            "virtqueue free descriptor token is out of range"
+        );
+        if self.free_head == token {
+            self.free_head = self.desc_shadow[usize::from(token)].next;
+            return;
+        }
+
+        let mut previous = self.free_head;
+        for _ in 0..self.size {
+            let next = self.desc_shadow[usize::from(previous)].next;
+            assert!(
+                next != previous,
+                "virtqueue free descriptor list contains a cycle"
+            );
+            if next == token {
+                self.desc_shadow[usize::from(previous)].next =
+                    self.desc_shadow[usize::from(token)].next;
+                return;
+            }
+            assert!(
+                next < self.size,
+                "virtqueue free descriptor {token} is not present"
+            );
+            previous = next;
+        }
+        panic!("virtqueue free descriptor {token} is not present");
     }
 
     fn recycle_chain(&mut self, head: u16) {
@@ -289,6 +354,7 @@ fn device_area_len(size: u16) -> usize {
 mod tests {
     use alloc::alloc::{alloc_zeroed, dealloc};
     use core::alloc::Layout;
+    use core::mem::size_of;
     use core::ptr::NonNull;
 
     use helios_hal::io::{IoError, IoResult};
@@ -511,5 +577,109 @@ mod tests {
                 .read_volatile()
         };
         assert_eq!(published_avail_idx, 2);
+    }
+
+    #[test]
+    fn completed_descriptors_recycle_in_lifo_order() {
+        let transport = FakeTransport {
+            bus: FakeBus { dma: FakeDmaPool },
+        };
+        let mut queue = VirtQueue::new(&transport, 0, 8).expect("queue should initialize");
+        let first_buffer = [1u8; 16];
+        let second_buffer = [2u8; 16];
+
+        let first_token = queue
+            .submit(&transport, &[&first_buffer], &mut [])
+            .expect("first submission should succeed");
+        let second_token = queue
+            .submit(&transport, &[&second_buffer], &mut [])
+            .expect("second submission should succeed");
+
+        unsafe {
+            queue
+                .device_area
+                .as_ptr()
+                .add(4)
+                .cast::<UsedElem>()
+                .write_volatile(UsedElem {
+                    id: first_token as u32,
+                    len: 0,
+                });
+            queue
+                .device_area
+                .as_ptr()
+                .add(4 + size_of::<UsedElem>())
+                .cast::<UsedElem>()
+                .write_volatile(UsedElem {
+                    id: second_token as u32,
+                    len: 0,
+                });
+            queue
+                .device_area
+                .as_ptr()
+                .cast::<u16>()
+                .add(1)
+                .write_volatile(2);
+        }
+
+        assert_eq!(queue.pop_used(), Some(first_token));
+        assert_eq!(queue.pop_used(), Some(second_token));
+        assert_eq!(queue.next_free_descriptor(), second_token);
+    }
+
+    #[test]
+    fn output_submit_can_reuse_specific_free_descriptor() {
+        let transport = FakeTransport {
+            bus: FakeBus { dma: FakeDmaPool },
+        };
+        let mut queue = VirtQueue::new(&transport, 0, 8).expect("queue should initialize");
+        let first_buffer = [1u8; 16];
+        let second_buffer = [2u8; 16];
+        let mut output = [0u8; 16];
+
+        let first_token = queue
+            .submit(&transport, &[&first_buffer], &mut [])
+            .expect("first submission should succeed");
+        let second_token = queue
+            .submit(&transport, &[&second_buffer], &mut [])
+            .expect("second submission should succeed");
+
+        unsafe {
+            queue
+                .device_area
+                .as_ptr()
+                .add(4)
+                .cast::<UsedElem>()
+                .write_volatile(UsedElem {
+                    id: first_token as u32,
+                    len: 0,
+                });
+            queue
+                .device_area
+                .as_ptr()
+                .add(4 + size_of::<UsedElem>())
+                .cast::<UsedElem>()
+                .write_volatile(UsedElem {
+                    id: second_token as u32,
+                    len: 0,
+                });
+            queue
+                .device_area
+                .as_ptr()
+                .cast::<u16>()
+                .add(1)
+                .write_volatile(2);
+        }
+
+        assert_eq!(queue.pop_used(), Some(first_token));
+        assert_eq!(queue.pop_used(), Some(second_token));
+        assert_eq!(queue.next_free_descriptor(), second_token);
+        assert_eq!(
+            queue
+                .submit_output_at(&transport, first_token, &mut output)
+                .expect("specific descriptor submit should succeed"),
+            first_token
+        );
+        assert_eq!(queue.next_free_descriptor(), second_token);
     }
 }
