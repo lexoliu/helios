@@ -14,6 +14,8 @@ use crate::transport::{DeviceStatus, DeviceType, VirtioFeatures, VirtioTransport
 const RX_QUEUE_INDEX: u16 = 0;
 const TX_QUEUE_INDEX: u16 = 1;
 const NET_QUEUE_SIZE: u16 = 256;
+const DESCRIPTOR_BITSET_WORDS: usize =
+    (NET_QUEUE_SIZE as usize + usize::BITS as usize - 1) / usize::BITS as usize;
 const ETH_HEADER_LEN: usize = 14;
 const DEFAULT_IP_MTU: usize = 1500;
 const NET_FEATURE_MAC: u64 = 1 << 5;
@@ -45,7 +47,8 @@ struct NetTxState<T: VirtioTransport> {
 }
 
 struct DescriptorBitSet {
-    words: Box<[usize]>,
+    words: [usize; DESCRIPTOR_BITSET_WORDS],
+    bits: usize,
 }
 
 pub struct VirtioNetDevice<T: VirtioTransport> {
@@ -504,9 +507,13 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
 
 impl DescriptorBitSet {
     fn new(bits: usize) -> Self {
-        let words = bits.div_ceil(usize::BITS as usize);
+        assert!(
+            bits <= usize::from(NET_QUEUE_SIZE),
+            "virtio descriptor bitset exceeds net queue capacity"
+        );
         Self {
-            words: vec![0; words].into_boxed_slice(),
+            words: [0; DESCRIPTOR_BITSET_WORDS],
+            bits,
         }
     }
 
@@ -526,12 +533,12 @@ impl DescriptorBitSet {
     }
 
     fn word_mask(&self, bit: usize) -> (usize, usize) {
-        let word = bit / usize::BITS as usize;
-        let shift = bit % usize::BITS as usize;
         assert!(
-            word < self.words.len(),
+            bit < self.bits,
             "virtio descriptor bit {bit} is outside bitset"
         );
+        let word = bit / usize::BITS as usize;
+        let shift = bit % usize::BITS as usize;
         (word, 1usize << shift)
     }
 }
