@@ -683,6 +683,78 @@ def comparison_rows(workloads: list[dict], helios: dict[str, dict], linux: dict[
     return rows
 
 
+def comparison_summary(
+    workloads: list[dict],
+    helios: dict[str, dict],
+    linux: dict[str, dict],
+) -> list[dict]:
+    summary = []
+    for workload in workloads:
+        helios_summary = helios.get(workload["name"])
+        linux_summary = linux.get(workload["name"])
+        helios_ms = helios_summary.get("median_elapsed_ms") if helios_summary else None
+        linux_seconds = linux_summary.get("median") if linux_summary else None
+        linux_ms = linux_seconds * 1000.0 if linux_seconds is not None else None
+        byte_count = workload.get("throughput_bytes")
+        ratio_value = helios_ms / linux_ms if helios_ms is not None and linux_ms else None
+        summary.append(
+            {
+                "name": workload["name"],
+                "class": workload["class"],
+                "helios_median_ms": helios_ms,
+                "linux_median_ms": linux_ms,
+                "helios_to_linux_ratio": ratio_value,
+                "throughput_bytes": byte_count,
+                "helios_mib_per_second": throughput_mib_s(byte_count, helios_ms),
+                "linux_mib_per_second": throughput_mib_s(byte_count, linux_ms),
+                "helios_validation_ok": bool(
+                    helios_summary and helios_summary["validation"]["ok"]
+                ),
+            }
+        )
+    return summary
+
+
+def write_summary_json(
+    path: Path,
+    workloads: list[dict],
+    run_record: dict,
+    helios: dict[str, dict],
+    linux: dict[str, dict],
+    docker_digest: str | None,
+    host_load: dict,
+    network_perf: list[dict],
+) -> None:
+    payload = {
+        "schema_version": 1,
+        "helios_git_sha": run_record.get("git_sha", git_sha()),
+        "docker_image_digest": docker_digest,
+        "vm": run_record.get("vm"),
+        "host": {
+            "cpu": host_cpu(),
+            "logical_cpus": os.cpu_count(),
+            "memory": host_memory(),
+            "load": host_load["load"],
+            "top_cpu_processes": host_load["top_cpu_processes"],
+        },
+        "workloads": comparison_summary(workloads, helios, linux),
+        "network_hotspots": [
+            {
+                "name": row["name"],
+                "events": row["events"],
+                "total_bytes": row["bytes"],
+                "total_nanos": row["nanos"],
+                "nanos_per_event": row["nanos_per_event"],
+                "bytes_per_event": row["bytes_per_event"],
+                "mib_per_second": row["mib_s"],
+                "source": str(row["source"]),
+            }
+            for row in network_perf[:16]
+        ],
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
 def throughput_mib_s(byte_count: int | None, elapsed_ms: float | int | None) -> float | None:
     if byte_count is None or elapsed_ms is None or elapsed_ms == 0:
         return None
@@ -867,6 +939,18 @@ def write_report(
     write_svg(svg_path, rows)
     throughput_svg_path = path.with_name("network-throughput.svg")
     has_throughput_svg = write_throughput_svg(throughput_svg_path, rows)
+    network_perf = network_perf_rows(perf_metric_paths)
+    summary_json = path.with_name("summary.json")
+    write_summary_json(
+        summary_json,
+        workloads,
+        run_record,
+        helios,
+        linux,
+        docker_digest,
+        host_load,
+        network_perf,
+    )
     lines = [
         "# Helios vs Native Linux Benchmark",
         "",
@@ -874,6 +958,7 @@ def write_report(
         "",
         f"- Helios JSONL: `{helios_jsonl or 'not-run'}`",
         f"- Linux Hyperfine JSON: `{linux_json or 'not-run'}`",
+        f"- Machine-readable summary: `{summary_json}`",
         f"- Helios git SHA: `{run_record.get('git_sha', git_sha())}`",
         f"- Docker image digest: `{docker_digest or 'not-run'}`",
         f"- Host CPU: `{host_cpu()}`",
@@ -914,7 +999,6 @@ def write_report(
                 "",
             ]
         )
-    network_perf = network_perf_rows(perf_metric_paths)
     if network_perf:
         lines.extend(
             [
