@@ -23,7 +23,7 @@ use spin::Mutex;
 use thiserror::Error;
 use wasmtime::component::{
     Access, Accessor, Component, Destination, FutureReader, HasSelf, Resource, Source,
-    StreamConsumer, StreamProducer, StreamReader, StreamResult, VecBuffer, WriteBuffer,
+    StreamConsumer, StreamProducer, StreamReader, StreamResult, WriteBuffer,
 };
 use wasmtime::{self, Result, StoreContextMut};
 
@@ -426,7 +426,7 @@ struct TcpReadStreamProducer {
     completion: Option<oneshot::Sender<core::result::Result<(), socket_types::ErrorCode>>>,
 }
 
-type TcpReadResult = core::result::Result<Option<Vec<u8>>, socket_types::ErrorCode>;
+type TcpReadResult = core::result::Result<Option<Bytes>, socket_types::ErrorCode>;
 
 struct TcpWriteConsumer {
     socket: TcpSocket,
@@ -857,7 +857,7 @@ impl TcpSocket {
     async fn read(
         &self,
         max_bytes: u32,
-    ) -> core::result::Result<Option<Vec<u8>>, socket_types::ErrorCode> {
+    ) -> core::result::Result<Option<Bytes>, socket_types::ErrorCode> {
         if self.inner.lock().receive_shutdown {
             return Ok(None);
         }
@@ -865,7 +865,6 @@ impl TcpSocket {
         service
             .tcp_read(stream, max_bytes, u64::MAX)
             .await
-            .map(|bytes| bytes.map(|bytes| bytes.to_vec()))
             .map_err(map_p3_tcp_error)
     }
 
@@ -1097,7 +1096,7 @@ impl Drop for TcpReadStreamProducer {
 
 impl<T: 'static> StreamProducer<T> for TcpReadStreamProducer {
     type Item = u8;
-    type Buffer = VecBuffer<u8>;
+    type Buffer = BytesStreamBuffer;
 
     fn poll_produce(
         mut self: Pin<&mut Self>,
@@ -1135,7 +1134,7 @@ impl<T: 'static> StreamProducer<T> for TcpReadStreamProducer {
                 }
                 Poll::Ready(Ok(Some(bytes))) => {
                     self.pending = None;
-                    destination.set_buffer(VecBuffer::from(bytes));
+                    destination.set_buffer(BytesStreamBuffer::new(bytes));
                     return Poll::Ready(Ok(StreamResult::Completed));
                 }
                 Poll::Ready(Ok(None)) => {
@@ -7669,6 +7668,9 @@ mod tests {
         assert_eq!(socket.remote_address().unwrap(), remote);
         block_on(socket.write_all_bytes(Bytes::from_static(b"hello")))
             .expect("test TCP backend should write");
-        assert_eq!(block_on(socket.read(16)).unwrap(), Some(vec![4, 2]));
+        let bytes = block_on(socket.read(16))
+            .unwrap()
+            .expect("test TCP backend should read bytes");
+        assert_eq!(bytes.as_ref(), [4, 2]);
     }
 }
