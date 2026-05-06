@@ -268,6 +268,17 @@ impl NetworkPollSource {
         }
     }
 
+    const fn tx_immediate_device_phase(self) -> &'static str {
+        match self {
+            Self::Pump => "tx-submit-immediate-device-pump",
+            Self::Ping => "tx-submit-immediate-device-ping",
+            Self::Dns => "tx-submit-immediate-device-dns",
+            Self::Tcp => "tx-submit-immediate-device-tcp",
+            Self::Udp => "tx-submit-immediate-device-udp",
+            Self::Configuration => "tx-submit-immediate-device-configuration",
+        }
+    }
+
     const fn tx_fallback_collect_phase(self) -> &'static str {
         match self {
             Self::Pump => "tx-submit-fallback-collect-pump",
@@ -1642,13 +1653,21 @@ where
         while submit_transmit && transmitted < budget.tx_frames {
             let remaining_budget = budget.tx_frames - transmitted;
             let immediate_started = self.profile_start();
+            let mut immediate_device_started = None;
+            let mut immediate_device_finished = None;
             let immediate =
                 self.inner
                     .state
                     .with_mut(|state| -> Result<OutboundBatchStatus, IoError> {
                         state.stack.try_submit_outbound_slices(
                             remaining_budget.min(NETWORK_TX_BATCH_FRAMES),
-                            |frames| self.inner.device.try_transmit_slices_immediate(frames),
+                            |frames| {
+                                immediate_device_started = self.profile_start();
+                                let result =
+                                    self.inner.device.try_transmit_slices_immediate(frames);
+                                immediate_device_finished = self.profile_start();
+                                result
+                            },
                         )
                     })?;
             match immediate {
@@ -1659,6 +1678,13 @@ where
                     accepted,
                     accepted_bytes,
                 } => {
+                    self.record_network_profile_events_bytes_between(
+                        source.tx_immediate_device_phase(),
+                        immediate_device_started,
+                        immediate_device_finished,
+                        accepted,
+                        accepted_bytes,
+                    );
                     self.record_network_profile_events_bytes(
                         source.tx_immediate_phase(),
                         immediate_started,
