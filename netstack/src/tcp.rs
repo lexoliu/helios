@@ -16,6 +16,8 @@ const TCP_RECEIVE_BYTES: usize = MAX_TCP_RECEIVE_SEGMENTS * TCP_RECEIVE_SEGMENT_
 const TCP_SMALL_PAYLOAD_ACK_BYTES: usize = TCP_RECEIVE_SEGMENT_BYTES / 2;
 const TCP_DELAYED_ACK_SEGMENTS: u8 = 2;
 const TCP_WINDOW_UPDATE_BYTES: u16 = (TCP_RECEIVE_SEGMENT_BYTES * 4) as u16;
+const TCP_LOCAL_WINDOW_SCALE: u8 = 2;
+const TCP_MAX_WINDOW_SCALE: u8 = 14;
 pub(crate) const TCP_RECEIVE_BACKPRESSURE_SEGMENTS: usize = MAX_TCP_RECEIVE_SEGMENTS - 4;
 pub const TCP_INITIAL_RTO_NANOS: u64 = 1_000_000_000;
 pub const TCP_MAX_RETRANSMISSIONS: u8 = 5;
@@ -96,6 +98,8 @@ where
     receive_next: u32,
     advertised_window: u16,
     peer_max_segment_size: usize,
+    peer_window_scale: u8,
+    peer_receive_window: u32,
     peer_sack_permitted: bool,
     peer_timestamp: Option<TcpTimestampOption>,
     receive_queue: Deque<Bytes, MAX_TCP_RECEIVE_SEGMENTS>,
@@ -131,8 +135,10 @@ where
             send_next: 0,
             send_unacknowledged: 0,
             receive_next: 0,
-            advertised_window: receive_window_size(0),
+            advertised_window: receive_window_size(0, TCP_LOCAL_WINDOW_SCALE),
             peer_max_segment_size: TCP_RECEIVE_SEGMENT_BYTES,
+            peer_window_scale: 0,
+            peer_receive_window: u32::from(u16::MAX),
             peer_sack_permitted: false,
             peer_timestamp: None,
             receive_queue: Deque::new(),
@@ -343,6 +349,14 @@ where
         self.peer_max_segment_size
     }
 
+    pub const fn peer_window_scale(&self) -> u8 {
+        self.peer_window_scale
+    }
+
+    pub const fn peer_receive_window(&self) -> u32 {
+        self.peer_receive_window
+    }
+
     pub const fn peer_sack_permitted(&self) -> bool {
         self.peer_sack_permitted
     }
@@ -384,11 +398,7 @@ where
         if self.transmit_queue.is_full() {
             return 0;
         }
-        let window = self
-            .congestion
-            .congestion_window()
-            .bytes()
-            .saturating_sub(self.bytes_in_flight) as usize;
+        let window = self.available_send_window();
         let writable = bytes.len().min(window);
         if writable != 0 {
             let segment = bytes.split_to(writable);
@@ -402,8 +412,8 @@ where
     pub fn take_transmit_segment(&mut self, now_nanos: u64) -> Option<TcpTransmitSegment> {
         let local = self.local?;
         let remote = self.remote?;
-        let cwnd = self.congestion.congestion_window().bytes();
-        if self.bytes_in_flight >= cwnd {
+        let available_window = self.available_send_window();
+        if available_window == 0 {
             return None;
         }
         if matches!(
@@ -411,7 +421,9 @@ where
             TcpState::Established | TcpState::CloseWait | TcpState::FinWait1 | TcpState::LastAck
         ) && !self.fin_queued
         {
-            if let Some(segment) = self.take_data_segment(local, remote, cwnd, now_nanos) {
+            if let Some(segment) =
+                self.take_data_segment(local, remote, available_window, now_nanos)
+            {
                 return Some(segment);
             }
         }
@@ -488,11 +500,10 @@ where
         &mut self,
         local: TcpEndpoint,
         remote: TcpEndpoint,
-        cwnd: u32,
+        available: usize,
         now_nanos: u64,
     ) -> Option<TcpTransmitSegment> {
         let mut payload = self.transmit_queue.pop_front()?;
-        let available = usize::try_from(cwnd - self.bytes_in_flight).unwrap_or(usize::MAX);
         let maximum_segment = available.min(self.peer_max_segment_size);
         if payload.len() > maximum_segment {
             let tail = payload.split_off(maximum_segment);
@@ -653,6 +664,7 @@ where
                 receive_backpressure: false,
             };
         }
+        self.update_peer_receive_window(packet.window_size);
 
         match self.state {
             TcpState::SynSent if packet.flags.contains(TcpFlags::SYN.union(TcpFlags::ACK)) => {
@@ -844,7 +856,8 @@ where
     }
 
     fn refresh_advertised_window(&mut self) {
-        self.advertised_window = receive_window_size(self.receive_buffered_bytes());
+        self.advertised_window =
+            receive_window_size(self.receive_buffered_bytes(), TCP_LOCAL_WINDOW_SCALE);
     }
 
     fn receive_buffered_bytes(&self) -> usize {
@@ -1055,8 +1068,28 @@ where
         if let Some(mss) = packet.options.maximum_segment_size() {
             self.peer_max_segment_size = usize::from(mss).min(TCP_RECEIVE_SEGMENT_BYTES).max(1);
         }
+        if let Some(shift) = packet.options.window_scale() {
+            self.peer_window_scale = shift.min(TCP_MAX_WINDOW_SCALE);
+            self.update_peer_receive_window(packet.window_size);
+        }
         self.peer_sack_permitted = packet.options.sack_permitted();
         self.peer_timestamp = packet.options.timestamp();
+    }
+
+    fn update_peer_receive_window(&mut self, window_size: u16) {
+        self.peer_receive_window = u32::from(window_size) << self.peer_window_scale;
+    }
+
+    fn available_send_window(&self) -> usize {
+        let congestion_window = self
+            .congestion
+            .congestion_window()
+            .bytes()
+            .saturating_sub(self.bytes_in_flight);
+        let receive_window = self
+            .peer_receive_window
+            .saturating_sub(self.bytes_in_flight);
+        congestion_window.min(receive_window) as usize
     }
 
     fn request_ack(&mut self) {
@@ -1085,14 +1118,15 @@ where
     }
 }
 
-fn receive_window_size(queued_bytes: usize) -> u16 {
+fn receive_window_size(queued_bytes: usize, scale: u8) -> u16 {
     let bytes = TCP_RECEIVE_BYTES.saturating_sub(queued_bytes);
-    bytes.min(u16::MAX as usize) as u16
+    (bytes >> scale).min(u16::MAX as usize) as u16
 }
 
 const fn syn_header_options() -> TcpHeaderOptions {
     TcpHeaderOptions::empty()
         .with_maximum_segment_size(TCP_RECEIVE_SEGMENT_BYTES as u16)
+        .with_window_scale(TCP_LOCAL_WINDOW_SCALE)
         .with_sack_permitted()
 }
 
@@ -1335,6 +1369,55 @@ mod tests {
     }
 
     #[test]
+    fn peer_window_scale_expands_tracked_receive_window() {
+        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+        socket.mark_syn_queued(0);
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: 4,
+                options: TcpOptions::parse(&[3, 3, 3, 0]).expect("window scale should parse"),
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS,
+        );
+
+        assert_eq!(socket.peer_window_scale(), 3);
+        assert_eq!(socket.peer_receive_window(), 32);
+        assert_eq!(socket.queue_send(b"abcdefghijklmnopqrstuvwxyz"), 26);
+        let segment = socket
+            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 1)
+            .expect("scaled peer receive window should allow data");
+
+        assert_eq!(segment.payload.len(), 26);
+    }
+
+    #[test]
+    fn peer_receive_window_caps_queued_send_bytes() {
+        let mut socket = established_socket();
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: 4,
+                options: TcpOptions::empty(),
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS + 1,
+        );
+
+        assert_eq!(socket.peer_receive_window(), 4);
+        assert_eq!(socket.queue_send(b"abcdefghij"), 4);
+    }
+
+    #[test]
     fn active_close_sends_queued_data_before_fin_and_enters_fin_wait2() {
         let mut socket = established_socket();
         assert_eq!(socket.queue_send(b"hi"), 2);
@@ -1510,8 +1593,7 @@ mod tests {
         );
         let open_window = socket.advertised_window();
         let payload = [0u8; TCP_RECEIVE_SEGMENT_BYTES];
-        let queued_segments =
-            MAX_TCP_RECEIVE_SEGMENTS - (u16::MAX as usize / TCP_RECEIVE_SEGMENT_BYTES);
+        let queued_segments = 4;
         for index in 0..queued_segments {
             let _ = socket.on_segment(
                 TcpPacket {
@@ -1532,6 +1614,13 @@ mod tests {
             socket.receive(TCP_RECEIVE_SEGMENT_BYTES).as_deref(),
             Some(&payload[..])
         );
+        assert!(socket.advertised_window() < open_window);
+        for _ in 1..queued_segments {
+            assert_eq!(
+                socket.receive(TCP_RECEIVE_SEGMENT_BYTES).as_deref(),
+                Some(&payload[..])
+            );
+        }
         assert_eq!(socket.advertised_window(), open_window);
     }
 
@@ -1923,7 +2012,9 @@ mod tests {
         }
         socket.mark_ack_queued();
 
-        for _ in 0..3 {
+        let update_segments = (usize::from(TCP_WINDOW_UPDATE_BYTES) << TCP_LOCAL_WINDOW_SCALE)
+            / TCP_RECEIVE_SEGMENT_BYTES;
+        for _ in 1..update_segments {
             assert_eq!(
                 socket.receive(TCP_RECEIVE_SEGMENT_BYTES).as_deref(),
                 Some(&payload[..])

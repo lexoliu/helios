@@ -624,6 +624,7 @@ impl<'a> TcpOptions<'a> {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TcpHeaderOptions {
     maximum_segment_size: Option<u16>,
+    window_scale: Option<u8>,
     sack_permitted: bool,
     sack_blocks: TcpSackBlocks,
     timestamp: Option<TcpTimestampOption>,
@@ -633,6 +634,7 @@ impl TcpHeaderOptions {
     pub const fn empty() -> Self {
         Self {
             maximum_segment_size: None,
+            window_scale: None,
             sack_permitted: false,
             sack_blocks: TcpSackBlocks::empty(),
             timestamp: None,
@@ -642,6 +644,12 @@ impl TcpHeaderOptions {
     pub const fn with_maximum_segment_size(mut self, value: u16) -> Self {
         assert!(value != 0, "TCP MSS option must be non-zero");
         self.maximum_segment_size = Some(value);
+        self
+    }
+
+    pub const fn with_window_scale(mut self, shift: u8) -> Self {
+        assert!(shift <= 14, "TCP window scale must be <= 14");
+        self.window_scale = Some(shift);
         self
     }
 
@@ -669,6 +677,10 @@ impl TcpHeaderOptions {
             Some(_) => 4,
             None => 0,
         };
+        let window_scale_len = match self.window_scale {
+            Some(_) => 3,
+            None => 0,
+        };
         let sack_permitted_len = if self.sack_permitted { 2 } else { 0 };
         let sack_blocks_len = if self.sack_blocks.is_empty() {
             0
@@ -680,7 +692,11 @@ impl TcpHeaderOptions {
             None => 0,
         };
         align_tcp_options_len(
-            maximum_segment_size_len + sack_permitted_len + sack_blocks_len + timestamp_len,
+            maximum_segment_size_len
+                + window_scale_len
+                + sack_permitted_len
+                + sack_blocks_len
+                + timestamp_len,
         )
     }
 
@@ -695,6 +711,12 @@ impl TcpHeaderOptions {
             output[offset + 1] = 4;
             output[offset + 2..offset + 4].copy_from_slice(&mss.to_be_bytes());
             offset += 4;
+        }
+        if let Some(shift) = self.window_scale {
+            output[offset] = 3;
+            output[offset + 1] = 3;
+            output[offset + 2] = shift;
+            offset += 3;
         }
         if self.sack_permitted {
             output[offset] = 4;
@@ -925,6 +947,7 @@ mod tests {
         };
         let options = TcpHeaderOptions::empty()
             .with_maximum_segment_size(1460)
+            .with_window_scale(7)
             .with_sack_permitted()
             .with_timestamp(TcpTimestampOption {
                 value: 11,
@@ -941,6 +964,7 @@ mod tests {
         assert_eq!(packet.destination_port, 80);
         assert_eq!(packet.payload, b"x");
         assert_eq!(packet.options.maximum_segment_size(), Some(1460));
+        assert_eq!(packet.options.window_scale(), Some(7));
         assert!(packet.options.sack_permitted());
         assert!(packet.options.sack_blocks().is_empty());
         assert_eq!(

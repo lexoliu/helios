@@ -2011,6 +2011,7 @@ mod tests {
         assert!(syn_ack.flags.contains(TcpFlags::SYN.union(TcpFlags::ACK)));
         assert_eq!(syn_ack.acknowledgement, 11);
         assert_eq!(syn_ack.options.maximum_segment_size(), Some(1460));
+        assert_eq!(syn_ack.options.window_scale(), Some(2));
         assert!(syn_ack.options.sack_permitted());
 
         let (ack, ack_len) = tcp_segment(
