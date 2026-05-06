@@ -209,8 +209,28 @@ impl NetworkDevice for VirtioNetworkDevice {
         self.inner.try_receive_frame().await
     }
 
+    fn try_receive_frames_immediate<'a, 'slots>(
+        &'a self,
+        frames: &'slots mut [Option<Self::RxFrame<'a>>],
+    ) -> Result<Option<usize>, IoError>
+    where
+        'a: 'slots,
+    {
+        self.inner.try_receive_frames_immediate(frames)
+    }
+
     async fn repost_rx_frame<'a>(&'a self, frame: Self::RxFrame<'a>) -> Result<(), IoError> {
         self.inner.repost_rx_frame(frame).await
+    }
+
+    fn repost_rx_frames_immediate<'a, 'slots>(
+        &'a self,
+        frames: &'slots mut [Option<Self::RxFrame<'a>>],
+    ) -> Result<Option<()>, IoError>
+    where
+        'a: 'slots,
+    {
+        self.inner.repost_rx_frames_immediate(frames)
     }
 
     async fn transmit(&self, frame: &[u8]) -> Result<(), IoError> {

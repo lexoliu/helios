@@ -1299,15 +1299,29 @@ where
                 break;
             }
 
-            let mut frames =
-                smallvec::SmallVec::<[DeviceImpl::RxFrame<'_>; NETWORK_RX_BATCH_FRAMES]>::new();
-            while frames.len() < NETWORK_RX_BATCH_FRAMES && frames.len() < remaining_rx_budget {
-                let Some(frame) = self.inner.device.try_receive_frame().await? else {
-                    break;
-                };
-                frames.push(frame);
-            }
-            if frames.is_empty() {
+            let receive_limit = remaining_rx_budget.min(NETWORK_RX_BATCH_FRAMES);
+            let mut frames: [Option<DeviceImpl::RxFrame<'_>>; NETWORK_RX_BATCH_FRAMES] =
+                core::array::from_fn(|_| None);
+            let received_batch = match self
+                .inner
+                .device
+                .try_receive_frames_immediate(&mut frames[..receive_limit])?
+            {
+                Some(received_batch) => received_batch,
+                None => {
+                    let mut received_batch = 0usize;
+                    for frame in &mut frames[..receive_limit] {
+                        let Some(received_frame) = self.inner.device.try_receive_frame().await?
+                        else {
+                            break;
+                        };
+                        *frame = Some(received_frame);
+                        received_batch += 1;
+                    }
+                    received_batch
+                }
+            };
+            if received_batch == 0 {
                 break;
             }
 
@@ -1315,7 +1329,7 @@ where
             let received_at = StackInstant::from_nanos(self.now_nanos());
             {
                 let mut state = self.inner.state.lock().await;
-                for frame in &frames {
+                for frame in frames[..received_batch].iter().flatten() {
                     let frame = frame.as_ref();
                     let frame_len = frame.len();
                     match state
@@ -1343,8 +1357,17 @@ where
                 }
             }
 
-            while let Some(frame) = frames.pop() {
-                self.inner.device.repost_rx_frame(frame).await?;
+            if self
+                .inner
+                .device
+                .repost_rx_frames_immediate(&mut frames[..received_batch])?
+                .is_none()
+            {
+                for frame in &mut frames[..received_batch] {
+                    if let Some(frame) = frame.take() {
+                        self.inner.device.repost_rx_frame(frame).await?;
+                    }
+                }
             }
 
             if receive_backpressured {

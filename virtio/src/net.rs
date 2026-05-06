@@ -276,6 +276,41 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         }))
     }
 
+    pub fn try_receive_frames_immediate<'a, 'slots>(
+        &'a self,
+        frames: &'slots mut [Option<BorrowedRxFrame<'a, T>>],
+    ) -> IoResult<Option<usize>>
+    where
+        'a: 'slots,
+    {
+        let Some(mut state) = self.rx_state.try_lock() else {
+            return Ok(None);
+        };
+        let mut received = 0usize;
+        for frame in frames {
+            assert!(frame.is_none(), "virtio net RX batch slot was not empty");
+            let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
+                break;
+            };
+            Self::mark_rx_completed(&mut state, token);
+            let used_len = used_len as usize;
+            if used_len < self.header_len || used_len > self.rx_buffer_len {
+                self.repost_rx_buffer(&mut state, token)?;
+                return Err(IoError::DeviceFault);
+            }
+
+            *frame = Some(BorrowedRxFrame {
+                device: self,
+                token,
+                frame_start: self.header_len,
+                frame_end: used_len,
+                reposted: false,
+            });
+            received += 1;
+        }
+        Ok(Some(received))
+    }
+
     pub async fn repost_rx_frame(&self, mut frame: BorrowedRxFrame<'_, T>) -> IoResult<()> {
         assert!(
             !frame.reposted,
@@ -284,6 +319,30 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         frame.reposted = true;
         let mut state = self.rx_state.lock().await;
         self.repost_rx_buffer(&mut state, frame.token)
+    }
+
+    pub fn repost_rx_frames_immediate<'a, 'slots>(
+        &'a self,
+        frames: &'slots mut [Option<BorrowedRxFrame<'a, T>>],
+    ) -> IoResult<Option<()>>
+    where
+        'a: 'slots,
+    {
+        let Some(mut state) = self.rx_state.try_lock() else {
+            return Ok(None);
+        };
+        for frame in frames {
+            let Some(mut frame) = frame.take() else {
+                continue;
+            };
+            assert!(
+                !frame.reposted,
+                "borrowed virtio RX frame was reposted twice"
+            );
+            frame.reposted = true;
+            self.repost_rx_buffer(&mut state, frame.token)?;
+        }
+        Ok(Some(()))
     }
 
     pub async fn transmit(&self, frame: &[u8]) -> IoResult<()> {

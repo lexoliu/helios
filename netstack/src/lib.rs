@@ -220,11 +220,35 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
     fn try_receive_frame(&self)
     -> impl Future<Output = IoResult<Option<Self::RxFrame<'_>>>> + Send;
 
+    /// Attempts to receive borrowed device buffers without waiting for any async lock or event.
+    fn try_receive_frames_immediate<'a, 'slots>(
+        &'a self,
+        frames: &'slots mut [Option<Self::RxFrame<'a>>],
+    ) -> IoResult<Option<usize>>
+    where
+        'a: 'slots,
+    {
+        let _ = frames;
+        Ok(None)
+    }
+
     /// Returns a borrowed device RX frame to the interface receive queue.
     fn repost_rx_frame<'a>(
         &'a self,
         frame: Self::RxFrame<'a>,
     ) -> impl Future<Output = IoResult<()>> + Send + 'a;
+
+    /// Returns borrowed device RX frames without waiting for any async lock or event.
+    fn repost_rx_frames_immediate<'a, 'slots>(
+        &'a self,
+        frames: &'slots mut [Option<Self::RxFrame<'a>>],
+    ) -> IoResult<Option<()>>
+    where
+        'a: 'slots,
+    {
+        let _ = frames;
+        Ok(None)
+    }
 
     /// Transmits one borrowed frame and waits until the device accepts ownership.
     fn transmit<'a>(&'a self, frame: &'a [u8]) -> impl Future<Output = IoResult<()>> + Send + 'a;
