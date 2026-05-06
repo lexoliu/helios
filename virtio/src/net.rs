@@ -322,7 +322,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     {
         self.validate_tx_frames(frames)?;
         let mut state = self.tx_state.lock().await;
-        Self::drain_tx_completions(&mut state, usize::MAX);
+        Self::drain_tx_completions_when_full(&mut state, frames.len());
         let mut next_frame = 0usize;
         self.submit_available_tx_frames(&mut state, frames, &mut next_frame)
     }
@@ -335,7 +335,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let Some(mut state) = self.tx_state.try_lock() else {
             return Ok(None);
         };
-        Self::drain_tx_completions(&mut state, usize::MAX);
+        Self::drain_tx_completions_when_full(&mut state, frames.len());
         let mut next_frame = 0usize;
         self.submit_available_tx_frames(&mut state, frames, &mut next_frame)
             .map(Some)
@@ -357,7 +357,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         while next_frame < frames.len() {
             let submitted = {
                 let mut state = self.tx_state.lock().await;
-                Self::drain_tx_completions(&mut state, usize::MAX);
+                Self::drain_tx_completions_when_full(&mut state, frames.len() - next_frame);
                 self.submit_available_tx_frames(&mut state, frames, &mut next_frame)?
             };
 
@@ -410,7 +410,10 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         } = state;
         let mut submitted = 0usize;
         let mut submitted_tokens = [0u16; NET_QUEUE_SIZE as usize];
-        while *next_frame < frames.len() && tx_queue.available_descriptors() != 0 {
+        let available_frames = tx_queue
+            .available_descriptors()
+            .min(frames.len().saturating_sub(*next_frame));
+        while submitted < available_frames {
             let frame = frames[*next_frame].as_ref();
             let token = tx_queue.next_free_descriptor();
             let token_index = usize::from(token);
@@ -502,6 +505,13 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             completed += 1;
         }
         completed
+    }
+
+    fn drain_tx_completions_when_full(state: &mut NetTxState<T>, budget: usize) -> usize {
+        if state.tx_queue.available_descriptors() != 0 {
+            return 0;
+        }
+        Self::drain_tx_completions(state, budget.max(1))
     }
 }
 

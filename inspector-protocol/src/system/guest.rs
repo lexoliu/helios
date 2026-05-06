@@ -281,7 +281,10 @@ async fn dispatch(instance: &str, func: &str, payload: &[u8]) -> Result<Vec<u8>,
                     operation: "profiling.metrics",
                     source,
                 })?;
-            let samples = host_profiling::metrics(&filter, limit);
+            let samples = host_profiling::metrics(&convert_metric_filter(filter), limit)
+                .into_iter()
+                .map(convert_metric_sample)
+                .collect::<Vec<_>>();
             postcard::to_allocvec(&samples).map_err(|source| DispatchError::Encode {
                 operation: "profiling.metrics",
                 source,
@@ -572,6 +575,28 @@ fn convert_profile_sample(sample: host_profiling::FoldedSample) -> profiling::Fo
         scope: convert_profile_scope_from_local(sample.scope),
         stack: sample.stack,
         weight: sample.weight,
+    }
+}
+
+fn convert_metric_filter(filter: profiling::MetricFilter) -> host_profiling::MetricFilter {
+    host_profiling::MetricFilter {
+        name_prefixes: filter.name_prefixes,
+    }
+}
+
+fn convert_metric_sample(sample: host_profiling::MetricSample) -> profiling::MetricSample {
+    profiling::MetricSample {
+        scope: convert_profile_scope_from_local(sample.scope),
+        name: sample.name,
+        count: sample.count,
+        total_events: sample.total_events,
+        total_nanos: sample.total_nanos,
+        min_nanos: sample.min_nanos,
+        max_nanos: sample.max_nanos,
+        total_bytes: sample.total_bytes,
+        total_reference_cycles: sample.total_reference_cycles,
+        total_cpu_cycles: sample.total_cpu_cycles,
+        total_instructions_retired: sample.total_instructions_retired,
     }
 }
 
