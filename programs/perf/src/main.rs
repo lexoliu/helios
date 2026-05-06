@@ -232,13 +232,21 @@ fn write_metrics(options: &Options) -> Result<(), PerfError> {
         OutputFormat::Text => {
             writeln!(
                 output,
-                "{:<6} {:>8} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14} name",
-                "scope", "count", "events", "total_ns", "min_ns", "max_ns", "cycles", "bytes"
+                "{:<6} {:>8} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14} name",
+                "scope",
+                "count",
+                "events",
+                "total_ns",
+                "min_ns",
+                "max_ns",
+                "cycles",
+                "bytes",
+                "B/s"
             )?;
             for sample in &samples {
                 writeln!(
                     output,
-                    "{:<6} {:>8} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14} {}",
+                    "{:<6} {:>8} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14} {:>14} {}",
                     scope_name(sample.scope),
                     sample.count,
                     sample.total_events,
@@ -247,6 +255,7 @@ fn write_metrics(options: &Options) -> Result<(), PerfError> {
                     sample.max_nanos,
                     sample.total_cpu_cycles,
                     sample.total_bytes,
+                    bytes_per_second(sample.total_bytes, sample.total_nanos),
                     sample.name
                 )?;
             }
@@ -259,7 +268,7 @@ fn write_metrics(options: &Options) -> Result<(), PerfError> {
                 }
                 write!(
                     output,
-                    "{{\"scope\":\"{}\",\"name\":\"{}\",\"count\":{},\"total_events\":{},\"total_nanos\":{},\"min_nanos\":{},\"max_nanos\":{},\"total_bytes\":{},\"total_reference_cycles\":{},\"total_cpu_cycles\":{},\"total_instructions_retired\":{}}}",
+                    "{{\"scope\":\"{}\",\"name\":\"{}\",\"count\":{},\"total_events\":{},\"total_nanos\":{},\"min_nanos\":{},\"max_nanos\":{},\"total_bytes\":{},\"bytes_per_second\":{},\"total_reference_cycles\":{},\"total_cpu_cycles\":{},\"total_instructions_retired\":{}}}",
                     scope_name(sample.scope),
                     JsonStr(&sample.name),
                     sample.count,
@@ -268,6 +277,7 @@ fn write_metrics(options: &Options) -> Result<(), PerfError> {
                     sample.min_nanos,
                     sample.max_nanos,
                     sample.total_bytes,
+                    bytes_per_second(sample.total_bytes, sample.total_nanos),
                     sample.total_reference_cycles,
                     sample.total_cpu_cycles,
                     sample.total_instructions_retired
@@ -302,6 +312,14 @@ fn scope_name(scope: Scope) -> &'static str {
     }
 }
 
+fn bytes_per_second(total_bytes: u64, total_nanos: u64) -> u64 {
+    if total_bytes == 0 || total_nanos == 0 {
+        return 0;
+    }
+    let bytes_per_second = (u128::from(total_bytes) * 1_000_000_000) / u128::from(total_nanos);
+    bytes_per_second.min(u128::from(u64::MAX)) as u64
+}
+
 struct JsonStr<'a>(&'a str);
 
 impl fmt::Display for JsonStr<'_> {
@@ -318,5 +336,17 @@ impl fmt::Display for JsonStr<'_> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bytes_per_second;
+
+    #[test]
+    fn byte_rate_uses_nanosecond_duration() {
+        assert_eq!(bytes_per_second(1_500, 1_000), 1_500_000_000);
+        assert_eq!(bytes_per_second(0, 1_000), 0);
+        assert_eq!(bytes_per_second(1_500, 0), 0);
     }
 }
