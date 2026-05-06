@@ -15658,10 +15658,12 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
+    let iovs_started = p1_kernel_profile_start(caller.data());
     let iovs = match p1_read_iovs(caller, memory, ri_data, ri_data_len) {
         Ok(iovs) => iovs,
         Err(errno) => return errno,
     };
+    p1_record_optional_kernel_profile(caller.data(), "sock_recv_iovs", iovs_started);
     let capacity = iovs
         .iter()
         .try_fold(0u32, |sum, (_, len)| sum.checked_add(*len));
@@ -15731,16 +15733,21 @@ where
     } else {
         u64::MAX
     };
+    let service_started = p1_kernel_profile_start(caller.data());
     let bytes = match service.tcp_read(stream, capacity, timeout).await {
         Ok(Some(bytes)) => bytes,
         Ok(None) => Bytes::new(),
         Err(error) => return p1_errno_from_tcp_error_for_fdflags(error, fdflags),
     };
+    p1_record_optional_kernel_profile(caller.data(), "sock_recv_tcp_read", service_started);
+    let write_started = p1_kernel_profile_start(caller.data());
     let status = p1_write_iovs_from_bytes(caller, memory, iovs, &bytes, ro_datalen);
     if status != p1::errno::SUCCESS {
         return status;
     }
-    p1_write_u16(caller, memory, ro_flags, 0)
+    let status = p1_write_u16(caller, memory, ro_flags, 0);
+    p1_record_optional_kernel_profile(caller.data(), "sock_recv_write_iovs", write_started);
+    status
 }
 
 async fn p1_sock_send<CpuImpl, HostFs>(
