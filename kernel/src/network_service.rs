@@ -257,6 +257,39 @@ impl NetworkTransmitStop {
 }
 
 impl NetworkPollSource {
+    const fn tx_immediate_phase(self) -> &'static str {
+        match self {
+            Self::Pump => "tx-submit-immediate-pump",
+            Self::Ping => "tx-submit-immediate-ping",
+            Self::Dns => "tx-submit-immediate-dns",
+            Self::Tcp => "tx-submit-immediate-tcp",
+            Self::Udp => "tx-submit-immediate-udp",
+            Self::Configuration => "tx-submit-immediate-configuration",
+        }
+    }
+
+    const fn tx_fallback_collect_phase(self) -> &'static str {
+        match self {
+            Self::Pump => "tx-submit-fallback-collect-pump",
+            Self::Ping => "tx-submit-fallback-collect-ping",
+            Self::Dns => "tx-submit-fallback-collect-dns",
+            Self::Tcp => "tx-submit-fallback-collect-tcp",
+            Self::Udp => "tx-submit-fallback-collect-udp",
+            Self::Configuration => "tx-submit-fallback-collect-configuration",
+        }
+    }
+
+    const fn tx_fallback_device_phase(self) -> &'static str {
+        match self {
+            Self::Pump => "tx-submit-fallback-device-pump",
+            Self::Ping => "tx-submit-fallback-device-ping",
+            Self::Dns => "tx-submit-fallback-device-dns",
+            Self::Tcp => "tx-submit-fallback-device-tcp",
+            Self::Udp => "tx-submit-fallback-device-udp",
+            Self::Configuration => "tx-submit-fallback-device-configuration",
+        }
+    }
+
     const fn rx_drain_phase(self) -> &'static str {
         match self {
             Self::Pump => "rx-drain-pump",
@@ -1608,6 +1641,7 @@ where
         let mut transmit_stop = NetworkTransmitStop::Drained;
         while submit_transmit && transmitted < budget.tx_frames {
             let remaining_budget = budget.tx_frames - transmitted;
+            let immediate_started = self.profile_start();
             let immediate =
                 self.inner
                     .state
@@ -1625,6 +1659,12 @@ where
                     accepted,
                     accepted_bytes,
                 } => {
+                    self.record_network_profile_events_bytes(
+                        source.tx_immediate_phase(),
+                        immediate_started,
+                        accepted,
+                        accepted_bytes,
+                    );
                     transmitted += accepted;
                     transmitted_bytes = transmitted_bytes.saturating_add(accepted_bytes);
                     if accepted < offered {
@@ -1636,6 +1676,7 @@ where
             }
 
             let mut frames = smallvec::SmallVec::<[PacketBuffer; NETWORK_TX_BATCH_FRAMES]>::new();
+            let collect_started = self.profile_start();
             self.inner.state.with_mut(|state| {
                 let remaining_budget = budget.tx_frames - transmitted;
                 while frames.len() < NETWORK_TX_BATCH_FRAMES && frames.len() < remaining_budget {
@@ -1648,15 +1689,30 @@ where
             if frames.is_empty() {
                 break;
             }
-            let submitted = self.inner.device.try_transmit_packet_batch(&frames).await?;
-            transmitted += submitted;
-            transmitted_bytes = transmitted_bytes.saturating_add(
+            self.record_network_profile_events_bytes(
+                source.tx_fallback_collect_phase(),
+                collect_started,
+                frames.len(),
                 frames
                     .iter()
-                    .take(submitted)
                     .map(|frame| frame.as_ref().len())
                     .sum::<usize>(),
             );
+            let device_started = self.profile_start();
+            let submitted = self.inner.device.try_transmit_packet_batch(&frames).await?;
+            let submitted_bytes = frames
+                .iter()
+                .take(submitted)
+                .map(|frame| frame.as_ref().len())
+                .sum::<usize>();
+            self.record_network_profile_events_bytes(
+                source.tx_fallback_device_phase(),
+                device_started,
+                submitted,
+                submitted_bytes,
+            );
+            transmitted += submitted;
+            transmitted_bytes = transmitted_bytes.saturating_add(submitted_bytes);
             if submitted < frames.len() {
                 transmit_stop = NetworkTransmitStop::RingFull;
                 self.inner.state.with_mut(|state| {
