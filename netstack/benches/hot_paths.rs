@@ -374,6 +374,19 @@ fn tcp_first_listen(bencher: Bencher) {
     });
 }
 
+#[divan::bench(args = [8usize, 64])]
+fn tcp_listen_many(bencher: Bencher, sockets: usize) {
+    bencher.counter(ItemsCount::new(sockets)).bench_local(|| {
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514));
+        for index in 0..sockets {
+            stack.open_tcp_listen(TcpEndpoint {
+                address: IpAddress::Ipv4(LOCAL_IP),
+                port: 8000 + u16::try_from(black_box(index)).expect("benchmark port fits u16"),
+            });
+        }
+    });
+}
+
 #[divan::bench]
 fn udp_queue_and_immediate_submit(bencher: Bencher) {
     let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514));
