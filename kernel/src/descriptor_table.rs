@@ -4,8 +4,11 @@ use alloc::collections::BinaryHeap;
 use alloc::vec::Vec;
 use core::cmp::Reverse;
 
+use heapless::binary_heap::{BinaryHeap as InlineBinaryHeap, Min};
 use helios_hal::resource::{KernelResource, ResourceRights};
 use thiserror::Error;
+
+const INLINE_FREE_DESCRIPTOR_SLOTS: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DescriptorId(u32);
@@ -73,7 +76,7 @@ where
     Rights: ResourceRights,
 {
     entries: Vec<Option<DescriptorEntry<T, Rights>>>,
-    free: BinaryHeap<Reverse<usize>>,
+    free: FreeDescriptorSlots,
 }
 
 impl<T, Rights> Default for DescriptorTable<T, Rights>
@@ -92,7 +95,14 @@ where
     pub const fn new() -> Self {
         Self {
             entries: Vec::new(),
-            free: BinaryHeap::new(),
+            free: FreeDescriptorSlots::new(),
+        }
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+            free: FreeDescriptorSlots::with_capacity(capacity),
         }
     }
 
@@ -137,7 +147,7 @@ where
             .and_then(Option::take)
             .map(DescriptorEntry::into_resource)
             .ok_or(DescriptorTableError::BadDescriptor(descriptor.raw()))?;
-        self.free.push(Reverse(descriptor_index(descriptor)?));
+        self.free.release(descriptor_index(descriptor)?);
         Ok(resource)
     }
 
@@ -176,10 +186,10 @@ where
         if self.entries.len() <= target_index {
             let old_len = self.entries.len();
             self.entries.resize_with(target_index + 1, || None);
-            self.free.extend((old_len..target_index).map(Reverse));
+            self.free.release_range(old_len..target_index);
         }
         self.entries[target_index] = Some(entry);
-        self.free.push(Reverse(source_index));
+        self.free.release(source_index);
         Ok(())
     }
 
@@ -187,13 +197,13 @@ where
         for (index, slot) in self.entries.iter_mut().enumerate() {
             if slot.as_ref().is_some_and(DescriptorEntry::close_on_exec) {
                 *slot = None;
-                self.free.push(Reverse(index));
+                self.free.release(index);
             }
         }
     }
 
     fn allocate_slot_index(&mut self) -> usize {
-        while let Some(Reverse(index)) = self.free.pop() {
+        while let Some(index) = self.free.allocate() {
             if self.entries.get(index).is_some_and(Option::is_none) {
                 return index;
             }
@@ -201,6 +211,60 @@ where
         let index = self.entries.len();
         self.entries.push(None);
         index
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct FreeDescriptorSlots {
+    inline: InlineBinaryHeap<usize, Min, INLINE_FREE_DESCRIPTOR_SLOTS>,
+    overflow: BinaryHeap<Reverse<usize>>,
+}
+
+impl FreeDescriptorSlots {
+    pub(crate) const fn new() -> Self {
+        Self {
+            inline: InlineBinaryHeap::new(),
+            overflow: BinaryHeap::new(),
+        }
+    }
+
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        let mut slots = Self::new();
+        if capacity > INLINE_FREE_DESCRIPTOR_SLOTS {
+            slots
+                .overflow
+                .reserve_exact(capacity - INLINE_FREE_DESCRIPTOR_SLOTS);
+        }
+        slots
+    }
+
+    pub(crate) fn release(&mut self, index: usize) {
+        if let Err(index) = self.inline.push(index) {
+            self.overflow.push(Reverse(index));
+        }
+    }
+
+    pub(crate) fn release_range(&mut self, range: core::ops::Range<usize>) {
+        if range.len() > INLINE_FREE_DESCRIPTOR_SLOTS {
+            self.overflow.reserve_exact(range.len());
+            self.overflow.extend(range.map(Reverse));
+            return;
+        }
+        for index in range {
+            self.release(index);
+        }
+    }
+
+    pub(crate) fn allocate(&mut self) -> Option<usize> {
+        match (
+            self.inline.peek().copied(),
+            self.overflow.peek().map(|Reverse(index)| *index),
+        ) {
+            (Some(inline), Some(overflow)) if inline <= overflow => self.inline.pop(),
+            (Some(_), None) => self.inline.pop(),
+            (_, Some(_)) => self.overflow.pop().map(|Reverse(index)| index),
+            (None, None) => None,
+        }
     }
 }
 

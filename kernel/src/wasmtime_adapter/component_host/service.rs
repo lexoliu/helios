@@ -1,5 +1,6 @@
 use super::*;
 use crate::ProgramExecErrorDetail;
+use crate::descriptor_table::FreeDescriptorSlots;
 use crate::wasmtime_adapter::artifact_profile::{self, ArtifactProfileError};
 use crate::wasmtime_adapter::config::AotCompileHint;
 use crate::wasmtime_adapter::cwasm::{self, ArtifactTrustError, UntrustedCwasm};
@@ -13,11 +14,9 @@ use crate::wasmtime_adapter::{
 };
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
-use alloc::collections::BinaryHeap;
 use alloc::string::String;
 use alloc::vec;
 use bytes::Bytes;
-use core::cmp::Reverse;
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering as AtomicOrdering};
@@ -555,7 +554,7 @@ struct Preview1Cwd {
 #[derive(Clone)]
 struct Preview1DescriptorTable {
     entries: Vec<Option<Preview1DescriptorEntry>>,
-    free: BinaryHeap<Reverse<usize>>,
+    free: FreeDescriptorSlots,
 }
 
 #[derive(Clone, Copy)]
@@ -3030,23 +3029,24 @@ fn guest_path_suffix<'a>(path: &'a str, preopen: &str) -> &'a str {
 
 impl Preview1DescriptorTable {
     fn from_authority(authority: &ProcessAuthority) -> Self {
-        let mut table = Self::from_entries(vec![
-            Some(Preview1DescriptorEntry::new(
-                Preview1Descriptor::Stdin {
-                    carry: Bytes::new(),
-                },
-                false,
-            )),
-            Some(Preview1DescriptorEntry::new(
-                Preview1Descriptor::Stdout,
-                false,
-            )),
-            Some(Preview1DescriptorEntry::new(
-                Preview1Descriptor::Stderr,
-                false,
-            )),
-        ]);
-        for preopen in authority.directory_preopens() {
+        let preopens = authority.directory_preopens();
+        let mut entries = Vec::with_capacity(3 + preopens.len());
+        entries.push(Some(Preview1DescriptorEntry::new(
+            Preview1Descriptor::Stdin {
+                carry: Bytes::new(),
+            },
+            false,
+        )));
+        entries.push(Some(Preview1DescriptorEntry::new(
+            Preview1Descriptor::Stdout,
+            false,
+        )));
+        entries.push(Some(Preview1DescriptorEntry::new(
+            Preview1Descriptor::Stderr,
+            false,
+        )));
+        let mut table = Self::from_entries(entries);
+        for preopen in preopens {
             let descriptor = FsDescriptor {
                 path: preopen.source_path().to_owned(),
                 kind: FsNodeKind::Directory,
@@ -3065,10 +3065,10 @@ impl Preview1DescriptorTable {
     }
 
     fn from_entries(entries: Vec<Option<Preview1DescriptorEntry>>) -> Self {
-        let mut free = BinaryHeap::new();
+        let mut free = FreeDescriptorSlots::with_capacity(entries.len());
         for (index, entry) in entries.iter().enumerate() {
             if entry.is_none() {
-                free.push(Reverse(index));
+                free.release(index);
             }
         }
         Self { entries, free }
@@ -3147,9 +3147,7 @@ impl Preview1DescriptorTable {
         if self.entries.len() <= to {
             let previous_len = self.entries.len();
             self.entries.resize_with(to + 1, || None);
-            for index in previous_len..to {
-                self.free.push(Reverse(index));
-            }
+            self.free.release_range(previous_len..to);
         }
         self.entries[to] = Some(entry);
         u32::try_from(to).map_err(|_| p1::errno::OVERFLOW)
@@ -3232,12 +3230,12 @@ impl Preview1DescriptorTable {
         self.entries
             .get_mut(index)
             .and_then(Option::take)
-            .map(|_| self.free.push(Reverse(index)))
+            .map(|_| self.free.release(index))
             .map_or(p1::errno::BADF, |_| p1::errno::SUCCESS)
     }
 
     fn allocate_slot_index(&mut self) -> usize {
-        while let Some(Reverse(index)) = self.free.pop() {
+        while let Some(index) = self.free.allocate() {
             if self.entries.get(index).is_some_and(Option::is_none) {
                 return index;
             }
@@ -3259,7 +3257,7 @@ impl Preview1DescriptorTable {
 
     fn close_slot(&mut self, index: usize) {
         self.entries[index] = None;
-        self.free.push(Reverse(index));
+        self.free.release(index);
     }
 
     fn renumber(&mut self, from: i32, to: i32) -> i32 {
@@ -3277,9 +3275,7 @@ impl Preview1DescriptorTable {
         if self.entries.len() <= to {
             let previous_len = self.entries.len();
             self.entries.resize_with(to + 1, || None);
-            for index in previous_len..to {
-                self.free.push(Reverse(index));
-            }
+            self.free.release_range(previous_len..to);
         }
         self.close_slot(from);
         self.entries[to] = Some(entry);

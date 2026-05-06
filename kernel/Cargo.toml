@@ -25,6 +25,7 @@ critical-section = "1.2.0"
 event-listener = { version = "5.4.1", default-features = false, features = ["critical-section"] }
 futures = { version = "0.3.31", default-features = false, features = ["alloc"] }
 hashbrown = { version = "0.16.1", default-features = false, features = ["allocator-api2", "default-hasher", "equivalent", "inline-more"] }
+heapless = { version = "0.7.17", default-features = false }
 nu-ansi-term = { version = "0.50.3", default-features = false }
 objectpool = { version = "0.1.0", default-features = false, features = ["alloc"] }
 helios-artifact.workspace = true
@@ -45,9 +46,14 @@ wasmparser = { version = "0.245.0", default-features = false, features = ["compo
 
 [dev-dependencies]
 critical-section = { version = "1.2.0", features = ["std"] }
+divan = { version = "0.1.21", default-features = false }
 futures-lite = "2.6.1"
 helios-kernel-macro.workspace = true
 wasm-encoder = "0.245.0"
+
+[[bench]]
+name = "data_structures"
+harness = false
 
 [build-dependencies]
 askama = "0.15.6"
