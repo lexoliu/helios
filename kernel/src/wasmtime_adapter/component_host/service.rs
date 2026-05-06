@@ -14116,7 +14116,14 @@ where
         Some(_) => return p1::errno::NOTSOCK,
         None => return p1::errno::BADF,
     };
-    let listener = match service.tcp_listen(local_port, backlog).await {
+    let listener = match service
+        .tcp_listen(
+            crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0])),
+            local_port,
+            backlog,
+        )
+        .await
+    {
         Ok(listener) => listener,
         Err(error) => return p1_errno_from_tcp_error(error),
     };
@@ -14201,13 +14208,7 @@ where
         return status;
     }
     if ret_addr != 0 {
-        return write_wasix_addr_port_ip4(
-            caller,
-            memory,
-            ret_addr,
-            peer_address,
-            accepted.port,
-        );
+        return write_wasix_addr_port_ip4(caller, memory, ret_addr, peer_address, accepted.port);
     }
     p1::errno::SUCCESS
 }

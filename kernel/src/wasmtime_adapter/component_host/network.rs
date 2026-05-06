@@ -10,8 +10,9 @@ use bytes::Bytes;
 
 use crate::{
     ComponentNetworkService, DnsError, Ipv4Address, Ipv4Cidr, Ipv4Route, MacAddress,
-    NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkPortId, PingError,
-    PingReply, TcpAccepted, TcpError, TcpListener, UdpBinding, UdpDatagram, UdpError,
+    NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkIpAddress,
+    NetworkPortId, PingError, PingReply, TcpAccepted, TcpError, TcpListener, UdpBinding,
+    UdpDatagram, UdpError,
 };
 
 pub trait ComponentHostTcpStreamToken: Copy + Send + 'static {
@@ -96,6 +97,7 @@ trait DynComponentHostNetworkService: Send + Sync + 'static {
 
     fn tcp_listen<'a>(
         &'a self,
+        local_address: NetworkIpAddress,
         local_port: u16,
         backlog: u16,
     ) -> Pin<Box<dyn Future<Output = Result<TcpListener<u64>, TcpError>> + Send + 'a>>;
@@ -311,10 +313,11 @@ impl ComponentNetworkService for ComponentHostNetworkService {
 
     fn tcp_listen(
         &self,
+        local_address: NetworkIpAddress,
         local_port: u16,
         backlog: u16,
     ) -> impl Future<Output = Result<TcpListener<Self::TcpListener>, TcpError>> + Send + '_ {
-        self.inner.tcp_listen(local_port, backlog)
+        self.inner.tcp_listen(local_address, local_port, backlog)
     }
 
     fn tcp_accept(
@@ -576,11 +579,15 @@ where
 
     fn tcp_listen<'a>(
         &'a self,
+        local_address: NetworkIpAddress,
         local_port: u16,
         backlog: u16,
     ) -> Pin<Box<dyn Future<Output = Result<TcpListener<u64>, TcpError>> + Send + 'a>> {
         Box::pin(async move {
-            let listener = self.service.tcp_listen(local_port, backlog).await?;
+            let listener = self
+                .service
+                .tcp_listen(local_address, local_port, backlog)
+                .await?;
             Ok(TcpListener {
                 listener: listener.listener.into_raw(),
                 local_port: listener.local_port,

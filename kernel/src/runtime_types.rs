@@ -467,6 +467,7 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
 
     fn tcp_listen(
         &self,
+        local_address: NetworkIpAddress,
         local_port: u16,
         backlog: u16,
     ) -> impl Future<Output = Result<TcpListener<Self::TcpListener>, TcpError>> + Send + '_;

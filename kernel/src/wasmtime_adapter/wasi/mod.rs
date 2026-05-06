@@ -505,6 +505,13 @@ impl WasiTcpIpAddress {
         }
     }
 
+    const fn network_address(self) -> crate::NetworkIpAddress {
+        match self {
+            Self::Ipv4(address) => crate::NetworkIpAddress::Ipv4(address),
+            Self::Ipv6(address) => crate::NetworkIpAddress::Ipv6(address),
+        }
+    }
+
     fn write_host<'a>(self, buffer: &'a mut [u8; 39]) -> &'a str {
         match self {
             Self::Ipv4(address) => {
@@ -5383,7 +5390,7 @@ where
     ) -> Result<core::result::Result<StreamReader<Resource<TcpSocket>>, socket_types::ErrorCode>>
     {
         let socket = access.get().table.get(&socket_resource)?.clone();
-        let (local_port, listen_backlog) = {
+        let (local_address, listen_backlog) = {
             let state = socket.inner.lock();
             if state.stream.is_some()
                 || state.listener.is_some()
@@ -5393,17 +5400,15 @@ where
             {
                 return Ok(Err(socket_types::ErrorCode::InvalidState));
             }
-            if state.family == WasiTcpSocketFamily::Ipv6 {
-                return Ok(Err(socket_types::ErrorCode::NotSupported));
-            }
-            (
-                state.local_address.map_or(0, |address| address.port),
-                state.listen_backlog,
-            )
+            let local_address = state.local_address.unwrap_or(WasiTcpSocketAddress {
+                address: state.family.unspecified_address(),
+                port: 0,
+            });
+            (local_address, state.listen_backlog)
         };
         if !has_wasi_network_rights(
             access.get().process_authority(),
-            wasi_tcp_bind_rights(local_port),
+            wasi_tcp_bind_rights(local_address.port),
         ) {
             return Ok(Err(socket_types::ErrorCode::AccessDenied));
         }
@@ -5431,7 +5436,13 @@ where
             )
         };
         spawner.spawn_detached(async move {
-            let result = service.tcp_listen(local_port, listen_backlog).await;
+            let result = service
+                .tcp_listen(
+                    local_address.address.network_address(),
+                    local_address.port,
+                    listen_backlog,
+                )
+                .await;
             let mut state = inner.lock();
             state.listen_in_progress = false;
             state.listen_result = Some(result);
@@ -5990,6 +6001,7 @@ mod tests {
 
         fn tcp_listen(
             &self,
+            _: crate::NetworkIpAddress,
             local_port: u16,
             _: u16,
         ) -> impl core::future::Future<

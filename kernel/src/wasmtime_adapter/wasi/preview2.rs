@@ -2765,7 +2765,7 @@ where
         socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
         let socket = self.table.get(&socket)?.clone();
-        let (service, inner, ready, local_port, listen_backlog) = {
+        let (service, inner, ready, local_address, listen_backlog) = {
             let mut state = socket.inner.lock();
             if state.stream.is_some()
                 || state.listener.is_some()
@@ -2775,12 +2775,14 @@ where
             {
                 return Ok(Err(p2tcp::ErrorCode::InvalidState));
             }
-            if state.family == WasiTcpSocketFamily::Ipv6 {
-                return Ok(Err(p2tcp::ErrorCode::NotSupported));
-            }
-            let local_port = state.local_address.map_or(0, |address| address.port);
-            if !has_wasi_network_rights(self.process_authority(), wasi_tcp_bind_rights(local_port))
-            {
+            let local_address = state.local_address.unwrap_or(WasiTcpSocketAddress {
+                address: state.family.unspecified_address(),
+                port: 0,
+            });
+            if !has_wasi_network_rights(
+                self.process_authority(),
+                wasi_tcp_bind_rights(local_address.port),
+            ) {
                 return Ok(Err(p2tcp::ErrorCode::AccessDenied));
             }
             state.listen_in_progress = true;
@@ -2788,12 +2790,18 @@ where
                 state.service.clone(),
                 socket.inner.clone(),
                 socket.ready.clone(),
-                local_port,
+                local_address,
                 state.listen_backlog,
             )
         };
         self.spawner().spawn_detached(async move {
-            let result = service.tcp_listen(local_port, listen_backlog).await;
+            let result = service
+                .tcp_listen(
+                    local_address.address.network_address(),
+                    local_address.port,
+                    listen_backlog,
+                )
+                .await;
             let mut state = inner.lock();
             state.listen_in_progress = false;
             state.listen_result = Some(result);

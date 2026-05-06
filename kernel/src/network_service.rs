@@ -292,6 +292,13 @@ fn map_ip_address(address: IpAddress) -> NetworkIpAddress {
     }
 }
 
+fn map_network_ip_address(address: NetworkIpAddress) -> IpAddress {
+    match address {
+        NetworkIpAddress::Ipv4(address) => IpAddress::Ipv4(map_kernel_ipv4_address(address)),
+        NetworkIpAddress::Ipv6(address) => IpAddress::Ipv6(address),
+    }
+}
+
 fn map_kernel_ipv4_address(address: KernelIpv4Address) -> Ipv4Address {
     Ipv4Address::new(address.octets())
 }
@@ -485,10 +492,12 @@ where
 
     pub async fn tcp_listen(
         &self,
+        local_address: NetworkIpAddress,
         local_port: u16,
         backlog: u16,
     ) -> Result<TcpListener<TcpListenerId>, TcpError> {
-        self.execute_tcp_listen(local_port, backlog).await
+        self.execute_tcp_listen(local_address, local_port, backlog)
+            .await
     }
 
     pub async fn tcp_accept(
@@ -701,11 +710,12 @@ where
 
     async fn execute_tcp_listen(
         &self,
+        local_address: NetworkIpAddress,
         local_port: u16,
         _backlog: u16,
     ) -> Result<TcpListener<TcpListenerId>, TcpError> {
         let mut state = self.inner.state.lock().await;
-        state.start_tcp_listen(local_port)
+        state.start_tcp_listen(local_address, local_port)
     }
 
     async fn execute_tcp_accept(
@@ -1355,11 +1365,12 @@ where
 
     fn tcp_listen(
         &self,
+        local_address: NetworkIpAddress,
         local_port: u16,
         backlog: u16,
     ) -> impl core::future::Future<Output = Result<TcpListener<Self::TcpListener>, TcpError>> + Send + '_
     {
-        async move { NetworkService::tcp_listen(self, local_port, backlog).await }
+        async move { NetworkService::tcp_listen(self, local_address, local_port, backlog).await }
     }
 
     fn tcp_accept(
@@ -1862,6 +1873,7 @@ impl NetworkState {
 
     fn start_tcp_listen(
         &mut self,
+        local_address: NetworkIpAddress,
         local_port: u16,
     ) -> Result<TcpListener<TcpListenerId>, TcpError> {
         let local_port = if local_port == 0 {
@@ -1875,7 +1887,7 @@ impl NetworkState {
             });
         };
         self.stack.open_tcp_listen(TcpEndpoint {
-            address: IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+            address: map_network_ip_address(local_address),
             port: local_port,
         });
         Ok(TcpListener {
@@ -2415,15 +2427,50 @@ fn socket_index(socket: UdpSocketId) -> usize {
 mod tests {
     use bytes::Bytes;
     use helios_netstack::{
-        ETHERNET_FRAME_BYTES, EthernetFrame, IpAddress, Ipv6Address, Ipv6Cidr, Ipv6Packet,
-        NeighborEntry, NeighborState, StackInstant, TcpFlags, TcpPacket,
+        ETHERNET_FRAME_BYTES, EthernetFrame, EthernetProtocol, IpAddress, IpProtocol, Ipv6Address,
+        Ipv6Cidr, Ipv6Packet, NeighborEntry, NeighborState, StackInstant, TcpFlags, TcpHeader,
+        TcpPacket,
     };
 
     use super::{
-        HandleSlab, NETWORK_BUSY_POLL_ROUNDS, NetworkPollBudget, NetworkPollProgress,
-        NetworkPollState, NetworkPumpAction, NetworkPumpCadence, NetworkState,
+        HandleSlab, NETWORK_BUSY_POLL_ROUNDS, NetworkIpAddress, NetworkPollBudget,
+        NetworkPollProgress, NetworkPollState, NetworkPumpAction, NetworkPumpCadence, NetworkState,
         limit_udp_datagram_bytes, parse_ipv6,
     };
+
+    fn ipv6_tcp_frame(
+        source: Ipv6Address,
+        destination: Ipv6Address,
+        header: TcpHeader,
+    ) -> ([u8; ETHERNET_FRAME_BYTES], usize) {
+        let mut frame = [0; ETHERNET_FRAME_BYTES];
+        let mut offset = EthernetFrame::encode_header(
+            &mut frame,
+            [0x02, 0, 0, 0, 0, 1],
+            [0x02, 0, 0, 0, 0, 2],
+            EthernetProtocol::Ipv6,
+        )
+        .expect("test Ethernet header should fit");
+        let tcp_start = offset + Ipv6Packet::HEADER_LEN;
+        let tcp_len = TcpPacket::encode(
+            &mut frame[tcp_start..],
+            IpAddress::Ipv6(source),
+            IpAddress::Ipv6(destination),
+            header,
+            &[],
+        )
+        .expect("test TCP segment should fit");
+        offset += Ipv6Packet::encode_header(
+            &mut frame[offset..],
+            source,
+            destination,
+            IpProtocol::Tcp,
+            tcp_len,
+            64,
+        )
+        .expect("test IPv6 header should fit");
+        (frame, offset + tcp_len)
+    }
 
     #[test]
     fn handle_slab_reuses_removed_slot() {
@@ -2499,6 +2546,77 @@ mod tests {
         assert_eq!(ipv6.destination, remote);
         assert_eq!(tcp.destination_port, 443);
         assert!(tcp.flags.contains(TcpFlags::SYN));
+    }
+
+    #[test]
+    fn tcp_listen_on_ipv6_address_accepts_ipv6_peer() {
+        let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        let mut state = NetworkState::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 8, 1);
+        state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+        state.stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv6(remote),
+            mac: [0x02, 0, 0, 0, 0, 2],
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        let listener = state
+            .start_tcp_listen(NetworkIpAddress::Ipv6(local), 8080)
+            .expect("IPv6 TCP listen should allocate a listener");
+
+        let (syn, syn_len) = ipv6_tcp_frame(
+            remote,
+            local,
+            TcpHeader {
+                source_port: 49152,
+                destination_port: 8080,
+                sequence: 10,
+                acknowledgement: 0,
+                flags: TcpFlags::SYN,
+                window_size: u16::MAX,
+            },
+        );
+        state
+            .stack
+            .receive_frame(&syn[..syn_len], StackInstant::from_nanos(1))
+            .expect("IPv6 SYN should be accepted by listener");
+        state
+            .stack
+            .drive_tcp(StackInstant::from_nanos(1))
+            .expect("IPv6 SYN-ACK should be queued");
+
+        let frame = state
+            .stack
+            .take_outbound()
+            .expect("IPv6 SYN-ACK frame should be queued");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        let ipv6 = Ipv6Packet::parse(ethernet.payload).expect("IPv6 packet should parse");
+        let syn_ack = TcpPacket::parse(ipv6.payload).expect("TCP packet should parse");
+        assert!(syn_ack.flags.contains(TcpFlags::SYN.union(TcpFlags::ACK)));
+
+        let (ack, ack_len) = ipv6_tcp_frame(
+            remote,
+            local,
+            TcpHeader {
+                source_port: 49152,
+                destination_port: 8080,
+                sequence: 11,
+                acknowledgement: syn_ack.sequence.wrapping_add(1),
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+        );
+        state
+            .stack
+            .receive_frame(&ack[..ack_len], StackInstant::from_nanos(2))
+            .expect("IPv6 final ACK should establish accepted socket");
+
+        let accepted = state
+            .poll_tcp_accept(listener.listener)
+            .expect("IPv6 accept should poll")
+            .expect("accepted IPv6 stream should be queued");
+        assert_eq!(accepted.address, NetworkIpAddress::Ipv6(remote));
+        assert_eq!(accepted.port, 49152);
     }
 
     #[test]

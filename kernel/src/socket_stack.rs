@@ -5,9 +5,9 @@ use core::future::Future;
 use bytes::Bytes;
 
 use crate::{
-    ComponentNetworkService, DnsCap, MulticastCap, NetworkErrorDetail, PrivilegedBindCap,
-    TcpAccepted, TcpCap, TcpError, TcpErrorKind, TcpListener, UdpBinding, UdpCap, UdpError,
-    UdpErrorKind,
+    ComponentNetworkService, DnsCap, MulticastCap, NetworkErrorDetail, NetworkIpAddress,
+    PrivilegedBindCap, TcpAccepted, TcpCap, TcpError, TcpErrorKind, TcpListener, UdpBinding,
+    UdpCap, UdpError, UdpErrorKind,
 };
 
 #[derive(Clone)]
@@ -59,6 +59,7 @@ where
         &self,
         _: TcpCap,
         privileged_bind: Option<PrivilegedBindCap>,
+        local_address: NetworkIpAddress,
         local_port: u16,
         backlog: u16,
     ) -> impl Future<Output = Result<TcpListener<Service::TcpListener>, TcpError>> + Send + '_ {
@@ -69,7 +70,9 @@ where
                     detail: NetworkErrorDetail::PrivilegedBindDenied,
                 });
             }
-            self.service.tcp_listen(local_port, backlog).await
+            self.service
+                .tcp_listen(local_address, local_port, backlog)
+                .await
         }
     }
 
@@ -213,6 +216,8 @@ mod tests {
         TcpListener, UdpBinding, UdpDatagram, UdpError,
     };
 
+    const TCP_ANY_V4: NetworkIpAddress = NetworkIpAddress::Ipv4(Ipv4Address::new([0, 0, 0, 0]));
+
     #[derive(Clone, Copy)]
     struct TestNetworkService;
 
@@ -272,6 +277,7 @@ mod tests {
 
         fn tcp_listen(
             &self,
+            _: NetworkIpAddress,
             local_port: u16,
             _: u16,
         ) -> impl Future<Output = Result<TcpListener<Self::TcpListener>, TcpError>> + Send + '_
@@ -405,7 +411,8 @@ mod tests {
             block_on(stack.tcp_connect_from(tcp, "localhost", 80, 4040, 1)).unwrap(),
             4040
         );
-        let listener = block_on(stack.tcp_listen(tcp, Some(privileged), 53, 1)).unwrap();
+        let listener =
+            block_on(stack.tcp_listen(tcp, Some(privileged), TCP_ANY_V4, 53, 1)).unwrap();
         assert_eq!(listener.local_port, 53);
         assert_eq!(
             block_on(stack.tcp_accept(tcp, listener.listener, 1))
@@ -444,7 +451,7 @@ mod tests {
         let tcp = authority.derive_tcp_cap().unwrap();
         let stack = SocketStack::new(TestNetworkService);
 
-        let error = block_on(stack.tcp_listen(tcp, None, 53, 1)).unwrap_err();
+        let error = block_on(stack.tcp_listen(tcp, None, TCP_ANY_V4, 53, 1)).unwrap_err();
         assert_eq!(error.kind, crate::TcpErrorKind::PermissionDenied);
         assert_eq!(error.detail, NetworkErrorDetail::PrivilegedBindDenied);
     }
@@ -472,7 +479,7 @@ mod tests {
         let stack = SocketStack::new(TestNetworkService);
 
         assert_eq!(
-            block_on(stack.tcp_listen(tcp, None, 8080, 1))
+            block_on(stack.tcp_listen(tcp, None, TCP_ANY_V4, 8080, 1))
                 .unwrap()
                 .local_port,
             8080
