@@ -7,10 +7,10 @@
 //!
 //! # Concurrency
 //!
-//! Single-frame reuse is serialized by the slab lock, while contiguous
-//! range allocation is serialized by the buddy heap. The slab is drained
-//! before retrying a failed contiguous allocation so cached frames do not
-//! harm large-range availability.
+//! Single-frame reuse uses lock-free per-processor slab shards, while
+//! contiguous range allocation is serialized by the buddy heap. The slab is
+//! drained before retrying a failed contiguous allocation so cached frames do
+//! not harm large-range availability.
 
 extern crate alloc;
 

@@ -4,6 +4,10 @@
 //! allocator remains the source of contiguous ranges; this cache keeps recently
 //! freed single frames in a compact slab-style freelist and drains them back to
 //! buddy storage when a larger allocation needs contiguity.
+//!
+//! Each processor shard has its own lock-free freelist and cached-frame
+//! counter. Stats paths aggregate shard counters, but the single-frame fast
+//! path does not update a global cache counter.
 
 extern crate alloc;
 
@@ -24,12 +28,12 @@ struct FreeFrame {
 
 struct FrameSlabShard {
     head: AtomicPtr<FreeFrame>,
+    cached_frames: AtomicUsize,
 }
 
 pub(crate) struct FrameSlabCache {
     fallback: FrameSlabShard,
     shards: Once<Box<[FrameSlabShard]>>,
-    cached_frames: AtomicUsize,
 }
 
 unsafe impl Send for FrameSlabShard {}
@@ -41,6 +45,7 @@ impl FrameSlabShard {
     const fn new() -> Self {
         Self {
             head: AtomicPtr::new(core::ptr::null_mut()),
+            cached_frames: AtomicUsize::new(0),
         }
     }
 
@@ -53,7 +58,10 @@ impl FrameSlabShard {
                 .head
                 .compare_exchange_weak(head, next, Ordering::AcqRel, Ordering::Acquire)
             {
-                Ok(_) => return Some(frame.cast()),
+                Ok(_) => {
+                    self.cached_frames.fetch_sub(1, Ordering::AcqRel);
+                    return Some(frame.cast());
+                }
                 Err(observed) => head = observed,
             }
         }
@@ -78,13 +86,35 @@ impl FrameSlabShard {
         }
     }
 
-    fn drain(&self, cached_frames: &AtomicUsize, mut release: impl FnMut(NonNull<u8>)) {
+    fn drain(&self, mut release: impl FnMut(NonNull<u8>)) {
         let mut head = self.head.swap(core::ptr::null_mut(), Ordering::AcqRel);
         while let Some(frame) = NonNull::new(head) {
             let next = unsafe { frame.as_ref().next };
             head = next;
-            cached_frames.fetch_sub(1, Ordering::AcqRel);
+            self.cached_frames.fetch_sub(1, Ordering::AcqRel);
             release(frame.cast());
+        }
+    }
+
+    fn cached_frames(&self) -> usize {
+        self.cached_frames.load(Ordering::Acquire)
+    }
+
+    fn try_reserve_cached_frame(&self, capacity: usize) -> bool {
+        let mut cached = self.cached_frames.load(Ordering::Acquire);
+        loop {
+            if cached >= capacity {
+                return false;
+            }
+            match self.cached_frames.compare_exchange_weak(
+                cached,
+                cached + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => cached = observed,
+            }
         }
     }
 }
@@ -94,7 +124,6 @@ impl FrameSlabCache {
         Self {
             fallback: FrameSlabShard::new(),
             shards: Once::new(),
-            cached_frames: AtomicUsize::new(0),
         }
     }
 
@@ -132,22 +161,30 @@ impl FrameSlabCache {
     }
 
     pub(crate) fn drain(&self, mut release: impl FnMut(NonNull<u8>)) {
-        self.fallback.drain(&self.cached_frames, &mut release);
+        self.fallback.drain(&mut release);
         if let Some(shards) = self.shards.get() {
             for shard in shards.iter() {
-                shard.drain(&self.cached_frames, &mut release);
+                shard.drain(&mut release);
             }
         }
     }
 
     pub(crate) fn cached_bytes(&self) -> usize {
-        self.cached_frames.load(Ordering::Acquire) * PhysFrame::SIZE
+        let processor_cached = self
+            .shards
+            .get()
+            .map(|shards| {
+                shards
+                    .iter()
+                    .map(FrameSlabShard::cached_frames)
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
+        (self.fallback.cached_frames() + processor_cached) * PhysFrame::SIZE
     }
 
     fn allocate_from(&self, shard: &FrameSlabShard) -> Option<NonNull<u8>> {
-        let frame = shard.allocate()?;
-        self.cached_frames.fetch_sub(1, Ordering::AcqRel);
-        Some(frame)
+        shard.allocate()
     }
 
     fn deallocate_to(
@@ -156,30 +193,19 @@ impl FrameSlabCache {
         frame: NonNull<u8>,
         total_frames: usize,
     ) -> bool {
-        let capacity = slab_capacity_frames(total_frames);
-        if !self.try_reserve_cached_frame(capacity) {
+        let capacity = self.shard_capacity_frames(total_frames);
+        if !shard.try_reserve_cached_frame(capacity) {
             return false;
         }
         shard.deallocate(frame);
         true
     }
 
-    fn try_reserve_cached_frame(&self, capacity: usize) -> bool {
-        let mut cached = self.cached_frames.load(Ordering::Acquire);
-        loop {
-            if cached >= capacity {
-                return false;
-            }
-            match self.cached_frames.compare_exchange_weak(
-                cached,
-                cached + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(observed) => cached = observed,
-            }
-        }
+    fn shard_capacity_frames(&self, total_frames: usize) -> usize {
+        let shard_count = self.shards.get().map_or(1, |shards| shards.len() + 1);
+        slab_capacity_frames(total_frames)
+            .div_ceil(shard_count)
+            .max(1)
     }
 
     fn processor_shard(&self, processor: ProcessorId) -> &FrameSlabShard {
@@ -263,5 +289,21 @@ mod tests {
         assert_eq!(drained, 1);
         assert_eq!(cache.cached_bytes(), PhysFrame::SIZE);
         assert_eq!(cache.allocate_on(ProcessorId::new(0)), Some(second));
+    }
+
+    #[test]
+    fn slab_capacity_is_shard_local() {
+        let cache = FrameSlabCache::new();
+        cache.configure_processors(2);
+        let backing = Box::new(AlignedFrames([0; PhysFrame::SIZE * 2]));
+        let first = NonNull::new(backing.0.as_ptr() as *mut u8).expect("first frame pointer");
+        let second = NonNull::new(unsafe { backing.0.as_ptr().add(PhysFrame::SIZE) } as *mut u8)
+            .expect("second frame pointer");
+
+        assert!(cache.deallocate_on(ProcessorId::new(0), first, 64));
+        assert!(cache.deallocate_on(ProcessorId::new(1), second, 64));
+        assert_eq!(cache.cached_bytes(), PhysFrame::SIZE * 2);
+        assert_eq!(cache.allocate_on(ProcessorId::new(0)), Some(first));
+        assert_eq!(cache.allocate_on(ProcessorId::new(1)), Some(second));
     }
 }
