@@ -20,6 +20,23 @@ HTTP_LARGE_PAYLOAD_BYTES = 64 * 1024 * 1024
 HTTP_LARGE_PAYLOAD_CHUNK = bytes(range(251))
 DEFAULT_GUEST_INTERVAL = "1ms"
 DEFAULT_PERF_EVENT = "cycles:u"
+PROFILE_DESCRIPTIONS = {
+    "guest": {
+        "profile_kind": "wasmtime-guest-profiler",
+        "profile_scope": "wasm-guest",
+        "description": "Wasmtime in-process guest sampling profile for wasm stacks, viewable in Firefox Profiler.",
+    },
+    "perfmap": {
+        "profile_kind": "linux-perf-jit-symbols",
+        "profile_scope": "native-and-jit",
+        "description": "Linux perf profile with Wasmtime perfmap JIT code symbols for flamegraph generation.",
+    },
+    "jitdump": {
+        "profile_kind": "linux-perf-jit-symbols",
+        "profile_scope": "native-and-jit",
+        "description": "Linux perf profile with Wasmtime jitdump records injected before flamegraph generation.",
+    },
+}
 
 
 class QuietHttpHandler(http.server.SimpleHTTPRequestHandler):
@@ -141,6 +158,7 @@ def run_guest_profile(
     run(command, out_dir)
     return {
         "mode": "guest",
+        **PROFILE_DESCRIPTIONS["guest"],
         "command": command,
         "firefox_profile_json": str(profile_path),
     }
@@ -190,6 +208,7 @@ def run_perf_profile(
     run([perf, "script", "-i", str(script_input)], out_dir, perf_script)
     metadata = {
         "mode": mode,
+        **PROFILE_DESCRIPTIONS[mode],
         "command": record,
         "perf_data": str(perf_data),
         "perf_script": str(perf_script),
@@ -212,7 +231,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, default=repo_root() / "tools/wasi-apps/workloads.json")
     parser.add_argument("--workload", required=True)
-    parser.add_argument("--mode", choices=["guest", "perfmap", "jitdump"], default="guest")
+    parser.add_argument(
+        "--mode",
+        choices=["guest", "perfmap", "jitdump"],
+        default="guest",
+        help="Wasmtime guest profiler or Linux perf-backed native/JIT symbol profiling mode.",
+    )
     parser.add_argument("--out-dir", type=Path)
     parser.add_argument("--wasmtime-bin", default=os.environ.get("WASMTIME_BIN", "wasmtime"))
     parser.add_argument("--host-http-url")

@@ -822,10 +822,16 @@ def write_report(
         for profile_path in sorted(helios_jsonl.parent.glob("helios*.kernel.folded")):
             lines.append(f"- Helios kernel folded profile is in `{profile_path}`.")
     if wasmtime_profiles:
-        lines.extend(["", "## Wasmtime Native And Guest Profiles", ""])
+        lines.extend(["", "## Wasmtime Wasm Profiling Artifacts", ""])
         for profile_path in wasmtime_profiles:
             profile = json.loads(profile_path.read_text(encoding="utf-8"))
-            lines.append(f"- `{profile['workload']}` `{profile['mode']}` metadata: `{profile_path}`")
+            profile_kind = profile.get("profile_kind", "unknown")
+            profile_scope = profile.get("profile_scope", "unknown")
+            lines.append(
+                f"- `{profile['workload']}` `{profile['mode']}` `{profile_kind}` `{profile_scope}` metadata: `{profile_path}`"
+            )
+            if "description" in profile:
+                lines.append(f"- `{profile['workload']}` profiler meaning: {profile['description']}")
             if "firefox_profile_json" in profile:
                 lines.append(f"- `{profile['workload']}` Firefox profiler JSON: `{profile['firefox_profile_json']}`")
             if "perf_data" in profile:
