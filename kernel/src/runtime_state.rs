@@ -1,7 +1,7 @@
 extern crate alloc;
 
-use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
+use triomphe::Arc;
 
 use crate::{
     DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY, EmbeddedBootFs,
