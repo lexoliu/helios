@@ -25,7 +25,7 @@ This script:
    under `artifacts/python3-root/`.
 4. Downloads and extracts the pinned official Wasmer WEBc images for
    `sharrattj/dash` `1.0.19`, `wasmer/bash` `1.0.25`,
-   `saghul/quickjs` `0.0.3`, and `wasmer/coreutils` `1.0.19`;
+   `quickjs-ng/quickjs` `v0.14.0`, and `wasmer/coreutils` `1.0.19`;
    validates their raw wasm atoms with `wasm-tools`.
 5. Builds the helios `curl-wasi` program from source with the optimized
    release profile into `artifacts/wasi-tools/`.
@@ -57,9 +57,9 @@ environment, place a pre-downloaded
 `python-${VERSION}-wasi_sdk-24.zip` somewhere and pass its path via
 `CPYTHON_WASI_ZIP=/path/to/zip tools/wasi-apps/build.sh`.
 
-The shell and QuickJS artifacts must be official Wasmer package payloads,
-not repo-local stubs. In an offline environment, either pass the raw
-modules:
+The shell and coreutils artifacts must be official Wasmer package payloads;
+QuickJS is staged from the matching official QuickJS-NG WASI release asset.
+In an offline environment, pass the raw modules:
 
 ```bash
 WASIX_DASH_WASM=/path/to/official/dash.wasm \
@@ -69,12 +69,12 @@ COREUTILS_WASM=/path/to/official/coreutils.wasm \
 tools/wasi-apps/build.sh
 ```
 
-or pass the pinned WEBc images:
+For the Wasmer-provided shell/coreutils artifacts, a pinned WEBc image can
+also be supplied:
 
 ```bash
 WASIX_DASH_WEBC=/path/to/dash.webc \
 WASIX_BASH_WEBC=/path/to/bash.webc \
-QUICKJS_WEBC=/path/to/quickjs.webc \
 COREUTILS_WEBC=/path/to/coreutils.webc \
 tools/wasi-apps/build.sh
 ```

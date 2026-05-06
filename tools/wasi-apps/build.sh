@@ -39,9 +39,9 @@ bash_package="${WASIX_BASH_PACKAGE:-wasmer/bash}"
 bash_version="${WASIX_BASH_VERSION:-1.0.25}"
 bash_webc_url="${WASIX_BASH_WEBC_URL:-https://cdn.wasmer.io/webcimages/059606d132e2e6bc1afe3b432ee64dcb1b1b059815c8bb213cf3b24798ef21e1.webc}"
 
-quickjs_package="${QUICKJS_PACKAGE:-saghul/quickjs}"
-quickjs_version="${QUICKJS_VERSION:-0.0.3}"
-quickjs_webc_url="${QUICKJS_WEBC_URL:-https://cdn.wasmer.io/webcimages/db5822e7db5e982ac387a588649d260f64d20d89e6feecfcc1ef7acbccafe9d6.webc}"
+quickjs_package="${QUICKJS_PACKAGE:-quickjs-ng/quickjs}"
+quickjs_version="${QUICKJS_VERSION:-v0.14.0}"
+quickjs_wasm_url="${QUICKJS_WASM_URL:-https://github.com/quickjs-ng/quickjs/releases/download/v0.14.0/qjs-wasi.wasm}"
 
 coreutils_package="${COREUTILS_PACKAGE:-wasmer/coreutils}"
 coreutils_version="${COREUTILS_VERSION:-1.0.19}"
@@ -134,12 +134,12 @@ echo "WASIX bash installed at: $bash_root/bash.wasm"
 ls -lh "$bash_root/bash.wasm"
 
 echo "Staging QuickJS $quickjs_package@$quickjs_version..."
-stage_wasmer_webc_atom \
-  "quickjs-$quickjs_version" \
-  "${QUICKJS_WASM:-}" \
-  "${QUICKJS_WEBC:-}" \
-  "$quickjs_webc_url" \
-  "$quickjs_root/qjs.wasm"
+if [[ -n "${QUICKJS_WASM:-}" ]]; then
+  cp -f "$QUICKJS_WASM" "$quickjs_root/qjs.wasm"
+else
+  curl -fL -o "$quickjs_root/qjs.wasm" "$quickjs_wasm_url"
+fi
+wasm-tools validate "$quickjs_root/qjs.wasm"
 
 echo "QuickJS installed at: $quickjs_root/qjs.wasm"
 ls -lh "$quickjs_root/qjs.wasm"

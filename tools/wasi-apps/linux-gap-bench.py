@@ -16,9 +16,16 @@ import time
 import tomllib
 from pathlib import Path
 
+from fedora_qemu_baseline import (
+    DEFAULT_ASSET_DIR,
+    DEFAULT_DISK_SIZE,
+    DEFAULT_FEDORA_IMAGE_URL,
+    DEFAULT_MEMORY,
+    DEFAULT_SMP,
+    run_fedora_qemu_linux,
+)
 from tcp_throughput_server import DEFAULT_PAYLOAD_BYTES, start_tcp_throughput_server
 
-DEFAULT_IMAGE = "debian:trixie"
 HTTP_PAYLOAD_FILE = "payload.txt"
 HTTP_LARGE_PAYLOAD_FILE = "payload-64m.bin"
 HTTP_PAYLOAD = b"helios-linux-gap:ok\n"
@@ -305,17 +312,6 @@ def write_http_payloads(root: Path) -> None:
             remaining -= len(chunk)
 
 
-def docker_image_digest(image: str) -> str:
-    try:
-        raw = output(["docker", "image", "inspect", image, "--format", "{{json .RepoDigests}} {{.Id}}"])
-    except subprocess.CalledProcessError:
-        run(["docker", "pull", image])
-        raw = output(["docker", "image", "inspect", image, "--format", "{{json .RepoDigests}} {{.Id}}"])
-    digests_raw, image_id = raw.split(" ", 1)
-    digests = json.loads(digests_raw)
-    return digests[0] if digests else image_id
-
-
 def run_helios(
     manifest: Path,
     out_dir: Path,
@@ -406,94 +402,35 @@ def run_linux(
     out_dir: Path,
     iterations: int,
     workloads: list[dict],
-    image: str,
+    fedora_image_url: str,
+    linux_vm_dir: Path,
+    linux_vm_qemu_bin: str,
+    linux_vm_ssh_port: int | None,
+    linux_vm_memory: str,
+    linux_vm_smp: int,
+    linux_vm_disk_size: str,
+    linux_vm_setup_timeout_seconds: int,
     host_http_url: str | None,
-    linux_http_port: int,
+    host_tcp_host: str | None,
     linux_tcp_port: int | None,
-) -> tuple[Path | None, str]:
-    native_workloads = [
-        workload for workload in workloads if workload["runner"] in ("shell", "program")
-    ]
-    digest = docker_image_digest(image)
-    if not native_workloads:
-        return None, digest
-
-    hyperfine_json = out_dir / "linux-hyperfine.json"
-    command = [
-        "apt-get update",
-        "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 quickjs bash dash coreutils curl hyperfine ca-certificates",
-        "mkdir -p /bench",
-        "cd /bench",
-    ]
-    needs_server_trap = host_http_url or linux_tcp_port is not None
-    if needs_server_trap:
-        command.append("server_pids=()")
-        command.append("trap 'kill ${server_pids[@]} 2>/dev/null || true' EXIT")
-    if host_http_url:
-        command.extend(
-            [
-                f"python3 -m http.server {linux_http_port} --bind 127.0.0.1 --directory /out/http-root >/tmp/helios-gap-http.log 2>&1 &",
-                "server_pids+=(\"$!\")",
-            ]
-        )
-    if linux_tcp_port is not None:
-        command.extend(
-            [
-                f"python3 /repo/tools/wasi-apps/tcp_throughput_server.py --host 127.0.0.1 --port {linux_tcp_port} --payload-bytes {HTTP_LARGE_PAYLOAD_BYTES} >/tmp/helios-gap-tcp.log 2>&1 &",
-                "server_pids+=(\"$!\")",
-            ]
-        )
-    if needs_server_trap:
-        command.extend(
-            [
-                "sleep 0.2",
-            ]
-        )
-
-    hyperfine = [
-        "hyperfine",
-        "--runs",
-        str(iterations),
-        "--export-json",
-        "/out/linux-hyperfine.json",
-    ]
-    linux_http_url = f"http://127.0.0.1:{linux_http_port}/{HTTP_PAYLOAD_FILE}" if host_http_url else None
-    linux_tcp_host = "127.0.0.1" if linux_tcp_port is not None else None
-    for workload in native_workloads:
-        runner = [
-            "python3",
-            "/repo/tools/wasi-apps/linux-workload-runner.py",
-            "--manifest",
-            "/repo/tools/wasi-apps/workloads.json",
-            "--workload",
-            workload["name"],
-        ]
-        if linux_http_url:
-            runner.extend(["--host-http-url", linux_http_url])
-        if linux_tcp_host and linux_tcp_port is not None:
-            runner.extend(["--host-tcp-host", linux_tcp_host])
-            runner.extend(["--host-tcp-port", str(linux_tcp_port)])
-        hyperfine.extend(["--command-name", workload["name"], " ".join(shlex.quote(part) for part in runner)])
-    command.append(" ".join(shlex.quote(part) for part in hyperfine))
-    docker_script = "\n".join(command)
-    run(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "--mount",
-            f"type=bind,source={repo_root()},target=/repo,readonly",
-            "--mount",
-            f"type=bind,source={out_dir},target=/out",
-            "-w",
-            "/bench",
-            image,
-            "bash",
-            "-lc",
-            docker_script,
-        ]
+) -> tuple[Path | None, dict]:
+    return run_fedora_qemu_linux(
+        repo_root(),
+        out_dir,
+        iterations,
+        workloads,
+        fedora_image_url,
+        linux_vm_dir,
+        linux_vm_qemu_bin,
+        linux_vm_ssh_port,
+        linux_vm_memory,
+        linux_vm_smp,
+        linux_vm_disk_size,
+        linux_vm_setup_timeout_seconds,
+        host_http_url,
+        host_tcp_host,
+        linux_tcp_port,
     )
-    return hyperfine_json, digest
 
 
 def run_wasmtime_profiles(
@@ -716,6 +653,39 @@ def artifact_provenance(manifest: dict, workloads: list[dict]) -> list[dict]:
     return artifacts
 
 
+def wasm_uses_simd(path: Path) -> bool:
+    if not path.is_file():
+        raise SystemExit(f"cannot inspect missing wasm artifact for SIMD: {path}")
+    try:
+        text = output(["wasm-tools", "print", str(path)])
+    except subprocess.CalledProcessError as error:
+        raise SystemExit(f"failed to inspect wasm artifact for SIMD: {path}") from error
+    simd_tokens = (
+        "v128.",
+        "i8x16.",
+        "i16x8.",
+        "i32x4.",
+        "i64x2.",
+        "f32x4.",
+        "f64x2.",
+    )
+    return any(token in text for token in simd_tokens)
+
+
+def wasm_simd_provenance(manifest: dict, workloads: list[dict]) -> list[dict]:
+    provenance = []
+    for artifact in artifact_provenance(manifest, workloads):
+        wasm_path = repo_root() / artifact["wasm"]
+        provenance.append(
+            {
+                "command": artifact["command"],
+                "wasm": artifact["wasm"],
+                "uses_simd": wasm_uses_simd(wasm_path),
+            }
+        )
+    return provenance
+
+
 def ratio(helios_ms: int | None, linux_seconds: float | None) -> str:
     if helios_ms is None or linux_seconds is None:
         return "n/a"
@@ -779,11 +749,12 @@ def comparison_summary(
 
 def write_summary_json(
     path: Path,
+    manifest: dict,
     workloads: list[dict],
     run_record: dict,
     helios: dict[str, dict],
     linux: dict[str, dict],
-    docker_digest: str | None,
+    linux_provenance: dict | None,
     host_load: dict,
     network_perf: list[dict],
     helios_kernel_flamegraphs: list[Path],
@@ -792,7 +763,7 @@ def write_summary_json(
     payload = {
         "schema_version": 1,
         "helios_git_sha": run_record.get("git_sha", git_sha()),
-        "docker_image_digest": docker_digest,
+        "linux_baseline": linux_provenance,
         "vm": run_record.get("vm"),
         "host": {
             "cpu": host_cpu(),
@@ -815,6 +786,7 @@ def write_summary_json(
             }
             for row in network_perf[:16]
         ],
+        "wasm_simd": wasm_simd_provenance(manifest, workloads),
         "helios_kernel_flamegraphs": [str(path) for path in helios_kernel_flamegraphs],
         "helios_kernel_profile_top": [
             {
@@ -875,15 +847,15 @@ def write_svg(path: Path, rows: list[dict]) -> None:
         '<?xml version="1.0" encoding="UTF-8"?>',
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#ffffff"/>',
-        '<text x="32" y="34" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="22" font-weight="700" fill="#111827">Helios vs Native Linux Median Timing</text>',
-        '<text x="32" y="58" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#4b5563">Lower is better. Ratio below 1.00x means Helios is faster.</text>',
+        '<text x="32" y="34" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="22" font-weight="700" fill="#111827">Helios vs Fedora QEMU Linux Median Timing</text>',
+        '<text x="32" y="58" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#4b5563">Lower is better. Linux is a Fedora aarch64 guest under QEMU/HVF with virtio devices.</text>',
         f'<line x1="{left}" y1="{top - 14}" x2="{left + chart_width}" y2="{top - 14}" stroke="#d1d5db" stroke-width="1"/>',
         f'<text x="{left}" y="{top - 22}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="12" fill="#6b7280">0 ms</text>',
         f'<text x="{left + chart_width - 64}" y="{top - 22}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="12" fill="#6b7280">{max_ms:.1f} ms</text>',
         f'<rect x="{width - 250}" y="28" width="14" height="14" fill="#2563eb" rx="2"/>',
         f'<text x="{width - 230}" y="40" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#374151">Helios</text>',
         f'<rect x="{width - 160}" y="28" width="14" height="14" fill="#f97316" rx="2"/>',
-        f'<text x="{width - 140}" y="40" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#374151">Linux</text>',
+        f'<text x="{width - 140}" y="40" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#374151">Fedora</text>',
     ]
     previous_class = None
     for index, row in enumerate(drawable_rows):
@@ -952,14 +924,14 @@ def write_throughput_svg(path: Path, rows: list[dict]) -> bool:
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#ffffff"/>',
         '<text x="32" y="34" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="22" font-weight="700" fill="#111827">Local Network Throughput</text>',
-        '<text x="32" y="58" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#4b5563">Higher is better. Raw TCP and HTTP payloads are generated locally; no external network is used.</text>',
+        '<text x="32" y="58" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#4b5563">Higher is better. Payloads are generated on the host and reached through QEMU user/virtio-net; no external network is used.</text>',
         f'<line x1="{left}" y1="{top - 14}" x2="{left + chart_width}" y2="{top - 14}" stroke="#d1d5db" stroke-width="1"/>',
         f'<text x="{left}" y="{top - 22}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="12" fill="#6b7280">0 MiB/s</text>',
         f'<text x="{left + chart_width - 86}" y="{top - 22}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="12" fill="#6b7280">{max_rate:.1f} MiB/s</text>',
         f'<rect x="{width - 250}" y="28" width="14" height="14" fill="#2563eb" rx="2"/>',
         f'<text x="{width - 230}" y="40" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#374151">Helios</text>',
         f'<rect x="{width - 160}" y="28" width="14" height="14" fill="#f97316" rx="2"/>',
-        f'<text x="{width - 140}" y="40" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#374151">Linux</text>',
+        f'<text x="{width - 140}" y="40" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#374151">Fedora</text>',
     ]
     for index, row in enumerate(drawable_rows):
         y = top + index * row_height
@@ -1001,7 +973,7 @@ def write_report(
     workloads: list[dict],
     helios_jsonl: Path | None,
     linux_json: Path | None,
-    docker_digest: str | None,
+    linux_provenance: dict | None,
     host_load: dict,
     wasmtime_profiles: list[Path],
 ) -> None:
@@ -1019,26 +991,27 @@ def write_report(
     summary_json = path.with_name("summary.json")
     write_summary_json(
         summary_json,
+        manifest,
         workloads,
         run_record,
         helios,
         linux,
-        docker_digest,
+        linux_provenance,
         host_load,
         network_perf,
         helios_kernel_flamegraphs,
         helios_kernel_profile_top,
     )
     lines = [
-        "# Helios vs Native Linux Benchmark",
+        "# Helios vs Fedora QEMU Linux Benchmark",
         "",
-        "![Helios vs Linux median timings](helios-vs-linux.svg)",
+        "![Helios vs Fedora Linux median timings](helios-vs-linux.svg)",
         "",
         f"- Helios JSONL: `{helios_jsonl or 'not-run'}`",
         f"- Linux Hyperfine JSON: `{linux_json or 'not-run'}`",
         f"- Machine-readable summary: `{summary_json}`",
         f"- Helios git SHA: `{run_record.get('git_sha', git_sha())}`",
-        f"- Docker image digest: `{docker_digest or 'not-run'}`",
+        f"- Linux baseline: `{(linux_provenance or {}).get('kind', 'not-run')}`",
         f"- Host CPU: `{host_cpu()}`",
         f"- Host logical CPUs: `{os.cpu_count()}`",
         f"- Host memory: `{host_memory()}`",
@@ -1046,6 +1019,25 @@ def write_report(
         f"- Host 1m load per logical CPU: `{format_load(host_load['load']['one_minute_per_cpu'])}`",
         "",
     ]
+    if linux_provenance:
+        lines.extend(["## Linux VM", ""])
+        for key, value in linux_provenance.items():
+            lines.append(f"- {key.replace('_', ' ').title()}: `{value}`")
+        lines.append("")
+    simd_rows = wasm_simd_provenance(manifest, workloads)
+    if simd_rows:
+        lines.extend(
+            [
+                "## WASM SIMD Provenance",
+                "",
+                "| Command | WASM | Uses SIMD |",
+                "| --- | --- | ---: |",
+            ]
+        )
+        for row in simd_rows:
+            simd_text = "yes" if row["uses_simd"] else "no"
+            lines.append(f"| `{row['command']}` | `{row['wasm']}` | {simd_text} |")
+        lines.append("")
     if host_load["top_cpu_processes"]:
         lines.extend(["## Host Load Provenance", ""])
         for process in host_load["top_cpu_processes"]:
@@ -1203,11 +1195,16 @@ def main() -> None:
     parser.add_argument("--class", dest="classes", action="append", choices=["cpu-bound", "io-bound"], default=[])
     parser.add_argument("--workload", dest="workloads", action="append", default=[])
     parser.add_argument("--arch", default="aarch64")
-    parser.add_argument("--docker-image", default=DEFAULT_IMAGE)
     parser.add_argument("--helios-host-http-host", default="10.0.2.2")
     parser.add_argument("--helios-host-tcp-host", default="10.0.2.2")
-    parser.add_argument("--linux-http-port", type=int, default=18080)
-    parser.add_argument("--linux-tcp-port", type=int, default=18081)
+    parser.add_argument("--fedora-image-url", default=DEFAULT_FEDORA_IMAGE_URL)
+    parser.add_argument("--linux-vm-dir", type=Path, default=DEFAULT_ASSET_DIR)
+    parser.add_argument("--linux-vm-qemu-bin", default="qemu-system-aarch64")
+    parser.add_argument("--linux-vm-ssh-port", type=int)
+    parser.add_argument("--linux-vm-memory", default=DEFAULT_MEMORY)
+    parser.add_argument("--linux-vm-smp", type=int, default=DEFAULT_SMP)
+    parser.add_argument("--linux-vm-disk-size", default=DEFAULT_DISK_SIZE)
+    parser.add_argument("--linux-vm-setup-timeout-seconds", type=int, default=900)
     parser.add_argument("--out-dir", type=Path)
     parser.add_argument("--skip-helios", action="store_true")
     parser.add_argument("--skip-linux", action="store_true")
@@ -1238,6 +1235,10 @@ def main() -> None:
         raise SystemExit("--max-host-load-per-cpu must be positive")
     if args.helios_timeout_seconds <= 0:
         raise SystemExit("--helios-timeout-seconds must be positive")
+    if args.linux_vm_smp <= 0:
+        raise SystemExit("--linux-vm-smp must be positive")
+    if args.linux_vm_setup_timeout_seconds <= 0:
+        raise SystemExit("--linux-vm-setup-timeout-seconds must be positive")
 
     if not args.skip_helios:
         enforce_no_stale_helios_benchmark_processes()
@@ -1267,16 +1268,16 @@ def main() -> None:
         server, port = start_host_http(http_root)
         host_http_url = f"http://{args.helios_host_http_host}:{port}/{HTTP_PAYLOAD_FILE}"
         local_http_url = f"http://127.0.0.1:{port}/{HTTP_PAYLOAD_FILE}"
-    if needs_tcp and not args.skip_helios:
+    if needs_tcp and (not args.skip_helios or not args.skip_linux):
         tcp_server, port = start_tcp_throughput_server("127.0.0.1", 0, HTTP_LARGE_PAYLOAD_BYTES)
         host_tcp_host = args.helios_host_tcp_host
         host_tcp_port = port
-    linux_tcp_port = args.linux_tcp_port if needs_tcp and not args.skip_linux else None
+    linux_tcp_port = host_tcp_port if needs_tcp and not args.skip_linux else None
 
     try:
         helios_jsonl = None
         linux_json = None
-        docker_digest = None
+        linux_provenance = None
         wasmtime_profiles = []
         if not args.skip_helios:
             helios_jsonl = run_helios(
@@ -1291,14 +1292,21 @@ def main() -> None:
                 args.helios_timeout_seconds,
             )
         if not args.skip_linux:
-            linux_json, docker_digest = run_linux(
+            linux_json, linux_provenance = run_linux(
                 args.manifest,
                 out_dir,
                 args.iterations,
                 workloads,
-                args.docker_image,
+                args.fedora_image_url,
+                args.linux_vm_dir,
+                args.linux_vm_qemu_bin,
+                args.linux_vm_ssh_port,
+                args.linux_vm_memory,
+                args.linux_vm_smp,
+                args.linux_vm_disk_size,
+                args.linux_vm_setup_timeout_seconds,
                 host_http_url,
-                args.linux_http_port,
+                host_tcp_host,
                 linux_tcp_port,
             )
         if args.wasmtime_profile_workload:
@@ -1320,7 +1328,7 @@ def main() -> None:
             workloads,
             helios_jsonl,
             linux_json,
-            docker_digest,
+            linux_provenance,
             host_load,
             wasmtime_profiles,
         )

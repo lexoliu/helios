@@ -17,7 +17,7 @@ LINUX_PLACEHOLDERS = {
     "{mkdir}": "mkdir",
     "{python3}": "python3",
     "{quickjs}": "qjs",
-    "{simd_lanes}": "python3 -c 'print(\"simd-lanes:17\")'",
+    "{simd_lanes}": "/usr/local/bin/helios-simd-lanes",
     "{tcp_throughput}": "python3 {repo_root}/tools/wasi-apps/linux_tcp_throughput_client.py",
     "{wasix_tcp_throughput}": "python3 {repo_root}/tools/wasi-apps/linux_tcp_throughput_client.py --label wasix-tcp-throughput",
 }

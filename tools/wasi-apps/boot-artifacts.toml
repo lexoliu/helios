@@ -26,9 +26,9 @@ source = "artifacts/wasix/bash/bash.wasm"
 
 [[artifact]]
 command = "quickjs"
-package = "saghul/quickjs"
-version = "0.0.3"
-source_url = "https://wasmer.io/_/quickjs"
+package = "quickjs-ng/quickjs"
+version = "v0.14.0"
+source_url = "https://github.com/quickjs-ng/quickjs/releases/tag/v0.14.0"
 bootfs_path = "bin/qjs"
 source = "artifacts/wasix/quickjs/qjs.wasm"
 
