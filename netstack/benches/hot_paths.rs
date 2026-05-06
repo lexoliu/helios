@@ -19,6 +19,7 @@ const UDP_PAYLOAD: &[u8] = b"helios-netstack-divan-udp-payload";
 const TCP_PAYLOAD_BYTES: usize = 1460;
 const TCP_RECEIVE_SEGMENTS: usize = 128;
 const TCP_ACK_COALESCE_SEGMENTS: usize = 16;
+const TCP_ACK_BATCH_SEGMENTS: usize = 32;
 const TCP_TRANSMIT_SEGMENTS: usize = 10;
 
 fn main() {
@@ -241,6 +242,58 @@ fn tcp_receive_ack_coalesces_unsubmitted_control_frames(bencher: Bencher) {
                 other => panic!("unexpected outbound status: {other:?}"),
             }
         });
+}
+
+#[divan::bench(args = [8usize, TCP_ACK_BATCH_SEGMENTS])]
+fn tcp_receive_batch_drive_ack_submit(bencher: Bencher, batch: usize) {
+    let payload = [0u8; TCP_PAYLOAD_BYTES];
+    let frames: [PacketBuffer; TCP_ACK_BATCH_SEGMENTS] = core::array::from_fn(|index| {
+        tcp_ipv4_frame(
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101
+                    + u32::try_from(index * TCP_PAYLOAD_BYTES)
+                        .expect("benchmark TCP sequence fits u32"),
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+            &payload,
+        )
+    });
+
+    bencher.counter(ItemsCount::new(batch)).bench_local(|| {
+        let mut stack = established_stack();
+        for (index, frame) in frames.iter().take(batch).enumerate() {
+            let now = StackInstant::from_nanos(
+                u64::try_from(index + 2).expect("benchmark timestamp fits u64"),
+            );
+            stack
+                .receive_frame(black_box(frame.as_slice()), now)
+                .expect("benchmark TCP payload should be accepted");
+        }
+        stack
+            .drive_tcp(StackInstant::from_nanos(
+                u64::try_from(batch + 2).expect("benchmark timestamp fits u64"),
+            ))
+            .expect("benchmark TCP drive should queue one ACK");
+        let status = stack
+            .try_submit_outbound_slices(MAX_OUTBOUND_FRAMES, |frames| {
+                black_box(frames);
+                Ok::<Option<usize>, ()>(Some(frames.len()))
+            })
+            .expect("benchmark outbound submit should succeed");
+        match status {
+            OutboundBatchStatus::Submitted {
+                offered, accepted, ..
+            } => {
+                assert_eq!(offered, 1);
+                assert_eq!(accepted, 1);
+            }
+            other => panic!("unexpected outbound status: {other:?}"),
+        }
+    });
 }
 
 #[divan::bench]

@@ -17,9 +17,12 @@ pub const MAX_TCP_RECEIVE_SEGMENTS: usize =
 pub const MAX_TCP_OUT_OF_ORDER_SEGMENTS: usize = 32;
 pub const MAX_TCP_QUEUED_SEGMENTS: usize = 32;
 const TCP_RECEIVE_COALESCE_BYTES: usize = 64 * 1024;
-// Throughput beats zero-copy purity here: divan showed a 32 KiB first
-// allocation keeps receive coalescing faster without the 64 KiB burst tax.
-const TCP_RECEIVE_PREALLOC_BYTES: usize = 32 * 1024;
+// Throughput beats small first-allocation purity here. After the RX pump began
+// draining 32 borrowed frames per pass, divan showed 64 KiB preallocation avoids
+// the extra 32 KiB receive-buffer grow and improves hot receive medians:
+// batch-drive-ACK 32 frames 13.39 us -> 12.79 us, contiguous reads
+// 10.76/18.97/12.61 us -> 8.53/17.28/10.37 us.
+const TCP_RECEIVE_PREALLOC_BYTES: usize = 64 * 1024;
 const TCP_RECEIVE_BYTES: usize = MAX_TCP_RECEIVE_SEGMENTS * TCP_RECEIVE_SEGMENT_BYTES;
 const TCP_RECEIVE_BACKPRESSURE_BYTES: usize =
     TCP_RECEIVE_BACKPRESSURE_SEGMENTS * TCP_RECEIVE_SEGMENT_BYTES;
