@@ -21,6 +21,7 @@ const SCHEDULER_INTERRUPT_INTERVAL: Duration = Duration::from_millis(100);
 const TIMER_WHEEL_QUANTUM: Duration = Duration::from_micros(50);
 const TIMER_WHEEL_LEVELS: usize = 4;
 const TIMER_WHEEL_SLOTS: usize = 256;
+const TIMER_INBOX_CAPACITY: usize = TIMER_WHEEL_SLOTS * 16;
 const TIMER_READY_POOL_SLOTS: usize = 8;
 const TIMER_READY_RETAINED_ENTRIES: usize = TIMER_WHEEL_SLOTS;
 
@@ -101,7 +102,7 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
                 state: UnsafeCell::new(TimerState {
                     wheel: TimingWheel::new(current_tick),
                 }),
-                inbox: ConcurrentQueue::unbounded(),
+                inbox: ConcurrentQueue::bounded(TIMER_INBOX_CAPACITY),
                 next_sleep_deadline: AtomicU64::new(u64::MAX),
                 armed_deadline: AtomicU64::new(initial_deadline.ticks()),
                 interrupt_interval_ticks,
@@ -181,7 +182,9 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
 
         match self.shared.inbox.push(entry) {
             Ok(()) => self.publish_deadline(deadline),
-            Err(PushError::Full(_)) => unreachable!("unbounded timer inbox reported full"),
+            Err(PushError::Full(_)) => {
+                panic!("timer inbox capacity {TIMER_INBOX_CAPACITY} exhausted")
+            }
             Err(PushError::Closed(_)) => panic!("timer inbox was closed unexpectedly"),
         }
     }
@@ -473,8 +476,8 @@ mod tests {
     use triomphe::Arc;
 
     use super::{
-        AtomicOrdering, SleepState, TIMER_READY_RETAINED_ENTRIES, TimerEntry, TimingWheel,
-        reset_timer_ready_entries, wheel_tick_ceil, wheel_tick_floor,
+        AtomicOrdering, SleepState, TIMER_INBOX_CAPACITY, TIMER_READY_RETAINED_ENTRIES, TimerEntry,
+        TimingWheel, reset_timer_ready_entries, wheel_tick_ceil, wheel_tick_floor,
     };
 
     #[derive(Clone)]
@@ -622,6 +625,13 @@ mod tests {
         assert!(timer.sleep_until(Instant::new(99)).state.is_none());
         assert!(timer.sleep_for(core::time::Duration::ZERO).state.is_none());
         assert!(timer.sleep_until(Instant::new(101)).state.is_some());
+    }
+
+    #[test]
+    fn timer_inbox_is_bounded_to_kernel_capacity() {
+        let timer = super::Timer::new(TestCpu { now: 100 });
+
+        assert_eq!(timer.shared.inbox.capacity(), Some(TIMER_INBOX_CAPACITY));
     }
 
     #[test]
