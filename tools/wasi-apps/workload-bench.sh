@@ -65,5 +65,9 @@ if [[ -n "${HELIOS_WORKLOAD_BENCH_USER_PROFILE_OUTPUT:-}" ]]; then
     command+=(--user-profile-output "${HELIOS_WORKLOAD_BENCH_USER_PROFILE_OUTPUT}")
 fi
 
+if [[ -n "${HELIOS_WORKLOAD_BENCH_PERF_METRICS_OUTPUT:-}" ]]; then
+    command+=(--perf-metrics-output "${HELIOS_WORKLOAD_BENCH_PERF_METRICS_OUTPUT}")
+fi
+
 printf 'writing WASI workload benchmark JSONL to %s\n' "${log}" >&2
 "${command[@]}" | tee "${log}"

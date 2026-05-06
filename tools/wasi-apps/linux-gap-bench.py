@@ -266,6 +266,7 @@ def run_helios_once(
     env["HELIOS_WORKLOAD_BENCH_MANIFEST"] = str(manifest)
     env["HELIOS_WORKLOAD_BENCH_LOG"] = str(log)
     env["HELIOS_WORKLOAD_BENCH_KERNEL_PROFILE_OUTPUT"] = str(log.with_suffix(".kernel.folded"))
+    env["HELIOS_WORKLOAD_BENCH_PERF_METRICS_OUTPUT"] = str(log.with_suffix(".perf.json"))
     if classes:
         env["HELIOS_WORKLOAD_BENCH_CLASSES"] = ",".join(classes)
     if names:
@@ -407,6 +408,61 @@ def parse_hyperfine(path: Path | None) -> dict[str, dict]:
     with path.open("r", encoding="utf-8") as handle:
         data = json.load(handle)
     return {entry["command"]: entry for entry in data.get("results", [])}
+
+
+def helios_perf_metric_paths(helios_jsonl: Path | None) -> list[Path]:
+    if helios_jsonl is None:
+        return []
+    return sorted(helios_jsonl.parent.glob("helios*.perf.json"))
+
+
+def parse_perf_metrics(paths: list[Path]) -> list[dict]:
+    samples = []
+    for path in paths:
+        if not path.exists():
+            continue
+        with path.open("r", encoding="utf-8") as handle:
+            for sample in json.load(handle):
+                sample = dict(sample)
+                sample["_source"] = path
+                samples.append(sample)
+    return samples
+
+
+def metric_field(sample: dict, name: str) -> int | str | None:
+    return sample.get(name, sample.get(name.replace("_", "-")))
+
+
+def metric_u64(sample: dict, name: str) -> int:
+    value = metric_field(sample, name)
+    return int(value) if value is not None else 0
+
+
+def metric_name(sample: dict) -> str:
+    value = metric_field(sample, "name")
+    return str(value) if value is not None else ""
+
+
+def network_perf_rows(paths: list[Path]) -> list[dict]:
+    rows = []
+    for sample in parse_perf_metrics(paths):
+        name = metric_name(sample)
+        if not name.startswith("kernel;network;"):
+            continue
+        total_nanos = metric_u64(sample, "total_nanos")
+        total_bytes = metric_u64(sample, "total_bytes")
+        rows.append(
+            {
+                "name": name,
+                "events": metric_u64(sample, "total_events"),
+                "nanos": total_nanos,
+                "bytes": total_bytes,
+                "mib_s": throughput_mib_s(total_bytes, total_nanos / 1_000_000.0),
+                "source": sample["_source"],
+            }
+        )
+    rows.sort(key=lambda row: row["nanos"], reverse=True)
+    return rows
 
 
 def artifact_provenance(manifest: dict, workloads: list[dict]) -> list[dict]:
@@ -644,6 +700,7 @@ def write_report(
     run_record, helios = parse_jsonl(helios_jsonl)
     linux = parse_hyperfine(linux_json)
     rows = comparison_rows(workloads, helios, linux)
+    perf_metric_paths = helios_perf_metric_paths(helios_jsonl)
     svg_path = path.with_name("helios-vs-linux.svg")
     write_svg(svg_path, rows)
     throughput_svg_path = path.with_name("network-throughput.svg")
@@ -695,6 +752,22 @@ def write_report(
                 "",
             ]
         )
+    network_perf = network_perf_rows(perf_metric_paths)
+    if network_perf:
+        lines.extend(
+            [
+                "## Helios Network Perf Metrics",
+                "",
+                "| Metric | Events | Total bytes | Total time | Throughput | Source |",
+                "| --- | ---: | ---: | ---: | ---: | --- |",
+            ]
+        )
+        for row in network_perf[:16]:
+            throughput = "n/a" if row["mib_s"] is None else f"{row['mib_s']:.1f} MiB/s"
+            lines.append(
+                f"| `{row['name']}` | {row['events']} | {row['bytes']} | {row['nanos']} ns | {throughput} | `{row['source']}` |"
+            )
+        lines.append("")
 
     for workload_class, title in [("cpu-bound", "CPU-Bound"), ("io-bound", "IO-Bound")]:
         class_workloads = [workload for workload in workloads if workload["class"] == workload_class]
@@ -737,6 +810,8 @@ def write_report(
             f"- Linux raw hyperfine timings are in `{linux_json or 'not-run'}`.",
         ]
     )
+    for perf_path in perf_metric_paths:
+        lines.append(f"- Helios perf metrics are in `{perf_path}`.")
     if helios_jsonl:
         for profile_path in sorted(helios_jsonl.parent.glob("helios*.kernel.folded")):
             lines.append(f"- Helios kernel folded profile is in `{profile_path}`.")
