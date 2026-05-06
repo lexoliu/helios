@@ -837,6 +837,16 @@ where
     ) -> Result<Option<Bytes>, TcpError> {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         loop {
+            let read = {
+                let mut state = self.inner.state.lock().await;
+                state.poll_tcp_read(stream, max_bytes as usize)?
+            };
+            match read {
+                TcpReadProgress::Data(bytes) => return Ok(Some(bytes)),
+                TcpReadProgress::Eof => return Ok(None),
+                TcpReadProgress::Pending => {}
+            }
+
             self.drive_tcp().await?;
             let read = {
                 let mut state = self.inner.state.lock().await;
@@ -845,16 +855,15 @@ where
             match read {
                 TcpReadProgress::Data(bytes) => return Ok(Some(bytes)),
                 TcpReadProgress::Eof => return Ok(None),
-                TcpReadProgress::Pending => {
-                    if self.now_nanos() >= deadline_nanos {
-                        return Err(TcpError {
-                            kind: TcpErrorKind::Timeout,
-                            detail: NetworkErrorDetail::TcpReadTimeout,
-                        });
-                    }
-                    self.wait_for_tcp_progress(deadline_nanos).await;
-                }
+                TcpReadProgress::Pending => {}
             }
+            if self.now_nanos() >= deadline_nanos {
+                return Err(TcpError {
+                    kind: TcpErrorKind::Timeout,
+                    detail: NetworkErrorDetail::TcpReadTimeout,
+                });
+            }
+            self.wait_for_tcp_progress(deadline_nanos).await;
         }
     }
 
