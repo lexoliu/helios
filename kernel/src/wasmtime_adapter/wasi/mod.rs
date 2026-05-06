@@ -2293,17 +2293,6 @@ where
         }
     }
 
-    fn link_count(&self, identity: ObjectIdentity) -> u64 {
-        self.snapshot
-            .inner
-            .lock()
-            .nodes
-            .iter()
-            .find(|node| node.identity == identity)
-            .map(|node| node.link_count)
-            .unwrap_or(0)
-    }
-
     fn descriptor_identity(
         &self,
         descriptor: &FsDescriptor,
@@ -2385,6 +2374,16 @@ where
             .ok_or(fs_types::ErrorCode::NoEntry)
     }
 
+    fn with_node<R>(
+        &self,
+        path: &str,
+        read: impl FnOnce(&FsNode) -> core::result::Result<R, fs_types::ErrorCode>,
+    ) -> core::result::Result<R, fs_types::ErrorCode> {
+        let state = self.snapshot.inner.lock();
+        let node = state.node(path).ok_or(fs_types::ErrorCode::NoEntry)?;
+        read(node)
+    }
+
     pub(crate) fn stat(
         &self,
         path: &str,
@@ -2395,15 +2394,16 @@ where
         // host file/directory). If neither exists, return NoEntry
         // instead of panicking so programs see a proper filesystem
         // error.
-        let node = self.get_node(path)?;
-        let size = Self::node_size(&node);
-        Ok(fs_types::DescriptorStat {
-            type_: Self::descriptor_type(node.kind),
-            link_count: self.link_count(node.identity),
-            size,
-            data_access_timestamp: Some(system_time_from_nanos(node.access_nanos)),
-            data_modification_timestamp: Some(system_time_from_nanos(node.modified_nanos)),
-            status_change_timestamp: Some(system_time_from_nanos(node.status_nanos)),
+        self.with_node(path, |node| {
+            let size = Self::node_size(node);
+            Ok(fs_types::DescriptorStat {
+                type_: Self::descriptor_type(node.kind),
+                link_count: node.link_count,
+                size,
+                data_access_timestamp: Some(system_time_from_nanos(node.access_nanos)),
+                data_modification_timestamp: Some(system_time_from_nanos(node.modified_nanos)),
+                status_change_timestamp: Some(system_time_from_nanos(node.status_nanos)),
+            })
         })
     }
 
@@ -2414,12 +2414,13 @@ where
         // Host paths are normally handled asynchronously in the WASI
         // trait impl, but fall through to the embedded view when the
         // node has already been seeded.
-        let node = self.get_node(path)?;
-        let size = Self::node_size(&node);
-        Ok(metadata_hash_value(
-            node.identity,
-            node.modified_nanos ^ size,
-        ))
+        self.with_node(path, |node| {
+            let size = Self::node_size(node);
+            Ok(metadata_hash_value(
+                node.identity,
+                node.modified_nanos ^ size,
+            ))
+        })
     }
 
     pub(crate) fn read_directory(
