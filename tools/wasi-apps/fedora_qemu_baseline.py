@@ -356,57 +356,75 @@ def ensure_provisioned(
     key: Path,
     port: int,
     timeout_seconds: int,
-    quickjs_policy: dict,
+    quickjs_policy: dict | None,
+    require_simd_probe: bool,
 ) -> None:
     marker = "/var/lib/helios-fedora-qemu-bench-provisioned"
-    quickjs_version_check = f"strings /usr/local/bin/qjs | grep -q '{QUICKJS_VERSION}'"
-    quickjs_policy_check = (
-        f"test \"$(cat {QUICKJS_POLICY_FILE} 2>/dev/null)\" = {shlex.quote(quickjs_policy['id'])}"
-    )
-    verify_command = " && ".join(
+    base_verify_command = " && ".join(
         [
-            quickjs_version_check,
-            quickjs_policy_check,
-            "/usr/local/bin/qjs -e 'console.log(\"qjs:ok\")' | grep -q 'qjs:ok'",
-            "/usr/local/bin/helios-simd-lanes | grep -q 'simd-lanes:17'",
+            "python3 --version >/dev/null",
+            "bash -c true",
+            "dash -c true",
+            "cat --version >/dev/null",
+            "curl --version >/dev/null",
             "hyperfine --version >/dev/null",
         ]
     )
-    if ssh_output(repo_root, key, port, f"test -f {marker} && ({verify_command}) && echo yes || true", timeout=20) == "yes":
+    verify_parts = [base_verify_command]
+    quickjs_version_check = ""
+    quickjs_policy_check = ""
+    if quickjs_policy is not None:
+        quickjs_version_check = f"strings /usr/local/bin/qjs | grep -q '{QUICKJS_VERSION}'"
+        quickjs_policy_check = (
+            f"test \"$(cat {QUICKJS_POLICY_FILE} 2>/dev/null)\" = {shlex.quote(quickjs_policy['id'])}"
+        )
+        verify_parts.extend(
+            [
+                quickjs_version_check,
+                quickjs_policy_check,
+                "/usr/local/bin/qjs -e 'console.log(\"qjs:ok\")' | grep -q 'qjs:ok'",
+            ]
+        )
+    if require_simd_probe:
+        verify_parts.append("/usr/local/bin/helios-simd-lanes | grep -q 'simd-lanes:17'")
+    verify_command = " && ".join(
+        verify_parts
+    )
+    if ssh_output(repo_root, key, port, f"({verify_command}) && echo yes || true", timeout=20) == "yes":
         return
     package_list = " ".join(shlex.quote(package) for package in FEDORA_PACKAGES)
-    quickjs_install = " && ".join(
-        [
-            "quickjs_work=$(mktemp -d)",
-            f"curl --fail --location --output \"$quickjs_work/quickjs.tar.gz\" {shlex.quote(QUICKJS_SOURCE_URL)}",
-            "tar -C \"$quickjs_work\" -xf \"$quickjs_work/quickjs.tar.gz\"",
-            f"quickjs_src=\"$quickjs_work/quickjs-{QUICKJS_VERSION}\"",
-            "cmake -S \"$quickjs_src\" -B \"$quickjs_src/build\" "
-            "-DCMAKE_BUILD_TYPE=Release "
-            f"-DCMAKE_C_FLAGS_RELEASE={shlex.quote(quickjs_policy['cmake_c_flags_release'])}",
-            "cmake --build \"$quickjs_src/build\" --target qjs_exe -j\"$(nproc)\"",
-            "sudo install -m 0755 \"$quickjs_src/build/qjs\" /usr/local/bin/qjs",
-            f"printf '%s\\n' {shlex.quote(quickjs_policy['id'])} | sudo tee {QUICKJS_POLICY_FILE} >/dev/null",
-            "rm -rf \"$quickjs_work\"",
-        ]
-    )
-    simd_install = " && ".join(
-        [
-            "test -f /home/bench/helios/fedora-guest-tools/simd_lanes.c",
-            "gcc -O3 -mcpu=native /home/bench/helios/fedora-guest-tools/simd_lanes.c -o /tmp/helios-simd-lanes",
-            "sudo install -m 0755 /tmp/helios-simd-lanes /usr/local/bin/helios-simd-lanes",
-            "rm -f /tmp/helios-simd-lanes",
-        ]
-    )
-    command = " && ".join(
-        [
-            f"sudo dnf install -y {package_list}",
-            f"(({quickjs_version_check} && {quickjs_policy_check}) || ({quickjs_install}))",
-            f"test -x /usr/local/bin/helios-simd-lanes || ({simd_install})",
-            verify_command,
-            f"sudo touch {marker}",
-        ]
-    )
+    command_parts = [f"({base_verify_command}) || sudo dnf install -y {package_list}"]
+    if quickjs_policy is not None:
+        quickjs_install = " && ".join(
+            [
+                "quickjs_work=$(mktemp -d)",
+                f"curl --fail --location --output \"$quickjs_work/quickjs.tar.gz\" {shlex.quote(QUICKJS_SOURCE_URL)}",
+                "tar -C \"$quickjs_work\" -xf \"$quickjs_work/quickjs.tar.gz\"",
+                f"quickjs_src=\"$quickjs_work/quickjs-{QUICKJS_VERSION}\"",
+                "cmake -S \"$quickjs_src\" -B \"$quickjs_src/build\" "
+                "-DCMAKE_BUILD_TYPE=Release "
+                f"-DCMAKE_C_FLAGS_RELEASE={shlex.quote(quickjs_policy['cmake_c_flags_release'])}",
+                "cmake --build \"$quickjs_src/build\" --target qjs_exe -j\"$(nproc)\"",
+                "sudo install -m 0755 \"$quickjs_src/build/qjs\" /usr/local/bin/qjs",
+                f"printf '%s\\n' {shlex.quote(quickjs_policy['id'])} | sudo tee {QUICKJS_POLICY_FILE} >/dev/null",
+                "rm -rf \"$quickjs_work\"",
+            ]
+        )
+        command_parts.append(
+            f"(({quickjs_version_check} && {quickjs_policy_check}) || ({quickjs_install}))"
+        )
+    if require_simd_probe:
+        simd_install = " && ".join(
+            [
+                "test -f /home/bench/helios/fedora-guest-tools/simd_lanes.c",
+                "gcc -O3 -mcpu=native /home/bench/helios/fedora-guest-tools/simd_lanes.c -o /tmp/helios-simd-lanes",
+                "sudo install -m 0755 /tmp/helios-simd-lanes /usr/local/bin/helios-simd-lanes",
+                "rm -f /tmp/helios-simd-lanes",
+            ]
+        )
+        command_parts.append(f"test -x /usr/local/bin/helios-simd-lanes || ({simd_install})")
+    command_parts.extend([verify_command, f"sudo touch {marker}"])
+    command = " && ".join(command_parts)
     ssh(repo_root, key, port, command, timeout=timeout_seconds)
 
 
@@ -443,7 +461,13 @@ def copy_guest_files(repo_root: Path, key: Path, port: int) -> None:
     run([*scp_base, *(str(path) for path in guest_tools), f"{SSH_USER}@127.0.0.1:{REMOTE_ROOT}/fedora-guest-tools/"], repo_root)
 
 
-def linux_cpu_features(repo_root: Path, key: Path, port: int, quickjs_policy: dict) -> dict:
+def linux_cpu_features(
+    repo_root: Path,
+    key: Path,
+    port: int,
+    quickjs_policy: dict | None,
+    require_simd_probe: bool,
+) -> dict:
     cpuinfo = ssh_output(repo_root, key, port, "cat /proc/cpuinfo", timeout=20)
     features = []
     for line in cpuinfo.splitlines():
@@ -451,28 +475,38 @@ def linux_cpu_features(repo_root: Path, key: Path, port: int, quickjs_policy: di
             _, _, value = line.partition(":")
             features = value.split()
             break
-    qjs_version = ssh_output(
-        repo_root,
-        key,
-        port,
-        f"strings /usr/local/bin/qjs | grep '{QUICKJS_VERSION}' | head -n 1",
-        timeout=20,
-    )
-    simd_output = ssh_output(repo_root, key, port, "/usr/local/bin/helios-simd-lanes", timeout=20)
-    return {
+    result = {
         "aarch64_features": features,
         "asimd": "asimd" in features,
-        "quickjs_native_version": qjs_version,
-        "quickjs_wasm_version": f"QuickJS-ng version {QUICKJS_VERSION}",
-        "quickjs_wasm_path": quickjs_policy["wasm_path"],
-        "quickjs_wasm_uses_simd": quickjs_policy["wasm_uses_simd"],
-        "quickjs_native_policy_id": quickjs_policy["id"],
-        "quickjs_native_c_flags_release": quickjs_policy["cmake_c_flags_release"],
-        "quickjs_baseline_strategy": quickjs_policy["baseline_strategy"],
-        "quickjs_source_url": QUICKJS_SOURCE_URL,
-        "quickjs_native_simd_policy": quickjs_policy["native_simd_policy"],
-        "native_simd_probe": simd_output,
+        "quickjs_required": quickjs_policy is not None,
+        "native_simd_probe_required": require_simd_probe,
     }
+    if quickjs_policy is not None:
+        qjs_version = ssh_output(
+            repo_root,
+            key,
+            port,
+            f"strings /usr/local/bin/qjs | grep '{QUICKJS_VERSION}' | head -n 1",
+            timeout=20,
+        )
+        result.update(
+            {
+                "quickjs_native_version": qjs_version,
+                "quickjs_wasm_version": f"QuickJS-ng version {QUICKJS_VERSION}",
+                "quickjs_wasm_path": quickjs_policy["wasm_path"],
+                "quickjs_wasm_uses_simd": quickjs_policy["wasm_uses_simd"],
+                "quickjs_native_policy_id": quickjs_policy["id"],
+                "quickjs_native_c_flags_release": quickjs_policy["cmake_c_flags_release"],
+                "quickjs_baseline_strategy": quickjs_policy["baseline_strategy"],
+                "quickjs_source_url": QUICKJS_SOURCE_URL,
+                "quickjs_native_simd_policy": quickjs_policy["native_simd_policy"],
+            }
+        )
+    if require_simd_probe:
+        result["native_simd_probe"] = ssh_output(
+            repo_root, key, port, "/usr/local/bin/helios-simd-lanes", timeout=20
+        )
+    return result
 
 
 def hyperfine_command(
@@ -523,6 +557,11 @@ def copy_hyperfine_json(repo_root: Path, key: Path, port: int, destination: Path
     run([*scp_base, f"{SSH_USER}@127.0.0.1:{REMOTE_OUT}/linux-hyperfine.json", str(destination)], repo_root)
 
 
+def workload_uses_placeholder(workload: dict, placeholder: str) -> bool:
+    values = [workload.get("command", ""), workload.get("program", ""), *workload.get("args", [])]
+    return any(placeholder in value for value in values)
+
+
 def run_fedora_qemu_linux(
     repo_root: Path,
     out_dir: Path,
@@ -544,7 +583,13 @@ def run_fedora_qemu_linux(
         workload for workload in workloads if workload["runner"] in ("shell", "program")
     ]
     asset_dir = resolve_asset_dir(repo_root, asset_dir)
-    quickjs_policy = quickjs_native_policy(repo_root)
+    quickjs_required = any(
+        workload_uses_placeholder(workload, "{quickjs}") for workload in native_workloads
+    )
+    simd_probe_required = any(
+        workload_uses_placeholder(workload, "{simd_lanes}") for workload in native_workloads
+    )
+    quickjs_policy = quickjs_native_policy(repo_root) if quickjs_required else None
     asset_dir.mkdir(parents=True, exist_ok=True)
     key = ensure_private_key(repo_root, asset_dir)
     public_key = key.with_suffix(key.suffix + ".pub").read_text(encoding="utf-8").strip()
@@ -563,6 +608,8 @@ def run_fedora_qemu_linux(
         "qemu_memory": memory,
         "network": "virtio-net-device over QEMU user net; workloads connect to host through 10.0.2.2",
         "block": "virtio-blk-device",
+        "quickjs_required": quickjs_required,
+        "native_simd_probe_required": simd_probe_required,
     }
     if not native_workloads:
         return None, provenance
@@ -571,8 +618,17 @@ def run_fedora_qemu_linux(
     try:
         wait_for_ssh(repo_root, key, port, setup_timeout_seconds)
         copy_guest_files(repo_root, key, port)
-        ensure_provisioned(repo_root, key, port, setup_timeout_seconds, quickjs_policy)
-        provenance.update(linux_cpu_features(repo_root, key, port, quickjs_policy))
+        ensure_provisioned(
+            repo_root,
+            key,
+            port,
+            setup_timeout_seconds,
+            quickjs_policy,
+            simd_probe_required,
+        )
+        provenance.update(
+            linux_cpu_features(repo_root, key, port, quickjs_policy, simd_probe_required)
+        )
         ssh(
             repo_root,
             key,
