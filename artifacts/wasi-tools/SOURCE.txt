@@ -1,4 +1,4 @@
 package=helios-curl-wasi
 version=0.1.0
 source=tools/wasi-apps/curl
-sha256=413a7f72e813e028f10083b69df3090f9e8f2bff44b5446dd5d0cbe12d2eba00
+sha256=07a52e013e07816f4788b8ebadf9bba6885d8bf726cc0483d7bc0779348818ac

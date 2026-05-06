@@ -1,13 +1,12 @@
 use std::fs::File;
 use std::io::{self, Write};
 
-use helios_api::net::TcpStream;
+use helios_api::net::{DEFAULT_READ_CHUNK_BYTES, TcpStream};
 use http::Uri;
 use thiserror::Error;
 
 type Result<T> = core::result::Result<T, CurlError>;
 
-const DEFAULT_READ_CHUNK_BYTES: usize = 23 * 1024;
 const NULL_DEVICE_PATH: &str = "/dev/null";
 
 #[derive(Debug, Error)]
@@ -86,10 +85,8 @@ impl OutputTarget {
         if path == NULL_DEVICE_PATH {
             return Ok(Self::Discard);
         }
-        let file = File::create(&path).map_err(|source| CurlError::CreateOutputFile {
-            path,
-            source,
-        })?;
+        let file =
+            File::create(&path).map_err(|source| CurlError::CreateOutputFile { path, source })?;
         Ok(Self::File(file))
     }
 
@@ -145,18 +142,18 @@ fn parse_options() -> Result<CurlOptions> {
 }
 
 fn header_end(response: &[u8]) -> Option<usize> {
-    response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
+    response.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
 fn chunked_transfer(headers: &[u8]) -> bool {
-    headers.windows(b"transfer-encoding: chunked".len()).any(|window| {
-        window
-            .iter()
-            .zip(b"transfer-encoding: chunked")
-            .all(|(left, right)| left.eq_ignore_ascii_case(right))
-    })
+    headers
+        .windows(b"transfer-encoding: chunked".len())
+        .any(|window| {
+            window
+                .iter()
+                .zip(b"transfer-encoding: chunked")
+                .all(|(left, right)| left.eq_ignore_ascii_case(right))
+        })
 }
 
 fn decode_chunked(mut body: &[u8]) -> Result<Vec<u8>> {
@@ -167,8 +164,8 @@ fn decode_chunked(mut body: &[u8]) -> Result<Vec<u8>> {
             .windows(2)
             .position(|window| window == b"\r\n")
             .ok_or(CurlError::MissingChunkSizeLineEnding)?;
-        let size_line = core::str::from_utf8(&body[..line_end])
-            .map_err(CurlError::ChunkSizeUtf8)?;
+        let size_line =
+            core::str::from_utf8(&body[..line_end]).map_err(CurlError::ChunkSizeUtf8)?;
         let size_hex = size_line
             .split(';')
             .next()

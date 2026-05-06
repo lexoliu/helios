@@ -12,7 +12,10 @@ pub const MAX_TCP_RECEIVE_SEGMENTS: usize = 128;
 pub const MAX_TCP_OUT_OF_ORDER_SEGMENTS: usize = 32;
 pub const MAX_TCP_QUEUED_SEGMENTS: usize = 32;
 pub(crate) const TCP_RECEIVE_SEGMENT_BYTES: usize = 1460;
+const TCP_RECEIVE_COALESCE_BYTES: usize = 64 * 1024;
 const TCP_RECEIVE_BYTES: usize = MAX_TCP_RECEIVE_SEGMENTS * TCP_RECEIVE_SEGMENT_BYTES;
+const TCP_RECEIVE_BACKPRESSURE_BYTES: usize =
+    TCP_RECEIVE_BACKPRESSURE_SEGMENTS * TCP_RECEIVE_SEGMENT_BYTES;
 const TCP_SMALL_PAYLOAD_ACK_BYTES: usize = TCP_RECEIVE_SEGMENT_BYTES / 2;
 const TCP_DELAYED_ACK_SEGMENTS: u8 = 2;
 const TCP_WINDOW_UPDATE_BYTES: u16 = (TCP_RECEIVE_SEGMENT_BYTES * 4) as u16;
@@ -151,7 +154,7 @@ where
     peer_receive_window: u32,
     peer_sack_permitted: bool,
     peer_timestamp: Option<TcpTimestampOption>,
-    receive_queue: Deque<Bytes, MAX_TCP_RECEIVE_SEGMENTS>,
+    receive_queue: Deque<BytesMut, MAX_TCP_RECEIVE_SEGMENTS>,
     receive_queued_bytes: usize,
     out_of_order: HeapVec<TcpOutOfOrderSegment, MAX_TCP_OUT_OF_ORDER_SEGMENTS>,
     out_of_order_queued_bytes: usize,
@@ -426,7 +429,7 @@ where
     }
 
     pub fn receive_backpressured(&self) -> bool {
-        self.receive_queue.len() + self.out_of_order.len() >= TCP_RECEIVE_BACKPRESSURE_SEGMENTS
+        self.receive_buffered_bytes() >= TCP_RECEIVE_BACKPRESSURE_BYTES
     }
 
     pub fn is_listening_on(&self, address: IpAddress, port: u16) -> bool {
@@ -700,7 +703,7 @@ where
             if drained_segments != 0 || self.should_advertise_window_update(previous_window) {
                 self.request_ack();
             }
-            return Some(bytes);
+            return Some(bytes.freeze());
         }
 
         if self.receive_queue.is_empty() {
@@ -709,32 +712,29 @@ where
             if drained_segments != 0 || self.should_advertise_window_update(previous_window) {
                 self.request_ack();
             }
-            return Some(bytes);
+            return Some(bytes.freeze());
         }
 
         let merge_len = self.receive_merge_len(bytes.len(), max_bytes);
-        let mut merged = BytesMut::with_capacity(merge_len);
-        merged.extend_from_slice(&bytes);
-        while merged.len() < merge_len {
+        while bytes.len() < merge_len {
             let Some(mut next) = self.pop_receive_segment() else {
                 break;
             };
-            let remaining = merge_len - merged.len();
+            let remaining = merge_len - bytes.len();
             if next.len() > remaining {
                 let tail = next.split_off(remaining);
-                merged.extend_from_slice(&next);
+                bytes.extend_from_slice(&next);
                 self.push_front_receive_segment(tail);
                 break;
             }
-            merged.extend_from_slice(&next);
+            bytes.extend_from_slice(&next);
         }
-        bytes = merged.freeze();
         let drained_segments = self.drain_contiguous_out_of_order();
         self.refresh_advertised_window();
         if drained_segments != 0 || self.should_advertise_window_update(previous_window) {
             self.request_ack();
         }
-        Some(bytes)
+        Some(bytes.freeze())
     }
 
     fn receive_merge_len(&self, first_len: usize, max_bytes: usize) -> usize {
@@ -1000,7 +1000,27 @@ where
             .expect("TCP receive buffered byte count overflowed")
     }
 
-    fn push_receive_segment(&mut self, bytes: Bytes) -> Result<(), Bytes> {
+    fn push_receive_payload(&mut self, payload: &[u8]) -> Result<(), ()> {
+        if payload.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(back) = self.receive_queue.back_mut()
+            && back.len().saturating_add(payload.len()) <= TCP_RECEIVE_COALESCE_BYTES
+        {
+            back.extend_from_slice(payload);
+            self.receive_queued_bytes = self
+                .receive_queued_bytes
+                .checked_add(payload.len())
+                .expect("TCP receive queued byte count overflowed");
+            return Ok(());
+        }
+
+        let bytes = BytesMut::from(payload);
+        self.push_receive_segment(bytes).map_err(|_| ())
+    }
+
+    fn push_receive_segment(&mut self, bytes: BytesMut) -> Result<(), BytesMut> {
         let len = bytes.len();
         self.receive_queue.push_back(bytes)?;
         self.receive_queued_bytes = self
@@ -1010,7 +1030,7 @@ where
         Ok(())
     }
 
-    fn push_front_receive_segment(&mut self, bytes: Bytes) {
+    fn push_front_receive_segment(&mut self, bytes: BytesMut) {
         let len = bytes.len();
         self.receive_queue
             .push_front(bytes)
@@ -1021,7 +1041,7 @@ where
             .expect("TCP receive queued byte count overflowed");
     }
 
-    fn pop_receive_segment(&mut self) -> Option<Bytes> {
+    fn pop_receive_segment(&mut self) -> Option<BytesMut> {
         let bytes = self.receive_queue.pop_front()?;
         assert!(
             self.receive_queued_bytes >= bytes.len(),
@@ -1057,8 +1077,7 @@ where
     }
 
     fn push_contiguous_payload(&mut self, payload: &[u8], now_nanos: u64) -> Result<(), ()> {
-        self.push_receive_segment(Bytes::copy_from_slice(payload))
-            .map_err(|_| ())?;
+        self.push_receive_payload(payload)?;
         self.receive_next = self
             .receive_next
             .wrapping_add(u32::try_from(payload.len()).unwrap_or(u32::MAX));
@@ -1106,7 +1125,7 @@ where
                 segment.sequence = self.receive_next;
             }
             let len = segment.payload.len();
-            self.push_receive_segment(segment.payload)
+            self.push_receive_segment(BytesMut::from(segment.payload.as_ref()))
                 .unwrap_or_else(|_| panic!("TCP receive queue reported full after capacity check"));
             self.receive_next = self
                 .receive_next

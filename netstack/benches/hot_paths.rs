@@ -1,9 +1,9 @@
 use divan::counter::{BytesCount, ItemsCount};
 use divan::{AllocProfiler, Bencher, black_box};
 use helios_netstack::{
-    EthernetAddress, IpAddress, Ipv4Address, Ipv4Cidr, MAX_OUTBOUND_FRAMES, NeighborEntry,
-    NeighborState, OutboundBatchStatus, Stack, StackConfig, StackInstant, TcpEndpoint,
-    internet_checksum,
+    BbrV3, EthernetAddress, IpAddress, Ipv4Address, Ipv4Cidr, MAX_OUTBOUND_FRAMES, NeighborEntry,
+    NeighborState, OutboundBatchStatus, Stack, StackConfig, StackInstant, TcpEndpoint, TcpFlags,
+    TcpOptions, TcpPacket, TcpSocket, TcpState, internet_checksum,
 };
 
 #[global_allocator]
@@ -14,6 +14,8 @@ const PEER_MAC: EthernetAddress = [0x02, 0, 0, 0, 0, 2];
 const LOCAL_IP: Ipv4Address = Ipv4Address::new([192, 0, 2, 10]);
 const PEER_IP: Ipv4Address = Ipv4Address::new([192, 0, 2, 20]);
 const UDP_PAYLOAD: &[u8] = b"helios-netstack-divan-udp-payload";
+const TCP_PAYLOAD_BYTES: usize = 1460;
+const TCP_RECEIVE_SEGMENTS: usize = 128;
 
 fn main() {
     divan::main();
@@ -34,6 +36,82 @@ fn checksum(bencher: Bencher, len: usize) {
 #[divan::bench]
 fn stack_new(bencher: Bencher) {
     bencher.bench_local(|| Stack::new(StackConfig::new(black_box(LOCAL_MAC), 1514)));
+}
+
+fn local_tcp_endpoint() -> TcpEndpoint {
+    TcpEndpoint {
+        address: IpAddress::Ipv4(LOCAL_IP),
+        port: 49152,
+    }
+}
+
+fn peer_tcp_endpoint() -> TcpEndpoint {
+    TcpEndpoint {
+        address: IpAddress::Ipv4(PEER_IP),
+        port: 80,
+    }
+}
+
+fn established_tcp_socket() -> TcpSocket<BbrV3> {
+    let mut socket = TcpSocket::connect(
+        local_tcp_endpoint(),
+        peer_tcp_endpoint(),
+        7,
+        BbrV3::new(1460),
+    );
+    let _ = socket.on_segment(
+        TcpPacket {
+            source_port: 80,
+            destination_port: 49152,
+            sequence: 100,
+            acknowledgement: 8,
+            flags: TcpFlags::SYN.union(TcpFlags::ACK),
+            window_size: u16::MAX,
+            options: TcpOptions::empty(),
+            payload: &[],
+        },
+        1,
+    );
+    assert_eq!(socket.state(), TcpState::Established);
+    socket
+}
+
+#[divan::bench(args = [23 * 1024, 128 * 1024])]
+fn tcp_receive_contiguous_read(bencher: Bencher, read_size: usize) {
+    let payload = vec![0u8; TCP_PAYLOAD_BYTES];
+    let target_bytes = TCP_RECEIVE_SEGMENTS * TCP_PAYLOAD_BYTES;
+
+    bencher
+        .counter(BytesCount::new(target_bytes))
+        .bench_local(|| {
+            let mut socket = established_tcp_socket();
+            for index in 0..TCP_RECEIVE_SEGMENTS {
+                let _ = socket.on_segment(
+                    TcpPacket {
+                        source_port: 80,
+                        destination_port: 49152,
+                        sequence: 101
+                            + u32::try_from(index * TCP_PAYLOAD_BYTES)
+                                .expect("TCP benchmark sequence fits u32"),
+                        acknowledgement: 8,
+                        flags: TcpFlags::ACK,
+                        window_size: u16::MAX,
+                        options: TcpOptions::empty(),
+                        payload: black_box(payload.as_slice()),
+                    },
+                    u64::try_from(index + 2).expect("TCP benchmark timestamp fits u64"),
+                );
+            }
+
+            let mut received = 0usize;
+            while received < target_bytes {
+                let bytes = socket
+                    .receive(black_box(read_size))
+                    .expect("TCP benchmark receive queue should contain data");
+                received = received.saturating_add(bytes.len());
+            }
+            assert_eq!(received, target_bytes);
+        });
 }
 
 #[divan::bench]
