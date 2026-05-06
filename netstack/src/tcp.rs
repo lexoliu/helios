@@ -17,6 +17,7 @@ pub const MAX_TCP_RECEIVE_SEGMENTS: usize =
 pub const MAX_TCP_OUT_OF_ORDER_SEGMENTS: usize = 32;
 pub const MAX_TCP_QUEUED_SEGMENTS: usize = 32;
 const TCP_RECEIVE_COALESCE_BYTES: usize = 64 * 1024;
+const TCP_RECEIVE_PREALLOC_BYTES: usize = 32 * 1024;
 const TCP_RECEIVE_BYTES: usize = MAX_TCP_RECEIVE_SEGMENTS * TCP_RECEIVE_SEGMENT_BYTES;
 const TCP_RECEIVE_BACKPRESSURE_BYTES: usize =
     TCP_RECEIVE_BACKPRESSURE_SEGMENTS * TCP_RECEIVE_SEGMENT_BYTES;
@@ -1241,7 +1242,7 @@ where
             return Ok(());
         }
 
-        let bytes = BytesMut::from(payload);
+        let bytes = receive_bytes_from_payload(payload);
         self.push_receive_segment(bytes).map_err(|_| ())
     }
 
@@ -1365,7 +1366,7 @@ where
                 segment.sequence = self.receive_next;
             }
             let len = segment.payload.len();
-            self.push_receive_segment(BytesMut::from(segment.payload.as_ref()))
+            self.push_receive_segment(receive_bytes_from_payload(segment.payload.as_ref()))
                 .unwrap_or_else(|_| panic!("TCP receive queue reported full after capacity check"));
             self.receive_next = self
                 .receive_next
@@ -1584,6 +1585,15 @@ fn syn_header_options(now_nanos: u64, echo_reply: Option<u32>) -> TcpHeaderOptio
             value: timestamp_value(now_nanos),
             echo_reply: echo_reply.unwrap_or(0),
         })
+}
+
+fn receive_bytes_from_payload(payload: &[u8]) -> BytesMut {
+    if payload.len() >= TCP_RECEIVE_SEGMENT_BYTES {
+        let mut bytes = BytesMut::with_capacity(TCP_RECEIVE_PREALLOC_BYTES.max(payload.len()));
+        bytes.extend_from_slice(payload);
+        return bytes;
+    }
+    BytesMut::from(payload)
 }
 
 fn segment_end(segment: &TcpInFlightSegment) -> u32 {
