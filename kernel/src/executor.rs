@@ -142,15 +142,15 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         progress_mode: ProgressMode,
         wake: WakeTarget,
     ) {
-        if progress_mode == ProgressMode::Counted {
-            self.progress.record_progress();
-            self.progress_notify.notify_one();
-        }
-
         match queue.push(runnable) {
             Ok(()) => {}
             Err(PushError::Full(_)) => unreachable!("unbounded ready queue reported full"),
             Err(PushError::Closed(_)) => panic!("executor ready queue was closed unexpectedly"),
+        }
+
+        if progress_mode == ProgressMode::Counted {
+            self.progress.record_progress();
+            self.progress_notify.notify_one();
         }
 
         match wake {
