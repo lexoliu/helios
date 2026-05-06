@@ -13,6 +13,7 @@ use tracing::Subscriber;
 const LOG_BUFFER_INITIAL_CAPACITY: usize = 256;
 const LOG_BUFFER_RETAINED_CAPACITY: usize = 4096;
 const LOG_BUFFER_POOL_SLOTS: usize = 64;
+const LOG_QUEUE_CAPACITY: usize = LOG_BUFFER_POOL_SLOTS * 4;
 
 pub struct KernelConsoleSubscriber<Console> {
     // The `flushing` flag serializes all writes into this single console value,
@@ -46,7 +47,9 @@ impl<Console: Write + Send + 'static> Subscriber for KernelConsoleSubscriber<Con
         let line = format_event(event, &self.buffers);
         match self.queue.push(line) {
             Ok(()) => self.try_flush(),
-            Err(PushError::Full(_)) => unreachable!("unbounded log queue reported full"),
+            Err(PushError::Full(_)) => {
+                panic!("kernel log queue capacity {LOG_QUEUE_CAPACITY} exhausted")
+            }
             Err(PushError::Closed(_)) => panic!("log queue was closed unexpectedly"),
         }
     }
@@ -140,7 +143,7 @@ impl tracing::field::Visit for ConsoleVisitor<'_> {
 pub fn init_logger(console: impl Write + Send + 'static) {
     tracing::subscriber::set_global_default(KernelConsoleSubscriber {
         console: UnsafeCell::new(console),
-        queue: ConcurrentQueue::unbounded(),
+        queue: ConcurrentQueue::bounded(LOG_QUEUE_CAPACITY),
         buffers: Pool::bounded(LOG_BUFFER_POOL_SLOTS, new_log_buffer, reset_log_buffer),
         flushing: AtomicBool::new(false),
         next_span_id: AtomicU64::new(1),
@@ -191,8 +194,16 @@ unsafe impl<Console: Send> Sync for KernelConsoleSubscriber<Console> {}
 #[cfg(test)]
 mod tests {
     use alloc::string::String;
+    use core::cell::UnsafeCell;
+    use core::sync::atomic::{AtomicBool, AtomicU64};
 
-    use super::{LOG_BUFFER_INITIAL_CAPACITY, LOG_BUFFER_RETAINED_CAPACITY, reset_log_buffer};
+    use concurrent_queue::ConcurrentQueue;
+    use objectpool::Pool;
+
+    use super::{
+        KernelConsoleSubscriber, LOG_BUFFER_INITIAL_CAPACITY, LOG_BUFFER_POOL_SLOTS,
+        LOG_BUFFER_RETAINED_CAPACITY, LOG_QUEUE_CAPACITY, new_log_buffer, reset_log_buffer,
+    };
 
     #[test]
     fn log_buffer_reset_drops_oversized_capacity() {
@@ -203,5 +214,18 @@ mod tests {
 
         assert!(buffer.is_empty());
         assert_eq!(buffer.capacity(), LOG_BUFFER_INITIAL_CAPACITY);
+    }
+
+    #[test]
+    fn log_queue_is_bounded_to_kernel_capacity() {
+        let logger = KernelConsoleSubscriber {
+            console: UnsafeCell::new(String::new()),
+            queue: ConcurrentQueue::bounded(LOG_QUEUE_CAPACITY),
+            buffers: Pool::bounded(LOG_BUFFER_POOL_SLOTS, new_log_buffer, reset_log_buffer),
+            flushing: AtomicBool::new(false),
+            next_span_id: AtomicU64::new(1),
+        };
+
+        assert_eq!(logger.queue.capacity(), Some(LOG_QUEUE_CAPACITY));
     }
 }
