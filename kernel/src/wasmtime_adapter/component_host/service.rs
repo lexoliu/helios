@@ -15674,8 +15674,12 @@ where
         Ok(fdflags) => fdflags,
         Err(errno) => return errno,
     };
-    let descriptor = caller.data().descriptors.get(fd).cloned();
-    if let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { .. })) = descriptor {
+    if matches!(
+        caller.data().descriptors.get(fd),
+        Some(Preview1Descriptor::Socket(
+            WasixSocketDescriptor::Pair { .. }
+        ))
+    ) {
         if capacity == 0 {
             let status = p1_write_iovs_from_bytes(caller, memory, iovs, &[], ro_datalen);
             if status != p1::errno::SUCCESS {
@@ -15712,14 +15716,13 @@ where
         }
         return p1_write_u16(caller, memory, ro_flags, 0);
     }
-    let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
-        stream,
-        ..
-    }))) = descriptor
-    else {
-        return p1_connected_tcp_stream(caller, fd)
-            .err()
-            .unwrap_or(p1::errno::INVAL);
+    let stream = match caller.data().descriptors.get(fd) {
+        Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
+            WasixTcpSocket::Connected { stream, .. },
+        ))) => *stream,
+        Some(Preview1Descriptor::Socket(_)) => return p1::errno::INVAL,
+        Some(_) => return p1::errno::NOTSOCK,
+        None => return p1::errno::BADF,
     };
     let status = caller.data().require_tcp_authority();
     if status != p1::errno::SUCCESS {
