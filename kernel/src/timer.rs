@@ -21,6 +21,8 @@ const SCHEDULER_INTERRUPT_INTERVAL: Duration = Duration::from_millis(100);
 const TIMER_WHEEL_QUANTUM: Duration = Duration::from_micros(50);
 const TIMER_WHEEL_LEVELS: usize = 4;
 const TIMER_WHEEL_SLOTS: usize = 256;
+const TIMER_READY_POOL_SLOTS: usize = 8;
+const TIMER_READY_RETAINED_ENTRIES: usize = TIMER_WHEEL_SLOTS;
 
 #[derive(Clone)]
 pub struct Timer<CpuImpl: Cpu + Clone> {
@@ -104,7 +106,11 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
                 armed_deadline: AtomicU64::new(initial_deadline.ticks()),
                 interrupt_interval_ticks,
                 wheel_quantum_ticks,
-                ready_pool: Pool::bounded(8, Vec::new, Vec::clear),
+                ready_pool: Pool::bounded(
+                    TIMER_READY_POOL_SLOTS,
+                    Vec::new,
+                    reset_timer_ready_entries,
+                ),
             }),
         }
     }
@@ -446,6 +452,14 @@ fn wheel_tick_ceil(deadline: Instant, quantum_ticks: u64) -> u64 {
         / quantum_ticks
 }
 
+fn reset_timer_ready_entries(ready: &mut Vec<TimerEntry>) {
+    if ready.capacity() > TIMER_READY_RETAINED_ENTRIES {
+        *ready = Vec::with_capacity(TIMER_READY_RETAINED_ENTRIES);
+    } else {
+        ready.clear();
+    }
+}
+
 unsafe impl Send for TimerShared {}
 unsafe impl Sync for TimerShared {}
 
@@ -459,7 +473,8 @@ mod tests {
     use triomphe::Arc;
 
     use super::{
-        AtomicOrdering, SleepState, TimerEntry, TimingWheel, wheel_tick_ceil, wheel_tick_floor,
+        AtomicOrdering, SleepState, TIMER_READY_RETAINED_ENTRIES, TimerEntry, TimingWheel,
+        reset_timer_ready_entries, wheel_tick_ceil, wheel_tick_floor,
     };
 
     #[derive(Clone)]
@@ -607,5 +622,16 @@ mod tests {
         assert!(timer.sleep_until(Instant::new(99)).state.is_none());
         assert!(timer.sleep_for(core::time::Duration::ZERO).state.is_none());
         assert!(timer.sleep_until(Instant::new(101)).state.is_some());
+    }
+
+    #[test]
+    fn timer_ready_pool_reset_drops_oversized_capacity() {
+        let mut ready = Vec::with_capacity(TIMER_READY_RETAINED_ENTRIES + 1);
+        ready.push(timer_entry(100, 50));
+
+        reset_timer_ready_entries(&mut ready);
+
+        assert!(ready.is_empty());
+        assert_eq!(ready.capacity(), TIMER_READY_RETAINED_ENTRIES);
     }
 }
