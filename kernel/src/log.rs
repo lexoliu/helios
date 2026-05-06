@@ -10,6 +10,10 @@ use nu_ansi_term::{Color, Style};
 use objectpool::{Pool, ReusableObject};
 use tracing::Subscriber;
 
+const LOG_BUFFER_INITIAL_CAPACITY: usize = 256;
+const LOG_BUFFER_RETAINED_CAPACITY: usize = 4096;
+const LOG_BUFFER_POOL_SLOTS: usize = 64;
+
 pub struct KernelConsoleSubscriber<Console> {
     // The `flushing` flag serializes all writes into this single console value,
     // so we do not need an additional spinlock here.
@@ -137,7 +141,7 @@ pub fn init_logger(console: impl Write + Send + 'static) {
     tracing::subscriber::set_global_default(KernelConsoleSubscriber {
         console: UnsafeCell::new(console),
         queue: ConcurrentQueue::unbounded(),
-        buffers: Pool::unbounded(|| String::with_capacity(256), String::clear),
+        buffers: Pool::bounded(LOG_BUFFER_POOL_SLOTS, new_log_buffer, reset_log_buffer),
         flushing: AtomicBool::new(false),
         next_span_id: AtomicU64::new(1),
     })
@@ -153,6 +157,18 @@ fn format_event(event: &tracing::Event<'_>, buffers: &Pool<String>) -> ReusableO
     event.record(&mut visitor);
     line.push('\n');
     line
+}
+
+fn new_log_buffer() -> String {
+    String::with_capacity(LOG_BUFFER_INITIAL_CAPACITY)
+}
+
+fn reset_log_buffer(buffer: &mut String) {
+    if buffer.capacity() > LOG_BUFFER_RETAINED_CAPACITY {
+        *buffer = new_log_buffer();
+    } else {
+        buffer.clear();
+    }
 }
 
 fn level_style(level: &tracing::Level) -> (Style, &'static str) {
@@ -171,3 +187,21 @@ fn is_message_field(field: &tracing::field::Field) -> bool {
 
 unsafe impl<Console: Send> Send for KernelConsoleSubscriber<Console> {}
 unsafe impl<Console: Send> Sync for KernelConsoleSubscriber<Console> {}
+
+#[cfg(test)]
+mod tests {
+    use alloc::string::String;
+
+    use super::{LOG_BUFFER_INITIAL_CAPACITY, LOG_BUFFER_RETAINED_CAPACITY, reset_log_buffer};
+
+    #[test]
+    fn log_buffer_reset_drops_oversized_capacity() {
+        let mut buffer = String::with_capacity(LOG_BUFFER_RETAINED_CAPACITY + 1);
+        buffer.push('x');
+
+        reset_log_buffer(&mut buffer);
+
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.capacity(), LOG_BUFFER_INITIAL_CAPACITY);
+    }
+}
