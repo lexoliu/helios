@@ -822,13 +822,14 @@ def write_report(
         for profile_path in sorted(helios_jsonl.parent.glob("helios*.kernel.folded")):
             lines.append(f"- Helios kernel folded profile is in `{profile_path}`.")
     if wasmtime_profiles:
-        lines.extend(["", "## Wasmtime Wasm Profiling Artifacts", ""])
+        lines.extend(["", "## Wasmtime Native Profiling Artifacts", ""])
         for profile_path in wasmtime_profiles:
             profile = json.loads(profile_path.read_text(encoding="utf-8"))
             profile_kind = profile.get("profile_kind", "unknown")
             profile_scope = profile.get("profile_scope", "unknown")
+            sample_source = profile.get("sample_source", "unknown")
             lines.append(
-                f"- `{profile['workload']}` `{profile['mode']}` `{profile_kind}` `{profile_scope}` metadata: `{profile_path}`"
+                f"- `{profile['workload']}` `{profile['mode']}` `{profile_kind}` `{profile_scope}` `{sample_source}` metadata: `{profile_path}`"
             )
             if "description" in profile:
                 lines.append(f"- `{profile['workload']}` profiler meaning: {profile['description']}")
@@ -862,7 +863,12 @@ def main() -> None:
     parser.add_argument("--skip-helios", action="store_true")
     parser.add_argument("--skip-linux", action="store_true")
     parser.add_argument("--wasmtime-profile-workload", action="append", default=[])
-    parser.add_argument("--wasmtime-profile-mode", choices=["guest", "perfmap", "jitdump"], default="guest")
+    parser.add_argument(
+        "--wasmtime-profile-mode",
+        choices=["guest", "perfmap", "jitdump"],
+        default="jitdump",
+        help="Wasmtime profiling mode for selected native runs. Default jitdump uses Linux perf and emits flamegraph artifacts.",
+    )
     parser.add_argument("--wasmtime-bin", default=os.environ.get("WASMTIME_BIN", "wasmtime"))
     parser.add_argument("--wasmtime-no-flamegraph", action="store_true")
     parser.add_argument("--wasmtime-profile-guest-interval", default="1ms")

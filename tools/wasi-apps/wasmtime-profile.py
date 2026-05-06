@@ -20,21 +20,25 @@ HTTP_LARGE_PAYLOAD_BYTES = 64 * 1024 * 1024
 HTTP_LARGE_PAYLOAD_CHUNK = bytes(range(251))
 DEFAULT_GUEST_INTERVAL = "1ms"
 DEFAULT_PERF_EVENT = "cycles:u"
+DEFAULT_MODE = "jitdump"
 PROFILE_DESCRIPTIONS = {
     "guest": {
         "profile_kind": "wasmtime-guest-profiler",
         "profile_scope": "wasm-guest",
-        "description": "Wasmtime in-process guest sampling profile for wasm stacks, viewable in Firefox Profiler.",
+        "sample_source": "wasmtime-in-process-sampler",
+        "description": "Wasmtime cross-platform guest sampler for wasm stacks, viewable in Firefox Profiler.",
     },
     "perfmap": {
-        "profile_kind": "linux-perf-jit-symbols",
+        "profile_kind": "wasmtime-linux-perfmap",
         "profile_scope": "native-and-jit",
-        "description": "Linux perf profile with Wasmtime perfmap JIT code symbols for flamegraph generation.",
+        "sample_source": "linux-perf",
+        "description": "Linux perf samples with Wasmtime perfmap code-region symbols, suitable for native/JIT flamegraphs.",
     },
     "jitdump": {
-        "profile_kind": "linux-perf-jit-symbols",
+        "profile_kind": "wasmtime-linux-jitdump",
         "profile_scope": "native-and-jit",
-        "description": "Linux perf profile with Wasmtime jitdump records injected before flamegraph generation.",
+        "sample_source": "linux-perf",
+        "description": "Linux perf samples with Wasmtime jitdump code-load records injected before native/JIT flamegraph generation.",
     },
 }
 
@@ -202,7 +206,7 @@ def run_perf_profile(
     injected = None
     if mode == "jitdump":
         injected = out_dir / "perf.jit.data"
-        run([perf, "inject", "-j", "-i", str(perf_data), "-o", str(injected)], out_dir)
+        run([perf, "inject", "--jit", "-i", str(perf_data), "-o", str(injected)], out_dir)
         script_input = injected
     perf_script = out_dir / "perf.script"
     run([perf, "script", "-i", str(script_input)], out_dir, perf_script)
@@ -234,8 +238,8 @@ def main() -> None:
     parser.add_argument(
         "--mode",
         choices=["guest", "perfmap", "jitdump"],
-        default="guest",
-        help="Wasmtime guest profiler or Linux perf-backed native/JIT symbol profiling mode.",
+        default=DEFAULT_MODE,
+        help="Wasmtime profiling mode. Default jitdump uses Linux perf plus JIT code-load records for flamegraphs; guest writes Firefox profiler JSON.",
     )
     parser.add_argument("--out-dir", type=Path)
     parser.add_argument("--wasmtime-bin", default=os.environ.get("WASMTIME_BIN", "wasmtime"))

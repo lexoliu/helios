@@ -224,6 +224,15 @@ CPython import-heavy startup, and QuickJS execution. Logs are written under
 `target/perf-baselines/`. Set `HELIOS_WORKLOAD_BENCH_WORKLOADS` to a
 comma-separated workload list when narrowing a run.
 
+To collect Wasmtime's native Linux profiling artifacts for the same wasm
+workloads, pass `--wasmtime-profile-workload <name>` to
+`tools/wasi-apps/linux-gap-bench.sh`. The default mode is `jitdump`, which
+runs Wasmtime under Linux `perf`, injects Wasmtime's JIT code-load records
+with `perf inject --jit`, and writes `perf.data`, `perf.jit.data`, folded
+stacks, and an SVG flamegraph. Use `--wasmtime-profile-mode perfmap` for the
+lighter perf-map symbol path or `--wasmtime-profile-mode guest` for
+Wasmtime's cross-platform Firefox-profiler JSON.
+
 ## Run In Helios (RISC-V VM)
 
 Use inspector `vm` mode when checking RISC-V-specific behavior. Use
