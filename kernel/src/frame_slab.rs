@@ -62,10 +62,10 @@ impl FrameSlabShard {
     }
 
     fn drain(&self, cached_frames: &AtomicUsize, mut release: impl FnMut(NonNull<u8>)) {
-        let mut head = self.head.lock();
-        while let Some(frame) = head.take() {
+        let mut head = self.head.lock().take();
+        while let Some(frame) = head {
             let next = unsafe { frame.as_ref().next };
-            *head = next;
+            head = next;
             cached_frames.fetch_sub(1, Ordering::AcqRel);
             release(frame.cast());
         }
@@ -224,5 +224,27 @@ mod tests {
         assert_eq!(drained, 2);
         assert_eq!(cache.cached_bytes(), 0);
         assert_eq!(cache.allocate(), None);
+    }
+
+    #[test]
+    fn slab_drain_releases_after_unlocking_shard() {
+        let cache = FrameSlabCache::new();
+        cache.configure_processors(1);
+        let backing = Box::new(AlignedFrames([0; PhysFrame::SIZE * 2]));
+        let first = NonNull::new(backing.0.as_ptr() as *mut u8).expect("first frame pointer");
+        let second = NonNull::new(unsafe { backing.0.as_ptr().add(PhysFrame::SIZE) } as *mut u8)
+            .expect("second frame pointer");
+
+        assert!(cache.deallocate_on(ProcessorId::new(0), first, 128));
+
+        let mut drained = 0;
+        cache.drain(|_| {
+            drained += 1;
+            assert!(cache.deallocate_on(ProcessorId::new(0), second, 128));
+        });
+
+        assert_eq!(drained, 1);
+        assert_eq!(cache.cached_bytes(), PhysFrame::SIZE);
+        assert_eq!(cache.allocate_on(ProcessorId::new(0)), Some(second));
     }
 }
