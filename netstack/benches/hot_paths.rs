@@ -76,7 +76,7 @@ fn established_tcp_socket() -> TcpSocket<BbrV3> {
     socket
 }
 
-#[divan::bench(args = [23 * 1024, 128 * 1024])]
+#[divan::bench(args = [23 * 1024, 64 * 1024, 128 * 1024])]
 fn tcp_receive_contiguous_read(bencher: Bencher, read_size: usize) {
     let payload = vec![0u8; TCP_PAYLOAD_BYTES];
     let target_bytes = TCP_RECEIVE_SEGMENTS * TCP_PAYLOAD_BYTES;
