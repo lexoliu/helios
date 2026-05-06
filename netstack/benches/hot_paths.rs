@@ -323,6 +323,47 @@ fn tcp_send_bytes_segments_without_copy(bencher: Bencher) {
 }
 
 #[divan::bench]
+fn tcp_ack_discards_in_flight_segments(bencher: Bencher) {
+    let payload = Bytes::from(vec![0u8; TCP_TRANSMIT_SEGMENTS * TCP_PAYLOAD_BYTES]);
+
+    bencher
+        .counter(ItemsCount::new(TCP_TRANSMIT_SEGMENTS))
+        .bench_local(|| {
+            let mut socket = established_tcp_socket();
+            let mut remaining = black_box(payload.clone());
+            let written = socket.queue_send_bytes(&mut remaining);
+            assert_eq!(written, TCP_TRANSMIT_SEGMENTS * TCP_PAYLOAD_BYTES);
+            assert!(remaining.is_empty());
+
+            let mut acknowledgement = 0u32;
+            for index in 0..TCP_TRANSMIT_SEGMENTS {
+                let segment = socket
+                    .take_transmit_segment(
+                        u64::try_from(index + 2).expect("TCP benchmark timestamp fits u64"),
+                    )
+                    .expect("TCP benchmark transmit segment should be queued");
+                acknowledgement = segment.header.sequence + segment.sequence_len;
+            }
+
+            let _ = socket.on_segment(
+                TcpPacket {
+                    source_port: 80,
+                    destination_port: 49152,
+                    sequence: 101,
+                    acknowledgement: black_box(acknowledgement),
+                    flags: TcpFlags::ACK,
+                    window_size: u16::MAX,
+                    options: TcpOptions::empty(),
+                    payload: &[],
+                },
+                u64::try_from(TCP_TRANSMIT_SEGMENTS + 2)
+                    .expect("TCP benchmark timestamp fits u64"),
+            );
+            assert_eq!(socket.pending_retransmission(u64::MAX), None);
+        });
+}
+
+#[divan::bench]
 fn tcp_first_listen(bencher: Bencher) {
     bencher.bench_local(|| {
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514));
