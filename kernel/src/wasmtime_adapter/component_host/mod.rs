@@ -1506,6 +1506,7 @@ where
     runtime_state: HostRuntimeState<CpuImpl, HostFs>,
     cpu: CpuImpl,
     started_ticks: u64,
+    counters: helios_hal::cpu::HardwarePerfCounters,
 }
 
 fn component_host_profile<CpuImpl, HostFs>(
@@ -1522,6 +1523,7 @@ where
             runtime_state: store.runtime_state.clone(),
             cpu: store.cpu.clone(),
             started_ticks: store.cpu.now().ticks(),
+            counters: store.cpu.hardware_perf_counters(),
         })
 }
 
@@ -1544,6 +1546,48 @@ fn record_component_host_kernel_profile<CpuImpl, HostFs>(
                 .saturating_sub(profile.started_ticks),
         );
     }
+}
+
+fn record_component_host_kernel_profile_events_bytes<CpuImpl, HostFs>(
+    profile: Option<ComponentHostProfile<CpuImpl, HostFs>>,
+    phase: &'static str,
+    events: u64,
+    bytes: u64,
+) where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    if let Some(profile) = profile {
+        let ended_ticks = profile.cpu.now().ticks();
+        let elapsed_ticks = ended_ticks.saturating_sub(profile.started_ticks);
+        profile.runtime_state.record_profile_stack_parts(
+            ProfileScope::Kernel,
+            "kernel;component-host;",
+            phase,
+            elapsed_ticks,
+        );
+        let elapsed_nanos = profile
+            .runtime_state
+            .uptime_nanos(ended_ticks)
+            .saturating_sub(profile.runtime_state.uptime_nanos(profile.started_ticks));
+        let counter_delta = profile
+            .cpu
+            .hardware_perf_counters()
+            .delta_since(profile.counters);
+        profile.runtime_state.record_perf_metric_parts_events_nanos(
+            ProfileScope::Kernel,
+            "kernel;component-host;",
+            phase,
+            events,
+            elapsed_nanos,
+            counter_delta,
+            bytes,
+        );
+    }
+}
+
+fn component_host_usize_to_u64(value: usize, label: &'static str) -> u64 {
+    u64::try_from(value).unwrap_or_else(|_| panic!("{label} does not fit into u64"))
 }
 
 pub(crate) fn add_program_world_to_linker<CpuImpl, HostFs>(
@@ -1990,13 +2034,21 @@ where
                         component_host_profile(access.get()),
                     ))
                 })?;
-                let response = socket
-                    .0
-                    .tcp_read(socket.1, max_bytes, timeout)
-                    .await
+                let response = socket.0.tcp_read(socket.1, max_bytes, timeout).await;
+                let bytes = response
+                    .as_ref()
+                    .ok()
+                    .and_then(Option::as_ref)
+                    .map_or(0, Bytes::len);
+                let response = response
                     .map(|bytes| bytes.map(|bytes| bytes.to_vec()))
                     .map_err(convert_tcp_error);
-                record_component_host_kernel_profile(profile, "system-net-tcp-read");
+                record_component_host_kernel_profile_events_bytes(
+                    profile,
+                    "system-net-tcp-read",
+                    1,
+                    component_host_usize_to_u64(bytes, "system TCP read byte count"),
+                );
                 Ok::<_, wasmtime::Error>((response,))
             })
         },
@@ -2317,13 +2369,21 @@ where
                         component_host_profile(access.get()),
                     ))
                 })?;
-                let response = socket
-                    .0
-                    .tcp_read(socket.1, max_bytes, timeout)
-                    .await
+                let response = socket.0.tcp_read(socket.1, max_bytes, timeout).await;
+                let bytes = response
+                    .as_ref()
+                    .ok()
+                    .and_then(Option::as_ref)
+                    .map_or(0, Bytes::len);
+                let response = response
                     .map(|bytes| bytes.map(|bytes| bytes.to_vec()))
                     .map_err(convert_program_tcp_error);
-                record_component_host_kernel_profile(profile, "program-net-tcp-read");
+                record_component_host_kernel_profile_events_bytes(
+                    profile,
+                    "program-net-tcp-read",
+                    1,
+                    component_host_usize_to_u64(bytes, "program TCP read byte count"),
+                );
                 Ok::<_, wasmtime::Error>((response,))
             })
         },
