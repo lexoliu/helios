@@ -1,11 +1,12 @@
 use alloc::boxed::Box;
 use alloc::vec;
-use async_lock::Mutex;
+use async_lock::Mutex as AsyncMutex;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::mem::size_of;
 
 use helios_hal::io::{IoError, IoResult};
+use spin::Mutex as SpinMutex;
 
 use crate::notify::Notify;
 use crate::queue::VirtQueue;
@@ -53,10 +54,10 @@ struct DescriptorBitSet {
 
 pub struct VirtioNetDevice<T: VirtioTransport> {
     transport: T,
-    rx_state: Mutex<NetRxState<T>>,
+    rx_state: AsyncMutex<NetRxState<T>>,
     rx_buffers: UnsafeCell<Box<[u8]>>,
     rx_buffer_len: usize,
-    tx_state: Mutex<NetTxState<T>>,
+    tx_state: SpinMutex<NetTxState<T>>,
     interrupts: Notify,
     mac_address: [u8; 6],
     max_frame_len: usize,
@@ -199,13 +200,13 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
 
         Ok(Self {
             transport,
-            rx_state: Mutex::new(NetRxState {
+            rx_state: AsyncMutex::new(NetRxState {
                 rx_queue,
                 rx_in_device,
             }),
             rx_buffers: UnsafeCell::new(rx_buffers),
             rx_buffer_len,
-            tx_state: Mutex::new(NetTxState {
+            tx_state: SpinMutex::new(NetTxState {
                 tx_queue,
                 tx_buffers,
                 tx_buffer_len,
@@ -380,7 +381,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         Frame: AsRef<[u8]>,
     {
         self.validate_tx_frames(frames)?;
-        let mut state = self.tx_state.lock().await;
+        let mut state = self.tx_state.lock();
         Self::drain_tx_completions_when_full(&mut state, frames.len());
         let mut next_frame = 0usize;
         self.submit_available_tx_frames(&mut state, frames, &mut next_frame)
@@ -415,7 +416,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let mut next_frame = 0usize;
         while next_frame < frames.len() {
             let submitted = {
-                let mut state = self.tx_state.lock().await;
+                let mut state = self.tx_state.lock();
                 Self::drain_tx_completions_when_full(&mut state, frames.len() - next_frame);
                 self.submit_available_tx_frames(&mut state, frames, &mut next_frame)?
             };
@@ -425,7 +426,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             }
 
             let should_wait = {
-                let mut state = self.tx_state.lock().await;
+                let mut state = self.tx_state.lock();
                 Self::drain_tx_completions(&mut state, usize::MAX);
                 state.tx_queue.available_descriptors() == 0
             };
@@ -503,7 +504,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     }
 
     pub async fn reclaim_transmit_completions(&self, budget: usize) -> IoResult<usize> {
-        let mut state = self.tx_state.lock().await;
+        let mut state = self.tx_state.lock();
         Ok(Self::drain_tx_completions(&mut state, budget))
     }
 
