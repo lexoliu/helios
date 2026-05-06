@@ -1114,8 +1114,18 @@ where
             if frames.is_empty() {
                 break;
             }
-            self.inner.device.transmit_packet_batch(&frames).await?;
-            transmitted += frames.len();
+            let submitted = self.inner.device.try_transmit_packet_batch(&frames).await?;
+            transmitted += submitted;
+            if submitted < frames.len() {
+                let mut state = self.inner.state.lock().await;
+                while frames.len() > submitted {
+                    let frame = frames
+                        .pop()
+                        .expect("TX restore lost an unsubmitted outbound frame");
+                    state.stack.push_outbound_front(frame);
+                }
+                break;
+            }
         }
         if transmitted != 0 {
             self.record_network_profile("tx-submit", transmit_started);

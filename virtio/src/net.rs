@@ -322,6 +322,18 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         self.transmit_frames_with_wait(frames, wait).await
     }
 
+    pub async fn try_transmit_frames<Frame>(&self, frames: &[Frame]) -> IoResult<usize>
+    where
+        Frame: AsRef<[u8]>,
+    {
+        self.validate_tx_frames(frames)?;
+        let _tx_turn = self.tx_gate.lock().await;
+        let mut state = self.tx_state.lock().await;
+        Self::drain_tx_completions(&mut state, usize::MAX);
+        let mut next_frame = 0usize;
+        self.submit_available_tx_frames(&mut state, frames, &mut next_frame)
+    }
+
     pub async fn transmit_frames_with_wait<Frame, Wait, Fut>(
         &self,
         frames: &[Frame],
@@ -332,15 +344,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         Wait: FnMut() -> Fut,
         Fut: Future<Output = ()>,
     {
-        for frame in frames {
-            let frame = frame.as_ref();
-            if frame.is_empty() || frame.len() > self.max_frame_len {
-                return Err(IoError::InvalidBufferLength {
-                    required_multiple: 1,
-                    actual: frame.len(),
-                });
-            }
-        }
+        self.validate_tx_frames(frames)?;
 
         let mut next_frame = 0usize;
         while next_frame < frames.len() {
@@ -348,45 +352,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 let _tx_turn = self.tx_gate.lock().await;
                 let mut state = self.tx_state.lock().await;
                 Self::drain_tx_completions(&mut state, usize::MAX);
-                let mut submitted = 0usize;
-                let NetTxState {
-                    tx_queue,
-                    tx_buffers,
-                    tx_buffer_len,
-                    tx_in_flight,
-                } = &mut *state;
-                let mut submitted_tokens = [0u16; NET_QUEUE_SIZE as usize];
-                while next_frame < frames.len() && tx_queue.available_descriptors() != 0 {
-                    let frame = frames[next_frame].as_ref();
-                    let token = tx_queue.next_free_descriptor();
-                    let token_index = usize::from(token);
-                    assert!(
-                        !tx_in_flight.get(token_index),
-                        "virtio net TX descriptor {token} is still in flight"
-                    );
-                    let payload_len = write_tx_payload(
-                        slot_buffer_mut(tx_buffers, *tx_buffer_len, token_index, "TX"),
-                        self.header_len,
-                        frame,
-                    )?;
-                    let payload =
-                        slot_buffer(tx_buffers, *tx_buffer_len, token_index, payload_len, "TX");
-                    let submitted_token =
-                        tx_queue.submit_read_only_deferred(&self.transport, payload)?;
-                    assert_eq!(
-                        submitted_token, token,
-                        "virtio net TX descriptor allocation moved while payload was prepared"
-                    );
-                    tx_in_flight.set(token_index);
-                    submitted_tokens[submitted] = token;
-                    submitted += 1;
-                    next_frame += 1;
-                }
-                if submitted != 0 {
-                    tx_queue.commit_deferred(&submitted_tokens[..submitted]);
-                    tx_queue.notify(&self.transport);
-                }
-                submitted
+                self.submit_available_tx_frames(&mut state, frames, &mut next_frame)?
             };
 
             if submitted != 0 {
@@ -403,6 +369,70 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             }
         }
         Ok(())
+    }
+
+    fn validate_tx_frames<Frame>(&self, frames: &[Frame]) -> IoResult<()>
+    where
+        Frame: AsRef<[u8]>,
+    {
+        for frame in frames {
+            let frame = frame.as_ref();
+            if frame.is_empty() || frame.len() > self.max_frame_len {
+                return Err(IoError::InvalidBufferLength {
+                    required_multiple: 1,
+                    actual: frame.len(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn submit_available_tx_frames<Frame>(
+        &self,
+        state: &mut NetTxState<T>,
+        frames: &[Frame],
+        next_frame: &mut usize,
+    ) -> IoResult<usize>
+    where
+        Frame: AsRef<[u8]>,
+    {
+        let NetTxState {
+            tx_queue,
+            tx_buffers,
+            tx_buffer_len,
+            tx_in_flight,
+        } = state;
+        let mut submitted = 0usize;
+        let mut submitted_tokens = [0u16; NET_QUEUE_SIZE as usize];
+        while *next_frame < frames.len() && tx_queue.available_descriptors() != 0 {
+            let frame = frames[*next_frame].as_ref();
+            let token = tx_queue.next_free_descriptor();
+            let token_index = usize::from(token);
+            assert!(
+                !tx_in_flight.get(token_index),
+                "virtio net TX descriptor {token} is still in flight"
+            );
+            let payload_len = write_tx_payload(
+                slot_buffer_mut(tx_buffers, *tx_buffer_len, token_index, "TX"),
+                self.header_len,
+                frame,
+            )?;
+            let payload = slot_buffer(tx_buffers, *tx_buffer_len, token_index, payload_len, "TX");
+            let submitted_token = tx_queue.submit_read_only_deferred(&self.transport, payload)?;
+            assert_eq!(
+                submitted_token, token,
+                "virtio net TX descriptor allocation moved while payload was prepared"
+            );
+            tx_in_flight.set(token_index);
+            submitted_tokens[submitted] = token;
+            submitted += 1;
+            *next_frame += 1;
+        }
+        if submitted != 0 {
+            tx_queue.commit_deferred(&submitted_tokens[..submitted]);
+            tx_queue.notify(&self.transport);
+        }
+        Ok(submitted)
     }
 
     pub async fn reclaim_transmit_completions(&self, budget: usize) -> IoResult<usize> {

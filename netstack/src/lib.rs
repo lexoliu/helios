@@ -254,6 +254,20 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
         }
     }
 
+    /// Attempts to submit stack-owned packet buffers and returns the accepted frame count.
+    fn try_transmit_packet_batch<'a>(
+        &'a self,
+        frames: &'a [PacketBuffer],
+    ) -> impl Future<Output = IoResult<usize>> + Send + 'a {
+        async move {
+            if frames.is_empty() {
+                return Ok(0);
+            }
+            self.transmit(frames[0].as_slice()).await?;
+            Ok(1)
+        }
+    }
+
     /// Reclaims completed transmit slots without waiting for new device events.
     fn reclaim_transmit_completions(
         &self,

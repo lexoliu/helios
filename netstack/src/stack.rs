@@ -525,6 +525,16 @@ impl OutboundFrameQueue {
             .unwrap_or_else(|_| panic!("outbound free queue overflowed after slot release"));
     }
 
+    fn push_front(&mut self, frame: PacketBuffer) {
+        let slot = self
+            .reserve()
+            .unwrap_or_else(|_| panic!("outbound frame queue had no slot for restore"));
+        *self.frame_mut(slot) = frame;
+        self.ready
+            .push_front(slot)
+            .unwrap_or_else(|_| panic!("outbound ready queue overflowed after frame restore"));
+    }
+
     fn pop(&mut self) -> Option<PacketBuffer> {
         let slot = self.ready.pop_front()?;
         let frame = core::mem::take(self.frame_mut(slot));
@@ -684,6 +694,10 @@ impl Stack {
 
     pub fn take_outbound(&mut self) -> Option<PacketBuffer> {
         self.outbound.pop()
+    }
+
+    pub fn push_outbound_front(&mut self, frame: PacketBuffer) {
+        self.outbound.push_front(frame);
     }
 
     fn queue_outbound_frame<R>(
@@ -1966,6 +1980,34 @@ mod tests {
         )
         .expect("test TCP segment should fit");
         (segment, len)
+    }
+
+    fn packet_buffer(bytes: &[u8]) -> PacketBuffer {
+        let mut buffer = PacketBuffer::new();
+        buffer.spare_capacity_mut()[..bytes.len()].copy_from_slice(bytes);
+        buffer.set_len(bytes.len());
+        buffer
+    }
+
+    #[test]
+    fn outbound_restore_preserves_front_order() {
+        let mut queue = OutboundFrameQueue::new();
+        queue.push_front(packet_buffer(b"third"));
+        queue.push_front(packet_buffer(b"second"));
+        queue.push_front(packet_buffer(b"first"));
+
+        assert_eq!(
+            queue.pop().expect("first frame").as_slice(),
+            b"first".as_slice()
+        );
+        assert_eq!(
+            queue.pop().expect("second frame").as_slice(),
+            b"second".as_slice()
+        );
+        assert_eq!(
+            queue.pop().expect("third frame").as_slice(),
+            b"third".as_slice()
+        );
     }
 
     #[test]
