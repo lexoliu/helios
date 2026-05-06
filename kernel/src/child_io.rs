@@ -12,7 +12,7 @@
 
 extern crate alloc;
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use concurrent_queue::{ConcurrentQueue, PopError, PushError};
@@ -35,6 +35,8 @@ struct ByteChannel {
     /// Set to `true` when the reader has gone away, so writers can stop
     /// producing bytes.
     reader_closed: AtomicBool,
+    writer_handles: AtomicUsize,
+    reader_handles: AtomicUsize,
 }
 
 impl ByteChannel {
@@ -44,53 +46,24 @@ impl ByteChannel {
             readable: Notify::new(),
             writer_closed: AtomicBool::new(false),
             reader_closed: AtomicBool::new(false),
+            writer_handles: AtomicUsize::new(1),
+            reader_handles: AtomicUsize::new(1),
         })
-    }
-}
-
-/// Writer liveness guard — when the last outstanding guard is dropped,
-/// the channel is marked closed so the reader observes EOF. Cloneable
-/// writers share one `Arc<WriterLiveness>`, so they all count as "the
-/// same writer" for close purposes.
-struct WriterLiveness {
-    channel: Arc<ByteChannel>,
-}
-
-impl Drop for WriterLiveness {
-    fn drop(&mut self) {
-        self.channel.writer_closed.store(true, Ordering::Release);
-        self.channel.readable.notify_one();
     }
 }
 
 /// Producer half of a byte stream. Writers can be cloned — the channel
 /// stays open as long as any cloned writer is alive; it closes once they
 /// are all dropped.
-#[derive(Clone)]
 pub struct ByteWriter {
     channel: Arc<ByteChannel>,
-    _liveness: Arc<WriterLiveness>,
-}
-
-/// Reader liveness guard — when the last cloned reader is dropped the
-/// channel is marked as reader-closed so writers can stop producing.
-struct ReaderLiveness {
-    channel: Arc<ByteChannel>,
-}
-
-impl Drop for ReaderLiveness {
-    fn drop(&mut self) {
-        self.channel.reader_closed.store(true, Ordering::Release);
-    }
 }
 
 /// Consumer half of a byte stream. Clonable so multiple async tasks can
 /// share the same byte feed — the underlying queue is already
 /// MPMC-safe. Dropping the last clone closes the reader side.
-#[derive(Clone)]
 pub struct ByteReader {
     channel: Arc<ByteChannel>,
-    _liveness: Arc<ReaderLiveness>,
 }
 
 pub struct ByteReadWait {
@@ -102,14 +75,8 @@ pub fn byte_channel() -> (ByteWriter, ByteReader) {
     (
         ByteWriter {
             channel: channel.clone(),
-            _liveness: Arc::new(WriterLiveness {
-                channel: channel.clone(),
-            }),
         },
-        ByteReader {
-            channel: channel.clone(),
-            _liveness: Arc::new(ReaderLiveness { channel }),
-        },
+        ByteReader { channel },
     )
 }
 
@@ -117,6 +84,53 @@ pub fn byte_channel() -> (ByteWriter, ByteReader) {
 /// was dropped; readers see EOF as `Option::None` instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClosedPeer;
+
+impl Clone for ByteWriter {
+    fn clone(&self) -> Self {
+        let previous = self.channel.writer_handles.fetch_add(1, Ordering::AcqRel);
+        assert!(
+            previous != 0,
+            "byte writer cloned after liveness reached zero"
+        );
+        Self {
+            channel: self.channel.clone(),
+        }
+    }
+}
+
+impl Drop for ByteWriter {
+    fn drop(&mut self) {
+        let previous = self.channel.writer_handles.fetch_sub(1, Ordering::AcqRel);
+        assert!(previous != 0, "byte writer handle count underflowed");
+        if previous == 1 {
+            self.channel.writer_closed.store(true, Ordering::Release);
+            self.channel.readable.notify_one();
+        }
+    }
+}
+
+impl Clone for ByteReader {
+    fn clone(&self) -> Self {
+        let previous = self.channel.reader_handles.fetch_add(1, Ordering::AcqRel);
+        assert!(
+            previous != 0,
+            "byte reader cloned after liveness reached zero"
+        );
+        Self {
+            channel: self.channel.clone(),
+        }
+    }
+}
+
+impl Drop for ByteReader {
+    fn drop(&mut self) {
+        let previous = self.channel.reader_handles.fetch_sub(1, Ordering::AcqRel);
+        assert!(previous != 0, "byte reader handle count underflowed");
+        if previous == 1 {
+            self.channel.reader_closed.store(true, Ordering::Release);
+        }
+    }
+}
 
 impl ByteWriter {
     /// Push a chunk of bytes to the consumer. Succeeds as long as the
