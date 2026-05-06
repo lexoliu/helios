@@ -42,6 +42,9 @@ const P9_SETATTR_ATIME_SET: u32 = 0x0000_0080;
 const P9_SETATTR_MTIME_SET: u32 = 0x0000_0100;
 const P9_QTDIR: u8 = 0x80;
 const P9_WRITE_CHUNK: usize = (DEFAULT_MSIZE as usize) - 24;
+const P9_HEADER_LEN: usize = 7;
+const P9_DEFAULT_REQUEST_BODY_BYTES: usize = 256;
+const P9_TWRITE_FIXED_BODY_BYTES: usize = 4 + 8 + 4;
 
 pub trait HostFsTransport: Clone + Send + Sync + 'static {
     fn mount_tag(&self) -> &str;
@@ -69,7 +72,18 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
         body: impl FnOnce(&mut Vec<u8>),
         response_len: usize,
     ) -> Result<Vec<u8>, HostFsError> {
-        let mut request = Vec::with_capacity(7 + 256);
+        self.transact_with_capacity(ty, P9_DEFAULT_REQUEST_BODY_BYTES, body, response_len)
+            .await
+    }
+
+    async fn transact_with_capacity(
+        &self,
+        ty: u8,
+        body_capacity: usize,
+        body: impl FnOnce(&mut Vec<u8>),
+        response_len: usize,
+    ) -> Result<Vec<u8>, HostFsError> {
+        let mut request = Vec::with_capacity(P9_HEADER_LEN + body_capacity);
         request.extend_from_slice(&0_u32.to_le_bytes());
         request.push(ty);
         request.extend_from_slice(&P9_NOTAG.to_le_bytes());
@@ -355,8 +369,9 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
             let count = bytes.len().min(P9_WRITE_CHUNK);
             let chunk = &bytes[..count];
             let response = self
-                .transact(
+                .transact_with_capacity(
                     P9_TWRITE,
+                    write_request_body_capacity(count),
                     |body| {
                         push_u32(body, fid);
                         push_u64(body, offset);
@@ -855,6 +870,12 @@ fn p9_optional_timestamp(flag: u32, nanos: Option<u64>) -> (u32, u64, u64) {
     (flag, nanos / 1_000_000_000, nanos % 1_000_000_000)
 }
 
+fn write_request_body_capacity(payload_len: usize) -> usize {
+    P9_TWRITE_FIXED_BODY_BYTES
+        .checked_add(payload_len)
+        .expect("9p write request capacity overflowed")
+}
+
 fn push_u16(buf: &mut Vec<u8>, value: u16) {
     buf.extend_from_slice(&value.to_le_bytes());
 }
@@ -961,5 +982,13 @@ mod tests {
 
         assert_eq!(read, 3);
         assert_eq!(output, b"prefix-abc");
+    }
+
+    #[test]
+    fn write_request_capacity_accounts_for_payload() {
+        assert_eq!(
+            write_request_body_capacity(4096),
+            P9_TWRITE_FIXED_BODY_BYTES + 4096
+        );
     }
 }
