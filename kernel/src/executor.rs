@@ -20,6 +20,7 @@ use crate::sync::Notify;
 type ReadyQueue = ConcurrentQueue<Runnable>;
 pub type JoinHandle<T> = Task<T>;
 pub const READY_BATCH_TASKS: usize = 1024;
+const READY_QUEUE_CAPACITY: usize = READY_BATCH_TASKS * 4;
 static EXECUTOR_GROUP: Once<NoWeakArc<ExecutorGroup>> = Once::new();
 
 struct ExecutorGroup {
@@ -150,7 +151,9 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
     ) {
         match queue.push(runnable) {
             Ok(()) => {}
-            Err(PushError::Full(_)) => unreachable!("unbounded ready queue reported full"),
+            Err(PushError::Full(_)) => {
+                panic!("executor ready queue capacity {READY_QUEUE_CAPACITY} exhausted")
+            }
             Err(PushError::Closed(_)) => panic!("executor ready queue was closed unexpectedly"),
         }
         let previous_ready = ready_count.fetch_add(1, Ordering::AcqRel);
@@ -316,18 +319,22 @@ fn executor_group(configured_processors: usize) -> NoWeakArc<ExecutorGroup> {
             let mut local_queues = Vec::with_capacity(configured_processors);
             let mut local_ready_counts = Vec::with_capacity(configured_processors);
             for _ in 0..configured_processors {
-                local_queues.push(ConcurrentQueue::unbounded());
+                local_queues.push(ready_queue());
                 local_ready_counts.push(AtomicUsize::new(0));
             }
             NoWeakArc::new(ExecutorGroup {
                 local_queues: local_queues.into_boxed_slice(),
                 local_ready_counts: local_ready_counts.into_boxed_slice(),
-                global_queue: ConcurrentQueue::unbounded(),
+                global_queue: ready_queue(),
                 global_ready_count: AtomicUsize::new(0),
                 global_wake_cursor: AtomicUsize::new(0),
             })
         })
         .clone()
+}
+
+fn ready_queue() -> ReadyQueue {
+    ConcurrentQueue::bounded(READY_QUEUE_CAPACITY)
 }
 
 fn pop_ready(queue: &ReadyQueue, ready_count: &AtomicUsize) -> Result<Runnable, PopError> {
@@ -371,7 +378,10 @@ impl<T> Future for LocalJoinHandle<T> {
 mod tests {
     use helios_hal::cpu::ProcessorId;
 
-    use super::{should_wake_global_processor, should_wake_owner_processor};
+    use super::{
+        READY_QUEUE_CAPACITY, ready_queue, should_wake_global_processor,
+        should_wake_owner_processor,
+    };
 
     #[test]
     fn global_wake_scales_to_processor_count_not_enqueue_count() {
@@ -389,5 +399,12 @@ mod tests {
         assert!(should_wake_owner_processor(0, remote, owner));
         assert!(!should_wake_owner_processor(1, remote, owner));
         assert!(!should_wake_owner_processor(0, owner, owner));
+    }
+
+    #[test]
+    fn ready_queue_is_bounded_to_kernel_capacity() {
+        let queue = ready_queue();
+
+        assert_eq!(queue.capacity(), Some(READY_QUEUE_CAPACITY));
     }
 }
