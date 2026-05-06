@@ -20,7 +20,7 @@ use triomphe::Arc;
 
 use crate::{Notify, NotifyWaiter};
 
-const BYTE_CHANNEL_CHUNK_CAPACITY: usize = 1024;
+const BYTE_CHANNEL_CHUNK_CAPACITY: usize = 256;
 
 /// A single byte-stream channel, closable from both ends. Producers push
 /// reference-counted byte chunks; consumers await and receive the same chunks
