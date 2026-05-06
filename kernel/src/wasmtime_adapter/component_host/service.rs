@@ -242,15 +242,7 @@ impl SharedMemoryPool {
         engine: &wasmtime::Engine,
         spec: SharedMemorySpec,
     ) -> Result<SharedMemory, ProgramExecError> {
-        if let Some((memory, bucket_empty)) = self.buckets.get_mut(&spec).map(|bucket| {
-            let memory = bucket
-                .pop()
-                .expect("shared-memory pool retained an empty bucket");
-            (memory, bucket.is_empty())
-        }) {
-            if bucket_empty {
-                self.buckets.remove(&spec);
-            }
+        if let Some(memory) = self.buckets.get_mut(&spec).and_then(|bucket| bucket.pop()) {
             self.resident_bytes = self
                 .resident_bytes
                 .checked_sub(spec.byte_size())
@@ -18190,7 +18182,7 @@ mod tests {
 
         let reused = pool.acquire(&engine, spec).unwrap();
         assert_eq!(pool.resident_bytes, 0);
-        assert!(!pool.buckets.contains_key(&spec));
+        assert!(pool.buckets.contains_key(&spec));
         let zeroed = unsafe { reused.data()[0].get().read() };
         assert_eq!(zeroed, 0);
     }
