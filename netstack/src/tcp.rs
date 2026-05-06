@@ -899,20 +899,18 @@ where
         }
 
         let merge_len = self.receive_merge_len(bytes.len(), max_bytes);
-        let mut merged = BytesMut::with_capacity(merge_len);
-        merged.extend_from_slice(&bytes);
-        while merged.len() < merge_len {
+        while bytes.len() < merge_len {
             let Some(mut next) = self.pop_receive_segment() else {
                 break;
             };
-            let remaining = merge_len - merged.len();
+            let remaining = merge_len - bytes.len();
             if next.len() > remaining {
                 let tail = next.split_off(remaining);
-                merged.extend_from_slice(&next);
+                bytes.unsplit(next);
                 self.push_front_receive_segment(tail);
                 break;
             }
-            merged.extend_from_slice(&next);
+            bytes.unsplit(next);
         }
         let drained_segments = self.drain_contiguous_out_of_order();
         self.consume_pending_receive_fin(now_nanos);
@@ -920,7 +918,7 @@ where
         if drained_segments != 0 || self.should_advertise_window_update(previous_window) {
             self.request_ack();
         }
-        Some(merged.freeze())
+        Some(bytes.freeze())
     }
 
     fn receive_merge_len(&self, first_len: usize, max_bytes: usize) -> usize {
