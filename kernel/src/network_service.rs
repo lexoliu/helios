@@ -35,6 +35,7 @@ const MAX_TCP_STREAM_HANDLES: usize = 256;
 const MAX_TCP_LISTENER_HANDLES: usize = 64;
 const MAX_UDP_SOCKET_HANDLES: usize = 256;
 const NETWORK_PROGRESS_WAIT: Duration = Duration::from_micros(50);
+const NETWORK_RX_BATCH_FRAMES: usize = 8;
 const NETWORK_TX_BATCH_FRAMES: usize = 8;
 const NETWORK_MIN_POLL_BUDGET: usize = 8;
 const NETWORK_MAX_POLL_BUDGET: usize = 128;
@@ -1211,32 +1212,59 @@ where
             }
         };
         loop {
-            if stack_rx_budget == 0 {
+            let remaining_rx_budget = budget
+                .rx_frames
+                .min(stack_rx_budget)
+                .saturating_sub(received);
+            if stack_rx_budget == 0 || remaining_rx_budget == 0 {
                 break;
             }
-            let Some(frame) = self.inner.device.try_receive_frame().await? else {
-                break;
-            };
-            let (result, receive_backpressured) = {
-                let mut state = self.inner.state.lock().await;
-                let result = state.stack.receive_frame_with_backpressure(
-                    frame.as_ref(),
-                    StackInstant::from_nanos(self.now_nanos()),
-                );
-                match result {
-                    Ok(receive_backpressured) => (Ok(()), receive_backpressured),
-                    Err(error) => (Err(error), false),
-                }
-            };
-            self.inner.device.repost_rx_frame(frame).await?;
-            if let Err(error) = result {
-                if error == StackError::ReceiveBackpressure {
+
+            let mut frames =
+                smallvec::SmallVec::<[DeviceImpl::RxFrame<'_>; NETWORK_RX_BATCH_FRAMES]>::new();
+            while frames.len() < NETWORK_RX_BATCH_FRAMES && frames.len() < remaining_rx_budget {
+                let Some(frame) = self.inner.device.try_receive_frame().await? else {
                     break;
-                }
-                tracing::debug!(?error, "dropped malformed network frame");
+                };
+                frames.push(frame);
             }
-            received += 1;
-            if receive_backpressured || received >= budget.rx_frames.min(stack_rx_budget) {
+            if frames.is_empty() {
+                break;
+            }
+
+            let mut receive_backpressured = false;
+            let received_at = StackInstant::from_nanos(self.now_nanos());
+            {
+                let mut state = self.inner.state.lock().await;
+                for frame in &frames {
+                    match state
+                        .stack
+                        .receive_frame_with_backpressure(frame.as_ref(), received_at)
+                    {
+                        Ok(backpressured) => {
+                            received += 1;
+                            if backpressured {
+                                receive_backpressured = true;
+                                break;
+                            }
+                        }
+                        Err(StackError::ReceiveBackpressure) => {
+                            receive_backpressured = true;
+                            break;
+                        }
+                        Err(error) => {
+                            tracing::debug!(?error, "dropped malformed network frame");
+                            received += 1;
+                        }
+                    }
+                }
+            }
+
+            for frame in frames {
+                self.inner.device.repost_rx_frame(frame).await?;
+            }
+
+            if receive_backpressured {
                 break;
             }
         }
