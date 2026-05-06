@@ -61,6 +61,12 @@ struct TcpOutOfOrderSegment {
     payload: Bytes,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TcpAckTiming {
+    rtt_nanos: u64,
+    interval_nanos: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TcpState {
     Closed,
@@ -749,6 +755,7 @@ where
             return None;
         }
         let acked = acknowledgement.wrapping_sub(self.send_unacknowledged);
+        let timing = self.ack_sample_timing(acknowledgement, now_nanos);
         self.send_unacknowledged = acknowledgement;
         self.bytes_in_flight = self.bytes_in_flight.saturating_sub(acked);
         self.discard_acked_segments(acknowledgement);
@@ -765,11 +772,40 @@ where
             acked_bytes: acked,
             delivered_bytes: self.delivered_bytes,
             bytes_in_flight: self.bytes_in_flight,
-            rtt_nanos: 0,
-            interval_nanos: 0,
+            rtt_nanos: timing.rtt_nanos,
+            interval_nanos: timing.interval_nanos,
             now_nanos,
             app_limited,
         }))
+    }
+
+    fn ack_sample_timing(&self, acknowledgement: u32, now_nanos: u64) -> TcpAckTiming {
+        let mut rtt_nanos = 0;
+        let mut first_sent_at = None;
+        let mut last_sent_at = None;
+        for segment in &self.in_flight {
+            if !sequence_leq(segment_end(segment), acknowledgement) {
+                break;
+            }
+            if segment.retransmissions != 0 {
+                continue;
+            }
+            first_sent_at.get_or_insert(segment.sent_at_nanos);
+            last_sent_at = Some(segment.sent_at_nanos);
+            rtt_nanos = now_nanos.saturating_sub(segment.sent_at_nanos);
+        }
+        let interval_nanos = first_sent_at
+            .zip(last_sent_at)
+            .map(|(first, last)| {
+                now_nanos
+                    .saturating_sub(first)
+                    .max(last.saturating_sub(first))
+            })
+            .unwrap_or(0);
+        TcpAckTiming {
+            rtt_nanos,
+            interval_nanos,
+        }
     }
 
     fn refresh_advertised_window(&mut self) {
@@ -1150,6 +1186,27 @@ mod tests {
         assert_eq!(
             socket.pending_retransmission(TCP_INITIAL_RTO_NANOS * 4),
             None
+        );
+    }
+
+    #[test]
+    fn ack_sample_timing_uses_in_flight_send_timestamp() {
+        let mut socket = established_socket();
+        assert_eq!(socket.queue_send(b"hello"), 5);
+        let sent_at = TCP_INITIAL_RTO_NANOS + 7;
+        let data = socket
+            .take_transmit_segment(sent_at)
+            .expect("established socket should transmit queued bytes");
+        let acked_at = sent_at + 123;
+
+        let timing = socket.ack_sample_timing(data.header.sequence + data.sequence_len, acked_at);
+
+        assert_eq!(
+            timing,
+            TcpAckTiming {
+                rtt_nanos: 123,
+                interval_nanos: 123,
+            }
         );
     }
 
