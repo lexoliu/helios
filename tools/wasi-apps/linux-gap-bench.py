@@ -265,6 +265,7 @@ def run_helios_once(
     env["HELIOS_WORKLOAD_BENCH_ITERATIONS"] = str(iterations)
     env["HELIOS_WORKLOAD_BENCH_MANIFEST"] = str(manifest)
     env["HELIOS_WORKLOAD_BENCH_LOG"] = str(log)
+    env["HELIOS_WORKLOAD_BENCH_KERNEL_PROFILE_OUTPUT"] = str(log.with_suffix(".kernel.folded"))
     if classes:
         env["HELIOS_WORKLOAD_BENCH_CLASSES"] = ",".join(classes)
     if names:
@@ -699,9 +700,12 @@ def write_report(
             "",
             f"- Helios raw iteration timings are in `{helios_jsonl or 'not-run'}`.",
             f"- Linux raw hyperfine timings are in `{linux_json or 'not-run'}`.",
-            "",
         ]
     )
+    if helios_jsonl:
+        for profile_path in sorted(helios_jsonl.parent.glob("helios*.kernel.folded")):
+            lines.append(f"- Helios kernel folded profile is in `{profile_path}`.")
+    lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
