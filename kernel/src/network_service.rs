@@ -12,8 +12,9 @@ use helios_hal::io::IoError;
 use helios_netstack::{
     DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage, DhcpDnsServers,
     DhcpMessageType, DhcpPacket, DnsQuestionWriter, DnsResponse, IpAddress, IpCidr, Ipv4Address,
-    Ipv4Cidr, Ipv6Address, NetworkInterface as NetworkDevice, PacketBuffer, Route, Stack,
-    StackConfig, StackError, StackInstant, TcpConnectState, TcpEndpoint, TcpReadState,
+    Ipv4Cidr, Ipv6Address, NetworkInterface as NetworkDevice, OutboundBatchStatus, PacketBuffer,
+    Route, Stack, StackConfig, StackError, StackInstant, TcpConnectState, TcpEndpoint,
+    TcpReadState,
 };
 
 use crate::{
@@ -1249,6 +1250,27 @@ where
         let transmit_started = self.profile_start();
         let mut transmit_stop = NetworkTransmitStop::Drained;
         while transmitted < budget.tx_frames {
+            let remaining_budget = budget.tx_frames - transmitted;
+            let immediate = {
+                let mut state = self.inner.state.lock().await;
+                state.stack.try_submit_outbound_slices(
+                    remaining_budget.min(NETWORK_TX_BATCH_FRAMES),
+                    |frames| self.inner.device.try_transmit_slices_immediate(frames),
+                )?
+            };
+            match immediate {
+                OutboundBatchStatus::Empty => break,
+                OutboundBatchStatus::Deferred => {}
+                OutboundBatchStatus::Submitted { offered, accepted } => {
+                    transmitted += accepted;
+                    if accepted < offered {
+                        transmit_stop = NetworkTransmitStop::RingFull;
+                        break;
+                    }
+                    continue;
+                }
+            }
+
             let mut frames = smallvec::SmallVec::<[PacketBuffer; NETWORK_TX_BATCH_FRAMES]>::new();
             {
                 let mut state = self.inner.state.lock().await;

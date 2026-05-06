@@ -324,6 +324,20 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         self.submit_available_tx_frames(&mut state, frames, &mut next_frame)
     }
 
+    pub fn try_transmit_frames_immediate<Frame>(&self, frames: &[Frame]) -> IoResult<Option<usize>>
+    where
+        Frame: AsRef<[u8]>,
+    {
+        self.validate_tx_frames(frames)?;
+        let Some(mut state) = self.tx_state.try_lock() else {
+            return Ok(None);
+        };
+        Self::drain_tx_completions(&mut state, usize::MAX);
+        let mut next_frame = 0usize;
+        self.submit_available_tx_frames(&mut state, frames, &mut next_frame)
+            .map(Some)
+    }
+
     pub async fn transmit_frames_with_wait<Frame, Wait, Fut>(
         &self,
         frames: &[Frame],

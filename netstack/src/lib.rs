@@ -35,9 +35,9 @@ pub use packet::{
     UdpPacket,
 };
 pub use stack::{
-    DhcpLease, DnsQueryId, IcmpEchoKey, NeighborEntry, NeighborState, Route, RouteTable, SocketId,
-    Stack, StackConfig, StackEvent, StackInstant, TcpAccept, TcpConnectState, TcpReadState,
-    UdpReceive,
+    DhcpLease, DnsQueryId, IcmpEchoKey, NeighborEntry, NeighborState, OutboundBatchStatus, Route,
+    RouteTable, SocketId, Stack, StackConfig, StackEvent, StackInstant, TcpAccept, TcpConnectState,
+    TcpReadState, UdpReceive,
 };
 pub use tcp::{TcpEndpoint, TcpSegmentOutcome, TcpSocket, TcpState, TcpTransmitSegment};
 pub use types::{
@@ -267,6 +267,12 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
             self.transmit(frames[0].as_slice()).await?;
             Ok(1)
         }
+    }
+
+    /// Attempts to submit borrowed frame slices without waiting for any async lock or event.
+    fn try_transmit_slices_immediate(&self, frames: &[&[u8]]) -> IoResult<Option<usize>> {
+        let _ = frames;
+        Ok(None)
     }
 
     /// Reclaims completed transmit slots without waiting for new device events.

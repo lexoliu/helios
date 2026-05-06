@@ -226,6 +226,13 @@ pub enum StackEvent {
     TcpClosed { socket: SocketId },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutboundBatchStatus {
+    Empty,
+    Deferred,
+    Submitted { offered: usize, accepted: usize },
+}
+
 struct TcpSocketSlab<C>
 where
     C: CongestionControl,
@@ -630,6 +637,41 @@ impl OutboundFrameQueue {
             .unwrap_or_else(|_| panic!("outbound free queue overflowed after frame pop"));
         Some(frame)
     }
+
+    fn try_submit_slices<E>(
+        &mut self,
+        limit: usize,
+        submit: impl FnOnce(&[&[u8]]) -> Result<Option<usize>, E>,
+    ) -> Result<OutboundBatchStatus, E> {
+        if limit == 0 || self.ready.is_empty() {
+            return Ok(OutboundBatchStatus::Empty);
+        }
+
+        let mut frames = ArrayVec::<&[u8], MAX_OUTBOUND_FRAMES>::new();
+        for slot in self.ready.iter().copied().take(limit) {
+            frames
+                .try_push(self.frames[slot].as_slice())
+                .unwrap_or_else(|_| panic!("outbound slice batch exceeded frame queue capacity"));
+        }
+        let offered = frames.len();
+        let Some(accepted) = submit(frames.as_slice())? else {
+            return Ok(OutboundBatchStatus::Deferred);
+        };
+        assert!(
+            accepted <= offered,
+            "network interface accepted more frames than offered"
+        );
+        drop(frames);
+
+        for _ in 0..accepted {
+            let slot = self
+                .ready
+                .pop_front()
+                .expect("outbound ready queue lost submitted frame");
+            self.release(slot);
+        }
+        Ok(OutboundBatchStatus::Submitted { offered, accepted })
+    }
 }
 
 impl Stack<BbrV3> {
@@ -795,6 +837,14 @@ where
 
     pub fn push_outbound_front(&mut self, frame: PacketBuffer) {
         self.outbound.push_front(frame);
+    }
+
+    pub fn try_submit_outbound_slices<E>(
+        &mut self,
+        limit: usize,
+        submit: impl FnOnce(&[&[u8]]) -> Result<Option<usize>, E>,
+    ) -> Result<OutboundBatchStatus, E> {
+        self.outbound.try_submit_slices(limit, submit)
     }
 
     fn queue_outbound_frame<R>(
@@ -2090,6 +2140,59 @@ mod tests {
         assert_eq!(
             queue.pop().expect("third frame").as_slice(),
             b"third".as_slice()
+        );
+    }
+
+    #[test]
+    fn outbound_slice_submit_releases_only_accepted_prefix() {
+        let mut queue = OutboundFrameQueue::new();
+        queue.push_front(packet_buffer(b"third"));
+        queue.push_front(packet_buffer(b"second"));
+        queue.push_front(packet_buffer(b"first"));
+
+        let status = queue
+            .try_submit_slices(3, |frames| {
+                assert_eq!(frames.len(), 3);
+                assert_eq!(frames[0], b"first".as_slice());
+                assert_eq!(frames[1], b"second".as_slice());
+                assert_eq!(frames[2], b"third".as_slice());
+                Ok::<Option<usize>, ()>(Some(2))
+            })
+            .expect("slice submit should succeed");
+        assert_eq!(
+            status,
+            OutboundBatchStatus::Submitted {
+                offered: 3,
+                accepted: 2
+            }
+        );
+        assert_eq!(
+            queue.pop().expect("third frame").as_slice(),
+            b"third".as_slice()
+        );
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn outbound_slice_submit_deferred_preserves_ready_queue() {
+        let mut queue = OutboundFrameQueue::new();
+        queue.push_front(packet_buffer(b"second"));
+        queue.push_front(packet_buffer(b"first"));
+
+        let status = queue
+            .try_submit_slices(2, |frames| {
+                assert_eq!(frames.len(), 2);
+                Ok::<Option<usize>, ()>(None)
+            })
+            .expect("deferred submit should succeed");
+        assert_eq!(status, OutboundBatchStatus::Deferred);
+        assert_eq!(
+            queue.pop().expect("first frame").as_slice(),
+            b"first".as_slice()
+        );
+        assert_eq!(
+            queue.pop().expect("second frame").as_slice(),
+            b"second".as_slice()
         );
     }
 
