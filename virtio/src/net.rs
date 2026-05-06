@@ -22,7 +22,6 @@ const DEFAULT_IP_MTU: usize = 1500;
 const NET_FEATURE_MAC: u64 = 1 << 5;
 const NET_FEATURE_STATUS: u64 = 1 << 16;
 const NET_FEATURE_MTU: u64 = 1 << 3;
-const ZERO_NET_HEADER: [u8; size_of::<VirtioNetHeader>()] = [0; size_of::<VirtioNetHeader>()];
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -683,14 +682,17 @@ fn write_tx_payload(buffer: &mut [u8], header_len: usize, frame: &[u8]) -> IoRes
         });
     }
 
-    buffer[..header_len].copy_from_slice(&ZERO_NET_HEADER[..header_len]);
+    // TX slots are zero-initialized and the device only reads them, so the
+    // virtio-net header remains the all-zero "no offload" header across reuse.
     buffer[header_len..payload_len].copy_from_slice(frame);
     Ok(payload_len)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::DescriptorBitSet;
+    use core::mem::size_of;
+
+    use super::{DescriptorBitSet, VirtioNetHeader, write_tx_payload};
 
     #[test]
     fn descriptor_bitset_tracks_sparse_tokens() {
@@ -709,5 +711,28 @@ mod tests {
         assert!(bits.get(0));
         assert!(!bits.get(65));
         assert!(bits.get(129));
+    }
+
+    #[test]
+    fn tx_payload_write_preserves_zero_net_header() {
+        let expected_header = [0; size_of::<VirtioNetHeader>()];
+        let header_len = expected_header.len();
+        let mut buffer = [0u8; 64];
+        let first = [1u8; 8];
+        let second = [2u8; 4];
+
+        assert_eq!(
+            write_tx_payload(&mut buffer, header_len, &first).expect("first payload fits"),
+            header_len + first.len()
+        );
+        assert_eq!(&buffer[..header_len], expected_header);
+        assert_eq!(&buffer[header_len..header_len + first.len()], first);
+
+        assert_eq!(
+            write_tx_payload(&mut buffer, header_len, &second).expect("second payload fits"),
+            header_len + second.len()
+        );
+        assert_eq!(&buffer[..header_len], expected_header);
+        assert_eq!(&buffer[header_len..header_len + second.len()], second);
     }
 }
