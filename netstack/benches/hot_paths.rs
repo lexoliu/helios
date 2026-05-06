@@ -2,7 +2,7 @@ use divan::counter::{BytesCount, ItemsCount};
 use divan::{AllocProfiler, Bencher, black_box};
 use helios_netstack::{
     EthernetAddress, IpAddress, Ipv4Address, Ipv4Cidr, NeighborEntry, NeighborState,
-    OutboundBatchStatus, Stack, StackConfig, StackInstant, internet_checksum,
+    OutboundBatchStatus, Stack, StackConfig, StackInstant, TcpEndpoint, internet_checksum,
 };
 
 #[global_allocator]
@@ -33,6 +33,17 @@ fn checksum(bencher: Bencher, len: usize) {
 #[divan::bench]
 fn stack_new(bencher: Bencher) {
     bencher.bench_local(|| Stack::new(StackConfig::new(black_box(LOCAL_MAC), 1514)));
+}
+
+#[divan::bench]
+fn tcp_first_listen(bencher: Bencher) {
+    bencher.bench_local(|| {
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514));
+        stack.open_tcp_listen(TcpEndpoint {
+            address: IpAddress::Ipv4(LOCAL_IP),
+            port: black_box(8080),
+        })
+    });
 }
 
 #[divan::bench]

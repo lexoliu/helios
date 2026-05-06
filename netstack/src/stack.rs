@@ -23,9 +23,12 @@ pub const MAX_STACK_EVENTS: usize = 64;
 pub const MAX_UDP_RX: usize = 64;
 pub const MAX_TCP_ACCEPT: usize = 64;
 pub const MAX_TCP_SOCKETS: usize = 256;
+const TCP_SOCKET_SLAB_CHUNK_SLOTS: usize = 16;
+const TCP_SOCKET_SLAB_CHUNKS: usize = MAX_TCP_SOCKETS / TCP_SOCKET_SLAB_CHUNK_SLOTS;
 const TCP_ENDPOINT_INDEX_SLOTS: usize = MAX_TCP_SOCKETS * 2;
 const TCP_LISTENER_INDEX_SLOTS: usize = MAX_TCP_SOCKETS * 2;
 const MAX_TCP_TIMER_ENTRIES: usize = MAX_TCP_SOCKETS * 4;
+const _: () = assert!(MAX_TCP_SOCKETS.is_multiple_of(TCP_SOCKET_SLAB_CHUNK_SLOTS));
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StackInstant {
@@ -237,7 +240,7 @@ struct TcpSocketSlab<C>
 where
     C: CongestionControl,
 {
-    slots: Option<Box<[MaybeUninit<TcpSocket<C>>]>>,
+    slots: [Option<Box<[MaybeUninit<TcpSocket<C>>]>>; TCP_SOCKET_SLAB_CHUNKS],
     occupied: [bool; MAX_TCP_SOCKETS],
     free: [usize; MAX_TCP_SOCKETS],
     free_len: usize,
@@ -285,7 +288,7 @@ where
 {
     fn new() -> Self {
         Self {
-            slots: None,
+            slots: core::array::from_fn(|_| None),
             occupied: [false; MAX_TCP_SOCKETS],
             free: core::array::from_fn(|index| MAX_TCP_SOCKETS - 1 - index),
             free_len: MAX_TCP_SOCKETS,
@@ -328,9 +331,9 @@ where
         if self.free_len == 0 {
             panic!("TCP socket slab is full");
         };
-        self.materialize_slots();
         self.free_len -= 1;
         let index = self.free[self.free_len];
+        self.materialize_slot_chunk(index);
         assert!(
             !self.occupied[index],
             "TCP socket slab free list is corrupt"
@@ -342,7 +345,7 @@ where
         let listener_key = socket
             .local_endpoint()
             .filter(|_| socket.remote_endpoint().is_none());
-        self.slots_mut()[index].write(socket);
+        self.slot_storage_mut(index).write(socket);
         self.occupied[index] = true;
         if let Some(key) = endpoint_key {
             self.endpoint_index.insert(key, index);
@@ -358,7 +361,7 @@ where
         if !self.occupied.get(index).copied().unwrap_or(false) {
             return None;
         }
-        let socket = unsafe { self.slots_mut()[index].assume_init_read() };
+        let socket = unsafe { self.slot_storage_mut(index).assume_init_read() };
         self.occupied[index] = false;
         if let Some((local, remote)) = socket.local_endpoint().zip(socket.remote_endpoint()) {
             self.endpoint_index
@@ -407,29 +410,41 @@ where
     }
 
     fn slot_ref(&self, index: usize) -> &TcpSocket<C> {
-        unsafe { self.slots_ref()[index].assume_init_ref() }
+        let (chunk, slot) = socket_slot_chunk(index);
+        unsafe { self.chunk_ref(chunk)[slot].assume_init_ref() }
     }
 
     fn slot_mut(&mut self, index: usize) -> &mut TcpSocket<C> {
-        unsafe { self.slots_mut()[index].assume_init_mut() }
+        let (chunk, slot) = socket_slot_chunk(index);
+        unsafe { self.chunk_mut(chunk)[slot].assume_init_mut() }
     }
 
-    fn materialize_slots(&mut self) {
-        if self.slots.is_none() {
-            self.slots = Some(Box::<[TcpSocket<C>]>::new_uninit_slice(MAX_TCP_SOCKETS));
+    fn slot_storage_mut(&mut self, index: usize) -> &mut MaybeUninit<TcpSocket<C>> {
+        let (chunk, slot) = socket_slot_chunk(index);
+        &mut self.chunk_mut(chunk)[slot]
+    }
+
+    fn materialize_slot_chunk(&mut self, index: usize) {
+        let (chunk, _) = socket_slot_chunk(index);
+        if self.slots[chunk].is_none() {
+            self.slots[chunk] = Some(Box::<[TcpSocket<C>]>::new_uninit_slice(
+                TCP_SOCKET_SLAB_CHUNK_SLOTS,
+            ));
         }
     }
 
-    fn slots_ref(&self) -> &[MaybeUninit<TcpSocket<C>>] {
+    fn chunk_ref(&self, chunk: usize) -> &[MaybeUninit<TcpSocket<C>>] {
         self.slots
-            .as_deref()
-            .expect("TCP socket storage is not materialized")
+            .get(chunk)
+            .and_then(Option::as_deref)
+            .expect("TCP socket chunk is not materialized")
     }
 
-    fn slots_mut(&mut self) -> &mut [MaybeUninit<TcpSocket<C>>] {
+    fn chunk_mut(&mut self, chunk: usize) -> &mut [MaybeUninit<TcpSocket<C>>] {
         self.slots
-            .as_deref_mut()
-            .expect("TCP socket storage is not materialized")
+            .get_mut(chunk)
+            .and_then(Option::as_deref_mut)
+            .expect("TCP socket chunk is not materialized")
     }
 }
 
@@ -439,10 +454,11 @@ where
 {
     fn clone(&self) -> Self {
         let mut cloned = Self {
-            slots: self
-                .slots
-                .as_ref()
-                .map(|_| Box::<[TcpSocket<C>]>::new_uninit_slice(MAX_TCP_SOCKETS)),
+            slots: core::array::from_fn(|chunk| {
+                self.slots[chunk]
+                    .as_ref()
+                    .map(|_| Box::<[TcpSocket<C>]>::new_uninit_slice(TCP_SOCKET_SLAB_CHUNK_SLOTS))
+            }),
             occupied: self.occupied,
             free: self.free,
             free_len: self.free_len,
@@ -454,7 +470,9 @@ where
         };
         for active_slot in 0..self.active_len {
             let index = self.active[active_slot];
-            cloned.slots_mut()[index].write(self.slot_ref(index).clone());
+            cloned
+                .slot_storage_mut(index)
+                .write(self.slot_ref(index).clone());
         }
         cloned
     }
@@ -482,7 +500,7 @@ where
             let index = self.active[active_slot];
             if self.occupied[index] {
                 unsafe {
-                    self.slots_mut()[index].assume_init_drop();
+                    self.slot_storage_mut(index).assume_init_drop();
                 }
                 self.occupied[index] = false;
             }
@@ -2061,6 +2079,13 @@ fn socket_id(index: usize) -> SocketId {
 fn socket_index(socket: SocketId) -> usize {
     usize::try_from(socket.raw() - 1)
         .unwrap_or_else(|_| panic!("socket id does not fit into usize"))
+}
+
+const fn socket_slot_chunk(index: usize) -> (usize, usize) {
+    (
+        index / TCP_SOCKET_SLAB_CHUNK_SLOTS,
+        index % TCP_SOCKET_SLAB_CHUNK_SLOTS,
+    )
 }
 
 fn mix_endpoint(mut hash: u64, endpoint: TcpEndpoint) -> u64 {
