@@ -152,6 +152,16 @@ enum NetworkTransmitStop {
     RingFull,
 }
 
+#[derive(Clone, Copy)]
+enum NetworkPollSource {
+    Pump,
+    Ping,
+    Dns,
+    Tcp,
+    Udp,
+    Configuration,
+}
+
 impl NetworkPollProgress {
     const fn is_idle(self) -> bool {
         self.received_frames == 0 && self.reclaimed_tx == 0 && self.transmitted_frames == 0
@@ -165,11 +175,63 @@ impl NetworkPollProgress {
 }
 
 impl NetworkTransmitStop {
-    const fn profile_phase(self) -> &'static str {
+    const fn profile_phase(self, source: NetworkPollSource) -> &'static str {
+        match (self, source) {
+            (Self::Drained, NetworkPollSource::Pump) => "tx-submit-drained-pump",
+            (Self::Drained, NetworkPollSource::Ping) => "tx-submit-drained-ping",
+            (Self::Drained, NetworkPollSource::Dns) => "tx-submit-drained-dns",
+            (Self::Drained, NetworkPollSource::Tcp) => "tx-submit-drained-tcp",
+            (Self::Drained, NetworkPollSource::Udp) => "tx-submit-drained-udp",
+            (Self::Drained, NetworkPollSource::Configuration) => "tx-submit-drained-configuration",
+            (Self::Budget, NetworkPollSource::Pump) => "tx-submit-budget-pump",
+            (Self::Budget, NetworkPollSource::Ping) => "tx-submit-budget-ping",
+            (Self::Budget, NetworkPollSource::Dns) => "tx-submit-budget-dns",
+            (Self::Budget, NetworkPollSource::Tcp) => "tx-submit-budget-tcp",
+            (Self::Budget, NetworkPollSource::Udp) => "tx-submit-budget-udp",
+            (Self::Budget, NetworkPollSource::Configuration) => "tx-submit-budget-configuration",
+            (Self::RingFull, NetworkPollSource::Pump) => "tx-submit-ring-full-pump",
+            (Self::RingFull, NetworkPollSource::Ping) => "tx-submit-ring-full-ping",
+            (Self::RingFull, NetworkPollSource::Dns) => "tx-submit-ring-full-dns",
+            (Self::RingFull, NetworkPollSource::Tcp) => "tx-submit-ring-full-tcp",
+            (Self::RingFull, NetworkPollSource::Udp) => "tx-submit-ring-full-udp",
+            (Self::RingFull, NetworkPollSource::Configuration) => {
+                "tx-submit-ring-full-configuration"
+            }
+        }
+    }
+}
+
+impl NetworkPollSource {
+    const fn rx_drain_phase(self) -> &'static str {
         match self {
-            Self::Drained => "tx-submit-drained",
-            Self::Budget => "tx-submit-budget",
-            Self::RingFull => "tx-submit-ring-full",
+            Self::Pump => "rx-drain-pump",
+            Self::Ping => "rx-drain-ping",
+            Self::Dns => "rx-drain-dns",
+            Self::Tcp => "rx-drain-tcp",
+            Self::Udp => "rx-drain-udp",
+            Self::Configuration => "rx-drain-configuration",
+        }
+    }
+
+    const fn tx_reclaim_phase(self) -> &'static str {
+        match self {
+            Self::Pump => "tx-reclaim-pump",
+            Self::Ping => "tx-reclaim-ping",
+            Self::Dns => "tx-reclaim-dns",
+            Self::Tcp => "tx-reclaim-tcp",
+            Self::Udp => "tx-reclaim-udp",
+            Self::Configuration => "tx-reclaim-configuration",
+        }
+    }
+
+    const fn tcp_drive_phase(self) -> &'static str {
+        match self {
+            Self::Pump => "tcp-drive-pump",
+            Self::Ping => "tcp-drive-ping",
+            Self::Dns => "tcp-drive-dns",
+            Self::Tcp => "tcp-drive-tcp",
+            Self::Udp => "tcp-drive-udp",
+            Self::Configuration => "tcp-drive-configuration",
         }
     }
 }
@@ -574,7 +636,7 @@ where
     pub async fn run_packet_pump(&self) -> ! {
         let mut cadence = NetworkPumpCadence::new();
         loop {
-            match self.poll_network_once().await {
+            match self.poll_network_once(NetworkPollSource::Pump).await {
                 Ok((progress, budget)) => match cadence.complete(progress, budget) {
                     NetworkPumpAction::Continue => {}
                     NetworkPumpAction::Yield => crate::yield_now().await,
@@ -1052,7 +1114,7 @@ where
     }
 
     async fn drive_ipv4_configuration(&self) -> Result<bool, NetworkConfigurationError> {
-        self.drive_network()
+        self.drive_network(NetworkPollSource::Configuration)
             .await
             .map_err(NetworkConfigurationError::Device)?;
         let now = StackInstant::from_nanos(self.now_nanos());
@@ -1063,7 +1125,7 @@ where
                 .map_err(NetworkConfigurationError::Control)?;
             state.is_configured()
         };
-        self.drive_network()
+        self.drive_network(NetworkPollSource::Configuration)
             .await
             .map_err(NetworkConfigurationError::Device)?;
         Ok(configured)
@@ -1166,35 +1228,38 @@ where
     }
 
     async fn drive_ping(&self) -> Result<(), PingError> {
-        self.drive_network()
+        self.drive_network(NetworkPollSource::Ping)
             .await
             .map_err(|error| PingError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed))
     }
 
     async fn drive_dns(&self) -> Result<(), DnsError> {
-        self.drive_network()
+        self.drive_network(NetworkPollSource::Dns)
             .await
             .map_err(|error| DnsError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed))
     }
 
     async fn drive_tcp(&self) -> Result<(), TcpError> {
-        self.drive_network()
+        self.drive_network(NetworkPollSource::Tcp)
             .await
             .map_err(|error| TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed))
     }
 
     async fn drive_udp(&self) -> Result<(), UdpError> {
-        self.drive_network()
+        self.drive_network(NetworkPollSource::Udp)
             .await
             .map_err(|error| UdpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed))
     }
 
-    async fn drive_network(&self) -> Result<(), IoError> {
-        let _ = self.poll_network_once().await?;
+    async fn drive_network(&self, source: NetworkPollSource) -> Result<(), IoError> {
+        let _ = self.poll_network_once(source).await?;
         Ok(())
     }
 
-    async fn poll_network_once(&self) -> Result<(NetworkPollProgress, NetworkPollBudget), IoError> {
+    async fn poll_network_once(
+        &self,
+        source: NetworkPollSource,
+    ) -> Result<(NetworkPollProgress, NetworkPollBudget), IoError> {
         let budget = {
             let state = self.inner.state.lock().await;
             state.poll.budget()
@@ -1207,7 +1272,11 @@ where
             .reclaim_transmit_completions(budget.tx_completions)
             .await?;
         if reclaimed != 0 {
-            self.record_network_profile_events("tx-reclaim", reclaim_started, reclaimed);
+            self.record_network_profile_events(
+                source.tx_reclaim_phase(),
+                reclaim_started,
+                reclaimed,
+            );
         }
 
         let mut received = 0usize;
@@ -1283,7 +1352,7 @@ where
             }
         }
         self.record_network_profile_events_bytes(
-            "rx-drain",
+            source.rx_drain_phase(),
             receive_started,
             received,
             received_bytes,
@@ -1297,7 +1366,7 @@ where
                 .drive_tcp(StackInstant::from_nanos(self.now_nanos()))
                 .unwrap_or_else(|error| tracing::debug!(?error, "failed to drive TCP control"));
         }
-        self.record_network_profile("tcp-drive", tcp_started);
+        self.record_network_profile(source.tcp_drive_phase(), tcp_started);
 
         let mut transmitted = 0usize;
         let mut transmitted_bytes = 0usize;
@@ -1370,7 +1439,7 @@ where
         }
         if transmitted != 0 {
             self.record_network_profile_events_bytes(
-                transmit_stop.profile_phase(),
+                transmit_stop.profile_phase(source),
                 transmit_started,
                 transmitted,
                 transmitted_bytes,
@@ -1520,7 +1589,7 @@ where
 
     async fn acquire_dhcp_address(&self) -> Result<KernelIpv4Cidr, NetworkControlError> {
         loop {
-            self.drive_network()
+            self.drive_network(NetworkPollSource::Configuration)
                 .await
                 .map_err(|_| NetworkControlError::BackendFault)?;
             let now = StackInstant::from_nanos(self.now_nanos());
@@ -1532,7 +1601,7 @@ where
             if let Some(cidr) = next {
                 return Ok(cidr);
             }
-            self.drive_network()
+            self.drive_network(NetworkPollSource::Configuration)
                 .await
                 .map_err(|_| NetworkControlError::BackendFault)?;
             self.wait_for_progress(NETWORK_PROGRESS_WAIT).await;
