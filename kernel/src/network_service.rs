@@ -36,7 +36,13 @@ const MAX_TCP_STREAM_HANDLES: usize = 256;
 const MAX_TCP_LISTENER_HANDLES: usize = 64;
 const MAX_UDP_SOCKET_HANDLES: usize = 256;
 const NETWORK_PROGRESS_WAIT: Duration = Duration::from_micros(50);
-const NETWORK_RX_BATCH_FRAMES: usize = 8;
+// AArch64/HVF local TCP diagnostics showed that matching the borrowed RX
+// batch to the virtio polling budget moves receive work in the right
+// direction without changing protocol semantics: 64 MiB raw tcp/wasix
+// medians went 92/102 ms -> 89/97 ms, and rx-drain ns/event went
+// 915/962 -> 838/842. This is not the final network win; it just keeps the
+// device-facing receive loop from reacquiring/reposting after every 8 frames.
+const NETWORK_RX_BATCH_FRAMES: usize = 32;
 const NETWORK_TX_BATCH_FRAMES: usize = MAX_OUTBOUND_FRAMES;
 const NETWORK_MIN_POLL_BUDGET: usize = 8;
 const NETWORK_MAX_POLL_BUDGET: usize = 128;
