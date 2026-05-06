@@ -342,13 +342,13 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             }
         }
 
-        let _tx_turn = self.tx_gate.lock().await;
         let mut next_frame = 0usize;
         while next_frame < frames.len() {
-            let mut submitted = 0usize;
-            {
+            let submitted = {
+                let _tx_turn = self.tx_gate.lock().await;
                 let mut state = self.tx_state.lock().await;
                 Self::drain_tx_completions(&mut state, usize::MAX);
+                let mut submitted = 0usize;
                 let NetTxState {
                     tx_queue,
                     tx_buffers,
@@ -386,7 +386,8 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                     tx_queue.commit_deferred(&submitted_tokens[..submitted]);
                     tx_queue.notify(&self.transport);
                 }
-            }
+                submitted
+            };
 
             if submitted != 0 {
                 continue;
