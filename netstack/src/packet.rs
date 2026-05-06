@@ -3,6 +3,8 @@ use crate::{
     ipv4_checksum, tcpv4_checksum, tcpv6_checksum, udp_checksum,
 };
 
+pub const MAX_TCP_SACK_BLOCKS: usize = 4;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EthernetProtocol {
     Ipv4,
@@ -468,12 +470,64 @@ pub struct TcpTimestampOption {
     pub echo_reply: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TcpSackBlock {
+    pub left_edge: u32,
+    pub right_edge: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TcpSackBlocks {
+    blocks: [TcpSackBlock; MAX_TCP_SACK_BLOCKS],
+    len: usize,
+}
+
+impl TcpSackBlocks {
+    pub const fn empty() -> Self {
+        Self {
+            blocks: [TcpSackBlock {
+                left_edge: 0,
+                right_edge: 0,
+            }; MAX_TCP_SACK_BLOCKS],
+            len: 0,
+        }
+    }
+
+    pub fn push(&mut self, block: TcpSackBlock) -> Result<(), TcpSackBlock> {
+        if self.len == MAX_TCP_SACK_BLOCKS {
+            return Err(block);
+        }
+        self.blocks[self.len] = block;
+        self.len += 1;
+        Ok(())
+    }
+
+    pub const fn len(self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    pub fn as_slice(&self) -> &[TcpSackBlock] {
+        &self.blocks[..self.len]
+    }
+}
+
+impl Default for TcpSackBlocks {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TcpOptions<'a> {
     raw: &'a [u8],
     maximum_segment_size: Option<u16>,
     window_scale: Option<u8>,
     sack_permitted: bool,
+    sack_blocks: TcpSackBlocks,
     timestamp: Option<TcpTimestampOption>,
 }
 
@@ -484,6 +538,7 @@ impl<'a> TcpOptions<'a> {
             maximum_segment_size: None,
             window_scale: None,
             sack_permitted: false,
+            sack_blocks: TcpSackBlocks::empty(),
             timestamp: None,
         }
     }
@@ -514,6 +569,17 @@ impl<'a> TcpOptions<'a> {
                         }
                         4 if data.is_empty() => {
                             options.sack_permitted = true;
+                        }
+                        5 if data.len() % 8 == 0 => {
+                            for block in data.chunks_exact(8) {
+                                options
+                                    .sack_blocks
+                                    .push(TcpSackBlock {
+                                        left_edge: u32::from_be_bytes(block[..4].try_into().ok()?),
+                                        right_edge: u32::from_be_bytes(block[4..].try_into().ok()?),
+                                    })
+                                    .ok()?;
+                            }
                         }
                         8 if data.len() == 8 => {
                             options.timestamp = Some(TcpTimestampOption {
@@ -546,6 +612,10 @@ impl<'a> TcpOptions<'a> {
         self.sack_permitted
     }
 
+    pub const fn sack_blocks(self) -> TcpSackBlocks {
+        self.sack_blocks
+    }
+
     pub const fn timestamp(self) -> Option<TcpTimestampOption> {
         self.timestamp
     }
@@ -555,6 +625,7 @@ impl<'a> TcpOptions<'a> {
 pub struct TcpHeaderOptions {
     maximum_segment_size: Option<u16>,
     sack_permitted: bool,
+    sack_blocks: TcpSackBlocks,
     timestamp: Option<TcpTimestampOption>,
 }
 
@@ -563,6 +634,7 @@ impl TcpHeaderOptions {
         Self {
             maximum_segment_size: None,
             sack_permitted: false,
+            sack_blocks: TcpSackBlocks::empty(),
             timestamp: None,
         }
     }
@@ -578,6 +650,15 @@ impl TcpHeaderOptions {
         self
     }
 
+    pub const fn with_sack_blocks(mut self, blocks: TcpSackBlocks) -> Self {
+        self.sack_blocks = blocks;
+        self
+    }
+
+    pub const fn sack_blocks(self) -> TcpSackBlocks {
+        self.sack_blocks
+    }
+
     pub const fn with_timestamp(mut self, value: TcpTimestampOption) -> Self {
         self.timestamp = Some(value);
         self
@@ -589,11 +670,18 @@ impl TcpHeaderOptions {
             None => 0,
         };
         let sack_permitted_len = if self.sack_permitted { 2 } else { 0 };
+        let sack_blocks_len = if self.sack_blocks.is_empty() {
+            0
+        } else {
+            2 + self.sack_blocks.len() * 8
+        };
         let timestamp_len = match self.timestamp {
             Some(_) => 10,
             None => 0,
         };
-        align_tcp_options_len(maximum_segment_size_len + sack_permitted_len + timestamp_len)
+        align_tcp_options_len(
+            maximum_segment_size_len + sack_permitted_len + sack_blocks_len + timestamp_len,
+        )
     }
 
     fn encode(self, output: &mut [u8]) -> Option<()> {
@@ -612,6 +700,16 @@ impl TcpHeaderOptions {
             output[offset] = 4;
             output[offset + 1] = 2;
             offset += 2;
+        }
+        if !self.sack_blocks.is_empty() {
+            output[offset] = 5;
+            output[offset + 1] = u8::try_from(2 + self.sack_blocks.len() * 8).ok()?;
+            offset += 2;
+            for block in self.sack_blocks.as_slice() {
+                output[offset..offset + 4].copy_from_slice(&block.left_edge.to_be_bytes());
+                output[offset + 4..offset + 8].copy_from_slice(&block.right_edge.to_be_bytes());
+                offset += 8;
+            }
         }
         if let Some(timestamp) = self.timestamp {
             output[offset] = 8;
@@ -802,6 +900,7 @@ mod tests {
         assert_eq!(options.maximum_segment_size(), Some(1460));
         assert_eq!(options.window_scale(), Some(7));
         assert!(options.sack_permitted());
+        assert!(options.sack_blocks().is_empty());
         assert_eq!(
             options.timestamp(),
             Some(TcpTimestampOption {
@@ -843,6 +942,7 @@ mod tests {
         assert_eq!(packet.payload, b"x");
         assert_eq!(packet.options.maximum_segment_size(), Some(1460));
         assert!(packet.options.sack_permitted());
+        assert!(packet.options.sack_blocks().is_empty());
         assert_eq!(
             packet.options.timestamp(),
             Some(TcpTimestampOption {
@@ -850,5 +950,40 @@ mod tests {
                 echo_reply: 5,
             })
         );
+    }
+
+    #[test]
+    fn tcp_sack_blocks_roundtrip_in_options() {
+        let source = IpAddress::Ipv4(Ipv4Address::new([192, 0, 2, 1]));
+        let destination = IpAddress::Ipv4(Ipv4Address::new([192, 0, 2, 2]));
+        let header = TcpHeader {
+            source_port: 49152,
+            destination_port: 80,
+            sequence: 7,
+            acknowledgement: 101,
+            flags: TcpFlags::ACK,
+            window_size: u16::MAX,
+        };
+        let mut blocks = TcpSackBlocks::empty();
+        blocks
+            .push(TcpSackBlock {
+                left_edge: 104,
+                right_edge: 107,
+            })
+            .expect("single SACK block should fit");
+        let mut bytes = [0u8; 64];
+
+        let len = TcpPacket::encode_with_options(
+            &mut bytes,
+            source,
+            destination,
+            header,
+            TcpHeaderOptions::empty().with_sack_blocks(blocks),
+            &[],
+        )
+        .expect("TCP SACK segment should fit");
+        let packet = TcpPacket::parse(&bytes[..len]).expect("encoded SACK should parse");
+
+        assert_eq!(packet.options.sack_blocks().as_slice(), blocks.as_slice());
     }
 }

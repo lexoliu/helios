@@ -5,7 +5,7 @@ use heapless::{Deque, Vec as HeapVec};
 
 use crate::{
     AckSample, CongestionControl, CongestionEvent, IpAddress, RecoveryAction, TcpFlags, TcpHeader,
-    TcpHeaderOptions, TcpPacket, TcpTimestampOption,
+    TcpHeaderOptions, TcpPacket, TcpSackBlock, TcpSackBlocks, TcpTimestampOption,
 };
 
 pub const MAX_TCP_RECEIVE_SEGMENTS: usize = 128;
@@ -296,6 +296,25 @@ where
     pub fn mark_ack_queued(&mut self) {
         self.ack_pending = false;
         self.delayed_ack_deadline_nanos = None;
+    }
+
+    pub fn pending_ack_options(&self) -> TcpHeaderOptions {
+        if !self.peer_sack_permitted {
+            return TcpHeaderOptions::empty();
+        }
+        let mut blocks = TcpSackBlocks::empty();
+        for segment in &self.out_of_order {
+            if blocks
+                .push(TcpSackBlock {
+                    left_edge: segment.sequence,
+                    right_edge: segment_end_from_parts(segment.sequence, segment.payload.len()),
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+        TcpHeaderOptions::empty().with_sack_blocks(blocks)
     }
 
     pub const fn advertised_window(&self) -> u16 {
@@ -1038,7 +1057,7 @@ fn min_deadline(left: Option<u64>, right: Option<u64>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BbrV3, Ipv4Address, TcpOptions};
+    use crate::{BbrV3, Ipv4Address, TcpOptions, TcpSackBlock};
 
     fn endpoint(port: u16) -> TcpEndpoint {
         TcpEndpoint {
@@ -1696,6 +1715,48 @@ mod tests {
         );
 
         assert_eq!(socket.receive(16).as_deref(), Some(b"abcdefghi".as_slice()));
+    }
+
+    #[test]
+    fn pending_ack_options_report_out_of_order_sack_blocks() {
+        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+        socket.mark_syn_queued(0);
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+                options: TcpOptions::parse(&[4, 2, 0, 0]).expect("SACK-permitted should parse"),
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS,
+        );
+        socket.mark_ack_queued();
+
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 104,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: b"def",
+            },
+            TCP_INITIAL_RTO_NANOS + 1,
+        );
+
+        assert_eq!(
+            socket.pending_ack_options().sack_blocks().as_slice(),
+            &[TcpSackBlock {
+                left_edge: 104,
+                right_edge: 107,
+            }]
+        );
     }
 
     #[test]

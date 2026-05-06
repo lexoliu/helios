@@ -796,7 +796,8 @@ impl Stack {
             ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader, TcpHeaderOptions), 16>::new();
         let mut pending_syn_ack =
             ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader, TcpHeaderOptions), 16>::new();
-        let mut pending_ack = ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader), 16>::new();
+        let mut pending_ack =
+            ArrayVec::<(usize, TcpEndpoint, TcpEndpoint, TcpHeader, TcpHeaderOptions), 16>::new();
         let mut pending_retransmit = ArrayVec::<(usize, TcpTransmitSegment), 16>::new();
         let mut pending_data = ArrayVec::<(usize, TcpTransmitSegment), 16>::new();
         for active_slot in 0..self.tcp.active_len() {
@@ -853,7 +854,7 @@ impl Stack {
                     }
                     if let Some(header) = socket.pending_ack() {
                         pending_ack
-                            .try_push((index, local, remote, header))
+                            .try_push((index, local, remote, header, socket.pending_ack_options()))
                             .unwrap_or_else(|_| panic!("TCP ACK transmit burst overflowed"));
                     }
                 }
@@ -884,16 +885,8 @@ impl Stack {
                 self.schedule_tcp_timer(index);
             }
         }
-        for (index, local, remote, header) in pending_ack {
-            if self.queue_tcp(
-                local,
-                remote,
-                header,
-                TcpHeaderOptions::empty(),
-                &[],
-                index as u16,
-                now,
-            )? {
+        for (index, local, remote, header, options) in pending_ack {
+            if self.queue_tcp(local, remote, header, options, &[], index as u16, now)? {
                 let socket = self
                     .tcp
                     .get_mut(index)
