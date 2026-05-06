@@ -35,9 +35,9 @@ pub use packet::{
     UdpPacket,
 };
 pub use stack::{
-    DhcpLease, DnsQueryId, IcmpEchoKey, NeighborEntry, NeighborState, OutboundBatchStatus, Route,
-    RouteTable, SocketId, Stack, StackConfig, StackEvent, StackInstant, TcpAccept, TcpConnectState,
-    TcpReadState, UdpReceive,
+    DhcpLease, DnsQueryId, IcmpEchoKey, MAX_OUTBOUND_FRAMES, NeighborEntry, NeighborState,
+    OutboundBatchStatus, Route, RouteTable, SocketId, Stack, StackConfig, StackEvent, StackInstant,
+    TcpAccept, TcpConnectState, TcpReadState, UdpReceive,
 };
 pub use tcp::{TcpEndpoint, TcpSegmentOutcome, TcpSocket, TcpState, TcpTransmitSegment};
 pub use types::{

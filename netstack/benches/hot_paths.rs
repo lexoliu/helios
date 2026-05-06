@@ -1,8 +1,9 @@
 use divan::counter::{BytesCount, ItemsCount};
 use divan::{AllocProfiler, Bencher, black_box};
 use helios_netstack::{
-    EthernetAddress, IpAddress, Ipv4Address, Ipv4Cidr, NeighborEntry, NeighborState,
-    OutboundBatchStatus, Stack, StackConfig, StackInstant, TcpEndpoint, internet_checksum,
+    EthernetAddress, IpAddress, Ipv4Address, Ipv4Cidr, MAX_OUTBOUND_FRAMES, NeighborEntry,
+    NeighborState, OutboundBatchStatus, Stack, StackConfig, StackInstant, TcpEndpoint,
+    internet_checksum,
 };
 
 #[global_allocator]
@@ -78,13 +79,66 @@ fn udp_queue_and_immediate_submit(bencher: Bencher) {
                 Ok::<Option<usize>, ()>(Some(1))
             })
             .expect("outbound immediate submit should succeed");
-        assert_eq!(
-            status,
+        match status {
             OutboundBatchStatus::Submitted {
-                offered: 1,
-                accepted: 1,
-                accepted_bytes: _
+                offered,
+                accepted,
+                accepted_bytes,
+            } => {
+                assert_eq!(offered, 1);
+                assert_eq!(accepted, 1);
+                assert!(accepted_bytes > UDP_PAYLOAD.len());
             }
-        );
+            other => panic!("unexpected outbound status: {other:?}"),
+        }
+    });
+}
+
+#[divan::bench(args = [8usize, MAX_OUTBOUND_FRAMES])]
+fn udp_queue_and_immediate_submit_batch(bencher: Bencher, batch: usize) {
+    let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514));
+    stack.add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24));
+    stack.learn_neighbor(NeighborEntry {
+        ip: IpAddress::Ipv4(PEER_IP),
+        mac: PEER_MAC,
+        state: NeighborState::Reachable,
+        updated_at: StackInstant::from_nanos(0),
+    });
+    let mut identification = 0u16;
+
+    bencher.counter(ItemsCount::new(batch)).bench_local(|| {
+        for _ in 0..batch {
+            stack
+                .send_udp_ipv4_from(
+                    LOCAL_IP,
+                    49152,
+                    PEER_IP,
+                    8080,
+                    black_box(UDP_PAYLOAD),
+                    identification,
+                    StackInstant::from_nanos(u64::from(identification)),
+                )
+                .expect("UDP frame should queue with a known neighbor");
+            identification = identification.wrapping_add(1);
+        }
+        let status = stack
+            .try_submit_outbound_slices(batch, |frames| {
+                assert_eq!(frames.len(), batch, "benchmark submits the queued batch");
+                black_box(frames);
+                Ok::<Option<usize>, ()>(Some(frames.len()))
+            })
+            .expect("outbound immediate submit should succeed");
+        match status {
+            OutboundBatchStatus::Submitted {
+                offered,
+                accepted,
+                accepted_bytes,
+            } => {
+                assert_eq!(offered, batch);
+                assert_eq!(accepted, batch);
+                assert!(accepted_bytes > UDP_PAYLOAD.len() * batch);
+            }
+            other => panic!("unexpected outbound status: {other:?}"),
+        }
     });
 }

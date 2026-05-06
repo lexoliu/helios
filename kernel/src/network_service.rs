@@ -12,9 +12,9 @@ use helios_hal::io::IoError;
 use helios_netstack::{
     DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage, DhcpDnsServers,
     DhcpMessageType, DhcpPacket, DnsQuestionWriter, DnsResponse, IpAddress, IpCidr, Ipv4Address,
-    Ipv4Cidr, Ipv6Address, NetworkInterface as NetworkDevice, OutboundBatchStatus, PacketBuffer,
-    Route, Stack, StackConfig, StackError, StackInstant, TcpConnectState, TcpEndpoint,
-    TcpReadState,
+    Ipv4Cidr, Ipv6Address, MAX_OUTBOUND_FRAMES, NetworkInterface as NetworkDevice,
+    OutboundBatchStatus, PacketBuffer, Route, Stack, StackConfig, StackError, StackInstant,
+    TcpConnectState, TcpEndpoint, TcpReadState,
 };
 
 use crate::{
@@ -36,7 +36,7 @@ const MAX_TCP_LISTENER_HANDLES: usize = 64;
 const MAX_UDP_SOCKET_HANDLES: usize = 256;
 const NETWORK_PROGRESS_WAIT: Duration = Duration::from_micros(50);
 const NETWORK_RX_BATCH_FRAMES: usize = 8;
-const NETWORK_TX_BATCH_FRAMES: usize = 8;
+const NETWORK_TX_BATCH_FRAMES: usize = MAX_OUTBOUND_FRAMES;
 const NETWORK_MIN_POLL_BUDGET: usize = 8;
 const NETWORK_MAX_POLL_BUDGET: usize = 128;
 const NETWORK_BUSY_POLL_ROUNDS: usize = 8;
@@ -2699,14 +2699,14 @@ mod tests {
     use bytes::Bytes;
     use helios_netstack::{
         ETHERNET_FRAME_BYTES, EthernetFrame, EthernetProtocol, IpAddress, IpProtocol, Ipv6Address,
-        Ipv6Cidr, Ipv6Packet, NeighborEntry, NeighborState, StackInstant, TcpFlags, TcpHeader,
-        TcpPacket, UdpPacket,
+        Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborEntry, NeighborState, StackInstant,
+        TcpFlags, TcpHeader, TcpPacket, UdpPacket,
     };
 
     use super::{
-        HandleSlab, NETWORK_BUSY_POLL_ROUNDS, NetworkIpAddress, NetworkPollBudget,
-        NetworkPollProgress, NetworkPollState, NetworkPumpAction, NetworkPumpCadence, NetworkState,
-        limit_udp_datagram_bytes, parse_ipv6,
+        HandleSlab, NETWORK_BUSY_POLL_ROUNDS, NETWORK_TX_BATCH_FRAMES, NetworkIpAddress,
+        NetworkPollBudget, NetworkPollProgress, NetworkPollState, NetworkPumpAction,
+        NetworkPumpCadence, NetworkState, limit_udp_datagram_bytes, parse_ipv6,
     };
 
     fn ipv6_tcp_frame(
@@ -3014,6 +3014,11 @@ mod tests {
             transmitted_frames: 0,
         });
         assert_eq!(poll.budget().tx_frames, 8);
+    }
+
+    #[test]
+    fn tx_batch_matches_outbound_slab_capacity() {
+        assert_eq!(NETWORK_TX_BATCH_FRAMES, MAX_OUTBOUND_FRAMES);
     }
 
     #[test]
