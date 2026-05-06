@@ -106,7 +106,11 @@ fn tcp_receive_contiguous_read(bencher: Bencher, read_size: usize) {
             let mut received = 0usize;
             while received < target_bytes {
                 let bytes = socket
-                    .receive(black_box(read_size))
+                    .receive(
+                        black_box(read_size),
+                        u64::try_from(received + target_bytes)
+                            .expect("TCP benchmark receive timestamp fits u64"),
+                    )
                     .expect("TCP benchmark receive queue should contain data");
                 received = received.saturating_add(bytes.len());
             }
