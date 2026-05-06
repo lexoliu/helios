@@ -5,6 +5,7 @@ import http.server
 import json
 import os
 import platform
+import shutil
 import signal
 import shlex
 import socketserver
@@ -566,6 +567,31 @@ def helios_perf_metric_paths(helios_jsonl: Path | None) -> list[Path]:
     return sorted(helios_jsonl.parent.glob("helios*.perf.json"))
 
 
+def render_helios_kernel_flamegraphs(helios_jsonl: Path | None) -> list[Path]:
+    if helios_jsonl is None:
+        return []
+    profile_paths = sorted(helios_jsonl.parent.glob("helios*.kernel.folded"))
+    if not profile_paths:
+        return []
+    flamegraph = shutil.which("inferno-flamegraph")
+    if flamegraph is None:
+        raise SystemExit(
+            "inferno-flamegraph is required to render Helios kernel flamegraphs; install the `inferno` cargo package"
+        )
+    outputs = []
+    for profile_path in profile_paths:
+        output = profile_path.with_suffix(".flamegraph.svg")
+        with output.open("w", encoding="utf-8") as handle:
+            subprocess.run(
+                [flamegraph, str(profile_path)],
+                cwd=repo_root(),
+                stdout=handle,
+                check=True,
+            )
+        outputs.append(output)
+    return outputs
+
+
 def parse_perf_metrics(paths: list[Path]) -> list[dict]:
     samples = []
     for path in paths:
@@ -724,6 +750,7 @@ def write_summary_json(
     docker_digest: str | None,
     host_load: dict,
     network_perf: list[dict],
+    helios_kernel_flamegraphs: list[Path],
 ) -> None:
     payload = {
         "schema_version": 1,
@@ -751,6 +778,7 @@ def write_summary_json(
             }
             for row in network_perf[:16]
         ],
+        "helios_kernel_flamegraphs": [str(path) for path in helios_kernel_flamegraphs],
     }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -935,6 +963,7 @@ def write_report(
     linux = parse_hyperfine(linux_json)
     rows = comparison_rows(workloads, helios, linux)
     perf_metric_paths = helios_perf_metric_paths(helios_jsonl)
+    helios_kernel_flamegraphs = render_helios_kernel_flamegraphs(helios_jsonl)
     svg_path = path.with_name("helios-vs-linux.svg")
     write_svg(svg_path, rows)
     throughput_svg_path = path.with_name("network-throughput.svg")
@@ -950,6 +979,7 @@ def write_report(
         docker_digest,
         host_load,
         network_perf,
+        helios_kernel_flamegraphs,
     )
     lines = [
         "# Helios vs Native Linux Benchmark",
@@ -1022,6 +1052,11 @@ def write_report(
                 f"| `{row['name']}` | {row['events']} | {row['bytes']} | {row['nanos']} ns | {nanos_per_event} | {bytes_per_event} | {throughput} | `{row['source']}` |"
             )
         lines.append("")
+    if helios_kernel_flamegraphs:
+        lines.extend(["## Helios Kernel Flamegraphs", ""])
+        for flamegraph_path in helios_kernel_flamegraphs:
+            lines.append(f"![{flamegraph_path.name}]({flamegraph_path.name})")
+            lines.append("")
 
     for workload_class, title in [("cpu-bound", "CPU-Bound"), ("io-bound", "IO-Bound")]:
         class_workloads = [workload for workload in workloads if workload["class"] == workload_class]
@@ -1069,6 +1104,8 @@ def write_report(
     if helios_jsonl:
         for profile_path in sorted(helios_jsonl.parent.glob("helios*.kernel.folded")):
             lines.append(f"- Helios kernel folded profile is in `{profile_path}`.")
+        for flamegraph_path in helios_kernel_flamegraphs:
+            lines.append(f"- Helios kernel flamegraph SVG is in `{flamegraph_path}`.")
     if wasmtime_profiles:
         lines.extend(["", "## Wasmtime Native Profiling Artifacts", ""])
         for profile_path in wasmtime_profiles:
