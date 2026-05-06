@@ -1,7 +1,8 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
+use core::fmt;
+use core::mem::MaybeUninit;
 
 use arrayvec::ArrayVec;
 use bytes::Bytes;
@@ -226,12 +227,12 @@ pub enum StackEvent {
     TcpClosed { socket: SocketId },
 }
 
-#[derive(Clone, Debug)]
 struct TcpSocketSlab<C>
 where
     C: CongestionControl,
 {
-    slots: Box<[Option<TcpSocket<C>>]>,
+    slots: Box<[MaybeUninit<TcpSocket<C>>]>,
+    occupied: [bool; MAX_TCP_SOCKETS],
     free: [usize; MAX_TCP_SOCKETS],
     free_len: usize,
     active: [usize; MAX_TCP_SOCKETS],
@@ -277,10 +278,9 @@ where
     C: CongestionControl,
 {
     fn new() -> Self {
-        let mut slots = Vec::with_capacity(MAX_TCP_SOCKETS);
-        slots.resize_with(MAX_TCP_SOCKETS, || None);
         Self {
-            slots: slots.into_boxed_slice(),
+            slots: Box::<[TcpSocket<C>]>::new_uninit_slice(MAX_TCP_SOCKETS),
+            occupied: [false; MAX_TCP_SOCKETS],
             free: core::array::from_fn(|index| MAX_TCP_SOCKETS - 1 - index),
             free_len: MAX_TCP_SOCKETS,
             active: [0; MAX_TCP_SOCKETS],
@@ -302,12 +302,20 @@ where
             .unwrap_or_else(|| panic!("TCP active socket slot {slot} is outside active set"))
     }
 
-    fn get(&self, index: usize) -> Option<&Option<TcpSocket<C>>> {
-        self.slots.get(index)
+    fn get(&self, index: usize) -> Option<&TcpSocket<C>> {
+        if self.occupied.get(index).copied().unwrap_or(false) {
+            Some(self.slot_ref(index))
+        } else {
+            None
+        }
     }
 
-    fn get_mut(&mut self, index: usize) -> Option<&mut Option<TcpSocket<C>>> {
-        self.slots.get_mut(index)
+    fn get_mut(&mut self, index: usize) -> Option<&mut TcpSocket<C>> {
+        if self.occupied.get(index).copied().unwrap_or(false) {
+            Some(self.slot_mut(index))
+        } else {
+            None
+        }
     }
 
     fn insert(&mut self, socket: TcpSocket<C>) -> SocketId {
@@ -316,8 +324,7 @@ where
         };
         self.free_len -= 1;
         let index = self.free[self.free_len];
-        let slot = &mut self.slots[index];
-        assert!(slot.is_none(), "TCP socket slab free list is corrupt");
+        assert!(!self.occupied[index], "TCP socket slab free list is corrupt");
         let endpoint_key = socket
             .local_endpoint()
             .zip(socket.remote_endpoint())
@@ -325,7 +332,8 @@ where
         let listener_key = socket
             .local_endpoint()
             .filter(|_| socket.remote_endpoint().is_none());
-        *slot = Some(socket);
+        self.slots[index].write(socket);
+        self.occupied[index] = true;
         if let Some(key) = endpoint_key {
             self.endpoint_index.insert(key, index);
         }
@@ -337,7 +345,11 @@ where
     }
 
     fn remove(&mut self, index: usize) -> Option<TcpSocket<C>> {
-        let socket = self.slots.get_mut(index).and_then(Option::take)?;
+        if !self.occupied.get(index).copied().unwrap_or(false) {
+            return None;
+        }
+        let socket = unsafe { self.slots[index].assume_init_read() };
+        self.occupied[index] = false;
         if let Some((local, remote)) = socket.local_endpoint().zip(socket.remote_endpoint()) {
             self.endpoint_index
                 .remove(TcpEndpointKey::new(local, remote));
@@ -382,6 +394,68 @@ where
         self.listener_index
             .lookup(local)
             .or_else(|| self.listener_index.lookup(wildcard_endpoint(local)))
+    }
+
+    fn slot_ref(&self, index: usize) -> &TcpSocket<C> {
+        unsafe { self.slots[index].assume_init_ref() }
+    }
+
+    fn slot_mut(&mut self, index: usize) -> &mut TcpSocket<C> {
+        unsafe { self.slots[index].assume_init_mut() }
+    }
+}
+
+impl<C> Clone for TcpSocketSlab<C>
+where
+    C: CongestionControl,
+{
+    fn clone(&self) -> Self {
+        let mut cloned = Self {
+            slots: Box::<[TcpSocket<C>]>::new_uninit_slice(MAX_TCP_SOCKETS),
+            occupied: self.occupied,
+            free: self.free,
+            free_len: self.free_len,
+            active: self.active,
+            active_positions: self.active_positions,
+            active_len: self.active_len,
+            endpoint_index: self.endpoint_index.clone(),
+            listener_index: self.listener_index.clone(),
+        };
+        for active_slot in 0..self.active_len {
+            let index = self.active[active_slot];
+            cloned.slots[index].write(self.slot_ref(index).clone());
+        }
+        cloned
+    }
+}
+
+impl<C> fmt::Debug for TcpSocketSlab<C>
+where
+    C: CongestionControl,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TcpSocketSlab")
+            .field("free_len", &self.free_len)
+            .field("active_len", &self.active_len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<C> Drop for TcpSocketSlab<C>
+where
+    C: CongestionControl,
+{
+    fn drop(&mut self) {
+        for active_slot in 0..self.active_len {
+            let index = self.active[active_slot];
+            if self.occupied[index] {
+                unsafe {
+                    self.slots[index].assume_init_drop();
+                }
+                self.occupied[index] = false;
+            }
+        }
     }
 }
 
@@ -838,7 +912,7 @@ where
         for active_slot in 0..self.tcp.active_len() {
             let index = self.tcp.active_index(active_slot);
             let deadline = {
-                let Some(socket) = self.tcp.get_mut(index).and_then(Option::as_mut) else {
+                let Some(socket) = self.tcp.get_mut(index) else {
                     panic!("TCP active socket index referenced a missing socket");
                 };
                 socket.expire_timers(now.nanos());
@@ -909,7 +983,6 @@ where
                 let socket = self
                     .tcp
                     .get_mut(index)
-                    .and_then(Option::as_mut)
                     .expect("TCP socket disappeared while queuing SYN");
                 socket.mark_syn_queued(now.nanos());
                 self.schedule_tcp_timer(index);
@@ -920,7 +993,6 @@ where
                 let socket = self
                     .tcp
                     .get_mut(index)
-                    .and_then(Option::as_mut)
                     .expect("TCP socket disappeared while queuing SYN-ACK");
                 socket.mark_syn_ack_queued(now.nanos());
                 self.schedule_tcp_timer(index);
@@ -931,7 +1003,6 @@ where
                 let socket = self
                     .tcp
                     .get_mut(index)
-                    .and_then(Option::as_mut)
                     .expect("TCP socket disappeared while queuing ACK");
                 socket.mark_ack_queued();
                 self.schedule_tcp_timer(index);
@@ -952,7 +1023,6 @@ where
                 let socket = self
                     .tcp
                     .get_mut(index)
-                    .and_then(Option::as_mut)
                     .expect("TCP socket disappeared while queuing retransmission");
                 socket.mark_retransmission_queued(sequence, now.nanos());
                 self.schedule_tcp_timer(index);
@@ -984,7 +1054,6 @@ where
             let accepted_local_port = self
                 .tcp
                 .get(socket_index(accepted.socket))
-                .and_then(Option::as_ref)
                 .and_then(TcpSocket::local_endpoint)
                 .map(|endpoint| endpoint.port);
             if accepted_local_port == Some(local_port) {
@@ -1664,7 +1733,6 @@ where
                 let socket = self
                     .tcp
                     .get_mut(index)
-                    .and_then(Option::as_mut)
                     .expect("TCP endpoint index referenced a missing socket");
                 let previous_state = socket.state();
                 let outcome = socket.on_segment(packet, now.nanos());
@@ -1709,7 +1777,6 @@ where
             let listener = self
                 .tcp
                 .get(listener_index)
-                .and_then(Option::as_ref)
                 .expect("TCP listener index referenced a missing socket");
             assert!(
                 listener.is_listening_on(destination, packet.destination_port),
@@ -1801,7 +1868,6 @@ where
         let deadline = self
             .tcp
             .get(index)
-            .and_then(Option::as_ref)
             .and_then(TcpSocket::next_deadline_nanos);
         self.schedule_tcp_timer_deadline(index, deadline);
     }
@@ -1833,7 +1899,6 @@ where
         let backpressured = self
             .tcp
             .get(index)
-            .and_then(Option::as_ref)
             .is_some_and(TcpSocket::receive_backpressured);
         match (self.tcp_receive_backpressured[index], backpressured) {
             (false, true) => {
@@ -1869,7 +1934,6 @@ where
             && self
                 .tcp
                 .get(entry.socket_index)
-                .and_then(Option::as_ref)
                 .is_some_and(|socket| socket.next_deadline_nanos() == Some(entry.deadline_nanos))
     }
 
@@ -1893,14 +1957,12 @@ where
     fn tcp_socket(&self, id: SocketId) -> Result<&TcpSocket<C>, StackError> {
         self.tcp
             .get(socket_index(id))
-            .and_then(Option::as_ref)
             .ok_or(StackError::UnknownSocket)
     }
 
     fn tcp_socket_mut(&mut self, id: SocketId) -> Result<&mut TcpSocket<C>, StackError> {
         self.tcp
             .get_mut(socket_index(id))
-            .and_then(Option::as_mut)
             .ok_or(StackError::UnknownSocket)
     }
 
@@ -2542,5 +2604,45 @@ mod tests {
         assert_eq!(stack.tcp.active_index(1), socket_index(reused));
         assert_eq!(reused.raw(), first.raw());
         assert_ne!(reused.raw(), second.raw());
+    }
+
+    #[test]
+    fn tcp_socket_slab_clone_preserves_ids_and_independent_ownership() {
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let first = stack.open_tcp_listen(TcpEndpoint {
+            address: IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+            port: 8000,
+        });
+        let second = stack.open_tcp_listen(TcpEndpoint {
+            address: IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+            port: 8001,
+        });
+
+        let mut cloned = stack.clone();
+        assert_eq!(cloned.tcp.active_len(), 2);
+        assert_eq!(
+            cloned
+                .tcp_socket(first)
+                .expect("first cloned socket should exist")
+                .local_endpoint()
+                .expect("first cloned socket should be bound")
+                .port,
+            8000
+        );
+        assert_eq!(
+            cloned
+                .tcp_socket(second)
+                .expect("second cloned socket should exist")
+                .local_endpoint()
+                .expect("second cloned socket should be bound")
+                .port,
+            8001
+        );
+
+        cloned
+            .remove_tcp_socket(first)
+            .expect("cloned socket should be removable");
+        assert!(cloned.tcp_socket(first).is_err());
+        assert!(stack.tcp_socket(first).is_ok());
     }
 }
