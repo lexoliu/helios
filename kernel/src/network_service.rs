@@ -48,6 +48,14 @@ const NETWORK_MIN_POLL_BUDGET: usize = 8;
 const NETWORK_MAX_POLL_BUDGET: usize = 128;
 const NETWORK_BUSY_POLL_ROUNDS: usize = 8;
 const NETWORK_POLLING_TCP_READ_ROUNDS: usize = NETWORK_BUSY_POLL_ROUNDS * 2;
+// Helios-vs-Linux flamegraphs at ccc73e8 put the IO-bound hot path in
+// `sock_recv` -> component-host TCP read -> `tcp-read-drive-network`, not in
+// the syscall wrapper itself. The same run read 64 MiB through 11660 kernel TCP
+// reads, only about 28.8 KiB/read despite a 1 MiB guest buffer. For polling NICs
+// we therefore drain a bounded burst of already-ready RX frames before returning
+// to the guest, amortizing WIT/component-host and TCP drive cost without waiting
+// for an interrupt or timer.
+const NETWORK_TCP_READ_BURST_ROUNDS: usize = NETWORK_BUSY_POLL_ROUNDS;
 
 #[derive(Clone)]
 pub struct NetworkService<CpuImpl, Runtime, Device>
@@ -210,8 +218,12 @@ impl NetworkPollProgress {
         self.received_frames == 0 && self.reclaimed_tx == 0 && self.transmitted_frames == 0
     }
 
+    const fn receive_saturated(self, budget: NetworkPollBudget) -> bool {
+        budget.rx_frames != 0 && self.received_frames >= budget.rx_frames
+    }
+
     const fn saturated(self, budget: NetworkPollBudget) -> bool {
-        self.received_frames >= budget.rx_frames
+        self.receive_saturated(budget)
             || self.reclaimed_tx >= budget.tx_completions
             || self.transmitted_frames >= budget.tx_frames
     }
@@ -960,9 +972,7 @@ where
             }
 
             let drive_started = self.profile_start();
-            let read = self
-                .drive_tcp_and_poll_read(stream, max_bytes, "tcp-read-after-drive")
-                .await?;
+            let read = self.drive_tcp_read_burst(stream, max_bytes).await?;
             self.record_network_profile("tcp-read-drive-network", drive_started);
             match read {
                 TcpReadProgress::Data(bytes) => return Ok(Some(bytes)),
@@ -1368,6 +1378,31 @@ where
         outcome
             .tcp_read
             .expect("TCP read probe did not produce a read result")
+    }
+
+    async fn drive_tcp_read_burst(
+        &self,
+        stream: TcpStreamId,
+        max_bytes: usize,
+    ) -> Result<TcpReadProgress, TcpError> {
+        let capabilities = self.inner.device.capabilities().events;
+        let rounds = if capabilities.polling && max_bytes > self.inner.device.max_frame_len() {
+            NETWORK_TCP_READ_BURST_ROUNDS
+        } else {
+            1
+        };
+        for _ in 0..rounds {
+            let outcome = self
+                .poll_network_once(NetworkPollSource::Tcp)
+                .await
+                .map_err(|error| {
+                    TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed)
+                })?;
+            if !outcome.0.receive_saturated(outcome.1) {
+                break;
+            }
+        }
+        self.poll_tcp_read_once(stream, max_bytes, "tcp-read-after-drive")
     }
 
     async fn drive_udp(&self) -> Result<(), UdpError> {
@@ -3339,6 +3374,29 @@ mod tests {
             transmitted_frames: 0,
         });
         assert_eq!(poll.budget().tx_frames, 8);
+    }
+
+    #[test]
+    fn network_poll_progress_separates_receive_saturation() {
+        let budget = NetworkPollBudget {
+            rx_frames: 8,
+            tx_completions: 8,
+            tx_frames: 8,
+        };
+        let tx_only = NetworkPollProgress {
+            received_frames: 0,
+            reclaimed_tx: 8,
+            transmitted_frames: 8,
+        };
+        let rx_full = NetworkPollProgress {
+            received_frames: 8,
+            reclaimed_tx: 0,
+            transmitted_frames: 0,
+        };
+
+        assert!(!tx_only.receive_saturated(budget));
+        assert!(tx_only.saturated(budget));
+        assert!(rx_full.receive_saturated(budget));
     }
 
     #[test]
