@@ -130,10 +130,10 @@ impl Executor {
 
     pub fn run_until_stalled_with_stats(&self) -> ExecutorRunStats {
         let mut stats = ExecutorRunStats::default();
+        let local_queue = &self.group.local_queues[self.local_queue_index];
+        let local_ready_count = &self.group.local_ready_counts[self.local_queue_index];
 
         while stats.runnable_count() < READY_BATCH_TASKS {
-            let local_queue = &self.group.local_queues[self.local_queue_index];
-            let local_ready_count = &self.group.local_ready_counts[self.local_queue_index];
             let (runnable, source) = match pop_ready(local_queue, local_ready_count) {
                 Ok(runnable) => (runnable, ReadySource::Local),
                 Err(PopError::Empty | PopError::Closed) => {
@@ -199,11 +199,9 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
                 }
             }
             WakeTarget::OwnerProcessor => {
-                if should_wake_owner_processor(
-                    previous_ready,
-                    self.cpu.current_processor(),
-                    self.owner_processor,
-                ) {
+                if should_wake_owner_processor(previous_ready)
+                    && self.cpu.current_processor() != self.owner_processor
+                {
                     self.cpu.wake_processor(self.owner_processor);
                 }
             }
@@ -377,12 +375,8 @@ const fn should_wake_global_processor(previous_ready: usize, processor_count: us
     previous_ready < processor_count.saturating_sub(1)
 }
 
-fn should_wake_owner_processor(
-    previous_ready: usize,
-    current_processor: ProcessorId,
-    owner_processor: ProcessorId,
-) -> bool {
-    previous_ready == 0 && current_processor != owner_processor
+const fn should_wake_owner_processor(previous_ready: usize) -> bool {
+    previous_ready == 0
 }
 
 impl<T> LocalJoinHandle<T> {
@@ -405,8 +399,6 @@ impl<T> Future for LocalJoinHandle<T> {
 
 #[cfg(test)]
 mod tests {
-    use helios_hal::cpu::ProcessorId;
-
     use super::{
         READY_QUEUE_CAPACITY, ready_queue, should_wake_global_processor,
         should_wake_owner_processor,
@@ -421,13 +413,9 @@ mod tests {
     }
 
     #[test]
-    fn local_wake_only_fires_on_empty_to_nonempty_remote_enqueue() {
-        let owner = ProcessorId::new(1);
-        let remote = ProcessorId::new(2);
-
-        assert!(should_wake_owner_processor(0, remote, owner));
-        assert!(!should_wake_owner_processor(1, remote, owner));
-        assert!(!should_wake_owner_processor(0, owner, owner));
+    fn owner_wake_query_only_fires_on_empty_to_nonempty_enqueue() {
+        assert!(should_wake_owner_processor(0));
+        assert!(!should_wake_owner_processor(1));
     }
 
     #[test]
