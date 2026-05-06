@@ -9,10 +9,11 @@ use heapless::Deque;
 use heapless::binary_heap::{BinaryHeap, Min};
 
 use crate::{
-    ArpOperation, ArpPacket, BbrV3, DEFAULT_POLL_BUDGET, DhcpDnsServers, EthernetAddress,
-    EthernetFrame, EthernetProtocol, Icmpv6Packet, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr,
-    Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, PacketBuffer, StackError, TcpEndpoint,
-    TcpHeader, TcpHeaderOptions, TcpPacket, TcpSocket, TcpTransmitSegment, UdpPacket,
+    ArpOperation, ArpPacket, BbrV3, CongestionControl, DEFAULT_POLL_BUDGET, DhcpDnsServers,
+    EthernetAddress, EthernetFrame, EthernetProtocol, Icmpv6Packet, IpAddress, IpCidr,
+    Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, PacketBuffer,
+    StackError, TcpEndpoint, TcpHeader, TcpHeaderOptions, TcpPacket, TcpSocket, TcpTransmitSegment,
+    UdpPacket,
 };
 
 pub const MAX_ROUTES: usize = 32;
@@ -226,8 +227,11 @@ pub enum StackEvent {
 }
 
 #[derive(Clone, Debug)]
-struct TcpSocketSlab {
-    slots: Box<[Option<TcpSocket<BbrV3>>]>,
+struct TcpSocketSlab<C>
+where
+    C: CongestionControl,
+{
+    slots: Box<[Option<TcpSocket<C>>]>,
     free: [usize; MAX_TCP_SOCKETS],
     free_len: usize,
     active: [usize; MAX_TCP_SOCKETS],
@@ -268,7 +272,10 @@ trait TcpIndexKey: Copy + Eq {
 type TcpEndpointIndex = TcpSocketIndex<TcpEndpointKey, TCP_ENDPOINT_INDEX_SLOTS>;
 type TcpListenerIndex = TcpSocketIndex<TcpEndpoint, TCP_LISTENER_INDEX_SLOTS>;
 
-impl TcpSocketSlab {
+impl<C> TcpSocketSlab<C>
+where
+    C: CongestionControl,
+{
     fn new() -> Self {
         let mut slots = Vec::with_capacity(MAX_TCP_SOCKETS);
         slots.resize_with(MAX_TCP_SOCKETS, || None);
@@ -295,15 +302,15 @@ impl TcpSocketSlab {
             .unwrap_or_else(|| panic!("TCP active socket slot {slot} is outside active set"))
     }
 
-    fn get(&self, index: usize) -> Option<&Option<TcpSocket<BbrV3>>> {
+    fn get(&self, index: usize) -> Option<&Option<TcpSocket<C>>> {
         self.slots.get(index)
     }
 
-    fn get_mut(&mut self, index: usize) -> Option<&mut Option<TcpSocket<BbrV3>>> {
+    fn get_mut(&mut self, index: usize) -> Option<&mut Option<TcpSocket<C>>> {
         self.slots.get_mut(index)
     }
 
-    fn insert(&mut self, socket: TcpSocket<BbrV3>) -> SocketId {
+    fn insert(&mut self, socket: TcpSocket<C>) -> SocketId {
         if self.free_len == 0 {
             panic!("TCP socket slab is full");
         };
@@ -329,7 +336,7 @@ impl TcpSocketSlab {
         socket_id(index)
     }
 
-    fn remove(&mut self, index: usize) -> Option<TcpSocket<BbrV3>> {
+    fn remove(&mut self, index: usize) -> Option<TcpSocket<C>> {
         let socket = self.slots.get_mut(index).and_then(Option::take)?;
         if let Some((local, remote)) = socket.local_endpoint().zip(socket.remote_endpoint()) {
             self.endpoint_index
@@ -463,8 +470,12 @@ impl<Key: TcpIndexKey, const SLOTS: usize> TcpSocketIndex<Key, SLOTS> {
 }
 
 #[derive(Clone, Debug)]
-pub struct Stack {
+pub struct Stack<C = BbrV3>
+where
+    C: CongestionControl,
+{
     config: StackConfig,
+    congestion: C,
     routes: RouteTable,
     ipv4_addresses: ArrayVec<Ipv4Cidr, 8>,
     ipv6_addresses: ArrayVec<Ipv6Cidr, 16>,
@@ -473,7 +484,7 @@ pub struct Stack {
     events: Deque<StackEvent, MAX_STACK_EVENTS>,
     udp_rx: Deque<UdpReceive, MAX_UDP_RX>,
     tcp_accept: Deque<TcpAccept, MAX_TCP_ACCEPT>,
-    tcp: TcpSocketSlab,
+    tcp: TcpSocketSlab<C>,
     tcp_timers: BinaryHeap<TcpTimerEntry, Min, MAX_TCP_TIMER_ENTRIES>,
     tcp_timer_generations: [u32; MAX_TCP_SOCKETS],
     tcp_timer_deadlines: [Option<u64>; MAX_TCP_SOCKETS],
@@ -545,10 +556,20 @@ impl OutboundFrameQueue {
     }
 }
 
-impl Stack {
+impl Stack<BbrV3> {
     pub fn new(config: StackConfig) -> Self {
+        Self::new_with_congestion(config, BbrV3::new(1460))
+    }
+}
+
+impl<C> Stack<C>
+where
+    C: CongestionControl,
+{
+    pub fn new_with_congestion(config: StackConfig, congestion: C) -> Self {
         Self {
             config,
+            congestion,
             routes: RouteTable::new(),
             ipv4_addresses: ArrayVec::new(),
             ipv6_addresses: ArrayVec::new(),
@@ -777,12 +798,12 @@ impl Stack {
         remote: TcpEndpoint,
         initial_sequence: u32,
     ) -> SocketId {
-        let socket = TcpSocket::connect(local, remote, initial_sequence, BbrV3::new(1460));
+        let socket = TcpSocket::connect(local, remote, initial_sequence, self.congestion.clone());
         self.insert_tcp(socket)
     }
 
     pub fn open_tcp_listen(&mut self, local: TcpEndpoint) -> SocketId {
-        let socket = TcpSocket::listen(local, BbrV3::new(1460));
+        let socket = TcpSocket::listen(local, self.congestion.clone());
         self.insert_tcp(socket)
     }
 
@@ -1706,7 +1727,7 @@ impl Stack {
                 remote_endpoint,
                 packet.sequence.wrapping_add(1),
                 initial_sequence,
-                BbrV3::new(1460),
+                self.congestion.clone(),
             );
             child.record_peer_options(packet);
             self.insert_tcp(child);
@@ -1770,7 +1791,7 @@ impl Stack {
         Ok(())
     }
 
-    fn insert_tcp(&mut self, socket: TcpSocket<BbrV3>) -> SocketId {
+    fn insert_tcp(&mut self, socket: TcpSocket<C>) -> SocketId {
         let id = self.tcp.insert(socket);
         self.schedule_tcp_timer(socket_index(id));
         id
@@ -1869,14 +1890,14 @@ impl Stack {
         }
     }
 
-    fn tcp_socket(&self, id: SocketId) -> Result<&TcpSocket<BbrV3>, StackError> {
+    fn tcp_socket(&self, id: SocketId) -> Result<&TcpSocket<C>, StackError> {
         self.tcp
             .get(socket_index(id))
             .and_then(Option::as_ref)
             .ok_or(StackError::UnknownSocket)
     }
 
-    fn tcp_socket_mut(&mut self, id: SocketId) -> Result<&mut TcpSocket<BbrV3>, StackError> {
+    fn tcp_socket_mut(&mut self, id: SocketId) -> Result<&mut TcpSocket<C>, StackError> {
         self.tcp
             .get_mut(socket_index(id))
             .and_then(Option::as_mut)
@@ -1951,6 +1972,7 @@ fn ipv6_multicast_mac(address: Ipv6Address) -> EthernetAddress {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NewReno;
     use crate::TcpFlags;
 
     const LOCAL_MAC: EthernetAddress = [0x02, 0, 0, 0, 0, 1];
@@ -2007,6 +2029,37 @@ mod tests {
         assert_eq!(
             queue.pop().expect("third frame").as_slice(),
             b"third".as_slice()
+        );
+    }
+
+    #[test]
+    fn tcp_stack_accepts_replaceable_congestion_control() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new_with_congestion(
+            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES),
+            NewReno::new(1460),
+        );
+
+        let socket = stack.open_tcp_connect(
+            TcpEndpoint {
+                address: IpAddress::Ipv4(local),
+                port: 49152,
+            },
+            TcpEndpoint {
+                address: IpAddress::Ipv4(peer),
+                port: 80,
+            },
+            7,
+        );
+
+        assert_eq!(
+            stack
+                .tcp_socket(socket)
+                .expect("test socket should exist")
+                .congestion()
+                .algorithm_name(),
+            "newreno"
         );
     }
 
