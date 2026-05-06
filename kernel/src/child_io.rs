@@ -20,6 +20,8 @@ use triomphe::Arc;
 
 use crate::{Notify, NotifyWaiter};
 
+const BYTE_CHANNEL_CHUNK_CAPACITY: usize = 1024;
+
 /// A single byte-stream channel, closable from both ends. Producers push
 /// reference-counted byte chunks; consumers await and receive the same chunks
 /// back without forcing an extra copy at adapter boundaries.
@@ -38,7 +40,7 @@ struct ByteChannel {
 impl ByteChannel {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            queue: ConcurrentQueue::unbounded(),
+            queue: ConcurrentQueue::bounded(BYTE_CHANNEL_CHUNK_CAPACITY),
             readable: Notify::new(),
             writer_closed: AtomicBool::new(false),
             reader_closed: AtomicBool::new(false),
@@ -136,7 +138,7 @@ impl ByteWriter {
             }
             Err(PushError::Closed(_)) => Err(ClosedPeer),
             Err(PushError::Full(_)) => {
-                unreachable!("byte channel queue is unbounded and cannot report full")
+                panic!("byte channel capacity {BYTE_CHANNEL_CHUNK_CAPACITY} exhausted")
             }
         }
     }
@@ -261,7 +263,7 @@ pub enum TryRead {
 mod tests {
     use bytes::Bytes;
 
-    use super::byte_channel;
+    use super::{BYTE_CHANNEL_CHUNK_CAPACITY, byte_channel};
 
     #[test]
     fn byte_channel_preserves_bytes_chunks_without_copying() {
@@ -276,6 +278,16 @@ mod tests {
             .expect("queued bytes should be delivered before EOF");
         assert_eq!(received.as_ref(), b"helios");
         assert_eq!(received.as_ptr(), ptr);
+    }
+
+    #[test]
+    fn byte_channel_queue_is_bounded_to_kernel_capacity() {
+        let (writer, _) = byte_channel();
+
+        assert_eq!(
+            writer.channel.queue.capacity(),
+            Some(BYTE_CHANNEL_CHUNK_CAPACITY)
+        );
     }
 
     #[test]
