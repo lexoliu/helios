@@ -2,12 +2,12 @@ extern crate alloc;
 
 use alloc::format;
 use core::panic::Location;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use triomphe::Arc;
 
 use crate::{
     DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,
-    EmbeddedBootFs, FoldedProfileSample, FutexKey, FutexTable, FutexWaitRegistration,
+    EmbeddedBootFs, FoldedProfileSample, FutexKey, FutexTable, FutexWaitRegistration, HeapStats,
     InstanceRegistry, Notify, PerfMetricFilter, PerfMetricHistory, PerfMetricSample, ProfileFilter,
     ProfileHistory, ProfileScope, StatsSample, TraceEvent, TraceFilter, TraceHistory,
     embedded_init,
@@ -38,6 +38,99 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     profiling_enabled: AtomicBool,
     profiling: Mutex<ProfileHistory>,
     perf_metrics: Mutex<PerfMetricHistory>,
+    heap_perf_snapshot: HeapPerfSnapshot,
+}
+
+struct HeapPerfSnapshot {
+    allocation_count: AtomicU64,
+    deallocation_count: AtomicU64,
+    reallocation_count: AtomicU64,
+    total_allocation_bytes: AtomicU64,
+    total_deallocation_bytes: AtomicU64,
+    total_reallocation_bytes: AtomicU64,
+}
+
+impl HeapPerfSnapshot {
+    const fn new() -> Self {
+        Self {
+            allocation_count: AtomicU64::new(0),
+            deallocation_count: AtomicU64::new(0),
+            reallocation_count: AtomicU64::new(0),
+            total_allocation_bytes: AtomicU64::new(0),
+            total_deallocation_bytes: AtomicU64::new(0),
+            total_reallocation_bytes: AtomicU64::new(0),
+        }
+    }
+
+    fn reset(&self, stats: HeapStats) {
+        self.allocation_count
+            .store(stats.allocation_count, Ordering::Release);
+        self.deallocation_count
+            .store(stats.deallocation_count, Ordering::Release);
+        self.reallocation_count
+            .store(stats.reallocation_count, Ordering::Release);
+        self.total_allocation_bytes
+            .store(stats.total_allocation_bytes, Ordering::Release);
+        self.total_deallocation_bytes
+            .store(stats.total_deallocation_bytes, Ordering::Release);
+        self.total_reallocation_bytes
+            .store(stats.total_reallocation_bytes, Ordering::Release);
+    }
+
+    fn allocation_count_delta(&self, stats: HeapStats) -> u64 {
+        swap_delta(&self.allocation_count, stats.allocation_count)
+    }
+
+    fn deallocation_count_delta(&self, stats: HeapStats) -> u64 {
+        swap_delta(&self.deallocation_count, stats.deallocation_count)
+    }
+
+    fn reallocation_count_delta(&self, stats: HeapStats) -> u64 {
+        swap_delta(&self.reallocation_count, stats.reallocation_count)
+    }
+
+    fn allocation_bytes_delta(&self, stats: HeapStats) -> u64 {
+        swap_delta(&self.total_allocation_bytes, stats.total_allocation_bytes)
+    }
+
+    fn deallocation_bytes_delta(&self, stats: HeapStats) -> u64 {
+        swap_delta(
+            &self.total_deallocation_bytes,
+            stats.total_deallocation_bytes,
+        )
+    }
+
+    fn reallocation_bytes_delta(&self, stats: HeapStats) -> u64 {
+        swap_delta(
+            &self.total_reallocation_bytes,
+            stats.total_reallocation_bytes,
+        )
+    }
+}
+
+fn swap_delta(value: &AtomicU64, current: u64) -> u64 {
+    let previous = value.swap(current, Ordering::AcqRel);
+    current.saturating_sub(previous)
+}
+
+fn record_heap_delta_metric(
+    metrics: &Mutex<PerfMetricHistory>,
+    name: &'static str,
+    events: u64,
+    bytes: u64,
+) {
+    if events == 0 && bytes == 0 {
+        return;
+    }
+    metrics.lock().record_parts_events(
+        ProfileScope::Kernel,
+        "kernel;heap;",
+        name,
+        events,
+        0,
+        HardwarePerfCounterDelta::default(),
+        bytes,
+    );
 }
 
 impl<ProgramService, NetworkService, HostFsService>
@@ -64,6 +157,7 @@ where
                 profiling_enabled: AtomicBool::new(false),
                 profiling: Mutex::new(ProfileHistory::new(DEFAULT_PROFILE_STACK_CAPACITY)),
                 perf_metrics: Mutex::new(PerfMetricHistory::new(DEFAULT_PERF_METRIC_CAPACITY)),
+                heap_perf_snapshot: HeapPerfSnapshot::new(),
             }),
         }
     }
@@ -95,6 +189,9 @@ where
     }
 
     pub fn set_profiling_enabled(&self, enabled: bool) {
+        if enabled {
+            self.inner.heap_perf_snapshot.reset(crate::heap_stats());
+        }
         self.inner
             .profiling_enabled
             .store(enabled, Ordering::Release);
@@ -107,6 +204,7 @@ where
     pub fn clear_profile(&self) {
         self.inner.profiling.lock().clear();
         self.inner.perf_metrics.lock().clear();
+        self.inner.heap_perf_snapshot.reset(crate::heap_stats());
     }
 
     pub fn record_profile_stack(
@@ -267,6 +365,51 @@ where
             .perf_metrics
             .lock()
             .record_str(scope, name, elapsed_nanos, counters, bytes);
+    }
+
+    pub fn record_kernel_heap_metrics(&self, stats: HeapStats) {
+        if !self.inner.profiling_enabled.load(Ordering::Acquire) {
+            return;
+        }
+
+        let allocations = self.inner.heap_perf_snapshot.allocation_count_delta(stats);
+        let allocation_bytes = self.inner.heap_perf_snapshot.allocation_bytes_delta(stats);
+        record_heap_delta_metric(
+            &self.inner.perf_metrics,
+            "alloc",
+            allocations,
+            allocation_bytes,
+        );
+
+        let deallocations = self
+            .inner
+            .heap_perf_snapshot
+            .deallocation_count_delta(stats);
+        let deallocation_bytes = self
+            .inner
+            .heap_perf_snapshot
+            .deallocation_bytes_delta(stats);
+        record_heap_delta_metric(
+            &self.inner.perf_metrics,
+            "dealloc",
+            deallocations,
+            deallocation_bytes,
+        );
+
+        let reallocations = self
+            .inner
+            .heap_perf_snapshot
+            .reallocation_count_delta(stats);
+        let reallocation_bytes = self
+            .inner
+            .heap_perf_snapshot
+            .reallocation_bytes_delta(stats);
+        record_heap_delta_metric(
+            &self.inner.perf_metrics,
+            "realloc",
+            reallocations,
+            reallocation_bytes,
+        );
     }
 
     #[track_caller]
@@ -455,5 +598,58 @@ where
 
     fn bootfs(&self) -> Option<EmbeddedBootFs> {
         RuntimeState::bootfs(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use super::*;
+
+    #[test]
+    fn runtime_state_records_kernel_heap_delta_metrics() {
+        let state = RuntimeState::<(), (), ()>::new(1_000_000_000, 1, 0);
+        let baseline = crate::heap_stats();
+        state.inner.heap_perf_snapshot.reset(baseline);
+        state.set_profiling_enabled(true);
+
+        let mut current = baseline;
+        current.allocation_count += 3;
+        current.total_allocation_bytes += 96;
+        current.deallocation_count += 2;
+        current.total_deallocation_bytes += 64;
+        current.reallocation_count += 1;
+        current.total_reallocation_bytes += 128;
+        state.inner.heap_perf_snapshot.reset(baseline);
+        state.record_kernel_heap_metrics(current);
+
+        let samples = state.perf_metrics(
+            &PerfMetricFilter {
+                name_prefixes: vec!["kernel;heap;".into()],
+            },
+            8,
+        );
+
+        let alloc = samples
+            .iter()
+            .find(|sample| sample.name == "kernel;heap;alloc")
+            .expect("alloc metric should be recorded");
+        assert_eq!(alloc.total_events, 3);
+        assert_eq!(alloc.total_bytes, 96);
+
+        let dealloc = samples
+            .iter()
+            .find(|sample| sample.name == "kernel;heap;dealloc")
+            .expect("dealloc metric should be recorded");
+        assert_eq!(dealloc.total_events, 2);
+        assert_eq!(dealloc.total_bytes, 64);
+
+        let realloc = samples
+            .iter()
+            .find(|sample| sample.name == "kernel;heap;realloc")
+            .expect("realloc metric should be recorded");
+        assert_eq!(realloc.total_events, 1);
+        assert_eq!(realloc.total_bytes, 128);
     }
 }

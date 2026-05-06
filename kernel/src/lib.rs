@@ -205,8 +205,10 @@ pub use wasmtime_adapter::component_host::{
 
 use alloc::sync::Arc;
 use alloc::task::Wake;
+use core::alloc::{GlobalAlloc, Layout};
 use core::future::Future;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::ptr;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 
@@ -226,18 +228,157 @@ const WATCHDOG_CHECK_DIVISOR: u32 = 4;
 const WATCHDOG_SELF_TEST_DELAY_MILLIS_ENV: &str = env!("HELIOS_WATCHDOG_SELF_TEST_DELAY_MS");
 
 #[cfg_attr(target_os = "none", global_allocator)]
-static ALLOCATOR: LockedHeap<HEAP_ORDER> = LockedHeap::empty();
+static ALLOCATOR: KernelAllocator<HEAP_ORDER> = KernelAllocator::empty();
 static BOOT_STATE: AtomicU8 = AtomicU8::new(BOOT_UNINITIALIZED);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HeapStats {
     pub total_bytes: usize,
     pub allocated_bytes: usize,
+    pub requested_live_bytes: usize,
+    pub allocation_count: u64,
+    pub deallocation_count: u64,
+    pub reallocation_count: u64,
+    pub total_allocation_bytes: u64,
+    pub total_deallocation_bytes: u64,
+    pub total_reallocation_bytes: u64,
 }
 
 impl HeapStats {
     pub fn available_bytes(self) -> usize {
         self.total_bytes.saturating_sub(self.allocated_bytes)
+    }
+}
+
+struct KernelAllocator<const ORDER: usize> {
+    heap: LockedHeap<ORDER>,
+    stats: KernelAllocationStats,
+}
+
+impl<const ORDER: usize> KernelAllocator<ORDER> {
+    const fn empty() -> Self {
+        Self {
+            heap: LockedHeap::empty(),
+            stats: KernelAllocationStats::new(),
+        }
+    }
+
+    unsafe fn add_to_heap(&self, start: usize, end: usize) {
+        unsafe {
+            self.heap.lock().add_to_heap(start, end);
+        }
+    }
+
+    fn stats(&self) -> HeapStats {
+        let allocator = self.heap.lock();
+        HeapStats {
+            total_bytes: allocator.stats_total_bytes(),
+            allocated_bytes: allocator.stats_alloc_actual(),
+            requested_live_bytes: self.stats.requested_live_bytes.load(Ordering::Relaxed),
+            allocation_count: self.stats.allocation_count.load(Ordering::Relaxed),
+            deallocation_count: self.stats.deallocation_count.load(Ordering::Relaxed),
+            reallocation_count: self.stats.reallocation_count.load(Ordering::Relaxed),
+            total_allocation_bytes: self.stats.total_allocation_bytes.load(Ordering::Relaxed),
+            total_deallocation_bytes: self.stats.total_deallocation_bytes.load(Ordering::Relaxed),
+            total_reallocation_bytes: self.stats.total_reallocation_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+unsafe impl<const ORDER: usize> GlobalAlloc for KernelAllocator<ORDER> {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { GlobalAlloc::alloc(&self.heap, layout) };
+        if !ptr.is_null() {
+            self.stats.record_alloc(layout.size());
+        }
+        ptr
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { GlobalAlloc::alloc_zeroed(&self.heap, layout) };
+        if !ptr.is_null() {
+            self.stats.record_alloc(layout.size());
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe {
+            GlobalAlloc::dealloc(&self.heap, ptr, layout);
+        }
+        self.stats.record_dealloc(layout.size());
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
+        let new_ptr = unsafe { GlobalAlloc::alloc(&self.heap, new_layout) };
+        if new_ptr.is_null() {
+            return ptr::null_mut();
+        }
+
+        unsafe {
+            ptr::copy_nonoverlapping(ptr, new_ptr, layout.size().min(new_size));
+            GlobalAlloc::dealloc(&self.heap, ptr, layout);
+        }
+        self.stats.record_realloc(layout.size(), new_size);
+        new_ptr
+    }
+}
+
+struct KernelAllocationStats {
+    requested_live_bytes: AtomicUsize,
+    allocation_count: AtomicU64,
+    deallocation_count: AtomicU64,
+    reallocation_count: AtomicU64,
+    total_allocation_bytes: AtomicU64,
+    total_deallocation_bytes: AtomicU64,
+    total_reallocation_bytes: AtomicU64,
+}
+
+impl KernelAllocationStats {
+    const fn new() -> Self {
+        Self {
+            requested_live_bytes: AtomicUsize::new(0),
+            allocation_count: AtomicU64::new(0),
+            deallocation_count: AtomicU64::new(0),
+            reallocation_count: AtomicU64::new(0),
+            total_allocation_bytes: AtomicU64::new(0),
+            total_deallocation_bytes: AtomicU64::new(0),
+            total_reallocation_bytes: AtomicU64::new(0),
+        }
+    }
+
+    fn record_alloc(&self, size: usize) {
+        self.allocation_count.fetch_add(1, Ordering::Relaxed);
+        self.requested_live_bytes.fetch_add(size, Ordering::Relaxed);
+        self.total_allocation_bytes.fetch_add(
+            usize_to_u64(size, "kernel allocation size"),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn record_dealloc(&self, size: usize) {
+        self.deallocation_count.fetch_add(1, Ordering::Relaxed);
+        self.requested_live_bytes.fetch_sub(size, Ordering::Relaxed);
+        self.total_deallocation_bytes.fetch_add(
+            usize_to_u64(size, "kernel deallocation size"),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn record_realloc(&self, old_size: usize, new_size: usize) {
+        self.reallocation_count.fetch_add(1, Ordering::Relaxed);
+        if new_size >= old_size {
+            self.requested_live_bytes
+                .fetch_add(new_size - old_size, Ordering::Relaxed);
+        } else {
+            self.requested_live_bytes
+                .fetch_sub(old_size - new_size, Ordering::Relaxed);
+        }
+        self.total_reallocation_bytes.fetch_add(
+            usize_to_u64(new_size, "kernel reallocation size"),
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -627,7 +768,7 @@ where
         let end = start + region.len();
         let (kernel_end, user_start) = split_bootstrap_memory_region(start, end);
         unsafe {
-            ALLOCATOR.lock().add_to_heap(start, kernel_end);
+            ALLOCATOR.add_to_heap(start, kernel_end);
         }
         let pool = *user_pool.get_or_insert_with(|| {
             let pool =
@@ -767,11 +908,11 @@ pub fn panic_log_message(
 }
 
 pub fn heap_stats() -> HeapStats {
-    let allocator = ALLOCATOR.lock();
-    HeapStats {
-        total_bytes: allocator.stats_total_bytes(),
-        allocated_bytes: allocator.stats_alloc_actual(),
-    }
+    ALLOCATOR.stats()
+}
+
+fn usize_to_u64(value: usize, label: &'static str) -> u64 {
+    u64::try_from(value).unwrap_or_else(|_| panic!("{label} does not fit into u64"))
 }
 
 pub fn user_memory_kernel_reserve_bytes(total_heap_bytes: usize) -> usize {
@@ -788,4 +929,48 @@ fn kernel_alloc_error(layout: core::alloc::Layout) -> ! {
         layout.size(),
         layout.align()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::boxed::Box;
+    use core::alloc::{GlobalAlloc, Layout};
+
+    use super::*;
+
+    const TEST_HEAP_BYTES: usize = 16 * 1024;
+
+    #[repr(align(4096))]
+    struct AlignedHeap([u8; TEST_HEAP_BYTES]);
+
+    #[test]
+    fn kernel_allocator_tracks_requested_allocation_pressure() {
+        let allocator = KernelAllocator::<HEAP_ORDER>::empty();
+        let mut heap = Box::new(AlignedHeap([0; TEST_HEAP_BYTES]));
+        let start = heap.0.as_mut_ptr() as usize;
+        unsafe {
+            allocator.add_to_heap(start, start + TEST_HEAP_BYTES);
+        }
+
+        let layout = Layout::from_size_align(64, 8).expect("valid allocation layout");
+        let ptr = unsafe { GlobalAlloc::alloc(&allocator, layout) };
+        assert!(!ptr.is_null());
+
+        let reallocated = unsafe { GlobalAlloc::realloc(&allocator, ptr, layout, 128) };
+        assert!(!reallocated.is_null());
+
+        let grown_layout = Layout::from_size_align(128, 8).expect("valid grown layout");
+        unsafe {
+            GlobalAlloc::dealloc(&allocator, reallocated, grown_layout);
+        }
+
+        let stats = allocator.stats();
+        assert_eq!(stats.allocation_count, 1);
+        assert_eq!(stats.reallocation_count, 1);
+        assert_eq!(stats.deallocation_count, 1);
+        assert_eq!(stats.total_allocation_bytes, 64);
+        assert_eq!(stats.total_reallocation_bytes, 128);
+        assert_eq!(stats.total_deallocation_bytes, 128);
+        assert_eq!(stats.requested_live_bytes, 0);
+    }
 }

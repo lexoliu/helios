@@ -1326,6 +1326,7 @@ fn record_executor_metrics<CpuImpl, HostFs>(
         stats.executor_global_runnable_count,
     );
     record_executor_event_metric(debug_state, "timer-fired", stats.timer_fired_count);
+    debug_state.record_kernel_heap_metrics(crate::heap_stats());
 }
 
 fn record_executor_event_metric<CpuImpl, HostFs>(
