@@ -5566,7 +5566,7 @@ where
             .await
             .map(|datagram| {
                 (
-                    datagram.bytes.to_vec(),
+                    Vec::from(datagram.bytes),
                     format_p3_udp_socket_address(datagram.remote_address),
                 )
             })

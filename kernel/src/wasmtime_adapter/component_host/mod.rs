@@ -57,6 +57,13 @@ const INSTANCES_INSTANCE: &str = "helios:system/instances@0.1.0";
 const COMPONENT_CACHE_FRACTION: usize = 8;
 const COMPONENT_PHASE_HEARTBEAT_INTERVAL_NANOS: u64 = 5_000_000_000;
 
+fn lower_bytes_to_vec(bytes: Bytes) -> Vec<u8> {
+    // `Bytes::to_vec` always copies. The owned conversion can reuse unique
+    // receive buffers, which matters in the profiled component-host TCP read
+    // lowering path (`program-net-tcp-read-lower-bytes`).
+    Vec::from(bytes)
+}
+
 mod network;
 pub mod service;
 mod topology;
@@ -814,6 +821,27 @@ impl_program_bindings!(
     convert_program_launch_error,
     build_program_child_authority
 );
+
+#[cfg(test)]
+mod lowering_tests {
+    use alloc::vec::Vec;
+
+    use bytes::Bytes;
+
+    use super::lower_bytes_to_vec;
+
+    #[test]
+    fn owned_bytes_lowering_reuses_unique_vec_buffer() {
+        let source = Vec::from([1_u8, 2, 3, 4]);
+        let source_ptr = source.as_ptr();
+        let bytes = Bytes::from(source);
+
+        let lowered = lower_bytes_to_vec(bytes);
+
+        assert_eq!(lowered.as_slice(), [1, 2, 3, 4]);
+        assert_eq!(lowered.as_ptr(), source_ptr);
+    }
+}
 
 #[cfg(test)]
 mod authority_tests {
@@ -2056,7 +2084,7 @@ where
                     .and_then(Option::as_ref)
                     .map_or(0, Bytes::len);
                 let response = response
-                    .map(|bytes| bytes.map(|bytes| bytes.to_vec()))
+                    .map(|bytes| bytes.map(lower_bytes_to_vec))
                     .map_err(convert_tcp_error);
                 record_component_host_kernel_profile_events_bytes(
                     profile,
@@ -2399,7 +2427,7 @@ where
                 );
                 let lower_profile = profile.as_ref().map(ComponentHostProfile::restarted);
                 let response = response
-                    .map(|bytes| bytes.map(|bytes| bytes.to_vec()))
+                    .map(|bytes| bytes.map(lower_bytes_to_vec))
                     .map_err(convert_program_tcp_error);
                 record_component_host_kernel_profile_events_bytes(
                     lower_profile,
@@ -2964,7 +2992,7 @@ fn convert_udp_datagram(
                     octets[0], octets[1], octets[2], octets[3],
                 )),
                 port: datagram.port,
-                bytes: datagram.bytes.to_vec(),
+                bytes: lower_bytes_to_vec(datagram.bytes),
             })
         }
         crate::NetworkIpAddress::Ipv6(_) => Err(crate::UdpError {
@@ -2985,7 +3013,7 @@ fn convert_program_udp_datagram(
                     octets[0], octets[1], octets[2], octets[3],
                 )),
                 port: datagram.port,
-                bytes: datagram.bytes.to_vec(),
+                bytes: lower_bytes_to_vec(datagram.bytes),
             })
         }
         crate::NetworkIpAddress::Ipv6(_) => Err(crate::UdpError {
