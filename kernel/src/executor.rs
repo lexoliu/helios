@@ -193,7 +193,7 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
 
         if progress_mode == ProgressMode::Counted {
             self.progress.record_progress();
-            self.progress_notify.notify_one();
+            self.progress_notify.notify_one_coalesced();
         }
 
         match wake {

@@ -173,6 +173,20 @@ impl Notify {
         self.notify_count(1);
     }
 
+    /// Signals one waiter only when no notification is already pending.
+    ///
+    /// Use this for level-triggered progress signals where one wake is enough
+    /// to make the waiter observe the latest state.
+    pub fn notify_one_coalesced(&self) {
+        if self
+            .permits
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.event.notify(1);
+        }
+    }
+
     /// Signals up to `count` waiters with one permit update.
     ///
     /// This operation is non-blocking and suitable for interrupt context.
@@ -537,6 +551,17 @@ mod tests {
             notify.notified().await;
             notify.notified().await;
         });
+    }
+
+    #[test]
+    fn notify_one_coalesced_keeps_one_pending_permit() {
+        let notify = Notify::new();
+        notify.notify_one_coalesced();
+        notify.notify_one_coalesced();
+        assert_eq!(notify.permits.load(Ordering::Acquire), 1);
+
+        block_on(notify.notified());
+        assert_eq!(notify.permits.load(Ordering::Acquire), 0);
     }
 
     #[test]
