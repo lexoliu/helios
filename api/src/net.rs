@@ -8,7 +8,7 @@ use crate::bindings::helios::system::net as raw;
 
 const DEFAULT_TCP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default TCP read size used by convenience readers.
-pub const DEFAULT_READ_CHUNK_BYTES: usize = 64 * 1024;
+pub const DEFAULT_READ_CHUNK_BYTES: usize = 1024 * 1024;
 
 pub use crate::bindings::helios::system::net::{
     IpAddress, Ipv4Address, PingErrorKind, PingReply, TcpErrorKind, UdpDatagram, UdpErrorKind,

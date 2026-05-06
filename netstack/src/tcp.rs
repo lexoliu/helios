@@ -8,10 +8,12 @@ use crate::{
     TcpHeaderOptions, TcpPacket, TcpSackBlock, TcpSackBlocks, TcpTimestampOption,
 };
 
-pub const MAX_TCP_RECEIVE_SEGMENTS: usize = 128;
+pub(crate) const TCP_RECEIVE_SEGMENT_BYTES: usize = 1460;
+pub const TCP_RECEIVE_WINDOW_BYTES: usize = 1024 * 1024;
+pub const MAX_TCP_RECEIVE_SEGMENTS: usize =
+    (TCP_RECEIVE_WINDOW_BYTES + TCP_RECEIVE_SEGMENT_BYTES - 1) / TCP_RECEIVE_SEGMENT_BYTES;
 pub const MAX_TCP_OUT_OF_ORDER_SEGMENTS: usize = 32;
 pub const MAX_TCP_QUEUED_SEGMENTS: usize = 32;
-pub(crate) const TCP_RECEIVE_SEGMENT_BYTES: usize = 1460;
 const TCP_RECEIVE_COALESCE_BYTES: usize = 64 * 1024;
 const TCP_RECEIVE_BYTES: usize = MAX_TCP_RECEIVE_SEGMENTS * TCP_RECEIVE_SEGMENT_BYTES;
 const TCP_RECEIVE_BACKPRESSURE_BYTES: usize =
@@ -19,7 +21,7 @@ const TCP_RECEIVE_BACKPRESSURE_BYTES: usize =
 const TCP_SMALL_PAYLOAD_ACK_BYTES: usize = TCP_RECEIVE_SEGMENT_BYTES / 2;
 const TCP_DELAYED_ACK_SEGMENTS: u8 = 2;
 const TCP_WINDOW_UPDATE_BYTES: u16 = (TCP_RECEIVE_SEGMENT_BYTES * 4) as u16;
-const TCP_LOCAL_WINDOW_SCALE: u8 = 2;
+const TCP_LOCAL_WINDOW_SCALE: u8 = 4;
 const TCP_MAX_WINDOW_SCALE: u8 = 14;
 pub(crate) const TCP_RECEIVE_BACKPRESSURE_SEGMENTS: usize = MAX_TCP_RECEIVE_SEGMENTS - 4;
 pub const TCP_INITIAL_RTO_NANOS: u64 = 1_000_000_000;
@@ -156,6 +158,7 @@ where
     peer_timestamp: Option<TcpTimestampOption>,
     receive_queue: Deque<BytesMut, MAX_TCP_RECEIVE_SEGMENTS>,
     receive_queued_bytes: usize,
+    receive_fin_sequence: Option<u32>,
     out_of_order: HeapVec<TcpOutOfOrderSegment, MAX_TCP_OUT_OF_ORDER_SEGMENTS>,
     out_of_order_queued_bytes: usize,
     transmit_queue: Deque<Bytes, MAX_TCP_QUEUED_SEGMENTS>,
@@ -197,6 +200,7 @@ where
             peer_timestamp: None,
             receive_queue: Deque::new(),
             receive_queued_bytes: 0,
+            receive_fin_sequence: None,
             out_of_order: HeapVec::new(),
             out_of_order_queued_bytes: 0,
             transmit_queue: Deque::new(),
@@ -687,10 +691,11 @@ where
         }
     }
 
-    pub fn receive(&mut self, max_bytes: usize) -> Option<Bytes> {
+    pub fn receive(&mut self, max_bytes: usize, now_nanos: u64) -> Option<Bytes> {
         if max_bytes == 0 {
             return (!self.receive_queue.is_empty()).then(Bytes::new);
         }
+        self.consume_pending_receive_fin(now_nanos);
         let previous_window = self.advertised_window;
         let mut bytes = self.pop_receive_segment()?;
         if bytes.len() >= max_bytes {
@@ -699,6 +704,7 @@ where
                 self.push_front_receive_segment(tail);
             }
             let drained_segments = self.drain_contiguous_out_of_order();
+            self.consume_pending_receive_fin(now_nanos);
             self.refresh_advertised_window();
             if drained_segments != 0 || self.should_advertise_window_update(previous_window) {
                 self.request_ack();
@@ -708,6 +714,7 @@ where
 
         if self.receive_queue.is_empty() {
             let drained_segments = self.drain_contiguous_out_of_order();
+            self.consume_pending_receive_fin(now_nanos);
             self.refresh_advertised_window();
             if drained_segments != 0 || self.should_advertise_window_update(previous_window) {
                 self.request_ack();
@@ -730,6 +737,7 @@ where
             bytes.extend_from_slice(&next);
         }
         let drained_segments = self.drain_contiguous_out_of_order();
+        self.consume_pending_receive_fin(now_nanos);
         self.refresh_advertised_window();
         if drained_segments != 0 || self.should_advertise_window_update(previous_window) {
             self.request_ack();
@@ -829,14 +837,7 @@ where
                     }
                 }
                 if packet.flags.contains(TcpFlags::FIN) {
-                    self.receive_next = self.receive_next.wrapping_add(1);
-                    match self.state {
-                        TcpState::Established => self.state = TcpState::CloseWait,
-                        TcpState::FinWait1 => self.state = TcpState::Closing,
-                        TcpState::FinWait2 => self.enter_time_wait(now_nanos),
-                        _ => {}
-                    }
-                    self.request_ack();
+                    self.note_receive_fin(packet.sequence, packet.payload.len(), now_nanos);
                 }
                 TcpSegmentOutcome {
                     recovery: action,
@@ -1132,6 +1133,34 @@ where
                 .wrapping_add(u32::try_from(len).unwrap_or(u32::MAX));
             drained += 1;
         }
+    }
+
+    fn note_receive_fin(&mut self, sequence: u32, payload_len: usize, now_nanos: u64) {
+        let fin_sequence = segment_end_from_parts(sequence, payload_len);
+        if sequence_lt(fin_sequence, self.receive_next) {
+            self.request_ack();
+            return;
+        }
+        self.receive_fin_sequence = Some(fin_sequence);
+        self.consume_pending_receive_fin(now_nanos);
+        if self.receive_fin_sequence.is_some() {
+            self.request_ack();
+        }
+    }
+
+    fn consume_pending_receive_fin(&mut self, now_nanos: u64) {
+        if self.receive_fin_sequence != Some(self.receive_next) {
+            return;
+        }
+        self.receive_fin_sequence = None;
+        self.receive_next = self.receive_next.wrapping_add(1);
+        match self.state {
+            TcpState::Established => self.state = TcpState::CloseWait,
+            TcpState::FinWait1 => self.state = TcpState::Closing,
+            TcpState::FinWait2 => self.enter_time_wait(now_nanos),
+            _ => {}
+        }
+        self.request_ack();
     }
 
     fn insert_out_of_order_payload(&mut self, sequence: u32, payload: &[u8]) -> Result<(), ()> {
@@ -2013,13 +2042,13 @@ mod tests {
         }
         assert!(socket.advertised_window() < open_window);
         assert_eq!(
-            socket.receive(TCP_RECEIVE_SEGMENT_BYTES).as_deref(),
+            socket.receive(TCP_RECEIVE_SEGMENT_BYTES, 2).as_deref(),
             Some(&payload[..])
         );
         assert!(socket.advertised_window() < open_window);
         for _ in 1..queued_segments {
             assert_eq!(
-                socket.receive(TCP_RECEIVE_SEGMENT_BYTES).as_deref(),
+                socket.receive(TCP_RECEIVE_SEGMENT_BYTES, 4).as_deref(),
                 Some(&payload[..])
             );
         }
@@ -2181,8 +2210,8 @@ mod tests {
             );
         }
 
-        assert_eq!(socket.receive(7).as_deref(), Some(b"abcdefg".as_slice()));
-        assert_eq!(socket.receive(7).as_deref(), Some(b"hij".as_slice()));
+        assert_eq!(socket.receive(7, 2).as_deref(), Some(b"abcdefg".as_slice()));
+        assert_eq!(socket.receive(7, 3).as_deref(), Some(b"hij".as_slice()));
     }
 
     #[test]
@@ -2203,7 +2232,7 @@ mod tests {
         );
 
         assert_eq!(
-            socket.receive(usize::MAX).as_deref(),
+            socket.receive(usize::MAX, 2).as_deref(),
             Some(b"abc".as_slice())
         );
     }
@@ -2271,7 +2300,7 @@ mod tests {
             .pending_ack()
             .expect("out-of-order payload must request duplicate ACK");
         assert_eq!(ack.acknowledgement, 101);
-        assert_eq!(socket.receive(16), None);
+        assert_eq!(socket.receive(16, 2), None);
 
         let _ = socket.on_segment(
             TcpPacket {
@@ -2291,7 +2320,7 @@ mod tests {
             .pending_ack()
             .expect("gap fill should acknowledge the reassembled range");
         assert_eq!(ack.acknowledgement, 107);
-        assert_eq!(socket.receive(16).as_deref(), Some(b"abcdef".as_slice()));
+        assert_eq!(socket.receive(16, 3).as_deref(), Some(b"abcdef".as_slice()));
     }
 
     #[test]
@@ -2314,7 +2343,7 @@ mod tests {
                 TCP_INITIAL_RTO_NANOS + u64::from(sequence),
             );
         }
-        assert_eq!(socket.receive(16), None);
+        assert_eq!(socket.receive(16, 2), None);
 
         let _ = socket.on_segment(
             TcpPacket {
@@ -2330,7 +2359,10 @@ mod tests {
             TCP_INITIAL_RTO_NANOS + 3,
         );
 
-        assert_eq!(socket.receive(16).as_deref(), Some(b"abcdefghi".as_slice()));
+        assert_eq!(
+            socket.receive(16, 3).as_deref(),
+            Some(b"abcdefghi".as_slice())
+        );
     }
 
     #[test]
@@ -2451,13 +2483,13 @@ mod tests {
             / TCP_RECEIVE_SEGMENT_BYTES;
         for _ in 1..update_segments {
             assert_eq!(
-                socket.receive(TCP_RECEIVE_SEGMENT_BYTES).as_deref(),
+                socket.receive(TCP_RECEIVE_SEGMENT_BYTES, 2).as_deref(),
                 Some(&payload[..])
             );
             assert_eq!(socket.pending_ack(), None);
         }
         assert_eq!(
-            socket.receive(TCP_RECEIVE_SEGMENT_BYTES).as_deref(),
+            socket.receive(TCP_RECEIVE_SEGMENT_BYTES, 4).as_deref(),
             Some(&payload[..])
         );
         assert!(socket.pending_ack().is_some());

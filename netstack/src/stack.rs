@@ -1200,10 +1200,11 @@ where
         &mut self,
         socket: SocketId,
         max_bytes: usize,
+        now: StackInstant,
     ) -> Result<TcpReadState, StackError> {
         let index = socket_index(socket);
         let socket = self.tcp_socket_mut(socket)?;
-        let state = match socket.receive(max_bytes) {
+        let state = match socket.receive(max_bytes, now.nanos()) {
             Some(bytes) => TcpReadState::Data(bytes),
             None if socket.state() == crate::TcpState::CloseWait => TcpReadState::Eof,
             None => TcpReadState::Pending,
@@ -2480,10 +2481,117 @@ mod tests {
             .expect("data FIN should be accepted");
 
         assert_eq!(
-            stack.tcp_read(socket, 8).unwrap(),
+            stack
+                .tcp_read(socket, 8, StackInstant::from_nanos(3))
+                .unwrap(),
             TcpReadState::Data(Bytes::from_static(b"ok"))
         );
-        assert_eq!(stack.tcp_read(socket, 8).unwrap(), TcpReadState::Eof);
+        assert_eq!(
+            stack
+                .tcp_read(socket, 8, StackInstant::from_nanos(4))
+                .unwrap(),
+            TcpReadState::Eof
+        );
+    }
+
+    #[test]
+    fn tcp_read_waits_for_missing_bytes_before_out_of_order_fin_eof() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let socket = stack.open_tcp_connect(
+            TcpEndpoint {
+                address: IpAddress::Ipv4(local),
+                port: 49152,
+            },
+            TcpEndpoint {
+                address: IpAddress::Ipv4(peer),
+                port: 80,
+            },
+            7,
+        );
+        let (syn_ack, syn_ack_len) = tcp_segment(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+            },
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &syn_ack[..syn_ack_len],
+                StackInstant::from_nanos(1),
+            )
+            .expect("SYN-ACK should establish the socket");
+
+        let (early_fin, early_fin_len) = tcp_segment(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 103,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK.union(TcpFlags::FIN),
+                window_size: u16::MAX,
+            },
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &early_fin[..early_fin_len],
+                StackInstant::from_nanos(2),
+            )
+            .expect("out-of-order FIN should be tracked");
+        assert_eq!(
+            stack
+                .tcp_read(socket, 8, StackInstant::from_nanos(3))
+                .unwrap(),
+            TcpReadState::Pending
+        );
+
+        let (payload, payload_len) = tcp_segment_with_payload(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+            b"ok",
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &payload[..payload_len],
+                StackInstant::from_nanos(4),
+            )
+            .expect("missing payload should complete before FIN");
+
+        assert_eq!(
+            stack
+                .tcp_read(socket, 8, StackInstant::from_nanos(5))
+                .unwrap(),
+            TcpReadState::Data(Bytes::from_static(b"ok"))
+        );
+        assert_eq!(
+            stack
+                .tcp_read(socket, 8, StackInstant::from_nanos(6))
+                .unwrap(),
+            TcpReadState::Eof
+        );
     }
 
     #[test]
@@ -2729,7 +2837,11 @@ mod tests {
         assert!(stack.receive_backpressured());
 
         assert!(matches!(
-            stack.tcp_read(socket, crate::tcp::TCP_RECEIVE_SEGMENT_BYTES),
+            stack.tcp_read(
+                socket,
+                crate::tcp::TCP_RECEIVE_SEGMENT_BYTES,
+                StackInstant::from_nanos(1000)
+            ),
             Ok(TcpReadState::Data(_))
         ));
         assert!(!stack.receive_backpressured());

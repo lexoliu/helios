@@ -899,21 +899,35 @@ where
     ) -> Result<Option<Bytes>, TcpError> {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         loop {
+            let initial_poll_started = self.profile_start();
             let read = {
                 let mut state = self.inner.state.lock().await;
-                state.poll_tcp_read(stream, max_bytes as usize)?
+                state.poll_tcp_read(
+                    stream,
+                    max_bytes as usize,
+                    StackInstant::from_nanos(self.now_nanos()),
+                )?
             };
+            self.record_tcp_read_progress("tcp-read-initial", initial_poll_started, &read);
             match read {
                 TcpReadProgress::Data(bytes) => return Ok(Some(bytes)),
                 TcpReadProgress::Eof => return Ok(None),
                 TcpReadProgress::Pending => {}
             }
 
+            let drive_started = self.profile_start();
             self.drive_tcp().await?;
+            self.record_network_profile("tcp-read-drive-network", drive_started);
+            let after_drive_poll_started = self.profile_start();
             let read = {
                 let mut state = self.inner.state.lock().await;
-                state.poll_tcp_read(stream, max_bytes as usize)?
+                state.poll_tcp_read(
+                    stream,
+                    max_bytes as usize,
+                    StackInstant::from_nanos(self.now_nanos()),
+                )?
             };
+            self.record_tcp_read_progress("tcp-read-after-drive", after_drive_poll_started, &read);
             match read {
                 TcpReadProgress::Data(bytes) => return Ok(Some(bytes)),
                 TcpReadProgress::Eof => return Ok(None),
@@ -925,7 +939,9 @@ where
                     detail: NetworkErrorDetail::TcpReadTimeout,
                 });
             }
+            let wait_started = self.profile_start();
             self.wait_for_tcp_progress(deadline_nanos).await;
+            self.record_network_profile("tcp-read-wait", wait_started);
         }
     }
 
@@ -1594,6 +1610,20 @@ where
                     usize_to_u64(bytes, "network profile byte count"),
                 );
         }
+    }
+
+    fn record_tcp_read_progress(
+        &self,
+        prefix: &'static str,
+        start: Option<NetworkPerfStart>,
+        read: &TcpReadProgress,
+    ) {
+        let (phase, bytes) = match read {
+            TcpReadProgress::Pending => (tcp_read_profile_phase(prefix, "pending"), 0),
+            TcpReadProgress::Data(bytes) => (tcp_read_profile_phase(prefix, "ready"), bytes.len()),
+            TcpReadProgress::Eof => (tcp_read_profile_phase(prefix, "eof"), 0),
+        };
+        self.record_network_profile_events_bytes(phase, start, 1, bytes);
     }
 
     pub fn hardware_address(&self) -> [u8; 6] {
@@ -2319,11 +2349,12 @@ impl NetworkState {
         &mut self,
         stream: TcpStreamId,
         max_bytes: usize,
+        now: StackInstant,
     ) -> Result<TcpReadProgress, TcpError> {
         let socket = self.tcp_socket(stream)?;
         match self
             .stack
-            .tcp_read(socket, max_bytes)
+            .tcp_read(socket, max_bytes, now)
             .map_err(|_| TcpError {
                 kind: TcpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::TcpReceiveFailed,
@@ -2723,6 +2754,18 @@ fn adjust_poll_budget(current: usize, base: usize, saturated: bool, idle: bool) 
         return current / 2;
     }
     current
+}
+
+fn tcp_read_profile_phase(prefix: &'static str, outcome: &'static str) -> &'static str {
+    match (prefix, outcome) {
+        ("tcp-read-initial", "pending") => "tcp-read-initial-pending",
+        ("tcp-read-initial", "ready") => "tcp-read-initial-ready",
+        ("tcp-read-initial", "eof") => "tcp-read-initial-eof",
+        ("tcp-read-after-drive", "pending") => "tcp-read-after-drive-pending",
+        ("tcp-read-after-drive", "ready") => "tcp-read-after-drive-ready",
+        ("tcp-read-after-drive", "eof") => "tcp-read-after-drive-eof",
+        _ => panic!("unknown TCP read profile phase"),
+    }
 }
 
 fn limit_udp_datagram_bytes(bytes: Bytes, max_bytes: usize) -> Bytes {

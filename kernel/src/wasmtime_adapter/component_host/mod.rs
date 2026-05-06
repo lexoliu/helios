@@ -1509,6 +1509,21 @@ where
     counters: helios_hal::cpu::HardwarePerfCounters,
 }
 
+impl<CpuImpl, HostFs> ComponentHostProfile<CpuImpl, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    fn restarted(&self) -> Self {
+        Self {
+            runtime_state: self.runtime_state.clone(),
+            cpu: self.cpu.clone(),
+            started_ticks: self.cpu.now().ticks(),
+            counters: self.cpu.hardware_perf_counters(),
+        }
+    }
+}
+
 fn component_host_profile<CpuImpl, HostFs>(
     store: &StoreData<CpuImpl, HostFs>,
 ) -> Option<ComponentHostProfile<CpuImpl, HostFs>>
@@ -2369,15 +2384,29 @@ where
                         component_host_profile(access.get()),
                     ))
                 })?;
+                let service_profile = profile.as_ref().map(ComponentHostProfile::restarted);
                 let response = socket.0.tcp_read(socket.1, max_bytes, timeout).await;
                 let bytes = response
                     .as_ref()
                     .ok()
                     .and_then(Option::as_ref)
                     .map_or(0, Bytes::len);
+                record_component_host_kernel_profile_events_bytes(
+                    service_profile,
+                    "program-net-tcp-read-service",
+                    1,
+                    component_host_usize_to_u64(bytes, "program TCP read byte count"),
+                );
+                let lower_profile = profile.as_ref().map(ComponentHostProfile::restarted);
                 let response = response
                     .map(|bytes| bytes.map(|bytes| bytes.to_vec()))
                     .map_err(convert_program_tcp_error);
+                record_component_host_kernel_profile_events_bytes(
+                    lower_profile,
+                    "program-net-tcp-read-lower-bytes",
+                    1,
+                    component_host_usize_to_u64(bytes, "program TCP read byte count"),
+                );
                 record_component_host_kernel_profile_events_bytes(
                     profile,
                     "program-net-tcp-read",

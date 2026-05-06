@@ -4,7 +4,7 @@ use thiserror::Error;
 
 type Result<T> = core::result::Result<T, WasixTcpThroughputError>;
 
-const BUFFER_BYTES: usize = 64 * 1024;
+const BUFFER_BYTES: usize = 1024 * 1024;
 const WASIX_ADDRESS_FAMILY_IP_INET4: u8 = 1;
 const WASIX_SOCK_TYPE_STREAM: i32 = 1;
 const WASIX_IPPROTO_TCP: i32 = 6;
