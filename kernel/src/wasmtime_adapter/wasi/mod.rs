@@ -3,7 +3,6 @@ extern crate alloc;
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
-use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
@@ -21,6 +20,7 @@ use helios_hal::cpu::Cpu;
 use helios_netstack::Ipv6Address;
 use spin::Mutex;
 use thiserror::Error;
+use triomphe::Arc;
 use wasmtime::component::{
     Access, Accessor, Component, Destination, FutureReader, HasSelf, Resource, Source,
     StreamConsumer, StreamProducer, StreamReader, StreamResult, WriteBuffer,
@@ -426,6 +426,8 @@ struct TcpReadStreamProducer {
     completion: Option<oneshot::Sender<core::result::Result<(), socket_types::ErrorCode>>>,
 }
 
+impl Unpin for TcpReadStreamProducer {}
+
 type TcpReadResult = core::result::Result<Option<Bytes>, socket_types::ErrorCode>;
 
 struct TcpWriteConsumer {
@@ -433,6 +435,8 @@ struct TcpWriteConsumer {
     pending: Option<Pin<Box<dyn core::future::Future<Output = TcpWriteResult> + Send>>>,
     completion: Option<oneshot::Sender<core::result::Result<(), socket_types::ErrorCode>>>,
 }
+
+impl Unpin for TcpWriteConsumer {}
 
 type TcpWriteResult = core::result::Result<(), socket_types::ErrorCode>;
 
