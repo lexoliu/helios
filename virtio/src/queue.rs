@@ -10,6 +10,7 @@ use crate::transport::VirtioTransport;
 
 const DESC_FLAG_NEXT: u16 = 1;
 const DESC_FLAG_WRITE: u16 = 2;
+const USED_FLAG_NO_NOTIFY: u16 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -202,7 +203,9 @@ impl<T: VirtioTransport> VirtQueue<T> {
     }
 
     pub fn notify(&self, transport: &T) {
-        transport.notify_queue(self.index);
+        if self.should_notify() {
+            transport.notify_queue(self.index);
+        }
     }
 
     fn push_descriptor(&mut self, transport: &T, buffer: &[u8], writable: bool) -> IoResult<u16> {
@@ -340,6 +343,14 @@ impl<T: VirtioTransport> VirtQueue<T> {
         }
     }
 
+    fn read_used_flags(&self) -> u16 {
+        unsafe { self.device_area.as_ptr().cast::<u16>().read_volatile() }
+    }
+
+    fn should_notify(&self) -> bool {
+        self.read_used_flags() & USED_FLAG_NO_NOTIFY == 0
+    }
+
     fn read_used_elem(&self, slot: u16) -> UsedElem {
         unsafe {
             self.device_area
@@ -368,7 +379,7 @@ mod tests {
 
     use helios_hal::io::{IoError, IoResult};
 
-    use super::{Descriptor, UsedElem, VirtQueue};
+    use super::{Descriptor, USED_FLAG_NO_NOTIFY, UsedElem, VirtQueue};
     use crate::bus::{DeviceBus, DmaBuffer, DmaPool};
     use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
@@ -696,5 +707,23 @@ mod tests {
             first_token
         );
         assert_eq!(queue.next_free_descriptor(), second_token);
+    }
+
+    #[test]
+    fn used_ring_no_notify_flag_suppresses_queue_notify() {
+        let transport = FakeTransport {
+            bus: FakeBus { dma: FakeDmaPool },
+        };
+        let queue = VirtQueue::new(&transport, 0, 8).expect("queue should initialize");
+
+        assert!(queue.should_notify());
+        unsafe {
+            queue
+                .device_area
+                .as_ptr()
+                .cast::<u16>()
+                .write_volatile(USED_FLAG_NO_NOTIFY);
+        }
+        assert!(!queue.should_notify());
     }
 }
