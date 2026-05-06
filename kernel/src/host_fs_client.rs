@@ -141,7 +141,7 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
     }
 
     async fn walk(&self, parent_fid: u32, new_fid: u32, path: &str) -> Result<u32, HostFsError> {
-        let segments = split_path(path);
+        let segment_count = path_segment_count(path);
         let response = self
             .transact(
                 P9_TWALK,
@@ -150,9 +150,9 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
                     push_u32(body, new_fid);
                     push_u16(
                         body,
-                        u16::try_from(segments.len()).expect("walk segment count overflowed u16"),
+                        u16::try_from(segment_count).expect("walk segment count overflowed u16"),
                     );
-                    for segment in &segments {
+                    for segment in path_segments(path) {
                         push_string(body, segment);
                     }
                 },
@@ -161,7 +161,7 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
             .await?;
         let cursor = 7;
         let walked = read_u16_le(&response, cursor)?;
-        if usize::from(walked) != segments.len() {
+        if usize::from(walked) != segment_count {
             // The server walked part of the path; the remaining segment
             // doesn't exist. 9p leaves `new_fid` unattached in this case
             // per the 2000.L spec ("if any walked element doesn't exist
@@ -231,6 +231,27 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
         Ok(read_slice(&response, cursor, count)?.to_vec())
     }
 
+    async fn read_chunk_into(
+        &self,
+        fid: u32,
+        offset: u64,
+        max_bytes: u32,
+        output: &mut Vec<u8>,
+    ) -> Result<usize, HostFsError> {
+        let response = self
+            .transact(
+                P9_TREAD,
+                |body| {
+                    push_u32(body, fid);
+                    push_u64(body, offset);
+                    push_u32(body, max_bytes);
+                },
+                usize::try_from(DEFAULT_MSIZE).expect("DEFAULT_MSIZE overflowed usize"),
+            )
+            .await?;
+        append_read_payload(&response, output)
+    }
+
     async fn read_file_all(&self, fid: u32, expected_size: u64) -> Result<Vec<u8>, HostFsError> {
         self.open(fid, P9_DOTL_RDONLY).await?;
 
@@ -243,14 +264,15 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
             let request_count = remaining.min(P9_WRITE_CHUNK);
             let request_count =
                 u32::try_from(request_count).expect("read request count overflowed u32");
-            let chunk = self.read_chunk(fid, offset, request_count).await?;
-            if chunk.is_empty() {
+            let read = self
+                .read_chunk_into(fid, offset, request_count, &mut bytes)
+                .await?;
+            if read == 0 {
                 return Err(HostFsError::Protocol("short 9p read"));
             }
             offset = offset
-                .checked_add(u64::try_from(chunk.len()).expect("chunk length overflowed u64"))
+                .checked_add(u64::try_from(read).expect("chunk length overflowed u64"))
                 .ok_or(HostFsError::Protocol("read offset overflowed u64"))?;
-            bytes.extend_from_slice(&chunk);
         }
         Ok(bytes)
     }
@@ -785,10 +807,12 @@ impl<Transport: HostFsTransport> HostFileSystem for HostFsClient<Transport> {
     }
 }
 
-fn split_path(path: &str) -> Vec<&str> {
-    path.split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect()
+fn path_segments(path: &str) -> impl Iterator<Item = &str> {
+    path.split('/').filter(|segment| !segment.is_empty())
+}
+
+fn path_segment_count(path: &str) -> usize {
+    path_segments(path).count()
 }
 
 fn split_parent_name(path: &str) -> Result<(&str, &str), HostFsError> {
@@ -885,6 +909,15 @@ fn read_string(buf: &[u8], cursor: &mut usize) -> Result<String, HostFsError> {
     String::from_utf8(bytes.to_vec()).map_err(|_| HostFsError::Utf8)
 }
 
+fn append_read_payload(response: &[u8], output: &mut Vec<u8>) -> Result<usize, HostFsError> {
+    let mut cursor = 7;
+    let count = usize::try_from(read_u32_le(response, cursor)?)
+        .map_err(|_| HostFsError::Protocol("read payload count overflowed usize"))?;
+    cursor += 4;
+    output.extend_from_slice(read_slice(response, cursor, count)?);
+    Ok(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -903,5 +936,30 @@ mod tests {
             p9_setattr_times(Some(4), Some(5)),
             (P9_SETATTR_ATIME_SET | P9_SETATTR_MTIME_SET, 0, 4, 0, 5)
         );
+    }
+
+    #[test]
+    fn path_segments_skip_empty_components_without_allocating() {
+        let segments = path_segments("/alpha//beta/gamma/").collect::<alloc::vec::Vec<_>>();
+
+        assert_eq!(segments, ["alpha", "beta", "gamma"]);
+        assert_eq!(path_segment_count("/alpha//beta/gamma/"), 3);
+    }
+
+    #[test]
+    fn append_read_payload_extends_existing_buffer() {
+        let mut response = Vec::new();
+        response.extend_from_slice(&14u32.to_le_bytes());
+        response.push(P9_TREAD + 1);
+        response.extend_from_slice(&P9_NOTAG.to_le_bytes());
+        response.extend_from_slice(&3u32.to_le_bytes());
+        response.extend_from_slice(b"abc");
+
+        let mut output = Vec::from(b"prefix-".as_slice());
+        let read = append_read_payload(&response, &mut output)
+            .expect("read response payload should append");
+
+        assert_eq!(read, 3);
+        assert_eq!(output, b"prefix-abc");
     }
 }
