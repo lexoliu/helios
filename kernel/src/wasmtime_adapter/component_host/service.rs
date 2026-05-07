@@ -64,6 +64,18 @@ const DEFAULT_WASIX_EXEC_SEARCH_PATHS: &[&str] = &["/usr/local/bin", "/bin", "/u
 type Preview1Iovs = SmallVec<[(u32, u32); 8]>;
 type Preview1IovRanges = SmallVec<[(usize, usize); 8]>;
 type CompilerThreadTasks = SmallVec<[crate::JoinHandle<()>; 8]>;
+
+struct Preview1IovLayout {
+    iovs: Preview1Iovs,
+    byte_len: usize,
+}
+
+impl Preview1IovLayout {
+    fn byte_len_u32(&self) -> Result<u32, i32> {
+        u32::try_from(self.byte_len).map_err(|_| p1::errno::OVERFLOW)
+    }
+}
+
 const WASIX_PROC_SPAWN_FD_OP_SIZE: u32 = 56;
 const WASIX_PROC_SPAWN_FD_OP_CMD_OFFSET: u32 = 0;
 const WASIX_PROC_SPAWN_FD_OP_FD_OFFSET: u32 = 4;
@@ -7874,19 +7886,16 @@ where
         if crate::guest_host_share_path(&descriptor.path).is_none() {
             let current_offset = *offset;
             let fdflags = *fdflags;
-            let iovs = match p1_read_iovs(caller, memory, iovs, iovs_len) {
-                Ok(iovs) => iovs,
+            let layout = match p1_read_iovs_with_byte_len(caller, memory, iovs, iovs_len) {
+                Ok(layout) => layout,
                 Err(errno) => return errno,
             };
-            let byte_len = match p1_iovs_byte_len(&iovs) {
-                Ok(byte_len) => byte_len,
-                Err(errno) => return errno,
-            };
+            let byte_len = layout.byte_len;
             let written = match u32::try_from(byte_len) {
                 Ok(written) => written,
                 Err(_) => return p1::errno::OVERFLOW,
             };
-            let ranges = match p1_iovs_memory_ranges(memory, &iovs) {
+            let ranges = match p1_iovs_memory_ranges(memory, &layout.iovs) {
                 Ok(ranges) => ranges,
                 Err(errno) => return errno,
             };
@@ -7970,25 +7979,22 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let iovs = match p1_read_iovs(caller, memory, iovs, iovs_len) {
-        Ok(iovs) => iovs,
+    let layout = match p1_read_iovs_with_byte_len(caller, memory, iovs, iovs_len) {
+        Ok(layout) => layout,
         Err(errno) => return errno,
     };
-    let capacity = iovs
-        .iter()
-        .try_fold(0usize, |acc, (_, len)| acc.checked_add(*len as usize))
-        .unwrap_or(usize::MAX);
+    let capacity = layout.byte_len;
     match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Stdin { .. }) => {
             let bytes = caller.data_mut().read_stdin(capacity).await;
-            return p1_write_iovs_from_bytes(caller, memory, iovs, &bytes, nread);
+            return p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, nread);
         }
         Some(Preview1Descriptor::PipeRead { .. }) => {
             let bytes = match caller.data_mut().read_pipe(fd, capacity).await {
                 Ok(bytes) => bytes,
                 Err(errno) => return errno,
             };
-            return p1_write_iovs_from_bytes(caller, memory, iovs, &bytes, nread);
+            return p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, nread);
         }
         Some(Preview1Descriptor::File {
             descriptor, offset, ..
@@ -8029,7 +8035,7 @@ where
             {
                 *offset = offset.saturating_add(bytes.len() as u64);
             }
-            return p1_write_iovs_from_bytes(caller, memory, iovs, &bytes, nread);
+            return p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, nread);
         }
         _ => {}
     }
@@ -8038,7 +8044,7 @@ where
         Err(errno) => return errno,
     };
     let mut copied = 0usize;
-    for (ptr, len) in iovs {
+    for (ptr, len) in layout.iovs {
         if copied >= bytes.len() {
             break;
         }
@@ -8443,14 +8449,11 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let iovs = match p1_read_iovs(caller, memory, iovs, iovs_len) {
-        Ok(iovs) => iovs,
+    let layout = match p1_read_iovs_with_byte_len(caller, memory, iovs, iovs_len) {
+        Ok(layout) => layout,
         Err(errno) => return errno,
     };
-    let capacity = iovs
-        .iter()
-        .try_fold(0usize, |acc, (_, len)| acc.checked_add(*len as usize))
-        .unwrap_or(usize::MAX);
+    let capacity = layout.byte_len;
     let Some(Preview1Descriptor::File { descriptor, .. }) = caller.data().descriptors.get(fd)
     else {
         return p1::errno::BADF;
@@ -8482,7 +8485,7 @@ where
             Err(error) => return p1_errno_from_fs(error),
         }
     };
-    p1_write_iovs_from_bytes(caller, memory, iovs, &bytes, nread)
+    p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, nread)
 }
 
 async fn p1_fd_pwrite<CpuImpl, HostFs>(
@@ -14435,15 +14438,13 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let iovs = match p1_read_iovs(caller, memory, iovs, iovs_len) {
-        Ok(iovs) => iovs,
+    let layout = match p1_read_iovs_with_byte_len(caller, memory, iovs, iovs_len) {
+        Ok(layout) => layout,
         Err(errno) => return errno,
     };
-    let capacity = iovs
-        .iter()
-        .try_fold(0u32, |sum, (_, len)| sum.checked_add(*len));
-    let Some(capacity) = capacity else {
-        return p1::errno::OVERFLOW;
+    let capacity = match layout.byte_len_u32() {
+        Ok(capacity) => capacity,
+        Err(errno) => return errno,
     };
     let descriptor = caller.data().descriptors.get(fd).cloned();
     let authority = match wasix_sock_recv_authority(descriptor.as_ref()) {
@@ -14473,7 +14474,8 @@ where
                 Ok(None) => return p1::errno::AGAIN,
                 Err(error) => return p1_errno_from_udp_error_for_fdflags(error, fdflags),
             };
-            let status = p1_write_iovs_from_bytes(caller, memory, iovs, &datagram.bytes, ret_size);
+            let status =
+                p1_write_iovs_from_bytes(caller, memory, layout.iovs, &datagram.bytes, ret_size);
             if status != p1::errno::SUCCESS {
                 return status;
             }
@@ -14504,7 +14506,7 @@ where
                 Ok(bytes) => bytes,
                 Err(errno) => return errno,
             };
-            let status = p1_write_iovs_from_bytes(caller, memory, iovs, &bytes, ret_size);
+            let status = p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, ret_size);
             if status != p1::errno::SUCCESS {
                 return status;
             }
@@ -14532,7 +14534,7 @@ where
                 Ok(None) => Bytes::new(),
                 Err(error) => return p1_errno_from_tcp_error_for_fdflags(error, fdflags),
             };
-            let status = p1_write_iovs_from_bytes(caller, memory, iovs, &bytes, ret_size);
+            let status = p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, ret_size);
             if status != p1::errno::SUCCESS {
                 return status;
             }
@@ -15669,16 +15671,14 @@ where
         return p1::errno::FAULT;
     };
     let iovs_started = p1_kernel_profile_start(caller.data());
-    let iovs = match p1_read_iovs(caller, memory, ri_data, ri_data_len) {
-        Ok(iovs) => iovs,
+    let layout = match p1_read_iovs_with_byte_len(caller, memory, ri_data, ri_data_len) {
+        Ok(layout) => layout,
         Err(errno) => return errno,
     };
     p1_record_optional_kernel_profile(caller.data(), "sock_recv_iovs", iovs_started);
-    let capacity = iovs
-        .iter()
-        .try_fold(0u32, |sum, (_, len)| sum.checked_add(*len));
-    let Some(capacity) = capacity else {
-        return p1::errno::OVERFLOW;
+    let capacity = match layout.byte_len_u32() {
+        Ok(capacity) => capacity,
+        Err(errno) => return errno,
     };
     let fdflags = match caller.data().descriptors.fdflags(fd) {
         Ok(fdflags) => fdflags,
@@ -15691,7 +15691,7 @@ where
         ))
     ) {
         if capacity == 0 {
-            let status = p1_write_iovs_from_bytes(caller, memory, iovs, &[], ro_datalen);
+            let status = p1_write_iovs_from_bytes(caller, memory, layout.iovs, &[], ro_datalen);
             if status != p1::errno::SUCCESS {
                 return status;
             }
@@ -15706,7 +15706,7 @@ where
                 Ok(None) => return p1::errno::AGAIN,
                 Err(errno) => return errno,
             };
-            let status = p1_write_iovs_from_bytes(caller, memory, iovs, &bytes, ro_datalen);
+            let status = p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, ro_datalen);
             if status != p1::errno::SUCCESS {
                 return status;
             }
@@ -15720,7 +15720,7 @@ where
             Ok(bytes) => bytes,
             Err(errno) => return errno,
         };
-        let status = p1_write_iovs_from_bytes(caller, memory, iovs, &bytes, ro_datalen);
+        let status = p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, ro_datalen);
         if status != p1::errno::SUCCESS {
             return status;
         }
@@ -15754,7 +15754,7 @@ where
     };
     p1_record_optional_kernel_profile(caller.data(), "sock_recv_tcp_read", service_started);
     let write_started = p1_kernel_profile_start(caller.data());
-    let status = p1_write_iovs_from_bytes(caller, memory, iovs, &bytes, ro_datalen);
+    let status = p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, ro_datalen);
     if status != p1::errno::SUCCESS {
         return status;
     }
@@ -16136,21 +16136,31 @@ fn preview1_write_u32(memory: Preview1Memory, ptr: u32, value: u32) -> i32 {
     preview1_write_memory(memory, ptr, &value.to_le_bytes())
 }
 
-fn p1_read_iovs<T>(
+// Preview1 socket/file profiles charge iov decoding separately from payload
+// copy. Keep length accounting in the guest-table decode pass so hot read and
+// recv syscalls do not rescan the same SmallVec before touching the real I/O
+// path.
+fn p1_read_iovs_with_byte_len<T>(
     caller: &mut Caller<'_, T>,
     memory: Preview1Memory,
     iovs: u32,
     iovs_len: u32,
-) -> Result<Preview1Iovs, i32> {
+) -> Result<Preview1IovLayout, i32> {
     let mut result = Preview1Iovs::new();
+    let mut byte_len = 0usize;
     for index in 0..iovs_len {
         let offset = index.checked_mul(8).ok_or(p1::errno::OVERFLOW)?;
         let iov = iovs.checked_add(offset).ok_or(p1::errno::OVERFLOW)?;
         let ptr = p1_try_read_u32(caller, memory, iov).map_err(|_| p1::errno::FAULT)?;
         let len = p1_try_read_u32(caller, memory, iov + 4).map_err(|_| p1::errno::FAULT)?;
+        let len_usize = usize::try_from(len).map_err(|_| p1::errno::OVERFLOW)?;
+        byte_len = byte_len.checked_add(len_usize).ok_or(p1::errno::OVERFLOW)?;
         result.push((ptr, len));
     }
-    Ok(result)
+    Ok(Preview1IovLayout {
+        iovs: result,
+        byte_len,
+    })
 }
 
 fn p1_read_iovs_to_bytes<T>(
@@ -16159,16 +16169,10 @@ fn p1_read_iovs_to_bytes<T>(
     iovs: u32,
     iovs_len: u32,
 ) -> Result<Vec<u8>, i32> {
-    let iovs = p1_read_iovs(caller, memory, iovs, iovs_len)?;
-    let capacity = iovs.iter().try_fold(0usize, |sum, (_, len)| {
-        sum.checked_add((*len).try_into().ok()?)
-    });
-    let Some(capacity) = capacity else {
-        return Err(p1::errno::OVERFLOW);
-    };
-    let mut bytes: Vec<u8> = Vec::with_capacity(capacity);
+    let layout = p1_read_iovs_with_byte_len(caller, memory, iovs, iovs_len)?;
+    let mut bytes: Vec<u8> = Vec::with_capacity(layout.byte_len);
     let mut written = 0usize;
-    for (ptr, len) in iovs {
+    for (ptr, len) in layout.iovs {
         let len = usize::try_from(len).map_err(|_| p1::errno::OVERFLOW)?;
         let start = preview1_memory_start(memory, ptr, len).map_err(|_| p1::errno::FAULT)?;
         unsafe {
@@ -16184,14 +16188,6 @@ fn p1_read_iovs_to_bytes<T>(
         bytes.set_len(written);
     }
     Ok(bytes)
-}
-
-fn p1_iovs_byte_len(iovs: &[(u32, u32)]) -> Result<usize, i32> {
-    iovs.iter()
-        .try_fold(0usize, |sum, (_, len)| {
-            sum.checked_add(usize::try_from(*len).ok()?)
-        })
-        .ok_or(p1::errno::OVERFLOW)
 }
 
 fn p1_iovs_memory_ranges(
