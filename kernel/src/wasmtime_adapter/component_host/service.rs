@@ -12334,24 +12334,34 @@ fn wasix_read_exec_string<T>(
 }
 
 fn wasix_split_lines(value: &str) -> Vec<String> {
-    value
-        .split('\n')
-        .filter(|entry| !entry.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
+    let mut lines = Vec::with_capacity(wasix_nonempty_line_count(value));
+    lines.extend(
+        value
+            .split('\n')
+            .filter(|entry| !entry.is_empty())
+            .map(ToOwned::to_owned),
+    );
+    lines
 }
 
 fn wasix_split_environment(value: &str) -> Vec<(String, String)> {
-    value
-        .split('\n')
-        .filter(|entry| !entry.is_empty())
-        .map(|entry| {
-            entry
-                .split_once('=')
-                .map(|(name, value)| (name.to_owned(), value.to_owned()))
-                .unwrap_or_else(|| (entry.to_owned(), String::new()))
-        })
-        .collect()
+    let mut environment = Vec::with_capacity(wasix_nonempty_line_count(value));
+    environment.extend(
+        value
+            .split('\n')
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| {
+                entry
+                    .split_once('=')
+                    .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                    .unwrap_or_else(|| (entry.to_owned(), String::new()))
+            }),
+    );
+    environment
+}
+
+fn wasix_nonempty_line_count(value: &str) -> usize {
+    value.split('\n').filter(|entry| !entry.is_empty()).count()
 }
 
 fn wasix_read_signal_dispositions<T>(
@@ -17544,6 +17554,24 @@ mod tests {
             ),
             p1::errno::AGAIN
         );
+    }
+
+    #[test]
+    fn wasix_split_helpers_preallocate_nonempty_entries() {
+        let lines = wasix_split_lines("alpha\n\nbeta\ngamma\n");
+        assert_eq!(lines, ["alpha", "beta", "gamma"]);
+        assert_eq!(lines.capacity(), 3);
+
+        let environment = wasix_split_environment("A=1\nEMPTY\n\nB=two\n");
+        assert_eq!(
+            environment,
+            [
+                ("A".into(), "1".into()),
+                ("EMPTY".into(), String::new()),
+                ("B".into(), "two".into())
+            ]
+        );
+        assert_eq!(environment.capacity(), 3);
     }
 
     #[test]
