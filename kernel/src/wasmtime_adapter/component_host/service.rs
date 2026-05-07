@@ -2821,7 +2821,10 @@ where
         if carry.is_empty() {
             match &self.output_mode {
                 OutputMode::Serial => loop {
-                    let bytes = (self.read_serial)(u32::MAX);
+                    let bytes = (self.read_serial)(
+                        u32::try_from(max_bytes)
+                            .unwrap_or_else(|_| panic!("stdin read capacity exceeds u32")),
+                    );
                     if !bytes.is_empty() {
                         *carry = Bytes::from(bytes);
                         break;
