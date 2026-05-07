@@ -2771,16 +2771,14 @@ impl NetworkState {
         max_bytes: usize,
     ) -> Result<Option<UdpDatagram>, UdpError> {
         let local_port = self.udp_socket(socket)?.local_port;
-        loop {
-            let Some(datagram) = self.stack.take_udp(local_port) else {
-                return Ok(None);
-            };
-            return Ok(Some(UdpDatagram {
-                address: map_ip_address(datagram.source),
-                port: datagram.source_port,
-                bytes: limit_udp_datagram_bytes(datagram.bytes, max_bytes),
-            }));
-        }
+        let Some(datagram) = self.stack.take_udp(local_port) else {
+            return Ok(None);
+        };
+        Ok(Some(UdpDatagram {
+            address: map_ip_address(datagram.source),
+            port: datagram.source_port,
+            bytes: limit_udp_datagram_bytes(datagram.bytes, max_bytes),
+        }))
     }
 
     fn remove_tcp_stream(&mut self, stream: TcpStreamId) {
