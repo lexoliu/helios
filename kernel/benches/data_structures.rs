@@ -125,6 +125,13 @@ fn byte_channel_write_try_read(bencher: Bencher, count: usize) {
     });
 }
 
+#[divan::bench]
+fn byte_channel_create_drop(bencher: Bencher) {
+    bencher.bench_local(|| {
+        black_box(byte_channel());
+    });
+}
+
 #[divan::bench(args = [1usize, 64, 1024])]
 fn component_network_direct_tcp_read(bencher: Bencher, count: usize) {
     let service = BenchNetworkService {

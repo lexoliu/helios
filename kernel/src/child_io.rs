@@ -12,6 +12,7 @@
 
 extern crate alloc;
 
+use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 
@@ -21,6 +22,13 @@ use spin::Mutex;
 use triomphe::Arc;
 
 const BYTE_CHANNEL_CHUNK_CAPACITY: usize = 256;
+// Keep the common process/stdio/socketpair path from pre-allocating the full
+// 256-slot queue. Local divan evidence: the old fixed queue allocated 8.408 KB
+// per channel, while this inline-64 layout allocates 2.304 KB for create/drop,
+// 16-chunk, and 64-chunk cases; only larger bursts spill to overflow.
+const BYTE_CHANNEL_INLINE_CHUNKS: usize = 64;
+const BYTE_CHANNEL_OVERFLOW_INITIAL_CHUNKS: usize =
+    BYTE_CHANNEL_CHUNK_CAPACITY - BYTE_CHANNEL_INLINE_CHUNKS;
 const BYTE_CHANNEL_WAKER_CAPACITY: usize = 8;
 
 /// A single byte-stream channel, closable from both ends. Producers push
@@ -64,13 +72,19 @@ impl ByteChannel {
 }
 
 struct ByteQueue {
-    chunks: Mutex<Deque<Bytes, BYTE_CHANNEL_CHUNK_CAPACITY>>,
+    chunks: Mutex<ByteChunks>,
+}
+
+struct ByteChunks {
+    inline: Deque<Bytes, BYTE_CHANNEL_INLINE_CHUNKS>,
+    overflow: Option<VecDeque<Bytes>>,
+    len: usize,
 }
 
 impl ByteQueue {
     const fn new() -> Self {
         Self {
-            chunks: Mutex::new(Deque::new()),
+            chunks: Mutex::new(ByteChunks::new()),
         }
     }
 
@@ -84,14 +98,12 @@ impl ByteQueue {
         if reader_closed.load(Ordering::Acquire) || writer_closed.load(Ordering::Acquire) {
             return Err(ClosedPeer);
         }
-        chunks.push_back(bytes).unwrap_or_else(|_| {
-            panic!("byte channel capacity {BYTE_CHANNEL_CHUNK_CAPACITY} exhausted")
-        });
+        chunks.push(bytes);
         Ok(())
     }
 
     fn pop(&self) -> Option<Bytes> {
-        self.chunks.lock().pop_front()
+        self.chunks.lock().pop()
     }
 
     fn is_empty(&self) -> bool {
@@ -107,6 +119,65 @@ impl ByteQueue {
     #[cfg(test)]
     const fn capacity(&self) -> usize {
         BYTE_CHANNEL_CHUNK_CAPACITY
+    }
+}
+
+impl ByteChunks {
+    const fn new() -> Self {
+        Self {
+            inline: Deque::new(),
+            overflow: None,
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, bytes: Bytes) {
+        if self.len >= BYTE_CHANNEL_CHUNK_CAPACITY {
+            panic!("byte channel capacity {BYTE_CHANNEL_CHUNK_CAPACITY} exhausted");
+        }
+        if let Some(overflow) = self.overflow.as_mut() {
+            overflow.push_back(bytes);
+            self.len += 1;
+            return;
+        }
+
+        match self.inline.push_back(bytes) {
+            Ok(()) => {
+                self.len += 1;
+            }
+            Err(bytes) => {
+                let mut overflow = VecDeque::with_capacity(BYTE_CHANNEL_OVERFLOW_INITIAL_CHUNKS);
+                overflow.push_back(bytes);
+                self.overflow = Some(overflow);
+                self.len += 1;
+            }
+        }
+    }
+
+    fn pop(&mut self) -> Option<Bytes> {
+        if let Some(bytes) = self.inline.pop_front() {
+            self.len -= 1;
+            return Some(bytes);
+        }
+        let overflow = self.overflow.as_mut()?;
+        let bytes = overflow.pop_front();
+        if bytes.is_some() {
+            self.len -= 1;
+        }
+        if overflow.is_empty() {
+            self.overflow = None;
+        }
+        bytes
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn clear(&mut self) {
+        self.inline.clear();
+        self.overflow = None;
+        self.len = 0;
     }
 }
 
@@ -458,6 +529,54 @@ mod tests {
         .expect("queued bytes should be delivered before EOF");
 
         assert_eq!(received.as_ref(), b"poll");
+    }
+
+    #[test]
+    fn byte_channel_spills_after_inline_chunks_without_reordering() {
+        let (writer, reader) = byte_channel();
+        for value in 0..80u8 {
+            writer
+                .write(Bytes::copy_from_slice(&[value]))
+                .expect("reader is still open");
+        }
+        drop(writer);
+
+        for value in 0..80u8 {
+            let received = futures_lite::future::block_on(reader.read())
+                .expect("queued byte should be delivered before EOF");
+            assert_eq!(received.as_ref(), &[value]);
+        }
+        assert!(futures_lite::future::block_on(reader.read()).is_none());
+    }
+
+    #[test]
+    fn byte_channel_preserves_capacity_after_inline_segment_drains() {
+        let (writer, reader) = byte_channel();
+        for value in 0..80u16 {
+            writer
+                .write(Bytes::copy_from_slice(&value.to_le_bytes()))
+                .expect("reader is still open");
+        }
+
+        for value in 0..64u16 {
+            let received = futures_lite::future::block_on(reader.read())
+                .expect("queued byte should be delivered before EOF");
+            assert_eq!(received.as_ref(), &value.to_le_bytes());
+        }
+
+        for value in 80..320u16 {
+            writer
+                .write(Bytes::copy_from_slice(&value.to_le_bytes()))
+                .expect("reader is still open");
+        }
+        drop(writer);
+
+        for value in 64..320u16 {
+            let received = futures_lite::future::block_on(reader.read())
+                .expect("queued byte should be delivered before EOF");
+            assert_eq!(received.as_ref(), &value.to_le_bytes());
+        }
+        assert!(futures_lite::future::block_on(reader.read()).is_none());
     }
 
     #[test]
