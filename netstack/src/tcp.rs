@@ -1,6 +1,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 
 use bytes::{Bytes, BytesMut};
 use heapless::{Deque, Vec as HeapVec};
@@ -16,9 +17,16 @@ pub const MAX_TCP_RECEIVE_SEGMENTS: usize =
     (TCP_RECEIVE_WINDOW_BYTES + TCP_RECEIVE_SEGMENT_BYTES - 1) / TCP_RECEIVE_SEGMENT_BYTES;
 pub const MAX_TCP_OUT_OF_ORDER_SEGMENTS: usize = 32;
 pub const MAX_TCP_QUEUED_SEGMENTS: usize = 32;
-const TCP_RECEIVE_COALESCE_BYTES: usize = 64 * 1024;
+// Local divan `tcp_receive_contiguous_read` showed that 128 KiB receive
+// coalescing plus a small segmented queue beats the old 64 KiB/full-window
+// queue metadata path: 23/64/128 KiB medians moved from
+// 11.02/10.94/12.72 us to 7.875/7.208/7.214 us, and per-iteration
+// allocation dropped from 121.4 KB to about 65.76 KB.
+const TCP_RECEIVE_COALESCE_BYTES: usize = 128 * 1024;
+const TCP_RECEIVE_INLINE_SEGMENTS: usize = 4;
+const TCP_RECEIVE_OVERFLOW_INITIAL_SEGMENTS: usize = 64;
 // Throughput beats zero-copy purity here: divan showed a 32 KiB first
-// allocation keeps receive coalescing faster without the 64 KiB burst tax.
+// allocation keeps receive coalescing faster without the old 64 KiB burst tax.
 const TCP_RECEIVE_PREALLOC_BYTES: usize = 32 * 1024;
 const TCP_RECEIVE_BYTES: usize = MAX_TCP_RECEIVE_SEGMENTS * TCP_RECEIVE_SEGMENT_BYTES;
 const TCP_RECEIVE_BACKPRESSURE_BYTES: usize =
@@ -196,38 +204,111 @@ impl TcpInFlightQueue {
 
 #[derive(Clone, Debug)]
 struct TcpReceiveQueue {
-    segments: Box<Deque<BytesMut, MAX_TCP_RECEIVE_SEGMENTS>>,
+    inline: Box<Deque<BytesMut, TCP_RECEIVE_INLINE_SEGMENTS>>,
+    overflow: Option<VecDeque<BytesMut>>,
+    len: usize,
 }
 
 impl TcpReceiveQueue {
     fn new() -> Self {
         Self {
-            segments: Box::new(Deque::new()),
+            inline: Box::new(Deque::new()),
+            overflow: None,
+            len: 0,
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.segments.is_empty()
+        self.len == 0
     }
 
     fn is_full(&self) -> bool {
-        self.segments.is_full()
+        self.len >= MAX_TCP_RECEIVE_SEGMENTS
     }
 
     fn back_mut(&mut self) -> Option<&mut BytesMut> {
-        self.segments.back_mut()
+        if let Some(back) = self.overflow.as_mut().and_then(VecDeque::back_mut) {
+            return Some(back);
+        }
+        self.inline.back_mut()
     }
 
     fn push_back(&mut self, bytes: BytesMut) -> Result<(), BytesMut> {
-        self.segments.push_back(bytes)
+        if self.is_full() {
+            return Err(bytes);
+        }
+        if let Some(overflow) = self.overflow.as_mut() {
+            overflow.push_back(bytes);
+            self.len += 1;
+            return Ok(());
+        }
+        match self.inline.push_back(bytes) {
+            Ok(()) => {
+                self.len += 1;
+                Ok(())
+            }
+            Err(bytes) => {
+                let mut overflow = VecDeque::with_capacity(TCP_RECEIVE_OVERFLOW_INITIAL_SEGMENTS);
+                overflow.push_back(bytes);
+                self.overflow = Some(overflow);
+                self.len += 1;
+                Ok(())
+            }
+        }
     }
 
     fn push_front(&mut self, bytes: BytesMut) -> Result<(), BytesMut> {
-        self.segments.push_front(bytes)
+        if self.is_full() {
+            return Err(bytes);
+        }
+        match self.inline.push_front(bytes) {
+            Ok(()) => {
+                self.len += 1;
+                Ok(())
+            }
+            Err(bytes) => {
+                let moved = self
+                    .inline
+                    .pop_back()
+                    .expect("full TCP receive inline queue had no tail segment");
+                let overflow = self.overflow.get_or_insert_with(|| {
+                    VecDeque::with_capacity(TCP_RECEIVE_OVERFLOW_INITIAL_SEGMENTS)
+                });
+                overflow.push_front(moved);
+                self.inline.push_front(bytes).unwrap_or_else(|_| {
+                    panic!("TCP receive inline queue stayed full after moving tail to overflow")
+                });
+                self.len += 1;
+                Ok(())
+            }
+        }
     }
 
     fn pop_front(&mut self) -> Option<BytesMut> {
-        self.segments.pop_front()
+        if let Some(bytes) = self.inline.pop_front() {
+            self.len -= 1;
+            return Some(bytes);
+        }
+        let overflow = self.overflow.as_mut()?;
+        let bytes = overflow.pop_front();
+        if bytes.is_some() {
+            self.len -= 1;
+        }
+        if overflow.is_empty() {
+            self.overflow = None;
+        }
+        bytes
+    }
+}
+
+#[cfg(test)]
+impl TcpReceiveQueue {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn overflow_len(&self) -> usize {
+        self.overflow.as_ref().map_or(0, VecDeque::len)
     }
 }
 
@@ -2528,6 +2609,47 @@ mod tests {
     }
 
     #[test]
+    fn receive_queue_spills_without_reordering_segments() {
+        let mut queue = TcpReceiveQueue::new();
+        for value in 0..(TCP_RECEIVE_INLINE_SEGMENTS + 4) {
+            queue
+                .push_back(BytesMut::from([value as u8].as_slice()))
+                .expect("receive queue should accept test segment");
+        }
+
+        assert_eq!(queue.len(), TCP_RECEIVE_INLINE_SEGMENTS + 4);
+        assert_eq!(queue.overflow_len(), 4);
+        for value in 0..(TCP_RECEIVE_INLINE_SEGMENTS + 4) {
+            let bytes = queue
+                .pop_front()
+                .expect("receive queue should preserve queued segment");
+            assert_eq!(bytes.as_ref(), &[value as u8]);
+        }
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn receive_queue_push_front_preserves_overflow_order() {
+        let mut queue = TcpReceiveQueue::new();
+        for value in 1..=(TCP_RECEIVE_INLINE_SEGMENTS + 2) {
+            queue
+                .push_back(BytesMut::from([value as u8].as_slice()))
+                .expect("receive queue should accept test segment");
+        }
+        queue
+            .push_front(BytesMut::from([0].as_slice()))
+            .expect("receive queue should accept split head segment");
+
+        for value in 0..=(TCP_RECEIVE_INLINE_SEGMENTS + 2) {
+            let bytes = queue
+                .pop_front()
+                .expect("receive queue should preserve front insertion order");
+            assert_eq!(bytes.as_ref(), &[value as u8]);
+        }
+        assert!(queue.is_empty());
+    }
+
+    #[test]
     fn out_of_order_receive_payload_reassembles_after_gap_arrives() {
         let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
         socket.mark_syn_queued(0);
@@ -2667,7 +2789,6 @@ mod tests {
                 .receive_queue
                 .as_ref()
                 .expect("receive queue must be allocated")
-                .segments
                 .len(),
             1
         );
@@ -2691,7 +2812,7 @@ mod tests {
             .receive_queue
             .as_ref()
             .expect("receive queue must remain allocated");
-        assert_eq!(queue.segments.len(), 1);
+        assert_eq!(queue.len(), 1);
         assert_eq!(socket.receive_queued_bytes, 9);
         assert_eq!(
             socket.receive(16, 4).as_deref(),
