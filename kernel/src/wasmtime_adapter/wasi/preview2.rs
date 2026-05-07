@@ -2562,6 +2562,45 @@ fn p2_record_kernel_profile<CpuImpl, HostFs>(
     }
 }
 
+fn p2_record_kernel_profile_events_bytes<CpuImpl, HostFs>(
+    runtime_state: &HostRuntimeState<CpuImpl, HostFs>,
+    cpu: &CpuImpl,
+    phase: &'static str,
+    started_ticks: u64,
+    events: u64,
+    bytes: u64,
+) where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    if runtime_state.profiling_enabled() {
+        let finished_ticks = cpu.now().ticks();
+        let elapsed_ticks = finished_ticks.saturating_sub(started_ticks);
+        runtime_state.record_profile_stack_parts(
+            ProfileScope::Kernel,
+            "kernel;preview2;",
+            phase,
+            elapsed_ticks,
+        );
+        let elapsed_nanos = runtime_state
+            .uptime_nanos(finished_ticks)
+            .saturating_sub(runtime_state.uptime_nanos(started_ticks));
+        runtime_state.record_perf_metric_parts_events_nanos(
+            ProfileScope::Kernel,
+            "kernel;preview2;",
+            phase,
+            events,
+            elapsed_nanos,
+            helios_hal::cpu::HardwarePerfCounterDelta::default(),
+            bytes,
+        );
+    }
+}
+
+fn p2_usize_to_u64(value: usize, label: &'static str) -> u64 {
+    u64::try_from(value).unwrap_or_else(|_| panic!("{label} does not fit into u64"))
+}
+
 fn p2_tcp_stream_pair<CpuImpl, HostFs>(
     store: &mut StoreData<CpuImpl, HostFs>,
     socket_resource: &Resource<TcpSocket>,
@@ -2587,25 +2626,45 @@ where
     let read_runtime_state = store.runtime_state.clone();
     store.spawner().spawn_detached(async move {
         loop {
-            let started = read_cpu.now().ticks();
+            let read_started = read_cpu.now().ticks();
             match read_socket.read(super::FILE_READ_CHUNK_BYTES as u32).await {
                 Ok(Some(bytes)) => {
-                    p2_record_kernel_profile(
+                    let byte_len = p2_usize_to_u64(bytes.len(), "preview2 tcp bridge byte count");
+                    p2_record_kernel_profile_events_bytes(
                         &read_runtime_state,
                         &read_cpu,
-                        "tcp-bridge-read",
-                        started,
+                        "tcp-bridge-read-backend",
+                        read_started,
+                        1,
+                        byte_len,
                     );
+                    let enqueue_started = read_cpu.now().ticks();
                     if network_writer.write(bytes).is_err() {
+                        p2_record_kernel_profile_events_bytes(
+                            &read_runtime_state,
+                            &read_cpu,
+                            "tcp-bridge-read-enqueue-closed",
+                            enqueue_started,
+                            1,
+                            byte_len,
+                        );
                         break;
                     }
+                    p2_record_kernel_profile_events_bytes(
+                        &read_runtime_state,
+                        &read_cpu,
+                        "tcp-bridge-read-enqueue",
+                        enqueue_started,
+                        1,
+                        byte_len,
+                    );
                 }
                 Ok(None) => {
                     p2_record_kernel_profile(
                         &read_runtime_state,
                         &read_cpu,
                         "tcp-bridge-read-eof",
-                        started,
+                        read_started,
                     );
                     break;
                 }
@@ -2614,7 +2673,7 @@ where
                         &read_runtime_state,
                         &read_cpu,
                         "tcp-bridge-read-error",
-                        started,
+                        read_started,
                     );
                     tracing::warn!(
                         target: "helios_kernel::wasi::preview2::tcp",
