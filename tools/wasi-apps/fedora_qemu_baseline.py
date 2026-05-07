@@ -70,7 +70,11 @@ def quickjs_wasm_artifact(repo_root: Path) -> Path:
 def wasm_uses_simd(repo_root: Path, path: Path) -> bool:
     if not path.is_file():
         raise SystemExit(f"cannot inspect missing QuickJS wasm artifact for SIMD: {path}")
-    text = output(["wasm-tools", "print", str(path)], repo_root, timeout=60)
+    text = output(
+        ["wasm-tools", "strip", "--all", "--wat", str(path)],
+        repo_root,
+        timeout=60,
+    )
     simd_tokens = (
         "v128.",
         "i8x16.",
@@ -84,8 +88,11 @@ def wasm_uses_simd(repo_root: Path, path: Path) -> bool:
 
 
 # QuickJS measures interpreter/runtime CPU cost, not vector throughput. Keep the
-# Fedora native build in SIMD lockstep with the Helios wasm artifact, and use the
-# separate simd-lanes workload when the benchmark needs explicit vector evidence.
+# Fedora native build in SIMD lockstep with the Helios wasm artifact: if the
+# stripped wasm code has no SIMD opcodes, the Linux baseline is built with SIMD
+# and GCC auto-vectorization disabled. The separate simd-lanes workload is the
+# explicit vector-capability check, so quickjs-loop cannot accidentally become
+# "Fedora native SIMD vs Helios scalar wasm" evidence.
 def quickjs_native_policy(repo_root: Path) -> dict:
     wasm_path = quickjs_wasm_artifact(repo_root)
     uses_simd = wasm_uses_simd(repo_root, wasm_path)

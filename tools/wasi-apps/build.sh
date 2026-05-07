@@ -52,7 +52,7 @@ trap 'rm -rf "$staging"' EXIT
 
 verify_wasm_uses_simd() {
   local path="$1"
-  if ! wasm-tools print "$path" | grep -E '(^|[[:space:]()])(v128|i8x16|i16x8|i32x4|i64x2|f32x4|f64x2)\.' >/dev/null; then
+  if ! wasm-tools strip --all --wat "$path" | grep -E '(^|[[:space:]()])(v128|i8x16|i16x8|i32x4|i64x2|f32x4|f64x2)\.' >/dev/null; then
     printf 'wasm SIMD instructions missing from %s\n' "$path" >&2
     exit 1
   fi

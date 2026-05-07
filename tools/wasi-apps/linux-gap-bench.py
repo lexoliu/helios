@@ -22,6 +22,7 @@ from fedora_qemu_baseline import (
     DEFAULT_FEDORA_IMAGE_URL,
     DEFAULT_MEMORY,
     DEFAULT_SMP,
+    wasm_uses_simd as fedora_wasm_uses_simd,
     run_fedora_qemu_linux,
 )
 from tcp_throughput_server import DEFAULT_PAYLOAD_BYTES, start_tcp_throughput_server
@@ -677,22 +678,10 @@ def artifact_provenance(manifest: dict, workloads: list[dict]) -> list[dict]:
 
 
 def wasm_uses_simd(path: Path) -> bool:
-    if not path.is_file():
-        raise SystemExit(f"cannot inspect missing wasm artifact for SIMD: {path}")
     try:
-        text = output(["wasm-tools", "print", str(path)])
+        return fedora_wasm_uses_simd(repo_root(), path)
     except subprocess.CalledProcessError as error:
         raise SystemExit(f"failed to inspect wasm artifact for SIMD: {path}") from error
-    simd_tokens = (
-        "v128.",
-        "i8x16.",
-        "i16x8.",
-        "i32x4.",
-        "i64x2.",
-        "f32x4.",
-        "f64x2.",
-    )
-    return any(token in text for token in simd_tokens)
 
 
 def wasm_simd_provenance(manifest: dict, workloads: list[dict]) -> list[dict]:
