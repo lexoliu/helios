@@ -112,7 +112,7 @@ pub use embedded_init::{
 };
 pub use embedded_program::EmbeddedProgram;
 pub use entropy_pool::{EntropyError, EntropyPool};
-pub use executor::{ExecutorRunStats, JoinHandle, LocalJoinHandle, Spawner};
+pub use executor::{Executor, ExecutorRunStats, JoinHandle, LocalJoinHandle, Spawner};
 pub use futex_table::{
     FutexKey, FutexTable, FutexWaitRegistration, GuestAddress, ProcessMemoryIdentity,
 };
@@ -213,7 +213,6 @@ use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 
 use buddy_system_allocator::LockedHeap;
-use executor::Executor;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::watchdog::{NoWatchdog, ProgressCounter, Watchdog};

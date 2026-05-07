@@ -75,6 +75,30 @@ pub struct ExecutorRunStats {
     global_empty_pop_count: usize,
 }
 
+struct ProgressSignal {
+    progress: ProgressCounter,
+    progress_notify: NoWeakArc<Notify>,
+    mode: ProgressMode,
+}
+
+// `async_task` stores the scheduler closure inside every heap-allocated task.
+// Keep global/local schedulers narrow instead of capturing the whole `Spawner`;
+// the executor spawn benchmark tracks this directly as bytes per task.
+struct GlobalScheduler<CpuImpl: Cpu + Clone> {
+    group: NoWeakArc<ExecutorGroup>,
+    cpu: CpuImpl,
+    processor_count: usize,
+    progress: ProgressSignal,
+}
+
+struct LocalScheduler<CpuImpl: Cpu + Clone> {
+    group: NoWeakArc<ExecutorGroup>,
+    cpu: CpuImpl,
+    owner_processor: ProcessorId,
+    local_queue_index: usize,
+    progress: ProgressSignal,
+}
+
 impl ExecutorRunStats {
     pub const fn runnable_count(self) -> usize {
         self.local_runnable_count + self.global_runnable_count
@@ -196,92 +220,6 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         self.progress_notify.clone()
     }
 
-    fn schedule_on_queue(
-        &self,
-        queue: &ReadyQueue,
-        ready_count: &AtomicUsize,
-        runnable: Runnable,
-        progress_mode: ProgressMode,
-        wake: WakeTarget,
-    ) {
-        // The queue itself publishes the `Runnable`; this counter only drives
-        // wake heuristics and underflow asserts, so a full fence just taxes the
-        // executor hot path.
-        let previous_ready = ready_count.fetch_add(1, Ordering::Relaxed);
-        match queue.push(runnable) {
-            Ok(()) => {}
-            Err(PushError::Full(_)) => {
-                rollback_ready_count(ready_count);
-                panic!("executor ready queue capacity {READY_QUEUE_CAPACITY} exhausted")
-            }
-            Err(PushError::Closed(_)) => {
-                rollback_ready_count(ready_count);
-                panic!("executor ready queue was closed unexpectedly")
-            }
-        }
-
-        if progress_mode == ProgressMode::Counted {
-            self.progress.record_progress();
-            self.progress_notify.notify_one_coalesced();
-        }
-
-        match wake {
-            WakeTarget::OneRemoteProcessor => {
-                if should_wake_global_processor(previous_ready, self.processor_count) {
-                    self.wake_one_remote_processor();
-                }
-            }
-            WakeTarget::OwnerProcessor => {
-                if should_wake_owner_processor(previous_ready)
-                    && self.cpu.current_processor() != self.owner_processor
-                {
-                    self.cpu.wake_processor(self.owner_processor);
-                }
-            }
-        }
-    }
-
-    fn schedule_local(&self, runnable: Runnable, progress_mode: ProgressMode) {
-        let queue = &self.group.local_queues[self.local_queue_index];
-        let ready_count = &self.group.local_ready_counts[self.local_queue_index];
-        self.schedule_on_queue(
-            queue,
-            ready_count,
-            runnable,
-            progress_mode,
-            WakeTarget::OwnerProcessor,
-        );
-    }
-
-    fn schedule_global(&self, runnable: Runnable, progress_mode: ProgressMode) {
-        self.schedule_on_queue(
-            &self.group.global_queue,
-            &self.group.global_ready_count,
-            runnable,
-            progress_mode,
-            WakeTarget::OneRemoteProcessor,
-        );
-    }
-
-    fn wake_one_remote_processor(&self) {
-        if self.processor_count <= 1 {
-            return;
-        }
-        let current_processor = self.cpu.current_processor();
-        let start = self
-            .group
-            .global_wake_cursor
-            .fetch_add(1, Ordering::Relaxed);
-        for offset in 0..self.processor_count {
-            let processor = (start + offset) % self.processor_count;
-            let processor = ProcessorId::new(processor as u16);
-            if processor != current_processor {
-                self.cpu.wake_processor(processor);
-                return;
-            }
-        }
-    }
-
     fn spawn_with_progress<Fut>(
         &self,
         future: Fut,
@@ -291,8 +229,8 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         Fut: Future + Send + 'static,
         Fut::Output: Send + 'static,
     {
-        let spawner = self.clone();
-        let schedule = move |runnable| spawner.schedule_global(runnable, progress_mode);
+        let scheduler = self.global_scheduler(progress_mode);
+        let schedule = move |runnable| scheduler.schedule(runnable);
         let (runnable, task) = Builder::new().spawn(move |_| future, schedule);
         runnable.schedule();
         task
@@ -307,8 +245,8 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         Fut: Future + 'static,
         Fut::Output: 'static,
     {
-        let spawner = self.clone();
-        let schedule = move |runnable| spawner.schedule_local(runnable, progress_mode);
+        let scheduler = self.local_scheduler(progress_mode);
+        let schedule = move |runnable| scheduler.schedule(runnable);
 
         // SAFETY: the runnable is always re-enqueued onto the spawning processor's ready
         // queue, and `LocalJoinHandle` is `!Send`, so the task cannot be awaited or
@@ -318,6 +256,33 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         LocalJoinHandle {
             task,
             _not_send_or_sync: PhantomData,
+        }
+    }
+
+    fn progress_signal(&self, mode: ProgressMode) -> ProgressSignal {
+        ProgressSignal {
+            progress: self.progress.clone(),
+            progress_notify: self.progress_notify.clone(),
+            mode,
+        }
+    }
+
+    fn global_scheduler(&self, progress_mode: ProgressMode) -> GlobalScheduler<CpuImpl> {
+        GlobalScheduler {
+            group: self.group.clone(),
+            cpu: self.cpu.clone(),
+            processor_count: self.processor_count,
+            progress: self.progress_signal(progress_mode),
+        }
+    }
+
+    fn local_scheduler(&self, progress_mode: ProgressMode) -> LocalScheduler<CpuImpl> {
+        LocalScheduler {
+            group: self.group.clone(),
+            cpu: self.cpu.clone(),
+            owner_processor: self.owner_processor,
+            local_queue_index: self.local_queue_index,
+            progress: self.progress_signal(progress_mode),
         }
     }
 
@@ -363,10 +328,64 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
     }
 }
 
-#[derive(Clone, Copy)]
-enum WakeTarget {
-    OneRemoteProcessor,
-    OwnerProcessor,
+impl ProgressSignal {
+    #[inline]
+    fn record(&self) {
+        if self.mode == ProgressMode::Counted {
+            self.progress.record_progress();
+            self.progress_notify.notify_one_coalesced();
+        }
+    }
+}
+
+impl<CpuImpl: Cpu + Clone> GlobalScheduler<CpuImpl> {
+    #[inline]
+    fn schedule(&self, runnable: Runnable) {
+        let previous_ready = push_ready(
+            &self.group.global_queue,
+            &self.group.global_ready_count,
+            runnable,
+        );
+        self.progress.record();
+        if should_wake_global_processor(previous_ready, self.processor_count) {
+            self.wake_one_remote_processor();
+        }
+    }
+
+    #[inline]
+    fn wake_one_remote_processor(&self) {
+        if self.processor_count <= 1 {
+            return;
+        }
+        let current_processor = self.cpu.current_processor();
+        let start = self
+            .group
+            .global_wake_cursor
+            .fetch_add(1, Ordering::Relaxed);
+        for offset in 0..self.processor_count {
+            let processor = (start + offset) % self.processor_count;
+            let processor = ProcessorId::new(processor as u16);
+            if processor != current_processor {
+                self.cpu.wake_processor(processor);
+                return;
+            }
+        }
+    }
+}
+
+impl<CpuImpl: Cpu + Clone> LocalScheduler<CpuImpl> {
+    #[inline]
+    fn schedule(&self, runnable: Runnable) {
+        let queue = &self.group.local_queues[self.local_queue_index];
+        let ready_count = &self.group.local_ready_counts[self.local_queue_index];
+        let previous_ready = push_ready(queue, ready_count, runnable);
+        self.progress.record();
+        if should_wake_owner_processor(previous_ready)
+            && self.cpu.current_processor() != self.owner_processor
+        {
+            self.cpu.wake_processor(self.owner_processor);
+        }
+    }
 }
 
 fn executor_group(configured_processors: usize) -> NoWeakArc<ExecutorGroup> {
@@ -395,6 +414,25 @@ fn executor_group(configured_processors: usize) -> NoWeakArc<ExecutorGroup> {
 
 fn ready_queue() -> ReadyQueue {
     ConcurrentQueue::bounded(READY_QUEUE_CAPACITY)
+}
+
+#[inline]
+fn push_ready(queue: &ReadyQueue, ready_count: &AtomicUsize, runnable: Runnable) -> usize {
+    // The queue itself publishes the `Runnable`; this counter only drives
+    // wake heuristics and underflow asserts, so a full fence just taxes the
+    // executor hot path.
+    let previous_ready = ready_count.fetch_add(1, Ordering::Relaxed);
+    match queue.push(runnable) {
+        Ok(()) => previous_ready,
+        Err(PushError::Full(_)) => {
+            rollback_ready_count(ready_count);
+            panic!("executor ready queue capacity {READY_QUEUE_CAPACITY} exhausted")
+        }
+        Err(PushError::Closed(_)) => {
+            rollback_ready_count(ready_count);
+            panic!("executor ready queue was closed unexpectedly")
+        }
+    }
 }
 
 fn pop_ready(queue: &ReadyQueue, ready_count: &AtomicUsize) -> Result<Runnable, PopError> {

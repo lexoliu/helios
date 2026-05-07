@@ -6,10 +6,11 @@ use divan::{AllocProfiler, Bencher, black_box};
 use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId};
 use helios_hal::fs::FileRights;
 use helios_hal::resource::KernelResource;
+use helios_hal::watchdog::ProgressCounter;
 use helios_kernel::{
     ComponentHostNetworkService, ComponentNetworkService, DescriptorId, DescriptorTable, DnsError,
-    DnsErrorKind, FutexKey, FutexTable, GuestAddress, Ipv4Address, Ipv4Cidr, Ipv4Route, MacAddress,
-    NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
+    DnsErrorKind, Executor, FutexKey, FutexTable, GuestAddress, Ipv4Address, Ipv4Cidr, Ipv4Route,
+    MacAddress, NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
     NetworkIpAddress, NetworkPortId, PingError, PingErrorKind, PingReply, ProcessMemoryIdentity,
     TcpAccepted, TcpError, TcpErrorKind, TcpListener, Timer, TryRead, UdpBinding, UdpDatagram,
     UdpError, UdpErrorKind, byte_channel,
@@ -172,6 +173,41 @@ fn timer_sleep_future_create_drop(bencher: Bencher, count: usize) {
         for _ in 0..count {
             black_box(timer.sleep_for(core::time::Duration::from_micros(500)));
         }
+    });
+}
+
+#[divan::bench(args = [1usize, 64, 1024])]
+fn executor_spawn_detached_run_global(bencher: Bencher, count: usize) {
+    let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
+    let spawner = executor.spawner(BenchCpu);
+    // Task allocation includes the scheduler capture stored by async-task. This
+    // benchmark keeps the per-task byte count visible while we move toward a
+    // pooled task/waker design; the current specialized scheduler path is 73 B
+    // per global no-op task on this host.
+    bencher.counter(ItemsCount::new(count)).bench_local(|| {
+        for _ in 0..count {
+            spawner.spawn_detached(async {});
+        }
+        let stats = executor.run_until_stalled_with_stats();
+        assert_eq!(stats.global_runnable_count(), count);
+        assert_eq!(stats.local_runnable_count(), 0);
+    });
+}
+
+#[divan::bench(args = [1usize, 64, 1024])]
+fn executor_spawn_detached_run_local(bencher: Bencher, count: usize) {
+    let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
+    let spawner = executor.spawner(BenchCpu);
+    // Local tasks still carry owner-processor routing state, so the scheduler
+    // capture is slightly larger than the global path: 81 B per no-op task on
+    // this host after removing the unused global wake fields.
+    bencher.counter(ItemsCount::new(count)).bench_local(|| {
+        for _ in 0..count {
+            spawner.spawn_local_detached(async {});
+        }
+        let stats = executor.run_until_stalled_with_stats();
+        assert_eq!(stats.local_runnable_count(), count);
+        assert_eq!(stats.global_runnable_count(), 0);
     });
 }
 
