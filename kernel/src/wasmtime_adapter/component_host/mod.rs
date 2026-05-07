@@ -826,7 +826,7 @@ impl_program_bindings!(
 mod lowering_tests {
     use alloc::vec::Vec;
 
-    use bytes::Bytes;
+    use bytes::{Bytes, BytesMut};
 
     use super::lower_bytes_to_vec;
 
@@ -835,6 +835,19 @@ mod lowering_tests {
         let source = Vec::from([1_u8, 2, 3, 4]);
         let source_ptr = source.as_ptr();
         let bytes = Bytes::from(source);
+
+        let lowered = lower_bytes_to_vec(bytes);
+
+        assert_eq!(lowered.as_slice(), [1, 2, 3, 4]);
+        assert_eq!(lowered.as_ptr(), source_ptr);
+    }
+
+    #[test]
+    fn frozen_bytes_mut_lowering_reuses_unique_vec_buffer() {
+        let mut source = BytesMut::with_capacity(4096);
+        source.extend_from_slice(&[1_u8, 2, 3, 4]);
+        let source_ptr = source.as_ptr();
+        let bytes = source.freeze();
 
         let lowered = lower_bytes_to_vec(bytes);
 
