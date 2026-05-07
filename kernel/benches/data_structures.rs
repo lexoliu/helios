@@ -1,5 +1,7 @@
 extern crate alloc;
 
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use bytes::Bytes;
 use divan::counter::ItemsCount;
 use divan::{AllocProfiler, Bencher, black_box};
@@ -86,6 +88,89 @@ fn descriptor_sparse_renumber_reuse(bencher: Bencher) {
 #[divan::bench]
 fn descriptor_sparse_renumber_reuse_preallocated(bencher: Bencher) {
     descriptor_sparse_renumber_reuse_with_table(bencher, || DescriptorTable::with_capacity(256));
+}
+
+#[divan::bench(args = [1usize, 64, 1024])]
+fn component_fs_resolve_child_path(bencher: Bencher, count: usize) {
+    // WASI filesystem operations resolve descriptor-relative paths on most
+    // calls. The production resolver now writes the normalized output in one
+    // pass; keep this benchmark next to the old segment-Vec shape so allocation
+    // regressions are visible instead of hidden inside full FS workloads.
+    bencher.counter(ItemsCount::new(count)).bench_local(|| {
+        for _ in 0..count {
+            black_box(
+                helios_kernel::resolve_child_path(
+                    "/sandbox/usr/local/share",
+                    "python/./lib/site-packages/module.py",
+                )
+                .expect("component fs path benchmark should resolve inside the base"),
+            );
+        }
+    });
+}
+
+#[divan::bench(args = [1usize, 64, 1024])]
+fn component_fs_resolve_child_path_segment_vec_baseline(bencher: Bencher, count: usize) {
+    bencher.counter(ItemsCount::new(count)).bench_local(|| {
+        for _ in 0..count {
+            black_box(
+                resolve_child_path_segment_vec_baseline(
+                    "/sandbox/usr/local/share",
+                    "python/./lib/site-packages/module.py",
+                )
+                .expect("component fs path baseline should resolve inside the base"),
+            );
+        }
+    });
+}
+
+fn resolve_child_path_segment_vec_baseline(base: &str, child: &str) -> Result<String, ()> {
+    if child.starts_with('/') {
+        return Err(());
+    }
+
+    let mut segments = split_absolute_path_segment_vec_baseline(base)?;
+    for segment in child.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." {
+            return Err(());
+        }
+        segments.push(segment.to_string());
+    }
+    Ok(build_absolute_path_segment_vec_baseline(&segments))
+}
+
+fn split_absolute_path_segment_vec_baseline(path: &str) -> Result<Vec<String>, ()> {
+    if !path.starts_with('/') {
+        return Err(());
+    }
+
+    let mut segments = Vec::new();
+    for segment in path.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." {
+            return Err(());
+        }
+        segments.push(segment.to_string());
+    }
+    Ok(segments)
+}
+
+fn build_absolute_path_segment_vec_baseline(segments: &[String]) -> String {
+    if segments.is_empty() {
+        return String::from("/");
+    }
+
+    let mut path = String::new();
+    for segment in segments {
+        path.push('/');
+        path.push_str(segment);
+    }
+    path
 }
 
 fn descriptor_sparse_renumber_reuse_with_table(
