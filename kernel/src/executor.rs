@@ -192,7 +192,10 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         progress_mode: ProgressMode,
         wake: WakeTarget,
     ) {
-        let previous_ready = ready_count.fetch_add(1, Ordering::AcqRel);
+        // The queue itself publishes the `Runnable`; this counter only drives
+        // wake heuristics and underflow asserts, so a full fence just taxes the
+        // executor hot path.
+        let previous_ready = ready_count.fetch_add(1, Ordering::Relaxed);
         match queue.push(runnable) {
             Ok(()) => {}
             Err(PushError::Full(_)) => {
@@ -384,13 +387,13 @@ fn ready_queue() -> ReadyQueue {
 
 fn pop_ready(queue: &ReadyQueue, ready_count: &AtomicUsize) -> Result<Runnable, PopError> {
     let runnable = queue.pop()?;
-    let previous = ready_count.fetch_sub(1, Ordering::AcqRel);
+    let previous = ready_count.fetch_sub(1, Ordering::Relaxed);
     assert!(previous != 0, "executor ready count underflowed");
     Ok(runnable)
 }
 
 fn rollback_ready_count(ready_count: &AtomicUsize) {
-    let previous = ready_count.fetch_sub(1, Ordering::AcqRel);
+    let previous = ready_count.fetch_sub(1, Ordering::Relaxed);
     assert!(
         previous != 0,
         "executor ready count underflowed while rolling back failed enqueue"
