@@ -144,18 +144,30 @@ impl Executor {
         let local_ready_count = &self.group.local_ready_counts[self.local_queue_index];
 
         while stats.runnable_count() < READY_BATCH_TASKS {
-            let (runnable, source) = match pop_ready(local_queue, local_ready_count) {
-                Ok(runnable) => (runnable, ReadySource::Local),
-                Err(PopError::Empty | PopError::Closed) => {
-                    stats.local_empty_pop_count += 1;
-                    match pop_ready(&self.group.global_queue, &self.group.global_ready_count) {
-                        Ok(runnable) => (runnable, ReadySource::Global),
-                        Err(PopError::Empty | PopError::Closed) => {
-                            stats.global_empty_pop_count += 1;
-                            return stats;
-                        }
-                    }
-                }
+            let (first, second) = if local_ready_count.load(Ordering::Relaxed) != 0 {
+                (ReadySource::Local, ReadySource::Global)
+            } else {
+                (ReadySource::Global, ReadySource::Local)
+            };
+            let Some((runnable, source)) = pop_ready_source(
+                first,
+                local_queue,
+                local_ready_count,
+                &self.group.global_queue,
+                &self.group.global_ready_count,
+                &mut stats,
+            )
+            .or_else(|| {
+                pop_ready_source(
+                    second,
+                    local_queue,
+                    local_ready_count,
+                    &self.group.global_queue,
+                    &self.group.global_ready_count,
+                    &mut stats,
+                )
+            }) else {
+                return stats;
             };
 
             runnable.run();
@@ -392,6 +404,30 @@ fn pop_ready(queue: &ReadyQueue, ready_count: &AtomicUsize) -> Result<Runnable, 
     Ok(runnable)
 }
 
+fn pop_ready_source(
+    source: ReadySource,
+    local_queue: &ReadyQueue,
+    local_ready_count: &AtomicUsize,
+    global_queue: &ReadyQueue,
+    global_ready_count: &AtomicUsize,
+    stats: &mut ExecutorRunStats,
+) -> Option<(Runnable, ReadySource)> {
+    let (queue, ready_count) = match source {
+        ReadySource::Local => (local_queue, local_ready_count),
+        ReadySource::Global => (global_queue, global_ready_count),
+    };
+    match pop_ready(queue, ready_count) {
+        Ok(runnable) => Some((runnable, source)),
+        Err(PopError::Empty | PopError::Closed) => {
+            match source {
+                ReadySource::Local => stats.local_empty_pop_count += 1,
+                ReadySource::Global => stats.global_empty_pop_count += 1,
+            }
+            None
+        }
+    }
+}
+
 fn rollback_ready_count(ready_count: &AtomicUsize) {
     let previous = ready_count.fetch_sub(1, Ordering::Relaxed);
     assert!(
@@ -429,9 +465,64 @@ impl<T> Future for LocalJoinHandle<T> {
 #[cfg(test)]
 mod tests {
     use super::{
-        READY_QUEUE_CAPACITY, ready_queue, should_wake_global_processor,
+        Executor, READY_QUEUE_CAPACITY, ready_queue, should_wake_global_processor,
         should_wake_owner_processor,
     };
+    use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId};
+    use helios_hal::watchdog::ProgressCounter;
+
+    #[derive(Clone)]
+    struct TestCpu;
+
+    impl Cpu for TestCpu {
+        fn current_processor(&self) -> ProcessorId {
+            ProcessorId::new(0)
+        }
+
+        fn processor_count(&self) -> usize {
+            1
+        }
+
+        fn bootstrap_processor(&self) -> ProcessorId {
+            ProcessorId::new(0)
+        }
+
+        fn park_current(&self) {}
+
+        fn start_processor(&self, _processor: ProcessorId) {}
+
+        fn wake_processor(&self, _processor: ProcessorId) {}
+
+        fn now(&self) -> Instant {
+            Instant::new(0)
+        }
+
+        fn timer_frequency(&self) -> u64 {
+            1_000_000_000
+        }
+
+        fn hardware_perf_counters(&self) -> HardwarePerfCounters {
+            HardwarePerfCounters::default()
+        }
+
+        fn set_deadline(&self, _deadline: Instant) {}
+
+        fn publish_executable(&self, _ptr: *const u8, _len: usize) {}
+
+        fn unpublish_executable(&self, _ptr: *const u8, _len: usize) {}
+
+        fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {
+            None
+        }
+
+        fn shutdown(&self) -> ! {
+            panic!("test CPU cannot shut down")
+        }
+
+        fn reboot(&self) -> ! {
+            panic!("test CPU cannot reboot")
+        }
+    }
 
     #[test]
     fn global_wake_scales_to_processor_count_not_enqueue_count() {
@@ -452,5 +543,21 @@ mod tests {
         let queue = ready_queue();
 
         assert_eq!(queue.capacity(), Some(READY_QUEUE_CAPACITY));
+    }
+
+    #[test]
+    fn global_batch_does_not_probe_empty_local_queue_per_task() {
+        let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
+        let spawner = executor.spawner(TestCpu);
+        for _ in 0..8 {
+            spawner.spawn_detached(async {});
+        }
+
+        let stats = executor.run_until_stalled_with_stats();
+
+        assert_eq!(stats.global_runnable_count(), 8);
+        assert_eq!(stats.local_runnable_count(), 0);
+        assert_eq!(stats.global_empty_pop_count(), 1);
+        assert_eq!(stats.local_empty_pop_count(), 1);
     }
 }
