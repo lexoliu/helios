@@ -67,6 +67,29 @@ impl ComponentOutputRoute {
             Self::Discard => {}
         }
     }
+
+    pub(crate) fn write_bytes<CpuImpl, RuntimeStateImpl>(
+        &self,
+        cpu: &CpuImpl,
+        runtime_state: &RuntimeStateImpl,
+        serial_writer: fn(&[u8]),
+        bytes: Bytes,
+    ) where
+        CpuImpl: Cpu + Clone,
+        RuntimeStateImpl: ComponentRuntimeState,
+    {
+        if bytes.is_empty() {
+            return;
+        }
+        match self {
+            Self::Child(writer) => {
+                let _: Result<(), ClosedPeer> = writer.write(bytes);
+            }
+            Self::Serial | Self::Trace | Self::Discard => {
+                self.write(cpu, runtime_state, serial_writer, &bytes);
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -424,6 +447,37 @@ where
                     ComponentOutputStreamKind::Stderr => stderr,
                 };
                 route.write(&self.cpu, &self.runtime_state, self.serial_writer, bytes);
+            }
+        }
+    }
+
+    /// Deliver an owned stdout/stderr chunk. Child-pipe routes keep the `Bytes`
+    /// allocation instead of copying into a second channel buffer.
+    pub fn write_output_bytes(&self, stream: ComponentOutputStreamKind, bytes: Bytes) {
+        if bytes.is_empty() {
+            return;
+        }
+        match &self.execution_context.output_mode {
+            ComponentOutputMode::Child {
+                stdout_tx,
+                stderr_tx,
+                ..
+            } => {
+                let writer = match stream {
+                    ComponentOutputStreamKind::Stdout => stdout_tx,
+                    ComponentOutputStreamKind::Stderr => stderr_tx,
+                };
+                let _: Result<(), ClosedPeer> = writer.write(bytes);
+            }
+            ComponentOutputMode::RoutedChild { stdout, stderr, .. } => {
+                let route = match stream {
+                    ComponentOutputStreamKind::Stdout => stdout,
+                    ComponentOutputStreamKind::Stderr => stderr,
+                };
+                route.write_bytes(&self.cpu, &self.runtime_state, self.serial_writer, bytes);
+            }
+            ComponentOutputMode::Serial | ComponentOutputMode::Trace => {
+                self.write_output(stream, &bytes);
             }
         }
     }

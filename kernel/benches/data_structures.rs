@@ -138,6 +138,52 @@ fn byte_channel_create_drop(bencher: Bencher) {
     });
 }
 
+#[divan::bench(args = [1usize, 64, 256])]
+fn byte_channel_write_owned_vec_chunk(bencher: Bencher, count: usize) {
+    // Models WASI stdout/stderr after the stream consumer has already filled a
+    // Vec from guest memory. Passing ownership to `Bytes` avoids the old second
+    // channel copy: 256 x 4 KiB chunks measured 258 allocs / 1.057 MB instead
+    // of the copied path's 514 allocs / 2.105 MB on this host.
+    bencher.counter(ItemsCount::new(count)).bench_local(|| {
+        let (writer, reader) = byte_channel();
+        for _ in 0..count {
+            let bytes = alloc::vec![7; 4096];
+            writer
+                .write(Bytes::from(bytes))
+                .expect("reader is alive during owned byte channel benchmark");
+        }
+        drain_byte_channel(reader, count);
+    });
+}
+
+#[divan::bench(args = [1usize, 64, 256])]
+fn byte_channel_write_copied_vec_chunk(bencher: Bencher, count: usize) {
+    // Retained as the regression baseline for `ComponentStoreData::write_output`
+    // callers that only have a borrowed slice and must create owned pipe data.
+    bencher.counter(ItemsCount::new(count)).bench_local(|| {
+        let (writer, reader) = byte_channel();
+        for _ in 0..count {
+            let bytes = alloc::vec![7; 4096];
+            writer
+                .write(Bytes::copy_from_slice(&bytes))
+                .expect("reader is alive during copied byte channel benchmark");
+        }
+        drain_byte_channel(reader, count);
+    });
+}
+
+fn drain_byte_channel(reader: helios_kernel::ByteReader, count: usize) {
+    for _ in 0..count {
+        match reader.try_read() {
+            TryRead::Ready(bytes) => {
+                black_box(bytes);
+            }
+            TryRead::Pending => panic!("byte channel benchmark lost queued bytes"),
+            TryRead::Eof => panic!("byte channel benchmark reached EOF before draining bytes"),
+        }
+    }
+}
+
 #[divan::bench(args = [1usize, 16, 64])]
 fn futex_prepare_complete_distinct_keys(bencher: Bencher, count: usize) {
     let memory = ProcessMemoryIdentity::new(1);

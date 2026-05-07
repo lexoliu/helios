@@ -1798,7 +1798,7 @@ where
         source.read(&mut store, &mut bytes)?;
         let consumer = self.as_ref().get_ref();
         let getter = consumer.getter;
-        getter(store.data_mut()).write_output(consumer.stream, &bytes);
+        getter(store.data_mut()).write_output_bytes(consumer.stream, Bytes::from(bytes));
         Poll::Ready(Ok(StreamResult::Completed))
     }
 }
