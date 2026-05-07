@@ -99,6 +99,13 @@ struct LocalScheduler<CpuImpl: Cpu + Clone> {
     progress: ProgressSignal,
 }
 
+struct LocalSilentScheduler<CpuImpl: Cpu + Clone> {
+    group: NoWeakArc<ExecutorGroup>,
+    cpu: CpuImpl,
+    owner_processor: ProcessorId,
+    local_queue_index: usize,
+}
+
 impl ExecutorRunStats {
     pub const fn runnable_count(self) -> usize {
         self.local_runnable_count + self.global_runnable_count
@@ -245,6 +252,22 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         Fut: Future + 'static,
         Fut::Output: 'static,
     {
+        if progress_mode == ProgressMode::Silent {
+            let scheduler = self.local_silent_scheduler();
+            let schedule = move |runnable| scheduler.schedule(runnable);
+
+            // SAFETY: the runnable is always re-enqueued onto the spawning processor's ready
+            // queue, and `LocalJoinHandle` is `!Send`, so the task cannot be awaited or
+            // dropped from a different processor through safe Rust.
+            let (runnable, task) =
+                unsafe { Builder::new().spawn_unchecked(move |_| future, schedule) };
+            runnable.schedule();
+            return LocalJoinHandle {
+                task,
+                _not_send_or_sync: PhantomData,
+            };
+        }
+
         let scheduler = self.local_scheduler(progress_mode);
         let schedule = move |runnable| scheduler.schedule(runnable);
 
@@ -283,6 +306,15 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
             owner_processor: self.owner_processor,
             local_queue_index: self.local_queue_index,
             progress: self.progress_signal(progress_mode),
+        }
+    }
+
+    fn local_silent_scheduler(&self) -> LocalSilentScheduler<CpuImpl> {
+        LocalSilentScheduler {
+            group: self.group.clone(),
+            cpu: self.cpu.clone(),
+            owner_processor: self.owner_processor,
+            local_queue_index: self.local_queue_index,
         }
     }
 
@@ -380,6 +412,20 @@ impl<CpuImpl: Cpu + Clone> LocalScheduler<CpuImpl> {
         let ready_count = &self.group.local_ready_counts[self.local_queue_index];
         let previous_ready = push_ready(queue, ready_count, runnable);
         self.progress.record();
+        if should_wake_owner_processor(previous_ready)
+            && self.cpu.current_processor() != self.owner_processor
+        {
+            self.cpu.wake_processor(self.owner_processor);
+        }
+    }
+}
+
+impl<CpuImpl: Cpu + Clone> LocalSilentScheduler<CpuImpl> {
+    #[inline]
+    fn schedule(&self, runnable: Runnable) {
+        let queue = &self.group.local_queues[self.local_queue_index];
+        let ready_count = &self.group.local_ready_counts[self.local_queue_index];
+        let previous_ready = push_ready(queue, ready_count, runnable);
         if should_wake_owner_processor(previous_ready)
             && self.cpu.current_processor() != self.owner_processor
         {
@@ -502,9 +548,11 @@ impl<T> Future for LocalJoinHandle<T> {
 
 #[cfg(test)]
 mod tests {
+    use core::mem::size_of;
+
     use super::{
-        Executor, READY_QUEUE_CAPACITY, ready_queue, should_wake_global_processor,
-        should_wake_owner_processor,
+        Executor, GlobalScheduler, LocalScheduler, LocalSilentScheduler, READY_QUEUE_CAPACITY,
+        Spawner, ready_queue, should_wake_global_processor, should_wake_owner_processor,
     };
     use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId};
     use helios_hal::watchdog::ProgressCounter;
@@ -581,6 +629,14 @@ mod tests {
         let queue = ready_queue();
 
         assert_eq!(queue.capacity(), Some(READY_QUEUE_CAPACITY));
+    }
+
+    #[test]
+    fn scheduler_captures_are_narrower_than_spawner() {
+        assert!(size_of::<GlobalScheduler<TestCpu>>() < size_of::<Spawner<TestCpu>>());
+        assert!(size_of::<LocalScheduler<TestCpu>>() <= size_of::<Spawner<TestCpu>>());
+        assert!(size_of::<LocalSilentScheduler<TestCpu>>() < size_of::<Spawner<TestCpu>>());
+        assert!(size_of::<LocalSilentScheduler<TestCpu>>() < size_of::<LocalScheduler<TestCpu>>());
     }
 
     #[test]
