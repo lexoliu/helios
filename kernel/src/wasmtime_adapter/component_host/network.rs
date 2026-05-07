@@ -577,7 +577,7 @@ where
     }
 
     fn ipv4_cidr(&self) -> Pin<Box<dyn Future<Output = Option<crate::Ipv4Cidr>> + Send + '_>> {
-        Box::pin(async move { self.service.ipv4_cidr().await })
+        Box::pin(self.service.ipv4_cidr())
     }
 
     fn ping<'a>(
@@ -585,7 +585,7 @@ where
         host: &'a str,
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<PingReply, PingError>> + Send + 'a>> {
-        Box::pin(async move { self.service.ping(host, timeout_nanos).await })
+        Box::pin(self.service.ping(host, timeout_nanos))
     }
 
     fn dns_resolve<'a>(
@@ -593,7 +593,7 @@ where
         host: &'a str,
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Ipv4Address>, DnsError>> + Send + 'a>> {
-        Box::pin(async move { self.service.dns_resolve(host, timeout_nanos).await })
+        Box::pin(self.service.dns_resolve(host, timeout_nanos))
     }
 
     fn tcp_connect<'a>(
@@ -685,15 +685,11 @@ where
         bytes: &'a [u8],
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<(), TcpError>> + Send + 'a>> {
-        Box::pin(async move {
-            self.service
-                .tcp_write_all(
-                    <Service::TcpStream as ComponentHostTcpStreamToken>::from_raw(stream),
-                    bytes,
-                    timeout_nanos,
-                )
-                .await
-        })
+        Box::pin(self.service.tcp_write_all(
+            <Service::TcpStream as ComponentHostTcpStreamToken>::from_raw(stream),
+            bytes,
+            timeout_nanos,
+        ))
     }
 
     fn tcp_write_all_bytes<'a>(
@@ -702,15 +698,11 @@ where
         bytes: Bytes,
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<(), TcpError>> + Send + 'a>> {
-        Box::pin(async move {
-            self.service
-                .tcp_write_all_bytes(
-                    <Service::TcpStream as ComponentHostTcpStreamToken>::from_raw(stream),
-                    bytes,
-                    timeout_nanos,
-                )
-                .await
-        })
+        Box::pin(self.service.tcp_write_all_bytes(
+            <Service::TcpStream as ComponentHostTcpStreamToken>::from_raw(stream),
+            bytes,
+            timeout_nanos,
+        ))
     }
 
     fn tcp_read<'a>(
@@ -719,36 +711,27 @@ where
         max_bytes: u32,
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, TcpError>> + Send + 'a>> {
-        Box::pin(async move {
-            self.service
-                .tcp_read(
-                    <Service::TcpStream as ComponentHostTcpStreamToken>::from_raw(stream),
-                    max_bytes,
-                    timeout_nanos,
-                )
-                .await
-        })
+        Box::pin(self.service.tcp_read(
+            <Service::TcpStream as ComponentHostTcpStreamToken>::from_raw(stream),
+            max_bytes,
+            timeout_nanos,
+        ))
     }
 
     fn tcp_shutdown_send<'a>(
         &'a self,
         stream: u64,
     ) -> Pin<Box<dyn Future<Output = Result<(), TcpError>> + Send + 'a>> {
-        Box::pin(async move {
-            self.service
-                .tcp_shutdown_send(
-                    <Service::TcpStream as ComponentHostTcpStreamToken>::from_raw(stream),
-                )
-                .await
-        })
+        Box::pin(self.service.tcp_shutdown_send(
+            <Service::TcpStream as ComponentHostTcpStreamToken>::from_raw(stream),
+        ))
     }
 
     fn tcp_close<'a>(&'a self, stream: u64) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(async move {
+        Box::pin(
             self.service
-                .tcp_close(<Service::TcpStream as ComponentHostTcpStreamToken>::from_raw(stream))
-                .await
-        })
+                .tcp_close(<Service::TcpStream as ComponentHostTcpStreamToken>::from_raw(stream)),
+        )
     }
 
     fn udp_bind<'a>(
@@ -772,17 +755,13 @@ where
         bytes: &'a [u8],
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<u64, UdpError>> + Send + 'a>> {
-        Box::pin(async move {
-            self.service
-                .udp_send(
-                    <Service::UdpSocket as ComponentHostUdpSocketToken>::from_raw(socket),
-                    host,
-                    port,
-                    bytes,
-                    timeout_nanos,
-                )
-                .await
-        })
+        Box::pin(self.service.udp_send(
+            <Service::UdpSocket as ComponentHostUdpSocketToken>::from_raw(socket),
+            host,
+            port,
+            bytes,
+            timeout_nanos,
+        ))
     }
 
     fn udp_send_address<'a>(
@@ -793,17 +772,13 @@ where
         bytes: &'a [u8],
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<u64, UdpError>> + Send + 'a>> {
-        Box::pin(async move {
-            self.service
-                .udp_send_address(
-                    <Service::UdpSocket as ComponentHostUdpSocketToken>::from_raw(socket),
-                    remote_address,
-                    port,
-                    bytes,
-                    timeout_nanos,
-                )
-                .await
-        })
+        Box::pin(self.service.udp_send_address(
+            <Service::UdpSocket as ComponentHostUdpSocketToken>::from_raw(socket),
+            remote_address,
+            port,
+            bytes,
+            timeout_nanos,
+        ))
     }
 
     fn udp_receive<'a>(
@@ -812,15 +787,11 @@ where
         max_bytes: u32,
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<Option<UdpDatagram>, UdpError>> + Send + 'a>> {
-        Box::pin(async move {
-            self.service
-                .udp_receive(
-                    <Service::UdpSocket as ComponentHostUdpSocketToken>::from_raw(socket),
-                    max_bytes,
-                    timeout_nanos,
-                )
-                .await
-        })
+        Box::pin(self.service.udp_receive(
+            <Service::UdpSocket as ComponentHostUdpSocketToken>::from_raw(socket),
+            max_bytes,
+            timeout_nanos,
+        ))
     }
 
     fn udp_join_multicast_v4<'a>(
@@ -828,7 +799,7 @@ where
         group: Ipv4Address,
         interface: Ipv4Address,
     ) -> Pin<Box<dyn Future<Output = Result<(), UdpError>> + Send + 'a>> {
-        Box::pin(async move { self.service.udp_join_multicast_v4(group, interface).await })
+        Box::pin(self.service.udp_join_multicast_v4(group, interface))
     }
 
     fn udp_leave_multicast_v4<'a>(
@@ -836,15 +807,14 @@ where
         group: Ipv4Address,
         interface: Ipv4Address,
     ) -> Pin<Box<dyn Future<Output = Result<(), UdpError>> + Send + 'a>> {
-        Box::pin(async move { self.service.udp_leave_multicast_v4(group, interface).await })
+        Box::pin(self.service.udp_leave_multicast_v4(group, interface))
     }
 
     fn udp_close<'a>(&'a self, socket: u64) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(async move {
+        Box::pin(
             self.service
-                .udp_close(<Service::UdpSocket as ComponentHostUdpSocketToken>::from_raw(socket))
-                .await
-        })
+                .udp_close(<Service::UdpSocket as ComponentHostUdpSocketToken>::from_raw(socket)),
+        )
     }
 
     fn bridge_port<'a>(
@@ -852,21 +822,21 @@ where
         port: NetworkPortId,
         bridge: NetworkBridgeRequest,
     ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>> {
-        Box::pin(async move { self.service.bridge_port(port, bridge).await })
+        Box::pin(self.service.bridge_port(port, bridge))
     }
 
     fn unbridge_port<'a>(
         &'a self,
         port: NetworkPortId,
     ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>> {
-        Box::pin(async move { self.service.unbridge_port(port).await })
+        Box::pin(self.service.unbridge_port(port))
     }
 
     fn acquire_dhcp<'a>(
         &'a self,
         port: NetworkPortId,
     ) -> Pin<Box<dyn Future<Output = Result<Ipv4Cidr, NetworkControlError>> + Send + 'a>> {
-        Box::pin(async move { self.service.acquire_dhcp(port).await })
+        Box::pin(self.service.acquire_dhcp(port))
     }
 
     fn add_address<'a>(
@@ -874,7 +844,7 @@ where
         port: NetworkPortId,
         address: Ipv4Cidr,
     ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>> {
-        Box::pin(async move { self.service.add_address(port, address).await })
+        Box::pin(self.service.add_address(port, address))
     }
 
     fn remove_address<'a>(
@@ -882,28 +852,28 @@ where
         port: NetworkPortId,
         address: Ipv4Cidr,
     ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>> {
-        Box::pin(async move { self.service.remove_address(port, address).await })
+        Box::pin(self.service.remove_address(port, address))
     }
 
     fn clear_addresses<'a>(
         &'a self,
         port: NetworkPortId,
     ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>> {
-        Box::pin(async move { self.service.clear_addresses(port).await })
+        Box::pin(self.service.clear_addresses(port))
     }
 
     fn list_addresses<'a>(
         &'a self,
         port: NetworkPortId,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Ipv4Cidr>, NetworkControlError>> + Send + 'a>> {
-        Box::pin(async move { self.service.list_addresses(port).await })
+        Box::pin(self.service.list_addresses(port))
     }
 
     fn mac_address<'a>(
         &'a self,
         port: NetworkPortId,
     ) -> Pin<Box<dyn Future<Output = Result<MacAddress, NetworkControlError>> + Send + 'a>> {
-        Box::pin(async move { self.service.mac_address(port).await })
+        Box::pin(self.service.mac_address(port))
     }
 
     fn set_gateway<'a>(
@@ -911,7 +881,7 @@ where
         port: NetworkPortId,
         gateway: Ipv4Address,
     ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>> {
-        Box::pin(async move { self.service.set_gateway(port, gateway).await })
+        Box::pin(self.service.set_gateway(port, gateway))
     }
 
     fn add_route<'a>(
@@ -919,7 +889,7 @@ where
         port: NetworkPortId,
         route: Ipv4Route,
     ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>> {
-        Box::pin(async move { self.service.add_route(port, route).await })
+        Box::pin(self.service.add_route(port, route))
     }
 
     fn remove_route<'a>(
@@ -927,14 +897,14 @@ where
         port: NetworkPortId,
         route: Ipv4Route,
     ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>> {
-        Box::pin(async move { self.service.remove_route(port, route).await })
+        Box::pin(self.service.remove_route(port, route))
     }
 
     fn clear_routes<'a>(
         &'a self,
         port: NetworkPortId,
     ) -> Pin<Box<dyn Future<Output = Result<(), NetworkControlError>> + Send + 'a>> {
-        Box::pin(async move { self.service.clear_routes(port).await })
+        Box::pin(self.service.clear_routes(port))
     }
 
     fn list_routes<'a>(
@@ -942,6 +912,6 @@ where
         port: NetworkPortId,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Ipv4Route>, NetworkControlError>> + Send + 'a>>
     {
-        Box::pin(async move { self.service.list_routes(port).await })
+        Box::pin(self.service.list_routes(port))
     }
 }
