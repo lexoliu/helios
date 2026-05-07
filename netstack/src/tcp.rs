@@ -17,11 +17,12 @@ pub const MAX_TCP_RECEIVE_SEGMENTS: usize =
     (TCP_RECEIVE_WINDOW_BYTES + TCP_RECEIVE_SEGMENT_BYTES - 1) / TCP_RECEIVE_SEGMENT_BYTES;
 pub const MAX_TCP_OUT_OF_ORDER_SEGMENTS: usize = 32;
 pub const MAX_TCP_QUEUED_SEGMENTS: usize = 32;
-// Local divan `tcp_ack_discards_in_flight_segments` showed that reserving 16
-// in-flight segments halves hot connection metadata versus the old 32-segment
-// reservation. The transmit side below keeps its common one-tail case inline,
-// so large sequential writes no longer allocate a separate transmit VecDeque.
-const TCP_QUEUED_INITIAL_SEGMENTS: usize = 16;
+// Local divan `tcp_ack_discards_in_flight_segments` and
+// `tcp_single_segment_transmit` keep this reservation tied to measured stream
+// shape rather than a round capacity. The 10-segment reservation covers the
+// current bulk transmit bench without growth and moved first/bulk in-flight
+// allocation from 2.048 KiB to 1.28 KiB versus 16 reserved segments.
+const TCP_QUEUED_INITIAL_SEGMENTS: usize = 10;
 // Local divan `tcp_receive_contiguous_read` showed that 128 KiB receive
 // coalescing plus a small segmented queue beats the old 64 KiB/full-window
 // queue metadata path: 23/64/128 KiB medians moved from
