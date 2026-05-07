@@ -37,7 +37,7 @@ pub use packet::{
 pub use stack::{
     DhcpLease, DnsQueryId, IcmpEchoKey, MAX_OUTBOUND_FRAMES, NeighborEntry, NeighborState,
     OutboundBatchStatus, Route, RouteTable, SocketId, Stack, StackConfig, StackEvent, StackInstant,
-    TcpAccept, TcpConnectState, TcpReadState, UdpReceive,
+    TcpAccept, TcpConnectState, TcpReadState, UdpPayload, UdpReceive,
 };
 pub use tcp::{TcpEndpoint, TcpSegmentOutcome, TcpSocket, TcpState, TcpTransmitSegment};
 pub use types::{

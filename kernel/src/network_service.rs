@@ -14,7 +14,7 @@ use helios_netstack::{
     DhcpMessageType, DhcpPacket, DnsQuestionWriter, DnsResponse, IpAddress, IpCidr, Ipv4Address,
     Ipv4Cidr, Ipv6Address, MAX_OUTBOUND_FRAMES, NetworkInterface as NetworkDevice,
     OutboundBatchStatus, PacketBuffer, Route, Stack, StackConfig, StackError, StackInstant,
-    TcpConnectState, TcpEndpoint, TcpReadState,
+    TcpConnectState, TcpEndpoint, TcpReadState, UdpPayload,
 };
 use spin::Mutex as SpinMutex;
 
@@ -3120,11 +3120,8 @@ fn tcp_read_profile_phase(prefix: &'static str, outcome: &'static str) -> &'stat
     }
 }
 
-fn limit_udp_datagram_bytes(bytes: Bytes, max_bytes: usize) -> Bytes {
-    if bytes.len() <= max_bytes {
-        return bytes;
-    }
-    bytes.slice(..max_bytes)
+fn limit_udp_datagram_bytes(bytes: UdpPayload, max_bytes: usize) -> Bytes {
+    bytes.into_limited_bytes(max_bytes)
 }
 
 fn parse_ipv4(input: &str) -> Option<Ipv4Address> {
@@ -3192,11 +3189,10 @@ fn usize_to_u64(value: usize, label: &'static str) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
     use helios_netstack::{
         ETHERNET_FRAME_BYTES, EthernetFrame, EthernetProtocol, IpAddress, IpProtocol, Ipv6Address,
         Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborEntry, NeighborState, StackInstant,
-        TcpFlags, TcpHeader, TcpPacket, UdpPacket,
+        TcpFlags, TcpHeader, TcpPacket, UdpPacket, UdpPayload,
     };
 
     use super::{
@@ -3297,14 +3293,12 @@ mod tests {
     }
 
     #[test]
-    fn udp_datagram_limit_slices_without_copying() {
-        let bytes = Bytes::from_static(b"abcdef");
-        let ptr = bytes.as_ptr();
+    fn udp_datagram_limit_copies_only_at_outer_api_boundary() {
+        let bytes = UdpPayload::copy_from_slice(b"abcdef");
 
         let limited = limit_udp_datagram_bytes(bytes, 3);
 
         assert_eq!(limited.as_ref(), b"abc");
-        assert_eq!(limited.as_ptr(), ptr);
     }
 
     #[test]
