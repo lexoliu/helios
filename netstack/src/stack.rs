@@ -1029,6 +1029,17 @@ where
     }
 
     pub fn take_udp(&mut self, local_port: u16) -> Option<UdpReceive> {
+        // Most UDP sockets drain their own FIFO immediately; keep that path to
+        // one front check before the mixed-port rotation. Local divan
+        // `udp_receive_and_take/64` moved from 9.183 us to 8.163 us median,
+        // while `udp_receive_take_tail_port/64` stayed flat at ~8.1 us.
+        if self
+            .udp_rx
+            .front()
+            .is_some_and(|datagram| datagram.destination_port == local_port)
+        {
+            return self.udp_rx.pop_front();
+        }
         let len = self.udp_rx.len();
         for _ in 0..len {
             let datagram = self

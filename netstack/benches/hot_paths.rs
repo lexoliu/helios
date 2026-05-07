@@ -211,6 +211,36 @@ fn udp_receive_and_take(bencher: Bencher, packets: usize) {
     });
 }
 
+#[divan::bench(args = [8usize, 32, 64])]
+fn udp_receive_take_tail_port(bencher: Bencher, packets: usize) {
+    let frames: [PacketBuffer; 64] = core::array::from_fn(|index| {
+        udp_ipv4_frame(
+            8080 + u16::try_from(index).expect("benchmark UDP source port fits"),
+            49152 + u16::try_from(index).expect("benchmark UDP destination port fits"),
+            UDP_PAYLOAD,
+        )
+    });
+
+    bencher.counter(ItemsCount::new(packets)).bench_local(|| {
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514));
+        stack.add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24));
+        for (index, frame) in frames.iter().take(packets).enumerate() {
+            stack
+                .receive_frame(
+                    black_box(frame.as_slice()),
+                    StackInstant::from_nanos(
+                        u64::try_from(index + 1).expect("benchmark timestamp fits"),
+                    ),
+                )
+                .expect("benchmark UDP frame should be accepted");
+        }
+        let datagram = stack
+            .take_udp(49152 + u16::try_from(packets - 1).expect("benchmark port fits"))
+            .expect("benchmark tail UDP datagram should be queued");
+        black_box(datagram.bytes);
+    });
+}
+
 #[divan::bench(args = [23 * 1024, 64 * 1024, 128 * 1024])]
 fn tcp_receive_contiguous_read(bencher: Bencher, read_size: usize) {
     let payload = vec![0u8; TCP_PAYLOAD_BYTES];
