@@ -535,6 +535,13 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         Ok(Self::drain_tx_completions(&mut state, budget))
     }
 
+    pub fn reclaim_transmit_completions_immediate(&self, budget: usize) -> IoResult<Option<usize>> {
+        let Some(mut state) = self.tx_state.try_lock() else {
+            return Ok(None);
+        };
+        Ok(Some(Self::drain_tx_completions(&mut state, budget)))
+    }
+
     pub async fn wait_for_interrupt(&self) {
         self.interrupts.notified().await;
     }

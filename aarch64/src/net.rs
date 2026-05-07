@@ -187,6 +187,13 @@ impl NetworkDevice for VirtioNetworkDevice {
         self.inner.reclaim_transmit_completions(budget).await
     }
 
+    fn reclaim_transmit_completions_immediate(
+        &self,
+        budget: usize,
+    ) -> Result<Option<usize>, IoError> {
+        self.inner.reclaim_transmit_completions_immediate(budget)
+    }
+
     async fn wait_for_event(&self) {
         helios_kernel::yield_now().await;
     }

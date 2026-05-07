@@ -1519,11 +1519,19 @@ where
         let budget = self.inner.state.with(|state| state.poll.budget());
 
         let reclaim_started = self.profile_start();
-        let reclaimed = self
+        let reclaimed = match self
             .inner
             .device
-            .reclaim_transmit_completions(budget.tx_completions)
-            .await?;
+            .reclaim_transmit_completions_immediate(budget.tx_completions)?
+        {
+            Some(reclaimed) => reclaimed,
+            None => {
+                self.inner
+                    .device
+                    .reclaim_transmit_completions(budget.tx_completions)
+                    .await?
+            }
+        };
         if reclaimed != 0 {
             self.record_network_profile_events(
                 source.tx_reclaim_phase(),

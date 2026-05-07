@@ -308,6 +308,12 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
         async { Ok(0) }
     }
 
+    /// Reclaims completed transmit slots without constructing an async wait path.
+    fn reclaim_transmit_completions_immediate(&self, budget: usize) -> IoResult<Option<usize>> {
+        let _ = budget;
+        Ok(None)
+    }
+
     /// Waits for interface progress, such as RX arrival or TX completion.
     fn wait_for_event(&self) -> impl Future<Output = ()> + Send + '_;
 }

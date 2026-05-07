@@ -244,6 +244,17 @@ impl NetworkDevice for VirtioNetworkDevice {
         self.inner.try_transmit_frames(frames).await
     }
 
+    fn try_transmit_slices_immediate(&self, frames: &[&[u8]]) -> Result<Option<usize>, IoError> {
+        self.inner.try_transmit_trusted_frames_immediate(frames)
+    }
+
+    fn reclaim_transmit_completions_immediate(
+        &self,
+        budget: usize,
+    ) -> Result<Option<usize>, IoError> {
+        self.inner.reclaim_transmit_completions_immediate(budget)
+    }
+
     async fn wait_for_event(&self) {
         self.inner.wait_for_interrupt().await;
     }
