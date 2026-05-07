@@ -471,6 +471,8 @@ pub struct KernelRunStats {
     pub timer_fired_count: usize,
     pub executor_local_runnable_count: usize,
     pub executor_global_runnable_count: usize,
+    pub executor_local_empty_pop_count: usize,
+    pub executor_global_empty_pop_count: usize,
 }
 
 impl KernelRunStats {
@@ -575,6 +577,8 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
             stats.timer_fired_count += fired;
             stats.executor_local_runnable_count += executor_stats.local_runnable_count();
             stats.executor_global_runnable_count += executor_stats.global_runnable_count();
+            stats.executor_local_empty_pop_count += executor_stats.local_empty_pop_count();
+            stats.executor_global_empty_pop_count += executor_stats.global_empty_pop_count();
 
             if fired == 0 && ran == 0 {
                 return stats;

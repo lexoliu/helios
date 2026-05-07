@@ -71,6 +71,8 @@ pub struct Executor {
 pub struct ExecutorRunStats {
     local_runnable_count: usize,
     global_runnable_count: usize,
+    local_empty_pop_count: usize,
+    global_empty_pop_count: usize,
 }
 
 impl ExecutorRunStats {
@@ -84,6 +86,14 @@ impl ExecutorRunStats {
 
     pub const fn global_runnable_count(self) -> usize {
         self.global_runnable_count
+    }
+
+    pub const fn local_empty_pop_count(self) -> usize {
+        self.local_empty_pop_count
+    }
+
+    pub const fn global_empty_pop_count(self) -> usize {
+        self.global_empty_pop_count
     }
 }
 
@@ -137,9 +147,13 @@ impl Executor {
             let (runnable, source) = match pop_ready(local_queue, local_ready_count) {
                 Ok(runnable) => (runnable, ReadySource::Local),
                 Err(PopError::Empty | PopError::Closed) => {
+                    stats.local_empty_pop_count += 1;
                     match pop_ready(&self.group.global_queue, &self.group.global_ready_count) {
                         Ok(runnable) => (runnable, ReadySource::Global),
-                        Err(PopError::Empty | PopError::Closed) => return stats,
+                        Err(PopError::Empty | PopError::Closed) => {
+                            stats.global_empty_pop_count += 1;
+                            return stats;
+                        }
                     }
                 }
             };

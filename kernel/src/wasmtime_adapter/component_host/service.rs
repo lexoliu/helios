@@ -1318,6 +1318,16 @@ fn record_executor_metrics<CpuImpl, HostFs>(
         "global-runnable",
         stats.executor_global_runnable_count,
     );
+    record_executor_event_metric(
+        debug_state,
+        "local-empty-pop",
+        stats.executor_local_empty_pop_count,
+    );
+    record_executor_event_metric(
+        debug_state,
+        "global-empty-pop",
+        stats.executor_global_empty_pop_count,
+    );
     record_executor_event_metric(debug_state, "timer-fired", stats.timer_fired_count);
     debug_state.record_kernel_heap_metrics(crate::heap_stats());
 }
