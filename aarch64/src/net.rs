@@ -172,7 +172,7 @@ impl NetworkDevice for VirtioNetworkDevice {
     fn try_transmit_slices_immediate(&self, frames: &[&[u8]]) -> Result<Option<usize>, IoError> {
         let mut submitted = 0usize;
         for chunk in frames.chunks(VIRTIO_POLLING_RX_BUDGET) {
-            let Some(accepted) = self.inner.try_transmit_frames_immediate(chunk)? else {
+            let Some(accepted) = self.inner.try_transmit_trusted_frames_immediate(chunk)? else {
                 return Ok((submitted != 0).then_some(submitted));
             };
             submitted += accepted;

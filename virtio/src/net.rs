@@ -392,6 +392,33 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         Frame: AsRef<[u8]>,
     {
         self.validate_tx_frames(frames)?;
+        self.try_transmit_valid_frames_immediate(frames)
+    }
+
+    /// Immediate TX path for frames already produced by the Helios netstack.
+    ///
+    /// The stack's `PacketBuffer` capacity and frame encoders enforce Ethernet
+    /// frame bounds before queueing; skipping the second validation pass keeps
+    /// the profile-visible `network;tx-submit-immediate-device-*` phase focused
+    /// on descriptor ownership and payload copy. Slot capacity is still checked
+    /// by `write_tx_payload` immediately before DMA publication.
+    pub fn try_transmit_trusted_frames_immediate<Frame>(
+        &self,
+        frames: &[Frame],
+    ) -> IoResult<Option<usize>>
+    where
+        Frame: AsRef<[u8]>,
+    {
+        self.try_transmit_valid_frames_immediate(frames)
+    }
+
+    fn try_transmit_valid_frames_immediate<Frame>(
+        &self,
+        frames: &[Frame],
+    ) -> IoResult<Option<usize>>
+    where
+        Frame: AsRef<[u8]>,
+    {
         let Some(mut state) = self.tx_state.try_lock() else {
             return Ok(None);
         };
