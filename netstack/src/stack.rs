@@ -23,7 +23,11 @@ pub const MAX_STACK_EVENTS: usize = 64;
 pub const MAX_UDP_RX: usize = 64;
 pub const MAX_TCP_ACCEPT: usize = 64;
 pub const MAX_TCP_SOCKETS: usize = 256;
-const TCP_SOCKET_SLAB_CHUNK_SLOTS: usize = 1;
+// Allocate TCP sockets in small slab chunks rather than one heap object per
+// socket. Local divan `tcp_listen_many/64` moved from 64 allocations and
+// 8.347 us median to 8 allocations and 8.033 us; chunk=4 measured worse at
+// 16 allocations and 8.441 us.
+const TCP_SOCKET_SLAB_CHUNK_SLOTS: usize = 8;
 const TCP_SOCKET_SLAB_CHUNKS: usize = MAX_TCP_SOCKETS / TCP_SOCKET_SLAB_CHUNK_SLOTS;
 const TCP_ENDPOINT_INDEX_SLOTS: usize = MAX_TCP_SOCKETS * 2;
 const TCP_LISTENER_INDEX_SLOTS: usize = MAX_TCP_SOCKETS * 2;
