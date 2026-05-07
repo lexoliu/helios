@@ -13,7 +13,7 @@ use crate::{
     TraceEvent, TraceFilter, TraceHistory, embedded_init,
 };
 use helios_hal::cpu::HardwarePerfCounterDelta;
-use spin::Mutex;
+use spin::{Mutex, Once};
 
 use crate::component_runtime::ComponentRuntimeState;
 use crate::runtime_types::ComponentHostFilesystemState;
@@ -30,7 +30,8 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     instance_registry: InstanceRegistry,
     program_service: Mutex<Option<ProgramService>>,
     program_service_ready: Notify,
-    network_service: Mutex<Option<NetworkService>>,
+    network_service_installed: AtomicBool,
+    network_service: Once<NetworkService>,
     host_fs_service: Mutex<Option<HostFsService>>,
     futex_table: Mutex<FutexTable>,
     bootfs: Mutex<Option<EmbeddedBootFs>>,
@@ -320,7 +321,8 @@ where
                 instance_registry: InstanceRegistry::new(),
                 program_service: Mutex::new(None),
                 program_service_ready: Notify::new(),
-                network_service: Mutex::new(None),
+                network_service_installed: AtomicBool::new(false),
+                network_service: Once::new(),
                 host_fs_service: Mutex::new(None),
                 futex_table: Mutex::new(FutexTable::new()),
                 bootfs: Mutex::new(embedded_init().map(|init| init.bootfs())),
@@ -681,16 +683,18 @@ where
     }
 
     pub fn install_network_service(&self, service: NetworkService) {
-        let mut slot = self.inner.network_service.lock();
         assert!(
-            slot.is_none(),
+            !self
+                .inner
+                .network_service_installed
+                .swap(true, Ordering::AcqRel),
             "network service was installed more than once"
         );
-        *slot = Some(service);
+        self.inner.network_service.call_once(|| service);
     }
 
     pub fn network_service(&self) -> Option<NetworkService> {
-        self.inner.network_service.lock().clone()
+        self.inner.network_service.get().cloned()
     }
 
     pub fn install_host_fs_service(&self, service: HostFsService) {
@@ -735,7 +739,7 @@ impl<ProgramService, NetworkService, HostFsService> ComponentRuntimeState
     for RuntimeState<ProgramService, NetworkService, HostFsService>
 where
     ProgramService: Clone + Send + 'static,
-    NetworkService: Clone + Send + 'static,
+    NetworkService: Clone + Send + Sync + 'static,
     HostFsService: Clone + Send + 'static,
 {
     fn uptime_nanos(&self, current_ticks: u64) -> u64 {
@@ -816,7 +820,7 @@ impl<ProgramService, NetworkService, HostFsService> ComponentHostFilesystemState
     for RuntimeState<ProgramService, NetworkService, HostFsService>
 where
     ProgramService: Clone + Send + 'static,
-    NetworkService: Clone + Send + 'static,
+    NetworkService: Clone + Send + Sync + 'static,
     HostFsService: crate::HostFileSystem,
 {
     fn host_filesystem_service(&self) -> Option<HostFsService> {

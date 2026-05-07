@@ -12,6 +12,7 @@ use helios_kernel::{
     PingError, PingErrorKind, PingReply, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TryRead,
     UdpBinding, UdpDatagram, UdpError, UdpErrorKind, byte_channel,
 };
+use spin::{Mutex, Once};
 
 #[global_allocator]
 static ALLOC: AllocProfiler = AllocProfiler::system();
@@ -22,6 +23,14 @@ struct BenchFile;
 #[derive(Clone)]
 struct BenchNetworkService {
     payload: Bytes,
+}
+
+struct MutexNetworkServiceSlot {
+    service: Mutex<Option<ComponentHostNetworkService>>,
+}
+
+struct OnceNetworkServiceSlot {
+    service: Once<ComponentHostNetworkService>,
 }
 
 fn main() {
@@ -149,10 +158,65 @@ fn component_network_erased_tcp_read(bencher: Bencher, count: usize) {
     });
 }
 
+#[divan::bench(args = [1usize, 64, 1024])]
+fn runtime_network_service_mutex_lookup(bencher: Bencher, count: usize) {
+    let slot = MutexNetworkServiceSlot::new(component_network_service());
+    bencher.counter(ItemsCount::new(count)).bench_local(|| {
+        for _ in 0..count {
+            black_box(slot.get());
+        }
+    });
+}
+
+// This models `RuntimeState::network_service()` after the service has been
+// installed. The syscall hot path only needs an immutable service handle, so a
+// Once read avoids the old uncontended spin mutex around every network call.
+#[divan::bench(args = [1usize, 64, 1024])]
+fn runtime_network_service_once_lookup(bencher: Bencher, count: usize) {
+    let slot = OnceNetworkServiceSlot::new(component_network_service());
+    bencher.counter(ItemsCount::new(count)).bench_local(|| {
+        for _ in 0..count {
+            black_box(slot.get());
+        }
+    });
+}
+
 fn file(id: u64) -> KernelResource<BenchFile, FileRights> {
     black_box(id);
     let resource = KernelResource::new(BenchFile, FileRights::READ | FileRights::WRITE);
     black_box(resource)
+}
+
+fn component_network_service() -> ComponentHostNetworkService {
+    ComponentHostNetworkService::from_service(BenchNetworkService {
+        payload: Bytes::copy_from_slice(&[7; 4096]),
+    })
+}
+
+impl MutexNetworkServiceSlot {
+    fn new(service: ComponentHostNetworkService) -> Self {
+        Self {
+            service: Mutex::new(Some(service)),
+        }
+    }
+
+    fn get(&self) -> Option<ComponentHostNetworkService> {
+        self.service.lock().clone()
+    }
+}
+
+impl OnceNetworkServiceSlot {
+    fn new(service: ComponentHostNetworkService) -> Self {
+        let slot = Self {
+            service: Once::new(),
+        };
+        slot.service.call_once(|| service);
+        slot
+    }
+
+    fn get(&self) -> Option<ComponentHostNetworkService> {
+        self.service.get().cloned()
+    }
 }
 
 impl ComponentNetworkService for BenchNetworkService {
