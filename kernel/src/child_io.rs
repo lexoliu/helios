@@ -22,13 +22,13 @@ use spin::Mutex;
 use triomphe::Arc;
 
 const BYTE_CHANNEL_CHUNK_CAPACITY: usize = 256;
-// Keep the common process/stdio/socketpair path from pre-allocating the full
-// 256-slot queue. Local divan evidence: the old fixed queue allocated 8.408 KB
-// per channel, while this inline-64 layout allocates 2.304 KB for create/drop,
-// 16-chunk, and 64-chunk cases; only larger bursts spill to overflow.
-const BYTE_CHANNEL_INLINE_CHUNKS: usize = 64;
-const BYTE_CHANNEL_OVERFLOW_INITIAL_CHUNKS: usize =
-    BYTE_CHANNEL_CHUNK_CAPACITY - BYTE_CHANNEL_INLINE_CHUNKS;
+// Keep process/stdio/socketpair setup cheap while preserving the common
+// 64-chunk burst shape: 16 chunks stay in the channel allocation and the first
+// overflow reserve covers the remaining 48 chunks. Local divan keeps the
+// 64-chunk case at 2.304 KiB while create/drop and 16-chunk transfers move to
+// a 768 B channel allocation instead of the old inline-64 2.304 KiB slab.
+const BYTE_CHANNEL_INLINE_CHUNKS: usize = 16;
+const BYTE_CHANNEL_OVERFLOW_INITIAL_CHUNKS: usize = 48;
 const BYTE_CHANNEL_WAKER_CAPACITY: usize = 8;
 
 /// A single byte-stream channel, closable from both ends. Producers push
