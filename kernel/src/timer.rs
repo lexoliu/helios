@@ -33,6 +33,7 @@ pub struct Timer<CpuImpl: Cpu + Clone> {
 
 pub struct Sleep<CpuImpl: Cpu + Clone> {
     timer: Timer<CpuImpl>,
+    deadline: Option<Instant>,
     state: Option<Arc<SleepState>>,
 }
 
@@ -124,19 +125,15 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
         if deadline <= self.now() {
             return Sleep {
                 timer: self.clone(),
+                deadline: None,
                 state: None,
             };
         }
 
         Sleep {
             timer: self.clone(),
-            state: Some(Arc::new(SleepState {
-                deadline,
-                queued: AtomicBool::new(false),
-                fired: AtomicBool::new(false),
-                cancelled: AtomicBool::new(false),
-                waker: AtomicWaker::new(),
-            })),
+            deadline: Some(deadline),
+            state: None,
         }
     }
 
@@ -265,17 +262,27 @@ impl<CpuImpl: Cpu + Clone> Future for Sleep<CpuImpl> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.as_ref().get_ref();
-        let Some(state) = this.state.as_ref() else {
+        let this = self.get_mut();
+        let Some(deadline) = this.deadline else {
             return Poll::Ready(());
         };
-
-        if state.fired.load(AtomicOrdering::Acquire) {
+        if deadline <= this.timer.now() {
+            this.deadline = None;
+            if let Some(state) = this.state.as_ref() {
+                state.fire();
+            }
             return Poll::Ready(());
         }
 
-        if state.deadline <= this.timer.now() {
-            state.fire();
+        if this.state.is_none() {
+            this.state = Some(Arc::new(SleepState::new(deadline)));
+        }
+        let state = this
+            .state
+            .as_ref()
+            .expect("sleep state must exist after first pending poll");
+
+        if state.fired.load(AtomicOrdering::Acquire) {
             return Poll::Ready(());
         }
 
@@ -293,6 +300,8 @@ impl<CpuImpl: Cpu + Clone> Future for Sleep<CpuImpl> {
     }
 }
 
+impl<CpuImpl: Cpu + Clone> Unpin for Sleep<CpuImpl> {}
+
 impl<CpuImpl: Cpu + Clone> Drop for Sleep<CpuImpl> {
     fn drop(&mut self) {
         if let Some(state) = self.state.as_ref() {
@@ -302,6 +311,16 @@ impl<CpuImpl: Cpu + Clone> Drop for Sleep<CpuImpl> {
 }
 
 impl SleepState {
+    fn new(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            queued: AtomicBool::new(false),
+            fired: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+            waker: AtomicWaker::new(),
+        }
+    }
+
     fn fire(&self) {
         if self.fired.swap(true, AtomicOrdering::AcqRel) {
             return;
@@ -467,9 +486,11 @@ unsafe impl Sync for TimerShared {}
 #[cfg(test)]
 mod tests {
     use alloc::vec::Vec;
-    use core::sync::atomic::AtomicBool;
+    use core::future::Future as _;
+    use core::pin::Pin;
+    use core::task::Context;
 
-    use atomic_waker::AtomicWaker;
+    use futures::task::noop_waker_ref;
     use helios_hal::cpu::{Cpu, Instant, ProcessorId};
     use triomphe::Arc;
 
@@ -530,13 +551,7 @@ mod tests {
     }
 
     fn sleep_state(deadline: u64) -> Arc<SleepState> {
-        Arc::new(SleepState {
-            deadline: Instant::new(deadline),
-            queued: AtomicBool::new(false),
-            fired: AtomicBool::new(false),
-            cancelled: AtomicBool::new(false),
-            waker: AtomicWaker::new(),
-        })
+        Arc::new(SleepState::new(Instant::new(deadline)))
     }
 
     fn timer_entry(deadline: u64, quantum_ticks: u64) -> TimerEntry {
@@ -649,10 +664,22 @@ mod tests {
     #[test]
     fn elapsed_sleep_does_not_allocate_state() {
         let timer = super::Timer::new(TestCpu { now: 100 });
+        assert!(timer.sleep_until(Instant::new(101)).state.is_none());
         assert!(timer.sleep_until(Instant::new(100)).state.is_none());
         assert!(timer.sleep_until(Instant::new(99)).state.is_none());
         assert!(timer.sleep_for(core::time::Duration::ZERO).state.is_none());
-        assert!(timer.sleep_until(Instant::new(101)).state.is_some());
+    }
+
+    #[test]
+    fn pending_sleep_allocates_state_on_first_poll() {
+        let timer = super::Timer::new(TestCpu { now: 100 });
+        let mut sleep = timer.sleep_until(Instant::new(101));
+        assert!(sleep.state.is_none());
+
+        let mut context = Context::from_waker(noop_waker_ref());
+        assert!(Pin::new(&mut sleep).poll(&mut context).is_pending());
+
+        assert!(sleep.state.is_some());
     }
 
     #[test]
