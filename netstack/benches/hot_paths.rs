@@ -414,6 +414,46 @@ fn tcp_send_bytes_segments_without_copy(bencher: Bencher) {
 }
 
 #[divan::bench]
+fn tcp_mark_syn_queued(bencher: Bencher) {
+    // Isolates the first in-flight allocation for handshake control traffic.
+    // Current baseline is one 2 KiB VecDeque allocation; a boxed-inline queue
+    // reduced this to 168 B but regressed the multi-segment ACK path, so the
+    // accepted fix needs a real pooled/slab-backed in-flight design.
+    bencher.bench_local(|| {
+        let mut socket = TcpSocket::connect(
+            local_tcp_endpoint(),
+            peer_tcp_endpoint(),
+            black_box(7),
+            BbrV3::new(1460),
+        );
+        socket.mark_syn_queued(1);
+        black_box(socket.pending_retransmission(u64::MAX));
+    });
+}
+
+#[divan::bench]
+fn tcp_single_segment_transmit(bencher: Bencher) {
+    let payload = Bytes::from_static(&[7; TCP_PAYLOAD_BYTES]);
+
+    // Keeps the single-data-segment path visible separately from bulk transmit.
+    // The right optimization target is first in-flight state allocation without
+    // adding allocations or branch cost to sustained multi-segment streams.
+    bencher
+        .counter(BytesCount::new(TCP_PAYLOAD_BYTES))
+        .bench_local(|| {
+            let mut socket = established_tcp_socket();
+            let mut remaining = black_box(payload.clone());
+            let written = socket.queue_send_bytes(&mut remaining);
+            assert_eq!(written, TCP_PAYLOAD_BYTES);
+            assert!(remaining.is_empty());
+            let segment = socket
+                .take_transmit_segment(2)
+                .expect("single queued segment should transmit");
+            black_box(segment);
+        });
+}
+
+#[divan::bench]
 fn tcp_ack_discards_in_flight_segments(bencher: Bencher) {
     let payload = Bytes::from(vec![0u8; TCP_TRANSMIT_SEGMENTS * TCP_PAYLOAD_BYTES]);
 
