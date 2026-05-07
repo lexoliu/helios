@@ -44,7 +44,7 @@ use crate::wasmtime_adapter::cwasm::{self, ArtifactTrustError, UntrustedCwasm};
 use crate::wasmtime_adapter::wasi::ChannelStreamProducer;
 use crate::wasmtime_adapter::wasi::bindings::filesystem::types::ErrorCode as FsErrorCode;
 use crate::{
-    PerfMetricFilter, ProfileFilter, ProfileScope, StatsSample, TraceEvent, TraceField,
+    HeapStats, PerfMetricFilter, ProfileFilter, ProfileScope, StatsSample, TraceEvent, TraceField,
     TraceFilter, TraceLevel, TraceValue,
 };
 
@@ -1535,6 +1535,7 @@ where
     cpu: CpuImpl,
     started_ticks: u64,
     counters: helios_hal::cpu::HardwarePerfCounters,
+    started_heap: HeapStats,
 }
 
 impl<CpuImpl, HostFs> ComponentHostProfile<CpuImpl, HostFs>
@@ -1548,6 +1549,7 @@ where
             cpu: self.cpu.clone(),
             started_ticks: self.cpu.now().ticks(),
             counters: self.cpu.hardware_perf_counters(),
+            started_heap: crate::heap_stats(),
         }
     }
 }
@@ -1567,6 +1569,7 @@ where
             cpu: store.cpu.clone(),
             started_ticks: store.cpu.now().ticks(),
             counters: store.cpu.hardware_perf_counters(),
+            started_heap: crate::heap_stats(),
         })
 }
 
@@ -1626,7 +1629,65 @@ fn record_component_host_kernel_profile_events_bytes<CpuImpl, HostFs>(
             counter_delta,
             bytes,
         );
+        let heap = crate::heap_stats();
+        record_component_host_heap_delta(
+            &profile.runtime_state,
+            phase,
+            "heap-alloc",
+            heap.allocation_count
+                .saturating_sub(profile.started_heap.allocation_count),
+            heap.total_allocation_bytes
+                .saturating_sub(profile.started_heap.total_allocation_bytes),
+        );
+        record_component_host_heap_delta(
+            &profile.runtime_state,
+            phase,
+            "heap-realloc",
+            heap.reallocation_count
+                .saturating_sub(profile.started_heap.reallocation_count),
+            heap.total_reallocation_bytes
+                .saturating_sub(profile.started_heap.total_reallocation_bytes),
+        );
+        record_component_host_heap_delta(
+            &profile.runtime_state,
+            phase,
+            "heap-dealloc",
+            heap.deallocation_count
+                .saturating_sub(profile.started_heap.deallocation_count),
+            heap.total_deallocation_bytes
+                .saturating_sub(profile.started_heap.total_deallocation_bytes),
+        );
     }
+}
+
+fn record_component_host_heap_delta<CpuImpl, HostFs>(
+    runtime_state: &HostRuntimeState<CpuImpl, HostFs>,
+    phase: &'static str,
+    kind: &'static str,
+    events: u64,
+    bytes: u64,
+) where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    if events == 0 && bytes == 0 {
+        return;
+    }
+    let phase_prefix = match kind {
+        "heap-alloc" => "kernel;component-host-heap;alloc;",
+        "heap-realloc" => "kernel;component-host-heap;realloc;",
+        "heap-dealloc" => "kernel;component-host-heap;dealloc;",
+        _ => panic!("unknown component-host heap metric kind {kind}"),
+    };
+    runtime_state.record_perf_metric_parts_events_nanos(
+        ProfileScope::Kernel,
+        phase_prefix,
+        phase,
+        events,
+        0,
+        helios_hal::cpu::HardwarePerfCounterDelta::default(),
+        bytes,
+    );
 }
 
 fn component_host_usize_to_u64(value: usize, label: &'static str) -> u64 {
