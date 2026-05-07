@@ -111,20 +111,22 @@ impl ByteQueue {
 }
 
 struct ByteSignal {
-    permits: AtomicUsize,
+    // Coalesce notifications: queue state is authoritative, so a burst of
+    // writes must not leave hundreds of stale permits for the next empty wait.
+    permit: AtomicBool,
     wakers: Mutex<HeapVec<Waker, BYTE_CHANNEL_WAKER_CAPACITY>>,
 }
 
 impl ByteSignal {
     const fn new() -> Self {
         Self {
-            permits: AtomicUsize::new(0),
+            permit: AtomicBool::new(false),
             wakers: Mutex::new(HeapVec::new()),
         }
     }
 
     fn notify_one(&self) {
-        self.permits.fetch_add(1, Ordering::AcqRel);
+        self.permit.store(true, Ordering::Release);
         let waker = self.wakers.lock().pop();
         if let Some(waker) = waker {
             waker.wake();
@@ -179,21 +181,7 @@ impl ByteSignal {
     }
 
     fn try_claim_permit(&self) -> bool {
-        let mut permits = self.permits.load(Ordering::Acquire);
-        loop {
-            if permits == 0 {
-                return false;
-            }
-            match self.permits.compare_exchange_weak(
-                permits,
-                permits - 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(next) => permits = next,
-            }
-        }
+        self.permit.swap(false, Ordering::AcqRel)
     }
 }
 
