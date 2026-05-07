@@ -709,6 +709,19 @@ def wasm_simd_provenance(manifest: dict, workloads: list[dict]) -> list[dict]:
     return provenance
 
 
+def quickjs_simd_fairness(linux_provenance: dict | None) -> dict | None:
+    if not linux_provenance or "quickjs_native_policy_id" not in linux_provenance:
+        return None
+    return {
+        "wasm_path": linux_provenance["quickjs_wasm_path"],
+        "wasm_uses_simd": linux_provenance["quickjs_wasm_uses_simd"],
+        "native_policy_id": linux_provenance["quickjs_native_policy_id"],
+        "native_c_flags_release": linux_provenance["quickjs_native_c_flags_release"],
+        "native_simd_policy": linux_provenance["quickjs_native_simd_policy"],
+        "baseline_strategy": linux_provenance["quickjs_baseline_strategy"],
+    }
+
+
 def ratio(helios_ms: int | None, linux_seconds: float | None) -> str:
     if helios_ms is None or linux_seconds is None:
         return "n/a"
@@ -821,6 +834,7 @@ def write_summary_json(
             for row in component_heap[:16]
         ],
         "wasm_simd": wasm_simd_provenance(manifest, workloads),
+        "quickjs_simd_fairness": quickjs_simd_fairness(linux_provenance),
         "helios_kernel_flamegraphs": [str(path) for path in helios_kernel_flamegraphs],
         "helios_kernel_profile_top": [
             {
@@ -1060,6 +1074,21 @@ def write_report(
         for key, value in linux_provenance.items():
             lines.append(f"- {key.replace('_', ' ').title()}: `{value}`")
         lines.append("")
+    quickjs_fairness = quickjs_simd_fairness(linux_provenance)
+    if quickjs_fairness:
+        lines.extend(
+            [
+                "## QuickJS SIMD Fairness",
+                "",
+                f"- Helios QuickJS wasm: `{quickjs_fairness['wasm_path']}`",
+                f"- Helios QuickJS uses wasm SIMD: `{str(quickjs_fairness['wasm_uses_simd']).lower()}`",
+                f"- Fedora native policy: `{quickjs_fairness['native_policy_id']}`",
+                f"- Fedora release C flags: `{quickjs_fairness['native_c_flags_release']}`",
+                f"- Decision: `{quickjs_fairness['native_simd_policy']}`",
+                f"- Strategy: `{quickjs_fairness['baseline_strategy']}`",
+                "",
+            ]
+        )
     simd_rows = wasm_simd_provenance(manifest, workloads)
     if simd_rows:
         lines.extend(
