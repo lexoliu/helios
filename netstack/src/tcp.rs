@@ -17,10 +17,10 @@ pub const MAX_TCP_RECEIVE_SEGMENTS: usize =
     (TCP_RECEIVE_WINDOW_BYTES + TCP_RECEIVE_SEGMENT_BYTES - 1) / TCP_RECEIVE_SEGMENT_BYTES;
 pub const MAX_TCP_OUT_OF_ORDER_SEGMENTS: usize = 32;
 pub const MAX_TCP_QUEUED_SEGMENTS: usize = 32;
-// Local divan `tcp_send_bytes_segments_without_copy` and
-// `tcp_ack_discards_in_flight_segments` showed that reserving 16 queued
-// segments halves hot connection queue metadata from 5.168 KB to 2.56 KB and
-// moves medians from 489.8/612.1 ns to 414.2/487.1 ns.
+// Local divan `tcp_ack_discards_in_flight_segments` showed that reserving 16
+// in-flight segments halves hot connection metadata versus the old 32-segment
+// reservation. The transmit side below keeps its common one-tail case inline,
+// so large sequential writes no longer allocate a separate transmit VecDeque.
 const TCP_QUEUED_INITIAL_SEGMENTS: usize = 16;
 // Local divan `tcp_receive_contiguous_read` showed that 128 KiB receive
 // coalescing plus a small segmented queue beats the old 64 KiB/full-window
@@ -139,29 +139,42 @@ impl core::ops::Index<usize> for TcpOutOfOrderQueue {
 
 #[derive(Clone, Debug)]
 struct TcpTransmitQueue {
-    segments: VecDeque<Bytes>,
+    // Sequential writes normally hold only the unsent tail after splitting a
+    // Bytes buffer by MSS. Keeping that single element inline moved local
+    // divan `tcp_send_bytes_segments_without_copy` from 2 allocations / 2.56
+    // KiB to 1 allocation / 2.048 KiB, with median 414.2 ns -> 409.9 ns.
+    front: Option<Bytes>,
+    overflow: Option<VecDeque<Bytes>>,
+    len: usize,
 }
 
 impl TcpTransmitQueue {
     fn new() -> Self {
         Self {
-            segments: VecDeque::with_capacity(TCP_QUEUED_INITIAL_SEGMENTS),
+            front: None,
+            overflow: None,
+            len: 0,
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.segments.is_empty()
+        self.len == 0
     }
 
     fn is_full(&self) -> bool {
-        self.segments.len() >= MAX_TCP_QUEUED_SEGMENTS
+        self.len >= MAX_TCP_QUEUED_SEGMENTS
     }
 
     fn push_back(&mut self, bytes: Bytes) -> Result<(), Bytes> {
         if self.is_full() {
             return Err(bytes);
         }
-        self.segments.push_back(bytes);
+        if self.front.is_none() {
+            self.front = Some(bytes);
+        } else {
+            self.overflow_mut().push_back(bytes);
+        }
+        self.len += 1;
         Ok(())
     }
 
@@ -169,12 +182,26 @@ impl TcpTransmitQueue {
         if self.is_full() {
             return Err(bytes);
         }
-        self.segments.push_front(bytes);
+        if let Some(front) = self.front.replace(bytes) {
+            self.overflow_mut().push_front(front);
+        }
+        self.len += 1;
         Ok(())
     }
 
     fn pop_front(&mut self) -> Option<Bytes> {
-        self.segments.pop_front()
+        let bytes = self.front.take()?;
+        self.len -= 1;
+        self.front = self.overflow.as_mut().and_then(VecDeque::pop_front);
+        if self.overflow.as_ref().is_some_and(VecDeque::is_empty) {
+            self.overflow = None;
+        }
+        Some(bytes)
+    }
+
+    fn overflow_mut(&mut self) -> &mut VecDeque<Bytes> {
+        self.overflow
+            .get_or_insert_with(|| VecDeque::with_capacity(TCP_QUEUED_INITIAL_SEGMENTS))
     }
 }
 
