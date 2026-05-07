@@ -624,6 +624,27 @@ def network_perf_rows(paths: list[Path]) -> list[dict]:
     return rows
 
 
+def component_heap_rows(paths: list[Path]) -> list[dict]:
+    rows = []
+    for sample in parse_perf_metrics(paths):
+        name = metric_name(sample)
+        if not name.startswith("kernel;component-host-heap;"):
+            continue
+        total_bytes = metric_u64(sample, "total_bytes")
+        total_events = metric_u64(sample, "total_events")
+        rows.append(
+            {
+                "name": name,
+                "events": total_events,
+                "bytes": total_bytes,
+                "bytes_per_event": average_or_none(total_bytes, total_events),
+                "source": sample["_source"],
+            }
+        )
+    rows.sort(key=lambda row: (row["bytes"], row["events"]), reverse=True)
+    return rows
+
+
 def average_or_none(total: int, count: int) -> float | None:
     if count == 0:
         return None
@@ -759,6 +780,7 @@ def write_summary_json(
     linux_provenance: dict | None,
     host_load: dict,
     network_perf: list[dict],
+    component_heap: list[dict],
     helios_kernel_flamegraphs: list[Path],
     helios_kernel_profile_top: list[dict],
 ) -> None:
@@ -787,6 +809,16 @@ def write_summary_json(
                 "source": str(row["source"]),
             }
             for row in network_perf[:16]
+        ],
+        "component_host_heap_hotspots": [
+            {
+                "name": row["name"],
+                "events": row["events"],
+                "total_bytes": row["bytes"],
+                "bytes_per_event": row["bytes_per_event"],
+                "source": str(row["source"]),
+            }
+            for row in component_heap[:16]
         ],
         "wasm_simd": wasm_simd_provenance(manifest, workloads),
         "helios_kernel_flamegraphs": [str(path) for path in helios_kernel_flamegraphs],
@@ -990,6 +1022,7 @@ def write_report(
     throughput_svg_path = path.with_name("network-throughput.svg")
     has_throughput_svg = write_throughput_svg(throughput_svg_path, rows)
     network_perf = network_perf_rows(perf_metric_paths)
+    component_heap = component_heap_rows(perf_metric_paths)
     summary_json = path.with_name("summary.json")
     write_summary_json(
         summary_json,
@@ -1001,6 +1034,7 @@ def write_report(
         linux_provenance,
         host_load,
         network_perf,
+        component_heap,
         helios_kernel_flamegraphs,
         helios_kernel_profile_top,
     )
@@ -1092,6 +1126,25 @@ def write_report(
             )
             lines.append(
                 f"| `{row['name']}` | {row['events']} | {row['bytes']} | {row['nanos']} ns | {nanos_per_event} | {bytes_per_event} | {throughput} | `{row['source']}` |"
+            )
+        lines.append("")
+    if component_heap:
+        lines.extend(
+            [
+                "## Component Host Heap Hotspots",
+                "",
+                "These rows are phase-local heap deltas captured while kernel profiling is enabled. They are inclusive for outer phases, so use the most specific matching phase when chasing allocation sources.",
+                "",
+                "| Metric | Events | Total bytes | bytes/event | Source |",
+                "| --- | ---: | ---: | ---: | --- |",
+            ]
+        )
+        for row in component_heap[:16]:
+            bytes_per_event = (
+                "n/a" if row["bytes_per_event"] is None else f"{row['bytes_per_event']:.1f}"
+            )
+            lines.append(
+                f"| `{row['name']}` | {row['events']} | {row['bytes']} | {bytes_per_event} | `{row['source']}` |"
             )
         lines.append("")
     if helios_kernel_flamegraphs:
