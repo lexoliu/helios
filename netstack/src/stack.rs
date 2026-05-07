@@ -37,6 +37,11 @@ pub const MAX_TCP_SOCKETS: usize = 256;
 // 16 allocations and 8.441 us.
 const TCP_SOCKET_SLAB_CHUNK_SLOTS: usize = 8;
 const TCP_SOCKET_SLAB_CHUNKS: usize = MAX_TCP_SOCKETS / TCP_SOCKET_SLAB_CHUNK_SLOTS;
+// Keep the first chunk inline so the common first TCP listen/connect path does
+// not allocate. Local divan moved `tcp_first_listen` from 8.868 us with one
+// 3.776 KiB allocation to 5.915 us with no measured allocation; `tcp_listen_many/64`
+// dropped one chunk allocation as well.
+const TCP_SOCKET_HEAP_SLAB_CHUNKS: usize = TCP_SOCKET_SLAB_CHUNKS - 1;
 const TCP_ENDPOINT_INDEX_SLOTS: usize = MAX_TCP_SOCKETS * 2;
 const TCP_LISTENER_INDEX_SLOTS: usize = MAX_TCP_SOCKETS * 2;
 const MAX_TCP_TIMER_ENTRIES: usize = MAX_TCP_SOCKETS * 4;
@@ -322,7 +327,8 @@ struct TcpSocketSlab<C>
 where
     C: CongestionControl,
 {
-    slots: [Option<Box<[MaybeUninit<TcpSocket<C>>]>>; TCP_SOCKET_SLAB_CHUNKS],
+    inline_slots: [MaybeUninit<TcpSocket<C>>; TCP_SOCKET_SLAB_CHUNK_SLOTS],
+    heap_slots: [Option<Box<[MaybeUninit<TcpSocket<C>>]>>; TCP_SOCKET_HEAP_SLAB_CHUNKS],
     occupied: [bool; MAX_TCP_SOCKETS],
     free: [usize; MAX_TCP_SOCKETS],
     free_len: usize,
@@ -370,7 +376,8 @@ where
 {
     fn new() -> Self {
         Self {
-            slots: core::array::from_fn(|_| None),
+            inline_slots: [const { MaybeUninit::uninit() }; TCP_SOCKET_SLAB_CHUNK_SLOTS],
+            heap_slots: core::array::from_fn(|_| None),
             occupied: [false; MAX_TCP_SOCKETS],
             free: core::array::from_fn(|index| MAX_TCP_SOCKETS - 1 - index),
             free_len: MAX_TCP_SOCKETS,
@@ -508,23 +515,33 @@ where
 
     fn materialize_slot_chunk(&mut self, index: usize) {
         let (chunk, _) = socket_slot_chunk(index);
-        if self.slots[chunk].is_none() {
-            self.slots[chunk] = Some(Box::<[TcpSocket<C>]>::new_uninit_slice(
+        if chunk == 0 {
+            return;
+        }
+        let heap_chunk = chunk - 1;
+        if self.heap_slots[heap_chunk].is_none() {
+            self.heap_slots[heap_chunk] = Some(Box::<[TcpSocket<C>]>::new_uninit_slice(
                 TCP_SOCKET_SLAB_CHUNK_SLOTS,
             ));
         }
     }
 
     fn chunk_ref(&self, chunk: usize) -> &[MaybeUninit<TcpSocket<C>>] {
-        self.slots
-            .get(chunk)
+        if chunk == 0 {
+            return &self.inline_slots;
+        }
+        self.heap_slots
+            .get(chunk - 1)
             .and_then(Option::as_deref)
             .expect("TCP socket chunk is not materialized")
     }
 
     fn chunk_mut(&mut self, chunk: usize) -> &mut [MaybeUninit<TcpSocket<C>>] {
-        self.slots
-            .get_mut(chunk)
+        if chunk == 0 {
+            return &mut self.inline_slots;
+        }
+        self.heap_slots
+            .get_mut(chunk - 1)
             .and_then(Option::as_deref_mut)
             .expect("TCP socket chunk is not materialized")
     }
@@ -536,8 +553,9 @@ where
 {
     fn clone(&self) -> Self {
         let mut cloned = Self {
-            slots: core::array::from_fn(|chunk| {
-                self.slots[chunk]
+            inline_slots: [const { MaybeUninit::uninit() }; TCP_SOCKET_SLAB_CHUNK_SLOTS],
+            heap_slots: core::array::from_fn(|chunk| {
+                self.heap_slots[chunk]
                     .as_ref()
                     .map(|_| Box::<[TcpSocket<C>]>::new_uninit_slice(TCP_SOCKET_SLAB_CHUNK_SLOTS))
             }),
