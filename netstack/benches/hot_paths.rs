@@ -5,7 +5,7 @@ use helios_netstack::{
     BbrV3, EthernetAddress, EthernetFrame, EthernetProtocol, IpAddress, IpProtocol, Ipv4Address,
     Ipv4Cidr, Ipv4Packet, MAX_OUTBOUND_FRAMES, NeighborEntry, NeighborState, OutboundBatchStatus,
     PacketBuffer, Stack, StackConfig, StackInstant, TcpEndpoint, TcpFlags, TcpHeader, TcpOptions,
-    TcpPacket, TcpSocket, TcpState, internet_checksum,
+    TcpPacket, TcpSocket, TcpState, UdpPacket, internet_checksum,
 };
 
 #[global_allocator]
@@ -109,6 +109,35 @@ fn tcp_ipv4_frame(header: TcpHeader, payload: &[u8]) -> PacketBuffer {
     frame
 }
 
+fn udp_ipv4_frame(source_port: u16, destination_port: u16, payload: &[u8]) -> PacketBuffer {
+    let mut frame = PacketBuffer::new();
+    let storage = frame.storage_mut();
+    let mut offset =
+        EthernetFrame::encode_header(storage, LOCAL_MAC, PEER_MAC, EthernetProtocol::Ipv4)
+            .expect("benchmark Ethernet header should fit");
+    offset += Ipv4Packet::encode_header(
+        &mut storage[offset..],
+        PEER_IP,
+        LOCAL_IP,
+        IpProtocol::Udp,
+        UdpPacket::HEADER_LEN + payload.len(),
+        1,
+        64,
+    )
+    .expect("benchmark IPv4 header should fit");
+    offset += UdpPacket::encode(
+        &mut storage[offset..],
+        IpAddress::Ipv4(PEER_IP),
+        IpAddress::Ipv4(LOCAL_IP),
+        source_port,
+        destination_port,
+        payload,
+    )
+    .expect("benchmark UDP packet should fit");
+    frame.set_len(offset);
+    frame
+}
+
 fn established_stack() -> Stack {
     let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514));
     stack.add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24));
@@ -148,6 +177,38 @@ fn established_stack() -> Stack {
         }
     ));
     stack
+}
+
+#[divan::bench(args = [1usize, 16, 64])]
+fn udp_receive_and_take(bencher: Bencher, packets: usize) {
+    let frames: [PacketBuffer; 64] = core::array::from_fn(|index| {
+        udp_ipv4_frame(
+            8080 + u16::try_from(index).expect("benchmark UDP source port fits"),
+            49152,
+            UDP_PAYLOAD,
+        )
+    });
+
+    bencher.counter(ItemsCount::new(packets)).bench_local(|| {
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514));
+        stack.add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24));
+        for (index, frame) in frames.iter().take(packets).enumerate() {
+            stack
+                .receive_frame(
+                    black_box(frame.as_slice()),
+                    StackInstant::from_nanos(
+                        u64::try_from(index + 1).expect("benchmark timestamp fits"),
+                    ),
+                )
+                .expect("benchmark UDP frame should be accepted");
+        }
+        for _ in 0..packets {
+            let datagram = stack
+                .take_udp(49152)
+                .expect("benchmark UDP datagram should be queued");
+            black_box(datagram.bytes);
+        }
+    });
 }
 
 #[divan::bench(args = [23 * 1024, 64 * 1024, 128 * 1024])]
