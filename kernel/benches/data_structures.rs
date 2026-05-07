@@ -3,6 +3,7 @@ extern crate alloc;
 use bytes::Bytes;
 use divan::counter::ItemsCount;
 use divan::{AllocProfiler, Bencher, black_box};
+use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId};
 use helios_hal::fs::FileRights;
 use helios_hal::resource::KernelResource;
 use helios_kernel::{
@@ -10,8 +11,8 @@ use helios_kernel::{
     DnsErrorKind, FutexKey, FutexTable, GuestAddress, Ipv4Address, Ipv4Cidr, Ipv4Route, MacAddress,
     NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
     NetworkIpAddress, NetworkPortId, PingError, PingErrorKind, PingReply, ProcessMemoryIdentity,
-    TcpAccepted, TcpError, TcpErrorKind, TcpListener, TryRead, UdpBinding, UdpDatagram, UdpError,
-    UdpErrorKind, byte_channel,
+    TcpAccepted, TcpError, TcpErrorKind, TcpListener, Timer, TryRead, UdpBinding, UdpDatagram,
+    UdpError, UdpErrorKind, byte_channel,
 };
 use spin::{Mutex, Once};
 
@@ -33,6 +34,9 @@ struct MutexNetworkServiceSlot {
 struct OnceNetworkServiceSlot {
     service: Once<ComponentHostNetworkService>,
 }
+
+#[derive(Clone)]
+struct BenchCpu;
 
 fn main() {
     divan::main();
@@ -153,6 +157,16 @@ fn futex_prepare_complete_distinct_keys(bencher: Bencher, count: usize) {
         }
         for registration in registrations.into_iter().take(count).flatten() {
             table.complete_wait(registration);
+        }
+    });
+}
+
+#[divan::bench(args = [1usize, 64, 1024])]
+fn timer_sleep_future_create_drop(bencher: Bencher, count: usize) {
+    let timer = Timer::new(BenchCpu);
+    bencher.counter(ItemsCount::new(count)).bench_local(|| {
+        for _ in 0..count {
+            black_box(timer.sleep_for(core::time::Duration::from_micros(500)));
         }
     });
 }
@@ -413,6 +427,56 @@ impl ComponentNetworkService for BenchNetworkService {
     }
 
     async fn udp_close(&self, _socket: Self::UdpSocket) {}
+}
+
+impl Cpu for BenchCpu {
+    fn current_processor(&self) -> ProcessorId {
+        ProcessorId::new(0)
+    }
+
+    fn processor_count(&self) -> usize {
+        1
+    }
+
+    fn bootstrap_processor(&self) -> ProcessorId {
+        ProcessorId::new(0)
+    }
+
+    fn park_current(&self) {}
+
+    fn start_processor(&self, _processor: ProcessorId) {}
+
+    fn wake_processor(&self, _processor: ProcessorId) {}
+
+    fn now(&self) -> Instant {
+        Instant::new(0)
+    }
+
+    fn timer_frequency(&self) -> u64 {
+        1_000_000
+    }
+
+    fn hardware_perf_counters(&self) -> HardwarePerfCounters {
+        HardwarePerfCounters::default()
+    }
+
+    fn set_deadline(&self, _deadline: Instant) {}
+
+    fn publish_executable(&self, _ptr: *const u8, _len: usize) {}
+
+    fn unpublish_executable(&self, _ptr: *const u8, _len: usize) {}
+
+    fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {
+        None
+    }
+
+    fn shutdown(&self) -> ! {
+        panic!("benchmark CPU cannot shut down")
+    }
+
+    fn reboot(&self) -> ! {
+        panic!("benchmark CPU cannot reboot")
+    }
 }
 
 impl NetworkAdminBackend for BenchNetworkService {
