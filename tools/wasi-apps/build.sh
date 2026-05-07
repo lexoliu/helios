@@ -7,14 +7,17 @@
 #   preview1→p2 adapter shipped alongside wasmtime, and stashes the
 #   component + stdlib under `$out_dir/../python3-root`.
 # - Builds our Rust `curl-wasi` and raw TCP throughput tool from source.
-# - Stages standard Wasmer WASIX/WASI shell and language artifacts used by
-#   the boot filesystem.
+# - Stages standard Wasmer WASIX shell/coreutils artifacts and builds QuickJS
+#   with wasm SIMD enabled for the boot filesystem.
 #
 # Network-gated: the CPython download needs internet; pass a pre-staged
 # zip via `CPYTHON_WASI_ZIP=<path>` to skip the curl step. Wasmer
-# artifacts may be supplied as raw modules (`*_WASM=<path>`) or WEBc
-# images (`*_WEBC=<path>`); otherwise this script downloads the pinned
-# official WEBc images and extracts their wasm atoms.
+# artifacts may be supplied as raw modules (`*_WASM=<path>`) or WEBc images
+# (`*_WEBC=<path>`); otherwise this script downloads the pinned official WEBc
+# images and extracts their wasm atoms. QuickJS may be supplied as a raw SIMD
+# module (`QUICKJS_WASM=<path>`) or as a source archive
+# (`QUICKJS_SOURCE_ARCHIVE=<path>`); otherwise this script downloads the pinned
+# source archive and builds the wasm module locally.
 
 set -euo pipefail
 
@@ -40,8 +43,9 @@ bash_version="${WASIX_BASH_VERSION:-1.0.25}"
 bash_webc_url="${WASIX_BASH_WEBC_URL:-https://cdn.wasmer.io/webcimages/059606d132e2e6bc1afe3b432ee64dcb1b1b059815c8bb213cf3b24798ef21e1.webc}"
 
 quickjs_package="${QUICKJS_PACKAGE:-quickjs-ng/quickjs}"
-quickjs_version="${QUICKJS_VERSION:-v0.14.0}"
-quickjs_wasm_url="${QUICKJS_WASM_URL:-https://github.com/quickjs-ng/quickjs/releases/download/v0.14.0/qjs-wasi.wasm}"
+quickjs_version_tag="${QUICKJS_VERSION:-v0.14.0}"
+quickjs_version="${quickjs_version_tag#v}"
+quickjs_source_url="${QUICKJS_SOURCE_URL:-https://github.com/quickjs-ng/quickjs/archive/refs/tags/$quickjs_version_tag.tar.gz}"
 
 coreutils_package="${COREUTILS_PACKAGE:-wasmer/coreutils}"
 coreutils_version="${COREUTILS_VERSION:-1.0.19}"
@@ -78,6 +82,63 @@ stage_wasmer_webc_atom() {
   fi
 
   wasm-tools validate "$output"
+}
+
+require_tool() {
+  local name="$1"
+  if ! command -v "$name" >/dev/null; then
+    printf 'required tool missing: %s\n' "$name" >&2
+    exit 1
+  fi
+}
+
+build_quickjs_wasm() {
+  local output="$1"
+  local archive="${QUICKJS_SOURCE_ARCHIVE:-}"
+  if [[ -z "$archive" ]]; then
+    archive="$staging/quickjs-$quickjs_version.tar.gz"
+    echo "Downloading QuickJS $quickjs_package@$quickjs_version_tag source..."
+    curl -fL -o "$archive" "$quickjs_source_url"
+  fi
+
+  require_tool zig
+  require_tool cmake
+  require_tool ninja
+
+  local llvm_ar="${LLVM_AR:-}"
+  local llvm_ranlib="${LLVM_RANLIB:-}"
+  if [[ -z "$llvm_ar" ]]; then
+    llvm_ar="$(command -v llvm-ar || true)"
+  fi
+  if [[ -z "$llvm_ranlib" ]]; then
+    llvm_ranlib="$(command -v llvm-ranlib || true)"
+  fi
+  if [[ -z "$llvm_ar" || -z "$llvm_ranlib" ]]; then
+    llvm_ar="/opt/homebrew/opt/llvm/bin/llvm-ar"
+    llvm_ranlib="/opt/homebrew/opt/llvm/bin/llvm-ranlib"
+  fi
+  if [[ ! -x "$llvm_ar" || ! -x "$llvm_ranlib" ]]; then
+    printf 'required LLVM archive tools missing: llvm-ar=%s llvm-ranlib=%s\n' "$llvm_ar" "$llvm_ranlib" >&2
+    exit 1
+  fi
+
+  local source_dir="$staging/quickjs-src"
+  local build_dir="$staging/quickjs-build"
+  mkdir -p "$source_dir"
+  tar -C "$source_dir" --strip-components=1 -xf "$archive"
+  CC='zig cc -target wasm32-wasi -msimd128' cmake \
+    -S "$source_dir" \
+    -B "$build_dir" \
+    -G Ninja \
+    -DCMAKE_SYSTEM_NAME=WASI \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_AR="$llvm_ar" \
+    -DCMAKE_RANLIB="$llvm_ranlib" \
+    -DCMAKE_C_FLAGS_RELEASE='-O3 -DNDEBUG -msimd128' \
+    -DQJS_BUILD_EXAMPLES=OFF \
+    -DQJS_BUILD_CLI_WITH_MIMALLOC=OFF
+  cmake --build "$build_dir" --target qjs_exe -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc)"
+  wasm-tools strip "$build_dir/qjs" -o "$output"
 }
 
 zip_path="${CPYTHON_WASI_ZIP:-}"
@@ -133,13 +194,14 @@ stage_wasmer_webc_atom \
 echo "WASIX bash installed at: $bash_root/bash.wasm"
 ls -lh "$bash_root/bash.wasm"
 
-echo "Staging QuickJS $quickjs_package@$quickjs_version..."
+echo "Staging QuickJS $quickjs_package@$quickjs_version_tag..."
 if [[ -n "${QUICKJS_WASM:-}" ]]; then
   cp -f "$QUICKJS_WASM" "$quickjs_root/qjs.wasm"
 else
-  curl -fL -o "$quickjs_root/qjs.wasm" "$quickjs_wasm_url"
+  build_quickjs_wasm "$quickjs_root/qjs.wasm"
 fi
 wasm-tools validate "$quickjs_root/qjs.wasm"
+verify_wasm_uses_simd "$quickjs_root/qjs.wasm"
 
 echo "QuickJS installed at: $quickjs_root/qjs.wasm"
 ls -lh "$quickjs_root/qjs.wasm"

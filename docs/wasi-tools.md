@@ -24,12 +24,15 @@ This script:
 3. Installs `python3.wasm` and `lib/python3.14/` (the CPython stdlib)
    under `artifacts/python3-root/`.
 4. Downloads and extracts the pinned official Wasmer WEBc images for
-   `sharrattj/dash` `1.0.19`, `wasmer/bash` `1.0.25`,
-   `quickjs-ng/quickjs` `v0.14.0`, and `wasmer/coreutils` `1.0.19`;
-   validates their raw wasm atoms with `wasm-tools`.
-5. Builds the helios `curl-wasi` program from source with the optimized
+   `sharrattj/dash` `1.0.19`, `wasmer/bash` `1.0.25`, and
+   `wasmer/coreutils` `1.0.19`; validates their raw wasm atoms with
+   `wasm-tools`.
+5. Builds `quickjs-ng/quickjs` `v0.14.0` from source with Zig's
+   `wasm32-wasi` C toolchain, `-O3`, and `-msimd128`; the script fails if
+   the resulting `qjs.wasm` has no wasm SIMD instructions.
+6. Builds the helios `curl-wasi` program from source with the optimized
    release profile into `artifacts/wasi-tools/`.
-6. Builds the Helios WASIX conformance WAT modules for thread/futex and
+7. Builds the Helios WASIX conformance WAT modules for thread/futex and
    stack continuation execution into `artifacts/wasix/`.
 
 Artifacts produced:
@@ -38,7 +41,8 @@ Artifacts produced:
 - `artifacts/python3-root/lib/python3.14/` — CPython standard library.
 - `artifacts/wasix/dash/dash.wasm` — standard WASIX dash raw module.
 - `artifacts/wasix/bash/bash.wasm` — standard Wasmer WASIX Bash raw module.
-- `artifacts/wasix/quickjs/qjs.wasm` — standard QuickJS WASI raw module.
+- `artifacts/wasix/quickjs/qjs.wasm` — QuickJS-NG WASI raw module built
+  from source with wasm SIMD enabled.
 - `artifacts/wasix/coreutils/coreutils.wasm` — standard Wasmer
   coreutils WASIX raw module. `boot-artifacts.toml` exposes the same
   module as `/bin/cat`, `/bin/env`, `/bin/head`, `/bin/ls`,
@@ -57,14 +61,14 @@ environment, place a pre-downloaded
 `python-${VERSION}-wasi_sdk-24.zip` somewhere and pass its path via
 `CPYTHON_WASI_ZIP=/path/to/zip tools/wasi-apps/build.sh`.
 
-The shell and coreutils artifacts must be official Wasmer package payloads;
-QuickJS is staged from the matching official QuickJS-NG WASI release asset.
+The shell and coreutils artifacts must be official Wasmer package payloads.
+QuickJS is built locally from the matching QuickJS-NG source archive so the
+Helios wasm artifact uses SIMD instead of forcing Linux down to scalar code.
 The Fedora/QEMU native QuickJS benchmark inspects
-`artifacts/wasix/quickjs/qjs.wasm` before provisioning: if that wasm contains
-SIMD instructions, native QuickJS is built with native SIMD enabled; otherwise
-native QuickJS is built with SIMD disabled so `quickjs-loop` does not compare a
-vectorized Linux interpreter against a scalar Helios interpreter. Explicit SIMD
-throughput is measured by the separate `wasm-simd-lanes` workload.
+`artifacts/wasix/quickjs/qjs.wasm` before provisioning: if that wasm does not
+contain SIMD instructions, the benchmark fails and asks for a rebuilt QuickJS
+artifact. When QuickJS is present, native QuickJS is built from the same
+QuickJS-NG source with native SIMD enabled.
 In an offline environment, pass the raw modules:
 
 ```bash
@@ -72,6 +76,14 @@ WASIX_DASH_WASM=/path/to/official/dash.wasm \
 WASIX_BASH_WASM=/path/to/official/bash.wasm \
 QUICKJS_WASM=/path/to/official/qjs.wasm \
 COREUTILS_WASM=/path/to/official/coreutils.wasm \
+tools/wasi-apps/build.sh
+```
+
+`QUICKJS_WASM` must already contain wasm SIMD instructions. To avoid a network
+fetch while still building QuickJS locally, pass the source archive:
+
+```bash
+QUICKJS_SOURCE_ARCHIVE=/path/to/quickjs-ng-0.14.0.tar.gz \
 tools/wasi-apps/build.sh
 ```
 

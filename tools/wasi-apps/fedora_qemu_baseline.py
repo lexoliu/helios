@@ -87,44 +87,33 @@ def wasm_uses_simd(repo_root: Path, path: Path) -> bool:
     return any(token in text for token in simd_tokens)
 
 
-# QuickJS measures interpreter/runtime CPU cost, not vector throughput. Keep the
-# Fedora native build in SIMD lockstep with the Helios wasm artifact: if the
-# stripped wasm code has no SIMD opcodes, the Linux baseline is built with SIMD
-# and GCC auto-vectorization disabled. The separate simd-lanes workload is the
-# explicit vector-capability check, so quickjs-loop cannot accidentally become
-# "Fedora native SIMD vs Helios scalar wasm" evidence.
+# QuickJS measures interpreter/runtime CPU cost, not vector throughput, but the
+# benchmark should still look like a real optimized deployment. Helios must run
+# a SIMD-capable QuickJS wasm artifact, and Fedora must run the same QuickJS-NG
+# source with native SIMD enabled. A scalar QuickJS wasm is benchmark setup
+# drift, not a condition to paper over by disabling Linux SIMD.
 def quickjs_native_policy(repo_root: Path) -> dict:
     wasm_path = quickjs_wasm_artifact(repo_root)
     uses_simd = wasm_uses_simd(repo_root, wasm_path)
     relative_wasm = wasm_path.relative_to(repo_root)
-    if uses_simd:
-        return {
-            "id": f"quickjs-{QUICKJS_VERSION}-native-simd",
-            "wasm_path": str(relative_wasm),
-            "wasm_uses_simd": True,
-            "cmake_c_flags_release": "-O2 -DNDEBUG -mcpu=native",
-            "baseline_strategy": (
-                "built from QuickJS-NG v0.14.0 source with native SIMD enabled "
-                "because the Helios WASI QuickJS artifact contains wasm SIMD instructions"
-            ),
-            "native_simd_policy": (
-                "enabled for QuickJS fairness; Helios and Fedora both execute SIMD-capable QuickJS"
-            ),
-        }
+    if not uses_simd:
+        raise SystemExit(
+            "QuickJS benchmark requires a SIMD-capable Helios wasm artifact; "
+            f"{relative_wasm} contains no wasm SIMD instructions. Rebuild WASI "
+            "artifacts with tools/wasi-apps/build.sh or provide a SIMD "
+            "QUICKJS_WASM."
+        )
     return {
-        "id": f"quickjs-{QUICKJS_VERSION}-native-nosimd-novec",
+        "id": f"quickjs-{QUICKJS_VERSION}-native-simd-o3",
         "wasm_path": str(relative_wasm),
-        "wasm_uses_simd": False,
-        "cmake_c_flags_release": (
-            "-O2 -DNDEBUG -march=armv8-a+nosimd "
-            "-fno-tree-vectorize -fno-tree-slp-vectorize"
-        ),
+        "wasm_uses_simd": True,
+        "cmake_c_flags_release": "-O3 -DNDEBUG -mcpu=native",
         "baseline_strategy": (
-            "built from QuickJS-NG v0.14.0 source with native vectorization disabled "
-            "because the Helios WASI QuickJS artifact does not contain wasm SIMD instructions"
+            "built from QuickJS-NG v0.14.0 source with native SIMD enabled "
+            "because the Helios WASI QuickJS artifact contains wasm SIMD instructions"
         ),
         "native_simd_policy": (
-            "disabled for QuickJS fairness; native SIMD is measured only by the separate simd-lanes workload"
+            "enabled for QuickJS realism; Helios and Fedora both execute SIMD-capable QuickJS"
         ),
     }
 
@@ -149,16 +138,18 @@ def resolve_quickjs_source_archive(
     repo_root: Path,
     asset_dir: Path,
     archive: Path | None,
-) -> Path:
+) -> Path | None:
     resolved = resolve_optional_path(repo_root, archive)
     if resolved is None:
         resolved = asset_dir / "sources" / QUICKJS_SOURCE_ARCHIVE_NAME
     if resolved.is_file():
         return resolved
+    if archive is None:
+        return None
     raise SystemExit(
-        "QuickJS native baseline requires a pre-staged source archive for offline "
-        f"Fedora provisioning: {resolved}. Expected QuickJS-NG v{QUICKJS_VERSION} "
-        f"source from {QUICKJS_SOURCE_URL}."
+        "explicit QuickJS native source archive does not exist: "
+        f"{resolved}. Expected QuickJS-NG v{QUICKJS_VERSION} source from "
+        f"{QUICKJS_SOURCE_URL}."
     )
 
 
@@ -392,6 +383,7 @@ def ensure_provisioned(
     port: int,
     timeout_seconds: int,
     quickjs_policy: dict | None,
+    quickjs_source_archive_available: bool,
     require_simd_probe: bool,
 ) -> None:
     marker = "/var/lib/helios-fedora-qemu-bench-provisioned"
@@ -427,6 +419,14 @@ def ensure_provisioned(
     )
     if ssh_output(repo_root, key, port, f"({verify_command}) && echo yes || true", timeout=20) == "yes":
         return
+    if quickjs_policy is not None and not quickjs_source_archive_available:
+        raise SystemExit(
+            "Fedora guest QuickJS is not already provisioned with policy "
+            f"{quickjs_policy['id']}, and no local QuickJS-NG v{QUICKJS_VERSION} "
+            "source archive is staged for offline rebuild. Place the archive at "
+            f"{DEFAULT_ASSET_DIR}/sources/{QUICKJS_SOURCE_ARCHIVE_NAME} or pass "
+            "--quickjs-source-archive."
+        )
     package_list = " ".join(shlex.quote(package) for package in FEDORA_PACKAGES)
     command_parts = [f"({base_verify_command}) || sudo dnf install -y {package_list}"]
     if quickjs_policy is not None:
@@ -669,6 +669,8 @@ def run_fedora_qemu_linux(
     }
     if quickjs_source_archive is not None:
         provenance["quickjs_source_archive"] = str(quickjs_source_archive)
+    elif quickjs_required:
+        provenance["quickjs_source_archive"] = "not-staged; using pre-provisioned guest qjs"
     if not native_workloads:
         return None, provenance
     port = ssh_port or free_tcp_port()
@@ -682,6 +684,7 @@ def run_fedora_qemu_linux(
             port,
             setup_timeout_seconds,
             quickjs_policy,
+            quickjs_source_archive is not None,
             simd_probe_required,
         )
         provenance.update(
