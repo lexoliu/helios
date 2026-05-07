@@ -34,6 +34,7 @@ pub(crate) mod user_memory;
 pub mod wasi;
 pub(crate) mod wasix;
 
+use bytes::Bytes;
 use helios_hal::cpu::Cpu;
 use wasmtime::component::Component;
 use wasmtime::{Engine, Module, Precompiled};
@@ -58,6 +59,7 @@ impl CompiledComponent for WasmtimeCompiledComponent {}
 
 /// Wasmtime-backed compiled Preview1 core-module artifact.
 pub(crate) struct WasmtimeCompiledCoreModule {
+    pub(crate) cache_key: Bytes,
     pub(crate) module: Module,
 }
 

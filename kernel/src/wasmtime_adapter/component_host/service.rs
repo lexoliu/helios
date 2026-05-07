@@ -162,6 +162,11 @@ where
     component_instance_pre_cache:
         Mutex<ComponentCache<ComponentInstancePre<StoreData<CpuImpl, HostFs>>>>,
     core_module_cache: Mutex<ComponentCache<WasmtimeCompiledCoreModule>>,
+    // Release AArch64/HVF quickjs-loop evidence: caching the Preview1 core
+    // InstancePre moved the median from 53 ms to 50-51 ms. Cache only modules
+    // whose imports are independent of per-process shared-memory binding.
+    core_module_instance_pre_cache:
+        Arc<Mutex<ComponentCache<InstancePre<Preview1ProgramStore<CpuImpl, HostFs>>>>>,
     compiler_artifact: Option<Bytes>,
     /// Lazily-built compiler kernel-plugin runtime. The plugin's
     /// `wasmtime::Module`, `InstancePre`, and 512 MiB `SharedMemory` are
@@ -1087,6 +1092,7 @@ where
             component_cache: Mutex::new(ComponentCache::new(cache_budget)),
             component_instance_pre_cache: Mutex::new(ComponentCache::new(cache_budget)),
             core_module_cache: Mutex::new(ComponentCache::new(cache_budget)),
+            core_module_instance_pre_cache: Arc::new(Mutex::new(ComponentCache::new(cache_budget))),
             compiler_artifact,
             compiler_plugin: Mutex::new(None),
             compile_in_progress: AtomicBool::new(false),
@@ -1647,6 +1653,7 @@ where
         let engine = self.inner.engine.clone();
         let preview1_core_linker = self.inner.preview1_core_linker.clone();
         let shared_memory_pool = self.inner.shared_memory_pool.clone();
+        let core_module_instance_pre_cache = self.inner.core_module_instance_pre_cache.clone();
         let spawner = exec_context.spawner.clone();
         let run_spawner = spawner.clone();
         let progress = spawner.progress_counter();
@@ -1669,6 +1676,7 @@ where
                 &runtime,
                 preview1_core_linker,
                 shared_memory_pool,
+                core_module_instance_pre_cache,
                 launched_instance,
                 output_mode,
             )
@@ -1998,7 +2006,10 @@ where
             .map_err(map_program_runtime_error)?;
         validate_preview1_program_module_imports(&module)?;
         super::emit_program_stage_marker(write_serial, "program:deserialize-core-end");
-        let compiled = Arc::new(WasmtimeCompiledCoreModule { module });
+        let compiled = Arc::new(WasmtimeCompiledCoreModule {
+            cache_key: payload.clone(),
+            module,
+        });
         let now = monotonic_nanos(&self.inner.clock_cpu);
         tracing::debug!(
             target: "helios_component_host::program_host",
@@ -4964,6 +4975,9 @@ async fn run_program_executable<CpuImpl, HostFs>(
     runtime: &crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
     preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
     shared_memory_pool: Arc<Mutex<SharedMemoryPool>>,
+    core_module_instance_pre_cache: Arc<
+        Mutex<ComponentCache<InstancePre<Preview1ProgramStore<CpuImpl, HostFs>>>>,
+    >,
     launched_instance: crate::RegisteredInstance,
     output_mode: OutputMode,
 ) -> Result<ChildExit, ProgramExecError>
@@ -5009,6 +5023,7 @@ where
                 runtime,
                 preview1_core_linker,
                 shared_memory_pool,
+                core_module_instance_pre_cache,
                 launched_instance,
                 output_mode,
             )
@@ -5031,6 +5046,7 @@ where
                 runtime,
                 preview1_core_linker,
                 shared_memory_pool,
+                core_module_instance_pre_cache,
                 launched_instance,
                 output_mode,
             )
@@ -5057,6 +5073,9 @@ async fn run_program_core_module<CpuImpl, HostFs>(
     runtime: &crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
     preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
     shared_memory_pool: Arc<Mutex<SharedMemoryPool>>,
+    core_module_instance_pre_cache: Arc<
+        Mutex<ComponentCache<InstancePre<Preview1ProgramStore<CpuImpl, HostFs>>>>,
+    >,
     launched_instance: crate::RegisteredInstance,
     output_mode: OutputMode,
 ) -> Result<ChildExit, ProgramExecError>
@@ -5112,30 +5131,80 @@ where
         );
         configure_preview1_program_store(&mut store);
 
-        let mut linker = preview1_core_linker;
-        if let Some(memory) = imported_memory {
+        let instance = if let Some(memory) = imported_memory {
+            let mut linker = preview1_core_linker;
             define_imported_shared_memory(&mut linker, &store, &compiled.module, memory)?;
-        }
 
-        super::emit_program_stage_marker(
-            exec_context.write_serial,
-            "program:instantiate-core-begin",
-        );
-        let instantiate_started = profile_cpu.now().ticks();
-        let instance = linker.instantiate_async(&mut store, &compiled.module).await;
-        record_named_program_kernel_profile(
-            &profile_runtime_state,
-            &profile_cpu,
-            "instantiate-core",
-            &profile_name,
-            instantiate_started,
-        );
-        record_program_kernel_profile(
-            &profile_runtime_state,
-            &profile_cpu,
-            "instantiate-core",
-            instantiate_started,
-        );
+            super::emit_program_stage_marker(
+                exec_context.write_serial,
+                "program:instantiate-core-begin",
+            );
+            let instantiate_started = profile_cpu.now().ticks();
+            let instance = linker.instantiate_async(&mut store, &compiled.module).await;
+            record_named_program_kernel_profile(
+                &profile_runtime_state,
+                &profile_cpu,
+                "instantiate-core",
+                &profile_name,
+                instantiate_started,
+            );
+            record_program_kernel_profile(
+                &profile_runtime_state,
+                &profile_cpu,
+                "instantiate-core",
+                instantiate_started,
+            );
+            instance
+        } else {
+            let instance_pre = if let Some(instance_pre) = core_module_instance_pre_cache
+                .lock()
+                .get(&compiled.cache_key)
+            {
+                super::emit_program_stage_marker(
+                    exec_context.write_serial,
+                    "program:instantiate-core-pre-cache-hit",
+                );
+                instance_pre
+            } else {
+                super::emit_program_stage_marker(
+                    exec_context.write_serial,
+                    "program:instantiate-core-pre-begin",
+                );
+                let instance_pre = Arc::new(
+                    preview1_core_linker
+                        .instantiate_pre(&compiled.module)
+                        .map_err(map_program_runtime_error)?,
+                );
+                super::emit_program_stage_marker(
+                    exec_context.write_serial,
+                    "program:instantiate-core-pre-end",
+                );
+                core_module_instance_pre_cache
+                    .lock()
+                    .insert_if_missing(compiled.cache_key.clone(), instance_pre)
+            };
+
+            super::emit_program_stage_marker(
+                exec_context.write_serial,
+                "program:instantiate-core-begin",
+            );
+            let instantiate_started = profile_cpu.now().ticks();
+            let instance = instance_pre.instantiate_async(&mut store).await;
+            record_named_program_kernel_profile(
+                &profile_runtime_state,
+                &profile_cpu,
+                "instantiate-core",
+                &profile_name,
+                instantiate_started,
+            );
+            record_program_kernel_profile(
+                &profile_runtime_state,
+                &profile_cpu,
+                "instantiate-core",
+                instantiate_started,
+            );
+            instance
+        };
         let instance = instance.map_err(map_program_runtime_error)?;
         super::emit_program_stage_marker(exec_context.write_serial, "program:instantiate-core-ok");
 
@@ -5231,6 +5300,7 @@ where
                 runtime,
                 replacement_core_linker,
                 shared_memory_pool,
+                core_module_instance_pre_cache,
                 replacement_instance,
                 replacement_output_mode,
             ))
@@ -5256,6 +5326,9 @@ async fn run_program_core_module_with_restore<CpuImpl, HostFs>(
     runtime: &crate::wasmtime_adapter::WasmtimeComponentRuntime<CpuImpl>,
     preview1_core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
     shared_memory_pool: Arc<Mutex<SharedMemoryPool>>,
+    core_module_instance_pre_cache: Arc<
+        Mutex<ComponentCache<InstancePre<Preview1ProgramStore<CpuImpl, HostFs>>>>,
+    >,
     launched_instance: crate::RegisteredInstance,
     output_mode: OutputMode,
 ) -> Result<ChildExit, ProgramExecError>
@@ -5442,6 +5515,7 @@ where
                 runtime,
                 replacement_core_linker,
                 shared_memory_pool,
+                core_module_instance_pre_cache,
                 replacement_instance,
                 replacement_output_mode,
             ))
