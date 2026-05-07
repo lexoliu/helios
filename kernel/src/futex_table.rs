@@ -1,6 +1,7 @@
 extern crate alloc;
 
 use hashbrown::HashMap;
+use hashbrown::hash_map::Entry;
 use triomphe::Arc;
 
 use crate::Notify;
@@ -108,13 +109,16 @@ impl FutexTable {
     }
 
     pub fn complete_wait(&mut self, registration: FutexWaitRegistration) {
-        let Some(entry) = self.entries.get_mut(&registration.key) else {
-            panic!("futex wait completion referenced an unknown key");
-        };
-        assert!(entry.waiters > 0, "futex wait completion underflow");
-        entry.waiters -= 1;
-        if entry.waiters == 0 {
-            self.entries.remove(&registration.key);
+        match self.entries.entry(registration.key) {
+            Entry::Occupied(mut entry) => {
+                let futex = entry.get_mut();
+                assert!(futex.waiters > 0, "futex wait completion underflow");
+                futex.waiters -= 1;
+                if futex.waiters == 0 {
+                    entry.remove();
+                }
+            }
+            Entry::Vacant(_) => panic!("futex wait completion referenced an unknown key"),
         }
     }
 

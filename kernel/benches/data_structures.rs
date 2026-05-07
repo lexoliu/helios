@@ -7,10 +7,11 @@ use helios_hal::fs::FileRights;
 use helios_hal::resource::KernelResource;
 use helios_kernel::{
     ComponentHostNetworkService, ComponentNetworkService, DescriptorId, DescriptorTable, DnsError,
-    DnsErrorKind, Ipv4Address, Ipv4Cidr, Ipv4Route, MacAddress, NetworkAdminBackend,
-    NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail, NetworkIpAddress, NetworkPortId,
-    PingError, PingErrorKind, PingReply, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TryRead,
-    UdpBinding, UdpDatagram, UdpError, UdpErrorKind, byte_channel,
+    DnsErrorKind, FutexKey, FutexTable, GuestAddress, Ipv4Address, Ipv4Cidr, Ipv4Route, MacAddress,
+    NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
+    NetworkIpAddress, NetworkPortId, PingError, PingErrorKind, PingReply, ProcessMemoryIdentity,
+    TcpAccepted, TcpError, TcpErrorKind, TcpListener, TryRead, UdpBinding, UdpDatagram, UdpError,
+    UdpErrorKind, byte_channel,
 };
 use spin::{Mutex, Once};
 
@@ -129,6 +130,24 @@ fn byte_channel_write_try_read(bencher: Bencher, count: usize) {
 fn byte_channel_create_drop(bencher: Bencher) {
     bencher.bench_local(|| {
         black_box(byte_channel());
+    });
+}
+
+#[divan::bench(args = [1usize, 16, 64])]
+fn futex_prepare_complete_distinct_keys(bencher: Bencher, count: usize) {
+    let memory = ProcessMemoryIdentity::new(1);
+    bencher.counter(ItemsCount::new(count)).bench_local(|| {
+        let mut table = FutexTable::new();
+        let mut registrations = [const { None }; 64];
+        for (index, registration) in registrations.iter_mut().take(count).enumerate() {
+            *registration = Some(table.prepare_wait(FutexKey::new(
+                memory,
+                GuestAddress::new(u64::try_from(index + 1).expect("futex bench address fits")),
+            )));
+        }
+        for registration in registrations.into_iter().take(count).flatten() {
+            table.complete_wait(registration);
+        }
     });
 }
 
