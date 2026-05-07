@@ -11,6 +11,13 @@
         "-e",
         "let s = 0; for (let i = 0; i < 250000; i++) s = (s + ((i * 17) % 97)) | 0; console.log(\"quickjs-loop:\" + s);"
       ],
+      "wasmtime_profile": {
+        "wasm_path": "artifacts/wasix/quickjs/qjs.wasm",
+        "args": [
+          "-e",
+          "let s = 0; for (let i = 0; i < 250000; i++) s = (s + ((i * 17) % 97)) | 0; console.log(\"quickjs-loop:\" + s);"
+        ]
+      },
       "boot_programs": ["quickjs"],
       "stdout_contains": ["quickjs-loop:"],
       "stderr_empty": true
@@ -27,6 +34,7 @@
       ],
       "wasmtime_profile": {
         "wasm_path": "artifacts/python3-root/python3.wasm",
+        "guest_paths": ["artifacts/python3-root"],
         "wasmtime_flags": ["--dir", "{repo_root}/artifacts/python3-root::/"],
         "args": [
           "-c",
@@ -48,6 +56,7 @@
       ],
       "wasmtime_profile": {
         "wasm_path": "artifacts/python3-root/python3.wasm",
+        "guest_paths": ["artifacts/python3-root"],
         "wasmtime_flags": ["--dir", "{repo_root}/artifacts/python3-root::/"],
         "args": [
           "-c",

@@ -220,6 +220,25 @@ CPython import-heavy startup, and QuickJS execution. Logs are written under
 `target/perf-baselines/`. Set `HELIOS_WORKLOAD_BENCH_WORKLOADS` to a
 comma-separated workload list when narrowing a run.
 
+The Helios/Linux gap report has three timing lines: Helios AArch64/HVF,
+native Fedora AArch64 under QEMU/HVF, and Wasmtime running the same wasm
+artifact inside that Fedora guest. Wasmtime-on-Linux is the floor: every
+workload with a `wasmtime_profile` entry in `tools/wasi-apps/workloads.json`
+must be beaten by Helios before the result is acceptable.
+
+```bash
+tools/wasi-apps/linux-gap-bench.sh \
+  --workload quickjs-loop \
+  --wasmtime-linux-bin /path/to/aarch64-linux/wasmtime
+```
+
+The benchmark itself must not depend on internet access. If the Fedora guest
+does not already contain Wasmtime, provide either `--wasmtime-linux-bin` with
+an AArch64 Linux executable or `--wasmtime-linux-archive` with a pre-staged
+AArch64 Linux Wasmtime tar archive. Workloads without `wasmtime_profile` are
+reported as uncovered by the floor rather than silently approximated through
+a different program or ABI.
+
 To collect Wasmtime's native Linux profiling artifacts for the same wasm
 workloads, pass `--wasmtime-profile-workload <name>` to
 `tools/wasi-apps/linux-gap-bench.sh`. The default mode is `jitdump`, which

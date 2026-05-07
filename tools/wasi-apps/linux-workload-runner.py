@@ -112,6 +112,35 @@ def render_program(
     return rendered
 
 
+def render_wasmtime_command(
+    workload: dict,
+    host_http_url: str | None,
+    host_tcp_host: str | None,
+    host_tcp_port: int | None,
+    wasmtime_bin: str,
+) -> list[str]:
+    profile = workload.get("wasmtime_profile")
+    if not profile:
+        raise SystemExit(f"workload {workload['name']} does not define wasmtime_profile")
+    wasm_path = profile.get("wasm_path")
+    if not wasm_path:
+        raise SystemExit(f"workload {workload['name']} wasmtime_profile is missing wasm_path")
+    command = [wasmtime_bin, "run"]
+    command.extend(
+        render_template(flag, host_http_url, host_tcp_host, host_tcp_port, workload)
+        for flag in profile.get("wasmtime_flags", [])
+    )
+    rendered_wasm = render_template(wasm_path, host_http_url, host_tcp_host, host_tcp_port, workload)
+    if not Path(rendered_wasm).is_absolute():
+        rendered_wasm = str(Path(__file__).resolve().parents[2] / rendered_wasm)
+    command.append(rendered_wasm)
+    command.extend(
+        render_template(arg, host_http_url, host_tcp_host, host_tcp_port, workload)
+        for arg in profile.get("args", workload.get("args", []))
+    )
+    return command
+
+
 def validate_output(workload: dict, stdout: bytes, stderr: bytes) -> None:
     stdout_text = stdout.decode("utf-8", errors="replace")
     for expected in workload.get("stdout_contains", []):
@@ -134,13 +163,29 @@ def main() -> None:
     parser.add_argument("--host-http-url")
     parser.add_argument("--host-tcp-host")
     parser.add_argument("--host-tcp-port", type=int)
+    parser.add_argument("--mode", choices=["native", "wasmtime"], default="native")
+    parser.add_argument("--wasmtime-bin", default="wasmtime")
     args = parser.parse_args()
 
     manifest = load_manifest(args.manifest)
     workload = selected_workload(manifest, args.workload)
     env = os.environ.copy()
     env["HELIOS_PROCESS_ID"] = str(os.getpid())
-    if workload["runner"] == "shell":
+    if args.mode == "wasmtime":
+        completed = subprocess.run(
+            render_wasmtime_command(
+                workload,
+                args.host_http_url,
+                args.host_tcp_host,
+                args.host_tcp_port,
+                args.wasmtime_bin,
+            ),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    elif workload["runner"] == "shell":
         completed = subprocess.run(
             [
                 "/bin/sh",

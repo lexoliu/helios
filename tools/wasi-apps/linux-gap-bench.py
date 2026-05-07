@@ -415,7 +415,9 @@ def run_linux(
     host_tcp_host: str | None,
     linux_tcp_port: int | None,
     quickjs_source_archive: Path | None,
-) -> tuple[Path | None, dict]:
+    wasmtime_linux_bin: Path | None,
+    wasmtime_linux_archive: Path | None,
+) -> tuple[Path | None, Path | None, dict]:
     return run_fedora_qemu_linux(
         repo_root(),
         out_dir,
@@ -433,6 +435,8 @@ def run_linux(
         host_tcp_host,
         linux_tcp_port,
         quickjs_source_archive,
+        wasmtime_linux_bin,
+        wasmtime_linux_archive,
     )
 
 
@@ -720,13 +724,20 @@ def ratio(helios_ms: int | None, linux_seconds: float | None) -> str:
     return f"{helios_ms / linux_ms:.2f}x"
 
 
-def comparison_rows(workloads: list[dict], helios: dict[str, dict], linux: dict[str, dict]) -> list[dict]:
+def comparison_rows(
+    workloads: list[dict],
+    helios: dict[str, dict],
+    linux: dict[str, dict],
+    wasmtime_linux: dict[str, dict],
+) -> list[dict]:
     rows = []
     for workload in workloads:
         helios_summary = helios.get(workload["name"])
         linux_summary = linux.get(workload["name"])
+        wasmtime_summary = wasmtime_linux.get(workload["name"])
         helios_ms = helios_summary.get("median_elapsed_ms") if helios_summary else None
         linux_seconds = linux_summary.get("median") if linux_summary else None
+        wasmtime_seconds = wasmtime_summary.get("median") if wasmtime_summary else None
         throughput_bytes = workload.get("throughput_bytes")
         rows.append(
             {
@@ -734,6 +745,9 @@ def comparison_rows(workloads: list[dict], helios: dict[str, dict], linux: dict[
                 "class": workload["class"],
                 "helios_ms": helios_ms,
                 "linux_ms": linux_seconds * 1000.0 if linux_seconds is not None else None,
+                "wasmtime_linux_ms": wasmtime_seconds * 1000.0
+                if wasmtime_seconds is not None
+                else None,
                 "throughput_bytes": throughput_bytes,
             }
         )
@@ -744,26 +758,43 @@ def comparison_summary(
     workloads: list[dict],
     helios: dict[str, dict],
     linux: dict[str, dict],
+    wasmtime_linux: dict[str, dict],
 ) -> list[dict]:
     summary = []
     for workload in workloads:
         helios_summary = helios.get(workload["name"])
         linux_summary = linux.get(workload["name"])
+        wasmtime_summary = wasmtime_linux.get(workload["name"])
         helios_ms = helios_summary.get("median_elapsed_ms") if helios_summary else None
         linux_seconds = linux_summary.get("median") if linux_summary else None
         linux_ms = linux_seconds * 1000.0 if linux_seconds is not None else None
+        wasmtime_seconds = wasmtime_summary.get("median") if wasmtime_summary else None
+        wasmtime_ms = wasmtime_seconds * 1000.0 if wasmtime_seconds is not None else None
         byte_count = workload.get("throughput_bytes")
         ratio_value = helios_ms / linux_ms if helios_ms is not None and linux_ms else None
+        wasmtime_ratio_value = (
+            helios_ms / wasmtime_ms
+            if helios_ms is not None and wasmtime_ms
+            else None
+        )
         summary.append(
             {
                 "name": workload["name"],
                 "class": workload["class"],
                 "helios_median_ms": helios_ms,
                 "linux_median_ms": linux_ms,
+                "wasmtime_linux_median_ms": wasmtime_ms,
                 "helios_to_linux_ratio": ratio_value,
+                "helios_to_wasmtime_linux_ratio": wasmtime_ratio_value,
+                "helios_beats_wasmtime_linux": (
+                    helios_ms < wasmtime_ms
+                    if helios_ms is not None and wasmtime_ms is not None
+                    else None
+                ),
                 "throughput_bytes": byte_count,
                 "helios_mib_per_second": throughput_mib_s(byte_count, helios_ms),
                 "linux_mib_per_second": throughput_mib_s(byte_count, linux_ms),
+                "wasmtime_linux_mib_per_second": throughput_mib_s(byte_count, wasmtime_ms),
                 "helios_validation_ok": bool(
                     helios_summary and helios_summary["validation"]["ok"]
                 ),
@@ -779,6 +810,7 @@ def write_summary_json(
     run_record: dict,
     helios: dict[str, dict],
     linux: dict[str, dict],
+    wasmtime_linux: dict[str, dict],
     linux_provenance: dict | None,
     host_load: dict,
     network_perf: list[dict],
@@ -790,6 +822,12 @@ def write_summary_json(
         "schema_version": 1,
         "helios_git_sha": run_record.get("git_sha", git_sha()),
         "linux_baseline": linux_provenance,
+        "wasmtime_linux_baseline": {
+            "kind": "wasmtime-on-fedora-qemu-aarch64-hvf",
+            "workloads": [
+                workload["name"] for workload in workloads if workload.get("wasmtime_profile")
+            ],
+        },
         "vm": run_record.get("vm"),
         "host": {
             "cpu": host_cpu(),
@@ -798,7 +836,7 @@ def write_summary_json(
             "load": host_load["load"],
             "top_cpu_processes": host_load["top_cpu_processes"],
         },
-        "workloads": comparison_summary(workloads, helios, linux),
+        "workloads": comparison_summary(workloads, helios, linux, wasmtime_linux),
         "network_hotspots": [
             {
                 "name": row["name"],
@@ -844,37 +882,51 @@ def throughput_mib_s(byte_count: int | None, elapsed_ms: float | int | None) -> 
     return (byte_count / (1024.0 * 1024.0)) / (elapsed_ms / 1000.0)
 
 
-def throughput_pair(workload: dict, helios_ms: int | None, linux_seconds: float | None) -> str:
+def throughput_pair(
+    workload: dict,
+    helios_ms: int | None,
+    linux_seconds: float | None,
+    wasmtime_seconds: float | None,
+) -> str:
     byte_count = workload.get("throughput_bytes")
     helios_rate = throughput_mib_s(byte_count, helios_ms)
     linux_rate = throughput_mib_s(
         byte_count,
         linux_seconds * 1000.0 if linux_seconds is not None else None,
     )
+    wasmtime_rate = throughput_mib_s(
+        byte_count,
+        wasmtime_seconds * 1000.0 if wasmtime_seconds is not None else None,
+    )
     helios_text = "n/a" if helios_rate is None else f"{helios_rate:.1f} MiB/s"
     linux_text = "n/a" if linux_rate is None else f"{linux_rate:.1f} MiB/s"
+    wasmtime_text = "n/a" if wasmtime_rate is None else f"{wasmtime_rate:.1f} MiB/s"
     if byte_count is None:
         return "n/a"
-    return f"H {helios_text} / L {linux_text}"
+    return f"H {helios_text} / L {linux_text} / W {wasmtime_text}"
 
 
 def write_svg(path: Path, rows: list[dict]) -> None:
     drawable_rows = [
-        row for row in rows if row["helios_ms"] is not None or row["linux_ms"] is not None
+        row
+        for row in rows
+        if row["helios_ms"] is not None
+        or row["linux_ms"] is not None
+        or row["wasmtime_linux_ms"] is not None
     ]
     if not drawable_rows:
         return
-    width = 1040
+    width = 1180
     left = 180
-    right = 140
+    right = 190
     top = 70
-    row_height = 54
-    bar_height = 15
+    row_height = 68
+    bar_height = 14
     gap = 4
     max_ms = max(
         value
         for row in drawable_rows
-        for value in [row["helios_ms"], row["linux_ms"]]
+        for value in [row["helios_ms"], row["linux_ms"], row["wasmtime_linux_ms"]]
         if value is not None
     )
     max_ms = max(max_ms, 1.0)
@@ -884,15 +936,17 @@ def write_svg(path: Path, rows: list[dict]) -> None:
         '<?xml version="1.0" encoding="UTF-8"?>',
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#ffffff"/>',
-        '<text x="32" y="34" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="22" font-weight="700" fill="#111827">Helios vs Fedora QEMU Linux Median Timing</text>',
-        '<text x="32" y="58" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#4b5563">Lower is better. Linux is a Fedora aarch64 guest under QEMU/HVF with virtio devices.</text>',
+        '<text x="32" y="34" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="22" font-weight="700" fill="#111827">Helios vs Fedora Native vs Fedora Wasmtime</text>',
+        '<text x="32" y="58" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#4b5563">Lower is better. Both baselines run inside the same Fedora aarch64 QEMU/HVF guest.</text>',
         f'<line x1="{left}" y1="{top - 14}" x2="{left + chart_width}" y2="{top - 14}" stroke="#d1d5db" stroke-width="1"/>',
         f'<text x="{left}" y="{top - 22}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="12" fill="#6b7280">0 ms</text>',
         f'<text x="{left + chart_width - 64}" y="{top - 22}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="12" fill="#6b7280">{max_ms:.1f} ms</text>',
-        f'<rect x="{width - 250}" y="28" width="14" height="14" fill="#2563eb" rx="2"/>',
-        f'<text x="{width - 230}" y="40" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#374151">Helios</text>',
-        f'<rect x="{width - 160}" y="28" width="14" height="14" fill="#f97316" rx="2"/>',
-        f'<text x="{width - 140}" y="40" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#374151">Fedora</text>',
+        f'<rect x="{width - 390}" y="28" width="14" height="14" fill="#2563eb" rx="2"/>',
+        f'<text x="{width - 370}" y="40" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#374151">Helios</text>',
+        f'<rect x="{width - 295}" y="28" width="14" height="14" fill="#f97316" rx="2"/>',
+        f'<text x="{width - 275}" y="40" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#374151">Fedora native</text>',
+        f'<rect x="{width - 165}" y="28" width="14" height="14" fill="#10b981" rx="2"/>',
+        f'<text x="{width - 145}" y="40" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#374151">Wasmtime</text>',
     ]
     previous_class = None
     for index, row in enumerate(drawable_rows):
@@ -909,6 +963,7 @@ def write_svg(path: Path, rows: list[dict]) -> None:
         for offset, key, color in [
             (12, "helios_ms", "#2563eb"),
             (12 + bar_height + gap, "linux_ms", "#f97316"),
+            (12 + (bar_height + gap) * 2, "wasmtime_linux_ms", "#10b981"),
         ]:
             value = row[key]
             label = "n/a" if value is None else f"{value:.2f} ms"
@@ -921,9 +976,16 @@ def write_svg(path: Path, rows: list[dict]) -> None:
             )
         helios_ms = row["helios_ms"]
         linux_ms = row["linux_ms"]
-        ratio_text = "n/a" if helios_ms is None or linux_ms in (None, 0) else f"{helios_ms / linux_ms:.2f}x"
+        wasmtime_ms = row["wasmtime_linux_ms"]
+        linux_ratio = "n/a" if helios_ms is None or linux_ms in (None, 0) else f"L {helios_ms / linux_ms:.2f}x"
+        wasmtime_ratio = (
+            "W n/a"
+            if helios_ms is None or wasmtime_ms in (None, 0)
+            else f"W {helios_ms / wasmtime_ms:.2f}x"
+        )
+        ratio_text = f"{linux_ratio} / {wasmtime_ratio}"
         lines.append(
-            f'<text x="{width - 94}" y="{y + 31}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" font-weight="700" fill="#111827">{ratio_text}</text>'
+            f'<text x="{width - 160}" y="{y + 38}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="12" font-weight="700" fill="#111827">{ratio_text}</text>'
         )
     lines.append("</svg>")
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -934,23 +996,31 @@ def write_throughput_svg(path: Path, rows: list[dict]) -> bool:
     for row in rows:
         helios_rate = throughput_mib_s(row["throughput_bytes"], row["helios_ms"])
         linux_rate = throughput_mib_s(row["throughput_bytes"], row["linux_ms"])
-        if helios_rate is None and linux_rate is None:
+        wasmtime_rate = throughput_mib_s(row["throughput_bytes"], row["wasmtime_linux_ms"])
+        if helios_rate is None and linux_rate is None and wasmtime_rate is None:
             continue
-        drawable_rows.append({**row, "helios_rate": helios_rate, "linux_rate": linux_rate})
+        drawable_rows.append(
+            {
+                **row,
+                "helios_rate": helios_rate,
+                "linux_rate": linux_rate,
+                "wasmtime_linux_rate": wasmtime_rate,
+            }
+        )
     if not drawable_rows:
         return False
 
-    width = 1040
+    width = 1180
     left = 220
-    right = 150
+    right = 190
     top = 74
-    row_height = 58
-    bar_height = 16
+    row_height = 72
+    bar_height = 15
     gap = 5
     max_rate = max(
         value
         for row in drawable_rows
-        for value in [row["helios_rate"], row["linux_rate"]]
+        for value in [row["helios_rate"], row["linux_rate"], row["wasmtime_linux_rate"]]
         if value is not None
     )
     max_rate = max(max_rate, 1.0)
@@ -965,10 +1035,12 @@ def write_throughput_svg(path: Path, rows: list[dict]) -> bool:
         f'<line x1="{left}" y1="{top - 14}" x2="{left + chart_width}" y2="{top - 14}" stroke="#d1d5db" stroke-width="1"/>',
         f'<text x="{left}" y="{top - 22}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="12" fill="#6b7280">0 MiB/s</text>',
         f'<text x="{left + chart_width - 86}" y="{top - 22}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="12" fill="#6b7280">{max_rate:.1f} MiB/s</text>',
-        f'<rect x="{width - 250}" y="28" width="14" height="14" fill="#2563eb" rx="2"/>',
-        f'<text x="{width - 230}" y="40" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#374151">Helios</text>',
-        f'<rect x="{width - 160}" y="28" width="14" height="14" fill="#f97316" rx="2"/>',
-        f'<text x="{width - 140}" y="40" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#374151">Fedora</text>',
+        f'<rect x="{width - 390}" y="28" width="14" height="14" fill="#2563eb" rx="2"/>',
+        f'<text x="{width - 370}" y="40" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#374151">Helios</text>',
+        f'<rect x="{width - 295}" y="28" width="14" height="14" fill="#f97316" rx="2"/>',
+        f'<text x="{width - 275}" y="40" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#374151">Fedora native</text>',
+        f'<rect x="{width - 165}" y="28" width="14" height="14" fill="#10b981" rx="2"/>',
+        f'<text x="{width - 145}" y="40" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" fill="#374151">Wasmtime</text>',
     ]
     for index, row in enumerate(drawable_rows):
         y = top + index * row_height
@@ -983,6 +1055,7 @@ def write_throughput_svg(path: Path, rows: list[dict]) -> bool:
         for offset, key, color in [
             (12, "helios_rate", "#2563eb"),
             (12 + bar_height + gap, "linux_rate", "#f97316"),
+            (12 + (bar_height + gap) * 2, "wasmtime_linux_rate", "#10b981"),
         ]:
             value = row[key]
             label = "n/a" if value is None else f"{value:.1f} MiB/s"
@@ -995,9 +1068,20 @@ def write_throughput_svg(path: Path, rows: list[dict]) -> bool:
             )
         helios_rate = row["helios_rate"]
         linux_rate = row["linux_rate"]
-        ratio_text = "n/a" if helios_rate is None or linux_rate in (None, 0) else f"{helios_rate / linux_rate:.2f}x"
+        wasmtime_rate = row["wasmtime_linux_rate"]
+        linux_ratio = (
+            "L n/a"
+            if helios_rate is None or linux_rate in (None, 0)
+            else f"L {helios_rate / linux_rate:.2f}x"
+        )
+        wasmtime_ratio = (
+            "W n/a"
+            if helios_rate is None or wasmtime_rate in (None, 0)
+            else f"W {helios_rate / wasmtime_rate:.2f}x"
+        )
+        ratio_text = f"{linux_ratio} / {wasmtime_ratio}"
         lines.append(
-            f'<text x="{width - 98}" y="{y + 34}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="13" font-weight="700" fill="#111827">{ratio_text}</text>'
+            f'<text x="{width - 160}" y="{y + 40}" font-family="ui-sans-serif, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="12" font-weight="700" fill="#111827">{ratio_text}</text>'
         )
     lines.append("</svg>")
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -1010,13 +1094,15 @@ def write_report(
     workloads: list[dict],
     helios_jsonl: Path | None,
     linux_json: Path | None,
+    wasmtime_linux_json: Path | None,
     linux_provenance: dict | None,
     host_load: dict,
     wasmtime_profiles: list[Path],
 ) -> None:
     run_record, helios = parse_jsonl(helios_jsonl)
     linux = parse_hyperfine(linux_json)
-    rows = comparison_rows(workloads, helios, linux)
+    wasmtime_linux = parse_hyperfine(wasmtime_linux_json)
+    rows = comparison_rows(workloads, helios, linux, wasmtime_linux)
     perf_metric_paths = helios_perf_metric_paths(helios_jsonl)
     helios_kernel_flamegraphs = render_helios_kernel_flamegraphs(helios_jsonl)
     helios_kernel_profile_top = helios_kernel_profile_top_rows(helios_jsonl)
@@ -1034,6 +1120,7 @@ def write_report(
         run_record,
         helios,
         linux,
+        wasmtime_linux,
         linux_provenance,
         host_load,
         network_perf,
@@ -1042,15 +1129,17 @@ def write_report(
         helios_kernel_profile_top,
     )
     lines = [
-        "# Helios vs Fedora QEMU Linux Benchmark",
+        "# Helios vs Fedora QEMU Linux and Wasmtime Benchmark",
         "",
-        "![Helios vs Fedora Linux median timings](helios-vs-linux.svg)",
+        "![Helios vs Fedora native and Wasmtime median timings](helios-vs-linux.svg)",
         "",
         f"- Helios JSONL: `{helios_jsonl or 'not-run'}`",
         f"- Linux Hyperfine JSON: `{linux_json or 'not-run'}`",
+        f"- Wasmtime-on-Linux Hyperfine JSON: `{wasmtime_linux_json or 'not-run'}`",
         f"- Machine-readable summary: `{summary_json}`",
         f"- Helios git SHA: `{run_record.get('git_sha', git_sha())}`",
         f"- Linux baseline: `{(linux_provenance or {}).get('kind', 'not-run')}`",
+        f"- Wasmtime-on-Linux: `{(linux_provenance or {}).get('wasmtime_linux', 'not-run')}`",
         f"- Host CPU: `{host_cpu()}`",
         f"- Host logical CPUs: `{os.cpu_count()}`",
         f"- Host memory: `{host_memory()}`",
@@ -1063,6 +1152,45 @@ def write_report(
         for key, value in linux_provenance.items():
             lines.append(f"- {key.replace('_', ' ').title()}: `{value}`")
         lines.append("")
+    wasmtime_floor_failures = []
+    wasmtime_floor_missing = []
+    for workload in workloads:
+        helios_summary = helios.get(workload["name"])
+        wasmtime_summary = wasmtime_linux.get(workload["name"])
+        if not workload.get("wasmtime_profile"):
+            wasmtime_floor_missing.append(workload["name"])
+            continue
+        helios_ms = helios_summary.get("median_elapsed_ms") if helios_summary else None
+        wasmtime_seconds = wasmtime_summary.get("median") if wasmtime_summary else None
+        wasmtime_ms = wasmtime_seconds * 1000.0 if wasmtime_seconds is not None else None
+        if helios_ms is None or wasmtime_ms is None or helios_ms >= wasmtime_ms:
+            wasmtime_floor_failures.append((workload["name"], helios_ms, wasmtime_ms))
+    if wasmtime_linux or wasmtime_floor_failures or wasmtime_floor_missing:
+        lines.extend(
+            [
+                "## Wasmtime-On-Linux Floor",
+                "",
+                "Target: Helios must be faster than Wasmtime running the same wasm artifact inside the Fedora QEMU/HVF Linux guest. Native Linux remains the aspirational CPU baseline and the IO target to beat.",
+                "",
+            ]
+        )
+        if wasmtime_floor_failures:
+            lines.extend(["| Workload | Helios median | Wasmtime median | Floor |", "| --- | ---: | ---: | --- |"])
+            for name, helios_ms, wasmtime_ms in wasmtime_floor_failures:
+                helios_text = "n/a" if helios_ms is None else f"{helios_ms} ms"
+                wasmtime_text = "n/a" if wasmtime_ms is None else f"{wasmtime_ms:.2f} ms"
+                lines.append(f"| `{name}` | {helios_text} | {wasmtime_text} | fail |")
+            lines.append("")
+        else:
+            lines.extend(["- All workloads with a Wasmtime-on-Linux baseline pass the floor.", ""])
+        if wasmtime_floor_missing:
+            missing = ", ".join(f"`{name}`" for name in wasmtime_floor_missing)
+            lines.extend(
+                [
+                    f"- No Wasmtime-on-Linux baseline is defined for: {missing}.",
+                    "",
+                ]
+            )
     quickjs_fairness = quickjs_simd_fairness(linux_provenance)
     if quickjs_fairness:
         lines.extend(
@@ -1193,22 +1321,29 @@ def write_report(
             [
                 f"## {title}",
                 "",
-                "| Workload | Helios median | Linux median | Ratio | Throughput | Validation |",
-                "| --- | ---: | ---: | ---: | ---: | --- |",
+                "| Workload | Helios median | Linux median | Wasmtime median | H/Linux | H/Wasmtime | Throughput | Validation |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
             ]
         )
         for workload in class_workloads:
             helios_summary = helios.get(workload["name"])
             linux_summary = linux.get(workload["name"])
+            wasmtime_summary = wasmtime_linux.get(workload["name"])
             helios_ms = helios_summary.get("median_elapsed_ms") if helios_summary else None
             linux_seconds = linux_summary.get("median") if linux_summary else None
+            wasmtime_seconds = wasmtime_summary.get("median") if wasmtime_summary else None
             helios_text = f"{helios_ms} ms" if helios_ms is not None else "n/a"
             linux_text = f"{linux_seconds * 1000.0:.2f} ms" if linux_seconds is not None else "n/a"
+            wasmtime_text = (
+                f"{wasmtime_seconds * 1000.0:.2f} ms"
+                if wasmtime_seconds is not None
+                else "n/a"
+            )
             validation = "ok" if helios_summary and helios_summary["validation"]["ok"] else "missing"
             if workload["runner"] == "helios-aot":
                 validation = "helios-aot"
             lines.append(
-                f"| `{workload['name']}` | {helios_text} | {linux_text} | {ratio(helios_ms, linux_seconds)} | {throughput_pair(workload, helios_ms, linux_seconds)} | {validation} |"
+                f"| `{workload['name']}` | {helios_text} | {linux_text} | {wasmtime_text} | {ratio(helios_ms, linux_seconds)} | {ratio(helios_ms, wasmtime_seconds)} | {throughput_pair(workload, helios_ms, linux_seconds, wasmtime_seconds)} | {validation} |"
             )
         lines.append("")
 
@@ -1224,6 +1359,7 @@ def write_report(
             "",
             f"- Helios raw iteration timings are in `{helios_jsonl or 'not-run'}`.",
             f"- Linux raw hyperfine timings are in `{linux_json or 'not-run'}`.",
+            f"- Wasmtime-on-Linux raw hyperfine timings are in `{wasmtime_linux_json or 'not-run'}`.",
         ]
     )
     for perf_path in perf_metric_paths:
@@ -1283,6 +1419,16 @@ def main() -> None:
         type=Path,
         help="Pre-staged QuickJS-NG source archive used to build the Fedora native qjs baseline without guest internet access.",
     )
+    parser.add_argument(
+        "--wasmtime-linux-bin",
+        type=Path,
+        help="Pre-staged aarch64 Linux wasmtime executable copied into the Fedora guest for the Wasmtime-on-Linux timing baseline.",
+    )
+    parser.add_argument(
+        "--wasmtime-linux-archive",
+        type=Path,
+        help="Pre-staged aarch64 Linux Wasmtime tar archive copied into the Fedora guest for the Wasmtime-on-Linux timing baseline.",
+    )
     parser.add_argument("--out-dir", type=Path)
     parser.add_argument("--skip-helios", action="store_true")
     parser.add_argument("--skip-linux", action="store_true")
@@ -1317,6 +1463,8 @@ def main() -> None:
         raise SystemExit("--linux-vm-smp must be positive")
     if args.linux_vm_setup_timeout_seconds <= 0:
         raise SystemExit("--linux-vm-setup-timeout-seconds must be positive")
+    if args.wasmtime_linux_bin is not None and args.wasmtime_linux_archive is not None:
+        raise SystemExit("pass either --wasmtime-linux-bin or --wasmtime-linux-archive, not both")
 
     if not args.skip_helios:
         enforce_no_stale_helios_benchmark_processes()
@@ -1355,6 +1503,7 @@ def main() -> None:
     try:
         helios_jsonl = None
         linux_json = None
+        wasmtime_linux_json = None
         linux_provenance = None
         wasmtime_profiles = []
         if not args.skip_helios:
@@ -1370,7 +1519,7 @@ def main() -> None:
                 args.helios_timeout_seconds,
             )
         if not args.skip_linux:
-            linux_json, linux_provenance = run_linux(
+            linux_json, wasmtime_linux_json, linux_provenance = run_linux(
                 args.manifest,
                 out_dir,
                 args.iterations,
@@ -1387,6 +1536,8 @@ def main() -> None:
                 host_tcp_host,
                 linux_tcp_port,
                 args.quickjs_source_archive,
+                args.wasmtime_linux_bin,
+                args.wasmtime_linux_archive,
             )
         if args.wasmtime_profile_workload:
             wasmtime_profiles = run_wasmtime_profiles(
@@ -1407,6 +1558,7 @@ def main() -> None:
             workloads,
             helios_jsonl,
             linux_json,
+            wasmtime_linux_json,
             linux_provenance,
             host_load,
             wasmtime_profiles,

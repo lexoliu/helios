@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -26,6 +27,8 @@ SSH_USER = "bench"
 REMOTE_ROOT = "/home/bench/helios"
 REMOTE_OUT = "/home/bench/out"
 REMOTE_QUICKJS_SOURCE_ARCHIVE = f"{REMOTE_ROOT}/sources/quickjs.tar.gz"
+REMOTE_WASMTIME_BIN = f"{REMOTE_ROOT}/tools/wasmtime"
+REMOTE_WASMTIME_ARCHIVE = f"{REMOTE_ROOT}/sources/wasmtime-linux.tar"
 FEDORA_PACKAGES = [
     "python3",
     "bash",
@@ -131,7 +134,40 @@ def resolve_asset_dir(repo_root: Path, asset_dir: Path) -> Path:
 def resolve_optional_path(repo_root: Path, path: Path | None) -> Path | None:
     if path is None:
         return None
-    return path if path.is_absolute() else repo_root / path
+    resolved = path if path.is_absolute() else repo_root / path
+    if not resolved.exists():
+        raise SystemExit(f"path does not exist: {resolved}")
+    return resolved
+
+
+def copy_path_to_guest(
+    repo_root: Path,
+    key: Path,
+    port: int,
+    source: Path,
+    remote_path: str,
+) -> None:
+    remote_parent = shlex.quote(str(Path(remote_path).parent))
+    ssh(repo_root, key, port, f"mkdir -p {remote_parent}", timeout=30)
+    scp_base = [
+        "scp",
+        "-r",
+        "-i",
+        str(key),
+        "-P",
+        str(port),
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "LogLevel=ERROR",
+    ]
+    target = f"{SSH_USER}@127.0.0.1:{remote_path}"
+    if source.is_dir():
+        ssh(repo_root, key, port, f"rm -rf {shlex.quote(remote_path)}", timeout=30)
+        target = f"{SSH_USER}@127.0.0.1:{Path(remote_path).parent}/"
+    run([*scp_base, str(source), target], repo_root)
 
 
 def resolve_quickjs_source_archive(
@@ -463,11 +499,36 @@ def ensure_provisioned(
     ssh(repo_root, key, port, command, timeout=timeout_seconds)
 
 
+def wasmtime_guest_paths(repo_root: Path, workloads: list[dict]) -> list[Path]:
+    paths: dict[str, Path] = {}
+    for workload in workloads:
+        profile = workload.get("wasmtime_profile")
+        if not profile:
+            continue
+        wasm_path = profile.get("wasm_path")
+        if not wasm_path:
+            raise SystemExit(f"workload {workload['name']} wasmtime_profile is missing wasm_path")
+        profile_paths = [wasm_path, *profile.get("guest_paths", [])]
+        for value in profile.get("wasmtime_flags", []):
+            profile_paths.extend(
+                match.group(1) for match in re.finditer(r"\{repo_root\}/([^:\s]+)", value)
+            )
+        for relative in profile_paths:
+            path = repo_root / relative
+            if not path.exists():
+                raise SystemExit(f"Wasmtime Linux baseline artifact is missing: {path}")
+            paths[str(path.relative_to(repo_root))] = path
+    return [paths[key] for key in sorted(paths)]
+
+
 def copy_guest_files(
     repo_root: Path,
     key: Path,
     port: int,
     quickjs_source_archive: Path | None,
+    wasmtime_linux_bin: Path | None,
+    wasmtime_linux_archive: Path | None,
+    wasmtime_workloads: list[dict],
 ) -> None:
     ssh(
         repo_root,
@@ -476,7 +537,9 @@ def copy_guest_files(
         f"rm -rf {shlex.quote(REMOTE_ROOT)} {shlex.quote(REMOTE_OUT)} && "
         f"mkdir -p {shlex.quote(REMOTE_ROOT)}/tools/wasi-apps "
         f"{shlex.quote(REMOTE_ROOT)}/fedora-guest-tools "
-        f"{shlex.quote(REMOTE_ROOT)}/sources {shlex.quote(REMOTE_OUT)}",
+        f"{shlex.quote(REMOTE_ROOT)}/sources "
+        f"{shlex.quote(REMOTE_ROOT)}/artifacts "
+        f"{shlex.quote(REMOTE_ROOT)}/tools {shlex.quote(REMOTE_OUT)}",
         timeout=30,
     )
     scp_base = [
@@ -509,6 +572,56 @@ def copy_guest_files(
             ],
             repo_root,
         )
+    if wasmtime_linux_bin is not None:
+        copy_path_to_guest(repo_root, key, port, wasmtime_linux_bin, REMOTE_WASMTIME_BIN)
+        ssh(repo_root, key, port, f"chmod 0755 {shlex.quote(REMOTE_WASMTIME_BIN)}", timeout=30)
+    if wasmtime_linux_archive is not None:
+        copy_path_to_guest(
+            repo_root,
+            key,
+            port,
+            wasmtime_linux_archive,
+            REMOTE_WASMTIME_ARCHIVE,
+        )
+    for path in wasmtime_guest_paths(repo_root, wasmtime_workloads):
+        remote_path = f"{REMOTE_ROOT}/{path.relative_to(repo_root)}"
+        copy_path_to_guest(repo_root, key, port, path, remote_path)
+
+
+def ensure_wasmtime_linux(
+    repo_root: Path,
+    key: Path,
+    port: int,
+    wasmtime_linux_bin: Path | None,
+    wasmtime_linux_archive: Path | None,
+) -> str:
+    if wasmtime_linux_bin is not None:
+        version = ssh_output(repo_root, key, port, f"{shlex.quote(REMOTE_WASMTIME_BIN)} --version", timeout=20)
+        return f"{REMOTE_WASMTIME_BIN} ({version})"
+    if wasmtime_linux_archive is not None:
+        install = " && ".join(
+            [
+                "rm -rf /home/bench/helios/tools/wasmtime-extract",
+                "mkdir -p /home/bench/helios/tools/wasmtime-extract",
+                f"tar -C /home/bench/helios/tools/wasmtime-extract -xf {shlex.quote(REMOTE_WASMTIME_ARCHIVE)}",
+                "wasmtime_found=$(find /home/bench/helios/tools/wasmtime-extract -type f -name wasmtime -perm -u+x | head -n 1)",
+                "test -n \"$wasmtime_found\"",
+                f"cp \"$wasmtime_found\" {shlex.quote(REMOTE_WASMTIME_BIN)}",
+                f"chmod 0755 {shlex.quote(REMOTE_WASMTIME_BIN)}",
+            ]
+        )
+        ssh(repo_root, key, port, install, timeout=60)
+        version = ssh_output(repo_root, key, port, f"{shlex.quote(REMOTE_WASMTIME_BIN)} --version", timeout=20)
+        return f"{REMOTE_WASMTIME_BIN} ({version})"
+    version = ssh_output(repo_root, key, port, "wasmtime --version 2>/dev/null || true", timeout=20)
+    if not version:
+        raise SystemExit(
+            "Wasmtime-on-Linux baseline requested, but the Fedora guest has no "
+            "wasmtime binary. Pass --wasmtime-linux-bin with an aarch64 Linux "
+            "wasmtime executable or --wasmtime-linux-archive with a pre-staged "
+            "aarch64 Linux Wasmtime tar archive."
+        )
+    return f"wasmtime ({version})"
 
 
 def linux_cpu_features(
@@ -565,13 +678,16 @@ def hyperfine_command(
     host_http_url: str | None,
     host_tcp_host: str | None,
     host_tcp_port: int | None,
+    output_name: str,
+    mode: str,
+    wasmtime_bin: str | None = None,
 ) -> str:
     command = [
         "hyperfine",
         "--runs",
         str(iterations),
         "--export-json",
-        f"{REMOTE_OUT}/linux-hyperfine.json",
+        f"{REMOTE_OUT}/{output_name}",
     ]
     for workload in workloads:
         runner = [
@@ -581,7 +697,11 @@ def hyperfine_command(
             f"{REMOTE_ROOT}/tools/wasi-apps/workloads.json",
             "--workload",
             workload["name"],
+            "--mode",
+            mode,
         ]
+        if wasmtime_bin is not None:
+            runner.extend(["--wasmtime-bin", wasmtime_bin])
         if host_http_url:
             runner.extend(["--host-http-url", host_http_url])
         if host_tcp_host and host_tcp_port is not None:
@@ -590,7 +710,7 @@ def hyperfine_command(
     return shlex.join(command)
 
 
-def copy_hyperfine_json(repo_root: Path, key: Path, port: int, destination: Path) -> None:
+def copy_hyperfine_json(repo_root: Path, key: Path, port: int, remote_name: str, destination: Path) -> None:
     scp_base = [
         "scp",
         "-i",
@@ -604,7 +724,7 @@ def copy_hyperfine_json(repo_root: Path, key: Path, port: int, destination: Path
         "-o",
         "LogLevel=ERROR",
     ]
-    run([*scp_base, f"{SSH_USER}@127.0.0.1:{REMOTE_OUT}/linux-hyperfine.json", str(destination)], repo_root)
+    run([*scp_base, f"{SSH_USER}@127.0.0.1:{REMOTE_OUT}/{remote_name}", str(destination)], repo_root)
 
 
 def workload_uses_placeholder(workload: dict, placeholder: str) -> bool:
@@ -629,11 +749,16 @@ def run_fedora_qemu_linux(
     host_tcp_host: str | None,
     host_tcp_port: int | None,
     quickjs_source_archive: Path | None = None,
-) -> tuple[Path | None, dict]:
+    wasmtime_linux_bin: Path | None = None,
+    wasmtime_linux_archive: Path | None = None,
+) -> tuple[Path | None, Path | None, dict]:
     native_workloads = [
         workload for workload in workloads if workload["runner"] in ("shell", "program")
     ]
+    wasmtime_workloads = [workload for workload in workloads if workload.get("wasmtime_profile")]
     asset_dir = resolve_asset_dir(repo_root, asset_dir)
+    wasmtime_linux_bin = resolve_optional_path(repo_root, wasmtime_linux_bin)
+    wasmtime_linux_archive = resolve_optional_path(repo_root, wasmtime_linux_archive)
     quickjs_required = any(
         workload_uses_placeholder(workload, "{quickjs}") for workload in native_workloads
     )
@@ -666,18 +791,32 @@ def run_fedora_qemu_linux(
         "block": "virtio-blk-device",
         "quickjs_required": quickjs_required,
         "native_simd_probe_required": simd_probe_required,
+        "wasmtime_linux_required": bool(wasmtime_workloads),
+        "wasmtime_linux_workloads": [workload["name"] for workload in wasmtime_workloads],
     }
     if quickjs_source_archive is not None:
         provenance["quickjs_source_archive"] = str(quickjs_source_archive)
     elif quickjs_required:
         provenance["quickjs_source_archive"] = "not-staged; using pre-provisioned guest qjs"
-    if not native_workloads:
-        return None, provenance
+    if wasmtime_linux_bin is not None:
+        provenance["wasmtime_linux_bin"] = str(wasmtime_linux_bin)
+    if wasmtime_linux_archive is not None:
+        provenance["wasmtime_linux_archive"] = str(wasmtime_linux_archive)
+    if not native_workloads and not wasmtime_workloads:
+        return None, None, provenance
     port = ssh_port or free_tcp_port()
     process = start_vm(repo_root, asset_dir, qemu_bin, disk, seed_iso, port, memory, smp)
     try:
         wait_for_ssh(repo_root, key, port, setup_timeout_seconds)
-        copy_guest_files(repo_root, key, port, quickjs_source_archive)
+        copy_guest_files(
+            repo_root,
+            key,
+            port,
+            quickjs_source_archive,
+            wasmtime_linux_bin,
+            wasmtime_linux_archive,
+            wasmtime_workloads,
+        )
         ensure_provisioned(
             repo_root,
             key,
@@ -690,21 +829,63 @@ def run_fedora_qemu_linux(
         provenance.update(
             linux_cpu_features(repo_root, key, port, quickjs_policy, simd_probe_required)
         )
-        ssh(
-            repo_root,
-            key,
-            port,
-            hyperfine_command(
-                iterations,
-                native_workloads,
-                host_http_url,
-                host_tcp_host,
-                host_tcp_port,
-            ),
-            timeout=setup_timeout_seconds,
-        )
-        hyperfine_json = out_dir / "linux-hyperfine.json"
-        copy_hyperfine_json(repo_root, key, port, hyperfine_json)
-        return hyperfine_json, provenance
+        wasmtime_bin = None
+        if wasmtime_workloads:
+            provenance["wasmtime_linux"] = ensure_wasmtime_linux(
+                repo_root,
+                key,
+                port,
+                wasmtime_linux_bin,
+                wasmtime_linux_archive,
+            )
+            wasmtime_bin = REMOTE_WASMTIME_BIN if (
+                wasmtime_linux_bin is not None or wasmtime_linux_archive is not None
+            ) else "wasmtime"
+        hyperfine_json = None
+        if native_workloads:
+            ssh(
+                repo_root,
+                key,
+                port,
+                hyperfine_command(
+                    iterations,
+                    native_workloads,
+                    host_http_url,
+                    host_tcp_host,
+                    host_tcp_port,
+                    "linux-hyperfine.json",
+                    "native",
+                ),
+                timeout=setup_timeout_seconds,
+            )
+            hyperfine_json = out_dir / "linux-hyperfine.json"
+            copy_hyperfine_json(repo_root, key, port, "linux-hyperfine.json", hyperfine_json)
+        wasmtime_hyperfine_json = None
+        if wasmtime_workloads:
+            ssh(
+                repo_root,
+                key,
+                port,
+                hyperfine_command(
+                    iterations,
+                    wasmtime_workloads,
+                    host_http_url,
+                    host_tcp_host,
+                    host_tcp_port,
+                    "wasmtime-linux-hyperfine.json",
+                    "wasmtime",
+                    wasmtime_bin,
+                ),
+                timeout=setup_timeout_seconds,
+            )
+            wasmtime_hyperfine_json = out_dir / "wasmtime-linux-hyperfine.json"
+            copy_hyperfine_json(
+                repo_root,
+                key,
+                port,
+                "wasmtime-linux-hyperfine.json",
+                wasmtime_hyperfine_json,
+            )
+        return hyperfine_json, wasmtime_hyperfine_json, provenance
     finally:
         shutdown_vm(repo_root, key, port, process)
