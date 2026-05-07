@@ -103,12 +103,15 @@ def quickjs_native_policy(repo_root: Path) -> dict:
             ),
         }
     return {
-        "id": f"quickjs-{QUICKJS_VERSION}-native-nosimd",
+        "id": f"quickjs-{QUICKJS_VERSION}-native-nosimd-novec",
         "wasm_path": str(relative_wasm),
         "wasm_uses_simd": False,
-        "cmake_c_flags_release": "-O2 -DNDEBUG -march=armv8-a+nosimd",
+        "cmake_c_flags_release": (
+            "-O2 -DNDEBUG -march=armv8-a+nosimd "
+            "-fno-tree-vectorize -fno-tree-slp-vectorize"
+        ),
         "baseline_strategy": (
-            "built from QuickJS-NG v0.14.0 source with -march=armv8-a+nosimd "
+            "built from QuickJS-NG v0.14.0 source with native vectorization disabled "
             "because the Helios WASI QuickJS artifact does not contain wasm SIMD instructions"
         ),
         "native_simd_policy": (
