@@ -1430,6 +1430,132 @@ fn record_named_program_kernel_profile<CpuImpl, HostFs>(
     }
 }
 
+struct ProgramKernelProfile<CpuImpl, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    runtime_state: HostRuntimeState<CpuImpl, HostFs>,
+    cpu: CpuImpl,
+    started_ticks: u64,
+    counters: helios_hal::cpu::HardwarePerfCounters,
+    started_heap: crate::HeapStats,
+}
+
+fn start_program_kernel_profile<CpuImpl, HostFs>(
+    runtime_state: &HostRuntimeState<CpuImpl, HostFs>,
+    cpu: &CpuImpl,
+) -> Option<ProgramKernelProfile<CpuImpl, HostFs>>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    runtime_state
+        .profiling_enabled()
+        .then(|| ProgramKernelProfile {
+            runtime_state: runtime_state.clone(),
+            cpu: cpu.clone(),
+            started_ticks: cpu.now().ticks(),
+            counters: cpu.hardware_perf_counters(),
+            started_heap: crate::heap_stats(),
+        })
+}
+
+fn record_program_kernel_profile_sample<CpuImpl, HostFs>(
+    profile: Option<ProgramKernelProfile<CpuImpl, HostFs>>,
+    phase: &'static str,
+) where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    if let Some(profile) = profile {
+        let ended_ticks = profile.cpu.now().ticks();
+        let elapsed_ticks = ended_ticks.saturating_sub(profile.started_ticks);
+        profile.runtime_state.record_profile_stack_parts(
+            ProfileScope::Kernel,
+            "kernel;program;",
+            phase,
+            elapsed_ticks,
+        );
+        let elapsed_nanos = profile
+            .runtime_state
+            .uptime_nanos(ended_ticks)
+            .saturating_sub(profile.runtime_state.uptime_nanos(profile.started_ticks));
+        let counter_delta = profile
+            .cpu
+            .hardware_perf_counters()
+            .delta_since(profile.counters);
+        profile.runtime_state.record_perf_metric_parts_events_nanos(
+            ProfileScope::Kernel,
+            "kernel;program;",
+            phase,
+            1,
+            elapsed_nanos,
+            counter_delta,
+            0,
+        );
+
+        let heap = crate::heap_stats();
+        record_program_heap_delta(
+            &profile.runtime_state,
+            phase,
+            "heap-alloc",
+            heap.allocation_count
+                .saturating_sub(profile.started_heap.allocation_count),
+            heap.total_allocation_bytes
+                .saturating_sub(profile.started_heap.total_allocation_bytes),
+        );
+        record_program_heap_delta(
+            &profile.runtime_state,
+            phase,
+            "heap-realloc",
+            heap.reallocation_count
+                .saturating_sub(profile.started_heap.reallocation_count),
+            heap.total_reallocation_bytes
+                .saturating_sub(profile.started_heap.total_reallocation_bytes),
+        );
+        record_program_heap_delta(
+            &profile.runtime_state,
+            phase,
+            "heap-dealloc",
+            heap.deallocation_count
+                .saturating_sub(profile.started_heap.deallocation_count),
+            heap.total_deallocation_bytes
+                .saturating_sub(profile.started_heap.total_deallocation_bytes),
+        );
+    }
+}
+
+fn record_program_heap_delta<CpuImpl, HostFs>(
+    runtime_state: &HostRuntimeState<CpuImpl, HostFs>,
+    phase: &'static str,
+    kind: &'static str,
+    events: u64,
+    bytes: u64,
+) where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    if events == 0 && bytes == 0 {
+        return;
+    }
+    let phase_prefix = match kind {
+        "heap-alloc" => "kernel;program-heap;alloc;",
+        "heap-realloc" => "kernel;program-heap;realloc;",
+        "heap-dealloc" => "kernel;program-heap;dealloc;",
+        _ => panic!("unknown program heap metric kind {kind}"),
+    };
+    runtime_state.record_perf_metric_parts_events_nanos(
+        ProfileScope::Kernel,
+        phase_prefix,
+        phase,
+        events,
+        0,
+        helios_hal::cpu::HardwarePerfCounterDelta::default(),
+        bytes,
+    );
+}
+
 impl<CpuImpl, HostFs> UserProgramService<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
@@ -5111,13 +5237,22 @@ where
         output_mode: output_mode.clone(),
         core_linker: preview1_core_linker.clone(),
     });
+    let shared_memory_prepare_profile =
+        start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
     let imported_memory_spec = imported_shared_memory_spec_with_user_budget(&compiled.module)?;
     let imported_memory = match imported_memory_spec {
         Some(spec) => Some(shared_memory_pool.lock().acquire(engine.raw(), spec)?),
         None => None,
     };
+    record_program_kernel_profile_sample(
+        shared_memory_prepare_profile,
+        "core-shared-memory-prepare",
+    );
     let recycle_memory = imported_memory.clone();
+    let store_teardown_profile: Option<ProgramKernelProfile<CpuImpl, HostFs>>;
     let (completion, recycle_allowed) = {
+        let store_prepare_profile =
+            start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
         let mut store = wasmtime::Store::new(
             engine.raw(),
             Preview1ProgramStore::<CpuImpl, HostFs>::new(
@@ -5143,10 +5278,17 @@ where
             ),
         );
         configure_preview1_program_store(&mut store);
+        record_program_kernel_profile_sample(store_prepare_profile, "core-store-prepare");
 
         let instance = if let Some(memory) = imported_memory {
             let mut linker = preview1_core_linker;
+            let imported_memory_define_profile =
+                start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
             define_imported_shared_memory(&mut linker, &store, &compiled.module, memory)?;
+            record_program_kernel_profile_sample(
+                imported_memory_define_profile,
+                "core-shared-memory-define",
+            );
 
             super::emit_program_stage_marker(
                 exec_context.write_serial,
@@ -5169,10 +5311,16 @@ where
             );
             instance
         } else {
-            let instance_pre = if let Some(instance_pre) = core_module_instance_pre_cache
+            let cache_lookup_profile =
+                start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
+            let cached_instance_pre = core_module_instance_pre_cache
                 .lock()
-                .get(&compiled.cache_key)
-            {
+                .get(&compiled.cache_key);
+            record_program_kernel_profile_sample(
+                cache_lookup_profile,
+                "core-instance-pre-cache-lookup",
+            );
+            let instance_pre = if let Some(instance_pre) = cached_instance_pre {
                 super::emit_program_stage_marker(
                     exec_context.write_serial,
                     "program:instantiate-core-pre-cache-hit",
@@ -5183,18 +5331,31 @@ where
                     exec_context.write_serial,
                     "program:instantiate-core-pre-begin",
                 );
+                let instantiate_pre_profile =
+                    start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
                 let instance_pre = Arc::new(
                     preview1_core_linker
                         .instantiate_pre(&compiled.module)
                         .map_err(map_program_runtime_error)?,
                 );
+                record_program_kernel_profile_sample(
+                    instantiate_pre_profile,
+                    "instantiate-core-pre",
+                );
                 super::emit_program_stage_marker(
                     exec_context.write_serial,
                     "program:instantiate-core-pre-end",
                 );
-                core_module_instance_pre_cache
+                let cache_insert_profile =
+                    start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
+                let inserted = core_module_instance_pre_cache
                     .lock()
-                    .insert_if_missing(compiled.cache_key.clone(), instance_pre)
+                    .insert_if_missing(compiled.cache_key.clone(), instance_pre);
+                record_program_kernel_profile_sample(
+                    cache_insert_profile,
+                    "core-instance-pre-cache-insert",
+                );
+                inserted
             };
 
             super::emit_program_stage_marker(
@@ -5221,12 +5382,15 @@ where
         let instance = instance.map_err(map_program_runtime_error)?;
         super::emit_program_stage_marker(exec_context.write_serial, "program:instantiate-core-ok");
 
+        let resolve_start_profile =
+            start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
         let start = instance
             .get_typed_func::<(), ()>(&mut store, "_start")
             .map_err(|_| ProgramExecError {
                 kind: ProgramExecErrorKind::InvalidBinary,
                 detail: ProgramExecErrorDetail::InvalidEntryPoint,
             })?;
+        record_program_kernel_profile_sample(resolve_start_profile, "resolve-core-start");
 
         let run_done = Arc::new(core::sync::atomic::AtomicBool::new(false));
         super::spawn_component_phase_heartbeat(
@@ -5264,6 +5428,7 @@ where
         run_done.store(true, core::sync::atomic::Ordering::Release);
         super::emit_program_stage_marker(exec_context.write_serial, "program:run-core-end");
 
+        let completion_profile = start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
         let completion = match result {
             Ok(()) => CoreModuleRunCompletion::Exit(Ok(ChildExit {
                 instance_id,
@@ -5285,8 +5450,11 @@ where
                 }
             }
         };
+        record_program_kernel_profile_sample(completion_profile, "complete-core");
+        store_teardown_profile = start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
         (completion, store.data().threads.is_empty())
     };
+    record_program_kernel_profile_sample(store_teardown_profile, "core-store-teardown");
 
     if recycle_allowed {
         if let (Some(spec), Some(memory)) = (imported_memory_spec, recycle_memory) {
@@ -5371,7 +5539,10 @@ where
     let imported_memory = Some(restore.memory.clone());
     let recycle_memory = restore.memory.clone();
     let memory_spec = restore.memory_spec;
+    let store_teardown_profile: Option<ProgramKernelProfile<CpuImpl, HostFs>>;
     let (completion, recycle_allowed) = {
+        let store_prepare_profile =
+            start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
         let mut store = wasmtime::Store::new(
             engine.raw(),
             Preview1ProgramStore::<CpuImpl, HostFs>::new(
@@ -5397,14 +5568,21 @@ where
             ),
         );
         configure_preview1_program_store(&mut store);
+        record_program_kernel_profile_sample(store_prepare_profile, "core-store-prepare-rewind");
 
         let mut linker = preview1_core_linker;
+        let imported_memory_define_profile =
+            start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
         define_imported_shared_memory(
             &mut linker,
             &store,
             &compiled.module,
             restore.memory.clone(),
         )?;
+        record_program_kernel_profile_sample(
+            imported_memory_define_profile,
+            "core-shared-memory-define-rewind",
+        );
 
         super::emit_program_stage_marker(
             exec_context.write_serial,
@@ -5428,6 +5606,7 @@ where
         let instance = instance.map_err(map_program_runtime_error)?;
         super::emit_program_stage_marker(exec_context.write_serial, "program:instantiate-core-ok");
 
+        let rewind_profile = start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
         wasix_begin_rewind(
             &mut store,
             &instance,
@@ -5439,13 +5618,17 @@ where
             Some(restore.value),
         )
         .await?;
+        record_program_kernel_profile_sample(rewind_profile, "core-begin-rewind");
 
+        let resolve_start_profile =
+            start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
         let start = instance
             .get_typed_func::<(), ()>(&mut store, "_start")
             .map_err(|_| ProgramExecError {
                 kind: ProgramExecErrorKind::InvalidBinary,
                 detail: ProgramExecErrorDetail::InvalidEntryPoint,
             })?;
+        record_program_kernel_profile_sample(resolve_start_profile, "resolve-core-start-rewind");
 
         let run_done = Arc::new(core::sync::atomic::AtomicBool::new(false));
         super::spawn_component_phase_heartbeat(
@@ -5483,6 +5666,7 @@ where
         run_done.store(true, core::sync::atomic::Ordering::Release);
         super::emit_program_stage_marker(exec_context.write_serial, "program:run-core-end");
 
+        let completion_profile = start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
         let completion = match result {
             Ok(()) => CoreModuleRunCompletion::Exit(Ok(ChildExit {
                 instance_id,
@@ -5504,8 +5688,11 @@ where
                 }
             }
         };
+        record_program_kernel_profile_sample(completion_profile, "complete-core-rewind");
+        store_teardown_profile = start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
         (completion, store.data().threads.is_empty())
     };
+    record_program_kernel_profile_sample(store_teardown_profile, "core-store-teardown-rewind");
 
     if recycle_allowed {
         shared_memory_pool

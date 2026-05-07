@@ -6,11 +6,12 @@ at `../wasmtime/crates/wasmtime`.
 Current required Wasmtime commit:
 
 ```text
-7b464276ee62af6d3e27d8c7dd122aebf97b0c2d
+a90057ba00125be6941d634f509fe9a4f48b9287
 ```
 
-This commit makes the generic pooling allocator's async fiber stack pool keep
-bounded warm stacks on non-Unix targets. The AArch64/HVF `quickjs-loop` profile
-showed one 8 MiB async stack allocation per run before this change; with this
-Wasmtime commit, the same workload keeps one warm stack and reuses it across
-subsequent runs.
+This commit includes the generic pooling allocator's bounded warm async fiber
+stack reuse on non-Unix targets, and limits custom-VM anonymous memory reset to
+the currently accessible linear-memory prefix. The AArch64/HVF `quickjs-loop`
+profile showed one 8 MiB async stack allocation per run before stack reuse; the
+custom-VM reset change then moved the profiled `quickjs-loop` median from 57 ms
+to 46 ms by avoiding a full static-reservation page-table scan on Store drop.
