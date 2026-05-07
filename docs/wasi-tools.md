@@ -216,7 +216,7 @@ tools/wasi-apps/workload-bench.sh
 
 It boots one release AArch64/HVF VM and measures repeated guest executions
 for process startup, stdio pipe throughput, filesystem-heavy shell work,
-CPython import-heavy startup, and QuickJS execution. Logs are written under
+CPython, QuickJS, and local TCP throughput. Logs are written under
 `target/perf-baselines/`. Set `HELIOS_WORKLOAD_BENCH_WORKLOADS` to a
 comma-separated workload list when narrowing a run.
 
@@ -237,7 +237,10 @@ does not already contain Wasmtime, provide either `--wasmtime-linux-bin` with
 an AArch64 Linux executable or `--wasmtime-linux-archive` with a pre-staged
 AArch64 Linux Wasmtime tar archive. Workloads without `wasmtime_profile` are
 reported as uncovered by the floor rather than silently approximated through
-a different program or ABI.
+a different program or ABI. `wasi-tcp-throughput` is the standard WASI sockets
+network floor workload: Helios, Fedora native, and Wasmtime-on-Linux all
+receive the same deterministic 64 MiB local TCP stream, and Helios and
+Wasmtime execute the same wasm component.
 
 To collect Wasmtime's native Linux profiling artifacts for the same wasm
 workloads, pass `--wasmtime-profile-workload <name>` to

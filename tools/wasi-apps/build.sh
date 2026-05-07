@@ -264,6 +264,17 @@ cp -f \
 wasm-tools strip "$out_dir/tcp-throughput.wasm" -o "$out_dir/tcp-throughput-stripped.wasm"
 
 env "${build_env[@]}" cargo build \
+  --manifest-path "$repo_root/tools/wasi-apps/wasi-tcp-throughput/Cargo.toml" \
+  --target wasm32-wasip2 \
+  --release
+
+cp -f \
+  "$repo_root/tools/wasi-apps/wasi-tcp-throughput/target/wasm32-wasip2/release/helios_wasi_tcp_throughput.wasm" \
+  "$out_dir/wasi-tcp-throughput.wasm"
+
+wasm-tools strip "$out_dir/wasi-tcp-throughput.wasm" -o "$out_dir/wasi-tcp-throughput-stripped.wasm"
+
+env "${build_env[@]}" cargo build \
   --manifest-path "$repo_root/tools/wasi-apps/wasix-tcp-throughput/Cargo.toml" \
   --target wasm32-wasip1 \
   --release
@@ -275,4 +286,4 @@ cp -f \
 wasm-tools strip "$out_dir/wasix-tcp-throughput.wasm" -o "$out_dir/wasix-tcp-throughput-stripped.wasm"
 
 echo "wasi artifacts written to: $out_dir and $python_root"
-ls -lh "$out_dir"/{curl,tcp-throughput,wasix-tcp-throughput}*.wasm
+ls -lh "$out_dir"/{curl,tcp-throughput,wasi-tcp-throughput,wasix-tcp-throughput}*.wasm

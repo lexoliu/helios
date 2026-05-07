@@ -97,6 +97,14 @@ bootfs_path = "bin/tcp-throughput"
 source = "artifacts/wasi-tools/tcp-throughput.wasm"
 
 [[artifact]]
+command = "wasi-tcp-throughput"
+package = "helios-wasi-tcp-throughput"
+version = "0.1.0"
+source_url = "tools/wasi-apps/wasi-tcp-throughput"
+bootfs_path = "bin/wasi-tcp-throughput"
+source = "artifacts/wasi-tools/wasi-tcp-throughput.wasm"
+
+[[artifact]]
 command = "wasix-tcp-throughput"
 package = "helios-wasix-tcp-throughput"
 version = "0.1.0"

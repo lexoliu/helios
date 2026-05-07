@@ -175,6 +175,32 @@
       "throughput_bytes": 67108864
     },
     {
+      "name": "wasi-tcp-throughput",
+      "class": "io-bound",
+      "runner": "program",
+      "description": "Read and discard a deterministic 64 MiB stream through standard WASI sockets.",
+      "program": "{wasi_tcp_throughput}",
+      "args": [
+        "{host_tcp_host}",
+        "{host_tcp_port}",
+        "67108864"
+      ],
+      "boot_programs": ["wasi-tcp-throughput"],
+      "wasmtime_profile": {
+        "wasm_path": "artifacts/wasi-tools/wasi-tcp-throughput.wasm",
+        "wasmtime_flags": ["-S", "inherit-network=y"],
+        "args": [
+          "{host_tcp_host}",
+          "{host_tcp_port}",
+          "67108864"
+        ]
+      },
+      "stdout_contains": ["wasi-tcp-throughput:67108864"],
+      "stderr_empty": true,
+      "requires_host_tcp": true,
+      "throughput_bytes": 67108864
+    },
+    {
       "name": "curl-http-throughput",
       "class": "io-bound",
       "runner": "program",

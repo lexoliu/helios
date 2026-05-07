@@ -19,6 +19,7 @@ LINUX_PLACEHOLDERS = {
     "{quickjs}": "qjs",
     "{simd_lanes}": "/usr/local/bin/helios-simd-lanes",
     "{tcp_throughput}": "python3 {repo_root}/tools/wasi-apps/linux_tcp_throughput_client.py",
+    "{wasi_tcp_throughput}": "python3 {repo_root}/tools/wasi-apps/linux_tcp_throughput_client.py --label wasi-tcp-throughput",
     "{wasix_tcp_throughput}": "python3 {repo_root}/tools/wasi-apps/linux_tcp_throughput_client.py --label wasix-tcp-throughput",
 }
 

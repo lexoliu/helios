@@ -1,0 +1,13 @@
+[package]
+name = "helios-wasi-tcp-throughput"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+thiserror = "2.0.17"
+
+[[bin]]
+name = "helios_wasi_tcp_throughput"
+path = "src/main.rs"
+
+[workspace]
