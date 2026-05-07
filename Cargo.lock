@@ -1715,6 +1715,7 @@ dependencies = [
  "toml",
  "tracing",
  "triomphe",
+ "unsize",
  "walkdir",
  "wasm-encoder 0.245.1",
  "wasmparser 0.245.1",
@@ -3669,6 +3670,9 @@ name = "triomphe"
 version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd69c5aa8f924c7519d6372789a74eac5b94fb0f8fcf0d4a97eb0bfc3e785f39"
+dependencies = [
+ "unsize",
+]
 
 [[package]]
 name = "typenum"
@@ -3737,6 +3741,15 @@ name = "unit-prefix"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81e544489bf3d8ef66c953931f56617f423cd4b5494be343d9b9d3dda037b9a3"
+
+[[package]]
+name = "unsize"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fa7a7a734c1a5664a662ddcea0b6c9472a21da8888c957c7f1eaa09dba7a939"
+dependencies = [
+ "autocfg",
+]
 
 [[package]]
 name = "utf8-tokio"

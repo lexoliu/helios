@@ -1,12 +1,13 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 
 use bytes::Bytes;
+use triomphe::Arc;
+use unsize::{CoerceUnsize, Coercion};
 
 use crate::{
     ComponentNetworkService, DnsError, Ipv4Address, Ipv4Cidr, Ipv4Route, MacAddress,
@@ -273,9 +274,15 @@ impl ComponentHostNetworkService {
         Service::TcpListener: ComponentHostTcpListenerToken,
         Service::UdpSocket: ComponentHostUdpSocketToken,
     {
-        Self {
-            inner: Arc::new(TypedNetworkService { service }),
-        }
+        let coercion = unsafe {
+            // SAFETY: the closure performs only Rust's built-in unsize coercion
+            // from the concrete adapter to the same allocation's trait-object view.
+            Coercion::new(|service: *const TypedNetworkService<Service>| {
+                service as *const dyn DynComponentHostNetworkService
+            })
+        };
+        let inner = Arc::new(TypedNetworkService { service }).unsize(coercion);
+        Self { inner }
     }
 }
 
