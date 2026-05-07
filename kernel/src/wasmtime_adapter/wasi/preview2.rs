@@ -2562,39 +2562,62 @@ fn p2_record_kernel_profile<CpuImpl, HostFs>(
     }
 }
 
+struct P2KernelProfileStart {
+    ticks: u64,
+    counters: helios_hal::cpu::HardwarePerfCounters,
+}
+
+fn p2_kernel_profile_start<CpuImpl, HostFs>(
+    runtime_state: &HostRuntimeState<CpuImpl, HostFs>,
+    cpu: &CpuImpl,
+) -> Option<P2KernelProfileStart>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    runtime_state
+        .profiling_enabled()
+        .then(|| P2KernelProfileStart {
+            ticks: cpu.now().ticks(),
+            counters: cpu.hardware_perf_counters(),
+        })
+}
+
 fn p2_record_kernel_profile_events_bytes<CpuImpl, HostFs>(
     runtime_state: &HostRuntimeState<CpuImpl, HostFs>,
     cpu: &CpuImpl,
     phase: &'static str,
-    started_ticks: u64,
+    profile: Option<P2KernelProfileStart>,
     events: u64,
     bytes: u64,
 ) where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    if runtime_state.profiling_enabled() {
-        let finished_ticks = cpu.now().ticks();
-        let elapsed_ticks = finished_ticks.saturating_sub(started_ticks);
-        runtime_state.record_profile_stack_parts(
-            ProfileScope::Kernel,
-            "kernel;preview2;",
-            phase,
-            elapsed_ticks,
-        );
-        let elapsed_nanos = runtime_state
-            .uptime_nanos(finished_ticks)
-            .saturating_sub(runtime_state.uptime_nanos(started_ticks));
-        runtime_state.record_perf_metric_parts_events_nanos(
-            ProfileScope::Kernel,
-            "kernel;preview2;",
-            phase,
-            events,
-            elapsed_nanos,
-            helios_hal::cpu::HardwarePerfCounterDelta::default(),
-            bytes,
-        );
-    }
+    let Some(profile) = profile else {
+        return;
+    };
+    let finished_ticks = cpu.now().ticks();
+    let elapsed_ticks = finished_ticks.saturating_sub(profile.ticks);
+    runtime_state.record_profile_stack_parts(
+        ProfileScope::Kernel,
+        "kernel;preview2;",
+        phase,
+        elapsed_ticks,
+    );
+    let elapsed_nanos = runtime_state
+        .uptime_nanos(finished_ticks)
+        .saturating_sub(runtime_state.uptime_nanos(profile.ticks));
+    let counters = cpu.hardware_perf_counters().delta_since(profile.counters);
+    runtime_state.record_perf_metric_parts_events_nanos(
+        ProfileScope::Kernel,
+        "kernel;preview2;",
+        phase,
+        events,
+        elapsed_nanos,
+        counters,
+        bytes,
+    );
 }
 
 fn p2_usize_to_u64(value: usize, label: &'static str) -> u64 {
@@ -2626,7 +2649,7 @@ where
     let read_runtime_state = store.runtime_state.clone();
     store.spawner().spawn_detached(async move {
         loop {
-            let read_started = read_cpu.now().ticks();
+            let read_started = p2_kernel_profile_start(&read_runtime_state, &read_cpu);
             match read_socket.read(super::FILE_READ_CHUNK_BYTES as u32).await {
                 Ok(Some(bytes)) => {
                     let byte_len = p2_usize_to_u64(bytes.len(), "preview2 tcp bridge byte count");
@@ -2638,7 +2661,7 @@ where
                         1,
                         byte_len,
                     );
-                    let enqueue_started = read_cpu.now().ticks();
+                    let enqueue_started = p2_kernel_profile_start(&read_runtime_state, &read_cpu);
                     if network_writer.write(bytes).is_err() {
                         p2_record_kernel_profile_events_bytes(
                             &read_runtime_state,
@@ -2660,6 +2683,9 @@ where
                     );
                 }
                 Ok(None) => {
+                    let read_started = read_started
+                        .map(|profile| profile.ticks)
+                        .unwrap_or_else(|| read_cpu.now().ticks());
                     p2_record_kernel_profile(
                         &read_runtime_state,
                         &read_cpu,
@@ -2669,6 +2695,9 @@ where
                     break;
                 }
                 Err(error) => {
+                    let read_started = read_started
+                        .map(|profile| profile.ticks)
+                        .unwrap_or_else(|| read_cpu.now().ticks());
                     p2_record_kernel_profile(
                         &read_runtime_state,
                         &read_cpu,
