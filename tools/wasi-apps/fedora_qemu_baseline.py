@@ -20,10 +20,12 @@ DEFAULT_MEMORY = "2G"
 DEFAULT_SMP = 4
 QUICKJS_SOURCE_URL = "https://github.com/quickjs-ng/quickjs/archive/refs/tags/v0.14.0.tar.gz"
 QUICKJS_VERSION = "0.14.0"
+QUICKJS_SOURCE_ARCHIVE_NAME = f"quickjs-ng-{QUICKJS_VERSION}.tar.gz"
 QUICKJS_POLICY_FILE = "/var/lib/helios-fedora-qemu-bench-quickjs-policy"
 SSH_USER = "bench"
 REMOTE_ROOT = "/home/bench/helios"
 REMOTE_OUT = "/home/bench/out"
+REMOTE_QUICKJS_SOURCE_ARCHIVE = f"{REMOTE_ROOT}/sources/quickjs.tar.gz"
 FEDORA_PACKAGES = [
     "python3",
     "bash",
@@ -128,6 +130,29 @@ def free_tcp_port() -> int:
 
 def resolve_asset_dir(repo_root: Path, asset_dir: Path) -> Path:
     return asset_dir if asset_dir.is_absolute() else repo_root / asset_dir
+
+
+def resolve_optional_path(repo_root: Path, path: Path | None) -> Path | None:
+    if path is None:
+        return None
+    return path if path.is_absolute() else repo_root / path
+
+
+def resolve_quickjs_source_archive(
+    repo_root: Path,
+    asset_dir: Path,
+    archive: Path | None,
+) -> Path:
+    resolved = resolve_optional_path(repo_root, archive)
+    if resolved is None:
+        resolved = asset_dir / "sources" / QUICKJS_SOURCE_ARCHIVE_NAME
+    if resolved.is_file():
+        return resolved
+    raise SystemExit(
+        "QuickJS native baseline requires a pre-staged source archive for offline "
+        f"Fedora provisioning: {resolved}. Expected QuickJS-NG v{QUICKJS_VERSION} "
+        f"source from {QUICKJS_SOURCE_URL}."
+    )
 
 
 def ensure_private_key(repo_root: Path, asset_dir: Path) -> Path:
@@ -401,8 +426,8 @@ def ensure_provisioned(
         quickjs_install = " && ".join(
             [
                 "quickjs_work=$(mktemp -d)",
-                f"curl --fail --location --output \"$quickjs_work/quickjs.tar.gz\" {shlex.quote(QUICKJS_SOURCE_URL)}",
-                "tar -C \"$quickjs_work\" -xf \"$quickjs_work/quickjs.tar.gz\"",
+                f"test -f {shlex.quote(REMOTE_QUICKJS_SOURCE_ARCHIVE)}",
+                f"tar -C \"$quickjs_work\" -xf {shlex.quote(REMOTE_QUICKJS_SOURCE_ARCHIVE)}",
                 f"quickjs_src=\"$quickjs_work/quickjs-{QUICKJS_VERSION}\"",
                 "cmake -S \"$quickjs_src\" -B \"$quickjs_src/build\" "
                 "-DCMAKE_BUILD_TYPE=Release "
@@ -431,14 +456,20 @@ def ensure_provisioned(
     ssh(repo_root, key, port, command, timeout=timeout_seconds)
 
 
-def copy_guest_files(repo_root: Path, key: Path, port: int) -> None:
+def copy_guest_files(
+    repo_root: Path,
+    key: Path,
+    port: int,
+    quickjs_source_archive: Path | None,
+) -> None:
     ssh(
         repo_root,
         key,
         port,
         f"rm -rf {shlex.quote(REMOTE_ROOT)} {shlex.quote(REMOTE_OUT)} && "
         f"mkdir -p {shlex.quote(REMOTE_ROOT)}/tools/wasi-apps "
-        f"{shlex.quote(REMOTE_ROOT)}/fedora-guest-tools {shlex.quote(REMOTE_OUT)}",
+        f"{shlex.quote(REMOTE_ROOT)}/fedora-guest-tools "
+        f"{shlex.quote(REMOTE_ROOT)}/sources {shlex.quote(REMOTE_OUT)}",
         timeout=30,
     )
     scp_base = [
@@ -462,6 +493,15 @@ def copy_guest_files(repo_root: Path, key: Path, port: int) -> None:
     run([*scp_base, *(str(path) for path in files), f"{SSH_USER}@127.0.0.1:{REMOTE_ROOT}/tools/wasi-apps/"], repo_root)
     guest_tools = [repo_root / "tools/wasi-apps/fedora-guest-tools/simd_lanes.c"]
     run([*scp_base, *(str(path) for path in guest_tools), f"{SSH_USER}@127.0.0.1:{REMOTE_ROOT}/fedora-guest-tools/"], repo_root)
+    if quickjs_source_archive is not None:
+        run(
+            [
+                *scp_base,
+                str(quickjs_source_archive),
+                f"{SSH_USER}@127.0.0.1:{REMOTE_QUICKJS_SOURCE_ARCHIVE}",
+            ],
+            repo_root,
+        )
 
 
 def linux_cpu_features(
@@ -581,6 +621,7 @@ def run_fedora_qemu_linux(
     host_http_url: str | None,
     host_tcp_host: str | None,
     host_tcp_port: int | None,
+    quickjs_source_archive: Path | None = None,
 ) -> tuple[Path | None, dict]:
     native_workloads = [
         workload for workload in workloads if workload["runner"] in ("shell", "program")
@@ -593,6 +634,11 @@ def run_fedora_qemu_linux(
         workload_uses_placeholder(workload, "{simd_lanes}") for workload in native_workloads
     )
     quickjs_policy = quickjs_native_policy(repo_root) if quickjs_required else None
+    quickjs_source_archive = (
+        resolve_quickjs_source_archive(repo_root, asset_dir, quickjs_source_archive)
+        if quickjs_required
+        else None
+    )
     asset_dir.mkdir(parents=True, exist_ok=True)
     key = ensure_private_key(repo_root, asset_dir)
     public_key = key.with_suffix(key.suffix + ".pub").read_text(encoding="utf-8").strip()
@@ -614,13 +660,15 @@ def run_fedora_qemu_linux(
         "quickjs_required": quickjs_required,
         "native_simd_probe_required": simd_probe_required,
     }
+    if quickjs_source_archive is not None:
+        provenance["quickjs_source_archive"] = str(quickjs_source_archive)
     if not native_workloads:
         return None, provenance
     port = ssh_port or free_tcp_port()
     process = start_vm(repo_root, asset_dir, qemu_bin, disk, seed_iso, port, memory, smp)
     try:
         wait_for_ssh(repo_root, key, port, setup_timeout_seconds)
-        copy_guest_files(repo_root, key, port)
+        copy_guest_files(repo_root, key, port, quickjs_source_archive)
         ensure_provisioned(
             repo_root,
             key,

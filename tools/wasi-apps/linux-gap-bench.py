@@ -413,6 +413,7 @@ def run_linux(
     host_http_url: str | None,
     host_tcp_host: str | None,
     linux_tcp_port: int | None,
+    quickjs_source_archive: Path | None,
 ) -> tuple[Path | None, dict]:
     return run_fedora_qemu_linux(
         repo_root(),
@@ -430,6 +431,7 @@ def run_linux(
         host_http_url,
         host_tcp_host,
         linux_tcp_port,
+        quickjs_source_archive,
     )
 
 
@@ -1205,6 +1207,11 @@ def main() -> None:
     parser.add_argument("--linux-vm-smp", type=int, default=DEFAULT_SMP)
     parser.add_argument("--linux-vm-disk-size", default=DEFAULT_DISK_SIZE)
     parser.add_argument("--linux-vm-setup-timeout-seconds", type=int, default=900)
+    parser.add_argument(
+        "--quickjs-source-archive",
+        type=Path,
+        help="Pre-staged QuickJS-NG source archive used to build the Fedora native qjs baseline without guest internet access.",
+    )
     parser.add_argument("--out-dir", type=Path)
     parser.add_argument("--skip-helios", action="store_true")
     parser.add_argument("--skip-linux", action="store_true")
@@ -1308,6 +1315,7 @@ def main() -> None:
                 host_http_url,
                 host_tcp_host,
                 linux_tcp_port,
+                args.quickjs_source_archive,
             )
         if args.wasmtime_profile_workload:
             wasmtime_profiles = run_wasmtime_profiles(
