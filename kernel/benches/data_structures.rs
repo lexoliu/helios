@@ -173,6 +173,31 @@ fn build_absolute_path_segment_vec_baseline(segments: &[String]) -> String {
     path
 }
 
+#[divan::bench(args = [1usize, 64, 1024])]
+fn component_fs_directory_membership(bencher: Bencher, count: usize) {
+    bencher.counter(ItemsCount::new(count)).bench_local(|| {
+        for _ in 0..count {
+            black_box(helios_kernel::path_is_within_directory(
+                "/sandbox/usr/local/share/python/lib.py",
+                "/sandbox/usr/local/share",
+            ));
+        }
+    });
+}
+
+#[divan::bench(args = [1usize, 64, 1024])]
+fn component_fs_directory_prefix_string_baseline(bencher: Bencher, count: usize) {
+    bencher.counter(ItemsCount::new(count)).bench_local(|| {
+        for _ in 0..count {
+            let prefix = helios_kernel::directory_prefix("/sandbox/usr/local/share");
+            black_box(
+                "/sandbox/usr/local/share/python/lib.py".starts_with(&prefix)
+                    && "/sandbox/usr/local/share/python/lib.py" != "/sandbox/usr/local/share",
+            );
+        }
+    });
+}
+
 fn descriptor_sparse_renumber_reuse_with_table(
     bencher: Bencher,
     new_table: impl Fn() -> DescriptorTable<BenchFile, FileRights>,

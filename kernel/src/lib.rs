@@ -84,8 +84,8 @@ pub use component_fs::{
     map_resource_table_error,
 };
 pub use component_fs_path::{
-    ComponentFsPathError, directory_prefix, parent_path, resolve_absolute_path, resolve_child_path,
-    resolve_guest_path,
+    ComponentFsPathError, directory_prefix, parent_path, path_is_within_directory,
+    resolve_absolute_path, resolve_child_path, resolve_guest_path, strip_directory_prefix,
 };
 pub use component_resources::{
     ComponentRawMutex, ComponentRawMutexGuard, ComponentRawRwLock, ComponentRawRwLockReadGuard,

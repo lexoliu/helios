@@ -2188,9 +2188,10 @@ where
     /// mutating operations (remove, rename) so stale placeholder nodes do
     /// not linger.
     pub(crate) fn invalidate_host_subtree(&mut self, path: &str) {
-        let prefix = crate::directory_prefix(path);
         let mut state = self.snapshot.inner.lock();
-        state.retain_nodes(|node| node.path != path && !node.path.starts_with(&prefix));
+        state.retain_nodes(|node| {
+            node.path != path && !crate::path_is_within_directory(&node.path, path)
+        });
     }
 
     /// Seed direct children of a host directory into the embedded FS so that
@@ -2436,19 +2437,15 @@ where
             return Err(fs_types::ErrorCode::NotDirectory);
         }
 
-        let prefix = crate::directory_prefix(path);
         let mut entries = Vec::new();
         let state = self.snapshot.inner.lock();
         for child in &state.nodes {
             if child.path == path {
                 continue;
             }
-            let Some(remainder) = child.path.strip_prefix(&prefix) else {
+            let Some(remainder) = crate::strip_directory_prefix(&child.path, path) else {
                 continue;
             };
-            if remainder.is_empty() {
-                continue;
-            }
             if let Some((name, _)) = remainder.split_once('/') {
                 push_directory_entry_if_absent(
                     &mut entries,
@@ -2952,14 +2949,13 @@ where
         if node.kind != FsNodeKind::Directory {
             return Err(fs_types::ErrorCode::NotDirectory);
         }
-        let prefix = crate::directory_prefix(&absolute);
         if self
             .snapshot
             .inner
             .lock()
             .nodes
             .iter()
-            .any(|child| child.path != absolute && child.path.starts_with(&prefix))
+            .any(|child| crate::path_is_within_directory(&child.path, &absolute))
         {
             return Err(fs_types::ErrorCode::NotEmpty);
         }
@@ -3238,15 +3234,13 @@ where
         }
 
         if source_node.kind == FsNodeKind::Directory {
-            let source_prefix = crate::directory_prefix(&source_absolute);
             if destination_absolute == source_absolute
-                || destination_absolute.starts_with(&source_prefix)
+                || crate::path_is_within_directory(&destination_absolute, &source_absolute)
             {
                 return Err(fs_types::ErrorCode::NotPermitted);
             }
         }
 
-        let source_prefix = crate::directory_prefix(&source_absolute);
         let mut state = self.snapshot.inner.lock();
         for node in &mut state.nodes {
             if node.path == source_absolute {
@@ -3255,7 +3249,9 @@ where
                 continue;
             }
 
-            if source_node.kind == FsNodeKind::Directory && node.path.starts_with(&source_prefix) {
+            if source_node.kind == FsNodeKind::Directory
+                && crate::path_is_within_directory(&node.path, &source_absolute)
+            {
                 node.path =
                     append_path_suffix(&destination_absolute, &node.path[source_absolute.len()..]);
                 node.touch_status(now_nanos);
