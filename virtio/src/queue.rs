@@ -145,7 +145,7 @@ impl<T: VirtioTransport> VirtQueue<T> {
         Ok(head)
     }
 
-    pub(crate) fn submit_output_at(
+    pub(crate) fn submit_output_at_deferred(
         &mut self,
         transport: &T,
         token: u16,
@@ -163,7 +163,6 @@ impl<T: VirtioTransport> VirtQueue<T> {
         self.desc_shadow[usize::from(token)].flags &= !DESC_FLAG_NEXT;
         self.write_desc(token);
         self.stage_deferred_head(token);
-        self.publish_deferred_heads();
         self.num_used += 1;
         Ok(token)
     }
@@ -702,11 +701,95 @@ mod tests {
         assert_eq!(queue.next_free_descriptor(), second_token);
         assert_eq!(
             queue
-                .submit_output_at(&transport, first_token, &mut output)
+                .submit_output_at_deferred(&transport, first_token, &mut output)
                 .expect("specific descriptor submit should succeed"),
             first_token
         );
+        queue.publish_deferred_heads();
         assert_eq!(queue.next_free_descriptor(), second_token);
+    }
+
+    #[test]
+    fn deferred_output_submit_publishes_avail_index_once_for_batch() {
+        let transport = FakeTransport {
+            bus: FakeBus { dma: FakeDmaPool },
+        };
+        let mut queue = VirtQueue::new(&transport, 0, 8).expect("queue should initialize");
+        let first_buffer = [1u8; 16];
+        let second_buffer = [2u8; 16];
+        let mut first_output = [0u8; 16];
+        let mut second_output = [0u8; 16];
+
+        let first_token = queue
+            .submit(&transport, &[&first_buffer], &mut [])
+            .expect("first submission should succeed");
+        let second_token = queue
+            .submit(&transport, &[&second_buffer], &mut [])
+            .expect("second submission should succeed");
+
+        unsafe {
+            queue
+                .device_area
+                .as_ptr()
+                .add(4)
+                .cast::<UsedElem>()
+                .write_volatile(UsedElem {
+                    id: first_token as u32,
+                    len: 0,
+                });
+            queue
+                .device_area
+                .as_ptr()
+                .add(4 + size_of::<UsedElem>())
+                .cast::<UsedElem>()
+                .write_volatile(UsedElem {
+                    id: second_token as u32,
+                    len: 0,
+                });
+            queue
+                .device_area
+                .as_ptr()
+                .cast::<u16>()
+                .add(1)
+                .write_volatile(2);
+        }
+
+        assert_eq!(queue.pop_used(), Some(first_token));
+        assert_eq!(queue.pop_used(), Some(second_token));
+        assert_eq!(
+            queue
+                .submit_output_at_deferred(&transport, second_token, &mut second_output)
+                .expect("second descriptor deferred submit should succeed"),
+            second_token
+        );
+        assert_eq!(
+            queue
+                .submit_output_at_deferred(&transport, first_token, &mut first_output)
+                .expect("first descriptor deferred submit should succeed"),
+            first_token
+        );
+
+        let unpublished_avail_idx = unsafe {
+            queue
+                .driver_area
+                .as_ptr()
+                .cast::<u16>()
+                .add(1)
+                .read_volatile()
+        };
+        assert_eq!(unpublished_avail_idx, 2);
+
+        queue.publish_deferred_heads();
+
+        let published_avail_idx = unsafe {
+            queue
+                .driver_area
+                .as_ptr()
+                .cast::<u16>()
+                .add(1)
+                .read_volatile()
+        };
+        assert_eq!(published_avail_idx, 4);
     }
 
     #[test]
