@@ -532,6 +532,17 @@ where
     signal_dispositions: Vec<WasixSignalDisposition>,
 }
 
+struct CoreModuleReplacementState<CpuImpl, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    exec_context: ProgramExecContext<CpuImpl, HostFs>,
+    instance: crate::RegisteredInstance,
+    output_mode: OutputMode,
+    core_linker: CoreLinker<Preview1ProgramStore<CpuImpl, HostFs>>,
+}
+
 enum CoreModuleRunCompletion<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
@@ -5093,17 +5104,19 @@ where
     let profile_cpu = exec_context.cpu.clone();
     let profile_runtime_state = exec_context.runtime_state.clone();
     let instance_id = launched_instance.id();
-    let replacement_exec_context = exec_context.clone();
-    let replacement_instance = launched_instance.clone();
-    let replacement_output_mode = output_mode.clone();
-    let replacement_core_linker = preview1_core_linker.clone();
+    let wasix_abi = core_module_imports_wasix(&compiled.module);
+    let replacement_state = wasix_abi.then(|| CoreModuleReplacementState {
+        exec_context: exec_context.clone(),
+        instance: launched_instance.clone(),
+        output_mode: output_mode.clone(),
+        core_linker: preview1_core_linker.clone(),
+    });
     let imported_memory_spec = imported_shared_memory_spec_with_user_budget(&compiled.module)?;
     let imported_memory = match imported_memory_spec {
         Some(spec) => Some(shared_memory_pool.lock().acquire(engine.raw(), spec)?),
         None => None,
     };
     let recycle_memory = imported_memory.clone();
-    let wasix_abi = core_module_imports_wasix(&compiled.module);
     let (completion, recycle_allowed) = {
         let mut store = wasmtime::Store::new(
             engine.raw(),
@@ -5283,8 +5296,10 @@ where
     match completion {
         CoreModuleRunCompletion::Exit(result) => result,
         CoreModuleRunCompletion::Exec(replacement) => {
+            let replacement_state = replacement_state
+                .expect("core module without WASIX imports requested exec replacement");
             Box::pin(run_program_executable(
-                replacement_exec_context,
+                replacement_state.exec_context,
                 replacement.name,
                 replacement.args,
                 replacement.env,
@@ -5298,11 +5313,11 @@ where
                 replacement.executable,
                 engine,
                 runtime,
-                replacement_core_linker,
+                replacement_state.core_linker,
                 shared_memory_pool,
                 core_module_instance_pre_cache,
-                replacement_instance,
-                replacement_output_mode,
+                replacement_state.instance,
+                replacement_state.output_mode,
             ))
             .await
         }
@@ -5346,14 +5361,16 @@ where
     let profile_cpu = exec_context.cpu.clone();
     let profile_runtime_state = exec_context.runtime_state.clone();
     let instance_id = launched_instance.id();
-    let replacement_exec_context = exec_context.clone();
-    let replacement_instance = launched_instance.clone();
-    let replacement_output_mode = output_mode.clone();
-    let replacement_core_linker = preview1_core_linker.clone();
+    let wasix_abi = core_module_imports_wasix(&compiled.module);
+    let replacement_state = wasix_abi.then(|| CoreModuleReplacementState {
+        exec_context: exec_context.clone(),
+        instance: launched_instance.clone(),
+        output_mode: output_mode.clone(),
+        core_linker: preview1_core_linker.clone(),
+    });
     let imported_memory = Some(restore.memory.clone());
     let recycle_memory = restore.memory.clone();
     let memory_spec = restore.memory_spec;
-    let wasix_abi = core_module_imports_wasix(&compiled.module);
     let (completion, recycle_allowed) = {
         let mut store = wasmtime::Store::new(
             engine.raw(),
@@ -5498,8 +5515,10 @@ where
     match completion {
         CoreModuleRunCompletion::Exit(result) => result,
         CoreModuleRunCompletion::Exec(replacement) => {
+            let replacement_state = replacement_state
+                .expect("core module without WASIX imports requested exec replacement");
             Box::pin(run_program_executable(
-                replacement_exec_context,
+                replacement_state.exec_context,
                 replacement.name,
                 replacement.args,
                 replacement.env,
@@ -5513,11 +5532,11 @@ where
                 replacement.executable,
                 engine,
                 runtime,
-                replacement_core_linker,
+                replacement_state.core_linker,
                 shared_memory_pool,
                 core_module_instance_pre_cache,
-                replacement_instance,
-                replacement_output_mode,
+                replacement_state.instance,
+                replacement_state.output_mode,
             ))
             .await
         }
