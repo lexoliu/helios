@@ -13,11 +13,14 @@ impl ProgressCounter {
     }
 
     pub fn record_progress(&self) {
-        self.epoch.fetch_add(1, Ordering::AcqRel);
+        // The epoch is a heartbeat only; it does not publish data protected by
+        // the counter. Atomic coherence is enough for watchdog/executor
+        // observers to notice forward progress without fencing every schedule.
+        self.epoch.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> u64 {
-        self.epoch.load(Ordering::Acquire)
+        self.epoch.load(Ordering::Relaxed)
     }
 }
 
