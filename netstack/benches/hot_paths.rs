@@ -356,8 +356,7 @@ fn tcp_ack_discards_in_flight_segments(bencher: Bencher) {
                     options: TcpOptions::empty(),
                     payload: &[],
                 },
-                u64::try_from(TCP_TRANSMIT_SEGMENTS + 2)
-                    .expect("TCP benchmark timestamp fits u64"),
+                u64::try_from(TCP_TRANSMIT_SEGMENTS + 2).expect("TCP benchmark timestamp fits u64"),
             );
             assert_eq!(socket.pending_retransmission(u64::MAX), None);
         });

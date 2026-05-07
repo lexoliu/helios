@@ -1369,7 +1369,7 @@ where
                 segment.sequence = self.receive_next;
             }
             let len = segment.payload.len();
-            self.push_receive_segment(receive_bytes_from_payload(segment.payload.as_ref()))
+            self.push_receive_payload(segment.payload.as_ref())
                 .unwrap_or_else(|_| panic!("TCP receive queue reported full after capacity check"));
             self.receive_next = self
                 .receive_next
@@ -2625,6 +2625,76 @@ mod tests {
 
         assert_eq!(
             socket.receive(16, 3).as_deref(),
+            Some(b"abcdefghi".as_slice())
+        );
+    }
+
+    #[test]
+    fn out_of_order_drain_coalesces_receive_queue_tail() {
+        let mut socket = established_socket();
+        socket.mark_ack_queued();
+
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 107,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: b"ghi",
+            },
+            TCP_INITIAL_RTO_NANOS + 1,
+        );
+
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: b"abc",
+            },
+            TCP_INITIAL_RTO_NANOS + 2,
+        );
+
+        assert_eq!(
+            socket
+                .receive_queue
+                .as_ref()
+                .expect("receive queue must be allocated")
+                .segments
+                .len(),
+            1
+        );
+        assert_eq!(socket.receive_queued_bytes, 3);
+
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 104,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: b"def",
+            },
+            TCP_INITIAL_RTO_NANOS + 3,
+        );
+
+        let queue = socket
+            .receive_queue
+            .as_ref()
+            .expect("receive queue must remain allocated");
+        assert_eq!(queue.segments.len(), 1);
+        assert_eq!(socket.receive_queued_bytes, 9);
+        assert_eq!(
+            socket.receive(16, 4).as_deref(),
             Some(b"abcdefghi".as_slice())
         );
     }
