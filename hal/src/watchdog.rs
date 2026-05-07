@@ -1,8 +1,6 @@
-extern crate alloc;
-
-use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
+use triomphe::Arc;
 
 #[derive(Clone, Default)]
 pub struct ProgressCounter {
