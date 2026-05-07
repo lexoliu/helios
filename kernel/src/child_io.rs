@@ -181,7 +181,7 @@ impl ByteSignal {
     }
 
     fn try_claim_permit(&self) -> bool {
-        self.permit.swap(false, Ordering::AcqRel)
+        self.permit.swap(false, Ordering::Acquire)
     }
 }
 
@@ -229,7 +229,9 @@ pub struct ClosedPeer;
 
 impl Clone for ByteWriter {
     fn clone(&self) -> Self {
-        let previous = self.channel.writer_handles.fetch_add(1, Ordering::AcqRel);
+        // The separate closed flags publish EOF/peer-close visibility; these
+        // counters only elect the last handle.
+        let previous = self.channel.writer_handles.fetch_add(1, Ordering::Relaxed);
         assert!(
             previous != 0,
             "byte writer cloned after liveness reached zero"
@@ -242,7 +244,7 @@ impl Clone for ByteWriter {
 
 impl Drop for ByteWriter {
     fn drop(&mut self) {
-        let previous = self.channel.writer_handles.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.channel.writer_handles.fetch_sub(1, Ordering::Relaxed);
         assert!(previous != 0, "byte writer handle count underflowed");
         if previous == 1 {
             self.channel.writer_closed.store(true, Ordering::Release);
@@ -253,7 +255,9 @@ impl Drop for ByteWriter {
 
 impl Clone for ByteReader {
     fn clone(&self) -> Self {
-        let previous = self.channel.reader_handles.fetch_add(1, Ordering::AcqRel);
+        // The separate closed flags publish EOF/peer-close visibility; these
+        // counters only elect the last handle.
+        let previous = self.channel.reader_handles.fetch_add(1, Ordering::Relaxed);
         assert!(
             previous != 0,
             "byte reader cloned after liveness reached zero"
@@ -266,7 +270,7 @@ impl Clone for ByteReader {
 
 impl Drop for ByteReader {
     fn drop(&mut self) {
-        let previous = self.channel.reader_handles.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.channel.reader_handles.fetch_sub(1, Ordering::Relaxed);
         assert!(previous != 0, "byte reader handle count underflowed");
         if previous == 1 {
             self.channel.close_reader();
