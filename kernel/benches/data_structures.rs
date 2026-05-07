@@ -257,8 +257,8 @@ fn executor_spawn_detached_run_global(bencher: Bencher, count: usize) {
     let spawner = executor.spawner(BenchCpu);
     // Task allocation includes the scheduler capture stored by async-task. This
     // benchmark keeps the per-task byte count visible while we move toward a
-    // pooled task/waker design; the current specialized scheduler path is 73 B
-    // per global no-op task on this host.
+    // pooled task/waker design; removing the runtime progress-mode field moved
+    // global no-op tasks from 73 B to 65 B on this host.
     bencher.counter(ItemsCount::new(count)).bench_local(|| {
         for _ in 0..count {
             spawner.spawn_detached(async {});
@@ -274,8 +274,8 @@ fn executor_spawn_detached_run_local(bencher: Bencher, count: usize) {
     let executor = Executor::new(ProgressCounter::new(), 1, ProcessorId::new(0));
     let spawner = executor.spawner(BenchCpu);
     // Local tasks still carry owner-processor routing state, so the scheduler
-    // capture is slightly larger than the global path: 81 B per no-op task on
-    // this host after removing the unused global wake fields.
+    // capture is slightly larger than the global path: 73 B per no-op task on
+    // this host after removing the runtime progress-mode field.
     bencher.counter(ItemsCount::new(count)).bench_local(|| {
         for _ in 0..count {
             spawner.spawn_local_detached(async {});

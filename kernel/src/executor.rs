@@ -78,7 +78,6 @@ pub struct ExecutorRunStats {
 struct ProgressSignal {
     progress: ProgressCounter,
     progress_notify: NoWeakArc<Notify>,
-    mode: ProgressMode,
 }
 
 // `async_task` stores the scheduler closure inside every heap-allocated task.
@@ -227,16 +226,12 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         self.progress_notify.clone()
     }
 
-    fn spawn_with_progress<Fut>(
-        &self,
-        future: Fut,
-        progress_mode: ProgressMode,
-    ) -> JoinHandle<Fut::Output>
+    fn spawn_with_progress<Fut>(&self, future: Fut) -> JoinHandle<Fut::Output>
     where
         Fut: Future + Send + 'static,
         Fut::Output: Send + 'static,
     {
-        let scheduler = self.global_scheduler(progress_mode);
+        let scheduler = self.global_scheduler();
         let schedule = move |runnable| scheduler.schedule(runnable);
         let (runnable, task) = Builder::new().spawn(move |_| future, schedule);
         runnable.schedule();
@@ -268,7 +263,7 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
             };
         }
 
-        let scheduler = self.local_scheduler(progress_mode);
+        let scheduler = self.local_scheduler();
         let schedule = move |runnable| scheduler.schedule(runnable);
 
         // SAFETY: the runnable is always re-enqueued onto the spawning processor's ready
@@ -282,30 +277,29 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         }
     }
 
-    fn progress_signal(&self, mode: ProgressMode) -> ProgressSignal {
+    fn progress_signal(&self) -> ProgressSignal {
         ProgressSignal {
             progress: self.progress.clone(),
             progress_notify: self.progress_notify.clone(),
-            mode,
         }
     }
 
-    fn global_scheduler(&self, progress_mode: ProgressMode) -> GlobalScheduler<CpuImpl> {
+    fn global_scheduler(&self) -> GlobalScheduler<CpuImpl> {
         GlobalScheduler {
             group: self.group.clone(),
             cpu: self.cpu.clone(),
             processor_count: self.processor_count,
-            progress: self.progress_signal(progress_mode),
+            progress: self.progress_signal(),
         }
     }
 
-    fn local_scheduler(&self, progress_mode: ProgressMode) -> LocalScheduler<CpuImpl> {
+    fn local_scheduler(&self) -> LocalScheduler<CpuImpl> {
         LocalScheduler {
             group: self.group.clone(),
             cpu: self.cpu.clone(),
             owner_processor: self.owner_processor,
             local_queue_index: self.local_queue_index,
-            progress: self.progress_signal(progress_mode),
+            progress: self.progress_signal(),
         }
     }
 
@@ -323,7 +317,7 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         Fut: Future + Send + 'static,
         Fut::Output: Send + 'static,
     {
-        self.spawn_with_progress(future, ProgressMode::Counted)
+        self.spawn_with_progress(future)
     }
 
     pub fn spawn_detached<Fut>(&self, future: Fut)
@@ -363,10 +357,8 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
 impl ProgressSignal {
     #[inline]
     fn record(&self) {
-        if self.mode == ProgressMode::Counted {
-            self.progress.record_progress();
-            self.progress_notify.notify_one_coalesced();
-        }
+        self.progress.record_progress();
+        self.progress_notify.notify_one_coalesced();
     }
 }
 
