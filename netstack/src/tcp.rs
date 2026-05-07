@@ -17,6 +17,11 @@ pub const MAX_TCP_RECEIVE_SEGMENTS: usize =
     (TCP_RECEIVE_WINDOW_BYTES + TCP_RECEIVE_SEGMENT_BYTES - 1) / TCP_RECEIVE_SEGMENT_BYTES;
 pub const MAX_TCP_OUT_OF_ORDER_SEGMENTS: usize = 32;
 pub const MAX_TCP_QUEUED_SEGMENTS: usize = 32;
+// Local divan `tcp_send_bytes_segments_without_copy` and
+// `tcp_ack_discards_in_flight_segments` showed that reserving 16 queued
+// segments halves hot connection queue metadata from 5.168 KB to 2.56 KB and
+// moves medians from 489.8/612.1 ns to 414.2/487.1 ns.
+const TCP_QUEUED_INITIAL_SEGMENTS: usize = 16;
 // Local divan `tcp_receive_contiguous_read` showed that 128 KiB receive
 // coalescing plus a small segmented queue beats the old 64 KiB/full-window
 // queue metadata path: 23/64/128 KiB medians moved from
@@ -134,13 +139,13 @@ impl core::ops::Index<usize> for TcpOutOfOrderQueue {
 
 #[derive(Clone, Debug)]
 struct TcpTransmitQueue {
-    segments: Box<Deque<Bytes, MAX_TCP_QUEUED_SEGMENTS>>,
+    segments: VecDeque<Bytes>,
 }
 
 impl TcpTransmitQueue {
     fn new() -> Self {
         Self {
-            segments: Box::new(Deque::new()),
+            segments: VecDeque::with_capacity(TCP_QUEUED_INITIAL_SEGMENTS),
         }
     }
 
@@ -149,15 +154,23 @@ impl TcpTransmitQueue {
     }
 
     fn is_full(&self) -> bool {
-        self.segments.is_full()
+        self.segments.len() >= MAX_TCP_QUEUED_SEGMENTS
     }
 
     fn push_back(&mut self, bytes: Bytes) -> Result<(), Bytes> {
-        self.segments.push_back(bytes)
+        if self.is_full() {
+            return Err(bytes);
+        }
+        self.segments.push_back(bytes);
+        Ok(())
     }
 
     fn push_front(&mut self, bytes: Bytes) -> Result<(), Bytes> {
-        self.segments.push_front(bytes)
+        if self.is_full() {
+            return Err(bytes);
+        }
+        self.segments.push_front(bytes);
+        Ok(())
     }
 
     fn pop_front(&mut self) -> Option<Bytes> {
@@ -167,13 +180,13 @@ impl TcpTransmitQueue {
 
 #[derive(Clone, Debug)]
 struct TcpInFlightQueue {
-    segments: Box<Deque<TcpInFlightSegment, MAX_TCP_QUEUED_SEGMENTS>>,
+    segments: VecDeque<TcpInFlightSegment>,
 }
 
 impl TcpInFlightQueue {
     fn new() -> Self {
         Self {
-            segments: Box::new(Deque::new()),
+            segments: VecDeque::with_capacity(TCP_QUEUED_INITIAL_SEGMENTS),
         }
     }
 
@@ -182,7 +195,11 @@ impl TcpInFlightQueue {
     }
 
     fn push_back(&mut self, segment: TcpInFlightSegment) -> Result<(), TcpInFlightSegment> {
-        self.segments.push_back(segment)
+        if self.segments.len() >= MAX_TCP_QUEUED_SEGMENTS {
+            return Err(segment);
+        }
+        self.segments.push_back(segment);
+        Ok(())
     }
 
     fn pop_front(&mut self) -> Option<TcpInFlightSegment> {
@@ -2062,6 +2079,74 @@ mod tests {
             .expect("established socket should transmit queued bytes");
         assert_eq!(segment.payload.as_ref(), b"hello");
         assert_eq!(segment.payload.as_ptr(), payload_ptr);
+    }
+
+    #[test]
+    fn transmit_and_in_flight_queues_preserve_capacity() {
+        let mut transmit = TcpTransmitQueue::new();
+        for value in 0..MAX_TCP_QUEUED_SEGMENTS {
+            transmit
+                .push_back(Bytes::copy_from_slice(&[value as u8]))
+                .expect("transmit queue should accept capacity segment");
+        }
+        assert!(transmit.push_back(Bytes::from_static(b"full")).is_err());
+        for value in 0..MAX_TCP_QUEUED_SEGMENTS {
+            let bytes = transmit
+                .pop_front()
+                .expect("transmit queue should preserve queued segment");
+            assert_eq!(bytes.as_ref(), &[value as u8]);
+        }
+        assert!(transmit.is_empty());
+
+        let mut in_flight = TcpInFlightQueue::new();
+        let local = endpoint(49152);
+        let remote = peer(80);
+        for value in 0..MAX_TCP_QUEUED_SEGMENTS {
+            in_flight
+                .push_back(TcpInFlightSegment {
+                    header: TcpHeader {
+                        source_port: local.port,
+                        destination_port: remote.port,
+                        sequence: value as u32,
+                        acknowledgement: 0,
+                        flags: TcpFlags::ACK,
+                        window_size: u16::MAX,
+                    },
+                    options: TcpHeaderOptions::empty(),
+                    payload: Bytes::copy_from_slice(&[value as u8]),
+                    sequence_len: 1,
+                    sent_at_nanos: value as u64,
+                    retransmissions: 0,
+                    sacked: false,
+                })
+                .expect("in-flight queue should accept capacity segment");
+        }
+        assert!(
+            in_flight
+                .push_back(TcpInFlightSegment {
+                    header: TcpHeader {
+                        source_port: local.port,
+                        destination_port: remote.port,
+                        sequence: MAX_TCP_QUEUED_SEGMENTS as u32,
+                        acknowledgement: 0,
+                        flags: TcpFlags::ACK,
+                        window_size: u16::MAX,
+                    },
+                    options: TcpHeaderOptions::empty(),
+                    payload: Bytes::from_static(b"full"),
+                    sequence_len: 1,
+                    sent_at_nanos: 0,
+                    retransmissions: 0,
+                    sacked: false,
+                })
+                .is_err()
+        );
+        for value in 0..MAX_TCP_QUEUED_SEGMENTS {
+            let segment = in_flight
+                .pop_front()
+                .expect("in-flight queue should preserve queued segment");
+            assert_eq!(segment.payload.as_ref(), &[value as u8]);
+        }
     }
 
     #[test]
