@@ -144,6 +144,12 @@ fn futex_prepare_complete_distinct_keys(bencher: Bencher, count: usize) {
                 memory,
                 GuestAddress::new(u64::try_from(index + 1).expect("futex bench address fits")),
             )));
+            black_box(
+                registration
+                    .as_ref()
+                    .expect("futex bench registration should be present")
+                    .notify(),
+            );
         }
         for registration in registrations.into_iter().take(count).flatten() {
             table.complete_wait(registration);

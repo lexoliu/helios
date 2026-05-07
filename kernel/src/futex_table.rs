@@ -66,8 +66,8 @@ impl FutexWaitRegistration {
         self.key
     }
 
-    pub fn notify(&self) -> Arc<Notify> {
-        self.notify.clone()
+    pub fn notify(&self) -> &Notify {
+        &self.notify
     }
 }
 
