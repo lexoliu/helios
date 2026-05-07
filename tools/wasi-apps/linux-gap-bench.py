@@ -607,18 +607,24 @@ def network_perf_rows(paths: list[Path]) -> list[dict]:
             continue
         total_nanos = metric_u64(sample, "total_nanos")
         total_bytes = metric_u64(sample, "total_bytes")
+        total_reference_cycles = metric_u64(sample, "total_reference_cycles")
         rows.append(
             {
                 "name": name,
                 "events": metric_u64(sample, "total_events"),
                 "nanos": total_nanos,
                 "bytes": total_bytes,
+                "reference_cycles": total_reference_cycles,
                 "nanos_per_event": average_or_none(
                     total_nanos,
                     metric_u64(sample, "total_events"),
                 ),
                 "bytes_per_event": average_or_none(
                     total_bytes,
+                    metric_u64(sample, "total_events"),
+                ),
+                "reference_cycles_per_event": average_or_none(
+                    total_reference_cycles,
                     metric_u64(sample, "total_events"),
                 ),
                 "mib_s": throughput_mib_s(total_bytes, total_nanos / 1_000_000.0),
@@ -843,8 +849,10 @@ def write_summary_json(
                 "events": row["events"],
                 "total_bytes": row["bytes"],
                 "total_nanos": row["nanos"],
+                "total_reference_cycles": row["reference_cycles"],
                 "nanos_per_event": row["nanos_per_event"],
                 "bytes_per_event": row["bytes_per_event"],
+                "reference_cycles_per_event": row["reference_cycles_per_event"],
                 "mib_per_second": row["mib_s"],
                 "source": str(row["source"]),
             }
@@ -1256,10 +1264,10 @@ def write_report(
             [
                 "## Helios Network Perf Metrics",
                 "",
-                "Read this table as kernel-path evidence, not as an HTTP or curl verdict: low payload bytes with high `ns/event` points at ACK/control submission cost, while high payload bytes with high total time points at RX drain or TCP receive drive cost.",
+                "Read this table as kernel-path evidence, not as an HTTP or curl verdict: low payload bytes with high `ns/event` points at ACK/control submission cost, while high wall time with low reference cycles points at waiting for device or scheduler progress rather than CPU burn.",
                 "",
-                "| Metric | Events | Total bytes | Total time | ns/event | bytes/event | Throughput | Source |",
-                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+                "| Metric | Events | Total bytes | Total time | Ref cycles | ns/event | ref/event | bytes/event | Throughput | Source |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
             ]
         )
         for row in network_perf[:16]:
@@ -1267,11 +1275,16 @@ def write_report(
             nanos_per_event = (
                 "n/a" if row["nanos_per_event"] is None else f"{row['nanos_per_event']:.1f}"
             )
+            reference_cycles_per_event = (
+                "n/a"
+                if row["reference_cycles_per_event"] is None
+                else f"{row['reference_cycles_per_event']:.1f}"
+            )
             bytes_per_event = (
                 "n/a" if row["bytes_per_event"] is None else f"{row['bytes_per_event']:.1f}"
             )
             lines.append(
-                f"| `{row['name']}` | {row['events']} | {row['bytes']} | {row['nanos']} ns | {nanos_per_event} | {bytes_per_event} | {throughput} | `{row['source']}` |"
+                f"| `{row['name']}` | {row['events']} | {row['bytes']} | {row['nanos']} ns | {row['reference_cycles']} | {nanos_per_event} | {reference_cycles_per_event} | {bytes_per_event} | {throughput} | `{row['source']}` |"
             )
         lines.append("")
     if component_heap:
