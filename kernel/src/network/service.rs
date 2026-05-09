@@ -1,5 +1,6 @@
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::num::NonZeroU32;
@@ -77,7 +78,7 @@ where
     runtime_state: Runtime,
     timer: Timer<CpuImpl>,
     device: Device,
-    state: NetworkShardCell,
+    state: NetworkShardSet,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -147,24 +148,51 @@ struct NetworkShard {
     next_dns_query_id: u16,
 }
 
-struct NetworkShardCell {
-    state: SpinMutex<NetworkShard>,
+/// A set of `NetworkShard` instances laid out per-CPU. The current
+/// implementation always carries a single shard; the surface
+/// (`with` / `with_mut`) is shaped so the upcoming N>1 expansion
+/// (one shard per processor, dispatched via socket-id hashing) is a
+/// localised change rather than a callsite-wide rewrite.
+///
+/// Cache-line padding around each shard avoids false sharing once
+/// multiple shards live in the box: without it, two adjacent
+/// `SpinMutex` fields would share a cache line and ping-pong on
+/// every cross-CPU lock operation. We pay the padding cost in the
+/// single-shard build to keep the layout invariant.
+#[repr(align(64))]
+struct PaddedShard {
+    inner: SpinMutex<NetworkShard>,
 }
 
-impl NetworkShardCell {
+struct NetworkShardSet {
+    shards: Box<[PaddedShard]>,
+}
+
+impl NetworkShardSet {
     fn new(state: NetworkShard) -> Self {
         Self {
-            state: SpinMutex::new(state),
+            shards: alloc::vec![PaddedShard {
+                inner: SpinMutex::new(state),
+            }]
+            .into_boxed_slice(),
         }
     }
 
+    /// Picks the shard responsible for an operation. Until the
+    /// per-CPU sharding lands all callers route to shard 0; the
+    /// helper exists so future hashing stays localised here.
+    #[inline]
+    fn shard_for_default(&self) -> &SpinMutex<NetworkShard> {
+        &self.shards[0].inner
+    }
+
     fn with<R>(&self, f: impl FnOnce(&NetworkShard) -> R) -> R {
-        let state = self.state.lock();
+        let state = self.shard_for_default().lock();
         f(&state)
     }
 
     fn with_mut<R>(&self, f: impl FnOnce(&mut NetworkShard) -> R) -> R {
-        let mut state = self.state.lock();
+        let mut state = self.shard_for_default().lock();
         f(&mut state)
     }
 }
@@ -615,7 +643,7 @@ where
                 cpu,
                 runtime_state,
                 timer,
-                state: NetworkShardCell::new(NetworkShard::new(
+                state: NetworkShardSet::new(NetworkShard::new(
                     device.mac_address(),
                     device.max_frame_len(),
                     capabilities.events.rx_poll_budget,
