@@ -148,6 +148,15 @@ impl crate::ComponentHostUdpSocketToken for UdpSocketId {
 
 struct NetworkShard {
     stack: Stack,
+    /// This shard's index inside the parent `NetworkShardSet`.
+    /// Encoded into every public socket id this shard mints so the
+    /// inverse mapping `(id - 1) % shard_count == shard_idx` can
+    /// route operations back to the owning shard without an extra
+    /// table lookup.
+    shard_idx: usize,
+    /// Total number of shards in the parent set. Required for the
+    /// stride-based handle encoding.
+    shard_count: usize,
     next_tcp_local_port: u16,
     next_udp_local_port: u16,
     tcp_streams: HandleSlab<helios_netstack::SocketId, MAX_TCP_STREAM_HANDLES>,
@@ -209,17 +218,20 @@ impl NetworkShardSet {
     /// so the routing rule lives in exactly one place.
     #[inline]
     fn shard_for_default(&self) -> &SpinMutex<NetworkShard> {
-        self.shard_for_handle(0u64)
+        // Handle id 1 is the canonical "shard 0" id under the
+        // stride encoding (slot 0 in shard 0 -> id = 1), so
+        // shard_for_default and shard_for_handle agree on shard 0.
+        self.shard_for_handle(1u64)
     }
 
-    /// Picks the shard owning a given socket / connection handle.
-    /// The hash is `handle mod shard_count`; every callsite that
-    /// already has a stream / listener / socket id routes here so
-    /// the per-handle dispatch stays in one helper.
+    /// Picks the shard owning a given socket / connection handle
+    /// using the inverse of `NetworkShard::encode_handle_id`:
+    /// `(handle - 1) % shard_count == shard_idx`.
     #[inline]
     fn shard_for_handle<H: Into<u64>>(&self, handle: H) -> &SpinMutex<NetworkShard> {
         let handle: u64 = handle.into();
-        let idx = (handle as usize) % self.shards.len();
+        let normalized = handle.saturating_sub(1) as usize;
+        let idx = normalized % self.shards.len();
         &self.shards[idx].inner
     }
 
@@ -710,7 +722,14 @@ where
         .rx_budget;
         let state = NetworkShardSet::new(shard_count, |index| {
             let staggered_xid = transaction_id.wrapping_add(index as u32);
-            NetworkShard::new(mac, max_frame_len, rx_poll_budget, staggered_xid)
+            NetworkShard::new(
+                mac,
+                max_frame_len,
+                rx_poll_budget,
+                staggered_xid,
+                index,
+                shard_count,
+            )
         });
         Self {
             inner: Arc::new(NetworkServiceInner {
@@ -2456,9 +2475,18 @@ impl NetworkShard {
         max_frame_len: usize,
         rx_poll_budget: usize,
         transaction_id: u32,
+        shard_idx: usize,
+        shard_count: usize,
     ) -> Self {
+        assert!(shard_count != 0, "network shard count must be non-zero");
+        assert!(
+            shard_idx < shard_count,
+            "shard idx {shard_idx} out of range for {shard_count} shards"
+        );
         Self {
             stack: Stack::new(StackConfig::new(mac, max_frame_len).with_rx_budget(rx_poll_budget)),
+            shard_idx,
+            shard_count,
             next_tcp_local_port: EPHEMERAL_PORT_START,
             next_udp_local_port: EPHEMERAL_PORT_START,
             tcp_streams: HandleSlab::new(),
@@ -2468,6 +2496,40 @@ impl NetworkShard {
             dns_servers: DhcpDnsServers::new(),
             next_dns_query_id: 1,
         }
+    }
+
+    /// Encodes a per-shard slab index into a globally unique handle
+    /// id whose value satisfies `(id - 1) % shard_count == shard_idx`.
+    /// This is the inverse of `NetworkShardSet::shard_for_handle`
+    /// so an operation arriving with a handle can route directly to
+    /// the shard that minted it without consulting a side table.
+    fn encode_handle_id(&self, slot: usize) -> u32 {
+        let stride = self.shard_count;
+        let raw = slot
+            .checked_mul(stride)
+            .and_then(|product| product.checked_add(self.shard_idx + 1))
+            .unwrap_or_else(|| {
+                panic!(
+                    "network handle slot {slot} overflowed stride {stride} encoding for shard {}",
+                    self.shard_idx
+                )
+            });
+        u32::try_from(raw).unwrap_or_else(|_| panic!("encoded handle id {raw} exceeds u32 range"))
+    }
+
+    /// Reverses `encode_handle_id`. Panics if the handle was minted
+    /// by a different shard, since misrouted handles indicate a
+    /// caller-side dispatch bug.
+    fn decode_handle_slot(&self, raw: u32) -> usize {
+        let value = (raw - 1) as usize;
+        assert_eq!(
+            value % self.shard_count,
+            self.shard_idx,
+            "handle id {raw} routed to shard {} but encodes shard {}",
+            self.shard_idx,
+            value % self.shard_count
+        );
+        value / self.shard_count
     }
 
     fn is_configured(&self) -> bool {
@@ -2894,7 +2956,8 @@ impl NetworkShard {
     }
 
     fn remove_tcp_stream(&mut self, stream: TcpStreamId) {
-        if let Some(socket) = self.tcp_streams.remove(stream_index(stream)) {
+        let slot = self.decode_handle_slot(stream.0.get());
+        if let Some(socket) = self.tcp_streams.remove(slot) {
             self.stack
                 .remove_tcp_socket(socket)
                 .unwrap_or_else(|_| panic!("TCP stream referenced an unknown stack socket"));
@@ -2902,24 +2965,38 @@ impl NetworkShard {
     }
 
     fn remove_udp_socket(&mut self, socket: UdpSocketId) {
-        let _ = self.udp_sockets.remove(socket_index(socket));
+        let slot = self.decode_handle_slot(socket.0.get());
+        let _ = self.udp_sockets.remove(slot);
     }
 
     fn insert_tcp_stream(&mut self, socket: helios_netstack::SocketId) -> TcpStreamId {
-        tcp_stream_id(self.tcp_streams.insert(socket))
+        let slot = self.tcp_streams.insert(socket);
+        TcpStreamId(
+            NonZeroU32::new(self.encode_handle_id(slot))
+                .unwrap_or_else(|| panic!("tcp stream ids must never be zero")),
+        )
     }
 
     fn insert_tcp_listener(&mut self, local_port: u16) -> TcpListenerId {
-        tcp_listener_id(self.tcp_listeners.insert(TcpListenerState { local_port }))
+        let slot = self.tcp_listeners.insert(TcpListenerState { local_port });
+        TcpListenerId(
+            NonZeroU32::new(self.encode_handle_id(slot))
+                .unwrap_or_else(|| panic!("tcp listener ids must never be zero")),
+        )
     }
 
     fn insert_udp_socket(&mut self, local_port: u16) -> UdpSocketId {
-        udp_socket_id(self.udp_sockets.insert(UdpSocketState { local_port }))
+        let slot = self.udp_sockets.insert(UdpSocketState { local_port });
+        UdpSocketId(
+            NonZeroU32::new(self.encode_handle_id(slot))
+                .unwrap_or_else(|| panic!("udp socket ids must never be zero")),
+        )
     }
 
     fn tcp_socket(&self, stream: TcpStreamId) -> Result<helios_netstack::SocketId, TcpError> {
+        let slot = self.decode_handle_slot(stream.0.get());
         self.tcp_streams
-            .get(stream_index(stream))
+            .get(slot)
             .copied()
             .ok_or_else(|| TcpError {
                 kind: TcpErrorKind::Unavailable,
@@ -2928,8 +3005,9 @@ impl NetworkShard {
     }
 
     fn tcp_listener(&self, listener: TcpListenerId) -> Result<&TcpListenerState, TcpError> {
+        let slot = self.decode_handle_slot(listener.0.get());
         self.tcp_listeners
-            .get(tcp_listener_index(listener))
+            .get(slot)
             .ok_or_else(|| TcpError {
                 kind: TcpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::TcpListenerClosedUnexpectedly,
@@ -2937,8 +3015,9 @@ impl NetworkShard {
     }
 
     fn udp_socket(&self, socket: UdpSocketId) -> Result<&UdpSocketState, UdpError> {
+        let slot = self.decode_handle_slot(socket.0.get());
         self.udp_sockets
-            .get(socket_index(socket))
+            .get(slot)
             .ok_or_else(|| UdpError {
                 kind: UdpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::UnknownUdpSocket,
@@ -3268,44 +3347,6 @@ fn parse_ipv6(input: &str) -> Option<Ipv6Address> {
         .map(|address| Ipv6Address::new(address.octets()))
 }
 
-fn tcp_stream_id(index: usize) -> TcpStreamId {
-    let raw =
-        u32::try_from(index + 1).unwrap_or_else(|_| panic!("tcp stream index {index} exceeds u32"));
-    TcpStreamId(NonZeroU32::new(raw).unwrap_or_else(|| panic!("tcp stream ids must never be zero")))
-}
-
-fn stream_index(stream: TcpStreamId) -> usize {
-    usize::try_from(stream.0.get() - 1)
-        .unwrap_or_else(|_| panic!("tcp stream id {} does not fit into usize", stream.0.get()))
-}
-
-fn tcp_listener_id(index: usize) -> TcpListenerId {
-    let raw = u32::try_from(index + 1)
-        .unwrap_or_else(|_| panic!("tcp listener index {index} exceeds u32"));
-    TcpListenerId(
-        NonZeroU32::new(raw).unwrap_or_else(|| panic!("tcp listener ids must never be zero")),
-    )
-}
-
-fn tcp_listener_index(listener: TcpListenerId) -> usize {
-    usize::try_from(listener.0.get() - 1).unwrap_or_else(|_| {
-        panic!(
-            "tcp listener id {} does not fit into usize",
-            listener.0.get()
-        )
-    })
-}
-
-fn udp_socket_id(index: usize) -> UdpSocketId {
-    let raw =
-        u32::try_from(index + 1).unwrap_or_else(|_| panic!("udp socket index {index} exceeds u32"));
-    UdpSocketId(NonZeroU32::new(raw).unwrap_or_else(|| panic!("udp socket ids must never be zero")))
-}
-
-fn socket_index(socket: UdpSocketId) -> usize {
-    usize::try_from(socket.0.get() - 1)
-        .unwrap_or_else(|_| panic!("udp socket id {} does not fit into usize", socket.0.get()))
-}
 
 fn usize_to_u64(value: usize, label: &'static str) -> u64 {
     u64::try_from(value).unwrap_or_else(|_| panic!("{label} does not fit into u64"))
@@ -3440,7 +3481,7 @@ mod tests {
     fn tcp_connect_to_ipv6_destination_uses_ipv6_source_address() {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
-        let mut state = NetworkShard::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 1);
+        let mut state = NetworkShard::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 1, 0, 1);
         state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(remote),
@@ -3474,7 +3515,7 @@ mod tests {
     fn udp_send_to_ipv6_destination_uses_ipv6_source_address() {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
-        let mut state = NetworkShard::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 1);
+        let mut state = NetworkShard::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 1, 0, 1);
         state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(remote),
@@ -3517,7 +3558,7 @@ mod tests {
     fn udp_receive_from_ipv6_source_preserves_typed_peer_address() {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
-        let mut state = NetworkShard::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 1);
+        let mut state = NetworkShard::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 1, 0, 1);
         state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
         let socket = state
             .start_udp_bind(4040)
@@ -3543,7 +3584,7 @@ mod tests {
     fn tcp_listen_on_ipv6_address_accepts_ipv6_peer() {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
-        let mut state = NetworkShard::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 1);
+        let mut state = NetworkShard::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 1, 0, 1);
         state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(remote),
