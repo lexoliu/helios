@@ -4,8 +4,10 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::future::Future;
+use core::mem::MaybeUninit;
+use core::ops::Deref;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering as AtomicOrdering, fence};
 use core::task::{Context, Poll};
 use core::time::Duration;
 
@@ -24,6 +26,10 @@ const TIMER_WHEEL_SLOTS: usize = 256;
 const TIMER_INBOX_CAPACITY: usize = TIMER_WHEEL_SLOTS * 16;
 const TIMER_READY_POOL_SLOTS: usize = 8;
 const TIMER_READY_RETAINED_ENTRIES: usize = TIMER_WHEEL_SLOTS;
+/// Slots reserved for the per-Timer SleepState pool. Sized so the
+/// fast path covers the same in-flight depth as `TIMER_INBOX_CAPACITY`
+/// without falling back to a heap `Arc<SleepState>`.
+const SLEEP_STATE_POOL_SLOTS: usize = TIMER_INBOX_CAPACITY;
 
 #[derive(Clone)]
 pub struct Timer<CpuImpl: Cpu + Clone> {
@@ -34,7 +40,7 @@ pub struct Timer<CpuImpl: Cpu + Clone> {
 pub struct Sleep<CpuImpl: Cpu + Clone> {
     timer: Timer<CpuImpl>,
     deadline: Option<Instant>,
-    state: Option<Arc<SleepState>>,
+    state: Option<SleepRef>,
 }
 
 struct TimerState {
@@ -53,12 +59,13 @@ struct TimerShared {
     interrupt_interval_ticks: u64,
     wheel_quantum_ticks: u64,
     ready_pool: Pool<Vec<TimerEntry>>,
+    sleep_pool: SleepStatePool,
 }
 
 struct TimerEntry {
     deadline: Instant,
     deadline_tick: u64,
-    state: Arc<SleepState>,
+    state: SleepRef,
 }
 
 struct SleepState {
@@ -67,6 +74,53 @@ struct SleepState {
     fired: AtomicBool,
     cancelled: AtomicBool,
     waker: AtomicWaker,
+}
+
+/// Bounded slab pool that hands out reference-counted handles to a
+/// fixed array of `SleepState` cells. The fast path eliminates the
+/// per-Sleep `Arc<SleepState>` heap allocation that the timer
+/// previously performed on every first-pending poll. When the pool
+/// is exhausted the caller falls back to a heap-allocated
+/// `Arc<SleepState>`, so the kernel still degrades to the previous
+/// behaviour rather than refusing to register a sleep.
+struct SleepStatePool {
+    slots: Box<[SleepStateSlot]>,
+    free_indices: ConcurrentQueue<u32>,
+}
+
+#[repr(C)]
+struct SleepStateSlot {
+    /// Live ref count when occupied. Zero means the slot is free
+    /// and the cell is uninitialised; readers must consult the
+    /// freelist before touching the cell.
+    refcount: AtomicU32,
+    /// Slot storage. Initialised between `acquire` and the final
+    /// `Drop` of every `SleepRef::Pooled` referencing this slot.
+    cell: UnsafeCell<MaybeUninit<SleepState>>,
+}
+
+// SAFETY: the pool synchronises slot ownership through `refcount`
+// (Acquire/Release for the cell publication) and through the
+// `ConcurrentQueue<u32>` freelist (which provides its own
+// happens-before for the slot index itself). Writes to `cell` only
+// happen with exclusive ownership: either the acquiring thread
+// before publishing the slot, or the releasing thread after
+// observing refcount==0.
+unsafe impl Send for SleepStateSlot {}
+unsafe impl Sync for SleepStateSlot {}
+
+enum SleepRef {
+    /// Pool-backed handle. The `shared` Arc keeps the pool alive
+    /// for the lifetime of every clone of this handle; the slot is
+    /// reclaimed once the last ref drops.
+    Pooled {
+        shared: Arc<TimerShared>,
+        idx: u32,
+    },
+    /// Fallback heap allocation used when the pool is exhausted.
+    /// Preserves the original semantics so a busy server with more
+    /// in-flight sleeps than the pool can hold still works.
+    Owned(Arc<SleepState>),
 }
 
 struct TimingWheel {
@@ -113,6 +167,7 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
                     Vec::new,
                     reset_timer_ready_entries,
                 ),
+                sleep_pool: SleepStatePool::new(SLEEP_STATE_POOL_SLOTS),
             }),
         }
     }
@@ -169,7 +224,7 @@ impl<CpuImpl: Cpu + Clone> Timer<CpuImpl> {
         0
     }
 
-    fn enqueue(&self, state: Arc<SleepState>) {
+    fn enqueue(&self, state: SleepRef) {
         let deadline = state.deadline;
         let entry = TimerEntry {
             deadline,
@@ -275,7 +330,7 @@ impl<CpuImpl: Cpu + Clone> Future for Sleep<CpuImpl> {
         }
 
         if this.state.is_none() {
-            this.state = Some(Arc::new(SleepState::new(deadline)));
+            this.state = Some(SleepRef::new_for_deadline(&this.timer.shared, deadline));
         }
         let state = this
             .state
@@ -327,6 +382,165 @@ impl SleepState {
         }
 
         self.waker.wake();
+    }
+}
+
+impl SleepStatePool {
+    fn new(capacity: usize) -> Self {
+        let slots: Box<[SleepStateSlot]> = (0..capacity)
+            .map(|_| SleepStateSlot {
+                refcount: AtomicU32::new(0),
+                cell: UnsafeCell::new(MaybeUninit::uninit()),
+            })
+            .collect();
+        let free_indices = ConcurrentQueue::bounded(capacity);
+        for index in 0..capacity {
+            free_indices
+                .push(index as u32)
+                .unwrap_or_else(|_| panic!("sleep state pool freelist overrun"));
+        }
+        Self {
+            slots,
+            free_indices,
+        }
+    }
+
+    /// Try to acquire a fresh slot from the pool, initialising it
+    /// with `state` and a refcount of 1. Returns `None` when the
+    /// pool is exhausted; callers fall back to a heap allocation.
+    fn try_acquire(&self, state: SleepState) -> Option<u32> {
+        let idx = self.free_indices.pop().ok()?;
+        let slot = &self.slots[idx as usize];
+        debug_assert_eq!(
+            slot.refcount.load(AtomicOrdering::Relaxed),
+            0,
+            "sleep slot popped from freelist must be free"
+        );
+        // SAFETY: the freelist had exclusive ownership of `idx` until
+        // the pop above; nothing else can observe `cell` until we
+        // publish the refcount below.
+        unsafe {
+            (*slot.cell.get()).write(state);
+        }
+        // Release ordering pairs with the Acquire load on `slot()`
+        // so cell initialisation happens-before any clone reads it.
+        slot.refcount.store(1, AtomicOrdering::Release);
+        Some(idx)
+    }
+
+    fn slot(&self, idx: u32) -> &SleepStateSlot {
+        &self.slots[idx as usize]
+    }
+}
+
+impl SleepRef {
+    fn new_for_deadline(shared: &Arc<TimerShared>, deadline: Instant) -> Self {
+        if let Some(idx) = shared.sleep_pool.try_acquire(SleepState::new(deadline)) {
+            return Self::Pooled {
+                shared: shared.clone(),
+                idx,
+            };
+        }
+        // Pool exhausted — fall back to a heap allocation so a busy
+        // workload still registers the sleep. This preserves the
+        // pre-Phase-3.1 behaviour rather than refusing to schedule.
+        Self::Owned(Arc::new(SleepState::new(deadline)))
+    }
+
+    fn state(&self) -> &SleepState {
+        match self {
+            Self::Pooled { shared, idx } => {
+                let slot = shared.sleep_pool.slot(*idx);
+                debug_assert!(
+                    slot.refcount.load(AtomicOrdering::Relaxed) > 0,
+                    "sleep slot dereferenced after final drop"
+                );
+                // SAFETY: the live refcount above guarantees the cell
+                // is still initialised, and Release on the publishing
+                // store paired with our Acquire on clone provides the
+                // happens-before for the contents.
+                unsafe { (*slot.cell.get()).assume_init_ref() }
+            }
+            Self::Owned(arc) => arc.as_ref(),
+        }
+    }
+
+    /// Compares two refs for the same underlying SleepState. Used by
+    /// the wheel tests to assert entry identity after the pool
+    /// indirection replaces the previous `Arc::ptr_eq` pattern.
+    #[cfg(test)]
+    fn ptr_eq(left: &Self, right: &Self) -> bool {
+        match (left, right) {
+            (
+                Self::Pooled {
+                    shared: ls,
+                    idx: li,
+                },
+                Self::Pooled {
+                    shared: rs,
+                    idx: ri,
+                },
+            ) => Arc::ptr_eq(ls, rs) && li == ri,
+            (Self::Owned(la), Self::Owned(ra)) => Arc::ptr_eq(la, ra),
+            _ => false,
+        }
+    }
+}
+
+impl Deref for SleepRef {
+    type Target = SleepState;
+
+    fn deref(&self) -> &SleepState {
+        self.state()
+    }
+}
+
+impl Clone for SleepRef {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Pooled { shared, idx } => {
+                let slot = shared.sleep_pool.slot(*idx);
+                let prev = slot.refcount.fetch_add(1, AtomicOrdering::Relaxed);
+                debug_assert!(prev > 0, "cloning a dropped sleep ref");
+                debug_assert!(prev < u32::MAX - 1, "sleep ref refcount overflow");
+                Self::Pooled {
+                    shared: shared.clone(),
+                    idx: *idx,
+                }
+            }
+            Self::Owned(arc) => Self::Owned(arc.clone()),
+        }
+    }
+}
+
+impl Drop for SleepRef {
+    fn drop(&mut self) {
+        if let Self::Pooled { shared, idx } = self {
+            let slot = shared.sleep_pool.slot(*idx);
+            // AcqRel: pair Acquire on the last-drop branch with all
+            // Release stores on prior clones so we observe the most
+            // recent state writes before tearing down the cell.
+            let prev = slot.refcount.fetch_sub(1, AtomicOrdering::AcqRel);
+            if prev != 1 {
+                return;
+            }
+            // Last reference. Synchronise with any concurrent
+            // pre-drop reads from other threads.
+            fence(AtomicOrdering::Acquire);
+            // SAFETY: we are the last observer of the slot; the
+            // refcount is now zero, no other thread can touch the
+            // cell until acquire republishes it. Drop-in-place
+            // releases the SleepState's `AtomicWaker` registration
+            // and any other resources before the slot is recycled.
+            unsafe {
+                (*slot.cell.get()).assume_init_drop();
+            }
+            shared
+                .sleep_pool
+                .free_indices
+                .push(*idx)
+                .unwrap_or_else(|_| panic!("sleep state pool freelist overflow"));
+        }
     }
 }
 
@@ -550,8 +764,8 @@ mod tests {
         }
     }
 
-    fn sleep_state(deadline: u64) -> Arc<SleepState> {
-        Arc::new(SleepState::new(Instant::new(deadline)))
+    fn sleep_state(deadline: u64) -> super::SleepRef {
+        super::SleepRef::Owned(Arc::new(SleepState::new(Instant::new(deadline))))
     }
 
     fn timer_entry(deadline: u64, quantum_ticks: u64) -> TimerEntry {
@@ -581,7 +795,7 @@ mod tests {
         assert!(ready.is_empty());
         wheel.drain_expired(3, &mut ready);
         assert_eq!(ready.len(), 1);
-        assert!(Arc::ptr_eq(&ready[0].state, &state));
+        assert!(super::SleepRef::ptr_eq(&ready[0].state, &state));
     }
 
     #[test]
@@ -596,7 +810,7 @@ mod tests {
         assert!(ready.is_empty());
         wheel.drain_expired(300, &mut ready);
         assert_eq!(ready.len(), 1);
-        assert!(Arc::ptr_eq(&ready[0].state, &state));
+        assert!(super::SleepRef::ptr_eq(&ready[0].state, &state));
     }
 
     #[test]
