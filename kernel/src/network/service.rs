@@ -77,7 +77,7 @@ where
     runtime_state: Runtime,
     timer: Timer<CpuImpl>,
     device: Device,
-    state: NetworkStateCell,
+    state: NetworkShardCell,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -134,7 +134,7 @@ impl crate::ComponentHostUdpSocketToken for UdpSocketId {
     }
 }
 
-struct NetworkState {
+struct NetworkShard {
     stack: Stack,
     next_tcp_local_port: u16,
     next_udp_local_port: u16,
@@ -147,23 +147,23 @@ struct NetworkState {
     next_dns_query_id: u16,
 }
 
-struct NetworkStateCell {
-    state: SpinMutex<NetworkState>,
+struct NetworkShardCell {
+    state: SpinMutex<NetworkShard>,
 }
 
-impl NetworkStateCell {
-    fn new(state: NetworkState) -> Self {
+impl NetworkShardCell {
+    fn new(state: NetworkShard) -> Self {
         Self {
             state: SpinMutex::new(state),
         }
     }
 
-    fn with<R>(&self, f: impl FnOnce(&NetworkState) -> R) -> R {
+    fn with<R>(&self, f: impl FnOnce(&NetworkShard) -> R) -> R {
         let state = self.state.lock();
         f(&state)
     }
 
-    fn with_mut<R>(&self, f: impl FnOnce(&mut NetworkState) -> R) -> R {
+    fn with_mut<R>(&self, f: impl FnOnce(&mut NetworkShard) -> R) -> R {
         let mut state = self.state.lock();
         f(&mut state)
     }
@@ -615,7 +615,7 @@ where
                 cpu,
                 runtime_state,
                 timer,
-                state: NetworkStateCell::new(NetworkState::new(
+                state: NetworkShardCell::new(NetworkShard::new(
                     device.mac_address(),
                     device.max_frame_len(),
                     capabilities.events.rx_poll_budget,
@@ -841,7 +841,7 @@ where
         }
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         self.wait_for_ipv4_dns(deadline_nanos).await?;
-        let query_id = self.inner.state.with_mut(NetworkState::next_dns_query_id);
+        let query_id = self.inner.state.with_mut(NetworkShard::next_dns_query_id);
 
         loop {
             self.drive_dns().await?;
@@ -2278,7 +2278,7 @@ where
         require_local_network_port(port)?;
         self.inner
             .state
-            .with_mut(NetworkState::clear_ipv4_addresses);
+            .with_mut(NetworkShard::clear_ipv4_addresses);
         Ok(())
     }
 
@@ -2287,7 +2287,7 @@ where
         port: NetworkPortId,
     ) -> Result<Vec<KernelIpv4Cidr>, NetworkControlError> {
         require_local_network_port(port)?;
-        Ok(self.inner.state.with(NetworkState::list_ipv4_addresses))
+        Ok(self.inner.state.with(NetworkShard::list_ipv4_addresses))
     }
 
     async fn mac_address(&self, port: NetworkPortId) -> Result<MacAddress, NetworkControlError> {
@@ -2331,7 +2331,7 @@ where
 
     async fn clear_routes(&self, port: NetworkPortId) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
-        self.inner.state.with_mut(NetworkState::clear_ipv4_routes);
+        self.inner.state.with_mut(NetworkShard::clear_ipv4_routes);
         Ok(())
     }
 
@@ -2340,11 +2340,11 @@ where
         port: NetworkPortId,
     ) -> Result<Vec<KernelIpv4Route>, NetworkControlError> {
         require_local_network_port(port)?;
-        Ok(self.inner.state.with(NetworkState::list_ipv4_routes))
+        Ok(self.inner.state.with(NetworkShard::list_ipv4_routes))
     }
 }
 
-impl NetworkState {
+impl NetworkShard {
     fn new(
         mac: [u8; 6],
         max_frame_len: usize,
@@ -3206,7 +3206,7 @@ mod tests {
     use super::{
         HandleSlab, NETWORK_BUSY_POLL_ROUNDS, NETWORK_TX_BATCH_FRAMES, NetworkIpAddress,
         NetworkPollBudget, NetworkPollProgress, NetworkPollState, NetworkPumpAction,
-        NetworkPumpCadence, NetworkState, limit_udp_datagram_bytes, parse_ipv6,
+        NetworkPumpCadence, NetworkShard, limit_udp_datagram_bytes, parse_ipv6,
     };
 
     fn ipv6_tcp_frame(
@@ -3324,7 +3324,7 @@ mod tests {
     fn tcp_connect_to_ipv6_destination_uses_ipv6_source_address() {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
-        let mut state = NetworkState::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 8, 1);
+        let mut state = NetworkShard::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 8, 1);
         state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(remote),
@@ -3358,7 +3358,7 @@ mod tests {
     fn udp_send_to_ipv6_destination_uses_ipv6_source_address() {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
-        let mut state = NetworkState::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 8, 1);
+        let mut state = NetworkShard::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 8, 1);
         state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(remote),
@@ -3401,7 +3401,7 @@ mod tests {
     fn udp_receive_from_ipv6_source_preserves_typed_peer_address() {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
-        let mut state = NetworkState::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 8, 1);
+        let mut state = NetworkShard::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 8, 1);
         state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
         let socket = state
             .start_udp_bind(4040)
@@ -3427,7 +3427,7 @@ mod tests {
     fn tcp_listen_on_ipv6_address_accepts_ipv6_peer() {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
-        let mut state = NetworkState::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 8, 1);
+        let mut state = NetworkShard::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 8, 1);
         state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(remote),
