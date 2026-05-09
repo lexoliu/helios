@@ -496,32 +496,47 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     where
         'a: 'slots,
     {
-        const PAIR: usize = 0;
-        let Some(mut state) = self.queue_pairs[PAIR].rx_state.try_lock() else {
-            return Ok(None);
-        };
+        // Drain across every queue pair so the device's RX hashing
+        // never strands frames on a non-default pair. We iterate
+        // pair 0 first (matches single-queue behaviour) then walk
+        // additional pairs, locking one at a time and stopping when
+        // the slot fills.
         let mut received = 0usize;
-        for frame in frames {
-            assert!(frame.is_none(), "virtio net RX batch slot was not empty");
-            let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
+        let mut any_locked = false;
+        for pair_idx in 0..self.queue_pairs.len() {
+            if received >= frames.len() {
                 break;
-            };
-            Self::mark_rx_completed(&mut state, token);
-            let used_len = used_len as usize;
-            if used_len < self.header_len || used_len > self.rx_buffer_len {
-                self.repost_rx_buffer(PAIR, &mut state, token)?;
-                return Err(IoError::DeviceFault);
             }
+            let Some(mut state) = self.queue_pairs[pair_idx].rx_state.try_lock() else {
+                continue;
+            };
+            any_locked = true;
+            while received < frames.len() {
+                let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
+                    break;
+                };
+                Self::mark_rx_completed(&mut state, token);
+                let used_len = used_len as usize;
+                if used_len < self.header_len || used_len > self.rx_buffer_len {
+                    self.repost_rx_buffer(pair_idx, &mut state, token)?;
+                    return Err(IoError::DeviceFault);
+                }
 
-            *frame = Some(BorrowedRxFrame {
-                device: self,
-                pair_idx: PAIR as u16,
-                token,
-                frame_start: self.header_len,
-                frame_end: used_len,
-                reposted: false,
-            });
-            received += 1;
+                let slot = &mut frames[received];
+                assert!(slot.is_none(), "virtio net RX batch slot was not empty");
+                *slot = Some(BorrowedRxFrame {
+                    device: self,
+                    pair_idx: pair_idx as u16,
+                    token,
+                    frame_start: self.header_len,
+                    frame_end: used_len,
+                    reposted: false,
+                });
+                received += 1;
+            }
+        }
+        if !any_locked {
+            return Ok(None);
         }
         Ok(Some(received))
     }
@@ -544,41 +559,49 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     where
         'a: 'slots,
     {
-        // All current callers pull frames from a single queue pair
-        // (PAIR 0 — see try_receive_frames_immediate above), so they
-        // all repost back to that same pair. When per-CPU RX
-        // dispatch lands and pulls from multiple pairs, this helper
-        // will need to group `frames` by `pair_idx` first; for now
-        // an assertion catches any mismatched origin.
-        const PAIR: usize = 0;
-        let Some(mut state) = self.queue_pairs[PAIR].rx_state.try_lock() else {
-            return Ok(None);
-        };
-        // `pop_used_with_len` recycles completed descriptors in LIFO order.
-        // Reposting a receive batch in reverse keeps each token at the free
-        // head and publishes the batch with one avail-idx write. The AArch64
-        // TCP throughput smoke stayed at 81 ms median after this change while
-        // removing the old middle-of-free-list removal shape from RX drain.
-        let mut reposted = 0usize;
-        for frame in frames.iter_mut().rev() {
-            let Some(mut frame) = frame.take() else {
+        // Group reposts by their originating pair; lock each pair
+        // once and walk its frames in reverse so consecutive
+        // descriptors stay at the free head and publish in a single
+        // avail-idx write. With multi-queue RX, frames from
+        // different pairs are interleaved in the slot, so we make
+        // one outer pass per pair index that appears.
+        let mut any_locked = false;
+        for pair_idx in 0..self.queue_pairs.len() {
+            // Skip pairs that don't have any frames in the slot to
+            // avoid an unnecessary try_lock.
+            if !frames.iter().flatten().any(|f| usize::from(f.pair_idx) == pair_idx) {
+                continue;
+            }
+            let Some(mut state) = self.queue_pairs[pair_idx].rx_state.try_lock() else {
                 continue;
             };
-            assert!(
-                !frame.reposted,
-                "borrowed virtio RX frame was reposted twice"
-            );
-            assert_eq!(
-                usize::from(frame.pair_idx),
-                PAIR,
-                "repost_rx_frames_immediate received a frame from a non-default pair"
-            );
-            frame.reposted = true;
-            self.repost_rx_buffer_deferred(PAIR, &mut state, frame.token)?;
-            reposted += 1;
+            any_locked = true;
+            let mut reposted = 0usize;
+            for frame in frames.iter_mut().rev() {
+                let pair_match = frame
+                    .as_ref()
+                    .map(|f| usize::from(f.pair_idx) == pair_idx)
+                    .unwrap_or(false);
+                if !pair_match {
+                    continue;
+                }
+                let Some(mut owned) = frame.take() else {
+                    continue;
+                };
+                assert!(
+                    !owned.reposted,
+                    "borrowed virtio RX frame was reposted twice"
+                );
+                owned.reposted = true;
+                self.repost_rx_buffer_deferred(pair_idx, &mut state, owned.token)?;
+                reposted += 1;
+            }
+            if reposted != 0 {
+                state.rx_queue.publish_deferred_heads();
+            }
         }
-        if reposted != 0 {
-            state.rx_queue.publish_deferred_heads();
+        if !any_locked {
+            return Ok(None);
         }
         Ok(Some(()))
     }

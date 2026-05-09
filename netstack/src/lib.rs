@@ -303,10 +303,36 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
         }
     }
 
+    /// Variant of `try_transmit_packet_batch` that submits to a
+    /// specific TX queue pair. The default implementation routes
+    /// every queue index to the single-queue path; multi-queue
+    /// devices override this to dispatch directly to the requested
+    /// queue without locking the other pairs' rings.
+    fn try_transmit_packet_batch_on<'a>(
+        &'a self,
+        queue_idx: usize,
+        frames: &'a [PacketBuffer],
+    ) -> impl Future<Output = IoResult<usize>> + Send + 'a {
+        let _ = queue_idx;
+        self.try_transmit_packet_batch(frames)
+    }
+
     /// Attempts to submit borrowed frame slices without waiting for any async lock or event.
     fn try_transmit_slices_immediate(&self, frames: &[&[u8]]) -> IoResult<Option<usize>> {
         let _ = frames;
         Ok(None)
+    }
+
+    /// Variant of `try_transmit_slices_immediate` that submits to a
+    /// specific TX queue pair. Same default-routes-to-queue-0
+    /// pattern as the packet-batch counterpart above.
+    fn try_transmit_slices_immediate_on(
+        &self,
+        queue_idx: usize,
+        frames: &[&[u8]],
+    ) -> IoResult<Option<usize>> {
+        let _ = queue_idx;
+        self.try_transmit_slices_immediate(frames)
     }
 
     /// Reclaims completed transmit slots without waiting for new device events.
@@ -318,10 +344,32 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
         async { Ok(0) }
     }
 
+    /// Variant of `reclaim_transmit_completions` that targets a
+    /// specific TX queue pair.
+    fn reclaim_transmit_completions_on(
+        &self,
+        queue_idx: usize,
+        budget: usize,
+    ) -> impl Future<Output = IoResult<usize>> + Send + '_ {
+        let _ = queue_idx;
+        self.reclaim_transmit_completions(budget)
+    }
+
     /// Reclaims completed transmit slots without constructing an async wait path.
     fn reclaim_transmit_completions_immediate(&self, budget: usize) -> IoResult<Option<usize>> {
         let _ = budget;
         Ok(None)
+    }
+
+    /// Variant of `reclaim_transmit_completions_immediate` that
+    /// targets a specific TX queue pair.
+    fn reclaim_transmit_completions_immediate_on(
+        &self,
+        queue_idx: usize,
+        budget: usize,
+    ) -> IoResult<Option<usize>> {
+        let _ = queue_idx;
+        self.reclaim_transmit_completions_immediate(budget)
     }
 
     /// Waits for interface progress, such as RX arrival or TX completion.
