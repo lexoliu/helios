@@ -640,8 +640,24 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     where
         Frame: AsRef<[u8]>,
     {
+        self.try_transmit_frames_on_pair(0, frames).await
+    }
+
+    /// Per-pair variant of [`try_transmit_frames`]. The pair index
+    /// is clamped to the actual queue pair count so callers that
+    /// pass a stale CPU index never panic and instead route to the
+    /// last live queue.
+    pub async fn try_transmit_frames_on_pair<Frame>(
+        &self,
+        pair_idx: usize,
+        frames: &[Frame],
+    ) -> IoResult<usize>
+    where
+        Frame: AsRef<[u8]>,
+    {
         self.validate_tx_frames(frames)?;
-        let mut state = self.queue_pairs[0].tx_state.lock();
+        let pair_idx = self.normalize_pair_idx(pair_idx);
+        let mut state = self.queue_pairs[pair_idx].tx_state.lock();
         Self::drain_tx_completions_when_full(&mut state, frames.len());
         let mut next_frame = 0usize;
         self.submit_available_tx_frames(&mut state, frames, &mut next_frame)
@@ -651,8 +667,19 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     where
         Frame: AsRef<[u8]>,
     {
+        self.try_transmit_frames_immediate_on_pair(0, frames)
+    }
+
+    pub fn try_transmit_frames_immediate_on_pair<Frame>(
+        &self,
+        pair_idx: usize,
+        frames: &[Frame],
+    ) -> IoResult<Option<usize>>
+    where
+        Frame: AsRef<[u8]>,
+    {
         self.validate_tx_frames(frames)?;
-        self.try_transmit_valid_frames_immediate(frames)
+        self.try_transmit_valid_frames_immediate(self.normalize_pair_idx(pair_idx), frames)
     }
 
     /// Immediate TX path for frames already produced by the Helios netstack.
@@ -669,17 +696,29 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     where
         Frame: AsRef<[u8]>,
     {
-        self.try_transmit_valid_frames_immediate(frames)
+        self.try_transmit_trusted_frames_immediate_on_pair(0, frames)
     }
 
-    fn try_transmit_valid_frames_immediate<Frame>(
+    pub fn try_transmit_trusted_frames_immediate_on_pair<Frame>(
         &self,
+        pair_idx: usize,
         frames: &[Frame],
     ) -> IoResult<Option<usize>>
     where
         Frame: AsRef<[u8]>,
     {
-        let Some(mut state) = self.queue_pairs[0].tx_state.try_lock() else {
+        self.try_transmit_valid_frames_immediate(self.normalize_pair_idx(pair_idx), frames)
+    }
+
+    fn try_transmit_valid_frames_immediate<Frame>(
+        &self,
+        pair_idx: usize,
+        frames: &[Frame],
+    ) -> IoResult<Option<usize>>
+    where
+        Frame: AsRef<[u8]>,
+    {
+        let Some(mut state) = self.queue_pairs[pair_idx].tx_state.try_lock() else {
             return Ok(None);
         };
         Self::drain_tx_completions_when_full(&mut state, frames.len());
@@ -688,8 +727,33 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             .map(Some)
     }
 
+    /// Clamps a caller-provided queue pair index to a valid one so
+    /// stale or oversized hints (e.g. `current_processor()` when
+    /// fewer pairs were brought up than CPUs) fall back to the
+    /// last live queue instead of panicking.
+    fn normalize_pair_idx(&self, pair_idx: usize) -> usize {
+        if self.queue_pairs.is_empty() {
+            return 0;
+        }
+        pair_idx % self.queue_pairs.len()
+    }
+
     pub async fn transmit_frames_with_wait<Frame, Wait, Fut>(
         &self,
+        frames: &[Frame],
+        wait: Wait,
+    ) -> IoResult<()>
+    where
+        Frame: AsRef<[u8]>,
+        Wait: FnMut() -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        self.transmit_frames_with_wait_on_pair(0, frames, wait).await
+    }
+
+    pub async fn transmit_frames_with_wait_on_pair<Frame, Wait, Fut>(
+        &self,
+        pair_idx: usize,
         frames: &[Frame],
         mut wait: Wait,
     ) -> IoResult<()>
@@ -699,11 +763,12 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         Fut: Future<Output = ()>,
     {
         self.validate_tx_frames(frames)?;
+        let pair_idx = self.normalize_pair_idx(pair_idx);
 
         let mut next_frame = 0usize;
         while next_frame < frames.len() {
             let submitted = {
-                let mut state = self.queue_pairs[0].tx_state.lock();
+                let mut state = self.queue_pairs[pair_idx].tx_state.lock();
                 Self::drain_tx_completions_when_full(&mut state, frames.len() - next_frame);
                 self.submit_available_tx_frames(&mut state, frames, &mut next_frame)?
             };
@@ -713,7 +778,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             }
 
             let should_wait = {
-                let mut state = self.queue_pairs[0].tx_state.lock();
+                let mut state = self.queue_pairs[pair_idx].tx_state.lock();
                 Self::drain_tx_completions(&mut state, usize::MAX);
                 state.tx_queue.available_descriptors() == 0
             };
@@ -791,12 +856,30 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     }
 
     pub async fn reclaim_transmit_completions(&self, budget: usize) -> IoResult<usize> {
-        let mut state = self.queue_pairs[0].tx_state.lock();
+        self.reclaim_transmit_completions_on_pair(0, budget).await
+    }
+
+    pub async fn reclaim_transmit_completions_on_pair(
+        &self,
+        pair_idx: usize,
+        budget: usize,
+    ) -> IoResult<usize> {
+        let pair_idx = self.normalize_pair_idx(pair_idx);
+        let mut state = self.queue_pairs[pair_idx].tx_state.lock();
         Ok(Self::drain_tx_completions(&mut state, budget))
     }
 
     pub fn reclaim_transmit_completions_immediate(&self, budget: usize) -> IoResult<Option<usize>> {
-        let Some(mut state) = self.queue_pairs[0].tx_state.try_lock() else {
+        self.reclaim_transmit_completions_immediate_on_pair(0, budget)
+    }
+
+    pub fn reclaim_transmit_completions_immediate_on_pair(
+        &self,
+        pair_idx: usize,
+        budget: usize,
+    ) -> IoResult<Option<usize>> {
+        let pair_idx = self.normalize_pair_idx(pair_idx);
+        let Some(mut state) = self.queue_pairs[pair_idx].tx_state.try_lock() else {
             return Ok(None);
         };
         Ok(Some(Self::drain_tx_completions(&mut state, budget)))

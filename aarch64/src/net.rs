@@ -162,9 +162,20 @@ impl NetworkDevice for VirtioNetworkDevice {
         &'a self,
         frames: &'a [PacketBuffer],
     ) -> Result<usize, IoError> {
+        self.try_transmit_packet_batch_on(0, frames).await
+    }
+
+    async fn try_transmit_packet_batch_on<'a>(
+        &'a self,
+        queue_idx: usize,
+        frames: &'a [PacketBuffer],
+    ) -> Result<usize, IoError> {
         let mut submitted = 0usize;
         for chunk in frames.chunks(VIRTIO_POLLING_RX_BUDGET) {
-            let accepted = self.inner.try_transmit_frames(chunk).await?;
+            let accepted = self
+                .inner
+                .try_transmit_frames_on_pair(queue_idx, chunk)
+                .await?;
             submitted += accepted;
             if accepted < chunk.len() {
                 break;
@@ -174,9 +185,20 @@ impl NetworkDevice for VirtioNetworkDevice {
     }
 
     fn try_transmit_slices_immediate(&self, frames: &[&[u8]]) -> Result<Option<usize>, IoError> {
+        self.try_transmit_slices_immediate_on(0, frames)
+    }
+
+    fn try_transmit_slices_immediate_on(
+        &self,
+        queue_idx: usize,
+        frames: &[&[u8]],
+    ) -> Result<Option<usize>, IoError> {
         let mut submitted = 0usize;
         for chunk in frames.chunks(VIRTIO_POLLING_RX_BUDGET) {
-            let Some(accepted) = self.inner.try_transmit_trusted_frames_immediate(chunk)? else {
+            let Some(accepted) = self
+                .inner
+                .try_transmit_trusted_frames_immediate_on_pair(queue_idx, chunk)?
+            else {
                 return Ok((submitted != 0).then_some(submitted));
             };
             submitted += accepted;
@@ -188,14 +210,33 @@ impl NetworkDevice for VirtioNetworkDevice {
     }
 
     async fn reclaim_transmit_completions(&self, budget: usize) -> Result<usize, IoError> {
-        self.inner.reclaim_transmit_completions(budget).await
+        self.reclaim_transmit_completions_on(0, budget).await
+    }
+
+    async fn reclaim_transmit_completions_on(
+        &self,
+        queue_idx: usize,
+        budget: usize,
+    ) -> Result<usize, IoError> {
+        self.inner
+            .reclaim_transmit_completions_on_pair(queue_idx, budget)
+            .await
     }
 
     fn reclaim_transmit_completions_immediate(
         &self,
         budget: usize,
     ) -> Result<Option<usize>, IoError> {
-        self.inner.reclaim_transmit_completions_immediate(budget)
+        self.reclaim_transmit_completions_immediate_on(0, budget)
+    }
+
+    fn reclaim_transmit_completions_immediate_on(
+        &self,
+        queue_idx: usize,
+        budget: usize,
+    ) -> Result<Option<usize>, IoError> {
+        self.inner
+            .reclaim_transmit_completions_immediate_on_pair(queue_idx, budget)
     }
 
     async fn wait_for_event(&self) {

@@ -2054,72 +2054,91 @@ where
                 }
             }
 
-            let mut frames = smallvec::SmallVec::<[PacketBuffer; NETWORK_TX_BATCH_FRAMES]>::new();
-            // Track each frame's origin shard so a `RingFull`
-            // push-back below can return the frame to the same
-            // Stack that produced it. With per-shard Stacks every
-            // shard maintains its own outbound queue.
-            let mut frame_shards =
-                smallvec::SmallVec::<[usize; NETWORK_TX_BATCH_FRAMES]>::new();
+            // Per-shard collect+submit: each shard drains its
+            // outbound frames into its OWN device queue. Multi-queue
+            // virtio (Phase 4.2) means shard N's TX submission hits
+            // queue pair N's `tx_state` SpinMutex, with no
+            // contention against shards on other CPUs. Single-queue
+            // devices fall back to queue 0 internally via
+            // `normalize_pair_idx`.
             let collect_started = self.profile_start();
             let remaining_budget = budget.tx_frames - transmitted;
             let collect_limit = NETWORK_TX_BATCH_FRAMES.min(remaining_budget);
-            'collect: for shard_idx in 0..self.inner.state.shard_count() {
-                let mut state = self.inner.state.shard_at(shard_idx).lock();
-                while frames.len() < collect_limit {
-                    let Some(frame) = state.stack.take_outbound() else {
-                        break;
-                    };
-                    frames.push(frame);
-                    frame_shards.push(shard_idx);
-                    if frames.len() >= collect_limit {
-                        break 'collect;
+            let shard_count = self.inner.state.shard_count();
+            let mut total_collected = 0usize;
+            let mut total_collected_bytes = 0usize;
+            let mut total_submitted = 0usize;
+            let mut total_submitted_bytes = 0usize;
+            let mut ring_full = false;
+            for shard_idx in 0..shard_count {
+                if total_collected >= collect_limit {
+                    break;
+                }
+                let mut shard_frames =
+                    smallvec::SmallVec::<[PacketBuffer; NETWORK_TX_BATCH_FRAMES]>::new();
+                {
+                    let mut state = self.inner.state.shard_at(shard_idx).lock();
+                    while shard_frames.len() < (collect_limit - total_collected) {
+                        let Some(frame) = state.stack.take_outbound() else {
+                            break;
+                        };
+                        shard_frames.push(frame);
                     }
                 }
+                if shard_frames.is_empty() {
+                    continue;
+                }
+                let collected_bytes: usize =
+                    shard_frames.iter().map(|f| f.as_ref().len()).sum();
+                total_collected += shard_frames.len();
+                total_collected_bytes += collected_bytes;
+                let submitted = self
+                    .inner
+                    .device
+                    .try_transmit_packet_batch_on(shard_idx, &shard_frames)
+                    .await?;
+                let submitted_bytes: usize = shard_frames
+                    .iter()
+                    .take(submitted)
+                    .map(|f| f.as_ref().len())
+                    .sum();
+                total_submitted += submitted;
+                total_submitted_bytes += submitted_bytes;
+                if submitted < shard_frames.len() {
+                    // RingFull on this shard's queue. Push leftovers
+                    // back to the same shard (and only that shard)
+                    // so per-pair ordering is preserved, then mark
+                    // the round as RingFull.
+                    let mut state = self.inner.state.shard_at(shard_idx).lock();
+                    while shard_frames.len() > submitted {
+                        let frame = shard_frames
+                            .pop()
+                            .expect("TX restore lost an unsubmitted outbound frame");
+                        state.stack.push_outbound_front(frame);
+                    }
+                    ring_full = true;
+                    break;
+                }
             }
-            if frames.is_empty() {
+            if total_collected == 0 {
                 break;
             }
             self.record_network_profile_events_bytes(
                 source.tx_fallback_collect_phase(),
                 collect_started,
-                frames.len(),
-                frames
-                    .iter()
-                    .map(|frame| frame.as_ref().len())
-                    .sum::<usize>(),
+                total_collected,
+                total_collected_bytes,
             );
-            let device_started = self.profile_start();
-            let submitted = self.inner.device.try_transmit_packet_batch(&frames).await?;
-            let submitted_bytes = frames
-                .iter()
-                .take(submitted)
-                .map(|frame| frame.as_ref().len())
-                .sum::<usize>();
             self.record_network_profile_events_bytes(
                 source.tx_fallback_device_phase(),
-                device_started,
-                submitted,
-                submitted_bytes,
+                collect_started,
+                total_submitted,
+                total_submitted_bytes,
             );
-            transmitted += submitted;
-            transmitted_bytes = transmitted_bytes.saturating_add(submitted_bytes);
-            if submitted < frames.len() {
+            transmitted += total_submitted;
+            transmitted_bytes = transmitted_bytes.saturating_add(total_submitted_bytes);
+            if ring_full {
                 transmit_stop = NetworkTransmitStop::RingFull;
-                while frames.len() > submitted {
-                    let frame = frames
-                        .pop()
-                        .expect("TX restore lost an unsubmitted outbound frame");
-                    let shard_idx = frame_shards
-                        .pop()
-                        .expect("TX restore lost shard origin for an outbound frame");
-                    self.inner
-                        .state
-                        .shard_at(shard_idx)
-                        .lock()
-                        .stack
-                        .push_outbound_front(frame);
-                }
                 break;
             }
         }

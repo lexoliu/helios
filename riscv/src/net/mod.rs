@@ -245,18 +245,54 @@ impl NetworkDevice for VirtioNetworkDevice {
         &'a self,
         frames: &'a [PacketBuffer],
     ) -> Result<usize, IoError> {
-        self.inner.try_transmit_frames(frames).await
+        self.try_transmit_packet_batch_on(0, frames).await
+    }
+
+    async fn try_transmit_packet_batch_on<'a>(
+        &'a self,
+        queue_idx: usize,
+        frames: &'a [PacketBuffer],
+    ) -> Result<usize, IoError> {
+        self.inner.try_transmit_frames_on_pair(queue_idx, frames).await
     }
 
     fn try_transmit_slices_immediate(&self, frames: &[&[u8]]) -> Result<Option<usize>, IoError> {
-        self.inner.try_transmit_trusted_frames_immediate(frames)
+        self.try_transmit_slices_immediate_on(0, frames)
+    }
+
+    fn try_transmit_slices_immediate_on(
+        &self,
+        queue_idx: usize,
+        frames: &[&[u8]],
+    ) -> Result<Option<usize>, IoError> {
+        self.inner
+            .try_transmit_trusted_frames_immediate_on_pair(queue_idx, frames)
+    }
+
+    async fn reclaim_transmit_completions_on(
+        &self,
+        queue_idx: usize,
+        budget: usize,
+    ) -> Result<usize, IoError> {
+        self.inner
+            .reclaim_transmit_completions_on_pair(queue_idx, budget)
+            .await
     }
 
     fn reclaim_transmit_completions_immediate(
         &self,
         budget: usize,
     ) -> Result<Option<usize>, IoError> {
-        self.inner.reclaim_transmit_completions_immediate(budget)
+        self.reclaim_transmit_completions_immediate_on(0, budget)
+    }
+
+    fn reclaim_transmit_completions_immediate_on(
+        &self,
+        queue_idx: usize,
+        budget: usize,
+    ) -> Result<Option<usize>, IoError> {
+        self.inner
+            .reclaim_transmit_completions_immediate_on_pair(queue_idx, budget)
     }
 
     async fn wait_for_event(&self) {
