@@ -4,6 +4,7 @@ use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::num::NonZeroU32;
+use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use core::task::Poll;
 use core::time::Duration;
 
@@ -79,6 +80,16 @@ where
     timer: Timer<CpuImpl>,
     device: Device,
     state: NetworkShardSet,
+    /// Adaptive poll budget shared across all shards. Lifted out of
+    /// `NetworkShard` so its atomic-load reads on the network poll
+    /// fast path do not have to acquire the per-shard SpinMutex.
+    poll: NetworkPollState,
+    /// `Stack::config().rx_budget` snapshot. The configured stack
+    /// budget is set at Stack construction and never mutates, so we
+    /// cache it outside the lock and avoid the
+    /// `state.with(|s| s.stack.config().rx_budget)` round-trip on
+    /// every receive iteration.
+    stack_rx_budget: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -142,7 +153,6 @@ struct NetworkShard {
     tcp_streams: HandleSlab<helios_netstack::SocketId, MAX_TCP_STREAM_HANDLES>,
     tcp_listeners: HandleSlab<TcpListenerState, MAX_TCP_LISTENER_HANDLES>,
     udp_sockets: HandleSlab<UdpSocketState, MAX_UDP_SOCKET_HANDLES>,
-    poll: NetworkPollState,
     dhcp: DhcpClientState,
     dns_servers: DhcpDnsServers,
     next_dns_query_id: u16,
@@ -363,13 +373,25 @@ impl NetworkPollSource {
     }
 }
 
+/// Adaptive poll budget. The base values are constants from device
+/// capabilities; the live budgets are tuned in `complete()` based on
+/// per-cycle progress so a saturated stack widens its budget while
+/// an idle stack contracts it.
+///
+/// Reads happen on every network poll iteration. Storing the live
+/// fields as `AtomicUsize` keeps that read off the lock — pre-Phase
+/// 4.x the read had to acquire the global `SpinMutex<NetworkShard>`
+/// just to copy three integers. Writes only happen in `complete()`,
+/// which is racy by design (concurrent shards complete and update
+/// the same atomic) but the outcome is a heuristic so the natural
+/// last-writer-wins is acceptable.
 struct NetworkPollState {
     base_rx_budget: usize,
     base_tx_completion_budget: usize,
     base_tx_frame_budget: usize,
-    rx_budget: usize,
-    tx_completion_budget: usize,
-    tx_frame_budget: usize,
+    rx_budget: AtomicUsize,
+    tx_completion_budget: AtomicUsize,
+    tx_frame_budget: AtomicUsize,
 }
 
 struct NetworkPumpCadence {
@@ -638,18 +660,20 @@ where
     ) -> Self {
         let transaction_id = cpu.now().ticks() as u32;
         let capabilities = device.capabilities();
+        let rx_poll_budget = capabilities.events.rx_poll_budget;
+        let tx_completion_budget = capabilities.events.tx_completion_budget;
+        let mac = device.mac_address();
+        let max_frame_len = device.max_frame_len();
+        let shard = NetworkShard::new(mac, max_frame_len, rx_poll_budget, transaction_id);
+        let stack_rx_budget = shard.stack.config().rx_budget;
         Self {
             inner: Arc::new(NetworkServiceInner {
                 cpu,
                 runtime_state,
                 timer,
-                state: NetworkShardSet::new(NetworkShard::new(
-                    device.mac_address(),
-                    device.max_frame_len(),
-                    capabilities.events.rx_poll_budget,
-                    capabilities.events.tx_completion_budget,
-                    transaction_id,
-                )),
+                state: NetworkShardSet::new(shard),
+                poll: NetworkPollState::new(rx_poll_budget, tx_completion_budget, rx_poll_budget),
+                stack_rx_budget,
                 device,
             }),
         }
@@ -1486,7 +1510,7 @@ where
                 // only needs to publish generated ACK/window-update frames here.
                 // Re-entering a full network poll showed up as extra
                 // `tcp-read-drive-network` work in local AArch64/HVF profiles.
-                let budget = self.inner.state.with(|state| state.poll.budget());
+                let budget = self.inner.poll.budget();
                 let (transmitted, _) = self
                     .submit_network_transmit(NetworkPollSource::Tcp, budget)
                     .await
@@ -1494,12 +1518,10 @@ where
                         TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed)
                     })?;
                 if transmitted != 0 {
-                    self.inner.state.with_mut(|state| {
-                        state.poll.complete(NetworkPollProgress {
-                            received_frames: 0,
-                            reclaimed_tx: 0,
-                            transmitted_frames: transmitted,
-                        });
+                    self.inner.poll.complete(NetworkPollProgress {
+                        received_frames: 0,
+                        reclaimed_tx: 0,
+                        transmitted_frames: transmitted,
                     });
                 }
             }
@@ -1544,7 +1566,7 @@ where
         tcp_read_probe: Option<NetworkTcpReadProbe>,
         submit_transmit: bool,
     ) -> Result<NetworkPollOutcome, IoError> {
-        let budget = self.inner.state.with(|state| state.poll.budget());
+        let budget = self.inner.poll.budget();
 
         let reclaim_started = self.profile_start();
         let reclaimed = match self
@@ -1571,11 +1593,15 @@ where
         let mut received = 0usize;
         let mut received_bytes = 0usize;
         let receive_started = self.profile_start();
+        // `stack_rx_budget` is fixed at Stack construction so we read
+        // it from the cached service-level value (no shard lock).
+        // Backpressure remains a per-shard query because it tracks
+        // live receive-window state.
         let stack_rx_budget = self.inner.state.with(|state| {
             if state.stack.receive_backpressured() {
                 0
             } else {
-                state.stack.config().rx_budget
+                self.inner.stack_rx_budget
             }
         });
         loop {
@@ -1706,9 +1732,7 @@ where
             reclaimed_tx: reclaimed,
             transmitted_frames: transmitted,
         };
-        self.inner.state.with_mut(|state| {
-            state.poll.complete(progress);
-        });
+        self.inner.poll.complete(progress);
         Ok(NetworkPollOutcome {
             progress,
             budget,
@@ -2377,7 +2401,6 @@ impl NetworkShard {
         mac: [u8; 6],
         max_frame_len: usize,
         rx_poll_budget: usize,
-        tx_completion_budget: usize,
         transaction_id: u32,
     ) -> Self {
         Self {
@@ -2387,7 +2410,6 @@ impl NetworkShard {
             tcp_streams: HandleSlab::new(),
             tcp_listeners: HandleSlab::new(),
             udp_sockets: HandleSlab::new(),
-            poll: NetworkPollState::new(rx_poll_budget, tx_completion_budget, rx_poll_budget),
             dhcp: DhcpClientState::Init { transaction_id },
             dns_servers: DhcpDnsServers::new(),
             next_dns_query_id: 1,
@@ -3052,38 +3074,50 @@ impl NetworkPollState {
             base_rx_budget: rx_budget,
             base_tx_completion_budget: tx_completion_budget,
             base_tx_frame_budget: tx_frame_budget,
-            rx_budget,
-            tx_completion_budget,
-            tx_frame_budget,
+            rx_budget: AtomicUsize::new(rx_budget),
+            tx_completion_budget: AtomicUsize::new(tx_completion_budget),
+            tx_frame_budget: AtomicUsize::new(tx_frame_budget),
         }
     }
 
-    const fn budget(&self) -> NetworkPollBudget {
+    fn budget(&self) -> NetworkPollBudget {
         NetworkPollBudget {
-            rx_frames: self.rx_budget,
-            tx_completions: self.tx_completion_budget,
-            tx_frames: self.tx_frame_budget,
+            rx_frames: self.rx_budget.load(AtomicOrdering::Relaxed),
+            tx_completions: self.tx_completion_budget.load(AtomicOrdering::Relaxed),
+            tx_frames: self.tx_frame_budget.load(AtomicOrdering::Relaxed),
         }
     }
 
-    fn complete(&mut self, progress: NetworkPollProgress) {
-        self.rx_budget = adjust_poll_budget(
-            self.rx_budget,
-            self.base_rx_budget,
-            progress.received_frames >= self.rx_budget,
-            progress.is_idle(),
+    fn complete(&self, progress: NetworkPollProgress) {
+        let rx_current = self.rx_budget.load(AtomicOrdering::Relaxed);
+        self.rx_budget.store(
+            adjust_poll_budget(
+                rx_current,
+                self.base_rx_budget,
+                progress.received_frames >= rx_current,
+                progress.is_idle(),
+            ),
+            AtomicOrdering::Relaxed,
         );
-        self.tx_completion_budget = adjust_poll_budget(
-            self.tx_completion_budget,
-            self.base_tx_completion_budget,
-            progress.reclaimed_tx >= self.tx_completion_budget,
-            progress.is_idle(),
+        let tx_completion_current = self.tx_completion_budget.load(AtomicOrdering::Relaxed);
+        self.tx_completion_budget.store(
+            adjust_poll_budget(
+                tx_completion_current,
+                self.base_tx_completion_budget,
+                progress.reclaimed_tx >= tx_completion_current,
+                progress.is_idle(),
+            ),
+            AtomicOrdering::Relaxed,
         );
-        self.tx_frame_budget = adjust_poll_budget(
-            self.tx_frame_budget,
-            self.base_tx_frame_budget,
-            progress.transmitted_frames >= self.tx_frame_budget,
-            progress.is_idle(),
+        let tx_frame_current = self.tx_frame_budget.load(AtomicOrdering::Relaxed);
+        self.tx_frame_budget.store(
+            adjust_poll_budget(
+                tx_frame_current,
+                self.base_tx_frame_budget,
+                progress.transmitted_frames >= tx_frame_current,
+                progress.is_idle(),
+            ),
+            AtomicOrdering::Relaxed,
         );
     }
 }
@@ -3352,7 +3386,7 @@ mod tests {
     fn tcp_connect_to_ipv6_destination_uses_ipv6_source_address() {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
-        let mut state = NetworkShard::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 8, 1);
+        let mut state = NetworkShard::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 1);
         state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(remote),
@@ -3386,7 +3420,7 @@ mod tests {
     fn udp_send_to_ipv6_destination_uses_ipv6_source_address() {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
-        let mut state = NetworkShard::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 8, 1);
+        let mut state = NetworkShard::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 1);
         state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(remote),
@@ -3429,7 +3463,7 @@ mod tests {
     fn udp_receive_from_ipv6_source_preserves_typed_peer_address() {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
-        let mut state = NetworkShard::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 8, 1);
+        let mut state = NetworkShard::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 1);
         state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
         let socket = state
             .start_udp_bind(4040)
@@ -3455,7 +3489,7 @@ mod tests {
     fn tcp_listen_on_ipv6_address_accepts_ipv6_peer() {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
-        let mut state = NetworkShard::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 8, 1);
+        let mut state = NetworkShard::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 1);
         state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(remote),
