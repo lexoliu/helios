@@ -13,10 +13,11 @@ use helios_hal::cpu::{Cpu, HardwarePerfCounters};
 use helios_hal::io::IoError;
 use helios_netstack::{
     DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage, DhcpDnsServers,
-    DhcpMessageType, DhcpPacket, DnsQuestionWriter, DnsResponse, IpAddress, IpCidr, Ipv4Address,
-    Ipv4Cidr, Ipv6Address, MAX_OUTBOUND_FRAMES, NetworkInterface as NetworkDevice,
-    OutboundBatchStatus, PacketBuffer, Route, Stack, StackConfig, StackError, StackInstant,
-    TcpConnectState, TcpEndpoint, TcpReadState, UdpPayload,
+    DhcpMessageType, DhcpPacket, DnsQuestionWriter, DnsResponse, EthernetFrame, EthernetProtocol,
+    IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Packet,
+    MAX_OUTBOUND_FRAMES, NetworkInterface as NetworkDevice, OutboundBatchStatus, PacketBuffer,
+    Route, Stack, StackConfig, StackError, StackInstant, TcpConnectState, TcpEndpoint,
+    TcpPacket, TcpReadState, UdpPacket, UdpPayload,
 };
 use spin::Mutex as SpinMutex;
 
@@ -31,6 +32,48 @@ use triomphe::Arc;
 
 const EPHEMERAL_PORT_START: u16 = 49_152;
 const EPHEMERAL_PORT_END: u16 = 65_535;
+
+/// Peek the L4 destination port out of a parsed Ethernet frame.
+/// Used by the RX demux to route frames to the shard that owns the
+/// local port. Returns `None` for non-IP frames (ARP), non-TCP/UDP
+/// IP frames (ICMP), or malformed packets — all of which fall back
+/// to shard 0 in the dispatch path so the existing single-shard
+/// behaviour is preserved.
+fn peek_local_port(frame: &[u8]) -> Option<u16> {
+    let ethernet = EthernetFrame::parse(frame)?;
+    let payload = ethernet.payload;
+    let (protocol, l4_payload) = match ethernet.protocol {
+        EthernetProtocol::Ipv4 => {
+            let packet = Ipv4Packet::parse(payload)?;
+            (packet.protocol, packet.payload)
+        }
+        EthernetProtocol::Ipv6 => {
+            let packet = Ipv6Packet::parse(payload)?;
+            (packet.next_header, packet.payload)
+        }
+        _ => return None,
+    };
+    match protocol {
+        IpProtocol::Tcp => Some(TcpPacket::parse(l4_payload)?.destination_port),
+        IpProtocol::Udp => Some(UdpPacket::parse(l4_payload)?.destination_port),
+        _ => None,
+    }
+}
+
+/// Maps a local port to the index of the shard that owns it. Server
+/// listening ports (anything below `EPHEMERAL_PORT_START`) always
+/// route to shard 0; ephemeral ports stride across shards so a
+/// freshly-allocated outgoing port `EPHEMERAL_PORT_START + k` lands
+/// on shard `k % shard_count`. Frames whose port is `None` (ARP,
+/// ICMP, …) or unparseable also map to shard 0.
+fn shard_idx_for_port(port: Option<u16>, shard_count: usize) -> usize {
+    let Some(port) = port else { return 0 };
+    if port < EPHEMERAL_PORT_START {
+        return 0;
+    }
+    let stride_idx = port - EPHEMERAL_PORT_START;
+    usize::from(stride_idx) % shard_count
+}
 const INTERNAL_DNS_PORT: u16 = 49_151;
 const LOCAL_NETWORK_PORT: NetworkPortId = NetworkPortId::new(0);
 const DHCP_RETRANSMIT_NANOS: u64 = 1_000_000_000;
@@ -250,6 +293,14 @@ impl NetworkShardSet {
         let handle: u64 = handle.into();
         let normalized = handle.saturating_sub(1) as usize;
         let idx = normalized % self.shards.len();
+        &self.shards[idx].inner
+    }
+
+    /// Locks shard `idx` directly. Used by the RX demux which has
+    /// already computed the target shard from the frame's
+    /// destination port; bypasses the handle-encoding round-trip.
+    #[inline]
+    fn shard_at(&self, idx: usize) -> &SpinMutex<NetworkShard> {
         &self.shards[idx].inner
     }
 
@@ -1764,34 +1815,46 @@ where
 
             let mut receive_backpressured = false;
             let received_at = StackInstant::from_nanos(self.now_nanos());
-            self.inner.state.with_mut(|state| {
-                for frame in frames[..received_batch].iter().flatten() {
-                    let frame = frame.as_ref();
-                    let frame_len = frame.len();
-                    match state
-                        .stack
-                        .receive_frame_with_backpressure(frame, received_at)
-                    {
-                        Ok(backpressured) => {
-                            received += 1;
-                            received_bytes = received_bytes.saturating_add(frame_len);
-                            if backpressured {
-                                receive_backpressured = true;
-                                break;
-                            }
-                        }
-                        Err(StackError::ReceiveBackpressure) => {
+            // Demux each frame to the shard owning its destination
+            // port. The previous single-shard path locked
+            // `shard_for_default` once per batch; under multi-shard
+            // we lock the owning shard per-frame so different
+            // ports can be processed in parallel by other CPUs and
+            // each shard's Stack only sees the connections it
+            // actually owns. Non-IP / non-TCP-UDP frames (ARP,
+            // ICMP, malformed) fall back to shard 0 via
+            // `shard_idx_for_port(None, ...)`.
+            let shard_count = self.inner.state.shard_count();
+            for frame in frames[..received_batch].iter().flatten() {
+                if receive_backpressured {
+                    break;
+                }
+                let frame_bytes = frame.as_ref();
+                let frame_len = frame_bytes.len();
+                let port = peek_local_port(frame_bytes);
+                let shard_idx = shard_idx_for_port(port, shard_count);
+                let mut shard = self.inner.state.shard_at(shard_idx).lock();
+                match shard
+                    .stack
+                    .receive_frame_with_backpressure(frame_bytes, received_at)
+                {
+                    Ok(backpressured) => {
+                        received += 1;
+                        received_bytes = received_bytes.saturating_add(frame_len);
+                        if backpressured {
                             receive_backpressured = true;
-                            break;
-                        }
-                        Err(error) => {
-                            tracing::debug!(?error, "dropped malformed network frame");
-                            received += 1;
-                            received_bytes = received_bytes.saturating_add(frame_len);
                         }
                     }
+                    Err(StackError::ReceiveBackpressure) => {
+                        receive_backpressured = true;
+                    }
+                    Err(error) => {
+                        tracing::debug!(?error, "dropped malformed network frame");
+                        received += 1;
+                        received_bytes = received_bytes.saturating_add(frame_len);
+                    }
                 }
-            });
+            }
 
             if self
                 .inner
