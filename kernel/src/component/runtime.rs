@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 
 use bytes::Bytes;
 
-use crate::child_io::{ByteReader, ByteWriter, ClosedPeer, TryRead};
+use crate::io::{ByteReader, ByteWriter, ClosedPeer, TryRead};
 use crate::{
     EntropyError, EntropyPool, InstanceExecutionTransition, InstanceRegistry, KernelClock,
     KillReason, ProcessAuthority, RegisteredInstance, SetWallClockCap, Sleep, Timer,

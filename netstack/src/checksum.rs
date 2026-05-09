@@ -1,6 +1,6 @@
 use crate::{IpProtocol, Ipv4Address, Ipv6Address};
 
-const WIDE_CHECKSUM_MIN_BYTES: usize = 64;
+const SIMD_CHECKSUM_MIN_BYTES: usize = 64;
 
 pub fn internet_checksum(bytes: &[u8]) -> u16 {
     finish_checksum(sum_words(bytes))
@@ -82,9 +82,20 @@ fn ipv6_pseudo_sum(
 }
 
 fn sum_words(bytes: &[u8]) -> u32 {
-    if bytes.len() < WIDE_CHECKSUM_MIN_BYTES {
-        sum_words_scalar(bytes)
-    } else {
+    if bytes.len() < SIMD_CHECKSUM_MIN_BYTES {
+        return sum_words_scalar(bytes);
+    }
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        // SAFETY: aarch64 + neon target feature guarantees the
+        // intrinsics below are available; the routine reads only the
+        // input slice and never goes past `bytes.len()`.
+        unsafe {
+            sum_words_neon(bytes)
+        }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+    {
         sum_words_wide(bytes)
     }
 }
@@ -101,6 +112,73 @@ fn sum_words_scalar(bytes: &[u8]) -> u32 {
     sum
 }
 
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[inline(always)]
+unsafe fn sum_words_neon(bytes: &[u8]) -> u32 {
+    use core::arch::aarch64::{
+        uint32x4_t, vaddvq_u32, vdupq_n_u32, vld1q_u8, vpadalq_u16, vreinterpretq_u16_u8,
+        vrev16q_u8,
+    };
+
+    // Process 16 bytes per iteration as 8 big-endian u16 lanes.
+    //
+    // `vrev16q_u8` swaps each adjacent byte pair inside the vector,
+    // turning the LE view of memory into the BE u16 view we need:
+    //   memory:  [b0 b1 b2 b3 ... b14 b15]
+    //   reversed -> reinterpret as u16x8:
+    //            [(b0<<8)|b1, (b2<<8)|b3, ..., (b14<<8)|b15]
+    //
+    // `vpadalq_u16` does pairwise add-long-accumulate: it adds adjacent
+    // u16 lanes and adds the resulting u32x4 into the accumulator. So
+    // per iteration we issue exactly three NEON ops — load, byte
+    // reverse, pair-add — vs five-plus in the swizzle/shift path.
+    //
+    // The u32x4 lanes can each absorb up to ~2 * 0xFFFF per iteration.
+    // The pseudo-header length cap is u16::MAX, so the maximum number
+    // of 16-byte iterations is 4096, giving each lane a worst case of
+    // about 0x2_0000 * 4096 ≈ 2^30 — well inside u32 headroom.
+    //
+    // SAFETY (whole-block): caller has guaranteed the `+neon` target
+    // feature is active (cfg gate above). All intrinsic calls below
+    // touch only the input slice and stay within `bytes.len()`.
+    //
+    // Two-way unroll keeps two independent vpadalq dependency chains
+    // in flight so Apple/Arm cores with multiple NEON pipes do not
+    // stall on a single accumulator.
+    let mut acc0: uint32x4_t = unsafe { vdupq_n_u32(0) };
+    let mut acc1: uint32x4_t = unsafe { vdupq_n_u32(0) };
+    let mut offset = 0usize;
+    let unroll_limit = bytes.len() & !31;
+    while offset < unroll_limit {
+        let v0 = unsafe { vld1q_u8(bytes.as_ptr().add(offset)) };
+        let v1 = unsafe { vld1q_u8(bytes.as_ptr().add(offset + 16)) };
+        let w0 = unsafe { vreinterpretq_u16_u8(vrev16q_u8(v0)) };
+        let w1 = unsafe { vreinterpretq_u16_u8(vrev16q_u8(v1)) };
+        acc0 = unsafe { vpadalq_u16(acc0, w0) };
+        acc1 = unsafe { vpadalq_u16(acc1, w1) };
+        offset += 32;
+    }
+    let limit = bytes.len() & !15;
+    while offset < limit {
+        let v = unsafe { vld1q_u8(bytes.as_ptr().add(offset)) };
+        let words = unsafe { vreinterpretq_u16_u8(vrev16q_u8(v)) };
+        acc0 = unsafe { vpadalq_u16(acc0, words) };
+        offset += 16;
+    }
+    let mut sum = unsafe { vaddvq_u32(acc0).wrapping_add(vaddvq_u32(acc1)) };
+
+    let tail = &bytes[offset..];
+    let mut chunks = tail.chunks_exact(2);
+    for chunk in chunks.by_ref() {
+        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    }
+    if let [last] = chunks.remainder() {
+        sum += u32::from(*last) << 8;
+    }
+    sum
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
 fn sum_words_wide(bytes: &[u8]) -> u32 {
     use wide::{u8x16, u16x8, u32x8};
 

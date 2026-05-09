@@ -16,7 +16,7 @@ use wasmtime_wasi_io::bytes::Bytes;
 use wasmtime_wasi_io::poll::Pollable;
 use wasmtime_wasi_io::streams::{InputStream, OutputStream, StreamError, StreamResult};
 
-use crate::child_io::{ByteReader, ByteWriter};
+use crate::io::{ByteReader, ByteWriter};
 use crate::{
     ComponentRuntimeState, ComponentStoreData, KillReason, ProgramOutOfMemory,
     allow_instance_resource_growth, heap_stats, user_heap_stats, user_memory_kernel_reserve_bytes,
@@ -224,7 +224,7 @@ impl InputStream for ChannelInputStream {
             return Ok(self.carry.split_to(take));
         }
         match self.reader.try_read() {
-            crate::child_io::TryRead::Ready(mut bytes) => {
+            crate::io::TryRead::Ready(mut bytes) => {
                 if bytes.len() > size {
                     let taken = bytes.split_to(size);
                     self.carry = bytes;
@@ -232,8 +232,8 @@ impl InputStream for ChannelInputStream {
                 }
                 Ok(bytes)
             }
-            crate::child_io::TryRead::Pending => Ok(Bytes::new()),
-            crate::child_io::TryRead::Eof => Err(StreamError::Closed),
+            crate::io::TryRead::Pending => Ok(Bytes::new()),
+            crate::io::TryRead::Eof => Err(StreamError::Closed),
         }
     }
 }

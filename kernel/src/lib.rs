@@ -7,48 +7,18 @@ extern crate self as helios_kernel;
 extern crate std;
 
 mod bootfs;
-mod child_io;
-mod compaction;
-mod component_cache;
-mod component_fs;
-mod component_fs_path;
-mod component_resources;
-mod component_runtime;
-mod component_runtime_backend;
-mod component_types;
-mod descriptor_table;
-mod embedded_component;
-mod embedded_init;
-mod embedded_program;
-mod entropy_pool;
-mod executor;
-mod frame_slab;
-mod futex_table;
-mod host_fs_client;
-mod host_share;
+mod component;
+mod embedded;
+mod exec;
+mod host_fs;
 mod instance;
+mod io;
 mod kernel_exception;
 mod log;
-mod network_control;
-mod network_service;
-mod observer;
-mod pmm;
-mod poll_registry;
-mod process_authority;
-mod process_table;
-mod program_service;
-mod recording_console;
-mod runtime_state;
-mod runtime_types;
-mod serial_transport;
-mod socket_stack;
-mod sync;
-mod task;
-mod thread_table;
-mod time;
-mod timer;
-mod unsupported_host_fs;
-mod user_memory;
+mod memory;
+mod network;
+mod process;
+mod runtime;
 #[cfg(feature = "wasmtime-runtime")]
 pub(crate) mod wasmtime_adapter;
 
@@ -73,56 +43,47 @@ pub use bootfs::{
     BootDirectory, BootDirectoryEntry, BootDirectoryHandleExt, BootFile, EmbeddedBootDirectory,
     EmbeddedBootFile, EmbeddedBootFs,
 };
-pub use child_io::{ByteReadWait, ByteReader, ByteWriter, ClosedPeer, TryRead, byte_channel};
-pub use compaction::{
-    CompactionBudget, CompactionPolicy, CompactionReport, CompactionTarget, Compactor,
-    PressureLevel,
-};
-pub(crate) use component_cache::ComponentCache;
-pub use component_fs::{
-    ComponentFsNodeKind, ComponentFsResourceError, ComponentResourceTableError,
-    map_resource_table_error,
-};
-pub use component_fs_path::{
-    ComponentFsPathError, directory_prefix, parent_path, path_is_within_directory,
-    resolve_absolute_path, resolve_child_path, resolve_guest_path, strip_directory_prefix,
-};
-pub use component_resources::{
-    ComponentRawMutex, ComponentRawMutexGuard, ComponentRawRwLock, ComponentRawRwLockReadGuard,
-    ComponentRawRwLockWriteGuard, ComponentSerialPort, ComponentTcpBackend, ComponentTcpStream,
-    ComponentUdpBackend, ComponentUdpSocket,
-};
-pub use component_runtime::{
-    ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind, ComponentRuntimeState,
-    ComponentStoreData, DeadlinePollable, InstanceKilled, wait_until_runtime_deadline,
-};
-pub use component_runtime_backend::{
+pub(crate) use component::ComponentCache;
+pub use component::{
     CompiledComponent, ComponentExecContext, ComponentExecutor, ComponentExitStatus,
-    ComponentRunResult, ComponentRuntimeEngine, ComponentRuntimeFactory, ComponentWorld,
+    ComponentFsNodeKind, ComponentFsPathError, ComponentFsResourceError, ComponentOutputMode,
+    ComponentOutputRoute, ComponentOutputStreamKind, ComponentRawMutex, ComponentRawMutexGuard,
+    ComponentRawRwLock, ComponentRawRwLockReadGuard, ComponentRawRwLockWriteGuard,
+    ComponentResourceTableError, ComponentRunResult, ComponentRuntimeEngine,
+    ComponentRuntimeFactory, ComponentRuntimeState, ComponentSerialPort, ComponentStoreData,
+    ComponentTcpBackend, ComponentTcpStream, ComponentUdpBackend, ComponentUdpSocket,
+    ComponentWorld, DeadlinePollable, InstanceKilled, RawMutexGuardResource, RawMutexResource,
+    RawRwLockReadGuardResource, RawRwLockResource, RawRwLockWriteGuardResource,
+    SerialPortResource, TcpStreamResource, UdpSocketResource, directory_prefix,
+    map_resource_table_error, parent_path, path_is_within_directory, resolve_absolute_path,
+    resolve_child_path, resolve_guest_path, strip_directory_prefix, wait_until_runtime_deadline,
 };
-pub use component_types::{
-    RawMutexGuardResource, RawMutexResource, RawRwLockReadGuardResource, RawRwLockResource,
-    RawRwLockWriteGuardResource, SerialPortResource, TcpStreamResource, UdpSocketResource,
+pub use embedded::{
+    EmbeddedComponent, EmbeddedInit, embedded_boot_component, embedded_init,
+    embedded_system_component, has_embedded_system_component,
 };
-pub use descriptor_table::{DescriptorEntry, DescriptorId, DescriptorTable, DescriptorTableError};
-pub use embedded_component::EmbeddedComponent;
-pub use embedded_init::{
-    EmbeddedInit, embedded_boot_component, embedded_init, embedded_system_component,
-    has_embedded_system_component,
-};
-pub use embedded_program::EmbeddedProgram;
-pub use entropy_pool::{EntropyError, EntropyPool};
-pub use executor::{Executor, ExecutorRunStats, JoinHandle, LocalJoinHandle, Spawner};
-pub use futex_table::{
-    FutexKey, FutexTable, FutexWaitRegistration, GuestAddress, ProcessMemoryIdentity,
+pub use exec::{
+    CompactionBudget, CompactionPolicy, CompactionReport, CompactionTarget, Compactor,
+    DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,
+    Executor, ExecutorRunStats, FoldedProfileSample, JoinHandle, KernelClock, LocalJoinHandle,
+    Mutex, MutexGuard, Notified, Notify, NotifyWaiter, OwnedRawMutexLease, OwnedRawRwLockReadLease,
+    OwnedRawRwLockWriteLease, PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PressureLevel,
+    ProfileFilter, ProfileHistory, ProfileScope, RawMutex, RawMutexLease, RawRwLock,
+    RawRwLockReadLease, RawRwLockWriteLease, RwLock, RwLockReadGuard, RwLockWriteGuard, Sleep,
+    Spawner, StatsSample, Timer, TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel,
+    TraceValue, YieldNow, duration_to_ticks, elapsed_millis, matches_perf_metric_filter,
+    matches_profile_filter, matches_trace_filter, monotonic_nanos,
+    nanos_to_ticks_ceil_saturating, parse_console_text, yield_now,
 };
 pub use helios_hal::Platform;
 pub use helios_netstack::{
     DEFAULT_POLL_BUDGET, EventDeliveryCapabilities, InterfaceCapabilities,
     NetworkInterface as NetworkDevice, PacketBuffer,
 };
-pub use host_fs_client::{HostFsClient, HostFsTransport};
-pub use host_share::{HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, guest_host_share_path};
+pub use host_fs::{
+    HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, HostFsClient, HostFsTransport,
+    UnsupportedHostFileSystem, guest_host_share_path,
+};
 pub use instance::{
     DEFAULT_RESTART_COST, InstanceExecutionTransition, InstanceId, InstanceProfileTotal,
     InstanceRegistry, InstanceSnapshot, KillReason, OomVictim, PLUGIN_RESTART_COST,
@@ -132,62 +93,41 @@ pub use instance::{
 pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
 };
-pub use network_control::{
+pub use network::{
     Ipv4Cidr, Ipv4Route, MacAddress, NetworkAdminBackend, NetworkBridgeRequest,
-    NetworkBridgeSecurity, NetworkControl, NetworkControlError, NetworkPortId,
+    NetworkBridgeSecurity, NetworkControl, NetworkControlError, NetworkPortId, NetworkService,
+    SocketStack, TcpListenerId, TcpStreamId, UdpSocketId,
 };
-pub use network_service::{NetworkService, TcpListenerId, TcpStreamId, UdpSocketId};
-pub use observer::{
-    DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,
-    FoldedProfileSample, PerfMetricFilter, PerfMetricHistory, PerfMetricSample, ProfileFilter,
-    ProfileHistory, ProfileScope, StatsSample, TraceEvent, TraceField, TraceFilter, TraceHistory,
-    TraceLevel, TraceValue, matches_perf_metric_filter, matches_profile_filter,
-    matches_trace_filter, parse_console_text,
+pub use io::{
+    ByteReadWait, ByteReader, ByteWriter, ClosedPeer, PollKey, PollRegistration, PollRegistry,
+    PollRegistryError, PollSourceKind, RecordingConsole, TryRead, byte_channel,
+    emit_serial_error_marker, emit_serial_stage_marker, read_serial, try_read_serial,
+    write_serial,
 };
-pub use pmm::KernelPhysFrameAllocator;
-pub use poll_registry::{
-    PollKey, PollRegistration, PollRegistry, PollRegistryError, PollSourceKind,
+pub use memory::{
+    EntropyError, EntropyPool, KernelPhysFrameAllocator, UserHeapStats,
+    allocate_user_frame_uninit_on, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
+    deallocate_user_frame, deallocate_user_frame_on, user_heap_stats,
 };
-pub use process_authority::{
-    ClockAuthorityRights, DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DnsCap,
-    ExecAuthority, ForkAuthority, JoinAuthority, LinkAuthorityRights, LinkSourceCap,
-    LinkTargetDirectoryCap, MulticastCap, NetworkAdminCap, NetworkAuthorityRights, NetworkCap,
-    PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights,
-    SetWallClockCap, SignalAuthority, SpawnAuthority, SymlinkCreateCap, SymlinkReadCap, TcpCap,
-    TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, TtyControlCap, UdpCap,
+pub use process::{
+    ClockAuthorityRights, DescriptorEntry, DescriptorId, DescriptorTable, DescriptorTableError,
+    ThreadId, ThreadRecord, ThreadState, ThreadTable, ThreadTableError,
+    DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DnsCap, ExecAuthority,
+    ForkAuthority, FutexKey, FutexTable, FutexWaitRegistration, GuestAddress, JoinAuthority,
+    LinkAuthorityRights, LinkSourceCap, LinkTargetDirectoryCap, MulticastCap, NetworkAdminCap,
+    NetworkAuthorityRights, NetworkCap, PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError,
+    ProcessAuthorityRights, ProcessId, ProcessMemoryIdentity, ProcessRecord, ProcessState,
+    ProcessTable, ProcessTableError, ProgramExecError, ProgramExecErrorDetail,
+    ProgramExecErrorKind, ProgramOutOfMemory, SetWallClockCap, SignalAuthority, SpawnAuthority,
+    SymlinkCreateCap, SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap,
+    TerminalOutputCap, TtyControlCap, UdpCap,
 };
-pub use process_table::{ProcessId, ProcessRecord, ProcessState, ProcessTable, ProcessTableError};
-pub use program_service::{
-    ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, ProgramOutOfMemory,
-};
-pub use recording_console::RecordingConsole;
-pub use runtime_state::RuntimeState;
-pub use runtime_types::{
+pub use runtime::{
     AuthorityDomain, ComponentHostFilesystemState, ComponentNetworkService, ComponentNetworkState,
     DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry, HostFileSystem, HostFsError,
     HostFsErrorKind, HostMetadata, Ipv4Address, NetworkErrorDetail, NetworkIpAddress,
-    ObjectIdentity, PingError, PingErrorKind, PingReply, TcpAccepted, TcpError, TcpErrorKind,
-    TcpListener, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
-};
-pub use serial_transport::{
-    emit_serial_error_marker, emit_serial_stage_marker, read_serial, try_read_serial, write_serial,
-};
-pub use socket_stack::SocketStack;
-pub use sync::{
-    Mutex, MutexGuard, Notified, Notify, NotifyWaiter, OwnedRawMutexLease, OwnedRawRwLockReadLease,
-    OwnedRawRwLockWriteLease, RawMutex, RawMutexLease, RawRwLock, RawRwLockReadLease,
-    RawRwLockWriteLease, RwLock, RwLockReadGuard, RwLockWriteGuard,
-};
-pub use task::{YieldNow, yield_now};
-pub use thread_table::{ThreadId, ThreadRecord, ThreadState, ThreadTable, ThreadTableError};
-pub use time::{
-    KernelClock, duration_to_ticks, elapsed_millis, monotonic_nanos, nanos_to_ticks_ceil_saturating,
-};
-pub use timer::{Sleep, Timer};
-pub use unsupported_host_fs::UnsupportedHostFileSystem;
-pub use user_memory::{
-    UserHeapStats, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
-    deallocate_user_frame, deallocate_user_frame_on, user_heap_stats,
+    ObjectIdentity, PingError, PingErrorKind, PingReply, RuntimeState, TcpAccepted, TcpError,
+    TcpErrorKind, TcpListener, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
 };
 #[cfg(feature = "wasmtime-runtime")]
 pub use wasmtime_adapter::component_host::{
@@ -584,7 +524,7 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, Watch
             }
 
             progress += fired + ran;
-            if ran == executor::READY_BATCH_TASKS || progress >= executor::READY_BATCH_TASKS {
+            if ran == exec::READY_BATCH_TASKS || progress >= exec::READY_BATCH_TASKS {
                 return stats;
             }
         }
@@ -844,7 +784,7 @@ where
 fn init_allocator<Regions>(
     memory_regions: Regions,
     processor_count: usize,
-) -> &'static user_memory::UserMemoryPool
+) -> &'static memory::UserMemoryPool
 where
     Regions: IntoIterator<Item = MemoryRegion>,
 {
@@ -859,7 +799,7 @@ where
         }
         let pool = *user_pool.get_or_insert_with(|| {
             let pool =
-                user_memory::install_user_memory_pool(user_memory::allocate_user_memory_pool());
+                memory::install_user_memory_pool(memory::allocate_user_memory_pool());
             pool.configure_processors(processor_count);
             pool
         });
@@ -891,7 +831,7 @@ const fn align_down(value: usize, align: usize) -> usize {
 pub fn prime_bootstrap_allocator<Regions>(
     memory_regions: Regions,
     processor_count: usize,
-) -> &'static user_memory::UserMemoryPool
+) -> &'static memory::UserMemoryPool
 where
     Regions: IntoIterator<Item = MemoryRegion>,
 {

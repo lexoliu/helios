@@ -15,8 +15,8 @@ use crate::{
 use helios_hal::cpu::HardwarePerfCounterDelta;
 use spin::{Mutex, Once};
 
-use crate::component_runtime::ComponentRuntimeState;
-use crate::runtime_types::ComponentHostFilesystemState;
+use crate::component::ComponentRuntimeState;
+use crate::runtime::types::ComponentHostFilesystemState;
 
 #[derive(Clone)]
 pub struct RuntimeState<ProgramService, NetworkService, HostFsService> {

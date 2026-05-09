@@ -100,9 +100,7 @@ fn build_engine_for_platform<P: Cpu + Clone>(
         // declared minimum" tuning so SharedMemory requests never
         // grow physical RAM beyond what the wasm guest actually
         // needs.
-        config.with_host_memory(Arc::new(UserMemoryCreator::new(
-            platform.current_processor(),
-        )));
+        config.with_host_memory(Arc::new(UserMemoryCreator::<P>::new(platform.clone())));
         config.memory_guard_size(helios_artifact::CWASM_NO_VMEM_MEMORY_GUARD_SIZE);
         config.memory_reservation(helios_artifact::CWASM_NO_VMEM_MEMORY_RESERVATION);
         config.memory_reservation_for_growth(

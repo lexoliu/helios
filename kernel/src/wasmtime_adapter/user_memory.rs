@@ -9,21 +9,21 @@ use thiserror::Error;
 use wasmtime::{LinearMemory, MemoryCreator, MemoryType};
 
 use crate::ProgramOutOfMemory;
-use crate::user_memory::{
-    allocate_user_zeroed_on, deallocate_user_on, user_memory_allocation_size,
-};
-use helios_hal::cpu::ProcessorId;
+use crate::memory::{allocate_user_uninit_on, deallocate_user_on};
+use helios_hal::cpu::{Cpu, ProcessorId};
 
 const LINEAR_MEMORY_ALIGNMENT: usize = 64 * 1024;
 
 #[derive(Clone)]
-pub(crate) struct UserMemoryCreator {
+pub(crate) struct UserMemoryCreator<C: Cpu + Clone> {
     processor: ProcessorId,
+    cpu: C,
 }
 
-impl UserMemoryCreator {
-    pub(crate) const fn new(processor: ProcessorId) -> Self {
-        Self { processor }
+impl<C: Cpu + Clone> UserMemoryCreator<C> {
+    pub(crate) fn new(cpu: C) -> Self {
+        let processor = cpu.current_processor();
+        Self { processor, cpu }
     }
 }
 
@@ -49,7 +49,7 @@ impl From<ProgramOutOfMemory> for UserLinearMemoryError {
     }
 }
 
-unsafe impl MemoryCreator for UserMemoryCreator {
+unsafe impl<C: Cpu + Clone> MemoryCreator for UserMemoryCreator<C> {
     fn new_memory(
         &self,
         ty: MemoryType,
@@ -65,7 +65,7 @@ unsafe impl MemoryCreator for UserMemoryCreator {
             reserved_size_in_bytes,
             guard_size_in_bytes,
         )
-        .and_then(|plan| plan.allocate(self.processor))
+        .and_then(|plan| plan.allocate(self.processor, self.cpu.clone()))
         .map(|memory| Box::new(memory) as Box<dyn LinearMemory>)
         .map_err(|error| error.to_string())
     }
@@ -79,8 +79,12 @@ struct UserLinearMemoryPlan {
 }
 
 impl UserLinearMemoryPlan {
-    fn allocate(self, processor: ProcessorId) -> Result<UserLinearMemory, UserLinearMemoryError> {
-        UserLinearMemory::new(self.minimum, self.capacity, self.relocatable, processor)
+    fn allocate<C: Cpu + Clone>(
+        self,
+        processor: ProcessorId,
+        cpu: C,
+    ) -> Result<UserLinearMemory<C>, UserLinearMemoryError> {
+        UserLinearMemory::new(self.minimum, self.capacity, self.relocatable, processor, cpu)
     }
 }
 
@@ -115,23 +119,28 @@ fn plan_user_linear_memory(
     })
 }
 
-struct UserLinearMemory {
+struct UserLinearMemory<C: Cpu + Clone> {
     ptr: NonNull<u8>,
     byte_len: usize,
     byte_capacity: usize,
     relocatable: bool,
     processor: ProcessorId,
+    cpu: C,
 }
 
-unsafe impl Send for UserLinearMemory {}
-unsafe impl Sync for UserLinearMemory {}
+// SAFETY: each `UserLinearMemory` owns a non-overlapping page-aligned
+// buffer; concurrent access is gated by Wasmtime's own LinearMemory
+// contract and not by this struct's internals.
+unsafe impl<C: Cpu + Clone> Send for UserLinearMemory<C> {}
+unsafe impl<C: Cpu + Clone> Sync for UserLinearMemory<C> {}
 
-impl UserLinearMemory {
+impl<C: Cpu + Clone> UserLinearMemory<C> {
     fn new(
         minimum: usize,
         capacity: usize,
         relocatable: bool,
         processor: ProcessorId,
+        cpu: C,
     ) -> Result<Self, UserLinearMemoryError> {
         if capacity < minimum {
             return Err(UserLinearMemoryError::CapacityBelowMinimum);
@@ -144,23 +153,31 @@ impl UserLinearMemory {
                 byte_capacity: 0,
                 relocatable,
                 processor,
+                cpu,
             });
         }
 
         let layout = linear_memory_layout(capacity)?;
-        let ptr = allocate_user_zeroed_on(processor, layout)?;
-        let byte_capacity = user_memory_allocation_size(layout);
+        let (ptr, byte_capacity) = allocate_user_uninit_on(processor, layout)?;
+        // SAFETY: `ptr` is a fresh exclusive allocation of
+        // `byte_capacity` writable bytes; the chosen `Cpu::zero_memory`
+        // implementation (potentially `dc zva` on aarch64) clears the
+        // whole region before any user code observes it.
+        unsafe {
+            cpu.zero_memory(ptr, byte_capacity);
+        }
         Ok(Self {
             ptr,
             byte_len: minimum,
             byte_capacity,
             relocatable,
             processor,
+            cpu,
         })
     }
 }
 
-unsafe impl LinearMemory for UserLinearMemory {
+unsafe impl<C: Cpu + Clone> LinearMemory for UserLinearMemory<C> {
     fn byte_size(&self) -> usize {
         self.byte_len
     }
@@ -183,9 +200,18 @@ unsafe impl LinearMemory for UserLinearMemory {
         }
 
         let new_layout = linear_memory_layout(new_size).map_err(wasmtime::Error::new)?;
-        let new_ptr =
-            allocate_user_zeroed_on(self.processor, new_layout).map_err(wasmtime::Error::from)?;
-        let new_capacity = user_memory_allocation_size(new_layout);
+        let (new_ptr, new_capacity) =
+            allocate_user_uninit_on(self.processor, new_layout).map_err(wasmtime::Error::from)?;
+        // SAFETY: `new_ptr` is a fresh exclusive allocation of
+        // `new_capacity` writable bytes; we will overwrite the prefix
+        // with the previous contents below, so only the tail truly
+        // needs zeroing — but driving `Cpu::zero_memory` over the
+        // whole region keeps the contract symmetric with `new_memory`
+        // and preserves the user-OOM invariant that fresh wasm memory
+        // is observed as zeros.
+        unsafe {
+            self.cpu.zero_memory(new_ptr, new_capacity);
+        }
         if self.byte_len != 0 {
             unsafe {
                 core::ptr::copy_nonoverlapping(self.ptr.as_ptr(), new_ptr.as_ptr(), self.byte_len);
@@ -209,7 +235,7 @@ unsafe impl LinearMemory for UserLinearMemory {
     }
 }
 
-impl Drop for UserLinearMemory {
+impl<C: Cpu + Clone> Drop for UserLinearMemory<C> {
     fn drop(&mut self) {
         if self.byte_capacity != 0 {
             deallocate_user_on(

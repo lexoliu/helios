@@ -42,16 +42,16 @@ impl HostFsTransport for HostFsTransportService {
         self.device.mount_tag()
     }
 
-    fn request(
-        &self,
-        bytes: Vec<u8>,
+    fn request<'a>(
+        &'a self,
+        bytes: &'a [u8],
         response_len: usize,
-    ) -> impl core::future::Future<Output = Result<Vec<u8>, IoError>> + Send + '_ {
+    ) -> impl core::future::Future<Output = Result<Vec<u8>, IoError>> + Send + 'a {
         async move {
             let mut response = alloc::vec![0_u8; response_len];
             let used = self
                 .device
-                .request_with_wait(&bytes, &mut response, helios_kernel::yield_now)
+                .request_with_wait(bytes, &mut response, helios_kernel::yield_now)
                 .await?;
             let used = usize::try_from(used).map_err(|_| IoError::DeviceFault)?;
             response.truncate(used);

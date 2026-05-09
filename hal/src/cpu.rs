@@ -1,3 +1,5 @@
+use core::ptr::NonNull;
+
 use crate::entropy::{EntropyQuality, EntropyUnavailable};
 
 /// Logical processor identifier.
@@ -178,6 +180,26 @@ pub trait Cpu: Send + Sync + 'static {
     /// wired this up on a conservative eager-backing strategy.
     fn has_lazy_commit_virtual_memory(&self) -> bool {
         false
+    }
+
+    /// Zero-initializes `size` bytes starting at `ptr`.
+    ///
+    /// The default implementation falls through to
+    /// [`core::ptr::write_bytes`], which lowers to the platform memset.
+    /// Architectures with hardware-assisted block clear instructions —
+    /// most notably AArch64 `dc zva` — override this to clear at
+    /// cache-line granularity without polluting the data caches.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must point to a region of at least `size` writable bytes
+    /// that is unaliased for the duration of the call.
+    unsafe fn zero_memory(&self, ptr: NonNull<u8>, size: usize) {
+        // SAFETY: caller has guaranteed `ptr` is writable for `size`
+        // bytes; `write_bytes` performs a typed-memory store of zeros.
+        unsafe {
+            core::ptr::write_bytes(ptr.as_ptr(), 0, size);
+        }
     }
 
     /// Powers the machine off and never returns.

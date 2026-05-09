@@ -15,7 +15,7 @@ use helios_hal::cpu::{Cpu, Instant};
 use objectpool::Pool;
 use triomphe::Arc;
 
-use crate::time::duration_to_ticks;
+use crate::exec::time::duration_to_ticks;
 
 const SCHEDULER_INTERRUPT_INTERVAL: Duration = Duration::from_millis(100);
 const TIMER_WHEEL_QUANTUM: Duration = Duration::from_micros(50);

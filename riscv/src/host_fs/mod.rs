@@ -170,12 +170,18 @@ impl HostFsTransport for HostFsTransportService {
         self.inner.device.mount_tag()
     }
 
-    fn request(
-        &self,
-        bytes: Vec<u8>,
+    fn request<'a>(
+        &'a self,
+        bytes: &'a [u8],
         response_len: usize,
-    ) -> impl core::future::Future<Output = Result<Vec<u8>, IoError>> + Send + '_ {
-        async move { self.raw_request(bytes, response_len).await }
+    ) -> impl core::future::Future<Output = Result<Vec<u8>, IoError>> + Send + 'a {
+        // The riscv transport hands the request to a worker task
+        // through `inner.requests`, so the bytes have to outlive the
+        // current await. The kernel-side request buffer is owned by
+        // the caller's pool, so we copy here into a freshly-owned
+        // Vec rather than smuggling a reference across the channel.
+        let owned = bytes.to_vec();
+        async move { self.raw_request(owned, response_len).await }
     }
 }
 

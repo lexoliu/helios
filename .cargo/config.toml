@@ -15,4 +15,9 @@ rustflags = [
 rustflags = [
   "-C", "link-arg=-Taarch64/linker.ld",
   "-C", "link-arg=-zmax-page-size=0x1000",
+  # ARMv8.1 LSE atomics (casal/ldaddal/swpal) replace ldxr/stxr LL/SC
+  # retry loops; ARMv8.3 RCPC adds release-consistent loads (ldapr);
+  # ARMv8.4 LSE2 lifts alignment requirements on atomics. Apple
+  # Silicon, Ampere Altra, AWS Graviton 2+ all support this baseline.
+  "-C", "target-feature=+lse,+rcpc,+lse2",
 ]

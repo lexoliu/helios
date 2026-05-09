@@ -3,7 +3,7 @@
 //! This module is the **only** place in the kernel that should directly
 //! depend on `wasmtime::*` types. All other kernel code interacts with
 //! the runtime through the traits defined in
-//! [`crate::component_runtime_backend`].
+//! [`crate::component::runtime_backend`].
 
 pub(crate) mod artifact_profile;
 pub mod bindings;

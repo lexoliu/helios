@@ -5,12 +5,22 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::future::Future;
 use helios_hal::io::IoError;
+use objectpool::Pool;
 
 use crate::{
     AuthorityDomain, HostDirEntry, HostFileSystem, HostFsError, HostMetadata, ObjectIdentity,
 };
 
 const DEFAULT_MSIZE: u32 = (1024 * 1024) + 24;
+/// Number of pre-allocated request buffers retained by each client.
+/// Sized so that the transport pipeline depth (currently single-flight)
+/// plus a couple of in-flight retries always have a hot buffer waiting.
+const REQUEST_BUFFER_POOL_SLOTS: usize = 4;
+/// Maximum capacity a returning request buffer is allowed to retain
+/// before it gets re-allocated. Caps memory pressure when a single
+/// large 9p TWRITE temporarily inflates a buffer.
+const REQUEST_BUFFER_RETAINED_CAPACITY: usize =
+    (DEFAULT_MSIZE as usize).next_power_of_two();
 const P9_NOTAG: u16 = u16::MAX;
 const P9_NOFID: u32 = u32::MAX;
 const P9_NOUID: u32 = u32::MAX;
@@ -49,21 +59,37 @@ const P9_TWRITE_FIXED_BODY_BYTES: usize = 4 + 8 + 4;
 pub trait HostFsTransport: Clone + Send + Sync + 'static {
     fn mount_tag(&self) -> &str;
 
-    fn request(
-        &self,
-        bytes: Vec<u8>,
+    /// Submits a fully-formed 9p Tmessage and resolves with the
+    /// reply. The request buffer is borrowed for the duration of the
+    /// future so that callers may pool and recycle it.
+    fn request<'a>(
+        &'a self,
+        bytes: &'a [u8],
         response_len: usize,
-    ) -> impl Future<Output = Result<Vec<u8>, IoError>> + Send + '_;
+    ) -> impl Future<Output = Result<Vec<u8>, IoError>> + Send + 'a;
 }
 
-#[derive(Clone)]
 pub struct HostFsClient<Transport: HostFsTransport> {
     transport: Transport,
+    request_buffers: Pool<Vec<u8>>,
+}
+
+impl<Transport: HostFsTransport> Clone for HostFsClient<Transport> {
+    fn clone(&self) -> Self {
+        Self::new(self.transport.clone())
+    }
 }
 
 impl<Transport: HostFsTransport> HostFsClient<Transport> {
-    pub const fn new(transport: Transport) -> Self {
-        Self { transport }
+    pub fn new(transport: Transport) -> Self {
+        Self {
+            transport,
+            request_buffers: Pool::bounded(
+                REQUEST_BUFFER_POOL_SLOTS,
+                Vec::new,
+                reset_request_buffer,
+            ),
+        }
     }
 
     async fn transact(
@@ -83,7 +109,9 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
         body: impl FnOnce(&mut Vec<u8>),
         response_len: usize,
     ) -> Result<Vec<u8>, HostFsError> {
-        let mut request = Vec::with_capacity(P9_HEADER_LEN + body_capacity);
+        let mut request = self.request_buffers.get_owned();
+        request.clear();
+        request.reserve(P9_HEADER_LEN + body_capacity);
         request.extend_from_slice(&0_u32.to_le_bytes());
         request.push(ty);
         request.extend_from_slice(&P9_NOTAG.to_le_bytes());
@@ -94,9 +122,13 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
 
         let response = self
             .transport
-            .request(request, response_len)
+            .request(&request, response_len)
             .await
             .map_err(HostFsError::Transport)?;
+        // Drop `request` here so the buffer is back in the pool
+        // before any error path below. The pool's reset hook clears
+        // contents and caps capacity to `REQUEST_BUFFER_RETAINED_CAPACITY`.
+        drop(request);
         if response.len() < 7 {
             return Err(HostFsError::Protocol("response shorter than 9p header"));
         }
@@ -874,6 +906,16 @@ fn write_request_body_capacity(payload_len: usize) -> usize {
     P9_TWRITE_FIXED_BODY_BYTES
         .checked_add(payload_len)
         .expect("9p write request capacity overflowed")
+}
+
+fn reset_request_buffer(buf: &mut Vec<u8>) {
+    buf.clear();
+    if buf.capacity() > REQUEST_BUFFER_RETAINED_CAPACITY {
+        // Shrink any one-shot oversize back so the pool does not
+        // permanently hold inflated buffers from a transient large
+        // 9p TWRITE.
+        *buf = Vec::with_capacity(REQUEST_BUFFER_RETAINED_CAPACITY);
+    }
 }
 
 fn push_u16(buf: &mut Vec<u8>, value: u16) {

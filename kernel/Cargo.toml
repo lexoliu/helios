@@ -46,6 +46,7 @@ spin = { version = "0.9.8", default-features = false, features = ["mutex", "once
 wasmparser = { version = "0.245.0", default-features = false, features = ["component-model"] }
 
 [dev-dependencies]
+arc-swap = "1.7.1"
 critical-section = { version = "1.2.0", features = ["std"] }
 divan = { version = "0.1.21", default-features = false }
 futures-lite = "2.6.1"
@@ -54,6 +55,14 @@ wasm-encoder = "0.245.0"
 
 [[bench]]
 name = "data_structures"
+harness = false
+
+[[bench]]
+name = "network_smp"
+harness = false
+
+[[bench]]
+name = "timer_alloc"
 harness = false
 
 [build-dependencies]

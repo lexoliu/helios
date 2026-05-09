@@ -11,7 +11,7 @@ use helios_hal::cpu::ProcessorId;
 use helios_hal::pmm::PhysFrame;
 
 use crate::ProgramOutOfMemory;
-use crate::frame_slab::FrameSlabCache;
+use crate::memory::frame_slab::FrameSlabCache;
 
 const USER_HEAP_ORDER: usize = 32;
 
@@ -54,7 +54,11 @@ impl UserMemoryPool {
     }
 
     pub fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<u8>, ProgramOutOfMemory> {
-        self.allocate_zeroed_with_processor(layout, None)
+        let (ptr, size) = self.allocate_uninit_with_processor(layout, None)?;
+        unsafe {
+            core::ptr::write_bytes(ptr.as_ptr(), 0, size);
+        }
+        Ok(ptr)
     }
 
     pub fn allocate_zeroed_on(
@@ -62,14 +66,34 @@ impl UserMemoryPool {
         processor: ProcessorId,
         layout: Layout,
     ) -> Result<NonNull<u8>, ProgramOutOfMemory> {
-        self.allocate_zeroed_with_processor(layout, Some(processor))
+        let (ptr, size) = self.allocate_uninit_with_processor(layout, Some(processor))?;
+        unsafe {
+            core::ptr::write_bytes(ptr.as_ptr(), 0, size);
+        }
+        Ok(ptr)
     }
 
-    fn allocate_zeroed_with_processor(
+    /// Allocates `layout` bytes of user memory without zero-filling.
+    ///
+    /// Returns the allocation pointer and the actual byte count
+    /// produced by the buddy allocator (rounded up to its block size).
+    /// The caller must zero or fully initialise the returned region
+    /// before exposing it to user code; the architecture-specific zero
+    /// path (for example AArch64 `dc zva` via `Cpu::zero_memory`)
+    /// applies here.
+    pub fn allocate_uninit_on(
+        &self,
+        processor: ProcessorId,
+        layout: Layout,
+    ) -> Result<(NonNull<u8>, usize), ProgramOutOfMemory> {
+        self.allocate_uninit_with_processor(layout, Some(processor))
+    }
+
+    fn allocate_uninit_with_processor(
         &self,
         layout: Layout,
         processor: Option<ProcessorId>,
-    ) -> Result<NonNull<u8>, ProgramOutOfMemory> {
+    ) -> Result<(NonNull<u8>, usize), ProgramOutOfMemory> {
         let allocation_size = buddy_allocation_size(layout);
         if is_single_frame_layout(layout) {
             let ptr = match processor {
@@ -77,10 +101,7 @@ impl UserMemoryPool {
                 None => self.frame_slab.allocate(),
             };
             if let Some(ptr) = ptr {
-                unsafe {
-                    core::ptr::write_bytes(ptr.as_ptr(), 0, PhysFrame::SIZE);
-                }
-                return Ok(ptr);
+                return Ok((ptr, PhysFrame::SIZE));
             }
         }
 
@@ -106,10 +127,7 @@ impl UserMemoryPool {
                     reserved_bytes: 0,
                 }
             })?;
-        unsafe {
-            core::ptr::write_bytes(ptr.as_ptr(), 0, allocation_size);
-        }
-        Ok(ptr)
+        Ok((ptr, allocation_size))
     }
 
     pub fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
@@ -204,6 +222,24 @@ pub fn allocate_user_frame_zeroed_on(
     user_memory_pool().allocate_zeroed_on(processor, layout)
 }
 
+/// Allocates a single user-mode physical frame without zero-filling.
+///
+/// The returned pointer is suitable for the caller's own zero path —
+/// in particular AArch64 backends use `dc zva` via
+/// [`helios_hal::cpu::Cpu::zero_memory`] which is several times faster
+/// than the generic memset that [`allocate_user_frame_zeroed_on`]
+/// performs internally. Callers must zero or otherwise initialise the
+/// frame before exposing it to user code.
+pub fn allocate_user_frame_uninit_on(
+    processor: ProcessorId,
+) -> Result<NonNull<u8>, ProgramOutOfMemory> {
+    let layout = Layout::from_size_align(PhysFrame::SIZE, PhysFrame::SIZE)
+        .unwrap_or_else(|_| panic!("invalid user-frame layout"));
+    user_memory_pool()
+        .allocate_uninit_on(processor, layout)
+        .map(|(ptr, _)| ptr)
+}
+
 pub fn deallocate_user_frame(ptr: NonNull<u8>) {
     let layout = Layout::from_size_align(PhysFrame::SIZE, PhysFrame::SIZE)
         .unwrap_or_else(|_| panic!("invalid user-frame layout"));
@@ -216,19 +252,20 @@ pub fn deallocate_user_frame_on(processor: ProcessorId, ptr: NonNull<u8>) {
     user_memory_pool().deallocate_on(processor, ptr, layout);
 }
 
-pub(crate) fn allocate_user_zeroed_on(
+/// Kernel-internal uninit allocator counterpart used by the wasmtime
+/// adapter. Returns the buddy-rounded byte size alongside the pointer
+/// so the caller can drive an architecture-specific zero
+/// (`Cpu::zero_memory`) over the actual allocation rather than the
+/// requested layout size.
+pub(crate) fn allocate_user_uninit_on(
     processor: ProcessorId,
     layout: Layout,
-) -> Result<NonNull<u8>, ProgramOutOfMemory> {
-    user_memory_pool().allocate_zeroed_on(processor, layout)
+) -> Result<(NonNull<u8>, usize), ProgramOutOfMemory> {
+    user_memory_pool().allocate_uninit_on(processor, layout)
 }
 
 pub(crate) fn deallocate_user_on(processor: ProcessorId, ptr: NonNull<u8>, layout: Layout) {
     user_memory_pool().deallocate_on(processor, ptr, layout);
-}
-
-pub(crate) fn user_memory_allocation_size(layout: Layout) -> usize {
-    buddy_allocation_size(layout)
 }
 
 fn buddy_allocation_size(layout: Layout) -> usize {

@@ -231,6 +231,30 @@ steady-state comparisons. `--compiler-timing` adds a cranelift pass
 breakdown to the log; use it for diagnosis when a regression appears,
 not for the canonical baseline.
 
+## 3.6 Architectural ambition
+
+- Performance, scalability, and architectural cleanliness work must
+  not be cut short because the change is large. If an improvement
+  better tracks modern high-performance practice and yields a more
+  elegant abstraction without violating an existing contract, take
+  the full path — including cross-crate interface reshapes,
+  ownership reorganization across subsystems, and ABI changes across
+  backends.
+- Do not estimate effort. Phrases like "X hours", "X days", "quick
+  win", "low-effort", or any time-cost framing are not valid
+  decision inputs. The only decision criteria are: (a) does the
+  change resolve a root problem; (b) does the resulting code track
+  modern practice and read more cleanly; (c) does it introduce any
+  new contract violation. All three pass → land it.
+- Do not propose a degraded variant in order to "ship something
+  first". If the only options are a degraded variant or no change,
+  do not change — record the decision as a real blocker for
+  explicit user discussion, and do not freelance an alternative.
+- Large changes should be discussed proactively (via AskUserQuestion
+  or normal conversation) to align on intent and direction. Such
+  discussions are for alignment, not for requesting permission to
+  land a degraded variant.
+
 ## 4. Async-first execution
 
 The kernel runs a cooperative async executor; anything that pins it blocks

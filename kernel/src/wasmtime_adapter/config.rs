@@ -14,6 +14,12 @@ pub fn build_target_engine_config(target: &str) -> Config {
     config
         .target(target)
         .expect("Helios build target must be accepted by Wasmtime");
+    // Cranelift optimisation level is intentionally NOT pinned here:
+    // the kernel-side wasmtime build does not enable the `cranelift`
+    // feature (only `runtime`), so it has no compiler to configure.
+    // All compilation happens inside the compiler-plugin user-mode
+    // program, which owns its own Wasmtime instance and pins
+    // `OptLevel::Speed` there.
     #[cfg(all(
         target_arch = "x86_64",
         target_os = "none",

@@ -36,7 +36,7 @@ use helios_kernel::runtime_memory::{
     self, RuntimeMemoryHooks, RuntimeMemoryImage, default_memory_image_free,
     default_memory_image_map_at, default_memory_image_new, default_page_size,
 };
-use helios_kernel::{allocate_user_frame_zeroed_on, deallocate_user_frame_on};
+use helios_kernel::{allocate_user_frame_uninit_on, deallocate_user_frame_on};
 use spin::{Mutex, Once};
 
 const PAGE: usize = 4096;
@@ -323,8 +323,15 @@ impl Aarch64UserAddressSpace {
     }
 
     fn alloc_user_frame(&self) -> Result<usize, AddressSpaceError> {
-        let raw = allocate_user_frame_zeroed_on(crate::current_processor_runtime().logical_id())
+        let raw = allocate_user_frame_uninit_on(crate::current_processor_runtime().logical_id())
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
+        // SAFETY: `raw` came from the user-memory pool above which
+        // produced a `PhysFrame::SIZE` aligned, exclusively owned
+        // writable region. The aarch64 backend's `dc zva` helper
+        // zeros the whole frame at cache-line granularity.
+        unsafe {
+            crate::aarch64_zero_memory(raw.as_ptr(), helios_hal::pmm::PhysFrame::SIZE);
+        }
         let virt = raw.as_ptr() as usize;
         Ok(virt - self.physical_memory_offset)
     }

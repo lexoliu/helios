@@ -23,7 +23,7 @@ use helios_hal::pmm::{
     FrameAllocError, FrameAllocStats, PhysFrame, PhysFrameAllocator, PhysFrameRange,
 };
 
-use crate::frame_slab::FrameSlabCache;
+use crate::memory::frame_slab::FrameSlabCache;
 
 const HEAP_ORDER: usize = 32;
 

@@ -28,7 +28,7 @@ use core::marker::PhantomData;
 
 use helios_hal::vmm::{AddressSpace, AddressSpaceError, VirtRange};
 
-use crate::pmm::KernelPhysFrameAllocator;
+use crate::memory::KernelPhysFrameAllocator;
 
 /// Coarse pressure classification used by the compactor and the OOM
 /// killer to decide whether to act on a `FrameAllocStats` snapshot.

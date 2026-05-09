@@ -11,7 +11,7 @@ use core::cell::UnsafeCell;
 use core::fmt::{self, Write};
 use core::ops::Range;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -171,6 +171,11 @@ struct ProcessorRuntime {
     wasmtime_component_tls: AtomicPtr<u8>,
     native_trap_handler: AtomicUsize,
     started: AtomicBool,
+    /// Block size in bytes for the `DC ZVA` cache-line zero
+    /// instruction, cached from `DCZID_EL0` at processor bring-up.
+    /// Zero means DC ZVA is prohibited on this PE (`DCZID_EL0.DZP`
+    /// is set) and callers must fall back to a generic memset.
+    dc_zva_block_bytes: AtomicU32,
 }
 
 impl ProcessorRuntime {
@@ -183,6 +188,7 @@ impl ProcessorRuntime {
             wasmtime_component_tls: AtomicPtr::new(core::ptr::null_mut()),
             native_trap_handler: AtomicUsize::new(0),
             started: AtomicBool::new(false),
+            dc_zva_block_bytes: AtomicU32::new(0),
         }
     }
 }
@@ -595,6 +601,15 @@ impl Cpu for Aarch64Cpu {
         true
     }
 
+    unsafe fn zero_memory(&self, ptr: NonNull<u8>, size: usize) {
+        // SAFETY: caller has guaranteed the buffer is writable; the
+        // helper uses `dc zva` for cache-line aligned blocks and
+        // `write_bytes` for the unaligned remainder.
+        unsafe {
+            aarch64_zero_memory(ptr.as_ptr(), size);
+        }
+    }
+
     fn fill_entropy(&self, buffer: &mut [u8]) -> Result<EntropyQuality, EntropyUnavailable> {
         self.state.fill_entropy(buffer)?;
         Ok(EntropyQuality::Cryptographic)
@@ -622,7 +637,93 @@ fn activate_processor_runtime(runtime: &'static ProcessorRuntime) {
     unsafe {
         asm!("msr tpidr_el1, {ptr}", ptr = in(reg) ptr, options(nomem, nostack, preserves_flags));
     }
+    cache_dc_zva_block_bytes(runtime);
     runtime.started.store(true, Ordering::Release);
+}
+
+/// Reads `DCZID_EL0` once for this PE and stores the byte block size
+/// for `DC ZVA` in `runtime.dc_zva_block_bytes`. A zero value means
+/// the architecture prohibits DC ZVA on this PE (`DCZID_EL0.DZP == 1`)
+/// and callers must fall through to a generic memset.
+fn cache_dc_zva_block_bytes(runtime: &ProcessorRuntime) {
+    let dczid: u64;
+    unsafe {
+        asm!(
+            "mrs {v}, dczid_el0",
+            v = out(reg) dczid,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    let dzp_prohibited = (dczid >> 4) & 1 != 0;
+    let block_bytes = if dzp_prohibited {
+        0
+    } else {
+        let bs = (dczid & 0xf) as u32;
+        4u32 << bs
+    };
+    runtime
+        .dc_zva_block_bytes
+        .store(block_bytes, Ordering::Relaxed);
+}
+
+/// Zero `size` bytes starting at `ptr` using `DC ZVA` for the
+/// largest aligned middle region. The unaligned head and tail use a
+/// scalar `write_bytes` that the compiler lowers to `stp`/`str`
+/// pairs.
+///
+/// # Safety
+///
+/// `ptr` must point to `size` writable bytes that no other thread
+/// observes for the duration of the call. `block_bytes` must be the
+/// active processor's `DCZID_EL0` block size in bytes and a power of
+/// two.
+unsafe fn dc_zva_zero(mut ptr: *mut u8, mut size: usize, block_bytes: usize) {
+    debug_assert!(block_bytes.is_power_of_two());
+    let block_mask = block_bytes - 1;
+    let misalignment = (ptr as usize) & block_mask;
+    if misalignment != 0 {
+        let prefix = (block_bytes - misalignment).min(size);
+        unsafe {
+            core::ptr::write_bytes(ptr, 0, prefix);
+            ptr = ptr.add(prefix);
+        }
+        size -= prefix;
+    }
+    while size >= block_bytes {
+        unsafe {
+            asm!("dc zva, {p}", p = in(reg) ptr, options(nostack, preserves_flags));
+            ptr = ptr.add(block_bytes);
+        }
+        size -= block_bytes;
+    }
+    if size > 0 {
+        unsafe {
+            core::ptr::write_bytes(ptr, 0, size);
+        }
+    }
+}
+
+/// Aarch64-specific zero-fill that consults the per-PE
+/// `dc_zva_block_bytes` cache and falls back to generic memset when
+/// DC ZVA is not available on the current PE.
+///
+/// # Safety
+///
+/// `ptr` must point to `size` writable bytes; the active processor
+/// must have completed `activate_processor_runtime` so the cached
+/// block size is published.
+pub(crate) unsafe fn aarch64_zero_memory(ptr: *mut u8, size: usize) {
+    let runtime = current_processor_runtime();
+    let block_bytes = runtime.dc_zva_block_bytes.load(Ordering::Relaxed) as usize;
+    if block_bytes == 0 {
+        unsafe {
+            core::ptr::write_bytes(ptr, 0, size);
+        }
+        return;
+    }
+    unsafe {
+        dc_zva_zero(ptr, size, block_bytes);
+    }
 }
 
 unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {

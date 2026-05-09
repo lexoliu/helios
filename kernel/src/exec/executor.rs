@@ -15,7 +15,7 @@ use helios_hal::watchdog::ProgressCounter;
 use spin::Once;
 use triomphe::Arc as NoWeakArc;
 
-use crate::sync::Notify;
+use crate::exec::sync::Notify;
 
 type ReadyQueue = ConcurrentQueue<Runnable>;
 pub type JoinHandle<T> = Task<T>;

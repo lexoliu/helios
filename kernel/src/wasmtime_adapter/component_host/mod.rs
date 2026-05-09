@@ -36,7 +36,7 @@ use wasmtime::component::{
 use wasmtime::{self, Engine, Store, StoreContextMut};
 use wasmtime_wasi_io;
 
-use crate::runtime_types::ComponentHostFilesystemState;
+use crate::runtime::ComponentHostFilesystemState;
 use crate::wasmtime_adapter::bindings::debugger::bindings as debugger_bindings;
 use crate::wasmtime_adapter::bindings::program::bindings as program_bindings;
 use crate::wasmtime_adapter::config::AotCompileHint;

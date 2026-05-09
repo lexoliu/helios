@@ -1,6 +1,6 @@
 use super::*;
 use crate::ProgramExecErrorDetail;
-use crate::descriptor_table::FreeDescriptorSlots;
+use crate::process::FreeDescriptorSlots;
 use crate::wasmtime_adapter::artifact_profile::{self, ArtifactProfileError};
 use crate::wasmtime_adapter::config::AotCompileHint;
 use crate::wasmtime_adapter::cwasm::{self, ArtifactTrustError, UntrustedCwasm};
