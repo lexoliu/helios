@@ -95,6 +95,12 @@ where
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct TcpStreamId(NonZeroU32);
 
+impl From<TcpStreamId> for u64 {
+    fn from(id: TcpStreamId) -> Self {
+        u64::from(id.0.get())
+    }
+}
+
 #[cfg(feature = "wasmtime-runtime")]
 impl crate::ComponentHostTcpStreamToken for TcpStreamId {
     fn into_raw(self) -> u64 {
@@ -113,6 +119,12 @@ impl crate::ComponentHostTcpStreamToken for TcpStreamId {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct TcpListenerId(NonZeroU32);
 
+impl From<TcpListenerId> for u64 {
+    fn from(id: TcpListenerId) -> Self {
+        u64::from(id.0.get())
+    }
+}
+
 #[cfg(feature = "wasmtime-runtime")]
 impl crate::ComponentHostTcpListenerToken for TcpListenerId {
     fn into_raw(self) -> u64 {
@@ -130,6 +142,12 @@ impl crate::ComponentHostTcpListenerToken for TcpListenerId {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct UdpSocketId(NonZeroU32);
+
+impl From<UdpSocketId> for u64 {
+    fn from(id: UdpSocketId) -> Self {
+        u64::from(id.0.get())
+    }
+}
 
 #[cfg(feature = "wasmtime-runtime")]
 impl crate::ComponentHostUdpSocketToken for UdpSocketId {
@@ -243,6 +261,38 @@ impl NetworkShardSet {
     fn with_mut<R>(&self, f: impl FnOnce(&mut NetworkShard) -> R) -> R {
         let mut state = self.shard_for_default().lock();
         f(&mut state)
+    }
+
+    /// Locks the shard owning `handle` and runs the closure against
+    /// it under `&mut`. Used by every op that takes a socket /
+    /// listener handle so the dispatch decision stays in
+    /// `shard_for_handle`. Mutable form is the universal one because
+    /// every socket op the caller might run (read drains the socket
+    /// receive queue, write enqueues, close removes the slab entry,
+    /// etc.) needs interior mutation; a read-only sibling would only
+    /// be useful for diagnostic peeks the kernel does not currently
+    /// expose.
+    fn with_handle<H: Into<u64>, R>(
+        &self,
+        handle: H,
+        f: impl FnOnce(&mut NetworkShard) -> R,
+    ) -> R {
+        let mut state = self.shard_for_handle(handle).lock();
+        f(&mut state)
+    }
+
+    /// Iterates every shard in the set, calling `f` once per shard
+    /// under its own lock. Used by control-plane ops that target the
+    /// whole stack — clearing routes, listing IPv4 addresses, the
+    /// upcoming control task pushing DNS results to all shards, etc.
+    fn for_each<F>(&self, mut f: F)
+    where
+        F: FnMut(&mut NetworkShard),
+    {
+        for shard in &self.shards {
+            let mut guard = shard.inner.lock();
+            f(&mut guard);
+        }
     }
 }
 
@@ -856,7 +906,7 @@ where
     }
 
     pub async fn tcp_close(&self, stream: TcpStreamId) {
-        self.inner.state.with_mut(|state| {
+        self.inner.state.with_handle(stream, |state| {
             state.remove_tcp_stream(stream);
         });
     }
@@ -934,7 +984,7 @@ where
     }
 
     pub async fn udp_close(&self, socket: UdpSocketId) {
-        self.inner.state.with_mut(|state| {
+        self.inner.state.with_handle(socket, |state| {
             state.remove_udp_socket(socket);
         });
     }
@@ -2382,9 +2432,18 @@ where
         address: KernelIpv4Cidr,
     ) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
-        self.inner
-            .state
-            .with_mut(|state| state.add_ipv4_address(address))
+        // Broadcast: each shard maintains its own ARP / route table
+        // off the RX traffic it observes, so the admin-installed
+        // address must reach every shard.
+        let mut result = Ok(());
+        self.inner.state.for_each(|state| {
+            if result.is_ok() {
+                if let Err(error) = state.add_ipv4_address(address) {
+                    result = Err(error);
+                }
+            }
+        });
+        result
     }
 
     async fn remove_address(
@@ -2393,7 +2452,7 @@ where
         address: KernelIpv4Cidr,
     ) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
-        self.inner.state.with_mut(|state| {
+        self.inner.state.for_each(|state| {
             state.remove_ipv4_address(address);
         });
         Ok(())
@@ -2403,7 +2462,7 @@ where
         require_local_network_port(port)?;
         self.inner
             .state
-            .with_mut(NetworkShard::clear_ipv4_addresses);
+            .for_each(NetworkShard::clear_ipv4_addresses);
         Ok(())
     }
 
@@ -2426,9 +2485,15 @@ where
         gateway: KernelIpv4Address,
     ) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
-        self.inner
-            .state
-            .with_mut(|state| state.set_default_ipv4_gateway(gateway))
+        let mut result = Ok(());
+        self.inner.state.for_each(|state| {
+            if result.is_ok() {
+                if let Err(error) = state.set_default_ipv4_gateway(gateway) {
+                    result = Err(error);
+                }
+            }
+        });
+        result
     }
 
     async fn add_route(
@@ -2437,9 +2502,15 @@ where
         route: KernelIpv4Route,
     ) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
-        self.inner
-            .state
-            .with_mut(|state| state.add_ipv4_route(route))
+        let mut result = Ok(());
+        self.inner.state.for_each(|state| {
+            if result.is_ok() {
+                if let Err(error) = state.add_ipv4_route(route) {
+                    result = Err(error);
+                }
+            }
+        });
+        result
     }
 
     async fn remove_route(
@@ -2448,7 +2519,7 @@ where
         route: KernelIpv4Route,
     ) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
-        self.inner.state.with_mut(|state| {
+        self.inner.state.for_each(|state| {
             state.remove_ipv4_route(route);
         });
         Ok(())
@@ -2456,7 +2527,7 @@ where
 
     async fn clear_routes(&self, port: NetworkPortId) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
-        self.inner.state.with_mut(NetworkShard::clear_ipv4_routes);
+        self.inner.state.for_each(NetworkShard::clear_ipv4_routes);
         Ok(())
     }
 
