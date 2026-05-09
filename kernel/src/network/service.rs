@@ -304,6 +304,21 @@ impl NetworkShardSet {
         &self.shards[idx].inner
     }
 
+    /// Picks the shard that should receive a new socket created on
+    /// the given processor. Future RX traffic for the socket's
+    /// stride-allocated ephemeral port will demux back to this
+    /// shard, so creation must place the slab entry here. Falls
+    /// back to shard 0 for processor ids out of the configured
+    /// range.
+    #[inline]
+    fn shard_for_processor(
+        &self,
+        processor: helios_hal::cpu::ProcessorId,
+    ) -> &SpinMutex<NetworkShard> {
+        let idx = (processor.id() as usize) % self.shards.len();
+        &self.shards[idx].inner
+    }
+
     fn with<R>(&self, f: impl FnOnce(&NetworkShard) -> R) -> R {
         let state = self.shard_for_default().lock();
         f(&state)
@@ -329,6 +344,29 @@ impl NetworkShardSet {
         f: impl FnOnce(&mut NetworkShard) -> R,
     ) -> R {
         let mut state = self.shard_for_handle(handle).lock();
+        f(&mut state)
+    }
+
+    /// Locks the shard owning the given processor and runs the
+    /// closure against it. Used by socket-creation paths so the
+    /// new socket lives on the processor that minted it; ephemeral
+    /// ports allocated under the stride scheme will demux back to
+    /// this shard for incoming traffic.
+    fn with_processor<R>(
+        &self,
+        processor: helios_hal::cpu::ProcessorId,
+        f: impl FnOnce(&mut NetworkShard) -> R,
+    ) -> R {
+        let mut state = self.shard_for_processor(processor).lock();
+        f(&mut state)
+    }
+
+    /// Locks the shard owning a fixed local port (server listener,
+    /// explicit UDP bind). Maps via `shard_idx_for_port` so RX
+    /// demux for the same port reaches the same shard.
+    fn with_local_port<R>(&self, port: u16, f: impl FnOnce(&mut NetworkShard) -> R) -> R {
+        let idx = shard_idx_for_port(Some(port), self.shards.len());
+        let mut state = self.shards[idx].inner.lock();
         f(&mut state)
     }
 
@@ -1127,35 +1165,41 @@ where
         if matches!(destination, IpAddress::Ipv4(_)) {
             self.wait_for_ipv4_tcp(deadline_nanos).await?;
         }
+        // Outgoing connect lands on the current processor's shard so
+        // its ephemeral source port (allocated under the stride
+        // scheme) demuxes RX traffic back here on every reply.
+        let processor = self.inner.cpu.current_processor();
         let stream = self
             .inner
             .state
-            .with_mut(|state| state.start_tcp_connect(destination, port, local_port))?;
+            .with_processor(processor, |state| {
+                state.start_tcp_connect(destination, port, local_port)
+            })?;
 
         loop {
             self.drive_tcp().await?;
             let now_nanos = self.now_nanos();
-            let poll_connect =
-                self.inner
-                    .state
-                    .with_mut(|state| match state.poll_tcp_connect(stream) {
-                        Ok(TcpConnectProgress::Connected) => Ok(TcpConnectProgress::Connected),
-                        Ok(TcpConnectProgress::Pending) => {
-                            if now_nanos >= deadline_nanos {
-                                state.remove_tcp_stream(stream);
-                                Err(TcpError {
-                                    kind: TcpErrorKind::Timeout,
-                                    detail: NetworkErrorDetail::TcpConnectTimeout,
-                                })
-                            } else {
-                                Ok(TcpConnectProgress::Pending)
-                            }
-                        }
-                        Err(error) => {
+            let poll_connect = self
+                .inner
+                .state
+                .with_handle(stream, |state| match state.poll_tcp_connect(stream) {
+                    Ok(TcpConnectProgress::Connected) => Ok(TcpConnectProgress::Connected),
+                    Ok(TcpConnectProgress::Pending) => {
+                        if now_nanos >= deadline_nanos {
                             state.remove_tcp_stream(stream);
-                            Err(error)
+                            Err(TcpError {
+                                kind: TcpErrorKind::Timeout,
+                                detail: NetworkErrorDetail::TcpConnectTimeout,
+                            })
+                        } else {
+                            Ok(TcpConnectProgress::Pending)
                         }
-                    })?;
+                    }
+                    Err(error) => {
+                        state.remove_tcp_stream(stream);
+                        Err(error)
+                    }
+                })?;
             if matches!(poll_connect, TcpConnectProgress::Connected) {
                 return Ok(stream);
             }
@@ -1169,9 +1213,13 @@ where
         local_port: u16,
         _backlog: u16,
     ) -> Result<TcpListener<TcpListenerId>, TcpError> {
+        // Listener lives on the shard that owns its local port: a
+        // well-known port (< EPHEMERAL_PORT_START) goes to shard 0,
+        // an explicit ephemeral port stride-maps to its owner. RX
+        // demux for the same port routes back here.
         self.inner
             .state
-            .with_mut(|state| state.start_tcp_listen(local_address, local_port))
+            .with_local_port(local_port, |state| state.start_tcp_listen(local_address, local_port))
     }
 
     async fn execute_tcp_accept(
@@ -1340,9 +1388,21 @@ where
     }
 
     async fn execute_udp_bind(&self, local_port: u16) -> Result<UdpBinding<UdpSocketId>, UdpError> {
-        self.inner
-            .state
-            .with_mut(|state| state.start_udp_bind(local_port))
+        // local_port == 0 means "allocate ephemeral"; the binding
+        // should live on the current processor's shard so its
+        // freshly stride-allocated port demuxes RX traffic back
+        // here. A non-zero `local_port` is fixed by the caller, so
+        // route by the port's stride owner instead.
+        if local_port == 0 {
+            let processor = self.inner.cpu.current_processor();
+            self.inner
+                .state
+                .with_processor(processor, |state| state.start_udp_bind(local_port))
+        } else {
+            self.inner
+                .state
+                .with_local_port(local_port, |state| state.start_udp_bind(local_port))
+        }
     }
 
     async fn execute_udp_send(
@@ -2617,12 +2677,13 @@ impl NetworkShard {
             shard_idx < shard_count,
             "shard idx {shard_idx} out of range for {shard_count} shards"
         );
+        let initial_ephemeral = EPHEMERAL_PORT_START + shard_idx as u16;
         Self {
             stack: Stack::new(StackConfig::new(mac, max_frame_len).with_rx_budget(rx_poll_budget)),
             shard_idx,
             shard_count,
-            next_tcp_local_port: EPHEMERAL_PORT_START,
-            next_udp_local_port: EPHEMERAL_PORT_START,
+            next_tcp_local_port: initial_ephemeral,
+            next_udp_local_port: initial_ephemeral,
             tcp_streams: HandleSlab::new(),
             tcp_listeners: HandleSlab::new(),
             udp_sockets: HandleSlab::new(),
@@ -3159,14 +3220,9 @@ impl NetworkShard {
     }
 
     fn allocate_tcp_local_port(&mut self) -> Result<u16, TcpError> {
-        let attempts = usize::from(EPHEMERAL_PORT_END - EPHEMERAL_PORT_START) + 1;
-        for _ in 0..attempts {
+        for _ in 0..self.ephemeral_port_attempts() {
             let candidate = self.next_tcp_local_port;
-            self.next_tcp_local_port = if self.next_tcp_local_port == EPHEMERAL_PORT_END {
-                EPHEMERAL_PORT_START
-            } else {
-                self.next_tcp_local_port + 1
-            };
+            self.next_tcp_local_port = self.advance_ephemeral_port(self.next_tcp_local_port);
             if self.is_tcp_local_port_free(candidate) {
                 return Ok(candidate);
             }
@@ -3178,14 +3234,9 @@ impl NetworkShard {
     }
 
     fn allocate_udp_local_port(&mut self) -> Result<u16, UdpError> {
-        let attempts = usize::from(EPHEMERAL_PORT_END - EPHEMERAL_PORT_START) + 1;
-        for _ in 0..attempts {
+        for _ in 0..self.ephemeral_port_attempts() {
             let candidate = self.next_udp_local_port;
-            self.next_udp_local_port = if self.next_udp_local_port == EPHEMERAL_PORT_END {
-                EPHEMERAL_PORT_START
-            } else {
-                self.next_udp_local_port + 1
-            };
+            self.next_udp_local_port = self.advance_ephemeral_port(self.next_udp_local_port);
             if self.is_udp_local_port_free(candidate) {
                 return Ok(candidate);
             }
@@ -3194,6 +3245,29 @@ impl NetworkShard {
             kind: UdpErrorKind::Unavailable,
             detail: NetworkErrorDetail::UdpNoEphemeralPorts,
         })
+    }
+
+    /// Number of ephemeral ports owned by this shard under the
+    /// stride-allocation scheme. Equal to the total ephemeral
+    /// range divided by the shard count, rounded up.
+    fn ephemeral_port_attempts(&self) -> usize {
+        let total = usize::from(EPHEMERAL_PORT_END - EPHEMERAL_PORT_START) + 1;
+        total.div_ceil(self.shard_count)
+    }
+
+    /// Advances the rolling allocator pointer by `shard_count`,
+    /// wrapping back to the shard's first ephemeral port when we
+    /// step past `EPHEMERAL_PORT_END`. The result is always a port
+    /// that satisfies `(port - EPHEMERAL_PORT_START) % shard_count
+    /// == shard_idx`, matching `shard_idx_for_port` so RX demux
+    /// routes back to this shard.
+    fn advance_ephemeral_port(&self, current: u16) -> u16 {
+        let stride = self.shard_count as u16;
+        let next = current.checked_add(stride);
+        match next {
+            Some(value) if value <= EPHEMERAL_PORT_END => value,
+            _ => EPHEMERAL_PORT_START + self.shard_idx as u16,
+        }
     }
 
     fn is_tcp_local_port_free(&self, port: u16) -> bool {
