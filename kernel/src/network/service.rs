@@ -1584,11 +1584,16 @@ where
             .await
             .map_err(NetworkConfigurationError::Device)?;
         let now = StackInstant::from_nanos(self.now_nanos());
-        let configured = self.inner.state.with_mut(|state| {
+        // DHCP runs on the shard that owns DHCP_CLIENT_PORT (68);
+        // since 68 < EPHEMERAL_PORT_START it always routes to
+        // shard 0, which is where DHCP responses also demux back.
+        // A future control-task PR will broadcast the lease to
+        // every shard so each Stack picks up the assigned IP.
+        let configured = self.inner.state.with_local_port(DHCP_CLIENT_PORT, |state| {
             state
                 .drive_dhcp(now)
                 .map_err(NetworkConfigurationError::Control)?;
-            Ok(state.is_configured())
+            Ok::<bool, NetworkConfigurationError>(state.is_configured())
         })?;
         self.drive_network(NetworkPollSource::Configuration)
             .await
@@ -1942,22 +1947,25 @@ where
 
         let tcp_started = self.profile_start();
         let now = StackInstant::from_nanos(self.now_nanos());
-        let mut tcp_finished = None;
         let mut tcp_read = None;
         let mut tcp_read_started = None;
         let mut tcp_read_finished = None;
-        self.inner.state.with_mut(|state| {
+        // Each shard owns its own TCP connections, so the timer
+        // drive must hit every shard's Stack.
+        self.inner.state.for_each(|state| {
             state
                 .stack
                 .drive_tcp(now)
                 .unwrap_or_else(|error| tracing::debug!(?error, "failed to drive TCP control"));
-            tcp_finished = self.profile_start();
-            if let Some(probe) = tcp_read_probe {
-                tcp_read_started = self.profile_start();
-                tcp_read = Some(state.poll_tcp_read(probe.stream, probe.max_bytes, now));
-                tcp_read_finished = self.profile_start();
-            }
         });
+        let tcp_finished = self.profile_start();
+        if let Some(probe) = tcp_read_probe {
+            tcp_read_started = self.profile_start();
+            tcp_read = Some(self.inner.state.with_handle(probe.stream, |state| {
+                state.poll_tcp_read(probe.stream, probe.max_bytes, now)
+            }));
+            tcp_read_finished = self.profile_start();
+        }
         self.record_network_profile_between(source.tcp_drive_phase(), tcp_started, tcp_finished);
         if let (Some(probe), Some(Ok(read))) = (tcp_read_probe, tcp_read.as_ref()) {
             self.record_tcp_read_progress_between(
@@ -2047,16 +2055,28 @@ where
             }
 
             let mut frames = smallvec::SmallVec::<[PacketBuffer; NETWORK_TX_BATCH_FRAMES]>::new();
+            // Track each frame's origin shard so a `RingFull`
+            // push-back below can return the frame to the same
+            // Stack that produced it. With per-shard Stacks every
+            // shard maintains its own outbound queue.
+            let mut frame_shards =
+                smallvec::SmallVec::<[usize; NETWORK_TX_BATCH_FRAMES]>::new();
             let collect_started = self.profile_start();
-            self.inner.state.with_mut(|state| {
-                let remaining_budget = budget.tx_frames - transmitted;
-                while frames.len() < NETWORK_TX_BATCH_FRAMES && frames.len() < remaining_budget {
+            let remaining_budget = budget.tx_frames - transmitted;
+            let collect_limit = NETWORK_TX_BATCH_FRAMES.min(remaining_budget);
+            'collect: for shard_idx in 0..self.inner.state.shard_count() {
+                let mut state = self.inner.state.shard_at(shard_idx).lock();
+                while frames.len() < collect_limit {
                     let Some(frame) = state.stack.take_outbound() else {
                         break;
                     };
                     frames.push(frame);
+                    frame_shards.push(shard_idx);
+                    if frames.len() >= collect_limit {
+                        break 'collect;
+                    }
                 }
-            });
+            }
             if frames.is_empty() {
                 break;
             }
@@ -2086,14 +2106,20 @@ where
             transmitted_bytes = transmitted_bytes.saturating_add(submitted_bytes);
             if submitted < frames.len() {
                 transmit_stop = NetworkTransmitStop::RingFull;
-                self.inner.state.with_mut(|state| {
-                    while frames.len() > submitted {
-                        let frame = frames
-                            .pop()
-                            .expect("TX restore lost an unsubmitted outbound frame");
-                        state.stack.push_outbound_front(frame);
-                    }
-                });
+                while frames.len() > submitted {
+                    let frame = frames
+                        .pop()
+                        .expect("TX restore lost an unsubmitted outbound frame");
+                    let shard_idx = frame_shards
+                        .pop()
+                        .expect("TX restore lost shard origin for an outbound frame");
+                    self.inner
+                        .state
+                        .shard_at(shard_idx)
+                        .lock()
+                        .stack
+                        .push_outbound_front(frame);
+                }
                 break;
             }
         }
