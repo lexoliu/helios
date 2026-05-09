@@ -199,25 +199,23 @@ impl NetworkShardSet {
         }
     }
 
-    #[allow(dead_code)]
     fn shard_count(&self) -> usize {
         self.shards.len()
     }
 
-    /// Picks the shard responsible for an operation. Until the
-    /// socket-id -> shard hashing lands all callers route to
-    /// shard 0; the helper exists so the future hash stays
-    /// localised here.
+    /// Picks the shard responsible for an unqualified operation
+    /// (control-plane queries, admin commands that target every
+    /// shard, etc.). Implemented in terms of `shard_for_handle(0)`
+    /// so the routing rule lives in exactly one place.
     #[inline]
     fn shard_for_default(&self) -> &SpinMutex<NetworkShard> {
-        &self.shards[0].inner
+        self.shard_for_handle(0u64)
     }
 
-    /// Picks the shard owning a given socket / connection. Hashing
-    /// happens here so the rest of the file does not have to know
-    /// about the layout. Currently reserved for the upcoming
-    /// per-handle dispatch — kept here to lock down the API shape.
-    #[allow(dead_code)]
+    /// Picks the shard owning a given socket / connection handle.
+    /// The hash is `handle mod shard_count`; every callsite that
+    /// already has a stream / listener / socket id routes here so
+    /// the per-handle dispatch stays in one helper.
     #[inline]
     fn shard_for_handle<H: Into<u64>>(&self, handle: H) -> &SpinMutex<NetworkShard> {
         let handle: u64 = handle.into();
@@ -725,6 +723,14 @@ where
                 device,
             }),
         }
+    }
+
+    /// Returns the number of `NetworkShard` instances backing this
+    /// service. Equal to `Cpu::processor_count()` at construction.
+    /// Surfaced for diagnostics, perf bench dispatch, and the
+    /// inspector statistics path.
+    pub fn shard_count(&self) -> usize {
+        self.inner.state.shard_count()
     }
 
     pub async fn ping(&self, host: &str, timeout_nanos: u64) -> Result<PingReply, PingError> {
