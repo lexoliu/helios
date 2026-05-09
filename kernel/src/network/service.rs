@@ -179,21 +179,50 @@ struct NetworkShardSet {
 }
 
 impl NetworkShardSet {
-    fn new(state: NetworkShard) -> Self {
+    /// Builds a shard set sized to `shard_count`. Each shard owns
+    /// an independent `NetworkShard`, produced by `factory(i)` so
+    /// the ctor can stagger per-shard fields (port allocator base,
+    /// DHCP transaction id) across the set.
+    fn new<F>(shard_count: usize, mut factory: F) -> Self
+    where
+        F: FnMut(usize) -> NetworkShard,
+    {
+        assert!(shard_count != 0, "network shard count must be non-zero");
+        let mut shards: Vec<PaddedShard> = Vec::with_capacity(shard_count);
+        for index in 0..shard_count {
+            shards.push(PaddedShard {
+                inner: SpinMutex::new(factory(index)),
+            });
+        }
         Self {
-            shards: alloc::vec![PaddedShard {
-                inner: SpinMutex::new(state),
-            }]
-            .into_boxed_slice(),
+            shards: shards.into_boxed_slice(),
         }
     }
 
+    #[allow(dead_code)]
+    fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
     /// Picks the shard responsible for an operation. Until the
-    /// per-CPU sharding lands all callers route to shard 0; the
-    /// helper exists so future hashing stays localised here.
+    /// socket-id -> shard hashing lands all callers route to
+    /// shard 0; the helper exists so the future hash stays
+    /// localised here.
     #[inline]
     fn shard_for_default(&self) -> &SpinMutex<NetworkShard> {
         &self.shards[0].inner
+    }
+
+    /// Picks the shard owning a given socket / connection. Hashing
+    /// happens here so the rest of the file does not have to know
+    /// about the layout. Currently reserved for the upcoming
+    /// per-handle dispatch — kept here to lock down the API shape.
+    #[allow(dead_code)]
+    #[inline]
+    fn shard_for_handle<H: Into<u64>>(&self, handle: H) -> &SpinMutex<NetworkShard> {
+        let handle: u64 = handle.into();
+        let idx = (handle as usize) % self.shards.len();
+        &self.shards[idx].inner
     }
 
     fn with<R>(&self, f: impl FnOnce(&NetworkShard) -> R) -> R {
@@ -664,14 +693,33 @@ where
         let tx_completion_budget = capabilities.events.tx_completion_budget;
         let mac = device.mac_address();
         let max_frame_len = device.max_frame_len();
-        let shard = NetworkShard::new(mac, max_frame_len, rx_poll_budget, transaction_id);
-        let stack_rx_budget = shard.stack.config().rx_budget;
+        // One NetworkShard per processor. Each shard owns an
+        // independent Stack, socket slabs, DHCP/DNS state, and port
+        // allocator. Routes / ARP / neighbour entries are still
+        // per-shard (each Stack maintains its own caches off the
+        // RX path it observes); cross-shard route / DNS broadcasts
+        // are a follow-up. The `transaction_id` is staggered per
+        // shard so DHCP DISCOVER messages from different shards do
+        // not race over the same XID.
+        let shard_count = cpu.processor_count().max(1);
+        // We probe the configured rx_budget once via a throwaway
+        // Stack — every shard's Stack uses the same StackConfig so
+        // the value is identical across shards.
+        let stack_rx_budget = Stack::new(
+            StackConfig::new(mac, max_frame_len).with_rx_budget(rx_poll_budget),
+        )
+        .config()
+        .rx_budget;
+        let state = NetworkShardSet::new(shard_count, |index| {
+            let staggered_xid = transaction_id.wrapping_add(index as u32);
+            NetworkShard::new(mac, max_frame_len, rx_poll_budget, staggered_xid)
+        });
         Self {
             inner: Arc::new(NetworkServiceInner {
                 cpu,
                 runtime_state,
                 timer,
-                state: NetworkShardSet::new(shard),
+                state,
                 poll: NetworkPollState::new(rx_poll_budget, tx_completion_budget, rx_poll_budget),
                 stack_rx_budget,
                 device,
