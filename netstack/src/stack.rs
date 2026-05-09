@@ -1017,11 +1017,37 @@ where
         frame: &[u8],
         now: StackInstant,
     ) -> Result<bool, StackError> {
-        let frame = EthernetFrame::parse(frame).ok_or(StackError::MalformedPacket)?;
-        match frame.protocol {
-            EthernetProtocol::Ipv4 => self.receive_ipv4(frame.payload, now),
-            EthernetProtocol::Ipv6 => self.receive_ipv6(frame.source, frame.payload, now),
-            EthernetProtocol::Arp => self.receive_arp(frame.source, frame.payload, now),
+        // Wrap the borrowed frame in an owning Bytes so segment
+        // payloads further down can be passed as owning Bytes
+        // without a per-segment copy. With the upcoming virtio
+        // zero-copy pool the kernel will already hand us an
+        // owning Bytes; this helper keeps the legacy &[u8] entry
+        // working by paying one copy at the boundary.
+        let frame_bytes = Bytes::copy_from_slice(frame);
+        self.receive_frame_bytes_with_backpressure(frame_bytes, now)
+    }
+
+    /// Bytes-aware receive entry. Takes ownership of the frame so
+    /// segment payloads can be sliced (zero-copy) into TCP receive
+    /// queues. Callers that already hold an owning `Bytes` (a
+    /// virtio zero-copy descriptor handle) should use this directly
+    /// instead of going through the `&[u8]` shim.
+    pub fn receive_frame_bytes_with_backpressure(
+        &mut self,
+        frame: Bytes,
+        now: StackInstant,
+    ) -> Result<bool, StackError> {
+        let parsed = EthernetFrame::parse(frame.as_ref()).ok_or(StackError::MalformedPacket)?;
+        // We need both the owning Bytes (for slicing payloads to
+        // owning Bytes downstream) and the borrowed view (for
+        // parser dispatch). Keep the same `frame` value alive for
+        // the duration of the call.
+        let payload_range = bytes_subrange(frame.as_ref(), parsed.payload);
+        let payload_bytes = frame.slice(payload_range.clone());
+        match parsed.protocol {
+            EthernetProtocol::Ipv4 => self.receive_ipv4(&payload_bytes, now),
+            EthernetProtocol::Ipv6 => self.receive_ipv6(parsed.source, &payload_bytes, now),
+            EthernetProtocol::Arp => self.receive_arp(parsed.source, parsed.payload, now),
         }
     }
 
@@ -1757,20 +1783,21 @@ where
         Ok(false)
     }
 
-    fn receive_ipv4(&mut self, bytes: &[u8], now: StackInstant) -> Result<bool, StackError> {
-        let packet = Ipv4Packet::parse(bytes).ok_or(StackError::MalformedPacket)?;
+    fn receive_ipv4(&mut self, frame: &Bytes, now: StackInstant) -> Result<bool, StackError> {
+        let packet = Ipv4Packet::parse(frame.as_ref()).ok_or(StackError::MalformedPacket)?;
+        let payload_bytes = frame.slice(bytes_subrange(frame.as_ref(), packet.payload));
         match packet.protocol {
             crate::IpProtocol::Tcp => self.receive_tcp(
                 IpAddress::Ipv4(packet.source),
                 IpAddress::Ipv4(packet.destination),
-                packet.payload,
+                &payload_bytes,
                 now,
             ),
             crate::IpProtocol::Udp => {
                 self.receive_udp(
                     IpAddress::Ipv4(packet.source),
                     IpAddress::Ipv4(packet.destination),
-                    packet.payload,
+                    payload_bytes.as_ref(),
                 )?;
                 Ok(false)
             }
@@ -1781,10 +1808,10 @@ where
     fn receive_ipv6(
         &mut self,
         source_mac: EthernetAddress,
-        bytes: &[u8],
+        frame: &Bytes,
         now: StackInstant,
     ) -> Result<bool, StackError> {
-        let packet = Ipv6Packet::parse(bytes).ok_or(StackError::MalformedPacket)?;
+        let packet = Ipv6Packet::parse(frame.as_ref()).ok_or(StackError::MalformedPacket)?;
         if !packet.source.is_unspecified() {
             self.learn_neighbor(NeighborEntry {
                 ip: IpAddress::Ipv6(packet.source),
@@ -1793,18 +1820,19 @@ where
                 updated_at: now,
             });
         }
+        let payload_bytes = frame.slice(bytes_subrange(frame.as_ref(), packet.payload));
         match packet.next_header {
             crate::IpProtocol::Tcp => self.receive_tcp(
                 IpAddress::Ipv6(packet.source),
                 IpAddress::Ipv6(packet.destination),
-                packet.payload,
+                &payload_bytes,
                 now,
             ),
             crate::IpProtocol::Udp => {
                 self.receive_udp(
                     IpAddress::Ipv6(packet.source),
                     IpAddress::Ipv6(packet.destination),
-                    packet.payload,
+                    payload_bytes.as_ref(),
                 )?;
                 Ok(false)
             }
@@ -2014,10 +2042,15 @@ where
         &mut self,
         source: IpAddress,
         destination: IpAddress,
-        bytes: &[u8],
+        bytes: &Bytes,
         now: StackInstant,
     ) -> Result<bool, StackError> {
-        let packet = crate::TcpPacket::parse(bytes).ok_or(StackError::MalformedPacket)?;
+        let packet = crate::TcpPacket::parse(bytes.as_ref()).ok_or(StackError::MalformedPacket)?;
+        // Slice an owning Bytes for the TCP payload so the receive
+        // queue downstream can retain ownership without per-segment
+        // copy. `slice_ref` reuses the parent buffer without
+        // allocating.
+        let payload_bytes = bytes.slice_ref(packet.payload);
         let local_endpoint = TcpEndpoint {
             address: destination,
             port: packet.destination_port,
@@ -2033,7 +2066,7 @@ where
                     .get_mut(index)
                     .expect("TCP endpoint index referenced a missing socket");
                 let previous_state = socket.state();
-                let outcome = socket.on_segment(packet, now.nanos());
+                let outcome = socket.on_segment(packet, payload_bytes, now.nanos());
                 (
                     previous_state,
                     socket.state(),
@@ -2361,6 +2394,27 @@ fn encode_tcp_ipv6_frame(
     .ok_or(StackError::OutputQueueFull)?;
     frame.set_len(offset);
     Ok(())
+}
+
+/// Returns the `start..end` byte range of `subset` within `parent`.
+/// Used to convert a borrowed slice that the parser produced into
+/// an owning `Bytes::slice` view of the parent buffer.
+///
+/// Panics if `subset` is not a sub-slice of `parent`. Callers
+/// always derive `subset` from `parent` via parsing helpers, so
+/// this is a programming-error check rather than a runtime
+/// validation.
+fn bytes_subrange(parent: &[u8], subset: &[u8]) -> core::ops::Range<usize> {
+    let parent_start = parent.as_ptr() as usize;
+    let parent_end = parent_start + parent.len();
+    let subset_start = subset.as_ptr() as usize;
+    let subset_end = subset_start + subset.len();
+    assert!(
+        subset_start >= parent_start && subset_end <= parent_end,
+        "bytes_subrange: subset is not within parent"
+    );
+    let start = subset_start - parent_start;
+    start..start + subset.len()
 }
 
 fn socket_id(index: usize) -> SocketId {
@@ -2732,7 +2786,7 @@ mod tests {
             .receive_tcp(
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
-                &syn[..syn_len],
+                &Bytes::copy_from_slice(&syn[..syn_len]),
                 StackInstant::from_nanos(1),
             )
             .expect("SYN should be accepted by listener");
@@ -2772,7 +2826,7 @@ mod tests {
             .receive_tcp(
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
-                &ack[..ack_len],
+                &Bytes::copy_from_slice(&ack[..ack_len]),
                 StackInstant::from_nanos(2),
             )
             .expect("final ACK should establish accepted socket");
@@ -2821,7 +2875,7 @@ mod tests {
             .receive_tcp(
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
-                &syn[..syn_len],
+                &Bytes::copy_from_slice(&syn[..syn_len]),
                 StackInstant::from_nanos(1),
             )
             .expect("SYN should be accepted by exact listener");
@@ -2870,7 +2924,7 @@ mod tests {
             .receive_tcp(
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
-                &syn_ack[..syn_ack_len],
+                &Bytes::copy_from_slice(&syn_ack[..syn_ack_len]),
                 StackInstant::from_nanos(1),
             )
             .expect("SYN-ACK should establish the socket");
@@ -2892,7 +2946,7 @@ mod tests {
             .receive_tcp(
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
-                &data_fin[..data_fin_len],
+                &Bytes::copy_from_slice(&data_fin[..data_fin_len]),
                 StackInstant::from_nanos(2),
             )
             .expect("data FIN should be accepted");
@@ -2943,7 +2997,7 @@ mod tests {
             .receive_tcp(
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
-                &syn_ack[..syn_ack_len],
+                &Bytes::copy_from_slice(&syn_ack[..syn_ack_len]),
                 StackInstant::from_nanos(1),
             )
             .expect("SYN-ACK should establish the socket");
@@ -2964,7 +3018,7 @@ mod tests {
             .receive_tcp(
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
-                &early_fin[..early_fin_len],
+                &Bytes::copy_from_slice(&early_fin[..early_fin_len]),
                 StackInstant::from_nanos(2),
             )
             .expect("out-of-order FIN should be tracked");
@@ -2992,7 +3046,7 @@ mod tests {
             .receive_tcp(
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
-                &payload[..payload_len],
+                &Bytes::copy_from_slice(&payload[..payload_len]),
                 StackInstant::from_nanos(4),
             )
             .expect("missing payload should complete before FIN");
@@ -3049,7 +3103,7 @@ mod tests {
             .receive_tcp(
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
-                &syn_ack[..syn_ack_len],
+                &Bytes::copy_from_slice(&syn_ack[..syn_ack_len]),
                 StackInstant::from_nanos(1),
             )
             .expect("SYN-ACK should establish the socket");
@@ -3070,7 +3124,7 @@ mod tests {
             .receive_tcp(
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
-                &request[..request_len],
+                &Bytes::copy_from_slice(&request[..request_len]),
                 StackInstant::from_nanos(2),
             )
             .expect("payload should request an ACK");
@@ -3127,7 +3181,7 @@ mod tests {
             .receive_tcp(
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
-                &syn_ack[..syn_ack_len],
+                &Bytes::copy_from_slice(&syn_ack[..syn_ack_len]),
                 StackInstant::from_nanos(1),
             )
             .expect("SYN-ACK should establish the socket");
@@ -3157,7 +3211,7 @@ mod tests {
             .receive_tcp(
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
-                &request[..request_len],
+                &Bytes::copy_from_slice(&request[..request_len]),
                 StackInstant::from_nanos(received_at),
             )
             .expect("payload should be accepted");
@@ -3222,7 +3276,7 @@ mod tests {
             .receive_tcp(
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
-                &syn_ack[..syn_ack_len],
+                &Bytes::copy_from_slice(&syn_ack[..syn_ack_len]),
                 StackInstant::from_nanos(1),
             )
             .expect("SYN-ACK should establish the socket");
@@ -3246,7 +3300,7 @@ mod tests {
                 .receive_tcp(
                     IpAddress::Ipv4(peer),
                     IpAddress::Ipv4(local),
-                    &segment[..segment_len],
+                    &Bytes::copy_from_slice(&segment[..segment_len]),
                     StackInstant::from_nanos(index as u64 + 2),
                 )
                 .expect("payload should be accepted");
