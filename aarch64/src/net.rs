@@ -73,6 +73,10 @@ impl NetworkDevice for VirtioNetworkDevice {
         self.inner.max_frame_len()
     }
 
+    fn queue_pair_count(&self) -> usize {
+        self.inner.queue_pair_count()
+    }
+
     fn capabilities(&self) -> InterfaceCapabilities {
         InterfaceCapabilities {
             max_frame_len: self.max_frame_len(),

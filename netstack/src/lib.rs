@@ -202,6 +202,16 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
     /// Returns the largest Ethernet frame the interface accepts.
     fn max_frame_len(&self) -> usize;
 
+    /// Returns the number of TX/RX queue pairs the device exposes.
+    /// Single-queue devices return 1; virtio-net with
+    /// `VIRTIO_NET_F_MQ` returns the negotiated pair count. The
+    /// kernel network service uses this to size its per-CPU
+    /// `NetworkShard` set and to dispatch TX submissions across
+    /// queues so per-CPU sends do not contend on the same ring.
+    fn queue_pair_count(&self) -> usize {
+        1
+    }
+
     /// Returns hardware capabilities used to select stack data paths.
     fn capabilities(&self) -> InterfaceCapabilities {
         InterfaceCapabilities {
