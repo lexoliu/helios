@@ -13,6 +13,7 @@ mod types;
 
 use core::future::Future;
 
+use bytes::Bytes;
 use helios_hal::io::IoResult;
 use thiserror::Error;
 
@@ -192,10 +193,6 @@ impl Default for PacketBuffer {
 
 /// Multi-core aware network interface contract used by packet stacks.
 pub trait NetworkInterface: Clone + Send + Sync + 'static {
-    type RxFrame<'a>: AsRef<[u8]> + Send + 'a
-    where
-        Self: 'a;
-
     /// Returns the hardware MAC address programmed for this interface.
     fn mac_address(&self) -> EthernetAddress;
 
@@ -226,14 +223,13 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
         buffer: &'a mut PacketBuffer,
     ) -> impl Future<Output = IoResult<bool>> + Send + 'a;
 
-    /// Attempts to receive one frame as a borrowed device buffer.
-    fn try_receive_frame(&self)
-    -> impl Future<Output = IoResult<Option<Self::RxFrame<'_>>>> + Send;
+    /// Attempts to receive one frame as an owning device buffer.
+    fn try_receive_frame(&self) -> impl Future<Output = IoResult<Option<Bytes>>> + Send;
 
-    /// Attempts to receive borrowed device buffers without waiting for any async lock or event.
+    /// Attempts to receive owning device buffers without waiting for any async lock or event.
     fn try_receive_frames_immediate<'a, 'slots>(
         &'a self,
-        frames: &'slots mut [Option<Self::RxFrame<'a>>],
+        frames: &'slots mut [Option<Bytes>],
     ) -> IoResult<Option<usize>>
     where
         'a: 'slots,
@@ -242,16 +238,16 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
         Ok(None)
     }
 
-    /// Returns a borrowed device RX frame to the interface receive queue.
+    /// Releases an owning device RX frame back to the interface.
     fn repost_rx_frame<'a>(
         &'a self,
-        frame: Self::RxFrame<'a>,
+        frame: Bytes,
     ) -> impl Future<Output = IoResult<()>> + Send + 'a;
 
-    /// Returns borrowed device RX frames without waiting for any async lock or event.
+    /// Releases owning device RX frames without waiting for any async lock or event.
     fn repost_rx_frames_immediate<'a, 'slots>(
         &'a self,
-        frames: &'slots mut [Option<Self::RxFrame<'a>>],
+        frames: &'slots mut [Option<Bytes>],
     ) -> IoResult<Option<()>>
     where
         'a: 'slots,

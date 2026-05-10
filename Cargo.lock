@@ -1796,6 +1796,7 @@ version = "0.1.0"
 dependencies = [
  "async-lock",
  "bitflags 2.11.0",
+ "bytes",
  "event-listener",
  "futures-lite",
  "helios-hal",

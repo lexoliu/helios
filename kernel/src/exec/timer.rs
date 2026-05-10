@@ -113,10 +113,7 @@ enum SleepRef {
     /// Pool-backed handle. The `shared` Arc keeps the pool alive
     /// for the lifetime of every clone of this handle; the slot is
     /// reclaimed once the last ref drops.
-    Pooled {
-        shared: Arc<TimerShared>,
-        idx: u32,
-    },
+    Pooled { shared: Arc<TimerShared>, idx: u32 },
     /// Fallback heap allocation used when the pool is exhausted.
     /// Preserves the original semantics so a busy server with more
     /// in-flight sleeps than the pool can hold still works.

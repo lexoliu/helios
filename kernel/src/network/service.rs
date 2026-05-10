@@ -16,8 +16,8 @@ use helios_netstack::{
     DhcpMessageType, DhcpPacket, DnsQuestionWriter, DnsResponse, EthernetFrame, EthernetProtocol,
     IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Packet,
     MAX_OUTBOUND_FRAMES, NetworkInterface as NetworkDevice, OutboundBatchStatus, PacketBuffer,
-    Route, Stack, StackConfig, StackError, StackInstant, TcpConnectState, TcpEndpoint,
-    TcpPacket, TcpReadState, UdpPacket, UdpPayload,
+    Route, Stack, StackConfig, StackError, StackInstant, TcpConnectState, TcpEndpoint, TcpPacket,
+    TcpReadState, UdpPacket, UdpPayload,
 };
 use spin::Mutex as SpinMutex;
 
@@ -338,11 +338,7 @@ impl NetworkShardSet {
     /// etc.) needs interior mutation; a read-only sibling would only
     /// be useful for diagnostic peeks the kernel does not currently
     /// expose.
-    fn with_handle<H: Into<u64>, R>(
-        &self,
-        handle: H,
-        f: impl FnOnce(&mut NetworkShard) -> R,
-    ) -> R {
+    fn with_handle<H: Into<u64>, R>(&self, handle: H, f: impl FnOnce(&mut NetworkShard) -> R) -> R {
         let mut state = self.shard_for_handle(handle).lock();
         f(&mut state)
     }
@@ -854,11 +850,10 @@ where
         // We probe the configured rx_budget once via a throwaway
         // Stack — every shard's Stack uses the same StackConfig so
         // the value is identical across shards.
-        let stack_rx_budget = Stack::new(
-            StackConfig::new(mac, max_frame_len).with_rx_budget(rx_poll_budget),
-        )
-        .config()
-        .rx_budget;
+        let stack_rx_budget =
+            Stack::new(StackConfig::new(mac, max_frame_len).with_rx_budget(rx_poll_budget))
+                .config()
+                .rx_budget;
         let state = NetworkShardSet::new(shard_count, |index| {
             let staggered_xid = transaction_id.wrapping_add(index as u32);
             NetworkShard::new(
@@ -1169,20 +1164,15 @@ where
         // its ephemeral source port (allocated under the stride
         // scheme) demuxes RX traffic back here on every reply.
         let processor = self.inner.cpu.current_processor();
-        let stream = self
-            .inner
-            .state
-            .with_processor(processor, |state| {
-                state.start_tcp_connect(destination, port, local_port)
-            })?;
+        let stream = self.inner.state.with_processor(processor, |state| {
+            state.start_tcp_connect(destination, port, local_port)
+        })?;
 
         loop {
             self.drive_tcp().await?;
             let now_nanos = self.now_nanos();
-            let poll_connect = self
-                .inner
-                .state
-                .with_handle(stream, |state| match state.poll_tcp_connect(stream) {
+            let poll_connect = self.inner.state.with_handle(stream, |state| {
+                match state.poll_tcp_connect(stream) {
                     Ok(TcpConnectProgress::Connected) => Ok(TcpConnectProgress::Connected),
                     Ok(TcpConnectProgress::Pending) => {
                         if now_nanos >= deadline_nanos {
@@ -1199,7 +1189,8 @@ where
                         state.remove_tcp_stream(stream);
                         Err(error)
                     }
-                })?;
+                }
+            })?;
             if matches!(poll_connect, TcpConnectProgress::Connected) {
                 return Ok(stream);
             }
@@ -1217,9 +1208,9 @@ where
         // well-known port (< EPHEMERAL_PORT_START) goes to shard 0,
         // an explicit ephemeral port stride-maps to its owner. RX
         // demux for the same port routes back here.
-        self.inner
-            .state
-            .with_local_port(local_port, |state| state.start_tcp_listen(local_address, local_port))
+        self.inner.state.with_local_port(local_port, |state| {
+            state.start_tcp_listen(local_address, local_port)
+        })
     }
 
     async fn execute_tcp_accept(
@@ -1589,12 +1580,15 @@ where
         // shard 0, which is where DHCP responses also demux back.
         // A future control-task PR will broadcast the lease to
         // every shard so each Stack picks up the assigned IP.
-        let configured = self.inner.state.with_local_port(DHCP_CLIENT_PORT, |state| {
-            state
-                .drive_dhcp(now)
-                .map_err(NetworkConfigurationError::Control)?;
-            Ok::<bool, NetworkConfigurationError>(state.is_configured())
-        })?;
+        let configured = self
+            .inner
+            .state
+            .with_local_port(DHCP_CLIENT_PORT, |state| {
+                state
+                    .drive_dhcp(now)
+                    .map_err(NetworkConfigurationError::Control)?;
+                Ok::<bool, NetworkConfigurationError>(state.is_configured())
+            })?;
         self.drive_network(NetworkPollSource::Configuration)
             .await
             .map_err(NetworkConfigurationError::Device)?;
@@ -1853,7 +1847,7 @@ where
             }
 
             let receive_limit = remaining_rx_budget.min(NETWORK_RX_BATCH_FRAMES);
-            let mut frames: [Option<DeviceImpl::RxFrame<'_>>; NETWORK_RX_BATCH_FRAMES] =
+            let mut frames: [Option<Bytes>; NETWORK_RX_BATCH_FRAMES] =
                 core::array::from_fn(|_| None);
             let received_batch = match self
                 .inner
@@ -1894,14 +1888,13 @@ where
                 if receive_backpressured {
                     break;
                 }
-                let frame_bytes = frame.as_ref();
-                let frame_len = frame_bytes.len();
-                let port = peek_local_port(frame_bytes);
+                let frame_len = frame.len();
+                let port = peek_local_port(frame.as_ref());
                 let shard_idx = shard_idx_for_port(port, shard_count);
                 let mut shard = self.inner.state.shard_at(shard_idx).lock();
                 match shard
                     .stack
-                    .receive_frame_with_backpressure(frame_bytes, received_at)
+                    .receive_frame_bytes_with_backpressure(frame.clone(), received_at)
                 {
                     Ok(backpressured) => {
                         received += 1;
@@ -1928,9 +1921,7 @@ where
                 .is_none()
             {
                 for frame in &mut frames[..received_batch] {
-                    if let Some(frame) = frame.take() {
-                        self.inner.device.repost_rx_frame(frame).await?;
-                    }
+                    drop(frame.take());
                 }
             }
 
@@ -2088,8 +2079,7 @@ where
                 if shard_frames.is_empty() {
                     continue;
                 }
-                let collected_bytes: usize =
-                    shard_frames.iter().map(|f| f.as_ref().len()).sum();
+                let collected_bytes: usize = shard_frames.iter().map(|f| f.as_ref().len()).sum();
                 total_collected += shard_frames.len();
                 total_collected_bytes += collected_bytes;
                 let submitted = self
@@ -3235,33 +3225,26 @@ impl NetworkShard {
 
     fn tcp_socket(&self, stream: TcpStreamId) -> Result<helios_netstack::SocketId, TcpError> {
         let slot = self.decode_handle_slot(stream.0.get());
-        self.tcp_streams
-            .get(slot)
-            .copied()
-            .ok_or_else(|| TcpError {
-                kind: TcpErrorKind::Unavailable,
-                detail: NetworkErrorDetail::UnknownTcpStream,
-            })
+        self.tcp_streams.get(slot).copied().ok_or_else(|| TcpError {
+            kind: TcpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UnknownTcpStream,
+        })
     }
 
     fn tcp_listener(&self, listener: TcpListenerId) -> Result<&TcpListenerState, TcpError> {
         let slot = self.decode_handle_slot(listener.0.get());
-        self.tcp_listeners
-            .get(slot)
-            .ok_or_else(|| TcpError {
-                kind: TcpErrorKind::Unavailable,
-                detail: NetworkErrorDetail::TcpListenerClosedUnexpectedly,
-            })
+        self.tcp_listeners.get(slot).ok_or_else(|| TcpError {
+            kind: TcpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::TcpListenerClosedUnexpectedly,
+        })
     }
 
     fn udp_socket(&self, socket: UdpSocketId) -> Result<&UdpSocketState, UdpError> {
         let slot = self.decode_handle_slot(socket.0.get());
-        self.udp_sockets
-            .get(slot)
-            .ok_or_else(|| UdpError {
-                kind: UdpErrorKind::Unavailable,
-                detail: NetworkErrorDetail::UnknownUdpSocket,
-            })
+        self.udp_sockets.get(slot).ok_or_else(|| UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UnknownUdpSocket,
+        })
     }
 
     fn allocate_tcp_local_port(&mut self) -> Result<u16, TcpError> {
@@ -3599,7 +3582,6 @@ fn parse_ipv6(input: &str) -> Option<Ipv6Address> {
         .ok()
         .map(|address| Ipv6Address::new(address.octets()))
 }
-
 
 fn usize_to_u64(value: usize, label: &'static str) -> u64 {
     u64::try_from(value).unwrap_or_else(|_| panic!("{label} does not fit into u64"))

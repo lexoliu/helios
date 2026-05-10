@@ -90,9 +90,7 @@ fn sum_words(bytes: &[u8]) -> u32 {
         // SAFETY: aarch64 + neon target feature guarantees the
         // intrinsics below are available; the routine reads only the
         // input slice and never goes past `bytes.len()`.
-        unsafe {
-            sum_words_neon(bytes)
-        }
+        unsafe { sum_words_neon(bytes) }
     }
     #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
     {

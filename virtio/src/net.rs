@@ -1,10 +1,13 @@
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use async_lock::Mutex as AsyncMutex;
+use bytes::Bytes;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::mem::size_of;
+use core::ops::Range;
 
 use helios_hal::io::{IoError, IoResult};
 use spin::Mutex as SpinMutex;
@@ -69,6 +72,21 @@ struct NetRxState<T: VirtioTransport> {
     rx_in_device: DescriptorBitSet,
 }
 
+struct RxReturnedTokens {
+    tokens: SpinMutex<Vec<u16>>,
+}
+
+struct RxBufferSlot {
+    token: u16,
+    returned: Arc<RxReturnedTokens>,
+    buffer: UnsafeCell<Box<[u8]>>,
+}
+
+struct RxFrameOwner {
+    slot: Arc<RxBufferSlot>,
+    range: Range<usize>,
+}
+
 struct NetTxState<T: VirtioTransport> {
     tx_queue: VirtQueue<T>,
     tx_buffers: Box<[u8]>,
@@ -82,17 +100,13 @@ struct NetTxState<T: VirtioTransport> {
 /// SpinMutex / async lock.
 struct NetQueuePair<T: VirtioTransport> {
     rx_state: AsyncMutex<NetRxState<T>>,
-    rx_buffers: UnsafeCell<Box<[u8]>>,
+    rx_returned: Arc<RxReturnedTokens>,
+    rx_slots: Box<[Arc<RxBufferSlot>]>,
     tx_state: SpinMutex<NetTxState<T>>,
 }
 
-// SAFETY: each queue pair's RX buffer slab is mutated only behind
-// `rx_state`'s async lock (RX completion handler) and read through
-// `BorrowedRxFrame` whose lifetime keeps the device borrow alive
-// until the consumer reposts the descriptor. TX mutation is gated
-// by `tx_state`. Wrapping in `UnsafeCell` mirrors the
-// pre-multi-queue layout so the existing safety argument carries
-// over per pair.
+unsafe impl Send for RxBufferSlot {}
+unsafe impl Sync for RxBufferSlot {}
 unsafe impl<T: VirtioTransport> Send for NetQueuePair<T> {}
 unsafe impl<T: VirtioTransport> Sync for NetQueuePair<T> {}
 
@@ -133,17 +147,7 @@ struct NetControlState<T: VirtioTransport> {
     ack_buffer: Box<[u8]>,
 }
 
-pub struct BorrowedRxFrame<'a, T: VirtioTransport> {
-    device: &'a VirtioNetDevice<T>,
-    /// Queue pair this frame came from. Reposting must hit the
-    /// same pair so the descriptor returns to the device-side
-    /// available ring it was popped from.
-    pair_idx: u16,
-    token: u16,
-    frame_start: usize,
-    frame_end: usize,
-    reposted: bool,
-}
+pub type RxFrame = Bytes;
 
 // SAFETY: each `NetQueuePair`'s RX/TX state is independently
 // synchronised by its own async / spin lock; `control` follows the
@@ -152,25 +156,25 @@ pub struct BorrowedRxFrame<'a, T: VirtioTransport> {
 // indexing (no aliasing) so the device as a whole is `Sync`.
 unsafe impl<T: VirtioTransport> Sync for VirtioNetDevice<T> {}
 
-impl<T: VirtioTransport> AsRef<[u8]> for BorrowedRxFrame<'_, T> {
+impl AsRef<[u8]> for RxFrameOwner {
     fn as_ref(&self) -> &[u8] {
-        assert!(
-            !self.reposted,
-            "borrowed virtio RX frame was already reposted"
-        );
-        let token_index = usize::from(self.token);
-        let pair_idx = usize::from(self.pair_idx);
-        &self.device.rx_slot(pair_idx, token_index, self.frame_end)
-            [self.frame_start..self.frame_end]
+        &self.slot.buffer()[self.range.clone()]
     }
 }
 
-impl<T: VirtioTransport> Drop for BorrowedRxFrame<'_, T> {
+impl Drop for RxFrameOwner {
     fn drop(&mut self) {
-        assert!(
-            self.reposted,
-            "borrowed virtio RX frame was dropped without reposting"
-        );
+        self.slot.returned.tokens.lock().push(self.slot.token);
+    }
+}
+
+impl RxBufferSlot {
+    fn buffer(&self) -> &[u8] {
+        unsafe { &*self.buffer.get() }
+    }
+
+    fn buffer_mut(&self) -> &mut [u8] {
+        unsafe { &mut *self.buffer.get() }
     }
 }
 
@@ -188,8 +192,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         // Only ask for MQ together with CTRL_VQ — without the
         // control queue there is no way to enable additional pairs
         // beyond the default single pair.
-        let mq_supported =
-            offered & NET_FEATURE_MQ != 0 && offered & NET_FEATURE_CTRL_VQ != 0;
+        let mq_supported = offered & NET_FEATURE_MQ != 0 && offered & NET_FEATURE_CTRL_VQ != 0;
         let mq_mask = if mq_supported {
             NET_FEATURE_MQ | NET_FEATURE_CTRL_VQ
         } else {
@@ -239,12 +242,8 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         for pair_idx in 0..pair_count {
             let rx_queue_index = pair_idx * 2;
             let tx_queue_index = pair_idx * 2 + 1;
-            let rx_queue_size = transport
-                .queue_max_size(rx_queue_index)
-                .min(NET_QUEUE_SIZE);
-            let tx_queue_size = transport
-                .queue_max_size(tx_queue_index)
-                .min(NET_QUEUE_SIZE);
+            let rx_queue_size = transport.queue_max_size(rx_queue_index).min(NET_QUEUE_SIZE);
+            let tx_queue_size = transport.queue_max_size(tx_queue_index).min(NET_QUEUE_SIZE);
             if rx_queue_size == 0
                 || tx_queue_size == 0
                 || !rx_queue_size.is_power_of_two()
@@ -256,27 +255,24 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             let mut rx_queue = VirtQueue::new(&transport, rx_queue_index, rx_queue_size)?;
             let tx_queue = VirtQueue::new(&transport, tx_queue_index, tx_queue_size)?;
             let rx_buffer_count = usize::from(rx_queue_size);
-            let mut rx_buffers = vec![
-                0_u8;
-                rx_buffer_len
-                    .checked_mul(rx_buffer_count)
-                    .ok_or(IoError::DeviceFault)?
-            ]
-            .into_boxed_slice();
+            let rx_returned = Arc::new(RxReturnedTokens {
+                tokens: SpinMutex::new(Vec::with_capacity(rx_buffer_count)),
+            });
+            let mut rx_slots: Vec<Arc<RxBufferSlot>> = Vec::with_capacity(rx_buffer_count);
+            for token_index in 0..rx_buffer_count {
+                let token = u16::try_from(token_index).map_err(|_| IoError::DeviceFault)?;
+                rx_slots.push(Arc::new(RxBufferSlot {
+                    token,
+                    returned: rx_returned.clone(),
+                    buffer: UnsafeCell::new(vec![0_u8; rx_buffer_len].into_boxed_slice()),
+                }));
+            }
             let mut rx_in_device = DescriptorBitSet::new(rx_buffer_count);
             for _ in 0..usize::from(rx_queue_size) {
                 let token = rx_queue.next_free_descriptor();
                 let token_index = usize::from(token);
-                let submitted_token = rx_queue.submit(
-                    &transport,
-                    &[],
-                    &mut [slot_buffer_mut(
-                        &mut rx_buffers,
-                        rx_buffer_len,
-                        token_index,
-                        "RX",
-                    )],
-                )?;
+                let submitted_token =
+                    rx_queue.submit(&transport, &[], &mut [rx_slots[token_index].buffer_mut()])?;
                 assert_eq!(
                     submitted_token, token,
                     "virtio net RX descriptor allocation moved while buffer was prepared"
@@ -302,7 +298,8 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                     rx_queue,
                     rx_in_device,
                 }),
-                rx_buffers: UnsafeCell::new(rx_buffers),
+                rx_returned,
+                rx_slots: rx_slots.into_boxed_slice(),
                 tx_state: SpinMutex::new(NetTxState {
                     tx_queue,
                     tx_buffers,
@@ -407,8 +404,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         ack_buffer[0] = CTRL_ACK_PENDING;
         let cmd_slice: &[u8] = &cmd_buffer[..CTRL_MQ_PAIRS_CMD_BYTES];
         let ack_slice: &mut [u8] = &mut ack_buffer[..];
-        let _token =
-            queue.submit(&self.transport, &[cmd_slice], &mut [ack_slice])?;
+        let _token = queue.submit(&self.transport, &[cmd_slice], &mut [ack_slice])?;
         queue.notify(&self.transport);
         // Spin-poll the used ring; the device handles the command
         // synchronously and `pop_used` becomes ready as soon as the
@@ -443,10 +439,10 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     pub async fn try_receive_into(&self, output: &mut [u8]) -> IoResult<Option<usize>> {
         const PAIR: usize = 0;
         let mut state = self.queue_pairs[PAIR].rx_state.lock().await;
+        self.drain_returned_rx_buffers(PAIR, &mut state)?;
         let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
             return Ok(None);
         };
-        let token_index = usize::from(token);
         Self::mark_rx_completed(&mut state, token);
         let used_len = used_len as usize;
         if used_len < self.header_len || used_len > self.rx_buffer_len {
@@ -459,16 +455,16 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             self.repost_rx_buffer(PAIR, &mut state, token)?;
             return Err(IoError::OutOfBounds);
         }
-        output[..frame_len].copy_from_slice(
-            &self.rx_slot(PAIR, token_index, used_len)[self.header_len..used_len],
-        );
+        let slot = &self.queue_pairs[PAIR].rx_slots[usize::from(token)];
+        output[..frame_len].copy_from_slice(&slot.buffer()[self.header_len..used_len]);
         self.repost_rx_buffer(PAIR, &mut state, token)?;
         Ok(Some(frame_len))
     }
 
-    pub async fn try_receive_frame(&self) -> IoResult<Option<BorrowedRxFrame<'_, T>>> {
+    pub async fn try_receive_frame(&self) -> IoResult<Option<RxFrame>> {
         const PAIR: usize = 0;
         let mut state = self.queue_pairs[PAIR].rx_state.lock().await;
+        self.drain_returned_rx_buffers(PAIR, &mut state)?;
         let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
             return Ok(None);
         };
@@ -479,28 +475,13 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             return Err(IoError::DeviceFault);
         }
 
-        Ok(Some(BorrowedRxFrame {
-            device: self,
-            pair_idx: PAIR as u16,
-            token,
-            frame_start: self.header_len,
-            frame_end: used_len,
-            reposted: false,
-        }))
+        Ok(Some(self.rx_frame_from_slot(PAIR, token, used_len)))
     }
 
-    pub fn try_receive_frames_immediate<'a, 'slots>(
-        &'a self,
-        frames: &'slots mut [Option<BorrowedRxFrame<'a, T>>],
-    ) -> IoResult<Option<usize>>
-    where
-        'a: 'slots,
-    {
-        // Drain across every queue pair so the device's RX hashing
-        // never strands frames on a non-default pair. We iterate
-        // pair 0 first (matches single-queue behaviour) then walk
-        // additional pairs, locking one at a time and stopping when
-        // the slot fills.
+    pub fn try_receive_frames_immediate(
+        &self,
+        frames: &mut [Option<RxFrame>],
+    ) -> IoResult<Option<usize>> {
         let mut received = 0usize;
         let mut any_locked = false;
         for pair_idx in 0..self.queue_pairs.len() {
@@ -511,6 +492,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 continue;
             };
             any_locked = true;
+            self.drain_returned_rx_buffers(pair_idx, &mut state)?;
             while received < frames.len() {
                 let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
                     break;
@@ -524,14 +506,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
 
                 let slot = &mut frames[received];
                 assert!(slot.is_none(), "virtio net RX batch slot was not empty");
-                *slot = Some(BorrowedRxFrame {
-                    device: self,
-                    pair_idx: pair_idx as u16,
-                    token,
-                    frame_start: self.header_len,
-                    frame_end: used_len,
-                    reposted: false,
-                });
+                *slot = Some(self.rx_frame_from_slot(pair_idx, token, used_len));
                 received += 1;
             }
         }
@@ -541,64 +516,29 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         Ok(Some(received))
     }
 
-    pub async fn repost_rx_frame(&self, mut frame: BorrowedRxFrame<'_, T>) -> IoResult<()> {
-        assert!(
-            !frame.reposted,
-            "borrowed virtio RX frame was reposted twice"
-        );
-        frame.reposted = true;
-        let pair_idx = usize::from(frame.pair_idx);
-        let mut state = self.queue_pairs[pair_idx].rx_state.lock().await;
-        self.repost_rx_buffer(pair_idx, &mut state, frame.token)
+    pub async fn repost_rx_frame(&self, frame: RxFrame) -> IoResult<()> {
+        drop(frame);
+        for pair_idx in 0..self.queue_pairs.len() {
+            let mut state = self.queue_pairs[pair_idx].rx_state.lock().await;
+            self.drain_returned_rx_buffers(pair_idx, &mut state)?;
+        }
+        Ok(())
     }
 
-    pub fn repost_rx_frames_immediate<'a, 'slots>(
-        &'a self,
-        frames: &'slots mut [Option<BorrowedRxFrame<'a, T>>],
-    ) -> IoResult<Option<()>>
-    where
-        'a: 'slots,
-    {
-        // Group reposts by their originating pair; lock each pair
-        // once and walk its frames in reverse so consecutive
-        // descriptors stay at the free head and publish in a single
-        // avail-idx write. With multi-queue RX, frames from
-        // different pairs are interleaved in the slot, so we make
-        // one outer pass per pair index that appears.
+    pub fn repost_rx_frames_immediate(
+        &self,
+        frames: &mut [Option<RxFrame>],
+    ) -> IoResult<Option<()>> {
+        for frame in frames.iter_mut() {
+            drop(frame.take());
+        }
         let mut any_locked = false;
         for pair_idx in 0..self.queue_pairs.len() {
-            // Skip pairs that don't have any frames in the slot to
-            // avoid an unnecessary try_lock.
-            if !frames.iter().flatten().any(|f| usize::from(f.pair_idx) == pair_idx) {
-                continue;
-            }
             let Some(mut state) = self.queue_pairs[pair_idx].rx_state.try_lock() else {
                 continue;
             };
             any_locked = true;
-            let mut reposted = 0usize;
-            for frame in frames.iter_mut().rev() {
-                let pair_match = frame
-                    .as_ref()
-                    .map(|f| usize::from(f.pair_idx) == pair_idx)
-                    .unwrap_or(false);
-                if !pair_match {
-                    continue;
-                }
-                let Some(mut owned) = frame.take() else {
-                    continue;
-                };
-                assert!(
-                    !owned.reposted,
-                    "borrowed virtio RX frame was reposted twice"
-                );
-                owned.reposted = true;
-                self.repost_rx_buffer_deferred(pair_idx, &mut state, owned.token)?;
-                reposted += 1;
-            }
-            if reposted != 0 {
-                state.rx_queue.publish_deferred_heads();
-            }
+            self.drain_returned_rx_buffers(pair_idx, &mut state)?;
         }
         if !any_locked {
             return Ok(None);
@@ -748,7 +688,8 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         Wait: FnMut() -> Fut,
         Fut: Future<Output = ()>,
     {
-        self.transmit_frames_with_wait_on_pair(0, frames, wait).await
+        self.transmit_frames_with_wait_on_pair(0, frames, wait)
+            .await
     }
 
     pub async fn transmit_frames_with_wait_on_pair<Frame, Wait, Fut>(
@@ -889,14 +830,28 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         self.interrupts.notified().await;
     }
 
-    fn rx_slot(&self, pair_idx: usize, token_index: usize, payload_len: usize) -> &[u8] {
-        let buffers = unsafe { &*self.queue_pairs[pair_idx].rx_buffers.get() };
-        slot_buffer(buffers, self.rx_buffer_len, token_index, payload_len, "RX")
+    fn rx_frame_from_slot(&self, pair_idx: usize, token: u16, used_len: usize) -> RxFrame {
+        Bytes::from_owner(RxFrameOwner {
+            slot: self.queue_pairs[pair_idx].rx_slots[usize::from(token)].clone(),
+            range: self.header_len..used_len,
+        })
     }
 
-    fn rx_slot_mut(&self, pair_idx: usize, token_index: usize) -> &mut [u8] {
-        let buffers = unsafe { &mut *self.queue_pairs[pair_idx].rx_buffers.get() };
-        slot_buffer_mut(buffers, self.rx_buffer_len, token_index, "RX")
+    fn drain_returned_rx_buffers(
+        &self,
+        pair_idx: usize,
+        state: &mut NetRxState<T>,
+    ) -> IoResult<()> {
+        let returned = &self.queue_pairs[pair_idx].rx_returned;
+        let mut tokens = returned.tokens.lock();
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        while let Some(token) = tokens.pop() {
+            self.repost_rx_buffer_deferred(pair_idx, state, token)?;
+        }
+        state.rx_queue.publish_deferred_heads();
+        Ok(())
     }
 
     fn repost_rx_buffer(
@@ -928,7 +883,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let submitted_token = state.rx_queue.submit_output_at_deferred(
             &self.transport,
             token,
-            self.rx_slot_mut(pair_idx, token_index),
+            self.queue_pairs[pair_idx].rx_slots[token_index].buffer_mut(),
         )?;
         state.rx_in_device.set(token_index);
         Ok(submitted_token)

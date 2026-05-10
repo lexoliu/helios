@@ -63,8 +63,6 @@ pub(crate) fn has_network_device(
 }
 
 impl NetworkDevice for VirtioNetworkDevice {
-    type RxFrame<'a> = helios_virtio::BorrowedRxFrame<'a, Aarch64VirtioNetTransport>;
-
     fn mac_address(&self) -> [u8; 6] {
         self.inner.mac_address()
     }
@@ -106,13 +104,13 @@ impl NetworkDevice for VirtioNetworkDevice {
         Ok(true)
     }
 
-    async fn try_receive_frame(&self) -> Result<Option<Self::RxFrame<'_>>, IoError> {
+    async fn try_receive_frame(&self) -> Result<Option<helios_virtio::RxFrame>, IoError> {
         self.inner.try_receive_frame().await
     }
 
     fn try_receive_frames_immediate<'a, 'slots>(
         &'a self,
-        frames: &'slots mut [Option<Self::RxFrame<'a>>],
+        frames: &'slots mut [Option<helios_virtio::RxFrame>],
     ) -> Result<Option<usize>, IoError>
     where
         'a: 'slots,
@@ -120,13 +118,13 @@ impl NetworkDevice for VirtioNetworkDevice {
         self.inner.try_receive_frames_immediate(frames)
     }
 
-    async fn repost_rx_frame<'a>(&'a self, frame: Self::RxFrame<'a>) -> Result<(), IoError> {
+    async fn repost_rx_frame<'a>(&'a self, frame: helios_virtio::RxFrame) -> Result<(), IoError> {
         self.inner.repost_rx_frame(frame).await
     }
 
     fn repost_rx_frames_immediate<'a, 'slots>(
         &'a self,
-        frames: &'slots mut [Option<Self::RxFrame<'a>>],
+        frames: &'slots mut [Option<helios_virtio::RxFrame>],
     ) -> Result<Option<()>, IoError>
     where
         'a: 'slots,

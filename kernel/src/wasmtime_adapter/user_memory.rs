@@ -84,7 +84,13 @@ impl UserLinearMemoryPlan {
         processor: ProcessorId,
         cpu: C,
     ) -> Result<UserLinearMemory<C>, UserLinearMemoryError> {
-        UserLinearMemory::new(self.minimum, self.capacity, self.relocatable, processor, cpu)
+        UserLinearMemory::new(
+            self.minimum,
+            self.capacity,
+            self.relocatable,
+            processor,
+            cpu,
+        )
     }
 }
 

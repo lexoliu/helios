@@ -53,10 +53,10 @@ pub use component::{
     ComponentRuntimeFactory, ComponentRuntimeState, ComponentSerialPort, ComponentStoreData,
     ComponentTcpBackend, ComponentTcpStream, ComponentUdpBackend, ComponentUdpSocket,
     ComponentWorld, DeadlinePollable, InstanceKilled, RawMutexGuardResource, RawMutexResource,
-    RawRwLockReadGuardResource, RawRwLockResource, RawRwLockWriteGuardResource,
-    SerialPortResource, TcpStreamResource, UdpSocketResource, directory_prefix,
-    map_resource_table_error, parent_path, path_is_within_directory, resolve_absolute_path,
-    resolve_child_path, resolve_guest_path, strip_directory_prefix, wait_until_runtime_deadline,
+    RawRwLockReadGuardResource, RawRwLockResource, RawRwLockWriteGuardResource, SerialPortResource,
+    TcpStreamResource, UdpSocketResource, directory_prefix, map_resource_table_error, parent_path,
+    path_is_within_directory, resolve_absolute_path, resolve_child_path, resolve_guest_path,
+    strip_directory_prefix, wait_until_runtime_deadline,
 };
 pub use embedded::{
     EmbeddedComponent, EmbeddedInit, embedded_boot_component, embedded_init,
@@ -72,8 +72,8 @@ pub use exec::{
     RawRwLockReadLease, RawRwLockWriteLease, RwLock, RwLockReadGuard, RwLockWriteGuard, Sleep,
     Spawner, StatsSample, Timer, TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel,
     TraceValue, YieldNow, duration_to_ticks, elapsed_millis, matches_perf_metric_filter,
-    matches_profile_filter, matches_trace_filter, monotonic_nanos,
-    nanos_to_ticks_ceil_saturating, parse_console_text, yield_now,
+    matches_profile_filter, matches_trace_filter, monotonic_nanos, nanos_to_ticks_ceil_saturating,
+    parse_console_text, yield_now,
 };
 pub use helios_hal::Platform;
 pub use helios_netstack::{
@@ -90,37 +90,35 @@ pub use instance::{
     RegisteredInstance, SYSTEM_COMPONENT_RESTART_COST, allow_instance_resource_growth,
     record_instance_transition,
 };
-pub use kernel_exception::{
-    KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
-};
-pub use network::{
-    Ipv4Cidr, Ipv4Route, MacAddress, NetworkAdminBackend, NetworkBridgeRequest,
-    NetworkBridgeSecurity, NetworkControl, NetworkControlError, NetworkPortId, NetworkService,
-    SocketStack, TcpListenerId, TcpStreamId, UdpSocketId,
-};
 pub use io::{
     ByteReadWait, ByteReader, ByteWriter, ClosedPeer, PollKey, PollRegistration, PollRegistry,
     PollRegistryError, PollSourceKind, RecordingConsole, TryRead, byte_channel,
-    emit_serial_error_marker, emit_serial_stage_marker, read_serial, try_read_serial,
-    write_serial,
+    emit_serial_error_marker, emit_serial_stage_marker, read_serial, try_read_serial, write_serial,
+};
+pub use kernel_exception::{
+    KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
 };
 pub use memory::{
     EntropyError, EntropyPool, KernelPhysFrameAllocator, UserHeapStats,
     allocate_user_frame_uninit_on, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
     deallocate_user_frame, deallocate_user_frame_on, user_heap_stats,
 };
+pub use network::{
+    Ipv4Cidr, Ipv4Route, MacAddress, NetworkAdminBackend, NetworkBridgeRequest,
+    NetworkBridgeSecurity, NetworkControl, NetworkControlError, NetworkPortId, NetworkService,
+    SocketStack, TcpListenerId, TcpStreamId, UdpSocketId,
+};
 pub use process::{
     ClockAuthorityRights, DescriptorEntry, DescriptorId, DescriptorTable, DescriptorTableError,
-    ThreadId, ThreadRecord, ThreadState, ThreadTable, ThreadTableError,
-    DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DnsCap, ExecAuthority,
-    ForkAuthority, FutexKey, FutexTable, FutexWaitRegistration, GuestAddress, JoinAuthority,
-    LinkAuthorityRights, LinkSourceCap, LinkTargetDirectoryCap, MulticastCap, NetworkAdminCap,
-    NetworkAuthorityRights, NetworkCap, PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError,
-    ProcessAuthorityRights, ProcessId, ProcessMemoryIdentity, ProcessRecord, ProcessState,
-    ProcessTable, ProcessTableError, ProgramExecError, ProgramExecErrorDetail,
-    ProgramExecErrorKind, ProgramOutOfMemory, SetWallClockCap, SignalAuthority, SpawnAuthority,
-    SymlinkCreateCap, SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap,
-    TerminalOutputCap, TtyControlCap, UdpCap,
+    DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DnsCap, ExecAuthority, ForkAuthority,
+    FutexKey, FutexTable, FutexWaitRegistration, GuestAddress, JoinAuthority, LinkAuthorityRights,
+    LinkSourceCap, LinkTargetDirectoryCap, MulticastCap, NetworkAdminCap, NetworkAuthorityRights,
+    NetworkCap, PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights,
+    ProcessId, ProcessMemoryIdentity, ProcessRecord, ProcessState, ProcessTable, ProcessTableError,
+    ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, ProgramOutOfMemory,
+    SetWallClockCap, SignalAuthority, SpawnAuthority, SymlinkCreateCap, SymlinkReadCap, TcpCap,
+    TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, ThreadId, ThreadRecord,
+    ThreadState, ThreadTable, ThreadTableError, TtyControlCap, UdpCap,
 };
 pub use runtime::{
     AuthorityDomain, ComponentHostFilesystemState, ComponentNetworkService, ComponentNetworkState,
@@ -798,8 +796,7 @@ where
             ALLOCATOR.add_to_heap(start, kernel_end);
         }
         let pool = *user_pool.get_or_insert_with(|| {
-            let pool =
-                memory::install_user_memory_pool(memory::allocate_user_memory_pool());
+            let pool = memory::install_user_memory_pool(memory::allocate_user_memory_pool());
             pool.configure_processors(processor_count);
             pool
         });

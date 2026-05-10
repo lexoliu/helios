@@ -1607,10 +1607,7 @@ where
         }
         // payload is already an owning Bytes — slice or copied into
         // by the caller. No further copy at the segment boundary.
-        let segment = TcpOutOfOrderSegment {
-            sequence,
-            payload,
-        };
+        let segment = TcpOutOfOrderSegment { sequence, payload };
         let len = segment.payload.len();
         self.out_of_order_mut().push(segment).map_err(|_| ())?;
         self.out_of_order_queued_bytes = self
@@ -1855,7 +1852,8 @@ mod tests {
     fn established_socket() -> TcpSocket<BbrV3> {
         let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
         socket.mark_syn_queued(0);
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -1880,7 +1878,8 @@ mod tests {
             FixedPacing::new(CongestionWindow::new(16), Some(rate)),
         );
         socket.mark_syn_queued(0);
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -1929,7 +1928,8 @@ mod tests {
     fn ack_discards_fully_covered_in_flight_data() {
         let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
         socket.mark_syn_queued(0);
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -1947,7 +1947,8 @@ mod tests {
         let data = socket
             .take_transmit_segment(TCP_INITIAL_RTO_NANOS)
             .expect("established socket should transmit queued bytes");
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2020,7 +2021,8 @@ mod tests {
             .expect("established socket should transmit queued bytes");
 
         for index in 0..3 {
-            let _ = deliver_segment(&mut socket, 
+            let _ = deliver_segment(
+                &mut socket,
                 TcpPacket {
                     source_port: 80,
                     destination_port: 49152,
@@ -2047,7 +2049,8 @@ mod tests {
     fn fast_retransmit_skips_sacked_in_flight_segments() {
         let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
         socket.mark_syn_queued(0);
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2082,7 +2085,8 @@ mod tests {
         socket.apply_sack_blocks(blocks);
 
         for index in 0..3 {
-            let _ = deliver_segment(&mut socket, 
+            let _ = deliver_segment(
+                &mut socket,
                 TcpPacket {
                     source_port: 80,
                     destination_port: 49152,
@@ -2108,7 +2112,8 @@ mod tests {
     fn queue_send_bytes_reuses_payload_storage() {
         let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
         socket.mark_syn_queued(0);
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2205,7 +2210,8 @@ mod tests {
     fn peer_mss_option_caps_transmit_segment_size() {
         let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
         socket.mark_syn_queued(0);
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2232,7 +2238,8 @@ mod tests {
     fn peer_window_scale_expands_tracked_receive_window() {
         let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
         socket.mark_syn_queued(0);
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2259,7 +2266,8 @@ mod tests {
     #[test]
     fn peer_receive_window_caps_queued_send_bytes() {
         let mut socket = established_socket();
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2355,7 +2363,8 @@ mod tests {
             data.header.sequence + data.sequence_len
         );
 
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2378,7 +2387,8 @@ mod tests {
         let fin = socket
             .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 1)
             .expect("active close must queue FIN");
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2394,7 +2404,8 @@ mod tests {
         assert_eq!(socket.state(), TcpState::FinWait2);
 
         let fin_received_at = TCP_INITIAL_RTO_NANOS + 3;
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2423,7 +2434,8 @@ mod tests {
     #[test]
     fn passive_close_sends_fin_and_closes_after_fin_ack() {
         let mut socket = established_socket();
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2445,7 +2457,8 @@ mod tests {
             .expect("passive close must queue FIN from LAST-ACK");
         assert!(fin.header.flags.contains(TcpFlags::FIN));
 
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2464,7 +2477,8 @@ mod tests {
     #[test]
     fn data_transmit_piggybacks_pending_ack() {
         let mut socket = established_socket();
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2491,7 +2505,8 @@ mod tests {
     fn receive_window_tracks_queued_payload_segments() {
         let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
         socket.mark_syn_queued(0);
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2508,7 +2523,8 @@ mod tests {
         let payload = [0u8; TCP_RECEIVE_SEGMENT_BYTES];
         let queued_segments = 4;
         for index in 0..queued_segments {
-            let _ = deliver_segment(&mut socket, 
+            let _ = deliver_segment(
+                &mut socket,
                 TcpPacket {
                     source_port: 80,
                     destination_port: 49152,
@@ -2541,7 +2557,8 @@ mod tests {
     fn full_size_receive_payloads_ack_every_two_segments() {
         let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
         socket.mark_syn_queued(0);
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2557,7 +2574,8 @@ mod tests {
         socket.mark_ack_queued();
 
         let payload = [0u8; TCP_RECEIVE_SEGMENT_BYTES];
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2572,7 +2590,8 @@ mod tests {
         );
         assert_eq!(socket.pending_ack(), None);
 
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2593,7 +2612,8 @@ mod tests {
         let mut socket = established_socket();
         let payload = [0u8; TCP_RECEIVE_SEGMENT_BYTES];
         let received_at = TCP_INITIAL_RTO_NANOS + 1;
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2623,7 +2643,8 @@ mod tests {
     fn small_receive_payload_ack_is_immediate() {
         let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
         socket.mark_syn_queued(0);
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2638,7 +2659,8 @@ mod tests {
         );
         socket.mark_ack_queued();
 
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2658,7 +2680,8 @@ mod tests {
     fn receive_aggregates_segments_up_to_read_budget() {
         let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
         socket.mark_syn_queued(0);
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2677,7 +2700,8 @@ mod tests {
             .into_iter()
             .enumerate()
         {
-            let _ = deliver_segment(&mut socket, 
+            let _ = deliver_segment(
+                &mut socket,
                 TcpPacket {
                     source_port: 80,
                     destination_port: 49152,
@@ -2699,7 +2723,8 @@ mod tests {
     #[test]
     fn receive_single_segment_does_not_allocate_merge_buffer() {
         let mut socket = established_socket();
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2726,7 +2751,8 @@ mod tests {
             .into_iter()
             .enumerate()
         {
-            let _ = deliver_segment(&mut socket, 
+            let _ = deliver_segment(
+                &mut socket,
                 TcpPacket {
                     source_port: 80,
                     destination_port: 49152,
@@ -2790,7 +2816,8 @@ mod tests {
     fn out_of_order_receive_payload_reassembles_after_gap_arrives() {
         let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
         socket.mark_syn_queued(0);
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2805,7 +2832,8 @@ mod tests {
         );
         socket.mark_ack_queued();
 
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2825,7 +2853,8 @@ mod tests {
         assert_eq!(ack.acknowledgement, 101);
         assert_eq!(socket.receive(16, 2), None);
 
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2852,7 +2881,8 @@ mod tests {
         socket.mark_ack_queued();
 
         for (sequence, payload) in [(107, b"ghi".as_slice()), (104, b"def".as_slice())] {
-            let _ = deliver_segment(&mut socket, 
+            let _ = deliver_segment(
+                &mut socket,
                 TcpPacket {
                     source_port: 80,
                     destination_port: 49152,
@@ -2868,7 +2898,8 @@ mod tests {
         }
         assert_eq!(socket.receive(16, 2), None);
 
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2893,7 +2924,8 @@ mod tests {
         let mut socket = established_socket();
         socket.mark_ack_queued();
 
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2907,7 +2939,8 @@ mod tests {
             TCP_INITIAL_RTO_NANOS + 1,
         );
 
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2931,7 +2964,8 @@ mod tests {
         );
         assert_eq!(socket.receive_queued_bytes, 3);
 
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2961,7 +2995,8 @@ mod tests {
     fn pending_ack_options_report_out_of_order_sack_blocks() {
         let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
         socket.mark_syn_queued(0);
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -2976,7 +3011,8 @@ mod tests {
         );
         socket.mark_ack_queued();
 
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -3006,7 +3042,8 @@ mod tests {
     fn pending_ack_options_echo_peer_timestamp() {
         let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
         socket.mark_syn_queued(0);
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -3036,7 +3073,8 @@ mod tests {
     fn receive_window_update_ack_is_thresholded() {
         let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
         socket.mark_syn_queued(0);
-        let _ = deliver_segment(&mut socket, 
+        let _ = deliver_segment(
+            &mut socket,
             TcpPacket {
                 source_port: 80,
                 destination_port: 49152,
@@ -3055,7 +3093,8 @@ mod tests {
         let queued_segments =
             MAX_TCP_RECEIVE_SEGMENTS - (u16::MAX as usize / TCP_RECEIVE_SEGMENT_BYTES) + 4;
         for index in 0..queued_segments {
-            let _ = deliver_segment(&mut socket, 
+            let _ = deliver_segment(
+                &mut socket,
                 TcpPacket {
                     source_port: 80,
                     destination_port: 49152,

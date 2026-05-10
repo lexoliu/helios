@@ -145,9 +145,8 @@ fn smp_sharded_mutex(bencher: Bencher, threads: usize) {
 #[divan::bench(args = [1usize, 2, 4, 8])]
 fn smp_sharded_mutex_with_cross_shard(bencher: Bencher, threads: usize) {
     let shard_count = threads.max(1);
-    let shards: Arc<[CacheAlignedShard]> = (0..shard_count)
-        .map(|_| CacheAlignedShard::new())
-        .collect();
+    let shards: Arc<[CacheAlignedShard]> =
+        (0..shard_count).map(|_| CacheAlignedShard::new()).collect();
     bencher
         .counter(ItemsCount::new(threads * OPS_PER_THREAD))
         .bench_local(|| {

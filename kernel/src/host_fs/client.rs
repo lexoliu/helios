@@ -19,8 +19,7 @@ const REQUEST_BUFFER_POOL_SLOTS: usize = 4;
 /// Maximum capacity a returning request buffer is allowed to retain
 /// before it gets re-allocated. Caps memory pressure when a single
 /// large 9p TWRITE temporarily inflates a buffer.
-const REQUEST_BUFFER_RETAINED_CAPACITY: usize =
-    (DEFAULT_MSIZE as usize).next_power_of_two();
+const REQUEST_BUFFER_RETAINED_CAPACITY: usize = (DEFAULT_MSIZE as usize).next_power_of_two();
 const P9_NOTAG: u16 = u16::MAX;
 const P9_NOFID: u32 = u32::MAX;
 const P9_NOUID: u32 = u32::MAX;

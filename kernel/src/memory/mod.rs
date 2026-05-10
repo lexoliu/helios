@@ -13,12 +13,12 @@ mod user;
 
 pub use entropy::{EntropyError, EntropyPool};
 pub use pmm::KernelPhysFrameAllocator;
-pub(crate) use user::{
-    allocate_user_memory_pool, allocate_user_uninit_on, deallocate_user_on,
-    install_user_memory_pool,
-};
 pub use user::{
     UserHeapStats, UserMemoryPool, allocate_user_frame_uninit_on, allocate_user_frame_zeroed,
     allocate_user_frame_zeroed_on, deallocate_user_frame, deallocate_user_frame_on,
     user_heap_stats,
+};
+pub(crate) use user::{
+    allocate_user_memory_pool, allocate_user_uninit_on, deallocate_user_on,
+    install_user_memory_pool,
 };

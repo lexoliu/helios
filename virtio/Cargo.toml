@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 async-lock = { version = "3.4.2", default-features = false }
 bitflags = "2.11.0"
+bytes = { version = "1.10.1", default-features = false }
 event-listener = { version = "5.4.1", default-features = false, features = ["critical-section"] }
 helios-hal.workspace = true
 spin = { version = "0.9.8", default-features = false, features = ["mutex", "spin_mutex"] }
