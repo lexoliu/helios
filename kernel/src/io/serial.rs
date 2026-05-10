@@ -4,48 +4,43 @@ use alloc::vec::Vec;
 
 use helios_hal::serial::ByteSerial;
 
-/// Try a non-blocking read — returns whatever bytes are immediately
-/// available up to `max_bytes`. Returns an empty `Vec` when no byte is
-/// ready. Callers that need to wait for a byte should loop with
+pub type SerialReader = fn(&mut Vec<u8>, u32);
+
+/// Try a non-blocking read into caller-owned storage. Returns whatever bytes
+/// are immediately available up to `max_bytes`. Leaves `buffer` empty when no
+/// byte is ready. Callers that need to wait for a byte should loop with
 /// `yield_now().await` between polls rather than spinning on the port.
-pub fn try_read_serial(io: &impl ByteSerial, max_bytes: u32) -> Vec<u8> {
+pub fn try_read_serial(io: &impl ByteSerial, buffer: &mut Vec<u8>, max_bytes: u32) {
+    buffer.clear();
     let max_bytes = max_bytes as usize;
-    // `max_bytes` may come from a guest fd-read capacity or from "drain
-    // whatever is ready" callers. Do not reserve that bound up front; UART
-    // readiness is discovered one byte at a time, so allocating from the bound
-    // turns a harmless empty poll into a huge allocation request.
-    let mut bytes = Vec::new();
-    while bytes.len() < max_bytes {
+    while buffer.len() < max_bytes {
         let Some(byte) = io.try_read_byte() else {
             break;
         };
-        bytes.push(byte);
+        buffer.push(byte);
     }
-    bytes
 }
 
 /// Synchronous blocking read used only during bootstrap (before the
 /// kernel executor is active). Spins on the port until a byte is available.
-pub fn read_serial(io: &impl ByteSerial, max_bytes: u32) -> Vec<u8> {
+pub fn read_serial(io: &impl ByteSerial, buffer: &mut Vec<u8>, max_bytes: u32) {
+    buffer.clear();
     let max_bytes = max_bytes as usize;
-    let mut bytes = Vec::new();
 
     loop {
         if let Some(byte) = io.try_read_byte() {
-            bytes.push(byte);
+            buffer.push(byte);
             break;
         }
         core::hint::spin_loop();
     }
 
-    while bytes.len() < max_bytes {
+    while buffer.len() < max_bytes {
         let Some(byte) = io.try_read_byte() else {
             break;
         };
-        bytes.push(byte);
+        buffer.push(byte);
     }
-
-    bytes
 }
 
 pub fn write_serial(io: &impl ByteSerial, bytes: &[u8]) {
@@ -91,7 +86,8 @@ mod tests {
     fn unbounded_try_read_does_not_preallocate_when_idle() {
         let serial = TestSerial::new(&[]);
 
-        let bytes = try_read_serial(&serial, u32::MAX);
+        let mut bytes = Vec::new();
+        try_read_serial(&serial, &mut bytes, u32::MAX);
 
         assert!(bytes.is_empty());
         assert_eq!(bytes.capacity(), 0);

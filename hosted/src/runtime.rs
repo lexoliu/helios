@@ -31,16 +31,14 @@ fn init_serial() {
     let _ = SERIAL_OUTPUT.lock().unwrap().insert(std::io::stdout());
 }
 
-fn read_debug_serial(max_bytes: u32) -> Vec<u8> {
+fn read_debug_serial(buffer: &mut Vec<u8>, max_bytes: u32) {
+    buffer.clear();
     let mut guard = SERIAL_INPUT.lock().unwrap();
     let stdin = guard.as_mut().expect("serial not initialized");
-    let mut buf = vec![0u8; max_bytes as usize];
-    match stdin.read(&mut buf) {
-        Ok(n) => {
-            buf.truncate(n);
-            buf
-        }
-        Err(_) => Vec::new(),
+    buffer.resize(max_bytes as usize, 0);
+    match stdin.read(buffer) {
+        Ok(n) => buffer.truncate(n),
+        Err(_) => buffer.clear(),
     }
 }
 

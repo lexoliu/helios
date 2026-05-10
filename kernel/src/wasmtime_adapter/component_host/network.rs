@@ -12,8 +12,8 @@ use unsize::{CoerceUnsize, Coercion};
 use crate::{
     ComponentNetworkService, DnsError, Ipv4Address, Ipv4Cidr, Ipv4Route, MacAddress,
     NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkIpAddress,
-    NetworkPortId, PingError, PingReply, TcpAccepted, TcpError, TcpListener, UdpBinding,
-    UdpDatagram, UdpError,
+    NetworkPortId, PingError, PingReply, RegisteredTcpReadBuffer, TcpAccepted, TcpError,
+    TcpListener, UdpBinding, UdpDatagram, UdpError,
 };
 
 pub trait ComponentHostTcpStreamToken: Copy + Send + 'static {
@@ -137,6 +137,13 @@ trait DynComponentHostNetworkService: Send + Sync + 'static {
         max_bytes: u32,
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, TcpError>> + Send + 'a>>;
+
+    fn tcp_read_into_registered<'a>(
+        &'a self,
+        stream: u64,
+        buffer: RegisteredTcpReadBuffer<'a>,
+        timeout_nanos: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<usize>, TcpError>> + Send + 'a>>;
 
     fn tcp_shutdown_send<'a>(
         &'a self,
@@ -283,6 +290,16 @@ impl ComponentHostNetworkService {
         };
         let inner = Arc::new(TypedNetworkService { service }).unsize(coercion);
         Self { inner }
+    }
+
+    pub fn tcp_read_into_registered<'a>(
+        &'a self,
+        stream: u64,
+        buffer: RegisteredTcpReadBuffer<'a>,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<Option<usize>, TcpError>> + Send + 'a {
+        self.inner
+            .tcp_read_into_registered(stream, buffer, timeout_nanos)
     }
 }
 
@@ -714,6 +731,19 @@ where
         Box::pin(self.service.tcp_read(
             <Service::TcpStream as ComponentHostTcpStreamToken>::from_raw(stream),
             max_bytes,
+            timeout_nanos,
+        ))
+    }
+
+    fn tcp_read_into_registered<'a>(
+        &'a self,
+        stream: u64,
+        buffer: RegisteredTcpReadBuffer<'a>,
+        timeout_nanos: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<usize>, TcpError>> + Send + 'a>> {
+        Box::pin(self.service.tcp_read_into(
+            <Service::TcpStream as ComponentHostTcpStreamToken>::from_raw(stream),
+            buffer,
             timeout_nanos,
         ))
     }

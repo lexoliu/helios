@@ -92,7 +92,7 @@ pub use instance::{
 };
 pub use io::{
     ByteReadWait, ByteReader, ByteWriter, ClosedPeer, PollKey, PollRegistration, PollRegistry,
-    PollRegistryError, PollSourceKind, RecordingConsole, TryRead, byte_channel,
+    PollRegistryError, PollSourceKind, RecordingConsole, SerialReader, TryRead, byte_channel,
     emit_serial_error_marker, emit_serial_stage_marker, read_serial, try_read_serial, write_serial,
 };
 pub use kernel_exception::{
@@ -124,8 +124,9 @@ pub use runtime::{
     AuthorityDomain, ComponentHostFilesystemState, ComponentNetworkService, ComponentNetworkState,
     DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry, HostFileSystem, HostFsError,
     HostFsErrorKind, HostMetadata, Ipv4Address, NetworkErrorDetail, NetworkIpAddress,
-    ObjectIdentity, PingError, PingErrorKind, PingReply, RuntimeState, TcpAccepted, TcpError,
-    TcpErrorKind, TcpListener, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+    ObjectIdentity, PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer, RuntimeState,
+    TcpAccepted, TcpError, TcpErrorKind, TcpListener, UdpBinding, UdpDatagram, UdpError,
+    UdpErrorKind,
 };
 #[cfg(feature = "wasmtime-runtime")]
 pub use wasmtime_adapter::component_host::{

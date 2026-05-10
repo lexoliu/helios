@@ -38,7 +38,7 @@ pub use packet::{
 pub use stack::{
     DhcpLease, DnsQueryId, IcmpEchoKey, MAX_OUTBOUND_FRAMES, NeighborEntry, NeighborState,
     OutboundBatchStatus, Route, RouteTable, SocketId, Stack, StackConfig, StackEvent, StackInstant,
-    TcpAccept, TcpConnectState, TcpReadState, UdpPayload, UdpReceive,
+    TcpAccept, TcpConnectState, TcpReadIntoState, TcpReadState, UdpPayload, UdpReceive,
 };
 pub use tcp::{TcpEndpoint, TcpSegmentOutcome, TcpSocket, TcpState, TcpTransmitSegment};
 pub use types::{
@@ -126,6 +126,11 @@ pub struct InterfaceCapabilities {
     pub direct_tx_dma: bool,
     /// DMA can fill stack-owned packet buffers directly when that path wins.
     pub direct_rx_dma: bool,
+}
+
+pub trait TcpReceiveBuffer {
+    fn remaining_capacity(&self) -> usize;
+    fn write_from(&mut self, bytes: &[u8]) -> usize;
 }
 
 /// Caller-owned packet storage used at stack/NIC boundaries.

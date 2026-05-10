@@ -4,11 +4,82 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use core::future::Future;
+use core::ptr;
 
 use crate::InstanceId;
 use bytes::Bytes;
 use helios_hal::io::IoError;
 use thiserror::Error;
+
+pub struct RegisteredTcpReadBuffer<'a> {
+    memory_base: usize,
+    ranges: &'a [(usize, usize)],
+    capacity: usize,
+    written: usize,
+}
+
+impl<'a> RegisteredTcpReadBuffer<'a> {
+    pub fn new(memory_base: usize, ranges: &'a [(usize, usize)]) -> Self {
+        let capacity = ranges.iter().fold(0usize, |total, (_, len)| {
+            total
+                .checked_add(*len)
+                .expect("registered TCP receive buffer capacity overflowed")
+        });
+        Self {
+            memory_base,
+            ranges,
+            capacity,
+            written: 0,
+        }
+    }
+
+    pub const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub const fn written(&self) -> usize {
+        self.written
+    }
+}
+
+impl helios_netstack::TcpReceiveBuffer for RegisteredTcpReadBuffer<'_> {
+    fn remaining_capacity(&self) -> usize {
+        self.capacity - self.written
+    }
+
+    fn write_from(&mut self, bytes: &[u8]) -> usize {
+        let write_len = bytes.len().min(self.remaining_capacity());
+        let mut source_offset = 0usize;
+        let mut global_offset = self.written;
+        for (range_start, range_len) in self.ranges {
+            if source_offset == write_len {
+                break;
+            }
+            if global_offset >= *range_len {
+                global_offset -= *range_len;
+                continue;
+            }
+            let range_offset = global_offset;
+            let range_remaining = *range_len - range_offset;
+            let chunk_len = (write_len - source_offset).min(range_remaining);
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    bytes.as_ptr().add(source_offset),
+                    (self.memory_base as *mut u8).add(*range_start + range_offset),
+                    chunk_len,
+                );
+            }
+            source_offset += chunk_len;
+            global_offset = 0;
+        }
+        assert_eq!(
+            source_offset, write_len,
+            "registered TCP receive buffer ranges did not cover their capacity"
+        );
+        self.written += write_len;
+        write_len
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ExecOutput {
@@ -513,6 +584,31 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         max_bytes: u32,
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Option<Bytes>, TcpError>> + Send + 'a;
+
+    fn tcp_read_into<'a>(
+        &'a self,
+        stream: Self::TcpStream,
+        buffer: RegisteredTcpReadBuffer<'a>,
+        timeout_nanos: u64,
+    ) -> impl Future<Output = Result<Option<usize>, TcpError>> + Send + 'a {
+        async move {
+            let capacity = u32::try_from(buffer.capacity()).unwrap_or(u32::MAX);
+            match self.tcp_read(stream, capacity, timeout_nanos).await? {
+                Some(bytes) => {
+                    let mut buffer = buffer;
+                    let written =
+                        helios_netstack::TcpReceiveBuffer::write_from(&mut buffer, bytes.as_ref());
+                    assert_eq!(
+                        written,
+                        bytes.len(),
+                        "registered TCP receive buffer truncated a read"
+                    );
+                    Ok(Some(written))
+                }
+                None => Ok(None),
+            }
+        }
+    }
 
     fn tcp_shutdown_send(
         &self,

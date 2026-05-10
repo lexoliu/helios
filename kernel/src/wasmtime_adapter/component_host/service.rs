@@ -135,7 +135,7 @@ where
     runtime_state: HostRuntimeState<CpuImpl, HostFs>,
     instance_registry: crate::InstanceRegistry,
     parent_instance_id: Option<crate::InstanceId>,
-    read_serial: fn(u32) -> Vec<u8>,
+    read_serial: crate::SerialReader,
     write_serial: fn(&[u8]),
 }
 
@@ -395,7 +395,8 @@ where
     arguments: Vec<String>,
     environment: Vec<(String, String)>,
     output_mode: OutputMode,
-    read_serial: fn(u32) -> Vec<u8>,
+    read_serial: crate::SerialReader,
+    serial_read_buffer: Vec<u8>,
     write_serial: fn(&[u8]),
     imported_memory: Option<SharedMemory>,
     current_core_module: Option<Arc<WasmtimeCompiledCoreModule>>,
@@ -1121,7 +1122,7 @@ pub fn run_embedded_component_forever<CpuImpl, HostFs, WatchdogImpl>(
     cpu: CpuImpl,
     kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
     debug_state: HostRuntimeState<CpuImpl, HostFs>,
-    read_serial: fn(u32) -> Vec<u8>,
+    read_serial: crate::SerialReader,
     write_serial: fn(&[u8]),
 ) -> !
 where
@@ -1242,7 +1243,7 @@ pub fn run_component_host_processor_forever<CpuImpl, HostFs, WatchdogImpl>(
     cpu: CpuImpl,
     kernel: crate::Kernel<CpuImpl, WatchdogImpl>,
     debug_state: HostRuntimeState<CpuImpl, HostFs>,
-    read_serial: fn(u32) -> Vec<u8>,
+    read_serial: crate::SerialReader,
     write_serial: fn(&[u8]),
 ) -> !
 where
@@ -2561,7 +2562,7 @@ where
         environment: Vec<(String, String)>,
         authority: ProcessAuthority,
         output_mode: OutputMode,
-        read_serial: fn(u32) -> Vec<u8>,
+        read_serial: crate::SerialReader,
         write_serial: fn(&[u8]),
         imported_memory: Option<SharedMemory>,
         filesystem: Option<DebugFileSystemSnapshot>,
@@ -2597,6 +2598,7 @@ where
             environment,
             output_mode,
             read_serial,
+            serial_read_buffer: Vec::new(),
             write_serial,
             imported_memory,
             current_core_module,
@@ -2969,12 +2971,13 @@ where
         if carry.is_empty() {
             match &self.output_mode {
                 OutputMode::Serial => loop {
-                    let bytes = (self.read_serial)(
+                    (self.read_serial)(
+                        &mut self.serial_read_buffer,
                         u32::try_from(max_bytes)
                             .unwrap_or_else(|_| panic!("stdin read capacity exceeds u32")),
                     );
-                    if !bytes.is_empty() {
-                        *carry = Bytes::from(bytes);
+                    if !self.serial_read_buffer.is_empty() {
+                        *carry = Bytes::copy_from_slice(&self.serial_read_buffer);
                         break;
                     }
                     crate::yield_now().await;
@@ -14822,12 +14825,26 @@ where
                 Err(errno) => return errno,
             };
             let timeout = wasix_effective_socket_timeout(options.receive_timeout, fdflags);
-            let bytes = match service.tcp_read(stream, capacity, timeout).await {
+            let ranges = match p1_iovs_memory_ranges(memory, &layout.iovs) {
+                Ok(ranges) => ranges,
+                Err(errno) => return errno,
+            };
+            let buffer = crate::RegisteredTcpReadBuffer::new(memory.base, &ranges);
+            let bytes = match service
+                .tcp_read_into_registered(stream, buffer, timeout)
+                .await
+            {
                 Ok(Some(bytes)) => bytes,
-                Ok(None) => Bytes::new(),
+                Ok(None) => 0,
                 Err(error) => return p1_errno_from_tcp_error_for_fdflags(error, fdflags),
             };
-            let status = p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, ret_size);
+            let status = p1_write_u32(
+                caller,
+                memory,
+                ret_size,
+                u32::try_from(bytes)
+                    .unwrap_or_else(|_| panic!("TCP receive byte count exceeds u32")),
+            );
             if status != p1::errno::SUCCESS {
                 return status;
             }
@@ -16039,15 +16056,28 @@ where
     } else {
         u64::MAX
     };
+    let ranges = match p1_iovs_memory_ranges(memory, &layout.iovs) {
+        Ok(ranges) => ranges,
+        Err(errno) => return errno,
+    };
+    let buffer = crate::RegisteredTcpReadBuffer::new(memory.base, &ranges);
     let service_started = p1_kernel_profile_start(caller.data());
-    let bytes = match service.tcp_read(stream, capacity, timeout).await {
+    let bytes = match service
+        .tcp_read_into_registered(stream, buffer, timeout)
+        .await
+    {
         Ok(Some(bytes)) => bytes,
-        Ok(None) => Bytes::new(),
+        Ok(None) => 0,
         Err(error) => return p1_errno_from_tcp_error_for_fdflags(error, fdflags),
     };
     p1_record_optional_kernel_profile(caller.data(), "sock_recv_tcp_read", service_started);
     let write_started = p1_kernel_profile_start(caller.data());
-    let status = p1_write_iovs_from_bytes(caller, memory, layout.iovs, &bytes, ro_datalen);
+    let status = p1_write_u32(
+        caller,
+        memory,
+        ro_datalen,
+        u32::try_from(bytes).unwrap_or_else(|_| panic!("TCP receive byte count exceeds u32")),
+    );
     if status != p1::errno::SUCCESS {
         return status;
     }

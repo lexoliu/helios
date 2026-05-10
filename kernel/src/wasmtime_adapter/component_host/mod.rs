@@ -1364,7 +1364,7 @@ async fn run_system_component<CpuImpl, HostFs>(
     timer: crate::Timer<CpuImpl>,
     spawner: crate::Spawner<CpuImpl>,
     debug_state: HostRuntimeState<CpuImpl, HostFs>,
-    read_serial: fn(u32) -> Vec<u8>,
+    read_serial: crate::SerialReader,
     write_serial: fn(&[u8]),
 ) -> Result<(), DebuggerError>
 where

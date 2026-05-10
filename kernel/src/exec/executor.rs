@@ -2,9 +2,13 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::array;
+use core::cell::UnsafeCell;
 use core::future::Future;
 use core::marker::PhantomData;
+use core::mem::{MaybeUninit, align_of, size_of};
 use core::pin::Pin;
+use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 
@@ -21,14 +25,123 @@ type ReadyQueue = ConcurrentQueue<Runnable>;
 pub type JoinHandle<T> = Task<T>;
 pub const READY_BATCH_TASKS: usize = 1024;
 const READY_QUEUE_CAPACITY: usize = READY_BATCH_TASKS * 4;
+const TASK_ARENA_BYTES: usize = 1024 * 1024;
+const TASK_ARENA_ALIGN: usize = 64;
 static EXECUTOR_GROUP: Once<NoWeakArc<ExecutorGroup>> = Once::new();
 
 struct ExecutorGroup {
     local_queues: Box<[ReadyQueue]>,
     local_ready_counts: Box<[AtomicUsize]>,
+    task_arenas: Box<[NoWeakArc<TaskArena>]>,
     global_queue: ReadyQueue,
     global_ready_count: AtomicUsize,
     global_wake_cursor: AtomicUsize,
+}
+
+struct TaskArena {
+    bytes: TaskArenaBytes,
+    offset: AtomicUsize,
+    active: AtomicUsize,
+}
+
+#[repr(align(64))]
+struct TaskArenaBytes {
+    bytes: UnsafeCell<[MaybeUninit<u8>; TASK_ARENA_BYTES]>,
+}
+
+struct ArenaFuture<Fut> {
+    ptr: NonNull<Fut>,
+    arena: NoWeakArc<TaskArena>,
+}
+
+unsafe impl Sync for TaskArenaBytes {}
+unsafe impl Sync for TaskArena {}
+unsafe impl<Fut: Send> Send for ArenaFuture<Fut> {}
+
+impl TaskArena {
+    fn new() -> Self {
+        Self {
+            bytes: TaskArenaBytes {
+                bytes: UnsafeCell::new(array::from_fn(|_| MaybeUninit::uninit())),
+            },
+            offset: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+        }
+    }
+
+    fn allocate<Fut>(arena: &NoWeakArc<Self>, future: Fut) -> ArenaFuture<Fut> {
+        let size = size_of::<Fut>();
+        let align = align_of::<Fut>().max(1);
+        assert!(
+            align <= TASK_ARENA_ALIGN,
+            "future alignment exceeds executor task arena alignment"
+        );
+        let aligned_size = align_up(size.max(1), align);
+        arena.active.fetch_add(1, Ordering::AcqRel);
+        let start = arena
+            .offset
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |offset| {
+                let aligned_offset = align_up(offset, align);
+                aligned_offset
+                    .checked_add(aligned_size)
+                    .filter(|end| *end <= TASK_ARENA_BYTES)
+                    .map(|_| aligned_offset + aligned_size)
+            })
+            .unwrap_or_else(|_| {
+                arena.active.fetch_sub(1, Ordering::AcqRel);
+                panic!("executor task arena exhausted")
+            });
+        let ptr = unsafe { arena.bytes.ptr().add(start).cast::<Fut>() };
+        unsafe {
+            ptr.write(future);
+        }
+        ArenaFuture {
+            ptr: NonNull::new(ptr).expect("task arena pointer was null"),
+            arena: arena.clone(),
+        }
+    }
+
+    fn release(&self) {
+        let previous = self.active.fetch_sub(1, Ordering::AcqRel);
+        assert!(previous != 0, "task arena active count underflowed");
+        if previous == 1 {
+            self.offset.store(0, Ordering::Release);
+        }
+    }
+}
+
+impl TaskArenaBytes {
+    fn ptr(&self) -> *mut u8 {
+        self.bytes.get().cast::<u8>()
+    }
+}
+
+impl<Fut> Future for ArenaFuture<Fut>
+where
+    Fut: Future,
+{
+    type Output = Fut::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        unsafe { Pin::new_unchecked(&mut *self.get_unchecked_mut().ptr.as_ptr()).poll(cx) }
+    }
+}
+
+impl<Fut> Drop for ArenaFuture<Fut> {
+    fn drop(&mut self) {
+        unsafe {
+            ptr::drop_in_place(self.ptr.as_ptr());
+        }
+        self.arena.release();
+    }
+}
+
+fn align_up(value: usize, align: usize) -> usize {
+    let mask = align - 1;
+    value
+        .checked_add(mask)
+        .expect("task arena alignment overflowed")
+        & !mask
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -54,6 +167,7 @@ pub struct Spawner<CpuImpl: Cpu + Clone> {
     owner_processor: ProcessorId,
     local_queue_index: usize,
     processor_count: usize,
+    task_arena: NoWeakArc<TaskArena>,
     progress: ProgressCounter,
     progress_notify: NoWeakArc<Notify>,
 }
@@ -63,6 +177,7 @@ pub struct Executor {
     owner_processor: ProcessorId,
     local_queue_index: usize,
     processor_count: usize,
+    task_arena: NoWeakArc<TaskArena>,
     progress: ProgressCounter,
     progress_notify: NoWeakArc<Notify>,
 }
@@ -146,11 +261,13 @@ impl Executor {
                 )
             });
         let processor_count = group.local_queues.len();
+        let task_arena = group.task_arenas[local_queue_index].clone();
         Self {
             group,
             owner_processor,
             local_queue_index,
             processor_count,
+            task_arena,
             progress,
             progress_notify: NoWeakArc::new(Notify::new()),
         }
@@ -163,6 +280,7 @@ impl Executor {
             owner_processor: self.owner_processor,
             local_queue_index: self.local_queue_index,
             processor_count: self.processor_count,
+            task_arena: self.task_arena.clone(),
             progress: self.progress.clone(),
             progress_notify: self.progress_notify.clone(),
         }
@@ -231,6 +349,7 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         Fut: Future + Send + 'static,
         Fut::Output: Send + 'static,
     {
+        let future = TaskArena::allocate(&self.task_arena, future);
         let scheduler = self.global_scheduler();
         let schedule = move |runnable| scheduler.schedule(runnable);
         let (runnable, task) = Builder::new().spawn(move |_| future, schedule);
@@ -247,6 +366,7 @@ impl<CpuImpl: Cpu + Clone> Spawner<CpuImpl> {
         Fut: Future + 'static,
         Fut::Output: 'static,
     {
+        let future = TaskArena::allocate(&self.task_arena, future);
         if progress_mode == ProgressMode::Silent {
             let scheduler = self.local_silent_scheduler();
             let schedule = move |runnable| scheduler.schedule(runnable);
@@ -435,13 +555,16 @@ fn executor_group(configured_processors: usize) -> NoWeakArc<ExecutorGroup> {
             );
             let mut local_queues = Vec::with_capacity(configured_processors);
             let mut local_ready_counts = Vec::with_capacity(configured_processors);
+            let mut task_arenas = Vec::with_capacity(configured_processors);
             for _ in 0..configured_processors {
                 local_queues.push(ready_queue());
                 local_ready_counts.push(AtomicUsize::new(0));
+                task_arenas.push(NoWeakArc::new(TaskArena::new()));
             }
             NoWeakArc::new(ExecutorGroup {
                 local_queues: local_queues.into_boxed_slice(),
                 local_ready_counts: local_ready_counts.into_boxed_slice(),
+                task_arenas: task_arenas.into_boxed_slice(),
                 global_queue: ready_queue(),
                 global_ready_count: AtomicUsize::new(0),
                 global_wake_cursor: AtomicUsize::new(0),

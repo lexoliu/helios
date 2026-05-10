@@ -1543,8 +1543,8 @@ fn active_debug_serial() -> DebugSerial {
     DebugSerial { base }
 }
 
-fn read_debug_serial(max_bytes: u32) -> alloc::vec::Vec<u8> {
-    helios_kernel::try_read_serial(&active_debug_serial(), max_bytes)
+fn read_debug_serial(buffer: &mut alloc::vec::Vec<u8>, max_bytes: u32) {
+    helios_kernel::try_read_serial(&active_debug_serial(), buffer, max_bytes);
 }
 
 fn write_debug_serial_bytes(bytes: &[u8]) {

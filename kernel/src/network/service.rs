@@ -17,7 +17,7 @@ use helios_netstack::{
     IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Packet,
     MAX_OUTBOUND_FRAMES, NetworkInterface as NetworkDevice, OutboundBatchStatus, PacketBuffer,
     Route, Stack, StackConfig, StackError, StackInstant, TcpConnectState, TcpEndpoint, TcpPacket,
-    TcpReadState, UdpPacket, UdpPayload,
+    TcpReadIntoState, TcpReadState, UdpPacket, UdpPayload,
 };
 use spin::Mutex as SpinMutex;
 
@@ -25,8 +25,9 @@ use crate::{
     ComponentNetworkService, ComponentRuntimeState, DnsError, DnsErrorKind,
     Ipv4Address as KernelIpv4Address, Ipv4Cidr as KernelIpv4Cidr, Ipv4Route as KernelIpv4Route,
     MacAddress, NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
-    NetworkIpAddress, NetworkPortId, PingError, PingErrorKind, PingReply, TcpAccepted, TcpError,
-    TcpErrorKind, TcpListener, Timer, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
+    NetworkIpAddress, NetworkPortId, PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer,
+    TcpAccepted, TcpError, TcpErrorKind, TcpListener, Timer, UdpBinding, UdpDatagram, UdpError,
+    UdpErrorKind,
 };
 use triomphe::Arc;
 
@@ -982,6 +983,16 @@ where
             .await
     }
 
+    pub async fn tcp_read_into(
+        &self,
+        stream: TcpStreamId,
+        buffer: RegisteredTcpReadBuffer<'_>,
+        timeout_nanos: u64,
+    ) -> Result<Option<usize>, TcpError> {
+        self.execute_tcp_read_into(stream, buffer, timeout_nanos)
+            .await
+    }
+
     pub async fn tcp_shutdown_send(&self, stream: TcpStreamId) -> Result<(), TcpError> {
         self.inner
             .state
@@ -1308,6 +1319,49 @@ where
         }
     }
 
+    async fn execute_tcp_read_into(
+        &self,
+        stream: TcpStreamId,
+        mut buffer: RegisteredTcpReadBuffer<'_>,
+        timeout_nanos: u64,
+    ) -> Result<Option<usize>, TcpError> {
+        let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
+        let max_bytes = buffer.capacity();
+        loop {
+            match self.poll_tcp_read_into_once(stream, &mut buffer, "tcp-read-into-initial")? {
+                TcpReadIntoState::Data(bytes) => return Ok(Some(bytes)),
+                TcpReadIntoState::Eof => return Ok(None),
+                TcpReadIntoState::Pending => {}
+            }
+
+            let drive_started = self.profile_start();
+            self.drive_tcp_read_network_burst(max_bytes).await?;
+            self.record_network_profile("tcp-read-into-drive-network", drive_started);
+            match self.poll_tcp_read_into_once(stream, &mut buffer, "tcp-read-into-after-drive")? {
+                TcpReadIntoState::Data(bytes) => return Ok(Some(bytes)),
+                TcpReadIntoState::Eof => return Ok(None),
+                TcpReadIntoState::Pending => {}
+            }
+            match self
+                .poll_tcp_read_into_without_interrupt_sleep(stream, &mut buffer, deadline_nanos)
+                .await?
+            {
+                TcpReadIntoState::Data(bytes) => return Ok(Some(bytes)),
+                TcpReadIntoState::Eof => return Ok(None),
+                TcpReadIntoState::Pending => {}
+            }
+            if self.now_nanos() >= deadline_nanos {
+                return Err(TcpError {
+                    kind: TcpErrorKind::Timeout,
+                    detail: NetworkErrorDetail::TcpReadTimeout,
+                });
+            }
+            let wait_started = self.profile_start();
+            self.wait_for_tcp_progress(deadline_nanos).await;
+            self.record_network_profile("tcp-read-into-wait", wait_started);
+        }
+    }
+
     fn poll_tcp_read_once(
         &self,
         stream: TcpStreamId,
@@ -1321,6 +1375,22 @@ where
             .state
             .with_mut(|state| state.poll_tcp_read(stream, max_bytes, now))?;
         self.record_tcp_read_progress(profile_prefix, started, &read);
+        Ok(read)
+    }
+
+    fn poll_tcp_read_into_once(
+        &self,
+        stream: TcpStreamId,
+        buffer: &mut RegisteredTcpReadBuffer<'_>,
+        profile_prefix: &'static str,
+    ) -> Result<TcpReadIntoState, TcpError> {
+        let started = self.profile_start();
+        let now = StackInstant::from_nanos(self.now_nanos());
+        let read = self
+            .inner
+            .state
+            .with_mut(|state| state.poll_tcp_read_into(stream, buffer, now))?;
+        self.record_tcp_read_into_progress(profile_prefix, started, &read);
         Ok(read)
     }
 
@@ -1376,6 +1446,44 @@ where
             }
         }
         Ok(TcpReadProgress::Pending)
+    }
+
+    async fn poll_tcp_read_into_without_interrupt_sleep(
+        &self,
+        stream: TcpStreamId,
+        buffer: &mut RegisteredTcpReadBuffer<'_>,
+        deadline_nanos: u64,
+    ) -> Result<TcpReadIntoState, TcpError> {
+        let capabilities = self.inner.device.capabilities().events;
+        if !capabilities.polling || capabilities.interrupts {
+            return Ok(TcpReadIntoState::Pending);
+        }
+
+        for _ in 0..NETWORK_POLLING_TCP_READ_ROUNDS {
+            if self.now_nanos() >= deadline_nanos {
+                return Ok(TcpReadIntoState::Pending);
+            }
+            let yield_started = self.profile_start();
+            crate::yield_now().await;
+            self.record_network_profile("tcp-read-into-polling-yield", yield_started);
+
+            let drive_started = self.profile_start();
+            let outcome = self
+                .poll_network_once(NetworkPollSource::Tcp)
+                .await
+                .map_err(|error| {
+                    TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed)
+                })?;
+            self.record_network_profile("tcp-read-into-polling-drive-network", drive_started);
+            match self.poll_tcp_read_into_once(stream, buffer, "tcp-read-into-polling")? {
+                ready @ (TcpReadIntoState::Data(_) | TcpReadIntoState::Eof) => return Ok(ready),
+                TcpReadIntoState::Pending => {}
+            }
+            if outcome.0.is_idle() {
+                break;
+            }
+        }
+        Ok(TcpReadIntoState::Pending)
     }
 
     async fn execute_udp_bind(&self, local_port: u16) -> Result<UdpBinding<UdpSocketId>, UdpError> {
@@ -1714,6 +1822,11 @@ where
         stream: TcpStreamId,
         max_bytes: usize,
     ) -> Result<TcpReadProgress, TcpError> {
+        self.drive_tcp_read_network_burst(max_bytes).await?;
+        self.poll_tcp_read_once(stream, max_bytes, "tcp-read-after-drive")
+    }
+
+    async fn drive_tcp_read_network_burst(&self, max_bytes: usize) -> Result<(), TcpError> {
         let capabilities = self.inner.device.capabilities().events;
         let rounds = if capabilities.polling && max_bytes > self.inner.device.max_frame_len() {
             NETWORK_TCP_READ_BURST_ROUNDS
@@ -1759,7 +1872,7 @@ where
                 }
             }
         }
-        self.poll_tcp_read_once(stream, max_bytes, "tcp-read-after-drive")
+        Ok(())
     }
 
     async fn drive_udp(&self) -> Result<(), UdpError> {
@@ -2315,6 +2428,20 @@ where
         self.record_network_profile_events_bytes_between(phase, start, end, 1, bytes);
     }
 
+    fn record_tcp_read_into_progress(
+        &self,
+        prefix: &'static str,
+        start: Option<NetworkPerfStart>,
+        read: &TcpReadIntoState,
+    ) {
+        let (phase, bytes) = match read {
+            TcpReadIntoState::Pending => (tcp_read_profile_phase(prefix, "pending"), 0),
+            TcpReadIntoState::Data(bytes) => (tcp_read_profile_phase(prefix, "ready"), *bytes),
+            TcpReadIntoState::Eof => (tcp_read_profile_phase(prefix, "eof"), 0),
+        };
+        self.record_network_profile_events_bytes(phase, start, 1, bytes);
+    }
+
     pub fn hardware_address(&self) -> [u8; 6] {
         self.inner.device.mac_address()
     }
@@ -2466,6 +2593,15 @@ where
         timeout_nanos: u64,
     ) -> impl core::future::Future<Output = Result<Option<Bytes>, TcpError>> + Send + 'a {
         async move { NetworkService::tcp_read(self, stream, max_bytes, timeout_nanos).await }
+    }
+
+    fn tcp_read_into<'a>(
+        &'a self,
+        stream: Self::TcpStream,
+        buffer: RegisteredTcpReadBuffer<'a>,
+        timeout_nanos: u64,
+    ) -> impl core::future::Future<Output = Result<Option<usize>, TcpError>> + Send + 'a {
+        async move { NetworkService::tcp_read_into(self, stream, buffer, timeout_nanos).await }
     }
 
     fn tcp_shutdown_send(
@@ -3118,6 +3254,21 @@ impl NetworkShard {
             TcpReadState::Data(bytes) => Ok(TcpReadProgress::Data(bytes)),
             TcpReadState::Eof => Ok(TcpReadProgress::Eof),
         }
+    }
+
+    fn poll_tcp_read_into(
+        &mut self,
+        stream: TcpStreamId,
+        buffer: &mut RegisteredTcpReadBuffer<'_>,
+        now: StackInstant,
+    ) -> Result<TcpReadIntoState, TcpError> {
+        let socket = self.tcp_socket(stream)?;
+        self.stack
+            .tcp_read_into(socket, buffer, now)
+            .map_err(|_| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::TcpReceiveFailed,
+            })
     }
 
     fn start_udp_bind(&mut self, local_port: u16) -> Result<UdpBinding<UdpSocketId>, UdpError> {

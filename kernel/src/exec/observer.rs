@@ -6,11 +6,13 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use arrayvec::ArrayString;
 use helios_hal::cpu::HardwarePerfCounterDelta;
 
 pub const DEFAULT_TRACE_HISTORY_CAPACITY: usize = 512;
 pub const DEFAULT_PROFILE_STACK_CAPACITY: usize = 1024;
 pub const DEFAULT_PERF_METRIC_CAPACITY: usize = 512;
+const OBSERVER_TEXT_STACK_BYTES: usize = 256;
 
 #[derive(Clone, Debug)]
 pub struct TraceFilter {
@@ -156,10 +158,15 @@ impl ProfileStackInput for ProfileStackParts<'_> {
     }
 
     fn into_string(self) -> String {
-        let mut stack = String::with_capacity(self.prefix.len().saturating_add(self.suffix.len()));
+        let len = self.prefix.len().saturating_add(self.suffix.len());
+        assert!(
+            len <= OBSERVER_TEXT_STACK_BYTES,
+            "profile stack exceeds observer stack buffer capacity"
+        );
+        let mut stack = ArrayString::<OBSERVER_TEXT_STACK_BYTES>::new();
         stack.push_str(self.prefix);
         stack.push_str(self.suffix);
-        stack
+        stack.as_str().to_owned()
     }
 }
 
@@ -560,8 +567,12 @@ fn level_priority(level: TraceLevel) -> u8 {
 }
 
 fn strip_ansi(text: &str) -> String {
+    assert!(
+        text.len() <= OBSERVER_TEXT_STACK_BYTES,
+        "trace line exceeds observer stack buffer capacity"
+    );
     let bytes = text.as_bytes();
-    let mut output = String::with_capacity(text.len());
+    let mut output = ArrayString::<OBSERVER_TEXT_STACK_BYTES>::new();
     let mut index = 0;
 
     while index < bytes.len() {
@@ -584,7 +595,7 @@ fn strip_ansi(text: &str) -> String {
         index += 1;
     }
 
-    output
+    output.as_str().to_owned()
 }
 
 #[cfg(test)]

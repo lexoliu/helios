@@ -223,7 +223,7 @@ where
     entropy: EntropyPool,
     clock: KernelClock<CpuImpl, RuntimeStateImpl>,
     execution_context: ComponentExecutionContext<FileSystem>,
-    serial_reader: fn(u32) -> Vec<u8>,
+    serial_reader: crate::SerialReader,
     serial_writer: fn(&[u8]),
     /// Set by the runtime exit interface before the guest
     /// traps; the executor reads it to distinguish a clean requested
@@ -287,7 +287,7 @@ where
         environment: Vec<(String, String)>,
         process_authority: ProcessAuthority,
         output_mode: ComponentOutputMode,
-        serial_reader: fn(u32) -> Vec<u8>,
+        serial_reader: crate::SerialReader,
         serial_writer: fn(&[u8]),
     ) -> Self {
         let entropy = EntropyPool::from_cpu(&cpu, instance.id().raw());
@@ -359,7 +359,7 @@ where
         &self.execution_context.output_mode
     }
 
-    pub(crate) fn serial_reader_fn(&self) -> fn(u32) -> Vec<u8> {
+    pub(crate) fn serial_reader_fn(&self) -> crate::SerialReader {
         self.serial_reader
     }
 
@@ -488,7 +488,11 @@ where
     /// reader half of the parent-provided channel is polled once.
     pub fn try_read_stdin(&self, max_bytes: u32) -> Vec<u8> {
         match &self.execution_context.output_mode {
-            ComponentOutputMode::Serial => (self.serial_reader)(max_bytes),
+            ComponentOutputMode::Serial => {
+                let mut bytes = Vec::new();
+                (self.serial_reader)(&mut bytes, max_bytes);
+                bytes
+            }
             ComponentOutputMode::Trace => Vec::new(),
             ComponentOutputMode::Child { stdin_rx, .. }
             | ComponentOutputMode::RoutedChild { stdin_rx, .. } => match stdin_rx.try_read() {
@@ -513,7 +517,8 @@ where
                 // Busy-poll with yield_now between polls — the serial
                 // port is a raw hardware reader without async wakeup.
                 loop {
-                    let bytes = (self.serial_reader)(u32::MAX);
+                    let mut bytes = Vec::new();
+                    (self.serial_reader)(&mut bytes, u32::MAX);
                     if !bytes.is_empty() {
                         return Some(bytes);
                     }
@@ -536,7 +541,9 @@ where
     /// configured stdio routing. Used by `helios:system/serial.read` and
     /// the debugger shell to drain user input directly from hardware.
     pub fn try_read_serial_port(&self, max_bytes: u32) -> Vec<u8> {
-        (self.serial_reader)(max_bytes)
+        let mut bytes = Vec::new();
+        (self.serial_reader)(&mut bytes, max_bytes);
+        bytes
     }
 
     pub fn record_transition(&mut self, transition: InstanceExecutionTransition) {

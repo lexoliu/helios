@@ -784,8 +784,8 @@ fn current_debug_transport() -> &'static DebugTransport {
         .expect("debug transport is missing from the current hart runtime")
 }
 
-fn read_debug_serial(max_bytes: u32) -> alloc::vec::Vec<u8> {
-    helios_kernel::try_read_serial(current_debug_transport(), max_bytes)
+fn read_debug_serial(buffer: &mut alloc::vec::Vec<u8>, max_bytes: u32) {
+    helios_kernel::try_read_serial(current_debug_transport(), buffer, max_bytes);
 }
 
 pub(crate) fn write_debug_serial_bytes(bytes: &[u8]) {

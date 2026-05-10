@@ -15,5 +15,6 @@ pub use poll_registry::{
     PollKey, PollRegistration, PollRegistry, PollRegistryError, PollSourceKind,
 };
 pub use serial::{
-    emit_serial_error_marker, emit_serial_stage_marker, read_serial, try_read_serial, write_serial,
+    SerialReader, emit_serial_error_marker, emit_serial_stage_marker, read_serial, try_read_serial,
+    write_serial,
 };

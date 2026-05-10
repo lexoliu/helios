@@ -13,7 +13,8 @@ use crate::{
     ArpOperation, ArpPacket, BbrV3, CongestionControl, DEFAULT_POLL_BUDGET, DhcpDnsServers,
     EthernetAddress, EthernetFrame, EthernetProtocol, Icmpv6Packet, IpAddress, IpCidr, Ipv4Address,
     Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, PacketBuffer, StackError, TcpEndpoint,
-    TcpFlags, TcpHeader, TcpHeaderOptions, TcpPacket, TcpSocket, TcpTransmitSegment, UdpPacket,
+    TcpFlags, TcpHeader, TcpHeaderOptions, TcpPacket, TcpReceiveBuffer, TcpSocket,
+    TcpTransmitSegment, UdpPacket,
 };
 
 pub const MAX_ROUTES: usize = 32;
@@ -299,6 +300,13 @@ pub enum TcpConnectState {
 pub enum TcpReadState {
     Pending,
     Data(Bytes),
+    Eof,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpReadIntoState {
+    Pending,
+    Data(usize),
     Eof,
 }
 
@@ -1414,6 +1422,27 @@ where
             Some(bytes) => TcpReadState::Data(bytes),
             None if socket.state() == crate::TcpState::CloseWait => TcpReadState::Eof,
             None => TcpReadState::Pending,
+        };
+        self.schedule_tcp_timer(index);
+        self.update_tcp_receive_backpressure(index);
+        Ok(state)
+    }
+
+    pub fn tcp_read_into<S>(
+        &mut self,
+        socket: SocketId,
+        sink: &mut S,
+        now: StackInstant,
+    ) -> Result<TcpReadIntoState, StackError>
+    where
+        S: TcpReceiveBuffer,
+    {
+        let index = socket_index(socket);
+        let socket = self.tcp_socket_mut(socket)?;
+        let state = match socket.receive_into(sink, now.nanos()) {
+            Some(bytes) => TcpReadIntoState::Data(bytes),
+            None if socket.state() == crate::TcpState::CloseWait => TcpReadIntoState::Eof,
+            None => TcpReadIntoState::Pending,
         };
         self.schedule_tcp_timer(index);
         self.update_tcp_receive_backpressure(index);

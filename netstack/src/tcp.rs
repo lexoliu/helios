@@ -8,7 +8,7 @@ use heapless::{Deque, Vec as HeapVec};
 
 use crate::{
     AckSample, CongestionControl, CongestionEvent, IpAddress, RecoveryAction, TcpFlags, TcpHeader,
-    TcpHeaderOptions, TcpPacket, TcpSackBlock, TcpSackBlocks, TcpTimestampOption,
+    TcpHeaderOptions, TcpPacket, TcpReceiveBuffer, TcpSackBlock, TcpSackBlocks, TcpTimestampOption,
 };
 
 pub(crate) const TCP_RECEIVE_SEGMENT_BYTES: usize = 1460;
@@ -1004,22 +1004,12 @@ where
                 let tail = bytes.split_off(max_bytes);
                 self.push_front_receive_segment(tail);
             }
-            let drained_segments = self.drain_contiguous_out_of_order();
-            self.consume_pending_receive_fin(now_nanos);
-            self.refresh_advertised_window();
-            if drained_segments != 0 || self.should_advertise_window_update(previous_window) {
-                self.request_ack();
-            }
+            self.complete_receive_drain(previous_window, now_nanos);
             return Some(bytes.freeze());
         }
 
         if self.receive_queue_is_empty() {
-            let drained_segments = self.drain_contiguous_out_of_order();
-            self.consume_pending_receive_fin(now_nanos);
-            self.refresh_advertised_window();
-            if drained_segments != 0 || self.should_advertise_window_update(previous_window) {
-                self.request_ack();
-            }
+            self.complete_receive_drain(previous_window, now_nanos);
             return Some(bytes.freeze());
         }
 
@@ -1037,19 +1027,68 @@ where
             }
             bytes.unsplit(next);
         }
-        let drained_segments = self.drain_contiguous_out_of_order();
-        self.consume_pending_receive_fin(now_nanos);
-        self.refresh_advertised_window();
-        if drained_segments != 0 || self.should_advertise_window_update(previous_window) {
-            self.request_ack();
-        }
+        self.complete_receive_drain(previous_window, now_nanos);
         Some(bytes.freeze())
+    }
+
+    pub fn receive_into<S>(&mut self, sink: &mut S, now_nanos: u64) -> Option<usize>
+    where
+        S: TcpReceiveBuffer,
+    {
+        if sink.remaining_capacity() == 0 {
+            return (!self.receive_queue_is_empty()).then_some(0);
+        }
+        self.consume_pending_receive_fin(now_nanos);
+        let previous_window = self.advertised_window;
+        let mut written_total = 0usize;
+
+        loop {
+            let Some(mut bytes) = self.pop_receive_segment() else {
+                if written_total == 0 {
+                    return None;
+                }
+                break;
+            };
+            let remaining_before = sink.remaining_capacity();
+            let written = sink.write_from(bytes.as_ref());
+            assert!(
+                written <= bytes.len(),
+                "TCP receive sink wrote more bytes than the source segment"
+            );
+            assert!(
+                written != 0 || remaining_before == 0 || bytes.is_empty(),
+                "TCP receive sink made no progress with available capacity"
+            );
+            written_total = written_total
+                .checked_add(written)
+                .expect("TCP receive sink byte count overflowed");
+            if written < bytes.len() {
+                let tail = bytes.split_off(written);
+                self.push_front_receive_segment(tail);
+                break;
+            }
+            if sink.remaining_capacity() == 0 || self.receive_queue_is_empty() {
+                break;
+            }
+        }
+
+        self.complete_receive_drain(previous_window, now_nanos);
+        Some(written_total)
     }
 
     fn receive_merge_len(&self, first_len: usize, max_bytes: usize) -> usize {
         first_len
             .saturating_add(self.receive_queued_bytes)
             .min(max_bytes)
+    }
+
+    fn complete_receive_drain(&mut self, previous_window: u16, now_nanos: u64) {
+        let drained_segments = self.drain_contiguous_out_of_order();
+        self.consume_pending_receive_fin(now_nanos);
+        self.refresh_advertised_window();
+        if drained_segments != 0 || self.should_advertise_window_update(previous_window) {
+            self.request_ack();
+        }
     }
 
     pub fn on_segment(

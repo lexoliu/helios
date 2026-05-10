@@ -48,7 +48,7 @@ where
     pub environment: Vec<(alloc::string::String, alloc::string::String)>,
     pub process_authority: ProcessAuthority,
     pub output_mode: ComponentOutputMode,
-    pub serial_reader: fn(u32) -> Vec<u8>,
+    pub serial_reader: crate::SerialReader,
     pub serial_writer: fn(&[u8]),
     _host_fs: core::marker::PhantomData<HostFs>,
 }
@@ -73,7 +73,7 @@ where
         environment: Vec<(alloc::string::String, alloc::string::String)>,
         process_authority: ProcessAuthority,
         output_mode: ComponentOutputMode,
-        serial_reader: fn(u32) -> Vec<u8>,
+        serial_reader: crate::SerialReader,
         serial_writer: fn(&[u8]),
     ) -> Self {
         Self {
