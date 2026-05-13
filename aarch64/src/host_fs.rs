@@ -1,7 +1,6 @@
 extern crate alloc;
 
-use alloc::vec::Vec;
-
+use bytes::BytesMut;
 use fdt::Fdt;
 use helios_hal::io::IoError;
 use helios_kernel::HostFsTransport;
@@ -45,17 +44,19 @@ impl HostFsTransport for HostFsTransportService {
     fn request<'a>(
         &'a self,
         bytes: &'a [u8],
+        response: &'a mut BytesMut,
         response_len: usize,
-    ) -> impl core::future::Future<Output = Result<Vec<u8>, IoError>> + Send + 'a {
+    ) -> impl core::future::Future<Output = Result<(), IoError>> + Send + 'a {
         async move {
-            let mut response = alloc::vec![0_u8; response_len];
+            response.clear();
+            response.resize(response_len, 0);
             let used = self
                 .device
-                .request_with_wait(bytes, &mut response, helios_kernel::yield_now)
+                .request_with_wait(bytes, response, helios_kernel::yield_now)
                 .await?;
             let used = usize::try_from(used).map_err(|_| IoError::DeviceFault)?;
             response.truncate(used);
-            Ok(response)
+            Ok(())
         }
     }
 }

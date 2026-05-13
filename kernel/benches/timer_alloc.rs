@@ -1,10 +1,9 @@
 //! Timer allocation baseline.
 //!
-//! `Sleep::poll` currently allocates an `Arc<SleepState>` on the
-//! first pending poll (kernel/src/timer.rs:278). The follow-up
-//! Phase 3.1 replaces that with a refcounted slab-pool inside
-//! `TimerShared` so steady-state usage is zero-allocation. This
-//! bench captures the current cost to anchor the regression line.
+//! `Sleep::poll` now acquires a refcounted slab slot inside
+//! `TimerShared` on the first pending poll. The bench captures the
+//! allocation profile of the pool-backed path so the old
+//! per-`Sleep` heap allocation does not return.
 //!
 //! Workload shape:
 //!
@@ -13,13 +12,12 @@
 //!     pending state. These already do not allocate today.
 //!   * `sleep_first_poll_pending` — poll once with a non-zero
 //!     deadline and a noop waker so the future returns Pending. This
-//!     forces the `Arc<SleepState>` allocation that Phase 3.1 will
-//!     pool. The divan allocator profile shows the per-iteration
-//!     bytes / count.
+//!     exercises pool acquisition. The divan allocator profile shows
+//!     per-iteration bytes / count.
 //!   * `sleep_register_then_drop` — first-pending poll, then drop the
 //!     future without firing. Mirrors a TCP retransmit timer that is
-//!     cancelled when an ACK arrives in time. Phase 3.1 must keep
-//!     this path zero-allocation.
+//!     cancelled when an ACK arrives in time. This path must stay
+//!     zero-allocation after warm pool setup.
 
 extern crate alloc;
 

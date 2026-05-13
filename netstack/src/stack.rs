@@ -923,8 +923,21 @@ where
         &mut self.routes
     }
 
+    pub fn replace_routes(&mut self, routes: RouteTable) {
+        self.routes = routes;
+    }
+
     pub fn neighbors(&self) -> impl Iterator<Item = NeighborEntry> + '_ {
         self.neighbors.iter().copied()
+    }
+
+    pub fn replace_neighbors(&mut self, neighbors: impl IntoIterator<Item = NeighborEntry>) {
+        self.neighbors.clear();
+        for entry in neighbors {
+            self.neighbors
+                .try_push(entry)
+                .unwrap_or_else(|_| panic!("neighbor table is full"));
+        }
     }
 
     pub fn learn_neighbor(&mut self, entry: NeighborEntry) {
@@ -1006,6 +1019,15 @@ where
 
     pub fn ipv4_addresses(&self) -> impl Iterator<Item = Ipv4Cidr> + '_ {
         self.ipv4_addresses.iter().copied()
+    }
+
+    pub fn replace_ipv4_addresses(&mut self, addresses: impl IntoIterator<Item = Ipv4Cidr>) {
+        self.ipv4_addresses.clear();
+        for address in addresses {
+            self.ipv4_addresses
+                .try_push(address)
+                .unwrap_or_else(|_| panic!("IPv4 address table is full"));
+        }
     }
 
     pub fn primary_ipv6_address(&self) -> Option<Ipv6Cidr> {

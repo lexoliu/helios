@@ -667,10 +667,10 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             .map(Some)
     }
 
-    /// Clamps a caller-provided queue pair index to a valid one so
-    /// stale or oversized hints (e.g. `current_processor()` when
-    /// fewer pairs were brought up than CPUs) fall back to the
-    /// last live queue instead of panicking.
+    /// Maps a caller-provided queue pair index onto the live
+    /// queue-pair ring. This lets CPU/shard indices exceed the
+    /// device's negotiated queue-pair count without adding a legacy
+    /// single-queue code path.
     fn normalize_pair_idx(&self, pair_idx: usize) -> usize {
         if self.queue_pairs.is_empty() {
             return 0;

@@ -1,9 +1,10 @@
 //! SMP scaling baseline for the in-kernel network service.
 //!
-//! The current production architecture (`kernel/src/network_service.rs`)
-//! wraps all socket state in a single `SpinMutex<NetworkState>`. Every
-//! TCP/UDP/DNS operation funnels through that lock, so on multi-core
-//! systems aggregate throughput plateaus or regresses with concurrency.
+//! The production architecture (`kernel/src/network/service.rs`) lays
+//! out one `NetworkShard` per CPU and routes socket handles back to
+//! their owner shard. This bench keeps the pre-sharding single-lock
+//! curve next to the sharded curve so regressions in the SMP scaling
+//! contract are obvious.
 //!
 //! These benches exercise the contention shape directly without
 //! standing up a full kernel: a tiny "socket op" (a contended-state
@@ -12,25 +13,21 @@
 //! `N` std threads against three concurrency primitives:
 //!
 //!   * `single_mutex` — one `SpinMutex` shared by every thread.
-//!     Models the existing architecture; aggregate ops/sec is bounded
+//!     Models the old architecture; aggregate ops/sec is bounded
 //!     by lock-acquisition latency and does not scale with `N`.
 //!   * `sharded_mutex` — `N` independent `SpinMutex`es, one per
 //!     thread, with the work permuted so each thread always hits its
 //!     local shard. Models the shared-nothing architecture
 //!     (Phase 4.1) where each socket's lifetime is tied to a single
-//!     CPU; aggregate ops/sec scales near-linearly with `N`.
+//!     CPU; aggregate ops/sec should scale near-linearly with `N`.
 //!   * `arc_swap_read` — `arc-swap`-backed read of an immutable route
 //!     table. Models the read-mostly RCU path Phase 4.1 introduces
 //!     for ARP / neighbour / routing tables.
 //!
-//! The Phase 4.1 success criterion sourced from these benches:
+//! The success criterion sourced from these benches:
 //! `sharded_mutex / N` should stay within 10% of the `N=1` baseline,
 //! while `single_mutex / N` falls off well below 50% of baseline at
-//! `N=4` and worse at `N=8`. Once Phase 4.1 lands, the production
-//! kernel/src/network_service.rs `runtime_network_smp` follow-up bench
-//! can replace the synthetic state with the real
-//! `helios_kernel::ComponentHostNetworkService` and the curves carry
-//! over without re-tuning.
+//! `N=4` and worse at `N=8`.
 
 use std::hint::black_box;
 use std::sync::Arc;

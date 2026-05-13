@@ -1,14 +1,13 @@
 use anyhow::{Context as _, Result};
 use async_io::Async;
-use async_net::unix::UnixStream as AsyncUnixStream;
 use futures_io::{AsyncRead, AsyncWrite};
-use futures_util::io::AsyncReadExt as _;
 use std::ffi::CStr;
 use std::fs::File;
 use std::io;
 use std::os::fd::FromRawFd;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::FileTypeExt;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{ChildStdin, ChildStdout};
 use std::time::{Duration, Instant};
@@ -290,7 +289,7 @@ fn open_tty_transport(device: &str, baud: u32) -> Result<(SerialReader, SerialWr
 async fn open_socket_transport(device: &str) -> Result<(SerialReader, SerialWriter)> {
     let deadline = Instant::now() + SOCKET_CONNECT_TIMEOUT;
     let socket = loop {
-        match AsyncUnixStream::connect(device).await {
+        match UnixStream::connect(device) {
             Ok(socket) => break socket,
             Err(error)
                 if matches!(
@@ -308,9 +307,54 @@ async fn open_socket_transport(device: &str) -> Result<(SerialReader, SerialWrit
             }
         }
     };
-    let (read, write) = socket.split();
+    socket
+        .set_nonblocking(true)
+        .with_context(|| format!("failed to configure serial socket {device} nonblocking"))?;
+    let read = socket
+        .try_clone()
+        .with_context(|| format!("failed to clone serial socket {device} reader"))?;
     Ok((
-        Box::new(read) as SerialReader,
-        Box::new(write) as SerialWriter,
+        Box::new(
+            Async::new(AsyncUnixSocket::new(read))
+                .with_context(|| format!("failed to register serial socket {device} reader"))?,
+        ) as SerialReader,
+        Box::new(
+            Async::new(AsyncUnixSocket::new(socket))
+                .with_context(|| format!("failed to register serial socket {device} writer"))?,
+        ) as SerialWriter,
     ))
+}
+
+struct AsyncUnixSocket {
+    socket: UnixStream,
+}
+
+impl AsyncUnixSocket {
+    fn new(socket: UnixStream) -> Self {
+        Self { socket }
+    }
+}
+
+unsafe impl async_io::IoSafe for AsyncUnixSocket {}
+
+impl AsFd for AsyncUnixSocket {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.socket.as_fd()
+    }
+}
+
+impl io::Read for AsyncUnixSocket {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        io::Read::read(&mut self.socket, buf)
+    }
+}
+
+impl io::Write for AsyncUnixSocket {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        io::Write::write(&mut self.socket, buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::Write::flush(&mut self.socket)
+    }
 }

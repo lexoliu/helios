@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 acpi = "6.1.1"
+bytes = { version = "1.10.1", default-features = false }
 critical-section = { version = "1.2.0", features = ["restore-state-usize"] }
 fdt = { version = "0.1.5", default-features = false }
 helios-hal.workspace = true

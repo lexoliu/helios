@@ -567,12 +567,8 @@ fn level_priority(level: TraceLevel) -> u8 {
 }
 
 fn strip_ansi(text: &str) -> String {
-    assert!(
-        text.len() <= OBSERVER_TEXT_STACK_BYTES,
-        "trace line exceeds observer stack buffer capacity"
-    );
     let bytes = text.as_bytes();
-    let mut output = ArrayString::<OBSERVER_TEXT_STACK_BYTES>::new();
+    let mut output = String::with_capacity(text.len());
     let mut index = 0;
 
     while index < bytes.len() {
@@ -595,7 +591,7 @@ fn strip_ansi(text: &str) -> String {
         index += 1;
     }
 
-    output.as_str().to_owned()
+    output
 }
 
 #[cfg(test)]

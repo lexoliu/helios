@@ -75,6 +75,7 @@ fn established_tcp_socket() -> TcpSocket<BbrV3> {
             options: TcpOptions::empty(),
             payload: &[],
         },
+        Bytes::new(),
         1,
     );
     assert_eq!(socket.state(), TcpState::Established);
@@ -251,6 +252,7 @@ fn tcp_receive_contiguous_read(bencher: Bencher, read_size: usize) {
         .bench_local(|| {
             let mut socket = established_tcp_socket();
             for index in 0..TCP_RECEIVE_SEGMENTS {
+                let payload_bytes = Bytes::copy_from_slice(black_box(payload.as_slice()));
                 let _ = socket.on_segment(
                     TcpPacket {
                         source_port: 80,
@@ -264,6 +266,7 @@ fn tcp_receive_contiguous_read(bencher: Bencher, read_size: usize) {
                         options: TcpOptions::empty(),
                         payload: black_box(payload.as_slice()),
                     },
+                    payload_bytes,
                     u64::try_from(index + 2).expect("TCP benchmark timestamp fits u64"),
                 );
             }
@@ -487,6 +490,7 @@ fn tcp_ack_discards_in_flight_segments(bencher: Bencher) {
                     options: TcpOptions::empty(),
                     payload: &[],
                 },
+                Bytes::new(),
                 u64::try_from(TCP_TRANSMIT_SEGMENTS + 2).expect("TCP benchmark timestamp fits u64"),
             );
             assert_eq!(socket.pending_retransmission(u64::MAX), None);

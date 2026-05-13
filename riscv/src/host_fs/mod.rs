@@ -1,9 +1,9 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 
+use bytes::BytesMut;
 use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 use core::num::NonZeroU32;
 use fdt::Fdt;
@@ -46,8 +46,9 @@ pub(crate) struct HostFsProbe {
 enum Request {
     Raw {
         bytes: Vec<u8>,
+        response: BytesMut,
         response_len: usize,
-        completion: oneshot::Sender<Result<Vec<u8>, IoError>>,
+        completion: oneshot::Sender<Result<BytesMut, IoError>>,
     },
 }
 
@@ -98,13 +99,19 @@ impl HostFsTransportService {
         self.inner.device.handle_interrupt();
     }
 
-    async fn raw_request(&self, bytes: Vec<u8>, response_len: usize) -> Result<Vec<u8>, IoError> {
+    async fn raw_request(
+        &self,
+        bytes: Vec<u8>,
+        response: BytesMut,
+        response_len: usize,
+    ) -> Result<BytesMut, IoError> {
         tracing::info!("9p: enqueuing raw request ({} bytes)", bytes.len());
         let (completion, rx) = oneshot::channel();
         self.inner
             .requests
             .push(Request::Raw {
                 bytes,
+                response,
                 response_len,
                 completion,
             })
@@ -126,10 +133,12 @@ impl HostFsTransportService {
             match request {
                 Request::Raw {
                     bytes,
+                    mut response,
                     response_len,
                     completion,
                 } => {
-                    let mut response = vec![0_u8; response_len];
+                    response.clear();
+                    response.resize(response_len, 0);
                     tracing::info!(
                         "9p transport: issuing device request ({} bytes)",
                         bytes.len()
@@ -173,15 +182,25 @@ impl HostFsTransport for HostFsTransportService {
     fn request<'a>(
         &'a self,
         bytes: &'a [u8],
+        response: &'a mut BytesMut,
         response_len: usize,
-    ) -> impl core::future::Future<Output = Result<Vec<u8>, IoError>> + Send + 'a {
+    ) -> impl core::future::Future<Output = Result<(), IoError>> + Send + 'a {
         // The riscv transport hands the request to a worker task
         // through `inner.requests`, so the bytes have to outlive the
         // current await. The kernel-side request buffer is owned by
-        // the caller's pool, so we copy here into a freshly-owned
-        // Vec rather than smuggling a reference across the channel.
+        // the caller's pool, so the request bytes are copied into an
+        // owned Vec while the caller-owned response buffer moves
+        // through the worker and returns through the completion.
         let owned = bytes.to_vec();
-        async move { self.raw_request(owned, response_len).await }
+        let mut worker_response = BytesMut::new();
+        core::mem::swap(response, &mut worker_response);
+        async move {
+            let mut filled = self
+                .raw_request(owned, worker_response, response_len)
+                .await?;
+            core::mem::swap(response, &mut filled);
+            Ok(())
+        }
     }
 }
 

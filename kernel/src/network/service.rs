@@ -1,6 +1,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::sync::Arc as StdArc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::num::NonZeroU32;
@@ -15,11 +16,11 @@ use helios_netstack::{
     DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage, DhcpDnsServers,
     DhcpMessageType, DhcpPacket, DnsQuestionWriter, DnsResponse, EthernetFrame, EthernetProtocol,
     IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Packet,
-    MAX_OUTBOUND_FRAMES, NetworkInterface as NetworkDevice, OutboundBatchStatus, PacketBuffer,
-    Route, Stack, StackConfig, StackError, StackInstant, TcpConnectState, TcpEndpoint, TcpPacket,
-    TcpReadIntoState, TcpReadState, UdpPacket, UdpPayload,
+    MAX_OUTBOUND_FRAMES, NeighborEntry, NetworkInterface as NetworkDevice, OutboundBatchStatus,
+    PacketBuffer, Route, RouteTable, Stack, StackConfig, StackError, StackEvent, StackInstant,
+    TcpConnectState, TcpEndpoint, TcpPacket, TcpReadIntoState, TcpReadState, UdpPacket, UdpPayload,
 };
-use spin::Mutex as SpinMutex;
+use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
 use crate::{
     ComponentNetworkService, ComponentRuntimeState, DnsError, DnsErrorKind,
@@ -37,9 +38,9 @@ const EPHEMERAL_PORT_END: u16 = 65_535;
 /// Peek the L4 destination port out of a parsed Ethernet frame.
 /// Used by the RX demux to route frames to the shard that owns the
 /// local port. Returns `None` for non-IP frames (ARP), non-TCP/UDP
-/// IP frames (ICMP), or malformed packets — all of which fall back
-/// to shard 0 in the dispatch path so the existing single-shard
-/// behaviour is preserved.
+/// IP frames (ICMP), or malformed packets — all of which route to
+/// shard 0 in the dispatch path because there is no socket-local
+/// owner to identify.
 fn peek_local_port(frame: &[u8]) -> Option<u16> {
     let ethernet = EthernetFrame::parse(frame)?;
     let payload = ethernet.payload;
@@ -124,6 +125,7 @@ where
     timer: Timer<CpuImpl>,
     device: Device,
     state: NetworkShardSet,
+    control: NetworkControlPlane,
     /// Adaptive poll budget shared across all shards. Lifted out of
     /// `NetworkShard` so its atomic-load reads on the network poll
     /// fast path do not have to acquire the per-shard SpinMutex.
@@ -134,6 +136,27 @@ where
     /// `state.with(|s| s.stack.config().rx_budget)` round-trip on
     /// every receive iteration.
     stack_rx_budget: usize,
+}
+
+struct NetworkControlPlane {
+    ipv4_addresses: SnapshotCell<NetworkIpv4AddressTable>,
+    routes: SnapshotCell<RouteTable>,
+    neighbors: SnapshotCell<NetworkNeighborTable>,
+    dns_servers: SnapshotCell<DhcpDnsServers>,
+}
+
+struct SnapshotCell<T> {
+    current: SpinRwLock<StdArc<T>>,
+}
+
+#[derive(Clone, Debug)]
+struct NetworkIpv4AddressTable {
+    entries: Vec<Ipv4Cidr>,
+}
+
+#[derive(Clone, Debug)]
+struct NetworkNeighborTable {
+    entries: Vec<NeighborEntry>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -229,11 +252,7 @@ struct NetworkShard {
     next_dns_query_id: u16,
 }
 
-/// A set of `NetworkShard` instances laid out per-CPU. The current
-/// implementation always carries a single shard; the surface
-/// (`with` / `with_mut`) is shaped so the upcoming N>1 expansion
-/// (one shard per processor, dispatched via socket-id hashing) is a
-/// localised change rather than a callsite-wide rewrite.
+/// A set of `NetworkShard` instances laid out per-CPU.
 ///
 /// Cache-line padding around each shard avoids false sharing once
 /// multiple shards live in the box: without it, two adjacent
@@ -380,6 +399,171 @@ impl NetworkShardSet {
             f(&mut guard);
         }
     }
+
+    fn min_tcp_deadline_nanos(&self) -> Option<u64> {
+        let mut next = None;
+        self.for_each(|shard| {
+            if let Some(deadline) = shard.stack.next_tcp_deadline().map(StackInstant::nanos) {
+                next = Some(next.map_or(deadline, |current: u64| current.min(deadline)));
+            }
+        });
+        next
+    }
+}
+
+impl NetworkControlPlane {
+    fn new() -> Self {
+        Self {
+            ipv4_addresses: SnapshotCell::new(NetworkIpv4AddressTable::new()),
+            routes: SnapshotCell::new(RouteTable::new()),
+            neighbors: SnapshotCell::new(NetworkNeighborTable::new()),
+            dns_servers: SnapshotCell::new(DhcpDnsServers::new()),
+        }
+    }
+
+    fn synchronize_shard(&self, shard: &mut NetworkShard) {
+        shard
+            .stack
+            .replace_ipv4_addresses(self.ipv4_addresses.load_full().entries.iter().copied());
+        shard
+            .stack
+            .replace_routes(self.routes.load_full().as_ref().clone());
+        shard
+            .stack
+            .replace_neighbors(self.neighbors.load_full().entries.iter().copied());
+        shard.dns_servers = self.dns_servers.load_full().as_ref().clone();
+    }
+
+    fn publish_from_shard(&self, shard: &NetworkShard) {
+        self.ipv4_addresses
+            .store(StdArc::new(NetworkIpv4AddressTable {
+                entries: shard.stack.ipv4_addresses().collect(),
+            }));
+        self.routes.store(StdArc::new(shard.stack.routes().clone()));
+        self.neighbors.store(StdArc::new(NetworkNeighborTable {
+            entries: shard.stack.neighbors().collect(),
+        }));
+        self.dns_servers
+            .store(StdArc::new(shard.dns_servers.clone()));
+    }
+
+    fn update_routes(
+        &self,
+        update: impl FnOnce(&mut RouteTable) -> Result<(), NetworkControlError>,
+    ) -> Result<(), NetworkControlError> {
+        let mut routes = self.routes.load_full().as_ref().clone();
+        update(&mut routes)?;
+        self.routes.store(StdArc::new(routes));
+        Ok(())
+    }
+
+    fn update_ipv4_addresses(
+        &self,
+        update: impl FnOnce(&mut NetworkIpv4AddressTable) -> Result<(), NetworkControlError>,
+    ) -> Result<(), NetworkControlError> {
+        let mut addresses = self.ipv4_addresses.load_full().as_ref().clone();
+        update(&mut addresses)?;
+        self.ipv4_addresses.store(StdArc::new(addresses));
+        Ok(())
+    }
+
+    fn update_neighbors(&self, update: impl FnOnce(&mut NetworkNeighborTable)) {
+        let mut neighbors = self.neighbors.load_full().as_ref().clone();
+        update(&mut neighbors);
+        self.neighbors.store(StdArc::new(neighbors));
+    }
+
+    fn list_ipv4_routes(&self) -> Vec<KernelIpv4Route> {
+        self.routes
+            .load_full()
+            .iter()
+            .filter_map(|route| match (route.destination, route.gateway) {
+                (IpCidr::Ipv4(destination), Some(IpAddress::Ipv4(gateway))) => {
+                    Some(KernelIpv4Route::with_lifetimes(
+                        map_ipv4_cidr(destination),
+                        map_ipv4_address(gateway),
+                        None,
+                        route.expires_at.map(StackInstant::nanos),
+                    ))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn list_ipv4_addresses(&self) -> Vec<KernelIpv4Cidr> {
+        self.ipv4_addresses
+            .load_full()
+            .entries
+            .iter()
+            .copied()
+            .map(map_ipv4_cidr)
+            .collect()
+    }
+}
+
+impl<T> SnapshotCell<T> {
+    fn new(value: T) -> Self {
+        Self {
+            current: SpinRwLock::new(StdArc::new(value)),
+        }
+    }
+
+    fn load_full(&self) -> StdArc<T> {
+        self.current.read().clone()
+    }
+
+    fn store(&self, value: StdArc<T>) {
+        *self.current.write() = value;
+    }
+}
+
+impl NetworkIpv4AddressTable {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, address: Ipv4Cidr) {
+        if !self.entries.contains(&address) {
+            self.entries.push(address);
+        }
+    }
+
+    fn remove(&mut self, address: Ipv4Cidr) {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|existing| *existing == address)
+        {
+            self.entries.remove(index);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+impl NetworkNeighborTable {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    fn learn(&mut self, entry: NeighborEntry) {
+        if let Some(existing) = self
+            .entries
+            .iter_mut()
+            .find(|existing| existing.ip == entry.ip)
+        {
+            *existing = entry;
+        } else {
+            self.entries.push(entry);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -492,25 +676,25 @@ impl NetworkPollSource {
         }
     }
 
-    const fn tx_fallback_collect_phase(self) -> &'static str {
+    const fn tx_batch_collect_phase(self) -> &'static str {
         match self {
-            Self::Pump => "tx-submit-fallback-collect-pump",
-            Self::Ping => "tx-submit-fallback-collect-ping",
-            Self::Dns => "tx-submit-fallback-collect-dns",
-            Self::Tcp => "tx-submit-fallback-collect-tcp",
-            Self::Udp => "tx-submit-fallback-collect-udp",
-            Self::Configuration => "tx-submit-fallback-collect-configuration",
+            Self::Pump => "tx-submit-batch-collect-pump",
+            Self::Ping => "tx-submit-batch-collect-ping",
+            Self::Dns => "tx-submit-batch-collect-dns",
+            Self::Tcp => "tx-submit-batch-collect-tcp",
+            Self::Udp => "tx-submit-batch-collect-udp",
+            Self::Configuration => "tx-submit-batch-collect-configuration",
         }
     }
 
-    const fn tx_fallback_device_phase(self) -> &'static str {
+    const fn tx_batch_device_phase(self) -> &'static str {
         match self {
-            Self::Pump => "tx-submit-fallback-device-pump",
-            Self::Ping => "tx-submit-fallback-device-ping",
-            Self::Dns => "tx-submit-fallback-device-dns",
-            Self::Tcp => "tx-submit-fallback-device-tcp",
-            Self::Udp => "tx-submit-fallback-device-udp",
-            Self::Configuration => "tx-submit-fallback-device-configuration",
+            Self::Pump => "tx-submit-batch-device-pump",
+            Self::Ping => "tx-submit-batch-device-ping",
+            Self::Dns => "tx-submit-batch-device-dns",
+            Self::Tcp => "tx-submit-batch-device-tcp",
+            Self::Udp => "tx-submit-batch-device-udp",
+            Self::Configuration => "tx-submit-batch-device-configuration",
         }
     }
 
@@ -872,6 +1056,7 @@ where
                 runtime_state,
                 timer,
                 state,
+                control: NetworkControlPlane::new(),
                 poll: NetworkPollState::new(rx_poll_budget, tx_completion_budget, rx_poll_budget),
                 stack_rx_budget,
                 device,
@@ -996,7 +1181,7 @@ where
     pub async fn tcp_shutdown_send(&self, stream: TcpStreamId) -> Result<(), TcpError> {
         self.inner
             .state
-            .with_mut(|state| state.shutdown_tcp_send(stream))?;
+            .with_handle(stream, |state| state.shutdown_tcp_send(stream))?;
         self.drive_tcp().await
     }
 
@@ -1235,7 +1420,7 @@ where
             let accepted = self
                 .inner
                 .state
-                .with_mut(|state| state.poll_tcp_accept(listener))?;
+                .with_handle(listener, |state| state.poll_tcp_accept(listener))?;
             if let Some(accepted) = accepted {
                 return Ok(accepted);
             }
@@ -1258,10 +1443,9 @@ where
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         while !bytes.is_empty() {
             self.drive_tcp().await?;
-            let written = self
-                .inner
-                .state
-                .with_mut(|state| state.try_write_tcp_bytes(stream, &mut bytes))?;
+            let written = self.inner.state.with_handle(stream, |state| {
+                state.try_write_tcp_bytes(stream, &mut bytes)
+            })?;
             if written != 0 {
                 continue;
             }
@@ -1373,7 +1557,7 @@ where
         let read = self
             .inner
             .state
-            .with_mut(|state| state.poll_tcp_read(stream, max_bytes, now))?;
+            .with_handle(stream, |state| state.poll_tcp_read(stream, max_bytes, now))?;
         self.record_tcp_read_progress(profile_prefix, started, &read);
         Ok(read)
     }
@@ -1386,10 +1570,9 @@ where
     ) -> Result<TcpReadIntoState, TcpError> {
         let started = self.profile_start();
         let now = StackInstant::from_nanos(self.now_nanos());
-        let read = self
-            .inner
-            .state
-            .with_mut(|state| state.poll_tcp_read_into(stream, buffer, now))?;
+        let read = self.inner.state.with_handle(stream, |state| {
+            state.poll_tcp_read_into(stream, buffer, now)
+        })?;
         self.record_tcp_read_into_progress(profile_prefix, started, &read);
         Ok(read)
     }
@@ -1565,6 +1748,7 @@ where
         port: u16,
         bytes: &[u8],
     ) -> Result<u64, UdpError> {
+        self.synchronize_control_plane();
         let now = StackInstant::from_nanos(self.now_nanos());
         let written = self
             .inner
@@ -1686,8 +1870,6 @@ where
         // DHCP runs on the shard that owns DHCP_CLIENT_PORT (68);
         // since 68 < EPHEMERAL_PORT_START it always routes to
         // shard 0, which is where DHCP responses also demux back.
-        // A future control-task PR will broadcast the lease to
-        // every shard so each Stack picks up the assigned IP.
         let configured = self
             .inner
             .state
@@ -1695,8 +1877,14 @@ where
                 state
                     .drive_dhcp(now)
                     .map_err(NetworkConfigurationError::Control)?;
+                if state.is_configured() {
+                    self.inner.control.publish_from_shard(state);
+                }
                 Ok::<bool, NetworkConfigurationError>(state.is_configured())
             })?;
+        if configured {
+            self.synchronize_control_plane();
+        }
         self.drive_network(NetworkPollSource::Configuration)
             .await
             .map_err(NetworkConfigurationError::Device)?;
@@ -1912,6 +2100,7 @@ where
         tcp_read_probe: Option<NetworkTcpReadProbe>,
         submit_transmit: bool,
     ) -> Result<NetworkPollOutcome, IoError> {
+        self.synchronize_control_plane();
         let budget = self.inner.poll.budget();
 
         let reclaim_started = self.profile_start();
@@ -1994,7 +2183,7 @@ where
             // ports can be processed in parallel by other CPUs and
             // each shard's Stack only sees the connections it
             // actually owns. Non-IP / non-TCP-UDP frames (ARP,
-            // ICMP, malformed) fall back to shard 0 via
+            // ICMP, malformed) route to shard 0 via
             // `shard_idx_for_port(None, ...)`.
             let shard_count = self.inner.state.shard_count();
             for frame in frames[..received_batch].iter().flatten() {
@@ -2025,6 +2214,7 @@ where
                         received_bytes = received_bytes.saturating_add(frame_len);
                     }
                 }
+                shard.drain_control_events(&self.inner.control);
             }
 
             if self
@@ -2098,6 +2288,12 @@ where
         })
     }
 
+    fn synchronize_control_plane(&self) {
+        self.inner
+            .state
+            .for_each(|state| self.inner.control.synchronize_shard(state));
+    }
+
     async fn submit_network_transmit(
         &self,
         source: NetworkPollSource,
@@ -2108,63 +2304,82 @@ where
         let transmit_started = self.profile_start();
         let mut transmit_stop = NetworkTransmitStop::Drained;
         while transmitted < budget.tx_frames {
-            let remaining_budget = budget.tx_frames - transmitted;
-            let immediate_started = self.profile_start();
-            let mut immediate_device_started = None;
-            let mut immediate_device_finished = None;
-            let immediate =
-                self.inner
-                    .state
-                    .with_mut(|state| -> Result<OutboundBatchStatus, IoError> {
-                        state.stack.try_submit_outbound_slices(
-                            remaining_budget.min(NETWORK_TX_BATCH_FRAMES),
-                            |frames| {
-                                immediate_device_started = self.profile_start();
-                                let result =
-                                    self.inner.device.try_transmit_slices_immediate(frames);
-                                immediate_device_finished = self.profile_start();
-                                result
-                            },
-                        )
-                    })?;
-            match immediate {
-                OutboundBatchStatus::Empty => break,
-                OutboundBatchStatus::Deferred => {}
-                OutboundBatchStatus::Submitted {
-                    offered,
-                    accepted,
-                    accepted_bytes,
-                } => {
-                    self.record_network_profile_events_bytes_between(
-                        source.tx_immediate_device_phase(),
-                        immediate_device_started,
-                        immediate_device_finished,
-                        accepted,
-                        accepted_bytes,
-                    );
-                    self.record_network_profile_events_bytes(
-                        source.tx_immediate_phase(),
-                        immediate_started,
-                        accepted,
-                        accepted_bytes,
-                    );
-                    transmitted += accepted;
-                    transmitted_bytes = transmitted_bytes.saturating_add(accepted_bytes);
-                    if accepted < offered {
-                        transmit_stop = NetworkTransmitStop::RingFull;
-                        break;
-                    }
-                    continue;
+            let mut immediate_submitted = false;
+            let mut immediate_deferred = false;
+            let shard_count = self.inner.state.shard_count();
+            for shard_idx in 0..shard_count {
+                if transmitted >= budget.tx_frames {
+                    break;
                 }
+                let remaining_budget = budget.tx_frames - transmitted;
+                let immediate_started = self.profile_start();
+                let mut immediate_device_started = None;
+                let mut immediate_device_finished = None;
+                let immediate = {
+                    let mut state = self.inner.state.shard_at(shard_idx).lock();
+                    state.stack.try_submit_outbound_slices(
+                        remaining_budget.min(NETWORK_TX_BATCH_FRAMES),
+                        |frames| {
+                            immediate_device_started = self.profile_start();
+                            let result = self
+                                .inner
+                                .device
+                                .try_transmit_slices_immediate_on(shard_idx, frames);
+                            immediate_device_finished = self.profile_start();
+                            result
+                        },
+                    )
+                }?;
+                match immediate {
+                    OutboundBatchStatus::Empty => {}
+                    OutboundBatchStatus::Deferred => {
+                        immediate_deferred = true;
+                    }
+                    OutboundBatchStatus::Submitted {
+                        offered,
+                        accepted,
+                        accepted_bytes,
+                    } => {
+                        immediate_submitted = true;
+                        self.record_network_profile_events_bytes_between(
+                            source.tx_immediate_device_phase(),
+                            immediate_device_started,
+                            immediate_device_finished,
+                            accepted,
+                            accepted_bytes,
+                        );
+                        self.record_network_profile_events_bytes(
+                            source.tx_immediate_phase(),
+                            immediate_started,
+                            accepted,
+                            accepted_bytes,
+                        );
+                        transmitted += accepted;
+                        transmitted_bytes = transmitted_bytes.saturating_add(accepted_bytes);
+                        if accepted < offered {
+                            transmit_stop = NetworkTransmitStop::RingFull;
+                            break;
+                        }
+                    }
+                }
+            }
+            if matches!(transmit_stop, NetworkTransmitStop::RingFull) {
+                break;
+            }
+            if immediate_submitted {
+                continue;
+            }
+            if !immediate_deferred {
+                break;
             }
 
             // Per-shard collect+submit: each shard drains its
             // outbound frames into its OWN device queue. Multi-queue
             // virtio (Phase 4.2) means shard N's TX submission hits
             // queue pair N's `tx_state` SpinMutex, with no
-            // contention against shards on other CPUs. Single-queue
-            // devices fall back to queue 0 internally via
-            // `normalize_pair_idx`.
+            // contention against shards on other CPUs. Devices with
+            // fewer negotiated queue pairs than shards map shards
+            // onto the live queue-pair ring.
             let collect_started = self.profile_start();
             let remaining_budget = budget.tx_frames - transmitted;
             let collect_limit = NETWORK_TX_BATCH_FRAMES.min(remaining_budget);
@@ -2227,13 +2442,13 @@ where
                 break;
             }
             self.record_network_profile_events_bytes(
-                source.tx_fallback_collect_phase(),
+                source.tx_batch_collect_phase(),
                 collect_started,
                 total_collected,
                 total_collected_bytes,
             );
             self.record_network_profile_events_bytes(
-                source.tx_fallback_device_phase(),
+                source.tx_batch_device_phase(),
                 collect_started,
                 total_submitted,
                 total_submitted_bytes,
@@ -2295,10 +2510,7 @@ where
         if now_nanos >= operation_deadline_nanos {
             return;
         }
-        let next_tcp_deadline = self
-            .inner
-            .state
-            .with_mut(|state| state.stack.next_tcp_deadline().map(StackInstant::nanos));
+        let next_tcp_deadline = self.inner.state.min_tcp_deadline_nanos();
         let next_deadline = next_tcp_deadline
             .unwrap_or(operation_deadline_nanos)
             .min(operation_deadline_nanos);
@@ -2447,9 +2659,7 @@ where
     }
 
     pub async fn ipv4_cidr(&self) -> Option<crate::Ipv4Cidr> {
-        self.inner
-            .state
-            .with(|state| state.stack.primary_ipv4_address().map(map_ipv4_cidr))
+        self.inner.control.list_ipv4_addresses().into_iter().next()
     }
 
     async fn acquire_dhcp_address(&self) -> Result<KernelIpv4Cidr, NetworkControlError> {
@@ -2460,9 +2670,13 @@ where
             let now = StackInstant::from_nanos(self.now_nanos());
             let next = self.inner.state.with_mut(|state| {
                 state.drive_dhcp(now)?;
+                if state.is_configured() {
+                    self.inner.control.publish_from_shard(state);
+                }
                 Ok(state.stack.primary_ipv4_address().map(map_ipv4_cidr))
             })?;
             if let Some(cidr) = next {
+                self.synchronize_control_plane();
                 return Ok(cidr);
             }
             self.drive_network(NetworkPollSource::Configuration)
@@ -2726,12 +2940,24 @@ where
         address: KernelIpv4Cidr,
     ) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
-        // Broadcast: each shard maintains its own ARP / route table
-        // off the RX traffic it observes, so the admin-installed
-        // address must reach every shard.
+        self.inner.control.update_ipv4_addresses(|addresses| {
+            addresses.add(map_kernel_ipv4_cidr(address));
+            Ok(())
+        })?;
+        let connected_route = Route {
+            destination: IpCidr::Ipv4(map_kernel_ipv4_cidr(address)),
+            gateway: None,
+            expires_at: None,
+        };
+        self.inner.control.update_routes(|routes| {
+            routes
+                .add(connected_route)
+                .map_err(|_| NetworkControlError::InvalidRoute)
+        })?;
         let mut result = Ok(());
         self.inner.state.for_each(|state| {
             if result.is_ok() {
+                self.inner.control.synchronize_shard(state);
                 if let Err(error) = state.add_ipv4_address(address) {
                     result = Err(error);
                 }
@@ -2746,7 +2972,20 @@ where
         address: KernelIpv4Cidr,
     ) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
+        self.inner.control.update_ipv4_addresses(|addresses| {
+            addresses.remove(map_kernel_ipv4_cidr(address));
+            Ok(())
+        })?;
+        self.inner.control.update_routes(|routes| {
+            routes.remove(Route {
+                destination: IpCidr::Ipv4(map_kernel_ipv4_cidr(address)),
+                gateway: None,
+                expires_at: None,
+            });
+            Ok(())
+        })?;
         self.inner.state.for_each(|state| {
+            self.inner.control.synchronize_shard(state);
             state.remove_ipv4_address(address);
         });
         Ok(())
@@ -2754,6 +2993,20 @@ where
 
     async fn clear_addresses(&self, port: NetworkPortId) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
+        self.inner.control.update_ipv4_addresses(|addresses| {
+            addresses.clear();
+            Ok(())
+        })?;
+        self.inner.control.update_routes(|routes| {
+            for cidr in self.inner.state.with(NetworkShard::list_ipv4_addresses) {
+                routes.remove(Route {
+                    destination: IpCidr::Ipv4(map_kernel_ipv4_cidr(cidr)),
+                    gateway: None,
+                    expires_at: None,
+                });
+            }
+            Ok(())
+        })?;
         self.inner
             .state
             .for_each(NetworkShard::clear_ipv4_addresses);
@@ -2765,7 +3018,7 @@ where
         port: NetworkPortId,
     ) -> Result<Vec<KernelIpv4Cidr>, NetworkControlError> {
         require_local_network_port(port)?;
-        Ok(self.inner.state.with(NetworkShard::list_ipv4_addresses))
+        Ok(self.inner.control.list_ipv4_addresses())
     }
 
     async fn mac_address(&self, port: NetworkPortId) -> Result<MacAddress, NetworkControlError> {
@@ -2779,9 +3032,19 @@ where
         gateway: KernelIpv4Address,
     ) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
+        self.inner.control.update_routes(|routes| {
+            routes
+                .add(Route {
+                    destination: IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0)),
+                    gateway: Some(IpAddress::Ipv4(map_kernel_ipv4_address(gateway))),
+                    expires_at: None,
+                })
+                .map_err(|_| NetworkControlError::InvalidRoute)
+        })?;
         let mut result = Ok(());
         self.inner.state.for_each(|state| {
             if result.is_ok() {
+                self.inner.control.synchronize_shard(state);
                 if let Err(error) = state.set_default_ipv4_gateway(gateway) {
                     result = Err(error);
                 }
@@ -2796,9 +3059,19 @@ where
         route: KernelIpv4Route,
     ) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
+        self.inner.control.update_routes(|routes| {
+            routes
+                .add(Route {
+                    destination: IpCidr::Ipv4(map_kernel_ipv4_cidr(route.destination())),
+                    gateway: Some(IpAddress::Ipv4(map_kernel_ipv4_address(route.gateway()))),
+                    expires_at: route.expires_at_nanos().map(StackInstant::from_nanos),
+                })
+                .map_err(|_| NetworkControlError::InvalidRoute)
+        })?;
         let mut result = Ok(());
         self.inner.state.for_each(|state| {
             if result.is_ok() {
+                self.inner.control.synchronize_shard(state);
                 if let Err(error) = state.add_ipv4_route(route) {
                     result = Err(error);
                 }
@@ -2813,7 +3086,16 @@ where
         route: KernelIpv4Route,
     ) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
+        self.inner.control.update_routes(|routes| {
+            routes.remove(Route {
+                destination: IpCidr::Ipv4(map_kernel_ipv4_cidr(route.destination())),
+                gateway: Some(IpAddress::Ipv4(map_kernel_ipv4_address(route.gateway()))),
+                expires_at: route.expires_at_nanos().map(StackInstant::from_nanos),
+            });
+            Ok(())
+        })?;
         self.inner.state.for_each(|state| {
+            self.inner.control.synchronize_shard(state);
             state.remove_ipv4_route(route);
         });
         Ok(())
@@ -2821,6 +3103,10 @@ where
 
     async fn clear_routes(&self, port: NetworkPortId) -> Result<(), NetworkControlError> {
         require_local_network_port(port)?;
+        self.inner.control.update_routes(|routes| {
+            routes.clear_ipv4();
+            Ok(())
+        })?;
         self.inner.state.for_each(NetworkShard::clear_ipv4_routes);
         Ok(())
     }
@@ -2830,7 +3116,7 @@ where
         port: NetworkPortId,
     ) -> Result<Vec<KernelIpv4Route>, NetworkControlError> {
         require_local_network_port(port)?;
-        Ok(self.inner.state.with(NetworkShard::list_ipv4_routes))
+        Ok(self.inner.control.list_ipv4_routes())
     }
 }
 
@@ -2900,6 +3186,21 @@ impl NetworkShard {
 
     fn is_configured(&self) -> bool {
         self.stack.primary_ipv4_address().is_some()
+    }
+
+    fn drain_control_events(&mut self, control: &NetworkControlPlane) {
+        while let Some(event) = self.stack.take_event() {
+            match event {
+                StackEvent::NeighborUpdated(entry) => {
+                    control.update_neighbors(|neighbors| neighbors.learn(entry));
+                }
+                StackEvent::DhcpConfigured(_) => control.publish_from_shard(self),
+                StackEvent::UdpDatagram { .. }
+                | StackEvent::TcpConnected { .. }
+                | StackEvent::TcpReadable { .. }
+                | StackEvent::TcpClosed { .. } => {}
+            }
+        }
     }
 
     fn drive_dhcp(&mut self, now: StackInstant) -> Result<(), NetworkControlError> {
@@ -3564,24 +3865,6 @@ impl NetworkShard {
 
     fn clear_ipv4_routes(&mut self) {
         self.stack.routes_mut().clear_ipv4();
-    }
-
-    fn list_ipv4_routes(&self) -> Vec<KernelIpv4Route> {
-        self.stack
-            .routes()
-            .iter()
-            .filter_map(|route| match (route.destination, route.gateway) {
-                (IpCidr::Ipv4(destination), Some(IpAddress::Ipv4(gateway))) => {
-                    Some(KernelIpv4Route::with_lifetimes(
-                        map_ipv4_cidr(destination),
-                        map_ipv4_address(gateway),
-                        None,
-                        route.expires_at.map(StackInstant::nanos),
-                    ))
-                }
-                _ => None,
-            })
-            .collect()
     }
 }
 

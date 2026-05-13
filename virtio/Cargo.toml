@@ -13,5 +13,10 @@ spin = { version = "0.9.8", default-features = false, features = ["mutex", "spin
 thiserror = { version = "2.0.17", default-features = false }
 
 [dev-dependencies]
+divan = "0.1.21"
 futures-lite = "2.6.1"
 zerocopy = { version = "0.8.27", features = ["derive"] }
+
+[[bench]]
+name = "net_tx_smp"
+harness = false
