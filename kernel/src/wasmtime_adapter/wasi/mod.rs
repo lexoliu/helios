@@ -1437,8 +1437,18 @@ impl UdpSocket {
         remote_address: WasiUdpSocketAddress,
     ) -> core::result::Result<(), WasiUdpSocketError> {
         validate_udp_remote_address(self.family(), remote_address)?;
-        let _ = self.ensure_bound(0).await?;
-        self.inner.lock().remote_address = Some(remote_address);
+        let bound = self.ensure_bound(0).await?;
+        let service = self.inner.lock().service.clone();
+        service
+            .udp_connect(bound.socket, remote_address.address, remote_address.port)
+            .map_err(WasiUdpSocketError::Backend)?;
+        let mut state = self.inner.lock();
+        assert_eq!(
+            state.bound,
+            Some(bound),
+            "udp socket binding changed during connect"
+        );
+        state.remote_address = Some(remote_address);
         Ok(())
     }
 
@@ -1447,6 +1457,11 @@ impl UdpSocket {
         if state.remote_address.is_none() {
             return Err(WasiUdpSocketError::InvalidState);
         }
+        let bound = state.bound.ok_or(WasiUdpSocketError::InvalidState)?;
+        let service = state.service.clone();
+        service
+            .udp_disconnect(bound.socket)
+            .map_err(WasiUdpSocketError::Backend)?;
         state.remote_address = None;
         Ok(())
     }
@@ -1461,13 +1476,32 @@ impl UdpSocket {
         if let Some(remote_address) = remote_address {
             validate_udp_remote_address(self.family(), remote_address)?;
         }
+        let bound = {
+            let state = self.inner.lock();
+            if state.pending_bind.is_some() || state.bound.is_none() {
+                return Err(WasiUdpSocketError::InvalidState);
+            }
+            if state.open_stream_handles != 0 {
+                return Err(WasiUdpSocketError::InvalidState);
+            }
+            state.bound.expect("UDP socket bound state checked above")
+        };
+        let service = self.inner.lock().service.clone();
+        if let Some(remote_address) = remote_address {
+            service
+                .udp_connect(bound.socket, remote_address.address, remote_address.port)
+                .map_err(WasiUdpSocketError::Backend)?;
+        } else if self.inner.lock().remote_address.is_some() {
+            service
+                .udp_disconnect(bound.socket)
+                .map_err(WasiUdpSocketError::Backend)?;
+        }
         let mut state = self.inner.lock();
-        if state.pending_bind.is_some() || state.bound.is_none() {
-            return Err(WasiUdpSocketError::InvalidState);
-        }
-        if state.open_stream_handles != 0 {
-            return Err(WasiUdpSocketError::InvalidState);
-        }
+        assert_eq!(
+            state.bound,
+            Some(bound),
+            "udp socket binding changed while opening streams"
+        );
         state.remote_address = remote_address;
         state.open_stream_handles = 2;
         let incoming = P2IncomingDatagramStream {
@@ -1488,6 +1522,15 @@ impl UdpSocket {
             return;
         }
         state.open_stream_handles -= 1;
+        if state.open_stream_handles == 0
+            && let (Some(bound), Some(_)) = (state.bound, state.remote_address)
+        {
+            let service = state.service.clone();
+            service
+                .udp_disconnect(bound.socket)
+                .unwrap_or_else(|error| panic!("failed to disconnect closed UDP streams: {error}"));
+            state.remote_address = None;
+        }
     }
 
     async fn send_datagram(
@@ -6140,6 +6183,19 @@ mod tests {
                 socket: 9,
                 local_port,
             }))
+        }
+
+        fn udp_connect(
+            &self,
+            _: Self::UdpSocket,
+            _: crate::NetworkIpAddress,
+            _: u16,
+        ) -> Result<(), crate::UdpError> {
+            Ok(())
+        }
+
+        fn udp_disconnect(&self, _: Self::UdpSocket) -> Result<(), crate::UdpError> {
+            Ok(())
         }
 
         fn udp_send(

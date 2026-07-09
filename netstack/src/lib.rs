@@ -18,7 +18,8 @@ use helios_hal::io::IoResult;
 use thiserror::Error;
 
 pub use checksum::{
-    icmpv6_checksum, internet_checksum, ipv4_checksum, tcpv4_checksum, tcpv6_checksum, udp_checksum,
+    icmpv6_checksum, icmpv6_checksum_valid, internet_checksum, ipv4_checksum, tcp_checksum_valid,
+    tcpv4_checksum, tcpv6_checksum, udp_checksum, udp_checksum_valid,
 };
 pub use congestion::{
     AckSample, BbrV3, CongestionControl, CongestionEvent, CongestionWindow, Cubic, NewReno,
@@ -30,17 +31,22 @@ pub use dhcp::{
 };
 pub use dns::{DNS_PORT, DnsMessage, DnsQuestionWriter, DnsResponse};
 pub use packet::{
-    ArpOperation, ArpPacket, EthernetFrame, EthernetProtocol, Icmpv4Echo, Icmpv4Packet, Icmpv6Echo,
-    Icmpv6Packet, IpProtocol, Ipv4Packet, Ipv6Packet, MAX_TCP_SACK_BLOCKS, TcpFlags, TcpHeader,
-    TcpHeaderOptions, TcpOptions, TcpPacket, TcpSackBlock, TcpSackBlocks, TcpTimestampOption,
-    UdpPacket,
+    ArpOperation, ArpPacket, EthernetFrame, EthernetProtocol, Icmpv4DestinationUnreachableCode,
+    Icmpv4Echo, Icmpv4Packet, Icmpv6DestinationUnreachableCode, Icmpv6Echo, Icmpv6Packet,
+    Icmpv6PacketTooBig, IpProtocol, Ipv4Packet, Ipv6Packet, MAX_TCP_SACK_BLOCKS, TcpFlags,
+    TcpHeader, TcpHeaderOptions, TcpOptions, TcpPacket, TcpSackBlock, TcpSackBlocks,
+    TcpTimestampOption, TransportPorts, UdpPacket,
 };
 pub use stack::{
-    DhcpLease, DnsQueryId, IcmpEchoKey, MAX_OUTBOUND_FRAMES, NeighborEntry, NeighborState,
-    OutboundBatchStatus, Route, RouteTable, SocketId, Stack, StackConfig, StackEvent, StackInstant,
-    TcpAccept, TcpConnectState, TcpReadIntoState, TcpReadState, UdpPayload, UdpReceive,
+    DEFAULT_TCP_LISTEN_BACKLOG, DhcpLease, DnsQueryId, IcmpEchoKey, Ipv4MulticastMembership,
+    MAX_IPV4_MULTICAST_MEMBERSHIPS, MAX_OUTBOUND_FRAMES, MAX_UDP_RX, MAX_UDP_SOCKETS,
+    NeighborEntry, NeighborState, OutboundBatchStatus, Route, RouteTable, RxChecksumOffload,
+    SocketId, Stack, StackConfig, StackEvent, StackInstant, TcpAccept, TcpConnectState,
+    TcpConnectTerminalError, TcpListenBacklog, TcpReadIntoState, TcpReadState, UdpEndpoint,
+    UdpPayload, UdpReceive, UdpSocketBinding, UdpSocketError, UdpSocketId,
 };
-pub use tcp::{TcpEndpoint, TcpSegmentOutcome, TcpSocket, TcpState, TcpTransmitSegment};
+pub use tcp::TCP_TRANSMIT_BUFFER_BYTES;
+pub use tcp::{TcpEndpoint, TcpReset, TcpSegmentOutcome, TcpSocket, TcpState, TcpTransmitSegment};
 pub use types::{
     EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr, Ipv6Scope,
 };
@@ -453,7 +459,34 @@ pub enum StackError {
     /// The requested socket is unknown.
     #[error("unknown network socket")]
     UnknownSocket,
+    /// A socket address set overlaps an existing socket.
+    #[error("network socket address is already in use")]
+    AddressInUse,
+    /// A listen backlog value cannot be represented by the stack.
+    #[error("TCP listen backlog is invalid")]
+    InvalidListenBacklog,
     /// No local address can route the requested destination.
     #[error("network destination is unroutable")]
     Unroutable,
+    /// Socket local and remote address families are inconsistent.
+    #[error("network socket address families do not match")]
+    AddressFamilyMismatch,
+    /// A connected socket attempted to send to a different remote endpoint.
+    #[error("network socket remote endpoint does not match")]
+    RemoteAddressMismatch,
+    /// A datagram or segment cannot fit in one packet for the current path.
+    #[error("network packet exceeds transmit capacity")]
+    PacketTooLarge,
+    /// The requested multicast group address is invalid for the operation.
+    #[error("network multicast group address is invalid")]
+    InvalidMulticastGroup,
+    /// The requested multicast interface is unavailable.
+    #[error("network multicast interface is unavailable")]
+    MulticastInterfaceUnavailable,
+    /// The requested multicast membership does not exist.
+    #[error("network multicast membership does not exist")]
+    MulticastMembershipNotFound,
+    /// Multicast membership storage was exhausted.
+    #[error("network multicast membership table is full")]
+    MulticastMembershipTableFull,
 }

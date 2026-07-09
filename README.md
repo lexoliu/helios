@@ -67,20 +67,20 @@ and component-model features are still evolving upstream). From the workspace
 root:
 
 ```bash
-# Hosted backend (fastest iteration)
-cargo check -p helios-hosted
+# Hosted backend and host kernel artifacts (fastest iteration)
+just check-host
+
+# AArch64 bare-metal backend
+just check-target aarch64-unknown-none helios-aarch64
 
 # RISC-V 64 bare-metal backend
-cargo check -p helios-riscv --target riscv64gc-unknown-none-elf
+just check-target riscv64gc-unknown-none-elf helios-riscv
 
 # x86_64 bare-metal backend
-cargo check -p helios-x86 --target x86_64-unknown-none
+just check-target x86_64-unknown-none helios-x86
 
-# Architecture-neutral kernel
-cargo check -p helios-kernel
-
-# Inspector CLI
-cargo check -p helios-inspector
+# Full local verification sweep
+just check-all
 ```
 
 Helios currently pins a local Wasmtime checkout through a `path = "../wasmtime/..."`

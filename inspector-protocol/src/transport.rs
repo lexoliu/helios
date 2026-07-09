@@ -11,6 +11,7 @@ use futures_core::Stream;
 use futures_io::{AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::sync::{Mutex, mpsc};
+#[cfg(test)]
 use wrpc_transport::{Index, Invoke, Serve};
 
 use crate::error::TransportError;
@@ -18,15 +19,13 @@ use crate::wire::{Frame, read_frame, write_frame};
 
 /// Transport-level result with structured error provenance.
 ///
-/// `wrpc_transport::{Invoke, Serve, Index}` are upstream contracts that
-/// return `anyhow::Result`; those impls remain spelled with `anyhow::Result`
-/// while every internal helper and the inherent `Client` API uses
-/// [`TransportError`] for typed propagation.
+/// Test-only wRPC trait impls adapt this typed contract to upstream
+/// `anyhow::Result`; production callers use this alias directly.
 pub type Result<T> = core::result::Result<T, TransportError>;
 
 type IoFuture<T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send + 'static>>;
-type ServeFuture = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'static>>;
-type InvocationAccept<R, W> = anyhow::Result<((), Outgoing<R, W>, Incoming<R, W>)>;
+type ServeFuture = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
+type InvocationAccept<R, W> = Result<((), Outgoing<R, W>, Incoming<R, W>)>;
 const RAW_UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Default)]
@@ -156,11 +155,8 @@ where
         chunk_bytes: usize,
     ) -> Result<Vec<u8>> {
         let chunk_bytes = chunk_bytes.max(1);
-        let paths: [Box<[Option<usize>]>; 0] = [];
         let (mut outgoing, mut incoming) =
-            Invoke::invoke(self, (), instance, func, Bytes::new(), paths)
-                .await
-                .map_err(extract_transport_error)?;
+            self.open_invocation(instance, func, Bytes::new()).await?;
         for chunk in payload.chunks(chunk_bytes) {
             outgoing
                 .write_all(chunk)
@@ -188,6 +184,57 @@ where
         self.invoke_raw_chunked(instance, func, payload, RAW_UPLOAD_CHUNK_BYTES)
             .await
     }
+
+    pub async fn open_invocation(
+        &self,
+        instance: &str,
+        func: &str,
+        params: Bytes,
+    ) -> Result<(Outgoing<R, W>, Incoming<R, W>)> {
+        let id = self.inner.next_invocation.fetch_add(1, Ordering::Relaxed);
+        let invocation = Invocation::new_client(id, &self.inner);
+        {
+            let mut io = self.inner.write.lock().await;
+            write_frame(
+                &mut *io,
+                &Frame::Open {
+                    invocation: id,
+                    instance: instance.to_owned(),
+                    func: func.to_owned(),
+                },
+            )
+            .await
+            .map_err(|source| TransportError::io("open remote invocation", source))?;
+        }
+
+        loop {
+            if let Some(reply) = take_reply(&self.inner.replies, id) {
+                match reply {
+                    Reply::Accept => break,
+                    Reply::Reject(message) => return Err(TransportError::Rejected(message)),
+                }
+            }
+            if is_closed(&self.inner.closed) {
+                return Err(TransportError::Closed);
+            }
+            pump_client_once(self.inner.clone())
+                .await
+                .map_err(|source| TransportError::io("read remote invocation reply", source))?;
+        }
+
+        if !params.is_empty() {
+            invocation
+                .clone()
+                .write_data(Vec::new(), params)
+                .await
+                .map_err(|source| TransportError::io("transmit synchronous parameters", source))?;
+        }
+
+        Ok((
+            Outgoing::root(invocation.clone()),
+            Incoming::root(invocation),
+        ))
+    }
 }
 
 impl<R, W> Server<R, W>
@@ -211,8 +258,31 @@ where
     pub fn is_closed(&self) -> bool {
         is_closed(&self.inner.closed)
     }
+
+    pub fn serve(&self, instance: &str, func: &str) -> Result<InvocationStream<R, W>> {
+        let key = (instance.to_owned(), func.to_owned());
+        let (tx, rx) = mpsc::channel(8);
+        let previous = self
+            .inner
+            .registrations
+            .lock()
+            .unwrap_or_else(|_| panic!("server registration table mutex poisoned"))
+            .insert(key.clone(), Registration { tx });
+        assert!(
+            previous.is_none(),
+            "duplicate handler registration for {}.{}",
+            key.0,
+            key.1
+        );
+        Ok(InvocationStream {
+            server: self.inner.clone(),
+            rx,
+            pending: None,
+        })
+    }
 }
 
+#[cfg(test)]
 impl<R, W> Invoke for Client<R, W>
 where
     R: FuturesAsyncRead + Send + Unpin + 'static,
@@ -233,54 +303,13 @@ where
     where
         P: AsRef<[Option<usize>]> + Send + Sync,
     {
-        let id = self.inner.next_invocation.fetch_add(1, Ordering::Relaxed);
-        let invocation = Invocation::new_client(id, &self.inner);
-        {
-            let mut io = self.inner.write.lock().await;
-            write_frame(
-                &mut *io,
-                &Frame::Open {
-                    invocation: id,
-                    instance: instance.to_owned(),
-                    func: func.to_owned(),
-                },
-            )
+        self.open_invocation(instance, func, params)
             .await
-            .map_err(|source| TransportError::io("open remote invocation", source))?;
-        }
-
-        loop {
-            if let Some(reply) = take_reply(&self.inner.replies, id) {
-                match reply {
-                    Reply::Accept => break,
-                    Reply::Reject(message) => {
-                        return Err(TransportError::Rejected(message).into());
-                    }
-                }
-            }
-            if is_closed(&self.inner.closed) {
-                return Err(TransportError::Closed.into());
-            }
-            pump_client_once(self.inner.clone())
-                .await
-                .map_err(|source| TransportError::io("read remote invocation reply", source))?;
-        }
-
-        if !params.is_empty() {
-            invocation
-                .clone()
-                .write_data(Vec::new(), params)
-                .await
-                .map_err(|source| TransportError::io("transmit synchronous parameters", source))?;
-        }
-
-        Ok((
-            Outgoing::root(invocation.clone()),
-            Incoming::root(invocation),
-        ))
+            .map_err(Into::into)
     }
 }
 
+#[cfg(test)]
 impl<R, W> Serve for Server<R, W>
 where
     R: FuturesAsyncRead + Send + Unpin + 'static,
@@ -298,24 +327,8 @@ where
     ) -> anyhow::Result<
         impl Stream<Item = anyhow::Result<(Self::Context, Self::Outgoing, Self::Incoming)>> + 'static,
     > {
-        let key = (instance.to_owned(), func.to_owned());
-        let (tx, rx) = mpsc::channel(8);
-        let previous = self
-            .inner
-            .registrations
-            .lock()
-            .unwrap_or_else(|_| panic!("server registration table mutex poisoned"))
-            .insert(key.clone(), Registration { tx });
-        assert!(
-            previous.is_none(),
-            "duplicate handler registration for {}.{}",
-            key.0,
-            key.1
-        );
-        Ok(InvocationStream {
-            server: self.inner.clone(),
-            rx,
-            pending: None,
+        Ok(WrpcInvocationStream {
+            inner: Server::serve(self, instance, func)?,
         })
     }
 }
@@ -520,6 +533,7 @@ impl<R, W> Outgoing<R, W> {
     }
 }
 
+#[cfg(test)]
 impl<R, W> Index<Self> for Incoming<R, W> {
     fn index(&self, path: &[usize]) -> anyhow::Result<Self> {
         assert!(!path.is_empty(), "incoming indexed path must not be empty");
@@ -531,6 +545,7 @@ impl<R, W> Index<Self> for Incoming<R, W> {
     }
 }
 
+#[cfg(test)]
 impl<R, W> Index<Self> for Outgoing<R, W> {
     fn index(&self, path: &[usize]) -> anyhow::Result<Self> {
         assert!(!path.is_empty(), "outgoing indexed path must not be empty");
@@ -729,7 +744,7 @@ where
     R: FuturesAsyncRead + Send + Unpin + 'static,
     W: FuturesAsyncWrite + Send + Unpin + 'static,
 {
-    type Item = anyhow::Result<((), Outgoing<R, W>, Incoming<R, W>)>;
+    type Item = Result<((), Outgoing<R, W>, Incoming<R, W>)>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -763,6 +778,27 @@ where
                 Poll::Pending => return Poll::Pending,
             }
         }
+    }
+}
+
+#[cfg(test)]
+struct WrpcInvocationStream<R, W> {
+    inner: InvocationStream<R, W>,
+}
+
+#[cfg(test)]
+impl<R, W> Stream for WrpcInvocationStream<R, W>
+where
+    R: FuturesAsyncRead + Send + Unpin + 'static,
+    W: FuturesAsyncWrite + Send + Unpin + 'static,
+{
+    type Item = anyhow::Result<((), Outgoing<R, W>, Incoming<R, W>)>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.inner)
+            .poll_next(cx)
+            .map(|item| item.map(|result| result.map_err(Into::into)))
     }
 }
 
@@ -942,7 +978,7 @@ where
     Ok(())
 }
 
-async fn pump_server_once<R, W>(server: Arc<ServerInner<R, W>>) -> anyhow::Result<()>
+async fn pump_server_once<R, W>(server: Arc<ServerInner<R, W>>) -> Result<()>
 where
     R: FuturesAsyncRead + Send + Unpin + 'static,
     W: FuturesAsyncWrite + Send + Unpin + 'static,
@@ -955,7 +991,10 @@ where
         let _dispatch = server.dispatch.lock().await;
         let frame = {
             let mut io = server.read.lock().await;
-            match read_frame(&mut *io).await? {
+            match read_frame(&mut *io)
+                .await
+                .map_err(|source| TransportError::io("read server transport frame", source))?
+            {
                 Some(frame) => frame,
                 None => {
                     mark_server_closed(&server);
@@ -1025,17 +1064,25 @@ where
                 dispatch_payload(
                     &server.active,
                     invocation,
-                    decode_path(&path)?,
+                    decode_path(&path).map_err(|source| {
+                        TransportError::io("decode incoming data path", source)
+                    })?,
                     Bytes::from(payload),
                 );
                 None
             }
             Frame::Close { invocation, path } => {
-                dispatch_close(&server.active, invocation, decode_path(&path)?);
+                dispatch_close(
+                    &server.active,
+                    invocation,
+                    decode_path(&path).map_err(|source| {
+                        TransportError::io("decode incoming close path", source)
+                    })?,
+                );
                 None
             }
             Frame::Accept { .. } | Frame::Reject { .. } => {
-                return Err(TransportError::UnexpectedReply.into());
+                return Err(TransportError::UnexpectedReply);
             }
         }
     };
@@ -1097,21 +1144,7 @@ impl<R, W> FrameWriter<W> for ServerInner<R, W> {
     }
 }
 
-/// Strip the wrpc-coupled `anyhow::Error` back into a typed `TransportError`.
-///
-/// `wrpc_transport::Invoke::invoke` returns `anyhow::Result` upstream, so our
-/// own impl wraps `TransportError` into `anyhow::Error` and inherent helpers
-/// downcast back to recover the typed contract.
-fn extract_transport_error(error: anyhow::Error) -> TransportError {
-    match error.downcast::<TransportError>() {
-        Ok(transport) => transport,
-        Err(other) => TransportError::Io {
-            operation: "wrpc invoke",
-            source: io::Error::other(other.to_string()),
-        },
-    }
-}
-
+#[cfg(test)]
 fn join_path(prefix: &[usize], suffix: &[usize]) -> Arc<[usize]> {
     if prefix.is_empty() {
         Arc::from(suffix)
@@ -1147,7 +1180,7 @@ mod tests {
     use tokio::sync::Notify;
     use tokio::time::{Duration, timeout};
     use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
-    use wrpc_transport::{Invoke as _, InvokeExt as _, Serve as _, ServeExt as _};
+    use wrpc_transport::{InvokeExt as _, ServeExt as _};
 
     #[test]
     fn sequential_empty_invocations_do_not_stall() {
@@ -1163,8 +1196,7 @@ mod tests {
                 let client = Client::new(peer_read.compat(), peer_write.compat_write());
 
                 let mut invocations = server
-                    .serve("transport:test", "ping", [])
-                    .await
+                    .serve("transport:test", "ping")
                     .unwrap_or_else(|error| panic!("failed to register server handler: {error}"));
                 let server_task = tokio::spawn(async move {
                     for response in ["one", "two"] {
@@ -1234,8 +1266,7 @@ mod tests {
                 let released = std::sync::Arc::new(Notify::new());
 
                 let mut stream_calls = server
-                    .serve("transport:test", "stream", [])
-                    .await
+                    .serve("transport:test", "stream")
                     .unwrap_or_else(|error| panic!("failed to register stream handler: {error}"));
                 let stream_release = released.clone();
                 let stream_task = tokio::spawn(async move {
@@ -1267,8 +1298,7 @@ mod tests {
                 });
 
                 let mut ping_calls = server
-                    .serve("transport:test", "ping", [])
-                    .await
+                    .serve("transport:test", "ping")
                     .unwrap_or_else(|error| panic!("failed to register ping handler: {error}"));
                 let ping_release = released.clone();
                 let ping_task =
@@ -1298,9 +1328,8 @@ mod tests {
                         ping_release.notify_one();
                     });
 
-                let empty_paths: [[Option<usize>; 0]; 0] = [];
                 let (mut first_outgoing, mut first_incoming) = client
-                    .invoke((), "transport:test", "stream", Bytes::new(), empty_paths)
+                    .open_invocation("transport:test", "stream", Bytes::new())
                     .await
                     .unwrap_or_else(|error| panic!("failed to open stream invocation: {error}"));
                 first_outgoing.shutdown().await.unwrap_or_else(|error| {
@@ -1345,8 +1374,7 @@ mod tests {
                 let client = Client::new(peer_read.compat(), peer_write.compat_write());
 
                 let mut calls = server
-                    .serve("transport:test", "fail", [])
-                    .await
+                    .serve("transport:test", "fail")
                     .unwrap_or_else(|error| panic!("failed to register fail handler: {error}"));
                 let server_task = tokio::spawn(async move {
                     let (_, _outgoing, mut incoming) = calls
@@ -1659,8 +1687,7 @@ mod tests {
 
                 let expected = vec![0x5a; RAW_UPLOAD_CHUNK_BYTES * 3 + 17];
                 let mut calls = server
-                    .serve("transport:test", "large-response", [])
-                    .await
+                    .serve("transport:test", "large-response")
                     .unwrap_or_else(|error| {
                         panic!("failed to register large-response handler: {error}")
                     });
@@ -1722,8 +1749,7 @@ mod tests {
                 let mut peer_write = peer_write.compat_write();
 
                 let mut invocations = server
-                    .serve("transport:test", "queue", [])
-                    .await
+                    .serve("transport:test", "queue")
                     .unwrap_or_else(|error| panic!("failed to register queue handler: {error}"));
 
                 super::write_frame(

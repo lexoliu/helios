@@ -375,6 +375,16 @@ pub enum NetworkErrorDetail {
     TcpConnectStartFailed,
     #[error("TCP stream closed during connect")]
     TcpClosedDuringConnect,
+    #[error("TCP remote port is unreachable")]
+    TcpRemotePortUnreachable,
+    #[error("TCP remote network is unreachable")]
+    TcpRemoteNetworkUnreachable,
+    #[error("TCP remote host is unreachable")]
+    TcpRemoteHostUnreachable,
+    #[error("TCP remote protocol is unreachable")]
+    TcpRemoteProtocolUnreachable,
+    #[error("TCP remote communication is prohibited")]
+    TcpRemoteCommunicationProhibited,
     #[error("TCP listen could not be started")]
     TcpListenStartFailed,
     #[error("TCP accept timed out")]
@@ -403,12 +413,26 @@ pub enum NetworkErrorDetail {
     UdpPortInUse,
     #[error("UDP bind failed")]
     UdpBindFailed,
+    #[error("UDP connect failed")]
+    UdpConnectFailed,
+    #[error("UDP disconnect failed")]
+    UdpDisconnectFailed,
     #[error("UDP datagram exceeds transmit capacity")]
     UdpDatagramTooLarge,
     #[error("UDP datagram could not be queued")]
     UdpQueueFailed,
     #[error("UDP receive failed")]
     UdpReceiveFailed,
+    #[error("UDP remote port is unreachable")]
+    UdpRemotePortUnreachable,
+    #[error("UDP remote network is unreachable")]
+    UdpRemoteNetworkUnreachable,
+    #[error("UDP remote host is unreachable")]
+    UdpRemoteHostUnreachable,
+    #[error("UDP remote protocol is unreachable")]
+    UdpRemoteProtocolUnreachable,
+    #[error("UDP remote communication is prohibited")]
+    UdpRemoteCommunicationProhibited,
     #[error("no ephemeral UDP ports are available")]
     UdpNoEphemeralPorts,
     #[error("UDP multicast interface is unavailable")]
@@ -445,6 +469,11 @@ impl NetworkErrorDetail {
             Self::TcpConnectTimeout => "TCP connect timed out",
             Self::TcpConnectStartFailed => "TCP connect could not be started",
             Self::TcpClosedDuringConnect => "TCP stream closed during connect",
+            Self::TcpRemotePortUnreachable => "TCP remote port is unreachable",
+            Self::TcpRemoteNetworkUnreachable => "TCP remote network is unreachable",
+            Self::TcpRemoteHostUnreachable => "TCP remote host is unreachable",
+            Self::TcpRemoteProtocolUnreachable => "TCP remote protocol is unreachable",
+            Self::TcpRemoteCommunicationProhibited => "TCP remote communication is prohibited",
             Self::TcpListenStartFailed => "TCP listen could not be started",
             Self::TcpAcceptTimeout => "TCP accept timed out",
             Self::TcpListenerClosedUnexpectedly => "TCP listener closed unexpectedly",
@@ -459,9 +488,16 @@ impl NetworkErrorDetail {
             Self::UdpReceiveTimeout => "UDP receive timed out",
             Self::UdpPortInUse => "UDP local port is already in use",
             Self::UdpBindFailed => "UDP bind failed",
+            Self::UdpConnectFailed => "UDP connect failed",
+            Self::UdpDisconnectFailed => "UDP disconnect failed",
             Self::UdpDatagramTooLarge => "UDP datagram exceeds transmit capacity",
             Self::UdpQueueFailed => "UDP datagram could not be queued",
             Self::UdpReceiveFailed => "UDP receive failed",
+            Self::UdpRemotePortUnreachable => "UDP remote port is unreachable",
+            Self::UdpRemoteNetworkUnreachable => "UDP remote network is unreachable",
+            Self::UdpRemoteHostUnreachable => "UDP remote host is unreachable",
+            Self::UdpRemoteProtocolUnreachable => "UDP remote protocol is unreachable",
+            Self::UdpRemoteCommunicationProhibited => "UDP remote communication is prohibited",
             Self::UdpNoEphemeralPorts => "no ephemeral UDP ports are available",
             Self::UdpMulticastInterfaceUnavailable => "UDP multicast interface is unavailable",
             Self::UdpMulticastJoinFailed => "UDP multicast group could not be joined",
@@ -621,6 +657,15 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         &self,
         local_port: u16,
     ) -> impl Future<Output = Result<UdpBinding<Self::UdpSocket>, UdpError>> + Send + '_;
+
+    fn udp_connect(
+        &self,
+        socket: Self::UdpSocket,
+        remote_address: NetworkIpAddress,
+        port: u16,
+    ) -> Result<(), UdpError>;
+
+    fn udp_disconnect(&self, socket: Self::UdpSocket) -> Result<(), UdpError>;
 
     fn udp_send<'a>(
         &'a self,

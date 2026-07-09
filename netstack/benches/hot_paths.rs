@@ -2,10 +2,11 @@ use bytes::Bytes;
 use divan::counter::{BytesCount, ItemsCount};
 use divan::{AllocProfiler, Bencher, black_box};
 use helios_netstack::{
-    BbrV3, EthernetAddress, EthernetFrame, EthernetProtocol, IpAddress, IpProtocol, Ipv4Address,
-    Ipv4Cidr, Ipv4Packet, MAX_OUTBOUND_FRAMES, NeighborEntry, NeighborState, OutboundBatchStatus,
-    PacketBuffer, Stack, StackConfig, StackInstant, TcpEndpoint, TcpFlags, TcpHeader, TcpOptions,
-    TcpPacket, TcpSocket, TcpState, UdpPacket, internet_checksum,
+    BbrV3, DEFAULT_TCP_LISTEN_BACKLOG, EthernetAddress, EthernetFrame, EthernetProtocol, IpAddress,
+    IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, MAX_OUTBOUND_FRAMES, NeighborEntry,
+    NeighborState, OutboundBatchStatus, PacketBuffer, RxChecksumOffload, Stack, StackConfig,
+    StackInstant, TCP_TRANSMIT_BUFFER_BYTES, TcpEndpoint, TcpFlags, TcpHeader, TcpOptions,
+    TcpPacket, TcpSocket, TcpState, UdpPacket, UdpSocketBinding, UdpSocketId, internet_checksum,
 };
 
 #[global_allocator]
@@ -15,7 +16,9 @@ const LOCAL_MAC: EthernetAddress = [0x02, 0, 0, 0, 0, 1];
 const PEER_MAC: EthernetAddress = [0x02, 0, 0, 0, 0, 2];
 const LOCAL_IP: Ipv4Address = Ipv4Address::new([192, 0, 2, 10]);
 const PEER_IP: Ipv4Address = Ipv4Address::new([192, 0, 2, 20]);
+const MULTICAST_IP: Ipv4Address = Ipv4Address::new([224, 0, 0, 251]);
 const UDP_PAYLOAD: &[u8] = b"helios-netstack-divan-udp-payload";
+const UDP_LARGE_PAYLOAD: &[u8; 1024] = &[0x5a; 1024];
 const TCP_PAYLOAD_BYTES: usize = 1460;
 const TCP_RECEIVE_SEGMENTS: usize = 128;
 const TCP_ACK_COALESCE_SEGMENTS: usize = 16;
@@ -111,6 +114,15 @@ fn tcp_ipv4_frame(header: TcpHeader, payload: &[u8]) -> PacketBuffer {
 }
 
 fn udp_ipv4_frame(source_port: u16, destination_port: u16, payload: &[u8]) -> PacketBuffer {
+    udp_ipv4_frame_to(LOCAL_IP, source_port, destination_port, payload)
+}
+
+fn udp_ipv4_frame_to(
+    destination: Ipv4Address,
+    source_port: u16,
+    destination_port: u16,
+    payload: &[u8],
+) -> PacketBuffer {
     let mut frame = PacketBuffer::new();
     let storage = frame.storage_mut();
     let mut offset =
@@ -119,7 +131,7 @@ fn udp_ipv4_frame(source_port: u16, destination_port: u16, payload: &[u8]) -> Pa
     offset += Ipv4Packet::encode_header(
         &mut storage[offset..],
         PEER_IP,
-        LOCAL_IP,
+        destination,
         IpProtocol::Udp,
         UdpPacket::HEADER_LEN + payload.len(),
         1,
@@ -129,7 +141,7 @@ fn udp_ipv4_frame(source_port: u16, destination_port: u16, payload: &[u8]) -> Pa
     offset += UdpPacket::encode(
         &mut storage[offset..],
         IpAddress::Ipv4(PEER_IP),
-        IpAddress::Ipv4(LOCAL_IP),
+        IpAddress::Ipv4(destination),
         source_port,
         destination_port,
         payload,
@@ -137,6 +149,78 @@ fn udp_ipv4_frame(source_port: u16, destination_port: u16, payload: &[u8]) -> Pa
     .expect("benchmark UDP packet should fit");
     frame.set_len(offset);
     frame
+}
+
+fn udp_ipv4_frame_bytes(source_port: u16, destination_port: u16, payload: &[u8]) -> Bytes {
+    Bytes::copy_from_slice(udp_ipv4_frame(source_port, destination_port, payload).as_slice())
+}
+
+fn udp_ipv4_frame_to_bytes(
+    destination: Ipv4Address,
+    source_port: u16,
+    destination_port: u16,
+    payload: &[u8],
+) -> Bytes {
+    Bytes::copy_from_slice(
+        udp_ipv4_frame_to(destination, source_port, destination_port, payload).as_slice(),
+    )
+}
+
+fn udp_ipv4_fragment_frame(
+    fragment_offset: usize,
+    more_fragments: bool,
+    payload: &[u8],
+) -> PacketBuffer {
+    let mut frame = PacketBuffer::new();
+    let storage = frame.storage_mut();
+    let mut offset =
+        EthernetFrame::encode_header(storage, LOCAL_MAC, PEER_MAC, EthernetProtocol::Ipv4)
+            .expect("benchmark Ethernet header should fit");
+    let ipv4_header = offset;
+    offset += Ipv4Packet::encode_header(
+        &mut storage[offset..],
+        PEER_IP,
+        LOCAL_IP,
+        IpProtocol::Udp,
+        payload.len(),
+        0x1234,
+        64,
+    )
+    .expect("benchmark IPv4 header should fit");
+    let fragment_offset_blocks =
+        u16::try_from(fragment_offset / 8).expect("benchmark fragment offset fits IPv4 field");
+    let fragment = fragment_offset_blocks | if more_fragments { 0x2000 } else { 0 };
+    storage[ipv4_header + 6..ipv4_header + 8].copy_from_slice(&fragment.to_be_bytes());
+    storage[ipv4_header + 10..ipv4_header + 12].copy_from_slice(&0u16.to_be_bytes());
+    let checksum = helios_netstack::ipv4_checksum(
+        &storage[ipv4_header..ipv4_header + Ipv4Packet::MIN_HEADER_LEN],
+    );
+    storage[ipv4_header + 10..ipv4_header + 12].copy_from_slice(&checksum.to_be_bytes());
+    storage[offset..offset + payload.len()].copy_from_slice(payload);
+    offset += payload.len();
+    frame.set_len(offset);
+    frame
+}
+
+fn udp_ipv4_fragment_frames(payload: &[u8]) -> [Bytes; 2] {
+    let mut datagram = [0u8; helios_netstack::ETHERNET_FRAME_BYTES];
+    let datagram_len = UdpPacket::encode(
+        &mut datagram,
+        IpAddress::Ipv4(PEER_IP),
+        IpAddress::Ipv4(LOCAL_IP),
+        8080,
+        49152,
+        payload,
+    )
+    .expect("benchmark UDP datagram should fit");
+    let split_at = 16usize;
+    assert!(split_at.is_multiple_of(8));
+    [
+        Bytes::copy_from_slice(udp_ipv4_fragment_frame(0, true, &datagram[..split_at]).as_slice()),
+        Bytes::copy_from_slice(
+            udp_ipv4_fragment_frame(split_at, false, &datagram[split_at..datagram_len]).as_slice(),
+        ),
+    ]
 }
 
 fn established_stack() -> Stack {
@@ -148,7 +232,9 @@ fn established_stack() -> Stack {
         state: NeighborState::Reachable,
         updated_at: StackInstant::from_nanos(0),
     });
-    stack.open_tcp_connect(local_tcp_endpoint(), peer_tcp_endpoint(), 7);
+    stack
+        .open_tcp_connect(local_tcp_endpoint(), peer_tcp_endpoint(), 7)
+        .expect("benchmark TCP connect should allocate a socket");
     let syn_ack = tcp_ipv4_frame(
         TcpHeader {
             source_port: 80,
@@ -182,8 +268,8 @@ fn established_stack() -> Stack {
 
 #[divan::bench(args = [1usize, 16, 64])]
 fn udp_receive_and_take(bencher: Bencher, packets: usize) {
-    let frames: [PacketBuffer; 64] = core::array::from_fn(|index| {
-        udp_ipv4_frame(
+    let frames: [Bytes; 64] = core::array::from_fn(|index| {
+        udp_ipv4_frame_bytes(
             8080 + u16::try_from(index).expect("benchmark UDP source port fits"),
             49152,
             UDP_PAYLOAD,
@@ -193,10 +279,13 @@ fn udp_receive_and_take(bencher: Bencher, packets: usize) {
     bencher.counter(ItemsCount::new(packets)).bench_local(|| {
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514));
         stack.add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24));
+        let socket = stack
+            .open_udp(UdpSocketBinding::wildcard(49152))
+            .expect("benchmark UDP socket should bind");
         for (index, frame) in frames.iter().take(packets).enumerate() {
             stack
-                .receive_frame(
-                    black_box(frame.as_slice()),
+                .receive_frame_bytes_with_backpressure(
+                    black_box(frame.clone()),
                     StackInstant::from_nanos(
                         u64::try_from(index + 1).expect("benchmark timestamp fits"),
                     ),
@@ -205,7 +294,8 @@ fn udp_receive_and_take(bencher: Bencher, packets: usize) {
         }
         for _ in 0..packets {
             let datagram = stack
-                .take_udp(49152)
+                .take_udp(socket)
+                .expect("benchmark UDP socket should exist")
                 .expect("benchmark UDP datagram should be queued");
             black_box(datagram.bytes);
         }
@@ -214,8 +304,8 @@ fn udp_receive_and_take(bencher: Bencher, packets: usize) {
 
 #[divan::bench(args = [8usize, 32, 64])]
 fn udp_receive_take_tail_port(bencher: Bencher, packets: usize) {
-    let frames: [PacketBuffer; 64] = core::array::from_fn(|index| {
-        udp_ipv4_frame(
+    let frames: [Bytes; 64] = core::array::from_fn(|index| {
+        udp_ipv4_frame_bytes(
             8080 + u16::try_from(index).expect("benchmark UDP source port fits"),
             49152 + u16::try_from(index).expect("benchmark UDP destination port fits"),
             UDP_PAYLOAD,
@@ -225,10 +315,17 @@ fn udp_receive_take_tail_port(bencher: Bencher, packets: usize) {
     bencher.counter(ItemsCount::new(packets)).bench_local(|| {
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514));
         stack.add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24));
+        let sockets: [UdpSocketId; 64] = core::array::from_fn(|index| {
+            stack
+                .open_udp(UdpSocketBinding::wildcard(
+                    49152 + u16::try_from(index).expect("benchmark UDP port fits"),
+                ))
+                .expect("benchmark UDP socket should bind")
+        });
         for (index, frame) in frames.iter().take(packets).enumerate() {
             stack
-                .receive_frame(
-                    black_box(frame.as_slice()),
+                .receive_frame_bytes_with_backpressure(
+                    black_box(frame.clone()),
                     StackInstant::from_nanos(
                         u64::try_from(index + 1).expect("benchmark timestamp fits"),
                     ),
@@ -236,8 +333,120 @@ fn udp_receive_take_tail_port(bencher: Bencher, packets: usize) {
                 .expect("benchmark UDP frame should be accepted");
         }
         let datagram = stack
-            .take_udp(49152 + u16::try_from(packets - 1).expect("benchmark port fits"))
+            .take_udp(sockets[packets - 1])
+            .expect("benchmark tail UDP socket should exist")
             .expect("benchmark tail UDP datagram should be queued");
+        black_box(datagram.bytes);
+    });
+}
+
+#[divan::bench]
+fn udp_receive_large_owned_frame(bencher: Bencher) {
+    let frame = udp_ipv4_frame_bytes(8080, 49152, UDP_LARGE_PAYLOAD);
+
+    bencher
+        .counter(BytesCount::new(UDP_LARGE_PAYLOAD.len()))
+        .bench_local(|| {
+            let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514));
+            stack.add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24));
+            let socket = stack
+                .open_udp(UdpSocketBinding::wildcard(49152))
+                .expect("benchmark UDP socket should bind");
+            stack
+                .receive_frame_bytes_with_backpressure(
+                    black_box(frame.clone()),
+                    StackInstant::from_nanos(1),
+                )
+                .expect("benchmark large UDP frame should be accepted");
+            let datagram = stack
+                .take_udp(socket)
+                .expect("benchmark UDP socket should exist")
+                .expect("benchmark large UDP datagram should be queued");
+            assert_eq!(datagram.bytes.as_ref(), UDP_LARGE_PAYLOAD.as_slice());
+            black_box(datagram.bytes);
+        });
+}
+
+#[divan::bench]
+fn udp_receive_large_owned_frame_rx_checksum_offload(bencher: Bencher) {
+    let frame = udp_ipv4_frame_bytes(8080, 49152, UDP_LARGE_PAYLOAD);
+    let config = StackConfig::new(LOCAL_MAC, 1514)
+        .with_rx_checksum_offload(RxChecksumOffload::new(true, false, true));
+
+    bencher
+        .counter(BytesCount::new(UDP_LARGE_PAYLOAD.len()))
+        .bench_local(|| {
+            let mut stack = Stack::new(black_box(config));
+            stack.add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24));
+            let socket = stack
+                .open_udp(UdpSocketBinding::wildcard(49152))
+                .expect("benchmark UDP socket should bind");
+            stack
+                .receive_frame_bytes_with_backpressure(
+                    black_box(frame.clone()),
+                    StackInstant::from_nanos(1),
+                )
+                .expect("benchmark checksum-offloaded large UDP frame should be accepted");
+            let datagram = stack
+                .take_udp(socket)
+                .expect("benchmark UDP socket should exist")
+                .expect("benchmark large UDP datagram should be queued");
+            assert_eq!(datagram.bytes.as_ref(), UDP_LARGE_PAYLOAD.as_slice());
+            black_box(datagram.bytes);
+        });
+}
+
+#[divan::bench]
+fn udp_receive_ipv4_joined_multicast(bencher: Bencher) {
+    let frame = udp_ipv4_frame_to_bytes(MULTICAST_IP, 5353, 49152, UDP_PAYLOAD);
+
+    bencher.counter(ItemsCount::new(1usize)).bench_local(|| {
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514));
+        stack.add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24));
+        stack
+            .join_ipv4_multicast(MULTICAST_IP, LOCAL_IP)
+            .expect("benchmark IPv4 multicast group should join");
+        let socket = stack
+            .open_udp(UdpSocketBinding::wildcard(49152))
+            .expect("benchmark UDP socket should bind");
+        stack
+            .receive_frame_bytes_with_backpressure(
+                black_box(frame.clone()),
+                StackInstant::from_nanos(1),
+            )
+            .expect("benchmark joined multicast UDP frame should be accepted");
+        let datagram = stack
+            .take_udp(socket)
+            .expect("benchmark UDP socket should exist")
+            .expect("benchmark joined multicast datagram should be queued");
+        black_box(datagram.bytes);
+    });
+}
+
+#[divan::bench]
+fn udp_receive_ipv4_fragment_reassembly(bencher: Bencher) {
+    let fragments = udp_ipv4_fragment_frames(UDP_PAYLOAD);
+
+    bencher.counter(ItemsCount::new(2usize)).bench_local(|| {
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514));
+        stack.add_ipv4_address(Ipv4Cidr::new(LOCAL_IP, 24));
+        let socket = stack
+            .open_udp(UdpSocketBinding::wildcard(49152))
+            .expect("benchmark UDP socket should bind");
+        for (index, fragment) in fragments.iter().enumerate() {
+            stack
+                .receive_frame_bytes_with_backpressure(
+                    black_box(fragment.clone()),
+                    StackInstant::from_nanos(
+                        u64::try_from(index + 1).expect("benchmark timestamp fits"),
+                    ),
+                )
+                .expect("benchmark IPv4 fragment should be accepted");
+        }
+        let datagram = stack
+            .take_udp(socket)
+            .expect("benchmark UDP socket should exist")
+            .expect("benchmark reassembled UDP datagram should be queued");
         black_box(datagram.bytes);
     });
 }
@@ -408,12 +617,80 @@ fn tcp_send_bytes_segments_without_copy(bencher: Bencher) {
                 let segment = socket
                     .take_transmit_segment(
                         u64::try_from(index + 2).expect("TCP benchmark timestamp fits u64"),
+                        usize::MAX,
                     )
                     .expect("TCP benchmark transmit segment should be queued");
                 transmitted = transmitted.saturating_add(segment.payload.len());
             }
             assert_eq!(transmitted, TCP_TRANSMIT_SEGMENTS * TCP_PAYLOAD_BYTES);
         });
+}
+
+#[divan::bench]
+fn tcp_zero_window_queue_send_bytes(bencher: Bencher) {
+    let payload = Bytes::from(vec![0u8; TCP_TRANSMIT_BUFFER_BYTES]);
+
+    bencher
+        .counter(BytesCount::new(payload.len()))
+        .bench_local(|| {
+            let mut socket = established_tcp_socket();
+            let _ = socket.on_segment(
+                TcpPacket {
+                    source_port: 80,
+                    destination_port: 49152,
+                    sequence: 101,
+                    acknowledgement: 8,
+                    flags: TcpFlags::ACK,
+                    window_size: 0,
+                    options: TcpOptions::empty(),
+                    payload: &[],
+                },
+                Bytes::new(),
+                2,
+            );
+            assert_eq!(socket.peer_receive_window(), 0);
+
+            let mut remaining = black_box(payload.clone());
+            let written = socket.queue_send_bytes(&mut remaining);
+            assert_eq!(written, TCP_TRANSMIT_BUFFER_BYTES);
+            assert!(remaining.is_empty());
+            assert_eq!(socket.take_transmit_segment(3, usize::MAX), None);
+        });
+}
+
+#[divan::bench]
+fn tcp_zero_window_persist_probe(bencher: Bencher) {
+    let payload = Bytes::from_static(b"helios-persist-probe");
+
+    bencher.bench_local(|| {
+        let mut socket = established_tcp_socket();
+        let _ = socket.on_segment(
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: 0,
+                options: TcpOptions::empty(),
+                payload: &[],
+            },
+            Bytes::new(),
+            2,
+        );
+        let mut remaining = black_box(payload.clone());
+        let written = socket.queue_send_bytes(&mut remaining);
+        assert_eq!(written, payload.len());
+        assert!(socket.take_transmit_segment(3, usize::MAX).is_none());
+        let deadline = socket
+            .next_deadline_nanos()
+            .expect("persist probe deadline should be armed");
+        let probe = socket
+            .take_transmit_segment(deadline, usize::MAX)
+            .expect("persist deadline should emit a probe");
+        assert_eq!(probe.payload.as_ref(), b"h");
+        black_box(probe);
+    });
 }
 
 #[divan::bench]
@@ -450,7 +727,7 @@ fn tcp_single_segment_transmit(bencher: Bencher) {
             assert_eq!(written, TCP_PAYLOAD_BYTES);
             assert!(remaining.is_empty());
             let segment = socket
-                .take_transmit_segment(2)
+                .take_transmit_segment(2, usize::MAX)
                 .expect("single queued segment should transmit");
             black_box(segment);
         });
@@ -474,6 +751,7 @@ fn tcp_ack_discards_in_flight_segments(bencher: Bencher) {
                 let segment = socket
                     .take_transmit_segment(
                         u64::try_from(index + 2).expect("TCP benchmark timestamp fits u64"),
+                        usize::MAX,
                     )
                     .expect("TCP benchmark transmit segment should be queued");
                 acknowledgement = segment.header.sequence + segment.sequence_len;
@@ -501,10 +779,15 @@ fn tcp_ack_discards_in_flight_segments(bencher: Bencher) {
 fn tcp_first_listen(bencher: Bencher) {
     bencher.bench_local(|| {
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514));
-        stack.open_tcp_listen(TcpEndpoint {
-            address: IpAddress::Ipv4(LOCAL_IP),
-            port: black_box(8080),
-        })
+        stack
+            .open_tcp_listen(
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(LOCAL_IP),
+                    port: black_box(8080),
+                },
+                DEFAULT_TCP_LISTEN_BACKLOG,
+            )
+            .expect("benchmark TCP listen should allocate a socket")
     });
 }
 
@@ -513,10 +796,16 @@ fn tcp_listen_many(bencher: Bencher, sockets: usize) {
     bencher.counter(ItemsCount::new(sockets)).bench_local(|| {
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, 1514));
         for index in 0..sockets {
-            stack.open_tcp_listen(TcpEndpoint {
-                address: IpAddress::Ipv4(LOCAL_IP),
-                port: 8000 + u16::try_from(black_box(index)).expect("benchmark port fits u16"),
-            });
+            stack
+                .open_tcp_listen(
+                    TcpEndpoint {
+                        address: IpAddress::Ipv4(LOCAL_IP),
+                        port: 8000
+                            + u16::try_from(black_box(index)).expect("benchmark port fits u16"),
+                    },
+                    DEFAULT_TCP_LISTEN_BACKLOG,
+                )
+                .expect("benchmark TCP listen should allocate a socket");
         }
     });
 }

@@ -2026,7 +2026,7 @@ mod tests {
                 debugger_programs::exec_path(
                     &client,
                     "/host/artifacts/wasi-tools/curl-stripped.wasm",
-                    &["http://example.com".to_owned()],
+                    &["http://neverssl.com/".to_owned()],
                 ),
             )
             .await
@@ -2036,7 +2036,7 @@ mod tests {
         assert_eq!(curl.exit_code, 0, "curl exited non-zero: {curl:?}");
         let curl_stdout = String::from_utf8_lossy(&curl.output.stdout).to_ascii_lowercase();
         assert!(
-            curl_stdout.contains("<title>example domain</title>"),
+            curl_stdout.contains("neverssl"),
             "unexpected curl stdout: {}",
             String::from_utf8_lossy(&curl.output.stdout)
         );

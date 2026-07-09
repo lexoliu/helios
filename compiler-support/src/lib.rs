@@ -1,6 +1,7 @@
 use helios_artifact::{
     CWASM_NO_VMEM_MEMORY_GUARD_SIZE, CWASM_NO_VMEM_MEMORY_RESERVATION,
-    CWASM_NO_VMEM_MEMORY_RESERVATION_FOR_GROWTH, cwasm_target_uses_lazy_commit_virtual_memory,
+    CWASM_NO_VMEM_MEMORY_RESERVATION_FOR_GROWTH, cwasm_target_supports_wasm_simd,
+    cwasm_target_uses_lazy_commit_virtual_memory,
 };
 use std::env;
 use std::num::NonZeroUsize;
@@ -148,8 +149,9 @@ fn build_engine_config(target: &str, hint: AotCompileHint, worker_count: usize) 
     config.wasm_component_model_async_builtins(true);
     config.wasm_component_model_async_stackful(true);
     config.wasm_component_model_threading(true);
-    config.wasm_simd(true);
-    config.wasm_relaxed_simd(true);
+    let wasm_simd = cwasm_target_supports_wasm_simd(target);
+    config.wasm_simd(wasm_simd);
+    config.wasm_relaxed_simd(wasm_simd);
     config.relaxed_simd_deterministic(false);
     config.wasm_multi_memory(true);
     config.wasm_memory64(true);

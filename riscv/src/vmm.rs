@@ -327,7 +327,7 @@ impl RiscvUserAddressSpace {
         Ok(prev)
     }
 
-    fn protect_4k(&self, virt: usize, flags: u64) -> Result<(), AddressSpaceError> {
+    fn protect_4k(&self, virt: usize, flags: u64) -> Result<u64, AddressSpaceError> {
         let l2 = self.root_table();
         let l2_index = (virt >> 30) & 0x1ff;
         if l2[l2_index] & PTE_VALID == 0 {
@@ -346,10 +346,11 @@ impl RiscvUserAddressSpace {
         if *entry & PTE_VALID == 0 {
             return Err(AddressSpaceError::NotCommitted);
         }
+        let old_entry = *entry;
         let ppn = *entry >> PTE_PPN_SHIFT;
         *entry = (ppn << PTE_PPN_SHIFT) | flags | PTE_VALID | PTE_USER | PTE_ACCESSED | PTE_DIRTY;
         sfence_vma_addr(virt);
-        Ok(())
+        Ok(old_entry)
     }
 
     fn translate_4k(&self, virt: usize) -> Option<(usize, u64)> {
@@ -467,6 +468,26 @@ impl RiscvUserAddressSpace {
             self.dealloc_user_phys(page.new_phys);
         }
     }
+
+    fn rollback_partial_commit(&self, start: usize, mapped_pages: usize) {
+        for page in 0..mapped_pages {
+            let virt = start + page * PAGE_SIZE;
+            let entry = self.unmap_4k(virt).unwrap_or_else(|error| {
+                panic!("RISC-V AddressSpace::commit rollback failed at {virt:#x}: {error}")
+            });
+            let phys = ((entry >> PTE_PPN_SHIFT) << PAGE_SHIFT) as usize;
+            self.dealloc_user_phys(phys);
+        }
+    }
+
+    fn rollback_partial_protect(&self, start: usize, old_entries: &[u64]) {
+        for (page, entry) in old_entries.iter().copied().enumerate().rev() {
+            let virt = start + page * PAGE_SIZE;
+            self.replace_4k(virt, entry).unwrap_or_else(|error| {
+                panic!("RISC-V AddressSpace::protect rollback failed at {virt:#x}: {error}")
+            });
+        }
+    }
 }
 
 impl AddressSpace for RiscvUserAddressSpace {
@@ -525,8 +546,19 @@ impl AddressSpace for RiscvUserAddressSpace {
 
         for offset in (0..virt.byte_len).step_by(PAGE_SIZE) {
             let virt_addr = virt.start.raw() + offset;
-            let phys = self.alloc_user_frame()?;
-            self.map_4k(virt_addr, phys, pte_flags)?;
+            let mapped_pages = offset / PAGE_SIZE;
+            let phys = match self.alloc_user_frame() {
+                Ok(phys) => phys,
+                Err(error) => {
+                    self.rollback_partial_commit(virt.start.raw(), mapped_pages);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self.map_4k(virt_addr, phys, pte_flags) {
+                self.dealloc_user_phys(phys);
+                self.rollback_partial_commit(virt.start.raw(), mapped_pages);
+                return Err(error);
+            }
         }
 
         let mut state = self.state.lock();
@@ -557,21 +589,33 @@ impl AddressSpace for RiscvUserAddressSpace {
     fn protect(&self, virt: VirtRange, flags: PageFlags) -> Result<(), AddressSpaceError> {
         validate_range(virt)?;
         let pte_flags = page_flags_to_pte(flags)?;
-        for offset in (0..virt.byte_len).step_by(PAGE_SIZE) {
-            self.protect_4k(virt.start.raw() + offset, pte_flags)?;
-        }
-        let mut state = self.state.lock();
-        if let Some(reservation) = state
-            .reservations
-            .iter_mut()
-            .find(|reservation| range_contains(reservation.range, virt))
         {
-            for region in reservation.committed.iter_mut() {
-                if region.range == virt {
-                    region.flags = flags;
+            let state = self.state.lock();
+            let reservation = state
+                .reservations
+                .iter()
+                .find(|reservation| range_contains(reservation.range, virt))
+                .ok_or(AddressSpaceError::NotReserved)?;
+            if !committed_regions_cover(&reservation.committed, virt) {
+                return Err(AddressSpaceError::NotCommitted);
+            }
+        }
+        let mut old_entries = Vec::new();
+        for offset in (0..virt.byte_len).step_by(PAGE_SIZE) {
+            match self.protect_4k(virt.start.raw() + offset, pte_flags) {
+                Ok(entry) => old_entries.push(entry),
+                Err(error) => {
+                    self.rollback_partial_protect(virt.start.raw(), &old_entries);
+                    return Err(error);
                 }
             }
         }
+        let mut state = self.state.lock();
+        let reservation = find_reservation_mut(&mut state.reservations, virt)?;
+        remove_committed_range(&mut reservation.committed, virt);
+        reservation
+            .committed
+            .push(CommittedRegion { range: virt, flags });
         Ok(())
     }
 

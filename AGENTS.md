@@ -342,12 +342,11 @@ through `HELIOS_KERNEL_PREBUILD_MANIFEST` for the target being checked.
 Run these locally before declaring a change complete:
 
 ```bash
-cargo check -p helios-kernel
-cargo check -p helios-hosted
-cargo check -p helios-inspector
-cargo check -p helios-riscv --target riscv64gc-unknown-none-elf
-cargo check -p helios-x86 --target x86_64-unknown-none
-cargo test  -p helios-hosted init_program::tests::embedded_debugger_ -- --nocapture
+just check-host
+just check-target aarch64-unknown-none helios-aarch64
+just check-target riscv64gc-unknown-none-elf helios-riscv
+just check-target x86_64-unknown-none helios-x86
+just test-embedded-debugger
 ```
 
 Contract compliance is enforced by module ownership and by these checks, not

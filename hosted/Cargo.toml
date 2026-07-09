@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+blocking = "1.6.2"
 critical-section = { version = "1.2.0", features = ["std"] }
 crossbeam-channel = "0.5.15"
 helios-hal.workspace = true

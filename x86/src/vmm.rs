@@ -164,21 +164,37 @@ impl X86UserAddressSpace {
     ) -> Result<(), AddressSpaceError> {
         for offset in (0..virt.byte_len).step_by(PAGE) {
             let virt_addr = virt.start.raw() + offset;
-            let phys = self.alloc_user_frame()?;
+            let mapped_pages = offset / PAGE;
+            let phys = match self.alloc_user_frame() {
+                Ok(phys) => phys,
+                Err(error) => {
+                    self.rollback_partial_commit(mapper, virt.start.raw(), mapped_pages);
+                    return Err(error);
+                }
+            };
             let frame = x86_64::structures::paging::PhysFrame::from_start_address(PhysAddr::new(
                 phys as u64,
             ))
-            .map_err(|_| AddressSpaceError::Misaligned)?;
+            .map_err(|_| {
+                self.dealloc_user_phys(phys);
+                self.rollback_partial_commit(mapper, virt.start.raw(), mapped_pages);
+                AddressSpaceError::Misaligned
+            })?;
             let page = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(virt_addr as u64))
-                .map_err(|_| AddressSpaceError::Misaligned)?;
+                .map_err(|_| {
+                    self.dealloc_user_phys(phys);
+                    self.rollback_partial_commit(mapper, virt.start.raw(), mapped_pages);
+                    AddressSpaceError::Misaligned
+                })?;
             unsafe {
-                mapper
-                    .map_to(page, frame, flags, frame_allocator)
-                    .map_err(|_| {
+                match mapper.map_to(page, frame, flags, frame_allocator) {
+                    Ok(flush) => flush.flush(),
+                    Err(_) => {
                         self.dealloc_user_phys(phys);
-                        AddressSpaceError::PageTableExhausted
-                    })?
-                    .flush();
+                        self.rollback_partial_commit(mapper, virt.start.raw(), mapped_pages);
+                        return Err(AddressSpaceError::PageTableExhausted);
+                    }
+                }
             }
         }
         Ok(())
@@ -212,13 +228,27 @@ impl X86UserAddressSpace {
         virt: VirtRange,
         flags: PageTableFlags,
     ) -> Result<(), AddressSpaceError> {
+        let mut old_flags = Vec::new();
         for offset in (0..virt.byte_len).step_by(PAGE) {
             let virt_addr = virt.start.raw() + offset;
             let page = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(virt_addr as u64))
                 .map_err(|_| AddressSpaceError::Misaligned)?;
+            let previous = match mapper.translate(X86VirtAddr::new(virt_addr as u64)) {
+                TranslateResult::Mapped { flags, .. } => flags,
+                _ => {
+                    rollback_partial_protect(mapper, &old_flags);
+                    return Err(AddressSpaceError::NotCommitted);
+                }
+            };
             match unsafe { mapper.update_flags(page, flags) } {
-                Ok(flush) => flush.flush(),
-                Err(_) => return Err(AddressSpaceError::NotCommitted),
+                Ok(flush) => {
+                    flush.flush();
+                    old_flags.push((page, previous));
+                }
+                Err(_) => {
+                    rollback_partial_protect(mapper, &old_flags);
+                    return Err(AddressSpaceError::NotCommitted);
+                }
             }
         }
         Ok(())
@@ -348,6 +378,26 @@ impl X86UserAddressSpace {
             self.dealloc_user_phys(page.new_phys);
         }
     }
+
+    fn rollback_partial_commit(
+        &self,
+        mapper: &mut OffsetPageTable<'static>,
+        start: usize,
+        mapped_pages: usize,
+    ) {
+        for page_index in 0..mapped_pages {
+            let virt = start + page_index * PAGE;
+            let page = Page::<Size4KiB>::from_start_address(X86VirtAddr::new(virt as u64))
+                .unwrap_or_else(|error| {
+                    panic!("x86 AddressSpace::commit rollback got invalid page {virt:#x}: {error}")
+                });
+            let (frame, flush) = mapper.unmap(page).unwrap_or_else(|error| {
+                panic!("x86 AddressSpace::commit rollback failed at {virt:#x}: {error:?}")
+            });
+            flush.flush();
+            self.dealloc_user_phys(frame.start_address().as_u64() as usize);
+        }
+    }
 }
 
 impl AddressSpace for X86UserAddressSpace {
@@ -441,26 +491,26 @@ impl AddressSpace for X86UserAddressSpace {
         self.assert_smp_safe();
         validate_range(virt)?;
         let pt_flags = page_flags_to_pt(flags)?;
-        // PT is the source of truth — update entries first, treat
-        // bookkeeping as cache. The runtime's mprotect call patterns
-        // routinely span what we recorded as separate commits, so a
-        // single-`CommittedRegion`-must-contain-virt gate refuses
-        // valid requests.
+        {
+            let state = self.state.lock();
+            let reservation = state
+                .reservations
+                .iter()
+                .find(|reservation| range_contains(reservation.range, virt))
+                .ok_or(AddressSpaceError::NotReserved)?;
+            if !committed_regions_cover(&reservation.committed, virt) {
+                return Err(AddressSpaceError::NotCommitted);
+            }
+        }
         let mut mapper = unsafe { smp::current_mapper(self.physical_memory_offset) };
         self.protect_pages(&mut mapper, virt, pt_flags)?;
         self.shootdown_range(virt);
         let mut state = self.state.lock();
-        if let Some(reservation) = state
-            .reservations
-            .iter_mut()
-            .find(|reservation| range_contains(reservation.range, virt))
-        {
-            for region in reservation.committed.iter_mut() {
-                if region.range == virt {
-                    region.flags = flags;
-                }
-            }
-        }
+        let reservation = find_reservation_mut(&mut state.reservations, virt)?;
+        remove_committed_range(&mut reservation.committed, virt);
+        reservation
+            .committed
+            .push(CommittedRegion { range: virt, flags });
         Ok(())
     }
 
@@ -606,6 +656,22 @@ fn remove_committed_range(regions: &mut Vec<CommittedRegion>, range: VirtRange) 
                 range: VirtRange::new(range.end(), region.range.end().raw() - range.end().raw()),
                 flags: region.flags,
             });
+        }
+    }
+}
+
+fn rollback_partial_protect(
+    mapper: &mut OffsetPageTable<'static>,
+    old_flags: &[(Page<Size4KiB>, PageTableFlags)],
+) {
+    for (page, flags) in old_flags.iter().rev().copied() {
+        unsafe {
+            mapper
+                .update_flags(page, flags)
+                .unwrap_or_else(|error| {
+                    panic!("x86 AddressSpace::protect rollback failed: {error:?}")
+                })
+                .flush();
         }
     }
 }

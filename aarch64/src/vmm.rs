@@ -232,7 +232,7 @@ impl Aarch64UserAddressSpace {
         Ok(entry)
     }
 
-    fn protect_4k_no_flush(&self, virt: usize, flags: u64) -> Result<(), AddressSpaceError> {
+    fn protect_4k_no_flush(&self, virt: usize, flags: u64) -> Result<u64, AddressSpaceError> {
         let l0 = self.root();
         let l0_index = (virt >> 39) & 0x1ff;
         let l0_entry = unsafe { l0.add(l0_index).read_volatile() };
@@ -263,7 +263,7 @@ impl Aarch64UserAddressSpace {
         unsafe {
             entry_ptr.write_volatile(new_descriptor);
         }
-        Ok(())
+        Ok(entry)
     }
 
     fn translate_4k(&self, virt: usize) -> Option<u64> {
@@ -407,6 +407,38 @@ impl Aarch64UserAddressSpace {
         }
         for page in pages {
             self.dealloc_user_phys(page.new_phys);
+        }
+    }
+
+    fn rollback_partial_commit(&self, start: usize, mapped_pages: usize) {
+        let mut batch_entries = [0u64; TLB_DECOMMIT_BATCH_PAGES];
+        let mut batch_count = 0;
+        let mut batch_start = start;
+        for page in 0..mapped_pages {
+            let virt = start + page * PAGE;
+            if batch_count == 0 {
+                batch_start = virt;
+            }
+            batch_entries[batch_count] = self.unmap_4k_no_flush(virt).unwrap_or_else(|error| {
+                panic!("Aarch64 AddressSpace::commit rollback failed at {virt:#x}: {error}")
+            });
+            batch_count += 1;
+            if batch_count == TLB_DECOMMIT_BATCH_PAGES {
+                self.flush_and_dealloc_entries(batch_start, &batch_entries[..batch_count]);
+                batch_count = 0;
+            }
+        }
+        if batch_count != 0 {
+            self.flush_and_dealloc_entries(batch_start, &batch_entries[..batch_count]);
+        }
+    }
+
+    fn rollback_partial_protect(&self, start: usize, old_entries: &[u64]) {
+        for (page, entry) in old_entries.iter().copied().enumerate().rev() {
+            let virt = start + page * PAGE;
+            self.replace_4k(virt, entry).unwrap_or_else(|error| {
+                panic!("Aarch64 AddressSpace::protect rollback failed at {virt:#x}: {error}")
+            });
         }
     }
 
@@ -585,21 +617,13 @@ impl AddressSpace for Aarch64UserAddressSpace {
             let phys = match self.alloc_user_frame() {
                 Ok(phys) => phys,
                 Err(error) => {
-                    if mapped_pages != 0 {
-                        unsafe {
-                            flush_tlb_pages(virt.start.raw(), mapped_pages);
-                        }
-                    }
+                    self.rollback_partial_commit(virt.start.raw(), mapped_pages);
                     return Err(error);
                 }
             };
             if let Err(error) = self.map_4k_no_flush(virt_addr, phys, pte_flags) {
                 self.dealloc_user_phys(phys);
-                if mapped_pages != 0 {
-                    unsafe {
-                        flush_tlb_pages(virt.start.raw(), mapped_pages);
-                    }
-                }
+                self.rollback_partial_commit(virt.start.raw(), mapped_pages);
                 return Err(error);
             }
             mapped_pages += 1;
@@ -634,23 +658,31 @@ impl AddressSpace for Aarch64UserAddressSpace {
     fn protect(&self, virt: VirtRange, flags: PageFlags) -> Result<(), AddressSpaceError> {
         validate_range(virt)?;
         let pte_flags = page_flags_to_pte(flags)?;
-        // Walk the page table directly rather than constraining the
-        // call to a single bookkeeping `CommittedRegion`. The runtime's
-        // `make_readonly` / `make_executable` routinely span what
-        // we recorded as separate commits (e.g. when a code memory
-        // is committed in halves and then protected as a single
-        // span); updating per-page PTEs and rejecting only on
-        // genuinely missing mappings keeps the semantic at "the PT
-        // is the source of truth".
+        {
+            let state = self.state.lock();
+            let reservation = state
+                .reservations
+                .iter()
+                .find(|reservation| range_contains(reservation.range, virt))
+                .ok_or(AddressSpaceError::NotReserved)?;
+            if !committed_regions_cover(&reservation.committed, virt) {
+                return Err(AddressSpaceError::NotCommitted);
+            }
+        }
         let mut protected_pages = 0;
+        let mut old_entries = Vec::new();
         for offset in (0..virt.byte_len).step_by(PAGE) {
-            if let Err(error) = self.protect_4k_no_flush(virt.start.raw() + offset, pte_flags) {
-                if protected_pages != 0 {
-                    unsafe {
-                        flush_tlb_pages(virt.start.raw(), protected_pages);
+            match self.protect_4k_no_flush(virt.start.raw() + offset, pte_flags) {
+                Ok(entry) => old_entries.push(entry),
+                Err(error) => {
+                    self.rollback_partial_protect(virt.start.raw(), &old_entries);
+                    if protected_pages != 0 {
+                        unsafe {
+                            flush_tlb_pages(virt.start.raw(), protected_pages);
+                        }
                     }
+                    return Err(error);
                 }
-                return Err(error);
             }
             protected_pages += 1;
         }
@@ -659,21 +691,12 @@ impl AddressSpace for Aarch64UserAddressSpace {
                 flush_tlb_pages(virt.start.raw(), protected_pages);
             }
         }
-        // Best-effort bookkeeping update — flag changes on
-        // exact-match committed regions stay accurate, partial
-        // overlaps lose the recorded flags and fall back to
-        // re-querying the PT through `translate`.
         let mut state = self.state.lock();
-        if let Some(reservation) = state
-            .reservations
-            .iter_mut()
-            .find(|reservation| range_contains(reservation.range, virt))
-        {
-            remove_committed_range(&mut reservation.committed, virt);
-            reservation
-                .committed
-                .push(CommittedRegion { range: virt, flags });
-        }
+        let reservation = find_reservation_mut(&mut state.reservations, virt)?;
+        remove_committed_range(&mut reservation.committed, virt);
+        reservation
+            .committed
+            .push(CommittedRegion { range: virt, flags });
         Ok(())
     }
 

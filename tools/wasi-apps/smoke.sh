@@ -261,7 +261,7 @@ run_smoke \
 if [[ "${HELIOS_WASI_SMOKE_CURL:-0}" == "1" ]]; then
     run_smoke \
         curl \
-        '<title>Example Domain</title>' \
+        'NeverSSL' \
         -- \
         --boot-program dash \
         --boot-program debugger \
@@ -269,5 +269,5 @@ if [[ "${HELIOS_WASI_SMOKE_CURL:-0}" == "1" ]]; then
         --no-compiler-plugin \
         shell \
         -c \
-        '/bin/curl http://example.com/'
+        '/bin/curl http://neverssl.com/'
 fi

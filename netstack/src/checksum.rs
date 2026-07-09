@@ -28,6 +28,26 @@ pub fn udp_checksum(
     }
 }
 
+pub fn udp_checksum_valid(
+    source: crate::IpAddress,
+    destination: crate::IpAddress,
+    datagram: &[u8],
+) -> bool {
+    match (source, destination) {
+        (crate::IpAddress::Ipv4(_), crate::IpAddress::Ipv4(_))
+            if udp_checksum_field(datagram) == 0 =>
+        {
+            true
+        }
+        (crate::IpAddress::Ipv6(_), crate::IpAddress::Ipv6(_))
+            if udp_checksum_field(datagram) == 0 =>
+        {
+            false
+        }
+        _ => udp_checksum(source, destination, datagram) == 0,
+    }
+}
+
 pub fn tcpv4_checksum(source: Ipv4Address, destination: Ipv4Address, segment: &[u8]) -> u16 {
     finish_checksum(
         ipv4_pseudo_sum(source, destination, IpProtocol::Tcp, segment.len()) + sum_words(segment),
@@ -40,11 +60,42 @@ pub fn tcpv6_checksum(source: Ipv6Address, destination: Ipv6Address, segment: &[
     )
 }
 
+pub fn tcp_checksum_valid(
+    source: crate::IpAddress,
+    destination: crate::IpAddress,
+    segment: &[u8],
+) -> bool {
+    match (source, destination) {
+        (crate::IpAddress::Ipv4(source), crate::IpAddress::Ipv4(destination)) => {
+            tcpv4_checksum(source, destination, segment) == 0
+        }
+        (crate::IpAddress::Ipv6(source), crate::IpAddress::Ipv6(destination)) => {
+            tcpv6_checksum(source, destination, segment) == 0
+        }
+        _ => panic!("TCP pseudo-header address families must match"),
+    }
+}
+
 pub fn icmpv6_checksum(source: Ipv6Address, destination: Ipv6Address, message: &[u8]) -> u16 {
     finish_checksum(
         ipv6_pseudo_sum(source, destination, IpProtocol::Icmpv6, message.len())
             + sum_words(message),
     )
+}
+
+pub fn icmpv6_checksum_valid(
+    source: Ipv6Address,
+    destination: Ipv6Address,
+    message: &[u8],
+) -> bool {
+    icmpv6_checksum(source, destination, message) == 0
+}
+
+fn udp_checksum_field(datagram: &[u8]) -> u16 {
+    if datagram.len() < 8 {
+        return 0;
+    }
+    u16::from_be_bytes([datagram[6], datagram[7]])
 }
 
 fn ipv4_pseudo_sum(

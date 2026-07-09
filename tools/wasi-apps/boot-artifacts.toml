@@ -29,6 +29,7 @@ command = "quickjs"
 package = "quickjs-ng/quickjs"
 version = "v0.14.0"
 source_url = "https://github.com/quickjs-ng/quickjs/archive/refs/tags/v0.14.0.tar.gz"
+requires_wasm_simd = true
 bootfs_path = "bin/qjs"
 source = "artifacts/wasix/quickjs/qjs.wasm"
 

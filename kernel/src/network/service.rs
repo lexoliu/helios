@@ -15,10 +15,12 @@ use helios_hal::io::IoError;
 use helios_netstack::{
     DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage, DhcpDnsServers,
     DhcpMessageType, DhcpPacket, DnsQuestionWriter, DnsResponse, EthernetFrame, EthernetProtocol,
-    IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Packet,
-    MAX_OUTBOUND_FRAMES, NeighborEntry, NetworkInterface as NetworkDevice, OutboundBatchStatus,
-    PacketBuffer, Route, RouteTable, Stack, StackConfig, StackError, StackEvent, StackInstant,
-    TcpConnectState, TcpEndpoint, TcpPacket, TcpReadIntoState, TcpReadState, UdpPacket, UdpPayload,
+    Icmpv4Packet, Icmpv6Packet, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet,
+    Ipv6Address, Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborEntry, NetworkInterface as NetworkDevice,
+    OutboundBatchStatus, PacketBuffer, Route, RouteTable, RxChecksumOffload, Stack, StackConfig,
+    StackError, StackEvent, StackInstant, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
+    TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState, UdpEndpoint, UdpPacket,
+    UdpPayload, UdpSocketBinding, UdpSocketError,
 };
 use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
@@ -58,6 +60,33 @@ fn peek_local_port(frame: &[u8]) -> Option<u16> {
     match protocol {
         IpProtocol::Tcp => Some(TcpPacket::parse(l4_payload)?.destination_port),
         IpProtocol::Udp => Some(UdpPacket::parse(l4_payload)?.destination_port),
+        IpProtocol::Icmp => peek_icmpv4_quoted_local_port(l4_payload),
+        IpProtocol::Icmpv6 => peek_icmpv6_quoted_local_port(l4_payload),
+    }
+}
+
+fn peek_icmpv4_quoted_local_port(bytes: &[u8]) -> Option<u16> {
+    let Icmpv4Packet::DestinationUnreachable(unreachable) = Icmpv4Packet::parse(bytes)? else {
+        return None;
+    };
+    let quoted = Ipv4Packet::parse_quoted(unreachable.original)?;
+    match quoted.protocol {
+        IpProtocol::Tcp => Some(TcpPacket::parse_ports(quoted.payload)?.source),
+        IpProtocol::Udp => Some(UdpPacket::parse_ports(quoted.payload)?.source),
+        _ => None,
+    }
+}
+
+fn peek_icmpv6_quoted_local_port(bytes: &[u8]) -> Option<u16> {
+    let original = match Icmpv6Packet::parse(bytes)? {
+        Icmpv6Packet::DestinationUnreachable(unreachable) => unreachable.original,
+        Icmpv6Packet::PacketTooBig(packet_too_big) => packet_too_big.original,
+        _ => return None,
+    };
+    let quoted = Ipv6Packet::parse_quoted(original)?;
+    match quoted.next_header {
+        IpProtocol::Tcp => Some(TcpPacket::parse_ports(quoted.payload)?.source),
+        IpProtocol::Udp => Some(UdpPacket::parse_ports(quoted.payload)?.source),
         _ => None,
     }
 }
@@ -77,6 +106,8 @@ fn shard_idx_for_port(port: Option<u16>, shard_count: usize) -> usize {
     usize::from(stride_idx) % shard_count
 }
 const INTERNAL_DNS_PORT: u16 = 49_151;
+const INTERNAL_DHCP_SOCKET_INDEX: usize = 0;
+const INTERNAL_DNS_SOCKET_INDEX: usize = 1;
 const LOCAL_NETWORK_PORT: NetworkPortId = NetworkPortId::new(0);
 const DHCP_RETRANSMIT_NANOS: u64 = 1_000_000_000;
 const MAX_TCP_STREAM_HANDLES: usize = 256;
@@ -232,7 +263,7 @@ impl crate::ComponentHostUdpSocketToken for UdpSocketId {
 }
 
 struct NetworkShard {
-    stack: Stack,
+    stack: Box<Stack>,
     /// This shard's index inside the parent `NetworkShardSet`.
     /// Encoded into every public socket id this shard mints so the
     /// inverse mapping `(id - 1) % shard_count == shard_idx` can
@@ -805,6 +836,10 @@ impl<T, const CAPACITY: usize> HandleSlab<T, CAPACITY> {
         self.slots.get(index).and_then(Option::as_ref)
     }
 
+    fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        self.slots.get_mut(index).and_then(Option::as_mut)
+    }
+
     fn remove(&mut self, index: usize) -> Option<T> {
         let value = self.slots.get_mut(index).and_then(Option::take)?;
         self.free[self.free_len] = index;
@@ -836,11 +871,14 @@ enum DhcpClientState {
 }
 
 struct TcpListenerState {
+    stack_socket: helios_netstack::SocketId,
     local_port: u16,
 }
 
+#[derive(Clone, Copy)]
 struct UdpSocketState {
-    local_port: u16,
+    stack_socket: helios_netstack::UdpSocketId,
+    binding: UdpSocketBinding,
 }
 
 enum TcpConnectProgress {
@@ -887,6 +925,204 @@ fn map_kernel_ipv4_cidr(cidr: KernelIpv4Cidr) -> Ipv4Cidr {
 
 fn map_ipv4_cidr(cidr: Ipv4Cidr) -> KernelIpv4Cidr {
     KernelIpv4Cidr::new(map_ipv4_address(cidr.address()), cidr.prefix_len())
+}
+
+fn map_tcp_connect_terminal_error(error: TcpConnectTerminalError) -> TcpError {
+    match error {
+        TcpConnectTerminalError::RemotePortUnreachable => TcpError {
+            kind: TcpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::TcpRemotePortUnreachable,
+        },
+        TcpConnectTerminalError::RemoteNetworkUnreachable => TcpError {
+            kind: TcpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::TcpRemoteNetworkUnreachable,
+        },
+        TcpConnectTerminalError::RemoteHostUnreachable => TcpError {
+            kind: TcpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::TcpRemoteHostUnreachable,
+        },
+        TcpConnectTerminalError::RemoteProtocolUnreachable => TcpError {
+            kind: TcpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::TcpRemoteProtocolUnreachable,
+        },
+        TcpConnectTerminalError::RemoteCommunicationProhibited => TcpError {
+            kind: TcpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::TcpRemoteCommunicationProhibited,
+        },
+        TcpConnectTerminalError::Closed => TcpError {
+            kind: TcpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::TcpClosedDuringConnect,
+        },
+    }
+}
+
+fn map_udp_socket_error(error: UdpSocketError) -> UdpError {
+    match error {
+        UdpSocketError::RemotePortUnreachable => UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UdpRemotePortUnreachable,
+        },
+        UdpSocketError::RemoteNetworkUnreachable => UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UdpRemoteNetworkUnreachable,
+        },
+        UdpSocketError::RemoteHostUnreachable => UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UdpRemoteHostUnreachable,
+        },
+        UdpSocketError::RemoteProtocolUnreachable => UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UdpRemoteProtocolUnreachable,
+        },
+        UdpSocketError::RemoteCommunicationProhibited => UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UdpRemoteCommunicationProhibited,
+        },
+    }
+}
+
+fn map_udp_bind_error(error: StackError) -> UdpError {
+    match error {
+        StackError::AddressInUse => UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UdpPortInUse,
+        },
+        StackError::UnknownSocket => UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UnknownUdpSocket,
+        },
+        StackError::AddressFamilyMismatch | StackError::RemoteAddressMismatch => UdpError {
+            kind: UdpErrorKind::Unsupported,
+            detail: NetworkErrorDetail::UnsupportedAddressFamily,
+        },
+        StackError::Unroutable => UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::NetworkServiceUnavailable,
+        },
+        StackError::PacketTooLarge => UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UdpDatagramTooLarge,
+        },
+        _ => UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UdpBindFailed,
+        },
+    }
+}
+
+fn map_udp_connect_error(error: StackError) -> UdpError {
+    match error {
+        StackError::AddressInUse => UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UdpPortInUse,
+        },
+        StackError::UnknownSocket => UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UnknownUdpSocket,
+        },
+        StackError::AddressFamilyMismatch | StackError::RemoteAddressMismatch => UdpError {
+            kind: UdpErrorKind::Unsupported,
+            detail: NetworkErrorDetail::UnsupportedAddressFamily,
+        },
+        StackError::Unroutable => UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::NetworkServiceUnavailable,
+        },
+        StackError::PacketTooLarge => UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UdpDatagramTooLarge,
+        },
+        _ => UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UdpConnectFailed,
+        },
+    }
+}
+
+fn map_udp_disconnect_error(error: StackError) -> UdpError {
+    match error {
+        StackError::AddressInUse => UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UdpPortInUse,
+        },
+        StackError::UnknownSocket => UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UnknownUdpSocket,
+        },
+        StackError::AddressFamilyMismatch | StackError::RemoteAddressMismatch => UdpError {
+            kind: UdpErrorKind::Unsupported,
+            detail: NetworkErrorDetail::UnsupportedAddressFamily,
+        },
+        StackError::Unroutable => UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::NetworkServiceUnavailable,
+        },
+        StackError::PacketTooLarge => UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UdpDatagramTooLarge,
+        },
+        _ => UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UdpDisconnectFailed,
+        },
+    }
+}
+
+fn map_udp_send_error(error: StackError) -> UdpError {
+    match error {
+        StackError::UnknownSocket => UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UnknownUdpSocket,
+        },
+        StackError::AddressFamilyMismatch | StackError::RemoteAddressMismatch => UdpError {
+            kind: UdpErrorKind::Unsupported,
+            detail: NetworkErrorDetail::UnsupportedAddressFamily,
+        },
+        StackError::Unroutable => UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::NetworkServiceUnavailable,
+        },
+        StackError::PacketTooLarge => UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UdpDatagramTooLarge,
+        },
+        _ => UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UdpQueueFailed,
+        },
+    }
+}
+
+fn multicast_join_error(error: StackError) -> UdpError {
+    let detail = match error {
+        StackError::MulticastInterfaceUnavailable => {
+            NetworkErrorDetail::UdpMulticastInterfaceUnavailable
+        }
+        StackError::InvalidMulticastGroup | StackError::MulticastMembershipTableFull => {
+            NetworkErrorDetail::UdpMulticastJoinFailed
+        }
+        _ => NetworkErrorDetail::UdpMulticastJoinFailed,
+    };
+    UdpError {
+        kind: UdpErrorKind::Unavailable,
+        detail,
+    }
+}
+
+fn multicast_leave_error(error: StackError) -> UdpError {
+    let detail = match error {
+        StackError::MulticastInterfaceUnavailable => {
+            NetworkErrorDetail::UdpMulticastInterfaceUnavailable
+        }
+        StackError::InvalidMulticastGroup | StackError::MulticastMembershipNotFound => {
+            NetworkErrorDetail::UdpMulticastLeaveFailed
+        }
+        _ => NetworkErrorDetail::UdpMulticastLeaveFailed,
+    };
+    UdpError {
+        kind: UdpErrorKind::Unavailable,
+        detail,
+    }
 }
 
 fn require_local_network_port(port: NetworkPortId) -> Result<(), NetworkControlError> {
@@ -1021,6 +1257,11 @@ where
         let capabilities = device.capabilities();
         let rx_poll_budget = capabilities.events.rx_poll_budget;
         let tx_completion_budget = capabilities.events.tx_completion_budget;
+        let rx_checksum_offload = RxChecksumOffload::new(
+            capabilities.checksum.rx_ipv4,
+            capabilities.checksum.rx_tcp,
+            capabilities.checksum.rx_udp,
+        );
         let mac = device.mac_address();
         let max_frame_len = device.max_frame_len();
         // One NetworkShard per processor. Each shard owns an
@@ -1035,16 +1276,17 @@ where
         // We probe the configured rx_budget once via a throwaway
         // Stack — every shard's Stack uses the same StackConfig so
         // the value is identical across shards.
-        let stack_rx_budget =
-            Stack::new(StackConfig::new(mac, max_frame_len).with_rx_budget(rx_poll_budget))
-                .config()
-                .rx_budget;
+        let stack_config = StackConfig::new(mac, max_frame_len)
+            .with_rx_budget(rx_poll_budget)
+            .with_rx_checksum_offload(rx_checksum_offload);
+        let stack_rx_budget = Stack::new(stack_config).config().rx_budget;
         let state = NetworkShardSet::new(shard_count, |index| {
             let staggered_xid = transaction_id.wrapping_add(index as u32);
             NetworkShard::new(
                 mac,
                 max_frame_len,
                 rx_poll_budget,
+                rx_checksum_offload,
                 staggered_xid,
                 index,
                 shard_count,
@@ -1213,6 +1455,19 @@ where
         self.execute_udp_bind(local_port).await
     }
 
+    pub fn udp_connect(
+        &self,
+        socket: UdpSocketId,
+        remote_address: NetworkIpAddress,
+        port: u16,
+    ) -> Result<(), UdpError> {
+        self.execute_udp_connect(socket, remote_address, port)
+    }
+
+    pub fn udp_disconnect(&self, socket: UdpSocketId) -> Result<(), UdpError> {
+        self.execute_udp_disconnect(socket)
+    }
+
     pub async fn udp_send(
         &self,
         socket: UdpSocketId,
@@ -1356,13 +1611,19 @@ where
         if matches!(destination, IpAddress::Ipv4(_)) {
             self.wait_for_ipv4_tcp(deadline_nanos).await?;
         }
-        // Outgoing connect lands on the current processor's shard so
-        // its ephemeral source port (allocated under the stride
-        // scheme) demuxes RX traffic back here on every reply.
-        let processor = self.inner.cpu.current_processor();
-        let stream = self.inner.state.with_processor(processor, |state| {
-            state.start_tcp_connect(destination, port, local_port)
-        })?;
+        // A caller-selected local port already has a deterministic
+        // shard owner; route there so RX demux and handle routing agree.
+        // Port 0 allocates from the current processor's shard.
+        let stream = if local_port == 0 {
+            let processor = self.inner.cpu.current_processor();
+            self.inner.state.with_processor(processor, |state| {
+                state.start_tcp_connect(destination, port, local_port)
+            })
+        } else {
+            self.inner.state.with_local_port(local_port, |state| {
+                state.start_tcp_connect(destination, port, local_port)
+            })
+        }?;
 
         loop {
             self.drive_tcp().await?;
@@ -1398,14 +1659,18 @@ where
         &self,
         local_address: NetworkIpAddress,
         local_port: u16,
-        _backlog: u16,
+        backlog: u16,
     ) -> Result<TcpListener<TcpListenerId>, TcpError> {
+        let backlog = TcpListenBacklog::try_new(backlog).map_err(|_| TcpError {
+            kind: TcpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::TcpListenStartFailed,
+        })?;
         // Listener lives on the shard that owns its local port: a
         // well-known port (< EPHEMERAL_PORT_START) goes to shard 0,
         // an explicit ephemeral port stride-maps to its owner. RX
         // demux for the same port routes back here.
         self.inner.state.with_local_port(local_port, |state| {
-            state.start_tcp_listen(local_address, local_port)
+            state.start_tcp_listen(local_address, local_port, backlog)
         })
     }
 
@@ -1687,6 +1952,25 @@ where
         }
     }
 
+    fn execute_udp_connect(
+        &self,
+        socket: UdpSocketId,
+        remote_address: NetworkIpAddress,
+        port: u16,
+    ) -> Result<(), UdpError> {
+        self.synchronize_control_plane();
+        let destination = map_network_ip_address(remote_address);
+        self.inner.state.with_handle(socket, |state| {
+            state.connect_udp_socket(socket, destination, port)
+        })
+    }
+
+    fn execute_udp_disconnect(&self, socket: UdpSocketId) -> Result<(), UdpError> {
+        self.inner
+            .state
+            .with_handle(socket, |state| state.disconnect_udp_socket(socket))
+    }
+
     async fn execute_udp_send(
         &self,
         socket: UdpSocketId,
@@ -1750,10 +2034,9 @@ where
     ) -> Result<u64, UdpError> {
         self.synchronize_control_plane();
         let now = StackInstant::from_nanos(self.now_nanos());
-        let written = self
-            .inner
-            .state
-            .with_mut(|state| state.try_send_udp(socket, destination, port, bytes, now))?;
+        let written = self.inner.state.with_handle(socket, |state| {
+            state.try_send_udp(socket, destination, port, bytes, now)
+        })?;
         Ok(u64::try_from(written).unwrap_or_else(|_| panic!("udp write length exceeds u64")))
     }
 
@@ -1766,10 +2049,9 @@ where
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         loop {
             self.drive_udp().await?;
-            let received = self
-                .inner
-                .state
-                .with_mut(|state| state.poll_udp_receive(socket, max_bytes as usize))?;
+            let received = self.inner.state.with_handle(socket, |state| {
+                state.poll_udp_receive(socket, max_bytes as usize)
+            })?;
             match received {
                 Some(datagram) => return Ok(Some(datagram)),
                 None => {
@@ -2840,6 +3122,19 @@ where
         async move { NetworkService::udp_bind(self, local_port).await }
     }
 
+    fn udp_connect(
+        &self,
+        socket: Self::UdpSocket,
+        remote_address: NetworkIpAddress,
+        port: u16,
+    ) -> Result<(), UdpError> {
+        NetworkService::udp_connect(self, socket, remote_address, port)
+    }
+
+    fn udp_disconnect(&self, socket: Self::UdpSocket) -> Result<(), UdpError> {
+        NetworkService::udp_disconnect(self, socket)
+    }
+
     fn udp_send<'a>(
         &'a self,
         socket: Self::UdpSocket,
@@ -3125,6 +3420,7 @@ impl NetworkShard {
         mac: [u8; 6],
         max_frame_len: usize,
         rx_poll_budget: usize,
+        rx_checksum_offload: RxChecksumOffload,
         transaction_id: u32,
         shard_idx: usize,
         shard_count: usize,
@@ -3135,15 +3431,49 @@ impl NetworkShard {
             "shard idx {shard_idx} out of range for {shard_count} shards"
         );
         let initial_ephemeral = EPHEMERAL_PORT_START + shard_idx as u16;
+        let mut stack = Box::new(Stack::new(
+            StackConfig::new(mac, max_frame_len)
+                .with_rx_budget(rx_poll_budget)
+                .with_rx_checksum_offload(rx_checksum_offload),
+        ));
+        let mut udp_sockets = HandleSlab::new();
+        if shard_idx == shard_idx_for_port(Some(DHCP_CLIENT_PORT), shard_count) {
+            let binding = UdpSocketBinding::wildcard(DHCP_CLIENT_PORT);
+            let stack_socket = stack
+                .open_udp(binding)
+                .unwrap_or_else(|error| panic!("failed to open DHCP UDP socket: {error}"));
+            let slot = udp_sockets.insert(UdpSocketState {
+                stack_socket,
+                binding,
+            });
+            assert_eq!(
+                slot, INTERNAL_DHCP_SOCKET_INDEX,
+                "DHCP internal UDP socket slot changed"
+            );
+        }
+        if shard_idx == shard_idx_for_port(Some(INTERNAL_DNS_PORT), shard_count) {
+            let binding = UdpSocketBinding::wildcard(INTERNAL_DNS_PORT);
+            let stack_socket = stack
+                .open_udp(binding)
+                .unwrap_or_else(|error| panic!("failed to open DNS UDP socket: {error}"));
+            let slot = udp_sockets.insert(UdpSocketState {
+                stack_socket,
+                binding,
+            });
+            assert_eq!(
+                slot, INTERNAL_DNS_SOCKET_INDEX,
+                "DNS internal UDP socket slot changed"
+            );
+        }
         Self {
-            stack: Stack::new(StackConfig::new(mac, max_frame_len).with_rx_budget(rx_poll_budget)),
+            stack,
             shard_idx,
             shard_count,
             next_tcp_local_port: initial_ephemeral,
             next_udp_local_port: initial_ephemeral,
             tcp_streams: HandleSlab::new(),
             tcp_listeners: HandleSlab::new(),
-            udp_sockets: HandleSlab::new(),
+            udp_sockets,
             dhcp: DhcpClientState::Init { transaction_id },
             dns_servers: DhcpDnsServers::new(),
             next_dns_query_id: 1,
@@ -3204,7 +3534,12 @@ impl NetworkShard {
     }
 
     fn drive_dhcp(&mut self, now: StackInstant) -> Result<(), NetworkControlError> {
-        while let Some(datagram) = self.stack.take_udp(DHCP_CLIENT_PORT) {
+        let socket = self.internal_udp_socket(INTERNAL_DHCP_SOCKET_INDEX, DHCP_CLIENT_PORT);
+        while let Some(datagram) = self
+            .stack
+            .take_udp(socket)
+            .unwrap_or_else(|error| panic!("DHCP UDP socket disappeared: {error}"))
+        {
             let Some(message) =
                 DhcpPacket::parse(&datagram.bytes).and_then(DhcpPacket::server_message)
             else {
@@ -3394,7 +3729,11 @@ impl NetworkShard {
     }
 
     fn take_dns_response(&mut self, query_id: u16) -> Result<Option<Vec<Ipv4Address>>, DnsError> {
-        while let Some(datagram) = self.stack.take_udp(INTERNAL_DNS_PORT) {
+        let socket = self.internal_udp_socket(INTERNAL_DNS_SOCKET_INDEX, INTERNAL_DNS_PORT);
+        while let Some(datagram) = self.stack.take_udp(socket).map_err(|_| DnsError {
+            kind: DnsErrorKind::Unavailable,
+            detail: NetworkErrorDetail::DnsQueryStartFailed,
+        })? {
             let Some(message) = DnsResponse::parse(&datagram.bytes).and_then(DnsResponse::message)
             else {
                 continue;
@@ -3445,17 +3784,23 @@ impl NetworkShard {
                 detail: NetworkErrorDetail::NetworkServiceUnavailable,
             });
         };
-        let socket = self.stack.open_tcp_connect(
-            TcpEndpoint {
-                address: local,
-                port: local_port,
-            },
-            TcpEndpoint {
-                address: destination,
-                port,
-            },
-            1,
-        );
+        let socket = self
+            .stack
+            .open_tcp_connect(
+                TcpEndpoint {
+                    address: local,
+                    port: local_port,
+                },
+                TcpEndpoint {
+                    address: destination,
+                    port,
+                },
+                1,
+            )
+            .map_err(|_| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::TcpConnectStartFailed,
+            })?;
         Ok(self.insert_tcp_stream(socket))
     }
 
@@ -3463,6 +3808,7 @@ impl NetworkShard {
         &mut self,
         local_address: NetworkIpAddress,
         local_port: u16,
+        backlog: TcpListenBacklog,
     ) -> Result<TcpListener<TcpListenerId>, TcpError> {
         let local_port = if local_port == 0 {
             self.allocate_tcp_local_port()?
@@ -3474,12 +3820,21 @@ impl NetworkShard {
                 detail: NetworkErrorDetail::TcpListenStartFailed,
             });
         };
-        self.stack.open_tcp_listen(TcpEndpoint {
-            address: map_network_ip_address(local_address),
-            port: local_port,
-        });
+        let stack_socket = self
+            .stack
+            .open_tcp_listen(
+                TcpEndpoint {
+                    address: map_network_ip_address(local_address),
+                    port: local_port,
+                },
+                backlog,
+            )
+            .map_err(|_| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::TcpListenStartFailed,
+            })?;
         Ok(TcpListener {
-            listener: self.insert_tcp_listener(local_port),
+            listener: self.insert_tcp_listener(stack_socket, local_port),
             local_port,
         })
     }
@@ -3488,8 +3843,15 @@ impl NetworkShard {
         &mut self,
         listener: TcpListenerId,
     ) -> Result<Option<TcpAccepted<TcpStreamId>>, TcpError> {
-        let local_port = self.tcp_listener(listener)?.local_port;
-        let Some(accepted) = self.stack.take_tcp_accept(local_port) else {
+        let stack_socket = self.tcp_listener(listener)?.stack_socket;
+        let Some(accepted) = self
+            .stack
+            .take_tcp_accept(stack_socket)
+            .map_err(|_| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::TcpListenerClosedUnexpectedly,
+            })?
+        else {
             return Ok(None);
         };
         let stream = self.insert_tcp_stream(accepted.socket);
@@ -3508,10 +3870,7 @@ impl NetworkShard {
         })? {
             TcpConnectState::Connected => Ok(TcpConnectProgress::Connected),
             TcpConnectState::Pending => Ok(TcpConnectProgress::Pending),
-            TcpConnectState::Closed => Err(TcpError {
-                kind: TcpErrorKind::Unavailable,
-                detail: NetworkErrorDetail::TcpClosedDuringConnect,
-            }),
+            TcpConnectState::Closed(error) => Err(map_tcp_connect_terminal_error(error)),
         }
     }
 
@@ -3575,7 +3934,10 @@ impl NetworkShard {
     fn start_udp_bind(&mut self, local_port: u16) -> Result<UdpBinding<UdpSocketId>, UdpError> {
         let local_port = if local_port == 0 {
             self.allocate_udp_local_port()?
-        } else if self.is_udp_local_port_free(local_port) {
+        } else if self
+            .stack
+            .udp_binding_free(UdpSocketBinding::wildcard(local_port))
+        {
             local_port
         } else {
             return Err(UdpError {
@@ -3583,10 +3945,60 @@ impl NetworkShard {
                 detail: NetworkErrorDetail::UdpPortInUse,
             });
         };
+        let binding = UdpSocketBinding::wildcard(local_port);
+        let stack_socket = self.stack.open_udp(binding).map_err(map_udp_bind_error)?;
         Ok(UdpBinding {
-            socket: self.insert_udp_socket(local_port),
+            socket: self.insert_udp_socket(stack_socket, binding),
             local_port,
         })
+    }
+
+    fn connect_udp_socket(
+        &mut self,
+        socket: UdpSocketId,
+        destination: IpAddress,
+        port: u16,
+    ) -> Result<(), UdpError> {
+        let slot = self.decode_handle_slot(socket.0.get());
+        let state = *self.udp_socket(socket)?;
+        let local = self
+            .udp_local_endpoint(state.binding.local_port, destination)
+            .map_err(map_udp_connect_error)?;
+        let remote = UdpEndpoint {
+            address: destination,
+            port,
+        };
+        let binding = UdpSocketBinding::connected(local, remote);
+        self.stack
+            .rebind_udp(state.stack_socket, binding)
+            .map_err(map_udp_connect_error)?;
+        let state = self
+            .udp_sockets
+            .get_mut(slot)
+            .unwrap_or_else(|| panic!("UDP socket disappeared during connect"));
+        state.binding = binding;
+        Ok(())
+    }
+
+    fn disconnect_udp_socket(&mut self, socket: UdpSocketId) -> Result<(), UdpError> {
+        let slot = self.decode_handle_slot(socket.0.get());
+        let state = *self.udp_socket(socket)?;
+        if state.binding.remote.is_none() {
+            return Err(UdpError {
+                kind: UdpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::UdpDisconnectFailed,
+            });
+        }
+        let binding = UdpSocketBinding::wildcard(state.binding.local_port);
+        self.stack
+            .rebind_udp(state.stack_socket, binding)
+            .map_err(map_udp_disconnect_error)?;
+        let state = self
+            .udp_sockets
+            .get_mut(slot)
+            .unwrap_or_else(|| panic!("UDP socket disappeared during disconnect"));
+        state.binding = binding;
+        Ok(())
     }
 
     fn try_send_udp(
@@ -3597,28 +4009,30 @@ impl NetworkShard {
         bytes: &[u8],
         now: StackInstant,
     ) -> Result<usize, UdpError> {
-        let local_port = self.udp_socket(socket)?.local_port;
-        match destination {
-            IpAddress::Ipv4(destination) => self.stack.send_udp_ipv4(
-                local_port,
+        let stack_socket = self.udp_socket(socket)?.stack_socket;
+        if let Some(error) = self
+            .stack
+            .take_udp_error(stack_socket)
+            .map_err(|_| UdpError {
+                kind: UdpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::UnknownUdpSocket,
+            })?
+        {
+            return Err(map_udp_socket_error(error));
+        }
+        self.stack
+            .send_udp(
+                stack_socket,
                 destination,
                 port,
                 bytes,
                 socket.0.get() as u16,
                 now,
-            ),
-            IpAddress::Ipv6(destination) => {
-                self.stack
-                    .send_udp_ipv6(local_port, destination, port, bytes, now)
-            }
-        }
-        .map_err(|error| {
-            tracing::debug!(?error, "failed to queue UDP datagram");
-            UdpError {
-                kind: UdpErrorKind::Unavailable,
-                detail: NetworkErrorDetail::UdpQueueFailed,
-            }
-        })
+            )
+            .map_err(|error| {
+                tracing::debug!(?error, "failed to queue UDP datagram");
+                map_udp_send_error(error)
+            })
     }
 
     fn poll_udp_receive(
@@ -3626,8 +4040,22 @@ impl NetworkShard {
         socket: UdpSocketId,
         max_bytes: usize,
     ) -> Result<Option<UdpDatagram>, UdpError> {
-        let local_port = self.udp_socket(socket)?.local_port;
-        let Some(datagram) = self.stack.take_udp(local_port) else {
+        let stack_socket = self.udp_socket(socket)?.stack_socket;
+        if let Some(error) = self
+            .stack
+            .take_udp_error(stack_socket)
+            .map_err(|_| UdpError {
+                kind: UdpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::UnknownUdpSocket,
+            })?
+        {
+            return Err(map_udp_socket_error(error));
+        }
+        let Some(datagram) = self.stack.take_udp(stack_socket).map_err(|_| UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UdpReceiveFailed,
+        })?
+        else {
             return Ok(None);
         };
         Ok(Some(UdpDatagram {
@@ -3648,7 +4076,11 @@ impl NetworkShard {
 
     fn remove_udp_socket(&mut self, socket: UdpSocketId) {
         let slot = self.decode_handle_slot(socket.0.get());
-        let _ = self.udp_sockets.remove(slot);
+        if let Some(socket) = self.udp_sockets.remove(slot) {
+            self.stack
+                .remove_udp_socket(socket.stack_socket)
+                .unwrap_or_else(|_| panic!("UDP handle referenced an unknown stack socket"));
+        }
     }
 
     fn insert_tcp_stream(&mut self, socket: helios_netstack::SocketId) -> TcpStreamId {
@@ -3659,16 +4091,30 @@ impl NetworkShard {
         )
     }
 
-    fn insert_tcp_listener(&mut self, local_port: u16) -> TcpListenerId {
-        let slot = self.tcp_listeners.insert(TcpListenerState { local_port });
+    fn insert_tcp_listener(
+        &mut self,
+        stack_socket: helios_netstack::SocketId,
+        local_port: u16,
+    ) -> TcpListenerId {
+        let slot = self.tcp_listeners.insert(TcpListenerState {
+            stack_socket,
+            local_port,
+        });
         TcpListenerId(
             NonZeroU32::new(self.encode_handle_id(slot))
                 .unwrap_or_else(|| panic!("tcp listener ids must never be zero")),
         )
     }
 
-    fn insert_udp_socket(&mut self, local_port: u16) -> UdpSocketId {
-        let slot = self.udp_sockets.insert(UdpSocketState { local_port });
+    fn insert_udp_socket(
+        &mut self,
+        stack_socket: helios_netstack::UdpSocketId,
+        binding: UdpSocketBinding,
+    ) -> UdpSocketId {
+        let slot = self.udp_sockets.insert(UdpSocketState {
+            stack_socket,
+            binding,
+        });
         UdpSocketId(
             NonZeroU32::new(self.encode_handle_id(slot))
                 .unwrap_or_else(|| panic!("udp socket ids must never be zero")),
@@ -3697,6 +4143,18 @@ impl NetworkShard {
             kind: UdpErrorKind::Unavailable,
             detail: NetworkErrorDetail::UnknownUdpSocket,
         })
+    }
+
+    fn internal_udp_socket(&self, slot: usize, expected_port: u16) -> helios_netstack::UdpSocketId {
+        let state = self
+            .udp_sockets
+            .get(slot)
+            .unwrap_or_else(|| panic!("internal UDP socket slot {slot} is not initialized"));
+        assert_eq!(
+            state.binding.local_port, expected_port,
+            "internal UDP socket slot {slot} has unexpected local port"
+        );
+        state.stack_socket
     }
 
     fn allocate_tcp_local_port(&mut self) -> Result<u16, TcpError> {
@@ -3757,9 +4215,40 @@ impl NetworkShard {
     }
 
     fn is_udp_local_port_free(&self, port: u16) -> bool {
-        self.udp_sockets
-            .iter()
-            .all(|state| state.local_port != port)
+        self.stack
+            .udp_binding_free(UdpSocketBinding::wildcard(port))
+    }
+
+    fn udp_local_endpoint(
+        &self,
+        local_port: u16,
+        destination: IpAddress,
+    ) -> Result<UdpEndpoint, StackError> {
+        let address = match destination {
+            IpAddress::Ipv4(destination) => self
+                .stack
+                .source_ipv4_address_for(destination)
+                .map(IpAddress::Ipv4)
+                .or_else(|| {
+                    self.stack
+                        .primary_ipv4_address()
+                        .map(|cidr| IpAddress::Ipv4(cidr.address()))
+                }),
+            IpAddress::Ipv6(destination) => self
+                .stack
+                .source_ipv6_address_for(destination)
+                .map(IpAddress::Ipv6)
+                .or_else(|| {
+                    self.stack
+                        .primary_ipv6_address()
+                        .map(|cidr| IpAddress::Ipv6(cidr.address()))
+                }),
+        }
+        .ok_or(StackError::Unroutable)?;
+        Ok(UdpEndpoint {
+            address,
+            port: local_port,
+        })
     }
 
     fn join_multicast_v4(
@@ -3767,15 +4256,11 @@ impl NetworkShard {
         group: KernelIpv4Address,
         interface: KernelIpv4Address,
     ) -> Result<(), UdpError> {
-        self.require_multicast_interface(interface)?;
         let group = map_kernel_ipv4_address(group);
-        if !group.is_multicast() {
-            return Err(UdpError {
-                kind: UdpErrorKind::Unavailable,
-                detail: NetworkErrorDetail::UdpMulticastJoinFailed,
-            });
-        }
-        Ok(())
+        let interface = self.require_multicast_interface(interface)?;
+        self.stack
+            .join_ipv4_multicast(group, interface)
+            .map_err(multicast_join_error)
     }
 
     fn leave_multicast_v4(
@@ -3783,34 +4268,34 @@ impl NetworkShard {
         group: KernelIpv4Address,
         interface: KernelIpv4Address,
     ) -> Result<(), UdpError> {
-        self.require_multicast_interface(interface)?;
         let group = map_kernel_ipv4_address(group);
-        if !group.is_multicast() {
-            return Err(UdpError {
-                kind: UdpErrorKind::Unavailable,
-                detail: NetworkErrorDetail::UdpMulticastLeaveFailed,
-            });
-        }
-        Ok(())
+        let interface = self.require_multicast_interface(interface)?;
+        self.stack
+            .leave_ipv4_multicast(group, interface)
+            .map_err(multicast_leave_error)
     }
 
-    fn require_multicast_interface(&self, interface: KernelIpv4Address) -> Result<(), UdpError> {
-        if interface.octets() == [0, 0, 0, 0] {
-            return Ok(());
-        }
+    fn require_multicast_interface(
+        &self,
+        interface: KernelIpv4Address,
+    ) -> Result<Ipv4Address, UdpError> {
         let Some(cidr) = self.stack.primary_ipv4_address() else {
             return Err(UdpError {
                 kind: UdpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::UdpMulticastInterfaceUnavailable,
             });
         };
-        if cidr.address() != map_kernel_ipv4_address(interface) {
+        if interface.octets() == [0, 0, 0, 0] {
+            return Ok(cidr.address());
+        }
+        let interface = map_kernel_ipv4_address(interface);
+        if cidr.address() != interface {
             return Err(UdpError {
                 kind: UdpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::UdpMulticastInterfaceUnavailable,
             });
         }
-        Ok(())
+        Ok(interface)
     }
 
     fn add_ipv4_address(&mut self, cidr: KernelIpv4Cidr) -> Result<(), NetworkControlError> {
@@ -4024,15 +4509,16 @@ fn usize_to_u64(value: usize, label: &'static str) -> u64 {
 #[cfg(test)]
 mod tests {
     use helios_netstack::{
-        ETHERNET_FRAME_BYTES, EthernetFrame, EthernetProtocol, IpAddress, IpProtocol, Ipv6Address,
-        Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborEntry, NeighborState, StackInstant,
-        TcpFlags, TcpHeader, TcpPacket, UdpPacket, UdpPayload,
+        ETHERNET_FRAME_BYTES, EthernetFrame, EthernetProtocol, Icmpv6Packet, IpAddress, IpProtocol,
+        Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES,
+        NeighborEntry, NeighborState, RxChecksumOffload, StackInstant, TcpFlags, TcpHeader,
+        TcpListenBacklog, TcpPacket, UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding,
     };
 
     use super::{
         HandleSlab, NETWORK_BUSY_POLL_ROUNDS, NETWORK_TX_BATCH_FRAMES, NetworkIpAddress,
         NetworkPollBudget, NetworkPollProgress, NetworkPollState, NetworkPumpAction,
-        NetworkPumpCadence, NetworkShard, limit_udp_datagram_bytes, parse_ipv6,
+        NetworkPumpCadence, NetworkShard, limit_udp_datagram_bytes, map_ipv4_address, parse_ipv6,
     };
 
     fn ipv6_tcp_frame(
@@ -4106,6 +4592,77 @@ mod tests {
         (frame, offset + udp_len)
     }
 
+    fn ipv6_packet_too_big_frame(
+        router: Ipv6Address,
+        local: Ipv6Address,
+        quoted_frame: &[u8],
+        mtu: u32,
+    ) -> ([u8; ETHERNET_FRAME_BYTES], usize) {
+        let ethernet =
+            EthernetFrame::parse(quoted_frame).expect("quoted Ethernet frame should parse");
+        let quoted = ethernet.payload;
+        let mut frame = [0; ETHERNET_FRAME_BYTES];
+        let icmp_len = Icmpv6Packet::PACKET_TOO_BIG_HEADER_LEN + quoted.len();
+        let mut offset = EthernetFrame::encode_header(
+            &mut frame,
+            [0x02, 0, 0, 0, 0, 1],
+            [0x02, 0, 0, 0, 0, 2],
+            EthernetProtocol::Ipv6,
+        )
+        .expect("test Ethernet header should fit");
+        offset += Ipv6Packet::encode_header(
+            &mut frame[offset..],
+            router,
+            local,
+            IpProtocol::Icmpv6,
+            icmp_len,
+            64,
+        )
+        .expect("test IPv6 ICMPv6 header should fit");
+        offset +=
+            Icmpv6Packet::encode_packet_too_big(&mut frame[offset..], router, local, mtu, quoted)
+                .expect("test ICMPv6 Packet Too Big should fit");
+        (frame, offset)
+    }
+
+    fn ipv4_udp_frame(
+        source: Ipv4Address,
+        source_port: u16,
+        destination: Ipv4Address,
+        destination_port: u16,
+        payload: &[u8],
+    ) -> ([u8; ETHERNET_FRAME_BYTES], usize) {
+        let mut frame = [0; ETHERNET_FRAME_BYTES];
+        let mut offset = EthernetFrame::encode_header(
+            &mut frame,
+            [0x02, 0, 0, 0, 0, 1],
+            [0x02, 0, 0, 0, 0, 2],
+            EthernetProtocol::Ipv4,
+        )
+        .expect("test Ethernet header should fit");
+        let udp_start = offset + Ipv4Packet::MIN_HEADER_LEN;
+        let udp_len = UdpPacket::encode(
+            &mut frame[udp_start..],
+            IpAddress::Ipv4(source),
+            IpAddress::Ipv4(destination),
+            source_port,
+            destination_port,
+            payload,
+        )
+        .expect("test UDP datagram should fit");
+        offset += Ipv4Packet::encode_header(
+            &mut frame[offset..],
+            source,
+            destination,
+            IpProtocol::Udp,
+            udp_len,
+            1,
+            64,
+        )
+        .expect("test IPv4 header should fit");
+        (frame, offset + udp_len)
+    }
+
     #[test]
     fn handle_slab_reuses_removed_slot() {
         let mut slab = HandleSlab::<u32, 3>::new();
@@ -4135,6 +4692,18 @@ mod tests {
         assert_eq!(limited.as_ref(), b"abc");
     }
 
+    fn test_network_shard() -> NetworkShard {
+        NetworkShard::new(
+            [0x02, 0, 0, 0, 0, 1],
+            ETHERNET_FRAME_BYTES,
+            8,
+            RxChecksumOffload::none(),
+            1,
+            0,
+            1,
+        )
+    }
+
     #[test]
     fn parse_ipv6_accepts_compressed_numeric_hosts() {
         assert_eq!(
@@ -4150,7 +4719,7 @@ mod tests {
     fn tcp_connect_to_ipv6_destination_uses_ipv6_source_address() {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
-        let mut state = NetworkShard::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 1, 0, 1);
+        let mut state = test_network_shard();
         state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(remote),
@@ -4184,7 +4753,7 @@ mod tests {
     fn udp_send_to_ipv6_destination_uses_ipv6_source_address() {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
-        let mut state = NetworkShard::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 1, 0, 1);
+        let mut state = test_network_shard();
         state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(remote),
@@ -4224,10 +4793,41 @@ mod tests {
     }
 
     #[test]
+    fn oversized_udp_send_reports_datagram_too_large() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let remote = Ipv4Address::new([192, 0, 2, 20]);
+        let mut state = test_network_shard();
+        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        state.stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(remote),
+            mac: [0x02, 0, 0, 0, 0, 2],
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        let socket = state
+            .start_udp_bind(4040)
+            .expect("UDP test socket should bind")
+            .socket;
+        let payload = [0u8; ETHERNET_FRAME_BYTES];
+
+        let error = state
+            .try_send_udp(
+                socket,
+                IpAddress::Ipv4(remote),
+                53,
+                &payload,
+                StackInstant::from_nanos(1),
+            )
+            .expect_err("oversized UDP datagram should fail");
+
+        assert_eq!(error.detail, crate::NetworkErrorDetail::UdpDatagramTooLarge);
+    }
+
+    #[test]
     fn udp_receive_from_ipv6_source_preserves_typed_peer_address() {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
-        let mut state = NetworkShard::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 1, 0, 1);
+        let mut state = test_network_shard();
         state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
         let socket = state
             .start_udp_bind(4040)
@@ -4250,10 +4850,358 @@ mod tests {
     }
 
     #[test]
+    fn connected_udp_receive_filters_at_stack_binding() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let expected_peer = Ipv4Address::new([192, 0, 2, 20]);
+        let other_peer = Ipv4Address::new([192, 0, 2, 30]);
+        let mut state = test_network_shard();
+        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        let socket = state
+            .start_udp_bind(4040)
+            .expect("UDP test socket should bind")
+            .socket;
+        state
+            .connect_udp_socket(socket, IpAddress::Ipv4(expected_peer), 53)
+            .expect("UDP socket should connect");
+
+        let (other_frame, other_len) = ipv4_udp_frame(other_peer, 53, local, 4040, b"other");
+        state
+            .stack
+            .receive_frame(&other_frame[..other_len], StackInstant::from_nanos(1))
+            .expect("unmatched UDP frame should be handled");
+        let (expected_frame, expected_len) =
+            ipv4_udp_frame(expected_peer, 53, local, 4040, b"expected");
+        state
+            .stack
+            .receive_frame(&expected_frame[..expected_len], StackInstant::from_nanos(2))
+            .expect("matched UDP frame should be handled");
+
+        let datagram = state
+            .poll_udp_receive(socket, usize::MAX)
+            .expect("UDP receive should poll")
+            .expect("matched UDP datagram should be queued");
+        assert_eq!(
+            datagram.address,
+            NetworkIpAddress::Ipv4(map_ipv4_address(expected_peer))
+        );
+        assert_eq!(datagram.port, 53);
+        assert_eq!(datagram.bytes.as_ref(), b"expected");
+        assert!(
+            state
+                .poll_udp_receive(socket, usize::MAX)
+                .expect("UDP receive should poll")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn udp_reconnect_updates_stack_binding() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let first_peer = Ipv4Address::new([192, 0, 2, 20]);
+        let second_peer = Ipv4Address::new([192, 0, 2, 30]);
+        let mut state = test_network_shard();
+        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        let socket = state
+            .start_udp_bind(4040)
+            .expect("UDP test socket should bind")
+            .socket;
+        state
+            .connect_udp_socket(socket, IpAddress::Ipv4(first_peer), 53)
+            .expect("UDP socket should connect");
+        state
+            .connect_udp_socket(socket, IpAddress::Ipv4(second_peer), 53)
+            .expect("UDP socket should reconnect");
+
+        let (first_frame, first_len) = ipv4_udp_frame(first_peer, 53, local, 4040, b"first");
+        state
+            .stack
+            .receive_frame(&first_frame[..first_len], StackInstant::from_nanos(1))
+            .expect("old peer UDP frame should be handled");
+        let (second_frame, second_len) = ipv4_udp_frame(second_peer, 53, local, 4040, b"second");
+        state
+            .stack
+            .receive_frame(&second_frame[..second_len], StackInstant::from_nanos(2))
+            .expect("new peer UDP frame should be handled");
+
+        let datagram = state
+            .poll_udp_receive(socket, usize::MAX)
+            .expect("UDP receive should poll")
+            .expect("new peer UDP datagram should be queued");
+        assert_eq!(
+            datagram.address,
+            NetworkIpAddress::Ipv4(map_ipv4_address(second_peer))
+        );
+        assert_eq!(datagram.bytes.as_ref(), b"second");
+    }
+
+    #[test]
+    fn udp_disconnect_restores_wildcard_when_unambiguous() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut state = test_network_shard();
+        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        let socket = state
+            .start_udp_bind(4040)
+            .expect("UDP test socket should bind")
+            .socket;
+        state
+            .connect_udp_socket(socket, IpAddress::Ipv4(peer), 53)
+            .expect("UDP socket should connect");
+        state
+            .disconnect_udp_socket(socket)
+            .expect("UDP socket should disconnect");
+
+        let (frame, len) = ipv4_udp_frame(peer, 53, local, 4040, b"wildcard");
+        state
+            .stack
+            .receive_frame(&frame[..len], StackInstant::from_nanos(1))
+            .expect("UDP frame should be handled after disconnect");
+        let datagram = state
+            .poll_udp_receive(socket, usize::MAX)
+            .expect("UDP receive should poll")
+            .expect("wildcard UDP datagram should be queued");
+        assert_eq!(datagram.bytes.as_ref(), b"wildcard");
+    }
+
+    #[test]
+    fn udp_disconnect_rejects_ambiguous_wildcard_binding() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let first_peer = Ipv4Address::new([192, 0, 2, 20]);
+        let second_peer = Ipv4Address::new([192, 0, 2, 30]);
+        let mut state = test_network_shard();
+        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        let first = state
+            .start_udp_bind(4040)
+            .expect("first UDP test socket should bind")
+            .socket;
+        state
+            .connect_udp_socket(first, IpAddress::Ipv4(first_peer), 53)
+            .expect("first UDP socket should connect");
+        let second_stack_socket = state
+            .stack
+            .open_udp(UdpSocketBinding::connected(
+                UdpEndpoint {
+                    address: IpAddress::Ipv4(local),
+                    port: 4040,
+                },
+                UdpEndpoint {
+                    address: IpAddress::Ipv4(second_peer),
+                    port: 53,
+                },
+            ))
+            .expect("second connected stack UDP socket should bind");
+        let second = state.insert_udp_socket(
+            second_stack_socket,
+            UdpSocketBinding::connected(
+                UdpEndpoint {
+                    address: IpAddress::Ipv4(local),
+                    port: 4040,
+                },
+                UdpEndpoint {
+                    address: IpAddress::Ipv4(second_peer),
+                    port: 53,
+                },
+            ),
+        );
+
+        let error = state
+            .disconnect_udp_socket(first)
+            .expect_err("disconnect should reject ambiguous wildcard binding");
+        assert_eq!(error.kind, crate::UdpErrorKind::Unavailable);
+        assert_eq!(error.detail, crate::NetworkErrorDetail::UdpPortInUse);
+        state.remove_udp_socket(second);
+    }
+
+    #[test]
+    fn explicit_ephemeral_udp_binding_ids_route_to_port_owner_shard() {
+        let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let peer = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        let router = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+        let state = super::NetworkShardSet::new(2, |index| {
+            NetworkShard::new(
+                [0x02, 0, 0, 0, 0, 1],
+                ETHERNET_FRAME_BYTES,
+                8,
+                RxChecksumOffload::none(),
+                1 + index as u32,
+                index,
+                2,
+            )
+        });
+        let binding = state
+            .with_local_port(49_153, |shard| shard.start_udp_bind(49_153))
+            .expect("explicit ephemeral UDP bind should allocate on owner shard");
+
+        state.with_handle(binding.socket, |shard| {
+            assert_eq!(shard.shard_idx, 1);
+            assert_eq!(
+                shard
+                    .udp_socket(binding.socket)
+                    .expect("bound UDP socket should be on handle shard")
+                    .binding
+                    .local_port,
+                49_153
+            );
+        });
+
+        let payload = [0u8; 1233];
+        let (packet_too_big, packet_too_big_len) = state.with_handle(binding.socket, |shard| {
+            shard.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+            shard.stack.learn_neighbor(NeighborEntry {
+                ip: IpAddress::Ipv6(peer),
+                mac: [0x02, 0, 0, 0, 0, 2],
+                state: NeighborState::Reachable,
+                updated_at: StackInstant::from_nanos(0),
+            });
+            let written = shard
+                .try_send_udp(
+                    binding.socket,
+                    IpAddress::Ipv6(peer),
+                    53,
+                    &payload,
+                    StackInstant::from_nanos(1),
+                )
+                .expect("owner shard should queue initial IPv6 UDP datagram");
+            assert_eq!(written, payload.len());
+            let quoted = shard
+                .stack
+                .take_outbound()
+                .expect("owner shard should queue initial IPv6 UDP datagram");
+            ipv6_packet_too_big_frame(router, local, quoted.as_slice(), 1280)
+        });
+
+        let port = super::peek_local_port(&packet_too_big[..packet_too_big_len]);
+        assert_eq!(port, Some(49_153));
+        let shard_idx = super::shard_idx_for_port(port, state.shard_count());
+        assert_eq!(shard_idx, 1);
+        state
+            .shard_at(shard_idx)
+            .lock()
+            .stack
+            .receive_frame(
+                &packet_too_big[..packet_too_big_len],
+                StackInstant::from_nanos(2),
+            )
+            .expect("ICMPv6 Packet Too Big should update owner shard PMTU");
+
+        state.with_handle(binding.socket, |shard| {
+            let error = shard
+                .try_send_udp(
+                    binding.socket,
+                    IpAddress::Ipv6(peer),
+                    53,
+                    &payload,
+                    StackInstant::from_nanos(3),
+                )
+                .expect_err("owner shard PMTU should cap later UDP sends");
+            assert_eq!(error.detail, crate::NetworkErrorDetail::UdpDatagramTooLarge);
+        });
+    }
+
+    #[test]
+    fn udp_multicast_join_and_leave_update_stack_delivery() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let group = Ipv4Address::new([224, 0, 0, 251]);
+        let mut state = test_network_shard();
+        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        let socket = state
+            .start_udp_bind(4040)
+            .expect("UDP test socket should bind")
+            .socket;
+        let (first, first_len) = ipv4_udp_frame(peer, 5353, group, 4040, b"first");
+        let (second, second_len) = ipv4_udp_frame(peer, 5353, group, 4040, b"second");
+        let (third, third_len) = ipv4_udp_frame(peer, 5353, group, 4040, b"third");
+
+        state
+            .stack
+            .receive_frame(&first[..first_len], StackInstant::from_nanos(1))
+            .expect("unjoined multicast frame should parse");
+        assert!(
+            state
+                .poll_udp_receive(socket, usize::MAX)
+                .expect("UDP receive should poll")
+                .is_none()
+        );
+
+        state
+            .join_multicast_v4(
+                map_ipv4_address(group),
+                crate::Ipv4Address::new([0, 0, 0, 0]),
+            )
+            .expect("unspecified multicast interface should resolve to primary IPv4");
+        state
+            .stack
+            .receive_frame(&second[..second_len], StackInstant::from_nanos(2))
+            .expect("joined multicast frame should parse");
+        let datagram = state
+            .poll_udp_receive(socket, usize::MAX)
+            .expect("UDP receive should poll")
+            .expect("joined multicast frame should be queued");
+        assert_eq!(
+            datagram.address,
+            NetworkIpAddress::Ipv4(map_ipv4_address(peer))
+        );
+        assert_eq!(datagram.port, 5353);
+        assert_eq!(datagram.bytes.as_ref(), b"second");
+
+        state
+            .leave_multicast_v4(
+                map_ipv4_address(group),
+                crate::Ipv4Address::new([0, 0, 0, 0]),
+            )
+            .expect("unspecified multicast interface should leave primary IPv4");
+        state
+            .stack
+            .receive_frame(&third[..third_len], StackInstant::from_nanos(3))
+            .expect("left multicast frame should parse");
+        assert!(
+            state
+                .poll_udp_receive(socket, usize::MAX)
+                .expect("UDP receive should poll")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn udp_multicast_join_maps_invalid_interface_and_group_errors() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let other = Ipv4Address::new([192, 0, 2, 11]);
+        let group = Ipv4Address::new([224, 0, 0, 251]);
+        let unicast = Ipv4Address::new([192, 0, 2, 20]);
+        let mut state = test_network_shard();
+        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+
+        let error = state
+            .join_multicast_v4(map_ipv4_address(group), map_ipv4_address(other))
+            .expect_err("unowned multicast interface should fail");
+        assert_eq!(
+            error.detail,
+            crate::NetworkErrorDetail::UdpMulticastInterfaceUnavailable
+        );
+
+        let error = state
+            .join_multicast_v4(map_ipv4_address(unicast), map_ipv4_address(local))
+            .expect_err("unicast multicast group should fail");
+        assert_eq!(
+            error.detail,
+            crate::NetworkErrorDetail::UdpMulticastJoinFailed
+        );
+
+        let error = state
+            .leave_multicast_v4(map_ipv4_address(group), map_ipv4_address(local))
+            .expect_err("unjoined multicast group leave should fail");
+        assert_eq!(
+            error.detail,
+            crate::NetworkErrorDetail::UdpMulticastLeaveFailed
+        );
+    }
+
+    #[test]
     fn tcp_listen_on_ipv6_address_accepts_ipv6_peer() {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
-        let mut state = NetworkShard::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES, 8, 1, 0, 1);
+        let mut state = test_network_shard();
         state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
         state.stack.learn_neighbor(NeighborEntry {
             ip: IpAddress::Ipv6(remote),
@@ -4262,7 +5210,11 @@ mod tests {
             updated_at: StackInstant::from_nanos(0),
         });
         let listener = state
-            .start_tcp_listen(NetworkIpAddress::Ipv6(local), 8080)
+            .start_tcp_listen(
+                NetworkIpAddress::Ipv6(local),
+                8080,
+                TcpListenBacklog::new(1),
+            )
             .expect("IPv6 TCP listen should allocate a listener");
 
         let (syn, syn_len) = ipv6_tcp_frame(
@@ -4322,7 +5274,7 @@ mod tests {
 
     #[test]
     fn network_poll_state_adapts_tx_submit_budget() {
-        let mut poll = NetworkPollState::new(8, 8, 8);
+        let poll = NetworkPollState::new(8, 8, 8);
         assert_eq!(poll.budget().tx_frames, 8);
 
         poll.complete(NetworkPollProgress {

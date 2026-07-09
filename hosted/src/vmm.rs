@@ -108,6 +108,13 @@ impl AddressSpace for HostedAddressSpace {
         let prot = page_flags_to_prot(flags);
         let mut reservations = self.reservations.lock().unwrap();
         let reservation = find_reservation_mut(&mut reservations, virt)?;
+        if reservation
+            .committed
+            .iter()
+            .any(|region| ranges_overlap(region.range, virt))
+        {
+            return Err(AddressSpaceError::Overlap);
+        }
         let mprotect_result =
             unsafe { libc::mprotect(virt.start.raw() as *mut _, virt.byte_len, prot) };
         if mprotect_result != 0 {
@@ -123,11 +130,7 @@ impl AddressSpace for HostedAddressSpace {
         validate_range(virt)?;
         let mut reservations = self.reservations.lock().unwrap();
         let reservation = find_reservation_mut(&mut reservations, virt)?;
-        if !reservation
-            .committed
-            .iter()
-            .any(|region| ranges_overlap(region.range, virt))
-        {
+        if !committed_regions_cover(&reservation.committed, virt) {
             return Err(AddressSpaceError::NotCommitted);
         }
         unsafe {
@@ -143,9 +146,7 @@ impl AddressSpace for HostedAddressSpace {
                 return Err(AddressSpaceError::InvalidFlags);
             }
         }
-        reservation
-            .committed
-            .retain(|region| !ranges_overlap(region.range, virt));
+        remove_committed_range(&mut reservation.committed, virt);
         Ok(())
     }
 
@@ -154,9 +155,9 @@ impl AddressSpace for HostedAddressSpace {
         let prot = page_flags_to_prot(flags);
         let mut reservations = self.reservations.lock().unwrap();
         let reservation = find_reservation_mut(&mut reservations, virt)?;
-        // The host kernel rejects mprotect on uncommitted pages with
-        // ENOMEM; treat that as the conformance-required
-        // `NotCommitted` rather than the generic `InvalidFlags`.
+        if !committed_regions_cover(&reservation.committed, virt) {
+            return Err(AddressSpaceError::NotCommitted);
+        }
         let mprotect_result =
             unsafe { libc::mprotect(virt.start.raw() as *mut _, virt.byte_len, prot) };
         if mprotect_result != 0 {
@@ -167,11 +168,10 @@ impl AddressSpace for HostedAddressSpace {
                 AddressSpaceError::InvalidFlags
             });
         }
-        for region in reservation.committed.iter_mut() {
-            if region.range == virt {
-                region.flags = flags;
-            }
-        }
+        remove_committed_range(&mut reservation.committed, virt);
+        reservation
+            .committed
+            .push(CommittedRegion { range: virt, flags });
         Ok(())
     }
 
@@ -179,6 +179,9 @@ impl AddressSpace for HostedAddressSpace {
         validate_range(virt)?;
         let mut reservations = self.reservations.lock().unwrap();
         let reservation = find_reservation_mut(&mut reservations, virt)?;
+        if !committed_regions_cover(&reservation.committed, virt) {
+            return Err(AddressSpaceError::NotCommitted);
+        }
         // Snapshot every committed sub-region that lies inside
         // `virt` so we can restore it after the in-place "reseat".
         // Hosted has no concept of "physical frame allocation" —
@@ -193,14 +196,16 @@ impl AddressSpace for HostedAddressSpace {
         let snapshots: Vec<_> = reservation
             .committed
             .iter()
-            .filter(|region| ranges_overlap(region.range, virt))
-            .copied()
+            .filter_map(|region| {
+                range_intersection(region.range, virt).map(|range| CommittedRegion {
+                    range,
+                    flags: region.flags,
+                })
+            })
             .collect();
-        if snapshots.is_empty() {
-            return Err(AddressSpaceError::NotCommitted);
-        }
         for region in &snapshots {
-            // Read the live bytes through the existing mapping.
+            let restore_prot = page_flags_to_prot(region.flags);
+            set_protection(region.range, libc::PROT_READ | libc::PROT_WRITE)?;
             let live: Vec<u8> = unsafe {
                 core::slice::from_raw_parts(
                     region.range.start.raw() as *const u8,
@@ -208,11 +213,9 @@ impl AddressSpace for HostedAddressSpace {
                 )
                 .to_vec()
             };
-            // Reset the host kernel's view: drop the pages, then
-            // mprotect the same range back to the same flags. The
-            // host returns fresh zeroed pages on the next access;
-            // we restore the captured bytes immediately so callers
-            // see the data unchanged.
+            // Reset the host kernel's view while temporarily keeping
+            // the page writable so read-only/executable mappings can
+            // have their bytes restored before their original flags.
             unsafe {
                 #[cfg(target_os = "linux")]
                 libc::madvise(
@@ -226,21 +229,13 @@ impl AddressSpace for HostedAddressSpace {
                     region.range.byte_len,
                     libc::MADV_FREE,
                 );
-                let prot = page_flags_to_prot(region.flags);
-                if libc::mprotect(
-                    region.range.start.raw() as *mut _,
-                    region.range.byte_len,
-                    prot,
-                ) != 0
-                {
-                    return Err(AddressSpaceError::InvalidFlags);
-                }
                 core::ptr::copy_nonoverlapping(
                     live.as_ptr(),
                     region.range.start.raw() as *mut u8,
                     region.range.byte_len,
                 );
             }
+            set_protection(region.range, restore_prot)?;
         }
         Ok(())
     }
@@ -291,6 +286,64 @@ fn range_contains(outer: VirtRange, inner: VirtRange) -> bool {
 
 fn ranges_overlap(a: VirtRange, b: VirtRange) -> bool {
     a.start.raw() < b.end().raw() && b.start.raw() < a.end().raw()
+}
+
+fn range_intersection(a: VirtRange, b: VirtRange) -> Option<VirtRange> {
+    let start = a.start.raw().max(b.start.raw());
+    let end = a.end().raw().min(b.end().raw());
+    (start < end).then(|| VirtRange::new(VirtAddr::new(start), end - start))
+}
+
+fn committed_regions_cover(regions: &[CommittedRegion], range: VirtRange) -> bool {
+    let mut cursor = range.start.raw();
+    let end = range.end().raw();
+    while cursor < end {
+        let Some(region) = regions
+            .iter()
+            .find(|region| region.range.contains(VirtAddr::new(cursor)))
+        else {
+            return false;
+        };
+        cursor = region.range.end().raw().min(end);
+    }
+    true
+}
+
+fn remove_committed_range(regions: &mut Vec<CommittedRegion>, range: VirtRange) {
+    let mut index = 0;
+    while index < regions.len() {
+        let region = regions[index];
+        if !ranges_overlap(region.range, range) {
+            index += 1;
+            continue;
+        }
+
+        regions.swap_remove(index);
+        if region.range.start.raw() < range.start.raw() {
+            regions.push(CommittedRegion {
+                range: VirtRange::new(
+                    region.range.start,
+                    range.start.raw() - region.range.start.raw(),
+                ),
+                flags: region.flags,
+            });
+        }
+        if range.end().raw() < region.range.end().raw() {
+            regions.push(CommittedRegion {
+                range: VirtRange::new(range.end(), region.range.end().raw() - range.end().raw()),
+                flags: region.flags,
+            });
+        }
+    }
+}
+
+fn set_protection(range: VirtRange, prot: i32) -> Result<(), AddressSpaceError> {
+    let result = unsafe { libc::mprotect(range.start.raw() as *mut _, range.byte_len, prot) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(AddressSpaceError::InvalidFlags)
+    }
 }
 
 fn page_flags_to_prot(flags: PageFlags) -> i32 {
@@ -402,6 +455,34 @@ mod tests {
             for byte in 0..(range.byte_len.min(256)) {
                 assert_eq!(pointer.add(byte).read_volatile(), (byte & 0xff) as u8);
             }
+        }
+        address_space.release(range).unwrap();
+    }
+
+    #[test]
+    fn relocate_preserves_readonly_committed_bytes_and_flags() {
+        use helios_hal::vmm::AddressSpace;
+        let address_space = HostedAddressSpace::new();
+        let range = address_space.reserve(page_aligned_len(1)).unwrap();
+        address_space
+            .commit(range, PageFlags::READ | PageFlags::WRITE)
+            .unwrap();
+        let pointer = range.start.raw() as *mut u8;
+        unsafe {
+            for byte in 0..128 {
+                pointer.add(byte).write_volatile((byte ^ 0xa5) as u8);
+            }
+        }
+        address_space.protect(range, PageFlags::READ).unwrap();
+        address_space.relocate(range).expect("relocate succeeds");
+        unsafe {
+            for byte in 0..128 {
+                assert_eq!(pointer.add(byte).read_volatile(), (byte ^ 0xa5) as u8);
+            }
+        }
+        match address_space.translate(range.start) {
+            Translation::Committed { flags, .. } => assert_eq!(flags, PageFlags::READ),
+            other => panic!("expected committed read-only translation, got {other:?}"),
         }
         address_space.release(range).unwrap();
     }

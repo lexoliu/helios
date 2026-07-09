@@ -9,7 +9,7 @@ use askama::Template;
 use clap::{Parser, Subcommand, ValueEnum};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions};
-use helios_artifact::sign_payload_with_key;
+use helios_artifact::{cwasm_target_supports_wasm_simd, sign_payload_with_key};
 use helios_compiler_support::{AotCompileHint, precompile_artifact};
 use mbrman::{BOOT_ACTIVE, CHS, MBR, MBRPartitionEntry};
 use rand::rngs::OsRng;
@@ -174,6 +174,8 @@ struct ExternalBootArtifact {
     source_url: String,
     #[serde(default)]
     targets: Vec<String>,
+    #[serde(default)]
+    requires_wasm_simd: bool,
     bootfs_path: String,
     source: PathBuf,
     support_root: Option<PathBuf>,
@@ -882,13 +884,7 @@ fn reject_selected_target_mismatches(
         .iter()
         .filter(|artifact| selected_programs.contains(&artifact.command))
         .filter(|artifact| !artifact.supports_target(target))
-        .map(|artifact| {
-            format!(
-                "{} supports {}",
-                artifact.command,
-                artifact.targets.join(", ")
-            )
-        })
+        .map(|artifact| format!("{} {}", artifact.command, artifact.target_constraints()))
         .collect::<Vec<_>>();
     ensure!(
         mismatches.is_empty(),
@@ -900,7 +896,22 @@ fn reject_selected_target_mismatches(
 
 impl ExternalBootArtifact {
     fn supports_target(&self, target: &str) -> bool {
-        self.targets.is_empty() || self.targets.iter().any(|candidate| candidate == target)
+        let target_allowed =
+            self.targets.is_empty() || self.targets.iter().any(|candidate| candidate == target);
+        let simd_satisfied =
+            !self.requires_wasm_simd || cwasm_target_supports_wasm_simd(target);
+        target_allowed && simd_satisfied
+    }
+
+    fn target_constraints(&self) -> String {
+        let mut constraints = Vec::new();
+        if !self.targets.is_empty() {
+            constraints.push(format!("supports {}", self.targets.join(", ")));
+        }
+        if self.requires_wasm_simd {
+            constraints.push("requires wasm SIMD".to_owned());
+        }
+        constraints.join(" and ")
     }
 }
 
@@ -1233,6 +1244,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wasm_simd_requirement_gates_targets() {
+        let mut artifact = test_artifact(
+            "quickjs",
+            "quickjs-ng/quickjs",
+            "v0.14.0",
+            "https://github.com/quickjs-ng/quickjs",
+            Path::new("qjs.wasm"),
+        );
+        artifact.requires_wasm_simd = true;
+
+        assert!(artifact.supports_target("aarch64-unknown-none"));
+        assert!(artifact.supports_target("x86_64-unknown-none"));
+        assert!(artifact.supports_target("aarch64-apple-darwin"));
+        assert!(!artifact.supports_target("riscv64gc-unknown-none-elf"));
+
+        let selected = Some(BTreeSet::from(["quickjs".to_owned()]));
+        let error =
+            reject_selected_target_mismatches(&[artifact], "riscv64gc-unknown-none-elf", &selected)
+                .expect_err("simd-requiring artifact must reject riscv64 selection");
+        assert!(
+            error.to_string().contains("quickjs requires wasm SIMD"),
+            "unexpected error: {error:#}"
+        );
+    }
+
     fn test_artifact(
         command: &str,
         package: &str,
@@ -1246,6 +1283,7 @@ mod tests {
             version: version.to_owned(),
             source_url: source_url.to_owned(),
             targets: Vec::new(),
+            requires_wasm_simd: false,
             bootfs_path: format!("bin/{command}"),
             source: source.to_owned(),
             support_root: None,

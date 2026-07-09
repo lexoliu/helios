@@ -3,8 +3,9 @@ use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{self as unix_fs, MetadataExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
+use helios_hal::io::IoError;
 use helios_kernel::{
     AuthorityDomain, HostDirEntry, HostFileSystem, HostFsError, HostMetadata, ObjectIdentity,
 };
@@ -24,14 +25,24 @@ impl HostedFileSystem {
         Self { root: root.into() }
     }
 
-    fn resolve(&self, path: &str) -> PathBuf {
-        let cleaned = path.strip_prefix('/').unwrap_or(path);
-        self.root.join(cleaned)
+    fn resolve(&self, path: &str) -> Result<PathBuf, HostFsError> {
+        let mut resolved = self.root.clone();
+        for component in Path::new(path).components() {
+            match component {
+                Component::Prefix(_) | Component::ParentDir => return Err(invalid_host_path()),
+                Component::RootDir | Component::CurDir => {}
+                Component::Normal(segment) => resolved.push(segment),
+            }
+        }
+        Ok(resolved)
     }
 }
 
+fn invalid_host_path() -> HostFsError {
+    HostFsError::Transport(IoError::PermissionDenied)
+}
+
 fn map_io_error(error: io::Error) -> HostFsError {
-    use helios_hal::io::IoError;
     let io_error = match error.kind() {
         io::ErrorKind::NotFound => IoError::NotFound,
         io::ErrorKind::AlreadyExists => IoError::AlreadyExists,
@@ -42,12 +53,40 @@ fn map_io_error(error: io::Error) -> HostFsError {
     HostFsError::Transport(io_error)
 }
 
+fn blocking_path<T>(
+    path: Result<PathBuf, HostFsError>,
+    operation: impl FnOnce(PathBuf) -> Result<T, HostFsError> + Send + 'static,
+) -> impl core::future::Future<Output = Result<T, HostFsError>> + Send
+where
+    T: Send + 'static,
+{
+    async move {
+        let path = path?;
+        blocking::unblock(move || operation(path)).await
+    }
+}
+
+fn blocking_two_paths<T>(
+    source: Result<PathBuf, HostFsError>,
+    destination: Result<PathBuf, HostFsError>,
+    operation: impl FnOnce(PathBuf, PathBuf) -> Result<T, HostFsError> + Send + 'static,
+) -> impl core::future::Future<Output = Result<T, HostFsError>> + Send
+where
+    T: Send + 'static,
+{
+    async move {
+        let source = source?;
+        let destination = destination?;
+        blocking::unblock(move || operation(source, destination)).await
+    }
+}
+
 impl HostFileSystem for HostedFileSystem {
     fn stat_path(
         &self,
         path: &str,
     ) -> impl core::future::Future<Output = Result<HostMetadata, HostFsError>> + Send + '_ {
-        core::future::ready(stat_impl(&self.resolve(path)))
+        blocking_path(self.resolve(path), |path| stat_impl(&path))
     }
 
     fn read_dir(
@@ -55,14 +94,16 @@ impl HostFileSystem for HostedFileSystem {
         path: &str,
     ) -> impl core::future::Future<Output = Result<Vec<HostDirEntry>, HostFsError>> + Send + '_
     {
-        core::future::ready(read_dir_impl(&self.resolve(path)))
+        blocking_path(self.resolve(path), |path| read_dir_impl(&path))
     }
 
     fn read_file(
         &self,
         path: &str,
     ) -> impl core::future::Future<Output = Result<Vec<u8>, HostFsError>> + Send + '_ {
-        core::future::ready(fs::read(self.resolve(path)).map_err(map_io_error))
+        blocking_path(self.resolve(path), |path| {
+            fs::read(path).map_err(map_io_error)
+        })
     }
 
     fn read_file_range(
@@ -71,7 +112,9 @@ impl HostFileSystem for HostedFileSystem {
         offset: u64,
         max_bytes: u32,
     ) -> impl core::future::Future<Output = Result<Vec<u8>, HostFsError>> + Send + '_ {
-        core::future::ready(read_file_range_impl(&self.resolve(path), offset, max_bytes))
+        blocking_path(self.resolve(path), move |path| {
+            read_file_range_impl(&path, offset, max_bytes)
+        })
     }
 
     fn write_file(
@@ -80,14 +123,17 @@ impl HostFileSystem for HostedFileSystem {
         offset: u64,
         bytes: &[u8],
     ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
-        core::future::ready(write_file_impl(&self.resolve(path), offset, bytes))
+        let bytes = bytes.to_vec();
+        blocking_path(self.resolve(path), move |path| {
+            write_file_impl(&path, offset, &bytes)
+        })
     }
 
     fn truncate_file(
         &self,
         path: &str,
     ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
-        core::future::ready(truncate_impl(&self.resolve(path)))
+        blocking_path(self.resolve(path), |path| truncate_impl(&path))
     }
 
     fn set_file_size(
@@ -95,7 +141,9 @@ impl HostFileSystem for HostedFileSystem {
         path: &str,
         size: u64,
     ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
-        core::future::ready(set_file_size_impl(&self.resolve(path), size))
+        blocking_path(self.resolve(path), move |path| {
+            set_file_size_impl(&path, size)
+        })
     }
 
     fn set_times(
@@ -104,29 +152,27 @@ impl HostFileSystem for HostedFileSystem {
         access_nanos: Option<u64>,
         modified_nanos: Option<u64>,
     ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
-        core::future::ready(set_times_impl(
-            &self.resolve(path),
-            access_nanos,
-            modified_nanos,
-        ))
+        blocking_path(self.resolve(path), move |path| {
+            set_times_impl(&path, access_nanos, modified_nanos)
+        })
     }
 
     fn create_file(
         &self,
         path: &str,
     ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
-        core::future::ready(
-            fs::File::create_new(self.resolve(path))
-                .map(|_| ())
-                .map_err(map_io_error),
-        )
+        blocking_path(self.resolve(path), |path| {
+            fs::File::create_new(path).map(|_| ()).map_err(map_io_error)
+        })
     }
 
     fn create_directory(
         &self,
         path: &str,
     ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
-        core::future::ready(fs::create_dir(self.resolve(path)).map_err(map_io_error))
+        blocking_path(self.resolve(path), |path| {
+            fs::create_dir(path).map_err(map_io_error)
+        })
     }
 
     fn remove(
@@ -134,11 +180,12 @@ impl HostFileSystem for HostedFileSystem {
         path: &str,
         directory: bool,
     ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
-        let resolved = self.resolve(path);
-        core::future::ready(if directory {
-            fs::remove_dir(resolved).map_err(map_io_error)
-        } else {
-            fs::remove_file(resolved).map_err(map_io_error)
+        blocking_path(self.resolve(path), move |path| {
+            if directory {
+                fs::remove_dir(path).map_err(map_io_error)
+            } else {
+                fs::remove_file(path).map_err(map_io_error)
+            }
         })
     }
 
@@ -147,8 +194,10 @@ impl HostFileSystem for HostedFileSystem {
         source: &str,
         destination: &str,
     ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
-        core::future::ready(
-            fs::rename(self.resolve(source), self.resolve(destination)).map_err(map_io_error),
+        blocking_two_paths(
+            self.resolve(source),
+            self.resolve(destination),
+            |source, destination| fs::rename(source, destination).map_err(map_io_error),
         )
     }
 
@@ -157,8 +206,10 @@ impl HostFileSystem for HostedFileSystem {
         source: &str,
         destination: &str,
     ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
-        core::future::ready(
-            fs::hard_link(self.resolve(source), self.resolve(destination)).map_err(map_io_error),
+        blocking_two_paths(
+            self.resolve(source),
+            self.resolve(destination),
+            |source, destination| fs::hard_link(source, destination).map_err(map_io_error),
         )
     }
 
@@ -167,14 +218,17 @@ impl HostFileSystem for HostedFileSystem {
         target: &str,
         link_path: &str,
     ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
-        core::future::ready(unix_fs::symlink(target, self.resolve(link_path)).map_err(map_io_error))
+        let target = PathBuf::from(target);
+        blocking_path(self.resolve(link_path), move |link_path| {
+            unix_fs::symlink(target, link_path).map_err(map_io_error)
+        })
     }
 
     fn read_link(
         &self,
         path: &str,
     ) -> impl core::future::Future<Output = Result<String, HostFsError>> + Send + '_ {
-        core::future::ready(read_link_impl(&self.resolve(path)))
+        blocking_path(self.resolve(path), |path| read_link_impl(&path))
     }
 }
 
@@ -286,6 +340,8 @@ fn read_link_impl(path: &Path) -> Result<String, HostFsError> {
 
 #[cfg(test)]
 mod tests {
+    use core::future::Future;
+
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -326,51 +382,83 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn hosted_filesystem_supports_links() {
-        let root = TestRoot::new();
-        std::fs::write(root.path.join("source"), b"payload").expect("source file must be written");
-        let filesystem = root.filesystem();
-
-        filesystem
-            .hard_link("source", "hard")
-            .await
-            .expect("hard link must be created");
-        filesystem
-            .symlink("source", "sym")
-            .await
-            .expect("symlink must be created");
-
-        let hard = filesystem
-            .read_file("hard")
-            .await
-            .expect("hard link must be readable");
-        let payload = filesystem
-            .read_link("sym")
-            .await
-            .expect("symlink payload must be readable");
-
-        assert_eq!(&hard, b"payload");
-        assert_eq!(payload, "source");
+    fn run_hosted_fs_test(test: impl Future<Output = ()> + Send + 'static) {
+        tokio::runtime::Builder::new_multi_thread()
+            .build()
+            .expect("hosted filesystem test runtime must be created")
+            .block_on(test);
     }
 
-    #[tokio::test]
-    async fn hosted_filesystem_sets_access_and_modification_times() {
-        use std::os::unix::fs::MetadataExt;
+    #[test]
+    fn hosted_filesystem_supports_links() {
+        run_hosted_fs_test(async {
+            let root = TestRoot::new();
+            std::fs::write(root.path.join("source"), b"payload")
+                .expect("source file must be written");
+            let filesystem = root.filesystem();
 
-        let root = TestRoot::new();
-        std::fs::write(root.path.join("source"), b"payload").expect("source file must be written");
-        let filesystem = root.filesystem();
+            filesystem
+                .hard_link("source", "hard")
+                .await
+                .expect("hard link must be created");
+            filesystem
+                .symlink("source", "sym")
+                .await
+                .expect("symlink must be created");
 
-        filesystem
-            .set_times("source", Some(1_500_000_002), Some(2_000_000_003))
-            .await
-            .expect("times must be set");
+            let hard = filesystem
+                .read_file("hard")
+                .await
+                .expect("hard link must be readable");
+            let payload = filesystem
+                .read_link("sym")
+                .await
+                .expect("symlink payload must be readable");
 
-        let metadata = std::fs::metadata(root.path.join("source")).expect("metadata must be read");
-        assert_eq!(metadata.atime(), 1);
-        assert_eq!(metadata.atime_nsec(), 500_000_002);
-        assert_eq!(metadata.mtime(), 2);
-        assert_eq!(metadata.mtime_nsec(), 3);
+            assert_eq!(&hard, b"payload");
+            assert_eq!(payload, "source");
+        });
+    }
+
+    #[test]
+    fn hosted_filesystem_sets_access_and_modification_times() {
+        run_hosted_fs_test(async {
+            use std::os::unix::fs::MetadataExt;
+
+            let root = TestRoot::new();
+            std::fs::write(root.path.join("source"), b"payload")
+                .expect("source file must be written");
+            let filesystem = root.filesystem();
+
+            filesystem
+                .set_times("source", Some(1_500_000_002), Some(2_000_000_003))
+                .await
+                .expect("times must be set");
+
+            let metadata =
+                std::fs::metadata(root.path.join("source")).expect("metadata must be read");
+            assert_eq!(metadata.atime(), 1);
+            assert_eq!(metadata.atime_nsec(), 500_000_002);
+            assert_eq!(metadata.mtime(), 2);
+            assert_eq!(metadata.mtime_nsec(), 3);
+        });
+    }
+
+    #[test]
+    fn hosted_filesystem_rejects_parent_components() {
+        run_hosted_fs_test(async {
+            let root = TestRoot::new();
+            let filesystem = root.filesystem();
+
+            let error = filesystem
+                .read_file("../outside")
+                .await
+                .expect_err("parent path must be rejected");
+
+            assert!(matches!(
+                error,
+                helios_kernel::HostFsError::Transport(helios_hal::io::IoError::PermissionDenied)
+            ));
+        });
     }
 }

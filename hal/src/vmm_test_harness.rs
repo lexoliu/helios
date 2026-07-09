@@ -52,6 +52,7 @@ where
     commit_then_decommit_round_trip(&fixture.fresh, fixture.verify_writes);
     decommit_uncommitted_range_errors(&fixture.fresh);
     protect_uncommitted_range_errors(&fixture.fresh);
+    protect_updates_translation_flags_across_committed_subranges(&fixture.fresh);
     translate_outside_reservation_is_unmapped(&fixture.fresh);
     release_drops_reservations(&fixture.fresh);
 }
@@ -179,6 +180,47 @@ where
         result.is_err(),
         "protect of an unreserved range must error, got {result:?}"
     );
+}
+
+fn protect_updates_translation_flags_across_committed_subranges<F, A>(fresh: F)
+where
+    F: Fn() -> A,
+    A: AddressSpace,
+{
+    let address_space = fresh();
+    let range = address_space.reserve(pages(2)).expect("reserve");
+    let first = VirtRange::new(range.start, PAGE);
+    let second = VirtRange::new(VirtAddr::new(range.start.raw() + PAGE), PAGE);
+    address_space
+        .commit(first, PageFlags::READ | PageFlags::WRITE)
+        .expect("commit first page");
+    address_space
+        .commit(second, PageFlags::READ | PageFlags::WRITE)
+        .expect("commit second page");
+
+    address_space
+        .protect(range, PageFlags::READ)
+        .expect("protect across adjacent committed subranges");
+
+    for addr in [first.start, second.start] {
+        match address_space.translate(addr) {
+            Translation::Committed { flags, .. } => {
+                assert_eq!(
+                    flags,
+                    PageFlags::READ,
+                    "protect must update translation flags for {addr:?}"
+                );
+            }
+            other => panic!("expected protected committed page at {addr:?}, got {other:?}"),
+        }
+    }
+
+    address_space
+        .decommit(range)
+        .expect("decommit protected range");
+    address_space
+        .release(range)
+        .expect("release after protect test");
 }
 
 fn translate_outside_reservation_is_unmapped<F, A>(fresh: F)

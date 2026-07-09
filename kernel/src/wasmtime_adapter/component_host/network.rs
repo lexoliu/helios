@@ -157,6 +157,15 @@ trait DynComponentHostNetworkService: Send + Sync + 'static {
         local_port: u16,
     ) -> Pin<Box<dyn Future<Output = Result<UdpBinding<u64>, UdpError>> + Send + 'a>>;
 
+    fn udp_connect<'a>(
+        &'a self,
+        socket: u64,
+        remote_address: NetworkIpAddress,
+        port: u16,
+    ) -> Result<(), UdpError>;
+
+    fn udp_disconnect(&self, socket: u64) -> Result<(), UdpError>;
+
     fn udp_send<'a>(
         &'a self,
         socket: u64,
@@ -423,6 +432,19 @@ impl ComponentNetworkService for ComponentHostNetworkService {
         local_port: u16,
     ) -> impl Future<Output = Result<UdpBinding<Self::UdpSocket>, UdpError>> + Send + '_ {
         self.inner.udp_bind(local_port)
+    }
+
+    fn udp_connect(
+        &self,
+        socket: Self::UdpSocket,
+        remote_address: NetworkIpAddress,
+        port: u16,
+    ) -> Result<(), UdpError> {
+        self.inner.udp_connect(socket, remote_address, port)
+    }
+
+    fn udp_disconnect(&self, socket: Self::UdpSocket) -> Result<(), UdpError> {
+        self.inner.udp_disconnect(socket)
     }
 
     fn udp_send<'a>(
@@ -775,6 +797,24 @@ where
                 local_port: binding.local_port,
             })
         })
+    }
+
+    fn udp_connect<'a>(
+        &'a self,
+        socket: u64,
+        remote_address: NetworkIpAddress,
+        port: u16,
+    ) -> Result<(), UdpError> {
+        self.service.udp_connect(
+            <Service::UdpSocket as ComponentHostUdpSocketToken>::from_raw(socket),
+            remote_address,
+            port,
+        )
+    }
+
+    fn udp_disconnect(&self, socket: u64) -> Result<(), UdpError> {
+        self.service
+            .udp_disconnect(<Service::UdpSocket as ComponentHostUdpSocketToken>::from_raw(socket))
     }
 
     fn udp_send<'a>(

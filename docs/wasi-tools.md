@@ -64,6 +64,10 @@ environment, place a pre-downloaded
 The shell and coreutils artifacts must be official Wasmer package payloads.
 QuickJS is built locally from the matching QuickJS-NG source archive so the
 Helios wasm artifact uses SIMD instead of forcing Linux down to scalar code.
+Because the artifact contains wasm SIMD instructions, `boot-artifacts.toml`
+marks it with `requires_wasm_simd = true`; kernel prebuilds exclude QuickJS on
+targets without wasm SIMD support (riscv64gc has no V extension), and
+selecting it explicitly there fails fast with a target-mismatch error.
 The Fedora/QEMU native QuickJS benchmark inspects
 `artifacts/wasix/quickjs/qjs.wasm` before provisioning: if that wasm does not
 contain SIMD instructions, the benchmark fails and asks for a rebuilt QuickJS
@@ -128,13 +132,12 @@ The same AArch64/HVF path is the preferred smoke test for the bootfs
 cargo run -p helios-inspector -- vm --arch aarch64 --release \
   --boot-program dash --boot-program debugger --boot-program curl \
   --no-compiler-plugin \
-  shell -c '/bin/curl http://example.com/'
+  shell -c '/bin/curl http://neverssl.com/'
 ```
 
 Expected output contains:
 
-- `<!doctype html>`
-- `<title>Example Domain</title>`
+- `NeverSSL`
 
 The same path runs the standard Bash artifact:
 
@@ -275,13 +278,12 @@ Expected output includes:
 cargo run -p helios-inspector -- vm --arch riscv64 --memory 2G \
   --boot-program dash --boot-program debugger --boot-program curl \
   --no-compiler-plugin \
-  shell -c '/bin/curl http://example.com/'
+  shell -c '/bin/curl http://neverssl.com/'
 ```
 
 Expected output contains:
 
-- `<!doctype html>`
-- `<title>Example Domain</title>`
+- `NeverSSL`
 
 ## Implementation Notes
 

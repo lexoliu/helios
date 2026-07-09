@@ -1607,6 +1607,7 @@ dependencies = [
 name = "helios-hosted"
 version = "0.1.0"
 dependencies = [
+ "blocking",
  "critical-section",
  "crossbeam-channel",
  "getrandom 0.3.4",

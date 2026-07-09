@@ -162,6 +162,20 @@ where
             .udp_send(socket, host, port, bytes, timeout_nanos)
     }
 
+    pub fn udp_connect(
+        &self,
+        _: UdpCap,
+        socket: Service::UdpSocket,
+        remote_address: crate::NetworkIpAddress,
+        port: u16,
+    ) -> Result<(), UdpError> {
+        self.service.udp_connect(socket, remote_address, port)
+    }
+
+    pub fn udp_disconnect(&self, _: UdpCap, socket: Service::UdpSocket) -> Result<(), UdpError> {
+        self.service.udp_disconnect(socket)
+    }
+
     pub fn udp_receive(
         &self,
         _: UdpCap,
@@ -353,6 +367,19 @@ mod tests {
                 socket: 9,
                 local_port,
             }))
+        }
+
+        fn udp_connect(
+            &self,
+            _: Self::UdpSocket,
+            _: NetworkIpAddress,
+            _: u16,
+        ) -> Result<(), UdpError> {
+            Ok(())
+        }
+
+        fn udp_disconnect(&self, _: Self::UdpSocket) -> Result<(), UdpError> {
+            Ok(())
         }
 
         fn udp_send(

@@ -20,6 +20,16 @@ pub fn cwasm_target_uses_lazy_commit_virtual_memory(target: &str) -> bool {
     matches!(target, "aarch64-unknown-none")
 }
 
+/// Whether cwasm artifacts for `target` may use 128-bit wasm SIMD.
+///
+/// Cranelift's riscv64 backend can only lower 128-bit vector operations when
+/// the V extension (`has_v`) is available, and the riscv64gc kernel target
+/// does not provide it; compiling a SIMD-bearing module there aborts inside
+/// Cranelift instead of returning an error.
+pub fn cwasm_target_supports_wasm_simd(target: &str) -> bool {
+    !target.starts_with("riscv64")
+}
+
 pub fn cwasm_target_cranelift_flags(target: &str) -> &'static [&'static str] {
     if target.starts_with("aarch64-") {
         return &["has_lse", "has_fp16"];

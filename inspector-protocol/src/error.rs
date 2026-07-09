@@ -4,9 +4,9 @@
 //! are encoded as structured enums so callers (inspector, CLI, debugger guest)
 //! can dispatch on a stable contract instead of opaque strings.
 //!
-//! `wrpc_transport::{Invoke, Serve, Index}` are upstream contracts that
-//! return `anyhow::Result` and we cannot replace them; the
-//! [`crate::transport`] module documents that boundary in detail.
+//! Test-only wRPC compatibility shims still adapt to upstream
+//! `anyhow::Result`, but the production transport API never exposes that
+//! boundary.
 
 #[cfg(feature = "host")]
 use std::io;

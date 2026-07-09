@@ -178,6 +178,11 @@ pub struct Ipv4Packet<'a> {
     pub destination: Ipv4Address,
     pub protocol: IpProtocol,
     pub hop_limit: u8,
+    pub identification: u16,
+    pub header_len: usize,
+    pub fragment_offset_blocks: u16,
+    pub more_fragments: bool,
+    pub total_len: usize,
     pub payload: &'a [u8],
 }
 
@@ -185,6 +190,22 @@ impl<'a> Ipv4Packet<'a> {
     pub const MIN_HEADER_LEN: usize = 20;
 
     pub fn parse(bytes: &'a [u8]) -> Option<Self> {
+        Self::parse_with_payload(bytes, Ipv4PayloadLength::Strict, Ipv4Checksum::Validate)
+    }
+
+    pub fn parse_without_checksum(bytes: &'a [u8]) -> Option<Self> {
+        Self::parse_with_payload(bytes, Ipv4PayloadLength::Strict, Ipv4Checksum::Skip)
+    }
+
+    pub fn parse_quoted(bytes: &'a [u8]) -> Option<Self> {
+        Self::parse_with_payload(bytes, Ipv4PayloadLength::Truncated, Ipv4Checksum::Validate)
+    }
+
+    fn parse_with_payload(
+        bytes: &'a [u8],
+        payload_length: Ipv4PayloadLength,
+        checksum: Ipv4Checksum,
+    ) -> Option<Self> {
         if bytes.len() < Self::MIN_HEADER_LEN || bytes[0] >> 4 != 4 {
             return None;
         }
@@ -192,24 +213,38 @@ impl<'a> Ipv4Packet<'a> {
         if header_len < Self::MIN_HEADER_LEN || bytes.len() < header_len {
             return None;
         }
-        if ipv4_checksum(&bytes[..header_len]) != 0 {
+        if matches!(checksum, Ipv4Checksum::Validate) && ipv4_checksum(&bytes[..header_len]) != 0 {
             return None;
         }
         let total_len = usize::from(read_u16(bytes, 2)?);
-        if total_len < header_len || total_len > bytes.len() {
+        if total_len < header_len {
+            return None;
+        }
+        let payload_end = match payload_length {
+            Ipv4PayloadLength::Strict if total_len > bytes.len() => return None,
+            Ipv4PayloadLength::Strict => total_len,
+            Ipv4PayloadLength::Truncated => total_len.min(bytes.len()),
+        };
+        if payload_end < header_len {
             return None;
         }
         let fragment = read_u16(bytes, 6)?;
-        if fragment & 0x3fff != 0 {
-            return None;
-        }
         Some(Self {
             source: Ipv4Address::new(read_array::<4>(bytes, 12)?),
             destination: Ipv4Address::new(read_array::<4>(bytes, 16)?),
             protocol: IpProtocol::from_number(bytes[9])?,
             hop_limit: bytes[8],
-            payload: &bytes[header_len..total_len],
+            identification: read_u16(bytes, 4)?,
+            header_len,
+            fragment_offset_blocks: fragment & 0x1fff,
+            more_fragments: fragment & 0x2000 != 0,
+            total_len,
+            payload: &bytes[header_len..payload_end],
         })
+    }
+
+    pub const fn is_fragmented(self) -> bool {
+        self.fragment_offset_blocks != 0 || self.more_fragments
     }
 
     pub fn encode_header(
@@ -242,6 +277,18 @@ impl<'a> Ipv4Packet<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ipv4PayloadLength {
+    Strict,
+    Truncated,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ipv4Checksum {
+    Validate,
+    Skip,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ipv6Packet<'a> {
     pub source: Ipv6Address,
     pub destination: Ipv6Address,
@@ -254,20 +301,30 @@ impl<'a> Ipv6Packet<'a> {
     pub const HEADER_LEN: usize = 40;
 
     pub fn parse(bytes: &'a [u8]) -> Option<Self> {
+        Self::parse_with_payload(bytes, Ipv6PayloadLength::Strict)
+    }
+
+    pub fn parse_quoted(bytes: &'a [u8]) -> Option<Self> {
+        Self::parse_with_payload(bytes, Ipv6PayloadLength::Truncated)
+    }
+
+    fn parse_with_payload(bytes: &'a [u8], payload_length: Ipv6PayloadLength) -> Option<Self> {
         if bytes.len() < Self::HEADER_LEN || bytes[0] >> 4 != 6 {
             return None;
         }
         let payload_len = usize::from(read_u16(bytes, 4)?);
         let end = Self::HEADER_LEN.checked_add(payload_len)?;
-        if bytes.len() < end {
-            return None;
-        }
+        let payload_end = match payload_length {
+            Ipv6PayloadLength::Strict if bytes.len() < end => return None,
+            Ipv6PayloadLength::Strict => end,
+            Ipv6PayloadLength::Truncated => end.min(bytes.len()),
+        };
         Some(Self {
             source: Ipv6Address::new(read_array::<16>(bytes, 8)?),
             destination: Ipv6Address::new(read_array::<16>(bytes, 24)?),
             next_header: IpProtocol::from_number(bytes[6])?,
             hop_limit: bytes[7],
-            payload: &bytes[Self::HEADER_LEN..end],
+            payload: &bytes[Self::HEADER_LEN..payload_end],
         })
     }
 
@@ -295,6 +352,12 @@ impl<'a> Ipv6Packet<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ipv6PayloadLength {
+    Strict,
+    Truncated,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UdpPacket<'a> {
     pub source_port: u16,
     pub destination_port: u16,
@@ -319,6 +382,13 @@ impl<'a> UdpPacket<'a> {
         })
     }
 
+    pub fn parse_ports(bytes: &[u8]) -> Option<TransportPorts> {
+        Some(TransportPorts {
+            source: read_u16(bytes, 0)?,
+            destination: read_u16(bytes, 2)?,
+        })
+    }
+
     pub fn encode(
         output: &mut [u8],
         source: IpAddress,
@@ -338,9 +408,13 @@ impl<'a> UdpPacket<'a> {
         write_u16(output, 6, 0)?;
         output[Self::HEADER_LEN..len].copy_from_slice(payload);
         let checksum = udp_checksum(source, destination, &output[..len]);
-        write_u16(output, 6, checksum)?;
+        write_u16(output, 6, udp_transmitted_checksum(checksum))?;
         Some(len)
     }
+}
+
+fn udp_transmitted_checksum(checksum: u16) -> u16 {
+    if checksum == 0 { u16::MAX } else { checksum }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -385,6 +459,13 @@ pub struct TcpPacket<'a> {
     pub payload: &'a [u8],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TcpQuotedPacket {
+    pub source_port: u16,
+    pub destination_port: u16,
+    pub sequence: u32,
+}
+
 impl<'a> TcpPacket<'a> {
     pub const MIN_HEADER_LEN: usize = 20;
 
@@ -405,6 +486,21 @@ impl<'a> TcpPacket<'a> {
             window_size: read_u16(bytes, 14)?,
             options: TcpOptions::parse(&bytes[Self::MIN_HEADER_LEN..header_len])?,
             payload: &bytes[header_len..],
+        })
+    }
+
+    pub fn parse_ports(bytes: &[u8]) -> Option<TransportPorts> {
+        Some(TransportPorts {
+            source: read_u16(bytes, 0)?,
+            destination: read_u16(bytes, 2)?,
+        })
+    }
+
+    pub fn parse_quoted(bytes: &[u8]) -> Option<TcpQuotedPacket> {
+        Some(TcpQuotedPacket {
+            source_port: read_u16(bytes, 0)?,
+            destination_port: read_u16(bytes, 2)?,
+            sequence: read_u32(bytes, 4)?,
         })
     }
 
@@ -462,6 +558,12 @@ impl<'a> TcpPacket<'a> {
         write_u16(output, 16, checksum)?;
         Some(len)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransportPorts {
+    pub source: u16,
+    pub destination: u16,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -769,13 +871,87 @@ pub struct Icmpv4Echo<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Icmpv4DestinationUnreachable<'a> {
+    pub code: Icmpv4DestinationUnreachableCode,
+    pub original: &'a [u8],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Icmpv4DestinationUnreachableCode {
+    Net,
+    Host,
+    Protocol,
+    Port,
+    FragmentationNeeded { next_hop_mtu: u16 },
+    SourceRouteFailed,
+    NetUnknown,
+    HostUnknown,
+    SourceHostIsolated,
+    NetProhibited,
+    HostProhibited,
+    NetTos,
+    HostTos,
+    CommunicationProhibited,
+    HostPrecedenceViolation,
+    PrecedenceCutoff,
+}
+
+impl Icmpv4DestinationUnreachableCode {
+    pub const fn raw(self) -> u8 {
+        match self {
+            Self::Net => 0,
+            Self::Host => 1,
+            Self::Protocol => 2,
+            Self::Port => 3,
+            Self::FragmentationNeeded { .. } => 4,
+            Self::SourceRouteFailed => 5,
+            Self::NetUnknown => 6,
+            Self::HostUnknown => 7,
+            Self::SourceHostIsolated => 8,
+            Self::NetProhibited => 9,
+            Self::HostProhibited => 10,
+            Self::NetTos => 11,
+            Self::HostTos => 12,
+            Self::CommunicationProhibited => 13,
+            Self::HostPrecedenceViolation => 14,
+            Self::PrecedenceCutoff => 15,
+        }
+    }
+
+    const fn from_raw(code: u8, next_hop_mtu: u16) -> Option<Self> {
+        match code {
+            0 => Some(Self::Net),
+            1 => Some(Self::Host),
+            2 => Some(Self::Protocol),
+            3 => Some(Self::Port),
+            4 => Some(Self::FragmentationNeeded { next_hop_mtu }),
+            5 => Some(Self::SourceRouteFailed),
+            6 => Some(Self::NetUnknown),
+            7 => Some(Self::HostUnknown),
+            8 => Some(Self::SourceHostIsolated),
+            9 => Some(Self::NetProhibited),
+            10 => Some(Self::HostProhibited),
+            11 => Some(Self::NetTos),
+            12 => Some(Self::HostTos),
+            13 => Some(Self::CommunicationProhibited),
+            14 => Some(Self::HostPrecedenceViolation),
+            15 => Some(Self::PrecedenceCutoff),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Icmpv4Packet<'a> {
     EchoRequest(Icmpv4Echo<'a>),
     EchoReply(Icmpv4Echo<'a>),
+    DestinationUnreachable(Icmpv4DestinationUnreachable<'a>),
 }
 
 impl<'a> Icmpv4Packet<'a> {
     pub const HEADER_LEN: usize = 8;
+    pub const DESTINATION_UNREACHABLE_PORT_CODE: Icmpv4DestinationUnreachableCode =
+        Icmpv4DestinationUnreachableCode::Port;
 
     pub fn parse(bytes: &'a [u8]) -> Option<Self> {
         if bytes.len() < Self::HEADER_LEN || internet_checksum(bytes) != 0 {
@@ -789,8 +965,33 @@ impl<'a> Icmpv4Packet<'a> {
         match (bytes[0], bytes[1]) {
             (8, 0) => Some(Self::EchoRequest(echo)),
             (0, 0) => Some(Self::EchoReply(echo)),
+            (3, code) => Some(Self::DestinationUnreachable(Icmpv4DestinationUnreachable {
+                code: Icmpv4DestinationUnreachableCode::from_raw(code, read_u16(bytes, 6)?)?,
+                original: &bytes[Self::HEADER_LEN..],
+            })),
             _ => None,
         }
+    }
+
+    pub fn encode_destination_unreachable(
+        output: &mut [u8],
+        code: Icmpv4DestinationUnreachableCode,
+        original: &[u8],
+    ) -> Option<usize> {
+        let len = Self::HEADER_LEN.checked_add(original.len())?;
+        if output.len() < len {
+            return None;
+        }
+        output[..len].fill(0);
+        output[0] = 3;
+        output[1] = code.raw();
+        if let Icmpv4DestinationUnreachableCode::FragmentationNeeded { next_hop_mtu } = code {
+            write_u16(output, 6, next_hop_mtu)?;
+        }
+        output[Self::HEADER_LEN..len].copy_from_slice(original);
+        let checksum = internet_checksum(&output[..len]);
+        write_u16(output, 2, checksum)?;
+        Some(len)
     }
 }
 
@@ -802,15 +1003,71 @@ pub struct Icmpv6Echo<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Icmpv6DestinationUnreachable<'a> {
+    pub code: Icmpv6DestinationUnreachableCode,
+    pub original: &'a [u8],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Icmpv6DestinationUnreachableCode {
+    NoRoute,
+    AdminProhibited,
+    BeyondScope,
+    AddressUnreachable,
+    PortUnreachable,
+    SourceAddressFailed,
+    RejectRoute,
+}
+
+impl Icmpv6DestinationUnreachableCode {
+    pub const fn raw(self) -> u8 {
+        match self {
+            Self::NoRoute => 0,
+            Self::AdminProhibited => 1,
+            Self::BeyondScope => 2,
+            Self::AddressUnreachable => 3,
+            Self::PortUnreachable => 4,
+            Self::SourceAddressFailed => 5,
+            Self::RejectRoute => 6,
+        }
+    }
+
+    const fn from_raw(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::NoRoute),
+            1 => Some(Self::AdminProhibited),
+            2 => Some(Self::BeyondScope),
+            3 => Some(Self::AddressUnreachable),
+            4 => Some(Self::PortUnreachable),
+            5 => Some(Self::SourceAddressFailed),
+            6 => Some(Self::RejectRoute),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Icmpv6PacketTooBig<'a> {
+    pub mtu: u32,
+    pub original: &'a [u8],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Icmpv6Packet<'a> {
     EchoRequest(Icmpv6Echo<'a>),
     EchoReply(Icmpv6Echo<'a>),
+    DestinationUnreachable(Icmpv6DestinationUnreachable<'a>),
+    PacketTooBig(Icmpv6PacketTooBig<'a>),
     NeighborSolicitation { target: Ipv6Address },
     NeighborAdvertisement { target: Ipv6Address },
 }
 
 impl<'a> Icmpv6Packet<'a> {
     pub const ECHO_HEADER_LEN: usize = 8;
+    pub const DESTINATION_UNREACHABLE_HEADER_LEN: usize = 8;
+    pub const DESTINATION_UNREACHABLE_PORT_CODE: Icmpv6DestinationUnreachableCode =
+        Icmpv6DestinationUnreachableCode::PortUnreachable;
+    pub const PACKET_TOO_BIG_HEADER_LEN: usize = 8;
     pub const NEIGHBOR_MESSAGE_LEN: usize = 32;
 
     pub fn parse(bytes: &'a [u8]) -> Option<Self> {
@@ -827,6 +1084,14 @@ impl<'a> Icmpv6Packet<'a> {
                 identifier: read_u16(bytes, 4)?,
                 sequence: read_u16(bytes, 6)?,
                 payload: &bytes[Self::ECHO_HEADER_LEN..],
+            })),
+            1 => Some(Self::DestinationUnreachable(Icmpv6DestinationUnreachable {
+                code: Icmpv6DestinationUnreachableCode::from_raw(bytes[1])?,
+                original: &bytes[Self::DESTINATION_UNREACHABLE_HEADER_LEN..],
+            })),
+            2 => Some(Self::PacketTooBig(Icmpv6PacketTooBig {
+                mtu: read_u32(bytes, 4)?,
+                original: &bytes[Self::PACKET_TOO_BIG_HEADER_LEN..],
             })),
             135 if bytes.len() >= 24 => Some(Self::NeighborSolicitation {
                 target: Ipv6Address::new(read_array::<16>(bytes, 8)?),
@@ -879,6 +1144,46 @@ impl<'a> Icmpv6Packet<'a> {
         let checksum = icmpv6_checksum(source, destination, &output[..Self::NEIGHBOR_MESSAGE_LEN]);
         write_u16(output, 2, checksum)?;
         Some(Self::NEIGHBOR_MESSAGE_LEN)
+    }
+
+    pub fn encode_destination_unreachable(
+        output: &mut [u8],
+        source: Ipv6Address,
+        destination: Ipv6Address,
+        code: Icmpv6DestinationUnreachableCode,
+        original: &[u8],
+    ) -> Option<usize> {
+        let len = Self::DESTINATION_UNREACHABLE_HEADER_LEN.checked_add(original.len())?;
+        if output.len() < len {
+            return None;
+        }
+        output[..len].fill(0);
+        output[0] = 1;
+        output[1] = code.raw();
+        output[Self::DESTINATION_UNREACHABLE_HEADER_LEN..len].copy_from_slice(original);
+        let checksum = icmpv6_checksum(source, destination, &output[..len]);
+        write_u16(output, 2, checksum)?;
+        Some(len)
+    }
+
+    pub fn encode_packet_too_big(
+        output: &mut [u8],
+        source: Ipv6Address,
+        destination: Ipv6Address,
+        mtu: u32,
+        original: &[u8],
+    ) -> Option<usize> {
+        let len = Self::PACKET_TOO_BIG_HEADER_LEN.checked_add(original.len())?;
+        if output.len() < len {
+            return None;
+        }
+        output[..len].fill(0);
+        output[0] = 2;
+        write_u32(output, 4, mtu)?;
+        output[Self::PACKET_TOO_BIG_HEADER_LEN..len].copy_from_slice(original);
+        let checksum = icmpv6_checksum(source, destination, &output[..len]);
+        write_u16(output, 2, checksum)?;
+        Some(len)
     }
 }
 
@@ -1013,5 +1318,69 @@ mod tests {
         let packet = TcpPacket::parse(&bytes[..len]).expect("encoded SACK should parse");
 
         assert_eq!(packet.options.sack_blocks().as_slice(), blocks.as_slice());
+    }
+
+    #[test]
+    fn udp_encode_transmits_zero_ipv4_checksum_as_ffff() {
+        let source = IpAddress::Ipv4(Ipv4Address::new([192, 0, 2, 1]));
+        let destination = IpAddress::Ipv4(Ipv4Address::new([192, 0, 2, 2]));
+        let mut bytes = [0u8; 16];
+
+        let len = UdpPacket::encode(&mut bytes, source, destination, 49152, 53, &[0xbb, 0xa0])
+            .expect("UDP packet should fit");
+
+        assert_eq!(len, UdpPacket::HEADER_LEN + 2);
+        assert_eq!(read_u16(&bytes, 6), Some(u16::MAX));
+    }
+
+    #[test]
+    fn udp_encode_transmits_zero_ipv6_checksum_as_ffff() {
+        let source = IpAddress::Ipv6(Ipv6Address::new([
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]));
+        let destination = IpAddress::Ipv6(Ipv6Address::new([
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+        ]));
+        let mut bytes = [0u8; 16];
+
+        let len = UdpPacket::encode(&mut bytes, source, destination, 49152, 53, &[0xe4, 0x2f])
+            .expect("UDP packet should fit");
+
+        assert_eq!(len, UdpPacket::HEADER_LEN + 2);
+        assert_eq!(read_u16(&bytes, 6), Some(u16::MAX));
+    }
+
+    #[test]
+    fn ipv4_parse_exposes_fragment_metadata() {
+        let source = Ipv4Address::new([192, 0, 2, 1]);
+        let destination = Ipv4Address::new([192, 0, 2, 2]);
+        let mut bytes = [0u8; 32];
+        let header_len = Ipv4Packet::encode_header(
+            &mut bytes,
+            source,
+            destination,
+            IpProtocol::Udp,
+            12,
+            0x1234,
+            64,
+        )
+        .expect("IPv4 header should fit");
+        bytes[6..8].copy_from_slice(&(0x2000u16 | 2).to_be_bytes());
+        bytes[10..12].copy_from_slice(&0u16.to_be_bytes());
+        let checksum = ipv4_checksum(&bytes[..header_len]);
+        bytes[10..12].copy_from_slice(&checksum.to_be_bytes());
+
+        let packet = Ipv4Packet::parse(&bytes[..header_len + 12])
+            .expect("fragmented IPv4 packet should parse");
+
+        assert_eq!(packet.source, source);
+        assert_eq!(packet.destination, destination);
+        assert_eq!(packet.protocol, IpProtocol::Udp);
+        assert_eq!(packet.identification, 0x1234);
+        assert_eq!(packet.header_len, Ipv4Packet::MIN_HEADER_LEN);
+        assert_eq!(packet.fragment_offset_blocks, 2);
+        assert!(packet.more_fragments);
+        assert!(packet.is_fragmented());
+        assert_eq!(packet.payload.len(), 12);
     }
 }
