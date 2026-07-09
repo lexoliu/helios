@@ -2,7 +2,6 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::array;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::marker::PhantomData;
@@ -17,7 +16,7 @@ use concurrent_queue::{ConcurrentQueue, PopError, PushError};
 use helios_hal::cpu::{Cpu, ProcessorId};
 use helios_hal::watchdog::ProgressCounter;
 use spin::Once;
-use triomphe::Arc as NoWeakArc;
+use triomphe::{Arc as NoWeakArc, UniqueArc};
 
 use crate::exec::sync::Notify;
 
@@ -59,13 +58,16 @@ unsafe impl Sync for TaskArena {}
 unsafe impl<Fut: Send> Send for ArenaFuture<Fut> {}
 
 impl TaskArena {
-    fn new() -> Self {
-        Self {
-            bytes: TaskArenaBytes {
-                bytes: UnsafeCell::new(array::from_fn(|_| MaybeUninit::uninit())),
-            },
-            offset: AtomicUsize::new(0),
-            active: AtomicUsize::new(0),
+    /// Constructs the arena directly inside its shared allocation. The
+    /// megabyte-sized `bytes` store is `MaybeUninit` and must never be
+    /// materialized on the stack; only the atomics need initialization.
+    fn new_shared() -> NoWeakArc<Self> {
+        let mut arena = UniqueArc::<Self>::new_uninit();
+        let ptr = arena.as_mut_ptr().cast::<Self>();
+        unsafe {
+            (&raw mut (*ptr).offset).write(AtomicUsize::new(0));
+            (&raw mut (*ptr).active).write(AtomicUsize::new(0));
+            UniqueArc::assume_init(arena).shareable()
         }
     }
 
@@ -559,7 +561,7 @@ fn executor_group(configured_processors: usize) -> NoWeakArc<ExecutorGroup> {
             for _ in 0..configured_processors {
                 local_queues.push(ready_queue());
                 local_ready_counts.push(AtomicUsize::new(0));
-                task_arenas.push(NoWeakArc::new(TaskArena::new()));
+                task_arenas.push(TaskArena::new_shared());
             }
             NoWeakArc::new(ExecutorGroup {
                 local_queues: local_queues.into_boxed_slice(),
