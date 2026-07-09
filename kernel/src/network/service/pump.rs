@@ -1,0 +1,587 @@
+use super::*;
+
+#[derive(Clone, Copy)]
+pub(super) struct NetworkPollBudget {
+    pub(super) rx_frames: usize,
+    pub(super) tx_completions: usize,
+    pub(super) tx_frames: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct NetworkPollProgress {
+    pub(super) received_frames: usize,
+    pub(super) reclaimed_tx: usize,
+    pub(super) transmitted_frames: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct NetworkTcpReadProbe {
+    pub(super) stream: TcpStreamId,
+    pub(super) max_bytes: usize,
+    pub(super) profile_prefix: &'static str,
+}
+
+pub(super) struct NetworkPollOutcome {
+    pub(super) progress: NetworkPollProgress,
+    pub(super) budget: NetworkPollBudget,
+    pub(super) tcp_read: Option<Result<TcpReadProgress, TcpError>>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum NetworkTransmitStop {
+    Drained,
+    Budget,
+    RingFull,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum NetworkPollSource {
+    Pump,
+    Ping,
+    Dns,
+    Tcp,
+    Udp,
+    Configuration,
+}
+
+impl NetworkPollProgress {
+    pub(super) const fn is_idle(self) -> bool {
+        self.received_frames == 0 && self.reclaimed_tx == 0 && self.transmitted_frames == 0
+    }
+
+    pub(super) const fn receive_saturated(self, budget: NetworkPollBudget) -> bool {
+        budget.rx_frames != 0 && self.received_frames >= budget.rx_frames
+    }
+
+    pub(super) const fn saturated(self, budget: NetworkPollBudget) -> bool {
+        self.receive_saturated(budget)
+            || self.reclaimed_tx >= budget.tx_completions
+            || self.transmitted_frames >= budget.tx_frames
+    }
+}
+
+impl NetworkTransmitStop {
+    pub(super) const fn profile_phase(self, source: NetworkPollSource) -> &'static str {
+        match (self, source) {
+            (Self::Drained, NetworkPollSource::Pump) => "tx-submit-drained-pump",
+            (Self::Drained, NetworkPollSource::Ping) => "tx-submit-drained-ping",
+            (Self::Drained, NetworkPollSource::Dns) => "tx-submit-drained-dns",
+            (Self::Drained, NetworkPollSource::Tcp) => "tx-submit-drained-tcp",
+            (Self::Drained, NetworkPollSource::Udp) => "tx-submit-drained-udp",
+            (Self::Drained, NetworkPollSource::Configuration) => "tx-submit-drained-configuration",
+            (Self::Budget, NetworkPollSource::Pump) => "tx-submit-budget-pump",
+            (Self::Budget, NetworkPollSource::Ping) => "tx-submit-budget-ping",
+            (Self::Budget, NetworkPollSource::Dns) => "tx-submit-budget-dns",
+            (Self::Budget, NetworkPollSource::Tcp) => "tx-submit-budget-tcp",
+            (Self::Budget, NetworkPollSource::Udp) => "tx-submit-budget-udp",
+            (Self::Budget, NetworkPollSource::Configuration) => "tx-submit-budget-configuration",
+            (Self::RingFull, NetworkPollSource::Pump) => "tx-submit-ring-full-pump",
+            (Self::RingFull, NetworkPollSource::Ping) => "tx-submit-ring-full-ping",
+            (Self::RingFull, NetworkPollSource::Dns) => "tx-submit-ring-full-dns",
+            (Self::RingFull, NetworkPollSource::Tcp) => "tx-submit-ring-full-tcp",
+            (Self::RingFull, NetworkPollSource::Udp) => "tx-submit-ring-full-udp",
+            (Self::RingFull, NetworkPollSource::Configuration) => {
+                "tx-submit-ring-full-configuration"
+            }
+        }
+    }
+}
+
+impl NetworkPollSource {
+    pub(super) const fn tx_immediate_phase(self) -> &'static str {
+        match self {
+            Self::Pump => "tx-submit-immediate-pump",
+            Self::Ping => "tx-submit-immediate-ping",
+            Self::Dns => "tx-submit-immediate-dns",
+            Self::Tcp => "tx-submit-immediate-tcp",
+            Self::Udp => "tx-submit-immediate-udp",
+            Self::Configuration => "tx-submit-immediate-configuration",
+        }
+    }
+
+    pub(super) const fn tx_immediate_device_phase(self) -> &'static str {
+        match self {
+            Self::Pump => "tx-submit-immediate-device-pump",
+            Self::Ping => "tx-submit-immediate-device-ping",
+            Self::Dns => "tx-submit-immediate-device-dns",
+            Self::Tcp => "tx-submit-immediate-device-tcp",
+            Self::Udp => "tx-submit-immediate-device-udp",
+            Self::Configuration => "tx-submit-immediate-device-configuration",
+        }
+    }
+
+    pub(super) const fn tx_batch_collect_phase(self) -> &'static str {
+        match self {
+            Self::Pump => "tx-submit-batch-collect-pump",
+            Self::Ping => "tx-submit-batch-collect-ping",
+            Self::Dns => "tx-submit-batch-collect-dns",
+            Self::Tcp => "tx-submit-batch-collect-tcp",
+            Self::Udp => "tx-submit-batch-collect-udp",
+            Self::Configuration => "tx-submit-batch-collect-configuration",
+        }
+    }
+
+    pub(super) const fn tx_batch_device_phase(self) -> &'static str {
+        match self {
+            Self::Pump => "tx-submit-batch-device-pump",
+            Self::Ping => "tx-submit-batch-device-ping",
+            Self::Dns => "tx-submit-batch-device-dns",
+            Self::Tcp => "tx-submit-batch-device-tcp",
+            Self::Udp => "tx-submit-batch-device-udp",
+            Self::Configuration => "tx-submit-batch-device-configuration",
+        }
+    }
+
+    pub(super) const fn rx_drain_phase(self) -> &'static str {
+        match self {
+            Self::Pump => "rx-drain-pump",
+            Self::Ping => "rx-drain-ping",
+            Self::Dns => "rx-drain-dns",
+            Self::Tcp => "rx-drain-tcp",
+            Self::Udp => "rx-drain-udp",
+            Self::Configuration => "rx-drain-configuration",
+        }
+    }
+
+    pub(super) const fn tx_reclaim_phase(self) -> &'static str {
+        match self {
+            Self::Pump => "tx-reclaim-pump",
+            Self::Ping => "tx-reclaim-ping",
+            Self::Dns => "tx-reclaim-dns",
+            Self::Tcp => "tx-reclaim-tcp",
+            Self::Udp => "tx-reclaim-udp",
+            Self::Configuration => "tx-reclaim-configuration",
+        }
+    }
+
+    pub(super) const fn tcp_drive_phase(self) -> &'static str {
+        match self {
+            Self::Pump => "tcp-drive-pump",
+            Self::Ping => "tcp-drive-ping",
+            Self::Dns => "tcp-drive-dns",
+            Self::Tcp => "tcp-drive-tcp",
+            Self::Udp => "tcp-drive-udp",
+            Self::Configuration => "tcp-drive-configuration",
+        }
+    }
+}
+
+/// Adaptive poll budget. The base values are constants from device
+/// capabilities; the live budgets are tuned in `complete()` based on
+/// per-cycle progress so a saturated stack widens its budget while
+/// an idle stack contracts it.
+///
+/// Reads happen on every network poll iteration. Storing the live
+/// fields as `AtomicUsize` keeps that read off the lock — pre-Phase
+/// 4.x the read had to acquire the global `SpinMutex<NetworkShard>`
+/// just to copy three integers. Writes only happen in `complete()`,
+/// which is racy by design (concurrent shards complete and update
+/// the same atomic) but the outcome is a heuristic so the natural
+/// last-writer-wins is acceptable.
+pub(super) struct NetworkPollState {
+    pub(super) base_rx_budget: usize,
+    pub(super) base_tx_completion_budget: usize,
+    pub(super) base_tx_frame_budget: usize,
+    pub(super) rx_budget: AtomicUsize,
+    pub(super) tx_completion_budget: AtomicUsize,
+    pub(super) tx_frame_budget: AtomicUsize,
+}
+
+pub(super) struct NetworkPumpCadence {
+    pub(super) busy_rounds: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct NetworkPerfStart {
+    pub(super) nanos: u64,
+    pub(super) counters: HardwarePerfCounters,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum NetworkPumpAction {
+    Continue,
+    Yield,
+    Wait,
+}
+
+impl<CpuImpl, Runtime, DeviceImpl> NetworkService<CpuImpl, Runtime, DeviceImpl>
+where
+    CpuImpl: Cpu + Clone,
+    Runtime: ComponentRuntimeState + Sync,
+    DeviceImpl: NetworkDevice,
+{
+    pub async fn run_packet_pump(&self) -> ! {
+        let mut cadence = NetworkPumpCadence::new();
+        loop {
+            match self.poll_network_once(NetworkPollSource::Pump).await {
+                Ok((progress, budget)) => match cadence.complete(progress, budget) {
+                    NetworkPumpAction::Continue => {}
+                    NetworkPumpAction::Yield => crate::yield_now().await,
+                    NetworkPumpAction::Wait => self.wait_for_progress(NETWORK_PROGRESS_WAIT).await,
+                },
+                Err(error) => {
+                    cadence.reset();
+                    tracing::debug!(?error, "network packet pump failed to drive device");
+                    self.wait_for_progress(NETWORK_PROGRESS_WAIT).await;
+                }
+            }
+        }
+    }
+
+    pub(super) async fn poll_network_once(
+        &self,
+        source: NetworkPollSource,
+    ) -> Result<(NetworkPollProgress, NetworkPollBudget), IoError> {
+        let outcome = self
+            .poll_network_once_with_tcp_read(source, None, true)
+            .await?;
+        Ok((outcome.progress, outcome.budget))
+    }
+
+    pub(super) async fn poll_network_receive_once(
+        &self,
+        source: NetworkPollSource,
+    ) -> Result<(NetworkPollProgress, NetworkPollBudget), IoError> {
+        let outcome = self
+            .poll_network_once_with_tcp_read(source, None, false)
+            .await?;
+        Ok((outcome.progress, outcome.budget))
+    }
+
+    pub(super) async fn submit_network_transmit(
+        &self,
+        source: NetworkPollSource,
+        budget: NetworkPollBudget,
+    ) -> Result<(usize, usize), IoError> {
+        let mut transmitted = 0usize;
+        let mut transmitted_bytes = 0usize;
+        let transmit_started = self.profile_start();
+        let mut transmit_stop = NetworkTransmitStop::Drained;
+        while transmitted < budget.tx_frames {
+            let mut immediate_submitted = false;
+            let mut immediate_deferred = false;
+            let shard_count = self.inner.state.shard_count();
+            for shard_idx in 0..shard_count {
+                if transmitted >= budget.tx_frames {
+                    break;
+                }
+                let remaining_budget = budget.tx_frames - transmitted;
+                let immediate_started = self.profile_start();
+                let mut immediate_device_started = None;
+                let mut immediate_device_finished = None;
+                let immediate = {
+                    let mut state = self.inner.state.shard_at(shard_idx).lock();
+                    state.stack.try_submit_outbound_slices(
+                        remaining_budget.min(NETWORK_TX_BATCH_FRAMES),
+                        |frames| {
+                            immediate_device_started = self.profile_start();
+                            let result = self
+                                .inner
+                                .device
+                                .try_transmit_slices_immediate_on(shard_idx, frames);
+                            immediate_device_finished = self.profile_start();
+                            result
+                        },
+                    )
+                }?;
+                match immediate {
+                    OutboundBatchStatus::Empty => {}
+                    OutboundBatchStatus::Deferred => {
+                        immediate_deferred = true;
+                    }
+                    OutboundBatchStatus::Submitted {
+                        offered,
+                        accepted,
+                        accepted_bytes,
+                    } => {
+                        immediate_submitted = true;
+                        self.record_network_profile_events_bytes_between(
+                            source.tx_immediate_device_phase(),
+                            immediate_device_started,
+                            immediate_device_finished,
+                            accepted,
+                            accepted_bytes,
+                        );
+                        self.record_network_profile_events_bytes(
+                            source.tx_immediate_phase(),
+                            immediate_started,
+                            accepted,
+                            accepted_bytes,
+                        );
+                        transmitted += accepted;
+                        transmitted_bytes = transmitted_bytes.saturating_add(accepted_bytes);
+                        if accepted < offered {
+                            transmit_stop = NetworkTransmitStop::RingFull;
+                            break;
+                        }
+                    }
+                }
+            }
+            if matches!(transmit_stop, NetworkTransmitStop::RingFull) {
+                break;
+            }
+            if immediate_submitted {
+                continue;
+            }
+            if !immediate_deferred {
+                break;
+            }
+
+            // Per-shard collect+submit: each shard drains its
+            // outbound frames into its OWN device queue. Multi-queue
+            // virtio (Phase 4.2) means shard N's TX submission hits
+            // queue pair N's `tx_state` SpinMutex, with no
+            // contention against shards on other CPUs. Devices with
+            // fewer negotiated queue pairs than shards map shards
+            // onto the live queue-pair ring.
+            let collect_started = self.profile_start();
+            let remaining_budget = budget.tx_frames - transmitted;
+            let collect_limit = NETWORK_TX_BATCH_FRAMES.min(remaining_budget);
+            let shard_count = self.inner.state.shard_count();
+            let mut total_collected = 0usize;
+            let mut total_collected_bytes = 0usize;
+            let mut total_submitted = 0usize;
+            let mut total_submitted_bytes = 0usize;
+            let mut ring_full = false;
+            for shard_idx in 0..shard_count {
+                if total_collected >= collect_limit {
+                    break;
+                }
+                let mut shard_frames =
+                    smallvec::SmallVec::<[PacketBuffer; NETWORK_TX_BATCH_FRAMES]>::new();
+                {
+                    let mut state = self.inner.state.shard_at(shard_idx).lock();
+                    while shard_frames.len() < (collect_limit - total_collected) {
+                        let Some(frame) = state.stack.take_outbound() else {
+                            break;
+                        };
+                        shard_frames.push(frame);
+                    }
+                }
+                if shard_frames.is_empty() {
+                    continue;
+                }
+                let collected_bytes: usize = shard_frames.iter().map(|f| f.as_ref().len()).sum();
+                total_collected += shard_frames.len();
+                total_collected_bytes += collected_bytes;
+                let submitted = self
+                    .inner
+                    .device
+                    .try_transmit_packet_batch_on(shard_idx, &shard_frames)
+                    .await?;
+                let submitted_bytes: usize = shard_frames
+                    .iter()
+                    .take(submitted)
+                    .map(|f| f.as_ref().len())
+                    .sum();
+                total_submitted += submitted;
+                total_submitted_bytes += submitted_bytes;
+                if submitted < shard_frames.len() {
+                    // RingFull on this shard's queue. Push leftovers
+                    // back to the same shard (and only that shard)
+                    // so per-pair ordering is preserved, then mark
+                    // the round as RingFull.
+                    let mut state = self.inner.state.shard_at(shard_idx).lock();
+                    while shard_frames.len() > submitted {
+                        let frame = shard_frames
+                            .pop()
+                            .expect("TX restore lost an unsubmitted outbound frame");
+                        state.stack.push_outbound_front(frame);
+                    }
+                    ring_full = true;
+                    break;
+                }
+            }
+            if total_collected == 0 {
+                break;
+            }
+            self.record_network_profile_events_bytes(
+                source.tx_batch_collect_phase(),
+                collect_started,
+                total_collected,
+                total_collected_bytes,
+            );
+            self.record_network_profile_events_bytes(
+                source.tx_batch_device_phase(),
+                collect_started,
+                total_submitted,
+                total_submitted_bytes,
+            );
+            transmitted += total_submitted;
+            transmitted_bytes = transmitted_bytes.saturating_add(total_submitted_bytes);
+            if ring_full {
+                transmit_stop = NetworkTransmitStop::RingFull;
+                break;
+            }
+        }
+        if transmitted >= budget.tx_frames {
+            transmit_stop = NetworkTransmitStop::Budget;
+        }
+        if transmitted != 0 {
+            self.record_network_profile_events_bytes(
+                transmit_stop.profile_phase(source),
+                transmit_started,
+                transmitted,
+                transmitted_bytes,
+            );
+        }
+        Ok((transmitted, transmitted_bytes))
+    }
+}
+
+impl NetworkShard {
+    pub(super) fn retransmit_dhcp(&mut self, now: StackInstant) -> Result<(), NetworkControlError> {
+        match self.dhcp {
+            DhcpClientState::Selecting {
+                transaction_id,
+                last_sent,
+            } if now.nanos().saturating_sub(last_sent.nanos()) >= DHCP_RETRANSMIT_NANOS => {
+                self.send_dhcp_discover(transaction_id, now)?;
+                self.dhcp = DhcpClientState::Selecting {
+                    transaction_id,
+                    last_sent: now,
+                };
+            }
+            DhcpClientState::Requesting {
+                transaction_id,
+                requested_ip,
+                server_identifier,
+                last_sent,
+            } if now.nanos().saturating_sub(last_sent.nanos()) >= DHCP_RETRANSMIT_NANOS => {
+                self.send_dhcp_request(transaction_id, requested_ip, server_identifier, now)?;
+                self.dhcp = DhcpClientState::Requesting {
+                    transaction_id,
+                    requested_ip,
+                    server_identifier,
+                    last_sent: now,
+                };
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+impl NetworkPollState {
+    pub(super) fn new(
+        rx_budget: usize,
+        tx_completion_budget: usize,
+        tx_frame_budget: usize,
+    ) -> Self {
+        let rx_budget = clamp_poll_budget(rx_budget);
+        let tx_completion_budget = clamp_poll_budget(tx_completion_budget);
+        let tx_frame_budget = clamp_poll_budget(tx_frame_budget);
+        Self {
+            base_rx_budget: rx_budget,
+            base_tx_completion_budget: tx_completion_budget,
+            base_tx_frame_budget: tx_frame_budget,
+            rx_budget: AtomicUsize::new(rx_budget),
+            tx_completion_budget: AtomicUsize::new(tx_completion_budget),
+            tx_frame_budget: AtomicUsize::new(tx_frame_budget),
+        }
+    }
+
+    pub(super) fn budget(&self) -> NetworkPollBudget {
+        NetworkPollBudget {
+            rx_frames: self.rx_budget.load(AtomicOrdering::Relaxed),
+            tx_completions: self.tx_completion_budget.load(AtomicOrdering::Relaxed),
+            tx_frames: self.tx_frame_budget.load(AtomicOrdering::Relaxed),
+        }
+    }
+
+    pub(super) fn complete(&self, progress: NetworkPollProgress) {
+        let rx_current = self.rx_budget.load(AtomicOrdering::Relaxed);
+        self.rx_budget.store(
+            adjust_poll_budget(
+                rx_current,
+                self.base_rx_budget,
+                progress.received_frames >= rx_current,
+                progress.is_idle(),
+            ),
+            AtomicOrdering::Relaxed,
+        );
+        let tx_completion_current = self.tx_completion_budget.load(AtomicOrdering::Relaxed);
+        self.tx_completion_budget.store(
+            adjust_poll_budget(
+                tx_completion_current,
+                self.base_tx_completion_budget,
+                progress.reclaimed_tx >= tx_completion_current,
+                progress.is_idle(),
+            ),
+            AtomicOrdering::Relaxed,
+        );
+        let tx_frame_current = self.tx_frame_budget.load(AtomicOrdering::Relaxed);
+        self.tx_frame_budget.store(
+            adjust_poll_budget(
+                tx_frame_current,
+                self.base_tx_frame_budget,
+                progress.transmitted_frames >= tx_frame_current,
+                progress.is_idle(),
+            ),
+            AtomicOrdering::Relaxed,
+        );
+    }
+}
+
+impl NetworkPumpCadence {
+    pub(super) const fn new() -> Self {
+        Self { busy_rounds: 0 }
+    }
+
+    pub(super) fn complete(
+        &mut self,
+        progress: NetworkPollProgress,
+        budget: NetworkPollBudget,
+    ) -> NetworkPumpAction {
+        if progress.is_idle() {
+            self.reset();
+            return NetworkPumpAction::Wait;
+        }
+
+        self.busy_rounds = self.busy_rounds.saturating_add(1);
+        if self.busy_rounds >= NETWORK_BUSY_POLL_ROUNDS {
+            self.reset();
+            return NetworkPumpAction::Yield;
+        }
+
+        if progress.saturated(budget) {
+            return NetworkPumpAction::Continue;
+        }
+
+        NetworkPumpAction::Continue
+    }
+
+    pub(super) fn reset(&mut self) {
+        self.busy_rounds = 0;
+    }
+}
+
+pub(super) fn adjust_poll_budget(
+    current: usize,
+    base: usize,
+    saturated: bool,
+    idle: bool,
+) -> usize {
+    if saturated {
+        return clamp_poll_budget(current.saturating_mul(2));
+    }
+    if idle && current > base {
+        return current / 2;
+    }
+    current
+}
+
+pub(super) fn tcp_read_profile_phase(prefix: &'static str, outcome: &'static str) -> &'static str {
+    match (prefix, outcome) {
+        ("tcp-read-initial", "pending") => "tcp-read-initial-pending",
+        ("tcp-read-initial", "ready") => "tcp-read-initial-ready",
+        ("tcp-read-initial", "eof") => "tcp-read-initial-eof",
+        ("tcp-read-after-drive", "pending") => "tcp-read-after-drive-pending",
+        ("tcp-read-after-drive", "ready") => "tcp-read-after-drive-ready",
+        ("tcp-read-after-drive", "eof") => "tcp-read-after-drive-eof",
+        ("tcp-read-polling", "pending") => "tcp-read-polling-pending",
+        ("tcp-read-polling", "ready") => "tcp-read-polling-ready",
+        ("tcp-read-polling", "eof") => "tcp-read-polling-eof",
+        _ => panic!("unknown TCP read profile phase"),
+    }
+}
