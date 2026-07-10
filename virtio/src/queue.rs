@@ -39,6 +39,13 @@ pub struct VirtQueue<T: VirtioTransport> {
     num_used: u16,
     avail_idx: u16,
     last_used_idx: u16,
+    /// VIRTIO_F_RING_EVENT_IDX negotiated: notify only when the
+    /// device's avail_event index falls inside the window published
+    /// since the previous notify decision, and publish used_event so
+    /// the device can suppress interrupts symmetrically.
+    event_idx: bool,
+    /// Avail entries published since the last notify decision.
+    num_added: u16,
 }
 
 impl<T: VirtioTransport> VirtQueue<T> {
@@ -84,6 +91,8 @@ impl<T: VirtioTransport> VirtQueue<T> {
             num_used: 0,
             avail_idx: 0,
             last_used_idx: 0,
+            event_idx: false,
+            num_added: 0,
         })
     }
 
@@ -120,6 +129,7 @@ impl<T: VirtioTransport> VirtQueue<T> {
         self.write_avail_ring(slot, head);
         fence(Ordering::Release);
         self.avail_idx = self.avail_idx.wrapping_add(1);
+        self.num_added = self.num_added.wrapping_add(1);
         self.write_avail_idx(self.avail_idx);
         self.num_used += descriptors_needed as u16;
 
@@ -171,6 +181,12 @@ impl<T: VirtioTransport> VirtQueue<T> {
         let slot = self.avail_idx & (self.size - 1);
         self.write_avail_ring(slot, head);
         self.avail_idx = self.avail_idx.wrapping_add(1);
+        self.num_added = self.num_added.wrapping_add(1);
+    }
+
+    /// Enables EVENT_IDX suppression after feature negotiation.
+    pub(crate) fn set_event_idx(&mut self, enabled: bool) {
+        self.event_idx = enabled;
     }
 
     pub(crate) fn publish_deferred_heads(&mut self) {
@@ -196,15 +212,19 @@ impl<T: VirtioTransport> VirtQueue<T> {
         let slot = self.last_used_idx & (self.size - 1);
         let elem = self.read_used_elem(slot);
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
+        if self.event_idx {
+            self.write_used_event(self.last_used_idx);
+        }
         let head = elem.id as u16;
         self.recycle_chain(head);
         Some((head, elem.len))
     }
 
-    pub fn notify(&self, transport: &T) {
+    pub fn notify(&mut self, transport: &T) {
         if self.should_notify() {
             transport.notify_queue(self.index);
         }
+        self.num_added = 0;
     }
 
     fn push_descriptor(&mut self, transport: &T, buffer: &[u8], writable: bool) -> IoResult<u16> {
@@ -347,7 +367,40 @@ impl<T: VirtioTransport> VirtQueue<T> {
     }
 
     fn should_notify(&self) -> bool {
+        if self.event_idx {
+            // vring_need_event (virtio 1.2 §2.7.6.1): kick only when the
+            // device's advertised avail_event falls inside the window of
+            // entries published since the last notify decision.
+            let new = self.avail_idx;
+            let old = new.wrapping_sub(self.num_added);
+            let event = self.read_avail_event();
+            return new.wrapping_sub(event).wrapping_sub(1) < new.wrapping_sub(old);
+        }
         self.read_used_flags() & USED_FLAG_NO_NOTIFY == 0
+    }
+
+    /// Device-written avail_event: the avail index after which the
+    /// device wants its next notification.
+    fn read_avail_event(&self) -> u16 {
+        unsafe {
+            self.device_area
+                .as_ptr()
+                .add(4 + usize::from(self.size) * size_of::<UsedElem>())
+                .cast::<u16>()
+                .read_volatile()
+        }
+    }
+
+    /// Publishes how far the driver has consumed the used ring so the
+    /// device can suppress interrupts for already-seen completions.
+    fn write_used_event(&self, index: u16) {
+        unsafe {
+            self.driver_area
+                .as_ptr()
+                .add(4 + usize::from(self.size) * 2)
+                .cast::<u16>()
+                .write_volatile(index);
+        }
     }
 
     fn read_used_elem(&self, slot: u16) -> UsedElem {
@@ -808,5 +861,47 @@ mod tests {
                 .write_volatile(USED_FLAG_NO_NOTIFY);
         }
         assert!(!queue.should_notify());
+    }
+
+    #[test]
+    fn event_idx_notify_suppresses_outside_device_window() {
+        let transport = FakeTransport {
+            bus: FakeBus { dma: FakeDmaPool },
+        };
+        let mut queue = VirtQueue::new(&transport, 0, 8).expect("queue should initialize");
+        queue.set_event_idx(true);
+
+        let write_avail_event = |queue: &VirtQueue<FakeTransport>, value: u16| unsafe {
+            queue
+                .device_area
+                .as_ptr()
+                .add(4 + usize::from(queue.size) * size_of::<UsedElem>())
+                .cast::<u16>()
+                .write_volatile(value);
+        };
+
+        // Device wants a kick once entry 0 is published.
+        write_avail_event(&queue, 0);
+        let input = [1u8; 8];
+        let mut output = [0u8; 8];
+        queue
+            .submit(&transport, &[&input], &mut [&mut output])
+            .expect("submission should succeed");
+        assert!(queue.should_notify(), "first publish must kick the device");
+        queue.notify(&transport);
+        assert_eq!(queue.num_added, 0, "notify resets the publish window");
+
+        // Device advertises it is still processing (avail_event far
+        // behind the next publish): the kick must be suppressed.
+        write_avail_event(&queue, 0);
+        let input = [2u8; 8];
+        let mut output = [0u8; 8];
+        queue
+            .submit(&transport, &[&input], &mut [&mut output])
+            .expect("second submission should succeed");
+        assert!(
+            !queue.should_notify(),
+            "publish outside the device's event window must not kick"
+        );
     }
 }

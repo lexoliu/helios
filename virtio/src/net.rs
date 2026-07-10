@@ -277,6 +277,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         };
         let accepted = offered
             & (VirtioFeatures::VERSION_1.bits()
+                | VirtioFeatures::RING_EVENT_IDX.bits()
                 | NET_FEATURE_CSUM
                 | NET_FEATURE_MAC
                 | NET_FEATURE_STATUS
@@ -330,8 +331,11 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 return Err(IoError::Unsupported);
             }
 
+            let event_idx = accepted & VirtioFeatures::RING_EVENT_IDX.bits() != 0;
             let mut rx_queue = VirtQueue::new(&transport, rx_queue_index, rx_queue_size)?;
-            let tx_queue = VirtQueue::new(&transport, tx_queue_index, tx_queue_size)?;
+            rx_queue.set_event_idx(event_idx);
+            let mut tx_queue = VirtQueue::new(&transport, tx_queue_index, tx_queue_size)?;
+            tx_queue.set_event_idx(event_idx);
             let rx_buffer_count = usize::from(rx_queue_size);
             let rx_returned = Arc::new(RxReturnedTokens {
                 tokens: SpinMutex::new(Vec::with_capacity(rx_buffer_count)),
@@ -399,7 +403,8 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             let ctrl_index = device_max * 2;
             let ctrl_size = transport.queue_max_size(ctrl_index).min(NET_QUEUE_SIZE);
             if ctrl_size != 0 && ctrl_size.is_power_of_two() {
-                let queue = VirtQueue::new(&transport, ctrl_index, ctrl_size)?;
+                let mut queue = VirtQueue::new(&transport, ctrl_index, ctrl_size)?;
+                queue.set_event_idx(accepted & VirtioFeatures::RING_EVENT_IDX.bits() != 0);
                 let cmd_buffer = vec![0u8; CTRL_CMD_MAX_BYTES].into_boxed_slice();
                 let ack_buffer = vec![0u8; 1].into_boxed_slice();
                 Some(SpinMutex::new(NetControlState {
