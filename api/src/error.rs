@@ -1,5 +1,12 @@
+//! `std::io::Error` constructors shared by the `fs` and `io` helpers.
+//!
+//! The SDK reports every fault as `std::io::Error` so programs interact
+//! with one error vocabulary; these constructors attach the failing
+//! path or stream and the WASI error code as the message.
+
 use std::io;
 
+/// Result alias used across the SDK's I/O surfaces.
 pub type Result<T> = io::Result<T>;
 
 pub fn missing_root_directory() -> io::Error {

@@ -19,9 +19,15 @@ use futures_lite::future::zip;
 const ROOT_PATH: &str = "/";
 const FILE_READ_RESERVE_CHUNK: usize = 64 * 1024;
 
+/// [`FileSystem`] backed by the program's WASI preopens, rooted at `/`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WasiFileSystem;
 
+/// Async filesystem operations abstracted from the WASI backend, so
+/// program logic can be exercised against a test double.
+///
+/// Paths are absolute, `..` traversal is rejected, and every failure is
+/// a `std::io::Error` naming the offending path.
 pub trait FileSystem {
     fn read(&self, path: &Path) -> impl core::future::Future<Output = Result<Vec<u8>>> + Send;
     fn read_to_string(
@@ -38,14 +44,18 @@ pub trait FileSystem {
     fn is_dir(&self, path: &Path) -> impl core::future::Future<Output = bool> + Send;
 }
 
+/// The WASI-backed [`FileSystem`] value; free functions below are
+/// shorthands for its methods.
 pub const fn wasi_filesystem() -> WasiFileSystem {
     WasiFileSystem
 }
 
+/// Reads the entire file at `path`.
 pub async fn read(path: impl AsRef<Path>) -> Result<Vec<u8>> {
     read_impl(path.as_ref()).await
 }
 
+/// Reads the entire file at `path` as UTF-8.
 pub async fn read_to_string(path: impl AsRef<Path>) -> Result<String> {
     let path = path.as_ref();
     let display = display_path(path);
@@ -53,18 +63,22 @@ pub async fn read_to_string(path: impl AsRef<Path>) -> Result<String> {
     String::from_utf8(bytes).map_err(|source| error::invalid_utf8(&display, source))
 }
 
+/// Creates or truncates the file at `path` and writes `contents`.
 pub async fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> Result<()> {
     write_impl(path.as_ref(), contents.as_ref()).await
 }
 
+/// Whether `path` names an existing file or directory.
 pub async fn exists(path: impl AsRef<Path>) -> bool {
     metadata_type(path).await.is_ok()
 }
 
+/// Whether `path` names an existing regular file.
 pub async fn is_file(path: impl AsRef<Path>) -> bool {
     matches!(metadata_type(path).await, Ok(DescriptorType::RegularFile))
 }
 
+/// Whether `path` names an existing directory.
 pub async fn is_dir(path: impl AsRef<Path>) -> bool {
     matches!(metadata_type(path).await, Ok(DescriptorType::Directory))
 }

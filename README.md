@@ -27,7 +27,10 @@ hardware support lives in thin adaptation crates.
   runtime model, but provisioned and lifecycle-managed by the kernel.
 - **Capability-based resources.** `KernelResource<T, Rights>` carries its own
   rights set; derived handles can only narrow permissions, never widen them.
-- **Three backends.**
+- **Four backends.**
+  - `helios-aarch64` — ARM64 (`aarch64-unknown-none`), Limine protocol boot,
+    PL011 UART, virtio-mmio transport; the fastest surface under HVF on
+    Apple Silicon.
   - `helios-riscv` — RISC-V 64 (`riscv64gc-unknown-none-elf`), SBI-based boot,
     virtio-mmio transport, ns16550a UART.
   - `helios-x86` — x86_64 (`x86_64-unknown-none`), Limine protocol boot,
@@ -47,9 +50,13 @@ hardware support lives in thin adaptation crates.
 | `kernel/` | Hardware-independent runtime: executor, timer, component host, trusted artifact loading, capability resources |
 | `artifact/` | Shared `cwasm` trailer parsing, signing, and trust-boundary helpers |
 | `cli/` | CLI workspace member for offline AOT, signing, and kernel bootfs prebuilds |
+| `aarch64/` | ARM64 backend (Limine boot, PL011, virtio-mmio, HVF-friendly) |
 | `riscv/` | RISC-V 64 backend (boot, trap, virtio, UART) |
 | `x86/` | x86_64 backend (bootloader entry, SMP wakeup, serial, timer) |
 | `hosted/` | Hosted backend that runs the same kernel on a normal OS |
+| `netstack/` | In-kernel TCP/UDP/ICMP network stack with BBRv3 congestion control |
+| `compiler-plugin/` | In-kernel wasm compiler, itself a kernel plugin |
+| `compiler-support/` | Shared AOT engine configuration used by the CLI and plugin |
 | `api/` | Async userland SDK for programs built as wasm components |
 | `api-macro/` | `#[helios_api::main]` proc macro |
 | `kernel-macro/` | Kernel-side proc macros |

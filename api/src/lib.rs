@@ -1,4 +1,11 @@
-//! Async-first userland helpers for Helios components.
+//! Async-first userland SDK for Helios wasm programs.
+//!
+//! Each capability area lives behind a Cargo feature so programs only
+//! link the WIT interfaces they use: `fs`, `io`, `net`, `programs`,
+//! `serial`, `stats`, `sync`, `task`, `tracing`, `profiling`,
+//! `instances`, and `channel`. `bindings` exposes the raw generated WIT
+//! bindings for anything the typed helpers do not cover, and
+//! [`main`](macro@main) wraps a program's async entry point.
 
 pub mod bindings;
 #[cfg(feature = "channel")]
@@ -41,6 +48,12 @@ pub use std::io::Error;
 use std::io::Write as _;
 pub use wit_bindgen;
 
+/// Return values accepted from a `#[helios_api::main]` entry point.
+///
+/// `()` always succeeds; `Result<(), E>` prints the error to stderr and
+/// exits with failure. Implemented here rather than via `Termination`
+/// because the wasm component entry point reports success as a plain
+/// `Result<(), ()>` to the host.
 #[allow(clippy::result_unit_err)]
 pub trait MainOutput {
     fn into_run_result(self) -> core::result::Result<(), ()>;

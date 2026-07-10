@@ -15,7 +15,14 @@ use clap::{Args as ClapArgs, Parser, Subcommand};
 use std::io::Write as _;
 
 #[derive(Debug, Parser)]
-#[command(name = "helios-inspector")]
+#[command(
+    name = "helios-inspector",
+    version,
+    about = "Inspect and drive a Helios guest over the debugger transport",
+    long_about = "Connects to the in-guest debugger component over a serial \
+                  transport (or boots one with `vm`) and exposes the guest \
+                  shell, tracing stream, and live system monitor."
+)]
 struct Args {
     #[command(flatten)]
     serial: SerialOptions,
@@ -81,9 +88,12 @@ pub(crate) struct TracingCommand {
     #[arg(long, default_value_t = 64)]
     limit: u32,
 
+    /// Lowest severity to stream (trace, debug, info, warn, or error).
     #[arg(long)]
     min_level: Option<String>,
 
+    /// Only stream events whose target starts with one of these prefixes;
+    /// repeat the flag to allow several prefixes.
     #[arg(long)]
     target_prefix: Vec<String>,
 }
