@@ -5,7 +5,11 @@ edition.workspace = true
 build = "build.rs"
 
 [features]
-default = ["wasmtime-host"]
+default = ["wasmtime-host", "embedded-debugger"]
+# Autostart of the embedded debugger system component. Production kernels
+# can drop it; the prebuild bootfs contents are controlled separately by
+# the kernel-prebuild manifest.
+embedded-debugger = []
 # Adapter-only runtime support. `wasmtime-wasi-io` must stay behind this
 # feature; the core kernel and HAL no-default path must not depend on it.
 wasmtime-runtime = ["dep:wasmtime", "dep:wasmtime-wasi-io"]

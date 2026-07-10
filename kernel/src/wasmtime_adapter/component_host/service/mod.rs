@@ -503,17 +503,24 @@ where
             run_kernel_processor_forever(cpu, kernel, debug_state);
         }
         ComponentHostProcessorRole::SharedRuntime | ComponentHostProcessorRole::SystemComponent => {
-            let component = crate::embedded_system_component()
-                .unwrap_or_else(|| panic!("embedded init bootfs is missing the system component"));
-            run_embedded_component_forever(
-                component,
-                ComponentBindingSet::System,
-                cpu,
-                &kernel,
-                debug_state,
-                read_serial,
-                write_serial,
-            );
+            match crate::embedded_system_component() {
+                Some(component) => run_embedded_component_forever(
+                    component,
+                    ComponentBindingSet::System,
+                    cpu,
+                    &kernel,
+                    debug_state,
+                    read_serial,
+                    write_serial,
+                ),
+                None => {
+                    assert!(
+                        !cfg!(feature = "embedded-debugger"),
+                        "embedded init bootfs is missing the system component"
+                    );
+                    run_kernel_processor_forever(cpu, kernel, debug_state);
+                }
+            }
         }
     }
 }

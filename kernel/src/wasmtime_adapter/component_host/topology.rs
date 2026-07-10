@@ -11,7 +11,7 @@ pub fn component_host_system_processor(
     bootstrap_processor: ProcessorId,
     processor_count: usize,
 ) -> Option<ProcessorId> {
-    if processor_count == 1 {
+    if processor_count == 1 || !cfg!(feature = "embedded-debugger") {
         return None;
     }
     assert!(

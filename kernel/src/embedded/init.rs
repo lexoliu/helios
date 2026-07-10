@@ -42,8 +42,15 @@ pub fn embedded_boot_component(path: &str) -> Option<EmbeddedComponent> {
     embedded_init().and_then(|init| init.boot_component(path))
 }
 
+/// The embedded debugger system component, when the `embedded-debugger`
+/// feature is enabled and the prebuild bootfs carries it. Kernels built
+/// without the feature never autostart a system component.
 pub fn embedded_system_component() -> Option<EmbeddedComponent> {
-    embedded_boot_component(EMBEDDED_SYSTEM_COMPONENT_PATH)
+    if cfg!(feature = "embedded-debugger") {
+        embedded_boot_component(EMBEDDED_SYSTEM_COMPONENT_PATH)
+    } else {
+        None
+    }
 }
 
 pub fn has_embedded_system_component() -> bool {

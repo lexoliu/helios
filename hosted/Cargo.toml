@@ -3,6 +3,10 @@ name = "helios-hosted"
 version = "0.1.0"
 edition.workspace = true
 
+[features]
+default = ["embedded-debugger"]
+embedded-debugger = ["helios-kernel/embedded-debugger"]
+
 [dependencies]
 blocking = "1.6.2"
 critical-section = { version = "1.2.0", features = ["std"] }
