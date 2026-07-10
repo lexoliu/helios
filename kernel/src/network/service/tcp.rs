@@ -287,7 +287,7 @@ where
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         let max_bytes = max_bytes as usize;
         loop {
-            match self.poll_tcp_read_once(stream, max_bytes, "tcp-read-initial")? {
+            match self.poll_tcp_read_once(stream, max_bytes, TcpReadPhasePrefix::Initial)? {
                 TcpReadProgress::Data(bytes) => return Ok(Some(bytes)),
                 TcpReadProgress::Eof => return Ok(None),
                 TcpReadProgress::Pending => {}
@@ -330,7 +330,11 @@ where
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         let max_bytes = buffer.capacity();
         loop {
-            match self.poll_tcp_read_into_once(stream, &mut buffer, "tcp-read-into-initial")? {
+            match self.poll_tcp_read_into_once(
+                stream,
+                &mut buffer,
+                TcpReadPhasePrefix::IntoInitial,
+            )? {
                 TcpReadIntoState::Data(bytes) => return Ok(Some(bytes)),
                 TcpReadIntoState::Eof => return Ok(None),
                 TcpReadIntoState::Pending => {}
@@ -339,7 +343,11 @@ where
             let drive_started = self.profile_start();
             self.drive_tcp_read_network_burst(max_bytes).await?;
             self.record_network_profile("tcp-read-into-drive-network", drive_started);
-            match self.poll_tcp_read_into_once(stream, &mut buffer, "tcp-read-into-after-drive")? {
+            match self.poll_tcp_read_into_once(
+                stream,
+                &mut buffer,
+                TcpReadPhasePrefix::IntoAfterDrive,
+            )? {
                 TcpReadIntoState::Data(bytes) => return Ok(Some(bytes)),
                 TcpReadIntoState::Eof => return Ok(None),
                 TcpReadIntoState::Pending => {}
@@ -368,7 +376,7 @@ where
         &self,
         stream: TcpStreamId,
         max_bytes: usize,
-        profile_prefix: &'static str,
+        profile_prefix: TcpReadPhasePrefix,
     ) -> Result<TcpReadProgress, TcpError> {
         let started = self.profile_start();
         let now = StackInstant::from_nanos(self.now_nanos());
@@ -384,7 +392,7 @@ where
         &self,
         stream: TcpStreamId,
         buffer: &mut RegisteredTcpReadBuffer<'_>,
-        profile_prefix: &'static str,
+        profile_prefix: TcpReadPhasePrefix,
     ) -> Result<TcpReadIntoState, TcpError> {
         let started = self.profile_start();
         let now = StackInstant::from_nanos(self.now_nanos());
@@ -421,7 +429,7 @@ where
                     Some(NetworkTcpReadProbe {
                         stream,
                         max_bytes,
-                        profile_prefix: "tcp-read-polling",
+                        profile_prefix: TcpReadPhasePrefix::Polling,
                     }),
                     true,
                 )
@@ -476,7 +484,7 @@ where
                     TcpError::from_io(error, NetworkErrorDetail::VirtioAdvanceFailed)
                 })?;
             self.record_network_profile("tcp-read-into-polling-drive-network", drive_started);
-            match self.poll_tcp_read_into_once(stream, buffer, "tcp-read-into-polling")? {
+            match self.poll_tcp_read_into_once(stream, buffer, TcpReadPhasePrefix::IntoPolling)? {
                 ready @ (TcpReadIntoState::Data(_) | TcpReadIntoState::Eof) => return Ok(ready),
                 TcpReadIntoState::Pending => {}
             }
@@ -542,7 +550,7 @@ where
         max_bytes: usize,
     ) -> Result<TcpReadProgress, TcpError> {
         self.drive_tcp_read_network_burst(max_bytes).await?;
-        self.poll_tcp_read_once(stream, max_bytes, "tcp-read-after-drive")
+        self.poll_tcp_read_once(stream, max_bytes, TcpReadPhasePrefix::AfterDrive)
     }
 
     pub(super) async fn drive_tcp_read_network_burst(
@@ -811,43 +819,61 @@ where
 
     pub(super) fn record_tcp_read_progress(
         &self,
-        prefix: &'static str,
+        prefix: TcpReadPhasePrefix,
         start: Option<NetworkPerfStart>,
         read: &TcpReadProgress,
     ) {
         let (phase, bytes) = match read {
-            TcpReadProgress::Pending => (tcp_read_profile_phase(prefix, "pending"), 0),
-            TcpReadProgress::Data(bytes) => (tcp_read_profile_phase(prefix, "ready"), bytes.len()),
-            TcpReadProgress::Eof => (tcp_read_profile_phase(prefix, "eof"), 0),
+            TcpReadProgress::Pending => (
+                tcp_read_profile_phase(prefix, TcpReadPhaseOutcome::Pending),
+                0,
+            ),
+            TcpReadProgress::Data(bytes) => (
+                tcp_read_profile_phase(prefix, TcpReadPhaseOutcome::Ready),
+                bytes.len(),
+            ),
+            TcpReadProgress::Eof => (tcp_read_profile_phase(prefix, TcpReadPhaseOutcome::Eof), 0),
         };
         self.record_network_profile_events_bytes(phase, start, 1, bytes);
     }
 
     pub(super) fn record_tcp_read_progress_between(
         &self,
-        prefix: &'static str,
+        prefix: TcpReadPhasePrefix,
         start: Option<NetworkPerfStart>,
         end: Option<NetworkPerfStart>,
         read: &TcpReadProgress,
     ) {
         let (phase, bytes) = match read {
-            TcpReadProgress::Pending => (tcp_read_profile_phase(prefix, "pending"), 0),
-            TcpReadProgress::Data(bytes) => (tcp_read_profile_phase(prefix, "ready"), bytes.len()),
-            TcpReadProgress::Eof => (tcp_read_profile_phase(prefix, "eof"), 0),
+            TcpReadProgress::Pending => (
+                tcp_read_profile_phase(prefix, TcpReadPhaseOutcome::Pending),
+                0,
+            ),
+            TcpReadProgress::Data(bytes) => (
+                tcp_read_profile_phase(prefix, TcpReadPhaseOutcome::Ready),
+                bytes.len(),
+            ),
+            TcpReadProgress::Eof => (tcp_read_profile_phase(prefix, TcpReadPhaseOutcome::Eof), 0),
         };
         self.record_network_profile_events_bytes_between(phase, start, end, 1, bytes);
     }
 
     pub(super) fn record_tcp_read_into_progress(
         &self,
-        prefix: &'static str,
+        prefix: TcpReadPhasePrefix,
         start: Option<NetworkPerfStart>,
         read: &TcpReadIntoState,
     ) {
         let (phase, bytes) = match read {
-            TcpReadIntoState::Pending => (tcp_read_profile_phase(prefix, "pending"), 0),
-            TcpReadIntoState::Data(bytes) => (tcp_read_profile_phase(prefix, "ready"), *bytes),
-            TcpReadIntoState::Eof => (tcp_read_profile_phase(prefix, "eof"), 0),
+            TcpReadIntoState::Pending => (
+                tcp_read_profile_phase(prefix, TcpReadPhaseOutcome::Pending),
+                0,
+            ),
+            TcpReadIntoState::Data(bytes) => (
+                tcp_read_profile_phase(prefix, TcpReadPhaseOutcome::Ready),
+                *bytes,
+            ),
+            TcpReadIntoState::Eof => (tcp_read_profile_phase(prefix, TcpReadPhaseOutcome::Eof), 0),
         };
         self.record_network_profile_events_bytes(phase, start, 1, bytes);
     }

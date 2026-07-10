@@ -18,7 +18,7 @@ pub(super) struct NetworkPollProgress {
 pub(super) struct NetworkTcpReadProbe {
     pub(super) stream: TcpStreamId,
     pub(super) max_bytes: usize,
-    pub(super) profile_prefix: &'static str,
+    pub(super) profile_prefix: TcpReadPhasePrefix,
 }
 
 pub(super) struct NetworkPollOutcome {
@@ -571,17 +571,52 @@ pub(super) fn adjust_poll_budget(
     current
 }
 
-pub(super) fn tcp_read_profile_phase(prefix: &'static str, outcome: &'static str) -> &'static str {
+/// TCP read call sites that record profile phases. Typed so a new read
+/// path cannot reach profiling without extending the exhaustive phase
+/// table below; the old stringly table panicked at runtime when the
+/// registered-buffer reads introduced prefixes it never listed.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum TcpReadPhasePrefix {
+    Initial,
+    AfterDrive,
+    Polling,
+    IntoInitial,
+    IntoAfterDrive,
+    IntoPolling,
+}
+
+/// Read progress outcome folded into the recorded phase name.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum TcpReadPhaseOutcome {
+    Pending,
+    Ready,
+    Eof,
+}
+
+pub(super) const fn tcp_read_profile_phase(
+    prefix: TcpReadPhasePrefix,
+    outcome: TcpReadPhaseOutcome,
+) -> &'static str {
+    use TcpReadPhaseOutcome as Outcome;
+    use TcpReadPhasePrefix as Prefix;
     match (prefix, outcome) {
-        ("tcp-read-initial", "pending") => "tcp-read-initial-pending",
-        ("tcp-read-initial", "ready") => "tcp-read-initial-ready",
-        ("tcp-read-initial", "eof") => "tcp-read-initial-eof",
-        ("tcp-read-after-drive", "pending") => "tcp-read-after-drive-pending",
-        ("tcp-read-after-drive", "ready") => "tcp-read-after-drive-ready",
-        ("tcp-read-after-drive", "eof") => "tcp-read-after-drive-eof",
-        ("tcp-read-polling", "pending") => "tcp-read-polling-pending",
-        ("tcp-read-polling", "ready") => "tcp-read-polling-ready",
-        ("tcp-read-polling", "eof") => "tcp-read-polling-eof",
-        _ => panic!("unknown TCP read profile phase"),
+        (Prefix::Initial, Outcome::Pending) => "tcp-read-initial-pending",
+        (Prefix::Initial, Outcome::Ready) => "tcp-read-initial-ready",
+        (Prefix::Initial, Outcome::Eof) => "tcp-read-initial-eof",
+        (Prefix::AfterDrive, Outcome::Pending) => "tcp-read-after-drive-pending",
+        (Prefix::AfterDrive, Outcome::Ready) => "tcp-read-after-drive-ready",
+        (Prefix::AfterDrive, Outcome::Eof) => "tcp-read-after-drive-eof",
+        (Prefix::Polling, Outcome::Pending) => "tcp-read-polling-pending",
+        (Prefix::Polling, Outcome::Ready) => "tcp-read-polling-ready",
+        (Prefix::Polling, Outcome::Eof) => "tcp-read-polling-eof",
+        (Prefix::IntoInitial, Outcome::Pending) => "tcp-read-into-initial-pending",
+        (Prefix::IntoInitial, Outcome::Ready) => "tcp-read-into-initial-ready",
+        (Prefix::IntoInitial, Outcome::Eof) => "tcp-read-into-initial-eof",
+        (Prefix::IntoAfterDrive, Outcome::Pending) => "tcp-read-into-after-drive-pending",
+        (Prefix::IntoAfterDrive, Outcome::Ready) => "tcp-read-into-after-drive-ready",
+        (Prefix::IntoAfterDrive, Outcome::Eof) => "tcp-read-into-after-drive-eof",
+        (Prefix::IntoPolling, Outcome::Pending) => "tcp-read-into-polling-pending",
+        (Prefix::IntoPolling, Outcome::Ready) => "tcp-read-into-polling-ready",
+        (Prefix::IntoPolling, Outcome::Eof) => "tcp-read-into-polling-eof",
     }
 }
