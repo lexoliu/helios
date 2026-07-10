@@ -542,6 +542,39 @@ impl<'a> TcpPacket<'a> {
         )
     }
 
+    /// Encodes only the TCP header and options for a scatter frame whose
+    /// payload is transmitted from its own buffer: the payload length is
+    /// folded into the pseudo-header checksum seed, so this encoding is
+    /// only valid together with transmit checksum offload.
+    pub fn encode_headers_scatter(
+        output: &mut [u8],
+        source: IpAddress,
+        destination: IpAddress,
+        header: TcpHeader,
+        options: TcpHeaderOptions,
+        payload_len: usize,
+    ) -> Option<usize> {
+        let options_len = options.encoded_len();
+        let header_len = Self::MIN_HEADER_LEN.checked_add(options_len)?;
+        let data_offset_words = u8::try_from(header_len / 4).ok()?;
+        if output.len() < header_len {
+            return None;
+        }
+        output[..header_len].fill(0);
+        write_u16(output, 0, header.source_port)?;
+        write_u16(output, 2, header.destination_port)?;
+        write_u32(output, 4, header.sequence)?;
+        write_u32(output, 8, header.acknowledgement)?;
+        output[12] = data_offset_words << 4;
+        output[13] = header.flags.bits() as u8;
+        write_u16(output, 14, header.window_size)?;
+        options.encode(&mut output[Self::MIN_HEADER_LEN..header_len])?;
+        let segment_len = header_len.checked_add(payload_len)?;
+        let field = tcp_pseudo_header_checksum(source, destination, segment_len);
+        write_u16(output, 16, field)?;
+        Some(header_len)
+    }
+
     pub fn encode_with_options(
         output: &mut [u8],
         source: IpAddress,

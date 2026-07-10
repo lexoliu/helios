@@ -473,6 +473,22 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     /// least 1; greater than 1 only when both `VIRTIO_NET_F_MQ` and
     /// `VIRTIO_NET_F_CTRL_VQ` were negotiated and the device
     /// advertised multiple pairs.
+    /// Descriptors in each TX queue: bounds the completion tokens a
+    /// zero-copy caller must be able to pin payloads for.
+    pub fn tx_queue_depth(&self) -> usize {
+        usize::from(NET_QUEUE_SIZE)
+    }
+
+    /// Queue topology as the netstack capability struct.
+    pub fn queue_topology(&self) -> helios_netstack::QueueTopology {
+        helios_netstack::QueueTopology {
+            rx_queues: self.queue_pair_count(),
+            tx_queues: self.queue_pair_count(),
+            tx_queue_depth: self.tx_queue_depth(),
+            rss: false,
+        }
+    }
+
     pub fn queue_pair_count(&self) -> usize {
         self.queue_pairs.len()
     }

@@ -93,6 +93,9 @@ pub struct QueueTopology {
     pub rx_queues: usize,
     /// Number of transmit queues available to the stack.
     pub tx_queues: usize,
+    /// Descriptors per transmit queue; bounds the completion tokens a
+    /// zero-copy transmitter must be able to pin payloads for.
+    pub tx_queue_depth: usize,
     /// Receive-side scaling hash can steer flows across receive queues.
     pub rss: bool,
 }
@@ -146,6 +149,10 @@ pub struct PacketBuffer {
     bytes: [u8; ETHERNET_FRAME_BYTES],
     len: usize,
     tx_checksum: Option<TxChecksum>,
+    /// Scatter payload following the encoded headers: the wire frame is
+    /// `bytes[..len]` ++ `payload`. Refcounted so transmit paths can pin
+    /// it until device completion without copying.
+    payload: Option<Bytes>,
 }
 
 /// Transmit checksum metadata for a frame whose transport checksum the
@@ -160,9 +167,12 @@ pub struct TxChecksum {
 
 /// Borrowed transmit frame plus its checksum-offload metadata, handed
 /// to [`NetworkInterface`] slice transmit entry points.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct TxFrameRef<'a> {
     pub bytes: &'a [u8],
+    /// Scatter payload following `bytes` on the wire; borrowed as the
+    /// refcounted handle so transmit paths can pin it cheaply.
+    pub payload: Option<&'a Bytes>,
     pub checksum: Option<TxChecksum>,
 }
 
@@ -173,7 +183,23 @@ impl PacketBuffer {
             bytes: [0; ETHERNET_FRAME_BYTES],
             len: 0,
             tx_checksum: None,
+            payload: None,
         }
+    }
+
+    /// Scatter payload that follows the encoded header bytes on the wire.
+    pub fn payload(&self) -> Option<&Bytes> {
+        self.payload.as_ref()
+    }
+
+    /// Attaches or clears the scatter payload.
+    pub fn set_payload(&mut self, payload: Option<Bytes>) {
+        self.payload = payload;
+    }
+
+    /// Total wire length: encoded headers plus any scatter payload.
+    pub fn wire_len(&self) -> usize {
+        self.len + self.payload.as_ref().map_or(0, Bytes::len)
     }
 
     /// Checksum-offload metadata attached by the stack's encoders.
@@ -190,6 +216,7 @@ impl PacketBuffer {
     pub fn as_tx_frame(&self) -> TxFrameRef<'_> {
         TxFrameRef {
             bytes: self.as_slice(),
+            payload: self.payload.as_ref(),
             checksum: self.tx_checksum,
         }
     }
@@ -223,10 +250,12 @@ impl PacketBuffer {
         self.len = len;
     }
 
-    /// Clears initialized length and metadata without modifying storage.
+    /// Clears initialized length, metadata, and payload without
+    /// modifying storage.
     pub fn clear(&mut self) {
         self.len = 0;
         self.tx_checksum = None;
+        self.payload = None;
     }
 }
 
@@ -397,6 +426,34 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
     ) -> IoResult<Option<usize>> {
         let _ = queue_idx;
         self.try_transmit_slices_immediate(frames)
+    }
+
+    /// Zero-copy transmit: headers are copied into the device slot but
+    /// each frame's scatter payload is read in place. Accepted frames
+    /// report a completion token through `tokens`; the caller must keep
+    /// the payload bytes alive until
+    /// `reclaim_transmit_tokens_immediate_on` reports that token.
+    /// Devices without in-place DMA leave the default (None) so callers
+    /// fall back to the copying paths.
+    fn try_transmit_scatter_immediate_on(
+        &self,
+        queue_idx: usize,
+        frames: &[TxFrameRef<'_>],
+        tokens: &mut [Option<u16>],
+    ) -> IoResult<Option<usize>> {
+        let _ = (queue_idx, frames, tokens);
+        Ok(None)
+    }
+
+    /// Reports completed transmit tokens so zero-copy payload pins can
+    /// be released.
+    fn reclaim_transmit_tokens_immediate_on(
+        &self,
+        queue_idx: usize,
+        tokens: &mut [Option<u16>],
+    ) -> IoResult<Option<usize>> {
+        let _ = (queue_idx, tokens);
+        Ok(None)
     }
 
     /// Reclaims completed transmit slots without waiting for new device events.

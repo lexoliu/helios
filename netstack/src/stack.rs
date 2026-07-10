@@ -94,10 +94,41 @@ pub struct StackConfig {
     /// let the device finish them; enabled by the embedding kernel only
     /// when the interface negotiated transmit checksum offload.
     pub tx_checksum_offload: bool,
+    /// Emit bulk TCP data as scatter frames (headers in the packet
+    /// buffer, payload attached as refcounted bytes the device reads in
+    /// place). Requires tx_checksum_offload and a device whose DMA can
+    /// read borrowed packet bytes.
+    pub zero_copy_tx: bool,
 }
 
 /// Byte offset of the checksum field inside a TCP header.
 const TCP_CHECKSUM_FIELD_OFFSET: u16 = 16;
+/// Minimum payload for the scatter transmit path; smaller segments copy
+/// faster than the extra descriptor costs.
+const TCP_SCATTER_MIN_PAYLOAD_BYTES: usize = 512;
+
+/// How a queued TCP segment carries its payload to the frame encoders.
+#[derive(Clone, Copy)]
+enum TcpTxPayload<'a> {
+    /// Payload bytes are copied into the packet buffer.
+    Flat(&'a [u8]),
+    /// Payload stays in its refcounted buffer and is attached to the
+    /// frame for in-place device reads.
+    Scatter(&'a Bytes),
+}
+
+impl TcpTxPayload<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Flat(bytes) => bytes.len(),
+            Self::Scatter(bytes) => bytes.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 /// Byte offset of the checksum field inside a UDP header.
 const UDP_CHECKSUM_FIELD_OFFSET: u16 = 6;
 
@@ -120,6 +151,7 @@ impl StackConfig {
             rx_budget: DEFAULT_POLL_BUDGET,
             rx_checksum_offload: RxChecksumOffload::none(),
             tx_checksum_offload: false,
+            zero_copy_tx: false,
         }
     }
 
@@ -130,6 +162,11 @@ impl StackConfig {
 
     pub const fn with_tx_checksum_offload(mut self, enabled: bool) -> Self {
         self.tx_checksum_offload = enabled;
+        self
+    }
+
+    pub const fn with_zero_copy_tx(mut self, enabled: bool) -> Self {
+        self.zero_copy_tx = enabled;
         self
     }
 
@@ -2774,7 +2811,15 @@ where
         }
 
         for (index, local, remote, header, options) in pending_syn {
-            if self.queue_tcp(local, remote, header, options, &[], index as u16, now)? {
+            if self.queue_tcp(
+                local,
+                remote,
+                header,
+                options,
+                TcpTxPayload::Flat(&[]),
+                index as u16,
+                now,
+            )? {
                 let socket = self
                     .tcp
                     .get_mut(index)
@@ -2784,7 +2829,15 @@ where
             }
         }
         for (index, local, remote, header, options) in pending_syn_ack {
-            if self.queue_tcp(local, remote, header, options, &[], index as u16, now)? {
+            if self.queue_tcp(
+                local,
+                remote,
+                header,
+                options,
+                TcpTxPayload::Flat(&[]),
+                index as u16,
+                now,
+            )? {
                 let socket = self
                     .tcp
                     .get_mut(index)
@@ -2794,7 +2847,15 @@ where
             }
         }
         for (index, local, remote, header, options) in pending_ack {
-            if self.queue_tcp(local, remote, header, options, &[], index as u16, now)? {
+            if self.queue_tcp(
+                local,
+                remote,
+                header,
+                options,
+                TcpTxPayload::Flat(&[]),
+                index as u16,
+                now,
+            )? {
                 let socket = self
                     .tcp
                     .get_mut(index)
@@ -2811,7 +2872,7 @@ where
                 segment.remote,
                 segment.header,
                 segment.options,
-                &segment.payload,
+                self.tcp_tx_payload(&segment.payload),
                 identification,
                 now,
             )? {
@@ -2830,7 +2891,7 @@ where
                 segment.remote,
                 segment.header,
                 segment.options,
-                &segment.payload,
+                self.tcp_tx_payload(&segment.payload),
                 identification,
                 now,
             )?;
@@ -3238,13 +3299,27 @@ where
         }
     }
 
+    /// Chooses the payload representation for a queued data segment:
+    /// scatter when zero-copy transmit is on, offload seeds the
+    /// checksum, and the payload is large enough to beat the copy.
+    fn tcp_tx_payload<'a>(&self, payload: &'a Bytes) -> TcpTxPayload<'a> {
+        if self.config.zero_copy_tx
+            && self.config.tx_checksum_offload
+            && payload.len() >= TCP_SCATTER_MIN_PAYLOAD_BYTES
+        {
+            TcpTxPayload::Scatter(payload)
+        } else {
+            TcpTxPayload::Flat(payload)
+        }
+    }
+
     fn queue_tcp(
         &mut self,
         local: TcpEndpoint,
         remote: TcpEndpoint,
         header: TcpHeader,
         options: TcpHeaderOptions,
-        payload: &[u8],
+        payload: TcpTxPayload<'_>,
         identification: u16,
         now: StackInstant,
     ) -> Result<bool, StackError> {
@@ -3271,7 +3346,7 @@ where
         destination: Ipv4Address,
         header: TcpHeader,
         options: TcpHeaderOptions,
-        payload: &[u8],
+        payload: TcpTxPayload<'_>,
         identification: u16,
         now: StackInstant,
     ) -> Result<bool, StackError> {
@@ -3297,7 +3372,7 @@ where
 
         let checksum = self.transport_checksum();
         let local_mac = self.config.mac;
-        if is_replaceable_tcp_ack(header, payload) {
+        if payload.is_empty() && is_replaceable_tcp_ack(header, &[]) {
             return self.queue_tcp_ack_frame(
                 TcpAckReplaceKey {
                     local: TcpEndpoint {
@@ -3350,7 +3425,7 @@ where
         destination: Ipv6Address,
         header: TcpHeader,
         options: TcpHeaderOptions,
-        payload: &[u8],
+        payload: TcpTxPayload<'_>,
         now: StackInstant,
     ) -> Result<bool, StackError> {
         let tcp_len = TcpPacket::MIN_HEADER_LEN
@@ -3375,7 +3450,7 @@ where
 
         let checksum = self.transport_checksum();
         let local_mac = self.config.mac;
-        if is_replaceable_tcp_ack(header, payload) {
+        if payload.is_empty() && is_replaceable_tcp_ack(header, &[]) {
             return self.queue_tcp_ack_frame(
                 TcpAckReplaceKey {
                     local: TcpEndpoint {
@@ -3983,7 +4058,7 @@ where
                     reset.remote,
                     reset.header,
                     TcpHeaderOptions::empty(),
-                    &[],
+                    TcpTxPayload::Flat(&[]),
                     packet.acknowledgement as u16,
                     now,
                 )?;
@@ -4035,7 +4110,7 @@ where
                 reset.remote,
                 reset.header,
                 TcpHeaderOptions::empty(),
-                &[],
+                TcpTxPayload::Flat(&[]),
                 packet.sequence as u16,
                 now,
             )?;
@@ -4942,7 +5017,7 @@ fn encode_tcp_ipv4_frame(
     destination: Ipv4Address,
     header: TcpHeader,
     options: TcpHeaderOptions,
-    payload: &[u8],
+    payload: TcpTxPayload<'_>,
     identification: u16,
     checksum: TransportChecksum,
 ) -> Result<(), StackError> {
@@ -4965,17 +5040,38 @@ fn encode_tcp_ipv4_frame(
     )
     .ok_or(StackError::OutputQueueFull)?;
     let transport_offset = offset;
-    offset += TcpPacket::encode_with_options(
-        &mut storage[offset..],
-        IpAddress::Ipv4(source),
-        IpAddress::Ipv4(destination),
-        header,
-        options,
-        payload,
-        checksum,
-    )
-    .ok_or(StackError::OutputQueueFull)?;
-    frame.set_len(offset);
+    match payload {
+        TcpTxPayload::Flat(payload) => {
+            offset += TcpPacket::encode_with_options(
+                &mut storage[offset..],
+                IpAddress::Ipv4(source),
+                IpAddress::Ipv4(destination),
+                header,
+                options,
+                payload,
+                checksum,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            frame.set_len(offset);
+        }
+        TcpTxPayload::Scatter(payload) => {
+            assert!(
+                matches!(checksum, TransportChecksum::DeviceOffload),
+                "scatter TCP frames require transmit checksum offload"
+            );
+            offset += TcpPacket::encode_headers_scatter(
+                &mut storage[offset..],
+                IpAddress::Ipv4(source),
+                IpAddress::Ipv4(destination),
+                header,
+                options,
+                payload.len(),
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            frame.set_len(offset);
+            frame.set_payload(Some(payload.clone()));
+        }
+    }
     if matches!(checksum, TransportChecksum::DeviceOffload) {
         frame.set_tx_checksum(Some(TxChecksum {
             start: transport_offset as u16,
@@ -4993,7 +5089,7 @@ fn encode_tcp_ipv6_frame(
     destination: Ipv6Address,
     header: TcpHeader,
     options: TcpHeaderOptions,
-    payload: &[u8],
+    payload: TcpTxPayload<'_>,
     checksum: TransportChecksum,
 ) -> Result<(), StackError> {
     let storage = frame.storage_mut();
@@ -5014,17 +5110,38 @@ fn encode_tcp_ipv6_frame(
     )
     .ok_or(StackError::OutputQueueFull)?;
     let transport_offset = offset;
-    offset += TcpPacket::encode_with_options(
-        &mut storage[offset..],
-        IpAddress::Ipv6(source),
-        IpAddress::Ipv6(destination),
-        header,
-        options,
-        payload,
-        checksum,
-    )
-    .ok_or(StackError::OutputQueueFull)?;
-    frame.set_len(offset);
+    match payload {
+        TcpTxPayload::Flat(payload) => {
+            offset += TcpPacket::encode_with_options(
+                &mut storage[offset..],
+                IpAddress::Ipv6(source),
+                IpAddress::Ipv6(destination),
+                header,
+                options,
+                payload,
+                checksum,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            frame.set_len(offset);
+        }
+        TcpTxPayload::Scatter(payload) => {
+            assert!(
+                matches!(checksum, TransportChecksum::DeviceOffload),
+                "scatter TCP frames require transmit checksum offload"
+            );
+            offset += TcpPacket::encode_headers_scatter(
+                &mut storage[offset..],
+                IpAddress::Ipv6(source),
+                IpAddress::Ipv6(destination),
+                header,
+                options,
+                payload.len(),
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            frame.set_len(offset);
+            frame.set_payload(Some(payload.clone()));
+        }
+    }
     if matches!(checksum, TransportChecksum::DeviceOffload) {
         frame.set_tx_checksum(Some(TxChecksum {
             start: transport_offset as u16,
@@ -5209,6 +5326,7 @@ mod tests {
     use super::*;
     use crate::NewReno;
     use crate::TcpFlags;
+    use alloc::vec;
 
     const LOCAL_MAC: EthernetAddress = [0x02, 0, 0, 0, 0, 1];
     const PEER_MAC: EthernetAddress = [0x02, 0, 0, 0, 0, 2];
@@ -5895,7 +6013,7 @@ mod tests {
                     peer,
                     queued,
                     TcpHeaderOptions::empty(),
-                    &[],
+                    TcpTxPayload::Flat(&[]),
                     1,
                     StackInstant::from_nanos(1),
                 )
@@ -5908,7 +6026,7 @@ mod tests {
                     peer,
                     replacement,
                     TcpHeaderOptions::empty(),
-                    &[],
+                    TcpTxPayload::Flat(&[]),
                     2,
                     StackInstant::from_nanos(2),
                 )
@@ -5960,7 +6078,7 @@ mod tests {
                     peer,
                     queued,
                     TcpHeaderOptions::empty(),
-                    &[],
+                    TcpTxPayload::Flat(&[]),
                     1,
                     StackInstant::from_nanos(1),
                 )
@@ -5973,7 +6091,7 @@ mod tests {
                     peer,
                     next_sequence,
                     TcpHeaderOptions::empty(),
-                    &[],
+                    TcpTxPayload::Flat(&[]),
                     2,
                     StackInstant::from_nanos(2),
                 )
@@ -6942,6 +7060,78 @@ mod tests {
             "device-completed checksum must validate in software"
         );
         assert!(stack.take_outbound().is_none());
+    }
+
+    #[test]
+    fn scatter_tcp_send_attaches_payload_and_seeds_pseudo_sum() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer_addr = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(
+            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES)
+                .with_tx_checksum_offload(true)
+                .with_zero_copy_tx(true),
+        );
+        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(peer_addr),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+
+        let header = TcpHeader {
+            source_port: 40000,
+            destination_port: 80,
+            sequence: 1,
+            acknowledgement: 1,
+            flags: TcpFlags::ACK,
+            window_size: u16::MAX,
+        };
+        let payload = Bytes::from(vec![0x5a_u8; TCP_SCATTER_MIN_PAYLOAD_BYTES]);
+        assert!(
+            stack
+                .queue_tcp_ipv4(
+                    local,
+                    peer_addr,
+                    header,
+                    TcpHeaderOptions::empty(),
+                    TcpTxPayload::Scatter(&payload),
+                    1,
+                    StackInstant::from_nanos(1),
+                )
+                .expect("scatter TCP segment should queue")
+        );
+
+        let frame = stack
+            .take_outbound()
+            .expect("scatter frame should be queued");
+        let attached = frame.payload().expect("scatter frame keeps its payload");
+        assert_eq!(attached.len(), payload.len());
+        assert_eq!(attached.as_ref(), payload.as_ref());
+        // Header buffer holds only the framing, not the payload bytes.
+        assert!(frame.as_slice().len() < payload.len());
+        let transport_offset = EthernetFrame::HEADER_LEN + Ipv4Packet::MIN_HEADER_LEN;
+        let metadata = frame
+            .tx_checksum()
+            .expect("scatter frame carries offload metadata");
+        assert_eq!(metadata.start as usize, transport_offset);
+        assert_eq!(metadata.offset, 16);
+
+        // The seeded checksum equals the software pseudo-header sum over
+        // the full segment length (headers + scattered payload).
+        let segment_len = frame.as_slice().len() - transport_offset + payload.len();
+        let seeded = u16::from_be_bytes([
+            frame.as_slice()[transport_offset + 16],
+            frame.as_slice()[transport_offset + 17],
+        ]);
+        assert_eq!(
+            seeded,
+            crate::tcp_pseudo_header_checksum(
+                IpAddress::Ipv4(local),
+                IpAddress::Ipv4(peer_addr),
+                segment_len,
+            )
+        );
     }
 
     #[test]
