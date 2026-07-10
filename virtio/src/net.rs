@@ -21,6 +21,9 @@ const DESCRIPTOR_BITSET_WORDS: usize =
     (NET_QUEUE_SIZE as usize + usize::BITS as usize - 1) / usize::BITS as usize;
 const ETH_HEADER_LEN: usize = 14;
 const DEFAULT_IP_MTU: usize = 1500;
+/// VIRTIO_NET_F_CSUM: the driver may submit frames with partial
+/// checksums that the device completes from csum_start/csum_offset.
+const NET_FEATURE_CSUM: u64 = 1 << 0;
 const NET_FEATURE_MAC: u64 = 1 << 5;
 const NET_FEATURE_STATUS: u64 = 1 << 16;
 const NET_FEATURE_MTU: u64 = 1 << 3;
@@ -54,6 +57,77 @@ const CTRL_MQ_PAIRS_CMD_BYTES: usize = 4;
 /// Maximum command payload size the control queue scratch buffer
 /// is sized for. Currently only `VQ_PAIRS_SET` is sent.
 const CTRL_CMD_MAX_BYTES: usize = CTRL_MQ_PAIRS_CMD_BYTES;
+
+/// Checksum-offload metadata for one transmit frame: the device
+/// finishes the one's-complement sum from byte `start` of the frame and
+/// stores the complemented result at `start + offset`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TxChecksumMeta {
+    pub start: u16,
+    pub offset: u16,
+}
+
+/// Borrowed transmit frame plus checksum-offload metadata.
+#[derive(Clone, Copy, Debug)]
+pub struct TxFrameDescriptor<'a> {
+    pub bytes: &'a [u8],
+    pub checksum: Option<TxChecksumMeta>,
+}
+
+/// A frame acceptable to the transmit entry points. Plain byte slices
+/// transmit with no offload; [`TxFrameDescriptor`] carries checksum
+/// metadata into the virtio-net header.
+pub trait TxFrame {
+    fn frame_bytes(&self) -> &[u8];
+    fn tx_checksum(&self) -> Option<TxChecksumMeta> {
+        None
+    }
+}
+
+impl TxFrame for &[u8] {
+    fn frame_bytes(&self) -> &[u8] {
+        self
+    }
+}
+
+impl TxFrame for TxFrameDescriptor<'_> {
+    fn frame_bytes(&self) -> &[u8] {
+        self.bytes
+    }
+
+    fn tx_checksum(&self) -> Option<TxChecksumMeta> {
+        self.checksum
+    }
+}
+
+impl TxFrame for helios_netstack::TxFrameRef<'_> {
+    fn frame_bytes(&self) -> &[u8] {
+        self.bytes
+    }
+
+    fn tx_checksum(&self) -> Option<TxChecksumMeta> {
+        self.checksum.map(|checksum| TxChecksumMeta {
+            start: checksum.start,
+            offset: checksum.offset,
+        })
+    }
+}
+
+impl TxFrame for helios_netstack::PacketBuffer {
+    fn frame_bytes(&self) -> &[u8] {
+        self.as_slice()
+    }
+
+    fn tx_checksum(&self) -> Option<TxChecksumMeta> {
+        helios_netstack::PacketBuffer::tx_checksum(self).map(|checksum| TxChecksumMeta {
+            start: checksum.start,
+            offset: checksum.offset,
+        })
+    }
+}
+
+/// VIRTIO_NET_HDR_F_NEEDS_CSUM: csum_start/csum_offset are valid.
+const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -132,6 +206,9 @@ pub struct VirtioNetDevice<T: VirtioTransport> {
     mac_address: [u8; 6],
     max_frame_len: usize,
     header_len: usize,
+    /// VIRTIO_NET_F_CSUM was negotiated: frames may carry partial
+    /// checksums for the device to finish.
+    tx_checksum_negotiated: bool,
 }
 
 /// Control queue state: a single descriptor pair (header bytes
@@ -200,6 +277,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         };
         let accepted = offered
             & (VirtioFeatures::VERSION_1.bits()
+                | NET_FEATURE_CSUM
                 | NET_FEATURE_MAC
                 | NET_FEATURE_STATUS
                 | NET_FEATURE_MTU
@@ -362,6 +440,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             mac_address,
             max_frame_len,
             header_len,
+            tx_checksum_negotiated: accepted & NET_FEATURE_CSUM != 0,
         };
 
         // Activate every queue pair on the device side. The device
@@ -426,6 +505,12 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     pub fn handle_interrupt(&self) {
         self.transport.ack_interrupt();
         self.interrupts.notify_one();
+    }
+
+    /// Whether VIRTIO_NET_F_CSUM was negotiated, allowing frames with
+    /// partial checksums the device finishes on transmit.
+    pub fn tx_checksum_negotiated(&self) -> bool {
+        self.tx_checksum_negotiated
     }
 
     pub fn mac_address(&self) -> [u8; 6] {
@@ -578,7 +663,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
 
     pub async fn try_transmit_frames<Frame>(&self, frames: &[Frame]) -> IoResult<usize>
     where
-        Frame: AsRef<[u8]>,
+        Frame: TxFrame,
     {
         self.try_transmit_frames_on_pair(0, frames).await
     }
@@ -593,7 +678,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         frames: &[Frame],
     ) -> IoResult<usize>
     where
-        Frame: AsRef<[u8]>,
+        Frame: TxFrame,
     {
         self.validate_tx_frames(frames)?;
         let pair_idx = self.normalize_pair_idx(pair_idx);
@@ -605,7 +690,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
 
     pub fn try_transmit_frames_immediate<Frame>(&self, frames: &[Frame]) -> IoResult<Option<usize>>
     where
-        Frame: AsRef<[u8]>,
+        Frame: TxFrame,
     {
         self.try_transmit_frames_immediate_on_pair(0, frames)
     }
@@ -616,7 +701,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         frames: &[Frame],
     ) -> IoResult<Option<usize>>
     where
-        Frame: AsRef<[u8]>,
+        Frame: TxFrame,
     {
         self.validate_tx_frames(frames)?;
         self.try_transmit_valid_frames_immediate(self.normalize_pair_idx(pair_idx), frames)
@@ -634,7 +719,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         frames: &[Frame],
     ) -> IoResult<Option<usize>>
     where
-        Frame: AsRef<[u8]>,
+        Frame: TxFrame,
     {
         self.try_transmit_trusted_frames_immediate_on_pair(0, frames)
     }
@@ -645,7 +730,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         frames: &[Frame],
     ) -> IoResult<Option<usize>>
     where
-        Frame: AsRef<[u8]>,
+        Frame: TxFrame,
     {
         self.try_transmit_valid_frames_immediate(self.normalize_pair_idx(pair_idx), frames)
     }
@@ -656,7 +741,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         frames: &[Frame],
     ) -> IoResult<Option<usize>>
     where
-        Frame: AsRef<[u8]>,
+        Frame: TxFrame,
     {
         let Some(mut state) = self.queue_pairs[pair_idx].tx_state.try_lock() else {
             return Ok(None);
@@ -684,7 +769,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         wait: Wait,
     ) -> IoResult<()>
     where
-        Frame: AsRef<[u8]>,
+        Frame: TxFrame,
         Wait: FnMut() -> Fut,
         Fut: Future<Output = ()>,
     {
@@ -699,7 +784,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         mut wait: Wait,
     ) -> IoResult<()>
     where
-        Frame: AsRef<[u8]>,
+        Frame: TxFrame,
         Wait: FnMut() -> Fut,
         Fut: Future<Output = ()>,
     {
@@ -732,10 +817,10 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
 
     fn validate_tx_frames<Frame>(&self, frames: &[Frame]) -> IoResult<()>
     where
-        Frame: AsRef<[u8]>,
+        Frame: TxFrame,
     {
         for frame in frames {
-            let frame = frame.as_ref();
+            let frame = frame.frame_bytes();
             if frame.is_empty() || frame.len() > self.max_frame_len {
                 return Err(IoError::InvalidBufferLength {
                     required_multiple: 1,
@@ -753,7 +838,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         next_frame: &mut usize,
     ) -> IoResult<usize>
     where
-        Frame: AsRef<[u8]>,
+        Frame: TxFrame,
     {
         let NetTxState {
             tx_queue,
@@ -766,7 +851,14 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             .available_descriptors()
             .min(frames.len().saturating_sub(*next_frame));
         while submitted < available_frames {
-            let frame = frames[*next_frame].as_ref();
+            let frame = frames[*next_frame].frame_bytes();
+            let checksum = frames[*next_frame].tx_checksum();
+            if checksum.is_some() {
+                assert!(
+                    self.tx_checksum_negotiated,
+                    "checksum-offload frame submitted without negotiated VIRTIO_NET_F_CSUM"
+                );
+            }
             let token = tx_queue.next_free_descriptor();
             let token_index = usize::from(token);
             assert!(
@@ -777,6 +869,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 slot_buffer_mut(tx_buffers, *tx_buffer_len, token_index, "TX"),
                 self.header_len,
                 frame,
+                checksum,
             )?;
             let payload = slot_buffer(tx_buffers, *tx_buffer_len, token_index, payload_len, "TX");
             let submitted_token = tx_queue.submit_read_only_deferred(&self.transport, payload)?;
@@ -1026,7 +1119,12 @@ fn slot_buffer<'a>(
     })
 }
 
-fn write_tx_payload(buffer: &mut [u8], header_len: usize, frame: &[u8]) -> IoResult<usize> {
+fn write_tx_payload(
+    buffer: &mut [u8],
+    header_len: usize,
+    frame: &[u8],
+    checksum: Option<TxChecksumMeta>,
+) -> IoResult<usize> {
     let payload_len = header_len
         .checked_add(frame.len())
         .ok_or(IoError::DeviceFault)?;
@@ -1037,8 +1135,15 @@ fn write_tx_payload(buffer: &mut [u8], header_len: usize, frame: &[u8]) -> IoRes
         });
     }
 
-    // TX slots are zero-initialized and the device only reads them, so the
-    // virtio-net header remains the all-zero "no offload" header across reuse.
+    // Slots are reused across frames with different offload needs, so the
+    // header is rewritten every submission: NEEDS_CSUM with the frame's
+    // csum_start/csum_offset, or all-zero "no offload".
+    buffer[..header_len].fill(0);
+    if let Some(meta) = checksum {
+        buffer[0] = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+        buffer[6..8].copy_from_slice(&meta.start.to_le_bytes());
+        buffer[8..10].copy_from_slice(&meta.offset.to_le_bytes());
+    }
     buffer[header_len..payload_len].copy_from_slice(frame);
     Ok(payload_len)
 }
@@ -1047,7 +1152,7 @@ fn write_tx_payload(buffer: &mut [u8], header_len: usize, frame: &[u8]) -> IoRes
 mod tests {
     use core::mem::size_of;
 
-    use super::{DescriptorBitSet, VirtioNetHeader, write_tx_payload};
+    use super::{DescriptorBitSet, TxChecksumMeta, VirtioNetHeader, write_tx_payload};
 
     #[test]
     fn descriptor_bitset_tracks_sparse_tokens() {
@@ -1069,25 +1174,38 @@ mod tests {
     }
 
     #[test]
-    fn tx_payload_write_preserves_zero_net_header() {
-        let expected_header = [0; size_of::<VirtioNetHeader>()];
-        let header_len = expected_header.len();
+    fn tx_payload_write_rewrites_net_header_per_frame() {
+        let zero_header = [0; size_of::<VirtioNetHeader>()];
+        let header_len = zero_header.len();
         let mut buffer = [0u8; 64];
         let first = [1u8; 8];
         let second = [2u8; 4];
 
         assert_eq!(
-            write_tx_payload(&mut buffer, header_len, &first).expect("first payload fits"),
+            write_tx_payload(
+                &mut buffer,
+                header_len,
+                &first,
+                Some(TxChecksumMeta {
+                    start: 34,
+                    offset: 16,
+                }),
+            )
+            .expect("first payload fits"),
             header_len + first.len()
         );
-        assert_eq!(&buffer[..header_len], expected_header);
+        assert_eq!(buffer[0], super::VIRTIO_NET_HDR_F_NEEDS_CSUM);
+        assert_eq!(&buffer[6..8], &34u16.to_le_bytes());
+        assert_eq!(&buffer[8..10], &16u16.to_le_bytes());
         assert_eq!(&buffer[header_len..header_len + first.len()], first);
 
+        // A non-offload frame reusing the slot must scrub the stale
+        // NEEDS_CSUM header back to all-zero.
         assert_eq!(
-            write_tx_payload(&mut buffer, header_len, &second).expect("second payload fits"),
+            write_tx_payload(&mut buffer, header_len, &second, None).expect("second payload fits"),
             header_len + second.len()
         );
-        assert_eq!(&buffer[..header_len], expected_header);
+        assert_eq!(&buffer[..header_len], zero_header);
         assert_eq!(&buffer[header_len..header_len + second.len()], second);
     }
 }

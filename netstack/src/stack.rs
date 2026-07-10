@@ -16,8 +16,8 @@ use crate::{
     Icmpv4Packet, Icmpv6DestinationUnreachableCode, Icmpv6Packet, IpAddress, IpCidr, Ipv4Address,
     Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, PacketBuffer, StackError, TcpEndpoint,
     TcpFlags, TcpHeader, TcpHeaderOptions, TcpPacket, TcpReceiveBuffer, TcpSocket,
-    TcpTransmitSegment, UdpPacket, icmpv6_checksum_valid, ipv4_checksum, tcp_checksum_valid,
-    udp_checksum_valid,
+    TcpTransmitSegment, TransportChecksum, TxChecksum, TxFrameRef, UdpPacket,
+    icmpv6_checksum_valid, ipv4_checksum, tcp_checksum_valid, udp_checksum_valid,
 };
 
 pub const MAX_ROUTES: usize = 32;
@@ -90,7 +90,16 @@ pub struct StackConfig {
     pub mtu: usize,
     pub rx_budget: usize,
     pub rx_checksum_offload: RxChecksumOffload,
+    /// Seed TCP/UDP transmit checksums with the pseudo-header sum and
+    /// let the device finish them; enabled by the embedding kernel only
+    /// when the interface negotiated transmit checksum offload.
+    pub tx_checksum_offload: bool,
 }
+
+/// Byte offset of the checksum field inside a TCP header.
+const TCP_CHECKSUM_FIELD_OFFSET: u16 = 16;
+/// Byte offset of the checksum field inside a UDP header.
+const UDP_CHECKSUM_FIELD_OFFSET: u16 = 6;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RxChecksumOffload {
@@ -110,11 +119,17 @@ impl StackConfig {
             mtu,
             rx_budget: DEFAULT_POLL_BUDGET,
             rx_checksum_offload: RxChecksumOffload::none(),
+            tx_checksum_offload: false,
         }
     }
 
     pub const fn with_rx_budget(mut self, rx_budget: usize) -> Self {
         self.rx_budget = rx_budget;
+        self
+    }
+
+    pub const fn with_tx_checksum_offload(mut self, enabled: bool) -> Self {
+        self.tx_checksum_offload = enabled;
         self
     }
 
@@ -2040,16 +2055,16 @@ impl OutboundFrameQueue {
     fn try_submit_slices<E>(
         &mut self,
         limit: usize,
-        submit: impl FnOnce(&[&[u8]]) -> Result<Option<usize>, E>,
+        submit: impl FnOnce(&[TxFrameRef<'_>]) -> Result<Option<usize>, E>,
     ) -> Result<OutboundBatchStatus, E> {
         if limit == 0 || self.ready.is_empty() {
             return Ok(OutboundBatchStatus::Empty);
         }
 
-        let mut frames = ArrayVec::<&[u8], MAX_OUTBOUND_FRAMES>::new();
+        let mut frames = ArrayVec::<TxFrameRef<'_>, MAX_OUTBOUND_FRAMES>::new();
         for slot in self.ready.iter().copied().take(limit) {
             frames
-                .try_push(self.frames[slot].as_slice())
+                .try_push(self.frames[slot].as_tx_frame())
                 .unwrap_or_else(|_| panic!("outbound slice batch exceeded frame queue capacity"));
         }
         let offered = frames.len();
@@ -2436,7 +2451,7 @@ where
     pub fn try_submit_outbound_slices<E>(
         &mut self,
         limit: usize,
-        submit: impl FnOnce(&[&[u8]]) -> Result<Option<usize>, E>,
+        submit: impl FnOnce(&[TxFrameRef<'_>]) -> Result<Option<usize>, E>,
     ) -> Result<OutboundBatchStatus, E> {
         self.outbound.try_submit_slices(limit, submit)
     }
@@ -2446,7 +2461,9 @@ where
         encode: impl FnOnce(&mut PacketBuffer) -> Result<R, StackError>,
     ) -> Result<R, StackError> {
         let slot = self.outbound.reserve()?;
-        match encode(self.outbound.frame_mut(slot)) {
+        let frame = self.outbound.frame_mut(slot);
+        frame.set_tx_checksum(None);
+        match encode(frame) {
             Ok(result) => {
                 self.outbound.commit(slot);
                 Ok(result)
@@ -2470,7 +2487,9 @@ where
             return Ok(true);
         }
         let slot = self.outbound.reserve()?;
-        match encode(self.outbound.frame_mut(slot)) {
+        let frame = self.outbound.frame_mut(slot);
+        frame.set_tx_checksum(None);
+        match encode(frame) {
             Ok(()) => {
                 self.outbound.set_tcp_ack_key(slot, key);
                 self.outbound.commit(slot);
@@ -3109,6 +3128,7 @@ where
             udp_len,
         )?;
         let local_mac = self.config.mac;
+        let checksum = self.transport_checksum();
         self.queue_outbound_frame(|frame| {
             let storage = frame.storage_mut();
             let mut offset = EthernetFrame::encode_header(
@@ -3128,6 +3148,7 @@ where
                 64,
             )
             .ok_or(StackError::OutputQueueFull)?;
+            let transport_offset = offset;
             offset += UdpPacket::encode(
                 &mut storage[offset..],
                 IpAddress::Ipv4(source),
@@ -3135,9 +3156,16 @@ where
                 source_port,
                 destination_port,
                 payload,
+                checksum,
             )
             .ok_or(StackError::OutputQueueFull)?;
             frame.set_len(offset);
+            if matches!(checksum, TransportChecksum::DeviceOffload) {
+                frame.set_tx_checksum(Some(TxChecksum {
+                    start: transport_offset as u16,
+                    offset: UDP_CHECKSUM_FIELD_OFFSET,
+                }));
+            }
             Ok(payload.len())
         })
     }
@@ -3160,6 +3188,7 @@ where
             udp_len,
         )?;
         let local_mac = self.config.mac;
+        let checksum = self.transport_checksum();
         self.queue_outbound_frame(|frame| {
             let storage = frame.storage_mut();
             let mut offset = EthernetFrame::encode_header(
@@ -3178,6 +3207,7 @@ where
                 64,
             )
             .ok_or(StackError::OutputQueueFull)?;
+            let transport_offset = offset;
             offset += UdpPacket::encode(
                 &mut storage[offset..],
                 IpAddress::Ipv6(source),
@@ -3185,11 +3215,27 @@ where
                 source_port,
                 destination_port,
                 payload,
+                checksum,
             )
             .ok_or(StackError::OutputQueueFull)?;
             frame.set_len(offset);
+            if matches!(checksum, TransportChecksum::DeviceOffload) {
+                frame.set_tx_checksum(Some(TxChecksum {
+                    start: transport_offset as u16,
+                    offset: UDP_CHECKSUM_FIELD_OFFSET,
+                }));
+            }
             Ok(payload.len())
         })
+    }
+
+    /// Transmit checksum strategy for outgoing TCP/UDP frames.
+    const fn transport_checksum(&self) -> TransportChecksum {
+        if self.config.tx_checksum_offload {
+            TransportChecksum::DeviceOffload
+        } else {
+            TransportChecksum::Software
+        }
     }
 
     fn queue_tcp(
@@ -3249,6 +3295,7 @@ where
             return Ok(false);
         };
 
+        let checksum = self.transport_checksum();
         let local_mac = self.config.mac;
         if is_replaceable_tcp_ack(header, payload) {
             return self.queue_tcp_ack_frame(
@@ -3275,6 +3322,7 @@ where
                         options,
                         payload,
                         identification,
+                        checksum,
                     )
                 },
             );
@@ -3290,6 +3338,7 @@ where
                 options,
                 payload,
                 identification,
+                checksum,
             )?;
             Ok(true)
         })
@@ -3324,6 +3373,7 @@ where
             return Ok(false);
         };
 
+        let checksum = self.transport_checksum();
         let local_mac = self.config.mac;
         if is_replaceable_tcp_ack(header, payload) {
             return self.queue_tcp_ack_frame(
@@ -3349,6 +3399,7 @@ where
                         header,
                         options,
                         payload,
+                        checksum,
                     )
                 },
             );
@@ -3363,6 +3414,7 @@ where
                 header,
                 options,
                 payload,
+                checksum,
             )?;
             Ok(true)
         })
@@ -4892,6 +4944,7 @@ fn encode_tcp_ipv4_frame(
     options: TcpHeaderOptions,
     payload: &[u8],
     identification: u16,
+    checksum: TransportChecksum,
 ) -> Result<(), StackError> {
     let storage = frame.storage_mut();
     let mut offset =
@@ -4911,6 +4964,7 @@ fn encode_tcp_ipv4_frame(
         64,
     )
     .ok_or(StackError::OutputQueueFull)?;
+    let transport_offset = offset;
     offset += TcpPacket::encode_with_options(
         &mut storage[offset..],
         IpAddress::Ipv4(source),
@@ -4918,9 +4972,16 @@ fn encode_tcp_ipv4_frame(
         header,
         options,
         payload,
+        checksum,
     )
     .ok_or(StackError::OutputQueueFull)?;
     frame.set_len(offset);
+    if matches!(checksum, TransportChecksum::DeviceOffload) {
+        frame.set_tx_checksum(Some(TxChecksum {
+            start: transport_offset as u16,
+            offset: TCP_CHECKSUM_FIELD_OFFSET,
+        }));
+    }
     Ok(())
 }
 
@@ -4933,6 +4994,7 @@ fn encode_tcp_ipv6_frame(
     header: TcpHeader,
     options: TcpHeaderOptions,
     payload: &[u8],
+    checksum: TransportChecksum,
 ) -> Result<(), StackError> {
     let storage = frame.storage_mut();
     let mut offset =
@@ -4951,6 +5013,7 @@ fn encode_tcp_ipv6_frame(
         64,
     )
     .ok_or(StackError::OutputQueueFull)?;
+    let transport_offset = offset;
     offset += TcpPacket::encode_with_options(
         &mut storage[offset..],
         IpAddress::Ipv6(source),
@@ -4958,9 +5021,16 @@ fn encode_tcp_ipv6_frame(
         header,
         options,
         payload,
+        checksum,
     )
     .ok_or(StackError::OutputQueueFull)?;
     frame.set_len(offset);
+    if matches!(checksum, TransportChecksum::DeviceOffload) {
+        frame.set_tx_checksum(Some(TxChecksum {
+            start: transport_offset as u16,
+            offset: TCP_CHECKSUM_FIELD_OFFSET,
+        }));
+    }
     Ok(())
 }
 
@@ -5164,6 +5234,7 @@ mod tests {
             IpAddress::Ipv4(destination),
             header,
             payload,
+            TransportChecksum::Software,
         )
         .expect("test TCP segment should fit");
         (segment, len)
@@ -5318,6 +5389,7 @@ mod tests {
             source_port,
             destination_port,
             payload,
+            TransportChecksum::Software,
         )
         .expect("test UDP datagram should fit");
         (datagram, len)
@@ -5338,6 +5410,7 @@ mod tests {
             source_port,
             destination_port,
             payload,
+            TransportChecksum::Software,
         )
         .expect("test UDP datagram should fit");
         (datagram, len)
@@ -5371,6 +5444,7 @@ mod tests {
             source_port,
             destination_port,
             payload,
+            TransportChecksum::Software,
         )
         .expect("test UDP datagram should fit");
         (frame, offset)
@@ -5521,6 +5595,7 @@ mod tests {
             source_port,
             destination_port,
             payload,
+            TransportChecksum::Software,
         )
         .expect("test UDP datagram should fit");
         (frame, offset)
@@ -5594,6 +5669,7 @@ mod tests {
             IpAddress::Ipv4(destination),
             header,
             &[],
+            TransportChecksum::Software,
         )
         .expect("quoted TCP packet should fit");
         ipv4_icmp_unreachable(
@@ -5744,9 +5820,9 @@ mod tests {
         let status = queue
             .try_submit_slices(3, |frames| {
                 assert_eq!(frames.len(), 3);
-                assert_eq!(frames[0], b"first".as_slice());
-                assert_eq!(frames[1], b"second".as_slice());
-                assert_eq!(frames[2], b"third".as_slice());
+                assert_eq!(frames[0].bytes, b"first".as_slice());
+                assert_eq!(frames[1].bytes, b"second".as_slice());
+                assert_eq!(frames[2].bytes, b"third".as_slice());
                 Ok::<Option<usize>, ()>(Some(2))
             })
             .expect("slice submit should succeed");
@@ -6793,6 +6869,103 @@ mod tests {
         assert_eq!(udp.destination_port, 5353);
         assert_eq!(udp.payload, b"multicast");
         assert!(stack.take_outbound().is_none());
+    }
+
+    #[test]
+    fn udp_send_with_tx_offload_seeds_pseudo_sum_and_metadata() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let group = Ipv4Address::new([224, 0, 0, 251]);
+        let mut stack = Stack::new(
+            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES).with_tx_checksum_offload(true),
+        );
+        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        let socket = stack
+            .open_udp(UdpSocketBinding::wildcard(4040))
+            .expect("wildcard UDP socket should bind");
+
+        assert_eq!(
+            stack.send_udp(
+                socket,
+                IpAddress::Ipv4(group),
+                5353,
+                b"offloaded",
+                1,
+                StackInstant::from_nanos(1),
+            ),
+            Ok(b"offloaded".len())
+        );
+
+        let frame = stack
+            .take_outbound()
+            .expect("offloaded UDP frame should be queued");
+        let transport_offset = EthernetFrame::HEADER_LEN + Ipv4Packet::MIN_HEADER_LEN;
+        let metadata = frame
+            .tx_checksum()
+            .expect("offloaded frame must carry checksum metadata");
+        assert_eq!(metadata.start as usize, transport_offset);
+        assert_eq!(metadata.offset, 6);
+
+        // The checksum field holds the folded pseudo-header sum: when the
+        // device continues the one's-complement sum over the transport
+        // bytes (with the seeded field in place) and complements it, the
+        // result must equal the software checksum of the same datagram.
+        let bytes = frame.as_slice();
+        let datagram = &bytes[transport_offset..];
+        let seeded = u16::from_be_bytes([datagram[6], datagram[7]]);
+        let device_sum = {
+            let mut sum = u32::from(seeded);
+            let mut chunks = datagram.chunks_exact(2);
+            for chunk in chunks.by_ref() {
+                sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+            }
+            if let [last] = chunks.remainder() {
+                sum += u32::from(*last) << 8;
+            }
+            // The seeded field itself was included once in the loop; the
+            // device sums payload bytes treating the field as part of the
+            // data, exactly as one's-complement arithmetic requires.
+            sum -= u32::from(seeded);
+            while (sum >> 16) != 0 {
+                sum = (sum & 0xffff) + (sum >> 16);
+            }
+            !(sum as u16)
+        };
+        let mut verified = [0u8; crate::ETHERNET_FRAME_BYTES];
+        verified[..datagram.len()].copy_from_slice(datagram);
+        verified[6..8].copy_from_slice(&device_sum.to_be_bytes());
+        assert!(
+            crate::udp_checksum_valid(
+                IpAddress::Ipv4(local),
+                IpAddress::Ipv4(group),
+                &verified[..datagram.len()],
+            ),
+            "device-completed checksum must validate in software"
+        );
+        assert!(stack.take_outbound().is_none());
+    }
+
+    #[test]
+    fn udp_send_without_tx_offload_carries_no_metadata() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let group = Ipv4Address::new([224, 0, 0, 251]);
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        let socket = stack
+            .open_udp(UdpSocketBinding::wildcard(4040))
+            .expect("wildcard UDP socket should bind");
+        stack
+            .send_udp(
+                socket,
+                IpAddress::Ipv4(group),
+                5353,
+                b"software",
+                1,
+                StackInstant::from_nanos(1),
+            )
+            .expect("software-checksum send should queue");
+
+        let frame = stack.take_outbound().expect("frame should be queued");
+        assert_eq!(frame.tx_checksum(), None);
     }
 
     #[test]

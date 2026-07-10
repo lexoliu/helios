@@ -78,6 +78,11 @@ impl NetworkDevice for VirtioNetworkDevice {
     fn capabilities(&self) -> InterfaceCapabilities {
         InterfaceCapabilities {
             max_frame_len: self.max_frame_len(),
+            checksum: helios_kernel::ChecksumOffload {
+                tx_tcp: self.inner.tx_checksum_negotiated(),
+                tx_udp: self.inner.tx_checksum_negotiated(),
+                ..helios_kernel::ChecksumOffload::default()
+            },
             events: EventDeliveryCapabilities {
                 polling: true,
                 interrupts: false,
@@ -182,14 +187,17 @@ impl NetworkDevice for VirtioNetworkDevice {
         Ok(submitted)
     }
 
-    fn try_transmit_slices_immediate(&self, frames: &[&[u8]]) -> Result<Option<usize>, IoError> {
+    fn try_transmit_slices_immediate(
+        &self,
+        frames: &[helios_kernel::TxFrameRef<'_>],
+    ) -> Result<Option<usize>, IoError> {
         self.try_transmit_slices_immediate_on(0, frames)
     }
 
     fn try_transmit_slices_immediate_on(
         &self,
         queue_idx: usize,
-        frames: &[&[u8]],
+        frames: &[helios_kernel::TxFrameRef<'_>],
     ) -> Result<Option<usize>, IoError> {
         let mut submitted = 0usize;
         for chunk in frames.chunks(VIRTIO_POLLING_RX_BUDGET) {

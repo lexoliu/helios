@@ -1,7 +1,18 @@
 use crate::{
     EthernetAddress, IpAddress, Ipv4Address, Ipv6Address, icmpv6_checksum, internet_checksum,
-    ipv4_checksum, tcpv4_checksum, tcpv6_checksum, udp_checksum,
+    ipv4_checksum, tcp_pseudo_header_checksum, tcpv4_checksum, tcpv6_checksum, udp_checksum,
+    udp_pseudo_header_checksum,
 };
+
+/// How a transport checksum is produced at encode time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportChecksum {
+    /// Compute and store the full checksum in software.
+    Software,
+    /// Seed the checksum field with the folded pseudo-header sum and
+    /// let the device finish it from the frame's csum_start/csum_offset.
+    DeviceOffload,
+}
 
 pub const MAX_TCP_SACK_BLOCKS: usize = 4;
 
@@ -396,6 +407,7 @@ impl<'a> UdpPacket<'a> {
         source_port: u16,
         destination_port: u16,
         payload: &[u8],
+        checksum: TransportChecksum,
     ) -> Option<usize> {
         let len = Self::HEADER_LEN.checked_add(payload.len())?;
         let len_u16 = u16::try_from(len).ok()?;
@@ -407,8 +419,15 @@ impl<'a> UdpPacket<'a> {
         write_u16(output, 4, len_u16)?;
         write_u16(output, 6, 0)?;
         output[Self::HEADER_LEN..len].copy_from_slice(payload);
-        let checksum = udp_checksum(source, destination, &output[..len]);
-        write_u16(output, 6, udp_transmitted_checksum(checksum))?;
+        let field = match checksum {
+            TransportChecksum::Software => {
+                udp_transmitted_checksum(udp_checksum(source, destination, &output[..len]))
+            }
+            TransportChecksum::DeviceOffload => {
+                udp_pseudo_header_checksum(source, destination, len)
+            }
+        };
+        write_u16(output, 6, field)?;
         Some(len)
     }
 }
@@ -510,6 +529,7 @@ impl<'a> TcpPacket<'a> {
         destination: IpAddress,
         header: TcpHeader,
         payload: &[u8],
+        checksum: TransportChecksum,
     ) -> Option<usize> {
         Self::encode_with_options(
             output,
@@ -518,6 +538,7 @@ impl<'a> TcpPacket<'a> {
             header,
             TcpHeaderOptions::empty(),
             payload,
+            checksum,
         )
     }
 
@@ -528,6 +549,7 @@ impl<'a> TcpPacket<'a> {
         header: TcpHeader,
         options: TcpHeaderOptions,
         payload: &[u8],
+        checksum: TransportChecksum,
     ) -> Option<usize> {
         let options_len = options.encoded_len();
         let header_len = Self::MIN_HEADER_LEN.checked_add(options_len)?;
@@ -546,16 +568,21 @@ impl<'a> TcpPacket<'a> {
         write_u16(output, 14, header.window_size)?;
         options.encode(&mut output[Self::MIN_HEADER_LEN..header_len])?;
         output[header_len..len].copy_from_slice(payload);
-        let checksum = match (source, destination) {
-            (IpAddress::Ipv4(source), IpAddress::Ipv4(destination)) => {
-                tcpv4_checksum(source, destination, &output[..len])
+        let field = match checksum {
+            TransportChecksum::Software => match (source, destination) {
+                (IpAddress::Ipv4(source), IpAddress::Ipv4(destination)) => {
+                    tcpv4_checksum(source, destination, &output[..len])
+                }
+                (IpAddress::Ipv6(source), IpAddress::Ipv6(destination)) => {
+                    tcpv6_checksum(source, destination, &output[..len])
+                }
+                _ => panic!("TCP pseudo-header address families must match"),
+            },
+            TransportChecksum::DeviceOffload => {
+                tcp_pseudo_header_checksum(source, destination, len)
             }
-            (IpAddress::Ipv6(source), IpAddress::Ipv6(destination)) => {
-                tcpv6_checksum(source, destination, &output[..len])
-            }
-            _ => panic!("TCP pseudo-header address families must match"),
         };
-        write_u16(output, 16, checksum)?;
+        write_u16(output, 16, field)?;
         Some(len)
     }
 }
@@ -1264,9 +1291,16 @@ mod tests {
             });
         let mut bytes = [0u8; 64];
 
-        let len =
-            TcpPacket::encode_with_options(&mut bytes, source, destination, header, options, b"x")
-                .expect("TCP segment should fit");
+        let len = TcpPacket::encode_with_options(
+            &mut bytes,
+            source,
+            destination,
+            header,
+            options,
+            b"x",
+            TransportChecksum::Software,
+        )
+        .expect("TCP segment should fit");
         let packet = TcpPacket::parse(&bytes[..len]).expect("encoded TCP packet should parse");
 
         assert_eq!(packet.source_port, 49152);
@@ -1313,6 +1347,7 @@ mod tests {
             header,
             TcpHeaderOptions::empty().with_sack_blocks(blocks),
             &[],
+            TransportChecksum::Software,
         )
         .expect("TCP SACK segment should fit");
         let packet = TcpPacket::parse(&bytes[..len]).expect("encoded SACK should parse");
@@ -1326,8 +1361,16 @@ mod tests {
         let destination = IpAddress::Ipv4(Ipv4Address::new([192, 0, 2, 2]));
         let mut bytes = [0u8; 16];
 
-        let len = UdpPacket::encode(&mut bytes, source, destination, 49152, 53, &[0xbb, 0xa0])
-            .expect("UDP packet should fit");
+        let len = UdpPacket::encode(
+            &mut bytes,
+            source,
+            destination,
+            49152,
+            53,
+            &[0xbb, 0xa0],
+            TransportChecksum::Software,
+        )
+        .expect("UDP packet should fit");
 
         assert_eq!(len, UdpPacket::HEADER_LEN + 2);
         assert_eq!(read_u16(&bytes, 6), Some(u16::MAX));
@@ -1343,8 +1386,16 @@ mod tests {
         ]));
         let mut bytes = [0u8; 16];
 
-        let len = UdpPacket::encode(&mut bytes, source, destination, 49152, 53, &[0xe4, 0x2f])
-            .expect("UDP packet should fit");
+        let len = UdpPacket::encode(
+            &mut bytes,
+            source,
+            destination,
+            49152,
+            53,
+            &[0xe4, 0x2f],
+            TransportChecksum::Software,
+        )
+        .expect("UDP packet should fit");
 
         assert_eq!(len, UdpPacket::HEADER_LEN + 2);
         assert_eq!(read_u16(&bytes, 6), Some(u16::MAX));

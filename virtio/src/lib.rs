@@ -30,7 +30,7 @@ pub use mmio::{
     VirtioMmioRngDevice, block_from_mmio, console_from_mmio, net_from_mmio, net_from_mmio_with_dma,
     p9_from_mmio, p9_from_mmio_with_dma, rng_from_mmio,
 };
-pub use net::{RxFrame, VirtioNetDevice};
+pub use net::{RxFrame, TxChecksumMeta, TxFrame, TxFrameDescriptor, VirtioNetDevice};
 pub use p9::Virtio9pDevice;
 pub use rng::VirtioRngDevice;
 pub use transport::{

@@ -164,6 +164,11 @@ impl NetworkDevice for VirtioNetworkDevice {
     fn capabilities(&self) -> InterfaceCapabilities {
         InterfaceCapabilities {
             max_frame_len: self.max_frame_len(),
+            checksum: helios_kernel::ChecksumOffload {
+                tx_tcp: self.inner.tx_checksum_negotiated(),
+                tx_udp: self.inner.tx_checksum_negotiated(),
+                ..helios_kernel::ChecksumOffload::default()
+            },
             events: EventDeliveryCapabilities {
                 polling: true,
                 interrupts: true,
@@ -239,14 +244,17 @@ impl NetworkDevice for VirtioNetworkDevice {
             .await
     }
 
-    fn try_transmit_slices_immediate(&self, frames: &[&[u8]]) -> Result<Option<usize>, IoError> {
+    fn try_transmit_slices_immediate(
+        &self,
+        frames: &[helios_kernel::TxFrameRef<'_>],
+    ) -> Result<Option<usize>, IoError> {
         self.try_transmit_slices_immediate_on(0, frames)
     }
 
     fn try_transmit_slices_immediate_on(
         &self,
         queue_idx: usize,
-        frames: &[&[u8]],
+        frames: &[helios_kernel::TxFrameRef<'_>],
     ) -> Result<Option<usize>, IoError> {
         self.inner
             .try_transmit_trusted_frames_immediate_on_pair(queue_idx, frames)

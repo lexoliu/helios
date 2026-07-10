@@ -616,7 +616,6 @@ const _: () = {
     assert!(USER_VA_END > USER_VA_BASE);
 };
 
-
 /// Register the boot-time `RiscvUserAddressSpace` as the active
 /// runtime custom-virtual-memory backend. Must be called once on
 /// the bootstrap hart, after `install_kernel_paging`, before any

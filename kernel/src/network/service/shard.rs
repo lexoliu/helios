@@ -262,6 +262,7 @@ impl NetworkShard {
         max_frame_len: usize,
         rx_poll_budget: usize,
         rx_checksum_offload: RxChecksumOffload,
+        tx_checksum_offload: bool,
         transaction_id: u32,
         shard_idx: usize,
         shard_count: usize,
@@ -275,7 +276,8 @@ impl NetworkShard {
         let mut stack = Box::new(Stack::new(
             StackConfig::new(mac, max_frame_len)
                 .with_rx_budget(rx_poll_budget)
-                .with_rx_checksum_offload(rx_checksum_offload),
+                .with_rx_checksum_offload(rx_checksum_offload)
+                .with_tx_checksum_offload(tx_checksum_offload),
         ));
         let mut udp_sockets = HandleSlab::new();
         if shard_idx == shard_idx_for_port(Some(DHCP_CLIENT_PORT), shard_count) {

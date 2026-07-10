@@ -19,7 +19,8 @@ use thiserror::Error;
 
 pub use checksum::{
     icmpv6_checksum, icmpv6_checksum_valid, internet_checksum, ipv4_checksum, tcp_checksum_valid,
-    tcpv4_checksum, tcpv6_checksum, udp_checksum, udp_checksum_valid,
+    tcp_pseudo_header_checksum, tcpv4_checksum, tcpv6_checksum, udp_checksum, udp_checksum_valid,
+    udp_pseudo_header_checksum,
 };
 pub use congestion::{
     AckSample, BbrV3, CongestionControl, CongestionEvent, CongestionWindow, Cubic, NewReno,
@@ -35,7 +36,7 @@ pub use packet::{
     Icmpv4Echo, Icmpv4Packet, Icmpv6DestinationUnreachableCode, Icmpv6Echo, Icmpv6Packet,
     Icmpv6PacketTooBig, IpProtocol, Ipv4Packet, Ipv6Packet, MAX_TCP_SACK_BLOCKS, TcpFlags,
     TcpHeader, TcpHeaderOptions, TcpOptions, TcpPacket, TcpSackBlock, TcpSackBlocks,
-    TcpTimestampOption, TransportPorts, UdpPacket,
+    TcpTimestampOption, TransportChecksum, TransportPorts, UdpPacket,
 };
 pub use stack::{
     DEFAULT_TCP_LISTEN_BACKLOG, DhcpLease, DnsQueryId, IcmpEchoKey, Ipv4MulticastMembership,
@@ -144,6 +145,25 @@ pub trait TcpReceiveBuffer {
 pub struct PacketBuffer {
     bytes: [u8; ETHERNET_FRAME_BYTES],
     len: usize,
+    tx_checksum: Option<TxChecksum>,
+}
+
+/// Transmit checksum metadata for a frame whose transport checksum the
+/// device finishes: the one's-complement sum continues from byte
+/// `start` of the frame and the complemented result is stored at
+/// `start + offset` (virtio 1.2 §5.1.6.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TxChecksum {
+    pub start: u16,
+    pub offset: u16,
+}
+
+/// Borrowed transmit frame plus its checksum-offload metadata, handed
+/// to [`NetworkInterface`] slice transmit entry points.
+#[derive(Clone, Copy, Debug)]
+pub struct TxFrameRef<'a> {
+    pub bytes: &'a [u8],
+    pub checksum: Option<TxChecksum>,
 }
 
 impl PacketBuffer {
@@ -152,6 +172,25 @@ impl PacketBuffer {
         Self {
             bytes: [0; ETHERNET_FRAME_BYTES],
             len: 0,
+            tx_checksum: None,
+        }
+    }
+
+    /// Checksum-offload metadata attached by the stack's encoders.
+    pub const fn tx_checksum(&self) -> Option<TxChecksum> {
+        self.tx_checksum
+    }
+
+    /// Attaches or clears checksum-offload metadata for this frame.
+    pub fn set_tx_checksum(&mut self, checksum: Option<TxChecksum>) {
+        self.tx_checksum = checksum;
+    }
+
+    /// Borrowed transmit view carrying the offload metadata.
+    pub fn as_tx_frame(&self) -> TxFrameRef<'_> {
+        TxFrameRef {
+            bytes: self.as_slice(),
+            checksum: self.tx_checksum,
         }
     }
 
@@ -184,9 +223,10 @@ impl PacketBuffer {
         self.len = len;
     }
 
-    /// Clears initialized length without modifying storage.
+    /// Clears initialized length and metadata without modifying storage.
     pub fn clear(&mut self) {
         self.len = 0;
+        self.tx_checksum = None;
     }
 }
 
@@ -324,8 +364,9 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
         self.try_transmit_packet_batch(frames)
     }
 
-    /// Attempts to submit borrowed frame slices without waiting for any async lock or event.
-    fn try_transmit_slices_immediate(&self, frames: &[&[u8]]) -> IoResult<Option<usize>> {
+    /// Attempts to submit borrowed frames (with their checksum-offload
+    /// metadata) without waiting for any async lock or event.
+    fn try_transmit_slices_immediate(&self, frames: &[TxFrameRef<'_>]) -> IoResult<Option<usize>> {
         let _ = frames;
         Ok(None)
     }
@@ -336,7 +377,7 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
     fn try_transmit_slices_immediate_on(
         &self,
         queue_idx: usize,
-        frames: &[&[u8]],
+        frames: &[TxFrameRef<'_>],
     ) -> IoResult<Option<usize>> {
         let _ = queue_idx;
         self.try_transmit_slices_immediate(frames)

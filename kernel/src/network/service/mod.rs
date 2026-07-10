@@ -439,6 +439,10 @@ where
             capabilities.checksum.rx_tcp,
             capabilities.checksum.rx_udp,
         );
+        // The stack only ever attaches offload metadata when the device
+        // finishes both TCP and UDP checksums; partial support would
+        // force a per-frame protocol branch for no measured win.
+        let tx_checksum_offload = capabilities.checksum.tx_tcp && capabilities.checksum.tx_udp;
         let mac = device.mac_address();
         let max_frame_len = device.max_frame_len();
         // One NetworkShard per processor. Each shard owns an
@@ -455,7 +459,8 @@ where
         // the value is identical across shards.
         let stack_config = StackConfig::new(mac, max_frame_len)
             .with_rx_budget(rx_poll_budget)
-            .with_rx_checksum_offload(rx_checksum_offload);
+            .with_rx_checksum_offload(rx_checksum_offload)
+            .with_tx_checksum_offload(tx_checksum_offload);
         let stack_rx_budget = Stack::new(stack_config).config().rx_budget;
         let state = NetworkShardSet::new(shard_count, |index| {
             let staggered_xid = transaction_id.wrapping_add(index as u32);
@@ -464,6 +469,7 @@ where
                 max_frame_len,
                 rx_poll_budget,
                 rx_checksum_offload,
+                tx_checksum_offload,
                 staggered_xid,
                 index,
                 shard_count,
@@ -736,7 +742,8 @@ mod tests {
         ETHERNET_FRAME_BYTES, EthernetFrame, EthernetProtocol, Icmpv6Packet, IpAddress, IpProtocol,
         Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES,
         NeighborEntry, NeighborState, RxChecksumOffload, StackInstant, TcpFlags, TcpHeader,
-        TcpListenBacklog, TcpPacket, UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding,
+        TcpListenBacklog, TcpPacket, TransportChecksum, UdpEndpoint, UdpPacket, UdpPayload,
+        UdpSocketBinding,
     };
 
     use super::{
@@ -765,6 +772,7 @@ mod tests {
             IpAddress::Ipv6(destination),
             header,
             &[],
+            TransportChecksum::Software,
         )
         .expect("test TCP segment should fit");
         offset += Ipv6Packet::encode_header(
@@ -802,6 +810,7 @@ mod tests {
             source_port,
             destination_port,
             payload,
+            TransportChecksum::Software,
         )
         .expect("test UDP datagram should fit");
         offset += Ipv6Packet::encode_header(
@@ -872,6 +881,7 @@ mod tests {
             source_port,
             destination_port,
             payload,
+            TransportChecksum::Software,
         )
         .expect("test UDP datagram should fit");
         offset += Ipv4Packet::encode_header(
@@ -922,6 +932,7 @@ mod tests {
             ETHERNET_FRAME_BYTES,
             8,
             RxChecksumOffload::none(),
+            false,
             1,
             0,
             1,
@@ -1247,6 +1258,7 @@ mod tests {
                 ETHERNET_FRAME_BYTES,
                 8,
                 RxChecksumOffload::none(),
+                false,
                 1 + index as u32,
                 index,
                 2,

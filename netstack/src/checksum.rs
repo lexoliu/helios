@@ -76,6 +76,44 @@ pub fn tcp_checksum_valid(
     }
 }
 
+/// Folded, uninverted pseudo-header sum seeded into the TCP checksum
+/// field when transmit checksum offload is negotiated: the device
+/// continues the one's-complement sum from `csum_start` and stores the
+/// final complement at `csum_offset` (virtio 1.2 §5.1.6.2).
+pub fn tcp_pseudo_header_checksum(
+    source: crate::IpAddress,
+    destination: crate::IpAddress,
+    segment_len: usize,
+) -> u16 {
+    match (source, destination) {
+        (crate::IpAddress::Ipv4(source), crate::IpAddress::Ipv4(destination)) => fold_sum(
+            ipv4_pseudo_sum(source, destination, IpProtocol::Tcp, segment_len),
+        ),
+        (crate::IpAddress::Ipv6(source), crate::IpAddress::Ipv6(destination)) => fold_sum(
+            ipv6_pseudo_sum(source, destination, IpProtocol::Tcp, segment_len),
+        ),
+        _ => panic!("TCP pseudo-header address families must match"),
+    }
+}
+
+/// Folded, uninverted pseudo-header sum for offloaded UDP transmit
+/// checksums; see [`tcp_pseudo_header_checksum`].
+pub fn udp_pseudo_header_checksum(
+    source: crate::IpAddress,
+    destination: crate::IpAddress,
+    datagram_len: usize,
+) -> u16 {
+    match (source, destination) {
+        (crate::IpAddress::Ipv4(source), crate::IpAddress::Ipv4(destination)) => fold_sum(
+            ipv4_pseudo_sum(source, destination, IpProtocol::Udp, datagram_len),
+        ),
+        (crate::IpAddress::Ipv6(source), crate::IpAddress::Ipv6(destination)) => fold_sum(
+            ipv6_pseudo_sum(source, destination, IpProtocol::Udp, datagram_len),
+        ),
+        _ => panic!("UDP pseudo-header address families must match"),
+    }
+}
+
 pub fn icmpv6_checksum(source: Ipv6Address, destination: Ipv6Address, message: &[u8]) -> u16 {
     finish_checksum(
         ipv6_pseudo_sum(source, destination, IpProtocol::Icmpv6, message.len())
@@ -259,11 +297,17 @@ fn sum_words_wide(bytes: &[u8]) -> u32 {
     sum
 }
 
-fn finish_checksum(mut sum: u32) -> u16 {
+fn finish_checksum(sum: u32) -> u16 {
+    !fold_sum(sum)
+}
+
+/// Folds a 32-bit one's-complement accumulator to 16 bits without the
+/// final complement, as stored for offloaded transmit checksums.
+fn fold_sum(mut sum: u32) -> u16 {
     while (sum >> 16) != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
-    !(sum as u16)
+    sum as u16
 }
 
 #[cfg(test)]
