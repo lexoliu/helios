@@ -424,6 +424,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         "Limine bootloader does not support the required base protocol revision"
     );
     install_exception_vectors();
+    enable_counter_event_stream();
     let handoff = limine_boot_handoff();
     let physical_memory_offset = physical_memory_offset();
     let boot_fdt = boot_fdt(&handoff);
@@ -768,6 +769,7 @@ fn prepare_current_processor() {
         asm!("msr cpacr_el1, {cpacr}", cpacr = in(reg) cpacr, options(nomem, nostack, preserves_flags));
         asm!("isb", options(nostack, preserves_flags));
     }
+    enable_counter_event_stream();
     enable_pmu_for_current_processor();
     install_exception_vectors();
 }
@@ -877,6 +879,27 @@ fn read_id_aa64dfr0_el1() -> u64 {
 fn aarch64_pmu_supported() -> bool {
     let pmuver = (read_id_aa64dfr0_el1() >> 8) & 0xf;
     pmuver != 0 && pmuver != 0xf
+}
+
+/// Enables the architectural counter event stream so a `wfe`-parked
+/// processor wakes at a fine, bounded period. Without it the only wake
+/// sources are cross-CPU events and the platform default stream —
+/// observed at ~22 ms under HVF, which quantized every executor timer
+/// sleep and stalled TCP receive in ~1.5 s steps. Watching counter
+/// bit 9 yields a 2^10-tick period, about 43 us at the 24 MHz virt
+/// counter, matching the network pump's 50 us progress-wait quantum.
+fn enable_counter_event_stream() {
+    const EVNTEN: u64 = 1 << 2;
+    const EVNTDIR: u64 = 1 << 3;
+    const EVNTI_MASK: u64 = 0xf << 4;
+    const EVNTI_BIT_9: u64 = 9 << 4;
+    unsafe {
+        let mut cntkctl: u64;
+        asm!("mrs {v}, cntkctl_el1", v = out(reg) cntkctl, options(nomem, nostack, preserves_flags));
+        cntkctl = (cntkctl & !(EVNTI_MASK | EVNTDIR)) | EVNTEN | EVNTI_BIT_9;
+        asm!("msr cntkctl_el1, {v}", v = in(reg) cntkctl, options(nomem, nostack, preserves_flags));
+        asm!("isb", options(nostack, preserves_flags));
+    }
 }
 
 fn enable_pmu_for_current_processor() {
