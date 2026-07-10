@@ -582,28 +582,56 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 continue;
             };
             any_locked = true;
-            self.drain_returned_rx_buffers(pair_idx, &mut state)?;
-            while received < frames.len() {
-                let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
-                    break;
-                };
-                Self::mark_rx_completed(&mut state, token);
-                let used_len = used_len as usize;
-                if used_len < self.header_len || used_len > self.rx_buffer_len {
-                    self.repost_rx_buffer(pair_idx, &mut state, token)?;
-                    return Err(IoError::DeviceFault);
-                }
-
-                let slot = &mut frames[received];
-                assert!(slot.is_none(), "virtio net RX batch slot was not empty");
-                *slot = Some(self.rx_frame_from_slot(pair_idx, token, used_len));
-                received += 1;
-            }
+            received += self.drain_rx_pair_locked(pair_idx, &mut state, &mut frames[received..])?;
         }
         if !any_locked {
             return Ok(None);
         }
         Ok(Some(received))
+    }
+
+    /// Variant of `try_receive_frames_immediate` that drains a single
+    /// RX queue pair, so per-processor pollers do not contend on the
+    /// other pairs' locks. The index is normalized like the TX pair
+    /// entry points.
+    pub fn try_receive_frames_immediate_on_pair(
+        &self,
+        pair_idx: usize,
+        frames: &mut [Option<RxFrame>],
+    ) -> IoResult<Option<usize>> {
+        let pair_idx = self.normalize_pair_idx(pair_idx);
+        let Some(mut state) = self.queue_pairs[pair_idx].rx_state.try_lock() else {
+            return Ok(None);
+        };
+        let received = self.drain_rx_pair_locked(pair_idx, &mut state, frames)?;
+        Ok(Some(received))
+    }
+
+    fn drain_rx_pair_locked(
+        &self,
+        pair_idx: usize,
+        state: &mut NetRxState<T>,
+        frames: &mut [Option<RxFrame>],
+    ) -> IoResult<usize> {
+        self.drain_returned_rx_buffers(pair_idx, state)?;
+        let mut received = 0usize;
+        while received < frames.len() {
+            let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
+                break;
+            };
+            Self::mark_rx_completed(state, token);
+            let used_len = used_len as usize;
+            if used_len < self.header_len || used_len > self.rx_buffer_len {
+                self.repost_rx_buffer(pair_idx, state, token)?;
+                return Err(IoError::DeviceFault);
+            }
+
+            let slot = &mut frames[received];
+            assert!(slot.is_none(), "virtio net RX batch slot was not empty");
+            *slot = Some(self.rx_frame_from_slot(pair_idx, token, used_len));
+            received += 1;
+        }
+        Ok(received)
     }
 
     pub async fn repost_rx_frame(&self, frame: RxFrame) -> IoResult<()> {

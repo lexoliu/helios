@@ -289,6 +289,22 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Variant of `try_receive_frames_immediate` that drains a specific
+    /// RX queue pair so per-processor pollers do not contend on the
+    /// other pairs. Defaults to the all-pairs path for single-queue
+    /// devices.
+    fn try_receive_frames_immediate_on<'a, 'slots>(
+        &'a self,
+        queue_idx: usize,
+        frames: &'slots mut [Option<Bytes>],
+    ) -> IoResult<Option<usize>>
+    where
+        'a: 'slots,
+    {
+        let _ = queue_idx;
+        self.try_receive_frames_immediate(frames)
+    }
+
     /// Releases an owning device RX frame back to the interface.
     fn repost_rx_frame<'a>(
         &'a self,

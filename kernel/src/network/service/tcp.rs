@@ -662,10 +662,11 @@ where
             let receive_limit = remaining_rx_budget.min(NETWORK_RX_BATCH_FRAMES);
             let mut frames: [Option<Bytes>; NETWORK_RX_BATCH_FRAMES] =
                 core::array::from_fn(|_| None);
+            let poll_pair = usize::from(self.inner.cpu.current_processor().id());
             let received_batch = match self
                 .inner
                 .device
-                .try_receive_frames_immediate(&mut frames[..receive_limit])?
+                .try_receive_frames_immediate_on(poll_pair, &mut frames[..receive_limit])?
             {
                 Some(received_batch) => received_batch,
                 None => {

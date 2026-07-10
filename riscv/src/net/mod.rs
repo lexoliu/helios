@@ -244,6 +244,18 @@ impl NetworkDevice for VirtioNetworkDevice {
             .await
     }
 
+    fn try_receive_frames_immediate_on<'a, 'slots>(
+        &'a self,
+        queue_idx: usize,
+        frames: &'slots mut [Option<bytes::Bytes>],
+    ) -> Result<Option<usize>, IoError>
+    where
+        'a: 'slots,
+    {
+        self.inner
+            .try_receive_frames_immediate_on_pair(queue_idx, frames)
+    }
+
     fn try_transmit_slices_immediate(
         &self,
         frames: &[helios_kernel::TxFrameRef<'_>],
