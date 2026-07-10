@@ -516,7 +516,7 @@ mod tests {
             EmbeddedBootFile::new("etc/config.txt", b"config", 0),
         ],
     );
-    const MACRO_IMAGE: EmbeddedBootFs = bootfs!("src/bootfs_test_data");
+    const MACRO_IMAGE: EmbeddedBootFs = bootfs!("tests/bootfs_data");
 
     #[test]
     fn lists_root_entries() {

@@ -43,7 +43,6 @@ use alloc::alloc::{Layout, alloc_zeroed};
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::ffi::c_int;
-use core::ops::Range;
 use core::ptr;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -74,8 +73,6 @@ const PTE_READ: u64 = 1 << 1;
 const PTE_WRITE: u64 = 1 << 2;
 const PTE_EXECUTE: u64 = 1 << 3;
 const PTE_USER: u64 = 1 << 4;
-#[allow(dead_code)]
-const PTE_GLOBAL: u64 = 1 << 5;
 const PTE_ACCESSED: u64 = 1 << 6;
 const PTE_DIRTY: u64 = 1 << 7;
 const PTE_PPN_SHIFT: u32 = 10;
@@ -619,12 +616,6 @@ const _: () = {
     assert!(USER_VA_END > USER_VA_BASE);
 };
 
-/// Range covered by the kernel identity map, used by sanity checks
-/// in tests / assertions elsewhere in the backend.
-#[allow(dead_code)]
-pub fn identity_map_range() -> Range<usize> {
-    0..(KERNEL_IDENTITY_GIB * GIB)
-}
 
 /// Register the boot-time `RiscvUserAddressSpace` as the active
 /// runtime custom-virtual-memory backend. Must be called once on

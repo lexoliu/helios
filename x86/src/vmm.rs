@@ -34,7 +34,6 @@ use helios_kernel::{
 use spin::{Mutex, Once};
 use x86_64::PhysAddr;
 use x86_64::VirtAddr as X86VirtAddr;
-use x86_64::instructions::tlb::flush as invalidate_local_tlb;
 use x86_64::structures::paging::mapper::TranslateResult;
 use x86_64::structures::paging::{
     Mapper, OffsetPageTable, Page, PageTableFlags, Size4KiB, Translate,
@@ -503,12 +502,6 @@ fn page_flags_to_pt(flags: PageFlags) -> Result<PageTableFlags, AddressSpaceErro
     Ok(pt)
 }
 
-#[allow(dead_code)]
-fn invlpg_range(virt: VirtRange) {
-    for offset in (0..virt.byte_len).step_by(PAGE) {
-        invalidate_local_tlb(X86VirtAddr::new((virt.start.raw() + offset) as u64));
-    }
-}
 
 static USER_AS: Once<X86UserAddressSpace> = Once::new();
 

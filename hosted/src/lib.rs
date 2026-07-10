@@ -17,7 +17,6 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::any::Any;
 use std::fmt;
-use std::panic::PanicHookInfo;
 
 use config::HostedConfig;
 use runtime::HostedRuntime;
@@ -48,6 +47,3 @@ impl fmt::Display for PanicPayload<'_> {
         f.write_str("non-string panic payload")
     }
 }
-
-#[allow(dead_code)]
-fn _panic_hook_typecheck(_: &PanicHookInfo<'_>) {}
