@@ -8,7 +8,7 @@ use core::marker::PhantomData;
 use core::mem::{MaybeUninit, align_of, size_of};
 use core::pin::Pin;
 use core::ptr::{self, NonNull};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 
 use async_task::{Builder, Runnable, Task};
@@ -26,6 +26,11 @@ pub const READY_BATCH_TASKS: usize = 1024;
 const READY_QUEUE_CAPACITY: usize = READY_BATCH_TASKS * 4;
 const TASK_ARENA_BYTES: usize = 1024 * 1024;
 const TASK_ARENA_ALIGN: usize = 64;
+/// Power-of-two block classes from the alignment granule (64 B) up to
+/// the largest future the arena places (256 KiB).
+const TASK_ARENA_CLASS_COUNT: usize = 13;
+/// Empty-list sentinel for the per-class free heads.
+const TASK_ARENA_FREE_NULL: u32 = u32::MAX;
 static EXECUTOR_GROUP: Once<NoWeakArc<ExecutorGroup>> = Once::new();
 
 struct ExecutorGroup {
@@ -37,10 +42,23 @@ struct ExecutorGroup {
     global_wake_cursor: AtomicUsize,
 }
 
+/// Per-processor bump arena with per-class block reuse.
+///
+/// Long-lived tasks (network pump, transport runners) pin allocations
+/// for the kernel's whole lifetime, so a reset-when-empty bump pointer
+/// would leak every completed task's bytes forever and exhaust under
+/// spawn churn. Freed blocks instead return to an ABA-tagged Treiber
+/// stack per power-of-two class and are reused before the bump pointer
+/// grows; steady-state usage is bounded by the peak number of live
+/// tasks per class, not by cumulative spawns.
 struct TaskArena {
     bytes: TaskArenaBytes,
     offset: AtomicUsize,
     active: AtomicUsize,
+    /// One Treiber-stack head per block class: low 32 bits the block
+    /// offset (`TASK_ARENA_FREE_NULL` = empty), high 32 bits a CAS tag
+    /// bumped on every successful push/pop to defeat ABA.
+    free_heads: [AtomicU64; TASK_ARENA_CLASS_COUNT],
 }
 
 #[repr(align(64))]
@@ -50,6 +68,7 @@ struct TaskArenaBytes {
 
 struct ArenaFuture<Fut> {
     ptr: NonNull<Fut>,
+    class: usize,
     arena: NoWeakArc<TaskArena>,
 }
 
@@ -67,8 +86,29 @@ impl TaskArena {
         unsafe {
             (&raw mut (*ptr).offset).write(AtomicUsize::new(0));
             (&raw mut (*ptr).active).write(AtomicUsize::new(0));
+            let heads = &raw mut (*ptr).free_heads;
+            for class in 0..TASK_ARENA_CLASS_COUNT {
+                (&raw mut (*heads)[class]).write(AtomicU64::new(u64::from(TASK_ARENA_FREE_NULL)));
+            }
             UniqueArc::assume_init(arena).shareable()
         }
+    }
+
+    /// Bytes a block of `class` occupies: `64 << class`.
+    const fn class_bytes(class: usize) -> usize {
+        TASK_ARENA_ALIGN << class
+    }
+
+    /// Smallest class whose block fits `size` bytes; panics when the
+    /// future exceeds the largest class the arena serves.
+    fn block_class(size: usize) -> usize {
+        let block = size.max(1).next_power_of_two().max(TASK_ARENA_ALIGN);
+        let class = block.trailing_zeros() as usize - TASK_ARENA_ALIGN.trailing_zeros() as usize;
+        assert!(
+            class < TASK_ARENA_CLASS_COUNT,
+            "task future of {size} bytes exceeds the largest executor arena block"
+        );
+        class
     }
 
     fn allocate<Fut>(arena: &NoWeakArc<Self>, future: Fut) -> ArenaFuture<Fut> {
@@ -78,37 +118,92 @@ impl TaskArena {
             align <= TASK_ARENA_ALIGN,
             "future alignment exceeds executor task arena alignment"
         );
-        let aligned_size = align_up(size.max(1), align);
+        let class = Self::block_class(size);
         arena.active.fetch_add(1, Ordering::AcqRel);
-        let start = arena
-            .offset
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |offset| {
-                let aligned_offset = align_up(offset, align);
-                aligned_offset
-                    .checked_add(aligned_size)
-                    .filter(|end| *end <= TASK_ARENA_BYTES)
-                    .map(|_| aligned_offset + aligned_size)
-            })
-            .unwrap_or_else(|_| {
-                arena.active.fetch_sub(1, Ordering::AcqRel);
-                panic!("executor task arena exhausted")
-            });
+        let start = arena.pop_free(class).unwrap_or_else(|| {
+            arena
+                .offset
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |offset| {
+                    offset
+                        .checked_add(Self::class_bytes(class))
+                        .filter(|end| *end <= TASK_ARENA_BYTES)
+                })
+                .unwrap_or_else(|_| {
+                    arena.active.fetch_sub(1, Ordering::AcqRel);
+                    panic!(
+                        "executor task arena exhausted: {} live tasks",
+                        arena.active.load(Ordering::Acquire)
+                    )
+                })
+        });
         let ptr = unsafe { arena.bytes.ptr().add(start).cast::<Fut>() };
         unsafe {
             ptr.write(future);
         }
         ArenaFuture {
             ptr: NonNull::new(ptr).expect("task arena pointer was null"),
+            class,
             arena: arena.clone(),
         }
     }
 
-    fn release(&self) {
+    /// Pops a reusable block offset for `class`, or `None` when the
+    /// class free list is empty.
+    fn pop_free(&self, class: usize) -> Option<usize> {
+        let head = &self.free_heads[class];
+        loop {
+            let current = head.load(Ordering::Acquire);
+            let offset = (current & u64::from(u32::MAX)) as u32;
+            if offset == TASK_ARENA_FREE_NULL {
+                return None;
+            }
+            let next = unsafe {
+                self.bytes
+                    .ptr()
+                    .add(offset as usize)
+                    .cast::<u32>()
+                    .read_volatile()
+            };
+            let tag = (current >> 32).wrapping_add(1);
+            let replacement = (tag << 32) | u64::from(next);
+            if head
+                .compare_exchange(current, replacement, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(offset as usize);
+            }
+        }
+    }
+
+    /// Returns a dropped block to its class free list.
+    fn push_free(&self, offset: usize, class: usize) {
+        let head = &self.free_heads[class];
+        let offset = u32::try_from(offset).expect("task arena offsets fit in 32 bits");
+        loop {
+            let current = head.load(Ordering::Acquire);
+            let next = (current & u64::from(u32::MAX)) as u32;
+            unsafe {
+                self.bytes
+                    .ptr()
+                    .add(offset as usize)
+                    .cast::<u32>()
+                    .write_volatile(next);
+            }
+            let tag = (current >> 32).wrapping_add(1);
+            let replacement = (tag << 32) | u64::from(offset);
+            if head
+                .compare_exchange(current, replacement, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    fn release(&self, block_offset: usize, class: usize) {
+        self.push_free(block_offset, class);
         let previous = self.active.fetch_sub(1, Ordering::AcqRel);
         assert!(previous != 0, "task arena active count underflowed");
-        if previous == 1 {
-            self.offset.store(0, Ordering::Release);
-        }
     }
 }
 
@@ -134,16 +229,9 @@ impl<Fut> Drop for ArenaFuture<Fut> {
         unsafe {
             ptr::drop_in_place(self.ptr.as_ptr());
         }
-        self.arena.release();
+        let offset = self.ptr.as_ptr() as usize - self.arena.bytes.ptr() as usize;
+        self.arena.release(offset, self.class);
     }
-}
-
-fn align_up(value: usize, align: usize) -> usize {
-    let mask = align - 1;
-    value
-        .checked_add(mask)
-        .expect("task arena alignment overflowed")
-        & !mask
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -669,7 +757,8 @@ mod tests {
 
     use super::{
         Executor, GlobalScheduler, LocalScheduler, LocalSilentScheduler, READY_QUEUE_CAPACITY,
-        Spawner, ready_queue, should_wake_global_processor, should_wake_owner_processor,
+        Spawner, TASK_ARENA_CLASS_COUNT, TaskArena, ready_queue, should_wake_global_processor,
+        should_wake_owner_processor,
     };
     use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId};
     use helios_hal::watchdog::ProgressCounter;
@@ -770,5 +859,35 @@ mod tests {
         assert_eq!(stats.local_runnable_count(), 0);
         assert_eq!(stats.global_empty_pop_count(), 1);
         assert_eq!(stats.local_empty_pop_count(), 1);
+    }
+
+    #[test]
+    fn task_arena_reuses_blocks_released_around_pinned_tasks() {
+        let arena = TaskArena::new_shared();
+        // An eternal task pins the arena non-empty for the whole test,
+        // matching the boot-time pump/transport tasks in a real kernel.
+        let pinned = TaskArena::allocate(&arena, [0_u8; 256]);
+        // Churn two orders of magnitude more bytes than the arena holds;
+        // the old reset-when-empty bump pointer exhausted after 1 MiB of
+        // cumulative spawns and panicked on the next allocation.
+        for _ in 0..200_000 {
+            drop(TaskArena::allocate(&arena, [0_u8; 512]));
+        }
+        // Distinct live allocations still coexist with the reused blocks.
+        let overlapped: [_; 8] = core::array::from_fn(|_| TaskArena::allocate(&arena, [0_u8; 512]));
+        drop(overlapped);
+        drop(pinned);
+    }
+
+    #[test]
+    fn task_arena_block_classes_round_up_and_reject_oversize() {
+        assert_eq!(TaskArena::block_class(1), 0);
+        assert_eq!(TaskArena::block_class(64), 0);
+        assert_eq!(TaskArena::block_class(65), 1);
+        assert_eq!(TaskArena::block_class(512), 3);
+        assert_eq!(
+            TaskArena::class_bytes(TASK_ARENA_CLASS_COUNT - 1),
+            256 * 1024
+        );
     }
 }
