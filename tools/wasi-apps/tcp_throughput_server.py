@@ -24,6 +24,20 @@ class TcpThroughputServer(socketserver.ThreadingTCPServer):
 
 class TcpThroughputHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
+        # Dual mode: a download client connects and only reads, so no
+        # data arrives here within the probe window and the payload is
+        # streamed. An upload client starts writing immediately; every
+        # received byte is discarded (sink) until it closes.
+        self.request.settimeout(0.25)
+        try:
+            first = self.request.recv(1024 * 1024)
+        except TimeoutError:
+            first = b""
+        self.request.settimeout(None)
+        if first:
+            while self.request.recv(1024 * 1024):
+                pass
+            return
         remaining = self.server.payload_bytes
         while remaining:
             chunk = PAYLOAD_CHUNK[: min(remaining, len(PAYLOAD_CHUNK))]

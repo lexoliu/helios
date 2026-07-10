@@ -8,8 +8,16 @@ type Result<T> = core::result::Result<T, TcpThroughputError>;
 
 #[derive(Debug, Error)]
 enum TcpThroughputError {
-    #[error("usage: tcp-throughput <host> <port> <expected-bytes>")]
+    #[error("usage: tcp-throughput <host> <port> <bytes> [up]")]
     Usage,
+    #[error("unknown transfer mode `{0}`; expected `up`")]
+    UnknownMode(String),
+    #[error("tcp write failed after {bytes_written} bytes: {source}")]
+    TcpWrite {
+        bytes_written: u64,
+        #[source]
+        source: io::Error,
+    },
     #[error("unexpected argument `{0}`")]
     UnexpectedArgument(String),
     #[error("invalid TCP port `{raw}`")]
@@ -49,6 +57,7 @@ struct TcpThroughputArgs {
     host: String,
     port: u16,
     expected_bytes: u64,
+    upload: bool,
 }
 
 fn parse_args() -> Result<TcpThroughputArgs> {
@@ -56,6 +65,11 @@ fn parse_args() -> Result<TcpThroughputArgs> {
     let host = args.next().ok_or(TcpThroughputError::Usage)?;
     let port_raw = args.next().ok_or(TcpThroughputError::Usage)?;
     let expected_raw = args.next().ok_or(TcpThroughputError::Usage)?;
+    let upload = match args.next() {
+        None => false,
+        Some(mode) if mode == "up" => true,
+        Some(mode) => return Err(TcpThroughputError::UnknownMode(mode)),
+    };
     if let Some(extra) = args.next() {
         return Err(TcpThroughputError::UnexpectedArgument(extra));
     }
@@ -76,6 +90,7 @@ fn parse_args() -> Result<TcpThroughputArgs> {
         host,
         port,
         expected_bytes,
+        upload,
     })
 }
 
@@ -88,6 +103,9 @@ async fn run() -> Result<()> {
             port: args.port,
             source,
         })?;
+    if args.upload {
+        return upload(&stream, args.expected_bytes).await;
+    }
     let mut total = 0u64;
     while let Some(chunk) =
         stream
@@ -110,6 +128,36 @@ async fn run() -> Result<()> {
         });
     }
     println!("tcp-throughput:{total}");
+    Ok(())
+}
+
+/// Streams `total_bytes` to the sink server and reports the byte count.
+async fn upload(stream: &TcpStream, total_bytes: u64) -> Result<()> {
+    const UPLOAD_CHUNK_BYTES: usize = 256 * 1024;
+    let chunk: Vec<u8> = (0..UPLOAD_CHUNK_BYTES)
+        .map(|index| (index & 0xff) as u8)
+        .collect();
+    let mut written = 0u64;
+    while written < total_bytes {
+        let remaining = total_bytes - written;
+        let len = remaining.min(UPLOAD_CHUNK_BYTES as u64) as usize;
+        stream
+            .write_all(&chunk[..len])
+            .await
+            .map_err(|source| TcpThroughputError::TcpWrite {
+                bytes_written: written,
+                source,
+            })?;
+        written += len as u64;
+    }
+    stream
+        .close()
+        .await
+        .map_err(|source| TcpThroughputError::TcpWrite {
+            bytes_written: written,
+            source,
+        })?;
+    println!("tcp-upload:{written}");
     Ok(())
 }
 

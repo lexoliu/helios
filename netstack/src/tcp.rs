@@ -17,6 +17,11 @@ pub const MAX_TCP_RECEIVE_SEGMENTS: usize =
     (TCP_RECEIVE_WINDOW_BYTES + TCP_RECEIVE_SEGMENT_BYTES - 1) / TCP_RECEIVE_SEGMENT_BYTES;
 pub const MAX_TCP_OUT_OF_ORDER_SEGMENTS: usize = 32;
 pub const MAX_TCP_QUEUED_SEGMENTS: usize = 32;
+/// In-flight (sent, unacknowledged) segment capacity. Sized so a full
+/// transmit window of MSS-sized segments fits: the old 32-segment cap
+/// (about 46 KiB) sat below a plain 64 KiB peer window and the first
+/// bulk upload overflowed it.
+pub const MAX_TCP_IN_FLIGHT_SEGMENTS: usize = MAX_TCP_RECEIVE_SEGMENTS;
 pub const TCP_TRANSMIT_BUFFER_BYTES: usize = TCP_RECEIVE_WINDOW_BYTES;
 // Local divan `tcp_ack_discards_in_flight_segments` and
 // `tcp_single_segment_transmit` keep this reservation tied to measured stream
@@ -303,11 +308,15 @@ impl TcpInFlightQueue {
     }
 
     fn push_back(&mut self, segment: TcpInFlightSegment) -> Result<(), TcpInFlightSegment> {
-        if self.segments.len() >= MAX_TCP_QUEUED_SEGMENTS {
+        if self.is_full() {
             return Err(segment);
         }
         self.segments.push_back(segment);
         Ok(())
+    }
+
+    fn is_full(&self) -> bool {
+        self.segments.len() >= MAX_TCP_IN_FLIGHT_SEGMENTS
     }
 
     fn pop_front(&mut self) -> Option<TcpInFlightSegment> {
@@ -905,6 +914,17 @@ where
             self.available_send_window()
         };
         if available_window == 0 {
+            return None;
+        }
+        // A full in-flight queue closes the effective send window until
+        // ACKs drain it; emitting another segment would have nowhere to
+        // record its retransmission state.
+        if persist_probe.is_none()
+            && self
+                .in_flight
+                .as_ref()
+                .is_some_and(TcpInFlightQueue::is_full)
+        {
             return None;
         }
         if matches!(
@@ -3277,6 +3297,47 @@ mod tests {
     }
 
     #[test]
+    fn full_in_flight_queue_closes_emission_instead_of_panicking() {
+        let mut socket = established_scaled_socket();
+        socket.update_peer_receive_window(u16::MAX);
+        assert_eq!(socket.queue_send(b"pending payload"), 15);
+
+        // Saturate the in-flight queue the way a long bulk upload does
+        // once the congestion window has grown past it; before the
+        // emission gate the next segment panicked on the full queue.
+        let local = endpoint(49152);
+        let remote = peer(80);
+        for value in 0..MAX_TCP_IN_FLIGHT_SEGMENTS {
+            socket
+                .in_flight_mut()
+                .push_back(TcpInFlightSegment {
+                    header: TcpHeader {
+                        source_port: local.port,
+                        destination_port: remote.port,
+                        sequence: value as u32,
+                        acknowledgement: 0,
+                        flags: TcpFlags::ACK,
+                        window_size: u16::MAX,
+                    },
+                    options: TcpHeaderOptions::empty(),
+                    payload: Bytes::from_static(b"x"),
+                    sequence_len: 1,
+                    sent_at_nanos: 0,
+                    retransmissions: 0,
+                    sacked: false,
+                })
+                .expect("in-flight fill within capacity");
+        }
+
+        assert!(
+            socket
+                .take_transmit_segment(TCP_INITIAL_RTO_NANOS, usize::MAX)
+                .is_none(),
+            "a full in-flight queue must close the send window"
+        );
+    }
+
+    #[test]
     fn transmit_and_in_flight_queues_preserve_capacity() {
         let mut transmit = TcpTransmitQueue::new();
         for value in 0..MAX_TCP_QUEUED_SEGMENTS {
@@ -3300,7 +3361,7 @@ mod tests {
         let mut in_flight = TcpInFlightQueue::new();
         let local = endpoint(49152);
         let remote = peer(80);
-        for value in 0..MAX_TCP_QUEUED_SEGMENTS {
+        for value in 0..MAX_TCP_IN_FLIGHT_SEGMENTS {
             in_flight
                 .push_back(TcpInFlightSegment {
                     header: TcpHeader {
@@ -3326,7 +3387,7 @@ mod tests {
                     header: TcpHeader {
                         source_port: local.port,
                         destination_port: remote.port,
-                        sequence: MAX_TCP_QUEUED_SEGMENTS as u32,
+                        sequence: MAX_TCP_IN_FLIGHT_SEGMENTS as u32,
                         acknowledgement: 0,
                         flags: TcpFlags::ACK,
                         window_size: u16::MAX,

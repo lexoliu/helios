@@ -18,8 +18,12 @@
           "let s = 0; for (let i = 0; i < 250000; i++) s = (s + ((i * 17) % 97)) | 0; console.log(\"quickjs-loop:\" + s);"
         ]
       },
-      "boot_programs": ["quickjs"],
-      "stdout_contains": ["quickjs-loop:"],
+      "boot_programs": [
+        "quickjs"
+      ],
+      "stdout_contains": [
+        "quickjs-loop:"
+      ],
       "stderr_empty": true
     },
     {
@@ -34,15 +38,24 @@
       ],
       "wasmtime_profile": {
         "wasm_path": "artifacts/python3-root/python3.wasm",
-        "guest_paths": ["artifacts/python3-root"],
-        "wasmtime_flags": ["--dir", "{repo_root}/artifacts/python3-root::/"],
+        "guest_paths": [
+          "artifacts/python3-root"
+        ],
+        "wasmtime_flags": [
+          "--dir",
+          "{repo_root}/artifacts/python3-root::/"
+        ],
         "args": [
           "-c",
           "import json; data=[{\"i\":i,\"s\":str(i)} for i in range(800)]; total=sum(len(json.loads(json.dumps(data,separators=(\",\",\":\")))) for _ in range(40)); print(f\"cpython-json:{total}\")"
         ]
       },
-      "boot_programs": ["python3"],
-      "stdout_contains": ["cpython-json:32000"]
+      "boot_programs": [
+        "python3"
+      ],
+      "stdout_contains": [
+        "cpython-json:32000"
+      ]
     },
     {
       "name": "cpython-regex",
@@ -56,15 +69,24 @@
       ],
       "wasmtime_profile": {
         "wasm_path": "artifacts/python3-root/python3.wasm",
-        "guest_paths": ["artifacts/python3-root"],
-        "wasmtime_flags": ["--dir", "{repo_root}/artifacts/python3-root::/"],
+        "guest_paths": [
+          "artifacts/python3-root"
+        ],
+        "wasmtime_flags": [
+          "--dir",
+          "{repo_root}/artifacts/python3-root::/"
+        ],
         "args": [
           "-c",
           "import re; text=(\"alpha123 beta456 gamma789 delta000\\n\"*2000); total=sum(len(re.findall(r\"[a-z]+\\d+\", text)) for _ in range(80)); print(f\"cpython-regex:{total}\")"
         ]
       },
-      "boot_programs": ["python3"],
-      "stdout_contains": ["cpython-regex:640000"]
+      "boot_programs": [
+        "python3"
+      ],
+      "stdout_contains": [
+        "cpython-regex:640000"
+      ]
     },
     {
       "name": "aot-curl",
@@ -81,11 +103,15 @@
       "runner": "program",
       "description": "Execute a deterministic wasm SIMD lane computation.",
       "program": "{simd_lanes}",
-      "boot_programs": ["simd-lanes"],
+      "boot_programs": [
+        "simd-lanes"
+      ],
       "wasmtime_profile": {
         "wasm_path": "artifacts/wasix/simd-lanes/simd-lanes.wasm"
       },
-      "stdout_contains": ["simd-lanes:17"],
+      "stdout_contains": [
+        "simd-lanes:17"
+      ],
       "stderr_empty": true
     },
     {
@@ -94,8 +120,12 @@
       "runner": "shell",
       "description": "Repeated shell command startup.",
       "command": "i=0; while [ $i -lt 20 ]; do {dash} -c true; i=$((i+1)); done; echo process-startup:ok",
-      "boot_programs": ["dash"],
-      "stdout_contains": ["process-startup:ok"],
+      "boot_programs": [
+        "dash"
+      ],
+      "stdout_contains": [
+        "process-startup:ok"
+      ],
       "stderr_empty": true
     },
     {
@@ -104,8 +134,14 @@
       "runner": "shell",
       "description": "Generate bytes, pipe through cat, write and read the result.",
       "command": "out=/pipe-$HELIOS_PROCESS_ID.out; copy=/pipe-$HELIOS_PROCESS_ID.copy; {head} --bytes=131072 /bin/bash | {cat} > $out; {cat} $out > $copy; {cat} $copy >/dev/null; echo stdio-pipe:ok",
-      "boot_programs": ["bash", "cat", "head"],
-      "stdout_contains": ["stdio-pipe:ok"],
+      "boot_programs": [
+        "bash",
+        "cat",
+        "head"
+      ],
+      "stdout_contains": [
+        "stdio-pipe:ok"
+      ],
       "stderr_empty": true
     },
     {
@@ -114,8 +150,13 @@
       "runner": "shell",
       "description": "Create, read, and copy many small files.",
       "command": "dir=/bench-smallfiles-$HELIOS_PROCESS_ID; {mkdir} $dir; i=0; while [ $i -lt 64 ]; do echo data-$i > $dir/f$i; {cat} $dir/f$i > $dir/c$i; i=$((i+1)); done; echo fs-smallfiles:ok",
-      "boot_programs": ["mkdir", "cat"],
-      "stdout_contains": ["fs-smallfiles:ok"],
+      "boot_programs": [
+        "mkdir",
+        "cat"
+      ],
+      "stdout_contains": [
+        "fs-smallfiles:ok"
+      ],
       "stderr_empty": true
     },
     {
@@ -124,8 +165,14 @@
       "runner": "shell",
       "description": "Sequential read of a larger generated file.",
       "command": "file=/bench-readstream-$HELIOS_PROCESS_ID.in; copy=/bench-readstream-$HELIOS_PROCESS_ID.out; {head} --bytes=1048576 /bin/bash > $file; {cat} $file > $copy; {cat} $copy >/dev/null; echo fs-readstream:ok",
-      "boot_programs": ["bash", "cat", "head"],
-      "stdout_contains": ["fs-readstream:ok"],
+      "boot_programs": [
+        "bash",
+        "cat",
+        "head"
+      ],
+      "stdout_contains": [
+        "fs-readstream:ok"
+      ],
       "stderr_empty": true
     },
     {
@@ -134,9 +181,15 @@
       "runner": "program",
       "description": "Fetch from a deterministic local HTTP server.",
       "program": "{curl}",
-      "args": ["{host_http_url}"],
-      "boot_programs": ["curl"],
-      "stdout_contains": ["helios-linux-gap:ok"],
+      "args": [
+        "{host_http_url}"
+      ],
+      "boot_programs": [
+        "curl"
+      ],
+      "stdout_contains": [
+        "helios-linux-gap:ok"
+      ],
       "stderr_empty": true,
       "requires_host_http": true
     },
@@ -151,11 +204,37 @@
         "{host_tcp_port}",
         "67108864"
       ],
-      "boot_programs": ["tcp-throughput"],
-      "stdout_contains": ["tcp-throughput:67108864"],
+      "boot_programs": [
+        "tcp-throughput"
+      ],
+      "stdout_contains": [
+        "tcp-throughput:67108864"
+      ],
       "stderr_empty": true,
       "requires_host_tcp": true,
       "throughput_bytes": 67108864
+    },
+    {
+      "name": "tcp-upload",
+      "class": "io-bound",
+      "runner": "program",
+      "description": "Stream 64 MiB from the guest to a host TCP sink.",
+      "program": "{tcp_throughput}",
+      "args": [
+        "{host_tcp_host}",
+        "{host_tcp_port}",
+        "67108864",
+        "up"
+      ],
+      "requires_host_tcp": true,
+      "throughput_bytes": 67108864,
+      "boot_programs": [
+        "tcp-throughput"
+      ],
+      "stdout_contains": [
+        "tcp-upload:67108864"
+      ],
+      "stderr_empty": true
     },
     {
       "name": "wasix-tcp-throughput",
@@ -168,8 +247,12 @@
         "{host_tcp_port}",
         "67108864"
       ],
-      "boot_programs": ["wasix-tcp-throughput"],
-      "stdout_contains": ["wasix-tcp-throughput:67108864"],
+      "boot_programs": [
+        "wasix-tcp-throughput"
+      ],
+      "stdout_contains": [
+        "wasix-tcp-throughput:67108864"
+      ],
       "stderr_empty": true,
       "requires_host_tcp": true,
       "throughput_bytes": 67108864
@@ -185,17 +268,24 @@
         "{host_tcp_port}",
         "67108864"
       ],
-      "boot_programs": ["wasi-tcp-throughput"],
+      "boot_programs": [
+        "wasi-tcp-throughput"
+      ],
       "wasmtime_profile": {
         "wasm_path": "artifacts/wasi-tools/wasi-tcp-throughput.wasm",
-        "wasmtime_flags": ["-S", "inherit-network=y"],
+        "wasmtime_flags": [
+          "-S",
+          "inherit-network=y"
+        ],
         "args": [
           "{host_tcp_host}",
           "{host_tcp_port}",
           "67108864"
         ]
       },
-      "stdout_contains": ["wasi-tcp-throughput:67108864"],
+      "stdout_contains": [
+        "wasi-tcp-throughput:67108864"
+      ],
       "stderr_empty": true,
       "requires_host_tcp": true,
       "throughput_bytes": 67108864
@@ -213,8 +303,12 @@
         "curl-http-throughput:%{size_download}\\n",
         "{host_http_large_url}"
       ],
-      "boot_programs": ["curl"],
-      "stdout_contains": ["curl-http-throughput:67108864"],
+      "boot_programs": [
+        "curl"
+      ],
+      "stdout_contains": [
+        "curl-http-throughput:67108864"
+      ],
       "stderr_empty": true,
       "requires_host_http": true,
       "throughput_bytes": 67108864
