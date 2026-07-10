@@ -543,6 +543,10 @@ where
     receive_next: u32,
     advertised_window: u16,
     peer_max_segment_size: usize,
+    /// Scale applied to our advertised window. Zero until the handshake
+    /// proves the peer sent a window-scale option; RFC 7323 only permits
+    /// scaling when both SYNs carried the option.
+    local_window_scale: u8,
     peer_window_scale: u8,
     peer_receive_window: u32,
     peer_sack_permitted: bool,
@@ -586,8 +590,9 @@ where
             send_next: 0,
             send_unacknowledged: 0,
             receive_next: 0,
-            advertised_window: receive_window_size(0, TCP_LOCAL_WINDOW_SCALE),
+            advertised_window: receive_window_size(0, 0),
             peer_max_segment_size: TCP_RECEIVE_SEGMENT_BYTES,
+            local_window_scale: 0,
             peer_window_scale: 0,
             peer_receive_window: u32::from(u16::MAX),
             peer_sack_permitted: false,
@@ -686,7 +691,8 @@ where
             sequence: self.send_unacknowledged,
             acknowledgement: 0,
             flags: TcpFlags::SYN,
-            window_size: self.advertised_window,
+            // The window field in a SYN segment is never scaled.
+            window_size: receive_window_size(self.receive_buffered_bytes(), 0),
         })
     }
 
@@ -702,7 +708,8 @@ where
             sequence: self.send_unacknowledged,
             acknowledgement: self.receive_next,
             flags: TcpFlags::SYN.union(TcpFlags::ACK),
-            window_size: self.advertised_window,
+            // The window field in a SYN segment is never scaled.
+            window_size: receive_window_size(self.receive_buffered_bytes(), 0),
         })
     }
 
@@ -818,6 +825,12 @@ where
 
     pub const fn peer_window_scale(&self) -> u8 {
         self.peer_window_scale
+    }
+
+    /// Scale applied to our advertised window: zero unless the peer's
+    /// SYN negotiated window scaling.
+    pub const fn local_window_scale(&self) -> u8 {
+        self.local_window_scale
     }
 
     pub const fn peer_receive_window(&self) -> u32 {
@@ -1853,7 +1866,7 @@ where
 
     fn refresh_advertised_window(&mut self) {
         self.advertised_window =
-            receive_window_size(self.receive_buffered_bytes(), TCP_LOCAL_WINDOW_SCALE);
+            receive_window_size(self.receive_buffered_bytes(), self.local_window_scale);
     }
 
     fn receive_buffered_bytes(&self) -> usize {
@@ -2198,6 +2211,14 @@ where
         if let Some(shift) = packet.options.window_scale() {
             self.peer_window_scale = shift.min(TCP_MAX_WINDOW_SCALE);
         }
+        // RFC 7323: window scaling is in effect only when both SYNs carry
+        // the option; we always offer it, so the peer's SYN decides.
+        self.local_window_scale = if packet.options.window_scale().is_some() {
+            TCP_LOCAL_WINDOW_SCALE
+        } else {
+            0
+        };
+        self.refresh_advertised_window();
         self.update_peer_receive_window(packet.window_size);
         self.peer_sack_permitted = packet.options.sack_permitted();
         self.record_peer_timestamp(packet.options.timestamp());
@@ -2489,6 +2510,30 @@ mod tests {
                 flags: TcpFlags::SYN.union(TcpFlags::ACK),
                 window_size: u16::MAX,
                 options: TcpOptions::empty(),
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS,
+        );
+        socket.mark_ack_queued();
+        socket
+    }
+
+    /// Like [`established_socket`], but the peer negotiates window
+    /// scaling so our advertised window is scaled too.
+    fn established_scaled_socket() -> TcpSocket<BbrV3> {
+        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+        socket.mark_syn_queued(0);
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+                options: TcpOptions::parse(&[3, 3, TCP_LOCAL_WINDOW_SCALE, 0])
+                    .expect("window scale option should parse"),
                 payload: &[],
             },
             TCP_INITIAL_RTO_NANOS,
@@ -3713,6 +3758,103 @@ mod tests {
     }
 
     #[test]
+    fn advertised_window_stays_unscaled_without_peer_wscale() {
+        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+        socket.mark_syn_queued(0);
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS,
+        );
+
+        assert_eq!(socket.state(), TcpState::Established);
+        assert_eq!(socket.local_window_scale(), 0);
+        // Large enough that the pre-fix scaled window drops below the
+        // u16 cap and would fail the unscaled assertion.
+        let payload = [0_u8; 1460];
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+                options: TcpOptions::empty(),
+                payload: &payload,
+            },
+            TCP_INITIAL_RTO_NANOS + 1,
+        );
+        assert_eq!(
+            socket.advertised_window(),
+            u16::MAX,
+            "without negotiated scaling the raw window must not be shifted"
+        );
+    }
+
+    #[test]
+    fn advertised_window_scales_after_peer_wscale() {
+        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
+        socket.mark_syn_queued(0);
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+                options: TcpOptions::parse(&[3, 3, 3, 0]).expect("window scale should parse"),
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS,
+        );
+
+        assert_eq!(socket.state(), TcpState::Established);
+        assert_eq!(socket.local_window_scale(), TCP_LOCAL_WINDOW_SCALE);
+        assert_eq!(
+            socket.advertised_window(),
+            receive_window_size(0, TCP_LOCAL_WINDOW_SCALE),
+        );
+    }
+
+    #[test]
+    fn syn_ack_window_is_unscaled_even_when_negotiated() {
+        let mut child = TcpSocket::accept(endpoint(80), peer(49152), 101, 700, BbrV3::new(1460));
+        child.record_peer_options(TcpPacket {
+            source_port: 49152,
+            destination_port: 80,
+            sequence: 100,
+            acknowledgement: 0,
+            flags: TcpFlags::SYN,
+            window_size: u16::MAX,
+            options: TcpOptions::parse(&[3, 3, 3, 0]).expect("window scale should parse"),
+            payload: &[],
+        });
+
+        assert_eq!(child.local_window_scale(), TCP_LOCAL_WINDOW_SCALE);
+        let syn_ack = child
+            .pending_syn_ack()
+            .expect("accepted child owes a SYN-ACK");
+        assert_eq!(
+            syn_ack.window_size,
+            receive_window_size(0, 0),
+            "the window field in a SYN segment is never scaled"
+        );
+    }
+
+    #[test]
     fn peer_receive_window_caps_transmitted_send_bytes() {
         let mut socket = established_socket();
         let _ = deliver_segment(
@@ -4260,22 +4402,7 @@ mod tests {
 
     #[test]
     fn receive_window_tracks_queued_payload_segments() {
-        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
-        socket.mark_syn_queued(0);
-        let _ = deliver_segment(
-            &mut socket,
-            TcpPacket {
-                source_port: 80,
-                destination_port: 49152,
-                sequence: 100,
-                acknowledgement: 8,
-                flags: TcpFlags::SYN.union(TcpFlags::ACK),
-                window_size: u16::MAX,
-                options: TcpOptions::empty(),
-                payload: &[],
-            },
-            TCP_INITIAL_RTO_NANOS,
-        );
+        let mut socket = established_scaled_socket();
         let open_window = socket.advertised_window();
         let payload = [0u8; TCP_RECEIVE_SEGMENT_BYTES];
         let queued_segments = 4;
@@ -4955,23 +5082,7 @@ mod tests {
 
     #[test]
     fn receive_window_update_ack_is_thresholded() {
-        let mut socket = TcpSocket::connect(endpoint(49152), peer(80), 7, BbrV3::new(1460));
-        socket.mark_syn_queued(0);
-        let _ = deliver_segment(
-            &mut socket,
-            TcpPacket {
-                source_port: 80,
-                destination_port: 49152,
-                sequence: 100,
-                acknowledgement: 8,
-                flags: TcpFlags::SYN.union(TcpFlags::ACK),
-                window_size: u16::MAX,
-                options: TcpOptions::empty(),
-                payload: &[],
-            },
-            TCP_INITIAL_RTO_NANOS,
-        );
-        socket.mark_ack_queued();
+        let mut socket = established_scaled_socket();
 
         let payload = [0u8; TCP_RECEIVE_SEGMENT_BYTES];
         let queued_segments =
