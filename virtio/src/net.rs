@@ -24,6 +24,10 @@ const DEFAULT_IP_MTU: usize = 1500;
 /// VIRTIO_NET_F_CSUM: the driver may submit frames with partial
 /// checksums that the device completes from csum_start/csum_offset.
 const NET_FEATURE_CSUM: u64 = 1 << 0;
+/// VIRTIO_NET_F_HOST_TSO4/6: the device performs TCP segmentation, so
+/// the driver may submit one oversized segment with GSO metadata.
+const NET_FEATURE_HOST_TSO4: u64 = 1 << 11;
+const NET_FEATURE_HOST_TSO6: u64 = 1 << 12;
 const NET_FEATURE_MAC: u64 = 1 << 5;
 const NET_FEATURE_STATUS: u64 = 1 << 16;
 const NET_FEATURE_MTU: u64 = 1 << 3;
@@ -139,6 +143,19 @@ impl TxFrame for helios_netstack::PacketBuffer {
 
 /// VIRTIO_NET_HDR_F_NEEDS_CSUM: csum_start/csum_offset are valid.
 const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
+const VIRTIO_NET_HDR_GSO_NONE: u8 = 0;
+const VIRTIO_NET_HDR_GSO_TCPV4: u8 = 1;
+const VIRTIO_NET_HDR_GSO_TCPV6: u8 = 4;
+
+/// TCP segmentation-offload metadata for one oversized transmit frame:
+/// the device splits it into `mss`-payload segments, replicating the
+/// `hdr_len`-byte header prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TxGsoMeta {
+    pub ipv6: bool,
+    pub hdr_len: u16,
+    pub mss: u16,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -220,6 +237,10 @@ pub struct VirtioNetDevice<T: VirtioTransport> {
     /// VIRTIO_NET_F_CSUM was negotiated: frames may carry partial
     /// checksums for the device to finish.
     tx_checksum_negotiated: bool,
+    /// VIRTIO_NET_F_HOST_TSO4/6 negotiated for the given families: the
+    /// driver may submit oversized TCP segments for device segmentation.
+    tso_v4_negotiated: bool,
+    tso_v6_negotiated: bool,
 }
 
 /// Control queue state: a single descriptor pair (header bytes
@@ -286,6 +307,15 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         } else {
             0
         };
+        // HOST_TSO requires CSUM; only ask for segmentation when both
+        // the device offers TSO and checksum is available.
+        let tso_supported = offered & NET_FEATURE_CSUM != 0
+            && offered & (NET_FEATURE_HOST_TSO4 | NET_FEATURE_HOST_TSO6) != 0;
+        let tso_mask = if tso_supported {
+            offered & (NET_FEATURE_HOST_TSO4 | NET_FEATURE_HOST_TSO6)
+        } else {
+            0
+        };
         let accepted = offered
             & (VirtioFeatures::VERSION_1.bits()
                 | VirtioFeatures::RING_EVENT_IDX.bits()
@@ -293,7 +323,8 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 | NET_FEATURE_MAC
                 | NET_FEATURE_STATUS
                 | NET_FEATURE_MTU
-                | mq_mask);
+                | mq_mask
+                | tso_mask);
         if accepted & VirtioFeatures::VERSION_1.bits() == 0 {
             return Err(IoError::Unsupported);
         }
@@ -457,6 +488,8 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             max_frame_len,
             header_len,
             tx_checksum_negotiated: accepted & NET_FEATURE_CSUM != 0,
+            tso_v4_negotiated: accepted & NET_FEATURE_HOST_TSO4 != 0,
+            tso_v6_negotiated: accepted & NET_FEATURE_HOST_TSO6 != 0,
         };
 
         // Activate every queue pair on the device side. The device
@@ -543,6 +576,16 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     /// partial checksums the device finishes on transmit.
     pub fn tx_checksum_negotiated(&self) -> bool {
         self.tx_checksum_negotiated
+    }
+
+    /// Whether the device performs TCP segmentation for the given
+    /// address family, allowing oversized TX segments.
+    pub fn tso_negotiated(&self, ipv6: bool) -> bool {
+        if ipv6 {
+            self.tso_v6_negotiated
+        } else {
+            self.tso_v4_negotiated
+        }
     }
 
     pub fn mac_address(&self) -> [u8; 6] {
@@ -1284,6 +1327,16 @@ fn write_tx_payload(
     frame: &[u8],
     checksum: Option<TxChecksumMeta>,
 ) -> IoResult<usize> {
+    write_tx_payload_gso(buffer, header_len, frame, checksum, None)
+}
+
+fn write_tx_payload_gso(
+    buffer: &mut [u8],
+    header_len: usize,
+    frame: &[u8],
+    checksum: Option<TxChecksumMeta>,
+    gso: Option<TxGsoMeta>,
+) -> IoResult<usize> {
     let payload_len = header_len
         .checked_add(frame.len())
         .ok_or(IoError::DeviceFault)?;
@@ -1296,13 +1349,30 @@ fn write_tx_payload(
 
     // Slots are reused across frames with different offload needs, so the
     // header is rewritten every submission: NEEDS_CSUM with the frame's
-    // csum_start/csum_offset, or all-zero "no offload".
+    // csum_start/csum_offset (and GSO fields when segmenting), or all-zero
+    // "no offload".
     buffer[..header_len].fill(0);
     if let Some(meta) = checksum {
         buffer[0] = VIRTIO_NET_HDR_F_NEEDS_CSUM;
         buffer[6..8].copy_from_slice(&meta.start.to_le_bytes());
         buffer[8..10].copy_from_slice(&meta.offset.to_le_bytes());
     }
+    buffer[1] = match gso {
+        None => VIRTIO_NET_HDR_GSO_NONE,
+        Some(meta) => {
+            assert!(
+                checksum.is_some(),
+                "GSO transmit requires transmit checksum offload"
+            );
+            buffer[2..4].copy_from_slice(&meta.hdr_len.to_le_bytes());
+            buffer[4..6].copy_from_slice(&meta.mss.to_le_bytes());
+            if meta.ipv6 {
+                VIRTIO_NET_HDR_GSO_TCPV6
+            } else {
+                VIRTIO_NET_HDR_GSO_TCPV4
+            }
+        }
+    };
     buffer[header_len..payload_len].copy_from_slice(frame);
     Ok(payload_len)
 }
@@ -1311,7 +1381,10 @@ fn write_tx_payload(
 mod tests {
     use core::mem::size_of;
 
-    use super::{DescriptorBitSet, TxChecksumMeta, VirtioNetHeader, write_tx_payload};
+    use super::{
+        DescriptorBitSet, TxChecksumMeta, TxGsoMeta, VirtioNetHeader, write_tx_payload,
+        write_tx_payload_gso,
+    };
 
     #[test]
     fn descriptor_bitset_tracks_sparse_tokens() {
@@ -1330,6 +1403,38 @@ mod tests {
         assert!(bits.get(0));
         assert!(!bits.get(65));
         assert!(bits.get(129));
+    }
+
+    #[test]
+    fn tx_payload_write_populates_gso_header() {
+        let header_len = size_of::<VirtioNetHeader>();
+        let mut buffer = [0u8; 256];
+        let frame = [0u8; 60];
+        write_tx_payload_gso(
+            &mut buffer,
+            header_len,
+            &frame,
+            Some(TxChecksumMeta {
+                start: 34,
+                offset: 16,
+            }),
+            Some(TxGsoMeta {
+                ipv6: false,
+                hdr_len: 54,
+                mss: 1460,
+            }),
+        )
+        .expect("gso payload fits");
+        assert_eq!(buffer[0], super::VIRTIO_NET_HDR_F_NEEDS_CSUM);
+        assert_eq!(buffer[1], super::VIRTIO_NET_HDR_GSO_TCPV4);
+        assert_eq!(&buffer[2..4], &54u16.to_le_bytes());
+        assert_eq!(&buffer[4..6], &1460u16.to_le_bytes());
+        assert_eq!(&buffer[6..8], &34u16.to_le_bytes());
+
+        // A non-GSO frame reusing the slot scrubs gso_type back to NONE.
+        write_tx_payload(&mut buffer, header_len, &frame, None).expect("plain payload fits");
+        assert_eq!(buffer[1], super::VIRTIO_NET_HDR_GSO_NONE);
+        assert_eq!(&buffer[2..6], &[0u8; 4]);
     }
 
     #[test]
