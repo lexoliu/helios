@@ -56,7 +56,10 @@ use helios_kernel::runtime_memory::{
     self, RuntimeMemoryHooks, default_memory_image_free, default_memory_image_map_at,
     default_memory_image_new, default_page_size,
 };
-use helios_kernel::{allocate_user_frame_zeroed_on, deallocate_user_frame_on};
+use helios_kernel::{
+    ReservationLookup, ReservationTracker, VaCursor, allocate_user_frame_zeroed_on,
+    deallocate_user_frame_on, validate_range,
+};
 use spin::{Mutex, Once};
 
 const PAGE_SHIFT: u32 = 12;
@@ -190,25 +193,8 @@ pub fn user_address_space() -> Option<&'static RiscvUserAddressSpace> {
 /// inside [`USER_VA_BASE`..`USER_VA_END`].
 pub struct RiscvUserAddressSpace {
     root_phys: usize,
-    next_va: AtomicUsize,
-    state: Mutex<UserState>,
-}
-
-#[derive(Default)]
-struct UserState {
-    reservations: Vec<Reservation>,
-    free_list: Vec<VirtRange>,
-}
-
-struct Reservation {
-    range: VirtRange,
-    committed: Vec<CommittedRegion>,
-}
-
-#[derive(Clone, Copy)]
-struct CommittedRegion {
-    range: VirtRange,
-    flags: PageFlags,
+    va_cursor: VaCursor,
+    state: Mutex<ReservationTracker>,
 }
 
 #[derive(Clone, Copy)]
@@ -223,44 +209,16 @@ impl RiscvUserAddressSpace {
     fn new(root_phys: usize) -> Self {
         Self {
             root_phys,
-            next_va: AtomicUsize::new(USER_VA_BASE),
-            state: Mutex::new(UserState::default()),
+            va_cursor: VaCursor::new(USER_VA_BASE, USER_VA_END),
+            state: Mutex::new(ReservationTracker::new()),
         }
     }
 
     fn carve_reservation(&self, byte_len: usize) -> Option<VirtRange> {
-        let mut state = self.state.lock();
-        if let Some(index) = state
-            .free_list
-            .iter()
-            .position(|range| range.byte_len >= byte_len)
-        {
-            let mut reused = state.free_list.swap_remove(index);
-            if reused.byte_len > byte_len {
-                let leftover = VirtRange::new(
-                    VirtAddr::new(reused.start.raw() + byte_len),
-                    reused.byte_len - byte_len,
-                );
-                state.free_list.push(leftover);
-                reused.byte_len = byte_len;
-            }
-            return Some(reused);
-        }
-        drop(state);
-        let mut current = self.next_va.load(Ordering::Acquire);
-        loop {
-            let next = current.checked_add(byte_len)?;
-            if next > USER_VA_END {
-                return None;
-            }
-            match self
-                .next_va
-                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => return Some(VirtRange::new(VirtAddr::new(current), byte_len)),
-                Err(observed) => current = observed,
-            }
-        }
+        self.state
+            .lock()
+            .reuse_free_range(byte_len)
+            .or_else(|| self.va_cursor.carve(byte_len))
     }
 
     fn root_table(&self) -> &mut [u64; PTE_COUNT] {
@@ -501,23 +459,13 @@ impl AddressSpace for RiscvUserAddressSpace {
         let range = self
             .carve_reservation(byte_len)
             .ok_or(AddressSpaceError::OutOfFrames)?;
-        self.state.lock().reservations.push(Reservation {
-            range,
-            committed: Vec::new(),
-        });
+        self.state.lock().reserve(range);
         Ok(range)
     }
 
     fn release(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
-        let mut state = self.state.lock();
-        let index = state
-            .reservations
-            .iter()
-            .position(|reservation| reservation.range == virt)
-            .ok_or(AddressSpaceError::NotReserved)?;
-        let reservation = state.reservations.swap_remove(index);
-        drop(state);
-        for region in &reservation.committed {
+        let committed = self.state.lock().release(virt)?;
+        for region in &committed {
             for offset in (0..region.range.byte_len).step_by(PAGE_SIZE) {
                 if let Ok(entry) = self.unmap_4k(region.range.start.raw() + offset) {
                     let phys = ((entry >> PTE_PPN_SHIFT) << PAGE_SHIFT) as usize;
@@ -525,7 +473,7 @@ impl AddressSpace for RiscvUserAddressSpace {
                 }
             }
         }
-        self.state.lock().free_list.push(reservation.range);
+        self.state.lock().push_free_range(virt);
         Ok(())
     }
 
@@ -533,16 +481,7 @@ impl AddressSpace for RiscvUserAddressSpace {
         validate_range(virt)?;
         let pte_flags = page_flags_to_pte(flags)?;
 
-        let mut state = self.state.lock();
-        let reservation = find_reservation_mut(&mut state.reservations, virt)?;
-        if reservation
-            .committed
-            .iter()
-            .any(|region| ranges_overlap(region.range, virt))
-        {
-            return Err(AddressSpaceError::Overlap);
-        }
-        drop(state);
+        self.state.lock().precheck_commit(virt)?;
 
         for offset in (0..virt.byte_len).step_by(PAGE_SIZE) {
             let virt_addr = virt.start.raw() + offset;
@@ -561,23 +500,13 @@ impl AddressSpace for RiscvUserAddressSpace {
             }
         }
 
-        let mut state = self.state.lock();
-        let reservation = find_reservation_mut(&mut state.reservations, virt)?;
-        reservation
-            .committed
-            .push(CommittedRegion { range: virt, flags });
+        self.state.lock().record_commit(virt, flags)?;
         Ok(())
     }
 
     fn decommit(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
         validate_range(virt)?;
-        let mut state = self.state.lock();
-        let reservation = find_reservation_mut(&mut state.reservations, virt)?;
-        if !committed_regions_cover(&reservation.committed, virt) {
-            return Err(AddressSpaceError::NotCommitted);
-        }
-        remove_committed_range(&mut reservation.committed, virt);
-        drop(state);
+        self.state.lock().record_decommit(virt)?;
         for offset in (0..virt.byte_len).step_by(PAGE_SIZE) {
             let entry = self.unmap_4k(virt.start.raw() + offset)?;
             let phys = ((entry >> PTE_PPN_SHIFT) << PAGE_SHIFT) as usize;
@@ -589,17 +518,7 @@ impl AddressSpace for RiscvUserAddressSpace {
     fn protect(&self, virt: VirtRange, flags: PageFlags) -> Result<(), AddressSpaceError> {
         validate_range(virt)?;
         let pte_flags = page_flags_to_pte(flags)?;
-        {
-            let state = self.state.lock();
-            let reservation = state
-                .reservations
-                .iter()
-                .find(|reservation| range_contains(reservation.range, virt))
-                .ok_or(AddressSpaceError::NotReserved)?;
-            if !committed_regions_cover(&reservation.committed, virt) {
-                return Err(AddressSpaceError::NotCommitted);
-            }
-        }
+        self.state.lock().ensure_committed(virt)?;
         let mut old_entries = Vec::new();
         for offset in (0..virt.byte_len).step_by(PAGE_SIZE) {
             match self.protect_4k(virt.start.raw() + offset, pte_flags) {
@@ -610,12 +529,7 @@ impl AddressSpace for RiscvUserAddressSpace {
                 }
             }
         }
-        let mut state = self.state.lock();
-        let reservation = find_reservation_mut(&mut state.reservations, virt)?;
-        remove_committed_range(&mut reservation.committed, virt);
-        reservation
-            .committed
-            .push(CommittedRegion { range: virt, flags });
+        self.state.lock().record_protect(virt, flags)?;
         Ok(())
     }
 
@@ -623,24 +537,10 @@ impl AddressSpace for RiscvUserAddressSpace {
         if addr.raw() < USER_VA_BASE || addr.raw() >= USER_VA_END {
             return Translation::Unmapped;
         }
-        let state = self.state.lock();
-        let reservation = match state
-            .reservations
-            .iter()
-            .find(|reservation| reservation.range.contains(addr))
-        {
-            Some(reservation) => reservation,
-            None => return Translation::Unmapped,
-        };
-        let committed = reservation
-            .committed
-            .iter()
-            .find(|region| region.range.contains(addr))
-            .copied();
-        drop(state);
-
-        let Some(committed) = committed else {
-            return Translation::Reserved;
+        let committed = match self.state.lock().lookup(addr) {
+            ReservationLookup::Unreserved => return Translation::Unmapped,
+            ReservationLookup::Reserved => return Translation::Reserved,
+            ReservationLookup::Committed(region) => region,
         };
         let virt = addr.raw() & !(PAGE_SIZE - 1);
         match self.translate_4k(virt) {
@@ -654,16 +554,7 @@ impl AddressSpace for RiscvUserAddressSpace {
 
     fn relocate(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
         validate_range(virt)?;
-        let state = self.state.lock();
-        let reservation = state
-            .reservations
-            .iter()
-            .find(|reservation| range_contains(reservation.range, virt))
-            .ok_or(AddressSpaceError::NotReserved)?;
-        if !committed_regions_cover(&reservation.committed, virt) {
-            return Err(AddressSpaceError::NotCommitted);
-        }
-        drop(state);
+        self.state.lock().ensure_committed(virt)?;
 
         let pages = self.build_relocation_plan(virt)?;
         for (index, page) in pages.iter().enumerate() {
@@ -700,77 +591,6 @@ fn sfence_vma_addr(virt: usize) {
         ret.error,
         ret.value
     );
-}
-
-fn validate_range(virt: VirtRange) -> Result<(), AddressSpaceError> {
-    if virt.byte_len == 0 {
-        return Err(AddressSpaceError::EmptyRange);
-    }
-    if !virt.is_page_aligned() {
-        return Err(AddressSpaceError::Misaligned);
-    }
-    Ok(())
-}
-
-fn find_reservation_mut(
-    reservations: &mut Vec<Reservation>,
-    virt: VirtRange,
-) -> Result<&mut Reservation, AddressSpaceError> {
-    reservations
-        .iter_mut()
-        .find(|reservation| range_contains(reservation.range, virt))
-        .ok_or(AddressSpaceError::NotReserved)
-}
-
-fn range_contains(outer: VirtRange, inner: VirtRange) -> bool {
-    outer.start.raw() <= inner.start.raw() && inner.end().raw() <= outer.end().raw()
-}
-
-fn ranges_overlap(a: VirtRange, b: VirtRange) -> bool {
-    a.start.raw() < b.end().raw() && b.start.raw() < a.end().raw()
-}
-
-fn committed_regions_cover(regions: &[CommittedRegion], range: VirtRange) -> bool {
-    let mut cursor = range.start.raw();
-    let end = range.end().raw();
-    while cursor < end {
-        let Some(region) = regions
-            .iter()
-            .find(|region| region.range.contains(VirtAddr::new(cursor)))
-        else {
-            return false;
-        };
-        cursor = region.range.end().raw().min(end);
-    }
-    true
-}
-
-fn remove_committed_range(regions: &mut Vec<CommittedRegion>, range: VirtRange) {
-    let mut index = 0;
-    while index < regions.len() {
-        let region = regions[index];
-        if !ranges_overlap(region.range, range) {
-            index += 1;
-            continue;
-        }
-
-        regions.swap_remove(index);
-        if region.range.start.raw() < range.start.raw() {
-            regions.push(CommittedRegion {
-                range: VirtRange::new(
-                    region.range.start,
-                    range.start.raw() - region.range.start.raw(),
-                ),
-                flags: region.flags,
-            });
-        }
-        if range.end().raw() < region.range.end().raw() {
-            regions.push(CommittedRegion {
-                range: VirtRange::new(range.end(), region.range.end().raw() - range.end().raw()),
-                flags: region.flags,
-            });
-        }
-    }
 }
 
 fn page_flags_to_pte(flags: PageFlags) -> Result<u64, AddressSpaceError> {

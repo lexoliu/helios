@@ -99,9 +99,10 @@ pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
 };
 pub use memory::{
-    EntropyError, EntropyPool, KernelPhysFrameAllocator, UserHeapStats,
-    allocate_user_frame_uninit_on, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
-    deallocate_user_frame, deallocate_user_frame_on, user_heap_stats,
+    AccessibilityPlan, CommittedRegion, EntropyError, EntropyPool, KernelPhysFrameAllocator,
+    ReservationLookup, ReservationTracker, UserHeapStats, VaCursor, allocate_user_frame_uninit_on,
+    allocate_user_frame_zeroed, allocate_user_frame_zeroed_on, deallocate_user_frame,
+    deallocate_user_frame_on, user_heap_stats, validate_range,
 };
 pub use network::{
     Ipv4Cidr, Ipv4Route, MacAddress, NetworkAdminBackend, NetworkBridgeRequest,
