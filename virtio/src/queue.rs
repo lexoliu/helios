@@ -155,6 +155,36 @@ impl<T: VirtioTransport> VirtQueue<T> {
         Ok(head)
     }
 
+    /// Submits a chain of read-only buffers as one deferred entry:
+    /// descriptors are linked and counted but the avail index is only
+    /// staged by the caller (`stage_deferred_head`) and published by
+    /// `publish_deferred_heads`, like `submit_read_only_deferred`.
+    pub(crate) fn submit_read_only_chain_deferred(
+        &mut self,
+        transport: &T,
+        parts: &[&[u8]],
+    ) -> IoResult<u16> {
+        if parts.is_empty() {
+            return Err(IoError::DeviceFault);
+        }
+        if self.num_used as usize + parts.len() > usize::from(self.size) {
+            return Err(IoError::DeviceFault);
+        }
+
+        let head = self.free_head;
+        let mut last = head;
+        for part in parts {
+            if part.is_empty() {
+                return Err(IoError::DeviceFault);
+            }
+            last = self.push_descriptor(transport, part, false)?;
+        }
+        self.desc_shadow[usize::from(last)].flags &= !DESC_FLAG_NEXT;
+        self.write_desc(last);
+        self.num_used += parts.len() as u16;
+        Ok(head)
+    }
+
     pub(crate) fn submit_output_at_deferred(
         &mut self,
         transport: &T,
@@ -861,6 +891,53 @@ mod tests {
                 .write_volatile(USED_FLAG_NO_NOTIFY);
         }
         assert!(!queue.should_notify());
+    }
+
+    #[test]
+    fn read_only_chain_links_descriptors_and_recycles_on_completion() {
+        let transport = FakeTransport {
+            bus: FakeBus { dma: FakeDmaPool },
+        };
+        let mut queue = VirtQueue::new(&transport, 0, 8).expect("queue should initialize");
+
+        let headers = [0xAAu8; 12];
+        let payload = [0xBBu8; 1024];
+        let head = queue
+            .submit_read_only_chain_deferred(&transport, &[&headers, &payload])
+            .expect("chain submit should succeed");
+        queue.stage_deferred_head(head);
+        queue.publish_deferred_heads();
+
+        let desc_table = queue.descriptors.as_ptr().cast::<Descriptor>();
+        let first = unsafe { desc_table.add(usize::from(head)).read() };
+        assert_eq!(first.addr, headers.as_ptr() as usize as u64);
+        assert_eq!(first.len, headers.len() as u32);
+        assert_ne!(
+            first.flags & 1,
+            0,
+            "head must link to the payload descriptor"
+        );
+        let second = unsafe { desc_table.add(usize::from(first.next)).read() };
+        assert_eq!(second.addr, payload.as_ptr() as usize as u64);
+        assert_eq!(second.len, payload.len() as u32);
+        assert_eq!(second.flags & 1, 0, "payload descriptor ends the chain");
+        assert_eq!(queue.available_descriptors(), 6);
+
+        // Device completes the chain: used ring gets the head token.
+        unsafe {
+            let used = queue.device_area.as_ptr();
+            used.add(4).cast::<UsedElem>().write_volatile(UsedElem {
+                id: u32::from(head),
+                len: 0,
+            });
+            used.cast::<u16>().add(1).write_volatile(1);
+        }
+        assert_eq!(queue.pop_used(), Some(head));
+        assert_eq!(
+            queue.available_descriptors(),
+            8,
+            "completion must recycle the whole chain"
+        );
     }
 
     #[test]

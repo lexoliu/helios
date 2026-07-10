@@ -74,6 +74,17 @@ pub struct TxFrameDescriptor<'a> {
     pub checksum: Option<TxChecksumMeta>,
 }
 
+/// A transmit frame split into a small header prefix (copied into the
+/// device slot behind the virtio-net header) and an external payload
+/// the device reads in place. The payload memory must stay valid until
+/// a token-reporting reclaim returns this frame's token.
+#[derive(Clone, Copy, Debug)]
+pub struct TxScatterFrame<'a> {
+    pub headers: &'a [u8],
+    pub payload: &'a [u8],
+    pub checksum: Option<TxChecksumMeta>,
+}
+
 /// A frame acceptable to the transmit entry points. Plain byte slices
 /// transmit with no offload; [`TxFrameDescriptor`] carries checksum
 /// metadata into the virtio-net header.
@@ -950,6 +961,105 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             return Ok(None);
         };
         Ok(Some(Self::drain_tx_completions(&mut state, budget)))
+    }
+
+    /// Immediate zero-copy TX: headers are copied into the descriptor
+    /// slot behind the virtio-net header while the payload is chained
+    /// as an external read-only descriptor. Accepted frames report
+    /// their head token through `tokens`; the caller must keep each
+    /// payload alive until `reclaim_transmit_tokens_immediate_on_pair`
+    /// returns that token.
+    pub fn try_transmit_scatter_immediate_on_pair(
+        &self,
+        pair_idx: usize,
+        frames: &[TxScatterFrame<'_>],
+        tokens: &mut [Option<u16>],
+    ) -> IoResult<Option<usize>> {
+        assert!(
+            tokens.len() >= frames.len(),
+            "scatter transmit token slots must cover the frame batch"
+        );
+        let pair_idx = self.normalize_pair_idx(pair_idx);
+        let Some(mut state) = self.queue_pairs[pair_idx].tx_state.try_lock() else {
+            return Ok(None);
+        };
+        Self::drain_tx_completions_when_full(&mut state, frames.len());
+        let NetTxState {
+            tx_queue,
+            tx_buffers,
+            tx_buffer_len,
+            tx_in_flight,
+        } = &mut *state;
+        let mut submitted = 0usize;
+        for frame in frames {
+            if frame.checksum.is_some() {
+                assert!(
+                    self.tx_checksum_negotiated,
+                    "checksum-offload frame submitted without negotiated VIRTIO_NET_F_CSUM"
+                );
+            }
+            // A chain needs two descriptors (slot prefix + payload).
+            if tx_queue.available_descriptors() < 2 {
+                break;
+            }
+            let token = tx_queue.next_free_descriptor();
+            let token_index = usize::from(token);
+            assert!(
+                !tx_in_flight.get(token_index),
+                "virtio net TX descriptor {token} is still in flight"
+            );
+            let slot = slot_buffer_mut(tx_buffers, *tx_buffer_len, token_index, "TX");
+            let prefix_len =
+                write_tx_payload(slot, self.header_len, frame.headers, frame.checksum)?;
+            let prefix = slot_buffer(tx_buffers, *tx_buffer_len, token_index, prefix_len, "TX");
+            let submitted_token = if frame.payload.is_empty() {
+                tx_queue.submit_read_only_deferred(&self.transport, prefix)?
+            } else {
+                tx_queue
+                    .submit_read_only_chain_deferred(&self.transport, &[prefix, frame.payload])?
+            };
+            assert_eq!(
+                submitted_token, token,
+                "virtio net TX descriptor allocation moved while scatter frame was prepared"
+            );
+            tx_in_flight.set(token_index);
+            tx_queue.stage_deferred_head(token);
+            tokens[submitted] = Some(token);
+            submitted += 1;
+        }
+        if submitted != 0 {
+            tx_queue.publish_deferred_heads();
+            tx_queue.notify(&self.transport);
+        }
+        Ok(Some(submitted))
+    }
+
+    /// Immediate TX completion drain that reports which head tokens
+    /// finished, releasing zero-copy payload pins held by the caller.
+    pub fn reclaim_transmit_tokens_immediate_on_pair(
+        &self,
+        pair_idx: usize,
+        tokens: &mut [Option<u16>],
+    ) -> IoResult<Option<usize>> {
+        let pair_idx = self.normalize_pair_idx(pair_idx);
+        let Some(mut state) = self.queue_pairs[pair_idx].tx_state.try_lock() else {
+            return Ok(None);
+        };
+        let mut completed = 0usize;
+        while completed < tokens.len() {
+            let Some(token) = state.tx_queue.pop_used() else {
+                break;
+            };
+            let token_index = usize::from(token);
+            assert!(
+                state.tx_in_flight.get(token_index),
+                "virtio net TX completion referenced idle descriptor {token}"
+            );
+            state.tx_in_flight.clear(token_index);
+            tokens[completed] = Some(token);
+            completed += 1;
+        }
+        Ok(Some(completed))
     }
 
     pub async fn wait_for_interrupt(&self) {
