@@ -6,6 +6,7 @@ extern crate std;
 mod block;
 mod bus;
 mod console;
+mod discovery;
 mod mmio;
 mod net;
 mod notify;
@@ -23,6 +24,7 @@ pub use bus::{
     OffsetDmaPool,
 };
 pub use console::VirtioConsoleDevice;
+pub use discovery::{MmioCandidate, mmio_candidates, mmio_device_matches};
 pub use mmio::{
     VirtioMmio9pDevice, VirtioMmioBlockDevice, VirtioMmioConsoleDevice, VirtioMmioNetDevice,
     VirtioMmioRngDevice, block_from_mmio, console_from_mmio, net_from_mmio, net_from_mmio_with_dma,

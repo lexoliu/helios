@@ -248,31 +248,17 @@ fn discover_network_device(
     handoff: &crate::LimineBootHandoff,
 ) -> Option<VirtioNetworkDevice> {
     if let Some(fdt) = fdt {
-        for node in fdt.all_nodes() {
-            if !node
-                .compatible()
-                .is_some_and(|compatible| compatible.all().any(|entry| entry == "virtio,mmio"))
-            {
-                continue;
-            }
-
-            let Some(region) = node.raw_reg().and_then(|mut regs| regs.next()) else {
-                continue;
-            };
-            let physical_base =
-                crate::fdt_cells_to_usize(region.address, "AArch64 virtio MMIO base");
-            if !crate::matches_virtio_mmio_device(
-                physical_base,
+        if let Some(candidate) = helios_virtio::mmio_candidates(fdt).find(|candidate| {
+            crate::matches_virtio_mmio_device(
+                candidate.base,
                 physical_memory_offset,
                 handoff,
                 helios_virtio::DeviceType::Network,
-            ) {
-                continue;
-            }
-            let size = crate::fdt_cells_to_usize(region.size, "AArch64 virtio MMIO size");
+            )
+        }) {
             return Some(init_network_device(
-                physical_base,
-                size,
+                candidate.base,
+                candidate.size,
                 physical_memory_offset,
                 handoff,
             ));

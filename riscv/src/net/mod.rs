@@ -9,8 +9,9 @@ use helios_hal::cpu::Cpu;
 use helios_hal::io::IoError;
 use helios_hal::watchdog::Watchdog;
 use helios_kernel::{
-    DEFAULT_POLL_BUDGET, EventDeliveryCapabilities, InterfaceCapabilities, Kernel, NetworkDevice,
-    NetworkService, PacketBuffer,
+    DEFAULT_POLL_BUDGET, EventDeliveryCapabilities, ExternalInterruptHandler,
+    ExternalInterruptRoutes, InterfaceCapabilities, Kernel, NetworkDevice, NetworkService,
+    PacketBuffer,
 };
 use plic::Plic;
 
@@ -30,13 +31,17 @@ struct VirtioNetworkDevice {
 pub(crate) struct ExternalInterrupts {
     plic: &'static Plic,
     context: PlicContext,
-    network: Option<NetworkInterrupt>,
-    host_fs: Option<crate::host_fs::HostFsInterrupt>,
+    routes: ExternalInterruptRoutes<
+        InterruptSourceId,
+        VirtioNetworkDevice,
+        crate::host_fs::HostFsTransportService,
+    >,
 }
 
-struct NetworkInterrupt {
-    source: InterruptSourceId,
-    device: VirtioNetworkDevice,
+impl ExternalInterruptHandler for VirtioNetworkDevice {
+    fn handle_interrupt(&self) {
+        self.inner.handle_interrupt();
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -77,14 +82,12 @@ where
         probe.irq_source.0.get(),
         probe.context.0
     );
+    let mut routes = ExternalInterruptRoutes::new();
+    routes.set_network(probe.irq_source, probe.device);
     Some(ExternalInterrupts {
         plic: probe.plic,
         context: probe.context,
-        network: Some(NetworkInterrupt {
-            source: probe.irq_source,
-            device: probe.device,
-        }),
-        host_fs: None,
+        routes,
     })
 }
 
@@ -94,50 +97,30 @@ impl ExternalInterrupts {
         context: PlicContext,
         interrupt: crate::host_fs::HostFsInterrupt,
     ) -> Self {
+        let mut routes = ExternalInterruptRoutes::new();
+        routes.set_host_fs(interrupt.source, interrupt.transport);
         Self {
             plic,
             context,
-            network: None,
-            host_fs: Some(interrupt),
+            routes,
         }
     }
 
     pub(crate) fn attach_host_fs(&mut self, interrupt: crate::host_fs::HostFsInterrupt) {
-        assert!(
-            self.host_fs.is_none(),
-            "host-fs interrupt was installed more than once"
-        );
-        self.host_fs = Some(interrupt);
+        self.routes
+            .set_host_fs(interrupt.source, interrupt.transport);
     }
 
     pub(crate) fn handle(&self) {
         while let Some(source) = self.plic.claim(self.context) {
             let source = InterruptSourceId(source);
-            if let Some(network) = self
-                .network
-                .as_ref()
-                .filter(|network| source == network.source)
-            {
-                network.device.inner.handle_interrupt();
-                self.plic.complete(self.context, source);
-                continue;
-            }
-
-            if let Some(host_fs) = self
-                .host_fs
-                .as_ref()
-                .filter(|host_fs| source == host_fs.source)
-            {
-                host_fs.transport.handle_interrupt();
-                self.plic.complete(self.context, source);
-                continue;
-            }
-
-            panic!(
+            assert!(
+                self.routes.route(source),
                 "unexpected external interrupt source={} on PLIC context={}",
                 source.0.get(),
                 self.context.0
             );
+            self.plic.complete(self.context, source);
         }
     }
 }
@@ -313,46 +296,26 @@ impl plic::InterruptSource for InterruptSourceId {
 }
 
 fn discover_network_device(fdt: &Fdt<'_>) -> Option<(VirtioNetworkDevice, InterruptSourceId)> {
-    for node in fdt.all_nodes() {
-        if !node
-            .compatible()
-            .is_some_and(|compatible| compatible.all().any(|entry| entry == "virtio,mmio"))
-        {
-            continue;
-        }
-
-        let Some(region) = node.reg().and_then(|mut regs| regs.next()) else {
-            continue;
-        };
-        let base = region.starting_address as usize;
-        if !is_network_mmio_device(base) {
-            continue;
-        }
-
-        let header = core::ptr::NonNull::new(base as *mut u8)
-            .unwrap_or_else(|| panic!("virtio MMIO base {base:#x} was unexpectedly null"));
-        let mmio_size = region.size.unwrap();
-        let irq_source = node
-            .interrupts()
-            .and_then(|mut interrupts| interrupts.next())
-            .and_then(|irq| NonZeroU32::new(irq as u32))
-            .map(InterruptSourceId)
-            .unwrap_or_else(|| {
-                panic!("virtio-net node at {base:#x} has no valid interrupt source")
-            });
-        let device =
-            unsafe { helios_virtio::net_from_mmio(header, mmio_size) }.unwrap_or_else(|error| {
-                panic!("failed to initialize virtio-net device at {base:#x}: {error}")
-            });
-        return Some((
-            VirtioNetworkDevice {
-                inner: Arc::new(device),
-            },
-            irq_source,
-        ));
-    }
-
-    None
+    let candidate = helios_virtio::mmio_candidates(fdt).find(|candidate| {
+        crate::matches_virtio_mmio_device(candidate.base, helios_virtio::DeviceType::Network)
+    })?;
+    let base = candidate.base;
+    let header = core::ptr::NonNull::new(base as *mut u8)
+        .unwrap_or_else(|| panic!("virtio MMIO base {base:#x} was unexpectedly null"));
+    let irq_source = candidate
+        .irq
+        .map(InterruptSourceId)
+        .unwrap_or_else(|| panic!("virtio-net node at {base:#x} has no valid interrupt source"));
+    let device =
+        unsafe { helios_virtio::net_from_mmio(header, candidate.size) }.unwrap_or_else(|error| {
+            panic!("failed to initialize virtio-net device at {base:#x}: {error}")
+        });
+    Some((
+        VirtioNetworkDevice {
+            inner: Arc::new(device),
+        },
+        irq_source,
+    ))
 }
 
 pub(crate) fn discover_plic_context(
@@ -427,10 +390,6 @@ fn node_phandle(node: FdtNode<'_, '_>) -> Option<u32> {
     node.property("phandle")
         .or_else(|| node.property("linux,phandle"))
         .map(|property| read_be_u32(property.value))
-}
-
-fn is_network_mmio_device(base: usize) -> bool {
-    crate::matches_virtio_mmio_device(base, helios_virtio::DeviceType::Network)
 }
 
 fn parse_cpu_hart_id(node: FdtNode<'_, '_>, address_cells: usize) -> Option<u16> {

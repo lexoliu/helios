@@ -68,11 +68,6 @@ const QEMU_FW_CFG_MMIO_BASE: usize = 0x0902_0000;
 const QEMU_FW_CFG_MMIO_SIZE: usize = 0x18;
 const FW_CFG_DATA: usize = 0x000;
 const FW_CFG_SELECTOR: usize = 0x008;
-const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976;
-const VIRTIO_MMIO_MODERN_VERSION: u32 = 2;
-const VIRTIO_MMIO_MAGIC_OFFSET: usize = 0x000;
-const VIRTIO_MMIO_VERSION_OFFSET: usize = 0x004;
-const VIRTIO_MMIO_DEVICE_ID_OFFSET: usize = 0x008;
 const QEMU_VIRT_MMIO_BASE: usize = 0x0a00_0000;
 const QEMU_VIRT_MMIO_STRIDE: usize = 0x200;
 const QEMU_VIRT_MMIO_SLOTS: usize = 32;
@@ -1285,31 +1280,15 @@ fn matches_virtio_mmio_device(
 ) -> bool {
     map_mmio_page(physical_base, physical_memory_offset, handoff);
     let virtual_base = mmio_virtual_base(physical_base, physical_memory_offset);
-    unsafe {
-        read_mmio_u32(virtual_base + VIRTIO_MMIO_MAGIC_OFFSET) == VIRTIO_MMIO_MAGIC
-            && read_mmio_u32(virtual_base + VIRTIO_MMIO_VERSION_OFFSET)
-                == VIRTIO_MMIO_MODERN_VERSION
-            && read_mmio_u32(virtual_base + VIRTIO_MMIO_DEVICE_ID_OFFSET) == expected as u32
-    }
-}
-
-unsafe fn read_mmio_u32(address: usize) -> u32 {
-    unsafe { (address as *const u32).read_volatile() }
+    unsafe { helios_virtio::mmio_device_matches(virtual_base, expected) }
 }
 
 fn count_virtio_mmio_devices(fdt: &Fdt<'_>, expected: helios_virtio::DeviceType) -> usize {
     let handoff = limine_boot_handoff();
     let physical_memory_offset = physical_memory_offset();
-    fdt.all_nodes()
-        .filter(|node| {
-            node.compatible()
-                .is_some_and(|compatible| compatible.all().any(|entry| entry == "virtio,mmio"))
-        })
-        .filter_map(|node| node.raw_reg().and_then(|mut regions| regions.next()))
-        .filter(|region| {
-            let physical_base =
-                fdt_cells_to_usize(region.address, "AArch64 virtio MMIO reg address");
-            matches_virtio_mmio_device(physical_base, physical_memory_offset, &handoff, expected)
+    helios_virtio::mmio_candidates(fdt)
+        .filter(|candidate| {
+            matches_virtio_mmio_device(candidate.base, physical_memory_offset, &handoff, expected)
         })
         .count()
 }

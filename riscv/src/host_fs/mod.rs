@@ -5,13 +5,12 @@ use alloc::vec::Vec;
 
 use bytes::BytesMut;
 use concurrent_queue::{ConcurrentQueue, PopError, PushError};
-use core::num::NonZeroU32;
 use fdt::Fdt;
 use futures::channel::oneshot;
 use helios_hal::cpu::Cpu;
 use helios_hal::io::IoError;
 use helios_hal::watchdog::Watchdog;
-use helios_kernel::{HostFsTransport, Kernel, Notify};
+use helios_kernel::{ExternalInterruptHandler, HostFsTransport, Kernel, Notify};
 use plic::Plic;
 
 use crate::RiscvCpu;
@@ -94,11 +93,13 @@ where
     })
 }
 
-impl HostFsTransportService {
-    pub(crate) fn handle_interrupt(&self) {
+impl ExternalInterruptHandler for HostFsTransportService {
+    fn handle_interrupt(&self) {
         self.inner.device.handle_interrupt();
     }
+}
 
+impl HostFsTransportService {
     async fn raw_request(
         &self,
         bytes: Vec<u8>,
@@ -207,45 +208,23 @@ impl HostFsTransport for HostFsTransportService {
 fn discover_9p_device(
     fdt: &Fdt<'_>,
 ) -> Option<(Arc<helios_virtio::VirtioMmio9pDevice>, InterruptSourceId)> {
-    for node in fdt.all_nodes() {
-        if !node
-            .compatible()
-            .is_some_and(|compatible| compatible.all().any(|entry| entry == "virtio,mmio"))
-        {
-            continue;
-        }
-
-        let Some(region) = node.reg().and_then(|mut regs| regs.next()) else {
-            continue;
-        };
-        let base = region.starting_address as usize;
-        if !is_9p_mmio_device(base) {
-            continue;
-        }
-
-        let header = core::ptr::NonNull::new(base as *mut u8)
-            .unwrap_or_else(|| panic!("virtio MMIO base {base:#x} was unexpectedly null"));
-        let mmio_size = region.size.unwrap();
-        let irq_source = node
-            .interrupts()
-            .and_then(|mut interrupts| interrupts.next())
-            .and_then(|irq| NonZeroU32::new(irq as u32))
-            .map(InterruptSourceId)
-            .unwrap_or_else(|| panic!("virtio-9p node at {base:#x} has no valid interrupt source"));
-        let device =
-            unsafe { helios_virtio::p9_from_mmio(header, mmio_size) }.unwrap_or_else(|error| {
-                panic!("failed to initialize virtio-9p device at {base:#x}: {error}")
-            });
-        return Some((Arc::new(device), irq_source));
-    }
-
-    None
+    let candidate = helios_virtio::mmio_candidates(fdt).find(|candidate| {
+        crate::matches_virtio_mmio_device(candidate.base, helios_virtio::DeviceType::_9P)
+    })?;
+    let base = candidate.base;
+    let header = core::ptr::NonNull::new(base as *mut u8)
+        .unwrap_or_else(|| panic!("virtio MMIO base {base:#x} was unexpectedly null"));
+    let irq_source = candidate
+        .irq
+        .map(InterruptSourceId)
+        .unwrap_or_else(|| panic!("virtio-9p node at {base:#x} has no valid interrupt source"));
+    let device =
+        unsafe { helios_virtio::p9_from_mmio(header, candidate.size) }.unwrap_or_else(|error| {
+            panic!("failed to initialize virtio-9p device at {base:#x}: {error}")
+        });
+    Some((Arc::new(device), irq_source))
 }
 
 pub(crate) fn has_9p_device(fdt: &Fdt<'_>) -> bool {
     crate::count_virtio_mmio_devices(fdt, helios_virtio::DeviceType::_9P) != 0
-}
-
-fn is_9p_mmio_device(base: usize) -> bool {
-    crate::matches_virtio_mmio_device(base, helios_virtio::DeviceType::_9P)
 }

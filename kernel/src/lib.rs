@@ -91,8 +91,9 @@ pub use instance::{
     record_instance_transition,
 };
 pub use io::{
-    ByteReadWait, ByteReader, ByteWriter, ClosedPeer, PollKey, PollRegistration, PollRegistry,
-    PollRegistryError, PollSourceKind, RecordingConsole, SerialReader, TryRead, byte_channel,
+    ByteReadWait, ByteReader, ByteWriter, ClosedPeer, ExternalInterruptHandler,
+    ExternalInterruptRoutes, PollKey, PollRegistration, PollRegistry, PollRegistryError,
+    PollSourceKind, RecordingConsole, SerialReader, TryRead, byte_channel,
     emit_serial_error_marker, emit_serial_stage_marker, read_serial, try_read_serial, write_serial,
 };
 pub use kernel_exception::{

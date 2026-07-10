@@ -74,33 +74,16 @@ impl ByteSerial for DebugTransport {
 
 use helios_virtio::DeviceType;
 
-const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976;
-const VIRTIO_MMIO_MODERN_VERSION: u32 = 2;
-const VIRTIO_MMIO_MAGIC_OFFSET: usize = 0x000;
-const VIRTIO_MMIO_VERSION_OFFSET: usize = 0x004;
-const VIRTIO_MMIO_DEVICE_ID_OFFSET: usize = 0x008;
-
+/// RISC-V MMIO is identity-mapped, so candidates are probed at their
+/// physical base directly.
 pub(crate) fn matches_virtio_mmio_device(base: usize, expected: DeviceType) -> bool {
-    unsafe {
-        read_u32(base + VIRTIO_MMIO_MAGIC_OFFSET) == VIRTIO_MMIO_MAGIC
-            && read_u32(base + VIRTIO_MMIO_VERSION_OFFSET) == VIRTIO_MMIO_MODERN_VERSION
-            && read_u32(base + VIRTIO_MMIO_DEVICE_ID_OFFSET) == expected as u32
-    }
+    unsafe { helios_virtio::mmio_device_matches(base, expected) }
 }
 
 pub(crate) fn count_virtio_mmio_devices(fdt: &Fdt<'_>, expected: DeviceType) -> usize {
-    fdt.all_nodes()
-        .filter(|node| {
-            node.compatible()
-                .is_some_and(|compatible| compatible.all().any(|entry| entry == "virtio,mmio"))
-        })
-        .filter_map(|node| node.reg().and_then(|mut regs| regs.next()))
-        .filter(|region| matches_virtio_mmio_device(region.starting_address as usize, expected))
+    helios_virtio::mmio_candidates(fdt)
+        .filter(|candidate| matches_virtio_mmio_device(candidate.base, expected))
         .count()
-}
-
-unsafe fn read_u32(addr: usize) -> u32 {
-    unsafe { (addr as *const u32).read_volatile() }
 }
 
 use core::arch::{asm, global_asm};

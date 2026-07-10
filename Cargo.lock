@@ -1794,6 +1794,7 @@ dependencies = [
  "bytes",
  "divan",
  "event-listener",
+ "fdt",
  "futures-lite",
  "helios-hal",
  "spin 0.9.8",
