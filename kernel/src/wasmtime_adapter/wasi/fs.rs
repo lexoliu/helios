@@ -1803,14 +1803,14 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> wasi::filesystem::types::HostDescriptorWithStore
+impl<CpuImpl, HostFs, U> wasi::filesystem::types::HostDescriptorWithStore<U>
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    fn read_via_stream<T>(
-        mut accessor: Access<'_, T, Self>,
+    fn read_via_stream(
+        mut accessor: Access<'_, U, Self>,
         descriptor: Resource<FsDescriptor>,
         offset: u64,
     ) -> Result<(
@@ -1834,8 +1834,8 @@ where
         Ok((stream, future))
     }
 
-    fn write_via_stream<T>(
-        mut accessor: Access<'_, T, Self>,
+    fn write_via_stream(
+        mut accessor: Access<'_, U, Self>,
         descriptor: Resource<FsDescriptor>,
         mut data: StreamReader<u8>,
         offset: u64,
@@ -1868,8 +1868,8 @@ where
         }
     }
 
-    fn append_via_stream<T>(
-        mut accessor: Access<'_, T, Self>,
+    fn append_via_stream(
+        mut accessor: Access<'_, U, Self>,
         descriptor: Resource<FsDescriptor>,
         mut data: StreamReader<u8>,
     ) -> Result<FutureReader<core::result::Result<(), fs_types::ErrorCode>>> {
@@ -1898,8 +1898,8 @@ where
         }
     }
 
-    async fn advise<T: Send>(
-        accessor: &Accessor<T, Self>,
+    async fn advise(
+        accessor: &Accessor<U, Self>,
         descriptor: Resource<FsDescriptor>,
         _: u64,
         _: u64,
@@ -1911,15 +1911,12 @@ where
         })
     }
 
-    async fn sync_data<T: Send>(
-        _: &Accessor<T, Self>,
-        _: Resource<FsDescriptor>,
-    ) -> Result<(), FsError> {
+    async fn sync_data(_: &Accessor<U, Self>, _: Resource<FsDescriptor>) -> Result<(), FsError> {
         Ok(())
     }
 
-    async fn get_flags<T: Send>(
-        accessor: &Accessor<T, Self>,
+    async fn get_flags(
+        accessor: &Accessor<U, Self>,
         descriptor: Resource<FsDescriptor>,
     ) -> Result<fs_types::DescriptorFlags, FsError> {
         accessor.with(|mut access| {
@@ -1928,8 +1925,8 @@ where
         })
     }
 
-    async fn get_type<T: Send>(
-        accessor: &Accessor<T, Self>,
+    async fn get_type(
+        accessor: &Accessor<U, Self>,
         descriptor: Resource<FsDescriptor>,
     ) -> Result<fs_types::DescriptorType, FsError> {
         let profile = accessor.with(|mut access| component_fs_profile(access.get()));
@@ -1946,8 +1943,8 @@ where
         result
     }
 
-    async fn set_size<T: Send>(
-        accessor: &Accessor<T, Self>,
+    async fn set_size(
+        accessor: &Accessor<U, Self>,
         descriptor: Resource<FsDescriptor>,
         size: u64,
     ) -> Result<(), FsError> {
@@ -1988,8 +1985,8 @@ where
         })
     }
 
-    async fn set_times<T: Send>(
-        accessor: &Accessor<T, Self>,
+    async fn set_times(
+        accessor: &Accessor<U, Self>,
         descriptor: Resource<FsDescriptor>,
         data_access_timestamp: fs_types::NewTimestamp,
         data_modification_timestamp: fs_types::NewTimestamp,
@@ -2031,8 +2028,8 @@ where
         })
     }
 
-    fn read_directory<T>(
-        mut accessor: Access<'_, T, Self>,
+    fn read_directory(
+        mut accessor: Access<'_, U, Self>,
         descriptor: Resource<FsDescriptor>,
     ) -> Result<(
         StreamReader<fs_types::DirectoryEntry>,
@@ -2063,15 +2060,12 @@ where
         }
     }
 
-    async fn sync<T: Send>(
-        _: &Accessor<T, Self>,
-        _: Resource<FsDescriptor>,
-    ) -> Result<(), FsError> {
+    async fn sync(_: &Accessor<U, Self>, _: Resource<FsDescriptor>) -> Result<(), FsError> {
         Ok(())
     }
 
-    async fn create_directory_at<T: Send>(
-        accessor: &Accessor<T, Self>,
+    async fn create_directory_at(
+        accessor: &Accessor<U, Self>,
         descriptor: Resource<FsDescriptor>,
         path: String,
     ) -> Result<(), FsError> {
@@ -2120,8 +2114,8 @@ where
         })
     }
 
-    async fn stat<T: Send>(
-        accessor: &Accessor<T, Self>,
+    async fn stat(
+        accessor: &Accessor<U, Self>,
         descriptor: Resource<FsDescriptor>,
     ) -> Result<fs_types::DescriptorStat, FsError> {
         let profile = accessor.with(|mut access| component_fs_profile(access.get()));
@@ -2168,8 +2162,8 @@ where
         result
     }
 
-    async fn stat_at<T: Send>(
-        accessor: &Accessor<T, Self>,
+    async fn stat_at(
+        accessor: &Accessor<U, Self>,
         descriptor: Resource<FsDescriptor>,
         path_flags: fs_types::PathFlags,
         path: String,
@@ -2224,8 +2218,8 @@ where
         result
     }
 
-    async fn set_times_at<T: Send>(
-        accessor: &Accessor<T, Self>,
+    async fn set_times_at(
+        accessor: &Accessor<U, Self>,
         descriptor: Resource<FsDescriptor>,
         _: fs_types::PathFlags,
         path: String,
@@ -2273,8 +2267,8 @@ where
         })
     }
 
-    async fn link_at<T: Send>(
-        accessor: &Accessor<T, Self>,
+    async fn link_at(
+        accessor: &Accessor<U, Self>,
         source_descriptor: Resource<FsDescriptor>,
         _: fs_types::PathFlags,
         source_path: String,
@@ -2370,8 +2364,8 @@ where
         })
     }
 
-    async fn open_at<T: Send>(
-        accessor: &Accessor<T, Self>,
+    async fn open_at(
+        accessor: &Accessor<U, Self>,
         descriptor: Resource<FsDescriptor>,
         path_flags: fs_types::PathFlags,
         path: String,
@@ -2541,8 +2535,8 @@ where
         result
     }
 
-    async fn readlink_at<T: Send>(
-        accessor: &Accessor<T, Self>,
+    async fn readlink_at(
+        accessor: &Accessor<U, Self>,
         descriptor: Resource<FsDescriptor>,
         path: String,
     ) -> Result<String, FsError> {
@@ -2595,8 +2589,8 @@ where
         })
     }
 
-    async fn remove_directory_at<T: Send>(
-        accessor: &Accessor<T, Self>,
+    async fn remove_directory_at(
+        accessor: &Accessor<U, Self>,
         descriptor: Resource<FsDescriptor>,
         path: String,
     ) -> Result<(), FsError> {
@@ -2640,8 +2634,8 @@ where
         })
     }
 
-    async fn rename_at<T: Send>(
-        accessor: &Accessor<T, Self>,
+    async fn rename_at(
+        accessor: &Accessor<U, Self>,
         source_descriptor: Resource<FsDescriptor>,
         source_path: String,
         destination_descriptor: Resource<FsDescriptor>,
@@ -2714,8 +2708,8 @@ where
         })
     }
 
-    async fn symlink_at<T: Send>(
-        accessor: &Accessor<T, Self>,
+    async fn symlink_at(
+        accessor: &Accessor<U, Self>,
         descriptor: Resource<FsDescriptor>,
         old_path: String,
         new_path: String,
@@ -2778,8 +2772,8 @@ where
         })
     }
 
-    async fn unlink_file_at<T: Send>(
-        accessor: &Accessor<T, Self>,
+    async fn unlink_file_at(
+        accessor: &Accessor<U, Self>,
         descriptor: Resource<FsDescriptor>,
         path: String,
     ) -> Result<(), FsError> {
@@ -2822,8 +2816,8 @@ where
         })
     }
 
-    async fn is_same_object<T: Send>(
-        accessor: &Accessor<T, Self>,
+    async fn is_same_object(
+        accessor: &Accessor<U, Self>,
         a: Resource<FsDescriptor>,
         b: Resource<FsDescriptor>,
     ) -> Result<bool> {
@@ -2837,8 +2831,8 @@ where
         })
     }
 
-    async fn metadata_hash<T: Send>(
-        accessor: &Accessor<T, Self>,
+    async fn metadata_hash(
+        accessor: &Accessor<U, Self>,
         descriptor: Resource<FsDescriptor>,
     ) -> Result<fs_types::MetadataHashValue, FsError> {
         let profile = accessor.with(|mut access| component_fs_profile(access.get()));
@@ -2876,8 +2870,8 @@ where
         result
     }
 
-    async fn metadata_hash_at<T: Send>(
-        accessor: &Accessor<T, Self>,
+    async fn metadata_hash_at(
+        accessor: &Accessor<U, Self>,
         descriptor: Resource<FsDescriptor>,
         path_flags: fs_types::PathFlags,
         path: String,

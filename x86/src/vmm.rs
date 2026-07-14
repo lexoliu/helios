@@ -502,7 +502,6 @@ fn page_flags_to_pt(flags: PageFlags) -> Result<PageTableFlags, AddressSpaceErro
     Ok(pt)
 }
 
-
 static USER_AS: Once<X86UserAddressSpace> = Once::new();
 
 /// Initialise the boot-time user address space and install the

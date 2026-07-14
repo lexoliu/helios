@@ -2,7 +2,7 @@ mod generated {
     use wasmtime;
 
     wasmtime::component::bindgen!({
-        path: "../../wasmtime/crates/wasi/src/p3/wit",
+        path: "../wit",
         world: "wasi:cli/command",
         imports: {
             "wasi:cli/stdin": store | trappable,

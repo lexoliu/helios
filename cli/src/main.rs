@@ -898,8 +898,7 @@ impl ExternalBootArtifact {
     fn supports_target(&self, target: &str) -> bool {
         let target_allowed =
             self.targets.is_empty() || self.targets.iter().any(|candidate| candidate == target);
-        let simd_satisfied =
-            !self.requires_wasm_simd || cwasm_target_supports_wasm_simd(target);
+        let simd_satisfied = !self.requires_wasm_simd || cwasm_target_supports_wasm_simd(target);
         target_allowed && simd_satisfied
     }
 

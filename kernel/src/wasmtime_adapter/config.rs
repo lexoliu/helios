@@ -38,12 +38,13 @@ pub fn build_component_engine_config(target: &str) -> Config {
     let mut config = build_target_engine_config(target);
     config.wasm_component_model(true);
     config.wasm_component_model_async(true);
-    config.wasm_component_model_async_builtins(true);
+    config.wasm_component_model_more_async_builtins(true);
     config.wasm_component_model_async_stackful(true);
     config.wasm_component_model_threading(true);
     config.wasm_simd(true);
     config.wasm_relaxed_simd(true);
     config.relaxed_simd_deterministic(false);
+    config.wasm_wide_arithmetic(true);
     config.wasm_multi_memory(true);
     config.wasm_memory64(true);
     config.wasm_tail_call(true);

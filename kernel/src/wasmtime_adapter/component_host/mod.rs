@@ -194,14 +194,14 @@ macro_rules! impl_program_bindings {
         {
         }
 
-        impl<CpuImpl, HostFs> $bindings::helios::system::programs::HostChildWithStore
+        impl<CpuImpl, HostFs, U> $bindings::helios::system::programs::HostChildWithStore<U>
             for HasSelf<StoreData<CpuImpl, HostFs>>
         where
             CpuImpl: Cpu + Clone,
             HostFs: crate::HostFileSystem,
         {
-            async fn drop<T>(
-                accessor: &Accessor<T, Self>,
+            async fn drop(
+                accessor: &Accessor<U, Self>,
                 child: wasmtime::component::Resource<ChildHandle>,
             ) -> wasmtime::Result<()> {
                 accessor.with(|mut access| {
@@ -211,8 +211,8 @@ macro_rules! impl_program_bindings {
                 Ok(())
             }
 
-            async fn wait<T: Send>(
-                accessor: &Accessor<T, Self>,
+            async fn wait(
+                accessor: &Accessor<U, Self>,
                 child: wasmtime::component::Resource<ChildHandle>,
             ) -> wasmtime::Result<
                 Result<
@@ -254,8 +254,8 @@ macro_rules! impl_program_bindings {
             }
 
             #[allow(unused_mut)]
-            fn stdin<T>(
-                mut access: Access<'_, T, Self>,
+            fn stdin(
+                mut access: Access<'_, U, Self>,
                 child: wasmtime::component::Resource<ChildHandle>,
                 mut data: StreamReader<u8>,
             ) -> wasmtime::Result<FutureReader<core::result::Result<(), ()>>> {
@@ -284,8 +284,8 @@ macro_rules! impl_program_bindings {
                 })
             }
 
-            fn stdout<T>(
-                mut access: Access<'_, T, Self>,
+            fn stdout(
+                mut access: Access<'_, U, Self>,
                 child: wasmtime::component::Resource<ChildHandle>,
             ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<core::result::Result<(), ()>>)>
             {
@@ -320,8 +320,8 @@ macro_rules! impl_program_bindings {
                 Ok((stream, future))
             }
 
-            fn stderr<T>(
-                mut access: Access<'_, T, Self>,
+            fn stderr(
+                mut access: Access<'_, U, Self>,
                 child: wasmtime::component::Resource<ChildHandle>,
             ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<core::result::Result<(), ()>>)>
             {
@@ -357,14 +357,14 @@ macro_rules! impl_program_bindings {
             }
         }
 
-        impl<CpuImpl, HostFs> $bindings::helios::system::programs::HostWithStore
+        impl<CpuImpl, HostFs, U> $bindings::helios::system::programs::HostWithStore<U>
             for HasSelf<StoreData<CpuImpl, HostFs>>
         where
             CpuImpl: Cpu + Clone,
             HostFs: crate::HostFileSystem,
         {
-            fn spawn<T: Send>(
-                accessor: &Accessor<T, Self>,
+            fn spawn(
+                accessor: &Accessor<U, Self>,
                 request: $bindings::helios::system::programs::SpawnRequest,
             ) -> impl core::future::Future<
                 Output = wasmtime::Result<
@@ -437,8 +437,8 @@ macro_rules! impl_program_bindings {
                 }
             }
 
-            fn exec<T: Send>(
-                accessor: &Accessor<T, Self>,
+            fn exec(
+                accessor: &Accessor<U, Self>,
                 request: $bindings::helios::system::programs::ExecRequest,
             ) -> impl core::future::Future<
                 Output = wasmtime::Result<
@@ -513,8 +513,8 @@ macro_rules! impl_program_bindings {
                 }
             }
 
-            fn aot<T: Send>(
-                accessor: &Accessor<T, Self>,
+            fn aot(
+                accessor: &Accessor<U, Self>,
                 request: $bindings::helios::system::programs::AotRequest,
             ) -> impl core::future::Future<
                 Output = wasmtime::Result<
@@ -3178,14 +3178,14 @@ where
 {
 }
 
-impl<CpuImpl, HostFs> debugger_bindings::helios::system::serial::HostWithStore
+impl<CpuImpl, HostFs, U> debugger_bindings::helios::system::serial::HostWithStore<U>
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    async fn debug_port<T: Send>(
-        accessor: &Accessor<T, Self>,
+    async fn debug_port(
+        accessor: &Accessor<U, Self>,
     ) -> wasmtime::Result<Option<Resource<SbiSerialPort>>> {
         accessor.with(|mut access| match access.get().debug_port() {
             Some(()) => Ok(Some(access.get().table.push(SbiSerialPort {
@@ -3204,14 +3204,14 @@ where
 {
 }
 
-impl<CpuImpl, HostFs> debugger_bindings::helios::system::serial::HostSerialPortWithStore
+impl<CpuImpl, HostFs, U> debugger_bindings::helios::system::serial::HostSerialPortWithStore<U>
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    async fn rights<T: Send>(
-        accessor: &Accessor<T, Self>,
+    async fn rights(
+        accessor: &Accessor<U, Self>,
         resource: Resource<SbiSerialPort>,
     ) -> wasmtime::Result<debugger_bindings::helios::system::serial::SerialRights> {
         accessor.with(|mut access| {
@@ -3224,8 +3224,8 @@ where
         })
     }
 
-    async fn drop<T>(
-        accessor: &Accessor<T, Self>,
+    async fn drop(
+        accessor: &Accessor<U, Self>,
         resource: Resource<SbiSerialPort>,
     ) -> wasmtime::Result<()> {
         accessor.with(|mut access| {
@@ -3234,8 +3234,8 @@ where
         })
     }
 
-    async fn read<T: 'static + Send>(
-        accessor: &Accessor<T, Self>,
+    async fn read(
+        accessor: &Accessor<U, Self>,
         resource: Resource<SbiSerialPort>,
         max_bytes: u32,
     ) -> wasmtime::Result<Vec<u8>> {
@@ -3255,8 +3255,8 @@ where
         }
     }
 
-    async fn write<T: 'static + Send>(
-        accessor: &Accessor<T, Self>,
+    async fn write(
+        accessor: &Accessor<U, Self>,
         resource: Resource<SbiSerialPort>,
         bytes: Vec<u8>,
     ) -> wasmtime::Result<()> {
@@ -3268,8 +3268,8 @@ where
         Ok(())
     }
 
-    async fn flush<T: 'static + Send>(
-        accessor: &Accessor<T, Self>,
+    async fn flush(
+        accessor: &Accessor<U, Self>,
         resource: Resource<SbiSerialPort>,
     ) -> wasmtime::Result<()> {
         accessor.with(|mut access| {
@@ -3295,24 +3295,27 @@ where
 {
 }
 
-impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawMutexWithStore
+impl<CpuImpl, HostFs, U> debugger_bindings::helios::system::sync::HostRawMutexWithStore<U>
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    async fn new<T: Send>(accessor: &Accessor<T, Self>) -> wasmtime::Result<Resource<SbiRawMutex>> {
-        accessor.with(|mut access| {
-            Ok(access.get().table.push(SbiRawMutex {
-                resource: RawMutexResource {
-                    inner: Arc::new(RawMutex::new()),
-                },
-            })?)
-        })
+    fn new(
+        mut access: Access<'_, U, Self>,
+    ) -> impl core::future::Future<Output = wasmtime::Result<Resource<SbiRawMutex>>> + Send {
+        // `Access` is not `Send`; do the table work synchronously and hand
+        // back a ready future that only captures the `Send` result.
+        let pushed = access.get().table.push(SbiRawMutex {
+            resource: RawMutexResource {
+                inner: Arc::new(RawMutex::new()),
+            },
+        });
+        async move { Ok(pushed?) }
     }
 
-    async fn drop<T>(
-        accessor: &Accessor<T, Self>,
+    async fn drop(
+        accessor: &Accessor<U, Self>,
         resource: Resource<SbiRawMutex>,
     ) -> wasmtime::Result<()> {
         accessor.with(|mut access| {
@@ -3321,8 +3324,8 @@ where
         })
     }
 
-    async fn lock<T: 'static>(
-        accessor: &Accessor<T, Self>,
+    async fn lock(
+        accessor: &Accessor<U, Self>,
         resource: Resource<SbiRawMutex>,
     ) -> wasmtime::Result<Resource<SbiRawMutexGuard>> {
         let mutex = accessor.with(|mut access| {
@@ -3345,14 +3348,14 @@ where
 {
 }
 
-impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawMutexGuardWithStore
+impl<CpuImpl, HostFs, U> debugger_bindings::helios::system::sync::HostRawMutexGuardWithStore<U>
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    async fn drop<T>(
-        accessor: &Accessor<T, Self>,
+    async fn drop(
+        accessor: &Accessor<U, Self>,
         resource: Resource<SbiRawMutexGuard>,
     ) -> wasmtime::Result<()> {
         accessor.with(|mut access| {
@@ -3370,26 +3373,25 @@ where
 {
 }
 
-impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawRwLockWithStore
+impl<CpuImpl, HostFs, U> debugger_bindings::helios::system::sync::HostRawRwLockWithStore<U>
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    async fn new<T: Send>(
-        accessor: &Accessor<T, Self>,
-    ) -> wasmtime::Result<Resource<SbiRawRwLock>> {
-        accessor.with(|mut access| {
-            Ok(access.get().table.push(SbiRawRwLock {
-                resource: RawRwLockResource {
-                    inner: Arc::new(RawRwLock::new()),
-                },
-            })?)
-        })
+    fn new(
+        mut access: Access<'_, U, Self>,
+    ) -> impl core::future::Future<Output = wasmtime::Result<Resource<SbiRawRwLock>>> + Send {
+        let pushed = access.get().table.push(SbiRawRwLock {
+            resource: RawRwLockResource {
+                inner: Arc::new(RawRwLock::new()),
+            },
+        });
+        async move { Ok(pushed?) }
     }
 
-    async fn drop<T>(
-        accessor: &Accessor<T, Self>,
+    async fn drop(
+        accessor: &Accessor<U, Self>,
         resource: Resource<SbiRawRwLock>,
     ) -> wasmtime::Result<()> {
         accessor.with(|mut access| {
@@ -3398,8 +3400,8 @@ where
         })
     }
 
-    async fn read<T: 'static>(
-        accessor: &Accessor<T, Self>,
+    async fn read(
+        accessor: &Accessor<U, Self>,
         resource: Resource<SbiRawRwLock>,
     ) -> wasmtime::Result<Resource<SbiRawRwLockReadGuard>> {
         let rwlock = accessor.with(|mut access| {
@@ -3413,8 +3415,8 @@ where
         })
     }
 
-    async fn write<T: 'static>(
-        accessor: &Accessor<T, Self>,
+    async fn write(
+        accessor: &Accessor<U, Self>,
         resource: Resource<SbiRawRwLock>,
     ) -> wasmtime::Result<Resource<SbiRawRwLockWriteGuard>> {
         let rwlock = accessor.with(|mut access| {
@@ -3437,14 +3439,14 @@ where
 {
 }
 
-impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawRwLockReadGuardWithStore
+impl<CpuImpl, HostFs, U> debugger_bindings::helios::system::sync::HostRawRwLockReadGuardWithStore<U>
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    async fn drop<T>(
-        accessor: &Accessor<T, Self>,
+    async fn drop(
+        accessor: &Accessor<U, Self>,
         resource: Resource<SbiRawRwLockReadGuard>,
     ) -> wasmtime::Result<()> {
         accessor.with(|mut access| {
@@ -3462,14 +3464,15 @@ where
 {
 }
 
-impl<CpuImpl, HostFs> debugger_bindings::helios::system::sync::HostRawRwLockWriteGuardWithStore
+impl<CpuImpl, HostFs, U>
+    debugger_bindings::helios::system::sync::HostRawRwLockWriteGuardWithStore<U>
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    async fn drop<T>(
-        accessor: &Accessor<T, Self>,
+    async fn drop(
+        accessor: &Accessor<U, Self>,
         resource: Resource<SbiRawRwLockWriteGuard>,
     ) -> wasmtime::Result<()> {
         accessor.with(|mut access| {

@@ -361,8 +361,8 @@ mod tests {
     #[test]
     fn component_imports_with_preview2_version_are_preview2() {
         let report = classify_component(alloc::vec![
-            "wasi:cli/environment@0.2.6".to_string(),
-            "wasi:filesystem/types@0.2.6".to_string(),
+            "wasi:cli/environment@0.2.12".to_string(),
+            "wasi:filesystem/types@0.2.12".to_string(),
             "import-func-run".to_string(),
         ])
         .expect("Preview2 imports must classify");

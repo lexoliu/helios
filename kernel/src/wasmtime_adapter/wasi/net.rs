@@ -1752,14 +1752,14 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> wasi::sockets::types::HostTcpSocketWithStore
+impl<CpuImpl, HostFs, U> wasi::sockets::types::HostTcpSocketWithStore<U>
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    async fn connect<T>(
-        accessor: &Accessor<T, Self>,
+    async fn connect(
+        accessor: &Accessor<U, Self>,
         socket: Resource<TcpSocket>,
         remote_address: socket_types::IpSocketAddress,
     ) -> Result<core::result::Result<(), socket_types::ErrorCode>> {
@@ -1783,8 +1783,8 @@ where
         Ok(socket.connect(remote_address).await)
     }
 
-    fn listen<T: 'static>(
-        mut access: Access<'_, T, Self>,
+    fn listen(
+        mut access: Access<'_, U, Self>,
         socket_resource: Resource<TcpSocket>,
     ) -> Result<core::result::Result<StreamReader<Resource<TcpSocket>>, socket_types::ErrorCode>>
     {
@@ -1850,8 +1850,8 @@ where
         Ok(Ok(stream))
     }
 
-    fn send<T>(
-        mut access: Access<'_, T, Self>,
+    fn send(
+        mut access: Access<'_, U, Self>,
         socket: Resource<TcpSocket>,
         mut bytes: StreamReader<u8>,
     ) -> Result<FutureReader<core::result::Result<(), socket_types::ErrorCode>>> {
@@ -1877,8 +1877,8 @@ where
         })
     }
 
-    fn receive<T>(
-        mut access: Access<'_, T, Self>,
+    fn receive(
+        mut access: Access<'_, U, Self>,
         socket: Resource<TcpSocket>,
     ) -> Result<(
         StreamReader<u8>,
@@ -1909,14 +1909,14 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> wasi::sockets::types::HostUdpSocketWithStore
+impl<CpuImpl, HostFs, U> wasi::sockets::types::HostUdpSocketWithStore<U>
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    async fn send<T>(
-        accessor: &Accessor<T, Self>,
+    async fn send(
+        accessor: &Accessor<U, Self>,
         socket: Resource<UdpSocket>,
         bytes: Vec<u8>,
         remote_address: Option<socket_types::IpSocketAddress>,
@@ -1946,8 +1946,8 @@ where
         Ok(result)
     }
 
-    async fn receive<T>(
-        accessor: &Accessor<T, Self>,
+    async fn receive(
+        accessor: &Accessor<U, Self>,
         socket: Resource<UdpSocket>,
     ) -> Result<
         core::result::Result<(Vec<u8>, socket_types::IpSocketAddress), socket_types::ErrorCode>,
@@ -2192,14 +2192,14 @@ where
 {
 }
 
-impl<CpuImpl, HostFs> wasi::sockets::ip_name_lookup::HostWithStore
+impl<CpuImpl, HostFs, U> wasi::sockets::ip_name_lookup::HostWithStore<U>
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    async fn resolve_addresses<T: Send>(
-        accessor: &Accessor<T, Self>,
+    async fn resolve_addresses(
+        accessor: &Accessor<U, Self>,
         name: String,
     ) -> Result<core::result::Result<Vec<socket_types::IpAddress>, ip_name_lookup::ErrorCode>> {
         let (has_dns_authority, service) = accessor.with(|mut access| {

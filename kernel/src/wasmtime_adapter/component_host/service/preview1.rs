@@ -846,6 +846,15 @@ where
     linker
         .func_wrap(
             "wasi_snapshot_preview1",
+            "fd_fdstat_get",
+            |caller: Caller<'_, CompilerCoreStore<CpuImpl, HostFs>>, fd: i32, stat: i32| -> i32 {
+                compiler_fd_fdstat_get(caller, fd, stat as u32)
+            },
+        )
+        .map_err(map_program_runtime_error)?;
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
             "fd_close",
             |mut caller: Caller<'_, CompilerCoreStore<CpuImpl, HostFs>>, fd: i32| -> i32 {
                 caller.data_mut().preview1_descriptors.close(fd)
@@ -2142,6 +2151,15 @@ where
     preview1_write_memory(memory, path, bytes)
 }
 
+pub(super) fn p1_fdstat_bytes(filetype: u8, fdflags: u16, rights: u64) -> [u8; 24] {
+    let mut bytes = [0; 24];
+    bytes[0] = filetype;
+    bytes[2..4].copy_from_slice(&fdflags.to_le_bytes());
+    bytes[8..16].copy_from_slice(&rights.to_le_bytes());
+    bytes[16..24].copy_from_slice(&rights.to_le_bytes());
+    bytes
+}
+
 pub(super) fn p1_fd_fdstat_get<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
@@ -2169,10 +2187,7 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let status = p1_write_u8(caller, memory, stat, filetype);
-    let status = status.max(p1_write_u16(caller, memory, stat + 2, fdflags));
-    let status = status.max(p1_write_u64(caller, memory, stat + 8, rights));
-    status.max(p1_write_u64(caller, memory, stat + 16, rights))
+    preview1_write_memory(memory, stat, &p1_fdstat_bytes(filetype, fdflags, rights))
 }
 
 pub(super) fn p1_fd_fdstat_set_flags<CpuImpl, HostFs>(

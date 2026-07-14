@@ -2002,6 +2002,17 @@ mod tests {
     }
 
     #[test]
+    fn preview1_fdstat_layout_is_little_endian_and_zero_padded() {
+        let bytes = p1_fdstat_bytes(2, 0x1234, 0x0102_0304_0506_0708);
+        assert_eq!(bytes[0], 2);
+        assert_eq!(bytes[1], 0);
+        assert_eq!(&bytes[2..4], &0x1234u16.to_le_bytes());
+        assert_eq!(&bytes[4..8], &[0; 4]);
+        assert_eq!(&bytes[8..16], &0x0102_0304_0506_0708u64.to_le_bytes());
+        assert_eq!(&bytes[16..24], &0x0102_0304_0506_0708u64.to_le_bytes());
+    }
+
+    #[test]
     fn wasix_program_linked_imports_have_authority_mapping() {
         for import in crate::wasmtime_adapter::wasix::LINKED_IMPORTS {
             assert!(

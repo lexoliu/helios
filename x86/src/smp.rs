@@ -11,7 +11,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use helios_hal::cpu::ProcessorId;
 use helios_hal::watchdog::Watchdog;
-use helios_kernel::Timer;
+use helios_kernel::{Timer, WasmtimeTlsSlots};
 use pci_types::ConfigRegionAccess;
 use spin::Once;
 use x86::apic::x2apic::X2APIC;
@@ -63,8 +63,7 @@ pub(crate) struct ProcessorRuntime {
     _reserved: u16,
     physical_memory_offset: usize,
     tsc_hz: u64,
-    pub(crate) wasmtime_tls: AtomicPtr<u8>,
-    pub(crate) wasmtime_component_tls: AtomicPtr<u8>,
+    pub(crate) wasmtime_tls: WasmtimeTlsSlots,
     pub(crate) native_trap_handler: AtomicUsize,
     pub(crate) exception_idt: ProcessorIdt,
     watchdog: X86Watchdog,
@@ -139,8 +138,7 @@ pub(crate) fn build_boot_context(
             _reserved: 0,
             physical_memory_offset,
             tsc_hz,
-            wasmtime_tls: AtomicPtr::new(core::ptr::null_mut()),
-            wasmtime_component_tls: AtomicPtr::new(core::ptr::null_mut()),
+            wasmtime_tls: WasmtimeTlsSlots::new(),
             native_trap_handler: AtomicUsize::new(0),
             exception_idt: ProcessorIdt::new(),
             watchdog: watchdog.clone(),
@@ -165,8 +163,7 @@ pub(crate) fn build_boot_context(
                 _reserved: 0,
                 physical_memory_offset,
                 tsc_hz,
-                wasmtime_tls: AtomicPtr::new(core::ptr::null_mut()),
-                wasmtime_component_tls: AtomicPtr::new(core::ptr::null_mut()),
+                wasmtime_tls: WasmtimeTlsSlots::new(),
                 native_trap_handler: AtomicUsize::new(0),
                 exception_idt: ProcessorIdt::new(),
                 watchdog: watchdog.clone(),

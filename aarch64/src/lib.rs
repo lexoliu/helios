@@ -11,7 +11,7 @@ use core::cell::UnsafeCell;
 use core::fmt::{self, Write};
 use core::ops::Range;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -25,7 +25,9 @@ use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
 use helios_hal::{DeviceInventory, DmaModel, Platform};
-use helios_kernel::{KernelException, KernelExceptionCause, KernelNativeTrapHandler};
+use helios_kernel::{
+    KernelException, KernelExceptionCause, KernelNativeTrapHandler, WasmtimeTlsSlots,
+};
 use limine::BaseRevision;
 use limine::file::File;
 use limine::firmware::{
@@ -162,8 +164,7 @@ struct ProcessorRuntime {
     exception_stack: ExceptionStack,
     logical_id: u16,
     _reserved: u16,
-    wasmtime_tls: AtomicPtr<u8>,
-    wasmtime_component_tls: AtomicPtr<u8>,
+    wasmtime_tls: WasmtimeTlsSlots,
     native_trap_handler: AtomicUsize,
     started: AtomicBool,
     /// Block size in bytes for the `DC ZVA` cache-line zero
@@ -179,8 +180,7 @@ impl ProcessorRuntime {
             exception_stack: ExceptionStack::new(),
             logical_id,
             _reserved: 0,
-            wasmtime_tls: AtomicPtr::new(core::ptr::null_mut()),
-            wasmtime_component_tls: AtomicPtr::new(core::ptr::null_mut()),
+            wasmtime_tls: WasmtimeTlsSlots::new(),
             native_trap_handler: AtomicUsize::new(0),
             started: AtomicBool::new(false),
             dc_zva_block_bytes: AtomicU32::new(0),
@@ -1855,7 +1855,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
 #[cfg(target_os = "none")]
 #[unsafe(no_mangle)]
-extern "C" fn wasmtime_tls_get() -> *mut u8 {
+extern "C" fn wasmtime_tls_get(slot: usize) -> *mut u8 {
     let runtime = read_processor_runtime();
     if runtime == 0 {
         return core::ptr::null_mut();
@@ -1863,38 +1863,14 @@ extern "C" fn wasmtime_tls_get() -> *mut u8 {
     unsafe {
         (*(runtime as *const ProcessorRuntime))
             .wasmtime_tls
-            .load(Ordering::Acquire)
+            .get(slot)
     }
 }
 
 #[cfg(target_os = "none")]
 #[unsafe(no_mangle)]
-extern "C" fn wasmtime_tls_set(ptr: *mut u8) {
-    current_processor_runtime()
-        .wasmtime_tls
-        .store(ptr, Ordering::Release);
-}
-
-#[cfg(target_os = "none")]
-#[unsafe(no_mangle)]
-extern "C" fn wasmtime_component_tls_get() -> *mut u8 {
-    let runtime = read_processor_runtime();
-    if runtime == 0 {
-        return core::ptr::null_mut();
-    }
-    unsafe {
-        (*(runtime as *const ProcessorRuntime))
-            .wasmtime_component_tls
-            .load(Ordering::Acquire)
-    }
-}
-
-#[cfg(target_os = "none")]
-#[unsafe(no_mangle)]
-extern "C" fn wasmtime_component_tls_set(ptr: *mut u8) {
-    current_processor_runtime()
-        .wasmtime_component_tls
-        .store(ptr, Ordering::Release);
+extern "C" fn wasmtime_tls_set(slot: usize, ptr: *mut u8) {
+    current_processor_runtime().wasmtime_tls.set(slot, ptr);
 }
 
 #[cfg(target_os = "none")]

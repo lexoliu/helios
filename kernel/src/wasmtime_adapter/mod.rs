@@ -30,6 +30,7 @@ pub mod store;
     )
 ))]
 mod sync;
+pub mod tls;
 pub(crate) mod user_memory;
 pub mod wasi;
 pub(crate) mod wasix;

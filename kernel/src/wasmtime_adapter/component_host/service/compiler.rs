@@ -278,6 +278,25 @@ pub(super) fn read_compiler_response(
     Ok(unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<CompilerResponseHeader>()) })
 }
 
+pub(super) fn compiler_fd_fdstat_get<CpuImpl, HostFs>(
+    caller: Caller<'_, CompilerCoreStore<CpuImpl, HostFs>>,
+    fd: i32,
+    stat: u32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let descriptor = match fd {
+        1 if caller.data().preview1_descriptors.stdout_open => Preview1Descriptor::Stdout,
+        2 if caller.data().preview1_descriptors.stderr_open => Preview1Descriptor::Stderr,
+        _ => return p1::errno::BADF,
+    };
+    let bytes = p1_fdstat_bytes(2, 0, p1_descriptor_rights(&descriptor));
+    write_shared_memory(caller.data().memory(), stat, &bytes)
+        .map_or(p1::errno::FAULT, |_| p1::errno::SUCCESS)
+}
+
 pub(super) fn fd_write<CpuImpl, HostFs>(
     caller: Caller<'_, CompilerCoreStore<CpuImpl, HostFs>>,
     fd: i32,

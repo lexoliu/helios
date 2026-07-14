@@ -24,14 +24,14 @@ where
     }
 }
 
-impl<CpuImpl, HostFs> wasi::clocks::monotonic_clock::HostWithStore
+impl<CpuImpl, HostFs, U> wasi::clocks::monotonic_clock::HostWithStore<U>
     for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    async fn wait_until<T: Send>(
-        accessor: &Accessor<T, Self>,
+    async fn wait_until(
+        accessor: &Accessor<U, Self>,
         when: wasi::clocks::monotonic_clock::Mark,
     ) -> Result<()> {
         let (timer, cpu, runtime_state) = accessor.with(|mut access| {
@@ -46,8 +46,8 @@ where
         Ok(())
     }
 
-    async fn wait_for<T: Send>(
-        accessor: &Accessor<T, Self>,
+    async fn wait_for(
+        accessor: &Accessor<U, Self>,
         duration: wasi::clocks::types::Duration,
     ) -> Result<()> {
         let deadline =
@@ -122,13 +122,13 @@ where
 {
 }
 
-impl<CpuImpl, HostFs> wasi::cli::stdin::HostWithStore for HasSelf<StoreData<CpuImpl, HostFs>>
+impl<CpuImpl, HostFs, U> wasi::cli::stdin::HostWithStore<U> for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    fn read_via_stream<T>(
-        mut access: Access<'_, T, Self>,
+    fn read_via_stream(
+        mut access: Access<'_, U, Self>,
     ) -> Result<(
         StreamReader<u8>,
         FutureReader<core::result::Result<(), cli_types::ErrorCode>>,
@@ -163,13 +163,13 @@ where
 {
 }
 
-impl<CpuImpl, HostFs> wasi::cli::stdout::HostWithStore for HasSelf<StoreData<CpuImpl, HostFs>>
+impl<CpuImpl, HostFs, U> wasi::cli::stdout::HostWithStore<U> for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    fn write_via_stream<T>(
-        mut access: Access<'_, T, Self>,
+    fn write_via_stream(
+        mut access: Access<'_, U, Self>,
         data: StreamReader<u8>,
     ) -> Result<FutureReader<core::result::Result<(), cli_types::ErrorCode>>> {
         let (tx, rx) = oneshot::channel();
@@ -194,13 +194,13 @@ where
 {
 }
 
-impl<CpuImpl, HostFs> wasi::cli::stderr::HostWithStore for HasSelf<StoreData<CpuImpl, HostFs>>
+impl<CpuImpl, HostFs, U> wasi::cli::stderr::HostWithStore<U> for HasSelf<StoreData<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    fn write_via_stream<T>(
-        mut access: Access<'_, T, Self>,
+    fn write_via_stream(
+        mut access: Access<'_, U, Self>,
         data: StreamReader<u8>,
     ) -> Result<FutureReader<core::result::Result<(), cli_types::ErrorCode>>> {
         let (tx, rx) = oneshot::channel();

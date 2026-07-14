@@ -146,13 +146,16 @@ fn build_engine_config(target: &str, hint: AotCompileHint, worker_count: usize) 
     }
     config.wasm_component_model(true);
     config.wasm_component_model_async(true);
-    config.wasm_component_model_async_builtins(true);
+    config.wasm_component_model_more_async_builtins(true);
     config.wasm_component_model_async_stackful(true);
     config.wasm_component_model_threading(true);
     let wasm_simd = cwasm_target_supports_wasm_simd(target);
     config.wasm_simd(wasm_simd);
     config.wasm_relaxed_simd(wasm_simd);
     config.relaxed_simd_deterministic(false);
+    // 128-bit integer arithmetic is supported on every backend, including
+    // riscv64gc where i128 lowers to register pairs and split i64 stores.
+    config.wasm_wide_arithmetic(true);
     config.wasm_multi_memory(true);
     config.wasm_memory64(true);
     config.wasm_tail_call(true);
@@ -164,7 +167,10 @@ fn build_engine_config(target: &str, hint: AotCompileHint, worker_count: usize) 
     config.concurrency_support(true);
     config.parallel_compilation(worker_count > 1);
     config.epoch_interruption(true);
+    // Wasmtime validates `max_wasm_stack <= async_stack_size`; keep the async
+    // fiber stack comfortably above the wasm stack limit with host headroom.
     config.max_wasm_stack(8 * 1024 * 1024);
+    config.async_stack_size(9 * 1024 * 1024);
     if cwasm_target_uses_lazy_commit_virtual_memory(target) {
         config.memory_init_cow(true);
         config.memory_may_move(false);

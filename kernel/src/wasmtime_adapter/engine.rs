@@ -166,7 +166,7 @@ pub fn resolve_wasi_cli_run<T: 'static>(
         .find_map(|(name, item)| {
             (name.starts_with("wasi:cli/run")
                 && matches!(
-                    item,
+                    item.ty,
                     wasmtime::component::types::ComponentItem::ComponentInstance(_)
                 ))
             .then(|| name.to_owned())

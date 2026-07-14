@@ -101,6 +101,7 @@ use helios_hal::serial::ByteSerial;
 use helios_hal::{DeviceInventory, DmaModel, ProcessorStartupPolicy, ProcessorTopology};
 use helios_kernel::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler, Timer,
+    WasmtimeTlsSlots,
 };
 use riscv::interrupt::Trap;
 use riscv::interrupt::supervisor::{Exception, Interrupt};
@@ -270,8 +271,7 @@ unsafe impl critical_section::Impl for SupervisorCriticalSection {
 struct HartRuntime {
     hart_id: ProcessorId,
     timer: Timer<RiscvCpu>,
-    wasmtime_tls: Cell<*mut u8>,
-    wasmtime_component_tls: Cell<*mut u8>,
+    wasmtime_tls: WasmtimeTlsSlots,
     native_trap_handler: Cell<Option<KernelNativeTrapHandler>>,
     debug_transport: Option<DebugTransport>,
     external_interrupts: Option<net::ExternalInterrupts>,
@@ -603,8 +603,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     let mut hart_runtime = HartRuntime {
         hart_id: current_hart,
         timer: kernel.timer(),
-        wasmtime_tls: Cell::new(core::ptr::null_mut()),
-        wasmtime_component_tls: Cell::new(core::ptr::null_mut()),
+        wasmtime_tls: WasmtimeTlsSlots::new(),
         native_trap_handler: Cell::new(None),
         debug_transport,
         external_interrupts,
@@ -776,39 +775,18 @@ pub(crate) fn write_debug_serial_bytes(bytes: &[u8]) {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn wasmtime_tls_get() -> *mut u8 {
+extern "C" fn wasmtime_tls_get(slot: usize) -> *mut u8 {
     let runtime = read_hart_runtime();
     if runtime == 0 {
         return core::ptr::null_mut();
     }
 
-    unsafe { (*(runtime as *const HartRuntime)).wasmtime_tls.get() }
+    unsafe { (*(runtime as *const HartRuntime)).wasmtime_tls.get(slot) }
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn wasmtime_tls_set(ptr: *mut u8) {
-    let runtime = current_hart_runtime();
-    runtime.wasmtime_tls.set(ptr);
-}
-
-#[unsafe(no_mangle)]
-extern "C" fn wasmtime_component_tls_get() -> *mut u8 {
-    let runtime = read_hart_runtime();
-    if runtime == 0 {
-        return core::ptr::null_mut();
-    }
-
-    unsafe {
-        (*(runtime as *const HartRuntime))
-            .wasmtime_component_tls
-            .get()
-    }
-}
-
-#[unsafe(no_mangle)]
-extern "C" fn wasmtime_component_tls_set(ptr: *mut u8) {
-    let runtime = current_hart_runtime();
-    runtime.wasmtime_component_tls.set(ptr);
+extern "C" fn wasmtime_tls_set(slot: usize, ptr: *mut u8) {
+    current_hart_runtime().wasmtime_tls.set(slot, ptr);
 }
 
 #[unsafe(no_mangle)]
@@ -868,7 +846,7 @@ fn dispatch_kernel_exception(
             "\n[KDBG kernel-exception-dispatch cause={cause:?} pc={:#x} fp={:#x} tls={:#x}]\n",
             tf.sepc,
             tf.general.s0,
-            wasmtime_tls_get() as usize,
+            wasmtime_tls_get(WasmtimeTlsSlots::RUNTIME) as usize,
         )
         .as_bytes(),
     );

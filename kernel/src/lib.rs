@@ -21,6 +21,8 @@ mod process;
 mod runtime;
 #[cfg(feature = "wasmtime-runtime")]
 pub(crate) mod wasmtime_adapter;
+#[cfg(feature = "wasmtime-runtime")]
+pub use wasmtime_adapter::tls::WasmtimeTlsSlots;
 
 #[cfg(all(
     target_os = "none",

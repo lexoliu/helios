@@ -968,29 +968,13 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn wasmtime_tls_get() -> *mut u8 {
-    smp::current_runtime().wasmtime_tls.load(Ordering::Acquire)
+extern "C" fn wasmtime_tls_get(slot: usize) -> *mut u8 {
+    smp::current_runtime().wasmtime_tls.get(slot)
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn wasmtime_tls_set(ptr: *mut u8) {
-    smp::current_runtime()
-        .wasmtime_tls
-        .store(ptr, Ordering::Release);
-}
-
-#[unsafe(no_mangle)]
-extern "C" fn wasmtime_component_tls_get() -> *mut u8 {
-    smp::current_runtime()
-        .wasmtime_component_tls
-        .load(Ordering::Acquire)
-}
-
-#[unsafe(no_mangle)]
-extern "C" fn wasmtime_component_tls_set(ptr: *mut u8) {
-    smp::current_runtime()
-        .wasmtime_component_tls
-        .store(ptr, Ordering::Release);
+extern "C" fn wasmtime_tls_set(slot: usize, ptr: *mut u8) {
+    smp::current_runtime().wasmtime_tls.set(slot, ptr);
 }
 
 #[unsafe(no_mangle)]

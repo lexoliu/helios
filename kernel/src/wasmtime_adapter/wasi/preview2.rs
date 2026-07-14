@@ -105,16 +105,16 @@ pub(crate) mod cli_bindings {
                     package helios:debugger-p2-cli;
 
                     world imports {
-                        import wasi:cli/environment@0.2.6;
-                        import wasi:cli/exit@0.2.6;
-                        import wasi:cli/stdin@0.2.6;
-                        import wasi:cli/stdout@0.2.6;
-                        import wasi:cli/stderr@0.2.6;
-                        import wasi:cli/terminal-input@0.2.6;
-                        import wasi:cli/terminal-output@0.2.6;
-                        import wasi:cli/terminal-stdin@0.2.6;
-                        import wasi:cli/terminal-stdout@0.2.6;
-                        import wasi:cli/terminal-stderr@0.2.6;
+                        import wasi:cli/environment@0.2.12;
+                        import wasi:cli/exit@0.2.12;
+                        import wasi:cli/stdin@0.2.12;
+                        import wasi:cli/stdout@0.2.12;
+                        import wasi:cli/stderr@0.2.12;
+                        import wasi:cli/terminal-input@0.2.12;
+                        import wasi:cli/terminal-output@0.2.12;
+                        import wasi:cli/terminal-stdin@0.2.12;
+                        import wasi:cli/terminal-stdout@0.2.12;
+                        import wasi:cli/terminal-stderr@0.2.12;
                     }
                 ",
             path: "../../wasmtime/crates/wasi/src/p2/wit",
@@ -143,8 +143,8 @@ pub(crate) mod clocks_bindings {
                     package helios:debugger-p2-clocks;
 
                     world imports {
-                        import wasi:clocks/monotonic-clock@0.2.6;
-                        import wasi:clocks/wall-clock@0.2.6;
+                        import wasi:clocks/monotonic-clock@0.2.12;
+                        import wasi:clocks/wall-clock@0.2.12;
                     }
                 ",
             path: "../../wasmtime/crates/wasi/src/p2/wit",
@@ -169,8 +169,8 @@ pub(crate) mod filesystem_bindings {
                     package helios:debugger-p2-filesystem;
 
                     world imports {
-                        import wasi:filesystem/preopens@0.2.6;
-                        import wasi:filesystem/types@0.2.6;
+                        import wasi:filesystem/preopens@0.2.12;
+                        import wasi:filesystem/types@0.2.12;
                     }
                 ",
             path: "../../wasmtime/crates/wasi/src/p2/wit",
@@ -217,9 +217,9 @@ pub(crate) mod random_bindings {
                     package helios:debugger-p2-random;
 
                     world imports {
-                        import wasi:random/random@0.2.6;
-                        import wasi:random/insecure@0.2.6;
-                        import wasi:random/insecure-seed@0.2.6;
+                        import wasi:random/random@0.2.12;
+                        import wasi:random/insecure@0.2.12;
+                        import wasi:random/insecure-seed@0.2.12;
                     }
                 ",
             path: "../../wasmtime/crates/wasi/src/p2/wit",
@@ -241,13 +241,13 @@ pub(crate) mod sockets_bindings {
                     package helios:debugger-p2-sockets;
 
                     world imports {
-                        import wasi:sockets/network@0.2.6;
-                        import wasi:sockets/instance-network@0.2.6;
-                        import wasi:sockets/udp@0.2.6;
-                        import wasi:sockets/udp-create-socket@0.2.6;
-                        import wasi:sockets/tcp@0.2.6;
-                        import wasi:sockets/tcp-create-socket@0.2.6;
-                        import wasi:sockets/ip-name-lookup@0.2.6;
+                        import wasi:sockets/network@0.2.12;
+                        import wasi:sockets/instance-network@0.2.12;
+                        import wasi:sockets/udp@0.2.12;
+                        import wasi:sockets/udp-create-socket@0.2.12;
+                        import wasi:sockets/tcp@0.2.12;
+                        import wasi:sockets/tcp-create-socket@0.2.12;
+                        import wasi:sockets/ip-name-lookup@0.2.12;
                     }
                 ",
             path: "../../wasmtime/crates/wasi/src/p2/wit",
@@ -368,7 +368,6 @@ where
     if imports.has("wasi:cli/exit", "0.2") {
         cli_bindings::cli::exit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
             linker,
-            &Default::default(),
             |state| state,
         )?;
     }
@@ -3622,12 +3621,12 @@ mod tests {
             let expected = {
                 let mut expected = String::from("package ");
                 expected.push_str(package);
-                expected.push_str("@0.2.6;");
+                expected.push_str("@0.2.12;");
                 expected
             };
             assert!(
                 wit.lines().any(|line| line.trim() == expected),
-                "preview2 WIT package {package} does not declare @0.2.6"
+                "preview2 WIT package {package} does not declare @0.2.12"
             );
         }
     }
