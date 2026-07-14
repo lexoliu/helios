@@ -8,7 +8,7 @@ at `../wasmtime/crates/wasmtime`.
 The checkout must be at:
 
 ```text
-67ff0c887046efcc7de8ed65a830afa01b05e7cf
+11218b3b9269f1fb50df1f468980708c6fc3ce4e
 ```
 
 This revision is based on upstream Wasmtime commit:
@@ -23,25 +23,28 @@ host, bare-metal, and WASI targets used by the workspace.
 
 ## Patch series
 
-The local `helios-upstream-series-final` branch is organized as a stacked,
-independently reviewable series. Each `pr-final/*` branch points at the tip intended
+The local `helios-upstream-series-ready` branch is organized as a stacked,
+independently reviewable series. Each `pr-ready/*` branch points at the tip intended
 for that upstream pull request:
 
-1. `pr-final/no-std-threads` — host-provided synchronization primitives and no-std
+1. `pr-ready/no-std-threads` — host-provided synchronization primitives and no-std
    WebAssembly threads support.
-2. `pr-final/no-std-pooling` — no-std pooling allocator, including deterministic
+2. `pr-ready/no-std-pooling` — no-std pooling allocator, including deterministic
    single-shard selection where host thread-local storage is unavailable.
-3. `pr-final/generic-fiber-pool` — bounded reuse of generic async fiber stacks.
-4. `pr-final/custom-vm-accessible-reset` — reset only the accessible prefix of
+3. `pr-ready/generic-fiber-pool` — bounded reuse of generic async fiber stacks.
+4. `pr-ready/custom-vm-accessible-reset` — reset only the accessible prefix of
    custom-VM linear memories.
-5. `pr-final/global-pass-timing` — aggregate Cranelift pass timings published by
+5. `pr-ready/global-pass-timing` — aggregate Cranelift pass timings published by
    parallel compiler workers.
-6. `pr-final/riscv64-inline-copy` — scalarize fixed-size inline copies when an ISA
+6. `pr-ready/riscv64-simd-fail-fast` — reject SIMD and relaxed-SIMD during
+   configuration validation when a riscv64 target does not enable the V
+   extension.
+7. `pr-ready/riscv64-inline-copy` — scalarize fixed-size inline copies when an ISA
    lacks native 128-bit SIMD. This fixes GC `array.copy` compilation on
    riscv64 without the V extension and includes a target-specific disassembly
    regression test.
 
-The final commit on `helios-upstream-series-final` remains a Helios integration
+The final commit on `helios-upstream-series-ready` remains a Helios integration
 patch: it separates Component Model Async ABI compilation
 from Wasmtime's async runtime/fiber support so the compiler plugin can produce
 compatible artifacts while the no-std kernel only loads and runs precompiled
