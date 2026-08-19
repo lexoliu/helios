@@ -577,9 +577,9 @@ def ensure_provisioned(
         raise SystemExit(
             "Fedora guest QuickJS is not already provisioned with policy "
             f"{quickjs_policy['id']}, and no local QuickJS-NG v{QUICKJS_VERSION} "
-            "source archive is staged for offline rebuild. Place the archive at "
-            f"{DEFAULT_ASSET_DIR}/sources/{QUICKJS_SOURCE_ARCHIVE_NAME} or pass "
-            "--quickjs-source-archive."
+            "source archive is staged for offline rebuild. Place the archive "
+            f"under the Fedora VM asset directory as sources/{QUICKJS_SOURCE_ARCHIVE_NAME} "
+            "or pass --quickjs-source-archive."
         )
     package_list = " ".join(shlex.quote(package) for package in FEDORA_PACKAGES)
     command_parts = [f"({base_verify_command}) || sudo dnf install -y {package_list}"]
