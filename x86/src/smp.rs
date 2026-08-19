@@ -751,9 +751,9 @@ fn stall_microseconds(tsc_hz: u64, microseconds: u64) {
 }
 
 fn xapic_mmio_region(physical_base: usize, physical_memory_offset: usize) -> &'static mut [u32] {
-    let virtual_base = physical_base
-        .checked_add(physical_memory_offset)
-        .unwrap_or_else(|| panic!("x86 local APIC virtual address overflow"));
+    // The local APIC page is MMIO, not RAM: it is absent from the boot
+    // memory map, so the HHDM does not cover it until it is mapped here.
+    let virtual_base = map_mmio_window(physical_memory_offset, physical_base, WAKEUP_PAGE_BYTES);
     unsafe { core::slice::from_raw_parts_mut(virtual_base as *mut u32, WAKEUP_PAGE_BYTES / 4) }
 }
 
