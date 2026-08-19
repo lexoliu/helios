@@ -13,9 +13,20 @@ const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const READY_DRAIN_QUIET_PERIOD: Duration = Duration::from_millis(100);
 const DEBUGGER_RUN_STAGE: &str = "run:begin";
 
+/// Boot-marker deadline. Firmware loading a release kernel image under
+/// pure TCG can legitimately take longer than the default 15 minutes,
+/// so slow hosts may widen it via HELIOS_BOOT_SYNC_TIMEOUT_SECS.
+fn boot_sync_timeout() -> Duration {
+    std::env::var("HELIOS_BOOT_SYNC_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(BOOT_SYNC_TIMEOUT)
+}
+
 pub(crate) async fn connect_after_boot(io: SerialIo) -> Result<RpcClient> {
     let (mut read, write) = io.into_split();
-    runtime::timeout(BOOT_SYNC_TIMEOUT, wait_for_debugger_stage(&mut read))
+    runtime::timeout(boot_sync_timeout(), wait_for_debugger_stage(&mut read))
         .await
         .context("timed out waiting for the embedded debugger cold-start markers")??;
 
