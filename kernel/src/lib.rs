@@ -129,8 +129,8 @@ pub use runtime::{
     DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry, HostFileSystem, HostFsError,
     HostFsErrorKind, HostMetadata, Ipv4Address, NetworkErrorDetail, NetworkIpAddress,
     ObjectIdentity, PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer, RuntimeState,
-    TcpAccepted, TcpError, TcpErrorKind, TcpListener, UdpBinding, UdpDatagram, UdpError,
-    UdpErrorKind,
+    SocketReadiness, TcpAccepted, TcpError, TcpErrorKind, TcpListener, UdpBinding, UdpDatagram,
+    UdpError, UdpErrorKind,
 };
 #[cfg(feature = "wasmtime-runtime")]
 pub use wasmtime_adapter::component_host::{

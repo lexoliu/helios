@@ -234,6 +234,27 @@ where
         async move { NetworkService::tcp_accept(self, listener, timeout_nanos).await }
     }
 
+    fn tcp_readiness(
+        &self,
+        stream: Self::TcpStream,
+    ) -> impl core::future::Future<Output = Result<SocketReadiness, TcpError>> + Send + '_ {
+        async move { NetworkService::tcp_readiness(self, stream).await }
+    }
+
+    fn tcp_listener_readiness(
+        &self,
+        listener: Self::TcpListener,
+    ) -> impl core::future::Future<Output = Result<SocketReadiness, TcpError>> + Send + '_ {
+        async move { NetworkService::tcp_listener_readiness(self, listener).await }
+    }
+
+    fn udp_readiness(
+        &self,
+        socket: Self::UdpSocket,
+    ) -> impl core::future::Future<Output = Result<SocketReadiness, UdpError>> + Send + '_ {
+        async move { NetworkService::udp_readiness(self, socket).await }
+    }
+
     fn tcp_write_all<'a>(
         &'a self,
         stream: Self::TcpStream,

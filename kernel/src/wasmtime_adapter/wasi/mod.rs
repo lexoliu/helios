@@ -29,7 +29,8 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use crate::{
-    AuthorityDomain, ComponentNetworkService, EmbeddedBootFs, HostFsErrorKind, ObjectIdentity,
+    AuthorityDomain, ComponentNetworkService, ComponentOutputMode, ComponentOutputRoute,
+    ComponentOutputStreamKind, EmbeddedBootFs, HostFsErrorKind, ObjectIdentity,
 };
 use bytes::{Bytes, BytesMut};
 use futures::channel::oneshot;
@@ -125,6 +126,54 @@ impl WasiImportSet {
     }
 }
 
+/// Whether the component's standard input is attached to the interactive
+/// serial console.
+///
+/// The serial console is the only terminal Helios attaches a component to;
+/// every other stdin route is a byte channel fed by a parent process, which is
+/// a pipe rather than a tty. `wasi:cli/terminal-stdin` must only produce a
+/// `terminal-input` resource for the console so guests do not misdetect a tty
+/// on a captured stream.
+///
+/// Console-attached components read keystrokes through `helios:system/serial`
+/// rather than the wasi stdin stream, which stays empty; the terminal
+/// resource describes the attachment, not that stream.
+pub(crate) fn stdin_is_terminal(mode: &ComponentOutputMode) -> bool {
+    match mode {
+        ComponentOutputMode::Serial => true,
+        ComponentOutputMode::Trace
+        | ComponentOutputMode::Child { .. }
+        | ComponentOutputMode::RoutedChild { .. } => false,
+    }
+}
+
+/// Whether the requested output stream is attached to the interactive serial
+/// console.
+///
+/// `Trace` and `Discard` routes are capture sinks, and `Child` routes are
+/// pipes to a parent process; only the serial console is a terminal.
+pub(crate) fn output_is_terminal(
+    mode: &ComponentOutputMode,
+    kind: ComponentOutputStreamKind,
+) -> bool {
+    match mode {
+        ComponentOutputMode::Serial => true,
+        ComponentOutputMode::Trace | ComponentOutputMode::Child { .. } => false,
+        ComponentOutputMode::RoutedChild { stdout, stderr, .. } => {
+            let route = match kind {
+                ComponentOutputStreamKind::Stdout => stdout,
+                ComponentOutputStreamKind::Stderr => stderr,
+            };
+            match route {
+                ComponentOutputRoute::Serial => true,
+                ComponentOutputRoute::Trace
+                | ComponentOutputRoute::Child(_)
+                | ComponentOutputRoute::Discard => false,
+            }
+        }
+    }
+}
+
 pub(crate) mod preview1;
 pub(crate) mod preview2;
 pub(crate) mod preview3;
@@ -190,6 +239,7 @@ impl<T> core::error::Error for TrappableError<T> {}
 
 #[cfg(test)]
 mod tests {
+    use crate::SocketReadiness;
     use alloc::boxed::Box;
     use alloc::collections::BTreeSet;
     use alloc::string::String;
@@ -213,8 +263,8 @@ mod tests {
         format_p3_tcp_socket_address, format_p3_udp_socket_address, fs_types,
         has_wasi_network_rights, ip_name_lookup, map_p3_dns_error, map_p3_tcp_error,
         map_p3_udp_family, map_p3_udp_socket_error, parse_p3_tcp_socket_address,
-        parse_p3_udp_socket_address, preview3, socket_types, wasi_tcp_bind_rights,
-        wasi_udp_bind_rights,
+        parse_p3_udp_socket_address, preview3, socket_types, stdin_is_terminal,
+        wasi_tcp_bind_rights, wasi_udp_bind_rights,
     };
 
     const fn tcp4(octets: [u8; 4], port: u16) -> WasiTcpSocketAddress {
@@ -251,6 +301,40 @@ mod tests {
         type TcpStream = u64;
         type TcpListener = u64;
         type UdpSocket = u64;
+
+        // The in-memory doubles model an always-ready loopback peer.
+        fn tcp_readiness(
+            &self,
+            _: Self::TcpStream,
+        ) -> impl Future<Output = Result<SocketReadiness, crate::TcpError>> + Send + '_ {
+            core::future::ready(Ok(SocketReadiness {
+                readable: true,
+                writable: true,
+                hangup: false,
+            }))
+        }
+
+        fn tcp_listener_readiness(
+            &self,
+            _: Self::TcpListener,
+        ) -> impl Future<Output = Result<SocketReadiness, crate::TcpError>> + Send + '_ {
+            core::future::ready(Ok(SocketReadiness {
+                readable: true,
+                writable: false,
+                hangup: false,
+            }))
+        }
+
+        fn udp_readiness(
+            &self,
+            _: Self::UdpSocket,
+        ) -> impl Future<Output = Result<SocketReadiness, crate::UdpError>> + Send + '_ {
+            core::future::ready(Ok(SocketReadiness {
+                readable: true,
+                writable: true,
+                hangup: false,
+            }))
+        }
 
         fn hardware_address(&self) -> [u8; 6] {
             [2, 0, 0, 0, 0, 1]
@@ -635,6 +719,7 @@ mod tests {
             &[
                 "wasi:clocks/monotonic-clock",
                 "wasi:clocks/system-clock",
+                "wasi:clocks/timezone",
                 "wasi:cli/environment",
                 "wasi:cli/exit",
                 "wasi:cli/stdin",
@@ -655,6 +740,42 @@ mod tests {
             ],
             "Preview3",
         );
+    }
+
+    #[test]
+    fn only_serial_console_stdio_is_reported_as_a_terminal() {
+        use super::{ComponentOutputMode, ComponentOutputRoute, output_is_terminal};
+        use crate::ComponentOutputStreamKind::{Stderr, Stdout};
+
+        assert!(stdin_is_terminal(&ComponentOutputMode::Serial));
+        assert!(output_is_terminal(&ComponentOutputMode::Serial, Stdout));
+        assert!(output_is_terminal(&ComponentOutputMode::Serial, Stderr));
+
+        assert!(!stdin_is_terminal(&ComponentOutputMode::Trace));
+        assert!(!output_is_terminal(&ComponentOutputMode::Trace, Stdout));
+        assert!(!output_is_terminal(&ComponentOutputMode::Trace, Stderr));
+
+        let (stdout_tx, _stdout_rx) = crate::byte_channel();
+        let (stderr_tx, _stderr_rx) = crate::byte_channel();
+        let (_stdin_tx, stdin_rx) = crate::byte_channel();
+        let captured = ComponentOutputMode::Child {
+            stdin_rx: stdin_rx.clone(),
+            stdout_tx,
+            stderr_tx,
+        };
+        assert!(!stdin_is_terminal(&captured));
+        assert!(!output_is_terminal(&captured, Stdout));
+        assert!(!output_is_terminal(&captured, Stderr));
+
+        let (routed_stdout_tx, _routed_stdout_rx) = crate::byte_channel();
+        let routed = ComponentOutputMode::RoutedChild {
+            stdin_rx,
+            stdout: ComponentOutputRoute::Child(routed_stdout_tx),
+            stderr: ComponentOutputRoute::Serial,
+        };
+        assert!(!stdin_is_terminal(&routed));
+        assert!(!output_is_terminal(&routed, Stdout));
+        assert!(output_is_terminal(&routed, Stderr));
     }
 
     #[test]
@@ -679,6 +800,9 @@ mod tests {
                 "wasi:clocks/monotonic-clock.wait-until",
                 "wasi:clocks/system-clock.get-resolution",
                 "wasi:clocks/system-clock.now",
+                "wasi:clocks/timezone.iana-id",
+                "wasi:clocks/timezone.to-debug-string",
+                "wasi:clocks/timezone.utc-offset",
                 "wasi:filesystem/preopens.get-directories",
                 "wasi:filesystem/types.descriptor.advise",
                 "wasi:filesystem/types.descriptor.append-via-stream",
@@ -1074,6 +1198,7 @@ mod tests {
                 "types" => "wasi:clocks/types",
                 "monotonic-clock" => "wasi:clocks/monotonic-clock",
                 "system-clock" | "wall-clock" => "wasi:clocks/system-clock",
+                "timezone" => "wasi:clocks/timezone",
                 _ => return None,
             },
             "wasi:io" => match name {

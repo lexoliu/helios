@@ -37,6 +37,7 @@ use helios_netstack::{
 };
 use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
+use crate::SocketReadiness;
 use crate::{
     ComponentNetworkService, ComponentRuntimeState, DnsError, DnsErrorKind,
     Ipv4Address as KernelIpv4Address, Ipv4Cidr as KernelIpv4Cidr, Ipv4Route as KernelIpv4Route,

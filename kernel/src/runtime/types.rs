@@ -541,10 +541,45 @@ pub struct TcpAccepted<Stream> {
     pub port: u16,
 }
 
+/// Non-destructive readiness of one socket, as `poll_oneoff` and
+/// `epoll_wait` observe it.
+///
+/// Readiness reporting cannot use the ordinary receive/accept entry points:
+/// those dequeue the very data the caller is about to read. Every field here
+/// is derived from a probe that leaves the socket's queues untouched.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SocketReadiness {
+    /// A receive would return data now, or end-of-stream when `hangup` is
+    /// also set. For a listener this means an accept would succeed.
+    pub readable: bool,
+    /// A send would make progress now.
+    pub writable: bool,
+    /// The peer closed its send side, so receives report end-of-stream.
+    pub hangup: bool,
+}
+
 pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
     type TcpStream: Copy + Send + 'static;
     type TcpListener: Copy + Send + 'static;
     type UdpSocket: Copy + Send + 'static;
+
+    /// Probe a connected stream without consuming buffered bytes.
+    fn tcp_readiness(
+        &self,
+        stream: Self::TcpStream,
+    ) -> impl Future<Output = Result<SocketReadiness, TcpError>> + Send + '_;
+
+    /// Probe a listener without consuming a queued connection.
+    fn tcp_listener_readiness(
+        &self,
+        listener: Self::TcpListener,
+    ) -> impl Future<Output = Result<SocketReadiness, TcpError>> + Send + '_;
+
+    /// Probe a bound datagram socket without consuming a queued datagram.
+    fn udp_readiness(
+        &self,
+        socket: Self::UdpSocket,
+    ) -> impl Future<Output = Result<SocketReadiness, UdpError>> + Send + '_;
 
     fn hardware_address(&self) -> [u8; 6];
 

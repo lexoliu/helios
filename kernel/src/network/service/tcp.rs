@@ -116,6 +116,65 @@ where
             .await
     }
 
+    /// Probe a connected stream's readiness without consuming buffered bytes.
+    ///
+    /// The stack only advances when the device is driven, so a probe has to
+    /// drive once before reading state; otherwise a socket whose data is
+    /// still sitting in the RX ring reports "not ready" forever. The read
+    /// probe itself is a zero-length `tcp_read`, which reports whether the
+    /// receive queue is non-empty (or the peer half-closed) and leaves the
+    /// queue intact.
+    pub async fn tcp_readiness(&self, stream: TcpStreamId) -> Result<SocketReadiness, TcpError> {
+        self.drive_tcp().await?;
+        let now = StackInstant::from_nanos(self.now_nanos());
+        self.inner.state.with_handle(stream, |state| {
+            let socket = state.tcp_socket(stream)?;
+            let read = state.stack.tcp_read(socket, 0, now).map_err(|_| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::TcpReceiveFailed,
+            })?;
+            let (readable, hangup) = match read {
+                TcpReadState::Data(_) => (true, false),
+                TcpReadState::Eof => (true, true),
+                TcpReadState::Pending => (false, false),
+            };
+            // Writability follows the send side, which outlives the read
+            // side: a peer that half-closed still accepts our data.
+            let writable = state.stack.tcp_send_open(socket).map_err(|_| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::UnknownTcpStream,
+            })?;
+            Ok(SocketReadiness {
+                readable,
+                writable,
+                hangup,
+            })
+        })
+    }
+
+    /// Probe a listener's accept queue without consuming a connection.
+    pub async fn tcp_listener_readiness(
+        &self,
+        listener: TcpListenerId,
+    ) -> Result<SocketReadiness, TcpError> {
+        self.drive_tcp().await?;
+        self.inner.state.with_handle(listener, |state| {
+            let stack_socket = state.tcp_listener(listener)?.stack_socket;
+            let readable = state
+                .stack
+                .tcp_accept_pending(stack_socket)
+                .map_err(|_| TcpError {
+                    kind: TcpErrorKind::Unavailable,
+                    detail: NetworkErrorDetail::TcpListenerClosedUnexpectedly,
+                })?;
+            Ok(SocketReadiness {
+                readable,
+                writable: false,
+                hangup: false,
+            })
+        })
+    }
+
     pub async fn tcp_shutdown_send(&self, stream: TcpStreamId) -> Result<(), TcpError> {
         self.inner
             .state

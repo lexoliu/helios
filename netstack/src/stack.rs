@@ -2699,6 +2699,42 @@ where
         })
     }
 
+    /// Report whether `listener` has a completed connection waiting in the
+    /// accept queue, without dequeuing it.
+    ///
+    /// `take_tcp_accept` is destructive, so readiness reporting (`poll`,
+    /// `epoll`) cannot use it: observing a listener must not consume the
+    /// connection the caller is about to accept.
+    pub fn tcp_accept_pending(&self, listener: SocketId) -> Result<bool, StackError> {
+        self.tcp_socket(listener)?;
+        Ok(self
+            .tcp_accept
+            .iter()
+            .any(|queued| queued.listener == listener))
+    }
+
+    /// Report whether `socket`'s send side is still open.
+    ///
+    /// `tcp_connect_state` folds every non-established state into `Pending`,
+    /// which loses the distinction readiness reporting needs: a peer that
+    /// half-closed (`CloseWait`) stops delivering data but still accepts
+    /// ours, so the socket remains writable.
+    pub fn tcp_send_open(&self, socket: SocketId) -> Result<bool, StackError> {
+        Ok(matches!(
+            self.tcp_socket(socket)?.state(),
+            crate::TcpState::Established | crate::TcpState::CloseWait
+        ))
+    }
+
+    /// Report whether `socket` has a datagram waiting, without dequeuing it.
+    ///
+    /// The counterpart of `tcp_accept_pending` for UDP: `take_udp` consumes
+    /// the datagram, so readiness reporting needs this non-destructive view.
+    pub fn udp_receive_pending(&self, socket: UdpSocketId) -> Result<bool, StackError> {
+        self.udp_socket(socket)?;
+        Ok(self.udp_rx_counts[udp_socket_index(socket)] != 0)
+    }
+
     pub fn next_tcp_deadline(&mut self) -> Option<StackInstant> {
         loop {
             let entry = self.tcp_timers.peek().copied()?;

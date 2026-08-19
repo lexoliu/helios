@@ -493,6 +493,53 @@ where
         take_preview1_carry(carry, max_bytes)
     }
 
+    /// Probe stdin for `poll_oneoff`/`epoll_wait` without blocking.
+    ///
+    /// Serial-backed stdin has no readiness notification, so the probe pulls
+    /// whatever the console already has into the descriptor's carry; a later
+    /// `fd_read` drains that carry, so nothing is lost. A child's stdin is a
+    /// byte channel that answers directly, and trace output never delivers
+    /// input at all.
+    pub(super) fn probe_stdin(&mut self, fd: i32) -> P1Readiness {
+        match self.descriptors.get(fd) {
+            Some(Preview1Descriptor::Stdin { carry }) if !carry.is_empty() => {
+                return P1Readiness::Ready {
+                    bytes: carry.len() as u64,
+                };
+            }
+            Some(Preview1Descriptor::Stdin { .. }) => {}
+            _ => return P1Readiness::Pending,
+        }
+        // Resolve the mode to a plain value first so the console read below
+        // does not overlap the borrow of `output_mode`.
+        let channel_readable = match &self.output_mode {
+            OutputMode::Serial => None,
+            OutputMode::Trace => return P1Readiness::Hangup,
+            OutputMode::Child { stdin_rx, .. } | OutputMode::RoutedChild { stdin_rx, .. } => {
+                Some(stdin_rx.is_readable())
+            }
+        };
+        if let Some(readable) = channel_readable {
+            return if readable {
+                P1Readiness::Ready { bytes: 1 }
+            } else {
+                P1Readiness::Pending
+            };
+        }
+
+        (self.read_serial)(&mut self.serial_read_buffer, P1_STDIN_PROBE_CAPACITY);
+        if self.serial_read_buffer.is_empty() {
+            return P1Readiness::Pending;
+        }
+        let bytes = Bytes::copy_from_slice(&self.serial_read_buffer);
+        let len = bytes.len() as u64;
+        let Some(Preview1Descriptor::Stdin { carry }) = self.descriptors.get_mut(fd) else {
+            return P1Readiness::Pending;
+        };
+        *carry = bytes;
+        P1Readiness::Ready { bytes: len }
+    }
+
     pub(super) async fn read_pipe(&mut self, fd: i32, max_bytes: usize) -> Result<Bytes, i32> {
         let reader = match self.descriptors.get_mut(fd) {
             Some(Preview1Descriptor::PipeRead { reader, carry }) => {
@@ -3712,6 +3759,51 @@ where
         .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
 }
 
+/// How much console input one stdin readiness probe pulls into the carry.
+const P1_STDIN_PROBE_CAPACITY: u32 = 4096;
+
+/// `eventrwflags`: the read end of the descriptor has hung up.
+const P1_EVENT_FD_READWRITE_HANGUP: u16 = 1;
+
+/// One decoded `poll_oneoff` subscription.
+enum P1Subscription {
+    /// A deadline in `clock_id`'s timebase.
+    Clock {
+        userdata: u64,
+        monotonic: bool,
+        deadline_nanos: u64,
+    },
+    Fd {
+        userdata: u64,
+        event_type: u8,
+        fd: i32,
+    },
+    /// Malformed subscription. It is reported immediately, like `POLLNVAL`.
+    Failed {
+        userdata: u64,
+        event_type: u8,
+        error: u16,
+    },
+}
+
+/// One event that `poll_oneoff` will hand back to the guest.
+struct P1ReadyEvent {
+    userdata: u64,
+    error: u16,
+    event_type: u8,
+    nbytes: u64,
+    fd_flags: u16,
+}
+
+/// `poll_oneoff` is `select`: block until at least one subscription is ready
+/// or the earliest clock deadline expires, then report only what is ready.
+///
+/// The previous implementation walked the subscriptions sequentially, slept
+/// the full duration of every clock subscription regardless of whether a
+/// descriptor had become ready, and emitted an event for every subscription
+/// whether or not it was ready. A guest polling "socket readable, or 5s
+/// timeout" therefore always waited the whole 5 seconds, and then could not
+/// tell which of the two events had actually fired.
 pub(super) async fn p1_poll_oneoff<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     subscriptions: u32,
@@ -3729,90 +3821,236 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let mut event_count = 0u32;
-    for index in 0..nsubscriptions {
-        let Some(subscription_ptr) = index
-            .checked_mul(P1_SUBSCRIPTION_SIZE)
-            .and_then(|offset| subscriptions.checked_add(offset))
-        else {
-            return p1::errno::OVERFLOW;
-        };
-        let userdata = match p1_try_read_u64(caller, memory, subscription_ptr) {
-            Ok(userdata) => userdata,
-            Err(_) => return p1::errno::FAULT,
-        };
-        let event_type = match p1_try_read_u8(caller, memory, subscription_ptr + 8) {
-            Ok(event_type) => event_type,
-            Err(_) => return p1::errno::FAULT,
-        };
-        let mut error = p1::errno::SUCCESS as u16;
-        let mut nbytes = 0u64;
-        let mut fd_flags = 0u16;
-        match event_type {
-            P1_EVENTTYPE_CLOCK => {
-                let clock_id = match p1_try_read_u32(caller, memory, subscription_ptr + 16) {
-                    Ok(clock_id) => clock_id,
-                    Err(_) => return p1::errno::FAULT,
-                };
-                let timeout = match p1_try_read_u64(caller, memory, subscription_ptr + 24) {
-                    Ok(timeout) => timeout,
-                    Err(_) => return p1::errno::FAULT,
-                };
-                let flags = match p1_try_read_u16(caller, memory, subscription_ptr + 40) {
-                    Ok(flags) => flags,
-                    Err(_) => return p1::errno::FAULT,
-                };
-                if !matches!(clock_id, 0 | 1) {
-                    error = p1::errno::INVAL as u16;
-                } else {
-                    let now = if clock_id == 0 {
-                        caller.data().system_time_nanos()
-                    } else {
+
+    let parsed = match p1_read_subscriptions(caller, memory, subscriptions, nsubscriptions) {
+        Ok(parsed) => parsed,
+        Err(errno) => return errno,
+    };
+
+    let ready = loop {
+        let mut ready = Vec::new();
+        let mut earliest: Option<Duration> = None;
+
+        for subscription in &parsed {
+            match subscription {
+                P1Subscription::Failed {
+                    userdata,
+                    event_type,
+                    error,
+                } => ready.push(P1ReadyEvent {
+                    userdata: *userdata,
+                    error: *error,
+                    event_type: *event_type,
+                    nbytes: 0,
+                    fd_flags: 0,
+                }),
+                P1Subscription::Fd {
+                    userdata,
+                    event_type,
+                    fd,
+                } => {
+                    let readiness = p1_descriptor_readiness(caller, *fd, *event_type).await;
+                    if let Some(event) = p1_fd_event(*userdata, *event_type, readiness) {
+                        ready.push(event);
+                    }
+                }
+                P1Subscription::Clock {
+                    userdata,
+                    monotonic,
+                    deadline_nanos,
+                } => {
+                    let now = if *monotonic {
                         caller.data().now_nanos()
-                    };
-                    let duration = if flags & P1_SUBSCRIPTION_CLOCK_ABSTIME != 0 {
-                        timeout.saturating_sub(now)
                     } else {
-                        timeout
+                        caller.data().system_time_nanos()
                     };
-                    if duration != 0 {
-                        caller
-                            .data()
-                            .sleep_for(Duration::from_nanos(duration))
-                            .await;
+                    match p1_clock_progress(*userdata, *deadline_nanos, now) {
+                        P1ClockProgress::Elapsed(event) => ready.push(event),
+                        P1ClockProgress::Waiting(remaining) => {
+                            earliest = Some(
+                                earliest
+                                    .map_or(remaining, |current: Duration| current.min(remaining)),
+                            );
+                        }
                     }
                 }
             }
-            P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE => {
-                let fd = match p1_try_read_u32(caller, memory, subscription_ptr + 16) {
-                    Ok(fd) => fd as i32,
-                    Err(_) => return p1::errno::FAULT,
-                };
-                match p1_poll_descriptor(caller.data().descriptors.get(fd), event_type) {
-                    Ok(bytes) => nbytes = bytes,
-                    Err(errno) => error = errno as u16,
-                }
-                fd_flags = 0;
-            }
-            _ => error = p1::errno::INVAL as u16,
         }
+
+        if !ready.is_empty() {
+            break ready;
+        }
+
+        // Nothing is ready and no deadline has expired: register on every
+        // subscribed descriptor and sleep until one of them makes progress
+        // or the earliest deadline arrives.
+        let mut wait = P1WaitSet::new();
+        for subscription in &parsed {
+            if let P1Subscription::Fd { fd, event_type, .. } = subscription {
+                p1_add_wait_target(caller.data(), *fd, *event_type, &mut wait);
+            }
+        }
+        let timer = caller.data().timer();
+        p1_wait_step(&timer, &mut wait, earliest).await;
+    };
+
+    let mut event_count = 0u32;
+    for event in &ready {
         let Some(event_ptr) = event_count
             .checked_mul(P1_EVENT_SIZE)
             .and_then(|offset| events.checked_add(offset))
         else {
             return p1::errno::OVERFLOW;
         };
-        let status = p1_write_u64(caller, memory, event_ptr, userdata)
-            .max(p1_write_u16(caller, memory, event_ptr + 8, error))
-            .max(p1_write_u8(caller, memory, event_ptr + 10, event_type))
-            .max(p1_write_u64(caller, memory, event_ptr + 16, nbytes))
-            .max(p1_write_u16(caller, memory, event_ptr + 24, fd_flags));
+        let status = p1_write_u64(caller, memory, event_ptr, event.userdata)
+            .max(p1_write_u16(caller, memory, event_ptr + 8, event.error))
+            .max(p1_write_u8(
+                caller,
+                memory,
+                event_ptr + 10,
+                event.event_type,
+            ))
+            .max(p1_write_u64(caller, memory, event_ptr + 16, event.nbytes))
+            .max(p1_write_u16(caller, memory, event_ptr + 24, event.fd_flags));
         if status != p1::errno::SUCCESS {
             return status;
         }
         event_count += 1;
     }
     p1_write_u32(caller, memory, nevents, event_count)
+}
+
+/// Whether a clock subscription's deadline has arrived.
+enum P1ClockProgress {
+    Elapsed(P1ReadyEvent),
+    Waiting(Duration),
+}
+
+/// Turn a descriptor's readiness into an event, or nothing when it would
+/// still block.
+///
+/// Returning `None` for `Pending` is what makes `poll_oneoff` behave like
+/// `select`: only subscriptions that are actually ready are reported, so the
+/// guest can tell which of its subscriptions fired.
+fn p1_fd_event(
+    userdata: u64,
+    event_type: u8,
+    readiness: Result<P1Readiness, i32>,
+) -> Option<P1ReadyEvent> {
+    match readiness {
+        Ok(readiness) if !readiness.is_ready() => None,
+        Ok(readiness) => Some(P1ReadyEvent {
+            userdata,
+            error: p1::errno::SUCCESS as u16,
+            event_type,
+            nbytes: readiness.bytes(),
+            fd_flags: if readiness.is_hangup() {
+                P1_EVENT_FD_READWRITE_HANGUP
+            } else {
+                0
+            },
+        }),
+        Err(errno) => Some(P1ReadyEvent {
+            userdata,
+            error: errno as u16,
+            event_type,
+            nbytes: 0,
+            fd_flags: 0,
+        }),
+    }
+}
+
+/// Evaluate a clock subscription against the current time in its timebase.
+///
+/// A deadline that already passed — including a zero timeout — is ready on
+/// the first pass, which is what makes a zero-timeout `poll_oneoff` a
+/// non-blocking readiness snapshot.
+fn p1_clock_progress(userdata: u64, deadline_nanos: u64, now: u64) -> P1ClockProgress {
+    if now >= deadline_nanos {
+        return P1ClockProgress::Elapsed(P1ReadyEvent {
+            userdata,
+            error: p1::errno::SUCCESS as u16,
+            event_type: P1_EVENTTYPE_CLOCK,
+            nbytes: 0,
+            fd_flags: 0,
+        });
+    }
+    P1ClockProgress::Waiting(Duration::from_nanos(deadline_nanos - now))
+}
+
+fn p1_read_subscriptions<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    memory: Preview1Memory,
+    subscriptions: u32,
+    nsubscriptions: u32,
+) -> Result<Vec<P1Subscription>, i32>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let mut parsed = Vec::with_capacity(nsubscriptions as usize);
+    for index in 0..nsubscriptions {
+        let subscription_ptr = index
+            .checked_mul(P1_SUBSCRIPTION_SIZE)
+            .and_then(|offset| subscriptions.checked_add(offset))
+            .ok_or(p1::errno::OVERFLOW)?;
+        let userdata =
+            p1_try_read_u64(caller, memory, subscription_ptr).map_err(|_| p1::errno::FAULT)?;
+        let event_type =
+            p1_try_read_u8(caller, memory, subscription_ptr + 8).map_err(|_| p1::errno::FAULT)?;
+        parsed.push(match event_type {
+            P1_EVENTTYPE_CLOCK => {
+                let clock_id = p1_try_read_u32(caller, memory, subscription_ptr + 16)
+                    .map_err(|_| p1::errno::FAULT)?;
+                let timeout = p1_try_read_u64(caller, memory, subscription_ptr + 24)
+                    .map_err(|_| p1::errno::FAULT)?;
+                let flags = p1_try_read_u16(caller, memory, subscription_ptr + 40)
+                    .map_err(|_| p1::errno::FAULT)?;
+                if !matches!(clock_id, 0 | 1) {
+                    P1Subscription::Failed {
+                        userdata,
+                        event_type,
+                        error: p1::errno::INVAL as u16,
+                    }
+                } else {
+                    let monotonic = clock_id == 1;
+                    let now = if monotonic {
+                        caller.data().now_nanos()
+                    } else {
+                        caller.data().system_time_nanos()
+                    };
+                    // Relative timeouts are anchored once, here, so a
+                    // subscription cannot restart its countdown every time
+                    // the wait loop re-probes.
+                    let deadline_nanos = if flags & P1_SUBSCRIPTION_CLOCK_ABSTIME != 0 {
+                        timeout
+                    } else {
+                        now.saturating_add(timeout)
+                    };
+                    P1Subscription::Clock {
+                        userdata,
+                        monotonic,
+                        deadline_nanos,
+                    }
+                }
+            }
+            P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE => {
+                let fd = p1_try_read_u32(caller, memory, subscription_ptr + 16)
+                    .map_err(|_| p1::errno::FAULT)? as i32;
+                P1Subscription::Fd {
+                    userdata,
+                    event_type,
+                    fd,
+                }
+            }
+            _ => P1Subscription::Failed {
+                userdata,
+                event_type,
+                error: p1::errno::INVAL as u16,
+            },
+        });
+    }
+    Ok(parsed)
 }
 
 pub(super) fn p1_proc_raise<CpuImpl, HostFs>(
@@ -4661,4 +4899,170 @@ pub(super) fn p1_errno_from_udp_error_for_fdflags(error: crate::UdpError, fdflag
         return p1::errno::AGAIN;
     }
     p1_errno_from_udp_error(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn regular_file() -> Preview1Descriptor {
+        Preview1Descriptor::File {
+            descriptor: FsDescriptor {
+                path: "/data".into(),
+                kind: FsNodeKind::File,
+                flags: fs_types::DescriptorFlags::READ,
+                identity: None,
+            },
+            offset: 0,
+            fdflags: 0,
+        }
+    }
+
+    fn connected_socket() -> Preview1Descriptor {
+        Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
+            stream: 9,
+            peer_address: crate::Ipv4Address::new([127, 0, 0, 1]),
+            peer_port: 80,
+            options: WasixSocketOptions::default(),
+        }))
+    }
+
+    /// `poll_oneoff` used to emit an event for every subscription, so a guest
+    /// could not tell which one fired. Only ready subscriptions are reported.
+    #[test]
+    fn poll_oneoff_reports_only_ready_subscriptions() {
+        assert!(p1_fd_event(1, P1_EVENTTYPE_FD_READ, Ok(P1Readiness::Pending)).is_none());
+
+        let ready = p1_fd_event(
+            2,
+            P1_EVENTTYPE_FD_READ,
+            Ok(P1Readiness::Ready { bytes: 12 }),
+        )
+        .expect("a readable descriptor produces an event");
+        assert_eq!(ready.userdata, 2);
+        assert_eq!(ready.error, p1::errno::SUCCESS as u16);
+        assert_eq!(ready.nbytes, 12);
+        assert_eq!(ready.fd_flags, 0);
+
+        let hangup = p1_fd_event(3, P1_EVENTTYPE_FD_READ, Ok(P1Readiness::Hangup))
+            .expect("an ended stream is ready");
+        assert_eq!(hangup.nbytes, 0);
+        assert_eq!(hangup.fd_flags, P1_EVENT_FD_READWRITE_HANGUP);
+
+        let bad = p1_fd_event(4, P1_EVENTTYPE_FD_READ, Err(p1::errno::BADF))
+            .expect("a bad descriptor is reported immediately");
+        assert_eq!(bad.error, p1::errno::BADF as u16);
+    }
+
+    /// A clock subscription is only ready once its deadline actually passed;
+    /// until then it contributes the remaining time to the sleep budget.
+    #[test]
+    fn poll_oneoff_clock_is_ready_only_after_its_deadline() {
+        match p1_clock_progress(1, 100, 40) {
+            P1ClockProgress::Waiting(remaining) => {
+                assert_eq!(remaining, Duration::from_nanos(60));
+            }
+            P1ClockProgress::Elapsed(_) => panic!("the deadline has not arrived yet"),
+        }
+        match p1_clock_progress(1, 100, 100) {
+            P1ClockProgress::Elapsed(event) => {
+                assert_eq!(event.event_type, P1_EVENTTYPE_CLOCK);
+                assert_eq!(event.userdata, 1);
+                assert_eq!(event.error, p1::errno::SUCCESS as u16);
+            }
+            P1ClockProgress::Waiting(_) => panic!("an arrived deadline is ready"),
+        }
+    }
+
+    /// A zero timeout (deadline == now) is ready on the first pass, so
+    /// `poll_oneoff` degrades to a non-blocking readiness snapshot.
+    #[test]
+    fn poll_oneoff_zero_timeout_never_sleeps() {
+        let now = 5_000;
+        // A relative timeout of zero anchors its deadline at `now`.
+        assert!(matches!(
+            p1_clock_progress(7, now, now),
+            P1ClockProgress::Elapsed(_)
+        ));
+        // An absolute deadline already in the past behaves the same way.
+        assert!(matches!(
+            p1_clock_progress(7, now - 1, now),
+            P1ClockProgress::Elapsed(_)
+        ));
+    }
+
+    /// The clock and the descriptors race: a descriptor that is ready ends
+    /// the wait immediately, and the clock event is not reported because its
+    /// deadline never arrived.
+    #[test]
+    fn poll_oneoff_returns_early_when_a_descriptor_becomes_ready() {
+        let mut ready = Vec::new();
+        let mut earliest: Option<Duration> = None;
+
+        if let Some(event) = p1_fd_event(
+            11,
+            P1_EVENTTYPE_FD_READ,
+            Ok(P1Readiness::Ready { bytes: 4 }),
+        ) {
+            ready.push(event);
+        }
+        match p1_clock_progress(12, 1_000_000, 0) {
+            P1ClockProgress::Elapsed(event) => ready.push(event),
+            P1ClockProgress::Waiting(remaining) => {
+                earliest =
+                    Some(earliest.map_or(remaining, |current: Duration| current.min(remaining)));
+            }
+        }
+
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].userdata, 11);
+        assert_eq!(ready[0].event_type, P1_EVENTTYPE_FD_READ);
+        // The clock only ever bounded the sleep; it never became an event.
+        assert_eq!(earliest, Some(Duration::from_nanos(1_000_000)));
+    }
+
+    /// The sleep is bounded by the earliest of several clock deadlines.
+    #[test]
+    fn poll_oneoff_sleeps_until_the_earliest_deadline() {
+        let mut earliest: Option<Duration> = None;
+        for deadline in [900u64, 300, 700] {
+            if let P1ClockProgress::Waiting(remaining) = p1_clock_progress(0, deadline, 100) {
+                earliest =
+                    Some(earliest.map_or(remaining, |current: Duration| current.min(remaining)));
+            }
+        }
+        assert_eq!(earliest, Some(Duration::from_nanos(200)));
+    }
+
+    /// Regular files never block, in either direction. They used to fall
+    /// through to `Ok(0)`, which `epoll` read as "not ready".
+    #[test]
+    fn regular_files_are_always_ready() {
+        let file = regular_file();
+        for event_type in [P1_EVENTTYPE_FD_READ, P1_EVENTTYPE_FD_WRITE] {
+            match p1_probe_descriptor(Some(&file), event_type) {
+                Ok(P1Probe::Local(readiness)) => {
+                    assert!(readiness.is_ready(), "a regular file never blocks");
+                    assert!(!readiness.is_hangup());
+                }
+                Ok(P1Probe::Network(_)) => panic!("a file is not a socket"),
+                Err(errno) => panic!("probing a regular file failed with {errno}"),
+            }
+        }
+    }
+
+    /// A connected socket's readiness is only knowable through the network
+    /// service, so the probe says so instead of silently reporting zero.
+    #[test]
+    fn connected_sockets_defer_to_the_network_service() {
+        let socket = connected_socket();
+        assert!(matches!(
+            p1_probe_descriptor(Some(&socket), P1_EVENTTYPE_FD_READ),
+            Ok(P1Probe::Network(P1NetworkProbe::TcpStream(9)))
+        ));
+        assert!(matches!(
+            p1_probe_descriptor(Some(&socket), P1_EVENTTYPE_FD_WRITE),
+            Ok(P1Probe::Network(P1NetworkProbe::TcpStream(9)))
+        ));
+    }
 }

@@ -173,6 +173,225 @@ impl EpollWaitTarget {
     }
 }
 
+/// How long a waiter sleeps between re-probing descriptors that have no
+/// wakeup source of their own.
+///
+/// Network sockets only advance when the device is driven and the serial
+/// console has no readiness interrupt, so a waiter registered on one of them
+/// has to come back and look. This matches the network service's own
+/// progress cadence; it is a bounded sleep, not a spin.
+pub(super) const P1_READINESS_REPOLL_INTERVAL: Duration = Duration::from_micros(50);
+
+/// Everything a `poll_oneoff`/`epoll_wait` sleep has to watch.
+pub(super) struct P1WaitSet {
+    /// Descriptors that wake the task themselves (pipes, socketpairs,
+    /// eventfds, child stdin).
+    pub(super) notified: Vec<EpollWaitTarget>,
+    /// Set when at least one descriptor only reveals readiness by being
+    /// re-probed (network sockets, the serial console).
+    pub(super) repoll: bool,
+}
+
+impl P1WaitSet {
+    pub(super) fn new() -> Self {
+        Self {
+            notified: Vec::new(),
+            repoll: false,
+        }
+    }
+
+    /// True when nothing in the set can ever report readiness, so a waiter
+    /// with no deadline would block forever.
+    pub(super) fn is_empty(&self) -> bool {
+        self.notified.is_empty() && !self.repoll
+    }
+}
+
+/// Sleep until a watched descriptor wakes us, the re-probe cadence elapses,
+/// or `remaining` runs out.
+///
+/// The caller re-probes after every step, so this only has to guarantee that
+/// it yields control and comes back when something might have changed.
+/// `remaining` of `None` means "no deadline": block until a descriptor makes
+/// progress.
+pub(super) async fn p1_wait_step<CpuImpl>(
+    timer: &crate::Timer<CpuImpl>,
+    wait: &mut P1WaitSet,
+    remaining: Option<Duration>,
+) where
+    CpuImpl: Cpu + Clone,
+{
+    if wait.is_empty() && remaining.is_none() {
+        // Nothing subscribed can ever become ready and no deadline will end
+        // the call. Park rather than spin; the task is dropped with the
+        // instance.
+        core::future::pending::<()>().await;
+        return;
+    }
+
+    // A descriptor without a wakeup source needs us back on a fixed cadence;
+    // otherwise sleep the whole remaining budget in one go.
+    let sleep = match (wait.repoll, remaining) {
+        (true, Some(remaining)) => remaining.min(P1_READINESS_REPOLL_INTERVAL),
+        (true, None) => P1_READINESS_REPOLL_INTERVAL,
+        (false, Some(remaining)) => remaining,
+        (false, None) => {
+            // Every subscribed descriptor can wake us, so wait on them alone.
+            let targets = &mut wait.notified;
+            core::future::poll_fn(|cx| poll_epoll_wait_targets(targets, cx)).await;
+            return;
+        }
+    };
+
+    if sleep.is_zero() {
+        return;
+    }
+
+    let mut timer = core::pin::pin!(timer.sleep_for(sleep));
+    if wait.notified.is_empty() {
+        timer.await;
+        return;
+    }
+
+    // Race the wakeup sources against the sleep: whichever comes first ends
+    // this step and sends the caller back to re-probe.
+    let targets = &mut wait.notified;
+    core::future::poll_fn(|cx| {
+        if poll_epoll_wait_targets(targets, cx).is_ready() {
+            return Poll::Ready(());
+        }
+        if timer.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(());
+        }
+        Poll::Pending
+    })
+    .await;
+}
+
+/// Register whatever wakes `fd` into `wait`.
+///
+/// Descriptors backed by a kernel channel register a real waiter. Network
+/// sockets and the serial console have no wakeup source, so they only set the
+/// re-probe flag.
+pub(super) fn p1_add_wait_target<CpuImpl, HostFs>(
+    store: &Preview1ProgramStore<CpuImpl, HostFs>,
+    fd: i32,
+    event_type: u8,
+    wait: &mut P1WaitSet,
+) where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    match store.descriptors.get(fd) {
+        Some(Preview1Descriptor::PipeRead { reader, carry })
+        | Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { reader, carry, .. }))
+            if carry.is_empty() && event_type == P1_EVENTTYPE_FD_READ =>
+        {
+            wait.notified.push(EpollWaitTarget::ByteReader {
+                reader: reader.clone(),
+                wait: reader.wait_state(),
+            });
+        }
+        Some(Preview1Descriptor::Event(event))
+            if event_type == P1_EVENTTYPE_FD_READ && !event.is_readable() =>
+        {
+            wait.notified.push(EpollWaitTarget::Event {
+                event: event.clone(),
+                wait: event.wait_state(),
+            });
+        }
+        Some(Preview1Descriptor::Stdin { carry })
+            if carry.is_empty() && event_type == P1_EVENTTYPE_FD_READ =>
+        {
+            match &store.output_mode {
+                // A child's stdin is a byte channel, so it can wake us.
+                OutputMode::Child { stdin_rx, .. } | OutputMode::RoutedChild { stdin_rx, .. } => {
+                    wait.notified.push(EpollWaitTarget::ByteReader {
+                        reader: stdin_rx.clone(),
+                        wait: stdin_rx.wait_state(),
+                    });
+                }
+                // The serial console has no readiness interrupt.
+                OutputMode::Serial => wait.repoll = true,
+                // Trace output never delivers input; the probe reports it as
+                // an immediate hangup, so there is nothing to wait for.
+                OutputMode::Trace => {}
+            }
+        }
+        Some(Preview1Descriptor::Socket(
+            WasixSocketDescriptor::Tcp(
+                WasixTcpSocket::Connected { .. } | WasixTcpSocket::Listening { .. },
+            )
+            | WasixSocketDescriptor::Udp(WasixUdpSocket::Bound { .. }),
+        )) => wait.repoll = true,
+        _ => {}
+    }
+}
+
+/// Resolve a descriptor's readiness, consulting the network service when the
+/// descriptor is a socket and the console when it is serial-backed stdin.
+pub(super) async fn p1_descriptor_readiness<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    fd: i32,
+    event_type: u8,
+) -> Result<P1Readiness, i32>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    if event_type == P1_EVENTTYPE_FD_READ
+        && matches!(
+            caller.data().descriptors.get(fd),
+            Some(Preview1Descriptor::Stdin { .. })
+        )
+    {
+        return Ok(caller.data_mut().probe_stdin(fd));
+    }
+    let probe = match p1_probe_descriptor(caller.data().descriptors.get(fd), event_type)? {
+        P1Probe::Local(readiness) => return Ok(readiness),
+        P1Probe::Network(probe) => probe,
+    };
+    let Some(service) = caller.data().runtime_state.network_service() else {
+        return Err(p1::errno::NETDOWN);
+    };
+    let readiness = match probe {
+        P1NetworkProbe::TcpStream(stream) => service
+            .tcp_readiness(stream)
+            .await
+            .map_err(p1_errno_from_tcp_error)?,
+        P1NetworkProbe::TcpListener(listener) => service
+            .tcp_listener_readiness(listener)
+            .await
+            .map_err(p1_errno_from_tcp_error)?,
+        P1NetworkProbe::UdpSocket(socket) => service
+            .udp_readiness(socket)
+            .await
+            .map_err(p1_errno_from_udp_error)?,
+    };
+    Ok(p1_readiness_from_socket(readiness, event_type))
+}
+
+pub(super) fn p1_readiness_from_socket(
+    readiness: crate::SocketReadiness,
+    event_type: u8,
+) -> P1Readiness {
+    let ready = if event_type == P1_EVENTTYPE_FD_WRITE {
+        readiness.writable
+    } else {
+        readiness.readable
+    };
+    if !ready {
+        return P1Readiness::Pending;
+    }
+    if event_type == P1_EVENTTYPE_FD_READ && readiness.hangup {
+        return P1Readiness::Hangup;
+    }
+    // The stack reports "something is queued" without a length, and a
+    // send is window-limited rather than byte-counted; report one byte so
+    // callers see a non-zero count and read what is actually there.
+    P1Readiness::Ready { bytes: 1 }
+}
+
 #[derive(Clone)]
 pub(super) enum WasixSocketDescriptor {
     Tcp(WasixTcpSocket),
@@ -950,43 +1169,164 @@ pub(super) fn p1_directory_descriptor(
     }
 }
 
-pub(super) fn p1_poll_descriptor(
+/// Readiness of one descriptor for a single `poll_oneoff`/`epoll` interest.
+///
+/// The probe used to return `Result<u64, i32>`, where `Ok(0)` meant both
+/// "ready, nothing buffered" and "not ready at all". `poll_oneoff` read that
+/// as ready and reported every subscription; `epoll_wait` read it as not
+/// ready and never reported a socket. The tri-state removes the ambiguity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum P1Readiness {
+    /// The operation would block; the caller has to wait for this descriptor.
+    Pending,
+    /// A non-blocking operation would make progress now. `bytes` is a
+    /// best-effort count of what is immediately available; zero is valid
+    /// (a regular file at end-of-file is always ready with nothing left).
+    Ready { bytes: u64 },
+    /// The stream ended: the peer hung up, or a read yields end-of-file.
+    /// Ready for reporting purposes, and additionally flagged as a hangup.
+    Hangup,
+}
+
+impl P1Readiness {
+    pub(super) fn is_ready(self) -> bool {
+        !matches!(self, Self::Pending)
+    }
+
+    pub(super) fn bytes(self) -> u64 {
+        match self {
+            Self::Ready { bytes } => bytes,
+            Self::Pending | Self::Hangup => 0,
+        }
+    }
+
+    pub(super) fn is_hangup(self) -> bool {
+        matches!(self, Self::Hangup)
+    }
+}
+
+/// Outcome of the synchronous readiness probe.
+///
+/// Descriptors backed by kernel-owned buffers answer immediately. Network
+/// sockets cannot: the stack only advances when the device is driven, so
+/// their readiness has to be resolved through the async network service.
+/// Making that an explicit variant keeps a caller from silently reading a
+/// socket as "not ready" when it simply never asked the network.
+pub(super) enum P1Probe {
+    Local(P1Readiness),
+    Network(P1NetworkProbe),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum P1NetworkProbe {
+    TcpStream(u64),
+    TcpListener(u64),
+    UdpSocket(u64),
+}
+
+/// Probe every descriptor whose readiness is answerable from local state.
+///
+/// `event_type` is one of `P1_EVENTTYPE_FD_READ` / `P1_EVENTTYPE_FD_WRITE`.
+pub(super) fn p1_probe_descriptor(
     descriptor: Option<&Preview1Descriptor>,
     event_type: u8,
-) -> Result<u64, i32> {
+) -> Result<P1Probe, i32> {
+    let local = |readiness| Ok(P1Probe::Local(readiness));
     match (descriptor, event_type) {
-        (Some(Preview1Descriptor::Stdin { carry }), P1_EVENTTYPE_FD_READ) => Ok(carry.len() as u64),
-        (Some(Preview1Descriptor::PipeRead { reader, carry }), P1_EVENTTYPE_FD_READ) => {
+        (Some(Preview1Descriptor::Stdin { carry }), P1_EVENTTYPE_FD_READ) => {
+            // Buffered stdin is ready; an empty carry means the backing
+            // source has to be polled, which only the waiter can do.
             if carry.is_empty() {
-                Ok(u64::from(reader.is_readable()))
+                local(P1Readiness::Pending)
             } else {
-                Ok(carry.len() as u64)
+                local(P1Readiness::Ready {
+                    bytes: carry.len() as u64,
+                })
             }
         }
-        (Some(Preview1Descriptor::Event(event)), P1_EVENTTYPE_FD_READ) => {
-            Ok(u64::from(event.is_readable()) * 8)
-        }
-        (Some(Preview1Descriptor::NullDevice), P1_EVENTTYPE_FD_READ) => Ok(0),
-        (
+        (Some(Preview1Descriptor::PipeRead { reader, carry }), P1_EVENTTYPE_FD_READ)
+        | (
             Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { reader, carry, .. })),
             P1_EVENTTYPE_FD_READ,
         ) => {
-            if carry.is_empty() {
-                Ok(u64::from(reader.is_readable()))
+            if !carry.is_empty() {
+                return local(P1Readiness::Ready {
+                    bytes: carry.len() as u64,
+                });
+            }
+            // `is_readable` covers queued bytes and a closed writer alike;
+            // the channel exposes no queue length, so report one byte
+            // available and let the read itself surface end-of-stream.
+            if reader.is_readable() {
+                local(P1Readiness::Ready { bytes: 1 })
             } else {
-                Ok(carry.len() as u64)
+                local(P1Readiness::Pending)
             }
         }
+        (Some(Preview1Descriptor::Event(event)), P1_EVENTTYPE_FD_READ) => {
+            if event.is_readable() {
+                local(P1Readiness::Ready { bytes: 8 })
+            } else {
+                local(P1Readiness::Pending)
+            }
+        }
+        // Reading /dev/null returns end-of-file immediately, so it never
+        // blocks.
+        (Some(Preview1Descriptor::NullDevice), P1_EVENTTYPE_FD_READ) => {
+            local(P1Readiness::Ready { bytes: 0 })
+        }
+        // POSIX: regular files and directories are always ready for both
+        // directions. The byte count is advisory and the descriptor does not
+        // carry a cached size, so report readiness without one rather than
+        // paying a filesystem round-trip per poll.
+        (
+            Some(Preview1Descriptor::File { .. }) | Some(Preview1Descriptor::Preopen { .. }),
+            P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
+        ) => local(P1Readiness::Ready { bytes: 0 }),
         (Some(Preview1Descriptor::Stdout), P1_EVENTTYPE_FD_WRITE)
         | (Some(Preview1Descriptor::Stderr), P1_EVENTTYPE_FD_WRITE)
         | (Some(Preview1Descriptor::PipeWrite { .. }), P1_EVENTTYPE_FD_WRITE)
         | (Some(Preview1Descriptor::Event(_)), P1_EVENTTYPE_FD_WRITE)
         | (Some(Preview1Descriptor::NullDevice), P1_EVENTTYPE_FD_WRITE)
-        | (Some(Preview1Descriptor::Socket(_)), P1_EVENTTYPE_FD_WRITE) => Ok(usize::MAX as u64),
+        | (
+            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { .. })),
+            P1_EVENTTYPE_FD_WRITE,
+        ) => local(P1Readiness::Ready {
+            bytes: usize::MAX as u64,
+        }),
         (
-            Some(Preview1Descriptor::File { .. }) | Some(Preview1Descriptor::Socket(_)),
+            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
+                WasixTcpSocket::Connected { stream, .. },
+            ))),
             P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
-        ) => Ok(0),
+        ) => Ok(P1Probe::Network(P1NetworkProbe::TcpStream(*stream))),
+        (
+            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
+                WasixTcpSocket::Listening { listener, .. },
+            ))),
+            P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
+        ) => Ok(P1Probe::Network(P1NetworkProbe::TcpListener(*listener))),
+        (
+            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
+                socket,
+                ..
+            }))),
+            P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
+        ) => Ok(P1Probe::Network(P1NetworkProbe::UdpSocket(*socket))),
+        // A socket with no endpoint yet can never make progress; it is not
+        // an error to poll it, it simply never becomes ready.
+        (
+            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
+                WasixTcpSocket::Unconnected { .. } | WasixTcpSocket::Bound { .. },
+            ))),
+            P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
+        )
+        | (
+            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
+                ..
+            }))),
+            P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
+        ) => local(P1Readiness::Pending),
         (Some(_), _) => Err(p1::errno::INVAL),
         (None, _) => Err(p1::errno::BADF),
     }

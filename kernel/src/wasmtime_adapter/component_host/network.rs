@@ -9,6 +9,7 @@ use bytes::Bytes;
 use triomphe::Arc;
 use unsize::{CoerceUnsize, Coercion};
 
+use crate::SocketReadiness;
 use crate::{
     ComponentNetworkService, DnsError, Ipv4Address, Ipv4Cidr, Ipv4Route, MacAddress,
     NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkIpAddress,
@@ -116,6 +117,21 @@ trait DynComponentHostNetworkService: Send + Sync + 'static {
         listener: u64,
         timeout_nanos: u64,
     ) -> Pin<Box<dyn Future<Output = Result<TcpAccepted<u64>, TcpError>> + Send + 'a>>;
+
+    fn tcp_readiness(
+        &self,
+        stream: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<SocketReadiness, TcpError>> + Send + '_>>;
+
+    fn tcp_listener_readiness(
+        &self,
+        listener: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<SocketReadiness, TcpError>> + Send + '_>>;
+
+    fn udp_readiness(
+        &self,
+        socket: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<SocketReadiness, UdpError>> + Send + '_>>;
 
     fn tcp_write_all<'a>(
         &'a self,
@@ -387,6 +403,27 @@ impl ComponentNetworkService for ComponentHostNetworkService {
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<TcpAccepted<Self::TcpStream>, TcpError>> + Send + '_ {
         self.inner.tcp_accept(listener, timeout_nanos)
+    }
+
+    fn tcp_readiness(
+        &self,
+        stream: Self::TcpStream,
+    ) -> impl Future<Output = Result<SocketReadiness, TcpError>> + Send + '_ {
+        self.inner.tcp_readiness(stream)
+    }
+
+    fn tcp_listener_readiness(
+        &self,
+        listener: Self::TcpListener,
+    ) -> impl Future<Output = Result<SocketReadiness, TcpError>> + Send + '_ {
+        self.inner.tcp_listener_readiness(listener)
+    }
+
+    fn udp_readiness(
+        &self,
+        socket: Self::UdpSocket,
+    ) -> impl Future<Output = Result<SocketReadiness, UdpError>> + Send + '_ {
+        self.inner.udp_readiness(socket)
     }
 
     fn tcp_write_all<'a>(
@@ -716,6 +753,37 @@ where
                 port: accepted.port,
             })
         })
+    }
+
+    fn tcp_readiness(
+        &self,
+        stream: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<SocketReadiness, TcpError>> + Send + '_>> {
+        Box::pin(
+            self.service.tcp_readiness(
+                <Service::TcpStream as ComponentHostTcpStreamToken>::from_raw(stream),
+            ),
+        )
+    }
+
+    fn tcp_listener_readiness(
+        &self,
+        listener: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<SocketReadiness, TcpError>> + Send + '_>> {
+        Box::pin(self.service.tcp_listener_readiness(
+            <Service::TcpListener as ComponentHostTcpListenerToken>::from_raw(listener),
+        ))
+    }
+
+    fn udp_readiness(
+        &self,
+        socket: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<SocketReadiness, UdpError>> + Send + '_>> {
+        Box::pin(
+            self.service.udp_readiness(
+                <Service::UdpSocket as ComponentHostUdpSocketToken>::from_raw(socket),
+            ),
+        )
     }
 
     fn tcp_write_all<'a>(

@@ -217,6 +217,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::SocketReadiness;
     use alloc::vec;
     use alloc::vec::Vec;
 
@@ -239,6 +240,40 @@ mod tests {
         type TcpStream = u64;
         type TcpListener = u64;
         type UdpSocket = u64;
+
+        // The in-memory doubles model an always-ready loopback peer.
+        fn tcp_readiness(
+            &self,
+            _: Self::TcpStream,
+        ) -> impl Future<Output = Result<SocketReadiness, TcpError>> + Send + '_ {
+            core::future::ready(Ok(SocketReadiness {
+                readable: true,
+                writable: true,
+                hangup: false,
+            }))
+        }
+
+        fn tcp_listener_readiness(
+            &self,
+            _: Self::TcpListener,
+        ) -> impl Future<Output = Result<SocketReadiness, TcpError>> + Send + '_ {
+            core::future::ready(Ok(SocketReadiness {
+                readable: true,
+                writable: false,
+                hangup: false,
+            }))
+        }
+
+        fn udp_readiness(
+            &self,
+            _: Self::UdpSocket,
+        ) -> impl Future<Output = Result<SocketReadiness, UdpError>> + Send + '_ {
+            core::future::ready(Ok(SocketReadiness {
+                readable: true,
+                writable: true,
+                hangup: false,
+            }))
+        }
 
         fn hardware_address(&self) -> [u8; 6] {
             [2, 0, 0, 0, 0, 1]

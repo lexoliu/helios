@@ -10,6 +10,7 @@ use crate::wasmtime_adapter::component_host::StoreData;
 pub(crate) const LINKED_INTERFACES: &[&str] = &[
     "wasi:clocks/monotonic-clock",
     "wasi:clocks/system-clock",
+    "wasi:clocks/timezone",
     "wasi:cli/environment",
     "wasi:cli/exit",
     "wasi:cli/stdin",
@@ -67,6 +68,18 @@ where
     if imports.has("wasi:clocks/system-clock", "0.3") {
         wasi::clocks::system_clock::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
             linker,
+            |state| state,
+        )?;
+    }
+    if imports.has("wasi:clocks/timezone", "0.3") {
+        // Every member of `wasi:clocks/timezone` is gated behind the
+        // `clocks-timezone` unstable feature, so the generated link options
+        // must opt in or the interface links with no functions at all.
+        let mut options = wasi::clocks::timezone::LinkOptions::default();
+        options.clocks_timezone(true);
+        wasi::clocks::timezone::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+            linker,
+            &options,
             |state| state,
         )?;
     }

@@ -24,7 +24,8 @@ use super::{
     P2OutgoingDatagramStream, P2ResolveAddressStream, Preview2GuestExit, TcpSocket, UdpSocket,
     WasiAdapterTrap, WasiImportSet, WasiTcpSocketAddress, WasiTcpSocketFamily,
     WasiUdpSocketAddress, WasiUdpSocketError, WasiUdpSocketFamily, has_wasi_network_rights,
-    metadata_hash_value, wasi_tcp_bind_rights, wasi_udp_bind_rights,
+    metadata_hash_value, output_is_terminal, stdin_is_terminal, wasi_tcp_bind_rights,
+    wasi_udp_bind_rights,
 };
 use crate::wasmtime_adapter::component_host::{
     HostRuntimeState, RuntimeDeadlinePollable, StoreData,
@@ -512,13 +513,18 @@ where
 
 #[wasmtime_wasi_io::async_trait]
 impl Pollable for EmptyInputStream {
+    /// A closed stream is always ready: there is nothing left to wait for.
     async fn ready(&mut self) {}
 }
 
 #[wasmtime_wasi_io::async_trait]
 impl InputStream for EmptyInputStream {
+    /// Signal end-of-file the same way `FileInputStream` does once its
+    /// contents are drained. Returning an empty `Bytes` instead would mean
+    /// "no data ready yet", which makes `blocking_read` spin until it
+    /// exhausts `MAX_BLOCKING_ATTEMPTS` and traps the guest.
     fn read(&mut self, _: usize) -> core::result::Result<Bytes, StreamError> {
-        Ok(Bytes::new())
+        Err(StreamError::Closed)
     }
 }
 
@@ -784,7 +790,10 @@ where
     HostFs: crate::HostFileSystem,
 {
     fn get_terminal_stdin(&mut self) -> Result<Option<Resource<TerminalInput>>> {
-        Ok(None)
+        if !stdin_is_terminal(self.output_mode()) {
+            return Ok(None);
+        }
+        Ok(Some(self.table.push(TerminalInput)?))
     }
 }
 
@@ -794,7 +803,10 @@ where
     HostFs: crate::HostFileSystem,
 {
     fn get_terminal_stdout(&mut self) -> Result<Option<Resource<TerminalOutput>>> {
-        Ok(None)
+        if !output_is_terminal(self.output_mode(), ComponentOutputStreamKind::Stdout) {
+            return Ok(None);
+        }
+        Ok(Some(self.table.push(TerminalOutput)?))
     }
 }
 
@@ -804,7 +816,10 @@ where
     HostFs: crate::HostFileSystem,
 {
     fn get_terminal_stderr(&mut self) -> Result<Option<Resource<TerminalOutput>>> {
-        Ok(None)
+        if !output_is_terminal(self.output_mode(), ComponentOutputStreamKind::Stderr) {
+            return Ok(None);
+        }
+        Ok(Some(self.table.push(TerminalOutput)?))
     }
 }
 
@@ -3608,12 +3623,36 @@ fn error_code_from_p3(error: p3fs::ErrorCode) -> p2fs::ErrorCode {
 mod tests {
     use alloc::string::String;
 
+    use futures_lite::future::block_on;
+    use wasmtime_wasi_io::poll::Pollable;
+    use wasmtime_wasi_io::streams::{InputStream, StreamError};
+
     use super::{
-        PREVIEW2_WIT_PACKAGES, WasiTcpSocketFamily, WasiUdpSocketError, WasiUdpSocketFamily,
-        format_p2_tcp_socket_address, format_p2_udp_family, format_p2_udp_socket_address,
-        map_p2_tcp_core_error, map_p2_tcp_family, map_p2_tcp_socket_error, p2net, p2tcp,
-        p2tcp_create, p2udp, parse_p2_tcp_socket_address, parse_p2_udp_socket_address,
+        EmptyInputStream, PREVIEW2_WIT_PACKAGES, WasiTcpSocketFamily, WasiUdpSocketError,
+        WasiUdpSocketFamily, format_p2_tcp_socket_address, format_p2_udp_family,
+        format_p2_udp_socket_address, map_p2_tcp_core_error, map_p2_tcp_family,
+        map_p2_tcp_socket_error, p2net, p2tcp, p2tcp_create, p2udp, parse_p2_tcp_socket_address,
+        parse_p2_udp_socket_address,
     };
+
+    #[test]
+    fn p2_empty_stdin_signals_eof_instead_of_starving_blocking_read() {
+        let mut stream = EmptyInputStream;
+        // `ready` must resolve without waiting; a closed stream has nothing
+        // left to wait for.
+        block_on(stream.ready());
+        for size in [0_usize, 1, 4096] {
+            match stream.read(size) {
+                Err(StreamError::Closed) => {}
+                Ok(bytes) => panic!(
+                    "empty stdin returned {} readable bytes instead of closing; \
+                     wasmtime-wasi-io traps after MAX_BLOCKING_ATTEMPTS empty reads",
+                    bytes.len()
+                ),
+                Err(error) => panic!("empty stdin read failed unexpectedly: {error:?}"),
+            }
+        }
+    }
 
     #[test]
     fn preview2_wit_packages_use_expected_version() {

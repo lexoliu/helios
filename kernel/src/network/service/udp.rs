@@ -63,6 +63,30 @@ where
             .await
     }
 
+    /// Probe a bound socket's receive queue without consuming a datagram.
+    ///
+    /// Like the TCP probe this drives the device first: a datagram that has
+    /// not been demuxed into the stack yet is invisible to the queue check.
+    /// A bound UDP socket is always writable — sends are not window-limited.
+    pub async fn udp_readiness(&self, socket: UdpSocketId) -> Result<SocketReadiness, UdpError> {
+        self.drive_udp().await?;
+        self.inner.state.with_handle(socket, |state| {
+            let stack_socket = state.udp_socket(socket)?.stack_socket;
+            let readable = state
+                .stack
+                .udp_receive_pending(stack_socket)
+                .map_err(|_| UdpError {
+                    kind: UdpErrorKind::Unavailable,
+                    detail: NetworkErrorDetail::UdpReceiveFailed,
+                })?;
+            Ok(SocketReadiness {
+                readable,
+                writable: true,
+                hangup: false,
+            })
+        })
+    }
+
     pub async fn udp_join_multicast_v4(
         &self,
         group: KernelIpv4Address,

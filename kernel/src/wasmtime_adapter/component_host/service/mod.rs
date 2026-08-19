@@ -2124,10 +2124,10 @@ mod tests {
             p1_null_device_stat().type_,
             fs_types::DescriptorType::CharacterDevice
         ));
-        assert_eq!(
-            p1_poll_descriptor(Some(&Preview1Descriptor::NullDevice), P1_EVENTTYPE_FD_WRITE),
-            Ok(usize::MAX as u64)
-        );
+        assert!(matches!(
+            p1_probe_descriptor(Some(&Preview1Descriptor::NullDevice), P1_EVENTTYPE_FD_WRITE),
+            Ok(P1Probe::Local(P1Readiness::Ready { bytes })) if bytes == usize::MAX as u64
+        ));
     }
 
     #[test]
@@ -2927,23 +2927,41 @@ mod tests {
         );
     }
 
+    /// Ready mask for a descriptor whose readiness needs no network service.
+    fn local_epoll_mask(descriptor: Option<&Preview1Descriptor>, interest: u32) -> u32 {
+        if descriptor.is_none() {
+            return WASIX_EPOLL_TYPE_EPOLLERR | WASIX_EPOLL_TYPE_EPOLLHUP;
+        }
+        let event_type = if interest & WASIX_EPOLL_TYPE_EPOLLOUT != 0 {
+            P1_EVENTTYPE_FD_WRITE
+        } else {
+            P1_EVENTTYPE_FD_READ
+        };
+        let readiness = match p1_probe_descriptor(descriptor, event_type) {
+            Ok(P1Probe::Local(readiness)) => Ok(readiness),
+            Ok(P1Probe::Network(_)) => panic!("descriptor needs the network service"),
+            Err(errno) => Err(errno),
+        };
+        wasix_epoll_mask_bit(readiness, event_type)
+    }
+
     #[test]
     fn wasix_epoll_ready_mask_reports_supported_descriptor_readiness() {
         let stdout = Preview1Descriptor::Stdout;
         assert_eq!(
-            wasix_epoll_ready_mask(Some(&stdout), WASIX_EPOLL_TYPE_EPOLLOUT),
+            local_epoll_mask(Some(&stdout), WASIX_EPOLL_TYPE_EPOLLOUT),
             WASIX_EPOLL_TYPE_EPOLLOUT
         );
 
         let event = Preview1Descriptor::Event(EventFd::new(1, false));
         assert_eq!(
-            wasix_epoll_ready_mask(Some(&event), WASIX_EPOLL_TYPE_EPOLLIN),
+            local_epoll_mask(Some(&event), WASIX_EPOLL_TYPE_EPOLLIN),
             WASIX_EPOLL_TYPE_EPOLLIN
         );
 
         let empty_event = Preview1Descriptor::Event(EventFd::new(0, false));
         assert_eq!(
-            wasix_epoll_ready_mask(Some(&empty_event), WASIX_EPOLL_TYPE_EPOLLIN),
+            local_epoll_mask(Some(&empty_event), WASIX_EPOLL_TYPE_EPOLLIN),
             0
         );
 
@@ -2952,15 +2970,12 @@ mod tests {
             reader: pipe_reader,
             carry: Bytes::new(),
         };
-        assert_eq!(
-            wasix_epoll_ready_mask(Some(&pipe), WASIX_EPOLL_TYPE_EPOLLIN),
-            0
-        );
+        assert_eq!(local_epoll_mask(Some(&pipe), WASIX_EPOLL_TYPE_EPOLLIN), 0);
         pipe_writer
             .write(Bytes::from_static(b"pipe"))
             .expect("pipe reader is still open");
         assert_eq!(
-            wasix_epoll_ready_mask(Some(&pipe), WASIX_EPOLL_TYPE_EPOLLIN),
+            local_epoll_mask(Some(&pipe), WASIX_EPOLL_TYPE_EPOLLIN),
             WASIX_EPOLL_TYPE_EPOLLIN
         );
 
@@ -2972,20 +2987,17 @@ mod tests {
             options: WasixSocketOptions::default(),
             socket_type: WASIX_SOCK_TYPE_STREAM,
         });
-        assert_eq!(
-            wasix_epoll_ready_mask(Some(&pair), WASIX_EPOLL_TYPE_EPOLLIN),
-            0
-        );
+        assert_eq!(local_epoll_mask(Some(&pair), WASIX_EPOLL_TYPE_EPOLLIN), 0);
         pair_writer
             .write(Bytes::from_static(b"pair"))
             .expect("socket-pair reader is still open");
         assert_eq!(
-            wasix_epoll_ready_mask(Some(&pair), WASIX_EPOLL_TYPE_EPOLLIN),
+            local_epoll_mask(Some(&pair), WASIX_EPOLL_TYPE_EPOLLIN),
             WASIX_EPOLL_TYPE_EPOLLIN
         );
 
         assert_eq!(
-            wasix_epoll_ready_mask(None, WASIX_EPOLL_TYPE_EPOLLIN),
+            local_epoll_mask(None, WASIX_EPOLL_TYPE_EPOLLIN),
             WASIX_EPOLL_TYPE_EPOLLERR | WASIX_EPOLL_TYPE_EPOLLHUP
         );
     }
