@@ -3815,6 +3815,24 @@ mod tests {
         );
 
         assert_eq!(socket.peer_window_scale(), 3);
+        // RFC 7323 §2.2: the SYN-ACK's own window field is never scaled.
+        assert_eq!(socket.peer_receive_window(), 4);
+
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: 4,
+                options: TcpOptions::empty(),
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS,
+        );
+
         assert_eq!(socket.peer_receive_window(), 32);
         assert_eq!(socket.queue_send(b"abcdefghijklmnopqrstuvwxyz"), 26);
         let segment = socket
@@ -5172,18 +5190,21 @@ mod tests {
         }
         socket.mark_ack_queued();
 
-        let update_segments = (usize::from(TCP_WINDOW_UPDATE_BYTES) << TCP_LOCAL_WINDOW_SCALE)
-            / TCP_RECEIVE_SEGMENT_BYTES;
+        // Drain in multiples of the 16-byte scale unit so every drain
+        // frees exactly the same number of advertised-window units and
+        // the byte-threshold crossing lands on a deterministic step.
+        let drain_bytes = TCP_RECEIVE_SEGMENT_BYTES & !((1 << TCP_LOCAL_WINDOW_SCALE) - 1);
+        let update_segments = usize::from(TCP_WINDOW_UPDATE_BYTES).div_ceil(drain_bytes);
         for _ in 1..update_segments {
             assert_eq!(
-                socket.receive(TCP_RECEIVE_SEGMENT_BYTES, 2).as_deref(),
-                Some(&payload[..])
+                socket.receive(drain_bytes, 2).map(|bytes| bytes.len()),
+                Some(drain_bytes)
             );
             assert_eq!(socket.pending_ack(), None);
         }
         assert_eq!(
-            socket.receive(TCP_RECEIVE_SEGMENT_BYTES, 4).as_deref(),
-            Some(&payload[..])
+            socket.receive(drain_bytes, 4).map(|bytes| bytes.len()),
+            Some(drain_bytes)
         );
         assert!(socket.pending_ack().is_some());
     }

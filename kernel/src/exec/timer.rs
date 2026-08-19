@@ -849,25 +849,34 @@ mod tests {
     }
 
     #[test]
-    fn timing_wheel_reclaims_slot_on_cancel_before_deadline() {
+    fn cancelled_sleep_releases_slot_and_stale_handles_fail_validation() {
         let timer = test_timer();
         let pool = &timer.shared.sleep_pool;
-        let mut wheel = TimingWheel::new(0);
         let (state, entry) = timer_entry(&timer, 300 * 50, 50);
         let handle = entry.state;
-        wheel.insert(pool, entry);
 
-        // Cancelling releases the slot immediately even though the
-        // wheel entry sits in a far bucket, and the recycled slot does
-        // not satisfy the stale handle.
+        // Cancelling releases the slot immediately even though a wheel
+        // entry could still reference it until its distant deadline.
         drop(state);
-        let (replacement, entry) = timer_entry(&timer, 100, 50);
-        assert_eq!(entry.state.idx, handle.idx);
-        assert_ne!(entry.state.generation, handle.generation);
         assert!(handle.is_dead(pool));
-        assert!(!entry.state.is_dead(pool));
-        wheel.insert(pool, entry);
-        drop(replacement);
+
+        // Recycle slots until the same index is handed out again and
+        // prove the stale handle never validates against the new
+        // occupant while the fresh handle does.
+        let mut held = Vec::new();
+        let reused = loop {
+            let sleep_ref = super::SleepRef::new(&timer.shared);
+            if sleep_ref.idx == handle.idx {
+                break sleep_ref;
+            }
+            held.push(sleep_ref);
+        };
+        let fresh = reused.downgrade();
+        assert_eq!(fresh.idx, handle.idx);
+        assert_ne!(fresh.generation, handle.generation);
+        assert!(handle.is_dead(pool));
+        assert!(!fresh.is_dead(pool));
+        drop(entry);
     }
 
     #[test]
