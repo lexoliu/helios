@@ -1555,7 +1555,19 @@ fn discover_qemu_edk2_code(arch: VmArch, qemu_bin: &Path) -> Result<PathBuf> {
     candidates.extend([
         PathBuf::from("/opt/homebrew/share/qemu").join(edk2_code_filename(arch)),
         PathBuf::from("/usr/local/share/qemu").join(edk2_code_filename(arch)),
+        PathBuf::from("/usr/share/qemu").join(edk2_code_filename(arch)),
     ]);
+    // Debian/Ubuntu package EDK2 as OVMF/AAVMF under their own names.
+    match arch {
+        VmArch::X86_64 => candidates.extend([
+            PathBuf::from("/usr/share/OVMF/OVMF_CODE_4M.fd"),
+            PathBuf::from("/usr/share/OVMF/OVMF_CODE.fd"),
+        ]),
+        VmArch::Aarch64 => candidates.extend([
+            PathBuf::from("/usr/share/AAVMF/AAVMF_CODE.fd"),
+        ]),
+        VmArch::Riscv64 => {}
+    }
     candidates
         .into_iter()
         .find(|path| path.is_file())
@@ -1596,11 +1608,19 @@ fn discover_qemu_edk2_vars(arch: VmArch, code: &Path) -> Result<PathBuf> {
 }
 
 fn edk2_vars_filenames(arch: VmArch) -> impl Iterator<Item = &'static str> {
-    match arch {
-        VmArch::Aarch64 => ["edk2-aarch64-vars.fd", "edk2-arm-vars.fd"].into_iter(),
-        VmArch::X86_64 => ["edk2-x86_64-vars.fd", "edk2-i386-vars.fd"].into_iter(),
+    // The OVMF/AAVMF names cover Debian/Ubuntu firmware packages, whose
+    // variable stores sit next to the code image under their own names.
+    let names: &'static [&'static str] = match arch {
+        VmArch::Aarch64 => &["edk2-aarch64-vars.fd", "edk2-arm-vars.fd", "AAVMF_VARS.fd"],
+        VmArch::X86_64 => &[
+            "edk2-x86_64-vars.fd",
+            "edk2-i386-vars.fd",
+            "OVMF_VARS_4M.fd",
+            "OVMF_VARS.fd",
+        ],
         VmArch::Riscv64 => panic!("riscv64 does not use EDK2 firmware"),
-    }
+    };
+    names.iter().copied()
 }
 
 fn configure_network_device(qemu: &mut Command, network: VmNetworkProfile) {
