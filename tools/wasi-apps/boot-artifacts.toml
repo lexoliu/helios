@@ -134,6 +134,9 @@ command = "simd-lanes"
 package = "helios-wasix-conformance"
 version = "0.1.0"
 source_url = "tools/wasi-apps/wasix-tests"
-targets = ["aarch64-unknown-none"]
+# Wasm SIMD lowers to SSE4.1+ on x86-64, which the kernel's native
+# feature probe verifies at runtime; riscv64gc stays excluded until the
+# target provides the vector extension.
+targets = ["aarch64-unknown-none", "x86_64-unknown-none"]
 bootfs_path = "bin/simd-lanes"
 source = "artifacts/wasix/simd-lanes/simd-lanes.wasm"
