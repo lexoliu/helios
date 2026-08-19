@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -11,11 +12,49 @@ import time
 from pathlib import Path
 
 
-DEFAULT_FEDORA_IMAGE_URL = (
-    "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/aarch64/images/"
-    "Fedora-Cloud-Base-Generic-44-1.7.aarch64.qcow2"
-)
-DEFAULT_ASSET_DIR = Path("target/perf-baselines/linux-vm/fedora-aarch64")
+FEDORA_IMAGE_URLS = {
+    "aarch64": (
+        "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/aarch64/images/"
+        "Fedora-Cloud-Base-Generic-44-1.7.aarch64.qcow2"
+    ),
+    "x86_64": (
+        "https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/"
+        "Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2"
+    ),
+}
+QEMU_BINS = {
+    "aarch64": "qemu-system-aarch64",
+    "x86_64": "qemu-system-x86_64",
+}
+def default_asset_dir(guest_arch: str) -> Path:
+    return Path(f"target/perf-baselines/linux-vm/fedora-{guest_arch}")
+
+
+def default_accel(guest_arch: str) -> str:
+    """Pick the fastest available QEMU accelerator for `guest_arch` on this host."""
+    host_system = platform.system()
+    host_arch = platform.machine()
+    native = (host_arch, guest_arch) in (
+        ("arm64", "aarch64"),
+        ("aarch64", "aarch64"),
+        ("x86_64", "x86_64"),
+        ("AMD64", "x86_64"),
+    )
+    if native and host_system == "Darwin":
+        return "hvf"
+    if native and host_system == "Linux" and os.access("/dev/kvm", os.R_OK | os.W_OK):
+        return "kvm"
+    return "tcg"
+
+
+def machine_and_cpu(guest_arch: str, accel: str) -> tuple[str, str]:
+    """QEMU -machine/-cpu values for the Fedora guest."""
+    cpu = "host" if accel in ("hvf", "kvm") else "max"
+    if guest_arch == "aarch64":
+        return f"virt,gic-version=3,accel={accel}", cpu
+    if guest_arch == "x86_64":
+        return f"q35,accel={accel}", cpu
+    raise SystemExit(f"unsupported Fedora guest architecture: {guest_arch}")
 DEFAULT_DISK_SIZE = "12G"
 DEFAULT_MEMORY = "2G"
 DEFAULT_SMP = 4
@@ -352,15 +391,21 @@ def start_vm(
     ssh_port: int,
     memory: str,
     smp: int,
+    guest_arch: str,
+    accel: str,
 ) -> subprocess.Popen:
-    code, vars_path = ensure_firmware_vars(asset_dir, qemu_bin)
+    machine, cpu = machine_and_cpu(guest_arch, accel)
     serial_log = asset_dir / "serial.log"
+    # aarch64 virt has no default firmware and uses MMIO virtio transports;
+    # x86_64 q35 boots the cloud image through SeaBIOS with PCI transports.
+    blk_device = "virtio-blk-device" if guest_arch == "aarch64" else "virtio-blk-pci"
+    net_device = "virtio-net-device" if guest_arch == "aarch64" else "virtio-net-pci"
     command = [
         qemu_bin,
         "-machine",
-        "virt,gic-version=3,accel=hvf",
+        machine,
         "-cpu",
-        "host",
+        cpu,
         "-smp",
         str(smp),
         "-m",
@@ -371,22 +416,28 @@ def start_vm(
         "none",
         "-serial",
         f"file:{serial_log}",
-        "-drive",
-        f"if=pflash,format=raw,readonly=on,file={code}",
-        "-drive",
-        f"if=pflash,format=raw,file={vars_path}",
+    ]
+    if guest_arch == "aarch64":
+        code, vars_path = ensure_firmware_vars(asset_dir, qemu_bin)
+        command += [
+            "-drive",
+            f"if=pflash,format=raw,readonly=on,file={code}",
+            "-drive",
+            f"if=pflash,format=raw,file={vars_path}",
+        ]
+    command += [
         "-drive",
         f"if=none,format=qcow2,file={disk},id=rootfs",
         "-device",
-        "virtio-blk-device,drive=rootfs",
+        f"{blk_device},drive=rootfs",
         "-drive",
         f"if=none,format=raw,readonly=on,file={seed_iso},id=seed",
         "-device",
-        "virtio-blk-device,drive=seed",
+        f"{blk_device},drive=seed",
         "-netdev",
         f"user,id=net0,hostfwd=tcp:127.0.0.1:{ssh_port}-:22",
         "-device",
-        "virtio-net-device,netdev=net0",
+        f"{net_device},netdev=net0",
     ]
     return subprocess.Popen(command, cwd=repo_root, start_new_session=True)
 
@@ -617,9 +668,9 @@ def ensure_wasmtime_linux(
     if not version:
         raise SystemExit(
             "Wasmtime-on-Linux baseline requested, but the Fedora guest has no "
-            "wasmtime binary. Pass --wasmtime-linux-bin with an aarch64 Linux "
-            "wasmtime executable or --wasmtime-linux-archive with a pre-staged "
-            "aarch64 Linux Wasmtime tar archive."
+            "wasmtime binary. Pass --wasmtime-linux-bin with a Linux wasmtime "
+            "executable matching the guest architecture, or "
+            "--wasmtime-linux-archive with a pre-staged Linux Wasmtime tar archive."
         )
     return f"wasmtime ({version})"
 
@@ -634,13 +685,14 @@ def linux_cpu_features(
     cpuinfo = ssh_output(repo_root, key, port, "cat /proc/cpuinfo", timeout=20)
     features = []
     for line in cpuinfo.splitlines():
-        if line.startswith("Features"):
+        # aarch64 reports "Features", x86_64 reports "flags".
+        if line.startswith(("Features", "flags")):
             _, _, value = line.partition(":")
             features = value.split()
             break
     result = {
-        "aarch64_features": features,
-        "asimd": "asimd" in features,
+        "cpu_features": features,
+        "simd": "asimd" in features or "sse2" in features,
         "quickjs_required": quickjs_policy is not None,
         "native_simd_probe_required": require_simd_probe,
     }
@@ -751,7 +803,11 @@ def run_fedora_qemu_linux(
     quickjs_source_archive: Path | None = None,
     wasmtime_linux_bin: Path | None = None,
     wasmtime_linux_archive: Path | None = None,
+    guest_arch: str = "aarch64",
+    accel: str | None = None,
 ) -> tuple[Path | None, Path | None, dict]:
+    accel = accel or default_accel(guest_arch)
+    machine, cpu = machine_and_cpu(guest_arch, accel)
     native_workloads = [
         workload for workload in workloads if workload["runner"] in ("shell", "program")
     ]
@@ -777,18 +833,20 @@ def run_fedora_qemu_linux(
     seed_iso = render_seed(repo_root, asset_dir, public_key)
     base = download_base_image(repo_root, asset_dir, image_url)
     disk = ensure_guest_disk(repo_root, base, asset_dir, disk_size)
+    blk_device = "virtio-blk-device" if guest_arch == "aarch64" else "virtio-blk-pci"
+    net_device = "virtio-net-device" if guest_arch == "aarch64" else "virtio-net-pci"
     provenance = {
-        "kind": "fedora-qemu-aarch64-hvf",
+        "kind": f"fedora-qemu-{guest_arch}-{accel}",
         "fedora_image_url": image_url,
         "fedora_base_image": str(base),
         "fedora_guest_disk": str(disk),
         "qemu_bin": qemu_bin,
-        "qemu_machine": "virt,gic-version=3,accel=hvf",
-        "qemu_cpu": "host",
+        "qemu_machine": machine,
+        "qemu_cpu": cpu,
         "qemu_smp": smp,
         "qemu_memory": memory,
-        "network": "virtio-net-device over QEMU user net; workloads connect to host through 10.0.2.2",
-        "block": "virtio-blk-device",
+        "network": f"{net_device} over QEMU user net; workloads connect to host through 10.0.2.2",
+        "block": blk_device,
         "quickjs_required": quickjs_required,
         "native_simd_probe_required": simd_probe_required,
         "wasmtime_linux_required": bool(wasmtime_workloads),
@@ -805,7 +863,9 @@ def run_fedora_qemu_linux(
     if not native_workloads and not wasmtime_workloads:
         return None, None, provenance
     port = ssh_port or free_tcp_port()
-    process = start_vm(repo_root, asset_dir, qemu_bin, disk, seed_iso, port, memory, smp)
+    process = start_vm(
+        repo_root, asset_dir, qemu_bin, disk, seed_iso, port, memory, smp, guest_arch, accel
+    )
     try:
         wait_for_ssh(repo_root, key, port, setup_timeout_seconds)
         copy_guest_files(

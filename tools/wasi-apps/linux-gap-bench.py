@@ -17,14 +17,18 @@ import tomllib
 from pathlib import Path
 
 from fedora_qemu_baseline import (
-    DEFAULT_ASSET_DIR,
     DEFAULT_DISK_SIZE,
-    DEFAULT_FEDORA_IMAGE_URL,
     DEFAULT_MEMORY,
     DEFAULT_SMP,
+    FEDORA_IMAGE_URLS,
+    QEMU_BINS,
+    default_asset_dir,
     wasm_uses_simd as fedora_wasm_uses_simd,
     run_fedora_qemu_linux,
 )
+
+# Helios inspector arch name -> Fedora guest arch name.
+LINUX_GUEST_ARCHES = {"aarch64": "aarch64", "x86-64": "x86_64"}
 from tcp_throughput_server import DEFAULT_PAYLOAD_BYTES, start_tcp_throughput_server
 
 HTTP_PAYLOAD_FILE = "payload.txt"
@@ -417,6 +421,8 @@ def run_linux(
     quickjs_source_archive: Path | None,
     wasmtime_linux_bin: Path | None,
     wasmtime_linux_archive: Path | None,
+    guest_arch: str,
+    accel: str | None,
 ) -> tuple[Path | None, Path | None, dict]:
     return run_fedora_qemu_linux(
         repo_root(),
@@ -437,6 +443,8 @@ def run_linux(
         quickjs_source_archive,
         wasmtime_linux_bin,
         wasmtime_linux_archive,
+        guest_arch=guest_arch,
+        accel=accel,
     )
 
 
@@ -1419,9 +1427,14 @@ def main() -> None:
     parser.add_argument("--arch", default="aarch64")
     parser.add_argument("--helios-host-http-host", default="10.0.2.2")
     parser.add_argument("--helios-host-tcp-host", default="10.0.2.2")
-    parser.add_argument("--fedora-image-url", default=DEFAULT_FEDORA_IMAGE_URL)
-    parser.add_argument("--linux-vm-dir", type=Path, default=DEFAULT_ASSET_DIR)
-    parser.add_argument("--linux-vm-qemu-bin", default="qemu-system-aarch64")
+    parser.add_argument("--fedora-image-url", default=None)
+    parser.add_argument("--linux-vm-dir", type=Path, default=None)
+    parser.add_argument("--linux-vm-qemu-bin", default=None)
+    parser.add_argument(
+        "--linux-vm-accel",
+        default=None,
+        help="QEMU accelerator for the Fedora guest (default: hvf/kvm when native, else tcg).",
+    )
     parser.add_argument("--linux-vm-ssh-port", type=int)
     parser.add_argument("--linux-vm-memory", default=DEFAULT_MEMORY)
     parser.add_argument("--linux-vm-smp", type=int, default=DEFAULT_SMP)
@@ -1478,6 +1491,19 @@ def main() -> None:
         raise SystemExit("--linux-vm-setup-timeout-seconds must be positive")
     if args.wasmtime_linux_bin is not None and args.wasmtime_linux_archive is not None:
         raise SystemExit("pass either --wasmtime-linux-bin or --wasmtime-linux-archive, not both")
+
+    linux_guest_arch = LINUX_GUEST_ARCHES.get(args.arch)
+    if not args.skip_linux:
+        if linux_guest_arch is None:
+            raise SystemExit(
+                f"no Fedora baseline mapping for --arch {args.arch}; pass --skip-linux"
+            )
+        if args.fedora_image_url is None:
+            args.fedora_image_url = FEDORA_IMAGE_URLS[linux_guest_arch]
+        if args.linux_vm_qemu_bin is None:
+            args.linux_vm_qemu_bin = QEMU_BINS[linux_guest_arch]
+        if args.linux_vm_dir is None:
+            args.linux_vm_dir = default_asset_dir(linux_guest_arch)
 
     if not args.skip_helios:
         enforce_no_stale_helios_benchmark_processes()
@@ -1551,6 +1577,8 @@ def main() -> None:
                 args.quickjs_source_archive,
                 args.wasmtime_linux_bin,
                 args.wasmtime_linux_archive,
+                linux_guest_arch,
+                args.linux_vm_accel,
             )
         if args.wasmtime_profile_workload:
             wasmtime_profiles = run_wasmtime_profiles(
