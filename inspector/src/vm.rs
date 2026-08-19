@@ -812,8 +812,8 @@ fn run_workload_bench(
 /// tracing session.
 async fn print_recent_guest_errors(client: &mut crate::serial::RpcClient) {
     let mut config = crate::system::TracingConfig::new();
-    config.limit = 40;
-    config.min_level = Some(helios_inspector_protocol::system::tracing::Level::Warn);
+    config.limit = 100;
+    config.min_level = Some(helios_inspector_protocol::system::tracing::Level::Info);
     match crate::system::fetch_tracing(client, &config).await {
         Ok(events) if events.is_empty() => {}
         Ok(events) => {
