@@ -3019,8 +3019,12 @@ mod tests {
             ptr.write(0xa5);
         }
 
-        pool.recycle(spec, memory);
+        // The recycle path scrubs before re-pooling, so acquire never
+        // zeroes on the spawn path and pooled entries come back clean.
+        assert!(pool.reserve_for_recycle(spec, &memory));
         assert_eq!(pool.resident_bytes, spec.byte_size());
+        futures_lite::future::block_on(scrub_shared_memory(&memory));
+        pool.finish_recycle(spec, memory);
 
         let reused = pool.acquire(&engine, spec).unwrap();
         assert_eq!(pool.resident_bytes, 0);

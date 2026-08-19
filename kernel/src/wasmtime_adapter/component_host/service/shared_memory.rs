@@ -34,6 +34,9 @@ impl SharedMemoryPool {
         }
     }
 
+    /// Hands out a pre-zeroed pooled memory, or a fresh one. Pooled
+    /// entries were scrubbed off the spawn path by the recycle task, so
+    /// this never zeroes memory on the process-start critical path.
     pub(super) fn acquire(
         &mut self,
         engine: &wasmtime::Engine,
@@ -44,36 +47,80 @@ impl SharedMemoryPool {
                 .resident_bytes
                 .checked_sub(spec.byte_size())
                 .expect("shared-memory pool byte accounting underflow");
-            zero_shared_memory(&memory);
             return Ok(memory);
         }
 
         SharedMemory::new(engine, spec.memory_type()).map_err(map_program_runtime_error)
     }
 
-    pub(super) fn recycle(&mut self, spec: SharedMemorySpec, memory: SharedMemory) {
+    /// Claims budget for a memory about to be scrubbed and re-pooled.
+    /// The bytes count as resident from this point so a burst of exits
+    /// cannot overshoot the pool budget while scrubs are in flight.
+    fn reserve_for_recycle(&mut self, spec: SharedMemorySpec, memory: &SharedMemory) -> bool {
         if memory.size() != u64::from(spec.initial_pages) {
-            return;
+            return false;
         }
         let bytes = spec.byte_size();
         if self.resident_bytes.saturating_add(bytes) > self.budget_bytes {
-            return;
+            return false;
         }
         self.resident_bytes = self
             .resident_bytes
             .checked_add(bytes)
             .expect("shared-memory pool byte accounting overflow");
+        true
+    }
+
+    /// Returns a scrubbed memory to its bucket. Budget was claimed by
+    /// `reserve_for_recycle`.
+    fn finish_recycle(&mut self, spec: SharedMemorySpec, memory: SharedMemory) {
         self.buckets.entry(spec).or_default().push(memory);
     }
 }
 
-pub(super) fn zero_shared_memory(memory: &SharedMemory) {
-    let data = memory.data();
-    let ptr = data.as_ptr().cast::<u8>() as *mut u8;
-    // The pool only calls this after the previous Store/Instance holders have
-    // been dropped, before handing the memory to a new guest.
-    unsafe {
-        core::ptr::write_bytes(ptr, 0, memory.data_size());
+/// Recycles an exited guest's shared memory through a background scrub
+/// task: zeroing a multi-megabyte memory is the dominant cost of
+/// re-pooling, and doing it here would land it on the child's exit path
+/// (which `proc_join` waits on). The scrub overlaps with other guests
+/// on other processors and yields between chunks.
+pub(super) fn spawn_scrubbed_recycle<CpuImpl>(
+    spawner: &crate::Spawner<CpuImpl>,
+    pool: Arc<Mutex<SharedMemoryPool>>,
+    spec: SharedMemorySpec,
+    memory: SharedMemory,
+) where
+    CpuImpl: Cpu + Clone,
+{
+    if !pool.lock().reserve_for_recycle(spec, &memory) {
+        return;
+    }
+    spawner.spawn_detached(async move {
+        scrub_shared_memory(&memory).await;
+        pool.lock().finish_recycle(spec, memory);
+    });
+}
+
+/// Bytes zeroed between cooperative yields while scrubbing.
+const SCRUB_CHUNK_BYTES: usize = 512 * 1024;
+
+pub(super) async fn scrub_shared_memory(memory: &SharedMemory) {
+    let len = memory.data_size();
+    let mut offset = 0;
+    while offset < len {
+        let chunk = SCRUB_CHUNK_BYTES.min(len - offset);
+        // Re-derive the pointer each chunk: holding a raw pointer across
+        // the yield would make the scrub future non-Send.
+        let base = memory.data().as_ptr().cast::<u8>() as *mut u8;
+        // SAFETY: the previous Store/Instance holders have been dropped
+        // and the memory is owned by the scrub task until it re-enters
+        // the pool, so no guest can observe the partial zeroing.
+        unsafe {
+            core::ptr::write_bytes(base.add(offset), 0, chunk);
+        }
+        offset += chunk;
+        if offset < len {
+            crate::exec::yield_now().await;
+        }
     }
 }
 

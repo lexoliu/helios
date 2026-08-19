@@ -299,6 +299,7 @@ where
         output_mode: output_mode.clone(),
         core_linker: preview1_core_linker.clone(),
     });
+    let recycle_spawner = exec_context.spawner.clone();
     let shared_memory_prepare_profile =
         start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
     let imported_memory_spec = imported_shared_memory_spec_with_user_budget(&compiled.module)?;
@@ -520,7 +521,7 @@ where
 
     if recycle_allowed {
         if let (Some(spec), Some(memory)) = (imported_memory_spec, recycle_memory) {
-            shared_memory_pool.lock().recycle(spec, memory);
+            spawn_scrubbed_recycle(&recycle_spawner, shared_memory_pool.clone(), spec, memory);
         }
     }
     match completion {
@@ -757,9 +758,12 @@ where
     record_program_kernel_profile_sample(store_teardown_profile, "core-store-teardown-rewind");
 
     if recycle_allowed {
-        shared_memory_pool
-            .lock()
-            .recycle(memory_spec, recycle_memory);
+        spawn_scrubbed_recycle(
+            &spawner,
+            shared_memory_pool.clone(),
+            memory_spec,
+            recycle_memory,
+        );
     }
     match completion {
         CoreModuleRunCompletion::Exit(result) => result,
