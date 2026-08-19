@@ -1012,7 +1012,14 @@ pub(super) fn configure_preview1_program_store<CpuImpl, HostFs>(
         },
     );
     store.set_epoch_deadline(1);
-    store.epoch_deadline_async_yield_and_update(1);
+    // Epoch ticks double as the kill observation point for CPU-bound
+    // guests (see `store_with_state`): check the flag, otherwise yield.
+    store.epoch_deadline_callback(|caller| {
+        if let Some(reason) = caller.data().check_pending_kill() {
+            return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
+        }
+        Ok(wasmtime::UpdateDeadline::Yield(1))
+    });
 }
 
 pub(super) fn preview1_program_linker<CpuImpl, HostFs>(
