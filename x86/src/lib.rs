@@ -32,7 +32,7 @@ use helios_hal::serial::ByteSerial;
 use helios_hal::watchdog::Watchdog;
 use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology};
 use x86_64::instructions::port::{Port, PortReadOnly, PortWriteOnly};
-use x86_64::registers::control::{Cr0, Cr0Flags, Cr3, Cr4, Cr4Flags};
+use x86_64::registers::control::{Cr0Flags, Cr3, Cr4Flags};
 
 const COM1_BASE: u16 = 0x3f8;
 const COM1_DATA: u16 = COM1_BASE;
@@ -104,9 +104,33 @@ unsafe impl critical_section::Impl for X86CriticalSection {
     }
 }
 
+/// Kernel entry from the bootloader. The kernel is compiled with SSE
+/// enabled, but the Limine x86_64 handoff does not guarantee an
+/// SSE-enabled machine state (the Limine 9 EFI loader hands off with
+/// CR4.OSFXSR clear), so no compiler-generated code may run before the
+/// FPU/SSE control bits are set: LLVM freely emits SSE moves into early
+/// boot code. This naked stub is the only pre-SSE code in the kernel.
 #[unsafe(no_mangle)]
+#[unsafe(naked)]
 extern "C" fn _start() -> ! {
-    x86_kernel_main()
+    core::arch::naked_asm!(
+        "mov rax, cr0",
+        "and eax, {cr0_clear}",
+        "or eax, {cr0_set}",
+        "mov cr0, rax",
+        "mov rax, cr4",
+        "or eax, {cr4_set}",
+        "mov cr4, rax",
+        "fninit",
+        "jmp {main}",
+        // Clear EM and TS, set MP.
+        cr0_clear = const !(Cr0Flags::EMULATE_COPROCESSOR.bits() as u32
+            | Cr0Flags::TASK_SWITCHED.bits() as u32),
+        cr0_set = const Cr0Flags::MONITOR_COPROCESSOR.bits() as u32,
+        cr4_set = const (Cr4Flags::OSFXSR.bits() as u32
+            | Cr4Flags::OSXMMEXCPT_ENABLE.bits() as u32),
+        main = sym x86_kernel_main,
+    )
 }
 
 fn x86_kernel_main() -> ! {
@@ -116,7 +140,6 @@ fn x86_kernel_main() -> ! {
         "Limine bootloader does not support the required base protocol revision"
     );
     let handoff = boot::limine_boot_handoff();
-    enable_fpu_simd();
     let physical_memory_offset = boot::physical_memory_offset();
     let reserved_ranges = boot_reserved_ranges(&handoff);
     let reserved_wakeup_page = reserve_wakeup_page(&handoff, &reserved_ranges);
@@ -189,22 +212,9 @@ fn x86_kernel_main() -> ! {
     run_current_processor(cpu, kernel, debug_state)
 }
 
-fn enable_fpu_simd() {
-    unsafe {
-        let mut cr0 = Cr0::read();
-        cr0.remove(Cr0Flags::EMULATE_COPROCESSOR | Cr0Flags::TASK_SWITCHED);
-        cr0.insert(Cr0Flags::MONITOR_COPROCESSOR);
-        Cr0::write(cr0);
-
-        let mut cr4 = Cr4::read();
-        cr4.insert(Cr4Flags::OSFXSR | Cr4Flags::OSXMMEXCPT_ENABLE);
-        Cr4::write(cr4);
-
-        asm!("fninit", options(nostack, preserves_flags));
-    }
-    // TODO(x86-avx): enable OSXSAVE, program XCR0, and preserve XSAVE state
-    // before advertising AVX/FMA/AVX512 to Wasmtime-generated code.
-}
+// TODO(x86-avx): enable OSXSAVE, program XCR0, and preserve XSAVE state
+// (in `_start` and the secondary wakeup trampoline) before advertising
+// AVX/FMA/AVX512 to Wasmtime-generated code.
 
 fn processor_count(rsdp_address: usize, physical_memory_offset: usize) -> usize {
     let handler = smp::PhysicalOffsetAcpiHandler {
@@ -649,8 +659,9 @@ extern "C" fn secondary_start_rust(
     boot: *const smp::BootContext,
     runtime: *const smp::ProcessorRuntime,
 ) -> ! {
+    // FPU/SSE control bits are set by the secondary wakeup trampoline
+    // before any compiler-generated code runs on this processor.
     serial_uart_init();
-    enable_fpu_simd();
     let boot = unsafe { &*boot };
     let runtime = unsafe { &*runtime };
     smp::activate_runtime(runtime);
