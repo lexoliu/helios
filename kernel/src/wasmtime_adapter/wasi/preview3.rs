@@ -90,9 +90,14 @@ where
         )?;
     }
     if imports.has("wasi:cli/exit", "0.3") {
+        // `exit-with-code` is gated behind the `cli-exit-with-code`
+        // unstable feature; without opting in, a component importing it
+        // fails instantiation even though the interface is linked.
+        let mut options = wasi::cli::exit::LinkOptions::default();
+        options.cli_exit_with_code(true);
         wasi::cli::exit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
             linker,
-            &Default::default(),
+            &options,
             |state| state,
         )?;
     }

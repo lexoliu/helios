@@ -146,6 +146,7 @@ pub(crate) mod clocks_bindings {
                     world imports {
                         import wasi:clocks/monotonic-clock@0.2.12;
                         import wasi:clocks/wall-clock@0.2.12;
+                        import wasi:clocks/timezone@0.2.12;
                     }
                 ",
             path: "../../wasmtime/crates/wasi/src/p2/wit",
@@ -430,6 +431,17 @@ where
     if imports.has("wasi:clocks/wall-clock", "0.2") {
         clocks_bindings::clocks::wall_clock::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
             linker,
+            |state| state,
+        )?;
+    }
+    if imports.has("wasi:clocks/timezone", "0.2") {
+        // Every member is gated behind the `clocks-timezone` unstable
+        // feature; opt in or the interface links with no functions.
+        let mut options = clocks_bindings::clocks::timezone::LinkOptions::default();
+        options.clocks_timezone(true);
+        clocks_bindings::clocks::timezone::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+            linker,
+            &options,
             |state| state,
         )?;
     }
@@ -865,6 +877,32 @@ where
             seconds: 0,
             nanoseconds: 1,
         })
+    }
+}
+
+impl<CpuImpl, HostFs> clocks_bindings::clocks::timezone::Host for StoreData<CpuImpl, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    fn display(
+        &mut self,
+        _when: clocks_bindings::clocks::timezone::Datetime,
+    ) -> Result<clocks_bindings::clocks::timezone::TimezoneDisplay> {
+        // The kernel does not expose a local time zone; per the WASI
+        // contract that means UTC with a zero offset.
+        Ok(clocks_bindings::clocks::timezone::TimezoneDisplay {
+            utc_offset: 0,
+            name: String::from("UTC"),
+            in_daylight_saving_time: false,
+        })
+    }
+
+    fn utc_offset(
+        &mut self,
+        _when: clocks_bindings::clocks::timezone::Datetime,
+    ) -> Result<i32> {
+        Ok(0)
     }
 }
 
