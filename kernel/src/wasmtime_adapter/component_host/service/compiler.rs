@@ -208,7 +208,20 @@ pub(super) fn configure_compiler_core_store<CpuImpl, HostFs>(
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    store.set_epoch_deadline(u64::MAX);
+    // The compiler must not be preempted by scheduler epoch ticks, but
+    // epoch bumps are also how the OOM killer wakes a CPU-bound victim,
+    // so extend the deadline tick by tick after checking for a pending
+    // kill. A u64::MAX delta is not "never": wasmtime computes
+    // `deadline = current_epoch + delta`, which wraps into the past as
+    // soon as the engine's epoch has ever advanced and then traps the
+    // very first epoch check with a bare interrupt.
+    store.set_epoch_deadline(1);
+    store.epoch_deadline_callback(|caller| {
+        if let Some(reason) = caller.data().instance.pending_kill() {
+            return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
+        }
+        Ok(wasmtime::UpdateDeadline::Continue(1))
+    });
 }
 
 pub(super) fn compiler_tls_base<CpuImpl, HostFs>(
