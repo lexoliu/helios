@@ -56,7 +56,7 @@ impl SharedMemoryPool {
     /// Claims budget for a memory about to be scrubbed and re-pooled.
     /// The bytes count as resident from this point so a burst of exits
     /// cannot overshoot the pool budget while scrubs are in flight.
-    fn reserve_for_recycle(&mut self, spec: SharedMemorySpec, memory: &SharedMemory) -> bool {
+    pub(super) fn reserve_for_recycle(&mut self, spec: SharedMemorySpec, memory: &SharedMemory) -> bool {
         if memory.size() != u64::from(spec.initial_pages) {
             return false;
         }
@@ -73,7 +73,7 @@ impl SharedMemoryPool {
 
     /// Returns a scrubbed memory to its bucket. Budget was claimed by
     /// `reserve_for_recycle`.
-    fn finish_recycle(&mut self, spec: SharedMemorySpec, memory: SharedMemory) {
+    pub(super) fn finish_recycle(&mut self, spec: SharedMemorySpec, memory: SharedMemory) {
         self.buckets.entry(spec).or_default().push(memory);
     }
 }
