@@ -494,20 +494,16 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
     } else {
         file.baud.unwrap_or(DEFAULT_BAUD)
     };
-    let cpu = command
-        .cpu
-        .or(file.cpu)
-        .or_else(|| profile.default_cpu.map(str::to_owned));
     let mut accel = if file.accel.is_empty() && command.accel.is_empty() {
-        profile
-            .default_accel
-            .iter()
-            .map(|value| (*value).to_owned())
-            .collect::<Vec<_>>()
+        default_accel(profile)
     } else {
         file.accel
     };
     accel.extend(command.accel);
+    let cpu = command
+        .cpu
+        .or(file.cpu)
+        .or_else(|| default_cpu(profile, &accel).map(str::to_owned));
     let shared_dir = command.shared_dir.or(file.shared_dir);
     let gdb = command
         .gdb
@@ -607,6 +603,43 @@ fn load_config_file(path: Option<&Path>) -> Result<VmConfigFile> {
 fn default_config_path() -> Option<PathBuf> {
     ProjectDirs::from("cool", "lexo", "helios-inspector")
         .map(|dirs| dirs.config_dir().join("vm.json"))
+}
+
+/// Picks the profile's accelerator by host capability when the user gave
+/// none: the profile's native accelerator (HVF/KVM) only when this host
+/// can actually provide it, otherwise TCG. Profiles with no default
+/// accelerator keep QEMU's own default.
+fn default_accel(profile: &VmProfile) -> Vec<String> {
+    let native_host = match profile.arch {
+        VmArch::Aarch64 => std::env::consts::ARCH == "aarch64",
+        VmArch::X86_64 => std::env::consts::ARCH == "x86_64",
+        VmArch::Riscv64 => false,
+    };
+    for accel in profile.default_accel {
+        let available = match *accel {
+            "hvf" => native_host && std::env::consts::OS == "macos",
+            "kvm" => native_host && Path::new("/dev/kvm").exists(),
+            _ => true,
+        };
+        if available {
+            return vec![(*accel).to_owned()];
+        }
+    }
+    if profile.default_accel.is_empty() {
+        Vec::new()
+    } else {
+        vec!["tcg".to_owned()]
+    }
+}
+
+/// `-cpu host` is only valid under a native accelerator; TCG (or QEMU's
+/// default accelerator) needs the emulated `max` model instead.
+fn default_cpu(profile: &VmProfile, accel: &[String]) -> Option<&'static str> {
+    let native = accel.iter().any(|value| value == "hvf" || value == "kvm");
+    match profile.default_cpu {
+        Some("host") if !native => Some("max"),
+        other => other,
+    }
 }
 
 fn ensure_qemu_command(command: &ResolvedVmCommand) -> Result<()> {
