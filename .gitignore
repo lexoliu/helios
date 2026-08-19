@@ -6,8 +6,11 @@
 /artifacts/wasix/*
 !/artifacts/wasix/dash/
 !/artifacts/wasix/dash/*
+!/artifacts/wasix/coreutils/
+!/artifacts/wasix/coreutils/*
 /tools/wasi-apps/python/target
 /tools/wasi-apps/curl/target
 *.wasm
 !/artifacts/wasix/dash/dash.wasm
+!/artifacts/wasix/coreutils/coreutils.wasm
 /.claude/
