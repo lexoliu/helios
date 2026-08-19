@@ -216,23 +216,40 @@ fn x86_kernel_main() -> ! {
 // (in `_start` and the secondary wakeup trampoline) before advertising
 // AVX/FMA/AVX512 to Wasmtime-generated code.
 
+/// Counts usable processors from the MADT. Runs before the bootstrap
+/// allocator is primed (the count sizes the allocator's per-processor
+/// structures), so it must not allocate: iterate MADT entries directly
+/// instead of building `AcpiPlatform` processor info.
 fn processor_count(rsdp_address: usize, physical_memory_offset: usize) -> usize {
+    use acpi::sdt::madt::{Madt, MadtEntry};
+
+    const LAPIC_ENABLED: u32 = 1 << 0;
+    const LAPIC_ONLINE_CAPABLE: u32 = 1 << 1;
+    const LAPIC_USABLE: u32 = LAPIC_ENABLED | LAPIC_ONLINE_CAPABLE;
+
     let handler = smp::PhysicalOffsetAcpiHandler {
         physical_memory_offset,
         tsc_base: 0,
         tsc_hz: 1,
     };
-    let tables = unsafe { acpi::AcpiTables::from_rsdp(handler.clone(), rsdp_address) }
+    let tables = unsafe { acpi::AcpiTables::from_rsdp(handler, rsdp_address) }
         .unwrap_or_else(|error| {
             panic!("failed to parse ACPI tables for processor count: {error:?}")
         });
-    let platform = acpi::platform::AcpiPlatform::new(tables, handler)
-        .unwrap_or_else(|error| panic!("failed to construct ACPI platform info: {error:?}"));
-    let processor_info = platform
-        .processor_info
-        .as_ref()
-        .unwrap_or_else(|| panic!("ACPI platform info did not expose processor topology"));
-    1 + processor_info.application_processors.len()
+    let madt = tables
+        .find_table::<Madt>()
+        .unwrap_or_else(|| panic!("ACPI tables did not expose an MADT"));
+    let count = madt
+        .get()
+        .entries()
+        .filter(|entry| match entry {
+            MadtEntry::LocalApic(apic) => apic.flags & LAPIC_USABLE != 0,
+            MadtEntry::LocalX2Apic(apic) => apic.flags & LAPIC_USABLE != 0,
+            _ => false,
+        })
+        .count();
+    assert!(count > 0, "MADT did not list any usable processors");
+    count
 }
 
 #[derive(Clone, Debug)]
