@@ -807,7 +807,28 @@ fn run_workload_bench(
     })
 }
 
-fn run_aot_bench(client: crate::serial::RpcClient, command: AotBenchCommand) -> Result<()> {
+/// Fetches and prints the guest's recent warn/error tracing events so a
+/// failed remote operation is diagnosable from the CLI without a second
+/// tracing session.
+async fn print_recent_guest_errors(client: &mut crate::serial::RpcClient) {
+    let mut config = crate::system::TracingConfig::new();
+    config.limit = 40;
+    config.min_level = Some(helios_inspector_protocol::system::tracing::Level::Warn);
+    match crate::system::fetch_tracing(client, &config).await {
+        Ok(events) if events.is_empty() => {}
+        Ok(events) => {
+            eprintln!("recent guest tracing events:");
+            for event in events {
+                if let Ok(line) = crate::system::render_tracing_event(&event) {
+                    eprintln!("  {line}");
+                }
+            }
+        }
+        Err(error) => eprintln!("failed to fetch guest tracing events: {error:#}"),
+    }
+}
+
+fn run_aot_bench(mut client: crate::serial::RpcClient, command: AotBenchCommand) -> Result<()> {
     crate::run_interruptible(async move {
         let wasm = fs::read(&command.wasm)
             .with_context(|| format!("failed to read {}", command.wasm.display()))?;
@@ -867,13 +888,20 @@ fn run_aot_bench(client: crate::serial::RpcClient, command: AotBenchCommand) -> 
             .with_context(|| {
                 format!("failed to AOT compile uploaded wasm iteration {iteration}")
             })?;
-            let result = outcome.map_err(|error| {
-                anyhow::anyhow!(
-                    "remote AOT iteration {iteration} failed: {:?}: {}",
-                    error.kind,
-                    error.detail
-                )
-            })?;
+            let result = match outcome {
+                Ok(result) => result,
+                Err(error) => {
+                    // Surface the guest-side error events before bailing:
+                    // the RPC error kind alone (e.g. `Internal`) does not
+                    // say which runtime operation actually failed.
+                    print_recent_guest_errors(&mut client).await;
+                    return Err(anyhow::anyhow!(
+                        "remote AOT iteration {iteration} failed: {:?}: {}",
+                        error.kind,
+                        error.detail
+                    ));
+                }
+            };
             let elapsed = started.elapsed();
             let mut stdout = std::io::stdout().lock();
             writeln!(
