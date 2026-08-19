@@ -10,6 +10,10 @@
 !/artifacts/wasix/coreutils/*
 /tools/wasi-apps/python/target
 /tools/wasi-apps/curl/target
+/tools/wasi-apps/tcp-throughput/target
+/tools/wasi-apps/wasi-tcp-throughput/target
+/tools/wasi-apps/wasix-tcp-throughput/target
+__pycache__/
 *.wasm
 !/artifacts/wasix/dash/dash.wasm
 !/artifacts/wasix/coreutils/coreutils.wasm
