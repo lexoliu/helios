@@ -583,7 +583,7 @@ where
     delayed_ack_deadline_nanos: Option<u64>,
     time_wait_deadline_nanos: Option<u64>,
     unacked_receive_segments: u8,
-    pending_window_update_bytes: u16,
+    pending_window_update_bytes: u32,
 }
 
 impl<C> TcpSocket<C>
@@ -1721,7 +1721,7 @@ where
     }
 
     fn local_receive_window_bytes(&self) -> u32 {
-        u32::from(self.advertised_window) << TCP_LOCAL_WINDOW_SCALE
+        u32::from(self.advertised_window) << self.local_window_scale
     }
 
     fn acknowledge_sent(
@@ -2239,7 +2239,9 @@ where
             0
         };
         self.refresh_advertised_window();
-        self.update_peer_receive_window(packet.window_size);
+        // RFC 7323 §2.2: the window field in a SYN or SYN-ACK is never
+        // scaled, even though that segment is what carries the option.
+        self.peer_receive_window = u32::from(packet.window_size);
         self.peer_sack_permitted = packet.options.sack_permitted();
         self.record_peer_timestamp(packet.options.timestamp());
     }
@@ -2367,10 +2369,14 @@ where
         if previous_window == 0 {
             return true;
         }
-        self.pending_window_update_bytes = self
-            .pending_window_update_bytes
-            .saturating_add(self.advertised_window - previous_window);
-        self.pending_window_update_bytes >= TCP_WINDOW_UPDATE_BYTES
+        // The advertised window field counts scaled units; accumulate the
+        // delta in bytes so the update threshold means the same thing with
+        // and without a negotiated window scale.
+        let delta_bytes =
+            u32::from(self.advertised_window - previous_window) << self.local_window_scale;
+        self.pending_window_update_bytes =
+            self.pending_window_update_bytes.saturating_add(delta_bytes);
+        self.pending_window_update_bytes >= u32::from(TCP_WINDOW_UPDATE_BYTES)
     }
 }
 

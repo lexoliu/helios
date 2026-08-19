@@ -893,10 +893,13 @@ fn enable_counter_event_stream() {
     const EVNTDIR: u64 = 1 << 3;
     const EVNTI_MASK: u64 = 0xf << 4;
     const EVNTI_BIT_9: u64 = 9 << 4;
+    // FEAT_ECV scales EVNTI to watch bit EVNTI+8 when EVNTIS is set, and
+    // the field resets to an UNKNOWN value; clear it so bit 9 means bit 9.
+    const EVNTIS: u64 = 1 << 17;
     unsafe {
         let mut cntkctl: u64;
         asm!("mrs {v}, cntkctl_el1", v = out(reg) cntkctl, options(nomem, nostack, preserves_flags));
-        cntkctl = (cntkctl & !(EVNTI_MASK | EVNTDIR)) | EVNTEN | EVNTI_BIT_9;
+        cntkctl = (cntkctl & !(EVNTI_MASK | EVNTDIR | EVNTIS)) | EVNTEN | EVNTI_BIT_9;
         asm!("msr cntkctl_el1, {v}", v = in(reg) cntkctl, options(nomem, nostack, preserves_flags));
         asm!("isb", options(nostack, preserves_flags));
     }
