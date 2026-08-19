@@ -236,6 +236,47 @@ def ensure_private_key(repo_root: Path, asset_dir: Path) -> Path:
     return key
 
 
+def proxied_user_data_extras() -> str:
+    """cloud-config additions for hosts whose outbound traffic must pass
+    an HTTP(S) proxy (e.g. CI containers with TLS-intercepting egress).
+
+    Driven by HELIOS_LINUX_VM_HTTP_PROXY (proxy URL as seen from the
+    guest, typically via QEMU user-net's 10.0.2.2 host alias) and
+    HELIOS_LINUX_VM_PROXY_CA (host path of the proxy's CA bundle).
+    """
+    proxy = os.environ.get("HELIOS_LINUX_VM_HTTP_PROXY")
+    if not proxy:
+        return ""
+    no_proxy = "localhost,127.0.0.1,10.0.2.2"
+    write_files = [
+        (
+            "/etc/profile.d/helios-proxy.sh",
+            f"export http_proxy={proxy}\n"
+            f"export https_proxy={proxy}\n"
+            f"export no_proxy={no_proxy}\n",
+        ),
+    ]
+    runcmd = [f"echo 'proxy={proxy}' >> /etc/dnf/dnf.conf"]
+    ca_path = os.environ.get("HELIOS_LINUX_VM_PROXY_CA")
+    if ca_path:
+        ca_content = Path(ca_path).read_text(encoding="utf-8")
+        write_files.append(
+            ("/etc/pki/ca-trust/source/anchors/helios-proxy-ca.crt", ca_content)
+        )
+        runcmd.append("update-ca-trust")
+    lines = ["write_files:"]
+    for path, content in write_files:
+        lines.append(f"  - path: {path}")
+        lines.append('    permissions: "0644"')
+        lines.append("    content: |")
+        for content_line in content.splitlines():
+            lines.append(f"      {content_line}")
+    lines.append("runcmd:")
+    for command in runcmd:
+        lines.append(f"  - {command}")
+    return "\n".join(lines) + "\n"
+
+
 def render_seed(repo_root: Path, asset_dir: Path, public_key: str) -> Path:
     seed_dir = asset_dir / "seed"
     seed_dir.mkdir(parents=True, exist_ok=True)
@@ -245,30 +286,56 @@ def render_seed(repo_root: Path, asset_dir: Path, public_key: str) -> Path:
         encoding="utf-8",
     )
     user_data = (template_dir / "user-data").read_text(encoding="utf-8")
-    (seed_dir / "user-data").write_text(
-        user_data.replace("{ssh_public_key}", public_key),
-        encoding="utf-8",
-    )
+    user_data = user_data.replace("{ssh_public_key}", public_key)
+    extras = proxied_user_data_extras()
+    if extras:
+        user_data = user_data.rstrip("\n") + "\n" + extras
+    (seed_dir / "user-data").write_text(user_data, encoding="utf-8")
     seed_iso = asset_dir / "cidata.iso"
     tmp_stem = asset_dir / "cidata.tmp"
     tmp_iso = tmp_stem.with_suffix(".tmp.iso")
     if tmp_iso.exists():
         tmp_iso.unlink()
-    run(
-        [
-            "hdiutil",
-            "makehybrid",
-            "-quiet",
-            "-o",
-            str(tmp_stem),
-            "-iso",
-            "-joliet",
-            "-default-volume-name",
-            "cidata",
-            str(seed_dir),
-        ],
-        repo_root,
-    )
+    if shutil.which("hdiutil"):
+        run(
+            [
+                "hdiutil",
+                "makehybrid",
+                "-quiet",
+                "-o",
+                str(tmp_stem),
+                "-iso",
+                "-joliet",
+                "-default-volume-name",
+                "cidata",
+                str(seed_dir),
+            ],
+            repo_root,
+        )
+    else:
+        iso_tool = next(
+            (tool for tool in ("genisoimage", "mkisofs", "xorrisofs") if shutil.which(tool)),
+            None,
+        )
+        if iso_tool is None:
+            raise SystemExit(
+                "no ISO tool found for the cloud-init seed; install genisoimage "
+                "(Linux) or run on macOS (hdiutil)"
+            )
+        run(
+            [
+                iso_tool,
+                "-quiet",
+                "-output",
+                str(tmp_iso),
+                "-volid",
+                "cidata",
+                "-joliet",
+                "-rock",
+                str(seed_dir),
+            ],
+            repo_root,
+        )
     tmp_iso.replace(seed_iso)
     return seed_iso
 
