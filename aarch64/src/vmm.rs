@@ -622,7 +622,7 @@ impl AddressSpace for Aarch64UserAddressSpace {
 
     fn relocate(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
         validate_range(virt)?;
-        let mut state = self.state.lock();
+        let state = self.state.lock();
         state.ensure_committed(virt)?;
 
         let pages = self.build_relocation_plan(virt)?;
