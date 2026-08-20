@@ -377,28 +377,34 @@ def ensure_guest_disk(repo_root: Path, base: Path, asset_dir: Path, disk_size: s
     return disk
 
 
-def find_qemu_file(qemu_bin: str, filename: str) -> Path:
+def find_qemu_file(qemu_bin: str, filenames: tuple[str, ...]) -> Path:
     qemu_path = shutil.which(qemu_bin) if len(Path(qemu_bin).parts) == 1 else qemu_bin
-    candidates = []
+    share_dirs = []
     if qemu_path:
         qemu_parent = Path(qemu_path).resolve().parent.parent
-        candidates.append(qemu_parent / "share/qemu" / filename)
-    candidates.extend(
+        share_dirs.append(qemu_parent / "share/qemu")
+    share_dirs.extend(
         [
-            Path("/opt/homebrew/share/qemu") / filename,
-            Path("/usr/local/share/qemu") / filename,
+            Path("/opt/homebrew/share/qemu"),
+            Path("/usr/local/share/qemu"),
+            # Debian/Ubuntu ship the aarch64 edk2 firmware as AAVMF.
+            Path("/usr/share/AAVMF"),
         ]
     )
+    candidates = [
+        share_dir / filename for share_dir in share_dirs for filename in filenames
+    ]
     for candidate in candidates:
         if candidate.is_file():
             return candidate
     searched = ", ".join(str(candidate) for candidate in candidates)
-    raise SystemExit(f"failed to find QEMU firmware {filename}; searched {searched}")
+    names = ", ".join(filenames)
+    raise SystemExit(f"failed to find QEMU firmware {names}; searched {searched}")
 
 
 def ensure_firmware_vars(asset_dir: Path, qemu_bin: str) -> tuple[Path, Path]:
-    code = find_qemu_file(qemu_bin, "edk2-aarch64-code.fd")
-    vars_template = find_qemu_file(qemu_bin, "edk2-arm-vars.fd")
+    code = find_qemu_file(qemu_bin, ("edk2-aarch64-code.fd", "AAVMF_CODE.fd"))
+    vars_template = find_qemu_file(qemu_bin, ("edk2-arm-vars.fd", "AAVMF_VARS.fd"))
     vars_path = asset_dir / "edk2-aarch64-vars.fd"
     if not vars_path.is_file():
         shutil.copyfile(vars_template, vars_path)
