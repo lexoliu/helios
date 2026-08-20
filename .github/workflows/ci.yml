@@ -91,12 +91,18 @@ jobs:
           - name: x86-64-linux
             runner: ubuntu-24.04
             helios-arch: x86-64
+            # Without lazy-commit virtual memory the x86 kernel allocates
+            # WASIX shared-memory capacity eagerly, so the shell workloads
+            # need more physical guest RAM than the aarch64 lanes.
+            vm-memory: 6G
           - name: aarch64-linux
             runner: ubuntu-24.04-arm
             helios-arch: aarch64
+            vm-memory: 2G
           - name: aarch64-macos
             runner: macos-15
             helios-arch: aarch64
+            vm-memory: 2G
     steps:
       - uses: actions/checkout@v4
         with:
@@ -161,6 +167,7 @@ jobs:
           HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
           HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
           HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+          HELIOS_WORKLOAD_BENCH_VM_MEMORY: ${{ matrix.vm-memory }}
         run: |
           python3 tools/wasi-apps/linux-gap-bench.py \
             --arch ${{ matrix.helios-arch }} \
