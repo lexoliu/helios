@@ -23,6 +23,11 @@ pub(super) struct SharedMemoryPool {
     pub(super) budget_bytes: usize,
     pub(super) resident_bytes: usize,
     pub(super) buckets: HashMap<SharedMemorySpec, Vec<SharedMemory>>,
+    /// Recycles claimed by `reserve_for_recycle` whose scrub has not yet
+    /// landed in a bucket. Spawns that lose the allocation race wait on
+    /// `recycled` instead of failing while this is non-zero.
+    pending_scrubs: usize,
+    recycled: Arc<crate::exec::Notify>,
 }
 
 impl SharedMemoryPool {
@@ -31,6 +36,8 @@ impl SharedMemoryPool {
             budget_bytes,
             resident_bytes: 0,
             buckets: HashMap::new(),
+            pending_scrubs: 0,
+            recycled: Arc::new(crate::exec::Notify::new()),
         }
     }
 
@@ -68,6 +75,7 @@ impl SharedMemoryPool {
             .resident_bytes
             .checked_add(bytes)
             .expect("shared-memory pool byte accounting overflow");
+        self.pending_scrubs += 1;
         true
     }
 
@@ -75,6 +83,42 @@ impl SharedMemoryPool {
     /// `reserve_for_recycle`.
     pub(super) fn finish_recycle(&mut self, spec: SharedMemorySpec, memory: SharedMemory) {
         self.buckets.entry(spec).or_default().push(memory);
+        self.pending_scrubs = self
+            .pending_scrubs
+            .checked_sub(1)
+            .expect("shared-memory pool finished a recycle it never reserved");
+        self.recycled.notify_one();
+    }
+}
+
+/// Acquires a shared memory, waiting for in-flight recycles when a fresh
+/// allocation fails. Fast spawn/exit cycles can outrun the background
+/// scrub: the exited guest's memory holds pool budget (and user RAM)
+/// until its scrub lands, so a burst of spawns would otherwise allocate
+/// fresh multi-hundred-megabyte memories until the user pool is empty.
+/// Waiting turns that transient shortage into backpressure; the error
+/// only propagates once no recycle is in flight to satisfy the retry.
+pub(super) async fn acquire_or_wait_for_recycle(
+    pool: &Mutex<SharedMemoryPool>,
+    engine: &wasmtime::Engine,
+    spec: SharedMemorySpec,
+) -> Result<SharedMemory, ProgramExecError> {
+    loop {
+        let recycled = {
+            let mut guard = pool.lock();
+            match guard.acquire(engine, spec) {
+                Ok(memory) => return Ok(memory),
+                Err(error) => {
+                    if guard.pending_scrubs == 0 {
+                        return Err(error);
+                    }
+                    guard.recycled.clone()
+                }
+            }
+        };
+        // The kernel Notify stores permits, so a recycle that lands
+        // between releasing the lock and awaiting is still observed.
+        recycled.notified().await;
     }
 }
 

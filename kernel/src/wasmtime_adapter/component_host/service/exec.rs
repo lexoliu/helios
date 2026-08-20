@@ -304,7 +304,9 @@ where
         start_program_kernel_profile(&profile_runtime_state, &profile_cpu);
     let imported_memory_spec = imported_shared_memory_spec_with_user_budget(&compiled.module)?;
     let imported_memory = match imported_memory_spec {
-        Some(spec) => Some(shared_memory_pool.lock().acquire(engine.raw(), spec)?),
+        Some(spec) => {
+            Some(acquire_or_wait_for_recycle(&shared_memory_pool, engine.raw(), spec).await?)
+        }
         None => None,
     };
     record_program_kernel_profile_sample(
