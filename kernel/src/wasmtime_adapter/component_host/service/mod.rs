@@ -3034,6 +3034,29 @@ mod tests {
     }
 
     #[test]
+    fn shared_memory_pool_evicts_other_specs_under_pressure() {
+        let mut config = wasmtime::Config::new();
+        config.wasm_threads(true);
+        config.shared_memory(true);
+        let engine = wasmtime::Engine::new(&config).unwrap();
+        let spec = SharedMemorySpec {
+            initial_pages: 1,
+            maximum_pages: 1,
+        };
+        let mut pool = SharedMemoryPool::new(spec.byte_size() * 2);
+        let memory = SharedMemory::new(&engine, spec.memory_type()).unwrap();
+        assert!(pool.reserve_for_recycle(spec, &memory));
+        futures_lite::future::block_on(scrub_shared_memory(&memory));
+        pool.finish_recycle(spec, memory);
+
+        // A retained entry under another spec is dropped, releasing its
+        // budget and user RAM, rather than starving a failing allocation.
+        assert!(pool.evict_one());
+        assert_eq!(pool.resident_bytes, 0);
+        assert!(!pool.evict_one());
+    }
+
+    #[test]
     fn wasix_socket_size_options_are_descriptor_local_state() {
         let mut descriptor = WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
             options: WasixSocketOptions::default(),

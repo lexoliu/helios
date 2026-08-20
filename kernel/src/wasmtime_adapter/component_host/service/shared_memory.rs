@@ -44,6 +44,9 @@ impl SharedMemoryPool {
     /// Hands out a pre-zeroed pooled memory, or a fresh one. Pooled
     /// entries were scrubbed off the spawn path by the recycle task, so
     /// this never zeroes memory on the process-start critical path.
+    /// The pool is a cache: when a fresh allocation fails, entries
+    /// retained under other specs are evicted (freeing their user RAM)
+    /// and the allocation retried before the failure propagates.
     pub(super) fn acquire(
         &mut self,
         engine: &wasmtime::Engine,
@@ -57,7 +60,39 @@ impl SharedMemoryPool {
             return Ok(memory);
         }
 
-        SharedMemory::new(engine, spec.memory_type()).map_err(map_program_runtime_error)
+        loop {
+            match SharedMemory::new(engine, spec.memory_type()) {
+                Ok(memory) => return Ok(memory),
+                Err(error) => {
+                    if !self.evict_one() {
+                        return Err(map_program_runtime_error(error));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drops one pooled memory, releasing its user RAM and budget.
+    /// Returns false when every bucket is empty.
+    pub(super) fn evict_one(&mut self) -> bool {
+        let Some(spec) = self
+            .buckets
+            .iter()
+            .find_map(|(spec, bucket)| (!bucket.is_empty()).then_some(*spec))
+        else {
+            return false;
+        };
+        let memory = self
+            .buckets
+            .get_mut(&spec)
+            .and_then(|bucket| bucket.pop())
+            .expect("shared-memory pool eviction found an empty bucket");
+        self.resident_bytes = self
+            .resident_bytes
+            .checked_sub(spec.byte_size())
+            .expect("shared-memory pool byte accounting underflow");
+        drop(memory);
+        true
     }
 
     /// Claims budget for a memory about to be scrubbed and re-pooled.
@@ -144,8 +179,12 @@ pub(super) fn spawn_scrubbed_recycle<CpuImpl>(
     });
 }
 
-/// Bytes zeroed between cooperative yields while scrubbing.
-const SCRUB_CHUNK_BYTES: usize = 512 * 1024;
+/// Bytes zeroed between cooperative yields while scrubbing. Sized so a
+/// 512 MiB memory turns around in ~128 yields: spawn bursts wait on the
+/// scrub through `acquire_or_wait_for_recycle`, so recycle latency is
+/// spawn latency under pressure, while each chunk still clears in well
+/// under a millisecond and keeps the executor responsive.
+const SCRUB_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
 pub(super) async fn scrub_shared_memory(memory: &SharedMemory) {
     let len = memory.data_size();
