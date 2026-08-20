@@ -1,0 +1,198 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned snapshot of the modified Wasmtime tree the workspace's
+  # `../wasmtime` path dependency builds against (docs/wasmtime.md).
+  WASMTIME_REPOSITORY: lexoliu/wasmtime
+  WASMTIME_REF: e202ac1cab2492a9bdf5d2df3423b670b75f04e3
+
+jobs:
+  checks:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: check-host
+            command: just check-host
+          - name: check-aarch64
+            command: just check-target aarch64-unknown-none helios-aarch64
+          - name: check-riscv
+            command: just check-target riscv64gc-unknown-none-elf helios-riscv
+          - name: check-x86
+            command: just check-target x86_64-unknown-none helios-x86
+          - name: test-embedded-debugger
+            command: just test-embedded-debugger
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.WASMTIME_REPOSITORY }}
+          ref: ${{ env.WASMTIME_REF }}
+          path: wasmtime
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libudev-dev just cmake ninja-build
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-tools
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+      - name: Restore WASI tooling artifacts
+        id: artifact-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            helios/artifacts/wasi-tools
+            helios/artifacts/python3-root
+            helios/artifacts/wasix
+          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/build.sh', 'helios/tools/wasi-apps/boot-artifacts.toml') }}
+      - name: Stage WASI tooling artifacts
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
+        working-directory: helios
+        run: tools/wasi-apps/build.sh
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: helios
+          key: ${{ matrix.name }}
+      - name: ${{ matrix.name }}
+        working-directory: helios
+        run: ${{ matrix.command }}
+
+  bench:
+    name: bench-${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86-64-linux
+            runner: ubuntu-24.04
+            helios-arch: x86-64
+          - name: aarch64-linux
+            runner: ubuntu-24.04-arm
+            helios-arch: aarch64
+          - name: aarch64-macos
+            runner: macos-15
+            helios-arch: aarch64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.WASMTIME_REPOSITORY }}
+          ref: ${{ env.WASMTIME_REF }}
+          path: wasmtime
+      - name: Install host dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libudev-dev just cmake ninja-build \
+            qemu-system-x86 ovmf qemu-system-arm qemu-efi-aarch64
+          # GitHub's x86-64 runners expose /dev/kvm; the inspector picks
+          # the accelerator by capability, this only fixes permissions.
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm
+            ls -la /dev/kvm
+          fi
+      - name: Install host dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install qemu just cmake ninja
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-tools
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+      - name: Stage Limine bootloader share
+        run: |
+          git clone --depth 1 --branch v11.x-binary \
+            https://github.com/limine-bootloader/limine "$GITHUB_WORKSPACE/limine"
+          make -C "$GITHUB_WORKSPACE/limine"
+      - name: Restore WASI tooling artifacts
+        id: artifact-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            helios/artifacts/wasi-tools
+            helios/artifacts/python3-root
+            helios/artifacts/wasix
+          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/build.sh', 'helios/tools/wasi-apps/boot-artifacts.toml') }}
+      - name: Stage WASI tooling artifacts
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
+        working-directory: helios
+        run: tools/wasi-apps/build.sh
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: helios
+          key: bench-${{ matrix.name }}
+      - name: Install inferno flamegraph renderer
+        run: cargo install inferno --locked
+      - name: Build inspector
+        working-directory: helios
+        run: cargo build --release -p helios-inspector
+      - name: Run Helios workload benchmarks
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          python3 tools/wasi-apps/linux-gap-bench.py \
+            --arch ${{ matrix.helios-arch }} \
+            --skip-linux \
+            --allow-busy-host \
+            --helios-timeout-seconds 9000 \
+            --out-dir target/perf-baselines/ci-${{ matrix.name }}
+      - name: Summarize results
+        if: always()
+        working-directory: helios
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          from pathlib import Path
+
+          out_dir = Path("target/perf-baselines/ci-${{ matrix.name }}")
+          print("### Helios workload medians (${{ matrix.name }})\n")
+          print("| workload | class | median (ms) | iterations (ms) |")
+          print("| --- | --- | --- | --- |")
+          for jsonl in sorted(out_dir.glob("helios*.jsonl")):
+              for line in jsonl.read_text().splitlines():
+                  row = json.loads(line)
+                  if row.get("type") != "summary":
+                      continue
+                  iters = ", ".join(str(v) for v in row.get("elapsed_ms", []))
+                  print(
+                      f"| {row['workload']} | {row['class']} "
+                      f"| {row['median_elapsed_ms']} | {iters} |"
+                  )
+          EOF
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-baselines-${{ matrix.name }}
+          path: helios/target/perf-baselines/ci-${{ matrix.name }}/**
+          if-no-files-found: warn
