@@ -884,6 +884,12 @@ fn finish_bootstrap<Console, CpuImpl>(
         topology.configured_processors,
         topology.startup_policy
     );
+    let user_heap = memory::user_heap_stats();
+    tracing::info!(
+        "User memory pool total_bytes={} available_bytes={}",
+        user_heap.total_bytes,
+        user_heap.available_bytes()
+    );
     tracing::info!(
         "Platform dma_model={dma_model:?} debug_serial={} network={} block_devices={} host_share={}",
         devices.has_debug_serial,
