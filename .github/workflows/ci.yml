@@ -159,6 +159,7 @@ jobs:
         working-directory: helios
         env:
           HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
           HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
         run: |
           python3 tools/wasi-apps/linux-gap-bench.py \
