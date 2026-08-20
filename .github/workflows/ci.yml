@@ -95,14 +95,24 @@ jobs:
             # WASIX shared-memory capacity eagerly, so the shell workloads
             # need more physical guest RAM than the aarch64 lanes.
             vm-memory: 6G
+            # The x86 backend does not wire virtio-net yet, so the
+            # network workloads only run on the aarch64 lanes.
+            workload-args: >-
+              --workload quickjs-loop --workload cpython-json
+              --workload cpython-regex --workload aot-curl
+              --workload wasm-simd-lanes --workload process-startup
+              --workload stdio-pipe --workload fs-smallfiles
+              --workload fs-readstream
           - name: aarch64-linux
             runner: ubuntu-24.04-arm
             helios-arch: aarch64
             vm-memory: 2G
+            workload-args: ""
           - name: aarch64-macos
             runner: macos-15
             helios-arch: aarch64
             vm-memory: 2G
+            workload-args: ""
     steps:
       - uses: actions/checkout@v4
         with:
@@ -174,7 +184,8 @@ jobs:
             --skip-linux \
             --allow-busy-host \
             --helios-timeout-seconds 9000 \
-            --out-dir target/perf-baselines/ci-${{ matrix.name }}
+            --out-dir target/perf-baselines/ci-${{ matrix.name }} \
+            ${{ matrix.workload-args }}
       - name: Summarize results
         if: always()
         working-directory: helios
