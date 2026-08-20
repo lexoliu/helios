@@ -122,7 +122,7 @@ const AARCH64_VIRT_HVF_PROFILE: VmProfile = VmProfile {
     default_smp: DEFAULT_AARCH64_SMP,
     default_memory: DEFAULT_AARCH64_MEMORY,
     default_bios: None,
-    default_accel: &["hvf"],
+    default_accel: &["hvf", "kvm"],
     default_cpu: Some("host"),
     boot_artifact: VmBootArtifactKind::LimineUefiDiskImage,
     console: VmConsoleProfile::SerialUnixSocket,
@@ -183,8 +183,8 @@ const X86_64_VM_PROFILE: VmProfile = VmProfile {
     default_smp: DEFAULT_X86_SMP,
     default_memory: DEFAULT_X86_MEMORY,
     default_bios: None,
-    default_accel: &[],
-    default_cpu: Some("max"),
+    default_accel: &["kvm"],
+    default_cpu: Some("host"),
     boot_artifact: VmBootArtifactKind::LimineUefiDiskImage,
     console: VmConsoleProfile::SerialUnixSocket,
     network: Some(VmNetworkProfile::VirtioPciUser),
@@ -807,9 +807,9 @@ fn run_workload_bench(
     })
 }
 
-/// Fetches and prints the guest's recent warn/error tracing events so a
-/// failed remote operation is diagnosable from the CLI without a second
-/// tracing session.
+/// Fetches and prints the guest's recent tracing events (info level and
+/// up, so boot markers frame the failure) so a failed remote operation
+/// is diagnosable from the CLI without a second tracing session.
 async fn print_recent_guest_errors(client: &mut crate::serial::RpcClient) {
     let mut config = crate::system::TracingConfig::new();
     config.limit = 100;

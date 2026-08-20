@@ -2713,17 +2713,20 @@ where
             .any(|queued| queued.listener == listener))
     }
 
-    /// Report whether `socket`'s send side is still open.
+    /// Report whether `socket` would accept bytes from `queue_send_bytes`.
     ///
     /// `tcp_connect_state` folds every non-established state into `Pending`,
     /// which loses the distinction readiness reporting needs: a peer that
     /// half-closed (`CloseWait`) stops delivering data but still accepts
-    /// ours, so the socket remains writable.
-    pub fn tcp_send_open(&self, socket: SocketId) -> Result<bool, StackError> {
+    /// ours, so the socket remains writable. A full transmit queue parks
+    /// writability until ACKs drain capacity — reporting writable there
+    /// would spin poll/epoll callers whose next write accepts zero bytes.
+    pub fn tcp_send_ready(&self, socket: SocketId) -> Result<bool, StackError> {
+        let socket = self.tcp_socket(socket)?;
         Ok(matches!(
-            self.tcp_socket(socket)?.state(),
+            socket.state(),
             crate::TcpState::Established | crate::TcpState::CloseWait
-        ))
+        ) && socket.send_capacity_bytes() != 0)
     }
 
     /// Report whether `socket` has a datagram waiting, without dequeuing it.

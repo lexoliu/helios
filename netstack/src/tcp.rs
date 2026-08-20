@@ -880,6 +880,16 @@ where
         self.queue_send_bytes(&mut bytes)
     }
 
+    /// Bytes `queue_send_bytes` would accept right now. Zero when the
+    /// transmit queue is full, so readiness reporting can avoid claiming
+    /// writability that the next write would reject.
+    pub fn send_capacity_bytes(&self) -> usize {
+        self.transmit_queue.as_ref().map_or(
+            TCP_TRANSMIT_BUFFER_BYTES,
+            TcpTransmitQueue::remaining_bytes_capacity,
+        )
+    }
+
     pub fn queue_send_bytes(&mut self, bytes: &mut Bytes) -> usize {
         if !matches!(self.state, TcpState::Established | TcpState::CloseWait) {
             return 0;

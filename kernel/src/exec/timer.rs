@@ -562,9 +562,12 @@ impl TimingWheel {
     }
 
     fn insert(&mut self, pool: &SleepStatePool, entry: TimerEntry) {
-        if !entry.is_dead(pool) {
-            self.observe_deadline(entry.deadline, entry.deadline_tick);
+        // A sleep dropped between enqueue and drain arrives already dead;
+        // dropping it here keeps wheel buckets bounded by live sleeps.
+        if entry.is_dead(pool) {
+            return;
         }
+        self.observe_deadline(entry.deadline, entry.deadline_tick);
         let target_tick = entry.deadline_tick.max(self.current_tick);
         let delay = target_tick.saturating_sub(self.current_tick);
         let level = wheel_level(delay);

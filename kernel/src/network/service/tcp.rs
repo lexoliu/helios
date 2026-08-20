@@ -139,8 +139,9 @@ where
                 TcpReadState::Pending => (false, false),
             };
             // Writability follows the send side, which outlives the read
-            // side: a peer that half-closed still accepts our data.
-            let writable = state.stack.tcp_send_open(socket).map_err(|_| TcpError {
+            // side: a peer that half-closed still accepts our data. A full
+            // transmit queue clears it until ACKs free capacity.
+            let writable = state.stack.tcp_send_ready(socket).map_err(|_| TcpError {
                 kind: TcpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::UnknownTcpStream,
             })?;
