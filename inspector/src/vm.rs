@@ -617,7 +617,20 @@ fn default_accel(profile: &VmProfile) -> Vec<String> {
     };
     for accel in profile.default_accel {
         let available = match *accel {
-            "hvf" => native_host && std::env::consts::OS == "macos",
+            // The OS check alone is not enough: virtualized macOS hosts
+            // without nested virtualization (e.g. CI runners) ship the
+            // Hypervisor framework but report kern.hv_support=0, and QEMU
+            // aborts with HV_UNSUPPORTED if HVF is requested anyway.
+            "hvf" => {
+                native_host
+                    && std::env::consts::OS == "macos"
+                    && std::process::Command::new("sysctl")
+                        .args(["-n", "kern.hv_support"])
+                        .output()
+                        .is_ok_and(|output| {
+                            String::from_utf8_lossy(&output.stdout).trim() == "1"
+                        })
+            }
             "kvm" => native_host && Path::new("/dev/kvm").exists(),
             _ => true,
         };
