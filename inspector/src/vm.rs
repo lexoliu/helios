@@ -802,7 +802,10 @@ fn run_workload_bench(
             Vec::new()
         };
 
-        crate::workload_bench::run_inner(&mut client, &command, &provenance).await?;
+        if let Err(error) = crate::workload_bench::run_inner(&mut client, &command, &provenance).await {
+            print_recent_guest_errors(&mut client).await;
+            return Err(error);
+        }
 
         if collect_profile {
             system_profiling::set_enabled(&client, false)

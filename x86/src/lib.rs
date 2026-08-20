@@ -718,7 +718,7 @@ fn detect_x86_native_feature(feature: &str) -> Option<bool> {
         ((edx as u64) << 32) | u64::from(eax)
     }
 
-    let max_basic = unsafe { __cpuid(0) }.eax;
+    let max_basic = __cpuid(0).eax;
     let max_extended = unsafe { __cpuid(0x8000_0000) }.eax;
     let leaf1 = unsafe { __cpuid(1) };
     let leaf7 = (max_basic >= 7).then(|| unsafe { __cpuid_count(7, 0) });
@@ -849,9 +849,9 @@ fn read_tsc() -> u64 {
 }
 
 fn detect_tsc_frequency_hz() -> u64 {
-    let max_basic = unsafe { __cpuid(0) }.eax;
+    let max_basic = __cpuid(0).eax;
     if max_basic >= 0x15 {
-        let leaf_15 = unsafe { __cpuid(0x15) };
+        let leaf_15 = __cpuid(0x15);
         let denominator = u64::from(leaf_15.eax);
         let numerator = u64::from(leaf_15.ebx);
         let crystal_hz = u64::from(leaf_15.ecx);
@@ -865,7 +865,7 @@ fn detect_tsc_frequency_hz() -> u64 {
     }
 
     if max_basic >= 0x16 {
-        let base_mhz = u64::from(unsafe { __cpuid(0x16) }.eax);
+        let base_mhz = u64::from(__cpuid(0x16).eax);
         if base_mhz != 0 {
             let tsc_hz = base_mhz.saturating_mul(1_000_000);
             assert!(tsc_hz != 0, "computed TSC frequency is zero");
