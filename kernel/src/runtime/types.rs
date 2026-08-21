@@ -595,7 +595,7 @@ pub trait ComponentNetworkService: Clone + Send + Sync + 'static {
         &'a self,
         host: &'a str,
         timeout_nanos: u64,
-    ) -> impl Future<Output = Result<Vec<Ipv4Address>, DnsError>> + Send + 'a;
+    ) -> impl Future<Output = Result<Vec<NetworkIpAddress>, DnsError>> + Send + 'a;
 
     fn tcp_connect<'a>(
         &'a self,

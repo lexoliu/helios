@@ -80,7 +80,7 @@ trait DynComponentHostNetworkService: Send + Sync + 'static {
         &'a self,
         host: &'a str,
         timeout_nanos: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Ipv4Address>, DnsError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<NetworkIpAddress>, DnsError>> + Send + 'a>>;
 
     fn tcp_connect<'a>(
         &'a self,
@@ -362,7 +362,7 @@ impl ComponentNetworkService for ComponentHostNetworkService {
         &'a self,
         host: &'a str,
         timeout_nanos: u64,
-    ) -> impl Future<Output = Result<Vec<Ipv4Address>, DnsError>> + Send + 'a {
+    ) -> impl Future<Output = Result<Vec<NetworkIpAddress>, DnsError>> + Send + 'a {
         self.inner.dns_resolve(host, timeout_nanos)
     }
 
@@ -697,7 +697,7 @@ where
         &'a self,
         host: &'a str,
         timeout_nanos: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Ipv4Address>, DnsError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<NetworkIpAddress>, DnsError>> + Send + 'a>> {
         Box::pin(self.service.dns_resolve(host, timeout_nanos))
     }
 

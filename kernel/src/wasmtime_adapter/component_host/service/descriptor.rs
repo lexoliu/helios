@@ -405,23 +405,64 @@ pub(super) enum WasixSocketDescriptor {
     },
 }
 
+/// Address family a WASIX socket was opened with.
+///
+/// `socket(AF_INET6, ...)` and `socket(AF_INET, ...)` produce sockets
+/// that differ in what a wildcard bind means and in which peer
+/// addresses they accept, so the family is descriptor identity and
+/// travels with the socket through every state transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WasixSocketFamily {
+    Ipv4,
+    Ipv6,
+}
+
+impl WasixSocketFamily {
+    /// The wildcard local address for this family: `0.0.0.0` or `::`.
+    pub(super) const fn unspecified_address(self) -> crate::NetworkIpAddress {
+        match self {
+            Self::Ipv4 => crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0])),
+            Self::Ipv6 => {
+                crate::NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::UNSPECIFIED)
+            }
+        }
+    }
+
+    /// Whether an address supplied by the guest may be used on a socket
+    /// of this family. There is no v4-mapped-v6 path here: the netstack
+    /// keeps the two families in separate socket address spaces, so
+    /// accepting a v4 address on an v6 socket would silently produce a
+    /// socket that cannot be described back to the guest.
+    pub(super) const fn accepts(self, address: crate::NetworkIpAddress) -> bool {
+        matches!(
+            (self, address),
+            (Self::Ipv4, crate::NetworkIpAddress::Ipv4(_))
+                | (Self::Ipv6, crate::NetworkIpAddress::Ipv6(_))
+        )
+    }
+}
+
 #[derive(Clone)]
 pub(super) enum WasixTcpSocket {
     Unconnected {
+        family: WasixSocketFamily,
         options: WasixSocketOptions,
     },
     Bound {
+        family: WasixSocketFamily,
         local_port: u16,
         options: WasixSocketOptions,
     },
     Listening {
+        family: WasixSocketFamily,
         listener: u64,
         local_port: u16,
         options: WasixSocketOptions,
     },
     Connected {
+        family: WasixSocketFamily,
         stream: u64,
-        peer_address: crate::Ipv4Address,
+        peer_address: crate::NetworkIpAddress,
         peer_port: u16,
         options: WasixSocketOptions,
     },
@@ -430,9 +471,11 @@ pub(super) enum WasixTcpSocket {
 #[derive(Clone)]
 pub(super) enum WasixUdpSocket {
     Unbound {
+        family: WasixSocketFamily,
         options: WasixSocketOptions,
     },
     Bound {
+        family: WasixSocketFamily,
         socket: u64,
         local_port: u16,
         options: WasixSocketOptions,
@@ -615,7 +658,7 @@ impl WasixSocketDescriptor {
 impl WasixTcpSocket {
     pub(super) fn options(&self) -> &WasixSocketOptions {
         match self {
-            WasixTcpSocket::Unconnected { options }
+            WasixTcpSocket::Unconnected { options, .. }
             | WasixTcpSocket::Bound { options, .. }
             | WasixTcpSocket::Listening { options, .. }
             | WasixTcpSocket::Connected { options, .. } => options,
@@ -624,10 +667,19 @@ impl WasixTcpSocket {
 
     pub(super) fn options_mut(&mut self) -> &mut WasixSocketOptions {
         match self {
-            WasixTcpSocket::Unconnected { options }
+            WasixTcpSocket::Unconnected { options, .. }
             | WasixTcpSocket::Bound { options, .. }
             | WasixTcpSocket::Listening { options, .. }
             | WasixTcpSocket::Connected { options, .. } => options,
+        }
+    }
+
+    pub(super) fn family(&self) -> WasixSocketFamily {
+        match self {
+            WasixTcpSocket::Unconnected { family, .. }
+            | WasixTcpSocket::Bound { family, .. }
+            | WasixTcpSocket::Listening { family, .. }
+            | WasixTcpSocket::Connected { family, .. } => *family,
         }
     }
 }
@@ -635,13 +687,23 @@ impl WasixTcpSocket {
 impl WasixUdpSocket {
     pub(super) fn options(&self) -> &WasixSocketOptions {
         match self {
-            WasixUdpSocket::Unbound { options } | WasixUdpSocket::Bound { options, .. } => options,
+            WasixUdpSocket::Unbound { options, .. }
+            | WasixUdpSocket::Bound { options, .. } => options,
         }
     }
 
     pub(super) fn options_mut(&mut self) -> &mut WasixSocketOptions {
         match self {
-            WasixUdpSocket::Unbound { options } | WasixUdpSocket::Bound { options, .. } => options,
+            WasixUdpSocket::Unbound { options, .. }
+            | WasixUdpSocket::Bound { options, .. } => options,
+        }
+    }
+
+    pub(super) fn family(&self) -> WasixSocketFamily {
+        match self {
+            WasixUdpSocket::Unbound { family, .. } | WasixUdpSocket::Bound { family, .. } => {
+                *family
+            }
         }
     }
 }

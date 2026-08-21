@@ -627,15 +627,10 @@ where
                 },
                 detail: error.detail,
             })?;
-        addresses
-            .into_iter()
-            .next()
-            .map(map_kernel_ipv4_address)
-            .map(IpAddress::Ipv4)
-            .ok_or(TcpError {
-                kind: TcpErrorKind::UnresolvedHost,
-                detail: NetworkErrorDetail::DnsNoIpv4Address,
-            })
+        self.first_usable_address(addresses).ok_or(TcpError {
+            kind: TcpErrorKind::UnresolvedHost,
+            detail: NetworkErrorDetail::DnsNoIpv4Address,
+        })
     }
 
     pub(super) async fn drive_tcp(&self) -> Result<(), TcpError> {

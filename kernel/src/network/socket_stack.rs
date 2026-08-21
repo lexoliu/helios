@@ -28,7 +28,7 @@ where
         _: DnsCap,
         host: &'a str,
         timeout_nanos: u64,
-    ) -> impl Future<Output = Result<alloc::vec::Vec<crate::Ipv4Address>, crate::DnsError>> + 'a
+    ) -> impl Future<Output = Result<alloc::vec::Vec<NetworkIpAddress>, crate::DnsError>> + 'a
     {
         self.service.dns_resolve(host, timeout_nanos)
     }
@@ -303,8 +303,11 @@ mod tests {
             &self,
             _: &str,
             _: u64,
-        ) -> impl Future<Output = Result<Vec<Ipv4Address>, DnsError>> + Send + '_ {
-            core::future::ready(Ok(vec![Ipv4Address::new([127, 0, 0, 1])]))
+        ) -> impl Future<Output = Result<Vec<NetworkIpAddress>, DnsError>> + Send + '_ {
+            core::future::ready(Ok(vec![
+                NetworkIpAddress::Ipv4(Ipv4Address::new([127, 0, 0, 1])),
+                NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::LOOPBACK),
+            ]))
         }
 
         fn tcp_connect(
@@ -503,9 +506,13 @@ mod tests {
         let privileged = authority.derive_privileged_bind_cap().unwrap();
         let stack = SocketStack::new(TestNetworkService);
 
+        // A dual-family lookup surfaces both records, in resolver order.
         assert_eq!(
             block_on(stack.dns_resolve(dns, "localhost", 1)).unwrap(),
-            vec![Ipv4Address::new([127, 0, 0, 1])]
+            vec![
+                NetworkIpAddress::Ipv4(Ipv4Address::new([127, 0, 0, 1])),
+                NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::LOOPBACK),
+            ]
         );
         assert_eq!(
             block_on(stack.tcp_connect(tcp, "localhost", 80, 1)).unwrap(),

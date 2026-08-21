@@ -376,10 +376,13 @@ mod tests {
             &self,
             _: &str,
             _: u64,
-        ) -> impl core::future::Future<Output = Result<Vec<crate::Ipv4Address>, crate::DnsError>>
-        + Send
+        ) -> impl core::future::Future<
+            Output = Result<Vec<crate::NetworkIpAddress>, crate::DnsError>,
+        > + Send
         + '_ {
-            core::future::ready(Ok(vec![crate::Ipv4Address::new([127, 0, 0, 1])]))
+            core::future::ready(Ok(vec![crate::NetworkIpAddress::Ipv4(
+                crate::Ipv4Address::new([127, 0, 0, 1]),
+            )]))
         }
 
         fn tcp_connect(
@@ -2125,6 +2128,42 @@ mod tests {
     }
 
     #[test]
+    fn p2_resolve_stream_yields_both_address_families_in_resolver_order() {
+        let mut stream = P2ResolveAddressStream::pending();
+        let v4 = crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([93, 184, 215, 14]));
+        let v6 = crate::NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::new([
+            0x26, 0x06, 0x28, 0x00, 0x02, 0x1f, 0xcb, 0x07, 0x68, 0x20, 0x80, 0xda, 0x00, 0xaf,
+            0x6b, 0x08,
+        ]));
+        stream.complete(Ok(vec![v4, v6]));
+
+        assert_eq!(stream.next_address().unwrap(), Some(v4));
+        assert_eq!(stream.next_address().unwrap(), Some(v6));
+        assert_eq!(stream.next_address().unwrap(), None);
+    }
+
+    #[test]
+    fn p3_ip_address_formatting_preserves_the_address_family() {
+        use crate::wasmtime_adapter::wasi::net::format_p3_ip_address;
+
+        assert!(matches!(
+            format_p3_ip_address(crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([
+                192, 0, 2, 1
+            ]))),
+            socket_types::IpAddress::Ipv4((192, 0, 2, 1))
+        ));
+        // Each 16-bit group is big-endian, per `wasi:sockets` ipv6-address.
+        assert!(matches!(
+            format_p3_ip_address(crate::NetworkIpAddress::Ipv6(
+                helios_netstack::Ipv6Address::new([
+                    0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ])
+            )),
+            socket_types::IpAddress::Ipv6((0x2001, 0x0db8, 0, 0, 0, 0, 0, 1))
+        ));
+    }
+
+    #[test]
     fn p2_resolve_stream_yields_addresses_after_background_completion() {
         let mut stream = P2ResolveAddressStream::pending();
         assert!(!stream.is_ready());
@@ -2138,7 +2177,7 @@ mod tests {
             }
         ));
 
-        let address = crate::Ipv4Address::new([192, 0, 2, 1]);
+        let address = crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([192, 0, 2, 1]));
         stream.complete(Ok(vec![address]));
         assert!(stream.is_ready());
         assert_eq!(stream.next_address().unwrap(), Some(address));

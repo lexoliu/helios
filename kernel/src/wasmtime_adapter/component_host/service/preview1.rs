@@ -4131,10 +4131,12 @@ where
     if status != p1::errno::SUCCESS {
         return status;
     }
-    let listener = match caller.data().descriptors.get(fd) {
+    let (listener, family) = match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Listening { listener, .. },
-        ))) => *listener,
+            WasixTcpSocket::Listening {
+                listener, family, ..
+            },
+        ))) => (*listener, *family),
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => {
             return p1::errno::INVAL;
         }
@@ -4154,14 +4156,11 @@ where
         Ok(accepted) => accepted,
         Err(error) => return p1_errno_from_tcp_error_for_fdflags(error, fdflags),
     };
-    let peer_address = match accepted.address {
-        crate::NetworkIpAddress::Ipv4(address) => address,
-        crate::NetworkIpAddress::Ipv6(_) => return p1::errno::NOTSUP,
-    };
     let descriptor =
         Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
+            family,
             stream: accepted.stream,
-            peer_address,
+            peer_address: accepted.address,
             peer_port: accepted.port,
             options: WasixSocketOptions::default(),
         }));
@@ -4483,7 +4482,10 @@ where
                 return p1::errno::BADF;
             };
             let options = *slot.options();
-            *slot = WasixTcpSocket::Unconnected { options };
+            *slot = WasixTcpSocket::Unconnected {
+                family: slot.family(),
+                options,
+            };
             p1::errno::SUCCESS
         }
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
@@ -4508,7 +4510,10 @@ where
                 return p1::errno::BADF;
             };
             let options = *slot.options();
-            *slot = WasixUdpSocket::Unbound { options };
+            *slot = WasixUdpSocket::Unbound {
+                family: slot.family(),
+                options,
+            };
             p1::errno::SUCCESS
         }
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
@@ -4953,8 +4958,9 @@ mod tests {
 
     fn connected_socket() -> Preview1Descriptor {
         Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
+            family: WasixSocketFamily::Ipv4,
             stream: 9,
-            peer_address: crate::Ipv4Address::new([127, 0, 0, 1]),
+            peer_address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1])),
             peer_port: 80,
             options: WasixSocketOptions::default(),
         }))

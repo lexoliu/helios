@@ -37,7 +37,10 @@ pub struct P2ResolveAddressStream {
 }
 
 pub(super) struct P2ResolveAddressStreamState {
-    pub(super) result: Option<core::result::Result<Vec<crate::Ipv4Address>, crate::DnsError>>,
+    /// Every resolved address, in both families. `wasi:sockets`
+    /// `resolve-address-stream` promises no ordering, so the resolver's
+    /// own answer order is preserved.
+    pub(super) result: Option<core::result::Result<Vec<crate::NetworkIpAddress>, crate::DnsError>>,
     pub(super) cursor: usize,
 }
 
@@ -192,7 +195,7 @@ impl P2ResolveAddressStream {
 
     pub(crate) fn complete(
         &self,
-        result: core::result::Result<Vec<crate::Ipv4Address>, crate::DnsError>,
+        result: core::result::Result<Vec<crate::NetworkIpAddress>, crate::DnsError>,
     ) {
         self.inner.lock().result = Some(result);
         self.ready.notify_all();
@@ -213,7 +216,7 @@ impl P2ResolveAddressStream {
 
     pub(crate) fn next_address(
         &mut self,
-    ) -> core::result::Result<Option<crate::Ipv4Address>, crate::DnsError> {
+    ) -> core::result::Result<Option<crate::NetworkIpAddress>, crate::DnsError> {
         let mut state = self.inner.lock();
         let Some(result) = state.result.as_ref() else {
             return Err(crate::DnsError {
@@ -2285,9 +2288,35 @@ where
     }
 }
 
-pub(super) fn format_p3_ip_address(address: crate::Ipv4Address) -> socket_types::IpAddress {
-    let [a, b, c, d] = address.octets();
-    socket_types::IpAddress::Ipv4((a, b, c, d))
+pub(super) fn format_p3_ip_address(address: crate::NetworkIpAddress) -> socket_types::IpAddress {
+    match address {
+        crate::NetworkIpAddress::Ipv4(address) => {
+            let [a, b, c, d] = address.octets();
+            socket_types::IpAddress::Ipv4((a, b, c, d))
+        }
+        crate::NetworkIpAddress::Ipv6(address) => {
+            socket_types::IpAddress::Ipv6(ipv6_address_groups(address))
+        }
+    }
+}
+
+/// Splits an IPv6 address into the eight big-endian 16-bit groups the
+/// `wasi:sockets` `ipv6-address` tuple carries.
+pub(super) fn ipv6_address_groups(
+    address: helios_netstack::Ipv6Address,
+) -> (u16, u16, u16, u16, u16, u16, u16, u16) {
+    let octets = address.octets();
+    let group = |index: usize| u16::from_be_bytes([octets[index * 2], octets[index * 2 + 1]]);
+    (
+        group(0),
+        group(1),
+        group(2),
+        group(3),
+        group(4),
+        group(5),
+        group(6),
+        group(7),
+    )
 }
 
 pub(super) fn map_p3_dns_error(error: crate::DnsError) -> ip_name_lookup::ErrorCode {

@@ -1902,6 +1902,10 @@ const WASIX_ADDR_CIDR_IP4_ADDRESS_OFFSET: u32 = WASIX_ADDR_CIDR_UNION_OFFSET;
 const WASIX_ADDR_CIDR_IP4_PREFIX_OFFSET: u32 = WASIX_ADDR_CIDR_IP4_ADDRESS_OFFSET + 4;
 const WASIX_ADDR_PORT_UNION_OFFSET: u32 = 2;
 const WASIX_ADDR_PORT_IP4_ADDRESS_OFFSET: u32 = 4;
+/// `__wasi_addr_ip6_port_t` overlays `__wasi_addr_ip4_port_t` in the
+/// `__wasi_addr_port_t` union: both are `{ u16 port; address }`, so the
+/// address starts at the same offset and only its width differs.
+const WASIX_ADDR_PORT_IP6_ADDRESS_OFFSET: u32 = WASIX_ADDR_PORT_IP4_ADDRESS_OFFSET;
 const WASIX_ROUTE_SIZE: u32 = 176;
 const WASIX_ROUTE_CIDR_OFFSET: u32 = 0;
 const WASIX_ROUTE_ROUTER_OFFSET: u32 = 28;
@@ -2690,19 +2694,22 @@ mod tests {
     fn wasix_socket_operations_select_network_authority_by_socket_kind() {
         let tcp =
             Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
+                family: WasixSocketFamily::Ipv4,
                 stream: 1,
-                peer_address: crate::Ipv4Address::new([127, 0, 0, 1]),
+                peer_address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1])),
                 peer_port: 80,
                 options: WasixSocketOptions::default(),
             }));
         let udp_bound =
             Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
+                family: WasixSocketFamily::Ipv4,
                 socket: 2,
                 local_port: 5353,
                 options: WasixSocketOptions::default(),
             }));
         let udp_unbound =
             Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
+                family: WasixSocketFamily::Ipv4,
                 options: WasixSocketOptions::default(),
             }));
         let (left_writer, right_reader) = crate::byte_channel();
@@ -2783,10 +2790,12 @@ mod tests {
     #[test]
     fn wasix_multicast_preflight_accepts_udp_sockets_only() {
         let udp = Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
+                family: WasixSocketFamily::Ipv4,
             options: WasixSocketOptions::default(),
         }));
         let tcp =
             Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
+                family: WasixSocketFamily::Ipv4,
                 options: WasixSocketOptions::default(),
             }));
         let file = Preview1Descriptor::Stdout;
@@ -2849,6 +2858,30 @@ mod tests {
     }
 
     #[test]
+    fn wasix_socket_family_pins_wildcard_address_and_rejects_cross_family_peers() {
+        let v4 = crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([192, 0, 2, 1]));
+        let v6 = crate::NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::new([
+            0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+        ]));
+
+        // A wildcard bind means 0.0.0.0 on AF_INET and :: on AF_INET6.
+        assert_eq!(
+            WasixSocketFamily::Ipv4.unspecified_address(),
+            crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0]))
+        );
+        assert_eq!(
+            WasixSocketFamily::Ipv6.unspecified_address(),
+            crate::NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::UNSPECIFIED)
+        );
+
+        // There is no v4-mapped-v6 path: each family accepts only its own.
+        assert!(WasixSocketFamily::Ipv4.accepts(v4));
+        assert!(!WasixSocketFamily::Ipv4.accepts(v6));
+        assert!(WasixSocketFamily::Ipv6.accepts(v6));
+        assert!(!WasixSocketFamily::Ipv6.accepts(v4));
+    }
+
+    #[test]
     fn wasix_socket_creation_validates_family_and_protocol() {
         assert_eq!(
             wasix_validate_network_socket_request(
@@ -2874,19 +2907,39 @@ mod tests {
             ),
             Err(p1::errno::NOTSUP)
         );
+        // AF_INET6 is a supported family for both socket types; only
+        // AF_UNIX remains unsupported for network sockets.
         assert_eq!(
             wasix_validate_network_socket_request(
                 WASIX_ADDRESS_FAMILY_IP_INET6_I32,
                 WASIX_SOCK_TYPE_STREAM,
                 WASIX_IPPROTO_TCP_I32,
             ),
-            Err(p1::errno::NOTSUP)
+            Ok(())
         );
         assert_eq!(
             wasix_validate_network_socket_request(
                 WASIX_ADDRESS_FAMILY_IP_INET6_I32,
                 WASIX_SOCK_TYPE_DGRAM,
                 WASIX_IPPROTO_UDP_I32,
+            ),
+            Ok(())
+        );
+        // A mismatched protocol is still rejected within AF_INET6.
+        assert_eq!(
+            wasix_validate_network_socket_request(
+                WASIX_ADDRESS_FAMILY_IP_INET6_I32,
+                WASIX_SOCK_TYPE_STREAM,
+                WASIX_IPPROTO_UDP_I32,
+            ),
+            Err(p1::errno::INVAL)
+        );
+        // socket_pair stays AF_UNIX/AF_UNSPEC only.
+        assert_eq!(
+            wasix_validate_socket_pair_request(
+                WASIX_ADDRESS_FAMILY_IP_INET6_I32,
+                WASIX_SOCK_TYPE_STREAM,
+                0,
             ),
             Err(p1::errno::NOTSUP)
         );
@@ -3064,6 +3117,7 @@ mod tests {
     #[test]
     fn wasix_socket_size_options_are_descriptor_local_state() {
         let mut descriptor = WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
+                family: WasixSocketFamily::Ipv4,
             options: WasixSocketOptions::default(),
         });
 
@@ -3131,6 +3185,7 @@ mod tests {
     #[test]
     fn wasix_socket_flag_options_are_descriptor_local_state() {
         let mut descriptor = WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
+                family: WasixSocketFamily::Ipv4,
             options: WasixSocketOptions::default(),
         });
 
@@ -3184,6 +3239,7 @@ mod tests {
     #[test]
     fn wasix_socket_rejects_flags_the_netstack_cannot_honour() {
         let mut descriptor = WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
+                family: WasixSocketFamily::Ipv4,
             options: WasixSocketOptions::default(),
         });
 
@@ -3231,6 +3287,7 @@ mod tests {
     #[test]
     fn wasix_socket_size_options_clamp_to_netstack_capacity() {
         let mut descriptor = WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
+                family: WasixSocketFamily::Ipv4,
             options: WasixSocketOptions::default(),
         });
 
@@ -3288,6 +3345,7 @@ mod tests {
     #[test]
     fn wasix_socket_time_options_are_descriptor_local_state() {
         let mut descriptor = WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
+                family: WasixSocketFamily::Ipv4,
             options: WasixSocketOptions::default(),
         });
 

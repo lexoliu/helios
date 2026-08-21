@@ -3681,9 +3681,16 @@ where
     }
 }
 
-fn format_p2_ip_address(address: crate::Ipv4Address) -> p2lookup::IpAddress {
-    let [a, b, c, d] = address.octets();
-    p2lookup::IpAddress::Ipv4((a, b, c, d))
+fn format_p2_ip_address(address: crate::NetworkIpAddress) -> p2lookup::IpAddress {
+    match address {
+        crate::NetworkIpAddress::Ipv4(address) => {
+            let [a, b, c, d] = address.octets();
+            p2lookup::IpAddress::Ipv4((a, b, c, d))
+        }
+        crate::NetworkIpAddress::Ipv6(address) => p2lookup::IpAddress::Ipv6(
+            crate::wasmtime_adapter::wasi::net::ipv6_address_groups(address),
+        ),
+    }
 }
 
 fn map_p2_dns_error(error: crate::DnsError) -> p2lookup::ErrorCode {
