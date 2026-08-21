@@ -223,27 +223,43 @@ CPython, QuickJS, and local TCP throughput. Logs are written under
 `target/perf-baselines/`. Set `HELIOS_WORKLOAD_BENCH_WORKLOADS` to a
 comma-separated workload list when narrowing a run.
 
-The Helios/Linux gap report has three timing lines: Helios AArch64/HVF,
-native Fedora AArch64 under QEMU/HVF, and Wasmtime running the same wasm
-artifact inside that Fedora guest. Wasmtime-on-Linux is the floor: every
-workload with a `wasmtime_profile` entry in `tools/wasi-apps/workloads.json`
-must be beaten by Helios before the result is acceptable.
+The Helios/Linux gap report has three timing lines: Helios, native Fedora
+under QEMU, and Wasmtime running the same wasm artifact inside that Fedora
+guest. Wasmtime-on-Linux is the floor: every workload with a
+`wasmtime_profile` entry in `tools/wasi-apps/workloads.json` must be beaten by
+Helios before the result is acceptable.
 
 ```bash
-tools/wasi-apps/linux-gap-bench.sh \
-  --workload quickjs-loop \
-  --wasmtime-linux-bin /path/to/aarch64-linux/wasmtime
+tools/wasi-apps/linux-gap-bench.sh --workload quickjs-loop
 ```
 
-The benchmark itself must not depend on internet access. If the Fedora guest
-does not already contain Wasmtime, provide either `--wasmtime-linux-bin` with
-an AArch64 Linux executable or `--wasmtime-linux-archive` with a pre-staged
-AArch64 Linux Wasmtime tar archive. Workloads without `wasmtime_profile` are
-reported as uncovered by the floor rather than silently approximated through
-a different program or ABI. `wasi-tcp-throughput` is the standard WASI sockets
-network floor workload: Helios, Fedora native, and Wasmtime-on-Linux all
-receive the same deterministic 64 MiB local TCP stream, and Helios and
-Wasmtime execute the same wasm component.
+Both Linux lanes run in one Fedora Cloud guest whose architecture matches the
+host: aarch64 on an Apple Silicon or arm64 Linux machine, x86_64 on an x86
+machine. A guest of the other architecture only runs under cross-architecture
+TCG, where the cloud image's own systemd device and service timeouts expire
+before it finishes booting, so the tool refuses that combination and asks for
+the two lanes to be split with `--skip-helios` / `--skip-linux` — which is
+also how CI compares a Helios lane and a Linux lane running on identical
+hardware. `--linux-guest-arch` forces the guest architecture when a host
+really can emulate the other one. The accelerator follows the host as well:
+HVF on macOS, KVM where `/dev/kvm` is available, otherwise TCG, and a TCG
+guest additionally receives generous systemd unit, device, and udev event
+timeouts through cloud-init because every guest instruction is translated.
+
+Host-side assets are pinned: the per-architecture Fedora Cloud image is
+verified against the SHA256 published in the compose's signed `CHECKSUM` file
+on every run, and the Wasmtime Linux release matching the guest architecture
+is downloaded and unpacked beside it. Both are cached in the VM asset
+directory, and the guest itself still needs no internet access for the
+measured run. `--fedora-image-url` requires a matching
+`--fedora-image-sha256`; `--wasmtime-linux-bin` and `--wasmtime-linux-archive`
+override the staged Wasmtime with a local executable or tar archive for the
+guest architecture. Workloads without `wasmtime_profile` are reported as
+uncovered by the floor rather than silently approximated through a different
+program or ABI. `wasi-tcp-throughput` is the standard WASI sockets network
+floor workload: Helios, Fedora native, and Wasmtime-on-Linux all receive the
+same deterministic 64 MiB local TCP stream, and Helios and Wasmtime execute
+the same wasm component.
 
 To collect Wasmtime's native Linux profiling artifacts for the same wasm
 workloads, pass `--wasmtime-profile-workload <name>` to
