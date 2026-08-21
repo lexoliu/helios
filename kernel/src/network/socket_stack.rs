@@ -49,10 +49,11 @@ where
         host: &'a str,
         port: u16,
         local_port: u16,
+        hop_limit: u8,
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Service::TcpStream, crate::TcpError>> + Send + 'a {
         self.service
-            .tcp_connect_from(host, port, local_port, timeout_nanos)
+            .tcp_connect_from(host, port, local_port, hop_limit, timeout_nanos)
     }
 
     pub fn tcp_listen(
@@ -62,6 +63,7 @@ where
         local_address: NetworkIpAddress,
         local_port: u16,
         backlog: u16,
+        hop_limit: u8,
     ) -> impl Future<Output = Result<TcpListener<Service::TcpListener>, TcpError>> + Send + '_ {
         async move {
             if local_port < 1024 && privileged_bind.is_none() {
@@ -71,7 +73,7 @@ where
                 });
             }
             self.service
-                .tcp_listen(local_address, local_port, backlog)
+                .tcp_listen(local_address, local_port, backlog, hop_limit)
                 .await
         }
     }
@@ -319,6 +321,7 @@ mod tests {
             _: &str,
             _: u16,
             local_port: u16,
+            _: u8,
             _: u64,
         ) -> impl Future<Output = Result<Self::TcpStream, TcpError>> + Send + '_ {
             core::future::ready(Ok(u64::from(local_port)))
@@ -329,6 +332,7 @@ mod tests {
             _: NetworkIpAddress,
             _: u16,
             local_port: u16,
+            _: u8,
             _: u64,
         ) -> impl Future<Output = Result<Self::TcpStream, TcpError>> + Send + '_ {
             core::future::ready(Ok(if local_port == 0 {
@@ -343,12 +347,21 @@ mod tests {
             _: NetworkIpAddress,
             local_port: u16,
             _: u16,
+            _: u8,
         ) -> impl Future<Output = Result<TcpListener<Self::TcpListener>, TcpError>> + Send + '_
         {
             core::future::ready(Ok(TcpListener {
                 listener: 8,
                 local_port,
             }))
+        }
+
+        fn tcp_set_hop_limit(&self, _: Self::TcpStream, _: u8) -> Result<(), TcpError> {
+            Ok(())
+        }
+
+        fn tcp_listener_set_hop_limit(&self, _: Self::TcpListener, _: u8) -> Result<(), TcpError> {
+            Ok(())
         }
 
         fn tcp_accept(
@@ -414,6 +427,10 @@ mod tests {
         }
 
         fn udp_disconnect(&self, _: Self::UdpSocket) -> Result<(), UdpError> {
+            Ok(())
+        }
+
+        fn udp_set_hop_limit(&self, _: Self::UdpSocket, _: u8) -> Result<(), UdpError> {
             Ok(())
         }
 
@@ -495,11 +512,25 @@ mod tests {
             7
         );
         assert_eq!(
-            block_on(stack.tcp_connect_from(tcp, "localhost", 80, 4040, 1)).unwrap(),
+            block_on(stack.tcp_connect_from(
+                tcp,
+                "localhost",
+                80,
+                4040,
+                helios_netstack::DEFAULT_HOP_LIMIT,
+                1,
+            )).unwrap(),
             4040
         );
         let listener =
-            block_on(stack.tcp_listen(tcp, Some(privileged), TCP_ANY_V4, 53, 1)).unwrap();
+            block_on(stack.tcp_listen(
+                tcp,
+                Some(privileged),
+                TCP_ANY_V4,
+                53,
+                1,
+                helios_netstack::DEFAULT_HOP_LIMIT,
+            )).unwrap();
         assert_eq!(listener.local_port, 53);
         assert_eq!(
             block_on(stack.tcp_accept(tcp, listener.listener, 1))
@@ -538,7 +569,14 @@ mod tests {
         let tcp = authority.derive_tcp_cap().unwrap();
         let stack = SocketStack::new(TestNetworkService);
 
-        let error = block_on(stack.tcp_listen(tcp, None, TCP_ANY_V4, 53, 1)).unwrap_err();
+        let error = block_on(stack.tcp_listen(
+            tcp,
+            None,
+            TCP_ANY_V4,
+            53,
+            1,
+            helios_netstack::DEFAULT_HOP_LIMIT,
+        )).unwrap_err();
         assert_eq!(error.kind, crate::TcpErrorKind::PermissionDenied);
         assert_eq!(error.detail, NetworkErrorDetail::PrivilegedBindDenied);
     }
@@ -566,7 +604,14 @@ mod tests {
         let stack = SocketStack::new(TestNetworkService);
 
         assert_eq!(
-            block_on(stack.tcp_listen(tcp, None, TCP_ANY_V4, 8080, 1))
+            block_on(stack.tcp_listen(
+                tcp,
+                None,
+                TCP_ANY_V4,
+                8080,
+                1,
+                helios_netstack::DEFAULT_HOP_LIMIT,
+            ))
                 .unwrap()
                 .local_port,
             8080

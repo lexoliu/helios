@@ -189,10 +189,12 @@ where
         host: &'a str,
         port: u16,
         local_port: u16,
+        hop_limit: u8,
         timeout_nanos: u64,
     ) -> impl core::future::Future<Output = Result<Self::TcpStream, TcpError>> + Send + 'a {
         async move {
-            NetworkService::tcp_connect_from(self, host, port, local_port, timeout_nanos).await
+            NetworkService::tcp_connect_from(self, host, port, local_port, hop_limit, timeout_nanos)
+                .await
         }
     }
 
@@ -201,6 +203,7 @@ where
         remote_address: NetworkIpAddress,
         port: u16,
         local_port: u16,
+        hop_limit: u8,
         timeout_nanos: u64,
     ) -> impl core::future::Future<Output = Result<Self::TcpStream, TcpError>> + Send + '_ {
         async move {
@@ -209,6 +212,7 @@ where
                 remote_address,
                 port,
                 local_port,
+                hop_limit,
                 timeout_nanos,
             )
             .await
@@ -220,9 +224,24 @@ where
         local_address: NetworkIpAddress,
         local_port: u16,
         backlog: u16,
+        hop_limit: u8,
     ) -> impl core::future::Future<Output = Result<TcpListener<Self::TcpListener>, TcpError>> + Send + '_
     {
-        async move { NetworkService::tcp_listen(self, local_address, local_port, backlog).await }
+        async move {
+            NetworkService::tcp_listen(self, local_address, local_port, backlog, hop_limit).await
+        }
+    }
+
+    fn tcp_set_hop_limit(&self, stream: Self::TcpStream, hop_limit: u8) -> Result<(), TcpError> {
+        NetworkService::tcp_set_hop_limit(self, stream, hop_limit)
+    }
+
+    fn tcp_listener_set_hop_limit(
+        &self,
+        listener: Self::TcpListener,
+        hop_limit: u8,
+    ) -> Result<(), TcpError> {
+        NetworkService::tcp_listener_set_hop_limit(self, listener, hop_limit)
     }
 
     fn tcp_accept(
@@ -324,6 +343,10 @@ where
 
     fn udp_disconnect(&self, socket: Self::UdpSocket) -> Result<(), UdpError> {
         NetworkService::udp_disconnect(self, socket)
+    }
+
+    fn udp_set_hop_limit(&self, socket: Self::UdpSocket, hop_limit: u8) -> Result<(), UdpError> {
+        NetworkService::udp_set_hop_limit(self, socket, hop_limit)
     }
 
     fn udp_send<'a>(

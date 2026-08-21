@@ -53,14 +53,24 @@ use crate::wasmtime_adapter::component_host::{
 pub(crate) type FsNodeKind = crate::ComponentFsNodeKind;
 const FILE_READ_CHUNK_BYTES: usize = 1024 * 1024;
 const DEFAULT_WASI_UDP_BUFFER_BYTES: u64 = 64 * 1024;
-const DEFAULT_WASI_UDP_HOP_LIMIT: u8 = 64;
-const DEFAULT_WASI_TCP_HOP_LIMIT: u8 = 64;
+/// Receive window the netstack actually reserves per TCP socket.
+///
+/// `wasi:sockets` lets an implementation clamp a buffer-size hint and expects
+/// the getter to report the effective value, so this is the ceiling for
+/// `set-receive-buffer-size` rather than an arbitrary echo of the request.
+const WASI_TCP_RECEIVE_BUFFER_BYTES: u64 = helios_netstack::TCP_RECEIVE_WINDOW_BYTES as u64;
+/// Transmit buffer the netstack actually reserves per TCP socket.
+const WASI_TCP_SEND_BUFFER_BYTES: u64 = helios_netstack::TCP_TRANSMIT_BUFFER_BYTES as u64;
+const DEFAULT_WASI_UDP_HOP_LIMIT: u8 = helios_netstack::DEFAULT_HOP_LIMIT;
+const DEFAULT_WASI_TCP_HOP_LIMIT: u8 = helios_netstack::DEFAULT_HOP_LIMIT;
 const DEFAULT_WASI_TCP_LISTEN_BACKLOG: u16 = 128;
 const DEFAULT_WASI_TCP_KEEP_ALIVE_IDLE_NANOS: u64 = 7_200_000_000_000;
 const DEFAULT_WASI_TCP_KEEP_ALIVE_INTERVAL_NANOS: u64 = 75_000_000_000;
 const DEFAULT_WASI_TCP_KEEP_ALIVE_COUNT: u32 = 9;
 const MAX_WASI_UDP_DATAGRAM_BYTES: usize = u16::MAX as usize;
 const MAX_SYMLINK_DEPTH: usize = 16;
+/// 9p `QTDIR`: the qid type bit that marks a host-share object as a directory.
+pub(crate) const P9_QID_TYPE_DIRECTORY: u8 = 0x80;
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[error("guest requested wasi preview2 exit code {code}")]
@@ -387,6 +397,7 @@ mod tests {
             _: &str,
             _: u16,
             local_port: u16,
+            _: u8,
             _: u64,
         ) -> impl core::future::Future<Output = Result<Self::TcpStream, crate::TcpError>> + Send + '_
         {
@@ -398,6 +409,7 @@ mod tests {
             _: crate::NetworkIpAddress,
             _: u16,
             local_port: u16,
+            _: u8,
             _: u64,
         ) -> impl core::future::Future<Output = Result<Self::TcpStream, crate::TcpError>> + Send + '_
         {
@@ -413,6 +425,7 @@ mod tests {
             _: crate::NetworkIpAddress,
             local_port: u16,
             _: u16,
+            _: u8,
         ) -> impl core::future::Future<
             Output = Result<crate::TcpListener<Self::TcpListener>, crate::TcpError>,
         > + Send
@@ -421,6 +434,18 @@ mod tests {
                 listener: 8,
                 local_port,
             }))
+        }
+
+        fn tcp_set_hop_limit(&self, _: Self::TcpStream, _: u8) -> Result<(), crate::TcpError> {
+            Ok(())
+        }
+
+        fn tcp_listener_set_hop_limit(
+            &self,
+            _: Self::TcpListener,
+            _: u8,
+        ) -> Result<(), crate::TcpError> {
+            Ok(())
         }
 
         fn tcp_accept(
@@ -494,6 +519,10 @@ mod tests {
         }
 
         fn udp_disconnect(&self, _: Self::UdpSocket) -> Result<(), crate::UdpError> {
+            Ok(())
+        }
+
+        fn udp_set_hop_limit(&self, _: Self::UdpSocket, _: u8) -> Result<(), crate::UdpError> {
             Ok(())
         }
 
@@ -1392,6 +1421,96 @@ mod tests {
         assert!(matches!(error, fs_types::ErrorCode::IsDirectory));
     }
 
+    fn host_metadata(identity: ObjectIdentity, qid_type: u8) -> crate::HostMetadata {
+        crate::HostMetadata {
+            identity,
+            qid_path: identity.local(),
+            qid_type,
+            mode: 0o100_644,
+            size: 17,
+            link_count: 2,
+            access_nanos: 3_000_000_004,
+            modified_nanos: 5_000_000_006,
+            status_nanos: 7_000_000_008,
+        }
+    }
+
+    /// Host-share stat must carry the host's real timestamps and link count.
+    ///
+    /// They used to be reported as absent and `1`, which makes `make`, `rsync`,
+    /// and every other mtime-driven tool treat a shared file as ageless.
+    #[test]
+    fn host_stat_reports_host_timestamps_and_link_count() {
+        let identity = ObjectIdentity::new(AuthorityDomain::HOST_SHARE_9P, 4242);
+
+        let stat = super::descriptor_stat_from_host_metadata(&host_metadata(identity, 0));
+
+        assert!(matches!(stat.type_, fs_types::DescriptorType::RegularFile));
+        assert_eq!(stat.link_count, 2);
+        assert_eq!(stat.size, 17);
+        let access = stat
+            .data_access_timestamp
+            .expect("host stat must report an access timestamp");
+        let modified = stat
+            .data_modification_timestamp
+            .expect("host stat must report a modification timestamp");
+        let status = stat
+            .status_change_timestamp
+            .expect("host stat must report a status timestamp");
+        assert_eq!((access.seconds, access.nanoseconds), (3, 4));
+        assert_eq!((modified.seconds, modified.nanoseconds), (5, 6));
+        assert_eq!((status.seconds, status.nanoseconds), (7, 8));
+    }
+
+    #[test]
+    fn host_directory_metadata_maps_to_a_directory_descriptor_type() {
+        let identity = ObjectIdentity::new(AuthorityDomain::HOST_SHARE_9P, 9);
+
+        let stat = super::descriptor_stat_from_host_metadata(&host_metadata(
+            identity,
+            super::P9_QID_TYPE_DIRECTORY,
+        ));
+
+        assert!(matches!(stat.type_, fs_types::DescriptorType::Directory));
+    }
+
+    /// `st_dev`/`st_ino` are derived from object identity, so neither half may
+    /// be zero for a host-share file: programs de-duplicate by that pair.
+    #[test]
+    fn host_file_identity_yields_nonzero_device_and_inode() {
+        let identity = ObjectIdentity::new(AuthorityDomain::HOST_SHARE_9P, 4242);
+
+        assert_ne!(identity.domain().raw(), 0);
+        assert_ne!(identity.local(), 0);
+        assert_eq!(identity.local(), 4242);
+        assert_ne!(
+            identity.domain().raw(),
+            AuthorityDomain::GUEST_BOOTFS.raw(),
+            "the host share must not share a device id with bootfs"
+        );
+    }
+
+    /// Embedded nodes need the same guarantee: a distinct, nonzero inode per
+    /// object within one device.
+    #[test]
+    fn embedded_nodes_report_nonzero_distinct_inodes() {
+        let mut filesystem = test_filesystem();
+        filesystem.seed_bootfs(test_bootfs());
+
+        let root = filesystem
+            .identity_at_path("/")
+            .expect("root identity must resolve");
+        let program = filesystem
+            .identity_at_path("/bin/tool")
+            .expect("bootfs program identity must resolve");
+
+        assert_eq!(root.domain(), AuthorityDomain::GUEST_BOOTFS);
+        assert_eq!(program.domain(), root.domain());
+        assert_ne!(root.local(), 0);
+        assert_ne!(program.local(), 0);
+        assert_ne!(root.local(), program.local());
+    }
+
     #[test]
     fn descriptors_carry_stable_object_identity() {
         let mut filesystem = test_filesystem();
@@ -2052,8 +2171,15 @@ mod tests {
         assert_eq!(socket.hop_limit().unwrap(), 127);
     }
 
+    /// Enabling keepalive must fail rather than be recorded.
+    ///
+    /// The netstack has no keepalive timer, so a socket that accepted
+    /// `set-keep-alive-enabled(true)` would leave a guest believing dead peers
+    /// get detected. The timing knobs stay settable — `wasi:sockets` allows
+    /// them to be configured while keepalive is off — and reading them back
+    /// still reports what was stored.
     #[test]
-    fn tcp_socket_keep_alive_options_are_descriptor_local_state() {
+    fn tcp_socket_rejects_enabling_unsupported_keep_alive() {
         let service = ComponentHostNetworkService::from_service(TestNetworkService);
         let socket = TcpSocket::new(service, WasiTcpSocketFamily::Ipv4);
 
@@ -2071,9 +2197,14 @@ mod tests {
             DEFAULT_WASI_TCP_KEEP_ALIVE_COUNT
         );
 
+        assert!(matches!(
+            socket.set_keep_alive_enabled(true),
+            Err(socket_types::ErrorCode::NotSupported)
+        ));
+        assert!(!socket.keep_alive_enabled().unwrap());
         socket
-            .set_keep_alive_enabled(true)
-            .expect("keepalive enable must be accepted");
+            .set_keep_alive_enabled(false)
+            .expect("disabling keepalive matches what the stack already does");
         socket
             .set_keep_alive_idle_time(11)
             .expect("nonzero idle time must be accepted");
@@ -2084,7 +2215,7 @@ mod tests {
             .set_keep_alive_count(3)
             .expect("nonzero count must be accepted");
 
-        assert!(socket.keep_alive_enabled().unwrap());
+        assert!(!socket.keep_alive_enabled().unwrap());
         assert_eq!(socket.keep_alive_idle_time().unwrap(), 11);
         assert_eq!(socket.keep_alive_interval().unwrap(), 13);
         assert_eq!(socket.keep_alive_count().unwrap(), 3);

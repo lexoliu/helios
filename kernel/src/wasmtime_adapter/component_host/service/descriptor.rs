@@ -475,11 +475,26 @@ impl Default for WasixSocketOptions {
 }
 
 impl WasixSocketOptions {
+    /// Records a boolean socket option, refusing the ones the netstack has no
+    /// mechanism for.
+    ///
+    /// `SO_KEEPALIVE` has no keepalive timer behind it, and `TCP_NODELAY`
+    /// cleared is a request for Nagle's algorithm, which the stack does not
+    /// implement — it transmits as soon as the window allows. Accepting either
+    /// would report a behaviour change that never happens, so both are
+    /// answered with `ENOTSUP`; clearing keepalive and setting nodelay
+    /// describe what the stack already does and succeed.
     pub(super) fn set_flag(&mut self, option: i32, flag: bool) -> i32 {
         let bit = match wasix_socket_flag_bit(option) {
             Ok(bit) => bit,
             Err(errno) => return errno,
         };
+        match (option, flag) {
+            (WASIX_SOCK_OPTION_KEEP_ALIVE, true) | (WASIX_SOCK_OPTION_NO_DELAY, false) => {
+                return p1::errno::NOTSUP;
+            }
+            _ => {}
+        }
         if flag {
             self.flag_bits |= bit;
         } else {
@@ -488,18 +503,37 @@ impl WasixSocketOptions {
         p1::errno::SUCCESS
     }
 
+    /// Records a sized socket option.
+    ///
+    /// Buffer sizes clamp to what the netstack actually reserves per socket so
+    /// a read-back reports the effective value; `IP_TTL` is range-checked here
+    /// and pushed to the live socket by the syscall wrapper.
     pub(super) fn set_size(&mut self, option: i32, size: u64) -> i32 {
         match option {
-            WASIX_SOCK_OPTION_RECV_BUF_SIZE => self.receive_buffer_size = size,
-            WASIX_SOCK_OPTION_SEND_BUF_SIZE => self.send_buffer_size = size,
+            WASIX_SOCK_OPTION_RECV_BUF_SIZE => {
+                self.receive_buffer_size = size.min(WASIX_SOCKET_RECEIVE_BUFFER_CEILING);
+            }
+            WASIX_SOCK_OPTION_SEND_BUF_SIZE => {
+                self.send_buffer_size = size.min(WASIX_SOCKET_SEND_BUFFER_CEILING);
+            }
             WASIX_SOCK_OPTION_RECV_LOWAT => self.receive_low_water = size,
             WASIX_SOCK_OPTION_SEND_LOWAT => self.send_low_water = size,
-            WASIX_SOCK_OPTION_TTL => self.ttl = size,
+            WASIX_SOCK_OPTION_TTL => {
+                if size == 0 || size > u64::from(u8::MAX) {
+                    return p1::errno::INVAL;
+                }
+                self.ttl = size;
+            }
             WASIX_SOCK_OPTION_MULTICAST_TTL_V4 => self.multicast_ttl_v4 = size,
             WASIX_SOCK_OPTION_TYPE | WASIX_SOCK_OPTION_PROTO => return p1::errno::INVAL,
             _ => return p1::errno::INVAL,
         }
         p1::errno::SUCCESS
+    }
+
+    /// TTL to stamp on this socket's packets, as a netstack hop limit.
+    pub(super) fn hop_limit(self) -> u8 {
+        u8::try_from(self.ttl).unwrap_or(helios_netstack::DEFAULT_HOP_LIMIT)
     }
 
     pub(super) fn size(self, option: i32) -> Result<u64, i32> {
@@ -1155,6 +1189,15 @@ pub(super) fn p1_null_device_stat() -> fs_types::DescriptorStat {
     }
 }
 
+/// Stable identity of the synthetic `/dev/null` character device.
+///
+/// It has no backing filesystem object, so it gets the guest-device authority
+/// domain and a fixed inode: two `stat` calls on `/dev/null` must agree, and
+/// its `st_dev` must not collide with bootfs or the host share.
+pub(super) fn p1_null_device_identity() -> crate::ObjectIdentity {
+    crate::ObjectIdentity::new(crate::AuthorityDomain::GUEST_DEVICES, 1)
+}
+
 pub(super) fn p1_directory_descriptor(
     descriptor: Option<&Preview1Descriptor>,
 ) -> Option<&FsDescriptor> {
@@ -1333,18 +1376,7 @@ pub(super) fn p1_probe_descriptor(
 }
 
 pub(super) fn p1_descriptor_stat_from_host_metadata(
-    metadata: crate::HostMetadata,
+    metadata: &crate::HostMetadata,
 ) -> fs_types::DescriptorStat {
-    fs_types::DescriptorStat {
-        type_: if metadata.qid_type & 0x80 != 0 {
-            fs_types::DescriptorType::Directory
-        } else {
-            fs_types::DescriptorType::RegularFile
-        },
-        link_count: 1,
-        size: metadata.size,
-        data_access_timestamp: None,
-        data_modification_timestamp: None,
-        status_change_timestamp: None,
-    }
+    crate::wasmtime_adapter::wasi::descriptor_stat_from_host_metadata(metadata)
 }

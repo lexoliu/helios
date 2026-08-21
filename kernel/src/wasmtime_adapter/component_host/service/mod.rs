@@ -71,7 +71,12 @@ const WASIX_MODULE: &str = "wasix_32v1";
 const WASIX_NULL_DEVICE_PATH: &str = "/dev/null";
 const DEFAULT_WASIX_SOCKET_BUFFER_BYTES: u64 = 64 * 1024;
 const DEFAULT_WASIX_SOCKET_LOW_WATER_BYTES: u64 = 1;
-const DEFAULT_WASIX_SOCKET_TTL: u64 = 64;
+const DEFAULT_WASIX_SOCKET_TTL: u64 = helios_netstack::DEFAULT_HOP_LIMIT as u64;
+/// Ceiling for `SO_RCVBUF`: the receive window the netstack really reserves.
+/// A larger request is clamped so a read-back reports the effective size.
+const WASIX_SOCKET_RECEIVE_BUFFER_CEILING: u64 = helios_netstack::TCP_RECEIVE_WINDOW_BYTES as u64;
+/// Ceiling for `SO_SNDBUF`: the netstack's per-socket transmit buffer.
+const WASIX_SOCKET_SEND_BUFFER_CEILING: u64 = helios_netstack::TCP_TRANSMIT_BUFFER_BYTES as u64;
 const DEFAULT_WASIX_SOCKET_MULTICAST_TTL: u64 = 1;
 const WASIX_IPPROTO_TCP: u64 = 6;
 const WASIX_IPPROTO_UDP: u64 = 17;
@@ -3168,6 +3173,116 @@ mod tests {
             descriptor.options().flag(WASIX_SOCK_OPTION_RECV_BUF_SIZE),
             Err(p1::errno::INVAL)
         );
+    }
+
+    /// Options the netstack cannot honour must fail loudly.
+    ///
+    /// The stack has no keepalive timer and transmits as soon as the window
+    /// allows, so `SO_KEEPALIVE` on and `TCP_NODELAY` off are behaviours it
+    /// will never produce. Recording them silently would tell a guest its
+    /// connections are being probed or coalesced when they are not.
+    #[test]
+    fn wasix_socket_rejects_flags_the_netstack_cannot_honour() {
+        let mut descriptor = WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
+            options: WasixSocketOptions::default(),
+        });
+
+        assert_eq!(
+            descriptor
+                .options_mut()
+                .set_flag(WASIX_SOCK_OPTION_KEEP_ALIVE, true),
+            p1::errno::NOTSUP
+        );
+        assert_eq!(
+            descriptor.options().flag(WASIX_SOCK_OPTION_KEEP_ALIVE),
+            Ok(false)
+        );
+        assert_eq!(
+            descriptor
+                .options_mut()
+                .set_flag(WASIX_SOCK_OPTION_KEEP_ALIVE, false),
+            p1::errno::SUCCESS
+        );
+
+        assert_eq!(
+            descriptor
+                .options_mut()
+                .set_flag(WASIX_SOCK_OPTION_NO_DELAY, true),
+            p1::errno::SUCCESS
+        );
+        assert_eq!(
+            descriptor.options().flag(WASIX_SOCK_OPTION_NO_DELAY),
+            Ok(true)
+        );
+        assert_eq!(
+            descriptor
+                .options_mut()
+                .set_flag(WASIX_SOCK_OPTION_NO_DELAY, false),
+            p1::errno::NOTSUP
+        );
+        assert_eq!(
+            descriptor.options().flag(WASIX_SOCK_OPTION_NO_DELAY),
+            Ok(true)
+        );
+    }
+
+    /// Buffer hints clamp to the netstack's real per-socket reservations, and
+    /// a TTL outside the IP header's range is rejected instead of truncated.
+    #[test]
+    fn wasix_socket_size_options_clamp_to_netstack_capacity() {
+        let mut descriptor = WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
+            options: WasixSocketOptions::default(),
+        });
+
+        assert_eq!(
+            descriptor
+                .options_mut()
+                .set_size(WASIX_SOCK_OPTION_RECV_BUF_SIZE, u64::MAX),
+            p1::errno::SUCCESS
+        );
+        assert_eq!(
+            descriptor.options().receive_buffer_size,
+            WASIX_SOCKET_RECEIVE_BUFFER_CEILING
+        );
+        assert_eq!(
+            descriptor
+                .options_mut()
+                .set_size(WASIX_SOCK_OPTION_SEND_BUF_SIZE, u64::MAX),
+            p1::errno::SUCCESS
+        );
+        assert_eq!(
+            descriptor.options().send_buffer_size,
+            WASIX_SOCKET_SEND_BUFFER_CEILING
+        );
+
+        assert_eq!(
+            descriptor.options_mut().set_size(WASIX_SOCK_OPTION_TTL, 0),
+            p1::errno::INVAL
+        );
+        assert_eq!(
+            descriptor.options_mut().set_size(WASIX_SOCK_OPTION_TTL, 256),
+            p1::errno::INVAL
+        );
+        assert_eq!(descriptor.options().hop_limit(), DEFAULT_WASIX_SOCKET_TTL as u8);
+        assert_eq!(
+            descriptor.options_mut().set_size(WASIX_SOCK_OPTION_TTL, 9),
+            p1::errno::SUCCESS
+        );
+        assert_eq!(descriptor.options().hop_limit(), 9);
+    }
+
+    /// `/dev/null` has no backing filesystem object, so it needs a device id
+    /// of its own for `st_dev`/`st_ino` to stay distinct and stable.
+    #[test]
+    fn null_device_reports_a_stable_device_identity() {
+        let identity = p1_null_device_identity();
+
+        assert_eq!(identity, p1_null_device_identity());
+        assert_eq!(identity.domain(), crate::AuthorityDomain::GUEST_DEVICES);
+        assert_ne!(identity.domain(), crate::AuthorityDomain::GUEST_BOOTFS);
+        assert_ne!(identity.domain(), crate::AuthorityDomain::HOST_SHARE_9P);
+        assert_ne!(identity.domain().raw(), 0);
+        assert_ne!(identity.local(), 0);
     }
 
     #[test]

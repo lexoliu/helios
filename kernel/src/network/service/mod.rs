@@ -965,7 +965,12 @@ mod tests {
         });
 
         state
-            .start_tcp_connect(IpAddress::Ipv6(remote), 443, 0)
+            .start_tcp_connect(
+                IpAddress::Ipv6(remote),
+                443,
+                0,
+                helios_netstack::DEFAULT_HOP_LIMIT,
+            )
             .expect("IPv6 TCP connect should allocate a socket");
         state
             .stack
@@ -1451,6 +1456,7 @@ mod tests {
                 NetworkIpAddress::Ipv6(local),
                 8080,
                 TcpListenBacklog::new(1),
+                helios_netstack::DEFAULT_HOP_LIMIT,
             )
             .expect("IPv6 TCP listen should allocate a listener");
 

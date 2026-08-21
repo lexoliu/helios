@@ -584,6 +584,8 @@ where
     time_wait_deadline_nanos: Option<u64>,
     unacked_receive_segments: u8,
     pending_window_update_bytes: u32,
+    /// IPv4 TTL / IPv6 hop limit stamped on every frame this socket emits.
+    hop_limit: u8,
 }
 
 impl<C> TcpSocket<C>
@@ -630,7 +632,18 @@ where
             time_wait_deadline_nanos: None,
             unacked_receive_segments: 0,
             pending_window_update_bytes: 0,
+            hop_limit: crate::DEFAULT_HOP_LIMIT,
         }
+    }
+
+    /// IPv4 TTL / IPv6 hop limit this socket stamps on outgoing frames.
+    pub const fn hop_limit(&self) -> u8 {
+        self.hop_limit
+    }
+
+    /// Sets the TTL / hop limit for frames this socket emits from now on.
+    pub const fn set_hop_limit(&mut self, hop_limit: u8) {
+        self.hop_limit = hop_limit;
     }
 
     pub fn listen(local: TcpEndpoint, congestion: C) -> Self {

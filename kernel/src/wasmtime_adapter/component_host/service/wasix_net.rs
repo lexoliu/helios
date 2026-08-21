@@ -1441,7 +1441,58 @@ where
             None => p1::errno::BADF,
         };
     };
-    descriptor.options_mut().set_size(option, size)
+    let status = descriptor.options_mut().set_size(option, size);
+    if status != p1::errno::SUCCESS || option != WASIX_SOCK_OPTION_TTL {
+        return status;
+    }
+    // A socket that already exists in the netstack takes the new TTL now;
+    // one that has not connected, listened, or bound yet gets it applied at
+    // that point, so no packet ever leaves with a stale value.
+    let hop_limit = descriptor.options().hop_limit();
+    let target = wasix_socket_backend_handle(descriptor);
+    let Some(service) = caller.data().runtime_state.network_service() else {
+        return p1::errno::SUCCESS;
+    };
+    match target {
+        Some(WasixSocketBackendHandle::TcpStream(stream)) => service
+            .tcp_set_hop_limit(stream, hop_limit)
+            .map_or_else(p1_errno_from_tcp_error, |()| p1::errno::SUCCESS),
+        Some(WasixSocketBackendHandle::TcpListener(listener)) => service
+            .tcp_listener_set_hop_limit(listener, hop_limit)
+            .map_or_else(p1_errno_from_tcp_error, |()| p1::errno::SUCCESS),
+        Some(WasixSocketBackendHandle::UdpSocket(socket)) => service
+            .udp_set_hop_limit(socket, hop_limit)
+            .map_or_else(p1_errno_from_udp_error, |()| p1::errno::SUCCESS),
+        None => p1::errno::SUCCESS,
+    }
+}
+
+/// The netstack handle a WASIX socket descriptor currently owns, if any.
+enum WasixSocketBackendHandle {
+    TcpStream(u64),
+    TcpListener(u64),
+    UdpSocket(u64),
+}
+
+fn wasix_socket_backend_handle(
+    descriptor: &WasixSocketDescriptor,
+) -> Option<WasixSocketBackendHandle> {
+    match descriptor {
+        WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected { stream, .. }) => {
+            Some(WasixSocketBackendHandle::TcpStream(*stream))
+        }
+        WasixSocketDescriptor::Tcp(WasixTcpSocket::Listening { listener, .. }) => {
+            Some(WasixSocketBackendHandle::TcpListener(*listener))
+        }
+        WasixSocketDescriptor::Udp(WasixUdpSocket::Bound { socket, .. }) => {
+            Some(WasixSocketBackendHandle::UdpSocket(*socket))
+        }
+        WasixSocketDescriptor::Tcp(
+            WasixTcpSocket::Unconnected { .. } | WasixTcpSocket::Bound { .. },
+        )
+        | WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound { .. })
+        | WasixSocketDescriptor::Pair { .. } => None,
+    }
 }
 
 pub(super) fn wasix_sock_get_opt_size<CpuImpl, HostFs>(
@@ -1611,6 +1662,11 @@ where
                 return p1::errno::BADF;
             };
             let options = *slot.options();
+            // Nothing can leave a datagram socket before its bind completes,
+            // so applying the descriptor's TTL here covers every packet.
+            if let Err(error) = service.udp_set_hop_limit(binding.socket, options.hop_limit()) {
+                return p1_errno_from_udp_error(error);
+            }
             *slot = WasixUdpSocket::Bound {
                 socket: binding.socket,
                 local_port: binding.local_port,
@@ -1665,14 +1721,14 @@ where
         Ok(backlog) => backlog,
         Err(_) => return p1::errno::OVERFLOW,
     };
-    let local_port = match caller.data().descriptors.get(fd) {
+    let (local_port, hop_limit) = match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Unconnected { .. },
-        ))) => 0,
+            WasixTcpSocket::Unconnected { options },
+        ))) => (0, options.hop_limit()),
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Bound {
             local_port,
-            ..
-        }))) => *local_port,
+            options,
+        }))) => (*local_port, options.hop_limit()),
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => {
             return p1::errno::INVAL;
         }
@@ -1684,6 +1740,7 @@ where
             crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0])),
             local_port,
             backlog,
+            hop_limit,
         )
         .await
     {
@@ -1819,14 +1876,14 @@ where
     if status != p1::errno::SUCCESS {
         return status;
     }
-    let (local_port, connect_timeout) = match caller.data().descriptors.get(fd) {
+    let (local_port, connect_timeout, hop_limit) = match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
             WasixTcpSocket::Unconnected { options },
-        ))) => (0, options.connect_timeout),
+        ))) => (0, options.connect_timeout, options.hop_limit()),
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Bound {
             local_port,
             options,
-        }))) => (*local_port, options.connect_timeout),
+        }))) => (*local_port, options.connect_timeout, options.hop_limit()),
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
             WasixTcpSocket::Connected { .. },
         ))) => return p1::errno::INVAL,
@@ -1850,7 +1907,7 @@ where
     };
     let timeout = wasix_effective_socket_timeout(connect_timeout, fdflags);
     let stream = match service
-        .tcp_connect_from(host, port, local_port, timeout)
+        .tcp_connect_from(host, port, local_port, hop_limit, timeout)
         .await
     {
         Ok(stream) => stream,
@@ -2116,6 +2173,11 @@ where
                         Ok(binding) => binding,
                         Err(error) => return p1_errno_from_udp_error(error),
                     };
+                    if let Err(error) =
+                        service.udp_set_hop_limit(binding.socket, options.hop_limit())
+                    {
+                        return p1_errno_from_udp_error(error);
+                    }
                     let Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(slot))) =
                         caller.data_mut().descriptors.get_mut(fd)
                     else {
@@ -2201,6 +2263,39 @@ where
     }
 }
 
+/// Reads one range of a `sock_send_file` source descriptor.
+async fn wasix_read_send_file_range<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    file: &crate::wasmtime_adapter::wasi::FsDescriptor,
+    offset: u64,
+    count: usize,
+) -> Result<Bytes, i32>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    if let Some(host_path) = crate::guest_host_share_path(&file.path).map(ToOwned::to_owned) {
+        let service = caller
+            .data()
+            .filesystem
+            .host_service()
+            .map_err(p1_errno_from_fs)?;
+        let max_bytes = u32::try_from(count).map_err(|_| p1::errno::OVERFLOW)?;
+        return service
+            .read_file_range(&host_path, offset, max_bytes)
+            .await
+            .map(Bytes::from)
+            .map_err(|error| {
+                p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error))
+            });
+    }
+    caller
+        .data()
+        .filesystem
+        .read_file_chunk(file, offset, count)
+        .map_err(p1_errno_from_fs)
+}
+
 pub(super) async fn wasix_sock_send_file<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     out_fd: i32,
@@ -2233,12 +2328,10 @@ where
         Ok(count) => count,
         Err(_) => return p1::errno::OVERFLOW,
     };
-    let bytes = match caller
-        .data()
-        .filesystem
-        .read_file_chunk(&file, offset, count)
-        .map_err(p1_errno_from_fs)
-    {
+    // `sendfile` reads its source the same way `fd_pread` does: a host-share
+    // file is pulled over 9p for the requested range, everything else comes
+    // from the embedded node list.
+    let bytes = match wasix_read_send_file_range(caller, &file, offset, count).await {
         Ok(bytes) => bytes,
         Err(errno) => return errno,
     };

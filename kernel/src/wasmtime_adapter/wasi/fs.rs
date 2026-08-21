@@ -264,6 +264,46 @@ pub(super) enum FsWriteOffset {
     Append,
 }
 
+/// A host-share file a stream is bound to.
+///
+/// Streams carry their own service handle and host-relative path so each
+/// chunk can be driven from a `poll` context without re-entering the store.
+#[derive(Clone)]
+pub(crate) struct HostFileStreamTarget<HostFs>
+where
+    HostFs: crate::HostFileSystem,
+{
+    pub(crate) service: HostFs,
+    pub(crate) path: String,
+}
+
+impl<HostFs> HostFileStreamTarget<HostFs>
+where
+    HostFs: crate::HostFileSystem,
+{
+    /// Binds a descriptor to the host share when its path lives under the
+    /// host mount, otherwise reports that the embedded filesystem owns it.
+    pub(crate) fn for_descriptor<CpuImpl>(
+        store: &StoreData<CpuImpl, HostFs>,
+        descriptor: &FsDescriptor,
+    ) -> core::result::Result<Option<Self>, fs_types::ErrorCode>
+    where
+        CpuImpl: Cpu + Clone,
+    {
+        let Some(path) = crate::guest_host_share_path(&descriptor.path) else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            service: store.filesystem().host_service()?,
+            path: path.to_owned(),
+        }))
+    }
+}
+
+/// A 9p transfer a file stream started and is now waiting on.
+type PendingHostTransfer<T> =
+    Pin<Box<dyn core::future::Future<Output = core::result::Result<T, fs_types::ErrorCode>> + Send>>;
+
 pub(super) struct FileWriteConsumer<T, CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
@@ -272,6 +312,8 @@ where
     pub(super) getter: fn(&mut T) -> &mut StoreData<CpuImpl, HostFs>,
     pub(super) descriptor: FsDescriptor,
     pub(super) mode: FileWriteMode,
+    pub(super) host: Option<HostFileStreamTarget<HostFs>>,
+    pub(super) pending: Option<PendingHostTransfer<usize>>,
     pub(super) result: Option<oneshot::Sender<core::result::Result<(), fs_types::ErrorCode>>>,
 }
 
@@ -284,7 +326,26 @@ where
     pub(super) descriptor: FsDescriptor,
     pub(super) offset: u64,
     pub(super) chunk_bytes: usize,
+    pub(super) host: Option<HostFileStreamTarget<HostFs>>,
+    pub(super) pending: Option<PendingHostTransfer<Vec<u8>>>,
     pub(super) result: Option<oneshot::Sender<core::result::Result<(), fs_types::ErrorCode>>>,
+}
+
+// The in-flight 9p transfer is already heap-pinned, and nothing else in
+// either stream is address-sensitive, so both drive their pending future
+// directly from `Pin<&mut Self>`.
+impl<T, CpuImpl, HostFs> Unpin for FileReadStreamProducer<T, CpuImpl, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+}
+
+impl<T, CpuImpl, HostFs> Unpin for FileWriteConsumer<T, CpuImpl, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
 }
 
 impl<T, CpuImpl, HostFs> FileReadStreamProducer<T, CpuImpl, HostFs>
@@ -297,6 +358,7 @@ where
         descriptor: FsDescriptor,
         offset: u64,
         chunk_bytes: usize,
+        host: Option<HostFileStreamTarget<HostFs>>,
         result: oneshot::Sender<core::result::Result<(), fs_types::ErrorCode>>,
     ) -> Self {
         Self {
@@ -304,6 +366,8 @@ where
             descriptor,
             offset,
             chunk_bytes,
+            host,
+            pending: None,
             result: Some(result),
         }
     }
@@ -312,6 +376,25 @@ where
         if let Some(tx) = self.result.take() {
             let _ = tx.send(result);
         }
+    }
+
+    /// Starts the next bounded host read.
+    ///
+    /// Only `chunk_bytes` are ever in flight, so a stream over a multi-gigabyte
+    /// host file never holds more than one chunk of kernel memory.
+    fn start_host_read(&mut self, capacity: Option<usize>) {
+        let Some(host) = self.host.clone() else {
+            return;
+        };
+        let request = capacity.unwrap_or(self.chunk_bytes).min(self.chunk_bytes);
+        let max_bytes = u32::try_from(request).unwrap_or(u32::MAX);
+        let offset = self.offset;
+        self.pending = Some(Box::pin(async move {
+            host.service
+                .read_file_range(&host.path, offset, max_bytes)
+                .await
+                .map_err(map_host_fs_error)
+        }));
     }
 }
 
@@ -335,7 +418,7 @@ where
 
     fn poll_produce<'a>(
         mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         mut store: wasmtime::StoreContextMut<'_, T>,
         mut destination: Destination<'a, Self::Item, Self::Buffer>,
         finish: bool,
@@ -343,6 +426,56 @@ where
         if finish {
             self.complete(Ok(()));
             return Poll::Ready(Ok(StreamResult::Cancelled));
+        }
+
+        if self.host.is_some() {
+            if self.descriptor.kind != FsNodeKind::File {
+                self.complete(Err(fs_types::ErrorCode::IsDirectory));
+                return Poll::Ready(Ok(StreamResult::Dropped));
+            }
+            if !self.descriptor.flags.contains(fs_types::DescriptorFlags::READ) {
+                self.complete(Err(fs_types::ErrorCode::NotPermitted));
+                return Poll::Ready(Ok(StreamResult::Dropped));
+            }
+            loop {
+                if self.pending.is_none() {
+                    let capacity = destination.remaining(&mut store);
+                    if capacity == Some(0) {
+                        return Poll::Ready(Ok(StreamResult::Completed));
+                    }
+                    self.start_host_read(capacity);
+                }
+                let pending = self
+                    .pending
+                    .as_mut()
+                    .expect("host read future must be present before polling");
+                match pending.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(bytes)) if bytes.is_empty() => {
+                        self.pending = None;
+                        self.complete(Ok(()));
+                        return Poll::Ready(Ok(StreamResult::Dropped));
+                    }
+                    Poll::Ready(Ok(bytes)) => {
+                        self.pending = None;
+                        self.offset = self
+                            .offset
+                            .checked_add(
+                                u64::try_from(bytes.len()).expect("read chunk size overflowed u64"),
+                            )
+                            .ok_or_else(|| {
+                                wasmtime::Error::new(WasiAdapterTrap::FileReadOffsetOverflow)
+                            })?;
+                        destination.set_buffer(BytesStreamBuffer::new(Bytes::from(bytes)));
+                        return Poll::Ready(Ok(StreamResult::Completed));
+                    }
+                    Poll::Ready(Err(error)) => {
+                        self.pending = None;
+                        self.complete(Err(error));
+                        return Poll::Ready(Ok(StreamResult::Dropped));
+                    }
+                }
+            }
         }
 
         let getter = self.getter;
@@ -383,12 +516,15 @@ where
         getter: fn(&mut T) -> &mut StoreData<CpuImpl, HostFs>,
         descriptor: FsDescriptor,
         offset: usize,
+        host: Option<HostFileStreamTarget<HostFs>>,
         result: oneshot::Sender<core::result::Result<(), fs_types::ErrorCode>>,
     ) -> Self {
         Self {
             getter,
             descriptor,
             mode: FileWriteMode::At(offset),
+            host,
+            pending: None,
             result: Some(result),
         }
     }
@@ -396,12 +532,15 @@ where
     pub(super) fn new_append(
         getter: fn(&mut T) -> &mut StoreData<CpuImpl, HostFs>,
         descriptor: FsDescriptor,
+        host: Option<HostFileStreamTarget<HostFs>>,
         result: oneshot::Sender<core::result::Result<(), fs_types::ErrorCode>>,
     ) -> Self {
         Self {
             getter,
             descriptor,
             mode: FileWriteMode::Append,
+            host,
+            pending: None,
             result: Some(result),
         }
     }
@@ -410,6 +549,40 @@ where
         if let Some(tx) = self.result.take() {
             let _ = tx.send(result);
         }
+    }
+
+    /// Starts the 9p transfer for one batch of stream bytes.
+    ///
+    /// Positional writes carry the stream offset; append writes resolve the
+    /// host's end of file inside the client so a concurrently grown file is
+    /// never overwritten. Both resolve with the number of bytes handed over.
+    fn start_host_write(&mut self, bytes: Vec<u8>) {
+        let Some(host) = self.host.clone() else {
+            return;
+        };
+        let mode = match &self.mode {
+            FileWriteMode::At(offset) => FileWriteMode::At(*offset),
+            FileWriteMode::Append => FileWriteMode::Append,
+        };
+        self.pending = Some(Box::pin(async move {
+            let written = bytes.len();
+            match mode {
+                FileWriteMode::At(offset) => {
+                    let offset = u64::try_from(offset).expect("file offset overflowed u64");
+                    host.service
+                        .write_file(&host.path, offset, &bytes)
+                        .await
+                        .map_err(map_host_fs_error)?;
+                }
+                FileWriteMode::Append => {
+                    host.service
+                        .append_file(&host.path, &bytes)
+                        .await
+                        .map_err(map_host_fs_error)?;
+                }
+            }
+            Ok(written)
+        }));
     }
 }
 
@@ -432,11 +605,54 @@ where
 
     fn poll_consume(
         mut self: Pin<&mut Self>,
-        _: &mut Context<'_>,
+        cx: &mut Context<'_>,
         mut store: wasmtime::StoreContextMut<'_, T>,
         mut source: Source<'_, Self::Item>,
         _: bool,
     ) -> Poll<Result<StreamResult>> {
+        if self.host.is_some() {
+            if self.descriptor.kind != FsNodeKind::File {
+                self.complete(Err(fs_types::ErrorCode::IsDirectory));
+                return Poll::Ready(Ok(StreamResult::Dropped));
+            }
+            if !self.descriptor.flags.contains(fs_types::DescriptorFlags::WRITE) {
+                self.complete(Err(fs_types::ErrorCode::NotPermitted));
+                return Poll::Ready(Ok(StreamResult::Dropped));
+            }
+            loop {
+                if self.pending.is_none() {
+                    let available = source.remaining(&mut store);
+                    if available == 0 {
+                        return Poll::Ready(Ok(StreamResult::Completed));
+                    }
+                    let mut bytes = Vec::with_capacity(available);
+                    source.read(&mut store, &mut bytes)?;
+                    self.start_host_write(bytes);
+                }
+                let pending = self
+                    .pending
+                    .as_mut()
+                    .expect("host write future must be present before polling");
+                match pending.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(written)) => {
+                        self.pending = None;
+                        if let FileWriteMode::At(offset) = &mut self.mode {
+                            *offset = offset
+                                .checked_add(written)
+                                .expect("file write offset overflowed usize");
+                        }
+                        return Poll::Ready(Ok(StreamResult::Completed));
+                    }
+                    Poll::Ready(Err(error)) => {
+                        self.pending = None;
+                        self.complete(Err(error));
+                        return Poll::Ready(Ok(StreamResult::Dropped));
+                    }
+                }
+            }
+        }
+
         let available = source.remaining(&mut store);
         if available == 0 {
             return Poll::Ready(Ok(StreamResult::Completed));
@@ -579,33 +795,10 @@ where
         ));
     }
 
-    /// Cache host file content in the embedded FS so that subsequent stream
-    /// reads can proceed synchronously without async 9p I/O.
-    pub(crate) fn seed_host_file_content(
-        &mut self,
-        path: &str,
-        identity: ObjectIdentity,
-        content: Vec<u8>,
-    ) {
-        let mut state = self.snapshot.inner.lock();
-        if let Some(node) = state.node_mut(path) {
-            node.identity = identity;
-            node.contents = Bytes::from(content);
-            return;
-        }
-        state.insert_node(FsNode::new(
-            path.to_owned(),
-            FsNodeKind::File,
-            Bytes::from(content),
-            identity,
-            0,
-            true,
-        ));
-    }
-
-    /// Drop any cached embedded nodes mirroring a host subtree. Called after
-    /// mutating operations (remove, rename) so stale placeholder nodes do
-    /// not linger.
+    /// Drops the embedded nodes mirroring a host subtree.
+    ///
+    /// Only directory listings are mirrored, so this clears stale directory
+    /// entries after a remove or rename rather than any cached file content.
     pub(crate) fn invalidate_host_subtree(&mut self, path: &str) {
         let mut state = self.snapshot.inner.lock();
         state.retain_nodes(|node| {
@@ -706,11 +899,7 @@ where
     }
 
     pub(super) fn descriptor_type(kind: FsNodeKind) -> fs_types::DescriptorType {
-        match kind {
-            FsNodeKind::Directory => fs_types::DescriptorType::Directory,
-            FsNodeKind::File => fs_types::DescriptorType::RegularFile,
-            FsNodeKind::Symlink => fs_types::DescriptorType::SymbolicLink,
-        }
+        descriptor_type_from_node_kind(kind)
     }
 
     pub(super) fn descriptor_identity(
@@ -808,12 +997,10 @@ where
         &self,
         path: &str,
     ) -> core::result::Result<fs_types::DescriptorStat, fs_types::ErrorCode> {
-        // Host paths are normally handled asynchronously in the WASI
-        // trait impl, but fall through to the embedded view when the
-        // node has already been seeded (open_at eagerly mirrors the
-        // host file/directory). If neither exists, return NoEntry
-        // instead of panicking so programs see a proper filesystem
-        // error.
+        // Host paths are answered asynchronously in the WASI trait impls,
+        // which never reach here. What does reach here for a host path is a
+        // directory node mirrored by `seed_host_directory_entries`; anything
+        // else is genuinely absent and reports NoEntry rather than panicking.
         self.with_node(path, |node| {
             let size = Self::node_size(node);
             Ok(fs_types::DescriptorStat {
@@ -827,13 +1014,21 @@ where
         })
     }
 
+    /// Object identity of an embedded node, for surfaces that report
+    /// `st_dev`/`st_ino` rather than a metadata hash.
+    pub(crate) fn identity_at_path(
+        &self,
+        path: &str,
+    ) -> core::result::Result<ObjectIdentity, fs_types::ErrorCode> {
+        self.with_node(path, |node| Ok(node.identity))
+    }
+
     pub(crate) fn metadata_hash(
         &self,
         path: &str,
     ) -> core::result::Result<fs_types::MetadataHashValue, fs_types::ErrorCode> {
-        // Host paths are normally handled asynchronously in the WASI
-        // trait impl, but fall through to the embedded view when the
-        // node has already been seeded.
+        // Host paths are answered asynchronously in the WASI trait impls;
+        // only mirrored host directories reach the embedded view here.
         self.with_node(path, |node| {
             let size = Self::node_size(node);
             Ok(metadata_hash_value(
@@ -847,10 +1042,9 @@ where
         &self,
         path: &str,
     ) -> core::result::Result<Vec<fs_types::DirectoryEntry>, fs_types::ErrorCode> {
-        // Host directories are eagerly seeded into the embedded FS by
-        // `open_at`, so reading them here walks the same embedded node
-        // list as guest-owned directories. If nothing was seeded, just
-        // report NoEntry.
+        // Opening a host directory seeds its direct children into the
+        // embedded FS, so listing one walks the same node list as a
+        // guest-owned directory. If nothing was seeded, report NoEntry.
         let node = self.get_node(path)?;
         if node.kind != FsNodeKind::Directory {
             return Err(fs_types::ErrorCode::NotDirectory);
@@ -904,9 +1098,10 @@ where
         offset: u64,
         max_bytes: usize,
     ) -> core::result::Result<Bytes, fs_types::ErrorCode> {
-        // Host file contents are eagerly cached during `open_at`, so
-        // stream reads always fall through to the embedded node list.
-        // If the node is missing, return NoEntry.
+        // Host file contents are never cached here: a stream over a host
+        // file carries its own `HostFileStreamTarget` and pulls bounded
+        // chunks over 9p instead. This path serves embedded nodes only, and
+        // a missing node is NoEntry.
         let node = self.get_node(&descriptor.path)?;
         if node.kind != FsNodeKind::File {
             return Err(fs_types::ErrorCode::IsDirectory);
@@ -1055,10 +1250,11 @@ where
     where
         Fill: FnOnce(&mut [u8]),
     {
-        // Host-backed writes would require an async flush path; stream
-        // consumers run in sync poll contexts, so we must not block here.
-        // Writing to host files is not yet supported; callers see a clean
-        // error rather than a hang.
+        // This is the synchronous embedded-filesystem writer. Host-share
+        // writes go through the 9p client from the async WASI entry points
+        // and the stream consumer, both of which branch on the path before
+        // calling here; reaching this with a host path would mean a caller
+        // bypassed that routing.
         if self.host_path(&descriptor.path).is_some() {
             return Err(fs_types::ErrorCode::Unsupported);
         }
@@ -1691,6 +1887,43 @@ pub(crate) fn preopen_descriptor(preopen: &crate::DirectoryPreopen) -> FsDescrip
     }
 }
 
+/// Node kind of a host-share object, from its 9p qid type bits.
+pub(crate) fn host_metadata_node_kind(metadata: &crate::HostMetadata) -> FsNodeKind {
+    if metadata.qid_type & P9_QID_TYPE_DIRECTORY != 0 {
+        FsNodeKind::Directory
+    } else {
+        FsNodeKind::File
+    }
+}
+
+/// Builds a WASI `descriptor-stat` from host-share metadata.
+///
+/// Timestamps and link count come from the host's own `Rgetattr`, so a guest
+/// sees the same mtime the host does. Object identity is not part of
+/// `descriptor-stat`; p2/p3 expose it through `metadata-hash` and preview1
+/// through `st_dev`/`st_ino`, both derived from
+/// [`crate::HostMetadata::identity`].
+pub(crate) fn descriptor_stat_from_host_metadata(
+    metadata: &crate::HostMetadata,
+) -> fs_types::DescriptorStat {
+    fs_types::DescriptorStat {
+        type_: descriptor_type_from_node_kind(host_metadata_node_kind(metadata)),
+        link_count: metadata.link_count,
+        size: metadata.size,
+        data_access_timestamp: Some(system_time_from_nanos(metadata.access_nanos)),
+        data_modification_timestamp: Some(system_time_from_nanos(metadata.modified_nanos)),
+        status_change_timestamp: Some(system_time_from_nanos(metadata.status_nanos)),
+    }
+}
+
+pub(crate) fn descriptor_type_from_node_kind(kind: FsNodeKind) -> fs_types::DescriptorType {
+    match kind {
+        FsNodeKind::Directory => fs_types::DescriptorType::Directory,
+        FsNodeKind::File => fs_types::DescriptorType::RegularFile,
+        FsNodeKind::Symlink => fs_types::DescriptorType::SymbolicLink,
+    }
+}
+
 pub(crate) fn metadata_hash_value(
     identity: ObjectIdentity,
     upper_entropy: u64,
@@ -1819,10 +2052,18 @@ where
     )> {
         let getter = accessor.getter();
         let descriptor = get_fs_descriptor(accessor.get(), &descriptor)?;
+        let host = HostFileStreamTarget::for_descriptor(accessor.get(), &descriptor)?;
         let (tx, rx) = oneshot::channel();
         let stream = StreamReader::new(
             &mut accessor,
-            FileReadStreamProducer::new(getter, descriptor, offset, FILE_READ_CHUNK_BYTES, tx),
+            FileReadStreamProducer::new(
+                getter,
+                descriptor,
+                offset,
+                FILE_READ_CHUNK_BYTES,
+                host,
+                tx,
+            ),
         )?;
         let future = FutureReader::new(&mut accessor, async move {
             match rx.await {
@@ -1843,14 +2084,17 @@ where
         let offset: usize = offset
             .try_into()
             .map_err(|_| wasmtime::Error::new(WasiAdapterTrap::FileWriteOffsetOverflow))?;
-        let descriptor = get_fs_descriptor(accessor.get(), &descriptor);
+        let descriptor = get_fs_descriptor(accessor.get(), &descriptor).and_then(|descriptor| {
+            let host = HostFileStreamTarget::for_descriptor(accessor.get(), &descriptor)?;
+            Ok((descriptor, host))
+        });
         let getter = accessor.getter();
         match descriptor {
-            Ok(descriptor) => {
+            Ok((descriptor, host)) => {
                 let (tx, rx) = oneshot::channel();
                 data.pipe(
                     &mut accessor,
-                    FileWriteConsumer::new_at(getter, descriptor, offset, tx),
+                    FileWriteConsumer::new_at(getter, descriptor, offset, host, tx),
                 )?;
                 FutureReader::new(&mut accessor, async move {
                     match rx.await {
@@ -1873,14 +2117,17 @@ where
         descriptor: Resource<FsDescriptor>,
         mut data: StreamReader<u8>,
     ) -> Result<FutureReader<core::result::Result<(), fs_types::ErrorCode>>> {
-        let descriptor = get_fs_descriptor(accessor.get(), &descriptor);
+        let descriptor = get_fs_descriptor(accessor.get(), &descriptor).and_then(|descriptor| {
+            let host = HostFileStreamTarget::for_descriptor(accessor.get(), &descriptor)?;
+            Ok((descriptor, host))
+        });
         let getter = accessor.getter();
         match descriptor {
-            Ok(descriptor) => {
+            Ok((descriptor, host)) => {
                 let (tx, rx) = oneshot::channel();
                 data.pipe(
                     &mut accessor,
-                    FileWriteConsumer::new_append(getter, descriptor, tx),
+                    FileWriteConsumer::new_append(getter, descriptor, host, tx),
                 )?;
                 FutureReader::new(&mut accessor, async move {
                     match rx.await {
@@ -1911,8 +2158,11 @@ where
         })
     }
 
-    async fn sync_data(_: &Accessor<U, Self>, _: Resource<FsDescriptor>) -> Result<(), FsError> {
-        Ok(())
+    async fn sync_data(
+        accessor: &Accessor<U, Self>,
+        descriptor: Resource<FsDescriptor>,
+    ) -> Result<(), FsError> {
+        sync_descriptor(accessor, descriptor).await
     }
 
     async fn get_flags(
@@ -2060,8 +2310,11 @@ where
         }
     }
 
-    async fn sync(_: &Accessor<U, Self>, _: Resource<FsDescriptor>) -> Result<(), FsError> {
-        Ok(())
+    async fn sync(
+        accessor: &Accessor<U, Self>,
+        descriptor: Resource<FsDescriptor>,
+    ) -> Result<(), FsError> {
+        sync_descriptor(accessor, descriptor).await
     }
 
     async fn create_directory_at(
@@ -2141,18 +2394,7 @@ where
                 .stat_path(&host_path)
                 .await
                 .map_err(map_host_fs_error)?;
-            let result = fs_types::DescriptorStat {
-                type_: if metadata.qid_type & 0x80 != 0 {
-                    fs_types::DescriptorType::Directory
-                } else {
-                    fs_types::DescriptorType::RegularFile
-                },
-                link_count: 1,
-                size: metadata.size,
-                data_access_timestamp: None,
-                data_modification_timestamp: None,
-                status_change_timestamp: None,
-            };
+            let result = descriptor_stat_from_host_metadata(&metadata);
             record_component_fs_profile(profile, "stat");
             return Ok(result);
         }
@@ -2192,18 +2434,7 @@ where
                 .stat_path(&host_path)
                 .await
                 .map_err(map_host_fs_error)?;
-            let result = fs_types::DescriptorStat {
-                type_: if metadata.qid_type & 0x80 != 0 {
-                    fs_types::DescriptorType::Directory
-                } else {
-                    fs_types::DescriptorType::RegularFile
-                },
-                link_count: 1,
-                size: metadata.size,
-                data_access_timestamp: None,
-                data_modification_timestamp: None,
-                status_change_timestamp: None,
-            };
+            let result = descriptor_stat_from_host_metadata(&metadata);
             record_component_fs_profile(profile, "stat-at");
             return Ok(result);
         }
@@ -2402,11 +2633,7 @@ where
             let metadata = service.stat_path(&host_path).await;
             match metadata {
                 Ok(metadata) => {
-                    let kind = if metadata.qid_type & 0x80 != 0 {
-                        FsNodeKind::Directory
-                    } else {
-                        FsNodeKind::File
-                    };
+                    let kind = host_metadata_node_kind(&metadata);
                     if open_flags.contains(fs_types::OpenFlags::EXCLUSIVE)
                         && open_flags.contains(fs_types::OpenFlags::CREATE)
                     {
@@ -2436,28 +2663,20 @@ where
                             .await
                             .map_err(map_host_fs_error)?;
                     }
-                    // For host files, eagerly read the content so that
-                    // subsequent stream reads work synchronously without
-                    // needing async 9p I/O inside poll_produce.
+                    // Host files are not materialised in kernel memory here:
+                    // the descriptor only records where the file lives, and
+                    // `read-via-stream` pulls bounded chunks over 9p as the
+                    // guest consumes them.
                     if kind == FsNodeKind::File {
-                        let content = service
-                            .read_file(&host_path)
-                            .await
-                            .map_err(map_host_fs_error)?;
                         let opened = FsDescriptor {
-                            path: absolute.clone(),
+                            path: absolute,
                             kind,
                             flags: descriptor_flags,
                             identity: Some(metadata.identity),
                         };
-                        let result = accessor.with(|mut access| {
-                            access.get().filesystem_mut().seed_host_file_content(
-                                &absolute,
-                                metadata.identity,
-                                content,
-                            );
-                            access.get().table.push(opened).map_err(FsError::trap)
-                        });
+                        let result = accessor
+                            .with(|mut access| access.get().table.push(opened))
+                            .map_err(FsError::trap);
                         record_component_fs_profile(profile, "open-at");
                         return result;
                     }
@@ -2914,6 +3133,43 @@ where
         record_component_fs_profile(profile, "metadata-hash-at");
         result
     }
+}
+
+/// Flushes a descriptor's host-side buffers.
+///
+/// `sync` and `sync-data` differ only in whether inode metadata is included;
+/// 9p exposes a single `Tfsync`, which the host translates to `fsync`, so both
+/// take the same path for the host share. The embedded filesystem holds every
+/// node in memory with no write-back stage, so there is nothing a sync could
+/// flush there — that no-op is the correct answer, not a missing feature, and
+/// is spelled out here rather than left implicit.
+async fn sync_descriptor<U, CpuImpl, HostFs>(
+    accessor: &Accessor<U, HasSelf<StoreData<CpuImpl, HostFs>>>,
+    descriptor: Resource<FsDescriptor>,
+) -> Result<(), FsError>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let path = accessor.with(|mut access| {
+        let descriptor = get_fs_descriptor(access.get(), &descriptor)?;
+        Ok::<_, FsError>(descriptor.path.clone())
+    })?;
+    let Some(host_path) = crate::guest_host_share_path(&path).map(|path| path.to_owned()) else {
+        return Ok(());
+    };
+    let service = accessor.with(|mut access| {
+        access
+            .get()
+            .filesystem()
+            .host_service()
+            .map_err(FsError::from)
+    })?;
+    service
+        .sync_file(&host_path)
+        .await
+        .map_err(map_host_fs_error)?;
+    Ok(())
 }
 
 pub(super) fn get_fs_descriptor<CpuImpl, HostFs>(

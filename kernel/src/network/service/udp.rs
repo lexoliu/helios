@@ -29,6 +29,13 @@ where
         self.execute_udp_disconnect(socket)
     }
 
+    /// Retargets a bound datagram socket's IPv4 TTL / IPv6 hop limit.
+    pub fn udp_set_hop_limit(&self, socket: UdpSocketId, hop_limit: u8) -> Result<(), UdpError> {
+        self.inner
+            .state
+            .with_handle(socket, |state| state.set_udp_hop_limit(socket, hop_limit))
+    }
+
     pub async fn udp_send(
         &self,
         socket: UdpSocketId,
@@ -362,6 +369,20 @@ impl NetworkShard {
             .unwrap_or_else(|| panic!("UDP socket disappeared during connect"));
         state.binding = binding;
         Ok(())
+    }
+
+    pub(super) fn set_udp_hop_limit(
+        &mut self,
+        socket: UdpSocketId,
+        hop_limit: u8,
+    ) -> Result<(), UdpError> {
+        let stack_socket = self.udp_socket(socket)?.stack_socket;
+        self.stack
+            .set_udp_hop_limit(stack_socket, hop_limit)
+            .map_err(|_| UdpError {
+                kind: UdpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::UnknownUdpSocket,
+            })
     }
 
     pub(super) fn disconnect_udp_socket(&mut self, socket: UdpSocketId) -> Result<(), UdpError> {

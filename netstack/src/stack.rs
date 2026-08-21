@@ -703,6 +703,8 @@ struct UdpSocketSlab {
 struct UdpSocketState {
     binding: UdpSocketBinding,
     pending_error: Option<UdpSocketError>,
+    /// IPv4 TTL / IPv6 hop limit stamped on datagrams this socket sends.
+    hop_limit: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1632,6 +1634,7 @@ impl UdpSocketState {
         Self {
             binding,
             pending_error: None,
+            hop_limit: crate::DEFAULT_HOP_LIMIT,
         }
     }
 }
@@ -1705,6 +1708,10 @@ impl UdpSocketSlab {
 
     fn get(&self, index: usize) -> Option<&UdpSocketState> {
         self.sockets.get(index).and_then(Option::as_ref)
+    }
+
+    fn get_mut(&mut self, index: usize) -> Option<&mut UdpSocketState> {
+        self.sockets.get_mut(index).and_then(Option::as_mut)
     }
 
     fn binding_free(&self, binding: UdpSocketBinding) -> bool {
@@ -2721,6 +2728,55 @@ where
     /// ours, so the socket remains writable. A full transmit queue parks
     /// writability until ACKs drain capacity — reporting writable there
     /// would spin poll/epoll callers whose next write accepts zero bytes.
+    /// Hop limit of the socket behind a transmit-queue index.
+    ///
+    /// The drive loop batches frames by index and queues them after the
+    /// per-socket borrow ends, so the option is read back here rather than
+    /// carried through every batch tuple.
+    fn tcp_socket_hop_limit(&self, index: usize) -> u8 {
+        self.tcp
+            .get(index)
+            .map_or(crate::DEFAULT_HOP_LIMIT, TcpSocket::hop_limit)
+    }
+
+    /// IPv4 TTL / IPv6 hop limit a TCP socket stamps on its frames.
+    pub fn tcp_hop_limit(&self, socket: SocketId) -> Result<u8, StackError> {
+        Ok(self.tcp_socket(socket)?.hop_limit())
+    }
+
+    /// Sets the TTL / hop limit for a TCP socket's outgoing frames.
+    ///
+    /// A listener passes its value on to every connection it accepts, so
+    /// setting it before `listen` covers the SYN-ACK and everything after.
+    pub fn set_tcp_hop_limit(
+        &mut self,
+        socket: SocketId,
+        hop_limit: u8,
+    ) -> Result<(), StackError> {
+        self.tcp_socket_mut(socket)?.set_hop_limit(hop_limit);
+        Ok(())
+    }
+
+    /// Hop limit a UDP socket stamps on its datagrams.
+    pub fn udp_hop_limit(&self, socket: UdpSocketId) -> Result<u8, StackError> {
+        Ok(self.udp_socket(socket)?.hop_limit)
+    }
+
+    /// Sets the TTL / hop limit for a UDP socket's outgoing datagrams.
+    pub fn set_udp_hop_limit(
+        &mut self,
+        socket: UdpSocketId,
+        hop_limit: u8,
+    ) -> Result<(), StackError> {
+        let index = udp_socket_index(socket);
+        self.udp_socket(socket)?;
+        self.udp
+            .get_mut(index)
+            .expect("UDP socket disappeared after a successful lookup")
+            .hop_limit = hop_limit;
+        Ok(())
+    }
+
     pub fn tcp_send_ready(&self, socket: SocketId) -> Result<bool, StackError> {
         let socket = self.tcp_socket(socket)?;
         Ok(matches!(
@@ -2850,6 +2906,7 @@ where
         }
 
         for (index, local, remote, header, options) in pending_syn {
+            let hop_limit = self.tcp_socket_hop_limit(index);
             if self.queue_tcp(
                 local,
                 remote,
@@ -2857,6 +2914,7 @@ where
                 options,
                 TcpTxPayload::Flat(&[]),
                 index as u16,
+                hop_limit,
                 now,
             )? {
                 let socket = self
@@ -2868,6 +2926,7 @@ where
             }
         }
         for (index, local, remote, header, options) in pending_syn_ack {
+            let hop_limit = self.tcp_socket_hop_limit(index);
             if self.queue_tcp(
                 local,
                 remote,
@@ -2875,6 +2934,7 @@ where
                 options,
                 TcpTxPayload::Flat(&[]),
                 index as u16,
+                hop_limit,
                 now,
             )? {
                 let socket = self
@@ -2886,6 +2946,7 @@ where
             }
         }
         for (index, local, remote, header, options) in pending_ack {
+            let hop_limit = self.tcp_socket_hop_limit(index);
             if self.queue_tcp(
                 local,
                 remote,
@@ -2893,6 +2954,7 @@ where
                 options,
                 TcpTxPayload::Flat(&[]),
                 index as u16,
+                hop_limit,
                 now,
             )? {
                 let socket = self
@@ -2906,6 +2968,7 @@ where
         for (index, segment) in pending_retransmit {
             let sequence = segment.header.sequence;
             let identification = segment.sequence_len as u16;
+            let hop_limit = self.tcp_socket_hop_limit(index);
             if self.queue_tcp(
                 segment.local,
                 segment.remote,
@@ -2913,6 +2976,7 @@ where
                 segment.options,
                 self.tcp_tx_payload(&segment.payload),
                 identification,
+                hop_limit,
                 now,
             )? {
                 let socket = self
@@ -2925,6 +2989,7 @@ where
         }
         for (index, segment) in pending_data {
             let identification = segment.sequence_len as u16;
+            let hop_limit = self.tcp_socket_hop_limit(index);
             self.queue_tcp(
                 segment.local,
                 segment.remote,
@@ -2932,6 +2997,7 @@ where
                 segment.options,
                 self.tcp_tx_payload(&segment.payload),
                 identification,
+                hop_limit,
                 now,
             )?;
             self.schedule_tcp_timer(index);
@@ -3047,7 +3113,9 @@ where
         identification: u16,
         now: StackInstant,
     ) -> Result<usize, StackError> {
-        let binding = self.udp_socket(socket)?.binding;
+        let socket_state = self.udp_socket(socket)?;
+        let binding = socket_state.binding;
+        let hop_limit = socket_state.hop_limit;
         if binding
             .remote
             .is_some_and(|remote| remote.address != destination || remote.port != destination_port)
@@ -3056,39 +3124,55 @@ where
         }
         match (binding.local_address, destination) {
             (Some(IpAddress::Ipv4(source)), IpAddress::Ipv4(destination)) => self
-                .send_udp_ipv4_from(
+                .send_udp_ipv4_from_with_hop_limit(
                     source,
                     binding.local_port,
                     destination,
                     destination_port,
                     payload,
                     identification,
+                    hop_limit,
                     now,
                 ),
             (Some(IpAddress::Ipv6(source)), IpAddress::Ipv6(destination)) => self
-                .send_udp_ipv6_from(
+                .send_udp_ipv6_from_with_hop_limit(
                     source,
                     binding.local_port,
                     destination,
                     destination_port,
                     payload,
+                    hop_limit,
                     now,
                 ),
-            (None, IpAddress::Ipv4(destination)) => self.send_udp_ipv4(
-                binding.local_port,
-                destination,
-                destination_port,
-                payload,
-                identification,
-                now,
-            ),
-            (None, IpAddress::Ipv6(destination)) => self.send_udp_ipv6(
-                binding.local_port,
-                destination,
-                destination_port,
-                payload,
-                now,
-            ),
+            (None, IpAddress::Ipv4(destination)) => {
+                let Some(source) = self.source_ipv4_for(destination) else {
+                    return Err(StackError::Unroutable);
+                };
+                self.send_udp_ipv4_from_with_hop_limit(
+                    source,
+                    binding.local_port,
+                    destination,
+                    destination_port,
+                    payload,
+                    identification,
+                    hop_limit,
+                    now,
+                )
+            }
+            (None, IpAddress::Ipv6(destination)) => {
+                let Some(source) = self.source_ipv6_for(destination) else {
+                    return Err(StackError::Unroutable);
+                };
+                self.send_udp_ipv6_from_with_hop_limit(
+                    source,
+                    binding.local_port,
+                    destination,
+                    destination_port,
+                    payload,
+                    hop_limit,
+                    now,
+                )
+            }
             (Some(_), _) => Err(StackError::AddressFamilyMismatch),
         }
     }
@@ -3126,6 +3210,33 @@ where
         identification: u16,
         now: StackInstant,
     ) -> Result<usize, StackError> {
+        self.send_udp_ipv4_from_with_hop_limit(
+            source,
+            source_port,
+            destination,
+            destination_port,
+            payload,
+            identification,
+            crate::DEFAULT_HOP_LIMIT,
+            now,
+        )
+    }
+
+    /// Sends an IPv4 datagram with an explicit TTL.
+    ///
+    /// Socket sends route here so a guest's `set-unicast-hop-limit` reaches
+    /// the wire; the positional entry points above keep the stack default.
+    fn send_udp_ipv4_from_with_hop_limit(
+        &mut self,
+        source: Ipv4Address,
+        source_port: u16,
+        destination: Ipv4Address,
+        destination_port: u16,
+        payload: &[u8],
+        identification: u16,
+        hop_limit: u8,
+        now: StackInstant,
+    ) -> Result<usize, StackError> {
         let next_hop = self.next_hop(IpAddress::Ipv4(destination));
         let next_hop = match next_hop {
             Some(IpAddress::Ipv4(next_hop)) => next_hop,
@@ -3151,6 +3262,7 @@ where
             destination_mac,
             payload,
             identification,
+            hop_limit,
         )
     }
 
@@ -3184,6 +3296,28 @@ where
         payload: &[u8],
         now: StackInstant,
     ) -> Result<usize, StackError> {
+        self.send_udp_ipv6_from_with_hop_limit(
+            source,
+            source_port,
+            destination,
+            destination_port,
+            payload,
+            crate::DEFAULT_HOP_LIMIT,
+            now,
+        )
+    }
+
+    /// Sends an IPv6 datagram with an explicit hop limit.
+    fn send_udp_ipv6_from_with_hop_limit(
+        &mut self,
+        source: Ipv6Address,
+        source_port: u16,
+        destination: Ipv6Address,
+        destination_port: u16,
+        payload: &[u8],
+        hop_limit: u8,
+        now: StackInstant,
+    ) -> Result<usize, StackError> {
         let next_hop = self.next_hop(IpAddress::Ipv6(destination));
         let next_hop = match next_hop {
             Some(IpAddress::Ipv6(next_hop)) => next_hop,
@@ -3206,6 +3340,7 @@ where
             destination_port,
             destination_mac,
             payload,
+            hop_limit,
         )
     }
 
@@ -3218,6 +3353,7 @@ where
         destination_mac: EthernetAddress,
         payload: &[u8],
         identification: u16,
+        hop_limit: u8,
     ) -> Result<usize, StackError> {
         let udp_len = UdpPacket::HEADER_LEN
             .checked_add(payload.len())
@@ -3245,7 +3381,7 @@ where
                 crate::IpProtocol::Udp,
                 udp_len,
                 identification,
-                64,
+                hop_limit,
             )
             .ok_or(StackError::OutputQueueFull)?;
             let transport_offset = offset;
@@ -3278,6 +3414,7 @@ where
         destination_port: u16,
         destination_mac: EthernetAddress,
         payload: &[u8],
+        hop_limit: u8,
     ) -> Result<usize, StackError> {
         let udp_len = UdpPacket::HEADER_LEN
             .checked_add(payload.len())
@@ -3304,7 +3441,7 @@ where
                 destination,
                 crate::IpProtocol::Udp,
                 udp_len,
-                64,
+                hop_limit,
             )
             .ok_or(StackError::OutputQueueFull)?;
             let transport_offset = offset;
@@ -3360,6 +3497,7 @@ where
         options: TcpHeaderOptions,
         payload: TcpTxPayload<'_>,
         identification: u16,
+        hop_limit: u8,
         now: StackInstant,
     ) -> Result<bool, StackError> {
         match (local.address, remote.address) {
@@ -3370,10 +3508,11 @@ where
                 options,
                 payload,
                 identification,
+                hop_limit,
                 now,
             ),
             (IpAddress::Ipv6(source), IpAddress::Ipv6(destination)) => {
-                self.queue_tcp_ipv6(source, destination, header, options, payload, now)
+                self.queue_tcp_ipv6(source, destination, header, options, payload, hop_limit, now)
             }
             _ => panic!("TCP endpoint address families must match"),
         }
@@ -3387,6 +3526,7 @@ where
         options: TcpHeaderOptions,
         payload: TcpTxPayload<'_>,
         identification: u16,
+        hop_limit: u8,
         now: StackInstant,
     ) -> Result<bool, StackError> {
         let tcp_len = TcpPacket::MIN_HEADER_LEN
@@ -3436,6 +3576,7 @@ where
                         options,
                         payload,
                         identification,
+                        hop_limit,
                         checksum,
                     )
                 },
@@ -3452,6 +3593,7 @@ where
                 options,
                 payload,
                 identification,
+                hop_limit,
                 checksum,
             )?;
             Ok(true)
@@ -3465,6 +3607,7 @@ where
         header: TcpHeader,
         options: TcpHeaderOptions,
         payload: TcpTxPayload<'_>,
+        hop_limit: u8,
         now: StackInstant,
     ) -> Result<bool, StackError> {
         let tcp_len = TcpPacket::MIN_HEADER_LEN
@@ -3513,6 +3656,7 @@ where
                         header,
                         options,
                         payload,
+                        hop_limit,
                         checksum,
                     )
                 },
@@ -3528,6 +3672,7 @@ where
                 header,
                 options,
                 payload,
+                hop_limit,
                 checksum,
             )?;
             Ok(true)
@@ -4099,6 +4244,7 @@ where
                     TcpHeaderOptions::empty(),
                     TcpTxPayload::Flat(&[]),
                     packet.acknowledgement as u16,
+                    crate::DEFAULT_HOP_LIMIT,
                     now,
                 )?;
             }
@@ -4130,6 +4276,7 @@ where
                 let initial_sequence = (now.nanos() as u32)
                     .wrapping_add(u32::from(packet.destination_port))
                     .wrapping_add(u32::from(packet.source_port));
+                let listener_hop_limit = listener.hop_limit();
                 let mut child = TcpSocket::accept(
                     local,
                     remote_endpoint,
@@ -4137,6 +4284,7 @@ where
                     initial_sequence,
                     self.congestion.clone(),
                 );
+                child.set_hop_limit(listener_hop_limit);
                 child.record_peer_options(packet);
                 let child = self.insert_tcp(child);
                 self.tcp_listener_children[socket_index(child)] = Some(listener_socket);
@@ -4151,6 +4299,7 @@ where
                 TcpHeaderOptions::empty(),
                 TcpTxPayload::Flat(&[]),
                 packet.sequence as u16,
+                crate::DEFAULT_HOP_LIMIT,
                 now,
             )?;
         }
@@ -5058,6 +5207,7 @@ fn encode_tcp_ipv4_frame(
     options: TcpHeaderOptions,
     payload: TcpTxPayload<'_>,
     identification: u16,
+    hop_limit: u8,
     checksum: TransportChecksum,
 ) -> Result<(), StackError> {
     let storage = frame.storage_mut();
@@ -5075,7 +5225,7 @@ fn encode_tcp_ipv4_frame(
         crate::IpProtocol::Tcp,
         tcp_len,
         identification,
-        64,
+        hop_limit,
     )
     .ok_or(StackError::OutputQueueFull)?;
     let transport_offset = offset;
@@ -5129,6 +5279,7 @@ fn encode_tcp_ipv6_frame(
     header: TcpHeader,
     options: TcpHeaderOptions,
     payload: TcpTxPayload<'_>,
+    hop_limit: u8,
     checksum: TransportChecksum,
 ) -> Result<(), StackError> {
     let storage = frame.storage_mut();
@@ -5145,7 +5296,7 @@ fn encode_tcp_ipv6_frame(
         destination,
         crate::IpProtocol::Tcp,
         tcp_len,
-        64,
+        hop_limit,
     )
     .ok_or(StackError::OutputQueueFull)?;
     let transport_offset = offset;
@@ -6054,6 +6205,7 @@ mod tests {
                     TcpHeaderOptions::empty(),
                     TcpTxPayload::Flat(&[]),
                     1,
+                    crate::DEFAULT_HOP_LIMIT,
                     StackInstant::from_nanos(1),
                 )
                 .expect("first ACK should queue")
@@ -6067,6 +6219,7 @@ mod tests {
                     TcpHeaderOptions::empty(),
                     TcpTxPayload::Flat(&[]),
                     2,
+                    crate::DEFAULT_HOP_LIMIT,
                     StackInstant::from_nanos(2),
                 )
                 .expect("replacement ACK should queue")
@@ -6119,6 +6272,7 @@ mod tests {
                     TcpHeaderOptions::empty(),
                     TcpTxPayload::Flat(&[]),
                     1,
+                    crate::DEFAULT_HOP_LIMIT,
                     StackInstant::from_nanos(1),
                 )
                 .expect("first ACK should queue")
@@ -6132,6 +6286,7 @@ mod tests {
                     TcpHeaderOptions::empty(),
                     TcpTxPayload::Flat(&[]),
                     2,
+                    crate::DEFAULT_HOP_LIMIT,
                     StackInstant::from_nanos(2),
                 )
                 .expect("different sequence ACK should queue")
@@ -7028,6 +7183,100 @@ mod tests {
         assert!(stack.take_outbound().is_none());
     }
 
+    /// A socket's TTL must reach the wire, not just the socket record.
+    ///
+    /// The datagram path stamped a hardcoded 64 before, so `IP_TTL` and
+    /// `set-unicast-hop-limit` were accepted and then discarded.
+    #[test]
+    fn udp_send_stamps_the_socket_hop_limit_on_the_ipv4_header() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let group = Ipv4Address::new([224, 0, 0, 251]);
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        let socket = stack
+            .open_udp(UdpSocketBinding::wildcard(4040))
+            .expect("wildcard UDP socket should bind");
+        assert_eq!(stack.udp_hop_limit(socket), Ok(crate::DEFAULT_HOP_LIMIT));
+
+        stack
+            .set_udp_hop_limit(socket, 7)
+            .expect("bound UDP socket should accept a hop limit");
+        assert_eq!(stack.udp_hop_limit(socket), Ok(7));
+        assert_eq!(
+            stack.send_udp(
+                socket,
+                IpAddress::Ipv4(group),
+                5353,
+                b"ttl",
+                1,
+                StackInstant::from_nanos(1),
+            ),
+            Ok(b"ttl".len())
+        );
+
+        let frame = stack.take_outbound().expect("UDP frame should be queued");
+        let ipv4 = Ipv4Packet::parse(&frame.as_slice()[EthernetFrame::HEADER_LEN..])
+            .expect("IPv4 packet should parse");
+        assert_eq!(ipv4.hop_limit, 7);
+    }
+
+    /// A listener's hop limit has to survive into the connections it accepts,
+    /// so the SYN-ACK and everything after carries the guest's TTL.
+    #[test]
+    fn accepted_connections_inherit_the_listener_hop_limit() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(peer),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        let listener = stack
+            .open_tcp_listen(
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(local),
+                    port: 8080,
+                },
+                TcpListenBacklog::new(1),
+            )
+            .expect("listener should open");
+        stack
+            .set_tcp_hop_limit(listener, 9)
+            .expect("listener should accept a hop limit");
+
+        let (syn, syn_len) = tcp_segment(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 4040,
+                destination_port: 8080,
+                sequence: 1000,
+                acknowledgement: 0,
+                flags: TcpFlags::SYN,
+                window_size: u16::MAX,
+            },
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&syn[..syn_len]),
+                StackInstant::from_nanos(1),
+            )
+            .expect("SYN should be accepted by the listener");
+        stack
+            .drive_tcp(StackInstant::from_nanos(2))
+            .expect("stack should emit the SYN-ACK");
+
+        let frame = stack.take_outbound().expect("SYN-ACK should be queued");
+        let ipv4 = Ipv4Packet::parse(&frame.as_slice()[EthernetFrame::HEADER_LEN..])
+            .expect("IPv4 packet should parse");
+        assert_eq!(ipv4.hop_limit, 9);
+    }
+
     #[test]
     fn udp_send_with_tx_offload_seeds_pseudo_sum_and_metadata() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
@@ -7136,6 +7385,7 @@ mod tests {
                     TcpHeaderOptions::empty(),
                     TcpTxPayload::Scatter(&payload),
                     1,
+                    crate::DEFAULT_HOP_LIMIT,
                     StackInstant::from_nanos(1),
                 )
                 .expect("scatter TCP segment should queue")

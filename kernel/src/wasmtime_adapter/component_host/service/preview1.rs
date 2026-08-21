@@ -1291,20 +1291,20 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_datasync",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>, fd: i32| -> i32 {
-                p1_fd_datasync(&mut caller, fd)
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>, (fd,): (i32,)| {
+                Box::new(async move { p1_fd_datasync(&mut caller, fd).await })
             },
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_sync",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>, fd: i32| -> i32 {
-                p1_fd_sync(&mut caller, fd)
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>, (fd,): (i32,)| {
+                Box::new(async move { p1_fd_sync(&mut caller, fd).await })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -2311,31 +2311,48 @@ where
         caller.data().descriptors.get(fd),
         Some(Preview1Descriptor::NullDevice)
     ) {
-        return p1_write_filestat(caller, stat, p1_null_device_stat());
+        return p1_write_filestat(caller, stat, p1_null_device_identity(), p1_null_device_stat());
     }
-    let Some(path) = p1_descriptor_path(caller.data().descriptors.get(fd)) else {
+    let Some(path) = p1_descriptor_path(caller.data().descriptors.get(fd)).map(ToOwned::to_owned)
+    else {
         return p1::errno::BADF;
     };
-    let stat_value = if let Some(host_path) =
-        crate::guest_host_share_path(path).map(ToOwned::to_owned)
-    {
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        match service.stat_path(&host_path).await {
-            Ok(metadata) => p1_descriptor_stat_from_host_metadata(metadata),
-            Err(error) => {
-                return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
-            }
-        }
-    } else {
-        match caller.data().filesystem.stat(path) {
-            Ok(stat) => stat,
-            Err(error) => return p1_errno_from_fs(error),
-        }
+    let (identity, stat_value) = match p1_stat_absolute_path(caller, &path).await {
+        Ok(stat) => stat,
+        Err(errno) => return errno,
     };
-    p1_write_filestat(caller, stat, stat_value)
+    p1_write_filestat(caller, stat, identity, stat_value)
+}
+
+/// Resolves a guest-absolute path to its object identity and descriptor stat.
+///
+/// Host-share paths take the async 9p route so `st_dev`/`st_ino`, link count,
+/// and timestamps all come from the host's own `Rgetattr`; embedded paths read
+/// the in-memory node, whose identity is allocated once per object.
+pub(super) async fn p1_stat_absolute_path<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    path: &str,
+) -> Result<(crate::ObjectIdentity, fs_types::DescriptorStat), i32>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    if let Some(host_path) = crate::guest_host_share_path(path).map(ToOwned::to_owned) {
+        let service = caller
+            .data()
+            .filesystem
+            .host_service()
+            .map_err(p1_errno_from_fs)?;
+        let metadata = service.stat_path(&host_path).await.map_err(|error| {
+            p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error))
+        })?;
+        let stat = p1_descriptor_stat_from_host_metadata(&metadata);
+        return Ok((metadata.identity, stat));
+    }
+    let filesystem = &caller.data().filesystem;
+    let identity = filesystem.identity_at_path(path).map_err(p1_errno_from_fs)?;
+    let stat = filesystem.stat(path).map_err(p1_errno_from_fs)?;
+    Ok((identity, stat))
 }
 
 pub(super) async fn p1_fd_filestat_set_size<CpuImpl, HostFs>(
@@ -2514,7 +2531,7 @@ where
         .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
 }
 
-pub(super) fn p1_fd_datasync<CpuImpl, HostFs>(
+pub(super) async fn p1_fd_datasync<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
 ) -> i32
@@ -2522,10 +2539,10 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    p1_fd_advise(caller, fd)
+    p1_fd_sync_impl(caller, fd).await
 }
 
-pub(super) fn p1_fd_sync<CpuImpl, HostFs>(
+pub(super) async fn p1_fd_sync<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
 ) -> i32
@@ -2533,7 +2550,41 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    p1_fd_advise(caller, fd)
+    p1_fd_sync_impl(caller, fd).await
+}
+
+/// Backs `fd_sync` and `fd_datasync`.
+///
+/// A descriptor on the host share is flushed with a real 9p `Tfsync`; 9p has
+/// no separate data-only barrier, so both entry points map to it. Descriptors
+/// on the embedded filesystem, on stdio, and on `/dev/null` have no
+/// write-back stage to flush, so success there is an accurate answer and not
+/// a silent skip.
+async fn p1_fd_sync_impl<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    fd: i32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let Some(descriptor) = caller.data().descriptors.get(fd) else {
+        return p1::errno::BADF;
+    };
+    let host_path = p1_descriptor_path(Some(descriptor))
+        .and_then(crate::guest_host_share_path)
+        .map(ToOwned::to_owned);
+    let Some(host_path) = host_path else {
+        return p1::errno::SUCCESS;
+    };
+    let service = match caller.data().filesystem.host_service() {
+        Ok(service) => service,
+        Err(error) => return p1_errno_from_fs(error),
+    };
+    match service.sync_file(&host_path).await {
+        Ok(()) => p1::errno::SUCCESS,
+        Err(error) => p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error)),
+    }
 }
 
 pub(super) async fn p1_fd_pread<CpuImpl, HostFs>(
@@ -3078,13 +3129,11 @@ where
         .host_service()
         .map_err(p1_errno_from_fs)?;
     let metadata = service.stat_path(&host_path).await;
-    let (kind, identity, contents, descriptor_flags) = match metadata {
+    // Host files are never materialised in kernel memory on open: `fd_read`
+    // and `fd_pread` pull bounded ranges over 9p on demand.
+    let (kind, identity, descriptor_flags) = match metadata {
         Ok(metadata) => {
-            let kind = if metadata.qid_type & 0x80 != 0 {
-                FsNodeKind::Directory
-            } else {
-                FsNodeKind::File
-            };
+            let kind = crate::wasmtime_adapter::wasi::host_metadata_node_kind(&metadata);
             if open_flags.contains(fs_types::OpenFlags::EXCLUSIVE)
                 && open_flags.contains(fs_types::OpenFlags::CREATE)
             {
@@ -3120,14 +3169,7 @@ where
                     .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
                     .map_err(p1_errno_from_fs)?;
             }
-            if kind == FsNodeKind::File {
-                let contents = service
-                    .read_file(&host_path)
-                    .await
-                    .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-                    .map_err(p1_errno_from_fs)?;
-                (kind, metadata.identity, Some(contents), descriptor_flags)
-            } else {
+            if kind != FsNodeKind::File {
                 let entries = service
                     .read_dir(&host_path)
                     .await
@@ -3137,8 +3179,8 @@ where
                     .data_mut()
                     .filesystem
                     .seed_host_directory_entries(&absolute, entries);
-                (kind, metadata.identity, None, descriptor_flags)
             }
+            (kind, metadata.identity, descriptor_flags)
         }
         Err(error) => {
             let error = crate::wasmtime_adapter::wasi::map_host_fs_error(error);
@@ -3169,20 +3211,9 @@ where
                 FsNodeKind::File,
             )
             .map_err(p1_errno_from_fs)?;
-            (
-                FsNodeKind::File,
-                metadata.identity,
-                Some(Vec::new()),
-                descriptor_flags,
-            )
+            (FsNodeKind::File, metadata.identity, descriptor_flags)
         }
     };
-    if let Some(contents) = contents {
-        caller
-            .data_mut()
-            .filesystem
-            .seed_host_file_content(&absolute, identity, contents);
-    }
     Ok(FsDescriptor {
         path: absolute,
         kind,
@@ -3270,26 +3301,13 @@ where
         Err(errno) => return errno,
     };
     if absolute == WASIX_NULL_DEVICE_PATH {
-        return p1_write_filestat(caller, stat, p1_null_device_stat());
+        return p1_write_filestat(caller, stat, p1_null_device_identity(), p1_null_device_stat());
     }
-    let stat_value = if let Some(host_path) = crate::guest_host_share_path(&absolute) {
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        match service.stat_path(host_path).await {
-            Ok(metadata) => p1_descriptor_stat_from_host_metadata(metadata),
-            Err(error) => {
-                return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
-            }
-        }
-    } else {
-        match caller.data().filesystem.stat(&absolute) {
-            Ok(stat) => stat,
-            Err(error) => return p1_errno_from_fs(error),
-        }
+    let (identity, stat_value) = match p1_stat_absolute_path(caller, &absolute).await {
+        Ok(stat) => stat,
+        Err(errno) => return errno,
     };
-    p1_write_filestat(caller, stat, stat_value)
+    p1_write_filestat(caller, stat, identity, stat_value)
 }
 
 pub(super) async fn p1_path_filestat_set_times<CpuImpl, HostFs>(
@@ -4767,9 +4785,17 @@ pub(super) fn p1_fdflags_nonblocking(fdflags: u16) -> bool {
     fdflags & P1_FDFLAG_NONBLOCK != 0
 }
 
+/// Writes a preview1 `filestat` record.
+///
+/// `identity` supplies `st_dev`/`st_ino`: the authority domain is the device
+/// (one per mount — bootfs, the 9p host share, synthetic devices) and the
+/// local id is the inode. Programs that de-duplicate files by `(dev, ino)` —
+/// `cp -r`, `find`, `rsync`, tar — need both to be real and stable, so no
+/// field here may be a placeholder zero.
 pub(super) fn p1_write_filestat<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     stat: u32,
+    identity: crate::ObjectIdentity,
     value: fs_types::DescriptorStat,
 ) -> i32
 where
@@ -4806,8 +4832,8 @@ where
                 .saturating_add(u64::from(datetime.nanoseconds))
         })
         .unwrap_or(0);
-    p1_write_u64(caller, memory, stat, 0)
-        .max(p1_write_u64(caller, memory, stat + 8, 0))
+    p1_write_u64(caller, memory, stat, identity.domain().raw())
+        .max(p1_write_u64(caller, memory, stat + 8, identity.local()))
         .max(p1_write_u8(
             caller,
             memory,
