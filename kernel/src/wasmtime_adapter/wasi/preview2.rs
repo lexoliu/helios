@@ -2972,7 +2972,10 @@ where
                         byte_len,
                     );
                     let enqueue_started = p2_kernel_profile_start(&read_runtime_state, &read_cpu);
-                    if network_writer.write(bytes).is_err() {
+                    // Awaiting here is the guest's backpressure: the
+                    // bridge stops pulling from the socket while the
+                    // guest-side channel is full.
+                    if network_writer.write(bytes).await.is_err() {
                         p2_record_kernel_profile_events_bytes(
                             &read_runtime_state,
                             &read_cpu,

@@ -16,7 +16,7 @@ use helios_kernel::{
     MacAddress, NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
     NetworkIpAddress, NetworkPortId, Notify, PingError, PingErrorKind, PingReply,
     ProcessMemoryIdentity, TcpAccepted, TcpError, TcpErrorKind, TcpListener, Timer, TryRead,
-    UdpBinding, UdpDatagram, UdpError, UdpErrorKind, byte_channel,
+    TryWrite, UdpBinding, UdpDatagram, UdpError, UdpErrorKind, byte_channel,
 };
 use spin::{Mutex, Once};
 
@@ -226,9 +226,11 @@ fn byte_channel_write_try_read(bencher: Bencher, count: usize) {
         let (writer, reader) = byte_channel();
         let payload = Bytes::from_static(b"helios-byte-channel");
         for _ in 0..count {
-            writer
-                .write(payload.clone())
-                .expect("reader is alive during byte channel benchmark");
+            assert_eq!(
+                writer.try_write(payload.clone()),
+                TryWrite::Written,
+                "reader is alive and the channel has room during the benchmark"
+            );
         }
         for _ in 0..count {
             match reader.try_read() {
@@ -259,9 +261,11 @@ fn byte_channel_write_owned_vec_chunk(bencher: Bencher, count: usize) {
         let (writer, reader) = byte_channel();
         for _ in 0..count {
             let bytes = alloc::vec![7; 4096];
-            writer
-                .write(Bytes::from(bytes))
-                .expect("reader is alive during owned byte channel benchmark");
+            assert_eq!(
+                writer.try_write(Bytes::from(bytes)),
+                TryWrite::Written,
+                "reader is alive and the channel has room during the benchmark"
+            );
         }
         drain_byte_channel(reader, count);
     });
@@ -269,15 +273,18 @@ fn byte_channel_write_owned_vec_chunk(bencher: Bencher, count: usize) {
 
 #[divan::bench(args = [1usize, 64, 256])]
 fn byte_channel_write_copied_vec_chunk(bencher: Bencher, count: usize) {
-    // Retained as the regression baseline for `ComponentStoreData::write_output`
-    // callers that only have a borrowed slice and must create owned pipe data.
+    // Retained as the regression baseline for
+    // `ComponentStoreData::poll_write_output_bytes` callers that only have a
+    // borrowed slice and must create owned pipe data.
     bencher.counter(ItemsCount::new(count)).bench_local(|| {
         let (writer, reader) = byte_channel();
         for _ in 0..count {
             let bytes = alloc::vec![7; 4096];
-            writer
-                .write(Bytes::copy_from_slice(&bytes))
-                .expect("reader is alive during copied byte channel benchmark");
+            assert_eq!(
+                writer.try_write(Bytes::copy_from_slice(&bytes)),
+                TryWrite::Written,
+                "reader is alive and the channel has room during the benchmark"
+            );
         }
         drain_byte_channel(reader, count);
     });

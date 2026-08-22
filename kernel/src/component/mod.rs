@@ -30,8 +30,9 @@ pub use resources::{
     ComponentUdpBackend, ComponentUdpSocket,
 };
 pub use runtime::{
-    ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind, ComponentRuntimeState,
-    ComponentStoreData, DeadlinePollable, InstanceKilled, wait_until_runtime_deadline,
+    ComponentOutputMode, ComponentOutputRoute, ComponentOutputSink, ComponentOutputStreamKind,
+    ComponentRuntimeState, ComponentStoreData, DeadlinePollable, InstanceKilled, LocalOutputSink,
+    wait_until_runtime_deadline,
 };
 pub use runtime_backend::{
     CompiledComponent, ComponentExecContext, ComponentExecutor, ComponentExitStatus,

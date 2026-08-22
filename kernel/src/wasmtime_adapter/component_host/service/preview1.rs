@@ -308,37 +308,27 @@ where
         self.instance.pending_kill()
     }
 
-    pub(super) fn write_output(&self, stream: crate::ComponentOutputStreamKind, bytes: &[u8]) {
+    /// Deliver stdout/stderr bytes to a sink that cannot block, or hand
+    /// back the bounded child channel the caller has to push through.
+    ///
+    /// The split exists because the store is not `Sync`: holding `&self`
+    /// across an `.await` would make every host-call future non-`Send`.
+    /// Callers take the returned writer — a cheap handle clone — and then
+    /// await or `try_write` it outside this borrow.
+    pub(super) fn route_output(
+        &self,
+        stream: crate::ComponentOutputStreamKind,
+        bytes: &[u8],
+    ) -> Option<crate::ByteWriter> {
         if bytes.is_empty() {
-            return;
+            return None;
         }
-        match &self.output_mode {
-            OutputMode::Serial => (self.write_serial)(bytes),
-            OutputMode::Trace => {
-                let text = core::str::from_utf8(bytes).unwrap_or_else(|error| {
-                    panic!("Preview1 guest wrote non-utf8 stdout/stderr bytes: {error}")
-                });
-                self.runtime_state
-                    .record_console_text(self.cpu.now().ticks(), text);
+        match self.output_mode.sink(stream) {
+            crate::ComponentOutputSink::Local(local) => {
+                local.write(&self.cpu, &self.runtime_state, self.write_serial, bytes);
+                None
             }
-            OutputMode::Child {
-                stdout_tx,
-                stderr_tx,
-                ..
-            } => {
-                let writer = match stream {
-                    crate::ComponentOutputStreamKind::Stdout => stdout_tx,
-                    crate::ComponentOutputStreamKind::Stderr => stderr_tx,
-                };
-                let _ = writer.write(Bytes::copy_from_slice(bytes));
-            }
-            OutputMode::RoutedChild { stdout, stderr, .. } => {
-                let route = match stream {
-                    crate::ComponentOutputStreamKind::Stdout => stdout,
-                    crate::ComponentOutputStreamKind::Stderr => stderr,
-                };
-                route.write(&self.cpu, &self.runtime_state, self.write_serial, bytes);
-            }
+            crate::ComponentOutputSink::Child(writer) => Some(writer.clone()),
         }
     }
 
@@ -4408,8 +4398,12 @@ where
             Ok(written) => written,
             Err(_) => return p1::errno::OVERFLOW,
         };
-        if writer.write(bytes).is_err() {
-            return p1::errno::IO;
+        let fdflags = match caller.data().descriptors.fdflags(fd) {
+            Ok(fdflags) => fdflags,
+            Err(errno) => return errno,
+        };
+        if let Err(errno) = p1_send_to_socketpair(&writer, bytes, fdflags).await {
+            return errno;
         }
         return p1_write_u32(caller, memory, so_datalen, written);
     }
@@ -4555,6 +4549,59 @@ where
         .collect()
 }
 
+/// Push one datagram into the peer half of a socketpair.
+///
+/// The pair is a bounded byte channel like every other child pipe, so a
+/// blocking socket waits for the peer to drain and a non-blocking one
+/// reports `EAGAIN` while keeping its bytes. Nothing is dropped.
+pub(super) async fn p1_send_to_socketpair(
+    writer: &crate::ByteWriter,
+    bytes: Vec<u8>,
+    fdflags: u16,
+) -> Result<(), i32> {
+    if p1_fdflags_nonblocking(fdflags) {
+        return match writer.try_write(bytes) {
+            crate::TryWrite::Written => Ok(()),
+            crate::TryWrite::Full(_) => Err(p1::errno::AGAIN),
+            crate::TryWrite::Closed => Err(p1::errno::IO),
+        };
+    }
+    writer.write(bytes).await.map_err(|_| p1::errno::IO)
+}
+
+/// Write one chunk to stdout/stderr, respecting the descriptor's
+/// blocking mode.
+///
+/// A serial or trace route takes the bytes inside `route_output`. A child
+/// pipe is bounded: a blocking descriptor waits for the parent to drain,
+/// a non-blocking one reports `EAGAIN` and keeps its bytes. A reader that
+/// has gone away is not an error — the bytes go nowhere, exactly like a
+/// POSIX write to a closed pipe with SIGPIPE suppressed.
+async fn p1_write_stdio<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    stream: crate::ComponentOutputStreamKind,
+    bytes: &[u8],
+    nonblocking: bool,
+) -> Result<u32, i32>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let written = u32::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW)?;
+    let Some(writer) = caller.data().route_output(stream, bytes) else {
+        return Ok(written);
+    };
+    if nonblocking {
+        match writer.try_write(Bytes::copy_from_slice(bytes)) {
+            crate::TryWrite::Written | crate::TryWrite::Closed => {}
+            crate::TryWrite::Full(_) => return Err(p1::errno::AGAIN),
+        }
+    } else {
+        let _: Result<(), crate::ClosedPeer> = writer.write(Bytes::copy_from_slice(bytes)).await;
+    }
+    Ok(written)
+}
+
 pub(super) async fn p1_write_descriptor<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
@@ -4564,23 +4611,47 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
+    // A descriptor whose sink is a bounded channel blocks the guest while
+    // that channel is full, unless the guest asked for non-blocking IO —
+    // then it gets `EAGAIN` and keeps its bytes, as POSIX requires.
+    let nonblocking = caller
+        .data()
+        .descriptors
+        .fdflags(fd)
+        .is_ok_and(p1_fdflags_nonblocking);
     match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Stdout) => {
-            caller
-                .data()
-                .write_output(crate::ComponentOutputStreamKind::Stdout, bytes);
-            u32::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW)
+            p1_write_stdio(
+                caller,
+                crate::ComponentOutputStreamKind::Stdout,
+                bytes,
+                nonblocking,
+            )
+            .await
         }
         Some(Preview1Descriptor::Stderr) => {
-            caller
-                .data()
-                .write_output(crate::ComponentOutputStreamKind::Stderr, bytes);
-            u32::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW)
+            p1_write_stdio(
+                caller,
+                crate::ComponentOutputStreamKind::Stderr,
+                bytes,
+                nonblocking,
+            )
+            .await
         }
         Some(Preview1Descriptor::PipeWrite { writer }) => {
-            writer
-                .write(Bytes::copy_from_slice(bytes))
-                .map_err(|_| p1::errno::IO)?;
+            let writer = writer.clone();
+            if nonblocking {
+                match writer.try_write(Bytes::copy_from_slice(bytes)) {
+                    crate::TryWrite::Written => {}
+                    crate::TryWrite::Full(_) => return Err(p1::errno::AGAIN),
+                    crate::TryWrite::Closed => return Err(p1::errno::IO),
+                }
+            } else {
+                writer
+                    .write(Bytes::copy_from_slice(bytes))
+                    .await
+                    .map_err(|_| p1::errno::IO)?;
+            }
             u32::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW)
         }
         Some(Preview1Descriptor::Event(event)) => {

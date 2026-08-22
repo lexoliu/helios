@@ -2280,8 +2280,12 @@ where
                 Ok(written) => written,
                 Err(_) => return p1::errno::OVERFLOW,
             };
-            if writer.write(bytes).is_err() {
-                return p1::errno::IO;
+            let fdflags = match caller.data().descriptors.fdflags(fd) {
+                Ok(fdflags) => fdflags,
+                Err(errno) => return errno,
+            };
+            if let Err(errno) = p1_send_to_socketpair(&writer, bytes, fdflags).await {
+                return errno;
             }
             p1_write_u32(caller, memory, ret_size, written)
         }
@@ -2392,7 +2396,17 @@ where
             p1_write_u64(caller, memory, ret_size, written)
         }
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { writer, .. })) => {
-            if writer.write(bytes).is_err() {
+            let fdflags = match caller.data().descriptors.fdflags(out_fd) {
+                Ok(fdflags) => fdflags,
+                Err(errno) => return errno,
+            };
+            if p1_fdflags_nonblocking(fdflags) {
+                match writer.try_write(bytes) {
+                    crate::TryWrite::Written => {}
+                    crate::TryWrite::Full(_) => return p1::errno::AGAIN,
+                    crate::TryWrite::Closed => return p1::errno::IO,
+                }
+            } else if writer.write(bytes).await.is_err() {
                 return p1::errno::IO;
             }
             p1_write_u64(caller, memory, ret_size, written)

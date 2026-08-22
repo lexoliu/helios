@@ -10,7 +10,10 @@ mod interrupts;
 mod poll_registry;
 mod serial;
 
-pub use child::{ByteReadWait, ByteReader, ByteWriter, ClosedPeer, TryRead, byte_channel};
+pub use child::{
+    ByteReadWait, ByteReader, ByteWriteWait, ByteWriter, ClosedPeer, TryRead, TryWrite,
+    byte_channel,
+};
 pub use console::RecordingConsole;
 pub use interrupts::{ExternalInterruptHandler, ExternalInterruptRoutes};
 pub use poll_registry::{

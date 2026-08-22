@@ -1176,7 +1176,9 @@ where
         // Feed stdin in one shot, then close the writer to signal EOF.
         if let Some(writer) = child.take_stdin() {
             if !stdin.is_empty() {
-                let _ = writer.write(stdin);
+                // The child may not have started draining yet, so this
+                // waits for room rather than overrunning the channel.
+                let _: Result<(), crate::ClosedPeer> = writer.write(stdin).await;
             }
             drop(writer);
         }
@@ -2790,7 +2792,7 @@ mod tests {
     #[test]
     fn wasix_multicast_preflight_accepts_udp_sockets_only() {
         let udp = Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
-                family: WasixSocketFamily::Ipv4,
+            family: WasixSocketFamily::Ipv4,
             options: WasixSocketOptions::default(),
         }));
         let tcp =
@@ -3029,9 +3031,11 @@ mod tests {
             carry: Bytes::new(),
         };
         assert_eq!(local_epoll_mask(Some(&pipe), WASIX_EPOLL_TYPE_EPOLLIN), 0);
-        pipe_writer
-            .write(Bytes::from_static(b"pipe"))
-            .expect("pipe reader is still open");
+        assert_eq!(
+            pipe_writer.try_write(Bytes::from_static(b"pipe")),
+            crate::TryWrite::Written,
+            "pipe reader is still open"
+        );
         assert_eq!(
             local_epoll_mask(Some(&pipe), WASIX_EPOLL_TYPE_EPOLLIN),
             WASIX_EPOLL_TYPE_EPOLLIN
@@ -3046,9 +3050,11 @@ mod tests {
             socket_type: WASIX_SOCK_TYPE_STREAM,
         });
         assert_eq!(local_epoll_mask(Some(&pair), WASIX_EPOLL_TYPE_EPOLLIN), 0);
-        pair_writer
-            .write(Bytes::from_static(b"pair"))
-            .expect("socket-pair reader is still open");
+        assert_eq!(
+            pair_writer.try_write(Bytes::from_static(b"pair")),
+            crate::TryWrite::Written,
+            "socket-pair reader is still open"
+        );
         assert_eq!(
             local_epoll_mask(Some(&pair), WASIX_EPOLL_TYPE_EPOLLIN),
             WASIX_EPOLL_TYPE_EPOLLIN

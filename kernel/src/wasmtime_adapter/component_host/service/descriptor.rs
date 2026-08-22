@@ -158,6 +158,13 @@ pub(super) enum EpollWaitTarget {
         reader: crate::ByteReader,
         wait: crate::ByteReadWait,
     },
+    /// A pipe/socketpair write end whose channel is at capacity. The
+    /// waiter sleeps until the peer drains, exactly like the read side
+    /// sleeps until bytes arrive.
+    ByteWriter {
+        writer: crate::ByteWriter,
+        wait: crate::ByteWriteWait,
+    },
     Event {
         event: EventFd,
         wait: crate::NotifyWaiter,
@@ -168,6 +175,7 @@ impl EpollWaitTarget {
     pub(super) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         match self {
             Self::ByteReader { reader, wait } => reader.poll_readable(cx, wait),
+            Self::ByteWriter { writer, wait } => writer.poll_writable(cx, wait),
             Self::Event { event, wait } => event.poll_readable(cx, wait),
         }
     }
@@ -290,6 +298,15 @@ pub(super) fn p1_add_wait_target<CpuImpl, HostFs>(
             wait.notified.push(EpollWaitTarget::ByteReader {
                 reader: reader.clone(),
                 wait: reader.wait_state(),
+            });
+        }
+        Some(Preview1Descriptor::PipeWrite { writer })
+        | Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { writer, .. }))
+            if event_type == P1_EVENTTYPE_FD_WRITE && !writer.is_writable() =>
+        {
+            wait.notified.push(EpollWaitTarget::ByteWriter {
+                writer: writer.clone(),
+                wait: writer.wait_state(),
             });
         }
         Some(Preview1Descriptor::Event(event))
@@ -1388,17 +1405,36 @@ pub(super) fn p1_probe_descriptor(
             Some(Preview1Descriptor::File { .. }) | Some(Preview1Descriptor::Preopen { .. }),
             P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE,
         ) => local(P1Readiness::Ready { bytes: 0 }),
+        // A guest-owned pipe or socketpair write end is a bounded channel:
+        // report it writable only while it can actually take a chunk, so a
+        // guest that polls for `POLLOUT` sleeps instead of spinning on a
+        // full pipe. `is_writable` also covers a vanished peer, where the
+        // write itself reports the error.
+        (Some(Preview1Descriptor::PipeWrite { writer }), P1_EVENTTYPE_FD_WRITE)
+        | (
+            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { writer, .. })),
+            P1_EVENTTYPE_FD_WRITE,
+        ) => {
+            if writer.is_writable() {
+                local(P1Readiness::Ready {
+                    bytes: usize::MAX as u64,
+                })
+            } else {
+                local(P1Readiness::Pending)
+            }
+        }
+        // stdout/stderr routing lives on the store, not on the descriptor,
+        // so it is not resolvable here; those descriptors report the
+        // always-writable behaviour of a terminal and the write itself
+        // applies whatever backpressure the route has.
         (Some(Preview1Descriptor::Stdout), P1_EVENTTYPE_FD_WRITE)
         | (Some(Preview1Descriptor::Stderr), P1_EVENTTYPE_FD_WRITE)
-        | (Some(Preview1Descriptor::PipeWrite { .. }), P1_EVENTTYPE_FD_WRITE)
         | (Some(Preview1Descriptor::Event(_)), P1_EVENTTYPE_FD_WRITE)
-        | (Some(Preview1Descriptor::NullDevice), P1_EVENTTYPE_FD_WRITE)
-        | (
-            Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Pair { .. })),
-            P1_EVENTTYPE_FD_WRITE,
-        ) => local(P1Readiness::Ready {
-            bytes: usize::MAX as u64,
-        }),
+        | (Some(Preview1Descriptor::NullDevice), P1_EVENTTYPE_FD_WRITE) => {
+            local(P1Readiness::Ready {
+                bytes: usize::MAX as u64,
+            })
+        }
         (
             Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
                 WasixTcpSocket::Connected { stream, .. },
