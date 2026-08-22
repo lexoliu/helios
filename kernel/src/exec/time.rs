@@ -1,5 +1,6 @@
 use core::time::Duration;
 use helios_hal::cpu::Cpu;
+pub use helios_hal::cpu::ticks_to_nanos;
 
 use crate::{ComponentRuntimeState, SetWallClockCap};
 
@@ -45,8 +46,7 @@ where
 }
 
 pub fn monotonic_nanos<CpuImpl: Cpu>(cpu: &CpuImpl) -> u64 {
-    let ticks = cpu.now().ticks();
-    ticks.saturating_mul(1_000_000_000) / cpu.timer_frequency()
+    ticks_to_nanos(cpu.now().ticks(), cpu.timer_frequency())
 }
 
 pub fn elapsed_millis(since_nanos: u64, now_nanos: u64) -> u64 {
@@ -204,5 +204,35 @@ mod tests {
         assert_eq!(clock.system_time_nanos(), 1_000);
         cpu.set_ticks(9);
         assert_eq!(clock.system_time_nanos(), 1_004);
+    }
+
+    #[test]
+    fn tick_conversion_keeps_advancing_past_the_u64_nanosecond_product() {
+        // A 1 GHz TSC timebase crosses `u64::MAX / 1e9` ticks after
+        // roughly 18.4 s of uptime. The naive `ticks * 1e9` product
+        // saturates there and pins every derived deadline to a
+        // constant, so the conversion has to stay monotonic well past
+        // that point.
+        const GIGAHERTZ: u64 = 1_000_000_000;
+        let cliff_ticks = u64::MAX / GIGAHERTZ;
+
+        assert_eq!(ticks_to_nanos(cliff_ticks, GIGAHERTZ), cliff_ticks);
+        assert_eq!(
+            ticks_to_nanos(cliff_ticks + 1, GIGAHERTZ),
+            cliff_ticks + 1,
+            "conversion must not saturate one tick past the u64 product limit"
+        );
+
+        let hour_ticks = 3_600 * GIGAHERTZ;
+        assert_eq!(ticks_to_nanos(hour_ticks, GIGAHERTZ), hour_ticks);
+        assert!(
+            ticks_to_nanos(hour_ticks + GIGAHERTZ, GIGAHERTZ)
+                > ticks_to_nanos(hour_ticks, GIGAHERTZ),
+            "conversion must stay strictly monotonic across long uptimes"
+        );
+
+        // A slower timebase reaches the same product limit later, which
+        // is why only the TSC-backed backend hit this in practice.
+        assert_eq!(ticks_to_nanos(cliff_ticks, 62_500_000), 295_147_905_168);
     }
 }

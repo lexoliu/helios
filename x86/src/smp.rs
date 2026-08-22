@@ -9,7 +9,7 @@ use core::arch::x86_64::__cpuid;
 use core::ops::Range;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
-use helios_hal::cpu::ProcessorId;
+use helios_hal::cpu::{ProcessorId, ticks_to_nanos};
 use helios_hal::watchdog::Watchdog;
 use helios_kernel::{Timer, WasmtimeTlsSlots};
 use pci_types::ConfigRegionAccess;
@@ -895,7 +895,7 @@ impl Handler for PhysicalOffsetAcpiHandler {
 
     fn nanos_since_boot(&self) -> u64 {
         let ticks = read_tsc().saturating_sub(self.tsc_base);
-        ticks.saturating_mul(1_000_000_000) / self.tsc_hz
+        ticks_to_nanos(ticks, self.tsc_hz)
     }
 
     fn stall(&self, microseconds: u64) {

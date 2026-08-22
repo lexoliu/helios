@@ -20,7 +20,7 @@ use helios_hal::boot::{
     BootFirmwareTables, BootHandoff, BootKernelImage, BootMemoryKind, BootMemoryMap,
     BootMemoryRegion, BootModule, BootModules, FirmwareKind,
 };
-use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId};
+use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId, ticks_to_nanos};
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
@@ -1098,7 +1098,7 @@ impl Handler for Aarch64AcpiHandler {
     }
 
     fn nanos_since_boot(&self) -> u64 {
-        read_counter().saturating_mul(1_000_000_000) / self.timer_frequency
+        ticks_to_nanos(read_counter(), self.timer_frequency)
     }
 
     fn stall(&self, microseconds: u64) {
