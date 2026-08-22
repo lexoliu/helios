@@ -95,16 +95,20 @@ jobs:
             # WASIX shared-memory capacity eagerly, so the shell workloads
             # need more physical guest RAM than the aarch64 lanes.
             vm-memory: 6G
+            # KVM boots in seconds; a marker hang should fail fast.
+            boot-timeout: "300"
             workloads: ""
           - name: aarch64-linux
             runner: ubuntu-24.04-arm
             helios-arch: aarch64
             vm-memory: 2G
+            boot-timeout: "3600"
             workloads: ""
           - name: aarch64-macos
             runner: macos-15
             helios-arch: aarch64
             vm-memory: 2G
+            boot-timeout: "3600"
             workloads: ""
     steps:
       - uses: actions/checkout@v4
@@ -169,7 +173,7 @@ jobs:
         env:
           HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
           HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
-          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: ${{ matrix.boot-timeout }}
           HELIOS_WORKLOAD_BENCH_VM_MEMORY: ${{ matrix.vm-memory }}
         run: |
           python3 tools/wasi-apps/linux-gap-bench.py \
