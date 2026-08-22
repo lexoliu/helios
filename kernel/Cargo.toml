@@ -55,6 +55,7 @@ critical-section = { version = "1.2.0", features = ["std"] }
 divan = { version = "0.1.21", default-features = false }
 futures-lite = "2.6.1"
 helios-kernel-macro.workspace = true
+arc-swap = "1.7.1"
 wasm-encoder = "0.245.0"
 
 [[bench]]

@@ -556,7 +556,7 @@ impl ComponentNetworkService for BenchNetworkService {
         &self,
         _host: &str,
         _timeout_nanos: u64,
-    ) -> Result<alloc::vec::Vec<Ipv4Address>, DnsError> {
+    ) -> Result<alloc::vec::Vec<NetworkIpAddress>, DnsError> {
         Err(bench_dns_error())
     }
 
@@ -574,6 +574,7 @@ impl ComponentNetworkService for BenchNetworkService {
         _host: &str,
         _port: u16,
         _local_port: u16,
+        _hop_limit: u8,
         _timeout_nanos: u64,
     ) -> Result<Self::TcpStream, TcpError> {
         Ok(1)
@@ -584,6 +585,7 @@ impl ComponentNetworkService for BenchNetworkService {
         _remote_address: NetworkIpAddress,
         _port: u16,
         _local_port: u16,
+        _hop_limit: u8,
         _timeout_nanos: u64,
     ) -> Result<Self::TcpStream, TcpError> {
         Ok(1)
@@ -594,11 +596,41 @@ impl ComponentNetworkService for BenchNetworkService {
         _local_address: NetworkIpAddress,
         local_port: u16,
         _backlog: u16,
+        _hop_limit: u8,
     ) -> Result<TcpListener<Self::TcpListener>, TcpError> {
         Ok(TcpListener {
             listener: 1,
             local_port,
         })
+    }
+
+    fn tcp_set_hop_limit(&self, _stream: Self::TcpStream, _hop_limit: u8) -> Result<(), TcpError> {
+        Ok(())
+    }
+
+    fn tcp_listener_set_hop_limit(
+        &self,
+        _listener: Self::TcpListener,
+        _hop_limit: u8,
+    ) -> Result<(), TcpError> {
+        Ok(())
+    }
+
+    fn udp_connect(
+        &self,
+        _socket: Self::UdpSocket,
+        _remote_address: NetworkIpAddress,
+        _port: u16,
+    ) -> Result<(), UdpError> {
+        Ok(())
+    }
+
+    fn udp_disconnect(&self, _socket: Self::UdpSocket) -> Result<(), UdpError> {
+        Ok(())
+    }
+
+    fn udp_set_hop_limit(&self, _socket: Self::UdpSocket, _hop_limit: u8) -> Result<(), UdpError> {
+        Ok(())
     }
 
     async fn tcp_accept(
