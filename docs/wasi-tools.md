@@ -246,6 +246,14 @@ HVF on macOS, KVM where `/dev/kvm` is available, otherwise TCG, and a TCG
 guest additionally receives generous systemd unit, device, and udev event
 timeouts through cloud-init because every guest instruction is translated.
 
+Fedora 44's systemd occasionally fails its manager startup under TCG
+("Failed to fork off sandboxing environment for executing generators")
+and freezes before sshd comes up. The harness treats this upstream guest
+flake as retryable: a boot that does not reach SSH within its budget is
+killed, its serial log is preserved as `serial.boot-attempt-N.log`, the
+overlay disk is recreated, and the first boot is retried up to three
+times before the run fails.
+
 Host-side assets are pinned: the per-architecture Fedora Cloud image is
 verified against the SHA256 published in the compose's signed `CHECKSUM` file
 on every run, and the Wasmtime Linux release matching the guest architecture

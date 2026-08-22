@@ -8,6 +8,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import tarfile
 import tomllib
 import time
@@ -631,6 +632,10 @@ def ssh_output(
     return output([*ssh_base(key, port), f"bash -lc {shlex.quote(command)}"], repo_root, timeout=timeout)
 
 
+class GuestUnreachable(RuntimeError):
+    """The guest never became reachable over SSH within its boot budget."""
+
+
 def wait_for_ssh(repo_root: Path, key: Path, port: int, timeout_seconds: int) -> None:
     deadline = time.monotonic() + timeout_seconds
     last_error = "ssh not attempted"
@@ -641,7 +646,62 @@ def wait_for_ssh(repo_root: Path, key: Path, port: int, timeout_seconds: int) ->
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
             last_error = str(error)
             time.sleep(2)
-    raise SystemExit(f"Fedora QEMU guest did not become reachable over SSH: {last_error}")
+    raise GuestUnreachable(
+        f"Fedora QEMU guest did not become reachable over SSH: {last_error}"
+    )
+
+
+# Fedora 44's systemd occasionally fails its manager startup under TCG
+# ("Failed to fork off sandboxing environment for executing generators:
+# Protocol error") and freezes before sshd, observed on the arm64 CI
+# runner on a fresh first boot. That is an upstream guest flake, not a
+# harness bug, so the boot is retried on a pristine overlay; each failed
+# attempt's serial log is preserved for diagnosis.
+BOOT_ATTEMPTS = 3
+BOOT_SSH_TIMEOUT_CEILING_SECONDS = 900
+
+
+def boot_reachable_vm(
+    repo_root: Path,
+    asset_dir: Path,
+    qemu_bin: str,
+    base: Path,
+    disk_size: str,
+    seed_iso: Path,
+    key: Path,
+    port: int,
+    memory: str,
+    smp: int,
+    guest_arch: str,
+    accel: str,
+    setup_timeout_seconds: int,
+) -> tuple[subprocess.Popen, Path]:
+    ssh_budget = min(setup_timeout_seconds, BOOT_SSH_TIMEOUT_CEILING_SECONDS)
+    serial_log = asset_dir / "serial.log"
+    last_error = "boot not attempted"
+    for attempt in range(1, BOOT_ATTEMPTS + 1):
+        disk = ensure_guest_disk(repo_root, base, asset_dir, disk_size)
+        process = start_vm(
+            repo_root, asset_dir, qemu_bin, disk, seed_iso, port, memory, smp, guest_arch, accel
+        )
+        try:
+            wait_for_ssh(repo_root, key, port, ssh_budget)
+            return process, disk
+        except GuestUnreachable as error:
+            last_error = str(error)
+            stop_vm(process)
+            preserved = asset_dir / f"serial.boot-attempt-{attempt}.log"
+            if serial_log.is_file():
+                shutil.copyfile(serial_log, preserved)
+            print(
+                f"guest boot attempt {attempt}/{BOOT_ATTEMPTS} failed; "
+                f"serial preserved at {preserved}",
+                file=sys.stderr,
+            )
+            disk.unlink(missing_ok=True)
+    raise SystemExit(
+        f"Fedora QEMU guest failed to boot after {BOOT_ATTEMPTS} attempts: {last_error}"
+    )
 
 
 def start_vm(
@@ -1081,7 +1141,7 @@ def run_fedora_qemu_linux(
     public_key = key.with_suffix(key.suffix + ".pub").read_text(encoding="utf-8").strip()
     seed_iso = render_seed(repo_root, asset_dir, public_key, accel)
     base = download_base_image(repo_root, asset_dir, image_url, image_sha256)
-    disk = ensure_guest_disk(repo_root, base, asset_dir, disk_size)
+    disk = asset_dir / "fedora-bench.qcow2"
     blk_device, net_device, _ = virtio_devices(guest_arch)
     provenance = {
         "kind": f"fedora-qemu-{guest_arch}-{accel}",
@@ -1113,11 +1173,22 @@ def run_fedora_qemu_linux(
     if not native_workloads and not wasmtime_workloads:
         return None, None, provenance
     port = ssh_port or free_tcp_port()
-    process = start_vm(
-        repo_root, asset_dir, qemu_bin, disk, seed_iso, port, memory, smp, guest_arch, accel
+    process, disk = boot_reachable_vm(
+        repo_root,
+        asset_dir,
+        qemu_bin,
+        base,
+        disk_size,
+        seed_iso,
+        key,
+        port,
+        memory,
+        smp,
+        guest_arch,
+        accel,
+        setup_timeout_seconds,
     )
     try:
-        wait_for_ssh(repo_root, key, port, setup_timeout_seconds)
         copy_guest_files(
             repo_root,
             key,
