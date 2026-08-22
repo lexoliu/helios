@@ -53,14 +53,15 @@ pub fn elapsed_millis(since_nanos: u64, now_nanos: u64) -> u64 {
     now_nanos.saturating_sub(since_nanos) / 1_000_000
 }
 
+/// Guests legitimately pass `u64::MAX` nanoseconds as an "infinite"
+/// timeout (WASIX futex waits, epoll). On timebases at or above 1 GHz
+/// that product exceeds `u64` ticks; a deadline centuries out is
+/// semantically "never", so the conversion saturates instead of
+/// treating guest input as a kernel invariant.
 pub fn duration_to_ticks(duration: Duration, frequency: u64) -> u64 {
     let seconds = (duration.as_secs() as u128) * (frequency as u128);
     let subsec = ((duration.subsec_nanos() as u128) * (frequency as u128)) / 1_000_000_000u128;
-    let ticks = seconds
-        .checked_add(subsec)
-        .expect("timer duration overflows tick conversion");
-
-    u64::try_from(ticks).expect("timer duration does not fit into u64 ticks")
+    u64::try_from(seconds.saturating_add(subsec)).unwrap_or(u64::MAX)
 }
 
 pub fn nanos_to_ticks_ceil_saturating(nanos: u64, frequency: u64) -> u64 {
@@ -204,6 +205,28 @@ mod tests {
         assert_eq!(clock.system_time_nanos(), 1_000);
         cpu.set_ticks(9);
         assert_eq!(clock.system_time_nanos(), 1_004);
+    }
+
+    #[test]
+    fn infinite_guest_timeout_saturates_instead_of_panicking() {
+        // WASIX guests pass u64::MAX nanoseconds as an "infinite"
+        // futex/epoll timeout. On a 1 GHz timebase the tick product
+        // exceeds u64; the conversion must saturate to a
+        // never-expiring deadline rather than panic the kernel on
+        // guest-controlled input. Below 1 GHz the product still fits
+        // and must stay exact.
+        const GIGAHERTZ: u64 = 1_000_000_000;
+        let infinite = Duration::from_nanos(u64::MAX);
+        assert_eq!(duration_to_ticks(infinite, GIGAHERTZ), u64::MAX);
+        assert_eq!(duration_to_ticks(infinite, 3 * GIGAHERTZ), u64::MAX);
+        let arm_frequency = 62_500_000;
+        assert_eq!(
+            duration_to_ticks(infinite, arm_frequency),
+            ((u64::MAX as u128 / 1_000_000_000) * arm_frequency as u128) as u64
+                + (u64::MAX as u128 % 1_000_000_000 * arm_frequency as u128 / 1_000_000_000)
+                    as u64
+        );
+        assert_eq!(duration_to_ticks(Duration::from_secs(1), GIGAHERTZ), GIGAHERTZ);
     }
 
     #[test]
