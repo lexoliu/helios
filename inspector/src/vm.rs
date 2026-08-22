@@ -80,6 +80,7 @@ enum VmBlockProfile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VmHostShareProfile {
     Virtio9pMmio,
+    Virtio9pPci,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,7 +190,7 @@ const X86_64_VM_PROFILE: VmProfile = VmProfile {
     console: VmConsoleProfile::SerialUnixSocket,
     network: Some(VmNetworkProfile::VirtioPciUser),
     block: Some(VmBlockProfile::VirtioPciBootDisk),
-    host_share: None,
+    host_share: Some(VmHostShareProfile::Virtio9pPci),
     entropy: None,
     watchdog: Some(VmWatchdogProfile::I6300Esb),
 };
@@ -1741,14 +1742,19 @@ fn configure_block_device(
 }
 
 fn configure_host_share(qemu: &mut Command, host_share: VmHostShareProfile, shared_dir: &Path) {
+    qemu.arg("-fsdev").arg(format!(
+        "local,id=hostfs,path={},security_model=none,multidevs=remap",
+        shared_dir.display()
+    ));
     match host_share {
         VmHostShareProfile::Virtio9pMmio => {
-            qemu.arg("-fsdev").arg(format!(
-                "local,id=hostfs,path={},security_model=none,multidevs=remap",
-                shared_dir.display()
-            ));
             qemu.arg("-device").arg(format!(
                 "virtio-9p-device,fsdev=hostfs,mount_tag={HOST_SHARE_MOUNT_TAG}"
+            ));
+        }
+        VmHostShareProfile::Virtio9pPci => {
+            qemu.arg("-device").arg(format!(
+                "virtio-9p-pci,fsdev=hostfs,mount_tag={HOST_SHARE_MOUNT_TAG}"
             ));
         }
     }
@@ -1823,7 +1829,7 @@ mod tests {
         assert_eq!(AARCH64_VIRT_HVF_PROFILE.arch, VmArch::Aarch64);
         assert_eq!(AARCH64_VIRT_HVF_PROFILE.machine, "virt,gic-version=3");
         assert_eq!(AARCH64_VIRT_HVF_PROFILE.default_smp, 4);
-        assert_eq!(AARCH64_VIRT_HVF_PROFILE.default_accel, &["hvf"]);
+        assert_eq!(AARCH64_VIRT_HVF_PROFILE.default_accel, &["hvf", "kvm"]);
         assert_eq!(AARCH64_VIRT_HVF_PROFILE.default_cpu, Some("host"));
         assert_eq!(
             AARCH64_VIRT_HVF_PROFILE.boot_artifact,
@@ -1902,7 +1908,10 @@ mod tests {
             X86_64_VM_PROFILE.block,
             Some(VmBlockProfile::VirtioPciBootDisk)
         );
-        assert_eq!(X86_64_VM_PROFILE.host_share, None);
+        assert_eq!(
+            X86_64_VM_PROFILE.host_share,
+            Some(VmHostShareProfile::Virtio9pPci)
+        );
         assert_eq!(
             X86_64_VM_PROFILE.watchdog,
             Some(VmWatchdogProfile::I6300Esb)

@@ -39,6 +39,22 @@ pub enum DeviceType {
     _9P = 9,
 }
 
+impl DeviceType {
+    /// Maps a virtio device type id onto the device kinds this kernel
+    /// drives. Every transport reports the same numbering, so the match
+    /// lives here rather than once per transport.
+    pub fn from_id(id: u32) -> Option<Self> {
+        match id {
+            1 => Some(Self::Network),
+            2 => Some(Self::Block),
+            3 => Some(Self::Console),
+            4 => Some(Self::Entropy),
+            9 => Some(Self::_9P),
+            _ => None,
+        }
+    }
+}
+
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct DeviceStatus: u32 {
@@ -104,14 +120,8 @@ impl<B: DeviceBus> VirtioMmioTransport<B> {
             return Err(IoError::Unsupported);
         }
 
-        let device_type = match bus.read_u32(REG_DEVICE_ID) {
-            1 => DeviceType::Network,
-            2 => DeviceType::Block,
-            3 => DeviceType::Console,
-            4 => DeviceType::Entropy,
-            9 => DeviceType::_9P,
-            _ => return Err(IoError::Unsupported),
-        };
+        let device_type =
+            DeviceType::from_id(bus.read_u32(REG_DEVICE_ID)).ok_or(IoError::Unsupported)?;
 
         Ok(Self { bus, device_type })
     }

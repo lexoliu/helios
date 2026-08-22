@@ -16,6 +16,18 @@ const PAGE_FAULT_INSTRUCTION_FETCH: u64 = 1 << 4;
 pub(crate) const TIMER_INTERRUPT_VECTOR: u8 = 0x20;
 pub(crate) const WAKE_INTERRUPT_VECTOR: u8 = 0x21;
 pub(crate) const TLB_SHOOTDOWN_INTERRUPT_VECTOR: u8 = 0x22;
+/// MSI-X vectors for the PCI devices the kernel drives. One vector per
+/// device keeps dispatch a direct lookup in [`DeviceInterruptRoutes`]
+/// without a shared interrupt-status scan.
+pub(crate) const NETWORK_INTERRUPT_VECTOR: u8 = 0x30;
+pub(crate) const HOST_FS_INTERRUPT_VECTOR: u8 = 0x31;
+
+/// Device interrupt routing table for this backend, keyed by IDT vector.
+pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
+    u8,
+    crate::net::VirtioNetworkDevice,
+    crate::host_fs::HostFsTransportService,
+>;
 
 global_asm!(include_str!("exceptions.S"));
 
@@ -30,6 +42,8 @@ unsafe extern "C" {
     fn helios_x86_interrupt_timer();
     fn helios_x86_interrupt_wake();
     fn helios_x86_interrupt_tlb_shootdown();
+    fn helios_x86_interrupt_network();
+    fn helios_x86_interrupt_host_fs();
 }
 
 pub(crate) struct ProcessorIdt {
@@ -76,6 +90,10 @@ impl ProcessorIdt {
                 .set_handler_addr(handler_address(helios_x86_interrupt_wake));
             table[TLB_SHOOTDOWN_INTERRUPT_VECTOR]
                 .set_handler_addr(handler_address(helios_x86_interrupt_tlb_shootdown));
+            table[NETWORK_INTERRUPT_VECTOR]
+                .set_handler_addr(handler_address(helios_x86_interrupt_network));
+            table[HOST_FS_INTERRUPT_VECTOR]
+                .set_handler_addr(handler_address(helios_x86_interrupt_host_fs));
             table.load_unsafe();
         }
     }
@@ -140,6 +158,9 @@ extern "C" fn helios_x86_interrupt_dispatch(frame: &mut ExceptionFrame) {
         }
         Ok(TLB_SHOOTDOWN_INTERRUPT_VECTOR) => {
             smp::handle_tlb_shootdown_interrupt();
+        }
+        Ok(vector @ (NETWORK_INTERRUPT_VECTOR | HOST_FS_INTERRUPT_VECTOR)) => {
+            smp::handle_device_interrupt(vector);
         }
         _ => panic!(
             "unhandled x86 interrupt vector={} rip={:#x}",

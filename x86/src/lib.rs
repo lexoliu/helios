@@ -6,6 +6,7 @@ extern crate alloc;
 mod boot;
 mod exceptions;
 mod host_fs;
+mod net;
 mod pci;
 mod smp;
 mod watchdog;
@@ -181,6 +182,16 @@ fn x86_kernel_main() -> ! {
     let console = serial_console(debug_state.clone(), mirror_to_uart);
     let cpu = X86Cpu::new(boot.platform());
     vmm::install_user_address_space(physical_memory_offset, cpu.processor_count());
+    let pci = pci::PciRoot::new(physical_memory_offset);
+    let network_function = net::discover(&pci);
+    let host_share_function = host_fs::discover(&pci);
+    let mut devices = DeviceInventory::new().with_debug_serial();
+    if network_function.is_some() {
+        devices = devices.with_network();
+    }
+    if host_share_function.is_some() {
+        devices = devices.with_host_share();
+    }
     let kernel = helios_kernel::init_with_watchdog(
         Platform::with_watchdog(console, memory_regions, cpu.clone(), cpu.watchdog())
             .with_topology(
@@ -191,11 +202,23 @@ fn x86_kernel_main() -> ! {
                 .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
             )
             .with_dma_model(DmaModel::Translated)
-            .with_devices(DeviceInventory::new().with_debug_serial()),
+            .with_devices(devices),
     );
     smp::current_runtime().install_timer(kernel.timer());
-    x86_64::instructions::interrupts::enable();
     let debug_state = cpu.debug_state();
+    // Devices are brought up while the bootstrap processor still runs
+    // with interrupts masked, so their MSI-X routes are published before
+    // the first message can be delivered.
+    install_pci_devices(
+        &cpu,
+        &kernel,
+        &pci,
+        physical_memory_offset,
+        network_function,
+        host_share_function,
+        &debug_state,
+    );
+    x86_64::instructions::interrupts::enable();
     let program_service =
         helios_kernel::install_component_host_program_service(&kernel, &cpu, &debug_state);
     smp::current_runtime().install_program_service(
@@ -210,6 +233,57 @@ fn x86_kernel_main() -> ! {
         }
     }
     run_current_processor(cpu, kernel, debug_state)
+}
+
+/// Brings up the virtio-PCI devices the platform exposes and publishes
+/// their MSI-X routes on the bootstrap processor.
+///
+/// Every device message is addressed to the bootstrap local APIC, which
+/// is the processor that owns the routing table; the routes are
+/// installed unconditionally so an interrupt from a device the kernel
+/// never claimed fails loudly instead of being silently acknowledged.
+fn install_pci_devices<WatchdogImpl>(
+    cpu: &X86Cpu,
+    kernel: &helios_kernel::Kernel<X86Cpu, WatchdogImpl>,
+    pci: &pci::PciRoot,
+    physical_memory_offset: usize,
+    network_function: Option<pci_types::PciAddress>,
+    host_share_function: Option<pci_types::PciAddress>,
+    debug_state: &debug_state::RuntimeState,
+) where
+    WatchdogImpl: Watchdog + Clone,
+{
+    let destination_apic_id = cpu.bootstrap_apic_id();
+    let mut routes = exceptions::DeviceInterruptRoutes::new();
+    if let Some(address) = host_share_function {
+        let transport = host_fs::install(
+            pci,
+            address,
+            physical_memory_offset,
+            exceptions::HOST_FS_INTERRUPT_VECTOR,
+            destination_apic_id,
+            debug_state,
+        );
+        routes.set_host_fs(exceptions::HOST_FS_INTERRUPT_VECTOR, transport);
+    } else {
+        tracing::warn!("virtio 9p device was not discovered on the PCI bus");
+    }
+    if let Some(address) = network_function {
+        let device = net::install(
+            cpu,
+            kernel,
+            pci,
+            address,
+            physical_memory_offset,
+            exceptions::NETWORK_INTERRUPT_VECTOR,
+            destination_apic_id,
+            debug_state,
+        );
+        routes.set_network(exceptions::NETWORK_INTERRUPT_VECTOR, device);
+    } else {
+        tracing::warn!("virtio network device was not discovered on the PCI bus");
+    }
+    smp::current_runtime().install_device_interrupts(routes);
 }
 
 // TODO(x86-avx): enable OSXSAVE, program XCR0, and preserve XSAVE state
@@ -232,8 +306,8 @@ fn processor_count(rsdp_address: usize, physical_memory_offset: usize) -> usize 
         tsc_base: 0,
         tsc_hz: 1,
     };
-    let tables = unsafe { acpi::AcpiTables::from_rsdp(handler, rsdp_address) }
-        .unwrap_or_else(|error| {
+    let tables =
+        unsafe { acpi::AcpiTables::from_rsdp(handler, rsdp_address) }.unwrap_or_else(|error| {
             panic!("failed to parse ACPI tables for processor count: {error:?}")
         });
     let madt = tables
@@ -529,6 +603,15 @@ impl X86Cpu {
 
     pub(crate) fn debug_state(&self) -> debug_state::RuntimeState {
         self.state.debug_state()
+    }
+
+    /// Local-APIC id of the bootstrap processor: the destination every
+    /// device MSI-X message is addressed to.
+    pub(crate) fn bootstrap_apic_id(&self) -> u32 {
+        let bootstrap = self.state.bootstrap_processor();
+        self.state
+            .apic_id_of(bootstrap)
+            .unwrap_or_else(|| panic!("x86 bootstrap processor {bootstrap:?} has no local-APIC id"))
     }
 
     pub(crate) fn watchdog(&self) -> crate::watchdog::X86Watchdog {

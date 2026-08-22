@@ -1802,6 +1802,7 @@ dependencies = [
  "futures-lite",
  "helios-hal",
  "helios-netstack",
+ "pci_types",
  "spin 0.9.8",
  "thiserror 2.0.18",
  "zerocopy",
@@ -1812,13 +1813,16 @@ name = "helios-x86"
 version = "0.1.0"
 dependencies = [
  "acpi",
+ "bytes",
  "critical-section",
  "helios-hal",
  "helios-kernel",
+ "helios-virtio",
  "i6300esb",
  "limine 0.5.0",
  "pci_types",
  "spin 0.9.8",
+ "tracing",
  "x86",
  "x86_64",
 ]

@@ -35,7 +35,7 @@ use x86_64::structures::paging::{
 
 use crate::KERNEL_STACK_BYTES;
 use crate::debug_state;
-use crate::exceptions::ProcessorIdt;
+use crate::exceptions::{DeviceInterruptRoutes, ProcessorIdt};
 use crate::pci::LegacyPciConfigAccess;
 use crate::read_tsc;
 use crate::watchdog::X86Watchdog;
@@ -69,6 +69,7 @@ pub(crate) struct ProcessorRuntime {
     watchdog: X86Watchdog,
     timer: Once<Timer<crate::X86Cpu>>,
     program_service: Once<debug_state::ProgramService>,
+    device_interrupts: Once<DeviceInterruptRoutes>,
     local_timer_ready: AtomicBool,
     started: AtomicBool,
 }
@@ -144,6 +145,7 @@ pub(crate) fn build_boot_context(
             watchdog: watchdog.clone(),
             timer: Once::new(),
             program_service: Once::new(),
+            device_interrupts: Once::new(),
             local_timer_ready: AtomicBool::new(false),
             started: AtomicBool::new(false),
         },
@@ -169,6 +171,7 @@ pub(crate) fn build_boot_context(
                 watchdog: watchdog.clone(),
                 timer: Once::new(),
                 program_service: Once::new(),
+                device_interrupts: Once::new(),
                 local_timer_ready: AtomicBool::new(false),
                 started: AtomicBool::new(false),
             },
@@ -250,6 +253,18 @@ impl ProcessorRuntime {
             "x86 processor program service was installed more than once"
         );
         self.program_service.call_once(|| service);
+    }
+
+    /// Publishes the device interrupt routes this processor dispatches
+    /// MSI-X vectors through. Installed on the bootstrap processor
+    /// before interrupts are unmasked; every device MSI-X message is
+    /// addressed to that processor's local APIC.
+    pub(crate) fn install_device_interrupts(&self, routes: DeviceInterruptRoutes) {
+        assert!(
+            self.device_interrupts.get().is_none(),
+            "x86 device interrupt routes were installed more than once"
+        );
+        self.device_interrupts.call_once(|| routes);
     }
 
     pub(crate) fn ensure_local_timer(&self, vector: u8) {
@@ -410,6 +425,19 @@ pub(crate) fn handle_local_timer_interrupt() {
         .get()
         .unwrap_or_else(|| panic!("x86 local timer interrupted before kernel timer installation"))
         .handle_interrupt();
+    local_apic_eoi();
+}
+
+/// Dispatches an MSI-X device interrupt to the driver bound to `vector`.
+pub(crate) fn handle_device_interrupt(vector: u8) {
+    let runtime = current_runtime();
+    let routes = runtime.device_interrupts.get().unwrap_or_else(|| {
+        panic!("x86 device interrupt vector {vector:#x} fired before routes were installed")
+    });
+    assert!(
+        routes.route(vector),
+        "x86 device interrupt vector {vector:#x} has no registered handler"
+    );
     local_apic_eoi();
 }
 
