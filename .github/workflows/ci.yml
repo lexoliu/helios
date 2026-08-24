@@ -18,7 +18,7 @@ env:
   # Pinned snapshot of the modified Wasmtime tree the workspace's
   # `../wasmtime` path dependency builds against (docs/wasmtime.md).
   WASMTIME_REPOSITORY: lexoliu/wasmtime
-  WASMTIME_REF: e202ac1cab2492a9bdf5d2df3423b670b75f04e3
+  WASMTIME_REF: b83d18c8558b6d32fb0c0727d1c6a32639842c49
 
 jobs:
   checks:
