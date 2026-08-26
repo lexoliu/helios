@@ -28,35 +28,54 @@ where
         &self,
         host: &str,
         timeout_nanos: u64,
-    ) -> Result<Vec<KernelIpv4Address>, DnsError> {
+    ) -> Result<Vec<NetworkIpAddress>, DnsError> {
         self.execute_dns_resolve(host, timeout_nanos).await
     }
 
+    /// Resolves `host` to every address the resolver knows, in both
+    /// families.
+    ///
+    /// One `A` and one `AAAA` question go out together under separate
+    /// ids and both answers are collected before returning, because
+    /// `wasi:sockets/ip-name-lookup` hands the guest one address stream
+    /// covering both families and cannot ask again for the other one.
+    /// A resolver that answers only one of the two still yields that
+    /// family once the deadline passes rather than failing the lookup.
     pub(super) async fn execute_dns_resolve(
         &self,
         host: &str,
         timeout_nanos: u64,
-    ) -> Result<Vec<KernelIpv4Address>, DnsError> {
+    ) -> Result<Vec<NetworkIpAddress>, DnsError> {
         if let Some(address) = parse_ipv4(host) {
-            return Ok(vec![map_ipv4_address(address)]);
+            return Ok(vec![NetworkIpAddress::Ipv4(map_ipv4_address(address))]);
+        }
+        if let Some(address) = parse_ipv6(host) {
+            return Ok(vec![NetworkIpAddress::Ipv6(address)]);
         }
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
-        self.wait_for_ipv4_dns(deadline_nanos).await?;
-        let query_id = self.inner.state.with_mut(NetworkShard::next_dns_query_id);
+        self.wait_for_dns_transport(deadline_nanos).await?;
+        let queries = self.inner.state.with_mut(|state| DnsQueryPair {
+            a: state.next_dns_query_id(),
+            aaaa: state.next_dns_query_id(),
+        });
+        let mut answers = DnsAnswers::new();
 
         loop {
             self.drive_dns().await?;
             let now = StackInstant::from_nanos(self.now_nanos());
-            let query = self.inner.state.with_mut(
-                |state| -> Result<Option<Vec<Ipv4Address>>, DnsError> {
-                    state.send_dns_query(query_id, host, now)?;
-                    state.take_dns_response(query_id)
-                },
-            )?;
-            if let Some(addresses) = query {
-                return Ok(addresses.into_iter().map(map_ipv4_address).collect());
+            self.inner
+                .state
+                .with_mut(|state| -> Result<(), DnsError> {
+                    state.send_dns_queries(queries, host, &answers, now)?;
+                    state.poll_dns_responses(queries, &mut answers)
+                })?;
+            if answers.complete() {
+                return answers.finish();
             }
             if self.now_nanos() >= deadline_nanos {
+                if answers.answered_any() {
+                    return answers.finish();
+                }
                 return Err(DnsError {
                     kind: DnsErrorKind::Timeout,
                     detail: NetworkErrorDetail::DnsLookupTimeout,
@@ -67,8 +86,8 @@ where
         }
     }
 
-    pub(super) async fn wait_for_ipv4_dns(&self, deadline_nanos: u64) -> Result<(), DnsError> {
-        self.wait_for_ipv4_configured(
+    pub(super) async fn wait_for_dns_transport(&self, deadline_nanos: u64) -> Result<(), DnsError> {
+        self.wait_for_dns_configured(
             deadline_nanos,
             dns_configuration_timeout,
             dns_configuration_error,
@@ -98,10 +117,14 @@ where
                 },
                 detail: error.detail,
             })?;
+        // ICMP echo is IPv4-only in this service, so an IPv6-only name
+        // is unreachable through it even though the lookup succeeded.
         addresses
             .into_iter()
-            .next()
-            .map(map_kernel_ipv4_address)
+            .find_map(|address| match address {
+                NetworkIpAddress::Ipv4(address) => Some(map_kernel_ipv4_address(address)),
+                NetworkIpAddress::Ipv6(_) => None,
+            })
             .ok_or(PingError {
                 kind: PingErrorKind::UnresolvedHost,
                 detail: NetworkErrorDetail::DnsNoIpv4Address,
@@ -170,7 +193,7 @@ where
         &'a self,
         host: &'a str,
         timeout_nanos: u64,
-    ) -> impl core::future::Future<Output = Result<Vec<KernelIpv4Address>, DnsError>> + Send + 'a
+    ) -> impl core::future::Future<Output = Result<Vec<NetworkIpAddress>, DnsError>> + Send + 'a
     {
         async move { NetworkService::dns_resolve(self, host, timeout_nanos).await }
     }
@@ -189,10 +212,12 @@ where
         host: &'a str,
         port: u16,
         local_port: u16,
+        hop_limit: u8,
         timeout_nanos: u64,
     ) -> impl core::future::Future<Output = Result<Self::TcpStream, TcpError>> + Send + 'a {
         async move {
-            NetworkService::tcp_connect_from(self, host, port, local_port, timeout_nanos).await
+            NetworkService::tcp_connect_from(self, host, port, local_port, hop_limit, timeout_nanos)
+                .await
         }
     }
 
@@ -201,6 +226,7 @@ where
         remote_address: NetworkIpAddress,
         port: u16,
         local_port: u16,
+        hop_limit: u8,
         timeout_nanos: u64,
     ) -> impl core::future::Future<Output = Result<Self::TcpStream, TcpError>> + Send + '_ {
         async move {
@@ -209,6 +235,7 @@ where
                 remote_address,
                 port,
                 local_port,
+                hop_limit,
                 timeout_nanos,
             )
             .await
@@ -220,9 +247,24 @@ where
         local_address: NetworkIpAddress,
         local_port: u16,
         backlog: u16,
+        hop_limit: u8,
     ) -> impl core::future::Future<Output = Result<TcpListener<Self::TcpListener>, TcpError>> + Send + '_
     {
-        async move { NetworkService::tcp_listen(self, local_address, local_port, backlog).await }
+        async move {
+            NetworkService::tcp_listen(self, local_address, local_port, backlog, hop_limit).await
+        }
+    }
+
+    fn tcp_set_hop_limit(&self, stream: Self::TcpStream, hop_limit: u8) -> Result<(), TcpError> {
+        NetworkService::tcp_set_hop_limit(self, stream, hop_limit)
+    }
+
+    fn tcp_listener_set_hop_limit(
+        &self,
+        listener: Self::TcpListener,
+        hop_limit: u8,
+    ) -> Result<(), TcpError> {
+        NetworkService::tcp_listener_set_hop_limit(self, listener, hop_limit)
     }
 
     fn tcp_accept(
@@ -232,6 +274,27 @@ where
     ) -> impl core::future::Future<Output = Result<TcpAccepted<Self::TcpStream>, TcpError>> + Send + '_
     {
         async move { NetworkService::tcp_accept(self, listener, timeout_nanos).await }
+    }
+
+    fn tcp_readiness(
+        &self,
+        stream: Self::TcpStream,
+    ) -> impl core::future::Future<Output = Result<SocketReadiness, TcpError>> + Send + '_ {
+        async move { NetworkService::tcp_readiness(self, stream).await }
+    }
+
+    fn tcp_listener_readiness(
+        &self,
+        listener: Self::TcpListener,
+    ) -> impl core::future::Future<Output = Result<SocketReadiness, TcpError>> + Send + '_ {
+        async move { NetworkService::tcp_listener_readiness(self, listener).await }
+    }
+
+    fn udp_readiness(
+        &self,
+        socket: Self::UdpSocket,
+    ) -> impl core::future::Future<Output = Result<SocketReadiness, UdpError>> + Send + '_ {
+        async move { NetworkService::udp_readiness(self, socket).await }
     }
 
     fn tcp_write_all<'a>(
@@ -303,6 +366,10 @@ where
 
     fn udp_disconnect(&self, socket: Self::UdpSocket) -> Result<(), UdpError> {
         NetworkService::udp_disconnect(self, socket)
+    }
+
+    fn udp_set_hop_limit(&self, socket: Self::UdpSocket, hop_limit: u8) -> Result<(), UdpError> {
+        NetworkService::udp_set_hop_limit(self, socket, hop_limit)
     }
 
     fn udp_send<'a>(
@@ -715,27 +782,46 @@ impl NetworkShard {
         id
     }
 
-    pub(super) fn send_dns_query(
+    /// Sends whichever of the pair's questions is still outstanding.
+    ///
+    /// Called on every poll iteration, so an unanswered question is
+    /// retransmitted while its peer's answer is already banked.
+    pub(super) fn send_dns_queries(
+        &mut self,
+        queries: DnsQueryPair,
+        host: &str,
+        answers: &DnsAnswers,
+        now: StackInstant,
+    ) -> Result<(), DnsError> {
+        if !answers.a_answered {
+            self.send_dns_query(queries.a, host, DnsRecordType::A, now)?;
+        }
+        if !answers.aaaa_answered {
+            self.send_dns_query(queries.aaaa, host, DnsRecordType::Aaaa, now)?;
+        }
+        Ok(())
+    }
+
+    fn send_dns_query(
         &mut self,
         query_id: u16,
         host: &str,
+        record: DnsRecordType,
         now: StackInstant,
     ) -> Result<(), DnsError> {
-        let Some(server) = self.dns_servers.first().copied() else {
-            return Err(DnsError {
-                kind: DnsErrorKind::Unavailable,
-                detail: NetworkErrorDetail::DnsServersUnavailable,
-            });
-        };
         let mut payload = [0u8; 512];
         let len = DnsQuestionWriter::new(&mut payload)
-            .write_a_query(query_id, host)
+            .write_query(query_id, host, record)
             .ok_or(DnsError {
                 kind: DnsErrorKind::UnresolvedHost,
                 detail: NetworkErrorDetail::DnsQueryStartFailed,
             })?;
-        self.stack
-            .send_udp_ipv4(
+        // A DHCP-supplied resolver is preferred because the IPv4 path
+        // is always configured first; a Router Advertisement's RDNSS
+        // servers stand in on a link that offers IPv6 only.
+        let ipv6_server = self.stack.ipv6_dns_servers().next();
+        let queued = if let Some(server) = self.dns_servers.first().copied() {
+            self.stack.send_udp_ipv4(
                 INTERNAL_DNS_PORT,
                 server,
                 DNS_PORT,
@@ -743,17 +829,33 @@ impl NetworkShard {
                 query_id,
                 now,
             )
-            .map(|_| ())
-            .map_err(|_| DnsError {
+        } else if let Some(server) = ipv6_server {
+            self.stack.send_udp_ipv6(
+                INTERNAL_DNS_PORT,
+                server,
+                DNS_PORT,
+                &payload[..len],
+                now,
+            )
+        } else {
+            return Err(DnsError {
                 kind: DnsErrorKind::Unavailable,
-                detail: NetworkErrorDetail::DnsQueryStartFailed,
-            })
+                detail: NetworkErrorDetail::DnsServersUnavailable,
+            });
+        };
+        queued.map(|_| ()).map_err(|_| DnsError {
+            kind: DnsErrorKind::Unavailable,
+            detail: NetworkErrorDetail::DnsQueryStartFailed,
+        })
     }
 
-    pub(super) fn take_dns_response(
+    /// Drains the shared internal DNS socket, banking whichever of the
+    /// pair's answers have arrived.
+    pub(super) fn poll_dns_responses(
         &mut self,
-        query_id: u16,
-    ) -> Result<Option<Vec<Ipv4Address>>, DnsError> {
+        queries: DnsQueryPair,
+        answers: &mut DnsAnswers,
+    ) -> Result<(), DnsError> {
         let socket = self.internal_udp_socket(INTERNAL_DNS_SOCKET_INDEX, INTERNAL_DNS_PORT);
         while let Some(datagram) = self.stack.take_udp(socket).map_err(|_| DnsError {
             kind: DnsErrorKind::Unavailable,
@@ -763,17 +865,88 @@ impl NetworkShard {
             else {
                 continue;
             };
-            if message.id != query_id {
+            if message.id == queries.a {
+                answers.a_answered = true;
+            } else if message.id == queries.aaaa {
+                answers.aaaa_answered = true;
+            } else {
                 continue;
             }
-            if message.addresses.is_empty() {
-                return Err(DnsError {
-                    kind: DnsErrorKind::UnresolvedHost,
-                    detail: NetworkErrorDetail::DnsNoIpv4Address,
-                });
-            }
-            return Ok(Some(message.addresses.into_iter().collect()));
+            answers.extend(message.addresses.iter().copied());
         }
-        Ok(None)
+        Ok(())
+    }
+
+    /// Drives IPv6 stateless address autoconfiguration one step:
+    /// installs the link-local address on first call and queues a
+    /// Router Solicitation when one is due.
+    pub(super) fn drive_ipv6_autoconfig(
+        &mut self,
+        now: StackInstant,
+    ) -> Result<(), NetworkControlError> {
+        if self.stack.ipv6_link_local_address().is_none() {
+            self.stack.configure_ipv6_link_local();
+        }
+        self.stack
+            .drive_ipv6_autoconfig(now)
+            .map_err(|_| NetworkControlError::BackendFault)
+    }
+}
+
+/// The two question ids one dual-family lookup has outstanding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DnsQueryPair {
+    pub(super) a: u16,
+    pub(super) aaaa: u16,
+}
+
+/// Answers accumulated for one dual-family lookup.
+///
+/// Both questions share the internal DNS socket, so answers arrive
+/// interleaved with each other and with responses to abandoned lookups;
+/// this keeps per-lookup state out of the shard.
+pub(super) struct DnsAnswers {
+    addresses: Vec<NetworkIpAddress>,
+    a_answered: bool,
+    aaaa_answered: bool,
+}
+
+impl DnsAnswers {
+    fn new() -> Self {
+        Self {
+            addresses: Vec::new(),
+            a_answered: false,
+            aaaa_answered: false,
+        }
+    }
+
+    fn extend(&mut self, addresses: impl IntoIterator<Item = IpAddress>) {
+        for address in addresses {
+            let address = map_ip_address(address);
+            if !self.addresses.contains(&address) {
+                self.addresses.push(address);
+            }
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.a_answered && self.aaaa_answered
+    }
+
+    fn answered_any(&self) -> bool {
+        self.a_answered || self.aaaa_answered
+    }
+
+    /// A resolver that answered but returned no address for either
+    /// family means the name does not resolve, which is distinct from
+    /// the resolver never answering at all.
+    fn finish(self) -> Result<Vec<NetworkIpAddress>, DnsError> {
+        if self.addresses.is_empty() {
+            return Err(DnsError {
+                kind: DnsErrorKind::UnresolvedHost,
+                detail: NetworkErrorDetail::DnsNoIpv4Address,
+            });
+        }
+        Ok(self.addresses)
     }
 }

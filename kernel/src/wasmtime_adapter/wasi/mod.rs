@@ -29,7 +29,8 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 use crate::{
-    AuthorityDomain, ComponentNetworkService, EmbeddedBootFs, HostFsErrorKind, ObjectIdentity,
+    AuthorityDomain, ComponentNetworkService, ComponentOutputMode, ComponentOutputRoute,
+    ComponentOutputStreamKind, EmbeddedBootFs, HostFsErrorKind, ObjectIdentity,
 };
 use bytes::{Bytes, BytesMut};
 use futures::channel::oneshot;
@@ -52,14 +53,24 @@ use crate::wasmtime_adapter::component_host::{
 pub(crate) type FsNodeKind = crate::ComponentFsNodeKind;
 const FILE_READ_CHUNK_BYTES: usize = 1024 * 1024;
 const DEFAULT_WASI_UDP_BUFFER_BYTES: u64 = 64 * 1024;
-const DEFAULT_WASI_UDP_HOP_LIMIT: u8 = 64;
-const DEFAULT_WASI_TCP_HOP_LIMIT: u8 = 64;
+/// Receive window the netstack actually reserves per TCP socket.
+///
+/// `wasi:sockets` lets an implementation clamp a buffer-size hint and expects
+/// the getter to report the effective value, so this is the ceiling for
+/// `set-receive-buffer-size` rather than an arbitrary echo of the request.
+const WASI_TCP_RECEIVE_BUFFER_BYTES: u64 = helios_netstack::TCP_RECEIVE_WINDOW_BYTES as u64;
+/// Transmit buffer the netstack actually reserves per TCP socket.
+const WASI_TCP_SEND_BUFFER_BYTES: u64 = helios_netstack::TCP_TRANSMIT_BUFFER_BYTES as u64;
+const DEFAULT_WASI_UDP_HOP_LIMIT: u8 = helios_netstack::DEFAULT_HOP_LIMIT;
+const DEFAULT_WASI_TCP_HOP_LIMIT: u8 = helios_netstack::DEFAULT_HOP_LIMIT;
 const DEFAULT_WASI_TCP_LISTEN_BACKLOG: u16 = 128;
 const DEFAULT_WASI_TCP_KEEP_ALIVE_IDLE_NANOS: u64 = 7_200_000_000_000;
 const DEFAULT_WASI_TCP_KEEP_ALIVE_INTERVAL_NANOS: u64 = 75_000_000_000;
 const DEFAULT_WASI_TCP_KEEP_ALIVE_COUNT: u32 = 9;
 const MAX_WASI_UDP_DATAGRAM_BYTES: usize = u16::MAX as usize;
 const MAX_SYMLINK_DEPTH: usize = 16;
+/// 9p `QTDIR`: the qid type bit that marks a host-share object as a directory.
+pub(crate) const P9_QID_TYPE_DIRECTORY: u8 = 0x80;
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[error("guest requested wasi preview2 exit code {code}")]
@@ -122,6 +133,54 @@ impl WasiImportSet {
 
     pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
         self.names.iter().map(String::as_str)
+    }
+}
+
+/// Whether the component's standard input is attached to the interactive
+/// serial console.
+///
+/// The serial console is the only terminal Helios attaches a component to;
+/// every other stdin route is a byte channel fed by a parent process, which is
+/// a pipe rather than a tty. `wasi:cli/terminal-stdin` must only produce a
+/// `terminal-input` resource for the console so guests do not misdetect a tty
+/// on a captured stream.
+///
+/// Console-attached components read keystrokes through `helios:system/serial`
+/// rather than the wasi stdin stream, which stays empty; the terminal
+/// resource describes the attachment, not that stream.
+pub(crate) fn stdin_is_terminal(mode: &ComponentOutputMode) -> bool {
+    match mode {
+        ComponentOutputMode::Serial => true,
+        ComponentOutputMode::Trace
+        | ComponentOutputMode::Child { .. }
+        | ComponentOutputMode::RoutedChild { .. } => false,
+    }
+}
+
+/// Whether the requested output stream is attached to the interactive serial
+/// console.
+///
+/// `Trace` and `Discard` routes are capture sinks, and `Child` routes are
+/// pipes to a parent process; only the serial console is a terminal.
+pub(crate) fn output_is_terminal(
+    mode: &ComponentOutputMode,
+    kind: ComponentOutputStreamKind,
+) -> bool {
+    match mode {
+        ComponentOutputMode::Serial => true,
+        ComponentOutputMode::Trace | ComponentOutputMode::Child { .. } => false,
+        ComponentOutputMode::RoutedChild { stdout, stderr, .. } => {
+            let route = match kind {
+                ComponentOutputStreamKind::Stdout => stdout,
+                ComponentOutputStreamKind::Stderr => stderr,
+            };
+            match route {
+                ComponentOutputRoute::Serial => true,
+                ComponentOutputRoute::Trace
+                | ComponentOutputRoute::Child(_)
+                | ComponentOutputRoute::Discard => false,
+            }
+        }
     }
 }
 
@@ -190,6 +249,7 @@ impl<T> core::error::Error for TrappableError<T> {}
 
 #[cfg(test)]
 mod tests {
+    use crate::SocketReadiness;
     use alloc::boxed::Box;
     use alloc::collections::BTreeSet;
     use alloc::string::String;
@@ -213,8 +273,8 @@ mod tests {
         format_p3_tcp_socket_address, format_p3_udp_socket_address, fs_types,
         has_wasi_network_rights, ip_name_lookup, map_p3_dns_error, map_p3_tcp_error,
         map_p3_udp_family, map_p3_udp_socket_error, parse_p3_tcp_socket_address,
-        parse_p3_udp_socket_address, preview3, socket_types, wasi_tcp_bind_rights,
-        wasi_udp_bind_rights,
+        parse_p3_udp_socket_address, preview3, socket_types, stdin_is_terminal,
+        wasi_tcp_bind_rights, wasi_udp_bind_rights,
     };
 
     const fn tcp4(octets: [u8; 4], port: u16) -> WasiTcpSocketAddress {
@@ -252,6 +312,40 @@ mod tests {
         type TcpListener = u64;
         type UdpSocket = u64;
 
+        // The in-memory doubles model an always-ready loopback peer.
+        fn tcp_readiness(
+            &self,
+            _: Self::TcpStream,
+        ) -> impl Future<Output = Result<SocketReadiness, crate::TcpError>> + Send + '_ {
+            core::future::ready(Ok(SocketReadiness {
+                readable: true,
+                writable: true,
+                hangup: false,
+            }))
+        }
+
+        fn tcp_listener_readiness(
+            &self,
+            _: Self::TcpListener,
+        ) -> impl Future<Output = Result<SocketReadiness, crate::TcpError>> + Send + '_ {
+            core::future::ready(Ok(SocketReadiness {
+                readable: true,
+                writable: false,
+                hangup: false,
+            }))
+        }
+
+        fn udp_readiness(
+            &self,
+            _: Self::UdpSocket,
+        ) -> impl Future<Output = Result<SocketReadiness, crate::UdpError>> + Send + '_ {
+            core::future::ready(Ok(SocketReadiness {
+                readable: true,
+                writable: true,
+                hangup: false,
+            }))
+        }
+
         fn hardware_address(&self) -> [u8; 6] {
             [2, 0, 0, 0, 0, 1]
         }
@@ -282,10 +376,13 @@ mod tests {
             &self,
             _: &str,
             _: u64,
-        ) -> impl core::future::Future<Output = Result<Vec<crate::Ipv4Address>, crate::DnsError>>
-        + Send
+        ) -> impl core::future::Future<
+            Output = Result<Vec<crate::NetworkIpAddress>, crate::DnsError>,
+        > + Send
         + '_ {
-            core::future::ready(Ok(vec![crate::Ipv4Address::new([127, 0, 0, 1])]))
+            core::future::ready(Ok(vec![crate::NetworkIpAddress::Ipv4(
+                crate::Ipv4Address::new([127, 0, 0, 1]),
+            )]))
         }
 
         fn tcp_connect(
@@ -303,6 +400,7 @@ mod tests {
             _: &str,
             _: u16,
             local_port: u16,
+            _: u8,
             _: u64,
         ) -> impl core::future::Future<Output = Result<Self::TcpStream, crate::TcpError>> + Send + '_
         {
@@ -314,6 +412,7 @@ mod tests {
             _: crate::NetworkIpAddress,
             _: u16,
             local_port: u16,
+            _: u8,
             _: u64,
         ) -> impl core::future::Future<Output = Result<Self::TcpStream, crate::TcpError>> + Send + '_
         {
@@ -329,6 +428,7 @@ mod tests {
             _: crate::NetworkIpAddress,
             local_port: u16,
             _: u16,
+            _: u8,
         ) -> impl core::future::Future<
             Output = Result<crate::TcpListener<Self::TcpListener>, crate::TcpError>,
         > + Send
@@ -337,6 +437,18 @@ mod tests {
                 listener: 8,
                 local_port,
             }))
+        }
+
+        fn tcp_set_hop_limit(&self, _: Self::TcpStream, _: u8) -> Result<(), crate::TcpError> {
+            Ok(())
+        }
+
+        fn tcp_listener_set_hop_limit(
+            &self,
+            _: Self::TcpListener,
+            _: u8,
+        ) -> Result<(), crate::TcpError> {
+            Ok(())
         }
 
         fn tcp_accept(
@@ -410,6 +522,10 @@ mod tests {
         }
 
         fn udp_disconnect(&self, _: Self::UdpSocket) -> Result<(), crate::UdpError> {
+            Ok(())
+        }
+
+        fn udp_set_hop_limit(&self, _: Self::UdpSocket, _: u8) -> Result<(), crate::UdpError> {
             Ok(())
         }
 
@@ -635,6 +751,7 @@ mod tests {
             &[
                 "wasi:clocks/monotonic-clock",
                 "wasi:clocks/system-clock",
+                "wasi:clocks/timezone",
                 "wasi:cli/environment",
                 "wasi:cli/exit",
                 "wasi:cli/stdin",
@@ -655,6 +772,42 @@ mod tests {
             ],
             "Preview3",
         );
+    }
+
+    #[test]
+    fn only_serial_console_stdio_is_reported_as_a_terminal() {
+        use super::{ComponentOutputMode, ComponentOutputRoute, output_is_terminal};
+        use crate::ComponentOutputStreamKind::{Stderr, Stdout};
+
+        assert!(stdin_is_terminal(&ComponentOutputMode::Serial));
+        assert!(output_is_terminal(&ComponentOutputMode::Serial, Stdout));
+        assert!(output_is_terminal(&ComponentOutputMode::Serial, Stderr));
+
+        assert!(!stdin_is_terminal(&ComponentOutputMode::Trace));
+        assert!(!output_is_terminal(&ComponentOutputMode::Trace, Stdout));
+        assert!(!output_is_terminal(&ComponentOutputMode::Trace, Stderr));
+
+        let (stdout_tx, _stdout_rx) = crate::byte_channel();
+        let (stderr_tx, _stderr_rx) = crate::byte_channel();
+        let (_stdin_tx, stdin_rx) = crate::byte_channel();
+        let captured = ComponentOutputMode::Child {
+            stdin_rx: stdin_rx.clone(),
+            stdout_tx,
+            stderr_tx,
+        };
+        assert!(!stdin_is_terminal(&captured));
+        assert!(!output_is_terminal(&captured, Stdout));
+        assert!(!output_is_terminal(&captured, Stderr));
+
+        let (routed_stdout_tx, _routed_stdout_rx) = crate::byte_channel();
+        let routed = ComponentOutputMode::RoutedChild {
+            stdin_rx,
+            stdout: ComponentOutputRoute::Child(routed_stdout_tx),
+            stderr: ComponentOutputRoute::Serial,
+        };
+        assert!(!stdin_is_terminal(&routed));
+        assert!(!output_is_terminal(&routed, Stdout));
+        assert!(output_is_terminal(&routed, Stderr));
     }
 
     #[test]
@@ -679,6 +832,9 @@ mod tests {
                 "wasi:clocks/monotonic-clock.wait-until",
                 "wasi:clocks/system-clock.get-resolution",
                 "wasi:clocks/system-clock.now",
+                "wasi:clocks/timezone.iana-id",
+                "wasi:clocks/timezone.to-debug-string",
+                "wasi:clocks/timezone.utc-offset",
                 "wasi:filesystem/preopens.get-directories",
                 "wasi:filesystem/types.descriptor.advise",
                 "wasi:filesystem/types.descriptor.append-via-stream",
@@ -1074,6 +1230,7 @@ mod tests {
                 "types" => "wasi:clocks/types",
                 "monotonic-clock" => "wasi:clocks/monotonic-clock",
                 "system-clock" | "wall-clock" => "wasi:clocks/system-clock",
+                "timezone" => "wasi:clocks/timezone",
                 _ => return None,
             },
             "wasi:io" => match name {
@@ -1265,6 +1422,96 @@ mod tests {
             Err(error) => error,
         };
         assert!(matches!(error, fs_types::ErrorCode::IsDirectory));
+    }
+
+    fn host_metadata(identity: ObjectIdentity, qid_type: u8) -> crate::HostMetadata {
+        crate::HostMetadata {
+            identity,
+            qid_path: identity.local(),
+            qid_type,
+            mode: 0o100_644,
+            size: 17,
+            link_count: 2,
+            access_nanos: 3_000_000_004,
+            modified_nanos: 5_000_000_006,
+            status_nanos: 7_000_000_008,
+        }
+    }
+
+    /// Host-share stat must carry the host's real timestamps and link count.
+    ///
+    /// They used to be reported as absent and `1`, which makes `make`, `rsync`,
+    /// and every other mtime-driven tool treat a shared file as ageless.
+    #[test]
+    fn host_stat_reports_host_timestamps_and_link_count() {
+        let identity = ObjectIdentity::new(AuthorityDomain::HOST_SHARE_9P, 4242);
+
+        let stat = super::descriptor_stat_from_host_metadata(&host_metadata(identity, 0));
+
+        assert!(matches!(stat.type_, fs_types::DescriptorType::RegularFile));
+        assert_eq!(stat.link_count, 2);
+        assert_eq!(stat.size, 17);
+        let access = stat
+            .data_access_timestamp
+            .expect("host stat must report an access timestamp");
+        let modified = stat
+            .data_modification_timestamp
+            .expect("host stat must report a modification timestamp");
+        let status = stat
+            .status_change_timestamp
+            .expect("host stat must report a status timestamp");
+        assert_eq!((access.seconds, access.nanoseconds), (3, 4));
+        assert_eq!((modified.seconds, modified.nanoseconds), (5, 6));
+        assert_eq!((status.seconds, status.nanoseconds), (7, 8));
+    }
+
+    #[test]
+    fn host_directory_metadata_maps_to_a_directory_descriptor_type() {
+        let identity = ObjectIdentity::new(AuthorityDomain::HOST_SHARE_9P, 9);
+
+        let stat = super::descriptor_stat_from_host_metadata(&host_metadata(
+            identity,
+            super::P9_QID_TYPE_DIRECTORY,
+        ));
+
+        assert!(matches!(stat.type_, fs_types::DescriptorType::Directory));
+    }
+
+    /// `st_dev`/`st_ino` are derived from object identity, so neither half may
+    /// be zero for a host-share file: programs de-duplicate by that pair.
+    #[test]
+    fn host_file_identity_yields_nonzero_device_and_inode() {
+        let identity = ObjectIdentity::new(AuthorityDomain::HOST_SHARE_9P, 4242);
+
+        assert_ne!(identity.domain().raw(), 0);
+        assert_ne!(identity.local(), 0);
+        assert_eq!(identity.local(), 4242);
+        assert_ne!(
+            identity.domain().raw(),
+            AuthorityDomain::GUEST_BOOTFS.raw(),
+            "the host share must not share a device id with bootfs"
+        );
+    }
+
+    /// Embedded nodes need the same guarantee: a distinct, nonzero inode per
+    /// object within one device.
+    #[test]
+    fn embedded_nodes_report_nonzero_distinct_inodes() {
+        let mut filesystem = test_filesystem();
+        filesystem.seed_bootfs(test_bootfs());
+
+        let root = filesystem
+            .identity_at_path("/")
+            .expect("root identity must resolve");
+        let program = filesystem
+            .identity_at_path("/bin/tool")
+            .expect("bootfs program identity must resolve");
+
+        assert_eq!(root.domain(), AuthorityDomain::GUEST_BOOTFS);
+        assert_eq!(program.domain(), root.domain());
+        assert_ne!(root.local(), 0);
+        assert_ne!(program.local(), 0);
+        assert_ne!(root.local(), program.local());
     }
 
     #[test]
@@ -1881,6 +2128,42 @@ mod tests {
     }
 
     #[test]
+    fn p2_resolve_stream_yields_both_address_families_in_resolver_order() {
+        let mut stream = P2ResolveAddressStream::pending();
+        let v4 = crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([93, 184, 215, 14]));
+        let v6 = crate::NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::new([
+            0x26, 0x06, 0x28, 0x00, 0x02, 0x1f, 0xcb, 0x07, 0x68, 0x20, 0x80, 0xda, 0x00, 0xaf,
+            0x6b, 0x08,
+        ]));
+        stream.complete(Ok(vec![v4, v6]));
+
+        assert_eq!(stream.next_address().unwrap(), Some(v4));
+        assert_eq!(stream.next_address().unwrap(), Some(v6));
+        assert_eq!(stream.next_address().unwrap(), None);
+    }
+
+    #[test]
+    fn p3_ip_address_formatting_preserves_the_address_family() {
+        use crate::wasmtime_adapter::wasi::net::format_p3_ip_address;
+
+        assert!(matches!(
+            format_p3_ip_address(crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([
+                192, 0, 2, 1
+            ]))),
+            socket_types::IpAddress::Ipv4((192, 0, 2, 1))
+        ));
+        // Each 16-bit group is big-endian, per `wasi:sockets` ipv6-address.
+        assert!(matches!(
+            format_p3_ip_address(crate::NetworkIpAddress::Ipv6(
+                helios_netstack::Ipv6Address::new([
+                    0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                ])
+            )),
+            socket_types::IpAddress::Ipv6((0x2001, 0x0db8, 0, 0, 0, 0, 0, 1))
+        ));
+    }
+
+    #[test]
     fn p2_resolve_stream_yields_addresses_after_background_completion() {
         let mut stream = P2ResolveAddressStream::pending();
         assert!(!stream.is_ready());
@@ -1894,7 +2177,7 @@ mod tests {
             }
         ));
 
-        let address = crate::Ipv4Address::new([192, 0, 2, 1]);
+        let address = crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([192, 0, 2, 1]));
         stream.complete(Ok(vec![address]));
         assert!(stream.is_ready());
         assert_eq!(stream.next_address().unwrap(), Some(address));
@@ -1927,8 +2210,15 @@ mod tests {
         assert_eq!(socket.hop_limit().unwrap(), 127);
     }
 
+    /// Enabling keepalive must fail rather than be recorded.
+    ///
+    /// The netstack has no keepalive timer, so a socket that accepted
+    /// `set-keep-alive-enabled(true)` would leave a guest believing dead peers
+    /// get detected. The timing knobs stay settable — `wasi:sockets` allows
+    /// them to be configured while keepalive is off — and reading them back
+    /// still reports what was stored.
     #[test]
-    fn tcp_socket_keep_alive_options_are_descriptor_local_state() {
+    fn tcp_socket_rejects_enabling_unsupported_keep_alive() {
         let service = ComponentHostNetworkService::from_service(TestNetworkService);
         let socket = TcpSocket::new(service, WasiTcpSocketFamily::Ipv4);
 
@@ -1946,9 +2236,14 @@ mod tests {
             DEFAULT_WASI_TCP_KEEP_ALIVE_COUNT
         );
 
+        assert!(matches!(
+            socket.set_keep_alive_enabled(true),
+            Err(socket_types::ErrorCode::NotSupported)
+        ));
+        assert!(!socket.keep_alive_enabled().unwrap());
         socket
-            .set_keep_alive_enabled(true)
-            .expect("keepalive enable must be accepted");
+            .set_keep_alive_enabled(false)
+            .expect("disabling keepalive matches what the stack already does");
         socket
             .set_keep_alive_idle_time(11)
             .expect("nonzero idle time must be accepted");
@@ -1959,7 +2254,7 @@ mod tests {
             .set_keep_alive_count(3)
             .expect("nonzero count must be accepted");
 
-        assert!(socket.keep_alive_enabled().unwrap());
+        assert!(!socket.keep_alive_enabled().unwrap());
         assert_eq!(socket.keep_alive_idle_time().unwrap(), 11);
         assert_eq!(socket.keep_alive_interval().unwrap(), 13);
         assert_eq!(socket.keep_alive_count().unwrap(), 3);

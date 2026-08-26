@@ -18,6 +18,14 @@
 //! update without an explicit IPI. AArch64's broadcast TLB
 //! invalidation is the architectural equivalent of the x86 IPI
 //! shootdown protocol.
+//!
+//! Concurrency contract: every page-table mutation (leaf writes,
+//! intermediate-table allocation in `ensure_table`, unmap, protect,
+//! relocation) runs while holding the `state` mutex, so two
+//! processors can never race an invalid table slot and orphan each
+//! other's freshly mapped leaves. Reads (`translate_4k`) stay
+//! lock-free: table frames are never freed while the address space
+//! lives, and 64-bit descriptor reads are single-copy atomic.
 
 extern crate alloc;
 
@@ -445,7 +453,8 @@ impl Aarch64UserAddressSpace {
     // cut Store teardown from 52.0 ms to 3.0 ms over five runs.
     fn decommit_committed_subranges(&self, range: VirtRange) -> Result<(), AddressSpaceError> {
         validate_range(range)?;
-        let decommit_ranges = self.state.lock().take_committed_intersections(range)?;
+        let mut state = self.state.lock();
+        let decommit_ranges = state.take_committed_intersections(range)?;
         for subrange in decommit_ranges {
             self.decommit_mapped_range(subrange)?;
         }
@@ -458,50 +467,25 @@ impl Aarch64UserAddressSpace {
         flags: PageFlags,
     ) -> Result<(), AddressSpaceError> {
         validate_range(range)?;
-        let plan = self.state.lock().accessibility_plan(range)?;
+        let mut state = self.state.lock();
+        let plan = state.accessibility_plan(range)?;
         for subrange in plan.protect {
-            self.protect(subrange, flags)?;
+            self.protect_locked(&mut state, subrange, flags)?;
         }
         for subrange in plan.commit {
-            self.commit(subrange, flags)?;
+            self.commit_locked(&mut state, subrange, flags)?;
         }
         Ok(())
     }
-}
 
-impl AddressSpace for Aarch64UserAddressSpace {
-    fn reserve(&self, byte_len: usize) -> Result<VirtRange, AddressSpaceError> {
-        if byte_len == 0 {
-            return Err(AddressSpaceError::EmptyRange);
-        }
-        if !byte_len.is_multiple_of(PAGE) {
-            return Err(AddressSpaceError::Misaligned);
-        }
-        let range = self
-            .carve_reservation(byte_len)
-            .ok_or(AddressSpaceError::OutOfFrames)?;
-        self.state.lock().reserve(range);
-        Ok(range)
-    }
-
-    fn release(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
-        let committed = self.state.lock().release(virt)?;
-        for region in &committed {
-            for offset in (0..region.range.byte_len).step_by(PAGE) {
-                if let Ok(entry) = self.unmap_4k(region.range.start.raw() + offset) {
-                    self.dealloc_user_frame(entry);
-                }
-            }
-        }
-        self.state.lock().push_free_range(virt);
-        Ok(())
-    }
-
-    fn commit(&self, virt: VirtRange, flags: PageFlags) -> Result<(), AddressSpaceError> {
-        validate_range(virt)?;
+    fn commit_locked(
+        &self,
+        state: &mut ReservationTracker,
+        virt: VirtRange,
+        flags: PageFlags,
+    ) -> Result<(), AddressSpaceError> {
         let pte_flags = page_flags_to_pte(flags)?;
-
-        self.state.lock().precheck_commit(virt)?;
+        state.precheck_commit(virt)?;
 
         let mut mapped_pages = 0;
         for offset in (0..virt.byte_len).step_by(PAGE) {
@@ -526,21 +510,18 @@ impl AddressSpace for Aarch64UserAddressSpace {
             }
         }
 
-        self.state.lock().record_commit(virt, flags)?;
+        state.record_commit(virt, flags)?;
         Ok(())
     }
 
-    fn decommit(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
-        validate_range(virt)?;
-        self.state.lock().record_decommit(virt)?;
-        self.decommit_mapped_range(virt)?;
-        Ok(())
-    }
-
-    fn protect(&self, virt: VirtRange, flags: PageFlags) -> Result<(), AddressSpaceError> {
-        validate_range(virt)?;
+    fn protect_locked(
+        &self,
+        state: &mut ReservationTracker,
+        virt: VirtRange,
+        flags: PageFlags,
+    ) -> Result<(), AddressSpaceError> {
         let pte_flags = page_flags_to_pte(flags)?;
-        self.state.lock().ensure_committed(virt)?;
+        state.ensure_committed(virt)?;
         let mut protected_pages = 0;
         let mut old_entries = Vec::new();
         for offset in (0..virt.byte_len).step_by(PAGE) {
@@ -563,8 +544,58 @@ impl AddressSpace for Aarch64UserAddressSpace {
                 flush_tlb_pages(virt.start.raw(), protected_pages);
             }
         }
-        self.state.lock().record_protect(virt, flags)?;
+        state.record_protect(virt, flags)?;
         Ok(())
+    }
+}
+
+impl AddressSpace for Aarch64UserAddressSpace {
+    fn reserve(&self, byte_len: usize) -> Result<VirtRange, AddressSpaceError> {
+        if byte_len == 0 {
+            return Err(AddressSpaceError::EmptyRange);
+        }
+        if !byte_len.is_multiple_of(PAGE) {
+            return Err(AddressSpaceError::Misaligned);
+        }
+        let range = self
+            .carve_reservation(byte_len)
+            .ok_or(AddressSpaceError::OutOfFrames)?;
+        self.state.lock().reserve(range);
+        Ok(range)
+    }
+
+    fn release(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
+        let mut state = self.state.lock();
+        let committed = state.release(virt)?;
+        for region in &committed {
+            for offset in (0..region.range.byte_len).step_by(PAGE) {
+                if let Ok(entry) = self.unmap_4k(region.range.start.raw() + offset) {
+                    self.dealloc_user_frame(entry);
+                }
+            }
+        }
+        state.push_free_range(virt);
+        Ok(())
+    }
+
+    fn commit(&self, virt: VirtRange, flags: PageFlags) -> Result<(), AddressSpaceError> {
+        validate_range(virt)?;
+        let mut state = self.state.lock();
+        self.commit_locked(&mut state, virt, flags)
+    }
+
+    fn decommit(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
+        validate_range(virt)?;
+        let mut state = self.state.lock();
+        state.record_decommit(virt)?;
+        self.decommit_mapped_range(virt)?;
+        Ok(())
+    }
+
+    fn protect(&self, virt: VirtRange, flags: PageFlags) -> Result<(), AddressSpaceError> {
+        validate_range(virt)?;
+        let mut state = self.state.lock();
+        self.protect_locked(&mut state, virt, flags)
     }
 
     fn translate(&self, addr: VirtAddr) -> Translation {
@@ -591,7 +622,8 @@ impl AddressSpace for Aarch64UserAddressSpace {
 
     fn relocate(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
         validate_range(virt)?;
-        self.state.lock().ensure_committed(virt)?;
+        let state = self.state.lock();
+        state.ensure_committed(virt)?;
 
         let pages = self.build_relocation_plan(virt)?;
         for (index, page) in pages.iter().enumerate() {

@@ -20,11 +20,13 @@ use super::bindings::clocks::system_clock::Instant as P3SystemInstant;
 use super::bindings::filesystem::types as p3fs;
 use super::bindings::filesystem::types::{ErrorCode as P3ErrorCode, OpenFlags as P3OpenFlags};
 use super::{
-    DebugFileSystem, FsDescriptor, FsNodeKind, P2IncomingDatagramStream, P2Network,
-    P2OutgoingDatagramStream, P2ResolveAddressStream, Preview2GuestExit, TcpSocket, UdpSocket,
-    WasiAdapterTrap, WasiImportSet, WasiTcpSocketAddress, WasiTcpSocketFamily,
-    WasiUdpSocketAddress, WasiUdpSocketError, WasiUdpSocketFamily, has_wasi_network_rights,
-    metadata_hash_value, wasi_tcp_bind_rights, wasi_udp_bind_rights,
+    DebugFileSystem, FsDescriptor, FsNodeKind, HostFileStreamTarget, P2IncomingDatagramStream,
+    P2Network, P2OutgoingDatagramStream, P2ResolveAddressStream, Preview2GuestExit, TcpSocket,
+    UdpSocket, WasiAdapterTrap, WasiImportSet, WasiTcpSocketAddress, WasiTcpSocketFamily,
+    WasiUdpSocketAddress, WasiUdpSocketError, WasiUdpSocketFamily,
+    descriptor_stat_from_host_metadata, has_wasi_network_rights, host_metadata_node_kind,
+    metadata_hash_value, output_is_terminal, stdin_is_terminal, wasi_tcp_bind_rights,
+    wasi_udp_bind_rights,
 };
 use crate::wasmtime_adapter::component_host::{
     HostRuntimeState, RuntimeDeadlinePollable, StoreData,
@@ -145,6 +147,7 @@ pub(crate) mod clocks_bindings {
                     world imports {
                         import wasi:clocks/monotonic-clock@0.2.12;
                         import wasi:clocks/wall-clock@0.2.12;
+                        import wasi:clocks/timezone@0.2.12;
                     }
                 ",
             path: "../../wasmtime/crates/wasi/src/p2/wit",
@@ -182,6 +185,10 @@ pub(crate) mod filesystem_bindings {
                 "wasi:filesystem/types.[method]descriptor.write": async | tracing | trappable,
                 "wasi:filesystem/types.[method]descriptor.read-directory": async | tracing | trappable,
                 "wasi:filesystem/types.[method]descriptor.set-size": async | tracing | trappable,
+                "wasi:filesystem/types.[method]descriptor.set-times": async | tracing | trappable,
+                "wasi:filesystem/types.[method]descriptor.set-times-at": async | tracing | trappable,
+                "wasi:filesystem/types.[method]descriptor.sync": async | tracing | trappable,
+                "wasi:filesystem/types.[method]descriptor.sync-data": async | tracing | trappable,
                 "wasi:filesystem/types.[method]descriptor.create-directory-at": async | tracing | trappable,
                 "wasi:filesystem/types.[method]descriptor.link-at": async | tracing | trappable,
                 "wasi:filesystem/types.[method]descriptor.readlink-at": async | tracing | trappable,
@@ -285,6 +292,13 @@ use sockets_bindings::sockets::tcp_create_socket as p2tcp_create;
 use sockets_bindings::sockets::udp as p2udp;
 use sockets_bindings::sockets::udp_create_socket as p2udp_create;
 
+/// Bytes a single `write` permit covers on a preview2 file output stream.
+/// A host-share write turns into one 9p `Twrite` batch, so the permit is
+/// capped well below the transport's message size.
+const P2_FILE_STREAM_WRITE_PERMIT_BYTES: usize = 64 * 1024;
+/// Bytes pulled from the host share per `Tread` while streaming a file.
+const HOST_FILE_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+
 pub struct TerminalInput;
 pub struct TerminalOutput;
 pub struct DirectoryEntryStream {
@@ -299,6 +313,24 @@ struct FileInputStream {
     cursor: usize,
 }
 
+/// Reads a host-share file through the 9p client one bounded chunk at a time.
+///
+/// `wasi:io/streams.input-stream.read` is synchronous, so the 9p round trip
+/// happens in `Pollable::ready`, which the guest awaits through the stream's
+/// pollable (and which `blocking-read` awaits for it). Only one chunk is ever
+/// resident, so streaming a large host file never scales kernel memory with
+/// the file's size.
+struct HostFileInputStream<HostFs>
+where
+    HostFs: crate::HostFileSystem,
+{
+    host: HostFileStreamTarget<HostFs>,
+    offset: u64,
+    buffer: Bytes,
+    end_of_file: bool,
+    failure: Option<p2fs::ErrorCode>,
+}
+
 struct FileOutputStream<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
@@ -310,6 +342,11 @@ where
     descriptor: FsDescriptor,
     offset: u64,
     append: bool,
+    /// Set when the descriptor names a host-share file; writes to it are
+    /// buffered here and flushed over 9p from `Pollable::ready`.
+    host: Option<HostFileStreamTarget<HostFs>>,
+    pending: Option<Bytes>,
+    failure: Option<p2fs::ErrorCode>,
 }
 
 #[derive(Debug, Error)]
@@ -324,6 +361,45 @@ impl FileInputStream {
     }
 }
 
+impl<HostFs> HostFileInputStream<HostFs>
+where
+    HostFs: crate::HostFileSystem,
+{
+    fn new(host: HostFileStreamTarget<HostFs>, offset: u64) -> Self {
+        Self {
+            host,
+            offset,
+            buffer: Bytes::new(),
+            end_of_file: false,
+            failure: None,
+        }
+    }
+
+    async fn fill(&mut self) {
+        if !self.buffer.is_empty() || self.end_of_file || self.failure.is_some() {
+            return;
+        }
+        let max_bytes = u32::try_from(HOST_FILE_STREAM_CHUNK_BYTES)
+            .expect("host file stream chunk must fit into a 9p read count");
+        match self
+            .host
+            .service
+            .read_file_range(&self.host.path, self.offset, max_bytes)
+            .await
+        {
+            Ok(bytes) if bytes.is_empty() => self.end_of_file = true,
+            Ok(bytes) => {
+                self.offset = self
+                    .offset
+                    .checked_add(u64::try_from(bytes.len()).expect("chunk length overflowed u64"))
+                    .expect("host file stream offset overflowed u64");
+                self.buffer = Bytes::from(bytes);
+            }
+            Err(error) => self.failure = Some(error_code_from_p3(map_host_fs_error(error))),
+        }
+    }
+}
+
 impl<CpuImpl, HostFs> FileOutputStream<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
@@ -335,6 +411,7 @@ where
         descriptor: FsDescriptor,
         offset: u64,
         append: bool,
+        host: Option<HostFileStreamTarget<HostFs>>,
     ) -> Self {
         Self {
             cpu,
@@ -343,11 +420,131 @@ where
             descriptor,
             offset,
             append,
+            host,
+            pending: None,
+            failure: None,
         }
     }
 
     fn now_nanos(&self) -> u64 {
         self.runtime_state.uptime_nanos(self.cpu.now().ticks())
+    }
+
+    /// Hands the buffered batch to the host share.
+    ///
+    /// Positional writes advance the stream offset by what was accepted;
+    /// append writes let the 9p client resolve the end of file so a file the
+    /// host grew in the meantime is not clobbered.
+    async fn flush_pending(&mut self) {
+        let Some(host) = self.host.clone() else {
+            return;
+        };
+        let Some(bytes) = self.pending.take() else {
+            return;
+        };
+        let result = if self.append {
+            host.service
+                .append_file(&host.path, bytes.as_ref())
+                .await
+                .map(|_| ())
+        } else {
+            host.service
+                .write_file(&host.path, self.offset, bytes.as_ref())
+                .await
+        };
+        match result {
+            Ok(()) => {
+                if !self.append {
+                    self.offset = self
+                        .offset
+                        .checked_add(
+                            u64::try_from(bytes.len()).expect("write length overflowed u64"),
+                        )
+                        .expect("host file stream offset overflowed u64");
+                }
+            }
+            Err(error) => self.failure = Some(error_code_from_p3(map_host_fs_error(error))),
+        }
+    }
+}
+
+impl<CpuImpl, HostFs> StoreData<CpuImpl, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    /// Backs both `sync` and `sync-data`.
+    ///
+    /// A host-share descriptor is flushed with a real 9p `Tfsync`. The
+    /// embedded filesystem stores every node in memory with no write-back
+    /// stage behind it, so there is nothing to flush and the no-op is the
+    /// correct result rather than an unimplemented one.
+    async fn sync_descriptor(
+        &mut self,
+        descriptor: Resource<FsDescriptor>,
+    ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
+        let descriptor = match get_fs_descriptor(self, &descriptor) {
+            Ok(descriptor) => descriptor,
+            Err(error) => return Ok(Err(error)),
+        };
+        let Some(host_path) =
+            crate::guest_host_share_path(&descriptor.path).map(|path| path.to_owned())
+        else {
+            return Ok(Ok(()));
+        };
+        let service = match self.filesystem().host_service() {
+            Ok(service) => service,
+            Err(error) => return Ok(Err(error_code_from_p3(error))),
+        };
+        match service.sync_file(&host_path).await {
+            Ok(()) => Ok(Ok(())),
+            Err(err) => Ok(Err(error_code_from_p3(map_host_fs_error(err)))),
+        }
+    }
+
+    /// Backs both `set-times` and `set-times-at`, routing host-share paths
+    /// through the 9p `Tsetattr` the client already speaks.
+    async fn set_times_at_absolute_path(
+        &mut self,
+        absolute: String,
+        data_access_timestamp: p2fs::NewTimestamp,
+        data_modification_timestamp: p2fs::NewTimestamp,
+    ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
+        let now_nanos = self.system_time_nanos();
+        let access_nanos = match p2_new_timestamp_nanos(data_access_timestamp, now_nanos) {
+            Ok(value) => value,
+            Err(error) => return Ok(Err(error)),
+        };
+        let modified_nanos = match p2_new_timestamp_nanos(data_modification_timestamp, now_nanos) {
+            Ok(value) => value,
+            Err(error) => return Ok(Err(error)),
+        };
+        if let Some(host_path) = crate::guest_host_share_path(&absolute).map(|path| path.to_owned())
+        {
+            let service = match self.filesystem().host_service() {
+                Ok(service) => service,
+                Err(error) => return Ok(Err(error_code_from_p3(error))),
+            };
+            return match service
+                .set_times(&host_path, access_nanos, modified_nanos)
+                .await
+            {
+                Ok(()) => {
+                    self.filesystem_mut().invalidate_host_subtree(&absolute);
+                    Ok(Ok(()))
+                }
+                Err(err) => Ok(Err(error_code_from_p3(map_host_fs_error(err)))),
+            };
+        }
+        match self.filesystem_mut().set_times_at_path(
+            &absolute,
+            access_nanos,
+            modified_nanos,
+            now_nanos,
+        ) {
+            Ok(()) => Ok(Ok(())),
+            Err(error) => Ok(Err(error_code_from_p3(error))),
+        }
     }
 }
 
@@ -432,6 +629,17 @@ where
             |state| state,
         )?;
     }
+    if imports.has("wasi:clocks/timezone", "0.2") {
+        // Every member is gated behind the `clocks-timezone` unstable
+        // feature; opt in or the interface links with no functions.
+        let mut options = clocks_bindings::clocks::timezone::LinkOptions::default();
+        options.clocks_timezone(true);
+        clocks_bindings::clocks::timezone::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
+            linker,
+            &options,
+            |state| state,
+        )?;
+    }
 
     if imports.has("wasi:filesystem/preopens", "0.2") {
         filesystem_bindings::filesystem::preopens::add_to_linker::<
@@ -512,13 +720,18 @@ where
 
 #[wasmtime_wasi_io::async_trait]
 impl Pollable for EmptyInputStream {
+    /// A closed stream is always ready: there is nothing left to wait for.
     async fn ready(&mut self) {}
 }
 
 #[wasmtime_wasi_io::async_trait]
 impl InputStream for EmptyInputStream {
+    /// Signal end-of-file the same way `FileInputStream` does once its
+    /// contents are drained. Returning an empty `Bytes` instead would mean
+    /// "no data ready yet", which makes `blocking_read` spin until it
+    /// exhausts `MAX_BLOCKING_ATTEMPTS` and traps the guest.
     fn read(&mut self, _: usize) -> core::result::Result<Bytes, StreamError> {
-        Ok(Bytes::new())
+        Err(StreamError::Closed)
     }
 }
 
@@ -542,12 +755,50 @@ impl InputStream for FileInputStream {
 }
 
 #[wasmtime_wasi_io::async_trait]
+impl<HostFs> Pollable for HostFileInputStream<HostFs>
+where
+    HostFs: crate::HostFileSystem,
+{
+    async fn ready(&mut self) {
+        self.fill().await;
+    }
+}
+
+#[wasmtime_wasi_io::async_trait]
+impl<HostFs> InputStream for HostFileInputStream<HostFs>
+where
+    HostFs: crate::HostFileSystem,
+{
+    fn read(&mut self, size: usize) -> core::result::Result<Bytes, StreamError> {
+        // A failure is sticky: once a 9p read has failed the stream is broken,
+        // and reporting it only once would let the guest read on as though
+        // the file had simply ended.
+        if let Some(error) = self.failure {
+            return Err(p2_stream_error(error));
+        }
+        if self.buffer.is_empty() {
+            // End of file closes the stream; otherwise the next chunk is
+            // still in flight and an empty read means "nothing ready yet".
+            return if self.end_of_file {
+                Err(StreamError::Closed)
+            } else {
+                Ok(Bytes::new())
+            };
+        }
+        let end = size.min(self.buffer.len());
+        Ok(self.buffer.split_to(end))
+    }
+}
+
+#[wasmtime_wasi_io::async_trait]
 impl<CpuImpl, HostFs> Pollable for FileOutputStream<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    async fn ready(&mut self) {}
+    async fn ready(&mut self) {
+        self.flush_pending().await;
+    }
 }
 
 #[wasmtime_wasi_io::async_trait]
@@ -557,6 +808,23 @@ where
     HostFs: crate::HostFileSystem,
 {
     fn write(&mut self, bytes: Bytes) -> core::result::Result<(), StreamError> {
+        // Sticky, like the read side: a stream whose host write failed stays
+        // failed instead of silently accepting more bytes.
+        if let Some(error) = self.failure {
+            return Err(p2_stream_error(error));
+        }
+        if self.host.is_some() {
+            // `write` must never block, and reaching the host share means a
+            // 9p round trip. The batch is parked here and flushed from
+            // `ready`; `check_write` withholds the next permit until then.
+            if self.pending.is_some() {
+                return Err(StreamError::trap(
+                    "preview2 file stream write exceeded its check-write permit",
+                ));
+            }
+            self.pending = Some(bytes);
+            return Ok(());
+        }
         let now_nanos = self.now_nanos();
         if self.append {
             self.filesystem
@@ -574,6 +842,12 @@ where
     }
 
     fn flush(&mut self) -> core::result::Result<(), StreamError> {
+        // Embedded writes are already durable in the node they target, and a
+        // buffered host batch is drained by `ready`, which `check_write`
+        // pends on. Neither case has anything left to push here.
+        if let Some(error) = self.failure {
+            return Err(p2_stream_error(error));
+        }
         Ok(())
     }
 
@@ -581,16 +855,37 @@ where
         if !self.descriptor.flags.contains(p3fs::DescriptorFlags::WRITE) {
             return Err(p2_stream_error(p2fs::ErrorCode::NotPermitted));
         }
-        Ok(64 * 1024)
+        if let Some(error) = self.failure {
+            return Err(p2_stream_error(error));
+        }
+        if self.pending.is_some() {
+            return Ok(0);
+        }
+        Ok(P2_FILE_STREAM_WRITE_PERMIT_BYTES)
     }
 }
 
 #[wasmtime_wasi_io::async_trait]
 impl Pollable for TcpSocket {
+    /// Resolves once the socket's outstanding operation has a result.
+    ///
+    /// `wasi:sockets/tcp` funnels `finish-connect`, `finish-listen`, and
+    /// `accept` through this one pollable: each returns `would-block` while
+    /// its background task runs, and the guest is expected to block on the
+    /// pollable until retrying is worthwhile. Reporting ready while an accept
+    /// is still waiting for a connection turns that contract into a spin —
+    /// the guest retries `accept`, gets `would-block`, and polls again — so
+    /// readiness has to cover every in-flight operation, not just connect.
     async fn ready(&mut self) {
         loop {
-            if !self.inner.lock().connect_in_progress {
-                return;
+            {
+                let state = self.inner.lock();
+                let in_flight = state.connect_in_progress
+                    || state.listen_in_progress
+                    || (state.accept_in_progress && state.accept_result.is_none());
+                if !in_flight {
+                    return;
+                }
             }
             self.ready.notified().await;
         }
@@ -784,7 +1079,10 @@ where
     HostFs: crate::HostFileSystem,
 {
     fn get_terminal_stdin(&mut self) -> Result<Option<Resource<TerminalInput>>> {
-        Ok(None)
+        if !stdin_is_terminal(self.output_mode()) {
+            return Ok(None);
+        }
+        Ok(Some(self.table.push(TerminalInput)?))
     }
 }
 
@@ -794,7 +1092,10 @@ where
     HostFs: crate::HostFileSystem,
 {
     fn get_terminal_stdout(&mut self) -> Result<Option<Resource<TerminalOutput>>> {
-        Ok(None)
+        if !output_is_terminal(self.output_mode(), ComponentOutputStreamKind::Stdout) {
+            return Ok(None);
+        }
+        Ok(Some(self.table.push(TerminalOutput)?))
     }
 }
 
@@ -804,7 +1105,10 @@ where
     HostFs: crate::HostFileSystem,
 {
     fn get_terminal_stderr(&mut self) -> Result<Option<Resource<TerminalOutput>>> {
-        Ok(None)
+        if !output_is_terminal(self.output_mode(), ComponentOutputStreamKind::Stderr) {
+            return Ok(None);
+        }
+        Ok(Some(self.table.push(TerminalOutput)?))
     }
 }
 
@@ -853,6 +1157,32 @@ where
     }
 }
 
+impl<CpuImpl, HostFs> clocks_bindings::clocks::timezone::Host for StoreData<CpuImpl, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    fn display(
+        &mut self,
+        _when: clocks_bindings::clocks::timezone::Datetime,
+    ) -> Result<clocks_bindings::clocks::timezone::TimezoneDisplay> {
+        // The kernel does not expose a local time zone; per the WASI
+        // contract that means UTC with a zero offset.
+        Ok(clocks_bindings::clocks::timezone::TimezoneDisplay {
+            utc_offset: 0,
+            name: String::from("UTC"),
+            in_daylight_saving_time: false,
+        })
+    }
+
+    fn utc_offset(
+        &mut self,
+        _when: clocks_bindings::clocks::timezone::Datetime,
+    ) -> Result<i32> {
+        Ok(0)
+    }
+}
+
 impl<CpuImpl, HostFs> filesystem_bindings::filesystem::preopens::Host for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
@@ -896,6 +1226,21 @@ where
             Ok(descriptor) => descriptor,
             Err(error) => return Ok(Err(error)),
         };
+        match HostFileStreamTarget::for_descriptor(self, &descriptor) {
+            Ok(Some(host)) => {
+                if descriptor.kind != FsNodeKind::File {
+                    return Ok(Err(p2fs::ErrorCode::IsDirectory));
+                }
+                if !descriptor.flags.contains(p3fs::DescriptorFlags::READ) {
+                    return Ok(Err(p2fs::ErrorCode::NotPermitted));
+                }
+                let stream = HostFileInputStream::new(host, offset);
+                let resource = self.table.push(Box::new(stream) as DynInputStream)?;
+                return Ok(Ok(resource));
+            }
+            Ok(None) => {}
+            Err(error) => return Ok(Err(error_code_from_p3(error))),
+        }
         let max_bytes = match self.filesystem_mut().stat(&descriptor.path) {
             Ok(stat) => {
                 if offset >= stat.size {
@@ -936,12 +1281,17 @@ where
         if !descriptor.flags.contains(p3fs::DescriptorFlags::WRITE) {
             return Ok(Err(p2fs::ErrorCode::NotPermitted));
         }
+        let host = match HostFileStreamTarget::for_descriptor(self, &descriptor) {
+            Ok(host) => host,
+            Err(error) => return Ok(Err(error_code_from_p3(error))),
+        };
         let stream = FileOutputStream::new(
             self.cpu.clone(),
             self.runtime_state.clone(),
             descriptor,
             offset,
             false,
+            host,
         );
         Ok(Ok(self.table.push(Box::new(stream) as DynOutputStream)?))
     }
@@ -957,12 +1307,17 @@ where
         if !descriptor.flags.contains(p3fs::DescriptorFlags::WRITE) {
             return Ok(Err(p2fs::ErrorCode::NotPermitted));
         }
+        let host = match HostFileStreamTarget::for_descriptor(self, &descriptor) {
+            Ok(host) => host,
+            Err(error) => return Ok(Err(error_code_from_p3(error))),
+        };
         let stream = FileOutputStream::new(
             self.cpu.clone(),
             self.runtime_state.clone(),
             descriptor,
             0,
             true,
+            host,
         );
         Ok(Ok(self.table.push(Box::new(stream) as DynOutputStream)?))
     }
@@ -980,11 +1335,11 @@ where
         }
     }
 
-    fn sync_data(
+    async fn sync_data(
         &mut self,
-        _: Resource<FsDescriptor>,
+        descriptor: Resource<FsDescriptor>,
     ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
-        Ok(Ok(()))
+        self.sync_descriptor(descriptor).await
     }
 
     fn get_flags(
@@ -1043,32 +1398,22 @@ where
         }
     }
 
-    fn set_times(
+    async fn set_times(
         &mut self,
         descriptor: Resource<FsDescriptor>,
         data_access_timestamp: p2fs::NewTimestamp,
         data_modification_timestamp: p2fs::NewTimestamp,
     ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
-        let now_nanos = self.system_time_nanos();
-        let access_nanos = match p2_new_timestamp_nanos(data_access_timestamp, now_nanos) {
-            Ok(value) => value,
-            Err(error) => return Ok(Err(error)),
-        };
-        let modified_nanos = match p2_new_timestamp_nanos(data_modification_timestamp, now_nanos) {
-            Ok(value) => value,
-            Err(error) => return Ok(Err(error)),
-        };
         let descriptor = match get_fs_descriptor(self, &descriptor) {
             Ok(descriptor) => descriptor,
             Err(error) => return Ok(Err(error)),
         };
-        match self
-            .filesystem_mut()
-            .set_times(&descriptor, access_nanos, modified_nanos, now_nanos)
-        {
-            Ok(()) => Ok(Ok(())),
-            Err(error) => Ok(Err(error_code_from_p3(error))),
-        }
+        self.set_times_at_absolute_path(
+            descriptor.path,
+            data_access_timestamp,
+            data_modification_timestamp,
+        )
+        .await
     }
 
     async fn read(
@@ -1192,11 +1537,11 @@ where
         }
     }
 
-    fn sync(
+    async fn sync(
         &mut self,
-        _: Resource<FsDescriptor>,
+        descriptor: Resource<FsDescriptor>,
     ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
-        Ok(Ok(()))
+        self.sync_descriptor(descriptor).await
     }
 
     async fn create_directory_at(
@@ -1251,18 +1596,9 @@ where
             };
             let host_path = host_path.to_owned();
             return match service.stat_path(&host_path).await {
-                Ok(metadata) => Ok(Ok(p2fs::DescriptorStat {
-                    type_: if metadata.qid_type & 0x80 != 0 {
-                        p2fs::DescriptorType::Directory
-                    } else {
-                        p2fs::DescriptorType::RegularFile
-                    },
-                    link_count: 1,
-                    size: metadata.size,
-                    data_access_timestamp: None,
-                    data_modification_timestamp: None,
-                    status_change_timestamp: None,
-                })),
+                Ok(metadata) => Ok(Ok(descriptor_stat_from_p3(
+                    descriptor_stat_from_host_metadata(&metadata),
+                ))),
                 Err(err) => Ok(Err(error_code_from_p3(map_host_fs_error(err)))),
             };
         }
@@ -1294,18 +1630,9 @@ where
             };
             let host_path = host_path.to_owned();
             return match service.stat_path(&host_path).await {
-                Ok(metadata) => Ok(Ok(p2fs::DescriptorStat {
-                    type_: if metadata.qid_type & 0x80 != 0 {
-                        p2fs::DescriptorType::Directory
-                    } else {
-                        p2fs::DescriptorType::RegularFile
-                    },
-                    link_count: 1,
-                    size: metadata.size,
-                    data_access_timestamp: None,
-                    data_modification_timestamp: None,
-                    status_change_timestamp: None,
-                })),
+                Ok(metadata) => Ok(Ok(descriptor_stat_from_p3(
+                    descriptor_stat_from_host_metadata(&metadata),
+                ))),
                 Err(err) => Ok(Err(error_code_from_p3(map_host_fs_error(err)))),
             };
         }
@@ -1315,7 +1642,7 @@ where
         }
     }
 
-    fn set_times_at(
+    async fn set_times_at(
         &mut self,
         descriptor: Resource<FsDescriptor>,
         _: p2fs::PathFlags,
@@ -1323,15 +1650,6 @@ where
         data_access_timestamp: p2fs::NewTimestamp,
         data_modification_timestamp: p2fs::NewTimestamp,
     ) -> Result<core::result::Result<(), p2fs::ErrorCode>> {
-        let now_nanos = self.system_time_nanos();
-        let access_nanos = match p2_new_timestamp_nanos(data_access_timestamp, now_nanos) {
-            Ok(value) => value,
-            Err(error) => return Ok(Err(error)),
-        };
-        let modified_nanos = match p2_new_timestamp_nanos(data_modification_timestamp, now_nanos) {
-            Ok(value) => value,
-            Err(error) => return Ok(Err(error)),
-        };
         let descriptor = match get_fs_descriptor(self, &descriptor) {
             Ok(descriptor) => descriptor,
             Err(error) => return Ok(Err(error)),
@@ -1340,15 +1658,12 @@ where
             Ok(path) => path,
             Err(error) => return Ok(Err(error_code_from_path(error))),
         };
-        match self.filesystem_mut().set_times_at_path(
-            &absolute,
-            access_nanos,
-            modified_nanos,
-            now_nanos,
-        ) {
-            Ok(()) => Ok(Ok(())),
-            Err(error) => Ok(Err(error_code_from_p3(error))),
-        }
+        self.set_times_at_absolute_path(
+            absolute,
+            data_access_timestamp,
+            data_modification_timestamp,
+        )
+        .await
     }
 
     async fn link_at(
@@ -1474,13 +1789,8 @@ where
                     }
                 }
             };
-            let (kind, identity, contents, descriptor_flags_p3) = if let Some(meta) = metadata {
-                let is_dir = meta.qid_type & 0x80 != 0;
-                let kind = if is_dir {
-                    crate::wasmtime_adapter::wasi::FsNodeKind::Directory
-                } else {
-                    crate::wasmtime_adapter::wasi::FsNodeKind::File
-                };
+            let (kind, identity, descriptor_flags_p3) = if let Some(meta) = metadata {
+                let kind = host_metadata_node_kind(&meta);
                 let descriptor_flags_p3 = match super::effective_open_descriptor_flags(
                     base.flags,
                     descriptor_flags_p3,
@@ -1489,24 +1799,34 @@ where
                     Ok(flags) => flags,
                     Err(error) => return Ok(Err(error_code_from_p3(error))),
                 };
-                if !is_dir {
-                    match service.read_file(&host_path).await {
-                        Ok(bytes) => (kind, meta.identity, Some(bytes), descriptor_flags_p3),
-                        Err(err) => {
-                            return Ok(Err(error_code_from_p3(map_host_fs_error(err))));
-                        }
+                if open_flags_p3.contains(P3OpenFlags::TRUNCATE) {
+                    if kind != crate::wasmtime_adapter::wasi::FsNodeKind::File {
+                        return Ok(Err(p2fs::ErrorCode::IsDirectory));
                     }
-                } else {
+                    if !base
+                        .flags
+                        .contains(p3fs::DescriptorFlags::MUTATE_DIRECTORY)
+                    {
+                        return Ok(Err(p2fs::ErrorCode::ReadOnly));
+                    }
+                    if let Err(err) = service.truncate_file(&host_path).await {
+                        return Ok(Err(error_code_from_p3(map_host_fs_error(err))));
+                    }
+                }
+                if kind == crate::wasmtime_adapter::wasi::FsNodeKind::Directory {
+                    // Directory listings still mirror into the embedded view:
+                    // `read-directory` walks that node list synchronously.
+                    // File contents do not — they stream on demand instead.
                     let entries = match service.read_dir(&host_path).await {
-                        Ok(e) => e,
+                        Ok(entries) => entries,
                         Err(err) => {
                             return Ok(Err(error_code_from_p3(map_host_fs_error(err))));
                         }
                     };
                     self.filesystem_mut()
                         .seed_host_directory_entries(&absolute, entries);
-                    (kind, meta.identity, None, descriptor_flags_p3)
                 }
+                (kind, meta.identity, descriptor_flags_p3)
             } else {
                 match service.create_file(&host_path).await {
                     Ok(()) => match service.stat_path(&host_path).await {
@@ -1520,12 +1840,7 @@ where
                                 Ok(flags) => flags,
                                 Err(error) => return Ok(Err(error_code_from_p3(error))),
                             };
-                            (
-                                kind,
-                                metadata.identity,
-                                Some(Vec::new()),
-                                descriptor_flags_p3,
-                            )
+                            (kind, metadata.identity, descriptor_flags_p3)
                         }
                         Err(err) => {
                             return Ok(Err(error_code_from_p3(map_host_fs_error(err))));
@@ -1536,10 +1851,6 @@ where
                     }
                 }
             };
-            if let Some(bytes) = contents {
-                self.filesystem_mut()
-                    .seed_host_file_content(&absolute, identity, bytes);
-            }
             let opened = crate::wasmtime_adapter::wasi::FsDescriptor {
                 path: absolute,
                 kind,
@@ -2661,7 +2972,10 @@ where
                         byte_len,
                     );
                     let enqueue_started = p2_kernel_profile_start(&read_runtime_state, &read_cpu);
-                    if network_writer.write(bytes).is_err() {
+                    // Awaiting here is the guest's backpressure: the
+                    // bridge stops pulling from the socket while the
+                    // guest-side channel is full.
+                    if network_writer.write(bytes).await.is_err() {
                         p2_record_kernel_profile_events_bytes(
                             &read_runtime_state,
                             &read_cpu,
@@ -2805,7 +3119,7 @@ where
             Ok(address) => address,
             Err(error) => return Ok(Err(error)),
         };
-        let (service, inner, ready, local_port) = {
+        let (service, inner, ready, local_port, hop_limit) = {
             let mut state = socket.inner.lock();
             if state.stream.is_some() || state.connect_in_progress || state.connect_result.is_some()
             {
@@ -2817,6 +3131,7 @@ where
                 socket.inner.clone(),
                 socket.ready.clone(),
                 state.local_address.map_or(0, |address| address.port),
+                state.hop_limit,
             )
         };
         let profile_cpu = self.cpu.clone();
@@ -2828,6 +3143,7 @@ where
                     remote_address.address.network_address(),
                     remote_address.port,
                     local_port,
+                    hop_limit,
                     u64::MAX,
                 )
                 .await;
@@ -2903,7 +3219,7 @@ where
         socket: Resource<TcpSocket>,
     ) -> Result<core::result::Result<(), p2tcp::ErrorCode>> {
         let socket = self.table.get(&socket)?.clone();
-        let (service, inner, ready, local_address, listen_backlog) = {
+        let (service, inner, ready, local_address, listen_backlog, hop_limit) = {
             let mut state = socket.inner.lock();
             if state.stream.is_some()
                 || state.listener.is_some()
@@ -2930,6 +3246,7 @@ where
                 socket.ready.clone(),
                 local_address,
                 state.listen_backlog,
+                state.hop_limit,
             )
         };
         self.spawner().spawn_detached(async move {
@@ -2938,6 +3255,7 @@ where
                     local_address.address.network_address(),
                     local_address.port,
                     listen_backlog,
+                    hop_limit,
                 )
                 .await;
             let mut state = inner.lock();
@@ -3366,9 +3684,16 @@ where
     }
 }
 
-fn format_p2_ip_address(address: crate::Ipv4Address) -> p2lookup::IpAddress {
-    let [a, b, c, d] = address.octets();
-    p2lookup::IpAddress::Ipv4((a, b, c, d))
+fn format_p2_ip_address(address: crate::NetworkIpAddress) -> p2lookup::IpAddress {
+    match address {
+        crate::NetworkIpAddress::Ipv4(address) => {
+            let [a, b, c, d] = address.octets();
+            p2lookup::IpAddress::Ipv4((a, b, c, d))
+        }
+        crate::NetworkIpAddress::Ipv6(address) => p2lookup::IpAddress::Ipv6(
+            crate::wasmtime_adapter::wasi::net::ipv6_address_groups(address),
+        ),
+    }
 }
 
 fn map_p2_dns_error(error: crate::DnsError) -> p2lookup::ErrorCode {
@@ -3608,12 +3933,36 @@ fn error_code_from_p3(error: p3fs::ErrorCode) -> p2fs::ErrorCode {
 mod tests {
     use alloc::string::String;
 
+    use futures_lite::future::block_on;
+    use wasmtime_wasi_io::poll::Pollable;
+    use wasmtime_wasi_io::streams::{InputStream, StreamError};
+
     use super::{
-        PREVIEW2_WIT_PACKAGES, WasiTcpSocketFamily, WasiUdpSocketError, WasiUdpSocketFamily,
-        format_p2_tcp_socket_address, format_p2_udp_family, format_p2_udp_socket_address,
-        map_p2_tcp_core_error, map_p2_tcp_family, map_p2_tcp_socket_error, p2net, p2tcp,
-        p2tcp_create, p2udp, parse_p2_tcp_socket_address, parse_p2_udp_socket_address,
+        EmptyInputStream, PREVIEW2_WIT_PACKAGES, WasiTcpSocketFamily, WasiUdpSocketError,
+        WasiUdpSocketFamily, format_p2_tcp_socket_address, format_p2_udp_family,
+        format_p2_udp_socket_address, map_p2_tcp_core_error, map_p2_tcp_family,
+        map_p2_tcp_socket_error, p2net, p2tcp, p2tcp_create, p2udp, parse_p2_tcp_socket_address,
+        parse_p2_udp_socket_address,
     };
+
+    #[test]
+    fn p2_empty_stdin_signals_eof_instead_of_starving_blocking_read() {
+        let mut stream = EmptyInputStream;
+        // `ready` must resolve without waiting; a closed stream has nothing
+        // left to wait for.
+        block_on(stream.ready());
+        for size in [0_usize, 1, 4096] {
+            match stream.read(size) {
+                Err(StreamError::Closed) => {}
+                Ok(bytes) => panic!(
+                    "empty stdin returned {} readable bytes instead of closing; \
+                     wasmtime-wasi-io traps after MAX_BLOCKING_ATTEMPTS empty reads",
+                    bytes.len()
+                ),
+                Err(error) => panic!("empty stdin read failed unexpectedly: {error:?}"),
+            }
+        }
+    }
 
     #[test]
     fn preview2_wit_packages_use_expected_version() {

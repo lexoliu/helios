@@ -468,6 +468,9 @@ fn render_helios_template(
 ) -> Result<String> {
     let mut rendered = template.to_owned();
     for (placeholder, value) in [
+        // Scratch files live at the embedded filesystem root inside the
+        // guest; the Linux runner maps the same placeholder to a tmpdir.
+        ("{workdir}", ""),
         ("{bash}", "/bin/bash"),
         ("{cat}", "/bin/cat"),
         ("{curl}", "/bin/curl"),

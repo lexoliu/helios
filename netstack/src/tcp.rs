@@ -583,7 +583,9 @@ where
     delayed_ack_deadline_nanos: Option<u64>,
     time_wait_deadline_nanos: Option<u64>,
     unacked_receive_segments: u8,
-    pending_window_update_bytes: u16,
+    pending_window_update_bytes: u32,
+    /// IPv4 TTL / IPv6 hop limit stamped on every frame this socket emits.
+    hop_limit: u8,
 }
 
 impl<C> TcpSocket<C>
@@ -630,7 +632,18 @@ where
             time_wait_deadline_nanos: None,
             unacked_receive_segments: 0,
             pending_window_update_bytes: 0,
+            hop_limit: crate::DEFAULT_HOP_LIMIT,
         }
+    }
+
+    /// IPv4 TTL / IPv6 hop limit this socket stamps on outgoing frames.
+    pub const fn hop_limit(&self) -> u8 {
+        self.hop_limit
+    }
+
+    /// Sets the TTL / hop limit for frames this socket emits from now on.
+    pub const fn set_hop_limit(&mut self, hop_limit: u8) {
+        self.hop_limit = hop_limit;
     }
 
     pub fn listen(local: TcpEndpoint, congestion: C) -> Self {
@@ -878,6 +891,16 @@ where
     pub fn queue_send(&mut self, bytes: &[u8]) -> usize {
         let mut bytes = Bytes::copy_from_slice(bytes);
         self.queue_send_bytes(&mut bytes)
+    }
+
+    /// Bytes `queue_send_bytes` would accept right now. Zero when the
+    /// transmit queue is full, so readiness reporting can avoid claiming
+    /// writability that the next write would reject.
+    pub fn send_capacity_bytes(&self) -> usize {
+        self.transmit_queue.as_ref().map_or(
+            TCP_TRANSMIT_BUFFER_BYTES,
+            TcpTransmitQueue::remaining_bytes_capacity,
+        )
     }
 
     pub fn queue_send_bytes(&mut self, bytes: &mut Bytes) -> usize {
@@ -1721,7 +1744,7 @@ where
     }
 
     fn local_receive_window_bytes(&self) -> u32 {
-        u32::from(self.advertised_window) << TCP_LOCAL_WINDOW_SCALE
+        u32::from(self.advertised_window) << self.local_window_scale
     }
 
     fn acknowledge_sent(
@@ -2239,7 +2262,9 @@ where
             0
         };
         self.refresh_advertised_window();
-        self.update_peer_receive_window(packet.window_size);
+        // RFC 7323 §2.2: the window field in a SYN or SYN-ACK is never
+        // scaled, even though that segment is what carries the option.
+        self.peer_receive_window = u32::from(packet.window_size);
         self.peer_sack_permitted = packet.options.sack_permitted();
         self.record_peer_timestamp(packet.options.timestamp());
     }
@@ -2367,10 +2392,14 @@ where
         if previous_window == 0 {
             return true;
         }
-        self.pending_window_update_bytes = self
-            .pending_window_update_bytes
-            .saturating_add(self.advertised_window - previous_window);
-        self.pending_window_update_bytes >= TCP_WINDOW_UPDATE_BYTES
+        // The advertised window field counts scaled units; accumulate the
+        // delta in bytes so the update threshold means the same thing with
+        // and without a negotiated window scale.
+        let delta_bytes =
+            u32::from(self.advertised_window - previous_window) << self.local_window_scale;
+        self.pending_window_update_bytes =
+            self.pending_window_update_bytes.saturating_add(delta_bytes);
+        self.pending_window_update_bytes >= u32::from(TCP_WINDOW_UPDATE_BYTES)
     }
 }
 
@@ -3809,6 +3838,24 @@ mod tests {
         );
 
         assert_eq!(socket.peer_window_scale(), 3);
+        // RFC 7323 §2.2: the SYN-ACK's own window field is never scaled.
+        assert_eq!(socket.peer_receive_window(), 4);
+
+        let _ = deliver_segment(
+            &mut socket,
+            TcpPacket {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: 4,
+                options: TcpOptions::empty(),
+                payload: &[],
+            },
+            TCP_INITIAL_RTO_NANOS,
+        );
+
         assert_eq!(socket.peer_receive_window(), 32);
         assert_eq!(socket.queue_send(b"abcdefghijklmnopqrstuvwxyz"), 26);
         let segment = socket
@@ -5166,18 +5213,21 @@ mod tests {
         }
         socket.mark_ack_queued();
 
-        let update_segments = (usize::from(TCP_WINDOW_UPDATE_BYTES) << TCP_LOCAL_WINDOW_SCALE)
-            / TCP_RECEIVE_SEGMENT_BYTES;
+        // Drain in multiples of the 16-byte scale unit so every drain
+        // frees exactly the same number of advertised-window units and
+        // the byte-threshold crossing lands on a deterministic step.
+        let drain_bytes = TCP_RECEIVE_SEGMENT_BYTES & !((1 << TCP_LOCAL_WINDOW_SCALE) - 1);
+        let update_segments = usize::from(TCP_WINDOW_UPDATE_BYTES).div_ceil(drain_bytes);
         for _ in 1..update_segments {
             assert_eq!(
-                socket.receive(TCP_RECEIVE_SEGMENT_BYTES, 2).as_deref(),
-                Some(&payload[..])
+                socket.receive(drain_bytes, 2).map(|bytes| bytes.len()),
+                Some(drain_bytes)
             );
             assert_eq!(socket.pending_ack(), None);
         }
         assert_eq!(
-            socket.receive(TCP_RECEIVE_SEGMENT_BYTES, 4).as_deref(),
-            Some(&payload[..])
+            socket.receive(drain_bytes, 4).map(|bytes| bytes.len()),
+            Some(drain_bytes)
         );
         assert!(socket.pending_ack().is_some());
     }

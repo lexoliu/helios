@@ -9,13 +9,14 @@ use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId};
 use helios_hal::fs::FileRights;
 use helios_hal::resource::KernelResource;
 use helios_hal::watchdog::ProgressCounter;
+use helios_kernel::SocketReadiness;
 use helios_kernel::{
     ComponentHostNetworkService, ComponentNetworkService, DescriptorId, DescriptorTable, DnsError,
     DnsErrorKind, Executor, FutexKey, FutexTable, GuestAddress, Ipv4Address, Ipv4Cidr, Ipv4Route,
     MacAddress, NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
     NetworkIpAddress, NetworkPortId, Notify, PingError, PingErrorKind, PingReply,
     ProcessMemoryIdentity, TcpAccepted, TcpError, TcpErrorKind, TcpListener, Timer, TryRead,
-    UdpBinding, UdpDatagram, UdpError, UdpErrorKind, byte_channel,
+    TryWrite, UdpBinding, UdpDatagram, UdpError, UdpErrorKind, byte_channel,
 };
 use spin::{Mutex, Once};
 
@@ -225,9 +226,11 @@ fn byte_channel_write_try_read(bencher: Bencher, count: usize) {
         let (writer, reader) = byte_channel();
         let payload = Bytes::from_static(b"helios-byte-channel");
         for _ in 0..count {
-            writer
-                .write(payload.clone())
-                .expect("reader is alive during byte channel benchmark");
+            assert_eq!(
+                writer.try_write(payload.clone()),
+                TryWrite::Written,
+                "reader is alive and the channel has room during the benchmark"
+            );
         }
         for _ in 0..count {
             match reader.try_read() {
@@ -258,9 +261,11 @@ fn byte_channel_write_owned_vec_chunk(bencher: Bencher, count: usize) {
         let (writer, reader) = byte_channel();
         for _ in 0..count {
             let bytes = alloc::vec![7; 4096];
-            writer
-                .write(Bytes::from(bytes))
-                .expect("reader is alive during owned byte channel benchmark");
+            assert_eq!(
+                writer.try_write(Bytes::from(bytes)),
+                TryWrite::Written,
+                "reader is alive and the channel has room during the benchmark"
+            );
         }
         drain_byte_channel(reader, count);
     });
@@ -268,15 +273,18 @@ fn byte_channel_write_owned_vec_chunk(bencher: Bencher, count: usize) {
 
 #[divan::bench(args = [1usize, 64, 256])]
 fn byte_channel_write_copied_vec_chunk(bencher: Bencher, count: usize) {
-    // Retained as the regression baseline for `ComponentStoreData::write_output`
-    // callers that only have a borrowed slice and must create owned pipe data.
+    // Retained as the regression baseline for
+    // `ComponentStoreData::poll_write_output_bytes` callers that only have a
+    // borrowed slice and must create owned pipe data.
     bencher.counter(ItemsCount::new(count)).bench_local(|| {
         let (writer, reader) = byte_channel();
         for _ in 0..count {
             let bytes = alloc::vec![7; 4096];
-            writer
-                .write(Bytes::copy_from_slice(&bytes))
-                .expect("reader is alive during copied byte channel benchmark");
+            assert_eq!(
+                writer.try_write(Bytes::copy_from_slice(&bytes)),
+                TryWrite::Written,
+                "reader is alive and the channel has room during the benchmark"
+            );
         }
         drain_byte_channel(reader, count);
     });
@@ -498,6 +506,40 @@ impl ComponentNetworkService for BenchNetworkService {
     type TcpListener = u64;
     type UdpSocket = u64;
 
+    // The in-memory doubles model an always-ready loopback peer.
+    fn tcp_readiness(
+        &self,
+        _: Self::TcpStream,
+    ) -> impl Future<Output = Result<SocketReadiness, TcpError>> + Send + '_ {
+        core::future::ready(Ok(SocketReadiness {
+            readable: true,
+            writable: true,
+            hangup: false,
+        }))
+    }
+
+    fn tcp_listener_readiness(
+        &self,
+        _: Self::TcpListener,
+    ) -> impl Future<Output = Result<SocketReadiness, TcpError>> + Send + '_ {
+        core::future::ready(Ok(SocketReadiness {
+            readable: true,
+            writable: false,
+            hangup: false,
+        }))
+    }
+
+    fn udp_readiness(
+        &self,
+        _: Self::UdpSocket,
+    ) -> impl Future<Output = Result<SocketReadiness, UdpError>> + Send + '_ {
+        core::future::ready(Ok(SocketReadiness {
+            readable: true,
+            writable: true,
+            hangup: false,
+        }))
+    }
+
     fn hardware_address(&self) -> [u8; 6] {
         [2, 0, 0, 0, 0, 1]
     }
@@ -514,7 +556,7 @@ impl ComponentNetworkService for BenchNetworkService {
         &self,
         _host: &str,
         _timeout_nanos: u64,
-    ) -> Result<alloc::vec::Vec<Ipv4Address>, DnsError> {
+    ) -> Result<alloc::vec::Vec<NetworkIpAddress>, DnsError> {
         Err(bench_dns_error())
     }
 
@@ -532,6 +574,7 @@ impl ComponentNetworkService for BenchNetworkService {
         _host: &str,
         _port: u16,
         _local_port: u16,
+        _hop_limit: u8,
         _timeout_nanos: u64,
     ) -> Result<Self::TcpStream, TcpError> {
         Ok(1)
@@ -542,6 +585,7 @@ impl ComponentNetworkService for BenchNetworkService {
         _remote_address: NetworkIpAddress,
         _port: u16,
         _local_port: u16,
+        _hop_limit: u8,
         _timeout_nanos: u64,
     ) -> Result<Self::TcpStream, TcpError> {
         Ok(1)
@@ -552,11 +596,41 @@ impl ComponentNetworkService for BenchNetworkService {
         _local_address: NetworkIpAddress,
         local_port: u16,
         _backlog: u16,
+        _hop_limit: u8,
     ) -> Result<TcpListener<Self::TcpListener>, TcpError> {
         Ok(TcpListener {
             listener: 1,
             local_port,
         })
+    }
+
+    fn tcp_set_hop_limit(&self, _stream: Self::TcpStream, _hop_limit: u8) -> Result<(), TcpError> {
+        Ok(())
+    }
+
+    fn tcp_listener_set_hop_limit(
+        &self,
+        _listener: Self::TcpListener,
+        _hop_limit: u8,
+    ) -> Result<(), TcpError> {
+        Ok(())
+    }
+
+    fn udp_connect(
+        &self,
+        _socket: Self::UdpSocket,
+        _remote_address: NetworkIpAddress,
+        _port: u16,
+    ) -> Result<(), UdpError> {
+        Ok(())
+    }
+
+    fn udp_disconnect(&self, _socket: Self::UdpSocket) -> Result<(), UdpError> {
+        Ok(())
+    }
+
+    fn udp_set_hop_limit(&self, _socket: Self::UdpSocket, _hop_limit: u8) -> Result<(), UdpError> {
+        Ok(())
     }
 
     async fn tcp_accept(

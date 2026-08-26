@@ -6,6 +6,7 @@ mod checksum;
 mod congestion;
 mod dhcp;
 mod dns;
+mod ndp;
 mod packet;
 mod stack;
 mod tcp;
@@ -30,11 +31,20 @@ pub use dhcp::{
     DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DhcpClientMessage, DhcpDnsServers, DhcpMessageType,
     DhcpOptionBuffer, DhcpOptionWriter, DhcpPacket, DhcpServerMessage, MAX_DHCP_DNS_SERVERS,
 };
-pub use dns::{DNS_PORT, DnsMessage, DnsQuestionWriter, DnsResponse};
+pub use dns::{
+    DNS_MAX_ADDRESS_RECORDS, DNS_PORT, DnsMessage, DnsQuestionWriter, DnsRecordType, DnsResponse,
+};
+pub use ndp::{
+    Ipv6DnsServers, Ipv6RouterConfiguration, MAX_ADVERTISED_PREFIXES, MAX_IPV6_DNS_SERVERS,
+    MAX_ROUTER_SOLICITATIONS, NeighborDiscovery, ROUTER_SOLICITATION_INTERVAL_NANOS,
+    SLAAC_PREFIX_LEN, interpret_router_advertisement,
+};
 pub use packet::{
     ArpOperation, ArpPacket, EthernetFrame, EthernetProtocol, Icmpv4DestinationUnreachableCode,
     Icmpv4Echo, Icmpv4Packet, Icmpv6DestinationUnreachableCode, Icmpv6Echo, Icmpv6Packet,
-    Icmpv6PacketTooBig, IpProtocol, Ipv4Packet, Ipv6Packet, MAX_TCP_SACK_BLOCKS, TcpFlags,
+    Icmpv6PacketTooBig, Icmpv6RouterAdvertisement, IpProtocol, Ipv4Packet, Ipv6Packet,
+    NdpOption, NdpOptionIter, NdpOptions, NdpPrefixInformation, NdpRecursiveDnsServers,
+    MAX_TCP_SACK_BLOCKS, TcpFlags,
     TcpHeader, TcpHeaderOptions, TcpOptions, TcpPacket, TcpSackBlock, TcpSackBlocks,
     TcpTimestampOption, TransportChecksum, TransportPorts, UdpPacket,
 };
@@ -46,7 +56,7 @@ pub use stack::{
     TcpConnectTerminalError, TcpListenBacklog, TcpReadIntoState, TcpReadState, UdpEndpoint,
     UdpPayload, UdpReceive, UdpSocketBinding, UdpSocketError, UdpSocketId,
 };
-pub use tcp::TCP_TRANSMIT_BUFFER_BYTES;
+pub use tcp::{TCP_RECEIVE_WINDOW_BYTES, TCP_TRANSMIT_BUFFER_BYTES};
 pub use tcp::{TcpEndpoint, TcpReset, TcpSegmentOutcome, TcpSocket, TcpState, TcpTransmitSegment};
 pub use types::{
     EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr, Ipv6Scope,
@@ -55,6 +65,8 @@ pub use types::{
 /// Maximum Ethernet frame payload including the Ethernet header and FCS-free
 /// frame bytes used by virtio-net and common Ethernet NICs.
 pub const ETHERNET_FRAME_BYTES: usize = 1514;
+/// IPv4 TTL / IPv6 hop limit applied to a socket that never asked for one.
+pub const DEFAULT_HOP_LIMIT: u8 = 64;
 /// Conservative default poll budget for single-queue virtio-style devices.
 pub const DEFAULT_POLL_BUDGET: usize = 8;
 

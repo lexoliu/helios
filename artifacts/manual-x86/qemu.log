@@ -1,1 +1,0 @@
-qemu-system-x86_64: -serial unix:artifacts/manual-x86/debug.sock,server=on,wait=on: info: QEMU waiting for connection on: disconnected:unix:artifacts/manual-x86/debug.sock,server=on

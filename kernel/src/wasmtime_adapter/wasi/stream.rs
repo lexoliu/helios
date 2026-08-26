@@ -8,6 +8,17 @@ where
     pub(super) getter: fn(&mut T) -> &mut StoreData<CpuImpl, HostFs>,
     pub(super) stream: OutputStreamKind,
     pub(super) result: Option<oneshot::Sender<core::result::Result<(), cli_types::ErrorCode>>>,
+    /// Batch that the sink could not take yet. Held here — never dropped
+    /// — until the child channel behind this stream has room again.
+    pub(super) pending: Option<Bytes>,
+    pub(super) write_wait: Option<crate::ByteWriteWait>,
+}
+
+impl<T, CpuImpl, HostFs> Unpin for SerialStreamConsumer<T, CpuImpl, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
 }
 
 impl<T, CpuImpl, HostFs> SerialStreamConsumer<T, CpuImpl, HostFs>
@@ -24,6 +35,8 @@ where
             getter,
             stream,
             result: Some(result),
+            pending: None,
+            write_wait: None,
         }
     }
 
@@ -51,24 +64,40 @@ where
 {
     type Item = u8;
 
+    /// Copy the guest's batch into the store's stdout/stderr sink.
+    ///
+    /// A child-pipe sink is bounded, so this parks — `pending` keeps the
+    /// bytes and `poll_write_output_bytes` registers the waker — instead
+    /// of dropping the batch or reporting a spurious error.
     fn poll_consume(
-        self: Pin<&mut Self>,
-        _: &mut Context<'_>,
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
         mut store: wasmtime::StoreContextMut<'_, T>,
         mut source: Source<'_, Self::Item>,
         _: bool,
     ) -> Poll<Result<StreamResult>> {
-        let available = source.remaining(&mut store);
-        if available == 0 {
-            return Poll::Ready(Ok(StreamResult::Completed));
+        if self.pending.is_none() {
+            let available = source.remaining(&mut store);
+            if available == 0 {
+                return Poll::Ready(Ok(StreamResult::Completed));
+            }
+            let mut bytes = Vec::with_capacity(available);
+            source.read(&mut store, &mut bytes)?;
+            self.pending = Some(Bytes::from(bytes));
         }
 
-        let mut bytes = Vec::with_capacity(available);
-        source.read(&mut store, &mut bytes)?;
-        let consumer = self.as_ref().get_ref();
+        let consumer = &mut *self;
         let getter = consumer.getter;
-        getter(store.data_mut()).write_output_bytes(consumer.stream, Bytes::from(bytes));
-        Poll::Ready(Ok(StreamResult::Completed))
+        let stream = consumer.stream;
+        match getter(store.data_mut()).poll_write_output_bytes(
+            stream,
+            cx,
+            &mut consumer.write_wait,
+            &mut consumer.pending,
+        ) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(()) => Poll::Ready(Ok(StreamResult::Completed)),
+        }
     }
 }
 
@@ -197,7 +226,12 @@ impl<T> StreamProducer<T> for ChannelStreamProducer {
 pub(crate) struct ChannelStreamConsumer {
     pub(super) writer: crate::ByteWriter,
     pub(super) completion: Option<oneshot::Sender<core::result::Result<(), ()>>>,
+    /// Batch the channel could not take yet, kept until it fits.
+    pub(super) pending: Option<Bytes>,
+    pub(super) write_wait: Option<crate::ByteWriteWait>,
 }
+
+impl Unpin for ChannelStreamConsumer {}
 
 impl ChannelStreamConsumer {
     pub(crate) fn new(
@@ -207,6 +241,8 @@ impl ChannelStreamConsumer {
         Self {
             writer,
             completion: Some(completion),
+            pending: None,
+            write_wait: None,
         }
     }
 
@@ -226,22 +262,34 @@ impl Drop for ChannelStreamConsumer {
 impl<T: 'static> StreamConsumer<T> for ChannelStreamConsumer {
     type Item = u8;
 
+    /// Copy the parent's batch into the child's stdin channel, parking on
+    /// a full channel the way [`TcpWriteConsumer`](super::net::TcpWriteConsumer)
+    /// parks on a busy socket.
     fn poll_consume(
-        self: Pin<&mut Self>,
-        _: &mut Context<'_>,
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
         mut store: wasmtime::StoreContextMut<'_, T>,
         mut source: Source<'_, Self::Item>,
         _: bool,
     ) -> Poll<Result<StreamResult>> {
-        let available = source.remaining(&mut store);
-        if available == 0 {
-            return Poll::Ready(Ok(StreamResult::Completed));
+        if self.pending.is_none() {
+            let available = source.remaining(&mut store);
+            if available == 0 {
+                return Poll::Ready(Ok(StreamResult::Completed));
+            }
+            let mut bytes = Vec::with_capacity(available);
+            source.read(&mut store, &mut bytes)?;
+            self.pending = Some(Bytes::from(bytes));
         }
-        let mut bytes = Vec::with_capacity(available);
-        source.read(&mut store, &mut bytes)?;
-        match self.as_ref().get_ref().writer.write(bytes) {
-            Ok(()) => Poll::Ready(Ok(StreamResult::Completed)),
-            Err(_closed) => Poll::Ready(Ok(StreamResult::Dropped)),
+
+        let consumer = &mut *self;
+        let wait = consumer
+            .write_wait
+            .get_or_insert_with(|| consumer.writer.wait_state());
+        match consumer.writer.poll_write(cx, wait, &mut consumer.pending) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(StreamResult::Completed)),
+            Poll::Ready(Err(_closed)) => Poll::Ready(Ok(StreamResult::Dropped)),
         }
     }
 }

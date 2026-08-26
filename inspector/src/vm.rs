@@ -27,10 +27,10 @@ const DEFAULT_RISCV_QEMU_BIN: &str = "qemu-system-riscv64";
 const DEFAULT_X86_QEMU_BIN: &str = "qemu-system-x86_64";
 const DEFAULT_AARCH64_MEMORY: &str = "2G";
 const DEFAULT_RISCV_MEMORY: &str = "2G";
-const DEFAULT_X86_MEMORY: &str = "1G";
+const DEFAULT_X86_MEMORY: &str = "2G";
 const DEFAULT_AARCH64_SMP: u16 = 4;
 const DEFAULT_RISCV_SMP: u16 = 4;
-const DEFAULT_X86_SMP: u16 = 2;
+const DEFAULT_X86_SMP: u16 = 4;
 const DEFAULT_SOCKET_WAIT: Duration = Duration::from_secs(10);
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DEFAULT_BLOCK_DEVICE_BYTES: u64 = 64 * 1024 * 1024;
@@ -80,6 +80,7 @@ enum VmBlockProfile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VmHostShareProfile {
     Virtio9pMmio,
+    Virtio9pPci,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,7 +123,7 @@ const AARCH64_VIRT_HVF_PROFILE: VmProfile = VmProfile {
     default_smp: DEFAULT_AARCH64_SMP,
     default_memory: DEFAULT_AARCH64_MEMORY,
     default_bios: None,
-    default_accel: &["hvf"],
+    default_accel: &["hvf", "kvm"],
     default_cpu: Some("host"),
     boot_artifact: VmBootArtifactKind::LimineUefiDiskImage,
     console: VmConsoleProfile::SerialUnixSocket,
@@ -183,13 +184,13 @@ const X86_64_VM_PROFILE: VmProfile = VmProfile {
     default_smp: DEFAULT_X86_SMP,
     default_memory: DEFAULT_X86_MEMORY,
     default_bios: None,
-    default_accel: &[],
-    default_cpu: Some("max"),
+    default_accel: &["kvm"],
+    default_cpu: Some("host"),
     boot_artifact: VmBootArtifactKind::LimineUefiDiskImage,
     console: VmConsoleProfile::SerialUnixSocket,
     network: Some(VmNetworkProfile::VirtioPciUser),
     block: Some(VmBlockProfile::VirtioPciBootDisk),
-    host_share: None,
+    host_share: Some(VmHostShareProfile::Virtio9pPci),
     entropy: None,
     watchdog: Some(VmWatchdogProfile::I6300Esb),
 };
@@ -494,20 +495,16 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
     } else {
         file.baud.unwrap_or(DEFAULT_BAUD)
     };
-    let cpu = command
-        .cpu
-        .or(file.cpu)
-        .or_else(|| profile.default_cpu.map(str::to_owned));
     let mut accel = if file.accel.is_empty() && command.accel.is_empty() {
-        profile
-            .default_accel
-            .iter()
-            .map(|value| (*value).to_owned())
-            .collect::<Vec<_>>()
+        default_accel(profile)
     } else {
         file.accel
     };
     accel.extend(command.accel);
+    let cpu = command
+        .cpu
+        .or(file.cpu)
+        .or_else(|| default_cpu(profile, &accel).map(str::to_owned));
     let shared_dir = command.shared_dir.or(file.shared_dir);
     let gdb = command
         .gdb
@@ -607,6 +604,56 @@ fn load_config_file(path: Option<&Path>) -> Result<VmConfigFile> {
 fn default_config_path() -> Option<PathBuf> {
     ProjectDirs::from("cool", "lexo", "helios-inspector")
         .map(|dirs| dirs.config_dir().join("vm.json"))
+}
+
+/// Picks the profile's accelerator by host capability when the user gave
+/// none: the profile's native accelerator (HVF/KVM) only when this host
+/// can actually provide it, otherwise TCG. Profiles with no default
+/// accelerator keep QEMU's own default.
+fn default_accel(profile: &VmProfile) -> Vec<String> {
+    let native_host = match profile.arch {
+        VmArch::Aarch64 => std::env::consts::ARCH == "aarch64",
+        VmArch::X86_64 => std::env::consts::ARCH == "x86_64",
+        VmArch::Riscv64 => false,
+    };
+    for accel in profile.default_accel {
+        let available = match *accel {
+            // The OS check alone is not enough: virtualized macOS hosts
+            // without nested virtualization (e.g. CI runners) ship the
+            // Hypervisor framework but report kern.hv_support=0, and QEMU
+            // aborts with HV_UNSUPPORTED if HVF is requested anyway.
+            "hvf" => {
+                native_host
+                    && std::env::consts::OS == "macos"
+                    && std::process::Command::new("sysctl")
+                        .args(["-n", "kern.hv_support"])
+                        .output()
+                        .is_ok_and(|output| {
+                            String::from_utf8_lossy(&output.stdout).trim() == "1"
+                        })
+            }
+            "kvm" => native_host && Path::new("/dev/kvm").exists(),
+            _ => true,
+        };
+        if available {
+            return vec![(*accel).to_owned()];
+        }
+    }
+    if profile.default_accel.is_empty() {
+        Vec::new()
+    } else {
+        vec!["tcg".to_owned()]
+    }
+}
+
+/// `-cpu host` is only valid under a native accelerator; TCG (or QEMU's
+/// default accelerator) needs the emulated `max` model instead.
+fn default_cpu(profile: &VmProfile, accel: &[String]) -> Option<&'static str> {
+    let native = accel.iter().any(|value| value == "hvf" || value == "kvm");
+    match profile.default_cpu {
+        Some("host") if !native => Some("max"),
+        other => other,
+    }
 }
 
 fn ensure_qemu_command(command: &ResolvedVmCommand) -> Result<()> {
@@ -756,7 +803,10 @@ fn run_workload_bench(
             Vec::new()
         };
 
-        crate::workload_bench::run_inner(&mut client, &command, &provenance).await?;
+        if let Err(error) = crate::workload_bench::run_inner(&mut client, &command, &provenance).await {
+            print_recent_guest_errors(&mut client).await;
+            return Err(error);
+        }
 
         if collect_profile {
             system_profiling::set_enabled(&client, false)
@@ -774,7 +824,28 @@ fn run_workload_bench(
     })
 }
 
-fn run_aot_bench(client: crate::serial::RpcClient, command: AotBenchCommand) -> Result<()> {
+/// Fetches and prints the guest's recent tracing events (info level and
+/// up, so boot markers frame the failure) so a failed remote operation
+/// is diagnosable from the CLI without a second tracing session.
+async fn print_recent_guest_errors(client: &mut crate::serial::RpcClient) {
+    let mut config = crate::system::TracingConfig::new();
+    config.limit = 100;
+    config.min_level = Some(helios_inspector_protocol::system::tracing::Level::Info);
+    match crate::system::fetch_tracing(client, &config).await {
+        Ok(events) if events.is_empty() => {}
+        Ok(events) => {
+            eprintln!("recent guest tracing events:");
+            for event in events {
+                if let Ok(line) = crate::system::render_tracing_event(&event) {
+                    eprintln!("  {line}");
+                }
+            }
+        }
+        Err(error) => eprintln!("failed to fetch guest tracing events: {error:#}"),
+    }
+}
+
+fn run_aot_bench(mut client: crate::serial::RpcClient, command: AotBenchCommand) -> Result<()> {
     crate::run_interruptible(async move {
         let wasm = fs::read(&command.wasm)
             .with_context(|| format!("failed to read {}", command.wasm.display()))?;
@@ -834,13 +905,20 @@ fn run_aot_bench(client: crate::serial::RpcClient, command: AotBenchCommand) -> 
             .with_context(|| {
                 format!("failed to AOT compile uploaded wasm iteration {iteration}")
             })?;
-            let result = outcome.map_err(|error| {
-                anyhow::anyhow!(
-                    "remote AOT iteration {iteration} failed: {:?}: {}",
-                    error.kind,
-                    error.detail
-                )
-            })?;
+            let result = match outcome {
+                Ok(result) => result,
+                Err(error) => {
+                    // Surface the guest-side error events before bailing:
+                    // the RPC error kind alone (e.g. `Internal`) does not
+                    // say which runtime operation actually failed.
+                    print_recent_guest_errors(&mut client).await;
+                    return Err(anyhow::anyhow!(
+                        "remote AOT iteration {iteration} failed: {:?}: {}",
+                        error.kind,
+                        error.detail
+                    ));
+                }
+            };
             let elapsed = started.elapsed();
             let mut stdout = std::io::stdout().lock();
             writeln!(
@@ -1555,7 +1633,19 @@ fn discover_qemu_edk2_code(arch: VmArch, qemu_bin: &Path) -> Result<PathBuf> {
     candidates.extend([
         PathBuf::from("/opt/homebrew/share/qemu").join(edk2_code_filename(arch)),
         PathBuf::from("/usr/local/share/qemu").join(edk2_code_filename(arch)),
+        PathBuf::from("/usr/share/qemu").join(edk2_code_filename(arch)),
     ]);
+    // Debian/Ubuntu package EDK2 as OVMF/AAVMF under their own names.
+    match arch {
+        VmArch::X86_64 => candidates.extend([
+            PathBuf::from("/usr/share/OVMF/OVMF_CODE_4M.fd"),
+            PathBuf::from("/usr/share/OVMF/OVMF_CODE.fd"),
+        ]),
+        VmArch::Aarch64 => candidates.extend([
+            PathBuf::from("/usr/share/AAVMF/AAVMF_CODE.fd"),
+        ]),
+        VmArch::Riscv64 => {}
+    }
     candidates
         .into_iter()
         .find(|path| path.is_file())
@@ -1596,11 +1686,19 @@ fn discover_qemu_edk2_vars(arch: VmArch, code: &Path) -> Result<PathBuf> {
 }
 
 fn edk2_vars_filenames(arch: VmArch) -> impl Iterator<Item = &'static str> {
-    match arch {
-        VmArch::Aarch64 => ["edk2-aarch64-vars.fd", "edk2-arm-vars.fd"].into_iter(),
-        VmArch::X86_64 => ["edk2-x86_64-vars.fd", "edk2-i386-vars.fd"].into_iter(),
+    // The OVMF/AAVMF names cover Debian/Ubuntu firmware packages, whose
+    // variable stores sit next to the code image under their own names.
+    let names: &'static [&'static str] = match arch {
+        VmArch::Aarch64 => &["edk2-aarch64-vars.fd", "edk2-arm-vars.fd", "AAVMF_VARS.fd"],
+        VmArch::X86_64 => &[
+            "edk2-x86_64-vars.fd",
+            "edk2-i386-vars.fd",
+            "OVMF_VARS_4M.fd",
+            "OVMF_VARS.fd",
+        ],
         VmArch::Riscv64 => panic!("riscv64 does not use EDK2 firmware"),
-    }
+    };
+    names.iter().copied()
 }
 
 fn configure_network_device(qemu: &mut Command, network: VmNetworkProfile) {
@@ -1644,14 +1742,19 @@ fn configure_block_device(
 }
 
 fn configure_host_share(qemu: &mut Command, host_share: VmHostShareProfile, shared_dir: &Path) {
+    qemu.arg("-fsdev").arg(format!(
+        "local,id=hostfs,path={},security_model=none,multidevs=remap",
+        shared_dir.display()
+    ));
     match host_share {
         VmHostShareProfile::Virtio9pMmio => {
-            qemu.arg("-fsdev").arg(format!(
-                "local,id=hostfs,path={},security_model=none,multidevs=remap",
-                shared_dir.display()
-            ));
             qemu.arg("-device").arg(format!(
                 "virtio-9p-device,fsdev=hostfs,mount_tag={HOST_SHARE_MOUNT_TAG}"
+            ));
+        }
+        VmHostShareProfile::Virtio9pPci => {
+            qemu.arg("-device").arg(format!(
+                "virtio-9p-pci,fsdev=hostfs,mount_tag={HOST_SHARE_MOUNT_TAG}"
             ));
         }
     }
@@ -1726,7 +1829,7 @@ mod tests {
         assert_eq!(AARCH64_VIRT_HVF_PROFILE.arch, VmArch::Aarch64);
         assert_eq!(AARCH64_VIRT_HVF_PROFILE.machine, "virt,gic-version=3");
         assert_eq!(AARCH64_VIRT_HVF_PROFILE.default_smp, 4);
-        assert_eq!(AARCH64_VIRT_HVF_PROFILE.default_accel, &["hvf"]);
+        assert_eq!(AARCH64_VIRT_HVF_PROFILE.default_accel, &["hvf", "kvm"]);
         assert_eq!(AARCH64_VIRT_HVF_PROFILE.default_cpu, Some("host"));
         assert_eq!(
             AARCH64_VIRT_HVF_PROFILE.boot_artifact,
@@ -1805,7 +1908,10 @@ mod tests {
             X86_64_VM_PROFILE.block,
             Some(VmBlockProfile::VirtioPciBootDisk)
         );
-        assert_eq!(X86_64_VM_PROFILE.host_share, None);
+        assert_eq!(
+            X86_64_VM_PROFILE.host_share,
+            Some(VmHostShareProfile::Virtio9pPci)
+        );
         assert_eq!(
             X86_64_VM_PROFILE.watchdog,
             Some(VmWatchdogProfile::I6300Esb)

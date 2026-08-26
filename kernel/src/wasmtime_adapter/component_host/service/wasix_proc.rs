@@ -1016,26 +1016,13 @@ where
         Err(error) => return p1_errno_from_component_path(error),
     };
     if absolute == WASIX_NULL_DEVICE_PATH {
-        return p1_write_filestat(caller, stat, p1_null_device_stat());
+        return p1_write_filestat(caller, stat, p1_null_device_identity(), p1_null_device_stat());
     }
-    let stat_value = if let Some(host_path) = crate::guest_host_share_path(&absolute) {
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        match service.stat_path(host_path).await {
-            Ok(metadata) => p1_descriptor_stat_from_host_metadata(metadata),
-            Err(error) => {
-                return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
-            }
-        }
-    } else {
-        match caller.data().filesystem.stat(&absolute) {
-            Ok(stat) => stat,
-            Err(error) => return p1_errno_from_fs(error),
-        }
+    let (identity, stat_value) = match p1_stat_absolute_path(caller, &absolute).await {
+        Ok(stat) => stat,
+        Err(errno) => return errno,
     };
-    p1_write_filestat(caller, stat, stat_value)
+    p1_write_filestat(caller, stat, identity, stat_value)
 }
 
 pub(super) fn wasix_clock_time_set<CpuImpl, HostFs>(

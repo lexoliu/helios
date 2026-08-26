@@ -13,9 +13,20 @@ const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const READY_DRAIN_QUIET_PERIOD: Duration = Duration::from_millis(100);
 const DEBUGGER_RUN_STAGE: &str = "run:begin";
 
+/// Boot-marker deadline. Firmware loading a release kernel image under
+/// pure TCG can legitimately take longer than the default 15 minutes,
+/// so slow hosts may widen it via HELIOS_BOOT_SYNC_TIMEOUT_SECS.
+fn boot_sync_timeout() -> Duration {
+    std::env::var("HELIOS_BOOT_SYNC_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(BOOT_SYNC_TIMEOUT)
+}
+
 pub(crate) async fn connect_after_boot(io: SerialIo) -> Result<RpcClient> {
     let (mut read, write) = io.into_split();
-    runtime::timeout(BOOT_SYNC_TIMEOUT, wait_for_debugger_stage(&mut read))
+    runtime::timeout(boot_sync_timeout(), wait_for_debugger_stage(&mut read))
         .await
         .context("timed out waiting for the embedded debugger cold-start markers")??;
 
@@ -55,6 +66,15 @@ async fn wait_for_debugger_stage(read: &mut SerialReader) -> Result<()> {
                         drain_boot_preamble(read).await?;
                         return Ok(());
                     }
+                } else if let Some(text) = printable_guest_line(&line) {
+                    eprintln!("guest serial: {text}");
+                    if text.contains("panicked at") {
+                        let trailer = collect_panic_trailer(read).await;
+                        anyhow::bail!(
+                            "kernel panicked before the embedded debugger entered \
+                             wasi:cli/run: {text}{trailer}"
+                        );
+                    }
                 }
                 line.clear();
             }
@@ -62,6 +82,45 @@ async fn wait_for_debugger_stage(read: &mut SerialReader) -> Result<()> {
             other => line.push(other),
         }
     }
+}
+
+/// Renders a non-marker serial line for diagnostics, or `None` when the
+/// line is empty or carries no printable text (RPC framing bytes).
+fn printable_guest_line(line: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(line);
+    let trimmed = text.trim_matches(|c: char| c.is_control() || c == '\u{fffd}');
+    let printable = trimmed
+        .chars()
+        .filter(|c| !c.is_control() && *c != '\u{fffd}')
+        .count();
+    (printable >= 4 && printable * 2 >= trimmed.chars().count()).then(|| trimmed.to_owned())
+}
+
+/// After a panic line appears, the guest usually follows with the panic
+/// message and location on separate lines; gather them until the serial
+/// link goes quiet so the failure carries the whole report.
+async fn collect_panic_trailer(read: &mut SerialReader) -> String {
+    let mut trailer = String::new();
+    let mut line = Vec::new();
+    loop {
+        match runtime::timeout(Duration::from_secs(2), read_byte(read)).await {
+            Some(Ok(Some(b'\n'))) => {
+                if let Some(text) = printable_guest_line(&line) {
+                    trailer.push_str("\n  ");
+                    trailer.push_str(&text);
+                }
+                line.clear();
+            }
+            Some(Ok(Some(b'\r'))) => {}
+            Some(Ok(Some(byte))) => line.push(byte),
+            Some(Ok(None)) | Some(Err(_)) | None => break,
+        }
+    }
+    if let Some(text) = printable_guest_line(&line) {
+        trailer.push_str("\n  ");
+        trailer.push_str(&text);
+    }
+    trailer
 }
 
 async fn drain_boot_preamble(read: &mut SerialReader) -> Result<()> {

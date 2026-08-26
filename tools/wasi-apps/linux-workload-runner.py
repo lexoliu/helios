@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import shlex
+import tempfile
 import subprocess
 import sys
 from pathlib import Path
@@ -44,6 +45,10 @@ def render_template(
     for placeholder, value in LINUX_PLACEHOLDERS.items():
         rendered = rendered.replace(placeholder, value)
     rendered = rendered.replace("{repo_root}", str(Path(__file__).resolve().parents[2]))
+    if "{workdir}" in rendered:
+        # Helios runs these at its embedded filesystem root; on Linux use
+        # a per-invocation scratch directory instead of /.
+        rendered = rendered.replace("{workdir}", tempfile.mkdtemp(prefix="helios-bench-"))
     if "{host_http_url}" in rendered:
         if not host_http_url:
             raise SystemExit(f"workload {workload['name']} requires --host-http-url")

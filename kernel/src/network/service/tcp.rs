@@ -28,7 +28,14 @@ where
         port: u16,
         timeout_nanos: u64,
     ) -> Result<TcpStreamId, TcpError> {
-        self.tcp_connect_from(host, port, 0, timeout_nanos).await
+        self.tcp_connect_from(
+            host,
+            port,
+            0,
+            helios_netstack::DEFAULT_HOP_LIMIT,
+            timeout_nanos,
+        )
+        .await
     }
 
     pub async fn tcp_connect_from(
@@ -36,9 +43,10 @@ where
         host: &str,
         port: u16,
         local_port: u16,
+        hop_limit: u8,
         timeout_nanos: u64,
     ) -> Result<TcpStreamId, TcpError> {
-        self.execute_tcp_connect(host, port, local_port, timeout_nanos)
+        self.execute_tcp_connect(host, port, local_port, hop_limit, timeout_nanos)
             .await
     }
 
@@ -47,12 +55,14 @@ where
         remote_address: NetworkIpAddress,
         port: u16,
         local_port: u16,
+        hop_limit: u8,
         timeout_nanos: u64,
     ) -> Result<TcpStreamId, TcpError> {
         self.execute_tcp_connect_address(
             map_network_ip_address(remote_address),
             port,
             local_port,
+            hop_limit,
             timeout_nanos,
         )
         .await
@@ -63,9 +73,29 @@ where
         local_address: NetworkIpAddress,
         local_port: u16,
         backlog: u16,
+        hop_limit: u8,
     ) -> Result<TcpListener<TcpListenerId>, TcpError> {
-        self.execute_tcp_listen(local_address, local_port, backlog)
+        self.execute_tcp_listen(local_address, local_port, backlog, hop_limit)
             .await
+    }
+
+    /// Retargets a connected stream's IPv4 TTL / IPv6 hop limit.
+    pub fn tcp_set_hop_limit(&self, stream: TcpStreamId, hop_limit: u8) -> Result<(), TcpError> {
+        self.inner
+            .state
+            .with_handle(stream, |state| state.set_tcp_hop_limit(stream, hop_limit))
+    }
+
+    /// Retargets a listener's hop limit. Connections accepted after this
+    /// inherit the new value; ones already queued keep the old one.
+    pub fn tcp_listener_set_hop_limit(
+        &self,
+        listener: TcpListenerId,
+        hop_limit: u8,
+    ) -> Result<(), TcpError> {
+        self.inner.state.with_handle(listener, |state| {
+            state.set_tcp_listener_hop_limit(listener, hop_limit)
+        })
     }
 
     pub async fn tcp_accept(
@@ -116,6 +146,66 @@ where
             .await
     }
 
+    /// Probe a connected stream's readiness without consuming buffered bytes.
+    ///
+    /// The stack only advances when the device is driven, so a probe has to
+    /// drive once before reading state; otherwise a socket whose data is
+    /// still sitting in the RX ring reports "not ready" forever. The read
+    /// probe itself is a zero-length `tcp_read`, which reports whether the
+    /// receive queue is non-empty (or the peer half-closed) and leaves the
+    /// queue intact.
+    pub async fn tcp_readiness(&self, stream: TcpStreamId) -> Result<SocketReadiness, TcpError> {
+        self.drive_tcp().await?;
+        let now = StackInstant::from_nanos(self.now_nanos());
+        self.inner.state.with_handle(stream, |state| {
+            let socket = state.tcp_socket(stream)?;
+            let read = state.stack.tcp_read(socket, 0, now).map_err(|_| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::TcpReceiveFailed,
+            })?;
+            let (readable, hangup) = match read {
+                TcpReadState::Data(_) => (true, false),
+                TcpReadState::Eof => (true, true),
+                TcpReadState::Pending => (false, false),
+            };
+            // Writability follows the send side, which outlives the read
+            // side: a peer that half-closed still accepts our data. A full
+            // transmit queue clears it until ACKs free capacity.
+            let writable = state.stack.tcp_send_ready(socket).map_err(|_| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::UnknownTcpStream,
+            })?;
+            Ok(SocketReadiness {
+                readable,
+                writable,
+                hangup,
+            })
+        })
+    }
+
+    /// Probe a listener's accept queue without consuming a connection.
+    pub async fn tcp_listener_readiness(
+        &self,
+        listener: TcpListenerId,
+    ) -> Result<SocketReadiness, TcpError> {
+        self.drive_tcp().await?;
+        self.inner.state.with_handle(listener, |state| {
+            let stack_socket = state.tcp_listener(listener)?.stack_socket;
+            let readable = state
+                .stack
+                .tcp_accept_pending(stack_socket)
+                .map_err(|_| TcpError {
+                    kind: TcpErrorKind::Unavailable,
+                    detail: NetworkErrorDetail::TcpListenerClosedUnexpectedly,
+                })?;
+            Ok(SocketReadiness {
+                readable,
+                writable: false,
+                hangup: false,
+            })
+        })
+    }
+
     pub async fn tcp_shutdown_send(&self, stream: TcpStreamId) -> Result<(), TcpError> {
         self.inner
             .state
@@ -134,11 +224,12 @@ where
         host: &str,
         port: u16,
         local_port: u16,
+        hop_limit: u8,
         timeout_nanos: u64,
     ) -> Result<TcpStreamId, TcpError> {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         let destination = self.resolve_host_tcp(host, deadline_nanos).await?;
-        self.execute_tcp_connect_address_until(destination, port, local_port, deadline_nanos)
+        self.execute_tcp_connect_address_until(destination, port, local_port, hop_limit, deadline_nanos)
             .await
     }
 
@@ -147,11 +238,18 @@ where
         destination: IpAddress,
         port: u16,
         local_port: u16,
+        hop_limit: u8,
         timeout_nanos: u64,
     ) -> Result<TcpStreamId, TcpError> {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
-        self.execute_tcp_connect_address_until(destination, port, local_port, deadline_nanos)
-            .await
+        self.execute_tcp_connect_address_until(
+            destination,
+            port,
+            local_port,
+            hop_limit,
+            deadline_nanos,
+        )
+        .await
     }
 
     pub(super) async fn execute_tcp_connect_address_until(
@@ -159,6 +257,7 @@ where
         destination: IpAddress,
         port: u16,
         local_port: u16,
+        hop_limit: u8,
         deadline_nanos: u64,
     ) -> Result<TcpStreamId, TcpError> {
         if matches!(destination, IpAddress::Ipv4(_)) {
@@ -170,11 +269,11 @@ where
         let stream = if local_port == 0 {
             let processor = self.inner.cpu.current_processor();
             self.inner.state.with_processor(processor, |state| {
-                state.start_tcp_connect(destination, port, local_port)
+                state.start_tcp_connect(destination, port, local_port, hop_limit)
             })
         } else {
             self.inner.state.with_local_port(local_port, |state| {
-                state.start_tcp_connect(destination, port, local_port)
+                state.start_tcp_connect(destination, port, local_port, hop_limit)
             })
         }?;
 
@@ -213,6 +312,7 @@ where
         local_address: NetworkIpAddress,
         local_port: u16,
         backlog: u16,
+        hop_limit: u8,
     ) -> Result<TcpListener<TcpListenerId>, TcpError> {
         let backlog = TcpListenBacklog::try_new(backlog).map_err(|_| TcpError {
             kind: TcpErrorKind::Unavailable,
@@ -223,7 +323,7 @@ where
         // an explicit ephemeral port stride-maps to its owner. RX
         // demux for the same port routes back here.
         self.inner.state.with_local_port(local_port, |state| {
-            state.start_tcp_listen(local_address, local_port, backlog)
+            state.start_tcp_listen(local_address, local_port, backlog, hop_limit)
         })
     }
 
@@ -527,15 +627,10 @@ where
                 },
                 detail: error.detail,
             })?;
-        addresses
-            .into_iter()
-            .next()
-            .map(map_kernel_ipv4_address)
-            .map(IpAddress::Ipv4)
-            .ok_or(TcpError {
-                kind: TcpErrorKind::UnresolvedHost,
-                detail: NetworkErrorDetail::DnsNoIpv4Address,
-            })
+        self.first_usable_address(addresses).ok_or(TcpError {
+            kind: TcpErrorKind::UnresolvedHost,
+            detail: NetworkErrorDetail::DnsNoIpv4Address,
+        })
     }
 
     pub(super) async fn drive_tcp(&self) -> Result<(), TcpError> {
@@ -886,6 +981,7 @@ impl NetworkShard {
         destination: IpAddress,
         port: u16,
         local_port: u16,
+        hop_limit: u8,
     ) -> Result<TcpStreamId, TcpError> {
         let local_port = if local_port == 0 {
             self.allocate_tcp_local_port()?
@@ -930,6 +1026,14 @@ impl NetworkShard {
                 kind: TcpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::TcpConnectStartFailed,
             })?;
+        // Applied before the connect loop drives the stack, so the SYN itself
+        // already carries the caller's TTL.
+        self.stack
+            .set_tcp_hop_limit(socket, hop_limit)
+            .map_err(|_| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::TcpConnectStartFailed,
+            })?;
         Ok(self.insert_tcp_stream(socket))
     }
 
@@ -938,6 +1042,7 @@ impl NetworkShard {
         local_address: NetworkIpAddress,
         local_port: u16,
         backlog: TcpListenBacklog,
+        hop_limit: u8,
     ) -> Result<TcpListener<TcpListenerId>, TcpError> {
         let local_port = if local_port == 0 {
             self.allocate_tcp_local_port()?
@@ -962,10 +1067,46 @@ impl NetworkShard {
                 kind: TcpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::TcpListenStartFailed,
             })?;
+        // Accepted children inherit the listener's hop limit inside the
+        // stack, so their SYN-ACK carries it as well.
+        self.stack
+            .set_tcp_hop_limit(stack_socket, hop_limit)
+            .map_err(|_| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::TcpListenStartFailed,
+            })?;
         Ok(TcpListener {
             listener: self.insert_tcp_listener(stack_socket, local_port),
             local_port,
         })
+    }
+
+    pub(super) fn set_tcp_hop_limit(
+        &mut self,
+        stream: TcpStreamId,
+        hop_limit: u8,
+    ) -> Result<(), TcpError> {
+        let socket = self.tcp_socket(stream)?;
+        self.stack
+            .set_tcp_hop_limit(socket, hop_limit)
+            .map_err(|_| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::UnknownTcpStream,
+            })
+    }
+
+    pub(super) fn set_tcp_listener_hop_limit(
+        &mut self,
+        listener: TcpListenerId,
+        hop_limit: u8,
+    ) -> Result<(), TcpError> {
+        let stack_socket = self.tcp_listener(listener)?.stack_socket;
+        self.stack
+            .set_tcp_hop_limit(stack_socket, hop_limit)
+            .map_err(|_| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::TcpListenerClosedUnexpectedly,
+            })
     }
 
     pub(super) fn poll_tcp_accept(

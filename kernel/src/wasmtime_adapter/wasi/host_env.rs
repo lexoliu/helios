@@ -70,6 +70,49 @@ where
     }
 }
 
+/// The timezone Helios reports through `wasi:clocks/timezone`.
+///
+/// Helios keeps wall-clock time in UTC and carries no timezone database, so
+/// the configured zone is UTC with a constant zero offset at every instant.
+/// `UTC` is a valid IANA Time Zone Database identifier, so guests take their
+/// normal timezone-aware path instead of the "no timezone available"
+/// fallback.
+pub(super) struct HostTimezone;
+
+impl HostTimezone {
+    const IANA_ID: &'static str = "UTC";
+
+    pub(super) fn iana_id() -> Option<String> {
+        Some(Self::IANA_ID.to_owned())
+    }
+
+    pub(super) fn utc_offset_nanos(_when: wasi::clocks::timezone::Instant) -> Option<i64> {
+        Some(0)
+    }
+
+    pub(super) fn debug_string() -> String {
+        Self::IANA_ID.to_owned()
+    }
+}
+
+impl<CpuImpl, HostFs> wasi::clocks::timezone::Host for StoreData<CpuImpl, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    fn iana_id(&mut self) -> Result<Option<String>> {
+        Ok(HostTimezone::iana_id())
+    }
+
+    fn utc_offset(&mut self, when: wasi::clocks::timezone::Instant) -> Result<Option<i64>> {
+        Ok(HostTimezone::utc_offset_nanos(when))
+    }
+
+    fn to_debug_string(&mut self) -> Result<String> {
+        Ok(HostTimezone::debug_string())
+    }
+}
+
 impl<CpuImpl, HostFs> wasi::cli::environment::Host for StoreData<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
@@ -258,7 +301,10 @@ where
     HostFs: crate::HostFileSystem,
 {
     fn get_terminal_stdin(&mut self) -> Result<Option<Resource<TerminalInput>>> {
-        Ok(None)
+        if !stdin_is_terminal(self.output_mode()) {
+            return Ok(None);
+        }
+        Ok(Some(self.table.push(TerminalInput)?))
     }
 }
 
@@ -268,7 +314,10 @@ where
     HostFs: crate::HostFileSystem,
 {
     fn get_terminal_stdout(&mut self) -> Result<Option<Resource<TerminalOutput>>> {
-        Ok(None)
+        if !output_is_terminal(self.output_mode(), ComponentOutputStreamKind::Stdout) {
+            return Ok(None);
+        }
+        Ok(Some(self.table.push(TerminalOutput)?))
     }
 }
 
@@ -278,7 +327,10 @@ where
     HostFs: crate::HostFileSystem,
 {
     fn get_terminal_stderr(&mut self) -> Result<Option<Resource<TerminalOutput>>> {
-        Ok(None)
+        if !output_is_terminal(self.output_mode(), ComponentOutputStreamKind::Stderr) {
+            return Ok(None);
+        }
+        Ok(Some(self.table.push(TerminalOutput)?))
     }
 }
 
@@ -354,6 +406,28 @@ pub(super) fn p3_new_timestamp_nanos(
                 .and_then(|value| value.checked_add(u64::from(instant.nanoseconds)))
                 .ok_or(fs_types::ErrorCode::Overflow)?;
             Ok(Some(nanos))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HostTimezone, wasi};
+
+    #[test]
+    fn host_timezone_reports_utc_with_a_zero_offset() {
+        assert_eq!(HostTimezone::iana_id().as_deref(), Some("UTC"));
+        assert_eq!(HostTimezone::debug_string(), "UTC");
+        for seconds in [i64::MIN, -1, 0, 1, i64::MAX] {
+            let when = wasi::clocks::timezone::Instant {
+                seconds,
+                nanoseconds: 500_000_000,
+            };
+            assert_eq!(
+                HostTimezone::utc_offset_nanos(when),
+                Some(0),
+                "UTC offset must stay zero at every instant"
+            );
         }
     }
 }

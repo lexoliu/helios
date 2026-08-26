@@ -28,7 +28,7 @@ where
         _: DnsCap,
         host: &'a str,
         timeout_nanos: u64,
-    ) -> impl Future<Output = Result<alloc::vec::Vec<crate::Ipv4Address>, crate::DnsError>> + 'a
+    ) -> impl Future<Output = Result<alloc::vec::Vec<NetworkIpAddress>, crate::DnsError>> + 'a
     {
         self.service.dns_resolve(host, timeout_nanos)
     }
@@ -49,10 +49,11 @@ where
         host: &'a str,
         port: u16,
         local_port: u16,
+        hop_limit: u8,
         timeout_nanos: u64,
     ) -> impl Future<Output = Result<Service::TcpStream, crate::TcpError>> + Send + 'a {
         self.service
-            .tcp_connect_from(host, port, local_port, timeout_nanos)
+            .tcp_connect_from(host, port, local_port, hop_limit, timeout_nanos)
     }
 
     pub fn tcp_listen(
@@ -62,6 +63,7 @@ where
         local_address: NetworkIpAddress,
         local_port: u16,
         backlog: u16,
+        hop_limit: u8,
     ) -> impl Future<Output = Result<TcpListener<Service::TcpListener>, TcpError>> + Send + '_ {
         async move {
             if local_port < 1024 && privileged_bind.is_none() {
@@ -71,7 +73,7 @@ where
                 });
             }
             self.service
-                .tcp_listen(local_address, local_port, backlog)
+                .tcp_listen(local_address, local_port, backlog, hop_limit)
                 .await
         }
     }
@@ -217,6 +219,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::SocketReadiness;
     use alloc::vec;
     use alloc::vec::Vec;
 
@@ -239,6 +242,40 @@ mod tests {
         type TcpStream = u64;
         type TcpListener = u64;
         type UdpSocket = u64;
+
+        // The in-memory doubles model an always-ready loopback peer.
+        fn tcp_readiness(
+            &self,
+            _: Self::TcpStream,
+        ) -> impl Future<Output = Result<SocketReadiness, TcpError>> + Send + '_ {
+            core::future::ready(Ok(SocketReadiness {
+                readable: true,
+                writable: true,
+                hangup: false,
+            }))
+        }
+
+        fn tcp_listener_readiness(
+            &self,
+            _: Self::TcpListener,
+        ) -> impl Future<Output = Result<SocketReadiness, TcpError>> + Send + '_ {
+            core::future::ready(Ok(SocketReadiness {
+                readable: true,
+                writable: false,
+                hangup: false,
+            }))
+        }
+
+        fn udp_readiness(
+            &self,
+            _: Self::UdpSocket,
+        ) -> impl Future<Output = Result<SocketReadiness, UdpError>> + Send + '_ {
+            core::future::ready(Ok(SocketReadiness {
+                readable: true,
+                writable: true,
+                hangup: false,
+            }))
+        }
 
         fn hardware_address(&self) -> [u8; 6] {
             [2, 0, 0, 0, 0, 1]
@@ -266,8 +303,11 @@ mod tests {
             &self,
             _: &str,
             _: u64,
-        ) -> impl Future<Output = Result<Vec<Ipv4Address>, DnsError>> + Send + '_ {
-            core::future::ready(Ok(vec![Ipv4Address::new([127, 0, 0, 1])]))
+        ) -> impl Future<Output = Result<Vec<NetworkIpAddress>, DnsError>> + Send + '_ {
+            core::future::ready(Ok(vec![
+                NetworkIpAddress::Ipv4(Ipv4Address::new([127, 0, 0, 1])),
+                NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::LOOPBACK),
+            ]))
         }
 
         fn tcp_connect(
@@ -284,6 +324,7 @@ mod tests {
             _: &str,
             _: u16,
             local_port: u16,
+            _: u8,
             _: u64,
         ) -> impl Future<Output = Result<Self::TcpStream, TcpError>> + Send + '_ {
             core::future::ready(Ok(u64::from(local_port)))
@@ -294,6 +335,7 @@ mod tests {
             _: NetworkIpAddress,
             _: u16,
             local_port: u16,
+            _: u8,
             _: u64,
         ) -> impl Future<Output = Result<Self::TcpStream, TcpError>> + Send + '_ {
             core::future::ready(Ok(if local_port == 0 {
@@ -308,12 +350,21 @@ mod tests {
             _: NetworkIpAddress,
             local_port: u16,
             _: u16,
+            _: u8,
         ) -> impl Future<Output = Result<TcpListener<Self::TcpListener>, TcpError>> + Send + '_
         {
             core::future::ready(Ok(TcpListener {
                 listener: 8,
                 local_port,
             }))
+        }
+
+        fn tcp_set_hop_limit(&self, _: Self::TcpStream, _: u8) -> Result<(), TcpError> {
+            Ok(())
+        }
+
+        fn tcp_listener_set_hop_limit(&self, _: Self::TcpListener, _: u8) -> Result<(), TcpError> {
+            Ok(())
         }
 
         fn tcp_accept(
@@ -379,6 +430,10 @@ mod tests {
         }
 
         fn udp_disconnect(&self, _: Self::UdpSocket) -> Result<(), UdpError> {
+            Ok(())
+        }
+
+        fn udp_set_hop_limit(&self, _: Self::UdpSocket, _: u8) -> Result<(), UdpError> {
             Ok(())
         }
 
@@ -451,20 +506,38 @@ mod tests {
         let privileged = authority.derive_privileged_bind_cap().unwrap();
         let stack = SocketStack::new(TestNetworkService);
 
+        // A dual-family lookup surfaces both records, in resolver order.
         assert_eq!(
             block_on(stack.dns_resolve(dns, "localhost", 1)).unwrap(),
-            vec![Ipv4Address::new([127, 0, 0, 1])]
+            vec![
+                NetworkIpAddress::Ipv4(Ipv4Address::new([127, 0, 0, 1])),
+                NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::LOOPBACK),
+            ]
         );
         assert_eq!(
             block_on(stack.tcp_connect(tcp, "localhost", 80, 1)).unwrap(),
             7
         );
         assert_eq!(
-            block_on(stack.tcp_connect_from(tcp, "localhost", 80, 4040, 1)).unwrap(),
+            block_on(stack.tcp_connect_from(
+                tcp,
+                "localhost",
+                80,
+                4040,
+                helios_netstack::DEFAULT_HOP_LIMIT,
+                1,
+            )).unwrap(),
             4040
         );
         let listener =
-            block_on(stack.tcp_listen(tcp, Some(privileged), TCP_ANY_V4, 53, 1)).unwrap();
+            block_on(stack.tcp_listen(
+                tcp,
+                Some(privileged),
+                TCP_ANY_V4,
+                53,
+                1,
+                helios_netstack::DEFAULT_HOP_LIMIT,
+            )).unwrap();
         assert_eq!(listener.local_port, 53);
         assert_eq!(
             block_on(stack.tcp_accept(tcp, listener.listener, 1))
@@ -503,7 +576,14 @@ mod tests {
         let tcp = authority.derive_tcp_cap().unwrap();
         let stack = SocketStack::new(TestNetworkService);
 
-        let error = block_on(stack.tcp_listen(tcp, None, TCP_ANY_V4, 53, 1)).unwrap_err();
+        let error = block_on(stack.tcp_listen(
+            tcp,
+            None,
+            TCP_ANY_V4,
+            53,
+            1,
+            helios_netstack::DEFAULT_HOP_LIMIT,
+        )).unwrap_err();
         assert_eq!(error.kind, crate::TcpErrorKind::PermissionDenied);
         assert_eq!(error.detail, NetworkErrorDetail::PrivilegedBindDenied);
     }
@@ -531,7 +611,14 @@ mod tests {
         let stack = SocketStack::new(TestNetworkService);
 
         assert_eq!(
-            block_on(stack.tcp_listen(tcp, None, TCP_ANY_V4, 8080, 1))
+            block_on(stack.tcp_listen(
+                tcp,
+                None,
+                TCP_ANY_V4,
+                8080,
+                1,
+                helios_netstack::DEFAULT_HOP_LIMIT,
+            ))
                 .unwrap()
                 .local_port,
             8080

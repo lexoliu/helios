@@ -308,37 +308,27 @@ where
         self.instance.pending_kill()
     }
 
-    pub(super) fn write_output(&self, stream: crate::ComponentOutputStreamKind, bytes: &[u8]) {
+    /// Deliver stdout/stderr bytes to a sink that cannot block, or hand
+    /// back the bounded child channel the caller has to push through.
+    ///
+    /// The split exists because the store is not `Sync`: holding `&self`
+    /// across an `.await` would make every host-call future non-`Send`.
+    /// Callers take the returned writer — a cheap handle clone — and then
+    /// await or `try_write` it outside this borrow.
+    pub(super) fn route_output(
+        &self,
+        stream: crate::ComponentOutputStreamKind,
+        bytes: &[u8],
+    ) -> Option<crate::ByteWriter> {
         if bytes.is_empty() {
-            return;
+            return None;
         }
-        match &self.output_mode {
-            OutputMode::Serial => (self.write_serial)(bytes),
-            OutputMode::Trace => {
-                let text = core::str::from_utf8(bytes).unwrap_or_else(|error| {
-                    panic!("Preview1 guest wrote non-utf8 stdout/stderr bytes: {error}")
-                });
-                self.runtime_state
-                    .record_console_text(self.cpu.now().ticks(), text);
+        match self.output_mode.sink(stream) {
+            crate::ComponentOutputSink::Local(local) => {
+                local.write(&self.cpu, &self.runtime_state, self.write_serial, bytes);
+                None
             }
-            OutputMode::Child {
-                stdout_tx,
-                stderr_tx,
-                ..
-            } => {
-                let writer = match stream {
-                    crate::ComponentOutputStreamKind::Stdout => stdout_tx,
-                    crate::ComponentOutputStreamKind::Stderr => stderr_tx,
-                };
-                let _ = writer.write(Bytes::copy_from_slice(bytes));
-            }
-            OutputMode::RoutedChild { stdout, stderr, .. } => {
-                let route = match stream {
-                    crate::ComponentOutputStreamKind::Stdout => stdout,
-                    crate::ComponentOutputStreamKind::Stderr => stderr,
-                };
-                route.write(&self.cpu, &self.runtime_state, self.write_serial, bytes);
-            }
+            crate::ComponentOutputSink::Child(writer) => Some(writer.clone()),
         }
     }
 
@@ -491,6 +481,53 @@ where
             }
         }
         take_preview1_carry(carry, max_bytes)
+    }
+
+    /// Probe stdin for `poll_oneoff`/`epoll_wait` without blocking.
+    ///
+    /// Serial-backed stdin has no readiness notification, so the probe pulls
+    /// whatever the console already has into the descriptor's carry; a later
+    /// `fd_read` drains that carry, so nothing is lost. A child's stdin is a
+    /// byte channel that answers directly, and trace output never delivers
+    /// input at all.
+    pub(super) fn probe_stdin(&mut self, fd: i32) -> P1Readiness {
+        match self.descriptors.get(fd) {
+            Some(Preview1Descriptor::Stdin { carry }) if !carry.is_empty() => {
+                return P1Readiness::Ready {
+                    bytes: carry.len() as u64,
+                };
+            }
+            Some(Preview1Descriptor::Stdin { .. }) => {}
+            _ => return P1Readiness::Pending,
+        }
+        // Resolve the mode to a plain value first so the console read below
+        // does not overlap the borrow of `output_mode`.
+        let channel_readable = match &self.output_mode {
+            OutputMode::Serial => None,
+            OutputMode::Trace => return P1Readiness::Hangup,
+            OutputMode::Child { stdin_rx, .. } | OutputMode::RoutedChild { stdin_rx, .. } => {
+                Some(stdin_rx.is_readable())
+            }
+        };
+        if let Some(readable) = channel_readable {
+            return if readable {
+                P1Readiness::Ready { bytes: 1 }
+            } else {
+                P1Readiness::Pending
+            };
+        }
+
+        (self.read_serial)(&mut self.serial_read_buffer, P1_STDIN_PROBE_CAPACITY);
+        if self.serial_read_buffer.is_empty() {
+            return P1Readiness::Pending;
+        }
+        let bytes = Bytes::copy_from_slice(&self.serial_read_buffer);
+        let len = bytes.len() as u64;
+        let Some(Preview1Descriptor::Stdin { carry }) = self.descriptors.get_mut(fd) else {
+            return P1Readiness::Pending;
+        };
+        *carry = bytes;
+        P1Readiness::Ready { bytes: len }
     }
 
     pub(super) async fn read_pipe(&mut self, fd: i32, max_bytes: usize) -> Result<Bytes, i32> {
@@ -965,7 +1002,14 @@ pub(super) fn configure_preview1_program_store<CpuImpl, HostFs>(
         },
     );
     store.set_epoch_deadline(1);
-    store.epoch_deadline_async_yield_and_update(1);
+    // Epoch ticks double as the kill observation point for CPU-bound
+    // guests (see `store_with_state`): check the flag, otherwise yield.
+    store.epoch_deadline_callback(|caller| {
+        if let Some(reason) = caller.data().check_pending_kill() {
+            return Err(wasmtime::Error::from(crate::InstanceKilled { reason }));
+        }
+        Ok(wasmtime::UpdateDeadline::Yield(1))
+    });
 }
 
 pub(super) fn preview1_program_linker<CpuImpl, HostFs>(
@@ -1237,20 +1281,20 @@ where
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_datasync",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>, fd: i32| -> i32 {
-                p1_fd_datasync(&mut caller, fd)
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>, (fd,): (i32,)| {
+                Box::new(async move { p1_fd_datasync(&mut caller, fd).await })
             },
         )
         .map_err(map_program_runtime_error)?;
     linker
-        .func_wrap(
+        .func_wrap_async(
             "wasi_snapshot_preview1",
             "fd_sync",
-            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>, fd: i32| -> i32 {
-                p1_fd_sync(&mut caller, fd)
+            |mut caller: Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>, (fd,): (i32,)| {
+                Box::new(async move { p1_fd_sync(&mut caller, fd).await })
             },
         )
         .map_err(map_program_runtime_error)?;
@@ -2257,31 +2301,48 @@ where
         caller.data().descriptors.get(fd),
         Some(Preview1Descriptor::NullDevice)
     ) {
-        return p1_write_filestat(caller, stat, p1_null_device_stat());
+        return p1_write_filestat(caller, stat, p1_null_device_identity(), p1_null_device_stat());
     }
-    let Some(path) = p1_descriptor_path(caller.data().descriptors.get(fd)) else {
+    let Some(path) = p1_descriptor_path(caller.data().descriptors.get(fd)).map(ToOwned::to_owned)
+    else {
         return p1::errno::BADF;
     };
-    let stat_value = if let Some(host_path) =
-        crate::guest_host_share_path(path).map(ToOwned::to_owned)
-    {
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        match service.stat_path(&host_path).await {
-            Ok(metadata) => p1_descriptor_stat_from_host_metadata(metadata),
-            Err(error) => {
-                return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
-            }
-        }
-    } else {
-        match caller.data().filesystem.stat(path) {
-            Ok(stat) => stat,
-            Err(error) => return p1_errno_from_fs(error),
-        }
+    let (identity, stat_value) = match p1_stat_absolute_path(caller, &path).await {
+        Ok(stat) => stat,
+        Err(errno) => return errno,
     };
-    p1_write_filestat(caller, stat, stat_value)
+    p1_write_filestat(caller, stat, identity, stat_value)
+}
+
+/// Resolves a guest-absolute path to its object identity and descriptor stat.
+///
+/// Host-share paths take the async 9p route so `st_dev`/`st_ino`, link count,
+/// and timestamps all come from the host's own `Rgetattr`; embedded paths read
+/// the in-memory node, whose identity is allocated once per object.
+pub(super) async fn p1_stat_absolute_path<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    path: &str,
+) -> Result<(crate::ObjectIdentity, fs_types::DescriptorStat), i32>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    if let Some(host_path) = crate::guest_host_share_path(path).map(ToOwned::to_owned) {
+        let service = caller
+            .data()
+            .filesystem
+            .host_service()
+            .map_err(p1_errno_from_fs)?;
+        let metadata = service.stat_path(&host_path).await.map_err(|error| {
+            p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error))
+        })?;
+        let stat = p1_descriptor_stat_from_host_metadata(&metadata);
+        return Ok((metadata.identity, stat));
+    }
+    let filesystem = &caller.data().filesystem;
+    let identity = filesystem.identity_at_path(path).map_err(p1_errno_from_fs)?;
+    let stat = filesystem.stat(path).map_err(p1_errno_from_fs)?;
+    Ok((identity, stat))
 }
 
 pub(super) async fn p1_fd_filestat_set_size<CpuImpl, HostFs>(
@@ -2460,7 +2521,7 @@ where
         .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
 }
 
-pub(super) fn p1_fd_datasync<CpuImpl, HostFs>(
+pub(super) async fn p1_fd_datasync<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
 ) -> i32
@@ -2468,10 +2529,10 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    p1_fd_advise(caller, fd)
+    p1_fd_sync_impl(caller, fd).await
 }
 
-pub(super) fn p1_fd_sync<CpuImpl, HostFs>(
+pub(super) async fn p1_fd_sync<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
 ) -> i32
@@ -2479,7 +2540,41 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    p1_fd_advise(caller, fd)
+    p1_fd_sync_impl(caller, fd).await
+}
+
+/// Backs `fd_sync` and `fd_datasync`.
+///
+/// A descriptor on the host share is flushed with a real 9p `Tfsync`; 9p has
+/// no separate data-only barrier, so both entry points map to it. Descriptors
+/// on the embedded filesystem, on stdio, and on `/dev/null` have no
+/// write-back stage to flush, so success there is an accurate answer and not
+/// a silent skip.
+async fn p1_fd_sync_impl<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    fd: i32,
+) -> i32
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let Some(descriptor) = caller.data().descriptors.get(fd) else {
+        return p1::errno::BADF;
+    };
+    let host_path = p1_descriptor_path(Some(descriptor))
+        .and_then(crate::guest_host_share_path)
+        .map(ToOwned::to_owned);
+    let Some(host_path) = host_path else {
+        return p1::errno::SUCCESS;
+    };
+    let service = match caller.data().filesystem.host_service() {
+        Ok(service) => service,
+        Err(error) => return p1_errno_from_fs(error),
+    };
+    match service.sync_file(&host_path).await {
+        Ok(()) => p1::errno::SUCCESS,
+        Err(error) => p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error)),
+    }
 }
 
 pub(super) async fn p1_fd_pread<CpuImpl, HostFs>(
@@ -3024,13 +3119,11 @@ where
         .host_service()
         .map_err(p1_errno_from_fs)?;
     let metadata = service.stat_path(&host_path).await;
-    let (kind, identity, contents, descriptor_flags) = match metadata {
+    // Host files are never materialised in kernel memory on open: `fd_read`
+    // and `fd_pread` pull bounded ranges over 9p on demand.
+    let (kind, identity, descriptor_flags) = match metadata {
         Ok(metadata) => {
-            let kind = if metadata.qid_type & 0x80 != 0 {
-                FsNodeKind::Directory
-            } else {
-                FsNodeKind::File
-            };
+            let kind = crate::wasmtime_adapter::wasi::host_metadata_node_kind(&metadata);
             if open_flags.contains(fs_types::OpenFlags::EXCLUSIVE)
                 && open_flags.contains(fs_types::OpenFlags::CREATE)
             {
@@ -3066,14 +3159,7 @@ where
                     .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
                     .map_err(p1_errno_from_fs)?;
             }
-            if kind == FsNodeKind::File {
-                let contents = service
-                    .read_file(&host_path)
-                    .await
-                    .map_err(crate::wasmtime_adapter::wasi::map_host_fs_error)
-                    .map_err(p1_errno_from_fs)?;
-                (kind, metadata.identity, Some(contents), descriptor_flags)
-            } else {
+            if kind != FsNodeKind::File {
                 let entries = service
                     .read_dir(&host_path)
                     .await
@@ -3083,8 +3169,8 @@ where
                     .data_mut()
                     .filesystem
                     .seed_host_directory_entries(&absolute, entries);
-                (kind, metadata.identity, None, descriptor_flags)
             }
+            (kind, metadata.identity, descriptor_flags)
         }
         Err(error) => {
             let error = crate::wasmtime_adapter::wasi::map_host_fs_error(error);
@@ -3115,20 +3201,9 @@ where
                 FsNodeKind::File,
             )
             .map_err(p1_errno_from_fs)?;
-            (
-                FsNodeKind::File,
-                metadata.identity,
-                Some(Vec::new()),
-                descriptor_flags,
-            )
+            (FsNodeKind::File, metadata.identity, descriptor_flags)
         }
     };
-    if let Some(contents) = contents {
-        caller
-            .data_mut()
-            .filesystem
-            .seed_host_file_content(&absolute, identity, contents);
-    }
     Ok(FsDescriptor {
         path: absolute,
         kind,
@@ -3216,26 +3291,13 @@ where
         Err(errno) => return errno,
     };
     if absolute == WASIX_NULL_DEVICE_PATH {
-        return p1_write_filestat(caller, stat, p1_null_device_stat());
+        return p1_write_filestat(caller, stat, p1_null_device_identity(), p1_null_device_stat());
     }
-    let stat_value = if let Some(host_path) = crate::guest_host_share_path(&absolute) {
-        let service = match caller.data().filesystem.host_service() {
-            Ok(service) => service,
-            Err(error) => return p1_errno_from_fs(error),
-        };
-        match service.stat_path(host_path).await {
-            Ok(metadata) => p1_descriptor_stat_from_host_metadata(metadata),
-            Err(error) => {
-                return p1_errno_from_fs(crate::wasmtime_adapter::wasi::map_host_fs_error(error));
-            }
-        }
-    } else {
-        match caller.data().filesystem.stat(&absolute) {
-            Ok(stat) => stat,
-            Err(error) => return p1_errno_from_fs(error),
-        }
+    let (identity, stat_value) = match p1_stat_absolute_path(caller, &absolute).await {
+        Ok(stat) => stat,
+        Err(errno) => return errno,
     };
-    p1_write_filestat(caller, stat, stat_value)
+    p1_write_filestat(caller, stat, identity, stat_value)
 }
 
 pub(super) async fn p1_path_filestat_set_times<CpuImpl, HostFs>(
@@ -3712,6 +3774,51 @@ where
         .map_or_else(p1_errno_from_fs, |_| p1::errno::SUCCESS)
 }
 
+/// How much console input one stdin readiness probe pulls into the carry.
+const P1_STDIN_PROBE_CAPACITY: u32 = 4096;
+
+/// `eventrwflags`: the read end of the descriptor has hung up.
+const P1_EVENT_FD_READWRITE_HANGUP: u16 = 1;
+
+/// One decoded `poll_oneoff` subscription.
+enum P1Subscription {
+    /// A deadline in `clock_id`'s timebase.
+    Clock {
+        userdata: u64,
+        monotonic: bool,
+        deadline_nanos: u64,
+    },
+    Fd {
+        userdata: u64,
+        event_type: u8,
+        fd: i32,
+    },
+    /// Malformed subscription. It is reported immediately, like `POLLNVAL`.
+    Failed {
+        userdata: u64,
+        event_type: u8,
+        error: u16,
+    },
+}
+
+/// One event that `poll_oneoff` will hand back to the guest.
+struct P1ReadyEvent {
+    userdata: u64,
+    error: u16,
+    event_type: u8,
+    nbytes: u64,
+    fd_flags: u16,
+}
+
+/// `poll_oneoff` is `select`: block until at least one subscription is ready
+/// or the earliest clock deadline expires, then report only what is ready.
+///
+/// The previous implementation walked the subscriptions sequentially, slept
+/// the full duration of every clock subscription regardless of whether a
+/// descriptor had become ready, and emitted an event for every subscription
+/// whether or not it was ready. A guest polling "socket readable, or 5s
+/// timeout" therefore always waited the whole 5 seconds, and then could not
+/// tell which of the two events had actually fired.
 pub(super) async fn p1_poll_oneoff<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     subscriptions: u32,
@@ -3729,90 +3836,236 @@ where
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
-    let mut event_count = 0u32;
-    for index in 0..nsubscriptions {
-        let Some(subscription_ptr) = index
-            .checked_mul(P1_SUBSCRIPTION_SIZE)
-            .and_then(|offset| subscriptions.checked_add(offset))
-        else {
-            return p1::errno::OVERFLOW;
-        };
-        let userdata = match p1_try_read_u64(caller, memory, subscription_ptr) {
-            Ok(userdata) => userdata,
-            Err(_) => return p1::errno::FAULT,
-        };
-        let event_type = match p1_try_read_u8(caller, memory, subscription_ptr + 8) {
-            Ok(event_type) => event_type,
-            Err(_) => return p1::errno::FAULT,
-        };
-        let mut error = p1::errno::SUCCESS as u16;
-        let mut nbytes = 0u64;
-        let mut fd_flags = 0u16;
-        match event_type {
-            P1_EVENTTYPE_CLOCK => {
-                let clock_id = match p1_try_read_u32(caller, memory, subscription_ptr + 16) {
-                    Ok(clock_id) => clock_id,
-                    Err(_) => return p1::errno::FAULT,
-                };
-                let timeout = match p1_try_read_u64(caller, memory, subscription_ptr + 24) {
-                    Ok(timeout) => timeout,
-                    Err(_) => return p1::errno::FAULT,
-                };
-                let flags = match p1_try_read_u16(caller, memory, subscription_ptr + 40) {
-                    Ok(flags) => flags,
-                    Err(_) => return p1::errno::FAULT,
-                };
-                if !matches!(clock_id, 0 | 1) {
-                    error = p1::errno::INVAL as u16;
-                } else {
-                    let now = if clock_id == 0 {
-                        caller.data().system_time_nanos()
-                    } else {
+
+    let parsed = match p1_read_subscriptions(caller, memory, subscriptions, nsubscriptions) {
+        Ok(parsed) => parsed,
+        Err(errno) => return errno,
+    };
+
+    let ready = loop {
+        let mut ready = Vec::new();
+        let mut earliest: Option<Duration> = None;
+
+        for subscription in &parsed {
+            match subscription {
+                P1Subscription::Failed {
+                    userdata,
+                    event_type,
+                    error,
+                } => ready.push(P1ReadyEvent {
+                    userdata: *userdata,
+                    error: *error,
+                    event_type: *event_type,
+                    nbytes: 0,
+                    fd_flags: 0,
+                }),
+                P1Subscription::Fd {
+                    userdata,
+                    event_type,
+                    fd,
+                } => {
+                    let readiness = p1_descriptor_readiness(caller, *fd, *event_type).await;
+                    if let Some(event) = p1_fd_event(*userdata, *event_type, readiness) {
+                        ready.push(event);
+                    }
+                }
+                P1Subscription::Clock {
+                    userdata,
+                    monotonic,
+                    deadline_nanos,
+                } => {
+                    let now = if *monotonic {
                         caller.data().now_nanos()
-                    };
-                    let duration = if flags & P1_SUBSCRIPTION_CLOCK_ABSTIME != 0 {
-                        timeout.saturating_sub(now)
                     } else {
-                        timeout
+                        caller.data().system_time_nanos()
                     };
-                    if duration != 0 {
-                        caller
-                            .data()
-                            .sleep_for(Duration::from_nanos(duration))
-                            .await;
+                    match p1_clock_progress(*userdata, *deadline_nanos, now) {
+                        P1ClockProgress::Elapsed(event) => ready.push(event),
+                        P1ClockProgress::Waiting(remaining) => {
+                            earliest = Some(
+                                earliest
+                                    .map_or(remaining, |current: Duration| current.min(remaining)),
+                            );
+                        }
                     }
                 }
             }
-            P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE => {
-                let fd = match p1_try_read_u32(caller, memory, subscription_ptr + 16) {
-                    Ok(fd) => fd as i32,
-                    Err(_) => return p1::errno::FAULT,
-                };
-                match p1_poll_descriptor(caller.data().descriptors.get(fd), event_type) {
-                    Ok(bytes) => nbytes = bytes,
-                    Err(errno) => error = errno as u16,
-                }
-                fd_flags = 0;
-            }
-            _ => error = p1::errno::INVAL as u16,
         }
+
+        if !ready.is_empty() {
+            break ready;
+        }
+
+        // Nothing is ready and no deadline has expired: register on every
+        // subscribed descriptor and sleep until one of them makes progress
+        // or the earliest deadline arrives.
+        let mut wait = P1WaitSet::new();
+        for subscription in &parsed {
+            if let P1Subscription::Fd { fd, event_type, .. } = subscription {
+                p1_add_wait_target(caller.data(), *fd, *event_type, &mut wait);
+            }
+        }
+        let timer = caller.data().timer();
+        p1_wait_step(&timer, &mut wait, earliest).await;
+    };
+
+    let mut event_count = 0u32;
+    for event in &ready {
         let Some(event_ptr) = event_count
             .checked_mul(P1_EVENT_SIZE)
             .and_then(|offset| events.checked_add(offset))
         else {
             return p1::errno::OVERFLOW;
         };
-        let status = p1_write_u64(caller, memory, event_ptr, userdata)
-            .max(p1_write_u16(caller, memory, event_ptr + 8, error))
-            .max(p1_write_u8(caller, memory, event_ptr + 10, event_type))
-            .max(p1_write_u64(caller, memory, event_ptr + 16, nbytes))
-            .max(p1_write_u16(caller, memory, event_ptr + 24, fd_flags));
+        let status = p1_write_u64(caller, memory, event_ptr, event.userdata)
+            .max(p1_write_u16(caller, memory, event_ptr + 8, event.error))
+            .max(p1_write_u8(
+                caller,
+                memory,
+                event_ptr + 10,
+                event.event_type,
+            ))
+            .max(p1_write_u64(caller, memory, event_ptr + 16, event.nbytes))
+            .max(p1_write_u16(caller, memory, event_ptr + 24, event.fd_flags));
         if status != p1::errno::SUCCESS {
             return status;
         }
         event_count += 1;
     }
     p1_write_u32(caller, memory, nevents, event_count)
+}
+
+/// Whether a clock subscription's deadline has arrived.
+enum P1ClockProgress {
+    Elapsed(P1ReadyEvent),
+    Waiting(Duration),
+}
+
+/// Turn a descriptor's readiness into an event, or nothing when it would
+/// still block.
+///
+/// Returning `None` for `Pending` is what makes `poll_oneoff` behave like
+/// `select`: only subscriptions that are actually ready are reported, so the
+/// guest can tell which of its subscriptions fired.
+fn p1_fd_event(
+    userdata: u64,
+    event_type: u8,
+    readiness: Result<P1Readiness, i32>,
+) -> Option<P1ReadyEvent> {
+    match readiness {
+        Ok(readiness) if !readiness.is_ready() => None,
+        Ok(readiness) => Some(P1ReadyEvent {
+            userdata,
+            error: p1::errno::SUCCESS as u16,
+            event_type,
+            nbytes: readiness.bytes(),
+            fd_flags: if readiness.is_hangup() {
+                P1_EVENT_FD_READWRITE_HANGUP
+            } else {
+                0
+            },
+        }),
+        Err(errno) => Some(P1ReadyEvent {
+            userdata,
+            error: errno as u16,
+            event_type,
+            nbytes: 0,
+            fd_flags: 0,
+        }),
+    }
+}
+
+/// Evaluate a clock subscription against the current time in its timebase.
+///
+/// A deadline that already passed — including a zero timeout — is ready on
+/// the first pass, which is what makes a zero-timeout `poll_oneoff` a
+/// non-blocking readiness snapshot.
+fn p1_clock_progress(userdata: u64, deadline_nanos: u64, now: u64) -> P1ClockProgress {
+    if now >= deadline_nanos {
+        return P1ClockProgress::Elapsed(P1ReadyEvent {
+            userdata,
+            error: p1::errno::SUCCESS as u16,
+            event_type: P1_EVENTTYPE_CLOCK,
+            nbytes: 0,
+            fd_flags: 0,
+        });
+    }
+    P1ClockProgress::Waiting(Duration::from_nanos(deadline_nanos - now))
+}
+
+fn p1_read_subscriptions<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    memory: Preview1Memory,
+    subscriptions: u32,
+    nsubscriptions: u32,
+) -> Result<Vec<P1Subscription>, i32>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let mut parsed = Vec::with_capacity(nsubscriptions as usize);
+    for index in 0..nsubscriptions {
+        let subscription_ptr = index
+            .checked_mul(P1_SUBSCRIPTION_SIZE)
+            .and_then(|offset| subscriptions.checked_add(offset))
+            .ok_or(p1::errno::OVERFLOW)?;
+        let userdata =
+            p1_try_read_u64(caller, memory, subscription_ptr).map_err(|_| p1::errno::FAULT)?;
+        let event_type =
+            p1_try_read_u8(caller, memory, subscription_ptr + 8).map_err(|_| p1::errno::FAULT)?;
+        parsed.push(match event_type {
+            P1_EVENTTYPE_CLOCK => {
+                let clock_id = p1_try_read_u32(caller, memory, subscription_ptr + 16)
+                    .map_err(|_| p1::errno::FAULT)?;
+                let timeout = p1_try_read_u64(caller, memory, subscription_ptr + 24)
+                    .map_err(|_| p1::errno::FAULT)?;
+                let flags = p1_try_read_u16(caller, memory, subscription_ptr + 40)
+                    .map_err(|_| p1::errno::FAULT)?;
+                if !matches!(clock_id, 0 | 1) {
+                    P1Subscription::Failed {
+                        userdata,
+                        event_type,
+                        error: p1::errno::INVAL as u16,
+                    }
+                } else {
+                    let monotonic = clock_id == 1;
+                    let now = if monotonic {
+                        caller.data().now_nanos()
+                    } else {
+                        caller.data().system_time_nanos()
+                    };
+                    // Relative timeouts are anchored once, here, so a
+                    // subscription cannot restart its countdown every time
+                    // the wait loop re-probes.
+                    let deadline_nanos = if flags & P1_SUBSCRIPTION_CLOCK_ABSTIME != 0 {
+                        timeout
+                    } else {
+                        now.saturating_add(timeout)
+                    };
+                    P1Subscription::Clock {
+                        userdata,
+                        monotonic,
+                        deadline_nanos,
+                    }
+                }
+            }
+            P1_EVENTTYPE_FD_READ | P1_EVENTTYPE_FD_WRITE => {
+                let fd = p1_try_read_u32(caller, memory, subscription_ptr + 16)
+                    .map_err(|_| p1::errno::FAULT)? as i32;
+                P1Subscription::Fd {
+                    userdata,
+                    event_type,
+                    fd,
+                }
+            }
+            _ => P1Subscription::Failed {
+                userdata,
+                event_type,
+                error: p1::errno::INVAL as u16,
+            },
+        });
+    }
+    Ok(parsed)
 }
 
 pub(super) fn p1_proc_raise<CpuImpl, HostFs>(
@@ -3868,10 +4121,12 @@ where
     if status != p1::errno::SUCCESS {
         return status;
     }
-    let listener = match caller.data().descriptors.get(fd) {
+    let (listener, family) = match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
-            WasixTcpSocket::Listening { listener, .. },
-        ))) => *listener,
+            WasixTcpSocket::Listening {
+                listener, family, ..
+            },
+        ))) => (*listener, *family),
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(_))) => {
             return p1::errno::INVAL;
         }
@@ -3891,14 +4146,11 @@ where
         Ok(accepted) => accepted,
         Err(error) => return p1_errno_from_tcp_error_for_fdflags(error, fdflags),
     };
-    let peer_address = match accepted.address {
-        crate::NetworkIpAddress::Ipv4(address) => address,
-        crate::NetworkIpAddress::Ipv6(_) => return p1::errno::NOTSUP,
-    };
     let descriptor =
         Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
+            family,
             stream: accepted.stream,
-            peer_address,
+            peer_address: accepted.address,
             peer_port: accepted.port,
             options: WasixSocketOptions::default(),
         }));
@@ -4146,8 +4398,12 @@ where
             Ok(written) => written,
             Err(_) => return p1::errno::OVERFLOW,
         };
-        if writer.write(bytes).is_err() {
-            return p1::errno::IO;
+        let fdflags = match caller.data().descriptors.fdflags(fd) {
+            Ok(fdflags) => fdflags,
+            Err(errno) => return errno,
+        };
+        if let Err(errno) = p1_send_to_socketpair(&writer, bytes, fdflags).await {
+            return errno;
         }
         return p1_write_u32(caller, memory, so_datalen, written);
     }
@@ -4220,7 +4476,10 @@ where
                 return p1::errno::BADF;
             };
             let options = *slot.options();
-            *slot = WasixTcpSocket::Unconnected { options };
+            *slot = WasixTcpSocket::Unconnected {
+                family: slot.family(),
+                options,
+            };
             p1::errno::SUCCESS
         }
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(
@@ -4245,7 +4504,10 @@ where
                 return p1::errno::BADF;
             };
             let options = *slot.options();
-            *slot = WasixUdpSocket::Unbound { options };
+            *slot = WasixUdpSocket::Unbound {
+                family: slot.family(),
+                options,
+            };
             p1::errno::SUCCESS
         }
         Some(Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
@@ -4287,6 +4549,59 @@ where
         .collect()
 }
 
+/// Push one datagram into the peer half of a socketpair.
+///
+/// The pair is a bounded byte channel like every other child pipe, so a
+/// blocking socket waits for the peer to drain and a non-blocking one
+/// reports `EAGAIN` while keeping its bytes. Nothing is dropped.
+pub(super) async fn p1_send_to_socketpair(
+    writer: &crate::ByteWriter,
+    bytes: Vec<u8>,
+    fdflags: u16,
+) -> Result<(), i32> {
+    if p1_fdflags_nonblocking(fdflags) {
+        return match writer.try_write(bytes) {
+            crate::TryWrite::Written => Ok(()),
+            crate::TryWrite::Full(_) => Err(p1::errno::AGAIN),
+            crate::TryWrite::Closed => Err(p1::errno::IO),
+        };
+    }
+    writer.write(bytes).await.map_err(|_| p1::errno::IO)
+}
+
+/// Write one chunk to stdout/stderr, respecting the descriptor's
+/// blocking mode.
+///
+/// A serial or trace route takes the bytes inside `route_output`. A child
+/// pipe is bounded: a blocking descriptor waits for the parent to drain,
+/// a non-blocking one reports `EAGAIN` and keeps its bytes. A reader that
+/// has gone away is not an error — the bytes go nowhere, exactly like a
+/// POSIX write to a closed pipe with SIGPIPE suppressed.
+async fn p1_write_stdio<CpuImpl, HostFs>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
+    stream: crate::ComponentOutputStreamKind,
+    bytes: &[u8],
+    nonblocking: bool,
+) -> Result<u32, i32>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    let written = u32::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW)?;
+    let Some(writer) = caller.data().route_output(stream, bytes) else {
+        return Ok(written);
+    };
+    if nonblocking {
+        match writer.try_write(Bytes::copy_from_slice(bytes)) {
+            crate::TryWrite::Written | crate::TryWrite::Closed => {}
+            crate::TryWrite::Full(_) => return Err(p1::errno::AGAIN),
+        }
+    } else {
+        let _: Result<(), crate::ClosedPeer> = writer.write(Bytes::copy_from_slice(bytes)).await;
+    }
+    Ok(written)
+}
+
 pub(super) async fn p1_write_descriptor<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     fd: i32,
@@ -4296,23 +4611,47 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
+    // A descriptor whose sink is a bounded channel blocks the guest while
+    // that channel is full, unless the guest asked for non-blocking IO —
+    // then it gets `EAGAIN` and keeps its bytes, as POSIX requires.
+    let nonblocking = caller
+        .data()
+        .descriptors
+        .fdflags(fd)
+        .is_ok_and(p1_fdflags_nonblocking);
     match caller.data().descriptors.get(fd) {
         Some(Preview1Descriptor::Stdout) => {
-            caller
-                .data()
-                .write_output(crate::ComponentOutputStreamKind::Stdout, bytes);
-            u32::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW)
+            p1_write_stdio(
+                caller,
+                crate::ComponentOutputStreamKind::Stdout,
+                bytes,
+                nonblocking,
+            )
+            .await
         }
         Some(Preview1Descriptor::Stderr) => {
-            caller
-                .data()
-                .write_output(crate::ComponentOutputStreamKind::Stderr, bytes);
-            u32::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW)
+            p1_write_stdio(
+                caller,
+                crate::ComponentOutputStreamKind::Stderr,
+                bytes,
+                nonblocking,
+            )
+            .await
         }
         Some(Preview1Descriptor::PipeWrite { writer }) => {
-            writer
-                .write(Bytes::copy_from_slice(bytes))
-                .map_err(|_| p1::errno::IO)?;
+            let writer = writer.clone();
+            if nonblocking {
+                match writer.try_write(Bytes::copy_from_slice(bytes)) {
+                    crate::TryWrite::Written => {}
+                    crate::TryWrite::Full(_) => return Err(p1::errno::AGAIN),
+                    crate::TryWrite::Closed => return Err(p1::errno::IO),
+                }
+            } else {
+                writer
+                    .write(Bytes::copy_from_slice(bytes))
+                    .await
+                    .map_err(|_| p1::errno::IO)?;
+            }
             u32::try_from(bytes.len()).map_err(|_| p1::errno::OVERFLOW)
         }
         Some(Preview1Descriptor::Event(event)) => {
@@ -4522,9 +4861,17 @@ pub(super) fn p1_fdflags_nonblocking(fdflags: u16) -> bool {
     fdflags & P1_FDFLAG_NONBLOCK != 0
 }
 
+/// Writes a preview1 `filestat` record.
+///
+/// `identity` supplies `st_dev`/`st_ino`: the authority domain is the device
+/// (one per mount — bootfs, the 9p host share, synthetic devices) and the
+/// local id is the inode. Programs that de-duplicate files by `(dev, ino)` —
+/// `cp -r`, `find`, `rsync`, tar — need both to be real and stable, so no
+/// field here may be a placeholder zero.
 pub(super) fn p1_write_filestat<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     stat: u32,
+    identity: crate::ObjectIdentity,
     value: fs_types::DescriptorStat,
 ) -> i32
 where
@@ -4561,8 +4908,8 @@ where
                 .saturating_add(u64::from(datetime.nanoseconds))
         })
         .unwrap_or(0);
-    p1_write_u64(caller, memory, stat, 0)
-        .max(p1_write_u64(caller, memory, stat + 8, 0))
+    p1_write_u64(caller, memory, stat, identity.domain().raw())
+        .max(p1_write_u64(caller, memory, stat + 8, identity.local()))
         .max(p1_write_u8(
             caller,
             memory,
@@ -4661,4 +5008,171 @@ pub(super) fn p1_errno_from_udp_error_for_fdflags(error: crate::UdpError, fdflag
         return p1::errno::AGAIN;
     }
     p1_errno_from_udp_error(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn regular_file() -> Preview1Descriptor {
+        Preview1Descriptor::File {
+            descriptor: FsDescriptor {
+                path: "/data".into(),
+                kind: FsNodeKind::File,
+                flags: fs_types::DescriptorFlags::READ,
+                identity: None,
+            },
+            offset: 0,
+            fdflags: 0,
+        }
+    }
+
+    fn connected_socket() -> Preview1Descriptor {
+        Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
+            family: WasixSocketFamily::Ipv4,
+            stream: 9,
+            peer_address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1])),
+            peer_port: 80,
+            options: WasixSocketOptions::default(),
+        }))
+    }
+
+    /// `poll_oneoff` used to emit an event for every subscription, so a guest
+    /// could not tell which one fired. Only ready subscriptions are reported.
+    #[test]
+    fn poll_oneoff_reports_only_ready_subscriptions() {
+        assert!(p1_fd_event(1, P1_EVENTTYPE_FD_READ, Ok(P1Readiness::Pending)).is_none());
+
+        let ready = p1_fd_event(
+            2,
+            P1_EVENTTYPE_FD_READ,
+            Ok(P1Readiness::Ready { bytes: 12 }),
+        )
+        .expect("a readable descriptor produces an event");
+        assert_eq!(ready.userdata, 2);
+        assert_eq!(ready.error, p1::errno::SUCCESS as u16);
+        assert_eq!(ready.nbytes, 12);
+        assert_eq!(ready.fd_flags, 0);
+
+        let hangup = p1_fd_event(3, P1_EVENTTYPE_FD_READ, Ok(P1Readiness::Hangup))
+            .expect("an ended stream is ready");
+        assert_eq!(hangup.nbytes, 0);
+        assert_eq!(hangup.fd_flags, P1_EVENT_FD_READWRITE_HANGUP);
+
+        let bad = p1_fd_event(4, P1_EVENTTYPE_FD_READ, Err(p1::errno::BADF))
+            .expect("a bad descriptor is reported immediately");
+        assert_eq!(bad.error, p1::errno::BADF as u16);
+    }
+
+    /// A clock subscription is only ready once its deadline actually passed;
+    /// until then it contributes the remaining time to the sleep budget.
+    #[test]
+    fn poll_oneoff_clock_is_ready_only_after_its_deadline() {
+        match p1_clock_progress(1, 100, 40) {
+            P1ClockProgress::Waiting(remaining) => {
+                assert_eq!(remaining, Duration::from_nanos(60));
+            }
+            P1ClockProgress::Elapsed(_) => panic!("the deadline has not arrived yet"),
+        }
+        match p1_clock_progress(1, 100, 100) {
+            P1ClockProgress::Elapsed(event) => {
+                assert_eq!(event.event_type, P1_EVENTTYPE_CLOCK);
+                assert_eq!(event.userdata, 1);
+                assert_eq!(event.error, p1::errno::SUCCESS as u16);
+            }
+            P1ClockProgress::Waiting(_) => panic!("an arrived deadline is ready"),
+        }
+    }
+
+    /// A zero timeout (deadline == now) is ready on the first pass, so
+    /// `poll_oneoff` degrades to a non-blocking readiness snapshot.
+    #[test]
+    fn poll_oneoff_zero_timeout_never_sleeps() {
+        let now = 5_000;
+        // A relative timeout of zero anchors its deadline at `now`.
+        assert!(matches!(
+            p1_clock_progress(7, now, now),
+            P1ClockProgress::Elapsed(_)
+        ));
+        // An absolute deadline already in the past behaves the same way.
+        assert!(matches!(
+            p1_clock_progress(7, now - 1, now),
+            P1ClockProgress::Elapsed(_)
+        ));
+    }
+
+    /// The clock and the descriptors race: a descriptor that is ready ends
+    /// the wait immediately, and the clock event is not reported because its
+    /// deadline never arrived.
+    #[test]
+    fn poll_oneoff_returns_early_when_a_descriptor_becomes_ready() {
+        let mut ready = Vec::new();
+        let mut earliest: Option<Duration> = None;
+
+        if let Some(event) = p1_fd_event(
+            11,
+            P1_EVENTTYPE_FD_READ,
+            Ok(P1Readiness::Ready { bytes: 4 }),
+        ) {
+            ready.push(event);
+        }
+        match p1_clock_progress(12, 1_000_000, 0) {
+            P1ClockProgress::Elapsed(event) => ready.push(event),
+            P1ClockProgress::Waiting(remaining) => {
+                earliest =
+                    Some(earliest.map_or(remaining, |current: Duration| current.min(remaining)));
+            }
+        }
+
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].userdata, 11);
+        assert_eq!(ready[0].event_type, P1_EVENTTYPE_FD_READ);
+        // The clock only ever bounded the sleep; it never became an event.
+        assert_eq!(earliest, Some(Duration::from_nanos(1_000_000)));
+    }
+
+    /// The sleep is bounded by the earliest of several clock deadlines.
+    #[test]
+    fn poll_oneoff_sleeps_until_the_earliest_deadline() {
+        let mut earliest: Option<Duration> = None;
+        for deadline in [900u64, 300, 700] {
+            if let P1ClockProgress::Waiting(remaining) = p1_clock_progress(0, deadline, 100) {
+                earliest =
+                    Some(earliest.map_or(remaining, |current: Duration| current.min(remaining)));
+            }
+        }
+        assert_eq!(earliest, Some(Duration::from_nanos(200)));
+    }
+
+    /// Regular files never block, in either direction. They used to fall
+    /// through to `Ok(0)`, which `epoll` read as "not ready".
+    #[test]
+    fn regular_files_are_always_ready() {
+        let file = regular_file();
+        for event_type in [P1_EVENTTYPE_FD_READ, P1_EVENTTYPE_FD_WRITE] {
+            match p1_probe_descriptor(Some(&file), event_type) {
+                Ok(P1Probe::Local(readiness)) => {
+                    assert!(readiness.is_ready(), "a regular file never blocks");
+                    assert!(!readiness.is_hangup());
+                }
+                Ok(P1Probe::Network(_)) => panic!("a file is not a socket"),
+                Err(errno) => panic!("probing a regular file failed with {errno}"),
+            }
+        }
+    }
+
+    /// A connected socket's readiness is only knowable through the network
+    /// service, so the probe says so instead of silently reporting zero.
+    #[test]
+    fn connected_sockets_defer_to_the_network_service() {
+        let socket = connected_socket();
+        assert!(matches!(
+            p1_probe_descriptor(Some(&socket), P1_EVENTTYPE_FD_READ),
+            Ok(P1Probe::Network(P1NetworkProbe::TcpStream(9)))
+        ));
+        assert!(matches!(
+            p1_probe_descriptor(Some(&socket), P1_EVENTTYPE_FD_WRITE),
+            Ok(P1Probe::Network(P1NetworkProbe::TcpStream(9)))
+        ));
+    }
 }

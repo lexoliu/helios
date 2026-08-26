@@ -71,7 +71,12 @@ const WASIX_MODULE: &str = "wasix_32v1";
 const WASIX_NULL_DEVICE_PATH: &str = "/dev/null";
 const DEFAULT_WASIX_SOCKET_BUFFER_BYTES: u64 = 64 * 1024;
 const DEFAULT_WASIX_SOCKET_LOW_WATER_BYTES: u64 = 1;
-const DEFAULT_WASIX_SOCKET_TTL: u64 = 64;
+const DEFAULT_WASIX_SOCKET_TTL: u64 = helios_netstack::DEFAULT_HOP_LIMIT as u64;
+/// Ceiling for `SO_RCVBUF`: the receive window the netstack really reserves.
+/// A larger request is clamped so a read-back reports the effective size.
+const WASIX_SOCKET_RECEIVE_BUFFER_CEILING: u64 = helios_netstack::TCP_RECEIVE_WINDOW_BYTES as u64;
+/// Ceiling for `SO_SNDBUF`: the netstack's per-socket transmit buffer.
+const WASIX_SOCKET_SEND_BUFFER_CEILING: u64 = helios_netstack::TCP_TRANSMIT_BUFFER_BYTES as u64;
 const DEFAULT_WASIX_SOCKET_MULTICAST_TTL: u64 = 1;
 const WASIX_IPPROTO_TCP: u64 = 6;
 const WASIX_IPPROTO_UDP: u64 = 17;
@@ -1171,7 +1176,9 @@ where
         // Feed stdin in one shot, then close the writer to signal EOF.
         if let Some(writer) = child.take_stdin() {
             if !stdin.is_empty() {
-                let _ = writer.write(stdin);
+                // The child may not have started draining yet, so this
+                // waits for room rather than overrunning the channel.
+                let _: Result<(), crate::ClosedPeer> = writer.write(stdin).await;
             }
             drop(writer);
         }
@@ -1897,6 +1904,10 @@ const WASIX_ADDR_CIDR_IP4_ADDRESS_OFFSET: u32 = WASIX_ADDR_CIDR_UNION_OFFSET;
 const WASIX_ADDR_CIDR_IP4_PREFIX_OFFSET: u32 = WASIX_ADDR_CIDR_IP4_ADDRESS_OFFSET + 4;
 const WASIX_ADDR_PORT_UNION_OFFSET: u32 = 2;
 const WASIX_ADDR_PORT_IP4_ADDRESS_OFFSET: u32 = 4;
+/// `__wasi_addr_ip6_port_t` overlays `__wasi_addr_ip4_port_t` in the
+/// `__wasi_addr_port_t` union: both are `{ u16 port; address }`, so the
+/// address starts at the same offset and only its width differs.
+const WASIX_ADDR_PORT_IP6_ADDRESS_OFFSET: u32 = WASIX_ADDR_PORT_IP4_ADDRESS_OFFSET;
 const WASIX_ROUTE_SIZE: u32 = 176;
 const WASIX_ROUTE_CIDR_OFFSET: u32 = 0;
 const WASIX_ROUTE_ROUTER_OFFSET: u32 = 28;
@@ -2124,10 +2135,10 @@ mod tests {
             p1_null_device_stat().type_,
             fs_types::DescriptorType::CharacterDevice
         ));
-        assert_eq!(
-            p1_poll_descriptor(Some(&Preview1Descriptor::NullDevice), P1_EVENTTYPE_FD_WRITE),
-            Ok(usize::MAX as u64)
-        );
+        assert!(matches!(
+            p1_probe_descriptor(Some(&Preview1Descriptor::NullDevice), P1_EVENTTYPE_FD_WRITE),
+            Ok(P1Probe::Local(P1Readiness::Ready { bytes })) if bytes == usize::MAX as u64
+        ));
     }
 
     #[test]
@@ -2685,19 +2696,22 @@ mod tests {
     fn wasix_socket_operations_select_network_authority_by_socket_kind() {
         let tcp =
             Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
+                family: WasixSocketFamily::Ipv4,
                 stream: 1,
-                peer_address: crate::Ipv4Address::new([127, 0, 0, 1]),
+                peer_address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1])),
                 peer_port: 80,
                 options: WasixSocketOptions::default(),
             }));
         let udp_bound =
             Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Bound {
+                family: WasixSocketFamily::Ipv4,
                 socket: 2,
                 local_port: 5353,
                 options: WasixSocketOptions::default(),
             }));
         let udp_unbound =
             Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
+                family: WasixSocketFamily::Ipv4,
                 options: WasixSocketOptions::default(),
             }));
         let (left_writer, right_reader) = crate::byte_channel();
@@ -2778,10 +2792,12 @@ mod tests {
     #[test]
     fn wasix_multicast_preflight_accepts_udp_sockets_only() {
         let udp = Preview1Descriptor::Socket(WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
+            family: WasixSocketFamily::Ipv4,
             options: WasixSocketOptions::default(),
         }));
         let tcp =
             Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
+                family: WasixSocketFamily::Ipv4,
                 options: WasixSocketOptions::default(),
             }));
         let file = Preview1Descriptor::Stdout;
@@ -2844,6 +2860,30 @@ mod tests {
     }
 
     #[test]
+    fn wasix_socket_family_pins_wildcard_address_and_rejects_cross_family_peers() {
+        let v4 = crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([192, 0, 2, 1]));
+        let v6 = crate::NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::new([
+            0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+        ]));
+
+        // A wildcard bind means 0.0.0.0 on AF_INET and :: on AF_INET6.
+        assert_eq!(
+            WasixSocketFamily::Ipv4.unspecified_address(),
+            crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0]))
+        );
+        assert_eq!(
+            WasixSocketFamily::Ipv6.unspecified_address(),
+            crate::NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::UNSPECIFIED)
+        );
+
+        // There is no v4-mapped-v6 path: each family accepts only its own.
+        assert!(WasixSocketFamily::Ipv4.accepts(v4));
+        assert!(!WasixSocketFamily::Ipv4.accepts(v6));
+        assert!(WasixSocketFamily::Ipv6.accepts(v6));
+        assert!(!WasixSocketFamily::Ipv6.accepts(v4));
+    }
+
+    #[test]
     fn wasix_socket_creation_validates_family_and_protocol() {
         assert_eq!(
             wasix_validate_network_socket_request(
@@ -2869,19 +2909,39 @@ mod tests {
             ),
             Err(p1::errno::NOTSUP)
         );
+        // AF_INET6 is a supported family for both socket types; only
+        // AF_UNIX remains unsupported for network sockets.
         assert_eq!(
             wasix_validate_network_socket_request(
                 WASIX_ADDRESS_FAMILY_IP_INET6_I32,
                 WASIX_SOCK_TYPE_STREAM,
                 WASIX_IPPROTO_TCP_I32,
             ),
-            Err(p1::errno::NOTSUP)
+            Ok(())
         );
         assert_eq!(
             wasix_validate_network_socket_request(
                 WASIX_ADDRESS_FAMILY_IP_INET6_I32,
                 WASIX_SOCK_TYPE_DGRAM,
                 WASIX_IPPROTO_UDP_I32,
+            ),
+            Ok(())
+        );
+        // A mismatched protocol is still rejected within AF_INET6.
+        assert_eq!(
+            wasix_validate_network_socket_request(
+                WASIX_ADDRESS_FAMILY_IP_INET6_I32,
+                WASIX_SOCK_TYPE_STREAM,
+                WASIX_IPPROTO_UDP_I32,
+            ),
+            Err(p1::errno::INVAL)
+        );
+        // socket_pair stays AF_UNIX/AF_UNSPEC only.
+        assert_eq!(
+            wasix_validate_socket_pair_request(
+                WASIX_ADDRESS_FAMILY_IP_INET6_I32,
+                WASIX_SOCK_TYPE_STREAM,
+                0,
             ),
             Err(p1::errno::NOTSUP)
         );
@@ -2927,23 +2987,41 @@ mod tests {
         );
     }
 
+    /// Ready mask for a descriptor whose readiness needs no network service.
+    fn local_epoll_mask(descriptor: Option<&Preview1Descriptor>, interest: u32) -> u32 {
+        if descriptor.is_none() {
+            return WASIX_EPOLL_TYPE_EPOLLERR | WASIX_EPOLL_TYPE_EPOLLHUP;
+        }
+        let event_type = if interest & WASIX_EPOLL_TYPE_EPOLLOUT != 0 {
+            P1_EVENTTYPE_FD_WRITE
+        } else {
+            P1_EVENTTYPE_FD_READ
+        };
+        let readiness = match p1_probe_descriptor(descriptor, event_type) {
+            Ok(P1Probe::Local(readiness)) => Ok(readiness),
+            Ok(P1Probe::Network(_)) => panic!("descriptor needs the network service"),
+            Err(errno) => Err(errno),
+        };
+        wasix_epoll_mask_bit(readiness, event_type)
+    }
+
     #[test]
     fn wasix_epoll_ready_mask_reports_supported_descriptor_readiness() {
         let stdout = Preview1Descriptor::Stdout;
         assert_eq!(
-            wasix_epoll_ready_mask(Some(&stdout), WASIX_EPOLL_TYPE_EPOLLOUT),
+            local_epoll_mask(Some(&stdout), WASIX_EPOLL_TYPE_EPOLLOUT),
             WASIX_EPOLL_TYPE_EPOLLOUT
         );
 
         let event = Preview1Descriptor::Event(EventFd::new(1, false));
         assert_eq!(
-            wasix_epoll_ready_mask(Some(&event), WASIX_EPOLL_TYPE_EPOLLIN),
+            local_epoll_mask(Some(&event), WASIX_EPOLL_TYPE_EPOLLIN),
             WASIX_EPOLL_TYPE_EPOLLIN
         );
 
         let empty_event = Preview1Descriptor::Event(EventFd::new(0, false));
         assert_eq!(
-            wasix_epoll_ready_mask(Some(&empty_event), WASIX_EPOLL_TYPE_EPOLLIN),
+            local_epoll_mask(Some(&empty_event), WASIX_EPOLL_TYPE_EPOLLIN),
             0
         );
 
@@ -2952,15 +3030,14 @@ mod tests {
             reader: pipe_reader,
             carry: Bytes::new(),
         };
+        assert_eq!(local_epoll_mask(Some(&pipe), WASIX_EPOLL_TYPE_EPOLLIN), 0);
         assert_eq!(
-            wasix_epoll_ready_mask(Some(&pipe), WASIX_EPOLL_TYPE_EPOLLIN),
-            0
+            pipe_writer.try_write(Bytes::from_static(b"pipe")),
+            crate::TryWrite::Written,
+            "pipe reader is still open"
         );
-        pipe_writer
-            .write(Bytes::from_static(b"pipe"))
-            .expect("pipe reader is still open");
         assert_eq!(
-            wasix_epoll_ready_mask(Some(&pipe), WASIX_EPOLL_TYPE_EPOLLIN),
+            local_epoll_mask(Some(&pipe), WASIX_EPOLL_TYPE_EPOLLIN),
             WASIX_EPOLL_TYPE_EPOLLIN
         );
 
@@ -2972,20 +3049,19 @@ mod tests {
             options: WasixSocketOptions::default(),
             socket_type: WASIX_SOCK_TYPE_STREAM,
         });
+        assert_eq!(local_epoll_mask(Some(&pair), WASIX_EPOLL_TYPE_EPOLLIN), 0);
         assert_eq!(
-            wasix_epoll_ready_mask(Some(&pair), WASIX_EPOLL_TYPE_EPOLLIN),
-            0
+            pair_writer.try_write(Bytes::from_static(b"pair")),
+            crate::TryWrite::Written,
+            "socket-pair reader is still open"
         );
-        pair_writer
-            .write(Bytes::from_static(b"pair"))
-            .expect("socket-pair reader is still open");
         assert_eq!(
-            wasix_epoll_ready_mask(Some(&pair), WASIX_EPOLL_TYPE_EPOLLIN),
+            local_epoll_mask(Some(&pair), WASIX_EPOLL_TYPE_EPOLLIN),
             WASIX_EPOLL_TYPE_EPOLLIN
         );
 
         assert_eq!(
-            wasix_epoll_ready_mask(None, WASIX_EPOLL_TYPE_EPOLLIN),
+            local_epoll_mask(None, WASIX_EPOLL_TYPE_EPOLLIN),
             WASIX_EPOLL_TYPE_EPOLLERR | WASIX_EPOLL_TYPE_EPOLLHUP
         );
     }
@@ -3007,8 +3083,12 @@ mod tests {
             ptr.write(0xa5);
         }
 
-        pool.recycle(spec, memory);
+        // The recycle path scrubs before re-pooling, so acquire never
+        // zeroes on the spawn path and pooled entries come back clean.
+        assert!(pool.reserve_for_recycle(spec, &memory));
         assert_eq!(pool.resident_bytes, spec.byte_size());
+        futures_lite::future::block_on(scrub_shared_memory(&memory));
+        pool.finish_recycle(spec, memory);
 
         let reused = pool.acquire(&engine, spec).unwrap();
         assert_eq!(pool.resident_bytes, 0);
@@ -3018,8 +3098,32 @@ mod tests {
     }
 
     #[test]
+    fn shared_memory_pool_evicts_other_specs_under_pressure() {
+        let mut config = wasmtime::Config::new();
+        config.wasm_threads(true);
+        config.shared_memory(true);
+        let engine = wasmtime::Engine::new(&config).unwrap();
+        let spec = SharedMemorySpec {
+            initial_pages: 1,
+            maximum_pages: 1,
+        };
+        let mut pool = SharedMemoryPool::new(spec.byte_size() * 2);
+        let memory = SharedMemory::new(&engine, spec.memory_type()).unwrap();
+        assert!(pool.reserve_for_recycle(spec, &memory));
+        futures_lite::future::block_on(scrub_shared_memory(&memory));
+        pool.finish_recycle(spec, memory);
+
+        // A retained entry under another spec is dropped, releasing its
+        // budget and user RAM, rather than starving a failing allocation.
+        assert!(pool.evict_one());
+        assert_eq!(pool.resident_bytes, 0);
+        assert!(!pool.evict_one());
+    }
+
+    #[test]
     fn wasix_socket_size_options_are_descriptor_local_state() {
         let mut descriptor = WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
+                family: WasixSocketFamily::Ipv4,
             options: WasixSocketOptions::default(),
         });
 
@@ -3087,6 +3191,7 @@ mod tests {
     #[test]
     fn wasix_socket_flag_options_are_descriptor_local_state() {
         let mut descriptor = WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
+                family: WasixSocketFamily::Ipv4,
             options: WasixSocketOptions::default(),
         });
 
@@ -3131,9 +3236,122 @@ mod tests {
         );
     }
 
+    /// Options the netstack cannot honour must fail loudly.
+    ///
+    /// The stack has no keepalive timer and transmits as soon as the window
+    /// allows, so `SO_KEEPALIVE` on and `TCP_NODELAY` off are behaviours it
+    /// will never produce. Recording them silently would tell a guest its
+    /// connections are being probed or coalesced when they are not.
+    #[test]
+    fn wasix_socket_rejects_flags_the_netstack_cannot_honour() {
+        let mut descriptor = WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
+                family: WasixSocketFamily::Ipv4,
+            options: WasixSocketOptions::default(),
+        });
+
+        assert_eq!(
+            descriptor
+                .options_mut()
+                .set_flag(WASIX_SOCK_OPTION_KEEP_ALIVE, true),
+            p1::errno::NOTSUP
+        );
+        assert_eq!(
+            descriptor.options().flag(WASIX_SOCK_OPTION_KEEP_ALIVE),
+            Ok(false)
+        );
+        assert_eq!(
+            descriptor
+                .options_mut()
+                .set_flag(WASIX_SOCK_OPTION_KEEP_ALIVE, false),
+            p1::errno::SUCCESS
+        );
+
+        assert_eq!(
+            descriptor
+                .options_mut()
+                .set_flag(WASIX_SOCK_OPTION_NO_DELAY, true),
+            p1::errno::SUCCESS
+        );
+        assert_eq!(
+            descriptor.options().flag(WASIX_SOCK_OPTION_NO_DELAY),
+            Ok(true)
+        );
+        assert_eq!(
+            descriptor
+                .options_mut()
+                .set_flag(WASIX_SOCK_OPTION_NO_DELAY, false),
+            p1::errno::NOTSUP
+        );
+        assert_eq!(
+            descriptor.options().flag(WASIX_SOCK_OPTION_NO_DELAY),
+            Ok(true)
+        );
+    }
+
+    /// Buffer hints clamp to the netstack's real per-socket reservations, and
+    /// a TTL outside the IP header's range is rejected instead of truncated.
+    #[test]
+    fn wasix_socket_size_options_clamp_to_netstack_capacity() {
+        let mut descriptor = WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
+                family: WasixSocketFamily::Ipv4,
+            options: WasixSocketOptions::default(),
+        });
+
+        assert_eq!(
+            descriptor
+                .options_mut()
+                .set_size(WASIX_SOCK_OPTION_RECV_BUF_SIZE, u64::MAX),
+            p1::errno::SUCCESS
+        );
+        assert_eq!(
+            descriptor.options().receive_buffer_size,
+            WASIX_SOCKET_RECEIVE_BUFFER_CEILING
+        );
+        assert_eq!(
+            descriptor
+                .options_mut()
+                .set_size(WASIX_SOCK_OPTION_SEND_BUF_SIZE, u64::MAX),
+            p1::errno::SUCCESS
+        );
+        assert_eq!(
+            descriptor.options().send_buffer_size,
+            WASIX_SOCKET_SEND_BUFFER_CEILING
+        );
+
+        assert_eq!(
+            descriptor.options_mut().set_size(WASIX_SOCK_OPTION_TTL, 0),
+            p1::errno::INVAL
+        );
+        assert_eq!(
+            descriptor.options_mut().set_size(WASIX_SOCK_OPTION_TTL, 256),
+            p1::errno::INVAL
+        );
+        assert_eq!(descriptor.options().hop_limit(), DEFAULT_WASIX_SOCKET_TTL as u8);
+        assert_eq!(
+            descriptor.options_mut().set_size(WASIX_SOCK_OPTION_TTL, 9),
+            p1::errno::SUCCESS
+        );
+        assert_eq!(descriptor.options().hop_limit(), 9);
+    }
+
+    /// `/dev/null` has no backing filesystem object, so it needs a device id
+    /// of its own for `st_dev`/`st_ino` to stay distinct and stable.
+    #[test]
+    fn null_device_reports_a_stable_device_identity() {
+        let identity = p1_null_device_identity();
+
+        assert_eq!(identity, p1_null_device_identity());
+        assert_eq!(identity.domain(), crate::AuthorityDomain::GUEST_DEVICES);
+        assert_ne!(identity.domain(), crate::AuthorityDomain::GUEST_BOOTFS);
+        assert_ne!(identity.domain(), crate::AuthorityDomain::HOST_SHARE_9P);
+        assert_ne!(identity.domain().raw(), 0);
+        assert_ne!(identity.local(), 0);
+    }
+
     #[test]
     fn wasix_socket_time_options_are_descriptor_local_state() {
         let mut descriptor = WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
+                family: WasixSocketFamily::Ipv4,
             options: WasixSocketOptions::default(),
         });
 

@@ -14,10 +14,12 @@ use crate::{
     ArpOperation, ArpPacket, BbrV3, CongestionControl, DEFAULT_POLL_BUDGET, DhcpDnsServers,
     EthernetAddress, EthernetFrame, EthernetProtocol, Icmpv4DestinationUnreachableCode,
     Icmpv4Packet, Icmpv6DestinationUnreachableCode, Icmpv6Packet, IpAddress, IpCidr, Ipv4Address,
-    Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, PacketBuffer, StackError, TcpEndpoint,
-    TcpFlags, TcpHeader, TcpHeaderOptions, TcpPacket, TcpReceiveBuffer, TcpSocket,
-    TcpTransmitSegment, TransportChecksum, TxChecksum, TxFrameRef, UdpPacket,
-    icmpv6_checksum_valid, ipv4_checksum, tcp_checksum_valid, udp_checksum_valid,
+    Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6DnsServers, Ipv6Packet,
+    Ipv6RouterConfiguration, Ipv6Scope, NeighborDiscovery, PacketBuffer, StackError, TcpEndpoint,
+    TcpFlags,
+    TcpHeader, TcpHeaderOptions, TcpPacket, TcpReceiveBuffer, TcpSocket, TcpTransmitSegment,
+    TransportChecksum, TxChecksum, TxFrameRef, UdpPacket, icmpv6_checksum_valid, ipv4_checksum,
+    interpret_router_advertisement, tcp_checksum_valid, udp_checksum_valid,
 };
 
 pub const MAX_ROUTES: usize = 32;
@@ -629,6 +631,8 @@ pub enum TcpReadIntoState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StackEvent {
     DhcpConfigured(DhcpLease),
+    /// A Router Advertisement completed stateless autoconfiguration.
+    Ipv6Autoconfigured(Ipv6RouterConfiguration),
     NeighborUpdated(NeighborEntry),
     UdpDatagram { socket: UdpSocketId },
     TcpConnected { socket: SocketId },
@@ -703,6 +707,8 @@ struct UdpSocketSlab {
 struct UdpSocketState {
     binding: UdpSocketBinding,
     pending_error: Option<UdpSocketError>,
+    /// IPv4 TTL / IPv6 hop limit stamped on datagrams this socket sends.
+    hop_limit: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1632,6 +1638,7 @@ impl UdpSocketState {
         Self {
             binding,
             pending_error: None,
+            hop_limit: crate::DEFAULT_HOP_LIMIT,
         }
     }
 }
@@ -1705,6 +1712,10 @@ impl UdpSocketSlab {
 
     fn get(&self, index: usize) -> Option<&UdpSocketState> {
         self.sockets.get(index).and_then(Option::as_ref)
+    }
+
+    fn get_mut(&mut self, index: usize) -> Option<&mut UdpSocketState> {
+        self.sockets.get_mut(index).and_then(Option::as_mut)
     }
 
     fn binding_free(&self, binding: UdpSocketBinding) -> bool {
@@ -1948,6 +1959,13 @@ where
     ipv4_reassembly: Ipv4ReassemblyCache,
     ipv4_addresses: ArrayVec<Ipv4Cidr, 8>,
     ipv6_addresses: ArrayVec<Ipv6Cidr, 16>,
+    /// Router-solicitation scheduling for stateless autoconfiguration.
+    /// Owned by this stack, therefore by exactly one network shard; see
+    /// the concurrency contract on [`crate::NeighborDiscovery`].
+    ipv6_discovery: NeighborDiscovery,
+    /// Recursive resolvers learned from a Router Advertisement's RDNSS
+    /// option, the IPv6 counterpart of the DHCPv4 lease's DNS servers.
+    ipv6_dns_servers: Ipv6DnsServers,
     ipv4_multicast_memberships: ArrayVec<Ipv4MulticastMembership, MAX_IPV4_MULTICAST_MEMBERSHIPS>,
     neighbors: ArrayVec<NeighborEntry, MAX_NEIGHBORS>,
     outbound: OutboundFrameQueue,
@@ -2195,6 +2213,8 @@ where
             ipv4_reassembly: Ipv4ReassemblyCache::new(),
             ipv4_addresses: ArrayVec::new(),
             ipv6_addresses: ArrayVec::new(),
+            ipv6_discovery: NeighborDiscovery::new(),
+            ipv6_dns_servers: Ipv6DnsServers::new(),
             ipv4_multicast_memberships: ArrayVec::new(),
             neighbors: ArrayVec::new(),
             outbound: OutboundFrameQueue::new(),
@@ -2260,6 +2280,29 @@ where
                 .unwrap_or_else(|_| panic!("neighbor table is full"));
         }
         Self::push_event_into(&mut self.events, StackEvent::NeighborUpdated(entry));
+    }
+
+    /// Records a neighbor observation that is only allowed to replace a
+    /// cached link-layer address when `override_cache` is set.
+    ///
+    /// RFC 4861 §7.2.5: an observation that does not carry the override
+    /// bit — a Neighbor Advertisement without it, or a passively
+    /// observed data frame, which carries no NDP flags at all — may
+    /// create a cache entry or refresh a matching one, but must leave a
+    /// resolved entry with a different address alone.
+    fn learn_neighbor_without_override(&mut self, entry: NeighborEntry, override_cache: bool) {
+        let cached = self
+            .neighbors
+            .iter()
+            .find(|existing| existing.ip == entry.ip)
+            .copied();
+        match cached {
+            Some(cached)
+                if cached.state != NeighborState::Incomplete
+                    && cached.mac != entry.mac
+                    && !override_cache => {}
+            _ => self.learn_neighbor(entry),
+        }
     }
 
     pub fn add_ipv4_address(&mut self, address: Ipv4Cidr) {
@@ -2417,6 +2460,179 @@ where
 
     pub fn ipv6_addresses(&self) -> impl Iterator<Item = Ipv6Cidr> + '_ {
         self.ipv6_addresses.iter().copied()
+    }
+
+    pub fn replace_ipv6_addresses(&mut self, addresses: impl IntoIterator<Item = Ipv6Cidr>) {
+        self.ipv6_addresses.clear();
+        for address in addresses {
+            self.ipv6_addresses
+                .try_push(address)
+                .unwrap_or_else(|_| panic!("IPv6 address table is full"));
+        }
+    }
+
+    /// Installs `fe80::/64` + modified EUI-64 for this interface's MAC.
+    ///
+    /// RFC 4862 §5.3 makes the link-local address a precondition for
+    /// Neighbor Discovery: it is the source address of the router
+    /// solicitations that start autoconfiguration, so the embedding
+    /// kernel calls this once the interface's hardware address is known.
+    pub fn configure_ipv6_link_local(&mut self) -> Ipv6Cidr {
+        let address = Ipv6Cidr::new(
+            Ipv6Address::link_local_from_mac(self.config.mac),
+            Ipv6Address::LINK_LOCAL_PREFIX_LEN,
+        );
+        self.add_ipv6_address(address);
+        address
+    }
+
+    /// The interface's link-local address, if one has been configured.
+    pub fn ipv6_link_local_address(&self) -> Option<Ipv6Address> {
+        self.ipv6_addresses
+            .iter()
+            .map(|cidr| cidr.address())
+            .find(|address| address.is_link_local())
+    }
+
+    /// Whether a Router Advertisement has configured this interface.
+    pub const fn ipv6_autoconfigured(&self) -> bool {
+        self.ipv6_discovery.is_configured()
+    }
+
+    /// Recursive resolvers learned from Router Advertisements.
+    pub fn ipv6_dns_servers(&self) -> impl Iterator<Item = Ipv6Address> + '_ {
+        self.ipv6_dns_servers.iter().copied()
+    }
+
+    pub fn replace_ipv6_dns_servers(&mut self, servers: impl IntoIterator<Item = Ipv6Address>) {
+        self.ipv6_dns_servers.clear();
+        for server in servers {
+            if self.ipv6_dns_servers.try_push(server).is_err() {
+                break;
+            }
+        }
+    }
+
+    /// Drives stateless address autoconfiguration one step: queues a
+    /// Router Solicitation when one is due.
+    ///
+    /// Mirrors the DHCPv4 driver the kernel calls on its configuration
+    /// poll. Both are pull-driven rather than timer-driven so the stack
+    /// keeps no wall clock of its own; `now` comes from the caller.
+    /// Solicitation stops once an advertisement arrives, so steady-state
+    /// calls are free.
+    pub fn drive_ipv6_autoconfig(&mut self, now: StackInstant) -> Result<(), StackError> {
+        if !self.ipv6_discovery.poll_solicitation(now) {
+            return Ok(());
+        }
+        // RFC 4861 §4.1: solicit from the link-local address when one is
+        // configured, and only then may the Source Link-Layer Address
+        // option appear.
+        let source = self
+            .ipv6_link_local_address()
+            .unwrap_or(Ipv6Address::UNSPECIFIED);
+        self.queue_icmpv6_router_solicitation(source)
+    }
+
+    fn queue_icmpv6_router_solicitation(&mut self, source: Ipv6Address) -> Result<(), StackError> {
+        let local_mac = self.config.mac;
+        let destination = Ipv6Address::ALL_ROUTERS_LINK_LOCAL;
+        let destination_mac = ipv6_multicast_mac(destination);
+        let source_mac = (!source.is_unspecified()).then_some(local_mac);
+        let icmp_len = if source_mac.is_some() {
+            Icmpv6Packet::ROUTER_SOLICITATION_LEN
+        } else {
+            Icmpv6Packet::ROUTER_SOLICITATION_ANONYMOUS_LEN
+        };
+        self.queue_outbound_frame(|frame| {
+            let storage = frame.storage_mut();
+            let mut offset = EthernetFrame::encode_header(
+                storage,
+                destination_mac,
+                local_mac,
+                EthernetProtocol::Ipv6,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            offset += Ipv6Packet::encode_header(
+                &mut storage[offset..],
+                source,
+                destination,
+                crate::IpProtocol::Icmpv6,
+                icmp_len,
+                255,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            offset += Icmpv6Packet::encode_router_solicitation(
+                &mut storage[offset..],
+                source,
+                destination,
+                source_mac,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            frame.set_len(offset);
+            Ok(())
+        })
+    }
+
+    /// Applies one Router Advertisement's configuration: SLAAC
+    /// addresses, on-link prefixes, the default route, and the RDNSS
+    /// resolver list.
+    fn apply_ipv6_router_configuration(
+        &mut self,
+        configuration: Ipv6RouterConfiguration,
+        now: StackInstant,
+    ) {
+        if let Some(router_mac) = configuration.router_mac {
+            self.learn_neighbor(NeighborEntry {
+                ip: IpAddress::Ipv6(configuration.router),
+                mac: router_mac,
+                state: NeighborState::Reachable,
+                updated_at: now,
+            });
+        }
+
+        for prefix in configuration.on_link_prefixes.iter().copied() {
+            // A connected route: on-link destinations resolve through
+            // Neighbor Discovery rather than the router.
+            let _ = self.routes.add(Route {
+                destination: IpCidr::Ipv6(prefix),
+                gateway: None,
+                expires_at: None,
+            });
+        }
+
+        for address in configuration.addresses.iter().copied() {
+            // A router that keeps advertising fresh prefixes must not be
+            // able to overflow a fixed table, so a full table drops the
+            // new address instead of asserting.
+            if self.ipv6_addresses.is_full() && !self.ipv6_addresses.contains(&address) {
+                continue;
+            }
+            self.add_ipv6_address(address);
+        }
+
+        let default_route = Route {
+            destination: IpCidr::Ipv6(Ipv6Cidr::new(Ipv6Address::UNSPECIFIED, 0)),
+            gateway: Some(IpAddress::Ipv6(configuration.router)),
+            expires_at: None,
+        };
+        if configuration.router_lifetime_seconds == 0 {
+            self.routes.remove(default_route);
+        } else {
+            let _ = self.routes.add(default_route);
+        }
+
+        if !configuration.dns_servers.is_empty() {
+            self.ipv6_dns_servers = configuration.dns_servers.clone();
+        }
+
+        if configuration.configures_interface() {
+            self.ipv6_discovery.record_advertisement();
+            Self::push_event_into(
+                &mut self.events,
+                StackEvent::Ipv6Autoconfigured(configuration),
+            );
+        }
     }
 
     pub fn source_ipv4_address_for(&self, destination: Ipv4Address) -> Option<Ipv4Address> {
@@ -2699,6 +2915,94 @@ where
         })
     }
 
+    /// Report whether `listener` has a completed connection waiting in the
+    /// accept queue, without dequeuing it.
+    ///
+    /// `take_tcp_accept` is destructive, so readiness reporting (`poll`,
+    /// `epoll`) cannot use it: observing a listener must not consume the
+    /// connection the caller is about to accept.
+    pub fn tcp_accept_pending(&self, listener: SocketId) -> Result<bool, StackError> {
+        self.tcp_socket(listener)?;
+        Ok(self
+            .tcp_accept
+            .iter()
+            .any(|queued| queued.listener == listener))
+    }
+
+    /// Report whether `socket` would accept bytes from `queue_send_bytes`.
+    ///
+    /// `tcp_connect_state` folds every non-established state into `Pending`,
+    /// which loses the distinction readiness reporting needs: a peer that
+    /// half-closed (`CloseWait`) stops delivering data but still accepts
+    /// ours, so the socket remains writable. A full transmit queue parks
+    /// writability until ACKs drain capacity — reporting writable there
+    /// would spin poll/epoll callers whose next write accepts zero bytes.
+    /// Hop limit of the socket behind a transmit-queue index.
+    ///
+    /// The drive loop batches frames by index and queues them after the
+    /// per-socket borrow ends, so the option is read back here rather than
+    /// carried through every batch tuple.
+    fn tcp_socket_hop_limit(&self, index: usize) -> u8 {
+        self.tcp
+            .get(index)
+            .map_or(crate::DEFAULT_HOP_LIMIT, TcpSocket::hop_limit)
+    }
+
+    /// IPv4 TTL / IPv6 hop limit a TCP socket stamps on its frames.
+    pub fn tcp_hop_limit(&self, socket: SocketId) -> Result<u8, StackError> {
+        Ok(self.tcp_socket(socket)?.hop_limit())
+    }
+
+    /// Sets the TTL / hop limit for a TCP socket's outgoing frames.
+    ///
+    /// A listener passes its value on to every connection it accepts, so
+    /// setting it before `listen` covers the SYN-ACK and everything after.
+    pub fn set_tcp_hop_limit(
+        &mut self,
+        socket: SocketId,
+        hop_limit: u8,
+    ) -> Result<(), StackError> {
+        self.tcp_socket_mut(socket)?.set_hop_limit(hop_limit);
+        Ok(())
+    }
+
+    /// Hop limit a UDP socket stamps on its datagrams.
+    pub fn udp_hop_limit(&self, socket: UdpSocketId) -> Result<u8, StackError> {
+        Ok(self.udp_socket(socket)?.hop_limit)
+    }
+
+    /// Sets the TTL / hop limit for a UDP socket's outgoing datagrams.
+    pub fn set_udp_hop_limit(
+        &mut self,
+        socket: UdpSocketId,
+        hop_limit: u8,
+    ) -> Result<(), StackError> {
+        let index = udp_socket_index(socket);
+        self.udp_socket(socket)?;
+        self.udp
+            .get_mut(index)
+            .expect("UDP socket disappeared after a successful lookup")
+            .hop_limit = hop_limit;
+        Ok(())
+    }
+
+    pub fn tcp_send_ready(&self, socket: SocketId) -> Result<bool, StackError> {
+        let socket = self.tcp_socket(socket)?;
+        Ok(matches!(
+            socket.state(),
+            crate::TcpState::Established | crate::TcpState::CloseWait
+        ) && socket.send_capacity_bytes() != 0)
+    }
+
+    /// Report whether `socket` has a datagram waiting, without dequeuing it.
+    ///
+    /// The counterpart of `tcp_accept_pending` for UDP: `take_udp` consumes
+    /// the datagram, so readiness reporting needs this non-destructive view.
+    pub fn udp_receive_pending(&self, socket: UdpSocketId) -> Result<bool, StackError> {
+        self.udp_socket(socket)?;
+        Ok(self.udp_rx_counts[udp_socket_index(socket)] != 0)
+    }
+
     pub fn next_tcp_deadline(&mut self) -> Option<StackInstant> {
         loop {
             let entry = self.tcp_timers.peek().copied()?;
@@ -2811,6 +3115,7 @@ where
         }
 
         for (index, local, remote, header, options) in pending_syn {
+            let hop_limit = self.tcp_socket_hop_limit(index);
             if self.queue_tcp(
                 local,
                 remote,
@@ -2818,6 +3123,7 @@ where
                 options,
                 TcpTxPayload::Flat(&[]),
                 index as u16,
+                hop_limit,
                 now,
             )? {
                 let socket = self
@@ -2829,6 +3135,7 @@ where
             }
         }
         for (index, local, remote, header, options) in pending_syn_ack {
+            let hop_limit = self.tcp_socket_hop_limit(index);
             if self.queue_tcp(
                 local,
                 remote,
@@ -2836,6 +3143,7 @@ where
                 options,
                 TcpTxPayload::Flat(&[]),
                 index as u16,
+                hop_limit,
                 now,
             )? {
                 let socket = self
@@ -2847,6 +3155,7 @@ where
             }
         }
         for (index, local, remote, header, options) in pending_ack {
+            let hop_limit = self.tcp_socket_hop_limit(index);
             if self.queue_tcp(
                 local,
                 remote,
@@ -2854,6 +3163,7 @@ where
                 options,
                 TcpTxPayload::Flat(&[]),
                 index as u16,
+                hop_limit,
                 now,
             )? {
                 let socket = self
@@ -2867,6 +3177,7 @@ where
         for (index, segment) in pending_retransmit {
             let sequence = segment.header.sequence;
             let identification = segment.sequence_len as u16;
+            let hop_limit = self.tcp_socket_hop_limit(index);
             if self.queue_tcp(
                 segment.local,
                 segment.remote,
@@ -2874,6 +3185,7 @@ where
                 segment.options,
                 self.tcp_tx_payload(&segment.payload),
                 identification,
+                hop_limit,
                 now,
             )? {
                 let socket = self
@@ -2886,6 +3198,7 @@ where
         }
         for (index, segment) in pending_data {
             let identification = segment.sequence_len as u16;
+            let hop_limit = self.tcp_socket_hop_limit(index);
             self.queue_tcp(
                 segment.local,
                 segment.remote,
@@ -2893,6 +3206,7 @@ where
                 segment.options,
                 self.tcp_tx_payload(&segment.payload),
                 identification,
+                hop_limit,
                 now,
             )?;
             self.schedule_tcp_timer(index);
@@ -3008,7 +3322,9 @@ where
         identification: u16,
         now: StackInstant,
     ) -> Result<usize, StackError> {
-        let binding = self.udp_socket(socket)?.binding;
+        let socket_state = self.udp_socket(socket)?;
+        let binding = socket_state.binding;
+        let hop_limit = socket_state.hop_limit;
         if binding
             .remote
             .is_some_and(|remote| remote.address != destination || remote.port != destination_port)
@@ -3017,39 +3333,55 @@ where
         }
         match (binding.local_address, destination) {
             (Some(IpAddress::Ipv4(source)), IpAddress::Ipv4(destination)) => self
-                .send_udp_ipv4_from(
+                .send_udp_ipv4_from_with_hop_limit(
                     source,
                     binding.local_port,
                     destination,
                     destination_port,
                     payload,
                     identification,
+                    hop_limit,
                     now,
                 ),
             (Some(IpAddress::Ipv6(source)), IpAddress::Ipv6(destination)) => self
-                .send_udp_ipv6_from(
+                .send_udp_ipv6_from_with_hop_limit(
                     source,
                     binding.local_port,
                     destination,
                     destination_port,
                     payload,
+                    hop_limit,
                     now,
                 ),
-            (None, IpAddress::Ipv4(destination)) => self.send_udp_ipv4(
-                binding.local_port,
-                destination,
-                destination_port,
-                payload,
-                identification,
-                now,
-            ),
-            (None, IpAddress::Ipv6(destination)) => self.send_udp_ipv6(
-                binding.local_port,
-                destination,
-                destination_port,
-                payload,
-                now,
-            ),
+            (None, IpAddress::Ipv4(destination)) => {
+                let Some(source) = self.source_ipv4_for(destination) else {
+                    return Err(StackError::Unroutable);
+                };
+                self.send_udp_ipv4_from_with_hop_limit(
+                    source,
+                    binding.local_port,
+                    destination,
+                    destination_port,
+                    payload,
+                    identification,
+                    hop_limit,
+                    now,
+                )
+            }
+            (None, IpAddress::Ipv6(destination)) => {
+                let Some(source) = self.source_ipv6_for(destination) else {
+                    return Err(StackError::Unroutable);
+                };
+                self.send_udp_ipv6_from_with_hop_limit(
+                    source,
+                    binding.local_port,
+                    destination,
+                    destination_port,
+                    payload,
+                    hop_limit,
+                    now,
+                )
+            }
             (Some(_), _) => Err(StackError::AddressFamilyMismatch),
         }
     }
@@ -3087,6 +3419,33 @@ where
         identification: u16,
         now: StackInstant,
     ) -> Result<usize, StackError> {
+        self.send_udp_ipv4_from_with_hop_limit(
+            source,
+            source_port,
+            destination,
+            destination_port,
+            payload,
+            identification,
+            crate::DEFAULT_HOP_LIMIT,
+            now,
+        )
+    }
+
+    /// Sends an IPv4 datagram with an explicit TTL.
+    ///
+    /// Socket sends route here so a guest's `set-unicast-hop-limit` reaches
+    /// the wire; the positional entry points above keep the stack default.
+    fn send_udp_ipv4_from_with_hop_limit(
+        &mut self,
+        source: Ipv4Address,
+        source_port: u16,
+        destination: Ipv4Address,
+        destination_port: u16,
+        payload: &[u8],
+        identification: u16,
+        hop_limit: u8,
+        now: StackInstant,
+    ) -> Result<usize, StackError> {
         let next_hop = self.next_hop(IpAddress::Ipv4(destination));
         let next_hop = match next_hop {
             Some(IpAddress::Ipv4(next_hop)) => next_hop,
@@ -3112,6 +3471,7 @@ where
             destination_mac,
             payload,
             identification,
+            hop_limit,
         )
     }
 
@@ -3145,6 +3505,28 @@ where
         payload: &[u8],
         now: StackInstant,
     ) -> Result<usize, StackError> {
+        self.send_udp_ipv6_from_with_hop_limit(
+            source,
+            source_port,
+            destination,
+            destination_port,
+            payload,
+            crate::DEFAULT_HOP_LIMIT,
+            now,
+        )
+    }
+
+    /// Sends an IPv6 datagram with an explicit hop limit.
+    fn send_udp_ipv6_from_with_hop_limit(
+        &mut self,
+        source: Ipv6Address,
+        source_port: u16,
+        destination: Ipv6Address,
+        destination_port: u16,
+        payload: &[u8],
+        hop_limit: u8,
+        now: StackInstant,
+    ) -> Result<usize, StackError> {
         let next_hop = self.next_hop(IpAddress::Ipv6(destination));
         let next_hop = match next_hop {
             Some(IpAddress::Ipv6(next_hop)) => next_hop,
@@ -3167,6 +3549,7 @@ where
             destination_port,
             destination_mac,
             payload,
+            hop_limit,
         )
     }
 
@@ -3179,6 +3562,7 @@ where
         destination_mac: EthernetAddress,
         payload: &[u8],
         identification: u16,
+        hop_limit: u8,
     ) -> Result<usize, StackError> {
         let udp_len = UdpPacket::HEADER_LEN
             .checked_add(payload.len())
@@ -3206,7 +3590,7 @@ where
                 crate::IpProtocol::Udp,
                 udp_len,
                 identification,
-                64,
+                hop_limit,
             )
             .ok_or(StackError::OutputQueueFull)?;
             let transport_offset = offset;
@@ -3239,6 +3623,7 @@ where
         destination_port: u16,
         destination_mac: EthernetAddress,
         payload: &[u8],
+        hop_limit: u8,
     ) -> Result<usize, StackError> {
         let udp_len = UdpPacket::HEADER_LEN
             .checked_add(payload.len())
@@ -3265,7 +3650,7 @@ where
                 destination,
                 crate::IpProtocol::Udp,
                 udp_len,
-                64,
+                hop_limit,
             )
             .ok_or(StackError::OutputQueueFull)?;
             let transport_offset = offset;
@@ -3321,6 +3706,7 @@ where
         options: TcpHeaderOptions,
         payload: TcpTxPayload<'_>,
         identification: u16,
+        hop_limit: u8,
         now: StackInstant,
     ) -> Result<bool, StackError> {
         match (local.address, remote.address) {
@@ -3331,10 +3717,11 @@ where
                 options,
                 payload,
                 identification,
+                hop_limit,
                 now,
             ),
             (IpAddress::Ipv6(source), IpAddress::Ipv6(destination)) => {
-                self.queue_tcp_ipv6(source, destination, header, options, payload, now)
+                self.queue_tcp_ipv6(source, destination, header, options, payload, hop_limit, now)
             }
             _ => panic!("TCP endpoint address families must match"),
         }
@@ -3348,6 +3735,7 @@ where
         options: TcpHeaderOptions,
         payload: TcpTxPayload<'_>,
         identification: u16,
+        hop_limit: u8,
         now: StackInstant,
     ) -> Result<bool, StackError> {
         let tcp_len = TcpPacket::MIN_HEADER_LEN
@@ -3397,6 +3785,7 @@ where
                         options,
                         payload,
                         identification,
+                        hop_limit,
                         checksum,
                     )
                 },
@@ -3413,6 +3802,7 @@ where
                 options,
                 payload,
                 identification,
+                hop_limit,
                 checksum,
             )?;
             Ok(true)
@@ -3426,6 +3816,7 @@ where
         header: TcpHeader,
         options: TcpHeaderOptions,
         payload: TcpTxPayload<'_>,
+        hop_limit: u8,
         now: StackInstant,
     ) -> Result<bool, StackError> {
         let tcp_len = TcpPacket::MIN_HEADER_LEN
@@ -3474,6 +3865,7 @@ where
                         header,
                         options,
                         payload,
+                        hop_limit,
                         checksum,
                     )
                 },
@@ -3489,6 +3881,7 @@ where
                 header,
                 options,
                 payload,
+                hop_limit,
                 checksum,
             )?;
             Ok(true)
@@ -3618,12 +4011,20 @@ where
     ) -> Result<bool, StackError> {
         let packet = Ipv6Packet::parse(frame.as_ref()).ok_or(StackError::MalformedPacket)?;
         if !packet.source.is_unspecified() {
-            self.learn_neighbor(NeighborEntry {
-                ip: IpAddress::Ipv6(packet.source),
-                mac: source_mac,
-                state: NeighborState::Reachable,
-                updated_at: now,
-            });
+            // Passive learning: filling the cache from ordinary traffic
+            // saves a solicitation round trip, but RFC 4861 §7.2.5 only
+            // lets a Neighbor Advertisement carrying the override bit
+            // replace a cached link-layer address, so a data frame must
+            // never do it either.
+            self.learn_neighbor_without_override(
+                NeighborEntry {
+                    ip: IpAddress::Ipv6(packet.source),
+                    mac: source_mac,
+                    state: NeighborState::Reachable,
+                    updated_at: now,
+                },
+                false,
+            );
         }
         let payload_bytes = frame.slice(bytes_subrange(frame.as_ref(), packet.payload));
         match packet.next_header {
@@ -3671,11 +4072,44 @@ where
             .map(Ipv4Cidr::address)
     }
 
+    /// Picks a source address for `destination` following the parts of
+    /// RFC 6724 §5 that matter to an interface holding a link-local
+    /// address plus whatever SLAAC configured.
+    ///
+    /// Rule 8 (longest matching prefix) first: an address on the
+    /// destination's own prefix always wins. Then rule 2 (appropriate
+    /// scope): a link-local destination must be answered from a
+    /// link-local source, and a destination of wider scope must not be
+    /// answered from a link-local source, which would be unroutable off
+    /// the link. Only when nothing else applies does the first
+    /// configured address stand in.
     fn source_ipv6_for(&self, destination: Ipv6Address) -> Option<Ipv6Address> {
-        self.ipv6_addresses
+        if let Some(cidr) = self
+            .ipv6_addresses
             .iter()
             .copied()
             .find(|cidr| cidr.contains(destination))
+        {
+            return Some(cidr.address());
+        }
+        let destination_scope = destination.scope();
+        let same_scope = self
+            .ipv6_addresses
+            .iter()
+            .copied()
+            .find(|cidr| cidr.address().scope() == destination_scope);
+        let wider_scope = if destination_scope == Ipv6Scope::LinkLocal {
+            // Nothing but a link-local source can reach a link-local
+            // destination, so there is no wider-scope substitute.
+            None
+        } else {
+            self.ipv6_addresses
+                .iter()
+                .copied()
+                .find(|cidr| !cidr.address().is_link_local())
+        };
+        same_scope
+            .or(wider_scope)
             .or_else(|| self.ipv6_addresses.first().copied())
             .map(Ipv6Cidr::address)
     }
@@ -4060,6 +4494,7 @@ where
                     TcpHeaderOptions::empty(),
                     TcpTxPayload::Flat(&[]),
                     packet.acknowledgement as u16,
+                    crate::DEFAULT_HOP_LIMIT,
                     now,
                 )?;
             }
@@ -4091,6 +4526,7 @@ where
                 let initial_sequence = (now.nanos() as u32)
                     .wrapping_add(u32::from(packet.destination_port))
                     .wrapping_add(u32::from(packet.source_port));
+                let listener_hop_limit = listener.hop_limit();
                 let mut child = TcpSocket::accept(
                     local,
                     remote_endpoint,
@@ -4098,6 +4534,7 @@ where
                     initial_sequence,
                     self.congestion.clone(),
                 );
+                child.set_hop_limit(listener_hop_limit);
                 child.record_peer_options(packet);
                 let child = self.insert_tcp(child);
                 self.tcp_listener_children[socket_index(child)] = Some(listener_socket);
@@ -4112,6 +4549,7 @@ where
                 TcpHeaderOptions::empty(),
                 TcpTxPayload::Flat(&[]),
                 packet.sequence as u16,
+                crate::DEFAULT_HOP_LIMIT,
                 now,
             )?;
         }
@@ -4128,10 +4566,33 @@ where
             return Err(StackError::MalformedPacket);
         }
         match Icmpv6Packet::parse(packet.payload).ok_or(StackError::MalformedPacket)? {
-            Icmpv6Packet::NeighborSolicitation { target } => {
+            Icmpv6Packet::RouterAdvertisement(advertisement) => {
+                // RFC 4861 §6.1.2: a valid advertisement has a link-local
+                // source and an unmodified hop limit of 255.
+                if !packet.source.is_link_local() || packet.hop_limit != 255 {
+                    return Ok(false);
+                }
+                let configuration = interpret_router_advertisement(
+                    advertisement,
+                    packet.source,
+                    self.config.mac,
+                );
+                self.apply_ipv6_router_configuration(configuration, now);
+            }
+            Icmpv6Packet::NeighborSolicitation { target, options } => {
                 if packet.source.is_unspecified() {
                     return Ok(false);
                 }
+                // RFC 4861 §4.3: prefer the solicitation's own source
+                // link-layer option over the Ethernet header, which a
+                // bridge or proxy may have rewritten.
+                let neighbor_mac = options.source_link_layer_address().unwrap_or(source_mac);
+                self.learn_neighbor(NeighborEntry {
+                    ip: IpAddress::Ipv6(packet.source),
+                    mac: neighbor_mac,
+                    state: NeighborState::Reachable,
+                    updated_at: now,
+                });
                 if self
                     .ipv6_addresses
                     .iter()
@@ -4141,17 +4602,31 @@ where
                         target,
                         packet.source,
                         target,
-                        source_mac,
+                        neighbor_mac,
                     )?;
                 }
             }
-            Icmpv6Packet::NeighborAdvertisement { target } => {
-                self.learn_neighbor(NeighborEntry {
-                    ip: IpAddress::Ipv6(target),
-                    mac: source_mac,
-                    state: NeighborState::Reachable,
-                    updated_at: now,
-                });
+            Icmpv6Packet::NeighborAdvertisement {
+                target,
+                override_cache,
+                options,
+                ..
+            } => {
+                // RFC 4861 §4.4: the target link-layer option names the
+                // node the advertisement speaks for, which is not the
+                // Ethernet source when a router proxies for it.
+                let target_mac = options.target_link_layer_address().unwrap_or(source_mac);
+                // §7.2.5: without the override bit an advertisement may
+                // not replace a cached link-layer address that differs.
+                self.learn_neighbor_without_override(
+                    NeighborEntry {
+                        ip: IpAddress::Ipv6(target),
+                        mac: target_mac,
+                        state: NeighborState::Reachable,
+                        updated_at: now,
+                    },
+                    override_cache,
+                );
             }
             Icmpv6Packet::DestinationUnreachable(unreachable) => {
                 self.receive_icmp_destination_unreachable(IcmpDestinationUnreachable::Ipv6(
@@ -5019,6 +5494,7 @@ fn encode_tcp_ipv4_frame(
     options: TcpHeaderOptions,
     payload: TcpTxPayload<'_>,
     identification: u16,
+    hop_limit: u8,
     checksum: TransportChecksum,
 ) -> Result<(), StackError> {
     let storage = frame.storage_mut();
@@ -5036,7 +5512,7 @@ fn encode_tcp_ipv4_frame(
         crate::IpProtocol::Tcp,
         tcp_len,
         identification,
-        64,
+        hop_limit,
     )
     .ok_or(StackError::OutputQueueFull)?;
     let transport_offset = offset;
@@ -5090,6 +5566,7 @@ fn encode_tcp_ipv6_frame(
     header: TcpHeader,
     options: TcpHeaderOptions,
     payload: TcpTxPayload<'_>,
+    hop_limit: u8,
     checksum: TransportChecksum,
 ) -> Result<(), StackError> {
     let storage = frame.storage_mut();
@@ -5106,7 +5583,7 @@ fn encode_tcp_ipv6_frame(
         destination,
         crate::IpProtocol::Tcp,
         tcp_len,
-        64,
+        hop_limit,
     )
     .ok_or(StackError::OutputQueueFull)?;
     let transport_offset = offset;
@@ -6015,6 +6492,7 @@ mod tests {
                     TcpHeaderOptions::empty(),
                     TcpTxPayload::Flat(&[]),
                     1,
+                    crate::DEFAULT_HOP_LIMIT,
                     StackInstant::from_nanos(1),
                 )
                 .expect("first ACK should queue")
@@ -6028,6 +6506,7 @@ mod tests {
                     TcpHeaderOptions::empty(),
                     TcpTxPayload::Flat(&[]),
                     2,
+                    crate::DEFAULT_HOP_LIMIT,
                     StackInstant::from_nanos(2),
                 )
                 .expect("replacement ACK should queue")
@@ -6080,6 +6559,7 @@ mod tests {
                     TcpHeaderOptions::empty(),
                     TcpTxPayload::Flat(&[]),
                     1,
+                    crate::DEFAULT_HOP_LIMIT,
                     StackInstant::from_nanos(1),
                 )
                 .expect("first ACK should queue")
@@ -6093,6 +6573,7 @@ mod tests {
                     TcpHeaderOptions::empty(),
                     TcpTxPayload::Flat(&[]),
                     2,
+                    crate::DEFAULT_HOP_LIMIT,
                     StackInstant::from_nanos(2),
                 )
                 .expect("different sequence ACK should queue")
@@ -6989,6 +7470,100 @@ mod tests {
         assert!(stack.take_outbound().is_none());
     }
 
+    /// A socket's TTL must reach the wire, not just the socket record.
+    ///
+    /// The datagram path stamped a hardcoded 64 before, so `IP_TTL` and
+    /// `set-unicast-hop-limit` were accepted and then discarded.
+    #[test]
+    fn udp_send_stamps_the_socket_hop_limit_on_the_ipv4_header() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let group = Ipv4Address::new([224, 0, 0, 251]);
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        let socket = stack
+            .open_udp(UdpSocketBinding::wildcard(4040))
+            .expect("wildcard UDP socket should bind");
+        assert_eq!(stack.udp_hop_limit(socket), Ok(crate::DEFAULT_HOP_LIMIT));
+
+        stack
+            .set_udp_hop_limit(socket, 7)
+            .expect("bound UDP socket should accept a hop limit");
+        assert_eq!(stack.udp_hop_limit(socket), Ok(7));
+        assert_eq!(
+            stack.send_udp(
+                socket,
+                IpAddress::Ipv4(group),
+                5353,
+                b"ttl",
+                1,
+                StackInstant::from_nanos(1),
+            ),
+            Ok(b"ttl".len())
+        );
+
+        let frame = stack.take_outbound().expect("UDP frame should be queued");
+        let ipv4 = Ipv4Packet::parse(&frame.as_slice()[EthernetFrame::HEADER_LEN..])
+            .expect("IPv4 packet should parse");
+        assert_eq!(ipv4.hop_limit, 7);
+    }
+
+    /// A listener's hop limit has to survive into the connections it accepts,
+    /// so the SYN-ACK and everything after carries the guest's TTL.
+    #[test]
+    fn accepted_connections_inherit_the_listener_hop_limit() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(peer),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        let listener = stack
+            .open_tcp_listen(
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(local),
+                    port: 8080,
+                },
+                TcpListenBacklog::new(1),
+            )
+            .expect("listener should open");
+        stack
+            .set_tcp_hop_limit(listener, 9)
+            .expect("listener should accept a hop limit");
+
+        let (syn, syn_len) = tcp_segment(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 4040,
+                destination_port: 8080,
+                sequence: 1000,
+                acknowledgement: 0,
+                flags: TcpFlags::SYN,
+                window_size: u16::MAX,
+            },
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&syn[..syn_len]),
+                StackInstant::from_nanos(1),
+            )
+            .expect("SYN should be accepted by the listener");
+        stack
+            .drive_tcp(StackInstant::from_nanos(2))
+            .expect("stack should emit the SYN-ACK");
+
+        let frame = stack.take_outbound().expect("SYN-ACK should be queued");
+        let ipv4 = Ipv4Packet::parse(&frame.as_slice()[EthernetFrame::HEADER_LEN..])
+            .expect("IPv4 packet should parse");
+        assert_eq!(ipv4.hop_limit, 9);
+    }
+
     #[test]
     fn udp_send_with_tx_offload_seeds_pseudo_sum_and_metadata() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
@@ -7097,6 +7672,7 @@ mod tests {
                     TcpHeaderOptions::empty(),
                     TcpTxPayload::Scatter(&payload),
                     1,
+                    crate::DEFAULT_HOP_LIMIT,
                     StackInstant::from_nanos(1),
                 )
                 .expect("scatter TCP segment should queue")
@@ -9536,5 +10112,591 @@ mod tests {
             .expect("cloned socket should be removable");
         assert!(cloned.tcp_socket(first).is_err());
         assert!(stack.tcp_socket(first).is_ok());
+    }
+
+    // ---------------------------------------------------------------
+    // IPv6 Neighbor Discovery / SLAAC frame-level coverage.
+    //
+    // The prefix and router addresses below mirror QEMU's user-mode
+    // network, which advertises fec0::/64 with the router at fec0::2
+    // (link-local fe80::2) and a resolver at fec0::3.
+    // ---------------------------------------------------------------
+
+    const ROUTER_LINK_LOCAL: Ipv6Address =
+        Ipv6Address::new([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02]);
+    const ROUTER_MAC: EthernetAddress = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
+
+    fn slaac_expected_address(mac: EthernetAddress) -> Ipv6Cidr {
+        Ipv6Cidr::new(
+            Ipv6Address::from_prefix_and_eui64(
+                Ipv6Address::new([0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+                mac,
+            ),
+            64,
+        )
+    }
+
+    /// Encodes a Router Advertisement body carrying a source
+    /// link-layer address, a `fec0::/64` on-link + autonomous prefix,
+    /// an MTU option, and an RDNSS option for `fec0::3`.
+    fn router_advertisement_body(
+        output: &mut [u8],
+        source: Ipv6Address,
+        destination: Ipv6Address,
+        router_lifetime_seconds: u16,
+    ) -> usize {
+        output[..16].fill(0);
+        output[0] = 134;
+        output[4] = 64;
+        output[6..8].copy_from_slice(&router_lifetime_seconds.to_be_bytes());
+        let mut offset = 16;
+
+        output[offset..offset + 8].fill(0);
+        output[offset] = 1;
+        output[offset + 1] = 1;
+        output[offset + 2..offset + 8].copy_from_slice(&ROUTER_MAC);
+        offset += 8;
+
+        output[offset..offset + 32].fill(0);
+        output[offset] = 3;
+        output[offset + 1] = 4;
+        output[offset + 2] = 64;
+        output[offset + 3] = 0xc0;
+        output[offset + 4..offset + 8].copy_from_slice(&86_400u32.to_be_bytes());
+        output[offset + 8..offset + 12].copy_from_slice(&14_400u32.to_be_bytes());
+        output[offset + 16] = 0xfe;
+        output[offset + 17] = 0xc0;
+        offset += 32;
+
+        output[offset..offset + 8].fill(0);
+        output[offset] = 5;
+        output[offset + 1] = 1;
+        output[offset + 4..offset + 8].copy_from_slice(&1500u32.to_be_bytes());
+        offset += 8;
+
+        output[offset..offset + 24].fill(0);
+        output[offset] = 25;
+        output[offset + 1] = 3;
+        output[offset + 4..offset + 8].copy_from_slice(&600u32.to_be_bytes());
+        output[offset + 8] = 0xfe;
+        output[offset + 9] = 0xc0;
+        output[offset + 23] = 3;
+        offset += 24;
+
+        let checksum = crate::icmpv6_checksum(source, destination, &output[..offset]);
+        output[2..4].copy_from_slice(&checksum.to_be_bytes());
+        offset
+    }
+
+    fn router_advertisement_frame(
+        router_lifetime_seconds: u16,
+        hop_limit: u8,
+        source: Ipv6Address,
+    ) -> ([u8; crate::ETHERNET_FRAME_BYTES], usize) {
+        let destination = Ipv6Address::ALL_NODES_LINK_LOCAL;
+        let mut body = [0u8; 256];
+        let body_len = router_advertisement_body(&mut body, source, destination, router_lifetime_seconds);
+        let mut frame = [0u8; crate::ETHERNET_FRAME_BYTES];
+        let mut offset = EthernetFrame::encode_header(
+            &mut frame,
+            ipv6_multicast_mac(destination),
+            ROUTER_MAC,
+            EthernetProtocol::Ipv6,
+        )
+        .expect("test Ethernet header should fit");
+        offset += Ipv6Packet::encode_header(
+            &mut frame[offset..],
+            source,
+            destination,
+            crate::IpProtocol::Icmpv6,
+            body_len,
+            hop_limit,
+        )
+        .expect("test IPv6 header should fit");
+        frame[offset..offset + body_len].copy_from_slice(&body[..body_len]);
+        offset += body_len;
+        (frame, offset)
+    }
+
+    fn autoconfigured_stack() -> Stack {
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack.configure_ipv6_link_local();
+        let (frame, len) = router_advertisement_frame(300, 255, ROUTER_LINK_LOCAL);
+        stack
+            .receive_frame(&frame[..len], StackInstant::from_nanos(1))
+            .expect("router advertisement should be handled");
+        stack
+    }
+
+    #[test]
+    fn ipv6_link_local_is_derived_from_the_interface_mac() {
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        let link_local = stack.configure_ipv6_link_local();
+
+        assert_eq!(
+            link_local,
+            Ipv6Cidr::new(Ipv6Address::link_local_from_mac(LOCAL_MAC), 64)
+        );
+        assert_eq!(
+            stack.ipv6_link_local_address(),
+            Some(Ipv6Address::link_local_from_mac(LOCAL_MAC))
+        );
+        // The link-local prefix is installed as a connected route.
+        assert_eq!(
+            stack
+                .routes()
+                .resolve(IpAddress::Ipv6(ROUTER_LINK_LOCAL))
+                .map(|route| route.gateway),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn ipv6_autoconfig_queues_router_solicitation_from_link_local() {
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack.configure_ipv6_link_local();
+
+        stack
+            .drive_ipv6_autoconfig(StackInstant::from_nanos(0))
+            .expect("router solicitation should queue");
+
+        let frame = stack
+            .take_outbound()
+            .expect("router solicitation frame should be queued");
+        let ethernet =
+            EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        assert_eq!(
+            ethernet.destination,
+            ipv6_multicast_mac(Ipv6Address::ALL_ROUTERS_LINK_LOCAL)
+        );
+        let ipv6 = Ipv6Packet::parse(ethernet.payload).expect("IPv6 packet should parse");
+        assert_eq!(ipv6.source, Ipv6Address::link_local_from_mac(LOCAL_MAC));
+        assert_eq!(ipv6.destination, Ipv6Address::ALL_ROUTERS_LINK_LOCAL);
+        // RFC 4861 requires hop limit 255 on every NDP message.
+        assert_eq!(ipv6.hop_limit, 255);
+        assert!(crate::icmpv6_checksum_valid(
+            ipv6.source,
+            ipv6.destination,
+            ipv6.payload
+        ));
+        assert_eq!(ipv6.payload[0], 133);
+        // Source Link-Layer Address option.
+        assert_eq!(ipv6.payload[8], 1);
+        assert_eq!(&ipv6.payload[10..16], &LOCAL_MAC);
+
+        // Inside the retransmit interval nothing more is queued.
+        stack
+            .drive_ipv6_autoconfig(StackInstant::from_nanos(1))
+            .expect("second poll should be a no-op");
+        assert!(stack.take_outbound().is_none());
+    }
+
+    #[test]
+    fn router_advertisement_configures_slaac_address_route_and_resolvers() {
+        let mut stack = autoconfigured_stack();
+
+        assert!(stack.ipv6_autoconfigured());
+        assert!(
+            stack
+                .ipv6_addresses()
+                .any(|address| address == slaac_expected_address(LOCAL_MAC))
+        );
+        let default_route = stack
+            .routes()
+            .resolve(IpAddress::Ipv6(Ipv6Address::new([
+                0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+            ])))
+            .expect("default IPv6 route should exist");
+        assert_eq!(
+            default_route.gateway,
+            Some(IpAddress::Ipv6(ROUTER_LINK_LOCAL))
+        );
+        assert_eq!(
+            stack.ipv6_dns_servers().collect::<Vec<_>>(),
+            vec![Ipv6Address::new([
+                0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3
+            ])]
+        );
+        // The router's link-layer address came from the advertisement's
+        // source link-layer option, so no solicitation is needed to
+        // reach it.
+        assert!(
+            stack
+                .neighbors()
+                .any(|entry| entry.ip == IpAddress::Ipv6(ROUTER_LINK_LOCAL)
+                    && entry.mac == ROUTER_MAC)
+        );
+        let mut autoconfigured = false;
+        while let Some(event) = stack.take_event() {
+            if let StackEvent::Ipv6Autoconfigured(configuration) = event {
+                assert_eq!(configuration.router, ROUTER_LINK_LOCAL);
+                autoconfigured = true;
+            }
+        }
+        assert!(autoconfigured, "an autoconfiguration event should be queued");
+
+        // Autoconfiguration stops soliciting once it has an answer.
+        stack
+            .drive_ipv6_autoconfig(StackInstant::from_nanos(2))
+            .expect("configured interface should not solicit");
+        assert!(stack.take_outbound().is_none());
+    }
+
+    #[test]
+    fn router_advertisement_with_modified_hop_limit_is_rejected() {
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack.configure_ipv6_link_local();
+        let (frame, len) = router_advertisement_frame(300, 64, ROUTER_LINK_LOCAL);
+
+        stack
+            .receive_frame(&frame[..len], StackInstant::from_nanos(1))
+            .expect("forwarded advertisement should be dropped without error");
+
+        assert!(!stack.ipv6_autoconfigured());
+        assert!(
+            !stack
+                .ipv6_addresses()
+                .any(|address| address == slaac_expected_address(LOCAL_MAC))
+        );
+    }
+
+    #[test]
+    fn router_advertisement_from_global_source_is_rejected() {
+        let global =
+            Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack.configure_ipv6_link_local();
+        let (frame, len) = router_advertisement_frame(300, 255, global);
+
+        stack
+            .receive_frame(&frame[..len], StackInstant::from_nanos(1))
+            .expect("non-link-local advertisement should be dropped without error");
+
+        assert!(!stack.ipv6_autoconfigured());
+    }
+
+    #[test]
+    fn zero_router_lifetime_withdraws_the_default_ipv6_route() {
+        let mut stack = autoconfigured_stack();
+        let (frame, len) = router_advertisement_frame(0, 255, ROUTER_LINK_LOCAL);
+
+        stack
+            .receive_frame(&frame[..len], StackInstant::from_nanos(2))
+            .expect("router advertisement should be handled");
+
+        let off_link = IpAddress::Ipv6(Ipv6Address::new([
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]));
+        assert!(stack.routes().resolve(off_link).is_none());
+        // The on-link prefix survives: it is a connected route, not a
+        // router-lifetime-scoped one.
+        assert!(
+            stack
+                .routes()
+                .resolve(IpAddress::Ipv6(Ipv6Address::new([
+                    0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9
+                ])))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn neighbor_solicitation_for_a_slaac_address_is_answered() {
+        let mut stack = autoconfigured_stack();
+        let target = slaac_expected_address(LOCAL_MAC).address();
+        let peer = Ipv6Address::new([0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]);
+        let destination = target.solicited_node_multicast();
+
+        let mut body = [0u8; 64];
+        let body_len = Icmpv6Packet::encode_neighbor_solicitation(
+            &mut body,
+            peer,
+            destination,
+            target,
+            PEER_MAC,
+        )
+        .expect("neighbor solicitation should encode");
+        let mut frame = [0u8; crate::ETHERNET_FRAME_BYTES];
+        let mut offset = EthernetFrame::encode_header(
+            &mut frame,
+            ipv6_multicast_mac(destination),
+            PEER_MAC,
+            EthernetProtocol::Ipv6,
+        )
+        .expect("test Ethernet header should fit");
+        offset += Ipv6Packet::encode_header(
+            &mut frame[offset..],
+            peer,
+            destination,
+            crate::IpProtocol::Icmpv6,
+            body_len,
+            255,
+        )
+        .expect("test IPv6 header should fit");
+        frame[offset..offset + body_len].copy_from_slice(&body[..body_len]);
+        offset += body_len;
+
+        stack
+            .receive_frame(&frame[..offset], StackInstant::from_nanos(3))
+            .expect("neighbor solicitation should be handled");
+
+        let response = stack
+            .take_outbound()
+            .expect("neighbor advertisement should be queued");
+        let ethernet =
+            EthernetFrame::parse(response.as_slice()).expect("Ethernet frame should parse");
+        assert_eq!(ethernet.destination, PEER_MAC);
+        let ipv6 = Ipv6Packet::parse(ethernet.payload).expect("IPv6 packet should parse");
+        assert_eq!(ipv6.source, target);
+        assert_eq!(ipv6.destination, peer);
+        assert_eq!(ipv6.hop_limit, 255);
+        let Some(Icmpv6Packet::NeighborAdvertisement {
+            target: advertised,
+            solicited,
+            override_cache,
+            options,
+        }) = Icmpv6Packet::parse(ipv6.payload)
+        else {
+            panic!("expected a neighbor advertisement");
+        };
+        assert_eq!(advertised, target);
+        assert!(solicited);
+        assert!(override_cache);
+        assert_eq!(options.target_link_layer_address(), Some(LOCAL_MAC));
+        // The solicitation's own source link-layer option seeded the cache.
+        assert!(
+            stack
+                .neighbors()
+                .any(|entry| entry.ip == IpAddress::Ipv6(peer) && entry.mac == PEER_MAC)
+        );
+    }
+
+    #[test]
+    fn neighbor_advertisement_without_override_keeps_the_cached_address() {
+        let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
+        stack.configure_ipv6_link_local();
+        let peer = Ipv6Address::new([0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]);
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv6(peer),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+
+        let impostor: EthernetAddress = [0x02, 0, 0, 0, 0, 0x99];
+        let mut body = [0u8; 64];
+        let body_len = Icmpv6Packet::encode_neighbor_advertisement(
+            &mut body,
+            peer,
+            Ipv6Address::link_local_from_mac(LOCAL_MAC),
+            peer,
+            impostor,
+        )
+        .expect("neighbor advertisement should encode");
+        // Clear the override bit that the encoder sets by default and
+        // restore the checksum for the edited body.
+        body[4] &= !0x20;
+        body[2..4].fill(0);
+        let checksum = crate::icmpv6_checksum(
+            peer,
+            Ipv6Address::link_local_from_mac(LOCAL_MAC),
+            &body[..body_len],
+        );
+        body[2..4].copy_from_slice(&checksum.to_be_bytes());
+
+        let mut frame = [0u8; crate::ETHERNET_FRAME_BYTES];
+        let mut offset = EthernetFrame::encode_header(
+            &mut frame,
+            LOCAL_MAC,
+            impostor,
+            EthernetProtocol::Ipv6,
+        )
+        .expect("test Ethernet header should fit");
+        offset += Ipv6Packet::encode_header(
+            &mut frame[offset..],
+            peer,
+            Ipv6Address::link_local_from_mac(LOCAL_MAC),
+            crate::IpProtocol::Icmpv6,
+            body_len,
+            255,
+        )
+        .expect("test IPv6 header should fit");
+        frame[offset..offset + body_len].copy_from_slice(&body[..body_len]);
+        offset += body_len;
+
+        stack
+            .receive_frame(&frame[..offset], StackInstant::from_nanos(4))
+            .expect("neighbor advertisement should be handled");
+
+        assert!(
+            stack
+                .neighbors()
+                .any(|entry| entry.ip == IpAddress::Ipv6(peer) && entry.mac == PEER_MAC),
+            "an advertisement without the override bit must not replace a cached address"
+        );
+    }
+
+    #[test]
+    fn ipv6_udp_send_to_an_unknown_neighbor_solicits_it() {
+        let mut stack = autoconfigured_stack();
+        let peer = Ipv6Address::new([0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]);
+
+        assert_eq!(
+            stack.send_udp_ipv6(4040, peer, 8080, b"probe", StackInstant::from_nanos(5)),
+            Ok(0),
+            "no payload bytes go out while the neighbor is being resolved"
+        );
+
+        let frame = stack
+            .take_outbound()
+            .expect("neighbor solicitation should be queued");
+        let ethernet =
+            EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        assert_eq!(
+            ethernet.destination,
+            ipv6_multicast_mac(peer.solicited_node_multicast())
+        );
+        let ipv6 = Ipv6Packet::parse(ethernet.payload).expect("IPv6 packet should parse");
+        assert_eq!(ipv6.source, slaac_expected_address(LOCAL_MAC).address());
+        let Some(Icmpv6Packet::NeighborSolicitation { target, options }) =
+            Icmpv6Packet::parse(ipv6.payload)
+        else {
+            panic!("expected a neighbor solicitation");
+        };
+        assert_eq!(target, peer);
+        assert_eq!(options.source_link_layer_address(), Some(LOCAL_MAC));
+    }
+
+    #[test]
+    fn ipv6_udp_datagram_is_routed_through_the_advertised_default_router() {
+        let mut stack = autoconfigured_stack();
+        let remote = Ipv6Address::new([
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]);
+
+        stack
+            .send_udp_ipv6(4040, remote, 8080, b"payload", StackInstant::from_nanos(6))
+            .expect("datagram should route through the advertised router");
+
+        let frame = stack.take_outbound().expect("datagram should be queued");
+        let ethernet =
+            EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        // Next hop is the router, so the frame carries the router's MAC
+        // while the IPv6 destination stays the final remote address.
+        assert_eq!(ethernet.destination, ROUTER_MAC);
+        let ipv6 = Ipv6Packet::parse(ethernet.payload).expect("IPv6 packet should parse");
+        assert_eq!(ipv6.source, slaac_expected_address(LOCAL_MAC).address());
+        assert_eq!(ipv6.destination, remote);
+        let udp = UdpPacket::parse(ipv6.payload).expect("UDP datagram should parse");
+        assert_eq!(udp.payload, b"payload");
+        assert!(crate::udp_checksum_valid(
+            IpAddress::Ipv6(ipv6.source),
+            IpAddress::Ipv6(ipv6.destination),
+            ipv6.payload
+        ));
+    }
+
+    #[test]
+    fn tcp_over_ipv6_completes_the_handshake_against_frame_fixtures() {
+        let mut stack = autoconfigured_stack();
+        let local_address = slaac_expected_address(LOCAL_MAC).address();
+        let remote_address = Ipv6Address::new([
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]);
+        let local = TcpEndpoint {
+            address: IpAddress::Ipv6(local_address),
+            port: 49152,
+        };
+        let remote = TcpEndpoint {
+            address: IpAddress::Ipv6(remote_address),
+            port: 80,
+        };
+
+        let socket = stack
+            .open_tcp_connect(local, remote, 1000)
+            .expect("IPv6 TCP connect should allocate");
+        stack
+            .drive_tcp(StackInstant::from_nanos(10))
+            .expect("SYN should be queued");
+
+        let frame = stack.take_outbound().expect("SYN frame should be queued");
+        let ethernet =
+            EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        assert_eq!(ethernet.destination, ROUTER_MAC);
+        let ipv6 = Ipv6Packet::parse(ethernet.payload).expect("IPv6 packet should parse");
+        assert_eq!(ipv6.source, local_address);
+        assert_eq!(ipv6.destination, remote_address);
+        assert_eq!(ipv6.next_header, crate::IpProtocol::Tcp);
+        let syn = TcpPacket::parse(ipv6.payload).expect("TCP segment should parse");
+        assert!(syn.flags.contains(TcpFlags::SYN));
+        assert!(crate::tcp_checksum_valid(
+            IpAddress::Ipv6(ipv6.source),
+            IpAddress::Ipv6(ipv6.destination),
+            ipv6.payload
+        ));
+
+        // Feed the peer's SYN-ACK back in as a real v6 frame.
+        let mut segment = [0u8; crate::ETHERNET_FRAME_BYTES];
+        let segment_len = TcpPacket::encode(
+            &mut segment,
+            IpAddress::Ipv6(remote_address),
+            IpAddress::Ipv6(local_address),
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 5000,
+                acknowledgement: syn.sequence.wrapping_add(1),
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+            },
+            &[],
+            TransportChecksum::Software,
+        )
+        .expect("test SYN-ACK should fit");
+        let mut frame = [0u8; crate::ETHERNET_FRAME_BYTES];
+        let mut offset = EthernetFrame::encode_header(
+            &mut frame,
+            LOCAL_MAC,
+            ROUTER_MAC,
+            EthernetProtocol::Ipv6,
+        )
+        .expect("test Ethernet header should fit");
+        offset += Ipv6Packet::encode_header(
+            &mut frame[offset..],
+            remote_address,
+            local_address,
+            crate::IpProtocol::Tcp,
+            segment_len,
+            64,
+        )
+        .expect("test IPv6 header should fit");
+        frame[offset..offset + segment_len].copy_from_slice(&segment[..segment_len]);
+        offset += segment_len;
+
+        stack
+            .receive_frame(&frame[..offset], StackInstant::from_nanos(11))
+            .expect("SYN-ACK should be handled");
+
+        assert_eq!(
+            stack.tcp_connect_state(socket),
+            Ok(TcpConnectState::Connected)
+        );
+
+        stack
+            .drive_tcp(StackInstant::from_nanos(12))
+            .expect("handshake ACK should be queued");
+        let frame = stack.take_outbound().expect("ACK frame should be queued");
+        let ethernet =
+            EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        let ipv6 = Ipv6Packet::parse(ethernet.payload).expect("IPv6 packet should parse");
+        let ack = TcpPacket::parse(ipv6.payload).expect("TCP segment should parse");
+        assert!(ack.flags.contains(TcpFlags::ACK));
+        assert!(!ack.flags.contains(TcpFlags::SYN));
+        assert_eq!(ack.acknowledgement, 5001);
+        assert!(crate::tcp_checksum_valid(
+            IpAddress::Ipv6(ipv6.source),
+            IpAddress::Ipv6(ipv6.destination),
+            ipv6.payload
+        ));
     }
 }
