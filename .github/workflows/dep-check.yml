@@ -22,13 +22,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: helios
+      # `cargo outdated` copies the manifests into a temporary directory
+      # before resolving, which severs the `../wasmtime` path dependency.
+      # `cargo upgrade --dry-run` resolves the real workspace in place and
+      # prints the upgrade table on stdout only when something is upgradable.
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-outdated
+          tool: cargo-edit
       - name: Check Rust dependencies
         working-directory: helios
         run: |
-          cargo outdated -R --exit-code 1 > outdated.txt 2>&1 || true
+          cargo upgrade --dry-run --incompatible allow --pinned allow > outdated.txt
           cat outdated.txt
       - name: Report
         working-directory: helios
