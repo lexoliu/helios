@@ -84,11 +84,6 @@ enum VmHostShareProfile {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VmEntropyProfile {
-    FwCfgSeed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VmWatchdogProfile {
     I6300Esb,
 }
@@ -110,15 +105,20 @@ struct VmProfile {
     network: Option<VmNetworkProfile>,
     block: Option<VmBlockProfile>,
     host_share: Option<VmHostShareProfile>,
-    entropy: Option<VmEntropyProfile>,
     watchdog: Option<VmWatchdogProfile>,
 }
+
+/// The aarch64 platform is device-tree only: the kernel reads the GIC
+/// register windows and every virtio device's interrupt from the FDT,
+/// and the EDK2 build QEMU ships installs the FDT configuration table
+/// only when it is not also publishing ACPI tables.
+const AARCH64_VIRT_MACHINE: &str = "virt,gic-version=3,acpi=off";
 
 const AARCH64_VIRT_HVF_PROFILE: VmProfile = VmProfile {
     arch: VmArch::Aarch64,
     qemu_bin: DEFAULT_AARCH64_QEMU_BIN,
     cargo_target: "aarch64-unknown-none",
-    machine: "virt,gic-version=3",
+    machine: AARCH64_VIRT_MACHINE,
     kernel_artifact_name: "helios",
     default_smp: DEFAULT_AARCH64_SMP,
     default_memory: DEFAULT_AARCH64_MEMORY,
@@ -130,7 +130,6 @@ const AARCH64_VIRT_HVF_PROFILE: VmProfile = VmProfile {
     network: Some(VmNetworkProfile::VirtioMmioUser),
     block: Some(VmBlockProfile::VirtioPciBootDisk),
     host_share: Some(VmHostShareProfile::Virtio9pMmio),
-    entropy: Some(VmEntropyProfile::FwCfgSeed),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
 };
 
@@ -139,7 +138,7 @@ const AARCH64_VIRT_TCG_PROFILE: VmProfile = VmProfile {
     arch: VmArch::Aarch64,
     qemu_bin: DEFAULT_AARCH64_QEMU_BIN,
     cargo_target: "aarch64-unknown-none",
-    machine: "virt,gic-version=3",
+    machine: AARCH64_VIRT_MACHINE,
     kernel_artifact_name: "helios",
     default_smp: DEFAULT_AARCH64_SMP,
     default_memory: DEFAULT_AARCH64_MEMORY,
@@ -151,7 +150,6 @@ const AARCH64_VIRT_TCG_PROFILE: VmProfile = VmProfile {
     network: Some(VmNetworkProfile::VirtioMmioUser),
     block: Some(VmBlockProfile::VirtioPciBootDisk),
     host_share: Some(VmHostShareProfile::Virtio9pMmio),
-    entropy: Some(VmEntropyProfile::FwCfgSeed),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
 };
 
@@ -171,7 +169,6 @@ const RISCV64_VM_PROFILE: VmProfile = VmProfile {
     network: Some(VmNetworkProfile::VirtioMmioUser),
     block: Some(VmBlockProfile::VirtioMmioDataDisk),
     host_share: Some(VmHostShareProfile::Virtio9pMmio),
-    entropy: None,
     watchdog: Some(VmWatchdogProfile::I6300Esb),
 };
 
@@ -191,7 +188,6 @@ const X86_64_VM_PROFILE: VmProfile = VmProfile {
     network: Some(VmNetworkProfile::VirtioPciUser),
     block: Some(VmBlockProfile::VirtioPciBootDisk),
     host_share: Some(VmHostShareProfile::Virtio9pPci),
-    entropy: None,
     watchdog: Some(VmWatchdogProfile::I6300Esb),
 };
 
@@ -628,9 +624,7 @@ fn default_accel(profile: &VmProfile) -> Vec<String> {
                     && std::process::Command::new("sysctl")
                         .args(["-n", "kern.hv_support"])
                         .output()
-                        .is_ok_and(|output| {
-                            String::from_utf8_lossy(&output.stdout).trim() == "1"
-                        })
+                        .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).trim() == "1")
             }
             "kvm" => native_host && Path::new("/dev/kvm").exists(),
             _ => true,
@@ -803,7 +797,9 @@ fn run_workload_bench(
             Vec::new()
         };
 
-        if let Err(error) = crate::workload_bench::run_inner(&mut client, &command, &provenance).await {
+        if let Err(error) =
+            crate::workload_bench::run_inner(&mut client, &command, &provenance).await
+        {
             print_recent_guest_errors(&mut client).await;
             return Err(error);
         }
@@ -1344,9 +1340,6 @@ impl VmRuntime {
                 configure_host_share(&mut qemu, host_share, shared_dir);
             }
         }
-        if let Some(entropy) = command.profile.entropy {
-            configure_entropy_device(&mut qemu, entropy, runtime_dir.path())?;
-        }
         if let Some(watchdog) = command.profile.watchdog {
             configure_watchdog(&mut qemu, watchdog);
         }
@@ -1641,9 +1634,7 @@ fn discover_qemu_edk2_code(arch: VmArch, qemu_bin: &Path) -> Result<PathBuf> {
             PathBuf::from("/usr/share/OVMF/OVMF_CODE_4M.fd"),
             PathBuf::from("/usr/share/OVMF/OVMF_CODE.fd"),
         ]),
-        VmArch::Aarch64 => candidates.extend([
-            PathBuf::from("/usr/share/AAVMF/AAVMF_CODE.fd"),
-        ]),
+        VmArch::Aarch64 => candidates.extend([PathBuf::from("/usr/share/AAVMF/AAVMF_CODE.fd")]),
         VmArch::Riscv64 => {}
     }
     candidates
@@ -1760,29 +1751,6 @@ fn configure_host_share(qemu: &mut Command, host_share: VmHostShareProfile, shar
     }
 }
 
-fn configure_entropy_device(
-    qemu: &mut Command,
-    entropy: VmEntropyProfile,
-    runtime_dir: &Path,
-) -> Result<()> {
-    match entropy {
-        VmEntropyProfile::FwCfgSeed => {
-            let seed_path = runtime_dir.join("rng-seed.bin");
-            let mut seed = [0_u8; 32];
-            getrandom::fill(&mut seed).map_err(|error| {
-                anyhow::anyhow!("failed to read host entropy for VM seed: {error:?}")
-            })?;
-            fs::write(&seed_path, seed)
-                .with_context(|| format!("failed to write {}", seed_path.display()))?;
-            qemu.arg("-fw_cfg").arg(format!(
-                "name=opt/org.helios/rng-seed,file={}",
-                seed_path.display()
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn configure_watchdog(qemu: &mut Command, watchdog: VmWatchdogProfile) {
     match watchdog {
         VmWatchdogProfile::I6300Esb => {
@@ -1811,7 +1779,7 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant};
 
-    use anyhow::{Context as _, Result, bail};
+    use anyhow::{Result, bail};
     use helios_inspector_protocol::debugger::programs as debugger_programs;
 
     use super::*;
@@ -1827,7 +1795,10 @@ mod tests {
     #[test]
     fn aarch64_profiles_are_modern_virt_only() {
         assert_eq!(AARCH64_VIRT_HVF_PROFILE.arch, VmArch::Aarch64);
-        assert_eq!(AARCH64_VIRT_HVF_PROFILE.machine, "virt,gic-version=3");
+        assert_eq!(
+            AARCH64_VIRT_HVF_PROFILE.machine,
+            "virt,gic-version=3,acpi=off"
+        );
         assert_eq!(AARCH64_VIRT_HVF_PROFILE.default_smp, 4);
         assert_eq!(AARCH64_VIRT_HVF_PROFILE.default_accel, &["hvf", "kvm"]);
         assert_eq!(AARCH64_VIRT_HVF_PROFILE.default_cpu, Some("host"));
@@ -1848,16 +1819,11 @@ mod tests {
             Some(VmHostShareProfile::Virtio9pMmio)
         );
         assert_eq!(
-            AARCH64_VIRT_HVF_PROFILE.entropy,
-            Some(VmEntropyProfile::FwCfgSeed)
+            AARCH64_VIRT_TCG_PROFILE.machine,
+            AARCH64_VIRT_HVF_PROFILE.machine
         );
-
         assert_eq!(AARCH64_VIRT_TCG_PROFILE.default_accel, &["tcg"]);
         assert_eq!(AARCH64_VIRT_TCG_PROFILE.default_cpu, Some("max"));
-        assert_eq!(
-            AARCH64_VIRT_TCG_PROFILE.entropy,
-            Some(VmEntropyProfile::FwCfgSeed)
-        );
         assert_eq!(AARCH64_VIRT_TCG_PROFILE.default_smp, 4);
         assert_ne!(AARCH64_VIRT_HVF_PROFILE.machine, "sbsa-ref");
         assert!(!AARCH64_VIRT_HVF_PROFILE.machine.contains("raspi"));
