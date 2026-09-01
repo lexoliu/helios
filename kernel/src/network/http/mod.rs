@@ -1,11 +1,11 @@
 //! Transport-neutral HTTP data model.
 //!
-//! Nothing here knows about Wasmtime, WIT, sockets, or a wire format: the
-//! types are the values that cross the boundary between a program that wants
-//! to make an HTTP request and whatever component actually speaks HTTP. The
-//! kernel's `wasi:http` host bindings translate WIT resources into these
-//! types, and the `http-client` kernel plugin turns them into bytes on a
-//! socket.
+//! Nothing here knows about a runtime, a component interface, sockets, or a
+//! wire format: the types are the values that cross the boundary between a
+//! program that wants to make an HTTP request and whatever component actually
+//! speaks HTTP. The runtime adapter translates its own resource handles into
+//! these types, and the `http-client` kernel plugin turns them into bytes on
+//! a socket.
 //!
 //! Bodies are streamed, never buffered: [`HttpBody`] carries the kernel byte
 //! channel the contents flow through, the future the trailers arrive on, and
@@ -28,7 +28,7 @@ use thiserror::Error;
 /// These are all hop-by-hop or connection-management headers: the component
 /// that owns the connection decides them, so letting a guest smuggle one
 /// through would let it desynchronise the framing of a connection it does not
-/// own. Mirrors `wasmtime_wasi_http::DEFAULT_FORBIDDEN_HEADERS`.
+/// own.
 pub const HTTP_FORBIDDEN_FIELD_NAMES: [&str; 9] = [
     "connection",
     "keep-alive",
@@ -710,8 +710,10 @@ pub struct HttpFieldSizePayload {
     pub field_size: Option<u32>,
 }
 
-/// Every failure `wasi:http` can report, one variant per WIT `error-code`
-/// case.
+/// Every failure an HTTP exchange can report.
+///
+/// One variant per case of the HTTP error vocabulary the runtime adapter
+/// exposes, so a code survives the trip across a store boundary intact.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum HttpErrorCode {
     #[error("DNS lookup timed out")]

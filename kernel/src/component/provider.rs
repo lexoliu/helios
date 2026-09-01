@@ -1,10 +1,10 @@
 //! Typed hand-off slot for an interface the kernel forwards to a plugin.
 //!
-//! Some capabilities the kernel exposes through WIT are not implemented by the
+//! Some capabilities the kernel exposes to guests are not implemented by the
 //! kernel at all: it validates the request, turns it into a transport-neutral
-//! message, and hands it to a user-mode wasm component that owns the protocol.
-//! `wasi:http/client` is the first such interface; `wasi:keyvalue`,
-//! `wasi:config`, and TLS termination fit the same shape.
+//! message, and hands it to a user-mode component that owns the protocol. The
+//! HTTP client is the first such capability; a key-value store, a
+//! configuration source, and TLS termination all fit the same shape.
 //!
 //! A [`ProviderSlot`] is the meeting point. The supervisor that owns the
 //! plugin installs the sending half of a bounded queue exactly once during
@@ -29,7 +29,8 @@
 //! `futures::channel::mpsc` is deliberately not used here: it lives behind
 //! `futures-channel`'s `std` feature, which a `#![no_std]` kernel cannot
 //! enable. The queue below is the same `concurrent-queue` + `Notify` pairing
-//! the kernel's byte channels already use, made generic over the message type.
+//! the kernel's byte channels already use, made generic over the message
+//! type.
 
 extern crate alloc;
 

@@ -34,8 +34,8 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     network_service_installed: AtomicBool,
     network_service: Once<NetworkService>,
     /// Queue into the `http-client` kernel plugin. Empty on a kernel image
-    /// that does not provision the plugin, in which case `wasi:http/client`
-    /// answers `configuration-error` rather than trapping.
+    /// that does not provision the plugin, in which case the runtime adapter
+    /// answers a configuration error rather than trapping.
     http_client: ProviderSlot<HttpExchange>,
     host_fs_service: Mutex<Option<HostFsService>>,
     futex_table: Mutex<FutexTable>,
@@ -705,10 +705,10 @@ where
 
     /// The hand-off slot for the `http-client` kernel plugin.
     ///
-    /// The plugin supervisor installs the queue during startup; the
-    /// `wasi:http/client` host binding sends every exchange through it. The
-    /// slot stays empty when the plugin is not provisioned, which the host
-    /// binding reports as `error-code.configuration-error`.
+    /// The plugin supervisor installs the queue during startup; the runtime
+    /// adapter's HTTP client binding sends every exchange through it. The slot
+    /// stays empty when the plugin is not provisioned, which that binding
+    /// reports to the guest as a configuration error.
     pub fn http_client(&self) -> &ProviderSlot<HttpExchange> {
         &self.inner.http_client
     }

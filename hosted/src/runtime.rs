@@ -262,7 +262,13 @@ fn spawn_processor_thread(
                 }
 
                 // Install component host program service (same as riscv/x86).
-                helios_kernel::install_component_host_program_service(&kernel, &cpu, &debug_state);
+                helios_kernel::install_component_host_program_service(
+                    &kernel,
+                    &cpu,
+                    &debug_state,
+                    read_debug_serial,
+                    write_debug_serial,
+                );
 
                 // Start non-bootstrap processors for component host topology.
                 for p in helios_kernel::component_host_processors_to_start(
