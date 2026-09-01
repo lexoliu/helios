@@ -1,37 +1,61 @@
+use arm_gic::{IntId, Trigger};
 use fdt::Fdt;
 use helios_hal::io::IoError;
 use helios_hal::watchdog::Watchdog;
 use helios_kernel::{
-    EventDeliveryCapabilities, InterfaceCapabilities, Kernel, NetworkDevice, NetworkService,
-    PacketBuffer,
+    DEFAULT_POLL_BUDGET, EventDeliveryCapabilities, ExternalInterruptHandler,
+    InterfaceCapabilities, Kernel, NetworkDevice, NetworkService, PacketBuffer,
 };
 use triomphe::Arc;
 
 type Aarch64VirtioNetTransport =
     helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<helios_virtio::OffsetDmaPool>>;
 type Aarch64VirtioNetDevice = helios_virtio::VirtioNetDevice<Aarch64VirtioNetTransport>;
-const VIRTIO_POLLING_RX_BUDGET: usize = 32;
+/// Frames submitted to the device in one descriptor-chain batch. This
+/// bounds the stack space the scatter path uses, independent of the
+/// receive poll budget the interrupt-driven capabilities advertise.
+const TX_BATCH_FRAMES: usize = 32;
 
 #[derive(Clone)]
-struct VirtioNetworkDevice {
+pub(crate) struct VirtioNetworkDevice {
     inner: Arc<Aarch64VirtioNetDevice>,
+}
+
+impl ExternalInterruptHandler for VirtioNetworkDevice {
+    fn handle_interrupt(&self) {
+        self.inner.handle_interrupt();
+    }
+}
+
+/// The network device the bootstrap processor brought up, together with
+/// the interrupt the device tree routes it to.
+pub(crate) struct NetworkInterrupt {
+    pub(crate) interrupt: IntId,
+    pub(crate) trigger: Trigger,
+    pub(crate) device: VirtioNetworkDevice,
 }
 
 pub(crate) fn install<WatchdogImpl>(
     cpu: &crate::Aarch64Cpu,
     kernel: &Kernel<crate::Aarch64Cpu, WatchdogImpl>,
-    fdt: Option<&Fdt<'_>>,
+    fdt: &Fdt<'_>,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
     debug_state: &crate::debug_state::RuntimeState,
-) where
+) -> Option<NetworkInterrupt>
+where
     WatchdogImpl: Watchdog + Clone,
 {
-    let Some(device) = discover_network_device(fdt, physical_memory_offset, handoff) else {
+    let Some(network) = discover_network_device(fdt, physical_memory_offset, handoff) else {
         tracing::warn!("virtio network device was not discovered on the platform bus");
-        return;
+        return None;
     };
-    let service = NetworkService::new(cpu.clone(), debug_state.clone(), kernel.timer(), device);
+    let service = NetworkService::new(
+        *cpu,
+        debug_state.clone(),
+        kernel.timer(),
+        network.device.clone(),
+    );
     let packet_pump = service.clone();
     debug_state.install_network_service(helios_kernel::ComponentHostNetworkService::from_service(
         service,
@@ -39,27 +63,12 @@ pub(crate) fn install<WatchdogImpl>(
     kernel.spawn_detached(async move {
         packet_pump.run_packet_pump().await;
     });
-    tracing::info!("virtio network online");
+    tracing::info!("virtio network online interrupt={:?}", network.interrupt);
+    Some(network)
 }
 
-pub(crate) fn has_network_device(
-    fdt: Option<&Fdt<'_>>,
-    physical_memory_offset: usize,
-    handoff: &crate::LimineBootHandoff,
-) -> bool {
-    if fdt.is_some_and(|fdt| {
-        crate::count_virtio_mmio_devices(fdt, helios_virtio::DeviceType::Network) != 0
-    }) {
-        return true;
-    }
-    scan_qemu_virt_mmio().any(|physical_base| {
-        crate::matches_virtio_mmio_device(
-            physical_base,
-            physical_memory_offset,
-            handoff,
-            helios_virtio::DeviceType::Network,
-        )
-    })
+pub(crate) fn has_network_device(fdt: &Fdt<'_>) -> bool {
+    crate::count_virtio_mmio_devices(fdt, helios_virtio::DeviceType::Network) != 0
 }
 
 impl NetworkDevice for VirtioNetworkDevice {
@@ -87,12 +96,12 @@ impl NetworkDevice for VirtioNetworkDevice {
             direct_tx_dma: true,
             events: EventDeliveryCapabilities {
                 polling: true,
-                interrupts: false,
+                interrupts: true,
                 adaptive_moderation: false,
                 rx_coalescing: false,
                 tx_coalescing: false,
-                rx_poll_budget: VIRTIO_POLLING_RX_BUDGET,
-                tx_completion_budget: VIRTIO_POLLING_RX_BUDGET,
+                rx_poll_budget: DEFAULT_POLL_BUDGET,
+                tx_completion_budget: DEFAULT_POLL_BUDGET,
             },
             ..InterfaceCapabilities::default()
         }
@@ -140,24 +149,20 @@ impl NetworkDevice for VirtioNetworkDevice {
     }
 
     async fn transmit(&self, frame: &[u8]) -> Result<(), IoError> {
-        self.inner
-            .transmit_with_wait(frame, helios_kernel::yield_now)
-            .await
+        self.inner.transmit(frame).await
     }
 
     async fn transmit_batch<'a>(&'a self, frames: &'a [&'a [u8]]) -> Result<(), IoError> {
-        self.inner
-            .transmit_batch_with_wait(frames, helios_kernel::yield_now)
-            .await
+        self.inner.transmit_batch(frames).await
     }
 
     async fn transmit_packet_batch<'a>(
         &'a self,
         frames: &'a [PacketBuffer],
     ) -> Result<(), IoError> {
-        for chunk in frames.chunks(VIRTIO_POLLING_RX_BUDGET) {
+        for chunk in frames.chunks(TX_BATCH_FRAMES) {
             self.inner
-                .transmit_frames_with_wait(chunk, helios_kernel::yield_now)
+                .transmit_frames_with_wait(chunk, || self.inner.wait_for_interrupt())
                 .await?;
         }
         Ok(())
@@ -176,7 +181,7 @@ impl NetworkDevice for VirtioNetworkDevice {
         frames: &'a [PacketBuffer],
     ) -> Result<usize, IoError> {
         let mut submitted = 0usize;
-        for chunk in frames.chunks(VIRTIO_POLLING_RX_BUDGET) {
+        for chunk in frames.chunks(TX_BATCH_FRAMES) {
             let accepted = self
                 .inner
                 .try_transmit_frames_on_pair(queue_idx, chunk)
@@ -207,13 +212,12 @@ impl NetworkDevice for VirtioNetworkDevice {
         frames: &[helios_kernel::TxFrameRef<'_>],
         tokens: &mut [Option<u16>],
     ) -> Result<Option<usize>, IoError> {
-        const SCATTER_BATCH: usize = 32;
         let mut descriptors = [helios_virtio::TxScatterFrame {
             headers: &[],
             payload: &[],
             checksum: None,
-        }; SCATTER_BATCH];
-        let count = frames.len().min(SCATTER_BATCH);
+        }; TX_BATCH_FRAMES];
+        let count = frames.len().min(TX_BATCH_FRAMES);
         for (descriptor, frame) in descriptors.iter_mut().zip(frames.iter().take(count)) {
             *descriptor = helios_virtio::TxScatterFrame {
                 headers: frame.bytes,
@@ -252,7 +256,7 @@ impl NetworkDevice for VirtioNetworkDevice {
         frames: &[helios_kernel::TxFrameRef<'_>],
     ) -> Result<Option<usize>, IoError> {
         let mut submitted = 0usize;
-        for chunk in frames.chunks(VIRTIO_POLLING_RX_BUDGET) {
+        for chunk in frames.chunks(TX_BATCH_FRAMES) {
             let Some(accepted) = self
                 .inner
                 .try_transmit_trusted_frames_immediate_on_pair(queue_idx, chunk)?
@@ -298,50 +302,34 @@ impl NetworkDevice for VirtioNetworkDevice {
     }
 
     async fn wait_for_event(&self) {
-        helios_kernel::yield_now().await;
+        self.inner.wait_for_interrupt().await;
     }
 }
 
 fn discover_network_device(
-    fdt: Option<&Fdt<'_>>,
+    fdt: &Fdt<'_>,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
-) -> Option<VirtioNetworkDevice> {
-    if let Some(fdt) = fdt {
-        if let Some(candidate) = helios_virtio::mmio_candidates(fdt).find(|candidate| {
-            crate::matches_virtio_mmio_device(
-                candidate.base,
-                physical_memory_offset,
-                handoff,
-                helios_virtio::DeviceType::Network,
-            )
-        }) {
-            return Some(init_network_device(
-                candidate.base,
-                candidate.size,
-                physical_memory_offset,
-                handoff,
-            ));
-        }
-    }
-
-    scan_qemu_virt_mmio()
-        .find(|physical_base| {
-            crate::matches_virtio_mmio_device(
-                *physical_base,
-                physical_memory_offset,
-                handoff,
-                helios_virtio::DeviceType::Network,
-            )
-        })
-        .map(|physical_base| {
-            init_network_device(
-                physical_base,
-                crate::QEMU_VIRT_MMIO_SIZE,
-                physical_memory_offset,
-                handoff,
-            )
-        })
+) -> Option<NetworkInterrupt> {
+    let candidate = helios_virtio::mmio_candidates(fdt).find(|candidate| {
+        crate::matches_virtio_mmio_device(
+            candidate.base,
+            physical_memory_offset,
+            handoff,
+            helios_virtio::DeviceType::Network,
+        )
+    })?;
+    let (interrupt, trigger) = crate::gic::device_interrupt(candidate.interrupt, candidate.base);
+    Some(NetworkInterrupt {
+        interrupt,
+        trigger,
+        device: init_network_device(
+            candidate.base,
+            candidate.size,
+            physical_memory_offset,
+            handoff,
+        ),
+    })
 }
 
 fn init_network_device(
@@ -363,9 +351,4 @@ fn init_network_device(
     VirtioNetworkDevice {
         inner: Arc::new(device),
     }
-}
-
-fn scan_qemu_virt_mmio() -> impl Iterator<Item = usize> {
-    (0..crate::QEMU_VIRT_MMIO_SLOTS)
-        .map(|slot| crate::QEMU_VIRT_MMIO_BASE + slot * crate::QEMU_VIRT_MMIO_STRIDE)
 }

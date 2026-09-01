@@ -3,9 +3,6 @@
 
 extern crate alloc;
 
-use acpi::address::AddressSpace;
-use acpi::sdt::spcr::{Spcr, SpcrInterfaceType};
-use acpi::{AcpiTables, Handler, PciAddress, PhysicalMapping};
 use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
 use core::fmt::{self, Write};
@@ -15,18 +12,19 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use arm_gic::IntId;
 use fdt::Fdt;
 use helios_hal::boot::{
     BootFirmwareTables, BootHandoff, BootKernelImage, BootMemoryKind, BootMemoryMap,
     BootMemoryRegion, BootModule, BootModules, FirmwareKind,
 };
-use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId, ticks_to_nanos};
+use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId};
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
-use helios_hal::{DeviceInventory, DmaModel, Platform};
+use helios_hal::{DeviceInventory, DmaModel, Platform, ProcessorStartupPolicy, ProcessorTopology};
 use helios_kernel::{
-    KernelException, KernelExceptionCause, KernelNativeTrapHandler, WasmtimeTlsSlots,
+    KernelException, KernelExceptionCause, KernelNativeTrapHandler, Timer, WasmtimeTlsSlots,
 };
 use limine::BaseRevision;
 use limine::file::File;
@@ -37,8 +35,7 @@ use limine::memmap::{Entry, MEMMAP_USABLE};
 use limine::mp::MpInfo;
 use limine::request::{
     DtbRequest, ExecutableAddressRequest, ExecutableCmdlineRequest, ExecutableFileRequest,
-    FirmwareTypeRequest, HhdmRequest, MemmapRequest, ModulesRequest, MpRequest, RsdpRequest,
-    StackSizeRequest,
+    FirmwareTypeRequest, HhdmRequest, MemmapRequest, ModulesRequest, MpRequest, StackSizeRequest,
 };
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
@@ -46,6 +43,10 @@ use spin::{Mutex, Once};
 
 const KERNEL_STACK_BYTES: usize = 4 * 1024 * 1024;
 const EXCEPTION_STACK_BYTES: usize = 64 * 1024;
+/// Bytes the IRQ entry reserves on the per-processor exception stack for
+/// `x0`-`x30`, `elr_el1` and `spsr_el1`, rounded up to the 16-byte stack
+/// alignment the architecture requires.
+const IRQ_FRAME_BYTES: usize = 272;
 const PAGE_BYTES: usize = 4096;
 const MMIO_BLOCK_BYTES: usize = 2 * 1024 * 1024;
 const MAX_USABLE_REGION_SEGMENTS: usize = 6;
@@ -62,29 +63,23 @@ const PAGE_PXN: u64 = 1 << 53;
 const PAGE_UXN: u64 = 1 << 54;
 const MAIR_DEVICE_ATTR_INDEX_SHIFT: u64 = PAGE_ATTR_DEVICE_INDEX * 8;
 const MAIR_DEVICE_NGNRNE: u64 = 0x00;
+/// Message for the one hard platform requirement: helios drives the
+/// aarch64 `virt` machine from its device tree, so the firmware must
+/// publish one. QEMU's EDK2 build installs the FDT configuration table
+/// only when it is not also publishing ACPI tables.
+const DEVICE_TREE_REQUIRED: &str =
+    "AArch64 bring-up requires the firmware device tree: boot the virt machine with acpi=off";
 const PL011_DATA: usize = 0x000;
 const PL011_FLAG: usize = 0x018;
 const PL011_FLAG_RXFE: u32 = 1 << 4;
 const PL011_FLAG_TXFF: u32 = 1 << 5;
-const QEMU_FW_CFG_MMIO_BASE: usize = 0x0902_0000;
-const QEMU_FW_CFG_MMIO_SIZE: usize = 0x18;
-const FW_CFG_DATA: usize = 0x000;
-const FW_CFG_SELECTOR: usize = 0x008;
-const QEMU_VIRT_MMIO_BASE: usize = 0x0a00_0000;
-const QEMU_VIRT_MMIO_STRIDE: usize = 0x200;
-const QEMU_VIRT_MMIO_SLOTS: usize = 32;
-const QEMU_VIRT_MMIO_SIZE: usize = 0x200;
-const FW_CFG_SIGNATURE: u16 = 0x0000;
-const FW_CFG_FILE_DIR: u16 = 0x0019;
-const FW_CFG_FILE_ENTRY_BYTES: usize = 64;
-const FW_CFG_FILE_NAME_BYTES: usize = 56;
-const FW_CFG_HELIOS_RNG_SEED: &[u8] = b"opt/org.helios/rng-seed";
 
 #[cfg(target_os = "none")]
 global_asm!(
     include_str!("entry.S"),
     boot_stack_bytes = const KERNEL_STACK_BYTES,
     exception_stack_bytes = const EXCEPTION_STACK_BYTES,
+    irq_frame_bytes = const IRQ_FRAME_BYTES,
 );
 
 unsafe extern "C" {
@@ -93,13 +88,25 @@ unsafe extern "C" {
 
 mod vmm;
 pub use vmm::Aarch64UserAddressSpace;
+mod gic;
 mod host_fs;
 mod net;
 
 mod debug_state {
     pub(crate) type RuntimeState =
         helios_kernel::HostRuntimeState<crate::Aarch64Cpu, crate::host_fs::HostFileSystemService>;
+    pub(crate) type ProgramService =
+        helios_kernel::UserProgramService<crate::Aarch64Cpu, crate::host_fs::HostFileSystemService>;
 }
+
+/// Interrupt routes the bootstrap processor installs for the virtio
+/// devices it brought up. Every device SPI is delivered to that
+/// processor, so the routes live in its per-processor runtime.
+pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
+    IntId,
+    net::VirtioNetworkDevice,
+    host_fs::HostFsTransportService,
+>;
 
 #[used]
 static BASE_REVISION: BaseRevision = BaseRevision::with_revision(6);
@@ -119,8 +126,6 @@ static MODULE_REQUEST: ModulesRequest = ModulesRequest::new();
 static MP_REQUEST: MpRequest = MpRequest::new(0);
 #[used]
 static FIRMWARE_TYPE_REQUEST: FirmwareTypeRequest = FirmwareTypeRequest::new();
-#[used]
-static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 #[used]
 static DEVICE_TREE_BLOB_REQUEST: DtbRequest = DtbRequest::new();
 #[used]
@@ -167,6 +172,15 @@ struct ProcessorRuntime {
     wasmtime_tls: WasmtimeTlsSlots,
     native_trap_handler: AtomicUsize,
     started: AtomicBool,
+    /// This processor's kernel timer, published once its own
+    /// `helios_kernel::init` has run so the timer PPI can advance it.
+    timer: Once<Timer<Aarch64Cpu>>,
+    /// The component-host program service, published on the processor
+    /// that owns it so the timer PPI can drive epoch interruption.
+    program_service: Once<debug_state::ProgramService>,
+    /// Device interrupt routes, installed on the bootstrap processor
+    /// only: every device SPI is routed to it.
+    device_interrupts: Once<DeviceInterruptRoutes>,
     /// Block size in bytes for the `DC ZVA` cache-line zero
     /// instruction, cached from `DCZID_EL0` at processor bring-up.
     /// Zero means DC ZVA is prohibited on this PE (`DCZID_EL0.DZP`
@@ -183,10 +197,18 @@ impl ProcessorRuntime {
             wasmtime_tls: WasmtimeTlsSlots::new(),
             native_trap_handler: AtomicUsize::new(0),
             started: AtomicBool::new(false),
+            timer: Once::new(),
+            program_service: Once::new(),
+            device_interrupts: Once::new(),
             dc_zva_block_bytes: AtomicU32::new(0),
         }
     }
 }
+
+/// The exception entries in `entry.S` derive the per-processor
+/// exception stack from `tpidr_el1`, which only holds if the stack is
+/// the first field of the runtime.
+const _: () = assert!(core::mem::offset_of!(ProcessorRuntime, exception_stack) == 0);
 
 #[repr(C, align(16))]
 struct ExceptionStack([u8; EXCEPTION_STACK_BYTES]);
@@ -207,6 +229,7 @@ struct Aarch64PlatformState {
     timer_frequency: u64,
     boot_entropy: Option<Aarch64BootEntropy>,
     debug_state: Once<debug_state::RuntimeState>,
+    gic: Once<gic::Gic>,
 }
 
 impl Aarch64PlatformState {
@@ -255,6 +278,7 @@ impl Aarch64PlatformState {
             timer_frequency,
             boot_entropy,
             debug_state: Once::new(),
+            gic: Once::new(),
         }))
     }
 
@@ -271,6 +295,24 @@ impl Aarch64PlatformState {
             .get()
             .unwrap_or_else(|| panic!("AArch64 secondary processor started before debug state"))
             .clone()
+    }
+
+    fn install_gic(&self, gic: gic::Gic) -> &gic::Gic {
+        assert!(
+            self.gic.get().is_none(),
+            "AArch64 interrupt controller was installed more than once"
+        );
+        self.gic.call_once(|| gic)
+    }
+
+    fn gic(&self) -> &gic::Gic {
+        self.gic
+            .get()
+            .unwrap_or_else(|| panic!("AArch64 processor ran before the interrupt controller"))
+    }
+
+    fn bootstrap_mpidr(&self) -> u64 {
+        self.processors[0].mp_info.mpidr
     }
 
     fn bootstrap_runtime(&'static self) -> &'static ProcessorRuntime {
@@ -306,7 +348,7 @@ impl Aarch64PlatformState {
             processor.id()
         );
         slot.mp_info
-            .bootstrap(aarch64_secondary_main, self as *const _ as u64);
+            .bootstrap(aarch64_secondary_entry, self as *const _ as u64);
         let deadline = read_counter()
             .checked_add(self.timer_frequency / 2)
             .unwrap_or_else(|| panic!("AArch64 secondary startup deadline overflow"));
@@ -327,6 +369,20 @@ impl Aarch64PlatformState {
             return Ok(());
         }
         fill_with_rndr(buffer)
+    }
+
+    /// Names the cryptographic source `fill_entropy` will draw from, so
+    /// a boot that has neither the firmware seed nor `RNDR` — and would
+    /// therefore leave the kernel pool insecure — is visible in the log
+    /// rather than only at the first failed secure draw.
+    fn entropy_source(&self) -> &'static str {
+        if self.boot_entropy.is_some() {
+            "device-tree /chosen/rng-seed"
+        } else if rndr_supported() {
+            "RNDR"
+        } else {
+            "none"
+        }
     }
 }
 
@@ -370,21 +426,12 @@ impl helios_hal::critical_section::InterruptOps for Aarch64InterruptOps {
     }
 
     fn disable_interrupts() {
-        unsafe {
-            asm!(
-                "msr daifset, #0xf",
-                options(nomem, nostack, preserves_flags)
-            );
-        }
+        mask_irq();
     }
 
     unsafe fn enable_interrupts() {
-        unsafe {
-            asm!(
-                "msr daifclr, #0xf",
-                options(nomem, nostack, preserves_flags)
-            );
-        }
+        // SAFETY: the caller owns the critical section this restores.
+        unsafe { unmask_irq() };
     }
 
     fn current_owner() -> usize {
@@ -395,12 +442,6 @@ impl helios_hal::critical_section::InterruptOps for Aarch64InterruptOps {
 
         1
     }
-}
-
-#[derive(Clone)]
-struct Aarch64AcpiHandler {
-    physical_memory_offset: usize,
-    timer_frequency: u64,
 }
 
 struct Aarch64CriticalSection;
@@ -424,19 +465,19 @@ extern "C" fn aarch64_kernel_main() -> ! {
         "Limine bootloader does not support the required base protocol revision"
     );
     install_exception_vectors();
-    enable_counter_event_stream();
     let handoff = limine_boot_handoff();
     let physical_memory_offset = physical_memory_offset();
     let boot_fdt = boot_fdt(&handoff);
     let debug_serial = DebugSerial::discover(&handoff, physical_memory_offset);
     debug_serial.init();
     DEBUG_SERIAL_BASE.store(debug_serial.base, Ordering::Release);
+    let boot_fdt = boot_fdt.unwrap_or_else(|| panic!("{DEVICE_TREE_REQUIRED}"));
     let processor_count = aarch64_processor_count();
     let reserved_ranges = boot_reserved_ranges(&handoff);
     let memory_regions = boot_memory_regions(&handoff, physical_memory_offset, &reserved_ranges);
     helios_kernel::prime_bootstrap_allocator(memory_regions, processor_count);
     vmm::install_user_address_space(physical_memory_offset);
-    let boot_entropy = discover_boot_entropy(&handoff, physical_memory_offset);
+    let boot_entropy = discover_boot_entropy(&handoff);
     let platform_state = Aarch64PlatformState::from_limine_mp(timer_frequency(), boot_entropy);
     activate_processor_runtime(platform_state.bootstrap_runtime());
 
@@ -455,39 +496,91 @@ extern "C" fn aarch64_kernel_main() -> ! {
         Some(write_debug_serial_bytes),
     );
     let mut devices = DeviceInventory::new().with_debug_serial();
-    if host_fs::has_9p_device(boot_fdt.as_ref(), physical_memory_offset, &handoff) {
+    if host_fs::has_9p_device(&boot_fdt) {
         devices = devices.with_host_share();
     }
-    if net::has_network_device(boot_fdt.as_ref(), physical_memory_offset, &handoff) {
+    if net::has_network_device(&boot_fdt) {
         devices = devices.with_network();
     }
     let kernel = helios_kernel::init(
         Platform::new(console, core::iter::empty::<MemoryRegion>(), cpu.clone())
+            .with_topology(
+                ProcessorTopology::start_all_secondaries(
+                    cpu.bootstrap_processor(),
+                    cpu.processor_count(),
+                )
+                .with_startup_policy(ProcessorStartupPolicy::BootstrapOnly),
+            )
             .with_timer_frequency_hz(cpu.timer_frequency())
             .with_dma_model(DmaModel::Translated)
             .with_devices(devices),
     );
-    host_fs::install(
-        boot_fdt.as_ref(),
+    let gic = platform_state.install_gic(gic::Gic::new(
+        gic::GicRegions::discover(&boot_fdt),
+        cpu.processor_count(),
+        platform_state.bootstrap_mpidr(),
         physical_memory_offset,
         &handoff,
-        &debug_state,
-    );
-    net::install(
+    ));
+    gic.attach_current_processor(platform_state.bootstrap_mpidr());
+    let entropy_source = platform_state.entropy_source();
+    if entropy_source == "none" {
+        tracing::warn!("boot entropy has no cryptographic source");
+    } else {
+        tracing::info!("boot entropy source={entropy_source}");
+    }
+
+    let mut routes = DeviceInterruptRoutes::new();
+    if let Some(host_fs) =
+        host_fs::install(&boot_fdt, physical_memory_offset, &handoff, &debug_state)
+    {
+        gic.enable_device_interrupt(
+            host_fs.interrupt,
+            host_fs.trigger,
+            platform_state.bootstrap_mpidr(),
+        );
+        routes.set_host_fs(host_fs.interrupt, host_fs.transport);
+    }
+    if let Some(network) = net::install(
         &cpu,
         &kernel,
-        boot_fdt.as_ref(),
+        &boot_fdt,
         physical_memory_offset,
         &handoff,
         &debug_state,
-    );
-    let _program_service = helios_kernel::install_component_host_program_service(
+    ) {
+        gic.enable_device_interrupt(
+            network.interrupt,
+            network.trigger,
+            platform_state.bootstrap_mpidr(),
+        );
+        routes.set_network(network.interrupt, network.device);
+    }
+
+    let runtime = current_processor_runtime();
+    runtime.install_device_interrupts(routes);
+    runtime.install_timer(kernel.timer());
+    if let Some(program_service) = helios_kernel::install_component_host_program_service(
         &kernel,
         &cpu,
         &debug_state,
         read_debug_serial,
         write_debug_serial_bytes,
-    );
+    ) {
+        runtime.install_program_service(program_service);
+    }
+    // SAFETY: this processor's CPU interface is initialised, its timer
+    // and device routes are published, and every device SPI is routed
+    // here, so an arriving interrupt now finds a handler.
+    unsafe { unmask_irq() };
+
+    for processor in helios_kernel::component_host_processors_to_start(
+        cpu.processor_count(),
+        cpu.bootstrap_processor(),
+    ) {
+        cpu.start_processor(processor);
+    }
+
     helios_kernel::run_component_host_processor_forever(
         cpu,
         kernel,
@@ -631,12 +724,42 @@ impl ProcessorRuntime {
     fn logical_id(&self) -> ProcessorId {
         ProcessorId::new(self.logical_id)
     }
+
+    fn install_timer(&self, timer: Timer<Aarch64Cpu>) {
+        assert!(
+            self.timer.get().is_none(),
+            "AArch64 processor timer was installed more than once"
+        );
+        self.timer.call_once(|| timer);
+    }
+
+    fn install_program_service(&self, program_service: debug_state::ProgramService) {
+        assert!(
+            self.program_service.get().is_none(),
+            "AArch64 program service was installed more than once"
+        );
+        self.program_service.call_once(|| program_service);
+    }
+
+    fn install_device_interrupts(&self, routes: DeviceInterruptRoutes) {
+        assert!(
+            self.device_interrupts.get().is_none(),
+            "AArch64 device interrupt routes were installed more than once"
+        );
+        self.device_interrupts.call_once(|| routes);
+    }
 }
 
 fn activate_processor_runtime(runtime: &'static ProcessorRuntime) {
     let ptr = runtime as *const _ as usize;
+    let exception_stack_top = ptr
+        .checked_add(EXCEPTION_STACK_BYTES)
+        .unwrap_or_else(|| panic!("AArch64 exception stack top overflow"));
     unsafe {
         asm!("msr tpidr_el1, {ptr}", ptr = in(reg) ptr, options(nomem, nostack, preserves_flags));
+        // The kernel never leaves EL1 and always runs on SP_EL1, so
+        // SP_EL0 is free to hold the stack the IRQ entry switches to.
+        asm!("msr sp_el0, {top}", top = in(reg) exception_stack_top, options(nomem, nostack, preserves_flags));
     }
     cache_dc_zva_block_bytes(runtime);
     runtime.started.store(true, Ordering::Release);
@@ -727,6 +850,26 @@ pub(crate) unsafe fn aarch64_zero_memory(ptr: *mut u8, size: usize) {
     }
 }
 
+/// Entry point Limine jumps to on a secondary processor.
+///
+/// Limine hands the processor over running on `SP_EL0`, while `_start`
+/// put the bootstrap processor on `SP_EL1`. The kernel needs one stack
+/// selection on every processor: exception entry always switches to
+/// `SP_EL1`, and the IRQ path claims `SP_EL0` for its own stack, which
+/// is `UNDEFINED` to access at EL1 while it is the selected one. Move
+/// Limine's stack under `SP_EL1` and select it before any Rust code
+/// runs.
+#[unsafe(naked)]
+unsafe extern "C" fn aarch64_secondary_entry(mp_info: &MpInfo) -> ! {
+    core::arch::naked_asm!(
+        "mov x9, sp",
+        "msr spsel, #1",
+        "mov sp, x9",
+        "b {main}",
+        main = sym aarch64_secondary_main,
+    )
+}
+
 unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
     prepare_current_processor();
     let state = mp_info.extra_argument() as *const Aarch64PlatformState;
@@ -737,6 +880,7 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
     let state = unsafe { &*state };
     let slot = state.processor_slot_by_mpidr(mp_info.mpidr);
     activate_processor_runtime(&slot.runtime);
+    state.gic().attach_current_processor(mp_info.mpidr);
 
     let cpu = Aarch64Cpu { state };
     let debug_state = state.debug_state();
@@ -751,13 +895,21 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
             .with_dma_model(DmaModel::Translated)
             .with_devices(DeviceInventory::new().with_debug_serial()),
     );
-    let _program_service = helios_kernel::install_component_host_program_service(
+    let runtime = current_processor_runtime();
+    runtime.install_timer(kernel.timer());
+    if let Some(program_service) = helios_kernel::install_component_host_program_service(
         &kernel,
         &cpu,
         &debug_state,
         read_debug_serial,
         write_debug_serial_bytes,
-    );
+    ) {
+        runtime.install_program_service(program_service);
+    }
+    // SAFETY: this processor's CPU interface is initialised and its
+    // timer is published; device interrupts are routed to the
+    // bootstrap processor, so only private interrupts arrive here.
+    unsafe { unmask_irq() };
     helios_kernel::run_component_host_processor_forever(
         cpu,
         kernel,
@@ -779,7 +931,6 @@ fn prepare_current_processor() {
         asm!("msr cpacr_el1, {cpacr}", cpacr = in(reg) cpacr, options(nomem, nostack, preserves_flags));
         asm!("isb", options(nostack, preserves_flags));
     }
-    enable_counter_event_stream();
     enable_pmu_for_current_processor();
     install_exception_vectors();
 }
@@ -830,6 +981,69 @@ extern "C" fn aarch64_handle_sync_exception(
     panic!(
         "unhandled AArch64 synchronous exception ec={exception_class:#x} esr={esr_el1:#x} elr={elr_el1:#x} far={far_el1:#x}"
     )
+}
+
+/// IRQ entry point for every exception level slot, called from
+/// `entry.S` on the per-processor exception stack with `PSTATE.I` still
+/// set, so the handler never nests.
+///
+/// The CPU interface signals one interrupt at a time; the loop drains
+/// every pending one before returning so a level-triggered device that
+/// re-asserts while its handler runs is picked up in the same entry.
+#[unsafe(no_mangle)]
+extern "C" fn aarch64_handle_irq() {
+    let runtime = current_processor_runtime();
+    while let Some(intid) = gic::acknowledge_interrupt() {
+        if intid == gic::VIRTUAL_TIMER_PPI {
+            if let Some(program_service) = runtime.program_service.get() {
+                program_service.increment_epoch();
+            }
+            runtime
+                .timer
+                .get()
+                .unwrap_or_else(|| {
+                    panic!("AArch64 timer interrupt fired before the kernel timer was installed")
+                })
+                .handle_interrupt();
+        } else {
+            let routes = runtime.device_interrupts.get().unwrap_or_else(|| {
+                panic!("AArch64 device interrupt {intid:?} fired before routes were installed")
+            });
+            assert!(
+                routes.route(intid),
+                "AArch64 device interrupt {intid:?} has no registered handler"
+            );
+        }
+        gic::end_interrupt(intid);
+    }
+}
+
+/// Masks IRQ delivery on the calling processor. Debug, SError and FIQ
+/// keep the mask the boot path gave them: they are fatal here, and a
+/// critical section that unmasked them on exit would enable more than
+/// it disabled.
+fn mask_irq() {
+    unsafe {
+        asm!(
+            "msr daifset, #0x2",
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}
+
+/// Unmasks IRQ delivery on the calling processor.
+///
+/// # Safety
+///
+/// The calling processor's GIC CPU interface must be initialised and
+/// every interrupt routed to it must have a handler installed.
+unsafe fn unmask_irq() {
+    unsafe {
+        asm!(
+            "msr daifclr, #0x2",
+            options(nomem, nostack, preserves_flags)
+        );
+    }
 }
 
 fn read_processor_runtime() -> usize {
@@ -891,30 +1105,6 @@ fn aarch64_pmu_supported() -> bool {
     pmuver != 0 && pmuver != 0xf
 }
 
-/// Enables the architectural counter event stream so a `wfe`-parked
-/// processor wakes at a fine, bounded period. Without it the only wake
-/// sources are cross-CPU events and the platform default stream —
-/// observed at ~22 ms under HVF, which quantized every executor timer
-/// sleep and stalled TCP receive in ~1.5 s steps. Watching counter
-/// bit 9 yields a 2^10-tick period, about 43 us at the 24 MHz virt
-/// counter, matching the network pump's 50 us progress-wait quantum.
-fn enable_counter_event_stream() {
-    const EVNTEN: u64 = 1 << 2;
-    const EVNTDIR: u64 = 1 << 3;
-    const EVNTI_MASK: u64 = 0xf << 4;
-    const EVNTI_BIT_9: u64 = 9 << 4;
-    // FEAT_ECV scales EVNTI to watch bit EVNTI+8 when EVNTIS is set, and
-    // the field resets to an UNKNOWN value; clear it so bit 9 means bit 9.
-    const EVNTIS: u64 = 1 << 17;
-    unsafe {
-        let mut cntkctl: u64;
-        asm!("mrs {v}, cntkctl_el1", v = out(reg) cntkctl, options(nomem, nostack, preserves_flags));
-        cntkctl = (cntkctl & !(EVNTI_MASK | EVNTDIR | EVNTIS)) | EVNTEN | EVNTI_BIT_9;
-        asm!("msr cntkctl_el1, {v}", v = in(reg) cntkctl, options(nomem, nostack, preserves_flags));
-        asm!("isb", options(nostack, preserves_flags));
-    }
-}
-
 fn enable_pmu_for_current_processor() {
     if !aarch64_pmu_supported() {
         return;
@@ -935,8 +1125,12 @@ fn read_cycle_counter() -> u64 {
     value
 }
 
+fn rndr_supported() -> bool {
+    (read_id_aa64isar0_el1() >> 60) & 0xf != 0
+}
+
 fn fill_with_rndr(buffer: &mut [u8]) -> Result<(), EntropyUnavailable> {
-    if (read_id_aa64isar0_el1() >> 60) & 0xf == 0 {
+    if !rndr_supported() {
         return Err(EntropyUnavailable);
     }
 
@@ -991,149 +1185,6 @@ fn cache_line_bytes() -> usize {
     }
     let log2_words = ((ctr_el0 >> 16) & 0xf) as usize;
     4 << log2_words
-}
-
-impl Aarch64AcpiHandler {
-    fn new(physical_memory_offset: usize) -> Self {
-        Self {
-            physical_memory_offset,
-            timer_frequency: timer_frequency(),
-        }
-    }
-
-    fn physical_to_virtual<T>(&self, physical_address: usize) -> NonNull<T> {
-        let virtual_address = physical_address
-            .checked_add(self.physical_memory_offset)
-            .unwrap_or_else(|| panic!("AArch64 ACPI physical mapping overflow"));
-        NonNull::new(virtual_address as *mut T)
-            .unwrap_or_else(|| panic!("AArch64 ACPI physical mapping produced a null pointer"))
-    }
-}
-
-impl Handler for Aarch64AcpiHandler {
-    unsafe fn map_physical_region<T>(
-        &self,
-        physical_address: usize,
-        size: usize,
-    ) -> PhysicalMapping<Self, T> {
-        PhysicalMapping {
-            physical_start: physical_address,
-            virtual_start: self.physical_to_virtual(physical_address),
-            region_length: size,
-            mapped_length: size,
-            handler: self.clone(),
-        }
-    }
-
-    fn unmap_physical_region<T>(_region: &PhysicalMapping<Self, T>) {}
-
-    fn read_u8(&self, address: usize) -> u8 {
-        unsafe { (address as *const u8).read_volatile() }
-    }
-
-    fn read_u16(&self, address: usize) -> u16 {
-        unsafe { (address as *const u16).read_volatile() }
-    }
-
-    fn read_u32(&self, address: usize) -> u32 {
-        unsafe { (address as *const u32).read_volatile() }
-    }
-
-    fn read_u64(&self, address: usize) -> u64 {
-        unsafe { (address as *const u64).read_volatile() }
-    }
-
-    fn write_u8(&self, address: usize, value: u8) {
-        unsafe { (address as *mut u8).write_volatile(value) }
-    }
-
-    fn write_u16(&self, address: usize, value: u16) {
-        unsafe { (address as *mut u16).write_volatile(value) }
-    }
-
-    fn write_u32(&self, address: usize, value: u32) {
-        unsafe { (address as *mut u32).write_volatile(value) }
-    }
-
-    fn write_u64(&self, address: usize, value: u64) {
-        unsafe { (address as *mut u64).write_volatile(value) }
-    }
-
-    fn read_io_u8(&self, port: u16) -> u8 {
-        panic!("AArch64 ACPI system I/O read is unsupported for port {port:#x}")
-    }
-
-    fn read_io_u16(&self, port: u16) -> u16 {
-        panic!("AArch64 ACPI system I/O read is unsupported for port {port:#x}")
-    }
-
-    fn read_io_u32(&self, port: u16) -> u32 {
-        panic!("AArch64 ACPI system I/O read is unsupported for port {port:#x}")
-    }
-
-    fn write_io_u8(&self, port: u16, _value: u8) {
-        panic!("AArch64 ACPI system I/O write is unsupported for port {port:#x}")
-    }
-
-    fn write_io_u16(&self, port: u16, _value: u16) {
-        panic!("AArch64 ACPI system I/O write is unsupported for port {port:#x}")
-    }
-
-    fn write_io_u32(&self, port: u16, _value: u32) {
-        panic!("AArch64 ACPI system I/O write is unsupported for port {port:#x}")
-    }
-
-    fn read_pci_u8(&self, address: PciAddress, offset: u16) -> u8 {
-        panic!("AArch64 ACPI PCI config read is unsupported for {address:?} offset {offset:#x}")
-    }
-
-    fn read_pci_u16(&self, address: PciAddress, offset: u16) -> u16 {
-        panic!("AArch64 ACPI PCI config read is unsupported for {address:?} offset {offset:#x}")
-    }
-
-    fn read_pci_u32(&self, address: PciAddress, offset: u16) -> u32 {
-        panic!("AArch64 ACPI PCI config read is unsupported for {address:?} offset {offset:#x}")
-    }
-
-    fn write_pci_u8(&self, address: PciAddress, offset: u16, _value: u8) {
-        panic!("AArch64 ACPI PCI config write is unsupported for {address:?} offset {offset:#x}")
-    }
-
-    fn write_pci_u16(&self, address: PciAddress, offset: u16, _value: u16) {
-        panic!("AArch64 ACPI PCI config write is unsupported for {address:?} offset {offset:#x}")
-    }
-
-    fn write_pci_u32(&self, address: PciAddress, offset: u16, _value: u32) {
-        panic!("AArch64 ACPI PCI config write is unsupported for {address:?} offset {offset:#x}")
-    }
-
-    fn nanos_since_boot(&self) -> u64 {
-        ticks_to_nanos(read_counter(), self.timer_frequency)
-    }
-
-    fn stall(&self, microseconds: u64) {
-        let ticks = self.timer_frequency.saturating_mul(microseconds) / 1_000_000;
-        let deadline = read_counter().saturating_add(ticks);
-        while read_counter() < deadline {
-            core::hint::spin_loop();
-        }
-    }
-
-    fn sleep(&self, milliseconds: u64) {
-        self.stall(milliseconds.saturating_mul(1_000));
-    }
-
-    fn create_mutex(&self) -> acpi::Handle {
-        panic!("AML mutex creation is unsupported in the AArch64 ACPI handler")
-    }
-
-    fn acquire(&self, _mutex: acpi::Handle, _timeout: u16) -> Result<(), acpi::aml::AmlError> {
-        panic!("AML mutex acquisition is unsupported in the AArch64 ACPI handler")
-    }
-
-    fn release(&self, _mutex: acpi::Handle) {
-        panic!("AML mutex release is unsupported in the AArch64 ACPI handler")
-    }
 }
 
 fn kernel_virtual_to_physical(virtual_address: usize, handoff: &LimineBootHandoff) -> usize {
@@ -1329,10 +1380,7 @@ fn count_virtio_mmio_devices(fdt: &Fdt<'_>, expected: helios_virtio::DeviceType)
         .count()
 }
 
-fn discover_boot_entropy(
-    handoff: &LimineBootHandoff,
-    physical_memory_offset: usize,
-) -> Option<Aarch64BootEntropy> {
+fn discover_boot_entropy(handoff: &LimineBootHandoff) -> Option<Aarch64BootEntropy> {
     if let Some(fdt) = boot_fdt(handoff) {
         if let Some(chosen) = fdt.find_node("/chosen") {
             if let Some(seed) = chosen.property("rng-seed") {
@@ -1341,69 +1389,6 @@ fn discover_boot_entropy(
                     "AArch64 FDT /chosen/rng-seed",
                 )));
             }
-        }
-    }
-    if handoff.tables.acpi_rsdp.is_some() {
-        return discover_fw_cfg_boot_entropy(physical_memory_offset, handoff);
-    }
-    None
-}
-
-fn discover_fw_cfg_boot_entropy(
-    physical_memory_offset: usize,
-    handoff: &LimineBootHandoff,
-) -> Option<Aarch64BootEntropy> {
-    map_mmio_range(
-        QEMU_FW_CFG_MMIO_BASE,
-        QEMU_FW_CFG_MMIO_SIZE,
-        physical_memory_offset,
-        handoff,
-    );
-    let base = mmio_virtual_base(QEMU_FW_CFG_MMIO_BASE, physical_memory_offset);
-    let signature = fw_cfg_read_signature(base);
-    if signature != *b"QEMU" {
-        return None;
-    }
-    fw_cfg_read_seed_file(base).map(Aarch64BootEntropy::new)
-}
-
-fn fw_cfg_read_signature(base: usize) -> [u8; 4] {
-    fw_cfg_select(base, FW_CFG_SIGNATURE);
-    let mut signature = [0_u8; 4];
-    fw_cfg_read_exact(base, &mut signature);
-    signature
-}
-
-fn fw_cfg_read_seed_file(base: usize) -> Option<[u8; 32]> {
-    fw_cfg_select(base, FW_CFG_FILE_DIR);
-    let count = fw_cfg_read_be_u32(base);
-    assert!(
-        count <= 1024,
-        "AArch64 fw_cfg file directory has an implausible entry count"
-    );
-    let mut entry = [0_u8; FW_CFG_FILE_ENTRY_BYTES];
-    for _ in 0..count {
-        fw_cfg_read_exact(base, &mut entry);
-        let size = u32::from_be_bytes(
-            entry[0..4]
-                .try_into()
-                .unwrap_or_else(|_| panic!("fw_cfg size field had invalid width")),
-        );
-        let selector = u16::from_be_bytes(
-            entry[4..6]
-                .try_into()
-                .unwrap_or_else(|_| panic!("fw_cfg selector field had invalid width")),
-        );
-        let name = &entry[8..8 + FW_CFG_FILE_NAME_BYTES];
-        if fw_cfg_name_matches(name, FW_CFG_HELIOS_RNG_SEED) {
-            assert!(
-                size >= 32,
-                "AArch64 fw_cfg rng seed is shorter than 32 bytes"
-            );
-            fw_cfg_select(base, selector);
-            let mut seed = [0_u8; 32];
-            fw_cfg_read_exact(base, &mut seed);
-            return Some(seed);
         }
     }
     None
@@ -1416,35 +1401,6 @@ fn seed_from_slice(seed: &[u8], source: &str) -> [u8; 32] {
     key
 }
 
-fn fw_cfg_name_matches(name_field: &[u8], expected: &[u8]) -> bool {
-    if name_field.len() < expected.len() {
-        return false;
-    }
-    name_field[..expected.len()] == *expected
-        && name_field[expected.len()..]
-            .iter()
-            .copied()
-            .all(|byte| byte == 0)
-}
-
-fn fw_cfg_select(base: usize, selector: u16) {
-    unsafe {
-        ((base + FW_CFG_SELECTOR) as *mut u16).write_volatile(selector.to_be());
-    }
-}
-
-fn fw_cfg_read_be_u32(base: usize) -> u32 {
-    let mut bytes = [0_u8; 4];
-    fw_cfg_read_exact(base, &mut bytes);
-    u32::from_be_bytes(bytes)
-}
-
-fn fw_cfg_read_exact(base: usize, buffer: &mut [u8]) {
-    for byte in buffer {
-        *byte = unsafe { ((base + FW_CFG_DATA) as *const u8).read_volatile() };
-    }
-}
-
 #[derive(Clone, Copy)]
 struct DebugSerial {
     base: usize,
@@ -1452,10 +1408,8 @@ struct DebugSerial {
 
 impl DebugSerial {
     fn discover(handoff: &LimineBootHandoff, physical_memory_offset: usize) -> Self {
-        if let Some(fdt) = boot_fdt(handoff) {
-            return Self::discover_fdt(&fdt, physical_memory_offset, handoff);
-        }
-        Self::discover_acpi(required_acpi_rsdp(handoff), physical_memory_offset, handoff)
+        let fdt = boot_fdt(handoff).unwrap_or_else(|| panic!("{DEVICE_TREE_REQUIRED}"));
+        Self::discover_fdt(&fdt, physical_memory_offset, handoff)
     }
 
     fn discover_fdt(
@@ -1477,37 +1431,6 @@ impl DebugSerial {
         let size = fdt_cells_to_usize(region.size, "AArch64 PL011 reg size");
         assert!(size != 0, "AArch64 PL011 UART reg property has zero size");
         let physical_base = fdt_cells_to_usize(region.address, "AArch64 PL011 reg address");
-        map_mmio_page(physical_base, physical_memory_offset, handoff);
-        Self {
-            base: mmio_virtual_base(physical_base, physical_memory_offset),
-        }
-    }
-
-    fn discover_acpi(
-        rsdp_address: usize,
-        physical_memory_offset: usize,
-        handoff: &LimineBootHandoff,
-    ) -> Self {
-        let tables = acpi_tables(rsdp_address, physical_memory_offset);
-        let spcr = tables
-            .find_table::<Spcr>()
-            .unwrap_or_else(|| panic!("AArch64 ACPI platform did not expose an SPCR table"));
-        assert!(
-            matches!(spcr.interface_type(), SpcrInterfaceType::ArmPL011),
-            "AArch64 virt platform requires an SPCR Arm PL011 console, got {:?}",
-            spcr.interface_type()
-        );
-        let base = spcr
-            .base_address()
-            .unwrap_or_else(|| panic!("AArch64 ACPI SPCR did not provide a serial base address"))
-            .unwrap_or_else(|error| panic!("AArch64 ACPI SPCR serial base was invalid: {error:?}"));
-        assert!(
-            base.address_space == AddressSpace::SystemMemory,
-            "AArch64 ACPI SPCR serial base must be system memory, got {:?}",
-            base.address_space
-        );
-        let physical_base = usize::try_from(base.address)
-            .unwrap_or_else(|_| panic!("AArch64 ACPI SPCR serial base does not fit usize"));
         map_mmio_page(physical_base, physical_memory_offset, handoff);
         Self {
             base: mmio_virtual_base(physical_base, physical_memory_offset),
@@ -1587,22 +1510,6 @@ fn boot_fdt(handoff: &LimineBootHandoff) -> Option<Fdt<'static>> {
     })
 }
 
-fn required_acpi_rsdp(handoff: &LimineBootHandoff) -> usize {
-    handoff
-        .tables
-        .acpi_rsdp
-        .unwrap_or_else(|| panic!("Limine provided neither DTB nor ACPI RSDP for AArch64 virt"))
-}
-
-fn acpi_tables(
-    rsdp_address: usize,
-    physical_memory_offset: usize,
-) -> AcpiTables<Aarch64AcpiHandler> {
-    let handler = Aarch64AcpiHandler::new(physical_memory_offset);
-    unsafe { AcpiTables::from_rsdp(handler, rsdp_address) }
-        .unwrap_or_else(|error| panic!("AArch64 ACPI table discovery failed: {error:?}"))
-}
-
 fn physical_memory_offset() -> usize {
     HHDM_REQUEST
         .response()
@@ -1667,12 +1574,6 @@ fn limine_boot_handoff() -> LimineBootHandoff {
         firmware == FirmwareKind::Uefi64,
         "AArch64 backend requires Limine UEFI64 boot, got {firmware:?}"
     );
-    let physical_memory_offset = physical_memory_offset();
-    let acpi_rsdp = RSDP_REQUEST.response().map(|response| {
-        (response.address as usize)
-            .checked_sub(physical_memory_offset)
-            .unwrap_or_else(|| panic!("Limine RSDP address was outside the HHDM"))
-    });
     BootHandoff {
         memory_map,
         kernel: BootKernelImage {
@@ -1694,7 +1595,9 @@ fn limine_boot_handoff() -> LimineBootHandoff {
         },
         firmware,
         tables: BootFirmwareTables {
-            acpi_rsdp,
+            // The aarch64 platform is driven entirely from the device
+            // tree; the kernel never asks Limine for ACPI tables.
+            acpi_rsdp: None,
             device_tree_blob: DEVICE_TREE_BLOB_REQUEST
                 .response()
                 .map(|response| response.dtb_ptr as usize),
