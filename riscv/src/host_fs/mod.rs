@@ -215,7 +215,8 @@ fn discover_9p_device(
     let header = core::ptr::NonNull::new(base as *mut u8)
         .unwrap_or_else(|| panic!("virtio MMIO base {base:#x} was unexpectedly null"));
     let irq_source = candidate
-        .irq
+        .interrupt
+        .and_then(|interrupt| core::num::NonZeroU32::new(interrupt.number))
         .map(InterruptSourceId)
         .unwrap_or_else(|| panic!("virtio-9p node at {base:#x} has no valid interrupt source"));
     let device =
