@@ -49,6 +49,7 @@ pub(crate) const WIT_PACKAGES: &[(&str, &str)] = &[
         "wasi:sockets",
         include_str!("../../../../wit/deps/sockets.wit"),
     ),
+    ("wasi:http", include_str!("../../../../wit/deps/http.wit")),
 ];
 
 pub(crate) fn add_to_linker<CpuImpl, HostFs>(
@@ -90,14 +91,8 @@ where
         )?;
     }
     if imports.has("wasi:cli/exit", "0.3") {
-        // `exit-with-code` is gated behind the `cli-exit-with-code`
-        // unstable feature; without opting in, a component importing it
-        // fails instantiation even though the interface is linked.
-        let mut options = wasi::cli::exit::LinkOptions::default();
-        options.cli_exit_with_code(true);
         wasi::cli::exit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, HostFs>>>(
             linker,
-            &options,
             |state| state,
         )?;
     }
@@ -201,17 +196,17 @@ mod tests {
     use super::WIT_PACKAGES;
 
     #[test]
-    fn preview3_wit_packages_use_expected_rc_version() {
+    fn preview3_wit_packages_use_expected_release_version() {
         for (package, wit) in WIT_PACKAGES {
             let expected = {
                 let mut expected = String::from("package ");
                 expected.push_str(package);
-                expected.push_str("@0.3.0-rc-2026-03-15;");
+                expected.push_str("@0.3.0;");
                 expected
             };
             assert!(
                 wit.lines().any(|line| line.trim() == expected),
-                "preview3 WIT package {package} does not declare @0.3.0-rc-2026-03-15"
+                "preview3 WIT package {package} does not declare @0.3.0"
             );
         }
     }

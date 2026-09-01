@@ -64,10 +64,13 @@ Do not submit replacement patches for those upstream implementations.
 
 Helios Preview 3 linker bindings are generated from the repository's own
 `wit/` contract, not from Wasmtime's sibling `crates/wasi/src/p3/wit` tree.
-This is intentional: Helios and the pinned Rust WASI adapter currently use
-`0.3.0-rc-2026-03-15`, while this Wasmtime revision's bundled Preview 3 WIT is
-`0.3.0`. Reading the sibling WIT silently produces a linker with incompatible
-package identities.
+This is intentional: the repository's `wit/` tree is the single source of
+truth shared by the kernel linker and by every guest (`helios-api` generates
+from the same directory), so the two halves can never drift into
+incompatible package identities. The files currently track the released
+`0.3.0` packages plus `wasi:http@0.3.0`; refresh them from Wasmtime's
+`crates/wasi/src/p3/wit/deps` and `crates/wasi-http/src/p3/wit/deps` when the
+vendored revision moves, rather than pointing bindgen at the sibling tree.
 
 ## Runtime-performance context
 
