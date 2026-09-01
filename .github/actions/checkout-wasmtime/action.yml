@@ -1,0 +1,19 @@
+name: Checkout the pinned Wasmtime tree
+description: >-
+  Checks out the vendored Helios Wasmtime snapshot that the workspace's
+  `../wasmtime` path dependency builds against, next to the `helios/`
+  checkout. The pin lives here so every workflow resolves the same tree;
+  update it together with docs/wasmtime.md.
+inputs:
+  path:
+    description: Directory to check the tree out into, relative to the workspace.
+    required: false
+    default: wasmtime
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v4
+      with:
+        repository: lexoliu/wasmtime
+        ref: b83d18c8558b6d32fb0c0727d1c6a32639842c49
+        path: ${{ inputs.path }}
