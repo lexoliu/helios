@@ -15,10 +15,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Pinned snapshot of the modified Wasmtime tree the workspace's
-  # `../wasmtime` path dependency builds against (docs/wasmtime.md).
-  WASMTIME_REPOSITORY: lexoliu/wasmtime
-  WASMTIME_REF: b83d18c8558b6d32fb0c0727d1c6a32639842c49
 
 jobs:
   checks:
@@ -43,11 +39,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: helios
-      - uses: actions/checkout@v4
-        with:
-          repository: ${{ env.WASMTIME_REPOSITORY }}
-          ref: ${{ env.WASMTIME_REF }}
-          path: wasmtime
+      - uses: ./helios/.github/actions/checkout-wasmtime
       - name: Install host dependencies
         run: |
           sudo apt-get update
@@ -114,11 +106,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: helios
-      - uses: actions/checkout@v4
-        with:
-          repository: ${{ env.WASMTIME_REPOSITORY }}
-          ref: ${{ env.WASMTIME_REF }}
-          path: wasmtime
+      - uses: ./helios/.github/actions/checkout-wasmtime
       - name: Install host dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -221,11 +209,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: helios
-      - uses: actions/checkout@v4
-        with:
-          repository: ${{ env.WASMTIME_REPOSITORY }}
-          ref: ${{ env.WASMTIME_REF }}
-          path: wasmtime
+      - uses: ./helios/.github/actions/checkout-wasmtime
       - name: Install host dependencies
         run: |
           sudo apt-get update
