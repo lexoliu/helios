@@ -266,6 +266,7 @@ if [[ "${HELIOS_WASI_SMOKE_CURL:-0}" == "1" ]]; then
         --boot-program dash \
         --boot-program debugger \
         --boot-program curl \
+        --boot-program http-client \
         --no-compiler-plugin \
         shell \
         -c \

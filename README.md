@@ -12,7 +12,9 @@ hardware support lives in thin adaptation crates.
 - **WASI Preview 3 as the syscall surface.** System services
   (`helios:system/programs`, `net`, `stats`, `tracing`, `sync`, `serial`,
   `instances`) are defined as WIT interfaces first, then implemented against
-  Rust traits inside the kernel.
+  Rust traits inside the kernel. Every Phase 3 WASI proposal is served:
+  `wasi:cli`, `clocks`, `filesystem`, `random`, `sockets` in the kernel, and
+  `wasi:http` through the `http-client` kernel plugin.
 - **Architecture-neutral kernel.** `helios-kernel` is `#![no_std]` and generic
   over a `Cpu` implementation supplied by the backend crate. No `#[cfg(target_arch)]`
   branches leak into core logic.
