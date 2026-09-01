@@ -1,13 +1,18 @@
 use std::fs::File;
 use std::io::{self, Write};
 
-use helios_api::net::{DEFAULT_READ_CHUNK_BYTES, TcpStream};
-use http::Uri;
+use helios_api::ReadExt;
+use helios_api::http::{ErrorCode, Request, UrlError};
 use thiserror::Error;
 
 type Result<T> = core::result::Result<T, CurlError>;
 
 const NULL_DEVICE_PATH: &str = "/dev/null";
+
+/// Bytes taken from the response body per write.
+const BODY_CHUNK_BYTES: usize = 64 * 1024;
+
+const USER_AGENT: &str = "helios-curl/0.1";
 
 #[derive(Debug, Error)]
 enum CurlError {
@@ -19,31 +24,24 @@ enum CurlError {
     UnsupportedOption(String),
     #[error("multiple URLs were provided")]
     MultipleUrls,
-    #[error("invalid URL `{raw}`")]
+    #[error("invalid URL `{raw}`: {source}")]
     InvalidUrl {
         raw: String,
         #[source]
-        source: http::uri::InvalidUri,
+        source: UrlError,
     },
-    #[error("only http:// is supported")]
-    UnsupportedScheme,
-    #[error("URL must include a host")]
-    MissingHost,
-    #[error("tcp connect failed for {host}:{port}: {source}")]
-    TcpConnect {
-        host: String,
-        port: u16,
-        #[source]
-        source: io::Error,
-    },
-    #[error("failed to write request")]
-    WriteRequest(#[source] io::Error),
+    #[error("failed to set the user agent header: {0}")]
+    UserAgent(helios_api::http::HeaderError),
+    #[error("http request failed: {0}")]
+    Request(ErrorCode),
     #[error("failed to read response after {bytes_read} bytes: {source}")]
     ReadResponse {
         bytes_read: usize,
         #[source]
         source: io::Error,
     },
+    #[error("response body did not complete: {0}")]
+    IncompleteResponse(ErrorCode),
     #[error("failed to write response body")]
     WriteResponseBody(#[source] io::Error),
     #[error("failed to create output file `{path}`")]
@@ -54,18 +52,6 @@ enum CurlError {
     },
     #[error("unsupported write-out variable in `{0}`")]
     UnsupportedWriteOut(String),
-    #[error("invalid chunked response: missing chunk-size line ending")]
-    MissingChunkSizeLineEnding,
-    #[error("invalid chunked response: chunk-size line was not utf-8")]
-    ChunkSizeUtf8(#[source] core::str::Utf8Error),
-    #[error("invalid chunked response: missing chunk-size")]
-    MissingChunkSize,
-    #[error("invalid chunked response: invalid chunk-size")]
-    InvalidChunkSize(#[source] core::num::ParseIntError),
-    #[error("invalid chunked response: truncated chunk payload")]
-    TruncatedChunkPayload,
-    #[error("invalid chunked response: missing chunk payload terminator")]
-    MissingChunkTerminator,
 }
 
 struct CurlOptions {
@@ -141,113 +127,6 @@ fn parse_options() -> Result<CurlOptions> {
     })
 }
 
-fn header_end(response: &[u8]) -> Option<usize> {
-    response.windows(4).position(|window| window == b"\r\n\r\n")
-}
-
-fn chunked_transfer(headers: &[u8]) -> bool {
-    headers
-        .windows(b"transfer-encoding: chunked".len())
-        .any(|window| {
-            window
-                .iter()
-                .zip(b"transfer-encoding: chunked")
-                .all(|(left, right)| left.eq_ignore_ascii_case(right))
-        })
-}
-
-fn decode_chunked(mut body: &[u8]) -> Result<Vec<u8>> {
-    let mut decoded = Vec::new();
-
-    loop {
-        let line_end = body
-            .windows(2)
-            .position(|window| window == b"\r\n")
-            .ok_or(CurlError::MissingChunkSizeLineEnding)?;
-        let size_line =
-            core::str::from_utf8(&body[..line_end]).map_err(CurlError::ChunkSizeUtf8)?;
-        let size_hex = size_line
-            .split(';')
-            .next()
-            .ok_or(CurlError::MissingChunkSize)?
-            .trim();
-        let chunk_size =
-            usize::from_str_radix(size_hex, 16).map_err(CurlError::InvalidChunkSize)?;
-
-        body = &body[line_end + 2..];
-        if chunk_size == 0 {
-            break;
-        }
-        if body.len() < chunk_size + 2 {
-            return Err(CurlError::TruncatedChunkPayload);
-        }
-
-        decoded.extend_from_slice(&body[..chunk_size]);
-        if &body[chunk_size..chunk_size + 2] != b"\r\n" {
-            return Err(CurlError::MissingChunkTerminator);
-        }
-        body = &body[chunk_size + 2..];
-    }
-
-    Ok(decoded)
-}
-
-async fn read_response_body(stream: &TcpStream, output: &mut OutputTarget) -> Result<usize> {
-    let mut buffered = Vec::new();
-    let header_split = loop {
-        let Some(bytes) = stream
-            .read(DEFAULT_READ_CHUNK_BYTES)
-            .await
-            .map_err(|source| CurlError::ReadResponse {
-                bytes_read: buffered.len(),
-                source,
-            })?
-        else {
-            output.write_body(&buffered)?;
-            return Ok(buffered.len());
-        };
-        buffered.extend_from_slice(&bytes);
-        if let Some(header_split) = header_end(&buffered) {
-            break header_split;
-        }
-    };
-
-    let body_start = header_split + 4;
-    let headers = buffered[..header_split].to_vec();
-    let mut body = buffered.split_off(body_start);
-    if chunked_transfer(&headers) {
-        while let Some(bytes) = stream
-            .read(DEFAULT_READ_CHUNK_BYTES)
-            .await
-            .map_err(|source| CurlError::ReadResponse {
-                bytes_read: body.len(),
-                source,
-            })?
-        {
-            body.extend_from_slice(&bytes);
-        }
-        let decoded = decode_chunked(&body)?;
-        let size = decoded.len();
-        output.write_body(&decoded)?;
-        return Ok(size);
-    }
-
-    let mut size = body.len();
-    output.write_body(&body)?;
-    while let Some(bytes) = stream
-        .read(DEFAULT_READ_CHUNK_BYTES)
-        .await
-        .map_err(|source| CurlError::ReadResponse {
-            bytes_read: size,
-            source,
-        })?
-    {
-        size += bytes.len();
-        output.write_body(&bytes)?;
-    }
-    Ok(size)
-}
-
 fn write_out(template: &str, size_download: usize) -> Result<()> {
     let rendered = template.replace("%{size_download}", &size_download.to_string());
     if rendered.contains("%{") {
@@ -262,38 +141,40 @@ fn write_out(template: &str, size_download: usize) -> Result<()> {
 
 async fn run() -> Result<()> {
     let mut options = parse_options()?;
-    let uri: Uri = options
-        .url
-        .parse()
-        .map_err(|source| CurlError::InvalidUrl {
-            raw: options.url.clone(),
-            source,
-        })?;
-    if uri.scheme_str() != Some("http") {
-        return Err(CurlError::UnsupportedScheme);
+    let request = Request::get(&options.url).map_err(|source| CurlError::InvalidUrl {
+        raw: options.url.clone(),
+        source,
+    })?;
+    let response = request
+        .header("user-agent", USER_AGENT)
+        .map_err(CurlError::UserAgent)?
+        .send()
+        .await
+        .map_err(CurlError::Request)?;
+
+    let mut body = response.into_body();
+    let mut buffer = vec![0_u8; BODY_CHUNK_BYTES];
+    let mut size_download = 0_usize;
+    loop {
+        let read = body
+            .read(&mut buffer)
+            .await
+            .map_err(|source| CurlError::ReadResponse {
+                bytes_read: size_download,
+                source,
+            })?;
+        if read == 0 {
+            break;
+        }
+        size_download += read;
+        options.output.write_body(&buffer[..read])?;
     }
-    let authority = uri.authority().ok_or(CurlError::MissingHost)?;
-    let host = authority.host();
-    let port = authority.port_u16().unwrap_or(80);
-    let target = uri.path_and_query().map_or("/", |path| path.as_str());
-    let host_header = authority.as_str();
-
-    let stream = TcpStream::connect(host, port)
+    // The stream closing means the transfer stopped, not that it succeeded;
+    // the trailers future carries the verdict.
+    body.trailers()
         .await
-        .map_err(|source| CurlError::TcpConnect {
-            host: host.to_owned(),
-            port,
-            source,
-        })?;
-    let request = format!(
-        "GET {target} HTTP/1.1\r\nHost: {host_header}\r\nUser-Agent: helios-curl/0.1\r\nConnection: close\r\n\r\n"
-    );
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .map_err(CurlError::WriteRequest)?;
+        .map_err(CurlError::IncompleteResponse)?;
 
-    let size_download = read_response_body(&stream, &mut options.output).await?;
     if let Some(template) = options.write_out.as_deref() {
         write_out(template, size_download)?;
     }
