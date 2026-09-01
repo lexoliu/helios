@@ -619,6 +619,24 @@ impl WasiResponse {
             body: WasiBody::Host { body },
         }
     }
+
+    /// Move a response the plugin just produced out of the plugin's store and
+    /// onto kernel channels, ready to travel back to the calling program.
+    pub(crate) fn into_host_response<T, CpuImpl, HostFs>(
+        self,
+        access: &mut Access<'_, T, HasSelf<StoreData<CpuImpl, HostFs>>>,
+    ) -> Result<HttpResponse>
+    where
+        T: 'static,
+        CpuImpl: Cpu + Clone,
+        HostFs: crate::HostFileSystem,
+    {
+        let Self { head, body } = self;
+        Ok(HttpResponse {
+            head,
+            body: body.into_host(access)?,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

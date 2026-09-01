@@ -44,6 +44,6 @@ mod generated {
     });
 }
 
+pub(crate) use self::generated::HttpHost;
 pub(crate) use self::generated::exports;
 pub(crate) use self::generated::wasi::http;
-pub(crate) use self::generated::{HttpHost, HttpHostPre};
