@@ -9,6 +9,7 @@ use std::io;
 /// Result alias used across the SDK's I/O surfaces.
 pub type Result<T> = io::Result<T>;
 
+#[cfg(feature = "fs")]
 pub fn missing_root_directory() -> io::Error {
     io::Error::new(
         io::ErrorKind::NotFound,
@@ -16,6 +17,7 @@ pub fn missing_root_directory() -> io::Error {
     )
 }
 
+#[cfg(feature = "fs")]
 pub fn parent_traversal(path: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
@@ -23,6 +25,7 @@ pub fn parent_traversal(path: &str) -> io::Error {
     )
 }
 
+#[cfg(feature = "fs")]
 pub fn non_utf8_path(path: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
@@ -30,6 +33,7 @@ pub fn non_utf8_path(path: &str) -> io::Error {
     )
 }
 
+#[cfg(feature = "fs")]
 pub fn filesystem(
     path: &str,
     code: crate::bindings::wasi::filesystem::types::ErrorCode,
@@ -52,6 +56,7 @@ pub fn stdin(code: crate::bindings::wasi::cli::types::ErrorCode) -> io::Error {
     io::Error::other(format!("stdin read failed: {code:?}"))
 }
 
+#[cfg(feature = "fs")]
 pub fn invalid_utf8(path: &str, error: std::string::FromUtf8Error) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -59,6 +64,7 @@ pub fn invalid_utf8(path: &str, error: std::string::FromUtf8Error) -> io::Error 
     )
 }
 
+#[cfg(feature = "fs")]
 pub fn file_too_large(path: &str, size: u64) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,

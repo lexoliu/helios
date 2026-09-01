@@ -159,7 +159,6 @@ impl Child {
 }
 
 async fn drain_stream(pair: (StreamReader<u8>, FutureReader<Result<(), ()>>)) -> Vec<u8> {
-    use crate::wit_bindgen::rt::async_support::StreamResult;
     let (mut stream, future) = pair;
     let mut collected = Vec::new();
     const CHUNK: usize = 16 * 1024;
@@ -169,10 +168,7 @@ async fn drain_stream(pair: (StreamReader<u8>, FutureReader<Result<(), ()>>)) ->
         if !chunk.is_empty() {
             collected.extend_from_slice(&chunk);
         }
-        if matches!(
-            result,
-            StreamResult::Dropped | StreamResult::Cancelled | StreamResult::Complete(0)
-        ) {
+        if crate::stream_closed(result) {
             break;
         }
     }
