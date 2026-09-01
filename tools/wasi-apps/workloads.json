@@ -185,7 +185,8 @@
         "{host_http_url}"
       ],
       "boot_programs": [
-        "curl"
+        "curl",
+        "http-client"
       ],
       "stdout_contains": [
         "helios-linux-gap:ok"
@@ -304,7 +305,8 @@
         "{host_http_large_url}"
       ],
       "boot_programs": [
-        "curl"
+        "curl",
+        "http-client"
       ],
       "stdout_contains": [
         "curl-http-throughput:67108864"
