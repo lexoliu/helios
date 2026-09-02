@@ -1763,7 +1763,10 @@ where
         let shared_memory = compiler_shared_memory(engine, &module)?;
         let shared = Arc::new(CompilerCoreShared {
             memory: shared_memory.clone(),
-            entropy: Mutex::new(crate::EntropyPool::from_cpu(&exec_context.cpu, 0)),
+            entropy: Mutex::new(crate::EntropyPool::derive(
+                exec_context.runtime_state.root_entropy(),
+                0,
+            )),
             instance_pre: spin::Once::new(),
             next_thread_id: AtomicI32::new(0),
             thread_tasks: Mutex::new(Vec::new()),
@@ -2727,7 +2730,9 @@ mod tests {
             Preview1Descriptor::Socket(WasixSocketDescriptor::Tcp(WasixTcpSocket::Connected {
                 family: WasixSocketFamily::Ipv4,
                 stream: 1,
-                peer_address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1])),
+                peer_address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([
+                    127, 0, 0, 1,
+                ])),
                 peer_port: 80,
                 options: WasixSocketOptions::default(),
             }));
@@ -3152,7 +3157,7 @@ mod tests {
     #[test]
     fn wasix_socket_size_options_are_descriptor_local_state() {
         let mut descriptor = WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
-                family: WasixSocketFamily::Ipv4,
+            family: WasixSocketFamily::Ipv4,
             options: WasixSocketOptions::default(),
         });
 
@@ -3220,7 +3225,7 @@ mod tests {
     #[test]
     fn wasix_socket_flag_options_are_descriptor_local_state() {
         let mut descriptor = WasixSocketDescriptor::Udp(WasixUdpSocket::Unbound {
-                family: WasixSocketFamily::Ipv4,
+            family: WasixSocketFamily::Ipv4,
             options: WasixSocketOptions::default(),
         });
 
@@ -3274,7 +3279,7 @@ mod tests {
     #[test]
     fn wasix_socket_rejects_flags_the_netstack_cannot_honour() {
         let mut descriptor = WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
-                family: WasixSocketFamily::Ipv4,
+            family: WasixSocketFamily::Ipv4,
             options: WasixSocketOptions::default(),
         });
 
@@ -3322,7 +3327,7 @@ mod tests {
     #[test]
     fn wasix_socket_size_options_clamp_to_netstack_capacity() {
         let mut descriptor = WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
-                family: WasixSocketFamily::Ipv4,
+            family: WasixSocketFamily::Ipv4,
             options: WasixSocketOptions::default(),
         });
 
@@ -3352,10 +3357,15 @@ mod tests {
             p1::errno::INVAL
         );
         assert_eq!(
-            descriptor.options_mut().set_size(WASIX_SOCK_OPTION_TTL, 256),
+            descriptor
+                .options_mut()
+                .set_size(WASIX_SOCK_OPTION_TTL, 256),
             p1::errno::INVAL
         );
-        assert_eq!(descriptor.options().hop_limit(), DEFAULT_WASIX_SOCKET_TTL as u8);
+        assert_eq!(
+            descriptor.options().hop_limit(),
+            DEFAULT_WASIX_SOCKET_TTL as u8
+        );
         assert_eq!(
             descriptor.options_mut().set_size(WASIX_SOCK_OPTION_TTL, 9),
             p1::errno::SUCCESS
@@ -3380,7 +3390,7 @@ mod tests {
     #[test]
     fn wasix_socket_time_options_are_descriptor_local_state() {
         let mut descriptor = WasixSocketDescriptor::Tcp(WasixTcpSocket::Unconnected {
-                family: WasixSocketFamily::Ipv4,
+            family: WasixSocketFamily::Ipv4,
             options: WasixSocketOptions::default(),
         });
 

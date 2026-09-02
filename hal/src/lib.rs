@@ -89,6 +89,8 @@ pub struct DeviceInventory {
     pub has_network: bool,
     pub block_device_count: usize,
     pub has_host_share: bool,
+    /// A hardware entropy device the kernel can read continuously.
+    pub has_entropy_device: bool,
 }
 
 impl DeviceInventory {
@@ -98,6 +100,7 @@ impl DeviceInventory {
             has_network: false,
             block_device_count: 0,
             has_host_share: false,
+            has_entropy_device: false,
         }
     }
 
@@ -125,6 +128,13 @@ impl DeviceInventory {
     pub const fn with_host_share(self) -> Self {
         Self {
             has_host_share: true,
+            ..self
+        }
+    }
+
+    pub const fn with_entropy_device(self) -> Self {
+        Self {
+            has_entropy_device: true,
             ..self
         }
     }

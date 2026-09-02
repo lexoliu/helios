@@ -14,23 +14,26 @@ pub trait ExternalInterruptHandler {
     fn handle_interrupt(&self);
 }
 
-/// Maps claimed interrupt sources to the network and host-fs handlers a
-/// backend registered at boot.
-pub struct ExternalInterruptRoutes<Source, Network, HostFs> {
+/// Maps claimed interrupt sources to the device handlers a backend
+/// registered at boot.
+pub struct ExternalInterruptRoutes<Source, Network, HostFs, Entropy> {
     network: Option<(Source, Network)>,
     host_fs: Option<(Source, HostFs)>,
+    entropy: Option<(Source, Entropy)>,
 }
 
-impl<Source, Network, HostFs> ExternalInterruptRoutes<Source, Network, HostFs>
+impl<Source, Network, HostFs, Entropy> ExternalInterruptRoutes<Source, Network, HostFs, Entropy>
 where
     Source: PartialEq + Copy,
     Network: ExternalInterruptHandler,
     HostFs: ExternalInterruptHandler,
+    Entropy: ExternalInterruptHandler,
 {
     pub const fn new() -> Self {
         Self {
             network: None,
             host_fs: None,
+            entropy: None,
         }
     }
 
@@ -50,6 +53,14 @@ where
         self.host_fs = Some((source, handler));
     }
 
+    pub fn set_entropy(&mut self, source: Source, handler: Entropy) {
+        assert!(
+            self.entropy.is_none(),
+            "entropy interrupt route was installed more than once"
+        );
+        self.entropy = Some((source, handler));
+    }
+
     /// Dispatches a claimed source to its handler. Returns false when no
     /// route matches so the backend can fail fast with controller
     /// context in the message.
@@ -67,15 +78,23 @@ where
                 return true;
             }
         }
+        if let Some((registered, handler)) = &self.entropy {
+            if *registered == source {
+                handler.handle_interrupt();
+                return true;
+            }
+        }
         false
     }
 }
 
-impl<Source, Network, HostFs> Default for ExternalInterruptRoutes<Source, Network, HostFs>
+impl<Source, Network, HostFs, Entropy> Default
+    for ExternalInterruptRoutes<Source, Network, HostFs, Entropy>
 where
     Source: PartialEq + Copy,
     Network: ExternalInterruptHandler,
     HostFs: ExternalInterruptHandler,
+    Entropy: ExternalInterruptHandler,
 {
     fn default() -> Self {
         Self::new()

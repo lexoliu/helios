@@ -4,10 +4,6 @@ pub(crate) fn random_len(len: u64) -> Result<usize> {
     usize::try_from(len).map_err(|_| wasmtime::Error::new(WasiAdapterTrap::RandomLengthOverflow))
 }
 
-pub(crate) fn entropy_error(error: crate::EntropyError) -> wasmtime::Error {
-    wasmtime::Error::new(error)
-}
-
 pub struct TerminalInput;
 pub struct TerminalOutput;
 impl<CpuImpl, HostFs> wasi::clocks::monotonic_clock::Host for StoreData<CpuImpl, HostFs>
@@ -342,12 +338,12 @@ where
     fn get_random_bytes(&mut self, len: u64) -> Result<Vec<u8>> {
         let len = random_len(len)?;
         let mut bytes = vec![0_u8; len];
-        self.fill_secure_random(&mut bytes).map_err(entropy_error)?;
+        self.fill_secure_random(&mut bytes);
         Ok(bytes)
     }
 
     fn get_random_u64(&mut self) -> Result<u64> {
-        self.secure_random_u64().map_err(entropy_error)
+        Ok(self.secure_random_u64())
     }
 }
 
