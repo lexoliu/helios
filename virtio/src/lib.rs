@@ -34,7 +34,7 @@ pub use features::{NegotiatedFeatures, RING_FEATURES, negotiate, negotiate_with}
 pub use mmio::{
     VirtioMmio9pDevice, VirtioMmioBlockDevice, VirtioMmioNetDevice, VirtioMmioRngDevice,
     block_from_mmio, net_from_mmio, net_from_mmio_with_dma, p9_from_mmio, p9_from_mmio_with_dma,
-    rng_from_mmio,
+    rng_from_mmio, rng_from_mmio_with_dma,
 };
 pub use net::{
     RxFrame, TxChecksumMeta, TxFrame, TxFrameDescriptor, TxScatterFrame, VirtioNetDevice,

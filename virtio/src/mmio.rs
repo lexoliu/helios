@@ -107,3 +107,23 @@ pub unsafe fn rng_from_mmio(
     let transport = VirtioMmioTransport::new(bus)?;
     VirtioRngDevice::new(transport)
 }
+
+/// Builds a VirtIO entropy device on a bus whose DMA addresses are
+/// translated, such as a backend running behind a physical-memory
+/// offset map.
+///
+/// # Safety
+///
+/// Same as [`rng_from_mmio`].
+pub unsafe fn rng_from_mmio_with_dma<P>(
+    header: NonNull<u8>,
+    mmio_size: usize,
+    dma: P,
+) -> IoResult<VirtioRngDevice<VirtioMmioTransport<MmioBus<P>>>>
+where
+    P: DmaPool,
+{
+    let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
+    let transport = VirtioMmioTransport::new(bus)?;
+    VirtioRngDevice::new(transport)
+}
