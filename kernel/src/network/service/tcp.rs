@@ -905,12 +905,7 @@ where
             .unwrap_or(operation_deadline_nanos)
             .min(operation_deadline_nanos);
         let timer_wait = Duration::from_nanos(next_deadline.saturating_sub(now_nanos));
-        let wait = if self.inner.device.capabilities().events.interrupts {
-            timer_wait
-        } else {
-            timer_wait.min(NETWORK_PROGRESS_WAIT)
-        };
-        self.wait_for_progress(wait).await;
+        self.wait_for_progress(self.progress_wait(timer_wait)).await;
     }
 
     pub(super) fn record_tcp_read_progress(

@@ -581,7 +581,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
 
     pub fn handle_interrupt(&self) {
         self.transport.ack_interrupt();
-        self.interrupts.notify_one();
+        self.interrupts.notify_all();
     }
 
     /// Whether VIRTIO_NET_F_CSUM was negotiated, allowing frames with

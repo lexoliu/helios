@@ -724,6 +724,44 @@ where
             .for_each(|state| self.inner.control.synchronize_shard(state));
     }
 
+    /// The wait the packet pump takes when a poll round found nothing.
+    ///
+    /// The pump has no caller deadline, but it does own the stack's
+    /// timer duties — DHCP retransmission, TCP retransmit and
+    /// delayed-ACK deadlines — so an interrupt-driven device still needs
+    /// the wait bounded by the soonest of them. Left purely
+    /// event-driven, a lost DHCP reply would never be retransmitted,
+    /// because the wake that would drive the retransmit is the reply
+    /// that never came.
+    fn pump_wait(&self) -> Duration {
+        let now = self.now_nanos();
+        let next_stack_deadline = self
+            .inner
+            .state
+            .min_tcp_deadline_nanos()
+            .map_or(DHCP_RETRANSMIT_NANOS, |deadline| {
+                deadline.saturating_sub(now).min(DHCP_RETRANSMIT_NANOS)
+            });
+        self.progress_wait(Duration::from_nanos(next_stack_deadline))
+    }
+
+    /// The wait to hand [`Self::wait_for_progress`] for a caller that
+    /// owns a bound of its own — an operation deadline, a retransmit
+    /// interval, the next protocol timer.
+    ///
+    /// An interrupt-driven device wakes the wait the moment it makes
+    /// progress, so the timer only has to cover the caller's own bound.
+    /// A polling-only device has nothing to wake it, so the wait is cut
+    /// into polling-cadence slices and the caller re-drives the device
+    /// on each one.
+    fn progress_wait(&self, bound: Duration) -> Duration {
+        if self.inner.device.capabilities().events.interrupts {
+            bound
+        } else {
+            bound.min(NETWORK_PROGRESS_WAIT)
+        }
+    }
+
     async fn wait_for_progress(&self, duration: Duration) {
         if duration.is_zero() {
             return;
