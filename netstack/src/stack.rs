@@ -16,10 +16,11 @@ use crate::{
     Icmpv4Packet, Icmpv6DestinationUnreachableCode, Icmpv6Packet, IpAddress, IpCidr, Ipv4Address,
     Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6DnsServers, Ipv6Packet,
     Ipv6RouterConfiguration, Ipv6Scope, NeighborDiscovery, PacketBuffer, RxChecksumReport, RxFrame,
-    RxFrameOffload, StackError, TcpEndpoint, TcpFlags, TcpHeader, TcpHeaderOptions, TcpPacket,
-    TcpReceiveBuffer, TcpSocket, TcpTransmitSegment, TransportChecksum, TxChecksum, TxFrameRef,
-    UdpPacket, icmpv6_checksum_valid, interpret_router_advertisement, ipv4_checksum,
-    partial_transport_checksum_completes, tcp_checksum_valid, udp_checksum_valid,
+    RxFrameOffload, SegmentationOffload, StackError, TcpEndpoint, TcpFlags, TcpHeader,
+    TcpHeaderOptions, TcpPacket, TcpReceiveBuffer, TcpSegmentBudget, TcpSocket, TcpTransmitSegment,
+    TransportChecksum, TxChecksum, TxFrameRef, TxSegmentation, UdpPacket, icmpv6_checksum_valid,
+    interpret_router_advertisement, ipv4_checksum, partial_transport_checksum_completes,
+    tcp_checksum_valid, udp_checksum_valid,
 };
 
 pub const MAX_ROUTES: usize = 32;
@@ -108,6 +109,18 @@ pub struct StackConfig {
     /// place). Requires tx_checksum_offload and a device whose DMA can
     /// read borrowed packet bytes.
     pub zero_copy_tx: bool,
+    /// Segmentation offload the embedding kernel enabled for this
+    /// interface.
+    ///
+    /// With a TCP segmentation family on, the send path coalesces the
+    /// MSS-sized segments it would have emitted one at a time into a
+    /// single oversized frame carrying
+    /// [`TxSegmentation`](crate::TxSegmentation) metadata, and the
+    /// device splits it back up. This is a framing decision taken at
+    /// transmit time only: the socket's in-flight queue still holds one
+    /// record per MSS-sized segment, so retransmission, SACK, and loss
+    /// recovery address exactly the segments the peer sees.
+    pub segmentation: SegmentationOffload,
 }
 
 /// Byte offset of the checksum field inside a TCP header.
@@ -124,6 +137,13 @@ enum TcpTxPayload<'a> {
     /// Payload stays in its refcounted buffer and is attached to the
     /// frame for in-place device reads.
     Scatter(&'a Bytes),
+    /// Several MSS-sized wire segments coalesced into one buffer for
+    /// the device to split. Always scatter: an oversized burst does not
+    /// fit a packet buffer.
+    Segmented {
+        payload: &'a Bytes,
+        segment_bytes: u16,
+    },
 }
 
 impl TcpTxPayload<'_> {
@@ -131,11 +151,31 @@ impl TcpTxPayload<'_> {
         match self {
             Self::Flat(bytes) => bytes.len(),
             Self::Scatter(bytes) => bytes.len(),
+            Self::Segmented { payload, .. } => payload.len(),
         }
     }
 
     fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Payload bytes of the largest packet this frame puts on the wire.
+    /// A coalesced burst is checked against the path MTU per wire
+    /// segment, because that is what the device emits.
+    fn wire_segment_len(&self) -> usize {
+        match self {
+            Self::Segmented { segment_bytes, .. } => usize::from(*segment_bytes),
+            other => other.len(),
+        }
+    }
+
+    /// The refcounted payload a scatter-capable transmit path attaches
+    /// to the frame.
+    fn scatter_bytes(&self) -> Option<&Bytes> {
+        match self {
+            Self::Flat(_) => None,
+            Self::Scatter(payload) | Self::Segmented { payload, .. } => Some(payload),
+        }
     }
 }
 /// Byte offset of the checksum field inside a UDP header.
@@ -161,6 +201,7 @@ impl StackConfig {
             rx_checksum_offload: RxChecksumOffload::none(),
             tx_checksum_offload: false,
             zero_copy_tx: false,
+            segmentation: SegmentationOffload::none(),
         }
     }
 
@@ -176,6 +217,11 @@ impl StackConfig {
 
     pub const fn with_zero_copy_tx(mut self, enabled: bool) -> Self {
         self.zero_copy_tx = enabled;
+        self
+    }
+
+    pub const fn with_segmentation_offload(mut self, segmentation: SegmentationOffload) -> Self {
+        self.segmentation = segmentation;
         self
     }
 
@@ -3070,14 +3116,14 @@ where
         for active_slot in 0..self.tcp.active_len() {
             let index = self.tcp.active_index(active_slot);
             let (deadline, closed) = {
-                let segment_mtu = {
+                let segment_budget = {
                     let Some(socket) = self.tcp.get(index) else {
                         panic!("TCP active socket index referenced a missing socket");
                     };
                     socket
                         .local_endpoint()
                         .zip(socket.remote_endpoint())
-                        .map(|(local, remote)| self.tcp_segment_mtu_for(local, remote))
+                        .map(|(local, remote)| self.tcp_segment_budget_for(local, remote))
                 };
                 let Some(socket) = self.tcp.get_mut(index) else {
                     panic!("TCP active socket index referenced a missing socket");
@@ -3088,12 +3134,13 @@ where
                     && let (Some(local), Some(remote)) =
                         (socket.local_endpoint(), socket.remote_endpoint())
                 {
-                    let segment_mtu =
-                        segment_mtu.expect("TCP connected socket lost PMTU endpoints");
+                    let segment_budget =
+                        segment_budget.expect("TCP connected socket lost PMTU endpoints");
                     let retransmitting = {
-                        if let Some(segment) =
-                            socket.pending_retransmission_with_mtu(now.nanos(), segment_mtu)
-                        {
+                        if let Some(segment) = socket.pending_retransmission_with_mtu(
+                            now.nanos(),
+                            segment_budget.wire_segment(),
+                        ) {
                             pending_retransmit
                                 .try_push((index, segment))
                                 .unwrap_or_else(|_| panic!("TCP retransmit burst overflowed"));
@@ -3130,7 +3177,7 @@ where
                                 });
                         }
                         if let Some(segment) =
-                            socket.take_transmit_segment(now.nanos(), segment_mtu)
+                            socket.take_transmit_segment(now.nanos(), segment_budget)
                         {
                             pending_data
                                 .try_push((index, segment))
@@ -3228,7 +3275,7 @@ where
                 segment.remote,
                 segment.header,
                 segment.options,
-                self.tcp_tx_payload(&segment.payload),
+                self.tcp_tx_payload(&segment),
                 identification,
                 hop_limit,
                 now,
@@ -3249,7 +3296,7 @@ where
                 segment.remote,
                 segment.header,
                 segment.options,
-                self.tcp_tx_payload(&segment.payload),
+                self.tcp_tx_payload(&segment),
                 identification,
                 hop_limit,
                 now,
@@ -3911,9 +3958,19 @@ where
     }
 
     /// Chooses the payload representation for a queued data segment:
-    /// scatter when zero-copy transmit is on, offload seeds the
-    /// checksum, and the payload is large enough to beat the copy.
-    fn tcp_tx_payload<'a>(&self, payload: &'a Bytes) -> TcpTxPayload<'a> {
+    /// a coalesced burst is always scatter (nothing else can carry it),
+    /// otherwise scatter when zero-copy transmit is on, offload seeds
+    /// the checksum, and the payload is large enough to beat the copy.
+    fn tcp_tx_payload<'a>(&self, segment: &'a TcpTransmitSegment) -> TcpTxPayload<'a> {
+        let payload = &segment.payload;
+        let segment_bytes = segment.segment_bytes as usize;
+        if segment_bytes != 0 && payload.len() > segment_bytes {
+            return TcpTxPayload::Segmented {
+                payload,
+                segment_bytes: u16::try_from(segment_bytes)
+                    .expect("TCP segmentation MSS exceeds a virtio gso_size"),
+            };
+        }
         if self.config.zero_copy_tx
             && self.config.tx_checksum_offload
             && payload.len() >= TCP_SCATTER_MIN_PAYLOAD_BYTES
@@ -3922,6 +3979,40 @@ where
         } else {
             TcpTxPayload::Flat(payload)
         }
+    }
+
+    /// What one transmit frame may carry on this path: the wire-segment
+    /// budget from the path MTU, plus the coalesced-frame budget when
+    /// the interface segments this address family.
+    ///
+    /// Both are measured the same way, so the socket subtracts its TCP
+    /// header and options from them identically.
+    ///
+    /// Segmentation rides on transmit checksum offload: the device
+    /// finishes each segment's TCP checksum, so a frame it has to split
+    /// must also be one it has to checksum (virtio 1.2 §5.1.6.2).
+    fn tcp_segment_budget_for(&self, local: TcpEndpoint, remote: TcpEndpoint) -> TcpSegmentBudget {
+        let wire_segment = self.tcp_segment_mtu_for(local, remote);
+        let (segments, packet_header_len) = match local.address {
+            IpAddress::Ipv4(_) => (
+                self.config.segmentation.tx_tcp_ipv4,
+                EthernetFrame::HEADER_LEN + Ipv4Packet::MIN_HEADER_LEN,
+            ),
+            IpAddress::Ipv6(_) => (
+                self.config.segmentation.tx_tcp_ipv6,
+                EthernetFrame::HEADER_LEN + Ipv6Packet::HEADER_LEN,
+            ),
+        };
+        if !segments || !self.config.tx_checksum_offload {
+            return TcpSegmentBudget::wire_segments(wire_segment);
+        }
+        let coalesced = self
+            .config
+            .segmentation
+            .max_tx_frame_bytes
+            .saturating_sub(packet_header_len)
+            .max(wire_segment);
+        TcpSegmentBudget::coalesced(wire_segment, coalesced)
     }
 
     fn queue_tcp(
@@ -3970,9 +4061,12 @@ where
         hop_limit: u8,
         now: StackInstant,
     ) -> Result<bool, StackError> {
+        // A coalesced burst is measured per wire segment: the device
+        // splits it into MSS-sized packets, and those are what the path
+        // has to carry.
         let tcp_len = TcpPacket::MIN_HEADER_LEN
             .checked_add(options.encoded_len())
-            .and_then(|header_len| header_len.checked_add(payload.len()))
+            .and_then(|header_len| header_len.checked_add(payload.wire_segment_len()))
             .ok_or(StackError::PacketTooLarge)?;
         self.ensure_path_packet_fits(
             PathMtuKey::new(IpAddress::Ipv4(source), IpAddress::Ipv4(destination)),
@@ -4051,9 +4145,10 @@ where
         hop_limit: u8,
         now: StackInstant,
     ) -> Result<bool, StackError> {
+        // Same per-wire-segment rule as the IPv4 path above.
         let tcp_len = TcpPacket::MIN_HEADER_LEN
             .checked_add(options.encoded_len())
-            .and_then(|header_len| header_len.checked_add(payload.len()))
+            .and_then(|header_len| header_len.checked_add(payload.wire_segment_len()))
             .ok_or(StackError::PacketTooLarge)?;
         self.ensure_path_packet_fits(
             PathMtuKey::new(IpAddress::Ipv6(source), IpAddress::Ipv6(destination)),
@@ -5866,22 +5961,34 @@ fn encode_tcp_ipv4_frame(
             .ok_or(StackError::OutputQueueFull)?;
             frame.set_len(offset);
         }
-        TcpTxPayload::Scatter(payload) => {
+        TcpTxPayload::Scatter(_) | TcpTxPayload::Segmented { .. } => {
             assert!(
                 matches!(checksum, TransportChecksum::DeviceOffload),
                 "scatter TCP frames require transmit checksum offload"
             );
+            let scatter = payload
+                .scatter_bytes()
+                .expect("scatter TCP payload lost its refcounted bytes");
             offset += TcpPacket::encode_headers_scatter(
                 &mut storage[offset..],
                 IpAddress::Ipv4(source),
                 IpAddress::Ipv4(destination),
                 header,
                 options,
-                payload.len(),
+                scatter.len(),
             )
             .ok_or(StackError::OutputQueueFull)?;
             frame.set_len(offset);
-            frame.set_payload(Some(payload.clone()));
+            frame.set_payload(Some(scatter.clone()));
+            if let TcpTxPayload::Segmented { segment_bytes, .. } = payload {
+                frame.set_tx_segmentation(Some(TxSegmentation {
+                    ipv6: false,
+                    header_len: u16::try_from(offset)
+                        .expect("TCP frame header prefix exceeds a virtio hdr_len"),
+                    segment_bytes,
+                    ecn: header.flags.contains(TcpFlags::CWR),
+                }));
+            }
         }
     }
     if matches!(checksum, TransportChecksum::DeviceOffload) {
@@ -5937,22 +6044,34 @@ fn encode_tcp_ipv6_frame(
             .ok_or(StackError::OutputQueueFull)?;
             frame.set_len(offset);
         }
-        TcpTxPayload::Scatter(payload) => {
+        TcpTxPayload::Scatter(_) | TcpTxPayload::Segmented { .. } => {
             assert!(
                 matches!(checksum, TransportChecksum::DeviceOffload),
                 "scatter TCP frames require transmit checksum offload"
             );
+            let scatter = payload
+                .scatter_bytes()
+                .expect("scatter TCP payload lost its refcounted bytes");
             offset += TcpPacket::encode_headers_scatter(
                 &mut storage[offset..],
                 IpAddress::Ipv6(source),
                 IpAddress::Ipv6(destination),
                 header,
                 options,
-                payload.len(),
+                scatter.len(),
             )
             .ok_or(StackError::OutputQueueFull)?;
             frame.set_len(offset);
-            frame.set_payload(Some(payload.clone()));
+            frame.set_payload(Some(scatter.clone()));
+            if let TcpTxPayload::Segmented { segment_bytes, .. } = payload {
+                frame.set_tx_segmentation(Some(TxSegmentation {
+                    ipv6: true,
+                    header_len: u16::try_from(offset)
+                        .expect("TCP frame header prefix exceeds a virtio hdr_len"),
+                    segment_bytes,
+                    ecn: header.flags.contains(TcpFlags::CWR),
+                }));
+            }
         }
     }
     if matches!(checksum, TransportChecksum::DeviceOffload) {
@@ -8215,6 +8334,214 @@ mod tests {
             "device-completed checksum must validate in software"
         );
         assert!(stack.take_outbound().is_none());
+    }
+
+    /// Brings a TCP socket to Established over `config` and returns the
+    /// stack plus the socket, with the handshake frames already drained.
+    fn established_tcp_stack(config: StackConfig) -> (Stack, SocketId) {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let mut stack = Stack::new(config);
+        stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(peer),
+            mac: PEER_MAC,
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        let socket = stack
+            .open_tcp_connect(
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(local),
+                    port: 49152,
+                },
+                TcpEndpoint {
+                    address: IpAddress::Ipv4(peer),
+                    port: 80,
+                },
+                7,
+            )
+            .expect("test TCP connect should allocate a socket");
+        stack
+            .drive_tcp(StackInstant::from_nanos(1))
+            .expect("SYN should be queued");
+        let _ = stack.take_outbound().expect("SYN frame should be queued");
+        let (syn_ack, syn_ack_len) = tcp_segment(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+            },
+        );
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&syn_ack[..syn_ack_len]),
+                RxFrameOffload::none(),
+                StackInstant::from_nanos(1),
+            )
+            .expect("SYN-ACK should establish the socket");
+        stack
+            .drive_tcp(StackInstant::from_nanos(1))
+            .expect("handshake ACK should be queued");
+        let _ = stack
+            .take_outbound()
+            .expect("handshake ACK frame should be queued");
+        (stack, socket)
+    }
+
+    /// Segmentation capability of a device that splits IPv4 TCP up to a
+    /// full IP packet, with the ECN modifier available.
+    fn tso_ipv4_offload() -> SegmentationOffload {
+        SegmentationOffload {
+            tx_tcp_ipv4: true,
+            tx_tcp_ipv6: false,
+            rx_tcp_ipv4: false,
+            rx_tcp_ipv6: false,
+            max_tx_frame_bytes: u16::MAX as usize + EthernetFrame::HEADER_LEN,
+            max_rx_frame_bytes: crate::ETHERNET_FRAME_BYTES,
+            tx_tcp_ecn: true,
+        }
+    }
+
+    /// A TSO-capable interface gets one oversized frame instead of a
+    /// train of MSS-sized ones: the whole congestion window in a single
+    /// scatter payload, plus the metadata the device needs to split it
+    /// back up. The payload bytes are the same bytes the socket queued,
+    /// in the same order.
+    #[test]
+    fn a_tso_interface_receives_one_coalesced_frame_with_gso_metadata() {
+        let (mut stack, socket) = established_tcp_stack(
+            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES)
+                .with_tx_checksum_offload(true)
+                .with_segmentation_offload(tso_ipv4_offload()),
+        );
+        let payload: Vec<u8> = (0..40 * 1024).map(|index| index as u8).collect();
+        let queued = stack
+            .tcp_send(socket, &payload)
+            .expect("bulk TCP send should queue");
+        assert_eq!(queued, payload.len());
+        stack
+            .drive_tcp(StackInstant::from_nanos(2))
+            .expect("coalesced TCP data should be queued");
+
+        let frame = stack
+            .take_outbound()
+            .expect("segmented data frame should be queued");
+        let scattered = frame
+            .payload()
+            .expect("a coalesced frame carries its payload by reference");
+        let segmentation = frame
+            .tx_segmentation()
+            .expect("a coalesced frame carries segmentation metadata");
+        assert!(
+            scattered.len() > usize::from(segmentation.segment_bytes),
+            "a coalesced frame must outgrow one wire segment"
+        );
+        assert_eq!(scattered.as_ref(), &payload[..scattered.len()]);
+        assert!(!segmentation.ipv6);
+        assert!(!segmentation.ecn);
+        // The header prefix the device replicates is exactly what the
+        // encoder wrote into the packet buffer.
+        assert_eq!(usize::from(segmentation.header_len), frame.as_slice().len());
+        // The oversized frame on the wire is the header prefix followed
+        // by the scatter payload; its IP length field describes the
+        // whole burst, which is what the device fixes up per segment.
+        let mut wire = Vec::from(frame.as_slice());
+        wire.extend_from_slice(scattered.as_ref());
+        let ethernet = EthernetFrame::parse(&wire).expect("Ethernet frame should parse");
+        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
+        let tcp = TcpPacket::parse(ipv4.payload).expect("TCP header should parse");
+        assert_eq!(tcp.payload.len(), scattered.len());
+        assert_eq!(
+            usize::from(segmentation.segment_bytes),
+            crate::ETHERNET_FRAME_BYTES
+                - EthernetFrame::HEADER_LEN
+                - Ipv4Packet::MIN_HEADER_LEN
+                - TcpPacket::MIN_HEADER_LEN
+                - tcp.options.raw().len(),
+            "the device segments at the path MSS"
+        );
+    }
+
+    /// The same send over an interface that segments nothing produces
+    /// the MSS-sized frames the socket has always produced, with no
+    /// segmentation metadata for a device that would not understand it.
+    #[test]
+    fn an_interface_without_segmentation_still_receives_mss_sized_frames() {
+        let (mut stack, socket) = established_tcp_stack(
+            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES).with_tx_checksum_offload(true),
+        );
+        let payload: Vec<u8> = (0..40 * 1024).map(|index| index as u8).collect();
+        stack
+            .tcp_send(socket, &payload)
+            .expect("bulk TCP send should queue");
+        stack
+            .drive_tcp(StackInstant::from_nanos(2))
+            .expect("TCP data should be queued");
+
+        let frame = stack.take_outbound().expect("data frame should be queued");
+        assert!(frame.tx_segmentation().is_none());
+        assert!(frame.payload().is_none());
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
+        let tcp = TcpPacket::parse(ipv4.payload).expect("TCP packet should parse");
+        assert_eq!(
+            tcp.payload.len(),
+            crate::ETHERNET_FRAME_BYTES
+                - EthernetFrame::HEADER_LEN
+                - Ipv4Packet::MIN_HEADER_LEN
+                - TcpPacket::MIN_HEADER_LEN
+                - tcp.options.raw().len()
+        );
+        assert_eq!(tcp.payload, &payload[..tcp.payload.len()]);
+    }
+
+    /// Coalescing changes framing, not accounting: the socket still
+    /// records one in-flight segment per MSS-sized wire segment, so a
+    /// retransmission after the burst addresses one segment, not the
+    /// whole frame.
+    #[test]
+    fn a_coalesced_burst_still_retransmits_one_segment_at_a_time() {
+        let (mut stack, socket) = established_tcp_stack(
+            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES)
+                .with_tx_checksum_offload(true)
+                .with_segmentation_offload(tso_ipv4_offload()),
+        );
+        let payload: Vec<u8> = (0..40 * 1024).map(|index| index as u8).collect();
+        stack
+            .tcp_send(socket, &payload)
+            .expect("bulk TCP send should queue");
+        stack
+            .drive_tcp(StackInstant::from_nanos(2))
+            .expect("coalesced TCP data should be queued");
+        let burst = stack
+            .take_outbound()
+            .expect("segmented data frame should be queued");
+        let burst_bytes = burst
+            .payload()
+            .expect("a coalesced frame carries its payload")
+            .len();
+        let segment_bytes = usize::from(
+            burst
+                .tx_segmentation()
+                .expect("a coalesced frame carries segmentation metadata")
+                .segment_bytes,
+        );
+        assert!(burst_bytes > segment_bytes);
+
+        let socket_state = stack.tcp_socket(socket).expect("socket should still exist");
+        let retransmission = socket_state
+            .pending_retransmission(crate::tcp::TCP_INITIAL_RTO_NANOS + 2)
+            .expect("the first in-flight segment should come due");
+        assert_eq!(retransmission.payload.len(), segment_bytes);
+        assert_eq!(retransmission.payload.as_ref(), &payload[..segment_bytes]);
     }
 
     #[test]

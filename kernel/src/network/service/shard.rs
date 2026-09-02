@@ -68,6 +68,7 @@ pub(super) fn shard_idx_for_port(port: Option<u16>, shard_count: usize) -> usize
     let stride_idx = port - EPHEMERAL_PORT_START;
     usize::from(stride_idx) % shard_count
 }
+
 pub(super) struct NetworkShard {
     pub(super) stack: Box<Stack>,
     /// This shard's index inside the parent `NetworkShardSet`.
@@ -261,12 +262,11 @@ impl NetworkShardSet {
 }
 
 impl NetworkShard {
+    /// Builds one shard around a stack configuration the service
+    /// derived once from the device's capabilities: every shard drives
+    /// the same interface, so they all share the same offload contract.
     pub(super) fn new(
-        mac: [u8; 6],
-        max_frame_len: usize,
-        rx_poll_budget: usize,
-        rx_checksum_offload: RxChecksumOffload,
-        tx_checksum_offload: bool,
+        stack_config: StackConfig,
         transaction_id: u32,
         shard_idx: usize,
         shard_count: usize,
@@ -277,12 +277,7 @@ impl NetworkShard {
             "shard idx {shard_idx} out of range for {shard_count} shards"
         );
         let initial_ephemeral = EPHEMERAL_PORT_START + shard_idx as u16;
-        let mut stack = Box::new(Stack::new(
-            StackConfig::new(mac, max_frame_len)
-                .with_rx_budget(rx_poll_budget)
-                .with_rx_checksum_offload(rx_checksum_offload)
-                .with_tx_checksum_offload(tx_checksum_offload),
-        ));
+        let mut stack = Box::new(Stack::new(stack_config));
         let mut udp_sockets = HandleSlab::new();
         if shard_idx == shard_idx_for_port(Some(DHCP_CLIENT_PORT), shard_count) {
             let binding = UdpSocketBinding::wildcard(DHCP_CLIENT_PORT);

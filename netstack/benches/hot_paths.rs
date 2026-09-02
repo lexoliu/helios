@@ -6,8 +6,8 @@ use helios_netstack::{
     IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, MAX_OUTBOUND_FRAMES, NeighborEntry,
     NeighborState, OutboundBatchStatus, PacketBuffer, RxChecksumOffload, RxFrame, RxFrameOffload,
     Stack, StackConfig, StackInstant, TCP_TRANSMIT_BUFFER_BYTES, TcpEndpoint, TcpFlags, TcpHeader,
-    TcpOptions, TcpPacket, TcpSocket, TcpState, TransportChecksum, UdpPacket, UdpSocketBinding,
-    UdpSocketId, internet_checksum,
+    TcpOptions, TcpPacket, TcpSegmentBudget, TcpSocket, TcpState, TransportChecksum, UdpPacket,
+    UdpSocketBinding, UdpSocketId, internet_checksum,
 };
 
 #[global_allocator]
@@ -621,7 +621,7 @@ fn tcp_send_bytes_segments_without_copy(bencher: Bencher) {
                 let segment = socket
                     .take_transmit_segment(
                         u64::try_from(index + 2).expect("TCP benchmark timestamp fits u64"),
-                        usize::MAX,
+                        TcpSegmentBudget::wire_segments(usize::MAX),
                     )
                     .expect("TCP benchmark transmit segment should be queued");
                 transmitted = transmitted.saturating_add(segment.payload.len());
@@ -658,7 +658,10 @@ fn tcp_zero_window_queue_send_bytes(bencher: Bencher) {
             let written = socket.queue_send_bytes(&mut remaining);
             assert_eq!(written, TCP_TRANSMIT_BUFFER_BYTES);
             assert!(remaining.is_empty());
-            assert_eq!(socket.take_transmit_segment(3, usize::MAX), None);
+            assert_eq!(
+                socket.take_transmit_segment(3, TcpSegmentBudget::wire_segments(usize::MAX)),
+                None
+            );
         });
 }
 
@@ -685,12 +688,16 @@ fn tcp_zero_window_persist_probe(bencher: Bencher) {
         let mut remaining = black_box(payload.clone());
         let written = socket.queue_send_bytes(&mut remaining);
         assert_eq!(written, payload.len());
-        assert!(socket.take_transmit_segment(3, usize::MAX).is_none());
+        assert!(
+            socket
+                .take_transmit_segment(3, TcpSegmentBudget::wire_segments(usize::MAX))
+                .is_none()
+        );
         let deadline = socket
             .next_deadline_nanos()
             .expect("persist probe deadline should be armed");
         let probe = socket
-            .take_transmit_segment(deadline, usize::MAX)
+            .take_transmit_segment(deadline, TcpSegmentBudget::wire_segments(usize::MAX))
             .expect("persist deadline should emit a probe");
         assert_eq!(probe.payload.as_ref(), b"h");
         black_box(probe);
@@ -731,7 +738,7 @@ fn tcp_single_segment_transmit(bencher: Bencher) {
             assert_eq!(written, TCP_PAYLOAD_BYTES);
             assert!(remaining.is_empty());
             let segment = socket
-                .take_transmit_segment(2, usize::MAX)
+                .take_transmit_segment(2, TcpSegmentBudget::wire_segments(usize::MAX))
                 .expect("single queued segment should transmit");
             black_box(segment);
         });
@@ -755,7 +762,7 @@ fn tcp_ack_discards_in_flight_segments(bencher: Bencher) {
                 let segment = socket
                     .take_transmit_segment(
                         u64::try_from(index + 2).expect("TCP benchmark timestamp fits u64"),
-                        usize::MAX,
+                        TcpSegmentBudget::wire_segments(usize::MAX),
                     )
                     .expect("TCP benchmark transmit segment should be queued");
                 acknowledgement = segment.header.sequence + segment.sequence_len;

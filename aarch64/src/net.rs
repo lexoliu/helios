@@ -195,37 +195,9 @@ impl NetworkDevice for VirtioNetworkDevice {
         &self,
         queue_idx: usize,
         frames: &[helios_kernel::TxFrameRef<'_>],
-        tokens: &mut [Option<u16>],
-    ) -> Result<Option<usize>, IoError> {
-        let mut descriptors = [helios_virtio::TxScatterFrame {
-            headers: &[],
-            payload: &[],
-            checksum: None,
-        }; TX_BATCH_FRAMES];
-        let count = frames.len().min(TX_BATCH_FRAMES);
-        for (descriptor, frame) in descriptors.iter_mut().zip(frames.iter().take(count)) {
-            *descriptor = helios_virtio::TxScatterFrame {
-                headers: frame.bytes,
-                payload: frame.payload.map(|payload| payload.as_ref()).unwrap_or(&[]),
-                checksum: frame
-                    .checksum
-                    .map(|checksum| helios_virtio::TxChecksumMeta {
-                        start: checksum.start,
-                        offset: checksum.offset,
-                    }),
-            };
-        }
-        self.inner
-            .try_transmit_scatter_immediate_on_pair(queue_idx, &descriptors[..count], tokens)
-    }
-
-    fn reclaim_transmit_tokens_immediate_on(
-        &self,
-        queue_idx: usize,
-        tokens: &mut [Option<u16>],
     ) -> Result<Option<usize>, IoError> {
         self.inner
-            .reclaim_transmit_tokens_immediate_on_pair(queue_idx, tokens)
+            .try_transmit_scatter_immediate_on_pair(queue_idx, frames)
     }
 
     fn try_transmit_slices_immediate(

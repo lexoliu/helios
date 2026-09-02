@@ -110,28 +110,6 @@ impl NetworkPollSource {
         }
     }
 
-    pub(super) const fn tx_batch_collect_phase(self) -> &'static str {
-        match self {
-            Self::Pump => "tx-submit-batch-collect-pump",
-            Self::Ping => "tx-submit-batch-collect-ping",
-            Self::Dns => "tx-submit-batch-collect-dns",
-            Self::Tcp => "tx-submit-batch-collect-tcp",
-            Self::Udp => "tx-submit-batch-collect-udp",
-            Self::Configuration => "tx-submit-batch-collect-configuration",
-        }
-    }
-
-    pub(super) const fn tx_batch_device_phase(self) -> &'static str {
-        match self {
-            Self::Pump => "tx-submit-batch-device-pump",
-            Self::Ping => "tx-submit-batch-device-ping",
-            Self::Dns => "tx-submit-batch-device-dns",
-            Self::Tcp => "tx-submit-batch-device-tcp",
-            Self::Udp => "tx-submit-batch-device-udp",
-            Self::Configuration => "tx-submit-batch-device-configuration",
-        }
-    }
-
     pub(super) const fn rx_drain_phase(self) -> &'static str {
         match self {
             Self::Pump => "rx-drain-pump",
@@ -259,7 +237,6 @@ where
         let mut transmit_stop = NetworkTransmitStop::Drained;
         while transmitted < budget.tx_frames {
             let mut immediate_submitted = false;
-            let mut immediate_deferred = false;
             let shard_count = self.inner.state.shard_count();
             for shard_idx in 0..shard_count {
                 if transmitted >= budget.tx_frames {
@@ -275,20 +252,25 @@ where
                         remaining_budget.min(NETWORK_TX_BATCH_FRAMES),
                         |frames| {
                             immediate_device_started = self.profile_start();
+                            // Zero-copy: only the header prefix is
+                            // copied into the device's slot, and the
+                            // device keeps each accepted payload's
+                            // handle until its descriptor completes, so
+                            // releasing the outbound slot here is safe.
                             let result = self
                                 .inner
                                 .device
-                                .try_transmit_slices_immediate_on(shard_idx, frames);
+                                .try_transmit_scatter_immediate_on(shard_idx, frames);
                             immediate_device_finished = self.profile_start();
                             result
                         },
                     )
                 }?;
                 match immediate {
-                    OutboundBatchStatus::Empty => {}
-                    OutboundBatchStatus::Deferred => {
-                        immediate_deferred = true;
-                    }
+                    // `Deferred`: another processor holds this queue
+                    // pair's ring and is already draining the same
+                    // frames. Nothing to do but come back.
+                    OutboundBatchStatus::Empty | OutboundBatchStatus::Deferred => {}
                     OutboundBatchStatus::Submitted {
                         offered,
                         accepted,
@@ -320,97 +302,7 @@ where
             if matches!(transmit_stop, NetworkTransmitStop::RingFull) {
                 break;
             }
-            if immediate_submitted {
-                continue;
-            }
-            if !immediate_deferred {
-                break;
-            }
-
-            // Per-shard collect+submit: each shard drains its
-            // outbound frames into its OWN device queue. Multi-queue
-            // virtio (Phase 4.2) means shard N's TX submission hits
-            // queue pair N's `tx_state` SpinMutex, with no
-            // contention against shards on other CPUs. Devices with
-            // fewer negotiated queue pairs than shards map shards
-            // onto the live queue-pair ring.
-            let collect_started = self.profile_start();
-            let remaining_budget = budget.tx_frames - transmitted;
-            let collect_limit = NETWORK_TX_BATCH_FRAMES.min(remaining_budget);
-            let shard_count = self.inner.state.shard_count();
-            let mut total_collected = 0usize;
-            let mut total_collected_bytes = 0usize;
-            let mut total_submitted = 0usize;
-            let mut total_submitted_bytes = 0usize;
-            let mut ring_full = false;
-            for shard_idx in 0..shard_count {
-                if total_collected >= collect_limit {
-                    break;
-                }
-                let mut shard_frames =
-                    smallvec::SmallVec::<[PacketBuffer; NETWORK_TX_BATCH_FRAMES]>::new();
-                {
-                    let mut state = self.inner.state.shard_at(shard_idx).lock();
-                    while shard_frames.len() < (collect_limit - total_collected) {
-                        let Some(frame) = state.stack.take_outbound() else {
-                            break;
-                        };
-                        shard_frames.push(frame);
-                    }
-                }
-                if shard_frames.is_empty() {
-                    continue;
-                }
-                let collected_bytes: usize = shard_frames.iter().map(|f| f.as_ref().len()).sum();
-                total_collected += shard_frames.len();
-                total_collected_bytes += collected_bytes;
-                let submitted = self
-                    .inner
-                    .device
-                    .try_transmit_packet_batch_on(shard_idx, &shard_frames)
-                    .await?;
-                let submitted_bytes: usize = shard_frames
-                    .iter()
-                    .take(submitted)
-                    .map(|f| f.as_ref().len())
-                    .sum();
-                total_submitted += submitted;
-                total_submitted_bytes += submitted_bytes;
-                if submitted < shard_frames.len() {
-                    // RingFull on this shard's queue. Push leftovers
-                    // back to the same shard (and only that shard)
-                    // so per-pair ordering is preserved, then mark
-                    // the round as RingFull.
-                    let mut state = self.inner.state.shard_at(shard_idx).lock();
-                    while shard_frames.len() > submitted {
-                        let frame = shard_frames
-                            .pop()
-                            .expect("TX restore lost an unsubmitted outbound frame");
-                        state.stack.push_outbound_front(frame);
-                    }
-                    ring_full = true;
-                    break;
-                }
-            }
-            if total_collected == 0 {
-                break;
-            }
-            self.record_network_profile_events_bytes(
-                source.tx_batch_collect_phase(),
-                collect_started,
-                total_collected,
-                total_collected_bytes,
-            );
-            self.record_network_profile_events_bytes(
-                source.tx_batch_device_phase(),
-                collect_started,
-                total_submitted,
-                total_submitted_bytes,
-            );
-            transmitted += total_submitted;
-            transmitted_bytes = transmitted_bytes.saturating_add(total_submitted_bytes);
-            if ring_full {
-                transmit_stop = NetworkTransmitStop::RingFull;
+            if !immediate_submitted {
                 break;
             }
         }
