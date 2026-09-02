@@ -114,3 +114,53 @@ driver: `fill` submits a writable buffer, registers an `InFlight` slot
 and parks on the device notification, and a zero-length completion is a
 device fault. The kernel mixes what it reads into its root DRBG; see
 `kernel/src/memory/entropy.rs`.
+
+virtio-blk is the kernel's disk. The driver in `virtio/src/block.rs`
+negotiates the whole feature set QEMU offers and turns it into a
+`hal::fs::BlockGeometry` plus a capability set, so callers address the
+device in its own logical blocks rather than in 512-byte sectors it may
+not use natively:
+
+| Feature | Bit | Effect when the device offers it |
+| --- | --- | --- |
+| `VIRTIO_BLK_F_SIZE_MAX` | 1 | Bounds the bytes one buffer of a request may carry. |
+| `VIRTIO_BLK_F_SEG_MAX` | 2 | Bounds the buffers one request is scattered across. |
+| `VIRTIO_BLK_F_RO` | 5 | Writes, discards and write-zeroes are refused before they reach the device. |
+| `VIRTIO_BLK_F_BLK_SIZE` | 6 | `block_size()` reports the device's logical block; addresses are converted to sectors on the wire. |
+| `VIRTIO_BLK_F_FLUSH` | 9 | `flush()` commits the volatile write cache. Without the bit there is no such cache, and `flush()` resolves without reaching the device. |
+| `VIRTIO_BLK_F_TOPOLOGY` | 10 | Physical block size, minimum and optimal I/O reach the geometry. |
+| `VIRTIO_BLK_F_CONFIG_WCE` | 11 | The current write-cache mode is read at bring-up and logged. |
+| `VIRTIO_BLK_F_MQ` | 12 | One queue per processor, up to what the device exposes; a request is bound to the queue it was written into. |
+| `VIRTIO_BLK_F_DISCARD` | 13 | `discard(range)` tells the device the blocks are free. |
+| `VIRTIO_BLK_F_WRITE_ZEROES` | 14 | `write_zeroes(range)` zeroes a run without carrying the zeroes. |
+
+Requests are pipelined: each queue keeps up to 128 chains in flight, each
+with its own `InFlight` slot, and a submitter that finds the ring full
+drains what the device published and parks on the device notification
+rather than failing. Transfers longer than `SEG_MAX × SIZE_MAX` are split
+into whole-block requests, and every read checks the used length against
+what it asked for.
+
+`VIRTIO_BLK_T_GET_ID` is what tells two disks apart. A VM hands the guest
+both the image its firmware booted from and the scratch disk the kernel
+owns, on the same bus and in an order nothing guarantees, so the kernel
+identifies its disk by the serial the inspector gives it —
+`helios-data` — and leaves every other disk untouched. The chosen disk is
+then proved before anything depends on it: a random 4 KiB pattern goes to
+its last blocks, is committed with a flush, read back and compared, and
+released with write-zeroes. A mismatch is a fatal boot error, and the
+result is visible in the boot log:
+
+```
+virtio-blk configured capacity_blocks=524288 block_bytes=512 queues=1 queue_depth=128
+  segments=14 flush=true discard=true write_zeroes=true writeback=true
+block device identified as the kernel scratch disk serial="helios-data"
+block device online, self check passed capacity_bytes=268435456 …
+```
+
+Every inspector profile attaches that disk: `virtio-blk-device` on the
+MMIO platforms (aarch64, riscv64) and `virtio-blk-pci` on x86, always
+with `serial=helios-data`, backed by a `data.img` in the VM's runtime
+directory whose size `--data-disk-size` controls. `helios-inspector
+stats` shows the device the guest kernel ended up with, its geometry, its
+queues and the requests the kernel has issued.
