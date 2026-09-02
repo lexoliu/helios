@@ -113,9 +113,23 @@ global_asm!(include_str!("mp_hook.S"));
 global_asm!(include_str!("secondary_entry.S"));
 
 const UNINITIALIZED_BOOT_HART: usize = usize::MAX;
+/// One bit of [`ONLINE_HARTS`] per hart id.
+const MAX_TRACKED_HARTS: usize = usize::BITS as usize;
 const SSTATUS_SPP_BIT: usize = 1 << 8;
 
 static BOOT_HART_ID: AtomicUsize = AtomicUsize::new(UNINITIALIZED_BOOT_HART);
+/// Harts that have entered [`run_hart`] and can therefore be parked in `wfi`.
+///
+/// SBI only accepts `sbi_send_ipi` for harts the firmware currently reports as
+/// started, suspended, or resume-pending: OpenSBI's `sbi_ipi_send_many`
+/// intersects the requested mask with the interruptible harts and rejects the
+/// whole call with `SBI_ERR_INVALID_PARAM` when any requested hart drops out.
+/// The kernel scheduler legitimately nudges secondaries while the bootstrap
+/// hart is still bringing up devices, long before it hands them to
+/// `sbi_hart_start`, so the backend tracks which harts are actually running
+/// kernel code. A hart that has not entered the kernel is not parked and needs
+/// no nudge: it drains the run queues as soon as it reaches the scheduler.
+static ONLINE_HARTS: AtomicUsize = AtomicUsize::new(0);
 static CRITICAL_SECTION_STATE: helios_hal::critical_section::CriticalSectionState =
     helios_hal::critical_section::CriticalSectionState::new();
 static WASMTIME_NATIVE_TRAP_HANDLER: AtomicUsize = AtomicUsize::new(0);
@@ -396,6 +410,14 @@ impl Cpu for RiscvCpu {
             return;
         }
 
+        if !hart_is_online(hart) {
+            // The hart has not entered the kernel yet, so it cannot be parked
+            // in `wfi`. Sending it an IPI would be rejected by SBI with
+            // `SBI_ERR_INVALID_PARAM`, and there is nothing to wake: the hart
+            // observes every queued task once it reaches the scheduler.
+            return;
+        }
+
         let ret = sbi_rt::send_ipi(sbi_rt::HartMask::from_mask_base(1, hart.id() as usize));
         if ret.is_ok() {
             return;
@@ -502,11 +524,16 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     let mut cpus = fdt.cpus();
     let first_cpu = cpus.next().expect("FDT does not describe any CPU");
     let hart_count = 1 + cpus.count();
+    assert!(
+        hart_count <= MAX_TRACKED_HARTS,
+        "FDT describes {hart_count} harts but this backend tracks at most {MAX_TRACKED_HARTS}"
+    );
     let timebase_frequency = first_cpu.timebase_frequency() as u64;
     let allocator_window = allocator_window();
     let memory_regions = collect_memory_regions(fdt.memory(), allocator_window.clone());
     let current_hart = ProcessorId::new(hart_id as u16);
     let bootstrap_processor = remember_bootstrap_hart(hart_id);
+    mark_hart_online(current_hart);
     // Bring up Sv39 paging on every hart before any allocator or
     // driver work. The bootstrap hart populates the root table once
     // (identity-mapping the kernel's 16 GiB physical window), then
@@ -725,6 +752,29 @@ fn remember_bootstrap_hart(current_hart: usize) -> ProcessorId {
         Ok(_) => ProcessorId::new(current_hart as u16),
         Err(bootstrap_hart) => ProcessorId::new(bootstrap_hart as u16),
     }
+}
+
+fn hart_bit(hart: ProcessorId) -> usize {
+    let index = usize::from(hart.id());
+    assert!(
+        index < MAX_TRACKED_HARTS,
+        "hart {index} is outside the {MAX_TRACKED_HARTS} harts this backend tracks"
+    );
+
+    1 << index
+}
+
+/// Publishes the current hart as a valid IPI target.
+///
+/// Called before the hart can reach any parking point, so a waker that misses
+/// the publication still cannot lose a wakeup: the hart drains the run queues
+/// after this point.
+fn mark_hart_online(hart: ProcessorId) {
+    ONLINE_HARTS.fetch_or(hart_bit(hart), Ordering::Release);
+}
+
+fn hart_is_online(hart: ProcessorId) -> bool {
+    ONLINE_HARTS.load(Ordering::Acquire) & hart_bit(hart) != 0
 }
 
 fn release_early_boot_harts() {
