@@ -381,12 +381,17 @@ impl<T: VirtioTransport> VirtioBalloonDevice<T> {
         Ok(())
     }
 
-    /// Answers a free-page hint command.
+    /// Opens a free-page hint sequence with the identifier the device
+    /// published.
     ///
-    /// The sequence the device expects is the command identifier it
-    /// published, then the free memory itself, then
-    /// [`FREE_PAGE_CMD_ID_STOP`] to close the sequence out.
-    pub async fn hint_free_pages(&self, cmd_id: u32, ranges: &mut [&mut [u8]]) -> IoResult<()> {
+    /// The sequence the device expects is the command identifier, then
+    /// the free memory itself through
+    /// [`VirtioBalloonDevice::hint_free_pages`], then
+    /// [`VirtioBalloonDevice::end_free_page_hint`] to close it out. It
+    /// is three calls rather than one because the caller has to hold
+    /// each run of free memory out of its allocator only for as long as
+    /// the device is looking at it.
+    pub async fn begin_free_page_hint(&self, cmd_id: u32) -> IoResult<()> {
         let Some(free_page) = &self.free_page else {
             return Err(IoError::Unsupported);
         };
@@ -394,11 +399,27 @@ impl<T: VirtioTransport> VirtioBalloonDevice<T> {
         free_page
             .request(&self.transport, &self.interrupts, &[&start], &mut [])
             .await?;
+        Ok(())
+    }
+
+    /// Names free memory inside an open hint sequence.
+    pub async fn hint_free_pages(&self, ranges: &mut [&mut [u8]]) -> IoResult<()> {
+        let Some(free_page) = &self.free_page else {
+            return Err(IoError::Unsupported);
+        };
         for batch in ranges.chunks_mut(MAX_CHAIN_BUFFERS) {
             free_page
                 .request(&self.transport, &self.interrupts, &[], batch)
                 .await?;
         }
+        Ok(())
+    }
+
+    /// Closes an open hint sequence.
+    pub async fn end_free_page_hint(&self) -> IoResult<()> {
+        let Some(free_page) = &self.free_page else {
+            return Err(IoError::Unsupported);
+        };
         let stop = FREE_PAGE_CMD_ID_STOP.to_le_bytes();
         free_page
             .request(&self.transport, &self.interrupts, &[&stop], &mut [])
@@ -831,11 +852,10 @@ mod tests {
         let mut pages = Pages::new(1);
         let page_base = pages.range(1).as_ptr() as u64;
         let mut ranges = [pages.range(1)];
-        let mut hint = pin!(device.hint_free_pages(7, &mut ranges));
-
         // The identifier the device published opens the sequence.
+        let mut begin = pin!(device.begin_free_page_hint(7));
         let token = next_token(free_page);
-        assert!(block_on(poll_once(hint.as_mut())).is_none());
+        assert!(block_on(poll_once(begin.as_mut())).is_none());
         assert_eq!(
             free_page
                 .queue
@@ -845,8 +865,10 @@ mod tests {
             7_u32.to_le_bytes()
         );
         complete(&device, 3, token);
+        assert_eq!(block_on(poll_once(begin.as_mut())), Some(Ok(())));
 
         // Then the free memory itself, as writable buffers.
+        let mut hint = pin!(device.hint_free_pages(&mut ranges));
         let token = next_token(free_page);
         assert!(block_on(poll_once(hint.as_mut())).is_none());
         assert_eq!(
@@ -858,10 +880,12 @@ mod tests {
             [(page_base, BALLOON_PAGE_SIZE as u32, true)]
         );
         complete(&device, 3, token);
+        assert_eq!(block_on(poll_once(hint.as_mut())), Some(Ok(())));
 
         // And the stop identifier closes it out.
+        let mut end = pin!(device.end_free_page_hint());
         let token = next_token(free_page);
-        assert!(block_on(poll_once(hint.as_mut())).is_none());
+        assert!(block_on(poll_once(end.as_mut())).is_none());
         assert_eq!(
             free_page
                 .queue
@@ -871,7 +895,7 @@ mod tests {
             FREE_PAGE_CMD_ID_STOP.to_le_bytes()
         );
         complete(&device, 3, token);
-        assert_eq!(block_on(poll_once(hint.as_mut())), Some(Ok(())));
+        assert_eq!(block_on(poll_once(end.as_mut())), Some(Ok(())));
     }
 
     /// The reserved identifiers are not requests, so a driver that

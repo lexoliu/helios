@@ -16,6 +16,8 @@ use crate::{RootEntropy, RootEntropyHandle};
 use helios_hal::cpu::HardwarePerfCounterDelta;
 use spin::{Mutex, Once};
 
+use crate::memory::BalloonHandle;
+
 use crate::BlockService;
 use crate::component::{ComponentRuntimeState, ProviderSlot};
 use crate::network::HttpExchange;
@@ -51,6 +53,9 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// What the platform's IOMMU confines, once the backend has built
     /// the domains. Empty on a machine whose devices are not behind one.
     iommu_report: Once<alloc::sync::Arc<crate::IommuReport>>,
+    /// The memory balloon the host resizes this guest through. Empty on
+    /// a machine that gave the kernel none.
+    balloon: Once<BalloonHandle>,
     futex_table: Mutex<FutexTable>,
     bootfs: Mutex<Option<EmbeddedBootFs>>,
     tracing: Mutex<TraceHistory>,
@@ -346,6 +351,7 @@ where
                 host_fs_service: Mutex::new(None),
                 block_service: Once::new(),
                 iommu_report: Once::new(),
+                balloon: Once::new(),
                 futex_table: Mutex::new(FutexTable::new()),
                 bootfs: Mutex::new(embedded_init().map(|init| init.bootfs())),
                 tracing: Mutex::new(TraceHistory::new(DEFAULT_TRACE_HISTORY_CAPACITY)),
@@ -370,6 +376,7 @@ where
                 .iommu_report
                 .get()
                 .map(|report| report.snapshot()),
+            balloon: self.inner.balloon.get().map(BalloonHandle::stats),
         }
     }
 
@@ -798,6 +805,16 @@ where
         assert!(installed, "IOMMU report was installed more than once");
     }
 
+    /// Publishes the memory balloon the platform gave this kernel.
+    pub fn install_memory_balloon(&self, balloon: BalloonHandle) {
+        let mut installed = false;
+        self.inner.balloon.call_once(|| {
+            installed = true;
+            balloon
+        });
+        assert!(installed, "memory balloon was installed more than once");
+    }
+
     pub fn prepare_futex_wait(&self, key: FutexKey) -> FutexWaitRegistration {
         self.inner.futex_table.lock().prepare_wait(key)
     }
@@ -840,6 +857,10 @@ where
 
     fn root_entropy(&self) -> &RootEntropy {
         RuntimeState::root_entropy(self)
+    }
+
+    fn memory_balloon(&self) -> Option<BalloonHandle> {
+        self.inner.balloon.get().cloned()
     }
 
     fn profiling_enabled(&self) -> bool {

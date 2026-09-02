@@ -19,6 +19,8 @@
 
 extern crate alloc;
 
+use core::future::Future;
+
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -195,7 +197,7 @@ fn word_bit(words: &[u64], index: usize) -> bool {
 /// each growing their own copy. `allocate` must not itself consult the
 /// reported bitmap: a report that zeroed the memory it is about to hand
 /// back would pay for the whole pool on every pass.
-pub(crate) fn visit_free_runs<Allocate, Free, Visit>(
+pub(crate) async fn visit_free_runs<Allocate, Free, Visit, Visited>(
     reported: &ReportedFrames,
     min_frames: usize,
     max_runs: usize,
@@ -206,7 +208,8 @@ pub(crate) fn visit_free_runs<Allocate, Free, Visit>(
 where
     Allocate: FnMut(usize) -> Option<PhysFrameRange>,
     Free: FnMut(PhysFrameRange),
-    Visit: FnMut(PhysFrameRange),
+    Visit: FnMut(PhysFrameRange) -> Visited,
+    Visited: Future<Output = ()>,
 {
     if min_frames == 0 {
         return 0;
@@ -218,7 +221,7 @@ where
         let Some(range) = allocate(min_frames) else {
             break;
         };
-        visit(range);
+        visit(range).await;
         reported.mark(range);
         held[visited] = Some(range);
         visited += 1;
@@ -303,13 +306,14 @@ mod tests {
 
     #[test]
     fn a_pass_visits_and_releases_every_run_it_took() {
+        use futures_lite::future::block_on;
         let reported = ReportedFrames::new();
         reported.cover(0, 64 * PhysFrame::SIZE);
         let mut next = 0usize;
         let mut freed = alloc::vec::Vec::new();
         let mut seen = alloc::vec::Vec::new();
 
-        let visited = visit_free_runs(
+        let visited = block_on(visit_free_runs(
             &reported,
             4,
             3,
@@ -319,8 +323,11 @@ mod tests {
                 Some(run)
             },
             |run| freed.push(run),
-            |run| seen.push(run),
-        );
+            |run| {
+                seen.push(run);
+                core::future::ready(())
+            },
+        ));
 
         assert_eq!(visited, 3);
         assert_eq!(seen, [range(0, 4), range(4, 4), range(8, 4)]);
@@ -332,7 +339,14 @@ mod tests {
     fn a_pool_with_no_run_that_large_visits_nothing() {
         let reported = ReportedFrames::new();
         reported.cover(0, 64 * PhysFrame::SIZE);
-        let visited = visit_free_runs(&reported, 512, 4, |_| None, |_| (), |_| ());
+        let visited = futures_lite::future::block_on(visit_free_runs(
+            &reported,
+            512,
+            4,
+            |_| None,
+            |_| (),
+            |_| core::future::ready(()),
+        ));
         assert_eq!(visited, 0);
         assert_eq!(reported.count(), 0);
     }

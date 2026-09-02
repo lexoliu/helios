@@ -15,6 +15,7 @@
 extern crate alloc;
 
 use core::alloc::Layout;
+use core::future::Future;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -147,9 +148,15 @@ impl PhysFrameAllocator for KernelPhysFrameAllocator {
         Ok(range)
     }
 
-    fn free_runs<Visit>(&self, min_frames: usize, max_runs: usize, visit: Visit) -> usize
+    fn free_runs<Visit, Visited>(
+        &self,
+        min_frames: usize,
+        max_runs: usize,
+        visit: Visit,
+    ) -> impl Future<Output = usize> + Send
     where
-        Visit: FnMut(PhysFrameRange),
+        Visit: FnMut(PhysFrameRange) -> Visited + Send,
+        Visited: Future<Output = ()> + Send,
     {
         visit_free_runs(
             &self.reported,
@@ -208,6 +215,7 @@ fn single_frame_layout() -> Layout {
 #[cfg(test)]
 mod tests {
     use super::{KernelPhysFrameAllocator, Layout};
+    use futures_lite::future::block_on;
     use helios_hal::pmm::{PhysFrame, PhysFrameAllocator, PhysFrameRange};
 
     /// A page-aligned pool of host memory, leaked for the lifetime of
@@ -246,7 +254,10 @@ mod tests {
         let free_before = allocator.stats().free_frames();
 
         let mut visited = alloc::vec::Vec::new();
-        let runs = allocator.free_runs(512, 4, |range| visited.push(range));
+        let runs = block_on(allocator.free_runs(512, 4, |range| {
+            visited.push(range);
+            core::future::ready(())
+        }));
 
         assert_eq!(runs, 4);
         assert_eq!(visited.len(), 4);
@@ -272,10 +283,11 @@ mod tests {
         // memory is still the guest's while the consumer looks at it.
         let mut reported = None;
         assert_eq!(
-            allocator.free_runs(8, 1, |run| {
+            block_on(allocator.free_runs(8, 1, |run| {
                 fill(run, 0xa5);
                 reported = Some(run);
-            }),
+                core::future::ready(())
+            })),
             1
         );
         let reported = reported.expect("one run was reported");
@@ -303,11 +315,15 @@ mod tests {
         let allocator = pool(4 * 1024 * 1024);
         let mut seen = alloc::vec::Vec::new();
 
-        allocator.free_runs(8, 1, |run| {
+        block_on(allocator.free_runs(8, 1, |run| {
             fill(run, 0x5a);
             seen.push(run);
-        });
-        allocator.free_runs(8, 1, |run| seen.push(run));
+            core::future::ready(())
+        }));
+        block_on(allocator.free_runs(8, 1, |run| {
+            seen.push(run);
+            core::future::ready(())
+        }));
 
         assert_eq!(seen.len(), 2);
         assert_eq!(
@@ -322,7 +338,10 @@ mod tests {
     #[test]
     fn a_pool_without_a_long_enough_run_reports_nothing() {
         let allocator = pool(1024 * 1024);
-        assert_eq!(allocator.free_runs(4096, 4, |_| ()), 0);
+        assert_eq!(
+            block_on(allocator.free_runs(4096, 4, |_| core::future::ready(()))),
+            0
+        );
         assert_eq!(allocator.stats().reported_frames, 0);
     }
 }

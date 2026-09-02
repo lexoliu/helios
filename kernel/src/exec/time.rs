@@ -151,6 +151,10 @@ mod tests {
             panic!("the clock test state has no root entropy")
         }
 
+        fn memory_balloon(&self) -> Option<crate::memory::BalloonHandle> {
+            None
+        }
+
         fn profiling_enabled(&self) -> bool {
             false
         }

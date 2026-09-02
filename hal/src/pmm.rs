@@ -25,6 +25,8 @@
 //! buffer's does — at the device boundary — so the allocator, its
 //! callers, and the page-table layer all speak one address space.
 
+use core::future::Future;
+
 use thiserror::Error;
 
 /// A single 4 KiB physical frame, identified by its frame number.
@@ -178,9 +180,22 @@ pub trait PhysFrameAllocator: Send + Sync + 'static {
     ///
     /// Every visited run is marked *reported*, which is what makes a
     /// later [`PhysFrameAllocator::allocate`] of it zero the memory.
-    fn free_runs<Visit>(&self, min_frames: usize, max_runs: usize, visit: Visit) -> usize
+    ///
+    /// The visit is a future because the consumer that matters is a
+    /// device: telling a host about a run means putting it on a
+    /// virtqueue and waiting for the host to take it. The run stays
+    /// reserved across that await, which is the whole point — a run
+    /// released back into the pool while the host is still discarding
+    /// it would be handed to someone whose writes then vanish.
+    fn free_runs<Visit, Visited>(
+        &self,
+        min_frames: usize,
+        max_runs: usize,
+        visit: Visit,
+    ) -> impl Future<Output = usize> + Send
     where
-        Visit: FnMut(PhysFrameRange);
+        Visit: FnMut(PhysFrameRange) -> Visited + Send,
+        Visited: Future<Output = ()> + Send;
 
     /// Return frames to the pool.
     ///

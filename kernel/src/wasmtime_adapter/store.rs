@@ -125,6 +125,13 @@ where
     /// analysis can trace which instance was sacrificed for which grow
     /// request.
     fn request_oom_kill_for_growth(&self, requested_bytes: usize) {
+        // VIRTIO_BALLOON_F_DEFLATE_ON_OOM: memory the host is holding is
+        // reclaimed before memory a program is using. The balloon task
+        // does the deflating, so this only asks; the requester still
+        // takes this grow failure and retries.
+        if let Some(balloon) = self.runtime_state.memory_balloon() {
+            balloon.request_deflate();
+        }
         let registry = &self.instance_registry;
         let requester = self.instance().id();
         let mut victim = registry.pick_oom_victim();

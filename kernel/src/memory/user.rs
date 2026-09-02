@@ -2,6 +2,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use core::alloc::Layout;
+use core::future::Future;
 use core::mem::size_of;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -160,11 +161,17 @@ impl UserMemoryPool {
         Ok((ptr, allocation_size))
     }
 
-    pub fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+    /// Returns a byte allocation to the pool.
+    ///
+    /// Named apart from the frame-allocator contract's `deallocate`,
+    /// which takes a frame run: one pool answers both, and a reader
+    /// should not have to work out which is which from the argument
+    /// list.
+    pub fn deallocate_bytes(&self, ptr: NonNull<u8>, layout: Layout) {
         self.deallocate_with_processor(ptr, layout, None);
     }
 
-    pub fn deallocate_on(&self, processor: ProcessorId, ptr: NonNull<u8>, layout: Layout) {
+    pub fn deallocate_bytes_on(&self, processor: ProcessorId, ptr: NonNull<u8>, layout: Layout) {
         self.deallocate_with_processor(ptr, layout, Some(processor));
     }
 
@@ -226,9 +233,15 @@ impl PhysFrameAllocator for UserMemoryPool {
         ))
     }
 
-    fn free_runs<Visit>(&self, min_frames: usize, max_runs: usize, visit: Visit) -> usize
+    fn free_runs<Visit, Visited>(
+        &self,
+        min_frames: usize,
+        max_runs: usize,
+        visit: Visit,
+    ) -> impl Future<Output = usize> + Send
     where
-        Visit: FnMut(PhysFrameRange),
+        Visit: FnMut(PhysFrameRange) -> Visited + Send,
+        Visited: Future<Output = ()> + Send,
     {
         visit_free_runs(
             &self.reported,
@@ -331,7 +344,7 @@ pub fn allocate_user_memory_pool() -> &'static UserMemoryPool {
     Box::leak(Box::new(UserMemoryPool::empty()))
 }
 
-pub fn installed_user_memory_pool() -> Option<&'static UserMemoryPool> {
+pub(crate) fn installed_user_memory_pool() -> Option<&'static UserMemoryPool> {
     let ptr = USER_MEMORY_POOL.load(Ordering::Acquire);
     if ptr.is_null() {
         None
@@ -384,13 +397,13 @@ pub fn allocate_user_frame_uninit_on(
 pub fn deallocate_user_frame(ptr: NonNull<u8>) {
     let layout = Layout::from_size_align(PhysFrame::SIZE, PhysFrame::SIZE)
         .unwrap_or_else(|_| panic!("invalid user-frame layout"));
-    user_memory_pool().deallocate(ptr, layout);
+    user_memory_pool().deallocate_bytes(ptr, layout);
 }
 
 pub fn deallocate_user_frame_on(processor: ProcessorId, ptr: NonNull<u8>) {
     let layout = Layout::from_size_align(PhysFrame::SIZE, PhysFrame::SIZE)
         .unwrap_or_else(|_| panic!("invalid user-frame layout"));
-    user_memory_pool().deallocate_on(processor, ptr, layout);
+    user_memory_pool().deallocate_bytes_on(processor, ptr, layout);
 }
 
 /// Kernel-internal uninit allocator counterpart used by the wasmtime
@@ -406,7 +419,7 @@ pub(crate) fn allocate_user_uninit_on(
 }
 
 pub(crate) fn deallocate_user_on(processor: ProcessorId, ptr: NonNull<u8>, layout: Layout) {
-    user_memory_pool().deallocate_on(processor, ptr, layout);
+    user_memory_pool().deallocate_bytes_on(processor, ptr, layout);
 }
 
 fn buddy_allocation_size(layout: Layout) -> usize {
@@ -509,12 +522,13 @@ mod tests {
 
         let mut reported = None;
         assert_eq!(
-            pool.free_runs(16, 1, |run| {
+            block_on(pool.free_runs(16, 1, |run| {
                 unsafe {
                     core::ptr::write_bytes(run.start.phys_addr() as *mut u8, 0xc3, run.byte_size());
                 }
                 reported = Some(run);
-            }),
+                core::future::ready(())
+            })),
             1
         );
         let reported = reported.expect("one run was reported");

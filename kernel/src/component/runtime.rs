@@ -192,6 +192,11 @@ pub trait ComponentRuntimeState: Clone + Send + 'static {
     /// derived.
     fn root_entropy(&self) -> &crate::RootEntropy;
 
+    /// The memory balloon the host resizes this guest through, if the
+    /// platform has one. The out-of-memory path asks it to give its
+    /// memory back before it condemns an instance.
+    fn memory_balloon(&self) -> Option<crate::memory::BalloonHandle>;
+
     fn profiling_enabled(&self) -> bool;
 
     fn record_profile_stack_nanos(
