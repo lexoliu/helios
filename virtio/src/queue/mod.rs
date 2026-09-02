@@ -687,15 +687,21 @@ impl<T: VirtioTransport> VirtQueue<T> {
         Ok(())
     }
 
-    /// Releases the queue on the device side when the feature allows it.
+    /// Releases the queue on the device side and leaves it disabled.
     ///
     /// Drivers call this from their `Drop` because they, not the queue,
-    /// own the transport the reset has to go through.
+    /// own the transport the reset has to go through. Unlike
+    /// [`VirtQueue::reset`] the queue is not re-programmed afterwards:
+    /// the caller is about to free the ring memory, and re-enabling the
+    /// queue would leave the device pointing at it. Without
+    /// VIRTIO_F_RING_RESET there is no way to take the queue away from
+    /// the device short of resetting the whole device, so the rings stay
+    /// device-visible until the owning driver does that.
     pub fn shutdown(&mut self, transport: &T) {
         if !self.features.ring_reset() {
             return;
         }
-        if let Err(error) = self.reset(transport) {
+        if let Err(error) = transport.reset_queue(self.index) {
             tracing::warn!(
                 queue = self.index,
                 ?error,
