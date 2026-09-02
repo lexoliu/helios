@@ -1146,13 +1146,16 @@ fn connect_and_run(command: &ResolvedVmCommand, runtime: &mut VmRuntime) -> Resu
                 let io = crate::serial::open(socket, baud).await?;
                 let (mut read, _write) = io.into_split();
                 crate::ready::wait_for_boot(&mut read).await?;
+                // The console echo starts before the RPC connection, not
+                // after it: nothing else reads the serial socket once the
+                // RPC has moved off it, and a socket QEMU cannot write
+                // into stops the guest console — but more importantly a
+                // connection that never comes up is exactly when the
+                // guest's own account of why is worth having.
+                crate::ready::echo_serial_console(read);
                 let (vsock_read, vsock_write) =
                     crate::vsock::connect(guest_cid, helios_inspector_protocol::VSOCK_RPC_PORT)
                         .await?;
-                // Nothing else reads the serial socket once the RPC has
-                // moved off it, and a socket QEMU cannot write into stops
-                // the guest console.
-                crate::ready::echo_serial_console(read);
                 let mut client =
                     helios_inspector_protocol::transport::Client::new(vsock_read, vsock_write);
                 crate::ready::wait_until_ready(&mut client).await?;

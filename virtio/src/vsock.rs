@@ -280,6 +280,7 @@ impl<T: VirtioTransport> VirtioVsockDevice<T> {
     /// Interrupt handlers should only acknowledge the device and wake
     /// waiters.
     pub fn handle_interrupt(&self) {
+        tracing::info!("virtio-vsock interrupt");
         self.transport.ack_interrupt();
         self.interrupts.notify_all();
     }
@@ -451,6 +452,7 @@ impl<T: VirtioTransport> VsockDevice for VirtioVsockDevice<T> {
                     return Ok(VsockDelivery::Packet(received));
                 }
             }
+            tracing::info!("virtio-vsock receive ring empty; waiting for the device");
             self.interrupts.notified().await;
         }
     }

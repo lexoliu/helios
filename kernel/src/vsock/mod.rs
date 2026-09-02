@@ -152,7 +152,7 @@ where
     /// Binds `port`, or an ephemeral port when `port` is zero.
     pub fn listen(&self, port: u32, backlog: usize) -> Result<VsockListenerId, VsockError> {
         let listener = self.inner.table.lock().listen(port, backlog)?;
-        tracing::debug!(
+        tracing::info!(
             port = self
                 .inner
                 .table
