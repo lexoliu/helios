@@ -135,12 +135,13 @@ jobs:
         run: |
           # curl speaks wasi:http, which the kernel forwards to the
           # http-client plugin, so both boot programs are required. curl is
-          # invoked by its bootfs path because a PATH-resolved exec currently
-          # reaches the guest with argv[0] duplicated.
+          # invoked by bare name so dash resolves it through PATH and execs
+          # it with argv[0] == "curl", which is the shape that regressed in
+          # issue #35; tools/wasi-apps/smoke.sh covers the bootfs-path shape.
           ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
             --boot-program dash --boot-program debugger \
             --boot-program curl --boot-program http-client --no-compiler-plugin \
-            shell -c '/bin/curl http://detectportal.firefox.com/success.txt' > curl-smoke.out
+            shell -c 'curl http://detectportal.firefox.com/success.txt' > curl-smoke.out
           cat curl-smoke.out
           grep -Fqx success curl-smoke.out
 

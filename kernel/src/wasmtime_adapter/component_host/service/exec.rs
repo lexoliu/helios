@@ -31,8 +31,7 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    pub(super) name: String,
-    pub(super) args: Vec<String>,
+    pub(super) argv: ProgramArgv,
     pub(super) env: Vec<(String, String)>,
     pub(super) executable: ProgramExecutable<CpuImpl, HostFs>,
     pub(super) authority: ProcessAuthority,
@@ -159,8 +158,7 @@ impl WasixAsyncifyState {
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_program_executable<CpuImpl, HostFs>(
     exec_context: ProgramExecContext<CpuImpl, HostFs>,
-    name: String,
-    args: Vec<String>,
+    argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
     filesystem: Option<DebugFileSystemSnapshot>,
@@ -188,8 +186,7 @@ where
         ProgramExecutable::Component(compiled) => {
             run_program_component(
                 exec_context,
-                name,
-                args,
+                argv,
                 env,
                 authority,
                 filesystem,
@@ -207,8 +204,7 @@ where
         ProgramExecutable::CoreModule(compiled) => {
             run_program_core_module(
                 exec_context,
-                name,
-                args,
+                argv,
                 env,
                 authority,
                 filesystem,
@@ -231,8 +227,7 @@ where
         ProgramExecutable::ForkedCoreModule { compiled, restore } => {
             run_program_core_module_with_restore(
                 exec_context,
-                name,
-                args,
+                argv,
                 env,
                 authority,
                 filesystem,
@@ -257,8 +252,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_program_core_module<CpuImpl, HostFs>(
     exec_context: ProgramExecContext<CpuImpl, HostFs>,
-    name: String,
-    args: Vec<String>,
+    argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
     filesystem: Option<DebugFileSystemSnapshot>,
@@ -282,10 +276,8 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    let profile_name = name.clone();
-    let mut argv = Vec::with_capacity(args.len() + 1);
-    argv.push(name);
-    argv.extend(args);
+    let profile_name = argv.program_name().to_owned();
+    let argv = argv.into_vec();
     let run_started_at = monotonic_nanos(&exec_context.cpu);
     let run_cpu = exec_context.cpu.clone();
     let run_timer = exec_context.timer.clone();
@@ -533,8 +525,7 @@ where
                 .expect("core module without WASIX imports requested exec replacement");
             Box::pin(run_program_executable(
                 replacement_state.exec_context,
-                replacement.name,
-                replacement.args,
+                replacement.argv,
                 replacement.env,
                 replacement.authority,
                 replacement.filesystem,
@@ -560,8 +551,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_program_core_module_with_restore<CpuImpl, HostFs>(
     exec_context: ProgramExecContext<CpuImpl, HostFs>,
-    name: String,
-    args: Vec<String>,
+    argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
     filesystem: Option<DebugFileSystemSnapshot>,
@@ -584,10 +574,8 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    let profile_name = name.clone();
-    let mut argv = Vec::with_capacity(args.len() + 1);
-    argv.push(name);
-    argv.extend(args);
+    let profile_name = argv.program_name().to_owned();
+    let argv = argv.into_vec();
     let run_started_at = monotonic_nanos(&exec_context.cpu);
     let run_cpu = exec_context.cpu.clone();
     let run_timer = exec_context.timer.clone();
@@ -774,8 +762,7 @@ where
                 .expect("core module without WASIX imports requested exec replacement");
             Box::pin(run_program_executable(
                 replacement_state.exec_context,
-                replacement.name,
-                replacement.args,
+                replacement.argv,
                 replacement.env,
                 replacement.authority,
                 replacement.filesystem,
@@ -801,8 +788,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_program_component<CpuImpl, HostFs>(
     exec_context: ProgramExecContext<CpuImpl, HostFs>,
-    name: String,
-    args: Vec<String>,
+    argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
     filesystem: Option<DebugFileSystemSnapshot>,
@@ -821,9 +807,7 @@ where
 {
     use crate::ComponentExecutor;
 
-    let mut argv = Vec::with_capacity(args.len() + 1);
-    argv.push(name);
-    argv.extend(args);
+    let argv = argv.into_vec();
     let run_started_at = monotonic_nanos(&exec_context.cpu);
     let run_cpu = exec_context.cpu.clone();
     let run_timer = exec_context.timer.clone();
@@ -1464,12 +1448,11 @@ where
         rewind_stack,
         value: 0,
     };
-    let argv = store.data().arguments.clone();
-    let name = argv.first().cloned().ok_or(ProgramExecError {
+    // A fork inherits the parent's argument vector verbatim.
+    let argv = ProgramArgv::inherited(store.data().arguments.clone()).ok_or(ProgramExecError {
         kind: ProgramExecErrorKind::InvalidBinary,
         detail: ProgramExecErrorDetail::InvalidEntryPoint,
     })?;
-    let args = argv.into_iter().skip(1).collect();
     let mut environment = store.data().environment.clone();
     environment.retain(|(name, _)| name.as_str() != HELIOS_PROCESS_ID_ENV);
     let (_, stdin_reader) = crate::byte_channel();
@@ -1484,8 +1467,7 @@ where
     };
     let mut child = service.spawn_loaded_with_output_mode(
         store.data().exec_context(),
-        name,
-        args,
+        argv,
         environment,
         ProgramExecutable::ForkedCoreModule { compiled, restore },
         store.data().authority.clone(),

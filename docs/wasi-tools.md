@@ -198,7 +198,8 @@ pipeline/redirection/script/cwd/env/exit-status behavior, QuickJS,
 CPython stdlib imports, and an ICMP echo against the slirp gateway. Set
 `HELIOS_WASI_SMOKE_RELEASE=1` when the smoke should rebuild and boot
 release artifacts. Set `HELIOS_WASI_SMOKE_CURL=1` to include the networked
-curl smoke and a ping resolved through DNS.
+curl smoke (run twice, once by bootfs path and once by bare name, so both
+`argv[0]` shapes stay covered) and a ping resolved through DNS.
 
 The compiler-plugin performance gate for the staged curl artifact is:
 

@@ -2,7 +2,6 @@ use super::*;
 
 pub(super) struct WasixPreparedProgram {
     pub(super) guest_name: String,
-    pub(super) source_path: String,
     pub(super) source: ProgramSource,
 }
 
@@ -1682,15 +1681,10 @@ where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
 {
-    let mut argv = wasix_read_exec_string(caller, memory, args, args_len)
+    let argv = wasix_read_exec_string(caller, memory, args, args_len)
         .map(|value| wasix_split_lines(&value))
-        .unwrap_or_default();
-    if argv
-        .first()
-        .is_some_and(|arg| arg == &prepared.guest_name || arg == &prepared.source_path)
-    {
-        argv.remove(0);
-    }
+        .map_err(wasmtime::Error::new)?;
+    let argv = ProgramArgv::from_caller(&prepared.guest_name, argv);
     let mut environment = match env {
         Some((ptr, len)) => wasix_read_exec_string(caller, memory, ptr, len)
             .map(|value| wasix_split_environment(&value))
@@ -1724,8 +1718,7 @@ where
     caller
         .data_mut()
         .request_exec_replacement(WasixExecReplacement {
-            name: prepared.guest_name,
-            args: argv,
+            argv,
             env: environment,
             executable,
             authority,
@@ -3056,11 +3049,7 @@ where
 {
     let source_path = wasix_resolve_exec_source_path(caller.data(), &guest_name)?;
     let source = wasix_read_program_source(caller, &source_path).await?;
-    Ok(WasixPreparedProgram {
-        guest_name,
-        source_path,
-        source,
-    })
+    Ok(WasixPreparedProgram { guest_name, source })
 }
 
 pub(super) async fn wasix_read_program_source<CpuImpl, HostFs>(
@@ -3190,7 +3179,7 @@ pub(super) fn wasix_search_path_candidate(
 pub(super) async fn wasix_spawn_child<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     prepared: WasixPreparedProgram,
-    mut argv: Vec<String>,
+    argv: Vec<String>,
     environment: Option<Vec<(String, String)>>,
     io: WasixSpawnIo,
     authority: Option<ProcessAuthority>,
@@ -3202,12 +3191,7 @@ where
     HostFs: crate::HostFileSystem,
 {
     let prepared_io = wasix_prepare_child_io(caller.data(), io)?;
-    if argv
-        .first()
-        .is_some_and(|arg| arg == &prepared.guest_name || arg == &prepared.source_path)
-    {
-        argv.remove(0);
-    }
+    let argv = ProgramArgv::from_caller(&prepared.guest_name, argv);
     let mut environment = environment.unwrap_or_else(|| caller.data().environment.clone());
     environment.retain(|(name, _)| name.as_str() != HELIOS_PROCESS_ID_ENV);
     let runtime_state = caller.data().runtime_state.clone();
@@ -3220,7 +3204,6 @@ where
         service
             .spawn_with_descriptors_and_output_mode(
                 exec_context,
-                prepared.guest_name,
                 argv,
                 environment,
                 prepared.source,
@@ -3239,7 +3222,6 @@ where
         service
             .spawn_with_signal_dispositions_and_output_mode(
                 exec_context,
-                prepared.guest_name,
                 argv,
                 environment,
                 prepared.source,

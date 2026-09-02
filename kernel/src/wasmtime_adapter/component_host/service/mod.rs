@@ -1,3 +1,5 @@
+mod argv;
+pub(crate) use argv::ProgramArgv;
 mod shared_memory;
 use shared_memory::*;
 mod memory;
@@ -203,8 +205,7 @@ where
 }
 
 struct ProgramSpawnRequest {
-    name: String,
-    args: Vec<String>,
+    argv: ProgramArgv,
     env: Vec<(String, String)>,
     authority: ProcessAuthority,
     filesystem: Option<DebugFileSystemSnapshot>,
@@ -855,8 +856,7 @@ where
     pub(crate) async fn spawn(
         &self,
         exec_context: ProgramExecContext<CpuImpl, HostFs>,
-        name: String,
-        args: Vec<String>,
+        argv: ProgramArgv,
         env: Vec<(String, String)>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
@@ -865,8 +865,7 @@ where
     ) -> Result<ChildHandle, ProgramExecError> {
         self.spawn_with_signal_dispositions(
             exec_context,
-            name,
-            args,
+            argv,
             env,
             source,
             hint,
@@ -881,8 +880,7 @@ where
     async fn spawn_with_signal_dispositions(
         &self,
         exec_context: ProgramExecContext<CpuImpl, HostFs>,
-        name: String,
-        args: Vec<String>,
+        argv: ProgramArgv,
         env: Vec<(String, String)>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
@@ -896,8 +894,7 @@ where
             .await?;
         self.spawn_loaded(
             exec_context,
-            name,
-            args,
+            argv,
             env,
             executable,
             authority,
@@ -911,8 +908,7 @@ where
     async fn spawn_with_signal_dispositions_and_output_mode(
         &self,
         exec_context: ProgramExecContext<CpuImpl, HostFs>,
-        name: String,
-        args: Vec<String>,
+        argv: ProgramArgv,
         env: Vec<(String, String)>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
@@ -930,8 +926,7 @@ where
             .await?;
         self.spawn_loaded_with_output_mode(
             exec_context,
-            name,
-            args,
+            argv,
             env,
             executable,
             authority,
@@ -949,8 +944,7 @@ where
     async fn spawn_with_descriptors_and_output_mode(
         &self,
         exec_context: ProgramExecContext<CpuImpl, HostFs>,
-        name: String,
-        args: Vec<String>,
+        argv: ProgramArgv,
         env: Vec<(String, String)>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
@@ -975,8 +969,7 @@ where
         };
         self.spawn_loaded_with_output_mode(
             exec_context,
-            name,
-            args,
+            argv,
             env,
             executable,
             authority,
@@ -994,8 +987,7 @@ where
     fn spawn_loaded(
         &self,
         exec_context: ProgramExecContext<CpuImpl, HostFs>,
-        name: String,
-        args: Vec<String>,
+        argv: ProgramArgv,
         env: Vec<(String, String)>,
         executable: ProgramExecutable<CpuImpl, HostFs>,
         authority: ProcessAuthority,
@@ -1008,8 +1000,7 @@ where
         let (stderr_writer, stderr_reader) = crate::byte_channel();
         self.spawn_loaded_with_output_mode(
             exec_context,
-            name,
-            args,
+            argv,
             env,
             executable,
             authority,
@@ -1031,8 +1022,7 @@ where
     fn spawn_loaded_with_output_mode(
         &self,
         exec_context: ProgramExecContext<CpuImpl, HostFs>,
-        name: String,
-        args: Vec<String>,
+        argv: ProgramArgv,
         mut env: Vec<(String, String)>,
         executable: ProgramExecutable<CpuImpl, HostFs>,
         authority: ProcessAuthority,
@@ -1049,7 +1039,7 @@ where
             .uptime_nanos(exec_context.cpu.now().ticks());
         let launched_instance = exec_context
             .instance_registry
-            .register(name.clone(), started_at);
+            .register(argv.program_name().to_owned(), started_at);
         let instance_id = launched_instance.id();
         assert!(
             !env.iter()
@@ -1059,8 +1049,7 @@ where
         env.push((HELIOS_PROCESS_ID_ENV.into(), instance_id.raw().to_string()));
         let signal_state = WasixSignalState::new();
         let request = ProgramSpawnRequest {
-            name,
-            args,
+            argv,
             env,
             authority,
             filesystem,
@@ -1082,8 +1071,7 @@ where
         spawner.spawn_local_detached(async move {
             let result = run_program_executable(
                 exec_context,
-                request.name,
-                request.args,
+                request.argv,
                 request.env,
                 request.authority,
                 request.filesystem,
@@ -1122,8 +1110,7 @@ where
     pub(crate) async fn exec_buffered(
         &self,
         exec_context: ProgramExecContext<CpuImpl, HostFs>,
-        name: impl Into<String>,
-        args: Vec<String>,
+        argv: ProgramArgv,
         env: Vec<(String, String)>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
@@ -1133,8 +1120,7 @@ where
     ) -> Result<ExecResult, ProgramExecError> {
         self.exec_buffered_with_snapshot(
             exec_context,
-            name,
-            args,
+            argv,
             env,
             source,
             hint,
@@ -1150,8 +1136,7 @@ where
     async fn exec_buffered_with_snapshot(
         &self,
         exec_context: ProgramExecContext<CpuImpl, HostFs>,
-        name: impl Into<String>,
-        args: Vec<String>,
+        argv: ProgramArgv,
         env: Vec<(String, String)>,
         source: ProgramSource,
         hint: Option<AotCompileHint>,
@@ -1164,8 +1149,7 @@ where
             .await?;
         self.exec_loaded_buffered(
             exec_context,
-            name.into(),
-            args,
+            argv,
             env,
             executable,
             stdin,
@@ -1180,8 +1164,7 @@ where
     async fn exec_loaded_buffered(
         &self,
         exec_context: ProgramExecContext<CpuImpl, HostFs>,
-        name: String,
-        args: Vec<String>,
+        argv: ProgramArgv,
         env: Vec<(String, String)>,
         executable: ProgramExecutable<CpuImpl, HostFs>,
         stdin: Vec<u8>,
@@ -1192,8 +1175,7 @@ where
     ) -> Result<(ExecResult, Option<DebugFileSystemSnapshot>), ProgramExecError> {
         let mut child = self.spawn_loaded(
             exec_context,
-            name,
-            args,
+            argv,
             env,
             executable,
             authority,
