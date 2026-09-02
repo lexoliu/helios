@@ -5,6 +5,7 @@ use core::fmt::Write;
 use crate::cpu::ProcessorId;
 use crate::memory::MemoryRegion;
 
+pub mod balloon;
 pub mod boot;
 pub mod cpu;
 pub mod critical_section;

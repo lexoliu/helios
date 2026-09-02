@@ -54,13 +54,12 @@
 
 extern crate alloc;
 
-use core::future::Future;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
 
 use arrayvec::ArrayVec;
+use helios_hal::balloon::{MemoryBalloon, MemoryStat, MemoryStatTag};
 use helios_hal::cpu::Cpu;
-use helios_hal::io::IoError;
 use helios_hal::pmm::{PhysFrame, PhysFrameAllocator, PhysFrameRange};
 use helios_hal::watchdog::Watchdog;
 use triomphe::Arc;
@@ -105,97 +104,6 @@ const MAX_INFLATED_RUNS: usize = 512;
 /// A balloon that inflated past it would be manufacturing the pressure
 /// the OOM killer then acts on.
 const PRESSURE_FLOOR_DIVISOR: usize = 4;
-
-/// A statistic the guest publishes about its own memory.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MemoryStatTag {
-    /// Memory the guest has free, in bytes.
-    Free,
-    /// Memory the guest manages, in bytes.
-    Total,
-    /// Memory the guest could hand to new work without reclaiming, in
-    /// bytes.
-    Available,
-}
-
-/// One published memory statistic.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MemoryStat {
-    pub tag: MemoryStatTag,
-    pub value: u64,
-}
-
-/// The device side of a balloon, as the kernel needs it.
-///
-/// Backends implement this over their virtio driver; the kernel owns the
-/// policy and never names a transport.
-pub trait MemoryBalloon: Clone + Send + Sync + 'static {
-    /// How many 4 KiB pages the host wants the balloon to hold.
-    fn target_pages(&self) -> u32;
-
-    /// Publishes how many pages the balloon actually holds.
-    fn set_actual(&self, pages: u32);
-
-    /// Whether an inflated page may only be reused after the host has
-    /// been told through the deflate path.
-    fn must_tell_host(&self) -> bool;
-
-    /// Whether the driver may deflate under memory pressure without the
-    /// host lowering its target first.
-    fn deflates_on_oom(&self) -> bool;
-
-    /// Whether the device accepts unsolicited free-page reports.
-    fn reports_free_pages(&self) -> bool;
-
-    /// Whether the device carries a statistics queue.
-    fn publishes_stats(&self) -> bool;
-
-    /// The hint command the device is asking for, if any.
-    fn free_page_hint_cmd_id(&self) -> Option<u32>;
-
-    /// Resolves when the device changes its configuration space.
-    fn config_changed(&self) -> impl Future<Output = ()> + Send + '_;
-
-    /// Hands `ranges` to the host.
-    fn inflate<'a>(
-        &'a self,
-        ranges: &'a mut [&'a mut [u8]],
-    ) -> impl Future<Output = Result<(), IoError>> + Send + 'a;
-
-    /// Takes `ranges` back from the host.
-    fn deflate<'a>(
-        &'a self,
-        ranges: &'a mut [&'a mut [u8]],
-    ) -> impl Future<Output = Result<(), IoError>> + Send + 'a;
-
-    /// Tells the host that `ranges` are free without giving them up.
-    fn report_free<'a>(
-        &'a self,
-        ranges: &'a mut [&'a mut [u8]],
-    ) -> impl Future<Output = Result<(), IoError>> + Send + 'a;
-
-    /// Opens a free-page hint sequence.
-    fn begin_free_page_hint(
-        &self,
-        cmd_id: u32,
-    ) -> impl Future<Output = Result<(), IoError>> + Send + '_;
-
-    /// Names free memory inside an open hint sequence.
-    fn hint_free_pages<'a>(
-        &'a self,
-        ranges: &'a mut [&'a mut [u8]],
-    ) -> impl Future<Output = Result<(), IoError>> + Send + 'a;
-
-    /// Closes an open hint sequence.
-    fn end_free_page_hint(&self) -> impl Future<Output = Result<(), IoError>> + Send + '_;
-
-    /// Publishes the guest's view of its own memory. Resolves when the
-    /// host consumes it, which is the host asking for the next one.
-    fn submit_stats<'a>(
-        &'a self,
-        stats: &'a [MemoryStat],
-    ) -> impl Future<Output = Result<(), IoError>> + Send + 'a;
-}
 
 /// What the balloon holds, as observers see it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -273,7 +181,7 @@ pub fn install_memory_balloon<CpuImpl, WatchdogImpl, Device>(
 where
     CpuImpl: Cpu + Clone + Send + Sync + 'static,
     WatchdogImpl: Watchdog + Clone,
-    Device: MemoryBalloon,
+    Device: MemoryBalloon + Clone,
 {
     let pool = installed_user_memory_pool()
         .unwrap_or_else(|| panic!("memory balloon installed before the user memory pool"));
@@ -341,7 +249,7 @@ struct BalloonService<Pool: PhysFrameAllocator, Device> {
     suppressed_target: Option<u32>,
 }
 
-impl<Pool: PhysFrameAllocator, Device: MemoryBalloon> BalloonService<Pool, Device> {
+impl<Pool: PhysFrameAllocator, Device: MemoryBalloon + Clone> BalloonService<Pool, Device> {
     async fn run(mut self) {
         tracing::info!(
             must_tell_host = self.device.must_tell_host(),
@@ -533,7 +441,7 @@ async fn report_free_memory_forever<CpuImpl, Pool, Device>(
 ) where
     CpuImpl: Cpu + Clone + Send + Sync + 'static,
     Pool: PhysFrameAllocator,
-    Device: MemoryBalloon,
+    Device: MemoryBalloon + Clone,
 {
     tracing::info!(
         interval_secs = FREE_PAGE_REPORT_INTERVAL.as_secs(),
@@ -582,7 +490,7 @@ async fn report_free_memory_forever<CpuImpl, Pool, Device>(
 async fn publish_stats_forever<Pool, Device>(pool: &'static Pool, device: Device)
 where
     Pool: PhysFrameAllocator,
-    Device: MemoryBalloon,
+    Device: MemoryBalloon + Clone,
 {
     loop {
         let stats = PhysFrameAllocator::stats(pool);
@@ -632,7 +540,7 @@ unsafe fn range_bytes<'a>(range: PhysFrameRange) -> &'a mut [u8] {
 #[cfg(test)]
 mod tests {
     use super::{
-        BalloonHandle, BalloonService, INFLATE_RUN_FRAMES, IoError, MemoryBalloon, MemoryStat,
+        BalloonHandle, BalloonService, INFLATE_RUN_FRAMES, MemoryBalloon, MemoryStat,
         MemoryStatTag, PRESSURE_FLOOR_DIVISOR, PhysFrame, PhysFrameAllocator,
         publish_stats_forever,
     };
@@ -641,9 +549,10 @@ mod tests {
     use alloc::vec::Vec;
     use arrayvec::ArrayVec;
     use core::alloc::Layout;
-    use core::future::{Future, pending};
+    use core::future::pending;
     use core::sync::atomic::{AtomicU32, Ordering};
     use futures_lite::future::block_on;
+    use helios_hal::io::IoError;
     use spin::Mutex;
     use triomphe::Arc;
 

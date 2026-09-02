@@ -24,20 +24,22 @@ pub trait ExternalInterruptHandler {
 
 /// Maps claimed interrupt sources to the device handlers a backend
 /// registered at boot.
-pub struct ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Block> {
+pub struct ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Balloon, Block> {
     network: Option<(Source, Network)>,
     host_fs: Option<(Source, HostFs)>,
     entropy: Option<(Source, Entropy)>,
+    balloon: Option<(Source, Balloon)>,
     block: [Option<(Source, Block)>; MAX_BLOCK_DEVICES],
 }
 
-impl<Source, Network, HostFs, Entropy, Block>
-    ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Block>
+impl<Source, Network, HostFs, Entropy, Balloon, Block>
+    ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Balloon, Block>
 where
     Source: PartialEq + Copy,
     Network: ExternalInterruptHandler,
     HostFs: ExternalInterruptHandler,
     Entropy: ExternalInterruptHandler,
+    Balloon: ExternalInterruptHandler,
     Block: ExternalInterruptHandler,
 {
     pub const fn new() -> Self {
@@ -45,6 +47,7 @@ where
             network: None,
             host_fs: None,
             entropy: None,
+            balloon: None,
             block: [const { None }; MAX_BLOCK_DEVICES],
         }
     }
@@ -73,6 +76,14 @@ where
         self.entropy = Some((source, handler));
     }
 
+    pub fn set_balloon(&mut self, source: Source, handler: Balloon) {
+        assert!(
+            self.balloon.is_none(),
+            "memory balloon interrupt route was installed more than once"
+        );
+        self.balloon = Some((source, handler));
+    }
+
     /// Registers one more block device.
     ///
     /// Unlike the single-device slots this one takes several handlers:
@@ -98,6 +109,7 @@ where
         if dispatch(&self.network, source)
             || dispatch(&self.host_fs, source)
             || dispatch(&self.entropy, source)
+            || dispatch(&self.balloon, source)
         {
             return true;
         }
@@ -119,13 +131,14 @@ where
     }
 }
 
-impl<Source, Network, HostFs, Entropy, Block> Default
-    for ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Block>
+impl<Source, Network, HostFs, Entropy, Balloon, Block> Default
+    for ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Balloon, Block>
 where
     Source: PartialEq + Copy,
     Network: ExternalInterruptHandler,
     HostFs: ExternalInterruptHandler,
     Entropy: ExternalInterruptHandler,
+    Balloon: ExternalInterruptHandler,
     Block: ExternalInterruptHandler,
 {
     fn default() -> Self {

@@ -30,9 +30,11 @@
 //! register reads and take no lock; the configuration-change interrupt
 //! wakes [`VirtioBalloonDevice::config_changed`] waiters.
 
+use core::future::Future;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use async_lock::Mutex;
+use helios_hal::balloon::{MemoryBalloon, MemoryStat, MemoryStatTag};
 use helios_hal::io::{IoError, IoResult};
 
 use crate::bus::{DeviceBus, DmaPool};
@@ -106,34 +108,21 @@ const STATS_PER_REPLY: usize = 8;
 /// an unaligned 64-bit value.
 const STAT_BYTES: usize = 10;
 
-/// `VIRTIO_BALLOON_S_*` statistics tags this driver can publish.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u16)]
-pub enum BalloonStatTag {
-    /// Memory the guest currently has free, in bytes.
-    MemFree = 4,
-    /// Total memory the guest manages, in bytes.
-    MemTotal = 5,
-    /// Memory available for starting new work without swapping.
-    Available = 6,
+/// The `VIRTIO_BALLOON_S_*` tag a published statistic goes out as.
+///
+/// The wire numbering is the device's, so it lives here rather than in
+/// the contract the kernel writes its statistics against.
+const fn stat_tag(tag: MemoryStatTag) -> u16 {
+    match tag {
+        MemoryStatTag::Free => 4,
+        MemoryStatTag::Total => 5,
+        MemoryStatTag::Available => 6,
+    }
 }
 
-/// One `VIRTIO_BALLOON_S_*` statistic.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BalloonStat {
-    pub tag: BalloonStatTag,
-    pub value: u64,
-}
-
-impl BalloonStat {
-    pub const fn new(tag: BalloonStatTag, value: u64) -> Self {
-        Self { tag, value }
-    }
-
-    fn encode(self, bytes: &mut [u8; STAT_BYTES]) {
-        bytes[..2].copy_from_slice(&(self.tag as u16).to_le_bytes());
-        bytes[2..].copy_from_slice(&self.value.to_le_bytes());
-    }
+fn encode_stat(stat: MemoryStat, bytes: &mut [u8; STAT_BYTES]) {
+    bytes[..2].copy_from_slice(&stat_tag(stat.tag).to_le_bytes());
+    bytes[2..].copy_from_slice(&stat.value.to_le_bytes());
 }
 
 /// One virtqueue of a balloon device, with the completion table its
@@ -431,7 +420,7 @@ impl<T: VirtioTransport> VirtioBalloonDevice<T> {
     ///
     /// The device consumes one buffer per request it makes, so the
     /// caller submits a fresh one each time the previous one comes back.
-    pub async fn submit_stats(&self, stats: &[BalloonStat]) -> IoResult<()> {
+    pub async fn submit_stats(&self, stats: &[MemoryStat]) -> IoResult<()> {
         let Some(queue) = &self.stats else {
             return Err(IoError::Unsupported);
         };
@@ -444,7 +433,7 @@ impl<T: VirtioTransport> VirtioBalloonDevice<T> {
             let entry: &mut [u8; STAT_BYTES] = (&mut encoded[start..start + STAT_BYTES])
                 .try_into()
                 .unwrap_or_else(|_| panic!("balloon statistics entry has a fixed width"));
-            stat.encode(entry);
+            encode_stat(*stat, entry);
         }
         let payload = &encoded[..stats.len() * STAT_BYTES];
         if payload.is_empty() {
@@ -507,6 +496,83 @@ impl<T: VirtioTransport> VirtioBalloonDevice<T> {
     }
 }
 
+impl<T: VirtioTransport> MemoryBalloon for VirtioBalloonDevice<T> {
+    fn target_pages(&self) -> u32 {
+        Self::target_pages(self)
+    }
+
+    fn set_actual(&self, pages: u32) {
+        Self::set_actual(self, pages);
+    }
+
+    fn must_tell_host(&self) -> bool {
+        Self::must_tell_host(self)
+    }
+
+    fn deflates_on_oom(&self) -> bool {
+        Self::deflates_on_oom(self)
+    }
+
+    fn reports_free_pages(&self) -> bool {
+        Self::reports_free_pages(self)
+    }
+
+    fn publishes_stats(&self) -> bool {
+        Self::publishes_stats(self)
+    }
+
+    fn free_page_hint_cmd_id(&self) -> Option<u32> {
+        Self::free_page_hint_cmd_id(self)
+    }
+
+    fn config_changed(&self) -> impl Future<Output = ()> + Send + '_ {
+        Self::config_changed(self)
+    }
+
+    fn inflate<'a>(
+        &'a self,
+        ranges: &'a mut [&'a mut [u8]],
+    ) -> impl Future<Output = IoResult<()>> + Send + 'a {
+        Self::inflate(self, ranges)
+    }
+
+    fn deflate<'a>(
+        &'a self,
+        ranges: &'a mut [&'a mut [u8]],
+    ) -> impl Future<Output = IoResult<()>> + Send + 'a {
+        Self::deflate(self, ranges)
+    }
+
+    fn report_free<'a>(
+        &'a self,
+        ranges: &'a mut [&'a mut [u8]],
+    ) -> impl Future<Output = IoResult<()>> + Send + 'a {
+        Self::report_free(self, ranges)
+    }
+
+    fn begin_free_page_hint(&self, cmd_id: u32) -> impl Future<Output = IoResult<()>> + Send + '_ {
+        Self::begin_free_page_hint(self, cmd_id)
+    }
+
+    fn hint_free_pages<'a>(
+        &'a self,
+        ranges: &'a mut [&'a mut [u8]],
+    ) -> impl Future<Output = IoResult<()>> + Send + 'a {
+        Self::hint_free_pages(self, ranges)
+    }
+
+    fn end_free_page_hint(&self) -> impl Future<Output = IoResult<()>> + Send + '_ {
+        Self::end_free_page_hint(self)
+    }
+
+    fn submit_stats<'a>(
+        &'a self,
+        stats: &'a [MemoryStat],
+    ) -> impl Future<Output = IoResult<()>> + Send + 'a {
+        Self::submit_stats(self, stats)
+    }
+}
+
 impl<T: VirtioTransport> Drop for VirtioBalloonDevice<T> {
     fn drop(&mut self) {
         self.inflate.shutdown(&self.transport);
@@ -554,16 +620,16 @@ impl QueueLayout {
 #[cfg(test)]
 mod tests {
     use super::{
-        BALLOON_PAGE_SIZE, BalloonQueue, BalloonStat, BalloonStatTag, CONFIG_ACTUAL,
-        CONFIG_FREE_PAGE_HINT_CMD_ID, CONFIG_NUM_PAGES, F_DEFLATE_ON_OOM, F_FREE_PAGE_HINT,
-        F_MUST_TELL_HOST, F_PAGE_REPORTING, F_STATS_VQ, FREE_PAGE_CMD_ID_STOP, QueueLayout,
-        VirtioBalloonDevice,
+        BALLOON_PAGE_SIZE, BalloonQueue, CONFIG_ACTUAL, CONFIG_FREE_PAGE_HINT_CMD_ID,
+        CONFIG_NUM_PAGES, F_DEFLATE_ON_OOM, F_FREE_PAGE_HINT, F_MUST_TELL_HOST, F_PAGE_REPORTING,
+        F_STATS_VQ, FREE_PAGE_CMD_ID_STOP, QueueLayout, VirtioBalloonDevice,
     };
     use crate::testing::{FakeTransport, FakeTransportConfig};
     use crate::transport::{DeviceType, VirtioFeatures, VirtioTransport};
     use alloc::vec::Vec;
     use core::pin::pin;
     use futures_lite::future::{block_on, poll_once};
+    use helios_hal::balloon::{MemoryStat, MemoryStatTag};
 
     /// ISR bit 0: the device used a buffer.
     const USED_BUFFER_INTERRUPT: u32 = 1;
@@ -918,8 +984,14 @@ mod tests {
     fn statistics_are_encoded_as_tag_value_pairs() {
         let device = device();
         let stats = [
-            BalloonStat::new(BalloonStatTag::MemTotal, 0x1122_3344),
-            BalloonStat::new(BalloonStatTag::MemFree, 7),
+            MemoryStat {
+                tag: MemoryStatTag::Total,
+                value: 0x1122_3344,
+            },
+            MemoryStat {
+                tag: MemoryStatTag::Free,
+                value: 7,
+            },
         ];
         let mut submit = pin!(device.submit_stats(&stats));
         assert!(block_on(poll_once(submit.as_mut())).is_none());

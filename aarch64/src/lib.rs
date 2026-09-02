@@ -86,6 +86,7 @@ unsafe extern "C" {
 
 mod vmm;
 pub use vmm::Aarch64UserAddressSpace;
+mod balloon;
 mod block;
 mod entropy;
 mod gic;
@@ -107,6 +108,7 @@ pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
     net::VirtioNetworkDevice,
     host_fs::HostFsTransportService,
     entropy::VirtioEntropyDevice,
+    balloon::VirtioBalloonInterrupt,
     block::VirtioBlockDevice,
 >;
 
@@ -470,6 +472,9 @@ extern "C" fn aarch64_kernel_main() -> ! {
     if entropy::has_entropy_device(&boot_fdt) {
         devices = devices.with_entropy_device();
     }
+    if balloon::has_balloon_device(&boot_fdt) {
+        devices = devices.with_memory_balloon();
+    }
     let block_device_count = block::count_block_devices(&boot_fdt);
     if block_device_count != 0 {
         devices = devices.with_block_devices(block_device_count);
@@ -544,6 +549,15 @@ extern "C" fn aarch64_kernel_main() -> ! {
             platform_state.bootstrap_mpidr(),
         );
         routes.set_entropy(entropy.interrupt, entropy.device);
+    }
+    if let Some(balloon) = balloon::install(&kernel, &boot_fdt, physical_memory_offset, &handoff) {
+        gic.enable_device_interrupt(
+            balloon.interrupt,
+            balloon.trigger,
+            platform_state.bootstrap_mpidr(),
+        );
+        debug_state.install_memory_balloon(balloon.handle);
+        routes.set_balloon(balloon.interrupt, balloon.handler);
     }
     for block in block::install(
         &cpu,

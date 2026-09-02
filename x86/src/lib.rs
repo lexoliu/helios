@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+mod balloon;
 mod block;
 mod boot;
 mod entropy;
@@ -203,6 +204,7 @@ fn x86_kernel_main() -> ! {
     let network_function = net::discover(&pci);
     let host_share_function = host_fs::discover(&pci);
     let entropy_function = entropy::discover(&pci);
+    let balloon_function = balloon::discover(&pci);
     let block_functions = block::discover(&pci);
     let mut devices = DeviceInventory::new().with_debug_serial();
     if network_function.is_some() {
@@ -213,6 +215,9 @@ fn x86_kernel_main() -> ! {
     }
     if entropy_function.is_some() {
         devices = devices.with_entropy_device();
+    }
+    if balloon_function.is_some() {
+        devices = devices.with_memory_balloon();
     }
     if !block_functions.is_empty() {
         devices = devices.with_block_devices(block_functions.len());
@@ -250,6 +255,7 @@ fn x86_kernel_main() -> ! {
         network_function,
         host_share_function,
         entropy_function,
+        balloon_function,
         &block_functions,
         &debug_state,
         root_entropy,
@@ -294,6 +300,7 @@ fn install_pci_devices<WatchdogImpl>(
     network_function: Option<pci_types::PciAddress>,
     host_share_function: Option<pci_types::PciAddress>,
     entropy_function: Option<pci_types::PciAddress>,
+    balloon_function: Option<pci_types::PciAddress>,
     block_functions: &[pci_types::PciAddress],
     debug_state: &debug_state::RuntimeState,
     root_entropy: helios_kernel::RootEntropyHandle,
@@ -373,6 +380,18 @@ fn install_pci_devices<WatchdogImpl>(
         routes.set_entropy(exceptions::ENTROPY_INTERRUPT_VECTOR, device);
     } else {
         tracing::warn!("virtio entropy device was not discovered on the PCI bus");
+    }
+    if let Some(address) = balloon_function {
+        let (handler, handle) = balloon::install(
+            kernel,
+            pci,
+            address,
+            physical_memory_offset,
+            exceptions::BALLOON_INTERRUPT_VECTOR,
+            destination_apic_id,
+        );
+        debug_state.install_memory_balloon(handle);
+        routes.set_balloon(exceptions::BALLOON_INTERRUPT_VECTOR, handler);
     }
     if block_functions.is_empty() {
         tracing::warn!("virtio block device was not discovered on the PCI bus");

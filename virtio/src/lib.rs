@@ -22,8 +22,7 @@ mod testing;
 mod transport;
 
 pub use balloon::{
-    BALLOON_PAGE_SIZE, BalloonStat, BalloonStatTag, FREE_PAGE_CMD_ID_DONE, FREE_PAGE_CMD_ID_STOP,
-    VirtioBalloonDevice,
+    BALLOON_PAGE_SIZE, FREE_PAGE_CMD_ID_DONE, FREE_PAGE_CMD_ID_STOP, VirtioBalloonDevice,
 };
 pub use block::{
     BlockRequestCounts, QueueAffinity, SECTOR_SIZE, VirtioBlockDevice, VirtioBlockResource,

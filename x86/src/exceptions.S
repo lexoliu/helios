@@ -59,6 +59,12 @@ helios_x86_interrupt_entropy:
     push 0x32
     jmp helios_x86_interrupt_common
 
+.global helios_x86_interrupt_balloon
+helios_x86_interrupt_balloon:
+    push 0
+    push 0x37
+    jmp helios_x86_interrupt_common
+
 .global helios_x86_interrupt_block_0
 helios_x86_interrupt_block_0:
     push 0
