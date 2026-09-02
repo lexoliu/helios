@@ -14,6 +14,7 @@ use crate::config::HostedConfig;
 use crate::console::HostedConsole;
 use crate::cpu::HostedCpu;
 use crate::host_fs::HostedFileSystem;
+use crate::rtc::HostRtc;
 
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
@@ -260,6 +261,11 @@ fn spawn_processor_thread(
                 // is the only cryptographic source, and it is always
                 // there, so the root DRBG never reseeds after boot.
                 debug_state.install_root_entropy(helios_kernel::seed_root_entropy(&cpu, None));
+
+                // The host's clock is this backend's calendar, and it is
+                // read once, here, before any component can ask what
+                // time it is.
+                debug_state.seed_wall_clock(cpu.now().ticks(), &HostRtc);
 
                 // Install host filesystem if configured.
                 if let Some(root) = config.init_wasi_root() {

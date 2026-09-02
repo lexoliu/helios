@@ -7,6 +7,7 @@ mod host_fs;
 mod init_program;
 mod oom_killer_tests;
 mod pmm_tests;
+mod rtc;
 mod runtime;
 mod vmm;
 
