@@ -340,7 +340,9 @@ where
                     let listener = access.get().table.get(&resource)?;
                     Ok::<_, wasmtime::Error>((listener.service.clone(), listener.listener))
                 })?;
+                tracing::info!(timeout, "vsock listener accept requested");
                 let accepted = listener.0.accept(listener.1, timeout).await;
+                tracing::info!(ok = accepted.is_ok(), "vsock listener accept returned");
                 let response = match accepted {
                     Ok(stream) => {
                         let pushed = accessor.with(|mut access| {
@@ -403,11 +405,19 @@ where
                     let stream = access.get().table.get(&resource)?;
                     Ok::<_, wasmtime::Error>((stream.service.clone(), stream.stream))
                 })?;
+                tracing::info!(max_bytes, timeout, "vsock stream read requested");
                 let response = stream
                     .0
                     .read(stream.1, max_bytes as usize, timeout)
                     .await
                     .map_err(convert_error::<Bindings>);
+                match &response {
+                    Ok(Some(bytes)) => {
+                        tracing::info!(len = bytes.len(), "vsock stream read returned");
+                    }
+                    Ok(None) => tracing::info!("vsock stream read reached end of file"),
+                    Err(_) => tracing::info!("vsock stream read failed"),
+                }
                 Ok::<_, wasmtime::Error>((response,))
             })
         },
@@ -421,12 +431,17 @@ where
                     let stream = access.get().table.get(&resource)?;
                     Ok::<_, wasmtime::Error>((stream.service.clone(), stream.stream))
                 })?;
+                tracing::info!(len = bytes.len(), timeout, "vsock stream write requested");
                 let response = stream
                     .0
                     .write(stream.1, &bytes, timeout)
                     .await
                     .map(|written| written as u64)
                     .map_err(convert_error::<Bindings>);
+                tracing::info!(
+                    written = response.as_ref().ok().copied(),
+                    "vsock stream write returned"
+                );
                 Ok::<_, wasmtime::Error>((response,))
             })
         },
