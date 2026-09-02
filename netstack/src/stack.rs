@@ -4677,17 +4677,27 @@ where
     /// [`partial_transport_checksum_completes`]); a frame that fails
     /// that falls through to the software verification, which fails it
     /// too, so a bad partial frame is dropped rather than delivered.
-    #[allow(clippy::too_many_arguments)]
     fn device_owns_transport_checksum(
         &self,
         source: IpAddress,
         destination: IpAddress,
         protocol: crate::IpProtocol,
         segment: &[u8],
-        checksum_field_offset: u16,
-        negotiated: bool,
         offload: RxFrameOffload,
     ) -> bool {
+        let (negotiated, checksum_field_offset) = match protocol {
+            crate::IpProtocol::Tcp => (
+                self.config.rx_checksum_offload.tcp,
+                TCP_CHECKSUM_FIELD_OFFSET,
+            ),
+            crate::IpProtocol::Udp => (
+                self.config.rx_checksum_offload.udp,
+                UDP_CHECKSUM_FIELD_OFFSET,
+            ),
+            // No other protocol carries a transport checksum a device
+            // reports on.
+            _ => return false,
+        };
         if !negotiated {
             return false;
         }
@@ -4721,8 +4731,6 @@ where
             destination,
             crate::IpProtocol::Tcp,
             bytes.as_ref(),
-            TCP_CHECKSUM_FIELD_OFFSET,
-            self.config.rx_checksum_offload.tcp,
             offload,
         ) && !tcp_checksum_valid(source, destination, bytes.as_ref())
         {
@@ -5139,8 +5147,6 @@ where
             destination,
             crate::IpProtocol::Udp,
             bytes.as_ref(),
-            UDP_CHECKSUM_FIELD_OFFSET,
-            self.config.rx_checksum_offload.udp,
             offload,
         ) && !udp_checksum_valid(source, destination, bytes.as_ref())
         {

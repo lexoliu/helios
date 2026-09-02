@@ -27,7 +27,7 @@ use crate::bus::{DeviceBus, DmaPool};
 use crate::net::VirtioNetDevice;
 use crate::p9::Virtio9pDevice;
 use crate::rng::VirtioRngDevice;
-use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
+use crate::transport::{DeviceStatus, DeviceType, InterruptStatus, VirtioTransport};
 
 /// PCI vendor id shared by every virtio function.
 pub const VIRTIO_PCI_VENDOR_ID: u16 = 0x1af4;
@@ -509,11 +509,12 @@ impl<P: DmaPool> VirtioTransport for VirtioPciTransport<P> {
         Ok(())
     }
 
-    fn ack_interrupt(&self) {
+    fn ack_interrupt(&self) -> InterruptStatus {
         // The ISR status byte is read-to-clear and is what an INTx-driven
         // function needs to deassert its pin. MSI-X functions report 0
         // here, so the read is harmless either way.
-        let _ = self.isr.read_u8(0);
+        let status = self.isr.read_u8(0);
+        interrupt_status(status, self.msix_vector.is_some())
     }
 
     fn read_config_u32(&self, offset: usize) -> u32 {
@@ -523,6 +524,20 @@ impl<P: DmaPool> VirtioTransport for VirtioPciTransport<P> {
     fn read_config_u8(&self, offset: usize) -> u8 {
         self.bus.read_u8(offset)
     }
+}
+
+/// The interrupt cause a virtio-PCI function reports.
+///
+/// An INTx function sets the two ISR bits and the read clears them, so
+/// the cause is exact. An MSI-X function never touches the ISR — it
+/// signals through the vector instead — and helios binds the
+/// configuration-change vector to the same entry as the virtqueues, so
+/// the register says nothing and either cause is possible.
+fn interrupt_status(isr: u8, msix_enabled: bool) -> InterruptStatus {
+    if msix_enabled {
+        return InterruptStatus::indistinguishable();
+    }
+    InterruptStatus::from_isr(u32::from(isr))
 }
 
 fn parse_capabilities<A: ConfigRegionAccess>(
@@ -684,8 +699,47 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{MODERN_DEVICE_ID_BASE, device_type_from_ids};
-    use crate::transport::DeviceType;
+    use super::{MODERN_DEVICE_ID_BASE, device_type_from_ids, interrupt_status};
+    use crate::transport::{DeviceType, InterruptStatus};
+
+    #[test]
+    fn an_intx_function_reports_the_interrupt_cause_from_its_isr() {
+        assert_eq!(interrupt_status(0, false), InterruptStatus::none());
+        assert_eq!(
+            interrupt_status(1, false),
+            InterruptStatus {
+                used_buffer: true,
+                config_change: false,
+            }
+        );
+        assert_eq!(
+            interrupt_status(2, false),
+            InterruptStatus {
+                used_buffer: false,
+                config_change: true,
+            }
+        );
+        assert_eq!(
+            interrupt_status(3, false),
+            InterruptStatus {
+                used_buffer: true,
+                config_change: true,
+            }
+        );
+    }
+
+    /// An MSI-X function leaves its ISR at zero and shares one vector
+    /// between the queues and the configuration change, so a driver that
+    /// believed the register would never re-read its configuration.
+    #[test]
+    fn an_msix_function_cannot_rule_out_either_interrupt_cause() {
+        assert_eq!(
+            interrupt_status(0, true),
+            InterruptStatus::indistinguishable()
+        );
+        assert!(interrupt_status(0, true).config_change);
+        assert!(interrupt_status(0, true).used_buffer);
+    }
 
     #[test]
     fn modern_device_ids_encode_the_virtio_type() {

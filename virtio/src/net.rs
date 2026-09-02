@@ -1,3 +1,23 @@
+//! virtio-net driver.
+//!
+//! Receive memory rule: every buffer the device ever writes into is
+//! allocated once, at bring-up, and recycled for the lifetime of the
+//! device. Nothing on the receive path allocates per packet.
+//!
+//! Two pools per queue pair carry that. The receive ring is backed by
+//! one page-granular slot per descriptor, handed to the device as a
+//! single writable buffer; a frame that fits one slot is delivered as an
+//! owning [`RxFrame`] borrowing that slot, so the common path copies
+//! nothing. With `VIRTIO_NET_F_MRG_RXBUF` the device may spread one
+//! frame across several consecutive slots, and since the network stack
+//! parses contiguous frames those chains are assembled into a buffer
+//! from the second pool: a small set of maximum-size frame buffers,
+//! sized so the pool can absorb every byte the receive ring can hold.
+//! The assembled frame borrows its pool buffer the same way, and the
+//! buffer returns to the pool when the stack drops the frame. A drain
+//! that finds the pool empty stops and leaves the used entries in the
+//! ring for the next call rather than dropping frames.
+
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -8,8 +28,10 @@ use core::cell::UnsafeCell;
 use core::future::Future;
 use core::mem::size_of;
 use core::ops::Range;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use helios_hal::io::{IoError, IoResult};
+use helios_netstack::{LinkState, RxChecksumReport, RxFrameOffload};
 use spin::Mutex as SpinMutex;
 
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate_with};
@@ -20,6 +42,21 @@ use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 const NET_QUEUE_SIZE: u16 = 256;
 /// Receive buffers are always a single writable descriptor.
 const RX_CHAIN_LIMIT: u16 = 1;
+/// Receive slot granularity. A page per descriptor is what makes
+/// `VIRTIO_NET_F_MRG_RXBUF` worth negotiating: MTU-sized frames leave
+/// most of a slot unused, while a device-coalesced large receive frame
+/// spans as many slots as it needs instead of forcing every slot to be
+/// 64 KiB.
+const RX_PAGE_BYTES: usize = 4096;
+/// Largest Ethernet frame a device with receive segmentation offload may
+/// deliver (virtio 1.2 §5.1.6.3.1 sizes its non-mergeable receive
+/// buffers at this plus the 12-byte header).
+const MAX_LARGE_RECEIVE_FRAME_BYTES: usize = 65_550;
+/// Upper bound on the reassembly buffers one queue pair keeps. Without
+/// receive segmentation offload a frame barely outgrows a page, so the
+/// byte-capacity rule alone would allocate hundreds of them for chains
+/// that a well-behaved device never even produces.
+const MAX_RX_REASSEMBLY_BUFFERS: usize = 64;
 /// A transmit frame is either one slot-resident buffer or a slot-resident
 /// header prefix chained to an external payload.
 const TX_CHAIN_LIMIT: u16 = 2;
@@ -39,6 +76,28 @@ const NET_FEATURE_HOST_TSO6: u64 = 1 << 12;
 const NET_FEATURE_MAC: u64 = 1 << 5;
 const NET_FEATURE_STATUS: u64 = 1 << 16;
 const NET_FEATURE_MTU: u64 = 1 << 3;
+/// VIRTIO_NET_F_GUEST_CSUM: the driver accepts frames whose transport
+/// checksum the device either validated or left partial, so the stack
+/// can skip a software verification per frame.
+const NET_FEATURE_GUEST_CSUM: u64 = 1 << 1;
+/// VIRTIO_NET_F_GUEST_TSO4/6, _GUEST_ECN, _GUEST_UFO: the driver accepts
+/// receive frames the device coalesced out of several wire segments.
+/// All four require GUEST_CSUM, and ECN additionally requires one of the
+/// TSO families (virtio 1.2 §5.1.3.1).
+const NET_FEATURE_GUEST_TSO4: u64 = 1 << 7;
+const NET_FEATURE_GUEST_TSO6: u64 = 1 << 8;
+const NET_FEATURE_GUEST_ECN: u64 = 1 << 9;
+const NET_FEATURE_GUEST_UFO: u64 = 1 << 10;
+/// VIRTIO_NET_F_MRG_RXBUF: the device may spread one receive frame
+/// across several buffers, reporting the count in the header's
+/// `num_buffers`. Required for large receive offload with buffers
+/// smaller than 64 KiB.
+const NET_FEATURE_MRG_RXBUF: u64 = 1 << 15;
+/// Byte offset of the `status` field in the virtio-net configuration
+/// space (mac[6], status[2], max_virtqueue_pairs[2], mtu[2]).
+const NET_CONFIG_STATUS_OFFSET: usize = 6;
+/// VIRTIO_NET_S_LINK_UP: the device reports carrier in `status`.
+const NET_STATUS_LINK_UP: u16 = 1;
 /// VIRTIO_NET_F_MQ: device exposes multiple TX/RX queue pairs and
 /// the driver may activate up to `max_virtqueue_pairs` of them via
 /// the control queue command class 4 (`VIRTIO_NET_CTRL_MQ`,
@@ -163,9 +222,15 @@ impl TxFrame for helios_netstack::PacketBuffer {
 
 /// VIRTIO_NET_HDR_F_NEEDS_CSUM: csum_start/csum_offset are valid.
 const VIRTIO_NET_HDR_F_NEEDS_CSUM: u8 = 1;
+/// VIRTIO_NET_HDR_F_DATA_VALID: the device validated the frame's
+/// transport checksum. Never set together with NEEDS_CSUM.
+const VIRTIO_NET_HDR_F_DATA_VALID: u8 = 2;
 const VIRTIO_NET_HDR_GSO_NONE: u8 = 0;
 const VIRTIO_NET_HDR_GSO_TCPV4: u8 = 1;
+const VIRTIO_NET_HDR_GSO_UDP: u8 = 3;
 const VIRTIO_NET_HDR_GSO_TCPV6: u8 = 4;
+/// VIRTIO_NET_HDR_GSO_ECN rides on the segmentation type as a flag.
+const VIRTIO_NET_HDR_GSO_ECN: u8 = 0x80;
 
 /// TCP segmentation-offload metadata for one oversized transmit frame:
 /// the device splits it into `mss`-payload segments, replicating the
@@ -189,6 +254,52 @@ struct VirtioNetHeader {
     num_buffers: u16,
 }
 
+/// The virtio-net header the device wrote in front of a received frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RxHeader {
+    flags: u8,
+    gso_type: u8,
+    gso_size: u16,
+    csum_start: u16,
+    csum_offset: u16,
+    /// Buffers this frame occupies, valid only with
+    /// `VIRTIO_NET_F_MRG_RXBUF`.
+    num_buffers: u16,
+}
+
+impl RxHeader {
+    /// Reads the fixed 12-byte header. Every field is little-endian.
+    fn parse(bytes: &[u8]) -> Self {
+        assert!(
+            bytes.len() >= size_of::<VirtioNetHeader>(),
+            "virtio net receive header is shorter than the header layout"
+        );
+        Self {
+            flags: bytes[0],
+            gso_type: bytes[1],
+            gso_size: u16::from_le_bytes([bytes[4], bytes[5]]),
+            csum_start: u16::from_le_bytes([bytes[6], bytes[7]]),
+            csum_offset: u16::from_le_bytes([bytes[8], bytes[9]]),
+            num_buffers: u16::from_le_bytes([bytes[10], bytes[11]]),
+        }
+    }
+
+    /// The segmentation type without its ECN flag.
+    const fn gso_family(self) -> u8 {
+        self.gso_type & !VIRTIO_NET_HDR_GSO_ECN
+    }
+}
+
+/// The first buffer of a mergeable receive chain: which slot it landed
+/// in, where in the available ring it was posted, and how many bytes the
+/// device wrote into it.
+#[derive(Clone, Copy)]
+struct RxChainHead {
+    slot: u16,
+    position: u64,
+    used_len: usize,
+}
+
 struct NetRxState<T: VirtioTransport> {
     rx_queue: VirtQueue<T>,
     /// Receive slots currently owned by the device, indexed by slot.
@@ -200,6 +311,18 @@ struct NetRxState<T: VirtioTransport> {
     /// mapping is recorded when a buffer is posted and read back when the
     /// device completes it.
     rx_slot_for_token: Box<[u16]>,
+    /// Position in the available ring each in-flight descriptor was
+    /// posted at, indexed by descriptor identifier.
+    ///
+    /// A mergeable receive chain is assembled out of consecutively
+    /// available buffers, so the tail buffers of a frame must carry the
+    /// positions that follow its head. Recording the order the driver
+    /// made buffers available is what lets the reassembly check that
+    /// assumption instead of trusting whatever the device completes
+    /// next.
+    rx_post_position: Box<[u64]>,
+    /// Position the next posted buffer is stamped with.
+    rx_next_post_position: u64,
 }
 
 struct RxReturnedSlots {
@@ -217,6 +340,59 @@ struct RxFrameOwner {
     range: Range<usize>,
 }
 
+/// Contiguous frame buffers that mergeable receive chains are assembled
+/// into.
+///
+/// Allocated once at bring-up and never grown. The pool holds as many
+/// maximum-size frame buffers as the receive ring can fill — its byte
+/// capacity matches the ring's — so a drain only ever runs out while the
+/// stack still holds frames handed to it earlier, and then it stops
+/// instead of dropping anything. Devices whose largest possible frame
+/// fits one receive slot never build a pool at all.
+struct RxReassemblyPool {
+    buffers: Box<[Arc<RxBufferSlot>]>,
+    /// Buffers not currently backing a delivered frame. A buffer returns
+    /// here through the same owner drop that recycles receive slots.
+    free: Arc<RxReturnedSlots>,
+}
+
+impl RxReassemblyPool {
+    fn new(count: usize, bytes: usize) -> IoResult<Self> {
+        assert!(
+            count != 0,
+            "a reassembly pool must hold at least one buffer"
+        );
+        let free = Arc::new(RxReturnedSlots {
+            slots: SpinMutex::new(Vec::with_capacity(count)),
+        });
+        let mut buffers = Vec::with_capacity(count);
+        for index in 0..count {
+            let slot = u16::try_from(index).map_err(|_| IoError::DeviceFault)?;
+            buffers.push(Arc::new(RxBufferSlot {
+                slot,
+                returned: free.clone(),
+                buffer: UnsafeCell::new(vec![0_u8; bytes].into_boxed_slice()),
+            }));
+            free.slots.lock().push(slot);
+        }
+        Ok(Self {
+            buffers: buffers.into_boxed_slice(),
+            free,
+        })
+    }
+
+    fn has_free(&self) -> bool {
+        !self.free.slots.lock().is_empty()
+    }
+
+    /// Takes a buffer out of the pool. It returns on its own when the
+    /// frame assembled into it is dropped.
+    fn take(&self) -> Option<Arc<RxBufferSlot>> {
+        let slot = self.free.slots.lock().pop()?;
+        Some(self.buffers[usize::from(slot)].clone())
+    }
+}
+
 struct NetTxState<T: VirtioTransport> {
     tx_queue: VirtQueue<T>,
     tx_buffers: Box<[u8]>,
@@ -232,6 +408,8 @@ struct NetQueuePair<T: VirtioTransport> {
     rx_state: AsyncMutex<NetRxState<T>>,
     rx_returned: Arc<RxReturnedSlots>,
     rx_slots: Box<[Arc<RxBufferSlot>]>,
+    /// Present only when a frame can span more than one receive slot.
+    rx_reassembly: Option<RxReassemblyPool>,
     tx_state: SpinMutex<NetTxState<T>>,
 }
 
@@ -262,6 +440,10 @@ pub struct VirtioNetDevice<T: VirtioTransport> {
     features: NegotiatedFeatures,
     mac_address: [u8; 6],
     max_frame_len: usize,
+    /// Largest frame the device may deliver. Equal to `max_frame_len`
+    /// unless receive segmentation offload is negotiated, in which case
+    /// the device may coalesce several wire segments into one frame.
+    max_receive_frame_len: usize,
     header_len: usize,
     /// VIRTIO_NET_F_CSUM was negotiated: frames may carry partial
     /// checksums for the device to finish.
@@ -270,6 +452,26 @@ pub struct VirtioNetDevice<T: VirtioTransport> {
     /// driver may submit oversized TCP segments for device segmentation.
     tso_v4_negotiated: bool,
     tso_v6_negotiated: bool,
+    /// VIRTIO_NET_F_GUEST_CSUM was negotiated: the device reports per
+    /// frame whether it validated the transport checksum or left it
+    /// partial.
+    guest_checksum_negotiated: bool,
+    /// VIRTIO_NET_F_MRG_RXBUF was negotiated: a received frame may span
+    /// several receive buffers and the header's `num_buffers` says how
+    /// many.
+    mergeable_rx_buffers: bool,
+    /// VIRTIO_NET_F_GUEST_TSO4/6 and _GUEST_UFO: the device may deliver
+    /// frames it coalesced out of several wire segments.
+    guest_tso_v4_negotiated: bool,
+    guest_tso_v6_negotiated: bool,
+    guest_ufo_negotiated: bool,
+    /// VIRTIO_NET_F_STATUS was negotiated: the configuration space
+    /// carries a link status the driver re-reads on configuration
+    /// change.
+    status_negotiated: bool,
+    /// Last link state read out of the configuration space. Devices
+    /// without VIRTIO_NET_F_STATUS are always up.
+    link_up: AtomicBool,
 }
 
 /// Control queue state: a single descriptor pair (header bytes
@@ -285,7 +487,7 @@ struct NetControlState<T: VirtioTransport> {
     ack_buffer: Box<[u8]>,
 }
 
-pub type RxFrame = Bytes;
+pub use helios_netstack::RxFrame;
 
 // SAFETY: each `NetQueuePair`'s RX/TX state is independently
 // synchronised by its own async / spin lock; `control` follows the
@@ -341,6 +543,31 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             } else {
                 0
             };
+            // Receive offloads. GUEST_CSUM stands on its own: it lets the
+            // device tell the stack, per frame, that the transport
+            // checksum is already accounted for. The receive
+            // segmentation bits all depend on it, and additionally need
+            // buffers that can hold a coalesced frame — either 64 KiB
+            // each or mergeable buffers (virtio 1.2 §5.1.6.3.1). helios
+            // pairs them with MRG_RXBUF and page-granular buffers, so
+            // they are asked for only when the device offers merging
+            // too. ECN is a modifier on a segmentation type, so it is
+            // only meaningful once one of the TSO families is in.
+            let guest_csum_mask = offered & NET_FEATURE_GUEST_CSUM;
+            let mrg_mask = offered & NET_FEATURE_MRG_RXBUF;
+            let guest_gso_mask = if guest_csum_mask != 0 && mrg_mask != 0 {
+                let families = offered
+                    & (NET_FEATURE_GUEST_TSO4 | NET_FEATURE_GUEST_TSO6 | NET_FEATURE_GUEST_UFO);
+                let tcp_families = families & (NET_FEATURE_GUEST_TSO4 | NET_FEATURE_GUEST_TSO6);
+                let ecn_mask = if tcp_families != 0 {
+                    offered & NET_FEATURE_GUEST_ECN
+                } else {
+                    0
+                };
+                families | ecn_mask
+            } else {
+                0
+            };
             RING_FEATURES
                 | NET_FEATURE_CSUM
                 | NET_FEATURE_MAC
@@ -348,6 +575,9 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 | NET_FEATURE_MTU
                 | mq_mask
                 | tso_mask
+                | guest_csum_mask
+                | mrg_mask
+                | guest_gso_mask
         })?;
 
         let mac_address = read_mac_address(&transport);
@@ -356,9 +586,29 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             .checked_add(ETH_HEADER_LEN)
             .ok_or(IoError::DeviceFault)?;
         let header_len = size_of::<VirtioNetHeader>();
-        let rx_buffer_len = header_len
-            .checked_add(max_frame_len)
-            .ok_or(IoError::DeviceFault)?;
+        let mergeable_rx_buffers = features.device(NET_FEATURE_MRG_RXBUF);
+        let guest_tso_v4_negotiated = features.device(NET_FEATURE_GUEST_TSO4);
+        let guest_tso_v6_negotiated = features.device(NET_FEATURE_GUEST_TSO6);
+        let guest_ufo_negotiated = features.device(NET_FEATURE_GUEST_UFO);
+        let large_receive =
+            guest_tso_v4_negotiated || guest_tso_v6_negotiated || guest_ufo_negotiated;
+        let max_receive_frame_len = if large_receive {
+            MAX_LARGE_RECEIVE_FRAME_BYTES
+        } else {
+            max_frame_len
+        };
+        // Receive slots are page-granular. Mergeable buffers make one
+        // page the whole slot: a frame larger than a page arrives as a
+        // chain. Without merging the device has no way to split a frame,
+        // so the slot has to hold the largest one whole.
+        let rx_buffer_len = if mergeable_rx_buffers {
+            RX_PAGE_BYTES
+        } else {
+            header_len
+                .checked_add(max_receive_frame_len)
+                .ok_or(IoError::DeviceFault)?
+                .next_multiple_of(RX_PAGE_BYTES)
+        };
         let tx_buffer_len = header_len
             .checked_add(max_frame_len)
             .ok_or(IoError::DeviceFault)?;
@@ -416,9 +666,13 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             }
             let mut rx_in_device = DescriptorBitSet::new(rx_buffer_count);
             let mut rx_slot_for_token = vec![0_u16; usize::from(rx_queue_size)].into_boxed_slice();
+            let mut rx_post_position = vec![0_u64; usize::from(rx_queue_size)].into_boxed_slice();
+            let mut rx_next_post_position = 0_u64;
             for (slot_index, slot) in rx_slots.iter().enumerate() {
                 let token = rx_queue.submit_output_deferred(&transport, slot.buffer_mut())?;
                 rx_slot_for_token[usize::from(token)] = slot.slot;
+                rx_post_position[usize::from(token)] = rx_next_post_position;
+                rx_next_post_position += 1;
                 assert!(
                     !rx_in_device.get(slot_index),
                     "virtio net RX slot was posted twice during initialization"
@@ -426,6 +680,23 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 rx_in_device.set(slot_index);
             }
             rx_queue.publish();
+            // A frame spans more than one slot only where merging is
+            // negotiated, so that is exactly where the pool exists. It
+            // holds as many frame buffers as the ring's byte capacity
+            // can produce — never the narrower resource — up to a cap
+            // that keeps the pool from dwarfing the ring when frames are
+            // small.
+            let rx_reassembly = if mergeable_rx_buffers {
+                let ring_bytes = rx_buffer_len
+                    .checked_mul(rx_buffer_count)
+                    .ok_or(IoError::DeviceFault)?;
+                let count = ring_bytes
+                    .div_ceil(max_receive_frame_len)
+                    .clamp(2, MAX_RX_REASSEMBLY_BUFFERS);
+                Some(RxReassemblyPool::new(count, max_receive_frame_len)?)
+            } else {
+                None
+            };
             let tx_buffer_count = usize::from(tx_queue_size);
             let tx_buffers = vec![
                 0_u8;
@@ -441,9 +712,12 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                     rx_queue,
                     rx_in_device,
                     rx_slot_for_token,
+                    rx_post_position,
+                    rx_next_post_position,
                 }),
                 rx_returned,
                 rx_slots: rx_slots.into_boxed_slice(),
+                rx_reassembly,
                 tx_state: SpinMutex::new(NetTxState {
                     tx_queue,
                     tx_buffers,
@@ -512,11 +786,22 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             features,
             mac_address,
             max_frame_len,
+            max_receive_frame_len,
             header_len,
             tx_checksum_negotiated: features.device(NET_FEATURE_CSUM),
             tso_v4_negotiated: features.device(NET_FEATURE_HOST_TSO4),
             tso_v6_negotiated: features.device(NET_FEATURE_HOST_TSO6),
+            guest_checksum_negotiated: features.device(NET_FEATURE_GUEST_CSUM),
+            mergeable_rx_buffers,
+            guest_tso_v4_negotiated,
+            guest_tso_v6_negotiated,
+            guest_ufo_negotiated,
+            status_negotiated: features.device(NET_FEATURE_STATUS),
+            link_up: AtomicBool::new(true),
         };
+        device
+            .link_up
+            .store(read_link_up(&device.transport, features), Ordering::Relaxed);
 
         // Activate every queue pair on the device side. The device
         // ships with a single pair active by default; without this
@@ -540,9 +825,19 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             csum = device.tx_checksum_negotiated,
             host_tso4 = device.tso_v4_negotiated,
             host_tso6 = device.tso_v6_negotiated,
+            guest_csum = device.guest_checksum_negotiated,
+            guest_tso4 = device.guest_tso_v4_negotiated,
+            guest_tso6 = device.guest_tso_v6_negotiated,
+            guest_ecn = features.device(NET_FEATURE_GUEST_ECN),
+            guest_ufo = device.guest_ufo_negotiated,
+            mrg_rxbuf = device.mergeable_rx_buffers,
             mq = features.device(NET_FEATURE_MQ),
             ctrl_vq = features.device(NET_FEATURE_CTRL_VQ),
+            status = device.status_negotiated,
+            link_up = device.link_up.load(Ordering::Relaxed),
             max_frame_len = device.max_frame_len,
+            max_receive_frame_len = device.max_receive_frame_len,
+            rx_buffer_len = device.rx_buffer_len,
             "virtio-net online"
         );
         Ok(device)
@@ -619,8 +914,34 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     }
 
     pub fn handle_interrupt(&self) {
-        self.transport.ack_interrupt();
+        let status = self.transport.ack_interrupt();
+        if status.config_change {
+            self.refresh_link_state();
+        }
+        // Waiters park on this notification for receive arrival and
+        // transmit completion alike, and a link change is progress they
+        // have to observe too, so both causes wake them.
         self.interrupts.notify_all();
+    }
+
+    /// Carrier as of the last configuration-change interrupt.
+    pub fn link_state(&self) -> LinkState {
+        if self.link_up.load(Ordering::Acquire) {
+            LinkState::Up
+        } else {
+            LinkState::Down
+        }
+    }
+
+    /// Re-reads the link status out of the configuration space and
+    /// publishes it. Logged only on a transition: a configuration change
+    /// can be raised for anything the device keeps there.
+    fn refresh_link_state(&self) -> LinkState {
+        let up = read_link_up(&self.transport, self.features);
+        if self.link_up.swap(up, Ordering::AcqRel) != up {
+            tracing::info!(link_up = up, "virtio-net link state changed");
+        }
+        if up { LinkState::Up } else { LinkState::Down }
     }
 
     /// Whether VIRTIO_NET_F_CSUM was negotiated, allowing frames with
@@ -647,28 +968,51 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         self.max_frame_len
     }
 
+    /// Largest frame the device may deliver, which exceeds
+    /// [`Self::max_frame_len`] once receive segmentation offload is
+    /// negotiated.
+    pub fn max_receive_frame_len(&self) -> usize {
+        self.max_receive_frame_len
+    }
+
+    /// Whether the device reports per received frame what it did about
+    /// the transport checksum (VIRTIO_NET_F_GUEST_CSUM).
+    pub fn guest_checksum_negotiated(&self) -> bool {
+        self.guest_checksum_negotiated
+    }
+
+    /// Whether the device may coalesce received segments of the given
+    /// address family into one frame (VIRTIO_NET_F_GUEST_TSO4/6).
+    pub fn large_receive_negotiated(&self, ipv6: bool) -> bool {
+        if ipv6 {
+            self.guest_tso_v6_negotiated
+        } else {
+            self.guest_tso_v4_negotiated
+        }
+    }
+
+    /// Whether the device may spread one received frame across several
+    /// receive buffers (VIRTIO_NET_F_MRG_RXBUF).
+    pub fn mergeable_rx_buffers(&self) -> bool {
+        self.mergeable_rx_buffers
+    }
+
     pub async fn try_receive_into(&self, output: &mut [u8]) -> IoResult<Option<usize>> {
         const PAIR: usize = 0;
         let mut state = self.queue_pairs[PAIR].rx_state.lock().await;
         self.drain_returned_rx_buffers(PAIR, &mut state)?;
-        let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
+        let Some(frame) = self.receive_next_frame(PAIR, &mut state)? else {
             return Ok(None);
         };
-        let slot_index = Self::complete_rx_slot(&mut state, token);
-        let used_len = used_len as usize;
-        if used_len < self.header_len || used_len > self.rx_buffer_len {
-            self.repost_rx_buffer(PAIR, &mut state, slot_index)?;
-            return Err(IoError::DeviceFault);
-        }
-
-        let frame_len = used_len - self.header_len;
+        let frame_len = frame.bytes.len();
         if frame_len > output.len() {
-            self.repost_rx_buffer(PAIR, &mut state, slot_index)?;
+            // Dropping the frame returns its slot; the next drain of
+            // this pair reposts it.
             return Err(IoError::OutOfBounds);
         }
-        let slot = &self.queue_pairs[PAIR].rx_slots[usize::from(slot_index)];
-        output[..frame_len].copy_from_slice(&slot.buffer()[self.header_len..used_len]);
-        self.repost_rx_buffer(PAIR, &mut state, slot_index)?;
+        output[..frame_len].copy_from_slice(frame.bytes.as_ref());
+        drop(frame);
+        self.drain_returned_rx_buffers(PAIR, &mut state)?;
         Ok(Some(frame_len))
     }
 
@@ -676,17 +1020,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         const PAIR: usize = 0;
         let mut state = self.queue_pairs[PAIR].rx_state.lock().await;
         self.drain_returned_rx_buffers(PAIR, &mut state)?;
-        let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
-            return Ok(None);
-        };
-        let slot_index = Self::complete_rx_slot(&mut state, token);
-        let used_len = used_len as usize;
-        if used_len < self.header_len || used_len > self.rx_buffer_len {
-            self.repost_rx_buffer(PAIR, &mut state, slot_index)?;
-            return Err(IoError::DeviceFault);
-        }
-
-        Ok(Some(self.rx_frame_from_slot(PAIR, slot_index, used_len)))
+        self.receive_next_frame(PAIR, &mut state)
     }
 
     pub fn try_receive_frames_immediate(
@@ -737,22 +1071,178 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         self.drain_returned_rx_buffers(pair_idx, state)?;
         let mut received = 0usize;
         while received < frames.len() {
-            let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
+            let Some(frame) = self.receive_next_frame(pair_idx, state)? else {
                 break;
             };
-            let slot_index = Self::complete_rx_slot(state, token);
-            let used_len = used_len as usize;
-            if used_len < self.header_len || used_len > self.rx_buffer_len {
-                self.repost_rx_buffer(pair_idx, state, slot_index)?;
-                return Err(IoError::DeviceFault);
-            }
-
             let slot = &mut frames[received];
             assert!(slot.is_none(), "virtio net RX batch slot was not empty");
-            *slot = Some(self.rx_frame_from_slot(pair_idx, slot_index, used_len));
+            *slot = Some(frame);
             received += 1;
         }
         Ok(received)
+    }
+
+    /// Takes the next completed frame off a receive ring, assembling a
+    /// mergeable chain when the device split one across buffers.
+    ///
+    /// `Ok(None)` means the ring has nothing ready — or, when a chain
+    /// would need a reassembly buffer and none is free, that the caller
+    /// should come back after releasing the frames it already holds. The
+    /// used entries stay in the ring either way, so nothing is dropped.
+    fn receive_next_frame(
+        &self,
+        pair_idx: usize,
+        state: &mut NetRxState<T>,
+    ) -> IoResult<Option<RxFrame>> {
+        let reassembly = self.queue_pairs[pair_idx].rx_reassembly.as_ref();
+        if reassembly.is_some_and(|pool| !pool.has_free()) {
+            return Ok(None);
+        }
+        let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
+            return Ok(None);
+        };
+        let (slot_index, position) = Self::complete_rx_slot(state, token);
+        let used_len = used_len as usize;
+        if used_len < self.header_len || used_len > self.rx_buffer_len {
+            self.repost_rx_buffer(pair_idx, state, slot_index)?;
+            return Err(IoError::DeviceFault);
+        }
+        let slot = &self.queue_pairs[pair_idx].rx_slots[usize::from(slot_index)];
+        let header = RxHeader::parse(&slot.buffer()[..self.header_len]);
+        let offload = match self.rx_offload(header) {
+            Ok(offload) => offload,
+            Err(error) => {
+                self.repost_rx_buffer(pair_idx, state, slot_index)?;
+                return Err(error);
+            }
+        };
+        let buffers = if self.mergeable_rx_buffers {
+            usize::from(header.num_buffers)
+        } else {
+            1
+        };
+        if buffers == 0 {
+            self.repost_rx_buffer(pair_idx, state, slot_index)?;
+            return Err(IoError::DeviceFault);
+        }
+        if buffers == 1 {
+            return Ok(Some(RxFrame::with_offload(
+                self.rx_bytes_from_slot(pair_idx, slot_index, self.header_len..used_len),
+                offload,
+            )));
+        }
+        let pool = reassembly.ok_or(IoError::DeviceFault)?;
+        let target = pool.take().ok_or(IoError::DeviceFault)?;
+        let head = RxChainHead {
+            slot: slot_index,
+            position,
+            used_len,
+        };
+        let assembled = self.assemble_rx_chain(pair_idx, state, head, buffers, &target);
+        // Every buffer of the chain has to go back to the device whether
+        // the assembly succeeded or not; the head slot is released by
+        // the assembly itself.
+        let assembled = assembled?;
+        Ok(Some(RxFrame::with_offload(
+            Bytes::from_owner(RxFrameOwner {
+                slot: target,
+                range: 0..assembled,
+            }),
+            offload,
+        )))
+    }
+
+    /// Copies a mergeable receive chain into `target` and returns the
+    /// assembled frame length.
+    ///
+    /// The device fills a chain out of consecutively available buffers
+    /// and publishes the whole group before the driver can see any of
+    /// it, so the tail buffers are already in the used ring and carry
+    /// the available-ring positions that follow the head's. A device
+    /// that breaks either half of that has handed over a frame this
+    /// driver cannot reconstruct, and the chain is refused rather than
+    /// stitched together out of unrelated buffers.
+    fn assemble_rx_chain(
+        &self,
+        pair_idx: usize,
+        state: &mut NetRxState<T>,
+        head: RxChainHead,
+        buffers: usize,
+        target: &Arc<RxBufferSlot>,
+    ) -> IoResult<usize> {
+        let head_slot = &self.queue_pairs[pair_idx].rx_slots[usize::from(head.slot)];
+        let mut assembled = head.used_len - self.header_len;
+        target.buffer_mut()[..assembled]
+            .copy_from_slice(&head_slot.buffer()[self.header_len..head.used_len]);
+        self.repost_rx_buffer_deferred(pair_idx, state, head.slot)?;
+        let mut expected_position = head.position;
+        for _ in 1..buffers {
+            expected_position += 1;
+            let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
+                state.rx_queue.publish();
+                state.rx_queue.notify(&self.transport);
+                return Err(IoError::DeviceFault);
+            };
+            let (slot_index, position) = Self::complete_rx_slot(state, token);
+            let used_len = used_len as usize;
+            let slot = &self.queue_pairs[pair_idx].rx_slots[usize::from(slot_index)];
+            let fits = used_len <= self.rx_buffer_len
+                && assembled
+                    .checked_add(used_len)
+                    .is_some_and(|end| end <= self.max_receive_frame_len);
+            if position != expected_position || !fits {
+                self.repost_rx_buffer(pair_idx, state, slot_index)?;
+                return Err(IoError::DeviceFault);
+            }
+            // Only the head buffer of a mergeable chain carries the
+            // virtio-net header; the rest are frame bytes end to end.
+            target.buffer_mut()[assembled..assembled + used_len]
+                .copy_from_slice(&slot.buffer()[..used_len]);
+            assembled += used_len;
+            self.repost_rx_buffer_deferred(pair_idx, state, slot_index)?;
+        }
+        state.rx_queue.publish();
+        state.rx_queue.notify(&self.transport);
+        Ok(assembled)
+    }
+
+    /// Translates the device's per-frame receive header into the
+    /// metadata the network stack decides checksum trust from.
+    fn rx_offload(&self, header: RxHeader) -> IoResult<RxFrameOffload> {
+        let needs_csum = header.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM != 0;
+        let data_valid = header.flags & VIRTIO_NET_HDR_F_DATA_VALID != 0;
+        // virtio 1.2 §5.1.6.1: a frame is either partially checksummed
+        // or validated, never both, and neither may appear without
+        // VIRTIO_NET_F_GUEST_CSUM.
+        if needs_csum && data_valid {
+            return Err(IoError::DeviceFault);
+        }
+        if (needs_csum || data_valid) && !self.guest_checksum_negotiated {
+            return Err(IoError::DeviceFault);
+        }
+        let checksum = if data_valid {
+            RxChecksumReport::Validated
+        } else if needs_csum {
+            RxChecksumReport::Partial {
+                start: header.csum_start,
+                offset: header.csum_offset,
+            }
+        } else {
+            RxChecksumReport::Unverified
+        };
+        let large_receive_segment_bytes = match header.gso_family() {
+            VIRTIO_NET_HDR_GSO_NONE => None,
+            VIRTIO_NET_HDR_GSO_TCPV4 if self.guest_tso_v4_negotiated => Some(header.gso_size),
+            VIRTIO_NET_HDR_GSO_TCPV6 if self.guest_tso_v6_negotiated => Some(header.gso_size),
+            VIRTIO_NET_HDR_GSO_UDP if self.guest_ufo_negotiated => Some(header.gso_size),
+            // A segmentation type the driver never asked for: the device
+            // is delivering a frame this driver cannot account for.
+            _ => return Err(IoError::DeviceFault),
+        };
+        Ok(RxFrameOffload {
+            checksum,
+            large_receive_segment_bytes,
+        })
     }
 
     pub async fn repost_rx_frame(&self, frame: RxFrame) -> IoResult<()> {
@@ -1174,10 +1664,10 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         self.interrupts.notified().await;
     }
 
-    fn rx_frame_from_slot(&self, pair_idx: usize, slot_index: u16, used_len: usize) -> RxFrame {
+    fn rx_bytes_from_slot(&self, pair_idx: usize, slot_index: u16, range: Range<usize>) -> Bytes {
         Bytes::from_owner(RxFrameOwner {
             slot: self.queue_pairs[pair_idx].rx_slots[usize::from(slot_index)].clone(),
-            range: self.header_len..used_len,
+            range,
         })
     }
 
@@ -1231,24 +1721,29 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             self.queue_pairs[pair_idx].rx_slots[slot].buffer_mut(),
         )?;
         state.rx_slot_for_token[usize::from(token)] = slot_index;
+        state.rx_post_position[usize::from(token)] = state.rx_next_post_position;
+        state.rx_next_post_position += 1;
         state.rx_in_device.set(slot);
         Ok(())
     }
 
     /// Resolves a completed descriptor identifier back to the receive
     /// slot it was carrying and marks that slot as driver-owned again.
-    fn complete_rx_slot(state: &mut NetRxState<T>, token: u16) -> u16 {
+    /// Also reports the available-ring position the slot was posted at,
+    /// which is what orders the buffers of a mergeable chain.
+    fn complete_rx_slot(state: &mut NetRxState<T>, token: u16) -> (u16, u64) {
         let slot_index = *state
             .rx_slot_for_token
             .get(usize::from(token))
             .unwrap_or_else(|| panic!("virtio net RX completion named unknown descriptor {token}"));
+        let position = state.rx_post_position[usize::from(token)];
         let slot = usize::from(slot_index);
         assert!(
             state.rx_in_device.get(slot),
             "virtio net RX completion referenced an idle slot {slot_index}"
         );
         state.rx_in_device.clear(slot);
-        slot_index
+        (slot_index, position)
     }
 
     fn drain_tx_completions(state: &mut NetTxState<T>, budget: usize) -> usize {
@@ -1340,6 +1835,22 @@ fn read_mac_address<T: VirtioTransport>(transport: &T) -> [u8; 6] {
     let low = transport.read_config_u32(0).to_le_bytes();
     let high = transport.read_config_u32(4).to_le_bytes();
     [low[0], low[1], low[2], low[3], high[0], high[1]]
+}
+
+/// Reads `status` out of the virtio-net configuration space. A device
+/// without VIRTIO_NET_F_STATUS keeps no link status there and is always
+/// treated as up.
+fn read_link_up<T: VirtioTransport>(transport: &T, features: NegotiatedFeatures) -> bool {
+    if !features.device(NET_FEATURE_STATUS) {
+        return true;
+    }
+    // The status field straddles bytes 6..8, the upper half of the
+    // aligned dword at offset 4.
+    let config = transport
+        .read_config_u32(NET_CONFIG_STATUS_OFFSET & !0x3)
+        .to_le_bytes();
+    let status = u16::from_le_bytes([config[2], config[3]]);
+    status & NET_STATUS_LINK_UP != 0
 }
 
 fn read_mtu<T: VirtioTransport>(transport: &T, features: NegotiatedFeatures) -> usize {
@@ -1452,12 +1963,508 @@ fn write_tx_payload_gso(
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+    use alloc::vec::Vec;
     use core::mem::size_of;
 
+    use helios_netstack::RxChecksumReport;
+
     use super::{
-        DescriptorBitSet, TxChecksumMeta, TxGsoMeta, VirtioNetHeader, write_tx_payload,
-        write_tx_payload_gso,
+        DescriptorBitSet, ETH_HEADER_LEN, MAX_LARGE_RECEIVE_FRAME_BYTES, NET_CONFIG_STATUS_OFFSET,
+        NET_FEATURE_GUEST_CSUM, NET_FEATURE_GUEST_ECN, NET_FEATURE_GUEST_TSO4,
+        NET_FEATURE_GUEST_TSO6, NET_FEATURE_GUEST_UFO, NET_FEATURE_MRG_RXBUF, NET_FEATURE_STATUS,
+        NET_STATUS_LINK_UP, RX_PAGE_BYTES, RxFrame, TxChecksumMeta, TxGsoMeta,
+        VIRTIO_NET_HDR_F_DATA_VALID, VIRTIO_NET_HDR_F_NEEDS_CSUM, VIRTIO_NET_HDR_GSO_TCPV4,
+        VirtioNetDevice, VirtioNetHeader, write_tx_payload, write_tx_payload_gso,
     };
+    use crate::testing::{FakeTransport, FakeTransportConfig};
+    use crate::transport::{DeviceType, VirtioFeatures};
+    use helios_netstack::LinkState;
+
+    /// One receive completion the fake device hands the driver: the
+    /// virtio-net header it writes in front of the frame (head buffers
+    /// only) and the frame bytes that follow.
+    struct DeviceRxBuffer<'a> {
+        header: Option<RxDeviceHeader>,
+        payload: &'a [u8],
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct RxDeviceHeader {
+        flags: u8,
+        gso_type: u8,
+        gso_size: u16,
+        csum_start: u16,
+        csum_offset: u16,
+        num_buffers: u16,
+    }
+
+    /// A driver bound to a fake device, plus the device-side moves the
+    /// receive tests need: filling posted buffers and completing them.
+    struct NetHarness {
+        device: VirtioNetDevice<FakeTransport>,
+    }
+
+    impl NetHarness {
+        fn new(offered_features: u64) -> Self {
+            Self::with_config(offered_features, |_| {})
+        }
+
+        fn with_config(offered_features: u64, configure: impl FnOnce(&FakeTransport)) -> Self {
+            let transport = FakeTransport::new(FakeTransportConfig {
+                device_type: DeviceType::Network,
+                offered_features: VirtioFeatures::VERSION_1.bits() | offered_features,
+                queue_size: 8,
+                supports_queue_reset: false,
+            });
+            configure(&transport);
+            Self {
+                device: VirtioNetDevice::new(transport).expect("fake virtio-net should initialize"),
+            }
+        }
+
+        /// Writes one buffer of a receive frame into the slot the driver
+        /// posted at descriptor `token` and completes that descriptor,
+        /// exactly as a device filling made-available buffers would.
+        fn complete_rx(&self, token: u16, buffer: DeviceRxBuffer<'_>) {
+            let pair = &self.device.queue_pairs[0];
+            let state = pair
+                .rx_state
+                .try_lock()
+                .expect("test receive state is uncontended");
+            let slot = usize::from(state.rx_slot_for_token[usize::from(token)]);
+            let target = pair.rx_slots[slot].buffer_mut();
+            let header_len = self.device.header_len;
+            let written = match buffer.header {
+                Some(header) => {
+                    target[..header_len].fill(0);
+                    target[0] = header.flags;
+                    target[1] = header.gso_type;
+                    target[4..6].copy_from_slice(&header.gso_size.to_le_bytes());
+                    target[6..8].copy_from_slice(&header.csum_start.to_le_bytes());
+                    target[8..10].copy_from_slice(&header.csum_offset.to_le_bytes());
+                    target[10..12].copy_from_slice(&header.num_buffers.to_le_bytes());
+                    target[header_len..header_len + buffer.payload.len()]
+                        .copy_from_slice(buffer.payload);
+                    header_len + buffer.payload.len()
+                }
+                None => {
+                    target[..buffer.payload.len()].copy_from_slice(buffer.payload);
+                    buffer.payload.len()
+                }
+            };
+            state
+                .rx_queue
+                .device_complete(token, u32::try_from(written).expect("test length fits"));
+        }
+
+        /// Delivers one frame as `parts.len()` mergeable buffers,
+        /// starting at descriptor `first_token` and continuing through
+        /// consecutive descriptors, and returns what the driver made of
+        /// it.
+        fn deliver_chain(
+            &self,
+            first_token: u16,
+            header: RxDeviceHeader,
+            parts: &[&[u8]],
+        ) -> Result<Option<RxFrame>, helios_hal::io::IoError> {
+            let header = RxDeviceHeader {
+                num_buffers: u16::try_from(parts.len()).expect("test chain length fits"),
+                ..header
+            };
+            self.complete_rx(
+                first_token,
+                DeviceRxBuffer {
+                    header: Some(header),
+                    payload: parts[0],
+                },
+            );
+            for (index, part) in parts.iter().enumerate().skip(1) {
+                self.complete_rx(
+                    first_token + u16::try_from(index).expect("test chain length fits"),
+                    DeviceRxBuffer {
+                        header: None,
+                        payload: part,
+                    },
+                );
+            }
+            self.receive()
+        }
+
+        fn receive(&self) -> Result<Option<RxFrame>, helios_hal::io::IoError> {
+            let mut frames = [const { None }; 1];
+            let received = self
+                .device
+                .try_receive_frames_immediate(&mut frames)?
+                .expect("the receive ring is uncontended in tests");
+            assert!(received <= 1);
+            Ok(frames[0].take())
+        }
+    }
+
+    /// The driver refuses a frame it cannot account for by faulting the
+    /// device rather than by delivering something it made up.
+    fn expect_device_fault(result: Result<Option<RxFrame>, helios_hal::io::IoError>) {
+        match result {
+            Err(helios_hal::io::IoError::DeviceFault) => {}
+            Err(error) => panic!("expected a device fault, got {error:?}"),
+            Ok(frame) => panic!(
+                "expected a device fault, got a {:?}-byte frame",
+                frame.map(|frame| frame.bytes.len())
+            ),
+        }
+    }
+
+    const RECEIVE_OFFLOAD_FEATURES: u64 = NET_FEATURE_GUEST_CSUM
+        | NET_FEATURE_GUEST_TSO4
+        | NET_FEATURE_GUEST_TSO6
+        | NET_FEATURE_GUEST_ECN
+        | NET_FEATURE_GUEST_UFO
+        | NET_FEATURE_MRG_RXBUF;
+
+    #[test]
+    fn every_offered_receive_offload_is_negotiated() {
+        let harness = NetHarness::new(RECEIVE_OFFLOAD_FEATURES);
+        let features = harness.device.features();
+
+        assert!(features.device(NET_FEATURE_GUEST_CSUM));
+        assert!(features.device(NET_FEATURE_GUEST_TSO4));
+        assert!(features.device(NET_FEATURE_GUEST_TSO6));
+        assert!(features.device(NET_FEATURE_GUEST_ECN));
+        assert!(features.device(NET_FEATURE_GUEST_UFO));
+        assert!(features.device(NET_FEATURE_MRG_RXBUF));
+        assert!(harness.device.guest_checksum_negotiated());
+        assert!(harness.device.mergeable_rx_buffers());
+        assert!(harness.device.large_receive_negotiated(false));
+        assert!(harness.device.large_receive_negotiated(true));
+        // Mergeable buffers are what make a page-granular receive slot
+        // enough for a frame the device coalesced out of many segments.
+        assert_eq!(harness.device.rx_buffer_len, RX_PAGE_BYTES);
+        assert_eq!(
+            harness.device.max_receive_frame_len(),
+            MAX_LARGE_RECEIVE_FRAME_BYTES
+        );
+        assert_eq!(harness.device.max_frame_len(), 1500 + ETH_HEADER_LEN);
+    }
+
+    /// Receive segmentation needs somewhere to put a 64 KiB frame. With
+    /// page-granular slots that is mergeable buffers, so a device that
+    /// offers segmentation without merging gets neither.
+    #[test]
+    fn receive_segmentation_is_refused_without_mergeable_buffers() {
+        let harness = NetHarness::new(
+            NET_FEATURE_GUEST_CSUM | NET_FEATURE_GUEST_TSO4 | NET_FEATURE_GUEST_TSO6,
+        );
+        let features = harness.device.features();
+
+        assert!(features.device(NET_FEATURE_GUEST_CSUM));
+        assert!(!features.device(NET_FEATURE_GUEST_TSO4));
+        assert!(!features.device(NET_FEATURE_GUEST_TSO6));
+        assert!(!harness.device.large_receive_negotiated(false));
+        // Without merging every frame has to fit one slot whole.
+        assert_eq!(harness.device.rx_buffer_len, RX_PAGE_BYTES);
+        assert_eq!(
+            harness.device.max_receive_frame_len(),
+            1500 + ETH_HEADER_LEN
+        );
+    }
+
+    /// ECN is a modifier on a segmentation type, so a device offering it
+    /// without a TCP segmentation family must not have it accepted.
+    #[test]
+    fn guest_ecn_is_refused_without_a_tcp_segmentation_family() {
+        let harness = NetHarness::new(
+            NET_FEATURE_GUEST_CSUM
+                | NET_FEATURE_MRG_RXBUF
+                | NET_FEATURE_GUEST_ECN
+                | NET_FEATURE_GUEST_UFO,
+        );
+        let features = harness.device.features();
+
+        assert!(features.device(NET_FEATURE_GUEST_UFO));
+        assert!(!features.device(NET_FEATURE_GUEST_ECN));
+    }
+
+    /// The receive offloads must not be claimed to a device that never
+    /// offered them.
+    #[test]
+    fn receive_offloads_are_not_claimed_to_a_device_without_them() {
+        let harness = NetHarness::new(0);
+        let features = harness.device.features();
+
+        assert!(!features.device(NET_FEATURE_GUEST_CSUM));
+        assert!(!features.device(NET_FEATURE_MRG_RXBUF));
+        assert!(!harness.device.guest_checksum_negotiated());
+        assert!(!harness.device.mergeable_rx_buffers());
+    }
+
+    /// A frame that fits one buffer is handed over as a borrow of the
+    /// receive slot the device wrote it into — no copy, and the slot
+    /// stays out of the ring until the frame is dropped.
+    #[test]
+    fn a_single_buffer_frame_borrows_its_receive_slot() {
+        let harness = NetHarness::new(RECEIVE_OFFLOAD_FEATURES);
+        let payload: Vec<u8> = (0..512_u32).map(|index| index as u8).collect();
+
+        let frame = harness
+            .deliver_chain(0, RxDeviceHeader::default(), &[&payload])
+            .expect("a well-formed frame is accepted")
+            .expect("the driver should deliver the frame");
+
+        assert_eq!(frame.bytes.as_ref(), payload.as_slice());
+        let slot_start = harness.device.queue_pairs[0].rx_slots[0]
+            .buffer()
+            .as_ptr()
+            .addr();
+        assert_eq!(
+            frame.bytes.as_ptr().addr(),
+            slot_start + harness.device.header_len,
+            "a single-buffer frame must borrow the slot rather than copy out of it"
+        );
+    }
+
+    /// A mergeable chain is assembled in the order the buffers were made
+    /// available, across any number of buffers.
+    #[test]
+    fn a_mergeable_chain_is_assembled_across_buffers() {
+        for parts in [2_usize, 3] {
+            let harness = NetHarness::new(RECEIVE_OFFLOAD_FEATURES);
+            let head: Vec<u8> = vec![0xa1; 4000];
+            let tails: Vec<Vec<u8>> = (1..parts)
+                .map(|index| vec![0xb0 + index as u8; 3000])
+                .collect();
+            let mut buffers: Vec<&[u8]> = vec![head.as_slice()];
+            buffers.extend(tails.iter().map(Vec::as_slice));
+            let mut expected: Vec<u8> = Vec::new();
+            for buffer in &buffers {
+                expected.extend_from_slice(buffer);
+            }
+
+            let frame = harness
+                .deliver_chain(0, RxDeviceHeader::default(), &buffers)
+                .expect("a well-formed chain is accepted")
+                .expect("the driver should deliver the assembled frame");
+
+            assert_eq!(frame.bytes.len(), expected.len());
+            assert_eq!(frame.bytes.as_ref(), expected.as_slice());
+        }
+    }
+
+    /// Every buffer of an assembled chain goes back to the device, so a
+    /// chained frame does not leak receive slots.
+    #[test]
+    fn an_assembled_chain_reposts_every_buffer() {
+        let harness = NetHarness::new(RECEIVE_OFFLOAD_FEATURES);
+        let head = vec![0x11_u8; 4000];
+        let tail = vec![0x22_u8; 1000];
+
+        let frame = harness
+            .deliver_chain(0, RxDeviceHeader::default(), &[&head, &tail])
+            .expect("a well-formed chain is accepted")
+            .expect("the driver should deliver the assembled frame");
+        drop(frame);
+        harness.receive().expect("an empty ring is not an error");
+
+        let state = harness.device.queue_pairs[0]
+            .rx_state
+            .try_lock()
+            .expect("test receive state is uncontended");
+        assert_eq!(
+            state.rx_queue.available_descriptors(),
+            0,
+            "every receive slot must be back in the device's hands"
+        );
+    }
+
+    /// A device that completes a buffer which was not the next one made
+    /// available has not delivered a chain this driver can reconstruct.
+    /// Stitching it together anyway would splice an unrelated frame into
+    /// the middle of this one.
+    #[test]
+    fn an_out_of_order_chain_tail_is_refused() {
+        let harness = NetHarness::new(RECEIVE_OFFLOAD_FEATURES);
+        let head = vec![0x33_u8; 4000];
+        let tail = vec![0x44_u8; 1000];
+
+        harness.complete_rx(
+            0,
+            DeviceRxBuffer {
+                header: Some(RxDeviceHeader {
+                    num_buffers: 2,
+                    ..RxDeviceHeader::default()
+                }),
+                payload: &head,
+            },
+        );
+        // The buffer posted third, not the one that follows the head.
+        harness.complete_rx(
+            2,
+            DeviceRxBuffer {
+                header: None,
+                payload: &tail,
+            },
+        );
+
+        expect_device_fault(harness.receive());
+    }
+
+    /// The per-frame checksum report is what the stack decides trust
+    /// from, so each header flag has to arrive intact.
+    #[test]
+    fn the_per_frame_checksum_report_reaches_the_stack() {
+        let harness = NetHarness::new(RECEIVE_OFFLOAD_FEATURES);
+        let payload = vec![0x5a_u8; 64];
+
+        let validated = harness
+            .deliver_chain(
+                0,
+                RxDeviceHeader {
+                    flags: VIRTIO_NET_HDR_F_DATA_VALID,
+                    ..RxDeviceHeader::default()
+                },
+                &[&payload],
+            )
+            .expect("a validated frame is accepted")
+            .expect("the driver should deliver the frame");
+        assert_eq!(validated.offload.checksum, RxChecksumReport::Validated);
+        assert_eq!(validated.offload.large_receive_segment_bytes, None);
+        drop(validated);
+
+        let partial = harness
+            .deliver_chain(
+                1,
+                RxDeviceHeader {
+                    flags: VIRTIO_NET_HDR_F_NEEDS_CSUM,
+                    csum_start: 34,
+                    csum_offset: 16,
+                    ..RxDeviceHeader::default()
+                },
+                &[&payload],
+            )
+            .expect("a partially checksummed frame is accepted")
+            .expect("the driver should deliver the frame");
+        assert_eq!(
+            partial.offload.checksum,
+            RxChecksumReport::Partial {
+                start: 34,
+                offset: 16,
+            }
+        );
+        drop(partial);
+
+        let plain = harness
+            .deliver_chain(2, RxDeviceHeader::default(), &[&payload])
+            .expect("a frame without offload metadata is accepted")
+            .expect("the driver should deliver the frame");
+        assert_eq!(plain.offload.checksum, RxChecksumReport::Unverified);
+    }
+
+    /// virtio 1.2 §5.1.6.1 allows one of the two checksum flags, never
+    /// both, and neither at all without VIRTIO_NET_F_GUEST_CSUM.
+    #[test]
+    fn contradictory_checksum_flags_are_refused() {
+        let harness = NetHarness::new(RECEIVE_OFFLOAD_FEATURES);
+        let payload = vec![0x5a_u8; 64];
+
+        expect_device_fault(harness.deliver_chain(
+            0,
+            RxDeviceHeader {
+                flags: VIRTIO_NET_HDR_F_DATA_VALID | VIRTIO_NET_HDR_F_NEEDS_CSUM,
+                ..RxDeviceHeader::default()
+            },
+            &[&payload],
+        ));
+
+        let without_offload = NetHarness::new(0);
+        expect_device_fault(without_offload.deliver_chain(
+            0,
+            RxDeviceHeader {
+                flags: VIRTIO_NET_HDR_F_DATA_VALID,
+                ..RxDeviceHeader::default()
+            },
+            &[&payload],
+        ));
+    }
+
+    /// A coalesced frame reports the wire segment size it was built from,
+    /// and a segmentation type the driver never negotiated is refused.
+    #[test]
+    fn a_coalesced_frame_reports_its_segment_size() {
+        let harness = NetHarness::new(RECEIVE_OFFLOAD_FEATURES);
+        let payload = vec![0x77_u8; 6000];
+
+        let frame = harness
+            .deliver_chain(
+                0,
+                RxDeviceHeader {
+                    flags: VIRTIO_NET_HDR_F_DATA_VALID,
+                    gso_type: VIRTIO_NET_HDR_GSO_TCPV4,
+                    gso_size: 1448,
+                    ..RxDeviceHeader::default()
+                },
+                &[&payload[..4000], &payload[4000..]],
+            )
+            .expect("a coalesced frame is accepted")
+            .expect("the driver should deliver the frame");
+        assert_eq!(frame.offload.large_receive_segment_bytes, Some(1448));
+        assert_eq!(frame.bytes.len(), payload.len());
+
+        let without_segmentation = NetHarness::new(NET_FEATURE_GUEST_CSUM | NET_FEATURE_MRG_RXBUF);
+        expect_device_fault(without_segmentation.deliver_chain(
+            0,
+            RxDeviceHeader {
+                gso_type: VIRTIO_NET_HDR_GSO_TCPV4,
+                gso_size: 1448,
+                ..RxDeviceHeader::default()
+            },
+            &[&payload[..1000]],
+        ));
+    }
+
+    /// A configuration-change interrupt is what tells the driver to
+    /// re-read the link status; a used-buffer interrupt is not.
+    #[test]
+    fn a_configuration_change_republishes_the_link_state() {
+        let harness = NetHarness::with_config(NET_FEATURE_STATUS, |transport| {
+            transport.set_config_u16(NET_CONFIG_STATUS_OFFSET, NET_STATUS_LINK_UP);
+        });
+        assert_eq!(harness.device.link_state(), LinkState::Up);
+
+        // The link drops, but only a queue interrupt is raised: nothing
+        // told the driver its configuration moved.
+        harness
+            .device
+            .transport
+            .set_config_u16(NET_CONFIG_STATUS_OFFSET, 0);
+        harness.device.transport.raise_interrupt(1);
+        harness.device.handle_interrupt();
+        assert_eq!(harness.device.link_state(), LinkState::Up);
+
+        harness.device.transport.raise_interrupt(2);
+        harness.device.handle_interrupt();
+        assert_eq!(harness.device.link_state(), LinkState::Down);
+
+        harness
+            .device
+            .transport
+            .set_config_u16(NET_CONFIG_STATUS_OFFSET, NET_STATUS_LINK_UP);
+        harness.device.transport.raise_interrupt(3);
+        harness.device.handle_interrupt();
+        assert_eq!(harness.device.link_state(), LinkState::Up);
+        assert_eq!(harness.device.transport.acknowledged_interrupts(), 3);
+    }
+
+    /// A device without VIRTIO_NET_F_STATUS keeps no link status, and
+    /// the zeroed configuration space must not read as a dead link.
+    #[test]
+    fn a_device_without_status_is_always_up() {
+        let harness = NetHarness::new(0);
+
+        assert_eq!(harness.device.link_state(), LinkState::Up);
+        harness.device.transport.raise_interrupt(2);
+        harness.device.handle_interrupt();
+        assert_eq!(harness.device.link_state(), LinkState::Up);
+    }
 
     #[test]
     fn descriptor_bitset_tracks_sparse_tokens() {

@@ -84,6 +84,67 @@ bitflags! {
     }
 }
 
+/// Why a device raised the interrupt the driver is now servicing.
+///
+/// virtio has exactly two causes and one status register bit for each
+/// (virtio 1.2 §4.1.4.5, §4.2.2): a virtqueue used-buffer notification
+/// and a device configuration change. Drivers that own configuration
+/// state — virtio-net watches its link status — need the distinction, so
+/// acknowledging an interrupt reports what it was for instead of
+/// swallowing the register read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InterruptStatus {
+    /// The device used a buffer on at least one virtqueue.
+    pub used_buffer: bool,
+    /// The device changed its configuration space.
+    pub config_change: bool,
+}
+
+/// `VIRTIO_MMIO_INT_VRING` / ISR bit 0: a virtqueue was used.
+const ISR_USED_BUFFER: u32 = 1 << 0;
+/// `VIRTIO_MMIO_INT_CONFIG` / ISR bit 1: the configuration changed.
+const ISR_CONFIG_CHANGE: u32 = 1 << 1;
+
+impl InterruptStatus {
+    /// Decodes an interrupt status register value.
+    pub const fn from_isr(bits: u32) -> Self {
+        Self {
+            used_buffer: bits & ISR_USED_BUFFER != 0,
+            config_change: bits & ISR_CONFIG_CHANGE != 0,
+        }
+    }
+
+    /// No cause: the device did not raise this interrupt.
+    pub const fn none() -> Self {
+        Self {
+            used_buffer: false,
+            config_change: false,
+        }
+    }
+
+    /// Both causes are possible and the transport cannot tell them
+    /// apart.
+    ///
+    /// A virtio-PCI function driven through MSI-X does not touch its ISR
+    /// register at all — it signals through the vector — and helios binds
+    /// the configuration-change vector to the same entry as the
+    /// virtqueues, so an MSI-X interrupt could be either. Reporting both
+    /// keeps the driver correct: it drains its queues and re-reads the
+    /// configuration it cares about, which is a register read, not a
+    /// wait.
+    pub const fn indistinguishable() -> Self {
+        Self {
+            used_buffer: true,
+            config_change: true,
+        }
+    }
+
+    /// Whether the device raised the interrupt for any reason at all.
+    pub const fn is_pending(self) -> bool {
+        self.used_buffer || self.config_change
+    }
+}
+
 pub trait VirtioTransport: Send + Sync + 'static {
     type Bus: DeviceBus;
 
@@ -124,7 +185,9 @@ pub trait VirtioTransport: Send + Sync + 'static {
     /// re-programs it through [`VirtioTransport::set_queue`].
     fn reset_queue(&self, index: u16) -> IoResult<()>;
 
-    fn ack_interrupt(&self);
+    /// Acknowledges the pending interrupt and reports what it was for.
+    fn ack_interrupt(&self) -> InterruptStatus;
+
     fn read_config_u32(&self, offset: usize) -> u32;
 
     fn read_config_u8(&self, offset: usize) -> u8 {
@@ -249,11 +312,12 @@ impl<B: DeviceBus> VirtioTransport for VirtioMmioTransport<B> {
         Err(IoError::Unsupported)
     }
 
-    fn ack_interrupt(&self) {
+    fn ack_interrupt(&self) -> InterruptStatus {
         let status = self.bus.read_u32(REG_INTERRUPT_STATUS);
         if status != 0 {
             self.bus.write_u32(REG_INTERRUPT_ACK, status);
         }
+        InterruptStatus::from_isr(status)
     }
 
     fn read_config_u32(&self, offset: usize) -> u32 {
@@ -268,11 +332,11 @@ impl<B: DeviceBus> VirtioTransport for VirtioMmioTransport<B> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeviceStatus, DeviceType, REG_DRIVER_FEATURES, REG_DRIVER_FEATURES_SEL, REG_INTERRUPT_ACK,
-        REG_INTERRUPT_STATUS, REG_QUEUE_DESC_HIGH, REG_QUEUE_DESC_LOW, REG_QUEUE_DEVICE_HIGH,
-        REG_QUEUE_DEVICE_LOW, REG_QUEUE_DRIVER_HIGH, REG_QUEUE_DRIVER_LOW, REG_QUEUE_NOTIFY,
-        REG_QUEUE_NUM, REG_QUEUE_READY, REG_QUEUE_SEL, REG_STATUS, VirtioFeatures,
-        VirtioMmioTransport, VirtioTransport,
+        DeviceStatus, DeviceType, InterruptStatus, REG_DRIVER_FEATURES, REG_DRIVER_FEATURES_SEL,
+        REG_INTERRUPT_ACK, REG_INTERRUPT_STATUS, REG_QUEUE_DESC_HIGH, REG_QUEUE_DESC_LOW,
+        REG_QUEUE_DEVICE_HIGH, REG_QUEUE_DEVICE_LOW, REG_QUEUE_DRIVER_HIGH, REG_QUEUE_DRIVER_LOW,
+        REG_QUEUE_NOTIFY, REG_QUEUE_NUM, REG_QUEUE_READY, REG_QUEUE_SEL, REG_STATUS,
+        VirtioFeatures, VirtioMmioTransport, VirtioTransport,
     };
     use crate::bus::DeviceBus;
     use crate::testing::MmioRegisterBus;
@@ -316,7 +380,13 @@ mod tests {
         assert_eq!(transport.bus().register(REG_QUEUE_READY), 1);
 
         transport.bus().write_u32(REG_INTERRUPT_STATUS, 3);
-        transport.ack_interrupt();
+        assert_eq!(
+            transport.ack_interrupt(),
+            InterruptStatus {
+                used_buffer: true,
+                config_change: true,
+            }
+        );
         assert_eq!(transport.bus().register(REG_INTERRUPT_ACK), 3);
 
         transport.notify_queue(0);
@@ -328,6 +398,32 @@ mod tests {
         assert_eq!(transport.bus().register(REG_QUEUE_NOTIFY), 0x0007_0000);
 
         assert_eq!(transport.read_config_u32(0), 0xfeed_beef);
+    }
+
+    /// The two interrupt causes have to be told apart: virtio-net
+    /// re-reads its link status on a configuration change, and a driver
+    /// that treated every interrupt as a used-buffer notification would
+    /// never see the link move.
+    #[test]
+    fn mmio_transport_reports_each_interrupt_cause_separately() {
+        let bus = MmioRegisterBus::new(DeviceType::Network, VirtioFeatures::VERSION_1.bits());
+        let transport = VirtioMmioTransport::new(bus).expect("transport should initialize");
+
+        assert_eq!(transport.ack_interrupt(), InterruptStatus::none());
+        assert_eq!(transport.bus().register(REG_INTERRUPT_ACK), 0);
+
+        transport.bus().write_u32(REG_INTERRUPT_STATUS, 1);
+        let status = transport.ack_interrupt();
+        assert!(status.used_buffer);
+        assert!(!status.config_change);
+        assert_eq!(transport.bus().register(REG_INTERRUPT_ACK), 1);
+
+        transport.bus().write_u32(REG_INTERRUPT_STATUS, 2);
+        let status = transport.ack_interrupt();
+        assert!(!status.used_buffer);
+        assert!(status.config_change);
+        assert!(status.is_pending());
+        assert_eq!(transport.bus().register(REG_INTERRUPT_ACK), 2);
     }
 
     #[test]
