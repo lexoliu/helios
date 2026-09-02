@@ -610,8 +610,13 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         program_service: None,
     };
     hart_runtime.install();
-    let program_service =
-        helios_kernel::install_component_host_program_service(&kernel, &cpu, &debug_state);
+    let program_service = helios_kernel::install_component_host_program_service(
+        &kernel,
+        &cpu,
+        &debug_state,
+        read_debug_serial,
+        write_debug_serial_bytes,
+    );
     hart_runtime.program_service = program_service;
     unsafe {
         configure_interrupts();

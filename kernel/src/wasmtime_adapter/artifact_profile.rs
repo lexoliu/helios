@@ -250,6 +250,7 @@ fn is_supported_component_import(name: &str) -> bool {
     name.starts_with("wasi:cli/")
         || name.starts_with("wasi:clocks/")
         || name.starts_with("wasi:filesystem/")
+        || name.starts_with("wasi:http/")
         || name.starts_with("wasi:io/")
         || name.starts_with("wasi:random/")
         || name.starts_with("wasi:sockets/")
@@ -373,8 +374,8 @@ mod tests {
     #[test]
     fn component_imports_with_preview3_version_are_preview3() {
         let report = classify_component(alloc::vec![
-            "wasi:cli/environment@0.3.0-rc-2026-03-15".to_string(),
-            "wasi:filesystem/types@0.3.0-rc-2026-03-15".to_string(),
+            "wasi:cli/environment@0.3.0".to_string(),
+            "wasi:filesystem/types@0.3.0".to_string(),
         ])
         .expect("Preview3 imports must classify");
 

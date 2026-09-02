@@ -1,0 +1,15 @@
+[package]
+name = "helios-http-client"
+version = "0.1.0"
+edition.workspace = true
+autobins = false
+
+[dependencies]
+helios-api = { path = "../../api", default-features = false, features = ["http-handler", "net", "task"] }
+http = "1.4.0"
+httparse = { version = "1.10.1", default-features = false }
+
+[lib]
+name = "helios_http_client"
+path = "src/main.rs"
+crate-type = ["cdylib"]

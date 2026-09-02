@@ -55,11 +55,12 @@ pub use component::{
     ComponentRuntimeEngine, ComponentRuntimeFactory, ComponentRuntimeState, ComponentSerialPort,
     ComponentStoreData, ComponentTcpBackend, ComponentTcpStream, ComponentUdpBackend,
     ComponentUdpSocket, ComponentWorld, DeadlinePollable, InstanceKilled, LocalOutputSink,
+    ProviderAlreadyInstalled, ProviderError, ProviderReceiver, ProviderSender, ProviderSlot,
     RawMutexGuardResource, RawMutexResource, RawRwLockReadGuardResource, RawRwLockResource,
     RawRwLockWriteGuardResource, SerialPortResource, TcpStreamResource, UdpSocketResource,
     directory_prefix, map_resource_table_error, parent_path, path_is_within_directory,
-    resolve_absolute_path, resolve_child_path, resolve_guest_path, strip_directory_prefix,
-    wait_until_runtime_deadline,
+    provider_channel, resolve_absolute_path, resolve_child_path, resolve_guest_path,
+    strip_directory_prefix, wait_until_runtime_deadline,
 };
 pub use embedded::{
     EmbeddedComponent, EmbeddedInit, embedded_boot_component, embedded_init,
@@ -109,9 +110,14 @@ pub use memory::{
     deallocate_user_frame_on, user_heap_stats, validate_range,
 };
 pub use network::{
-    Ipv4Cidr, Ipv4Route, MacAddress, NetworkAdminBackend, NetworkBridgeRequest,
-    NetworkBridgeSecurity, NetworkControl, NetworkControlError, NetworkPortId, NetworkService,
-    SocketStack, TcpListenerId, TcpStreamId, UdpSocketId,
+    HTTP_FORBIDDEN_FIELD_NAMES, HTTP_MAX_FIELD_SECTION_BYTES, HTTP_MAX_FIELD_VALUE_BYTES, HttpBody,
+    HttpDnsErrorPayload, HttpErrorCode, HttpExchange, HttpFieldName, HttpFieldSizePayload,
+    HttpFields, HttpHeaderError, HttpMethod, HttpRequestHead, HttpRequestOptions,
+    HttpRequestOptionsError, HttpResponse, HttpResponseHead, HttpScheme, HttpSyntaxError,
+    HttpSyntaxKind, HttpTlsAlertReceivedPayload, Ipv4Cidr, Ipv4Route, MacAddress,
+    NetworkAdminBackend, NetworkBridgeRequest, NetworkBridgeSecurity, NetworkControl,
+    NetworkControlError, NetworkPortId, NetworkService, SocketStack, TcpListenerId, TcpStreamId,
+    UdpSocketId, validate_http_authority, validate_http_path_with_query, validate_http_status_code,
 };
 pub use process::{
     ClockAuthorityRights, DescriptorEntry, DescriptorId, DescriptorTable, DescriptorTableError,

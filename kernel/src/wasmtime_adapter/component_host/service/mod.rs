@@ -8,6 +8,8 @@ mod compiler;
 use compiler::*;
 mod exec;
 use exec::*;
+mod http_plugin;
+use http_plugin::*;
 mod preview1;
 use preview1::*;
 mod wasix_proc;
@@ -284,22 +286,26 @@ pub struct ChildExit {
 }
 
 pub fn install_program_service<CpuImpl, HostFs, WatchdogImpl>(
-    _kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
+    kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
     cpu: &CpuImpl,
     debug_state: &HostRuntimeState<CpuImpl, HostFs>,
+    read_serial: crate::SerialReader,
+    write_serial: fn(&[u8]),
 ) -> UserProgramService<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
     WatchdogImpl: Watchdog + Clone,
 {
-    install_program_service_inner(cpu, debug_state)
+    install_program_service_inner(kernel, cpu, debug_state, read_serial, write_serial)
 }
 
 pub fn install_component_host_program_service<CpuImpl, HostFs, WatchdogImpl>(
     kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
     cpu: &CpuImpl,
     debug_state: &HostRuntimeState<CpuImpl, HostFs>,
+    read_serial: crate::SerialReader,
+    write_serial: fn(&[u8]),
 ) -> Option<UserProgramService<CpuImpl, HostFs>>
 where
     CpuImpl: Cpu + Clone,
@@ -311,16 +317,26 @@ where
         return None;
     }
 
-    Some(install_program_service_inner(cpu, debug_state))
+    Some(install_program_service_inner(
+        kernel,
+        cpu,
+        debug_state,
+        read_serial,
+        write_serial,
+    ))
 }
 
-fn install_program_service_inner<CpuImpl, HostFs>(
+fn install_program_service_inner<CpuImpl, HostFs, WatchdogImpl>(
+    kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
     cpu: &CpuImpl,
     debug_state: &HostRuntimeState<CpuImpl, HostFs>,
+    read_serial: crate::SerialReader,
+    write_serial: fn(&[u8]),
 ) -> UserProgramService<CpuImpl, HostFs>
 where
     CpuImpl: Cpu + Clone,
     HostFs: crate::HostFileSystem,
+    WatchdogImpl: Watchdog + Clone,
 {
     if let Some(service) = debug_state.program_service() {
         return service;
@@ -360,6 +376,19 @@ where
         }),
     };
     debug_state.install_program_service(service.clone());
+    install_http_client_plugin(
+        &service,
+        ProgramExecContext {
+            cpu: cpu.clone(),
+            timer: kernel.timer(),
+            spawner: kernel.spawner(),
+            runtime_state: debug_state.clone(),
+            instance_registry: debug_state.instance_registry(),
+            parent_instance_id: None,
+            read_serial,
+            write_serial,
+        },
+    );
     service
 }
 

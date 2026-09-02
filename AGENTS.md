@@ -153,6 +153,12 @@ crates.
 - Non-core kernel functionality may depend on kernel plugins.
 - The compiler is a kernel plugin: it is bootfs-provisioned, loaded during
   kernel startup, and trusted by the kernel for signed `cwasm` output.
+- The HTTP client is a kernel plugin (`programs/http-client`): the kernel
+  implements only `wasi:http/types` and forwards `wasi:http/client.send`
+  through a typed provider slot to the plugin's exported
+  `wasi:http/handler`; HTTP/1.1 framing, DNS, and (later) TLS run in user
+  memory. The same provider-slot routing is the path for any future
+  interface served by a plugin.
 - Kernel plugins and ordinary user-mode programs share the same user-memory
   and allocation contracts. Do not add plugin-private allocator policy, custom
   memory floors, or oversized linker memory settings to work around OOM. A

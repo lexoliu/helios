@@ -246,6 +246,21 @@ impl ChannelStreamConsumer {
         }
     }
 
+    /// A consumer with no completion signal, for callers that only care that
+    /// the channel closes once the stream ends.
+    ///
+    /// Dropping the consumer drops `writer`, and the last writer handle going
+    /// away is what publishes end-of-stream to the reader — which is the whole
+    /// signal an HTTP body needs.
+    pub(crate) fn detached(writer: crate::ByteWriter) -> Self {
+        Self {
+            writer,
+            completion: None,
+            pending: None,
+            write_wait: None,
+        }
+    }
+
     pub(super) fn finish(&mut self, result: core::result::Result<(), ()>) {
         if let Some(tx) = self.completion.take() {
             let _ = tx.send(result);
