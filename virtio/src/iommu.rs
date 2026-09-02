@@ -161,6 +161,28 @@ struct RequestBuffers {
 struct EventQueue<T: VirtioTransport> {
     queue: VirtQueue<T>,
     buffers: Box<[u8]>,
+    /// Which fault buffer each in-flight descriptor identifier carries.
+    ///
+    /// A re-armed buffer is not guaranteed the identifier it had before
+    /// — the ring hands identifiers back in completion order — so the
+    /// pairing is recorded at submission rather than assumed.
+    slot_for_token: [u16; EVENT_QUEUE_SIZE as usize],
+}
+
+impl<T: VirtioTransport> EventQueue<T> {
+    /// Hands one fault buffer to the device.
+    fn arm(&mut self, transport: &T, slot: u16) -> IoResult<()> {
+        let buffer = fault_slot(&mut self.buffers, slot);
+        let token = self.queue.submit(transport, &[], &mut [buffer])?;
+        self.slot_for_token[usize::from(token)] = slot;
+        Ok(())
+    }
+}
+
+/// The bytes of one fault record inside the event buffer slab.
+fn fault_slot(buffers: &mut [u8], slot: u16) -> &mut [u8] {
+    let start = usize::from(slot) * FAULT_BYTES;
+    &mut buffers[start..start + FAULT_BYTES]
 }
 
 impl<T: VirtioTransport> VirtioIommuDevice<T> {
@@ -204,7 +226,7 @@ impl<T: VirtioTransport> VirtioIommuDevice<T> {
             REQUEST_CHAIN_LIMIT,
             features,
         )?;
-        let mut event_ring = build_queue(
+        let event_ring = build_queue(
             &transport,
             EVENT_QUEUE_INDEX,
             EVENT_QUEUE_SIZE,
@@ -212,8 +234,12 @@ impl<T: VirtioTransport> VirtioIommuDevice<T> {
             features,
         )?;
         let event_slots = event_ring.available_descriptors();
-        let mut event_buffers = vec![0_u8; event_slots * FAULT_BYTES].into_boxed_slice();
-        stock_event_queue(&transport, &mut event_ring, &mut event_buffers)?;
+        let mut events = EventQueue {
+            queue: event_ring,
+            buffers: vec![0_u8; event_slots * FAULT_BYTES].into_boxed_slice(),
+            slot_for_token: [0; EVENT_QUEUE_SIZE as usize],
+        };
+        stock_event_queue(&mut events, &transport)?;
 
         transport.set_status(
             DeviceStatus::ACKNOWLEDGE
@@ -229,10 +255,7 @@ impl<T: VirtioTransport> VirtioIommuDevice<T> {
                 reply: vec![0_u8; probe_bytes + TAIL_BYTES].into_boxed_slice(),
             }),
             request_queue: Mutex::new(request_queue),
-            event_queue: Mutex::new(EventQueue {
-                queue: event_ring,
-                buffers: event_buffers,
-            }),
+            event_queue: Mutex::new(events),
             geometry,
             probe_bytes,
             features,
@@ -277,14 +300,17 @@ impl<T: VirtioTransport> VirtioIommuDevice<T> {
     /// buffers it used.
     pub fn drain_faults(&self) {
         let mut state = self.event_queue.lock();
-        let EventQueue { queue, buffers } = &mut *state;
-        let mut refill = [false; EVENT_QUEUE_SIZE as usize];
-        let drained = queue.drain_used(|token, _len| {
-            let slot = usize::from(token);
-            let Some(bytes) = buffers.get(slot * FAULT_BYTES..(slot + 1) * FAULT_BYTES) else {
-                panic!("virtio-iommu reported fault slot {token} outside the event buffers");
-            };
-            let fault = decode_fault(bytes);
+        let EventQueue {
+            queue,
+            buffers,
+            slot_for_token,
+        } = &mut *state;
+        let mut returned = [0_u16; EVENT_QUEUE_SIZE as usize];
+        let mut drained = 0;
+        queue.drain_used(|token, _len| {
+            let slot = slot_for_token[usize::from(token)];
+            let start = usize::from(slot) * FAULT_BYTES;
+            let fault = decode_fault(&buffers[start..start + FAULT_BYTES]);
             tracing::error!(
                 reason = fault.reason,
                 flags = fault.flags,
@@ -292,27 +318,19 @@ impl<T: VirtioTransport> VirtioIommuDevice<T> {
                 address = fault.address,
                 "virtio-iommu reported a translation fault"
             );
-            if let Some(slot) = refill.get_mut(slot) {
-                *slot = true;
-            }
+            returned[drained] = slot;
+            drained += 1;
         });
         if drained == 0 {
             return;
         }
         self.faults.fetch_add(drained as u64, Ordering::Relaxed);
-        for (slot, needs_refill) in refill.iter().enumerate() {
-            if !needs_refill {
-                continue;
-            }
-            let range = slot * FAULT_BYTES..(slot + 1) * FAULT_BYTES;
-            let buffer = &mut buffers[range];
-            queue
-                .submit(&self.transport, &[], &mut [buffer])
-                .unwrap_or_else(|error| {
-                    panic!("virtio-iommu event buffer could not be re-armed: {error}")
-                });
+        for slot in returned[..drained].iter().copied() {
+            state.arm(&self.transport, slot).unwrap_or_else(|error| {
+                panic!("virtio-iommu event buffer could not be re-armed: {error}")
+            });
         }
-        queue.notify(&self.transport);
+        state.queue.notify(&self.transport);
     }
 
     /// Asks the device which physical ranges `endpoint` has to keep
@@ -470,21 +488,12 @@ fn build_queue<T: VirtioTransport>(
 
 /// Hands every event buffer to the device so a fault always has
 /// somewhere to land.
-fn stock_event_queue<T: VirtioTransport>(
-    transport: &T,
-    queue: &mut VirtQueue<T>,
-    buffers: &mut [u8],
-) -> IoResult<()> {
-    for slot in 0..buffers.len() / FAULT_BYTES {
-        let buffer = &mut buffers[slot * FAULT_BYTES..(slot + 1) * FAULT_BYTES];
-        let token = queue.submit(transport, &[], &mut [buffer])?;
-        assert_eq!(
-            usize::from(token),
-            slot,
-            "virtio-iommu event buffers must line up with their descriptor identifiers"
-        );
+fn stock_event_queue<T: VirtioTransport>(state: &mut EventQueue<T>, transport: &T) -> IoResult<()> {
+    for slot in 0..state.buffers.len() / FAULT_BYTES {
+        let slot = u16::try_from(slot).map_err(|_| IoError::OutOfBounds)?;
+        state.arm(transport, slot)?;
     }
-    queue.notify(transport);
+    state.queue.notify(transport);
     Ok(())
 }
 
@@ -1005,6 +1014,10 @@ mod tests {
         assert_eq!(decode_reserved_regions(&[0; 64], &mut regions), 0);
     }
 
+    /// Every buffer goes straight back to the device, and it goes back
+    /// paired with whatever identifier the ring gave it: the ring hands
+    /// identifiers out in completion order, so a driver that assumed the
+    /// old one would decode the next fault out of the wrong buffer.
     #[test]
     fn a_fault_event_is_counted_and_its_buffer_re_armed() {
         let device = device();
@@ -1021,12 +1034,14 @@ mod tests {
         device.drain_faults();
 
         assert_eq!(device.fault_count(), 1);
-        // The buffer went straight back to the device: a second fault
-        // has somewhere to land.
+        let state = device.event_queue.lock();
         assert_eq!(
-            device.event_queue.lock().queue.available_descriptors(),
+            state.queue.available_descriptors(),
             0,
             "every event buffer is back in the device's hands"
         );
+        // The identifier the re-armed buffer was given points back at
+        // the slot it actually occupies.
+        assert_eq!(state.slot_for_token[0], 0);
     }
 }
