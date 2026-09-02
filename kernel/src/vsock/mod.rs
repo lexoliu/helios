@@ -114,6 +114,18 @@ where
         loop {
             match self.inner.device.receive_into(&mut payload).await {
                 Ok(VsockDelivery::Packet(received)) => {
+                    // Connection lifecycle is worth a line each: the
+                    // packets that carry it are a handful per session,
+                    // and a link that never gets past its handshake is
+                    // otherwise indistinguishable from one that is idle.
+                    tracing::info!(
+                        op = ?received.header.op,
+                        source_cid = received.header.source.cid,
+                        source_port = received.header.source.port,
+                        destination_port = received.header.destination.port,
+                        payload_len = received.payload_len,
+                        "vsock packet received"
+                    );
                     let reply = self
                         .inner
                         .table
@@ -328,6 +340,14 @@ where
     }
 
     async fn transmit(&self, header: VsockPacketHeader, payload: &[u8]) -> Result<(), VsockError> {
+        tracing::info!(
+            op = ?header.op,
+            source_port = header.source.port,
+            destination_cid = header.destination.cid,
+            destination_port = header.destination.port,
+            payload_len = payload.len(),
+            "vsock packet transmitted"
+        );
         self.inner
             .device
             .send(header, payload)
