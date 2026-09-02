@@ -19,6 +19,7 @@ stats = []
 sync = []
 task = ["wit-bindgen/async-spawn"]
 tracing = []
+vsock = []
 
 [dependencies]
 async-channel = { version = "2.5.0", optional = true }

@@ -337,10 +337,17 @@ where
 
     /// Turns a caller's timeout into an absolute deadline on this
     /// processor's clock.
+    ///
+    /// The conversion saturates rather than wrapping: a caller that asks
+    /// for `u64::MAX` nanoseconds means "no deadline", and a truncated
+    /// tick count would turn that into an immediate timeout.
     fn deadline(&self, timeout_nanos: u64) -> Instant {
         let frequency = self.inner.cpu.timer_frequency();
-        let ticks = (u128::from(timeout_nanos) * u128::from(frequency) / 1_000_000_000) as u64;
-        self.inner.cpu.now().saturating_add(ticks)
+        let ticks = u128::from(timeout_nanos) * u128::from(frequency) / 1_000_000_000;
+        self.inner
+            .cpu
+            .now()
+            .saturating_add(u64::try_from(ticks).unwrap_or(u64::MAX))
     }
 
     fn expired(&self, deadline: Instant) -> bool {

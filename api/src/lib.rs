@@ -3,7 +3,7 @@
 //! Each capability area lives behind a Cargo feature so programs only
 //! link the WIT interfaces they use: `fs`, `http`, `http-handler`, `io`,
 //! `net`, `programs`, `serial`, `stats`, `sync`, `task`, `tracing`,
-//! `profiling`, `instances`, and `channel`. `bindings` exposes the raw generated WIT
+//! `profiling`, `instances`, `vsock`, and `channel`. `bindings` exposes the raw generated WIT
 //! bindings for anything the typed helpers do not cover, and
 //! [`main`](macro@main) wraps a program's async entry point.
 
@@ -37,6 +37,8 @@ pub mod sync;
 pub mod task;
 #[cfg(feature = "tracing")]
 pub mod tracing;
+#[cfg(feature = "vsock")]
+pub mod vsock;
 
 #[cfg(any(feature = "fs", feature = "io"))]
 pub use error::Result;

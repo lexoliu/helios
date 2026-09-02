@@ -20,6 +20,7 @@ use spin::{Mutex, Once};
 use crate::memory::BalloonHandle;
 
 use crate::BlockService;
+use crate::ComponentHostVsockService;
 use crate::component::{ComponentRuntimeState, ProviderSlot};
 use crate::network::HttpExchange;
 use crate::runtime::types::ComponentHostFilesystemState;
@@ -61,6 +62,10 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// The memory balloon the host resizes this guest through. Empty on
     /// a machine that gave the kernel none.
     balloon: Once<BalloonHandle>,
+    /// The machine's link to its host, once a backend brought a vsock
+    /// device up. Empty on a machine with no vsock device, where the
+    /// runtime adapter answers `unavailable` rather than trapping.
+    vsock_service: Once<ComponentHostVsockService>,
     futex_table: Mutex<FutexTable>,
     bootfs: Mutex<Option<EmbeddedBootFs>>,
     tracing: Mutex<TraceHistory>,
@@ -358,6 +363,7 @@ where
                 block_service: Once::new(),
                 iommu_report: Once::new(),
                 balloon: Once::new(),
+                vsock_service: Once::new(),
                 futex_table: Mutex::new(FutexTable::new()),
                 bootfs: Mutex::new(embedded_init().map(|init| init.bootfs())),
                 tracing: Mutex::new(TraceHistory::new(DEFAULT_TRACE_HISTORY_CAPACITY)),
@@ -856,6 +862,24 @@ where
             balloon
         });
         assert!(installed, "memory balloon was installed more than once");
+    }
+
+    /// Publishes the machine's vsock link.
+    ///
+    /// Called from the backend that brought the device up, before any
+    /// component runs, so a service visible here is one every consumer
+    /// may use without checking the device first.
+    pub fn install_vsock_service(&self, service: ComponentHostVsockService) {
+        let mut installed = false;
+        self.inner.vsock_service.call_once(|| {
+            installed = true;
+            service
+        });
+        assert!(installed, "vsock service was installed more than once");
+    }
+
+    pub fn vsock_service(&self) -> Option<ComponentHostVsockService> {
+        self.inner.vsock_service.get().cloned()
     }
 
     pub fn prepare_futex_wait(&self, key: FutexKey) -> FutexWaitRegistration {
