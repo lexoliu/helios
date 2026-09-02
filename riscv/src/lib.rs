@@ -7,6 +7,7 @@ mod entropy;
 mod host_fs;
 mod net;
 mod pci;
+mod rtc;
 mod watchdog;
 
 mod debug_state {
@@ -616,6 +617,19 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         let root =
             helios_kernel::seed_root_entropy(&cpu, helios_hal::entropy::device_tree_seed(&fdt));
         debug_state.install_root_entropy(root.clone());
+        // The calendar is read once, on the bootstrap hart, before any
+        // component can ask what time it is. The hart timer carries wall
+        // time forward from that reading; nothing re-synchronises it.
+        match rtc::discover(&fdt) {
+            Some(rtc) => {
+                debug_state.seed_wall_clock(cpu.now().ticks(), &rtc);
+            }
+            None => {
+                tracing::warn!(
+                    "no goldfish RTC in the device tree; the wall clock reads as uptime"
+                );
+            }
+        }
         root
     });
     // Only the bootstrap hart brings devices up, and it is the hart
