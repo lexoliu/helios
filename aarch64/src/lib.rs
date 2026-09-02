@@ -37,9 +37,7 @@ use limine::request::{
     DtbRequest, ExecutableAddressRequest, ExecutableCmdlineRequest, ExecutableFileRequest,
     FirmwareTypeRequest, HhdmRequest, MemmapRequest, ModulesRequest, MpRequest, StackSizeRequest,
 };
-use rand_chacha::ChaCha20Rng;
-use rand_core::{RngCore, SeedableRng};
-use spin::{Mutex, Once};
+use spin::Once;
 
 const KERNEL_STACK_BYTES: usize = 4 * 1024 * 1024;
 const EXCEPTION_STACK_BYTES: usize = 64 * 1024;
@@ -88,6 +86,7 @@ unsafe extern "C" {
 
 mod vmm;
 pub use vmm::Aarch64UserAddressSpace;
+mod entropy;
 mod gic;
 mod host_fs;
 mod net;
@@ -106,6 +105,7 @@ pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
     IntId,
     net::VirtioNetworkDevice,
     host_fs::HostFsTransportService,
+    entropy::VirtioEntropyDevice,
 >;
 
 #[used]
@@ -234,16 +234,12 @@ struct Aarch64ProcessorSlot {
 struct Aarch64PlatformState {
     processors: Box<[Aarch64ProcessorSlot]>,
     timer_frequency: u64,
-    boot_entropy: Option<Aarch64BootEntropy>,
     debug_state: Once<debug_state::RuntimeState>,
     gic: Once<gic::Gic>,
 }
 
 impl Aarch64PlatformState {
-    fn from_limine_mp(
-        timer_frequency: u64,
-        boot_entropy: Option<Aarch64BootEntropy>,
-    ) -> &'static Self {
+    fn from_limine_mp(timer_frequency: u64) -> &'static Self {
         let response = MP_REQUEST
             .response()
             .unwrap_or_else(|| panic!("Limine did not provide an AArch64 MP response"));
@@ -283,7 +279,6 @@ impl Aarch64PlatformState {
         Box::leak(Box::new(Self {
             processors,
             timer_frequency,
-            boot_entropy,
             debug_state: Once::new(),
             gic: Once::new(),
         }))
@@ -369,28 +364,6 @@ impl Aarch64PlatformState {
             core::hint::spin_loop();
         }
     }
-
-    fn fill_entropy(&self, buffer: &mut [u8]) -> Result<(), EntropyUnavailable> {
-        if let Some(boot_entropy) = &self.boot_entropy {
-            boot_entropy.fill(buffer);
-            return Ok(());
-        }
-        fill_with_rndr(buffer)
-    }
-
-    /// Names the cryptographic source `fill_entropy` will draw from, so
-    /// a boot that has neither the firmware seed nor `RNDR` — and would
-    /// therefore leave the kernel pool insecure — is visible in the log
-    /// rather than only at the first failed secure draw.
-    fn entropy_source(&self) -> &'static str {
-        if self.boot_entropy.is_some() {
-            "device-tree /chosen/rng-seed"
-        } else if rndr_supported() {
-            "RNDR"
-        } else {
-            "none"
-        }
-    }
 }
 
 fn aarch64_processor_count() -> usize {
@@ -403,22 +376,6 @@ fn aarch64_processor_count() -> usize {
         "Limine AArch64 MP response did not describe any CPU"
     );
     processor_count
-}
-
-struct Aarch64BootEntropy {
-    rng: Mutex<ChaCha20Rng>,
-}
-
-impl Aarch64BootEntropy {
-    fn new(seed: [u8; 32]) -> Self {
-        Self {
-            rng: Mutex::new(ChaCha20Rng::from_seed(seed)),
-        }
-    }
-
-    fn fill(&self, buffer: &mut [u8]) {
-        self.rng.lock().fill_bytes(buffer);
-    }
 }
 
 struct Aarch64InterruptOps;
@@ -484,8 +441,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
     let memory_regions = boot_memory_regions(&handoff, physical_memory_offset, &reserved_ranges);
     helios_kernel::prime_bootstrap_allocator(memory_regions, processor_count);
     vmm::install_user_address_space(physical_memory_offset);
-    let boot_entropy = discover_boot_entropy(&handoff);
-    let platform_state = Aarch64PlatformState::from_limine_mp(timer_frequency(), boot_entropy);
+    let platform_state = Aarch64PlatformState::from_limine_mp(timer_frequency());
     activate_processor_runtime(platform_state.bootstrap_runtime());
 
     let cpu = Aarch64Cpu {
@@ -502,12 +458,23 @@ extern "C" fn aarch64_kernel_main() -> ! {
         || read_counter(),
         Some(write_debug_serial_bytes),
     );
+    // The root DRBG is seeded before any component can ask for random
+    // bytes: `RNDR` where the processor implements it, plus the seed the
+    // bootloader left in `/chosen/rng-seed`. Neither is a fallback for
+    // the other, and the entropy device joins them once the executor
+    // runs.
+    let root_entropy =
+        helios_kernel::seed_root_entropy(&cpu, helios_hal::entropy::device_tree_seed(&boot_fdt));
+    debug_state.install_root_entropy(root_entropy.clone());
     let mut devices = DeviceInventory::new().with_debug_serial();
     if host_fs::has_9p_device(&boot_fdt) {
         devices = devices.with_host_share();
     }
     if net::has_network_device(&boot_fdt) {
         devices = devices.with_network();
+    }
+    if entropy::has_entropy_device(&boot_fdt) {
+        devices = devices.with_entropy_device();
     }
     let kernel = helios_kernel::init(
         Platform::new(console, core::iter::empty::<MemoryRegion>(), cpu.clone())
@@ -530,12 +497,6 @@ extern "C" fn aarch64_kernel_main() -> ! {
         &handoff,
     ));
     gic.attach_current_processor(platform_state.bootstrap_mpidr());
-    let entropy_source = platform_state.entropy_source();
-    if entropy_source == "none" {
-        tracing::warn!("boot entropy has no cryptographic source");
-    } else {
-        tracing::info!("boot entropy source={entropy_source}");
-    }
 
     let mut routes = DeviceInterruptRoutes::new();
     if let Some(host_fs) =
@@ -562,6 +523,20 @@ extern "C" fn aarch64_kernel_main() -> ! {
             platform_state.bootstrap_mpidr(),
         );
         routes.set_network(network.interrupt, network.device);
+    }
+    if let Some(entropy) = entropy::install(
+        &kernel,
+        &boot_fdt,
+        physical_memory_offset,
+        &handoff,
+        root_entropy,
+    ) {
+        gic.enable_device_interrupt(
+            entropy.interrupt,
+            entropy.trigger,
+            platform_state.bootstrap_mpidr(),
+        );
+        routes.set_entropy(entropy.interrupt, entropy.device);
     }
 
     let runtime = current_processor_runtime();
@@ -728,8 +703,12 @@ impl Cpu for Aarch64Cpu {
         }
     }
 
+    /// The processor's own entropy source. The seed firmware leaves in
+    /// the device tree is a separate source that the kernel mixes into
+    /// its root DRBG; it is deliberately not laundered through here,
+    /// which would make one a fallback for the other.
     fn fill_entropy(&self, buffer: &mut [u8]) -> Result<EntropyQuality, EntropyUnavailable> {
-        self.state.fill_entropy(buffer)?;
+        fill_with_rndr(buffer)?;
         Ok(EntropyQuality::Cryptographic)
     }
 
@@ -1426,27 +1405,6 @@ fn count_virtio_mmio_devices(fdt: &Fdt<'_>, expected: helios_virtio::DeviceType)
             matches_virtio_mmio_device(candidate.base, physical_memory_offset, &handoff, expected)
         })
         .count()
-}
-
-fn discover_boot_entropy(handoff: &LimineBootHandoff) -> Option<Aarch64BootEntropy> {
-    if let Some(fdt) = boot_fdt(handoff) {
-        if let Some(chosen) = fdt.find_node("/chosen") {
-            if let Some(seed) = chosen.property("rng-seed") {
-                return Some(Aarch64BootEntropy::new(seed_from_slice(
-                    seed.value,
-                    "AArch64 FDT /chosen/rng-seed",
-                )));
-            }
-        }
-    }
-    None
-}
-
-fn seed_from_slice(seed: &[u8], source: &str) -> [u8; 32] {
-    assert!(seed.len() >= 32, "{source} must contain at least 32 bytes");
-    let mut key = [0_u8; 32];
-    key.copy_from_slice(&seed[..32]);
-    key
 }
 
 #[derive(Clone, Copy)]
