@@ -1,3 +1,22 @@
+//! TCP connection state machine.
+//!
+//! # Segmentation is a framing decision, not a protocol one
+//!
+//! A socket always accounts for what it sends at MSS granularity: one
+//! [`TcpInFlightSegment`] per MSS-sized segment, one congestion-control
+//! `on_packet_sent` per MSS-sized segment, and retransmission, SACK,
+//! and loss recovery addressing individual MSS-sized sequence ranges.
+//!
+//! When the interface segments in hardware,
+//! [`TcpSocket::take_transmit_segment`] coalesces the run of MSS-sized
+//! segments it was about to emit into one oversized buffer and reports
+//! the MSS in [`TcpTransmitSegment::segment_bytes`], so the frame
+//! encoder can attach the device's segmentation metadata. The bytes,
+//! the sequence numbers, and the bookkeeping are identical either way;
+//! only the number of descriptors handed to the NIC changes. Nothing
+//! below this module may assume a transmitted segment and an in-flight
+//! record are one to one.
+
 extern crate alloc;
 
 use alloc::boxed::Box;
@@ -55,6 +74,44 @@ pub const TCP_MAX_RETRANSMISSIONS: u8 = 5;
 pub const TCP_DELAYED_ACK_NANOS: u64 = 40_000_000;
 pub const TCP_TIME_WAIT_NANOS: u64 = 60_000_000_000;
 
+/// How much of the transmit queue a socket may put into one frame.
+///
+/// Both budgets are TCP header-plus-payload bytes, measured from the
+/// same place: `wire_segment` is what one packet on the wire may carry,
+/// and `coalesced` is what one frame handed to a segmenting interface
+/// may carry before the device splits it back into wire segments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TcpSegmentBudget {
+    wire_segment: usize,
+    coalesced: usize,
+}
+
+impl TcpSegmentBudget {
+    /// An interface that segments nothing: every frame is one wire
+    /// segment.
+    pub const fn wire_segments(wire_segment: usize) -> Self {
+        Self {
+            wire_segment,
+            coalesced: wire_segment,
+        }
+    }
+
+    /// An interface that splits an oversized frame into `wire_segment`
+    /// sized packets, accepting `coalesced` bytes per frame.
+    pub const fn coalesced(wire_segment: usize, coalesced: usize) -> Self {
+        Self {
+            wire_segment,
+            coalesced,
+        }
+    }
+
+    /// TCP header-plus-payload bytes of one packet on the wire.
+    /// Retransmission is always framed one wire segment at a time.
+    pub const fn wire_segment(self) -> usize {
+        self.wire_segment
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TcpEndpoint {
     pub address: IpAddress,
@@ -69,6 +126,16 @@ pub struct TcpTransmitSegment {
     pub options: TcpHeaderOptions,
     pub payload: Bytes,
     pub sequence_len: u32,
+    /// Payload bytes the peer sees per wire segment.
+    ///
+    /// Equal to `payload.len()` for everything the socket emits at MSS
+    /// granularity. A transmit-time coalesced burst carries several
+    /// MSS-sized segments in one buffer and reports the MSS here, so
+    /// the frame encoder can hand the device the segmentation metadata
+    /// it needs to split the burst back up. Retransmission and loss
+    /// recovery never see a burst: the in-flight queue records one
+    /// entry per MSS-sized segment regardless of how they were framed.
+    pub segment_bytes: u32,
     pub retransmission: bool,
 }
 
@@ -333,6 +400,11 @@ impl TcpInFlightQueue {
 
     fn iter_mut(&mut self) -> impl Iterator<Item = &mut TcpInFlightSegment> {
         self.segments.iter_mut()
+    }
+
+    /// Segment records the queue can still take before it is full.
+    fn remaining_capacity(&self) -> usize {
+        MAX_TCP_IN_FLIGHT_SEGMENTS.saturating_sub(self.segments.len())
     }
 }
 
@@ -922,10 +994,20 @@ where
         writable
     }
 
+    /// Takes the next segment this socket wants on the wire.
+    ///
+    /// `budget` says what one frame may carry: a
+    /// [`TcpSegmentBudget::wire_segments`] budget keeps the socket
+    /// emitting one MSS-sized segment per call, and a
+    /// [`TcpSegmentBudget::coalesced`] one lets it hand a segmenting
+    /// interface a whole run of them at once. Whatever the framing, the
+    /// in-flight queue records one entry per MSS-sized segment, so
+    /// retransmission, SACK, and loss recovery keep addressing
+    /// individual segments.
     pub fn take_transmit_segment(
         &mut self,
         now_nanos: u64,
-        tcp_segment_mtu: usize,
+        budget: TcpSegmentBudget,
     ) -> Option<TcpTransmitSegment> {
         self.arm_persist_timer_if_needed(now_nanos);
         let local = self.local?;
@@ -959,7 +1041,7 @@ where
                 local,
                 remote,
                 available_window,
-                tcp_segment_mtu,
+                budget,
                 now_nanos,
                 persist_probe,
             ) {
@@ -1040,6 +1122,7 @@ where
             options,
             payload: Bytes::new(),
             sequence_len: 1,
+            segment_bytes: 0,
             retransmission: false,
         })
     }
@@ -1091,7 +1174,7 @@ where
         local: TcpEndpoint,
         remote: TcpEndpoint,
         available: usize,
-        tcp_segment_mtu: usize,
+        budget: TcpSegmentBudget,
         now_nanos: u64,
         persist_probe: Option<TcpPersistProbe>,
     ) -> Option<TcpTransmitSegment> {
@@ -1103,30 +1186,53 @@ where
             return None;
         }
         let options = self.timestamped_options(now_nanos);
-        let payload_mtu = tcp_segment_mtu.checked_sub(
-            TcpPacket::MIN_HEADER_LEN
-                .checked_add(options.encoded_len())
-                .expect("TCP options length overflowed"),
-        )?;
+        let tcp_header_len = TcpPacket::MIN_HEADER_LEN
+            .checked_add(options.encoded_len())
+            .expect("TCP options length overflowed");
+        let payload_mtu = budget.wire_segment.checked_sub(tcp_header_len)?;
         if payload_mtu == 0 {
             return None;
         }
+        // Coalescing is on only when the interface asked for a frame
+        // wider than one wire segment; otherwise the socket emits
+        // exactly one segment per call, as it always has.
+        let coalesced_payload = (budget.coalesced > budget.wire_segment)
+            .then(|| budget.coalesced.saturating_sub(tcp_header_len));
         let persist_probe = persist_probe.filter(|probe| !probe.fin);
-        let mut payload = if persist_probe.is_some() {
+        let is_persist_probe = persist_probe.is_some();
+        let maximum_segment = available.min(self.peer_max_segment_size).min(payload_mtu);
+        // Every MSS-sized segment inside a coalesced burst still needs
+        // its own in-flight record, so the burst can never be longer
+        // than the queue has room for.
+        let in_flight_room = self.in_flight.as_ref().map_or(
+            MAX_TCP_IN_FLIGHT_SEGMENTS,
+            TcpInFlightQueue::remaining_capacity,
+        );
+        let burst_limit = match coalesced_payload.filter(|_| !is_persist_probe) {
+            Some(coalesced_payload) => coalesced_payload
+                .min(available)
+                .min(maximum_segment.saturating_mul(in_flight_room))
+                .max(maximum_segment),
+            None => maximum_segment,
+        };
+        if burst_limit == 0 {
+            return None;
+        }
+        let mut payload = if is_persist_probe {
             self.transmit_queue.as_ref()?.front()?.slice(..1)
         } else {
             self.transmit_queue.as_mut()?.pop_front()?
         };
-        let maximum_segment = available.min(self.peer_max_segment_size).min(payload_mtu);
-        if payload.len() > maximum_segment {
-            let tail = payload.split_off(maximum_segment);
-            if persist_probe.is_none() {
+        if payload.len() > burst_limit {
+            let tail = payload.split_off(burst_limit);
+            if !is_persist_probe {
                 self.transmit_queue_mut()
                     .push_front(tail)
                     .unwrap_or_else(|_| panic!("TCP transmit queue lost capacity while splitting"));
             }
         }
-        let sequence_len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+        let payload_len = payload.len();
+        let sequence_len = u32::try_from(payload_len).unwrap_or(u32::MAX);
         let sequence = persist_probe.map_or(self.send_next, |probe| probe.sequence);
         let header = TcpHeader {
             source_port: local.port,
@@ -1136,14 +1242,6 @@ where
             flags: TcpFlags::ACK.union(TcpFlags::PSH),
             window_size: self.advertised_window,
         };
-        let is_persist_probe = persist_probe.is_some();
-        if !is_persist_probe {
-            self.send_next = self.send_next.wrapping_add(sequence_len);
-            self.bytes_in_flight = self.bytes_in_flight.saturating_add(sequence_len);
-            self.congestion
-                .on_packet_sent(sequence_len, self.bytes_in_flight, now_nanos);
-            self.schedule_next_pacing_send(sequence_len, now_nanos);
-        }
         if is_persist_probe {
             self.mark_persist_probe_queued(
                 TcpPersistProbe {
@@ -1154,17 +1252,35 @@ where
                 now_nanos,
             );
         } else {
-            self.in_flight_mut()
-                .push_back(TcpInFlightSegment {
-                    header,
-                    options,
-                    payload: payload.clone(),
-                    sequence_len,
-                    sent_at_nanos: now_nanos,
-                    retransmissions: 0,
-                    sacked: false,
-                })
-                .unwrap_or_else(|_| panic!("TCP in-flight queue is full"));
+            // Split the burst back into MSS-sized in-flight records.
+            // Congestion control sees exactly the packet train the
+            // device will put on the wire.
+            let mut offset = 0usize;
+            while offset < payload_len {
+                let chunk_len = maximum_segment.min(payload_len - offset);
+                let chunk_sequence_len = chunk_len as u32;
+                let chunk_header = TcpHeader {
+                    sequence: sequence.wrapping_add(offset as u32),
+                    ..header
+                };
+                self.send_next = self.send_next.wrapping_add(chunk_sequence_len);
+                self.bytes_in_flight = self.bytes_in_flight.saturating_add(chunk_sequence_len);
+                self.congestion
+                    .on_packet_sent(chunk_sequence_len, self.bytes_in_flight, now_nanos);
+                self.in_flight_mut()
+                    .push_back(TcpInFlightSegment {
+                        header: chunk_header,
+                        options,
+                        payload: payload.slice(offset..offset + chunk_len),
+                        sequence_len: chunk_sequence_len,
+                        sent_at_nanos: now_nanos,
+                        retransmissions: 0,
+                        sacked: false,
+                    })
+                    .unwrap_or_else(|_| panic!("TCP in-flight queue is full"));
+                offset += chunk_len;
+            }
+            self.schedule_next_pacing_send(sequence_len, now_nanos);
         }
         self.ack_pending = false;
         self.delayed_ack_deadline_nanos = None;
@@ -1175,6 +1291,7 @@ where
             options,
             payload,
             sequence_len,
+            segment_bytes: maximum_segment as u32,
             retransmission: false,
         })
     }
@@ -1230,6 +1347,7 @@ where
             options: in_flight.options,
             payload: in_flight.payload.slice(..payload_len),
             sequence_len,
+            segment_bytes: payload_len as u32,
             retransmission: true,
         })
     }
@@ -2801,7 +2919,10 @@ mod tests {
 
         assert_eq!(socket.queue_send(b"hello"), 5);
         let data = socket
-            .take_transmit_segment(TCP_INITIAL_RTO_NANOS, usize::MAX)
+            .take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS,
+                TcpSegmentBudget::wire_segments(usize::MAX),
+            )
             .expect("established socket should transmit queued bytes");
         let _ = deliver_segment(
             &mut socket,
@@ -2830,7 +2951,7 @@ mod tests {
         assert_eq!(socket.queue_send(b"hello"), 5);
         let sent_at = TCP_INITIAL_RTO_NANOS + 7;
         let data = socket
-            .take_transmit_segment(sent_at, usize::MAX)
+            .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
             .expect("established socket should transmit queued bytes");
         let acked_at = sent_at + 123;
 
@@ -2873,7 +2994,7 @@ mod tests {
         assert_eq!(socket.queue_send(b"hello"), 5);
         let sent_at = TCP_INITIAL_RTO_NANOS + 7;
         let data = socket
-            .take_transmit_segment(sent_at, usize::MAX)
+            .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
             .expect("established socket should transmit queued bytes");
 
         for index in 0u64..3 {
@@ -2907,7 +3028,7 @@ mod tests {
         assert_eq!(socket.queue_send(b"hello"), 5);
         let sent_at = TCP_INITIAL_RTO_NANOS + 7;
         let data = socket
-            .take_transmit_segment(sent_at, usize::MAX)
+            .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
             .expect("established socket should transmit queued bytes");
 
         for index in 0u64..3 {
@@ -2938,7 +3059,7 @@ mod tests {
         assert_eq!(socket.queue_send(b"hello"), 5);
         let sent_at = TCP_INITIAL_RTO_NANOS + 7;
         let data = socket
-            .take_transmit_segment(sent_at, usize::MAX)
+            .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
             .expect("established socket should transmit queued bytes");
 
         for (index, window_size) in [4096u16, 8192, 16_384].into_iter().enumerate() {
@@ -2985,13 +3106,13 @@ mod tests {
         assert_eq!(socket.queue_send(b"abcdefgh"), 8);
         let sent_at = TCP_INITIAL_RTO_NANOS + 7;
         let first = socket
-            .take_transmit_segment(sent_at, usize::MAX)
+            .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
             .expect("first segment should transmit");
         let second_send_at = socket
             .next_deadline_nanos()
             .expect("paced second segment should have a deadline");
         let second = socket
-            .take_transmit_segment(second_send_at, usize::MAX)
+            .take_transmit_segment(second_send_at, TcpSegmentBudget::wire_segments(usize::MAX))
             .expect("second segment should transmit");
         let mut blocks = TcpSackBlocks::empty();
         blocks
@@ -3074,13 +3195,13 @@ mod tests {
         assert_eq!(socket.queue_send(b"abcdefghijkl"), 12);
         let sent_at = TCP_INITIAL_RTO_NANOS + 7;
         let first = socket
-            .take_transmit_segment(sent_at, usize::MAX)
+            .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
             .expect("first segment should transmit");
         let second_send_at = socket
             .next_deadline_nanos()
             .expect("paced second segment should have a deadline");
         let second = socket
-            .take_transmit_segment(second_send_at, usize::MAX)
+            .take_transmit_segment(second_send_at, TcpSegmentBudget::wire_segments(usize::MAX))
             .expect("second segment should transmit");
         assert!(sequence_lt(first.header.sequence, second.header.sequence));
         let mut blocks = TcpSackBlocks::empty();
@@ -3118,13 +3239,13 @@ mod tests {
         assert_eq!(socket.queue_send(b"abcdefgh"), 8);
         let sent_at = TCP_INITIAL_RTO_NANOS + 7;
         let first = socket
-            .take_transmit_segment(sent_at, usize::MAX)
+            .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
             .expect("first segment should transmit");
         let second_send_at = socket
             .next_deadline_nanos()
             .expect("paced second segment should have a deadline");
         let second = socket
-            .take_transmit_segment(second_send_at, usize::MAX)
+            .take_transmit_segment(second_send_at, TcpSegmentBudget::wire_segments(usize::MAX))
             .expect("second segment should transmit");
         let mut blocks = TcpSackBlocks::empty();
         blocks
@@ -3231,13 +3352,13 @@ mod tests {
         assert_eq!(socket.queue_send(b"abcdefgh"), 8);
         let sent_at = TCP_INITIAL_RTO_NANOS + 7;
         let first = socket
-            .take_transmit_segment(sent_at, usize::MAX)
+            .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
             .expect("first segment should transmit");
         let second_send_at = socket
             .next_deadline_nanos()
             .expect("paced second segment should have a deadline");
         let second = socket
-            .take_transmit_segment(second_send_at, usize::MAX)
+            .take_transmit_segment(second_send_at, TcpSegmentBudget::wire_segments(usize::MAX))
             .expect("second segment should transmit");
         let _ = deliver_segment(
             &mut socket,
@@ -3319,7 +3440,10 @@ mod tests {
         assert_eq!(socket.queue_send_bytes(&mut payload), 5);
         assert!(payload.is_empty());
         let segment = socket
-            .take_transmit_segment(TCP_INITIAL_RTO_NANOS, usize::MAX)
+            .take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS,
+                TcpSegmentBudget::wire_segments(usize::MAX),
+            )
             .expect("established socket should transmit queued bytes");
         assert_eq!(segment.payload.as_ref(), b"hello");
         assert_eq!(segment.payload.as_ptr(), payload_ptr);
@@ -3360,7 +3484,10 @@ mod tests {
 
         assert!(
             socket
-                .take_transmit_segment(TCP_INITIAL_RTO_NANOS, usize::MAX)
+                .take_transmit_segment(
+                    TCP_INITIAL_RTO_NANOS,
+                    TcpSegmentBudget::wire_segments(usize::MAX)
+                )
                 .is_none(),
             "a full in-flight queue must close the send window"
         );
@@ -3460,7 +3587,10 @@ mod tests {
         assert_eq!(socket.peer_max_segment_size(), 4);
         assert_eq!(socket.queue_send(b"abcdefghij"), 10);
         let first = socket
-            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 1, usize::MAX)
+            .take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 1,
+                TcpSegmentBudget::wire_segments(usize::MAX),
+            )
             .expect("queued bytes should produce a capped segment");
 
         assert_eq!(first.payload.as_ref(), b"abcd");
@@ -3472,13 +3602,19 @@ mod tests {
 
         assert_eq!(socket.queue_send(b"abcdefghij"), 10);
         let first = socket
-            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 1, TcpPacket::MIN_HEADER_LEN + 4)
+            .take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 1,
+                TcpSegmentBudget::wire_segments(TcpPacket::MIN_HEADER_LEN + 4),
+            )
             .expect("path MTU should allow a capped data segment");
         let second_send_at = socket
             .next_deadline_nanos()
             .expect("PMTU split second segment should have a pacing deadline");
         let second = socket
-            .take_transmit_segment(second_send_at, TcpPacket::MIN_HEADER_LEN + 4)
+            .take_transmit_segment(
+                second_send_at,
+                TcpSegmentBudget::wire_segments(TcpPacket::MIN_HEADER_LEN + 4),
+            )
             .expect("remaining bytes should stay queued after PMTU split");
 
         assert_eq!(first.payload.as_ref(), b"abcd");
@@ -3491,7 +3627,7 @@ mod tests {
         assert_eq!(socket.queue_send(b"abcdefgh"), 8);
         let sent_at = TCP_INITIAL_RTO_NANOS + 7;
         let data = socket
-            .take_transmit_segment(sent_at, usize::MAX)
+            .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
             .expect("queued data should transmit");
 
         socket.mark_path_mtu_reduced(data.header.sequence);
@@ -3510,7 +3646,7 @@ mod tests {
         assert_eq!(socket.queue_send(b"abcdefgh"), 8);
         let sent_at = TCP_INITIAL_RTO_NANOS + 7;
         let data = socket
-            .take_transmit_segment(sent_at, usize::MAX)
+            .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
             .expect("queued data should transmit");
 
         socket.mark_path_mtu_reduced(data.header.sequence + 3);
@@ -3531,7 +3667,10 @@ mod tests {
         let mut socket = established_socket();
         assert_eq!(socket.queue_send(b"abcdefgh"), 8);
         let data = socket
-            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 1, usize::MAX)
+            .take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 1,
+                TcpSegmentBudget::wire_segments(usize::MAX),
+            )
             .expect("queued data should transmit");
         let _ = deliver_segment(
             &mut socket,
@@ -3566,7 +3705,7 @@ mod tests {
         assert_eq!(socket.queue_send(b"abcdefgh"), 8);
         let sent_at = TCP_INITIAL_RTO_NANOS + 1;
         let data = socket
-            .take_transmit_segment(sent_at, usize::MAX)
+            .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
             .expect("queued data should transmit");
         let delivered_before = socket.delivered_bytes;
         let send_unacknowledged_before = socket.send_unacknowledged;
@@ -3625,7 +3764,7 @@ mod tests {
         assert_eq!(socket.queue_send(b"abcdefgh"), 8);
         let sent_at = TCP_INITIAL_RTO_NANOS + 1;
         let data = socket
-            .take_transmit_segment(sent_at, usize::MAX)
+            .take_transmit_segment(sent_at, TcpSegmentBudget::wire_segments(usize::MAX))
             .expect("queued data should transmit");
         socket.mark_path_mtu_reduced(data.header.sequence);
 
@@ -3859,7 +3998,10 @@ mod tests {
         assert_eq!(socket.peer_receive_window(), 32);
         assert_eq!(socket.queue_send(b"abcdefghijklmnopqrstuvwxyz"), 26);
         let segment = socket
-            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 1, usize::MAX)
+            .take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 1,
+                TcpSegmentBudget::wire_segments(usize::MAX),
+            )
             .expect("scaled peer receive window should allow data");
 
         assert_eq!(segment.payload.len(), 26);
@@ -3983,11 +4125,17 @@ mod tests {
         assert_eq!(socket.peer_receive_window(), 4);
         assert_eq!(socket.queue_send(b"abcdefghij"), 10);
         let first = socket
-            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 2, usize::MAX)
+            .take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 2,
+                TcpSegmentBudget::wire_segments(usize::MAX),
+            )
             .expect("peer receive window should allow a capped segment");
         assert_eq!(first.payload.as_ref(), b"abcd");
         assert_eq!(
-            socket.take_transmit_segment(TCP_INITIAL_RTO_NANOS + 3, usize::MAX),
+            socket.take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 3,
+                TcpSegmentBudget::wire_segments(usize::MAX)
+            ),
             None
         );
     }
@@ -4013,7 +4161,10 @@ mod tests {
         assert_eq!(socket.peer_receive_window(), 0);
         assert_eq!(socket.queue_send(b"abcdefghij"), 10);
         assert_eq!(
-            socket.take_transmit_segment(TCP_INITIAL_RTO_NANOS + 2, usize::MAX),
+            socket.take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 2,
+                TcpSegmentBudget::wire_segments(usize::MAX)
+            ),
             None
         );
 
@@ -4032,7 +4183,10 @@ mod tests {
             TCP_INITIAL_RTO_NANOS + 3,
         );
         let segment = socket
-            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 4, usize::MAX)
+            .take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 4,
+                TcpSegmentBudget::wire_segments(usize::MAX),
+            )
             .expect("window update should release locally buffered bytes");
 
         assert_eq!(segment.payload.as_ref(), b"abcdefghij");
@@ -4060,13 +4214,16 @@ mod tests {
         let rto = socket.retransmission_timer.timeout_nanos();
         let first_deadline = TCP_INITIAL_RTO_NANOS + 2 + rto;
         assert_eq!(
-            socket.take_transmit_segment(TCP_INITIAL_RTO_NANOS + 2, usize::MAX),
+            socket.take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 2,
+                TcpSegmentBudget::wire_segments(usize::MAX)
+            ),
             None
         );
         assert_eq!(socket.next_deadline_nanos(), Some(first_deadline));
 
         let probe = socket
-            .take_transmit_segment(first_deadline, usize::MAX)
+            .take_transmit_segment(first_deadline, TcpSegmentBudget::wire_segments(usize::MAX))
             .expect("persist timer should send a one-byte probe");
         assert_eq!(probe.payload.as_ref(), b"a");
         assert_eq!(probe.header.sequence, 8);
@@ -4091,11 +4248,17 @@ mod tests {
         );
         assert_eq!(socket.next_deadline_nanos(), Some(first_deadline + rto * 2));
         assert_eq!(
-            socket.take_transmit_segment(first_deadline + rto, usize::MAX),
+            socket.take_transmit_segment(
+                first_deadline + rto,
+                TcpSegmentBudget::wire_segments(usize::MAX)
+            ),
             None
         );
         let second = socket
-            .take_transmit_segment(first_deadline + rto * 2, usize::MAX)
+            .take_transmit_segment(
+                first_deadline + rto * 2,
+                TcpSegmentBudget::wire_segments(usize::MAX),
+            )
             .expect("persist probe should exponentially back off");
         assert_eq!(second.payload.as_ref(), b"a");
         assert_eq!(second.header.sequence, 8);
@@ -4121,11 +4284,14 @@ mod tests {
         assert_eq!(socket.queue_send(b"abc"), 3);
         let deadline = TCP_INITIAL_RTO_NANOS + 2 + socket.retransmission_timer.timeout_nanos();
         assert_eq!(
-            socket.take_transmit_segment(TCP_INITIAL_RTO_NANOS + 2, usize::MAX),
+            socket.take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 2,
+                TcpSegmentBudget::wire_segments(usize::MAX)
+            ),
             None
         );
         let _probe = socket
-            .take_transmit_segment(deadline, usize::MAX)
+            .take_transmit_segment(deadline, TcpSegmentBudget::wire_segments(usize::MAX))
             .expect("persist timer should send a one-byte probe");
 
         let _ = deliver_segment(
@@ -4146,7 +4312,7 @@ mod tests {
         assert_eq!(socket.next_deadline_nanos(), None);
 
         let segment = socket
-            .take_transmit_segment(deadline + 2, usize::MAX)
+            .take_transmit_segment(deadline + 2, TcpSegmentBudget::wire_segments(usize::MAX))
             .expect("opened window should transmit queued data normally");
         assert_eq!(segment.payload.as_ref(), b"bc");
         assert_eq!(segment.header.sequence, 9);
@@ -4174,11 +4340,14 @@ mod tests {
 
         let deadline = TCP_INITIAL_RTO_NANOS + 2 + socket.retransmission_timer.timeout_nanos();
         assert_eq!(
-            socket.take_transmit_segment(TCP_INITIAL_RTO_NANOS + 2, usize::MAX),
+            socket.take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 2,
+                TcpSegmentBudget::wire_segments(usize::MAX)
+            ),
             None
         );
         let probe = socket
-            .take_transmit_segment(deadline, usize::MAX)
+            .take_transmit_segment(deadline, TcpSegmentBudget::wire_segments(usize::MAX))
             .expect("persist timer should probe queued FIN");
         assert!(probe.payload.is_empty());
         assert!(probe.header.flags.contains(TcpFlags::FIN));
@@ -4220,7 +4389,10 @@ mod tests {
         assert_eq!(socket.queue_send(b"x"), 0);
 
         let segment = socket
-            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 1, usize::MAX)
+            .take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 1,
+                TcpSegmentBudget::wire_segments(usize::MAX),
+            )
             .expect("local transmit buffer should drain through normal send path");
         assert_eq!(segment.payload.len(), TCP_RECEIVE_SEGMENT_BYTES);
         assert_eq!(socket.queue_send(b"x"), 1);
@@ -4231,7 +4403,10 @@ mod tests {
         let mut socket = established_fixed_pacing_socket(PacingRate::from_bytes_per_second(1_000));
         assert_eq!(socket.queue_send(b"abcdefgh"), 8);
         let first = socket
-            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 1, usize::MAX)
+            .take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 1,
+                TcpSegmentBudget::wire_segments(usize::MAX),
+            )
             .expect("first paced segment should transmit immediately");
         assert_eq!(first.payload.as_ref(), b"abcdefgh");
         assert_eq!(socket.queue_send(b"ijkl"), 4);
@@ -4240,12 +4415,18 @@ mod tests {
             Some(TCP_INITIAL_RTO_NANOS + 1 + 8_000_000)
         );
         assert_eq!(
-            socket.take_transmit_segment(TCP_INITIAL_RTO_NANOS + 2, usize::MAX),
+            socket.take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 2,
+                TcpSegmentBudget::wire_segments(usize::MAX)
+            ),
             None
         );
 
         let second = socket
-            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 1 + 8_000_000, usize::MAX)
+            .take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 1 + 8_000_000,
+                TcpSegmentBudget::wire_segments(usize::MAX),
+            )
             .expect("paced deadline should release the next segment");
         assert_eq!(second.payload.as_ref(), b"ijkl");
     }
@@ -4255,7 +4436,10 @@ mod tests {
         let mut socket = established_fixed_pacing_socket(PacingRate::from_bytes_per_second(1_000));
         assert_eq!(socket.queue_send(b"abcdefgh"), 8);
         let first = socket
-            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 1, usize::MAX)
+            .take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 1,
+                TcpSegmentBudget::wire_segments(usize::MAX),
+            )
             .expect("first paced segment should transmit immediately");
         assert_eq!(first.payload.as_ref(), b"abcdefgh");
         assert_eq!(socket.queue_send(b"ijkl"), 4);
@@ -4263,17 +4447,26 @@ mod tests {
         socket.close_send();
         assert_eq!(socket.state(), TcpState::FinWait1);
         assert_eq!(
-            socket.take_transmit_segment(TCP_INITIAL_RTO_NANOS + 2, usize::MAX),
+            socket.take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 2,
+                TcpSegmentBudget::wire_segments(usize::MAX)
+            ),
             None
         );
 
         let second = socket
-            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 1 + 8_000_000, usize::MAX)
+            .take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 1 + 8_000_000,
+                TcpSegmentBudget::wire_segments(usize::MAX),
+            )
             .expect("paced data must be transmitted before FIN");
         assert_eq!(second.payload.as_ref(), b"ijkl");
 
         let fin = socket
-            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 1 + 12_000_000, usize::MAX)
+            .take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 1 + 12_000_000,
+                TcpSegmentBudget::wire_segments(usize::MAX),
+            )
             .expect("FIN should follow drained queued data");
         assert!(fin.payload.is_empty());
         assert!(fin.header.flags.contains(TcpFlags::FIN));
@@ -4287,14 +4480,20 @@ mod tests {
         assert_eq!(socket.state(), TcpState::FinWait1);
 
         let data = socket
-            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 1, usize::MAX)
+            .take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 1,
+                TcpSegmentBudget::wire_segments(usize::MAX),
+            )
             .expect("active close must drain queued data before FIN");
         assert_eq!(data.payload.as_ref(), b"hi");
         assert!(data.header.flags.contains(TcpFlags::PSH));
         assert!(!data.header.flags.contains(TcpFlags::FIN));
 
         let fin = socket
-            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 2, usize::MAX)
+            .take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 2,
+                TcpSegmentBudget::wire_segments(usize::MAX),
+            )
             .expect("active close must queue FIN after data");
         assert!(fin.payload.is_empty());
         assert_eq!(fin.sequence_len, 1);
@@ -4326,7 +4525,10 @@ mod tests {
         let mut socket = established_socket();
         socket.close_send();
         let fin = socket
-            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 1, usize::MAX)
+            .take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 1,
+                TcpSegmentBudget::wire_segments(usize::MAX),
+            )
             .expect("active close must queue FIN");
         let _ = deliver_segment(
             &mut socket,
@@ -4377,7 +4579,10 @@ mod tests {
         let mut socket = established_socket();
         socket.close_send();
         let fin = socket
-            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 1, usize::MAX)
+            .take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 1,
+                TcpSegmentBudget::wire_segments(usize::MAX),
+            )
             .expect("active close must queue FIN");
         let _ = deliver_segment(
             &mut socket,
@@ -4460,7 +4665,10 @@ mod tests {
         socket.close_send();
         assert_eq!(socket.state(), TcpState::LastAck);
         let fin = socket
-            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 2, usize::MAX)
+            .take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 2,
+                TcpSegmentBudget::wire_segments(usize::MAX),
+            )
             .expect("passive close must queue FIN from LAST-ACK");
         assert!(fin.header.flags.contains(TcpFlags::FIN));
 
@@ -4502,7 +4710,10 @@ mod tests {
         assert_eq!(socket.queue_send(b"w"), 1);
 
         let segment = socket
-            .take_transmit_segment(TCP_INITIAL_RTO_NANOS + 2, usize::MAX)
+            .take_transmit_segment(
+                TCP_INITIAL_RTO_NANOS + 2,
+                TcpSegmentBudget::wire_segments(usize::MAX),
+            )
             .expect("queued data must transmit");
         assert!(segment.header.flags.contains(TcpFlags::ACK));
         assert_eq!(socket.pending_ack(), None);

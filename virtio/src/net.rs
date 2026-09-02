@@ -55,6 +55,11 @@ const RX_PAGE_BYTES: usize = 4096;
 /// deliver (virtio 1.2 §5.1.6.3.1 sizes its non-mergeable receive
 /// buffers at this plus the 12-byte header).
 const MAX_LARGE_RECEIVE_FRAME_BYTES: usize = 65_550;
+/// Largest oversized frame the driver submits to a segmenting device.
+/// An IP length field describes at most 65535 bytes of packet, and the
+/// Ethernet header the device replicates in front of every segment
+/// rides on top of it.
+const MAX_SEGMENTED_TRANSMIT_FRAME_BYTES: usize = u16::MAX as usize + ETH_HEADER_LEN;
 /// Upper bound on the reassembly buffers one queue pair keeps. Without
 /// receive segmentation offload a frame barely outgrows a page, so the
 /// byte-capacity rule alone would allocate hundreds of them for chains
@@ -76,6 +81,11 @@ const NET_FEATURE_CSUM: u64 = 1 << 0;
 /// the driver may submit one oversized segment with GSO metadata.
 const NET_FEATURE_HOST_TSO4: u64 = 1 << 11;
 const NET_FEATURE_HOST_TSO6: u64 = 1 << 12;
+/// VIRTIO_NET_F_HOST_ECN: the device segments ECN-capable TCP, so the
+/// driver may set `VIRTIO_NET_HDR_GSO_ECN` on an oversized frame whose
+/// header template carries CWR. A modifier on a TSO family, never
+/// requested on its own.
+const NET_FEATURE_HOST_ECN: u64 = 1 << 13;
 const NET_FEATURE_MAC: u64 = 1 << 5;
 const NET_FEATURE_STATUS: u64 = 1 << 16;
 const NET_FEATURE_MTU: u64 = 1 << 3;
@@ -146,25 +156,36 @@ pub struct TxChecksumMeta {
 pub struct TxFrameDescriptor<'a> {
     pub bytes: &'a [u8],
     pub checksum: Option<TxChecksumMeta>,
-}
-
-/// A transmit frame split into a small header prefix (copied into the
-/// device slot behind the virtio-net header) and an external payload
-/// the device reads in place. The payload memory must stay valid until
-/// a token-reporting reclaim returns this frame's token.
-#[derive(Clone, Copy, Debug)]
-pub struct TxScatterFrame<'a> {
-    pub headers: &'a [u8],
-    pub payload: &'a [u8],
-    pub checksum: Option<TxChecksumMeta>,
+    /// Set when the device is expected to split this frame into
+    /// MSS-sized wire segments.
+    pub gso: Option<TxGsoMeta>,
 }
 
 /// A frame acceptable to the transmit entry points. Plain byte slices
 /// transmit with no offload; [`TxFrameDescriptor`] carries checksum
 /// metadata into the virtio-net header.
+///
+/// A frame is `frame_bytes()` followed by `payload()` on the wire. The
+/// copying entry points require the payload to be absent because they
+/// have one slot per frame; the scatter entry point copies only
+/// `frame_bytes()` into the slot and chains the payload by reference,
+/// holding the refcounted handle until the descriptor completes.
 pub trait TxFrame {
     fn frame_bytes(&self) -> &[u8];
+
+    /// Frame bytes the device reads in place rather than out of the
+    /// descriptor slot, as the refcounted handle that owns them.
+    fn payload(&self) -> Option<&Bytes> {
+        None
+    }
+
     fn tx_checksum(&self) -> Option<TxChecksumMeta> {
+        None
+    }
+
+    /// Segmentation metadata for a frame the device splits. A frame
+    /// carrying this is larger than the interface MTU on purpose.
+    fn tx_segmentation(&self) -> Option<TxGsoMeta> {
         None
     }
 }
@@ -183,19 +204,19 @@ impl TxFrame for TxFrameDescriptor<'_> {
     fn tx_checksum(&self) -> Option<TxChecksumMeta> {
         self.checksum
     }
+
+    fn tx_segmentation(&self) -> Option<TxGsoMeta> {
+        self.gso
+    }
 }
 
 impl TxFrame for helios_netstack::TxFrameRef<'_> {
     fn frame_bytes(&self) -> &[u8] {
-        // The contiguous entry points cannot carry a scatter payload; a
-        // frame that reaches them with one attached would go on the wire
-        // truncated with a matching-length IP header. Scatter frames must
-        // go through the scatter transmit entry points.
-        assert!(
-            self.payload.is_none(),
-            "scatter TCP frame routed through a contiguous transmit path"
-        );
         self.bytes
+    }
+
+    fn payload(&self) -> Option<&Bytes> {
+        self.payload
     }
 
     fn tx_checksum(&self) -> Option<TxChecksumMeta> {
@@ -204,15 +225,19 @@ impl TxFrame for helios_netstack::TxFrameRef<'_> {
             offset: checksum.offset,
         })
     }
+
+    fn tx_segmentation(&self) -> Option<TxGsoMeta> {
+        self.segmentation.map(tx_gso_meta)
+    }
 }
 
 impl TxFrame for helios_netstack::PacketBuffer {
     fn frame_bytes(&self) -> &[u8] {
-        assert!(
-            self.payload().is_none(),
-            "scatter TCP frame routed through a contiguous transmit path"
-        );
         self.as_slice()
+    }
+
+    fn payload(&self) -> Option<&Bytes> {
+        helios_netstack::PacketBuffer::payload(self)
     }
 
     fn tx_checksum(&self) -> Option<TxChecksumMeta> {
@@ -220,6 +245,21 @@ impl TxFrame for helios_netstack::PacketBuffer {
             start: checksum.start,
             offset: checksum.offset,
         })
+    }
+
+    fn tx_segmentation(&self) -> Option<TxGsoMeta> {
+        helios_netstack::PacketBuffer::tx_segmentation(self).map(tx_gso_meta)
+    }
+}
+
+/// Translates the stack's segmentation metadata into the virtio-net
+/// header fields that describe it.
+fn tx_gso_meta(segmentation: helios_netstack::TxSegmentation) -> TxGsoMeta {
+    TxGsoMeta {
+        ipv6: segmentation.ipv6,
+        hdr_len: segmentation.header_len,
+        mss: segmentation.segment_bytes,
+        ecn: segmentation.ecn,
     }
 }
 
@@ -243,6 +283,10 @@ pub struct TxGsoMeta {
     pub ipv6: bool,
     pub hdr_len: u16,
     pub mss: u16,
+    /// The header template carries CWR, so the segments are ECN-capable
+    /// and the device is told through `VIRTIO_NET_HDR_GSO_ECN`. Only
+    /// meaningful with VIRTIO_NET_F_HOST_ECN negotiated.
+    pub ecn: bool,
 }
 
 #[repr(C)]
@@ -401,6 +445,17 @@ struct NetTxState<T: VirtioTransport> {
     tx_buffers: Box<[u8]>,
     tx_buffer_len: usize,
     tx_in_flight: DescriptorBitSet,
+    /// Scatter payloads the device is reading in place, indexed by the
+    /// descriptor identifier of the chain that points at them.
+    ///
+    /// A zero-copy submission chains caller-owned bytes by reference
+    /// rather than copying them into the slot, so the driver keeps the
+    /// refcounted handle for exactly as long as the device owns the
+    /// descriptor: taken at submission, dropped when the used ring
+    /// returns the identifier. The ring never reissues an identifier
+    /// whose chain is still in flight, so one slot per descriptor is
+    /// the whole bookkeeping.
+    tx_payloads: Box<[Option<Bytes>]>,
 }
 
 /// One TX/RX queue pair as exposed by VIRTIO_NET_F_MQ. Each pair
@@ -455,6 +510,9 @@ pub struct VirtioNetDevice<T: VirtioTransport> {
     /// driver may submit oversized TCP segments for device segmentation.
     tso_v4_negotiated: bool,
     tso_v6_negotiated: bool,
+    /// VIRTIO_NET_F_HOST_ECN was negotiated: an oversized frame may
+    /// carry `VIRTIO_NET_HDR_GSO_ECN`.
+    tso_ecn_negotiated: bool,
     /// VIRTIO_NET_F_GUEST_CSUM was negotiated: the device reports per
     /// frame whether it validated the transport checksum or left it
     /// partial.
@@ -542,7 +600,8 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             let tso_supported = offered & NET_FEATURE_CSUM != 0
                 && offered & (NET_FEATURE_HOST_TSO4 | NET_FEATURE_HOST_TSO6) != 0;
             let tso_mask = if tso_supported {
-                NET_FEATURE_HOST_TSO4 | NET_FEATURE_HOST_TSO6
+                let families = offered & (NET_FEATURE_HOST_TSO4 | NET_FEATURE_HOST_TSO6);
+                families | (offered & NET_FEATURE_HOST_ECN)
             } else {
                 0
             };
@@ -709,6 +768,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             ]
             .into_boxed_slice();
             let tx_in_flight = DescriptorBitSet::new(tx_buffer_count);
+            let tx_payloads = vec![None; tx_buffer_count].into_boxed_slice();
 
             queue_pairs.push(NetQueuePair {
                 rx_state: AsyncMutex::new(NetRxState {
@@ -726,6 +786,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                     tx_buffers,
                     tx_buffer_len,
                     tx_in_flight,
+                    tx_payloads,
                 }),
             });
         }
@@ -794,6 +855,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             tx_checksum_negotiated: features.device(NET_FEATURE_CSUM),
             tso_v4_negotiated: features.device(NET_FEATURE_HOST_TSO4),
             tso_v6_negotiated: features.device(NET_FEATURE_HOST_TSO6),
+            tso_ecn_negotiated: features.device(NET_FEATURE_HOST_ECN),
             guest_checksum_negotiated: features.device(NET_FEATURE_GUEST_CSUM),
             mergeable_rx_buffers,
             guest_tso_v4_negotiated,
@@ -828,6 +890,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             csum = device.tx_checksum_negotiated,
             host_tso4 = device.tso_v4_negotiated,
             host_tso6 = device.tso_v6_negotiated,
+            host_ecn = device.tso_ecn_negotiated,
             guest_csum = device.guest_checksum_negotiated,
             guest_tso4 = device.guest_tso_v4_negotiated,
             guest_tso6 = device.guest_tso_v6_negotiated,
@@ -892,11 +955,9 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 tx_tcp_ipv6: self.tso_v6_negotiated,
                 rx_tcp_ipv4: self.guest_tso_v4_negotiated,
                 rx_tcp_ipv6: self.guest_tso_v6_negotiated,
-                // The transmit entry points take one frame per chain and
-                // bound it by the interface frame size; segmentation
-                // metadata is attached per frame, not per interface.
-                max_tx_segment_bytes: self.max_frame_len,
+                max_tx_frame_bytes: self.max_transmit_frame_len(),
                 max_rx_frame_bytes: self.max_receive_frame_len,
+                tx_tcp_ecn: self.tso_ecn_negotiated,
             },
             queues: self.queue_topology(),
             events: EventDeliveryCapabilities {
@@ -1007,6 +1068,42 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             self.tso_v6_negotiated
         } else {
             self.tso_v4_negotiated
+        }
+    }
+
+    /// Whether the device accepts `VIRTIO_NET_HDR_GSO_ECN` on an
+    /// oversized frame (VIRTIO_NET_F_HOST_ECN).
+    pub fn tso_ecn_negotiated(&self) -> bool {
+        self.tso_ecn_negotiated
+    }
+
+    /// A segmented frame may only be submitted for a family the device
+    /// agreed to split, and may only be marked ECN-capable when the
+    /// device agreed to that too.
+    fn assert_segmentation_negotiated(&self, gso: TxGsoMeta) {
+        assert!(
+            self.tso_negotiated(gso.ipv6),
+            "segmented frame submitted without negotiated VIRTIO_NET_F_HOST_TSO"
+        );
+        assert!(
+            !gso.ecn || self.tso_ecn_negotiated,
+            "ECN-capable segmented frame submitted without negotiated VIRTIO_NET_F_HOST_ECN"
+        );
+    }
+
+    /// Largest frame the driver hands the device in one submission.
+    ///
+    /// Equal to [`Self::max_frame_len`] until a TCP segmentation family
+    /// is negotiated, at which point the driver may submit one
+    /// oversized frame for the device to split. The ceiling is the
+    /// widest packet an IP length field can describe plus its Ethernet
+    /// header, matching the receive-side bound in virtio 1.2
+    /// §5.1.6.3.1.
+    pub fn max_transmit_frame_len(&self) -> usize {
+        if self.tso_v4_negotiated || self.tso_v6_negotiated {
+            MAX_SEGMENTED_TRANSMIT_FRAME_BYTES
+        } else {
+            self.max_frame_len
         }
     }
 
@@ -1539,6 +1636,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             tx_buffers,
             tx_buffer_len,
             tx_in_flight,
+            tx_payloads: _,
         } = state;
         let mut submitted = 0usize;
         let available_frames = tx_queue
@@ -1546,12 +1644,23 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             .min(frames.len().saturating_sub(*next_frame));
         while submitted < available_frames {
             let frame = frames[*next_frame].frame_bytes();
+            // The copying entry points have one slot per frame; a frame
+            // that reaches them with a scatter payload attached would go
+            // on the wire truncated behind a matching-length IP header.
+            assert!(
+                frames[*next_frame].payload().is_none(),
+                "scatter TCP frame routed through a copying transmit path"
+            );
             let checksum = frames[*next_frame].tx_checksum();
+            let gso = frames[*next_frame].tx_segmentation();
             if checksum.is_some() {
                 assert!(
                     self.tx_checksum_negotiated,
                     "checksum-offload frame submitted without negotiated VIRTIO_NET_F_CSUM"
                 );
+            }
+            if let Some(gso) = gso {
+                self.assert_segmentation_negotiated(gso);
             }
             let token = tx_queue.next_free_descriptor();
             let token_index = usize::from(token);
@@ -1564,6 +1673,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 self.header_len,
                 frame,
                 checksum,
+                gso,
             )?;
             let payload = slot_buffer(tx_buffers, *tx_buffer_len, token_index, payload_len, "TX");
             let submitted_token = tx_queue.submit_read_only_deferred(&self.transport, payload)?;
@@ -1614,20 +1724,18 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
 
     /// Immediate zero-copy TX: headers are copied into the descriptor
     /// slot behind the virtio-net header while the payload is chained
-    /// as an external read-only descriptor. Accepted frames report
-    /// their head token through `tokens`; the caller must keep each
-    /// payload alive until `reclaim_transmit_tokens_immediate_on_pair`
-    /// returns that token.
-    pub fn try_transmit_scatter_immediate_on_pair(
+    /// as an external read-only descriptor. The driver holds each
+    /// accepted payload's refcounted handle until the used ring returns
+    /// its descriptor, so the caller may drop its own handle as soon as
+    /// the submission is accepted.
+    pub fn try_transmit_scatter_immediate_on_pair<Frame>(
         &self,
         pair_idx: usize,
-        frames: &[TxScatterFrame<'_>],
-        tokens: &mut [Option<u16>],
-    ) -> IoResult<Option<usize>> {
-        assert!(
-            tokens.len() >= frames.len(),
-            "scatter transmit token slots must cover the frame batch"
-        );
+        frames: &[Frame],
+    ) -> IoResult<Option<usize>>
+    where
+        Frame: TxFrame,
+    {
         let pair_idx = self.normalize_pair_idx(pair_idx);
         let Some(mut state) = self.queue_pairs[pair_idx].tx_state.try_lock() else {
             return Ok(None);
@@ -1638,15 +1746,22 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             tx_buffers,
             tx_buffer_len,
             tx_in_flight,
+            tx_payloads,
         } = &mut *state;
         let mut submitted = 0usize;
         for frame in frames {
-            if frame.checksum.is_some() {
+            let checksum = frame.tx_checksum();
+            let gso = frame.tx_segmentation();
+            if checksum.is_some() {
                 assert!(
                     self.tx_checksum_negotiated,
                     "checksum-offload frame submitted without negotiated VIRTIO_NET_F_CSUM"
                 );
             }
+            if let Some(gso) = gso {
+                self.assert_segmentation_negotiated(gso);
+            }
+            let payload = frame.payload();
             // A chain needs two descriptors (slot prefix + payload).
             if tx_queue.available_descriptors() < 2 {
                 break;
@@ -1659,20 +1774,23 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             );
             let slot = slot_buffer_mut(tx_buffers, *tx_buffer_len, token_index, "TX");
             let prefix_len =
-                write_tx_payload(slot, self.header_len, frame.headers, frame.checksum)?;
+                write_tx_payload(slot, self.header_len, frame.frame_bytes(), checksum, gso)?;
             let prefix = slot_buffer(tx_buffers, *tx_buffer_len, token_index, prefix_len, "TX");
-            let submitted_token = if frame.payload.is_empty() {
-                tx_queue.submit_read_only_deferred(&self.transport, prefix)?
-            } else {
-                tx_queue
-                    .submit_read_only_chain_deferred(&self.transport, &[prefix, frame.payload])?
+            let submitted_token = match payload.filter(|payload| !payload.is_empty()) {
+                Some(payload) => {
+                    tx_queue.submit_read_only_chain_deferred(&self.transport, &[prefix, payload])?
+                }
+                None => tx_queue.submit_read_only_deferred(&self.transport, prefix)?,
             };
             assert_eq!(
                 submitted_token, token,
                 "virtio net TX descriptor allocation moved while scatter frame was prepared"
             );
             tx_in_flight.set(token_index);
-            tokens[submitted] = Some(token);
+            // The device now owns the descriptor and reads the payload
+            // in place; the handle stays here until it hands the
+            // descriptor back.
+            tx_payloads[token_index] = payload.cloned();
             submitted += 1;
         }
         if submitted != 0 {
@@ -1680,34 +1798,6 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             tx_queue.notify(&self.transport);
         }
         Ok(Some(submitted))
-    }
-
-    /// Immediate TX completion drain that reports which head tokens
-    /// finished, releasing zero-copy payload pins held by the caller.
-    pub fn reclaim_transmit_tokens_immediate_on_pair(
-        &self,
-        pair_idx: usize,
-        tokens: &mut [Option<u16>],
-    ) -> IoResult<Option<usize>> {
-        let pair_idx = self.normalize_pair_idx(pair_idx);
-        let Some(mut state) = self.queue_pairs[pair_idx].tx_state.try_lock() else {
-            return Ok(None);
-        };
-        let mut completed = 0usize;
-        while completed < tokens.len() {
-            let Some(token) = state.tx_queue.pop_used() else {
-                break;
-            };
-            let token_index = usize::from(token);
-            assert!(
-                state.tx_in_flight.get(token_index),
-                "virtio net TX completion referenced idle descriptor {token}"
-            );
-            state.tx_in_flight.clear(token_index);
-            tokens[completed] = Some(token);
-            completed += 1;
-        }
-        Ok(Some(completed))
     }
 
     pub async fn wait_for_interrupt(&self) {
@@ -1808,6 +1898,9 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 "virtio net TX completion referenced idle descriptor {token}"
             );
             state.tx_in_flight.clear(token_index);
+            // The device is done reading this chain, so whatever
+            // scatter payload it pointed at is free to go.
+            state.tx_payloads[token_index] = None;
             completed += 1;
         }
         completed
@@ -1955,16 +2048,14 @@ fn slot_buffer<'a>(
     })
 }
 
+/// Writes the virtio-net header for one transmit frame followed by the
+/// frame bytes themselves, and returns the total slot bytes used.
+///
+/// `frame` is the whole wire frame on the copying path and only the
+/// replicated header prefix on the scatter path; either way the
+/// virtio-net header in front of it describes the complete frame,
+/// including the segmentation metadata the device splits it by.
 fn write_tx_payload(
-    buffer: &mut [u8],
-    header_len: usize,
-    frame: &[u8],
-    checksum: Option<TxChecksumMeta>,
-) -> IoResult<usize> {
-    write_tx_payload_gso(buffer, header_len, frame, checksum, None)
-}
-
-fn write_tx_payload_gso(
     buffer: &mut [u8],
     header_len: usize,
     frame: &[u8],
@@ -2000,10 +2091,15 @@ fn write_tx_payload_gso(
             );
             buffer[2..4].copy_from_slice(&meta.hdr_len.to_le_bytes());
             buffer[4..6].copy_from_slice(&meta.mss.to_le_bytes());
-            if meta.ipv6 {
+            let family = if meta.ipv6 {
                 VIRTIO_NET_HDR_GSO_TCPV6
             } else {
                 VIRTIO_NET_HDR_GSO_TCPV4
+            };
+            if meta.ecn {
+                family | VIRTIO_NET_HDR_GSO_ECN
+            } else {
+                family
             }
         }
     };
@@ -2017,15 +2113,18 @@ mod tests {
     use alloc::vec::Vec;
     use core::mem::size_of;
 
+    use bytes::Bytes;
     use helios_netstack::RxChecksumReport;
 
     use super::{
-        DescriptorBitSet, ETH_HEADER_LEN, MAX_LARGE_RECEIVE_FRAME_BYTES, NET_CONFIG_STATUS_OFFSET,
+        DescriptorBitSet, ETH_HEADER_LEN, MAX_LARGE_RECEIVE_FRAME_BYTES,
+        MAX_SEGMENTED_TRANSMIT_FRAME_BYTES, NET_CONFIG_STATUS_OFFSET, NET_FEATURE_CSUM,
         NET_FEATURE_GUEST_CSUM, NET_FEATURE_GUEST_ECN, NET_FEATURE_GUEST_TSO4,
-        NET_FEATURE_GUEST_TSO6, NET_FEATURE_GUEST_UFO, NET_FEATURE_MRG_RXBUF, NET_FEATURE_STATUS,
-        NET_STATUS_LINK_UP, RX_PAGE_BYTES, RxFrame, TxChecksumMeta, TxGsoMeta,
-        VIRTIO_NET_HDR_F_DATA_VALID, VIRTIO_NET_HDR_F_NEEDS_CSUM, VIRTIO_NET_HDR_GSO_TCPV4,
-        VirtioNetDevice, VirtioNetHeader, write_tx_payload, write_tx_payload_gso,
+        NET_FEATURE_GUEST_TSO6, NET_FEATURE_GUEST_UFO, NET_FEATURE_HOST_ECN, NET_FEATURE_HOST_TSO4,
+        NET_FEATURE_HOST_TSO6, NET_FEATURE_MRG_RXBUF, NET_FEATURE_STATUS, NET_STATUS_LINK_UP,
+        RX_PAGE_BYTES, RxFrame, TxChecksumMeta, TxGsoMeta, VIRTIO_NET_HDR_F_DATA_VALID,
+        VIRTIO_NET_HDR_F_NEEDS_CSUM, VIRTIO_NET_HDR_GSO_TCPV4, VirtioNetDevice, VirtioNetHeader,
+        write_tx_payload,
     };
     use crate::testing::{FakeTransport, FakeTransportConfig};
     use crate::transport::{DeviceType, VirtioFeatures};
@@ -2171,6 +2270,63 @@ mod tests {
         | NET_FEATURE_GUEST_ECN
         | NET_FEATURE_GUEST_UFO
         | NET_FEATURE_MRG_RXBUF;
+
+    /// A device offering the transmit segmentation families gets them,
+    /// gets the ECN modifier that rides on them, and reports both to
+    /// the network stack — including the oversized frame ceiling that
+    /// makes segmentation worth anything.
+    #[test]
+    fn offered_transmit_segmentation_is_negotiated_and_published() {
+        let harness = NetHarness::new(
+            NET_FEATURE_CSUM | NET_FEATURE_HOST_TSO4 | NET_FEATURE_HOST_TSO6 | NET_FEATURE_HOST_ECN,
+        );
+        let features = harness.device.features();
+
+        assert!(features.device(NET_FEATURE_HOST_TSO4));
+        assert!(features.device(NET_FEATURE_HOST_TSO6));
+        assert!(features.device(NET_FEATURE_HOST_ECN));
+        assert!(harness.device.tso_negotiated(false));
+        assert!(harness.device.tso_negotiated(true));
+        assert!(harness.device.tso_ecn_negotiated());
+
+        let capabilities = harness.device.interface_capabilities();
+        assert!(capabilities.segmentation.tx_tcp_ipv4);
+        assert!(capabilities.segmentation.tx_tcp_ipv6);
+        assert!(capabilities.segmentation.tx_tcp_ecn);
+        assert_eq!(
+            capabilities.segmentation.max_tx_frame_bytes,
+            MAX_SEGMENTED_TRANSMIT_FRAME_BYTES
+        );
+        assert!(capabilities.segmentation.max_tx_frame_bytes > capabilities.max_frame_len);
+    }
+
+    /// Transmit segmentation needs the device to finish each segment's
+    /// checksum, so a device offering TSO without CSUM gets neither the
+    /// families nor the oversized frame ceiling.
+    #[test]
+    fn transmit_segmentation_is_refused_without_transmit_checksum() {
+        let harness = NetHarness::new(NET_FEATURE_HOST_TSO4 | NET_FEATURE_HOST_TSO6);
+
+        assert!(!harness.device.features().device(NET_FEATURE_HOST_TSO4));
+        assert!(!harness.device.features().device(NET_FEATURE_HOST_TSO6));
+        assert!(!harness.device.tso_negotiated(false));
+        let capabilities = harness.device.interface_capabilities();
+        assert!(!capabilities.segmentation.tx_tcp_ipv4);
+        assert_eq!(
+            capabilities.segmentation.max_tx_frame_bytes,
+            capabilities.max_frame_len
+        );
+    }
+
+    /// ECN is a modifier on a transmit segmentation type, so a device
+    /// offering it without a TSO family must not have it accepted.
+    #[test]
+    fn host_ecn_is_refused_without_a_transmit_segmentation_family() {
+        let harness = NetHarness::new(NET_FEATURE_CSUM | NET_FEATURE_HOST_ECN);
+
+        assert!(!harness.device.features().device(NET_FEATURE_HOST_ECN));
+        assert!(!harness.device.tso_ecn_negotiated());
+    }
 
     #[test]
     fn every_offered_receive_offload_is_negotiated() {
@@ -2535,23 +2691,114 @@ mod tests {
         assert!(bits.get(129));
     }
 
+    /// A scatter frame reaches the device as two descriptors: the
+    /// header prefix out of the driver's own slot, and the payload
+    /// pointed at where the caller already had it. The driver keeps the
+    /// payload alive for exactly as long as the device owns the
+    /// descriptor, so the caller may drop its handle immediately.
+    #[test]
+    fn a_scatter_frame_chains_its_payload_by_reference_until_completion() {
+        let harness = NetHarness::new(NET_FEATURE_CSUM);
+        let headers = [0x11_u8; 54];
+        let payload = Bytes::from(vec![0xa5_u8; 2048]);
+        let payload_address = payload.as_ptr() as u64;
+        let token = {
+            let state = harness.device.queue_pairs[0]
+                .tx_state
+                .try_lock()
+                .expect("test transmit state is uncontended");
+            state.tx_queue.next_free_descriptor()
+        };
+
+        let submitted = harness
+            .device
+            .try_transmit_scatter_immediate_on_pair(
+                0,
+                &[helios_netstack::TxFrameRef {
+                    bytes: &headers,
+                    payload: Some(&payload),
+                    checksum: None,
+                    segmentation: None,
+                }],
+            )
+            .expect("scatter submission should succeed")
+            .expect("the transmit ring is uncontended in tests");
+        assert_eq!(submitted, 1);
+        // The caller's handle is gone; only the driver's pin keeps the
+        // payload alive while the device reads it.
+        drop(payload);
+
+        let chain = {
+            let state = harness.device.queue_pairs[0]
+                .tx_state
+                .try_lock()
+                .expect("test transmit state is uncontended");
+            let pinned = state.tx_payloads[usize::from(token)]
+                .as_ref()
+                .expect("the driver pins a scatter payload until completion");
+            assert_eq!(pinned.as_ptr() as u64, payload_address);
+            assert_eq!(pinned.len(), 2048);
+            state.tx_queue.device_chain(token)
+        };
+        assert_eq!(chain.len(), 2, "prefix descriptor plus payload descriptor");
+        assert_eq!(
+            chain[0].1 as usize,
+            harness.device.header_len + headers.len(),
+            "the prefix descriptor covers the virtio header and the frame headers"
+        );
+        assert_eq!(
+            chain[1],
+            (payload_address, 2048, false),
+            "the payload descriptor points at the caller's bytes, read-only"
+        );
+
+        harness.device.queue_pairs[0]
+            .tx_state
+            .try_lock()
+            .expect("test transmit state is uncontended")
+            .tx_queue
+            .device_complete(token, 0);
+        let reclaimed = harness
+            .device
+            .reclaim_transmit_completions_immediate_on_pair(0, 8)
+            .expect("completion drain should succeed")
+            .expect("the transmit ring is uncontended in tests");
+        assert_eq!(reclaimed, 1);
+        let state = harness.device.queue_pairs[0]
+            .tx_state
+            .try_lock()
+            .expect("test transmit state is uncontended");
+        assert!(
+            state.tx_payloads[usize::from(token)].is_none(),
+            "a completed descriptor releases the payload it was reading"
+        );
+    }
+
+    /// virtio 1.2 §5.1.6.2: an oversized frame carries NEEDS_CSUM with
+    /// its csum_start/csum_offset, the segmentation family in
+    /// `gso_type`, the replicated header length in `hdr_len`, and the
+    /// per-segment payload in `gso_size`. Every byte of that header is
+    /// pinned here, for both address families and with and without the
+    /// ECN modifier.
     #[test]
     fn tx_payload_write_populates_gso_header() {
         let header_len = size_of::<VirtioNetHeader>();
         let mut buffer = [0u8; 256];
         let frame = [0u8; 60];
-        write_tx_payload_gso(
+        let checksum = Some(TxChecksumMeta {
+            start: 34,
+            offset: 16,
+        });
+        write_tx_payload(
             &mut buffer,
             header_len,
             &frame,
-            Some(TxChecksumMeta {
-                start: 34,
-                offset: 16,
-            }),
+            checksum,
             Some(TxGsoMeta {
                 ipv6: false,
                 hdr_len: 54,
                 mss: 1460,
+                ecn: false,
             }),
         )
         .expect("gso payload fits");
@@ -2560,9 +2807,32 @@ mod tests {
         assert_eq!(&buffer[2..4], &54u16.to_le_bytes());
         assert_eq!(&buffer[4..6], &1460u16.to_le_bytes());
         assert_eq!(&buffer[6..8], &34u16.to_le_bytes());
+        assert_eq!(&buffer[8..10], &16u16.to_le_bytes());
+
+        // IPv6 selects the TCPV6 family, and CWR in the header template
+        // rides along as the ECN modifier on it.
+        write_tx_payload(
+            &mut buffer,
+            header_len,
+            &frame,
+            checksum,
+            Some(TxGsoMeta {
+                ipv6: true,
+                hdr_len: 74,
+                mss: 1440,
+                ecn: true,
+            }),
+        )
+        .expect("ipv6 gso payload fits");
+        assert_eq!(
+            buffer[1],
+            super::VIRTIO_NET_HDR_GSO_TCPV6 | super::VIRTIO_NET_HDR_GSO_ECN
+        );
+        assert_eq!(&buffer[2..4], &74u16.to_le_bytes());
+        assert_eq!(&buffer[4..6], &1440u16.to_le_bytes());
 
         // A non-GSO frame reusing the slot scrubs gso_type back to NONE.
-        write_tx_payload(&mut buffer, header_len, &frame, None).expect("plain payload fits");
+        write_tx_payload(&mut buffer, header_len, &frame, None, None).expect("plain payload fits");
         assert_eq!(buffer[1], super::VIRTIO_NET_HDR_GSO_NONE);
         assert_eq!(&buffer[2..6], &[0u8; 4]);
     }
@@ -2584,6 +2854,7 @@ mod tests {
                     start: 34,
                     offset: 16,
                 }),
+                None,
             )
             .expect("first payload fits"),
             header_len + first.len()
@@ -2596,7 +2867,8 @@ mod tests {
         // A non-offload frame reusing the slot must scrub the stale
         // NEEDS_CSUM header back to all-zero.
         assert_eq!(
-            write_tx_payload(&mut buffer, header_len, &second, None).expect("second payload fits"),
+            write_tx_payload(&mut buffer, header_len, &second, None, None)
+                .expect("second payload fits"),
             header_len + second.len()
         );
         assert_eq!(&buffer[..header_len], zero_header);

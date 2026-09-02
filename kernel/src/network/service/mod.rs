@@ -33,8 +33,8 @@ use helios_netstack::{
     EthernetProtocol, IcmpEchoKey, IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, IpAddress, IpCidr,
     IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet,
     MAX_OUTBOUND_FRAMES, NeighborEntry, NetworkInterface as NetworkDevice, OutboundBatchStatus,
-    PacketBuffer, Route, RouteTable, RxChecksumOffload, RxFrame, Stack, StackConfig, StackError,
-    StackEvent, StackInstant, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
+    Route, RouteTable, RxChecksumOffload, RxFrame, SegmentationOffload, Stack, StackConfig,
+    StackError, StackEvent, StackInstant, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
     TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState, UdpEndpoint, UdpPacket,
     UdpPayload, UdpSocketBinding, UdpSocketError,
 };
@@ -530,23 +530,24 @@ where
         // We probe the configured rx_budget once via a throwaway
         // Stack — every shard's Stack uses the same StackConfig so
         // the value is identical across shards.
+        // An oversized frame never fits a packet buffer: its payload
+        // leaves as a borrowed scatter descriptor or not at all. A
+        // device whose DMA cannot read borrowed bytes therefore
+        // segments nothing, whatever its feature bits say.
+        let segmentation = if capabilities.direct_tx_dma {
+            capabilities.segmentation
+        } else {
+            SegmentationOffload::none()
+        };
         let stack_config = StackConfig::new(mac, max_frame_len)
             .with_rx_budget(rx_poll_budget)
             .with_rx_checksum_offload(rx_checksum_offload)
-            .with_tx_checksum_offload(tx_checksum_offload);
+            .with_tx_checksum_offload(tx_checksum_offload)
+            .with_segmentation_offload(segmentation);
         let stack_rx_budget = Stack::new(stack_config).config().rx_budget;
         let state = NetworkShardSet::new(shard_count, |index| {
             let staggered_xid = transaction_id.wrapping_add(index as u32);
-            NetworkShard::new(
-                mac,
-                max_frame_len,
-                rx_poll_budget,
-                rx_checksum_offload,
-                tx_checksum_offload,
-                staggered_xid,
-                index,
-                shard_count,
-            )
+            NetworkShard::new(stack_config, staggered_xid, index, shard_count)
         });
         Self {
             inner: Arc::new(NetworkServiceInner {
@@ -1039,7 +1040,7 @@ mod tests {
         ETHERNET_FRAME_BYTES, EthernetFrame, EthernetProtocol, IcmpEchoKey, Icmpv4Packet,
         Icmpv6Packet, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet,
         Ipv6Address, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborEntry, NeighborState,
-        Route, RxChecksumOffload, StackInstant, TcpFlags, TcpHeader, TcpListenBacklog, TcpPacket,
+        Route, StackConfig, StackInstant, TcpFlags, TcpHeader, TcpListenBacklog, TcpPacket,
         TransportChecksum, UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding, internet_checksum,
     };
 
@@ -1224,17 +1225,12 @@ mod tests {
         assert_eq!(limited.as_ref(), b"abc");
     }
 
+    fn test_stack_config() -> StackConfig {
+        StackConfig::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES).with_rx_budget(8)
+    }
+
     fn test_network_shard() -> NetworkShard {
-        NetworkShard::new(
-            [0x02, 0, 0, 0, 0, 1],
-            ETHERNET_FRAME_BYTES,
-            8,
-            RxChecksumOffload::none(),
-            false,
-            1,
-            0,
-            1,
-        )
+        NetworkShard::new(test_stack_config(), 1, 0, 1)
     }
 
     /// A link that comes back is not the link that went away: the lease,
@@ -1901,16 +1897,7 @@ mod tests {
         let peer = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let router = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
         let state = super::NetworkShardSet::new(2, |index| {
-            NetworkShard::new(
-                [0x02, 0, 0, 0, 0, 1],
-                ETHERNET_FRAME_BYTES,
-                8,
-                RxChecksumOffload::none(),
-                false,
-                1 + index as u32,
-                index,
-                2,
-            )
+            NetworkShard::new(test_stack_config(), 1 + index as u32, index, 2)
         });
         let binding = state
             .with_local_port(49_153, |shard| shard.start_udp_bind(49_153))

@@ -816,7 +816,7 @@ impl<T: VirtioTransport> VirtQueue<T> {
     }
 
     #[cfg(test)]
-    fn device_chain(&self, id: u16) -> alloc::vec::Vec<(u64, u32, bool)> {
+    pub(crate) fn device_chain(&self, id: u16) -> alloc::vec::Vec<(u64, u32, bool)> {
         match &self.ring {
             Ring::Split(ring) => ring.device_chain(id),
             Ring::Packed(_) => {

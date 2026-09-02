@@ -712,6 +712,32 @@ where
         Ok(())
     }
 
+    /// Drains finished transmit descriptors on every queue pair, which
+    /// is what frees the scatter payloads the device was reading in
+    /// place.
+    ///
+    /// Every shard submits to its own queue pair, so a reclaim that
+    /// visited only pair zero would leave the other pairs' rings full.
+    /// A pair another processor currently holds is skipped: that
+    /// processor is draining it, and this poll has nothing to add.
+    fn reclaim_transmit_completions(&self, budget: usize) -> Result<usize, IoError> {
+        let mut reclaimed = 0usize;
+        for shard_idx in 0..self.inner.state.shard_count() {
+            if reclaimed >= budget {
+                break;
+            }
+            let Some(completed) = self
+                .inner
+                .device
+                .reclaim_transmit_completions_immediate_on(shard_idx, budget - reclaimed)?
+            else {
+                continue;
+            };
+            reclaimed += completed;
+        }
+        Ok(reclaimed)
+    }
+
     pub(super) async fn poll_network_once_with_tcp_read(
         &self,
         source: NetworkPollSource,
@@ -726,19 +752,7 @@ where
         let budget = self.inner.poll.budget();
 
         let reclaim_started = self.profile_start();
-        let reclaimed = match self
-            .inner
-            .device
-            .reclaim_transmit_completions_immediate(budget.tx_completions)?
-        {
-            Some(reclaimed) => reclaimed,
-            None => {
-                self.inner
-                    .device
-                    .reclaim_transmit_completions(budget.tx_completions)
-                    .await?
-            }
-        };
+        let reclaimed = self.reclaim_transmit_completions(budget.tx_completions)?;
         if reclaimed != 0 {
             self.record_network_profile_events(
                 source.tx_reclaim_phase(),

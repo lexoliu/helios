@@ -57,7 +57,10 @@ pub use stack::{
     UdpSocketBinding, UdpSocketError, UdpSocketId,
 };
 pub use tcp::{TCP_RECEIVE_WINDOW_BYTES, TCP_TRANSMIT_BUFFER_BYTES};
-pub use tcp::{TcpEndpoint, TcpReset, TcpSegmentOutcome, TcpSocket, TcpState, TcpTransmitSegment};
+pub use tcp::{
+    TcpEndpoint, TcpReset, TcpSegmentBudget, TcpSegmentOutcome, TcpSocket, TcpState,
+    TcpTransmitSegment,
+};
 pub use types::{
     EthernetAddress, IpAddress, IpCidr, Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr, Ipv6Scope,
 };
@@ -245,11 +248,30 @@ pub struct SegmentationOffload {
     pub rx_tcp_ipv4: bool,
     /// TCP large receive offload for IPv6 packets.
     pub rx_tcp_ipv6: bool,
-    /// Maximum payload bytes accepted by TSO.
-    pub max_tx_segment_bytes: usize,
+    /// Largest oversized transmit frame the device segments, counting
+    /// the header prefix it replicates; zero when it segments nothing.
+    pub max_tx_frame_bytes: usize,
     /// Largest frame the device may deliver once large receive offload
     /// is enabled; equal to `max_frame_len` when it is not.
     pub max_rx_frame_bytes: usize,
+    /// The device accepts ECN-capable segmentation, so a coalesced
+    /// burst whose header template carries CWR may be handed to it.
+    pub tx_tcp_ecn: bool,
+}
+
+impl SegmentationOffload {
+    /// An interface that neither segments nor coalesces.
+    pub const fn none() -> Self {
+        Self {
+            tx_tcp_ipv4: false,
+            tx_tcp_ipv6: false,
+            rx_tcp_ipv4: false,
+            rx_tcp_ipv6: false,
+            max_tx_frame_bytes: 0,
+            max_rx_frame_bytes: 0,
+            tx_tcp_ecn: false,
+        }
+    }
 }
 
 /// Multi-queue and flow steering capabilities.
@@ -315,6 +337,7 @@ pub struct PacketBuffer {
     bytes: [u8; ETHERNET_FRAME_BYTES],
     len: usize,
     tx_checksum: Option<TxChecksum>,
+    tx_segmentation: Option<TxSegmentation>,
     /// Scatter payload following the encoded headers: the wire frame is
     /// `bytes[..len]` ++ `payload`. Refcounted so transmit paths can pin
     /// it until device completion without copying.
@@ -331,6 +354,28 @@ pub struct TxChecksum {
     pub offset: u16,
 }
 
+/// Transmit segmentation metadata for one oversized TCP frame: the
+/// device splits the frame into wire segments of `segment_bytes`
+/// payload each, replicating the `header_len`-byte Ethernet + IP + TCP
+/// header prefix and fixing up the per-segment lengths, sequence
+/// numbers, and checksums (virtio 1.2 §5.1.6.2).
+///
+/// A frame carrying this is larger than the path MTU on purpose; only
+/// the segments the device emits are MTU-bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TxSegmentation {
+    /// The frame carries an IPv6 packet, selecting the device's TCPv6
+    /// segmentation type rather than TCPv4.
+    pub ipv6: bool,
+    /// Header bytes the device replicates in front of every segment.
+    pub header_len: u16,
+    /// Payload bytes per wire segment: the connection's MSS.
+    pub segment_bytes: u16,
+    /// The header template carries CWR, so the segments are
+    /// ECN-capable and the device must mark them as such.
+    pub ecn: bool,
+}
+
 /// Borrowed transmit frame plus its checksum-offload metadata, handed
 /// to [`NetworkInterface`] slice transmit entry points.
 #[derive(Clone, Debug)]
@@ -340,6 +385,8 @@ pub struct TxFrameRef<'a> {
     /// refcounted handle so transmit paths can pin it cheaply.
     pub payload: Option<&'a Bytes>,
     pub checksum: Option<TxChecksum>,
+    /// Set when the device is expected to segment this frame.
+    pub segmentation: Option<TxSegmentation>,
 }
 
 impl PacketBuffer {
@@ -349,6 +396,7 @@ impl PacketBuffer {
             bytes: [0; ETHERNET_FRAME_BYTES],
             len: 0,
             tx_checksum: None,
+            tx_segmentation: None,
             payload: None,
         }
     }
@@ -378,12 +426,25 @@ impl PacketBuffer {
         self.tx_checksum = checksum;
     }
 
+    /// Segmentation-offload metadata attached by the stack's TCP
+    /// encoders when the frame is an oversized segment the device
+    /// splits.
+    pub const fn tx_segmentation(&self) -> Option<TxSegmentation> {
+        self.tx_segmentation
+    }
+
+    /// Attaches or clears segmentation-offload metadata for this frame.
+    pub fn set_tx_segmentation(&mut self, segmentation: Option<TxSegmentation>) {
+        self.tx_segmentation = segmentation;
+    }
+
     /// Borrowed transmit view carrying the offload metadata.
     pub fn as_tx_frame(&self) -> TxFrameRef<'_> {
         TxFrameRef {
             bytes: self.as_slice(),
             payload: self.payload.as_ref(),
             checksum: self.tx_checksum,
+            segmentation: self.tx_segmentation,
         }
     }
 
@@ -421,6 +482,7 @@ impl PacketBuffer {
     pub fn clear(&mut self) {
         self.len = 0;
         self.tx_checksum = None;
+        self.tx_segmentation = None;
         self.payload = None;
     }
 }
@@ -604,30 +666,18 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
     }
 
     /// Zero-copy transmit: headers are copied into the device slot but
-    /// each frame's scatter payload is read in place. Accepted frames
-    /// report a completion token through `tokens`; the caller must keep
-    /// the payload bytes alive until
-    /// `reclaim_transmit_tokens_immediate_on` reports that token.
-    /// Devices without in-place DMA leave the default (None) so callers
-    /// fall back to the copying paths.
+    /// each frame's scatter payload is read in place. The device holds
+    /// the refcounted payload handle for as long as it owns the
+    /// descriptor, so the caller may release the frame as soon as the
+    /// submission is accepted; a completion drain is what frees the
+    /// payload again. `Ok(None)` means the queue could not be entered
+    /// without waiting and nothing was submitted.
     fn try_transmit_scatter_immediate_on(
         &self,
         queue_idx: usize,
         frames: &[TxFrameRef<'_>],
-        tokens: &mut [Option<u16>],
     ) -> IoResult<Option<usize>> {
-        let _ = (queue_idx, frames, tokens);
-        Ok(None)
-    }
-
-    /// Reports completed transmit tokens so zero-copy payload pins can
-    /// be released.
-    fn reclaim_transmit_tokens_immediate_on(
-        &self,
-        queue_idx: usize,
-        tokens: &mut [Option<u16>],
-    ) -> IoResult<Option<usize>> {
-        let _ = (queue_idx, tokens);
+        let _ = (queue_idx, frames);
         Ok(None)
     }
 
