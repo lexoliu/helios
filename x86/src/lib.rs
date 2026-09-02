@@ -353,6 +353,7 @@ fn install_pci_devices<WatchdogImpl>(
     };
     if let Some(address) = host_share_function {
         let transport = host_fs::install(
+            cpu,
             pci,
             address,
             dma_pool(address),

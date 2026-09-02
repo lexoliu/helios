@@ -21,6 +21,11 @@ fn unsupported<T>() -> core::future::Ready<Result<T, HostFsError>> {
 }
 
 impl HostFileSystem for UnsupportedHostFileSystem {
+    /// There is no share here, so there is nothing to have cached.
+    fn cache_stats(&self) -> Option<crate::HostFsCacheStats> {
+        None
+    }
+
     fn stat_path(
         &self,
         _path: &str,

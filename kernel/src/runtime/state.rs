@@ -369,24 +369,6 @@ where
         }
     }
 
-    pub fn snapshot(&self, current_ticks: u64) -> StatsSample {
-        let uptime = self.ticks_to_nanos(current_ticks.saturating_sub(self.inner.boot_ticks));
-        StatsSample {
-            timestamp: uptime,
-            uptime,
-            wall_clock: self.wall_clock_nanos(current_ticks),
-            configured_processors: self.inner.processor_count,
-            online_processors: self.inner.processor_count,
-            block: self.inner.block_service.get().map(BlockService::stats),
-            iommu: self
-                .inner
-                .iommu_report
-                .get()
-                .map(|report| report.snapshot()),
-            balloon: self.inner.balloon.get().map(BalloonHandle::stats),
-        }
-    }
-
     pub fn record_console_text(&self, current_ticks: u64, text: &str) {
         let timestamp = self.ticks_to_nanos(current_ticks.saturating_sub(self.inner.boot_ticks));
         self.inner
@@ -898,6 +880,40 @@ where
 
     pub fn retire_bootfs(&self) {
         *self.inner.bootfs.lock() = None;
+    }
+}
+
+/// The system-wide observation snapshot.
+///
+/// This sits in its own block because reporting the host share's cache
+/// counters needs the filesystem service to actually be a filesystem,
+/// which the rest of `RuntimeState` does not care about.
+impl<ProgramService, NetworkService, HostFsService>
+    RuntimeState<ProgramService, NetworkService, HostFsService>
+where
+    ProgramService: Clone,
+    NetworkService: Clone,
+    HostFsService: crate::HostFileSystem,
+{
+    pub fn snapshot(&self, current_ticks: u64) -> StatsSample {
+        let uptime = self.ticks_to_nanos(current_ticks.saturating_sub(self.inner.boot_ticks));
+        StatsSample {
+            timestamp: uptime,
+            uptime,
+            wall_clock: self.wall_clock_nanos(current_ticks),
+            configured_processors: self.inner.processor_count,
+            online_processors: self.inner.processor_count,
+            block: self.inner.block_service.get().map(BlockService::stats),
+            iommu: self
+                .inner
+                .iommu_report
+                .get()
+                .map(|report| report.snapshot()),
+            balloon: self.inner.balloon.get().map(BalloonHandle::stats),
+            host_share: self
+                .host_fs_service()
+                .and_then(|service| service.cache_stats()),
+        }
     }
 }
 

@@ -82,6 +82,12 @@ where
 }
 
 impl HostFileSystem for HostedFileSystem {
+    /// The hosted backend calls the host OS directly, which does its own
+    /// caching; there is no 9p session in front of it to cache for.
+    fn cache_stats(&self) -> Option<helios_kernel::HostFsCacheStats> {
+        None
+    }
+
     fn stat_path(
         &self,
         path: &str,

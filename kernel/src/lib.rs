@@ -88,8 +88,8 @@ pub use helios_netstack::{
     SegmentationOffload, TxFrameRef,
 };
 pub use host_fs::{
-    HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, HostFsClient, HostFsTransport,
-    UnsupportedHostFileSystem, guest_host_share_path,
+    HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, HostFsCacheStats, HostFsClient,
+    HostFsTransport, UnsupportedHostFileSystem, guest_host_share_path,
 };
 pub use instance::{
     DEFAULT_RESTART_COST, InstanceExecutionTransition, InstanceId, InstanceProfileTotal,

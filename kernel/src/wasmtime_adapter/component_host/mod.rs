@@ -3738,6 +3738,27 @@ macro_rules! convert_iommu_stats {
     };
 }
 
+/// Maps the host share's cache counters onto one binding set's
+/// `host-share-cache` record.
+macro_rules! convert_host_share_stats {
+    ($bindings:path, $host_share:expr) => {
+        $host_share.map(|cache: crate::HostFsCacheStats| {
+            use $bindings as stats_bindings;
+            stats_bindings::HostShareCache {
+                attribute_hits: cache.attribute_hits,
+                attribute_misses: cache.attribute_misses,
+                negative_hits: cache.negative_hits,
+                directory_hits: cache.directory_hits,
+                directory_misses: cache.directory_misses,
+                fid_hits: cache.fid_hits,
+                fid_misses: cache.fid_misses,
+                evictions: cache.evictions,
+                invalidations: cache.invalidations,
+            }
+        })
+    };
+}
+
 macro_rules! convert_block_stats {
     ($bindings:path, $block:expr) => {
         $block.map(|block: crate::BlockStats| {
@@ -3805,6 +3826,10 @@ fn convert_sample(sample: StatsSample) -> debugger_bindings::helios::system::sta
         block: convert_block_stats!(debugger_bindings::helios::system::stats, sample.block),
         iommu: convert_iommu_stats!(debugger_bindings::helios::system::stats, sample.iommu),
         balloon: convert_balloon_stats!(debugger_bindings::helios::system::stats, sample.balloon),
+        host_share: convert_host_share_stats!(
+            debugger_bindings::helios::system::stats,
+            sample.host_share
+        ),
     }
 }
 
@@ -3833,6 +3858,10 @@ fn convert_program_sample(sample: StatsSample) -> program_bindings::helios::syst
         block: convert_block_stats!(program_bindings::helios::system::stats, sample.block),
         iommu: convert_iommu_stats!(program_bindings::helios::system::stats, sample.iommu),
         balloon: convert_balloon_stats!(program_bindings::helios::system::stats, sample.balloon),
+        host_share: convert_host_share_stats!(
+            program_bindings::helios::system::stats,
+            sample.host_share
+        ),
     }
 }
 

@@ -523,9 +523,13 @@ extern "C" fn aarch64_kernel_main() -> ! {
     gic.attach_current_processor(platform_state.bootstrap_mpidr());
 
     let mut routes = DeviceInterruptRoutes::new();
-    if let Some(host_fs) =
-        host_fs::install(&boot_fdt, physical_memory_offset, &handoff, &debug_state)
-    {
+    if let Some(host_fs) = host_fs::install(
+        &cpu,
+        &boot_fdt,
+        physical_memory_offset,
+        &handoff,
+        &debug_state,
+    ) {
         gic.enable_device_interrupt(
             host_fs.interrupt,
             host_fs.trigger,
