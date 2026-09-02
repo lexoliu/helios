@@ -218,13 +218,26 @@ pub(super) fn imported_shared_memory_with_declared_maximum(
     imported_shared_memory(engine, module, None)
 }
 
+/// The largest shared-memory maximum the user pool can still commit.
+///
+/// Backends without lazy-commit virtual memory commit a shared memory's
+/// whole maximum up front, so every maximum this kernel hands out has to
+/// be one the user pool can actually satisfy *now*. Two properties make
+/// the naive "whatever is free" answer wrong, and both are covered here:
+/// the pool rounds every request up to a power of two, so a request for
+/// the raw free byte count is refused by construction, and the maximum
+/// is capped by [`PROGRAM_SHARED_MEMORY_MAX_PAGES`] so one program
+/// cannot claim a pool that later programs still need.
+pub(super) fn user_shared_memory_budget_pages() -> u32 {
+    let allocatable_pages = user_heap_stats().largest_allocatable_bytes() / WASM_PAGE_SIZE;
+    let allocatable_pages = u32::try_from(allocatable_pages).unwrap_or(u32::MAX);
+    allocatable_pages.min(PROGRAM_SHARED_MEMORY_MAX_PAGES)
+}
+
 pub(super) fn imported_shared_memory_spec_with_user_budget(
     module: &Module,
 ) -> Result<Option<SharedMemorySpec>, ProgramExecError> {
-    let available_pages = user_heap_stats().available_bytes() / WASM_PAGE_SIZE;
-    let available_pages = u32::try_from(available_pages).unwrap_or(u32::MAX);
-    let budget_pages = available_pages.min(PROGRAM_SHARED_MEMORY_MAX_PAGES);
-    imported_shared_memory_spec(module, Some(budget_pages))
+    imported_shared_memory_spec(module, Some(user_shared_memory_budget_pages()))
 }
 
 pub(super) fn imported_shared_memory(

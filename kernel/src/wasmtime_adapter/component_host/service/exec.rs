@@ -1388,9 +1388,20 @@ where
             kind: ProgramExecErrorKind::Unavailable,
             detail: ProgramExecErrorDetail::HostOperationFailed,
         })?;
+    // A fork gets its own shared memory, so it has to be sized against
+    // what the user pool can still commit rather than against the fixed
+    // per-program ceiling: on backends that commit the whole maximum up
+    // front the ceiling is unallocatable once the parent holds one.
+    let maximum_pages = user_shared_memory_budget_pages();
+    if maximum_pages < current_pages {
+        return Err(ProgramExecError {
+            kind: ProgramExecErrorKind::OutOfMemory,
+            detail: ProgramExecErrorDetail::ImportedSharedMemoryBudgetExceeded,
+        });
+    }
     let memory_spec = SharedMemorySpec {
         initial_pages: current_pages,
-        maximum_pages: PROGRAM_SHARED_MEMORY_MAX_PAGES,
+        maximum_pages,
     };
     // Fork bursts in shell pipelines outrun the background scrub just
     // like exec spawns do; wait for an in-flight recycle before treating
