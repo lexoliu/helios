@@ -22,6 +22,12 @@ pub(crate) const TLB_SHOOTDOWN_INTERRUPT_VECTOR: u8 = 0x22;
 pub(crate) const NETWORK_INTERRUPT_VECTOR: u8 = 0x30;
 pub(crate) const HOST_FS_INTERRUPT_VECTOR: u8 = 0x31;
 pub(crate) const ENTROPY_INTERRUPT_VECTOR: u8 = 0x32;
+/// One vector per block device the routing table can hold: the platform
+/// exposes the boot image and the kernel's own disk as separate
+/// functions, and each of them delivers its completions on its own
+/// message.
+pub(crate) const BLOCK_INTERRUPT_VECTORS: [u8; helios_kernel::MAX_BLOCK_DEVICES] =
+    [0x33, 0x34, 0x35, 0x36];
 
 /// Device interrupt routing table for this backend, keyed by IDT vector.
 pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
@@ -29,6 +35,7 @@ pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
     crate::net::VirtioNetworkDevice,
     crate::host_fs::HostFsTransportService,
     crate::entropy::VirtioEntropyDevice,
+    crate::block::VirtioBlockDevice,
 >;
 
 global_asm!(include_str!("exceptions.S"));
@@ -47,6 +54,10 @@ unsafe extern "C" {
     fn helios_x86_interrupt_network();
     fn helios_x86_interrupt_host_fs();
     fn helios_x86_interrupt_entropy();
+    fn helios_x86_interrupt_block_0();
+    fn helios_x86_interrupt_block_1();
+    fn helios_x86_interrupt_block_2();
+    fn helios_x86_interrupt_block_3();
 }
 
 pub(crate) struct ProcessorIdt {
@@ -99,6 +110,15 @@ impl ProcessorIdt {
                 .set_handler_addr(handler_address(helios_x86_interrupt_host_fs));
             table[ENTROPY_INTERRUPT_VECTOR]
                 .set_handler_addr(handler_address(helios_x86_interrupt_entropy));
+            let block_stubs: [unsafe extern "C" fn(); helios_kernel::MAX_BLOCK_DEVICES] = [
+                helios_x86_interrupt_block_0,
+                helios_x86_interrupt_block_1,
+                helios_x86_interrupt_block_2,
+                helios_x86_interrupt_block_3,
+            ];
+            for (vector, stub) in BLOCK_INTERRUPT_VECTORS.iter().zip(block_stubs) {
+                table[*vector].set_handler_addr(handler_address(stub));
+            }
             table.load_unsafe();
         }
     }
