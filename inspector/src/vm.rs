@@ -88,6 +88,17 @@ enum VmWatchdogProfile {
     I6300Esb,
 }
 
+/// How a profile exposes the guest's entropy device.
+///
+/// Every profile has one: the kernel's root DRBG treats it as its
+/// continuous source, and a guest booted without it would run the whole
+/// session on nothing but its boot seed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VmEntropyProfile {
+    VirtioRngMmio,
+    VirtioRngPci,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VmProfile {
     arch: VmArch,
@@ -106,6 +117,7 @@ struct VmProfile {
     block: Option<VmBlockProfile>,
     host_share: Option<VmHostShareProfile>,
     watchdog: Option<VmWatchdogProfile>,
+    entropy: VmEntropyProfile,
 }
 
 /// The aarch64 platform is device-tree only: the kernel reads the GIC
@@ -131,6 +143,7 @@ const AARCH64_VIRT_HVF_PROFILE: VmProfile = VmProfile {
     block: Some(VmBlockProfile::VirtioPciBootDisk),
     host_share: Some(VmHostShareProfile::Virtio9pMmio),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
+    entropy: VmEntropyProfile::VirtioRngMmio,
 };
 
 #[cfg(test)]
@@ -151,6 +164,7 @@ const AARCH64_VIRT_TCG_PROFILE: VmProfile = VmProfile {
     block: Some(VmBlockProfile::VirtioPciBootDisk),
     host_share: Some(VmHostShareProfile::Virtio9pMmio),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
+    entropy: VmEntropyProfile::VirtioRngMmio,
 };
 
 const RISCV64_VM_PROFILE: VmProfile = VmProfile {
@@ -170,6 +184,7 @@ const RISCV64_VM_PROFILE: VmProfile = VmProfile {
     block: Some(VmBlockProfile::VirtioMmioDataDisk),
     host_share: Some(VmHostShareProfile::Virtio9pMmio),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
+    entropy: VmEntropyProfile::VirtioRngMmio,
 };
 
 const X86_64_VM_PROFILE: VmProfile = VmProfile {
@@ -189,6 +204,7 @@ const X86_64_VM_PROFILE: VmProfile = VmProfile {
     block: Some(VmBlockProfile::VirtioPciBootDisk),
     host_share: Some(VmHostShareProfile::Virtio9pPci),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
+    entropy: VmEntropyProfile::VirtioRngPci,
 };
 
 /// Virtqueue ring layout the inspector asks every virtio device for.
@@ -1420,6 +1436,7 @@ impl VmRuntime {
         if let Some(watchdog) = command.profile.watchdog {
             configure_watchdog(&mut qemu, watchdog);
         }
+        configure_entropy_device(&mut qemu, command.profile.entropy, command.virtio_queues);
 
         let mut child = qemu.spawn().with_context(|| {
             format!(
@@ -1845,6 +1862,33 @@ fn configure_host_share(
     }
 }
 
+/// Gives the guest a virtio-entropy device backed by the host's own
+/// `/dev/urandom`.
+///
+/// QEMU's default `rng-builtin` backend draws from the QEMU process's
+/// RNG; naming `/dev/urandom` explicitly ties guest entropy to the host
+/// kernel pool instead, which is what a real deployment's device would
+/// do.
+fn configure_entropy_device(
+    qemu: &mut Command,
+    entropy: VmEntropyProfile,
+    queues: VirtioQueueProfile,
+) {
+    qemu.arg("-object")
+        .arg("rng-random,filename=/dev/urandom,id=rng0");
+    let properties = queues.device_properties();
+    match entropy {
+        VmEntropyProfile::VirtioRngMmio => {
+            qemu.arg("-device")
+                .arg(format!("virtio-rng-device,rng=rng0{properties}"));
+        }
+        VmEntropyProfile::VirtioRngPci => {
+            qemu.arg("-device")
+                .arg(format!("virtio-rng-pci,rng=rng0{properties}"));
+        }
+    }
+}
+
 fn configure_watchdog(qemu: &mut Command, watchdog: VmWatchdogProfile) {
     match watchdog {
         VmWatchdogProfile::I6300Esb => {
@@ -1913,6 +1957,14 @@ mod tests {
             Some(VmHostShareProfile::Virtio9pMmio)
         );
         assert_eq!(
+            AARCH64_VIRT_HVF_PROFILE.entropy,
+            VmEntropyProfile::VirtioRngMmio
+        );
+        assert_eq!(
+            AARCH64_VIRT_TCG_PROFILE.entropy,
+            VmEntropyProfile::VirtioRngMmio
+        );
+        assert_eq!(
             AARCH64_VIRT_TCG_PROFILE.machine,
             AARCH64_VIRT_HVF_PROFILE.machine
         );
@@ -1948,6 +2000,7 @@ mod tests {
             RISCV64_VM_PROFILE.watchdog,
             Some(VmWatchdogProfile::I6300Esb)
         );
+        assert_eq!(RISCV64_VM_PROFILE.entropy, VmEntropyProfile::VirtioRngMmio);
     }
 
     #[test]
@@ -1976,6 +2029,7 @@ mod tests {
             X86_64_VM_PROFILE.watchdog,
             Some(VmWatchdogProfile::I6300Esb)
         );
+        assert_eq!(X86_64_VM_PROFILE.entropy, VmEntropyProfile::VirtioRngPci);
     }
 
     #[test]
