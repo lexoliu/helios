@@ -182,9 +182,11 @@ struct OrderFifo {
 }
 
 impl OrderFifo {
-    fn new(size: u16) -> Self {
+    /// A `capacity` of zero builds a FIFO nothing may be pushed into,
+    /// which is what a queue without VIRTIO_F_IN_ORDER wants.
+    fn new(capacity: u16) -> Self {
         Self {
-            ids: alloc::vec![0_u16; usize::from(size)].into_boxed_slice(),
+            ids: alloc::vec![0_u16; usize::from(capacity)].into_boxed_slice(),
             head: 0,
             len: 0,
         }
@@ -274,6 +276,10 @@ struct RingCore<B: DmaBuffer> {
     /// lets a device report a batch of completions with a single used
     /// entry, in which case the spec defines the skipped buffers as
     /// having been used completely — which is exactly this length.
+    ///
+    /// Empty unless the feature was negotiated: nothing else reads it,
+    /// and a queue that cannot receive a batched completion should not
+    /// carry the table that decodes one.
     writable_len: Box<[u32]>,
     order: OrderFifo,
     batch: InOrderBatch,
@@ -308,13 +314,16 @@ impl<B: DmaBuffer> RingCore<B> {
             None
         };
 
+        // Submission-order bookkeeping only exists to decode a batched
+        // VIRTIO_F_IN_ORDER completion.
+        let order_capacity = if features.in_order() { size } else { 0 };
         Ok(Self {
             size,
             chain_limit,
             features,
             ids: IdPool::new(size),
-            writable_len: alloc::vec![0_u32; usize::from(size)].into_boxed_slice(),
-            order: OrderFifo::new(size),
+            writable_len: alloc::vec![0_u32; usize::from(order_capacity)].into_boxed_slice(),
+            order: OrderFifo::new(order_capacity),
             batch: InOrderBatch::default(),
             indirect,
             num_added: 0,
@@ -349,15 +358,15 @@ impl<B: DmaBuffer> RingCore<B> {
     }
 
     fn record_chain(&mut self, id: u16, chain: &[ChainEntry]) {
-        let writable = chain
+        if !self.features.in_order() {
+            return;
+        }
+        self.writable_len[usize::from(id)] = chain
             .iter()
             .filter(|entry| entry.writable)
             .map(|entry| entry.len)
             .fold(0_u32, u32::saturating_add);
-        self.writable_len[usize::from(id)] = writable;
-        if self.features.in_order() {
-            self.order.push(id);
-        }
+        self.order.push(id);
     }
 
     /// Opens an in-order completion batch that the device reported with a
