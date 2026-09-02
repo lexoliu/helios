@@ -20,7 +20,7 @@
 
 use core::future::Future;
 
-use triomphe::Arc;
+use alloc::sync::Arc;
 
 use crate::io::IoError;
 

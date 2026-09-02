@@ -7,10 +7,10 @@
 
 extern crate alloc;
 
+use alloc::sync::Arc;
 use arm_gic::{IntId, Trigger};
 use fdt::Fdt;
 use helios_kernel::{BalloonHandle, ExternalInterruptHandler, Kernel};
-use triomphe::Arc;
 
 type Aarch64VirtioBalloonDevice = helios_virtio::VirtioBalloonDevice<
     helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<helios_virtio::OffsetDmaPool>>,
