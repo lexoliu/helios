@@ -2302,7 +2302,7 @@ pub(super) fn format_p3_ip_address(address: crate::NetworkIpAddress) -> socket_t
 
 /// Splits an IPv6 address into the eight big-endian 16-bit groups the
 /// `wasi:sockets` `ipv6-address` tuple carries.
-pub(super) fn ipv6_address_groups(
+pub(in crate::wasmtime_adapter) fn ipv6_address_groups(
     address: helios_netstack::Ipv6Address,
 ) -> (u16, u16, u16, u16, u16, u16, u16, u16) {
     let octets = address.octets();

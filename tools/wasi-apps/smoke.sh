@@ -258,7 +258,33 @@ run_smoke \
     -c \
     '/bin/python3 -c "import json, pathlib; print(json.dumps({\"ok\": pathlib.PurePosixPath(\"/a\").name}, separators=(\",\",\":\")))"'
 
+# The slirp gateway answers ICMP echo without leaving the host, so the
+# ping path is covered even when the runner has no outbound network.
+run_smoke \
+    ping-gateway \
+    'bytes from 10.0.2.2' \
+    -- \
+    --boot-program dash \
+    --boot-program debugger \
+    --boot-program ping \
+    --no-compiler-plugin \
+    shell \
+    -c \
+    '/bin/ping 10.0.2.2'
+
 if [[ "${HELIOS_WASI_SMOKE_CURL:-0}" == "1" ]]; then
+    run_smoke \
+        ping-by-name \
+        'bytes from ' \
+        -- \
+        --boot-program dash \
+        --boot-program debugger \
+        --boot-program ping \
+        --no-compiler-plugin \
+        shell \
+        -c \
+        '/bin/ping detectportal.firefox.com'
+
     run_smoke \
         curl \
         'success' \

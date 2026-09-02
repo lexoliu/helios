@@ -1,6 +1,6 @@
 mod fs;
 pub(crate) use fs::*;
-mod net;
+pub(in crate::wasmtime_adapter) mod net;
 pub(crate) use net::*;
 mod stream;
 pub(crate) use stream::*;
@@ -371,7 +371,7 @@ mod tests {
         ) -> impl core::future::Future<Output = Result<crate::PingReply, crate::PingError>> + Send + '_
         {
             core::future::ready(Ok(crate::PingReply {
-                address: crate::Ipv4Address::new([127, 0, 0, 1]),
+                address: crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([127, 0, 0, 1])),
                 round_trip_nanos: 1,
                 payload_bytes: 1,
             }))

@@ -11,6 +11,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
 
+use crate::wasmtime_adapter::wasi::net::ipv6_address_groups;
+
 use bytes::Bytes;
 
 use crate::{
@@ -2243,7 +2245,7 @@ where
                     .0
                     .udp_receive(socket.1, max_bytes, timeout)
                     .await
-                    .and_then(|datagram| datagram.map(convert_udp_datagram).transpose())
+                    .map(|datagram| datagram.map(convert_udp_datagram))
                     .map_err(convert_udp_error);
                 Ok::<_, wasmtime::Error>((response,))
             })
@@ -2592,7 +2594,7 @@ where
                     .0
                     .udp_receive(socket.1, max_bytes, timeout)
                     .await
-                    .and_then(|datagram| datagram.map(convert_program_udp_datagram).transpose())
+                    .map(|datagram| datagram.map(convert_program_udp_datagram))
                     .map_err(convert_program_udp_error);
                 Ok::<_, wasmtime::Error>((response,))
             })
@@ -2892,14 +2894,43 @@ fn convert_program_launch_result(
     }
 }
 
+fn convert_ip_address(
+    address: crate::NetworkIpAddress,
+) -> debugger_bindings::helios::system::net::IpAddress {
+    match address {
+        crate::NetworkIpAddress::Ipv4(address) => {
+            let octets = address.octets();
+            debugger_bindings::helios::system::net::IpAddress::Ipv4((
+                octets[0], octets[1], octets[2], octets[3],
+            ))
+        }
+        crate::NetworkIpAddress::Ipv6(address) => {
+            debugger_bindings::helios::system::net::IpAddress::Ipv6(ipv6_address_groups(address))
+        }
+    }
+}
+
+fn convert_program_ip_address(
+    address: crate::NetworkIpAddress,
+) -> program_bindings::helios::system::net::IpAddress {
+    match address {
+        crate::NetworkIpAddress::Ipv4(address) => {
+            let octets = address.octets();
+            program_bindings::helios::system::net::IpAddress::Ipv4((
+                octets[0], octets[1], octets[2], octets[3],
+            ))
+        }
+        crate::NetworkIpAddress::Ipv6(address) => {
+            program_bindings::helios::system::net::IpAddress::Ipv6(ipv6_address_groups(address))
+        }
+    }
+}
+
 fn convert_ping_reply(
     reply: crate::PingReply,
 ) -> debugger_bindings::helios::system::net::PingReply {
-    let octets = reply.address.octets();
     debugger_bindings::helios::system::net::PingReply {
-        address: debugger_bindings::helios::system::net::IpAddress::Ipv4((
-            octets[0], octets[1], octets[2], octets[3],
-        )),
+        address: convert_ip_address(reply.address),
         round_trip: reply.round_trip_nanos,
         payload_bytes: reply.payload_bytes,
     }
@@ -2908,11 +2939,8 @@ fn convert_ping_reply(
 fn convert_program_ping_reply(
     reply: crate::PingReply,
 ) -> program_bindings::helios::system::net::PingReply {
-    let octets = reply.address.octets();
     program_bindings::helios::system::net::PingReply {
-        address: program_bindings::helios::system::net::IpAddress::Ipv4((
-            octets[0], octets[1], octets[2], octets[3],
-        )),
+        address: convert_program_ip_address(reply.address),
         round_trip: reply.round_trip_nanos,
         payload_bytes: reply.payload_bytes,
     }
@@ -3068,43 +3096,21 @@ fn convert_program_tcp_error(
 
 fn convert_udp_datagram(
     datagram: crate::UdpDatagram,
-) -> Result<debugger_bindings::helios::system::net::UdpDatagram, crate::UdpError> {
-    match datagram.address {
-        crate::NetworkIpAddress::Ipv4(address) => {
-            let octets = address.octets();
-            Ok(debugger_bindings::helios::system::net::UdpDatagram {
-                address: debugger_bindings::helios::system::net::IpAddress::Ipv4((
-                    octets[0], octets[1], octets[2], octets[3],
-                )),
-                port: datagram.port,
-                bytes: lower_bytes_to_vec(datagram.bytes),
-            })
-        }
-        crate::NetworkIpAddress::Ipv6(_) => Err(crate::UdpError {
-            kind: crate::UdpErrorKind::Unsupported,
-            detail: crate::NetworkErrorDetail::UnsupportedAddressFamily,
-        }),
+) -> debugger_bindings::helios::system::net::UdpDatagram {
+    debugger_bindings::helios::system::net::UdpDatagram {
+        address: convert_ip_address(datagram.address),
+        port: datagram.port,
+        bytes: lower_bytes_to_vec(datagram.bytes),
     }
 }
 
 fn convert_program_udp_datagram(
     datagram: crate::UdpDatagram,
-) -> Result<program_bindings::helios::system::net::UdpDatagram, crate::UdpError> {
-    match datagram.address {
-        crate::NetworkIpAddress::Ipv4(address) => {
-            let octets = address.octets();
-            Ok(program_bindings::helios::system::net::UdpDatagram {
-                address: program_bindings::helios::system::net::IpAddress::Ipv4((
-                    octets[0], octets[1], octets[2], octets[3],
-                )),
-                port: datagram.port,
-                bytes: lower_bytes_to_vec(datagram.bytes),
-            })
-        }
-        crate::NetworkIpAddress::Ipv6(_) => Err(crate::UdpError {
-            kind: crate::UdpErrorKind::Unsupported,
-            detail: crate::NetworkErrorDetail::UnsupportedAddressFamily,
-        }),
+) -> program_bindings::helios::system::net::UdpDatagram {
+    program_bindings::helios::system::net::UdpDatagram {
+        address: convert_program_ip_address(datagram.address),
+        port: datagram.port,
+        bytes: lower_bytes_to_vec(datagram.bytes),
     }
 }
 

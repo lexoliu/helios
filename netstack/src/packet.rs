@@ -1033,6 +1033,27 @@ impl<'a> Icmpv4Packet<'a> {
         }
     }
 
+    /// Encodes an Echo Request (RFC 792) carrying `payload`.
+    pub fn encode_echo_request(
+        output: &mut [u8],
+        identifier: u16,
+        sequence: u16,
+        payload: &[u8],
+    ) -> Option<usize> {
+        let len = Self::HEADER_LEN.checked_add(payload.len())?;
+        if output.len() < len {
+            return None;
+        }
+        output[..len].fill(0);
+        output[0] = 8;
+        write_u16(output, 4, identifier)?;
+        write_u16(output, 6, sequence)?;
+        output[Self::HEADER_LEN..len].copy_from_slice(payload);
+        let checksum = internet_checksum(&output[..len]);
+        write_u16(output, 2, checksum)?;
+        Some(len)
+    }
+
     pub fn encode_destination_unreachable(
         output: &mut [u8],
         code: Icmpv4DestinationUnreachableCode,
@@ -1387,6 +1408,29 @@ impl<'a> Icmpv6Packet<'a> {
             output[9] = 1;
             output[10..16].copy_from_slice(&mac);
         }
+        let checksum = icmpv6_checksum(source, destination, &output[..len]);
+        write_u16(output, 2, checksum)?;
+        Some(len)
+    }
+
+    /// Encodes an Echo Request (RFC 4443 §4.1) carrying `payload`.
+    pub fn encode_echo_request(
+        output: &mut [u8],
+        source: Ipv6Address,
+        destination: Ipv6Address,
+        identifier: u16,
+        sequence: u16,
+        payload: &[u8],
+    ) -> Option<usize> {
+        let len = Self::ECHO_HEADER_LEN.checked_add(payload.len())?;
+        if output.len() < len {
+            return None;
+        }
+        output[..len].fill(0);
+        output[0] = 128;
+        write_u16(output, 4, identifier)?;
+        write_u16(output, 6, sequence)?;
+        output[Self::ECHO_HEADER_LEN..len].copy_from_slice(payload);
         let checksum = icmpv6_checksum(source, destination, &output[..len]);
         write_u16(output, 2, checksum)?;
         Some(len)

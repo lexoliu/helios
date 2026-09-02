@@ -188,7 +188,9 @@ fn write_decimal_u8(value: u8, buffer: &mut [u8]) -> usize {
 
 #[derive(Clone, Debug)]
 pub struct PingReply {
-    pub address: Ipv4Address,
+    /// The address that answered, in whichever family the echo request
+    /// went out.
+    pub address: NetworkIpAddress,
     pub round_trip_nanos: u64,
     pub payload_bytes: u16,
 }

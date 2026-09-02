@@ -49,12 +49,13 @@ pub use packet::{
     TcpTimestampOption, TransportChecksum, TransportPorts, UdpPacket,
 };
 pub use stack::{
-    DEFAULT_TCP_LISTEN_BACKLOG, DhcpLease, DnsQueryId, IcmpEchoKey, Ipv4MulticastMembership,
-    MAX_IPV4_MULTICAST_MEMBERSHIPS, MAX_OUTBOUND_FRAMES, MAX_UDP_RX, MAX_UDP_SOCKETS,
-    NeighborEntry, NeighborState, OutboundBatchStatus, Route, RouteTable, RxChecksumOffload,
-    SocketId, Stack, StackConfig, StackEvent, StackInstant, TcpAccept, TcpConnectState,
-    TcpConnectTerminalError, TcpListenBacklog, TcpReadIntoState, TcpReadState, UdpEndpoint,
-    UdpPayload, UdpReceive, UdpSocketBinding, UdpSocketError, UdpSocketId,
+    DEFAULT_TCP_LISTEN_BACKLOG, DhcpLease, DnsQueryId, IcmpEchoKey, IcmpEchoReply,
+    Ipv4MulticastMembership, MAX_ICMP_ECHO_REPLIES, MAX_IPV4_MULTICAST_MEMBERSHIPS,
+    MAX_OUTBOUND_FRAMES, MAX_UDP_RX, MAX_UDP_SOCKETS, NeighborEntry, NeighborState,
+    OutboundBatchStatus, Route, RouteTable, RxChecksumOffload, SocketId, Stack, StackConfig,
+    StackEvent, StackInstant, TcpAccept, TcpConnectState, TcpConnectTerminalError,
+    TcpListenBacklog, TcpReadIntoState, TcpReadState, UdpEndpoint, UdpPayload, UdpReceive,
+    UdpSocketBinding, UdpSocketError, UdpSocketId,
 };
 pub use tcp::{TCP_RECEIVE_WINDOW_BYTES, TCP_TRANSMIT_BUFFER_BYTES};
 pub use tcp::{TcpEndpoint, TcpReset, TcpSegmentOutcome, TcpSocket, TcpState, TcpTransmitSegment};
