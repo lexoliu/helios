@@ -153,3 +153,101 @@ impl Cpu for ManualClockCpu {
         panic!("test CPU should not reboot")
     }
 }
+
+/// A CPU that answers for a chosen slot out of a chosen processor count
+/// and records every cross-processor wake it is asked to deliver.
+///
+/// SMP hand-off paths — the network RX demux placing a frame in another
+/// processor's shard, above all — are only correct if they actually pull
+/// the owning processor out of its idle park. That is invisible to a
+/// single-processor fixture, so this one reports the topology the test
+/// needs and keeps the IPIs for the test to assert on.
+pub(crate) struct RecordingSmpCpu {
+    base: TestCpu,
+    current: ProcessorId,
+    processors: usize,
+    woken: spin::Mutex<alloc::vec::Vec<ProcessorId>>,
+}
+
+impl RecordingSmpCpu {
+    pub(crate) fn new(current: u16, processors: usize) -> Self {
+        assert!(processors != 0, "test CPU needs at least one processor");
+        assert!(
+            usize::from(current) < processors,
+            "test CPU slot {current} out of range for {processors} processors"
+        );
+        Self {
+            base: TestCpu::without_entropy(),
+            current: ProcessorId::new(current),
+            processors,
+            woken: spin::Mutex::new(alloc::vec::Vec::new()),
+        }
+    }
+
+    /// The processors this CPU was asked to wake, in order.
+    pub(crate) fn woken(&self) -> alloc::vec::Vec<ProcessorId> {
+        self.woken.lock().clone()
+    }
+}
+
+impl Cpu for RecordingSmpCpu {
+    fn current_processor(&self) -> ProcessorId {
+        self.current
+    }
+
+    fn processor_count(&self) -> usize {
+        self.processors
+    }
+
+    fn bootstrap_processor(&self) -> ProcessorId {
+        ProcessorId::new(0)
+    }
+
+    fn park_current(&self) {
+        self.base.park_current();
+    }
+
+    fn start_processor(&self, processor: ProcessorId) {
+        self.base.start_processor(processor);
+    }
+
+    fn wake_processor(&self, processor: ProcessorId) {
+        self.woken.lock().push(processor);
+    }
+
+    fn now(&self) -> Instant {
+        self.base.now()
+    }
+
+    fn timer_frequency(&self) -> u64 {
+        self.base.timer_frequency()
+    }
+
+    fn set_deadline(&self, deadline: Instant) {
+        self.base.set_deadline(deadline);
+    }
+
+    fn publish_executable(&self, address: *const u8, len: usize) {
+        self.base.publish_executable(address, len);
+    }
+
+    fn unpublish_executable(&self, address: *const u8, len: usize) {
+        self.base.unpublish_executable(address, len);
+    }
+
+    fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {
+        self.base.native_feature_probe()
+    }
+
+    fn fill_entropy(&self, buffer: &mut [u8]) -> Result<EntropyQuality, EntropyUnavailable> {
+        self.base.fill_entropy(buffer)
+    }
+
+    fn shutdown(&self) -> ! {
+        self.base.shutdown()
+    }
+
+    fn reboot(&self) -> ! {
+        self.base.reboot()
+    }
+}

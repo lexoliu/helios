@@ -45,9 +45,9 @@ use crate::{
     ComponentNetworkService, ComponentRuntimeState, DnsError, DnsErrorKind,
     Ipv4Address as KernelIpv4Address, Ipv4Cidr as KernelIpv4Cidr, Ipv4Route as KernelIpv4Route,
     MacAddress, NetworkAdminBackend, NetworkBridgeRequest, NetworkControlError, NetworkErrorDetail,
-    NetworkIpAddress, NetworkPortId, PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer,
-    TcpAccepted, TcpError, TcpErrorKind, TcpListener, Timer, UdpBinding, UdpDatagram, UdpError,
-    UdpErrorKind,
+    NetworkIpAddress, NetworkPortId, PingError, PingErrorKind, PingReply, ProgressMark,
+    ProgressSignal, RegisteredTcpReadBuffer, TcpAccepted, TcpError, TcpErrorKind, TcpListener,
+    Timer, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
 };
 use triomphe::Arc;
 
@@ -62,7 +62,26 @@ const DHCP_RETRANSMIT_NANOS: u64 = 1_000_000_000;
 const MAX_TCP_STREAM_HANDLES: usize = 256;
 const MAX_TCP_LISTENER_HANDLES: usize = 64;
 const MAX_UDP_SOCKET_HANDLES: usize = 256;
+/// Polling cadence for a device that cannot interrupt.
+///
+/// Only the polling-only device model needs it: nothing on such a
+/// device wakes a parked task, so a wait is cut into slices and the
+/// caller re-drives the device on each one. Every interrupt-capable
+/// path is event-driven instead — the device event for what this
+/// processor drained, the owning shard's arrival signal for what
+/// another processor drained on its behalf.
 const NETWORK_PROGRESS_WAIT: Duration = Duration::from_micros(50);
+/// How long an operation that owns a retransmission duty parks before
+/// it re-drives that duty.
+///
+/// A query or a solicitation that was dropped on the wire produces no
+/// event at all, so a purely event-driven wait would sit until the
+/// caller's deadline and give up without ever asking twice. The
+/// callers that own such a duty — the DNS resolver and the ping walk
+/// while its next hop is still unresolved — bound their wait by this
+/// instead. DHCP has a retransmission interval of its own
+/// (`DHCP_RETRANSMIT_NANOS`) and bounds its wait by that.
+const NETWORK_RETRANSMIT_WAIT: Duration = Duration::from_millis(250);
 // AArch64/HVF local TCP diagnostics showed that matching the borrowed RX
 // batch to the virtio polling budget moves receive work in the right
 // direction without changing protocol semantics: 64 MiB raw tcp/wasix
@@ -609,8 +628,8 @@ where
     ///
     /// The request is retransmitted only while the next hop's
     /// link-layer address is still unresolved; once it is on the wire
-    /// the task parks on the device event or the poll timer until the
-    /// reply lands or the deadline passes.
+    /// the task parks on the device event, the default shard's arrival
+    /// signal, or its own deadline — whichever comes first.
     async fn echo_address(
         &self,
         key: IcmpEchoKey,
@@ -622,6 +641,11 @@ where
         let payload = icmp_echo_payload();
         let mut sent_at_nanos = None;
         loop {
+            // ICMP carries no local port, so echo replies demux to the
+            // default shard; the mark is taken before the reply is
+            // looked for so a reply another processor drains in between
+            // does not sleep this task to its deadline.
+            let wait = self.inner.state.default_shard_wait();
             self.drive_ping().await?;
             let now_nanos = self.now_nanos();
             match sent_at_nanos {
@@ -656,7 +680,16 @@ where
                 });
             }
             self.drive_ping().await?;
-            self.wait_for_progress(NETWORK_PROGRESS_WAIT).await;
+            // Until the request is actually on the wire this walk owes
+            // a retransmission — the next hop's link-layer address is
+            // still being resolved and nothing will report that but the
+            // caller's own retry. Once it is sent, the reply is the only
+            // thing worth waking for.
+            let bound = match sent_at_nanos {
+                None => self.retransmit_wait(deadline_nanos, NETWORK_RETRANSMIT_WAIT),
+                Some(_) => self.deadline_wait(deadline_nanos),
+            };
+            self.wait_for_shard_progress(wait, bound).await;
         }
     }
 
@@ -743,6 +776,10 @@ where
         ready: impl Fn(bool) -> bool,
     ) -> Result<(), Error> {
         loop {
+            // Interface configuration runs on the shard that owns the
+            // DHCP client port, which is also where DHCP offers and
+            // Router Advertisements demux back to.
+            let wait = self.inner.state.shard_wait_for_local_port(DHCP_CLIENT_PORT);
             let ipv4_configured = self
                 .drive_ipv4_configuration()
                 .await
@@ -753,7 +790,14 @@ where
             if self.now_nanos() >= deadline_nanos {
                 return Err(timeout_error());
             }
-            self.wait_for_progress(NETWORK_PROGRESS_WAIT).await;
+            // A dropped DISCOVER or router solicitation produces no
+            // event at all, so the wait is capped by the retransmission
+            // interval the client state machine expects.
+            self.wait_for_shard_progress(
+                wait,
+                self.retransmit_wait(deadline_nanos, Duration::from_nanos(DHCP_RETRANSMIT_NANOS)),
+            )
+            .await;
         }
     }
 
@@ -881,6 +925,8 @@ where
         }
     }
 
+    /// The wait the packet pump takes: it is the producer for every
+    /// shard, so it parks on the device alone.
     async fn wait_for_progress(&self, duration: Duration) {
         if duration.is_zero() {
             return;
@@ -910,6 +956,94 @@ where
             Poll::Pending
         })
         .await;
+    }
+
+    /// The wait every per-operation caller takes.
+    ///
+    /// An operation belongs to exactly one shard, and the frame that
+    /// ends its wait can be drained by any processor. Three things can
+    /// end it, and all three are races rather than polls:
+    ///
+    /// * the shard's arrival signal, raised by whichever processor
+    ///   placed a frame in this shard — the cross-processor hand-off,
+    ///   and the only one that covers a reply drained on a foreign CPU;
+    /// * the device event, which covers transmit completions, link
+    ///   changes and anything else the device reports;
+    /// * `duration`, the caller's own bound — its deadline, or the
+    ///   interval at which it owes a retransmission.
+    ///
+    /// `wait` must have been sampled before the caller inspected its
+    /// shard; [`NetworkShardSet::shard_wait`] and its siblings are the
+    /// only way to build one, and an arrival that lands between that
+    /// inspection and this park resolves immediately rather than
+    /// sleeping through the wake.
+    async fn wait_for_shard_progress(&self, wait: ShardWait, duration: Duration) {
+        if duration.is_zero() {
+            return;
+        }
+
+        let arrival = self.inner.state.arrival(wait.shard_idx).changed(wait.mark);
+        let mut arrival = core::pin::pin!(arrival);
+
+        if !self.inner.device.capabilities().events.interrupts {
+            // A polling-only device wakes nothing by itself, so
+            // `progress_wait` has already cut `duration` into polling
+            // slices and the caller re-drives on each one. Another
+            // processor's drain still cuts the slice short.
+            let timer = self.inner.timer.sleep_for(duration);
+            let mut timer = core::pin::pin!(timer);
+            core::future::poll_fn(|cx| {
+                if arrival.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(());
+                }
+                if timer.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(());
+                }
+                Poll::Pending
+            })
+            .await;
+            return;
+        }
+
+        let event = self.inner.device.wait_for_event();
+        let mut event = core::pin::pin!(event);
+        if core::future::poll_fn(|cx| {
+            Poll::Ready(arrival.as_mut().poll(cx).is_ready() || event.as_mut().poll(cx).is_ready())
+        })
+        .await
+        {
+            return;
+        }
+
+        let timer = self.inner.timer.sleep_for(duration);
+        let mut timer = core::pin::pin!(timer);
+
+        core::future::poll_fn(|cx| {
+            if arrival.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(());
+            }
+            if event.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(());
+            }
+            if timer.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(());
+            }
+            Poll::Pending
+        })
+        .await;
+    }
+
+    /// The wait for a caller whose only bound is its own deadline.
+    fn deadline_wait(&self, deadline_nanos: u64) -> Duration {
+        self.progress_wait(Duration::from_nanos(
+            deadline_nanos.saturating_sub(self.now_nanos()),
+        ))
+    }
+
+    /// The wait for a caller that owes a retransmission: whichever of
+    /// its deadline and its retransmission interval comes first.
+    fn retransmit_wait(&self, deadline_nanos: u64, interval: Duration) -> Duration {
+        self.deadline_wait(deadline_nanos).min(interval)
     }
 
     fn now_nanos(&self) -> u64 {
@@ -1044,6 +1178,13 @@ mod tests {
         Route, StackConfig, StackInstant, TcpFlags, TcpHeader, TcpListenBacklog, TcpPacket,
         TransportChecksum, UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding, internet_checksum,
     };
+
+    use alloc::vec::Vec;
+    use bytes::Bytes;
+    use futures_lite::future::{block_on, poll_once};
+    use helios_netstack::RxFrame;
+
+    use crate::test_support::RecordingSmpCpu;
 
     use super::{
         AddressAttemptError, DhcpClientState, HandleSlab, NETWORK_BUSY_POLL_ROUNDS,
@@ -1890,6 +2031,129 @@ mod tests {
         assert_eq!(error.kind, crate::UdpErrorKind::Unavailable);
         assert_eq!(error.detail, crate::NetworkErrorDetail::UdpPortInUse);
         state.remove_udp_socket(second);
+    }
+
+    /// The regression #31 describes: a reply for a socket on shard 1
+    /// drained by the pump running on processor 0.
+    ///
+    /// Before the arrival signal existed nothing told shard 1 that its
+    /// datagram had landed, and the waiting operation slept on the
+    /// device event until its own deadline expired — which is what made
+    /// `--smp 4` DNS lookups time out. The assertions here are that the
+    /// wait ends *by notification*: it is pending before the foreign
+    /// drain and ready after it, with no timer in the test at all, and
+    /// the owning processor is sent an IPI because it is not the one
+    /// that drained.
+    #[test]
+    fn reply_drained_on_a_foreign_processor_wakes_the_owning_shard() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        // Two shards, and this fixture is processor 0 — the shard that
+        // owns port 49_153 is shard 1, so every hand-off below is
+        // cross-processor.
+        let cpu = RecordingSmpCpu::new(0, 2);
+        let control = super::NetworkControlPlane::new();
+        let state = super::NetworkShardSet::new(2, |index| {
+            NetworkShard::new(test_stack_config(), 1 + index as u32, index, 2)
+        });
+        let binding = state
+            .with_local_port(49_153, |shard| {
+                shard.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+                shard.start_udp_bind(49_153)
+            })
+            .expect("explicit ephemeral UDP bind should allocate on owner shard");
+        let owner = state.shard_idx_for_handle(binding.socket);
+        assert_eq!(owner, 1, "port 49_153 should belong to shard 1");
+
+        // The operation's park, taken the way every per-operation wait
+        // takes it: mark first, then inspect.
+        let wait = state.shard_wait_for_handle(binding.socket);
+        assert!(
+            state
+                .with_handle(binding.socket, |shard| shard
+                    .poll_udp_receive(binding.socket, usize::MAX)
+                    .expect("bound UDP socket should poll"))
+                .is_none(),
+            "nothing has arrived yet"
+        );
+        let mut parked = core::pin::pin!(state.arrival(wait.shard_idx).changed(wait.mark));
+        assert!(
+            block_on(poll_once(parked.as_mut())).is_none(),
+            "the wait must park while the reply is still on the wire"
+        );
+
+        // Processor 0 drains the reply and demuxes it, exactly as the
+        // packet pump does.
+        let (reply, reply_len) = ipv4_udp_frame(peer, 53, local, 49_153, b"reply");
+        let mut arrivals = super::ShardArrivals::new();
+        match state.dispatch_rx_frame(
+            &RxFrame::new(Bytes::copy_from_slice(&reply[..reply_len])),
+            StackInstant::from_nanos(1),
+            &control,
+        ) {
+            super::RxFrameDispatch::Delivered {
+                shard_idx,
+                backpressured,
+            } => {
+                assert_eq!(shard_idx, owner, "the reply belongs to the socket's shard");
+                assert!(!backpressured);
+                arrivals.record(shard_idx);
+            }
+            _ => panic!("the owning shard should have taken the reply"),
+        }
+        state.notify_arrivals(&arrivals, &cpu);
+
+        assert!(
+            block_on(poll_once(parked)).is_some(),
+            "the foreign drain must release the wait, not its deadline"
+        );
+        assert_eq!(
+            cpu.woken(),
+            alloc::vec![helios_hal::cpu::ProcessorId::new(1)],
+            "the owning processor must be pulled out of its idle park"
+        );
+        assert!(
+            state
+                .with_handle(binding.socket, |shard| shard
+                    .poll_udp_receive(binding.socket, usize::MAX)
+                    .expect("bound UDP socket should poll"))
+                .is_some(),
+            "the released operation must find its datagram"
+        );
+    }
+
+    /// A batch that lands several frames in the same shard releases it
+    /// once, and a shard that took nothing is never signalled.
+    #[test]
+    fn shard_arrivals_deduplicate_within_one_receive_batch() {
+        let cpu = RecordingSmpCpu::new(0, 4);
+        let state = super::NetworkShardSet::new(4, |index| {
+            NetworkShard::new(test_stack_config(), 1 + index as u32, index, 4)
+        });
+        let mut arrivals = super::ShardArrivals::new();
+        arrivals.record(2);
+        arrivals.record(2);
+        arrivals.record(0);
+
+        assert_eq!(arrivals.iter().collect::<Vec<_>>(), alloc::vec![2, 0]);
+
+        let marks: Vec<_> = (0..4).map(|idx| state.shard_wait(idx)).collect();
+        state.notify_arrivals(&arrivals, &cpu);
+
+        for wait in marks {
+            let touched = arrivals.iter().any(|idx| idx == wait.shard_idx);
+            let mut parked = core::pin::pin!(state.arrival(wait.shard_idx).changed(wait.mark));
+            assert_eq!(
+                block_on(poll_once(parked.as_mut())).is_some(),
+                touched,
+                "only a shard that took a frame is released"
+            );
+        }
+        // Shard 0 is this processor's own, so only shard 2 costs an IPI.
+        assert_eq!(
+            cpu.woken(),
+            alloc::vec![helios_hal::cpu::ProcessorId::new(2)]
+        );
     }
 
     #[test]

@@ -61,6 +61,18 @@ where
         let mut answers = DnsAnswers::new();
 
         loop {
+            // The internal resolver socket is bound to
+            // `INTERNAL_DNS_PORT`, so a response demuxes to that port's
+            // shard whichever processor drained it off the device. The
+            // mark is taken before the responses are polled, so a
+            // response that lands in between resolves the wait instead
+            // of being slept through — the exact case that made
+            // `--smp 4` DNS lookups time out while the per-operation
+            // wait was a device-event wait.
+            let wait = self
+                .inner
+                .state
+                .shard_wait_for_local_port(INTERNAL_DNS_PORT);
             self.drive_dns().await?;
             let now = StackInstant::from_nanos(self.now_nanos());
             self.inner.state.with_mut(|state| -> Result<(), DnsError> {
@@ -80,7 +92,13 @@ where
                 });
             }
             self.drive_dns().await?;
-            self.wait_for_progress(NETWORK_PROGRESS_WAIT).await;
+            // A dropped query is answered by nothing, so the resolver
+            // owns its own retransmission and bounds the wait by it.
+            self.wait_for_shard_progress(
+                wait,
+                self.retransmit_wait(deadline_nanos, NETWORK_RETRANSMIT_WAIT),
+            )
+            .await;
         }
     }
 
@@ -139,6 +157,9 @@ where
 
     pub(super) async fn acquire_dhcp_address(&self) -> Result<KernelIpv4Cidr, NetworkControlError> {
         loop {
+            // The lease is negotiated on the shard that owns the DHCP
+            // client port, and the offer demuxes back to it.
+            let wait = self.inner.state.shard_wait_for_local_port(DHCP_CLIENT_PORT);
             self.drive_network(NetworkPollSource::Configuration)
                 .await
                 .map_err(|_| NetworkControlError::BackendFault)?;
@@ -157,7 +178,15 @@ where
             self.drive_network(NetworkPollSource::Configuration)
                 .await
                 .map_err(|_| NetworkControlError::BackendFault)?;
-            self.wait_for_progress(NETWORK_PROGRESS_WAIT).await;
+            // This walk has no caller deadline of its own; a dropped
+            // DISCOVER is retried at the client's retransmission
+            // interval, and an offer that lands sooner wakes it through
+            // the shard.
+            self.wait_for_shard_progress(
+                wait,
+                self.progress_wait(Duration::from_nanos(DHCP_RETRANSMIT_NANOS)),
+            )
+            .await;
         }
     }
 }
