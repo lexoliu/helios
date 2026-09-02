@@ -513,6 +513,35 @@ mod tests {
         );
     }
 
+    /// A reporting pass names as much of the pool as the caller lets it,
+    /// in runs of the size the caller asked for. A pass that could only
+    /// ever name one run would leave a mostly idle guest holding memory
+    /// its host could have back.
+    #[test]
+    fn a_pass_names_as_many_runs_as_the_pool_can_spare() {
+        let pool = pool(64 * 1024 * 1024);
+        let free_before = PhysFrameAllocator::stats(&pool).free_frames();
+
+        let mut runs = 0usize;
+        let named = block_on(pool.free_runs(512, 256, |run| {
+            assert_eq!(run.frame_count, 512);
+            runs += 1;
+            core::future::ready(())
+        }));
+
+        assert_eq!(named, runs);
+        assert!(
+            runs >= 24,
+            "a 64 MiB pool has more than {runs} spare 2 MiB runs"
+        );
+        assert_eq!(
+            PhysFrameAllocator::stats(&pool).free_frames(),
+            free_before,
+            "a pass leaves the pool as it found it"
+        );
+        assert_eq!(PhysFrameAllocator::stats(&pool).reported_frames, runs * 512);
+    }
+
     /// Reporting user memory to a host that may discard it means the
     /// next wasm instance to be handed that memory must not see a hole,
     /// even on the uninit path that normally skips zeroing.

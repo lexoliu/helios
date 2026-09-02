@@ -31,8 +31,11 @@ use spin::Mutex;
 ///
 /// A pass takes every run it visits out of the pool for the duration of
 /// the visit, so the bound is what keeps a report from emptying the pool
-/// under a concurrent allocator on another processor.
-pub(crate) const MAX_FREE_RUN_BATCH: usize = 32;
+/// under a concurrent allocator on another processor. It has to be large
+/// enough to cover a meaningful share of an idle pool in one pass: a
+/// pass always gets the same runs off the free list, so what it does not
+/// reach in one go it will not reach in the next one either.
+pub(crate) const MAX_FREE_RUN_BATCH: usize = 256;
 
 const BITS_PER_WORD: usize = u64::BITS as usize;
 

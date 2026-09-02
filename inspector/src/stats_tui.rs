@@ -645,7 +645,7 @@ fn format_duration(nanos: u64) -> String {
     format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
-fn format_bytes(bytes: u64) -> String {
+pub(crate) fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
     let mut unit = 0;

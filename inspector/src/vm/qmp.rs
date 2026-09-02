@@ -18,10 +18,11 @@ use serde_json::{Value, json};
 
 /// How long a single command waits for its response.
 ///
-/// Generous because the commands the inspector drives make QEMU do
-/// real work: moving a balloon target has the host discard every page
-/// the guest hands back, one madvise at a time, before the reply comes.
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
+/// A guest that is handing memory back keeps QEMU's vCPU thread busy
+/// discarding pages, and the monitor only runs between those bursts, so
+/// a reply can take a while. It is still bounded: a caller that cannot
+/// get an answer says so rather than hanging the session.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// One QMP session over a QEMU monitor socket.
 pub(crate) struct QmpClient {

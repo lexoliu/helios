@@ -18,6 +18,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
+use crate::stats_tui::format_bytes;
 use crate::workload_bench::{VmProvenance, WorkloadBenchCommand};
 use crate::{SessionCommand, connect_client, run_connected};
 
@@ -52,6 +53,9 @@ const DATA_DISK_SERIAL: &str = "helios-data";
 const DEFAULT_GDB_ENDPOINT: &str = "tcp::1234";
 /// The QEMU IOThread the memory balloon's free-page hint queue runs on.
 const BALLOON_IOTHREAD_ID: &str = "balloon-io";
+/// How long the guest's reported balloon size has to hold still before a
+/// wait calls it settled short of the target it was given.
+const BALLOON_STILL_FOR: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1087,7 +1091,7 @@ fn run_balloon(
         println!("{} balloon target {target}", style("set").cyan());
         qmp.set_balloon(bytes)
             .with_context(|| format!("failed to set the balloon target to {target}"))?;
-        settle_balloon(&mut qmp, bytes, command.settle_seconds)?;
+        settle_balloon(&mut client, bytes, command.settle_seconds)?;
         report_balloon(&mut qmp, &mut client, target)?;
         if command.hold_seconds != 0 {
             std::thread::sleep(Duration::from_secs(command.hold_seconds));
@@ -1097,21 +1101,54 @@ fn run_balloon(
     Ok(())
 }
 
-/// Waits for QEMU to report the guest at the target it was given.
+/// Waits for the guest to settle on the target the host named.
 ///
-/// A guest that stops short is not an error: the kernel refuses to
-/// inflate past its own pressure floor and reports that honestly, so the
-/// wait ends and the caller sees the difference.
-fn settle_balloon(qmp: &mut QmpClient, target: u64, seconds: u64) -> Result<()> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
+/// The guest is asked rather than QEMU: it is the side that decides how
+/// much it can spare, it publishes that decision through
+/// `helios:system/stats`, and its answer arrives over the debug serial
+/// rather than over the monitor — which the very memory work the guest
+/// is doing keeps busy.
+///
+/// A guest that stops short is not an error. The kernel refuses to
+/// inflate past its own pressure floor and reports the truth, so the
+/// wait ends when the guest stops moving and the caller sees where it
+/// stopped.
+fn settle_balloon(client: &mut crate::serial::RpcClient, target: u64, seconds: u64) -> Result<()> {
+    let started = std::time::Instant::now();
+    let deadline = started + Duration::from_secs(seconds);
+    let mut previous = None;
+    let mut still_since = started;
     loop {
-        if qmp.query_balloon()?.actual == target {
+        let sample = crate::runtime::block_on(crate::system::fetch_stats(client))?;
+        let actual = sample.balloon.as_ref().map(|balloon| balloon.actual_bytes);
+        if actual == Some(target) {
+            println!(
+                "{} guest reached the target after {:.1}s",
+                style("settled").green(),
+                started.elapsed().as_secs_f64()
+            );
+            return Ok(());
+        }
+        if actual != previous {
+            previous = actual;
+            still_since = std::time::Instant::now();
+        } else if still_since.elapsed() >= BALLOON_STILL_FOR {
+            println!(
+                "{} guest stopped at {} after {:.1}s",
+                style("settled").yellow(),
+                actual.map_or_else(|| "no balloon".to_owned(), format_bytes),
+                started.elapsed().as_secs_f64()
+            );
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
+            println!(
+                "{} guest was still moving when the {seconds}s wait ran out",
+                style("settled").yellow()
+            );
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(Duration::from_secs(1));
     }
 }
 
@@ -1120,20 +1157,27 @@ fn report_balloon(
     client: &mut crate::serial::RpcClient,
     label: &str,
 ) -> Result<()> {
-    let info = qmp.query_balloon()?;
     let sample = crate::runtime::block_on(crate::system::fetch_stats(client))?;
     let guest = match &sample.balloon {
         Some(balloon) => format!(
             "guest target={} actual={} reported-free={}",
-            balloon.target_bytes, balloon.actual_bytes, balloon.reported_bytes
+            format_bytes(balloon.target_bytes),
+            format_bytes(balloon.actual_bytes),
+            format_bytes(balloon.reported_bytes)
         ),
         None => "guest reports no balloon".to_owned(),
     };
+    // QEMU's own view is a cross-check, and the monitor competes for the
+    // lock with the memory work the guest is doing, so failing to get it
+    // is worth saying rather than worth aborting over.
+    let host = match qmp.query_balloon() {
+        Ok(info) => format!("qemu-backed={}", format_bytes(info.actual)),
+        Err(error) => format!("qemu-backed=unavailable ({error})"),
+    };
     println!(
-        "{} {label}: qemu actual={} {guest} user-memory available={}",
+        "{} {label}: {guest} {host} user-memory-available={}",
         style("balloon").green(),
-        info.actual,
-        sample.memory.available_bytes
+        format_bytes(sample.memory.available_bytes)
     );
     Ok(())
 }

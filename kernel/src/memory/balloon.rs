@@ -65,6 +65,7 @@ use helios_hal::watchdog::Watchdog;
 use triomphe::Arc;
 
 use crate::Notify;
+use crate::memory::reported::MAX_FREE_RUN_BATCH;
 use crate::memory::user::installed_user_memory_pool;
 use crate::{Kernel, Timer};
 
@@ -80,8 +81,12 @@ pub const FREE_PAGE_REPORT_INTERVAL: Duration = Duration::from_secs(2);
 /// settled on for the same reason.
 const MIN_REPORT_RUN_FRAMES: usize = 512;
 
-/// Runs one reporting pass names.
-const REPORT_RUNS_PER_PASS: usize = 32;
+/// Runs one reporting pass names at most.
+///
+/// The real bound is how much of the pool sits above the pressure floor
+/// — a pass holds every run it names, so it must not be able to squeeze
+/// the pool while it works. This is the ceiling on top of that.
+const REPORT_RUNS_PER_PASS: usize = MAX_FREE_RUN_BATCH;
 
 /// Frames one inflate request takes out of the pool.
 ///
@@ -96,6 +101,15 @@ const INFLATE_RUN_FRAMES: usize = 512;
 /// is more than a host can ask of any guest this kernel runs on. A host
 /// that asks for more gets what fits and an honest `actual`.
 const MAX_INFLATED_RUNS: usize = 512;
+
+/// Runs the balloon moves between two publications of `actual`.
+///
+/// The host watches `actual` to see the guest following its target, and
+/// a long move should not look like a stall — but every publication is a
+/// device configuration write the host turns into an event, so
+/// publishing per run buries the host in them. Every few runs is
+/// progress the host can see without a storm.
+const ACTUAL_PUBLISH_RUNS: usize = 64;
 
 /// The share of the pool the balloon leaves free.
 ///
@@ -333,6 +347,11 @@ impl<Pool: PhysFrameAllocator, Device: MemoryBalloon + Clone> BalloonService<Poo
 
     async fn inflate_to(&mut self, target: usize) {
         let mut wanted = (target - self.held_frames()).min(self.inflation_budget());
+        tracing::info!(
+            target_frames = target,
+            budget_frames = wanted,
+            "memory balloon inflating"
+        );
         if wanted == 0 {
             tracing::info!(
                 target_frames = target,
@@ -364,10 +383,9 @@ impl<Pool: PhysFrameAllocator, Device: MemoryBalloon + Clone> BalloonService<Poo
             }
             wanted -= range.frame_count;
             self.runs.push(range);
-            // The host watches `actual` to see how far the guest has
-            // got. Publishing only at the end would leave it reading a
-            // stale zero for as long as the whole target takes to move.
-            self.publish_actual();
+            if self.runs.len().is_multiple_of(ACTUAL_PUBLISH_RUNS) {
+                self.publish_actual();
+            }
         }
         tracing::info!(
             held_frames = self.held_frames(),
@@ -398,7 +416,9 @@ impl<Pool: PhysFrameAllocator, Device: MemoryBalloon + Clone> BalloonService<Poo
             self.runs.pop();
             PhysFrameAllocator::deallocate(self.pool, run);
             released += run.frame_count;
-            self.publish_actual();
+            if self.runs.len().is_multiple_of(ACTUAL_PUBLISH_RUNS) {
+                self.publish_actual();
+            }
         }
         if released != 0 {
             tracing::info!(
@@ -467,18 +487,23 @@ async fn report_free_memory_forever<CpuImpl, Pool, Device>(
     );
     let mut last_free_frames = 0usize;
     loop {
-        timer.sleep_for(FREE_PAGE_REPORT_INTERVAL).await;
-        let free_frames = PhysFrameAllocator::stats(pool).free_frames();
+        let stats = PhysFrameAllocator::stats(pool);
+        let free_frames = stats.free_frames();
         if free_frames <= last_free_frames {
-            // Nothing has been released since the last pass, so every
-            // run a pass could name is one the host already dropped.
+            // Nothing has been released since the last pass that named
+            // something, so every run a pass could name is one the host
+            // has already dropped.
+            timer.sleep_for(FREE_PAGE_REPORT_INTERVAL).await;
             continue;
         }
-        last_free_frames = free_frames;
+        // A pass holds every run it names, so it may only reach for the
+        // memory that sits above the floor the runtime defends.
+        let spare = free_frames.saturating_sub(stats.total_frames / PRESSURE_FLOOR_DIVISOR);
+        let runs = (spare / MIN_REPORT_RUN_FRAMES).min(REPORT_RUNS_PER_PASS);
 
         let mut reported_frames = 0usize;
         let reporter = device.clone();
-        pool.free_runs(MIN_REPORT_RUN_FRAMES, REPORT_RUNS_PER_PASS, |run| {
+        pool.free_runs(MIN_REPORT_RUN_FRAMES, runs, |run| {
             reported_frames += run.frame_count;
             let device = reporter.clone();
             async move {
@@ -489,14 +514,23 @@ async fn report_free_memory_forever<CpuImpl, Pool, Device>(
             }
         })
         .await;
-        if reported_frames != 0 {
-            let bytes = (reported_frames * PhysFrame::SIZE) as u64;
-            handle.shared.reported_bytes.store(bytes, Ordering::Release);
-            tracing::debug!(
-                reported_bytes = bytes,
-                "memory balloon reported free memory"
-            );
+        if reported_frames == 0 {
+            // The pool had nothing long enough to be worth naming. The
+            // high-water mark stays where it was so the next release of
+            // memory tries again rather than being suppressed by a pass
+            // that reported nothing.
+            timer.sleep_for(FREE_PAGE_REPORT_INTERVAL).await;
+            continue;
         }
+        last_free_frames = free_frames;
+        let bytes = (reported_frames * PhysFrame::SIZE) as u64;
+        handle.shared.reported_bytes.store(bytes, Ordering::Release);
+        tracing::info!(
+            reported_bytes = bytes,
+            free_bytes = (free_frames * PhysFrame::SIZE) as u64,
+            "memory balloon reported free memory"
+        );
+        timer.sleep_for(FREE_PAGE_REPORT_INTERVAL).await;
     }
 }
 
