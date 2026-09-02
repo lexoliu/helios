@@ -1576,8 +1576,6 @@ dependencies = [
  "helios-kernel",
  "helios-virtio",
  "limine 0.6.3",
- "rand_chacha",
- "rand_core",
  "spin 0.10.0",
  "tracing",
  "triomphe",
@@ -1681,6 +1679,7 @@ name = "helios-hal"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.13.1",
+ "fdt",
  "thiserror 2.0.18",
  "triomphe",
 ]
@@ -1803,6 +1802,7 @@ dependencies = [
  "rand_core",
  "serde",
  "serde_json",
+ "sha2",
  "slab",
  "smallvec",
  "spin 0.9.8",

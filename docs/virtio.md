@@ -93,3 +93,24 @@ QEMU defaults and need no flag. `notification_data` has no QEMU property
 at all — QEMU does not implement VIRTIO_F_NOTIFICATION_DATA — so that
 path is covered by the unit tests in `virtio/src/queue/tests.rs` rather
 than under the VM.
+
+## Devices
+
+`DeviceType` lists exactly the virtio device kinds a Helios driver
+claims: network (1), block (2), entropy (4) and 9P (9). A transport that
+reads any other device id rejects the function rather than mapping it to
+a placeholder driver.
+
+virtio-console (3) is deliberately absent. Every backend's console is the
+platform UART, which has to work before the allocator exists and on the
+panic path, so a virtio console could only ever be a second port on an
+already-working terminal; structured host↔guest transport belongs to
+vsock instead. The driver that used to sit in `virtio/src/console.rs` had
+no callers and was removed rather than kept as dead weight.
+
+virtio-entropy is the kernel's continuous entropy source. The driver in
+`virtio/src/rng.rs` is interrupt-driven like every other single-request
+driver: `fill` submits a writable buffer, registers an `InFlight` slot
+and parks on the device notification, and a zero-length completion is a
+device fault. The kernel mixes what it reads into its root DRBG; see
+`kernel/src/memory/entropy.rs`.

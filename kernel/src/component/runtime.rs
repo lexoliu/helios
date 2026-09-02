@@ -7,8 +7,8 @@ use bytes::Bytes;
 
 use crate::io::{ByteReader, ByteWriter, TryRead};
 use crate::{
-    EntropyError, EntropyPool, InstanceExecutionTransition, InstanceRegistry, KernelClock,
-    KillReason, ProcessAuthority, RegisteredInstance, SetWallClockCap, Sleep, Timer,
+    EntropyPool, InstanceExecutionTransition, InstanceRegistry, KernelClock, KillReason,
+    ProcessAuthority, RegisteredInstance, SetWallClockCap, Sleep, Timer,
     nanos_to_ticks_ceil_saturating, record_instance_transition,
 };
 use helios_hal::cpu::{Cpu, Instant};
@@ -188,6 +188,10 @@ pub trait ComponentRuntimeState: Clone + Send + 'static {
 
     fn record_console_text(&self, current_ticks: u64, text: &str);
 
+    /// The kernel's root DRBG, from which this instance's pool is
+    /// derived.
+    fn root_entropy(&self) -> &crate::RootEntropy;
+
     fn profiling_enabled(&self) -> bool;
 
     fn record_profile_stack_nanos(
@@ -318,7 +322,7 @@ where
         serial_reader: crate::SerialReader,
         serial_writer: fn(&[u8]),
     ) -> Self {
-        let entropy = EntropyPool::from_cpu(&cpu, instance.id().raw());
+        let entropy = EntropyPool::derive(runtime_state.root_entropy(), instance.id().raw());
         let clock = KernelClock::new(cpu.clone(), runtime_state.clone());
         Self {
             table,
@@ -419,11 +423,11 @@ where
         &self.spawner
     }
 
-    pub(crate) fn fill_secure_random(&mut self, buffer: &mut [u8]) -> Result<(), EntropyError> {
-        self.entropy.fill_secure(buffer)
+    pub(crate) fn fill_secure_random(&mut self, buffer: &mut [u8]) {
+        self.entropy.fill_secure(buffer);
     }
 
-    pub(crate) fn secure_random_u64(&mut self) -> Result<u64, EntropyError> {
+    pub(crate) fn secure_random_u64(&mut self) -> u64 {
         self.entropy.secure_u64()
     }
 

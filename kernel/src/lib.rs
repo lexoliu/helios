@@ -104,10 +104,13 @@ pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
 };
 pub use memory::{
-    AccessibilityPlan, CommittedRegion, EntropyError, EntropyPool, KernelPhysFrameAllocator,
-    ReservationLookup, ReservationTracker, UserHeapStats, VaCursor, allocate_user_frame_uninit_on,
+    AccessibilityPlan, CommittedRegion, ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources,
+    HardwareEntropySource, KernelPhysFrameAllocator, NoCryptographicEntropy,
+    ROOT_ENTROPY_MATERIAL_BYTES, ReservationLookup, ReservationTracker, RootEntropy,
+    RootEntropyHandle, UserHeapStats, VaCursor, allocate_user_frame_uninit_on,
     allocate_user_frame_zeroed, allocate_user_frame_zeroed_on, deallocate_user_frame,
-    deallocate_user_frame_on, user_heap_stats, validate_range,
+    deallocate_user_frame_on, install_entropy_device, seed_root_entropy, user_heap_stats,
+    validate_range,
 };
 pub use network::{
     HTTP_FORBIDDEN_FIELD_NAMES, HTTP_MAX_FIELD_SECTION_BYTES, HTTP_MAX_FIELD_VALUE_BYTES, HttpBody,
@@ -898,11 +901,13 @@ fn finish_bootstrap<Console, CpuImpl>(
         user_heap.available_bytes()
     );
     tracing::info!(
-        "Platform dma_model={dma_model:?} debug_serial={} network={} block_devices={} host_share={}",
+        "Platform dma_model={dma_model:?} debug_serial={} network={} block_devices={} \
+         host_share={} entropy_device={}",
         devices.has_debug_serial,
         devices.has_network,
         devices.block_device_count,
-        devices.has_host_share
+        devices.has_host_share,
+        devices.has_entropy_device
     );
     tracing::info!("Kernel is ready\n\n{}", include_str!("welcome.txt"));
 

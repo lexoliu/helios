@@ -98,7 +98,11 @@ impl SharedMemoryPool {
     /// Claims budget for a memory about to be scrubbed and re-pooled.
     /// The bytes count as resident from this point so a burst of exits
     /// cannot overshoot the pool budget while scrubs are in flight.
-    pub(super) fn reserve_for_recycle(&mut self, spec: SharedMemorySpec, memory: &SharedMemory) -> bool {
+    pub(super) fn reserve_for_recycle(
+        &mut self,
+        spec: SharedMemorySpec,
+        memory: &SharedMemory,
+    ) -> bool {
         if memory.size() != u64::from(spec.initial_pages) {
             return false;
         }
@@ -306,9 +310,7 @@ pub(super) fn fill_random(
     len: u32,
 ) -> i32 {
     let mut bytes = alloc::vec![0_u8; len as usize];
-    if entropy.lock().fill_secure(&mut bytes).is_err() {
-        return p1::errno::IO;
-    }
+    entropy.lock().fill_secure(&mut bytes);
     write_shared_memory(memory, ptr, &bytes).map_or(p1::errno::FAULT, |_| p1::errno::SUCCESS)
 }
 

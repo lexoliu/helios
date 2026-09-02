@@ -21,12 +21,14 @@ pub(crate) const TLB_SHOOTDOWN_INTERRUPT_VECTOR: u8 = 0x22;
 /// without a shared interrupt-status scan.
 pub(crate) const NETWORK_INTERRUPT_VECTOR: u8 = 0x30;
 pub(crate) const HOST_FS_INTERRUPT_VECTOR: u8 = 0x31;
+pub(crate) const ENTROPY_INTERRUPT_VECTOR: u8 = 0x32;
 
 /// Device interrupt routing table for this backend, keyed by IDT vector.
 pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
     u8,
     crate::net::VirtioNetworkDevice,
     crate::host_fs::HostFsTransportService,
+    crate::entropy::VirtioEntropyDevice,
 >;
 
 global_asm!(include_str!("exceptions.S"));
@@ -44,6 +46,7 @@ unsafe extern "C" {
     fn helios_x86_interrupt_tlb_shootdown();
     fn helios_x86_interrupt_network();
     fn helios_x86_interrupt_host_fs();
+    fn helios_x86_interrupt_entropy();
 }
 
 pub(crate) struct ProcessorIdt {
@@ -94,6 +97,8 @@ impl ProcessorIdt {
                 .set_handler_addr(handler_address(helios_x86_interrupt_network));
             table[HOST_FS_INTERRUPT_VECTOR]
                 .set_handler_addr(handler_address(helios_x86_interrupt_host_fs));
+            table[ENTROPY_INTERRUPT_VECTOR]
+                .set_handler_addr(handler_address(helios_x86_interrupt_entropy));
             table.load_unsafe();
         }
     }
@@ -159,7 +164,11 @@ extern "C" fn helios_x86_interrupt_dispatch(frame: &mut ExceptionFrame) {
         Ok(TLB_SHOOTDOWN_INTERRUPT_VECTOR) => {
             smp::handle_tlb_shootdown_interrupt();
         }
-        Ok(vector @ (NETWORK_INTERRUPT_VECTOR | HOST_FS_INTERRUPT_VECTOR)) => {
+        Ok(
+            vector @ (NETWORK_INTERRUPT_VECTOR
+            | HOST_FS_INTERRUPT_VECTOR
+            | ENTROPY_INTERRUPT_VECTOR),
+        ) => {
             smp::handle_device_interrupt(vector);
         }
         _ => panic!(

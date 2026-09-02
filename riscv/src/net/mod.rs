@@ -5,7 +5,6 @@ use core::num::NonZeroU32;
 
 use fdt::Fdt;
 use fdt::node::FdtNode;
-use helios_hal::cpu::Cpu;
 use helios_hal::io::IoError;
 use helios_hal::watchdog::Watchdog;
 use helios_kernel::{
@@ -35,6 +34,7 @@ pub(crate) struct ExternalInterrupts {
         InterruptSourceId,
         VirtioNetworkDevice,
         crate::host_fs::HostFsTransportService,
+        crate::entropy::VirtioEntropyDevice,
     >,
 }
 
@@ -50,11 +50,11 @@ pub(crate) struct PlicContext(pub(crate) usize);
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InterruptSourceId(pub(crate) NonZeroU32);
 
-struct NetworkProbe {
+/// The network device the bootstrap hart brought up, together with the
+/// PLIC source the device tree routes it to.
+pub(crate) struct NetworkInterrupt {
+    source: InterruptSourceId,
     device: VirtioNetworkDevice,
-    irq_source: InterruptSourceId,
-    plic: &'static Plic,
-    context: PlicContext,
 }
 
 pub(crate) fn install_network_service<WatchdogImpl>(
@@ -62,53 +62,59 @@ pub(crate) fn install_network_service<WatchdogImpl>(
     kernel: &Kernel<RiscvCpu, WatchdogImpl>,
     fdt: &Fdt<'_>,
     debug_state: &RuntimeState,
-) -> Option<ExternalInterrupts>
+) -> Option<NetworkInterrupt>
 where
     WatchdogImpl: Watchdog + Clone,
 {
-    let probe = NetworkProbe::discover(fdt, cpu.bootstrap_processor().id())?;
+    let Some((device, source)) = discover_network_device(fdt) else {
+        tracing::warn!("virtio network device was not discovered on the platform bus");
+        return None;
+    };
     let service = NetworkService::new(
         cpu.clone(),
         debug_state.clone(),
         kernel.timer(),
-        probe.device.clone(),
+        device.clone(),
     );
     debug_state.install_network_service(helios_kernel::ComponentHostNetworkService::from_service(
         service,
     ));
-    probe.enable();
-    tracing::info!(
-        "virtio network online irq={} context={}",
-        probe.irq_source.0.get(),
-        probe.context.0
-    );
-    let mut routes = ExternalInterruptRoutes::new();
-    routes.set_network(probe.irq_source, probe.device);
-    Some(ExternalInterrupts {
-        plic: probe.plic,
-        context: probe.context,
-        routes,
-    })
+    tracing::info!("virtio network online irq={}", source.0.get());
+    Some(NetworkInterrupt { source, device })
 }
 
 impl ExternalInterrupts {
-    pub(crate) fn host_fs_only(
-        plic: &'static Plic,
-        context: PlicContext,
-        interrupt: crate::host_fs::HostFsInterrupt,
-    ) -> Self {
-        let mut routes = ExternalInterruptRoutes::new();
-        routes.set_host_fs(interrupt.source, interrupt.transport);
+    /// Opens the bootstrap hart's PLIC context. Devices attach to it as
+    /// they come up; a source with no route reaching `handle` is a
+    /// bring-up bug and panics there.
+    pub(crate) fn new(plic: &'static Plic, context: PlicContext) -> Self {
         Self {
             plic,
             context,
-            routes,
+            routes: ExternalInterruptRoutes::new(),
         }
     }
 
+    pub(crate) fn attach_network(&mut self, interrupt: NetworkInterrupt) {
+        self.enable_source(interrupt.source);
+        self.routes.set_network(interrupt.source, interrupt.device);
+    }
+
     pub(crate) fn attach_host_fs(&mut self, interrupt: crate::host_fs::HostFsInterrupt) {
+        self.enable_source(interrupt.source);
         self.routes
             .set_host_fs(interrupt.source, interrupt.transport);
+    }
+
+    pub(crate) fn attach_entropy(&mut self, interrupt: crate::entropy::EntropyInterrupt) {
+        self.enable_source(interrupt.source);
+        self.routes.set_entropy(interrupt.source, interrupt.device);
+    }
+
+    fn enable_source(&self, source: InterruptSourceId) {
+        self.plic.set_priority(source, 1);
+        self.plic.enable(source, self.context);
+        self.plic.set_threshold(self.context, 0);
     }
 
     pub(crate) fn handle(&self) {
@@ -122,25 +128,6 @@ impl ExternalInterrupts {
             );
             self.plic.complete(self.context, source);
         }
-    }
-}
-
-impl NetworkProbe {
-    fn discover(fdt: &Fdt<'_>, bootstrap_hart: u16) -> Option<Self> {
-        let (device, irq_source) = discover_network_device(fdt)?;
-        let (plic, context) = discover_plic_context(fdt, bootstrap_hart)?;
-        Some(Self {
-            device,
-            irq_source,
-            plic,
-            context,
-        })
-    }
-
-    fn enable(&self) {
-        self.plic.set_priority(self.irq_source, 1);
-        self.plic.enable(self.irq_source, self.context);
-        self.plic.set_threshold(self.context, 0);
     }
 }
 

@@ -71,7 +71,7 @@ where
             || DebugFileSystem::new(runtime_state.clone()),
             |snapshot| DebugFileSystem::from_snapshot(runtime_state.clone(), snapshot),
         );
-        let entropy = crate::EntropyPool::from_cpu(&cpu, instance.id().raw());
+        let entropy = crate::EntropyPool::derive(runtime_state.root_entropy(), instance.id().raw());
         let descriptors =
             descriptors.unwrap_or_else(|| Preview1DescriptorTable::from_authority(&authority));
         let clock = crate::KernelClock::new(cpu.clone(), runtime_state.clone());
@@ -1878,9 +1878,7 @@ where
     HostFs: crate::HostFileSystem,
 {
     let mut bytes = vec![0; len as usize];
-    if caller.data_mut().entropy.fill_secure(&mut bytes).is_err() {
-        return p1::errno::IO;
-    }
+    caller.data_mut().entropy.fill_secure(&mut bytes);
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
     };
@@ -2301,7 +2299,12 @@ where
         caller.data().descriptors.get(fd),
         Some(Preview1Descriptor::NullDevice)
     ) {
-        return p1_write_filestat(caller, stat, p1_null_device_identity(), p1_null_device_stat());
+        return p1_write_filestat(
+            caller,
+            stat,
+            p1_null_device_identity(),
+            p1_null_device_stat(),
+        );
     }
     let Some(path) = p1_descriptor_path(caller.data().descriptors.get(fd)).map(ToOwned::to_owned)
     else {
@@ -2340,7 +2343,9 @@ where
         return Ok((metadata.identity, stat));
     }
     let filesystem = &caller.data().filesystem;
-    let identity = filesystem.identity_at_path(path).map_err(p1_errno_from_fs)?;
+    let identity = filesystem
+        .identity_at_path(path)
+        .map_err(p1_errno_from_fs)?;
     let stat = filesystem.stat(path).map_err(p1_errno_from_fs)?;
     Ok((identity, stat))
 }
@@ -3291,7 +3296,12 @@ where
         Err(errno) => return errno,
     };
     if absolute == WASIX_NULL_DEVICE_PATH {
-        return p1_write_filestat(caller, stat, p1_null_device_identity(), p1_null_device_stat());
+        return p1_write_filestat(
+            caller,
+            stat,
+            p1_null_device_identity(),
+            p1_null_device_stat(),
+        );
     }
     let (identity, stat_value) = match p1_stat_absolute_path(caller, &absolute).await {
         Ok(stat) => stat,

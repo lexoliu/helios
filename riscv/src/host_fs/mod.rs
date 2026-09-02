@@ -13,13 +13,10 @@ use alloc::sync::Arc;
 
 use bytes::BytesMut;
 use fdt::Fdt;
-use helios_hal::cpu::Cpu;
 use helios_hal::io::IoError;
 use helios_kernel::{ExternalInterruptHandler, HostFsTransport};
-use plic::Plic;
 
-use crate::RiscvCpu;
-use crate::net::{InterruptSourceId, PlicContext};
+use crate::net::InterruptSourceId;
 
 pub(crate) const HOST_MOUNT_TAG: &str = helios_kernel::HOST_SHARE_MOUNT_TAG;
 
@@ -35,36 +32,23 @@ pub(crate) struct HostFsInterrupt {
     pub(crate) transport: HostFsTransportService,
 }
 
-pub(crate) struct HostFsProbe {
-    pub(crate) plic: &'static Plic,
-    pub(crate) context: PlicContext,
-    pub(crate) interrupt: HostFsInterrupt,
-}
-
 pub(crate) fn install(
-    cpu: &RiscvCpu,
     fdt: &Fdt<'_>,
     debug_state: &crate::debug_state::RuntimeState,
-) -> Option<HostFsProbe> {
+) -> Option<HostFsInterrupt> {
     let Some((device, source)) = discover_9p_device(fdt) else {
         tracing::warn!("virtio 9p device was not discovered on the platform bus");
-        return None;
-    };
-    let Some((plic, context)) =
-        crate::net::discover_plic_context(fdt, cpu.bootstrap_processor().id())
-    else {
-        tracing::warn!("virtio 9p device was discovered but no PLIC context was available");
         return None;
     };
 
     let transport = HostFsTransportService { device };
     debug_state.install_host_fs_service(HostFileSystemService::new(transport.clone()));
+    tracing::info!(
+        "virtio 9p online mount_tag={HOST_MOUNT_TAG} irq={}",
+        source.0.get()
+    );
 
-    Some(HostFsProbe {
-        plic,
-        context,
-        interrupt: HostFsInterrupt { source, transport },
-    })
+    Some(HostFsInterrupt { source, transport })
 }
 
 impl ExternalInterruptHandler for HostFsTransportService {

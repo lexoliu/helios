@@ -16,8 +16,6 @@ helios-hal.workspace = true
 helios-kernel = { workspace = true, default-features = false, features = ["wasmtime-aarch64"] }
 helios-virtio.workspace = true
 limine = "0.6.3"
-rand_chacha = { version = "0.3.1", default-features = false }
-rand_core = { version = "0.6.4", default-features = false }
 spin = "0.10.0"
 triomphe = { version = "0.1.15", default-features = false }
 tracing.workspace = true

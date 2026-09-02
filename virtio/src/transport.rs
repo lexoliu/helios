@@ -29,12 +29,18 @@ const REG_QUEUE_DEVICE_LOW: usize = 0x0a0;
 const REG_QUEUE_DEVICE_HIGH: usize = 0x0a4;
 const CONFIG_SPACE_OFFSET: usize = 0x100;
 
+/// The virtio device kinds this kernel drives.
+///
+/// A device id that is absent here is one no Helios driver claims; the
+/// transports reject it rather than mapping it to a placeholder. The
+/// platform console is a UART on every backend — it has to work before
+/// the allocator and on the panic path — so virtio-console is not a
+/// device kind this kernel has a driver for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum DeviceType {
     Network = 1,
     Block = 2,
-    Console = 3,
     Entropy = 4,
     _9P = 9,
 }
@@ -47,7 +53,6 @@ impl DeviceType {
         match id {
             1 => Some(Self::Network),
             2 => Some(Self::Block),
-            3 => Some(Self::Console),
             4 => Some(Self::Entropy),
             9 => Some(Self::_9P),
             _ => None,

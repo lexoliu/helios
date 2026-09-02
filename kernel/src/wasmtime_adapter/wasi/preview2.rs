@@ -1175,10 +1175,7 @@ where
         })
     }
 
-    fn utc_offset(
-        &mut self,
-        _when: clocks_bindings::clocks::timezone::Datetime,
-    ) -> Result<i32> {
+    fn utc_offset(&mut self, _when: clocks_bindings::clocks::timezone::Datetime) -> Result<i32> {
         Ok(0)
     }
 }
@@ -1803,10 +1800,7 @@ where
                     if kind != crate::wasmtime_adapter::wasi::FsNodeKind::File {
                         return Ok(Err(p2fs::ErrorCode::IsDirectory));
                     }
-                    if !base
-                        .flags
-                        .contains(p3fs::DescriptorFlags::MUTATE_DIRECTORY)
-                    {
+                    if !base.flags.contains(p3fs::DescriptorFlags::MUTATE_DIRECTORY) {
                         return Ok(Err(p2fs::ErrorCode::ReadOnly));
                     }
                     if let Err(err) = service.truncate_file(&host_path).await {
@@ -2214,13 +2208,12 @@ where
     fn get_random_bytes(&mut self, len: u64) -> Result<Vec<u8>> {
         let len = super::random_len(len)?;
         let mut bytes = vec![0_u8; len];
-        self.fill_secure_random(&mut bytes)
-            .map_err(super::entropy_error)?;
+        self.fill_secure_random(&mut bytes);
         Ok(bytes)
     }
 
     fn get_random_u64(&mut self) -> Result<u64> {
-        self.secure_random_u64().map_err(super::entropy_error)
+        Ok(self.secure_random_u64())
     }
 }
 

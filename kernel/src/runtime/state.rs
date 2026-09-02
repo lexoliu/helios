@@ -12,6 +12,7 @@ use crate::{
     PerfMetricHistory, PerfMetricSample, ProfileFilter, ProfileHistory, ProfileScope, StatsSample,
     TraceEvent, TraceFilter, TraceHistory, embedded_init,
 };
+use crate::{RootEntropy, RootEntropyHandle};
 use helios_hal::cpu::HardwarePerfCounterDelta;
 use spin::{Mutex, Once};
 
@@ -33,6 +34,11 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     program_service_ready: Notify,
     network_service_installed: AtomicBool,
     network_service: Once<NetworkService>,
+    /// The boot-seeded root DRBG. Installed by the backend before any
+    /// component runs; every instance's `EntropyPool` is derived from
+    /// it, so a kernel that reaches component start-up without one is a
+    /// bring-up bug rather than a degraded mode.
+    root_entropy: Once<RootEntropyHandle>,
     /// Queue into the `http-client` kernel plugin. Empty on a kernel image
     /// that does not provision the plugin, in which case the runtime adapter
     /// answers a configuration error rather than trapping.
@@ -328,6 +334,7 @@ where
                 program_service_ready: Notify::new(),
                 network_service_installed: AtomicBool::new(false),
                 network_service: Once::new(),
+                root_entropy: Once::new(),
                 http_client: ProviderSlot::new(),
                 host_fs_service: Mutex::new(None),
                 futex_table: Mutex::new(FutexTable::new()),
@@ -713,6 +720,24 @@ where
         &self.inner.http_client
     }
 
+    /// Publishes the root DRBG the backend seeded at boot.
+    pub fn install_root_entropy(&self, root: RootEntropyHandle) {
+        let mut installed = false;
+        self.inner.root_entropy.call_once(|| {
+            installed = true;
+            root
+        });
+        assert!(installed, "root entropy was installed more than once");
+    }
+
+    /// The root DRBG every instance pool is derived from.
+    pub fn root_entropy(&self) -> &RootEntropy {
+        self.inner
+            .root_entropy
+            .get()
+            .unwrap_or_else(|| panic!("root entropy was used before the backend installed it"))
+    }
+
     pub fn install_host_fs_service(&self, service: HostFsService) {
         let mut slot = self.inner.host_fs_service.lock();
         assert!(
@@ -764,6 +789,10 @@ where
 
     fn record_console_text(&self, current_ticks: u64, text: &str) {
         RuntimeState::record_console_text(self, current_ticks, text);
+    }
+
+    fn root_entropy(&self) -> &RootEntropy {
+        RuntimeState::root_entropy(self)
     }
 
     fn profiling_enabled(&self) -> bool {

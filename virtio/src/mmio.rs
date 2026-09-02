@@ -5,14 +5,12 @@ use helios_hal::io::IoResult;
 
 use crate::block::{VirtioBlockDevice, VirtioBlockResource};
 use crate::bus::{DmaPool, IdentityDmaPool, MmioBus};
-use crate::console::VirtioConsoleDevice;
 use crate::net::VirtioNetDevice;
 use crate::p9::Virtio9pDevice;
 use crate::rng::VirtioRngDevice;
 use crate::transport::VirtioMmioTransport;
 
 pub type VirtioMmioBlockDevice = VirtioBlockResource<VirtioMmioTransport<MmioBus>>;
-pub type VirtioMmioConsoleDevice = VirtioConsoleDevice<VirtioMmioTransport<MmioBus>>;
 pub type VirtioMmioNetDevice = VirtioNetDevice<VirtioMmioTransport<MmioBus>>;
 pub type VirtioMmio9pDevice = Virtio9pDevice<VirtioMmioTransport<MmioBus>>;
 pub type VirtioMmioRngDevice = VirtioRngDevice<VirtioMmioTransport<MmioBus>>;
@@ -37,22 +35,6 @@ pub unsafe fn block_from_mmio(
     let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     VirtioBlockDevice::new_resource(transport, rights)
-}
-
-/// Builds a VirtIO console device from a permanently mapped MMIO header.
-///
-/// # Safety
-///
-/// `header..header+mmio_size` must refer to a valid, permanently mapped VirtIO
-/// MMIO register block for a console device, and no other code may violate the
-/// transport's register access invariants while the returned driver is alive.
-pub unsafe fn console_from_mmio(
-    header: NonNull<u8>,
-    mmio_size: usize,
-) -> IoResult<VirtioMmioConsoleDevice> {
-    let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
-    let transport = VirtioMmioTransport::new(bus)?;
-    VirtioConsoleDevice::new(transport)
 }
 
 /// Builds a VirtIO network device from a permanently mapped MMIO header.
@@ -122,6 +104,26 @@ pub unsafe fn rng_from_mmio(
     mmio_size: usize,
 ) -> IoResult<VirtioMmioRngDevice> {
     let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
+    let transport = VirtioMmioTransport::new(bus)?;
+    VirtioRngDevice::new(transport)
+}
+
+/// Builds a VirtIO entropy device on a bus whose DMA addresses are
+/// translated, such as a backend running behind a physical-memory
+/// offset map.
+///
+/// # Safety
+///
+/// Same as [`rng_from_mmio`].
+pub unsafe fn rng_from_mmio_with_dma<P>(
+    header: NonNull<u8>,
+    mmio_size: usize,
+    dma: P,
+) -> IoResult<VirtioRngDevice<VirtioMmioTransport<MmioBus<P>>>>
+where
+    P: DmaPool,
+{
+    let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     VirtioRngDevice::new(transport)
 }

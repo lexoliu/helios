@@ -141,7 +141,6 @@ impl<T: VirtioTransport> Virtio9pDevice<T> {
         let token = submit_chain(
             &self.inflight,
             &self.queue,
-            &self.interrupts,
             &self.transport,
             &[request],
             &mut [response],
@@ -151,11 +150,10 @@ impl<T: VirtioTransport> Virtio9pDevice<T> {
         // Completions are routed by descriptor identifier: with EVENT_IDX
         // and IN_ORDER the device may finish requests in an order that
         // has nothing to do with which task is awake.
-        let used_len =
-            await_completion(&self.inflight, &self.queue, &self.interrupts, token, || {
-                self.interrupts.notified()
-            })
-            .await;
+        let used_len = await_completion(&self.inflight, &self.queue, token, || {
+            self.interrupts.notified()
+        })
+        .await;
 
         let header_len = u32::from_le_bytes([response[0], response[1], response[2], response[3]]);
         if header_len != used_len {

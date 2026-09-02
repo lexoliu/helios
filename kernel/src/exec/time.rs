@@ -147,6 +147,10 @@ mod tests {
 
         fn record_console_text(&self, _: u64, _: &str) {}
 
+        fn root_entropy(&self) -> &crate::RootEntropy {
+            panic!("the clock test state has no root entropy")
+        }
+
         fn profiling_enabled(&self) -> bool {
             false
         }
