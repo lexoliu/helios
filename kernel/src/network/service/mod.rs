@@ -1,3 +1,5 @@
+mod address;
+use address::*;
 mod error;
 use error::*;
 mod pump;
@@ -575,35 +577,24 @@ where
         .await
     }
 
-    /// Picks the first resolved address this interface can actually
-    /// reach, in resolver order.
+    /// Every resolved address worth attempting for this destination,
+    /// in the order the connect walk should try them.
     ///
     /// A dual-family lookup routinely returns AAAA records on a link
     /// where nothing configured an IPv6 address, and vice versa, so
     /// connecting blindly to the first answer would fail on exactly the
-    /// hosts that also published a usable one. Addresses of a family
-    /// this interface holds no source address for are skipped; when no
-    /// family is configured the resolver order stands, leaving the
-    /// unreachability to surface from the send path.
-    fn first_usable_address(
+    /// hosts that also published a usable one. `ConnectCandidates`
+    /// owns that ordering; `None` means the lookup produced nothing to
+    /// attempt.
+    fn usable_addresses(
         &self,
         addresses: impl IntoIterator<Item = NetworkIpAddress>,
-    ) -> Option<IpAddress> {
-        let has_ipv4 = !self.inner.control.list_ipv4_addresses().is_empty();
-        let has_ipv6 = !self.inner.control.list_ipv6_addresses().is_empty();
-        let mut fallback = None;
-        for address in addresses {
-            let address = map_network_ip_address(address);
-            let usable = match address {
-                IpAddress::Ipv4(_) => has_ipv4,
-                IpAddress::Ipv6(_) => has_ipv6,
-            };
-            if usable {
-                return Some(address);
-            }
-            fallback.get_or_insert(address);
-        }
-        fallback
+    ) -> Option<ConnectCandidates> {
+        ConnectCandidates::new(
+            !self.inner.control.list_ipv4_addresses().is_empty(),
+            !self.inner.control.list_ipv6_addresses().is_empty(),
+            addresses,
+        )
     }
 
     async fn wait_for_ipv4_configured<Error>(
@@ -915,9 +906,10 @@ mod tests {
     };
 
     use super::{
-        HandleSlab, NETWORK_BUSY_POLL_ROUNDS, NETWORK_TX_BATCH_FRAMES, NetworkIpAddress,
-        NetworkPollBudget, NetworkPollProgress, NetworkPollState, NetworkPumpAction,
-        NetworkPumpCadence, NetworkShard, limit_udp_datagram_bytes, map_ipv4_address, parse_ipv6,
+        AddressAttemptError, HandleSlab, NETWORK_BUSY_POLL_ROUNDS, NETWORK_TX_BATCH_FRAMES,
+        NetworkIpAddress, NetworkPollBudget, NetworkPollProgress, NetworkPollState,
+        NetworkPumpAction, NetworkPumpCadence, NetworkShard, limit_udp_datagram_bytes,
+        map_ipv4_address, parse_ipv6,
     };
 
     fn ipv6_tcp_frame(
@@ -1155,6 +1147,72 @@ mod tests {
         assert_eq!(ipv6.destination, remote);
         assert_eq!(tcp.destination_port, 443);
         assert!(tcp.flags.contains(TcpFlags::SYN));
+    }
+
+    /// The IPv6 half of the QEMU user-networking failure in issue #36:
+    /// slirp answers an IPv6 SYN with a RST on an IPv6-less host. The
+    /// resulting error has to classify as address-specific, or the
+    /// connect walk would report it instead of trying the A record.
+    #[test]
+    fn refused_ipv6_connect_reports_an_address_specific_error() {
+        let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        let mut state = test_network_shard();
+        state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+        state.stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv6(remote),
+            mac: [0x02, 0, 0, 0, 0, 2],
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        let stream = state
+            .start_tcp_connect(
+                IpAddress::Ipv6(remote),
+                443,
+                0,
+                helios_netstack::DEFAULT_HOP_LIMIT,
+            )
+            .expect("IPv6 TCP connect should allocate a socket");
+        state
+            .stack
+            .drive_tcp(StackInstant::from_nanos(1))
+            .expect("IPv6 TCP SYN should be queued");
+        let frame = state
+            .stack
+            .take_outbound()
+            .expect("IPv6 SYN frame should be queued");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        let ipv6 = Ipv6Packet::parse(ethernet.payload).expect("IPv6 packet should parse");
+        let syn = TcpPacket::parse(ipv6.payload).expect("TCP packet should parse");
+
+        let (reset, reset_len) = ipv6_tcp_frame(
+            remote,
+            local,
+            TcpHeader {
+                source_port: 443,
+                destination_port: syn.source_port,
+                sequence: 0,
+                acknowledgement: syn.sequence.wrapping_add(1),
+                flags: TcpFlags::RST.union(TcpFlags::ACK),
+                window_size: 0,
+            },
+        );
+        state
+            .stack
+            .receive_frame(&reset[..reset_len], StackInstant::from_nanos(2))
+            .expect("IPv6 RST should be accepted");
+
+        let error = state
+            .poll_tcp_connect(stream)
+            .expect_err("a refused connect should fail");
+        assert_eq!(
+            error.detail,
+            crate::NetworkErrorDetail::TcpClosedDuringConnect
+        );
+        assert!(
+            AddressAttemptError::is_address_specific(&error),
+            "a refused candidate must fall through to the next resolved address"
+        );
     }
 
     #[test]

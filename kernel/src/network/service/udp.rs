@@ -165,17 +165,23 @@ where
         timeout_nanos: u64,
     ) -> Result<u64, UdpError> {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
-        let destination = self.resolve_host_udp(host, deadline_nanos).await?;
-        match destination {
-            IpAddress::Ipv4(destination) => {
-                self.execute_udp_send_ipv4(socket, destination, port, bytes, deadline_nanos)
-                    .await
+        let candidates = self.resolve_host_udp(host, deadline_nanos).await?;
+        // A name resolved in both families can answer with a family
+        // this link cannot source, so the send walks the candidates the
+        // same way a connect does, on the same shared deadline.
+        attempt_each_address(&candidates, move |destination| async move {
+            match destination {
+                IpAddress::Ipv4(address) => {
+                    self.execute_udp_send_ipv4(socket, address, port, bytes, deadline_nanos)
+                        .await
+                }
+                IpAddress::Ipv6(_) => {
+                    self.execute_udp_send_ip(socket, destination, port, bytes)
+                        .await
+                }
             }
-            IpAddress::Ipv6(_) => {
-                self.execute_udp_send_ip(socket, destination, port, bytes)
-                    .await
-            }
-        }
+        })
+        .await
     }
 
     pub(super) async fn execute_udp_send_address(
@@ -293,12 +299,12 @@ where
         &self,
         host: &str,
         deadline_nanos: u64,
-    ) -> Result<IpAddress, UdpError> {
+    ) -> Result<ConnectCandidates, UdpError> {
         if let Some(address) = parse_ipv4(host) {
-            return Ok(IpAddress::Ipv4(address));
+            return Ok(ConnectCandidates::literal(IpAddress::Ipv4(address)));
         }
         if let Some(address) = parse_ipv6(host) {
-            return Ok(IpAddress::Ipv6(address));
+            return Ok(ConnectCandidates::literal(IpAddress::Ipv6(address)));
         }
         let timeout_nanos = deadline_nanos.saturating_sub(self.now_nanos());
         let addresses = self
@@ -312,7 +318,7 @@ where
                 },
                 detail: error.detail,
             })?;
-        self.first_usable_address(addresses).ok_or(UdpError {
+        self.usable_addresses(addresses).ok_or(UdpError {
             kind: UdpErrorKind::UnresolvedHost,
             detail: NetworkErrorDetail::DnsNoIpv4Address,
         })
