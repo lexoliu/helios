@@ -256,6 +256,11 @@ fn spawn_processor_thread(
             if processor == machine.bootstrap_processor() {
                 init_serial();
 
+                // The hosted backend has no entropy device: the host OS
+                // is the only cryptographic source, and it is always
+                // there, so the root DRBG never reseeds after boot.
+                debug_state.install_root_entropy(helios_kernel::seed_root_entropy(&cpu, None));
+
                 // Install host filesystem if configured.
                 if let Some(root) = config.init_wasi_root() {
                     debug_state.install_host_fs_service(HostedFileSystem::new(root));
