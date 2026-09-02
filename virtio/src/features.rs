@@ -13,6 +13,7 @@
 
 use helios_hal::io::{IoError, IoResult};
 
+use crate::bus::{DeviceBus, DmaAddressing, DmaPool};
 use crate::transport::{DeviceStatus, VirtioFeatures, VirtioTransport};
 
 /// Transport-level ring features every helios driver asks for.
@@ -82,6 +83,12 @@ impl NegotiatedFeatures {
         self.contains(VirtioFeatures::RING_RESET)
     }
 
+    /// VIRTIO_F_ACCESS_PLATFORM: every address the driver publishes is
+    /// one the platform translates, not a physical address.
+    pub const fn access_platform(self) -> bool {
+        self.contains(VirtioFeatures::ACCESS_PLATFORM)
+    }
+
     /// Whether every bit of a device-class mask was accepted.
     pub const fn device(self, mask: u64) -> bool {
         self.0 & mask == mask
@@ -122,10 +129,39 @@ where
     transport.set_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER);
 
     let offered = transport.device_features();
-    let mut accepted = offered & select(offered);
+    // Whether the device has to translate is a property of the pool its
+    // driver publishes addresses from, not of what the driver asked for,
+    // so the bit is added and removed here rather than in every driver.
+    let addressing = transport.bus().dma().addressing();
+    let wanted = match addressing {
+        DmaAddressing::Platform => select(offered) | VirtioFeatures::ACCESS_PLATFORM.bits(),
+        DmaAddressing::Physical => select(offered) & !VirtioFeatures::ACCESS_PLATFORM.bits(),
+    };
+    let mut accepted = offered & wanted;
     if accepted & VirtioFeatures::VERSION_1.bits() == 0 {
         return Err(IoError::InvalidDeviceConfig(
             "virtio device does not support the 1.0 specification",
+        ));
+    }
+    if addressing == DmaAddressing::Platform
+        && accepted & VirtioFeatures::ACCESS_PLATFORM.bits() == 0
+    {
+        // The device would read the descriptor rings as physical
+        // addresses while the kernel publishes I/O virtual ones, so it
+        // would fault on its first fetch. Fail here, where the device is
+        // still named, instead of at the fault.
+        return Err(IoError::InvalidDeviceConfig(
+            "virtio device behind an IOMMU does not support VIRTIO_F_ACCESS_PLATFORM",
+        ));
+    }
+    if addressing == DmaAddressing::Physical
+        && offered & VirtioFeatures::ACCESS_PLATFORM.bits() != 0
+    {
+        // The platform put this device behind a translation unit but the
+        // kernel built it no domain, so every address it is about to be
+        // given is one the unit will refuse.
+        return Err(IoError::InvalidDeviceConfig(
+            "virtio device requires VIRTIO_F_ACCESS_PLATFORM but was given no IOMMU domain",
         ));
     }
 
@@ -157,6 +193,7 @@ where
         in_order = features.in_order(),
         notification_data = features.notification_data(),
         ring_reset = features.ring_reset(),
+        access_platform = features.access_platform(),
         "virtio features negotiated"
     );
     Ok(features)
@@ -164,9 +201,25 @@ where
 
 #[cfg(test)]
 mod tests {
+    use helios_hal::iommu::{DmaTranslation, DmaWindow, IoVirtAddr};
+
     use super::{RING_FEATURES, negotiate};
+    use crate::bus::{IdentityDmaPool, PlatformDmaPool};
     use crate::testing::{FakeTransport, FakeTransportConfig};
     use crate::transport::VirtioFeatures;
+
+    /// A pool that puts its device behind a translation, which is what
+    /// makes VIRTIO_F_ACCESS_PLATFORM mandatory for that device.
+    fn confined_pool() -> PlatformDmaPool<IdentityDmaPool> {
+        let translation = DmaTranslation::confined()
+            .with_window(DmaWindow {
+                physical_start: 0,
+                bytes: u64::MAX,
+                iova_start: IoVirtAddr::new(0),
+            })
+            .expect("the window fits");
+        PlatformDmaPool::new(IdentityDmaPool, translation)
+    }
 
     #[test]
     fn negotiation_intersects_offered_and_wanted_features() {
@@ -211,5 +264,75 @@ mod tests {
         });
 
         negotiate(&transport, RING_FEATURES).expect_err("a legacy-only device must be rejected");
+    }
+
+    /// A device whose driver publishes translated addresses has to be
+    /// told, or it would read the rings as physical addresses.
+    #[test]
+    fn a_confined_device_negotiates_access_platform() {
+        let transport = FakeTransport::with_dma(
+            FakeTransportConfig {
+                offered_features: VirtioFeatures::VERSION_1.bits()
+                    | VirtioFeatures::ACCESS_PLATFORM.bits(),
+                ..FakeTransportConfig::default()
+            },
+            confined_pool(),
+        );
+
+        let features = negotiate(&transport, RING_FEATURES).expect("negotiation should succeed");
+
+        assert!(features.access_platform());
+        assert!(
+            transport.driver_features() & VirtioFeatures::ACCESS_PLATFORM.bits() != 0,
+            "the device has to be told the addresses it will be given are translated"
+        );
+    }
+
+    /// A device that cannot translate cannot be put behind an IOMMU:
+    /// every address it is about to be handed would fault.
+    #[test]
+    fn a_confined_device_that_cannot_translate_is_rejected() {
+        let transport = FakeTransport::with_dma(
+            FakeTransportConfig {
+                offered_features: VirtioFeatures::VERSION_1.bits(),
+                ..FakeTransportConfig::default()
+            },
+            confined_pool(),
+        );
+
+        negotiate(&transport, RING_FEATURES)
+            .expect_err("a device with no ACCESS_PLATFORM support cannot be confined");
+    }
+
+    /// The mirror case: the platform put the device behind a
+    /// translation unit but the kernel built it no domain, so the
+    /// addresses it is about to be given are ones the unit will refuse.
+    #[test]
+    fn a_device_that_requires_access_platform_without_a_domain_is_rejected() {
+        let transport = FakeTransport::new(FakeTransportConfig {
+            offered_features: VirtioFeatures::VERSION_1.bits()
+                | VirtioFeatures::ACCESS_PLATFORM.bits(),
+            ..FakeTransportConfig::default()
+        });
+
+        negotiate(&transport, RING_FEATURES)
+            .expect_err("a device that demands platform addresses needs a domain");
+    }
+
+    /// An ordinary machine's devices must not be told to translate.
+    #[test]
+    fn an_unconfined_device_never_asks_for_access_platform() {
+        let transport = FakeTransport::new(FakeTransportConfig {
+            offered_features: VirtioFeatures::VERSION_1.bits(),
+            ..FakeTransportConfig::default()
+        });
+
+        let features = negotiate(&transport, RING_FEATURES).expect("negotiation should succeed");
+
+        assert!(!features.access_platform());
+        assert_eq!(
+            transport.driver_features() & VirtioFeatures::ACCESS_PLATFORM.bits(),
+            0
+        );
     }
 }

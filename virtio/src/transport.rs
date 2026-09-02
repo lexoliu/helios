@@ -43,6 +43,9 @@ pub enum DeviceType {
     Block = 2,
     Entropy = 4,
     _9P = 9,
+    /// virtio-iommu: the translation unit the platform's confined
+    /// devices issue their DMA through.
+    Iommu = 23,
 }
 
 impl DeviceType {
@@ -55,6 +58,7 @@ impl DeviceType {
             2 => Some(Self::Block),
             4 => Some(Self::Entropy),
             9 => Some(Self::_9P),
+            23 => Some(Self::Iommu),
             _ => None,
         }
     }
@@ -77,6 +81,9 @@ bitflags! {
         const RING_INDIRECT_DESC = 1 << 28;
         const RING_EVENT_IDX = 1 << 29;
         const VERSION_1 = 1 << 32;
+        /// VIRTIO_F_ACCESS_PLATFORM: the device issues addresses the
+        /// platform translates rather than raw physical addresses.
+        const ACCESS_PLATFORM = 1 << 33;
         const RING_PACKED = 1 << 34;
         const IN_ORDER = 1 << 35;
         const NOTIFICATION_DATA = 1 << 38;

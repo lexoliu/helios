@@ -24,6 +24,7 @@ use pci_types::{Bar, CommandRegister, ConfigRegionAccess, EndpointHeader, PciAdd
 
 use crate::block::{QueueAffinity, VirtioBlockDevice, VirtioBlockResource};
 use crate::bus::{DeviceBus, DmaPool};
+use crate::iommu::VirtioIommuDevice;
 use crate::net::VirtioNetDevice;
 use crate::p9::Virtio9pDevice;
 use crate::rng::VirtioRngDevice;
@@ -678,6 +679,27 @@ where
 {
     let transport = VirtioPciTransport::new(access, address, mapper, dma, msix_vector)?;
     VirtioBlockDevice::new_resource(transport, cpu, rights)
+}
+
+/// Builds a virtio-iommu driver on top of a modern virtio-PCI function.
+///
+/// The translation unit itself is never confined: it publishes its own
+/// request and event rings at physical addresses, which is why the pool
+/// it is given is the platform's untranslated one.
+pub fn iommu_from_pci<A, M, P>(
+    access: &A,
+    address: PciAddress,
+    mapper: &M,
+    dma: P,
+    msix_vector: Option<u16>,
+) -> IoResult<VirtioIommuDevice<VirtioPciTransport<P>>>
+where
+    A: ConfigRegionAccess,
+    M: PciMmioMapper,
+    P: DmaPool,
+{
+    let transport = VirtioPciTransport::new(access, address, mapper, dma, msix_vector)?;
+    VirtioIommuDevice::new(transport)
 }
 
 /// Builds a virtio-entropy driver on top of a modern virtio-PCI function.

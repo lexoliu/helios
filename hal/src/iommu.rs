@@ -197,6 +197,22 @@ pub trait Iommu: Send + Sync + 'static {
     fn unmap(&self, domain: DomainId, iova: IoVirtAddr, bytes: u64) -> Result<(), IommuError>;
 }
 
+impl From<IommuError> for crate::io::IoError {
+    fn from(error: IommuError) -> Self {
+        match error {
+            IommuError::Unsupported => Self::Unsupported,
+            IommuError::Invalid | IommuError::TooManyWindows => {
+                Self::InvalidDeviceConfig("the IOMMU refused the request as invalid")
+            }
+            IommuError::NotFound => Self::NotFound,
+            IommuError::OutOfRange | IommuError::Unmapped { .. } => Self::OutOfBounds,
+            IommuError::OutOfResources | IommuError::Fault | IommuError::DeviceFault => {
+                Self::DeviceFault
+            }
+        }
+    }
+}
+
 /// One contiguous physical range as a device sees it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DmaWindow {
@@ -289,6 +305,28 @@ impl DmaTranslation {
     /// Total number of physical bytes the device can reach.
     pub fn mapped_bytes(&self) -> u64 {
         self.windows().map(|window| window.bytes).sum()
+    }
+
+    /// The address the device has to issue to reach the `bytes`-long
+    /// range at `physical`.
+    ///
+    /// The whole range has to sit inside one window: a buffer that
+    /// straddled two of them would be contiguous in physical memory but
+    /// not in the device's address space.
+    pub fn device_range(&self, physical: u64, bytes: u64) -> Result<u64, IommuError> {
+        assert!(bytes != 0, "a DMA range covers at least one byte");
+        if self.direct {
+            return Ok(physical);
+        }
+        let last = physical
+            .checked_add(bytes - 1)
+            .ok_or(IommuError::OutOfRange)?;
+        let start = self.device_address(physical)?;
+        let end = self.device_address(last)?;
+        if end - start != bytes - 1 {
+            return Err(IommuError::Unmapped { physical });
+        }
+        Ok(start)
     }
 
     /// The address the device has to issue to reach `physical`.
