@@ -24,23 +24,34 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const CONNECT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Why this host cannot carry the inspector RPC over vsock.
+///
+/// Every variant is part of the typed contract on every host — the tests
+/// below pin the messages and the documentation quotes them wherever the
+/// inspector is built — so each one carries the `cfg_attr` that says
+/// which host can actually construct it.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum VsockUnsupported {
     #[error(
         "vsock needs an AF_VSOCK host socket, which only Linux provides; \
          run this session with --rpc-transport serial"
     )]
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     HostOperatingSystem,
     #[error(
         "vsock needs {VHOST_VSOCK_DEVICE_NAME}, which this host does not expose; \
          load the vhost_vsock kernel module (modprobe vhost_vsock) or run this \
          session with --rpc-transport serial"
     )]
-    // Only the Linux preflight can construct this, but the message is
-    // part of the typed contract on every host: the tests below pin it
-    // and the documentation quotes it wherever the inspector is built.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     VhostDeviceMissing,
+    #[error(
+        "vsock needs {VHOST_VSOCK_DEVICE_NAME} to be readable and writable by this \
+         account, and opening it failed: {0}; the node is created root:kvm mode 0660, \
+         so put this account in the kvm group or relax the node's mode, or run this \
+         session with --rpc-transport serial"
+    )]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    VhostDeviceUnusable(#[source] std::io::Error),
 }
 
 /// Named separately so the message above renders the same path the
@@ -51,12 +62,26 @@ const VHOST_VSOCK_DEVICE_NAME: &str = "/dev/vhost-vsock";
 ///
 /// Called before QEMU is built so an unusable request fails with an
 /// explanation rather than as a QEMU device error.
+///
+/// The check opens the node the way QEMU's vhost backend does rather
+/// than merely testing for its presence: the module's udev rule creates
+/// it root:kvm mode 0660, so an account outside that group finds the
+/// path and still cannot use it. That case used to surface as QEMU
+/// dying during device realization — after the debug serial socket
+/// existed, and before the guest printed a line.
 #[cfg(target_os = "linux")]
 pub(crate) fn preflight() -> Result<(), VsockUnsupported> {
-    if !std::path::Path::new(VHOST_VSOCK_DEVICE_NAME).exists() {
-        return Err(VsockUnsupported::VhostDeviceMissing);
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(VHOST_VSOCK_DEVICE_NAME)
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(VsockUnsupported::VhostDeviceMissing)
+        }
+        Err(error) => Err(VsockUnsupported::VhostDeviceUnusable(error)),
     }
-    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -176,7 +201,7 @@ pub(crate) fn default_guest_cid() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{VsockUnsupported, default_guest_cid, preflight};
+    use super::{VHOST_VSOCK_DEVICE_NAME, VsockUnsupported, default_guest_cid, preflight};
 
     #[test]
     fn every_refusal_names_the_serial_transport_as_the_way_forward() {
@@ -186,6 +211,9 @@ mod tests {
         for refusal in [
             VsockUnsupported::HostOperatingSystem,
             VsockUnsupported::VhostDeviceMissing,
+            VsockUnsupported::VhostDeviceUnusable(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            )),
         ] {
             let message = refusal.to_string();
             assert!(
@@ -193,12 +221,17 @@ mod tests {
                 "refusal does not name the transport that works here: {message}"
             );
         }
-        assert!(
-            VsockUnsupported::VhostDeviceMissing
-                .to_string()
-                .contains("/dev/vhost-vsock"),
-            "a missing vhost device has to name the device node"
-        );
+        for refusal in [
+            VsockUnsupported::VhostDeviceMissing,
+            VsockUnsupported::VhostDeviceUnusable(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            )),
+        ] {
+            assert!(
+                refusal.to_string().contains(VHOST_VSOCK_DEVICE_NAME),
+                "a vhost device refusal has to name the device node: {refusal}"
+            );
+        }
     }
 
     #[test]
@@ -219,8 +252,15 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn a_linux_host_is_judged_by_its_vhost_device() {
-        let expected = std::path::Path::new("/dev/vhost-vsock").exists();
+    fn a_linux_host_is_judged_by_opening_its_vhost_device() {
+        // Presence is not the question the preflight asks: QEMU needs
+        // the node open for read and write, so the verdict has to match
+        // what opening it actually does here.
+        let expected = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(VHOST_VSOCK_DEVICE_NAME)
+            .is_ok();
         assert_eq!(preflight().is_ok(), expected);
     }
 }
