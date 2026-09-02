@@ -72,6 +72,78 @@ jobs:
         working-directory: helios
         run: ${{ matrix.command }}
 
+  smoke-riscv64:
+    name: smoke-riscv64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: ./helios/.github/actions/checkout-wasmtime
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libudev-dev just cmake ninja-build \
+            qemu-system-misc opensbi
+          qemu-system-riscv64 --version
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-tools
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+      - name: Restore WASI tooling artifacts
+        id: artifact-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            helios/artifacts/wasi-tools
+            helios/artifacts/python3-root
+            helios/artifacts/wasix
+          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/Cargo.lock') }}
+      - name: Stage WASI tooling artifacts
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
+        working-directory: helios
+        run: tools/wasi-apps/build.sh
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: helios
+          key: smoke-riscv64
+      - name: Build inspector
+        working-directory: helios
+        run: cargo build --release -p helios-inspector
+      - name: Boot riscv64 guest
+        shell: bash
+        working-directory: helios
+        env:
+          # GitHub runners expose no riscv64 accelerator, so the guest runs
+          # under TCG and needs an emulation-sized bring-up budget.
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' > boot-smoke.out
+          cat boot-smoke.out
+          grep -Fqx ok boot-smoke.out
+      - name: Fetch over virtio-net with curl
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          # curl speaks wasi:http, which the kernel forwards to the
+          # http-client plugin, so both boot programs are required. curl is
+          # invoked by its bootfs path because a PATH-resolved exec currently
+          # reaches the guest with argv[0] duplicated.
+          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --boot-program dash --boot-program debugger \
+            --boot-program curl --boot-program http-client --no-compiler-plugin \
+            shell -c '/bin/curl http://detectportal.firefox.com/success.txt' > curl-smoke.out
+          cat curl-smoke.out
+          grep -Fqx success curl-smoke.out
+
   bench:
     name: bench-${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
