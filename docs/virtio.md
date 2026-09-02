@@ -62,20 +62,34 @@ completion it observes belongs to the request it submitted; the single
 request drivers register a slot in `InFlight` and any woken task drains
 the queue on everyone's behalf.
 
-## Exercising the packed layout under QEMU
+## Exercising the layouts under QEMU
 
-QEMU creates virtio devices with `packed=off` by default, so the guest
-cannot choose the layout — the VM has to be built for it. The inspector
-exposes this as a flag that applies to every virtio device it creates:
+QEMU creates virtio devices with `packed=off` and `in_order=off`, so the
+guest cannot reach either path on its own — the VM has to be built for
+it. The inspector exposes both as flags that apply to every virtio
+device it creates, and they compose:
 
 ```bash
+# Packed ring.
 cargo run -p helios-inspector -- vm --arch aarch64 --virtio-packed \
+    --boot-program dash --boot-program debugger --no-compiler-plugin \
+    shell -c 'echo ok'
+
+# Split ring with batched in-order completions.
+cargo run -p helios-inspector -- vm --arch aarch64 --virtio-in-order \
+    --boot-program dash --boot-program debugger --no-compiler-plugin \
+    shell -c 'echo ok'
+
+# Both at once.
+cargo run -p helios-inspector -- vm --arch aarch64 \
+    --virtio-packed --virtio-in-order \
     --boot-program dash --boot-program debugger --no-compiler-plugin \
     shell -c 'echo ok'
 ```
 
-The same switch is available in a VM config file as `virtio_packed`.
-`indirect_desc`, `event_idx` and `queue_reset` are QEMU defaults and need
-no flag; `in_order` defaults to off and `notification_data` is not
-implemented by QEMU at all, so those two paths are covered by the unit
-tests in `virtio/src/queue/tests.rs` rather than under the VM.
+The same switches are available in a VM config file as `virtio_packed`
+and `virtio_in_order`. `indirect_desc`, `event_idx` and `queue_reset` are
+QEMU defaults and need no flag. `notification_data` has no QEMU property
+at all — QEMU does not implement VIRTIO_F_NOTIFICATION_DATA — so that
+path is covered by the unit tests in `virtio/src/queue/tests.rs` rather
+than under the VM.
