@@ -572,17 +572,6 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         timebase_frequency,
         fdt_addr,
     );
-    // The root DRBG is seeded once, on the bootstrap hart, before
-    // anything can ask for random bytes. RISC-V has no unprivileged
-    // entropy instruction the kernel can rely on, so the seed OpenSBI
-    // leaves in `/chosen/rng-seed` is the platform's pre-boot source;
-    // the entropy device joins it as soon as the executor runs.
-    let root_entropy = (current_hart == bootstrap_processor).then(|| {
-        let root =
-            helios_kernel::seed_root_entropy(&cpu, helios_hal::entropy::device_tree_seed(&fdt));
-        debug_state.install_root_entropy(root.clone());
-        root
-    });
     let mut devices = DeviceInventory::new();
     if debug_transport.is_some() {
         devices = devices.with_debug_serial();
@@ -615,6 +604,19 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         .with_dma_model(DmaModel::Identity)
         .with_devices(devices),
     );
+    // The root DRBG is seeded once, on the bootstrap hart, before
+    // anything can ask for random bytes. RISC-V has no unprivileged
+    // entropy instruction the kernel can rely on, so the seed OpenSBI
+    // leaves in `/chosen/rng-seed` is the platform's pre-boot source;
+    // the entropy device joins it as soon as the executor runs. This
+    // follows `init` so the source line reaches the log the kernel just
+    // installed.
+    let root_entropy = (current_hart == bootstrap_processor).then(|| {
+        let root =
+            helios_kernel::seed_root_entropy(&cpu, helios_hal::entropy::device_tree_seed(&fdt));
+        debug_state.install_root_entropy(root.clone());
+        root
+    });
     // Only the bootstrap hart brings devices up, and it is the hart
     // that holds the root DRBG handle.
     let external_interrupts = root_entropy.and_then(|root_entropy| {

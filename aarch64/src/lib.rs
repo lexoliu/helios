@@ -458,14 +458,6 @@ extern "C" fn aarch64_kernel_main() -> ! {
         || read_counter(),
         Some(write_debug_serial_bytes),
     );
-    // The root DRBG is seeded before any component can ask for random
-    // bytes: `RNDR` where the processor implements it, plus the seed the
-    // bootloader left in `/chosen/rng-seed`. Neither is a fallback for
-    // the other, and the entropy device joins them once the executor
-    // runs.
-    let root_entropy =
-        helios_kernel::seed_root_entropy(&cpu, helios_hal::entropy::device_tree_seed(&boot_fdt));
-    debug_state.install_root_entropy(root_entropy.clone());
     let mut devices = DeviceInventory::new().with_debug_serial();
     if host_fs::has_9p_device(&boot_fdt) {
         devices = devices.with_host_share();
@@ -489,6 +481,15 @@ extern "C" fn aarch64_kernel_main() -> ! {
             .with_dma_model(DmaModel::Translated)
             .with_devices(devices),
     );
+    // The root DRBG is seeded before any component can ask for random
+    // bytes: `RNDR` where the processor implements it, plus the seed the
+    // bootloader left in `/chosen/rng-seed`. Neither is a fallback for
+    // the other, and the entropy device joins them once the executor
+    // runs. This follows `init` so the source line reaches the log the
+    // kernel just installed.
+    let root_entropy =
+        helios_kernel::seed_root_entropy(&cpu, helios_hal::entropy::device_tree_seed(&boot_fdt));
+    debug_state.install_root_entropy(root_entropy.clone());
     let gic = platform_state.install_gic(gic::Gic::new(
         gic::GicRegions::discover(&boot_fdt),
         cpu.processor_count(),
