@@ -7,6 +7,8 @@ mod block;
 mod bus;
 mod console;
 mod discovery;
+mod features;
+mod inflight;
 mod mmio;
 mod net;
 mod notify;
@@ -14,6 +16,8 @@ mod p9;
 mod pci;
 mod queue;
 mod rng;
+#[cfg(test)]
+mod testing;
 mod transport;
 
 pub use block::{
@@ -28,6 +32,7 @@ pub use console::VirtioConsoleDevice;
 pub use discovery::{
     InterruptTrigger, MmioCandidate, MmioInterrupt, mmio_candidates, mmio_device_matches,
 };
+pub use features::{NegotiatedFeatures, RING_FEATURES, negotiate};
 pub use mmio::{
     VirtioMmio9pDevice, VirtioMmioBlockDevice, VirtioMmioConsoleDevice, VirtioMmioNetDevice,
     VirtioMmioRngDevice, block_from_mmio, console_from_mmio, net_from_mmio, net_from_mmio_with_dma,
@@ -41,6 +46,7 @@ pub use pci::{
     PciMmioMapper, VIRTIO_PCI_VENDOR_ID, VirtioPciBus, VirtioPciTransport, net_from_pci,
     p9_from_pci, virtio_pci_device_type,
 };
+pub use queue::{MAX_CHAIN_BUFFERS, VirtQueue, VirtqueueError};
 pub use rng::VirtioRngDevice;
 pub use transport::{
     DeviceStatus, DeviceType, VirtioFeatures, VirtioMmioTransport, VirtioTransport,

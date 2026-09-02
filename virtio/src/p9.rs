@@ -5,12 +5,16 @@ use async_lock::Mutex;
 use core::future::Future;
 use helios_hal::io::{IoError, IoResult};
 
+use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
+use crate::inflight::InFlight;
 use crate::notify::Notify;
 use crate::queue::VirtQueue;
-use crate::transport::{DeviceStatus, DeviceType, VirtioFeatures, VirtioTransport};
+use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 const REQUEST_QUEUE_INDEX: u16 = 0;
 const REQUEST_QUEUE_SIZE: u16 = 16;
+/// One read-only request buffer plus one writable response buffer.
+const REQUEST_CHAIN_LIMIT: u16 = 2;
 const HEADER_SIZE: usize = 7;
 
 /// Thin async wrapper around a virtio-9p request queue.
@@ -21,7 +25,9 @@ const HEADER_SIZE: usize = 7;
 pub struct Virtio9pDevice<T: VirtioTransport> {
     transport: T,
     queue: Mutex<VirtQueue<T>>,
+    inflight: InFlight<{ REQUEST_QUEUE_SIZE as usize }>,
     interrupts: Notify,
+    features: NegotiatedFeatures,
     mount_tag: String,
 }
 
@@ -31,24 +37,7 @@ impl<T: VirtioTransport> Virtio9pDevice<T> {
             return Err(IoError::Unsupported);
         }
 
-        transport.reset();
-        transport.set_status(DeviceStatus::ACKNOWLEDGE);
-        transport.set_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER);
-
-        let offered = transport.device_features();
-        let accepted = offered
-            & (VirtioFeatures::VERSION_1.bits() | VirtioFeatures::RING_INDIRECT_DESC.bits());
-        if accepted & VirtioFeatures::VERSION_1.bits() == 0 {
-            return Err(IoError::Unsupported);
-        }
-
-        transport.set_driver_features(accepted);
-        transport.set_status(
-            DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER | DeviceStatus::FEATURES_OK,
-        );
-        if !transport.status().contains(DeviceStatus::FEATURES_OK) {
-            return Err(IoError::Unsupported);
-        }
+        let features = negotiate(&transport, RING_FEATURES)?;
 
         let queue_size = transport
             .queue_max_size(REQUEST_QUEUE_INDEX)
@@ -57,7 +46,13 @@ impl<T: VirtioTransport> Virtio9pDevice<T> {
             return Err(IoError::Unsupported);
         }
 
-        let queue = VirtQueue::new(&transport, REQUEST_QUEUE_INDEX, queue_size)?;
+        let queue = VirtQueue::new(
+            &transport,
+            REQUEST_QUEUE_INDEX,
+            queue_size,
+            REQUEST_CHAIN_LIMIT,
+            features,
+        )?;
         let mount_tag = read_mount_tag(&transport)?;
 
         transport.set_status(
@@ -70,13 +65,20 @@ impl<T: VirtioTransport> Virtio9pDevice<T> {
         Ok(Self {
             transport,
             queue: Mutex::new(queue),
+            inflight: InFlight::new(),
             interrupts: Notify::new(),
+            features,
             mount_tag,
         })
     }
 
     pub fn mount_tag(&self) -> &str {
         &self.mount_tag
+    }
+
+    /// The feature set this device negotiated.
+    pub fn features(&self) -> NegotiatedFeatures {
+        self.features
     }
 
     /// Interrupt handlers should only acknowledge the device and wake waiters.
@@ -107,14 +109,35 @@ impl<T: VirtioTransport> Virtio9pDevice<T> {
             });
         }
 
-        let mut queue = self.queue.lock().await;
-        let token = queue.submit(&self.transport, &[request], &mut [response])?;
-        queue.notify(&self.transport);
+        let token = {
+            let mut queue = self.queue.lock().await;
+            let token = queue.submit(&self.transport, &[request], &mut [response])?;
+            queue.notify(&self.transport);
+            // Claiming the slot under the queue lock is what makes the
+            // completion reachable: no other task can drain this token
+            // before the waiter exists.
+            self.inflight.register(token);
+            token
+        };
 
         let used_len = loop {
-            if let Some((used, len)) = queue.pop_used_with_len() {
-                assert_eq!(used, token, "virtio 9p completion token mismatch");
+            if let Some(len) = self.inflight.take(token) {
                 break len;
+            }
+
+            // Any woken task drains: with EVENT_IDX and IN_ORDER the
+            // device may finish requests in an order that has nothing to
+            // do with which task is awake, so completions are routed by
+            // token rather than assumed to be the caller's own.
+            let drained = match self.queue.try_lock() {
+                Some(mut queue) => {
+                    queue.drain_used(|token, len| self.inflight.complete(token, len))
+                }
+                None => 0,
+            };
+            if drained != 0 {
+                self.interrupts.notify_all();
+                continue;
             }
 
             wait().await;
@@ -128,6 +151,12 @@ impl<T: VirtioTransport> Virtio9pDevice<T> {
         }
 
         Ok(used_len)
+    }
+}
+
+impl<T: VirtioTransport> Drop for Virtio9pDevice<T> {
+    fn drop(&mut self) {
+        self.queue.get_mut().shutdown(&self.transport);
     }
 }
 

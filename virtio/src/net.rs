@@ -12,11 +12,19 @@ use core::ops::Range;
 use helios_hal::io::{IoError, IoResult};
 use spin::Mutex as SpinMutex;
 
+use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
 use crate::notify::Notify;
 use crate::queue::VirtQueue;
-use crate::transport::{DeviceStatus, DeviceType, VirtioFeatures, VirtioTransport};
+use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 const NET_QUEUE_SIZE: u16 = 256;
+/// Receive buffers are always a single writable descriptor.
+const RX_CHAIN_LIMIT: u16 = 1;
+/// A transmit frame is either one slot-resident buffer or a slot-resident
+/// header prefix chained to an external payload.
+const TX_CHAIN_LIMIT: u16 = 2;
+/// A control command is a read-only command buffer plus a writable ack.
+const CONTROL_CHAIN_LIMIT: u16 = 2;
 const DESCRIPTOR_BITSET_WORDS: usize =
     (NET_QUEUE_SIZE as usize + usize::BITS as usize - 1) / usize::BITS as usize;
 const ETH_HEADER_LEN: usize = 14;
@@ -183,16 +191,24 @@ struct VirtioNetHeader {
 
 struct NetRxState<T: VirtioTransport> {
     rx_queue: VirtQueue<T>,
+    /// Receive slots currently owned by the device, indexed by slot.
     rx_in_device: DescriptorBitSet,
+    /// Which receive slot each in-flight descriptor identifier carries.
+    ///
+    /// Descriptor identifiers are owned by the ring, which hands them out
+    /// in its own order, so a slot keeps no permanent identifier: the
+    /// mapping is recorded when a buffer is posted and read back when the
+    /// device completes it.
+    rx_slot_for_token: Box<[u16]>,
 }
 
-struct RxReturnedTokens {
-    tokens: SpinMutex<Vec<u16>>,
+struct RxReturnedSlots {
+    slots: SpinMutex<Vec<u16>>,
 }
 
 struct RxBufferSlot {
-    token: u16,
-    returned: Arc<RxReturnedTokens>,
+    slot: u16,
+    returned: Arc<RxReturnedSlots>,
     buffer: UnsafeCell<Box<[u8]>>,
 }
 
@@ -214,7 +230,7 @@ struct NetTxState<T: VirtioTransport> {
 /// SpinMutex / async lock.
 struct NetQueuePair<T: VirtioTransport> {
     rx_state: AsyncMutex<NetRxState<T>>,
-    rx_returned: Arc<RxReturnedTokens>,
+    rx_returned: Arc<RxReturnedSlots>,
     rx_slots: Box<[Arc<RxBufferSlot>]>,
     tx_state: SpinMutex<NetTxState<T>>,
 }
@@ -243,6 +259,7 @@ pub struct VirtioNetDevice<T: VirtioTransport> {
     control: Option<SpinMutex<NetControlState<T>>>,
     rx_buffer_len: usize,
     interrupts: Notify,
+    features: NegotiatedFeatures,
     mac_address: [u8; 6],
     max_frame_len: usize,
     header_len: usize,
@@ -285,7 +302,7 @@ impl AsRef<[u8]> for RxFrameOwner {
 
 impl Drop for RxFrameOwner {
     fn drop(&mut self) {
-        self.slot.returned.tokens.lock().push(self.slot.token);
+        self.slot.returned.slots.lock().push(self.slot.slot);
     }
 }
 
@@ -305,10 +322,6 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             return Err(IoError::Unsupported);
         }
 
-        transport.reset();
-        transport.set_status(DeviceStatus::ACKNOWLEDGE);
-        transport.set_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER);
-
         let offered = transport.device_features();
         // Only ask for MQ together with CTRL_VQ — without the
         // control queue there is no way to enable additional pairs
@@ -324,32 +337,23 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let tso_supported = offered & NET_FEATURE_CSUM != 0
             && offered & (NET_FEATURE_HOST_TSO4 | NET_FEATURE_HOST_TSO6) != 0;
         let tso_mask = if tso_supported {
-            offered & (NET_FEATURE_HOST_TSO4 | NET_FEATURE_HOST_TSO6)
+            NET_FEATURE_HOST_TSO4 | NET_FEATURE_HOST_TSO6
         } else {
             0
         };
-        let accepted = offered
-            & (VirtioFeatures::VERSION_1.bits()
-                | VirtioFeatures::RING_EVENT_IDX.bits()
+        let features = negotiate(
+            &transport,
+            RING_FEATURES
                 | NET_FEATURE_CSUM
                 | NET_FEATURE_MAC
                 | NET_FEATURE_STATUS
                 | NET_FEATURE_MTU
                 | mq_mask
-                | tso_mask);
-        if accepted & VirtioFeatures::VERSION_1.bits() == 0 {
-            return Err(IoError::Unsupported);
-        }
-        transport.set_driver_features(accepted);
-        transport.set_status(
-            DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER | DeviceStatus::FEATURES_OK,
-        );
-        if !transport.status().contains(DeviceStatus::FEATURES_OK) {
-            return Err(IoError::Unsupported);
-        }
+                | tso_mask,
+        )?;
 
         let mac_address = read_mac_address(&transport);
-        let ip_mtu = read_mtu(&transport, accepted);
+        let ip_mtu = read_mtu(&transport, features);
         let max_frame_len = ip_mtu
             .checked_add(ETH_HEADER_LEN)
             .ok_or(IoError::DeviceFault)?;
@@ -361,7 +365,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             .checked_add(max_frame_len)
             .ok_or(IoError::DeviceFault)?;
 
-        let pair_count = if accepted & NET_FEATURE_MQ != 0 {
+        let pair_count = if features.device(NET_FEATURE_MQ) {
             let device_max = read_max_virtqueue_pairs(&transport);
             device_max.clamp(1, NET_MAX_QUEUE_PAIRS)
         } else {
@@ -385,40 +389,45 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 return Err(IoError::Unsupported);
             }
 
-            let event_idx = accepted & VirtioFeatures::RING_EVENT_IDX.bits() != 0;
-            let mut rx_queue = VirtQueue::new(&transport, rx_queue_index, rx_queue_size)?;
-            rx_queue.set_event_idx(event_idx);
-            let mut tx_queue = VirtQueue::new(&transport, tx_queue_index, tx_queue_size)?;
-            tx_queue.set_event_idx(event_idx);
+            let mut rx_queue = VirtQueue::new(
+                &transport,
+                rx_queue_index,
+                rx_queue_size,
+                RX_CHAIN_LIMIT,
+                features,
+            )?;
+            let tx_queue = VirtQueue::new(
+                &transport,
+                tx_queue_index,
+                tx_queue_size,
+                TX_CHAIN_LIMIT,
+                features,
+            )?;
             let rx_buffer_count = usize::from(rx_queue_size);
-            let rx_returned = Arc::new(RxReturnedTokens {
-                tokens: SpinMutex::new(Vec::with_capacity(rx_buffer_count)),
+            let rx_returned = Arc::new(RxReturnedSlots {
+                slots: SpinMutex::new(Vec::with_capacity(rx_buffer_count)),
             });
             let mut rx_slots: Vec<Arc<RxBufferSlot>> = Vec::with_capacity(rx_buffer_count);
-            for token_index in 0..rx_buffer_count {
-                let token = u16::try_from(token_index).map_err(|_| IoError::DeviceFault)?;
+            for slot_index in 0..rx_buffer_count {
+                let slot = u16::try_from(slot_index).map_err(|_| IoError::DeviceFault)?;
                 rx_slots.push(Arc::new(RxBufferSlot {
-                    token,
+                    slot,
                     returned: rx_returned.clone(),
                     buffer: UnsafeCell::new(vec![0_u8; rx_buffer_len].into_boxed_slice()),
                 }));
             }
             let mut rx_in_device = DescriptorBitSet::new(rx_buffer_count);
-            for _ in 0..usize::from(rx_queue_size) {
-                let token = rx_queue.next_free_descriptor();
-                let token_index = usize::from(token);
-                let submitted_token =
-                    rx_queue.submit(&transport, &[], &mut [rx_slots[token_index].buffer_mut()])?;
-                assert_eq!(
-                    submitted_token, token,
-                    "virtio net RX descriptor allocation moved while buffer was prepared"
-                );
+            let mut rx_slot_for_token = vec![0_u16; usize::from(rx_queue_size)].into_boxed_slice();
+            for (slot_index, slot) in rx_slots.iter().enumerate() {
+                let token = rx_queue.submit_output_deferred(&transport, slot.buffer_mut())?;
+                rx_slot_for_token[usize::from(token)] = slot.slot;
                 assert!(
-                    !rx_in_device.get(token_index),
-                    "virtio net RX token was allocated twice during initialization"
+                    !rx_in_device.get(slot_index),
+                    "virtio net RX slot was posted twice during initialization"
                 );
-                rx_in_device.set(token_index);
+                rx_in_device.set(slot_index);
             }
+            rx_queue.publish();
             let tx_buffer_count = usize::from(tx_queue_size);
             let tx_buffers = vec![
                 0_u8;
@@ -433,6 +442,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 rx_state: AsyncMutex::new(NetRxState {
                     rx_queue,
                     rx_in_device,
+                    rx_slot_for_token,
                 }),
                 rx_returned,
                 rx_slots: rx_slots.into_boxed_slice(),
@@ -448,8 +458,8 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         // Optional control queue. Allocated AFTER all RX/TX queues
         // because virtio places it at index 2*max_pairs, not
         // immediately after the queues we activated.
-        let control = if accepted & NET_FEATURE_CTRL_VQ != 0 {
-            let device_max = if accepted & NET_FEATURE_MQ != 0 {
+        let control = if features.device(NET_FEATURE_CTRL_VQ) {
+            let device_max = if features.device(NET_FEATURE_MQ) {
                 read_max_virtqueue_pairs(&transport).max(1)
             } else {
                 1
@@ -457,8 +467,13 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             let ctrl_index = device_max * 2;
             let ctrl_size = transport.queue_max_size(ctrl_index).min(NET_QUEUE_SIZE);
             if ctrl_size != 0 && ctrl_size.is_power_of_two() {
-                let mut queue = VirtQueue::new(&transport, ctrl_index, ctrl_size)?;
-                queue.set_event_idx(accepted & VirtioFeatures::RING_EVENT_IDX.bits() != 0);
+                let queue = VirtQueue::new(
+                    &transport,
+                    ctrl_index,
+                    ctrl_size,
+                    CONTROL_CHAIN_LIMIT,
+                    features,
+                )?;
                 let cmd_buffer = vec![0u8; CTRL_CMD_MAX_BYTES].into_boxed_slice();
                 let ack_buffer = vec![0u8; 1].into_boxed_slice();
                 Some(SpinMutex::new(NetControlState {
@@ -496,19 +511,20 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             control,
             rx_buffer_len,
             interrupts: Notify::new(),
+            features,
             mac_address,
             max_frame_len,
             header_len,
-            tx_checksum_negotiated: accepted & NET_FEATURE_CSUM != 0,
-            tso_v4_negotiated: accepted & NET_FEATURE_HOST_TSO4 != 0,
-            tso_v6_negotiated: accepted & NET_FEATURE_HOST_TSO6 != 0,
+            tx_checksum_negotiated: features.device(NET_FEATURE_CSUM),
+            tso_v4_negotiated: features.device(NET_FEATURE_HOST_TSO4),
+            tso_v6_negotiated: features.device(NET_FEATURE_HOST_TSO6),
         };
 
         // Activate every queue pair on the device side. The device
         // ships with a single pair active by default; without this
         // command extra RX queues we just allocated would not
         // receive traffic.
-        if accepted & NET_FEATURE_MQ != 0 && device.queue_pair_count() > 1 {
+        if features.device(NET_FEATURE_MQ) && device.queue_pair_count() > 1 {
             device.send_set_vq_pairs(device.queue_pair_count())?;
         }
         Ok(device)
@@ -536,6 +552,11 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
 
     pub fn queue_pair_count(&self) -> usize {
         self.queue_pairs.len()
+    }
+
+    /// The feature set this device negotiated.
+    pub fn features(&self) -> NegotiatedFeatures {
+        self.features
     }
 
     fn send_set_vq_pairs(&self, pairs: usize) -> IoResult<()> {
@@ -615,21 +636,21 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
             return Ok(None);
         };
-        Self::mark_rx_completed(&mut state, token);
+        let slot_index = Self::complete_rx_slot(&mut state, token);
         let used_len = used_len as usize;
         if used_len < self.header_len || used_len > self.rx_buffer_len {
-            self.repost_rx_buffer(PAIR, &mut state, token)?;
+            self.repost_rx_buffer(PAIR, &mut state, slot_index)?;
             return Err(IoError::DeviceFault);
         }
 
         let frame_len = used_len - self.header_len;
         if frame_len > output.len() {
-            self.repost_rx_buffer(PAIR, &mut state, token)?;
+            self.repost_rx_buffer(PAIR, &mut state, slot_index)?;
             return Err(IoError::OutOfBounds);
         }
-        let slot = &self.queue_pairs[PAIR].rx_slots[usize::from(token)];
+        let slot = &self.queue_pairs[PAIR].rx_slots[usize::from(slot_index)];
         output[..frame_len].copy_from_slice(&slot.buffer()[self.header_len..used_len]);
-        self.repost_rx_buffer(PAIR, &mut state, token)?;
+        self.repost_rx_buffer(PAIR, &mut state, slot_index)?;
         Ok(Some(frame_len))
     }
 
@@ -640,14 +661,14 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
             return Ok(None);
         };
-        Self::mark_rx_completed(&mut state, token);
+        let slot_index = Self::complete_rx_slot(&mut state, token);
         let used_len = used_len as usize;
         if used_len < self.header_len || used_len > self.rx_buffer_len {
-            self.repost_rx_buffer(PAIR, &mut state, token)?;
+            self.repost_rx_buffer(PAIR, &mut state, slot_index)?;
             return Err(IoError::DeviceFault);
         }
 
-        Ok(Some(self.rx_frame_from_slot(PAIR, token, used_len)))
+        Ok(Some(self.rx_frame_from_slot(PAIR, slot_index, used_len)))
     }
 
     pub fn try_receive_frames_immediate(
@@ -701,16 +722,16 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             let Some((token, used_len)) = state.rx_queue.pop_used_with_len() else {
                 break;
             };
-            Self::mark_rx_completed(state, token);
+            let slot_index = Self::complete_rx_slot(state, token);
             let used_len = used_len as usize;
             if used_len < self.header_len || used_len > self.rx_buffer_len {
-                self.repost_rx_buffer(pair_idx, state, token)?;
+                self.repost_rx_buffer(pair_idx, state, slot_index)?;
                 return Err(IoError::DeviceFault);
             }
 
             let slot = &mut frames[received];
             assert!(slot.is_none(), "virtio net RX batch slot was not empty");
-            *slot = Some(self.rx_frame_from_slot(pair_idx, token, used_len));
+            *slot = Some(self.rx_frame_from_slot(pair_idx, slot_index, used_len));
             received += 1;
         }
         Ok(received)
@@ -993,12 +1014,11 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 "virtio net TX descriptor allocation moved while payload was prepared"
             );
             tx_in_flight.set(token_index);
-            tx_queue.stage_deferred_head(token);
             submitted += 1;
             *next_frame += 1;
         }
         if submitted != 0 {
-            tx_queue.publish_deferred_heads();
+            tx_queue.publish();
             tx_queue.notify(&self.transport);
         }
         Ok(submitted)
@@ -1094,12 +1114,11 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 "virtio net TX descriptor allocation moved while scatter frame was prepared"
             );
             tx_in_flight.set(token_index);
-            tx_queue.stage_deferred_head(token);
             tokens[submitted] = Some(token);
             submitted += 1;
         }
         if submitted != 0 {
-            tx_queue.publish_deferred_heads();
+            tx_queue.publish();
             tx_queue.notify(&self.transport);
         }
         Ok(Some(submitted))
@@ -1137,9 +1156,9 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         self.interrupts.notified().await;
     }
 
-    fn rx_frame_from_slot(&self, pair_idx: usize, token: u16, used_len: usize) -> RxFrame {
+    fn rx_frame_from_slot(&self, pair_idx: usize, slot_index: u16, used_len: usize) -> RxFrame {
         Bytes::from_owner(RxFrameOwner {
-            slot: self.queue_pairs[pair_idx].rx_slots[usize::from(token)].clone(),
+            slot: self.queue_pairs[pair_idx].rx_slots[usize::from(slot_index)].clone(),
             range: self.header_len..used_len,
         })
     }
@@ -1150,14 +1169,14 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         state: &mut NetRxState<T>,
     ) -> IoResult<()> {
         let returned = &self.queue_pairs[pair_idx].rx_returned;
-        let mut tokens = returned.tokens.lock();
-        if tokens.is_empty() {
+        let mut slots = returned.slots.lock();
+        if slots.is_empty() {
             return Ok(());
         }
-        while let Some(token) = tokens.pop() {
-            self.repost_rx_buffer_deferred(pair_idx, state, token)?;
+        while let Some(slot_index) = slots.pop() {
+            self.repost_rx_buffer_deferred(pair_idx, state, slot_index)?;
         }
-        state.rx_queue.publish_deferred_heads();
+        state.rx_queue.publish();
         // Kick the device: after the RX ring runs dry QEMU re-enables
         // notification and parks arrived packets until the guest signals
         // fresh buffers, so an unkicked repost leaves the receive path
@@ -1170,15 +1189,11 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         &self,
         pair_idx: usize,
         state: &mut NetRxState<T>,
-        token: u16,
+        slot_index: u16,
     ) -> IoResult<()> {
-        let submitted_token = self.repost_rx_buffer_deferred(pair_idx, state, token)?;
-        state.rx_queue.publish_deferred_heads();
+        self.repost_rx_buffer_deferred(pair_idx, state, slot_index)?;
+        state.rx_queue.publish();
         state.rx_queue.notify(&self.transport);
-        assert_eq!(
-            submitted_token, token,
-            "virtio net RX descriptor allocation moved while buffer was reposted"
-        );
         Ok(())
     }
 
@@ -1186,29 +1201,36 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         &self,
         pair_idx: usize,
         state: &mut NetRxState<T>,
-        token: u16,
-    ) -> IoResult<u16> {
-        let token_index = usize::from(token);
+        slot_index: u16,
+    ) -> IoResult<()> {
+        let slot = usize::from(slot_index);
         assert!(
-            !state.rx_in_device.get(token_index),
+            !state.rx_in_device.get(slot),
             "virtio net RX buffer was reposted while still owned by the device"
         );
-        let submitted_token = state.rx_queue.submit_output_at_deferred(
+        let token = state.rx_queue.submit_output_deferred(
             &self.transport,
-            token,
-            self.queue_pairs[pair_idx].rx_slots[token_index].buffer_mut(),
+            self.queue_pairs[pair_idx].rx_slots[slot].buffer_mut(),
         )?;
-        state.rx_in_device.set(token_index);
-        Ok(submitted_token)
+        state.rx_slot_for_token[usize::from(token)] = slot_index;
+        state.rx_in_device.set(slot);
+        Ok(())
     }
 
-    fn mark_rx_completed(state: &mut NetRxState<T>, token: u16) {
-        let token_index = usize::from(token);
+    /// Resolves a completed descriptor identifier back to the receive
+    /// slot it was carrying and marks that slot as driver-owned again.
+    fn complete_rx_slot(state: &mut NetRxState<T>, token: u16) -> u16 {
+        let slot_index = *state
+            .rx_slot_for_token
+            .get(usize::from(token))
+            .unwrap_or_else(|| panic!("virtio net RX completion named unknown descriptor {token}"));
+        let slot = usize::from(slot_index);
         assert!(
-            state.rx_in_device.get(token_index),
-            "virtio net RX completion referenced an idle token {token}"
+            state.rx_in_device.get(slot),
+            "virtio net RX completion referenced an idle slot {slot_index}"
         );
-        state.rx_in_device.clear(token_index);
+        state.rx_in_device.clear(slot);
+        slot_index
     }
 
     fn drain_tx_completions(state: &mut NetTxState<T>, budget: usize) -> usize {
@@ -1233,6 +1255,21 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             return 0;
         }
         Self::drain_tx_completions(state, budget.max(1))
+    }
+}
+
+impl<T: VirtioTransport> Drop for VirtioNetDevice<T> {
+    fn drop(&mut self) {
+        // The driver owns the transport, so releasing the device-side
+        // queues belongs here rather than inside the queue: a queue has
+        // no way to reach the register that resets it.
+        for pair in self.queue_pairs.iter_mut() {
+            pair.rx_state.get_mut().rx_queue.shutdown(&self.transport);
+            pair.tx_state.get_mut().tx_queue.shutdown(&self.transport);
+        }
+        if let Some(control) = self.control.as_mut() {
+            control.get_mut().queue.shutdown(&self.transport);
+        }
     }
 }
 
@@ -1287,8 +1324,8 @@ fn read_mac_address<T: VirtioTransport>(transport: &T) -> [u8; 6] {
     [low[0], low[1], low[2], low[3], high[0], high[1]]
 }
 
-fn read_mtu<T: VirtioTransport>(transport: &T, accepted_features: u64) -> usize {
-    if accepted_features & NET_FEATURE_MTU == 0 {
+fn read_mtu<T: VirtioTransport>(transport: &T, features: NegotiatedFeatures) -> usize {
+    if !features.device(NET_FEATURE_MTU) {
         return DEFAULT_IP_MTU;
     }
 
