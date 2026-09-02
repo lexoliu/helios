@@ -438,6 +438,10 @@ impl<T: VirtioTransport> VsockDevice for VirtioVsockDevice<T> {
             return Err(IoError::OutOfBounds);
         }
         loop {
+            // Armed before the rings are drained: a packet that the
+            // device publishes in between belongs to this wait, not to
+            // the next interrupt.
+            let notified = self.interrupts.notified();
             if let Some(mut event) = self.event.try_lock()
                 && Self::drain_events(&mut event, &self.transport)?
             {
@@ -452,8 +456,7 @@ impl<T: VirtioTransport> VsockDevice for VirtioVsockDevice<T> {
                     return Ok(VsockDelivery::Packet(received));
                 }
             }
-            tracing::info!("virtio-vsock receive ring empty; waiting for the device");
-            self.interrupts.notified().await;
+            notified.await;
         }
     }
 }
