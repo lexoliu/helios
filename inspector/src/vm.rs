@@ -21,6 +21,15 @@ use tempfile::TempDir;
 use crate::workload_bench::{VmProvenance, WorkloadBenchCommand};
 use crate::{SessionCommand, connect_client, run_connected};
 
+mod network;
+mod qemu;
+
+use network::{
+    HostPlatform, NetSetupCommand, NetTeardownCommand, QemuNetArgs, VmNetwork, VmNetworkArgs,
+    VmNetworkFile, VmNetworkProfile,
+};
+use qemu::QemuOptions;
+
 const DEFAULT_BAUD: u32 = 115_200;
 const DEFAULT_AARCH64_QEMU_BIN: &str = "qemu-system-aarch64";
 const DEFAULT_RISCV_QEMU_BIN: &str = "qemu-system-riscv64";
@@ -67,12 +76,6 @@ enum VmBootArtifactKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VmConsoleProfile {
     SerialUnixSocket,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VmNetworkProfile {
-    VirtioMmioUser,
-    VirtioPciUser,
 }
 
 /// How a profile attaches the image the guest firmware boots from.
@@ -159,7 +162,7 @@ const AARCH64_VIRT_HVF_PROFILE: VmProfile = VmProfile {
     default_cpu: Some("host"),
     boot_artifact: VmBootArtifactKind::LimineUefiDiskImage,
     console: VmConsoleProfile::SerialUnixSocket,
-    network: Some(VmNetworkProfile::VirtioMmioUser),
+    network: Some(VmNetworkProfile::VirtioMmio),
     boot_disk: Some(VmBootDiskProfile::VirtioPci),
     data_disk: VmDataDiskProfile::VirtioMmio,
     host_share: Some(VmHostShareProfile::Virtio9pMmio),
@@ -181,7 +184,7 @@ const AARCH64_VIRT_TCG_PROFILE: VmProfile = VmProfile {
     default_cpu: Some("max"),
     boot_artifact: VmBootArtifactKind::LimineUefiDiskImage,
     console: VmConsoleProfile::SerialUnixSocket,
-    network: Some(VmNetworkProfile::VirtioMmioUser),
+    network: Some(VmNetworkProfile::VirtioMmio),
     boot_disk: Some(VmBootDiskProfile::VirtioPci),
     data_disk: VmDataDiskProfile::VirtioMmio,
     host_share: Some(VmHostShareProfile::Virtio9pMmio),
@@ -202,7 +205,7 @@ const RISCV64_VM_PROFILE: VmProfile = VmProfile {
     default_cpu: None,
     boot_artifact: VmBootArtifactKind::KernelBinary,
     console: VmConsoleProfile::SerialUnixSocket,
-    network: Some(VmNetworkProfile::VirtioMmioUser),
+    network: Some(VmNetworkProfile::VirtioMmio),
     boot_disk: None,
     data_disk: VmDataDiskProfile::VirtioMmio,
     host_share: Some(VmHostShareProfile::Virtio9pMmio),
@@ -223,7 +226,7 @@ const X86_64_VM_PROFILE: VmProfile = VmProfile {
     default_cpu: Some("host"),
     boot_artifact: VmBootArtifactKind::LimineUefiDiskImage,
     console: VmConsoleProfile::SerialUnixSocket,
-    network: Some(VmNetworkProfile::VirtioPciUser),
+    network: Some(VmNetworkProfile::VirtioPci),
     boot_disk: Some(VmBootDiskProfile::VirtioPci),
     data_disk: VmDataDiskProfile::VirtioPci,
     host_share: Some(VmHostShareProfile::Virtio9pPci),
@@ -265,13 +268,14 @@ pub(crate) struct VirtioQueueProfile {
 }
 
 impl VirtioQueueProfile {
-    /// Device property suffix that selects this profile.
-    fn device_properties(self) -> &'static str {
-        match (self.ring, self.completion) {
-            (VirtioRingLayout::Split, VirtioCompletionOrder::Unordered) => "",
-            (VirtioRingLayout::Split, VirtioCompletionOrder::InOrder) => ",in_order=on",
-            (VirtioRingLayout::Packed, VirtioCompletionOrder::Unordered) => ",packed=on",
-            (VirtioRingLayout::Packed, VirtioCompletionOrder::InOrder) => ",packed=on,in_order=on",
+    /// Adds the device properties that select this profile to a device
+    /// option list.
+    fn apply(self, options: &mut QemuOptions) {
+        if self.ring == VirtioRingLayout::Packed {
+            options.set("packed", "on");
+        }
+        if self.completion == VirtioCompletionOrder::InOrder {
+            options.set("in_order", "on");
         }
     }
 }
@@ -334,6 +338,8 @@ pub(crate) struct VmConfigFile {
     pub(crate) virtio_packed: Option<bool>,
     #[serde(default)]
     pub(crate) virtio_in_order: Option<bool>,
+    #[serde(default)]
+    pub(crate) network: VmNetworkFile,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -457,6 +463,9 @@ pub(crate) struct VmCommand {
     #[arg(long, default_value_t = false)]
     virtio_in_order: bool,
 
+    #[command(flatten)]
+    network: VmNetworkArgs,
+
     #[command(subcommand)]
     command: Option<VmSessionCommand>,
 }
@@ -469,6 +478,10 @@ enum VmSessionCommand {
     Repl,
     AotBench(AotBenchCommand),
     WorkloadBench(WorkloadBenchCommand),
+    /// Provision the privileged host state a network backend needs.
+    NetSetup(NetSetupCommand),
+    /// Remove the host state `net-setup` provisioned.
+    NetTeardown(NetTeardownCommand),
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -541,6 +554,8 @@ struct ResolvedVmCommand {
     runtime_dir: Option<PathBuf>,
     keep_runtime_dir: bool,
     virtio_queues: VirtioQueueProfile,
+    network: VmNetwork,
+    qemu_net: Option<QemuNetArgs>,
     command: Option<ResolvedVmSessionCommand>,
 }
 
@@ -551,7 +566,16 @@ enum ResolvedVmSessionCommand {
     WorkloadBench(WorkloadBenchCommand),
 }
 
-pub(crate) fn run(command: VmCommand) -> Result<()> {
+pub(crate) fn run(mut command: VmCommand) -> Result<()> {
+    // The privileged network helpers provision the host, they do not boot
+    // a guest, so they are dispatched before any build or QEMU work.
+    match command.command.take() {
+        Some(VmSessionCommand::NetSetup(setup)) => return Ok(network::run_setup(setup)?),
+        Some(VmSessionCommand::NetTeardown(teardown)) => {
+            return Ok(network::run_teardown(teardown)?);
+        }
+        session => command.command = session,
+    }
     let command = resolve(command)?;
     ensure_qemu_command(&command)?;
     if !command.no_build {
@@ -666,6 +690,12 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
         },
     };
 
+    let network = VmNetwork::resolve(command.network, file.network);
+    let qemu_net = profile
+        .network
+        .map(|device| network.render(device, virtio_queues, smp, HostPlatform::current()))
+        .transpose()?;
+
     Ok(ResolvedVmCommand {
         profile,
         release,
@@ -697,6 +727,8 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
         runtime_dir,
         keep_runtime_dir,
         virtio_queues,
+        network,
+        qemu_net,
         command: session_command,
     })
 }
@@ -787,6 +819,13 @@ fn ensure_qemu_command(command: &ResolvedVmCommand) -> Result<()> {
         && std::env::consts::ARCH != "aarch64"
     {
         bail!("aarch64-virt-hvf requires an aarch64 host; pass --accel tcg explicitly for TCG");
+    }
+    // Host state the selected backend depends on is checked before the
+    // kernel build, so a missing tap costs seconds rather than a rebuild.
+    if let Some(qemu_net) = &command.qemu_net {
+        command
+            .network
+            .preflight(&command.qemu_bin, qemu_net.queue_pairs())?;
     }
     Ok(())
 }
@@ -1381,11 +1420,17 @@ impl VmRuntime {
         let artifact = prepare_boot_artifact(command, Some(runtime_dir.path()))?;
         let data_disk = prepare_data_disk(command, runtime_dir.path())?;
 
-        let spinner = spinner(&format!(
-            "starting QEMU for {}",
-            arch_label(command.profile.arch)
-        ));
-        let mut qemu = Command::new(&command.qemu_bin);
+        let spinner = spinner(&match &command.qemu_net {
+            Some(qemu_net) => format!(
+                "starting QEMU for {} with {qemu_net}",
+                arch_label(command.profile.arch)
+            ),
+            None => format!("starting QEMU for {}", arch_label(command.profile.arch)),
+        });
+        let mut qemu = match &command.qemu_net {
+            Some(qemu_net) => qemu_net.command(&command.qemu_bin),
+            None => Command::new(&command.qemu_bin),
+        };
         qemu.arg("-display").arg("none");
         if let Some(monitor) = monitor_endpoint(command, runtime_dir.path()) {
             qemu.arg("-monitor").arg(monitor);
@@ -1455,8 +1500,8 @@ impl VmRuntime {
             }
             VmBootArtifactKind::LimineUefiDiskImage => {}
         }
-        if let Some(network) = command.profile.network {
-            configure_network_device(&mut qemu, network, command.virtio_queues);
+        if let Some(qemu_net) = &command.qemu_net {
+            qemu_net.apply(&mut qemu);
         }
         if let Some(boot_disk) = command.profile.boot_disk {
             configure_boot_disk(&mut qemu, boot_disk, &artifact, command.virtio_queues);
@@ -1823,25 +1868,6 @@ fn edk2_vars_filenames(arch: VmArch) -> impl Iterator<Item = &'static str> {
     names.iter().copied()
 }
 
-fn configure_network_device(
-    qemu: &mut Command,
-    network: VmNetworkProfile,
-    queues: VirtioQueueProfile,
-) {
-    qemu.arg("-netdev").arg("user,id=net0");
-    let properties = queues.device_properties();
-    match network {
-        VmNetworkProfile::VirtioMmioUser => {
-            qemu.arg("-device")
-                .arg(format!("virtio-net-device,netdev=net0{properties}"));
-        }
-        VmNetworkProfile::VirtioPciUser => {
-            qemu.arg("-device")
-                .arg(format!("virtio-net-pci,netdev=net0{properties}"));
-        }
-    }
-}
-
 /// Attaches the image the guest firmware boots from.
 ///
 /// The guest kernel must never write to it, which is why it carries no
@@ -1852,18 +1878,19 @@ fn configure_boot_disk(
     boot_artifact: &Path,
     queues: VirtioQueueProfile,
 ) {
-    let properties = queues.device_properties();
-    match boot_disk {
-        VmBootDiskProfile::VirtioPci => {
-            qemu.arg("-drive").arg(format!(
-                "if=none,format=raw,file={},id=bootdisk",
-                boot_artifact.display()
-            ));
-            qemu.arg("-device").arg(format!(
-                "virtio-blk-pci,drive=bootdisk,bootindex=0{properties}"
-            ));
-        }
-    }
+    let mut drive = QemuOptions::keyed();
+    drive.set("if", "none");
+    drive.set("format", "raw");
+    drive.set("file", boot_artifact.display());
+    drive.set("id", "bootdisk");
+    qemu.arg("-drive").arg(drive.to_string());
+    let mut device = QemuOptions::new(match boot_disk {
+        VmBootDiskProfile::VirtioPci => "virtio-blk-pci",
+    });
+    device.set("drive", "bootdisk");
+    device.set("bootindex", 0);
+    queues.apply(&mut device);
+    qemu.arg("-device").arg(device.to_string());
 }
 
 /// Attaches the scratch disk the guest kernel owns.
@@ -1876,18 +1903,20 @@ fn configure_data_disk(
     image: &Path,
     queues: VirtioQueueProfile,
 ) {
-    let properties = queues.device_properties();
-    qemu.arg("-drive").arg(format!(
-        "if=none,format=raw,file={},id=data",
-        image.display()
-    ));
-    let device = match data_disk {
+    let mut drive = QemuOptions::keyed();
+    drive.set("if", "none");
+    drive.set("format", "raw");
+    drive.set("file", image.display());
+    drive.set("id", "data");
+    qemu.arg("-drive").arg(drive.to_string());
+    let mut device = QemuOptions::new(match data_disk {
         VmDataDiskProfile::VirtioMmio => "virtio-blk-device",
         VmDataDiskProfile::VirtioPci => "virtio-blk-pci",
-    };
-    qemu.arg("-device").arg(format!(
-        "{device},drive=data,serial={DATA_DISK_SERIAL}{properties}"
-    ));
+    });
+    device.set("drive", "data");
+    device.set("serial", DATA_DISK_SERIAL);
+    queues.apply(&mut device);
+    qemu.arg("-device").arg(device.to_string());
 }
 
 fn configure_host_share(
@@ -1896,23 +1925,20 @@ fn configure_host_share(
     shared_dir: &Path,
     queues: VirtioQueueProfile,
 ) {
-    qemu.arg("-fsdev").arg(format!(
-        "local,id=hostfs,path={},security_model=none,multidevs=remap",
-        shared_dir.display()
-    ));
-    let properties = queues.device_properties();
-    match host_share {
-        VmHostShareProfile::Virtio9pMmio => {
-            qemu.arg("-device").arg(format!(
-                "virtio-9p-device,fsdev=hostfs,mount_tag={HOST_SHARE_MOUNT_TAG}{properties}"
-            ));
-        }
-        VmHostShareProfile::Virtio9pPci => {
-            qemu.arg("-device").arg(format!(
-                "virtio-9p-pci,fsdev=hostfs,mount_tag={HOST_SHARE_MOUNT_TAG}{properties}"
-            ));
-        }
-    }
+    let mut fsdev = QemuOptions::new("local");
+    fsdev.set("id", "hostfs");
+    fsdev.set("path", shared_dir.display());
+    fsdev.set("security_model", "none");
+    fsdev.set("multidevs", "remap");
+    qemu.arg("-fsdev").arg(fsdev.to_string());
+    let mut device = QemuOptions::new(match host_share {
+        VmHostShareProfile::Virtio9pMmio => "virtio-9p-device",
+        VmHostShareProfile::Virtio9pPci => "virtio-9p-pci",
+    });
+    device.set("fsdev", "hostfs");
+    device.set("mount_tag", HOST_SHARE_MOUNT_TAG);
+    queues.apply(&mut device);
+    qemu.arg("-device").arg(device.to_string());
 }
 
 /// Gives the guest a virtio-entropy device backed by the host's own
@@ -1927,19 +1953,17 @@ fn configure_entropy_device(
     entropy: VmEntropyProfile,
     queues: VirtioQueueProfile,
 ) {
-    qemu.arg("-object")
-        .arg("rng-random,filename=/dev/urandom,id=rng0");
-    let properties = queues.device_properties();
-    match entropy {
-        VmEntropyProfile::VirtioRngMmio => {
-            qemu.arg("-device")
-                .arg(format!("virtio-rng-device,rng=rng0{properties}"));
-        }
-        VmEntropyProfile::VirtioRngPci => {
-            qemu.arg("-device")
-                .arg(format!("virtio-rng-pci,rng=rng0{properties}"));
-        }
-    }
+    let mut object = QemuOptions::new("rng-random");
+    object.set("filename", "/dev/urandom");
+    object.set("id", "rng0");
+    qemu.arg("-object").arg(object.to_string());
+    let mut device = QemuOptions::new(match entropy {
+        VmEntropyProfile::VirtioRngMmio => "virtio-rng-device",
+        VmEntropyProfile::VirtioRngPci => "virtio-rng-pci",
+    });
+    device.set("rng", "rng0");
+    queues.apply(&mut device);
+    qemu.arg("-device").arg(device.to_string());
 }
 
 fn configure_watchdog(qemu: &mut Command, watchdog: VmWatchdogProfile) {
@@ -1960,6 +1984,9 @@ impl From<VmSessionCommand> for ResolvedVmSessionCommand {
             VmSessionCommand::Repl => Self::Session(SessionCommand::Repl),
             VmSessionCommand::AotBench(command) => Self::AotBench(command),
             VmSessionCommand::WorkloadBench(command) => Self::WorkloadBench(command),
+            VmSessionCommand::NetSetup(_) | VmSessionCommand::NetTeardown(_) => {
+                unreachable!("the privileged network helpers never reach a guest session")
+            }
         }
     }
 }
@@ -1983,6 +2010,22 @@ mod tests {
     const SERIAL_READ_TIMEOUT: Duration = Duration::from_millis(500);
     const DEBUGGER_RUN_STAGE_MARKER: &[u8] = b"[KDBG run:begin]";
 
+    fn default_network_args() -> VmNetworkArgs {
+        VmNetworkArgs {
+            backend: None,
+            queues: None,
+            ifname: None,
+            bridge: None,
+            socket_vmnet_path: None,
+            socket_vmnet_client: None,
+            device_props: Vec::new(),
+        }
+    }
+
+    fn default_network() -> VmNetwork {
+        VmNetwork::resolve(default_network_args(), VmNetworkFile::default())
+    }
+
     #[test]
     fn aarch64_profiles_are_modern_virt_only() {
         assert_eq!(AARCH64_VIRT_HVF_PROFILE.arch, VmArch::Aarch64);
@@ -1999,7 +2042,7 @@ mod tests {
         );
         assert_eq!(
             AARCH64_VIRT_HVF_PROFILE.network,
-            Some(VmNetworkProfile::VirtioMmioUser)
+            Some(VmNetworkProfile::VirtioMmio)
         );
         assert_eq!(
             AARCH64_VIRT_HVF_PROFILE.boot_disk,
@@ -2043,7 +2086,7 @@ mod tests {
         );
         assert_eq!(
             RISCV64_VM_PROFILE.network,
-            Some(VmNetworkProfile::VirtioMmioUser)
+            Some(VmNetworkProfile::VirtioMmio)
         );
         assert_eq!(RISCV64_VM_PROFILE.boot_disk, None);
         assert_eq!(RISCV64_VM_PROFILE.data_disk, VmDataDiskProfile::VirtioMmio);
@@ -2068,10 +2111,7 @@ mod tests {
             X86_64_VM_PROFILE.boot_artifact,
             VmBootArtifactKind::LimineUefiDiskImage
         );
-        assert_eq!(
-            X86_64_VM_PROFILE.network,
-            Some(VmNetworkProfile::VirtioPciUser)
-        );
+        assert_eq!(X86_64_VM_PROFILE.network, Some(VmNetworkProfile::VirtioPci));
         assert_eq!(
             X86_64_VM_PROFILE.boot_disk,
             Some(VmBootDiskProfile::VirtioPci)
@@ -2127,6 +2167,7 @@ mod tests {
             keep_runtime_dir: false,
             virtio_packed: false,
             virtio_in_order: false,
+            network: default_network_args(),
             command: None,
         };
 
@@ -2184,6 +2225,7 @@ mod tests {
             keep_runtime_dir: false,
             virtio_packed: false,
             virtio_in_order: false,
+            network: default_network_args(),
             command: None,
         };
 
@@ -2287,6 +2329,17 @@ mod tests {
             runtime_dir: None,
             keep_runtime_dir: false,
             virtio_queues: VirtioQueueProfile::default(),
+            network: default_network(),
+            qemu_net: profile.network.map(|device| {
+                default_network()
+                    .render(
+                        device,
+                        VirtioQueueProfile::default(),
+                        profile.default_smp,
+                        HostPlatform::current(),
+                    )
+                    .expect("the default user backend renders on every host")
+            }),
             command: None,
         }
     }
@@ -2443,6 +2496,17 @@ mod tests {
             runtime_dir: None,
             keep_runtime_dir: false,
             virtio_queues: VirtioQueueProfile::default(),
+            network: default_network(),
+            qemu_net: profile.network.map(|device| {
+                default_network()
+                    .render(
+                        device,
+                        VirtioQueueProfile::default(),
+                        profile.default_smp,
+                        HostPlatform::current(),
+                    )
+                    .expect("the default user backend renders on every host")
+            }),
             command: None,
         }
     }
