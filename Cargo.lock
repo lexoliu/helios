@@ -1883,6 +1883,7 @@ dependencies = [
  "async-lock",
  "bitflags 2.13.1",
  "bytes",
+ "critical-section",
  "divan",
  "event-listener",
  "fdt",

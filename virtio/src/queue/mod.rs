@@ -344,6 +344,16 @@ impl<B: DmaBuffer> RingCore<B> {
         self.indirect.is_some() && buffers >= INDIRECT_MIN_CHAIN
     }
 
+    /// Ring descriptors a chain of `buffers` buffers consumes: one for
+    /// an indirect table, otherwise one per buffer.
+    fn descriptors_needed(&self, buffers: usize) -> usize {
+        if self.use_indirect(buffers) {
+            1
+        } else {
+            buffers
+        }
+    }
+
     fn check_chain(&self, chain: &[ChainEntry]) -> Result<(), VirtqueueError> {
         if chain.is_empty() {
             return Err(VirtqueueError::EmptyChain);
@@ -432,6 +442,9 @@ trait RingOps<T: VirtioTransport>: Sized {
 
     fn available(&self) -> usize;
 
+    /// Whether a chain of `buffers` buffers fits in the ring right now.
+    fn has_room_for(&self, buffers: usize) -> bool;
+
     fn next_id(&self) -> u16;
 
     /// Drops every in-flight chain and re-programs the device-side queue
@@ -492,6 +505,13 @@ impl<T: VirtioTransport> Ring<T> {
         match self {
             Self::Split(ring) => ring.available(),
             Self::Packed(ring) => ring.available(),
+        }
+    }
+
+    fn has_room_for(&self, buffers: usize) -> bool {
+        match self {
+            Self::Split(ring) => ring.has_room_for(buffers),
+            Self::Packed(ring) => ring.has_room_for(buffers),
         }
     }
 
@@ -674,6 +694,33 @@ impl<T: VirtioTransport> VirtQueue<T> {
     /// Free descriptor slots left in the ring.
     pub fn available_descriptors(&self) -> usize {
         self.ring.available()
+    }
+
+    /// Whether a chain of `buffers` buffers can be submitted right now.
+    ///
+    /// A driver that keeps several requests in flight asks this before
+    /// it submits, so a full ring parks the caller until a completion
+    /// frees descriptors instead of turning back-pressure into an I/O
+    /// error.
+    pub fn has_room_for(&self, buffers: usize) -> bool {
+        self.ring.has_room_for(buffers)
+    }
+
+    /// Device side, tests only: completes the chain `id` with `len`
+    /// written bytes.
+    ///
+    /// The split layout addresses the used ring by its own index, so a
+    /// driver test can play the device from a shared reference. The
+    /// packed layout needs the ring position and wrap counter as well,
+    /// and its tests drive [`PackedRing`] directly.
+    #[cfg(test)]
+    pub(crate) fn device_complete(&self, id: u16, len: u32) {
+        match &self.ring {
+            Ring::Split(ring) => ring.device_complete(id, len),
+            Ring::Packed(_) => {
+                panic!("a packed completion needs a ring position; drive PackedRing directly")
+            }
+        }
     }
 
     /// The identifier the next submission will be given.

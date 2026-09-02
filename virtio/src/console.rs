@@ -5,7 +5,7 @@ use helios_hal::io::{IoError, IoResult};
 use spin::Mutex as SpinMutex;
 
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
-use crate::inflight::{InFlight, await_completion};
+use crate::inflight::{InFlight, await_completion, submit_chain};
 use crate::notify::Notify;
 use crate::queue::VirtQueue;
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
@@ -109,14 +109,16 @@ impl<T: VirtioTransport> VirtioConsoleDevice<T> {
 
     pub async fn write_bytes(&self, bytes: &[u8]) -> IoResult<()> {
         for chunk in bytes.chunks(TRANSMIT_CHUNK_SIZE) {
-            let token = {
-                let mut queue = self.transmit.lock().await;
-                let mut outputs: [&mut [u8]; 0] = [];
-                let token = queue.submit(&self.transport, &[chunk], &mut outputs)?;
-                queue.notify(&self.transport);
-                self.transmit_inflight.register(token);
-                token
-            };
+            let mut outputs: [&mut [u8]; 0] = [];
+            let token = submit_chain(
+                &self.transmit_inflight,
+                &self.transmit,
+                &self.interrupts,
+                &self.transport,
+                &[chunk],
+                &mut outputs,
+            )
+            .await?;
 
             await_completion(
                 &self.transmit_inflight,

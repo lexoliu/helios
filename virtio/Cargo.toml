@@ -17,6 +17,9 @@ spin = { version = "0.9.8", default-features = false, features = ["mutex", "spin
 thiserror = { version = "2.0.17", default-features = false }
 
 [dev-dependencies]
+# Test binaries link `event_listener`'s critical-section backend, so the
+# host test build has to supply an implementation of it.
+critical-section = { version = "1.2.0", features = ["std"] }
 divan = "0.1.21"
 futures-lite = "2.6.1"
 zerocopy = { version = "0.8.27", features = ["derive"] }

@@ -3,7 +3,7 @@ use async_lock::Mutex;
 use helios_hal::io::{IoError, IoResult};
 
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
-use crate::inflight::{InFlight, await_completion};
+use crate::inflight::{InFlight, await_completion, submit_chain};
 use crate::notify::Notify;
 use crate::queue::VirtQueue;
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
@@ -88,13 +88,15 @@ impl<T: VirtioTransport> VirtioRngDevice<T> {
 
     async fn fill_chunk(&self, buffer: &mut [u8]) -> IoResult<usize> {
         let capacity = buffer.len();
-        let token = {
-            let mut queue = self.queue.lock().await;
-            let token = queue.submit(&self.transport, &[], &mut [buffer])?;
-            queue.notify(&self.transport);
-            self.inflight.register(token);
-            token
-        };
+        let token = submit_chain(
+            &self.inflight,
+            &self.queue,
+            &self.interrupts,
+            &self.transport,
+            &[],
+            &mut [buffer],
+        )
+        .await?;
 
         let len = await_completion(&self.inflight, &self.queue, &self.interrupts, token, || {
             self.interrupts.notified()
