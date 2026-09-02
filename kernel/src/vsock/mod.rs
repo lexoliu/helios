@@ -130,7 +130,7 @@ where
                     // packets that carry it are a handful per session,
                     // and a link that never gets past its handshake is
                     // otherwise indistinguishable from one that is idle.
-                    tracing::info!(
+                    tracing::debug!(
                         op = ?received.header.op,
                         source_cid = received.header.source.cid,
                         source_port = received.header.source.port,
@@ -356,7 +356,7 @@ where
     }
 
     async fn transmit(&self, header: VsockPacketHeader, payload: &[u8]) -> Result<(), VsockError> {
-        tracing::info!(
+        tracing::debug!(
             op = ?header.op,
             source_port = header.source.port,
             destination_cid = header.destination.cid,
