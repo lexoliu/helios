@@ -19,14 +19,15 @@ use helios_kernel::{
     ExternalInterruptHandler, InterfaceCapabilities, Kernel, LinkState, NetworkDevice,
     NetworkService, PacketBuffer,
 };
-use helios_virtio::{DeviceType, OffsetDmaPool, VirtioNetDevice, VirtioPciTransport};
+use helios_virtio::{DeviceType, VirtioNetDevice, VirtioPciTransport};
 use pci_types::PciAddress;
 
 use crate::X86Cpu;
 use crate::debug_state::RuntimeState;
+use crate::iommu::X86DmaPool;
 use crate::pci::PciRoot;
 
-type X86VirtioNetDevice = VirtioNetDevice<VirtioPciTransport<OffsetDmaPool>>;
+type X86VirtioNetDevice = VirtioNetDevice<VirtioPciTransport<X86DmaPool>>;
 
 #[derive(Clone)]
 pub(crate) struct VirtioNetworkDevice {
@@ -45,7 +46,7 @@ pub(crate) fn install<WatchdogImpl>(
     kernel: &Kernel<X86Cpu, WatchdogImpl>,
     pci: &PciRoot,
     address: PciAddress,
-    physical_memory_offset: usize,
+    dma: X86DmaPool,
     vector: u8,
     destination_apic_id: u32,
     debug_state: &RuntimeState,
@@ -54,16 +55,10 @@ where
     WatchdogImpl: Watchdog + Clone,
 {
     let msix_vector = pci.bind_msix_vector(address, vector, destination_apic_id);
-    let device = helios_virtio::net_from_pci(
-        &pci.access(),
-        address,
-        pci,
-        OffsetDmaPool::new(physical_memory_offset),
-        Some(msix_vector),
-    )
-    .unwrap_or_else(|error| {
-        panic!("failed to initialize the virtio-net function at {address}: {error}")
-    });
+    let device = helios_virtio::net_from_pci(&pci.access(), address, pci, dma, Some(msix_vector))
+        .unwrap_or_else(|error| {
+            panic!("failed to initialize the virtio-net function at {address}: {error}")
+        });
     let device = VirtioNetworkDevice {
         inner: Arc::new(device),
     };

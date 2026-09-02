@@ -527,6 +527,24 @@ fn convert_sample(sample: host_stats::Sample) -> stats::Sample {
             pressure: convert_memory_pressure(sample.memory.pressure),
         },
         block: sample.block.map(convert_block_device),
+        iommu: sample.iommu.map(convert_iommu),
+    }
+}
+
+fn convert_iommu(iommu: host_stats::Iommu) -> stats::Iommu {
+    stats::Iommu {
+        granule_bytes: iommu.granule_bytes,
+        global_bypass: iommu.global_bypass,
+        faults: iommu.faults,
+        endpoints: iommu
+            .endpoints
+            .into_iter()
+            .map(|endpoint| stats::IommuEndpoint {
+                endpoint: endpoint.endpoint,
+                domain: endpoint.domain,
+                mapped_bytes: endpoint.mapped_bytes,
+            })
+            .collect(),
     }
 }
 

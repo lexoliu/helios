@@ -14,13 +14,14 @@ use alloc::sync::Arc;
 use bytes::BytesMut;
 use helios_hal::io::IoError;
 use helios_kernel::{ExternalInterruptHandler, HostFsTransport};
-use helios_virtio::{DeviceType, OffsetDmaPool, Virtio9pDevice, VirtioPciTransport};
+use helios_virtio::{DeviceType, Virtio9pDevice, VirtioPciTransport};
 use pci_types::PciAddress;
 
 use crate::debug_state::RuntimeState;
+use crate::iommu::X86DmaPool;
 use crate::pci::PciRoot;
 
-type X86Virtio9pDevice = Virtio9pDevice<VirtioPciTransport<OffsetDmaPool>>;
+type X86Virtio9pDevice = Virtio9pDevice<VirtioPciTransport<X86DmaPool>>;
 
 pub(crate) type HostFileSystemService = helios_kernel::HostFsClient<HostFsTransportService>;
 
@@ -39,22 +40,16 @@ pub(crate) fn discover(pci: &PciRoot) -> Option<PciAddress> {
 pub(crate) fn install(
     pci: &PciRoot,
     address: PciAddress,
-    physical_memory_offset: usize,
+    dma: X86DmaPool,
     vector: u8,
     destination_apic_id: u32,
     debug_state: &RuntimeState,
 ) -> HostFsTransportService {
     let msix_vector = pci.bind_msix_vector(address, vector, destination_apic_id);
-    let device = helios_virtio::p9_from_pci(
-        &pci.access(),
-        address,
-        pci,
-        OffsetDmaPool::new(physical_memory_offset),
-        Some(msix_vector),
-    )
-    .unwrap_or_else(|error| {
-        panic!("failed to initialize the virtio-9p function at {address}: {error}")
-    });
+    let device = helios_virtio::p9_from_pci(&pci.access(), address, pci, dma, Some(msix_vector))
+        .unwrap_or_else(|error| {
+            panic!("failed to initialize the virtio-9p function at {address}: {error}")
+        });
     let transport = HostFsTransportService {
         device: Arc::new(device),
     };

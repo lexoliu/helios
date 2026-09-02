@@ -8,6 +8,7 @@ mod boot;
 mod entropy;
 mod exceptions;
 mod host_fs;
+mod iommu;
 mod net;
 mod pci;
 mod smp;
@@ -167,6 +168,15 @@ fn x86_kernel_main() -> ! {
         &reserved_ranges,
         wakeup_page.clone(),
     );
+    // The memory a confined device is allowed to reach is exactly what
+    // the allocator was primed with, captured here while the boot
+    // handoff is still in hand.
+    let dma_memory = dma_capable_ranges(
+        &handoff,
+        physical_memory_offset,
+        &reserved_ranges,
+        wakeup_page.clone(),
+    );
     let tsc_hz = detect_tsc_frequency_hz();
     let tsc_base = read_tsc();
     let debug_state = debug_state::RuntimeState::new(tsc_hz, processor_count, 0);
@@ -185,6 +195,11 @@ fn x86_kernel_main() -> ! {
     let cpu = X86Cpu::new(boot.platform());
     vmm::install_user_address_space(physical_memory_offset, cpu.processor_count());
     let pci = pci::PciRoot::new(physical_memory_offset);
+    // The translation topology is read before any device is programmed:
+    // whether a function is confined decides which addresses its driver
+    // may publish, and that has to be settled before the first ring is
+    // allocated.
+    let iommu_topology = iommu::discover(rsdp_address, physical_memory_offset);
     let network_function = net::discover(&pci);
     let host_share_function = host_fs::discover(&pci);
     let entropy_function = entropy::discover(&pci);
@@ -230,6 +245,8 @@ fn x86_kernel_main() -> ! {
         &kernel,
         &pci,
         physical_memory_offset,
+        iommu_topology,
+        &dma_memory,
         network_function,
         host_share_function,
         entropy_function,
@@ -272,6 +289,8 @@ fn install_pci_devices<WatchdogImpl>(
     kernel: &helios_kernel::Kernel<X86Cpu, WatchdogImpl>,
     pci: &pci::PciRoot,
     physical_memory_offset: usize,
+    iommu_topology: Option<iommu::IommuTopology>,
+    dma_memory: &[helios_hal::iommu::PhysicalRange],
     network_function: Option<pci_types::PciAddress>,
     host_share_function: Option<pci_types::PciAddress>,
     entropy_function: Option<pci_types::PciAddress>,
@@ -283,11 +302,41 @@ fn install_pci_devices<WatchdogImpl>(
 {
     let destination_apic_id = cpu.bootstrap_apic_id();
     let mut routes = exceptions::DeviceInterruptRoutes::new();
+    // Every virtio function the kernel is about to drive has to be in a
+    // domain before it is programmed, so the whole set is confined in
+    // one pass first.
+    let confined: alloc::vec::Vec<pci_types::PciAddress> = host_share_function
+        .into_iter()
+        .chain(network_function)
+        .chain(entropy_function)
+        .chain(block_functions.iter().copied())
+        .collect();
+    let confinement = iommu_topology.map(|topology| {
+        iommu::confine_devices(pci, topology, physical_memory_offset, dma_memory, &confined)
+    });
+    if let Some(confinement) = &confinement {
+        let report = confinement.report();
+        debug_state.install_iommu_report(report.clone());
+        // The unit has no interrupt of its own to report a fault on, so
+        // the kernel collects them on a task that sleeps between polls.
+        kernel.spawn_detached(iommu::watch_faults(
+            confinement.device(),
+            report,
+            kernel.timer(),
+        ));
+    } else {
+        tracing::info!(
+            "no virtio-iommu in the ACPI topology; device DMA reaches all of physical memory"
+        );
+    }
+    let dma_pool = |address: pci_types::PciAddress| {
+        iommu::dma_pool(confinement.as_ref(), address, physical_memory_offset)
+    };
     if let Some(address) = host_share_function {
         let transport = host_fs::install(
             pci,
             address,
-            physical_memory_offset,
+            dma_pool(address),
             exceptions::HOST_FS_INTERRUPT_VECTOR,
             destination_apic_id,
             debug_state,
@@ -302,7 +351,7 @@ fn install_pci_devices<WatchdogImpl>(
             kernel,
             pci,
             address,
-            physical_memory_offset,
+            dma_pool(address),
             exceptions::NETWORK_INTERRUPT_VECTOR,
             destination_apic_id,
             debug_state,
@@ -316,7 +365,7 @@ fn install_pci_devices<WatchdogImpl>(
             kernel,
             pci,
             address,
-            physical_memory_offset,
+            dma_pool(address),
             exceptions::ENTROPY_INTERRUPT_VECTOR,
             destination_apic_id,
             root_entropy.clone(),
@@ -328,12 +377,16 @@ fn install_pci_devices<WatchdogImpl>(
     if block_functions.is_empty() {
         tracing::warn!("virtio block device was not discovered on the PCI bus");
     }
+    let block_devices: alloc::vec::Vec<(pci_types::PciAddress, iommu::X86DmaPool)> =
+        block_functions
+            .iter()
+            .map(|address| (*address, dma_pool(*address)))
+            .collect();
     for block in block::install(
         cpu,
         kernel,
         pci,
-        block_functions,
-        physical_memory_offset,
+        &block_devices,
         destination_apic_id,
         debug_state,
         root_entropy,
@@ -473,6 +526,26 @@ fn boot_memory_regions(
                 })
             })
     })
+}
+
+/// The physical memory the kernel allocates its DMA buffers from.
+///
+/// It is exactly what the bootstrap allocator was primed with: every
+/// buffer a driver hands to a device is a kernel heap allocation, so a
+/// domain that maps these runs reaches every buffer and nothing else.
+fn dma_capable_ranges(
+    handoff: &boot::LimineBootHandoff,
+    physical_memory_offset: usize,
+    reserved_ranges: &BootReservedRanges,
+    excluded: Option<Range<usize>>,
+) -> alloc::vec::Vec<helios_hal::iommu::PhysicalRange> {
+    boot_memory_regions(handoff, physical_memory_offset, reserved_ranges, excluded)
+        .into_iter()
+        .map(|region| {
+            let start = region.as_ptr().cast::<u8>() as usize - physical_memory_offset;
+            helios_hal::iommu::PhysicalRange::new(start as u64, region.len() as u64)
+        })
+        .collect()
 }
 
 fn usable_region_segments(

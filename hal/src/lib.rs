@@ -13,6 +13,7 @@ pub mod entropy;
 pub mod fs;
 pub mod interrupt;
 pub mod io;
+pub mod iommu;
 pub mod memory;
 pub mod pmm;
 pub mod resource;
@@ -77,10 +78,18 @@ impl ProcessorTopology {
     }
 }
 
+/// How a device's DMA addresses relate to physical memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DmaModel {
+    /// A device address is a physical address, and the kernel's virtual
+    /// addresses are physical addresses too.
     Identity,
+    /// A device address is a physical address the kernel reaches through
+    /// a fixed virtual offset.
     Translated,
+    /// A device address is an I/O virtual address an IOMMU translates,
+    /// so a device only reaches the ranges its domain maps.
+    Iommu,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -271,6 +280,8 @@ mod tests {
         }
 
         fn publish_executable(&self, _ptr: *const u8, _len: usize) {}
+
+        fn unpublish_executable(&self, _ptr: *const u8, _len: usize) {}
 
         fn native_feature_probe(&self) -> Option<fn(&str) -> Option<bool>> {
             None

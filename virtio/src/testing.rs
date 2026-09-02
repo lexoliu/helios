@@ -14,7 +14,7 @@ use core::cell::UnsafeCell;
 use helios_hal::io::{IoError, IoResult};
 use spin::Mutex;
 
-use crate::bus::{DeviceBus, IdentityDmaPool};
+use crate::bus::{DeviceBus, DmaPool, IdentityDmaPool};
 use crate::transport::{DeviceStatus, DeviceType, InterruptStatus, VirtioTransport};
 
 const REG_MAGIC_VALUE: usize = 0x000;
@@ -86,24 +86,25 @@ unsafe impl Send for MmioRegisterBus {}
 unsafe impl Sync for MmioRegisterBus {}
 
 /// Host-memory bus: virtqueue rings are ordinary heap allocations whose
-/// DMA address is their virtual address.
-pub(crate) struct HeapBus {
+/// DMA address is their virtual address, put through whatever platform
+/// translation the test gave the bus.
+pub(crate) struct HeapBus<P = IdentityDmaPool> {
     /// Wide enough for the largest device configuration a driver in this
     /// crate reads (virtio-blk's runs to offset 0x40).
     config: UnsafeCell<[u32; 32]>,
-    dma: IdentityDmaPool,
+    dma: P,
 }
 
-impl HeapBus {
-    fn new() -> Self {
+impl<P> HeapBus<P> {
+    fn new(dma: P) -> Self {
         Self {
             config: UnsafeCell::new([0; 32]),
-            dma: IdentityDmaPool,
+            dma,
         }
     }
 }
 
-impl DeviceBus for HeapBus {
+impl<P: DmaPool> DeviceBus for HeapBus<P> {
     fn read_u32(&self, offset: usize) -> u32 {
         unsafe { (*self.config.get())[offset / 4] }
     }
@@ -114,15 +115,15 @@ impl DeviceBus for HeapBus {
         }
     }
 
-    type DmaPool = IdentityDmaPool;
+    type DmaPool = P;
 
     fn dma(&self) -> &Self::DmaPool {
         &self.dma
     }
 }
 
-unsafe impl Send for HeapBus {}
-unsafe impl Sync for HeapBus {}
+unsafe impl<P: Send> Send for HeapBus<P> {}
+unsafe impl<P: Sync> Sync for HeapBus<P> {}
 
 /// How a [`FakeTransport`] presents itself to a driver.
 pub(crate) struct FakeTransportConfig {
@@ -186,8 +187,8 @@ impl<const PROCESSORS: usize> crate::block::QueueAffinity for FakeAffinity<PROCE
 }
 
 /// A virtio transport that records everything a driver does to it.
-pub(crate) struct FakeTransport {
-    bus: HeapBus,
+pub(crate) struct FakeTransport<P = IdentityDmaPool> {
+    bus: HeapBus<P>,
     device_type: DeviceType,
     offered_features: u64,
     queue_size: u16,
@@ -197,8 +198,19 @@ pub(crate) struct FakeTransport {
 
 impl FakeTransport {
     pub(crate) fn new(config: FakeTransportConfig) -> Self {
+        Self::with_dma(config, IdentityDmaPool)
+    }
+}
+
+impl<P: DmaPool> FakeTransport<P> {
+    /// A transport whose driver publishes addresses from `dma`.
+    ///
+    /// This is what a test uses to put a device behind a platform
+    /// translation: the pool decides what kind of address the rings
+    /// carry, and therefore what the feature handshake has to ask for.
+    pub(crate) fn with_dma(config: FakeTransportConfig, dma: P) -> Self {
         Self {
-            bus: HeapBus::new(),
+            bus: HeapBus::new(dma),
             device_type: config.device_type,
             offered_features: config.offered_features,
             queue_size: config.queue_size,
@@ -271,8 +283,8 @@ impl FakeTransport {
     }
 }
 
-impl VirtioTransport for FakeTransport {
-    type Bus = HeapBus;
+impl<P: DmaPool> VirtioTransport for FakeTransport<P> {
+    type Bus = HeapBus<P>;
 
     fn bus(&self) -> &Self::Bus {
         &self.bus

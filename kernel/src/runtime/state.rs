@@ -48,6 +48,9 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// The scratch disk the platform gave this kernel, once it has been
     /// identified and proved. Empty on a machine with no block device.
     block_service: Once<BlockService>,
+    /// What the platform's IOMMU confines, once the backend has built
+    /// the domains. Empty on a machine whose devices are not behind one.
+    iommu_report: Once<alloc::sync::Arc<crate::IommuReport>>,
     futex_table: Mutex<FutexTable>,
     bootfs: Mutex<Option<EmbeddedBootFs>>,
     tracing: Mutex<TraceHistory>,
@@ -342,6 +345,7 @@ where
                 http_client: ProviderSlot::new(),
                 host_fs_service: Mutex::new(None),
                 block_service: Once::new(),
+                iommu_report: Once::new(),
                 futex_table: Mutex::new(FutexTable::new()),
                 bootfs: Mutex::new(embedded_init().map(|init| init.bootfs())),
                 tracing: Mutex::new(TraceHistory::new(DEFAULT_TRACE_HISTORY_CAPACITY)),
@@ -361,6 +365,11 @@ where
             configured_processors: self.inner.processor_count,
             online_processors: self.inner.processor_count,
             block: self.inner.block_service.get().map(BlockService::stats),
+            iommu: self
+                .inner
+                .iommu_report
+                .get()
+                .map(|report| report.snapshot()),
         }
     }
 
@@ -773,6 +782,20 @@ where
 
     pub fn block_service(&self) -> Option<BlockService> {
         self.inner.block_service.get().cloned()
+    }
+
+    /// Publishes what the platform's IOMMU confines.
+    ///
+    /// Called from the backend once every device it protects has been
+    /// attached to its domain, so a report that is visible here already
+    /// describes the machine's final device topology.
+    pub fn install_iommu_report(&self, report: alloc::sync::Arc<crate::IommuReport>) {
+        let mut installed = false;
+        self.inner.iommu_report.call_once(|| {
+            installed = true;
+            report
+        });
+        assert!(installed, "IOMMU report was installed more than once");
     }
 
     pub fn prepare_futex_wait(&self, key: FutexKey) -> FutexWaitRegistration {

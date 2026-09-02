@@ -1,5 +1,6 @@
 pub use super::bindings::helios::system::stats::{
-    BlockDevice, Memory, MemoryPressure, MonoNanos, Permille, Processor, Processors, Sample,
+    BlockDevice, Iommu, IommuEndpoint, Memory, MemoryPressure, MonoNanos, Permille, Processor,
+    Processors, Sample,
 };
 
 #[cfg(feature = "host")]

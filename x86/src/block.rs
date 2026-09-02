@@ -17,14 +17,15 @@ use alloc::vec::Vec;
 
 use helios_hal::fs::BlockDeviceRights;
 use helios_kernel::{ExternalInterruptHandler, RootEntropyHandle};
-use helios_virtio::{DeviceType, OffsetDmaPool, VirtioBlockResource, VirtioPciTransport};
+use helios_virtio::{DeviceType, VirtioBlockResource, VirtioPciTransport};
 use pci_types::PciAddress;
 
 use crate::X86Cpu;
 use crate::exceptions::BLOCK_INTERRUPT_VECTORS;
+use crate::iommu::X86DmaPool;
 use crate::pci::PciRoot;
 
-type X86VirtioBlockDevice = VirtioBlockResource<VirtioPciTransport<OffsetDmaPool>, X86Cpu>;
+type X86VirtioBlockDevice = VirtioBlockResource<VirtioPciTransport<X86DmaPool>, X86Cpu>;
 
 #[derive(Clone)]
 pub(crate) struct VirtioBlockDevice {
@@ -62,8 +63,7 @@ pub(crate) fn install<WatchdogImpl>(
     cpu: &X86Cpu,
     kernel: &helios_kernel::Kernel<X86Cpu, WatchdogImpl>,
     pci: &PciRoot,
-    functions: &[PciAddress],
-    physical_memory_offset: usize,
+    functions: &[(PciAddress, X86DmaPool)],
     destination_apic_id: u32,
     debug_state: &crate::debug_state::RuntimeState,
     root: RootEntropyHandle,
@@ -74,13 +74,13 @@ where
     let discovered: Vec<BlockInterrupt> = functions
         .iter()
         .zip(BLOCK_INTERRUPT_VECTORS)
-        .map(|(address, vector)| {
+        .map(|((address, dma), vector)| {
             let msix_vector = pci.bind_msix_vector(*address, vector, destination_apic_id);
             let device = helios_virtio::block_from_pci(
                 &pci.access(),
                 *address,
                 pci,
-                OffsetDmaPool::new(physical_memory_offset),
+                *dma,
                 Some(msix_vector),
                 cpu.clone(),
                 BlockDeviceRights::READ | BlockDeviceRights::WRITE,

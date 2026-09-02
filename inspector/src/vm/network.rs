@@ -35,7 +35,7 @@ use console::style;
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 
-use super::VirtioQueueProfile;
+use super::VirtioDeviceProfile;
 use super::qemu::QemuOptions;
 
 /// QEMU netdev identifier shared by the backend and the device.
@@ -759,7 +759,7 @@ impl VmNetwork {
     pub(crate) fn render(
         &self,
         profile: VmNetworkProfile,
-        ring: VirtioQueueProfile,
+        ring: VirtioDeviceProfile,
         smp: u16,
         host: HostPlatform,
     ) -> Result<QemuNetArgs, VmNetworkError> {
@@ -827,7 +827,10 @@ impl VmNetwork {
             }
             device.set(property.name(), &property.value);
         }
-        ring.apply(&mut device);
+        match profile {
+            VmNetworkProfile::VirtioMmio => ring.apply(&mut device),
+            VmNetworkProfile::VirtioPci => ring.apply_pci(&mut device),
+        }
 
         Ok(QemuNetArgs {
             launcher,
@@ -1519,7 +1522,7 @@ mod tests {
     use std::str::FromStr as _;
 
     use super::*;
-    use crate::vm::{VirtioCompletionOrder, VirtioRingLayout};
+    use crate::vm::{VirtioCompletionOrder, VirtioPlatformAccess, VirtioRingLayout};
 
     fn request(backend: VmNetworkBackend) -> VmNetwork {
         VmNetwork {
@@ -1533,8 +1536,8 @@ mod tests {
         }
     }
 
-    fn split_ring() -> VirtioQueueProfile {
-        VirtioQueueProfile::default()
+    fn split_ring() -> VirtioDeviceProfile {
+        VirtioDeviceProfile::default()
     }
 
     #[test]
@@ -1829,9 +1832,10 @@ mod tests {
 
     #[test]
     fn ring_layout_properties_reach_the_network_device() {
-        let ring = VirtioQueueProfile {
+        let ring = VirtioDeviceProfile {
             ring: VirtioRingLayout::Packed,
             completion: VirtioCompletionOrder::InOrder,
+            access: VirtioPlatformAccess::Direct,
         };
         let rendered = request(VmNetworkBackend::User)
             .render(VmNetworkProfile::VirtioPci, ring, 1, HostPlatform::LINUX)
@@ -1839,6 +1843,24 @@ mod tests {
         assert_eq!(
             rendered.device(),
             "virtio-net-pci,netdev=net0,packed=on,in_order=on"
+        );
+    }
+
+    /// A confined device has to be told to translate, and only a
+    /// non-transitional function offers the feature that says so.
+    #[test]
+    fn a_confined_network_device_negotiates_platform_access() {
+        let devices = VirtioDeviceProfile {
+            ring: VirtioRingLayout::Split,
+            completion: VirtioCompletionOrder::Unordered,
+            access: VirtioPlatformAccess::Confined,
+        };
+        let rendered = request(VmNetworkBackend::User)
+            .render(VmNetworkProfile::VirtioPci, devices, 1, HostPlatform::LINUX)
+            .expect("the user backend renders behind an IOMMU");
+        assert_eq!(
+            rendered.device(),
+            "virtio-net-pci,netdev=net0,disable-legacy=on,iommu_platform=on"
         );
     }
 

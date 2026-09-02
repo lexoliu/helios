@@ -62,6 +62,9 @@ pub struct StatsSample {
     /// The block device the kernel owns, absent on a machine that gave
     /// it none.
     pub block: Option<crate::BlockStats>,
+    /// The platform's I/O translation unit, absent on a machine whose
+    /// devices are not confined by one.
+    pub iommu: Option<crate::IommuStats>,
 }
 
 #[derive(Clone, Debug)]
