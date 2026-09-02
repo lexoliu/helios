@@ -104,11 +104,19 @@ pub struct StackConfig {
     /// let the device finish them; enabled by the embedding kernel only
     /// when the interface negotiated transmit checksum offload.
     pub tx_checksum_offload: bool,
-    /// Emit bulk TCP data as scatter frames (headers in the packet
-    /// buffer, payload attached as refcounted bytes the device reads in
-    /// place). Requires tx_checksum_offload and a device whose DMA can
-    /// read borrowed packet bytes.
-    pub zero_copy_tx: bool,
+    /// The interface's DMA can read borrowed packet bytes, so bulk TCP
+    /// data leaves as a scatter frame: headers in the packet buffer,
+    /// payload attached as the refcounted bytes the socket already
+    /// holds, and the device reading them in place until it completes
+    /// the descriptor.
+    ///
+    /// This is a device property the embedding kernel copies out of
+    /// [`InterfaceCapabilities::direct_tx_dma`](crate::InterfaceCapabilities),
+    /// not a policy knob: a device that can read borrowed bytes has no
+    /// reason to be handed a copy. Scatter framing also needs
+    /// `tx_checksum_offload`, because the device finishes the transport
+    /// checksum over bytes the stack never assembled.
+    pub direct_tx_dma: bool,
     /// Segmentation offload the embedding kernel enabled for this
     /// interface.
     ///
@@ -200,7 +208,7 @@ impl StackConfig {
             rx_budget: DEFAULT_POLL_BUDGET,
             rx_checksum_offload: RxChecksumOffload::none(),
             tx_checksum_offload: false,
-            zero_copy_tx: false,
+            direct_tx_dma: false,
             segmentation: SegmentationOffload::none(),
         }
     }
@@ -215,8 +223,8 @@ impl StackConfig {
         self
     }
 
-    pub const fn with_zero_copy_tx(mut self, enabled: bool) -> Self {
-        self.zero_copy_tx = enabled;
+    pub const fn with_direct_tx_dma(mut self, enabled: bool) -> Self {
+        self.direct_tx_dma = enabled;
         self
     }
 
@@ -3959,8 +3967,9 @@ where
 
     /// Chooses the payload representation for a queued data segment:
     /// a coalesced burst is always scatter (nothing else can carry it),
-    /// otherwise scatter when zero-copy transmit is on, offload seeds
-    /// the checksum, and the payload is large enough to beat the copy.
+    /// otherwise scatter when the device reads borrowed bytes, offload
+    /// seeds the checksum, and the payload is large enough to beat the
+    /// copy.
     fn tcp_tx_payload<'a>(&self, segment: &'a TcpTransmitSegment) -> TcpTxPayload<'a> {
         let payload = &segment.payload;
         let segment_bytes = segment.segment_bytes as usize;
@@ -3971,7 +3980,7 @@ where
                     .expect("TCP segmentation MSS exceeds a virtio gso_size"),
             };
         }
-        if self.config.zero_copy_tx
+        if self.config.direct_tx_dma
             && self.config.tx_checksum_offload
             && payload.len() >= TCP_SCATTER_MIN_PAYLOAD_BYTES
         {
@@ -8410,6 +8419,62 @@ mod tests {
         }
     }
 
+    /// Bulk TCP data leaves as a scatter frame whenever the interface
+    /// says its DMA can read borrowed bytes: the payload the socket
+    /// already holds is attached to the frame instead of copied into
+    /// it, and the packet buffer carries only the headers.
+    #[test]
+    fn bulk_tcp_data_is_scattered_when_the_device_reads_borrowed_bytes() {
+        let (mut stack, socket) = established_tcp_stack(
+            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES)
+                .with_tx_checksum_offload(true)
+                .with_direct_tx_dma(true),
+        );
+        let payload = vec![0x5a_u8; TCP_SCATTER_MIN_PAYLOAD_BYTES];
+        stack
+            .tcp_send(socket, &payload)
+            .expect("bulk TCP send should queue");
+        stack
+            .drive_tcp(StackInstant::from_nanos(2))
+            .expect("TCP data should be queued");
+
+        let frame = stack.take_outbound().expect("data frame should be queued");
+        let attached = frame
+            .payload()
+            .expect("a scatter frame carries its payload by reference");
+        assert_eq!(attached.as_ref(), payload.as_slice());
+        assert_eq!(
+            frame.as_slice().len(),
+            EthernetFrame::HEADER_LEN + Ipv4Packet::MIN_HEADER_LEN + TcpPacket::MIN_HEADER_LEN,
+            "the packet buffer holds framing only"
+        );
+        assert!(frame.tx_segmentation().is_none());
+    }
+
+    /// The same send over an interface whose DMA cannot reach borrowed
+    /// bytes copies the payload into the packet buffer, because that is
+    /// the only memory the device will read.
+    #[test]
+    fn bulk_tcp_data_is_copied_when_the_device_cannot_read_borrowed_bytes() {
+        let (mut stack, socket) = established_tcp_stack(
+            StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES).with_tx_checksum_offload(true),
+        );
+        let payload = vec![0x5a_u8; TCP_SCATTER_MIN_PAYLOAD_BYTES];
+        stack
+            .tcp_send(socket, &payload)
+            .expect("bulk TCP send should queue");
+        stack
+            .drive_tcp(StackInstant::from_nanos(2))
+            .expect("TCP data should be queued");
+
+        let frame = stack.take_outbound().expect("data frame should be queued");
+        assert!(frame.payload().is_none());
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
+        let tcp = TcpPacket::parse(ipv4.payload).expect("TCP packet should parse");
+        assert_eq!(tcp.payload, payload.as_slice());
+    }
+
     /// A TSO-capable interface gets one oversized frame instead of a
     /// train of MSS-sized ones: the whole congestion window in a single
     /// scatter payload, plus the metadata the device needs to split it
@@ -8551,7 +8616,7 @@ mod tests {
         let mut stack = Stack::new(
             StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES)
                 .with_tx_checksum_offload(true)
-                .with_zero_copy_tx(true),
+                .with_direct_tx_dma(true),
         );
         stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
         stack.learn_neighbor(NeighborEntry {
