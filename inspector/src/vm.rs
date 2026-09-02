@@ -1119,7 +1119,21 @@ fn settle_balloon(client: &mut crate::serial::RpcClient, target: u64, seconds: u
     let mut previous = None;
     let mut still_since = started;
     loop {
-        let sample = crate::runtime::block_on(crate::system::fetch_stats(client))?;
+        // A guest that is handing memory back may be too busy to answer
+        // for a while — a target move on an emulated machine is a lot of
+        // work. Not answering is not the same as having stopped, so it
+        // does not end the wait or reset the stillness clock.
+        let Some(sample) = guest_stats(client) else {
+            if std::time::Instant::now() >= deadline {
+                println!(
+                    "{} guest stopped answering before the {seconds}s wait ran out",
+                    style("settled").yellow()
+                );
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        };
         let actual = sample.balloon.as_ref().map(|balloon| balloon.actual_bytes);
         if actual == Some(target) {
             println!(
@@ -1152,12 +1166,26 @@ fn settle_balloon(client: &mut crate::serial::RpcClient, target: u64, seconds: u
     }
 }
 
+/// Reads the guest's own view of its memory, or nothing when the guest
+/// is too busy to answer right now.
+fn guest_stats(
+    client: &mut crate::serial::RpcClient,
+) -> Option<helios_inspector_protocol::system::stats::Sample> {
+    crate::runtime::block_on(crate::system::fetch_stats(client)).ok()
+}
+
 fn report_balloon(
     qmp: &mut QmpClient,
     client: &mut crate::serial::RpcClient,
     label: &str,
 ) -> Result<()> {
-    let sample = crate::runtime::block_on(crate::system::fetch_stats(client))?;
+    let Some(sample) = guest_stats(client) else {
+        println!(
+            "{} {label}: the guest did not answer",
+            style("balloon").yellow()
+        );
+        return Ok(());
+    };
     let guest = match &sample.balloon {
         Some(balloon) => format!(
             "guest target={} actual={} reported-free={}",
