@@ -65,6 +65,9 @@ pub struct StatsSample {
     /// The platform's I/O translation unit, absent on a machine whose
     /// devices are not confined by one.
     pub iommu: Option<crate::IommuStats>,
+    /// The memory balloon the host resizes this guest through, absent on
+    /// a machine that gave the kernel none.
+    pub balloon: Option<crate::memory::BalloonStats>,
 }
 
 #[derive(Clone, Debug)]

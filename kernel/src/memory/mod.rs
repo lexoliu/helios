@@ -7,12 +7,15 @@
 //! per-instance pools derived from it. `reservations` is the AddressSpace
 //! reservation/committed-region bookkeeping shared by every backend.
 
+mod balloon;
 mod entropy;
 mod frame_slab;
 mod pmm;
+mod reported;
 mod reservations;
 mod user;
 
+pub use balloon::{BalloonHandle, BalloonStats, FREE_PAGE_REPORT_INTERVAL, install_memory_balloon};
 pub use entropy::{
     ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources, HardwareEntropySource,
     NoCryptographicEntropy, ROOT_ENTROPY_MATERIAL_BYTES, RootEntropy, RootEntropyHandle,

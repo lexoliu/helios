@@ -18,17 +18,20 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
+use crate::stats_tui::format_bytes;
 use crate::workload_bench::{VmProvenance, WorkloadBenchCommand};
 use crate::{SessionCommand, connect_client, run_connected};
 
 mod network;
 mod qemu;
+mod qmp;
 
 use network::{
     HostPlatform, NetSetupCommand, NetTeardownCommand, QemuNetArgs, VmNetwork, VmNetworkArgs,
     VmNetworkFile, VmNetworkProfile,
 };
 use qemu::QemuOptions;
+use qmp::QmpClient;
 
 const DEFAULT_BAUD: u32 = 115_200;
 const DEFAULT_AARCH64_QEMU_BIN: &str = "qemu-system-aarch64";
@@ -48,6 +51,11 @@ const DEFAULT_DATA_DISK_BYTES: u64 = 256 * 1024 * 1024;
 /// on the bus carries it, so the boot image is never mistaken for it.
 const DATA_DISK_SERIAL: &str = "helios-data";
 const DEFAULT_GDB_ENDPOINT: &str = "tcp::1234";
+/// The QEMU IOThread the memory balloon's free-page hint queue runs on.
+const BALLOON_IOTHREAD_ID: &str = "balloon-io";
+/// How long the guest's reported balloon size has to hold still before a
+/// wait calls it settled short of the target it was given.
+const BALLOON_STILL_FOR: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -121,6 +129,18 @@ enum VmEntropyProfile {
     VirtioRngPci,
 }
 
+/// How a profile exposes the guest's memory balloon.
+///
+/// Every profile has one: the balloon is the only way a host resizes a
+/// running guest's memory, and free-page reporting is what lets the host
+/// reclaim what the guest is not using, so a guest booted without it
+/// would hold its whole `-m` allocation resident forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VmBalloonProfile {
+    VirtioBalloonMmio,
+    VirtioBalloonPci,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VmProfile {
     arch: VmArch,
@@ -144,6 +164,7 @@ struct VmProfile {
     /// The translation unit this machine can put its virtio devices
     /// behind, if any.
     iommu: Option<VmIommuProfile>,
+    balloon: VmBalloonProfile,
 }
 
 /// The aarch64 platform is device-tree only: the kernel reads the GIC
@@ -175,6 +196,7 @@ const AARCH64_VIRT_HVF_PROFILE: VmProfile = VmProfile {
     // virtio-iommu translates PCI endpoints only, so there is nothing
     // here it could confine.
     iommu: None,
+    balloon: VmBalloonProfile::VirtioBalloonMmio,
 };
 
 #[cfg(test)]
@@ -201,6 +223,7 @@ const AARCH64_VIRT_TCG_PROFILE: VmProfile = VmProfile {
     // virtio-iommu translates PCI endpoints only, so there is nothing
     // here it could confine.
     iommu: None,
+    balloon: VmBalloonProfile::VirtioBalloonMmio,
 };
 
 const RISCV64_VM_PROFILE: VmProfile = VmProfile {
@@ -226,6 +249,7 @@ const RISCV64_VM_PROFILE: VmProfile = VmProfile {
     // virtio-iommu translates PCI endpoints only, so there is nothing
     // here it could confine.
     iommu: None,
+    balloon: VmBalloonProfile::VirtioBalloonMmio,
 };
 
 const X86_64_VM_PROFILE: VmProfile = VmProfile {
@@ -248,6 +272,7 @@ const X86_64_VM_PROFILE: VmProfile = VmProfile {
     watchdog: Some(VmWatchdogProfile::I6300Esb),
     entropy: VmEntropyProfile::VirtioRngPci,
     iommu: Some(VmIommuProfile::VirtioIommuPci),
+    balloon: VmBalloonProfile::VirtioBalloonPci,
 };
 
 /// Virtqueue ring layout the inspector asks every virtio device for.
@@ -539,10 +564,35 @@ enum VmSessionCommand {
     Repl,
     AotBench(AotBenchCommand),
     WorkloadBench(WorkloadBenchCommand),
+    /// Move the guest's memory balloon and watch the guest follow.
+    Balloon(BalloonCommand),
     /// Provision the privileged host state a network backend needs.
     NetSetup(NetSetupCommand),
     /// Remove the host state `net-setup` provisioned.
     NetTeardown(NetTeardownCommand),
+}
+
+/// Drives the QMP `balloon` command against the running guest.
+///
+/// The host names the memory it wants the guest to keep; the guest gives
+/// back the difference and reports what it managed. Naming several
+/// targets walks the balloon through them in order, which is how the
+/// return path — the guest taking its memory back — is exercised without
+/// a second boot.
+#[derive(Debug, Clone, ClapArgs)]
+pub(crate) struct BalloonCommand {
+    /// Guest memory size to ask for, QEMU-style (`1536M`, `2G`). Repeat
+    /// to move the balloon through several targets. With none, the
+    /// current state is printed and nothing is moved.
+    targets: Vec<String>,
+
+    /// How long to wait for the guest to reach each target.
+    #[arg(long, default_value_t = 30)]
+    settle_seconds: u64,
+
+    /// How long to hold each target before moving to the next one.
+    #[arg(long, default_value_t = 0)]
+    hold_seconds: u64,
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -619,6 +669,10 @@ struct ResolvedVmCommand {
     network: VmNetwork,
     qemu_net: Option<QemuNetArgs>,
     command: Option<ResolvedVmSessionCommand>,
+    /// Whether the session command drives QEMU's machine protocol and
+    /// therefore needs a socket even when the runtime directory is not
+    /// being kept.
+    needs_qmp: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -626,6 +680,7 @@ enum ResolvedVmSessionCommand {
     Session(SessionCommand),
     AotBench(AotBenchCommand),
     WorkloadBench(WorkloadBenchCommand),
+    Balloon(BalloonCommand),
 }
 
 pub(crate) fn run(mut command: VmCommand) -> Result<()> {
@@ -805,6 +860,7 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
         virtio_devices,
         network,
         qemu_net,
+        needs_qmp: matches!(session_command, Some(ResolvedVmSessionCommand::Balloon(_))),
         command: session_command,
     })
 }
@@ -974,6 +1030,7 @@ fn run_kernel_prebuild(command: &ResolvedVmCommand) -> Result<PathBuf> {
 }
 
 fn connect_and_run(command: &ResolvedVmCommand, runtime: &mut VmRuntime) -> Result<()> {
+    let qmp_socket = runtime.qmp_socket.clone();
     let client = match runtime.take_transport()? {
         VmTransport::SerialSocket(socket_path) => {
             let socket = socket_path.to_str().ok_or_else(|| {
@@ -1002,9 +1059,155 @@ fn connect_and_run(command: &ResolvedVmCommand, runtime: &mut VmRuntime) -> Resu
                 accel: command.accel.clone(),
             },
         ),
+        Some(ResolvedVmSessionCommand::Balloon(balloon)) => {
+            let socket = qmp_socket.context(
+                "the balloon command needs a QMP socket; pass --qmp unix:<path>,server=on,wait=off",
+            )?;
+            run_balloon(client, balloon, &socket)
+        }
         Some(ResolvedVmSessionCommand::Session(command)) => run_connected(client, Some(command)),
         None => run_connected(client, None),
     }
+}
+
+/// Moves the guest's balloon through the targets the caller named,
+/// reporting what the host asked for and what the guest gave up after
+/// each move.
+///
+/// Both sides are printed because they answer different questions: QEMU
+/// says how much guest memory it is still backing, the guest's own
+/// `helios:system/stats` says how much of its user memory the balloon is
+/// holding and how much it has named as free.
+fn run_balloon(
+    mut client: crate::serial::RpcClient,
+    command: BalloonCommand,
+    qmp_socket: &Path,
+) -> Result<()> {
+    let mut qmp = QmpClient::connect(qmp_socket)?;
+    report_balloon(&mut qmp, &mut client, "initial")?;
+
+    for target in &command.targets {
+        let bytes = qmp::parse_size(target)?;
+        println!("{} balloon target {target}", style("set").cyan());
+        qmp.set_balloon(bytes)
+            .with_context(|| format!("failed to set the balloon target to {target}"))?;
+        settle_balloon(&mut client, bytes, command.settle_seconds)?;
+        report_balloon(&mut qmp, &mut client, target)?;
+        if command.hold_seconds != 0 {
+            std::thread::sleep(Duration::from_secs(command.hold_seconds));
+            report_balloon(&mut qmp, &mut client, &format!("{target} after hold"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Waits for the guest to settle on the target the host named.
+///
+/// The guest is asked rather than QEMU: it is the side that decides how
+/// much it can spare, it publishes that decision through
+/// `helios:system/stats`, and its answer arrives over the debug serial
+/// rather than over the monitor — which the very memory work the guest
+/// is doing keeps busy.
+///
+/// A guest that stops short is not an error. The kernel refuses to
+/// inflate past its own pressure floor and reports the truth, so the
+/// wait ends when the guest stops moving and the caller sees where it
+/// stopped.
+fn settle_balloon(client: &mut crate::serial::RpcClient, target: u64, seconds: u64) -> Result<()> {
+    let started = std::time::Instant::now();
+    let deadline = started + Duration::from_secs(seconds);
+    let mut previous = None;
+    let mut still_since = started;
+    loop {
+        // A guest that is handing memory back may be too busy to answer
+        // for a while — a target move on an emulated machine is a lot of
+        // work. Not answering is not the same as having stopped, so it
+        // does not end the wait or reset the stillness clock.
+        let Some(sample) = guest_stats(client) else {
+            if std::time::Instant::now() >= deadline {
+                println!(
+                    "{} guest stopped answering before the {seconds}s wait ran out",
+                    style("settled").yellow()
+                );
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        };
+        let actual = sample.balloon.as_ref().map(|balloon| balloon.actual_bytes);
+        if actual == Some(target) {
+            println!(
+                "{} guest reached the target after {:.1}s",
+                style("settled").green(),
+                started.elapsed().as_secs_f64()
+            );
+            return Ok(());
+        }
+        if actual != previous {
+            previous = actual;
+            still_since = std::time::Instant::now();
+        } else if still_since.elapsed() >= BALLOON_STILL_FOR {
+            println!(
+                "{} guest stopped at {} after {:.1}s",
+                style("settled").yellow(),
+                actual.map_or_else(|| "no balloon".to_owned(), format_bytes),
+                started.elapsed().as_secs_f64()
+            );
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            println!(
+                "{} guest was still moving when the {seconds}s wait ran out",
+                style("settled").yellow()
+            );
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// Reads the guest's own view of its memory, or nothing when the guest
+/// is too busy to answer right now.
+fn guest_stats(
+    client: &mut crate::serial::RpcClient,
+) -> Option<helios_inspector_protocol::system::stats::Sample> {
+    crate::runtime::block_on(crate::system::fetch_stats(client)).ok()
+}
+
+fn report_balloon(
+    qmp: &mut QmpClient,
+    client: &mut crate::serial::RpcClient,
+    label: &str,
+) -> Result<()> {
+    let Some(sample) = guest_stats(client) else {
+        println!(
+            "{} {label}: the guest did not answer",
+            style("balloon").yellow()
+        );
+        return Ok(());
+    };
+    let guest = match &sample.balloon {
+        Some(balloon) => format!(
+            "guest target={} actual={} reported-free={}",
+            format_bytes(balloon.target_bytes),
+            format_bytes(balloon.actual_bytes),
+            format_bytes(balloon.reported_bytes)
+        ),
+        None => "guest reports no balloon".to_owned(),
+    };
+    // QEMU's own view is a cross-check, and the monitor competes for the
+    // lock with the memory work the guest is doing, so failing to get it
+    // is worth saying rather than worth aborting over.
+    let host = match qmp.query_balloon() {
+        Ok(info) => format!("qemu-backed={}", format_bytes(info.actual)),
+        Err(error) => format!("qemu-backed=unavailable ({error})"),
+    };
+    println!(
+        "{} {label}: {guest} {host} user-memory-available={}",
+        style("balloon").green(),
+        format_bytes(sample.memory.available_bytes)
+    );
+    Ok(())
 }
 
 fn run_workload_bench(
@@ -1427,6 +1630,8 @@ fn run_step(label: &str, command: &mut Command) -> Result<()> {
 struct VmRuntime {
     transport: Option<VmTransport>,
     _serial_pty_slave: Option<fs::File>,
+    /// The QMP socket the inspector created, when it owns one.
+    qmp_socket: Option<PathBuf>,
     runtime_dir: VmRuntimeDir,
     child: Child,
 }
@@ -1604,6 +1809,7 @@ impl VmRuntime {
             configure_watchdog(&mut qemu, watchdog);
         }
         configure_entropy_device(&mut qemu, command.profile.entropy, command.virtio_devices);
+        configure_balloon(&mut qemu, command.profile.balloon, command.virtio_devices);
 
         let mut child = qemu.spawn().with_context(|| {
             format!(
@@ -1638,6 +1844,7 @@ impl VmRuntime {
         Ok(Self {
             transport: Some(transport),
             _serial_pty_slave: serial_pty_slave,
+            qmp_socket: qmp_socket_path(command, runtime_dir.path()),
             runtime_dir,
             child,
         })
@@ -1696,10 +1903,23 @@ fn monitor_endpoint(command: &ResolvedVmCommand, runtime_dir: &Path) -> Option<S
 
 fn qmp_endpoint(command: &ResolvedVmCommand, runtime_dir: &Path) -> Option<String> {
     command.qmp.clone().or_else(|| {
-        command
-            .keep_runtime_dir
+        (command.keep_runtime_dir || command.needs_qmp)
             .then(|| unix_endpoint(runtime_dir, "qmp.sock"))
     })
+}
+
+/// The QMP socket the inspector can talk to, when there is one it owns
+/// the path of.
+///
+/// A hand-written `--qmp` endpoint is passed to QEMU verbatim and may
+/// name a TCP port or a socket QEMU connects out to, so only the
+/// `unix:<path>` form the inspector understands is offered back to the
+/// commands that drive QMP themselves.
+fn qmp_socket_path(command: &ResolvedVmCommand, runtime_dir: &Path) -> Option<PathBuf> {
+    let endpoint = qmp_endpoint(command, runtime_dir)?;
+    let path = endpoint.strip_prefix("unix:")?;
+    let path = path.split(',').next().unwrap_or(path);
+    Some(PathBuf::from(path))
 }
 
 fn unix_endpoint(runtime_dir: &Path, name: &str) -> String {
@@ -2092,6 +2312,39 @@ fn apply_transport(pci: bool, devices: VirtioDeviceProfile, options: &mut QemuOp
     }
 }
 
+/// Gives the guest a memory balloon with every reclamation path this
+/// kernel drives turned on.
+///
+/// `free-page-reporting` is what makes an idle guest give its host back
+/// real pages; `free-page-hint` is the migration-time form of the same
+/// information; `deflate-on-oom` lets the guest take its memory back
+/// before it starts killing programs. None of them is on by default in
+/// QEMU, and a guest that negotiated a feature the device never offered
+/// would silently run without it.
+fn configure_balloon(qemu: &mut Command, balloon: VmBalloonProfile, devices: VirtioDeviceProfile) {
+    // QEMU walks a free-page hint sequence on a thread of its own and
+    // refuses to create the device without one, because the hint queue
+    // is drained while the guest is still running.
+    let mut iothread = QemuOptions::new("iothread");
+    iothread.set("id", BALLOON_IOTHREAD_ID);
+    qemu.arg("-object").arg(iothread.to_string());
+
+    let mut device = QemuOptions::new(match balloon {
+        VmBalloonProfile::VirtioBalloonMmio => "virtio-balloon-device",
+        VmBalloonProfile::VirtioBalloonPci => "virtio-balloon-pci",
+    });
+    device.set("free-page-reporting", "on");
+    device.set("free-page-hint", "on");
+    device.set("deflate-on-oom", "on");
+    device.set("iothread", BALLOON_IOTHREAD_ID);
+    apply_transport(
+        balloon == VmBalloonProfile::VirtioBalloonPci,
+        devices,
+        &mut device,
+    );
+    qemu.arg("-device").arg(device.to_string());
+}
+
 fn configure_watchdog(qemu: &mut Command, watchdog: VmWatchdogProfile) {
     match watchdog {
         VmWatchdogProfile::I6300Esb => {
@@ -2110,6 +2363,7 @@ impl From<VmSessionCommand> for ResolvedVmSessionCommand {
             VmSessionCommand::Repl => Self::Session(SessionCommand::Repl),
             VmSessionCommand::AotBench(command) => Self::AotBench(command),
             VmSessionCommand::WorkloadBench(command) => Self::WorkloadBench(command),
+            VmSessionCommand::Balloon(command) => Self::Balloon(command),
             VmSessionCommand::NetSetup(_) | VmSessionCommand::NetTeardown(_) => {
                 unreachable!("the privileged network helpers never reach a guest session")
             }
@@ -2150,6 +2404,68 @@ mod tests {
 
     fn default_network() -> VmNetwork {
         VmNetwork::resolve(default_network_args(), VmNetworkFile::default())
+    }
+
+    /// Every reclamation path the guest kernel drives has to be on the
+    /// device, because QEMU offers none of them by default and a
+    /// feature the device never offered is one the guest silently runs
+    /// without.
+    #[test]
+    fn every_profile_attaches_a_balloon_with_every_reclamation_path() {
+        for profile in [
+            &AARCH64_VIRT_HVF_PROFILE,
+            &RISCV64_VM_PROFILE,
+            &X86_64_VM_PROFILE,
+        ] {
+            let mut qemu = Command::new("qemu");
+            configure_balloon(&mut qemu, profile.balloon, VirtioDeviceProfile::default());
+            let rendered: Vec<String> = qemu
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect();
+            let device = rendered.last().expect("the balloon device is rendered");
+            assert!(device.contains("free-page-reporting=on"), "{device}");
+            assert!(device.contains("free-page-hint=on"), "{device}");
+            assert!(device.contains("deflate-on-oom=on"), "{device}");
+            assert!(
+                device.contains(&format!("iothread={BALLOON_IOTHREAD_ID}")),
+                "{device}"
+            );
+            assert!(
+                rendered
+                    .iter()
+                    .any(|argument| argument == &format!("iothread,id={BALLOON_IOTHREAD_ID}")),
+                "the balloon's IOThread has to be created before the device names it: {rendered:?}"
+            );
+        }
+        assert_eq!(
+            AARCH64_VIRT_HVF_PROFILE.balloon,
+            VmBalloonProfile::VirtioBalloonMmio
+        );
+        assert_eq!(
+            RISCV64_VM_PROFILE.balloon,
+            VmBalloonProfile::VirtioBalloonMmio
+        );
+        assert_eq!(
+            X86_64_VM_PROFILE.balloon,
+            VmBalloonProfile::VirtioBalloonPci
+        );
+    }
+
+    /// A balloon session needs a socket to speak QMP over, whether or
+    /// not the runtime directory is being kept.
+    #[test]
+    fn a_balloon_session_gets_a_qmp_socket_of_its_own() {
+        let mut command = watchdog_test_command(VmArch::Aarch64);
+        command.needs_qmp = true;
+        let runtime_dir = Path::new("/tmp/helios-vm");
+        assert_eq!(
+            qmp_socket_path(&command, runtime_dir),
+            Some(PathBuf::from("/tmp/helios-vm/qmp.sock"))
+        );
+
+        command.needs_qmp = false;
+        assert_eq!(qmp_socket_path(&command, runtime_dir), None);
     }
 
     #[test]
@@ -2565,6 +2881,7 @@ mod tests {
             keep_runtime_dir: false,
             iommu: false,
             virtio_devices: VirtioDeviceProfile::default(),
+            needs_qmp: false,
             network: default_network(),
             qemu_net: profile.network.map(|device| {
                 default_network()
@@ -2733,6 +3050,7 @@ mod tests {
             keep_runtime_dir: false,
             iommu: false,
             virtio_devices: VirtioDeviceProfile::default(),
+            needs_qmp: false,
             network: default_network(),
             qemu_net: profile.network.map(|device| {
                 default_network()

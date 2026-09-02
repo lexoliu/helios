@@ -22,6 +22,7 @@ use helios_hal::io::{IoError, IoResult};
 use pci_types::capability::PciCapability;
 use pci_types::{Bar, CommandRegister, ConfigRegionAccess, EndpointHeader, PciAddress, PciHeader};
 
+use crate::balloon::VirtioBalloonDevice;
 use crate::block::{QueueAffinity, VirtioBlockDevice, VirtioBlockResource};
 use crate::bus::{DeviceBus, DmaPool};
 use crate::iommu::VirtioIommuDevice;
@@ -522,6 +523,10 @@ impl<P: DmaPool> VirtioTransport for VirtioPciTransport<P> {
         self.bus.read_u32(offset)
     }
 
+    fn write_config_u32(&self, offset: usize, value: u32) {
+        self.bus.write_u32(offset, value);
+    }
+
     fn read_config_u8(&self, offset: usize) -> u8 {
         self.bus.read_u8(offset)
     }
@@ -717,6 +722,23 @@ where
 {
     let transport = VirtioPciTransport::new(access, address, mapper, dma, msix_vector)?;
     VirtioRngDevice::new(transport)
+}
+
+/// Builds a virtio-balloon driver on top of a modern virtio-PCI function.
+pub fn balloon_from_pci<A, M, P>(
+    access: &A,
+    address: PciAddress,
+    mapper: &M,
+    dma: P,
+    msix_vector: Option<u16>,
+) -> IoResult<VirtioBalloonDevice<VirtioPciTransport<P>>>
+where
+    A: ConfigRegionAccess,
+    M: PciMmioMapper,
+    P: DmaPool,
+{
+    let transport = VirtioPciTransport::new(access, address, mapper, dma, msix_vector)?;
+    VirtioBalloonDevice::new(transport)
 }
 
 #[cfg(test)]

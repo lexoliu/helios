@@ -42,6 +42,7 @@ pub enum DeviceType {
     Network = 1,
     Block = 2,
     Entropy = 4,
+    MemoryBalloon = 5,
     _9P = 9,
     /// virtio-iommu: the translation unit the platform's confined
     /// devices issue their DMA through.
@@ -57,6 +58,7 @@ impl DeviceType {
             1 => Some(Self::Network),
             2 => Some(Self::Block),
             4 => Some(Self::Entropy),
+            5 => Some(Self::MemoryBalloon),
             9 => Some(Self::_9P),
             23 => Some(Self::Iommu),
             _ => None,
@@ -197,6 +199,14 @@ pub trait VirtioTransport: Send + Sync + 'static {
 
     fn read_config_u32(&self, offset: usize) -> u32;
 
+    /// Writes one 32-bit device configuration field.
+    ///
+    /// Most device configuration is read-only to the driver; the fields
+    /// that are not — virtio-balloon's `actual` — are how the driver
+    /// reports its own state back, so the write path belongs to the
+    /// transport alongside the read.
+    fn write_config_u32(&self, offset: usize, value: u32);
+
     fn read_config_u8(&self, offset: usize) -> u8 {
         let word_offset = offset & !0x3;
         let byte_index = offset & 0x3;
@@ -329,6 +339,10 @@ impl<B: DeviceBus> VirtioTransport for VirtioMmioTransport<B> {
 
     fn read_config_u32(&self, offset: usize) -> u32 {
         self.bus.read_u32(CONFIG_SPACE_OFFSET + offset)
+    }
+
+    fn write_config_u32(&self, offset: usize, value: u32) {
+        self.bus.write_u32(CONFIG_SPACE_OFFSET + offset, value);
     }
 
     fn read_config_u8(&self, offset: usize) -> u8 {

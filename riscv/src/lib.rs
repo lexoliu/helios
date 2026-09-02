@@ -2,6 +2,7 @@
 #![no_main]
 
 extern crate alloc;
+mod balloon;
 mod block;
 mod entropy;
 mod host_fs;
@@ -590,6 +591,9 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     if entropy::has_entropy_device(&fdt) {
         devices = devices.with_entropy_device();
     }
+    if balloon::has_balloon_device(&fdt) {
+        devices = devices.with_memory_balloon();
+    }
     let kernel = helios_kernel::init_with_watchdog(
         helios_kernel::Platform::with_watchdog(
             console,
@@ -633,6 +637,10 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             }
             if let Some(entropy) = entropy::install(&kernel, &fdt, root_entropy.clone()) {
                 interrupts.attach_entropy(entropy);
+            }
+            if let Some(balloon) = balloon::install(&kernel, &fdt) {
+                debug_state.install_memory_balloon(balloon.handle.clone());
+                interrupts.attach_balloon(balloon);
             }
             for block in block::install(&cpu, &kernel, &fdt, &debug_state, root_entropy) {
                 interrupts.attach_block(block);

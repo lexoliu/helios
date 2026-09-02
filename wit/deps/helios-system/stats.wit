@@ -79,6 +79,16 @@ interface stats {
     endpoints: list<iommu-endpoint>,
   }
 
+  /// The memory balloon the host resizes this guest through.
+  record memory-balloon {
+    /// Bytes the host has asked the guest to give up.
+    target-bytes: u64,
+    /// Bytes the guest has actually given up.
+    actual-bytes: u64,
+    /// Bytes named to the host as free in the last reporting pass.
+    reported-bytes: u64,
+  }
+
   record sample {
     timestamp: mono-nanos,
     uptime: mono-nanos,
@@ -89,6 +99,8 @@ interface stats {
     /// Absent on a machine whose devices are not behind a translation
     /// unit, and therefore reach all of memory.
     iommu: option<iommu>,
+    /// Absent on a machine that gave the kernel no memory balloon.
+    balloon: option<memory-balloon>,
   }
 
   /// Returns the latest coherent system-wide observation snapshot.

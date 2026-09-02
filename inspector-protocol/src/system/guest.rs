@@ -528,6 +528,15 @@ fn convert_sample(sample: host_stats::Sample) -> stats::Sample {
         },
         block: sample.block.map(convert_block_device),
         iommu: sample.iommu.map(convert_iommu),
+        balloon: sample.balloon.map(convert_memory_balloon),
+    }
+}
+
+fn convert_memory_balloon(balloon: host_stats::MemoryBalloon) -> stats::MemoryBalloon {
+    stats::MemoryBalloon {
+        target_bytes: balloon.target_bytes,
+        actual_bytes: balloon.actual_bytes,
+        reported_bytes: balloon.reported_bytes,
     }
 }
 
