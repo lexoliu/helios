@@ -93,7 +93,7 @@ impl<T: VirtioTransport> RingOps<T> for SplitRing<T> {
     fn submit(&mut self, chain: &[ChainEntry], publish: bool) -> Result<u16, VirtqueueError> {
         self.core.check_chain(chain)?;
         let indirect = self.core.use_indirect(chain.len());
-        let needed = if indirect { 1 } else { chain.len() };
+        let needed = self.core.descriptors_needed(chain.len());
         if usize::from(self.core.ids.available()) < needed {
             return Err(VirtqueueError::Full { needed });
         }
@@ -156,6 +156,10 @@ impl<T: VirtioTransport> RingOps<T> for SplitRing<T> {
 
     fn available(&self) -> usize {
         usize::from(self.core.ids.available())
+    }
+
+    fn has_room_for(&self, buffers: usize) -> bool {
+        usize::from(self.core.ids.available()) >= self.core.descriptors_needed(buffers)
     }
 
     fn next_id(&self) -> u16 {

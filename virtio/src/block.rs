@@ -9,7 +9,7 @@ use helios_hal::resource::KernelResource;
 use helios_hal::vmm::SwapBackend;
 
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
-use crate::inflight::{InFlight, await_completion};
+use crate::inflight::{InFlight, await_completion, submit_chain};
 use crate::notify::Notify;
 use crate::queue::VirtQueue;
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
@@ -213,13 +213,15 @@ impl<T: VirtioTransport> VirtioBlockDevice<T> {
     /// — which EVENT_IDX and IN_ORDER both permit — is handled without
     /// any task assuming the completion it sees is its own.
     async fn execute(&self, inputs: &[&[u8]], outputs: &mut [&mut [u8]]) -> IoResult<u32> {
-        let token = {
-            let mut queue = self.queue.lock().await;
-            let token = queue.submit(&self.transport, inputs, outputs)?;
-            queue.notify(&self.transport);
-            self.inflight.register(token);
-            token
-        };
+        let token = submit_chain(
+            &self.inflight,
+            &self.queue,
+            &self.interrupts,
+            &self.transport,
+            inputs,
+            outputs,
+        )
+        .await?;
 
         Ok(
             await_completion(&self.inflight, &self.queue, &self.interrupts, token, || {

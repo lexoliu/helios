@@ -108,7 +108,7 @@ impl<T: VirtioTransport> RingOps<T> for PackedRing<T> {
     fn submit(&mut self, chain: &[ChainEntry], _publish: bool) -> Result<u16, VirtqueueError> {
         self.core.check_chain(chain)?;
         let indirect = self.core.use_indirect(chain.len());
-        let needed = if indirect { 1 } else { chain.len() };
+        let needed = self.core.descriptors_needed(chain.len());
         if usize::from(self.free_slots) < needed || self.core.ids.available() == 0 {
             return Err(VirtqueueError::Full { needed });
         }
@@ -232,6 +232,11 @@ impl<T: VirtioTransport> RingOps<T> for PackedRing<T> {
 
     fn available(&self) -> usize {
         usize::from(self.free_slots.min(self.core.ids.available()))
+    }
+
+    fn has_room_for(&self, buffers: usize) -> bool {
+        usize::from(self.free_slots) >= self.core.descriptors_needed(buffers)
+            && self.core.ids.available() != 0
     }
 
     fn next_id(&self) -> u16 {

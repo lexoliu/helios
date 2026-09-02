@@ -1856,10 +1856,8 @@ version = "0.1.0"
 dependencies = [
  "arrayvec",
  "bytes",
- "concurrent-queue",
  "critical-section",
  "fdt",
- "futures",
  "helios-hal",
  "helios-kernel",
  "helios-virtio",
@@ -1883,6 +1881,7 @@ dependencies = [
  "async-lock",
  "bitflags 2.13.1",
  "bytes",
+ "critical-section",
  "divan",
  "event-listener",
  "fdt",

@@ -1,10 +1,11 @@
 //! virtio-9p host share over PCI for the x86 backend.
 //!
 //! Concurrency contract: the device is constructed on the bootstrap
-//! processor before interrupts are unmasked. Afterwards requests are
-//! serialised by the driver's own async mutex and completions arrive on
-//! the device's MSI-X vector, so callers await a notification instead of
-//! polling the used ring.
+//! processor before interrupts are unmasked. Afterwards every caller
+//! submits straight to the device, which pipelines requests and routes
+//! each completion back to the task that submitted it; completions
+//! arrive on the device's MSI-X vector, so callers await a notification
+//! instead of polling the used ring.
 
 extern crate alloc;
 
@@ -74,6 +75,10 @@ impl ExternalInterruptHandler for HostFsTransportService {
 impl HostFsTransport for HostFsTransportService {
     fn mount_tag(&self) -> &str {
         self.device.mount_tag()
+    }
+
+    fn pipeline_depth(&self) -> usize {
+        self.device.pipeline_depth()
     }
 
     fn request<'a>(

@@ -602,7 +602,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     );
     let external_interrupts = if current_hart == bootstrap_processor {
         let mut interrupts = net::install_network_service(&cpu, &kernel, &fdt, &debug_state);
-        if let Some(host_fs) = host_fs::install(&cpu, &kernel, &fdt, &debug_state) {
+        if let Some(host_fs) = host_fs::install(&cpu, &fdt, &debug_state) {
             host_fs.plic.set_priority(host_fs.interrupt.source, 1);
             host_fs
                 .plic
