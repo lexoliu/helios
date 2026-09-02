@@ -82,7 +82,7 @@ impl<T: VirtioTransport> Virtio9pDevice<T> {
     /// Interrupt handlers should only acknowledge the device and wake waiters.
     pub fn handle_interrupt(&self) {
         self.transport.ack_interrupt();
-        self.interrupts.notify_one();
+        self.interrupts.notify_all();
     }
 
     pub async fn request(&self, request: &[u8], response: &mut [u8]) -> IoResult<u32> {

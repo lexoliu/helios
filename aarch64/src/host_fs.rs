@@ -1,9 +1,10 @@
 extern crate alloc;
 
+use arm_gic::{IntId, Trigger};
 use bytes::BytesMut;
 use fdt::Fdt;
 use helios_hal::io::IoError;
-use helios_kernel::HostFsTransport;
+use helios_kernel::{ExternalInterruptHandler, HostFsTransport};
 use triomphe::Arc;
 
 type Aarch64Virtio9pDevice = helios_virtio::Virtio9pDevice<
@@ -17,23 +18,38 @@ pub(crate) struct HostFsTransportService {
     device: Arc<Aarch64Virtio9pDevice>,
 }
 
+impl ExternalInterruptHandler for HostFsTransportService {
+    fn handle_interrupt(&self) {
+        self.device.handle_interrupt();
+    }
+}
+
+/// The 9p transport the bootstrap processor brought up, together with
+/// the interrupt the device tree routes it to.
+pub(crate) struct HostFsInterrupt {
+    pub(crate) interrupt: IntId,
+    pub(crate) trigger: Trigger,
+    pub(crate) transport: HostFsTransportService,
+}
+
 pub(crate) fn install(
-    fdt: Option<&Fdt<'_>>,
+    fdt: &Fdt<'_>,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
     debug_state: &crate::debug_state::RuntimeState,
-) {
-    let Some(device) = discover_9p_device(fdt, physical_memory_offset, handoff) else {
+) -> Option<HostFsInterrupt> {
+    let Some(probe) = discover_9p_device(fdt, physical_memory_offset, handoff) else {
         tracing::warn!("virtio 9p device was not discovered on the platform bus");
-        return;
+        return None;
     };
-    let transport = HostFsTransportService { device };
-    let service = HostFileSystemService::new(transport);
+    let service = HostFileSystemService::new(probe.transport.clone());
     debug_state.install_host_fs_service(service);
     tracing::info!(
-        "virtio 9p online mount_tag={}",
-        helios_kernel::HOST_SHARE_MOUNT_TAG
+        "virtio 9p online mount_tag={} interrupt={:?}",
+        helios_kernel::HOST_SHARE_MOUNT_TAG,
+        probe.interrupt
     );
+    Some(probe)
 }
 
 impl HostFsTransport for HostFsTransportService {
@@ -50,10 +66,7 @@ impl HostFsTransport for HostFsTransportService {
         async move {
             response.clear();
             response.resize(response_len, 0);
-            let used = self
-                .device
-                .request_with_wait(bytes, response, helios_kernel::yield_now)
-                .await?;
+            let used = self.device.request(bytes, response).await?;
             let used = usize::try_from(used).map_err(|_| IoError::DeviceFault)?;
             response.truncate(used);
             Ok(())
@@ -61,66 +74,36 @@ impl HostFsTransport for HostFsTransportService {
     }
 }
 
-pub(crate) fn has_9p_device(
-    fdt: Option<&Fdt<'_>>,
+pub(crate) fn has_9p_device(fdt: &Fdt<'_>) -> bool {
+    crate::count_virtio_mmio_devices(fdt, helios_virtio::DeviceType::_9P) != 0
+}
+
+fn discover_9p_device(
+    fdt: &Fdt<'_>,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
-) -> bool {
-    if fdt.is_some_and(|fdt| {
-        crate::count_virtio_mmio_devices(fdt, helios_virtio::DeviceType::_9P) != 0
-    }) {
-        return true;
-    }
-    scan_qemu_virt_mmio(physical_memory_offset, handoff).any(|physical_base| {
+) -> Option<HostFsInterrupt> {
+    let candidate = helios_virtio::mmio_candidates(fdt).find(|candidate| {
         crate::matches_virtio_mmio_device(
-            physical_base,
+            candidate.base,
             physical_memory_offset,
             handoff,
             helios_virtio::DeviceType::_9P,
         )
-    })
-}
-
-fn discover_9p_device(
-    fdt: Option<&Fdt<'_>>,
-    physical_memory_offset: usize,
-    handoff: &crate::LimineBootHandoff,
-) -> Option<Arc<Aarch64Virtio9pDevice>> {
-    if let Some(fdt) = fdt {
-        if let Some(candidate) = helios_virtio::mmio_candidates(fdt).find(|candidate| {
-            crate::matches_virtio_mmio_device(
-                candidate.base,
-                physical_memory_offset,
-                handoff,
-                helios_virtio::DeviceType::_9P,
-            )
-        }) {
-            return Some(init_9p_device(
+    })?;
+    let (interrupt, trigger) = crate::gic::device_interrupt(candidate.interrupt, candidate.base);
+    Some(HostFsInterrupt {
+        interrupt,
+        trigger,
+        transport: HostFsTransportService {
+            device: init_9p_device(
                 candidate.base,
                 candidate.size,
                 physical_memory_offset,
                 handoff,
-            ));
-        }
-    }
-
-    scan_qemu_virt_mmio(physical_memory_offset, handoff)
-        .find(|physical_base| {
-            crate::matches_virtio_mmio_device(
-                *physical_base,
-                physical_memory_offset,
-                handoff,
-                helios_virtio::DeviceType::_9P,
-            )
-        })
-        .map(|physical_base| {
-            init_9p_device(
-                physical_base,
-                crate::QEMU_VIRT_MMIO_SIZE,
-                physical_memory_offset,
-                handoff,
-            )
-        })
+            ),
+        },
+    })
 }
 
 fn init_9p_device(
@@ -139,9 +122,4 @@ fn init_9p_device(
         |error| panic!("failed to initialize virtio-9p device at {physical_base:#x}: {error}"),
     );
     Arc::new(device)
-}
-
-fn scan_qemu_virt_mmio(_: usize, _: &crate::LimineBootHandoff) -> impl Iterator<Item = usize> {
-    (0..crate::QEMU_VIRT_MMIO_SLOTS)
-        .map(|slot| crate::QEMU_VIRT_MMIO_BASE + slot * crate::QEMU_VIRT_MMIO_STRIDE)
 }

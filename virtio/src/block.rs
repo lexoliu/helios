@@ -169,7 +169,7 @@ impl<T: VirtioTransport> VirtioBlockDevice<T> {
     /// interrupt and wake the async driver task.
     pub fn handle_interrupt(&self) {
         self.transport.ack_interrupt();
-        self.interrupts.notify_one();
+        self.interrupts.notify_all();
     }
 
     async fn read_block_inner(&self, block_id: usize, buf: &mut [u8]) -> IoResult<()> {

@@ -363,7 +363,8 @@ fn discover_network_device(fdt: &Fdt<'_>) -> Option<(VirtioNetworkDevice, Interr
     let header = core::ptr::NonNull::new(base as *mut u8)
         .unwrap_or_else(|| panic!("virtio MMIO base {base:#x} was unexpectedly null"));
     let irq_source = candidate
-        .irq
+        .interrupt
+        .and_then(|interrupt| NonZeroU32::new(interrupt.number))
         .map(InterruptSourceId)
         .unwrap_or_else(|| panic!("virtio-net node at {base:#x} has no valid interrupt source"));
     let device =

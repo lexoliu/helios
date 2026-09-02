@@ -30,9 +30,18 @@ impl Notify {
         }
     }
 
-    pub fn notify_one(&self) {
+    /// Wakes every task waiting on this notification.
+    ///
+    /// A device interrupt is a broadcast fact — the device made
+    /// progress — and not a token that one waiter may consume: the
+    /// packet pump and a per-operation waiter are routinely parked on
+    /// the same device at once, and handing the wake to only one of
+    /// them leaves the other asleep until its own deadline expires.
+    /// The permit still covers a waiter that registers just after the
+    /// interrupt rather than just before it.
+    pub fn notify_all(&self) {
         self.add_permits(1);
-        self.event.notify(1);
+        self.event.notify(usize::MAX);
     }
 
     fn add_permits(&self, permits: usize) {

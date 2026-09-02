@@ -23,7 +23,7 @@ _start:
 __helios_aarch64_exception_vectors:
     b __helios_aarch64_sync_exception
     .balign 128
-    b __helios_aarch64_sync_exception
+    b __helios_aarch64_irq
     .balign 128
     b __helios_aarch64_sync_exception
     .balign 128
@@ -31,7 +31,7 @@ __helios_aarch64_exception_vectors:
     .balign 128
     b __helios_aarch64_sync_exception
     .balign 128
-    b __helios_aarch64_sync_exception
+    b __helios_aarch64_irq
     .balign 128
     b __helios_aarch64_sync_exception
     .balign 128
@@ -39,7 +39,7 @@ __helios_aarch64_exception_vectors:
     .balign 128
     b __helios_aarch64_sync_exception
     .balign 128
-    b __helios_aarch64_sync_exception
+    b __helios_aarch64_irq
     .balign 128
     b __helios_aarch64_sync_exception
     .balign 128
@@ -47,7 +47,7 @@ __helios_aarch64_exception_vectors:
     .balign 128
     b __helios_aarch64_sync_exception
     .balign 128
-    b __helios_aarch64_sync_exception
+    b __helios_aarch64_irq
     .balign 128
     b __helios_aarch64_sync_exception
     .balign 128
@@ -71,6 +71,58 @@ __helios_aarch64_sync_exception:
 1:
     wfi
     b 1b
+
+// IRQ entry. The interrupted context keeps SP_EL1 untouched: selecting
+// SP_EL0 switches to the per-processor exception stack that
+// `activate_processor_runtime` installed there, so an interrupt taken on
+// a small runtime stack cannot overflow it, and returning is a plain
+// `msr spsel, #1`. PSTATE.I stays set for the whole handler, so the
+// frame below is never re-entered.
+__helios_aarch64_irq:
+    msr spsel, #0
+    sub sp, sp, #{irq_frame_bytes}
+    stp x0, x1, [sp, #0x00]
+    stp x2, x3, [sp, #0x10]
+    stp x4, x5, [sp, #0x20]
+    stp x6, x7, [sp, #0x30]
+    stp x8, x9, [sp, #0x40]
+    stp x10, x11, [sp, #0x50]
+    stp x12, x13, [sp, #0x60]
+    stp x14, x15, [sp, #0x70]
+    stp x16, x17, [sp, #0x80]
+    stp x18, x19, [sp, #0x90]
+    stp x20, x21, [sp, #0xa0]
+    stp x22, x23, [sp, #0xb0]
+    stp x24, x25, [sp, #0xc0]
+    stp x26, x27, [sp, #0xd0]
+    stp x28, x29, [sp, #0xe0]
+    mrs x0, elr_el1
+    mrs x1, spsr_el1
+    stp x30, x0, [sp, #0xf0]
+    str x1, [sp, #0x100]
+    bl aarch64_handle_irq
+    ldr x1, [sp, #0x100]
+    ldp x30, x0, [sp, #0xf0]
+    msr elr_el1, x0
+    msr spsr_el1, x1
+    ldp x28, x29, [sp, #0xe0]
+    ldp x26, x27, [sp, #0xd0]
+    ldp x24, x25, [sp, #0xc0]
+    ldp x22, x23, [sp, #0xb0]
+    ldp x20, x21, [sp, #0xa0]
+    ldp x18, x19, [sp, #0x90]
+    ldp x16, x17, [sp, #0x80]
+    ldp x14, x15, [sp, #0x70]
+    ldp x12, x13, [sp, #0x60]
+    ldp x10, x11, [sp, #0x50]
+    ldp x8, x9, [sp, #0x40]
+    ldp x6, x7, [sp, #0x30]
+    ldp x4, x5, [sp, #0x20]
+    ldp x2, x3, [sp, #0x10]
+    ldp x0, x1, [sp, #0x00]
+    add sp, sp, #{irq_frame_bytes}
+    msr spsel, #1
+    eret
 
 .section .bss.stack, "aw", %nobits
 .align 12
