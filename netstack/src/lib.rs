@@ -19,9 +19,9 @@ use helios_hal::io::IoResult;
 use thiserror::Error;
 
 pub use checksum::{
-    icmpv6_checksum, icmpv6_checksum_valid, internet_checksum, ipv4_checksum, tcp_checksum_valid,
-    tcp_pseudo_header_checksum, tcpv4_checksum, tcpv6_checksum, udp_checksum, udp_checksum_valid,
-    udp_pseudo_header_checksum,
+    icmpv6_checksum, icmpv6_checksum_valid, internet_checksum, ipv4_checksum,
+    partial_transport_checksum_completes, tcp_checksum_valid, tcp_pseudo_header_checksum,
+    tcpv4_checksum, tcpv6_checksum, udp_checksum, udp_checksum_valid, udp_pseudo_header_checksum,
 };
 pub use congestion::{
     AckSample, BbrV3, CongestionControl, CongestionEvent, CongestionWindow, Cubic, NewReno,
@@ -43,10 +43,9 @@ pub use packet::{
     ArpOperation, ArpPacket, EthernetFrame, EthernetProtocol, Icmpv4DestinationUnreachableCode,
     Icmpv4Echo, Icmpv4Packet, Icmpv6DestinationUnreachableCode, Icmpv6Echo, Icmpv6Packet,
     Icmpv6PacketTooBig, Icmpv6RouterAdvertisement, IpProtocol, Ipv4Packet, Ipv6Packet,
-    NdpOption, NdpOptionIter, NdpOptions, NdpPrefixInformation, NdpRecursiveDnsServers,
-    MAX_TCP_SACK_BLOCKS, TcpFlags,
-    TcpHeader, TcpHeaderOptions, TcpOptions, TcpPacket, TcpSackBlock, TcpSackBlocks,
-    TcpTimestampOption, TransportChecksum, TransportPorts, UdpPacket,
+    MAX_TCP_SACK_BLOCKS, NdpOption, NdpOptionIter, NdpOptions, NdpPrefixInformation,
+    NdpRecursiveDnsServers, TcpFlags, TcpHeader, TcpHeaderOptions, TcpOptions, TcpPacket,
+    TcpSackBlock, TcpSackBlocks, TcpTimestampOption, TransportChecksum, TransportPorts, UdpPacket,
 };
 pub use stack::{
     DEFAULT_TCP_LISTEN_BACKLOG, DhcpLease, DnsQueryId, IcmpEchoKey, IcmpEchoReply,
@@ -88,15 +87,169 @@ pub struct ChecksumOffload {
     pub tx_udp: bool,
 }
 
+/// What a device reported about one received frame's transport
+/// checksum.
+///
+/// The interface-wide [`ChecksumOffload`] says what the device is *able*
+/// to do; this says what it actually did to the frame in hand. Both are
+/// required before the stack skips a software verification: a device
+/// that validates checksums still delivers frames it did not validate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RxChecksumReport {
+    /// The device made no claim about this frame; the stack verifies the
+    /// transport checksum in software.
+    #[default]
+    Unverified,
+    /// The device validated the transport checksum (virtio's
+    /// `VIRTIO_NET_HDR_F_DATA_VALID`).
+    Validated,
+    /// The frame carries a partial checksum the sender never finished
+    /// (virtio's `VIRTIO_NET_HDR_F_NEEDS_CSUM`): the two bytes at
+    /// `start + offset` hold the running one's-complement sum, and the
+    /// receiver completes it over `start..` before the checksum means
+    /// anything. Offsets are relative to the first byte of the layer the
+    /// report is attached to, starting at the Ethernet header.
+    Partial { start: u16, offset: u16 },
+}
+
+/// Per-frame receive metadata a device reports alongside the frame
+/// bytes, taken from its receive descriptor header.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RxFrameOffload {
+    /// What the device did about the transport checksum.
+    pub checksum: RxChecksumReport,
+    /// Payload bytes per wire segment when the device coalesced several
+    /// received segments into this frame (large receive offload), or
+    /// `None` for a frame that arrived as it is.
+    pub large_receive_segment_bytes: Option<u16>,
+}
+
+impl RxFrameOffload {
+    /// Metadata for a frame the device said nothing about.
+    pub const fn none() -> Self {
+        Self {
+            checksum: RxChecksumReport::Unverified,
+            large_receive_segment_bytes: None,
+        }
+    }
+
+    /// Metadata for a frame whose transport checksum the device
+    /// validated.
+    pub const fn validated() -> Self {
+        Self {
+            checksum: RxChecksumReport::Validated,
+            large_receive_segment_bytes: None,
+        }
+    }
+
+    /// Metadata for a frame carrying an unfinished partial checksum.
+    pub const fn partial(start: u16, offset: u16) -> Self {
+        Self {
+            checksum: RxChecksumReport::Partial { start, offset },
+            large_receive_segment_bytes: None,
+        }
+    }
+
+    /// Re-bases the checksum offsets onto a payload that begins `bytes`
+    /// into the layer this metadata currently describes.
+    ///
+    /// A report whose checksum region starts before the new layer says
+    /// nothing about that layer's transport checksum, so it degrades to
+    /// [`RxChecksumReport::Unverified`] and the stack verifies in
+    /// software.
+    pub fn advance(self, bytes: usize) -> Self {
+        let checksum = match self.checksum {
+            RxChecksumReport::Partial { start, offset } => {
+                match usize::from(start).checked_sub(bytes) {
+                    Some(start) => match u16::try_from(start) {
+                        Ok(start) => RxChecksumReport::Partial { start, offset },
+                        Err(_) => RxChecksumReport::Unverified,
+                    },
+                    None => RxChecksumReport::Unverified,
+                }
+            }
+            report => report,
+        };
+        Self { checksum, ..self }
+    }
+}
+
+/// One received frame plus the offload metadata the device reported for
+/// it.
+///
+/// The bytes are owned so the stack can slice payloads into socket
+/// receive queues without copying; the metadata is `Copy` and travels
+/// with them down the receive path.
+#[derive(Clone, Debug)]
+pub struct RxFrame {
+    pub bytes: Bytes,
+    pub offload: RxFrameOffload,
+}
+
+impl RxFrame {
+    /// A frame the device reported no offload metadata for.
+    pub fn new(bytes: Bytes) -> Self {
+        Self {
+            bytes,
+            offload: RxFrameOffload::none(),
+        }
+    }
+
+    /// A frame with the metadata its device receive header carried.
+    pub const fn with_offload(bytes: Bytes, offload: RxFrameOffload) -> Self {
+        Self { bytes, offload }
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+impl AsRef<[u8]> for RxFrame {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+}
+
+/// Whether the interface currently has carrier.
+///
+/// Devices that cannot report carrier leave this at [`LinkState::Up`];
+/// virtio-net reports it out of its configuration space whenever a
+/// configuration-change interrupt arrives.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LinkState {
+    #[default]
+    Up,
+    Down,
+}
+
+impl LinkState {
+    pub const fn is_up(self) -> bool {
+        matches!(self, Self::Up)
+    }
+}
+
 /// Hardware segmentation and coalescing capabilities.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SegmentationOffload {
     /// TCP segmentation offload for IPv4 packets.
     pub tx_tcp_ipv4: bool,
-    /// TCP large receive offload for IPv4 packets.
+    /// TCP segmentation offload for IPv6 packets.
+    pub tx_tcp_ipv6: bool,
+    /// TCP large receive offload for IPv4 packets: the device may
+    /// deliver one frame carrying several coalesced wire segments.
     pub rx_tcp_ipv4: bool,
+    /// TCP large receive offload for IPv6 packets.
+    pub rx_tcp_ipv6: bool,
     /// Maximum payload bytes accepted by TSO.
     pub max_tx_segment_bytes: usize,
+    /// Largest frame the device may deliver once large receive offload
+    /// is enabled; equal to `max_frame_len` when it is not.
+    pub max_rx_frame_bytes: usize,
 }
 
 /// Multi-queue and flow steering capabilities.
@@ -317,12 +470,12 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = IoResult<bool>> + Send + 'a;
 
     /// Attempts to receive one frame as an owning device buffer.
-    fn try_receive_frame(&self) -> impl Future<Output = IoResult<Option<Bytes>>> + Send;
+    fn try_receive_frame(&self) -> impl Future<Output = IoResult<Option<RxFrame>>> + Send;
 
     /// Attempts to receive owning device buffers without waiting for any async lock or event.
     fn try_receive_frames_immediate<'a, 'slots>(
         &'a self,
-        frames: &'slots mut [Option<Bytes>],
+        frames: &'slots mut [Option<RxFrame>],
     ) -> IoResult<Option<usize>>
     where
         'a: 'slots,
@@ -338,7 +491,7 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
     fn try_receive_frames_immediate_on<'a, 'slots>(
         &'a self,
         queue_idx: usize,
-        frames: &'slots mut [Option<Bytes>],
+        frames: &'slots mut [Option<RxFrame>],
     ) -> IoResult<Option<usize>>
     where
         'a: 'slots,
@@ -350,19 +503,28 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
     /// Releases an owning device RX frame back to the interface.
     fn repost_rx_frame<'a>(
         &'a self,
-        frame: Bytes,
+        frame: RxFrame,
     ) -> impl Future<Output = IoResult<()>> + Send + 'a;
 
     /// Releases owning device RX frames without waiting for any async lock or event.
     fn repost_rx_frames_immediate<'a, 'slots>(
         &'a self,
-        frames: &'slots mut [Option<Bytes>],
+        frames: &'slots mut [Option<RxFrame>],
     ) -> IoResult<Option<()>>
     where
         'a: 'slots,
     {
         let _ = frames;
         Ok(None)
+    }
+
+    /// Whether the interface currently has carrier.
+    ///
+    /// Devices that cannot report carrier answer [`LinkState::Up`]; the
+    /// kernel re-reads this whenever the device signals a configuration
+    /// change so a link bounce reconfigures the interface.
+    fn link_state(&self) -> LinkState {
+        LinkState::Up
     }
 
     /// Transmits one borrowed frame and waits until the device accepts ownership.

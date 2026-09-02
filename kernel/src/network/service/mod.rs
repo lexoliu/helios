@@ -20,7 +20,7 @@ use alloc::sync::Arc as StdArc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::num::NonZeroU32;
-use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use core::task::Poll;
 use core::time::Duration;
 
@@ -33,10 +33,10 @@ use helios_netstack::{
     EthernetProtocol, IcmpEchoKey, IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, IpAddress, IpCidr,
     IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet,
     MAX_OUTBOUND_FRAMES, NeighborEntry, NetworkInterface as NetworkDevice, OutboundBatchStatus,
-    PacketBuffer, Route, RouteTable, RxChecksumOffload, Stack, StackConfig, StackError, StackEvent,
-    StackInstant, TcpConnectState, TcpConnectTerminalError, TcpEndpoint, TcpListenBacklog,
-    TcpPacket, TcpReadIntoState, TcpReadState, UdpEndpoint, UdpPacket, UdpPayload,
-    UdpSocketBinding, UdpSocketError,
+    PacketBuffer, Route, RouteTable, RxChecksumOffload, RxFrame, Stack, StackConfig, StackError,
+    StackEvent, StackInstant, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
+    TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState, UdpEndpoint, UdpPacket,
+    UdpPayload, UdpSocketBinding, UdpSocketError,
 };
 use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
@@ -116,6 +116,12 @@ where
     /// `state.with(|s| s.stack.config().rx_budget)` round-trip on
     /// every receive iteration.
     stack_rx_budget: usize,
+    /// Carrier the service last acted on. The device publishes link
+    /// state out of its configuration-change interrupt, and every poll
+    /// round compares it against this, so a link bounce reconfigures
+    /// the interface exactly once without a task or a device poll of
+    /// its own.
+    link_up: AtomicBool,
 }
 
 struct NetworkControlPlane {
@@ -258,6 +264,23 @@ impl NetworkControlPlane {
             .stack
             .replace_neighbors(self.neighbors.load_full().entries.iter().copied());
         shard.dns_servers = self.dns_servers.load_full().as_ref().clone();
+    }
+
+    /// Drops everything the interface learned from the link.
+    ///
+    /// The shards pick this up through `synchronize_shard` on their next
+    /// poll, so the reset does not have to reach into them.
+    fn reset_link_configuration(&self) {
+        self.ipv4_addresses
+            .store(StdArc::new(NetworkIpv4AddressTable::new()));
+        self.ipv6_addresses
+            .store(StdArc::new(NetworkIpv6AddressTable::new()));
+        self.ipv6_dns_servers
+            .store(StdArc::new(NetworkIpv6DnsServers::default()));
+        self.routes.store(StdArc::new(RouteTable::new()));
+        self.neighbors
+            .store(StdArc::new(NetworkNeighborTable::new()));
+        self.dns_servers.store(StdArc::new(DhcpDnsServers::new()));
     }
 
     fn publish_from_shard(&self, shard: &NetworkShard) {
@@ -534,6 +557,7 @@ where
                 control: NetworkControlPlane::new(),
                 poll: NetworkPollState::new(rx_poll_budget, tx_completion_budget, rx_poll_budget),
                 stack_rx_budget,
+                link_up: AtomicBool::new(device.link_state().is_up()),
                 device,
             }),
         }
@@ -669,9 +693,12 @@ where
         timeout_error: fn() -> Error,
         configuration_error: fn(NetworkConfigurationError) -> Error,
     ) -> Result<(), Error> {
-        self.wait_for_configured(deadline_nanos, timeout_error, configuration_error, |ready| {
-            ready
-        })
+        self.wait_for_configured(
+            deadline_nanos,
+            timeout_error,
+            configuration_error,
+            |ready| ready,
+        )
         .await
     }
 
@@ -688,9 +715,12 @@ where
         timeout_error: fn() -> Error,
         configuration_error: fn(NetworkConfigurationError) -> Error,
     ) -> Result<(), Error> {
-        self.wait_for_configured(deadline_nanos, timeout_error, configuration_error, |ready| {
-            ready || self.has_ipv6_resolver()
-        })
+        self.wait_for_configured(
+            deadline_nanos,
+            timeout_error,
+            configuration_error,
+            |ready| ready || self.has_ipv6_resolver(),
+        )
         .await
     }
 
@@ -779,6 +809,36 @@ where
         self.inner
             .state
             .for_each(|state| self.inner.control.synchronize_shard(state));
+    }
+
+    /// Acts on a carrier change the device reported.
+    ///
+    /// Everything the interface learned — addresses, routes, neighbours,
+    /// resolvers — describes the link that was there, so losing carrier
+    /// drops it and regaining carrier starts configuration again from
+    /// DHCP DISCOVER and router solicitation. Nothing here waits on the
+    /// device: the driver publishes link state from its
+    /// configuration-change interrupt and this is one atomic load per
+    /// poll round.
+    fn synchronize_link_state(&self) {
+        let link_up = self.inner.device.link_state().is_up();
+        if self.inner.link_up.swap(link_up, AtomicOrdering::AcqRel) == link_up {
+            return;
+        }
+        // A link that just came back has stale configuration from the
+        // link that went away, and one that just went away has
+        // configuration that no longer describes anything, so both
+        // transitions drop it.
+        self.inner.control.reset_link_configuration();
+        if !link_up {
+            tracing::info!("network link down: interface configuration dropped");
+            return;
+        }
+        let transaction_id = next_transaction_id(self.now_nanos() as u32);
+        self.inner.state.for_each(|shard| {
+            shard.restart_link_configuration(transaction_id.wrapping_add(shard.shard_idx as u32));
+        });
+        tracing::info!("network link up: reconfiguring the interface");
     }
 
     /// The wait the packet pump takes when a poll round found nothing.
@@ -977,16 +1037,16 @@ fn usize_to_u64(value: usize, label: &'static str) -> u64 {
 mod tests {
     use helios_netstack::{
         ETHERNET_FRAME_BYTES, EthernetFrame, EthernetProtocol, IcmpEchoKey, Icmpv4Packet,
-        Icmpv6Packet, IpAddress, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address,
-        Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborEntry, NeighborState, RxChecksumOffload,
-        StackInstant, TcpFlags, TcpHeader, TcpListenBacklog, TcpPacket, TransportChecksum,
-        UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding, internet_checksum,
+        Icmpv6Packet, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet,
+        Ipv6Address, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborEntry, NeighborState,
+        Route, RxChecksumOffload, StackInstant, TcpFlags, TcpHeader, TcpListenBacklog, TcpPacket,
+        TransportChecksum, UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding, internet_checksum,
     };
 
     use super::{
-        AddressAttemptError, HandleSlab, NETWORK_BUSY_POLL_ROUNDS, NETWORK_TX_BATCH_FRAMES,
-        NetworkIpAddress, NetworkPollBudget, NetworkPollProgress, NetworkPollState,
-        NetworkPumpAction, NetworkPumpCadence, NetworkShard, icmp_echo_payload,
+        AddressAttemptError, DhcpClientState, HandleSlab, NETWORK_BUSY_POLL_ROUNDS,
+        NETWORK_TX_BATCH_FRAMES, NetworkIpAddress, NetworkPollBudget, NetworkPollProgress,
+        NetworkPollState, NetworkPumpAction, NetworkPumpCadence, NetworkShard, icmp_echo_payload,
         limit_udp_datagram_bytes, map_ipv4_address, parse_ipv6,
     };
 
@@ -1175,6 +1235,59 @@ mod tests {
             0,
             1,
         )
+    }
+
+    /// A link that comes back is not the link that went away: the lease,
+    /// the routes it pointed at and the resolvers that came with it are
+    /// all stale, and nothing would ask the new link for an address
+    /// unless the client is put back at the start.
+    #[test]
+    fn a_link_bounce_restarts_interface_configuration() {
+        let mut shard = test_network_shard();
+        shard
+            .stack
+            .add_ipv4_address(Ipv4Cidr::new(Ipv4Address::new([192, 0, 2, 10]), 24));
+        shard
+            .stack
+            .routes_mut()
+            .add(Route {
+                destination: IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::UNSPECIFIED, 0)),
+                gateway: Some(IpAddress::Ipv4(Ipv4Address::new([192, 0, 2, 1]))),
+                expires_at: None,
+            })
+            .expect("test gateway should be accepted");
+        shard.dhcp = DhcpClientState::Bound;
+        shard
+            .dns_servers
+            .push(helios_netstack::Ipv4Address::new([192, 0, 2, 1]));
+
+        shard.restart_link_configuration(9);
+
+        assert_eq!(shard.dhcp, DhcpClientState::Init { transaction_id: 9 });
+        assert_eq!(shard.stack.ipv4_addresses().count(), 0);
+        assert!(shard.stack.routes().iter().next().is_none());
+        assert!(shard.dns_servers.is_empty());
+
+        // With the client back at Init the next configuration round
+        // sends a fresh DISCOVER for the new link.
+        shard
+            .drive_dhcp(StackInstant::from_nanos(1))
+            .expect("a restarted DHCP client should send DISCOVER");
+        assert_eq!(
+            shard.dhcp,
+            DhcpClientState::Selecting {
+                transaction_id: 9,
+                last_sent: StackInstant::from_nanos(1),
+            }
+        );
+        let frame = shard
+            .stack
+            .take_outbound()
+            .expect("a DHCP DISCOVER frame should be queued");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
+        let udp = UdpPacket::parse(ipv4.payload).expect("UDP datagram should parse");
+        assert_eq!(udp.destination_port, helios_netstack::DHCP_SERVER_PORT);
     }
 
     #[test]

@@ -3,8 +3,8 @@ use fdt::Fdt;
 use helios_hal::io::IoError;
 use helios_hal::watchdog::Watchdog;
 use helios_kernel::{
-    DEFAULT_POLL_BUDGET, EventDeliveryCapabilities, ExternalInterruptHandler,
-    InterfaceCapabilities, Kernel, NetworkDevice, NetworkService, PacketBuffer,
+    ExternalInterruptHandler, InterfaceCapabilities, Kernel, LinkState, NetworkDevice,
+    NetworkService, PacketBuffer,
 };
 use triomphe::Arc;
 
@@ -85,26 +85,11 @@ impl NetworkDevice for VirtioNetworkDevice {
     }
 
     fn capabilities(&self) -> InterfaceCapabilities {
-        InterfaceCapabilities {
-            max_frame_len: self.max_frame_len(),
-            checksum: helios_kernel::ChecksumOffload {
-                tx_tcp: self.inner.tx_checksum_negotiated(),
-                tx_udp: self.inner.tx_checksum_negotiated(),
-                ..helios_kernel::ChecksumOffload::default()
-            },
-            queues: self.inner.queue_topology(),
-            direct_tx_dma: true,
-            events: EventDeliveryCapabilities {
-                polling: true,
-                interrupts: true,
-                adaptive_moderation: false,
-                rx_coalescing: false,
-                tx_coalescing: false,
-                rx_poll_budget: DEFAULT_POLL_BUDGET,
-                tx_completion_budget: DEFAULT_POLL_BUDGET,
-            },
-            ..InterfaceCapabilities::default()
-        }
+        self.inner.interface_capabilities()
+    }
+
+    fn link_state(&self) -> LinkState {
+        self.inner.link_state()
     }
 
     async fn try_receive(&self, buffer: &mut PacketBuffer) -> Result<bool, IoError> {
@@ -197,7 +182,7 @@ impl NetworkDevice for VirtioNetworkDevice {
     fn try_receive_frames_immediate_on<'a, 'slots>(
         &'a self,
         queue_idx: usize,
-        frames: &'slots mut [Option<bytes::Bytes>],
+        frames: &'slots mut [Option<helios_virtio::RxFrame>],
     ) -> Result<Option<usize>, IoError>
     where
         'a: 'slots,

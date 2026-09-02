@@ -84,7 +84,8 @@ pub use exec::{
 pub use helios_hal::Platform;
 pub use helios_netstack::{
     ChecksumOffload, DEFAULT_POLL_BUDGET, EventDeliveryCapabilities, InterfaceCapabilities,
-    NetworkInterface as NetworkDevice, PacketBuffer, TxFrameRef,
+    LinkState, NetworkInterface as NetworkDevice, PacketBuffer, RxFrame, RxFrameOffload,
+    SegmentationOffload, TxFrameRef,
 };
 pub use host_fs::{
     HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, HostFsClient, HostFsTransport,

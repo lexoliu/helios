@@ -439,9 +439,7 @@ impl WasixSocketFamily {
     pub(super) const fn unspecified_address(self) -> crate::NetworkIpAddress {
         match self {
             Self::Ipv4 => crate::NetworkIpAddress::Ipv4(crate::Ipv4Address::new([0, 0, 0, 0])),
-            Self::Ipv6 => {
-                crate::NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::UNSPECIFIED)
-            }
+            Self::Ipv6 => crate::NetworkIpAddress::Ipv6(helios_netstack::Ipv6Address::UNSPECIFIED),
         }
     }
 
@@ -704,15 +702,17 @@ impl WasixTcpSocket {
 impl WasixUdpSocket {
     pub(super) fn options(&self) -> &WasixSocketOptions {
         match self {
-            WasixUdpSocket::Unbound { options, .. }
-            | WasixUdpSocket::Bound { options, .. } => options,
+            WasixUdpSocket::Unbound { options, .. } | WasixUdpSocket::Bound { options, .. } => {
+                options
+            }
         }
     }
 
     pub(super) fn options_mut(&mut self) -> &mut WasixSocketOptions {
         match self {
-            WasixUdpSocket::Unbound { options, .. }
-            | WasixUdpSocket::Bound { options, .. } => options,
+            WasixUdpSocket::Unbound { options, .. } | WasixUdpSocket::Bound { options, .. } => {
+                options
+            }
         }
     }
 

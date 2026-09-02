@@ -252,10 +252,7 @@ mod tests {
 
         assert_eq!(a_len, aaaa_len);
         assert_eq!(&a[..a_len - 4], &aaaa[..aaaa_len - 4]);
-        assert_eq!(
-            u16::from_be_bytes([a[a_len - 4], a[a_len - 3]]),
-            TYPE_A
-        );
+        assert_eq!(u16::from_be_bytes([a[a_len - 4], a[a_len - 3]]), TYPE_A);
         assert_eq!(
             u16::from_be_bytes([aaaa[aaaa_len - 4], aaaa[aaaa_len - 3]]),
             TYPE_AAAA

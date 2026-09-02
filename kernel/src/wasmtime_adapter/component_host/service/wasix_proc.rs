@@ -1015,7 +1015,12 @@ where
         Err(error) => return p1_errno_from_component_path(error),
     };
     if absolute == WASIX_NULL_DEVICE_PATH {
-        return p1_write_filestat(caller, stat, p1_null_device_identity(), p1_null_device_stat());
+        return p1_write_filestat(
+            caller,
+            stat,
+            p1_null_device_identity(),
+            p1_null_device_stat(),
+        );
     }
     let (identity, stat_value) = match p1_stat_absolute_path(caller, &absolute).await {
         Ok(stat) => stat,

@@ -301,8 +301,9 @@ where
 }
 
 /// A 9p transfer a file stream started and is now waiting on.
-type PendingHostTransfer<T> =
-    Pin<Box<dyn core::future::Future<Output = core::result::Result<T, fs_types::ErrorCode>> + Send>>;
+type PendingHostTransfer<T> = Pin<
+    Box<dyn core::future::Future<Output = core::result::Result<T, fs_types::ErrorCode>> + Send>,
+>;
 
 pub(super) struct FileWriteConsumer<T, CpuImpl, HostFs>
 where
@@ -433,7 +434,11 @@ where
                 self.complete(Err(fs_types::ErrorCode::IsDirectory));
                 return Poll::Ready(Ok(StreamResult::Dropped));
             }
-            if !self.descriptor.flags.contains(fs_types::DescriptorFlags::READ) {
+            if !self
+                .descriptor
+                .flags
+                .contains(fs_types::DescriptorFlags::READ)
+            {
                 self.complete(Err(fs_types::ErrorCode::NotPermitted));
                 return Poll::Ready(Ok(StreamResult::Dropped));
             }
@@ -615,7 +620,11 @@ where
                 self.complete(Err(fs_types::ErrorCode::IsDirectory));
                 return Poll::Ready(Ok(StreamResult::Dropped));
             }
-            if !self.descriptor.flags.contains(fs_types::DescriptorFlags::WRITE) {
+            if !self
+                .descriptor
+                .flags
+                .contains(fs_types::DescriptorFlags::WRITE)
+            {
                 self.complete(Err(fs_types::ErrorCode::NotPermitted));
                 return Poll::Ready(Ok(StreamResult::Dropped));
             }

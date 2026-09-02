@@ -15,7 +15,7 @@ use helios_hal::io::{IoError, IoResult};
 use spin::Mutex;
 
 use crate::bus::{DeviceBus, IdentityDmaPool};
-use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
+use crate::transport::{DeviceStatus, DeviceType, InterruptStatus, VirtioTransport};
 
 const REG_MAGIC_VALUE: usize = 0x000;
 const REG_VERSION: usize = 0x004;
@@ -162,6 +162,9 @@ struct FakeTransportLog {
     programmed: Vec<QueueProgramming>,
     resets: Vec<u16>,
     acknowledged_interrupts: usize,
+    /// Interrupt status register the next acknowledgement reads and
+    /// clears, as a device would present it.
+    pending_interrupt: u32,
 }
 
 /// A platform with `PROCESSORS` processors, all of which report the
@@ -227,6 +230,18 @@ impl FakeTransport {
     /// Every queue index the driver reset, in order.
     pub(crate) fn queue_resets(&self) -> Vec<u16> {
         self.log.lock().resets.clone()
+    }
+
+    /// Raises an interrupt with `status` in the device's interrupt
+    /// status register; the driver's acknowledgement reads and clears
+    /// it.
+    pub(crate) fn raise_interrupt(&self, status: u32) {
+        self.log.lock().pending_interrupt |= status;
+    }
+
+    /// Number of interrupts the driver acknowledged.
+    pub(crate) fn acknowledged_interrupts(&self) -> usize {
+        self.log.lock().acknowledged_interrupts
     }
 
     /// Presets one 32-bit device configuration field.
@@ -330,8 +345,10 @@ impl VirtioTransport for FakeTransport {
         Ok(())
     }
 
-    fn ack_interrupt(&self) {
-        self.log.lock().acknowledged_interrupts += 1;
+    fn ack_interrupt(&self) -> InterruptStatus {
+        let mut log = self.log.lock();
+        log.acknowledged_interrupts += 1;
+        InterruptStatus::from_isr(core::mem::take(&mut log.pending_interrupt))
     }
 
     fn read_config_u32(&self, offset: usize) -> u32 {

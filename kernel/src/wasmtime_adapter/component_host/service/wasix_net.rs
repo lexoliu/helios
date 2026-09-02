@@ -1753,12 +1753,7 @@ where
     };
     // A wildcard listen means `::` on an AF_INET6 socket, not `0.0.0.0`.
     let listener = match service
-        .tcp_listen(
-            family.unspecified_address(),
-            local_port,
-            backlog,
-            hop_limit,
-        )
+        .tcp_listen(family.unspecified_address(), local_port, backlog, hop_limit)
         .await
     {
         Ok(listener) => listener,

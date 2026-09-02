@@ -465,4 +465,19 @@ impl NetworkShard {
     pub(super) fn clear_ipv4_routes(&mut self) {
         self.stack.routes_mut().clear_ipv4();
     }
+
+    /// Starts interface configuration over after the link came back.
+    ///
+    /// The control plane owns addresses, routes, neighbours and
+    /// resolvers and has already dropped them; what lives only in the
+    /// shard is the configuration state machines, and both have to be
+    /// returned to their initial state or nothing would ever ask the new
+    /// link for an address.
+    pub(super) fn restart_link_configuration(&mut self, transaction_id: u32) {
+        self.stack.clear_ipv4_addresses();
+        self.clear_ipv4_routes();
+        self.stack.restart_ipv6_autoconfig();
+        self.dns_servers.clear();
+        self.dhcp = DhcpClientState::Init { transaction_id };
+    }
 }

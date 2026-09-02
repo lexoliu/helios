@@ -114,6 +114,59 @@ pub fn udp_pseudo_header_checksum(
     }
 }
 
+/// Completes a partial transport checksum a device handed over
+/// unfinished, and reports whether the completion is consistent with the
+/// packet the stack parsed.
+///
+/// A frame delivered with virtio's `VIRTIO_NET_HDR_F_NEEDS_CSUM` carries
+/// no finished checksum: the sender stopped after the pseudo-header sum
+/// and left it in the checksum field, expecting whoever takes the frame
+/// off the wire to fold the rest of the segment into it. Completing it
+/// means storing `C = !fold(sum(segment))` — the sum runs over the field
+/// itself, which holds the partial sum `F` — and verifying the result
+/// then asks for `fold(P + sum(segment with C in place)) == !0` for the
+/// pseudo-header sum `P` this stack computes from the parsed addresses,
+/// protocol and length. In one's-complement arithmetic that reduces
+/// exactly to `F == P`, because `sum(segment) + C ≡ !0` holds by
+/// construction of `C`: completing the checksum can never disagree with
+/// itself, and the only thing left to check is whether the sender
+/// checksummed the packet the stack is about to deliver.
+///
+/// So this is that completion, evaluated in closed form. A frame that
+/// fails it is one whose length, addresses or protocol do not match what
+/// the sender summed, and the caller drops it exactly as it would drop a
+/// frame with a bad software checksum.
+pub fn partial_transport_checksum_completes(
+    source: crate::IpAddress,
+    destination: crate::IpAddress,
+    protocol: IpProtocol,
+    segment: &[u8],
+    field_offset: usize,
+) -> bool {
+    let Some(field) = segment
+        .get(field_offset..field_offset + 2)
+        .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+    else {
+        return false;
+    };
+    let pseudo = match (source, destination) {
+        (crate::IpAddress::Ipv4(source), crate::IpAddress::Ipv4(destination)) => fold_sum(
+            ipv4_pseudo_sum(source, destination, protocol, segment.len()),
+        ),
+        (crate::IpAddress::Ipv6(source), crate::IpAddress::Ipv6(destination)) => fold_sum(
+            ipv6_pseudo_sum(source, destination, protocol, segment.len()),
+        ),
+        _ => return false,
+    };
+    // 0x0000 and 0xffff are the same value in one's-complement
+    // arithmetic, so compare the difference against zero rather than the
+    // two representations against each other.
+    matches!(
+        fold_sum(u32::from(field) + u32::from(!pseudo)),
+        0 | u16::MAX
+    )
+}
+
 pub fn icmpv6_checksum(source: Ipv6Address, destination: Ipv6Address, message: &[u8]) -> u16 {
     finish_checksum(
         ipv6_pseudo_sum(source, destination, IpProtocol::Icmpv6, message.len())
@@ -323,5 +376,87 @@ mod tests {
             super::finish_checksum(super::sum_words(&bytes)),
             super::finish_checksum(super::sum_words_scalar(&bytes))
         );
+    }
+
+    /// The closed form
+    /// [`super::partial_transport_checksum_completes`] evaluates must
+    /// agree with actually finishing the checksum: a segment whose
+    /// checksum field holds the pseudo-header sum becomes a segment with
+    /// a valid checksum once the sum over the segment is folded in, and
+    /// only then.
+    #[test]
+    fn completing_a_partial_checksum_produces_a_valid_segment() {
+        use crate::{IpAddress, IpProtocol, Ipv4Address};
+
+        let source = Ipv4Address::new([192, 0, 2, 20]);
+        let destination = Ipv4Address::new([192, 0, 2, 10]);
+        let mut segment = [0u8; 64];
+        for (index, byte) in segment.iter_mut().enumerate() {
+            *byte = index.wrapping_mul(11).wrapping_add(3) as u8;
+        }
+        let partial = super::tcp_pseudo_header_checksum(
+            IpAddress::Ipv4(source),
+            IpAddress::Ipv4(destination),
+            segment.len(),
+        );
+        segment[16..18].copy_from_slice(&partial.to_be_bytes());
+
+        assert!(super::partial_transport_checksum_completes(
+            IpAddress::Ipv4(source),
+            IpAddress::Ipv4(destination),
+            IpProtocol::Tcp,
+            &segment,
+            16,
+        ));
+
+        // Finish the checksum the way the device asked and the segment
+        // verifies in software.
+        let completed = super::finish_checksum(super::sum_words(&segment));
+        segment[16..18].copy_from_slice(&completed.to_be_bytes());
+        assert!(super::tcp_checksum_valid(
+            IpAddress::Ipv4(source),
+            IpAddress::Ipv4(destination),
+            &segment,
+        ));
+    }
+
+    #[test]
+    fn a_partial_checksum_for_a_different_packet_does_not_complete() {
+        use crate::{IpAddress, IpProtocol, Ipv4Address};
+
+        let source = Ipv4Address::new([192, 0, 2, 20]);
+        let destination = Ipv4Address::new([192, 0, 2, 10]);
+        let mut segment = [0u8; 64];
+        let partial = super::tcp_pseudo_header_checksum(
+            IpAddress::Ipv4(source),
+            IpAddress::Ipv4(destination),
+            segment.len() + 16,
+        );
+        segment[16..18].copy_from_slice(&partial.to_be_bytes());
+
+        assert!(!super::partial_transport_checksum_completes(
+            IpAddress::Ipv4(source),
+            IpAddress::Ipv4(destination),
+            IpProtocol::Tcp,
+            &segment,
+            16,
+        ));
+    }
+
+    #[test]
+    fn a_partial_checksum_field_outside_the_segment_does_not_complete() {
+        use crate::{IpAddress, IpProtocol, Ipv4Address};
+
+        let source = Ipv4Address::new([192, 0, 2, 20]);
+        let destination = Ipv4Address::new([192, 0, 2, 10]);
+        let segment = [0u8; 8];
+
+        assert!(!super::partial_transport_checksum_completes(
+            IpAddress::Ipv4(source),
+            IpAddress::Ipv4(destination),
+            IpProtocol::Tcp,
+            &segment,
+            16,
+        ));
     }
 }
