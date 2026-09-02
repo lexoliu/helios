@@ -4,10 +4,10 @@ use divan::{AllocProfiler, Bencher, black_box};
 use helios_netstack::{
     BbrV3, DEFAULT_TCP_LISTEN_BACKLOG, EthernetAddress, EthernetFrame, EthernetProtocol, IpAddress,
     IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, MAX_OUTBOUND_FRAMES, NeighborEntry,
-    NeighborState, OutboundBatchStatus, PacketBuffer, RxChecksumOffload, Stack, StackConfig,
-    StackInstant, TCP_TRANSMIT_BUFFER_BYTES, TcpEndpoint, TcpFlags, TcpHeader, TcpOptions,
-    TcpPacket, TcpSocket, TcpState, TransportChecksum, UdpPacket, UdpSocketBinding, UdpSocketId,
-    internet_checksum,
+    NeighborState, OutboundBatchStatus, PacketBuffer, RxChecksumOffload, RxFrame, RxFrameOffload,
+    Stack, StackConfig, StackInstant, TCP_TRANSMIT_BUFFER_BYTES, TcpEndpoint, TcpFlags, TcpHeader,
+    TcpOptions, TcpPacket, TcpSocket, TcpState, TransportChecksum, UdpPacket, UdpSocketBinding,
+    UdpSocketId, internet_checksum,
 };
 
 #[global_allocator]
@@ -288,8 +288,8 @@ fn udp_receive_and_take(bencher: Bencher, packets: usize) {
             .expect("benchmark UDP socket should bind");
         for (index, frame) in frames.iter().take(packets).enumerate() {
             stack
-                .receive_frame_bytes_with_backpressure(
-                    black_box(frame.clone()),
+                .receive_rx_frame(
+                    RxFrame::new(black_box(frame.clone())),
                     StackInstant::from_nanos(
                         u64::try_from(index + 1).expect("benchmark timestamp fits"),
                     ),
@@ -328,8 +328,8 @@ fn udp_receive_take_tail_port(bencher: Bencher, packets: usize) {
         });
         for (index, frame) in frames.iter().take(packets).enumerate() {
             stack
-                .receive_frame_bytes_with_backpressure(
-                    black_box(frame.clone()),
+                .receive_rx_frame(
+                    RxFrame::new(black_box(frame.clone())),
                     StackInstant::from_nanos(
                         u64::try_from(index + 1).expect("benchmark timestamp fits"),
                     ),
@@ -357,8 +357,8 @@ fn udp_receive_large_owned_frame(bencher: Bencher) {
                 .open_udp(UdpSocketBinding::wildcard(49152))
                 .expect("benchmark UDP socket should bind");
             stack
-                .receive_frame_bytes_with_backpressure(
-                    black_box(frame.clone()),
+                .receive_rx_frame(
+                    RxFrame::new(black_box(frame.clone())),
                     StackInstant::from_nanos(1),
                 )
                 .expect("benchmark large UDP frame should be accepted");
@@ -386,8 +386,8 @@ fn udp_receive_large_owned_frame_rx_checksum_offload(bencher: Bencher) {
                 .open_udp(UdpSocketBinding::wildcard(49152))
                 .expect("benchmark UDP socket should bind");
             stack
-                .receive_frame_bytes_with_backpressure(
-                    black_box(frame.clone()),
+                .receive_rx_frame(
+                    RxFrame::with_offload(black_box(frame.clone()), RxFrameOffload::validated()),
                     StackInstant::from_nanos(1),
                 )
                 .expect("benchmark checksum-offloaded large UDP frame should be accepted");
@@ -414,8 +414,8 @@ fn udp_receive_ipv4_joined_multicast(bencher: Bencher) {
             .open_udp(UdpSocketBinding::wildcard(49152))
             .expect("benchmark UDP socket should bind");
         stack
-            .receive_frame_bytes_with_backpressure(
-                black_box(frame.clone()),
+            .receive_rx_frame(
+                RxFrame::new(black_box(frame.clone())),
                 StackInstant::from_nanos(1),
             )
             .expect("benchmark joined multicast UDP frame should be accepted");
@@ -439,8 +439,8 @@ fn udp_receive_ipv4_fragment_reassembly(bencher: Bencher) {
             .expect("benchmark UDP socket should bind");
         for (index, fragment) in fragments.iter().enumerate() {
             stack
-                .receive_frame_bytes_with_backpressure(
-                    black_box(fragment.clone()),
+                .receive_rx_frame(
+                    RxFrame::new(black_box(fragment.clone())),
                     StackInstant::from_nanos(
                         u64::try_from(index + 1).expect("benchmark timestamp fits"),
                     ),

@@ -15,11 +15,11 @@ use crate::{
     EthernetAddress, EthernetFrame, EthernetProtocol, Icmpv4DestinationUnreachableCode,
     Icmpv4Packet, Icmpv6DestinationUnreachableCode, Icmpv6Packet, IpAddress, IpCidr, Ipv4Address,
     Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6DnsServers, Ipv6Packet,
-    Ipv6RouterConfiguration, Ipv6Scope, NeighborDiscovery, PacketBuffer, StackError, TcpEndpoint,
-    TcpFlags,
-    TcpHeader, TcpHeaderOptions, TcpPacket, TcpReceiveBuffer, TcpSocket, TcpTransmitSegment,
-    TransportChecksum, TxChecksum, TxFrameRef, UdpPacket, icmpv6_checksum_valid, ipv4_checksum,
-    interpret_router_advertisement, tcp_checksum_valid, udp_checksum_valid,
+    Ipv6RouterConfiguration, Ipv6Scope, NeighborDiscovery, PacketBuffer, RxChecksumReport, RxFrame,
+    RxFrameOffload, StackError, TcpEndpoint, TcpFlags, TcpHeader, TcpHeaderOptions, TcpPacket,
+    TcpReceiveBuffer, TcpSocket, TcpTransmitSegment, TransportChecksum, TxChecksum, TxFrameRef,
+    UdpPacket, icmpv6_checksum_valid, interpret_router_advertisement, ipv4_checksum,
+    partial_transport_checksum_completes, tcp_checksum_valid, udp_checksum_valid,
 };
 
 pub const MAX_ROUTES: usize = 32;
@@ -652,10 +652,18 @@ pub enum StackEvent {
     /// A Router Advertisement completed stateless autoconfiguration.
     Ipv6Autoconfigured(Ipv6RouterConfiguration),
     NeighborUpdated(NeighborEntry),
-    UdpDatagram { socket: UdpSocketId },
-    TcpConnected { socket: SocketId },
-    TcpReadable { socket: SocketId },
-    TcpClosed { socket: SocketId },
+    UdpDatagram {
+        socket: UdpSocketId,
+    },
+    TcpConnected {
+        socket: SocketId,
+    },
+    TcpReadable {
+        socket: SocketId,
+    },
+    TcpClosed {
+        socket: SocketId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2536,6 +2544,16 @@ where
         }
     }
 
+    /// Returns the interface to the unconfigured state so router
+    /// solicitation restarts.
+    ///
+    /// The kernel calls this when the link comes back: the router
+    /// advertisement that configured the interface belongs to the link
+    /// that just went away, and nothing else would ever solicit again.
+    pub fn restart_ipv6_autoconfig(&mut self) {
+        self.ipv6_discovery.reset();
+    }
+
     /// Drives stateless address autoconfiguration one step: queues a
     /// Router Solicitation when one is due.
     ///
@@ -2684,24 +2702,27 @@ where
     ) -> Result<bool, StackError> {
         // Wrap the borrowed frame in an owning Bytes so segment
         // payloads further down can be passed as owning Bytes
-        // without a per-segment copy. With the upcoming virtio
-        // zero-copy pool the kernel will already hand us an
-        // owning Bytes; this helper keeps the legacy &[u8] entry
-        // working by paying one copy at the boundary.
+        // without a per-segment copy. A caller that hands us a plain
+        // slice has no device metadata to go with it, so the frame is
+        // verified in software throughout.
         let frame_bytes = Bytes::copy_from_slice(frame);
-        self.receive_frame_bytes_with_backpressure(frame_bytes, now)
+        self.receive_rx_frame(RxFrame::new(frame_bytes), now)
     }
 
-    /// Bytes-aware receive entry. Takes ownership of the frame so
-    /// segment payloads can be sliced (zero-copy) into TCP receive
-    /// queues. Callers that already hold an owning `Bytes` (a
-    /// virtio zero-copy descriptor handle) should use this directly
-    /// instead of going through the `&[u8]` shim.
-    pub fn receive_frame_bytes_with_backpressure(
+    /// Device receive entry. Takes ownership of the frame so segment
+    /// payloads can be sliced (zero-copy) into TCP receive queues, and
+    /// carries the per-frame offload metadata the device reported so the
+    /// protocol layers can decide what still has to be verified in
+    /// software.
+    pub fn receive_rx_frame(
         &mut self,
-        frame: Bytes,
+        frame: RxFrame,
         now: StackInstant,
     ) -> Result<bool, StackError> {
+        let RxFrame {
+            bytes: frame,
+            offload,
+        } = frame;
         let parsed = EthernetFrame::parse(frame.as_ref()).ok_or(StackError::MalformedPacket)?;
         // We need both the owning Bytes (for slicing payloads to
         // owning Bytes downstream) and the borrowed view (for
@@ -2709,9 +2730,14 @@ where
         // the duration of the call.
         let payload_range = bytes_subrange(frame.as_ref(), parsed.payload);
         let payload_bytes = frame.slice(payload_range.clone());
+        let offload = offload.advance(payload_range.start);
         match parsed.protocol {
-            EthernetProtocol::Ipv4 => self.receive_ipv4(parsed.source, &payload_bytes, now),
-            EthernetProtocol::Ipv6 => self.receive_ipv6(parsed.source, &payload_bytes, now),
+            EthernetProtocol::Ipv4 => {
+                self.receive_ipv4(parsed.source, &payload_bytes, offload, now)
+            }
+            EthernetProtocol::Ipv6 => {
+                self.receive_ipv6(parsed.source, &payload_bytes, offload, now)
+            }
             EthernetProtocol::Arp => self.receive_arp(parsed.source, parsed.payload, now),
         }
     }
@@ -2980,11 +3006,7 @@ where
     ///
     /// A listener passes its value on to every connection it accepts, so
     /// setting it before `listen` covers the SYN-ACK and everything after.
-    pub fn set_tcp_hop_limit(
-        &mut self,
-        socket: SocketId,
-        hop_limit: u8,
-    ) -> Result<(), StackError> {
+    pub fn set_tcp_hop_limit(&mut self, socket: SocketId, hop_limit: u8) -> Result<(), StackError> {
         self.tcp_socket_mut(socket)?.set_hop_limit(hop_limit);
         Ok(())
     }
@@ -3924,9 +3946,15 @@ where
                 hop_limit,
                 now,
             ),
-            (IpAddress::Ipv6(source), IpAddress::Ipv6(destination)) => {
-                self.queue_tcp_ipv6(source, destination, header, options, payload, hop_limit, now)
-            }
+            (IpAddress::Ipv6(source), IpAddress::Ipv6(destination)) => self.queue_tcp_ipv6(
+                source,
+                destination,
+                header,
+                options,
+                payload,
+                hop_limit,
+                now,
+            ),
             _ => panic!("TCP endpoint address families must match"),
         }
     }
@@ -4120,6 +4148,7 @@ where
         &mut self,
         source_mac: EthernetAddress,
         frame: &Bytes,
+        offload: RxFrameOffload,
         now: StackInstant,
     ) -> Result<bool, StackError> {
         let packet = self.parse_ipv4(frame.as_ref())?;
@@ -4145,14 +4174,24 @@ where
                         !packet.is_fragmented(),
                         "IPv4 reassembly produced a fragmented packet"
                     );
-                    self.dispatch_ipv4(source_mac, &packet_bytes, packet, now)
+                    // A device checksum report describes the fragment it
+                    // arrived with, not the datagram reassembly just
+                    // produced, so the reassembled packet is verified in
+                    // software like any frame without metadata.
+                    self.dispatch_ipv4(
+                        source_mac,
+                        &packet_bytes,
+                        packet,
+                        RxFrameOffload::none(),
+                        now,
+                    )
                 }
                 Ipv4ReassemblyResult::NeedMoreFragments
                 | Ipv4ReassemblyResult::InvalidFragment
                 | Ipv4ReassemblyResult::CacheFull => Ok(false),
             };
         }
-        self.dispatch_ipv4(source_mac, frame, packet, now)
+        self.dispatch_ipv4(source_mac, frame, packet, offload, now)
     }
 
     fn dispatch_ipv4(
@@ -4160,9 +4199,12 @@ where
         source_mac: EthernetAddress,
         frame: &Bytes,
         packet: Ipv4Packet<'_>,
+        offload: RxFrameOffload,
         now: StackInstant,
     ) -> Result<bool, StackError> {
-        let payload_bytes = frame.slice(bytes_subrange(frame.as_ref(), packet.payload));
+        let payload_range = bytes_subrange(frame.as_ref(), packet.payload);
+        let offload = offload.advance(payload_range.start);
+        let payload_bytes = frame.slice(payload_range);
         match packet.protocol {
             crate::IpProtocol::Tcp => {
                 if !self.owns_ip_address(IpAddress::Ipv4(packet.destination)) {
@@ -4172,6 +4214,7 @@ where
                     IpAddress::Ipv4(packet.source),
                     IpAddress::Ipv4(packet.destination),
                     &payload_bytes,
+                    offload,
                     now,
                 )
             }
@@ -4183,6 +4226,7 @@ where
                     IpAddress::Ipv4(packet.source),
                     IpAddress::Ipv4(packet.destination),
                     payload_bytes,
+                    offload,
                 )?;
                 if !consumed && should_send_icmpv4_error_for_destination(packet.destination) {
                     self.queue_icmpv4_port_unreachable(source_mac, packet, frame.as_ref())?;
@@ -4211,6 +4255,7 @@ where
         &mut self,
         source_mac: EthernetAddress,
         frame: &Bytes,
+        offload: RxFrameOffload,
         now: StackInstant,
     ) -> Result<bool, StackError> {
         let packet = Ipv6Packet::parse(frame.as_ref()).ok_or(StackError::MalformedPacket)?;
@@ -4230,7 +4275,9 @@ where
                 false,
             );
         }
-        let payload_bytes = frame.slice(bytes_subrange(frame.as_ref(), packet.payload));
+        let payload_range = bytes_subrange(frame.as_ref(), packet.payload);
+        let offload = offload.advance(payload_range.start);
+        let payload_bytes = frame.slice(payload_range);
         match packet.next_header {
             crate::IpProtocol::Tcp => {
                 if !self.owns_ip_address(IpAddress::Ipv6(packet.destination)) {
@@ -4240,6 +4287,7 @@ where
                     IpAddress::Ipv6(packet.source),
                     IpAddress::Ipv6(packet.destination),
                     &payload_bytes,
+                    offload,
                     now,
                 )
             }
@@ -4251,6 +4299,7 @@ where
                     IpAddress::Ipv6(packet.source),
                     IpAddress::Ipv6(packet.destination),
                     payload_bytes,
+                    offload,
                 )?;
                 if !consumed {
                     self.queue_icmpv6_port_unreachable(source_mac, packet, frame.as_ref())?;
@@ -4615,15 +4664,67 @@ where
             && !packet.destination.is_multicast()
     }
 
+    /// Whether the device, not the stack, is answerable for this
+    /// frame's transport checksum.
+    ///
+    /// Both halves have to agree. `negotiated` is the interface-wide
+    /// capability the kernel configured from the feature set the device
+    /// accepted, and the report is what the device said about the frame
+    /// in hand: a device that validates checksums still delivers frames
+    /// it did not validate, and one that never negotiated the feature
+    /// cannot make a claim at all. A partial checksum is completed and
+    /// checked against the packet the stack parsed (see
+    /// [`partial_transport_checksum_completes`]); a frame that fails
+    /// that falls through to the software verification, which fails it
+    /// too, so a bad partial frame is dropped rather than delivered.
+    #[allow(clippy::too_many_arguments)]
+    fn device_owns_transport_checksum(
+        &self,
+        source: IpAddress,
+        destination: IpAddress,
+        protocol: crate::IpProtocol,
+        segment: &[u8],
+        checksum_field_offset: u16,
+        negotiated: bool,
+        offload: RxFrameOffload,
+    ) -> bool {
+        if !negotiated {
+            return false;
+        }
+        match offload.checksum {
+            RxChecksumReport::Unverified => false,
+            RxChecksumReport::Validated => true,
+            RxChecksumReport::Partial { start, offset } => {
+                start == 0
+                    && offset == checksum_field_offset
+                    && partial_transport_checksum_completes(
+                        source,
+                        destination,
+                        protocol,
+                        segment,
+                        usize::from(offset),
+                    )
+            }
+        }
+    }
+
     fn receive_tcp(
         &mut self,
         source: IpAddress,
         destination: IpAddress,
         bytes: &Bytes,
+        offload: RxFrameOffload,
         now: StackInstant,
     ) -> Result<bool, StackError> {
-        if !self.config.rx_checksum_offload.tcp
-            && !tcp_checksum_valid(source, destination, bytes.as_ref())
+        if !self.device_owns_transport_checksum(
+            source,
+            destination,
+            crate::IpProtocol::Tcp,
+            bytes.as_ref(),
+            TCP_CHECKSUM_FIELD_OFFSET,
+            self.config.rx_checksum_offload.tcp,
+            offload,
+        ) && !tcp_checksum_valid(source, destination, bytes.as_ref())
         {
             return Err(StackError::MalformedPacket);
         }
@@ -4776,11 +4877,8 @@ where
                 if !packet.source.is_link_local() || packet.hop_limit != 255 {
                     return Ok(false);
                 }
-                let configuration = interpret_router_advertisement(
-                    advertisement,
-                    packet.source,
-                    self.config.mac,
-                );
+                let configuration =
+                    interpret_router_advertisement(advertisement, packet.source, self.config.mac);
                 self.apply_ipv6_router_configuration(configuration, now);
             }
             Icmpv6Packet::NeighborSolicitation { target, options } => {
@@ -5034,9 +5132,17 @@ where
         source: IpAddress,
         destination: IpAddress,
         bytes: Bytes,
+        offload: RxFrameOffload,
     ) -> Result<bool, StackError> {
-        if !self.config.rx_checksum_offload.udp
-            && !udp_checksum_valid(source, destination, bytes.as_ref())
+        if !self.device_owns_transport_checksum(
+            source,
+            destination,
+            crate::IpProtocol::Udp,
+            bytes.as_ref(),
+            UDP_CHECKSUM_FIELD_OFFSET,
+            self.config.rx_checksum_offload.udp,
+            offload,
+        ) && !udp_checksum_valid(source, destination, bytes.as_ref())
         {
             return Err(StackError::MalformedPacket);
         }
@@ -6094,6 +6200,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&syn[..syn_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(now),
             )
             .expect("SYN should be handled by listener");
@@ -6158,6 +6265,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&syn_ack[..syn_ack_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(1),
             )
             .expect("SYN-ACK should establish the socket");
@@ -6930,6 +7038,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&syn_ack[..syn_ack_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(1),
             ),
             Err(StackError::MalformedPacket)
@@ -6940,8 +7049,66 @@ mod tests {
         );
     }
 
+    /// A device that reports it validated the checksum is believed even
+    /// when the checksum on the wire is wrong: the frame it validated is
+    /// the one it delivered, and the bytes it handed over are the ones
+    /// it summed.
     #[test]
-    fn tcp_receive_trusts_configured_rx_checksum_offload() {
+    fn tcp_receive_trusts_a_device_validated_frame() {
+        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES)
+            .with_rx_checksum_offload(RxChecksumOffload::new(false, true, false));
+        let (mut stack, socket, local, peer) = open_pending_tcp_connect_stack(config);
+        let (mut syn_ack, syn_ack_len) = corrupt_tcp_syn_ack(peer, local);
+
+        stack
+            .receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&syn_ack[..syn_ack_len]),
+                RxFrameOffload::validated(),
+                StackInstant::from_nanos(1),
+            )
+            .expect("TCP checksum-offloaded SYN-ACK should be accepted");
+        assert_eq!(
+            stack.tcp_connect_state(socket),
+            Ok(TcpConnectState::Connected)
+        );
+        let _ = &mut syn_ack;
+    }
+
+    /// The negotiated capability alone proves nothing: a device that can
+    /// validate checksums still delivers frames it did not validate, and
+    /// those are verified in software like any other.
+    #[test]
+    fn tcp_receive_verifies_a_frame_the_device_did_not_validate() {
+        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES)
+            .with_rx_checksum_offload(RxChecksumOffload::new(false, true, false));
+        let (mut stack, socket, local, peer) = open_pending_tcp_connect_stack(config);
+        let (syn_ack, syn_ack_len) = corrupt_tcp_syn_ack(peer, local);
+
+        assert_eq!(
+            stack.receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&syn_ack[..syn_ack_len]),
+                RxFrameOffload::none(),
+                StackInstant::from_nanos(1),
+            ),
+            Err(StackError::MalformedPacket)
+        );
+        assert_eq!(
+            stack.tcp_connect_state(socket),
+            Ok(TcpConnectState::Pending)
+        );
+    }
+
+    /// A frame carrying an unfinished partial checksum is completed by
+    /// the stack: the sender left the pseudo-header sum in the checksum
+    /// field, which is exactly what this stack's own transmit offload
+    /// path writes, so the completion succeeds and the segment is
+    /// delivered even though a software verification would reject it.
+    #[test]
+    fn tcp_receive_completes_a_partial_checksum_frame() {
         let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES)
             .with_rx_checksum_offload(RxChecksumOffload::new(false, true, false));
         let (mut stack, socket, local, peer) = open_pending_tcp_connect_stack(config);
@@ -6957,20 +7124,194 @@ mod tests {
                 window_size: u16::MAX,
             },
         );
-        syn_ack[16] ^= 0x80;
+        let partial = crate::tcp_pseudo_header_checksum(
+            IpAddress::Ipv4(peer),
+            IpAddress::Ipv4(local),
+            syn_ack_len,
+        );
+        syn_ack[16..18].copy_from_slice(&partial.to_be_bytes());
+        assert!(
+            !crate::tcp_checksum_valid(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &syn_ack[..syn_ack_len],
+            ),
+            "a partial checksum must not pass software verification"
+        );
 
         stack
             .receive_tcp(
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&syn_ack[..syn_ack_len]),
+                RxFrameOffload::partial(0, 16),
                 StackInstant::from_nanos(1),
             )
-            .expect("TCP checksum-offloaded SYN-ACK should be accepted");
+            .expect("a completed partial checksum should be accepted");
         assert_eq!(
             stack.tcp_connect_state(socket),
             Ok(TcpConnectState::Connected)
         );
+    }
+
+    /// A partial report whose stored sum does not match the packet the
+    /// stack parsed completes to a checksum the segment does not carry,
+    /// and the frame is dropped.
+    #[test]
+    fn tcp_receive_drops_an_inconsistent_partial_checksum_frame() {
+        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES)
+            .with_rx_checksum_offload(RxChecksumOffload::new(false, true, false));
+        let (mut stack, socket, local, peer) = open_pending_tcp_connect_stack(config);
+        let (mut syn_ack, syn_ack_len) = tcp_segment(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+            },
+        );
+        // The pseudo-header sum of a longer segment than the one that
+        // actually arrived: a truncated or mis-framed delivery.
+        let partial = crate::tcp_pseudo_header_checksum(
+            IpAddress::Ipv4(peer),
+            IpAddress::Ipv4(local),
+            syn_ack_len + 8,
+        );
+        syn_ack[16..18].copy_from_slice(&partial.to_be_bytes());
+
+        assert_eq!(
+            stack.receive_tcp(
+                IpAddress::Ipv4(peer),
+                IpAddress::Ipv4(local),
+                &Bytes::copy_from_slice(&syn_ack[..syn_ack_len]),
+                RxFrameOffload::partial(0, 16),
+                StackInstant::from_nanos(1),
+            ),
+            Err(StackError::MalformedPacket)
+        );
+        assert_eq!(
+            stack.tcp_connect_state(socket),
+            Ok(TcpConnectState::Pending)
+        );
+    }
+
+    /// A device with large receive offload coalesces several wire
+    /// segments into one frame, so the receive path has to take a TCP
+    /// segment far larger than the path MTU. Nothing between the
+    /// Ethernet parser and the socket receive queue may cap a segment at
+    /// the interface frame size: the coalesced frame is one segment, and
+    /// its length is bounded by the receive window, not by the MTU.
+    #[test]
+    fn tcp_receive_accepts_a_coalesced_large_receive_segment() {
+        const COALESCED_PAYLOAD_BYTES: usize = 16 * 1024;
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let (mut stack, socket) = open_established_tcp_stack(local, peer);
+        let payload = alloc::vec![0xa5_u8; COALESCED_PAYLOAD_BYTES];
+        let frame = ipv4_tcp_frame(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 101,
+                acknowledgement: 8,
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+            &payload,
+        );
+        assert!(
+            frame.len() > crate::ETHERNET_FRAME_BYTES,
+            "a coalesced frame must exceed the interface frame size for this test to mean anything"
+        );
+
+        stack
+            .receive_rx_frame(
+                RxFrame::with_offload(
+                    Bytes::from(frame),
+                    RxFrameOffload {
+                        checksum: RxChecksumReport::Validated,
+                        large_receive_segment_bytes: Some(1460),
+                    },
+                ),
+                StackInstant::from_nanos(2),
+            )
+            .expect("a coalesced large receive frame should be accepted");
+
+        let TcpReadState::Data(received) = stack
+            .tcp_read(socket, COALESCED_PAYLOAD_BYTES, StackInstant::from_nanos(3))
+            .expect("TCP socket should still exist")
+        else {
+            panic!("the coalesced segment payload should be readable");
+        };
+        assert_eq!(received.len(), COALESCED_PAYLOAD_BYTES);
+        assert!(received.iter().all(|byte| *byte == 0xa5));
+    }
+
+    /// Encodes one Ethernet/IPv4/TCP frame of any length, for segments
+    /// that do not fit the fixed interface frame buffer.
+    fn ipv4_tcp_frame(
+        source: Ipv4Address,
+        destination: Ipv4Address,
+        header: TcpHeader,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut frame = alloc::vec![
+            0_u8;
+            EthernetFrame::HEADER_LEN
+                + Ipv4Packet::MIN_HEADER_LEN
+                + TcpPacket::MIN_HEADER_LEN
+                + payload.len()
+        ];
+        let mut offset =
+            EthernetFrame::encode_header(&mut frame, LOCAL_MAC, PEER_MAC, EthernetProtocol::Ipv4)
+                .expect("test Ethernet header should fit");
+        offset += Ipv4Packet::encode_header(
+            &mut frame[offset..],
+            source,
+            destination,
+            crate::IpProtocol::Tcp,
+            TcpPacket::MIN_HEADER_LEN + payload.len(),
+            7,
+            64,
+        )
+        .expect("test IPv4 header should fit");
+        offset += TcpPacket::encode(
+            &mut frame[offset..],
+            IpAddress::Ipv4(source),
+            IpAddress::Ipv4(destination),
+            header,
+            payload,
+            TransportChecksum::Software,
+        )
+        .expect("test TCP segment should fit");
+        frame.truncate(offset);
+        frame
+    }
+
+    fn corrupt_tcp_syn_ack(
+        peer: Ipv4Address,
+        local: Ipv4Address,
+    ) -> ([u8; crate::ETHERNET_FRAME_BYTES], usize) {
+        let (mut syn_ack, syn_ack_len) = tcp_segment(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 80,
+                destination_port: 49152,
+                sequence: 100,
+                acknowledgement: 8,
+                flags: TcpFlags::SYN.union(TcpFlags::ACK),
+                window_size: u16::MAX,
+            },
+        );
+        syn_ack[16] ^= 0x80;
+        (syn_ack, syn_ack_len)
     }
 
     #[test]
@@ -7016,6 +7357,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&syn_ack[..syn_ack_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(1),
             )
             .expect("unacceptable SYN-ACK should be handled");
@@ -7162,6 +7504,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&rst[..rst_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(1),
             )
             .expect("RST should close pending connect");
@@ -7210,6 +7553,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&syn_ack[..syn_ack_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(1),
             )
             .expect("SYN-ACK should establish the socket");
@@ -7310,6 +7654,7 @@ mod tests {
                     IpAddress::Ipv4(second_peer),
                     IpAddress::Ipv4(local),
                     Bytes::copy_from_slice(&second_datagram[..second_len]),
+                    RxFrameOffload::none(),
                 )
                 .expect("second UDP datagram should be accepted")
         );
@@ -7319,6 +7664,7 @@ mod tests {
                     IpAddress::Ipv4(first_peer),
                     IpAddress::Ipv4(local),
                     Bytes::copy_from_slice(&first_datagram[..first_len]),
+                    RxFrameOffload::none(),
                 )
                 .expect("first UDP datagram should be accepted")
         );
@@ -7366,6 +7712,7 @@ mod tests {
                     IpAddress::Ipv6(peer_v6),
                     IpAddress::Ipv6(local_v6),
                     Bytes::copy_from_slice(&v6_datagram[..v6_len]),
+                    RxFrameOffload::none(),
                 )
                 .expect("IPv6 UDP datagram should be accepted")
         );
@@ -7375,6 +7722,7 @@ mod tests {
                     IpAddress::Ipv4(peer_v4),
                     IpAddress::Ipv4(local_v4),
                     Bytes::copy_from_slice(&v4_datagram[..v4_len]),
+                    RxFrameOffload::none(),
                 )
                 .expect("IPv4 UDP datagram should be accepted")
         );
@@ -7415,6 +7763,7 @@ mod tests {
                     IpAddress::Ipv6(peer_v6),
                     IpAddress::Ipv6(local_v6),
                     Bytes::copy_from_slice(&datagram[..datagram_len]),
+                    RxFrameOffload::none(),
                 )
                 .expect("IPv6 UDP datagram should parse")
         );
@@ -7775,6 +8124,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&syn[..syn_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(1),
             )
             .expect("SYN should be accepted by the listener");
@@ -8168,6 +8518,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 Bytes::copy_from_slice(&datagram[..datagram_len]),
+                RxFrameOffload::none(),
             ),
             Err(StackError::MalformedPacket)
         );
@@ -8175,7 +8526,7 @@ mod tests {
     }
 
     #[test]
-    fn udp_receive_trusts_configured_rx_checksum_offload() {
+    fn udp_receive_trusts_a_device_validated_datagram() {
         let local = Ipv4Address::new([192, 0, 2, 10]);
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES)
@@ -8193,8 +8544,44 @@ mod tests {
                     IpAddress::Ipv4(peer),
                     IpAddress::Ipv4(local),
                     Bytes::copy_from_slice(&datagram[..datagram_len]),
+                    RxFrameOffload::validated(),
                 )
                 .expect("UDP checksum-offloaded datagram should be accepted")
+        );
+        let received = stack
+            .take_udp(socket)
+            .expect("UDP socket should exist")
+            .expect("UDP datagram should be queued");
+        assert_eq!(received.bytes.as_ref(), b"payload");
+    }
+
+    #[test]
+    fn udp_receive_completes_a_partial_checksum_datagram() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([192, 0, 2, 20]);
+        let config = StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES)
+            .with_rx_checksum_offload(RxChecksumOffload::new(false, false, true));
+        let mut stack = Stack::new(config);
+        let socket = stack
+            .open_udp(UdpSocketBinding::wildcard(4040))
+            .expect("UDP socket should bind");
+        let (mut datagram, datagram_len) = udp_datagram(peer, 53, local, 4040, b"payload");
+        let partial = crate::udp_pseudo_header_checksum(
+            IpAddress::Ipv4(peer),
+            IpAddress::Ipv4(local),
+            datagram_len,
+        );
+        datagram[6..8].copy_from_slice(&partial.to_be_bytes());
+
+        assert!(
+            stack
+                .receive_udp(
+                    IpAddress::Ipv4(peer),
+                    IpAddress::Ipv4(local),
+                    Bytes::copy_from_slice(&datagram[..datagram_len]),
+                    RxFrameOffload::partial(0, 6),
+                )
+                .expect("a completed partial checksum should be accepted")
         );
         let received = stack
             .take_udp(socket)
@@ -8221,6 +8608,7 @@ mod tests {
                     IpAddress::Ipv4(peer),
                     IpAddress::Ipv4(local),
                     Bytes::copy_from_slice(&datagram[..datagram_len]),
+                    RxFrameOffload::none(),
                 )
                 .expect("IPv4 UDP zero checksum should be accepted")
         );
@@ -8270,7 +8658,7 @@ mod tests {
         let frame = Bytes::copy_from_slice(&frame[..frame_len]);
 
         stack
-            .receive_frame_bytes_with_backpressure(frame.clone(), StackInstant::from_nanos(1))
+            .receive_rx_frame(RxFrame::new(frame.clone()), StackInstant::from_nanos(1))
             .expect("large UDP frame should parse");
 
         let received = stack
@@ -8459,6 +8847,7 @@ mod tests {
                 IpAddress::Ipv6(peer),
                 IpAddress::Ipv6(local),
                 Bytes::copy_from_slice(&datagram[..datagram_len]),
+                RxFrameOffload::none(),
             ),
             Err(StackError::MalformedPacket)
         );
@@ -8661,6 +9050,7 @@ mod tests {
                     IpAddress::Ipv4(peer),
                     IpAddress::Ipv4(local),
                     Bytes::copy_from_slice(&datagram[..datagram_len]),
+                    RxFrameOffload::none(),
                 )
                 .expect("UDP datagram should be accepted")
         );
@@ -8692,6 +9082,7 @@ mod tests {
                         IpAddress::Ipv4(peer),
                         IpAddress::Ipv4(local),
                         Bytes::copy_from_slice(&saturated_datagram[..saturated_len]),
+                        RxFrameOffload::none(),
                     )
                     .unwrap_or_else(|error| {
                         panic!("UDP datagram {index} should be accepted: {error}")
@@ -8706,6 +9097,7 @@ mod tests {
                     IpAddress::Ipv4(peer),
                     IpAddress::Ipv4(local),
                     Bytes::copy_from_slice(&dropped[..dropped_len]),
+                    RxFrameOffload::none(),
                 )
                 .expect("full UDP socket queue should drop without global backpressure")
         );
@@ -8716,6 +9108,7 @@ mod tests {
                     IpAddress::Ipv4(peer),
                     IpAddress::Ipv4(local),
                     Bytes::copy_from_slice(&other_datagram[..other_len]),
+                    RxFrameOffload::none(),
                 )
                 .expect("other UDP socket should not be starved by saturated socket")
         );
@@ -8823,6 +9216,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&syn[..syn_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(1),
             )
             .expect("closed-port SYN should be handled");
@@ -8869,6 +9263,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&ack[..ack_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(1),
             )
             .expect("closed-port ACK should be handled");
@@ -8915,6 +9310,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&reset[..reset_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(1),
             )
             .expect("unknown RST should be ignored");
@@ -9001,6 +9397,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&ack[..ack_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(2),
             )
             .expect("pure ACK should be accepted");
@@ -9032,6 +9429,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&payload[..payload_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(2),
             )
             .expect("payload should be accepted");
@@ -9063,6 +9461,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&fin[..fin_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(2),
             )
             .expect("FIN should be accepted");
@@ -9114,6 +9513,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&syn_ack[..syn_ack_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(1),
             )
             .expect("SYN-ACK should establish the socket");
@@ -9148,6 +9548,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&fin_ack[..fin_ack_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(time_wait_started),
             )
             .expect("peer FIN should enter TIME_WAIT");
@@ -9250,6 +9651,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&ack[..ack_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(2),
             )
             .expect("final ACK should establish accepted socket");
@@ -9309,6 +9711,7 @@ mod tests {
                 IpAddress::Ipv4(second_peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&second_syn[..second_syn_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(2),
             )
             .expect("full-backlog SYN should be consumed");
@@ -9334,6 +9737,7 @@ mod tests {
                 IpAddress::Ipv4(first_peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&first_ack[..first_ack_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(3),
             )
             .expect("first final ACK should establish accepted socket");
@@ -9356,6 +9760,7 @@ mod tests {
                 IpAddress::Ipv4(second_peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&second_retry[..second_retry_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(4),
             )
             .expect("ready-but-unaccepted backlog should still reject SYN");
@@ -9420,6 +9825,7 @@ mod tests {
                 IpAddress::Ipv4(first_peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&rst[..rst_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(2),
             )
             .expect("half-open RST should be handled");
@@ -9475,6 +9881,7 @@ mod tests {
                 IpAddress::Ipv4(first_peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&rst[..rst_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(2),
             )
             .expect("out-of-window half-open RST should be ignored");
@@ -9496,6 +9903,7 @@ mod tests {
                 IpAddress::Ipv4(second_peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&second_syn[..second_syn_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(3),
             )
             .expect("full backlog should consume second SYN");
@@ -9543,6 +9951,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&syn[..syn_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(1),
             )
             .expect("SYN should be accepted by exact listener");
@@ -9650,6 +10059,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&syn_ack[..syn_ack_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(1),
             )
             .expect("SYN-ACK should establish the socket");
@@ -9672,6 +10082,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&data_fin[..data_fin_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(2),
             )
             .expect("data FIN should be accepted");
@@ -9725,6 +10136,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&syn_ack[..syn_ack_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(1),
             )
             .expect("SYN-ACK should establish the socket");
@@ -9746,6 +10158,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&early_fin[..early_fin_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(2),
             )
             .expect("out-of-order FIN should be tracked");
@@ -9774,6 +10187,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&payload[..payload_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(4),
             )
             .expect("missing payload should complete before FIN");
@@ -9833,6 +10247,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&syn_ack[..syn_ack_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(1),
             )
             .expect("SYN-ACK should establish the socket");
@@ -9854,6 +10269,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&request[..request_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(2),
             )
             .expect("payload should request an ACK");
@@ -9915,6 +10331,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&syn_ack[..syn_ack_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(1),
             )
             .expect("SYN-ACK should establish the socket");
@@ -10002,6 +10419,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&syn_ack[..syn_ack_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(1),
             )
             .expect("SYN-ACK should establish the socket");
@@ -10104,6 +10522,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&syn_ack[..syn_ack_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(1),
             )
             .expect("SYN-ACK should establish the socket");
@@ -10134,6 +10553,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&request[..request_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(received_at),
             )
             .expect("payload should be accepted");
@@ -10201,6 +10621,7 @@ mod tests {
                 IpAddress::Ipv4(peer),
                 IpAddress::Ipv4(local),
                 &Bytes::copy_from_slice(&syn_ack[..syn_ack_len]),
+                RxFrameOffload::none(),
                 StackInstant::from_nanos(1),
             )
             .expect("SYN-ACK should establish the socket");
@@ -10225,6 +10646,7 @@ mod tests {
                     IpAddress::Ipv4(peer),
                     IpAddress::Ipv4(local),
                     &Bytes::copy_from_slice(&segment[..segment_len]),
+                    RxFrameOffload::none(),
                     StackInstant::from_nanos(index as u64 + 2),
                 )
                 .expect("payload should be accepted");
@@ -10419,7 +10841,8 @@ mod tests {
     ) -> ([u8; crate::ETHERNET_FRAME_BYTES], usize) {
         let destination = Ipv6Address::ALL_NODES_LINK_LOCAL;
         let mut body = [0u8; 256];
-        let body_len = router_advertisement_body(&mut body, source, destination, router_lifetime_seconds);
+        let body_len =
+            router_advertisement_body(&mut body, source, destination, router_lifetime_seconds);
         let mut frame = [0u8; crate::ETHERNET_FRAME_BYTES];
         let mut offset = EthernetFrame::encode_header(
             &mut frame,
@@ -10487,8 +10910,7 @@ mod tests {
         let frame = stack
             .take_outbound()
             .expect("router solicitation frame should be queued");
-        let ethernet =
-            EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
         assert_eq!(
             ethernet.destination,
             ipv6_multicast_mac(Ipv6Address::ALL_ROUTERS_LINK_LOCAL)
@@ -10557,7 +10979,10 @@ mod tests {
                 autoconfigured = true;
             }
         }
-        assert!(autoconfigured, "an autoconfiguration event should be queued");
+        assert!(
+            autoconfigured,
+            "an autoconfiguration event should be queued"
+        );
 
         // Autoconfiguration stops soliciting once it has an answer.
         stack
@@ -10586,8 +11011,7 @@ mod tests {
 
     #[test]
     fn router_advertisement_from_global_source_is_rejected() {
-        let global =
-            Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        let global = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let mut stack = Stack::new(StackConfig::new(LOCAL_MAC, crate::ETHERNET_FRAME_BYTES));
         stack.configure_ipv6_link_local();
         let (frame, len) = router_advertisement_frame(300, 255, global);
@@ -10729,13 +11153,9 @@ mod tests {
         body[2..4].copy_from_slice(&checksum.to_be_bytes());
 
         let mut frame = [0u8; crate::ETHERNET_FRAME_BYTES];
-        let mut offset = EthernetFrame::encode_header(
-            &mut frame,
-            LOCAL_MAC,
-            impostor,
-            EthernetProtocol::Ipv6,
-        )
-        .expect("test Ethernet header should fit");
+        let mut offset =
+            EthernetFrame::encode_header(&mut frame, LOCAL_MAC, impostor, EthernetProtocol::Ipv6)
+                .expect("test Ethernet header should fit");
         offset += Ipv6Packet::encode_header(
             &mut frame[offset..],
             peer,
@@ -10774,8 +11194,7 @@ mod tests {
         let frame = stack
             .take_outbound()
             .expect("neighbor solicitation should be queued");
-        let ethernet =
-            EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
         assert_eq!(
             ethernet.destination,
             ipv6_multicast_mac(peer.solicited_node_multicast())
@@ -10794,17 +11213,14 @@ mod tests {
     #[test]
     fn ipv6_udp_datagram_is_routed_through_the_advertised_default_router() {
         let mut stack = autoconfigured_stack();
-        let remote = Ipv6Address::new([
-            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-        ]);
+        let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
 
         stack
             .send_udp_ipv6(4040, remote, 8080, b"payload", StackInstant::from_nanos(6))
             .expect("datagram should route through the advertised router");
 
         let frame = stack.take_outbound().expect("datagram should be queued");
-        let ethernet =
-            EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
         // Next hop is the router, so the frame carries the router's MAC
         // while the IPv6 destination stays the final remote address.
         assert_eq!(ethernet.destination, ROUTER_MAC);
@@ -10824,9 +11240,8 @@ mod tests {
     fn tcp_over_ipv6_completes_the_handshake_against_frame_fixtures() {
         let mut stack = autoconfigured_stack();
         let local_address = slaac_expected_address(LOCAL_MAC).address();
-        let remote_address = Ipv6Address::new([
-            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-        ]);
+        let remote_address =
+            Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let local = TcpEndpoint {
             address: IpAddress::Ipv6(local_address),
             port: 49152,
@@ -10844,8 +11259,7 @@ mod tests {
             .expect("SYN should be queued");
 
         let frame = stack.take_outbound().expect("SYN frame should be queued");
-        let ethernet =
-            EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
         assert_eq!(ethernet.destination, ROUTER_MAC);
         let ipv6 = Ipv6Packet::parse(ethernet.payload).expect("IPv6 packet should parse");
         assert_eq!(ipv6.source, local_address);
@@ -10878,13 +11292,9 @@ mod tests {
         )
         .expect("test SYN-ACK should fit");
         let mut frame = [0u8; crate::ETHERNET_FRAME_BYTES];
-        let mut offset = EthernetFrame::encode_header(
-            &mut frame,
-            LOCAL_MAC,
-            ROUTER_MAC,
-            EthernetProtocol::Ipv6,
-        )
-        .expect("test Ethernet header should fit");
+        let mut offset =
+            EthernetFrame::encode_header(&mut frame, LOCAL_MAC, ROUTER_MAC, EthernetProtocol::Ipv6)
+                .expect("test Ethernet header should fit");
         offset += Ipv6Packet::encode_header(
             &mut frame[offset..],
             remote_address,
@@ -10910,8 +11320,7 @@ mod tests {
             .drive_tcp(StackInstant::from_nanos(12))
             .expect("handshake ACK should be queued");
         let frame = stack.take_outbound().expect("ACK frame should be queued");
-        let ethernet =
-            EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
         let ipv6 = Ipv6Packet::parse(ethernet.payload).expect("IPv6 packet should parse");
         let ack = TcpPacket::parse(ipv6.payload).expect("TCP segment should parse");
         assert!(ack.flags.contains(TcpFlags::ACK));

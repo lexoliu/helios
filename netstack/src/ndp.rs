@@ -175,7 +175,8 @@ pub fn interpret_router_advertisement(
         on_link_prefixes: ArrayVec::new(),
         addresses: ArrayVec::new(),
         link_mtu: None,
-        hop_limit: (advertisement.current_hop_limit != 0).then_some(advertisement.current_hop_limit),
+        hop_limit: (advertisement.current_hop_limit != 0)
+            .then_some(advertisement.current_hop_limit),
         dns_servers: ArrayVec::new(),
     };
 
@@ -227,9 +228,8 @@ mod tests {
     use crate::Icmpv6Packet;
 
     const MAC: EthernetAddress = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
-    const ROUTER: Ipv6Address = Ipv6Address::new([
-        0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
-    ]);
+    const ROUTER: Ipv6Address =
+        Ipv6Address::new([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02]);
 
     /// Builds a Router Advertisement body with a prefix-information
     /// option for `fec0::/64` (QEMU user-mode networking's prefix), a
@@ -409,9 +409,10 @@ mod tests {
         assert!(discovery.poll_solicitation(StackInstant::from_nanos(0)));
         // Inside the retransmit interval: no second frame.
         assert!(!discovery.poll_solicitation(StackInstant::from_nanos(1)));
-        assert!(discovery.poll_solicitation(StackInstant::from_nanos(
-            ROUTER_SOLICITATION_INTERVAL_NANOS
-        )));
+        assert!(
+            discovery
+                .poll_solicitation(StackInstant::from_nanos(ROUTER_SOLICITATION_INTERVAL_NANOS))
+        );
         assert!(discovery.poll_solicitation(StackInstant::from_nanos(
             2 * ROUTER_SOLICITATION_INTERVAL_NANOS
         )));

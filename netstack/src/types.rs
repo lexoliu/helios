@@ -69,7 +69,10 @@ impl Ipv6Address {
 
     /// Builds `fe80::/64` + modified EUI-64 for this interface's MAC.
     pub const fn link_local_from_mac(mac: EthernetAddress) -> Self {
-        Self::from_prefix_and_eui64(Self([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), mac)
+        Self::from_prefix_and_eui64(
+            Self([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            mac,
+        )
     }
 
     /// Combines the top 64 bits of `prefix` with the modified EUI-64
