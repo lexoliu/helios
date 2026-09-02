@@ -1851,6 +1851,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-ping"
+version = "0.1.0"
+dependencies = [
+ "helios-api",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "helios-riscv"
 version = "0.1.0"
 dependencies = [

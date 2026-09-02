@@ -87,6 +87,10 @@ pub(super) struct NetworkShard {
     pub(super) dhcp: DhcpClientState,
     pub(super) dns_servers: DhcpDnsServers,
     pub(super) next_dns_query_id: u16,
+    /// Identifier stamped on the next ICMP echo request. ICMP frames
+    /// carry no port, so every one of them is demultiplexed onto shard
+    /// 0 and this counter is that shard's alone.
+    pub(super) next_icmp_echo_identifier: u16,
 }
 
 /// A set of `NetworkShard` instances laid out per-CPU.
@@ -320,6 +324,7 @@ impl NetworkShard {
             dhcp: DhcpClientState::Init { transaction_id },
             dns_servers: DhcpDnsServers::new(),
             next_dns_query_id: 1,
+            next_icmp_echo_identifier: 1,
         }
     }
 

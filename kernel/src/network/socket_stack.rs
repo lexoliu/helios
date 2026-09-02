@@ -293,7 +293,7 @@ mod tests {
             _: u64,
         ) -> impl Future<Output = Result<PingReply, PingError>> + Send + '_ {
             core::future::ready(Ok(PingReply {
-                address: Ipv4Address::new([127, 0, 0, 1]),
+                address: NetworkIpAddress::Ipv4(Ipv4Address::new([127, 0, 0, 1])),
                 round_trip_nanos: 1,
                 payload_bytes: 0,
             }))

@@ -113,6 +113,18 @@ impl AddressAttemptError for TcpError {
     }
 }
 
+impl AddressAttemptError for PingError {
+    fn is_address_specific(&self) -> bool {
+        matches!(
+            self.detail,
+            NetworkErrorDetail::NetworkConfigurationTimeout
+                | NetworkErrorDetail::NetworkServiceUnavailable
+                | NetworkErrorDetail::IcmpEchoTimeout
+                | NetworkErrorDetail::IcmpQueueFailed
+        )
+    }
+}
+
 impl AddressAttemptError for UdpError {
     fn is_address_specific(&self) -> bool {
         matches!(

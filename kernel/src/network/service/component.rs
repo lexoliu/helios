@@ -95,13 +95,23 @@ where
         .await
     }
 
+    /// Every address worth an echo request for this destination, in the
+    /// order the ping walk should try them.
+    ///
+    /// Echo works in both families, so a name is resolved the same way
+    /// a connect resolves it: the dual-family answer is ordered by what
+    /// this link can actually source, and a target that is unreachable
+    /// in one family falls through to the next.
     pub(super) async fn resolve_host_ping(
         &self,
         host: &str,
         deadline_nanos: u64,
-    ) -> Result<Ipv4Address, PingError> {
+    ) -> Result<ConnectCandidates, PingError> {
         if let Some(address) = parse_ipv4(host) {
-            return Ok(address);
+            return Ok(ConnectCandidates::literal(IpAddress::Ipv4(address)));
+        }
+        if let Some(address) = parse_ipv6(host) {
+            return Ok(ConnectCandidates::literal(IpAddress::Ipv6(address)));
         }
         let timeout_nanos = deadline_nanos.saturating_sub(self.now_nanos());
         let addresses = self
@@ -117,18 +127,10 @@ where
                 },
                 detail: error.detail,
             })?;
-        // ICMP echo is IPv4-only in this service, so an IPv6-only name
-        // is unreachable through it even though the lookup succeeded.
-        addresses
-            .into_iter()
-            .find_map(|address| match address {
-                NetworkIpAddress::Ipv4(address) => Some(map_kernel_ipv4_address(address)),
-                NetworkIpAddress::Ipv6(_) => None,
-            })
-            .ok_or(PingError {
-                kind: PingErrorKind::UnresolvedHost,
-                detail: NetworkErrorDetail::DnsNoIpv4Address,
-            })
+        self.usable_addresses(addresses).ok_or(PingError {
+            kind: PingErrorKind::UnresolvedHost,
+            detail: NetworkErrorDetail::DnsNoIpv4Address,
+        })
     }
 
     pub(super) async fn drive_dns(&self) -> Result<(), DnsError> {
@@ -771,6 +773,54 @@ impl NetworkShard {
             )
             .map(|_| ())
             .map_err(|_| NetworkControlError::BackendFault)
+    }
+
+    /// Identifier for the next echo exchange this shard starts.
+    ///
+    /// Replies are matched on it, so an identifier that a previous ping
+    /// abandoned must not be handed out again while its late reply may
+    /// still arrive; the counter therefore walks the whole 16-bit space
+    /// before it repeats, and skips zero the way the DNS query ids do.
+    pub(super) fn next_icmp_echo_identifier(&mut self) -> u16 {
+        let identifier = self.next_icmp_echo_identifier;
+        self.next_icmp_echo_identifier = self.next_icmp_echo_identifier.wrapping_add(1);
+        if self.next_icmp_echo_identifier == 0 {
+            self.next_icmp_echo_identifier = 1;
+        }
+        identifier
+    }
+
+    /// Queues the echo request `key` describes.
+    ///
+    /// Reports whether the request reached the transmit queue: a `false`
+    /// means the next hop's link-layer address is still being resolved
+    /// and an ARP request or neighbour solicitation went out instead, so
+    /// the caller repeats the send once the neighbour answers.
+    pub(super) fn send_icmp_echo_request(
+        &mut self,
+        key: IcmpEchoKey,
+        payload: &[u8],
+        now: StackInstant,
+    ) -> Result<bool, PingError> {
+        self.stack
+            .send_icmp_echo_request(
+                key.destination,
+                key.identifier,
+                key.sequence,
+                payload,
+                key.sequence,
+                now,
+            )
+            .map(|queued| queued != 0)
+            .map_err(|_| PingError {
+                kind: PingErrorKind::Unavailable,
+                detail: NetworkErrorDetail::IcmpQueueFailed,
+            })
+    }
+
+    /// Claims the reply to `key`, if one has arrived on this shard.
+    pub(super) fn take_icmp_echo_reply(&mut self, key: IcmpEchoKey) -> Option<IcmpEchoReply> {
+        self.stack.take_icmp_echo_reply(key)
     }
 
     pub(super) fn next_dns_query_id(&mut self) -> u16 {

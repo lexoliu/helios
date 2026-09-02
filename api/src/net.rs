@@ -11,7 +11,8 @@ const DEFAULT_TCP_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_READ_CHUNK_BYTES: usize = 1024 * 1024;
 
 pub use crate::bindings::helios::system::net::{
-    IpAddress, Ipv4Address, PingErrorKind, PingReply, TcpErrorKind, UdpDatagram, UdpErrorKind,
+    IpAddress, Ipv4Address, Ipv6Address, PingErrorKind, PingReply, TcpErrorKind, UdpDatagram,
+    UdpErrorKind,
 };
 
 /// Outbound TCP client stream backed by the kernel network service.

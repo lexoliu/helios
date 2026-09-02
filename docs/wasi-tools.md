@@ -194,11 +194,11 @@ tools/wasi-apps/smoke.sh
 ```
 
 It runs the AArch64/HVF VM path for standard dash, Bash plus coreutils
-pipeline/redirection/script/cwd/env/exit-status behavior, QuickJS, and
-CPython stdlib imports. Set
+pipeline/redirection/script/cwd/env/exit-status behavior, QuickJS,
+CPython stdlib imports, and an ICMP echo against the slirp gateway. Set
 `HELIOS_WASI_SMOKE_RELEASE=1` when the smoke should rebuild and boot
 release artifacts. Set `HELIOS_WASI_SMOKE_CURL=1` to include the networked
-curl smoke.
+curl smoke and a ping resolved through DNS.
 
 The compiler-plugin performance gate for the staged curl artifact is:
 

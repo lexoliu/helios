@@ -30,13 +30,13 @@ use helios_hal::io::IoError;
 use helios_netstack::{
     DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage, DhcpDnsServers,
     DhcpMessageType, DhcpPacket, DnsQuestionWriter, DnsRecordType, DnsResponse, EthernetFrame,
-    EthernetProtocol, Icmpv4Packet, Icmpv6Packet, IpAddress, IpCidr, IpProtocol, Ipv4Address,
-    Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborEntry,
-    NetworkInterface as NetworkDevice,
-    OutboundBatchStatus, PacketBuffer, Route, RouteTable, RxChecksumOffload, Stack, StackConfig,
-    StackError, StackEvent, StackInstant, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
-    TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState, UdpEndpoint, UdpPacket,
-    UdpPayload, UdpSocketBinding, UdpSocketError,
+    EthernetProtocol, IcmpEchoKey, IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, IpAddress, IpCidr,
+    IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet,
+    MAX_OUTBOUND_FRAMES, NeighborEntry, NetworkInterface as NetworkDevice, OutboundBatchStatus,
+    PacketBuffer, Route, RouteTable, RxChecksumOffload, Stack, StackConfig, StackError, StackEvent,
+    StackInstant, TcpConnectState, TcpConnectTerminalError, TcpEndpoint, TcpListenBacklog,
+    TcpPacket, TcpReadIntoState, TcpReadState, UdpEndpoint, UdpPacket, UdpPayload,
+    UdpSocketBinding, UdpSocketError,
 };
 use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
@@ -553,18 +553,84 @@ where
 
     async fn execute_ping(&self, host: &str, timeout_nanos: u64) -> Result<PingReply, PingError> {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
-        self.wait_for_ipv4_ping(deadline_nanos).await?;
-        let destination = self.resolve_host_ping(host, deadline_nanos).await?;
+        let candidates = self.resolve_host_ping(host, deadline_nanos).await?;
+        // One identifier covers the whole request; the sequence number
+        // separates the attempts, so a late reply to an abandoned
+        // candidate can never be mistaken for the current one.
+        let identifier = self
+            .inner
+            .state
+            .with_mut(NetworkShard::next_icmp_echo_identifier);
+        let mut sequence: u16 = 0;
+        // Every candidate shares the caller's deadline, exactly as the
+        // connect walk does: a destination that is unreachable in one
+        // family hands whatever time is left to the next address.
+        attempt_each_address(&candidates, move |destination| {
+            sequence = sequence.wrapping_add(1);
+            self.echo_address(
+                IcmpEchoKey {
+                    destination,
+                    identifier,
+                    sequence,
+                },
+                deadline_nanos,
+            )
+        })
+        .await
+    }
+
+    /// Sends one echo request and resolves with its round-trip time.
+    ///
+    /// The request is retransmitted only while the next hop's
+    /// link-layer address is still unresolved; once it is on the wire
+    /// the task parks on the device event or the poll timer until the
+    /// reply lands or the deadline passes.
+    async fn echo_address(
+        &self,
+        key: IcmpEchoKey,
+        deadline_nanos: u64,
+    ) -> Result<PingReply, PingError> {
+        if matches!(key.destination, IpAddress::Ipv4(_)) {
+            self.wait_for_ipv4_ping(deadline_nanos).await?;
+        }
+        let payload = icmp_echo_payload();
+        let mut sent_at_nanos = None;
         loop {
             self.drive_ping().await?;
-            if self.now_nanos() >= deadline_nanos {
+            let now_nanos = self.now_nanos();
+            match sent_at_nanos {
+                None => {
+                    let now = StackInstant::from_nanos(now_nanos);
+                    let transmitted = self
+                        .inner
+                        .state
+                        .with_mut(|state| state.send_icmp_echo_request(key, &payload, now))?;
+                    if transmitted {
+                        sent_at_nanos = Some(now_nanos);
+                    }
+                }
+                Some(sent_at) => {
+                    let reply: Option<IcmpEchoReply> = self
+                        .inner
+                        .state
+                        .with_mut(|state| state.take_icmp_echo_reply(key));
+                    if let Some(reply) = reply {
+                        return Ok(PingReply {
+                            address: map_ip_address(key.destination),
+                            round_trip_nanos: self.now_nanos().saturating_sub(sent_at),
+                            payload_bytes: reply.payload_bytes,
+                        });
+                    }
+                }
+            }
+            if now_nanos >= deadline_nanos {
                 return Err(PingError {
                     kind: PingErrorKind::Timeout,
                     detail: NetworkErrorDetail::IcmpEchoTimeout,
                 });
             }
+            self.drive_ping().await?;
             self.wait_for_progress(NETWORK_PROGRESS_WAIT).await;
-            let _ = destination;
         }
     }
 
@@ -891,6 +957,18 @@ const fn clamp_poll_budget(budget: usize) -> usize {
     }
 }
 
+/// Data an echo request carries.
+///
+/// A conventional `ping` sends 56 data bytes, so a target or middlebox
+/// that sizes its reply on the request sees the shape it expects; the
+/// contents are a fixed ramp so a truncated or rewritten echo shows up
+/// in the reported `payload_bytes`.
+const ICMP_ECHO_PAYLOAD_BYTES: usize = 56;
+
+fn icmp_echo_payload() -> [u8; ICMP_ECHO_PAYLOAD_BYTES] {
+    core::array::from_fn(|index| index as u8)
+}
+
 fn usize_to_u64(value: usize, label: &'static str) -> u64 {
     u64::try_from(value).unwrap_or_else(|_| panic!("{label} does not fit into u64"))
 }
@@ -898,18 +976,18 @@ fn usize_to_u64(value: usize, label: &'static str) -> u64 {
 #[cfg(test)]
 mod tests {
     use helios_netstack::{
-        ETHERNET_FRAME_BYTES, EthernetFrame, EthernetProtocol, Icmpv6Packet, IpAddress, IpProtocol,
-        Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES,
-        NeighborEntry, NeighborState, RxChecksumOffload, StackInstant, TcpFlags, TcpHeader,
-        TcpListenBacklog, TcpPacket, TransportChecksum, UdpEndpoint, UdpPacket, UdpPayload,
-        UdpSocketBinding,
+        ETHERNET_FRAME_BYTES, EthernetFrame, EthernetProtocol, IcmpEchoKey, Icmpv4Packet,
+        Icmpv6Packet, IpAddress, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address,
+        Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborEntry, NeighborState, RxChecksumOffload,
+        StackInstant, TcpFlags, TcpHeader, TcpListenBacklog, TcpPacket, TransportChecksum,
+        UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding, internet_checksum,
     };
 
     use super::{
         AddressAttemptError, HandleSlab, NETWORK_BUSY_POLL_ROUNDS, NETWORK_TX_BATCH_FRAMES,
         NetworkIpAddress, NetworkPollBudget, NetworkPollProgress, NetworkPollState,
-        NetworkPumpAction, NetworkPumpCadence, NetworkShard, limit_udp_datagram_bytes,
-        map_ipv4_address, parse_ipv6,
+        NetworkPumpAction, NetworkPumpCadence, NetworkShard, icmp_echo_payload,
+        limit_udp_datagram_bytes, map_ipv4_address, parse_ipv6,
     };
 
     fn ipv6_tcp_frame(
@@ -1213,6 +1291,232 @@ mod tests {
             AddressAttemptError::is_address_specific(&error),
             "a refused candidate must fall through to the next resolved address"
         );
+    }
+
+    /// Builds the ICMPv4 echo reply a host would send back for
+    /// `request`, so the test drives the same bytes the wire would.
+    fn ipv4_echo_reply_frame(
+        source: Ipv4Address,
+        destination: Ipv4Address,
+        identifier: u16,
+        sequence: u16,
+        payload: &[u8],
+    ) -> ([u8; ETHERNET_FRAME_BYTES], usize) {
+        let mut frame = [0; ETHERNET_FRAME_BYTES];
+        let mut offset = EthernetFrame::encode_header(
+            &mut frame,
+            [0x02, 0, 0, 0, 0, 1],
+            [0x02, 0, 0, 0, 0, 2],
+            EthernetProtocol::Ipv4,
+        )
+        .expect("test Ethernet header should fit");
+        let icmp_len = Icmpv4Packet::HEADER_LEN + payload.len();
+        offset += Ipv4Packet::encode_header(
+            &mut frame[offset..],
+            source,
+            destination,
+            IpProtocol::Icmp,
+            icmp_len,
+            1,
+            64,
+        )
+        .expect("test IPv4 header should fit");
+        // RFC 792 echo reply: type 0, code 0, then the identifier,
+        // sequence and echoed data the request carried.
+        let icmp = &mut frame[offset..offset + icmp_len];
+        icmp.fill(0);
+        icmp[4..6].copy_from_slice(&identifier.to_be_bytes());
+        icmp[6..8].copy_from_slice(&sequence.to_be_bytes());
+        icmp[Icmpv4Packet::HEADER_LEN..].copy_from_slice(payload);
+        let checksum = internet_checksum(icmp);
+        icmp[2..4].copy_from_slice(&checksum.to_be_bytes());
+        (frame, offset + icmp_len)
+    }
+
+    /// The core of issue #38: a ping has to put an echo request on the
+    /// wire, and the reply that answers it has to be claimable by the
+    /// identifier and sequence the request carried.
+    #[test]
+    fn icmp_echo_request_is_transmitted_and_its_reply_is_claimed() {
+        let local = Ipv4Address::new([10, 0, 2, 15]);
+        let remote = Ipv4Address::new([10, 0, 2, 2]);
+        let mut state = test_network_shard();
+        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        state.stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(remote),
+            mac: [0x02, 0, 0, 0, 0, 2],
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        let key = IcmpEchoKey {
+            destination: IpAddress::Ipv4(remote),
+            identifier: state.next_icmp_echo_identifier(),
+            sequence: 1,
+        };
+        let payload = icmp_echo_payload();
+
+        assert!(
+            state
+                .send_icmp_echo_request(key, &payload, StackInstant::from_nanos(1))
+                .expect("the echo request should queue"),
+            "a resolved neighbour puts the request on the wire immediately"
+        );
+
+        let frame = state
+            .stack
+            .take_outbound()
+            .expect("an echo request frame should be queued");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
+        assert_eq!(ipv4.source, local);
+        assert_eq!(ipv4.destination, remote);
+        assert_eq!(ipv4.protocol, IpProtocol::Icmp);
+        let request = match Icmpv4Packet::parse(ipv4.payload) {
+            Some(Icmpv4Packet::EchoRequest(echo)) => echo,
+            other => panic!("expected an ICMPv4 echo request, got {other:?}"),
+        };
+        assert_eq!(request.identifier, key.identifier);
+        assert_eq!(request.sequence, key.sequence);
+        assert_eq!(request.payload, payload.as_slice());
+
+        assert!(
+            state.take_icmp_echo_reply(key).is_none(),
+            "no reply has arrived yet"
+        );
+
+        let (reply_frame, reply_len) =
+            ipv4_echo_reply_frame(remote, local, key.identifier, key.sequence, request.payload);
+        state
+            .stack
+            .receive_frame(&reply_frame[..reply_len], StackInstant::from_nanos(2))
+            .expect("the echo reply should be accepted");
+
+        let reply = state
+            .take_icmp_echo_reply(key)
+            .expect("the matching echo reply should be claimable");
+        assert_eq!(reply.key, key);
+        assert_eq!(usize::from(reply.payload_bytes), payload.len());
+        assert!(
+            state.take_icmp_echo_reply(key).is_none(),
+            "a claimed reply is consumed"
+        );
+    }
+
+    /// A reply whose identifier or sequence belongs to some other
+    /// exchange must not satisfy this one, or a stale answer would be
+    /// reported as this ping's round-trip time.
+    #[test]
+    fn icmp_echo_reply_with_another_key_is_not_claimed() {
+        let local = Ipv4Address::new([10, 0, 2, 15]);
+        let remote = Ipv4Address::new([10, 0, 2, 2]);
+        let mut state = test_network_shard();
+        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        state.stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv4(remote),
+            mac: [0x02, 0, 0, 0, 0, 2],
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        let key = IcmpEchoKey {
+            destination: IpAddress::Ipv4(remote),
+            identifier: 0x4242,
+            sequence: 1,
+        };
+        let payload = icmp_echo_payload();
+        state
+            .send_icmp_echo_request(key, &payload, StackInstant::from_nanos(1))
+            .expect("the echo request should queue");
+        let _ = state.stack.take_outbound();
+
+        for (identifier, sequence) in [
+            (key.identifier.wrapping_add(1), key.sequence),
+            (key.identifier, key.sequence.wrapping_add(1)),
+        ] {
+            let (frame, len) = ipv4_echo_reply_frame(remote, local, identifier, sequence, &payload);
+            state
+                .stack
+                .receive_frame(&frame[..len], StackInstant::from_nanos(2))
+                .expect("the echo reply should be accepted");
+        }
+
+        assert!(
+            state.take_icmp_echo_reply(key).is_none(),
+            "a reply for another exchange must not answer this one"
+        );
+    }
+
+    /// IPv6 targets take the ICMPv6 path with an IPv6 source address,
+    /// which is what makes a AAAA-only host pingable at all.
+    #[test]
+    fn icmpv6_echo_request_uses_the_ipv6_source_address() {
+        let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        let mut state = test_network_shard();
+        state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+        state.stack.learn_neighbor(NeighborEntry {
+            ip: IpAddress::Ipv6(remote),
+            mac: [0x02, 0, 0, 0, 0, 2],
+            state: NeighborState::Reachable,
+            updated_at: StackInstant::from_nanos(0),
+        });
+        let key = IcmpEchoKey {
+            destination: IpAddress::Ipv6(remote),
+            identifier: 7,
+            sequence: 3,
+        };
+        let payload = icmp_echo_payload();
+
+        assert!(
+            state
+                .send_icmp_echo_request(key, &payload, StackInstant::from_nanos(1))
+                .expect("the ICMPv6 echo request should queue")
+        );
+
+        let frame = state
+            .stack
+            .take_outbound()
+            .expect("an ICMPv6 echo request frame should be queued");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        assert_eq!(ethernet.protocol, EthernetProtocol::Ipv6);
+        let ipv6 = Ipv6Packet::parse(ethernet.payload).expect("IPv6 packet should parse");
+        assert_eq!(ipv6.source, local);
+        assert_eq!(ipv6.destination, remote);
+        let request = match Icmpv6Packet::parse(ipv6.payload) {
+            Some(Icmpv6Packet::EchoRequest(echo)) => echo,
+            other => panic!("expected an ICMPv6 echo request, got {other:?}"),
+        };
+        assert_eq!(request.identifier, key.identifier);
+        assert_eq!(request.sequence, key.sequence);
+        assert_eq!(request.payload, payload.as_slice());
+    }
+
+    /// An unresolved next hop sends an ARP request instead, and the
+    /// caller learns nothing went out so it can retry rather than start
+    /// timing a round trip that never began.
+    #[test]
+    fn icmp_echo_request_waits_for_the_neighbour_to_answer() {
+        let local = Ipv4Address::new([10, 0, 2, 15]);
+        let remote = Ipv4Address::new([10, 0, 2, 2]);
+        let mut state = test_network_shard();
+        state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+        let key = IcmpEchoKey {
+            destination: IpAddress::Ipv4(remote),
+            identifier: 9,
+            sequence: 1,
+        };
+
+        assert!(
+            !state
+                .send_icmp_echo_request(key, &icmp_echo_payload(), StackInstant::from_nanos(1))
+                .expect("an unresolved neighbour is not an error"),
+            "nothing is on the wire until ARP resolves the next hop"
+        );
+        let frame = state
+            .stack
+            .take_outbound()
+            .expect("an ARP request should be queued in its place");
+        let ethernet = EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+        assert_eq!(ethernet.protocol, EthernetProtocol::Arp);
     }
 
     #[test]

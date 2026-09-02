@@ -27,6 +27,13 @@ pub const MAX_NEIGHBORS: usize = 128;
 pub const MAX_OUTBOUND_FRAMES: usize = 32;
 pub const MAX_STACK_EVENTS: usize = 64;
 pub const MAX_UDP_RX: usize = 64;
+/// Echo replies retained until a waiter claims them.
+///
+/// A ping has one request outstanding at a time, so this only has to
+/// absorb replies that raced past their waiter's deadline plus any
+/// unsolicited ones the link delivers. The oldest is evicted once the
+/// buffer fills.
+pub const MAX_ICMP_ECHO_REPLIES: usize = 8;
 pub const MAX_UDP_SOCKETS: usize = 256;
 pub const MAX_IPV4_MULTICAST_MEMBERSHIPS: usize = 64;
 pub const MAX_PATH_MTU_ENTRIES: usize = 128;
@@ -248,11 +255,22 @@ impl TcpListenBacklog {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DnsQueryId(u32);
 
+/// Identifies one echo exchange. `destination` is the host that was
+/// pinged, which is the source address of the reply that answers it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IcmpEchoKey {
     pub destination: IpAddress,
     pub identifier: u16,
     pub sequence: u16,
+}
+
+/// A received echo reply, held until the waiter for its key claims it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IcmpEchoReply {
+    pub key: IcmpEchoKey,
+    /// Length of the echoed data, which a caller compares against the
+    /// payload it sent.
+    pub payload_bytes: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1972,6 +1990,10 @@ where
     events: Deque<StackEvent, MAX_STACK_EVENTS>,
     udp: UdpSocketSlab,
     udp_rx: Deque<UdpQueuedReceive, MAX_UDP_RX>,
+    /// Echo replies observed on this shard's receive path, oldest
+    /// first. ICMP frames carry no port, so every one of them lands on
+    /// shard 0 and this buffer belongs to that shard alone.
+    icmp_echo_replies: ArrayVec<IcmpEchoReply, MAX_ICMP_ECHO_REPLIES>,
     udp_rx_counts: [u8; MAX_UDP_SOCKETS],
     tcp_accept: Deque<TcpQueuedAccept, MAX_TCP_ACCEPT>,
     tcp_listener_queues: TcpListenerQueues,
@@ -2221,6 +2243,7 @@ where
             events: Deque::new(),
             udp: UdpSocketSlab::new(),
             udp_rx: Deque::new(),
+            icmp_echo_replies: ArrayVec::new(),
             udp_rx_counts: [0; MAX_UDP_SOCKETS],
             tcp_accept: Deque::new(),
             tcp_listener_queues: TcpListenerQueues::new(),
@@ -3475,6 +3498,187 @@ where
         )
     }
 
+    /// Queues one ICMP echo request to `destination`, choosing ICMPv4 or
+    /// ICMPv6 from the address family.
+    ///
+    /// Returns the number of payload bytes queued, or `0` when the next
+    /// hop's link-layer address is still unknown: an ARP request or a
+    /// neighbour solicitation went out in its place and the caller
+    /// repeats the send once the neighbour answers, exactly as the UDP
+    /// send path does.
+    pub fn send_icmp_echo_request(
+        &mut self,
+        destination: IpAddress,
+        identifier: u16,
+        sequence: u16,
+        payload: &[u8],
+        identification: u16,
+        now: StackInstant,
+    ) -> Result<usize, StackError> {
+        match destination {
+            IpAddress::Ipv4(destination) => self.send_icmpv4_echo_request(
+                destination,
+                identifier,
+                sequence,
+                payload,
+                identification,
+                now,
+            ),
+            IpAddress::Ipv6(destination) => {
+                self.send_icmpv6_echo_request(destination, identifier, sequence, payload, now)
+            }
+        }
+    }
+
+    fn send_icmpv4_echo_request(
+        &mut self,
+        destination: Ipv4Address,
+        identifier: u16,
+        sequence: u16,
+        payload: &[u8],
+        identification: u16,
+        now: StackInstant,
+    ) -> Result<usize, StackError> {
+        let source = self
+            .source_ipv4_for(destination)
+            .ok_or(StackError::Unroutable)?;
+        let next_hop = match self.next_hop(IpAddress::Ipv4(destination)) {
+            Some(IpAddress::Ipv4(next_hop)) => next_hop,
+            Some(IpAddress::Ipv6(_)) => panic!("IPv4 route resolved to IPv6 next hop"),
+            None => destination,
+        };
+        let Some(destination_mac) = self.neighbor_mac(IpAddress::Ipv4(next_hop)) else {
+            self.queue_arp_request(source, next_hop, now)?;
+            return Ok(0);
+        };
+        let icmp_len = Icmpv4Packet::HEADER_LEN
+            .checked_add(payload.len())
+            .ok_or(StackError::PacketTooLarge)?;
+        self.ensure_path_packet_fits(
+            PathMtuKey::new(IpAddress::Ipv4(source), IpAddress::Ipv4(destination)),
+            EthernetFrame::HEADER_LEN + Ipv4Packet::MIN_HEADER_LEN,
+            icmp_len,
+        )?;
+        let local_mac = self.config.mac;
+        self.queue_outbound_frame(|frame| {
+            let storage = frame.storage_mut();
+            let mut offset = EthernetFrame::encode_header(
+                storage,
+                destination_mac,
+                local_mac,
+                EthernetProtocol::Ipv4,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            offset += Ipv4Packet::encode_header(
+                &mut storage[offset..],
+                source,
+                destination,
+                crate::IpProtocol::Icmp,
+                icmp_len,
+                identification,
+                crate::DEFAULT_HOP_LIMIT,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            offset += Icmpv4Packet::encode_echo_request(
+                &mut storage[offset..],
+                identifier,
+                sequence,
+                payload,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            frame.set_len(offset);
+            Ok(payload.len())
+        })
+    }
+
+    fn send_icmpv6_echo_request(
+        &mut self,
+        destination: Ipv6Address,
+        identifier: u16,
+        sequence: u16,
+        payload: &[u8],
+        now: StackInstant,
+    ) -> Result<usize, StackError> {
+        let source = self
+            .source_ipv6_for(destination)
+            .ok_or(StackError::Unroutable)?;
+        let next_hop = match self.next_hop(IpAddress::Ipv6(destination)) {
+            Some(IpAddress::Ipv6(next_hop)) => next_hop,
+            Some(IpAddress::Ipv4(_)) => panic!("IPv6 route resolved to IPv4 next hop"),
+            None => destination,
+        };
+        let destination_mac = if destination.is_multicast() {
+            ipv6_multicast_mac(destination)
+        } else {
+            let Some(destination_mac) = self.neighbor_mac(IpAddress::Ipv6(next_hop)) else {
+                self.queue_ndp_solicitation(source, next_hop, now)?;
+                return Ok(0);
+            };
+            destination_mac
+        };
+        let icmp_len = Icmpv6Packet::ECHO_HEADER_LEN
+            .checked_add(payload.len())
+            .ok_or(StackError::PacketTooLarge)?;
+        self.ensure_path_packet_fits(
+            PathMtuKey::new(IpAddress::Ipv6(source), IpAddress::Ipv6(destination)),
+            EthernetFrame::HEADER_LEN + Ipv6Packet::HEADER_LEN,
+            icmp_len,
+        )?;
+        let local_mac = self.config.mac;
+        self.queue_outbound_frame(|frame| {
+            let storage = frame.storage_mut();
+            let mut offset = EthernetFrame::encode_header(
+                storage,
+                destination_mac,
+                local_mac,
+                EthernetProtocol::Ipv6,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            offset += Ipv6Packet::encode_header(
+                &mut storage[offset..],
+                source,
+                destination,
+                crate::IpProtocol::Icmpv6,
+                icmp_len,
+                crate::DEFAULT_HOP_LIMIT,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            offset += Icmpv6Packet::encode_echo_request(
+                &mut storage[offset..],
+                source,
+                destination,
+                identifier,
+                sequence,
+                payload,
+            )
+            .ok_or(StackError::OutputQueueFull)?;
+            frame.set_len(offset);
+            Ok(payload.len())
+        })
+    }
+
+    /// Claims the reply to one outstanding echo exchange, if it has
+    /// arrived. A reply nobody is waiting for ages out of the buffer
+    /// rather than being reported to the next caller.
+    pub fn take_icmp_echo_reply(&mut self, key: IcmpEchoKey) -> Option<IcmpEchoReply> {
+        let index = self
+            .icmp_echo_replies
+            .iter()
+            .position(|reply| reply.key == key)?;
+        Some(self.icmp_echo_replies.remove(index))
+    }
+
+    /// Banks a received echo reply for whichever waiter owns its key.
+    fn record_icmp_echo_reply(&mut self, key: IcmpEchoKey, payload_bytes: usize) {
+        if self.icmp_echo_replies.is_full() {
+            self.icmp_echo_replies.remove(0);
+        }
+        self.icmp_echo_replies.push(IcmpEchoReply {
+            key,
+            payload_bytes: u16::try_from(payload_bytes).unwrap_or(u16::MAX),
+        });
+    }
+
     pub fn send_udp_ipv6(
         &mut self,
         source_port: u16,
@@ -4636,7 +4840,17 @@ where
             Icmpv6Packet::PacketTooBig(packet_too_big) => {
                 self.receive_icmpv6_packet_too_big(packet_too_big, now);
             }
-            Icmpv6Packet::EchoRequest(_) | Icmpv6Packet::EchoReply(_) => {}
+            Icmpv6Packet::EchoReply(echo) => {
+                self.record_icmp_echo_reply(
+                    IcmpEchoKey {
+                        destination: IpAddress::Ipv6(packet.source),
+                        identifier: echo.identifier,
+                        sequence: echo.sequence,
+                    },
+                    echo.payload.len(),
+                );
+            }
+            Icmpv6Packet::EchoRequest(_) => {}
         }
         Ok(false)
     }
@@ -4662,7 +4876,17 @@ where
                     unreachable,
                 ));
             }
-            Icmpv4Packet::EchoRequest(_) | Icmpv4Packet::EchoReply(_) => {}
+            Icmpv4Packet::EchoReply(echo) => {
+                self.record_icmp_echo_reply(
+                    IcmpEchoKey {
+                        destination: IpAddress::Ipv4(packet.source),
+                        identifier: echo.identifier,
+                        sequence: echo.sequence,
+                    },
+                    echo.payload.len(),
+                );
+            }
+            Icmpv4Packet::EchoRequest(_) => {}
         }
         Ok(false)
     }

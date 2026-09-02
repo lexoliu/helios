@@ -5,9 +5,11 @@ interface net {
   type mono-nanos = u64;
 
   type ipv4-address = tuple<u8, u8, u8, u8>;
+  type ipv6-address = tuple<u16, u16, u16, u16, u16, u16, u16, u16>;
 
   variant ip-address {
     ipv4(ipv4-address),
+    ipv6(ipv6-address),
   }
 
   record ping-reply {
