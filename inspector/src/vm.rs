@@ -750,8 +750,16 @@ pub(crate) fn run(mut command: VmCommand) -> Result<()> {
     let mut runtime = VmRuntime::spawn(&command)?;
     let result = connect_and_run(&command, &mut runtime);
     let runtime_dir = runtime.runtime_dir_path().to_path_buf();
+    // QEMU can die after the debug serial socket exists — a device the
+    // host cannot back fails during realization — and then nothing on
+    // the RPC path can say why. Read its epitaph before the runtime
+    // directory is torn down.
+    let epitaph = result.is_err().then(|| runtime.qemu_epitaph()).flatten();
     runtime.shutdown();
-    result.with_context(|| format!("VM runtime directory: {}", runtime_dir.display()))
+    result.with_context(|| match &epitaph {
+        Some(epitaph) => format!("VM runtime directory: {}\n{epitaph}", runtime_dir.display()),
+        None => format!("VM runtime directory: {}", runtime_dir.display()),
+    })
 }
 
 fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
@@ -1736,6 +1744,7 @@ struct VmRuntime {
     /// The QMP socket the inspector created, when it owns one.
     qmp_socket: Option<PathBuf>,
     runtime_dir: VmRuntimeDir,
+    qemu_log: PathBuf,
     child: Child,
 }
 
@@ -1971,6 +1980,7 @@ impl VmRuntime {
             transport: Some(transport),
             _serial_pty_slave: serial_pty_slave,
             qmp_socket: qmp_socket_path(command, runtime_dir.path()),
+            qemu_log,
             runtime_dir,
             child,
         })
@@ -1999,6 +2009,24 @@ impl VmRuntime {
 
     fn runtime_dir_path(&self) -> &Path {
         self.runtime_dir.path()
+    }
+
+    /// What QEMU said on its way out, when it left before the session
+    /// did.
+    ///
+    /// QEMU writes its own diagnostics to the runtime directory's log,
+    /// and a machine it refuses to build — a `-device` the host cannot
+    /// back, a property the model rejects — kills it there. Returns
+    /// `None` while QEMU is still running, so a failure that is the
+    /// guest's own carries no misleading epitaph.
+    fn qemu_epitaph(&mut self) -> Option<String> {
+        let status = self.child.try_wait().ok().flatten()?;
+        let log = fs::read(&self.qemu_log).unwrap_or_default();
+        Some(format!(
+            "QEMU exited with {status}; {} says:\n{}",
+            self.qemu_log.display(),
+            String::from_utf8_lossy(&log).trim_end()
+        ))
     }
 
     fn shutdown(&mut self) {
