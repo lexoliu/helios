@@ -17,10 +17,12 @@
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU16, Ordering};
 
+use helios_hal::fs::BlockDeviceRights;
 use helios_hal::io::{IoError, IoResult};
 use pci_types::capability::PciCapability;
 use pci_types::{Bar, CommandRegister, ConfigRegionAccess, EndpointHeader, PciAddress, PciHeader};
 
+use crate::block::{QueueAffinity, VirtioBlockDevice, VirtioBlockResource};
 use crate::bus::{DeviceBus, DmaPool};
 use crate::net::VirtioNetDevice;
 use crate::p9::Virtio9pDevice;
@@ -641,6 +643,26 @@ where
 {
     let transport = VirtioPciTransport::new(access, address, mapper, dma, msix_vector)?;
     Virtio9pDevice::new(transport)
+}
+
+/// Builds a virtio-blk driver on top of a modern virtio-PCI function.
+pub fn block_from_pci<A, M, P, C>(
+    access: &A,
+    address: PciAddress,
+    mapper: &M,
+    dma: P,
+    msix_vector: Option<u16>,
+    cpu: C,
+    rights: BlockDeviceRights,
+) -> IoResult<VirtioBlockResource<VirtioPciTransport<P>, C>>
+where
+    A: ConfigRegionAccess,
+    M: PciMmioMapper,
+    P: DmaPool,
+    C: QueueAffinity,
+{
+    let transport = VirtioPciTransport::new(access, address, mapper, dma, msix_vector)?;
+    VirtioBlockDevice::new_resource(transport, cpu, rights)
 }
 
 /// Builds a virtio-entropy driver on top of a modern virtio-PCI function.

@@ -88,14 +88,16 @@ unsafe impl Sync for MmioRegisterBus {}
 /// Host-memory bus: virtqueue rings are ordinary heap allocations whose
 /// DMA address is their virtual address.
 pub(crate) struct HeapBus {
-    config: UnsafeCell<[u32; 8]>,
+    /// Wide enough for the largest device configuration a driver in this
+    /// crate reads (virtio-blk's runs to offset 0x40).
+    config: UnsafeCell<[u32; 32]>,
     dma: IdentityDmaPool,
 }
 
 impl HeapBus {
     fn new() -> Self {
         Self {
-            config: UnsafeCell::new([0; 8]),
+            config: UnsafeCell::new([0; 32]),
             dma: IdentityDmaPool,
         }
     }
@@ -162,6 +164,24 @@ struct FakeTransportLog {
     acknowledged_interrupts: usize,
 }
 
+/// A platform with `PROCESSORS` processors, all of which report the
+/// caller as running on processor zero.
+///
+/// A driver that picks a queue by processor only needs those two facts,
+/// and a test that pins every request to one queue is what makes the
+/// completions it plays back deterministic.
+pub(crate) struct FakeAffinity<const PROCESSORS: usize>;
+
+impl<const PROCESSORS: usize> crate::block::QueueAffinity for FakeAffinity<PROCESSORS> {
+    fn current_processor(&self) -> usize {
+        0
+    }
+
+    fn processor_count(&self) -> usize {
+        PROCESSORS
+    }
+}
+
 /// A virtio transport that records everything a driver does to it.
 pub(crate) struct FakeTransport {
     bus: HeapBus,
@@ -207,6 +227,32 @@ impl FakeTransport {
     /// Every queue index the driver reset, in order.
     pub(crate) fn queue_resets(&self) -> Vec<u16> {
         self.log.lock().resets.clone()
+    }
+
+    /// Presets one 32-bit device configuration field.
+    pub(crate) fn set_config_u32(&self, offset: usize, value: u32) {
+        self.bus.write_u32(offset, value);
+    }
+
+    /// Presets one 16-bit device configuration field, which may sit in
+    /// either half of a configuration word.
+    pub(crate) fn set_config_u16(&self, offset: usize, value: u16) {
+        let word = offset & !0x3;
+        let shift = (offset & 0x3) * 8;
+        let mut current = self.bus.read_u32(word);
+        current &= !(0xffff_u32 << shift);
+        current |= u32::from(value) << shift;
+        self.bus.write_u32(word, current);
+    }
+
+    /// Presets one 8-bit device configuration field.
+    pub(crate) fn set_config_u8(&self, offset: usize, value: u8) {
+        let word = offset & !0x3;
+        let shift = (offset & 0x3) * 8;
+        let mut current = self.bus.read_u32(word);
+        current &= !(0xff_u32 << shift);
+        current |= u32::from(value) << shift;
+        self.bus.write_u32(word, current);
     }
 }
 

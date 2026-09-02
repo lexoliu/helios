@@ -1878,6 +1878,7 @@ dependencies = [
 name = "helios-virtio"
 version = "0.1.0"
 dependencies = [
+ "arrayvec",
  "async-lock",
  "bitflags 2.13.1",
  "bytes",

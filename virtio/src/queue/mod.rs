@@ -765,6 +765,67 @@ impl<T: VirtioTransport> VirtQueue<T> {
             );
         }
     }
+
+    /// Plays the device side of a split-ring request: the bytes the
+    /// driver made readable in chain `id`.
+    #[cfg(test)]
+    pub(crate) fn device_request(&self, id: u16) -> alloc::vec::Vec<u8> {
+        let mut request = alloc::vec::Vec::new();
+        for (addr, len, writable) in self.device_chain(id) {
+            if writable {
+                continue;
+            }
+            let len = usize::try_from(len).expect("descriptor length fits a usize");
+            // SAFETY: the tests' bus hands out host addresses, so a
+            // descriptor address is a pointer to the driver's own buffer,
+            // which stays alive while its chain is in flight.
+            request.extend_from_slice(unsafe {
+                core::slice::from_raw_parts(addr as usize as *const u8, len)
+            });
+        }
+        request
+    }
+
+    /// Plays the device side of a split-ring request: fills the writable
+    /// buffers of chain `id` with `response`, and returns how many bytes
+    /// were written.
+    ///
+    /// The status byte a device writes last is part of `response`, just as
+    /// it is part of the chain.
+    #[cfg(test)]
+    pub(crate) fn device_respond(&self, id: u16, response: &[u8]) -> u32 {
+        let mut written = 0;
+        for (addr, len, writable) in self.device_chain(id) {
+            if !writable {
+                continue;
+            }
+            let len = usize::try_from(len).expect("descriptor length fits a usize");
+            let take = core::cmp::min(len, response.len() - written);
+            if take == 0 {
+                break;
+            }
+            // SAFETY: as in `device_request`; the buffer is writable
+            // because the driver marked its descriptor writable.
+            unsafe {
+                core::slice::from_raw_parts_mut(addr as usize as *mut u8, take)
+                    .copy_from_slice(&response[written..written + take]);
+            }
+            written += take;
+        }
+        u32::try_from(written).expect("device response length fits a u32")
+    }
+
+    #[cfg(test)]
+    fn device_chain(&self, id: u16) -> alloc::vec::Vec<(u64, u32, bool)> {
+        match &self.ring {
+            Ring::Split(ring) => ring.device_chain(id),
+            Ring::Packed(_) => {
+                panic!(
+                    "device_chain drives the split ring; packed tests read their own descriptors"
+                )
+            }
+        }
+    }
 }
 
 /// Translates a driver's buffers into device addresses.

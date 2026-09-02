@@ -509,6 +509,44 @@ impl<T: VirtioTransport> SplitRing<T> {
         }
     }
 
+    /// Device side: the buffers of chain `id`, in chain order, as
+    /// address/length/writable triples.
+    ///
+    /// Driver tests need to read the request a driver wrote and answer it
+    /// the way a device would; both start from the chain the driver
+    /// published, whether it went into the ring directly or into this
+    /// chain's indirect table.
+    #[cfg(test)]
+    pub(super) fn device_chain(&self, id: u16) -> alloc::vec::Vec<(u64, u32, bool)> {
+        let head = self.descriptor(id);
+        let mut buffers = alloc::vec::Vec::new();
+        if head.flags & DESC_FLAG_INDIRECT != 0 {
+            let entries = usize::try_from(head.len).expect("indirect table length fits a usize")
+                / DESCRIPTOR_BYTES;
+            for slot in 0..entries {
+                let descriptor = self.indirect_descriptor(id, slot);
+                buffers.push((
+                    descriptor.addr,
+                    descriptor.len,
+                    descriptor.flags & DESC_FLAG_WRITE != 0,
+                ));
+            }
+            return buffers;
+        }
+        let mut descriptor = head;
+        loop {
+            buffers.push((
+                descriptor.addr,
+                descriptor.len,
+                descriptor.flags & DESC_FLAG_WRITE != 0,
+            ));
+            if descriptor.flags & DESC_FLAG_NEXT == 0 {
+                return buffers;
+            }
+            descriptor = self.descriptor(descriptor.next);
+        }
+    }
+
     /// Device side: complete one chain by its identifier.
     pub(super) fn device_complete(&self, id: u16, len: u32) {
         let used_idx = self.read_used_idx();
