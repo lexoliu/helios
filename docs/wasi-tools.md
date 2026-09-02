@@ -131,6 +131,7 @@ The same AArch64/HVF path is the preferred smoke test for the bootfs
 ```bash
 cargo run -p helios-inspector -- vm --arch aarch64 --release \
   --boot-program dash --boot-program debugger --boot-program curl \
+  --boot-program http-client \
   --no-compiler-plugin \
   shell -c '/bin/curl http://neverssl.com/'
 ```
@@ -301,6 +302,7 @@ Expected output includes:
 ```bash
 cargo run -p helios-inspector -- vm --arch riscv64 --memory 2G \
   --boot-program dash --boot-program debugger --boot-program curl \
+  --boot-program http-client \
   --no-compiler-plugin \
   shell -c '/bin/curl http://neverssl.com/'
 ```
@@ -315,9 +317,13 @@ Expected output contains:
   converted from WASI preview1 to the preview2 component we run. In bootfs
   the stdlib is mounted under `usr/local/lib/python3.14/`, matching the
   upstream CPython build prefix.
-- `tools/wasi-apps/curl` uses `helios-api::net::TcpStream` (WIT syscall
-  surface) instead of host libc sockets, so it runs correctly inside
-  helios. It currently supports `http://` URLs only.
+- `tools/wasi-apps/curl` uses `helios_api::http` (`wasi:http/client`)
+  instead of host libc sockets, so it runs correctly inside helios. The
+  kernel forwards each request to the `http-client` kernel plugin
+  (`programs/http-client`), which speaks HTTP/1.1 over `helios:system/net`;
+  the plugin must be provisioned (`--boot-program http-client`) or
+  `wasi:http/client` reports `configuration-error`. `https://` returns the
+  typed `TLS-protocol-error` until the TLS transport lands.
 - `tools/wasi-apps/extract-webc-wasm.pl` extracts the single raw wasm atom
   from the pinned Wasmer WEBc images. The build script validates both WEBc
   and raw wasm SHA-256 digests before staging.

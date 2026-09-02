@@ -1,17 +1,19 @@
 package helios:kernel@0.1.0;
 
 world init {
-  include wasi:cli/command@0.3.0-rc-2026-03-15;
+  include wasi:cli/command@0.3.0;
   import helios:system/programs@0.1.0;
   import helios:system/net@0.1.0;
   import helios:system/stats@0.1.0;
   import helios:system/tracing@0.1.0;
   import helios:system/sync@0.1.0;
   import helios:system/serial@0.1.0;
+  import wasi:http/types@0.3.0;
+  import wasi:http/client@0.3.0;
 }
 
 world debugger {
-  include wasi:cli/command@0.3.0-rc-2026-03-15;
+  include wasi:cli/command@0.3.0;
   import helios:system/programs@0.1.0;
   import helios:system/net@0.1.0;
   import helios:system/stats@0.1.0;
@@ -20,6 +22,34 @@ world debugger {
   import helios:system/sync@0.1.0;
   import helios:system/serial@0.1.0;
   import helios:system/instances@0.1.0;
+  import wasi:http/types@0.3.0;
+  import wasi:http/client@0.3.0;
+}
+
+/// World implemented by the `http-client` kernel plugin: it speaks HTTP over
+/// the kernel's sockets and answers exchanges the kernel forwards to it.
+///
+/// The plugin must not import `wasi:http/client` — it *is* the client.
+world http-handler {
+  include wasi:cli/imports@0.3.0;
+  import helios:system/net@0.1.0;
+  import helios:system/sync@0.1.0;
+  import wasi:http/types@0.3.0;
+  export wasi:http/handler@0.3.0;
+}
+
+/// World the kernel generates its own `wasi:http` bindings from.
+///
+/// The import half (`types`, `client`) is what the kernel implements for
+/// every program store; the export half (`handler`) is the call the plugin
+/// runner makes into the `http-client` plugin's store. Keeping this world
+/// separate from `http-handler` keeps the kernel's bindgen down to the two
+/// interfaces it actually serves instead of regenerating every `wasi:cli`
+/// import that `wasi/bindings.rs` already provides.
+world http-host {
+  import wasi:http/types@0.3.0;
+  import wasi:http/client@0.3.0;
+  export wasi:http/handler@0.3.0;
 }
 
 world remote-system {

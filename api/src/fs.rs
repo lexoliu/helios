@@ -127,7 +127,6 @@ impl FileSystem for WasiFileSystem {
 }
 
 async fn read_impl(path: &Path) -> Result<Vec<u8>> {
-    let path = path.as_ref();
     let display = display_path(path);
     let descriptor = open_file(path).await?;
     let expected_size = descriptor

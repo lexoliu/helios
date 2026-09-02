@@ -6,11 +6,14 @@ mod stream;
 pub(crate) use stream::*;
 mod host_env;
 pub(crate) use host_env::*;
+pub(crate) mod http;
+pub(crate) use http::*;
 
 // The bindgen `with:` mappings re-export these resource types with `pub use`,
 // which requires a fully `pub` path; the globs above are only crate-visible.
 pub use fs::FsDescriptor;
 pub use host_env::{TerminalInput, TerminalOutput};
+pub use http::{WasiRequest, WasiResponse};
 pub use net::{
     P2IncomingDatagramStream, P2Network, P2OutgoingDatagramStream, P2ResolveAddressStream,
     TcpSocket, UdpSocket,
@@ -41,8 +44,9 @@ use spin::Mutex;
 use thiserror::Error;
 use triomphe::Arc;
 use wasmtime::component::{
-    Access, Accessor, Component, Destination, FutureReader, HasSelf, Resource, Source,
-    StreamConsumer, StreamProducer, StreamReader, StreamResult, WriteBuffer,
+    Access, Accessor, Component, Destination, FutureConsumer, FutureProducer, FutureReader,
+    HasSelf, Resource, Source, StreamConsumer, StreamProducer, StreamReader, StreamResult,
+    WriteBuffer,
 };
 use wasmtime::{self, Result, StoreContextMut};
 
@@ -189,6 +193,7 @@ pub(crate) mod preview2;
 pub(crate) mod preview3;
 
 pub(crate) mod bindings;
+pub(crate) mod http_bindings;
 
 use bindings as wasi;
 use wasi::cli::types as cli_types;
@@ -271,7 +276,7 @@ mod tests {
         P2ResolveAddressStream, TcpSocket, UdpSocket, WasiTcpIpAddress, WasiTcpSocketAddress,
         WasiTcpSocketFamily, WasiUdpSocketAddress, WasiUdpSocketError, WasiUdpSocketFamily,
         format_p3_tcp_socket_address, format_p3_udp_socket_address, fs_types,
-        has_wasi_network_rights, ip_name_lookup, map_p3_dns_error, map_p3_tcp_error,
+        has_wasi_network_rights, http, ip_name_lookup, map_p3_dns_error, map_p3_tcp_error,
         map_p3_udp_family, map_p3_udp_socket_error, parse_p3_tcp_socket_address,
         parse_p3_udp_socket_address, preview3, socket_types, stdin_is_terminal,
         wasi_tcp_bind_rights, wasi_udp_bind_rights,
@@ -775,6 +780,37 @@ mod tests {
     }
 
     #[test]
+    fn http_linked_interfaces_exist_in_checked_in_wit() {
+        let wit_interfaces = wit_interface_names(preview3::WIT_PACKAGES);
+        for interface in http::LINKED_INTERFACES {
+            assert!(
+                wit_interfaces.contains(interface),
+                "http adapter maps {interface}, but checked-in WIT does not declare it"
+            );
+        }
+    }
+
+    #[test]
+    fn http_linked_interfaces_cover_the_client_surface() {
+        // `handler` is deliberately absent: the kernel calls it as an export
+        // on the plugin store, it never serves it as an import.
+        assert_interface_set_eq(
+            http::LINKED_INTERFACES,
+            &["wasi:http/types", "wasi:http/client"],
+            "http",
+        );
+    }
+
+    #[test]
+    fn http_linked_functions_cover_the_whole_types_interface() {
+        assert_function_set_eq(
+            &wit_function_names(preview3::WIT_PACKAGES, http::LINKED_INTERFACES),
+            &HTTP_EXPECTED_FUNCTIONS,
+            "http",
+        );
+    }
+
+    #[test]
     fn only_serial_console_stdio_is_reported_as_a_terminal() {
         use super::{ComponentOutputMode, ComponentOutputRoute, output_is_terminal};
         use crate::ComponentOutputStreamKind::{Stderr, Stdout};
@@ -1098,6 +1134,46 @@ mod tests {
         );
     }
 
+    /// Every function the kernel must implement to serve `wasi:http` to a
+    /// guest. Derived from the checked-in WIT, so adding a method upstream
+    /// fails this test rather than silently going unimplemented.
+    const HTTP_EXPECTED_FUNCTIONS: [&str; 34] = [
+        "wasi:http/client.send",
+        "wasi:http/types.fields.append",
+        "wasi:http/types.fields.clone",
+        "wasi:http/types.fields.copy-all",
+        "wasi:http/types.fields.delete",
+        "wasi:http/types.fields.from-list",
+        "wasi:http/types.fields.get",
+        "wasi:http/types.fields.get-and-delete",
+        "wasi:http/types.fields.has",
+        "wasi:http/types.fields.set",
+        "wasi:http/types.request.consume-body",
+        "wasi:http/types.request.get-authority",
+        "wasi:http/types.request.get-headers",
+        "wasi:http/types.request.get-method",
+        "wasi:http/types.request.get-options",
+        "wasi:http/types.request.get-path-with-query",
+        "wasi:http/types.request.get-scheme",
+        "wasi:http/types.request.new",
+        "wasi:http/types.request.set-authority",
+        "wasi:http/types.request.set-method",
+        "wasi:http/types.request.set-path-with-query",
+        "wasi:http/types.request.set-scheme",
+        "wasi:http/types.request-options.clone",
+        "wasi:http/types.request-options.get-between-bytes-timeout",
+        "wasi:http/types.request-options.get-connect-timeout",
+        "wasi:http/types.request-options.get-first-byte-timeout",
+        "wasi:http/types.request-options.set-between-bytes-timeout",
+        "wasi:http/types.request-options.set-connect-timeout",
+        "wasi:http/types.request-options.set-first-byte-timeout",
+        "wasi:http/types.response.consume-body",
+        "wasi:http/types.response.get-headers",
+        "wasi:http/types.response.get-status-code",
+        "wasi:http/types.response.new",
+        "wasi:http/types.response.set-status-code",
+    ];
+
     fn assert_interface_set_eq(actual: &[&'static str], expected: &[&'static str], label: &str) {
         let actual = actual.iter().copied().collect::<BTreeSet<_>>();
         let expected = expected.iter().copied().collect::<BTreeSet<_>>();
@@ -1242,6 +1318,12 @@ mod tests {
             "wasi:filesystem" => match name {
                 "types" => "wasi:filesystem/types",
                 "preopens" => "wasi:filesystem/preopens",
+                _ => return None,
+            },
+            "wasi:http" => match name {
+                "types" => "wasi:http/types",
+                "client" => "wasi:http/client",
+                "handler" => "wasi:http/handler",
                 _ => return None,
             },
             "wasi:random" => match name {

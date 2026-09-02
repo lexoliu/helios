@@ -219,8 +219,13 @@ fn x86_kernel_main() -> ! {
         &debug_state,
     );
     x86_64::instructions::interrupts::enable();
-    let program_service =
-        helios_kernel::install_component_host_program_service(&kernel, &cpu, &debug_state);
+    let program_service = helios_kernel::install_component_host_program_service(
+        &kernel,
+        &cpu,
+        &debug_state,
+        read_debug_serial,
+        write_debug_serial_bytes,
+    );
     smp::current_runtime().install_program_service(
         program_service.unwrap_or_else(|| panic!("x86 bootstrap did not install program service")),
     );

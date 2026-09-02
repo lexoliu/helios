@@ -1,9 +1,9 @@
 //! Async-first userland SDK for Helios wasm programs.
 //!
 //! Each capability area lives behind a Cargo feature so programs only
-//! link the WIT interfaces they use: `fs`, `io`, `net`, `programs`,
-//! `serial`, `stats`, `sync`, `task`, `tracing`, `profiling`,
-//! `instances`, and `channel`. `bindings` exposes the raw generated WIT
+//! link the WIT interfaces they use: `fs`, `http`, `http-handler`, `io`,
+//! `net`, `programs`, `serial`, `stats`, `sync`, `task`, `tracing`,
+//! `profiling`, `instances`, and `channel`. `bindings` exposes the raw generated WIT
 //! bindings for anything the typed helpers do not cover, and
 //! [`main`](macro@main) wraps a program's async entry point.
 
@@ -14,6 +14,8 @@ pub mod channel;
 mod error;
 #[cfg(feature = "fs")]
 pub mod fs;
+#[cfg(feature = "http")]
+pub mod http;
 #[cfg(feature = "instances")]
 pub mod instances;
 #[cfg(feature = "io")]
@@ -47,6 +49,19 @@ pub use io::{ReadExt, WriteExt};
 pub use std::io::Error;
 use std::io::Write as _;
 pub use wit_bindgen;
+
+/// Whether a component-model stream read result means the stream is closed.
+///
+/// `StreamReader::read` reports the outcome of one read; every caller that
+/// drains a stream needs the same test for "nothing more is coming", so it
+/// lives here rather than in each of them.
+pub fn stream_closed(result: wit_bindgen::rt::async_support::StreamResult) -> bool {
+    use wit_bindgen::rt::async_support::StreamResult;
+    matches!(
+        result,
+        StreamResult::Dropped | StreamResult::Cancelled | StreamResult::Complete(0)
+    )
+}
 
 /// Return values accepted from a `#[helios_api::main]` entry point.
 ///

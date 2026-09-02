@@ -481,8 +481,13 @@ extern "C" fn aarch64_kernel_main() -> ! {
         &handoff,
         &debug_state,
     );
-    let _program_service =
-        helios_kernel::install_component_host_program_service(&kernel, &cpu, &debug_state);
+    let _program_service = helios_kernel::install_component_host_program_service(
+        &kernel,
+        &cpu,
+        &debug_state,
+        read_debug_serial,
+        write_debug_serial_bytes,
+    );
     helios_kernel::run_component_host_processor_forever(
         cpu,
         kernel,
@@ -746,8 +751,13 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
             .with_dma_model(DmaModel::Translated)
             .with_devices(DeviceInventory::new().with_debug_serial()),
     );
-    let _program_service =
-        helios_kernel::install_component_host_program_service(&kernel, &cpu, &debug_state);
+    let _program_service = helios_kernel::install_component_host_program_service(
+        &kernel,
+        &cpu,
+        &debug_state,
+        read_debug_serial,
+        write_debug_serial_bytes,
+    );
     helios_kernel::run_component_host_processor_forever(
         cpu,
         kernel,
