@@ -618,15 +618,11 @@ impl VsockTable {
 
     /// Closes every connection, as a transport reset requires.
     pub fn reset_all(&mut self) {
-        for slot in &mut self.connections {
-            if let Some(connection) = slot {
-                connection.state = ConnectionState::Closed(VsockError::ConnectionReset);
-            }
+        for connection in self.connections.iter_mut().flatten() {
+            connection.state = ConnectionState::Closed(VsockError::ConnectionReset);
         }
-        for slot in &mut self.listeners {
-            if let Some(listener) = slot {
-                listener.queued.clear();
-            }
+        for listener in self.listeners.iter_mut().flatten() {
+            listener.queued.clear();
         }
     }
 
