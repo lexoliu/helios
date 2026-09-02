@@ -101,6 +101,13 @@ claims: network (1), block (2), entropy (4) and 9P (9). A transport that
 reads any other device id rejects the function rather than mapping it to
 a placeholder driver.
 
+Four further device kinds have been evaluated and deliberately not
+claimed — RTC (17), memory (24), file system (26) and PMEM (27).
+`docs/virtio-evaluations.md` records, for each one, what the device
+offers with virtio 1.4 spec citations, what QEMU actually exposes on the
+supported host matrix as probed, what building the driver would cost in
+this repository, and the decision.
+
 virtio-console (3) is deliberately absent. Every backend's console is the
 platform UART, which has to work before the allocator exists and on the
 panic path, so a virtio console could only ever be a second port on an
