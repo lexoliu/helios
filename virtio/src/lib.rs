@@ -42,7 +42,7 @@ pub use net::{
 pub use p9::Virtio9pDevice;
 pub use pci::{
     PciMmioMapper, VIRTIO_PCI_VENDOR_ID, VirtioPciBus, VirtioPciTransport, net_from_pci,
-    p9_from_pci, virtio_pci_device_type,
+    p9_from_pci, rng_from_pci, virtio_pci_device_type,
 };
 pub use queue::{MAX_CHAIN_BUFFERS, VirtQueue, VirtqueueError};
 pub use rng::VirtioRngDevice;

@@ -24,6 +24,7 @@ use pci_types::{Bar, CommandRegister, ConfigRegionAccess, EndpointHeader, PciAdd
 use crate::bus::{DeviceBus, DmaPool};
 use crate::net::VirtioNetDevice;
 use crate::p9::Virtio9pDevice;
+use crate::rng::VirtioRngDevice;
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 /// PCI vendor id shared by every virtio function.
@@ -640,6 +641,23 @@ where
 {
     let transport = VirtioPciTransport::new(access, address, mapper, dma, msix_vector)?;
     Virtio9pDevice::new(transport)
+}
+
+/// Builds a virtio-entropy driver on top of a modern virtio-PCI function.
+pub fn rng_from_pci<A, M, P>(
+    access: &A,
+    address: PciAddress,
+    mapper: &M,
+    dma: P,
+    msix_vector: Option<u16>,
+) -> IoResult<VirtioRngDevice<VirtioPciTransport<P>>>
+where
+    A: ConfigRegionAccess,
+    M: PciMmioMapper,
+    P: DmaPool,
+{
+    let transport = VirtioPciTransport::new(access, address, mapper, dma, msix_vector)?;
+    VirtioRngDevice::new(transport)
 }
 
 #[cfg(test)]

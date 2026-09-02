@@ -8,6 +8,14 @@
 //! finds is its own: it drains everything the device published into this
 //! table and then looks up its own slot.
 //!
+//! Because a completion may be drained by a task other than the one
+//! waiting on it, each slot carries that waiter's waker. The drainer
+//! wakes the tasks whose requests it finished directly, rather than
+//! going back through the device notification: an interrupt is a
+//! broadcast that only tells a task to look, and routing a completion
+//! through it would make one task's wake-up depend on another task not
+//! having consumed the notification first.
+//!
 //! The table also carries the back-pressure signal for submitters. A
 //! descriptor identifier goes back to the queue's free pool the moment
 //! its completion is drained, which is before its waiter has read the
@@ -16,16 +24,18 @@
 //! ring with no room left — is woken by whichever task frees the chain
 //! or collects the completion.
 //!
-//! Concurrency contract: the table is a lock-free-to-the-caller spin
-//! mutex over a fixed slot array. It is never held across an await, and
-//! it is deliberately independent of the queue lock so a task that
+//! Concurrency contract: the table is a spin mutex over a fixed slot
+//! array, never held across an await and never held while a waker runs.
+//! It is deliberately independent of the queue lock so a task that
 //! failed to take the queue can still observe a completion another task
-//! drained for it. Waiters park on the device interrupt, submitters on
-//! this table's own notification, so neither can consume the other's
+//! drained for it. A waiter is woken through its own slot, a submitter
+//! through this table's notification, so neither can consume the other's
 //! wake-up.
 
-use core::future::Future;
+use core::future::{Future, poll_fn};
+use core::pin::pin;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use core::task::{Context, Poll, Waker};
 
 use async_lock::Mutex as AsyncMutex;
 use helios_hal::io::IoResult;
@@ -36,13 +46,14 @@ use crate::queue::VirtQueue;
 use crate::transport::VirtioTransport;
 
 /// State of one descriptor identifier.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 enum Slot {
     /// No request is using this identifier.
     #[default]
     Idle,
-    /// A request is in flight and its submitter is waiting.
-    Pending,
+    /// A request is in flight, together with the waker of the task
+    /// waiting on it once that task has parked.
+    Pending(Option<Waker>),
     /// The device finished the request, writing this many bytes.
     Complete(u32),
 }
@@ -53,16 +64,16 @@ pub(crate) struct InFlight<const N: usize> {
     /// Submitters parked because the ring is full or because the
     /// identifier they would be handed still owes a completion.
     blocked: AtomicUsize,
-    /// Wakes those submitters. A device interrupt means "a completion
-    /// arrived" and belongs to the waiters; this means "a chain or a
-    /// slot was freed" and belongs to the submitters.
+    /// Wakes those submitters. A completed slot wakes its own waiter
+    /// directly; this means "a chain or a slot was freed" and belongs to
+    /// the submitters.
     available: Notify,
 }
 
 impl<const N: usize> InFlight<N> {
     pub(crate) const fn new() -> Self {
         Self {
-            slots: Mutex::new([Slot::Idle; N]),
+            slots: Mutex::new([const { Slot::Idle }; N]),
             blocked: AtomicUsize::new(0),
             available: Notify::new(),
         }
@@ -76,7 +87,7 @@ impl<const N: usize> InFlight<N> {
     /// identifier would overwrite a completion nobody has collected.
     pub(crate) fn is_idle(&self, token: u16) -> bool {
         let mut slots = self.slots.lock();
-        *Self::slot(&mut slots, token) == Slot::Idle
+        matches!(Self::slot(&mut slots, token), Slot::Idle)
     }
 
     /// Announces that a submitter is parked waiting for a chain or a
@@ -114,36 +125,62 @@ impl<const N: usize> InFlight<N> {
     pub(crate) fn register(&self, token: u16) {
         let mut slots = self.slots.lock();
         let slot = Self::slot(&mut slots, token);
-        assert_eq!(
-            *slot,
-            Slot::Idle,
+        assert!(
+            matches!(slot, Slot::Idle),
             "virtio descriptor {token} was submitted while still in flight"
         );
-        *slot = Slot::Pending;
+        *slot = Slot::Pending(None);
     }
 
-    /// Records a completion the caller drained from the queue.
+    /// Records a completion the caller drained from the queue and wakes
+    /// the task waiting on it, which may not be the caller.
     pub(crate) fn complete(&self, token: u16, len: u32) {
-        let mut slots = self.slots.lock();
-        let slot = Self::slot(&mut slots, token);
-        assert_eq!(
-            *slot,
-            Slot::Pending,
-            "virtio device completed descriptor {token}, which no request was waiting on"
-        );
-        *slot = Slot::Complete(len);
+        let waker = {
+            let mut slots = self.slots.lock();
+            let slot = Self::slot(&mut slots, token);
+            match core::mem::replace(slot, Slot::Complete(len)) {
+                Slot::Pending(waker) => waker,
+                Slot::Idle | Slot::Complete(_) => panic!(
+                    "virtio device completed descriptor {token}, which no request was waiting on"
+                ),
+            }
+        };
+        // The slot lock is released first: a waker runs executor code,
+        // and no executor may be entered from inside this table.
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 
     /// Takes the completion for `token` if it has arrived.
     pub(crate) fn take(&self, token: u16) -> Option<u32> {
         let mut slots = self.slots.lock();
         let slot = Self::slot(&mut slots, token);
-        match *slot {
+        match slot {
             Slot::Complete(len) => {
+                let len = *len;
                 *slot = Slot::Idle;
                 Some(len)
             }
-            _ => None,
+            Slot::Idle | Slot::Pending(_) => None,
+        }
+    }
+
+    /// Parks `waker` on `token`, reporting whether the completion is
+    /// already there and the caller should not park at all.
+    fn arm(&self, token: u16, waker: &Waker) -> bool {
+        let mut slots = self.slots.lock();
+        let slot = Self::slot(&mut slots, token);
+        match slot {
+            Slot::Complete(_) => true,
+            Slot::Pending(parked) => {
+                match parked {
+                    Some(parked) if parked.will_wake(waker) => {}
+                    parked => *parked = Some(waker.clone()),
+                }
+                false
+            }
+            Slot::Idle => panic!("virtio descriptor {token} was awaited while not in flight"),
         }
     }
 
@@ -167,13 +204,13 @@ impl<const N: usize> InFlight<N> {
 /// fault: the ring has no room for the chain, or the identifier the
 /// queue would hand out next still holds a completion its waiter has
 /// not collected. In both cases the submitter drains what the device
-/// has already published, which is what recycles descriptors, and then
-/// parks on the table's own notification until a waiter frees the chain
-/// or collects the completion it needs.
+/// has already published, which is what recycles descriptors and wakes
+/// the waiters those completions belong to, and then parks on the
+/// table's own notification until a waiter frees the chain or collects
+/// the completion it needs.
 pub(crate) async fn submit_chain<T, const N: usize>(
     inflight: &InFlight<N>,
     queue: &AsyncMutex<VirtQueue<T>>,
-    interrupts: &Notify,
     transport: &T,
     inputs: &[&[u8]],
     outputs: &mut [&mut [u8]],
@@ -198,11 +235,6 @@ where
             }
             queue.drain_used(|completed, len| inflight.complete(completed, len))
         };
-        // A notification is handed to a single claimant, so a drain that
-        // finished other tasks' requests owes one wake-up per task.
-        for _ in 0..drained {
-            interrupts.notify_all();
-        }
         inflight.note_released(drained);
         if drained != 0 {
             continue;
@@ -223,16 +255,16 @@ where
 /// Waits for `token`'s completion, draining the queue on behalf of every
 /// waiter whenever this task can take it.
 ///
-/// This is the shape every single-request driver uses: a task parks on
-/// the device's interrupt notification, and whichever task wakes first
-/// reaps the whole used ring into the completion table rather than
-/// looking for its own descriptor. `wait` is a parameter so callers can
-/// park on something other than the raw interrupt — a deadline, say —
-/// without duplicating the loop.
+/// This is the shape every single-request driver uses. A parked task is
+/// woken by either of two things: the device notification, which means
+/// there may be work in the used ring for this task to drain on
+/// everyone's behalf, or its own slot being completed by whichever task
+/// drained the ring first. `wait` is a parameter so callers can park on
+/// something other than the raw interrupt — a deadline, say — without
+/// duplicating the loop.
 pub(crate) async fn await_completion<T, Wait, WaitFuture, const N: usize>(
     inflight: &InFlight<N>,
     queue: &AsyncMutex<VirtQueue<T>>,
-    interrupts: &Notify,
     token: u16,
     mut wait: Wait,
 ) -> u32
@@ -250,34 +282,32 @@ where
             return len;
         }
 
-        let mut others = 0_usize;
         let drained = match queue.try_lock() {
             Some(mut queue) => queue.drain_used(|completed, len| {
-                if completed != token {
-                    others += 1;
-                }
                 inflight.complete(completed, len);
             }),
             None => 0,
         };
-        // A notification is handed to a single claimant, so a drain that
-        // finished several other tasks' requests owes one wake-up per
-        // task rather than one for the whole batch.
-        for _ in 0..others {
-            interrupts.notify_all();
-        }
         inflight.note_released(drained);
         if drained != 0 {
             continue;
         }
 
-        wait().await;
+        let mut notified = pin!(wait());
+        poll_fn(|context: &mut Context<'_>| {
+            if inflight.arm(token, context.waker()) {
+                return Poll::Ready(());
+            }
+            notified.as_mut().poll(context)
+        })
+        .await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::InFlight;
+    use core::task::Waker;
 
     #[test]
     fn a_completion_is_delivered_to_the_registered_token() {
@@ -320,6 +350,21 @@ mod tests {
 
         assert_eq!(inflight.take(1), Some(4));
         assert!(inflight.is_idle(1));
+    }
+
+    #[test]
+    fn a_parked_waiter_is_woken_by_whoever_drains_its_completion() {
+        let inflight: InFlight<2> = InFlight::new();
+        let waker = Waker::noop();
+
+        inflight.register(1);
+        assert!(!inflight.arm(1, waker), "the request is still in flight");
+        inflight.complete(1, 5);
+        assert!(
+            inflight.arm(1, waker),
+            "an armed waiter sees its completion without parking again"
+        );
+        assert_eq!(inflight.take(1), Some(5));
     }
 
     #[test]

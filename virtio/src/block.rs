@@ -216,19 +216,16 @@ impl<T: VirtioTransport> VirtioBlockDevice<T> {
         let token = submit_chain(
             &self.inflight,
             &self.queue,
-            &self.interrupts,
             &self.transport,
             inputs,
             outputs,
         )
         .await?;
 
-        Ok(
-            await_completion(&self.inflight, &self.queue, &self.interrupts, token, || {
-                self.interrupts.notified()
-            })
-            .await,
-        )
+        Ok(await_completion(&self.inflight, &self.queue, token, || {
+            self.interrupts.notified()
+        })
+        .await)
     }
 }
 
