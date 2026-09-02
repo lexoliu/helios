@@ -280,6 +280,37 @@ pub trait VsockDevice: Send + Sync {
     ) -> impl Future<Output = IoResult<VsockDelivery>> + Send + 'a;
 }
 
+/// A shared device is a device.
+///
+/// Backends hand the same driver to two owners at once — the kernel's
+/// vsock service and the interrupt route that wakes it — so the shared
+/// handle has to satisfy the contract without every backend writing the
+/// same six forwarding methods.
+impl<Device: VsockDevice + ?Sized> VsockDevice for alloc::sync::Arc<Device> {
+    fn guest_cid(&self) -> u64 {
+        Device::guest_cid(self)
+    }
+
+    fn max_payload_bytes(&self) -> usize {
+        Device::max_payload_bytes(self)
+    }
+
+    fn send<'a>(
+        &'a self,
+        header: VsockPacketHeader,
+        payload: &'a [u8],
+    ) -> impl Future<Output = IoResult<()>> + Send + 'a {
+        Device::send(self, header, payload)
+    }
+
+    fn receive_into<'a>(
+        &'a self,
+        payload: &'a mut [u8],
+    ) -> impl Future<Output = IoResult<VsockDelivery>> + Send + 'a {
+        Device::receive_into(self, payload)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{VsockAddress, VsockOp, VsockPacketHeader, VsockShutdown};

@@ -9,6 +9,7 @@ mod host_fs;
 mod net;
 mod pci;
 mod rtc;
+mod vsock;
 mod watchdog;
 
 mod debug_state {
@@ -595,6 +596,9 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     if balloon::has_balloon_device(&fdt) {
         devices = devices.with_memory_balloon();
     }
+    if vsock::has_vsock_device(&fdt) {
+        devices = devices.with_vsock();
+    }
     let kernel = helios_kernel::init_with_watchdog(
         helios_kernel::Platform::with_watchdog(
             console,
@@ -655,6 +659,9 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             if let Some(balloon) = balloon::install(&kernel, &fdt) {
                 debug_state.install_memory_balloon(balloon.handle.clone());
                 interrupts.attach_balloon(balloon);
+            }
+            if let Some(vsock) = vsock::install(&kernel, &cpu, &fdt, &debug_state) {
+                interrupts.attach_vsock(vsock);
             }
             for block in block::install(&cpu, &kernel, &fdt, &debug_state, root_entropy) {
                 interrupts.attach_block(block);

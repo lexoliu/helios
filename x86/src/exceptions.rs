@@ -22,6 +22,7 @@ pub(crate) const TLB_SHOOTDOWN_INTERRUPT_VECTOR: u8 = 0x22;
 pub(crate) const NETWORK_INTERRUPT_VECTOR: u8 = 0x30;
 pub(crate) const HOST_FS_INTERRUPT_VECTOR: u8 = 0x31;
 pub(crate) const ENTROPY_INTERRUPT_VECTOR: u8 = 0x32;
+pub(crate) const VSOCK_INTERRUPT_VECTOR: u8 = 0x37;
 /// The memory balloon's vector sits after the block devices' rather
 /// than filling the first free slot: the vsock transport claims `0x37`,
 /// and two devices sharing a vector would each be told about the
@@ -41,6 +42,7 @@ pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
     crate::host_fs::HostFsTransportService,
     crate::entropy::VirtioEntropyDevice,
     crate::balloon::VirtioBalloonInterrupt,
+    crate::vsock::VirtioVsockFunction,
     crate::block::VirtioBlockDevice,
 >;
 
@@ -60,6 +62,7 @@ unsafe extern "C" {
     fn helios_x86_interrupt_network();
     fn helios_x86_interrupt_host_fs();
     fn helios_x86_interrupt_entropy();
+    fn helios_x86_interrupt_vsock();
     fn helios_x86_interrupt_balloon();
     fn helios_x86_interrupt_block_0();
     fn helios_x86_interrupt_block_1();
@@ -117,6 +120,8 @@ impl ProcessorIdt {
                 .set_handler_addr(handler_address(helios_x86_interrupt_host_fs));
             table[ENTROPY_INTERRUPT_VECTOR]
                 .set_handler_addr(handler_address(helios_x86_interrupt_entropy));
+            table[VSOCK_INTERRUPT_VECTOR]
+                .set_handler_addr(handler_address(helios_x86_interrupt_vsock));
             table[BALLOON_INTERRUPT_VECTOR]
                 .set_handler_addr(handler_address(helios_x86_interrupt_balloon));
             let block_stubs: [unsafe extern "C" fn(); helios_kernel::MAX_BLOCK_DEVICES] = [
@@ -199,6 +204,7 @@ extern "C" fn helios_x86_interrupt_dispatch(frame: &mut ExceptionFrame) {
         _ => panic!(
             "unhandled x86 interrupt vector={:#x} rip={:#x}; device vectors are \
              network={NETWORK_INTERRUPT_VECTOR:#x} host-fs={HOST_FS_INTERRUPT_VECTOR:#x} \
+             entropy={ENTROPY_INTERRUPT_VECTOR:#x} vsock={VSOCK_INTERRUPT_VECTOR:#x} \
              entropy={ENTROPY_INTERRUPT_VECTOR:#x} balloon={BALLOON_INTERRUPT_VECTOR:#x} \
              block={BLOCK_INTERRUPT_VECTORS:#x?}",
             frame.vector, frame.rip
@@ -220,6 +226,7 @@ fn is_device_interrupt(vector: u8) -> bool {
         NETWORK_INTERRUPT_VECTOR
             | HOST_FS_INTERRUPT_VECTOR
             | ENTROPY_INTERRUPT_VECTOR
+            | VSOCK_INTERRUPT_VECTOR
             | BALLOON_INTERRUPT_VECTOR
     ) || BLOCK_INTERRUPT_VECTORS.contains(&vector)
 }

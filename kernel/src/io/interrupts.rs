@@ -24,22 +24,24 @@ pub trait ExternalInterruptHandler {
 
 /// Maps claimed interrupt sources to the device handlers a backend
 /// registered at boot.
-pub struct ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Balloon, Block> {
+pub struct ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Balloon, Vsock, Block> {
     network: Option<(Source, Network)>,
     host_fs: Option<(Source, HostFs)>,
     entropy: Option<(Source, Entropy)>,
     balloon: Option<(Source, Balloon)>,
+    vsock: Option<(Source, Vsock)>,
     block: [Option<(Source, Block)>; MAX_BLOCK_DEVICES],
 }
 
-impl<Source, Network, HostFs, Entropy, Balloon, Block>
-    ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Balloon, Block>
+impl<Source, Network, HostFs, Entropy, Balloon, Vsock, Block>
+    ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Balloon, Vsock, Block>
 where
     Source: PartialEq + Copy,
     Network: ExternalInterruptHandler,
     HostFs: ExternalInterruptHandler,
     Entropy: ExternalInterruptHandler,
     Balloon: ExternalInterruptHandler,
+    Vsock: ExternalInterruptHandler,
     Block: ExternalInterruptHandler,
 {
     pub const fn new() -> Self {
@@ -48,6 +50,7 @@ where
             host_fs: None,
             entropy: None,
             balloon: None,
+            vsock: None,
             block: [const { None }; MAX_BLOCK_DEVICES],
         }
     }
@@ -84,6 +87,14 @@ where
         self.balloon = Some((source, handler));
     }
 
+    pub fn set_vsock(&mut self, source: Source, handler: Vsock) {
+        assert!(
+            self.vsock.is_none(),
+            "vsock interrupt route was installed more than once"
+        );
+        self.vsock = Some((source, handler));
+    }
+
     /// Registers one more block device.
     ///
     /// Unlike the single-device slots this one takes several handlers:
@@ -110,6 +121,7 @@ where
             || dispatch(&self.host_fs, source)
             || dispatch(&self.entropy, source)
             || dispatch(&self.balloon, source)
+            || dispatch(&self.vsock, source)
         {
             return true;
         }
@@ -131,14 +143,15 @@ where
     }
 }
 
-impl<Source, Network, HostFs, Entropy, Balloon, Block> Default
-    for ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Balloon, Block>
+impl<Source, Network, HostFs, Entropy, Balloon, Vsock, Block> Default
+    for ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Balloon, Vsock, Block>
 where
     Source: PartialEq + Copy,
     Network: ExternalInterruptHandler,
     HostFs: ExternalInterruptHandler,
     Entropy: ExternalInterruptHandler,
     Balloon: ExternalInterruptHandler,
+    Vsock: ExternalInterruptHandler,
     Block: ExternalInterruptHandler,
 {
     fn default() -> Self {
