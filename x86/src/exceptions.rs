@@ -184,18 +184,31 @@ extern "C" fn helios_x86_interrupt_dispatch(frame: &mut ExceptionFrame) {
         Ok(TLB_SHOOTDOWN_INTERRUPT_VECTOR) => {
             smp::handle_tlb_shootdown_interrupt();
         }
-        Ok(
-            vector @ (NETWORK_INTERRUPT_VECTOR
-            | HOST_FS_INTERRUPT_VECTOR
-            | ENTROPY_INTERRUPT_VECTOR),
-        ) => {
+        Ok(vector) if is_device_interrupt(vector) => {
             smp::handle_device_interrupt(vector);
         }
         _ => panic!(
-            "unhandled x86 interrupt vector={} rip={:#x}",
+            "unhandled x86 interrupt vector={:#x} rip={:#x}; device vectors are \
+             network={NETWORK_INTERRUPT_VECTOR:#x} host-fs={HOST_FS_INTERRUPT_VECTOR:#x} \
+             entropy={ENTROPY_INTERRUPT_VECTOR:#x} block={BLOCK_INTERRUPT_VECTORS:#x?}",
             frame.vector, frame.rip
         ),
     }
+}
+
+/// Whether `vector` belongs to a device route.
+///
+/// The IDT stub for a device vector pushes nothing but the vector
+/// number, so this predicate is what decides between the routing table
+/// and a fatal spurious interrupt. Every vector [`ProcessorIdt::install`]
+/// points at a device stub has to be listed here, which is why the block
+/// devices are tested against the same array the IDT is built from
+/// rather than against a second copy of those numbers.
+fn is_device_interrupt(vector: u8) -> bool {
+    matches!(
+        vector,
+        NETWORK_INTERRUPT_VECTOR | HOST_FS_INTERRUPT_VECTOR | ENTROPY_INTERRUPT_VECTOR
+    ) || BLOCK_INTERRUPT_VECTORS.contains(&vector)
 }
 
 fn dispatch_to_wasmtime(exception: KernelException) -> KernelExceptionDispatch {
