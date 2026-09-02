@@ -5,6 +5,7 @@ pub(super) struct TcpListenerState {
     pub(super) local_port: u16,
 }
 
+#[derive(Debug)]
 pub(super) enum TcpConnectProgress {
     Pending,
     Connected,
@@ -228,9 +229,20 @@ where
         timeout_nanos: u64,
     ) -> Result<TcpStreamId, TcpError> {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
-        let destination = self.resolve_host_tcp(host, deadline_nanos).await?;
-        self.execute_tcp_connect_address_until(destination, port, local_port, hop_limit, deadline_nanos)
-            .await
+        let candidates = self.resolve_host_tcp(host, deadline_nanos).await?;
+        // Every candidate shares the caller's deadline: a refused or
+        // unreachable answer hands whatever time is left to the next
+        // address instead of restarting the timeout.
+        attempt_each_address(&candidates, move |destination| {
+            self.execute_tcp_connect_address_until(
+                destination,
+                port,
+                local_port,
+                hop_limit,
+                deadline_nanos,
+            )
+        })
+        .await
     }
 
     pub(super) async fn execute_tcp_connect_address(
@@ -608,12 +620,12 @@ where
         &self,
         host: &str,
         deadline_nanos: u64,
-    ) -> Result<IpAddress, TcpError> {
+    ) -> Result<ConnectCandidates, TcpError> {
         if let Some(address) = parse_ipv4(host) {
-            return Ok(IpAddress::Ipv4(address));
+            return Ok(ConnectCandidates::literal(IpAddress::Ipv4(address)));
         }
         if let Some(address) = parse_ipv6(host) {
-            return Ok(IpAddress::Ipv6(address));
+            return Ok(ConnectCandidates::literal(IpAddress::Ipv6(address)));
         }
         let timeout_nanos = deadline_nanos.saturating_sub(self.now_nanos());
         let addresses = self
@@ -627,7 +639,7 @@ where
                 },
                 detail: error.detail,
             })?;
-        self.first_usable_address(addresses).ok_or(TcpError {
+        self.usable_addresses(addresses).ok_or(TcpError {
             kind: TcpErrorKind::UnresolvedHost,
             detail: NetworkErrorDetail::DnsNoIpv4Address,
         })
