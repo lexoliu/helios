@@ -50,6 +50,8 @@ const DEFAULT_DATA_DISK_BYTES: u64 = 256 * 1024 * 1024;
 /// on the bus carries it, so the boot image is never mistaken for it.
 const DATA_DISK_SERIAL: &str = "helios-data";
 const DEFAULT_GDB_ENDPOINT: &str = "tcp::1234";
+/// The QEMU IOThread the memory balloon's free-page hint queue runs on.
+const BALLOON_IOTHREAD_ID: &str = "balloon-io";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -2248,6 +2250,13 @@ fn apply_transport(pci: bool, devices: VirtioDeviceProfile, options: &mut QemuOp
 /// QEMU, and a guest that negotiated a feature the device never offered
 /// would silently run without it.
 fn configure_balloon(qemu: &mut Command, balloon: VmBalloonProfile, devices: VirtioDeviceProfile) {
+    // QEMU walks a free-page hint sequence on a thread of its own and
+    // refuses to create the device without one, because the hint queue
+    // is drained while the guest is still running.
+    let mut iothread = QemuOptions::new("iothread");
+    iothread.set("id", BALLOON_IOTHREAD_ID);
+    qemu.arg("-object").arg(iothread.to_string());
+
     let mut device = QemuOptions::new(match balloon {
         VmBalloonProfile::VirtioBalloonMmio => "virtio-balloon-device",
         VmBalloonProfile::VirtioBalloonPci => "virtio-balloon-pci",
@@ -2255,6 +2264,7 @@ fn configure_balloon(qemu: &mut Command, balloon: VmBalloonProfile, devices: Vir
     device.set("free-page-reporting", "on");
     device.set("free-page-hint", "on");
     device.set("deflate-on-oom", "on");
+    device.set("iothread", BALLOON_IOTHREAD_ID);
     apply_transport(
         balloon == VmBalloonProfile::VirtioBalloonPci,
         devices,
@@ -2345,6 +2355,16 @@ mod tests {
             assert!(device.contains("free-page-reporting=on"), "{device}");
             assert!(device.contains("free-page-hint=on"), "{device}");
             assert!(device.contains("deflate-on-oom=on"), "{device}");
+            assert!(
+                device.contains(&format!("iothread={BALLOON_IOTHREAD_ID}")),
+                "{device}"
+            );
+            assert!(
+                rendered
+                    .iter()
+                    .any(|argument| argument == &format!("iothread,id={BALLOON_IOTHREAD_ID}")),
+                "the balloon's IOThread has to be created before the device names it: {rendered:?}"
+            );
         }
         assert_eq!(
             AARCH64_VIRT_HVF_PROFILE.balloon,

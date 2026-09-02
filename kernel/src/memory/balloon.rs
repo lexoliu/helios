@@ -364,7 +364,16 @@ impl<Pool: PhysFrameAllocator, Device: MemoryBalloon + Clone> BalloonService<Poo
             }
             wanted -= range.frame_count;
             self.runs.push(range);
+            // The host watches `actual` to see how far the guest has
+            // got. Publishing only at the end would leave it reading a
+            // stale zero for as long as the whole target takes to move.
+            self.publish_actual();
         }
+        tracing::info!(
+            held_frames = self.held_frames(),
+            target_frames = target,
+            "memory balloon inflated"
+        );
     }
 
     /// Gives runs back until the balloon holds no more than `target`
@@ -389,6 +398,14 @@ impl<Pool: PhysFrameAllocator, Device: MemoryBalloon + Clone> BalloonService<Poo
             self.runs.pop();
             PhysFrameAllocator::deallocate(self.pool, run);
             released += run.frame_count;
+            self.publish_actual();
+        }
+        if released != 0 {
+            tracing::info!(
+                released_frames = released,
+                held_frames = self.held_frames(),
+                "memory balloon deflated"
+            );
         }
         released
     }

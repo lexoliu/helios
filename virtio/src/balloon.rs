@@ -126,10 +126,19 @@ fn encode_stat(stat: MemoryStat, bytes: &mut [u8; STAT_BYTES]) {
 }
 
 /// One virtqueue of a balloon device, with the completion table its
-/// waiters are routed through.
+/// waiters are routed through and the notification they park on.
+///
+/// The notification is per queue rather than per device because a
+/// balloon is driven by several independent tasks at once — one follows
+/// the host's target, one reports free memory, one answers the
+/// statistics queue — and a waiter only ever drains the queue it is
+/// waiting on. A device-wide notification would let the task parked on
+/// one queue consume the wake-up belonging to another, whose completion
+/// would then sit in the used ring with nobody left to reap it.
 struct BalloonQueue<T: VirtioTransport> {
     queue: Mutex<VirtQueue<T>>,
     inflight: InFlight<{ QUEUE_SIZE as usize }>,
+    interrupts: Notify,
 }
 
 impl<T: VirtioTransport> BalloonQueue<T> {
@@ -152,6 +161,7 @@ impl<T: VirtioTransport> BalloonQueue<T> {
                 features,
             )?),
             inflight: InFlight::new(),
+            interrupts: Notify::new(),
         })
     }
 
@@ -159,12 +169,19 @@ impl<T: VirtioTransport> BalloonQueue<T> {
     async fn request(
         &self,
         transport: &T,
-        interrupts: &Notify,
         inputs: &[&[u8]],
         outputs: &mut [&mut [u8]],
     ) -> IoResult<u32> {
         let token = submit_chain(&self.inflight, &self.queue, transport, inputs, outputs).await?;
-        Ok(await_completion(&self.inflight, &self.queue, token, || interrupts.notified()).await)
+        Ok(await_completion(&self.inflight, &self.queue, token, || {
+            self.interrupts.notified()
+        })
+        .await)
+    }
+
+    /// Wakes whoever is waiting on this queue.
+    fn wake(&self) {
+        self.interrupts.notify_all();
     }
 
     fn shutdown(&mut self, transport: &T) {
@@ -180,8 +197,6 @@ pub struct VirtioBalloonDevice<T: VirtioTransport> {
     stats: Option<BalloonQueue<T>>,
     free_page: Option<BalloonQueue<T>>,
     reporting: Option<BalloonQueue<T>>,
-    /// Wakes tasks parked on a used-buffer notification.
-    interrupts: Notify,
     /// Wakes tasks parked on a configuration change.
     config_changes: Notify,
     features: NegotiatedFeatures,
@@ -234,7 +249,6 @@ impl<T: VirtioTransport> VirtioBalloonDevice<T> {
             stats,
             free_page,
             reporting,
-            interrupts: Notify::new(),
             config_changes: Notify::new(),
             features,
             actual_pages: AtomicU32::new(0),
@@ -290,8 +304,24 @@ impl<T: VirtioTransport> VirtioBalloonDevice<T> {
             self.config_changes.notify_all();
         }
         if status.used_buffer {
-            self.interrupts.notify_all();
+            // The interrupt says only that the device used *a* buffer,
+            // so every queue's waiters have to look.
+            for queue in self.queues() {
+                queue.wake();
+            }
         }
+    }
+
+    /// Every queue this device programmed, in index order.
+    fn queues(&self) -> impl Iterator<Item = &BalloonQueue<T>> {
+        [Some(&self.inflate), Some(&self.deflate)]
+            .into_iter()
+            .chain([
+                self.stats.as_ref(),
+                self.free_page.as_ref(),
+                self.reporting.as_ref(),
+            ])
+            .flatten()
     }
 
     /// Waits for the device to change its configuration space.
@@ -363,9 +393,7 @@ impl<T: VirtioTransport> VirtioBalloonDevice<T> {
             return Err(IoError::Unsupported);
         };
         for batch in ranges.chunks_mut(MAX_CHAIN_BUFFERS) {
-            reporting
-                .request(&self.transport, &self.interrupts, &[], batch)
-                .await?;
+            reporting.request(&self.transport, &[], batch).await?;
         }
         Ok(())
     }
@@ -386,7 +414,7 @@ impl<T: VirtioTransport> VirtioBalloonDevice<T> {
         };
         let start = cmd_id.to_le_bytes();
         free_page
-            .request(&self.transport, &self.interrupts, &[&start], &mut [])
+            .request(&self.transport, &[&start], &mut [])
             .await?;
         Ok(())
     }
@@ -397,9 +425,7 @@ impl<T: VirtioTransport> VirtioBalloonDevice<T> {
             return Err(IoError::Unsupported);
         };
         for batch in ranges.chunks_mut(MAX_CHAIN_BUFFERS) {
-            free_page
-                .request(&self.transport, &self.interrupts, &[], batch)
-                .await?;
+            free_page.request(&self.transport, &[], batch).await?;
         }
         Ok(())
     }
@@ -411,7 +437,7 @@ impl<T: VirtioTransport> VirtioBalloonDevice<T> {
         };
         let stop = FREE_PAGE_CMD_ID_STOP.to_le_bytes();
         free_page
-            .request(&self.transport, &self.interrupts, &[&stop], &mut [])
+            .request(&self.transport, &[&stop], &mut [])
             .await?;
         Ok(())
     }
@@ -439,9 +465,7 @@ impl<T: VirtioTransport> VirtioBalloonDevice<T> {
         if payload.is_empty() {
             return Err(IoError::OutOfBounds);
         }
-        queue
-            .request(&self.transport, &self.interrupts, &[payload], &mut [])
-            .await?;
+        queue.request(&self.transport, &[payload], &mut []).await?;
         Ok(())
     }
 
@@ -485,12 +509,7 @@ impl<T: VirtioTransport> VirtioBalloonDevice<T> {
             bytes[index * 4..index * 4 + 4].copy_from_slice(&pfn.to_le_bytes());
         }
         queue
-            .request(
-                &self.transport,
-                &self.interrupts,
-                &[&bytes[..pfns.len() * 4]],
-                &mut [],
-            )
+            .request(&self.transport, &[&bytes[..pfns.len() * 4]], &mut [])
             .await?;
         Ok(())
     }
@@ -1018,6 +1037,36 @@ mod tests {
 
         complete(&device, 2, 0);
         assert_eq!(block_on(poll_once(submit.as_mut())), Some(Ok(())));
+    }
+
+    /// A balloon is driven by several tasks at once, each parked on a
+    /// different queue. A device-wide notification would let one of them
+    /// consume the wake-up that belonged to another, leaving that
+    /// other's completion in the used ring with nobody to reap it — and
+    /// the host waiting forever for a guest that never answers again.
+    #[test]
+    fn a_completion_wakes_the_queue_it_belongs_to_even_while_another_waits() {
+        let device = device();
+        let mut pages = Pages::new(1);
+        let mut inflated = [pages.range(1)];
+        let mut free = Pages::new(1);
+        let mut reported = [free.range(1)];
+
+        let mut inflate = pin!(device.inflate(&mut inflated));
+        let mut report = pin!(device.report_free(&mut reported));
+        assert!(block_on(poll_once(inflate.as_mut())).is_none());
+        assert!(block_on(poll_once(report.as_mut())).is_none());
+
+        // The device finishes only the report.
+        complete(&device, 4, 0);
+        assert_eq!(block_on(poll_once(report.as_mut())), Some(Ok(())));
+        assert!(
+            block_on(poll_once(inflate.as_mut())).is_none(),
+            "the inflate request is still with the device"
+        );
+
+        complete(&device, 0, 0);
+        assert_eq!(block_on(poll_once(inflate.as_mut())), Some(Ok(())));
     }
 
     /// A configuration-change interrupt is the only way the driver
