@@ -4,7 +4,8 @@
 guest. Which host-side packet path sits behind that device is selected
 with `--net-backend`, and it decides what the guest's virtio-net driver
 can negotiate at all: multiqueue, TCP segmentation offload and checksum
-offload are host-path properties, not guest choices. A benchmark taken
+offload — in both directions — are host-path properties, not guest
+choices. A benchmark taken
 over the wrong backend measures QEMU's slirp copy loop rather than the
 driver.
 
@@ -15,13 +16,13 @@ error naming the reason.
 
 ## What each backend can exercise
 
-| Backend | Host | Multiqueue | TSO (`HOST_TSO4/6`) | Checksum (`CSUM`) | Packed ring | Privilege |
-| --- | --- | --- | --- | --- | --- | --- |
-| `user` | any | no (1 pair) | no | no | yes | none |
-| `tap` | Linux | yes (`--net-queues`) | yes | yes | yes | one-time `net-setup` |
-| `vmnet-shared` | macOS | no (1 pair) | yes | yes | yes | root or entitlement |
-| `vmnet-bridged` | macOS | no (1 pair) | yes | yes | yes | root or entitlement |
-| `socket-vmnet` | macOS | no (1 pair) | yes | yes | yes | daemon installed once |
+| Backend | Host | Multiqueue | TSO (`HOST_TSO4/6`) | Checksum (`CSUM`) | Receive offload (`GUEST_CSUM`, `GUEST_TSO4/6`) | Packed ring | Privilege |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `user` | any | no (1 pair) | no | no | no | yes | none |
+| `tap` | Linux | yes (`--net-queues`) | yes | yes | yes | yes | one-time `net-setup` |
+| `vmnet-shared` | macOS | no (1 pair) | yes | yes | yes | yes | root or entitlement |
+| `vmnet-bridged` | macOS | no (1 pair) | yes | yes | yes | yes | root or entitlement |
+| `socket-vmnet` | macOS | no (1 pair) | yes | yes | yes | yes | daemon installed once |
 
 The packed-ring column is a property of the virtqueue rather than the
 backend: `--virtio-packed` and `--virtio-in-order` are applied to every
@@ -38,16 +39,52 @@ error rather than a quiet downgrade.
 Two `info` lines per device land in the boot log. The generic
 `virtio features negotiated` line (from `virtio/src/features.rs`) reports
 the ring bits, and `virtio-net online` (from `virtio/src/net.rs`) reports
-the device-class facts:
+the device-class facts, transmit and receive:
 
 ```
 INFO [helios_virtio::net] virtio-net online queue_pairs=4 csum=true
-  host_tso4=true host_tso6=true mq=true ctrl_vq=true max_frame_len=1514
+  host_tso4=true host_tso6=true guest_csum=true guest_tso4=true
+  guest_tso6=true guest_ecn=true guest_ufo=true mrg_rxbuf=true mq=true
+  ctrl_vq=true status=true link_up=true max_frame_len=1514
+  max_receive_frame_len=65550 rx_buffer_len=4096
 ```
+
+The `guest_*` bits are the receive half: `guest_csum` is what lets the
+device tell the stack, per frame, that it validated the transport
+checksum or left it partial, and `guest_tso4`/`guest_tso6`/`guest_ufo`
+let it hand over one frame coalesced out of several wire segments.
+Those need somewhere to put a 64 KiB frame, which is `mrg_rxbuf`:
+receive buffers are one page each and a coalesced frame arrives as a
+chain of them, so `max_receive_frame_len` exceeds `max_frame_len`
+exactly when receive segmentation was negotiated.
 
 `helios-inspector vm` echoes every guest boot line it reads before the
 debugger comes up as `guest serial: …` on stderr, so capturing the
 inspector's stderr is enough to record which offloads a run actually had.
+
+## Link state
+
+With `VIRTIO_NET_F_STATUS` the device reports carrier, and a change
+arrives as a configuration-change interrupt rather than a queue
+notification. The driver re-reads the status word, publishes it, and the
+kernel network service drops the addresses, routes, neighbours and
+resolvers that describe the link that went away; when carrier returns it
+puts every shard's DHCP client and router solicitation back at the start
+so the new link is configured from scratch.
+
+QEMU can drive that from the HMP monitor the inspector already exposes,
+which is the cheapest way to exercise the path on any backend:
+
+```bash
+helios-inspector vm --arch aarch64 --release \
+    --monitor unix:/tmp/helios-hmp.sock,server=on,wait=off tracing &
+printf 'set_link net0 off\n' | nc -U /tmp/helios-hmp.sock
+printf 'set_link net0 on\n' | nc -U /tmp/helios-hmp.sock
+```
+
+The streamed guest tracing shows the driver's
+`virtio-net link state changed` followed by the service's
+`network link down` / `network link up` lines.
 
 ## The `user` backend
 
