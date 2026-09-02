@@ -217,12 +217,12 @@ where
                 Ok((progress, budget)) => match cadence.complete(progress, budget) {
                     NetworkPumpAction::Continue => {}
                     NetworkPumpAction::Yield => crate::yield_now().await,
-                    NetworkPumpAction::Wait => self.wait_for_progress(NETWORK_PROGRESS_WAIT).await,
+                    NetworkPumpAction::Wait => self.wait_for_progress(self.pump_wait()).await,
                 },
                 Err(error) => {
                     cadence.reset();
                     tracing::debug!(?error, "network packet pump failed to drive device");
-                    self.wait_for_progress(NETWORK_PROGRESS_WAIT).await;
+                    self.wait_for_progress(self.pump_wait()).await;
                 }
             }
         }
