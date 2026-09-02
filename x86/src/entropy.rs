@@ -13,12 +13,13 @@ use core::future::Future;
 
 use helios_hal::io::IoError;
 use helios_kernel::{ExternalInterruptHandler, HardwareEntropySource, RootEntropyHandle};
-use helios_virtio::{DeviceType, OffsetDmaPool, VirtioPciTransport, VirtioRngDevice};
+use helios_virtio::{DeviceType, VirtioPciTransport, VirtioRngDevice};
 use pci_types::PciAddress;
 
+use crate::iommu::X86DmaPool;
 use crate::pci::PciRoot;
 
-type X86VirtioRngDevice = VirtioRngDevice<VirtioPciTransport<OffsetDmaPool>>;
+type X86VirtioRngDevice = VirtioRngDevice<VirtioPciTransport<X86DmaPool>>;
 
 #[derive(Clone)]
 pub(crate) struct VirtioEntropyDevice {
@@ -51,7 +52,7 @@ pub(crate) fn install<WatchdogImpl>(
     kernel: &helios_kernel::Kernel<crate::X86Cpu, WatchdogImpl>,
     pci: &PciRoot,
     address: PciAddress,
-    physical_memory_offset: usize,
+    dma: X86DmaPool,
     vector: u8,
     destination_apic_id: u32,
     root: RootEntropyHandle,
@@ -60,16 +61,10 @@ where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
 {
     let msix_vector = pci.bind_msix_vector(address, vector, destination_apic_id);
-    let device = helios_virtio::rng_from_pci(
-        &pci.access(),
-        address,
-        pci,
-        OffsetDmaPool::new(physical_memory_offset),
-        Some(msix_vector),
-    )
-    .unwrap_or_else(|error| {
-        panic!("failed to initialize the virtio-rng function at {address}: {error}")
-    });
+    let device = helios_virtio::rng_from_pci(&pci.access(), address, pci, dma, Some(msix_vector))
+        .unwrap_or_else(|error| {
+            panic!("failed to initialize the virtio-rng function at {address}: {error}")
+        });
     let device = VirtioEntropyDevice {
         device: Arc::new(device),
     };

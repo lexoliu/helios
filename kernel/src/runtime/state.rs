@@ -50,7 +50,7 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     block_service: Once<BlockService>,
     /// What the platform's IOMMU confines, once the backend has built
     /// the domains. Empty on a machine whose devices are not behind one.
-    iommu_report: Once<Arc<crate::IommuReport>>,
+    iommu_report: Once<alloc::sync::Arc<crate::IommuReport>>,
     futex_table: Mutex<FutexTable>,
     bootfs: Mutex<Option<EmbeddedBootFs>>,
     tracing: Mutex<TraceHistory>,
@@ -789,7 +789,7 @@ where
     /// Called from the backend once every device it protects has been
     /// attached to its domain, so a report that is visible here already
     /// describes the machine's final device topology.
-    pub fn install_iommu_report(&self, report: Arc<crate::IommuReport>) {
+    pub fn install_iommu_report(&self, report: alloc::sync::Arc<crate::IommuReport>) {
         let mut installed = false;
         self.inner.iommu_report.call_once(|| {
             installed = true;

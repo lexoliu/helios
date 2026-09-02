@@ -28,6 +28,9 @@ pub(crate) const ENTROPY_INTERRUPT_VECTOR: u8 = 0x32;
 /// message.
 pub(crate) const BLOCK_INTERRUPT_VECTORS: [u8; helios_kernel::MAX_BLOCK_DEVICES] =
     [0x33, 0x34, 0x35, 0x36];
+/// The platform's translation unit reports its faults on its own
+/// message, so a fault names the endpoint that caused it.
+pub(crate) const IOMMU_INTERRUPT_VECTOR: u8 = 0x37;
 
 /// Device interrupt routing table for this backend, keyed by IDT vector.
 pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
@@ -36,6 +39,7 @@ pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
     crate::host_fs::HostFsTransportService,
     crate::entropy::VirtioEntropyDevice,
     crate::block::VirtioBlockDevice,
+    crate::iommu::VirtioIommu,
 >;
 
 global_asm!(include_str!("exceptions.S"));
@@ -58,6 +62,7 @@ unsafe extern "C" {
     fn helios_x86_interrupt_block_1();
     fn helios_x86_interrupt_block_2();
     fn helios_x86_interrupt_block_3();
+    fn helios_x86_interrupt_iommu();
 }
 
 pub(crate) struct ProcessorIdt {
@@ -119,6 +124,8 @@ impl ProcessorIdt {
             for (vector, stub) in BLOCK_INTERRUPT_VECTORS.iter().zip(block_stubs) {
                 table[*vector].set_handler_addr(handler_address(stub));
             }
+            table[IOMMU_INTERRUPT_VECTOR]
+                .set_handler_addr(handler_address(helios_x86_interrupt_iommu));
             table.load_unsafe();
         }
     }
@@ -190,7 +197,8 @@ extern "C" fn helios_x86_interrupt_dispatch(frame: &mut ExceptionFrame) {
         _ => panic!(
             "unhandled x86 interrupt vector={:#x} rip={:#x}; device vectors are \
              network={NETWORK_INTERRUPT_VECTOR:#x} host-fs={HOST_FS_INTERRUPT_VECTOR:#x} \
-             entropy={ENTROPY_INTERRUPT_VECTOR:#x} block={BLOCK_INTERRUPT_VECTORS:#x?}",
+             entropy={ENTROPY_INTERRUPT_VECTOR:#x} block={BLOCK_INTERRUPT_VECTORS:#x?} \
+             iommu={IOMMU_INTERRUPT_VECTOR:#x}",
             frame.vector, frame.rip
         ),
     }
@@ -207,7 +215,10 @@ extern "C" fn helios_x86_interrupt_dispatch(frame: &mut ExceptionFrame) {
 fn is_device_interrupt(vector: u8) -> bool {
     matches!(
         vector,
-        NETWORK_INTERRUPT_VECTOR | HOST_FS_INTERRUPT_VECTOR | ENTROPY_INTERRUPT_VECTOR
+        NETWORK_INTERRUPT_VECTOR
+            | HOST_FS_INTERRUPT_VECTOR
+            | ENTROPY_INTERRUPT_VECTOR
+            | IOMMU_INTERRUPT_VECTOR
     ) || BLOCK_INTERRUPT_VECTORS.contains(&vector)
 }
 

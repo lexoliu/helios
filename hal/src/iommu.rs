@@ -306,10 +306,11 @@ impl DmaWindow {
 
 /// How many windows one device address space can describe.
 ///
-/// A window is one contiguous run of DMA-capable physical memory plus
-/// the platform's interrupt doorbells; no machine helios boots on splits
-/// its usable memory into more runs than this.
-pub const MAX_DMA_WINDOWS: usize = 8;
+/// A window is one contiguous run of DMA-capable physical memory or one
+/// of the platform's interrupt doorbells. A firmware memory map that
+/// names more runs than this is folded into this many by the kernel
+/// before the domain is built.
+pub const MAX_DMA_WINDOWS: usize = 16;
 
 /// The translation a device's DMA addresses go through, as the platform
 /// established it.

@@ -83,6 +83,12 @@ helios_x86_interrupt_block_3:
     push 0x36
     jmp helios_x86_interrupt_common
 
+.global helios_x86_interrupt_iommu
+helios_x86_interrupt_iommu:
+    push 0
+    push 0x37
+    jmp helios_x86_interrupt_common
+
 helios_x86_exception_common:
     push rax
     push rcx

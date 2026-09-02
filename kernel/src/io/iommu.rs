@@ -131,11 +131,24 @@ impl<I: Iommu> IommuDomains<I> {
         doorbells: &[PhysicalRange],
     ) -> Result<Self, IommuError> {
         let geometry = iommu.geometry();
-        let memory = align_ranges(memory, &geometry)?;
-        let doorbells = align_ranges(doorbells, &geometry)?;
-        if memory.iter().flatten().next().is_none() {
+        let doorbells = RangeSet::build(doorbells, &geometry)?;
+        let mut memory = RangeSet::build(memory, &geometry)?;
+        if memory.len == 0 {
             return Err(IommuError::Invalid);
         }
+        let budget = MAX_DMA_WINDOWS
+            .checked_sub(doorbells.len)
+            .ok_or(IommuError::TooManyWindows)?;
+        let swallowed = memory.fold_to(budget)?;
+        if swallowed != 0 {
+            tracing::info!(
+                windows = memory.len,
+                swallowed_bytes = swallowed,
+                "firmware memory map folded into the domain window budget"
+            );
+        }
+        let doorbells = windows_of(doorbells.as_slice());
+        let memory = windows_of(memory.as_slice());
 
         let span = memory
             .iter()
@@ -267,18 +280,114 @@ impl<I: Iommu> IommuDomains<I> {
     }
 }
 
-fn align_ranges(
-    ranges: &[PhysicalRange],
-    geometry: &IommuGeometry,
-) -> Result<[Option<PhysicalRange>; MAX_DMA_WINDOWS], IommuError> {
-    let mut aligned = [const { None }; MAX_DMA_WINDOWS];
-    for (slot, range) in ranges.iter().enumerate() {
-        if slot >= MAX_DMA_WINDOWS {
+/// Ranges a firmware memory map may name before the kernel refuses to
+/// look at it at all.
+const MAX_INPUT_RANGES: usize = 64;
+
+/// A fixed-capacity, ascending, disjoint set of physical ranges.
+///
+/// Firmware describes usable memory as many small runs; a translation
+/// domain describes it as a handful of windows. This is what turns one
+/// into the other without allocating.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RangeSet {
+    ranges: [PhysicalRange; MAX_INPUT_RANGES],
+    len: usize,
+}
+
+impl RangeSet {
+    /// Aligns every range outwards to `geometry`'s granule, sorts them,
+    /// and merges the ones that touch.
+    fn build(ranges: &[PhysicalRange], geometry: &IommuGeometry) -> Result<Self, IommuError> {
+        if ranges.len() > MAX_INPUT_RANGES {
             return Err(IommuError::TooManyWindows);
         }
-        aligned[slot] = Some(range.aligned_to(geometry));
+        let mut set = Self {
+            ranges: [PhysicalRange::new(0, 0); MAX_INPUT_RANGES],
+            len: 0,
+        };
+        for range in ranges {
+            set.ranges[set.len] = range.aligned_to(geometry);
+            set.len += 1;
+        }
+        // The firmware map arrives ascending, but nothing in the
+        // contract says so, and an out-of-order pair would merge wrong.
+        for index in 1..set.len {
+            let mut slot = index;
+            while slot > 0 && set.ranges[slot - 1].start > set.ranges[slot].start {
+                set.ranges.swap(slot - 1, slot);
+                slot -= 1;
+            }
+        }
+        set.merge_touching();
+        Ok(set)
     }
-    Ok(aligned)
+
+    fn as_slice(&self) -> &[PhysicalRange] {
+        &self.ranges[..self.len]
+    }
+
+    fn merge_touching(&mut self) {
+        let mut kept = 0;
+        for index in 1..self.len {
+            let candidate = self.ranges[index];
+            let current = self.ranges[kept];
+            if candidate.start <= current.last().saturating_add(1) {
+                self.ranges[kept] = merge(current, candidate);
+                continue;
+            }
+            kept += 1;
+            self.ranges[kept] = candidate;
+        }
+        if self.len != 0 {
+            self.len = kept + 1;
+        }
+    }
+
+    /// Folds the set down to at most `budget` ranges by repeatedly
+    /// merging the pair separated by the smallest gap.
+    ///
+    /// Merging swallows the gap, so a domain built from the result
+    /// reaches a little more than the usable memory it was given; taking
+    /// the smallest gaps first is what keeps that surplus minimal.
+    fn fold_to(&mut self, budget: usize) -> Result<u64, IommuError> {
+        if budget == 0 {
+            return Err(IommuError::TooManyWindows);
+        }
+        let mut swallowed = 0;
+        while self.len > budget {
+            let mut victim = 0;
+            let mut smallest = u64::MAX;
+            for index in 1..self.len {
+                let gap = self.ranges[index].start - (self.ranges[index - 1].last() + 1);
+                if gap < smallest {
+                    smallest = gap;
+                    victim = index - 1;
+                }
+            }
+            swallowed += smallest;
+            self.ranges[victim] = merge(self.ranges[victim], self.ranges[victim + 1]);
+            for index in victim + 1..self.len - 1 {
+                self.ranges[index] = self.ranges[index + 1];
+            }
+            self.len -= 1;
+        }
+        Ok(swallowed)
+    }
+}
+
+fn merge(first: PhysicalRange, second: PhysicalRange) -> PhysicalRange {
+    let start = first.start.min(second.start);
+    let last = first.last().max(second.last());
+    PhysicalRange::new(start, last - start + 1)
+}
+
+fn windows_of(ranges: &[PhysicalRange]) -> [Option<PhysicalRange>; MAX_DMA_WINDOWS] {
+    let mut windows = [const { None }; MAX_DMA_WINDOWS];
+    for (slot, range) in ranges.iter().enumerate() {
+        windows[slot] = Some(*range);
+    }
+    windows
 }
 
 #[cfg(test)]
@@ -509,6 +618,38 @@ mod tests {
         assert_eq!(stats.endpoints()[0].domain, 0);
         assert_eq!(stats.endpoints()[0].mapped_bytes, 0x1000_0000 + 0x10_0000);
         assert_eq!(stats.endpoints()[1].domain, 1);
+    }
+
+    /// A firmware map names more runs than a domain has windows, so the
+    /// kernel folds them together — taking the smallest gaps first, so
+    /// the domain reaches as little memory that is not RAM as possible.
+    #[test]
+    fn a_memory_map_with_more_runs_than_windows_is_folded() {
+        let mut ranges = Vec::new();
+        for index in 0..24_u64 {
+            // Every run is a page long; the gaps between them grow, so
+            // the ones that get swallowed are the earliest.
+            ranges.push(PhysicalRange::new(
+                0x4000_0000 + index * 0x1_0000 + index * index * 0x1000,
+                0x1000,
+            ));
+        }
+        let mut domains = IommuDomains::new(RecordingIommu::new(u32::MAX), &ranges, &doorbells())
+            .expect("the layout is buildable");
+        let translation = domains
+            .confine(EndpointId::new(0x18))
+            .expect("the device is confined");
+
+        // One doorbell window plus the folded memory windows.
+        assert_eq!(translation.windows().count(), 16);
+        // Every run the firmware named is still reachable.
+        for range in &ranges {
+            translation
+                .device_address(range.start)
+                .expect("every usable run stays mapped");
+        }
+        // And nothing below or above the map became reachable.
+        assert!(translation.device_address(0x3fff_ffff).is_err());
     }
 
     #[test]

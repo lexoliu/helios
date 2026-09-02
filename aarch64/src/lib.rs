@@ -108,6 +108,10 @@ pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
     host_fs::HostFsTransportService,
     entropy::VirtioEntropyDevice,
     block::VirtioBlockDevice,
+    // The platform's virtio devices are memory-mapped, and virtio-iommu
+    // can only confine PCI endpoints, so there is no translation unit to
+    // route faults from.
+    helios_kernel::NoExternalInterrupts,
 >;
 
 #[used]
