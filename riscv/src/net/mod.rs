@@ -35,6 +35,7 @@ pub(crate) struct ExternalInterrupts {
         VirtioNetworkDevice,
         crate::host_fs::HostFsTransportService,
         crate::entropy::VirtioEntropyDevice,
+        crate::block::VirtioBlockDevice,
     >,
 }
 
@@ -109,6 +110,11 @@ impl ExternalInterrupts {
     pub(crate) fn attach_entropy(&mut self, interrupt: crate::entropy::EntropyInterrupt) {
         self.enable_source(interrupt.source);
         self.routes.set_entropy(interrupt.source, interrupt.device);
+    }
+
+    pub(crate) fn attach_block(&mut self, interrupt: crate::block::BlockInterrupt) {
+        self.enable_source(interrupt.source);
+        self.routes.add_block(interrupt.source, interrupt.device);
     }
 
     fn enable_source(&self, source: InterruptSourceId) {
