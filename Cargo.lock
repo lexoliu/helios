@@ -1576,8 +1576,6 @@ dependencies = [
  "helios-kernel",
  "helios-virtio",
  "limine 0.6.3",
- "rand_chacha",
- "rand_core",
  "spin 0.10.0",
  "tracing",
  "triomphe",
