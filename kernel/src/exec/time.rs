@@ -227,10 +227,12 @@ mod tests {
         assert_eq!(
             duration_to_ticks(infinite, arm_frequency),
             ((u64::MAX as u128 / 1_000_000_000) * arm_frequency as u128) as u64
-                + (u64::MAX as u128 % 1_000_000_000 * arm_frequency as u128 / 1_000_000_000)
-                    as u64
+                + (u64::MAX as u128 % 1_000_000_000 * arm_frequency as u128 / 1_000_000_000) as u64
         );
-        assert_eq!(duration_to_ticks(Duration::from_secs(1), GIGAHERTZ), GIGAHERTZ);
+        assert_eq!(
+            duration_to_ticks(Duration::from_secs(1), GIGAHERTZ),
+            GIGAHERTZ
+        );
     }
 
     #[test]

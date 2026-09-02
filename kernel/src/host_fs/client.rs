@@ -1485,8 +1485,7 @@ mod tests {
         reply[P9_RGETATTR_QID_PATH..P9_RGETATTR_QID_PATH + 8]
             .copy_from_slice(&qid_path.to_le_bytes());
         reply[P9_RGETATTR_MODE..P9_RGETATTR_MODE + 4].copy_from_slice(&mode.to_le_bytes());
-        reply[P9_RGETATTR_NLINK..P9_RGETATTR_NLINK + 8]
-            .copy_from_slice(&link_count.to_le_bytes());
+        reply[P9_RGETATTR_NLINK..P9_RGETATTR_NLINK + 8].copy_from_slice(&link_count.to_le_bytes());
         reply[P9_RGETATTR_SIZE..P9_RGETATTR_SIZE + 8].copy_from_slice(&size.to_le_bytes());
         for (offset, (seconds, subnanoseconds)) in [
             (P9_RGETATTR_ATIME_SECONDS, access),

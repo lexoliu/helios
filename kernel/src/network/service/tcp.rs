@@ -718,6 +718,10 @@ where
         tcp_read_probe: Option<NetworkTcpReadProbe>,
         submit_transmit: bool,
     ) -> Result<NetworkPollOutcome, IoError> {
+        // Carrier first: a link that moved invalidates the very
+        // configuration the control plane is about to push into the
+        // shards.
+        self.synchronize_link_state();
         self.synchronize_control_plane();
         let budget = self.inner.poll.budget();
 
@@ -767,7 +771,7 @@ where
             }
 
             let receive_limit = remaining_rx_budget.min(NETWORK_RX_BATCH_FRAMES);
-            let mut frames: [Option<Bytes>; NETWORK_RX_BATCH_FRAMES] =
+            let mut frames: [Option<RxFrame>; NETWORK_RX_BATCH_FRAMES] =
                 core::array::from_fn(|_| None);
             let poll_pair = usize::from(self.inner.cpu.current_processor().id());
             let received_batch = match self
@@ -813,10 +817,7 @@ where
                 let port = peek_local_port(frame.as_ref());
                 let shard_idx = shard_idx_for_port(port, shard_count);
                 let mut shard = self.inner.state.shard_at(shard_idx).lock();
-                match shard
-                    .stack
-                    .receive_frame_bytes_with_backpressure(frame.clone(), received_at)
-                {
+                match shard.stack.receive_rx_frame(frame.clone(), received_at) {
                     Ok(backpressured) => {
                         received += 1;
                         received_bytes = received_bytes.saturating_add(frame_len);

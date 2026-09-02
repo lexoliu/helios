@@ -28,8 +28,7 @@ where
         _: DnsCap,
         host: &'a str,
         timeout_nanos: u64,
-    ) -> impl Future<Output = Result<alloc::vec::Vec<NetworkIpAddress>, crate::DnsError>> + 'a
-    {
+    ) -> impl Future<Output = Result<alloc::vec::Vec<NetworkIpAddress>, crate::DnsError>> + 'a {
         self.service.dns_resolve(host, timeout_nanos)
     }
 
@@ -526,18 +525,19 @@ mod tests {
                 4040,
                 helios_netstack::DEFAULT_HOP_LIMIT,
                 1,
-            )).unwrap(),
+            ))
+            .unwrap(),
             4040
         );
-        let listener =
-            block_on(stack.tcp_listen(
-                tcp,
-                Some(privileged),
-                TCP_ANY_V4,
-                53,
-                1,
-                helios_netstack::DEFAULT_HOP_LIMIT,
-            )).unwrap();
+        let listener = block_on(stack.tcp_listen(
+            tcp,
+            Some(privileged),
+            TCP_ANY_V4,
+            53,
+            1,
+            helios_netstack::DEFAULT_HOP_LIMIT,
+        ))
+        .unwrap();
         assert_eq!(listener.local_port, 53);
         assert_eq!(
             block_on(stack.tcp_accept(tcp, listener.listener, 1))
@@ -583,7 +583,8 @@ mod tests {
             53,
             1,
             helios_netstack::DEFAULT_HOP_LIMIT,
-        )).unwrap_err();
+        ))
+        .unwrap_err();
         assert_eq!(error.kind, crate::TcpErrorKind::PermissionDenied);
         assert_eq!(error.detail, NetworkErrorDetail::PrivilegedBindDenied);
     }
@@ -619,8 +620,8 @@ mod tests {
                 1,
                 helios_netstack::DEFAULT_HOP_LIMIT,
             ))
-                .unwrap()
-                .local_port,
+            .unwrap()
+            .local_port,
             8080
         );
     }

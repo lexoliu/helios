@@ -31,7 +31,10 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use helios_hal::io::{IoError, IoResult};
-use helios_netstack::{LinkState, RxChecksumReport, RxFrameOffload};
+use helios_netstack::{
+    ChecksumOffload, DEFAULT_POLL_BUDGET, EventDeliveryCapabilities, InterfaceCapabilities,
+    LinkState, QueueTopology, RxChecksumReport, RxFrameOffload, SegmentationOffload,
+};
 use spin::Mutex as SpinMutex;
 
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate_with};
@@ -854,12 +857,59 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     }
 
     /// Queue topology as the netstack capability struct.
-    pub fn queue_topology(&self) -> helios_netstack::QueueTopology {
-        helios_netstack::QueueTopology {
+    pub fn queue_topology(&self) -> QueueTopology {
+        QueueTopology {
             rx_queues: self.queue_pair_count(),
             tx_queues: self.queue_pair_count(),
             tx_queue_depth: self.tx_queue_depth(),
             rss: false,
+        }
+    }
+
+    /// The capability set the network stack specializes its data paths
+    /// from, as this device negotiated it.
+    ///
+    /// Every backend that owns a virtio-net device answers with this:
+    /// what the device can do follows from the feature handshake, not
+    /// from which machine the driver was instantiated on.
+    pub fn interface_capabilities(&self) -> InterfaceCapabilities {
+        InterfaceCapabilities {
+            max_frame_len: self.max_frame_len,
+            checksum: ChecksumOffload {
+                // virtio-net reports on the transport checksum only. The
+                // IPv4 header checksum is never covered by
+                // VIRTIO_NET_F_GUEST_CSUM, so the stack keeps verifying
+                // it in software.
+                rx_ipv4: false,
+                rx_tcp: self.guest_checksum_negotiated,
+                rx_udp: self.guest_checksum_negotiated,
+                tx_ipv4: false,
+                tx_tcp: self.tx_checksum_negotiated,
+                tx_udp: self.tx_checksum_negotiated,
+            },
+            segmentation: SegmentationOffload {
+                tx_tcp_ipv4: self.tso_v4_negotiated,
+                tx_tcp_ipv6: self.tso_v6_negotiated,
+                rx_tcp_ipv4: self.guest_tso_v4_negotiated,
+                rx_tcp_ipv6: self.guest_tso_v6_negotiated,
+                // The transmit entry points take one frame per chain and
+                // bound it by the interface frame size; segmentation
+                // metadata is attached per frame, not per interface.
+                max_tx_segment_bytes: self.max_frame_len,
+                max_rx_frame_bytes: self.max_receive_frame_len,
+            },
+            queues: self.queue_topology(),
+            events: EventDeliveryCapabilities {
+                polling: true,
+                interrupts: true,
+                adaptive_moderation: false,
+                rx_coalescing: false,
+                tx_coalescing: false,
+                rx_poll_budget: DEFAULT_POLL_BUDGET,
+                tx_completion_budget: DEFAULT_POLL_BUDGET,
+            },
+            direct_tx_dma: true,
+            direct_rx_dma: false,
         }
     }
 

@@ -63,12 +63,10 @@ where
         loop {
             self.drive_dns().await?;
             let now = StackInstant::from_nanos(self.now_nanos());
-            self.inner
-                .state
-                .with_mut(|state| -> Result<(), DnsError> {
-                    state.send_dns_queries(queries, host, &answers, now)?;
-                    state.poll_dns_responses(queries, &mut answers)
-                })?;
+            self.inner.state.with_mut(|state| -> Result<(), DnsError> {
+                state.send_dns_queries(queries, host, &answers, now)?;
+                state.poll_dns_responses(queries, &mut answers)
+            })?;
             if answers.complete() {
                 return answers.finish();
             }
@@ -880,13 +878,8 @@ impl NetworkShard {
                 now,
             )
         } else if let Some(server) = ipv6_server {
-            self.stack.send_udp_ipv6(
-                INTERNAL_DNS_PORT,
-                server,
-                DNS_PORT,
-                &payload[..len],
-                now,
-            )
+            self.stack
+                .send_udp_ipv6(INTERNAL_DNS_PORT, server, DNS_PORT, &payload[..len], now)
         } else {
             return Err(DnsError {
                 kind: DnsErrorKind::Unavailable,
