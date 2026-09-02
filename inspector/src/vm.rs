@@ -191,6 +191,51 @@ const X86_64_VM_PROFILE: VmProfile = VmProfile {
     watchdog: Some(VmWatchdogProfile::I6300Esb),
 };
 
+/// Virtqueue ring layout the inspector asks every virtio device for.
+///
+/// QEMU offers the packed ring only when the device is created with
+/// `packed=on`, so exercising that layout is a property of how the VM is
+/// built rather than something the guest can choose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
+pub(crate) enum VirtioRingLayout {
+    #[default]
+    Split,
+    Packed,
+}
+
+/// Whether the inspector asks every virtio device to use buffers in the
+/// order the driver made them available.
+///
+/// QEMU offers VIRTIO_F_IN_ORDER only when the device is created with
+/// `in_order=on`, so like the ring layout this is a property of how the
+/// VM is built rather than something the guest can choose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
+pub(crate) enum VirtioCompletionOrder {
+    #[default]
+    Unordered,
+    InOrder,
+}
+
+/// The virtqueue behaviour every virtio device the inspector creates is
+/// asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct VirtioQueueProfile {
+    ring: VirtioRingLayout,
+    completion: VirtioCompletionOrder,
+}
+
+impl VirtioQueueProfile {
+    /// Device property suffix that selects this profile.
+    fn device_properties(self) -> &'static str {
+        match (self.ring, self.completion) {
+            (VirtioRingLayout::Split, VirtioCompletionOrder::Unordered) => "",
+            (VirtioRingLayout::Split, VirtioCompletionOrder::InOrder) => ",in_order=on",
+            (VirtioRingLayout::Packed, VirtioCompletionOrder::Unordered) => ",packed=on",
+            (VirtioRingLayout::Packed, VirtioCompletionOrder::InOrder) => ",packed=on,in_order=on",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct VmConfigFile {
     #[serde(default)]
@@ -243,6 +288,10 @@ pub(crate) struct VmConfigFile {
     pub(crate) runtime_dir: Option<PathBuf>,
     #[serde(default)]
     pub(crate) keep_runtime_dir: Option<bool>,
+    #[serde(default)]
+    pub(crate) virtio_packed: Option<bool>,
+    #[serde(default)]
+    pub(crate) virtio_in_order: Option<bool>,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -354,6 +403,14 @@ pub(crate) struct VmCommand {
     #[arg(long, default_value_t = false)]
     keep_runtime_dir: bool,
 
+    /// Create every virtio device with the packed virtqueue layout.
+    #[arg(long, default_value_t = false)]
+    virtio_packed: bool,
+
+    /// Offer VIRTIO_F_IN_ORDER on every virtio device.
+    #[arg(long, default_value_t = false)]
+    virtio_in_order: bool,
+
     #[command(subcommand)]
     command: Option<VmSessionCommand>,
 }
@@ -436,6 +493,7 @@ struct ResolvedVmCommand {
     no_compiler_plugin: bool,
     runtime_dir: Option<PathBuf>,
     keep_runtime_dir: bool,
+    virtio_queues: VirtioQueueProfile,
     command: Option<ResolvedVmSessionCommand>,
 }
 
@@ -541,6 +599,18 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
     let runtime_dir = command.runtime_dir.or(file.runtime_dir);
     let keep_runtime_dir =
         debug || command.keep_runtime_dir || file.keep_runtime_dir.unwrap_or(false);
+    let virtio_queues = VirtioQueueProfile {
+        ring: if command.virtio_packed || file.virtio_packed.unwrap_or(false) {
+            VirtioRingLayout::Packed
+        } else {
+            VirtioRingLayout::Split
+        },
+        completion: if command.virtio_in_order || file.virtio_in_order.unwrap_or(false) {
+            VirtioCompletionOrder::InOrder
+        } else {
+            VirtioCompletionOrder::Unordered
+        },
+    };
 
     Ok(ResolvedVmCommand {
         profile,
@@ -571,6 +641,7 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
         no_compiler_plugin,
         runtime_dir,
         keep_runtime_dir,
+        virtio_queues,
         command: session_command,
     })
 }
@@ -1330,14 +1401,20 @@ impl VmRuntime {
             VmBootArtifactKind::LimineUefiDiskImage => {}
         }
         if let Some(network) = command.profile.network {
-            configure_network_device(&mut qemu, network);
+            configure_network_device(&mut qemu, network, command.virtio_queues);
         }
         if let Some(block) = command.profile.block {
-            configure_block_device(&mut qemu, block, &artifact, block_image.as_deref());
+            configure_block_device(
+                &mut qemu,
+                block,
+                &artifact,
+                block_image.as_deref(),
+                command.virtio_queues,
+            );
         }
         if let Some(host_share) = command.profile.host_share {
             if let Some(shared_dir) = &command.shared_dir {
-                configure_host_share(&mut qemu, host_share, shared_dir);
+                configure_host_share(&mut qemu, host_share, shared_dir, command.virtio_queues);
             }
         }
         if let Some(watchdog) = command.profile.watchdog {
@@ -1692,14 +1769,21 @@ fn edk2_vars_filenames(arch: VmArch) -> impl Iterator<Item = &'static str> {
     names.iter().copied()
 }
 
-fn configure_network_device(qemu: &mut Command, network: VmNetworkProfile) {
+fn configure_network_device(
+    qemu: &mut Command,
+    network: VmNetworkProfile,
+    queues: VirtioQueueProfile,
+) {
     qemu.arg("-netdev").arg("user,id=net0");
+    let properties = queues.device_properties();
     match network {
         VmNetworkProfile::VirtioMmioUser => {
-            qemu.arg("-device").arg("virtio-net-device,netdev=net0");
+            qemu.arg("-device")
+                .arg(format!("virtio-net-device,netdev=net0{properties}"));
         }
         VmNetworkProfile::VirtioPciUser => {
-            qemu.arg("-device").arg("virtio-net-pci,netdev=net0");
+            qemu.arg("-device")
+                .arg(format!("virtio-net-pci,netdev=net0{properties}"));
         }
     }
 }
@@ -1709,7 +1793,9 @@ fn configure_block_device(
     block: VmBlockProfile,
     boot_artifact: &Path,
     data_image: Option<&Path>,
+    queues: VirtioQueueProfile,
 ) {
+    let properties = queues.device_properties();
     match block {
         VmBlockProfile::VirtioMmioDataDisk => {
             let image = data_image.unwrap_or_else(|| {
@@ -1719,33 +1805,41 @@ fn configure_block_device(
                 "if=none,format=raw,file={},id=rootfs",
                 image.display()
             ));
-            qemu.arg("-device").arg("virtio-blk-device,drive=rootfs");
+            qemu.arg("-device")
+                .arg(format!("virtio-blk-device,drive=rootfs{properties}"));
         }
         VmBlockProfile::VirtioPciBootDisk => {
             qemu.arg("-drive").arg(format!(
                 "if=none,format=raw,file={},id=bootdisk",
                 boot_artifact.display()
             ));
-            qemu.arg("-device")
-                .arg("virtio-blk-pci,drive=bootdisk,bootindex=0");
+            qemu.arg("-device").arg(format!(
+                "virtio-blk-pci,drive=bootdisk,bootindex=0{properties}"
+            ));
         }
     }
 }
 
-fn configure_host_share(qemu: &mut Command, host_share: VmHostShareProfile, shared_dir: &Path) {
+fn configure_host_share(
+    qemu: &mut Command,
+    host_share: VmHostShareProfile,
+    shared_dir: &Path,
+    queues: VirtioQueueProfile,
+) {
     qemu.arg("-fsdev").arg(format!(
         "local,id=hostfs,path={},security_model=none,multidevs=remap",
         shared_dir.display()
     ));
+    let properties = queues.device_properties();
     match host_share {
         VmHostShareProfile::Virtio9pMmio => {
             qemu.arg("-device").arg(format!(
-                "virtio-9p-device,fsdev=hostfs,mount_tag={HOST_SHARE_MOUNT_TAG}"
+                "virtio-9p-device,fsdev=hostfs,mount_tag={HOST_SHARE_MOUNT_TAG}{properties}"
             ));
         }
         VmHostShareProfile::Virtio9pPci => {
             qemu.arg("-device").arg(format!(
-                "virtio-9p-pci,fsdev=hostfs,mount_tag={HOST_SHARE_MOUNT_TAG}"
+                "virtio-9p-pci,fsdev=hostfs,mount_tag={HOST_SHARE_MOUNT_TAG}{properties}"
             ));
         }
     }
@@ -1920,6 +2014,8 @@ mod tests {
             no_compiler_plugin: false,
             runtime_dir: None,
             keep_runtime_dir: false,
+            virtio_packed: false,
+            virtio_in_order: false,
             command: None,
         };
 
@@ -1974,6 +2070,8 @@ mod tests {
             no_compiler_plugin: false,
             runtime_dir: None,
             keep_runtime_dir: false,
+            virtio_packed: false,
+            virtio_in_order: false,
             command: None,
         };
 
@@ -2075,6 +2173,7 @@ mod tests {
             no_compiler_plugin: true,
             runtime_dir: None,
             keep_runtime_dir: false,
+            virtio_queues: VirtioQueueProfile::default(),
             command: None,
         }
     }
@@ -2229,6 +2328,7 @@ mod tests {
             no_compiler_plugin: false,
             runtime_dir: None,
             keep_runtime_dir: false,
+            virtio_queues: VirtioQueueProfile::default(),
             command: None,
         }
     }

@@ -12,6 +12,7 @@ event-listener = { version = "5.4.1", default-features = false, features = ["cri
 helios-hal.workspace = true
 helios-netstack.workspace = true
 pci_types = "0.10.1"
+tracing.workspace = true
 spin = { version = "0.9.8", default-features = false, features = ["mutex", "spin_mutex"] }
 thiserror = { version = "2.0.17", default-features = false }
 

@@ -65,6 +65,13 @@ const COMMON_QUEUE_DESC: usize = 0x20;
 const COMMON_QUEUE_DRIVER: usize = 0x28;
 const COMMON_QUEUE_DEVICE: usize = 0x30;
 const COMMON_CFG_BYTES: usize = 0x38;
+/// `queue_reset` of `struct virtio_pci_modern_common_cfg`, the two-byte
+/// field virtio 1.2 appended after `queue_notify_data` for
+/// VIRTIO_F_RING_RESET.
+const COMMON_QUEUE_RESET: usize = 0x3a;
+/// Bytes a common configuration window needs before `queue_reset` may be
+/// touched at all.
+const COMMON_CFG_RESET_BYTES: usize = COMMON_QUEUE_RESET + 2;
 
 /// `VIRTIO_MSI_NO_VECTOR`: no MSI-X vector is bound to the structure.
 const MSI_NO_VECTOR: u16 = 0xffff;
@@ -343,6 +350,15 @@ impl<P: DmaPool> VirtioPciTransport<P> {
         self.common.write_u16(COMMON_QUEUE_SELECT, index);
     }
 
+    /// Byte offset of `index`'s doorbell inside the notification window.
+    fn notify_offset(&self, index: u16) -> usize {
+        let notify_off = u64::from(self.notify_slot(index).load(Ordering::Acquire));
+        let offset = notify_off * u64::from(self.notify_off_multiplier);
+        usize::try_from(offset).unwrap_or_else(|_| {
+            panic!("virtio-pci notify offset {offset:#x} does not fit in usize")
+        })
+    }
+
     fn notify_slot(&self, index: u16) -> &AtomicU16 {
         self.queue_notify_offsets
             .get(usize::from(index))
@@ -460,12 +476,34 @@ impl<P: DmaPool> VirtioTransport for VirtioPciTransport<P> {
     }
 
     fn notify_queue(&self, index: u16) {
-        let notify_off = u64::from(self.notify_slot(index).load(Ordering::Acquire));
-        let offset = notify_off * u64::from(self.notify_off_multiplier);
-        let offset = usize::try_from(offset).unwrap_or_else(|_| {
-            panic!("virtio-pci notify offset {offset:#x} does not fit in usize")
-        });
-        self.notify.write_u16(offset, index);
+        self.notify.write_u16(self.notify_offset(index), index);
+    }
+
+    fn notify_queue_with_data(&self, index: u16, data: u32) {
+        self.notify.write_u32(self.notify_offset(index), data);
+    }
+
+    fn supports_queue_reset(&self) -> bool {
+        self.common.len >= COMMON_CFG_RESET_BYTES
+    }
+
+    fn reset_queue(&self, index: u16) -> IoResult<()> {
+        if !self.supports_queue_reset() {
+            return Err(IoError::Unsupported);
+        }
+        self.select_queue(index);
+        self.common.write_u16(COMMON_QUEUE_RESET, 1);
+        // Both polls are register handshakes inside the device model,
+        // not waits on software state, so spinning is the right
+        // primitive: the device clears queue_reset once it has dropped
+        // the buffers and then reports the queue as disabled.
+        while self.common.read_u16(COMMON_QUEUE_RESET) != 0 {
+            core::hint::spin_loop();
+        }
+        while self.common.read_u16(COMMON_QUEUE_ENABLE) != 0 {
+            core::hint::spin_loop();
+        }
+        Ok(())
     }
 
     fn ack_interrupt(&self) {

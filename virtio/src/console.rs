@@ -1,27 +1,37 @@
 use alloc::boxed::Box;
 
+use async_lock::Mutex as AsyncMutex;
 use helios_hal::io::{IoError, IoResult};
-use spin::Mutex;
+use spin::Mutex as SpinMutex;
 
+use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
+use crate::inflight::{InFlight, await_completion};
+use crate::notify::Notify;
 use crate::queue::VirtQueue;
-use crate::transport::{DeviceStatus, DeviceType, VirtioFeatures, VirtioTransport};
+use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 const RECEIVE_QUEUE_INDEX: u16 = 0;
 const TRANSMIT_QUEUE_INDEX: u16 = 1;
 const CONSOLE_QUEUE_SIZE: u16 = 16;
+/// Both console queues carry exactly one buffer per request.
+const CONSOLE_CHAIN_LIMIT: u16 = 1;
 const RECEIVE_BUFFER_SIZE: usize = 4096;
 const TRANSMIT_CHUNK_SIZE: usize = 4096;
 
 pub struct VirtioConsoleDevice<T: VirtioTransport> {
     transport: T,
-    receive: Mutex<ReceiveState<T>>,
-    transmit: Mutex<VirtQueue<T>>,
+    receive: SpinMutex<ReceiveState<T>>,
+    transmit: AsyncMutex<VirtQueue<T>>,
+    transmit_inflight: InFlight<{ CONSOLE_QUEUE_SIZE as usize }>,
+    interrupts: Notify,
+    features: NegotiatedFeatures,
 }
 
 struct ReceiveState<T: VirtioTransport> {
     queue: VirtQueue<T>,
     buffer: Box<[u8]>,
-    token: Option<u16>,
+    /// Whether the single receive buffer is currently with the device.
+    posted: bool,
     available: usize,
     offset: usize,
 }
@@ -32,24 +42,7 @@ impl<T: VirtioTransport> VirtioConsoleDevice<T> {
             return Err(IoError::Unsupported);
         }
 
-        transport.reset();
-        transport.set_status(DeviceStatus::ACKNOWLEDGE);
-        transport.set_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER);
-
-        let offered = transport.device_features();
-        let accepted = offered & VirtioFeatures::VERSION_1.bits();
-        if accepted & VirtioFeatures::VERSION_1.bits() == 0 {
-            return Err(IoError::Unsupported);
-        }
-
-        transport.set_driver_features(accepted);
-        transport.set_status(
-            DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER | DeviceStatus::FEATURES_OK,
-        );
-
-        if !transport.status().contains(DeviceStatus::FEATURES_OK) {
-            return Err(IoError::Unsupported);
-        }
+        let features = negotiate(&transport, RING_FEATURES)?;
 
         let receive_size = transport
             .queue_max_size(RECEIVE_QUEUE_INDEX)
@@ -69,8 +62,16 @@ impl<T: VirtioTransport> VirtioConsoleDevice<T> {
             &transport,
             RECEIVE_QUEUE_INDEX,
             receive_size,
+            CONSOLE_CHAIN_LIMIT,
+            features,
         )?);
-        let transmit = VirtQueue::new(&transport, TRANSMIT_QUEUE_INDEX, transmit_size)?;
+        let transmit = VirtQueue::new(
+            &transport,
+            TRANSMIT_QUEUE_INDEX,
+            transmit_size,
+            CONSOLE_CHAIN_LIMIT,
+            features,
+        )?;
         transport.set_status(
             DeviceStatus::ACKNOWLEDGE
                 | DeviceStatus::DRIVER
@@ -80,11 +81,25 @@ impl<T: VirtioTransport> VirtioConsoleDevice<T> {
 
         let device = Self {
             transport,
-            receive: Mutex::new(receive),
-            transmit: Mutex::new(transmit),
+            receive: SpinMutex::new(receive),
+            transmit: AsyncMutex::new(transmit),
+            transmit_inflight: InFlight::new(),
+            interrupts: Notify::new(),
+            features,
         };
         device.prime_receive_queue()?;
         Ok(device)
+    }
+
+    /// The feature set this device negotiated.
+    pub fn features(&self) -> NegotiatedFeatures {
+        self.features
+    }
+
+    /// Interrupt handlers should only acknowledge the device and wake waiters.
+    pub fn handle_interrupt(&self) {
+        self.transport.ack_interrupt();
+        self.interrupts.notify_all();
     }
 
     pub fn try_read_byte(&self) -> Option<u8> {
@@ -92,19 +107,25 @@ impl<T: VirtioTransport> VirtioConsoleDevice<T> {
         receive.try_read_byte(&self.transport)
     }
 
-    pub fn write_bytes(&self, bytes: &[u8]) -> IoResult<()> {
-        let mut queue = self.transmit.lock();
+    pub async fn write_bytes(&self, bytes: &[u8]) -> IoResult<()> {
         for chunk in bytes.chunks(TRANSMIT_CHUNK_SIZE) {
-            let mut outputs: [&mut [u8]; 0] = [];
-            let token = queue.submit(&self.transport, &[chunk], &mut outputs)?;
-            queue.notify(&self.transport);
-            loop {
-                if let Some((used, _len)) = queue.pop_used_with_len() {
-                    assert_eq!(used, token, "virtio console transmit token mismatch");
-                    break;
-                }
-                core::hint::spin_loop();
-            }
+            let token = {
+                let mut queue = self.transmit.lock().await;
+                let mut outputs: [&mut [u8]; 0] = [];
+                let token = queue.submit(&self.transport, &[chunk], &mut outputs)?;
+                queue.notify(&self.transport);
+                self.transmit_inflight.register(token);
+                token
+            };
+
+            await_completion(
+                &self.transmit_inflight,
+                &self.transmit,
+                &self.interrupts,
+                token,
+                || self.interrupts.notified(),
+            )
+            .await;
         }
         Ok(())
     }
@@ -115,12 +136,19 @@ impl<T: VirtioTransport> VirtioConsoleDevice<T> {
     }
 }
 
+impl<T: VirtioTransport> Drop for VirtioConsoleDevice<T> {
+    fn drop(&mut self) {
+        self.receive.get_mut().queue.shutdown(&self.transport);
+        self.transmit.get_mut().shutdown(&self.transport);
+    }
+}
+
 impl<T: VirtioTransport> ReceiveState<T> {
     fn new(queue: VirtQueue<T>) -> Self {
         Self {
             queue,
             buffer: alloc::vec![0_u8; RECEIVE_BUFFER_SIZE].into_boxed_slice(),
-            token: None,
+            posted: false,
             available: 0,
             offset: 0,
         }
@@ -144,12 +172,7 @@ impl<T: VirtioTransport> ReceiveState<T> {
             panic!("failed to arm virtio console receive queue: {error:?}")
         });
 
-        let (token, used_len) = self.queue.pop_used_with_len()?;
-        let expected = self
-            .token
-            .take()
-            .expect("virtio console receive completion arrived without a pending buffer");
-        assert_eq!(token, expected, "virtio console receive token mismatch");
+        let used_len = self.take_completion()?;
 
         self.available = used_len as usize;
         assert!(
@@ -179,15 +202,35 @@ impl<T: VirtioTransport> ReceiveState<T> {
         Some(byte)
     }
 
+    /// Reaps the receive buffer if the device has filled it.
+    ///
+    /// Exactly one buffer is ever outstanding, so the completion the
+    /// device publishes identifies itself: the driver does not have to
+    /// match a descriptor identifier against the one it submitted, which
+    /// would be an assumption about completion order that EVENT_IDX and
+    /// IN_ORDER both allow the device to break.
+    fn take_completion(&mut self) -> Option<u32> {
+        let mut completion = None;
+        self.queue.drain_used(|_id, len| {
+            assert!(
+                completion.replace(len).is_none(),
+                "virtio console completed more receive buffers than were posted"
+            );
+        });
+        let len = completion?;
+        self.posted = false;
+        Some(len)
+    }
+
     fn queue_buffer(&mut self, transport: &T) -> IoResult<()> {
-        if self.token.is_some() || self.available != 0 {
+        if self.posted || self.available != 0 {
             return Ok(());
         }
 
         let mut outputs = [self.buffer.as_mut()];
-        let token = self.queue.submit(transport, &[], &mut outputs)?;
+        self.queue.submit(transport, &[], &mut outputs)?;
         self.queue.notify(transport);
-        self.token = Some(token);
+        self.posted = true;
         Ok(())
     }
 }

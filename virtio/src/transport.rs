@@ -72,6 +72,10 @@ bitflags! {
         const RING_INDIRECT_DESC = 1 << 28;
         const RING_EVENT_IDX = 1 << 29;
         const VERSION_1 = 1 << 32;
+        const RING_PACKED = 1 << 34;
+        const IN_ORDER = 1 << 35;
+        const NOTIFICATION_DATA = 1 << 38;
+        const RING_RESET = 1 << 40;
     }
 }
 
@@ -95,6 +99,26 @@ pub trait VirtioTransport: Send + Sync + 'static {
         device_area: u64,
     );
     fn notify_queue(&self, index: u16);
+
+    /// Kicks `index` carrying a VIRTIO_F_NOTIFICATION_DATA payload.
+    ///
+    /// `data` already encodes the queue index in its low half and the
+    /// ring position the driver has published up to in its high half;
+    /// the transport only has to deliver the whole word to the
+    /// notification register.
+    fn notify_queue_with_data(&self, index: u16, data: u32);
+
+    /// Whether this transport exposes a per-queue reset register, and
+    /// therefore whether VIRTIO_F_RING_RESET may be negotiated at all.
+    fn supports_queue_reset(&self) -> bool;
+
+    /// Resets a single virtqueue on the device side.
+    ///
+    /// On return the device has dropped every buffer the driver made
+    /// available on `index` and the queue is disabled; the driver
+    /// re-programs it through [`VirtioTransport::set_queue`].
+    fn reset_queue(&self, index: u16) -> IoResult<()>;
+
     fn ack_interrupt(&self);
     fn read_config_u32(&self, offset: usize) -> u32;
 
@@ -202,6 +226,24 @@ impl<B: DeviceBus> VirtioTransport for VirtioMmioTransport<B> {
         self.bus.write_u32(REG_QUEUE_NOTIFY, u32::from(index));
     }
 
+    fn notify_queue_with_data(&self, _index: u16, data: u32) {
+        self.bus.write_u32(REG_QUEUE_NOTIFY, data);
+    }
+
+    fn supports_queue_reset(&self) -> bool {
+        // The virtio-mmio register layout (virtio 1.2 §4.2.2) has no
+        // per-queue reset register: QueueReady only gates whether the
+        // device may use a queue, and clearing it is not defined to
+        // drop the buffers already made available. VIRTIO_F_RING_RESET
+        // is therefore unreachable over this transport, and
+        // `negotiate` masks the bit out for us.
+        false
+    }
+
+    fn reset_queue(&self, _index: u16) -> IoResult<()> {
+        Err(IoError::Unsupported)
+    }
+
     fn ack_interrupt(&self) {
         let status = self.bus.read_u32(REG_INTERRUPT_STATUS);
         if status != 0 {
@@ -220,75 +262,22 @@ impl<B: DeviceBus> VirtioTransport for VirtioMmioTransport<B> {
 
 #[cfg(test)]
 mod tests {
-    use core::cell::UnsafeCell;
-
     use super::{
-        DeviceStatus, DeviceType, REG_DEVICE_FEATURES, REG_DEVICE_FEATURES_SEL, REG_DEVICE_ID,
-        REG_DRIVER_FEATURES, REG_DRIVER_FEATURES_SEL, REG_INTERRUPT_ACK, REG_INTERRUPT_STATUS,
-        REG_MAGIC_VALUE, REG_QUEUE_DESC_HIGH, REG_QUEUE_DESC_LOW, REG_QUEUE_DEVICE_HIGH,
+        DeviceStatus, DeviceType, REG_DRIVER_FEATURES, REG_DRIVER_FEATURES_SEL, REG_INTERRUPT_ACK,
+        REG_INTERRUPT_STATUS, REG_QUEUE_DESC_HIGH, REG_QUEUE_DESC_LOW, REG_QUEUE_DEVICE_HIGH,
         REG_QUEUE_DEVICE_LOW, REG_QUEUE_DRIVER_HIGH, REG_QUEUE_DRIVER_LOW, REG_QUEUE_NOTIFY,
-        REG_QUEUE_NUM, REG_QUEUE_NUM_MAX, REG_QUEUE_READY, REG_QUEUE_SEL, REG_STATUS, REG_VERSION,
-        VirtioFeatures, VirtioMmioTransport, VirtioTransport,
+        REG_QUEUE_NUM, REG_QUEUE_READY, REG_QUEUE_SEL, REG_STATUS, VirtioFeatures,
+        VirtioMmioTransport, VirtioTransport,
     };
-    use crate::bus::{DeviceBus, IdentityDmaPool};
-
-    struct FakeBus {
-        regs: UnsafeCell<[u32; 128]>,
-        dma: IdentityDmaPool,
-    }
-
-    impl FakeBus {
-        fn new() -> Self {
-            let mut regs = [0u32; 128];
-            regs[REG_MAGIC_VALUE / 4] = 0x7472_6976;
-            regs[REG_VERSION / 4] = 2;
-            regs[REG_DEVICE_ID / 4] = DeviceType::Block as u32;
-            regs[REG_QUEUE_NUM_MAX / 4] = 16;
-            regs[0x100 / 4] = 0xfeed_beef;
-            Self {
-                regs: UnsafeCell::new(regs),
-                dma: IdentityDmaPool,
-            }
-        }
-
-        fn regs(&self) -> &[u32; 128] {
-            unsafe { &*self.regs.get() }
-        }
-    }
-
-    impl DeviceBus for FakeBus {
-        type DmaPool = IdentityDmaPool;
-
-        fn read_u32(&self, offset: usize) -> u32 {
-            if offset == REG_DEVICE_FEATURES {
-                let selector = self.regs()[REG_DEVICE_FEATURES_SEL / 4];
-                return match selector {
-                    0 => VirtioFeatures::RING_EVENT_IDX.bits() as u32,
-                    1 => (VirtioFeatures::VERSION_1.bits() >> 32) as u32,
-                    value => panic!("unexpected device feature selector {value}"),
-                };
-            }
-
-            self.regs()[offset / 4]
-        }
-
-        fn write_u32(&self, offset: usize, value: u32) {
-            unsafe {
-                (*self.regs.get())[offset / 4] = value;
-            }
-        }
-
-        fn dma(&self) -> &Self::DmaPool {
-            &self.dma
-        }
-    }
-
-    unsafe impl Send for FakeBus {}
-    unsafe impl Sync for FakeBus {}
+    use crate::bus::DeviceBus;
+    use crate::testing::MmioRegisterBus;
 
     #[test]
     fn mmio_transport_reads_identity_and_programs_queue() {
-        let bus = FakeBus::new();
+        let bus = MmioRegisterBus::new(
+            DeviceType::Block,
+            VirtioFeatures::RING_EVENT_IDX.bits() | VirtioFeatures::VERSION_1.bits(),
+        );
         let transport = VirtioMmioTransport::new(bus).expect("transport should initialize");
 
         assert_eq!(transport.device_type(), DeviceType::Block);
@@ -298,11 +287,11 @@ mod tests {
         );
 
         transport.set_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER);
-        assert_eq!(transport.bus().regs()[REG_STATUS / 4], 0b11);
+        assert_eq!(transport.bus().register(REG_STATUS), 0b11);
 
         transport.set_driver_features(VirtioFeatures::VERSION_1.bits());
-        assert_eq!(transport.bus().regs()[REG_DRIVER_FEATURES_SEL / 4], 1);
-        assert_eq!(transport.bus().regs()[REG_DRIVER_FEATURES / 4], 1);
+        assert_eq!(transport.bus().register(REG_DRIVER_FEATURES_SEL), 1);
+        assert_eq!(transport.bus().register(REG_DRIVER_FEATURES), 1);
 
         transport.set_queue(
             0,
@@ -311,35 +300,39 @@ mod tests {
             0x99aa_bbcc_ddee_ff00,
             0x1234_5678_9abc_def0,
         );
-        assert_eq!(transport.bus().regs()[REG_QUEUE_SEL / 4], 0);
-        assert_eq!(transport.bus().regs()[REG_QUEUE_NUM / 4], 8);
-        assert_eq!(transport.bus().regs()[REG_QUEUE_DESC_LOW / 4], 0x5566_7788);
-        assert_eq!(transport.bus().regs()[REG_QUEUE_DESC_HIGH / 4], 0x1122_3344);
-        assert_eq!(
-            transport.bus().regs()[REG_QUEUE_DRIVER_LOW / 4],
-            0xddee_ff00
-        );
-        assert_eq!(
-            transport.bus().regs()[REG_QUEUE_DRIVER_HIGH / 4],
-            0x99aa_bbcc
-        );
-        assert_eq!(
-            transport.bus().regs()[REG_QUEUE_DEVICE_LOW / 4],
-            0x9abc_def0
-        );
-        assert_eq!(
-            transport.bus().regs()[REG_QUEUE_DEVICE_HIGH / 4],
-            0x1234_5678
-        );
-        assert_eq!(transport.bus().regs()[REG_QUEUE_READY / 4], 1);
+        assert_eq!(transport.bus().register(REG_QUEUE_SEL), 0);
+        assert_eq!(transport.bus().register(REG_QUEUE_NUM), 8);
+        assert_eq!(transport.bus().register(REG_QUEUE_DESC_LOW), 0x5566_7788);
+        assert_eq!(transport.bus().register(REG_QUEUE_DESC_HIGH), 0x1122_3344);
+        assert_eq!(transport.bus().register(REG_QUEUE_DRIVER_LOW), 0xddee_ff00);
+        assert_eq!(transport.bus().register(REG_QUEUE_DRIVER_HIGH), 0x99aa_bbcc);
+        assert_eq!(transport.bus().register(REG_QUEUE_DEVICE_LOW), 0x9abc_def0);
+        assert_eq!(transport.bus().register(REG_QUEUE_DEVICE_HIGH), 0x1234_5678);
+        assert_eq!(transport.bus().register(REG_QUEUE_READY), 1);
 
         transport.bus().write_u32(REG_INTERRUPT_STATUS, 3);
         transport.ack_interrupt();
-        assert_eq!(transport.bus().regs()[REG_INTERRUPT_ACK / 4], 3);
+        assert_eq!(transport.bus().register(REG_INTERRUPT_ACK), 3);
 
         transport.notify_queue(0);
-        assert_eq!(transport.bus().regs()[REG_QUEUE_NOTIFY / 4], 0);
+        assert_eq!(transport.bus().register(REG_QUEUE_NOTIFY), 0);
+
+        // VIRTIO_F_NOTIFICATION_DATA replaces the bare queue index with
+        // the index plus the published ring position.
+        transport.notify_queue_with_data(0, 0x0007_0000);
+        assert_eq!(transport.bus().register(REG_QUEUE_NOTIFY), 0x0007_0000);
 
         assert_eq!(transport.read_config_u32(0), 0xfeed_beef);
+    }
+
+    #[test]
+    fn mmio_transport_cannot_reset_a_single_queue() {
+        let bus = MmioRegisterBus::new(DeviceType::Block, VirtioFeatures::VERSION_1.bits());
+        let transport = VirtioMmioTransport::new(bus).expect("transport should initialize");
+
+        assert!(!transport.supports_queue_reset());
+        transport
+            .reset_queue(0)
+            .expect_err("virtio-mmio defines no per-queue reset register");
     }
 }

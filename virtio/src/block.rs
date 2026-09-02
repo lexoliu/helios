@@ -8,19 +8,25 @@ use helios_hal::io::{IoError, IoResult};
 use helios_hal::resource::KernelResource;
 use helios_hal::vmm::SwapBackend;
 
+use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
+use crate::inflight::{InFlight, await_completion};
 use crate::notify::Notify;
 use crate::queue::VirtQueue;
-use crate::transport::{DeviceStatus, DeviceType, VirtioFeatures, VirtioTransport};
+use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
 
 pub const SECTOR_SIZE: usize = 512;
 const BLOCK_QUEUE_INDEX: u16 = 0;
 const BLOCK_QUEUE_SIZE: u16 = 16;
+/// A request carries a header, one data buffer and a status byte.
+const BLOCK_CHAIN_LIMIT: u16 = 3;
 const BLK_FEATURE_RO: u64 = 1 << 5;
 
 pub struct VirtioBlockDevice<T: VirtioTransport> {
     transport: T,
     queue: Mutex<VirtQueue<T>>,
+    inflight: InFlight<{ BLOCK_QUEUE_SIZE as usize }>,
     interrupts: Notify,
+    features: NegotiatedFeatures,
     capacity_blocks: usize,
     readonly: bool,
 }
@@ -105,23 +111,7 @@ impl<T: VirtioTransport> VirtioBlockDevice<T> {
             return Err(IoError::Unsupported);
         }
 
-        transport.reset();
-        transport.set_status(DeviceStatus::ACKNOWLEDGE);
-        transport.set_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER);
-
-        let offered = transport.device_features();
-        let accepted = offered & (VirtioFeatures::VERSION_1.bits() | BLK_FEATURE_RO);
-        if accepted & VirtioFeatures::VERSION_1.bits() == 0 {
-            return Err(IoError::Unsupported);
-        }
-        transport.set_driver_features(accepted);
-        transport.set_status(
-            DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER | DeviceStatus::FEATURES_OK,
-        );
-
-        if !transport.status().contains(DeviceStatus::FEATURES_OK) {
-            return Err(IoError::Unsupported);
-        }
+        let features = negotiate(&transport, RING_FEATURES | BLK_FEATURE_RO)?;
 
         let capacity_low = transport.read_config_u32(0) as u64;
         let capacity_high = transport.read_config_u32(4) as u64;
@@ -135,7 +125,13 @@ impl<T: VirtioTransport> VirtioBlockDevice<T> {
             return Err(IoError::Unsupported);
         }
 
-        let queue = VirtQueue::new(&transport, BLOCK_QUEUE_INDEX, queue_size)?;
+        let queue = VirtQueue::new(
+            &transport,
+            BLOCK_QUEUE_INDEX,
+            queue_size,
+            BLOCK_CHAIN_LIMIT,
+            features,
+        )?;
         transport.set_status(
             DeviceStatus::ACKNOWLEDGE
                 | DeviceStatus::DRIVER
@@ -146,10 +142,17 @@ impl<T: VirtioTransport> VirtioBlockDevice<T> {
         Ok(Self {
             transport,
             queue: Mutex::new(queue),
+            inflight: InFlight::new(),
             interrupts: Notify::new(),
+            features,
             capacity_blocks,
-            readonly: accepted & BLK_FEATURE_RO != 0,
+            readonly: features.device(BLK_FEATURE_RO),
         })
+    }
+
+    /// The feature set this device negotiated.
+    pub fn features(&self) -> NegotiatedFeatures {
+        self.features
     }
 
     pub fn into_resource(self, rights: BlockDeviceRights) -> VirtioBlockResource<T> {
@@ -183,18 +186,7 @@ impl<T: VirtioTransport> VirtioBlockDevice<T> {
         let response_bytes = as_bytes_mut(&mut response);
         let mut outputs = [buf, response_bytes];
 
-        let mut queue = self.queue.lock().await;
-        let token = queue.submit(&self.transport, &[request_bytes], &mut outputs)?;
-        queue.notify(&self.transport);
-
-        loop {
-            if let Some(used) = queue.pop_used() {
-                assert_eq!(used, token, "virtio block completion token mismatch");
-                break;
-            }
-            self.interrupts.notified().await;
-        }
-
+        self.execute(&[request_bytes], &mut outputs).await?;
         map_block_status(response.status)
     }
 
@@ -209,19 +201,38 @@ impl<T: VirtioTransport> VirtioBlockDevice<T> {
         let response_bytes = as_bytes_mut(&mut response);
         let mut outputs = [response_bytes];
 
-        let mut queue = self.queue.lock().await;
-        let token = queue.submit(&self.transport, &[request_bytes, buf], &mut outputs)?;
-        queue.notify(&self.transport);
-
-        loop {
-            if let Some(used) = queue.pop_used() {
-                assert_eq!(used, token, "virtio block completion token mismatch");
-                break;
-            }
-            self.interrupts.notified().await;
-        }
-
+        self.execute(&[request_bytes, buf], &mut outputs).await?;
         map_block_status(response.status)
+    }
+
+    /// Submits one request chain and waits for its completion.
+    ///
+    /// The completion is routed by descriptor identifier: whichever task
+    /// wins the queue lock after an interrupt drains everything the
+    /// device published, so a device that finishes requests out of order
+    /// — which EVENT_IDX and IN_ORDER both permit — is handled without
+    /// any task assuming the completion it sees is its own.
+    async fn execute(&self, inputs: &[&[u8]], outputs: &mut [&mut [u8]]) -> IoResult<u32> {
+        let token = {
+            let mut queue = self.queue.lock().await;
+            let token = queue.submit(&self.transport, inputs, outputs)?;
+            queue.notify(&self.transport);
+            self.inflight.register(token);
+            token
+        };
+
+        Ok(
+            await_completion(&self.inflight, &self.queue, &self.interrupts, token, || {
+                self.interrupts.notified()
+            })
+            .await,
+        )
+    }
+}
+
+impl<T: VirtioTransport> Drop for VirtioBlockDevice<T> {
+    fn drop(&mut self) {
+        self.queue.get_mut().shutdown(&self.transport);
     }
 }
 

@@ -1892,6 +1892,7 @@ dependencies = [
  "pci_types",
  "spin 0.9.8",
  "thiserror 2.0.18",
+ "tracing",
  "zerocopy",
 ]
 
