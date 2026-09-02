@@ -237,6 +237,27 @@ steady-state comparisons. `--compiler-timing` adds a cranelift pass
 breakdown to the log; use it for diagnosis when a regression appears,
 not for the canonical baseline.
 
+Network-path changes take a second baseline, because the compiler
+workload never touches the NIC. The canonical network workload is
+`tcp-throughput` on a multi-queue backend — `user` (slirp) is a
+single-queue, no-offload path and is not valid evidence for anything the
+virtio-net driver negotiates:
+
+```bash
+helios-inspector vm net-setup \
+    --net-backend tap --net-ifname helios0 --net-bridge helios-br0 --net-dhcp
+./target/release/helios-inspector vm --arch aarch64 --release \
+    --net-backend tap --net-ifname helios0 --net-bridge helios-br0 \
+    --net-queues "$(nproc)" \
+    workload-bench --workload tcp-throughput --iterations 5 \
+    | tee target/perf-baselines/aarch64-tap-tcp-<short-sha>.jsonl
+```
+
+Cite the negotiated feature set alongside the median: the `virtio-net
+online` boot line records the queue-pair count and the checksum/TSO bits
+the run actually had. `docs/networking.md` covers the backends, the
+privileged setup, and what each one can exercise.
+
 ## 3.6 Architectural ambition
 
 - Performance, scalability, and architectural cleanliness work must
