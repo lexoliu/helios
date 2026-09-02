@@ -56,6 +56,12 @@ const BALLOON_IOTHREAD_ID: &str = "balloon-io";
 /// How long the guest's reported balloon size has to hold still before a
 /// wait calls it settled short of the target it was given.
 const BALLOON_STILL_FOR: Duration = Duration::from_secs(10);
+/// How much of QEMU's log a failed session quotes.
+///
+/// The log holds QEMU's own stdout and stderr and stays small, because
+/// the guest console goes to the serial socket instead; the cap is there
+/// so a `-d` trace run cannot bury the error that matters.
+const QEMU_REPORT_TAIL_BYTES: usize = 8192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -750,14 +756,13 @@ pub(crate) fn run(mut command: VmCommand) -> Result<()> {
     let mut runtime = VmRuntime::spawn(&command)?;
     let result = connect_and_run(&command, &mut runtime);
     let runtime_dir = runtime.runtime_dir_path().to_path_buf();
-    // QEMU can die after the debug serial socket exists — a device the
-    // host cannot back fails during realization — and then nothing on
-    // the RPC path can say why. Read its epitaph before the runtime
-    // directory is torn down.
-    let epitaph = result.is_err().then(|| runtime.qemu_epitaph()).flatten();
+    // QEMU's own log is the only account of a machine it refused to
+    // build or a device backend that never started, and the runtime
+    // directory is about to go away, so a failed session reads it here.
+    let report = result.is_err().then(|| runtime.qemu_report());
     runtime.shutdown();
-    result.with_context(|| match &epitaph {
-        Some(epitaph) => format!("VM runtime directory: {}\n{epitaph}", runtime_dir.display()),
+    result.with_context(|| match &report {
+        Some(report) => format!("VM runtime directory: {}\n{report}", runtime_dir.display()),
         None => format!("VM runtime directory: {}", runtime_dir.display()),
     })
 }
@@ -2011,22 +2016,28 @@ impl VmRuntime {
         self.runtime_dir.path()
     }
 
-    /// What QEMU said on its way out, when it left before the session
-    /// did.
+    /// What QEMU has to say about a session that failed.
     ///
     /// QEMU writes its own diagnostics to the runtime directory's log,
-    /// and a machine it refuses to build — a `-device` the host cannot
-    /// back, a property the model rejects — kills it there. Returns
-    /// `None` while QEMU is still running, so a failure that is the
-    /// guest's own carries no misleading epitaph.
-    fn qemu_epitaph(&mut self) -> Option<String> {
-        let status = self.child.try_wait().ok().flatten()?;
+    /// and they are the only account of two failures the RPC path
+    /// cannot see: a machine QEMU refused to build, and a device whose
+    /// host backend never started — a `vhost` backend that gave up
+    /// leaves the device in place, answering configuration reads and
+    /// carrying no traffic at all. The exit status joins the report when
+    /// QEMU is already gone.
+    fn qemu_report(&mut self) -> String {
         let log = fs::read(&self.qemu_log).unwrap_or_default();
-        Some(format!(
-            "QEMU exited with {status}; {} says:\n{}",
+        let start = log.len().saturating_sub(QEMU_REPORT_TAIL_BYTES);
+        let tail = String::from_utf8_lossy(&log[start..]);
+        let epitaph = match self.child.try_wait().ok().flatten() {
+            Some(status) => format!("QEMU exited with {status}"),
+            None => "QEMU was still running".to_owned(),
+        };
+        format!(
+            "{epitaph}; {} says:\n{}",
             self.qemu_log.display(),
-            String::from_utf8_lossy(&log).trim_end()
-        ))
+            tail.trim()
+        )
     }
 
     fn shutdown(&mut self) {
