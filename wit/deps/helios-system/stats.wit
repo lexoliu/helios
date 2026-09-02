@@ -34,11 +34,35 @@ interface stats {
     pressure: memory-pressure,
   }
 
+  /// The block device the kernel owns, as it identified it at boot.
+  record block-device {
+    capacity-bytes: u64,
+    block-bytes: u32,
+    physical-block-bytes: u32,
+    /// Whether the device commits a volatile write cache on request.
+    flush: bool,
+    /// Whether the device accepts deallocation hints.
+    discard: bool,
+    /// Whether the device writes runs of zeroes without carrying them.
+    write-zeroes: bool,
+    /// Independent request queues, and requests each may keep in flight.
+    queues: u32,
+    queue-depth: u32,
+    /// Requests the kernel has issued, by kind.
+    reads: u64,
+    writes: u64,
+    flushes: u64,
+    discards: u64,
+    write-zeroes-requests: u64,
+  }
+
   record sample {
     timestamp: mono-nanos,
     uptime: mono-nanos,
     processors: processors,
     memory: memory,
+    /// Absent on a machine that gave the kernel no block device.
+    block: option<block-device>,
   }
 
   /// Returns the latest coherent system-wide observation snapshot.

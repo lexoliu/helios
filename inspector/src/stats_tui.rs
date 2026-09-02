@@ -202,11 +202,16 @@ fn draw_main_panels(
 
     let panels = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+        .constraints([
+            Constraint::Percentage(45),
+            Constraint::Percentage(25),
+            Constraint::Percentage(30),
+        ])
         .split(sections[0]);
 
     draw_cpu_chart(frame, panels[0], sample);
     draw_memory_panel(frame, panels[1], sample);
+    draw_block_panel(frame, panels[2], sample);
     draw_instances_panel(frame, sections[1], instances);
 }
 
@@ -363,6 +368,71 @@ fn draw_memory_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats:
     .block(Block::default().title("Memory").borders(Borders::ALL))
     .wrap(Wrap { trim: true });
     frame.render_widget(details, layout[2]);
+}
+
+/// The block device the kernel identified at boot, or the fact that it
+/// has none.
+fn draw_block_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Sample) {
+    let lines = match &sample.block {
+        Some(block) => {
+            let mut features = Vec::new();
+            if block.flush {
+                features.push("flush");
+            }
+            if block.discard {
+                features.push("discard");
+            }
+            if block.write_zeroes {
+                features.push("write-zeroes");
+            }
+            if features.is_empty() {
+                features.push("none");
+            }
+            vec![
+                block_line("capacity", format_bytes(block.capacity_bytes)),
+                block_line(
+                    "block",
+                    format!(
+                        "{} logical / {} physical",
+                        format_bytes(u64::from(block.block_bytes)),
+                        format_bytes(u64::from(block.physical_block_bytes))
+                    ),
+                ),
+                block_line(
+                    "queues",
+                    format!("{} x {} deep", block.queues, block.queue_depth),
+                ),
+                block_line("offloads", features.join(" ")),
+                block_line(
+                    "requests",
+                    format!(
+                        "{} read  {} write  {} flush  {} discard  {} zero",
+                        block.reads,
+                        block.writes,
+                        block.flushes,
+                        block.discards,
+                        block.write_zeroes_requests
+                    ),
+                ),
+            ]
+        }
+        None => vec![Line::from(Span::styled(
+            "no block device",
+            Style::default().fg(Color::DarkGray),
+        ))],
+    };
+
+    let panel = Paragraph::new(Text::from(lines))
+        .block(Block::default().title("Disk").borders(Borders::ALL))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(panel, area);
+}
+
+fn block_line(label: &'static str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<9}"), Style::default().fg(Color::Cyan)),
+        Span::raw(value),
+    ])
 }
 
 fn render_card(

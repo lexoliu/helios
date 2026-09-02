@@ -59,6 +59,9 @@ pub struct StatsSample {
     pub uptime: u64,
     pub configured_processors: u32,
     pub online_processors: u32,
+    /// The block device the kernel owns, absent on a machine that gave
+    /// it none.
+    pub block: Option<crate::BlockStats>,
 }
 
 #[derive(Clone, Debug)]

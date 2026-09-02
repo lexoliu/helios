@@ -27,7 +27,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use helios_hal::cpu::Cpu;
 use helios_hal::fs::{
-    BlockDevice, BlockDeviceCapabilities, BlockDeviceRights, BlockGeometry, BlockRange, BlockSerial,
+    BlockDevice, BlockDeviceCapabilities, BlockDeviceRights, BlockGeometry, BlockQueueTopology,
+    BlockRange, BlockSerial,
 };
 use helios_hal::io::{IoError, IoResult};
 use helios_hal::resource::KernelResource;
@@ -1073,6 +1074,13 @@ impl<T: VirtioTransport, C: QueueAffinity> BlockDevice for VirtioBlockResource<T
     fn capabilities(&self) -> BlockDeviceCapabilities {
         self.object().capabilities
     }
+
+    fn queue_topology(&self) -> BlockQueueTopology {
+        BlockQueueTopology {
+            queues: self.object().queue_count(),
+            depth: self.object().queue_depth(),
+        }
+    }
 }
 
 impl<D: BlockDevice + 'static> SwapBackend for VirtioBlockSwapBackend<D> {
@@ -1862,6 +1870,13 @@ mod tests {
 
         fn capabilities(&self) -> BlockDeviceCapabilities {
             BlockDeviceCapabilities::FLUSH
+        }
+
+        fn queue_topology(&self) -> BlockQueueTopology {
+            BlockQueueTopology {
+                queues: 1,
+                depth: 1,
+            }
         }
     }
 

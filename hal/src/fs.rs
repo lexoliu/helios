@@ -289,6 +289,17 @@ impl BlockGeometry {
     }
 }
 
+/// How many requests a block device can have in flight, and across how
+/// many independent queues it spreads them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockQueueTopology {
+    /// Independent request queues. More than one means requests
+    /// submitted from different processors do not contend.
+    pub queues: usize,
+    /// Requests one queue may keep in flight.
+    pub depth: usize,
+}
+
 pub trait BlockDevice: Send + Sync {
     fn read_block(
         &self,
@@ -332,6 +343,9 @@ pub trait BlockDevice: Send + Sync {
 
     /// Operations this device implements beyond read and write.
     fn capabilities(&self) -> BlockDeviceCapabilities;
+
+    /// Request queues and pipeline depth this device is driven with.
+    fn queue_topology(&self) -> BlockQueueTopology;
 
     fn block_size(&self) -> usize {
         self.geometry().logical_block_bytes

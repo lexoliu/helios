@@ -3701,6 +3701,38 @@ where
     convert_program_sample(store.runtime_state.snapshot(store.cpu.now().ticks()))
 }
 
+/// Maps the kernel's block-device snapshot onto one binding set's
+/// `block-device` record.
+///
+/// The debugger world and the program world generate distinct Rust types
+/// for the same WIT record, so the field mapping is written once here and
+/// instantiated for each of them.
+macro_rules! convert_block_stats {
+    ($bindings:path, $block:expr) => {
+        $block.map(|block: crate::BlockStats| {
+            use $bindings as stats_bindings;
+            let capabilities =
+                helios_hal::fs::BlockDeviceCapabilities::from_bits_truncate(block.capabilities);
+            stats_bindings::BlockDevice {
+                capacity_bytes: block.capacity_bytes,
+                block_bytes: block.block_bytes,
+                physical_block_bytes: block.physical_block_bytes,
+                flush: capabilities.contains(helios_hal::fs::BlockDeviceCapabilities::FLUSH),
+                discard: capabilities.contains(helios_hal::fs::BlockDeviceCapabilities::DISCARD),
+                write_zeroes: capabilities
+                    .contains(helios_hal::fs::BlockDeviceCapabilities::WRITE_ZEROES),
+                queues: block.queues,
+                queue_depth: block.queue_depth,
+                reads: block.reads,
+                writes: block.writes,
+                flushes: block.flushes,
+                discards: block.discards,
+                write_zeroes_requests: block.write_zeroes,
+            }
+        })
+    };
+}
+
 fn convert_sample(sample: StatsSample) -> debugger_bindings::helios::system::stats::Sample {
     let heap = heap_stats();
     let total_bytes =
@@ -3722,6 +3754,7 @@ fn convert_sample(sample: StatsSample) -> debugger_bindings::helios::system::sta
             available_bytes,
             pressure: convert_memory_pressure(total_bytes, available_bytes),
         },
+        block: convert_block_stats!(debugger_bindings::helios::system::stats, sample.block),
     }
 }
 
@@ -3746,6 +3779,7 @@ fn convert_program_sample(sample: StatsSample) -> program_bindings::helios::syst
             available_bytes,
             pressure: convert_program_memory_pressure(total_bytes, available_bytes),
         },
+        block: convert_block_stats!(program_bindings::helios::system::stats, sample.block),
     }
 }
 
