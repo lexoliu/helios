@@ -149,6 +149,10 @@ jobs:
     name: bench-${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
+    env:
+      HELIOS_NET_IFNAME: helios0
+      HELIOS_NET_BRIDGE: helios-br0
+      NET_BOOT_LOG: ${{ github.workspace }}/helios-bench-boot.log
     strategy:
       fail-fast: false
       matrix:
@@ -163,18 +167,33 @@ jobs:
             # KVM boots in seconds; a marker hang should fail fast.
             boot-timeout: "300"
             workloads: ""
+            # Linux runners allow sudo, so the network workloads run over
+            # a multi-queue tap with vhost-net: the only host packet path
+            # on which the guest's virtio-net multiqueue, checksum and
+            # TSO paths exist at all. See docs/networking.md.
+            net-backend: tap
+            net-host: 10.77.0.1
           - name: aarch64-linux
             runner: ubuntu-24.04-arm
             helios-arch: aarch64
             vm-memory: 2G
             boot-timeout: "3600"
             workloads: ""
+            net-backend: tap
+            net-host: 10.77.0.1
           - name: aarch64-macos
             runner: macos-15
             helios-arch: aarch64
             vm-memory: 2G
             boot-timeout: "3600"
             workloads: ""
+            # GitHub's macOS runners can hold neither the
+            # com.apple.vm.networking entitlement nor a socket_vmnet
+            # launchd daemon, so this lane stays on slirp: single queue,
+            # no offload. Its network numbers are not comparable with the
+            # Linux lanes'.
+            net-backend: user
+            net-host: 10.0.2.2
     steps:
       - uses: actions/checkout@v4
         with:
@@ -186,7 +205,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libudev-dev just cmake ninja-build \
-            qemu-system-x86 ovmf qemu-system-arm qemu-efi-aarch64
+            qemu-system-x86 ovmf qemu-system-arm qemu-efi-aarch64 \
+            iproute2 nftables dnsmasq-base
           # GitHub's x86-64 runners expose /dev/kvm; the inspector picks
           # the accelerator by capability, this only fixes permissions.
           if [ -e /dev/kvm ]; then
@@ -229,6 +249,15 @@ jobs:
       - name: Build inspector
         working-directory: helios
         run: cargo build --release -p helios-inspector
+      - name: Provision the multi-queue tap network backend
+        if: matrix.net-backend == 'tap'
+        working-directory: helios
+        run: |
+          ./target/release/helios-inspector vm net-setup \
+            --net-backend tap \
+            --net-ifname "${HELIOS_NET_IFNAME}" \
+            --net-bridge "${HELIOS_NET_BRIDGE}" \
+            --net-dhcp
       - name: Run Helios workload benchmarks
         working-directory: helios
         env:
@@ -236,14 +265,52 @@ jobs:
           HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
           HELIOS_BOOT_SYNC_TIMEOUT_SECS: ${{ matrix.boot-timeout }}
           HELIOS_WORKLOAD_BENCH_VM_MEMORY: ${{ matrix.vm-memory }}
+          HELIOS_WORKLOAD_BENCH_NET_BACKEND: ${{ matrix.net-backend }}
         run: |
+          if [ "${{ matrix.net-backend }}" = tap ]; then
+            export HELIOS_WORKLOAD_BENCH_NET_IFNAME="${HELIOS_NET_IFNAME}"
+            export HELIOS_WORKLOAD_BENCH_NET_BRIDGE="${HELIOS_NET_BRIDGE}"
+            # One queue pair per host processor: the point of the tap
+            # backend is that the guest driver can actually fan out.
+            HELIOS_WORKLOAD_BENCH_NET_QUEUES="$(nproc)"
+            export HELIOS_WORKLOAD_BENCH_NET_QUEUES
+          fi
+          # The inspector echoes the guest's boot lines on stderr; the
+          # log is kept so the next step can record which virtio-net
+          # features this lane actually negotiated.
           python3 tools/wasi-apps/linux-gap-bench.py \
             --arch ${{ matrix.helios-arch }} \
             --skip-linux \
             --allow-busy-host \
             --helios-timeout-seconds 9000 \
+            --helios-host-http-host ${{ matrix.net-host }} \
+            --helios-host-tcp-host ${{ matrix.net-host }} \
             --out-dir target/perf-baselines/ci-${{ matrix.name }} \
-            ${{ matrix.workloads }}
+            ${{ matrix.workloads }} 2>&1 | tee "${NET_BOOT_LOG}"
+      - name: Report negotiated virtio-net features
+        if: always()
+        working-directory: helios
+        run: |
+          {
+            printf '### virtio-net feature set (%s)\n\n' '${{ matrix.name }}'
+            printf 'Backend: `%s`' '${{ matrix.net-backend }}'
+            if [ '${{ matrix.net-backend }}' = user ]; then
+              printf ' — single queue, no checksum or TSO offload; not\n'
+              printf 'comparable with the multi-queue tap lanes.'
+            fi
+            printf '\n\n```\n'
+            grep -h -e 'virtio-net online' -e 'virtio features negotiated' \
+              "${NET_BOOT_LOG}" | sort -u || printf 'no virtio-net bring-up line was logged\n'
+            printf '```\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove the tap network backend
+        if: always() && matrix.net-backend == 'tap'
+        working-directory: helios
+        run: |
+          ./target/release/helios-inspector vm net-teardown \
+            --net-backend tap \
+            --net-ifname "${HELIOS_NET_IFNAME}" \
+            --net-bridge "${HELIOS_NET_BRIDGE}"
       - name: Summarize results
         if: always()
         working-directory: helios

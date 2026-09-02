@@ -525,6 +525,26 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         if features.device(NET_FEATURE_MQ) && device.queue_pair_count() > 1 {
             device.send_set_vq_pairs(device.queue_pair_count())?;
         }
+
+        // The negotiated set is the only record of what the host packet
+        // path was actually able to offer: a slirp-backed device
+        // negotiates neither multiqueue nor segmentation offload, so a
+        // measurement taken against it exercises none of the driver's
+        // offload paths. Logging it at bring-up puts the feature set of
+        // every run into the boot log, where a benchmark lane can record
+        // which backend it really measured. The ring bits are already on
+        // the `virtio features negotiated` line this device emitted, so
+        // only the device-class facts are repeated here.
+        tracing::info!(
+            queue_pairs = device.queue_pair_count(),
+            csum = device.tx_checksum_negotiated,
+            host_tso4 = device.tso_v4_negotiated,
+            host_tso6 = device.tso_v6_negotiated,
+            mq = features.device(NET_FEATURE_MQ),
+            ctrl_vq = features.device(NET_FEATURE_CTRL_VQ),
+            max_frame_len = device.max_frame_len,
+            "virtio-net online"
+        );
         Ok(device)
     }
 

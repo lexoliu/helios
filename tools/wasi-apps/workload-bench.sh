@@ -34,6 +34,25 @@ if [[ -n "${HELIOS_WORKLOAD_BENCH_VM_MEMORY:-}" ]]; then
     command+=(--memory "${HELIOS_WORKLOAD_BENCH_VM_MEMORY}")
 fi
 
+# Host packet path for the guest's virtio-net device. Only a multi-queue
+# backend can exercise the driver's multiqueue and offload paths; see
+# docs/networking.md.
+if [[ -n "${HELIOS_WORKLOAD_BENCH_NET_BACKEND:-}" ]]; then
+    command+=(--net-backend "${HELIOS_WORKLOAD_BENCH_NET_BACKEND}")
+fi
+
+if [[ -n "${HELIOS_WORKLOAD_BENCH_NET_QUEUES:-}" ]]; then
+    command+=(--net-queues "${HELIOS_WORKLOAD_BENCH_NET_QUEUES}")
+fi
+
+if [[ -n "${HELIOS_WORKLOAD_BENCH_NET_IFNAME:-}" ]]; then
+    command+=(--net-ifname "${HELIOS_WORKLOAD_BENCH_NET_IFNAME}")
+fi
+
+if [[ -n "${HELIOS_WORKLOAD_BENCH_NET_BRIDGE:-}" ]]; then
+    command+=(--net-bridge "${HELIOS_WORKLOAD_BENCH_NET_BRIDGE}")
+fi
+
 command+=(
     workload-bench
     --manifest

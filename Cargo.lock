@@ -1739,6 +1739,7 @@ dependencies = [
  "helios-hal",
  "helios-inspector-protocol",
  "indicatif",
+ "ipnet",
  "libc",
  "nu-ansi-term",
  "ratatui",
@@ -1748,6 +1749,7 @@ dependencies = [
  "serialport",
  "shell-words",
  "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2061,6 +2063,12 @@ dependencies = [
  "core-foundation-sys",
  "mach2 0.4.3",
 ]
+
+[[package]]
+name = "ipnet"
+version = "2.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a756c3fac73139e83f14c2d742155dd2b78d3ee56597b419a0579b7bdd6dd78"
 
 [[package]]
 name = "is_terminal_polyfill"

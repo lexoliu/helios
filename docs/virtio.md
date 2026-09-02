@@ -108,6 +108,13 @@ already-working terminal; structured host↔guest transport belongs to
 vsock instead. The driver that used to sit in `virtio/src/console.rs` had
 no callers and was removed rather than kept as dead weight.
 
+virtio-net is the one device whose capabilities are decided outside the
+guest: multiqueue, segmentation offload and checksum offload are all
+properties of the host packet path QEMU is given, so what the driver can
+negotiate depends on `helios-inspector vm --net-backend`. The driver logs
+its device-class result as `virtio-net online` next to the generic
+feature line above. See `docs/networking.md`.
+
 virtio-entropy is the kernel's continuous entropy source. The driver in
 `virtio/src/rng.rs` is interrupt-driven like every other single-request
 driver: `fill` submits a writable buffer, registers an `InFlight` slot
