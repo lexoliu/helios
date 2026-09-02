@@ -22,6 +22,7 @@ pub mod rtc;
 pub mod serial;
 pub mod vmm;
 pub mod vmm_test_harness;
+pub mod vsock;
 pub mod watchdog;
 
 /// Aligns `value` up to the next multiple of `align`.
