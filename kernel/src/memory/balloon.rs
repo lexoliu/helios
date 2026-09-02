@@ -485,21 +485,23 @@ async fn report_free_memory_forever<CpuImpl, Pool, Device>(
         min_run_bytes = MIN_REPORT_RUN_FRAMES * PhysFrame::SIZE,
         "memory balloon free-page reporting started"
     );
-    let mut last_free_frames = 0usize;
     loop {
         let stats = PhysFrameAllocator::stats(pool);
-        let free_frames = stats.free_frames();
-        if free_frames <= last_free_frames {
-            // Nothing has been released since the last pass that named
-            // something, so every run a pass could name is one the host
-            // has already dropped.
+        // Free memory the host has not been told about. It shrinks as a
+        // pass names runs and grows again when memory that was named is
+        // allocated and released, which is exactly when the host needs
+        // to hear about it a second time.
+        let unreported = stats.free_frames().saturating_sub(stats.reported_frames);
+        // A pass holds every run it names, so it may only reach for the
+        // memory that sits above the floor the runtime defends.
+        let spare = stats
+            .free_frames()
+            .saturating_sub(stats.total_frames / PRESSURE_FLOOR_DIVISOR);
+        let runs = (unreported.min(spare) / MIN_REPORT_RUN_FRAMES).min(REPORT_RUNS_PER_PASS);
+        if runs == 0 {
             timer.sleep_for(FREE_PAGE_REPORT_INTERVAL).await;
             continue;
         }
-        // A pass holds every run it names, so it may only reach for the
-        // memory that sits above the floor the runtime defends.
-        let spare = free_frames.saturating_sub(stats.total_frames / PRESSURE_FLOOR_DIVISOR);
-        let runs = (spare / MIN_REPORT_RUN_FRAMES).min(REPORT_RUNS_PER_PASS);
 
         let mut reported_frames = 0usize;
         let reporter = device.clone();
@@ -514,22 +516,15 @@ async fn report_free_memory_forever<CpuImpl, Pool, Device>(
             }
         })
         .await;
-        if reported_frames == 0 {
-            // The pool had nothing long enough to be worth naming. The
-            // high-water mark stays where it was so the next release of
-            // memory tries again rather than being suppressed by a pass
-            // that reported nothing.
-            timer.sleep_for(FREE_PAGE_REPORT_INTERVAL).await;
-            continue;
+        if reported_frames != 0 {
+            let bytes = (PhysFrameAllocator::stats(pool).reported_frames * PhysFrame::SIZE) as u64;
+            handle.shared.reported_bytes.store(bytes, Ordering::Release);
+            tracing::info!(
+                named_bytes = (reported_frames * PhysFrame::SIZE) as u64,
+                reported_bytes = bytes,
+                "memory balloon reported free memory"
+            );
         }
-        last_free_frames = free_frames;
-        let bytes = (reported_frames * PhysFrame::SIZE) as u64;
-        handle.shared.reported_bytes.store(bytes, Ordering::Release);
-        tracing::info!(
-            reported_bytes = bytes,
-            free_bytes = (free_frames * PhysFrame::SIZE) as u64,
-            "memory balloon reported free memory"
-        );
         timer.sleep_for(FREE_PAGE_REPORT_INTERVAL).await;
     }
 }
