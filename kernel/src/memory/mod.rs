@@ -10,6 +10,7 @@
 mod entropy;
 mod frame_slab;
 mod pmm;
+mod reported;
 mod reservations;
 mod user;
 

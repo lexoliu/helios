@@ -8,10 +8,13 @@ use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use buddy_system_allocator::LockedHeap;
 use helios_hal::cpu::ProcessorId;
-use helios_hal::pmm::PhysFrame;
+use helios_hal::pmm::{
+    FrameAllocError, FrameAllocStats, PhysFrame, PhysFrameAllocator, PhysFrameRange,
+};
 
 use crate::ProgramOutOfMemory;
 use crate::memory::frame_slab::FrameSlabCache;
+use crate::memory::reported::{ReportedFrames, visit_free_runs};
 
 const USER_HEAP_ORDER: usize = 32;
 
@@ -19,6 +22,9 @@ pub struct UserMemoryPool {
     heap: LockedHeap<USER_HEAP_ORDER>,
     frame_slab: FrameSlabCache,
     total_bytes: AtomicUsize,
+    /// Frames shown to a free-page consumer. The memory is still the
+    /// pool's to hand out; its contents are not.
+    reported: ReportedFrames,
 }
 
 impl UserMemoryPool {
@@ -27,6 +33,7 @@ impl UserMemoryPool {
             heap: LockedHeap::empty(),
             frame_slab: FrameSlabCache::new(),
             total_bytes: AtomicUsize::new(0),
+            reported: ReportedFrames::new(),
         }
     }
 
@@ -37,6 +44,7 @@ impl UserMemoryPool {
         unsafe {
             self.heap.lock().add_to_heap(start, end);
         }
+        self.reported.cover(start, end);
         self.total_bytes.fetch_add(end - start, Ordering::Release);
     }
 
@@ -90,6 +98,28 @@ impl UserMemoryPool {
     }
 
     fn allocate_uninit_with_processor(
+        &self,
+        layout: Layout,
+        processor: Option<ProcessorId>,
+    ) -> Result<(NonNull<u8>, usize), ProgramOutOfMemory> {
+        let (ptr, size) = self.allocate_raw(layout, processor)?;
+        // Memory the pool showed to a free-page consumer may have been
+        // discarded by it. The uninit contract lets a caller skip
+        // zeroing what it is about to overwrite; it does not let the
+        // pool hand back a hole.
+        if self.reported.take_bytes(ptr.as_ptr() as usize, size) {
+            unsafe {
+                core::ptr::write_bytes(ptr.as_ptr(), 0, size);
+            }
+        }
+        Ok((ptr, size))
+    }
+
+    /// The pool's allocation path without the reported-frame check.
+    ///
+    /// Free-page reporting takes runs out of the pool only to hand them
+    /// straight back, and must not pay to zero them on the way through.
+    fn allocate_raw(
         &self,
         layout: Layout,
         processor: Option<ProcessorId>,
@@ -158,6 +188,94 @@ impl UserMemoryPool {
             self.heap.lock().dealloc(ptr, layout);
         }
     }
+}
+
+/// The pool as a frame allocator.
+///
+/// User memory is the guest's bulk memory: it is where wasm linear
+/// memories live, it is page-granular, and running it dry costs an
+/// instance rather than the kernel. That makes it the pool a memory
+/// balloon draws from — the kernel heap's exhaustion is fatal, so it is
+/// not something a host may ask the guest to give away.
+impl PhysFrameAllocator for UserMemoryPool {
+    fn allocate(
+        &self,
+        count: usize,
+        zero_first_use: bool,
+    ) -> Result<PhysFrameRange, FrameAllocError> {
+        if count == 0 {
+            return Err(FrameAllocError::OutOfFrames {
+                requested: 0,
+                available: 0,
+            });
+        }
+        let (ptr, size) = self
+            .allocate_uninit_with_processor(frame_layout(count), None)
+            .map_err(|error| FrameAllocError::OutOfFrames {
+                requested: count,
+                available: error.available_bytes / PhysFrame::SIZE,
+            })?;
+        if zero_first_use {
+            unsafe {
+                core::ptr::write_bytes(ptr.as_ptr(), 0, size);
+            }
+        }
+        Ok(PhysFrameRange::from_phys_addr(
+            ptr.as_ptr() as usize,
+            count * PhysFrame::SIZE,
+        ))
+    }
+
+    fn free_runs<Visit>(&self, min_frames: usize, max_runs: usize, visit: Visit) -> usize
+    where
+        Visit: FnMut(PhysFrameRange),
+    {
+        visit_free_runs(
+            &self.reported,
+            min_frames,
+            max_runs,
+            |frames| {
+                self.allocate_raw(frame_layout(frames), None)
+                    .ok()
+                    .map(|(ptr, _)| {
+                        PhysFrameRange::from_phys_addr(
+                            ptr.as_ptr() as usize,
+                            frames * PhysFrame::SIZE,
+                        )
+                    })
+            },
+            |range| PhysFrameAllocator::deallocate(self, range),
+            visit,
+        )
+    }
+
+    fn deallocate(&self, range: PhysFrameRange) {
+        if range.is_empty() {
+            return;
+        }
+        let ptr = NonNull::new(range.start.phys_addr() as *mut u8)
+            .unwrap_or_else(|| panic!("user frame deallocator received a null range"));
+        self.deallocate_with_processor(ptr, frame_layout(range.frame_count), None);
+    }
+
+    fn stats(&self) -> FrameAllocStats {
+        let heap = UserMemoryPool::stats(self);
+        FrameAllocStats {
+            total_frames: heap.total_bytes / PhysFrame::SIZE,
+            allocated_frames: heap.allocated_bytes / PhysFrame::SIZE,
+            // The buddy heap surfaces no true largest-free-run; total
+            // free is the upper bound, which is what the pressure policy
+            // treats it as.
+            largest_free_run: heap.available_bytes() / PhysFrame::SIZE,
+            reported_frames: self.reported.count(),
+        }
+    }
+}
+
+fn frame_layout(frames: usize) -> Layout {
+    let bytes = frames * PhysFrame::SIZE;
+    Layout::from_size_align(bytes, PhysFrame::SIZE)
+        .unwrap_or_else(|_| panic!("user frame layout overflow for {bytes} bytes"))
 }
 
 static USER_MEMORY_POOL: AtomicPtr<UserMemoryPool> = AtomicPtr::new(core::ptr::null_mut());
@@ -311,6 +429,7 @@ fn single_frame_layout() -> Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_lite::future::block_on;
 
     fn stats(total: usize, allocated: usize) -> UserHeapStats {
         UserHeapStats {
@@ -346,5 +465,75 @@ mod tests {
     fn largest_allocatable_is_zero_for_an_exhausted_pool() {
         let stats = stats(1 << 30, 1 << 30);
         assert_eq!(stats.largest_allocatable_bytes(), 0);
+    }
+
+    /// A pool over a leaked, page-aligned block of host memory.
+    fn pool(bytes: usize) -> UserMemoryPool {
+        let layout = Layout::from_size_align(bytes, PhysFrame::SIZE).expect("pool layout");
+        let start = unsafe { alloc::alloc::alloc(layout) } as usize;
+        assert!(start != 0, "host allocation for the user pool failed");
+        let pool = UserMemoryPool::empty();
+        pool.add_region(start, start + bytes);
+        pool
+    }
+
+    fn tail_byte(address: usize, bytes: usize) -> u8 {
+        unsafe { core::ptr::read_volatile((address + bytes - 1) as *const u8) }
+    }
+
+    /// The balloon draws from user memory, so the pool has to answer the
+    /// frame-allocator contract as well as the wasm allocation paths.
+    #[test]
+    fn the_pool_hands_out_and_takes_back_contiguous_frames() {
+        let pool = pool(8 * 1024 * 1024);
+        let free_before = PhysFrameAllocator::stats(&pool).free_frames();
+
+        let range = pool.allocate(64, false).expect("64 frames");
+        assert_eq!(range.frame_count, 64);
+        assert!(PhysFrameAllocator::stats(&pool).free_frames() < free_before);
+
+        PhysFrameAllocator::deallocate(&pool, range);
+        assert_eq!(
+            PhysFrameAllocator::stats(&pool).free_frames(),
+            free_before,
+            "a returned run is free again"
+        );
+    }
+
+    /// Reporting user memory to a host that may discard it means the
+    /// next wasm instance to be handed that memory must not see a hole,
+    /// even on the uninit path that normally skips zeroing.
+    #[test]
+    fn reported_user_memory_is_zeroed_before_it_is_handed_out_again() {
+        let pool = pool(4 * 1024 * 1024);
+
+        let mut reported = None;
+        assert_eq!(
+            pool.free_runs(16, 1, |run| {
+                unsafe {
+                    core::ptr::write_bytes(run.start.phys_addr() as *mut u8, 0xc3, run.byte_size());
+                }
+                reported = Some(run);
+            }),
+            1
+        );
+        let reported = reported.expect("one run was reported");
+        assert_eq!(
+            PhysFrameAllocator::stats(&pool).reported_frames,
+            reported.frame_count
+        );
+
+        let layout =
+            Layout::from_size_align(reported.byte_size(), PhysFrame::SIZE).expect("frame layout");
+        let (ptr, size) = pool
+            .allocate_uninit_with_processor(layout, None)
+            .expect("the reported run is free again");
+        assert_eq!(ptr.as_ptr() as usize, reported.start.phys_addr());
+        assert_eq!(
+            tail_byte(ptr.as_ptr() as usize, size),
+            0,
+            "user memory the host may have discarded is zeroed on reuse"
+        );
+        assert_eq!(PhysFrameAllocator::stats(&pool).reported_frames, 0);
     }
 }

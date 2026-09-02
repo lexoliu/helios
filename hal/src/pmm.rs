@@ -15,6 +15,15 @@
 //! Frames are stable: the allocator does not relocate them behind the
 //! caller's back. Coalescing of the *free* portion of the pool may happen
 //! between calls.
+//!
+//! # Addressing
+//!
+//! A frame is named by its index in the kernel's direct map of physical
+//! memory, which is what a backend hands the allocator when it publishes
+//! a memory region. On a backend whose direct map sits at a non-zero
+//! offset the translation to a bus address happens where every other
+//! buffer's does — at the device boundary — so the allocator, its
+//! callers, and the page-table layer all speak one address space.
 
 use thiserror::Error;
 
@@ -111,6 +120,10 @@ pub struct FrameAllocStats {
     /// Largest contiguous free run, in frames. Used by the kernel
     /// pressure monitor to decide when to invoke compaction.
     pub largest_free_run: usize,
+    /// Free frames currently shown to a free-page consumer through
+    /// [`PhysFrameAllocator::free_runs`]. They are still the guest's to
+    /// allocate; their contents are not.
+    pub reported_frames: usize,
 }
 
 impl FrameAllocStats {
@@ -138,11 +151,36 @@ pub trait PhysFrameAllocator: Send + Sync + 'static {
     /// `false`, the caller is responsible for zeroing before exposing
     /// the frames to user code; this is an opt-out for hot paths that
     /// will overwrite the entire region anyway (image map-in, swap-in).
+    ///
+    /// A run that was handed to [`PhysFrameAllocator::free_runs`] is
+    /// zeroed whatever the caller asked for: whoever the run was shown
+    /// to is entitled to have discarded its contents, so `false` is not
+    /// a promise the allocator can keep for it.
     fn allocate(
         &self,
         count: usize,
         zero_first_use: bool,
     ) -> Result<PhysFrameRange, FrameAllocError>;
+
+    /// Shows contiguous runs of currently free memory to `visit`.
+    ///
+    /// This is the free-page reporting primitive: a consumer that wants
+    /// to know which memory the guest has no use for — a virtio balloon
+    /// telling its host, a hypervisor migration hint — needs runs it can
+    /// name, and needs them to stay free while it names them. Each run
+    /// is reserved before `visit` sees it and released afterwards, so no
+    /// other allocation can be handed the same memory mid-report.
+    ///
+    /// Only runs of at least `min_frames` contiguous frames are visited,
+    /// and at most `max_runs` of them; an implementation may visit
+    /// fewer, and visits none at all when the pool has no run that
+    /// large. Returns how many runs `visit` was called with.
+    ///
+    /// Every visited run is marked *reported*, which is what makes a
+    /// later [`PhysFrameAllocator::allocate`] of it zero the memory.
+    fn free_runs<Visit>(&self, min_frames: usize, max_runs: usize, visit: Visit) -> usize
+    where
+        Visit: FnMut(PhysFrameRange);
 
     /// Return frames to the pool.
     ///

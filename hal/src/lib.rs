@@ -100,6 +100,8 @@ pub struct DeviceInventory {
     pub has_host_share: bool,
     /// A hardware entropy device the kernel can read continuously.
     pub has_entropy_device: bool,
+    /// A memory balloon the host resizes the guest's memory through.
+    pub has_memory_balloon: bool,
 }
 
 impl DeviceInventory {
@@ -110,6 +112,7 @@ impl DeviceInventory {
             block_device_count: 0,
             has_host_share: false,
             has_entropy_device: false,
+            has_memory_balloon: false,
         }
     }
 
@@ -144,6 +147,13 @@ impl DeviceInventory {
     pub const fn with_entropy_device(self) -> Self {
         Self {
             has_entropy_device: true,
+            ..self
+        }
+    }
+
+    pub const fn with_memory_balloon(self) -> Self {
+        Self {
+            has_memory_balloon: true,
             ..self
         }
     }
