@@ -3773,6 +3773,7 @@ fn convert_sample(sample: StatsSample) -> debugger_bindings::helios::system::sta
     debugger_bindings::helios::system::stats::Sample {
         timestamp: sample.timestamp,
         uptime: sample.uptime,
+        wall_clock: sample.wall_clock,
         processors: debugger_bindings::helios::system::stats::Processors {
             configured: sample.configured_processors,
             online: sample.online_processors,
@@ -3799,6 +3800,7 @@ fn convert_program_sample(sample: StatsSample) -> program_bindings::helios::syst
     program_bindings::helios::system::stats::Sample {
         timestamp: sample.timestamp,
         uptime: sample.uptime,
+        wall_clock: sample.wall_clock,
         processors: program_bindings::helios::system::stats::Processors {
             configured: sample.configured_processors,
             online: sample.online_processors,

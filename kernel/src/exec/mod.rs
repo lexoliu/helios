@@ -37,6 +37,6 @@ pub use sync::{
 pub use task::{YieldNow, yield_now};
 pub use time::{
     KernelClock, duration_to_ticks, elapsed_millis, monotonic_nanos,
-    nanos_to_ticks_ceil_saturating, ticks_to_nanos,
+    nanos_to_ticks_ceil_saturating, ticks_to_nanos, wall_clock_offset_nanos,
 };
 pub use timer::{Sleep, Timer};

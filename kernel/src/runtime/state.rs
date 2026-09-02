@@ -14,6 +14,7 @@ use crate::{
 };
 use crate::{RootEntropy, RootEntropyHandle};
 use helios_hal::cpu::HardwarePerfCounterDelta;
+use helios_hal::rtc::{RealTimeClock, UnixSeconds};
 use spin::{Mutex, Once};
 
 use crate::BlockService;
@@ -40,6 +41,10 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// it, so a kernel that reaches component start-up without one is a
     /// bring-up bug rather than a degraded mode.
     root_entropy: Once<RootEntropyHandle>,
+    /// Nanoseconds between the monotonic clock and wall time, as the
+    /// platform's real-time clock set them during bring-up. Empty on a
+    /// machine that carries no such clock, where wall time is uptime.
+    wall_clock_offset_nanos: Once<i128>,
     /// Queue into the `http-client` kernel plugin. Empty on a kernel image
     /// that does not provision the plugin, in which case the runtime adapter
     /// answers a configuration error rather than trapping.
@@ -342,6 +347,7 @@ where
                 network_service_installed: AtomicBool::new(false),
                 network_service: Once::new(),
                 root_entropy: Once::new(),
+                wall_clock_offset_nanos: Once::new(),
                 http_client: ProviderSlot::new(),
                 host_fs_service: Mutex::new(None),
                 block_service: Once::new(),
@@ -362,6 +368,7 @@ where
         StatsSample {
             timestamp: uptime,
             uptime,
+            wall_clock: self.wall_clock_nanos(current_ticks),
             configured_processors: self.inner.processor_count,
             online_processors: self.inner.processor_count,
             block: self.inner.block_service.get().map(BlockService::stats),
@@ -682,6 +689,60 @@ where
         self.ticks_to_nanos(current_ticks.saturating_sub(self.inner.boot_ticks))
     }
 
+    /// Places the monotonic clock on the wall, from the platform's
+    /// real-time clock.
+    ///
+    /// The backend calls this once, on the bootstrap processor, after
+    /// the kernel's log is installed and before any component runs, so
+    /// every store the runtime opens afterwards reads the same calendar.
+    /// The clock is read exactly once: the monotonic timer carries time
+    /// forward from here, and nothing re-synchronises it.
+    ///
+    /// A clock that answers with something no calendar can mean is a
+    /// bring-up fault rather than a degraded mode, so it panics instead
+    /// of leaving the kernel quietly running at the epoch.
+    pub fn seed_wall_clock<Rtc>(&self, current_ticks: u64, rtc: &Rtc) -> UnixSeconds
+    where
+        Rtc: RealTimeClock,
+    {
+        let wall = rtc.read().unwrap_or_else(|error| {
+            panic!(
+                "platform real-time clock {} could not be read: {error}",
+                Rtc::SOURCE
+            )
+        });
+        let offset = crate::exec::wall_clock_offset_nanos(wall, self.uptime_nanos(current_ticks));
+        let mut installed = false;
+        self.inner.wall_clock_offset_nanos.call_once(|| {
+            installed = true;
+            offset
+        });
+        assert!(installed, "the wall clock was seeded more than once");
+        tracing::info!(
+            "wall clock seeded source={} unix_seconds={}",
+            Rtc::SOURCE,
+            wall.get()
+        );
+        wall
+    }
+
+    /// Nanoseconds between the monotonic clock and wall time, zero until
+    /// a real-time clock has seeded it.
+    pub fn wall_clock_offset_nanos(&self) -> i128 {
+        self.inner
+            .wall_clock_offset_nanos
+            .get()
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Wall time in nanoseconds since the Unix epoch, as the seeded
+    /// offset places the monotonic reading at `current_ticks`.
+    pub fn wall_clock_nanos(&self, current_ticks: u64) -> u64 {
+        let value = i128::from(self.uptime_nanos(current_ticks)) + self.wall_clock_offset_nanos();
+        u64::try_from(value).unwrap_or_default()
+    }
+
     pub fn instance_registry(&self) -> InstanceRegistry {
         self.inner.instance_registry.clone()
     }
@@ -832,6 +893,10 @@ where
 {
     fn uptime_nanos(&self, current_ticks: u64) -> u64 {
         RuntimeState::uptime_nanos(self, current_ticks)
+    }
+
+    fn wall_clock_offset_nanos(&self) -> i128 {
+        RuntimeState::wall_clock_offset_nanos(self)
     }
 
     fn record_console_text(&self, current_ticks: u64, text: &str) {

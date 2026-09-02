@@ -4,6 +4,9 @@ interface stats {
   /// Monotonic nanoseconds since system boot.
   type mono-nanos = u64;
 
+  /// Wall-clock nanoseconds since the Unix epoch.
+  type unix-nanos = u64;
+
   /// Utilization is reported in permille to avoid floating-point drift while
   /// still being precise enough for UI rendering and trend analysis.
   type permille = u16;
@@ -82,6 +85,10 @@ interface stats {
   record sample {
     timestamp: mono-nanos,
     uptime: mono-nanos,
+    /// Wall time, from the real-time clock the kernel read at boot.
+    /// Zero on a machine that carried no such clock, where wall time
+    /// cannot be told apart from uptime.
+    wall-clock: unix-nanos,
     processors: processors,
     memory: memory,
     /// Absent on a machine that gave the kernel no block device.
