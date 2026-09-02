@@ -5,7 +5,6 @@ extern crate std;
 
 mod block;
 mod bus;
-mod console;
 mod discovery;
 mod features;
 mod inflight;
@@ -28,15 +27,14 @@ pub use bus::{
     DeviceBus, DmaBuffer, DmaPool, IdentityDmaBuffer, IdentityDmaPool, MmioBus, OffsetDmaBuffer,
     OffsetDmaPool,
 };
-pub use console::VirtioConsoleDevice;
 pub use discovery::{
     InterruptTrigger, MmioCandidate, MmioInterrupt, mmio_candidates, mmio_device_matches,
 };
 pub use features::{NegotiatedFeatures, RING_FEATURES, negotiate, negotiate_with};
 pub use mmio::{
-    VirtioMmio9pDevice, VirtioMmioBlockDevice, VirtioMmioConsoleDevice, VirtioMmioNetDevice,
-    VirtioMmioRngDevice, block_from_mmio, console_from_mmio, net_from_mmio, net_from_mmio_with_dma,
-    p9_from_mmio, p9_from_mmio_with_dma, rng_from_mmio,
+    VirtioMmio9pDevice, VirtioMmioBlockDevice, VirtioMmioNetDevice, VirtioMmioRngDevice,
+    block_from_mmio, net_from_mmio, net_from_mmio_with_dma, p9_from_mmio, p9_from_mmio_with_dma,
+    rng_from_mmio,
 };
 pub use net::{
     RxFrame, TxChecksumMeta, TxFrame, TxFrameDescriptor, TxScatterFrame, VirtioNetDevice,
