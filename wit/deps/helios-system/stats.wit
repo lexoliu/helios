@@ -56,6 +56,29 @@ interface stats {
     write-zeroes-requests: u64,
   }
 
+  /// One device the platform's IOMMU confines to its own domain.
+  record iommu-endpoint {
+    /// The endpoint identity the platform gave the device.
+    endpoint: u32,
+    /// The translation domain the device is attached to.
+    domain: u32,
+    /// Physical bytes that domain maps, interrupt doorbells included.
+    mapped-bytes: u64,
+  }
+
+  /// The platform's I/O translation unit, absent on a machine that has
+  /// none or whose devices cannot be put behind one.
+  record iommu {
+    /// The smallest page the unit maps.
+    granule-bytes: u64,
+    /// Whether endpoints attached to no domain still reach memory. A
+    /// confined device is translated either way.
+    global-bypass: bool,
+    /// Translation faults the unit has reported since boot.
+    faults: u64,
+    endpoints: list<iommu-endpoint>,
+  }
+
   record sample {
     timestamp: mono-nanos,
     uptime: mono-nanos,
@@ -63,6 +86,9 @@ interface stats {
     memory: memory,
     /// Absent on a machine that gave the kernel no block device.
     block: option<block-device>,
+    /// Absent on a machine whose devices are not behind a translation
+    /// unit, and therefore reach all of memory.
+    iommu: option<iommu>,
   }
 
   /// Returns the latest coherent system-wide observation snapshot.

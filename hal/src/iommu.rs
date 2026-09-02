@@ -165,6 +165,38 @@ pub enum IommuError {
     TooManyWindows,
 }
 
+/// A shared translation unit is still one unit: delegating lets a
+/// backend keep the driver alive on its interrupt path while the kernel
+/// builds domains through the same contract.
+impl<I: Iommu> Iommu for alloc::sync::Arc<I> {
+    fn geometry(&self) -> IommuGeometry {
+        I::geometry(self)
+    }
+
+    fn attach(&self, domain: DomainId, endpoint: EndpointId) -> Result<(), IommuError> {
+        I::attach(self, domain, endpoint)
+    }
+
+    fn detach(&self, domain: DomainId, endpoint: EndpointId) -> Result<(), IommuError> {
+        I::detach(self, domain, endpoint)
+    }
+
+    fn map(
+        &self,
+        domain: DomainId,
+        iova: IoVirtAddr,
+        physical: u64,
+        bytes: u64,
+        access: DmaAccess,
+    ) -> Result<(), IommuError> {
+        I::map(self, domain, iova, physical, bytes, access)
+    }
+
+    fn unmap(&self, domain: DomainId, iova: IoVirtAddr, bytes: u64) -> Result<(), IommuError> {
+        I::unmap(self, domain, iova, bytes)
+    }
+}
+
 /// The hardware contract a translation unit satisfies.
 ///
 /// Requests are issued during device bring-up and teardown, never on a
@@ -209,6 +241,42 @@ impl From<IommuError> for crate::io::IoError {
             IommuError::OutOfResources | IommuError::Fault | IommuError::DeviceFault => {
                 Self::DeviceFault
             }
+        }
+    }
+}
+
+/// A contiguous run of physical memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PhysicalRange {
+    /// First physical byte of the range.
+    pub start: u64,
+    /// Length of the range in bytes.
+    pub bytes: u64,
+}
+
+impl PhysicalRange {
+    pub const fn new(start: u64, bytes: u64) -> Self {
+        Self { start, bytes }
+    }
+
+    /// The inclusive last byte of the range.
+    pub const fn last(&self) -> u64 {
+        assert!(self.bytes != 0, "a physical range covers at least one byte");
+        self.start + (self.bytes - 1)
+    }
+
+    /// The smallest range covering this one whose bounds sit on
+    /// `geometry`'s granule.
+    pub fn aligned_to(&self, geometry: &IommuGeometry) -> Self {
+        let start = geometry.align_down(self.start);
+        let end = self
+            .last()
+            .checked_add(1)
+            .map(|end| geometry.align_up(end))
+            .unwrap_or_else(|| panic!("physical range {self:?} ends at the top of memory"));
+        Self {
+            start,
+            bytes: end - start,
         }
     }
 }

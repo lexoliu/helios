@@ -3711,6 +3711,33 @@ where
 /// The debugger world and the program world generate distinct Rust types
 /// for the same WIT record, so the field mapping is written once here and
 /// instantiated for each of them.
+/// Maps the kernel's IOMMU snapshot onto one binding set's `iommu`
+/// record.
+///
+/// The two generated worlds carry the same WIT record as distinct Rust
+/// types, so the mapping is written once and instantiated for each.
+macro_rules! convert_iommu_stats {
+    ($bindings:path, $iommu:expr) => {
+        $iommu.map(|iommu: crate::IommuStats| {
+            use $bindings as stats_bindings;
+            stats_bindings::Iommu {
+                granule_bytes: iommu.granule_bytes,
+                global_bypass: iommu.global_bypass,
+                faults: iommu.faults,
+                endpoints: iommu
+                    .endpoints()
+                    .iter()
+                    .map(|endpoint| stats_bindings::IommuEndpoint {
+                        endpoint: endpoint.endpoint,
+                        domain: endpoint.domain,
+                        mapped_bytes: endpoint.mapped_bytes,
+                    })
+                    .collect(),
+            }
+        })
+    };
+}
+
 macro_rules! convert_block_stats {
     ($bindings:path, $block:expr) => {
         $block.map(|block: crate::BlockStats| {
@@ -3759,6 +3786,7 @@ fn convert_sample(sample: StatsSample) -> debugger_bindings::helios::system::sta
             pressure: convert_memory_pressure(total_bytes, available_bytes),
         },
         block: convert_block_stats!(debugger_bindings::helios::system::stats, sample.block),
+        iommu: convert_iommu_stats!(debugger_bindings::helios::system::stats, sample.iommu),
     }
 }
 
@@ -3784,6 +3812,7 @@ fn convert_program_sample(sample: StatsSample) -> program_bindings::helios::syst
             pressure: convert_program_memory_pressure(total_bytes, available_bytes),
         },
         block: convert_block_stats!(program_bindings::helios::system::stats, sample.block),
+        iommu: convert_iommu_stats!(program_bindings::helios::system::stats, sample.iommu),
     }
 }
 
