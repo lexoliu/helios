@@ -203,15 +203,17 @@ fn draw_main_panels(
     let panels = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(45),
-            Constraint::Percentage(25),
-            Constraint::Percentage(30),
+            Constraint::Percentage(34),
+            Constraint::Percentage(19),
+            Constraint::Percentage(23),
+            Constraint::Percentage(24),
         ])
         .split(sections[0]);
 
     draw_cpu_chart(frame, panels[0], sample);
     draw_memory_panel(frame, panels[1], sample);
     draw_block_panel(frame, panels[2], sample);
+    draw_iommu_panel(frame, panels[3], sample);
     draw_instances_panel(frame, sections[1], instances);
 }
 
@@ -424,6 +426,49 @@ fn draw_block_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::
 
     let panel = Paragraph::new(Text::from(lines))
         .block(Block::default().title("Disk").borders(Borders::ALL))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(panel, area);
+}
+
+/// What the platform's translation unit confines, or the fact that the
+/// machine has none and its devices reach all of memory.
+fn draw_iommu_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Sample) {
+    let lines = match &sample.iommu {
+        Some(iommu) => {
+            let mut lines = vec![
+                block_line("granule", format_bytes(iommu.granule_bytes)),
+                block_line(
+                    "bypass",
+                    match iommu.global_bypass {
+                        true => "unattached endpoints pass through".to_owned(),
+                        false => "off".to_owned(),
+                    },
+                ),
+                block_line("faults", iommu.faults.to_string()),
+            ];
+            lines.extend(iommu.endpoints.iter().map(|endpoint| {
+                Line::from(vec![
+                    Span::styled(
+                        format!("{:<9}", format!("{:#06x}", endpoint.endpoint)),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::raw(format!(
+                        "domain {}  {}",
+                        endpoint.domain,
+                        format_bytes(endpoint.mapped_bytes)
+                    )),
+                ])
+            }));
+            lines
+        }
+        None => vec![Line::from(Span::styled(
+            "devices reach all of memory",
+            Style::default().fg(Color::DarkGray),
+        ))],
+    };
+
+    let panel = Paragraph::new(Text::from(lines))
+        .block(Block::default().title("IOMMU").borders(Borders::ALL))
         .wrap(Wrap { trim: true });
     frame.render_widget(panel, area);
 }

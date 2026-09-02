@@ -141,6 +141,9 @@ struct VmProfile {
     host_share: Option<VmHostShareProfile>,
     watchdog: Option<VmWatchdogProfile>,
     entropy: VmEntropyProfile,
+    /// The translation unit this machine can put its virtio devices
+    /// behind, if any.
+    iommu: Option<VmIommuProfile>,
 }
 
 /// The aarch64 platform is device-tree only: the kernel reads the GIC
@@ -168,6 +171,10 @@ const AARCH64_VIRT_HVF_PROFILE: VmProfile = VmProfile {
     host_share: Some(VmHostShareProfile::Virtio9pMmio),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
     entropy: VmEntropyProfile::VirtioRngMmio,
+    // The virtio devices of the `virt` machines are memory-mapped, and
+    // virtio-iommu translates PCI endpoints only, so there is nothing
+    // here it could confine.
+    iommu: None,
 };
 
 #[cfg(test)]
@@ -190,6 +197,10 @@ const AARCH64_VIRT_TCG_PROFILE: VmProfile = VmProfile {
     host_share: Some(VmHostShareProfile::Virtio9pMmio),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
     entropy: VmEntropyProfile::VirtioRngMmio,
+    // The virtio devices of the `virt` machines are memory-mapped, and
+    // virtio-iommu translates PCI endpoints only, so there is nothing
+    // here it could confine.
+    iommu: None,
 };
 
 const RISCV64_VM_PROFILE: VmProfile = VmProfile {
@@ -211,6 +222,10 @@ const RISCV64_VM_PROFILE: VmProfile = VmProfile {
     host_share: Some(VmHostShareProfile::Virtio9pMmio),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
     entropy: VmEntropyProfile::VirtioRngMmio,
+    // The virtio devices of the `virt` machines are memory-mapped, and
+    // virtio-iommu translates PCI endpoints only, so there is nothing
+    // here it could confine.
+    iommu: None,
 };
 
 const X86_64_VM_PROFILE: VmProfile = VmProfile {
@@ -232,6 +247,7 @@ const X86_64_VM_PROFILE: VmProfile = VmProfile {
     host_share: Some(VmHostShareProfile::Virtio9pPci),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
     entropy: VmEntropyProfile::VirtioRngPci,
+    iommu: Some(VmIommuProfile::VirtioIommuPci),
 };
 
 /// Virtqueue ring layout the inspector asks every virtio device for.
@@ -259,15 +275,29 @@ pub(crate) enum VirtioCompletionOrder {
     InOrder,
 }
 
-/// The virtqueue behaviour every virtio device the inspector creates is
-/// asked for.
+/// Whether the machine's virtio-PCI devices sit behind its
+/// virtio-iommu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct VirtioQueueProfile {
-    ring: VirtioRingLayout,
-    completion: VirtioCompletionOrder,
+pub(crate) enum VirtioPlatformAccess {
+    /// The device issues physical addresses.
+    #[default]
+    Direct,
+    /// The device is an endpoint of the machine's translation unit and
+    /// issues addresses that unit translates.
+    Confined,
 }
 
-impl VirtioQueueProfile {
+/// The behaviour every virtio device the inspector creates is asked for:
+/// its virtqueue layout, and whether its DMA goes through the machine's
+/// translation unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct VirtioDeviceProfile {
+    ring: VirtioRingLayout,
+    completion: VirtioCompletionOrder,
+    access: VirtioPlatformAccess,
+}
+
+impl VirtioDeviceProfile {
     /// Adds the device properties that select this profile to a device
     /// option list.
     fn apply(self, options: &mut QemuOptions) {
@@ -278,6 +308,30 @@ impl VirtioQueueProfile {
             options.set("in_order", "on");
         }
     }
+
+    /// As [`Self::apply`], for a device on the PCI bus the machine's
+    /// translation unit protects.
+    ///
+    /// Only a PCI endpoint can be confined, and only a
+    /// non-transitional function offers VIRTIO_F_ACCESS_PLATFORM at
+    /// all, so a confined device is created with the legacy interface
+    /// disabled.
+    pub(crate) fn apply_pci(self, options: &mut QemuOptions) {
+        self.apply(options);
+        if self.access == VirtioPlatformAccess::Confined {
+            options.set("disable-legacy", "on");
+            options.set("iommu_platform", "on");
+        }
+    }
+}
+
+/// How a machine profile attaches its translation unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VmIommuProfile {
+    /// The virtio-iommu function of a PCI machine. virtio-iommu can
+    /// only protect PCI endpoints, so a machine whose virtio devices are
+    /// memory-mapped has no profile here at all.
+    VirtioIommuPci,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -334,6 +388,8 @@ pub(crate) struct VmConfigFile {
     pub(crate) keep_runtime_dir: Option<bool>,
     #[serde(default)]
     pub(crate) data_disk_size: Option<u64>,
+    #[serde(default)]
+    pub(crate) iommu: Option<bool>,
     #[serde(default)]
     pub(crate) virtio_packed: Option<bool>,
     #[serde(default)]
@@ -455,6 +511,11 @@ pub(crate) struct VmCommand {
     #[arg(long, default_value_t = false)]
     keep_runtime_dir: bool,
 
+    /// Put every virtio device behind a virtio-iommu, so its DMA only
+    /// reaches the memory the kernel maps into its domain.
+    #[arg(long, default_value_t = false)]
+    iommu: bool,
+
     /// Create every virtio device with the packed virtqueue layout.
     #[arg(long, default_value_t = false)]
     virtio_packed: bool,
@@ -553,7 +614,8 @@ struct ResolvedVmCommand {
     no_compiler_plugin: bool,
     runtime_dir: Option<PathBuf>,
     keep_runtime_dir: bool,
-    virtio_queues: VirtioQueueProfile,
+    iommu: bool,
+    virtio_devices: VirtioDeviceProfile,
     network: VmNetwork,
     qemu_net: Option<QemuNetArgs>,
     command: Option<ResolvedVmSessionCommand>,
@@ -677,7 +739,15 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
     let runtime_dir = command.runtime_dir.or(file.runtime_dir);
     let keep_runtime_dir =
         debug || command.keep_runtime_dir || file.keep_runtime_dir.unwrap_or(false);
-    let virtio_queues = VirtioQueueProfile {
+    let iommu = command.iommu || file.iommu.unwrap_or(false);
+    if iommu && profile.iommu.is_none() {
+        bail!(
+            "--iommu is not available on {}: its virtio devices are memory-mapped, and \
+             virtio-iommu can only confine PCI endpoints",
+            arch_label(arch)
+        );
+    }
+    let virtio_devices = VirtioDeviceProfile {
         ring: if command.virtio_packed || file.virtio_packed.unwrap_or(false) {
             VirtioRingLayout::Packed
         } else {
@@ -688,12 +758,17 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
         } else {
             VirtioCompletionOrder::Unordered
         },
+        access: if iommu {
+            VirtioPlatformAccess::Confined
+        } else {
+            VirtioPlatformAccess::Direct
+        },
     };
 
     let network = VmNetwork::resolve(command.network, file.network);
     let qemu_net = profile
         .network
-        .map(|device| network.render(device, virtio_queues, smp, HostPlatform::current()))
+        .map(|device| network.render(device, virtio_devices, smp, HostPlatform::current()))
         .transpose()?;
 
     Ok(ResolvedVmCommand {
@@ -726,7 +801,8 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
         no_compiler_plugin,
         runtime_dir,
         keep_runtime_dir,
-        virtio_queues,
+        iommu,
+        virtio_devices,
         network,
         qemu_net,
         command: session_command,
@@ -1500,27 +1576,34 @@ impl VmRuntime {
             }
             VmBootArtifactKind::LimineUefiDiskImage => {}
         }
+        // The unit has to be realised before the functions it protects:
+        // QEMU binds a PCI function to its address space when the
+        // function is created, and one created first would keep the
+        // untranslated one.
+        if command.iommu {
+            configure_iommu(&mut qemu, command.profile.iommu, command.virtio_devices);
+        }
         if let Some(qemu_net) = &command.qemu_net {
             qemu_net.apply(&mut qemu);
         }
         if let Some(boot_disk) = command.profile.boot_disk {
-            configure_boot_disk(&mut qemu, boot_disk, &artifact, command.virtio_queues);
+            configure_boot_disk(&mut qemu, boot_disk, &artifact, command.virtio_devices);
         }
         configure_data_disk(
             &mut qemu,
             command.profile.data_disk,
             &data_disk,
-            command.virtio_queues,
+            command.virtio_devices,
         );
         if let Some(host_share) = command.profile.host_share {
             if let Some(shared_dir) = &command.shared_dir {
-                configure_host_share(&mut qemu, host_share, shared_dir, command.virtio_queues);
+                configure_host_share(&mut qemu, host_share, shared_dir, command.virtio_devices);
             }
         }
         if let Some(watchdog) = command.profile.watchdog {
             configure_watchdog(&mut qemu, watchdog);
         }
-        configure_entropy_device(&mut qemu, command.profile.entropy, command.virtio_queues);
+        configure_entropy_device(&mut qemu, command.profile.entropy, command.virtio_devices);
 
         let mut child = qemu.spawn().with_context(|| {
             format!(
@@ -1876,7 +1959,7 @@ fn configure_boot_disk(
     qemu: &mut Command,
     boot_disk: VmBootDiskProfile,
     boot_artifact: &Path,
-    queues: VirtioQueueProfile,
+    queues: VirtioDeviceProfile,
 ) {
     let mut drive = QemuOptions::keyed();
     drive.set("if", "none");
@@ -1889,7 +1972,7 @@ fn configure_boot_disk(
     });
     device.set("drive", "bootdisk");
     device.set("bootindex", 0);
-    queues.apply(&mut device);
+    queues.apply_pci(&mut device);
     qemu.arg("-device").arg(device.to_string());
 }
 
@@ -1901,7 +1984,7 @@ fn configure_data_disk(
     qemu: &mut Command,
     data_disk: VmDataDiskProfile,
     image: &Path,
-    queues: VirtioQueueProfile,
+    queues: VirtioDeviceProfile,
 ) {
     let mut drive = QemuOptions::keyed();
     drive.set("if", "none");
@@ -1915,7 +1998,11 @@ fn configure_data_disk(
     });
     device.set("drive", "data");
     device.set("serial", DATA_DISK_SERIAL);
-    queues.apply(&mut device);
+    apply_transport(
+        data_disk == VmDataDiskProfile::VirtioPci,
+        queues,
+        &mut device,
+    );
     qemu.arg("-device").arg(device.to_string());
 }
 
@@ -1923,7 +2010,7 @@ fn configure_host_share(
     qemu: &mut Command,
     host_share: VmHostShareProfile,
     shared_dir: &Path,
-    queues: VirtioQueueProfile,
+    queues: VirtioDeviceProfile,
 ) {
     let mut fsdev = QemuOptions::new("local");
     fsdev.set("id", "hostfs");
@@ -1937,7 +2024,11 @@ fn configure_host_share(
     });
     device.set("fsdev", "hostfs");
     device.set("mount_tag", HOST_SHARE_MOUNT_TAG);
-    queues.apply(&mut device);
+    apply_transport(
+        host_share == VmHostShareProfile::Virtio9pPci,
+        queues,
+        &mut device,
+    );
     qemu.arg("-device").arg(device.to_string());
 }
 
@@ -1951,7 +2042,7 @@ fn configure_host_share(
 fn configure_entropy_device(
     qemu: &mut Command,
     entropy: VmEntropyProfile,
-    queues: VirtioQueueProfile,
+    queues: VirtioDeviceProfile,
 ) {
     let mut object = QemuOptions::new("rng-random");
     object.set("filename", "/dev/urandom");
@@ -1962,8 +2053,43 @@ fn configure_entropy_device(
         VmEntropyProfile::VirtioRngPci => "virtio-rng-pci",
     });
     device.set("rng", "rng0");
-    queues.apply(&mut device);
+    apply_transport(
+        entropy == VmEntropyProfile::VirtioRngPci,
+        queues,
+        &mut device,
+    );
     qemu.arg("-device").arg(device.to_string());
+}
+
+/// Attaches the machine's translation unit.
+///
+/// The unit is itself a virtio-PCI function, but it is never one of its
+/// own endpoints: it publishes its request and event rings at physical
+/// addresses, so it is created without the platform-access property its
+/// endpoints carry.
+fn configure_iommu(
+    qemu: &mut Command,
+    iommu: Option<VmIommuProfile>,
+    devices: VirtioDeviceProfile,
+) {
+    let Some(iommu) = iommu else {
+        unreachable!("--iommu is refused on a machine profile that declares no translation unit")
+    };
+    let mut device = QemuOptions::new(match iommu {
+        VmIommuProfile::VirtioIommuPci => "virtio-iommu-pci",
+    });
+    devices.apply(&mut device);
+    qemu.arg("-device").arg(device.to_string());
+}
+
+/// A memory-mapped virtio device cannot be an IOMMU endpoint, so only a
+/// PCI function carries the platform-access properties.
+fn apply_transport(pci: bool, devices: VirtioDeviceProfile, options: &mut QemuOptions) {
+    if pci {
+        devices.apply_pci(options);
+    } else {
+        devices.apply(options);
+    }
 }
 
 fn configure_watchdog(qemu: &mut Command, watchdog: VmWatchdogProfile) {
@@ -2128,6 +2254,49 @@ mod tests {
         assert_eq!(X86_64_VM_PROFILE.entropy, VmEntropyProfile::VirtioRngPci);
     }
 
+    /// A `vm` invocation with nothing but its defaults, for tests that
+    /// only care about one option.
+    fn minimal_command() -> VmCommand {
+        VmCommand {
+            arch: VmArch::X86_64,
+            debug: false,
+            release: false,
+            kernel_debug: false,
+            config: None,
+            qemu_bin: None,
+            kernel: None,
+            socket: None,
+            serial_stdio: false,
+            serial_pty: false,
+            no_build: true,
+            smp: None,
+            memory: None,
+            bios: None,
+            baud: DEFAULT_BAUD,
+            cpu: None,
+            accel: Vec::new(),
+            shared_dir: None,
+            data_disk_size: None,
+            gdb: None,
+            gdb_wait: false,
+            monitor: None,
+            qmp: None,
+            qemu_log: None,
+            qemu_trace: Vec::new(),
+            qemu_trace_log: None,
+            qemu_arg: Vec::new(),
+            boot_programs: Vec::new(),
+            no_compiler_plugin: false,
+            runtime_dir: None,
+            keep_runtime_dir: false,
+            iommu: false,
+            virtio_packed: false,
+            virtio_in_order: false,
+            network: default_network_args(),
+            command: None,
+        }
+    }
+
     #[test]
     fn resolve_uses_profile_defaults_without_local_config() {
         let tempdir =
@@ -2165,6 +2334,7 @@ mod tests {
             no_compiler_plugin: false,
             runtime_dir: None,
             keep_runtime_dir: false,
+            iommu: false,
             virtio_packed: false,
             virtio_in_order: false,
             network: default_network_args(),
@@ -2185,6 +2355,70 @@ mod tests {
                 .join("debug")
                 .join(X86_64_VM_PROFILE.kernel_artifact_name)
         );
+    }
+
+    /// virtio-iommu can only confine PCI endpoints, so asking for it on
+    /// a machine whose virtio devices are memory-mapped is refused
+    /// rather than quietly ignored.
+    #[test]
+    fn iommu_is_refused_on_a_memory_mapped_machine() {
+        let tempdir =
+            tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
+        let config = tempdir.path().join("missing-vm.json");
+
+        for arch in [VmArch::Aarch64, VmArch::Riscv64] {
+            let error = resolve(VmCommand {
+                arch,
+                iommu: true,
+                config: Some(config.clone()),
+                ..minimal_command()
+            })
+            .expect_err("a memory-mapped machine cannot confine its devices");
+            assert!(
+                error.to_string().contains("--iommu is not available"),
+                "unexpected error for {arch:?}: {error}"
+            );
+        }
+
+        let resolved = resolve(VmCommand {
+            arch: VmArch::X86_64,
+            iommu: true,
+            config: Some(config),
+            ..minimal_command()
+        })
+        .expect("q35 carries its virtio devices on PCI");
+        assert!(resolved.iommu);
+        assert_eq!(
+            resolved.virtio_devices.access,
+            VirtioPlatformAccess::Confined
+        );
+    }
+
+    /// Every endpoint the unit protects is told to translate; the unit
+    /// itself is not one of its own endpoints.
+    #[test]
+    fn a_confined_machine_marks_only_its_endpoints() {
+        let devices = VirtioDeviceProfile {
+            ring: VirtioRingLayout::Split,
+            completion: VirtioCompletionOrder::Unordered,
+            access: VirtioPlatformAccess::Confined,
+        };
+
+        let mut endpoint = QemuOptions::new("virtio-blk-pci");
+        devices.apply_pci(&mut endpoint);
+        assert_eq!(
+            endpoint.to_string(),
+            "virtio-blk-pci,disable-legacy=on,iommu_platform=on"
+        );
+
+        let mut unit = QemuOptions::new("virtio-iommu-pci");
+        devices.apply(&mut unit);
+        assert_eq!(unit.to_string(), "virtio-iommu-pci");
+
+        // A memory-mapped device is never an endpoint either.
+        let mut mmio = QemuOptions::new("virtio-blk-device");
+        apply_transport(false, devices, &mut mmio);
+        assert_eq!(mmio.to_string(), "virtio-blk-device");
     }
 
     #[test]
@@ -2223,6 +2457,7 @@ mod tests {
             no_compiler_plugin: false,
             runtime_dir: None,
             keep_runtime_dir: false,
+            iommu: false,
             virtio_packed: false,
             virtio_in_order: false,
             network: default_network_args(),
@@ -2328,13 +2563,14 @@ mod tests {
             no_compiler_plugin: true,
             runtime_dir: None,
             keep_runtime_dir: false,
-            virtio_queues: VirtioQueueProfile::default(),
+            iommu: false,
+            virtio_devices: VirtioDeviceProfile::default(),
             network: default_network(),
             qemu_net: profile.network.map(|device| {
                 default_network()
                     .render(
                         device,
-                        VirtioQueueProfile::default(),
+                        VirtioDeviceProfile::default(),
                         profile.default_smp,
                         HostPlatform::current(),
                     )
@@ -2495,13 +2731,14 @@ mod tests {
             no_compiler_plugin: false,
             runtime_dir: None,
             keep_runtime_dir: false,
-            virtio_queues: VirtioQueueProfile::default(),
+            iommu: false,
+            virtio_devices: VirtioDeviceProfile::default(),
             network: default_network(),
             qemu_net: profile.network.map(|device| {
                 default_network()
                     .render(
                         device,
-                        VirtioQueueProfile::default(),
+                        VirtioDeviceProfile::default(),
                         profile.default_smp,
                         HostPlatform::current(),
                     )
