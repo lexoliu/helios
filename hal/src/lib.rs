@@ -18,6 +18,7 @@ pub mod iommu;
 pub mod memory;
 pub mod pmm;
 pub mod resource;
+pub mod rtc;
 pub mod serial;
 pub mod vmm;
 pub mod vmm_test_harness;

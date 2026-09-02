@@ -12,6 +12,7 @@ mod host_fs;
 mod iommu;
 mod net;
 mod pci;
+mod rtc;
 mod smp;
 mod watchdog;
 
@@ -242,6 +243,17 @@ fn x86_kernel_main() -> ! {
     // and the entropy device joins it once the executor runs.
     let root_entropy = helios_kernel::seed_root_entropy(&cpu, None);
     debug_state.install_root_entropy(root_entropy.clone());
+    // The calendar is read once, here, before any component can ask
+    // what time it is. The TSC carries wall time forward from that
+    // reading; nothing re-synchronises it afterwards.
+    match rtc::discover(rsdp_address, physical_memory_offset) {
+        Some(rtc) => {
+            debug_state.seed_wall_clock(cpu.now().ticks(), &rtc);
+        }
+        None => {
+            tracing::warn!("the FADT points at no readable CMOS clock; wall time reads as uptime");
+        }
+    }
     // Devices are brought up while the bootstrap processor still runs
     // with interrupts masked, so their MSI-X routes are published before
     // the first message can be delivered.

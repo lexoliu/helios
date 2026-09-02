@@ -92,6 +92,7 @@ mod entropy;
 mod gic;
 mod host_fs;
 mod net;
+mod rtc;
 
 mod debug_state {
     pub(crate) type RuntimeState =
@@ -501,6 +502,17 @@ extern "C" fn aarch64_kernel_main() -> ! {
     let root_entropy =
         helios_kernel::seed_root_entropy(&cpu, helios_hal::entropy::device_tree_seed(&boot_fdt));
     debug_state.install_root_entropy(root_entropy.clone());
+    // The calendar is read once, here, before any component can ask
+    // what time it is. The processor's timer carries wall time forward
+    // from that reading; nothing re-synchronises it afterwards.
+    match rtc::discover(&boot_fdt, physical_memory_offset, &handoff) {
+        Some(rtc) => {
+            debug_state.seed_wall_clock(cpu.now().ticks(), &rtc);
+        }
+        None => {
+            tracing::warn!("no PL031 in the device tree; the wall clock reads as uptime");
+        }
+    }
     let gic = platform_state.install_gic(gic::Gic::new(
         gic::GicRegions::discover(&boot_fdt),
         cpu.processor_count(),

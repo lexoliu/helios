@@ -79,7 +79,7 @@ pub use exec::{
     Spawner, StatsSample, Timer, TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel,
     TraceValue, YieldNow, duration_to_ticks, elapsed_millis, matches_perf_metric_filter,
     matches_profile_filter, matches_trace_filter, monotonic_nanos, nanos_to_ticks_ceil_saturating,
-    parse_console_text, yield_now,
+    parse_console_text, wall_clock_offset_nanos, yield_now,
 };
 pub use helios_hal::Platform;
 pub use helios_netstack::{

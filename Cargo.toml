@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "aarch64", "api", "api-macro", "artifact", "cli", "compiler-abi", "compiler-plugin", "compiler-support", "hal", "i6300esb", "hosted", "kernel", "kernel-macro", "netstack", "programs/debugger", "programs/http-client", "programs/init", "programs/perf", "programs/ping", "riscv", "x86", "inspector", "inspector-protocol", "virtio",
+    "aarch64", "api", "api-macro", "artifact", "cli", "compiler-abi", "compiler-plugin", "compiler-support", "hal", "i6300esb", "hosted", "kernel", "kernel-macro", "netstack", "programs/date", "programs/debugger", "programs/http-client", "programs/init", "programs/perf", "programs/ping", "riscv", "x86", "inspector", "inspector-protocol", "virtio",
 ]
 resolver = "2"
 

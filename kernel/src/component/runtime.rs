@@ -186,6 +186,13 @@ pub enum ComponentOutputStreamKind {
 pub trait ComponentRuntimeState: Clone + Send + 'static {
     fn uptime_nanos(&self, current_ticks: u64) -> u64;
 
+    /// Nanoseconds between the monotonic clock and wall time, as the
+    /// platform's real-time clock set them at boot.
+    ///
+    /// Zero on a machine whose kernel found no real-time clock, where
+    /// wall time cannot be told apart from uptime.
+    fn wall_clock_offset_nanos(&self) -> i128;
+
     fn record_console_text(&self, current_ticks: u64, text: &str);
 
     /// The kernel's root DRBG, from which this instance's pool is

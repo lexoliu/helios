@@ -511,6 +511,7 @@ fn convert_sample(sample: host_stats::Sample) -> stats::Sample {
     stats::Sample {
         timestamp: sample.timestamp,
         uptime: sample.uptime,
+        wall_clock: sample.wall_clock,
         processors: stats::Processors {
             configured: sample.processors.configured,
             online: sample.processors.online,

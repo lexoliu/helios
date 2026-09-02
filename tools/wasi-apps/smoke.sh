@@ -8,6 +8,9 @@ cargo_bin="${CARGO:-cargo}"
 arch="${HELIOS_WASI_SMOKE_ARCH:-aarch64}"
 cpu="${HELIOS_WASI_SMOKE_CPU:-max}"
 smp="${HELIOS_WASI_SMOKE_SMP:-1}"
+# A guest boots, compiles and runs inside this window, so the seeded
+# clock may legitimately trail the host by the length of the boot.
+readonly WALL_CLOCK_TOLERANCE_SECONDS=60
 tmp_files=()
 
 cleanup() {
@@ -153,6 +156,56 @@ run_smoke() {
     done
 }
 
+# The kernel seeds its wall clock from the platform real-time clock
+# before any program runs, so a guest asking wasi:clocks/wall-clock must
+# agree with the host that booted it. Comparing the printed epoch with
+# the host clock is what proves the seed came from the device rather
+# than from the kernel's own uptime, and it is the assertion here: the
+# kernel's own "wall clock seeded" line only reaches the serial on a
+# backend that mirrors kernel logs there, so it is reported as evidence
+# when present rather than required.
+run_wall_clock_smoke() {
+    printf '==> %s\n' wall-clock >&2
+
+    local output
+    if ! output="$("${cargo_bin}" "${vm_args[@]}" \
+        --boot-program dash \
+        --boot-program debugger \
+        --boot-program date \
+        --no-compiler-plugin \
+        shell -c '/bin/date' 2>&1)"; then
+        printf '%s\n' "${output}" >&2
+        printf 'smoke wall-clock failed before expected output check\n' >&2
+        return 1
+    fi
+
+    local seed_line
+    seed_line="$(grep -o -- 'wall clock seeded source=.*' <<<"${output}" | tail -n 1)"
+    if [[ -n "${seed_line}" ]]; then
+        printf '%s\n' "${seed_line}" >&2
+    fi
+
+    local guest_epoch
+    guest_epoch="$(sed -n 's/^unix_seconds=\([0-9][0-9]*\).*$/\1/p' <<<"${output}" | tail -n 1)"
+    if [[ -z "${guest_epoch}" ]]; then
+        printf '%s\n' "${output}" >&2
+        printf 'smoke wall-clock: the guest printed no unix_seconds line\n' >&2
+        return 1
+    fi
+
+    local host_epoch skew
+    host_epoch="$(date +%s)"
+    skew=$(( guest_epoch > host_epoch ? guest_epoch - host_epoch : host_epoch - guest_epoch ))
+    if (( skew > WALL_CLOCK_TOLERANCE_SECONDS )); then
+        printf '%s\n' "${output}" >&2
+        printf 'smoke wall-clock: guest epoch %s is %ss from host epoch %s\n' \
+            "${guest_epoch}" "${skew}" "${host_epoch}" >&2
+        return 1
+    fi
+    printf 'wall clock within %ss of the host (guest %s, host %s)\n' \
+        "${skew}" "${guest_epoch}" "${host_epoch}" >&2
+}
+
 run_smoke \
     dash \
     dash:42 \
@@ -163,6 +216,8 @@ run_smoke \
     shell \
     -c \
     'echo dash:42'
+
+run_wall_clock_smoke
 
 run_smoke \
     dash-process \

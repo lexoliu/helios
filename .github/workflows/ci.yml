@@ -127,6 +127,28 @@ jobs:
             shell -c 'echo ok' > boot-smoke.out
           cat boot-smoke.out
           grep -Fqx ok boot-smoke.out
+      - name: Seed the wall clock from the goldfish RTC
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          # The kernel reads the goldfish RTC before any program runs, so
+          # a guest asking wasi:clocks/wall-clock must agree with the
+          # runner's own clock. Comparing the two is what distinguishes a
+          # seeded clock from one that only counts uptime; the kernel's
+          # own seed line stays in the trace history on this backend,
+          # which does not mirror kernel logs to the serial.
+          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --boot-program dash --boot-program debugger --boot-program date \
+            --no-compiler-plugin \
+            shell -c '/bin/date' > wall-clock-smoke.out 2>&1
+          cat wall-clock-smoke.out
+          guest_epoch="$(sed -n 's/^unix_seconds=\([0-9][0-9]*\).*$/\1/p' wall-clock-smoke.out | tail -n 1)"
+          host_epoch="$(date +%s)"
+          skew=$(( guest_epoch > host_epoch ? guest_epoch - host_epoch : host_epoch - guest_epoch ))
+          echo "guest ${guest_epoch}, host ${host_epoch}, skew ${skew}s"
+          test "${skew}" -le 60
       - name: Run the coreutils applets through dash
         shell: bash
         working-directory: helios

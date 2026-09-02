@@ -57,6 +57,10 @@ pub enum TraceLevel {
 pub struct StatsSample {
     pub timestamp: u64,
     pub uptime: u64,
+    /// Wall time in nanoseconds since the Unix epoch, as the real-time
+    /// clock the kernel read at boot places it. Zero on a machine that
+    /// carried no such clock, where wall time is uptime.
+    pub wall_clock: u64,
     pub configured_processors: u32,
     pub online_processors: u32,
     /// The block device the kernel owns, absent on a machine that gave
