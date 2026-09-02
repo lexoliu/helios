@@ -5,11 +5,19 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The checkout must be at:
+The local checkout must be at (branch `codex/helios-minimal-current`):
 
 ```text
-11218b3b9269f1fb50df1f468980708c6fc3ce4e
+fb07c3dd6f8445e261b9a595967a56ba029fac5d
 ```
+
+CI does not clone that history. It checks out the vendored snapshot of the same
+tree, `lexoliu/wasmtime@b83d18c8558b6d32fb0c0727d1c6a32639842c49` (branch
+`helios-vendored`), whose `crates/`, `cranelift/`, `winch/` and `pulley/`
+directories are identical to the revision above. The snapshot pin lives in one
+place, `.github/actions/checkout-wasmtime/action.yml`, and every workflow that
+needs the workspace to resolve uses that action. Update the pin there and the
+revision here in the same change.
 
 This revision is based on upstream Wasmtime commit:
 
