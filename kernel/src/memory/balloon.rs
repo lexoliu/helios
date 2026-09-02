@@ -236,6 +236,7 @@ where
         handle: handle.clone(),
         runs: ArrayVec::new(),
         suppressed_target: None,
+        floor_notice: None,
     };
     kernel.spawn_local_detached(async move {
         service.run().await;
@@ -261,6 +262,9 @@ struct BalloonService<Pool: PhysFrameAllocator, Device> {
     /// balloon. Inflation stays off until the host names a different
     /// one.
     suppressed_target: Option<u32>,
+    /// The target and holding the balloon last said it could not grow
+    /// past, so the same conclusion is not logged on every wake.
+    floor_notice: Option<(usize, usize)>,
 }
 
 impl<Pool: PhysFrameAllocator, Device: MemoryBalloon + Clone> BalloonService<Pool, Device> {
@@ -346,20 +350,24 @@ impl<Pool: PhysFrameAllocator, Device: MemoryBalloon + Clone> BalloonService<Poo
     }
 
     async fn inflate_to(&mut self, target: usize) {
-        let mut wanted = (target - self.held_frames()).min(self.inflation_budget());
-        tracing::info!(
-            target_frames = target,
-            budget_frames = wanted,
-            "memory balloon inflating"
-        );
+        let held = self.held_frames();
+        let mut wanted = (target - held).min(self.inflation_budget());
         if wanted == 0 {
-            tracing::info!(
-                target_frames = target,
-                held_frames = self.held_frames(),
-                "memory balloon target is past the pressure floor; holding what it has"
-            );
+            // A host that keeps asking for more than the guest can spare
+            // leaves the balloon in this state, and the service is woken
+            // for every device configuration change while it lasts. The
+            // conclusion is worth saying once, not on every wake.
+            if self.floor_notice != Some((target, held)) {
+                self.floor_notice = Some((target, held));
+                tracing::info!(
+                    target_frames = target,
+                    held_frames = held,
+                    "memory balloon target is past the pressure floor; holding what it has"
+                );
+            }
             return;
         }
+        self.floor_notice = None;
         let mut run_frames = INFLATE_RUN_FRAMES.min(wanted);
         while wanted > 0 && !self.runs.is_full() {
             let Ok(range) = self.pool.allocate(run_frames.min(wanted), false) else {
@@ -743,6 +751,7 @@ mod tests {
                 handle: handle.clone(),
                 runs: ArrayVec::new(),
                 suppressed_target: None,
+                floor_notice: None,
             },
             handle,
         )
