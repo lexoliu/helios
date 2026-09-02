@@ -180,6 +180,10 @@ impl HostFsTransport for HostFsTransportService {
         self.inner.device.mount_tag()
     }
 
+    fn pipeline_depth(&self) -> usize {
+        self.inner.device.pipeline_depth()
+    }
+
     fn request<'a>(
         &'a self,
         bytes: &'a [u8],
