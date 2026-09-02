@@ -236,6 +236,11 @@ pub const ENTROPY_RESEED_INTERVAL: Duration = Duration::from_secs(60);
 /// can ask for random bytes. Reads never block the executor — the driver
 /// parks on the device's interrupt — and a failed read leaves the root
 /// with the state it already had.
+///
+/// The task is local to the calling processor because the device's
+/// completions are: a backend routes the entropy interrupt to the
+/// processor that brought the device up, so its sole reader belongs on
+/// that processor's run queue rather than on the work-stealing one.
 pub fn install_entropy_device<CpuImpl, WatchdogImpl, Device>(
     kernel: &Kernel<CpuImpl, WatchdogImpl>,
     root: RootEntropyHandle,
@@ -246,7 +251,7 @@ pub fn install_entropy_device<CpuImpl, WatchdogImpl, Device>(
     Device: HardwareEntropySource,
 {
     let timer = kernel.timer();
-    kernel.spawn_detached(async move {
+    kernel.spawn_local_detached(async move {
         reseed_forever(root, device, timer).await;
     });
 }
@@ -259,6 +264,10 @@ async fn reseed_forever<CpuImpl, Device>(
     CpuImpl: Cpu + Clone + Send + Sync + 'static,
     Device: HardwareEntropySource,
 {
+    tracing::info!(
+        interval_secs = ENTROPY_RESEED_INTERVAL.as_secs(),
+        "root entropy reseed task started"
+    );
     let mut material = [0_u8; ROOT_ENTROPY_MATERIAL_BYTES];
     loop {
         match device.fill(&mut material).await {
