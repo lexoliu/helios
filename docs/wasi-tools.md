@@ -170,6 +170,31 @@ Expected output includes:
 42
 ```
 
+The kernel seeds its wall clock from the platform real-time clock — a
+PL031 on AArch64, the goldfish RTC on RISC-V, the CMOS bank on x86 —
+before any program runs, so a guest sees the calendar rather than its
+own uptime. The `date` boot program prints what
+`wasi:clocks/wall-clock` answers:
+
+```bash
+cargo run -p helios-inspector -- vm --arch aarch64 --smp 1 \
+  --boot-program dash --boot-program debugger --boot-program date \
+  --no-compiler-plugin \
+  shell -c '/bin/date'
+```
+
+Expected output is the host's own epoch, within the length of the boot:
+
+```text
+unix_seconds=1788381063
+```
+
+The kernel logs `wall clock seeded source=<device> unix_seconds=<n>` as
+it reads the device; that line reaches the serial on backends that
+mirror kernel logs there (AArch64) and stays in the trace history on the
+others. `helios:system/stats` carries the same wall clock in every
+snapshot.
+
 The staged coreutils module provides ordinary shell helpers used by the
 WASIX shell smoke tests:
 
@@ -193,7 +218,8 @@ The complete local smoke gate for the staged real artifacts is:
 tools/wasi-apps/smoke.sh
 ```
 
-It runs the AArch64/HVF VM path for standard dash, Bash plus coreutils
+It runs the AArch64/HVF VM path for standard dash, the wall clock the
+kernel seeded from the platform RTC, Bash plus coreutils
 pipeline/redirection/script/cwd/env/exit-status behavior, QuickJS,
 CPython stdlib imports, and an ICMP echo against the slirp gateway. Set
 `HELIOS_WASI_SMOKE_RELEASE=1` when the smoke should rebuild and boot
