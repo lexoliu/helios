@@ -99,12 +99,30 @@ impl NegotiatedFeatures {
 /// selection through `FEATURES_OK`. The caller programs its virtqueues
 /// afterwards and sets `DRIVER_OK` itself.
 pub fn negotiate<T: VirtioTransport>(transport: &T, wanted: u64) -> IoResult<NegotiatedFeatures> {
+    negotiate_with(transport, |_| wanted)
+}
+
+/// Negotiation for drivers whose request depends on what the device
+/// offers.
+///
+/// `select` is handed the offered feature word and returns the mask the
+/// driver wants. It runs inside the handshake, after the device has been
+/// reset and told a driver is present, so a driver never has to poke the
+/// feature registers before the status protocol allows it (virtio 1.2
+/// §3.1.1) just to decide what to ask for. virtio-net needs this: it may
+/// only ask for multiqueue together with a control queue, and for TCP
+/// segmentation only together with checksum offload.
+pub fn negotiate_with<T, Select>(transport: &T, select: Select) -> IoResult<NegotiatedFeatures>
+where
+    T: VirtioTransport,
+    Select: FnOnce(u64) -> u64,
+{
     transport.reset();
     transport.set_status(DeviceStatus::ACKNOWLEDGE);
     transport.set_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER);
 
     let offered = transport.device_features();
-    let mut accepted = offered & wanted;
+    let mut accepted = offered & select(offered);
     if accepted & VirtioFeatures::VERSION_1.bits() == 0 {
         return Err(IoError::InvalidDeviceConfig(
             "virtio device does not support the 1.0 specification",

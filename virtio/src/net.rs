@@ -12,7 +12,7 @@ use core::ops::Range;
 use helios_hal::io::{IoError, IoResult};
 use spin::Mutex as SpinMutex;
 
-use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
+use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate_with};
 use crate::notify::Notify;
 use crate::queue::VirtQueue;
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
@@ -322,35 +322,33 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             return Err(IoError::Unsupported);
         }
 
-        let offered = transport.device_features();
-        // Only ask for MQ together with CTRL_VQ — without the
-        // control queue there is no way to enable additional pairs
-        // beyond the default single pair.
-        let mq_supported = offered & NET_FEATURE_MQ != 0 && offered & NET_FEATURE_CTRL_VQ != 0;
-        let mq_mask = if mq_supported {
-            NET_FEATURE_MQ | NET_FEATURE_CTRL_VQ
-        } else {
-            0
-        };
-        // HOST_TSO requires CSUM; only ask for segmentation when both
-        // the device offers TSO and checksum is available.
-        let tso_supported = offered & NET_FEATURE_CSUM != 0
-            && offered & (NET_FEATURE_HOST_TSO4 | NET_FEATURE_HOST_TSO6) != 0;
-        let tso_mask = if tso_supported {
-            NET_FEATURE_HOST_TSO4 | NET_FEATURE_HOST_TSO6
-        } else {
-            0
-        };
-        let features = negotiate(
-            &transport,
+        let features = negotiate_with(&transport, |offered| {
+            // Only ask for MQ together with CTRL_VQ — without the
+            // control queue there is no way to enable additional pairs
+            // beyond the default single pair.
+            let mq_supported = offered & NET_FEATURE_MQ != 0 && offered & NET_FEATURE_CTRL_VQ != 0;
+            let mq_mask = if mq_supported {
+                NET_FEATURE_MQ | NET_FEATURE_CTRL_VQ
+            } else {
+                0
+            };
+            // HOST_TSO requires CSUM; only ask for segmentation when both
+            // the device offers TSO and checksum is available.
+            let tso_supported = offered & NET_FEATURE_CSUM != 0
+                && offered & (NET_FEATURE_HOST_TSO4 | NET_FEATURE_HOST_TSO6) != 0;
+            let tso_mask = if tso_supported {
+                NET_FEATURE_HOST_TSO4 | NET_FEATURE_HOST_TSO6
+            } else {
+                0
+            };
             RING_FEATURES
                 | NET_FEATURE_CSUM
                 | NET_FEATURE_MAC
                 | NET_FEATURE_STATUS
                 | NET_FEATURE_MTU
                 | mq_mask
-                | tso_mask,
-        )?;
+                | tso_mask
+        })?;
 
         let mac_address = read_mac_address(&transport);
         let ip_mtu = read_mtu(&transport, features);
