@@ -436,6 +436,13 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
                 return Err(IoError::Unsupported);
             }
             let chain_limit = u16::try_from(data_segments + 2).map_err(|_| IoError::DeviceFault)?;
+            // A ring that cannot hold one whole request would make every
+            // submission wait for descriptors that can never arrive.
+            if queue_size < chain_limit {
+                return Err(IoError::InvalidDeviceConfig(
+                    "virtio-blk queue is too small to carry one request chain",
+                ));
+            }
             queues.push(BlockQueue {
                 queue: Mutex::new(VirtQueue::new(
                     &transport,
@@ -557,6 +564,13 @@ impl<T: VirtioTransport, C: QueueAffinity> VirtioBlockDevice<T, C> {
 
     /// Interrupt handlers should only call this method: acknowledge the
     /// device interrupt and wake the tasks parked on its queues.
+    ///
+    /// The transport acknowledges the whole interrupt-status word, so a
+    /// configuration-change notification (virtio 1.2 §4.1.4.5, ISR bit
+    /// 1) is cleared but not decoded: the capacity this driver reports
+    /// is the one the device published when it was opened. Re-reading it
+    /// needs the transport to report which bit fired, which is a change
+    /// to the interrupt path rather than to this driver.
     pub fn handle_interrupt(&self) {
         self.transport.ack_interrupt();
         self.interrupts.notify_all();
