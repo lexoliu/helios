@@ -11,7 +11,7 @@
 use core::ptr::NonNull;
 
 use arm_gic::gicv3::registers::{Gicd, GicrSgi};
-use arm_gic::gicv3::{GicCpuInterface, GicV3};
+use arm_gic::gicv3::{GicCpuInterface, GicV3, SgiTarget, SgiTargetGroup};
 use arm_gic::{IntId, InterruptGroup, Trigger, UniqueMmioPointer};
 use fdt::Fdt;
 use spin::Mutex;
@@ -23,6 +23,10 @@ const GROUP: InterruptGroup = InterruptGroup::Group1;
 /// `CNTV` — the EL1 virtual timer the kernel arms through
 /// `cntv_cval_el0` — is private peripheral interrupt 11, INTID 27.
 pub(crate) const VIRTUAL_TIMER_PPI: IntId = IntId::ppi(11);
+
+/// Software-generated interrupt that pulls one specific processor out
+/// of `wfi`. It carries no payload: taking it is the whole message.
+pub(crate) const WAKE_SGI: IntId = IntId::sgi(0);
 
 /// Lowest priority value the CPU interface accepts, so every interrupt
 /// the distributor signals reaches the processor. The driver's default
@@ -162,10 +166,14 @@ impl Gic {
         gic.init_cpu(index);
         GicCpuInterface::enable_group1(true);
         GicCpuInterface::set_priority_mask(PRIORITY_MASK_ALL);
-        gic.enable_interrupt(VIRTUAL_TIMER_PPI, Some(index), true)
-            .unwrap_or_else(|error| {
-                panic!("AArch64 GIC could not enable the virtual timer PPI: {error}")
-            });
+        for intid in [VIRTUAL_TIMER_PPI, WAKE_SGI] {
+            gic.enable_interrupt(intid, Some(index), true)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "AArch64 GIC could not enable {intid:?} on redistributor {index}: {error}"
+                    )
+                });
+        }
         tracing::debug!("GICv3 cpu interface online mpidr={mpidr:#x} redistributor={index}");
     }
 
@@ -184,6 +192,30 @@ impl Gic {
             .unwrap_or_else(|error| panic!("AArch64 GIC could not enable {intid:?}: {error}"));
         tracing::info!("GICv3 routed {intid:?} to mpidr={mpidr:#x} trigger={trigger:?}");
     }
+}
+
+/// Sends the wake SGI to the single processor with `mpidr`.
+///
+/// Unlike the `sev` this replaces, the interrupt reaches only its
+/// target, so waking one task no longer drags every parked processor
+/// out of `wfi`.
+pub(crate) fn send_wake(mpidr: u64) {
+    let affinity0 = (mpidr & 0xff) as u8;
+    assert!(
+        affinity0 < 16,
+        "AArch64 processor MPIDR {mpidr:#x} has an affinity 0 outside a single SGI target list"
+    );
+    GicCpuInterface::send_sgi(
+        WAKE_SGI,
+        SgiTarget::List {
+            affinity3: ((mpidr >> 32) & 0xff) as u8,
+            affinity2: ((mpidr >> 16) & 0xff) as u8,
+            affinity1: ((mpidr >> 8) & 0xff) as u8,
+            target_list: 1 << affinity0,
+        },
+        SgiTargetGroup::CurrentGroup1,
+    )
+    .unwrap_or_else(|error| panic!("AArch64 GIC could not send the wake SGI: {error}"));
 }
 
 /// Acknowledges the highest priority pending interrupt, if any.

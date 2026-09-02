@@ -181,6 +181,12 @@ struct ProcessorRuntime {
     /// Device interrupt routes, installed on the bootstrap processor
     /// only: every device SPI is routed to it.
     device_interrupts: Once<DeviceInterruptRoutes>,
+    /// Set by `wake_processor` before it sends the wake SGI, cleared by
+    /// `park_current` under masked interrupts. It closes the window
+    /// between the run loop finding its queue empty and the `wfi` that
+    /// parks: a wake published in that window is observed instead of
+    /// slept through.
+    wake_pending: AtomicBool,
     /// Block size in bytes for the `DC ZVA` cache-line zero
     /// instruction, cached from `DCZID_EL0` at processor bring-up.
     /// Zero means DC ZVA is prohibited on this PE (`DCZID_EL0.DZP`
@@ -200,6 +206,7 @@ impl ProcessorRuntime {
             timer: Once::new(),
             program_service: Once::new(),
             device_interrupts: Once::new(),
+            wake_pending: AtomicBool::new(false),
             dc_zva_block_bytes: AtomicU32::new(0),
         }
     }
@@ -609,19 +616,36 @@ impl Cpu for Aarch64Cpu {
     }
 
     fn park_current(&self) {
-        unsafe {
-            asm!("wfe", options(nomem, nostack, preserves_flags));
+        let runtime = current_processor_runtime();
+        let daif = read_daif();
+        // Masking IRQ around the check and the wait is what makes the
+        // pair race-free: a wake SGI that arrives after the flag test
+        // stays pending rather than being taken and forgotten, and WFI
+        // completes on a pending interrupt even while PSTATE.I masks
+        // it. Restoring DAIF afterwards then delivers it. WFE is not an
+        // option here: under HVF it returns immediately and the park
+        // becomes a spin that burns a whole host core per processor.
+        mask_irq();
+        if !runtime.wake_pending.swap(false, Ordering::AcqRel) {
+            unsafe {
+                asm!("wfi", options(nomem, nostack, preserves_flags));
+            }
         }
+        // SAFETY: restores exactly the mask state the caller had.
+        unsafe { write_daif(daif) };
     }
 
     fn start_processor(&self, processor: ProcessorId) {
         self.state.start_processor(processor);
     }
 
-    fn wake_processor(&self, _processor: ProcessorId) {
-        unsafe {
-            asm!("sev", options(nomem, nostack, preserves_flags));
-        }
+    fn wake_processor(&self, processor: ProcessorId) {
+        let slot = self.state.processor_slot(processor);
+        // Publish before signalling: `park_current` masks interrupts
+        // around its own test, so a target that is on its way into
+        // `wfi` either sees this store or takes the pending SGI.
+        slot.runtime.wake_pending.store(true, Ordering::Release);
+        gic::send_wake(slot.mp_info.mpidr);
     }
 
     fn now(&self) -> Instant {
@@ -994,7 +1018,10 @@ extern "C" fn aarch64_handle_sync_exception(
 extern "C" fn aarch64_handle_irq() {
     let runtime = current_processor_runtime();
     while let Some(intid) = gic::acknowledge_interrupt() {
-        if intid == gic::VIRTUAL_TIMER_PPI {
+        if intid == gic::WAKE_SGI {
+            // The wake carries no payload: returning from `wfi` is the
+            // whole message, and `park_current` owns the flag.
+        } else if intid == gic::VIRTUAL_TIMER_PPI {
             if let Some(program_service) = runtime.program_service.get() {
                 program_service.increment_epoch();
             }
@@ -1028,6 +1055,27 @@ fn mask_irq() {
             "msr daifset, #0x2",
             options(nomem, nostack, preserves_flags)
         );
+    }
+}
+
+fn read_daif() -> u64 {
+    let daif: u64;
+    unsafe {
+        asm!("mrs {daif}, daif", daif = out(reg) daif, options(nomem, nostack, preserves_flags));
+    }
+    daif
+}
+
+/// Restores a previously read `DAIF`.
+///
+/// # Safety
+///
+/// `daif` must come from [`read_daif`] on this processor, so the call
+/// restores a mask state the caller established rather than inventing
+/// one.
+unsafe fn write_daif(daif: u64) {
+    unsafe {
+        asm!("msr daif, {daif}", daif = in(reg) daif, options(nomem, nostack, preserves_flags));
     }
 }
 
