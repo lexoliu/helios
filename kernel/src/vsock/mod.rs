@@ -25,6 +25,7 @@ use core::future::{Future, poll_fn};
 use core::pin::pin;
 use core::task::Poll;
 
+use event_listener::{Event, EventListener};
 use helios_hal::cpu::{Cpu, Instant};
 use helios_hal::vsock::{
     VsockAddress, VsockDelivery, VsockDevice, VsockPacketHeader, VsockShutdown,
@@ -32,7 +33,7 @@ use helios_hal::vsock::{
 use spin::Mutex as SpinMutex;
 use triomphe::Arc;
 
-use crate::{Notify, Timer};
+use crate::{ProgressMark, ProgressSignal, Timer};
 
 pub use table::{
     MAX_VSOCK_BACKLOG, MAX_VSOCK_CONNECTIONS, MAX_VSOCK_LISTENERS, VSOCK_RECEIVE_WINDOW_BYTES,
@@ -75,7 +76,18 @@ where
     table: SpinMutex<VsockTable>,
     /// Signalled whenever a packet arrived, so every parked reader,
     /// writer and accepter re-tests what it was waiting for.
-    progress: Notify,
+    ///
+    /// Waiters take their mark *before* they test the table and park on
+    /// it afterwards, which is what makes the wait both complete and
+    /// quiet: a packet that lands in between falls after the mark and
+    /// the park returns at once, and a wait that follows a quiet moment
+    /// really parks. A permit-counting notification can do neither —
+    /// one arrival would release exactly one of the operations parked on
+    /// this link, and permits handed out while nobody was waiting make
+    /// the next wait return immediately, turning every one of these
+    /// loops into a spin that never yields the cooperative executor it
+    /// shares with the receive pump.
+    progress: ProgressSignal,
 }
 
 impl<CpuImpl, Device> VsockService<CpuImpl, Device>
@@ -91,7 +103,7 @@ where
                 timer,
                 device,
                 table: SpinMutex::new(table),
-                progress: Notify::new(),
+                progress: ProgressSignal::new(),
             }),
         }
     }
@@ -145,7 +157,7 @@ where
                     tracing::warn!(?error, "vsock device delivered an unusable packet");
                 }
             }
-            self.inner.progress.notify_all();
+            self.inner.progress.signal();
         }
     }
 
@@ -182,13 +194,14 @@ where
     ) -> Result<VsockStreamId, VsockError> {
         let deadline = self.deadline(timeout_nanos);
         loop {
+            let armed = self.arm();
             if let Some(stream) = self.inner.table.lock().accept(listener)? {
                 return Ok(stream);
             }
             if self.expired(deadline) {
                 return Err(VsockError::Timeout);
             }
-            self.wait_for_progress(deadline).await;
+            self.park(armed, deadline).await;
         }
     }
 
@@ -205,6 +218,7 @@ where
             return Err(error);
         }
         loop {
+            let armed = self.arm();
             match self.inner.table.lock().connect_progress(stream) {
                 Ok(true) => return Ok(stream),
                 Ok(false) => {}
@@ -217,7 +231,7 @@ where
                 let _ = self.close(stream).await;
                 return Err(VsockError::Timeout);
             }
-            self.wait_for_progress(deadline).await;
+            self.park(armed, deadline).await;
         }
     }
 
@@ -243,6 +257,7 @@ where
         // buffer is bounded by it however much the caller asks for.
         let mut buffer = vec![0_u8; max_bytes.min(VSOCK_RECEIVE_WINDOW_BYTES)];
         loop {
+            let armed = self.arm();
             let progress = self.inner.table.lock().read(stream, &mut buffer)?;
             match progress {
                 VsockReadProgress::Ready { len, credit_update } => {
@@ -257,7 +272,7 @@ where
                     if self.expired(deadline) {
                         return Err(VsockError::Timeout);
                     }
-                    self.wait_for_progress(deadline).await;
+                    self.park(armed, deadline).await;
                 }
             }
         }
@@ -278,6 +293,7 @@ where
         let deadline = self.deadline(timeout_nanos);
         let mut sent = 0;
         while sent < bytes.len() {
+            let armed = self.arm();
             let progress = self
                 .inner
                 .table
@@ -310,7 +326,7 @@ where
                             Ok(sent)
                         };
                     }
-                    self.wait_for_progress(deadline).await;
+                    self.park(armed, deadline).await;
                 }
             }
         }
@@ -374,14 +390,25 @@ where
         self.inner.cpu.now() >= deadline
     }
 
-    /// Parks until a packet arrives or the deadline passes.
-    async fn wait_for_progress(&self, deadline: Instant) {
-        let notified = self.inner.progress.notified();
-        let mut notified = pin!(notified);
+    /// Takes a place in the packet stream, to be parked on once the
+    /// caller has tested the table and found nothing to do.
+    ///
+    /// The mark is taken here, before the test, so a packet that arrives
+    /// between the test and the park lands after it rather than slipping
+    /// past.
+    fn arm(&self) -> ProgressMark {
+        self.inner.progress.mark()
+    }
+
+    /// Parks on an armed place in the packet stream until a packet
+    /// arrives or the deadline passes.
+    async fn park(&self, armed: ProgressMark, deadline: Instant) {
+        let arrived = self.inner.progress.changed(armed);
+        let mut armed = pin!(arrived);
         let sleep = self.inner.timer.sleep_until(deadline);
         let mut sleep = pin!(sleep);
         poll_fn(|context| {
-            if notified.as_mut().poll(context).is_ready() {
+            if armed.as_mut().poll(context).is_ready() {
                 return Poll::Ready(());
             }
             if sleep.as_mut().poll(context).is_ready() {
