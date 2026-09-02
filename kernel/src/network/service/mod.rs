@@ -543,6 +543,7 @@ where
             .with_rx_budget(rx_poll_budget)
             .with_rx_checksum_offload(rx_checksum_offload)
             .with_tx_checksum_offload(tx_checksum_offload)
+            .with_direct_tx_dma(capabilities.direct_tx_dma)
             .with_segmentation_offload(segmentation);
         let stack_rx_budget = Stack::new(stack_config).config().rx_budget;
         let state = NetworkShardSet::new(shard_count, |index| {

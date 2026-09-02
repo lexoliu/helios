@@ -25,7 +25,6 @@ use alloc::vec::Vec;
 use async_lock::Mutex as AsyncMutex;
 use bytes::Bytes;
 use core::cell::UnsafeCell;
-use core::future::Future;
 use core::mem::size_of;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -67,6 +66,15 @@ const MAX_SEGMENTED_TRANSMIT_FRAME_BYTES: usize = u16::MAX as usize + ETH_HEADER
 const MAX_RX_REASSEMBLY_BUFFERS: usize = 64;
 /// A transmit frame is either one slot-resident buffer or a slot-resident
 /// header prefix chained to an external payload.
+///
+/// Two is the deliberate ceiling, not a placeholder. Everything the
+/// network stack hands the driver is a header prefix plus at most one
+/// refcounted payload buffer, and that buffer is a single kernel-heap
+/// allocation, which every target's DMA pool maps linearly onto one
+/// contiguous physical range. A third descriptor would have no
+/// producer, and with `VIRTIO_F_INDIRECT_DESC` the limit also sizes the
+/// indirect table allocated for every descriptor in the ring, so
+/// widening it speculatively costs memory on every queue pair.
 const TX_CHAIN_LIMIT: u16 = 2;
 /// A control command is a read-only command buffer plus a writable ack.
 const CONTROL_CHAIN_LIMIT: u16 = 2;
@@ -151,115 +159,23 @@ pub struct TxChecksumMeta {
     pub offset: u16,
 }
 
-/// Borrowed transmit frame plus checksum-offload metadata.
-#[derive(Clone, Copy, Debug)]
-pub struct TxFrameDescriptor<'a> {
-    pub bytes: &'a [u8],
-    pub checksum: Option<TxChecksumMeta>,
-    /// Set when the device is expected to split this frame into
-    /// MSS-sized wire segments.
-    pub gso: Option<TxGsoMeta>,
-}
-
-/// A frame acceptable to the transmit entry points. Plain byte slices
-/// transmit with no offload; [`TxFrameDescriptor`] carries checksum
-/// metadata into the virtio-net header.
-///
-/// A frame is `frame_bytes()` followed by `payload()` on the wire. The
-/// copying entry points require the payload to be absent because they
-/// have one slot per frame; the scatter entry point copies only
-/// `frame_bytes()` into the slot and chains the payload by reference,
-/// holding the refcounted handle until the descriptor completes.
-pub trait TxFrame {
-    fn frame_bytes(&self) -> &[u8];
-
-    /// Frame bytes the device reads in place rather than out of the
-    /// descriptor slot, as the refcounted handle that owns them.
-    fn payload(&self) -> Option<&Bytes> {
-        None
-    }
-
-    fn tx_checksum(&self) -> Option<TxChecksumMeta> {
-        None
-    }
-
-    /// Segmentation metadata for a frame the device splits. A frame
-    /// carrying this is larger than the interface MTU on purpose.
-    fn tx_segmentation(&self) -> Option<TxGsoMeta> {
-        None
-    }
-}
-
-impl TxFrame for &[u8] {
-    fn frame_bytes(&self) -> &[u8] {
-        self
-    }
-}
-
-impl TxFrame for TxFrameDescriptor<'_> {
-    fn frame_bytes(&self) -> &[u8] {
-        self.bytes
-    }
-
-    fn tx_checksum(&self) -> Option<TxChecksumMeta> {
-        self.checksum
-    }
-
-    fn tx_segmentation(&self) -> Option<TxGsoMeta> {
-        self.gso
-    }
-}
-
-impl TxFrame for helios_netstack::TxFrameRef<'_> {
-    fn frame_bytes(&self) -> &[u8] {
-        self.bytes
-    }
-
-    fn payload(&self) -> Option<&Bytes> {
-        self.payload
-    }
-
-    fn tx_checksum(&self) -> Option<TxChecksumMeta> {
-        self.checksum.map(|checksum| TxChecksumMeta {
+impl From<helios_netstack::TxChecksum> for TxChecksumMeta {
+    fn from(checksum: helios_netstack::TxChecksum) -> Self {
+        Self {
             start: checksum.start,
             offset: checksum.offset,
-        })
-    }
-
-    fn tx_segmentation(&self) -> Option<TxGsoMeta> {
-        self.segmentation.map(tx_gso_meta)
+        }
     }
 }
 
-impl TxFrame for helios_netstack::PacketBuffer {
-    fn frame_bytes(&self) -> &[u8] {
-        self.as_slice()
-    }
-
-    fn payload(&self) -> Option<&Bytes> {
-        helios_netstack::PacketBuffer::payload(self)
-    }
-
-    fn tx_checksum(&self) -> Option<TxChecksumMeta> {
-        helios_netstack::PacketBuffer::tx_checksum(self).map(|checksum| TxChecksumMeta {
-            start: checksum.start,
-            offset: checksum.offset,
-        })
-    }
-
-    fn tx_segmentation(&self) -> Option<TxGsoMeta> {
-        helios_netstack::PacketBuffer::tx_segmentation(self).map(tx_gso_meta)
-    }
-}
-
-/// Translates the stack's segmentation metadata into the virtio-net
-/// header fields that describe it.
-fn tx_gso_meta(segmentation: helios_netstack::TxSegmentation) -> TxGsoMeta {
-    TxGsoMeta {
-        ipv6: segmentation.ipv6,
-        hdr_len: segmentation.header_len,
-        mss: segmentation.segment_bytes,
-        ecn: segmentation.ecn,
+impl From<helios_netstack::TxSegmentation> for TxGsoMeta {
+    fn from(segmentation: helios_netstack::TxSegmentation) -> Self {
+        Self {
+            ipv6: segmentation.ipv6,
+            hdr_len: segmentation.header_len,
+            mss: segmentation.segment_bytes,
+            ecn: segmentation.ecn,
+        }
     }
 }
 
@@ -1422,127 +1338,6 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         Ok(Some(()))
     }
 
-    pub async fn transmit(&self, frame: &[u8]) -> IoResult<()> {
-        self.transmit_with_wait(frame, || self.interrupts.notified())
-            .await
-    }
-
-    pub async fn transmit_with_wait<Wait, Fut>(&self, frame: &[u8], wait: Wait) -> IoResult<()>
-    where
-        Wait: FnMut() -> Fut,
-        Fut: Future<Output = ()>,
-    {
-        self.transmit_batch_with_wait(&[frame], wait).await
-    }
-
-    pub async fn transmit_batch(&self, frames: &[&[u8]]) -> IoResult<()> {
-        self.transmit_batch_with_wait(frames, || self.interrupts.notified())
-            .await
-    }
-
-    pub async fn transmit_batch_with_wait<Wait, Fut>(
-        &self,
-        frames: &[&[u8]],
-        wait: Wait,
-    ) -> IoResult<()>
-    where
-        Wait: FnMut() -> Fut,
-        Fut: Future<Output = ()>,
-    {
-        self.transmit_frames_with_wait(frames, wait).await
-    }
-
-    pub async fn try_transmit_frames<Frame>(&self, frames: &[Frame]) -> IoResult<usize>
-    where
-        Frame: TxFrame,
-    {
-        self.try_transmit_frames_on_pair(0, frames).await
-    }
-
-    /// Per-pair variant of [`try_transmit_frames`]. The pair index
-    /// is clamped to the actual queue pair count so callers that
-    /// pass a stale CPU index never panic and instead route to the
-    /// last live queue.
-    pub async fn try_transmit_frames_on_pair<Frame>(
-        &self,
-        pair_idx: usize,
-        frames: &[Frame],
-    ) -> IoResult<usize>
-    where
-        Frame: TxFrame,
-    {
-        self.validate_tx_frames(frames)?;
-        let pair_idx = self.normalize_pair_idx(pair_idx);
-        let mut state = self.queue_pairs[pair_idx].tx_state.lock();
-        Self::drain_tx_completions_when_full(&mut state, frames.len());
-        let mut next_frame = 0usize;
-        self.submit_available_tx_frames(&mut state, frames, &mut next_frame)
-    }
-
-    pub fn try_transmit_frames_immediate<Frame>(&self, frames: &[Frame]) -> IoResult<Option<usize>>
-    where
-        Frame: TxFrame,
-    {
-        self.try_transmit_frames_immediate_on_pair(0, frames)
-    }
-
-    pub fn try_transmit_frames_immediate_on_pair<Frame>(
-        &self,
-        pair_idx: usize,
-        frames: &[Frame],
-    ) -> IoResult<Option<usize>>
-    where
-        Frame: TxFrame,
-    {
-        self.validate_tx_frames(frames)?;
-        self.try_transmit_valid_frames_immediate(self.normalize_pair_idx(pair_idx), frames)
-    }
-
-    /// Immediate TX path for frames already produced by the Helios netstack.
-    ///
-    /// The stack's `PacketBuffer` capacity and frame encoders enforce Ethernet
-    /// frame bounds before queueing; skipping the second validation pass keeps
-    /// the profile-visible `network;tx-submit-immediate-device-*` phase focused
-    /// on descriptor ownership and payload copy. Slot capacity is still checked
-    /// by `write_tx_payload` immediately before DMA publication.
-    pub fn try_transmit_trusted_frames_immediate<Frame>(
-        &self,
-        frames: &[Frame],
-    ) -> IoResult<Option<usize>>
-    where
-        Frame: TxFrame,
-    {
-        self.try_transmit_trusted_frames_immediate_on_pair(0, frames)
-    }
-
-    pub fn try_transmit_trusted_frames_immediate_on_pair<Frame>(
-        &self,
-        pair_idx: usize,
-        frames: &[Frame],
-    ) -> IoResult<Option<usize>>
-    where
-        Frame: TxFrame,
-    {
-        self.try_transmit_valid_frames_immediate(self.normalize_pair_idx(pair_idx), frames)
-    }
-
-    fn try_transmit_valid_frames_immediate<Frame>(
-        &self,
-        pair_idx: usize,
-        frames: &[Frame],
-    ) -> IoResult<Option<usize>>
-    where
-        Frame: TxFrame,
-    {
-        let Some(mut state) = self.queue_pairs[pair_idx].tx_state.try_lock() else {
-            return Ok(None);
-        };
-        Self::drain_tx_completions_when_full(&mut state, frames.len());
-        let mut next_frame = 0usize;
-        self.submit_available_tx_frames(&mut state, frames, &mut next_frame)
-            .map(Some)
-    }
-
     /// Maps a caller-provided queue pair index onto the live
     /// queue-pair ring. This lets CPU/shard indices exceed the
     /// device's negotiated queue-pair count without adding a legacy
@@ -1552,162 +1347,6 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             return 0;
         }
         pair_idx % self.queue_pairs.len()
-    }
-
-    pub async fn transmit_frames_with_wait<Frame, Wait, Fut>(
-        &self,
-        frames: &[Frame],
-        wait: Wait,
-    ) -> IoResult<()>
-    where
-        Frame: TxFrame,
-        Wait: FnMut() -> Fut,
-        Fut: Future<Output = ()>,
-    {
-        self.transmit_frames_with_wait_on_pair(0, frames, wait)
-            .await
-    }
-
-    pub async fn transmit_frames_with_wait_on_pair<Frame, Wait, Fut>(
-        &self,
-        pair_idx: usize,
-        frames: &[Frame],
-        mut wait: Wait,
-    ) -> IoResult<()>
-    where
-        Frame: TxFrame,
-        Wait: FnMut() -> Fut,
-        Fut: Future<Output = ()>,
-    {
-        self.validate_tx_frames(frames)?;
-        let pair_idx = self.normalize_pair_idx(pair_idx);
-
-        let mut next_frame = 0usize;
-        while next_frame < frames.len() {
-            let submitted = {
-                let mut state = self.queue_pairs[pair_idx].tx_state.lock();
-                Self::drain_tx_completions_when_full(&mut state, frames.len() - next_frame);
-                self.submit_available_tx_frames(&mut state, frames, &mut next_frame)?
-            };
-
-            if submitted != 0 {
-                continue;
-            }
-
-            let should_wait = {
-                let mut state = self.queue_pairs[pair_idx].tx_state.lock();
-                Self::drain_tx_completions(&mut state, usize::MAX);
-                state.tx_queue.available_descriptors() == 0
-            };
-            if should_wait {
-                wait().await;
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_tx_frames<Frame>(&self, frames: &[Frame]) -> IoResult<()>
-    where
-        Frame: TxFrame,
-    {
-        for frame in frames {
-            let frame = frame.frame_bytes();
-            if frame.is_empty() || frame.len() > self.max_frame_len {
-                return Err(IoError::InvalidBufferLength {
-                    required_multiple: 1,
-                    actual: frame.len(),
-                });
-            }
-        }
-        Ok(())
-    }
-
-    fn submit_available_tx_frames<Frame>(
-        &self,
-        state: &mut NetTxState<T>,
-        frames: &[Frame],
-        next_frame: &mut usize,
-    ) -> IoResult<usize>
-    where
-        Frame: TxFrame,
-    {
-        let NetTxState {
-            tx_queue,
-            tx_buffers,
-            tx_buffer_len,
-            tx_in_flight,
-            tx_payloads: _,
-        } = state;
-        let mut submitted = 0usize;
-        let available_frames = tx_queue
-            .available_descriptors()
-            .min(frames.len().saturating_sub(*next_frame));
-        while submitted < available_frames {
-            let frame = frames[*next_frame].frame_bytes();
-            // The copying entry points have one slot per frame; a frame
-            // that reaches them with a scatter payload attached would go
-            // on the wire truncated behind a matching-length IP header.
-            assert!(
-                frames[*next_frame].payload().is_none(),
-                "scatter TCP frame routed through a copying transmit path"
-            );
-            let checksum = frames[*next_frame].tx_checksum();
-            let gso = frames[*next_frame].tx_segmentation();
-            if checksum.is_some() {
-                assert!(
-                    self.tx_checksum_negotiated,
-                    "checksum-offload frame submitted without negotiated VIRTIO_NET_F_CSUM"
-                );
-            }
-            if let Some(gso) = gso {
-                self.assert_segmentation_negotiated(gso);
-            }
-            let token = tx_queue.next_free_descriptor();
-            let token_index = usize::from(token);
-            assert!(
-                !tx_in_flight.get(token_index),
-                "virtio net TX descriptor {token} is still in flight"
-            );
-            let payload_len = write_tx_payload(
-                slot_buffer_mut(tx_buffers, *tx_buffer_len, token_index, "TX"),
-                self.header_len,
-                frame,
-                checksum,
-                gso,
-            )?;
-            let payload = slot_buffer(tx_buffers, *tx_buffer_len, token_index, payload_len, "TX");
-            let submitted_token = tx_queue.submit_read_only_deferred(&self.transport, payload)?;
-            assert_eq!(
-                submitted_token, token,
-                "virtio net TX descriptor allocation moved while payload was prepared"
-            );
-            tx_in_flight.set(token_index);
-            submitted += 1;
-            *next_frame += 1;
-        }
-        if submitted != 0 {
-            tx_queue.publish();
-            tx_queue.notify(&self.transport);
-        }
-        Ok(submitted)
-    }
-
-    pub async fn reclaim_transmit_completions(&self, budget: usize) -> IoResult<usize> {
-        self.reclaim_transmit_completions_on_pair(0, budget).await
-    }
-
-    pub async fn reclaim_transmit_completions_on_pair(
-        &self,
-        pair_idx: usize,
-        budget: usize,
-    ) -> IoResult<usize> {
-        let pair_idx = self.normalize_pair_idx(pair_idx);
-        let mut state = self.queue_pairs[pair_idx].tx_state.lock();
-        Ok(Self::drain_tx_completions(&mut state, budget))
-    }
-
-    pub fn reclaim_transmit_completions_immediate(&self, budget: usize) -> IoResult<Option<usize>> {
-        self.reclaim_transmit_completions_immediate_on_pair(0, budget)
     }
 
     pub fn reclaim_transmit_completions_immediate_on_pair(
@@ -1728,14 +1367,11 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     /// accepted payload's refcounted handle until the used ring returns
     /// its descriptor, so the caller may drop its own handle as soon as
     /// the submission is accepted.
-    pub fn try_transmit_scatter_immediate_on_pair<Frame>(
+    pub fn try_transmit_scatter_immediate_on_pair(
         &self,
         pair_idx: usize,
-        frames: &[Frame],
-    ) -> IoResult<Option<usize>>
-    where
-        Frame: TxFrame,
-    {
+        frames: &[helios_netstack::TxFrameRef<'_>],
+    ) -> IoResult<Option<usize>> {
         let pair_idx = self.normalize_pair_idx(pair_idx);
         let Some(mut state) = self.queue_pairs[pair_idx].tx_state.try_lock() else {
             return Ok(None);
@@ -1750,8 +1386,8 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         } = &mut *state;
         let mut submitted = 0usize;
         for frame in frames {
-            let checksum = frame.tx_checksum();
-            let gso = frame.tx_segmentation();
+            let checksum = frame.checksum.map(TxChecksumMeta::from);
+            let gso = frame.segmentation.map(TxGsoMeta::from);
             if checksum.is_some() {
                 assert!(
                     self.tx_checksum_negotiated,
@@ -1761,9 +1397,13 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             if let Some(gso) = gso {
                 self.assert_segmentation_negotiated(gso);
             }
-            let payload = frame.payload();
-            // A chain needs two descriptors (slot prefix + payload).
-            if tx_queue.available_descriptors() < 2 {
+            let payload = frame.payload.filter(|payload| !payload.is_empty());
+            // A frame is one buffer (the slot-resident prefix) plus one
+            // more when it carries a scatter payload. Asking the ring
+            // rather than counting descriptors is what lets an indirect
+            // chain cost a single ring slot instead of two.
+            let buffers = if payload.is_some() { 2 } else { 1 };
+            if !tx_queue.has_room_for(buffers) {
                 break;
             }
             let token = tx_queue.next_free_descriptor();
@@ -1773,10 +1413,9 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 "virtio net TX descriptor {token} is still in flight"
             );
             let slot = slot_buffer_mut(tx_buffers, *tx_buffer_len, token_index, "TX");
-            let prefix_len =
-                write_tx_payload(slot, self.header_len, frame.frame_bytes(), checksum, gso)?;
+            let prefix_len = write_tx_payload(slot, self.header_len, frame.bytes, checksum, gso)?;
             let prefix = slot_buffer(tx_buffers, *tx_buffer_len, token_index, prefix_len, "TX");
-            let submitted_token = match payload.filter(|payload| !payload.is_empty()) {
+            let submitted_token = match payload {
                 Some(payload) => {
                     tx_queue.submit_read_only_chain_deferred(&self.transport, &[prefix, payload])?
                 }
@@ -2772,6 +2411,97 @@ mod tests {
             state.tx_payloads[usize::from(token)].is_none(),
             "a completed descriptor releases the payload it was reading"
         );
+    }
+
+    /// The used ring is not the available ring: a device may finish
+    /// the second chain first, and the driver must release that chain's
+    /// payload and only that one.
+    #[test]
+    fn an_out_of_order_completion_releases_only_its_own_payload() {
+        let harness = NetHarness::new(NET_FEATURE_CSUM);
+        let headers = [0x22_u8; 54];
+        let first = Bytes::from(vec![0x11_u8; 512]);
+        let second = Bytes::from(vec![0x22_u8; 768]);
+        let first_address = first.as_ptr() as u64;
+        let second_address = second.as_ptr() as u64;
+        let first_token = {
+            let state = harness.device.queue_pairs[0]
+                .tx_state
+                .try_lock()
+                .expect("test transmit state is uncontended");
+            state.tx_queue.next_free_descriptor()
+        };
+
+        let submitted = harness
+            .device
+            .try_transmit_scatter_immediate_on_pair(
+                0,
+                &[
+                    helios_netstack::TxFrameRef {
+                        bytes: &headers,
+                        payload: Some(&first),
+                        checksum: None,
+                        segmentation: None,
+                    },
+                    helios_netstack::TxFrameRef {
+                        bytes: &headers,
+                        payload: Some(&second),
+                        checksum: None,
+                        segmentation: None,
+                    },
+                ],
+            )
+            .expect("scatter submission should succeed")
+            .expect("the transmit ring is uncontended in tests");
+        assert_eq!(submitted, 2);
+        drop(first);
+        drop(second);
+
+        let second_token = {
+            let state = harness.device.queue_pairs[0]
+                .tx_state
+                .try_lock()
+                .expect("test transmit state is uncontended");
+            let second_token = state
+                .tx_payloads
+                .iter()
+                .position(|pinned| {
+                    pinned
+                        .as_ref()
+                        .is_some_and(|payload| payload.as_ptr() as u64 == second_address)
+                })
+                .expect("the second frame's payload is pinned");
+            u16::try_from(second_token).expect("test token fits")
+        };
+        assert_ne!(second_token, first_token);
+
+        // The device finishes the second chain first.
+        harness.device.queue_pairs[0]
+            .tx_state
+            .try_lock()
+            .expect("test transmit state is uncontended")
+            .tx_queue
+            .device_complete(second_token, 0);
+        let reclaimed = harness
+            .device
+            .reclaim_transmit_completions_immediate_on_pair(0, 8)
+            .expect("completion drain should succeed")
+            .expect("the transmit ring is uncontended in tests");
+        assert_eq!(reclaimed, 1);
+
+        let state = harness.device.queue_pairs[0]
+            .tx_state
+            .try_lock()
+            .expect("test transmit state is uncontended");
+        assert!(
+            state.tx_payloads[usize::from(second_token)].is_none(),
+            "the completed chain released its payload"
+        );
+        let still_pinned = state.tx_payloads[usize::from(first_token)]
+            .as_ref()
+            .expect("the chain the device still owns keeps its payload");
+        assert_eq!(still_pinned.as_ptr() as u64, first_address);
+        assert_eq!(still_pinned.len(), 512);
     }
 
     /// virtio 1.2 §5.1.6.2: an oversized frame carries NEEDS_CSUM with

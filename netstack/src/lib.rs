@@ -589,82 +589,6 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
         LinkState::Up
     }
 
-    /// Transmits one borrowed frame and waits until the device accepts ownership.
-    fn transmit<'a>(&'a self, frame: &'a [u8]) -> impl Future<Output = IoResult<()>> + Send + 'a;
-
-    /// Transmits borrowed frame slices in order.
-    fn transmit_batch<'a>(
-        &'a self,
-        frames: &'a [&'a [u8]],
-    ) -> impl Future<Output = IoResult<()>> + Send + 'a {
-        async move {
-            for frame in frames {
-                self.transmit(frame).await?;
-            }
-            Ok(())
-        }
-    }
-
-    /// Transmits stack-owned packet buffers in order.
-    fn transmit_packet_batch<'a>(
-        &'a self,
-        frames: &'a [PacketBuffer],
-    ) -> impl Future<Output = IoResult<()>> + Send + 'a {
-        async move {
-            for frame in frames {
-                self.transmit(frame.as_slice()).await?;
-            }
-            Ok(())
-        }
-    }
-
-    /// Attempts to submit stack-owned packet buffers and returns the accepted frame count.
-    fn try_transmit_packet_batch<'a>(
-        &'a self,
-        frames: &'a [PacketBuffer],
-    ) -> impl Future<Output = IoResult<usize>> + Send + 'a {
-        async move {
-            if frames.is_empty() {
-                return Ok(0);
-            }
-            self.transmit(frames[0].as_slice()).await?;
-            Ok(1)
-        }
-    }
-
-    /// Variant of `try_transmit_packet_batch` that submits to a
-    /// specific TX queue pair. The default implementation routes
-    /// every queue index to the single-queue path; multi-queue
-    /// devices override this to dispatch directly to the requested
-    /// queue without locking the other pairs' rings.
-    fn try_transmit_packet_batch_on<'a>(
-        &'a self,
-        queue_idx: usize,
-        frames: &'a [PacketBuffer],
-    ) -> impl Future<Output = IoResult<usize>> + Send + 'a {
-        let _ = queue_idx;
-        self.try_transmit_packet_batch(frames)
-    }
-
-    /// Attempts to submit borrowed frames (with their checksum-offload
-    /// metadata) without waiting for any async lock or event.
-    fn try_transmit_slices_immediate(&self, frames: &[TxFrameRef<'_>]) -> IoResult<Option<usize>> {
-        let _ = frames;
-        Ok(None)
-    }
-
-    /// Variant of `try_transmit_slices_immediate` that submits to a
-    /// specific TX queue pair. Same default-routes-to-queue-0
-    /// pattern as the packet-batch counterpart above.
-    fn try_transmit_slices_immediate_on(
-        &self,
-        queue_idx: usize,
-        frames: &[TxFrameRef<'_>],
-    ) -> IoResult<Option<usize>> {
-        let _ = queue_idx;
-        self.try_transmit_slices_immediate(frames)
-    }
-
     /// Zero-copy transmit: headers are copied into the device slot but
     /// each frame's scatter payload is read in place. The device holds
     /// the refcounted payload handle for as long as it owns the
@@ -681,41 +605,17 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
         Ok(None)
     }
 
-    /// Reclaims completed transmit slots without waiting for new device events.
-    fn reclaim_transmit_completions(
-        &self,
-        budget: usize,
-    ) -> impl Future<Output = IoResult<usize>> + Send + '_ {
-        let _ = budget;
-        async { Ok(0) }
-    }
-
-    /// Variant of `reclaim_transmit_completions` that targets a
-    /// specific TX queue pair.
-    fn reclaim_transmit_completions_on(
-        &self,
-        queue_idx: usize,
-        budget: usize,
-    ) -> impl Future<Output = IoResult<usize>> + Send + '_ {
-        let _ = queue_idx;
-        self.reclaim_transmit_completions(budget)
-    }
-
-    /// Reclaims completed transmit slots without constructing an async wait path.
-    fn reclaim_transmit_completions_immediate(&self, budget: usize) -> IoResult<Option<usize>> {
-        let _ = budget;
-        Ok(None)
-    }
-
-    /// Variant of `reclaim_transmit_completions_immediate` that
-    /// targets a specific TX queue pair.
+    /// Drains completed transmit descriptors on one queue pair,
+    /// releasing the scatter payloads they were reading, and reports
+    /// how many finished. `Ok(None)` means the queue could not be
+    /// entered without waiting.
     fn reclaim_transmit_completions_immediate_on(
         &self,
         queue_idx: usize,
         budget: usize,
     ) -> IoResult<Option<usize>> {
-        let _ = queue_idx;
-        self.reclaim_transmit_completions_immediate(budget)
+        let _ = (queue_idx, budget);
+        Ok(None)
     }
 
     /// Waits for interface progress, such as RX arrival or TX completion.

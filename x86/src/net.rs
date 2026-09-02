@@ -150,27 +150,6 @@ impl NetworkDevice for VirtioNetworkDevice {
         self.inner.repost_rx_frames_immediate(frames)
     }
 
-    async fn transmit(&self, frame: &[u8]) -> Result<(), IoError> {
-        self.inner.transmit(frame).await
-    }
-
-    async fn try_transmit_packet_batch<'a>(
-        &'a self,
-        frames: &'a [PacketBuffer],
-    ) -> Result<usize, IoError> {
-        self.try_transmit_packet_batch_on(0, frames).await
-    }
-
-    async fn try_transmit_packet_batch_on<'a>(
-        &'a self,
-        queue_idx: usize,
-        frames: &'a [PacketBuffer],
-    ) -> Result<usize, IoError> {
-        self.inner
-            .try_transmit_frames_on_pair(queue_idx, frames)
-            .await
-    }
-
     fn try_receive_frames_immediate_on<'a, 'slots>(
         &'a self,
         queue_idx: usize,
@@ -190,39 +169,6 @@ impl NetworkDevice for VirtioNetworkDevice {
     ) -> Result<Option<usize>, IoError> {
         self.inner
             .try_transmit_scatter_immediate_on_pair(queue_idx, frames)
-    }
-
-    fn try_transmit_slices_immediate(
-        &self,
-        frames: &[helios_kernel::TxFrameRef<'_>],
-    ) -> Result<Option<usize>, IoError> {
-        self.try_transmit_slices_immediate_on(0, frames)
-    }
-
-    fn try_transmit_slices_immediate_on(
-        &self,
-        queue_idx: usize,
-        frames: &[helios_kernel::TxFrameRef<'_>],
-    ) -> Result<Option<usize>, IoError> {
-        self.inner
-            .try_transmit_trusted_frames_immediate_on_pair(queue_idx, frames)
-    }
-
-    async fn reclaim_transmit_completions_on(
-        &self,
-        queue_idx: usize,
-        budget: usize,
-    ) -> Result<usize, IoError> {
-        self.inner
-            .reclaim_transmit_completions_on_pair(queue_idx, budget)
-            .await
-    }
-
-    fn reclaim_transmit_completions_immediate(
-        &self,
-        budget: usize,
-    ) -> Result<Option<usize>, IoError> {
-        self.reclaim_transmit_completions_immediate_on(0, budget)
     }
 
     fn reclaim_transmit_completions_immediate_on(

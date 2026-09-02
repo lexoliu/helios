@@ -11,10 +11,6 @@ use triomphe::Arc;
 type Aarch64VirtioNetTransport =
     helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<helios_virtio::OffsetDmaPool>>;
 type Aarch64VirtioNetDevice = helios_virtio::VirtioNetDevice<Aarch64VirtioNetTransport>;
-/// Frames submitted to the device in one descriptor-chain batch. This
-/// bounds the stack space the scatter path uses, independent of the
-/// receive poll budget the interrupt-driven capabilities advertise.
-const TX_BATCH_FRAMES: usize = 32;
 
 #[derive(Clone)]
 pub(crate) struct VirtioNetworkDevice {
@@ -133,52 +129,6 @@ impl NetworkDevice for VirtioNetworkDevice {
         self.inner.repost_rx_frames_immediate(frames)
     }
 
-    async fn transmit(&self, frame: &[u8]) -> Result<(), IoError> {
-        self.inner.transmit(frame).await
-    }
-
-    async fn transmit_batch<'a>(&'a self, frames: &'a [&'a [u8]]) -> Result<(), IoError> {
-        self.inner.transmit_batch(frames).await
-    }
-
-    async fn transmit_packet_batch<'a>(
-        &'a self,
-        frames: &'a [PacketBuffer],
-    ) -> Result<(), IoError> {
-        for chunk in frames.chunks(TX_BATCH_FRAMES) {
-            self.inner
-                .transmit_frames_with_wait(chunk, || self.inner.wait_for_interrupt())
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn try_transmit_packet_batch<'a>(
-        &'a self,
-        frames: &'a [PacketBuffer],
-    ) -> Result<usize, IoError> {
-        self.try_transmit_packet_batch_on(0, frames).await
-    }
-
-    async fn try_transmit_packet_batch_on<'a>(
-        &'a self,
-        queue_idx: usize,
-        frames: &'a [PacketBuffer],
-    ) -> Result<usize, IoError> {
-        let mut submitted = 0usize;
-        for chunk in frames.chunks(TX_BATCH_FRAMES) {
-            let accepted = self
-                .inner
-                .try_transmit_frames_on_pair(queue_idx, chunk)
-                .await?;
-            submitted += accepted;
-            if accepted < chunk.len() {
-                break;
-            }
-        }
-        Ok(submitted)
-    }
-
     fn try_receive_frames_immediate_on<'a, 'slots>(
         &'a self,
         queue_idx: usize,
@@ -198,55 +148,6 @@ impl NetworkDevice for VirtioNetworkDevice {
     ) -> Result<Option<usize>, IoError> {
         self.inner
             .try_transmit_scatter_immediate_on_pair(queue_idx, frames)
-    }
-
-    fn try_transmit_slices_immediate(
-        &self,
-        frames: &[helios_kernel::TxFrameRef<'_>],
-    ) -> Result<Option<usize>, IoError> {
-        self.try_transmit_slices_immediate_on(0, frames)
-    }
-
-    fn try_transmit_slices_immediate_on(
-        &self,
-        queue_idx: usize,
-        frames: &[helios_kernel::TxFrameRef<'_>],
-    ) -> Result<Option<usize>, IoError> {
-        let mut submitted = 0usize;
-        for chunk in frames.chunks(TX_BATCH_FRAMES) {
-            let Some(accepted) = self
-                .inner
-                .try_transmit_trusted_frames_immediate_on_pair(queue_idx, chunk)?
-            else {
-                return Ok((submitted != 0).then_some(submitted));
-            };
-            submitted += accepted;
-            if accepted < chunk.len() {
-                break;
-            }
-        }
-        Ok(Some(submitted))
-    }
-
-    async fn reclaim_transmit_completions(&self, budget: usize) -> Result<usize, IoError> {
-        self.reclaim_transmit_completions_on(0, budget).await
-    }
-
-    async fn reclaim_transmit_completions_on(
-        &self,
-        queue_idx: usize,
-        budget: usize,
-    ) -> Result<usize, IoError> {
-        self.inner
-            .reclaim_transmit_completions_on_pair(queue_idx, budget)
-            .await
-    }
-
-    fn reclaim_transmit_completions_immediate(
-        &self,
-        budget: usize,
-    ) -> Result<Option<usize>, IoError> {
-        self.reclaim_transmit_completions_immediate_on(0, budget)
     }
 
     fn reclaim_transmit_completions_immediate_on(
