@@ -366,4 +366,8 @@ impl<P: DmaPool> VirtioTransport for FakeTransport<P> {
     fn read_config_u32(&self, offset: usize) -> u32 {
         self.bus.read_u32(offset)
     }
+
+    fn write_config_u32(&self, offset: usize, value: u32) {
+        self.bus.write_u32(offset, value);
+    }
 }

@@ -3,6 +3,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod balloon;
 mod block;
 mod bus;
 mod discovery;
@@ -20,6 +21,10 @@ mod rng;
 mod testing;
 mod transport;
 
+pub use balloon::{
+    BALLOON_PAGE_SIZE, BalloonStat, BalloonStatTag, FREE_PAGE_CMD_ID_DONE, FREE_PAGE_CMD_ID_STOP,
+    VirtioBalloonDevice,
+};
 pub use block::{
     BlockRequestCounts, QueueAffinity, SECTOR_SIZE, VirtioBlockDevice, VirtioBlockResource,
     VirtioBlockSwapBackend, VirtioBlockSwapError, VirtioBlockSwapToken,
@@ -34,15 +39,17 @@ pub use discovery::{
 pub use features::{NegotiatedFeatures, RING_FEATURES, negotiate, negotiate_with};
 pub use iommu::{MAX_RESERVED_REGIONS, ReservedRegion, VirtioIommuDevice};
 pub use mmio::{
-    VirtioMmio9pDevice, VirtioMmioBlockDevice, VirtioMmioNetDevice, VirtioMmioRngDevice,
-    block_from_mmio, block_from_mmio_with_dma, net_from_mmio, net_from_mmio_with_dma, p9_from_mmio,
+    VirtioMmio9pDevice, VirtioMmioBalloonDevice, VirtioMmioBlockDevice, VirtioMmioNetDevice,
+    VirtioMmioRngDevice, balloon_from_mmio, balloon_from_mmio_with_dma, block_from_mmio,
+    block_from_mmio_with_dma, net_from_mmio, net_from_mmio_with_dma, p9_from_mmio,
     p9_from_mmio_with_dma, rng_from_mmio, rng_from_mmio_with_dma,
 };
 pub use net::{RxFrame, TxChecksumMeta, TxGsoMeta, VirtioNetDevice};
 pub use p9::Virtio9pDevice;
 pub use pci::{
-    PciMmioMapper, VIRTIO_PCI_VENDOR_ID, VirtioPciBus, VirtioPciTransport, block_from_pci,
-    iommu_from_pci, net_from_pci, p9_from_pci, rng_from_pci, virtio_pci_device_type,
+    PciMmioMapper, VIRTIO_PCI_VENDOR_ID, VirtioPciBus, VirtioPciTransport, balloon_from_pci,
+    block_from_pci, iommu_from_pci, net_from_pci, p9_from_pci, rng_from_pci,
+    virtio_pci_device_type,
 };
 pub use queue::{MAX_CHAIN_BUFFERS, VirtQueue, VirtqueueError};
 pub use rng::VirtioRngDevice;
