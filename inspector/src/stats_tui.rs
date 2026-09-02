@@ -11,6 +11,8 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Bar, BarChart, BarGroup, Block, Borders, Cell, Gauge, Paragraph, Row, Table, Wrap,
 };
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use crate::serial::RpcClient;
 use crate::system;
@@ -160,7 +162,7 @@ fn draw_summary(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Samp
         cards[0],
         "Uptime",
         &format_duration(sample.uptime),
-        None,
+        Some(&format_wall_clock(sample.wall_clock)),
         Color::Cyan,
     );
     render_card(
@@ -604,6 +606,24 @@ impl MemoryView {
     fn available_bytes(&self) -> Option<u64> {
         self.total_bytes.map(|_| self.available_bytes)
     }
+}
+
+/// Renders the kernel's wall clock, which a machine whose kernel found
+/// no real-time clock leaves at the epoch.
+fn format_wall_clock(unix_nanos: u64) -> String {
+    if unix_nanos == 0 {
+        return "clock unseeded".to_owned();
+    }
+
+    let unseeded = || format!("unix {unix_nanos}ns");
+    let Ok(instant) = OffsetDateTime::from_unix_timestamp_nanos(i128::from(unix_nanos)) else {
+        return unseeded();
+    };
+    // Seconds are as fine as a boot-seeded clock is meaningful.
+    let Ok(instant) = instant.replace_nanosecond(0) else {
+        return unseeded();
+    };
+    instant.format(&Rfc3339).unwrap_or_else(|_| unseeded())
 }
 
 fn format_duration(nanos: u64) -> String {
