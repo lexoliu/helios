@@ -12,23 +12,28 @@ use std::path::PathBuf;
 use std::process::{ChildStdin, ChildStdout};
 use std::time::{Duration, Instant};
 
-pub(crate) trait SerialRead: AsyncRead + Unpin + Send {}
-pub(crate) trait SerialWrite: AsyncWrite + Unpin + Send {}
+/// The read half of a transport the inspector RPC can run over.
+///
+/// The transport is deliberately erased: the RPC framing is identical
+/// whether it runs over a serial line, a QEMU stdio pipe, or a vsock
+/// connection, so nothing above this alias is written twice per
+/// transport.
+pub(crate) trait RpcRead: AsyncRead + Unpin + Send {}
+pub(crate) trait RpcWrite: AsyncWrite + Unpin + Send {}
 
-impl<T> SerialRead for T where T: AsyncRead + Unpin + Send {}
-impl<T> SerialWrite for T where T: AsyncWrite + Unpin + Send {}
+impl<T> RpcRead for T where T: AsyncRead + Unpin + Send {}
+impl<T> RpcWrite for T where T: AsyncWrite + Unpin + Send {}
 
-pub(crate) type SerialReader = Box<dyn SerialRead>;
-pub(crate) type SerialWriter = Box<dyn SerialWrite>;
-pub(crate) type RpcClient =
-    helios_inspector_protocol::transport::Client<SerialReader, SerialWriter>;
+pub(crate) type RpcReader = Box<dyn RpcRead>;
+pub(crate) type RpcWriter = Box<dyn RpcWrite>;
+pub(crate) type RpcClient = helios_inspector_protocol::transport::Client<RpcReader, RpcWriter>;
 
 const SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SOCKET_CONNECT_POLL: Duration = Duration::from_millis(50);
 
 pub(crate) struct SerialIo {
-    read: SerialReader,
-    write: SerialWriter,
+    read: RpcReader,
+    write: RpcWriter,
 }
 
 pub(crate) struct PtyTransport {
@@ -178,7 +183,7 @@ impl SerialIo {
         helios_inspector_protocol::transport::Client::new(read, write)
     }
 
-    pub(crate) fn into_split(self) -> (SerialReader, SerialWriter) {
+    pub(crate) fn into_split(self) -> (RpcReader, RpcWriter) {
         (self.read, self.write)
     }
 }
@@ -269,7 +274,7 @@ impl io::Write for AsyncChildStdin {
     }
 }
 
-fn open_tty_transport(device: &str, baud: u32) -> Result<(SerialReader, SerialWriter)> {
+fn open_tty_transport(device: &str, baud: u32) -> Result<(RpcReader, RpcWriter)> {
     let port = serialport::new(device, baud)
         .open_native()
         .with_context(|| format!("failed to open serial device {device} with serialport"))?;
@@ -280,15 +285,15 @@ fn open_tty_transport(device: &str, baud: u32) -> Result<(SerialReader, SerialWr
         Box::new(
             Async::new(AsyncSerialPort::new(read_port))
                 .with_context(|| format!("failed to register serial device {device}"))?,
-        ) as SerialReader,
+        ) as RpcReader,
         Box::new(
             Async::new(AsyncSerialPort::new(port))
                 .with_context(|| format!("failed to register serial device {device}"))?,
-        ) as SerialWriter,
+        ) as RpcWriter,
     ))
 }
 
-async fn open_socket_transport(device: &str) -> Result<(SerialReader, SerialWriter)> {
+async fn open_socket_transport(device: &str) -> Result<(RpcReader, RpcWriter)> {
     let deadline = Instant::now() + SOCKET_CONNECT_TIMEOUT;
     let socket = loop {
         match UnixStream::connect(device) {
@@ -319,11 +324,11 @@ async fn open_socket_transport(device: &str) -> Result<(SerialReader, SerialWrit
         Box::new(
             Async::new(AsyncUnixSocket::new(read))
                 .with_context(|| format!("failed to register serial socket {device} reader"))?,
-        ) as SerialReader,
+        ) as RpcReader,
         Box::new(
             Async::new(AsyncUnixSocket::new(socket))
                 .with_context(|| format!("failed to register serial socket {device} writer"))?,
-        ) as SerialWriter,
+        ) as RpcWriter,
     ))
 }
 

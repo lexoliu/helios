@@ -182,6 +182,23 @@ jobs:
             > cpython-smoke.out
           cat cpython-smoke.out
           grep -Fqx '{"ok":"a"}' cpython-smoke.out
+      - name: Boot riscv64 guest with the inspector RPC on vsock
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          # vsock is the only transport whose host half needs a kernel
+          # module, and the inspector refuses rather than falling back,
+          # so a runner without it fails this step loudly.
+          sudo modprobe vhost_vsock
+          ls -l /dev/vhost-vsock
+          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --rpc-transport vsock \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' > vsock-smoke.out
+          cat vsock-smoke.out
+          grep -Fqx ok vsock-smoke.out
       - name: Fetch over virtio-net with curl
         shell: bash
         working-directory: helios
