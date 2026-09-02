@@ -97,7 +97,7 @@ pub use service::{
     install_program_service, run_component_host_processor_forever, run_embedded_component_forever,
     run_program_workers_forever,
 };
-pub(crate) use service::{ProgramExecContext, ProgramSource};
+pub(crate) use service::{ProgramArgv, ProgramExecContext, ProgramSource};
 pub use topology::{
     ComponentHostProcessorRole, component_host_kernel_processor_count,
     component_host_processor_role, component_host_processors_to_start,
@@ -414,8 +414,7 @@ macro_rules! impl_program_bindings {
                     match service
                         .spawn(
                             context,
-                            request.name,
-                            request.args,
+                            ProgramArgv::launched(request.name, request.args),
                             request.env,
                             source,
                             None,
@@ -500,8 +499,7 @@ macro_rules! impl_program_bindings {
                     Ok(service
                         .exec_buffered(
                             context,
-                            request.name,
-                            request.args,
+                            ProgramArgv::launched(request.name, request.args),
                             request.env,
                             source,
                             hint,

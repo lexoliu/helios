@@ -285,8 +285,10 @@ if [[ "${HELIOS_WASI_SMOKE_CURL:-0}" == "1" ]]; then
         -c \
         '/bin/ping detectportal.firefox.com'
 
+    # Launch by bootfs path: dash execs "/bin/curl" and the guest must see
+    # argv[0] == "/bin/curl".
     run_smoke \
-        curl \
+        curl-by-path \
         'success' \
         -- \
         --boot-program dash \
@@ -297,4 +299,20 @@ if [[ "${HELIOS_WASI_SMOKE_CURL:-0}" == "1" ]]; then
         shell \
         -c \
         '/bin/curl http://detectportal.firefox.com/success.txt'
+
+    # Launch by bare name: dash resolves PATH itself and execs "/bin/curl"
+    # while naming the child "curl". The guest must see argv[0] == "curl"
+    # exactly once (issue #35).
+    run_smoke \
+        curl-by-name \
+        'success' \
+        -- \
+        --boot-program dash \
+        --boot-program debugger \
+        --boot-program curl \
+        --boot-program http-client \
+        --no-compiler-plugin \
+        shell \
+        -c \
+        'curl http://detectportal.firefox.com/success.txt'
 fi

@@ -120,7 +120,8 @@ interface programs {
   }
 
   record spawn-request {
-    /// User-visible instance name used for inspection and diagnostics.
+    /// Name the child is launched under. It becomes the child's
+    /// `argv[0]` and names the instance for inspection and diagnostics.
     name: string,
     /// Argument vector passed to the launched component (argv[1..]).
     args: list<string>,
@@ -136,6 +137,7 @@ interface programs {
   }
 
   record exec-request {
+    /// Name the child is launched under, which becomes its `argv[0]`.
     name: string,
     args: list<string>,
     env: list<tuple<string, string>>,
