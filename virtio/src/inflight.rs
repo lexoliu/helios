@@ -14,7 +14,14 @@
 //! failed to take the queue can still observe a completion another task
 //! drained for it.
 
+use core::future::Future;
+
+use async_lock::Mutex as AsyncMutex;
 use spin::Mutex;
+
+use crate::notify::Notify;
+use crate::queue::VirtQueue;
+use crate::transport::VirtioTransport;
 
 /// State of one descriptor identifier.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -83,6 +90,56 @@ impl<const N: usize> InFlight<N> {
         slots.get_mut(usize::from(token)).unwrap_or_else(|| {
             panic!("virtio descriptor {token} is outside the {N}-slot completion table")
         })
+    }
+}
+
+/// Waits for `token`'s completion, draining the queue on behalf of every
+/// waiter whenever this task can take it.
+///
+/// This is the shape every single-request driver uses: a task parks on
+/// the device's interrupt notification, and whichever task wakes first
+/// reaps the whole used ring into the completion table rather than
+/// looking for its own descriptor. `wait` is a parameter so callers can
+/// park on something other than the raw interrupt — a deadline, say —
+/// without duplicating the loop.
+pub(crate) async fn await_completion<T, Wait, WaitFuture, const N: usize>(
+    inflight: &InFlight<N>,
+    queue: &AsyncMutex<VirtQueue<T>>,
+    interrupts: &Notify,
+    token: u16,
+    mut wait: Wait,
+) -> u32
+where
+    T: VirtioTransport,
+    Wait: FnMut() -> WaitFuture,
+    WaitFuture: Future<Output = ()>,
+{
+    loop {
+        if let Some(len) = inflight.take(token) {
+            return len;
+        }
+
+        let mut others = 0_usize;
+        let drained = match queue.try_lock() {
+            Some(mut queue) => queue.drain_used(|completed, len| {
+                if completed != token {
+                    others += 1;
+                }
+                inflight.complete(completed, len);
+            }),
+            None => 0,
+        };
+        // A notification is handed to a single claimant, so a drain that
+        // finished several other tasks' requests owes one wake-up per
+        // task rather than one for the whole batch.
+        for _ in 0..others {
+            interrupts.notify_all();
+        }
+        if drained != 0 {
+            continue;
+        }
+
+        wait().await;
     }
 }
 

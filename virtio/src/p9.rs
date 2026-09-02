@@ -6,7 +6,7 @@ use core::future::Future;
 use helios_hal::io::{IoError, IoResult};
 
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
-use crate::inflight::InFlight;
+use crate::inflight::{InFlight, await_completion};
 use crate::notify::Notify;
 use crate::queue::VirtQueue;
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
@@ -96,7 +96,7 @@ impl<T: VirtioTransport> Virtio9pDevice<T> {
         &self,
         request: &[u8],
         response: &mut [u8],
-        mut wait: Wait,
+        wait: Wait,
     ) -> IoResult<u32>
     where
         Wait: FnMut() -> WaitFuture,
@@ -120,28 +120,11 @@ impl<T: VirtioTransport> Virtio9pDevice<T> {
             token
         };
 
-        let used_len = loop {
-            if let Some(len) = self.inflight.take(token) {
-                break len;
-            }
-
-            // Any woken task drains: with EVENT_IDX and IN_ORDER the
-            // device may finish requests in an order that has nothing to
-            // do with which task is awake, so completions are routed by
-            // token rather than assumed to be the caller's own.
-            let drained = match self.queue.try_lock() {
-                Some(mut queue) => {
-                    queue.drain_used(|token, len| self.inflight.complete(token, len))
-                }
-                None => 0,
-            };
-            if drained != 0 {
-                self.interrupts.notify_all();
-                continue;
-            }
-
-            wait().await;
-        };
+        // Completions are routed by descriptor identifier: with EVENT_IDX
+        // and IN_ORDER the device may finish requests in an order that
+        // has nothing to do with which task is awake.
+        let used_len =
+            await_completion(&self.inflight, &self.queue, &self.interrupts, token, wait).await;
 
         let header_len = u32::from_le_bytes([response[0], response[1], response[2], response[3]]);
         if header_len != used_len {

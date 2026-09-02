@@ -9,7 +9,7 @@ use helios_hal::resource::KernelResource;
 use helios_hal::vmm::SwapBackend;
 
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
-use crate::inflight::InFlight;
+use crate::inflight::{InFlight, await_completion};
 use crate::notify::Notify;
 use crate::queue::VirtQueue;
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
@@ -221,24 +221,12 @@ impl<T: VirtioTransport> VirtioBlockDevice<T> {
             token
         };
 
-        loop {
-            if let Some(len) = self.inflight.take(token) {
-                return Ok(len);
-            }
-
-            let drained = match self.queue.try_lock() {
-                Some(mut queue) => {
-                    queue.drain_used(|token, len| self.inflight.complete(token, len))
-                }
-                None => 0,
-            };
-            if drained != 0 {
-                self.interrupts.notify_all();
-                continue;
-            }
-
-            self.interrupts.notified().await;
-        }
+        Ok(
+            await_completion(&self.inflight, &self.queue, &self.interrupts, token, || {
+                self.interrupts.notified()
+            })
+            .await,
+        )
     }
 }
 

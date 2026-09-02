@@ -5,7 +5,7 @@ use helios_hal::io::{IoError, IoResult};
 use spin::Mutex as SpinMutex;
 
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
-use crate::inflight::InFlight;
+use crate::inflight::{InFlight, await_completion};
 use crate::notify::Notify;
 use crate::queue::VirtQueue;
 use crate::transport::{DeviceStatus, DeviceType, VirtioTransport};
@@ -118,24 +118,14 @@ impl<T: VirtioTransport> VirtioConsoleDevice<T> {
                 token
             };
 
-            loop {
-                if self.transmit_inflight.take(token).is_some() {
-                    break;
-                }
-
-                let drained = match self.transmit.try_lock() {
-                    Some(mut queue) => queue.drain_used(|token, len| {
-                        self.transmit_inflight.complete(token, len);
-                    }),
-                    None => 0,
-                };
-                if drained != 0 {
-                    self.interrupts.notify_all();
-                    continue;
-                }
-
-                self.interrupts.notified().await;
-            }
+            await_completion(
+                &self.transmit_inflight,
+                &self.transmit,
+                &self.interrupts,
+                token,
+                || self.interrupts.notified(),
+            )
+            .await;
         }
         Ok(())
     }
