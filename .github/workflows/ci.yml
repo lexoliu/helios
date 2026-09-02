@@ -192,7 +192,12 @@ jobs:
           # module, and the inspector refuses rather than falling back,
           # so a runner without it fails this step loudly.
           sudo modprobe vhost_vsock
+          # udev creates the node root:kvm mode 0660 and the runner
+          # account is not in that group, so QEMU's vhost backend cannot
+          # open it. Hand the node to this account before asking for it.
+          sudo chmod 0666 /dev/vhost-vsock
           ls -l /dev/vhost-vsock
+          id
           ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
             --rpc-transport vsock \
             --boot-program dash --boot-program debugger --no-compiler-plugin \
