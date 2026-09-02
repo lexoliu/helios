@@ -22,7 +22,11 @@ pub(crate) const TLB_SHOOTDOWN_INTERRUPT_VECTOR: u8 = 0x22;
 pub(crate) const NETWORK_INTERRUPT_VECTOR: u8 = 0x30;
 pub(crate) const HOST_FS_INTERRUPT_VECTOR: u8 = 0x31;
 pub(crate) const ENTROPY_INTERRUPT_VECTOR: u8 = 0x32;
-pub(crate) const BALLOON_INTERRUPT_VECTOR: u8 = 0x37;
+/// The memory balloon's vector sits after the block devices' rather
+/// than filling the first free slot: the vsock transport claims `0x37`,
+/// and two devices sharing a vector would each be told about the
+/// other's completions.
+pub(crate) const BALLOON_INTERRUPT_VECTOR: u8 = 0x38;
 /// One vector per block device the routing table can hold: the platform
 /// exposes the boot image and the kernel's own disk as separate
 /// functions, and each of them delivers its completions on its own
