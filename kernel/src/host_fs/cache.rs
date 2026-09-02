@@ -368,7 +368,15 @@ impl HostFsCache {
     #[must_use]
     pub(super) fn invalidate_entry(&self, path: &str) -> Option<u32> {
         let orphaned = self.invalidate_contents(path);
-        if let Some(parent) = parent_path(path) {
+        // The parent is derived from the normalised key, not from the
+        // caller's spelling: the guest side of the share hands paths
+        // over without a leading slash, and splitting one of those
+        // would find no parent and leave the directory's listing
+        // claiming a name that is no longer there.
+        let Some(key) = cache_key(path) else {
+            return orphaned;
+        };
+        if let Some(parent) = parent_key(key.as_ref()) {
             let dropped = self.invalidate_contents(parent);
             debug_assert!(
                 dropped.is_none(),
@@ -461,11 +469,14 @@ fn is_normalised(path: &str) -> bool {
     path.starts_with('/') && !path.ends_with('/') && !path.contains("//")
 }
 
-/// The directory `path` sits in, or `None` for the share root, which has
-/// no parent inside the share.
-fn parent_path(path: &str) -> Option<&str> {
-    let trimmed = path.trim_end_matches('/');
-    let (parent, name) = trimmed.rsplit_once('/')?;
+/// The directory a normalised key sits in, or `None` for the share
+/// root, which has no parent inside the share.
+fn parent_key(key: &str) -> Option<&str> {
+    debug_assert!(
+        key.starts_with('/'),
+        "a parent is only well defined for a normalised cache key"
+    );
+    let (parent, name) = key.rsplit_once('/')?;
     if name.is_empty() {
         return None;
     }
@@ -543,10 +554,33 @@ mod tests {
     }
 
     #[test]
-    fn parent_paths_stop_at_the_share_root() {
-        assert_eq!(parent_path("/alpha/beta"), Some("/alpha"));
-        assert_eq!(parent_path("/alpha"), Some("/"));
-        assert_eq!(parent_path("/"), None);
+    fn parent_keys_stop_at_the_share_root() {
+        assert_eq!(parent_key("/alpha/beta"), Some("/alpha"));
+        assert_eq!(parent_key("/alpha"), Some("/"));
+        assert_eq!(parent_key("/"), None);
+    }
+
+    /// The guest side of the share strips the mount prefix and hands
+    /// paths over without a leading slash, so an entry created that way
+    /// has to reach the same directory listing a rooted read cached.
+    #[test]
+    fn an_unrooted_spelling_still_invalidates_the_parent_listing() {
+        let cache = HostFsCache::new();
+        cache.insert_directory(
+            "/",
+            &[HostDirEntry {
+                name: "greeting.txt".to_string(),
+                is_directory: false,
+            }],
+            0,
+        );
+
+        assert!(cache.invalidate_entry("newdir").is_none());
+
+        assert!(
+            cache.directory("/", 1).is_none(),
+            "the share root gained a name, so its cached listing is stale"
+        );
     }
 
     #[test]
