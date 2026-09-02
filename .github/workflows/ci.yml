@@ -75,7 +75,7 @@ jobs:
   smoke-riscv64:
     name: smoke-riscv64
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
         with:
@@ -127,6 +127,39 @@ jobs:
             shell -c 'echo ok' > boot-smoke.out
           cat boot-smoke.out
           grep -Fqx ok boot-smoke.out
+      - name: Run the coreutils applets through dash
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          # coreutils is one multicall WASIX module published under several
+          # bootfs names, so every applet is launched by bare name and dash
+          # resolves it through PATH. Issue #39 died here on riscv64.
+          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --boot-program dash --boot-program debugger \
+            --boot-program ls --boot-program mkdir --boot-program cat \
+            --no-compiler-plugin \
+            shell -c 'mkdir /d; echo coreutils:ok > /d/f; cat /d/f; ls /' \
+            > coreutils-smoke.out
+          cat coreutils-smoke.out
+          grep -Fqx coreutils:ok coreutils-smoke.out
+          grep -Fqx bin coreutils-smoke.out
+      - name: Run CPython
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          # Same interpreter and one-liner as tools/wasi-apps/smoke.sh, so the
+          # riscv64 lane covers the stdlib import path that issue #39 broke.
+          ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
+            --boot-program dash --boot-program debugger --boot-program python3 \
+            --no-compiler-plugin \
+            shell -c 'python3 -c "import json, pathlib; print(json.dumps({\"ok\": pathlib.PurePosixPath(\"/a\").name}, separators=(\",\",\":\")))"' \
+            > cpython-smoke.out
+          cat cpython-smoke.out
+          grep -Fqx '{"ok":"a"}' cpython-smoke.out
       - name: Fetch over virtio-net with curl
         shell: bash
         working-directory: helios

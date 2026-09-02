@@ -172,6 +172,29 @@ impl UserHeapStats {
     pub fn available_bytes(self) -> usize {
         self.total_bytes.saturating_sub(self.allocated_bytes)
     }
+
+    /// The largest single allocation the pool can still be asked for.
+    ///
+    /// [`buddy_allocation_size`] rounds every request up to a power of
+    /// two, so a request for exactly [`Self::available_bytes`] is refused
+    /// whenever the free byte count is not itself a power of two: the
+    /// allocator asks its buddy heap for the next power of two above it,
+    /// which by definition exceeds what is free. Callers that size an
+    /// allocation from whatever is left of the pool must clamp to this
+    /// value; clamping to `available_bytes` computes a budget the
+    /// allocator can never hand out.
+    ///
+    /// This is the allocator's granularity bound, not a promise: a buddy
+    /// heap can still refuse a block this large when its free space is
+    /// fragmented across smaller buddies, so callers keep handling
+    /// [`ProgramOutOfMemory`].
+    pub fn largest_allocatable_bytes(self) -> usize {
+        let available = self.available_bytes();
+        if available == 0 {
+            return 0;
+        }
+        1_usize << (usize::BITS - 1 - available.leading_zeros())
+    }
 }
 
 pub fn install_user_memory_pool(pool: &'static UserMemoryPool) -> &'static UserMemoryPool {
@@ -283,4 +306,45 @@ fn is_single_frame_layout(layout: Layout) -> bool {
 fn single_frame_layout() -> Layout {
     Layout::from_size_align(PhysFrame::SIZE, PhysFrame::SIZE)
         .unwrap_or_else(|_| panic!("invalid user-frame layout"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats(total: usize, allocated: usize) -> UserHeapStats {
+        UserHeapStats {
+            total_bytes: total,
+            allocated_bytes: allocated,
+        }
+    }
+
+    #[test]
+    fn largest_allocatable_rounds_free_space_down_to_a_buddy_block() {
+        // 488 MiB free: the buddy allocator would round a request for all
+        // of it up to 512 MiB and refuse, so the usable request is 256 MiB.
+        let free = 511_705_088;
+        let stats = stats(1 << 30, (1 << 30) - free);
+        assert_eq!(stats.available_bytes(), free);
+        assert_eq!(stats.largest_allocatable_bytes(), 256 * 1024 * 1024);
+        assert_eq!(
+            buddy_allocation_size(
+                Layout::from_size_align(stats.largest_allocatable_bytes(), 64 * 1024)
+                    .expect("power-of-two layout is valid")
+            ),
+            stats.largest_allocatable_bytes(),
+        );
+    }
+
+    #[test]
+    fn largest_allocatable_keeps_an_exact_power_of_two() {
+        let stats = stats(1 << 30, 1 << 29);
+        assert_eq!(stats.largest_allocatable_bytes(), 1 << 29);
+    }
+
+    #[test]
+    fn largest_allocatable_is_zero_for_an_exhausted_pool() {
+        let stats = stats(1 << 30, 1 << 30);
+        assert_eq!(stats.largest_allocatable_bytes(), 0);
+    }
 }
