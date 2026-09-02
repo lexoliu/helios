@@ -3764,6 +3764,22 @@ macro_rules! convert_block_stats {
     };
 }
 
+/// Maps the kernel's balloon snapshot onto one binding set's
+/// `memory-balloon` record, for the same reason
+/// [`convert_block_stats`] exists.
+macro_rules! convert_balloon_stats {
+    ($bindings:path, $balloon:expr) => {
+        $balloon.map(|balloon: crate::BalloonStats| {
+            use $bindings as stats_bindings;
+            stats_bindings::MemoryBalloon {
+                target_bytes: balloon.target_bytes,
+                actual_bytes: balloon.actual_bytes,
+                reported_bytes: balloon.reported_bytes,
+            }
+        })
+    };
+}
+
 fn convert_sample(sample: StatsSample) -> debugger_bindings::helios::system::stats::Sample {
     let heap = heap_stats();
     let total_bytes =
@@ -3787,6 +3803,7 @@ fn convert_sample(sample: StatsSample) -> debugger_bindings::helios::system::sta
         },
         block: convert_block_stats!(debugger_bindings::helios::system::stats, sample.block),
         iommu: convert_iommu_stats!(debugger_bindings::helios::system::stats, sample.iommu),
+        balloon: convert_balloon_stats!(debugger_bindings::helios::system::stats, sample.balloon),
     }
 }
 
@@ -3813,6 +3830,7 @@ fn convert_program_sample(sample: StatsSample) -> program_bindings::helios::syst
         },
         block: convert_block_stats!(program_bindings::helios::system::stats, sample.block),
         iommu: convert_iommu_stats!(program_bindings::helios::system::stats, sample.iommu),
+        balloon: convert_balloon_stats!(program_bindings::helios::system::stats, sample.balloon),
     }
 }
 

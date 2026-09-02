@@ -197,7 +197,7 @@ fn draw_main_panels(
 ) {
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(10), Constraint::Min(6)])
+        .constraints([Constraint::Length(11), Constraint::Min(6)])
         .split(area);
 
     let panels = Layout::default()
@@ -350,7 +350,7 @@ fn draw_memory_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats:
         .label(memory.available_label());
     frame.render_widget(free_gauge, layout[1]);
 
-    let details = Paragraph::new(Text::from(vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("pressure ", Style::default().fg(Color::Cyan)),
             Span::styled(
@@ -366,10 +366,41 @@ fn draw_memory_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats:
             Span::styled("free     ", Style::default().fg(Color::Cyan)),
             Span::raw(memory.free_detail()),
         ]),
-    ]))
-    .block(Block::default().title("Memory").borders(Borders::ALL))
-    .wrap(Wrap { trim: true });
+    ];
+    lines.extend(balloon_lines(sample));
+    let details = Paragraph::new(Text::from(lines))
+        .block(Block::default().title("Memory").borders(Borders::ALL))
+        .wrap(Wrap { trim: true });
     frame.render_widget(details, layout[2]);
+}
+
+/// What the host is holding through the memory balloon, on a machine
+/// that has one.
+///
+/// A balloon that is following its target reads as one number; a
+/// balloon that stopped short of what the host asked for is the case
+/// worth seeing, so the target is shown alongside whenever the two
+/// differ.
+fn balloon_lines(sample: &stats::Sample) -> Vec<Line<'static>> {
+    let Some(balloon) = &sample.balloon else {
+        return Vec::new();
+    };
+    let held = if balloon.actual_bytes == balloon.target_bytes {
+        format_bytes(balloon.actual_bytes)
+    } else {
+        format!(
+            "{} of {} asked",
+            format_bytes(balloon.actual_bytes),
+            format_bytes(balloon.target_bytes)
+        )
+    };
+    vec![Line::from(vec![
+        Span::styled("balloon  ", Style::default().fg(Color::Cyan)),
+        Span::raw(format!(
+            "{held}, {} reported free",
+            format_bytes(balloon.reported_bytes)
+        )),
+    ])]
 }
 
 /// The block device the kernel identified at boot, or the fact that it
