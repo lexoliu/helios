@@ -4,6 +4,7 @@
 extern crate alloc;
 
 mod boot;
+mod entropy;
 mod exceptions;
 mod host_fs;
 mod net;
@@ -185,12 +186,16 @@ fn x86_kernel_main() -> ! {
     let pci = pci::PciRoot::new(physical_memory_offset);
     let network_function = net::discover(&pci);
     let host_share_function = host_fs::discover(&pci);
+    let entropy_function = entropy::discover(&pci);
     let mut devices = DeviceInventory::new().with_debug_serial();
     if network_function.is_some() {
         devices = devices.with_network();
     }
     if host_share_function.is_some() {
         devices = devices.with_host_share();
+    }
+    if entropy_function.is_some() {
+        devices = devices.with_entropy_device();
     }
     let kernel = helios_kernel::init_with_watchdog(
         Platform::with_watchdog(console, memory_regions, cpu.clone(), cpu.watchdog())
@@ -206,6 +211,12 @@ fn x86_kernel_main() -> ! {
     );
     smp::current_runtime().install_timer(kernel.timer());
     let debug_state = cpu.debug_state();
+    // The root DRBG is seeded before any component can ask for random
+    // bytes. x86 has no firmware seed to read — the boot protocol here
+    // is ACPI, not a device tree — so `RDRAND` is the pre-boot source
+    // and the entropy device joins it once the executor runs.
+    let root_entropy = helios_kernel::seed_root_entropy(&cpu, None);
+    debug_state.install_root_entropy(root_entropy.clone());
     // Devices are brought up while the bootstrap processor still runs
     // with interrupts masked, so their MSI-X routes are published before
     // the first message can be delivered.
@@ -216,7 +227,9 @@ fn x86_kernel_main() -> ! {
         physical_memory_offset,
         network_function,
         host_share_function,
+        entropy_function,
         &debug_state,
+        root_entropy,
     );
     x86_64::instructions::interrupts::enable();
     let program_service = helios_kernel::install_component_host_program_service(
@@ -247,6 +260,7 @@ fn x86_kernel_main() -> ! {
 /// is the processor that owns the routing table; the routes are
 /// installed unconditionally so an interrupt from a device the kernel
 /// never claimed fails loudly instead of being silently acknowledged.
+#[allow(clippy::too_many_arguments)]
 fn install_pci_devices<WatchdogImpl>(
     cpu: &X86Cpu,
     kernel: &helios_kernel::Kernel<X86Cpu, WatchdogImpl>,
@@ -254,7 +268,9 @@ fn install_pci_devices<WatchdogImpl>(
     physical_memory_offset: usize,
     network_function: Option<pci_types::PciAddress>,
     host_share_function: Option<pci_types::PciAddress>,
+    entropy_function: Option<pci_types::PciAddress>,
     debug_state: &debug_state::RuntimeState,
+    root_entropy: helios_kernel::RootEntropyHandle,
 ) where
     WatchdogImpl: Watchdog + Clone,
 {
@@ -287,6 +303,20 @@ fn install_pci_devices<WatchdogImpl>(
         routes.set_network(exceptions::NETWORK_INTERRUPT_VECTOR, device);
     } else {
         tracing::warn!("virtio network device was not discovered on the PCI bus");
+    }
+    if let Some(address) = entropy_function {
+        let device = entropy::install(
+            kernel,
+            pci,
+            address,
+            physical_memory_offset,
+            exceptions::ENTROPY_INTERRUPT_VECTOR,
+            destination_apic_id,
+            root_entropy,
+        );
+        routes.set_entropy(exceptions::ENTROPY_INTERRUPT_VECTOR, device);
+    } else {
+        tracing::warn!("virtio entropy device was not discovered on the PCI bus");
     }
     smp::current_runtime().install_device_interrupts(routes);
 }

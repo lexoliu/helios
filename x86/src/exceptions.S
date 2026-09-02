@@ -53,6 +53,12 @@ helios_x86_interrupt_host_fs:
     push 0x31
     jmp helios_x86_interrupt_common
 
+.global helios_x86_interrupt_entropy
+helios_x86_interrupt_entropy:
+    push 0
+    push 0x32
+    jmp helios_x86_interrupt_common
+
 helios_x86_exception_common:
     push rax
     push rcx
