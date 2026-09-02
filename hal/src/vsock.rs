@@ -218,7 +218,7 @@ impl VsockPacketHeader {
     }
 }
 
-/// What one [`VsockDevice::receive_into`] delivered.
+/// One packet [`VsockDevice::receive_into`] delivered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VsockReceived {
     pub header: VsockPacketHeader,
@@ -226,6 +226,20 @@ pub struct VsockReceived {
     /// the header's `payload_len`; a device that announces more than it
     /// delivered is a fault, not a short read.
     pub payload_len: usize,
+}
+
+/// What one [`VsockDevice::receive_into`] handed back.
+///
+/// A transport reset is delivered through the same call as a packet
+/// rather than through a flag the caller polls: it is the one event that
+/// invalidates every connection at once, and a caller parked waiting for
+/// the next packet has to learn about it without a packet arriving.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VsockDelivery {
+    Packet(VsockReceived),
+    /// The host end of the link was replaced. Every connection this
+    /// machine held is gone.
+    TransportReset,
 }
 
 /// A device that carries vsock packets between this machine and its
@@ -253,7 +267,8 @@ pub trait VsockDevice: Send + Sync {
         payload: &'a [u8],
     ) -> impl Future<Output = IoResult<()>> + Send + 'a;
 
-    /// Receives the next packet, copying its payload into `payload`.
+    /// Receives the next packet, copying its payload into `payload`,
+    /// or reports that the transport was reset underneath the caller.
     ///
     /// The buffer must hold [`VsockDevice::max_payload_bytes`]; a packet
     /// that does not fit is a device fault rather than a short read,
@@ -262,7 +277,7 @@ pub trait VsockDevice: Send + Sync {
     fn receive_into<'a>(
         &'a self,
         payload: &'a mut [u8],
-    ) -> impl Future<Output = IoResult<VsockReceived>> + Send + 'a;
+    ) -> impl Future<Output = IoResult<VsockDelivery>> + Send + 'a;
 }
 
 #[cfg(test)]

@@ -21,6 +21,7 @@ mod process;
 mod runtime;
 #[cfg(test)]
 mod test_support;
+mod vsock;
 #[cfg(feature = "wasmtime-runtime")]
 pub(crate) mod wasmtime_adapter;
 #[cfg(feature = "wasmtime-runtime")]
@@ -147,6 +148,11 @@ pub use runtime::{
     ObjectIdentity, PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer, RuntimeState,
     SocketReadiness, TcpAccepted, TcpError, TcpErrorKind, TcpListener, UdpBinding, UdpDatagram,
     UdpError, UdpErrorKind,
+};
+pub use vsock::{
+    ComponentHostVsockService, MAX_VSOCK_BACKLOG, MAX_VSOCK_CONNECTIONS, MAX_VSOCK_LISTENERS,
+    VSOCK_RECEIVE_WINDOW_BYTES, VsockError, VsockListenerId, VsockService, VsockStreamId,
+    install_vsock_device,
 };
 #[cfg(feature = "wasmtime-runtime")]
 pub use wasmtime_adapter::component_host::{

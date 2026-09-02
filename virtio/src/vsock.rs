@@ -30,7 +30,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use helios_hal::io::{IoError, IoResult};
 use helios_hal::vsock::{
-    VsockAddress, VsockDevice, VsockOp, VsockPacketHeader, VsockReceived, VsockShutdown,
+    VsockAddress, VsockDelivery, VsockDevice, VsockOp, VsockPacketHeader, VsockReceived,
+    VsockShutdown,
 };
 
 use crate::features::{NegotiatedFeatures, RING_FEATURES, negotiate};
@@ -431,7 +432,7 @@ impl<T: VirtioTransport> VsockDevice for VirtioVsockDevice<T> {
         Ok(())
     }
 
-    async fn receive_into(&self, payload: &mut [u8]) -> IoResult<VsockReceived> {
+    async fn receive_into(&self, payload: &mut [u8]) -> IoResult<VsockDelivery> {
         if payload.len() < VSOCK_MAX_PAYLOAD_BYTES {
             return Err(IoError::OutOfBounds);
         }
@@ -441,10 +442,13 @@ impl<T: VirtioTransport> VsockDevice for VirtioVsockDevice<T> {
             {
                 self.transport_reset.store(true, Ordering::Release);
             }
+            if self.take_transport_reset() {
+                return Ok(VsockDelivery::TransportReset);
+            }
             {
                 let mut state = self.rx.lock().await;
                 if let Some(received) = Self::try_receive(&mut state, &self.transport, payload)? {
-                    return Ok(received);
+                    return Ok(VsockDelivery::Packet(received));
                 }
             }
             self.interrupts.notified().await;
@@ -494,7 +498,9 @@ mod tests {
     use alloc::vec;
     use core::pin::pin;
     use futures_lite::future::{block_on, poll_once};
-    use helios_hal::vsock::{VsockAddress, VsockDevice, VsockOp, VsockPacketHeader, VsockShutdown};
+    use helios_hal::vsock::{
+        VsockAddress, VsockDelivery, VsockDevice, VsockOp, VsockPacketHeader, VsockShutdown,
+    };
 
     const GUEST_CID: u64 = 42;
 
@@ -621,9 +627,13 @@ mod tests {
             packet[HEADER_BYTES..].copy_from_slice(b"hello");
             deliver(&device, 0, &packet);
 
-            block_on(poll_once(receive.as_mut()))
+            match block_on(poll_once(receive.as_mut()))
                 .expect("the packet is ready")
                 .expect("the packet decodes")
+            {
+                VsockDelivery::Packet(received) => received,
+                VsockDelivery::TransportReset => panic!("no transport reset was announced"),
+            }
         };
         assert_eq!(received.payload_len, 5);
         assert_eq!(&payload[..5], b"hello");
@@ -657,9 +667,13 @@ mod tests {
         });
         deliver(&device, 0, &packet);
 
-        let received = block_on(poll_once(receive.as_mut()))
+        let received = match block_on(poll_once(receive.as_mut()))
             .expect("the packet is ready")
-            .expect("the packet decodes");
+            .expect("the packet decodes")
+        {
+            VsockDelivery::Packet(received) => received,
+            VsockDelivery::TransportReset => panic!("no transport reset was announced"),
+        };
         assert_eq!(received.payload_len, 0);
         assert_eq!(received.header.op, VsockOp::CreditUpdate);
         assert_eq!(received.header.buf_alloc, 262_144);
@@ -770,10 +784,11 @@ mod tests {
             let len = state.queue.device_respond(0, &0_u32.to_le_bytes());
             state.queue.device_complete(0, len);
         }
-        let mut receive = pin!(device.receive_into(&mut payload));
-        assert!(block_on(poll_once(receive.as_mut())).is_none());
-
-        assert!(device.take_transport_reset(), "the announcement is pending");
+        assert_eq!(
+            block_on(device.receive_into(&mut payload)),
+            Ok(VsockDelivery::TransportReset),
+            "the announcement reaches a caller parked for a packet"
+        );
         assert!(
             !device.take_transport_reset(),
             "an announcement is delivered once"
