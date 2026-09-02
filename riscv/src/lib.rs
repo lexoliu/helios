@@ -2,6 +2,7 @@
 #![no_main]
 
 extern crate alloc;
+mod entropy;
 mod host_fs;
 mod net;
 mod pci;
@@ -571,6 +572,17 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         timebase_frequency,
         fdt_addr,
     );
+    // The root DRBG is seeded once, on the bootstrap hart, before
+    // anything can ask for random bytes. RISC-V has no unprivileged
+    // entropy instruction the kernel can rely on, so the seed OpenSBI
+    // leaves in `/chosen/rng-seed` is the platform's pre-boot source;
+    // the entropy device joins it as soon as the executor runs.
+    let root_entropy = (current_hart == bootstrap_processor).then(|| {
+        let root =
+            helios_kernel::seed_root_entropy(&cpu, helios_hal::entropy::device_tree_seed(&fdt));
+        debug_state.install_root_entropy(root.clone());
+        root
+    });
     let mut devices = DeviceInventory::new();
     if debug_transport.is_some() {
         devices = devices.with_debug_serial();
@@ -584,6 +596,9 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     }
     if host_fs::has_9p_device(&fdt) {
         devices = devices.with_host_share();
+    }
+    if entropy::has_entropy_device(&fdt) {
+        devices = devices.with_entropy_device();
     }
     let kernel = helios_kernel::init_with_watchdog(
         helios_kernel::Platform::with_watchdog(
@@ -600,33 +615,25 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
         .with_dma_model(DmaModel::Identity)
         .with_devices(devices),
     );
-    let external_interrupts = if current_hart == bootstrap_processor {
-        let mut interrupts = net::install_network_service(&cpu, &kernel, &fdt, &debug_state);
-        if let Some(host_fs) = host_fs::install(&cpu, &fdt, &debug_state) {
-            host_fs.plic.set_priority(host_fs.interrupt.source, 1);
-            host_fs
-                .plic
-                .enable(host_fs.interrupt.source, host_fs.context);
-            host_fs.plic.set_threshold(host_fs.context, 0);
-            match interrupts.as_mut() {
-                Some(interrupts_ref) => interrupts_ref.attach_host_fs(host_fs.interrupt),
-                None => {
-                    interrupts = Some(net::ExternalInterrupts::host_fs_only(
-                        host_fs.plic,
-                        host_fs.context,
-                        host_fs.interrupt,
-                    ));
-                }
+    // Only the bootstrap hart brings devices up, and it is the hart
+    // that holds the root DRBG handle.
+    let external_interrupts = root_entropy.and_then(|root_entropy| {
+        // Every platform device shares one PLIC context, so the context
+        // is opened once and each device attaches its own source to it.
+        net::discover_plic_context(&fdt, bootstrap_processor.id()).map(|(plic, context)| {
+            let mut interrupts = net::ExternalInterrupts::new(plic, context);
+            if let Some(network) = net::install_network_service(&cpu, &kernel, &fdt, &debug_state) {
+                interrupts.attach_network(network);
             }
-            tracing::info!(
-                "virtio 9p online mount_tag={}",
-                crate::host_fs::HOST_MOUNT_TAG
-            );
-        }
-        interrupts
-    } else {
-        None
-    };
+            if let Some(host_fs) = host_fs::install(&fdt, &debug_state) {
+                interrupts.attach_host_fs(host_fs);
+            }
+            if let Some(entropy) = entropy::install(&kernel, &fdt, root_entropy) {
+                interrupts.attach_entropy(entropy);
+            }
+            interrupts
+        })
+    });
     let mut hart_runtime = HartRuntime {
         hart_id: current_hart,
         timer: kernel.timer(),

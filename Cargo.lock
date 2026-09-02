@@ -1681,6 +1681,7 @@ name = "helios-hal"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.13.1",
+ "fdt",
  "thiserror 2.0.18",
  "triomphe",
 ]
@@ -1803,6 +1804,7 @@ dependencies = [
  "rand_core",
  "serde",
  "serde_json",
+ "sha2",
  "slab",
  "smallvec",
  "spin 0.9.8",
