@@ -312,22 +312,18 @@ fn install_pci_devices<WatchdogImpl>(
         .chain(block_functions.iter().copied())
         .collect();
     let confinement = iommu_topology.map(|topology| {
-        iommu::confine_devices(
-            pci,
-            topology,
-            physical_memory_offset,
-            exceptions::IOMMU_INTERRUPT_VECTOR,
-            destination_apic_id,
-            dma_memory,
-            &confined,
-        )
+        iommu::confine_devices(pci, topology, physical_memory_offset, dma_memory, &confined)
     });
     if let Some(confinement) = &confinement {
-        debug_state.install_iommu_report(confinement.report());
-        routes.set_iommu(
-            exceptions::IOMMU_INTERRUPT_VECTOR,
-            confinement.interrupt_handler(),
-        );
+        let report = confinement.report();
+        debug_state.install_iommu_report(report.clone());
+        // The unit has no interrupt of its own to report a fault on, so
+        // the kernel collects them on a task that sleeps between polls.
+        kernel.spawn_detached(iommu::watch_faults(
+            confinement.device(),
+            report,
+            kernel.timer(),
+        ));
     } else {
         tracing::info!(
             "no virtio-iommu in the ACPI topology; device DMA reaches all of physical memory"

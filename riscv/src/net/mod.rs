@@ -35,9 +35,6 @@ pub(crate) struct ExternalInterrupts {
         crate::host_fs::HostFsTransportService,
         crate::entropy::VirtioEntropyDevice,
         crate::block::VirtioBlockDevice,
-        // As on aarch64: memory-mapped virtio devices cannot be put
-        // behind a virtio-iommu, so no unit reports faults here.
-        helios_kernel::NoExternalInterrupts,
     >,
 }
 

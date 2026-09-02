@@ -22,59 +22,31 @@ pub trait ExternalInterruptHandler {
     fn handle_interrupt(&self);
 }
 
-/// The handler a backend registers for a device class its platform does
-/// not have.
-///
-/// A machine whose devices are memory-mapped has no IOMMU endpoint to
-/// confine, so its routing table still needs a type for that slot even
-/// though nothing is ever installed in it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct NoExternalInterrupts;
-
-impl ExternalInterruptHandler for NoExternalInterrupts {
-    fn handle_interrupt(&self) {
-        panic!("an interrupt was routed to a device class this platform does not have")
-    }
-}
-
 /// Maps claimed interrupt sources to the device handlers a backend
 /// registered at boot.
-pub struct ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Block, Iommu> {
+pub struct ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Block> {
     network: Option<(Source, Network)>,
     host_fs: Option<(Source, HostFs)>,
     entropy: Option<(Source, Entropy)>,
-    iommu: Option<(Source, Iommu)>,
     block: [Option<(Source, Block)>; MAX_BLOCK_DEVICES],
 }
 
-impl<Source, Network, HostFs, Entropy, Block, Iommu>
-    ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Block, Iommu>
+impl<Source, Network, HostFs, Entropy, Block>
+    ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Block>
 where
     Source: PartialEq + Copy,
     Network: ExternalInterruptHandler,
     HostFs: ExternalInterruptHandler,
     Entropy: ExternalInterruptHandler,
     Block: ExternalInterruptHandler,
-    Iommu: ExternalInterruptHandler,
 {
     pub const fn new() -> Self {
         Self {
             network: None,
             host_fs: None,
             entropy: None,
-            iommu: None,
             block: [const { None }; MAX_BLOCK_DEVICES],
         }
-    }
-
-    /// Registers the platform's translation unit, which reports its
-    /// translation faults on its own interrupt.
-    pub fn set_iommu(&mut self, source: Source, handler: Iommu) {
-        assert!(
-            self.iommu.is_none(),
-            "IOMMU interrupt route was installed more than once"
-        );
-        self.iommu = Some((source, handler));
     }
 
     pub fn set_network(&mut self, source: Source, handler: Network) {
@@ -126,7 +98,6 @@ where
         if dispatch(&self.network, source)
             || dispatch(&self.host_fs, source)
             || dispatch(&self.entropy, source)
-            || dispatch(&self.iommu, source)
         {
             return true;
         }
@@ -148,15 +119,14 @@ where
     }
 }
 
-impl<Source, Network, HostFs, Entropy, Block, Iommu> Default
-    for ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Block, Iommu>
+impl<Source, Network, HostFs, Entropy, Block> Default
+    for ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Block>
 where
     Source: PartialEq + Copy,
     Network: ExternalInterruptHandler,
     HostFs: ExternalInterruptHandler,
     Entropy: ExternalInterruptHandler,
     Block: ExternalInterruptHandler,
-    Iommu: ExternalInterruptHandler,
 {
     fn default() -> Self {
         Self::new()

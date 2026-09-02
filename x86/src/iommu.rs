@@ -15,10 +15,12 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
+use core::time::Duration;
 
 use acpi::sdt::SdtHeader;
+use helios_hal::cpu::Cpu;
 use helios_hal::iommu::{DmaTranslation, EndpointId, PhysicalRange};
-use helios_kernel::{ExternalInterruptHandler, IommuDomains, IommuReport, MAX_IOMMU_ENDPOINTS};
+use helios_kernel::{IommuDomains, IommuReport, MAX_IOMMU_ENDPOINTS, Timer};
 use helios_virtio::{
     DeviceType, MAX_RESERVED_REGIONS, OffsetDmaPool, PlatformDmaPool, ReservedRegion,
     VirtioIommuDevice, VirtioPciTransport,
@@ -133,26 +135,28 @@ impl IommuTopology {
 /// The unit the platform exposes, once it has been brought up.
 pub(crate) type X86VirtioIommuDevice = VirtioIommuDevice<VirtioPciTransport<OffsetDmaPool>>;
 
-/// The interrupt handler of the platform's translation unit.
+/// How often the platform's translation unit is asked whether it has
+/// reported a fault.
 ///
-/// It drains the faults the unit reported and publishes the running
-/// total so `helios-inspector stats` shows it.
-#[derive(Clone)]
-pub(crate) struct VirtioIommu {
+/// The unit has no interrupt to report one on. QEMU's
+/// `virtio-iommu-pci` function exposes no MSI-X capability at all — it
+/// has no `vectors` property to give it one — and this backend routes
+/// device interrupts through MSI-X only. A fault is exceptional, so a
+/// task that sleeps on the kernel timer between polls costs nothing and
+/// never busy-waits; what it must not do is leave a fault unreported.
+const FAULT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Reads back the faults the unit reported and publishes the running
+/// total, so `helios-inspector stats` shows it.
+pub(crate) async fn watch_faults<CpuImpl: Cpu + Clone>(
     device: Arc<X86VirtioIommuDevice>,
     report: Arc<IommuReport>,
-}
-
-impl VirtioIommu {
-    pub(crate) fn new(device: Arc<X86VirtioIommuDevice>, report: Arc<IommuReport>) -> Self {
-        Self { device, report }
-    }
-}
-
-impl ExternalInterruptHandler for VirtioIommu {
-    fn handle_interrupt(&self) {
-        self.device.handle_interrupt();
-        self.report.record_faults(self.device.fault_count());
+    timer: Timer<CpuImpl>,
+) {
+    loop {
+        timer.sleep_for(FAULT_POLL_INTERVAL).await;
+        device.drain_faults();
+        report.record_faults(device.fault_count());
     }
 }
 
@@ -190,33 +194,33 @@ pub(crate) fn discover(
     Some(parse_viot(table))
 }
 
-/// Brings the unit at `address` up on its own MSI-X vector.
+/// Brings the unit at `address` up.
+///
+/// It is left on its INTx pin: the function carries no MSI-X capability
+/// to bind, and nothing in this backend routes a legacy pin, so the
+/// faults it reports are collected by [`watch_faults`] instead.
 pub(crate) fn install(
     pci: &PciRoot,
     address: PciAddress,
     physical_memory_offset: usize,
-    vector: u8,
-    destination_apic_id: u32,
 ) -> Arc<X86VirtioIommuDevice> {
     assert_eq!(
         helios_virtio::virtio_pci_device_type(&pci.access(), address),
         Some(DeviceType::Iommu),
         "the ACPI VIOT named {address} as the translation unit but it carries no virtio-iommu"
     );
-    let msix_vector = pci.bind_msix_vector(address, vector, destination_apic_id);
     let device = helios_virtio::iommu_from_pci(
         &pci.access(),
         address,
         pci,
         OffsetDmaPool::new(physical_memory_offset),
-        Some(msix_vector),
+        None,
     )
     .unwrap_or_else(|error| {
         panic!("failed to initialize the virtio-iommu function at {address}: {error}")
     });
     tracing::info!(
         function = %address,
-        msix_vector = vector,
         global_bypass = device.global_bypass(),
         "virtio-iommu online"
     );
@@ -242,9 +246,9 @@ impl Confinement {
             .unwrap_or_else(|| panic!("PCI function {address} was never given an IOMMU domain"))
     }
 
-    /// The handler that drains the unit's fault reports.
-    pub(crate) fn interrupt_handler(&self) -> VirtioIommu {
-        VirtioIommu::new(self.device.clone(), self.report.clone())
+    /// The unit itself, for the task that collects its fault reports.
+    pub(crate) fn device(&self) -> Arc<X86VirtioIommuDevice> {
+        self.device.clone()
     }
 
     /// What the kernel publishes about this unit.
@@ -264,18 +268,10 @@ pub(crate) fn confine_devices(
     pci: &PciRoot,
     topology: IommuTopology,
     physical_memory_offset: usize,
-    vector: u8,
-    destination_apic_id: u32,
     dma_memory: &[PhysicalRange],
     functions: &[PciAddress],
 ) -> Confinement {
-    let device = install(
-        pci,
-        topology.unit(),
-        physical_memory_offset,
-        vector,
-        destination_apic_id,
-    );
+    let device = install(pci, topology.unit(), physical_memory_offset);
 
     // The unit is authoritative about the ranges its endpoints have to
     // keep reaching; the platform's own message window is the answer
