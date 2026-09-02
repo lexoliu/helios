@@ -86,6 +86,7 @@ unsafe extern "C" {
 
 mod vmm;
 pub use vmm::Aarch64UserAddressSpace;
+mod block;
 mod entropy;
 mod gic;
 mod host_fs;
@@ -106,6 +107,7 @@ pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
     net::VirtioNetworkDevice,
     host_fs::HostFsTransportService,
     entropy::VirtioEntropyDevice,
+    block::VirtioBlockDevice,
 >;
 
 #[used]
@@ -468,6 +470,10 @@ extern "C" fn aarch64_kernel_main() -> ! {
     if entropy::has_entropy_device(&boot_fdt) {
         devices = devices.with_entropy_device();
     }
+    let block_device_count = block::count_block_devices(&boot_fdt);
+    if block_device_count != 0 {
+        devices = devices.with_block_devices(block_device_count);
+    }
     let kernel = helios_kernel::init(
         Platform::new(console, core::iter::empty::<MemoryRegion>(), cpu.clone())
             .with_topology(
@@ -530,7 +536,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         &boot_fdt,
         physical_memory_offset,
         &handoff,
-        root_entropy,
+        root_entropy.clone(),
     ) {
         gic.enable_device_interrupt(
             entropy.interrupt,
@@ -538,6 +544,22 @@ extern "C" fn aarch64_kernel_main() -> ! {
             platform_state.bootstrap_mpidr(),
         );
         routes.set_entropy(entropy.interrupt, entropy.device);
+    }
+    for block in block::install(
+        &cpu,
+        &kernel,
+        &boot_fdt,
+        physical_memory_offset,
+        &handoff,
+        &debug_state,
+        root_entropy,
+    ) {
+        gic.enable_device_interrupt(
+            block.interrupt,
+            block.trigger,
+            platform_state.bootstrap_mpidr(),
+        );
+        routes.add_block(block.interrupt, block.device);
     }
 
     let runtime = current_processor_runtime();

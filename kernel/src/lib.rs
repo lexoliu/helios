@@ -19,6 +19,8 @@ mod memory;
 mod network;
 mod process;
 mod runtime;
+#[cfg(test)]
+mod test_support;
 #[cfg(feature = "wasmtime-runtime")]
 pub(crate) mod wasmtime_adapter;
 #[cfg(feature = "wasmtime-runtime")]
@@ -95,10 +97,12 @@ pub use instance::{
     record_instance_transition,
 };
 pub use io::{
-    ByteReadWait, ByteReader, ByteWriteWait, ByteWriter, ClosedPeer, ExternalInterruptHandler,
-    ExternalInterruptRoutes, PollKey, PollRegistration, PollRegistry, PollRegistryError,
-    PollSourceKind, RecordingConsole, SerialReader, TryRead, TryWrite, byte_channel,
-    emit_serial_error_marker, emit_serial_stage_marker, read_serial, try_read_serial, write_serial,
+    BlockInstallError, BlockSelfCheckError, BlockService, BlockStats, ByteReadWait, ByteReader,
+    ByteWriteWait, ByteWriter, ClosedPeer, ExternalInterruptHandler, ExternalInterruptRoutes,
+    MAX_BLOCK_DEVICES, PollKey, PollRegistration, PollRegistry, PollRegistryError, PollSourceKind,
+    RecordingConsole, SCRATCH_DISK_SERIAL, SerialReader, TryRead, TryWrite, byte_channel,
+    emit_serial_error_marker, emit_serial_stage_marker, install_block_devices, read_serial,
+    try_read_serial, write_serial,
 };
 pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,

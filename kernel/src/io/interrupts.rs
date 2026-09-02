@@ -9,6 +9,14 @@
 //! bring-up and are read-only on the interrupt path afterwards.
 //! Handlers run in interrupt context and must be non-blocking.
 
+/// Block devices one platform may route interrupts for.
+///
+/// A machine routinely carries more than one: the disk the kernel was
+/// booted from and the scratch disk it owns are separate devices on the
+/// same bus, and the kernel has to be able to reach both to tell them
+/// apart.
+pub const MAX_BLOCK_DEVICES: usize = 4;
+
 /// A device that consumes external interrupts for one source.
 pub trait ExternalInterruptHandler {
     fn handle_interrupt(&self);
@@ -16,24 +24,28 @@ pub trait ExternalInterruptHandler {
 
 /// Maps claimed interrupt sources to the device handlers a backend
 /// registered at boot.
-pub struct ExternalInterruptRoutes<Source, Network, HostFs, Entropy> {
+pub struct ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Block> {
     network: Option<(Source, Network)>,
     host_fs: Option<(Source, HostFs)>,
     entropy: Option<(Source, Entropy)>,
+    block: [Option<(Source, Block)>; MAX_BLOCK_DEVICES],
 }
 
-impl<Source, Network, HostFs, Entropy> ExternalInterruptRoutes<Source, Network, HostFs, Entropy>
+impl<Source, Network, HostFs, Entropy, Block>
+    ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Block>
 where
     Source: PartialEq + Copy,
     Network: ExternalInterruptHandler,
     HostFs: ExternalInterruptHandler,
     Entropy: ExternalInterruptHandler,
+    Block: ExternalInterruptHandler,
 {
     pub const fn new() -> Self {
         Self {
             network: None,
             host_fs: None,
             entropy: None,
+            block: [const { None }; MAX_BLOCK_DEVICES],
         }
     }
 
@@ -61,40 +73,60 @@ where
         self.entropy = Some((source, handler));
     }
 
+    /// Registers one more block device.
+    ///
+    /// Unlike the single-device slots this one takes several handlers:
+    /// the platform decides which of the disks it exposes the kernel
+    /// ends up owning, and that decision needs every candidate to be
+    /// reachable first.
+    pub fn add_block(&mut self, source: Source, handler: Block) {
+        let slot = self
+            .block
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .unwrap_or_else(|| {
+                panic!("more than {MAX_BLOCK_DEVICES} block interrupt routes were installed")
+            });
+        *slot = Some((source, handler));
+    }
+
     /// Dispatches a claimed source to its handler. Returns false when no
     /// route matches so the backend can fail fast with controller
     /// context in the message.
     #[must_use]
     pub fn route(&self, source: Source) -> bool {
-        if let Some((registered, handler)) = &self.network {
-            if *registered == source {
-                handler.handle_interrupt();
-                return true;
-            }
+        if dispatch(&self.network, source)
+            || dispatch(&self.host_fs, source)
+            || dispatch(&self.entropy, source)
+        {
+            return true;
         }
-        if let Some((registered, handler)) = &self.host_fs {
-            if *registered == source {
-                handler.handle_interrupt();
-                return true;
-            }
-        }
-        if let Some((registered, handler)) = &self.entropy {
-            if *registered == source {
-                handler.handle_interrupt();
-                return true;
-            }
-        }
-        false
+        self.block.iter().any(|slot| dispatch(slot, source))
     }
 }
 
-impl<Source, Network, HostFs, Entropy> Default
-    for ExternalInterruptRoutes<Source, Network, HostFs, Entropy>
+fn dispatch<Source, Handler>(slot: &Option<(Source, Handler)>, source: Source) -> bool
+where
+    Source: PartialEq + Copy,
+    Handler: ExternalInterruptHandler,
+{
+    match slot {
+        Some((registered, handler)) if *registered == source => {
+            handler.handle_interrupt();
+            true
+        }
+        Some(_) | None => false,
+    }
+}
+
+impl<Source, Network, HostFs, Entropy, Block> Default
+    for ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Block>
 where
     Source: PartialEq + Copy,
     Network: ExternalInterruptHandler,
     HostFs: ExternalInterruptHandler,
     Entropy: ExternalInterruptHandler,
+    Block: ExternalInterruptHandler,
 {
     fn default() -> Self {
         Self::new()

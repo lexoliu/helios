@@ -2,6 +2,7 @@
 #![no_main]
 
 extern crate alloc;
+mod block;
 mod entropy;
 mod host_fs;
 mod net;
@@ -579,7 +580,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     if net::has_network_device(&fdt) {
         devices = devices.with_network();
     }
-    let block_device_count = count_virtio_mmio_devices(&fdt, DeviceType::Block);
+    let block_device_count = block::count_block_devices(&fdt);
     if block_device_count != 0 {
         devices = devices.with_block_devices(block_device_count);
     }
@@ -630,8 +631,11 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             if let Some(host_fs) = host_fs::install(&fdt, &debug_state) {
                 interrupts.attach_host_fs(host_fs);
             }
-            if let Some(entropy) = entropy::install(&kernel, &fdt, root_entropy) {
+            if let Some(entropy) = entropy::install(&kernel, &fdt, root_entropy.clone()) {
                 interrupts.attach_entropy(entropy);
+            }
+            for block in block::install(&cpu, &kernel, &fdt, &debug_state, root_entropy) {
+                interrupts.attach_block(block);
             }
             interrupts
         })

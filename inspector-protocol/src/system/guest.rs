@@ -526,6 +526,25 @@ fn convert_sample(sample: host_stats::Sample) -> stats::Sample {
             available_bytes: sample.memory.available_bytes,
             pressure: convert_memory_pressure(sample.memory.pressure),
         },
+        block: sample.block.map(convert_block_device),
+    }
+}
+
+fn convert_block_device(block: host_stats::BlockDevice) -> stats::BlockDevice {
+    stats::BlockDevice {
+        capacity_bytes: block.capacity_bytes,
+        block_bytes: block.block_bytes,
+        physical_block_bytes: block.physical_block_bytes,
+        flush: block.flush,
+        discard: block.discard,
+        write_zeroes: block.write_zeroes,
+        queues: block.queues,
+        queue_depth: block.queue_depth,
+        reads: block.reads,
+        writes: block.writes,
+        flushes: block.flushes,
+        discards: block.discards,
+        write_zeroes_requests: block.write_zeroes_requests,
     }
 }
 

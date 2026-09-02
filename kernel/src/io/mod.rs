@@ -4,18 +4,23 @@
 //! that captures host stderr, and the poll registry that wakes async
 //! tasks on external events.
 
+mod block;
 mod child;
 mod console;
 mod interrupts;
 mod poll_registry;
 mod serial;
 
+pub use block::{
+    BlockInstallError, BlockSelfCheckError, BlockService, BlockStats, SCRATCH_DISK_SERIAL,
+    install_block_devices,
+};
 pub use child::{
     ByteReadWait, ByteReader, ByteWriteWait, ByteWriter, ClosedPeer, TryRead, TryWrite,
     byte_channel,
 };
 pub use console::RecordingConsole;
-pub use interrupts::{ExternalInterruptHandler, ExternalInterruptRoutes};
+pub use interrupts::{ExternalInterruptHandler, ExternalInterruptRoutes, MAX_BLOCK_DEVICES};
 pub use poll_registry::{
     PollKey, PollRegistration, PollRegistry, PollRegistryError, PollSourceKind,
 };

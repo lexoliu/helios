@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+mod block;
 mod boot;
 mod entropy;
 mod exceptions;
@@ -187,6 +188,7 @@ fn x86_kernel_main() -> ! {
     let network_function = net::discover(&pci);
     let host_share_function = host_fs::discover(&pci);
     let entropy_function = entropy::discover(&pci);
+    let block_functions = block::discover(&pci);
     let mut devices = DeviceInventory::new().with_debug_serial();
     if network_function.is_some() {
         devices = devices.with_network();
@@ -196,6 +198,9 @@ fn x86_kernel_main() -> ! {
     }
     if entropy_function.is_some() {
         devices = devices.with_entropy_device();
+    }
+    if !block_functions.is_empty() {
+        devices = devices.with_block_devices(block_functions.len());
     }
     let kernel = helios_kernel::init_with_watchdog(
         Platform::with_watchdog(console, memory_regions, cpu.clone(), cpu.watchdog())
@@ -228,6 +233,7 @@ fn x86_kernel_main() -> ! {
         network_function,
         host_share_function,
         entropy_function,
+        &block_functions,
         &debug_state,
         root_entropy,
     );
@@ -269,6 +275,7 @@ fn install_pci_devices<WatchdogImpl>(
     network_function: Option<pci_types::PciAddress>,
     host_share_function: Option<pci_types::PciAddress>,
     entropy_function: Option<pci_types::PciAddress>,
+    block_functions: &[pci_types::PciAddress],
     debug_state: &debug_state::RuntimeState,
     root_entropy: helios_kernel::RootEntropyHandle,
 ) where
@@ -312,11 +319,26 @@ fn install_pci_devices<WatchdogImpl>(
             physical_memory_offset,
             exceptions::ENTROPY_INTERRUPT_VECTOR,
             destination_apic_id,
-            root_entropy,
+            root_entropy.clone(),
         );
         routes.set_entropy(exceptions::ENTROPY_INTERRUPT_VECTOR, device);
     } else {
         tracing::warn!("virtio entropy device was not discovered on the PCI bus");
+    }
+    if block_functions.is_empty() {
+        tracing::warn!("virtio block device was not discovered on the PCI bus");
+    }
+    for block in block::install(
+        cpu,
+        kernel,
+        pci,
+        block_functions,
+        physical_memory_offset,
+        destination_apic_id,
+        debug_state,
+        root_entropy,
+    ) {
+        routes.add_block(block.vector, block.device);
     }
     smp::current_runtime().install_device_interrupts(routes);
 }

@@ -168,7 +168,20 @@ impl PciRoot {
 
     /// Locates the first modern virtio function of the requested type.
     pub(crate) fn find_virtio_function(&self, device_type: DeviceType) -> Option<PciAddress> {
-        self.functions().find(|address| {
+        self.find_virtio_functions(device_type).next()
+    }
+
+    /// Every modern virtio function of the requested type, in bus order.
+    ///
+    /// Device classes the platform exposes more than once — block
+    /// devices, where the boot image and the kernel's own disk sit on
+    /// the same bus — are brought up from this rather than from the
+    /// first match.
+    pub(crate) fn find_virtio_functions(
+        &self,
+        device_type: DeviceType,
+    ) -> impl Iterator<Item = PciAddress> + '_ {
+        self.functions().filter(move |address| {
             helios_virtio::virtio_pci_device_type(&self.access, *address) == Some(device_type)
         })
     }

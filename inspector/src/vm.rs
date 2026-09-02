@@ -33,7 +33,11 @@ const DEFAULT_RISCV_SMP: u16 = 4;
 const DEFAULT_X86_SMP: u16 = 4;
 const DEFAULT_SOCKET_WAIT: Duration = Duration::from_secs(10);
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const DEFAULT_BLOCK_DEVICE_BYTES: u64 = 64 * 1024 * 1024;
+/// Size of the scratch disk every profile attaches.
+const DEFAULT_DATA_DISK_BYTES: u64 = 256 * 1024 * 1024;
+/// The serial the guest kernel identifies its own disk by. Nothing else
+/// on the bus carries it, so the boot image is never mistaken for it.
+const DATA_DISK_SERIAL: &str = "helios-data";
 const DEFAULT_GDB_ENDPOINT: &str = "tcp::1234";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
@@ -71,10 +75,25 @@ enum VmNetworkProfile {
     VirtioPciUser,
 }
 
+/// How a profile attaches the image the guest firmware boots from.
+///
+/// Only the profiles whose boot artifact is a disk image have one; the
+/// guest kernel never writes to it, and on the arches where it is visible
+/// at all it is told apart from the scratch disk by its serial.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VmBlockProfile {
-    VirtioMmioDataDisk,
-    VirtioPciBootDisk,
+enum VmBootDiskProfile {
+    VirtioPci,
+}
+
+/// How a profile attaches the scratch disk the guest kernel owns.
+///
+/// Every profile has one: the kernel identifies it by the
+/// [`DATA_DISK_SERIAL`] serial and proves it round-trips at boot, so a
+/// guest booted without it cannot bring its block device up at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VmDataDiskProfile {
+    VirtioMmio,
+    VirtioPci,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,7 +133,8 @@ struct VmProfile {
     boot_artifact: VmBootArtifactKind,
     console: VmConsoleProfile,
     network: Option<VmNetworkProfile>,
-    block: Option<VmBlockProfile>,
+    boot_disk: Option<VmBootDiskProfile>,
+    data_disk: VmDataDiskProfile,
     host_share: Option<VmHostShareProfile>,
     watchdog: Option<VmWatchdogProfile>,
     entropy: VmEntropyProfile,
@@ -140,7 +160,8 @@ const AARCH64_VIRT_HVF_PROFILE: VmProfile = VmProfile {
     boot_artifact: VmBootArtifactKind::LimineUefiDiskImage,
     console: VmConsoleProfile::SerialUnixSocket,
     network: Some(VmNetworkProfile::VirtioMmioUser),
-    block: Some(VmBlockProfile::VirtioPciBootDisk),
+    boot_disk: Some(VmBootDiskProfile::VirtioPci),
+    data_disk: VmDataDiskProfile::VirtioMmio,
     host_share: Some(VmHostShareProfile::Virtio9pMmio),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
     entropy: VmEntropyProfile::VirtioRngMmio,
@@ -161,7 +182,8 @@ const AARCH64_VIRT_TCG_PROFILE: VmProfile = VmProfile {
     boot_artifact: VmBootArtifactKind::LimineUefiDiskImage,
     console: VmConsoleProfile::SerialUnixSocket,
     network: Some(VmNetworkProfile::VirtioMmioUser),
-    block: Some(VmBlockProfile::VirtioPciBootDisk),
+    boot_disk: Some(VmBootDiskProfile::VirtioPci),
+    data_disk: VmDataDiskProfile::VirtioMmio,
     host_share: Some(VmHostShareProfile::Virtio9pMmio),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
     entropy: VmEntropyProfile::VirtioRngMmio,
@@ -181,7 +203,8 @@ const RISCV64_VM_PROFILE: VmProfile = VmProfile {
     boot_artifact: VmBootArtifactKind::KernelBinary,
     console: VmConsoleProfile::SerialUnixSocket,
     network: Some(VmNetworkProfile::VirtioMmioUser),
-    block: Some(VmBlockProfile::VirtioMmioDataDisk),
+    boot_disk: None,
+    data_disk: VmDataDiskProfile::VirtioMmio,
     host_share: Some(VmHostShareProfile::Virtio9pMmio),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
     entropy: VmEntropyProfile::VirtioRngMmio,
@@ -201,7 +224,8 @@ const X86_64_VM_PROFILE: VmProfile = VmProfile {
     boot_artifact: VmBootArtifactKind::LimineUefiDiskImage,
     console: VmConsoleProfile::SerialUnixSocket,
     network: Some(VmNetworkProfile::VirtioPciUser),
-    block: Some(VmBlockProfile::VirtioPciBootDisk),
+    boot_disk: Some(VmBootDiskProfile::VirtioPci),
+    data_disk: VmDataDiskProfile::VirtioPci,
     host_share: Some(VmHostShareProfile::Virtio9pPci),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
     entropy: VmEntropyProfile::VirtioRngPci,
@@ -305,6 +329,8 @@ pub(crate) struct VmConfigFile {
     #[serde(default)]
     pub(crate) keep_runtime_dir: Option<bool>,
     #[serde(default)]
+    pub(crate) data_disk_size: Option<u64>,
+    #[serde(default)]
     pub(crate) virtio_packed: Option<bool>,
     #[serde(default)]
     pub(crate) virtio_in_order: Option<bool>,
@@ -371,6 +397,10 @@ pub(crate) struct VmCommand {
 
     #[arg(long)]
     shared_dir: Option<PathBuf>,
+
+    /// Size in bytes of the scratch disk every profile attaches.
+    #[arg(long)]
+    data_disk_size: Option<u64>,
 
     #[arg(long)]
     gdb: Option<String>,
@@ -497,6 +527,7 @@ struct ResolvedVmCommand {
     cpu: Option<String>,
     accel: Vec<String>,
     shared_dir: Option<PathBuf>,
+    data_disk_bytes: u64,
     gdb: Option<String>,
     gdb_wait: bool,
     monitor: Option<String>,
@@ -576,6 +607,13 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
         .or(file.cpu)
         .or_else(|| default_cpu(profile, &accel).map(str::to_owned));
     let shared_dir = command.shared_dir.or(file.shared_dir);
+    let data_disk_bytes = command
+        .data_disk_size
+        .or(file.data_disk_size)
+        .unwrap_or(DEFAULT_DATA_DISK_BYTES);
+    if data_disk_bytes == 0 {
+        bail!("--data-disk-size must be greater than zero");
+    }
     let gdb = command
         .gdb
         .or(file.gdb)
@@ -645,6 +683,7 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
         cpu,
         accel,
         shared_dir,
+        data_disk_bytes,
         gdb,
         gdb_wait,
         monitor,
@@ -1340,7 +1379,7 @@ impl VmRuntime {
         }
         prepare_log_path(&qemu_log)?;
         let artifact = prepare_boot_artifact(command, Some(runtime_dir.path()))?;
-        let block_image = prepare_block_image(command, runtime_dir.path())?;
+        let data_disk = prepare_data_disk(command, runtime_dir.path())?;
 
         let spinner = spinner(&format!(
             "starting QEMU for {}",
@@ -1419,15 +1458,15 @@ impl VmRuntime {
         if let Some(network) = command.profile.network {
             configure_network_device(&mut qemu, network, command.virtio_queues);
         }
-        if let Some(block) = command.profile.block {
-            configure_block_device(
-                &mut qemu,
-                block,
-                &artifact,
-                block_image.as_deref(),
-                command.virtio_queues,
-            );
+        if let Some(boot_disk) = command.profile.boot_disk {
+            configure_boot_disk(&mut qemu, boot_disk, &artifact, command.virtio_queues);
         }
+        configure_data_disk(
+            &mut qemu,
+            command.profile.data_disk,
+            &data_disk,
+            command.virtio_queues,
+        );
         if let Some(host_share) = command.profile.host_share {
             if let Some(shared_dir) = &command.shared_dir {
                 configure_host_share(&mut qemu, host_share, shared_dir, command.virtio_queues);
@@ -1651,19 +1690,17 @@ fn default_kernel_path(arch: VmArch, profile_dir: &str) -> PathBuf {
         .join(profile.kernel_artifact_name)
 }
 
-fn prepare_block_image(command: &ResolvedVmCommand, runtime_dir: &Path) -> Result<Option<PathBuf>> {
-    let Some(block_profile) = command.profile.block else {
-        return Ok(None);
-    };
-    if block_profile == VmBlockProfile::VirtioPciBootDisk {
-        return Ok(None);
-    }
+/// Creates the scratch disk image this VM's guest kernel will own.
+///
+/// It lives in the runtime directory, so every VM gets a disk of its own
+/// and a retained runtime directory keeps whatever the guest wrote.
+fn prepare_data_disk(command: &ResolvedVmCommand, runtime_dir: &Path) -> Result<PathBuf> {
     let image = runtime_dir.join("data.img");
     let file = fs::File::create(&image)
-        .with_context(|| format!("failed to create block image {}", image.display()))?;
-    file.set_len(DEFAULT_BLOCK_DEVICE_BYTES)
-        .with_context(|| format!("failed to size block image {}", image.display()))?;
-    Ok(Some(image))
+        .with_context(|| format!("failed to create scratch disk image {}", image.display()))?;
+    file.set_len(command.data_disk_bytes)
+        .with_context(|| format!("failed to size scratch disk image {}", image.display()))?;
+    Ok(image)
 }
 
 fn configure_firmware(
@@ -1805,27 +1842,19 @@ fn configure_network_device(
     }
 }
 
-fn configure_block_device(
+/// Attaches the image the guest firmware boots from.
+///
+/// The guest kernel must never write to it, which is why it carries no
+/// scratch-disk serial: a kernel that cannot name a disk leaves it alone.
+fn configure_boot_disk(
     qemu: &mut Command,
-    block: VmBlockProfile,
+    boot_disk: VmBootDiskProfile,
     boot_artifact: &Path,
-    data_image: Option<&Path>,
     queues: VirtioQueueProfile,
 ) {
     let properties = queues.device_properties();
-    match block {
-        VmBlockProfile::VirtioMmioDataDisk => {
-            let image = data_image.unwrap_or_else(|| {
-                panic!("virtio-mmio block device requires a prepared data image")
-            });
-            qemu.arg("-drive").arg(format!(
-                "if=none,format=raw,file={},id=rootfs",
-                image.display()
-            ));
-            qemu.arg("-device")
-                .arg(format!("virtio-blk-device,drive=rootfs{properties}"));
-        }
-        VmBlockProfile::VirtioPciBootDisk => {
+    match boot_disk {
+        VmBootDiskProfile::VirtioPci => {
             qemu.arg("-drive").arg(format!(
                 "if=none,format=raw,file={},id=bootdisk",
                 boot_artifact.display()
@@ -1835,6 +1864,30 @@ fn configure_block_device(
             ));
         }
     }
+}
+
+/// Attaches the scratch disk the guest kernel owns.
+///
+/// The serial is the contract: the guest identifies its disk by name, so
+/// the same bus can carry a boot image the kernel must not touch.
+fn configure_data_disk(
+    qemu: &mut Command,
+    data_disk: VmDataDiskProfile,
+    image: &Path,
+    queues: VirtioQueueProfile,
+) {
+    let properties = queues.device_properties();
+    qemu.arg("-drive").arg(format!(
+        "if=none,format=raw,file={},id=data",
+        image.display()
+    ));
+    let device = match data_disk {
+        VmDataDiskProfile::VirtioMmio => "virtio-blk-device",
+        VmDataDiskProfile::VirtioPci => "virtio-blk-pci",
+    };
+    qemu.arg("-device").arg(format!(
+        "{device},drive=data,serial={DATA_DISK_SERIAL}{properties}"
+    ));
 }
 
 fn configure_host_share(
@@ -1949,8 +2002,12 @@ mod tests {
             Some(VmNetworkProfile::VirtioMmioUser)
         );
         assert_eq!(
-            AARCH64_VIRT_HVF_PROFILE.block,
-            Some(VmBlockProfile::VirtioPciBootDisk)
+            AARCH64_VIRT_HVF_PROFILE.boot_disk,
+            Some(VmBootDiskProfile::VirtioPci)
+        );
+        assert_eq!(
+            AARCH64_VIRT_HVF_PROFILE.data_disk,
+            VmDataDiskProfile::VirtioMmio
         );
         assert_eq!(
             AARCH64_VIRT_HVF_PROFILE.host_share,
@@ -1988,10 +2045,8 @@ mod tests {
             RISCV64_VM_PROFILE.network,
             Some(VmNetworkProfile::VirtioMmioUser)
         );
-        assert_eq!(
-            RISCV64_VM_PROFILE.block,
-            Some(VmBlockProfile::VirtioMmioDataDisk)
-        );
+        assert_eq!(RISCV64_VM_PROFILE.boot_disk, None);
+        assert_eq!(RISCV64_VM_PROFILE.data_disk, VmDataDiskProfile::VirtioMmio);
         assert_eq!(
             RISCV64_VM_PROFILE.host_share,
             Some(VmHostShareProfile::Virtio9pMmio)
@@ -2018,9 +2073,10 @@ mod tests {
             Some(VmNetworkProfile::VirtioPciUser)
         );
         assert_eq!(
-            X86_64_VM_PROFILE.block,
-            Some(VmBlockProfile::VirtioPciBootDisk)
+            X86_64_VM_PROFILE.boot_disk,
+            Some(VmBootDiskProfile::VirtioPci)
         );
+        assert_eq!(X86_64_VM_PROFILE.data_disk, VmDataDiskProfile::VirtioPci);
         assert_eq!(
             X86_64_VM_PROFILE.host_share,
             Some(VmHostShareProfile::Virtio9pPci)
@@ -2056,6 +2112,7 @@ mod tests {
             cpu: None,
             accel: Vec::new(),
             shared_dir: None,
+            data_disk_size: None,
             gdb: None,
             gdb_wait: false,
             monitor: None,
@@ -2112,6 +2169,7 @@ mod tests {
             cpu: None,
             accel: Vec::new(),
             shared_dir: None,
+            data_disk_size: None,
             gdb: None,
             gdb_wait: false,
             monitor: None,
@@ -2215,6 +2273,7 @@ mod tests {
                 .map(|value| (*value).to_owned())
                 .collect(),
             shared_dir: None,
+            data_disk_bytes: DEFAULT_DATA_DISK_BYTES,
             gdb: None,
             gdb_wait: false,
             monitor: None,
@@ -2370,6 +2429,7 @@ mod tests {
                 .map(|value| (*value).to_owned())
                 .collect(),
             shared_dir: Some(repo_root().to_path_buf()),
+            data_disk_bytes: DEFAULT_DATA_DISK_BYTES,
             gdb: None,
             gdb_wait: false,
             monitor: None,

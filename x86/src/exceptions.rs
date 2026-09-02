@@ -22,6 +22,12 @@ pub(crate) const TLB_SHOOTDOWN_INTERRUPT_VECTOR: u8 = 0x22;
 pub(crate) const NETWORK_INTERRUPT_VECTOR: u8 = 0x30;
 pub(crate) const HOST_FS_INTERRUPT_VECTOR: u8 = 0x31;
 pub(crate) const ENTROPY_INTERRUPT_VECTOR: u8 = 0x32;
+/// One vector per block device the routing table can hold: the platform
+/// exposes the boot image and the kernel's own disk as separate
+/// functions, and each of them delivers its completions on its own
+/// message.
+pub(crate) const BLOCK_INTERRUPT_VECTORS: [u8; helios_kernel::MAX_BLOCK_DEVICES] =
+    [0x33, 0x34, 0x35, 0x36];
 
 /// Device interrupt routing table for this backend, keyed by IDT vector.
 pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
@@ -29,6 +35,7 @@ pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
     crate::net::VirtioNetworkDevice,
     crate::host_fs::HostFsTransportService,
     crate::entropy::VirtioEntropyDevice,
+    crate::block::VirtioBlockDevice,
 >;
 
 global_asm!(include_str!("exceptions.S"));
@@ -47,6 +54,10 @@ unsafe extern "C" {
     fn helios_x86_interrupt_network();
     fn helios_x86_interrupt_host_fs();
     fn helios_x86_interrupt_entropy();
+    fn helios_x86_interrupt_block_0();
+    fn helios_x86_interrupt_block_1();
+    fn helios_x86_interrupt_block_2();
+    fn helios_x86_interrupt_block_3();
 }
 
 pub(crate) struct ProcessorIdt {
@@ -99,6 +110,15 @@ impl ProcessorIdt {
                 .set_handler_addr(handler_address(helios_x86_interrupt_host_fs));
             table[ENTROPY_INTERRUPT_VECTOR]
                 .set_handler_addr(handler_address(helios_x86_interrupt_entropy));
+            let block_stubs: [unsafe extern "C" fn(); helios_kernel::MAX_BLOCK_DEVICES] = [
+                helios_x86_interrupt_block_0,
+                helios_x86_interrupt_block_1,
+                helios_x86_interrupt_block_2,
+                helios_x86_interrupt_block_3,
+            ];
+            for (vector, stub) in BLOCK_INTERRUPT_VECTORS.iter().zip(block_stubs) {
+                table[*vector].set_handler_addr(handler_address(stub));
+            }
             table.load_unsafe();
         }
     }
@@ -164,18 +184,31 @@ extern "C" fn helios_x86_interrupt_dispatch(frame: &mut ExceptionFrame) {
         Ok(TLB_SHOOTDOWN_INTERRUPT_VECTOR) => {
             smp::handle_tlb_shootdown_interrupt();
         }
-        Ok(
-            vector @ (NETWORK_INTERRUPT_VECTOR
-            | HOST_FS_INTERRUPT_VECTOR
-            | ENTROPY_INTERRUPT_VECTOR),
-        ) => {
+        Ok(vector) if is_device_interrupt(vector) => {
             smp::handle_device_interrupt(vector);
         }
         _ => panic!(
-            "unhandled x86 interrupt vector={} rip={:#x}",
+            "unhandled x86 interrupt vector={:#x} rip={:#x}; device vectors are \
+             network={NETWORK_INTERRUPT_VECTOR:#x} host-fs={HOST_FS_INTERRUPT_VECTOR:#x} \
+             entropy={ENTROPY_INTERRUPT_VECTOR:#x} block={BLOCK_INTERRUPT_VECTORS:#x?}",
             frame.vector, frame.rip
         ),
     }
+}
+
+/// Whether `vector` belongs to a device route.
+///
+/// The IDT stub for a device vector pushes nothing but the vector
+/// number, so this predicate is what decides between the routing table
+/// and a fatal spurious interrupt. Every vector [`ProcessorIdt::install`]
+/// points at a device stub has to be listed here, which is why the block
+/// devices are tested against the same array the IDT is built from
+/// rather than against a second copy of those numbers.
+fn is_device_interrupt(vector: u8) -> bool {
+    matches!(
+        vector,
+        NETWORK_INTERRUPT_VECTOR | HOST_FS_INTERRUPT_VECTOR | ENTROPY_INTERRUPT_VECTOR
+    ) || BLOCK_INTERRUPT_VECTORS.contains(&vector)
 }
 
 fn dispatch_to_wasmtime(exception: KernelException) -> KernelExceptionDispatch {

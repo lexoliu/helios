@@ -16,6 +16,7 @@ use crate::{RootEntropy, RootEntropyHandle};
 use helios_hal::cpu::HardwarePerfCounterDelta;
 use spin::{Mutex, Once};
 
+use crate::BlockService;
 use crate::component::{ComponentRuntimeState, ProviderSlot};
 use crate::network::HttpExchange;
 use crate::runtime::types::ComponentHostFilesystemState;
@@ -44,6 +45,9 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// answers a configuration error rather than trapping.
     http_client: ProviderSlot<HttpExchange>,
     host_fs_service: Mutex<Option<HostFsService>>,
+    /// The scratch disk the platform gave this kernel, once it has been
+    /// identified and proved. Empty on a machine with no block device.
+    block_service: Once<BlockService>,
     futex_table: Mutex<FutexTable>,
     bootfs: Mutex<Option<EmbeddedBootFs>>,
     tracing: Mutex<TraceHistory>,
@@ -337,6 +341,7 @@ where
                 root_entropy: Once::new(),
                 http_client: ProviderSlot::new(),
                 host_fs_service: Mutex::new(None),
+                block_service: Once::new(),
                 futex_table: Mutex::new(FutexTable::new()),
                 bootfs: Mutex::new(embedded_init().map(|init| init.bootfs())),
                 tracing: Mutex::new(TraceHistory::new(DEFAULT_TRACE_HISTORY_CAPACITY)),
@@ -355,6 +360,7 @@ where
             uptime,
             configured_processors: self.inner.processor_count,
             online_processors: self.inner.processor_count,
+            block: self.inner.block_service.get().map(BlockService::stats),
         }
     }
 
@@ -749,6 +755,24 @@ where
 
     pub fn host_fs_service(&self) -> Option<HostFsService> {
         self.inner.host_fs_service.lock().clone()
+    }
+
+    /// Publishes the block device the kernel owns.
+    ///
+    /// Called from the task that identified the disk and proved it round
+    /// trips, so a service that is visible here is one every consumer may
+    /// use without checking it first.
+    pub fn install_block_service(&self, service: BlockService) {
+        let mut installed = false;
+        self.inner.block_service.call_once(|| {
+            installed = true;
+            service
+        });
+        assert!(installed, "block service was installed more than once");
+    }
+
+    pub fn block_service(&self) -> Option<BlockService> {
+        self.inner.block_service.get().cloned()
     }
 
     pub fn prepare_futex_wait(&self, key: FutexKey) -> FutexWaitRegistration {

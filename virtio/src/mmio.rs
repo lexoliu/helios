@@ -3,14 +3,14 @@ use core::ptr::NonNull;
 use helios_hal::fs::BlockDeviceRights;
 use helios_hal::io::IoResult;
 
-use crate::block::{VirtioBlockDevice, VirtioBlockResource};
+use crate::block::{QueueAffinity, VirtioBlockDevice, VirtioBlockResource};
 use crate::bus::{DmaPool, IdentityDmaPool, MmioBus};
 use crate::net::VirtioNetDevice;
 use crate::p9::Virtio9pDevice;
 use crate::rng::VirtioRngDevice;
 use crate::transport::VirtioMmioTransport;
 
-pub type VirtioMmioBlockDevice = VirtioBlockResource<VirtioMmioTransport<MmioBus>>;
+pub type VirtioMmioBlockDevice<C> = VirtioBlockResource<VirtioMmioTransport<MmioBus>, C>;
 pub type VirtioMmioNetDevice = VirtioNetDevice<VirtioMmioTransport<MmioBus>>;
 pub type VirtioMmio9pDevice = Virtio9pDevice<VirtioMmioTransport<MmioBus>>;
 pub type VirtioMmioRngDevice = VirtioRngDevice<VirtioMmioTransport<MmioBus>>;
@@ -27,14 +27,34 @@ pub type VirtioMmioRngDevice = VirtioRngDevice<VirtioMmioTransport<MmioBus>>;
 /// `header..header+mmio_size` must refer to a valid, permanently mapped VirtIO
 /// MMIO register block for a block device, and no other code may violate the
 /// transport's register access invariants while the returned driver is alive.
-pub unsafe fn block_from_mmio(
+pub unsafe fn block_from_mmio<C: QueueAffinity>(
     header: NonNull<u8>,
     mmio_size: usize,
+    cpu: C,
     rights: BlockDeviceRights,
-) -> IoResult<VirtioMmioBlockDevice> {
+) -> IoResult<VirtioMmioBlockDevice<C>> {
     let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
     let transport = VirtioMmioTransport::new(bus)?;
-    VirtioBlockDevice::new_resource(transport, rights)
+    VirtioBlockDevice::new_resource(transport, cpu, rights)
+}
+
+/// Builds a VirtIO block resource on a bus whose DMA addresses are
+/// translated, such as a backend running behind a physical-memory offset
+/// map.
+///
+/// # Safety
+///
+/// Same as [`block_from_mmio`].
+pub unsafe fn block_from_mmio_with_dma<C: QueueAffinity, P: DmaPool>(
+    header: NonNull<u8>,
+    mmio_size: usize,
+    dma: P,
+    cpu: C,
+    rights: BlockDeviceRights,
+) -> IoResult<VirtioBlockResource<VirtioMmioTransport<MmioBus<P>>, C>> {
+    let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
+    let transport = VirtioMmioTransport::new(bus)?;
+    VirtioBlockDevice::new_resource(transport, cpu, rights)
 }
 
 /// Builds a VirtIO network device from a permanently mapped MMIO header.
