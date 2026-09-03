@@ -9,8 +9,12 @@ mod oom_killer_tests;
 mod pmm_tests;
 mod rtc;
 mod runtime;
+mod swap;
+#[cfg(test)]
+mod swap_tests;
 mod vmm;
 
+pub use swap::{FileSwapBackend, FileSwapError, FileSwapToken};
 pub use vmm::HostedAddressSpace;
 
 #[global_allocator]

@@ -69,13 +69,60 @@ where
         .map(|interrupt| interrupt.device.inner.clone())
         .collect();
     let state = debug_state.clone();
+    let spawner = kernel.spawner();
+    let timer = kernel.timer();
+    let swap_cpu = *cpu;
     helios_kernel::install_block_devices(kernel, root, devices, move |service| {
-        state.install_block_service(service);
+        state.install_block_service(service.clone());
+        install_swap(&state, service, spawner, timer, swap_cpu);
     });
     for interrupt in &discovered {
         tracing::info!(interrupt = ?interrupt.interrupt, "virtio block online");
     }
     discovered
+}
+
+/// Puts swap on the scratch disk, behind the self-check's blocks.
+///
+/// The self-check owns the last blocks of the device and has already
+/// run by the time this is called; everything before them is swap's.
+/// Swap is not persistence — a token is meaningless across a boot — so
+/// the whole extent is handed out fresh every time.
+fn install_swap(
+    state: &RuntimeState,
+    service: helios_kernel::BlockService,
+    spawner: helios_kernel::Spawner<Aarch64Cpu>,
+    timer: helios_kernel::Timer<Aarch64Cpu>,
+    cpu: Aarch64Cpu,
+) {
+    let block_bytes = service.geometry().logical_block_bytes;
+    let swap_blocks = service.swap_blocks();
+    if swap_blocks == 0 {
+        helios_kernel::disable_swap(helios_kernel::SwapDisabled::NoSwapDevice);
+        return;
+    }
+    let backend = match helios_virtio::VirtioBlockSwapBackend::new(service, 0, swap_blocks) {
+        Ok(backend) => backend,
+        Err(error) => {
+            tracing::warn!(
+                target: "helios_aarch64::swap",
+                %error,
+                "scratch disk cannot back swap"
+            );
+            helios_kernel::disable_swap(helios_kernel::SwapDisabled::NoSwapDevice);
+            return;
+        }
+    };
+    let handle = helios_kernel::install_swap(
+        spawner,
+        timer,
+        cpu,
+        state.instance_registry(),
+        backend,
+        "virtio-blk",
+        (swap_blocks * block_bytes) as u64,
+    );
+    state.install_swap(handle);
 }
 
 fn discover_block_devices(

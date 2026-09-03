@@ -374,6 +374,7 @@ fn draw_memory_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats:
         ]),
     ];
     lines.extend(balloon_lines(sample));
+    lines.extend(swap_lines(sample));
     let details = Paragraph::new(Text::from(lines))
         .block(Block::default().title("Memory").borders(Borders::ALL))
         .wrap(Wrap { trim: true });
@@ -405,6 +406,35 @@ fn balloon_lines(sample: &stats::Sample) -> Vec<Line<'static>> {
         Span::raw(format!(
             "{held}, {} reported free",
             format_bytes(balloon.reported_bytes)
+        )),
+    ])]
+}
+
+/// What the kernel has swapped out, on a machine that has swap.
+///
+/// The number that matters when a guest feels slow is the mean fault
+/// latency, so it is shown next to how much is out rather than in a
+/// panel of its own.
+fn swap_lines(sample: &stats::Sample) -> Vec<Line<'static>> {
+    let Some(swap) = &sample.swap else {
+        return Vec::new();
+    };
+    let latency = if swap.faults_served == 0 {
+        String::from("no faults yet")
+    } else {
+        format!(
+            "{} faults, {} mean",
+            swap.faults_served,
+            format_duration_nanos(swap.mean_fault_latency)
+        )
+    };
+    vec![Line::from(vec![
+        Span::styled("swap     ", Style::default().fg(Color::Cyan)),
+        Span::raw(format!(
+            "{} of {} on {}, {latency}",
+            format_bytes(swap.used_bytes),
+            format_bytes(swap.capacity_bytes),
+            swap.backend
         )),
     ])]
 }
@@ -783,6 +813,16 @@ fn format_duration(nanos: u64) -> String {
     let minutes = (seconds % 3_600) / 60;
     let seconds = seconds % 60;
     format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+/// A duration in the unit a reader can act on: sub-millisecond waits in
+/// microseconds, anything longer in milliseconds.
+pub(crate) fn format_duration_nanos(nanos: u64) -> String {
+    if nanos < 1_000_000 {
+        format!("{:.1}us", nanos as f64 / 1_000.0)
+    } else {
+        format!("{:.1}ms", nanos as f64 / 1_000_000.0)
+    }
 }
 
 pub(crate) fn format_bytes(bytes: u64) -> String {
