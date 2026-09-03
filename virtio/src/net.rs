@@ -781,12 +781,39 @@ impl RxBufferSlot {
     }
 }
 
+/// Why a virtio-net function could not be brought up.
+///
+/// A headless boot reports a failed bring-up only through the panic that
+/// carries this error, so the one refusal that depends on numbers the
+/// device chose — how many queue pairs it advertises against the queues
+/// it actually backs — spells those numbers out instead of collapsing
+/// into an [`IoError`].
+#[derive(Debug, thiserror::Error)]
+pub enum NetSetupError {
+    #[error(transparent)]
+    Io(#[from] IoError),
+    #[error(
+        "virtio-net advertises {advertised_pairs} queue pairs (driving {driven_pairs}), but the \
+         {role} queue of pair {pair} (virtqueue {queue}) reports size {size}, which is not a \
+         non-zero power of two"
+    )]
+    QueueSize {
+        advertised_pairs: u16,
+        driven_pairs: u16,
+        pair: u16,
+        queue: u16,
+        role: &'static str,
+        size: u16,
+    },
+}
+
 impl<T: VirtioTransport> VirtioNetDevice<T> {
-    pub fn new(transport: T) -> IoResult<Self> {
+    pub fn new(transport: T) -> Result<Self, NetSetupError> {
         if transport.device_type() != DeviceType::Network {
             return Err(IoError::InvalidDeviceConfig(
                 "virtio function handed to the network driver is not a network device",
-            ));
+            )
+            .into());
         }
 
         let features = negotiate_with(&transport, |offered| {
@@ -932,12 +959,14 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             .checked_add(max_frame_len)
             .ok_or(IoError::DeviceFault)?;
 
-        let pair_count = if features.device(NET_FEATURE_MQ) {
-            let device_max = read_max_virtqueue_pairs(&transport);
-            device_max.clamp(1, NET_MAX_QUEUE_PAIRS)
+        // `max_virtqueue_pairs` only exists in the config space once MQ
+        // is negotiated; a single-pair device advertises exactly one.
+        let advertised_pairs = if features.device(NET_FEATURE_MQ) {
+            read_max_virtqueue_pairs(&transport)
         } else {
             1
         };
+        let pair_count = advertised_pairs.clamp(1, NET_MAX_QUEUE_PAIRS);
 
         let mut queue_pairs: Vec<NetQueuePair<T>> = Vec::with_capacity(usize::from(pair_count));
         for pair_idx in 0..pair_count {
@@ -945,29 +974,20 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             let tx_queue_index = tx_queue_index(pair_idx);
             let rx_queue_size = transport.queue_max_size(rx_queue_index).min(NET_QUEUE_SIZE);
             let tx_queue_size = transport.queue_max_size(tx_queue_index).min(NET_QUEUE_SIZE);
-            // Each condition is named on its own: this is the first thing
-            // a device with fewer queues than it advertises pairs, or
-            // with an odd ring size, trips over, and the panic that
-            // carries it is all a headless boot reports.
-            if rx_queue_size == 0 {
-                return Err(IoError::InvalidDeviceConfig(
-                    "virtio-net advertises a queue pair whose receive queue has size 0",
-                ));
+            let queue_size_error =
+                |role: &'static str, queue: u16, size: u16| NetSetupError::QueueSize {
+                    advertised_pairs,
+                    driven_pairs: pair_count,
+                    pair: pair_idx,
+                    queue,
+                    role,
+                    size,
+                };
+            if rx_queue_size == 0 || !rx_queue_size.is_power_of_two() {
+                return Err(queue_size_error("receive", rx_queue_index, rx_queue_size));
             }
-            if tx_queue_size == 0 {
-                return Err(IoError::InvalidDeviceConfig(
-                    "virtio-net advertises a queue pair whose transmit queue has size 0",
-                ));
-            }
-            if !rx_queue_size.is_power_of_two() {
-                return Err(IoError::InvalidDeviceConfig(
-                    "virtio-net receive queue size is not a power of two",
-                ));
-            }
-            if !tx_queue_size.is_power_of_two() {
-                return Err(IoError::InvalidDeviceConfig(
-                    "virtio-net transmit queue size is not a power of two",
-                ));
+            if tx_queue_size == 0 || !tx_queue_size.is_power_of_two() {
+                return Err(queue_size_error("transmit", tx_queue_index, tx_queue_size));
             }
 
             let mut rx_queue = VirtQueue::new(

@@ -26,7 +26,7 @@ use crate::balloon::VirtioBalloonDevice;
 use crate::block::{QueueAffinity, VirtioBlockDevice, VirtioBlockResource};
 use crate::bus::{DeviceBus, DmaPool};
 use crate::iommu::VirtioIommuDevice;
-use crate::net::VirtioNetDevice;
+use crate::net::{NetSetupError, VirtioNetDevice};
 use crate::p9::Virtio9pDevice;
 use crate::rng::VirtioRngDevice;
 use crate::transport::{DeviceStatus, DeviceType, InterruptStatus, VirtioTransport};
@@ -698,7 +698,7 @@ pub fn net_from_pci<A, M, P>(
     mapper: &M,
     dma: P,
     msix: Option<MsixBinding>,
-) -> IoResult<VirtioNetDevice<VirtioPciTransport<P>>>
+) -> Result<VirtioNetDevice<VirtioPciTransport<P>>, NetSetupError>
 where
     A: ConfigRegionAccess,
     M: PciMmioMapper,

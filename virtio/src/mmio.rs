@@ -6,7 +6,7 @@ use helios_hal::io::IoResult;
 use crate::balloon::VirtioBalloonDevice;
 use crate::block::{QueueAffinity, VirtioBlockDevice, VirtioBlockResource};
 use crate::bus::{DmaPool, IdentityDmaPool, MmioBus};
-use crate::net::VirtioNetDevice;
+use crate::net::{NetSetupError, VirtioNetDevice};
 use crate::p9::Virtio9pDevice;
 use crate::rng::VirtioRngDevice;
 use crate::transport::VirtioMmioTransport;
@@ -71,7 +71,7 @@ pub unsafe fn block_from_mmio_with_dma<C: QueueAffinity, P: DmaPool>(
 pub unsafe fn net_from_mmio(
     header: NonNull<u8>,
     mmio_size: usize,
-) -> IoResult<VirtioMmioNetDevice> {
+) -> Result<VirtioMmioNetDevice, NetSetupError> {
     let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     VirtioNetDevice::new(transport)
@@ -89,7 +89,7 @@ pub unsafe fn net_from_mmio_with_dma<P>(
     header: NonNull<u8>,
     mmio_size: usize,
     dma: P,
-) -> IoResult<VirtioNetDevice<VirtioMmioTransport<MmioBus<P>>>>
+) -> Result<VirtioNetDevice<VirtioMmioTransport<MmioBus<P>>>, NetSetupError>
 where
     P: DmaPool,
 {

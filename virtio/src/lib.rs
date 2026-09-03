@@ -46,7 +46,8 @@ pub use mmio::{
     vsock_from_mmio_with_dma,
 };
 pub use net::{
-    NotificationCoalescing, QueuePairProgress, RxFrame, TxChecksumMeta, TxGsoMeta, VirtioNetDevice,
+    NetSetupError, NotificationCoalescing, QueuePairProgress, RxFrame, TxChecksumMeta, TxGsoMeta,
+    VirtioNetDevice,
 };
 pub use p9::Virtio9pDevice;
 pub use pci::{
