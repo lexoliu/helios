@@ -636,6 +636,18 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
 
     /// Waits for interface progress, such as RX arrival or TX completion.
     fn wait_for_event(&self) -> impl Future<Output = ()> + Send + '_;
+
+    /// Waits for progress on one queue pair, or for anything the device
+    /// reports that belongs to no pair.
+    ///
+    /// An operation belongs to one shard, which drains one queue pair,
+    /// so a completion on another pair is not progress it can use.
+    /// Defaults to the whole-device wait for interfaces that cannot
+    /// tell their queues apart.
+    fn wait_for_event_on(&self, queue_idx: usize) -> impl Future<Output = ()> + Send + '_ {
+        let _ = queue_idx;
+        self.wait_for_event()
+    }
 }
 
 /// Batch-oriented optional fast path for interfaces with queue-level access.

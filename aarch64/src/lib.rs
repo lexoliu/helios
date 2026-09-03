@@ -555,7 +555,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
             network.trigger,
             platform_state.bootstrap_mpidr(),
         );
-        routes.set_network(network.interrupt, network.device);
+        routes.add_network(network.interrupt, network.device);
     }
     if let Some(entropy) = entropy::install(
         &kernel,

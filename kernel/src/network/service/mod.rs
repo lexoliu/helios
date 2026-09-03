@@ -998,7 +998,8 @@ where
     }
 
     /// The wait the packet pump takes: it is the producer for every
-    /// shard, so it parks on the device alone.
+    /// shard, so it parks on the device — on the pair this processor
+    /// drains, which is the only one its next poll will look at.
     async fn wait_for_progress(&self, duration: Duration) {
         if duration.is_zero() {
             return;
@@ -1009,7 +1010,11 @@ where
             return;
         }
 
-        let event = self.inner.device.wait_for_event();
+        let event = self.inner.device.wait_for_event_on(
+            self.inner
+                .state
+                .shard_idx_for_processor(self.inner.cpu.current_processor()),
+        );
         let mut event = core::pin::pin!(event);
         if core::future::poll_fn(|cx| Poll::Ready(event.as_mut().poll(cx).is_ready())).await {
             return;
@@ -1079,7 +1084,14 @@ where
             return;
         }
 
-        let event = self.inner.device.wait_for_event();
+        // The device event is taken on the pair this shard drains: a
+        // completion on another pair is not progress this operation can
+        // use, and on a device with per-queue interrupts that pair's
+        // message is already delivered to this processor.
+        let event = self
+            .inner
+            .device
+            .wait_for_event_on(self.event_queue_idx(wait));
         let mut event = core::pin::pin!(event);
         if core::future::poll_fn(|cx| {
             Poll::Ready(arrival.as_mut().poll(cx).is_ready() || event.as_mut().poll(cx).is_ready())
@@ -1105,6 +1117,23 @@ where
             Poll::Pending
         })
         .await;
+    }
+
+    /// The queue pair a wait should watch.
+    ///
+    /// A shard drains the pair with its own index, so an operation on
+    /// one shard watches that pair. A replicated socket has no single
+    /// shard, so it watches the pair this processor drains — the
+    /// cross-shard hand-off is the arrival signal's job, not the
+    /// device's.
+    fn event_queue_idx(&self, wait: ShardWait) -> usize {
+        match wait.target {
+            WaitTarget::Shard(idx) => idx,
+            WaitTarget::AnyShard => self
+                .inner
+                .state
+                .shard_idx_for_processor(self.inner.cpu.current_processor()),
+        }
     }
 
     /// The wait for a caller whose only bound is its own deadline.

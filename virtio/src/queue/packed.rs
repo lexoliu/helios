@@ -193,6 +193,10 @@ impl<T: VirtioTransport> RingOps<T> for PackedRing<T> {
 
     fn publish(&mut self) {}
 
+    fn has_pending_used(&self) -> bool {
+        is_used(self.read_descriptor(self.next_used).flags, self.used_wrap)
+    }
+
     fn pop_used(&mut self) -> Option<(u16, u32)> {
         if self.core.features.in_order() {
             self.pop_used_in_order()

@@ -300,6 +300,37 @@ impl CoalescingBudget {
     }
 }
 
+/// The queue pairs an interrupt found completions on.
+///
+/// A bitmask rather than a list because the caller is an interrupt
+/// handler: no allocation, no iteration over pairs that did nothing,
+/// and `NET_MAX_QUEUE_PAIRS` pairs fit a `u16` exactly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QueuePairProgress(u16);
+
+impl QueuePairProgress {
+    pub const fn none() -> Self {
+        Self(0)
+    }
+
+    fn record(&mut self, pair_idx: usize) {
+        assert!(
+            pair_idx < usize::from(NET_MAX_QUEUE_PAIRS),
+            "queue pair {pair_idx} is outside the maximum this driver brings up"
+        );
+        self.0 |= 1 << pair_idx;
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The pairs with completions waiting, in index order.
+    pub fn iter(self) -> impl Iterator<Item = usize> {
+        (0..usize::from(NET_MAX_QUEUE_PAIRS)).filter(move |idx| self.0 & (1 << idx) != 0)
+    }
+}
+
 /// What a device does about notification coalescing, as negotiated.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NotificationCoalescing {
@@ -567,11 +598,38 @@ struct NetTxState<T: VirtioTransport> {
     tx_payloads: Box<[Option<Bytes>]>,
 }
 
+impl<T: VirtioTransport> NetQueuePair<T> {
+    /// Whether either ring of this pair has a completion nobody has
+    /// taken yet.
+    ///
+    /// A pair another processor currently holds is reported as idle:
+    /// that processor is draining it, so it needs no wake, and an
+    /// interrupt handler must not wait for a lock in any case.
+    fn has_pending_completions(&self) -> bool {
+        let receive = self
+            .rx_state
+            .try_lock()
+            .is_some_and(|state| state.rx_queue.has_pending_used());
+        let transmit = self
+            .tx_state
+            .try_lock()
+            .is_some_and(|state| state.tx_queue.has_pending_used());
+        receive || transmit
+    }
+}
+
 /// One TX/RX queue pair as exposed by VIRTIO_NET_F_MQ. Each pair
 /// owns its own pair of `VirtQueue`s, RX buffer slab, and TX buffer
 /// slab so submissions on different CPUs do not contend on the same
 /// SpinMutex / async lock.
 struct NetQueuePair<T: VirtioTransport> {
+    /// Progress on this pair alone.
+    ///
+    /// A per-CPU queue layout wants a per-queue wake: a waiter whose
+    /// socket lives on shard 3 has nothing to learn from pair 0's
+    /// completion, and waking it costs the same as waking the task that
+    /// did make progress.
+    interrupts: Notify,
     rx_state: AsyncMutex<NetRxState<T>>,
     rx_returned: Arc<RxReturnedSlots>,
     rx_slots: Box<[Arc<RxBufferSlot>]>,
@@ -603,6 +661,8 @@ pub struct VirtioNetDevice<T: VirtioTransport> {
     /// the case for single-queue paths).
     control: Option<SpinMutex<NetControlState<T>>>,
     rx_buffer_len: usize,
+    /// Progress that belongs to no single pair: a configuration change,
+    /// and the control queue's own completions.
     interrupts: Notify,
     features: NegotiatedFeatures,
     mac_address: [u8; 6],
@@ -940,6 +1000,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             let tx_payloads = vec![None; tx_buffer_count].into_boxed_slice();
 
             queue_pairs.push(NetQueuePair {
+                interrupts: Notify::new(),
                 rx_state: AsyncMutex::new(NetRxState {
                     rx_queue,
                     rx_in_device,
@@ -1318,14 +1379,49 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         }
     }
 
-    pub fn handle_interrupt(&self) {
+    /// Handles an interrupt that names no queue, which is what every
+    /// transport with a single interrupt line delivers.
+    ///
+    /// Returns the queue pairs that actually have completions waiting,
+    /// so the backend — which owns the `Cpu` and therefore the IPI —
+    /// can wake exactly those pairs' processors instead of every parked
+    /// one. A pair another processor currently holds is left out: that
+    /// processor is draining it and needs no wake.
+    pub fn handle_interrupt(&self) -> QueuePairProgress {
         let status = self.transport.ack_interrupt();
         if status.config_change {
             self.refresh_link_state();
         }
-        // Waiters park on this notification for receive arrival and
-        // transmit completion alike, and a link change is progress they
-        // have to observe too, so both causes wake them.
+        let mut progress = QueuePairProgress::none();
+        for (pair_idx, pair) in self.queue_pairs.iter().enumerate() {
+            if !pair.has_pending_completions() {
+                continue;
+            }
+            progress.record(pair_idx);
+            pair.interrupts.notify_all();
+        }
+        // A configuration change belongs to no pair, and neither does a
+        // control-queue completion, so the device-wide notification
+        // still exists for the waiters that watch those.
+        self.interrupts.notify_all();
+        progress
+    }
+
+    /// Handles an interrupt raised by one queue pair's own vector.
+    ///
+    /// A transport with per-queue interrupts already knows which pair
+    /// made progress and has already delivered the message to that
+    /// pair's processor, so there is nothing to scan and nobody to wake.
+    pub fn handle_interrupt_on(&self, pair_idx: usize) {
+        let pair_idx = self.normalize_pair_idx(pair_idx);
+        self.transport.ack_interrupt();
+        self.queue_pairs[pair_idx].interrupts.notify_all();
+    }
+
+    /// Handles an interrupt raised by the configuration-change vector.
+    pub fn handle_configuration_interrupt(&self) {
+        self.transport.ack_interrupt();
+        self.refresh_link_state();
         self.interrupts.notify_all();
     }
 
@@ -1816,6 +1912,30 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             tx_queue.notify(&self.transport);
         }
         Ok(Some(submitted))
+    }
+
+    /// Waits for progress on one queue pair, or for anything the device
+    /// reports that belongs to no pair.
+    ///
+    /// An operation belongs to one shard, which drains one pair, so this
+    /// is what its wait parks on: a completion on another pair is not
+    /// progress it can use, and waking for it would cost the same as
+    /// waking the task that did make progress.
+    pub async fn wait_for_interrupt_on(&self, pair_idx: usize) {
+        let pair_idx = self.normalize_pair_idx(pair_idx);
+        let pair = self.queue_pairs[pair_idx].interrupts.notified();
+        let mut pair = core::pin::pin!(pair);
+        let device = self.interrupts.notified();
+        let mut device = core::pin::pin!(device);
+        core::future::poll_fn(|cx| {
+            use core::future::Future;
+            use core::task::Poll;
+            if pair.as_mut().poll(cx).is_ready() || device.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(());
+            }
+            Poll::Pending
+        })
+        .await;
     }
 
     pub async fn wait_for_interrupt(&self) {
@@ -3099,6 +3219,36 @@ mod tests {
             }
             .accepts_our_table()
         );
+    }
+
+    /// The progress mask an interrupt hands back is what a single-line
+    /// transport steers by, so it has to name exactly the pairs with
+    /// completions and nothing else.
+    #[test]
+    fn queue_pair_progress_names_only_the_pairs_recorded() {
+        let mut progress = super::QueuePairProgress::none();
+        assert!(progress.is_empty());
+        assert_eq!(progress.iter().count(), 0);
+
+        progress.record(0);
+        progress.record(3);
+        // Recording a pair twice is not two wakes.
+        progress.record(3);
+        assert!(!progress.is_empty());
+        assert_eq!(progress.iter().collect::<alloc::vec::Vec<_>>(), [0, 3]);
+
+        let mut full = super::QueuePairProgress::none();
+        for pair_idx in 0..usize::from(super::NET_MAX_QUEUE_PAIRS) {
+            full.record(pair_idx);
+        }
+        assert_eq!(full.iter().count(), usize::from(super::NET_MAX_QUEUE_PAIRS));
+    }
+
+    #[test]
+    #[should_panic(expected = "outside the maximum this driver brings up")]
+    fn a_pair_beyond_the_maximum_is_rejected() {
+        let mut progress = super::QueuePairProgress::none();
+        progress.record(usize::from(super::NET_MAX_QUEUE_PAIRS));
     }
 
     /// The hash the device reports is only meaningful when it says it

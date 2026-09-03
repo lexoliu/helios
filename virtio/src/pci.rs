@@ -81,6 +81,60 @@ const COMMON_CFG_RESET_BYTES: usize = COMMON_QUEUE_RESET + 2;
 /// `VIRTIO_MSI_NO_VECTOR`: no MSI-X vector is bound to the structure.
 const MSI_NO_VECTOR: u16 = 0xffff;
 
+/// How a function's MSI-X table entries are shared out among its
+/// structures.
+///
+/// A function whose queues all raise the same message needs only one
+/// entry; a function whose queues are drained by different processors
+/// wants one entry each, so a queue's completions are delivered to the
+/// processor that will do the work rather than to whichever one happens
+/// to own the function's single vector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MsixBinding {
+    /// Table entry the configuration-change notification uses.
+    config: u16,
+    /// Table entry queue zero uses; queue `i` uses `queues + i`.
+    queues: u16,
+    /// Queues covered by an entry of their own. A queue past this shares
+    /// the last one, which keeps a device with more queues than the
+    /// backend has vectors working rather than leaving its tail silent.
+    queue_entries: u16,
+}
+
+impl MsixBinding {
+    /// Every structure of the function raises the same message.
+    pub const fn shared(entry: u16) -> Self {
+        Self {
+            config: entry,
+            queues: entry,
+            queue_entries: 1,
+        }
+    }
+
+    /// Queue `i` raises the message at `queues + i`, and a
+    /// configuration change raises `config`.
+    pub const fn per_queue(config: u16, queues: u16, queue_entries: u16) -> Self {
+        assert!(
+            queue_entries != 0,
+            "a per-queue MSI-X binding needs at least one queue entry"
+        );
+        Self {
+            config,
+            queues,
+            queue_entries,
+        }
+    }
+
+    /// The table entry a queue's notifications are delivered through.
+    const fn vector_for_queue(self, index: u16) -> u16 {
+        if index < self.queue_entries {
+            self.queues + index
+        } else {
+            self.queues + self.queue_entries - 1
+        }
+    }
+}
+
 /// Static capacity for the per-queue notification offsets. virtio-net
 /// tops out at 16 queue pairs plus a control queue, so 64 covers every
 /// device this kernel drives with room to spare.
@@ -202,7 +256,7 @@ pub struct VirtioPciTransport<P: DmaPool> {
     isr: BarWindow,
     notify_off_multiplier: u32,
     device_type: DeviceType,
-    msix_vector: Option<u16>,
+    msix: Option<MsixBinding>,
     queue_notify_offsets: [AtomicU16; MAX_VIRTQUEUES],
 }
 
@@ -259,7 +313,7 @@ impl<P: DmaPool> VirtioPciTransport<P> {
         address: PciAddress,
         mapper: &M,
         dma: P,
-        msix_vector: Option<u16>,
+        msix: Option<MsixBinding>,
     ) -> IoResult<Self>
     where
         A: ConfigRegionAccess,
@@ -332,7 +386,7 @@ impl<P: DmaPool> VirtioPciTransport<P> {
         endpoint.update_command(access, |command| {
             let command =
                 command | CommandRegister::MEMORY_ENABLE | CommandRegister::BUS_MASTER_ENABLE;
-            if msix_vector.is_some() {
+            if msix.is_some() {
                 command | CommandRegister::INTERRUPT_DISABLE
             } else {
                 command & !CommandRegister::INTERRUPT_DISABLE
@@ -346,7 +400,7 @@ impl<P: DmaPool> VirtioPciTransport<P> {
             isr,
             notify_off_multiplier,
             device_type,
-            msix_vector,
+            msix,
             queue_notify_offsets: [const { AtomicU16::new(0) }; MAX_VIRTQUEUES],
         })
     }
@@ -399,7 +453,7 @@ impl<P: DmaPool> VirtioTransport for VirtioPciTransport<P> {
         // per-queue vectors follow in `set_queue`.
         self.common.write_u16(
             COMMON_CONFIG_MSIX_VECTOR,
-            self.msix_vector.unwrap_or(MSI_NO_VECTOR),
+            self.msix.map_or(MSI_NO_VECTOR, |msix| msix.config),
         );
     }
 
@@ -452,11 +506,12 @@ impl<P: DmaPool> VirtioTransport for VirtioPciTransport<P> {
             .write_u64_halves(COMMON_QUEUE_DRIVER, driver_area);
         self.common
             .write_u64_halves(COMMON_QUEUE_DEVICE, device_area);
+        let queue_vector = self.msix.map(|msix| msix.vector_for_queue(index));
         self.common.write_u16(
             COMMON_QUEUE_MSIX_VECTOR,
-            self.msix_vector.unwrap_or(MSI_NO_VECTOR),
+            queue_vector.unwrap_or(MSI_NO_VECTOR),
         );
-        if let Some(vector) = self.msix_vector {
+        if let Some(vector) = queue_vector {
             assert_eq!(
                 self.common.read_u16(COMMON_QUEUE_MSIX_VECTOR),
                 vector,
@@ -516,7 +571,7 @@ impl<P: DmaPool> VirtioTransport for VirtioPciTransport<P> {
         // function needs to deassert its pin. MSI-X functions report 0
         // here, so the read is harmless either way.
         let status = self.isr.read_u8(0);
-        interrupt_status(status, self.msix_vector.is_some())
+        interrupt_status(status, self.msix.is_some())
     }
 
     fn read_config_u32(&self, offset: usize) -> u32 {
@@ -638,14 +693,14 @@ pub fn net_from_pci<A, M, P>(
     address: PciAddress,
     mapper: &M,
     dma: P,
-    msix_vector: Option<u16>,
+    msix: Option<MsixBinding>,
 ) -> IoResult<VirtioNetDevice<VirtioPciTransport<P>>>
 where
     A: ConfigRegionAccess,
     M: PciMmioMapper,
     P: DmaPool,
 {
-    let transport = VirtioPciTransport::new(access, address, mapper, dma, msix_vector)?;
+    let transport = VirtioPciTransport::new(access, address, mapper, dma, msix)?;
     VirtioNetDevice::new(transport)
 }
 
@@ -655,14 +710,14 @@ pub fn p9_from_pci<A, M, P>(
     address: PciAddress,
     mapper: &M,
     dma: P,
-    msix_vector: Option<u16>,
+    msix: Option<MsixBinding>,
 ) -> IoResult<Virtio9pDevice<VirtioPciTransport<P>>>
 where
     A: ConfigRegionAccess,
     M: PciMmioMapper,
     P: DmaPool,
 {
-    let transport = VirtioPciTransport::new(access, address, mapper, dma, msix_vector)?;
+    let transport = VirtioPciTransport::new(access, address, mapper, dma, msix)?;
     Virtio9pDevice::new(transport)
 }
 
@@ -672,7 +727,7 @@ pub fn block_from_pci<A, M, P, C>(
     address: PciAddress,
     mapper: &M,
     dma: P,
-    msix_vector: Option<u16>,
+    msix: Option<MsixBinding>,
     cpu: C,
     rights: BlockDeviceRights,
 ) -> IoResult<VirtioBlockResource<VirtioPciTransport<P>, C>>
@@ -682,7 +737,7 @@ where
     P: DmaPool,
     C: QueueAffinity,
 {
-    let transport = VirtioPciTransport::new(access, address, mapper, dma, msix_vector)?;
+    let transport = VirtioPciTransport::new(access, address, mapper, dma, msix)?;
     VirtioBlockDevice::new_resource(transport, cpu, rights)
 }
 
@@ -696,14 +751,14 @@ pub fn iommu_from_pci<A, M, P>(
     address: PciAddress,
     mapper: &M,
     dma: P,
-    msix_vector: Option<u16>,
+    msix: Option<MsixBinding>,
 ) -> IoResult<VirtioIommuDevice<VirtioPciTransport<P>>>
 where
     A: ConfigRegionAccess,
     M: PciMmioMapper,
     P: DmaPool,
 {
-    let transport = VirtioPciTransport::new(access, address, mapper, dma, msix_vector)?;
+    let transport = VirtioPciTransport::new(access, address, mapper, dma, msix)?;
     VirtioIommuDevice::new(transport)
 }
 
@@ -713,14 +768,14 @@ pub fn rng_from_pci<A, M, P>(
     address: PciAddress,
     mapper: &M,
     dma: P,
-    msix_vector: Option<u16>,
+    msix: Option<MsixBinding>,
 ) -> IoResult<VirtioRngDevice<VirtioPciTransport<P>>>
 where
     A: ConfigRegionAccess,
     M: PciMmioMapper,
     P: DmaPool,
 {
-    let transport = VirtioPciTransport::new(access, address, mapper, dma, msix_vector)?;
+    let transport = VirtioPciTransport::new(access, address, mapper, dma, msix)?;
     VirtioRngDevice::new(transport)
 }
 
@@ -730,14 +785,14 @@ pub fn balloon_from_pci<A, M, P>(
     address: PciAddress,
     mapper: &M,
     dma: P,
-    msix_vector: Option<u16>,
+    msix: Option<MsixBinding>,
 ) -> IoResult<VirtioBalloonDevice<VirtioPciTransport<P>>>
 where
     A: ConfigRegionAccess,
     M: PciMmioMapper,
     P: DmaPool,
 {
-    let transport = VirtioPciTransport::new(access, address, mapper, dma, msix_vector)?;
+    let transport = VirtioPciTransport::new(access, address, mapper, dma, msix)?;
     VirtioBalloonDevice::new(transport)
 }
 
@@ -760,7 +815,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{MODERN_DEVICE_ID_BASE, device_type_from_ids, interrupt_status};
+    use super::{MODERN_DEVICE_ID_BASE, MsixBinding, device_type_from_ids, interrupt_status};
     use crate::transport::{DeviceType, InterruptStatus};
 
     #[test]
@@ -824,5 +879,43 @@ mod tests {
     fn non_virtio_device_ids_are_rejected() {
         assert_eq!(device_type_from_ids(0x2000, 1), None);
         assert_eq!(device_type_from_ids(MODERN_DEVICE_ID_BASE + 0x20, 0), None);
+    }
+
+    /// A function whose queues share one message must keep pointing
+    /// every structure at that entry, however many queues it has.
+    #[test]
+    fn a_shared_binding_points_every_queue_at_one_entry() {
+        let binding = MsixBinding::shared(0);
+        for queue in 0..8 {
+            assert_eq!(binding.vector_for_queue(queue), 0);
+        }
+    }
+
+    /// Queue `i` takes entry `queues + i`, which is what delivers its
+    /// completions to the processor that drains it.
+    #[test]
+    fn a_per_queue_binding_gives_each_queue_its_own_entry() {
+        // Entry zero is the configuration change; the queues follow it.
+        let binding = MsixBinding::per_queue(0, 1, 4);
+        for queue in 0..4 {
+            assert_eq!(binding.vector_for_queue(queue), 1 + queue);
+        }
+    }
+
+    /// A device with more queues than the backend has vectors keeps
+    /// working: the tail shares the last entry, which costs those pairs
+    /// a cross-core hand-off but never leaves them silent.
+    #[test]
+    fn queues_past_the_vector_count_share_the_last_entry() {
+        let binding = MsixBinding::per_queue(0, 1, 4);
+        for queue in 4..16 {
+            assert_eq!(binding.vector_for_queue(queue), 4);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "at least one queue entry")]
+    fn a_per_queue_binding_needs_a_queue_entry() {
+        let _ = MsixBinding::per_queue(0, 1, 0);
     }
 }

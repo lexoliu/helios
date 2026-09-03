@@ -373,7 +373,7 @@ fn install_pci_devices<WatchdogImpl>(
         tracing::warn!("virtio 9p device was not discovered on the PCI bus");
     }
     if let Some(address) = network_function {
-        let device = net::install(
+        let interrupts = net::install(
             cpu,
             kernel,
             pci,
@@ -383,7 +383,13 @@ fn install_pci_devices<WatchdogImpl>(
             destination_apic_id,
             debug_state,
         );
-        routes.set_network(exceptions::NETWORK_INTERRUPT_VECTOR, device);
+        for (vector, handler) in interrupts.queues {
+            routes.add_network(vector, handler);
+        }
+        routes.add_network(
+            exceptions::NETWORK_INTERRUPT_VECTOR,
+            interrupts.configuration,
+        );
     } else {
         tracing::warn!("virtio network device was not discovered on the PCI bus");
     }
@@ -791,6 +797,17 @@ impl X86Cpu {
 
     /// Local-APIC id of the bootstrap processor: the destination every
     /// device MSI-X message is addressed to.
+    /// The local APIC an MSI-X message for `processor` must target.
+    ///
+    /// Falls back to the bootstrap processor's APIC for a slot ACPI did
+    /// not describe, so a vector is never programmed with a destination
+    /// no processor answers.
+    pub(crate) fn apic_id_of_processor(&self, processor: helios_hal::cpu::ProcessorId) -> u32 {
+        self.state
+            .apic_id_of(processor)
+            .unwrap_or_else(|| self.bootstrap_apic_id())
+    }
+
     pub(crate) fn bootstrap_apic_id(&self) -> u32 {
         let bootstrap = self.state.bootstrap_processor();
         self.state
