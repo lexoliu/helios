@@ -3,10 +3,10 @@
 //! # SMP contract
 //!
 //! There is one [`NetworkShard`] per processor and every shard owns an
-//! independent `Stack`, socket slab and port allocator. A local port
-//! belongs to exactly one shard ([`shard_idx_for_port`]), so the frames
-//! for a socket are always placed in that socket's shard whichever
-//! processor drained them off the device.
+//! independent `Stack`, socket slab and port allocator. A flow belongs
+//! to exactly one shard ([`shard_idx_for_frame`]), so the frames for a
+//! socket are always placed in that socket's shard whichever processor
+//! drained them off the device.
 //!
 //! Placement is therefore routinely cross-processor: the shard lock is
 //! taken by the draining CPU, not the owning one. That hand-off is
@@ -20,73 +20,148 @@
 
 use super::*;
 
-/// Peek the L4 destination port out of a parsed Ethernet frame.
-/// Used by the RX demux to route frames to the shard that owns the
-/// local port. Returns `None` for non-IP frames (ARP), non-TCP/UDP
-/// IP frames (ICMP), or malformed packets — all of which route to
-/// shard 0 in the dispatch path because there is no socket-local
-/// owner to identify.
-pub(super) fn peek_local_port(frame: &[u8]) -> Option<u16> {
+/// The shard a received frame belongs to.
+///
+/// This is the one receive-side ownership rule in the kernel, and it is
+/// the rule a device's RSS engine reproduces: the flow's Toeplitz hash,
+/// modulo the shard count. A device that steers by the same hash
+/// delivers the frame on the queue whose processor already owns the
+/// socket; a device that cannot steer delivers everything on queue zero
+/// and this routes it to the same shard anyway, so only the CPU hop
+/// differs.
+///
+/// Three kinds of frame have no flow the hash can name and belong to
+/// [`DEFAULT_SHARD_IDX`]:
+///
+/// * ARP, ICMP echo and neighbour discovery, which carry no ports;
+/// * anything unparseable, which the owning stack will drop;
+/// * the DHCP client's exchange, which is broadcast at a moment when
+///   the interface has no address to hash a flow with.
+///
+/// An ICMP error is not one of them: it quotes the packet that provoked
+/// it, so the flow it concerns is recoverable and the error is routed to
+/// that flow's shard rather than to a shard with no socket to tell.
+pub(super) fn shard_idx_for_frame(frame: &RxFrame, shard_count: usize) -> usize {
+    // A device that steers has already hashed the frame to pick the
+    // queue it delivered on, so taking its number rather than
+    // recomputing the same one is the whole benefit of `HASH_REPORT`.
+    // It is the same function over the same bytes under the same key,
+    // so the answer does not depend on which side produced it.
+    if let Some(hash) = frame.offload.flow_hash {
+        return hash.bucket(shard_count);
+    }
+    flow_tuple_for_frame(frame.as_ref())
+        .map(|tuple| flow_hash(&tuple).bucket(shard_count))
+        .unwrap_or(DEFAULT_SHARD_IDX)
+}
+
+/// The received flow a frame belongs to, or `None` when it has none.
+fn flow_tuple_for_frame(frame: &[u8]) -> Option<FlowTuple> {
     let ethernet = EthernetFrame::parse(frame)?;
-    let payload = ethernet.payload;
     let (protocol, l4_payload) = match ethernet.protocol {
         EthernetProtocol::Ipv4 => {
-            let packet = Ipv4Packet::parse(payload)?;
+            let packet = Ipv4Packet::parse(ethernet.payload)?;
             (packet.protocol, packet.payload)
         }
         EthernetProtocol::Ipv6 => {
-            let packet = Ipv6Packet::parse(payload)?;
+            let packet = Ipv6Packet::parse(ethernet.payload)?;
             (packet.next_header, packet.payload)
         }
         _ => return None,
     };
     match protocol {
-        IpProtocol::Tcp => Some(TcpPacket::parse(l4_payload)?.destination_port),
-        IpProtocol::Udp => Some(UdpPacket::parse(l4_payload)?.destination_port),
-        IpProtocol::Icmp => peek_icmpv4_quoted_local_port(l4_payload),
-        IpProtocol::Icmpv6 => peek_icmpv6_quoted_local_port(l4_payload),
+        IpProtocol::Tcp | IpProtocol::Udp => {
+            if is_dhcp_exchange(protocol, l4_payload) {
+                return None;
+            }
+            FlowTuple::from_frame(frame)
+        }
+        IpProtocol::Icmp => icmpv4_quoted_flow(l4_payload),
+        IpProtocol::Icmpv6 => icmpv6_quoted_flow(l4_payload),
     }
 }
 
-pub(super) fn peek_icmpv4_quoted_local_port(bytes: &[u8]) -> Option<u16> {
+/// Whether a datagram is part of the DHCP client's exchange.
+///
+/// It is checked on the ports rather than on the addresses because a
+/// reply may be unicast or broadcast, and the client has no address of
+/// its own to match against until the exchange has finished.
+fn is_dhcp_exchange(protocol: IpProtocol, payload: &[u8]) -> bool {
+    if protocol != IpProtocol::Udp {
+        return false;
+    }
+    let Some(packet) = UdpPacket::parse(payload) else {
+        return false;
+    };
+    [packet.source_port, packet.destination_port]
+        .iter()
+        .any(|port| *port == DHCP_CLIENT_PORT || *port == DHCP_SERVER_PORT)
+}
+
+/// The flow an ICMPv4 error concerns, in the direction this interface
+/// receives it.
+///
+/// The quoted header is the packet *we sent*, so its tuple is the
+/// outgoing direction and has to be reversed to match how the frames of
+/// that flow arrive — which is what the hash is taken over.
+fn icmpv4_quoted_flow(bytes: &[u8]) -> Option<FlowTuple> {
     let Icmpv4Packet::DestinationUnreachable(unreachable) = Icmpv4Packet::parse(bytes)? else {
         return None;
     };
     let quoted = Ipv4Packet::parse_quoted(unreachable.original)?;
-    match quoted.protocol {
-        IpProtocol::Tcp => Some(TcpPacket::parse_ports(quoted.payload)?.source),
-        IpProtocol::Udp => Some(UdpPacket::parse_ports(quoted.payload)?.source),
-        _ => None,
-    }
+    let ports = quoted_ports(quoted.protocol, quoted.payload)?;
+    Some(FlowTuple::ipv4(quoted.source, ports.0, quoted.destination, ports.1).reversed())
 }
 
-pub(super) fn peek_icmpv6_quoted_local_port(bytes: &[u8]) -> Option<u16> {
+/// The flow an ICMPv6 error concerns, in the receive direction.
+fn icmpv6_quoted_flow(bytes: &[u8]) -> Option<FlowTuple> {
     let original = match Icmpv6Packet::parse(bytes)? {
         Icmpv6Packet::DestinationUnreachable(unreachable) => unreachable.original,
         Icmpv6Packet::PacketTooBig(packet_too_big) => packet_too_big.original,
         _ => return None,
     };
     let quoted = Ipv6Packet::parse_quoted(original)?;
-    match quoted.next_header {
-        IpProtocol::Tcp => Some(TcpPacket::parse_ports(quoted.payload)?.source),
-        IpProtocol::Udp => Some(UdpPacket::parse_ports(quoted.payload)?.source),
-        _ => None,
-    }
+    let ports = quoted_ports(quoted.next_header, quoted.payload)?;
+    Some(FlowTuple::ipv6(quoted.source, ports.0, quoted.destination, ports.1).reversed())
 }
 
-/// Maps a local port to the index of the shard that owns it. Server
-/// listening ports (anything below `EPHEMERAL_PORT_START`) always
-/// route to shard 0; ephemeral ports stride across shards so a
-/// freshly-allocated outgoing port `EPHEMERAL_PORT_START + k` lands
-/// on shard `k % shard_count`. Frames whose port is `None` (ARP,
-/// ICMP, …) or unparseable also map to shard 0.
-pub(super) fn shard_idx_for_port(port: Option<u16>, shard_count: usize) -> usize {
-    let Some(port) = port else { return 0 };
-    if port < EPHEMERAL_PORT_START {
-        return 0;
-    }
-    let stride_idx = port - EPHEMERAL_PORT_START;
-    usize::from(stride_idx) % shard_count
+/// The port pair of a quoted transport header. An ICMP error only has
+/// to quote the first eight bytes of it, which is exactly the ports.
+fn quoted_ports(protocol: IpProtocol, payload: &[u8]) -> Option<(u16, u16)> {
+    let ports = match protocol {
+        IpProtocol::Tcp => TcpPacket::parse_ports(payload)?,
+        IpProtocol::Udp => UdpPacket::parse_ports(payload)?,
+        _ => return None,
+    };
+    Some((ports.source, ports.destination))
+}
+
+/// Ports per shard when the ephemeral range is split evenly.
+///
+/// The last shard keeps whatever remainder the division leaves, so
+/// every port in the range belongs to exactly one window.
+fn ephemeral_window_len(shard_count: usize) -> u16 {
+    let total = u32::from(EPHEMERAL_PORT_END - EPHEMERAL_PORT_START) + 1;
+    let window = total / (shard_count as u32).max(1);
+    u16::try_from(window.max(1)).unwrap_or(u16::MAX)
+}
+
+/// The shard that will receive a flow between these endpoints.
+///
+/// Called before a socket is opened, so the socket is placed where its
+/// frames will arrive. The tuple is the receive direction — remote to
+/// local — because that is what the demux hashes, and the standard
+/// Toeplitz key is not symmetric.
+pub(super) fn shard_idx_for_flow(
+    local: IpAddress,
+    local_port: u16,
+    remote: IpAddress,
+    remote_port: u16,
+    shard_count: usize,
+) -> usize {
+    FlowTuple::between(remote, remote_port, local, local_port)
+        .map(|tuple| flow_hash(&tuple).bucket(shard_count))
+        .unwrap_or(DEFAULT_SHARD_IDX)
 }
 
 pub(super) struct NetworkShard {
@@ -124,6 +199,16 @@ pub(super) struct NetworkShard {
 #[repr(align(64))]
 pub(super) struct PaddedShard {
     pub(super) inner: SpinMutex<NetworkShard>,
+    /// Frames this shard's stack has taken off the device, and frames
+    /// it has handed back to it.
+    ///
+    /// Counted per shard because that is the distribution the steering
+    /// work exists to produce: a device that steers spreads a machine's
+    /// flows across these, and one that cannot leaves them all on the
+    /// default shard's counter. Relaxed atomics — a statistic that is a
+    /// few frames stale is still the right answer.
+    pub(super) rx_frames: AtomicU64,
+    pub(super) tx_frames: AtomicU64,
     /// Raised every time a frame is placed in this shard's stack.
     ///
     /// Deliberately outside the `SpinMutex`: the processor that drained
@@ -159,6 +244,151 @@ pub(super) enum RxFrameDispatch {
     Malformed,
 }
 
+/// A socket handle with the shard that owns it written into it.
+///
+/// The owner used to be recovered as `(id - 1) % shard_count`, which
+/// only worked because a socket was placed on the shard its ephemeral
+/// port strided to — the id encoded the *placement rule* rather than
+/// the placement. Ownership now follows the flow hash, so there is no
+/// rule left to invert and the owner is carried explicitly: the high
+/// half of the id is the shard, the low half is that shard's slab slot.
+///
+/// The low half is stored as `slot + 1` so a handle is never zero, and
+/// so slot 0 of shard 0 is still a valid id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ShardHandle(NonZeroU32);
+
+impl ShardHandle {
+    const SLOT_BITS: u32 = 16;
+    const SLOT_MASK: u32 = (1 << Self::SLOT_BITS) - 1;
+
+    pub(super) fn new(owner: usize, slot: usize) -> Self {
+        let owner = u32::try_from(owner)
+            .ok()
+            .filter(|owner| *owner <= Self::SLOT_MASK)
+            .unwrap_or_else(|| panic!("network shard {owner} does not fit a handle's owner half"));
+        let encoded_slot = u32::try_from(slot)
+            .ok()
+            .and_then(|slot| slot.checked_add(1))
+            .filter(|slot| *slot <= Self::SLOT_MASK)
+            .unwrap_or_else(|| panic!("network handle slot {slot} does not fit a handle"));
+        Self(
+            NonZeroU32::new((owner << Self::SLOT_BITS) | encoded_slot)
+                .unwrap_or_else(|| panic!("network handle slot {slot} encoded to zero")),
+        )
+    }
+
+    /// The shard that minted this handle and owns the socket behind it.
+    pub(super) const fn owner(self) -> usize {
+        (self.0.get() >> Self::SLOT_BITS) as usize
+    }
+
+    /// The owning shard's slab slot.
+    pub(super) const fn slot(self) -> usize {
+        ((self.0.get() & Self::SLOT_MASK) - 1) as usize
+    }
+
+    pub(super) const fn get(self) -> NonZeroU32 {
+        self.0
+    }
+
+    /// Rebuilds a handle a component host round-tripped through a raw
+    /// integer. A value that never named a slot is a caller bug, not a
+    /// recoverable error.
+    pub(super) fn from_raw(raw: NonZeroU32) -> Self {
+        assert!(
+            raw.get() & Self::SLOT_MASK != 0,
+            "network handle {raw} carries no slab slot"
+        );
+        Self(raw)
+    }
+}
+
+/// A handle for a socket that exists on every shard at once.
+///
+/// A listener and a wildcard-bound datagram socket cannot belong to one
+/// shard: the flow hash of an inbound SYN or of a datagram from an
+/// arbitrary peer is not known when the socket is opened, so it lands
+/// wherever the hash says. Both are therefore installed on every shard
+/// in the *same* slab slot, and the handle names only that slot — the
+/// shard is chosen at receive time by the hash rather than written into
+/// the id.
+///
+/// The slot is stored as `slot + 1` so a handle is never zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ReplicaHandle(NonZeroU32);
+
+impl ReplicaHandle {
+    pub(super) fn new(slot: usize) -> Self {
+        let encoded = u32::try_from(slot)
+            .ok()
+            .and_then(|slot| slot.checked_add(1))
+            .unwrap_or_else(|| panic!("replicated handle slot {slot} does not fit a handle"));
+        Self(
+            NonZeroU32::new(encoded)
+                .unwrap_or_else(|| panic!("replicated handle slot {slot} encoded to zero")),
+        )
+    }
+
+    /// The slab slot this socket occupies on every shard.
+    pub(super) const fn slot(self) -> usize {
+        (self.0.get() - 1) as usize
+    }
+
+    pub(super) const fn get(self) -> NonZeroU32 {
+        self.0
+    }
+
+    pub(super) const fn from_raw(raw: NonZeroU32) -> Self {
+        Self(raw)
+    }
+}
+
+/// Slab slots reserved across every shard at once.
+///
+/// A replicated socket has to occupy the same slot in each shard's
+/// slab, which the per-shard free lists cannot agree on by themselves.
+/// This allocator is the single owner of that decision; the shards then
+/// take the slot it hands out.
+pub(super) struct ReplicaSlots<const CAPACITY: usize> {
+    used: SpinMutex<[bool; CAPACITY]>,
+}
+
+impl<const CAPACITY: usize> ReplicaSlots<CAPACITY> {
+    /// Builds an allocator whose first `reserved` slots are already
+    /// taken, for sockets the shards install at construction.
+    pub(super) fn new(reserved: usize) -> Self {
+        assert!(
+            reserved <= CAPACITY,
+            "cannot reserve {reserved} of {CAPACITY} replicated slots"
+        );
+        let mut used = [false; CAPACITY];
+        for slot in &mut used[..reserved] {
+            *slot = true;
+        }
+        Self {
+            used: SpinMutex::new(used),
+        }
+    }
+
+    /// Takes the lowest free slot, or `None` when the table is full.
+    pub(super) fn allocate(&self) -> Option<usize> {
+        let mut used = self.used.lock();
+        let slot = used.iter().position(|taken| !*taken)?;
+        used[slot] = true;
+        Some(slot)
+    }
+
+    /// Returns a slot after every shard has dropped its replica.
+    pub(super) fn release(&self, slot: usize) {
+        let mut used = self.used.lock();
+        assert!(
+            core::mem::replace(&mut used[slot], false),
+            "replicated slot {slot} was released twice"
+        );
+    }
+}
+
 /// A shard's arrival signal sampled before the caller inspected that
 /// shard, together with the shard it came from.
 ///
@@ -168,12 +398,36 @@ pub(super) enum RxFrameDispatch {
 /// shard the operation belongs to.
 #[derive(Clone, Copy)]
 pub(super) struct ShardWait {
-    pub(super) shard_idx: usize,
+    pub(super) target: WaitTarget,
     pub(super) mark: ProgressMark,
+}
+
+/// Which arrival signal an operation parks on.
+///
+/// A socket that lives on one shard waits for that shard. A replicated
+/// socket cannot: an inbound connection or a datagram from an arbitrary
+/// peer lands on whichever shard its flow hashes to, so the operation
+/// waits for the whole set instead.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum WaitTarget {
+    Shard(usize),
+    AnyShard,
 }
 
 pub(super) struct NetworkShardSet {
     pub(super) shards: Box<[PaddedShard]>,
+    /// Slots for listeners, which exist on every shard because an
+    /// inbound connection's hash is not known when the port is opened.
+    pub(super) listener_slots: ReplicaSlots<MAX_TCP_LISTENER_HANDLES>,
+    /// Slots for bound datagram sockets, for the same reason.
+    pub(super) udp_slots: ReplicaSlots<MAX_UDP_SOCKET_HANDLES>,
+    /// Raised whenever any shard takes a frame.
+    ///
+    /// A replicated socket has no single shard to watch, so this is what
+    /// its operations park on. Raising it costs one atomic increment per
+    /// receive batch, and the waiters it releases are the accept and
+    /// datagram-receive calls of server sockets.
+    pub(super) replica_arrival: ProgressSignal,
 }
 
 impl ShardArrivals {
@@ -225,12 +479,95 @@ impl NetworkShardSet {
         for index in 0..shard_count {
             shards.push(PaddedShard {
                 inner: SpinMutex::new(factory(index)),
+                rx_frames: AtomicU64::new(0),
+                tx_frames: AtomicU64::new(0),
                 arrival: ProgressSignal::new(),
             });
         }
         Self {
             shards: shards.into_boxed_slice(),
+            listener_slots: ReplicaSlots::new(0),
+            // Slot zero is the DHCP client, which every shard reserves
+            // so a replicated bind cannot land on top of it.
+            udp_slots: ReplicaSlots::new(INTERNAL_UDP_RESERVED_SLOTS),
+            replica_arrival: ProgressSignal::new(),
         }
+    }
+
+    /// Installs a replicated socket on every shard, or on none.
+    ///
+    /// A partial install would leave a port taken on some shards and
+    /// free on others, and the next bind would then disagree with the
+    /// receive path about who owns it, so a shard that refuses unwinds
+    /// the ones that already took it.
+    pub(super) fn install_replica<E>(
+        &self,
+        slot: usize,
+        mut install: impl FnMut(&mut NetworkShard, usize) -> Result<(), E>,
+        mut remove: impl FnMut(&mut NetworkShard, usize),
+    ) -> Result<(), E> {
+        for (installed, shard) in self.shards.iter().enumerate() {
+            let outcome = install(&mut shard.inner.lock(), slot);
+            if let Err(error) = outcome {
+                for unwound in &self.shards[..installed] {
+                    remove(&mut unwound.inner.lock(), slot);
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Runs `f` against each shard's replica in turn, starting at
+    /// `start`, and stops at the first one that answers.
+    ///
+    /// Receiving from a replicated socket works this way: the caller's
+    /// own shard is the likeliest to hold something and costs no
+    /// cross-processor traffic, and the rest are visited afterwards so
+    /// a datagram or a connection the hash placed elsewhere is never
+    /// stranded. An error from any replica ends the walk, because a
+    /// replicated socket that failed on one shard is not healthy on the
+    /// others.
+    pub(super) fn find_in_replicas<R, E>(
+        &self,
+        start: usize,
+        mut f: impl FnMut(&mut NetworkShard) -> Result<Option<R>, E>,
+    ) -> Result<Option<R>, E> {
+        for offset in 0..self.shards.len() {
+            let idx = (start + offset) % self.shards.len();
+            let mut shard = self.shards[idx].inner.lock();
+            if let Some(found) = f(&mut shard)? {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Retargets every replica of a socket, in shard order.
+    ///
+    /// The first shard decides the outcome. Every replica holds the same
+    /// binding and reads the same replicated address table, so a later
+    /// shard that disagrees means the set has drifted — a kernel bug,
+    /// not a caller error — and it is reported as one rather than left
+    /// as a half-applied change.
+    pub(super) fn for_each_replica<E: core::fmt::Display>(
+        &self,
+        operation: &'static str,
+        mut f: impl FnMut(&mut NetworkShard) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut shards = self.shards.iter();
+        let first = shards
+            .next()
+            .unwrap_or_else(|| panic!("a network shard set is never empty"));
+        f(&mut first.inner.lock())?;
+        for shard in shards {
+            if let Err(error) = f(&mut shard.inner.lock()) {
+                panic!(
+                    "replicated {operation} succeeded on the first shard but failed on a later one: {error}"
+                );
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn shard_count(&self) -> usize {
@@ -239,36 +576,65 @@ impl NetworkShardSet {
 
     /// Picks the shard responsible for an unqualified operation
     /// (control-plane queries, admin commands that target every
-    /// shard, etc.). Implemented in terms of `shard_for_handle(0)`
-    /// so the routing rule lives in exactly one place.
+    /// shard, etc.).
     #[inline]
     pub(super) fn shard_for_default(&self) -> &SpinMutex<NetworkShard> {
         &self.shards[self.default_shard_idx()].inner
     }
 
     /// Index of the shard [`Self::shard_for_default`] resolves to.
+    ///
+    /// The same shard that owns every frame the hash cannot name, so a
+    /// control-plane operation and an ARP reply meet on one shard.
     #[inline]
-    pub(super) fn default_shard_idx(&self) -> usize {
-        // Handle id 1 is the canonical "shard 0" id under the
-        // stride encoding (slot 0 in shard 0 -> id = 1), so
-        // shard_for_default and shard_for_handle agree on shard 0.
-        self.shard_idx_for_handle(1u64)
+    pub(super) const fn default_shard_idx(&self) -> usize {
+        DEFAULT_SHARD_IDX
     }
 
-    /// Picks the shard owning a given socket / connection handle
-    /// using the inverse of `NetworkShard::encode_handle_id`:
-    /// `(handle - 1) % shard_count == shard_idx`.
+    /// Picks the shard owning a given socket / connection handle.
     #[inline]
-    pub(super) fn shard_for_handle<H: Into<u64>>(&self, handle: H) -> &SpinMutex<NetworkShard> {
+    pub(super) fn shard_for_handle<H: Into<ShardHandle>>(
+        &self,
+        handle: H,
+    ) -> &SpinMutex<NetworkShard> {
         &self.shards[self.shard_idx_for_handle(handle)].inner
     }
 
-    /// Index of the shard owning `handle`.
+    /// Index of the shard owning `handle`, as the handle itself records
+    /// it.
     #[inline]
-    pub(super) fn shard_idx_for_handle<H: Into<u64>>(&self, handle: H) -> usize {
-        let handle: u64 = handle.into();
-        let normalized = handle.saturating_sub(1) as usize;
-        normalized % self.shards.len()
+    pub(super) fn shard_idx_for_handle<H: Into<ShardHandle>>(&self, handle: H) -> usize {
+        let owner = handle.into().owner();
+        assert!(
+            owner < self.shards.len(),
+            "network handle names shard {owner} but the set has {}",
+            self.shards.len()
+        );
+        owner
+    }
+
+    /// Records frames this shard took off the device.
+    #[inline]
+    pub(super) fn record_received(&self, idx: usize, frames: usize) {
+        self.shards[idx]
+            .rx_frames
+            .fetch_add(frames as u64, AtomicOrdering::Relaxed);
+    }
+
+    /// Records frames this shard handed to the device.
+    #[inline]
+    pub(super) fn record_transmitted(&self, idx: usize, frames: usize) {
+        self.shards[idx]
+            .tx_frames
+            .fetch_add(frames as u64, AtomicOrdering::Relaxed);
+    }
+
+    /// Frames this shard has moved in each direction since boot.
+    pub(super) fn frame_counts(&self, idx: usize) -> (u64, u64) {
+        (
+            self.shards[idx].rx_frames.load(AtomicOrdering::Relaxed),
+            self.shards[idx].tx_frames.load(AtomicOrdering::Relaxed),
+        )
     }
 
     /// The shard's cross-processor arrival signal. Raised by whichever
@@ -298,21 +664,34 @@ impl NetworkShardSet {
     #[inline]
     pub(super) fn shard_wait(&self, idx: usize) -> ShardWait {
         ShardWait {
-            shard_idx: idx,
+            target: WaitTarget::Shard(idx),
             mark: self.arrival(idx).mark(),
+        }
+    }
+
+    /// Samples the set-wide arrival signal, for an operation on a
+    /// socket that lives on every shard.
+    #[inline]
+    pub(super) fn replica_wait(&self) -> ShardWait {
+        ShardWait {
+            target: WaitTarget::AnyShard,
+            mark: self.replica_arrival.mark(),
+        }
+    }
+
+    /// The signal a sampled wait belongs to.
+    #[inline]
+    pub(super) fn arrival_for(&self, target: WaitTarget) -> &ProgressSignal {
+        match target {
+            WaitTarget::Shard(idx) => self.arrival(idx),
+            WaitTarget::AnyShard => &self.replica_arrival,
         }
     }
 
     /// Samples the arrival signal of the shard owning `handle`.
     #[inline]
-    pub(super) fn shard_wait_for_handle<H: Into<u64>>(&self, handle: H) -> ShardWait {
+    pub(super) fn shard_wait_for_handle<H: Into<ShardHandle>>(&self, handle: H) -> ShardWait {
         self.shard_wait(self.shard_idx_for_handle(handle))
-    }
-
-    /// Samples the arrival signal of the shard owning `port`.
-    #[inline]
-    pub(super) fn shard_wait_for_local_port(&self, port: u16) -> ShardWait {
-        self.shard_wait(self.shard_idx_for_local_port(port))
     }
 
     /// Samples the arrival signal of the shard that unqualified
@@ -340,6 +719,10 @@ impl NetworkShardSet {
                 cpu.wake_processor(owner);
             }
         }
+        // A replicated socket's operations watch the whole set, because
+        // the shard their next connection or datagram lands on is not
+        // known until its flow is hashed.
+        self.replica_arrival.signal();
     }
 
     /// Places one received frame in the shard that owns its local port.
@@ -356,8 +739,7 @@ impl NetworkShardSet {
         received_at: StackInstant,
         control: &NetworkControlPlane,
     ) -> RxFrameDispatch {
-        let port = peek_local_port(frame.as_ref());
-        let shard_idx = shard_idx_for_port(port, self.shard_count());
+        let shard_idx = shard_idx_for_frame(frame, self.shard_count());
         let mut shard = self.shards[shard_idx].inner.lock();
         let dispatch = match shard.stack.receive_rx_frame(frame.clone(), received_at) {
             Ok(backpressured) => RxFrameDispatch::Delivered {
@@ -382,30 +764,14 @@ impl NetworkShardSet {
         &self.shards[idx].inner
     }
 
-    /// Picks the shard that should receive a new socket created on
-    /// the given processor. Future RX traffic for the socket's
-    /// stride-allocated ephemeral port will demux back to this
-    /// shard, so creation must place the slab entry here. Falls
-    /// back to shard 0 for processor ids out of the configured
-    /// range.
-    #[inline]
-    pub(super) fn shard_for_processor(
-        &self,
-        processor: helios_hal::cpu::ProcessorId,
-    ) -> &SpinMutex<NetworkShard> {
-        &self.shards[self.shard_idx_for_processor(processor)].inner
-    }
-
-    /// Index of the shard [`Self::shard_for_processor`] resolves to.
+    /// The shard a socket created on `processor` should prefer.
+    ///
+    /// Only a preference: ownership follows the flow hash, and this is
+    /// what an allocator aims at so a socket opened on one processor is
+    /// also received on it.
     #[inline]
     pub(super) fn shard_idx_for_processor(&self, processor: helios_hal::cpu::ProcessorId) -> usize {
         (processor.id() as usize) % self.shards.len()
-    }
-
-    /// Index of the shard owning a fixed local port.
-    #[inline]
-    pub(super) fn shard_idx_for_local_port(&self, port: u16) -> usize {
-        shard_idx_for_port(Some(port), self.shards.len())
     }
 
     pub(super) fn with<R>(&self, f: impl FnOnce(&NetworkShard) -> R) -> R {
@@ -427,40 +793,12 @@ impl NetworkShardSet {
     /// etc.) needs interior mutation; a read-only sibling would only
     /// be useful for diagnostic peeks the kernel does not currently
     /// expose.
-    pub(super) fn with_handle<H: Into<u64>, R>(
+    pub(super) fn with_handle<H: Into<ShardHandle>, R>(
         &self,
         handle: H,
         f: impl FnOnce(&mut NetworkShard) -> R,
     ) -> R {
         let mut state = self.shard_for_handle(handle).lock();
-        f(&mut state)
-    }
-
-    /// Locks the shard owning the given processor and runs the
-    /// closure against it. Used by socket-creation paths so the
-    /// new socket lives on the processor that minted it; ephemeral
-    /// ports allocated under the stride scheme will demux back to
-    /// this shard for incoming traffic.
-    pub(super) fn with_processor<R>(
-        &self,
-        processor: helios_hal::cpu::ProcessorId,
-        f: impl FnOnce(&mut NetworkShard) -> R,
-    ) -> R {
-        let mut state = self.shard_for_processor(processor).lock();
-        f(&mut state)
-    }
-
-    /// Locks the shard owning a fixed local port (server listener,
-    /// explicit UDP bind). Maps via `shard_idx_for_port` so RX
-    /// demux for the same port reaches the same shard.
-    pub(super) fn with_local_port<R>(
-        &self,
-        port: u16,
-        f: impl FnOnce(&mut NetworkShard) -> R,
-    ) -> R {
-        let mut state = self.shards[self.shard_idx_for_local_port(port)]
-            .inner
-            .lock();
         f(&mut state)
     }
 
@@ -504,37 +842,28 @@ impl NetworkShard {
             shard_idx < shard_count,
             "shard idx {shard_idx} out of range for {shard_count} shards"
         );
-        let initial_ephemeral = EPHEMERAL_PORT_START + shard_idx as u16;
+        let initial_ephemeral =
+            EPHEMERAL_PORT_START + (shard_idx as u16) * ephemeral_window_len(shard_count);
         let mut stack = Box::new(Stack::new(stack_config));
         let mut udp_sockets = HandleSlab::new();
-        if shard_idx == shard_idx_for_port(Some(DHCP_CLIENT_PORT), shard_count) {
-            let binding = UdpSocketBinding::wildcard(DHCP_CLIENT_PORT);
-            let stack_socket = stack
-                .open_udp(binding)
-                .unwrap_or_else(|error| panic!("failed to open DHCP UDP socket: {error}"));
-            let slot = udp_sockets.insert(UdpSocketState {
-                stack_socket,
-                binding,
-            });
-            assert_eq!(
-                slot, INTERNAL_DHCP_SOCKET_INDEX,
-                "DHCP internal UDP socket slot changed"
-            );
-        }
-        if shard_idx == shard_idx_for_port(Some(INTERNAL_DNS_PORT), shard_count) {
-            let binding = UdpSocketBinding::wildcard(INTERNAL_DNS_PORT);
-            let stack_socket = stack
-                .open_udp(binding)
-                .unwrap_or_else(|error| panic!("failed to open DNS UDP socket: {error}"));
-            let slot = udp_sockets.insert(UdpSocketState {
-                stack_socket,
-                binding,
-            });
-            assert_eq!(
-                slot, INTERNAL_DNS_SOCKET_INDEX,
-                "DNS internal UDP socket slot changed"
-            );
-        }
+        // Every shard opens the DHCP client socket, and always in the
+        // same slab slot, because a replicated bind occupies one slot
+        // index across the whole set and must not land on top of it.
+        // Only the default shard ever receives on it — a DHCP exchange
+        // is broadcast at a moment when the interface has no address to
+        // hash a flow with — but the slot is spent everywhere.
+        let binding = UdpSocketBinding::wildcard(DHCP_CLIENT_PORT);
+        let stack_socket = stack
+            .open_udp(binding)
+            .unwrap_or_else(|error| panic!("failed to open DHCP UDP socket: {error}"));
+        let slot = udp_sockets.insert(UdpSocketState {
+            stack_socket,
+            binding,
+        });
+        assert_eq!(
+            slot, INTERNAL_DHCP_SOCKET_INDEX,
+            "DHCP internal UDP socket slot changed"
+        );
         Self {
             stack,
             shard_idx,
@@ -551,38 +880,25 @@ impl NetworkShard {
         }
     }
 
-    /// Encodes a per-shard slab index into a globally unique handle
-    /// id whose value satisfies `(id - 1) % shard_count == shard_idx`.
-    /// This is the inverse of `NetworkShardSet::shard_for_handle`
-    /// so an operation arriving with a handle can route directly to
-    /// the shard that minted it without consulting a side table.
-    pub(super) fn encode_handle_id(&self, slot: usize) -> u32 {
-        let stride = self.shard_count;
-        let raw = slot
-            .checked_mul(stride)
-            .and_then(|product| product.checked_add(self.shard_idx + 1))
-            .unwrap_or_else(|| {
-                panic!(
-                    "network handle slot {slot} overflowed stride {stride} encoding for shard {}",
-                    self.shard_idx
-                )
-            });
-        u32::try_from(raw).unwrap_or_else(|_| panic!("encoded handle id {raw} exceeds u32 range"))
+    /// Mints a handle for one of this shard's slab slots, stamping this
+    /// shard as its owner so an operation arriving with the handle
+    /// routes straight back here without a side table.
+    pub(super) fn encode_handle_id(&self, slot: usize) -> ShardHandle {
+        ShardHandle::new(self.shard_idx, slot)
     }
 
-    /// Reverses `encode_handle_id`. Panics if the handle was minted
-    /// by a different shard, since misrouted handles indicate a
-    /// caller-side dispatch bug.
-    pub(super) fn decode_handle_slot(&self, raw: u32) -> usize {
-        let value = (raw - 1) as usize;
+    /// Reads the slab slot out of a handle this shard owns. Panics if
+    /// the handle was minted by a different shard, since a misrouted
+    /// handle is a caller-side dispatch bug.
+    pub(super) fn decode_handle_slot(&self, handle: ShardHandle) -> usize {
         assert_eq!(
-            value % self.shard_count,
+            handle.owner(),
             self.shard_idx,
-            "handle id {raw} routed to shard {} but encodes shard {}",
+            "handle routed to shard {} but names shard {}",
             self.shard_idx,
-            value % self.shard_count
+            handle.owner()
         );
-        value / self.shard_count
+        handle.slot()
     }
 
     pub(super) fn is_configured(&self) -> bool {
@@ -606,26 +922,42 @@ impl NetworkShard {
         }
     }
 
-    /// Number of ephemeral ports owned by this shard under the
-    /// stride-allocation scheme. Equal to the total ephemeral
-    /// range divided by the shard count, rounded up.
-    pub(super) fn ephemeral_port_attempts(&self) -> usize {
-        let total = usize::from(EPHEMERAL_PORT_END - EPHEMERAL_PORT_START) + 1;
-        total.div_ceil(self.shard_count)
+    /// The contiguous slice of the ephemeral range this shard hands
+    /// out, as an inclusive `(first, last)` pair.
+    ///
+    /// A socket's shard follows its flow hash, so the allocator no
+    /// longer has to make a port decode back to a shard. What it still
+    /// has to do is keep two shards from handing out the same port at
+    /// the same moment, which one window each achieves without any
+    /// shared state — and unlike the old stride it leaves each shard
+    /// walking consecutive numbers instead of skipping `shard_count` at
+    /// a time.
+    pub(super) fn ephemeral_window(&self) -> (u16, u16) {
+        let window = ephemeral_window_len(self.shard_count);
+        let first = EPHEMERAL_PORT_START + (self.shard_idx as u16) * window;
+        let last = if self.shard_idx + 1 == self.shard_count {
+            EPHEMERAL_PORT_END
+        } else {
+            first + window - 1
+        };
+        (first, last)
     }
 
-    /// Advances the rolling allocator pointer by `shard_count`,
-    /// wrapping back to the shard's first ephemeral port when we
-    /// step past `EPHEMERAL_PORT_END`. The result is always a port
-    /// that satisfies `(port - EPHEMERAL_PORT_START) % shard_count
-    /// == shard_idx`, matching `shard_idx_for_port` so RX demux
-    /// routes back to this shard.
+    /// How many candidates an allocation walk may try before it gives
+    /// up: every port in this shard's window.
+    pub(super) fn ephemeral_port_attempts(&self) -> usize {
+        let (first, last) = self.ephemeral_window();
+        usize::from(last - first) + 1
+    }
+
+    /// Advances the rolling allocator pointer, wrapping at the end of
+    /// this shard's window.
     pub(super) fn advance_ephemeral_port(&self, current: u16) -> u16 {
-        let stride = self.shard_count as u16;
-        let next = current.checked_add(stride);
-        match next {
-            Some(value) if value <= EPHEMERAL_PORT_END => value,
-            _ => EPHEMERAL_PORT_START + self.shard_idx as u16,
+        let (first, last) = self.ephemeral_window();
+        if current >= last || current < first {
+            first
+        } else {
+            current + 1
         }
     }
 

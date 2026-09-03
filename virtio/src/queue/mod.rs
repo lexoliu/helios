@@ -432,6 +432,13 @@ trait RingOps<T: VirtioTransport>: Sized {
 
     fn pop_used(&mut self) -> Option<(u16, u32)>;
 
+    /// Whether the device has published a completion the driver has not
+    /// taken yet.
+    ///
+    /// Read-only, so an interrupt handler can ask it about a queue it
+    /// holds only briefly, without draining anything.
+    fn has_pending_used(&self) -> bool;
+
     fn should_notify(&self) -> bool;
 
     /// The VIRTIO_F_NOTIFICATION_DATA payload for the current ring
@@ -477,6 +484,13 @@ impl<T: VirtioTransport> Ring<T> {
         match self {
             Self::Split(ring) => ring.pop_used(),
             Self::Packed(ring) => ring.pop_used(),
+        }
+    }
+
+    fn has_pending_used(&self) -> bool {
+        match self {
+            Self::Split(ring) => ring.has_pending_used(),
+            Self::Packed(ring) => ring.has_pending_used(),
         }
     }
 
@@ -654,6 +668,15 @@ impl<T: VirtioTransport> VirtQueue<T> {
     }
 
     /// Reaps the next completed chain, if any.
+    /// Whether the device has published a completion nobody has taken.
+    ///
+    /// This is what lets an interrupt handler decide which queue pairs
+    /// actually made progress, and therefore which processors to wake,
+    /// without draining a ring that belongs to another CPU.
+    pub fn has_pending_used(&self) -> bool {
+        self.ring.has_pending_used()
+    }
+
     pub fn pop_used(&mut self) -> Option<u16> {
         self.pop_used_with_len().map(|(id, _)| id)
     }

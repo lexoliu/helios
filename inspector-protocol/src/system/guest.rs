@@ -531,6 +531,22 @@ fn convert_sample(sample: host_stats::Sample) -> stats::Sample {
         iommu: sample.iommu.map(convert_iommu),
         balloon: sample.balloon.map(convert_memory_balloon),
         host_share: sample.host_share.map(convert_host_share_cache),
+        network: sample.network.map(convert_network),
+    }
+}
+
+fn convert_network(network: host_stats::Network) -> stats::Network {
+    stats::Network {
+        queues: network
+            .queues
+            .into_iter()
+            .map(|queue| stats::NetworkQueue {
+                id: queue.id,
+                rx_frames: queue.rx_frames,
+                tx_frames: queue.tx_frames,
+                interrupts: queue.interrupts,
+            })
+            .collect(),
     }
 }
 

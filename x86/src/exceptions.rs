@@ -19,7 +19,19 @@ pub(crate) const TLB_SHOOTDOWN_INTERRUPT_VECTOR: u8 = 0x22;
 /// MSI-X vectors for the PCI devices the kernel drives. One vector per
 /// device keeps dispatch a direct lookup in [`DeviceInterruptRoutes`]
 /// without a shared interrupt-status scan.
+/// The network device's configuration-change message. Its queue pairs
+/// have vectors of their own, one per processor that drains one.
 pub(crate) const NETWORK_INTERRUPT_VECTOR: u8 = 0x30;
+/// Queue pairs the backend hands a vector of their own, each delivered
+/// to the local APIC of the processor whose shard drains that pair.
+/// A machine with more processors than this shares the last vector,
+/// which costs a cross-core hand-off for the tail pairs but never drops
+/// their completions.
+pub(crate) const MAX_NETWORK_QUEUE_VECTORS: usize = 8;
+/// One IDT vector per steered queue pair, contiguous so the dispatch is
+/// a subtraction rather than a table search.
+pub(crate) const NETWORK_QUEUE_INTERRUPT_VECTORS: [u8; MAX_NETWORK_QUEUE_VECTORS] =
+    [0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47];
 pub(crate) const HOST_FS_INTERRUPT_VECTOR: u8 = 0x31;
 pub(crate) const ENTROPY_INTERRUPT_VECTOR: u8 = 0x32;
 pub(crate) const VSOCK_INTERRUPT_VECTOR: u8 = 0x37;
@@ -60,6 +72,14 @@ unsafe extern "C" {
     fn helios_x86_interrupt_wake();
     fn helios_x86_interrupt_tlb_shootdown();
     fn helios_x86_interrupt_network();
+    fn helios_x86_interrupt_network_queue_0();
+    fn helios_x86_interrupt_network_queue_1();
+    fn helios_x86_interrupt_network_queue_2();
+    fn helios_x86_interrupt_network_queue_3();
+    fn helios_x86_interrupt_network_queue_4();
+    fn helios_x86_interrupt_network_queue_5();
+    fn helios_x86_interrupt_network_queue_6();
+    fn helios_x86_interrupt_network_queue_7();
     fn helios_x86_interrupt_host_fs();
     fn helios_x86_interrupt_entropy();
     fn helios_x86_interrupt_vsock();
@@ -116,6 +136,22 @@ impl ProcessorIdt {
                 .set_handler_addr(handler_address(helios_x86_interrupt_tlb_shootdown));
             table[NETWORK_INTERRUPT_VECTOR]
                 .set_handler_addr(handler_address(helios_x86_interrupt_network));
+            let network_queue_stubs: [unsafe extern "C" fn(); MAX_NETWORK_QUEUE_VECTORS] = [
+                helios_x86_interrupt_network_queue_0,
+                helios_x86_interrupt_network_queue_1,
+                helios_x86_interrupt_network_queue_2,
+                helios_x86_interrupt_network_queue_3,
+                helios_x86_interrupt_network_queue_4,
+                helios_x86_interrupt_network_queue_5,
+                helios_x86_interrupt_network_queue_6,
+                helios_x86_interrupt_network_queue_7,
+            ];
+            for (vector, stub) in NETWORK_QUEUE_INTERRUPT_VECTORS
+                .iter()
+                .zip(network_queue_stubs)
+            {
+                table[*vector].set_handler_addr(handler_address(stub));
+            }
             table[HOST_FS_INTERRUPT_VECTOR]
                 .set_handler_addr(handler_address(helios_x86_interrupt_host_fs));
             table[ENTROPY_INTERRUPT_VECTOR]
@@ -229,6 +265,7 @@ fn is_device_interrupt(vector: u8) -> bool {
             | VSOCK_INTERRUPT_VECTOR
             | BALLOON_INTERRUPT_VECTOR
     ) || BLOCK_INTERRUPT_VECTORS.contains(&vector)
+        || NETWORK_QUEUE_INTERRUPT_VECTORS.contains(&vector)
 }
 
 fn dispatch_to_wasmtime(exception: KernelException) -> KernelExceptionDispatch {

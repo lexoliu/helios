@@ -47,6 +47,54 @@ helios_x86_interrupt_network:
     push 0x30
     jmp helios_x86_interrupt_common
 
+.global helios_x86_interrupt_network_queue_0
+helios_x86_interrupt_network_queue_0:
+    push 0
+    push 0x40
+    jmp helios_x86_interrupt_common
+
+.global helios_x86_interrupt_network_queue_1
+helios_x86_interrupt_network_queue_1:
+    push 0
+    push 0x41
+    jmp helios_x86_interrupt_common
+
+.global helios_x86_interrupt_network_queue_2
+helios_x86_interrupt_network_queue_2:
+    push 0
+    push 0x42
+    jmp helios_x86_interrupt_common
+
+.global helios_x86_interrupt_network_queue_3
+helios_x86_interrupt_network_queue_3:
+    push 0
+    push 0x43
+    jmp helios_x86_interrupt_common
+
+.global helios_x86_interrupt_network_queue_4
+helios_x86_interrupt_network_queue_4:
+    push 0
+    push 0x44
+    jmp helios_x86_interrupt_common
+
+.global helios_x86_interrupt_network_queue_5
+helios_x86_interrupt_network_queue_5:
+    push 0
+    push 0x45
+    jmp helios_x86_interrupt_common
+
+.global helios_x86_interrupt_network_queue_6
+helios_x86_interrupt_network_queue_6:
+    push 0
+    push 0x46
+    jmp helios_x86_interrupt_common
+
+.global helios_x86_interrupt_network_queue_7
+helios_x86_interrupt_network_queue_7:
+    push 0
+    push 0x47
+    jmp helios_x86_interrupt_common
+
 .global helios_x86_interrupt_host_fs
 helios_x86_interrupt_host_fs:
     push 0

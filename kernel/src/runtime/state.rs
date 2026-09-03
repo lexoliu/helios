@@ -916,7 +916,7 @@ impl<ProgramService, NetworkService, HostFsService>
     RuntimeState<ProgramService, NetworkService, HostFsService>
 where
     ProgramService: Clone,
-    NetworkService: Clone,
+    NetworkService: crate::NetworkAdminBackend,
     HostFsService: crate::HostFileSystem,
 {
     pub fn snapshot(&self, current_ticks: u64) -> StatsSample {
@@ -937,6 +937,9 @@ where
             host_share: self
                 .host_fs_service()
                 .and_then(|service| service.cache_stats()),
+            network: self
+                .network_service()
+                .map(|service| service.network_stats()),
         }
     }
 }

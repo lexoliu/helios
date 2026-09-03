@@ -782,6 +782,10 @@ impl Cpu for BenchCpu {
 }
 
 impl NetworkAdminBackend for BenchNetworkService {
+    fn network_stats(&self) -> helios_kernel::NetworkStats {
+        helios_kernel::NetworkStats::default()
+    }
+
     async fn bridge_port(
         &self,
         _port: NetworkPortId,

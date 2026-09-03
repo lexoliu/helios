@@ -24,6 +24,13 @@ type RiscvVirtioNetDevice = helios_virtio::VirtioNetDevice<RiscvVirtioNetTranspo
 #[derive(Clone)]
 struct VirtioNetworkDevice {
     inner: Arc<RiscvVirtioNetDevice>,
+    /// Held so the interrupt handler can steer by IPI.
+    ///
+    /// The PLIC source is enabled on the bootstrap hart's context
+    /// alone, so every queue pair's completions are noticed there
+    /// whichever hart owns them. Waking the owners is the only steering
+    /// a single-source transport can do.
+    cpu: RiscvCpu,
 }
 
 pub(crate) struct ExternalInterrupts {
@@ -42,7 +49,7 @@ pub(crate) struct ExternalInterrupts {
 
 impl ExternalInterruptHandler for VirtioNetworkDevice {
     fn handle_interrupt(&self) {
-        self.inner.handle_interrupt();
+        helios_kernel::wake_queue_owners(&self.cpu, self.inner.handle_interrupt().iter());
     }
 }
 
@@ -68,7 +75,7 @@ pub(crate) fn install_network_service<WatchdogImpl>(
 where
     WatchdogImpl: Watchdog + Clone,
 {
-    let Some((device, source)) = discover_network_device(fdt) else {
+    let Some((device, source)) = discover_network_device(cpu, fdt) else {
         tracing::warn!("virtio network device was not discovered on the platform bus");
         return None;
     };
@@ -99,7 +106,7 @@ impl ExternalInterrupts {
 
     pub(crate) fn attach_network(&mut self, interrupt: NetworkInterrupt) {
         self.enable_source(interrupt.source);
-        self.routes.set_network(interrupt.source, interrupt.device);
+        self.routes.add_network(interrupt.source, interrupt.device);
     }
 
     pub(crate) fn attach_host_fs(&mut self, interrupt: crate::host_fs::HostFsInterrupt) {
@@ -247,6 +254,14 @@ impl NetworkDevice for VirtioNetworkDevice {
     async fn wait_for_event(&self) {
         self.inner.wait_for_interrupt().await;
     }
+
+    async fn wait_for_event_on(&self, queue_idx: usize) {
+        self.inner.wait_for_interrupt_on(queue_idx).await;
+    }
+
+    fn queue_interrupts(&self, queue_idx: usize) -> u64 {
+        self.inner.queue_interrupts(queue_idx)
+    }
 }
 
 impl plic::HartContext for PlicContext {
@@ -261,7 +276,10 @@ impl plic::InterruptSource for InterruptSourceId {
     }
 }
 
-fn discover_network_device(fdt: &Fdt<'_>) -> Option<(VirtioNetworkDevice, InterruptSourceId)> {
+fn discover_network_device(
+    cpu: &RiscvCpu,
+    fdt: &Fdt<'_>,
+) -> Option<(VirtioNetworkDevice, InterruptSourceId)> {
     let candidate = helios_virtio::mmio_candidates(fdt).find(|candidate| {
         crate::matches_virtio_mmio_device(candidate.base, helios_virtio::DeviceType::Network)
     })?;
@@ -280,6 +298,7 @@ fn discover_network_device(fdt: &Fdt<'_>) -> Option<(VirtioNetworkDevice, Interr
     Some((
         VirtioNetworkDevice {
             inner: Arc::new(device),
+            cpu: cpu.clone(),
         },
         irq_source,
     ))

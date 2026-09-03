@@ -290,6 +290,7 @@ where
                             accepted,
                             accepted_bytes,
                         );
+                        self.inner.state.record_transmitted(shard_idx, accepted);
                         transmitted += accepted;
                         transmitted_bytes = transmitted_bytes.saturating_add(accepted_bytes);
                         if accepted < offered {

@@ -45,11 +45,13 @@ pub use mmio::{
     p9_from_mmio_with_dma, rng_from_mmio, rng_from_mmio_with_dma, vsock_from_mmio,
     vsock_from_mmio_with_dma,
 };
-pub use net::{RxFrame, TxChecksumMeta, TxGsoMeta, VirtioNetDevice};
+pub use net::{
+    NotificationCoalescing, QueuePairProgress, RxFrame, TxChecksumMeta, TxGsoMeta, VirtioNetDevice,
+};
 pub use p9::Virtio9pDevice;
 pub use pci::{
-    PciMmioMapper, VIRTIO_PCI_VENDOR_ID, VirtioPciBus, VirtioPciTransport, balloon_from_pci,
-    block_from_pci, iommu_from_pci, net_from_pci, p9_from_pci, rng_from_pci,
+    MsixBinding, PciMmioMapper, VIRTIO_PCI_VENDOR_ID, VirtioPciBus, VirtioPciTransport,
+    balloon_from_pci, block_from_pci, iommu_from_pci, net_from_pci, p9_from_pci, rng_from_pci,
     virtio_pci_device_type, vsock_from_pci,
 };
 pub use queue::{MAX_CHAIN_BUFFERS, VirtQueue, VirtqueueError};

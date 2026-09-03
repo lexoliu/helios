@@ -122,6 +122,10 @@ impl<T: VirtioTransport> RingOps<T> for SplitRing<T> {
         self.write_avail_idx(self.avail_idx);
     }
 
+    fn has_pending_used(&self) -> bool {
+        self.read_used_idx() != self.last_used_idx
+    }
+
     fn pop_used(&mut self) -> Option<(u16, u32)> {
         if self.core.features.in_order() {
             self.pop_used_in_order()

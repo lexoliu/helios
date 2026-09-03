@@ -9,6 +9,8 @@
 //! bring-up and are read-only on the interrupt path afterwards.
 //! Handlers run in interrupt context and must be non-blocking.
 
+use helios_hal::cpu::{Cpu, ProcessorId};
+
 /// Block devices one platform may route interrupts for.
 ///
 /// A machine routinely carries more than one: the disk the kernel was
@@ -16,6 +18,13 @@
 /// same bus, and the kernel has to be able to reach both to tell them
 /// apart.
 pub const MAX_BLOCK_DEVICES: usize = 4;
+
+/// Interrupt messages one network device may install routes for.
+///
+/// A device with per-queue vectors takes one per queue pair plus one for
+/// configuration changes, which is what bounds this: the number of queue
+/// vectors the x86 backend hands out, and the configuration message.
+pub const MAX_NETWORK_INTERRUPTS: usize = 9;
 
 /// A device that consumes external interrupts for one source.
 pub trait ExternalInterruptHandler {
@@ -25,7 +34,7 @@ pub trait ExternalInterruptHandler {
 /// Maps claimed interrupt sources to the device handlers a backend
 /// registered at boot.
 pub struct ExternalInterruptRoutes<Source, Network, HostFs, Entropy, Balloon, Vsock, Block> {
-    network: Option<(Source, Network)>,
+    network: [Option<(Source, Network)>; MAX_NETWORK_INTERRUPTS],
     host_fs: Option<(Source, HostFs)>,
     entropy: Option<(Source, Entropy)>,
     balloon: Option<(Source, Balloon)>,
@@ -46,7 +55,7 @@ where
 {
     pub const fn new() -> Self {
         Self {
-            network: None,
+            network: [const { None }; MAX_NETWORK_INTERRUPTS],
             host_fs: None,
             entropy: None,
             balloon: None,
@@ -55,12 +64,21 @@ where
         }
     }
 
-    pub fn set_network(&mut self, source: Source, handler: Network) {
-        assert!(
-            self.network.is_none(),
-            "network interrupt route was installed more than once"
-        );
-        self.network = Some((source, handler));
+    /// Registers one of the network device's interrupt messages.
+    ///
+    /// A device with per-queue vectors installs several: each queue
+    /// pair's own message, delivered to that pair's processor, plus the
+    /// configuration-change message. A device with a single interrupt
+    /// line installs exactly one.
+    pub fn add_network(&mut self, source: Source, handler: Network) {
+        let slot = self
+            .network
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .unwrap_or_else(|| {
+                panic!("more than {MAX_NETWORK_INTERRUPTS} network interrupt routes were installed")
+            });
+        *slot = Some((source, handler));
     }
 
     pub fn set_host_fs(&mut self, source: Source, handler: HostFs) {
@@ -117,8 +135,10 @@ where
     /// context in the message.
     #[must_use]
     pub fn route(&self, source: Source) -> bool {
-        if dispatch(&self.network, source)
-            || dispatch(&self.host_fs, source)
+        if self.network.iter().any(|slot| dispatch(slot, source)) {
+            return true;
+        }
+        if dispatch(&self.host_fs, source)
             || dispatch(&self.entropy, source)
             || dispatch(&self.balloon, source)
             || dispatch(&self.vsock, source)
@@ -126,6 +146,39 @@ where
             return true;
         }
         self.block.iter().any(|slot| dispatch(slot, source))
+    }
+}
+
+/// Pulls the owner of every queue that made progress out of its idle
+/// park, skipping the processor already running the handler.
+///
+/// A device queue is drained by the processor whose shard owns it, so
+/// its completions are only useful to that processor. A transport with
+/// one interrupt line delivers them somewhere else, and this is the
+/// hand-off; a transport with per-queue vectors delivers them to the
+/// right processor already and never calls this.
+///
+/// # SMP contract
+///
+/// Called from interrupt context on any processor. It takes no locks
+/// and allocates nothing; `Cpu::wake_processor` is the only thing it
+/// does, once per queue, and never for the processor it runs on.
+pub fn wake_queue_owners<CpuImpl: Cpu>(cpu: &CpuImpl, queues: impl Iterator<Item = usize>) {
+    let current = cpu.current_processor();
+    let processors = cpu.processor_count();
+    for queue in queues {
+        // A queue beyond the processor count belongs to no shard: the
+        // service sizes its shard set to the processors it has.
+        if queue >= processors {
+            continue;
+        }
+        let owner = ProcessorId::new(
+            u16::try_from(queue)
+                .unwrap_or_else(|_| panic!("queue {queue} exceeds the processor id range")),
+        );
+        if owner != current {
+            cpu.wake_processor(owner);
+        }
     }
 }
 
@@ -156,5 +209,50 @@ where
 {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use helios_hal::cpu::ProcessorId;
+
+    use crate::test_support::RecordingSmpCpu;
+
+    /// A single-line transport notices every queue's completions on one
+    /// processor, so the hand-off is an IPI to each owner — and never to
+    /// the processor already running the handler, which is about to
+    /// drain its own queue anyway.
+    #[test]
+    fn only_foreign_queue_owners_are_woken() {
+        let cpu = RecordingSmpCpu::new(1, 4);
+
+        super::wake_queue_owners(&cpu, [0usize, 1, 3].into_iter());
+
+        assert_eq!(
+            cpu.woken(),
+            alloc::vec![ProcessorId::new(0), ProcessorId::new(3)],
+            "queue 1 belongs to this processor and costs no IPI"
+        );
+    }
+
+    /// A device may expose more queues than the machine has processors;
+    /// the shard set is sized to the processors, so a queue past that
+    /// belongs to nobody.
+    #[test]
+    fn a_queue_without_a_processor_is_not_woken() {
+        let cpu = RecordingSmpCpu::new(0, 2);
+
+        super::wake_queue_owners(&cpu, [1usize, 2, 7].into_iter());
+
+        assert_eq!(cpu.woken(), alloc::vec![ProcessorId::new(1)]);
+    }
+
+    #[test]
+    fn nothing_to_wake_costs_no_ipi() {
+        let cpu = RecordingSmpCpu::new(0, 4);
+
+        super::wake_queue_owners(&cpu, core::iter::empty());
+
+        assert!(cpu.woken().is_empty());
     }
 }

@@ -15,11 +15,18 @@ type Aarch64VirtioNetDevice = helios_virtio::VirtioNetDevice<Aarch64VirtioNetTra
 #[derive(Clone)]
 pub(crate) struct VirtioNetworkDevice {
     inner: Arc<Aarch64VirtioNetDevice>,
+    /// Held so the interrupt handler can steer by IPI.
+    ///
+    /// The device tree routes this device's single SPI to one
+    /// processor, so every queue pair's completions are noticed there
+    /// whichever processor owns them. Waking the owners is the only
+    /// steering a single-line transport can do.
+    cpu: crate::Aarch64Cpu,
 }
 
 impl ExternalInterruptHandler for VirtioNetworkDevice {
     fn handle_interrupt(&self) {
-        self.inner.handle_interrupt();
+        helios_kernel::wake_queue_owners(&self.cpu, self.inner.handle_interrupt().iter());
     }
 }
 
@@ -42,7 +49,7 @@ pub(crate) fn install<WatchdogImpl>(
 where
     WatchdogImpl: Watchdog + Clone,
 {
-    let Some(network) = discover_network_device(fdt, physical_memory_offset, handoff) else {
+    let Some(network) = discover_network_device(cpu, fdt, physical_memory_offset, handoff) else {
         tracing::warn!("virtio network device was not discovered on the platform bus");
         return None;
     };
@@ -162,9 +169,18 @@ impl NetworkDevice for VirtioNetworkDevice {
     async fn wait_for_event(&self) {
         self.inner.wait_for_interrupt().await;
     }
+
+    async fn wait_for_event_on(&self, queue_idx: usize) {
+        self.inner.wait_for_interrupt_on(queue_idx).await;
+    }
+
+    fn queue_interrupts(&self, queue_idx: usize) -> u64 {
+        self.inner.queue_interrupts(queue_idx)
+    }
 }
 
 fn discover_network_device(
+    cpu: &crate::Aarch64Cpu,
     fdt: &Fdt<'_>,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
@@ -182,6 +198,7 @@ fn discover_network_device(
         interrupt,
         trigger,
         device: init_network_device(
+            cpu,
             candidate.base,
             candidate.size,
             physical_memory_offset,
@@ -191,6 +208,7 @@ fn discover_network_device(
 }
 
 fn init_network_device(
+    cpu: &crate::Aarch64Cpu,
     physical_base: usize,
     size: usize,
     physical_memory_offset: usize,
@@ -208,5 +226,6 @@ fn init_network_device(
         });
     VirtioNetworkDevice {
         inner: Arc::new(device),
+        cpu: *cpu,
     }
 }

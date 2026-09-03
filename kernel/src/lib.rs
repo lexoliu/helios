@@ -102,10 +102,10 @@ pub use io::{
     BlockInstallError, BlockSelfCheckError, BlockService, BlockStats, ByteReadWait, ByteReader,
     ByteWriteWait, ByteWriter, ClosedPeer, ExternalInterruptHandler, ExternalInterruptRoutes,
     IommuDomains, IommuEndpointStats, IommuReport, IommuStats, MAX_BLOCK_DEVICES,
-    MAX_IOMMU_ENDPOINTS, PollKey, PollRegistration, PollRegistry, PollRegistryError,
-    PollSourceKind, RecordingConsole, SCRATCH_DISK_SERIAL, SerialReader, TryRead, TryWrite,
-    byte_channel, emit_serial_error_marker, emit_serial_stage_marker, install_block_devices,
-    read_serial, try_read_serial, write_serial,
+    MAX_IOMMU_ENDPOINTS, MAX_NETWORK_INTERRUPTS, PollKey, PollRegistration, PollRegistry,
+    PollRegistryError, PollSourceKind, RecordingConsole, SCRATCH_DISK_SERIAL, SerialReader,
+    TryRead, TryWrite, byte_channel, emit_serial_error_marker, emit_serial_stage_marker,
+    install_block_devices, read_serial, try_read_serial, wake_queue_owners, write_serial,
 };
 pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
@@ -126,8 +126,9 @@ pub use network::{
     HttpRequestOptionsError, HttpResponse, HttpResponseHead, HttpScheme, HttpSyntaxError,
     HttpSyntaxKind, HttpTlsAlertReceivedPayload, Ipv4Cidr, Ipv4Route, MacAddress,
     NetworkAdminBackend, NetworkBridgeRequest, NetworkBridgeSecurity, NetworkControl,
-    NetworkControlError, NetworkPortId, NetworkService, SocketStack, TcpListenerId, TcpStreamId,
-    UdpSocketId, validate_http_authority, validate_http_path_with_query, validate_http_status_code,
+    NetworkControlError, NetworkPortId, NetworkQueueStats, NetworkService, NetworkStats,
+    SocketStack, TcpListenerId, TcpStreamId, UdpSocketId, validate_http_authority,
+    validate_http_path_with_query, validate_http_status_code,
 };
 pub use process::{
     ClockAuthorityRights, DescriptorEntry, DescriptorId, DescriptorTable, DescriptorTableError,

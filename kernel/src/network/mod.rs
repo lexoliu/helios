@@ -24,5 +24,7 @@ pub use http::{
     HttpSyntaxKind, HttpTlsAlertReceivedPayload, validate_http_authority,
     validate_http_path_with_query, validate_http_status_code,
 };
-pub use service::{NetworkService, TcpListenerId, TcpStreamId, UdpSocketId};
+pub use service::{
+    NetworkQueueStats, NetworkService, NetworkStats, TcpListenerId, TcpStreamId, UdpSocketId,
+};
 pub use socket_stack::SocketStack;
