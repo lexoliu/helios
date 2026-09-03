@@ -1,5 +1,5 @@
+use crate::platform::PlatformDescription;
 use arm_gic::{IntId, Trigger};
-use fdt::Fdt;
 use helios_hal::io::IoError;
 use helios_hal::watchdog::Watchdog;
 use helios_kernel::{
@@ -41,7 +41,7 @@ pub(crate) struct NetworkInterrupt {
 pub(crate) fn install<WatchdogImpl>(
     cpu: &crate::Aarch64Cpu,
     kernel: &Kernel<crate::Aarch64Cpu, WatchdogImpl>,
-    fdt: &Fdt<'_>,
+    platform: &PlatformDescription,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
     debug_state: &crate::debug_state::RuntimeState,
@@ -49,7 +49,8 @@ pub(crate) fn install<WatchdogImpl>(
 where
     WatchdogImpl: Watchdog + Clone,
 {
-    let Some(network) = discover_network_device(cpu, fdt, physical_memory_offset, handoff) else {
+    let Some(network) = discover_network_device(cpu, platform, physical_memory_offset, handoff)
+    else {
         tracing::warn!("virtio network device was not discovered on the platform bus");
         return None;
     };
@@ -70,8 +71,8 @@ where
     Some(network)
 }
 
-pub(crate) fn has_network_device(fdt: &Fdt<'_>) -> bool {
-    crate::count_virtio_mmio_devices(fdt, helios_virtio::DeviceType::Network) != 0
+pub(crate) fn has_network_device(platform: &PlatformDescription) -> bool {
+    crate::count_virtio_mmio_devices(platform, helios_virtio::DeviceType::Network) != 0
 }
 
 impl NetworkDevice for VirtioNetworkDevice {
@@ -181,26 +182,25 @@ impl NetworkDevice for VirtioNetworkDevice {
 
 fn discover_network_device(
     cpu: &crate::Aarch64Cpu,
-    fdt: &Fdt<'_>,
+    platform: &PlatformDescription,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
 ) -> Option<NetworkInterrupt> {
-    let candidate = helios_virtio::mmio_candidates(fdt).find(|candidate| {
-        crate::matches_virtio_mmio_device(
-            candidate.base,
-            physical_memory_offset,
-            handoff,
-            helios_virtio::DeviceType::Network,
-        )
-    })?;
-    let (interrupt, trigger) = crate::gic::device_interrupt(candidate.interrupt, candidate.base);
+    let candidate = crate::virtio_slots(
+        platform,
+        physical_memory_offset,
+        handoff,
+        helios_virtio::DeviceType::Network,
+    )
+    .next()?;
+    let (interrupt, trigger) = (candidate.interrupt.intid(), candidate.interrupt.trigger);
     Some(NetworkInterrupt {
         interrupt,
         trigger,
         device: init_network_device(
             cpu,
-            candidate.base,
-            candidate.size,
+            candidate.region.base,
+            candidate.region.size,
             physical_memory_offset,
             handoff,
         ),

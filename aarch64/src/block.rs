@@ -13,8 +13,8 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+use crate::platform::PlatformDescription;
 use arm_gic::{IntId, Trigger};
-use fdt::Fdt;
 use helios_hal::fs::BlockDeviceRights;
 use helios_kernel::ExternalInterruptHandler;
 
@@ -45,8 +45,8 @@ impl ExternalInterruptHandler for VirtioBlockDevice {
     }
 }
 
-pub(crate) fn count_block_devices(fdt: &Fdt<'_>) -> usize {
-    crate::count_virtio_mmio_devices(fdt, helios_virtio::DeviceType::Block)
+pub(crate) fn count_block_devices(platform: &PlatformDescription) -> usize {
+    crate::count_virtio_mmio_devices(platform, helios_virtio::DeviceType::Block)
 }
 
 /// Brings up every block device on the platform bus and hands them to
@@ -54,7 +54,7 @@ pub(crate) fn count_block_devices(fdt: &Fdt<'_>) -> usize {
 pub(crate) fn install<WatchdogImpl>(
     cpu: &Aarch64Cpu,
     kernel: &helios_kernel::Kernel<Aarch64Cpu, WatchdogImpl>,
-    fdt: &Fdt<'_>,
+    platform: &PlatformDescription,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
     debug_state: &RuntimeState,
@@ -63,7 +63,7 @@ pub(crate) fn install<WatchdogImpl>(
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
 {
-    let discovered = discover_block_devices(cpu, fdt, physical_memory_offset, handoff);
+    let discovered = discover_block_devices(cpu, platform, physical_memory_offset, handoff);
     let devices = discovered
         .iter()
         .map(|interrupt| interrupt.device.inner.clone())
@@ -80,52 +80,47 @@ where
 
 fn discover_block_devices(
     cpu: &Aarch64Cpu,
-    fdt: &Fdt<'_>,
+    platform: &PlatformDescription,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
 ) -> Vec<BlockInterrupt> {
-    helios_virtio::mmio_candidates(fdt)
-        .filter(|candidate| {
-            crate::matches_virtio_mmio_device(
-                candidate.base,
-                physical_memory_offset,
-                handoff,
-                helios_virtio::DeviceType::Block,
+    crate::virtio_slots(
+        platform,
+        physical_memory_offset,
+        handoff,
+        helios_virtio::DeviceType::Block,
+    )
+    .map(|candidate| {
+        let (interrupt, trigger) = (candidate.interrupt.intid(), candidate.interrupt.trigger);
+        assert!(
+            candidate.region.size != 0,
+            "AArch64 virtio-blk node has zero MMIO size"
+        );
+        crate::map_mmio_page(candidate.region.base, physical_memory_offset, handoff);
+        let virtual_base = crate::mmio_virtual_base(candidate.region.base, physical_memory_offset);
+        let header = core::ptr::NonNull::new(virtual_base as *mut u8)
+            .unwrap_or_else(|| panic!("virtio MMIO base {virtual_base:#x} was unexpectedly null"));
+        let dma = helios_virtio::OffsetDmaPool::new(physical_memory_offset);
+        let device = unsafe {
+            helios_virtio::block_from_mmio_with_dma(
+                header,
+                candidate.region.size,
+                dma,
+                *cpu,
+                BlockDeviceRights::READ | BlockDeviceRights::WRITE,
             )
-        })
-        .map(|candidate| {
-            let (interrupt, trigger) =
-                crate::gic::device_interrupt(candidate.interrupt, candidate.base);
-            assert!(
-                candidate.size != 0,
-                "AArch64 virtio-blk node has zero MMIO size"
-            );
-            crate::map_mmio_page(candidate.base, physical_memory_offset, handoff);
-            let virtual_base = crate::mmio_virtual_base(candidate.base, physical_memory_offset);
-            let header = core::ptr::NonNull::new(virtual_base as *mut u8).unwrap_or_else(|| {
-                panic!("virtio MMIO base {virtual_base:#x} was unexpectedly null")
-            });
-            let dma = helios_virtio::OffsetDmaPool::new(physical_memory_offset);
-            let device = unsafe {
-                helios_virtio::block_from_mmio_with_dma(
-                    header,
-                    candidate.size,
-                    dma,
-                    *cpu,
-                    BlockDeviceRights::READ | BlockDeviceRights::WRITE,
-                )
-            }
-            .unwrap_or_else(|error| {
-                panic!(
-                    "failed to initialize virtio-blk device at {:#x}: {error}",
-                    candidate.base
-                )
-            });
-            BlockInterrupt {
-                interrupt,
-                trigger,
-                device: VirtioBlockDevice { inner: device },
-            }
-        })
-        .collect()
+        }
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to initialize virtio-blk device at {:#x}: {error}",
+                candidate.region.base
+            )
+        });
+        BlockInterrupt {
+            interrupt,
+            trigger,
+            device: VirtioBlockDevice { inner: device },
+        }
+    })
+    .collect()
 }

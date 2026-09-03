@@ -38,9 +38,22 @@ pub struct BootKernelImage {
     pub size: u64,
 }
 
+/// Where the bootloader left the firmware's own descriptions of the
+/// machine, for whichever of them this firmware publishes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BootFirmwareTables {
+    /// Physical address of the ACPI root pointer.
+    ///
+    /// Physical rather than mapped, because an ACPI table walk follows
+    /// physical addresses out of the tables themselves and has to map
+    /// each one the same way; handing it a pre-mapped root would make
+    /// the root the one address that is translated differently.
     pub acpi_rsdp: Option<usize>,
+    /// Address of the flattened device tree, mapped and readable.
+    ///
+    /// Unlike ACPI, a device tree is one self-contained blob: nothing
+    /// in it is reached by physical address, so the only thing a reader
+    /// needs is somewhere to read it from.
     pub device_tree_blob: Option<usize>,
 }
 

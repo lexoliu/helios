@@ -35,6 +35,7 @@ pub use bus::{
 };
 pub use discovery::{
     InterruptTrigger, MmioCandidate, MmioInterrupt, mmio_candidates, mmio_device_matches,
+    node_interrupt,
 };
 pub use features::{NegotiatedFeatures, RING_FEATURES, negotiate, negotiate_with};
 pub use iommu::{MAX_RESERVED_REGIONS, ReservedRegion, VirtioIommuDevice};

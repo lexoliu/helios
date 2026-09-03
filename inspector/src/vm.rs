@@ -193,6 +193,9 @@ struct VmProfile {
     host_share: Option<VmHostShareProfile>,
     watchdog: Option<VmWatchdogProfile>,
     entropy: VmEntropyProfile,
+    /// The `-machine` option list that makes this machine publish ACPI
+    /// tables instead of a device tree, when it can publish both.
+    acpi_machine: Option<&'static str>,
     /// The translation unit this machine can put its virtio devices
     /// behind, if any.
     iommu: Option<VmIommuProfile>,
@@ -202,11 +205,17 @@ struct VmProfile {
     vsock: VmVsockProfile,
 }
 
-/// The aarch64 platform is device-tree only: the kernel reads the GIC
-/// register windows and every virtio device's interrupt from the FDT,
-/// and the EDK2 build QEMU ships installs the FDT configuration table
-/// only when it is not also publishing ACPI tables.
+/// The `virt` machine as the aarch64 kernel boots it by default: EDK2
+/// installs the FDT configuration table only when it is not also
+/// publishing ACPI tables, so the device-tree description needs ACPI
+/// turned off.
 const AARCH64_VIRT_MACHINE: &str = "virt,gic-version=3,acpi=off";
+
+/// The same machine publishing ACPI tables instead, which is what
+/// `--acpi` selects and what every Arm server platform looks like. The
+/// kernel then takes its whole description from the MADT, the SPCR and
+/// the DSDT.
+const AARCH64_VIRT_ACPI_MACHINE: &str = "virt,gic-version=3,acpi=on";
 
 const AARCH64_VIRT_HVF_PROFILE: VmProfile = VmProfile {
     arch: VmArch::Aarch64,
@@ -230,6 +239,7 @@ const AARCH64_VIRT_HVF_PROFILE: VmProfile = VmProfile {
     // The virtio devices of the `virt` machines are memory-mapped, and
     // virtio-iommu translates PCI endpoints only, so there is nothing
     // here it could confine.
+    acpi_machine: Some(AARCH64_VIRT_ACPI_MACHINE),
     iommu: None,
     balloon: VmBalloonProfile::VirtioBalloonMmio,
     vsock: VmVsockProfile::VhostVsockMmio,
@@ -258,6 +268,7 @@ const AARCH64_VIRT_TCG_PROFILE: VmProfile = VmProfile {
     // The virtio devices of the `virt` machines are memory-mapped, and
     // virtio-iommu translates PCI endpoints only, so there is nothing
     // here it could confine.
+    acpi_machine: Some(AARCH64_VIRT_ACPI_MACHINE),
     iommu: None,
     balloon: VmBalloonProfile::VirtioBalloonMmio,
     vsock: VmVsockProfile::VhostVsockMmio,
@@ -285,6 +296,7 @@ const RISCV64_VM_PROFILE: VmProfile = VmProfile {
     // The virtio devices of the `virt` machines are memory-mapped, and
     // virtio-iommu translates PCI endpoints only, so there is nothing
     // here it could confine.
+    acpi_machine: None,
     iommu: None,
     balloon: VmBalloonProfile::VirtioBalloonMmio,
     vsock: VmVsockProfile::VhostVsockMmio,
@@ -309,6 +321,7 @@ const X86_64_VM_PROFILE: VmProfile = VmProfile {
     host_share: Some(VmHostShareProfile::Virtio9pPci),
     watchdog: Some(VmWatchdogProfile::I6300Esb),
     entropy: VmEntropyProfile::VirtioRngPci,
+    acpi_machine: None,
     iommu: Some(VmIommuProfile::VirtioIommuPci),
     balloon: VmBalloonProfile::VirtioBalloonPci,
     vsock: VmVsockProfile::VhostVsockPci,
@@ -457,6 +470,8 @@ pub(crate) struct VmConfigFile {
     #[serde(default)]
     pub(crate) data_disk_size: Option<u64>,
     #[serde(default)]
+    pub(crate) acpi: Option<bool>,
+    #[serde(default)]
     pub(crate) iommu: Option<bool>,
     #[serde(default)]
     pub(crate) virtio_packed: Option<bool>,
@@ -578,6 +593,12 @@ pub(crate) struct VmCommand {
     /// Keep the generated VM runtime directory after QEMU exits.
     #[arg(long, default_value_t = false)]
     keep_runtime_dir: bool,
+
+    /// Boot the guest with ACPI tables instead of a device tree, so the
+    /// kernel takes its platform description from the MADT, the SPCR
+    /// and the DSDT.
+    #[arg(long, default_value_t = false)]
+    acpi: bool,
 
     /// Put every virtio device behind a virtio-iommu, so its DMA only
     /// reaches the memory the kernel maps into its domain.
@@ -717,6 +738,7 @@ struct ResolvedVmCommand {
     no_compiler_plugin: bool,
     runtime_dir: Option<PathBuf>,
     keep_runtime_dir: bool,
+    acpi: bool,
     iommu: bool,
     virtio_devices: VirtioDeviceProfile,
     rpc_transport: VmRpcTransport,
@@ -879,6 +901,14 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
     let runtime_dir = command.runtime_dir.or(file.runtime_dir);
     let keep_runtime_dir =
         debug || command.keep_runtime_dir || file.keep_runtime_dir.unwrap_or(false);
+    let acpi = command.acpi || file.acpi.unwrap_or(false);
+    if acpi && profile.acpi_machine.is_none() {
+        bail!(
+            "--acpi is not available on {}: its machine publishes one firmware description and \
+             the kernel already takes that one",
+            arch_label(arch)
+        );
+    }
     let iommu = command.iommu || file.iommu.unwrap_or(false);
     if iommu && profile.iommu.is_none() {
         bail!(
@@ -941,6 +971,7 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
         no_compiler_plugin,
         runtime_dir,
         keep_runtime_dir,
+        acpi,
         iommu,
         virtio_devices,
         rpc_transport,
@@ -1850,7 +1881,7 @@ impl VmRuntime {
         if let Some(qmp) = qmp_endpoint(command, runtime_dir.path()) {
             qemu.arg("-qmp").arg(qmp);
         }
-        qemu.arg("-machine").arg(command.profile.machine);
+        qemu.arg("-machine").arg(machine(command));
         for accel in &command.accel {
             qemu.arg("-accel").arg(accel);
         }
@@ -2456,6 +2487,17 @@ fn configure_entropy_device(
 /// own endpoints: it publishes its request and event rings at physical
 /// addresses, so it is created without the platform-access property its
 /// endpoints carry.
+/// The `-machine` option list this session boots, which is the ACPI
+/// variant only when `--acpi` asked for it and the profile has one.
+fn machine(command: &ResolvedVmCommand) -> &'static str {
+    if command.acpi {
+        return command.profile.acpi_machine.unwrap_or_else(|| {
+            unreachable!("--acpi is refused on a machine profile that publishes no ACPI tables")
+        });
+    }
+    command.profile.machine
+}
+
 fn configure_iommu(
     qemu: &mut Command,
     iommu: Option<VmIommuProfile>,
@@ -2702,6 +2744,31 @@ mod tests {
     }
 
     #[test]
+    fn aarch64_boots_a_device_tree_unless_acpi_is_asked_for() {
+        let mut command = watchdog_test_command(VmArch::Aarch64);
+        assert_eq!(machine(&command), "virt,gic-version=3,acpi=off");
+        command.acpi = true;
+        assert_eq!(machine(&command), "virt,gic-version=3,acpi=on");
+    }
+
+    #[test]
+    fn only_the_aarch64_machines_can_publish_acpi_tables() {
+        assert_eq!(
+            AARCH64_VIRT_HVF_PROFILE.acpi_machine,
+            Some("virt,gic-version=3,acpi=on")
+        );
+        assert_eq!(
+            AARCH64_VIRT_TCG_PROFILE.acpi_machine,
+            AARCH64_VIRT_HVF_PROFILE.acpi_machine
+        );
+        // The riscv64 `virt` machine describes itself with a device
+        // tree only, and q35 with ACPI only; neither has a second
+        // description for `--acpi` to select.
+        assert_eq!(RISCV64_VM_PROFILE.acpi_machine, None);
+        assert_eq!(X86_64_VM_PROFILE.acpi_machine, None);
+    }
+
+    #[test]
     fn aarch64_profiles_are_modern_virt_only() {
         assert_eq!(AARCH64_VIRT_HVF_PROFILE.arch, VmArch::Aarch64);
         assert_eq!(
@@ -2840,6 +2907,7 @@ mod tests {
             no_compiler_plugin: false,
             runtime_dir: None,
             keep_runtime_dir: false,
+            acpi: false,
             iommu: false,
             virtio_packed: false,
             virtio_in_order: false,
@@ -2887,6 +2955,7 @@ mod tests {
             no_compiler_plugin: false,
             runtime_dir: None,
             keep_runtime_dir: false,
+            acpi: false,
             iommu: false,
             virtio_packed: false,
             virtio_in_order: false,
@@ -3012,6 +3081,7 @@ mod tests {
             no_compiler_plugin: false,
             runtime_dir: None,
             keep_runtime_dir: false,
+            acpi: false,
             iommu: false,
             virtio_packed: false,
             virtio_in_order: false,
@@ -3118,6 +3188,7 @@ mod tests {
             no_compiler_plugin: true,
             runtime_dir: None,
             keep_runtime_dir: false,
+            acpi: false,
             iommu: false,
             needs_qmp: false,
             virtio_devices: VirtioDeviceProfile::default(),
@@ -3289,6 +3360,7 @@ mod tests {
             no_compiler_plugin: false,
             runtime_dir: None,
             keep_runtime_dir: false,
+            acpi: false,
             iommu: false,
             needs_qmp: false,
             virtio_devices: VirtioDeviceProfile::default(),

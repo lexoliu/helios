@@ -10,8 +10,8 @@ extern crate alloc;
 
 use alloc::sync::Arc;
 
+use crate::platform::PlatformDescription;
 use arm_gic::{IntId, Trigger};
-use fdt::Fdt;
 use helios_kernel::ExternalInterruptHandler;
 
 type Aarch64VirtioVsockDevice = helios_virtio::VirtioVsockDevice<
@@ -42,8 +42,8 @@ impl ExternalInterruptHandler for VirtioVsockDevice {
     }
 }
 
-pub(crate) fn has_vsock_device(fdt: &Fdt<'_>) -> bool {
-    crate::count_virtio_mmio_devices(fdt, helios_virtio::DeviceType::Vsock) != 0
+pub(crate) fn has_vsock_device(platform: &PlatformDescription) -> bool {
+    crate::count_virtio_mmio_devices(platform, helios_virtio::DeviceType::Vsock) != 0
 }
 
 /// Brings up the vsock device and publishes it as the machine's host
@@ -51,7 +51,7 @@ pub(crate) fn has_vsock_device(fdt: &Fdt<'_>) -> bool {
 pub(crate) fn install<WatchdogImpl>(
     kernel: &helios_kernel::Kernel<crate::Aarch64Cpu, WatchdogImpl>,
     cpu: &crate::Aarch64Cpu,
-    fdt: &Fdt<'_>,
+    platform: &PlatformDescription,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
     debug_state: &crate::debug_state::RuntimeState,
@@ -59,7 +59,7 @@ pub(crate) fn install<WatchdogImpl>(
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
 {
-    let vsock = discover_vsock_device(fdt, physical_memory_offset, handoff)?;
+    let vsock = discover_vsock_device(platform, physical_memory_offset, handoff)?;
     let service = helios_kernel::install_vsock_device(kernel, cpu, vsock.device.device.clone());
     let guest_cid = service.guest_cid();
     debug_state.install_vsock_service(helios_kernel::ComponentHostVsockService::from_service(
@@ -74,35 +74,35 @@ where
 }
 
 fn discover_vsock_device(
-    fdt: &Fdt<'_>,
+    platform: &PlatformDescription,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
 ) -> Option<VsockInterrupt> {
-    let candidate = helios_virtio::mmio_candidates(fdt).find(|candidate| {
-        crate::matches_virtio_mmio_device(
-            candidate.base,
-            physical_memory_offset,
-            handoff,
-            helios_virtio::DeviceType::Vsock,
-        )
-    })?;
-    let (interrupt, trigger) = crate::gic::device_interrupt(candidate.interrupt, candidate.base);
+    let candidate = crate::virtio_slots(
+        platform,
+        physical_memory_offset,
+        handoff,
+        helios_virtio::DeviceType::Vsock,
+    )
+    .next()?;
+    let (interrupt, trigger) = (candidate.interrupt.intid(), candidate.interrupt.trigger);
     assert!(
-        candidate.size != 0,
+        candidate.region.size != 0,
         "AArch64 virtio-vsock node has zero MMIO size"
     );
-    crate::map_mmio_page(candidate.base, physical_memory_offset, handoff);
-    let virtual_base = crate::mmio_virtual_base(candidate.base, physical_memory_offset);
+    crate::map_mmio_page(candidate.region.base, physical_memory_offset, handoff);
+    let virtual_base = crate::mmio_virtual_base(candidate.region.base, physical_memory_offset);
     let header = core::ptr::NonNull::new(virtual_base as *mut u8)
         .unwrap_or_else(|| panic!("virtio MMIO base {virtual_base:#x} was unexpectedly null"));
     let dma = helios_virtio::OffsetDmaPool::new(physical_memory_offset);
-    let device = unsafe { helios_virtio::vsock_from_mmio_with_dma(header, candidate.size, dma) }
-        .unwrap_or_else(|error| {
-            panic!(
-                "failed to initialize virtio-vsock device at {:#x}: {error}",
-                candidate.base
-            )
-        });
+    let device =
+        unsafe { helios_virtio::vsock_from_mmio_with_dma(header, candidate.region.size, dma) }
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to initialize virtio-vsock device at {:#x}: {error}",
+                    candidate.region.base
+                )
+            });
     Some(VsockInterrupt {
         interrupt,
         trigger,
