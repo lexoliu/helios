@@ -33,7 +33,8 @@ impl LatencySamples {
     }
 
     pub fn record(&mut self, elapsed: Duration) {
-        let nanos = u64::try_from(elapsed.as_nanos()).expect("latency sample exceeds u64 nanoseconds");
+        let nanos =
+            u64::try_from(elapsed.as_nanos()).expect("latency sample exceeds u64 nanoseconds");
         self.nanos.push(nanos);
     }
 
@@ -59,7 +60,10 @@ impl LatencySamples {
         report_metric(&format!("{prefix}_max_us"), micros(self.percentile(100)));
         let total: u128 = self.nanos.iter().map(|&nanos| u128::from(nanos)).sum();
         let mean = total / self.nanos.len() as u128;
-        report_metric(&format!("{prefix}_mean_us"), micros(u64::try_from(mean).expect("mean fits u64")));
+        report_metric(
+            &format!("{prefix}_mean_us"),
+            micros(u64::try_from(mean).expect("mean fits u64")),
+        );
     }
 
     /// Nearest-rank percentile over the sorted samples.
