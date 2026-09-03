@@ -1453,23 +1453,21 @@ fn tap_setup_plan(
     command: &NetSetupCommand,
     ifname: &str,
     bridge: &str,
-    vhost_net: VhostNet,
 ) -> Result<Vec<PrivilegedCommand>, VmNetworkSetupError> {
     let (uid, gid) = invoking_credentials();
     let mut plan = Vec::new();
     // The queues are served by vhost-net threads, so the node has to be
     // this account's to open, the same way the tap below is created
-    // owned by it. udev creates the node root:kvm 0660 when the module
-    // loads, which no plain account can open.
-    let hand_over_vhost_net = || PrivilegedCommand::new("chmod", ["0666", VHOST_NET_DEVICE]);
-    match vhost_net {
-        VhostNet::Usable => {}
-        VhostNet::Unusable(_) => plan.push(hand_over_vhost_net()),
-        VhostNet::Missing => {
-            plan.push(PrivilegedCommand::new("modprobe", ["vhost_net"]));
-            plan.push(hand_over_vhost_net());
-        }
-    }
+    // owned by it. The steps are unconditional because a probe cannot
+    // be trusted here: udev keeps a static node for the device before
+    // the module is loaded, the first open autoloads the module, and the
+    // device event that follows re-applies udev's root:kvm 0660 rule
+    // over anything done to the node earlier. Loading the module first
+    // and letting udev finish with the event makes the chmod the last
+    // word.
+    plan.push(PrivilegedCommand::new("modprobe", ["vhost_net"]));
+    plan.push(PrivilegedCommand::new("udevadm", ["settle"]));
+    plan.push(PrivilegedCommand::new("chmod", ["0666", VHOST_NET_DEVICE]));
     if !interface_exists(bridge) {
         plan.push(PrivilegedCommand::new(
             "ip",
@@ -1638,15 +1636,16 @@ pub(crate) fn run_setup(command: NetSetupCommand) -> Result<(), VmNetworkSetupEr
         return Err(VmNetworkSetupError::ExistingTapNotMultiQueue { ifname });
     }
     let elevate = !is_root();
-    let plan = tap_setup_plan(&command, &ifname, &bridge, VhostNet::probe())?;
+    let plan = tap_setup_plan(&command, &ifname, &bridge)?;
     execute_plan(&plan, elevate, command.dry_run)?;
     if command.dry_run {
         return Ok(());
     }
 
     // Proven the same way QEMU will use it, so a module that loaded
-    // without creating the node, or a chmod udev raced, fails here and
-    // not as a QEMU assertion after the kernel build.
+    // without creating the node, or a udev rule that still won over the
+    // chmod, fails here and not as a QEMU assertion after the kernel
+    // build.
     match VhostNet::probe() {
         VhostNet::Usable => {}
         VhostNet::Unusable(source) => {
@@ -2271,13 +2270,20 @@ mod tests {
             dhcp: true,
             dry_run: true,
         };
-        let plan = tap_setup_plan(&command, "helios0", "helios-br0", VhostNet::Missing)
+        let plan = tap_setup_plan(&command, "helios0", "helios-br0")
             .expect("a fully specified tap plan builds");
         let rendered: Vec<String> = plan.iter().map(|step| step.display(true)).collect();
-        // A host without the module gets it loaded and its node handed to
-        // this account before the tap that depends on it is created.
-        assert_eq!(rendered[0], "sudo modprobe vhost_net");
-        assert_eq!(rendered[1], "sudo chmod 0666 /dev/vhost-net");
+        // The vhost-net node is handed to this account only after the
+        // module is loaded and udev has finished applying its own rule,
+        // and before the tap that depends on it is created.
+        assert_eq!(
+            &rendered[..3],
+            [
+                "sudo modprobe vhost_net",
+                "sudo udevadm settle",
+                "sudo chmod 0666 /dev/vhost-net",
+            ]
+        );
         assert!(rendered.iter().any(|step| {
             step.starts_with("sudo ip tuntap add dev helios0 mode tap multi_queue user ")
         }));
