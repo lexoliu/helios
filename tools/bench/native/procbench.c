@@ -194,8 +194,6 @@ static void startup(uint64_t count, char **child_argv) {
     samples_report(&samples, "first_output");
     printf("bench.batch_ms=%.3f\n", (double)batch_elapsed / 1e6);
     printf("bench.memory_per_instance_bytes=%llu\n", (unsigned long long)(resident_total / count));
-    printf("bench.live_instances=%llu\n", (unsigned long long)count);
-    printf("bench.instance_memory_bytes=%llu\n", (unsigned long long)(resident_total / count));
 }
 
 static void spawn_wait(uint64_t count, char **child_argv) {

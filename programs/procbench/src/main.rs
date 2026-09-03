@@ -23,7 +23,7 @@ use std::time::Instant;
 
 use helios_api::channel;
 use helios_api::programs::{self, Child, ExecRequest, SpawnRequest};
-use helios_api::{instances, stats, task};
+use helios_api::{stats, task};
 use helios_bench_metrics::{LatencySamples, mib_per_second, report_metric};
 use thiserror::Error;
 
@@ -167,7 +167,8 @@ async fn startup(count: u64, child: ChildSpec) -> Result<(), ProcbenchError> {
     }
     drop(tx);
 
-    let mut samples = LatencySamples::with_capacity(usize::try_from(count).expect("count fits usize"));
+    let mut samples =
+        LatencySamples::with_capacity(usize::try_from(count).expect("count fits usize"));
     let mut children = Vec::with_capacity(usize::try_from(count).expect("count fits usize"));
     for _ in 0..count {
         let (child, elapsed) = rx.recv().await.map_err(|_| ProcbenchError::WorkerLost)??;
@@ -177,19 +178,12 @@ async fn startup(count: u64, child: ChildSpec) -> Result<(), ProcbenchError> {
     let batch_elapsed = batch_started.elapsed();
 
     // Every child is alive and blocked on stdin here, so the difference in
-    // available memory is what the batch costs the kernel.
+    // available memory is what the batch costs the kernel. The per-instance
+    // registry (`helios:system/instances`) is not consulted: it belongs to
+    // the privileged debugger world, and the batch is proven alive by
+    // construction, since every child has written its first line and none
+    // has had its stdin closed yet.
     let memory_after = stats::snapshot().memory.available_bytes;
-    let child_name = child.name();
-    let live = instances::snapshot();
-    let instance_memory: u64 = live
-        .iter()
-        .filter(|instance| instance.name == child_name)
-        .map(|instance| instance.memory_bytes)
-        .sum();
-    let instance_count = live
-        .iter()
-        .filter(|instance| instance.name == child_name)
-        .count() as u64;
 
     for handle in children {
         // Closing stdin releases a `hello hold` child; the batch is
@@ -206,15 +200,13 @@ async fn startup(count: u64, child: ChildSpec) -> Result<(), ProcbenchError> {
 
     println!("instance-startup:{count}");
     samples.report("first_output");
-    report_metric("batch_ms", format!("{:.3}", batch_elapsed.as_secs_f64() * 1_000.0));
+    report_metric(
+        "batch_ms",
+        format!("{:.3}", batch_elapsed.as_secs_f64() * 1_000.0),
+    );
     report_metric(
         "memory_per_instance_bytes",
         memory_before.saturating_sub(memory_after) / count,
-    );
-    report_metric("live_instances", instance_count);
-    report_metric(
-        "instance_memory_bytes",
-        if instance_count == 0 { 0 } else { instance_memory / instance_count },
     );
     Ok(())
 }
@@ -251,7 +243,8 @@ async fn wait_child(child: Child, path: &str) -> Result<(), ProcbenchError> {
 }
 
 async fn spawn_wait(count: u64, child: ChildSpec) -> Result<(), ProcbenchError> {
-    let mut samples = LatencySamples::with_capacity(usize::try_from(count).expect("count fits usize"));
+    let mut samples =
+        LatencySamples::with_capacity(usize::try_from(count).expect("count fits usize"));
     for _ in 0..count {
         let started = Instant::now();
         let result = programs::exec(ExecRequest {
@@ -289,7 +282,8 @@ async fn pingpong(rounds: u64, bytes: u64, child: ChildSpec) -> Result<(), Procb
     let stdin_done = handle.pipe_stdin(reader);
     let (mut stdout, _completion) = handle.stdout();
 
-    let mut samples = LatencySamples::with_capacity(usize::try_from(rounds).expect("rounds fit usize"));
+    let mut samples =
+        LatencySamples::with_capacity(usize::try_from(rounds).expect("rounds fit usize"));
     let mut pending = Vec::with_capacity(message_len);
     for round in 0..rounds {
         let message: Vec<u8> = (0..message_len)
@@ -345,7 +339,9 @@ async fn stream(total: u64, child: ChildSpec) -> Result<(), ProcbenchError> {
             }
             let len = usize::try_from((total - written).min(STREAM_CHUNK_BYTES as u64))
                 .expect("chunk fits usize");
-            let chunk: Vec<u8> = (0..len).map(|index| (written as usize + index) as u8).collect();
+            let chunk: Vec<u8> = (0..len)
+                .map(|index| (written as usize + index) as u8)
+                .collect();
             let unwritten = writer.write_all(chunk).await;
             if !unwritten.is_empty() {
                 break Err(ProcbenchError::StdinClosed { written, total });
