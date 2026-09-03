@@ -930,28 +930,50 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             .checked_add(max_frame_len)
             .ok_or(IoError::DeviceFault)?;
 
-        let pair_count = if features.device(NET_FEATURE_MQ) {
-            let device_max = read_max_virtqueue_pairs(&transport);
-            device_max.clamp(1, NET_MAX_QUEUE_PAIRS)
+        // The most pairs worth bringing up. `max_virtqueue_pairs` is a
+        // ceiling the device advertises, not a promise that every pair
+        // below it is present and usable: a device whose host packet
+        // path offers fewer queues than the configuration space
+        // advertises reports queue size zero for the pairs it does not
+        // have, and the spec has the driver use the ones it finds and
+        // tell the device the number over the control queue.
+        let advertised_pairs = if features.device(NET_FEATURE_MQ) {
+            read_max_virtqueue_pairs(&transport).clamp(1, NET_MAX_QUEUE_PAIRS)
         } else {
             1
         };
-        if pair_count == 0 {
-            return Err(IoError::Unsupported);
-        }
 
-        let mut queue_pairs: Vec<NetQueuePair<T>> = Vec::with_capacity(usize::from(pair_count));
-        for pair_idx in 0..pair_count {
+        let mut queue_pairs: Vec<NetQueuePair<T>> =
+            Vec::with_capacity(usize::from(advertised_pairs));
+        for pair_idx in 0..advertised_pairs {
             let rx_queue_index = rx_queue_index(pair_idx);
             let tx_queue_index = tx_queue_index(pair_idx);
             let rx_queue_size = transport.queue_max_size(rx_queue_index).min(NET_QUEUE_SIZE);
             let tx_queue_size = transport.queue_max_size(tx_queue_index).min(NET_QUEUE_SIZE);
-            if rx_queue_size == 0
-                || tx_queue_size == 0
-                || !rx_queue_size.is_power_of_two()
-                || !tx_queue_size.is_power_of_two()
-            {
-                return Err(IoError::Unsupported);
+            if rx_queue_size == 0 || tx_queue_size == 0 {
+                // Multiqueue is optional in both directions. Refusing the
+                // whole device here would leave a working single-pair NIC
+                // unusable because its ceiling was optimistic.
+                if pair_idx == 0 {
+                    return Err(IoError::InvalidDeviceConfig(
+                        "virtio-net function presents no receive or transmit queue",
+                    ));
+                }
+                tracing::warn!(
+                    advertised_pairs,
+                    usable_pairs = pair_idx,
+                    "virtio-net advertised more queue pairs than it presents; \
+                     bringing up the pairs that exist"
+                );
+                break;
+            }
+            if !rx_queue_size.is_power_of_two() || !tx_queue_size.is_power_of_two() {
+                // A ring length that is not a power of two has no valid
+                // wrap, so this is the device model being wrong rather
+                // than a capability the driver can do without.
+                return Err(IoError::InvalidDeviceConfig(
+                    "virtio-net queue size is not a power of two",
+                ));
             }
 
             let mut rx_queue = VirtQueue::new(
@@ -1062,24 +1084,36 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             };
             let ctrl_index = control_queue_index(device_max);
             let ctrl_size = transport.queue_max_size(ctrl_index).min(NET_QUEUE_SIZE);
-            if ctrl_size != 0 && ctrl_size.is_power_of_two() {
-                let queue = VirtQueue::new(
-                    &transport,
-                    ctrl_index,
-                    ctrl_size,
-                    CONTROL_CHAIN_LIMIT,
-                    features,
-                )?;
-                let cmd_buffer = vec![0u8; CTRL_CMD_MAX_BYTES].into_boxed_slice();
-                let ack_buffer = vec![0u8; 1].into_boxed_slice();
-                Some(SpinMutex::new(NetControlState {
-                    queue,
-                    cmd_buffer,
-                    ack_buffer,
-                }))
-            } else {
-                None
+            // The driver has already told the device it accepted
+            // `CTRL_VQ`, so a control queue that cannot be brought up is
+            // a device that disagrees with its own feature bits. Leaving
+            // the slot empty here used to defer the failure to the first
+            // command, where it surfaced as a bare "operation is not
+            // supported" with nothing naming the queue (issue #91).
+            if ctrl_size == 0 {
+                return Err(IoError::InvalidDeviceConfig(
+                    "virtio-net offered the control queue but presents no queue at its index",
+                ));
             }
+            if !ctrl_size.is_power_of_two() {
+                return Err(IoError::InvalidDeviceConfig(
+                    "virtio-net control queue size is not a power of two",
+                ));
+            }
+            let queue = VirtQueue::new(
+                &transport,
+                ctrl_index,
+                ctrl_size,
+                CONTROL_CHAIN_LIMIT,
+                features,
+            )?;
+            let cmd_buffer = vec![0u8; CTRL_CMD_MAX_BYTES].into_boxed_slice();
+            let ack_buffer = vec![0u8; 1].into_boxed_slice();
+            Some(SpinMutex::new(NetControlState {
+                queue,
+                cmd_buffer,
+                ack_buffer,
+            }))
         } else {
             None
         };
@@ -2351,6 +2385,7 @@ mod tests {
     };
     use crate::testing::{FakeTransport, FakeTransportConfig};
     use crate::transport::{DeviceType, VirtioFeatures};
+    use helios_hal::io::IoError;
     use helios_netstack::LinkState;
 
     /// One receive completion the fake device hands the driver: the
@@ -2388,6 +2423,7 @@ mod tests {
                 offered_features: VirtioFeatures::VERSION_1.bits() | offered_features,
                 queue_size: 8,
                 supports_queue_reset: false,
+                absent_queues: &[],
             });
             configure(&transport);
             Self {
@@ -3340,6 +3376,70 @@ mod tests {
         assert_eq!(
             budget.encode_for_queue(super::tx_queue_index(2)),
             [5, 0, 0, 0, 8, 0, 0, 0, 50, 0, 0, 0]
+        );
+    }
+
+    /// The virtio-net configuration field holding `max_virtqueue_pairs`.
+    const CONFIG_MAX_VIRTQUEUE_PAIRS_OFFSET: usize = 8;
+
+    /// A device presenting `queue_size`-deep queues at every index
+    /// except the ones named, advertising `advertised_pairs` in its
+    /// configuration space.
+    fn multiqueue_transport(
+        offered_features: u64,
+        advertised_pairs: u16,
+        absent_queues: &'static [u16],
+    ) -> FakeTransport {
+        let transport = FakeTransport::new(FakeTransportConfig {
+            device_type: DeviceType::Network,
+            offered_features: VirtioFeatures::VERSION_1.bits() | offered_features,
+            queue_size: 8,
+            supports_queue_reset: false,
+            absent_queues,
+        });
+        transport.set_config_u16(CONFIG_MAX_VIRTQUEUE_PAIRS_OFFSET, advertised_pairs);
+        transport
+    }
+
+    /// `max_virtqueue_pairs` is a ceiling the device advertises, not a
+    /// promise. A driver that treats a missing pair as fatal turns a
+    /// working single-pair NIC into a boot failure, which is what the
+    /// x86 bench lane hit under a multi-queue tap (issue #91).
+    #[test]
+    fn a_device_advertising_more_pairs_than_it_presents_comes_up_on_the_pairs_it_has() {
+        let transport = multiqueue_transport(
+            super::NET_FEATURE_MQ | super::NET_FEATURE_CTRL_VQ,
+            4,
+            // Pair 1's receive queue is missing, so only pair 0 is
+            // usable. The control queue still sits at 2 * 4.
+            &[2],
+        );
+
+        let device = VirtioNetDevice::new(transport)
+            .expect("a device with one usable pair is a device the driver can drive");
+
+        assert_eq!(device.queue_pair_count(), 1);
+    }
+
+    /// The driver accepts `CTRL_VQ` before it can see whether the queue
+    /// is there. Discovering it is not has to name the device's own
+    /// disagreement, not surface later as a bare "operation is not
+    /// supported" from the first command sent (issue #91).
+    #[test]
+    fn a_control_queue_the_device_does_not_present_is_named_at_bring_up() {
+        // The driver only accepts `CTRL_VQ` when it has something to
+        // say over it, so this is the multiqueue shape with the control
+        // queue — at 2 * 4 — missing.
+        let transport =
+            multiqueue_transport(super::NET_FEATURE_MQ | super::NET_FEATURE_CTRL_VQ, 4, &[8]);
+
+        let Err(error) = VirtioNetDevice::new(transport) else {
+            panic!("a device that offers a queue it does not have is misconfigured");
+        };
+
+        assert!(
+            matches!(error, IoError::InvalidDeviceConfig(detail) if detail.contains("control queue")),
+            "the failure must name the control queue, got {error}"
         );
     }
 }

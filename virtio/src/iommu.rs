@@ -732,6 +732,7 @@ mod tests {
             offered_features: OFFERED,
             queue_size: 8,
             supports_queue_reset: false,
+            absent_queues: &[],
         });
         transport.set_config_u32(super::CONFIG_PAGE_SIZE_MASK, PAGE_SIZE_MASK as u32);
         transport.set_config_u32(

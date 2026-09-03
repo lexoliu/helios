@@ -208,6 +208,7 @@ mod tests {
             offered_features: VirtioFeatures::VERSION_1.bits() | P9_FEATURE_MOUNT_TAG,
             queue_size,
             supports_queue_reset: true,
+            absent_queues: &[],
         });
         let mut config = [0_u8; 32];
         let tag_len = u16::try_from(MOUNT_TAG.len()).expect("mount tag length fits in u16");

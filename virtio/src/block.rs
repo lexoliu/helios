@@ -1259,6 +1259,7 @@ mod tests {
             offered_features: VirtioFeatures::VERSION_1.bits() | features,
             queue_size: 8,
             supports_queue_reset: false,
+            absent_queues: &[],
         });
         transport.set_config_u32(CFG_CAPACITY_LOW, TEST_CAPACITY_SECTORS);
         setup(&transport);
@@ -1703,6 +1704,7 @@ mod tests {
             offered_features: VirtioFeatures::VERSION_1.bits() | BLK_F_MQ,
             queue_size: 8,
             supports_queue_reset: false,
+            absent_queues: &[],
         });
         transport.set_config_u32(CFG_CAPACITY_LOW, TEST_CAPACITY_SECTORS);
         transport.set_config_u16(CFG_NUM_QUEUES, 8);
@@ -1732,6 +1734,7 @@ mod tests {
             offered_features: VirtioFeatures::VERSION_1.bits() | BLK_F_DISCARD,
             queue_size: 8,
             supports_queue_reset: false,
+            absent_queues: &[],
         });
         transport.set_config_u32(CFG_CAPACITY_LOW, TEST_CAPACITY_SECTORS);
 

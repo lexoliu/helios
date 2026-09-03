@@ -135,6 +135,11 @@ pub(crate) struct FakeTransportConfig {
     pub(crate) offered_features: u64,
     pub(crate) queue_size: u16,
     pub(crate) supports_queue_reset: bool,
+    /// Queue indices this device does not present. Selecting one reads
+    /// a queue size of zero, which is how real hardware says "there is
+    /// no queue here" — the only way a driver can tell that a device
+    /// advertised more queues than it built.
+    pub(crate) absent_queues: &'static [u16],
 }
 
 impl Default for FakeTransportConfig {
@@ -144,6 +149,7 @@ impl Default for FakeTransportConfig {
             offered_features: crate::transport::VirtioFeatures::VERSION_1.bits(),
             queue_size: 8,
             supports_queue_reset: true,
+            absent_queues: &[],
         }
     }
 }
@@ -197,6 +203,7 @@ pub(crate) struct FakeTransport<P = IdentityDmaPool> {
     offered_features: u64,
     queue_size: u16,
     supports_queue_reset: bool,
+    absent_queues: &'static [u16],
     log: Mutex<FakeTransportLog>,
 }
 
@@ -219,6 +226,7 @@ impl<P: DmaPool> FakeTransport<P> {
             offered_features: config.offered_features,
             queue_size: config.queue_size,
             supports_queue_reset: config.supports_queue_reset,
+            absent_queues: config.absent_queues,
             log: Mutex::new(FakeTransportLog::default()),
         }
     }
@@ -318,7 +326,10 @@ impl<P: DmaPool> VirtioTransport for FakeTransport<P> {
         self.log.lock().driver_features = features;
     }
 
-    fn queue_max_size(&self, _index: u16) -> u16 {
+    fn queue_max_size(&self, index: u16) -> u16 {
+        if self.absent_queues.contains(&index) {
+            return 0;
+        }
         self.queue_size
     }
 
