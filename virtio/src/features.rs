@@ -243,6 +243,7 @@ mod tests {
         let transport = FakeTransport::new(FakeTransportConfig {
             offered_features: VirtioFeatures::VERSION_1.bits() | VirtioFeatures::RING_RESET.bits(),
             supports_queue_reset: false,
+            absent_queues: &[],
             ..FakeTransportConfig::default()
         });
 

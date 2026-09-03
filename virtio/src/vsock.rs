@@ -514,6 +514,7 @@ mod tests {
             offered_features: VirtioFeatures::VERSION_1.bits(),
             queue_size: 8,
             supports_queue_reset: false,
+            absent_queues: &[],
         });
         transport.set_config_u32(0, GUEST_CID as u32);
         transport.set_config_u32(4, (GUEST_CID >> 32) as u32);

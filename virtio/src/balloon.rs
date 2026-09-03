@@ -682,6 +682,7 @@ mod tests {
                 offered_features: offered,
                 queue_size: 8,
                 supports_queue_reset: false,
+                absent_queues: &[],
             },
             dma,
         ))
