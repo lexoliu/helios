@@ -29,7 +29,7 @@ pub use reservations::{
 pub use user::{
     UserHeapStats, UserMemoryPool, allocate_user_frame_uninit_on, allocate_user_frame_zeroed,
     allocate_user_frame_zeroed_on, deallocate_user_frame, deallocate_user_frame_on,
-    user_heap_stats,
+    largest_servable_user_bytes, user_heap_stats,
 };
 pub(crate) use user::{
     allocate_user_memory_pool, allocate_user_uninit_on, deallocate_user_on,
