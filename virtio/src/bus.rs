@@ -14,6 +14,14 @@ pub trait DeviceBus: Send + Sync + 'static {
         self.read_u32(word_offset).to_le_bytes()[byte_index]
     }
 
+    /// Reads one naturally aligned 16-bit register.
+    ///
+    /// Not derived from [`DeviceBus::read_u32`] on purpose: a device
+    /// bounds configuration accesses by the length of the structure it
+    /// exposes, and a dword read that straddles that end (virtio-net's
+    /// `max_virtqueue_pairs` when MQ is the last feature it offers)
+    /// comes back all-ones rather than as the field.
+    fn read_u16(&self, offset: usize) -> u16;
     fn read_u32(&self, offset: usize) -> u32;
     fn write_u32(&self, offset: usize, value: u32);
     fn dma(&self) -> &Self::DmaPool;
@@ -126,6 +134,19 @@ impl<P> MmioBus<P> {
         assert!(offset < self.size, "MMIO byte access out of range");
 
         unsafe { self.base.as_ptr().add(offset) }
+    }
+
+    fn checked_half_ptr(&self, offset: usize) -> *mut u16 {
+        let end = offset
+            .checked_add(core::mem::size_of::<u16>())
+            .unwrap_or_else(|| panic!("MMIO offset overflow"));
+        assert!(end <= self.size, "MMIO half-word access out of range");
+        assert!(
+            offset.is_multiple_of(core::mem::align_of::<u16>()),
+            "MMIO half-word access misaligned"
+        );
+
+        unsafe { self.base.as_ptr().add(offset).cast::<u16>() }
     }
 }
 
@@ -307,6 +328,10 @@ impl<P: DmaPool> DeviceBus for MmioBus<P> {
 
     fn read_u8(&self, offset: usize) -> u8 {
         unsafe { self.checked_byte_ptr(offset).read_volatile() }
+    }
+
+    fn read_u16(&self, offset: usize) -> u16 {
+        unsafe { self.checked_half_ptr(offset).read_volatile() }
     }
 
     fn read_u32(&self, offset: usize) -> u32 {
