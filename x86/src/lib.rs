@@ -33,6 +33,7 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use helios_hal::boot::BootMemoryMap;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
+use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
@@ -87,13 +88,8 @@ impl helios_hal::critical_section::InterruptOps for X86InterruptOps {
         x86_64::instructions::interrupts::enable();
     }
 
-    fn current_owner() -> usize {
-        let runtime = smp::current_runtime_address();
-        if runtime != 0 {
-            return runtime;
-        }
-
-        1
+    fn current_identity() -> ProcessorIdentity {
+        smp::current_identity()
     }
 }
 

@@ -25,7 +25,6 @@ use core::future::{Future, poll_fn};
 use core::pin::pin;
 use core::task::Poll;
 
-use event_listener::{Event, EventListener};
 use helios_hal::cpu::{Cpu, Instant};
 use helios_hal::vsock::{
     VsockAddress, VsockDelivery, VsockDevice, VsockPacketHeader, VsockShutdown,
