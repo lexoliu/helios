@@ -45,7 +45,8 @@ the device-class facts, transmit and receive:
 INFO [helios_virtio::net] virtio-net online queue_pairs=4 csum=true
   host_tso4=true host_tso6=true guest_csum=true guest_tso4=true
   guest_tso6=true guest_ecn=true guest_ufo=true mrg_rxbuf=true mq=true
-  ctrl_vq=true status=true link_up=true max_frame_len=1514
+  ctrl_vq=true notf_coal=true vq_notf_coal=true notf_coal_max_packets=8
+  notf_coal_max_usecs=50 status=true link_up=true max_frame_len=1514
   max_receive_frame_len=65550 rx_buffer_len=4096
 ```
 
@@ -57,6 +58,18 @@ Those need somewhere to put a 64 KiB frame, which is `mrg_rxbuf`:
 receive buffers are one page each and a coalesced frame arrives as a
 chain of them, so `max_receive_frame_len` exceeds `max_frame_len`
 exactly when receive segmentation was negotiated.
+
+`notf_coal` and `vq_notf_coal` are the notification-coalescing bits
+(`VIRTIO_NET_F_NOTF_COAL` / `VIRTIO_NET_F_VQ_NOTF_COAL`): the device
+holds a queue's notification back until `notf_coal_max_packets` frames
+have accumulated or `notf_coal_max_usecs` have passed, whichever comes
+first, so a saturated queue raises one interrupt per batch instead of
+one per descriptor and an idle one is still bounded by the delay. With
+`vq_notf_coal` the budget is programmed per virtqueue, which is what a
+per-CPU queue layout wants — each pair is driven by its own processor at
+its own rate, and one device-wide setting would make an idle pair pay
+the busy pair's delay. Without it the same budget is set once for every
+receive queue and once for every transmit queue.
 
 `helios-inspector vm` echoes every guest boot line it reads before the
 debugger comes up as `guest serial: …` on stderr, so capturing the
@@ -234,6 +247,8 @@ halfway through machine construction:
 | `mrg_rxbuf` | `on`/`off` | Offer mergeable receive buffers. |
 | `event_idx` | `on`/`off` | Offer `VIRTIO_F_RING_EVENT_IDX` on this device. |
 | `indirect_desc` | `on`/`off` | Offer `VIRTIO_F_INDIRECT_DESC` on this device. |
+| `notf_coal` | `on`/`off` | Offer `VIRTIO_NET_F_NOTF_COAL` (device-wide notification coalescing). |
+| `vq_notf_coal` | `on`/`off` | Offer `VIRTIO_NET_F_VQ_NOTF_COAL` (per-virtqueue coalescing). |
 
 Turning an offload off is how its contribution is measured:
 

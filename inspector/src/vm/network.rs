@@ -304,6 +304,16 @@ const VIRTIO_NET_PROPERTIES: &[VirtioNetPropertySpec] = &[
         value: VirtioNetPropertyValue::Count,
         owner: Some("--net-queues"),
     },
+    VirtioNetPropertySpec {
+        name: "notf_coal",
+        value: VirtioNetPropertyValue::Toggle,
+        owner: None,
+    },
+    VirtioNetPropertySpec {
+        name: "vq_notf_coal",
+        value: VirtioNetPropertyValue::Toggle,
+        owner: None,
+    },
 ];
 
 fn supported_property_names() -> String {
