@@ -1,3 +1,6 @@
+use core::fmt::{self, Write};
+
+use arrayvec::ArrayString;
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -34,6 +37,60 @@ pub struct ProgramOutOfMemory {
     pub reserved_bytes: usize,
 }
 
+/// How much of a runtime message travels with a [`ProgramExecError`].
+///
+/// Long enough for a wasmtime error's own sentence, short enough that every
+/// program error stays a stack value in a kernel that does not allocate on
+/// failure paths.
+const RUNTIME_MESSAGE_CAPACITY: usize = 192;
+
+/// What the runtime itself said about a failure the kernel has no name for.
+///
+/// [`ProgramExecErrorDetail`] names every failure the kernel recognises;
+/// `RuntimeFailure` is by construction the one it does not. Dropping the
+/// runtime's own message there leaves a caller — the inspector, a guest
+/// program, a CI log — with `runtime operation failed` and nothing to act on,
+/// so the message travels with the error instead.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeMessage(ArrayString<RUNTIME_MESSAGE_CAPACITY>);
+
+impl RuntimeMessage {
+    /// Records `message`, truncated at [`RUNTIME_MESSAGE_CAPACITY`].
+    pub fn of(message: impl fmt::Display) -> Self {
+        let mut text = Truncating(ArrayString::new());
+        // `Truncating` never fails, so the message is recorded in full or cut
+        // at capacity; neither outcome is an error worth propagating out of a
+        // diagnostic.
+        let _ = write!(text, "{message}");
+        Self(text.0)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RuntimeMessage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A `fmt::Write` sink that stops at its capacity instead of failing, so a
+/// diagnostic longer than the buffer is shortened rather than lost.
+struct Truncating(ArrayString<RUNTIME_MESSAGE_CAPACITY>);
+
+impl fmt::Write for Truncating {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        for character in text.chars() {
+            if self.0.try_push(character).is_err() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum ProgramExecErrorDetail {
     #[error("child exit channel closed before completion")]
@@ -68,8 +125,8 @@ pub enum ProgramExecErrorDetail {
     ArtifactSignatureInvalid,
     #[error("artifact profile is unsupported")]
     ArtifactProfileInvalid,
-    #[error("runtime operation failed")]
-    RuntimeFailure,
+    #[error("runtime operation failed: {0}")]
+    RuntimeFailure(RuntimeMessage),
     #[error("program image replacement is not available for this runtime")]
     ImageReplacementUnavailable,
     #[error("program stack restoration is not available for this runtime")]
@@ -111,7 +168,7 @@ pub enum ProgramExecErrorDetail {
 }
 
 impl ProgramExecErrorDetail {
-    pub const fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Self::ChildExitChannelDropped => "child exit channel closed before completion",
             Self::ChildExitAlreadyConsumed => "child exit result was already consumed",
@@ -133,7 +190,7 @@ impl ProgramExecErrorDetail {
             Self::HostFilesystemUnavailable => "host filesystem service is unavailable",
             Self::ArtifactSignatureInvalid => "artifact signature verification failed",
             Self::ArtifactProfileInvalid => "artifact profile is unsupported",
-            Self::RuntimeFailure => "runtime operation failed",
+            Self::RuntimeFailure(message) => message.as_str(),
             Self::ImageReplacementUnavailable => {
                 "program image replacement is not available for this runtime"
             }
@@ -170,4 +227,52 @@ impl ProgramExecErrorDetail {
 pub struct ProgramExecError {
     pub kind: ProgramExecErrorKind,
     pub detail: ProgramExecErrorDetail,
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::string::ToString;
+
+    use super::*;
+
+    /// The evidence gap #62 ran into: `RuntimeFailure` is the detail for
+    /// failures the kernel has no name for, so the runtime's own sentence is
+    /// the only account of them and has to survive the trip to the host.
+    #[test]
+    fn a_runtime_failure_carries_what_the_runtime_said() {
+        let error = ProgramExecError {
+            kind: ProgramExecErrorKind::Internal,
+            detail: ProgramExecErrorDetail::RuntimeFailure(RuntimeMessage::of(
+                "memory index 0 out of bounds",
+            )),
+        };
+
+        assert_eq!(
+            error.detail.as_str(),
+            "memory index 0 out of bounds",
+            "the host reads `detail.as_str()` verbatim onto the wire"
+        );
+        assert_eq!(
+            error.to_string(),
+            "the kernel rejected the program for an internal reason: \
+             runtime operation failed: memory index 0 out of bounds"
+        );
+    }
+
+    #[test]
+    fn a_message_longer_than_the_buffer_is_shortened_rather_than_lost() {
+        let long = "x".repeat(RUNTIME_MESSAGE_CAPACITY * 2);
+        let message = RuntimeMessage::of(&long);
+
+        assert_eq!(message.as_str().len(), RUNTIME_MESSAGE_CAPACITY);
+        assert!(long.starts_with(message.as_str()));
+    }
+
+    #[test]
+    fn a_detail_the_kernel_names_still_reads_as_its_own_sentence() {
+        assert_eq!(
+            ProgramExecErrorDetail::ImportedSharedMemoryBudgetExceeded.as_str(),
+            "imported shared memory exceeds the user-memory budget"
+        );
+    }
 }

@@ -14,6 +14,7 @@ mod workload_bench;
 use anyhow::{Context as _, Result, bail};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use std::io::Write as _;
+use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -81,6 +82,26 @@ pub(crate) struct ShellCommand {
     /// Path to a local script file whose contents are executed remotely by `/bin/dash`.
     #[arg(conflicts_with = "command")]
     script: Option<String>,
+
+    /// Write the guest tracing events the script produced to this file.
+    ///
+    /// The capture is primed before the script runs and drained after it, so
+    /// the file holds the guest's own account of the run — including a run
+    /// that failed, which is the case the file exists for.
+    #[arg(long = "trace-log", value_name = "PATH")]
+    trace_log: Option<PathBuf>,
+
+    /// Lowest severity to capture into `--trace-log`.
+    #[arg(
+        long = "trace-log-level",
+        value_name = "LEVEL",
+        default_value = "trace"
+    )]
+    trace_log_level: String,
+
+    /// Number of recent guest events each `--trace-log` poll retrieves.
+    #[arg(long = "trace-log-limit", value_name = "COUNT", default_value_t = 512)]
+    trace_log_limit: u32,
 }
 
 #[derive(Debug, Clone, ClapArgs)]
@@ -139,7 +160,26 @@ pub(crate) fn run_connected(
     match command.unwrap_or(SessionCommand::Repl) {
         SessionCommand::Shell(command) => run_interruptible(async move {
             let mut client = client;
-            let output = repl::run_shell_command(&mut client, &command).await?;
+            let mut capture = match command.trace_log.as_ref() {
+                Some(_) => Some(
+                    system::TracingCapture::start(
+                        &mut client,
+                        system::tracing_config(
+                            command.trace_log_limit,
+                            Some(command.trace_log_level.as_str()),
+                            Vec::new(),
+                        )?,
+                    )
+                    .await
+                    .context("failed to prime the guest tracing capture")?,
+                ),
+                None => None,
+            };
+            let result = repl::run_shell_command(&mut client, &command).await;
+            if let (Some(capture), Some(path)) = (capture.as_mut(), command.trace_log.as_ref()) {
+                write_trace_log(&mut client, capture, path).await?;
+            }
+            let output = result?;
             std::io::stdout().write_all(&output.output.stdout)?;
             std::io::stderr().write_all(&output.output.stderr)?;
             if output.exit_code != 0 {
@@ -159,6 +199,30 @@ pub(crate) fn run_connected(
         }),
         SessionCommand::Repl => repl::run(client),
     }
+}
+
+/// Writes what the guest traced during the shell command to `path`.
+///
+/// A failed script is exactly when this file matters, so a failure to drain or
+/// write it is reported rather than swallowed: an empty or missing trace log
+/// would be read as "the guest said nothing", which is a different claim.
+async fn write_trace_log(
+    client: &mut serial::RpcClient,
+    capture: &mut system::TracingCapture,
+    path: &PathBuf,
+) -> Result<()> {
+    let lines = capture
+        .drain(client)
+        .await
+        .context("failed to drain the guest tracing capture")?;
+    let mut log = std::fs::File::create(path)
+        .with_context(|| format!("failed to create the guest trace log at {}", path.display()))?;
+    for line in lines {
+        writeln!(log, "{line}").with_context(|| {
+            format!("failed to write the guest trace log at {}", path.display())
+        })?;
+    }
+    Ok(())
 }
 
 fn into_session_command(command: Option<Command>) -> Option<SessionCommand> {

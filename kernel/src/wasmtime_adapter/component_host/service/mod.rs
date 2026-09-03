@@ -24,7 +24,6 @@ mod wasix_epoll;
 use wasix_epoll::*;
 
 use super::*;
-use crate::ProgramExecErrorDetail;
 use crate::process::FreeDescriptorSlots;
 use crate::wasmtime_adapter::artifact_profile::{self, ArtifactProfileError};
 use crate::wasmtime_adapter::config::AotCompileHint;
@@ -37,6 +36,7 @@ use crate::wasmtime_adapter::{
         bindings::filesystem::types as fs_types, preview1 as p1,
     },
 };
+use crate::{ProgramExecErrorDetail, RuntimeMessage};
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -1440,7 +1440,7 @@ where
                 tracing::error!(?error, "program component deserialization failed");
                 ProgramExecError {
                     kind: ProgramExecErrorKind::InvalidBinary,
-                    detail: ProgramExecErrorDetail::RuntimeFailure,
+                    detail: ProgramExecErrorDetail::RuntimeFailure(RuntimeMessage::of(&error)),
                 }
             })?;
         let imports = WasiImportSet::from_component(self.inner.engine.raw(), &component);

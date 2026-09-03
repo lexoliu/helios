@@ -84,7 +84,7 @@ pub async fn stream_tracing_command(
     stream_tracing(client, &config).await
 }
 
-fn tracing_config(
+pub fn tracing_config(
     limit: u32,
     min_level: Option<&str>,
     target_prefixes: Vec<String>,
@@ -158,17 +158,47 @@ async fn wait_for_tracing_tick_or_interrupt(signals: &mut Signals) -> std::io::R
     .await
 }
 
+/// How a rendered tracing event is coloured.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TracingPalette {
+    /// ANSI colour, for a terminal.
+    Terminal,
+    /// No escape sequences, for a log file the inspector retains — escape
+    /// sequences in an artifact are noise a reader has to strip back out.
+    Plain,
+}
+
+impl TracingPalette {
+    fn apply(self, style: AnsiStyle) -> AnsiStyle {
+        match self {
+            Self::Terminal => style,
+            Self::Plain => AnsiStyle::new(),
+        }
+    }
+}
+
 pub fn render_tracing_event(event: &tracing::Event) -> Result<String> {
+    render_tracing_event_with(event, TracingPalette::Terminal)
+}
+
+pub fn render_tracing_event_with(
+    event: &tracing::Event,
+    palette: TracingPalette,
+) -> Result<String> {
     let mut text = String::new();
     write!(
         &mut text,
         "{}",
-        level_style(event.level).paint(level_name(event.level))
+        palette
+            .apply(level_style(event.level))
+            .paint(level_name(event.level))
     )?;
     write!(
         &mut text,
         " {}",
-        AnsiStyle::new().fg(Color::Fixed(244)).paint(&event.target)
+        palette
+            .apply(AnsiStyle::new().fg(Color::Fixed(244)))
+            .paint(&event.target)
     )?;
     for field in &event.fields {
         if field.key == "message" {
@@ -176,8 +206,8 @@ pub fn render_tracing_event(event: &tracing::Event) -> Result<String> {
             write!(
                 &mut text,
                 "{}",
-                AnsiStyle::new()
-                    .fg(Color::White)
+                palette
+                    .apply(AnsiStyle::new().fg(Color::White))
                     .paint(render_value(&field.value)?)
             )?;
             continue;
@@ -185,13 +215,61 @@ pub fn render_tracing_event(event: &tracing::Event) -> Result<String> {
         write!(
             &mut text,
             " {}={}",
-            AnsiStyle::new().fg(Color::Fixed(109)).paint(&field.key),
-            AnsiStyle::new()
-                .fg(Color::Fixed(252))
+            palette
+                .apply(AnsiStyle::new().fg(Color::Fixed(109)))
+                .paint(&field.key),
+            palette
+                .apply(AnsiStyle::new().fg(Color::Fixed(252)))
                 .paint(render_value(&field.value)?)
         )?;
     }
     Ok(text)
+}
+
+/// Captures the guest's tracing around a command that runs on the same RPC
+/// client.
+///
+/// The guest keeps a bounded ring of recent events and `recent` always answers
+/// with its tail, so the events a command produced are exactly the ones that
+/// were not already in the ring when it started. One connection cannot poll
+/// and run a command at the same time, so the capture primes its seen-set
+/// before the command and drains after it; what comes back is the command's
+/// own account, in order.
+pub struct TracingCapture {
+    config: TracingConfig,
+    emitted: EmittedEvents,
+}
+
+impl TracingCapture {
+    /// Primes the capture with whatever the ring already holds.
+    pub async fn start(client: &mut RpcClient, config: TracingConfig) -> Result<Self> {
+        let mut capture = Self {
+            emitted: EmittedEvents::new(config.limit),
+            config,
+        };
+        capture.take_new_events(client).await?;
+        Ok(capture)
+    }
+
+    /// Returns the events that reached the ring since the last call, rendered
+    /// without escape sequences.
+    pub async fn drain(&mut self, client: &mut RpcClient) -> Result<Vec<String>> {
+        let events = self.take_new_events(client).await?;
+        events
+            .iter()
+            .map(|event| render_tracing_event_with(event, TracingPalette::Plain))
+            .collect()
+    }
+
+    async fn take_new_events(&mut self, client: &mut RpcClient) -> Result<Vec<tracing::Event>> {
+        let mut fresh = Vec::new();
+        for event in fetch_tracing(client, &self.config).await? {
+            if self.emitted.insert(tracing_event_key(&event)?) {
+                fresh.push(event);
+            }
+        }
+        Ok(fresh)
+    }
 }
 
 fn tracing_event_key(event: &tracing::Event) -> Result<String> {
