@@ -975,8 +975,9 @@ mod tests {
 
     #[test]
     fn metric_lines_are_collected_and_validated() {
-        let metrics = parse_metrics(b"pipe-pingpong:20000\nbench.rtt_p50_us=12.5\nbench.rtt_p99_us=40\n")
-            .expect("well-formed metrics parse");
+        let metrics =
+            parse_metrics(b"pipe-pingpong:20000\nbench.rtt_p50_us=12.5\nbench.rtt_p99_us=40\n")
+                .expect("well-formed metrics parse");
         assert_eq!(metrics.get("rtt_p50_us"), Some(&12.5));
         assert_eq!(metrics.get("rtt_p99_us"), Some(&40.0));
         assert!(parse_metrics(b"bench.broken\n").is_err());
