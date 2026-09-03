@@ -184,6 +184,11 @@ pub struct SwapStats {
 ///
 /// The enumeration hooks take a context pointer and a plain function
 /// rather than a closure, because a function pointer cannot be generic.
+///
+/// The two visiting hooks take their callback and an opaque context
+/// pointer rather than a closure for the same reason: the caller keeps
+/// its state on its own stack and the hook only has to be able to reach
+/// it.
 pub struct SwapVmHooks {
     /// Detach one committed page, copying it into the caller's buffer.
     pub swap_out_page: fn(VirtAddr, SwapToken, &mut [u8]) -> Result<PageFlags, AddressSpaceError>,
@@ -194,14 +199,22 @@ pub struct SwapVmHooks {
     pub swapped_token: fn(VirtAddr) -> Option<SwapToken>,
     /// Visit an owner's committed pages with their age, clearing the
     /// access flag as it goes. `visit` returns `false` to stop.
-    pub scan_committed_pages:
-        fn(u64, *mut (), fn(*mut (), VirtAddr, PageFlags, PageAge) -> bool) -> usize,
+    pub scan_committed_pages: fn(u64, *mut (), CommittedPageVisitor) -> usize,
     /// Bytes this owner has committed right now.
     pub owned_resident_bytes: fn(u64) -> u64,
     /// Take tokens the address space dropped when a range was released,
     /// decommitted, or committed over.
-    pub drain_orphaned_swap_tokens: fn(*mut (), fn(*mut (), SwapToken)) -> usize,
+    pub drain_orphaned_swap_tokens: fn(*mut (), OrphanedTokenVisitor) -> usize,
 }
+
+/// What [`SwapVmHooks::scan_committed_pages`] calls for each page it
+/// walks: the caller's context, the page, its flags and its age.
+/// Returning `false` ends the scan.
+pub type CommittedPageVisitor = fn(*mut (), VirtAddr, PageFlags, PageAge) -> bool;
+
+/// What [`SwapVmHooks::drain_orphaned_swap_tokens`] calls for each token
+/// the address space dropped: the caller's context and the token.
+pub type OrphanedTokenVisitor = fn(*mut (), SwapToken);
 
 /// A shared view of swap for the fault path, teardown, and observers.
 #[derive(Clone)]
@@ -339,7 +352,7 @@ impl SwapHandle {
 
     /// Reads back every swapped-out page in `range`.
     ///
-    /// Kernel code that touches user memory directly — a WASI host call
+    /// Kernel code that touches user memory directly — a host call
     /// copying a guest buffer, a byte channel taking bytes out of guest
     /// memory, a DMA source built over a guest slice — calls this before
     /// the copy. Kernel stacks have no fault trampoline, so a fault

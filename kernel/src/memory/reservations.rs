@@ -454,7 +454,7 @@ impl ReservationTracker {
             .filter(|region| region.owner == owner)
             .copied()
             .collect();
-        regions.sort_by(|a, b| b.range.byte_len.cmp(&a.range.byte_len));
+        regions.sort_by_key(|region| core::cmp::Reverse(region.range.byte_len));
         for region in regions {
             if !visit(region) {
                 return;
