@@ -1680,7 +1680,7 @@ pub(super) fn map_program_runtime_error(error: wasmtime::Error) -> ProgramExecEr
         tracing::error!(?error, "program runtime reported out of memory");
         return ProgramExecError {
             kind: ProgramExecErrorKind::OutOfMemory,
-            detail: ProgramExecErrorDetail::RuntimeFailure,
+            detail: ProgramExecErrorDetail::RuntimeFailure(RuntimeMessage::of(&error)),
         };
     }
     if let Some(killed) = error.downcast_ref::<crate::InstanceKilled>() {
@@ -1691,14 +1691,14 @@ pub(super) fn map_program_runtime_error(error: wasmtime::Error) -> ProgramExecEr
         };
         return ProgramExecError {
             kind,
-            detail: ProgramExecErrorDetail::RuntimeFailure,
+            detail: ProgramExecErrorDetail::RuntimeFailure(RuntimeMessage::of(&error)),
         };
     }
 
     tracing::error!(?error, "program runtime operation failed");
     ProgramExecError {
         kind: ProgramExecErrorKind::Internal,
-        detail: ProgramExecErrorDetail::RuntimeFailure,
+        detail: ProgramExecErrorDetail::RuntimeFailure(RuntimeMessage::of(&error)),
     }
 }
 
