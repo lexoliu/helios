@@ -305,19 +305,6 @@ impl InstanceRegistry {
         idle.into_iter().map(|(_, id)| id).collect()
     }
 
-    /// Every registered instance that has not been condemned, most
-    /// recently active last.
-    pub fn live_instances(&self) -> Vec<InstanceId> {
-        let entries = self.inner.entries.lock();
-        let mut live: Vec<(u64, InstanceId)> = entries
-            .iter()
-            .filter(|(_, entry)| entry.kill_flag.load(Ordering::Acquire) == KILL_FLAG_NONE)
-            .map(|(_, entry)| (entry.last_active_at.load(Ordering::Acquire), entry.id))
-            .collect();
-        live.sort_unstable();
-        live.into_iter().map(|(_, id)| id).collect()
-    }
-
     pub fn snapshot(&self, now_nanos: u64) -> Vec<InstanceSnapshot> {
         let entries = self.inner.entries.lock();
         let mut sampling = self.inner.sampling.lock();
