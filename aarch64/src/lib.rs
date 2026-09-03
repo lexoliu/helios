@@ -527,13 +527,23 @@ extern "C" fn aarch64_kernel_main() -> ! {
         platform.virtio.len(),
         platform.rtc.is_some(),
     );
+    // The entropy device comes up before the root DRBG is seeded,
+    // because on this platform it can be the only source there is: an
+    // ACPI-described machine has no `/chosen/rng-seed`, and a processor
+    // without `FEAT_RNG` has no `RNDR`. Its interrupt is routed later,
+    // with every other device's; the bring-up read polls the used ring
+    // and needs none.
+    let entropy_device = entropy::bring_up(&platform, physical_memory_offset, &handoff);
     // The root DRBG is seeded before any component can ask for random
-    // bytes: `RNDR` where the processor implements it, plus whatever
-    // seed the bootloader left behind. Neither is a fallback for the
-    // other, and the entropy device joins them once the executor runs.
-    // This follows `init` so the source line reaches the log the kernel
-    // just installed.
-    let root_entropy = helios_kernel::seed_root_entropy(&cpu, platform.boot_entropy_seed);
+    // bytes: `RNDR` where the processor implements it, whatever seed
+    // the bootloader left behind, and a read of the entropy device.
+    // None is a fallback for another. This follows `init` so the source
+    // line reaches the log the kernel just installed.
+    let root_entropy = helios_kernel::seed_root_entropy(
+        &cpu,
+        platform.boot_entropy_seed,
+        entropy_device.as_ref().map(|entropy| &entropy.device),
+    );
     debug_state.install_root_entropy(root_entropy.clone());
     // The calendar is read once, here, before any component can ask
     // what time it is. The processor's timer carries wall time forward
@@ -586,13 +596,8 @@ extern "C" fn aarch64_kernel_main() -> ! {
         );
         routes.add_network(network.interrupt, network.device);
     }
-    if let Some(entropy) = entropy::install(
-        &kernel,
-        &platform,
-        physical_memory_offset,
-        &handoff,
-        root_entropy.clone(),
-    ) {
+    if let Some(entropy) = entropy_device {
+        entropy::install(&kernel, &entropy, root_entropy.clone());
         gic.enable_device_interrupt(
             entropy.interrupt,
             entropy.trigger,
