@@ -983,6 +983,20 @@ where
         }
     }
 
+    /// Every path the tree holds right now, for a diagnostic that has to
+    /// say what was there instead of what was expected.
+    pub(super) fn node_names(&self) -> alloc::string::String {
+        let state = self.snapshot.inner.lock();
+        let mut names = alloc::string::String::new();
+        for node in &state.nodes {
+            if !names.is_empty() {
+                names.push(' ');
+            }
+            names.push_str(&node.path);
+        }
+        names
+    }
+
     pub(super) fn get_node(&self, path: &str) -> core::result::Result<FsNode, fs_types::ErrorCode> {
         self.snapshot
             .inner
@@ -1527,7 +1541,24 @@ where
             effective_open_descriptor_flags(base.flags, descriptor_flags, FsNodeKind::File)?;
 
         let parent = crate::parent_path(&absolute);
-        let parent_node = self.get_node(parent)?;
+        let parent_node = match self.get_node(parent) {
+            Ok(node) => node,
+            Err(error) => {
+                // A create whose parent directory is missing is what the
+                // guest sees as "Directory nonexistent", and the only
+                // thing that distinguishes a guest that never made the
+                // directory from a kernel that lost it is what the tree
+                // held at that moment.
+                let names = self.node_names();
+                tracing::warn!(
+                    path = absolute.as_str(),
+                    parent,
+                    nodes = names.as_str(),
+                    "creating a file found no parent directory"
+                );
+                return Err(error);
+            }
+        };
         if parent_node.kind != FsNodeKind::Directory {
             return Err(fs_types::ErrorCode::NotDirectory);
         }

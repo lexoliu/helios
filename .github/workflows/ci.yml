@@ -171,7 +171,7 @@ jobs:
             --boot-program dash --boot-program debugger \
             --boot-program ls --boot-program mkdir --boot-program cat \
             --no-compiler-plugin \
-            shell -c 'mkdir /d; echo coreutils:ok > /d/f; cat /d/f; ls /' \
+            shell -c 'mkdir /d; ls -la /; echo coreutils:ok > /d/f; cat /d/f; ls /' \
             2>&1 > coreutils-smoke.out | tee "$runtime/inspector.log"
           cat coreutils-smoke.out
           grep -Fqx coreutils:ok coreutils-smoke.out
