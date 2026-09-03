@@ -85,7 +85,7 @@ fn zero_first_use_writes_zeros() {
 #[test]
 fn out_of_frames_reports_available() {
     let allocator = KernelPhysFrameAllocator::new();
-    let pool_bytes = 1 * 1024 * 1024; // 1 MiB
+    let pool_bytes = 1024 * 1024; // 1 MiB
     let (start, end) = leak_aligned_pool(pool_bytes);
     allocator.add_region(start, end);
 
