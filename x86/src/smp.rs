@@ -72,7 +72,7 @@ pub(crate) struct ProcessorRuntime {
     watchdog: X86Watchdog,
     timer: Once<Timer<crate::X86Cpu>>,
     program_service: Once<debug_state::ProgramService>,
-    device_interrupts: Once<DeviceInterruptRoutes>,
+    device_interrupts: Once<&'static DeviceInterruptRoutes>,
     local_timer_ready: AtomicBool,
     started: AtomicBool,
 }
@@ -285,18 +285,6 @@ impl ProcessorRuntime {
         self.program_service.call_once(|| service);
     }
 
-    /// Publishes the device interrupt routes this processor dispatches
-    /// MSI-X vectors through. Installed on the bootstrap processor
-    /// before interrupts are unmasked; every device MSI-X message is
-    /// addressed to that processor's local APIC.
-    pub(crate) fn install_device_interrupts(&self, routes: DeviceInterruptRoutes) {
-        assert!(
-            self.device_interrupts.get().is_none(),
-            "x86 device interrupt routes were installed more than once"
-        );
-        self.device_interrupts.call_once(|| routes);
-    }
-
     pub(crate) fn ensure_local_timer(&self, vector: u8) {
         if self
             .local_timer_ready
@@ -341,6 +329,42 @@ impl X86PlatformState {
 
     pub(crate) fn processor_count(&self) -> usize {
         self.processors.len()
+    }
+
+    /// Publishes the device interrupt routes every processor dispatches
+    /// MSI-X vectors through.
+    ///
+    /// One table, shared: a device's configuration message is addressed
+    /// to the bootstrap processor, but a multi-queue network device
+    /// steers each queue pair's message to the processor whose shard
+    /// drains that pair, so any processor can be the one an MSI-X
+    /// vector lands on. Which queue a vector belongs to does not depend
+    /// on who fields it, so every processor reads the same table.
+    ///
+    /// # SMP contract
+    ///
+    /// The table is built once, while the bootstrap processor is the
+    /// only one online and its own interrupts are still masked, and it
+    /// is borrowed for the life of the machine. Every processor slot
+    /// the ACPI topology described already exists by then, so a
+    /// processor started later reads the table its slot was handed
+    /// before it ran its first instruction; the interrupt path only
+    /// loads a pointer, taking no lock and no allocation.
+    pub(crate) fn install_device_interrupts(&self, routes: DeviceInterruptRoutes) {
+        assert_eq!(
+            ONLINE_PROCESSOR_MASK.load(Ordering::Acquire),
+            processor_bit(usize::from(self.bootstrap_processor().id())),
+            "x86 device interrupt routes must be published while the bootstrap \
+             processor is the only one online"
+        );
+        let routes: &'static DeviceInterruptRoutes = Box::leak(Box::new(routes));
+        for slot in self.processors.iter() {
+            assert!(
+                slot.runtime.device_interrupts.get().is_none(),
+                "x86 device interrupt routes were installed more than once"
+            );
+            slot.runtime.device_interrupts.call_once(|| routes);
+        }
     }
 
     pub(crate) fn bootstrap_processor(&self) -> ProcessorId {
@@ -455,6 +479,10 @@ pub(crate) fn handle_local_timer_interrupt() {
 }
 
 /// Dispatches an MSI-X device interrupt to the driver bound to `vector`.
+///
+/// Runs on whichever processor the message was steered to; the routes
+/// its runtime holds are the one table every processor was handed
+/// during device bring-up.
 pub(crate) fn handle_device_interrupt(vector: u8) {
     let runtime = current_runtime();
     let routes = runtime.device_interrupts.get().unwrap_or_else(|| {

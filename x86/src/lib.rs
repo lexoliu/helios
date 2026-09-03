@@ -300,12 +300,17 @@ fn x86_kernel_main() -> ! {
 }
 
 /// Brings up the virtio-PCI devices the platform exposes and publishes
-/// their MSI-X routes on the bootstrap processor.
+/// their MSI-X routes to every processor.
 ///
-/// Every device message is addressed to the bootstrap local APIC, which
-/// is the processor that owns the routing table; the routes are
-/// installed unconditionally so an interrupt from a device the kernel
-/// never claimed fails loudly instead of being silently acknowledged.
+/// A device's configuration message is addressed to the bootstrap local
+/// APIC, but a multi-queue network device steers each queue pair's
+/// message to the processor that drains the pair, so every processor
+/// has to be able to dispatch a device vector. This runs while the
+/// bootstrap processor is the only one online and its interrupts are
+/// still masked, so the table is in place before the first message can
+/// be delivered anywhere. The routes are installed unconditionally so
+/// an interrupt from a device the kernel never claimed fails loudly
+/// instead of being silently acknowledged.
 #[allow(clippy::too_many_arguments)]
 fn install_pci_devices<WatchdogImpl>(
     cpu: &X86Cpu,
@@ -462,7 +467,7 @@ fn install_pci_devices<WatchdogImpl>(
     ) {
         routes.add_block(block.vector, block.device);
     }
-    smp::current_runtime().install_device_interrupts(routes);
+    cpu.platform_state().install_device_interrupts(routes);
 }
 
 // TODO(x86-avx): enable OSXSAVE, program XCR0, and preserve XSAVE state
@@ -769,6 +774,10 @@ pub(crate) struct X86Cpu {
 impl X86Cpu {
     fn new(state: Arc<smp::X86PlatformState>) -> Self {
         Self { state }
+    }
+
+    pub(crate) fn platform_state(&self) -> &smp::X86PlatformState {
+        &self.state
     }
 
     pub(crate) fn debug_state(&self) -> debug_state::RuntimeState {
