@@ -45,7 +45,7 @@ pub use mmio::{
     p9_from_mmio_with_dma, rng_from_mmio, rng_from_mmio_with_dma, vsock_from_mmio,
     vsock_from_mmio_with_dma,
 };
-pub use net::{RxFrame, TxChecksumMeta, TxGsoMeta, VirtioNetDevice};
+pub use net::{NotificationCoalescing, RxFrame, TxChecksumMeta, TxGsoMeta, VirtioNetDevice};
 pub use p9::Virtio9pDevice;
 pub use pci::{
     PciMmioMapper, VIRTIO_PCI_VENDOR_ID, VirtioPciBus, VirtioPciTransport, balloon_from_pci,

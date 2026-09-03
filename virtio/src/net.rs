@@ -130,6 +130,16 @@ const NET_FEATURE_MQ: u64 = 1 << 22;
 /// driver uses to issue runtime configuration commands such as
 /// `VQ_PAIRS_SET`. Required when negotiating `NET_FEATURE_MQ`.
 const NET_FEATURE_CTRL_VQ: u64 = 1 << 17;
+/// VIRTIO_NET_F_NOTF_COAL: the device can hold a notification back
+/// until a packet count or a delay is reached, so a busy queue raises
+/// one interrupt per batch instead of one per descriptor. Programmed
+/// through the control queue, so it needs `VIRTIO_NET_F_CTRL_VQ`.
+const NET_FEATURE_NOTF_COAL: u64 = 1 << 53;
+/// VIRTIO_NET_F_VQ_NOTF_COAL: coalescing can be programmed per
+/// virtqueue rather than once for every receive and every transmit
+/// queue. What a per-CPU queue layout wants, because each pair is
+/// driven by its own processor at its own rate.
+const NET_FEATURE_VQ_NOTF_COAL: u64 = 1 << 52;
 /// Maximum queue pairs the kernel is willing to bring up. Sized so
 /// the per-CPU shard count on Apple Silicon (up to 12 cores) fits;
 /// devices advertising more pairs are simply capped at this value.
@@ -138,17 +148,119 @@ const NET_MAX_QUEUE_PAIRS: u16 = 16;
 const CTRL_CLASS_MQ: u8 = 4;
 /// Control-queue command id for `VQ_PAIRS_SET` under class MQ.
 const CTRL_CMD_MQ_VQ_PAIRS_SET: u8 = 0;
+/// Control-queue command class for `VIRTIO_NET_CTRL_NOTF_COAL`.
+const CTRL_CLASS_NOTF_COAL: u8 = 6;
+/// Coalescing command ids under class `VIRTIO_NET_CTRL_NOTF_COAL`.
+const CTRL_CMD_NOTF_COAL_TX_SET: u8 = 0;
+const CTRL_CMD_NOTF_COAL_RX_SET: u8 = 1;
+const CTRL_CMD_NOTF_COAL_VQ_SET: u8 = 2;
 /// Pre-submission ack sentinel; the device replaces this with
 /// `CTRL_ACK_OK` (0) on success or `CTRL_ACK_FAIL` (1) on error.
 const CTRL_ACK_PENDING: u8 = 0xff;
 /// Device-side success ack on the control queue.
 const CTRL_ACK_OK: u8 = 0;
-/// Bytes the `VQ_PAIRS_SET` command payload occupies (class +
-/// command + le16 pairs).
-const CTRL_MQ_PAIRS_CMD_BYTES: usize = 4;
-/// Maximum command payload size the control queue scratch buffer
-/// is sized for. Currently only `VQ_PAIRS_SET` is sent.
-const CTRL_CMD_MAX_BYTES: usize = CTRL_MQ_PAIRS_CMD_BYTES;
+/// Bytes the `VQ_PAIRS_SET` payload occupies: one le16 pair count.
+const CTRL_MQ_PAIRS_PAYLOAD_BYTES: usize = 2;
+/// Bytes a `NOTF_COAL_TX_SET` / `NOTF_COAL_RX_SET` payload occupies:
+/// `le32 max_packets` then `le32 max_usecs`.
+const CTRL_NOTF_COAL_PAYLOAD_BYTES: usize = 8;
+/// Bytes a `NOTF_COAL_VQ_SET` payload occupies: `le16 vqn`, `le16`
+/// reserved, then the same pair of le32 fields.
+const CTRL_NOTF_COAL_VQ_PAYLOAD_BYTES: usize = 12;
+/// Maximum command payload size the control queue scratch buffer is
+/// sized for, plus the two-byte class/command prefix every command
+/// carries.
+const CTRL_CMD_MAX_BYTES: usize = 2 + CTRL_NOTF_COAL_VQ_PAYLOAD_BYTES;
+/// The scratch buffer is sized once at bring-up and shared by every
+/// control command, so a command that outgrew it would assert at
+/// runtime on a path only real hardware reaches. Checking it here means
+/// a new command with a longer payload fails the build instead.
+const _: () = {
+    assert!(CTRL_CMD_MAX_BYTES >= 2 + CTRL_MQ_PAIRS_PAYLOAD_BYTES);
+    assert!(CTRL_CMD_MAX_BYTES >= 2 + CTRL_NOTF_COAL_PAYLOAD_BYTES);
+    assert!(CTRL_CMD_MAX_BYTES >= 2 + CTRL_NOTF_COAL_VQ_PAYLOAD_BYTES);
+};
+
+/// Frames a queue may accumulate before the device raises its
+/// notification.
+///
+/// Small enough that a latency-sensitive exchange still gets its
+/// interrupt from the delay bound below rather than waiting for a
+/// batch that will never fill, and large enough that a saturated queue
+/// raises one interrupt per receive batch instead of one per frame.
+const NET_NOTF_COAL_MAX_PACKETS: u32 = 8;
+/// Microseconds a queue may hold a notification back before raising it
+/// even though the packet count was never reached.
+const NET_NOTF_COAL_MAX_USECS: u32 = 50;
+
+/// virtqueue index of a queue pair's receive ring.
+///
+/// virtio-net lays its queues out as RX0, TX0, RX1, TX1, ... followed by
+/// the control queue, and three call sites depend on that ordering, so
+/// it is spelled once here.
+const fn rx_queue_index(pair_idx: u16) -> u16 {
+    pair_idx * 2
+}
+
+/// virtqueue index of a queue pair's transmit ring.
+const fn tx_queue_index(pair_idx: u16) -> u16 {
+    pair_idx * 2 + 1
+}
+
+/// virtqueue index of the control queue, which follows every pair the
+/// *device* advertises rather than every pair the driver brought up.
+const fn control_queue_index(device_max_pairs: u16) -> u16 {
+    device_max_pairs * 2
+}
+
+/// How long a queue may hold a notification back.
+///
+/// Both bounds apply at once: whichever of the packet count and the
+/// delay is reached first releases the notification, so a saturated
+/// queue coalesces by count and an idle one is still bounded by time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CoalescingBudget {
+    max_packets: u32,
+    max_usecs: u32,
+}
+
+impl CoalescingBudget {
+    /// `struct virtio_net_ctrl_coal`: the payload of a device-wide
+    /// `NOTF_COAL_RX_SET` / `NOTF_COAL_TX_SET`.
+    fn encode(self) -> [u8; CTRL_NOTF_COAL_PAYLOAD_BYTES] {
+        let mut payload = [0; CTRL_NOTF_COAL_PAYLOAD_BYTES];
+        payload[..4].copy_from_slice(&self.max_packets.to_le_bytes());
+        payload[4..].copy_from_slice(&self.max_usecs.to_le_bytes());
+        payload
+    }
+
+    /// `struct virtio_net_ctrl_coal_vq`: the same budget addressed to
+    /// one virtqueue, which is what a per-CPU queue layout programs.
+    fn encode_for_queue(self, queue: u16) -> [u8; CTRL_NOTF_COAL_VQ_PAYLOAD_BYTES] {
+        let mut payload = [0; CTRL_NOTF_COAL_VQ_PAYLOAD_BYTES];
+        payload[..2].copy_from_slice(&queue.to_le_bytes());
+        // Bytes 2..4 are the reserved half of the header and stay zero.
+        payload[4..].copy_from_slice(&self.encode());
+        payload
+    }
+}
+
+/// What a device does about notification coalescing, as negotiated.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NotificationCoalescing {
+    /// `VIRTIO_NET_F_NOTF_COAL`: one budget for every receive queue and
+    /// one for every transmit queue.
+    pub device_wide: bool,
+    /// `VIRTIO_NET_F_VQ_NOTF_COAL`: a budget per virtqueue.
+    pub per_queue: bool,
+}
+
+impl NotificationCoalescing {
+    /// Whether the device coalesces at all.
+    pub const fn enabled(self) -> bool {
+        self.device_wide
+    }
+}
 
 /// Checksum-offload metadata for one transmit frame: the device
 /// finishes the one's-complement sum from byte `start` of the frame and
@@ -546,6 +658,27 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             } else {
                 0
             };
+            // Notification coalescing is programmed over the control
+            // queue, so it is only worth asking for when the control
+            // queue itself is in. The per-virtqueue form is a strict
+            // refinement of the device-wide one and the spec has the
+            // driver take both.
+            let coalescing_mask = if offered & NET_FEATURE_CTRL_VQ != 0 {
+                let device_wide = offered & NET_FEATURE_NOTF_COAL;
+                let per_queue = if device_wide != 0 {
+                    offered & NET_FEATURE_VQ_NOTF_COAL
+                } else {
+                    0
+                };
+                let ctrl_vq = if device_wide != 0 {
+                    NET_FEATURE_CTRL_VQ
+                } else {
+                    0
+                };
+                device_wide | per_queue | ctrl_vq
+            } else {
+                0
+            };
             RING_FEATURES
                 | NET_FEATURE_CSUM
                 | NET_FEATURE_MAC
@@ -556,6 +689,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 | guest_csum_mask
                 | mrg_mask
                 | guest_gso_mask
+                | coalescing_mask
         })?;
 
         let mac_address = read_mac_address(&transport);
@@ -603,8 +737,8 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
 
         let mut queue_pairs: Vec<NetQueuePair<T>> = Vec::with_capacity(usize::from(pair_count));
         for pair_idx in 0..pair_count {
-            let rx_queue_index = pair_idx * 2;
-            let tx_queue_index = pair_idx * 2 + 1;
+            let rx_queue_index = rx_queue_index(pair_idx);
+            let tx_queue_index = tx_queue_index(pair_idx);
             let rx_queue_size = transport.queue_max_size(rx_queue_index).min(NET_QUEUE_SIZE);
             let tx_queue_size = transport.queue_max_size(tx_queue_index).min(NET_QUEUE_SIZE);
             if rx_queue_size == 0
@@ -716,7 +850,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             } else {
                 1
             };
-            let ctrl_index = device_max * 2;
+            let ctrl_index = control_queue_index(device_max);
             let ctrl_size = transport.queue_max_size(ctrl_index).min(NET_QUEUE_SIZE);
             if ctrl_size != 0 && ctrl_size.is_power_of_two() {
                 let queue = VirtQueue::new(
@@ -792,6 +926,13 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             device.send_set_vq_pairs(device.queue_pair_count())?;
         }
 
+        // Coalescing is programmed after the pairs are active, because
+        // the per-virtqueue form addresses queues by index and a pair
+        // the device has not been told to activate has no budget to set.
+        if features.device(NET_FEATURE_NOTF_COAL) {
+            device.send_notification_coalescing()?;
+        }
+
         // The negotiated set is the only record of what the host packet
         // path was actually able to offer: a slirp-backed device
         // negotiates neither multiqueue nor segmentation offload, so a
@@ -815,6 +956,10 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             mrg_rxbuf = device.mergeable_rx_buffers,
             mq = features.device(NET_FEATURE_MQ),
             ctrl_vq = features.device(NET_FEATURE_CTRL_VQ),
+            notf_coal = features.device(NET_FEATURE_NOTF_COAL),
+            vq_notf_coal = features.device(NET_FEATURE_VQ_NOTF_COAL),
+            notf_coal_max_packets = NET_NOTF_COAL_MAX_PACKETS,
+            notf_coal_max_usecs = NET_NOTF_COAL_MAX_USECS,
             status = device.status_negotiated,
             link_up = device.link_up.load(Ordering::Relaxed),
             max_frame_len = device.max_frame_len,
@@ -880,8 +1025,8 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 polling: true,
                 interrupts: true,
                 adaptive_moderation: false,
-                rx_coalescing: false,
-                tx_coalescing: false,
+                rx_coalescing: self.notification_coalescing().enabled(),
+                tx_coalescing: self.notification_coalescing().enabled(),
                 rx_poll_budget: DEFAULT_POLL_BUDGET,
                 tx_completion_budget: DEFAULT_POLL_BUDGET,
             },
@@ -899,13 +1044,17 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         self.features
     }
 
-    fn send_set_vq_pairs(&self, pairs: usize) -> IoResult<()> {
+    /// Issues one control-queue command and waits for the device's ack.
+    ///
+    /// Every command the driver sends has the same shape — a one-byte
+    /// class, a one-byte command id, a fixed payload, and a single ack
+    /// byte back — so the submission lives here once and each caller
+    /// only spells out its own payload.
+    fn send_control_command(&self, class: u8, command: u8, payload: &[u8]) -> IoResult<()> {
         let Some(control) = self.control.as_ref() else {
             return Err(IoError::Unsupported);
         };
-        let pairs_u16 = u16::try_from(pairs).map_err(|_| IoError::DeviceFault)?;
         let mut state = control.lock();
-        let pairs_bytes = pairs_u16.to_le_bytes();
         // Destructure under `&mut` so the split borrows of the
         // queue, cmd buffer, and ack buffer are independent for the
         // duration of the submission.
@@ -914,12 +1063,17 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             cmd_buffer,
             ack_buffer,
         } = &mut *state;
-        cmd_buffer[0] = CTRL_CLASS_MQ;
-        cmd_buffer[1] = CTRL_CMD_MQ_VQ_PAIRS_SET;
-        cmd_buffer[2] = pairs_bytes[0];
-        cmd_buffer[3] = pairs_bytes[1];
+        let len = 2 + payload.len();
+        assert!(
+            len <= cmd_buffer.len(),
+            "virtio-net control command {class}/{command} needs {len} bytes but the scratch buffer holds {}",
+            cmd_buffer.len()
+        );
+        cmd_buffer[0] = class;
+        cmd_buffer[1] = command;
+        cmd_buffer[2..len].copy_from_slice(payload);
         ack_buffer[0] = CTRL_ACK_PENDING;
-        let cmd_slice: &[u8] = &cmd_buffer[..CTRL_MQ_PAIRS_CMD_BYTES];
+        let cmd_slice: &[u8] = &cmd_buffer[..len];
         let ack_slice: &mut [u8] = &mut ack_buffer[..];
         let _token = queue.submit(&self.transport, &[cmd_slice], &mut [ack_slice])?;
         queue.notify(&self.transport);
@@ -938,6 +1092,61 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             return Err(IoError::DeviceFault);
         }
         Ok(())
+    }
+
+    fn send_set_vq_pairs(&self, pairs: usize) -> IoResult<()> {
+        let pairs = u16::try_from(pairs).map_err(|_| IoError::DeviceFault)?;
+        let mut payload = [0_u8; CTRL_MQ_PAIRS_PAYLOAD_BYTES];
+        payload.copy_from_slice(&pairs.to_le_bytes());
+        self.send_control_command(CTRL_CLASS_MQ, CTRL_CMD_MQ_VQ_PAIRS_SET, &payload)
+    }
+
+    /// Programs notification coalescing for every queue this device
+    /// brought up.
+    ///
+    /// A per-CPU queue layout wants the per-virtqueue form: each pair is
+    /// driven by its own processor at its own rate, and one device-wide
+    /// setting would make an idle pair pay the busy pair's delay. When
+    /// the device only offers the device-wide form the same budget is
+    /// programmed once for receive and once for transmit, which is the
+    /// same policy at a coarser grain.
+    fn send_notification_coalescing(&self) -> IoResult<()> {
+        let budget = CoalescingBudget {
+            max_packets: NET_NOTF_COAL_MAX_PACKETS,
+            max_usecs: NET_NOTF_COAL_MAX_USECS,
+        };
+        if self.features.device(NET_FEATURE_VQ_NOTF_COAL) {
+            for pair_idx in 0..self.queue_pair_count() {
+                let pair_idx = u16::try_from(pair_idx).map_err(|_| IoError::DeviceFault)?;
+                for queue in [rx_queue_index(pair_idx), tx_queue_index(pair_idx)] {
+                    self.send_control_command(
+                        CTRL_CLASS_NOTF_COAL,
+                        CTRL_CMD_NOTF_COAL_VQ_SET,
+                        &budget.encode_for_queue(queue),
+                    )?;
+                }
+            }
+            return Ok(());
+        }
+        self.send_control_command(
+            CTRL_CLASS_NOTF_COAL,
+            CTRL_CMD_NOTF_COAL_RX_SET,
+            &budget.encode(),
+        )?;
+        self.send_control_command(
+            CTRL_CLASS_NOTF_COAL,
+            CTRL_CMD_NOTF_COAL_TX_SET,
+            &budget.encode(),
+        )
+    }
+
+    /// Whether the device holds notifications back for a batch or a
+    /// delay, and at what grain.
+    pub fn notification_coalescing(&self) -> NotificationCoalescing {
+        NotificationCoalescing {
+            device_wide: self.features.device(NET_FEATURE_NOTF_COAL),
+            per_queue: self.features.device(NET_FEATURE_VQ_NOTF_COAL),
+        }
     }
 
     pub fn handle_interrupt(&self) {
@@ -2603,5 +2812,36 @@ mod tests {
         );
         assert_eq!(&buffer[..header_len], zero_header);
         assert_eq!(&buffer[header_len..header_len + second.len()], second);
+    }
+
+    /// virtio-net lays its queues out RX0, TX0, RX1, TX1, ... and the
+    /// control queue follows every pair the *device* advertises, not
+    /// every pair the driver activated. Programming a coalescing budget
+    /// for the wrong index would silently tune somebody else's ring.
+    #[test]
+    fn queue_indices_follow_the_virtio_net_layout() {
+        assert_eq!(super::rx_queue_index(0), 0);
+        assert_eq!(super::tx_queue_index(0), 1);
+        assert_eq!(super::rx_queue_index(3), 6);
+        assert_eq!(super::tx_queue_index(3), 7);
+        assert_eq!(super::control_queue_index(4), 8);
+    }
+
+    #[test]
+    fn coalescing_budget_encodes_the_control_queue_payloads() {
+        let budget = super::CoalescingBudget {
+            max_packets: 8,
+            max_usecs: 50,
+        };
+
+        // `struct virtio_net_ctrl_coal`: max_packets then max_usecs.
+        assert_eq!(budget.encode(), [8, 0, 0, 0, 50, 0, 0, 0]);
+
+        // `struct virtio_net_ctrl_coal_vq`: the virtqueue number, two
+        // reserved bytes, then the same budget.
+        assert_eq!(
+            budget.encode_for_queue(super::tx_queue_index(2)),
+            [5, 0, 0, 0, 8, 0, 0, 0, 50, 0, 0, 0]
+        );
     }
 }
