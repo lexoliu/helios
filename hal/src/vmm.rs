@@ -42,7 +42,7 @@ use core::future::Future;
 use thiserror::Error;
 
 use crate::cpu::ProcessorId;
-use crate::pmm::PhysFrame;
+use crate::pmm::{PhysFrame, PhysFrameRange};
 
 /// Virtual address. No alignment guarantees; ranges check
 /// [`VirtRange::is_page_aligned`] where required.
@@ -108,6 +108,16 @@ bitflags! {
         const READ    = 1 << 0;
         const WRITE   = 1 << 1;
         const EXECUTE = 1 << 2;
+        /// Map with the processor's device-memory attribute rather than
+        /// as ordinary cacheable memory: accesses are not gathered, not
+        /// reordered and not speculated. A register window mapped
+        /// without this reads whatever the cache happens to hold, which
+        /// is a fault that presents as a device that does not respond.
+        ///
+        /// Only meaningful together with [`AddressSpace::map_physical`];
+        /// [`AddressSpace::commit`] materialises ordinary memory and
+        /// rejects it.
+        const DEVICE  = 1 << 3;
     }
 }
 
@@ -126,6 +136,15 @@ pub enum Translation {
 /// Failures from [`AddressSpace`] mutating operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub enum AddressSpaceError {
+    #[error(
+        "this backend has no lazy-commit address space, so physical memory cannot be placed in \
+         a reservation"
+    )]
+    PhysicalMappingUnsupported,
+    #[error("physical range is not page-aligned")]
+    MisalignedPhysical,
+    #[error("physical range does not cover the virtual range")]
+    LengthMismatch,
     #[error("range is not page-aligned")]
     Misaligned,
     #[error("range is empty")]
@@ -236,6 +255,40 @@ pub trait AddressSpace: Send + Sync + 'static {
 
     /// Look up the current state of `addr`. Lock-free.
     fn translate(&self, addr: VirtAddr) -> Translation;
+
+    /// Map `physical` behind `virt`, which must be a sub-range of an
+    /// existing reservation, instead of frames the address space owns.
+    ///
+    /// This is how memory that is not the address space's to allocate
+    /// gets into a reservation: a device's register window, or a run of
+    /// frames pinned for DMA. The frames belong to the caller for as
+    /// long as the mapping stands, and [`Self::unmap_physical`] is what
+    /// gives them back — [`Self::decommit`] would hand them to the
+    /// address space's own pool, which never owned them.
+    ///
+    /// `flags` carries [`PageFlags::DEVICE`] for a register window.
+    /// `virt` must already be decommitted, and `physical` must cover
+    /// exactly `virt.byte_len` bytes.
+    ///
+    /// The default reports [`AddressSpaceError::PhysicalMappingUnsupported`],
+    /// which is the honest answer for a backend without a real
+    /// reserve/commit address space: there is no reservation to place
+    /// anything in.
+    fn map_physical(
+        &self,
+        _virt: VirtRange,
+        _physical: PhysFrameRange,
+        _flags: PageFlags,
+    ) -> Result<(), AddressSpaceError> {
+        Err(AddressSpaceError::PhysicalMappingUnsupported)
+    }
+
+    /// Undo a [`Self::map_physical`], leaving `virt` reserved and
+    /// faulting again, and returning nothing to the address space's own
+    /// frame pool.
+    fn unmap_physical(&self, _virt: VirtRange) -> Result<(), AddressSpaceError> {
+        Err(AddressSpaceError::PhysicalMappingUnsupported)
+    }
 
     /// Relocate the physical backing of an already-committed range
     /// without changing its virtual base address.

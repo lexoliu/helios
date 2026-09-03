@@ -35,7 +35,7 @@ use core::arch::asm;
 use core::ffi::c_int;
 use core::ptr::{self, NonNull};
 
-use helios_hal::pmm::PhysFrame;
+use helios_hal::pmm::{PhysFrame, PhysFrameRange};
 use helios_hal::vmm::{
     AddressSpace, AddressSpaceError, PageFlags, Translation, VirtAddr, VirtRange,
 };
@@ -63,6 +63,10 @@ const TABLE_DESCRIPTOR: u64 = 0b11;
 const AF: u64 = 1 << 10;
 const SH_INNER: u64 = 0b11 << 8;
 const ATTR_NORMAL: u64 = 0; // MAIR index 0: outer/inner write-back cacheable.
+/// MAIR index 7: device nGnRnE, the attribute the boot code programmes
+/// for every MMIO window the kernel maps for itself. A register window
+/// placed in a user reservation gets the same one.
+const ATTR_DEVICE: u64 = 7;
 const PXN: u64 = 1 << 53;
 const UXN: u64 = 1 << 54;
 const PT_ADDR_MASK: u64 = 0x0000_ffff_ffff_f000;
@@ -437,6 +441,24 @@ impl Aarch64UserAddressSpace {
         Ok(())
     }
 
+    /// Takes `pages` mappings down from `start` without returning
+    /// anything to the frame pool: the frames these entries point at
+    /// were never the address space's to allocate.
+    fn unmap_physical_pages(&self, start: usize, pages: usize) {
+        for index in 0..pages {
+            let page = start + index * PAGE;
+            // The entries were installed by this call, so a failure here
+            // would mean the page tables changed underneath the lock.
+            self.unmap_4k_no_flush(page)
+                .unwrap_or_else(|error| panic!("AArch64 physical mapping vanished: {error}"));
+        }
+        if pages != 0 {
+            unsafe {
+                flush_tlb_pages(start, pages);
+            }
+        }
+    }
+
     fn flush_and_dealloc_entries(&self, start: usize, entries: &[u64]) {
         unsafe {
             flush_tlb_pages(start, entries.len());
@@ -592,6 +614,49 @@ impl AddressSpace for Aarch64UserAddressSpace {
         Ok(())
     }
 
+    fn map_physical(
+        &self,
+        virt: VirtRange,
+        physical: PhysFrameRange,
+        flags: PageFlags,
+    ) -> Result<(), AddressSpaceError> {
+        validate_range(virt)?;
+        if physical.frame_count != virt.frame_count() {
+            return Err(AddressSpaceError::LengthMismatch);
+        }
+        let pte_flags = page_flags_to_pte(flags)?;
+        let mut state = self.state.lock();
+        state.precheck_commit(virt)?;
+
+        let mut mapped_pages = 0;
+        for (index, offset) in (0..virt.byte_len).step_by(PAGE).enumerate() {
+            let virt_addr = virt.start.raw() + offset;
+            let phys = physical.start.phys_addr() + index * PAGE;
+            if let Err(error) = self.map_4k_no_flush(virt_addr, phys, pte_flags) {
+                // The frames belong to the caller, so rolling back only
+                // takes the mappings down; nothing goes to the pool.
+                self.unmap_physical_pages(virt.start.raw(), mapped_pages);
+                return Err(error);
+            }
+            mapped_pages += 1;
+        }
+        if mapped_pages != 0 {
+            unsafe {
+                flush_tlb_pages(virt.start.raw(), mapped_pages);
+            }
+        }
+        state.record_commit(virt, flags)?;
+        Ok(())
+    }
+
+    fn unmap_physical(&self, virt: VirtRange) -> Result<(), AddressSpaceError> {
+        validate_range(virt)?;
+        let mut state = self.state.lock();
+        state.record_decommit(virt)?;
+        self.unmap_physical_pages(virt.start.raw(), virt.frame_count());
+        Ok(())
+    }
+
     fn protect(&self, virt: VirtRange, flags: PageFlags) -> Result<(), AddressSpaceError> {
         validate_range(virt)?;
         let mut state = self.state.lock();
@@ -645,7 +710,17 @@ fn page_flags_to_pte(flags: PageFlags) -> Result<u64, AddressSpaceError> {
     if flags.is_empty() {
         return Err(AddressSpaceError::InvalidFlags);
     }
-    let mut pte = (ATTR_NORMAL << 2) | PXN | UXN;
+    // Executable device memory is a contradiction the architecture does
+    // not describe, and nothing has a reason to ask for it.
+    if flags.contains(PageFlags::DEVICE) && flags.contains(PageFlags::EXECUTE) {
+        return Err(AddressSpaceError::InvalidFlags);
+    }
+    let attr = if flags.contains(PageFlags::DEVICE) {
+        ATTR_DEVICE
+    } else {
+        ATTR_NORMAL
+    };
+    let mut pte = (attr << 2) | PXN | UXN;
     if flags.contains(PageFlags::WRITE) {
         pte |= AP_KERNEL_RW;
     } else {
