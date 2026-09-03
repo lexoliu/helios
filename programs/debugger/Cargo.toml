@@ -14,3 +14,6 @@ thiserror = "2.0.17"
 name = "helios_debugger"
 path = "src/main.rs"
 crate-type = ["cdylib"]
+
+[lints]
+workspace = true

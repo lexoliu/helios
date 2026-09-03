@@ -8,13 +8,17 @@
 //! tests can assert on them and can play the device side by writing into
 //! the rings directly.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::alloc::Layout;
 use core::cell::UnsafeCell;
+use core::ptr::NonNull;
+use core::sync::atomic::AtomicUsize;
 
 use helios_hal::io::{IoError, IoResult};
 use spin::Mutex;
 
-use crate::bus::{DeviceBus, DmaPool, IdentityDmaPool};
+use crate::bus::{DeviceBus, DmaAddressing, DmaBuffer, DmaPool, IdentityDmaPool};
 use crate::transport::{DeviceStatus, DeviceType, InterruptStatus, VirtioTransport};
 
 const REG_MAGIC_VALUE: usize = 0x000;
@@ -369,5 +373,136 @@ impl<P: DmaPool> VirtioTransport for FakeTransport<P> {
 
     fn write_config_u32(&self, offset: usize, value: u32) {
         self.bus.write_u32(offset, value);
+    }
+}
+
+/// Where the device-visible window of a [`WindowDmaPool`] starts.
+///
+/// Any value below 16 TiB keeps the window's 4 KiB frame numbers inside
+/// the 32 bits the balloon protocol carries; starting above 4 GiB also
+/// keeps a test from mistaking a small offset for a host pointer.
+pub(crate) const DEVICE_WINDOW_BASE: u64 = 1 << 32;
+
+/// Where the storage behind a [`WindowDmaPool`] lives and how much of it
+/// has been handed out.
+struct WindowArena {
+    storage: Vec<u8>,
+    next: AtomicUsize,
+}
+
+/// A DMA pool that carves its buffers — ring memory and the pages a
+/// test posts alike — out of one arena and publishes them as a compact
+/// device address window starting at [`DEVICE_WINDOW_BASE`].
+///
+/// [`IdentityDmaPool`] hands a device the host heap addresses as they
+/// are, which a Linux heap places far above the 32-bit page-frame space
+/// some devices count in. Tests of such devices take the memory whose
+/// frame numbers matter from this pool instead, and the window keeps
+/// those small no matter where the host placed the arena; memory from
+/// anywhere else still translates identically. The pool is a bump
+/// allocator: nothing is ever freed, which is fine for a test's few
+/// kilobytes.
+#[derive(Clone)]
+pub(crate) struct WindowDmaPool {
+    arena: Arc<WindowArena>,
+}
+
+pub(crate) struct WindowDmaBuffer {
+    ptr: NonNull<u8>,
+    len: usize,
+    device_address: u64,
+}
+
+unsafe impl Send for WindowDmaBuffer {}
+unsafe impl Sync for WindowDmaBuffer {}
+
+impl WindowDmaPool {
+    /// A pool over `size` bytes, page aligned at the start.
+    pub(crate) fn new(size: usize) -> Self {
+        Self {
+            arena: Arc::new(WindowArena {
+                storage: alloc::vec![0; size + PAGE_ALIGNMENT],
+                next: AtomicUsize::new(0),
+            }),
+        }
+    }
+
+    fn arena_base(&self) -> usize {
+        (self.arena.storage.as_ptr() as usize).next_multiple_of(PAGE_ALIGNMENT)
+    }
+
+    fn arena_len(&self) -> usize {
+        self.arena.storage.len() - (self.arena_base() - self.arena.storage.as_ptr() as usize)
+    }
+
+    /// A zeroed, page-aligned buffer of `pages` 4 KiB pages.
+    pub(crate) fn pages(&self, pages: usize) -> WindowDmaBuffer {
+        let layout = Layout::from_size_align(pages * PAGE_ALIGNMENT, PAGE_ALIGNMENT)
+            .expect("a page count small enough for a test");
+        self.allocate_zeroed(layout)
+            .expect("the test arena is large enough for its pages")
+    }
+}
+
+const PAGE_ALIGNMENT: usize = 4096;
+
+impl DmaPool for WindowDmaPool {
+    type Buffer = WindowDmaBuffer;
+
+    fn allocate_zeroed(&self, layout: Layout) -> IoResult<Self::Buffer> {
+        let base = self.arena_base();
+        let mut offset = 0;
+        let taken = self.arena.next.fetch_update(
+            core::sync::atomic::Ordering::SeqCst,
+            core::sync::atomic::Ordering::SeqCst,
+            |next| {
+                offset = next.next_multiple_of(layout.align());
+                let end = offset.checked_add(layout.size())?;
+                (end <= self.arena_len()).then_some(end)
+            },
+        );
+        taken.map_err(|_| IoError::DeviceFault)?;
+        let ptr = NonNull::new((base + offset) as *mut u8).ok_or(IoError::DeviceFault)?;
+        Ok(WindowDmaBuffer {
+            ptr,
+            len: layout.size(),
+            device_address: DEVICE_WINDOW_BASE + offset as u64,
+        })
+    }
+
+    /// Arena memory translates into the window; everything else — a
+    /// request header a driver builds on its stack, say — keeps its host
+    /// address, the way a kernel's linear map would.
+    fn dma_addr(&self, ptr: *const u8) -> IoResult<u64> {
+        let host = ptr as usize;
+        match host.checked_sub(self.arena_base()) {
+            Some(offset) if offset < self.arena_len() => Ok(DEVICE_WINDOW_BASE + offset as u64),
+            _ => Ok(host as u64),
+        }
+    }
+
+    fn addressing(&self) -> DmaAddressing {
+        DmaAddressing::Physical
+    }
+}
+
+impl DmaBuffer for WindowDmaBuffer {
+    fn phys_addr(&self) -> u64 {
+        self.device_address
+    }
+
+    fn as_ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+impl WindowDmaBuffer {
+    /// The buffer as guest memory a driver can be handed.
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 }

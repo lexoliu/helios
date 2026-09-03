@@ -7,3 +7,6 @@ edition.workspace = true
 critical-section = "1.2.0"
 helios-hal.workspace = true
 pci_types = "0.10.1"
+
+[lints]
+workspace = true

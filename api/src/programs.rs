@@ -101,6 +101,18 @@ pub struct Child {
     inner: raw::Child,
 }
 
+/// The child closed its standard input before the bytes were delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StdinClosed;
+
+impl core::fmt::Display for StdinClosed {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("the child closed its standard input")
+    }
+}
+
+impl std::error::Error for StdinClosed {}
+
 impl Child {
     /// Launch a program and return a live [`Child`] handle.
     pub async fn spawn(request: SpawnRequest) -> Result<Self, SpawnError> {
@@ -110,7 +122,7 @@ impl Child {
 
     /// Pipe `bytes` into the child's stdin and close the writer. Returns
     /// when the delivery completes.
-    pub async fn write_stdin(&self, bytes: Vec<u8>) -> Result<(), ()> {
+    pub async fn write_stdin(&self, bytes: Vec<u8>) -> Result<(), StdinClosed> {
         let (mut tx, rx) = wit_stream::new::<u8>();
         let future = self.inner.stdin(rx);
         let produce = async move {
@@ -120,7 +132,7 @@ impl Child {
             drop(tx);
         };
         let ((), result) = zip(produce, std::future::IntoFuture::into_future(future)).await;
-        result
+        result.map_err(|()| StdinClosed)
     }
 
     /// Collect the child's entire stdout as a `Vec<u8>`.

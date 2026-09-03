@@ -26,3 +26,6 @@ i6300esb.workspace = true
 helios-kernel = { workspace = true, default-features = false, features = ["wasmtime-riscv64"] }
 helios-virtio = { path = "../virtio" }
 tracing.workspace = true
+
+[lints]
+workspace = true

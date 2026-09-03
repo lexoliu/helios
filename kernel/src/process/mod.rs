@@ -3,7 +3,7 @@
 //! `table` and `thread` track live processes and their threads.
 //! `authority` declares the capability rights granted to a process.
 //! `descriptor` is the per-process file/handle table. `futex` backs
-//! `wasi:threads` futex wait/wake. `program_service` exposes the
+//! guest thread futex wait/wake. `program_service` exposes the
 //! program execution status types used by both the runtime backend
 //! and the kernel-facing API.
 

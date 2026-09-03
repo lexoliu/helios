@@ -468,7 +468,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
     platform_state.install_debug_state(debug_state.clone());
     let console = helios_kernel::RecordingConsole::new(
         debug_state.clone(),
-        || read_counter(),
+        read_counter,
         Some(write_debug_serial_bytes),
     );
     let mut devices = DeviceInventory::new().with_debug_serial();
@@ -492,7 +492,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
         devices = devices.with_block_devices(block_device_count);
     }
     let kernel = helios_kernel::init(
-        Platform::new(console, core::iter::empty::<MemoryRegion>(), cpu.clone())
+        Platform::new(console, core::iter::empty::<MemoryRegion>(), cpu)
             .with_topology(
                 ProcessorTopology::start_all_secondaries(
                     cpu.bootstrap_processor(),
@@ -968,11 +968,11 @@ unsafe extern "C" fn aarch64_secondary_main(mp_info: &MpInfo) -> ! {
     let debug_state = state.debug_state();
     let console = helios_kernel::RecordingConsole::new(
         debug_state.clone(),
-        || read_counter(),
+        read_counter,
         Some(write_debug_serial_bytes),
     );
     let kernel = helios_kernel::init(
-        Platform::new(console, core::iter::empty::<MemoryRegion>(), cpu.clone())
+        Platform::new(console, core::iter::empty::<MemoryRegion>(), cpu)
             .with_timer_frequency_hz(cpu.timer_frequency())
             .with_dma_model(DmaModel::Translated)
             .with_devices(DeviceInventory::new().with_debug_serial()),

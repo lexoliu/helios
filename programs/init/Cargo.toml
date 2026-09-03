@@ -11,3 +11,6 @@ helios-api = { path = "../../api", default-features = false }
 name = "helios_init"
 path = "src/main.rs"
 crate-type = ["cdylib"]
+
+[lints]
+workspace = true

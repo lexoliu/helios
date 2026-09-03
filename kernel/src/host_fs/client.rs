@@ -1621,6 +1621,23 @@ mod tests {
         assert_eq!(output, b"prefix-abc");
     }
 
+    /// The three 9P2000.L timestamps of an `Rgetattr` reply, each a
+    /// `(seconds, nanoseconds)` pair.
+    struct RgetattrTimes {
+        access: (u64, u64),
+        modified: (u64, u64),
+        status: (u64, u64),
+    }
+
+    impl RgetattrTimes {
+        /// The timestamps a test that does not look at them uses.
+        const ZERO: Self = Self {
+            access: (0, 0),
+            modified: (0, 0),
+            status: (0, 0),
+        };
+    }
+
     /// Builds an `Rgetattr` reply with the 9P2000.L field layout.
     fn rgetattr_reply(
         qid_type: u8,
@@ -1628,10 +1645,13 @@ mod tests {
         mode: u32,
         link_count: u64,
         size: u64,
-        access: (u64, u64),
-        modified: (u64, u64),
-        status: (u64, u64),
+        times: RgetattrTimes,
     ) -> alloc::vec::Vec<u8> {
+        let RgetattrTimes {
+            access,
+            modified,
+            status,
+        } = times;
         let mut reply = alloc::vec![0_u8; P9_RGETATTR_LEN];
         reply[..4].copy_from_slice(&(P9_RGETATTR_LEN as u32).to_le_bytes());
         reply[4] = P9_TGETATTR + 1;
@@ -1662,9 +1682,11 @@ mod tests {
             0o100_644,
             3,
             4096,
-            (11, 12),
-            (13, 14),
-            (15, 16),
+            RgetattrTimes {
+                access: (11, 12),
+                modified: (13, 14),
+                status: (15, 16),
+            },
         );
 
         let metadata = parse_getattr_reply(&reply).expect("Rgetattr reply should decode");
@@ -1682,7 +1704,7 @@ mod tests {
 
     #[test]
     fn getattr_reply_reports_directory_qid_type() {
-        let reply = rgetattr_reply(P9_QTDIR, 7, 0o040_755, 2, 0, (0, 0), (0, 0), (0, 0));
+        let reply = rgetattr_reply(P9_QTDIR, 7, 0o040_755, 2, 0, RgetattrTimes::ZERO);
 
         let metadata = parse_getattr_reply(&reply).expect("Rgetattr reply should decode");
 
@@ -1692,7 +1714,7 @@ mod tests {
 
     #[test]
     fn getattr_reply_shorter_than_the_fixed_layout_is_rejected() {
-        let mut reply = rgetattr_reply(0, 1, 0, 1, 0, (0, 0), (0, 0), (0, 0));
+        let mut reply = rgetattr_reply(0, 1, 0, 1, 0, RgetattrTimes::ZERO);
         reply.truncate(P9_RGETATTR_CTIME_SECONDS + 4);
 
         assert!(matches!(
@@ -1923,7 +1945,7 @@ mod tests {
 
     /// The `Rgetattr` body, i.e. the reply without its 7-byte header.
     fn rgetattr_body(size: u64) -> Vec<u8> {
-        let reply = rgetattr_reply(0, 2, 0o100_644, 1, size, (0, 0), (0, 0), (0, 0));
+        let reply = rgetattr_reply(0, 2, 0o100_644, 1, size, RgetattrTimes::ZERO);
         reply[P9_HEADER_LEN..].to_vec()
     }
 

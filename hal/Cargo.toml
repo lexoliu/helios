@@ -8,3 +8,6 @@ bitflags = "2.11.0"
 fdt = { version = "0.1.5", default-features = false }
 thiserror = { version = "2.0.17", default-features = false }
 triomphe = { version = "0.1.15", default-features = false }
+
+[lints]
+workspace = true

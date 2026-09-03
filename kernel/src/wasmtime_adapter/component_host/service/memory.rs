@@ -140,18 +140,11 @@ pub(super) fn preview1_read_memory(
     len: usize,
 ) -> Result<Vec<u8>, ProgramExecError> {
     let start = preview1_memory_start(memory, ptr, len)?;
-    let mut bytes = Vec::with_capacity(len);
-    // SAFETY: the vector has enough capacity for `len` bytes, and the bounds
-    // check above proves the source range lies inside guest memory.
-    unsafe {
-        bytes.set_len(len);
-        core::ptr::copy_nonoverlapping(
-            (memory.base as *const u8).add(start),
-            bytes.as_mut_ptr(),
-            len,
-        );
-    }
-    Ok(bytes)
+    // SAFETY: the bounds check above proves `start..start + len` lies
+    // inside the guest's linear memory, which stays mapped for as long
+    // as the borrow of `memory` lasts.
+    let source = unsafe { core::slice::from_raw_parts((memory.base as *const u8).add(start), len) };
+    Ok(source.to_vec())
 }
 
 pub(super) fn preview1_read_memory_into(
@@ -179,7 +172,7 @@ pub(super) fn preview1_memory_start(
     len: usize,
 ) -> Result<usize, ProgramExecError> {
     let start = ptr as usize;
-    let end = start.checked_add(len).ok_or_else(|| ProgramExecError {
+    let end = start.checked_add(len).ok_or(ProgramExecError {
         kind: ProgramExecErrorKind::InvalidBinary,
         detail: ProgramExecErrorDetail::GuestMemoryAccessOverflow,
     })?;

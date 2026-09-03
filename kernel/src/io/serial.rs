@@ -53,6 +53,20 @@ pub fn emit_serial_stage_marker(io: &impl ByteSerial, stage: &str) {
     io.write_bytes(b"]\n");
 }
 
+pub fn emit_serial_error_marker(io: &impl ByteSerial, label: &str, message: &str) {
+    io.write_bytes(b"\n[KDBG ");
+    io.write_bytes(label.as_bytes());
+    io.write_bytes(b": ");
+    for byte in message.bytes() {
+        match byte {
+            b'\n' | b'\r' => io.write_bytes(b" "),
+            b']' => io.write_bytes(b")"),
+            other => io.write_bytes(&[other]),
+        }
+    }
+    io.write_bytes(b"]\n");
+}
+
 #[cfg(test)]
 mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
@@ -92,18 +106,4 @@ mod tests {
         assert!(bytes.is_empty());
         assert_eq!(bytes.capacity(), 0);
     }
-}
-
-pub fn emit_serial_error_marker(io: &impl ByteSerial, label: &str, message: &str) {
-    io.write_bytes(b"\n[KDBG ");
-    io.write_bytes(label.as_bytes());
-    io.write_bytes(b": ");
-    for byte in message.bytes() {
-        match byte {
-            b'\n' | b'\r' => io.write_bytes(b" "),
-            b']' => io.write_bytes(b")"),
-            other => io.write_bytes(&[other]),
-        }
-    }
-    io.write_bytes(b"]\n");
 }

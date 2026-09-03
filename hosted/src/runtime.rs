@@ -388,11 +388,11 @@ fn spawn_timer_thread(machine: Arc<HostedMachine>, rx: Receiver<TimerCommand>) {
 fn fire_expired_deadlines(machine: &HostedMachine, deadlines: &mut [Option<Instant>]) {
     let now = machine.now();
     for (slot, deadline) in deadlines.iter_mut().enumerate() {
-        if let Some(d) = *deadline {
-            if d <= now {
-                *deadline = None;
-                machine.wake_processor(ProcessorId::new(slot as u16));
-            }
+        if let Some(d) = *deadline
+            && d <= now
+        {
+            *deadline = None;
+            machine.wake_processor(ProcessorId::new(slot as u16));
         }
     }
 }

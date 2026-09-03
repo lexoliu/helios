@@ -234,7 +234,7 @@ where
 {
     let global = instance
         .get_global(&mut *store, "__tls_base")
-        .ok_or_else(|| ProgramExecError {
+        .ok_or(ProgramExecError {
             kind: ProgramExecErrorKind::InvalidBinary,
             detail: ProgramExecErrorDetail::CompilerPluginInvalid,
         })?;

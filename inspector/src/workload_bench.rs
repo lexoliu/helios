@@ -393,9 +393,7 @@ fn select_workloads(command: &WorkloadBenchCommand) -> Result<Vec<Workload>> {
         {
             continue;
         }
-        if !command.classes.is_empty()
-            && !command.classes.iter().any(|class| *class == workload.class)
-        {
+        if !command.classes.is_empty() && !command.classes.contains(&workload.class) {
             continue;
         }
         validate_workload_shape(&workload)?;

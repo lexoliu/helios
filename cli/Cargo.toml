@@ -21,3 +21,6 @@ toml = "0.8.23"
 walkdir = "2.5.0"
 wasmparser = "0.245.0"
 wit-component = "0.245.0"
+
+[lints]
+workspace = true

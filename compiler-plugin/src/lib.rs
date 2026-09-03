@@ -39,6 +39,13 @@ pub extern "C" fn helios_compiler_alloc(len: usize, align: usize) -> *mut u8 {
     unsafe { std::alloc::alloc(layout) }
 }
 
+/// Releases an allocation made by `helios_compiler_alloc`.
+///
+/// # Safety
+///
+/// `ptr` must come from `helios_compiler_alloc`, `len` and `align`
+/// must be the ones it was allocated with, and the allocation must not
+/// have been freed already.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn helios_compiler_free(ptr: *mut u8, len: usize, align: usize) {
     let layout = std::alloc::Layout::from_size_align(len, align)
@@ -48,6 +55,13 @@ pub unsafe extern "C" fn helios_compiler_free(ptr: *mut u8, len: usize, align: u
     }
 }
 
+/// Compiles the request encoded at `request_ptr` and returns the
+/// address of the response in the plugin's own linear memory.
+///
+/// # Safety
+///
+/// `request_ptr..request_ptr + request_len` must be a readable range of
+/// this module's linear memory holding an encoded compile request.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn helios_compiler_compile(request_ptr: u32, request_len: u32) -> u32 {
     let request = unsafe { read_request(request_ptr, request_len) };

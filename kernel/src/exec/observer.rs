@@ -328,6 +328,33 @@ impl ProfileHistory {
     }
 }
 
+/// One measured interval: the work it did, how long it took, and what
+/// the hardware counters saw while it ran.
+///
+/// The four numbers are always produced and consumed together, so they
+/// travel as one value from the measuring site down into the history.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PerfSample {
+    /// Discrete units of work, for rates the elapsed time cannot express
+    /// on its own. Zero when the interval is only timed.
+    pub events: u64,
+    pub elapsed_nanos: u64,
+    pub counters: HardwarePerfCounterDelta,
+    pub bytes: u64,
+}
+
+impl PerfSample {
+    /// A timed interval that counted no discrete events.
+    pub fn timed(elapsed_nanos: u64, counters: HardwarePerfCounterDelta, bytes: u64) -> Self {
+        Self {
+            events: 0,
+            elapsed_nanos,
+            counters,
+            bytes,
+        }
+    }
+}
+
 impl PerfMetricHistory {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity != 0, "perf metric capacity must be non-zero");
@@ -341,15 +368,8 @@ impl PerfMetricHistory {
         self.samples.clear();
     }
 
-    pub fn record_str(
-        &mut self,
-        scope: ProfileScope,
-        name: &str,
-        elapsed_nanos: u64,
-        counters: HardwarePerfCounterDelta,
-        bytes: u64,
-    ) {
-        self.record_input(scope, name, 0, elapsed_nanos, counters, bytes);
+    pub fn record_str(&mut self, scope: ProfileScope, name: &str, sample: PerfSample) {
+        self.record_input(scope, name, sample);
     }
 
     pub fn record_parts(
@@ -357,44 +377,21 @@ impl PerfMetricHistory {
         scope: ProfileScope,
         prefix: &str,
         suffix: &str,
-        elapsed_nanos: u64,
-        counters: HardwarePerfCounterDelta,
-        bytes: u64,
+        sample: PerfSample,
     ) {
-        self.record_parts_events(scope, prefix, suffix, 0, elapsed_nanos, counters, bytes);
+        self.record_input(scope, ProfileStackParts { prefix, suffix }, sample);
     }
 
-    pub fn record_parts_events(
-        &mut self,
-        scope: ProfileScope,
-        prefix: &str,
-        suffix: &str,
-        events: u64,
-        elapsed_nanos: u64,
-        counters: HardwarePerfCounterDelta,
-        bytes: u64,
-    ) {
-        self.record_input(
-            scope,
-            ProfileStackParts { prefix, suffix },
+    fn record_input<Name>(&mut self, scope: ProfileScope, name: Name, sample: PerfSample)
+    where
+        Name: ProfileStackInput,
+    {
+        let PerfSample {
             events,
             elapsed_nanos,
             counters,
             bytes,
-        );
-    }
-
-    fn record_input<Name>(
-        &mut self,
-        scope: ProfileScope,
-        name: Name,
-        events: u64,
-        elapsed_nanos: u64,
-        counters: HardwarePerfCounterDelta,
-        bytes: u64,
-    ) where
-        Name: ProfileStackInput,
-    {
+        } = sample;
         if events == 0
             && elapsed_nanos == 0
             && bytes == 0
@@ -619,8 +616,8 @@ mod tests {
     use alloc::vec;
 
     use super::{
-        PerfMetricFilter, PerfMetricHistory, ProfileFilter, ProfileHistory, ProfileScope,
-        TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceValue,
+        PerfMetricFilter, PerfMetricHistory, PerfSample, ProfileFilter, ProfileHistory,
+        ProfileScope, TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceValue,
         matches_trace_filter, parse_console_text,
     };
     use helios_hal::cpu::HardwarePerfCounterDelta;
@@ -724,25 +721,31 @@ mod tests {
             ProfileScope::Kernel,
             "kernel;network;",
             "tx-submit",
-            10,
-            HardwarePerfCounterDelta {
-                reference_cycles: 30,
-                cpu_cycles: 40,
-                instructions_retired: 50,
+            PerfSample {
+                events: 0,
+                elapsed_nanos: 10,
+                counters: HardwarePerfCounterDelta {
+                    reference_cycles: 30,
+                    cpu_cycles: 40,
+                    instructions_retired: 50,
+                },
+                bytes: 1500,
             },
-            1500,
         );
         history.record_parts(
             ProfileScope::Kernel,
             "kernel;network;",
             "tx-submit",
-            25,
-            HardwarePerfCounterDelta {
-                reference_cycles: 70,
-                cpu_cycles: 80,
-                instructions_retired: 90,
+            PerfSample {
+                events: 0,
+                elapsed_nanos: 25,
+                counters: HardwarePerfCounterDelta {
+                    reference_cycles: 70,
+                    cpu_cycles: 80,
+                    instructions_retired: 90,
+                },
+                bytes: 9000,
             },
-            9000,
         );
 
         let samples = history.recent(
@@ -769,23 +772,27 @@ mod tests {
     #[test]
     fn perf_metric_history_aggregates_events_without_latency() {
         let mut history = PerfMetricHistory::new(4);
-        history.record_parts_events(
+        history.record_parts(
             ProfileScope::Kernel,
             "kernel;executor;",
             "local-runnable",
-            7,
-            0,
-            HardwarePerfCounterDelta::default(),
-            0,
+            PerfSample {
+                events: 7,
+                elapsed_nanos: 0,
+                counters: HardwarePerfCounterDelta::default(),
+                bytes: 0,
+            },
         );
-        history.record_parts_events(
+        history.record_parts(
             ProfileScope::Kernel,
             "kernel;executor;",
             "local-runnable",
-            11,
-            0,
-            HardwarePerfCounterDelta::default(),
-            0,
+            PerfSample {
+                events: 11,
+                elapsed_nanos: 0,
+                counters: HardwarePerfCounterDelta::default(),
+                bytes: 0,
+            },
         );
 
         let samples = history.recent(

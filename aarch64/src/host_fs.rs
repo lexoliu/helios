@@ -44,7 +44,7 @@ pub(crate) fn install(
         tracing::warn!("virtio 9p device was not discovered on the platform bus");
         return None;
     };
-    let service = HostFileSystemService::new(probe.transport.clone(), cpu.clone());
+    let service = HostFileSystemService::new(probe.transport.clone(), *cpu);
     debug_state.install_host_fs_service(service);
     tracing::info!(
         "virtio 9p online mount_tag={} interrupt={:?}",

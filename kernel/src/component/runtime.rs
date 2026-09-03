@@ -221,25 +221,12 @@ pub trait ComponentRuntimeState: Clone + Send + 'static {
         weight_nanos: u64,
     );
 
-    fn record_perf_metric_parts_nanos(
+    fn record_perf_metric_parts(
         &self,
         scope: crate::ProfileScope,
         prefix: &str,
         suffix: &str,
-        elapsed_nanos: u64,
-        counters: helios_hal::cpu::HardwarePerfCounterDelta,
-        bytes: u64,
-    );
-
-    fn record_perf_metric_parts_events_nanos(
-        &self,
-        scope: crate::ProfileScope,
-        prefix: &str,
-        suffix: &str,
-        events: u64,
-        elapsed_nanos: u64,
-        counters: helios_hal::cpu::HardwarePerfCounterDelta,
-        bytes: u64,
+        sample: crate::PerfSample,
     );
 }
 

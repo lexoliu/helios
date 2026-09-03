@@ -35,6 +35,21 @@ jobs:
             command: just check-target x86_64-unknown-none helios-x86
           - name: test-embedded-debugger
             command: just test-embedded-debugger
+          # `just lint` runs these five gates back to back locally; CI
+          # splits them so a lint failure names the surface it came from
+          # and each lane keeps its own build cache.
+          - name: lint-fmt
+            command: just fmt-check
+          - name: lint-host
+            command: just clippy-host && just clippy-programs
+          - name: lint-aarch64
+            command: just clippy-target aarch64-unknown-none helios-aarch64
+          - name: lint-riscv
+            command: just clippy-target riscv64gc-unknown-none-elf helios-riscv
+          - name: lint-x86
+            command: just clippy-target x86_64-unknown-none helios-x86
+          - name: test-units
+            command: just test-units
     steps:
       - uses: actions/checkout@v4
         with:

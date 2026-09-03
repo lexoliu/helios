@@ -28,3 +28,6 @@ zerocopy = { version = "0.8.27", features = ["derive"] }
 [[bench]]
 name = "net_tx_smp"
 harness = false
+
+[lints]
+workspace = true

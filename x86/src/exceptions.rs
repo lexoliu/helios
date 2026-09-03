@@ -208,10 +208,10 @@ pub(crate) struct ExceptionFrame {
 
 #[unsafe(no_mangle)]
 extern "C" fn helios_x86_exception_dispatch(frame: &mut ExceptionFrame) -> ! {
-    if let Some(exception) = exception_from_frame(frame) {
-        if dispatch_to_wasmtime(exception) == KernelExceptionDispatch::Unhandled {
-            panic!("unhandled x86 kernel exception after Wasmtime dispatch: {exception:?}");
-        }
+    if let Some(exception) = exception_from_frame(frame)
+        && dispatch_to_wasmtime(exception) == KernelExceptionDispatch::Unhandled
+    {
+        panic!("unhandled x86 kernel exception after Wasmtime dispatch: {exception:?}");
     }
     panic!(
         "unhandled x86 kernel exception vector={} rip={:#x} error_code={:#x}",

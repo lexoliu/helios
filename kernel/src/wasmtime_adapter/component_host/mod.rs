@@ -36,7 +36,6 @@ use wasmtime::component::{
     ResourceTable, ResourceType, StreamProducer, StreamReader, StreamResult,
 };
 use wasmtime::{self, Engine, Store, StoreContextMut};
-use wasmtime_wasi_io;
 
 use crate::runtime::ComponentHostFilesystemState;
 use crate::wasmtime_adapter::bindings::debugger::bindings as debugger_bindings;
@@ -46,8 +45,8 @@ use crate::wasmtime_adapter::cwasm::{self, ArtifactTrustError, UntrustedCwasm};
 use crate::wasmtime_adapter::wasi::ChannelStreamProducer;
 use crate::wasmtime_adapter::wasi::bindings::filesystem::types::ErrorCode as FsErrorCode;
 use crate::{
-    HeapStats, PerfMetricFilter, ProfileFilter, ProfileScope, StatsSample, TraceEvent, TraceField,
-    TraceFilter, TraceLevel, TraceValue,
+    HeapStats, PerfMetricFilter, PerfSample, ProfileFilter, ProfileScope, StatsSample, TraceEvent,
+    TraceField, TraceFilter, TraceLevel, TraceValue,
 };
 
 const SYNC_INSTANCE: &str = "helios:system/sync@0.1.0";
@@ -127,18 +126,31 @@ pub type OutputStreamKind = ComponentOutputStreamKind;
 pub type RuntimeDeadlinePollable<CpuImpl, HostFs> =
     DeadlinePollable<CpuImpl, HostRuntimeState<CpuImpl, HostFs>>;
 
+/// A long-running bring-up phase the heartbeat reports on.
+///
+/// The name, its start, and the flag that ends it are one description
+/// of the same phase, so they travel together.
+pub(super) struct ComponentPhase<'a> {
+    pub(super) name: &'static str,
+    pub(super) started_at: u64,
+    pub(super) done: &'a Arc<AtomicBool>,
+}
+
 fn spawn_component_phase_heartbeat<CpuImpl>(
     spawner: &crate::Spawner<CpuImpl>,
     cpu: &CpuImpl,
     timer: &crate::Timer<CpuImpl>,
     progress: &helios_hal::watchdog::ProgressCounter,
     write_serial: fn(&[u8]),
-    phase: &'static str,
-    started_at: u64,
-    done: &Arc<AtomicBool>,
+    phase: ComponentPhase<'_>,
 ) where
     CpuImpl: Cpu + Clone,
 {
+    let ComponentPhase {
+        name: phase,
+        started_at,
+        done,
+    } = phase;
     spawner.spawn_detached({
         let done = done.clone();
         let cpu = cpu.clone();
@@ -417,12 +429,14 @@ macro_rules! impl_program_bindings {
                     match service
                         .spawn(
                             context,
-                            ProgramArgv::launched(request.name, request.args),
-                            request.env,
                             source,
                             None,
-                            child_authority,
-                            None,
+                            service::ProgramLaunch::new(
+                                ProgramArgv::launched(request.name, request.args),
+                                request.env,
+                                child_authority,
+                                None,
+                            ),
                         )
                         .await
                     {
@@ -502,13 +516,15 @@ macro_rules! impl_program_bindings {
                     Ok(service
                         .exec_buffered(
                             context,
-                            ProgramArgv::launched(request.name, request.args),
-                            request.env,
                             source,
                             hint,
                             request.stdin,
-                            child_authority,
-                            None,
+                            service::ProgramLaunch::new(
+                                ProgramArgv::launched(request.name, request.args),
+                                request.env,
+                                child_authority,
+                                None,
+                            ),
                         )
                         .await
                         .map($convert_result)
@@ -1360,15 +1376,24 @@ fn map_program_host_error(
     }
 }
 
+/// The kernel handles a system component borrows for its whole run.
+pub(super) struct SystemComponentHost<CpuImpl, HostFs>
+where
+    CpuImpl: Cpu + Clone,
+    HostFs: crate::HostFileSystem,
+{
+    pub(super) cpu: CpuImpl,
+    pub(super) timer: crate::Timer<CpuImpl>,
+    pub(super) spawner: crate::Spawner<CpuImpl>,
+    pub(super) debug_state: HostRuntimeState<CpuImpl, HostFs>,
+    pub(super) read_serial: crate::SerialReader,
+    pub(super) write_serial: fn(&[u8]),
+}
+
 async fn run_system_component<CpuImpl, HostFs>(
     component: EmbeddedComponent,
     world: ComponentBindingSet,
-    cpu: CpuImpl,
-    timer: crate::Timer<CpuImpl>,
-    spawner: crate::Spawner<CpuImpl>,
-    debug_state: HostRuntimeState<CpuImpl, HostFs>,
-    read_serial: crate::SerialReader,
-    write_serial: fn(&[u8]),
+    host: SystemComponentHost<CpuImpl, HostFs>,
 ) -> Result<(), DebuggerError>
 where
     CpuImpl: Cpu + Clone,
@@ -1378,6 +1403,15 @@ where
         ComponentExecContext, ComponentExecutor, ComponentExitStatus, ComponentRuntimeFactory,
         ComponentWorld,
     };
+
+    let SystemComponentHost {
+        cpu,
+        timer,
+        spawner,
+        debug_state,
+        read_serial,
+        write_serial,
+    } = host;
 
     let component_name = component.name();
     let runtime = crate::wasmtime_adapter::WasmtimeComponentRuntime::new(cpu.clone());
@@ -1453,9 +1487,11 @@ where
         &instantiate_timer,
         &instantiate_spawner.progress_counter(),
         write_serial,
-        "instantiate",
-        instantiate_started_at,
-        &instantiate_done,
+        ComponentPhase {
+            name: "instantiate",
+            started_at: instantiate_started_at,
+            done: &instantiate_done,
+        },
     );
     let executor = executor.await;
     instantiate_done.store(true, Ordering::Release);
@@ -1648,14 +1684,16 @@ fn record_component_host_kernel_profile_events_bytes<CpuImpl, HostFs>(
             .cpu
             .hardware_perf_counters()
             .delta_since(profile.counters);
-        profile.runtime_state.record_perf_metric_parts_events_nanos(
+        profile.runtime_state.record_perf_metric_parts(
             ProfileScope::Kernel,
             "kernel;component-host;",
             phase,
-            events,
-            elapsed_nanos,
-            counter_delta,
-            bytes,
+            PerfSample {
+                events,
+                elapsed_nanos,
+                counters: counter_delta,
+                bytes,
+            },
         );
         let heap = crate::heap_stats();
         record_component_host_heap_delta(
@@ -1707,14 +1745,16 @@ fn record_component_host_heap_delta<CpuImpl, HostFs>(
         "heap-dealloc" => "kernel;component-host-heap;dealloc;",
         _ => panic!("unknown component-host heap metric kind {kind}"),
     };
-    runtime_state.record_perf_metric_parts_events_nanos(
+    runtime_state.record_perf_metric_parts(
         ProfileScope::Kernel,
         phase_prefix,
         phase,
-        events,
-        0,
-        helios_hal::cpu::HardwarePerfCounterDelta::default(),
-        bytes,
+        PerfSample {
+            events,
+            elapsed_nanos: 0,
+            counters: helios_hal::cpu::HardwarePerfCounterDelta::default(),
+            bytes,
+        },
     );
 }
 

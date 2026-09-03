@@ -35,7 +35,7 @@ use crate::wasmtime_adapter::store::{ChannelInputStream, ChannelOutputStream, St
 use crate::wasmtime_adapter::wasi::map_host_fs_error;
 use crate::{
     ComponentNetworkService, ComponentOutputMode, ComponentOutputRoute, ComponentOutputStreamKind,
-    ProfileScope,
+    PerfSample, ProfileScope,
 };
 
 #[cfg(test)]
@@ -1510,16 +1510,16 @@ where
         // For host-mirrored paths, pull the entries through the async
         // host-fs service first so the sync embedded path sees a fully
         // populated view.
-        if let Some(host_path) = crate::guest_host_share_path(&descriptor.path) {
-            if let Ok(service) = self.filesystem().host_service().map_err(error_code_from_p3) {
-                let host_path = host_path.to_owned();
-                match service.read_dir(&host_path).await {
-                    Ok(entries) => {
-                        self.filesystem_mut()
-                            .seed_host_directory_entries(&descriptor.path, entries);
-                    }
-                    Err(err) => return Ok(Err(error_code_from_p3(map_host_fs_error(err)))),
+        if let Some(host_path) = crate::guest_host_share_path(&descriptor.path)
+            && let Ok(service) = self.filesystem().host_service().map_err(error_code_from_p3)
+        {
+            let host_path = host_path.to_owned();
+            match service.read_dir(&host_path).await {
+                Ok(entries) => {
+                    self.filesystem_mut()
+                        .seed_host_directory_entries(&descriptor.path, entries);
                 }
+                Err(err) => return Ok(Err(error_code_from_p3(map_host_fs_error(err)))),
             }
         }
         match self.filesystem_mut().read_directory(&descriptor.path) {
@@ -2912,14 +2912,16 @@ fn p2_record_kernel_profile_events_bytes<CpuImpl, HostFs>(
         .uptime_nanos(finished_ticks)
         .saturating_sub(runtime_state.uptime_nanos(profile.ticks));
     let counters = cpu.hardware_perf_counters().delta_since(profile.counters);
-    runtime_state.record_perf_metric_parts_events_nanos(
+    runtime_state.record_perf_metric_parts(
         ProfileScope::Kernel,
         "kernel;preview2;",
         phase,
-        events,
-        elapsed_nanos,
-        counters,
-        bytes,
+        PerfSample {
+            events,
+            elapsed_nanos,
+            counters,
+            bytes,
+        },
     );
 }
 

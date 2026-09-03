@@ -273,7 +273,7 @@ pub(super) fn imported_shared_memory_spec(
             detail: ProgramExecErrorDetail::ImportedSharedMemoryContractInvalid,
         });
     }
-    let maximum_pages = memory_type.maximum().ok_or_else(|| ProgramExecError {
+    let maximum_pages = memory_type.maximum().ok_or(ProgramExecError {
         kind: ProgramExecErrorKind::InvalidBinary,
         detail: ProgramExecErrorDetail::ImportedSharedMemoryContractInvalid,
     })?;
@@ -352,7 +352,7 @@ pub(super) fn read_shared_memory(
     let data = memory.data();
     let start = ptr as usize;
     let len = len as usize;
-    let end = start.checked_add(len).ok_or_else(|| ProgramExecError {
+    let end = start.checked_add(len).ok_or(ProgramExecError {
         kind: ProgramExecErrorKind::InvalidBinary,
         detail: ProgramExecErrorDetail::GuestMemoryAccessOverflow,
     })?;
@@ -385,12 +385,10 @@ pub(super) fn write_shared_memory(
 ) -> Result<(), ProgramExecError> {
     let data = memory.data();
     let start = ptr as usize;
-    let end = start
-        .checked_add(bytes.len())
-        .ok_or_else(|| ProgramExecError {
-            kind: ProgramExecErrorKind::InvalidBinary,
-            detail: ProgramExecErrorDetail::GuestMemoryAccessOverflow,
-        })?;
+    let end = start.checked_add(bytes.len()).ok_or(ProgramExecError {
+        kind: ProgramExecErrorKind::InvalidBinary,
+        detail: ProgramExecErrorDetail::GuestMemoryAccessOverflow,
+    })?;
     if end > data.len() {
         tracing::error!(
             start,

@@ -79,7 +79,7 @@ pub fn elapsed_millis(since_nanos: u64, now_nanos: u64) -> u64 {
 }
 
 /// Guests legitimately pass `u64::MAX` nanoseconds as an "infinite"
-/// timeout (WASIX futex waits, epoll). On timebases at or above 1 GHz
+/// timeout (futex and poll waits). On timebases at or above 1 GHz
 /// that product exceeds `u64` ticks; a deadline centuries out is
 /// semantically "never", so the conversion saturates instead of
 /// treating guest input as a kernel invariant.
@@ -211,26 +211,12 @@ mod tests {
 
         fn record_profile_stack_parts_nanos(&self, _: ProfileScope, _: &str, _: &str, _: u64) {}
 
-        fn record_perf_metric_parts_nanos(
+        fn record_perf_metric_parts(
             &self,
             _: ProfileScope,
             _: &str,
             _: &str,
-            _: u64,
-            _: helios_hal::cpu::HardwarePerfCounterDelta,
-            _: u64,
-        ) {
-        }
-
-        fn record_perf_metric_parts_events_nanos(
-            &self,
-            _: ProfileScope,
-            _: &str,
-            _: &str,
-            _: u64,
-            _: u64,
-            _: helios_hal::cpu::HardwarePerfCounterDelta,
-            _: u64,
+            _: crate::PerfSample,
         ) {
         }
     }
@@ -317,8 +303,8 @@ mod tests {
 
     #[test]
     fn infinite_guest_timeout_saturates_instead_of_panicking() {
-        // WASIX guests pass u64::MAX nanoseconds as an "infinite"
-        // futex/epoll timeout. On a 1 GHz timebase the tick product
+        // Guests pass u64::MAX nanoseconds as an "infinite"
+        // futex/poll timeout. On a 1 GHz timebase the tick product
         // exceeds u64; the conversion must saturate to a
         // never-expiring deadline rather than panic the kernel on
         // guest-controlled input. Below 1 GHz the product still fits

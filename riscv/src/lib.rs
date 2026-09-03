@@ -328,7 +328,7 @@ fn sbi_console(
     } else {
         None
     };
-    helios_kernel::RecordingConsole::new(debug_state, || riscv::register::time::read64(), write_fn)
+    helios_kernel::RecordingConsole::new(debug_state, riscv::register::time::read64, write_fn)
 }
 
 #[derive(Clone)]
@@ -933,7 +933,10 @@ fn dispatch_kernel_exception(
         if raw_handler == 0 {
             return KernelExceptionDispatch::Unhandled;
         }
-        unsafe { mem::transmute(raw_handler) }
+        // SAFETY: the only writer of this slot stores a
+        // `KernelNativeTrapHandler` cast to `usize`, and a zero means
+        // "unset", which the check above has already ruled out.
+        unsafe { mem::transmute::<usize, KernelNativeTrapHandler>(raw_handler) }
     };
     let Some(cause) = kernel_exception_cause(exception) else {
         return KernelExceptionDispatch::Unhandled;

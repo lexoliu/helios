@@ -12,3 +12,6 @@ thiserror = { version = "2.0.17", default-features = false }
 name = "helios_ping"
 path = "src/main.rs"
 crate-type = ["cdylib"]
+
+[lints]
+workspace = true

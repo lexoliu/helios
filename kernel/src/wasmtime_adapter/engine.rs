@@ -21,13 +21,13 @@ const POOLING_MAX_UNUSED_WARM_SLOTS: u32 = 100;
 #[derive(Debug, Error)]
 enum WasiCliRunResolveError {
     #[error("component export interface starting with `wasi:cli/run` was not found")]
-    RunInterfaceMissing,
+    InterfaceMissing,
     #[error("component run interface was not found on instance")]
-    RunInterfaceExportMissing,
+    InterfaceExportMissing,
     #[error("component run interface does not expose `run`")]
-    RunFunctionMissing,
+    FunctionMissing,
     #[error("component run function has an invalid type")]
-    RunFunctionTypeMismatch(#[source] wasmtime::Error),
+    FunctionTypeMismatch(#[source] wasmtime::Error),
 }
 
 #[cfg(target_os = "none")]
@@ -171,19 +171,17 @@ pub fn resolve_wasi_cli_run<T: 'static>(
                 ))
             .then(|| name.to_owned())
         })
-        .ok_or_else(|| wasmtime::Error::new(WasiCliRunResolveError::RunInterfaceMissing))?;
+        .ok_or_else(|| wasmtime::Error::new(WasiCliRunResolveError::InterfaceMissing))?;
     let mut store = store.as_context_mut();
     let run_interface = instance
         .get_export_index(&mut store, None, &run_interface_name)
-        .ok_or_else(|| wasmtime::Error::new(WasiCliRunResolveError::RunInterfaceExportMissing))?;
+        .ok_or_else(|| wasmtime::Error::new(WasiCliRunResolveError::InterfaceExportMissing))?;
     let run = instance
         .get_export_index(&mut store, Some(&run_interface), WASI_CLI_RUN_FUNC)
-        .ok_or_else(|| wasmtime::Error::new(WasiCliRunResolveError::RunFunctionMissing))?;
+        .ok_or_else(|| wasmtime::Error::new(WasiCliRunResolveError::FunctionMissing))?;
     instance
         .get_typed_func::<(), (core::result::Result<(), ()>,)>(&mut store, &run)
-        .map_err(|error| {
-            wasmtime::Error::new(WasiCliRunResolveError::RunFunctionTypeMismatch(error))
-        })
+        .map_err(|error| wasmtime::Error::new(WasiCliRunResolveError::FunctionTypeMismatch(error)))
 }
 
 use super::config::build_component_engine_config;

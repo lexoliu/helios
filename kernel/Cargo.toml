@@ -87,3 +87,6 @@ wasmtime-wasi-io = { path = "../../wasmtime/crates/wasi-io", optional = true, de
 [target.'cfg(not(target_os = "none"))'.dependencies]
 wasmtime = { path = "../../wasmtime/crates/wasmtime", optional = true, default-features = false, features = ["call-hook", "component-model", "component-model-async", "gc-null", "pooling-allocator", "runtime", "std", "threads"] }
 wasmtime-wasi-io = { path = "../../wasmtime/crates/wasi-io", optional = true }
+
+[lints]
+workspace = true

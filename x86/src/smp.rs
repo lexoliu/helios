@@ -259,13 +259,13 @@ pub(crate) fn current_identity() -> ProcessorIdentity {
 /// The local APIC id of the executing processor, from the topology leaf when
 /// the CPU publishes one and the legacy 8-bit initial APIC id otherwise.
 fn current_apic_id() -> u32 {
-    let max_basic_leaf = unsafe { __cpuid(0) }.eax;
+    let max_basic_leaf = __cpuid(0).eax;
     if max_basic_leaf >= 0x0b {
-        let topology = unsafe { __cpuid(0x0b) };
+        let topology = __cpuid(0x0b);
         return topology.edx;
     }
 
-    unsafe { __cpuid(1) }.ebx >> 24
+    __cpuid(1).ebx >> 24
 }
 
 impl ProcessorRuntime {
@@ -761,7 +761,7 @@ unsafe fn wake_application_processor(
 }
 
 fn local_apic_mode(target_apic_id: u32) -> LocalApicMode {
-    let cpuid = unsafe { __cpuid(1) };
+    let cpuid = __cpuid(1);
     if cpuid.ecx & (1 << 21) != 0 {
         return LocalApicMode::X2Apic;
     }

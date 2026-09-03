@@ -11,3 +11,6 @@ helios-api = { path = "../../api", default-features = false, features = ["instan
 name = "helios_perf"
 path = "src/main.rs"
 crate-type = ["cdylib"]
+
+[lints]
+workspace = true

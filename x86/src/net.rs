@@ -60,16 +60,28 @@ pub(crate) fn discover(pci: &PciRoot) -> Option<PciAddress> {
     pci.find_virtio_function(DeviceType::Network)
 }
 
-/// Brings up the virtio-net function at `address` and installs the
-/// kernel network service on top of it.
+/// The PCI function a virtio device is brought up on, and the DMA pool
+/// its rings are allocated from.
+pub(crate) struct PciFunction<'a> {
+    pub(crate) root: &'a PciRoot,
+    pub(crate) address: PciAddress,
+    pub(crate) dma: X86DmaPool,
+}
+
+/// Where a device's fallback MSI-X message is delivered: the vector it
+/// raises and the local APIC that takes it.
+pub(crate) struct MsixDelivery {
+    pub(crate) vector: u8,
+    pub(crate) destination_apic_id: u32,
+}
+
+/// Brings up the virtio-net function and installs the kernel network
+/// service on top of it.
 pub(crate) fn install<WatchdogImpl>(
     cpu: &X86Cpu,
     kernel: &Kernel<X86Cpu, WatchdogImpl>,
-    pci: &PciRoot,
-    address: PciAddress,
-    dma: X86DmaPool,
-    vector: u8,
-    destination_apic_id: u32,
+    function: PciFunction<'_>,
+    delivery: MsixDelivery,
     debug_state: &RuntimeState,
 ) -> NetworkInterrupts
 where
@@ -80,6 +92,15 @@ where
     // configuration changes. This is the point of the whole steering
     // path: a flow the device puts on pair `i` raises an interrupt on
     // the processor that already owns the socket.
+    let PciFunction {
+        root: pci,
+        address,
+        dma,
+    } = function;
+    let MsixDelivery {
+        vector,
+        destination_apic_id,
+    } = delivery;
     let queue_vectors = crate::exceptions::NETWORK_QUEUE_INTERRUPT_VECTORS;
     let steered = cpu.processor_count().min(queue_vectors.len());
     let mut messages = [MsixMessage {
@@ -206,7 +227,7 @@ impl NetworkDevice for VirtioNetworkDevice {
         self.inner.try_receive_frames_immediate(frames)
     }
 
-    async fn repost_rx_frame<'a>(&'a self, frame: helios_virtio::RxFrame) -> Result<(), IoError> {
+    async fn repost_rx_frame(&self, frame: helios_virtio::RxFrame) -> Result<(), IoError> {
         self.inner.repost_rx_frame(frame).await
     }
 

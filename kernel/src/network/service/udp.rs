@@ -565,7 +565,7 @@ impl NetworkShard {
 
     pub(super) fn udp_socket(&self, socket: UdpSocketId) -> Result<&UdpSocketState, UdpError> {
         let slot = ReplicaHandle::from(socket).slot();
-        self.udp_sockets.get(slot).ok_or_else(|| UdpError {
+        self.udp_sockets.get(slot).ok_or(UdpError {
             kind: UdpErrorKind::Unavailable,
             detail: NetworkErrorDetail::UnknownUdpSocket,
         })

@@ -17,3 +17,6 @@ divan = { version = "0.1.21", default-features = false }
 [[bench]]
 name = "hot_paths"
 harness = false
+
+[lints]
+workspace = true

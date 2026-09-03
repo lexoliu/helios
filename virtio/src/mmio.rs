@@ -77,6 +77,14 @@ pub unsafe fn net_from_mmio(
     VirtioNetDevice::new(transport)
 }
 
+/// Builds a VirtIO network device from a permanently mapped MMIO
+/// header, with descriptor memory taken from `dma`.
+///
+/// # Safety
+///
+/// `header..header+mmio_size` must refer to a valid, permanently mapped VirtIO
+/// MMIO register block for a network device, and no other code may violate the
+/// transport's register access invariants while the returned driver is alive.
 pub unsafe fn net_from_mmio_with_dma<P>(
     header: NonNull<u8>,
     mmio_size: usize,
@@ -103,6 +111,14 @@ pub unsafe fn p9_from_mmio(header: NonNull<u8>, mmio_size: usize) -> IoResult<Vi
     Virtio9pDevice::new(transport)
 }
 
+/// Builds a VirtIO 9P device from a permanently mapped MMIO header,
+/// with descriptor memory taken from `dma`.
+///
+/// # Safety
+///
+/// `header..header+mmio_size` must refer to a valid, permanently mapped VirtIO
+/// MMIO register block for a 9P device, and no other code may violate the
+/// transport's register access invariants while the returned driver is alive.
 pub unsafe fn p9_from_mmio_with_dma<P>(
     header: NonNull<u8>,
     mmio_size: usize,

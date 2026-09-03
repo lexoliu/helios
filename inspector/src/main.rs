@@ -58,7 +58,10 @@ enum Command {
     /// Start an interactive shell that forwards most input to the remote shell.
     Repl,
     /// Launch a local QEMU VM, wait for the debugger, and connect the inspector.
-    Vm(vm::VmCommand),
+    ///
+    /// Boxed: the VM options dwarf every other subcommand's, and the
+    /// parsed command is moved around by value.
+    Vm(Box<vm::VmCommand>),
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -123,7 +126,7 @@ pub(crate) struct TracingCommand {
 fn main() -> Result<()> {
     let args = Args::parse();
     match args.command {
-        Some(Command::Vm(command)) => vm::run(command),
+        Some(Command::Vm(command)) => vm::run(*command),
         command => run_serial(args.serial, into_session_command(command)),
     }
 }
@@ -238,6 +241,15 @@ fn into_session_command(command: Option<Command>) -> Option<SessionCommand> {
     }
 }
 
+fn run_interruptible(command: impl std::future::Future<Output = Result<()>>) -> Result<()> {
+    match runtime::block_on(runtime::interruptible(command))
+        .context("failed to listen for Ctrl+C during inspector command execution")?
+    {
+        runtime::CommandRun::Completed(result) => result,
+        runtime::CommandRun::Interrupted => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Args, Command};
@@ -318,14 +330,5 @@ mod tests {
             Command::Vm(_) => {}
             _ => panic!("expected vm command"),
         }
-    }
-}
-
-fn run_interruptible(command: impl std::future::Future<Output = Result<()>>) -> Result<()> {
-    match runtime::block_on(runtime::interruptible(command))
-        .context("failed to listen for Ctrl+C during inspector command execution")?
-    {
-        runtime::CommandRun::Completed(result) => result,
-        runtime::CommandRun::Interrupted => Ok(()),
     }
 }

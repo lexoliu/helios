@@ -434,8 +434,8 @@ fn capacity(entries: usize) -> NonZeroUsize {
 /// Two spellings of one path have to collide, or a write through one of
 /// them would leave a stale answer under the other. Segments are
 /// therefore normalised — empty components and trailing slashes go away
-/// — without allocating for the already-normal spelling that the WASI
-/// layer produces. A path carrying `.` or `..` names no fixed file
+/// — without allocating for the already-normal spelling that the
+/// component layer produces. A path carrying `.` or `..` names no fixed file
 /// until the server has resolved it, so it is not cached at all rather
 /// than cached under a key that may not mean what it says.
 fn cache_key(path: &str) -> Option<Cow<'_, str>> {

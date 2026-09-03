@@ -2,11 +2,12 @@ use bytes::Bytes;
 use divan::counter::{BytesCount, ItemsCount};
 use divan::{AllocProfiler, Bencher, black_box};
 use helios_netstack::{
-    BbrV3, DEFAULT_TCP_LISTEN_BACKLOG, EthernetAddress, EthernetFrame, EthernetProtocol, IpAddress,
-    IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, MAX_OUTBOUND_FRAMES, NeighborEntry,
-    NeighborState, OutboundBatchStatus, PacketBuffer, RxChecksumOffload, RxFrame, RxFrameOffload,
-    Stack, StackConfig, StackInstant, TCP_TRANSMIT_BUFFER_BYTES, TcpEndpoint, TcpFlags, TcpHeader,
-    TcpOptions, TcpPacket, TcpSegmentBudget, TcpSocket, TcpState, TransportChecksum, UdpPacket,
+    BbrV3, DEFAULT_HOP_LIMIT, DEFAULT_TCP_LISTEN_BACKLOG, EthernetAddress, EthernetFrame,
+    EthernetProtocol, IpAddress, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet,
+    MAX_OUTBOUND_FRAMES, NeighborEntry, NeighborState, OutboundBatchStatus, PacketBuffer,
+    RxChecksumOffload, RxFrame, RxFrameOffload, Stack, StackConfig, StackInstant,
+    TCP_TRANSMIT_BUFFER_BYTES, TcpEndpoint, TcpFlags, TcpHeader, TcpOptions, TcpPacket,
+    TcpSegmentBudget, TcpSocket, TcpState, TransportChecksum, UdpEgress, UdpPacket,
     UdpSocketBinding, UdpSocketId, internet_checksum,
 };
 
@@ -837,10 +838,13 @@ fn udp_queue_and_immediate_submit(bencher: Bencher) {
         stack
             .send_udp_ipv4_from(
                 LOCAL_IP,
-                49152,
                 PEER_IP,
-                8080,
-                black_box(UDP_PAYLOAD),
+                UdpEgress {
+                    source_port: 49152,
+                    destination_port: 8080,
+                    payload: black_box(UDP_PAYLOAD),
+                    hop_limit: DEFAULT_HOP_LIMIT,
+                },
                 identification,
                 StackInstant::from_nanos(u64::from(identification)),
             )
@@ -885,10 +889,13 @@ fn udp_queue_and_immediate_submit_batch(bencher: Bencher, batch: usize) {
             stack
                 .send_udp_ipv4_from(
                     LOCAL_IP,
-                    49152,
                     PEER_IP,
-                    8080,
-                    black_box(UDP_PAYLOAD),
+                    UdpEgress {
+                        source_port: 49152,
+                        destination_port: 8080,
+                        payload: black_box(UDP_PAYLOAD),
+                        hop_limit: DEFAULT_HOP_LIMIT,
+                    },
                     identification,
                     StackInstant::from_nanos(u64::from(identification)),
                 )

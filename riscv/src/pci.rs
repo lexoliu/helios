@@ -345,7 +345,7 @@ fn infer_parent_address_cells(node: fdt::node::FdtNode<'_, '_>) -> usize {
         .property("ranges")
         .unwrap_or_else(|| panic!("PCI host node is missing ranges"));
     assert!(
-        property.value.len() % 4 == 0,
+        property.value.len().is_multiple_of(4),
         "PCI ranges byte length {} is not a multiple of 4",
         property.value.len()
     );
@@ -362,7 +362,7 @@ fn infer_parent_address_cells(node: fdt::node::FdtNode<'_, '_>) -> usize {
 
     for candidate in [1_usize, 2] {
         let entry_cells = entry_tail_cells + candidate;
-        if total_cells % entry_cells == 0 {
+        if total_cells.is_multiple_of(entry_cells) {
             assert!(
                 parent_cells.is_none(),
                 "PCI ranges matched multiple parent #address-cells candidates"
@@ -390,7 +390,7 @@ fn parse_memory_windows(
     let entry_cells = child_sizes.address_cells + parent_address_cells + child_sizes.size_cells;
     let entry_bytes = entry_cells * 4;
     assert!(
-        property.value.len() % entry_bytes == 0,
+        property.value.len().is_multiple_of(entry_bytes),
         "PCI ranges byte length {} is not divisible by entry size {}",
         property.value.len(),
         entry_bytes
@@ -445,7 +445,7 @@ fn parse_optional_u32_property(property: Option<fdt::node::NodeProperty<'_>>) ->
 
 fn parse_cells_as_u64(bytes: &[u8]) -> u64 {
     assert!(
-        bytes.len() % 4 == 0,
+        bytes.len().is_multiple_of(4),
         "device-tree cell slice length {} is not a multiple of 4",
         bytes.len()
     );
