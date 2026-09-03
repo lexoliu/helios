@@ -374,7 +374,22 @@ just check-target aarch64-unknown-none helios-aarch64
 just check-target riscv64gc-unknown-none-elf helios-riscv
 just check-target x86_64-unknown-none helios-x86
 just test-embedded-debugger
+just lint
+just test-units
 ```
+
+`just lint` is `cargo fmt --all --check` plus `cargo clippy … -D warnings`
+over the host crates, each guest program, and all three bare-metal targets;
+`just test-units` runs the `hal`, `virtio`, `netstack` and `kernel` unit tests
+and the `hal_layering` layering test. CI runs the same recipes, split across
+one lane each, so a red lane names the surface that broke.
+
+Clippy is gated at `-D warnings`, and the only lint the workspace turns off is
+`clippy::manual_async_fn`, which contradicts §3's explicit-future trait style;
+it is allowed once in the root `Cargo.toml` and inherited by every crate
+through `[lints] workspace = true`. Suppressing any other lint needs an
+`#[expect(…, reason = "…")]` on the item that says why the lint is wrong
+there.
 
 Contract compliance is enforced by module ownership and by these checks, not
 by guard scripts.
