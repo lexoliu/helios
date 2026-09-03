@@ -5,14 +5,14 @@ at `../wasmtime/crates/wasmtime`.
 
 ## Required revision
 
-The local checkout must be at (branch `codex/helios-minimal-current`):
+The local checkout must be at (branch `helios/fiber-block-on-current`):
 
 ```text
-fb07c3dd6f8445e261b9a595967a56ba029fac5d
+f9ea747c52b65aaa1b9216d6ac6d2a6c207e345a
 ```
 
 CI does not clone that history. It checks out the vendored snapshot of the same
-tree, `lexoliu/wasmtime@b83d18c8558b6d32fb0c0727d1c6a32639842c49` (branch
+tree, `lexoliu/wasmtime@6bbaceda21b3de992508f1c26e45f66bfd175e68` (branch
 `helios-vendored`), whose `crates/`, `cranelift/`, `winch/` and `pulley/`
 directories are identical to the revision above. The snapshot pin lives in one
 place, `.github/actions/checkout-wasmtime/action.yml`, and every workflow that
