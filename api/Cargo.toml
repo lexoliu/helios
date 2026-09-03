@@ -29,3 +29,6 @@ helios-api-macro = { path = "../api-macro" }
 http = { version = "1.4.0", optional = true }
 thiserror = { version = "2.0.17", optional = true }
 wit-bindgen = { workspace = true, features = ["async", "macros", "realloc"] }
+
+[lints]
+workspace = true

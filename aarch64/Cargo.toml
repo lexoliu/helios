@@ -19,3 +19,6 @@ limine = "0.6.3"
 spin = "0.10.0"
 triomphe = { version = "0.1.15", default-features = false }
 tracing.workspace = true
+
+[lints]
+workspace = true

@@ -13,3 +13,6 @@ helios-compiler-support.workspace = true
 tracing.workspace = true
 tracing-log = { version = "0.2.0", default-features = false, features = ["log-tracer", "std"] }
 tracing-subscriber = { version = "0.3.20", default-features = false, features = ["fmt", "std"] }
+
+[lints]
+workspace = true
