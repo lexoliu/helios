@@ -1399,6 +1399,55 @@ mod tests {
         assert_eq!(node.modified_nanos, 7);
     }
 
+    /// A shell runs `mkdir /d` in a spawned process and then creates
+    /// `/d/f` itself. The child is handed the parent's filesystem
+    /// snapshot, so the directory it makes has to be a directory the
+    /// parent can create inside — the shape the riscv64 coreutils smoke
+    /// exercises and the one that answered "Directory nonexistent".
+    #[test]
+    fn a_directory_a_child_process_created_accepts_a_file_from_its_parent() {
+        let mut parent = test_filesystem();
+        let root = parent.root_descriptor();
+        let missing = parent.open_at(
+            &root,
+            fs_types::PathFlags::empty(),
+            "d/f",
+            fs_types::OpenFlags::CREATE,
+            fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
+            1,
+        );
+        assert!(
+            matches!(missing, Err(fs_types::ErrorCode::NoEntry)),
+            "the directory does not exist yet"
+        );
+
+        let mut child =
+            DebugFileSystem::<TestRuntimeState, UnsupportedHostFileSystem>::from_snapshot(
+                TestRuntimeState,
+                parent.snapshot(),
+            );
+        let child_root = child.root_descriptor();
+        child
+            .create_directory_at(&child_root, "d", 2)
+            .expect("the child creates the directory");
+
+        parent
+            .open_at(
+                &root,
+                fs_types::PathFlags::empty(),
+                "d/f",
+                fs_types::OpenFlags::CREATE,
+                fs_types::DescriptorFlags::READ | fs_types::DescriptorFlags::WRITE,
+                3,
+            )
+            .expect("the parent creates a file inside the directory the child made");
+
+        let node = parent
+            .get_node("/d/f")
+            .expect("the created file has a node");
+        assert_eq!(node.kind, FsNodeKind::File);
+    }
+
     #[test]
     fn create_directory_rejects_existing_path() {
         let mut filesystem = test_filesystem();
