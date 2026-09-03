@@ -484,6 +484,15 @@ pub(crate) enum VmNetworkError {
     )]
     TapInterfaceMissing { ifname: String },
 
+    #[error(
+        "the `tap` backend drives its queues through {VHOST_NET_DEVICE}, which this account \
+         cannot open: {source}; provision it with `helios-inspector vm net-setup --net-backend tap`"
+    )]
+    VhostNetUnusable {
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("failed to read {path}")]
     SysfsUnreadable {
         path: PathBuf,
@@ -965,6 +974,13 @@ impl VmNetwork {
                 ifname: ifname.to_owned(),
             });
         }
+        // QEMU 8.2 does not fail cleanly when `vhost=on` cannot open the
+        // device: it warns per queue and then trips an assertion in
+        // `net_client_init1`, after the debug serial socket is expected
+        // and before the guest prints a line. Refuse here with the fix.
+        if let VhostNet::Unusable(source) = VhostNet::probe() {
+            return Err(VmNetworkError::VhostNetUnusable { source });
+        }
         let flags = read_tun_flags(ifname)?;
         if queue_pairs > 1 && flags & IFF_MULTI_QUEUE == 0 {
             return Err(VmNetworkError::TapNotMultiQueue {
@@ -1114,6 +1130,41 @@ fn validate_interface_name(name: &str) -> Result<(), VmNetworkError> {
 
 fn interface_path(ifname: &str) -> PathBuf {
     Path::new(SYSFS_NET_ROOT).join(ifname)
+}
+
+/// The vhost-net character device QEMU opens for every queue of a
+/// `vhost=on` tap.
+const VHOST_NET_DEVICE: &str = "/dev/vhost-net";
+
+/// Whether this account can drive tap queues through vhost-net.
+///
+/// The probe opens the node the way QEMU does rather than testing for
+/// its presence: the `vhost_net` module's udev rule creates it root:kvm
+/// mode 0660, so an account outside that group (a CI runner, typically)
+/// finds the path and still cannot use it.
+#[derive(Debug)]
+enum VhostNet {
+    /// The node opens read-write.
+    Usable,
+    /// The node opened with an error other than "not found": the module
+    /// is loaded but the node is not this account's to use.
+    Unusable(std::io::Error),
+    /// There is no node at all: the `vhost_net` module is not loaded.
+    Missing,
+}
+
+impl VhostNet {
+    fn probe() -> Self {
+        match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(VHOST_NET_DEVICE)
+        {
+            Ok(_) => Self::Usable,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::Missing,
+            Err(error) => Self::Unusable(error),
+        }
+    }
 }
 
 fn interface_exists(ifname: &str) -> bool {
@@ -1402,9 +1453,23 @@ fn tap_setup_plan(
     command: &NetSetupCommand,
     ifname: &str,
     bridge: &str,
+    vhost_net: VhostNet,
 ) -> Result<Vec<PrivilegedCommand>, VmNetworkSetupError> {
     let (uid, gid) = invoking_credentials();
     let mut plan = Vec::new();
+    // The queues are served by vhost-net threads, so the node has to be
+    // this account's to open, the same way the tap below is created
+    // owned by it. udev creates the node root:kvm 0660 when the module
+    // loads, which no plain account can open.
+    let hand_over_vhost_net = || PrivilegedCommand::new("chmod", ["0666", VHOST_NET_DEVICE]);
+    match vhost_net {
+        VhostNet::Usable => {}
+        VhostNet::Unusable(_) => plan.push(hand_over_vhost_net()),
+        VhostNet::Missing => {
+            plan.push(PrivilegedCommand::new("modprobe", ["vhost_net"]));
+            plan.push(hand_over_vhost_net());
+        }
+    }
     if !interface_exists(bridge) {
         plan.push(PrivilegedCommand::new(
             "ip",
@@ -1573,10 +1638,26 @@ pub(crate) fn run_setup(command: NetSetupCommand) -> Result<(), VmNetworkSetupEr
         return Err(VmNetworkSetupError::ExistingTapNotMultiQueue { ifname });
     }
     let elevate = !is_root();
-    let plan = tap_setup_plan(&command, &ifname, &bridge)?;
+    let plan = tap_setup_plan(&command, &ifname, &bridge, VhostNet::probe())?;
     execute_plan(&plan, elevate, command.dry_run)?;
     if command.dry_run {
         return Ok(());
+    }
+
+    // Proven the same way QEMU will use it, so a module that loaded
+    // without creating the node, or a chmod udev raced, fails here and
+    // not as a QEMU assertion after the kernel build.
+    match VhostNet::probe() {
+        VhostNet::Usable => {}
+        VhostNet::Unusable(source) => {
+            return Err(VmNetworkError::VhostNetUnusable { source }.into());
+        }
+        VhostNet::Missing => {
+            return Err(VmNetworkError::VhostNetUnusable {
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            }
+            .into());
+        }
     }
 
     // The whole point of the tap backend is multi-queue; a tap that came
@@ -1587,8 +1668,8 @@ pub(crate) fn run_setup(command: NetSetupCommand) -> Result<(), VmNetworkSetupEr
         return Err(VmNetworkSetupError::ExistingTapNotMultiQueue { ifname });
     }
     println!(
-        "{} tap {ifname} on bridge {bridge} is multi-queue (tun_flags {flags:#06x}); \
-         guests reach the host at {}",
+        "{} tap {ifname} on bridge {bridge} is multi-queue (tun_flags {flags:#06x}) on \
+         vhost-net; guests reach the host at {}",
         style("ready").green(),
         command.bridge_address.addr(),
     );
@@ -2190,9 +2271,13 @@ mod tests {
             dhcp: true,
             dry_run: true,
         };
-        let plan = tap_setup_plan(&command, "helios0", "helios-br0")
+        let plan = tap_setup_plan(&command, "helios0", "helios-br0", VhostNet::Missing)
             .expect("a fully specified tap plan builds");
         let rendered: Vec<String> = plan.iter().map(|step| step.display(true)).collect();
+        // A host without the module gets it loaded and its node handed to
+        // this account before the tap that depends on it is created.
+        assert_eq!(rendered[0], "sudo modprobe vhost_net");
+        assert_eq!(rendered[1], "sudo chmod 0666 /dev/vhost-net");
         assert!(rendered.iter().any(|step| {
             step.starts_with("sudo ip tuntap add dev helios0 mode tap multi_queue user ")
         }));

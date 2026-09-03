@@ -172,7 +172,12 @@ A multi-queue tap device enslaved to a host bridge, driven by
 `vhost=on` so the packet copy runs in host kernel threads rather than
 the QEMU main loop. The tap outlives individual VMs: it is provisioned
 once by the privileged helper and the VM command never elevates by
-itself.
+itself. The helper also loads `vhost_net` and hands `/dev/vhost-net` to
+the invoking account (udev creates it `root:kvm 0660`), because QEMU
+8.2 does not fail cleanly when `vhost=on` cannot open the node: it
+warns per queue and then dies on an assertion in `net_client_init1`.
+The VM command checks the node before building the kernel for the same
+reason.
 
 ```bash
 # once per host, prints every privileged command before running it
