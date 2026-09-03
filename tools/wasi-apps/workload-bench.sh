@@ -42,6 +42,10 @@ if [[ -n "${HELIOS_WORKLOAD_BENCH_ACCEL:-}" ]]; then
     command+=(--accel "${HELIOS_WORKLOAD_BENCH_ACCEL}")
 fi
 
+if [[ -n "${HELIOS_WORKLOAD_BENCH_VM_SMP:-}" ]]; then
+    command+=(--smp "${HELIOS_WORKLOAD_BENCH_VM_SMP}")
+fi
+
 # A benchmark that never boots leaves nothing behind to say why. Keeping
 # the runtime directory puts the guest console, QEMU's own stderr and the
 # inspector's log on disk, which is the only place a CI lane can collect

@@ -1281,12 +1281,16 @@ def run_fedora_qemu_linux(
     guest_arch: str | None = None,
     accel: str | None = None,
     native_bin_dir: Path | None = None,
+    control_workload: dict | None = None,
 ) -> tuple[Path | None, Path | None, dict]:
     guest_arch = guest_arch or host_arch()
     accel = accel or default_accel(guest_arch)
     machine, cpu = machine_and_cpu(guest_arch, accel)
     native_workloads = runner.workloads_with_counterpart(workloads, "linux_native")
     wasmtime_workloads = runner.workloads_with_counterpart(workloads, "linux_wasmtime")
+    controls = [control_workload] if control_workload is not None else []
+    if controls:
+        workloads = [*workloads, *controls]
     native_bin_dir = resolve_optional_path(repo_root, native_bin_dir)
     if runner.needs_native_bin(workloads):
         if native_bin_dir is None or not native_bin_dir.is_dir():
@@ -1397,26 +1401,40 @@ def run_fedora_qemu_linux(
                 wasmtime_linux_archive,
             )
             wasmtime_bin = REMOTE_WASMTIME_BIN
-        native_jsonl = None
-        if native_workloads:
+        def time_side(side: str, selection: list[dict], output_name: str, bin_path: str | None) -> Path:
             ssh(
                 repo_root,
                 key,
                 port,
                 runner_command(
                     iterations,
-                    native_workloads,
+                    selection,
                     host_http_url,
                     host_tcp_host,
                     host_tcp_port,
                     host_tcp_echo_port,
-                    "linux-native.jsonl",
-                    "linux_native",
+                    output_name,
+                    side,
+                    bin_path,
                 ),
                 timeout=setup_timeout_seconds,
             )
-            native_jsonl = out_dir / "linux-native.jsonl"
-            copy_guest_output(repo_root, key, port, "linux-native.jsonl", native_jsonl)
+            destination = out_dir / output_name
+            copy_guest_output(repo_root, key, port, output_name, destination)
+            return destination
+
+        def time_side_with_control(side: str, selection: list[dict], label: str, bin_path: str | None) -> Path:
+            side_controls = runner.workloads_with_counterpart(controls, side)
+            if side_controls:
+                time_side(side, side_controls, f"{label}-control-before.jsonl", bin_path)
+            result = time_side(side, selection, f"{label}.jsonl", bin_path)
+            if side_controls:
+                time_side(side, side_controls, f"{label}-control-after.jsonl", bin_path)
+            return result
+
+        native_jsonl = None
+        if native_workloads:
+            native_jsonl = time_side_with_control("linux_native", native_workloads, "linux-native", None)
         wasmtime_jsonl = None
         if wasmtime_workloads:
             # Compile every module once up front so the timed iterations
@@ -1425,28 +1443,12 @@ def run_fedora_qemu_linux(
                 repo_root,
                 key,
                 port,
-                precompile_command(wasmtime_workloads, wasmtime_bin),
+                precompile_command([*wasmtime_workloads, *controls], wasmtime_bin),
                 timeout=setup_timeout_seconds,
             )
-            ssh(
-                repo_root,
-                key,
-                port,
-                runner_command(
-                    iterations,
-                    wasmtime_workloads,
-                    host_http_url,
-                    host_tcp_host,
-                    host_tcp_port,
-                    host_tcp_echo_port,
-                    "linux-wasmtime.jsonl",
-                    "linux_wasmtime",
-                    wasmtime_bin,
-                ),
-                timeout=setup_timeout_seconds,
+            wasmtime_jsonl = time_side_with_control(
+                "linux_wasmtime", wasmtime_workloads, "linux-wasmtime", wasmtime_bin
             )
-            wasmtime_jsonl = out_dir / "linux-wasmtime.jsonl"
-            copy_guest_output(repo_root, key, port, "linux-wasmtime.jsonl", wasmtime_jsonl)
         return native_jsonl, wasmtime_jsonl, provenance
     finally:
         shutdown_vm(repo_root, key, port, process)

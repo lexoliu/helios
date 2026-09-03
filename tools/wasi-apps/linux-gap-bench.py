@@ -344,11 +344,34 @@ def run_helios(
     host_tcp_port: int | None,
     host_tcp_echo_port: int | None,
     timeout_seconds: int,
+    control_workload: dict | None,
 ) -> Path:
     log = out_dir / "helios.jsonl"
     workloads_by_class: dict[str, list[str]] = {}
     for workload in workloads:
         workloads_by_class.setdefault(workload["class"], []).append(workload["name"])
+
+    def run_control(moment: str) -> None:
+        # The control workload measures the machine, not Helios: the same
+        # program before and after the suite bounds how much the host
+        # drifted while the numbers in between were taken.
+        if control_workload is None:
+            return
+        run_helios_once(
+            manifest,
+            out_dir / f"helios-control-{moment}.jsonl",
+            iterations,
+            [],
+            [control_workload["name"]],
+            arch,
+            host_http_url,
+            host_tcp_host,
+            host_tcp_port,
+            host_tcp_echo_port,
+            timeout_seconds,
+        )
+
+    run_control("before")
 
     if len(workloads_by_class) > 1:
         class_logs = []
@@ -371,6 +394,7 @@ def run_helios(
         with log.open("w", encoding="utf-8") as output_handle:
             for class_log in class_logs:
                 output_handle.write(class_log.read_text(encoding="utf-8"))
+        run_control("after")
         return log
 
     run_helios_once(
@@ -386,6 +410,7 @@ def run_helios(
         host_tcp_echo_port,
         timeout_seconds,
     )
+    run_control("after")
     return log
 
 
@@ -455,6 +480,7 @@ def run_linux(
     guest_arch: str,
     accel: str | None,
     native_bin_dir: Path | None,
+    control_workload: dict | None,
 ) -> tuple[Path | None, Path | None, dict]:
     return run_fedora_qemu_linux(
         repo_root(),
@@ -480,6 +506,7 @@ def run_linux(
         guest_arch=guest_arch,
         accel=accel,
         native_bin_dir=native_bin_dir,
+        control_workload=control_workload,
     )
 
 
@@ -1542,6 +1569,11 @@ def main() -> None:
         help="Pre-staged Linux Wasmtime tar archive for the guest architecture, copied into the Fedora guest for the Wasmtime-on-Linux timing baseline.",
     )
     parser.add_argument("--out-dir", type=Path)
+    parser.add_argument(
+        "--control",
+        action="store_true",
+        help="Run the manifest's control_workload before and after the suite on every side to measure machine noise.",
+    )
     parser.add_argument("--skip-helios", action="store_true")
     parser.add_argument("--skip-linux", action="store_true")
     parser.add_argument("--wasmtime-profile-workload", action="append", default=[])
@@ -1617,6 +1649,9 @@ def main() -> None:
     enforce_host_load(host_load, args.max_host_load_per_cpu, args.allow_busy_host)
     manifest = load_manifest(args.manifest)
     workloads = selected_workloads(manifest, args.classes, args.workloads)
+    control_workload = None
+    if args.control:
+        control_workload = runner.selected_workload(manifest, manifest["control_workload"])
     out_dir = args.out_dir or repo_root() / "target/perf-baselines" / f"linux-gap-{git_short_sha()}-{int(time.time())}"
     if not out_dir.is_absolute():
         out_dir = repo_root() / out_dir
@@ -1673,6 +1708,7 @@ def main() -> None:
                 host_tcp_port,
                 host_tcp_echo_port,
                 args.helios_timeout_seconds,
+                control_workload,
             )
         if not args.skip_linux:
             linux_json, wasmtime_linux_json, linux_provenance = run_linux(
@@ -1699,6 +1735,7 @@ def main() -> None:
                 linux_guest_arch,
                 args.linux_vm_accel,
                 args.native_bin_dir,
+                control_workload,
             )
         if args.wasmtime_profile_workload:
             wasmtime_profiles = run_wasmtime_profiles(

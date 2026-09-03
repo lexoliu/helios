@@ -1,0 +1,13 @@
+{% import "macros.md.j2" as m with context %}
+Numbers below are from CI run [{{ run_id }}]({{ reports[0].run.url }}){% if reports | selectattr("run.publishable") | list | length == 0 %} on GitHub's shared runners in advisory mode: they show the shape of the comparison, not a publishable result, until the dedicated runners described in [docs/benchmarks.md](docs/benchmarks.md) exist{% endif %}.
+Each cell is the median warm wall time in milliseconds with its 95% bootstrap interval; the "vs" columns divide the other side's median by Helios's, so above 1x Helios is faster. Same QEMU, accelerator, vCPUs, memory and virtio devices on every side; Linux + Wasmtime runs the same wasm precompiled by the same Wasmtime revision Helios vendors. Methodology, pins and the full tables: [docs/benchmarks.md](docs/benchmarks.md).
+
+{% for report in reports %}
+**{{ report.run.lane }}** — {{ report.hardware.cpu }}, {{ report.hardware.accelerator }}{% if report.control %}, noise floor {{ report.control.noise_floor | percent }}{% endif %}
+
+{{ m.header() }}
+{% for workload in report.headline_workloads() %}
+{{ m.row(workload) }}
+{% endfor %}
+
+{% endfor %}

@@ -1,0 +1,62 @@
+# Benchmark-suite manifest: everything a run must match before its numbers
+# may be published. Pins that already live elsewhere in the repository
+# (the vendored Wasmtime revision, the Fedora image digest, the Wasmtime
+# Linux release, the workload list) are read from their single source by
+# helios_bench.manifest, not repeated here.
+
+schema_version = 1
+
+[statistics]
+# Measured executions per workload and side. The first is reported as the
+# cold iteration and excluded from the warm series, leaving ten warm
+# iterations for every cell.
+iterations = 11
+warmup_discard = 1
+# A warm series whose coefficient of variation exceeds this bound is
+# rejected: the cell is reported, but flagged and excluded from the gate.
+cv_bound = 0.15
+bootstrap_resamples = 10000
+confidence = 0.95
+# Fixed seed so the bootstrap intervals in a report can be recomputed
+# from its raw iterations.
+bootstrap_seed = 20260903
+
+[[lane]]
+name = "x86-64-kvm"
+helios_arch = "x86-64"
+guest_arch = "x86_64"
+accelerator = "kvm"
+# Dedicated runner: fixed CPU governor, nothing else scheduled
+# (docs/benchmarks.md, "Dedicated runners").
+runner_label = "helios-bench-x86-kvm"
+# GitHub shared runner the same job runs on in advisory mode.
+shared_runner = "ubuntu-24.04"
+# QEMU release the lane is pinned to; ubuntu-24.04's qemu-system-x86 package.
+qemu_version = "8.2.2"
+vcpus = 4
+# Without lazy-commit virtual memory the x86 kernel allocates WASIX
+# shared-memory capacity eagerly, so the shell workloads need more guest RAM.
+memory = "6G"
+linux_vm_memory = "4G"
+net_backend = "tap"
+net_host = "10.77.0.1"
+devices = ["virtio-blk-pci", "virtio-net-pci", "virtio-rng-pci"]
+
+[[lane]]
+name = "aarch64-hvf"
+helios_arch = "aarch64"
+guest_arch = "aarch64"
+accelerator = "hvf"
+runner_label = "helios-bench-arm-hvf"
+shared_runner = "macos-15"
+# Homebrew qemu on the dedicated Apple Silicon machine.
+qemu_version = "10.2.2"
+vcpus = 4
+memory = "2G"
+linux_vm_memory = "4G"
+# GitHub's macOS runners can hold neither the com.apple.vm.networking
+# entitlement nor a socket_vmnet daemon, so the shared lane is slirp
+# (single queue, no offload); the dedicated machine runs vmnet-bridged.
+net_backend = "user"
+net_host = "10.0.2.2"
+devices = ["virtio-blk-device", "virtio-net-device", "virtio-rng-device"]

@@ -1,0 +1,38 @@
+[project]
+name = "helios-bench"
+version = "0.1.0"
+description = "Publishable benchmark suite tooling: manifest pins, runner, statistics, report schema, rendering and regression gate."
+requires-python = ">=3.12"
+dependencies = [
+    "jinja2>=3.1",
+    "matplotlib>=3.9",
+    "numpy>=2.0",
+    "pydantic>=2.9",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+helios-bench = "helios_bench.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/helios_bench"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

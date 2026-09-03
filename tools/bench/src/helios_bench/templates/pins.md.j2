@@ -1,0 +1,14 @@
+| Pin | Value |
+| --- | --- |
+| Helios | `{{ report.run.helios_git_sha }}` |
+| Vendored Wasmtime | `{{ report.pins.wasmtime_revision }}` |
+| Wasmtime on Linux | `{{ report.pins.wasmtime_linux_release }}` |
+| Fedora image | `{{ report.pins.fedora_image_url }}` (`{{ report.pins.fedora_image_sha256 }}`) |
+| QEMU | `{{ report.pins.qemu_version }}` |
+| Guest | {{ report.pins.vcpus }} vCPUs, {{ report.pins.memory }} (Helios) / {{ report.pins.linux_vm_memory }} (Linux), `{{ report.pins.net_backend }}` network, {{ report.pins.devices | join(", ") }} |
+{% for path, digest in report.pins.wasm_artifacts.items() %}
+| wasm `{{ path }}` | `{{ digest }}` |
+{% endfor %}
+{% for path, digest in report.pins.bootfs_cwasm.items() %}
+| cwasm `{{ path }}` | `{{ digest }}` |
+{% endfor %}
