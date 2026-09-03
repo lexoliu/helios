@@ -371,7 +371,7 @@ impl NetworkShard {
         destination: IpAddress,
         port: u16,
     ) -> Result<(), UdpError> {
-        let slot = self.decode_handle_slot(socket.0.get());
+        let slot = self.decode_handle_slot(socket.into());
         let state = *self.udp_socket(socket)?;
         let local = self
             .udp_local_endpoint(state.binding.local_port, destination)
@@ -407,7 +407,7 @@ impl NetworkShard {
     }
 
     pub(super) fn disconnect_udp_socket(&mut self, socket: UdpSocketId) -> Result<(), UdpError> {
-        let slot = self.decode_handle_slot(socket.0.get());
+        let slot = self.decode_handle_slot(socket.into());
         let state = *self.udp_socket(socket)?;
         if state.binding.remote.is_none() {
             return Err(UdpError {
@@ -492,7 +492,7 @@ impl NetworkShard {
     }
 
     pub(super) fn remove_udp_socket(&mut self, socket: UdpSocketId) {
-        let slot = self.decode_handle_slot(socket.0.get());
+        let slot = self.decode_handle_slot(socket.into());
         if let Some(socket) = self.udp_sockets.remove(slot) {
             self.stack
                 .remove_udp_socket(socket.stack_socket)
@@ -509,14 +509,11 @@ impl NetworkShard {
             stack_socket,
             binding,
         });
-        UdpSocketId(
-            NonZeroU32::new(self.encode_handle_id(slot))
-                .unwrap_or_else(|| panic!("udp socket ids must never be zero")),
-        )
+        UdpSocketId(self.encode_handle_id(slot).get())
     }
 
     pub(super) fn udp_socket(&self, socket: UdpSocketId) -> Result<&UdpSocketState, UdpError> {
-        let slot = self.decode_handle_slot(socket.0.get());
+        let slot = self.decode_handle_slot(socket.into());
         self.udp_sockets.get(slot).ok_or_else(|| UdpError {
             kind: UdpErrorKind::Unavailable,
             detail: NetworkErrorDetail::UnknownUdpSocket,

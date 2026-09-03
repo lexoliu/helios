@@ -1261,7 +1261,7 @@ impl NetworkShard {
     }
 
     pub(super) fn remove_tcp_stream(&mut self, stream: TcpStreamId) {
-        let slot = self.decode_handle_slot(stream.0.get());
+        let slot = self.decode_handle_slot(stream.into());
         if let Some(socket) = self.tcp_streams.remove(slot) {
             self.stack
                 .remove_tcp_socket(socket)
@@ -1271,10 +1271,7 @@ impl NetworkShard {
 
     pub(super) fn insert_tcp_stream(&mut self, socket: helios_netstack::SocketId) -> TcpStreamId {
         let slot = self.tcp_streams.insert(socket);
-        TcpStreamId(
-            NonZeroU32::new(self.encode_handle_id(slot))
-                .unwrap_or_else(|| panic!("tcp stream ids must never be zero")),
-        )
+        TcpStreamId(self.encode_handle_id(slot).get())
     }
 
     pub(super) fn insert_tcp_listener(
@@ -1286,17 +1283,14 @@ impl NetworkShard {
             stack_socket,
             local_port,
         });
-        TcpListenerId(
-            NonZeroU32::new(self.encode_handle_id(slot))
-                .unwrap_or_else(|| panic!("tcp listener ids must never be zero")),
-        )
+        TcpListenerId(self.encode_handle_id(slot).get())
     }
 
     pub(super) fn tcp_socket(
         &self,
         stream: TcpStreamId,
     ) -> Result<helios_netstack::SocketId, TcpError> {
-        let slot = self.decode_handle_slot(stream.0.get());
+        let slot = self.decode_handle_slot(stream.into());
         self.tcp_streams.get(slot).copied().ok_or_else(|| TcpError {
             kind: TcpErrorKind::Unavailable,
             detail: NetworkErrorDetail::UnknownTcpStream,
@@ -1307,7 +1301,7 @@ impl NetworkShard {
         &self,
         listener: TcpListenerId,
     ) -> Result<&TcpListenerState, TcpError> {
-        let slot = self.decode_handle_slot(listener.0.get());
+        let slot = self.decode_handle_slot(listener.into());
         self.tcp_listeners.get(slot).ok_or_else(|| TcpError {
             kind: TcpErrorKind::Unavailable,
             detail: NetworkErrorDetail::TcpListenerClosedUnexpectedly,
