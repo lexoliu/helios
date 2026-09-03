@@ -499,6 +499,14 @@ jobs:
         if: matrix.net-backend == 'tap'
         working-directory: helios
         run: |
+          # QEMU's vhost-net backend opens /dev/vhost-net itself; udev
+          # creates that node root:kvm mode 0660 and the runner account is
+          # not in the group, so without this QEMU warns four times, fails
+          # its tap client and asserts before the guest boots. The lane's
+          # pipeline status used to hide exactly that.
+          sudo modprobe vhost_net
+          sudo chmod 0666 /dev/vhost-net
+          ls -l /dev/vhost-net
           ./target/release/helios-inspector vm net-setup \
             --net-backend tap \
             --net-ifname "${HELIOS_NET_IFNAME}" \
