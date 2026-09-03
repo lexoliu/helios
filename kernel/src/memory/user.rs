@@ -192,6 +192,7 @@ impl UserMemoryPool {
                 ProgramOutOfMemory {
                     requested_bytes: allocation_size,
                     available_bytes: stats.available_bytes(),
+                    pool_bytes: stats.total_bytes,
                     reserved_bytes: 0,
                 }
             })?;
