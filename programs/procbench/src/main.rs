@@ -64,6 +64,8 @@ enum ProcbenchError {
     CorruptEcho { round: u64 },
     #[error("the child's stdin closed after {written} of {total} bytes")]
     StdinClosed { written: u64, total: u64 },
+    #[error("a held child could not be released")]
+    Release(#[from] programs::StdinClosed),
     #[error("the child echoed {echoed} bytes, expected {expected}")]
     ShortStream { echoed: u64, expected: u64 },
     #[error("a worker task ended without reporting its result")]
@@ -188,13 +190,7 @@ async fn startup(count: u64, child: ChildSpec) -> Result<(), ProcbenchError> {
     for handle in children {
         // Closing stdin releases a `hello hold` child; the batch is
         // dismantled only after its footprint was sampled.
-        handle
-            .write_stdin(Vec::new())
-            .await
-            .map_err(|()| ProcbenchError::StdinClosed {
-                written: 0,
-                total: 0,
-            })?;
+        handle.write_stdin(Vec::new()).await?;
         wait_child(handle, &child.path).await?;
     }
 
