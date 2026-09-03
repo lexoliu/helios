@@ -94,9 +94,13 @@ where
         listener: TcpListenerId,
         hop_limit: u8,
     ) -> Result<(), TcpError> {
-        self.inner.state.with_handle(listener, |state| {
-            state.set_tcp_listener_hop_limit(listener, hop_limit)
-        })
+        // Every replica has to answer with the same hop limit, or which
+        // shard accepted a connection would change what it sends.
+        self.inner
+            .state
+            .for_each_replica("tcp listener hop limit", |state| {
+                state.set_tcp_listener_hop_limit(listener, hop_limit)
+            })
     }
 
     pub async fn tcp_accept(
@@ -190,21 +194,36 @@ where
         listener: TcpListenerId,
     ) -> Result<SocketReadiness, TcpError> {
         self.drive_tcp().await?;
-        self.inner.state.with_handle(listener, |state| {
-            let stack_socket = state.tcp_listener(listener)?.stack_socket;
-            let readable = state
-                .stack
-                .tcp_accept_pending(stack_socket)
-                .map_err(|_| TcpError {
-                    kind: TcpErrorKind::Unavailable,
-                    detail: NetworkErrorDetail::TcpListenerClosedUnexpectedly,
-                })?;
-            Ok(SocketReadiness {
-                readable,
-                writable: false,
-                hangup: false,
-            })
+        // Readable means "some replica has a connection queued", so the
+        // probe walks them the same way `accept` does.
+        let readable = self
+            .inner
+            .state
+            .find_in_replicas(self.accepting_shard_idx(), |state| {
+                let stack_socket = state.tcp_listener(listener)?.stack_socket;
+                state
+                    .stack
+                    .tcp_accept_pending(stack_socket)
+                    .map(|pending| pending.then_some(()))
+                    .map_err(|_| TcpError {
+                        kind: TcpErrorKind::Unavailable,
+                        detail: NetworkErrorDetail::TcpListenerClosedUnexpectedly,
+                    })
+            })?
+            .is_some();
+        Ok(SocketReadiness {
+            readable,
+            writable: false,
+            hangup: false,
         })
+    }
+
+    /// The shard an accept walk starts at: this processor's own, which
+    /// is the one it can drain without touching another CPU's cache.
+    fn accepting_shard_idx(&self) -> usize {
+        self.inner
+            .state
+            .shard_idx_for_processor(self.inner.cpu.current_processor())
     }
 
     pub async fn tcp_shutdown_send(&self, stream: TcpStreamId) -> Result<(), TcpError> {
@@ -333,12 +352,48 @@ where
             kind: TcpErrorKind::Unavailable,
             detail: NetworkErrorDetail::TcpListenStartFailed,
         })?;
-        // Listener lives on the shard that owns its local port: a
-        // well-known port (< EPHEMERAL_PORT_START) goes to shard 0,
-        // an explicit ephemeral port stride-maps to its owner. RX
-        // demux for the same port routes back here.
-        self.inner.state.with_local_port(local_port, |state| {
-            state.start_tcp_listen(local_address, local_port, backlog, hop_limit)
+        // A listener cannot belong to one shard. The four-tuple of an
+        // inbound connection is not known when the port is opened, so
+        // its SYN lands on whichever shard the flow hashes to; the
+        // listener is therefore installed on every shard, in one slab
+        // slot the whole set agrees on, each with its own accept queue.
+        let slot = self.inner.state.listener_slots.allocate().ok_or(TcpError {
+            kind: TcpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::TcpListenStartFailed,
+        })?;
+        // The port is chosen once and then bound identically on every
+        // replica: a per-shard choice would give the same listener a
+        // different port depending on which shard answered.
+        let local_port = match local_port {
+            0 => self
+                .inner
+                .state
+                .shard_for_default()
+                .lock()
+                .allocate_tcp_local_port(),
+            port => Ok(port),
+        };
+        let local_port = match local_port {
+            Ok(port) => port,
+            Err(error) => {
+                self.inner.state.listener_slots.release(slot);
+                return Err(error);
+            }
+        };
+        let install = self.inner.state.install_replica(
+            slot,
+            |shard, slot| {
+                shard.install_tcp_listener(slot, local_address, local_port, backlog, hop_limit)
+            },
+            NetworkShard::remove_tcp_listener,
+        );
+        if let Err(error) = install {
+            self.inner.state.listener_slots.release(slot);
+            return Err(error);
+        }
+        Ok(TcpListener {
+            listener: TcpListenerId(ReplicaHandle::new(slot).get()),
+            local_port,
         })
     }
 
@@ -349,12 +404,18 @@ where
     ) -> Result<TcpAccepted<TcpStreamId>, TcpError> {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         loop {
-            let wait = self.inner.state.shard_wait_for_handle(listener);
+            // A listener has an accept queue on every shard, so the walk
+            // starts at this processor's own — the cheapest to drain —
+            // and then visits the rest, and the wait watches the whole
+            // set because the next SYN's shard is not known until its
+            // flow is hashed.
+            let wait = self.inner.state.replica_wait();
+            let start = self.accepting_shard_idx();
             self.drive_tcp().await?;
             let accepted = self
                 .inner
                 .state
-                .with_handle(listener, |state| state.poll_tcp_accept(listener))?;
+                .find_in_replicas(start, |state| state.poll_tcp_accept(listener))?;
             if let Some(accepted) = accepted {
                 return Ok(accepted);
             }
@@ -1093,23 +1154,25 @@ impl NetworkShard {
         Ok(self.insert_tcp_stream(socket))
     }
 
-    pub(super) fn start_tcp_listen(
+    /// Installs this shard's replica of a listener into `slot`.
+    ///
+    /// The slot and the port are decided once for the whole set, so
+    /// every replica of the same listener answers to the same handle
+    /// and binds the same port.
+    pub(super) fn install_tcp_listener(
         &mut self,
+        slot: usize,
         local_address: NetworkIpAddress,
         local_port: u16,
         backlog: TcpListenBacklog,
         hop_limit: u8,
-    ) -> Result<TcpListener<TcpListenerId>, TcpError> {
-        let local_port = if local_port == 0 {
-            self.allocate_tcp_local_port()?
-        } else if self.is_tcp_local_port_free(local_port) {
-            local_port
-        } else {
+    ) -> Result<(), TcpError> {
+        if !self.is_tcp_local_port_free(local_port) {
             return Err(TcpError {
                 kind: TcpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::TcpListenStartFailed,
             });
-        };
+        }
         let stack_socket = self
             .stack
             .open_tcp_listen(
@@ -1131,10 +1194,24 @@ impl NetworkShard {
                 kind: TcpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::TcpListenStartFailed,
             })?;
-        Ok(TcpListener {
-            listener: self.insert_tcp_listener(stack_socket, local_port),
-            local_port,
-        })
+        self.tcp_listeners.insert_at(
+            slot,
+            TcpListenerState {
+                stack_socket,
+                local_port,
+            },
+        );
+        Ok(())
+    }
+
+    /// Drops this shard's replica of a listener, used to unwind a
+    /// partial install.
+    pub(super) fn remove_tcp_listener(&mut self, slot: usize) {
+        if let Some(state) = self.tcp_listeners.remove(slot) {
+            self.stack
+                .remove_tcp_socket(state.stack_socket)
+                .unwrap_or_else(|_| panic!("TCP listener referenced an unknown stack socket"));
+        }
     }
 
     pub(super) fn set_tcp_hop_limit(
@@ -1274,18 +1351,6 @@ impl NetworkShard {
         TcpStreamId(self.encode_handle_id(slot).get())
     }
 
-    pub(super) fn insert_tcp_listener(
-        &mut self,
-        stack_socket: helios_netstack::SocketId,
-        local_port: u16,
-    ) -> TcpListenerId {
-        let slot = self.tcp_listeners.insert(TcpListenerState {
-            stack_socket,
-            local_port,
-        });
-        TcpListenerId(self.encode_handle_id(slot).get())
-    }
-
     pub(super) fn tcp_socket(
         &self,
         stream: TcpStreamId,
@@ -1301,11 +1366,12 @@ impl NetworkShard {
         &self,
         listener: TcpListenerId,
     ) -> Result<&TcpListenerState, TcpError> {
-        let slot = self.decode_handle_slot(listener.into());
-        self.tcp_listeners.get(slot).ok_or_else(|| TcpError {
-            kind: TcpErrorKind::Unavailable,
-            detail: NetworkErrorDetail::TcpListenerClosedUnexpectedly,
-        })
+        self.tcp_listeners
+            .get(ReplicaHandle::from(listener).slot())
+            .ok_or_else(|| TcpError {
+                kind: TcpErrorKind::Unavailable,
+                detail: NetworkErrorDetail::TcpListenerClosedUnexpectedly,
+            })
     }
 
     pub(super) fn allocate_tcp_local_port(&mut self) -> Result<u16, TcpError> {

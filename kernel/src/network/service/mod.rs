@@ -63,9 +63,11 @@ const EPHEMERAL_PORT_END: u16 = 65_535;
 /// ARP reply taught and the query that reads it meet on one shard.
 const DEFAULT_SHARD_IDX: usize = 0;
 
-const INTERNAL_DNS_PORT: u16 = 49_151;
 const INTERNAL_DHCP_SOCKET_INDEX: usize = 0;
-const INTERNAL_DNS_SOCKET_INDEX: usize = 1;
+/// Datagram slab slots every shard keeps for its own use, so a
+/// replicated bind never lands on top of one. Only the DHCP client
+/// needs one: the resolver uses an ordinary connected socket.
+const INTERNAL_UDP_RESERVED_SLOTS: usize = 1;
 const LOCAL_NETWORK_PORT: NetworkPortId = NetworkPortId::new(0);
 const DHCP_RETRANSMIT_NANOS: u64 = 1_000_000_000;
 const MAX_TCP_STREAM_HANDLES: usize = 256;
@@ -230,9 +232,9 @@ impl From<TcpListenerId> for u64 {
     }
 }
 
-impl From<TcpListenerId> for ShardHandle {
+impl From<TcpListenerId> for ReplicaHandle {
     fn from(id: TcpListenerId) -> Self {
-        ShardHandle::from_raw(id.0)
+        ReplicaHandle::from_raw(id.0)
     }
 }
 
@@ -260,9 +262,9 @@ impl From<UdpSocketId> for u64 {
     }
 }
 
-impl From<UdpSocketId> for ShardHandle {
+impl From<UdpSocketId> for ReplicaHandle {
     fn from(id: UdpSocketId) -> Self {
-        ShardHandle::from_raw(id.0)
+        ReplicaHandle::from_raw(id.0)
     }
 }
 
@@ -510,6 +512,30 @@ impl<T, const CAPACITY: usize> HandleSlab<T, CAPACITY> {
         assert!(slot.is_none(), "network handle slab free list is corrupt");
         *slot = Some(value);
         index
+    }
+
+    /// Fills a slot chosen by the caller rather than by the free list.
+    ///
+    /// A replicated socket occupies the same slot in every shard's slab,
+    /// so the slot is picked once by `ReplicaSlots` and then written
+    /// here on each shard. The slot is removed from this slab's free
+    /// list so a later `insert` cannot hand it out again.
+    fn insert_at(&mut self, index: usize, value: T) {
+        let slot = self
+            .slots
+            .get_mut(index)
+            .unwrap_or_else(|| panic!("network handle slot {index} is outside the slab"));
+        assert!(
+            slot.is_none(),
+            "network handle slot {index} is already occupied"
+        );
+        *slot = Some(value);
+        let position = self.free[..self.free_len]
+            .iter()
+            .position(|free| *free == index)
+            .unwrap_or_else(|| panic!("network handle slot {index} was not free"));
+        self.free_len -= 1;
+        self.free.swap(position, self.free_len);
     }
 
     fn get(&self, index: usize) -> Option<&T> {
@@ -1003,13 +1029,15 @@ where
     /// shard; [`NetworkShardSet::shard_wait`] and its siblings are the
     /// only way to build one, and an arrival that lands between that
     /// inspection and this park resolves immediately rather than
-    /// sleeping through the wake.
+    /// sleeping through the wake. A replicated socket samples the
+    /// set-wide signal instead, because the shard its next connection
+    /// or datagram lands on is not known until the flow is hashed.
     async fn wait_for_shard_progress(&self, wait: ShardWait, duration: Duration) {
         if duration.is_zero() {
             return;
         }
 
-        let arrival = self.inner.state.arrival(wait.shard_idx).changed(wait.mark);
+        let arrival = self.inner.state.arrival_for(wait.target).changed(wait.mark);
         let mut arrival = core::pin::pin!(arrival);
 
         if !self.inner.device.capabilities().events.interrupts {
@@ -1216,8 +1244,9 @@ mod tests {
     use super::{
         AddressAttemptError, DhcpClientState, HandleSlab, NETWORK_BUSY_POLL_ROUNDS,
         NETWORK_TX_BATCH_FRAMES, NetworkIpAddress, NetworkPollBudget, NetworkPollProgress,
-        NetworkPollState, NetworkPumpAction, NetworkPumpCadence, NetworkShard, icmp_echo_payload,
-        limit_udp_datagram_bytes, map_ipv4_address, parse_ipv6,
+        NetworkPollState, NetworkPumpAction, NetworkPumpCadence, NetworkShard, ReplicaHandle,
+        TcpListenerId, UdpSocketId, icmp_echo_payload, limit_udp_datagram_bytes, map_ipv4_address,
+        parse_ipv6,
     };
 
     fn ipv6_tcp_frame(
@@ -1326,6 +1355,42 @@ mod tests {
         (frame, offset)
     }
 
+    fn ipv4_tcp_frame(
+        source: Ipv4Address,
+        destination: Ipv4Address,
+        header: TcpHeader,
+    ) -> ([u8; ETHERNET_FRAME_BYTES], usize) {
+        let mut frame = [0; ETHERNET_FRAME_BYTES];
+        let mut offset = EthernetFrame::encode_header(
+            &mut frame,
+            [0x02, 0, 0, 0, 0, 1],
+            [0x02, 0, 0, 0, 0, 2],
+            EthernetProtocol::Ipv4,
+        )
+        .expect("test Ethernet header should fit");
+        let tcp_start = offset + Ipv4Packet::MIN_HEADER_LEN;
+        let tcp_len = TcpPacket::encode(
+            &mut frame[tcp_start..],
+            IpAddress::Ipv4(source),
+            IpAddress::Ipv4(destination),
+            header,
+            &[],
+            TransportChecksum::Software,
+        )
+        .expect("test TCP segment should fit");
+        offset += Ipv4Packet::encode_header(
+            &mut frame[offset..],
+            source,
+            destination,
+            IpProtocol::Tcp,
+            tcp_len,
+            1,
+            64,
+        )
+        .expect("test IPv4 header should fit");
+        (frame, offset + tcp_len)
+    }
+
     fn ipv4_udp_frame(
         source: Ipv4Address,
         source_port: u16,
@@ -1398,8 +1463,44 @@ mod tests {
         StackConfig::new([0x02, 0, 0, 0, 0, 1], ETHERNET_FRAME_BYTES).with_rx_budget(8)
     }
 
+    /// The first datagram slot a replicated bind may take: the DHCP
+    /// client owns everything below it on every shard.
+    const FIRST_TEST_UDP_SLOT: usize = super::INTERNAL_UDP_RESERVED_SLOTS;
+    /// Listeners reserve nothing, so their first slot is zero.
+    const FIRST_TEST_LISTENER_SLOT: usize = 0;
+
     fn test_network_shard() -> NetworkShard {
         NetworkShard::new(test_stack_config(), 1, 0, 1)
+    }
+
+    /// Installs one shard's replica of a bound datagram socket and
+    /// returns the id that names it, the way `execute_udp_bind` does
+    /// for the whole set.
+    fn bind_udp(shard: &mut NetworkShard, slot: usize, local_port: u16) -> UdpSocketId {
+        shard
+            .install_udp_bind(slot, local_port)
+            .expect("test UDP socket should bind");
+        UdpSocketId(ReplicaHandle::new(slot).get())
+    }
+
+    /// The same for a listener.
+    fn listen_tcp(
+        shard: &mut NetworkShard,
+        slot: usize,
+        local_address: NetworkIpAddress,
+        local_port: u16,
+        backlog: TcpListenBacklog,
+    ) -> TcpListenerId {
+        shard
+            .install_tcp_listener(
+                slot,
+                local_address,
+                local_port,
+                backlog,
+                helios_netstack::DEFAULT_HOP_LIMIT,
+            )
+            .expect("test TCP listener should bind");
+        TcpListenerId(ReplicaHandle::new(slot).get())
     }
 
     /// A link that comes back is not the link that went away: the lease,
@@ -1809,10 +1910,7 @@ mod tests {
             state: NeighborState::Reachable,
             updated_at: StackInstant::from_nanos(0),
         });
-        let socket = state
-            .start_udp_bind(4040)
-            .expect("IPv6 UDP test socket should bind")
-            .socket;
+        let socket = bind_udp(&mut state, FIRST_TEST_UDP_SLOT, 4040);
 
         let written = state
             .try_send_udp(
@@ -1852,10 +1950,7 @@ mod tests {
             state: NeighborState::Reachable,
             updated_at: StackInstant::from_nanos(0),
         });
-        let socket = state
-            .start_udp_bind(4040)
-            .expect("UDP test socket should bind")
-            .socket;
+        let socket = bind_udp(&mut state, FIRST_TEST_UDP_SLOT, 4040);
         let payload = [0u8; ETHERNET_FRAME_BYTES];
 
         let error = state
@@ -1877,10 +1972,7 @@ mod tests {
         let remote = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let mut state = test_network_shard();
         state.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
-        let socket = state
-            .start_udp_bind(4040)
-            .expect("IPv6 UDP test socket should bind")
-            .socket;
+        let socket = bind_udp(&mut state, FIRST_TEST_UDP_SLOT, 4040);
         let (frame, len) = ipv6_udp_frame(remote, 53, local, 4040, b"hello");
 
         state
@@ -1904,10 +1996,7 @@ mod tests {
         let other_peer = Ipv4Address::new([192, 0, 2, 30]);
         let mut state = test_network_shard();
         state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
-        let socket = state
-            .start_udp_bind(4040)
-            .expect("UDP test socket should bind")
-            .socket;
+        let socket = bind_udp(&mut state, FIRST_TEST_UDP_SLOT, 4040);
         state
             .connect_udp_socket(socket, IpAddress::Ipv4(expected_peer), 53)
             .expect("UDP socket should connect");
@@ -1949,10 +2038,7 @@ mod tests {
         let second_peer = Ipv4Address::new([192, 0, 2, 30]);
         let mut state = test_network_shard();
         state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
-        let socket = state
-            .start_udp_bind(4040)
-            .expect("UDP test socket should bind")
-            .socket;
+        let socket = bind_udp(&mut state, FIRST_TEST_UDP_SLOT, 4040);
         state
             .connect_udp_socket(socket, IpAddress::Ipv4(first_peer), 53)
             .expect("UDP socket should connect");
@@ -1988,10 +2074,7 @@ mod tests {
         let peer = Ipv4Address::new([192, 0, 2, 20]);
         let mut state = test_network_shard();
         state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
-        let socket = state
-            .start_udp_bind(4040)
-            .expect("UDP test socket should bind")
-            .socket;
+        let socket = bind_udp(&mut state, FIRST_TEST_UDP_SLOT, 4040);
         state
             .connect_udp_socket(socket, IpAddress::Ipv4(peer), 53)
             .expect("UDP socket should connect");
@@ -2018,10 +2101,7 @@ mod tests {
         let second_peer = Ipv4Address::new([192, 0, 2, 30]);
         let mut state = test_network_shard();
         state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
-        let first = state
-            .start_udp_bind(4040)
-            .expect("first UDP test socket should bind")
-            .socket;
+        let first = bind_udp(&mut state, FIRST_TEST_UDP_SLOT, 4040);
         state
             .connect_udp_socket(first, IpAddress::Ipv4(first_peer), 53)
             .expect("first UDP socket should connect");
@@ -2038,26 +2118,15 @@ mod tests {
                 },
             ))
             .expect("second connected stack UDP socket should bind");
-        let second = state.insert_udp_socket(
-            second_stack_socket,
-            UdpSocketBinding::connected(
-                UdpEndpoint {
-                    address: IpAddress::Ipv4(local),
-                    port: 4040,
-                },
-                UdpEndpoint {
-                    address: IpAddress::Ipv4(second_peer),
-                    port: 53,
-                },
-            ),
-        );
-
         let error = state
             .disconnect_udp_socket(first)
             .expect_err("disconnect should reject ambiguous wildcard binding");
         assert_eq!(error.kind, crate::UdpErrorKind::Unavailable);
         assert_eq!(error.detail, crate::NetworkErrorDetail::UdpPortInUse);
-        state.remove_udp_socket(second);
+        state
+            .stack
+            .remove_udp_socket(second_stack_socket)
+            .expect("the second connected socket should close");
     }
 
     /// The regression #31 describes: a reply for a socket on shard 1
@@ -2083,27 +2152,36 @@ mod tests {
         let state = super::NetworkShardSet::new(2, |index| {
             NetworkShard::new(test_stack_config(), 1 + index as u32, index, 2)
         });
-        let binding = state
-            .with_local_port(49_153, |shard| {
-                shard.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
-                shard.start_udp_bind(49_153)
-            })
-            .expect("explicit ephemeral UDP bind should allocate on owner shard");
-        let owner = state.shard_idx_for_handle(binding.socket);
-        assert_eq!(owner, 1, "port 49_153 should belong to shard 1");
+        // A bound datagram socket is replicated: the same slot on every
+        // shard, with the receive path deciding which replica gets a
+        // given datagram.
+        let socket = UdpSocketId(ReplicaHandle::new(FIRST_TEST_UDP_SLOT).get());
+        state
+            .install_replica(
+                FIRST_TEST_UDP_SLOT,
+                |shard, slot| {
+                    shard.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+                    shard.install_udp_bind(slot, 49_153)
+                },
+                NetworkShard::remove_udp_replica,
+            )
+            .expect("the bind should install on every shard");
+        let owner = super::shard_idx_for_port(Some(49_153), state.shard_count());
+        assert_eq!(owner, 1, "port 49_153 demuxes to shard 1");
 
         // The operation's park, taken the way every per-operation wait
         // takes it: mark first, then inspect.
-        let wait = state.shard_wait_for_handle(binding.socket);
+        let wait = state.shard_wait(owner);
         assert!(
             state
-                .with_handle(binding.socket, |shard| shard
-                    .poll_udp_receive(binding.socket, usize::MAX)
-                    .expect("bound UDP socket should poll"))
+                .shard_at(owner)
+                .lock()
+                .poll_udp_receive(socket, usize::MAX)
+                .expect("bound UDP socket should poll")
                 .is_none(),
             "nothing has arrived yet"
         );
-        let mut parked = core::pin::pin!(state.arrival(wait.shard_idx).changed(wait.mark));
+        let mut parked = core::pin::pin!(state.arrival(owner).changed(wait.mark));
         assert!(
             block_on(poll_once(parked.as_mut())).is_none(),
             "the wait must park while the reply is still on the wire"
@@ -2141,11 +2219,122 @@ mod tests {
         );
         assert!(
             state
-                .with_handle(binding.socket, |shard| shard
-                    .poll_udp_receive(binding.socket, usize::MAX)
-                    .expect("bound UDP socket should poll"))
+                .shard_at(owner)
+                .lock()
+                .poll_udp_receive(socket, usize::MAX)
+                .expect("bound UDP socket should poll")
                 .is_some(),
             "the released operation must find its datagram"
+        );
+    }
+
+    /// A listener exists on every shard, and `accept` starts at the
+    /// caller's own shard and then visits the rest, so a connection the
+    /// receive path placed on a foreign shard is never stranded.
+    #[test]
+    fn accept_starts_at_the_callers_shard_and_visits_the_rest() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([198, 51, 100, 20]);
+        let state = super::NetworkShardSet::new(3, |index| {
+            NetworkShard::new(test_stack_config(), 1 + index as u32, index, 3)
+        });
+        let listener = TcpListenerId(ReplicaHandle::new(FIRST_TEST_LISTENER_SLOT).get());
+        state
+            .install_replica(
+                FIRST_TEST_LISTENER_SLOT,
+                |shard, slot| {
+                    shard.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
+                    shard.stack.learn_neighbor(NeighborEntry {
+                        ip: IpAddress::Ipv4(peer),
+                        mac: [0x02, 0, 0, 0, 0, 2],
+                        state: NeighborState::Reachable,
+                        updated_at: StackInstant::from_nanos(0),
+                    });
+                    shard.install_tcp_listener(
+                        slot,
+                        NetworkIpAddress::Ipv4(map_ipv4_address(local)),
+                        8080,
+                        TcpListenBacklog::new(2),
+                        helios_netstack::DEFAULT_HOP_LIMIT,
+                    )
+                },
+                NetworkShard::remove_tcp_listener,
+            )
+            .expect("the listener should install on every shard");
+
+        // A handshake delivered to shard 2 only: that is the replica
+        // whose accept queue fills.
+        let (syn, syn_len) = ipv4_tcp_frame(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 40_000,
+                destination_port: 8080,
+                sequence: 10,
+                acknowledgement: 0,
+                flags: TcpFlags::SYN,
+                window_size: u16::MAX,
+            },
+        );
+        let syn_ack_sequence = {
+            let mut shard = state.shard_at(2).lock();
+            shard
+                .stack
+                .receive_frame(&syn[..syn_len], StackInstant::from_nanos(1))
+                .expect("the foreign replica should take the SYN");
+            shard
+                .stack
+                .drive_tcp(StackInstant::from_nanos(1))
+                .expect("the replica should queue a SYN-ACK");
+            let frame = shard
+                .stack
+                .take_outbound()
+                .expect("the replica should queue a SYN-ACK");
+            let ethernet =
+                EthernetFrame::parse(frame.as_slice()).expect("Ethernet frame should parse");
+            let ipv4 = Ipv4Packet::parse(ethernet.payload).expect("IPv4 packet should parse");
+            let syn_ack = TcpPacket::parse(ipv4.payload).expect("TCP packet should parse");
+            assert!(syn_ack.flags.contains(TcpFlags::SYN.union(TcpFlags::ACK)));
+            syn_ack.sequence
+        };
+        let (ack, ack_len) = ipv4_tcp_frame(
+            peer,
+            local,
+            TcpHeader {
+                source_port: 40_000,
+                destination_port: 8080,
+                sequence: 11,
+                acknowledgement: syn_ack_sequence.wrapping_add(1),
+                flags: TcpFlags::ACK,
+                window_size: u16::MAX,
+            },
+        );
+        state
+            .shard_at(2)
+            .lock()
+            .stack
+            .receive_frame(&ack[..ack_len], StackInstant::from_nanos(2))
+            .expect("the final ACK should establish the accepted socket");
+
+        // Starting the walk on an empty shard still finds it, and the
+        // accepted stream belongs to the shard that produced it.
+        let accepted = state
+            .find_in_replicas(0, |shard| shard.poll_tcp_accept(listener))
+            .expect("the accept walk should not fail")
+            .expect("a connection queued on any replica is acceptable");
+        assert_eq!(
+            state.shard_idx_for_handle(accepted.stream),
+            2,
+            "an accepted stream belongs to the shard whose replica took the SYN"
+        );
+        assert_eq!(accepted.port, 40_000);
+
+        // Nothing is left over: the connection was taken exactly once.
+        assert!(
+            state
+                .find_in_replicas(0, |shard| shard.poll_tcp_accept(listener))
+                .expect("the accept walk should not fail")
+                .is_none()
         );
     }
 
@@ -2198,12 +2387,12 @@ mod tests {
 
         assert_eq!(arrivals.iter().collect::<Vec<_>>(), alloc::vec![2, 0]);
 
-        let marks: Vec<_> = (0..4).map(|idx| state.shard_wait(idx)).collect();
+        let marks: Vec<_> = (0..4).map(|idx| (idx, state.shard_wait(idx))).collect();
         state.notify_arrivals(&arrivals, &cpu);
 
-        for wait in marks {
-            let touched = arrivals.iter().any(|idx| idx == wait.shard_idx);
-            let mut parked = core::pin::pin!(state.arrival(wait.shard_idx).changed(wait.mark));
+        for (shard_idx, wait) in marks {
+            let touched = arrivals.iter().any(|idx| idx == shard_idx);
+            let mut parked = core::pin::pin!(state.arrival(shard_idx).changed(wait.mark));
             assert_eq!(
                 block_on(poll_once(parked.as_mut())).is_some(),
                 touched,
@@ -2217,82 +2406,78 @@ mod tests {
         );
     }
 
+    /// A replicated bind exists on every shard, and an ICMPv6 Packet
+    /// Too Big teaches the path MTU to the replica that receives it —
+    /// which is the replica that will send on that path again.
     #[test]
-    fn explicit_ephemeral_udp_binding_ids_route_to_port_owner_shard() {
+    fn a_packet_too_big_caps_the_replica_that_received_it() {
         let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         let peer = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
         let router = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
         let state = super::NetworkShardSet::new(2, |index| {
             NetworkShard::new(test_stack_config(), 1 + index as u32, index, 2)
         });
-        let binding = state
-            .with_local_port(49_153, |shard| shard.start_udp_bind(49_153))
-            .expect("explicit ephemeral UDP bind should allocate on owner shard");
+        let socket = UdpSocketId(ReplicaHandle::new(FIRST_TEST_UDP_SLOT).get());
+        state
+            .install_replica(
+                FIRST_TEST_UDP_SLOT,
+                |shard, slot| {
+                    shard.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
+                    shard.stack.learn_neighbor(NeighborEntry {
+                        ip: IpAddress::Ipv6(peer),
+                        mac: [0x02, 0, 0, 0, 0, 2],
+                        state: NeighborState::Reachable,
+                        updated_at: StackInstant::from_nanos(0),
+                    });
+                    shard.install_udp_bind(slot, 49_153)
+                },
+                NetworkShard::remove_udp_replica,
+            )
+            .expect("the bind should install on every shard");
 
-        state.with_handle(binding.socket, |shard| {
-            assert_eq!(shard.shard_idx, 1);
-            assert_eq!(
-                shard
-                    .udp_socket(binding.socket)
-                    .expect("bound UDP socket should be on handle shard")
-                    .binding
-                    .local_port,
-                49_153
-            );
-        });
-
+        let sender = super::shard_idx_for_port(Some(49_153), state.shard_count());
         let payload = [0u8; 1233];
-        let (packet_too_big, packet_too_big_len) = state.with_handle(binding.socket, |shard| {
-            shard.stack.add_ipv6_address(Ipv6Cidr::new(local, 64));
-            shard.stack.learn_neighbor(NeighborEntry {
-                ip: IpAddress::Ipv6(peer),
-                mac: [0x02, 0, 0, 0, 0, 2],
-                state: NeighborState::Reachable,
-                updated_at: StackInstant::from_nanos(0),
-            });
+        let (packet_too_big, packet_too_big_len) = {
+            let mut shard = state.shard_at(sender).lock();
             let written = shard
                 .try_send_udp(
-                    binding.socket,
+                    socket,
                     IpAddress::Ipv6(peer),
                     53,
                     &payload,
                     StackInstant::from_nanos(1),
                 )
-                .expect("owner shard should queue initial IPv6 UDP datagram");
+                .expect("the replica should queue the initial IPv6 UDP datagram");
             assert_eq!(written, payload.len());
             let quoted = shard
                 .stack
                 .take_outbound()
-                .expect("owner shard should queue initial IPv6 UDP datagram");
+                .expect("the replica should queue the initial IPv6 UDP datagram");
             ipv6_packet_too_big_frame(router, local, quoted.as_slice(), 1280)
-        });
+        };
 
-        let port = super::peek_local_port(&packet_too_big[..packet_too_big_len]);
-        assert_eq!(port, Some(49_153));
-        let shard_idx = super::shard_idx_for_port(port, state.shard_count());
-        assert_eq!(shard_idx, 1);
         state
-            .shard_at(shard_idx)
+            .shard_at(sender)
             .lock()
             .stack
             .receive_frame(
                 &packet_too_big[..packet_too_big_len],
                 StackInstant::from_nanos(2),
             )
-            .expect("ICMPv6 Packet Too Big should update owner shard PMTU");
+            .expect("ICMPv6 Packet Too Big should update the replica's PMTU");
 
-        state.with_handle(binding.socket, |shard| {
-            let error = shard
-                .try_send_udp(
-                    binding.socket,
-                    IpAddress::Ipv6(peer),
-                    53,
-                    &payload,
-                    StackInstant::from_nanos(3),
-                )
-                .expect_err("owner shard PMTU should cap later UDP sends");
-            assert_eq!(error.detail, crate::NetworkErrorDetail::UdpDatagramTooLarge);
-        });
+        let error = state
+            .shard_at(sender)
+            .lock()
+            .try_send_udp(
+                socket,
+                IpAddress::Ipv6(peer),
+                53,
+                &payload,
+                StackInstant::from_nanos(3),
+            )
+            .expect_err("the learned PMTU should cap later UDP sends");
+        assert_eq!(error.detail, crate::NetworkErrorDetail::UdpDatagramTooLarge);
     }
 
     #[test]
@@ -2302,10 +2487,7 @@ mod tests {
         let group = Ipv4Address::new([224, 0, 0, 251]);
         let mut state = test_network_shard();
         state.stack.add_ipv4_address(Ipv4Cidr::new(local, 24));
-        let socket = state
-            .start_udp_bind(4040)
-            .expect("UDP test socket should bind")
-            .socket;
+        let socket = bind_udp(&mut state, FIRST_TEST_UDP_SLOT, 4040);
         let (first, first_len) = ipv4_udp_frame(peer, 5353, group, 4040, b"first");
         let (second, second_len) = ipv4_udp_frame(peer, 5353, group, 4040, b"second");
         let (third, third_len) = ipv4_udp_frame(peer, 5353, group, 4040, b"third");
@@ -2406,14 +2588,13 @@ mod tests {
             state: NeighborState::Reachable,
             updated_at: StackInstant::from_nanos(0),
         });
-        let listener = state
-            .start_tcp_listen(
-                NetworkIpAddress::Ipv6(local),
-                8080,
-                TcpListenBacklog::new(1),
-                helios_netstack::DEFAULT_HOP_LIMIT,
-            )
-            .expect("IPv6 TCP listen should allocate a listener");
+        let listener = listen_tcp(
+            &mut state,
+            FIRST_TEST_LISTENER_SLOT,
+            NetworkIpAddress::Ipv6(local),
+            8080,
+            TcpListenBacklog::new(1),
+        );
 
         let (syn, syn_len) = ipv6_tcp_frame(
             remote,
@@ -2463,7 +2644,7 @@ mod tests {
             .expect("IPv6 final ACK should establish accepted socket");
 
         let accepted = state
-            .poll_tcp_accept(listener.listener)
+            .poll_tcp_accept(listener)
             .expect("IPv6 accept should poll")
             .expect("accepted IPv6 stream should be queued");
         assert_eq!(accepted.address, NetworkIpAddress::Ipv6(remote));
