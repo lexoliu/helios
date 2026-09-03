@@ -378,7 +378,7 @@ just lint
 just test-units
 ```
 
-`just lint` is `cargo fmt --all --check` plus `cargo clippy … -D warnings`
+`just lint` is `tools/fmt.sh --check` plus `cargo clippy … -D warnings`
 over the host crates, each guest program, and all three bare-metal targets;
 `just test-units` runs the `hal`, `virtio`, `netstack` and `kernel` unit tests
 and the `hal_layering` layering test. CI runs the same recipes, split across

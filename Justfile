@@ -29,8 +29,13 @@ lint:
     just clippy-target riscv64gc-unknown-none-elf helios-riscv
     just clippy-target x86_64-unknown-none helios-x86
 
+# Check formatting of this workspace's own crates.
 fmt-check:
-    cargo fmt --all --check
+    {{repo_root}}/tools/fmt.sh --check
+
+# Reformat this workspace's own crates.
+fmt:
+    {{repo_root}}/tools/fmt.sh
 
 # Clippy every crate that builds for the host, denying warnings.
 clippy-host:
