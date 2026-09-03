@@ -20,7 +20,7 @@ pub use child::{
     ByteReadWait, ByteReader, ByteWriteWait, ByteWriter, ClosedPeer, TryRead, TryWrite,
     byte_channel,
 };
-pub use console::RecordingConsole;
+pub use console::{RecordingConsole, emit_console_line};
 pub use interrupts::{
     ExternalInterruptHandler, ExternalInterruptRoutes, MAX_BLOCK_DEVICES, MAX_NETWORK_INTERRUPTS,
     wake_queue_owners,

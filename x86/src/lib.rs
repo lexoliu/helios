@@ -240,9 +240,18 @@ fn x86_kernel_main() -> ! {
     let debug_state = cpu.debug_state();
     // The root DRBG is seeded before any component can ask for random
     // bytes. x86 has no firmware seed to read — the boot protocol here
-    // is ACPI, not a device tree — so `RDRAND` is the pre-boot source
-    // and the entropy device joins it once the executor runs.
-    let root_entropy = helios_kernel::seed_root_entropy(&cpu, None);
+    // is ACPI, not a device tree — so `RDSEED`/`RDRAND` is the
+    // pre-executor source, and a processor without one refuses to boot
+    // here rather than running with a predictable stream.
+    //
+    // Unlike the device-tree backends, this one cannot take the
+    // bring-up read of its entropy device instead: that device is a PCI
+    // function which has to be confined in its virtio-iommu domain
+    // before it is programmed, and that pass also programs the block
+    // device, which needs the root DRBG this call produces. It joins
+    // through the reseed task once the executor runs.
+    let root_entropy =
+        helios_kernel::seed_root_entropy(&cpu, None, None::<&helios_kernel::NoEntropyDevice>);
     debug_state.install_root_entropy(root_entropy.clone());
     // The calendar is read once, here, before any component can ask
     // what time it is. The TSC carries wall time forward from that
@@ -1270,7 +1279,11 @@ pub(crate) fn write_debug_serial_bytes(bytes: &[u8]) {
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     serial_uart_init();
-    let _ = writeln!(PanicSerialWriter, "{info}");
+    // One indivisible message, like every other console producer: the panic
+    // report shares this UART with kernel tracing and the debugger markers.
+    helios_kernel::emit_console_line(|| {
+        let _ = writeln!(PanicSerialWriter, "{info}");
+    });
     helios_kernel::panic_log(info);
     loop {
         core::hint::spin_loop();

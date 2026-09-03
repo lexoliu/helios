@@ -3,11 +3,20 @@
 //!
 //! Every cryptographic byte the kernel or a guest sees comes from
 //! [`RootEntropy`], a ChaCha20 DRBG seeded at boot from every source the
-//! platform actually has — the CPU's own instruction or host source, the
-//! seed firmware handed us in the device tree, and the bytes a
-//! virtio-entropy device produces once the executor is running. A kernel
-//! that finds none of them fails to boot rather than running with a
-//! predictable stream.
+//! platform actually has. There are three, and a platform needs one:
+//! the processor's own instruction or host source (`RDSEED`/`RDRAND`,
+//! `RNDR`, the host OS), the seed firmware handed us in the device
+//! tree's `/chosen/rng-seed`, and a read of the platform's entropy
+//! device taken during bring-up. A kernel that finds none of them fails
+//! to boot rather than running with a predictable stream.
+//!
+//! The third exists because the first two are not always there. An
+//! AArch64 machine described by ACPI has no `/chosen/rng-seed` — ACPI
+//! has no counterpart to it — and a processor without `FEAT_RNG` has no
+//! instruction either, which leaves the entropy device as the only
+//! source such a machine has. The same device goes on reseeding the
+//! root from a kernel task once the executor runs; the bring-up read is
+//! what makes the boot possible at all.
 //!
 //! Concurrency contract: the root DRBG is a spin mutex held for the
 //! length of one generate or reseed and never across an await. Reads of
@@ -19,6 +28,8 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use core::future::Future;
+use core::pin::pin;
+use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 
 use helios_hal::cpu::Cpu;
@@ -49,8 +60,8 @@ const DERIVE_DOMAIN: &[u8] = b"helios.entropy.pool.derive.v1";
 /// would make every one of those predictable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 #[error(
-    "the platform exposes no cryptographic entropy source: neither the CPU, nor firmware, nor a \
-     virtio-entropy device offered seed material"
+    "the platform exposes no cryptographic entropy source: the processor has no entropy \
+     instruction, firmware left no seed, and no entropy device answered at bring-up"
 )]
 pub struct NoCryptographicEntropy;
 
@@ -68,7 +79,9 @@ pub struct EntropySources {
     /// Firmware handed the kernel a seed, such as the device tree's
     /// `/chosen/rng-seed`.
     pub firmware: bool,
-    /// A virtio-entropy device has reseeded the root at least once.
+    /// The platform's entropy device has contributed, either through
+    /// the bring-up read that seeded the root or through a later
+    /// reseed.
     pub device: bool,
 }
 
@@ -92,17 +105,18 @@ struct RootState {
 }
 
 impl RootEntropy {
-    /// Seeds the root DRBG from the sources available before the
-    /// executor runs: the CPU's own source and whatever seed firmware
-    /// left for us.
+    /// Seeds the root DRBG from every source the platform has before
+    /// the executor runs: the processor's own, whatever seed firmware
+    /// left behind, and a bring-up read of the entropy device.
     ///
-    /// Neither is a fallback for the other — every source present is
-    /// mixed in, and the result is unpredictable as long as one of them
-    /// was. A virtio-entropy device joins later through [`Self::reseed`]
-    /// because reading it requires the executor and device interrupts.
+    /// None is a fallback for another — every source present is mixed
+    /// in, and the result is unpredictable as long as one of them was.
+    /// The device goes on contributing after boot through
+    /// [`Self::reseed`].
     pub fn from_platform<CpuImpl>(
         cpu: &CpuImpl,
         firmware_seed: Option<&[u8]>,
+        device_material: Option<&[u8; ROOT_ENTROPY_MATERIAL_BYTES]>,
     ) -> Result<Self, NoCryptographicEntropy>
     where
         CpuImpl: Cpu,
@@ -123,6 +137,10 @@ impl RootEntropy {
             );
             hash.update(seed);
             sources.firmware = true;
+        }
+        if let Some(material) = device_material {
+            hash.update(material);
+            sources.device = true;
         }
 
         if !sources.any() {
@@ -184,26 +202,111 @@ impl RootEntropy {
 
 /// Seeds the root DRBG for this boot, or fails the boot.
 ///
-/// Backends call this once on the bootstrap processor with whatever seed
+/// Backends call this once on the bootstrap processor with the seed
 /// firmware left them — the device tree's `/chosen/rng-seed` on the
-/// platforms that have one — and install the result on the runtime
-/// state. A platform with no cryptographic source at all panics here:
-/// the alternative is a kernel whose guest randomness, address-space
-/// layout and TCP sequence numbers are all predictable, which is worse
-/// than not booting.
-pub fn seed_root_entropy<CpuImpl>(cpu: &CpuImpl, firmware_seed: Option<&[u8]>) -> RootEntropyHandle
+/// platforms that have one — and the entropy device they have already
+/// brought up, and install the result on the runtime state. A platform
+/// with no cryptographic source at all panics here: the alternative is
+/// a kernel whose guest randomness, address-space layout and TCP
+/// sequence numbers are all predictable, which is worse than not
+/// booting.
+///
+/// The device is read here rather than in each backend so the three of
+/// them share one implementation, and it must already be programmed:
+/// this is the same device the caller later hands to
+/// [`install_entropy_device`] for continuous reseeding.
+pub fn seed_root_entropy<CpuImpl, Device>(
+    cpu: &CpuImpl,
+    firmware_seed: Option<&[u8]>,
+    device: Option<&Device>,
+) -> RootEntropyHandle
 where
     CpuImpl: Cpu,
+    Device: HardwareEntropySource,
 {
-    let root =
-        RootEntropy::from_platform(cpu, firmware_seed).unwrap_or_else(|error| panic!("{error}"));
+    let device_material = device.and_then(|device| match read_at_bring_up(device) {
+        Ok(material) => Some(material),
+        Err(error) => {
+            // Not fatal on its own: a platform that also has a
+            // processor source or a firmware seed is still seeded from
+            // those, and one that has neither fails immediately below.
+            tracing::warn!("the platform entropy device did not answer at bring-up: {error:?}");
+            None
+        }
+    });
+    let root = RootEntropy::from_platform(cpu, firmware_seed, device_material.as_ref())
+        .unwrap_or_else(|error| panic!("{error}"));
     let sources = root.sources();
     tracing::info!(
         cpu = sources.cpu,
         firmware = sources.firmware,
+        device = sources.device,
         "root entropy seeded"
     );
     Arc::new(root)
+}
+
+/// Reads seed material from an entropy device before the executor
+/// exists.
+///
+/// This is one of the `block_on` sites AGENTS.md §4 allows: a bootstrap
+/// entry point that runs before the kernel executor starts, on the
+/// bootstrap processor, with nothing else to yield to. Polling rather
+/// than awaiting is sound for this device because the virtio completion
+/// path drains its own used ring on every poll — the device interrupt
+/// exists to spare the reader from spinning, not to deliver the
+/// completion — so the spin waits on the descriptor the device is
+/// writing and not on software state.
+fn read_at_bring_up<Device>(device: &Device) -> Result<[u8; ROOT_ENTROPY_MATERIAL_BYTES], IoError>
+where
+    Device: HardwareEntropySource,
+{
+    let mut material = [0_u8; ROOT_ENTROPY_MATERIAL_BYTES];
+    {
+        let mut fill = pin!(device.fill(&mut material));
+        let mut context = Context::from_waker(Waker::noop());
+        loop {
+            match fill.as_mut().poll(&mut context) {
+                Poll::Ready(result) => break result?,
+                Poll::Pending => {
+                    // Nothing else runs on this processor yet, so the
+                    // completion has to be collected by this loop
+                    // rather than by the handler that will own the
+                    // device once interrupts are unmasked.
+                    device.drain_completions();
+                    core::hint::spin_loop();
+                }
+            }
+        }
+    }
+    Ok(material)
+}
+
+/// A platform with no entropy device the kernel can read at bring-up.
+///
+/// Uninhabited, so a backend that names it as the device type is
+/// stating a fact the type system enforces rather than supplying a
+/// stub that would have to answer somehow. The hosted backend is the
+/// one that uses it: its only cryptographic source is the host OS,
+/// which reaches the kernel through `Cpu::fill_entropy`.
+pub enum NoEntropyDevice {}
+
+impl HardwareEntropySource for NoEntropyDevice {
+    #[expect(
+        unreachable_code,
+        reason = "`Self` is uninhabited, so the empty match diverges; the call it feeds exists \
+                  only to give the signature a concrete future type"
+    )]
+    fn fill<'a>(
+        &'a self,
+        _buffer: &'a mut [u8],
+    ) -> impl Future<Output = Result<(), IoError>> + Send + 'a {
+        core::future::ready(match *self {})
+    }
+
+    fn drain_completions(&self) {
+        match *self {}
+    }
 }
 
 /// A hardware entropy device the kernel can read.
@@ -217,6 +320,17 @@ pub trait HardwareEntropySource: Send + 'static {
         &'a self,
         buffer: &'a mut [u8],
     ) -> impl Future<Output = Result<(), IoError>> + Send + 'a;
+
+    /// Collects whatever the device has finished, without waiting for
+    /// its interrupt.
+    ///
+    /// This is the same work the device's interrupt handler does, and
+    /// it exists as its own method for the one caller that has no
+    /// interrupt to rely on: the bring-up read in
+    /// [`seed_root_entropy`], which runs before the executor exists and
+    /// before interrupts are unmasked. A completion the driver would
+    /// otherwise learn about from its handler is noticed here instead.
+    fn drain_completions(&self);
 }
 
 /// How long the reseed task waits between hardware reads.
@@ -368,7 +482,7 @@ mod tests {
     use crate::test_support::TestCpu;
 
     fn root() -> RootEntropy {
-        RootEntropy::from_platform(&TestCpu::with_entropy(0x5a), None)
+        RootEntropy::from_platform(&TestCpu::with_entropy(0x5a), None, None)
             .expect("a CPU source is enough to seed the root")
     }
 
@@ -381,14 +495,14 @@ mod tests {
     #[test]
     fn a_platform_without_any_source_cannot_seed_the_root() {
         assert_eq!(
-            RootEntropy::from_platform(&TestCpu::without_entropy(), None).err(),
+            RootEntropy::from_platform(&TestCpu::without_entropy(), None, None).err(),
             Some(NoCryptographicEntropy)
         );
     }
 
     #[test]
     fn firmware_alone_seeds_the_root() {
-        let root = RootEntropy::from_platform(&TestCpu::without_entropy(), Some(&[7_u8; 32]))
+        let root = RootEntropy::from_platform(&TestCpu::without_entropy(), Some(&[7_u8; 32]), None)
             .expect("a firmware seed is a cryptographic source");
         assert_eq!(
             root.sources(),
@@ -402,17 +516,56 @@ mod tests {
     }
 
     #[test]
+    fn a_bring_up_device_read_alone_seeds_the_root() {
+        // The case an ACPI-described AArch64 machine without FEAT_RNG
+        // is in: no processor source, no firmware seed, and only the
+        // entropy device read during bring-up.
+        let root = RootEntropy::from_platform(&TestCpu::without_entropy(), None, Some(&[9_u8; 64]))
+            .expect("a bring-up device read is a cryptographic source");
+        assert_eq!(
+            root.sources(),
+            EntropySources {
+                cpu: false,
+                firmware: false,
+                device: true,
+            }
+        );
+        assert_ne!(first_bytes(&root), [0_u8; 32]);
+    }
+
+    #[test]
+    fn a_bring_up_device_read_is_mixed_in_rather_than_replacing_the_others() {
+        let without = RootEntropy::from_platform(&TestCpu::with_entropy(0x5a), None, None)
+            .expect("cpu source seeds the root");
+        let with = RootEntropy::from_platform(
+            &TestCpu::with_entropy(0x5a),
+            None,
+            Some(&[1_u8; ROOT_ENTROPY_MATERIAL_BYTES]),
+        )
+        .expect("cpu and device seed the root");
+        assert_ne!(first_bytes(&without), first_bytes(&with));
+        assert_eq!(
+            with.sources(),
+            EntropySources {
+                cpu: true,
+                firmware: false,
+                device: true,
+            }
+        );
+    }
+
+    #[test]
     fn every_present_source_changes_the_seed() {
         // Firmware is mixed in, not used as a fallback for the CPU: two
         // roots that share a CPU source but differ in the firmware seed
         // must not produce the same stream.
-        let cpu_only = RootEntropy::from_platform(&TestCpu::with_entropy(0x5a), None)
+        let cpu_only = RootEntropy::from_platform(&TestCpu::with_entropy(0x5a), None, None)
             .expect("cpu source seeds the root");
         let with_firmware =
-            RootEntropy::from_platform(&TestCpu::with_entropy(0x5a), Some(&[3_u8; 32]))
+            RootEntropy::from_platform(&TestCpu::with_entropy(0x5a), Some(&[3_u8; 32]), None)
                 .expect("cpu and firmware seed the root");
         let other_firmware =
-            RootEntropy::from_platform(&TestCpu::with_entropy(0x5a), Some(&[4_u8; 32]))
+            RootEntropy::from_platform(&TestCpu::with_entropy(0x5a), Some(&[4_u8; 32]), None)
                 .expect("cpu and firmware seed the root");
 
         assert_eq!(
@@ -455,8 +608,10 @@ mod tests {
         // Identical device material on two roots that differ only in
         // their boot seed must still yield different streams: the
         // reseed folds the old state in rather than replacing it.
-        let first = RootEntropy::from_platform(&TestCpu::with_entropy(1), None).expect("seeded");
-        let second = RootEntropy::from_platform(&TestCpu::with_entropy(2), None).expect("seeded");
+        let first =
+            RootEntropy::from_platform(&TestCpu::with_entropy(1), None, None).expect("seeded");
+        let second =
+            RootEntropy::from_platform(&TestCpu::with_entropy(2), None, None).expect("seeded");
 
         first.reseed(&[9_u8; ROOT_ENTROPY_MATERIAL_BYTES]);
         second.reseed(&[9_u8; ROOT_ENTROPY_MATERIAL_BYTES]);

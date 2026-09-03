@@ -105,8 +105,9 @@ pub use io::{
     IommuDomains, IommuEndpointStats, IommuReport, IommuStats, MAX_BLOCK_DEVICES,
     MAX_IOMMU_ENDPOINTS, MAX_NETWORK_INTERRUPTS, PollKey, PollRegistration, PollRegistry,
     PollRegistryError, PollSourceKind, RecordingConsole, SCRATCH_DISK_SERIAL, SerialReader,
-    TryRead, TryWrite, byte_channel, emit_serial_error_marker, emit_serial_stage_marker,
-    install_block_devices, read_serial, try_read_serial, wake_queue_owners, write_serial,
+    TryRead, TryWrite, byte_channel, emit_console_line, emit_serial_error_marker,
+    emit_serial_stage_marker, install_block_devices, read_serial, try_read_serial,
+    wake_queue_owners, write_serial,
 };
 pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
@@ -114,11 +115,12 @@ pub use kernel_exception::{
 pub use memory::{
     AccessibilityPlan, BalloonHandle, BalloonStats, CommittedRegion, ENTROPY_RESEED_INTERVAL,
     EntropyPool, EntropySources, FREE_PAGE_REPORT_INTERVAL, HardwareEntropySource,
-    KernelPhysFrameAllocator, NoCryptographicEntropy, ROOT_ENTROPY_MATERIAL_BYTES,
+    KernelPhysFrameAllocator, NoCryptographicEntropy, NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES,
     ReservationLookup, ReservationTracker, RootEntropy, RootEntropyHandle, UserHeapStats, VaCursor,
     allocate_user_frame_uninit_on, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
     deallocate_user_frame, deallocate_user_frame_on, install_entropy_device,
-    install_memory_balloon, seed_root_entropy, user_heap_stats, validate_range,
+    install_memory_balloon, largest_servable_user_bytes, seed_root_entropy, user_heap_stats,
+    validate_range,
 };
 pub use network::{
     HTTP_FORBIDDEN_FIELD_NAMES, HTTP_MAX_FIELD_SECTION_BYTES, HTTP_MAX_FIELD_VALUE_BYTES, HttpBody,

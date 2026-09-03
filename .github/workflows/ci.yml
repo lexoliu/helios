@@ -354,12 +354,10 @@ jobs:
           cat boot-dt.out
           grep -Fqx ok boot-dt.out
           grep -F 'platform described by device-tree' "$runtime/inspector.log"
-      # Under TCG with `-cpu max`, because ACPI carries no counterpart to
-      # the device tree's `/chosen/rng-seed` and the kernel refuses to
-      # boot without a pre-executor entropy source. `-cpu max`
-      # implements FEAT_RNG, which the Apple cores behind HVF do not.
-      # Two processors rather than four, to bound what TCG has to
-      # emulate. See issue #83.
+      # Under HVF like the device-tree boot above. ACPI carries no
+      # counterpart to `/chosen/rng-seed` and the Apple cores behind HVF
+      # implement no FEAT_RNG, so this boot's only entropy source is the
+      # bring-up read of the virtio-rng device.
       - name: Boot aarch64 guest from ACPI
         shell: bash
         working-directory: helios
@@ -374,7 +372,6 @@ jobs:
           runtime="$GITHUB_WORKSPACE/smoke-runtime/acpi"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G --acpi \
-            --accel tcg --cpu max --smp 2 \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --no-compiler-plugin \
             shell -c 'echo ok' 2>&1 > boot-acpi.out | tee "$runtime/inspector.log"

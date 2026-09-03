@@ -43,29 +43,42 @@ impl HardwareEntropySource for VirtioEntropyDevice {
     ) -> impl Future<Output = Result<(), IoError>> + Send + 'a {
         self.inner.fill(buffer)
     }
+
+    fn drain_completions(&self) {
+        self.inner.handle_interrupt();
+    }
 }
 
 pub(crate) fn has_entropy_device(fdt: &Fdt<'_>) -> bool {
     crate::count_virtio_mmio_devices(fdt, helios_virtio::DeviceType::Entropy) != 0
 }
 
-/// Brings up the platform's entropy device and hands it to the kernel's
-/// reseed task.
-pub(crate) fn install<WatchdogImpl>(
-    kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl>,
-    fdt: &Fdt<'_>,
-    root: helios_kernel::RootEntropyHandle,
-) -> Option<EntropyInterrupt>
-where
-    WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
-{
+/// Brings the platform's entropy device up.
+///
+/// Separate from [`install`] and called earlier, because the root DRBG
+/// is seeded from a read of this device: riscv64 has no entropy
+/// instruction the kernel can rely on, so a platform whose firmware
+/// leaves no `/chosen/rng-seed` has this device and nothing else. The
+/// reseed task that keeps reading it needs the seeded root and so comes
+/// after.
+pub(crate) fn bring_up(fdt: &Fdt<'_>) -> Option<EntropyInterrupt> {
     let Some((device, source)) = discover_entropy_device(fdt) else {
         tracing::warn!("virtio entropy device was not discovered on the platform bus");
         return None;
     };
-    helios_kernel::install_entropy_device(kernel, root, device.clone());
-    tracing::info!("virtio entropy online irq={}", source.0.get());
     Some(EntropyInterrupt { source, device })
+}
+
+/// Hands the device to the kernel's reseed task.
+pub(crate) fn install<WatchdogImpl>(
+    kernel: &helios_kernel::Kernel<crate::RiscvCpu, WatchdogImpl>,
+    entropy: &EntropyInterrupt,
+    root: helios_kernel::RootEntropyHandle,
+) where
+    WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+{
+    helios_kernel::install_entropy_device(kernel, root, entropy.device.clone());
+    tracing::info!("virtio entropy online irq={}", entropy.source.0.get());
 }
 
 fn discover_entropy_device(fdt: &Fdt<'_>) -> Option<(VirtioEntropyDevice, InterruptSourceId)> {
