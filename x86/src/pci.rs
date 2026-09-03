@@ -33,10 +33,24 @@ const MSIX_ENTRY_DATA: usize = 0x8;
 const MSIX_ENTRY_VECTOR_CONTROL: usize = 0xc;
 const MSIX_VECTOR_CONTROL_MASKED: u32 = 1 << 0;
 
-/// The MSI-X table entry Helios binds every virtio structure of a
-/// function to. One entry per device keeps the interrupt path a single
-/// IDT vector per device, which is all the kernel's route table needs.
+/// The MSI-X table entry Helios binds a single-message function to.
+/// One entry per device keeps the interrupt path a single IDT vector,
+/// which is all a device whose queues are drained by one processor
+/// needs.
 pub(crate) const MSIX_VIRTIO_ENTRY: u16 = 0;
+
+/// One MSI-X message: the IDT vector it raises and the local APIC it is
+/// delivered to.
+///
+/// The destination is what makes per-queue vectors worth having — a
+/// queue pair's completions are delivered to the processor that drains
+/// that pair, instead of to whichever processor owns the function's only
+/// vector and then has to hand the work across a core.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MsixMessage {
+    pub(crate) vector: u8,
+    pub(crate) destination_apic_id: u32,
+}
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct LegacyPciConfigAccess;
@@ -197,11 +211,42 @@ impl PciRoot {
         address: PciAddress,
         vector: u8,
         destination_apic_id: u32,
-    ) -> u16 {
-        assert!(
-            destination_apic_id <= u32::from(u8::MAX),
-            "MSI-X without interrupt remapping cannot target APIC id {destination_apic_id}"
+    ) -> helios_virtio::MsixBinding {
+        let entry = self.bind_msix_vectors(
+            address,
+            &[MsixMessage {
+                vector,
+                destination_apic_id,
+            }],
         );
+        helios_virtio::MsixBinding::shared(entry)
+    }
+
+    /// Points the first `messages.len()` MSI-X table entries of
+    /// `address` at the given vectors and local APICs, and enables MSI-X
+    /// on the function.
+    ///
+    /// Returns the first table index programmed, which is always zero;
+    /// the caller decides which structure each entry belongs to.
+    ///
+    /// # Concurrency contract
+    ///
+    /// Called during single-processor bring-up, before the vectors it
+    /// programs can fire. The destinations may name secondary
+    /// processors that are not started yet: a message to a parked local
+    /// APIC is held by it, not lost.
+    pub(crate) fn bind_msix_vectors(&self, address: PciAddress, messages: &[MsixMessage]) -> u16 {
+        assert!(
+            !messages.is_empty(),
+            "PCI function {address} needs at least one MSI-X message"
+        );
+        for message in messages {
+            assert!(
+                message.destination_apic_id <= u32::from(u8::MAX),
+                "MSI-X without interrupt remapping cannot target APIC id {}",
+                message.destination_apic_id
+            );
+        }
         let header = PciHeader::new(address);
         let mut endpoint = EndpointHeader::from_header(header, self.access)
             .unwrap_or_else(|| panic!("PCI function {address} is not an endpoint"));
@@ -213,8 +258,10 @@ impl PciRoot {
             })
             .unwrap_or_else(|| panic!("PCI function {address} exposes no MSI-X capability"));
         assert!(
-            capability.table_size() > MSIX_VIRTIO_ENTRY,
-            "PCI function {address} has an MSI-X table too small for entry {MSIX_VIRTIO_ENTRY}"
+            usize::from(capability.table_size()) >= messages.len(),
+            "PCI function {address} has an MSI-X table of {} entries, too small for {} messages",
+            capability.table_size(),
+            messages.len()
         );
 
         // Sizing a BAR drives all-ones probe values through it, so
@@ -227,31 +274,36 @@ impl PciRoot {
             command | CommandRegister::MEMORY_ENABLE
         });
 
-        let entry_offset = usize::try_from(capability.table_offset())
-            .unwrap_or_else(|_| panic!("MSI-X table offset for {address} does not fit in usize"))
-            + usize::from(MSIX_VIRTIO_ENTRY) * MSIX_ENTRY_BYTES;
-        let entry = self
-            .map_region(table_bar + entry_offset as u64, MSIX_ENTRY_BYTES)
+        let table_offset = usize::try_from(capability.table_offset())
+            .unwrap_or_else(|_| panic!("MSI-X table offset for {address} does not fit in usize"));
+        let table = self
+            .map_region(
+                table_bar + table_offset as u64,
+                MSIX_ENTRY_BYTES * messages.len(),
+            )
             .unwrap_or_else(|error| panic!("failed to map the MSI-X table of {address}: {error}"))
             .as_ptr()
             .cast::<u32>();
 
-        let message_address =
-            MSI_ADDRESS_BASE | (u64::from(destination_apic_id) << MSI_DESTINATION_SHIFT);
-        unsafe {
-            entry
-                .byte_add(MSIX_ENTRY_VECTOR_CONTROL)
-                .write_volatile(MSIX_VECTOR_CONTROL_MASKED);
-            entry
-                .byte_add(MSIX_ENTRY_ADDRESS_LOW)
-                .write_volatile(message_address as u32);
-            entry
-                .byte_add(MSIX_ENTRY_ADDRESS_HIGH)
-                .write_volatile((message_address >> 32) as u32);
-            entry
-                .byte_add(MSIX_ENTRY_DATA)
-                .write_volatile(u32::from(vector));
-            entry.byte_add(MSIX_ENTRY_VECTOR_CONTROL).write_volatile(0);
+        for (index, message) in messages.iter().enumerate() {
+            let entry = unsafe { table.byte_add(index * MSIX_ENTRY_BYTES) };
+            let message_address = MSI_ADDRESS_BASE
+                | (u64::from(message.destination_apic_id) << MSI_DESTINATION_SHIFT);
+            unsafe {
+                entry
+                    .byte_add(MSIX_ENTRY_VECTOR_CONTROL)
+                    .write_volatile(MSIX_VECTOR_CONTROL_MASKED);
+                entry
+                    .byte_add(MSIX_ENTRY_ADDRESS_LOW)
+                    .write_volatile(message_address as u32);
+                entry
+                    .byte_add(MSIX_ENTRY_ADDRESS_HIGH)
+                    .write_volatile((message_address >> 32) as u32);
+                entry
+                    .byte_add(MSIX_ENTRY_DATA)
+                    .write_volatile(u32::from(message.vector));
+                entry.byte_add(MSIX_ENTRY_VECTOR_CONTROL).write_volatile(0);
+            }
         }
 
         capability.set_function_mask(false, self.access);

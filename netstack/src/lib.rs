@@ -6,6 +6,7 @@ mod checksum;
 mod congestion;
 mod dhcp;
 mod dns;
+mod hash;
 mod ndp;
 mod packet;
 mod stack;
@@ -33,6 +34,10 @@ pub use dhcp::{
 };
 pub use dns::{
     DNS_MAX_ADDRESS_RECORDS, DNS_PORT, DnsMessage, DnsQuestionWriter, DnsRecordType, DnsResponse,
+};
+pub use hash::{
+    FlowHash, FlowTuple, RSS_INDIRECTION_ENTRIES, RSS_KEY_BYTES, STANDARD_RSS_KEY, flow_hash,
+    rss_indirection_entry, toeplitz,
 };
 pub use ndp::{
     Ipv6DnsServers, Ipv6RouterConfiguration, MAX_ADVERTISED_PREFIXES, MAX_IPV6_DNS_SERVERS,
@@ -125,6 +130,14 @@ pub struct RxFrameOffload {
     /// received segments into this frame (large receive offload), or
     /// `None` for a frame that arrived as it is.
     pub large_receive_segment_bytes: Option<u16>,
+    /// The flow hash the device computed for this frame, when it
+    /// reported one.
+    ///
+    /// A device that steers has already hashed the frame to pick the
+    /// queue it delivered on, so a driver that hashes it again is doing
+    /// the work twice. `None` means the device said nothing and the
+    /// receive path computes the hash itself, which is the same number.
+    pub flow_hash: Option<FlowHash>,
 }
 
 impl RxFrameOffload {
@@ -133,6 +146,7 @@ impl RxFrameOffload {
         Self {
             checksum: RxChecksumReport::Unverified,
             large_receive_segment_bytes: None,
+            flow_hash: None,
         }
     }
 
@@ -142,6 +156,7 @@ impl RxFrameOffload {
         Self {
             checksum: RxChecksumReport::Validated,
             large_receive_segment_bytes: None,
+            flow_hash: None,
         }
     }
 
@@ -150,6 +165,7 @@ impl RxFrameOffload {
         Self {
             checksum: RxChecksumReport::Partial { start, offset },
             large_receive_segment_bytes: None,
+            flow_hash: None,
         }
     }
 
@@ -620,6 +636,30 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
 
     /// Waits for interface progress, such as RX arrival or TX completion.
     fn wait_for_event(&self) -> impl Future<Output = ()> + Send + '_;
+
+    /// Interrupts this queue pair's own message has raised since boot.
+    ///
+    /// The distribution across pairs is what says whether steering is
+    /// actually working: a device that steers raises each pair's
+    /// interrupt on the processor that drains it, so the counts spread
+    /// across processors instead of piling on one. Zero for an interface
+    /// that cannot tell its queues apart.
+    fn queue_interrupts(&self, queue_idx: usize) -> u64 {
+        let _ = queue_idx;
+        0
+    }
+
+    /// Waits for progress on one queue pair, or for anything the device
+    /// reports that belongs to no pair.
+    ///
+    /// An operation belongs to one shard, which drains one queue pair,
+    /// so a completion on another pair is not progress it can use.
+    /// Defaults to the whole-device wait for interfaces that cannot
+    /// tell their queues apart.
+    fn wait_for_event_on(&self, queue_idx: usize) -> impl Future<Output = ()> + Send + '_ {
+        let _ = queue_idx;
+        self.wait_for_event()
+    }
 }
 
 /// Batch-oriented optional fast path for interfaces with queue-level access.

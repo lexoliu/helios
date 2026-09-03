@@ -11,7 +11,8 @@ type Aarch64Virtio9pDevice = helios_virtio::Virtio9pDevice<
     helios_virtio::VirtioMmioTransport<helios_virtio::MmioBus<helios_virtio::OffsetDmaPool>>,
 >;
 
-pub(crate) type HostFileSystemService = helios_kernel::HostFsClient<HostFsTransportService>;
+pub(crate) type HostFileSystemService =
+    helios_kernel::HostFsClient<HostFsTransportService, crate::Aarch64Cpu>;
 
 #[derive(Clone)]
 pub(crate) struct HostFsTransportService {
@@ -33,6 +34,7 @@ pub(crate) struct HostFsInterrupt {
 }
 
 pub(crate) fn install(
+    cpu: &crate::Aarch64Cpu,
     fdt: &Fdt<'_>,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
@@ -42,7 +44,7 @@ pub(crate) fn install(
         tracing::warn!("virtio 9p device was not discovered on the platform bus");
         return None;
     };
-    let service = HostFileSystemService::new(probe.transport.clone());
+    let service = HostFileSystemService::new(probe.transport.clone(), cpu.clone());
     debug_state.install_host_fs_service(service);
     tracing::info!(
         "virtio 9p online mount_tag={} interrupt={:?}",

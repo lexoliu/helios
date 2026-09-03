@@ -636,10 +636,63 @@ class GuestUnreachable(RuntimeError):
     """The guest never became reachable over SSH within its boot budget."""
 
 
-def wait_for_ssh(repo_root: Path, key: Path, port: int, timeout_seconds: int) -> None:
+# Console lines after which the guest can never reach sshd: PID 1 freezes
+# itself after a failed manager startup, and a panicked kernel halts (the
+# cloud image sets no `panic=` reboot). Waiting out the SSH budget after one
+# of these only delays the retry.
+FATAL_BOOT_SIGNATURES = (
+    "systemd[1]: Freezing execution.",
+    "Kernel panic - not syncing",
+)
+
+
+class SerialWatch:
+    """Incremental scan of a QEMU serial log for lines that end a boot.
+
+    QEMU appends to the log while the guest runs; each `fatal_line()` call
+    reads only the bytes written since the previous call and carries an
+    unterminated trailing line over to the next call.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.offset = 0
+        self.partial = ""
+
+    def fatal_line(self) -> str | None:
+        if not self.path.is_file():
+            return None
+        with self.path.open("rb") as handle:
+            handle.seek(self.offset)
+            chunk = handle.read()
+        self.offset += len(chunk)
+        lines = (self.partial + chunk.decode("utf-8", errors="replace")).split("\n")
+        self.partial = lines.pop()
+        for line in lines:
+            if any(signature in line for signature in FATAL_BOOT_SIGNATURES):
+                return line.strip()
+        return None
+
+
+def wait_for_guest(
+    repo_root: Path,
+    key: Path,
+    port: int,
+    timeout_seconds: int,
+    process: subprocess.Popen,
+    serial_log: Path,
+) -> None:
+    """Block until sshd answers, or fail as soon as the boot provably cannot."""
     deadline = time.monotonic() + timeout_seconds
+    watch = SerialWatch(serial_log)
     last_error = "ssh not attempted"
     while time.monotonic() < deadline:
+        status = process.poll()
+        if status is not None:
+            raise GuestUnreachable(f"QEMU exited with status {status} before sshd answered")
+        fatal = watch.fatal_line()
+        if fatal is not None:
+            raise GuestUnreachable(f"guest boot ended on the serial console: {fatal}")
         try:
             ssh(repo_root, key, port, "true", timeout=10)
             return
@@ -651,12 +704,57 @@ def wait_for_ssh(repo_root: Path, key: Path, port: int, timeout_seconds: int) ->
     )
 
 
-# Fedora 44's systemd occasionally fails its manager startup under TCG
-# ("Failed to fork off sandboxing environment for executing generators:
-# Protocol error") and freezes before sshd, observed on the arm64 CI
-# runner on a fresh first boot. That is an upstream guest flake, not a
-# harness bug, so the boot is retried on a pristine overlay; each failed
-# attempt's serial log is preserved for diagnosis.
+# Host memory counters that explain a slow guest first boot: a guest vCPU
+# blocks in the host page-fault path whenever the guest first touches a page
+# QEMU has not backed yet, and direct compaction (THP) or swapping is what
+# makes that path take seconds. Sampled from /proc/vmstat around each boot
+# attempt so the artifact carries the host-side half of the story.
+HOST_VMSTAT_COUNTERS = (
+    "allocstall_movable",
+    "allocstall_normal",
+    "compact_fail",
+    "compact_stall",
+    "compact_success",
+    "pgmajfault",
+    "pswpin",
+    "pswpout",
+    "thp_fault_alloc",
+    "thp_fault_fallback",
+)
+HOST_MEMINFO_FIELDS = ("MemTotal", "MemAvailable", "SwapTotal", "SwapFree")
+
+
+def host_memory_snapshot() -> dict | None:
+    """Linux VM/THP counters, or None on hosts without procfs (macOS/HVF)."""
+    vmstat = Path("/proc/vmstat")
+    meminfo = Path("/proc/meminfo")
+    if not vmstat.is_file() or not meminfo.is_file():
+        return None
+    counters = {}
+    for line in vmstat.read_text(encoding="utf-8").splitlines():
+        name, _, value = line.partition(" ")
+        if name in HOST_VMSTAT_COUNTERS:
+            counters[name] = int(value)
+    memory = {}
+    for line in meminfo.read_text(encoding="utf-8").splitlines():
+        name, _, value = line.partition(":")
+        if name in HOST_MEMINFO_FIELDS:
+            memory[name] = value.strip()
+    thp_dir = Path("/sys/kernel/mm/transparent_hugepage")
+    thp = {
+        knob: (thp_dir / knob).read_text(encoding="utf-8").strip()
+        for knob in ("enabled", "defrag")
+        if (thp_dir / knob).is_file()
+    }
+    return {"vmstat": counters, "meminfo": memory, "transparent_hugepage": thp}
+
+
+# A first boot that misses sshd is retried on a pristine overlay; every
+# attempt keeps its own serial log and host memory counters for diagnosis.
+# Guest RAM is populated before the first guest instruction (see
+# `guest_ram_backend`), so a retry only covers host faults the harness
+# cannot prevent, and `wait_for_guest` ends a doomed attempt the moment the
+# console proves it.
 BOOT_ATTEMPTS = 3
 BOOT_SSH_TIMEOUT_CEILING_SECONDS = 900
 
@@ -677,30 +775,83 @@ def boot_reachable_vm(
     setup_timeout_seconds: int,
 ) -> tuple[subprocess.Popen, Path]:
     ssh_budget = min(setup_timeout_seconds, BOOT_SSH_TIMEOUT_CEILING_SECONDS)
-    serial_log = asset_dir / "serial.log"
     last_error = "boot not attempted"
     for attempt in range(1, BOOT_ATTEMPTS + 1):
+        serial_log = asset_dir / f"serial.boot-attempt-{attempt}.log"
+        host_memory_log = asset_dir / f"host-memory.boot-attempt-{attempt}.json"
         disk = ensure_guest_disk(repo_root, base, asset_dir, disk_size)
+        started = time.monotonic()
+        host_before = host_memory_snapshot()
+        outcome = "aborted"
         process = start_vm(
-            repo_root, asset_dir, qemu_bin, disk, seed_iso, port, memory, smp, guest_arch, accel
+            repo_root,
+            asset_dir,
+            qemu_bin,
+            disk,
+            seed_iso,
+            port,
+            memory,
+            smp,
+            guest_arch,
+            accel,
+            serial_log,
         )
         try:
-            wait_for_ssh(repo_root, key, port, ssh_budget)
+            wait_for_guest(repo_root, key, port, ssh_budget, process, serial_log)
+            outcome = "reachable"
             return process, disk
         except GuestUnreachable as error:
             last_error = str(error)
+            outcome = last_error
             stop_vm(process)
-            preserved = asset_dir / f"serial.boot-attempt-{attempt}.log"
-            if serial_log.is_file():
-                shutil.copyfile(serial_log, preserved)
             print(
-                f"guest boot attempt {attempt}/{BOOT_ATTEMPTS} failed; "
-                f"serial preserved at {preserved}",
+                f"guest boot attempt {attempt}/{BOOT_ATTEMPTS} failed after "
+                f"{time.monotonic() - started:.0f}s: {last_error}; serial at {serial_log}",
                 file=sys.stderr,
             )
             disk.unlink(missing_ok=True)
+        finally:
+            host_memory_log.write_text(
+                json.dumps(
+                    {
+                        "attempt": attempt,
+                        "outcome": outcome,
+                        "elapsed_seconds": round(time.monotonic() - started, 1),
+                        "before_start": host_before,
+                        "after": host_memory_snapshot(),
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
     raise SystemExit(
         f"Fedora QEMU guest failed to boot after {BOOT_ATTEMPTS} attempts: {last_error}"
+    )
+
+
+GUEST_RAM_ID = "guest-ram"
+
+
+def guest_ram_backend(memory: str) -> str:
+    """`-object` spec that backs guest RAM with host pages populated up front.
+
+    QEMU maps guest RAM lazily and marks it MADV_HUGEPAGE, so the first guest
+    store to each page takes a host page fault, and on a fragmented or
+    overcommitted host that fault runs direct compaction or waits for the
+    hypervisor to back the page — tens of seconds per burst on the arm64 CI
+    runner. The guest kernel zeroes every page it hands out (`dc zva` in
+    `clear_page`, `init_on_alloc=1`), so those stalls surface as soft lockups
+    in whichever allocation touched fresh memory first, and when one lands
+    inside systemd's 45 s generator alarm the manager fails to start and PID 1
+    freezes. `prealloc=on` populates the whole range before the first guest
+    instruction, moving that cost out of the guest's timed boot phases and out
+    of the measured workloads.
+    """
+    threads = os.cpu_count() or 1
+    return (
+        f"memory-backend-ram,id={GUEST_RAM_ID},size={memory},"
+        f"prealloc=on,prealloc-threads={threads}"
     )
 
 
@@ -715,20 +866,22 @@ def start_vm(
     smp: int,
     guest_arch: str,
     accel: str,
+    serial_log: Path,
 ) -> subprocess.Popen:
     machine, cpu = machine_and_cpu(guest_arch, accel)
-    serial_log = asset_dir / "serial.log"
     blk_device, net_device, rng_device = virtio_devices(guest_arch)
     command = [
         qemu_bin,
         "-machine",
-        machine,
+        f"{machine},memory-backend={GUEST_RAM_ID}",
         "-cpu",
         cpu,
         "-smp",
         str(smp),
         "-m",
         memory,
+        "-object",
+        guest_ram_backend(memory),
         "-display",
         "none",
         "-monitor",
@@ -1155,6 +1308,7 @@ def run_fedora_qemu_linux(
         "qemu_cpu": cpu,
         "qemu_smp": smp,
         "qemu_memory": memory,
+        "qemu_ram": guest_ram_backend(memory),
         "network": f"{net_device} over QEMU user net; workloads connect to host through 10.0.2.2",
         "block": blk_device,
         "quickjs_required": quickjs_required,

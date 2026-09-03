@@ -106,17 +106,15 @@ impl<const N: usize> InFlight<N> {
 
     /// Reports that `count` chains or completion slots became free.
     ///
-    /// Each freed resource admits one blocked submitter, so each gets
-    /// its own wake-up. Nothing is published when no submitter is
-    /// parked: an unclaimed notification would leave a permit behind
-    /// for a later submitter to spin through.
+    /// The notification is a broadcast, so one is enough however many
+    /// were freed: every parked submitter re-tests the ring and its own
+    /// identifier for itself, and the ones that still do not fit park
+    /// again. Nothing is published when no submitter is parked.
     fn note_released(&self, count: usize) {
         if count == 0 || self.blocked.load(Ordering::SeqCst) == 0 {
             return;
         }
-        for _ in 0..count {
-            self.available.notify_all();
-        }
+        self.available.notify_all();
     }
 
     /// Claims `token` for the caller. Must be called while the queue
@@ -221,6 +219,10 @@ where
     let buffers = inputs.len() + outputs.len();
     let mut announced = false;
     let outcome = loop {
+        // Armed before the ring is tested, for the same reason the
+        // completion wait is: a release that lands in between must not
+        // be slept through.
+        let notified = inflight.available.notified();
         let drained = {
             let mut queue = queue.lock().await;
             if queue.has_room_for(buffers) && inflight.is_idle(queue.next_free_descriptor()) {
@@ -244,7 +246,7 @@ where
             announced = true;
             continue;
         }
-        inflight.available.notified().await;
+        notified.await;
     };
     if announced {
         inflight.release_blocked();
@@ -274,6 +276,11 @@ where
     WaitFuture: Future<Output = ()>,
 {
     loop {
+        // The device wait is created before the slot and the ring are
+        // tested, so a completion that arrives in between is observed
+        // by this future rather than slept through.
+        let mut notified = pin!(wait());
+
         if let Some(len) = inflight.take(token) {
             // This request's chain went back to the ring when its
             // completion was drained, and its slot is idle again now.
@@ -293,7 +300,6 @@ where
             continue;
         }
 
-        let mut notified = pin!(wait());
         poll_fn(|context: &mut Context<'_>| {
             if inflight.arm(token, context.waker()) {
                 return Poll::Ready(());

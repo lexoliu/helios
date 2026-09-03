@@ -68,6 +68,8 @@ impl ComponentHostUdpSocketToken for u64 {
 trait DynComponentHostNetworkService: Send + Sync + 'static {
     fn hardware_address(&self) -> [u8; 6];
 
+    fn network_stats(&self) -> crate::NetworkStats;
+
     fn ipv4_cidr(&self) -> Pin<Box<dyn Future<Output = Option<crate::Ipv4Cidr>> + Send + '_>>;
 
     fn ping<'a>(
@@ -568,6 +570,10 @@ impl ComponentNetworkService for ComponentHostNetworkService {
 }
 
 impl NetworkAdminBackend for ComponentHostNetworkService {
+    fn network_stats(&self) -> crate::NetworkStats {
+        self.inner.network_stats()
+    }
+
     fn bridge_port(
         &self,
         port: NetworkPortId,
@@ -679,6 +685,10 @@ where
 {
     fn hardware_address(&self) -> [u8; 6] {
         self.service.hardware_address()
+    }
+
+    fn network_stats(&self) -> crate::NetworkStats {
+        self.service.network_stats()
     }
 
     fn ipv4_cidr(&self) -> Pin<Box<dyn Future<Output = Option<crate::Ipv4Cidr>> + Send + '_>> {

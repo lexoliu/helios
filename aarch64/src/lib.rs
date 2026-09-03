@@ -138,6 +138,7 @@ mod gic;
 mod host_fs;
 mod net;
 mod rtc;
+mod vsock;
 
 mod debug_state {
     pub(crate) type RuntimeState =
@@ -155,6 +156,7 @@ pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
     host_fs::HostFsTransportService,
     entropy::VirtioEntropyDevice,
     balloon::VirtioBalloonInterrupt,
+    vsock::VirtioVsockDevice,
     block::VirtioBlockDevice,
 >;
 
@@ -521,6 +523,9 @@ extern "C" fn aarch64_kernel_main() -> ! {
     if balloon::has_balloon_device(&boot_fdt) {
         devices = devices.with_memory_balloon();
     }
+    if vsock::has_vsock_device(&boot_fdt) {
+        devices = devices.with_vsock();
+    }
     let block_device_count = block::count_block_devices(&boot_fdt);
     if block_device_count != 0 {
         devices = devices.with_block_devices(block_device_count);
@@ -568,9 +573,13 @@ extern "C" fn aarch64_kernel_main() -> ! {
     gic.attach_current_processor(platform_state.bootstrap_mpidr());
 
     let mut routes = DeviceInterruptRoutes::new();
-    if let Some(host_fs) =
-        host_fs::install(&boot_fdt, physical_memory_offset, &handoff, &debug_state)
-    {
+    if let Some(host_fs) = host_fs::install(
+        &cpu,
+        &boot_fdt,
+        physical_memory_offset,
+        &handoff,
+        &debug_state,
+    ) {
         gic.enable_device_interrupt(
             host_fs.interrupt,
             host_fs.trigger,
@@ -591,7 +600,7 @@ extern "C" fn aarch64_kernel_main() -> ! {
             network.trigger,
             platform_state.bootstrap_mpidr(),
         );
-        routes.set_network(network.interrupt, network.device);
+        routes.add_network(network.interrupt, network.device);
     }
     if let Some(entropy) = entropy::install(
         &kernel,
@@ -615,6 +624,21 @@ extern "C" fn aarch64_kernel_main() -> ! {
         );
         debug_state.install_memory_balloon(balloon.handle);
         routes.set_balloon(balloon.interrupt, balloon.handler);
+    }
+    if let Some(vsock) = vsock::install(
+        &kernel,
+        &cpu,
+        &boot_fdt,
+        physical_memory_offset,
+        &handoff,
+        &debug_state,
+    ) {
+        gic.enable_device_interrupt(
+            vsock.interrupt,
+            vsock.trigger,
+            platform_state.bootstrap_mpidr(),
+        );
+        routes.set_vsock(vsock.interrupt, vsock.device);
     }
     for block in block::install(
         &cpu,

@@ -177,6 +177,14 @@ pub enum NetworkControlError {
 }
 
 pub trait NetworkAdminBackend: Clone + Send + 'static {
+    /// Per-shard frame and interrupt counters, one entry per processor.
+    ///
+    /// Part of the admin surface rather than the socket surface because
+    /// it describes the interface, not a connection: it is what says
+    /// whether the device is steering flows across processors or piling
+    /// them on one.
+    fn network_stats(&self) -> crate::NetworkStats;
+
     fn bridge_port(
         &self,
         port: NetworkPortId,
@@ -389,6 +397,10 @@ mod tests {
     struct TestBackend;
 
     impl NetworkAdminBackend for TestBackend {
+        fn network_stats(&self) -> crate::NetworkStats {
+            crate::NetworkStats::default()
+        }
+
         async fn bridge_port(
             &self,
             _: NetworkPortId,

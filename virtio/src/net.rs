@@ -27,12 +27,13 @@ use bytes::Bytes;
 use core::cell::UnsafeCell;
 use core::mem::size_of;
 use core::ops::Range;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use helios_hal::io::{IoError, IoResult};
 use helios_netstack::{
-    ChecksumOffload, DEFAULT_POLL_BUDGET, EventDeliveryCapabilities, InterfaceCapabilities,
-    LinkState, QueueTopology, RxChecksumReport, RxFrameOffload, SegmentationOffload,
+    ChecksumOffload, DEFAULT_POLL_BUDGET, EventDeliveryCapabilities, FlowHash,
+    InterfaceCapabilities, LinkState, QueueTopology, RSS_INDIRECTION_ENTRIES, RSS_KEY_BYTES,
+    RxChecksumReport, RxFrameOffload, STANDARD_RSS_KEY, SegmentationOffload, rss_indirection_entry,
 };
 use spin::Mutex as SpinMutex;
 
@@ -117,6 +118,17 @@ const NET_FEATURE_MRG_RXBUF: u64 = 1 << 15;
 /// Byte offset of the `status` field in the virtio-net configuration
 /// space (mac[6], status[2], max_virtqueue_pairs[2], mtu[2]).
 const NET_CONFIG_STATUS_OFFSET: usize = 6;
+/// `duplex`, after mac[6], status[2], max_virtqueue_pairs[2], mtu[2]
+/// and speed[4]. The RSS limits share its aligned dword.
+const NET_CONFIG_DUPLEX_OFFSET: usize = 16;
+/// `rss_max_key_size`, after mac[6], status[2], max_virtqueue_pairs[2],
+/// mtu[2], speed[4] and duplex[1].
+const NET_CONFIG_RSS_MAX_KEY_SIZE_OFFSET: usize = 17;
+/// `rss_max_indirection_table_length`, the entry count the device can
+/// hold minus one is *not* what this reports: it is the length itself.
+const NET_CONFIG_RSS_MAX_TABLE_LEN_OFFSET: usize = 18;
+/// `supported_hash_types`.
+const NET_CONFIG_SUPPORTED_HASH_TYPES_OFFSET: usize = 20;
 /// VIRTIO_NET_S_LINK_UP: the device reports carrier in `status`.
 const NET_STATUS_LINK_UP: u16 = 1;
 /// VIRTIO_NET_F_MQ: device exposes multiple TX/RX queue pairs and
@@ -130,6 +142,27 @@ const NET_FEATURE_MQ: u64 = 1 << 22;
 /// driver uses to issue runtime configuration commands such as
 /// `VQ_PAIRS_SET`. Required when negotiating `NET_FEATURE_MQ`.
 const NET_FEATURE_CTRL_VQ: u64 = 1 << 17;
+/// VIRTIO_NET_F_RSS: the device steers received frames across its queue
+/// pairs by hashing the flow and reading a queue out of a driver-programmed
+/// indirection table. What makes a per-CPU queue layout pay: without it
+/// every frame arrives on queue zero and reaches its owner's processor
+/// only after a cross-core hand-off.
+const NET_FEATURE_RSS: u64 = 1 << 60;
+/// VIRTIO_NET_F_HASH_REPORT: the device writes the hash it computed into
+/// the receive header, so the driver does not have to compute the same
+/// number a second time. Costs eight extra header bytes per frame in
+/// both directions.
+const NET_FEATURE_HASH_REPORT: u64 = 1 << 57;
+/// VIRTIO_NET_F_NOTF_COAL: the device can hold a notification back
+/// until a packet count or a delay is reached, so a busy queue raises
+/// one interrupt per batch instead of one per descriptor. Programmed
+/// through the control queue, so it needs `VIRTIO_NET_F_CTRL_VQ`.
+const NET_FEATURE_NOTF_COAL: u64 = 1 << 53;
+/// VIRTIO_NET_F_VQ_NOTF_COAL: coalescing can be programmed per
+/// virtqueue rather than once for every receive and every transmit
+/// queue. What a per-CPU queue layout wants, because each pair is
+/// driven by its own processor at its own rate.
+const NET_FEATURE_VQ_NOTF_COAL: u64 = 1 << 52;
 /// Maximum queue pairs the kernel is willing to bring up. Sized so
 /// the per-CPU shard count on Apple Silicon (up to 12 cores) fits;
 /// devices advertising more pairs are simply capped at this value.
@@ -138,17 +171,182 @@ const NET_MAX_QUEUE_PAIRS: u16 = 16;
 const CTRL_CLASS_MQ: u8 = 4;
 /// Control-queue command id for `VQ_PAIRS_SET` under class MQ.
 const CTRL_CMD_MQ_VQ_PAIRS_SET: u8 = 0;
+/// Control-queue command id for `RSS_CONFIG` under class MQ. It carries
+/// the active queue-pair count itself, so a device that steers is
+/// configured with this instead of `VQ_PAIRS_SET`.
+const CTRL_CMD_MQ_RSS_CONFIG: u8 = 1;
+/// `VIRTIO_NET_HASH_TYPE_*`: the flows the device is asked to hash.
+///
+/// Only the four-tuple types are requested. A frame the device cannot
+/// classify goes to `unclassified_queue`, which is queue zero — exactly
+/// where the driver's own rule puts a frame with no flow to hash.
+const NET_HASH_TYPE_TCPV4: u32 = 1 << 1;
+const NET_HASH_TYPE_UDPV4: u32 = 1 << 2;
+const NET_HASH_TYPE_TCPV6: u32 = 1 << 4;
+const NET_HASH_TYPE_UDPV6: u32 = 1 << 5;
+const NET_RSS_HASH_TYPES: u32 =
+    NET_HASH_TYPE_TCPV4 | NET_HASH_TYPE_UDPV4 | NET_HASH_TYPE_TCPV6 | NET_HASH_TYPE_UDPV6;
+/// `VIRTIO_NET_HASH_REPORT_NONE`: the device classified nothing, so the
+/// hash field of the receive header says nothing either.
+const NET_HASH_REPORT_NONE: u16 = 0;
+/// Control-queue command class for `VIRTIO_NET_CTRL_NOTF_COAL`.
+const CTRL_CLASS_NOTF_COAL: u8 = 6;
+/// Coalescing command ids under class `VIRTIO_NET_CTRL_NOTF_COAL`.
+const CTRL_CMD_NOTF_COAL_TX_SET: u8 = 0;
+const CTRL_CMD_NOTF_COAL_RX_SET: u8 = 1;
+const CTRL_CMD_NOTF_COAL_VQ_SET: u8 = 2;
 /// Pre-submission ack sentinel; the device replaces this with
 /// `CTRL_ACK_OK` (0) on success or `CTRL_ACK_FAIL` (1) on error.
 const CTRL_ACK_PENDING: u8 = 0xff;
 /// Device-side success ack on the control queue.
 const CTRL_ACK_OK: u8 = 0;
-/// Bytes the `VQ_PAIRS_SET` command payload occupies (class +
-/// command + le16 pairs).
-const CTRL_MQ_PAIRS_CMD_BYTES: usize = 4;
-/// Maximum command payload size the control queue scratch buffer
-/// is sized for. Currently only `VQ_PAIRS_SET` is sent.
-const CTRL_CMD_MAX_BYTES: usize = CTRL_MQ_PAIRS_CMD_BYTES;
+/// Bytes the `VQ_PAIRS_SET` payload occupies: one le16 pair count.
+const CTRL_MQ_PAIRS_PAYLOAD_BYTES: usize = 2;
+/// Bytes a `NOTF_COAL_TX_SET` / `NOTF_COAL_RX_SET` payload occupies:
+/// `le32 max_packets` then `le32 max_usecs`.
+const CTRL_NOTF_COAL_PAYLOAD_BYTES: usize = 8;
+/// Bytes a `NOTF_COAL_VQ_SET` payload occupies: `le16 vqn`, `le16`
+/// reserved, then the same pair of le32 fields.
+const CTRL_NOTF_COAL_VQ_PAYLOAD_BYTES: usize = 12;
+/// Bytes a `RSS_CONFIG` payload occupies: `struct virtio_net_rss_config`
+/// — hash types, table mask, unclassified queue, the table itself, the
+/// transmit queue count, and the key with its length byte.
+const CTRL_RSS_CONFIG_PAYLOAD_BYTES: usize =
+    4 + 2 + 2 + 2 * RSS_INDIRECTION_ENTRIES + 2 + 1 + RSS_KEY_BYTES;
+/// Maximum command payload size the control queue scratch buffer is
+/// sized for, plus the two-byte class/command prefix every command
+/// carries.
+const CTRL_CMD_MAX_BYTES: usize = 2 + CTRL_RSS_CONFIG_PAYLOAD_BYTES;
+/// The scratch buffer is sized once at bring-up and shared by every
+/// control command, so a command that outgrew it would assert at
+/// runtime on a path only real hardware reaches. Checking it here means
+/// a new command with a longer payload fails the build instead.
+const _: () = {
+    assert!(CTRL_CMD_MAX_BYTES >= 2 + CTRL_MQ_PAIRS_PAYLOAD_BYTES);
+    assert!(CTRL_CMD_MAX_BYTES >= 2 + CTRL_NOTF_COAL_PAYLOAD_BYTES);
+    assert!(CTRL_CMD_MAX_BYTES >= 2 + CTRL_NOTF_COAL_VQ_PAYLOAD_BYTES);
+    assert!(CTRL_CMD_MAX_BYTES >= 2 + CTRL_RSS_CONFIG_PAYLOAD_BYTES);
+    // The device masks the hash to an indirection-table slot, so the
+    // table length it is told about has to be a power of two.
+    assert!(RSS_INDIRECTION_ENTRIES.is_power_of_two());
+};
+
+/// Frames a queue may accumulate before the device raises its
+/// notification.
+///
+/// Small enough that a latency-sensitive exchange still gets its
+/// interrupt from the delay bound below rather than waiting for a
+/// batch that will never fill, and large enough that a saturated queue
+/// raises one interrupt per receive batch instead of one per frame.
+const NET_NOTF_COAL_MAX_PACKETS: u32 = 8;
+/// Microseconds a queue may hold a notification back before raising it
+/// even though the packet count was never reached.
+const NET_NOTF_COAL_MAX_USECS: u32 = 50;
+
+/// Bytes of `struct virtio_net_hdr_v1_hash`: the ordinary header plus
+/// the reported hash, its report type, and two bytes of padding. Both
+/// directions carry it once `VIRTIO_NET_F_HASH_REPORT` is negotiated.
+const HASH_REPORT_HEADER_BYTES: usize = size_of::<VirtioNetHeader>() + 8;
+
+/// virtqueue index of a queue pair's receive ring.
+///
+/// virtio-net lays its queues out as RX0, TX0, RX1, TX1, ... followed by
+/// the control queue, and three call sites depend on that ordering, so
+/// it is spelled once here.
+const fn rx_queue_index(pair_idx: u16) -> u16 {
+    pair_idx * 2
+}
+
+/// virtqueue index of a queue pair's transmit ring.
+const fn tx_queue_index(pair_idx: u16) -> u16 {
+    pair_idx * 2 + 1
+}
+
+/// virtqueue index of the control queue, which follows every pair the
+/// *device* advertises rather than every pair the driver brought up.
+const fn control_queue_index(device_max_pairs: u16) -> u16 {
+    device_max_pairs * 2
+}
+
+/// How long a queue may hold a notification back.
+///
+/// Both bounds apply at once: whichever of the packet count and the
+/// delay is reached first releases the notification, so a saturated
+/// queue coalesces by count and an idle one is still bounded by time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CoalescingBudget {
+    max_packets: u32,
+    max_usecs: u32,
+}
+
+impl CoalescingBudget {
+    /// `struct virtio_net_ctrl_coal`: the payload of a device-wide
+    /// `NOTF_COAL_RX_SET` / `NOTF_COAL_TX_SET`.
+    fn encode(self) -> [u8; CTRL_NOTF_COAL_PAYLOAD_BYTES] {
+        let mut payload = [0; CTRL_NOTF_COAL_PAYLOAD_BYTES];
+        payload[..4].copy_from_slice(&self.max_packets.to_le_bytes());
+        payload[4..].copy_from_slice(&self.max_usecs.to_le_bytes());
+        payload
+    }
+
+    /// `struct virtio_net_ctrl_coal_vq`: the same budget addressed to
+    /// one virtqueue, which is what a per-CPU queue layout programs.
+    fn encode_for_queue(self, queue: u16) -> [u8; CTRL_NOTF_COAL_VQ_PAYLOAD_BYTES] {
+        let mut payload = [0; CTRL_NOTF_COAL_VQ_PAYLOAD_BYTES];
+        payload[..2].copy_from_slice(&queue.to_le_bytes());
+        // Bytes 2..4 are the reserved half of the header and stay zero.
+        payload[4..].copy_from_slice(&self.encode());
+        payload
+    }
+}
+
+/// The queue pairs an interrupt found completions on.
+///
+/// A bitmask rather than a list because the caller is an interrupt
+/// handler: no allocation, no iteration over pairs that did nothing,
+/// and `NET_MAX_QUEUE_PAIRS` pairs fit a `u16` exactly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QueuePairProgress(u16);
+
+impl QueuePairProgress {
+    pub const fn none() -> Self {
+        Self(0)
+    }
+
+    fn record(&mut self, pair_idx: usize) {
+        assert!(
+            pair_idx < usize::from(NET_MAX_QUEUE_PAIRS),
+            "queue pair {pair_idx} is outside the maximum this driver brings up"
+        );
+        self.0 |= 1 << pair_idx;
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The pairs with completions waiting, in index order.
+    pub fn iter(self) -> impl Iterator<Item = usize> {
+        (0..usize::from(NET_MAX_QUEUE_PAIRS)).filter(move |idx| self.0 & (1 << idx) != 0)
+    }
+}
+
+/// What a device does about notification coalescing, as negotiated.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NotificationCoalescing {
+    /// `VIRTIO_NET_F_NOTF_COAL`: one budget for every receive queue and
+    /// one for every transmit queue.
+    pub device_wide: bool,
+    /// `VIRTIO_NET_F_VQ_NOTF_COAL`: a budget per virtqueue.
+    pub per_queue: bool,
+}
+
+impl NotificationCoalescing {
+    /// Whether the device coalesces at all.
+    pub const fn enabled(self) -> bool {
+        self.device_wide
+    }
+}
 
 /// Checksum-offload metadata for one transmit frame: the device
 /// finishes the one's-complement sum from byte `start` of the frame and
@@ -228,15 +426,30 @@ struct RxHeader {
     /// Buffers this frame occupies, valid only with
     /// `VIRTIO_NET_F_MRG_RXBUF`.
     num_buffers: u16,
+    /// The flow hash the device computed, valid only with
+    /// `VIRTIO_NET_F_HASH_REPORT` and only when `hash_report` says the
+    /// device classified the frame.
+    hash_value: u32,
+    hash_report: u16,
 }
 
 impl RxHeader {
-    /// Reads the fixed 12-byte header. Every field is little-endian.
-    fn parse(bytes: &[u8]) -> Self {
+    /// Reads the header. Every field is little-endian, and the eight
+    /// trailing hash bytes exist only under `VIRTIO_NET_F_HASH_REPORT`,
+    /// which is what `header_len` records.
+    fn parse(bytes: &[u8], header_len: usize) -> Self {
         assert!(
-            bytes.len() >= size_of::<VirtioNetHeader>(),
+            header_len >= size_of::<VirtioNetHeader>() && bytes.len() >= header_len,
             "virtio net receive header is shorter than the header layout"
         );
+        let (hash_value, hash_report) = if header_len >= HASH_REPORT_HEADER_BYTES {
+            (
+                u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+                u16::from_le_bytes([bytes[16], bytes[17]]),
+            )
+        } else {
+            (0, NET_HASH_REPORT_NONE)
+        };
         Self {
             flags: bytes[0],
             gso_type: bytes[1],
@@ -244,6 +457,17 @@ impl RxHeader {
             csum_start: u16::from_le_bytes([bytes[6], bytes[7]]),
             csum_offset: u16::from_le_bytes([bytes[8], bytes[9]]),
             num_buffers: u16::from_le_bytes([bytes[10], bytes[11]]),
+            hash_value,
+            hash_report,
+        }
+    }
+
+    /// The hash the device reported, if it reported one.
+    const fn flow_hash(self) -> Option<FlowHash> {
+        if self.hash_report == NET_HASH_REPORT_NONE {
+            None
+        } else {
+            Some(FlowHash::new(self.hash_value))
         }
     }
 
@@ -374,11 +598,51 @@ struct NetTxState<T: VirtioTransport> {
     tx_payloads: Box<[Option<Bytes>]>,
 }
 
+impl<T: VirtioTransport> NetQueuePair<T> {
+    /// Whether either ring of this pair has a completion nobody has
+    /// taken yet.
+    ///
+    /// A pair another processor currently holds is reported as idle:
+    /// that processor is draining it, so it needs no wake, and an
+    /// interrupt handler must not wait for a lock in any case.
+    /// Counts one interrupt for this pair and releases its waiters.
+    fn raise_interrupt(&self) {
+        self.interrupt_count.fetch_add(1, Ordering::Relaxed);
+        self.interrupts.notify_all();
+    }
+
+    fn has_pending_completions(&self) -> bool {
+        let receive = self
+            .rx_state
+            .try_lock()
+            .is_some_and(|state| state.rx_queue.has_pending_used());
+        let transmit = self
+            .tx_state
+            .try_lock()
+            .is_some_and(|state| state.tx_queue.has_pending_used());
+        receive || transmit
+    }
+}
+
 /// One TX/RX queue pair as exposed by VIRTIO_NET_F_MQ. Each pair
 /// owns its own pair of `VirtQueue`s, RX buffer slab, and TX buffer
 /// slab so submissions on different CPUs do not contend on the same
 /// SpinMutex / async lock.
 struct NetQueuePair<T: VirtioTransport> {
+    /// Interrupts raised for this pair alone.
+    ///
+    /// The distribution across pairs is the evidence that steering
+    /// works: with per-queue vectors each of these is incremented on the
+    /// processor that drains the pair, so the counts spread instead of
+    /// piling on whichever processor owns a single vector.
+    interrupt_count: AtomicU64,
+    /// Progress on this pair alone.
+    ///
+    /// A per-CPU queue layout wants a per-queue wake: a waiter whose
+    /// socket lives on shard 3 has nothing to learn from pair 0's
+    /// completion, and waking it costs the same as waking the task that
+    /// did make progress.
+    interrupts: Notify,
     rx_state: AsyncMutex<NetRxState<T>>,
     rx_returned: Arc<RxReturnedSlots>,
     rx_slots: Box<[Arc<RxBufferSlot>]>,
@@ -410,6 +674,8 @@ pub struct VirtioNetDevice<T: VirtioTransport> {
     /// the case for single-queue paths).
     control: Option<SpinMutex<NetControlState<T>>>,
     rx_buffer_len: usize,
+    /// Progress that belongs to no single pair: a configuration change,
+    /// and the control queue's own completions.
     interrupts: Notify,
     features: NegotiatedFeatures,
     mac_address: [u8; 6],
@@ -449,6 +715,13 @@ pub struct VirtioNetDevice<T: VirtioTransport> {
     /// Last link state read out of the configuration space. Devices
     /// without VIRTIO_NET_F_STATUS are always up.
     link_up: AtomicBool,
+    /// The receive-side scaling limits the device reported, present
+    /// only when `VIRTIO_NET_F_RSS` was negotiated *and* the device can
+    /// hold the table and key this driver's demux is defined in terms
+    /// of. A device that cannot is left unsteered rather than
+    /// half-programmed: a wrong table would put a flow on a queue whose
+    /// processor does not own the socket, which is worse than the hop.
+    rss: Option<RssLimits>,
 }
 
 /// Control queue state: a single descriptor pair (header bytes
@@ -546,6 +819,38 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             } else {
                 0
             };
+            // Receive-side scaling is what makes the per-CPU queue
+            // layout pay, but only together with multiqueue: on a
+            // single-pair device there is nothing to steer to. The
+            // hash report rides along so the driver reads the number
+            // the device already computed instead of computing it
+            // again; both are programmed over the control queue.
+            let rss_mask = if mq_supported && offered & NET_FEATURE_RSS != 0 {
+                NET_FEATURE_RSS | (offered & NET_FEATURE_HASH_REPORT)
+            } else {
+                0
+            };
+            // Notification coalescing is programmed over the control
+            // queue, so it is only worth asking for when the control
+            // queue itself is in. The per-virtqueue form is a strict
+            // refinement of the device-wide one and the spec has the
+            // driver take both.
+            let coalescing_mask = if offered & NET_FEATURE_CTRL_VQ != 0 {
+                let device_wide = offered & NET_FEATURE_NOTF_COAL;
+                let per_queue = if device_wide != 0 {
+                    offered & NET_FEATURE_VQ_NOTF_COAL
+                } else {
+                    0
+                };
+                let ctrl_vq = if device_wide != 0 {
+                    NET_FEATURE_CTRL_VQ
+                } else {
+                    0
+                };
+                device_wide | per_queue | ctrl_vq
+            } else {
+                0
+            };
             RING_FEATURES
                 | NET_FEATURE_CSUM
                 | NET_FEATURE_MAC
@@ -556,6 +861,8 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 | guest_csum_mask
                 | mrg_mask
                 | guest_gso_mask
+                | coalescing_mask
+                | rss_mask
         })?;
 
         let mac_address = read_mac_address(&transport);
@@ -563,7 +870,26 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let max_frame_len = ip_mtu
             .checked_add(ETH_HEADER_LEN)
             .ok_or(IoError::DeviceFault)?;
-        let header_len = size_of::<VirtioNetHeader>();
+        // A device that cannot hold the table and key this driver's
+        // demux is defined in terms of is left unsteered rather than
+        // half-programmed.
+        let rss = features
+            .device(NET_FEATURE_RSS)
+            .then(|| read_rss_limits(&transport))
+            .filter(|limits| limits.accepts_our_table());
+        if features.device(NET_FEATURE_RSS) && rss.is_none() {
+            tracing::warn!(
+                "virtio-net offered RSS but cannot hold a {RSS_INDIRECTION_ENTRIES}-entry table with a {RSS_KEY_BYTES}-byte key over the four-tuple hash types; receives stay unsteered"
+            );
+        }
+        // `VIRTIO_NET_F_HASH_REPORT` lengthens the header in both
+        // directions, so it is one number every buffer size derives
+        // from rather than a per-path branch.
+        let header_len = if features.device(NET_FEATURE_HASH_REPORT) {
+            HASH_REPORT_HEADER_BYTES
+        } else {
+            size_of::<VirtioNetHeader>()
+        };
         let mergeable_rx_buffers = features.device(NET_FEATURE_MRG_RXBUF);
         let guest_tso_v4_negotiated = features.device(NET_FEATURE_GUEST_TSO4);
         let guest_tso_v6_negotiated = features.device(NET_FEATURE_GUEST_TSO6);
@@ -603,8 +929,8 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
 
         let mut queue_pairs: Vec<NetQueuePair<T>> = Vec::with_capacity(usize::from(pair_count));
         for pair_idx in 0..pair_count {
-            let rx_queue_index = pair_idx * 2;
-            let tx_queue_index = pair_idx * 2 + 1;
+            let rx_queue_index = rx_queue_index(pair_idx);
+            let tx_queue_index = tx_queue_index(pair_idx);
             let rx_queue_size = transport.queue_max_size(rx_queue_index).min(NET_QUEUE_SIZE);
             let tx_queue_size = transport.queue_max_size(tx_queue_index).min(NET_QUEUE_SIZE);
             if rx_queue_size == 0
@@ -687,6 +1013,8 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             let tx_payloads = vec![None; tx_buffer_count].into_boxed_slice();
 
             queue_pairs.push(NetQueuePair {
+                interrupt_count: AtomicU64::new(0),
+                interrupts: Notify::new(),
                 rx_state: AsyncMutex::new(NetRxState {
                     rx_queue,
                     rx_in_device,
@@ -716,7 +1044,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             } else {
                 1
             };
-            let ctrl_index = device_max * 2;
+            let ctrl_index = control_queue_index(device_max);
             let ctrl_size = transport.queue_max_size(ctrl_index).min(NET_QUEUE_SIZE);
             if ctrl_size != 0 && ctrl_size.is_power_of_two() {
                 let queue = VirtQueue::new(
@@ -779,6 +1107,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             guest_ufo_negotiated,
             status_negotiated: features.device(NET_FEATURE_STATUS),
             link_up: AtomicBool::new(true),
+            rss,
         };
         device
             .link_up
@@ -787,9 +1116,20 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         // Activate every queue pair on the device side. The device
         // ships with a single pair active by default; without this
         // command extra RX queues we just allocated would not
-        // receive traffic.
-        if features.device(NET_FEATURE_MQ) && device.queue_pair_count() > 1 {
+        // receive traffic. A steering device is told the same count
+        // inside its RSS configuration instead, which is the command
+        // that also hands it the table and the key.
+        if device.steers_receives() {
+            device.send_rss_config()?;
+        } else if features.device(NET_FEATURE_MQ) && device.queue_pair_count() > 1 {
             device.send_set_vq_pairs(device.queue_pair_count())?;
+        }
+
+        // Coalescing is programmed after the pairs are active, because
+        // the per-virtqueue form addresses queues by index and a pair
+        // the device has not been told to activate has no budget to set.
+        if features.device(NET_FEATURE_NOTF_COAL) {
+            device.send_notification_coalescing()?;
         }
 
         // The negotiated set is the only record of what the host packet
@@ -815,6 +1155,12 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             mrg_rxbuf = device.mergeable_rx_buffers,
             mq = features.device(NET_FEATURE_MQ),
             ctrl_vq = features.device(NET_FEATURE_CTRL_VQ),
+            rss = device.steers_receives(),
+            hash_report = features.device(NET_FEATURE_HASH_REPORT),
+            notf_coal = features.device(NET_FEATURE_NOTF_COAL),
+            vq_notf_coal = features.device(NET_FEATURE_VQ_NOTF_COAL),
+            notf_coal_max_packets = NET_NOTF_COAL_MAX_PACKETS,
+            notf_coal_max_usecs = NET_NOTF_COAL_MAX_USECS,
             status = device.status_negotiated,
             link_up = device.link_up.load(Ordering::Relaxed),
             max_frame_len = device.max_frame_len,
@@ -841,8 +1187,14 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             rx_queues: self.queue_pair_count(),
             tx_queues: self.queue_pair_count(),
             tx_queue_depth: self.tx_queue_depth(),
-            rss: false,
+            rss: self.steers_receives(),
         }
+    }
+
+    /// Whether the device steers received frames across its queues by
+    /// flow hash, rather than delivering everything on queue zero.
+    pub fn steers_receives(&self) -> bool {
+        self.rss.is_some()
     }
 
     /// The capability set the network stack specializes its data paths
@@ -880,8 +1232,8 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 polling: true,
                 interrupts: true,
                 adaptive_moderation: false,
-                rx_coalescing: false,
-                tx_coalescing: false,
+                rx_coalescing: self.notification_coalescing().enabled(),
+                tx_coalescing: self.notification_coalescing().enabled(),
                 rx_poll_budget: DEFAULT_POLL_BUDGET,
                 tx_completion_budget: DEFAULT_POLL_BUDGET,
             },
@@ -899,13 +1251,17 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         self.features
     }
 
-    fn send_set_vq_pairs(&self, pairs: usize) -> IoResult<()> {
+    /// Issues one control-queue command and waits for the device's ack.
+    ///
+    /// Every command the driver sends has the same shape — a one-byte
+    /// class, a one-byte command id, a fixed payload, and a single ack
+    /// byte back — so the submission lives here once and each caller
+    /// only spells out its own payload.
+    fn send_control_command(&self, class: u8, command: u8, payload: &[u8]) -> IoResult<()> {
         let Some(control) = self.control.as_ref() else {
             return Err(IoError::Unsupported);
         };
-        let pairs_u16 = u16::try_from(pairs).map_err(|_| IoError::DeviceFault)?;
         let mut state = control.lock();
-        let pairs_bytes = pairs_u16.to_le_bytes();
         // Destructure under `&mut` so the split borrows of the
         // queue, cmd buffer, and ack buffer are independent for the
         // duration of the submission.
@@ -914,12 +1270,17 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             cmd_buffer,
             ack_buffer,
         } = &mut *state;
-        cmd_buffer[0] = CTRL_CLASS_MQ;
-        cmd_buffer[1] = CTRL_CMD_MQ_VQ_PAIRS_SET;
-        cmd_buffer[2] = pairs_bytes[0];
-        cmd_buffer[3] = pairs_bytes[1];
+        let len = 2 + payload.len();
+        assert!(
+            len <= cmd_buffer.len(),
+            "virtio-net control command {class}/{command} needs {len} bytes but the scratch buffer holds {}",
+            cmd_buffer.len()
+        );
+        cmd_buffer[0] = class;
+        cmd_buffer[1] = command;
+        cmd_buffer[2..len].copy_from_slice(payload);
         ack_buffer[0] = CTRL_ACK_PENDING;
-        let cmd_slice: &[u8] = &cmd_buffer[..CTRL_MQ_PAIRS_CMD_BYTES];
+        let cmd_slice: &[u8] = &cmd_buffer[..len];
         let ack_slice: &mut [u8] = &mut ack_buffer[..];
         let _token = queue.submit(&self.transport, &[cmd_slice], &mut [ack_slice])?;
         queue.notify(&self.transport);
@@ -940,14 +1301,148 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         Ok(())
     }
 
-    pub fn handle_interrupt(&self) {
+    fn send_set_vq_pairs(&self, pairs: usize) -> IoResult<()> {
+        let pairs = u16::try_from(pairs).map_err(|_| IoError::DeviceFault)?;
+        let mut payload = [0_u8; CTRL_MQ_PAIRS_PAYLOAD_BYTES];
+        payload.copy_from_slice(&pairs.to_le_bytes());
+        self.send_control_command(CTRL_CLASS_MQ, CTRL_CMD_MQ_VQ_PAIRS_SET, &payload)
+    }
+
+    /// Programs notification coalescing for every queue this device
+    /// brought up.
+    ///
+    /// A per-CPU queue layout wants the per-virtqueue form: each pair is
+    /// driven by its own processor at its own rate, and one device-wide
+    /// setting would make an idle pair pay the busy pair's delay. When
+    /// the device only offers the device-wide form the same budget is
+    /// programmed once for receive and once for transmit, which is the
+    /// same policy at a coarser grain.
+    fn send_notification_coalescing(&self) -> IoResult<()> {
+        let budget = CoalescingBudget {
+            max_packets: NET_NOTF_COAL_MAX_PACKETS,
+            max_usecs: NET_NOTF_COAL_MAX_USECS,
+        };
+        if self.features.device(NET_FEATURE_VQ_NOTF_COAL) {
+            for pair_idx in 0..self.queue_pair_count() {
+                let pair_idx = u16::try_from(pair_idx).map_err(|_| IoError::DeviceFault)?;
+                for queue in [rx_queue_index(pair_idx), tx_queue_index(pair_idx)] {
+                    self.send_control_command(
+                        CTRL_CLASS_NOTF_COAL,
+                        CTRL_CMD_NOTF_COAL_VQ_SET,
+                        &budget.encode_for_queue(queue),
+                    )?;
+                }
+            }
+            return Ok(());
+        }
+        self.send_control_command(
+            CTRL_CLASS_NOTF_COAL,
+            CTRL_CMD_NOTF_COAL_RX_SET,
+            &budget.encode(),
+        )?;
+        self.send_control_command(
+            CTRL_CLASS_NOTF_COAL,
+            CTRL_CMD_NOTF_COAL_TX_SET,
+            &budget.encode(),
+        )
+    }
+
+    /// Hands the device the indirection table and the key the driver's
+    /// own demux is defined in terms of.
+    ///
+    /// The table is not stored: entry `i` is `i % pairs`, which is
+    /// exactly what [`rss_indirection_entry`] computes when the receive
+    /// path has to reach the same answer in software. Programming it
+    /// this way is the whole point — a frame the device steers and a
+    /// frame the driver hashes land on the same shard.
+    fn send_rss_config(&self) -> IoResult<()> {
+        let pairs = u16::try_from(self.queue_pair_count()).map_err(|_| IoError::DeviceFault)?;
+        let mut payload = [0_u8; CTRL_RSS_CONFIG_PAYLOAD_BYTES];
+        let mut offset = 0;
+        let mut push = |bytes: &[u8]| {
+            payload[offset..offset + bytes.len()].copy_from_slice(bytes);
+            offset += bytes.len();
+        };
+        push(&NET_RSS_HASH_TYPES.to_le_bytes());
+        // The mask is the table length minus one, which is why the
+        // length has to be a power of two.
+        push(&((RSS_INDIRECTION_ENTRIES - 1) as u16).to_le_bytes());
+        // A frame the device cannot classify goes here — the same queue
+        // the driver's own rule sends a frame with no flow to.
+        push(&0_u16.to_le_bytes());
+        for slot in 0..RSS_INDIRECTION_ENTRIES {
+            let queue = rss_indirection_entry(slot, usize::from(pairs));
+            push(&(queue as u16).to_le_bytes());
+        }
+        push(&pairs.to_le_bytes());
+        push(&[RSS_KEY_BYTES as u8]);
+        push(&STANDARD_RSS_KEY);
+        assert_eq!(
+            offset, CTRL_RSS_CONFIG_PAYLOAD_BYTES,
+            "the RSS configuration payload was not filled exactly"
+        );
+        self.send_control_command(CTRL_CLASS_MQ, CTRL_CMD_MQ_RSS_CONFIG, &payload)
+    }
+
+    /// Whether the device holds notifications back for a batch or a
+    /// delay, and at what grain.
+    pub fn notification_coalescing(&self) -> NotificationCoalescing {
+        NotificationCoalescing {
+            device_wide: self.features.device(NET_FEATURE_NOTF_COAL),
+            per_queue: self.features.device(NET_FEATURE_VQ_NOTF_COAL),
+        }
+    }
+
+    /// Handles an interrupt that names no queue, which is what every
+    /// transport with a single interrupt line delivers.
+    ///
+    /// Returns the queue pairs that actually have completions waiting,
+    /// so the backend — which owns the `Cpu` and therefore the IPI —
+    /// can wake exactly those pairs' processors instead of every parked
+    /// one. A pair another processor currently holds is left out: that
+    /// processor is draining it and needs no wake.
+    pub fn handle_interrupt(&self) -> QueuePairProgress {
         let status = self.transport.ack_interrupt();
         if status.config_change {
             self.refresh_link_state();
         }
-        // Waiters park on this notification for receive arrival and
-        // transmit completion alike, and a link change is progress they
-        // have to observe too, so both causes wake them.
+        let mut progress = QueuePairProgress::none();
+        for (pair_idx, pair) in self.queue_pairs.iter().enumerate() {
+            if !pair.has_pending_completions() {
+                continue;
+            }
+            progress.record(pair_idx);
+            pair.raise_interrupt();
+        }
+        // A configuration change belongs to no pair, and neither does a
+        // control-queue completion, so the device-wide notification
+        // still exists for the waiters that watch those.
+        self.interrupts.notify_all();
+        progress
+    }
+
+    /// Handles an interrupt raised by one queue pair's own vector.
+    ///
+    /// A transport with per-queue interrupts already knows which pair
+    /// made progress and has already delivered the message to that
+    /// pair's processor, so there is nothing to scan and nobody to wake.
+    pub fn handle_interrupt_on(&self, pair_idx: usize) {
+        let pair_idx = self.normalize_pair_idx(pair_idx);
+        self.transport.ack_interrupt();
+        self.queue_pairs[pair_idx].raise_interrupt();
+    }
+
+    /// Interrupts raised for one queue pair since boot.
+    pub fn queue_interrupts(&self, pair_idx: usize) -> u64 {
+        self.queue_pairs
+            .get(self.normalize_pair_idx(pair_idx))
+            .map_or(0, |pair| pair.interrupt_count.load(Ordering::Relaxed))
+    }
+
+    /// Handles an interrupt raised by the configuration-change vector.
+    pub fn handle_configuration_interrupt(&self) {
+        self.transport.ack_interrupt();
+        self.refresh_link_state();
         self.interrupts.notify_all();
     }
 
@@ -1171,7 +1666,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             return Err(IoError::DeviceFault);
         }
         let slot = &self.queue_pairs[pair_idx].rx_slots[usize::from(slot_index)];
-        let header = RxHeader::parse(&slot.buffer()[..self.header_len]);
+        let header = RxHeader::parse(&slot.buffer()[..self.header_len], self.header_len);
         let offload = match self.rx_offload(header) {
             Ok(offload) => offload,
             Err(error) => {
@@ -1305,6 +1800,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         Ok(RxFrameOffload {
             checksum,
             large_receive_segment_bytes,
+            flow_hash: header.flow_hash(),
         })
     }
 
@@ -1437,6 +1933,30 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             tx_queue.notify(&self.transport);
         }
         Ok(Some(submitted))
+    }
+
+    /// Waits for progress on one queue pair, or for anything the device
+    /// reports that belongs to no pair.
+    ///
+    /// An operation belongs to one shard, which drains one pair, so this
+    /// is what its wait parks on: a completion on another pair is not
+    /// progress it can use, and waking for it would cost the same as
+    /// waking the task that did make progress.
+    pub async fn wait_for_interrupt_on(&self, pair_idx: usize) {
+        let pair_idx = self.normalize_pair_idx(pair_idx);
+        let pair = self.queue_pairs[pair_idx].interrupts.notified();
+        let mut pair = core::pin::pin!(pair);
+        let device = self.interrupts.notified();
+        let mut device = core::pin::pin!(device);
+        core::future::poll_fn(|cx| {
+            use core::future::Future;
+            use core::task::Poll;
+            if pair.as_mut().poll(cx).is_ready() || device.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(());
+            }
+            Poll::Pending
+        })
+        .await;
     }
 
     pub async fn wait_for_interrupt(&self) {
@@ -1611,6 +2131,49 @@ fn read_max_virtqueue_pairs<T: VirtioTransport>(transport: &T) -> u16 {
     // status (2B), max_virtqueue_pairs (2B at offset 8).
     let config = transport.read_config_u32(8).to_le_bytes();
     u16::from_le_bytes([config[0], config[1]])
+}
+
+/// `rss_max_key_size`, `rss_max_indirection_table_length` and
+/// `supported_hash_types`, read as one dword each so the transport's
+/// aligned config accessors cover them.
+fn read_rss_limits<T: VirtioTransport>(transport: &T) -> RssLimits {
+    // The three fields straddle one aligned dword: `duplex` at 16,
+    // `rss_max_key_size` at 17, and the table length at 18..20.
+    let word = transport
+        .read_config_u32(NET_CONFIG_DUPLEX_OFFSET)
+        .to_le_bytes();
+    let key_index = NET_CONFIG_RSS_MAX_KEY_SIZE_OFFSET - NET_CONFIG_DUPLEX_OFFSET;
+    let table_index = NET_CONFIG_RSS_MAX_TABLE_LEN_OFFSET - NET_CONFIG_DUPLEX_OFFSET;
+    RssLimits {
+        max_key_bytes: usize::from(word[key_index]),
+        max_table_len: usize::from(u16::from_le_bytes([
+            word[table_index],
+            word[table_index + 1],
+        ])),
+        supported_hash_types: transport.read_config_u32(NET_CONFIG_SUPPORTED_HASH_TYPES_OFFSET),
+    }
+}
+
+/// What a device says it can do about receive-side scaling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RssLimits {
+    max_key_bytes: usize,
+    max_table_len: usize,
+    supported_hash_types: u32,
+}
+
+impl RssLimits {
+    /// Whether the device can be programmed with the table and key this
+    /// driver's own demux is defined in terms of.
+    ///
+    /// A device that cannot is not steered at all: half-programming it
+    /// would put a flow on a queue whose processor does not own the
+    /// socket, which is worse than the extra hop.
+    const fn accepts_our_table(self) -> bool {
+        self.max_key_bytes >= RSS_KEY_BYTES
+            && self.max_table_len >= RSS_INDIRECTION_ENTRIES
+            && self.supported_hash_types & NET_RSS_HASH_TYPES == NET_RSS_HASH_TYPES
+    }
 }
 
 fn read_mac_address<T: VirtioTransport>(transport: &T) -> [u8; 6] {
@@ -2603,5 +3166,155 @@ mod tests {
         );
         assert_eq!(&buffer[..header_len], zero_header);
         assert_eq!(&buffer[header_len..header_len + second.len()], second);
+    }
+
+    /// virtio-net lays its queues out RX0, TX0, RX1, TX1, ... and the
+    /// control queue follows every pair the *device* advertises, not
+    /// every pair the driver activated. Programming a coalescing budget
+    /// for the wrong index would silently tune somebody else's ring.
+    #[test]
+    fn queue_indices_follow_the_virtio_net_layout() {
+        assert_eq!(super::rx_queue_index(0), 0);
+        assert_eq!(super::tx_queue_index(0), 1);
+        assert_eq!(super::rx_queue_index(3), 6);
+        assert_eq!(super::tx_queue_index(3), 7);
+        assert_eq!(super::control_queue_index(4), 8);
+    }
+
+    /// The table the device is handed has to be the same function the
+    /// driver evaluates in software, entry for entry, or a steered
+    /// frame lands on a queue whose processor does not own the socket.
+    #[test]
+    fn the_rss_table_matches_the_software_rule() {
+        for pairs in [1usize, 2, 3, 4, 8] {
+            for slot in 0..super::RSS_INDIRECTION_ENTRIES {
+                let queue = super::rss_indirection_entry(slot, pairs);
+                assert!(queue < pairs);
+                assert_eq!(
+                    queue,
+                    super::FlowHash::new(slot as u32).bucket(pairs),
+                    "the programmed table and the software bucket must agree"
+                );
+            }
+        }
+    }
+
+    /// A device that cannot hold the driver's table or key, or that
+    /// cannot hash all four flow types, is left unsteered rather than
+    /// half-programmed.
+    #[test]
+    fn rss_limits_are_checked_before_the_device_is_steered() {
+        let usable = super::RssLimits {
+            max_key_bytes: super::RSS_KEY_BYTES,
+            max_table_len: super::RSS_INDIRECTION_ENTRIES,
+            supported_hash_types: super::NET_RSS_HASH_TYPES,
+        };
+        assert!(usable.accepts_our_table());
+        assert!(
+            !super::RssLimits {
+                max_key_bytes: super::RSS_KEY_BYTES - 1,
+                ..usable
+            }
+            .accepts_our_table()
+        );
+        assert!(
+            !super::RssLimits {
+                max_table_len: super::RSS_INDIRECTION_ENTRIES - 1,
+                ..usable
+            }
+            .accepts_our_table()
+        );
+        assert!(
+            !super::RssLimits {
+                supported_hash_types: super::NET_RSS_HASH_TYPES & !super::NET_HASH_TYPE_UDPV6,
+                ..usable
+            }
+            .accepts_our_table()
+        );
+        // A device offering more than the driver needs is still usable.
+        assert!(
+            super::RssLimits {
+                max_key_bytes: 64,
+                max_table_len: 512,
+                supported_hash_types: u32::MAX,
+            }
+            .accepts_our_table()
+        );
+    }
+
+    /// The progress mask an interrupt hands back is what a single-line
+    /// transport steers by, so it has to name exactly the pairs with
+    /// completions and nothing else.
+    #[test]
+    fn queue_pair_progress_names_only_the_pairs_recorded() {
+        let mut progress = super::QueuePairProgress::none();
+        assert!(progress.is_empty());
+        assert_eq!(progress.iter().count(), 0);
+
+        progress.record(0);
+        progress.record(3);
+        // Recording a pair twice is not two wakes.
+        progress.record(3);
+        assert!(!progress.is_empty());
+        assert_eq!(progress.iter().collect::<alloc::vec::Vec<_>>(), [0, 3]);
+
+        let mut full = super::QueuePairProgress::none();
+        for pair_idx in 0..usize::from(super::NET_MAX_QUEUE_PAIRS) {
+            full.record(pair_idx);
+        }
+        assert_eq!(full.iter().count(), usize::from(super::NET_MAX_QUEUE_PAIRS));
+    }
+
+    #[test]
+    #[should_panic(expected = "outside the maximum this driver brings up")]
+    fn a_pair_beyond_the_maximum_is_rejected() {
+        let mut progress = super::QueuePairProgress::none();
+        progress.record(usize::from(super::NET_MAX_QUEUE_PAIRS));
+    }
+
+    /// The hash the device reports is only meaningful when it says it
+    /// classified the frame, and it only exists in the longer header.
+    #[test]
+    fn a_reported_hash_needs_both_the_long_header_and_a_report_type() {
+        let mut header = [0_u8; super::HASH_REPORT_HEADER_BYTES];
+        header[12..16].copy_from_slice(&0xdead_beef_u32.to_le_bytes());
+        header[16..18].copy_from_slice(&1_u16.to_le_bytes());
+
+        let long = super::RxHeader::parse(&header, super::HASH_REPORT_HEADER_BYTES);
+        assert_eq!(
+            long.flow_hash().map(super::FlowHash::get),
+            Some(0xdead_beef)
+        );
+
+        // The same bytes read as a short header report nothing: those
+        // eight bytes are the next frame's, not a hash.
+        let short = super::RxHeader::parse(&header, size_of::<VirtioNetHeader>());
+        assert_eq!(short.flow_hash(), None);
+
+        // A long header whose report type is NONE means the device
+        // classified nothing.
+        header[16..18].copy_from_slice(&super::NET_HASH_REPORT_NONE.to_le_bytes());
+        assert_eq!(
+            super::RxHeader::parse(&header, super::HASH_REPORT_HEADER_BYTES).flow_hash(),
+            None
+        );
+    }
+
+    #[test]
+    fn coalescing_budget_encodes_the_control_queue_payloads() {
+        let budget = super::CoalescingBudget {
+            max_packets: 8,
+            max_usecs: 50,
+        };
+
+        // `struct virtio_net_ctrl_coal`: max_packets then max_usecs.
+        assert_eq!(budget.encode(), [8, 0, 0, 0, 50, 0, 0, 0]);
+
+        // `struct virtio_net_ctrl_coal_vq`: the virtqueue number, two
+        // reserved bytes, then the same budget.
+        assert_eq!(
+            budget.encode_for_queue(super::tx_queue_index(2)),
+            [5, 0, 0, 0, 8, 0, 0, 0, 50, 0, 0, 0]
+        );
     }
 }

@@ -1,3 +1,11 @@
+//! `futures-io` adapters over the byte transports the debugger serves
+//! RPC on.
+//!
+//! Both transports — the debug serial port and a vsock connection —
+//! present the same three async operations, so the poll state machine
+//! that turns them into `AsyncRead`/`AsyncWrite` is written once over
+//! [`ByteEndpoint`] rather than once per transport.
+
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -6,44 +14,106 @@ use std::task::{Context, Poll};
 
 use futures_io::{AsyncRead, AsyncWrite};
 use helios_api::serial::DebugPort;
+use helios_api::vsock::VsockStream;
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send>>;
 
-pub struct DebugPortReader {
-    port: Arc<DebugPort>,
+/// A byte transport the RPC framing can run over.
+///
+/// The receiver is an `Arc` so a future can own its endpoint for as long
+/// as it is in flight, which is what lets the reader and the writer hold
+/// the same transport at once.
+pub trait ByteEndpoint: Send + Sync + 'static {
+    /// Reads whatever is available, up to `max_bytes`. An empty vector
+    /// means the transport is closed.
+    fn read(self: &Arc<Self>, max_bytes: usize) -> BoxFuture<Vec<u8>>;
+
+    fn write_all(self: &Arc<Self>, bytes: Vec<u8>) -> BoxFuture<()>;
+
+    fn flush(self: &Arc<Self>) -> BoxFuture<()>;
+}
+
+/// Bytes the reader asks its transport for in one call.
+const READ_CHUNK_BYTES: usize = 4096;
+
+impl ByteEndpoint for DebugPort {
+    fn read(self: &Arc<Self>, max_bytes: usize) -> BoxFuture<Vec<u8>> {
+        let port = Arc::clone(self);
+        // The receiver is narrowed to `&Self` so these resolve to the
+        // transport's own inherent methods rather than recursing back
+        // into this trait, whose receiver is the `Arc`.
+        Box::pin(async move { port.as_ref().read(max_bytes).await })
+    }
+
+    fn write_all(self: &Arc<Self>, bytes: Vec<u8>) -> BoxFuture<()> {
+        let port = Arc::clone(self);
+        Box::pin(async move { port.as_ref().write_all(&bytes).await })
+    }
+
+    fn flush(self: &Arc<Self>) -> BoxFuture<()> {
+        let port = Arc::clone(self);
+        Box::pin(async move { port.as_ref().flush().await })
+    }
+}
+
+impl ByteEndpoint for VsockStream {
+    fn read(self: &Arc<Self>, max_bytes: usize) -> BoxFuture<Vec<u8>> {
+        let stream = Arc::clone(self);
+        // An orderly end of file is an empty read, which is what the
+        // poll adapter treats as "closed".
+        Box::pin(async move { Ok(stream.as_ref().read(max_bytes).await?.unwrap_or_default()) })
+    }
+
+    fn write_all(self: &Arc<Self>, bytes: Vec<u8>) -> BoxFuture<()> {
+        let stream = Arc::clone(self);
+        Box::pin(async move { stream.as_ref().write_all(&bytes).await })
+    }
+
+    fn flush(self: &Arc<Self>) -> BoxFuture<()> {
+        // A vsock write has reached the device by the time it returns;
+        // there is no buffer between here and the peer to push.
+        let _ = self;
+        Box::pin(async move { Ok(()) })
+    }
+}
+
+pub struct EndpointReader<Endpoint: ByteEndpoint> {
+    endpoint: Arc<Endpoint>,
     buffer: Vec<u8>,
     offset: usize,
     closed: bool,
     pending: Option<BoxFuture<Vec<u8>>>,
 }
 
-pub struct DebugPortWriter {
-    port: Arc<DebugPort>,
+pub struct EndpointWriter<Endpoint: ByteEndpoint> {
+    endpoint: Arc<Endpoint>,
     write: Option<(usize, BoxFuture<()>)>,
     flush: Option<BoxFuture<()>>,
 }
 
-pub fn split(
-    read_port: Arc<DebugPort>,
-    write_port: Arc<DebugPort>,
-) -> (DebugPortReader, DebugPortWriter) {
+/// Splits one transport into the reader and writer halves the RPC
+/// framing takes.
+pub fn split<Endpoint: ByteEndpoint>(
+    read_endpoint: Arc<Endpoint>,
+    write_endpoint: Arc<Endpoint>,
+) -> (EndpointReader<Endpoint>, EndpointWriter<Endpoint>) {
     (
-        DebugPortReader {
-            port: read_port,
+        EndpointReader {
+            endpoint: read_endpoint,
             buffer: Vec::new(),
             offset: 0,
             closed: false,
             pending: None,
         },
-        DebugPortWriter {
-            port: write_port,
+        EndpointWriter {
+            endpoint: write_endpoint,
             write: None,
             flush: None,
         },
     )
 }
 
-impl AsyncRead for DebugPortReader {
+impl<Endpoint: ByteEndpoint> AsyncRead for EndpointReader<Endpoint> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -72,8 +142,7 @@ impl AsyncRead for DebugPortReader {
         }
 
         if this.pending.is_none() {
-            let port = Arc::clone(&this.port);
-            this.pending = Some(Box::pin(async move { port.read(4096).await }));
+            this.pending = Some(this.endpoint.read(READ_CHUNK_BYTES));
         }
 
         match this
@@ -104,7 +173,7 @@ impl AsyncRead for DebugPortReader {
     }
 }
 
-impl AsyncWrite for DebugPortWriter {
+impl<Endpoint: ByteEndpoint> AsyncWrite for EndpointWriter<Endpoint> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -117,10 +186,9 @@ impl AsyncWrite for DebugPortWriter {
         }
 
         if this.write.is_none() {
-            let port = Arc::clone(&this.port);
             let bytes = Vec::from(buf);
             let len = bytes.len();
-            this.write = Some((len, Box::pin(async move { port.write_all(&bytes).await })));
+            this.write = Some((len, this.endpoint.write_all(bytes)));
         }
 
         let (len, future) = this.write.as_mut().expect("writer future must exist");
@@ -153,8 +221,7 @@ impl AsyncWrite for DebugPortWriter {
         }
 
         if this.flush.is_none() {
-            let port = Arc::clone(&this.port);
-            this.flush = Some(Box::pin(async move { port.flush().await }));
+            this.flush = Some(this.endpoint.flush());
         }
 
         match this

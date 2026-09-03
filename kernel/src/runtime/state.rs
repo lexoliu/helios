@@ -20,6 +20,7 @@ use spin::{Mutex, Once};
 use crate::memory::BalloonHandle;
 
 use crate::BlockService;
+use crate::ComponentHostVsockService;
 use crate::component::{ComponentRuntimeState, ProviderSlot};
 use crate::network::HttpExchange;
 use crate::runtime::types::ComponentHostFilesystemState;
@@ -64,6 +65,10 @@ struct RuntimeStateInner<ProgramService, NetworkService, HostFsService> {
     /// Swap, once a backend with a lazy-commit address space and a disk
     /// to write to has brought it up. Empty everywhere else.
     swap: Once<crate::SwapHandle>,
+    /// The machine's link to its host, once a backend brought a vsock
+    /// device up. Empty on a machine with no vsock device, where the
+    /// runtime adapter answers `unavailable` rather than trapping.
+    vsock_service: Once<ComponentHostVsockService>,
     futex_table: Mutex<FutexTable>,
     bootfs: Mutex<Option<EmbeddedBootFs>>,
     tracing: Mutex<TraceHistory>,
@@ -362,6 +367,7 @@ where
                 iommu_report: Once::new(),
                 balloon: Once::new(),
                 swap: Once::new(),
+                vsock_service: Once::new(),
                 futex_table: Mutex::new(FutexTable::new()),
                 bootfs: Mutex::new(embedded_init().map(|init| init.bootfs())),
                 tracing: Mutex::new(TraceHistory::new(DEFAULT_TRACE_HISTORY_CAPACITY)),
@@ -370,25 +376,6 @@ where
                 perf_metrics: Mutex::new(PerfMetricHistory::new(DEFAULT_PERF_METRIC_CAPACITY)),
                 heap_perf_snapshot: HeapPerfSnapshot::new(),
             }),
-        }
-    }
-
-    pub fn snapshot(&self, current_ticks: u64) -> StatsSample {
-        let uptime = self.ticks_to_nanos(current_ticks.saturating_sub(self.inner.boot_ticks));
-        StatsSample {
-            timestamp: uptime,
-            uptime,
-            wall_clock: self.wall_clock_nanos(current_ticks),
-            configured_processors: self.inner.processor_count,
-            online_processors: self.inner.processor_count,
-            block: self.inner.block_service.get().map(BlockService::stats),
-            iommu: self
-                .inner
-                .iommu_report
-                .get()
-                .map(|report| report.snapshot()),
-            balloon: self.inner.balloon.get().map(BalloonHandle::stats),
-            swap: self.inner.swap.get().map(crate::SwapHandle::stats),
         }
     }
 
@@ -891,6 +878,24 @@ where
         assert!(installed, "swap was installed more than once");
     }
 
+    /// Publishes the machine's vsock link.
+    ///
+    /// Called from the backend that brought the device up, before any
+    /// component runs, so a service visible here is one every consumer
+    /// may use without checking the device first.
+    pub fn install_vsock_service(&self, service: ComponentHostVsockService) {
+        let mut installed = false;
+        self.inner.vsock_service.call_once(|| {
+            installed = true;
+            service
+        });
+        assert!(installed, "vsock service was installed more than once");
+    }
+
+    pub fn vsock_service(&self) -> Option<ComponentHostVsockService> {
+        self.inner.vsock_service.get().cloned()
+    }
+
     pub fn prepare_futex_wait(&self, key: FutexKey) -> FutexWaitRegistration {
         self.inner.futex_table.lock().prepare_wait(key)
     }
@@ -913,6 +918,44 @@ where
 
     pub fn retire_bootfs(&self) {
         *self.inner.bootfs.lock() = None;
+    }
+}
+
+/// The system-wide observation snapshot.
+///
+/// This sits in its own block because reporting the host share's cache
+/// counters needs the filesystem service to actually be a filesystem,
+/// which the rest of `RuntimeState` does not care about.
+impl<ProgramService, NetworkService, HostFsService>
+    RuntimeState<ProgramService, NetworkService, HostFsService>
+where
+    ProgramService: Clone,
+    NetworkService: crate::NetworkAdminBackend,
+    HostFsService: crate::HostFileSystem,
+{
+    pub fn snapshot(&self, current_ticks: u64) -> StatsSample {
+        let uptime = self.ticks_to_nanos(current_ticks.saturating_sub(self.inner.boot_ticks));
+        StatsSample {
+            timestamp: uptime,
+            uptime,
+            wall_clock: self.wall_clock_nanos(current_ticks),
+            configured_processors: self.inner.processor_count,
+            online_processors: self.inner.processor_count,
+            block: self.inner.block_service.get().map(BlockService::stats),
+            iommu: self
+                .inner
+                .iommu_report
+                .get()
+                .map(|report| report.snapshot()),
+            balloon: self.inner.balloon.get().map(BalloonHandle::stats),
+            swap: self.inner.swap.get().map(crate::SwapHandle::stats),
+            host_share: self
+                .host_fs_service()
+                .and_then(|service| service.cache_stats()),
+            network: self
+                .network_service()
+                .map(|service| service.network_stats()),
+        }
     }
 }
 

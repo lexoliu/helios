@@ -6,12 +6,19 @@ use anyhow::{Context as _, Result};
 use helios_inspector_protocol::system::stats;
 
 use crate::runtime;
-use crate::serial::{RpcClient, SerialIo, SerialReader};
+use crate::serial::{RpcClient, RpcReader, SerialIo};
 
 const BOOT_SYNC_TIMEOUT: Duration = Duration::from_secs(900);
 const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const READY_DRAIN_QUIET_PERIOD: Duration = Duration::from_millis(100);
 const DEBUGGER_RUN_STAGE: &str = "run:begin";
+/// Bytes one serial line may gather before it is rendered anyway.
+///
+/// A guest that stops emitting newlines — a corrupted stream, a binary
+/// blob on the console — would otherwise grow a single line for as long
+/// as the session runs, and an unbounded line is also what a log viewer
+/// refuses to render.
+const MAX_GUEST_LINE_BYTES: usize = 8 * 1024;
 
 /// Boot-marker deadline. Firmware loading a release kernel image under
 /// pure TCG can legitimately take longer than the default 15 minutes,
@@ -26,13 +33,51 @@ fn boot_sync_timeout() -> Duration {
 
 pub(crate) async fn connect_after_boot(io: SerialIo) -> Result<RpcClient> {
     let (mut read, write) = io.into_split();
-    runtime::timeout(boot_sync_timeout(), wait_for_debugger_stage(&mut read))
-        .await
-        .context("timed out waiting for the embedded debugger cold-start markers")??;
-
+    wait_for_boot(&mut read).await?;
     let mut client = helios_inspector_protocol::transport::Client::new(read, write);
     wait_until_ready(&mut client).await?;
     Ok(client)
+}
+
+/// Waits on the guest's serial line until the embedded debugger reports
+/// that it entered `wasi:cli/run`.
+///
+/// The boot markers ride the serial line whatever transport the RPC
+/// itself uses: they are printed before any RPC transport exists, and a
+/// session on vsock still has to know when the guest is up.
+pub(crate) async fn wait_for_boot(read: &mut RpcReader) -> Result<()> {
+    runtime::timeout(boot_sync_timeout(), wait_for_debugger_stage(read))
+        .await
+        .context("timed out waiting for the embedded debugger cold-start markers")??;
+    Ok(())
+}
+
+/// Keeps draining the guest's serial line for the rest of the session,
+/// echoing what it carries.
+///
+/// With the RPC on vsock nothing else reads the serial socket, and a
+/// socket QEMU cannot write into stops the guest console; this also
+/// keeps the guest's own diagnostics visible, which is the whole reason
+/// the console stays on the serial line.
+pub(crate) fn echo_serial_console(mut read: RpcReader) {
+    std::thread::spawn(move || {
+        runtime::block_on(async move {
+            let mut line = Vec::new();
+            loop {
+                match read_byte(&mut read).await {
+                    Ok(Some(b'\n')) => {
+                        if let Some(text) = printable_guest_line(&line) {
+                            eprintln!("guest serial: {text}");
+                        }
+                        line.clear();
+                    }
+                    Ok(Some(b'\r')) => {}
+                    Ok(Some(byte)) => line.push(byte),
+                    Ok(None) | Err(_) => return,
+                }
+            }
+        });
+    });
 }
 
 pub(crate) async fn wait_until_ready(client: &mut RpcClient) -> Result<()> {
@@ -45,7 +90,7 @@ pub(crate) async fn wait_until_ready(client: &mut RpcClient) -> Result<()> {
     Ok(())
 }
 
-async fn wait_for_debugger_stage(read: &mut SerialReader) -> Result<()> {
+async fn wait_for_debugger_stage(read: &mut RpcReader) -> Result<()> {
     let mut line = Vec::new();
 
     loop {
@@ -79,13 +124,33 @@ async fn wait_for_debugger_stage(read: &mut SerialReader) -> Result<()> {
                 line.clear();
             }
             b'\r' => {}
-            other => line.push(other),
+            other => {
+                line.push(other);
+                if line.len() >= MAX_GUEST_LINE_BYTES {
+                    if let Some(text) = printable_guest_line(&line) {
+                        eprintln!("guest serial: {text}");
+                    }
+                    line.clear();
+                }
+            }
         }
     }
 }
 
+/// The one control character a rendered line keeps.
+///
+/// The guest colours its log with ANSI escape sequences, which read
+/// correctly in a terminal and in a CI log alike.
+const ESCAPE: char = '\u{1b}';
+
 /// Renders a non-marker serial line for diagnostics, or `None` when the
 /// line is empty or carries no printable text (RPC framing bytes).
+///
+/// Control characters are dropped from the middle of the line and not
+/// only trimmed off its ends. A serial line that carries RPC framing or
+/// a partially written buffer can hold a NUL anywhere in it, and one NUL
+/// is enough for a CI log collector to discard the whole step's output —
+/// which is exactly the evidence a failing boot exists to leave behind.
 fn printable_guest_line(line: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(line);
     let trimmed = text.trim_matches(|c: char| c.is_control() || c == '\u{fffd}');
@@ -93,13 +158,21 @@ fn printable_guest_line(line: &[u8]) -> Option<String> {
         .chars()
         .filter(|c| !c.is_control() && *c != '\u{fffd}')
         .count();
-    (printable >= 4 && printable * 2 >= trimmed.chars().count()).then(|| trimmed.to_owned())
+    if printable < 4 || printable * 2 < trimmed.chars().count() {
+        return None;
+    }
+    Some(
+        trimmed
+            .chars()
+            .filter(|character| *character == ESCAPE || !character.is_control())
+            .collect(),
+    )
 }
 
 /// After a panic line appears, the guest usually follows with the panic
 /// message and location on separate lines; gather them until the serial
 /// link goes quiet so the failure carries the whole report.
-async fn collect_panic_trailer(read: &mut SerialReader) -> String {
+async fn collect_panic_trailer(read: &mut RpcReader) -> String {
     let mut trailer = String::new();
     let mut line = Vec::new();
     loop {
@@ -123,7 +196,7 @@ async fn collect_panic_trailer(read: &mut SerialReader) -> String {
     trailer
 }
 
-async fn drain_boot_preamble(read: &mut SerialReader) -> Result<()> {
+async fn drain_boot_preamble(read: &mut RpcReader) -> Result<()> {
     loop {
         match runtime::timeout(READY_DRAIN_QUIET_PERIOD, read_byte(read)).await {
             Some(Ok(Some(_))) => {}
@@ -138,7 +211,7 @@ async fn drain_boot_preamble(read: &mut SerialReader) -> Result<()> {
     }
 }
 
-async fn read_byte(read: &mut SerialReader) -> std::io::Result<Option<u8>> {
+async fn read_byte(read: &mut RpcReader) -> std::io::Result<Option<u8>> {
     let mut byte = [0_u8; 1];
     let count = std::future::poll_fn(|cx| Pin::new(&mut **read).poll_read(cx, &mut byte)).await?;
     Ok((count != 0).then_some(byte[0]))

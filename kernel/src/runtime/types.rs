@@ -897,6 +897,10 @@ impl HostFsError {
 }
 
 pub trait HostFileSystem: Clone + Send + 'static {
+    /// How this filesystem's caches have been serving the kernel, or
+    /// `None` from an implementation that caches nothing.
+    fn cache_stats(&self) -> Option<crate::HostFsCacheStats>;
+
     fn stat_path<'a>(
         &'a self,
         path: &'a str,

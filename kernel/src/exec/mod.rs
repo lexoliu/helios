@@ -31,8 +31,9 @@ pub use observer::{
 };
 pub use sync::{
     Mutex, MutexGuard, Notified, Notify, NotifyWaiter, OwnedRawMutexLease, OwnedRawRwLockReadLease,
-    OwnedRawRwLockWriteLease, RawMutex, RawMutexLease, RawRwLock, RawRwLockReadLease,
-    RawRwLockWriteLease, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    OwnedRawRwLockWriteLease, ProgressChanged, ProgressMark, ProgressSignal, RawMutex,
+    RawMutexLease, RawRwLock, RawRwLockReadLease, RawRwLockWriteLease, RwLock, RwLockReadGuard,
+    RwLockWriteGuard,
 };
 pub use task::{YieldNow, yield_now};
 pub use time::{

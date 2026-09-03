@@ -22,6 +22,7 @@ pub mod rtc;
 pub mod serial;
 pub mod vmm;
 pub mod vmm_test_harness;
+pub mod vsock;
 pub mod watchdog;
 
 /// Aligns `value` up to the next multiple of `align`.
@@ -104,6 +105,9 @@ pub struct DeviceInventory {
     pub has_entropy_device: bool,
     /// A memory balloon the host resizes the guest's memory through.
     pub has_memory_balloon: bool,
+    /// A vsock transport: the machine can reach whatever is hosting it
+    /// without a network.
+    pub has_vsock: bool,
 }
 
 impl DeviceInventory {
@@ -115,6 +119,7 @@ impl DeviceInventory {
             has_host_share: false,
             has_entropy_device: false,
             has_memory_balloon: false,
+            has_vsock: false,
         }
     }
 
@@ -156,6 +161,13 @@ impl DeviceInventory {
     pub const fn with_memory_balloon(self) -> Self {
         Self {
             has_memory_balloon: true,
+            ..self
+        }
+    }
+
+    pub const fn with_vsock(self) -> Self {
+        Self {
+            has_vsock: true,
             ..self
         }
     }

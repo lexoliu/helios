@@ -594,6 +594,10 @@ mod tests {
     }
 
     impl crate::NetworkAdminBackend for TestNetworkService {
+        fn network_stats(&self) -> crate::NetworkStats {
+            crate::NetworkStats::default()
+        }
+
         fn bridge_port(
             &self,
             _: crate::NetworkPortId,

@@ -4,6 +4,7 @@ world init {
   include wasi:cli/command@0.3.0;
   import helios:system/programs@0.1.0;
   import helios:system/net@0.1.0;
+  import helios:system/vsock@0.1.0;
   import helios:system/stats@0.1.0;
   import helios:system/tracing@0.1.0;
   import helios:system/sync@0.1.0;
@@ -16,6 +17,7 @@ world debugger {
   include wasi:cli/command@0.3.0;
   import helios:system/programs@0.1.0;
   import helios:system/net@0.1.0;
+  import helios:system/vsock@0.1.0;
   import helios:system/stats@0.1.0;
   import helios:system/tracing@0.1.0;
   import helios:system/profiling@0.1.0;

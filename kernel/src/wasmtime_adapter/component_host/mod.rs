@@ -69,6 +69,7 @@ fn lower_bytes_to_vec(bytes: Bytes) -> Vec<u8> {
 mod network;
 pub mod service;
 mod topology;
+mod vsock;
 
 struct SerialFmtWriter {
     write_serial: fn(&[u8]),
@@ -105,6 +106,8 @@ pub use topology::{
 };
 
 pub type SbiSerialPort = crate::ComponentSerialPort;
+
+pub use vsock::{ComponentVsockListener, ComponentVsockStream};
 
 pub type NetworkTcpBackend = crate::ComponentTcpBackend<ComponentHostNetworkService>;
 pub type NetworkUdpBackend = crate::ComponentUdpBackend<ComponentHostNetworkService>;
@@ -1543,6 +1546,7 @@ where
 {
     add_programs_to_linker(linker)?;
     add_net_to_linker(linker)?;
+    vsock::add_vsock_to_linker::<vsock::DebuggerVsock, _, _>(linker)?;
     add_stats_to_linker(linker)?;
     add_instances_to_linker(linker)?;
     add_tracing_to_linker(linker)?;
@@ -1727,6 +1731,7 @@ where
 {
     add_programs_to_program_linker(linker)?;
     add_net_to_program_linker(linker)?;
+    vsock::add_vsock_to_linker::<vsock::ProgramVsock, _, _>(linker)?;
     add_stats_to_program_linker(linker)?;
     add_tracing_to_program_linker(linker)?;
     Ok(())
@@ -3738,6 +3743,47 @@ macro_rules! convert_iommu_stats {
     };
 }
 
+/// Maps the host share's cache counters onto one binding set's
+/// `host-share-cache` record.
+macro_rules! convert_host_share_stats {
+    ($bindings:path, $host_share:expr) => {
+        $host_share.map(|cache: crate::HostFsCacheStats| {
+            use $bindings as stats_bindings;
+            stats_bindings::HostShareCache {
+                attribute_hits: cache.attribute_hits,
+                attribute_misses: cache.attribute_misses,
+                negative_hits: cache.negative_hits,
+                directory_hits: cache.directory_hits,
+                directory_misses: cache.directory_misses,
+                fid_hits: cache.fid_hits,
+                fid_misses: cache.fid_misses,
+                evictions: cache.evictions,
+                invalidations: cache.invalidations,
+            }
+        })
+    };
+}
+
+macro_rules! convert_network_stats {
+    ($bindings:path, $network:expr) => {
+        $network.map(|network: crate::NetworkStats| {
+            use $bindings as stats_bindings;
+            stats_bindings::Network {
+                queues: network
+                    .queues
+                    .into_iter()
+                    .map(|queue| stats_bindings::NetworkQueue {
+                        id: queue.id,
+                        rx_frames: queue.rx_frames,
+                        tx_frames: queue.tx_frames,
+                        interrupts: queue.interrupts,
+                    })
+                    .collect(),
+            }
+        })
+    };
+}
+
 macro_rules! convert_block_stats {
     ($bindings:path, $block:expr) => {
         $block.map(|block: crate::BlockStats| {
@@ -3825,6 +3871,11 @@ fn convert_sample(sample: StatsSample) -> debugger_bindings::helios::system::sta
         iommu: convert_iommu_stats!(debugger_bindings::helios::system::stats, sample.iommu),
         balloon: convert_balloon_stats!(debugger_bindings::helios::system::stats, sample.balloon),
         swap: convert_swap_stats!(debugger_bindings::helios::system::stats, sample.swap),
+        host_share: convert_host_share_stats!(
+            debugger_bindings::helios::system::stats,
+            sample.host_share
+        ),
+        network: convert_network_stats!(debugger_bindings::helios::system::stats, sample.network),
     }
 }
 
@@ -3854,6 +3905,11 @@ fn convert_program_sample(sample: StatsSample) -> program_bindings::helios::syst
         iommu: convert_iommu_stats!(program_bindings::helios::system::stats, sample.iommu),
         balloon: convert_balloon_stats!(program_bindings::helios::system::stats, sample.balloon),
         swap: convert_swap_stats!(program_bindings::helios::system::stats, sample.swap),
+        host_share: convert_host_share_stats!(
+            program_bindings::helios::system::stats,
+            sample.host_share
+        ),
+        network: convert_network_stats!(program_bindings::helios::system::stats, sample.network),
     }
 }
 

@@ -21,7 +21,10 @@ pub use child::{
     byte_channel,
 };
 pub use console::RecordingConsole;
-pub use interrupts::{ExternalInterruptHandler, ExternalInterruptRoutes, MAX_BLOCK_DEVICES};
+pub use interrupts::{
+    ExternalInterruptHandler, ExternalInterruptRoutes, MAX_BLOCK_DEVICES, MAX_NETWORK_INTERRUPTS,
+    wake_queue_owners,
+};
 pub use iommu::{IommuDomains, IommuEndpointStats, IommuReport, IommuStats, MAX_IOMMU_ENDPOINTS};
 pub use poll_registry::{
     PollKey, PollRegistration, PollRegistry, PollRegistryError, PollSourceKind,

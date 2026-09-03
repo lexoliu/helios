@@ -10,6 +10,9 @@ enum DebuggerError {
 
     #[error("inspector dispatch failed: {0}")]
     Dispatch(#[from] helios_inspector_protocol::DispatchError),
+
+    #[error("vsock transport failed: {0}")]
+    VsockTransport(std::io::Error),
 }
 
 #[helios_api::main]

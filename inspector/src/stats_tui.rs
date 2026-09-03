@@ -205,10 +205,12 @@ fn draw_main_panels(
     let panels = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(34),
-            Constraint::Percentage(19),
-            Constraint::Percentage(23),
             Constraint::Percentage(24),
+            Constraint::Percentage(13),
+            Constraint::Percentage(16),
+            Constraint::Percentage(16),
+            Constraint::Percentage(15),
+            Constraint::Percentage(16),
         ])
         .split(sections[0]);
 
@@ -216,6 +218,8 @@ fn draw_main_panels(
     draw_memory_panel(frame, panels[1], sample);
     draw_block_panel(frame, panels[2], sample);
     draw_iommu_panel(frame, panels[3], sample);
+    draw_host_share_panel(frame, panels[4], sample);
+    draw_network_panel(frame, panels[5], sample);
     draw_instances_panel(frame, sections[1], instances);
 }
 
@@ -493,6 +497,65 @@ fn draw_block_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::
     frame.render_widget(panel, area);
 }
 
+/// How well the in-kernel 9p client's caches are keeping the guest from
+/// re-walking the host share, or the fact that there is no share.
+fn draw_host_share_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Sample) {
+    let lines = match &sample.host_share {
+        Some(cache) => {
+            let hits =
+                cache.attribute_hits + cache.negative_hits + cache.directory_hits + cache.fid_hits;
+            let misses = cache.attribute_misses + cache.directory_misses + cache.fid_misses;
+            let lookups = hits + misses;
+            vec![
+                block_line(
+                    "hit rate",
+                    match lookups {
+                        0 => "no lookups yet".to_owned(),
+                        _ => format!(
+                            "{:.1}%  ({hits}/{lookups})",
+                            (hits as f64 * 100.0) / lookups as f64
+                        ),
+                    },
+                ),
+                block_line(
+                    "attrs",
+                    format!(
+                        "{} hit  {} miss  {} negative",
+                        cache.attribute_hits, cache.attribute_misses, cache.negative_hits
+                    ),
+                ),
+                block_line(
+                    "dirs",
+                    format!(
+                        "{} hit  {} miss",
+                        cache.directory_hits, cache.directory_misses
+                    ),
+                ),
+                block_line(
+                    "fids",
+                    format!("{} hit  {} miss", cache.fid_hits, cache.fid_misses),
+                ),
+                block_line(
+                    "dropped",
+                    format!(
+                        "{} evicted  {} invalidated",
+                        cache.evictions, cache.invalidations
+                    ),
+                ),
+            ]
+        }
+        None => vec![Line::from(Span::styled(
+            "no 9p host share",
+            Style::default().fg(Color::DarkGray),
+        ))],
+    };
+
+    let panel = Paragraph::new(Text::from(lines))
+        .block(Block::default().title("Host share").borders(Borders::ALL))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(panel, area);
+}
+
 /// What the platform's translation unit confines, or the fact that the
 /// machine has none and its devices reach all of memory.
 fn draw_iommu_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Sample) {
@@ -532,6 +595,63 @@ fn draw_iommu_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::
 
     let panel = Paragraph::new(Text::from(lines))
         .block(Block::default().title("IOMMU").borders(Borders::ALL))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(panel, area);
+}
+
+/// Whether the interface's work is actually spread across processors.
+///
+/// One line per shard, which is one per processor. A device that steers
+/// by flow hash raises each queue pair's interrupt on the processor that
+/// drains it, so the frame and interrupt counts spread down the column;
+/// a device that cannot steer leaves everything on shard 0, which is
+/// what the summary line names.
+fn draw_network_panel(frame: &mut ratatui::Frame<'_>, area: Rect, sample: &stats::Sample) {
+    let lines = match &sample.network {
+        Some(network) if !network.queues.is_empty() => {
+            let rx: u64 = network.queues.iter().map(|queue| queue.rx_frames).sum();
+            let interrupts: u64 = network.queues.iter().map(|queue| queue.interrupts).sum();
+            let busiest = network
+                .queues
+                .iter()
+                .max_by_key(|queue| queue.rx_frames)
+                .map_or(0, |queue| queue.rx_frames);
+            let mut lines = vec![block_line(
+                "spread",
+                match rx {
+                    0 => "no frames yet".to_owned(),
+                    _ => format!(
+                        "{:.0}% on the busiest of {} shards",
+                        (busiest as f64 * 100.0) / rx as f64,
+                        network.queues.len()
+                    ),
+                },
+            )];
+            if interrupts == 0 {
+                lines.push(block_line("irqs", "one shared line".to_owned()));
+            }
+            lines.extend(network.queues.iter().map(|queue| {
+                Line::from(vec![
+                    Span::styled(
+                        format!("cpu{:<6}", queue.id),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::raw(format!(
+                        "{} rx  {} tx  {} irq",
+                        queue.rx_frames, queue.tx_frames, queue.interrupts
+                    )),
+                ])
+            }));
+            lines
+        }
+        Some(_) | None => vec![Line::from(Span::styled(
+            "no network device",
+            Style::default().fg(Color::DarkGray),
+        ))],
+    };
+
+    let panel = Paragraph::new(Text::from(lines))
+        .block(Block::default().title("Network").borders(Borders::ALL))
         .wrap(Wrap { trim: true });
     frame.render_widget(panel, area);
 }

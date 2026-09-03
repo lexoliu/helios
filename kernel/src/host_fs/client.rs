@@ -38,15 +38,17 @@ use alloc::vec::Vec;
 use bytes::BytesMut;
 use core::future::Future;
 use core::sync::atomic::{AtomicU64, Ordering};
+use helios_hal::cpu::Cpu;
 use helios_hal::io::IoError;
 use objectpool::{Pool, ReusableObject};
 use slab::Slab;
 use spin::Mutex as SpinMutex;
 use triomphe::Arc;
 
+use super::cache::{CachedAttributes, HostFsCache, HostFsCacheStats, PooledReadFid};
 use crate::{
-    AuthorityDomain, HostDirEntry, HostFileSystem, HostFsError, HostMetadata, ObjectIdentity,
-    RawMutex,
+    AuthorityDomain, HostDirEntry, HostFileSystem, HostFsError, HostFsErrorKind, HostMetadata,
+    ObjectIdentity, RawMutex,
 };
 
 /// The msize this client asks for. The server answers with its own
@@ -294,20 +296,25 @@ impl Drop for Handle<'_> {
 }
 
 /// State every clone of a client shares.
-struct ClientInner<Transport: HostFsTransport> {
+struct ClientInner<Transport: HostFsTransport, CpuImpl: Cpu + Clone> {
     transport: Transport,
+    /// The platform clock the caches age their entries against. Time is
+    /// a hardware capability like any other here, injected by the
+    /// backend rather than read from a global.
+    cpu: CpuImpl,
     session: SessionCell,
     tags: HandleAllocator,
     fids: HandleAllocator,
+    cache: HostFsCache,
     request_buffers: Pool<BytesMut>,
     response_buffers: Pool<BytesMut>,
 }
 
-pub struct HostFsClient<Transport: HostFsTransport> {
-    inner: Arc<ClientInner<Transport>>,
+pub struct HostFsClient<Transport: HostFsTransport, CpuImpl: Cpu + Clone> {
+    inner: Arc<ClientInner<Transport, CpuImpl>>,
 }
 
-impl<Transport: HostFsTransport> Clone for HostFsClient<Transport> {
+impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> Clone for HostFsClient<Transport, CpuImpl> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -315,8 +322,8 @@ impl<Transport: HostFsTransport> Clone for HostFsClient<Transport> {
     }
 }
 
-impl<Transport: HostFsTransport> HostFsClient<Transport> {
-    pub fn new(transport: Transport) -> Self {
+impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, CpuImpl> {
+    pub fn new(transport: Transport, cpu: CpuImpl) -> Self {
         let depth = transport.pipeline_depth();
         assert!(
             depth != 0,
@@ -332,11 +339,23 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
                     "9p tag space exhausted",
                 ),
                 fids: HandleAllocator::new(depth, P9_NOFID, "fid", "9p fid space exhausted"),
+                cache: HostFsCache::new(),
                 request_buffers: Pool::bounded(depth, BytesMut::new, reset_p9_buffer),
                 response_buffers: Pool::bounded(depth, BytesMut::new, reset_p9_buffer),
                 transport,
+                cpu,
             }),
         }
+    }
+
+    /// How the session's caches have been serving the kernel.
+    pub fn cache_stats(&self) -> HostFsCacheStats {
+        self.inner.cache.stats()
+    }
+
+    /// The monotonic reading the caches age their entries against.
+    fn now_nanos(&self) -> u64 {
+        crate::monotonic_nanos(&self.inner.cpu)
     }
 
     /// The session, establishing it if this is the first use.
@@ -555,12 +574,83 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
     /// has already produced its result — so it is logged rather than
     /// returned.
     async fn clunk(&self, fid: Handle<'_>) {
-        let value = fid.value();
+        self.clunk_value(fid.retain()).await;
+    }
+
+    /// Releases a fid the client holds as a bare number rather than as a
+    /// handle.
+    ///
+    /// The read-fid pool parks fids that outlive the operation which
+    /// opened them, so their client-side number is retained past that
+    /// operation's stack frame and released here instead.
+    async fn clunk_value(&self, fid: u32) {
         if let Err(error) = self
-            .transact(P9_TCLUNK, |body| push_u32(body, value), P9_SMALL_REPLY_LEN)
+            .transact(P9_TCLUNK, |body| push_u32(body, fid), P9_SMALL_REPLY_LEN)
             .await
         {
-            tracing::warn!(fid = value, ?error, "9p clunk failed");
+            tracing::warn!(fid, ?error, "9p clunk failed");
+        }
+        self.inner.fids.release(fid);
+    }
+
+    /// A fid open for reading on `path`, from the pool where one is
+    /// parked and freshly walked and opened where none is.
+    async fn acquire_read_fid(&self, session: Session, path: &str) -> Result<u32, HostFsError> {
+        let retired = match self.inner.cache.take_read_fid(path, self.now_nanos()) {
+            PooledReadFid::Reusable(fid) => return Ok(fid),
+            PooledReadFid::Retired(fid) => Some(fid),
+            PooledReadFid::Absent => None,
+        };
+        if let Some(fid) = retired {
+            self.clunk_value(fid).await;
+        }
+        let target = self.walk(session, path).await?;
+        match self.open(target.value(), P9_DOTL_RDONLY).await {
+            Ok(()) => Ok(target.retain()),
+            Err(error) => {
+                self.clunk(target).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Parks a read fid for the next read of `path`, clunking whatever
+    /// the pool had to give up to make room for it.
+    async fn release_read_fid(&self, path: &str, fid: u32) {
+        if let Some(orphaned) = self.inner.cache.park_read_fid(path, fid, self.now_nanos()) {
+            self.clunk_value(orphaned).await;
+        }
+    }
+
+    /// Forgets what the caches knew about a file whose contents or
+    /// attributes the kernel just changed.
+    async fn invalidate_contents(&self, path: &str) {
+        if let Some(orphaned) = self.inner.cache.invalidate_contents(path) {
+            self.clunk_value(orphaned).await;
+        }
+    }
+
+    /// Forgets what the caches knew about a name the kernel just
+    /// created, removed, moved or linked, and about its directory.
+    async fn invalidate_entry(&self, path: &str) {
+        if let Some(orphaned) = self.inner.cache.invalidate_entry(path) {
+            self.clunk_value(orphaned).await;
+        }
+    }
+
+    /// Remembers what the host answered about `path`, including that it
+    /// answered "no such path".
+    fn record_stat(&self, path: &str, result: &Result<HostMetadata, HostFsError>) {
+        let now_nanos = self.now_nanos();
+        match result {
+            Ok(metadata) => self
+                .inner
+                .cache
+                .insert_attributes(path, metadata, now_nanos),
+            Err(error) if error.kind() == HostFsErrorKind::NoEntry => {
+                self.inner.cache.insert_missing(path, now_nanos);
+            }
+            Err(_) => {}
         }
     }
 
@@ -623,14 +713,19 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
         append_read_payload(&response, output)
     }
 
+    /// Reads `fid` — already open for reading — from the start.
+    ///
+    /// `expected_size` plans the reads and sizes the buffer; it is what
+    /// the host last said, which a host-side truncation may already have
+    /// outlived. A zero-length `Rread` is therefore end of file rather
+    /// than a protocol fault, and the caller gets the bytes that were
+    /// actually there.
     async fn read_file_all(
         &self,
         session: Session,
         fid: u32,
         expected_size: u64,
     ) -> Result<Vec<u8>, HostFsError> {
-        self.open(fid, P9_DOTL_RDONLY).await?;
-
         let chunk = session.payload_chunk();
         let expected_size = usize::try_from(expected_size)
             .map_err(|_| HostFsError::Protocol("file size overflowed usize"))?;
@@ -645,7 +740,12 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
                 .read_chunk_into(session, fid, offset, request_count, &mut bytes)
                 .await?;
             if read == 0 {
-                return Err(HostFsError::Protocol("short 9p read"));
+                tracing::debug!(
+                    read_bytes = bytes.len(),
+                    expected_size,
+                    "the host share reached end of file before the size it reported"
+                );
+                break;
             }
             offset = offset
                 .checked_add(u64::try_from(read).expect("chunk length overflowed u64"))
@@ -760,34 +860,73 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
     }
 
     async fn stat_path_impl(&self, path: &str) -> Result<HostMetadata, HostFsError> {
+        match self.inner.cache.attributes(path, self.now_nanos()) {
+            CachedAttributes::Present(metadata) => return Ok(metadata),
+            CachedAttributes::Absent => return Err(HostFsError::Transport(IoError::NotFound)),
+            CachedAttributes::Unknown => {}
+        }
         let session = self.session().await?;
-        let target = self.walk(session, path).await?;
-        let metadata = self.get_attr(target.value()).await;
-        self.clunk(target).await;
+        let target = self.walk(session, path).await;
+        let metadata = match target {
+            Ok(target) => {
+                let metadata = self.get_attr(target.value()).await;
+                self.clunk(target).await;
+                metadata
+            }
+            Err(error) => Err(error),
+        };
+        self.record_stat(path, &metadata);
         metadata
     }
 
     async fn read_dir_impl(&self, path: &str) -> Result<Vec<HostDirEntry>, HostFsError> {
+        if let Some(entries) = self.inner.cache.directory(path, self.now_nanos()) {
+            return Ok(entries);
+        }
         let session = self.session().await?;
         let target = self.walk(session, path).await?;
         let entries = self.read_dir_entries(session, target.value()).await;
         self.clunk(target).await;
+        if let Ok(entries) = &entries {
+            self.inner
+                .cache
+                .insert_directory(path, entries, self.now_nanos());
+        }
         entries
     }
 
     async fn read_file_impl(&self, path: &str) -> Result<Vec<u8>, HostFsError> {
         let session = self.session().await?;
-        let target = self.walk(session, path).await?;
+        let cached_size = match self.inner.cache.attributes(path, self.now_nanos()) {
+            CachedAttributes::Present(metadata) => Some(metadata.size),
+            CachedAttributes::Absent => return Err(HostFsError::Transport(IoError::NotFound)),
+            CachedAttributes::Unknown => None,
+        };
+        let fid = match self.acquire_read_fid(session, path).await {
+            Ok(fid) => fid,
+            Err(error) => {
+                self.record_stat(path, &Err(error.clone()));
+                tracing::warn!("host-fs read_file({path}) failed: {error:?}");
+                return Err(error);
+            }
+        };
         let data = async {
-            let metadata = self.get_attr(target.value()).await?;
-            self.read_file_all(session, target.value(), metadata.size)
-                .await
+            let size = match cached_size {
+                Some(size) => size,
+                None => {
+                    let metadata = self.get_attr(fid).await?;
+                    let size = metadata.size;
+                    self.record_stat(path, &Ok(metadata));
+                    size
+                }
+            };
+            self.read_file_all(session, fid, size).await
         }
         .await;
         if let Err(error) = &data {
             tracing::warn!("host-fs read_file({path}) failed: {error:?}");
         }
-        self.clunk(target).await;
+        self.release_read_fid(path, fid).await;
         data
     }
 
@@ -798,24 +937,19 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
         max_bytes: u32,
     ) -> Result<Vec<u8>, HostFsError> {
         let session = self.session().await?;
-        let target = self.walk(session, path).await?;
-        let data = async {
-            self.open(target.value(), P9_DOTL_RDONLY).await?;
-            // The reply has to fit in one message, so a caller asking
-            // for more than that gets a short read rather than a
-            // request the server would have to truncate.
-            let max_bytes = max_bytes
-                .min(u32::try_from(session.payload_chunk()).expect("a payload chunk fits in u32"));
-            self.read_chunk(session, target.value(), offset, max_bytes)
-                .await
-        }
-        .await;
+        let fid = self.acquire_read_fid(session, path).await?;
+        // The reply has to fit in one message, so a caller asking for
+        // more than that gets a short read rather than a request the
+        // server would have to truncate.
+        let bounded = max_bytes
+            .min(u32::try_from(session.payload_chunk()).expect("a payload chunk fits in u32"));
+        let data = self.read_chunk(session, fid, offset, bounded).await;
         if let Err(error) = &data {
             tracing::warn!(
                 "host-fs read_file_range(path={path}, offset={offset}, max_bytes={max_bytes}) failed: {error:?}"
             );
         }
-        self.clunk(target).await;
+        self.release_read_fid(path, fid).await;
         data
     }
 
@@ -838,6 +972,7 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
             .await
             .map(|_| ());
         self.clunk(directory).await;
+        self.invalidate_entry(path).await;
         result
     }
 
@@ -861,6 +996,7 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
             .await
             .map(|_| ());
         self.clunk(directory).await;
+        self.invalidate_entry(path).await;
         result
     }
 
@@ -892,6 +1028,7 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
             .await
             .map(|_| ());
         self.clunk(file).await;
+        self.invalidate_contents(path).await;
         result
     }
 
@@ -931,6 +1068,7 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
             .await
             .map(|_| ());
         self.clunk(file).await;
+        self.invalidate_contents(path).await;
         result
     }
 
@@ -949,6 +1087,7 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
         }
         .await;
         self.clunk(file).await;
+        self.invalidate_contents(path).await;
         result
     }
 
@@ -971,6 +1110,7 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
         }
         .await;
         self.clunk(file).await;
+        self.invalidate_contents(path).await;
         result
     }
 
@@ -1017,6 +1157,7 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
             .await
             .map(|_| ());
         self.clunk(dir).await;
+        self.invalidate_entry(path).await;
         result
     }
 
@@ -1049,6 +1190,8 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
             .map(|_| ());
         self.clunk(destination_dir).await;
         self.clunk(source_dir).await;
+        self.invalidate_entry(source).await;
+        self.invalidate_entry(destination).await;
         result
     }
 
@@ -1079,6 +1222,11 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
             .map(|_| ());
         self.clunk(destination_dir).await;
         self.clunk(source_file).await;
+        // The new name is a new directory entry; the old one keeps its
+        // contents but gains a link, which its cached attributes no
+        // longer report.
+        self.invalidate_entry(destination).await;
+        self.invalidate_contents(source).await;
         result
     }
 
@@ -1101,6 +1249,7 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
             .await
             .map(|_| ());
         self.clunk(directory).await;
+        self.invalidate_entry(link_path).await;
         result
     }
 
@@ -1120,7 +1269,13 @@ impl<Transport: HostFsTransport> HostFsClient<Transport> {
     }
 }
 
-impl<Transport: HostFsTransport> HostFileSystem for HostFsClient<Transport> {
+impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFileSystem
+    for HostFsClient<Transport, CpuImpl>
+{
+    fn cache_stats(&self) -> Option<HostFsCacheStats> {
+        Some(self.cache_stats())
+    }
+
     fn stat_path<'a>(
         &'a self,
         path: &'a str,
@@ -1422,6 +1577,7 @@ fn append_read_payload(response: &[u8], output: &mut Vec<u8>) -> Result<usize, H
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ManualClockCpu;
     use futures_lite::future::{block_on, zip};
 
     #[test]
@@ -1569,10 +1725,30 @@ mod tests {
     struct ServerLog {
         versions: usize,
         attaches: usize,
+        walks: usize,
+        opens: usize,
+        getattrs: usize,
+        readdirs: usize,
         outstanding: Vec<u16>,
         peak_outstanding: usize,
         read_counts: Vec<u32>,
         clunked: Vec<u32>,
+    }
+
+    impl ServerLog {
+        /// Counts one arriving request by its message type.
+        fn record(&mut self, ty: u8) {
+            let counter = match ty {
+                P9_TVERSION => &mut self.versions,
+                P9_TATTACH => &mut self.attaches,
+                P9_TWALK => &mut self.walks,
+                P9_TLOPEN => &mut self.opens,
+                P9_TGETATTR => &mut self.getattrs,
+                P9_TREADDIR => &mut self.readdirs,
+                _ => return,
+            };
+            *counter += 1;
+        }
     }
 
     /// An in-memory 9p server reachable through the [`HostFsTransport`]
@@ -1621,6 +1797,10 @@ mod tests {
                 );
                 log.outstanding.push(tag);
                 log.peak_outstanding = log.peak_outstanding.max(log.outstanding.len());
+                // Counted where the request arrives rather than where it
+                // is answered, so a request the fault injector refuses
+                // still shows up as one the client chose to send.
+                log.record(ty);
             }
 
             let reply_tag = if self.inner.fault.corrupt_tag {
@@ -1637,16 +1817,12 @@ mod tests {
 
             match ty {
                 P9_TVERSION => {
-                    self.log().versions += 1;
                     let requested = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
                     reply.extend_from_slice(&requested.min(self.inner.msize).to_le_bytes());
                     reply.extend_from_slice(&(P9_VERSION.len() as u16).to_le_bytes());
                     reply.extend_from_slice(P9_VERSION.as_bytes());
                 }
-                P9_TATTACH => {
-                    self.log().attaches += 1;
-                    reply.extend_from_slice(&qid(P9_QTDIR, 1));
-                }
+                P9_TATTACH => reply.extend_from_slice(&qid(P9_QTDIR, 1)),
                 P9_TWALK => {
                     let names = u16::from_le_bytes([body[8], body[9]]);
                     reply.extend_from_slice(&names.to_le_bytes());
@@ -1658,7 +1834,9 @@ mod tests {
                     reply.extend_from_slice(&qid(0, 2));
                     reply.extend_from_slice(&0_u32.to_le_bytes());
                 }
-                P9_TGETATTR => reply.extend_from_slice(&rgetattr_body(FILE_CONTENT_LEN as u64)),
+                P9_TGETATTR => {
+                    reply.extend_from_slice(&rgetattr_body(FILE_CONTENT_LEN as u64));
+                }
                 P9_TREAD => {
                     let offset = u64::from_le_bytes([
                         body[4], body[5], body[6], body[7], body[8], body[9], body[10], body[11],
@@ -1749,8 +1927,25 @@ mod tests {
         reply[P9_HEADER_LEN..].to_vec()
     }
 
-    fn client(msize: u32, fault: FakeFault) -> HostFsClient<FakeTransport> {
-        HostFsClient::new(FakeTransport::new(msize, fault))
+    /// A client, its fake server and the clock its caches age against.
+    struct Fixture {
+        client: HostFsClient<FakeTransport, ManualClockCpu>,
+        transport: FakeTransport,
+        clock: ManualClockCpu,
+    }
+
+    fn client(msize: u32, fault: FakeFault) -> HostFsClient<FakeTransport, ManualClockCpu> {
+        fixture(msize, fault).client
+    }
+
+    fn fixture(msize: u32, fault: FakeFault) -> Fixture {
+        let transport = FakeTransport::new(msize, fault);
+        let clock = ManualClockCpu::new();
+        Fixture {
+            client: HostFsClient::new(transport.clone(), clock.clone()),
+            transport,
+            clock,
+        }
     }
 
     #[test]
@@ -1810,7 +2005,11 @@ mod tests {
             0,
             "every tag is returned once its reply is parsed"
         );
-        assert_eq!(client.inner.fids.live_count(), 1);
+        assert_eq!(
+            client.inner.fids.live_count(),
+            2,
+            "the session root fid, plus the read fid the pool parked for the range read"
+        );
     }
 
     #[test]
@@ -1889,6 +2088,217 @@ mod tests {
             counts.first().copied(),
             Some(chunk),
             "a read that could fill a message asks for a whole message"
+        );
+    }
+
+    #[test]
+    fn a_repeated_stat_asks_the_host_once_inside_the_ttl() {
+        let Fixture {
+            client,
+            transport,
+            clock,
+        } = fixture(P9_REQUESTED_MSIZE, FakeFault::default());
+
+        block_on(async {
+            client.stat_path_impl("/alpha").await.expect("first stat");
+            clock.advance(super::super::cache::CACHE_TTL_NANOS - 1);
+            client.stat_path_impl("/alpha").await.expect("cached stat");
+        });
+        assert_eq!(
+            transport.log().getattrs,
+            1,
+            "the second stat is inside the TTL, so it never reaches the host"
+        );
+
+        block_on(async {
+            clock.advance(1);
+            client.stat_path_impl("/alpha").await.expect("expired stat");
+        });
+        assert_eq!(
+            transport.log().getattrs,
+            2,
+            "past the TTL the host is asked again"
+        );
+        assert_eq!(client.cache_stats().attribute_hits, 1);
+        assert_eq!(client.cache_stats().attribute_misses, 2);
+    }
+
+    #[test]
+    fn a_path_the_host_does_not_have_is_remembered_as_missing() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(
+            P9_REQUESTED_MSIZE,
+            FakeFault {
+                fail_type: Some(P9_TWALK),
+                ..FakeFault::default()
+            },
+        );
+
+        block_on(async {
+            client
+                .stat_path_impl("/missing")
+                .await
+                .expect_err("the host has no such path");
+            client
+                .stat_path_impl("/missing")
+                .await
+                .expect_err("and still has none");
+        });
+
+        assert_eq!(
+            transport.log().walks,
+            1,
+            "the negative entry answers the second stat without a walk"
+        );
+        assert_eq!(client.cache_stats().negative_hits, 1);
+    }
+
+    #[test]
+    fn reading_one_file_twice_reuses_its_fid() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(P9_REQUESTED_MSIZE, FakeFault::default());
+
+        block_on(async {
+            let first = client.read_file_impl("/alpha").await.expect("first read");
+            let second = client.read_file_impl("/alpha").await.expect("second read");
+            assert_eq!(first.len(), FILE_CONTENT_LEN);
+            assert_eq!(second, first);
+        });
+
+        let log = transport.log();
+        assert_eq!(log.walks, 1, "the second read reuses the parked fid");
+        assert_eq!(log.opens, 1, "a parked fid is already open");
+        assert!(
+            log.clunked.is_empty(),
+            "the fid stays parked for the next read instead of being clunked"
+        );
+        drop(log);
+        assert_eq!(client.cache_stats().fid_hits, 1);
+        assert_eq!(client.cache_stats().fid_misses, 1);
+    }
+
+    #[test]
+    fn a_parked_fid_past_its_ttl_is_clunked_before_a_fresh_one_is_opened() {
+        let Fixture {
+            client,
+            transport,
+            clock,
+        } = fixture(P9_REQUESTED_MSIZE, FakeFault::default());
+
+        block_on(async {
+            client.read_file_impl("/alpha").await.expect("first read");
+            clock.advance(super::super::cache::CACHE_TTL_NANOS);
+            client.read_file_impl("/alpha").await.expect("second read");
+        });
+
+        let log = transport.log();
+        assert_eq!(log.opens, 2, "the stale fid cannot be read from again");
+        assert_eq!(
+            log.clunked.len(),
+            1,
+            "the fid the pool gave up is released on the server too"
+        );
+        drop(log);
+        assert_eq!(
+            client.inner.fids.live_count(),
+            2,
+            "the session root fid, plus the fid the second read parked"
+        );
+    }
+
+    #[test]
+    fn a_directory_listing_is_served_from_the_cache() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(P9_REQUESTED_MSIZE, FakeFault::default());
+
+        block_on(async {
+            client.read_dir_impl("/alpha").await.expect("first listing");
+            client
+                .read_dir_impl("/alpha")
+                .await
+                .expect("cached listing");
+        });
+
+        assert_eq!(transport.log().readdirs, 1);
+        assert_eq!(client.cache_stats().directory_hits, 1);
+    }
+
+    #[test]
+    fn creating_a_file_invalidates_the_parent_listing() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(P9_REQUESTED_MSIZE, FakeFault::default());
+
+        block_on(async {
+            client.read_dir_impl("/alpha").await.expect("first listing");
+            client
+                .create_file_impl("/alpha/beta")
+                .await
+                .expect("create the file");
+            client.read_dir_impl("/alpha").await.expect("fresh listing");
+        });
+
+        assert_eq!(
+            transport.log().readdirs,
+            2,
+            "the new name means the cached listing no longer describes the directory"
+        );
+    }
+
+    #[test]
+    fn writing_a_file_invalidates_its_cached_attributes() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(P9_REQUESTED_MSIZE, FakeFault::default());
+
+        block_on(async {
+            client.stat_path_impl("/alpha/beta").await.expect("stat");
+            client
+                .write_file_impl("/alpha/beta", 0, b"payload")
+                .await
+                .expect("write");
+            client.stat_path_impl("/alpha/beta").await.expect("restat");
+        });
+
+        assert_eq!(
+            transport.log().getattrs,
+            2,
+            "the write changed the size the cached attributes reported"
+        );
+    }
+
+    #[test]
+    fn removing_a_file_clunks_the_fid_the_pool_parked_for_it() {
+        let Fixture {
+            client, transport, ..
+        } = fixture(P9_REQUESTED_MSIZE, FakeFault::default());
+
+        let parked = block_on(async {
+            client.read_file_impl("/alpha/beta").await.expect("read");
+            let parked = client.inner.fids.live_count();
+            client
+                .remove_impl("/alpha/beta", false)
+                .await
+                .expect("remove");
+            parked
+        });
+
+        assert_eq!(
+            parked, 2,
+            "the read parked a fid alongside the session root"
+        );
+        assert_eq!(
+            client.inner.fids.live_count(),
+            1,
+            "removing the path releases the fid the pool held open on it"
+        );
+        assert_eq!(
+            transport.log().clunked.len(),
+            2,
+            "the write-side fid and the parked read fid are both released"
         );
     }
 

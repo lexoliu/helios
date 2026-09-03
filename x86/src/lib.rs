@@ -14,6 +14,7 @@ mod net;
 mod pci;
 mod rtc;
 mod smp;
+mod vsock;
 mod watchdog;
 
 mod debug_state {
@@ -206,6 +207,7 @@ fn x86_kernel_main() -> ! {
     let host_share_function = host_fs::discover(&pci);
     let entropy_function = entropy::discover(&pci);
     let balloon_function = balloon::discover(&pci);
+    let vsock_function = vsock::discover(&pci);
     let block_functions = block::discover(&pci);
     let mut devices = DeviceInventory::new().with_debug_serial();
     if network_function.is_some() {
@@ -219,6 +221,9 @@ fn x86_kernel_main() -> ! {
     }
     if balloon_function.is_some() {
         devices = devices.with_memory_balloon();
+    }
+    if vsock_function.is_some() {
+        devices = devices.with_vsock();
     }
     if !block_functions.is_empty() {
         devices = devices.with_block_devices(block_functions.len());
@@ -268,6 +273,7 @@ fn x86_kernel_main() -> ! {
         host_share_function,
         entropy_function,
         balloon_function,
+        vsock_function,
         &block_functions,
         &debug_state,
         root_entropy,
@@ -313,6 +319,7 @@ fn install_pci_devices<WatchdogImpl>(
     host_share_function: Option<pci_types::PciAddress>,
     entropy_function: Option<pci_types::PciAddress>,
     balloon_function: Option<pci_types::PciAddress>,
+    vsock_function: Option<pci_types::PciAddress>,
     block_functions: &[pci_types::PciAddress],
     debug_state: &debug_state::RuntimeState,
     root_entropy: helios_kernel::RootEntropyHandle,
@@ -353,6 +360,7 @@ fn install_pci_devices<WatchdogImpl>(
     };
     if let Some(address) = host_share_function {
         let transport = host_fs::install(
+            cpu,
             pci,
             address,
             dma_pool(address),
@@ -365,7 +373,7 @@ fn install_pci_devices<WatchdogImpl>(
         tracing::warn!("virtio 9p device was not discovered on the PCI bus");
     }
     if let Some(address) = network_function {
-        let device = net::install(
+        let interrupts = net::install(
             cpu,
             kernel,
             pci,
@@ -375,7 +383,13 @@ fn install_pci_devices<WatchdogImpl>(
             destination_apic_id,
             debug_state,
         );
-        routes.set_network(exceptions::NETWORK_INTERRUPT_VECTOR, device);
+        for (vector, handler) in interrupts.queues {
+            routes.add_network(vector, handler);
+        }
+        routes.add_network(
+            exceptions::NETWORK_INTERRUPT_VECTOR,
+            interrupts.configuration,
+        );
     } else {
         tracing::warn!("virtio network device was not discovered on the PCI bus");
     }
@@ -392,6 +406,21 @@ fn install_pci_devices<WatchdogImpl>(
         routes.set_entropy(exceptions::ENTROPY_INTERRUPT_VECTOR, device);
     } else {
         tracing::warn!("virtio entropy device was not discovered on the PCI bus");
+    }
+    if let Some(address) = vsock_function {
+        let device = vsock::install(
+            cpu,
+            kernel,
+            pci,
+            address,
+            physical_memory_offset,
+            exceptions::VSOCK_INTERRUPT_VECTOR,
+            destination_apic_id,
+            debug_state,
+        );
+        routes.set_vsock(exceptions::VSOCK_INTERRUPT_VECTOR, device);
+    } else {
+        tracing::warn!("virtio vsock device was not discovered on the PCI bus");
     }
     if let Some(address) = balloon_function {
         let (handler, handle) = balloon::install(
@@ -773,6 +802,17 @@ impl X86Cpu {
 
     /// Local-APIC id of the bootstrap processor: the destination every
     /// device MSI-X message is addressed to.
+    /// The local APIC an MSI-X message for `processor` must target.
+    ///
+    /// Falls back to the bootstrap processor's APIC for a slot ACPI did
+    /// not describe, so a vector is never programmed with a destination
+    /// no processor answers.
+    pub(crate) fn apic_id_of_processor(&self, processor: helios_hal::cpu::ProcessorId) -> u32 {
+        self.state
+            .apic_id_of(processor)
+            .unwrap_or_else(|| self.bootstrap_apic_id())
+    }
+
     pub(crate) fn bootstrap_apic_id(&self) -> u32 {
         let bootstrap = self.state.bootstrap_processor();
         self.state

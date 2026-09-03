@@ -274,13 +274,27 @@ HVF on macOS, KVM where `/dev/kvm` is available, otherwise TCG, and a TCG
 guest additionally receives generous systemd unit, device, and udev event
 timeouts through cloud-init because every guest instruction is translated.
 
-Fedora 44's systemd occasionally fails its manager startup under TCG
-("Failed to fork off sandboxing environment for executing generators")
-and freezes before sshd comes up. The harness treats this upstream guest
-flake as retryable: a boot that does not reach SSH within its budget is
-killed, its serial log is preserved as `serial.boot-attempt-N.log`, the
-overlay disk is recreated, and the first boot is retried up to three
-times before the run fails.
+Guest RAM is populated before the guest starts
+(`memory-backend-ram,prealloc=on`). QEMU otherwise backs guest memory
+lazily, so the first store to every guest page takes a host page fault, and
+on a busy runner that fault can run direct compaction or wait for the
+hypervisor for tens of seconds. The Fedora kernel zeroes each page it
+allocates, so those host stalls showed up as `clear_page` soft lockups
+during the SELinux policy load, the BPF verifier, and the systemd
+generators; one landing inside systemd's 45 s generator alarm (Fedora
+builds systemd with `default-timeout-sec=45`) ends in "Failed to fork off
+sandboxing environment for executing generators: Protocol error" and a
+frozen PID 1. Preallocation moves that cost ahead of the first guest
+instruction, where it counts against the harness's SSH budget instead of
+the guest's own timers, and keeps first-touch faults out of the measured
+workloads.
+
+Each first-boot attempt writes its own `serial.boot-attempt-N.log` and a
+`host-memory.boot-attempt-N.json` with the host's compaction, THP, and swap
+counters sampled before and after the attempt. A boot whose console reports
+`Freezing execution.` or a kernel panic is stopped immediately rather than
+waiting out the SSH budget; the overlay disk is recreated and the first boot
+is retried up to three times before the run fails.
 
 Host-side assets are pinned: the per-architecture Fedora Cloud image is
 verified against the SHA256 published in the compose's signed `CHECKSUM` file

@@ -531,6 +531,8 @@ fn convert_sample(sample: host_stats::Sample) -> stats::Sample {
         iommu: sample.iommu.map(convert_iommu),
         balloon: sample.balloon.map(convert_memory_balloon),
         swap: sample.swap.map(convert_swap),
+        host_share: sample.host_share.map(convert_host_share_cache),
+        network: sample.network.map(convert_network),
     }
 }
 
@@ -546,11 +548,40 @@ fn convert_swap(swap: host_stats::Swap) -> stats::Swap {
     }
 }
 
+fn convert_network(network: host_stats::Network) -> stats::Network {
+    stats::Network {
+        queues: network
+            .queues
+            .into_iter()
+            .map(|queue| stats::NetworkQueue {
+                id: queue.id,
+                rx_frames: queue.rx_frames,
+                tx_frames: queue.tx_frames,
+                interrupts: queue.interrupts,
+            })
+            .collect(),
+    }
+}
+
 fn convert_memory_balloon(balloon: host_stats::MemoryBalloon) -> stats::MemoryBalloon {
     stats::MemoryBalloon {
         target_bytes: balloon.target_bytes,
         actual_bytes: balloon.actual_bytes,
         reported_bytes: balloon.reported_bytes,
+    }
+}
+
+fn convert_host_share_cache(cache: host_stats::HostShareCache) -> stats::HostShareCache {
+    stats::HostShareCache {
+        attribute_hits: cache.attribute_hits,
+        attribute_misses: cache.attribute_misses,
+        negative_hits: cache.negative_hits,
+        directory_hits: cache.directory_hits,
+        directory_misses: cache.directory_misses,
+        fid_hits: cache.fid_hits,
+        fid_misses: cache.fid_misses,
+        evictions: cache.evictions,
+        invalidations: cache.invalidations,
     }
 }
 

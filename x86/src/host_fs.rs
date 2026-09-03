@@ -23,7 +23,8 @@ use crate::pci::PciRoot;
 
 type X86Virtio9pDevice = Virtio9pDevice<VirtioPciTransport<X86DmaPool>>;
 
-pub(crate) type HostFileSystemService = helios_kernel::HostFsClient<HostFsTransportService>;
+pub(crate) type HostFileSystemService =
+    helios_kernel::HostFsClient<HostFsTransportService, crate::X86Cpu>;
 
 #[derive(Clone)]
 pub(crate) struct HostFsTransportService {
@@ -38,6 +39,7 @@ pub(crate) fn discover(pci: &PciRoot) -> Option<PciAddress> {
 /// Brings up the virtio-9p function at `address` and installs the host
 /// file system service on top of it.
 pub(crate) fn install(
+    cpu: &crate::X86Cpu,
     pci: &PciRoot,
     address: PciAddress,
     dma: X86DmaPool,
@@ -53,7 +55,7 @@ pub(crate) fn install(
     let transport = HostFsTransportService {
         device: Arc::new(device),
     };
-    debug_state.install_host_fs_service(HostFileSystemService::new(transport.clone()));
+    debug_state.install_host_fs_service(HostFileSystemService::new(transport.clone(), cpu.clone()));
     tracing::info!(
         "virtio 9p online transport=pci function={address} msix_vector={vector:#x} mount_tag={}",
         transport.device.mount_tag()

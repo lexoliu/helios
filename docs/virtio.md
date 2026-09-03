@@ -97,9 +97,9 @@ than under the VM.
 ## Devices
 
 `DeviceType` lists exactly the virtio device kinds a Helios driver
-claims: network (1), block (2), entropy (4) and 9P (9). A transport that
-reads any other device id rejects the function rather than mapping it to
-a placeholder driver.
+claims: network (1), block (2), entropy (4), 9P (9) and vsock (19). A
+transport that reads any other device id rejects the function rather than
+mapping it to a placeholder driver.
 
 Four further device kinds have been evaluated and deliberately not
 claimed — RTC (17), memory (24), file system (26) and PMEM (27).
@@ -114,6 +114,33 @@ panic path, so a virtio console could only ever be a second port on an
 already-working terminal; structured host↔guest transport belongs to
 vsock instead. The driver that used to sit in `virtio/src/console.rs` had
 no callers and was removed rather than kept as dead weight.
+
+virtio-vsock is the machine's link to whatever hosts it. The driver in
+`virtio/src/vsock.rs` drives the three queues the device defines —
+receive, transmit, and an event queue carrying
+`VIRTIO_VSOCK_EVENT_TRANSPORT_RESET` — and reads the guest's context id
+out of the configuration space. The receive ring is also its whole
+receive buffer pool: one page per descriptor, allocated at bring-up and
+reposted the moment a packet is copied out, so nothing on the receive
+path allocates. Transmit is a header-plus-payload chain through the
+shared `submit_chain`/`await_completion` pair, so several tasks transmit
+at once.
+
+Everything above the wire format is device-neutral. The AF_VSOCK value
+types and the `VsockDevice` trait live in `hal/src/vsock.rs` — vsock is a
+hypervisor transport contract that virtio is one implementation of — and
+the connection table, credit accounting and port allocation live in
+`kernel/src/vsock/`. Programs reach it through
+`helios:system/vsock@0.1.0`.
+
+Its backend is `vhost-vsock`, which QEMU implements only against the host
+kernel's `/dev/vhost-vsock`: there is no user-space vsock backend, so on
+a host without that device node — every macOS host, and any Linux host
+without the `vhost_vsock` module — no guest can have the device at all.
+`helios-inspector vm --rpc-transport vsock` therefore checks the host
+before it builds anything and refuses with an explanation rather than
+booting a guest whose device is silently absent. The default transport
+stays the serial line; see `docs/inspector-vsock.md`.
 
 virtio-net is the one device whose capabilities are decided outside the
 guest: multiqueue, segmentation offload and checksum offload are all

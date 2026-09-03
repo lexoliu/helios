@@ -6,7 +6,7 @@ autobins = false
 
 [dependencies]
 futures-io = "0.3.31"
-helios-api = { path = "../../api", default-features = false, features = ["instances", "profiling", "programs", "serial", "stats", "tracing"] }
+helios-api = { path = "../../api", default-features = false, features = ["instances", "profiling", "programs", "serial", "stats", "tracing", "vsock"] }
 helios-inspector-protocol = { path = "../../inspector-protocol", default-features = false, features = ["guest"] }
 thiserror = "2.0.17"
 
