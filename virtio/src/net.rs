@@ -79,8 +79,7 @@ const MAX_RX_REASSEMBLY_BUFFERS: usize = 64;
 const TX_CHAIN_LIMIT: u16 = 2;
 /// A control command is a read-only command buffer plus a writable ack.
 const CONTROL_CHAIN_LIMIT: u16 = 2;
-const DESCRIPTOR_BITSET_WORDS: usize =
-    (NET_QUEUE_SIZE as usize + usize::BITS as usize - 1) / usize::BITS as usize;
+const DESCRIPTOR_BITSET_WORDS: usize = (NET_QUEUE_SIZE as usize).div_ceil(usize::BITS as usize);
 const ETH_HEADER_LEN: usize = 14;
 const DEFAULT_IP_MTU: usize = 1500;
 /// VIRTIO_NET_F_CSUM: the driver may submit frames with partial
@@ -763,8 +762,22 @@ impl RxBufferSlot {
         unsafe { &*self.buffer.get() }
     }
 
-    fn buffer_mut(&self) -> &mut [u8] {
-        unsafe { &mut *self.buffer.get() }
+    /// The receive buffer as a raw slice.
+    ///
+    /// Which of the driver and the device may write to a receive
+    /// buffer is decided by the receive ring, not by the borrow
+    /// checker: a slot belongs to the driver from the moment the used
+    /// ring returns it until the driver makes it available again, and
+    /// to the device in between. The slot is shared as `Arc` for
+    /// exactly that reason, so there is never a `&mut RxBufferSlot` to
+    /// hand out and the buffer is handed over raw instead. Callers
+    /// build the mutable reference themselves and write down which
+    /// half of that alternation they are in.
+    fn buffer_ptr(&self) -> *mut [u8] {
+        // SAFETY: `UnsafeCell::get` yields a pointer to the owned
+        // `Box`, and `&raw mut` projects through it to the heap slice
+        // without ever materialising a reference to the box itself.
+        unsafe { &raw mut *(*self.buffer.get()) }
     }
 }
 
@@ -973,7 +986,10 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             let mut rx_post_position = vec![0_u64; usize::from(rx_queue_size)].into_boxed_slice();
             let mut rx_next_post_position = 0_u64;
             for (slot_index, slot) in rx_slots.iter().enumerate() {
-                let token = rx_queue.submit_output_deferred(&transport, slot.buffer_mut())?;
+                // SAFETY: bring-up owns every slot; none has been made
+                // available to the device yet.
+                let buffer = unsafe { &mut *slot.buffer_ptr() };
+                let token = rx_queue.submit_output_deferred(&transport, buffer)?;
                 rx_slot_for_token[usize::from(token)] = slot.slot;
                 rx_post_position[usize::from(token)] = rx_next_post_position;
                 rx_next_post_position += 1;
@@ -1730,7 +1746,11 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     ) -> IoResult<usize> {
         let head_slot = &self.queue_pairs[pair_idx].rx_slots[usize::from(head.slot)];
         let mut assembled = head.used_len - self.header_len;
-        target.buffer_mut()[..assembled]
+        // SAFETY: `target` was taken out of the reassembly pool's free
+        // list by this drain and is not referenced by any live frame,
+        // and the caller holds the receive state that serialises drains.
+        let assembly = unsafe { &mut *target.buffer_ptr() };
+        assembly[..assembled]
             .copy_from_slice(&head_slot.buffer()[self.header_len..head.used_len]);
         self.repost_rx_buffer_deferred(pair_idx, state, head.slot)?;
         let mut expected_position = head.position;
@@ -1754,8 +1774,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             }
             // Only the head buffer of a mergeable chain carries the
             // virtio-net header; the rest are frame bytes end to end.
-            target.buffer_mut()[assembled..assembled + used_len]
-                .copy_from_slice(&slot.buffer()[..used_len]);
+            assembly[assembled..assembled + used_len].copy_from_slice(&slot.buffer()[..used_len]);
             assembled += used_len;
             self.repost_rx_buffer_deferred(pair_idx, state, slot_index)?;
         }
@@ -2015,10 +2034,13 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             !state.rx_in_device.get(slot),
             "virtio net RX buffer was reposted while still owned by the device"
         );
-        let token = state.rx_queue.submit_output_deferred(
-            &self.transport,
-            self.queue_pairs[pair_idx].rx_slots[slot].buffer_mut(),
-        )?;
+        // SAFETY: the assertion above proves the device has returned
+        // this slot, and the caller holds the receive state, so the
+        // driver is the only writer until it is made available again.
+        let buffer = unsafe { &mut *self.queue_pairs[pair_idx].rx_slots[slot].buffer_ptr() };
+        let token = state
+            .rx_queue
+            .submit_output_deferred(&self.transport, buffer)?;
         state.rx_slot_for_token[usize::from(token)] = slot_index;
         state.rx_post_position[usize::from(token)] = state.rx_next_post_position;
         state.rx_next_post_position += 1;
@@ -2384,7 +2406,11 @@ mod tests {
                 .try_lock()
                 .expect("test receive state is uncontended");
             let slot = usize::from(state.rx_slot_for_token[usize::from(token)]);
-            let target = pair.rx_slots[slot].buffer_mut();
+            // SAFETY: this stands in for the device writing the buffer
+            // it was given, which is the one moment the driver is not
+            // touching the slot; the receive state is held for the
+            // duration.
+            let target = unsafe { &mut *pair.rx_slots[slot].buffer_ptr() };
             let header_len = self.device.header_len;
             let written = match buffer.header {
                 Some(header) => {
