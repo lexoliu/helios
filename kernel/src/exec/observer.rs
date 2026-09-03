@@ -72,6 +72,9 @@ pub struct StatsSample {
     /// The memory balloon the host resizes this guest through, absent on
     /// a machine that gave the kernel none.
     pub balloon: Option<crate::memory::BalloonStats>,
+    /// What the kernel has swapped out and what bringing it back costs,
+    /// absent on a machine that runs without swap.
+    pub swap: Option<crate::memory::SwapStats>,
     /// How the host share's 9p caches have served the kernel, absent on
     /// a machine with no host share behind a 9p session.
     pub host_share: Option<crate::HostFsCacheStats>,

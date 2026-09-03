@@ -1155,6 +1155,10 @@ impl<D: BlockDevice + 'static> SwapBackend for VirtioBlockSwapBackend<D> {
         self.release_token(token).await;
         Ok(())
     }
+
+    async fn release(&self, token: Self::Token) {
+        self.release_token(token).await;
+    }
 }
 
 impl<D: BlockDevice> VirtioBlockSwapBackend<D> {

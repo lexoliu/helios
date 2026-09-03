@@ -25,6 +25,7 @@ mod vsock;
 #[cfg(feature = "wasmtime-runtime")]
 pub(crate) mod wasmtime_adapter;
 #[cfg(feature = "wasmtime-runtime")]
+pub use wasmtime_adapter::swap_fault::resolve_swap_fault_blocking;
 pub use wasmtime_adapter::tls::WasmtimeTlsSlots;
 
 #[cfg(all(
@@ -114,13 +115,17 @@ pub use kernel_exception::{
 };
 pub use memory::{
     AccessibilityPlan, BalloonHandle, BalloonStats, CommittedRegion, ENTROPY_RESEED_INTERVAL,
-    EntropyPool, EntropySources, FREE_PAGE_REPORT_INTERVAL, HardwareEntropySource,
-    KernelPhysFrameAllocator, NoCryptographicEntropy, NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES,
-    ReservationLookup, ReservationTracker, RootEntropy, RootEntropyHandle, UserHeapStats, VaCursor,
-    allocate_user_frame_uninit_on, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
-    deallocate_user_frame, deallocate_user_frame_on, install_entropy_device,
-    install_memory_balloon, largest_servable_user_bytes, seed_root_entropy, user_heap_stats,
-    validate_range,
+    EntropyPool, EntropySources, FREE_PAGE_REPORT_INTERVAL, HardwareEntropySource, IDLE_SWAP_AFTER,
+    KernelPhysFrameAllocator, MemoryOwner, NoCryptographicEntropy, NoEntropyDevice,
+    ROOT_ENTROPY_MATERIAL_BYTES, ReleasedReservation, ReservationLookup, ReservationTracker,
+    RootEntropy, RootEntropyHandle, SWAP_BATCH_BYTES, SWAP_TICK, SwapDisabled, SwapEntry,
+    SwapFaultError, SwapHandle, SwapStats, SwapVmHooks, UserHeapStats, UserMemoryOwnerScope,
+    UserMemoryOwners, VaCursor, allocate_user_frame_uninit_on, allocate_user_frame_zeroed,
+    allocate_user_frame_zeroed_on, configure_user_memory_owner_processors,
+    current_user_memory_owner, deallocate_user_frame, deallocate_user_frame_on, disable_swap,
+    enter_user_memory_owner, install_entropy_device, install_memory_balloon, install_swap,
+    install_swap_hooks, installed_swap_handle, installed_swap_hooks, largest_servable_user_bytes,
+    seed_root_entropy, set_user_memory_owner, swapped_token, user_heap_stats, validate_range,
 };
 pub use network::{
     HTTP_FORBIDDEN_FIELD_NAMES, HTTP_MAX_FIELD_SECTION_BYTES, HTTP_MAX_FIELD_VALUE_BYTES, HttpBody,
@@ -829,6 +834,10 @@ where
         let pool = *user_pool.get_or_insert_with(|| {
             let pool = memory::install_user_memory_pool(memory::allocate_user_memory_pool());
             pool.configure_processors(processor_count);
+            // The swap policy asks which instance a committed page
+            // belongs to, and the answer is per-processor; size that
+            // table with the pool it describes.
+            memory::configure_user_memory_owner_processors(processor_count);
             pool
         });
         if let Some(user_start) = user_start {

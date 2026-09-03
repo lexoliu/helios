@@ -289,9 +289,24 @@ where
         }
     }
 
+    /// Same naming as the component path: while this processor is
+    /// running the program's guest code, pages it commits are the
+    /// program's. See `component::runtime`'s `record_transition`.
     pub(super) fn record_transition(&self, transition: crate::InstanceExecutionTransition) {
         let now_nanos = self.now_nanos();
         let elapsed = crate::record_instance_transition(&self.instance, transition, now_nanos);
+        let owner = match transition {
+            crate::InstanceExecutionTransition::Resume => {
+                Some(crate::MemoryOwner::new(self.instance.id().raw()))
+            }
+            crate::InstanceExecutionTransition::Pause if elapsed.is_some() => {
+                Some(crate::MemoryOwner::NONE)
+            }
+            crate::InstanceExecutionTransition::Pause => None,
+        };
+        if let Some(owner) = owner {
+            crate::set_user_memory_owner(self.cpu.current_processor(), owner);
+        }
         if let Some(elapsed) = elapsed
             && self.runtime_state.profiling_enabled()
         {

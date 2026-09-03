@@ -47,6 +47,12 @@ const EXCEPTION_STACK_BYTES: usize = 64 * 1024;
 /// `x0`-`x30`, `elr_el1` and `spsr_el1`, rounded up to the 16-byte stack
 /// alignment the architecture requires.
 const IRQ_FRAME_BYTES: usize = 272;
+/// Bytes the synchronous-exception entry reserves for the complete
+/// interrupted context: `x0`-`x30`, `elr_el1`, `spsr_el1`, the
+/// interrupted `SP_EL1`, `q0`-`q31`, `fpsr` and `fpcr`. The whole
+/// FP/SIMD file is saved because a fault can be redirected into kernel
+/// code that clobbers it, and the guest it interrupted must not notice.
+const SYNC_FRAME_BYTES: usize = 0x320;
 const PAGE_BYTES: usize = 4096;
 const MMIO_BLOCK_BYTES: usize = 2 * 1024 * 1024;
 const MAX_USABLE_REGION_SEGMENTS: usize = 6;
@@ -74,11 +80,50 @@ global_asm!(
     boot_stack_bytes = const KERNEL_STACK_BYTES,
     exception_stack_bytes = const EXCEPTION_STACK_BYTES,
     irq_frame_bytes = const IRQ_FRAME_BYTES,
+    sync_frame_bytes = const SYNC_FRAME_BYTES,
 );
 
 unsafe extern "C" {
     static __helios_aarch64_exception_vectors: u8;
+    static __helios_aarch64_boot_exception_stack_top: u8;
+    /// Returns to a context saved by the synchronous-exception entry,
+    /// from kernel code running on the interrupted stack.
+    ///
+    /// # Safety
+    ///
+    /// `frame` must be a [`SyncTrapFrame`] the entry wrote, sitting
+    /// exactly `SYNC_FRAME_BYTES` below the SP it recorded, and the
+    /// caller must be running on that same stack. Diverges.
+    fn __helios_aarch64_swap_fault_resume(frame: *mut SyncTrapFrame) -> !;
 }
+
+/// The interrupted context a synchronous exception saved.
+///
+/// Layout is pinned by `entry.S`; the assertions below keep the two from
+/// drifting apart.
+#[repr(C, align(16))]
+struct SyncTrapFrame {
+    /// `x0`-`x30`.
+    x: [u64; 31],
+    elr: u64,
+    spsr: u64,
+    /// The `SP_EL1` the interrupted context was running on.
+    sp: u64,
+    /// `q0`-`q31`.
+    v: [u128; 32],
+    fpsr: u64,
+    fpcr: u64,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<SyncTrapFrame>() == SYNC_FRAME_BYTES);
+    assert!(core::mem::offset_of!(SyncTrapFrame, elr) == 0xf8);
+    assert!(core::mem::offset_of!(SyncTrapFrame, spsr) == 0x100);
+    assert!(core::mem::offset_of!(SyncTrapFrame, sp) == 0x108);
+    assert!(core::mem::offset_of!(SyncTrapFrame, v) == 0x110);
+    assert!(core::mem::offset_of!(SyncTrapFrame, fpsr) == 0x310);
+    assert!(core::mem::offset_of!(SyncTrapFrame, fpcr) == 0x318);
+};
 
 mod vmm;
 pub use vmm::Aarch64UserAddressSpace;
@@ -1046,6 +1091,19 @@ fn prepare_current_processor() {
 }
 
 fn install_exception_vectors() {
+    // Both exception entries switch to SP_EL0, so it has to hold a
+    // usable stack from the moment the vectors are live. Until this
+    // processor's runtime is activated that is the boot exception
+    // stack; `activate_processor_runtime` then swaps in the
+    // per-processor one. A processor that faults before activation is
+    // on a fatal path anyway, and sharing one stack there is what the
+    // previous entry did too.
+    if read_processor_runtime() == 0 {
+        let boot_stack_top = &raw const __helios_aarch64_boot_exception_stack_top as usize;
+        unsafe {
+            asm!("msr sp_el0, {top}", top = in(reg) boot_stack_top, options(nomem, nostack, preserves_flags));
+        }
+    }
     let vectors = &raw const __helios_aarch64_exception_vectors as usize;
     unsafe {
         asm!("msr vbar_el1, {vectors}", vectors = in(reg) vectors, options(nomem, nostack, preserves_flags));
@@ -1053,13 +1111,16 @@ fn install_exception_vectors() {
     }
 }
 
+/// Instruction- and data-abort fault status codes for an access-flag
+/// fault at translation levels 1 through 3.
+const ACCESS_FLAG_FAULT_STATUS: core::ops::RangeInclusive<usize> = 0b001001..=0b001011;
+
 #[unsafe(no_mangle)]
 extern "C" fn aarch64_handle_sync_exception(
     esr_el1: usize,
-    elr_el1: usize,
-    frame_pointer: usize,
     far_el1: usize,
-) -> ! {
+    frame: *mut SyncTrapFrame,
+) {
     let exception_class = (esr_el1 >> 26) & 0x3f;
     let (cause, faulting_address) = match exception_class {
         0b100000 | 0b100001 => (KernelExceptionCause::InstructionFault, Some(far_el1)),
@@ -1069,28 +1130,133 @@ extern "C" fn aarch64_handle_sync_exception(
         _ => (KernelExceptionCause::IllegalInstruction, None),
     };
 
-    let runtime = read_processor_runtime();
-    if runtime != 0 {
-        let handler = unsafe {
-            (*(runtime as *const ProcessorRuntime))
-                .native_trap_handler
-                .load(Ordering::Acquire)
-        };
-        if handler != 0 {
-            let handler: KernelNativeTrapHandler = unsafe { core::mem::transmute(handler) };
-            let exception = KernelException {
-                cause,
-                instruction_pointer: elr_el1,
-                frame_pointer,
-                faulting_address,
-            };
-            let _ = exception.dispatch_to(handler);
+    if faulting_address.is_some() {
+        // The swap policy's aging pass clears access flags to measure
+        // which pages are still being used. This machine may not set
+        // them again in hardware, so the fault is how a page reports
+        // that it was touched: set the bit and retry the instruction.
+        if ACCESS_FLAG_FAULT_STATUS.contains(&(esr_el1 & 0x3f))
+            && vmm::resolve_access_flag_fault(far_el1)
+        {
+            return;
+        }
+        // A swapped-out page is ours to resolve, and resolving it means
+        // waiting for the swap device. Redirect the faulting context
+        // onto a kernel trampoline running on its own stack, which can
+        // block the fiber the way a host call does; everything else —
+        // guard pages included — still belongs to the runtime.
+        if helios_kernel::swapped_token(helios_hal::vmm::VirtAddr::new(far_el1)).is_some() {
+            // SAFETY: `frame` is the frame the entry above wrote, and
+            // `enter_swap_fault_trampoline` only rewrites fields in it.
+            unsafe {
+                enter_swap_fault_trampoline(frame, far_el1);
+            }
+            return;
         }
     }
+
+    // SAFETY: the entry wrote a complete frame at this address.
+    let (elr_el1, frame_pointer) = unsafe { ((*frame).elr as usize, (*frame).x[29] as usize) };
+    dispatch_to_native_trap_handler(KernelException {
+        cause,
+        instruction_pointer: elr_el1,
+        frame_pointer,
+        faulting_address,
+    });
 
     panic!(
         "unhandled AArch64 synchronous exception ec={exception_class:#x} esr={esr_el1:#x} elr={elr_el1:#x} far={far_el1:#x}"
     )
+}
+
+/// Hands an exception to the runtime's own trap handler. Returns only
+/// when the runtime did not claim it; when it does claim it, the handler
+/// jumps out of this stack and never comes back.
+fn dispatch_to_native_trap_handler(exception: KernelException) {
+    let runtime = read_processor_runtime();
+    if runtime == 0 {
+        return;
+    }
+    let handler = unsafe {
+        (*(runtime as *const ProcessorRuntime))
+            .native_trap_handler
+            .load(Ordering::Acquire)
+    };
+    if handler == 0 {
+        return;
+    }
+    let handler: KernelNativeTrapHandler = unsafe { core::mem::transmute(handler) };
+    let _ = exception.dispatch_to(handler);
+}
+
+/// Rewrites a saved context so the exception epilogue returns into
+/// [`swap_fault_trampoline`] on the faulting stack instead of retrying
+/// the faulting instruction.
+///
+/// A copy of the context goes one frame below the interrupted SP —
+/// AAPCS64 has no red zone, so that space is free — and the trampoline
+/// gets its address. `SPSR` is left alone, so the trampoline runs with
+/// the interrupt mask the faulting context had.
+///
+/// # Safety
+///
+/// `frame` must be the frame the synchronous-exception entry wrote, and
+/// the SP it recorded must be a live stack with a frame's worth of room
+/// below it.
+unsafe fn enter_swap_fault_trampoline(frame: *mut SyncTrapFrame, faulting_address: usize) {
+    let interrupted_sp = unsafe { (*frame).sp } as usize;
+    assert!(
+        interrupted_sp.is_multiple_of(16),
+        "AArch64 fault took a context whose SP {interrupted_sp:#x} is not 16-byte aligned"
+    );
+    let landing = interrupted_sp - SYNC_FRAME_BYTES;
+    unsafe {
+        core::ptr::copy_nonoverlapping(frame, landing as *mut SyncTrapFrame, 1);
+        (*frame).x[0] = landing as u64;
+        (*frame).x[1] = faulting_address as u64;
+        (*frame).elr = swap_fault_trampoline as *const () as usize as u64;
+        (*frame).sp = landing as u64;
+    }
+}
+
+/// Resolves a swapped-out page from the faulting context's own stack.
+///
+/// This runs in the fiber the fault interrupted, so it may block that
+/// fiber exactly as an async host call does: the executor keeps running,
+/// the swap task performs the read, and the fiber is resumed here. On
+/// success the saved context is restored and the faulting instruction
+/// runs again, having observed nothing.
+///
+/// A fault the kernel cannot resolve — no fiber to block (kernel code
+/// touched user memory without pre-faulting it), the fiber cancelled
+/// mid-wait, or the swap device refusing the read — is handed to the
+/// runtime's trap handler, which unwinds the guest. Only a fault the
+/// runtime does not claim either is fatal.
+extern "C" fn swap_fault_trampoline(frame: *mut SyncTrapFrame, faulting_address: usize) -> ! {
+    let outcome = helios_kernel::resolve_swap_fault_blocking(helios_hal::vmm::VirtAddr::new(
+        faulting_address,
+    ));
+    if outcome.is_ok() {
+        // SAFETY: `frame` is the copy `enter_swap_fault_trampoline` put
+        // one frame below this stack's interrupted SP, and this code is
+        // running on that stack.
+        unsafe { __helios_aarch64_swap_fault_resume(frame) }
+    }
+    // SAFETY: the frame is intact; only its saved registers are read.
+    let (elr_el1, frame_pointer) = unsafe { ((*frame).elr as usize, (*frame).x[29] as usize) };
+    tracing::error!(
+        target: "helios_aarch64::swap",
+        addr = faulting_address,
+        error = ?outcome.err(),
+        "page fault on a swapped-out page could not be resolved"
+    );
+    dispatch_to_native_trap_handler(KernelException {
+        cause: KernelExceptionCause::DataFault,
+        instruction_pointer: elr_el1,
+        frame_pointer,
+        faulting_address: Some(faulting_address),
+    });
+    panic!("unresolvable swap fault at {faulting_address:#x} that the runtime did not claim either")
 }
 
 /// IRQ entry point for every exception level slot, called from

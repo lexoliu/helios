@@ -128,6 +128,12 @@ struct InstanceEntry {
     active_nanos: AtomicU64,
     active_depth: AtomicU32,
     last_resume_at: AtomicU64,
+    /// When this instance was last on a processor. Set on every pause,
+    /// so an instance that is running right now carries the timestamp of
+    /// its previous stretch and `active_depth` tells the two apart. The
+    /// swap policy reads both to decide whether an instance has been
+    /// idle long enough to evict.
+    last_active_at: AtomicU64,
     /// Cost weight for OOM victim selection. Higher = harder to kill.
     /// See `DEFAULT_RESTART_COST` and friends.
     restart_cost: u32,
@@ -188,6 +194,7 @@ impl InstanceRegistry {
             active_nanos: AtomicU64::new(0),
             active_depth: AtomicU32::new(0),
             last_resume_at: AtomicU64::new(INACTIVE_RESUME_AT),
+            last_active_at: AtomicU64::new(started_at),
             restart_cost,
             kill_flag: AtomicU8::new(KILL_FLAG_NONE),
             handle_count: AtomicUsize::new(1),
@@ -268,6 +275,47 @@ impl InstanceRegistry {
             notify();
         }
         flipped
+    }
+
+    /// Instances that have not run on any processor for at least
+    /// `idle_after_nanos`, newest activity last.
+    ///
+    /// An instance that is on a processor right now is never idle no
+    /// matter how long its previous stretch was, and an instance
+    /// condemned by the OOM killer is skipped: its memory is about to
+    /// come back for free, and writing it to disk first would be work
+    /// thrown away.
+    pub fn idle_instances(&self, now_nanos: u64, idle_after_nanos: u64) -> Vec<InstanceId> {
+        let entries = self.inner.entries.lock();
+        let mut idle: Vec<(u64, InstanceId)> = entries
+            .iter()
+            .filter_map(|(_, entry)| {
+                if entry.active_depth.load(Ordering::Acquire) != 0 {
+                    return None;
+                }
+                if entry.kill_flag.load(Ordering::Acquire) != KILL_FLAG_NONE {
+                    return None;
+                }
+                let last_active = entry.last_active_at.load(Ordering::Acquire);
+                let idle_for = now_nanos.saturating_sub(last_active);
+                (idle_for >= idle_after_nanos).then_some((last_active, entry.id))
+            })
+            .collect();
+        idle.sort_unstable();
+        idle.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// Every registered instance that has not been condemned, most
+    /// recently active last.
+    pub fn live_instances(&self) -> Vec<InstanceId> {
+        let entries = self.inner.entries.lock();
+        let mut live: Vec<(u64, InstanceId)> = entries
+            .iter()
+            .filter(|(_, entry)| entry.kill_flag.load(Ordering::Acquire) == KILL_FLAG_NONE)
+            .map(|(_, entry)| (entry.last_active_at.load(Ordering::Acquire), entry.id))
+            .collect();
+        live.sort_unstable();
+        live.into_iter().map(|(_, id)| id).collect()
     }
 
     pub fn snapshot(&self, now_nanos: u64) -> Vec<InstanceSnapshot> {
@@ -514,6 +562,7 @@ impl InstanceEntry {
             );
             let elapsed = now_nanos.saturating_sub(resumed_at);
             self.active_nanos.fetch_add(elapsed, Ordering::AcqRel);
+            self.last_active_at.store(now_nanos, Ordering::Release);
             return Some(elapsed);
         }
         None

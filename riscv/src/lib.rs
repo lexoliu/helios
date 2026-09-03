@@ -684,6 +684,12 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             for block in block::install(&cpu, &kernel, &fdt, &debug_state, root_entropy) {
                 interrupts.attach_block(block);
             }
+            // riscv commits linear memory eagerly out of the user pool:
+            // there is no reservation to leave a not-present entry in,
+            // and Cranelift emits explicit bounds checks rather than
+            // relying on guard pages, so a swapped-out page could never
+            // fault back in. Tracked as #59.
+            helios_kernel::disable_swap(helios_kernel::SwapDisabled::NoLazyCommitAddressSpace);
             interrupts
         })
     });
