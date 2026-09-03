@@ -372,11 +372,15 @@ fn install_pci_devices<WatchdogImpl>(
         let interrupts = net::install(
             cpu,
             kernel,
-            pci,
-            address,
-            dma_pool(address),
-            exceptions::NETWORK_INTERRUPT_VECTOR,
-            destination_apic_id,
+            net::PciFunction {
+                root: pci,
+                address,
+                dma: dma_pool(address),
+            },
+            net::MsixDelivery {
+                vector: exceptions::NETWORK_INTERRUPT_VECTOR,
+                destination_apic_id,
+            },
             debug_state,
         );
         for (vector, handler) in interrupts.queues {
@@ -744,7 +748,7 @@ fn serial_console(
     } else {
         None
     };
-    helios_kernel::RecordingConsole::new(debug_state, || read_tsc(), write_fn)
+    helios_kernel::RecordingConsole::new(debug_state, read_tsc, write_fn)
 }
 
 #[derive(Clone)]
@@ -903,7 +907,7 @@ impl Cpu for X86Cpu {
 }
 
 fn x86_has_rdrand() -> bool {
-    unsafe { __cpuid(1) }.ecx & (1 << 30) != 0
+    __cpuid(1).ecx & (1 << 30) != 0
 }
 
 fn fill_with_rdrand(buffer: &mut [u8]) {
@@ -999,9 +1003,9 @@ fn detect_x86_native_feature(feature: &str) -> Option<bool> {
     }
 
     let max_basic = __cpuid(0).eax;
-    let max_extended = unsafe { __cpuid(0x8000_0000) }.eax;
-    let leaf1 = unsafe { __cpuid(1) };
-    let leaf7 = (max_basic >= 7).then(|| unsafe { __cpuid_count(7, 0) });
+    let max_extended = __cpuid(0x8000_0000).eax;
+    let leaf1 = __cpuid(1);
+    let leaf7 = (max_basic >= 7).then(|| __cpuid_count(7, 0));
     let osxsave = (leaf1.ecx & (1 << 27)) != 0;
     let xcr0 = osxsave.then(xgetbv0).unwrap_or(0);
     let avx_os_enabled = (leaf1.ecx & (1 << 28)) != 0 && (xcr0 & 0b110) == 0b110;
@@ -1031,7 +1035,7 @@ fn detect_x86_native_feature(feature: &str) -> Option<bool> {
             Some(leaf7.is_some_and(|leaf| leaf.ecx & (1 << 1) != 0) && avx512_os_enabled)
         }
         "lzcnt" => {
-            Some(max_extended >= 0x8000_0001 && unsafe { __cpuid(0x8000_0001) }.ecx & (1 << 5) != 0)
+            Some(max_extended >= 0x8000_0001 && __cpuid(0x8000_0001).ecx & (1 << 5) != 0)
         }
         _ => None,
     }

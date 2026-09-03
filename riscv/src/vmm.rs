@@ -102,12 +102,18 @@ impl PageTable {
         Self(UnsafeCell::new([0; PTE_COUNT]))
     }
 
-    fn entries_mut(&self) -> &mut [u64; PTE_COUNT] {
-        unsafe { &mut *self.0.get() }
+    /// The table's entries as a raw array pointer.
+    ///
+    /// The root table is a `static` shared by every hart, so there is
+    /// never a `&mut PageTable` to hand out; who may write it is decided
+    /// by the paging bring-up order rather than by the borrow checker,
+    /// and each caller states which side of that order it is on.
+    fn entries_ptr(&self) -> *mut [u64; PTE_COUNT] {
+        self.0.get()
     }
 
     fn phys_addr(&self) -> usize {
-        self.entries_mut().as_ptr() as usize
+        self.entries_ptr().cast::<u64>() as usize
     }
 }
 
@@ -129,14 +135,16 @@ static USER_AS: Once<RiscvUserAddressSpace> = Once::new();
 /// space owned by this kernel; it survives for the lifetime of the
 /// process.
 pub unsafe fn install_kernel_paging() -> &'static RiscvUserAddressSpace {
-    let entries = ROOT_TABLE.entries_mut();
+    // SAFETY: the caller guarantees this runs once, before any hart
+    // writes `satp`, so the bootstrap hart is the only writer.
+    let entries = unsafe { &mut *ROOT_TABLE.entries_ptr() };
     for entry in entries.iter_mut() {
         *entry = 0;
     }
-    for gib in 0..KERNEL_IDENTITY_GIB {
+    for (gib, entry) in entries.iter_mut().take(KERNEL_IDENTITY_GIB).enumerate() {
         let pa: u64 = (gib as u64) * (GIB as u64);
         let ppn = pa >> PAGE_SHIFT;
-        entries[gib] = (ppn << PTE_PPN_SHIFT)
+        *entry = (ppn << PTE_PPN_SHIFT)
             | PTE_VALID
             | PTE_READ
             | PTE_WRITE
@@ -218,8 +226,13 @@ impl RiscvUserAddressSpace {
             .or_else(|| self.va_cursor.carve(byte_len))
     }
 
-    fn root_table(&self) -> &mut [u64; PTE_COUNT] {
-        unsafe { &mut *(self.root_phys as *mut [u64; PTE_COUNT]) }
+    /// The root table this address space maps through.
+    ///
+    /// The table lives at a fixed physical address rather than inside
+    /// the address space value, so it is reached by pointer; callers
+    /// hold the reservation lock that serialises table edits.
+    fn root_table(&self) -> *mut [u64; PTE_COUNT] {
+        self.root_phys as *mut [u64; PTE_COUNT]
     }
 
     fn ensure_intermediate(table: &mut [u64; PTE_COUNT], index: usize) -> &mut [u64; PTE_COUNT] {
@@ -242,7 +255,9 @@ impl RiscvUserAddressSpace {
     }
 
     fn map_4k(&self, virt: usize, phys: usize, flags: u64) -> Result<(), AddressSpaceError> {
-        let l2 = self.root_table();
+        // SAFETY: the caller holds this address space's reservation
+        // lock, so no other hart is editing its tables.
+        let l2 = unsafe { &mut *self.root_table() };
         let l2_index = (virt >> 30) & 0x1ff;
         let l1 = Self::ensure_intermediate(l2, l2_index);
         let l1_index = (virt >> 21) & 0x1ff;
@@ -259,7 +274,9 @@ impl RiscvUserAddressSpace {
     }
 
     fn unmap_4k(&self, virt: usize) -> Result<u64, AddressSpaceError> {
-        let l2 = self.root_table();
+        // SAFETY: the caller holds this address space's reservation
+        // lock, so no other hart is editing its tables.
+        let l2 = unsafe { &mut *self.root_table() };
         let l2_index = (virt >> 30) & 0x1ff;
         if l2[l2_index] & PTE_VALID == 0 {
             return Err(AddressSpaceError::NotCommitted);
@@ -283,7 +300,9 @@ impl RiscvUserAddressSpace {
     }
 
     fn protect_4k(&self, virt: usize, flags: u64) -> Result<u64, AddressSpaceError> {
-        let l2 = self.root_table();
+        // SAFETY: the caller holds this address space's reservation
+        // lock, so no other hart is editing its tables.
+        let l2 = unsafe { &mut *self.root_table() };
         let l2_index = (virt >> 30) & 0x1ff;
         if l2[l2_index] & PTE_VALID == 0 {
             return Err(AddressSpaceError::NotCommitted);
@@ -309,7 +328,9 @@ impl RiscvUserAddressSpace {
     }
 
     fn translate_4k(&self, virt: usize) -> Option<(usize, u64)> {
-        let l2 = self.root_table();
+        // SAFETY: the caller holds this address space's reservation
+        // lock, so no other hart is editing its tables.
+        let l2 = unsafe { &mut *self.root_table() };
         let l2_index = (virt >> 30) & 0x1ff;
         if l2[l2_index] & PTE_VALID == 0 {
             return None;
@@ -336,7 +357,9 @@ impl RiscvUserAddressSpace {
     }
 
     fn replace_4k(&self, virt: usize, new_entry: u64) -> Result<u64, AddressSpaceError> {
-        let l2 = self.root_table();
+        // SAFETY: the caller holds this address space's reservation
+        // lock, so no other hart is editing its tables.
+        let l2 = unsafe { &mut *self.root_table() };
         let l2_index = (virt >> 30) & 0x1ff;
         if l2[l2_index] & PTE_VALID == 0 {
             return Err(AddressSpaceError::NotCommitted);

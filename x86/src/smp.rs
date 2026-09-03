@@ -761,7 +761,7 @@ unsafe fn wake_application_processor(
 }
 
 fn local_apic_mode(target_apic_id: u32) -> LocalApicMode {
-    let cpuid = unsafe { __cpuid(1) };
+    let cpuid = __cpuid(1);
     if cpuid.ecx & (1 << 21) != 0 {
         return LocalApicMode::X2Apic;
     }
