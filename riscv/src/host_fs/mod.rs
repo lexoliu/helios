@@ -20,7 +20,8 @@ use crate::net::InterruptSourceId;
 
 pub(crate) const HOST_MOUNT_TAG: &str = helios_kernel::HOST_SHARE_MOUNT_TAG;
 
-pub(crate) type HostFileSystemService = helios_kernel::HostFsClient<HostFsTransportService>;
+pub(crate) type HostFileSystemService =
+    helios_kernel::HostFsClient<HostFsTransportService, crate::RiscvCpu>;
 
 #[derive(Clone)]
 pub(crate) struct HostFsTransportService {
@@ -33,6 +34,7 @@ pub(crate) struct HostFsInterrupt {
 }
 
 pub(crate) fn install(
+    cpu: &crate::RiscvCpu,
     fdt: &Fdt<'_>,
     debug_state: &crate::debug_state::RuntimeState,
 ) -> Option<HostFsInterrupt> {
@@ -42,7 +44,7 @@ pub(crate) fn install(
     };
 
     let transport = HostFsTransportService { device };
-    debug_state.install_host_fs_service(HostFileSystemService::new(transport.clone()));
+    debug_state.install_host_fs_service(HostFileSystemService::new(transport.clone(), cpu.clone()));
     tracing::info!(
         "virtio 9p online mount_tag={HOST_MOUNT_TAG} irq={}",
         source.0.get()

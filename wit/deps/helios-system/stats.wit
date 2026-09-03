@@ -92,6 +92,31 @@ interface stats {
     reported-bytes: u64,
   }
 
+  /// How the in-kernel 9p client's caches have served the host share
+  /// since boot. The share is not exclusive, so every table is bounded
+  /// in entries and in time; these counters say how much of that budget
+  /// is actually paying off.
+  record host-share-cache {
+    /// Attribute lookups answered from a cached `Rgetattr`.
+    attribute-hits: u64,
+    /// Attribute lookups that had to walk and ask the host.
+    attribute-misses: u64,
+    /// Attribute lookups answered "no such path" without asking.
+    negative-hits: u64,
+    /// Directory listings answered from a cached `Treaddir` sweep.
+    directory-hits: u64,
+    /// Directory listings that had to be read from the host.
+    directory-misses: u64,
+    /// Reads that reused a fid the pool already had open.
+    fid-hits: u64,
+    /// Reads that had to walk and open a fid of their own.
+    fid-misses: u64,
+    /// Entries dropped because a table was full or an entry went stale.
+    evictions: u64,
+    /// Entries dropped because the kernel changed what they described.
+    invalidations: u64,
+  }
+
   record sample {
     timestamp: mono-nanos,
     uptime: mono-nanos,
@@ -108,6 +133,9 @@ interface stats {
     iommu: option<iommu>,
     /// Absent on a machine that gave the kernel no memory balloon.
     balloon: option<memory-balloon>,
+    /// Absent on a machine with no host share, or one whose host
+    /// filesystem is reached without a 9p session in front of it.
+    host-share: option<host-share-cache>,
   }
 
   /// Returns the latest coherent system-wide observation snapshot.

@@ -530,6 +530,7 @@ fn convert_sample(sample: host_stats::Sample) -> stats::Sample {
         block: sample.block.map(convert_block_device),
         iommu: sample.iommu.map(convert_iommu),
         balloon: sample.balloon.map(convert_memory_balloon),
+        host_share: sample.host_share.map(convert_host_share_cache),
     }
 }
 
@@ -538,6 +539,20 @@ fn convert_memory_balloon(balloon: host_stats::MemoryBalloon) -> stats::MemoryBa
         target_bytes: balloon.target_bytes,
         actual_bytes: balloon.actual_bytes,
         reported_bytes: balloon.reported_bytes,
+    }
+}
+
+fn convert_host_share_cache(cache: host_stats::HostShareCache) -> stats::HostShareCache {
+    stats::HostShareCache {
+        attribute_hits: cache.attribute_hits,
+        attribute_misses: cache.attribute_misses,
+        negative_hits: cache.negative_hits,
+        directory_hits: cache.directory_hits,
+        directory_misses: cache.directory_misses,
+        fid_hits: cache.fid_hits,
+        fid_misses: cache.fid_misses,
+        evictions: cache.evictions,
+        invalidations: cache.invalidations,
     }
 }
 

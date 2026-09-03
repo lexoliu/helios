@@ -646,7 +646,7 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             if let Some(network) = net::install_network_service(&cpu, &kernel, &fdt, &debug_state) {
                 interrupts.attach_network(network);
             }
-            if let Some(host_fs) = host_fs::install(&fdt, &debug_state) {
+            if let Some(host_fs) = host_fs::install(&cpu, &fdt, &debug_state) {
                 interrupts.attach_host_fs(host_fs);
             }
             if let Some(entropy) = entropy::install(&kernel, &fdt, root_entropy.clone()) {
