@@ -1291,6 +1291,9 @@ def run_fedora_qemu_linux(
     controls = [control_workload] if control_workload is not None else []
     if controls:
         workloads = [*workloads, *controls]
+    # The control runs on every side that has a counterpart for it, so the
+    # guest must be provisioned for it even when the selection leaves it out.
+    provisioned_native = [*native_workloads, *runner.workloads_with_counterpart(controls, "linux_native")]
     native_bin_dir = resolve_optional_path(repo_root, native_bin_dir)
     if runner.needs_native_bin(workloads):
         if native_bin_dir is None or not native_bin_dir.is_dir():
@@ -1303,10 +1306,10 @@ def run_fedora_qemu_linux(
     wasmtime_linux_bin = resolve_optional_path(repo_root, wasmtime_linux_bin)
     wasmtime_linux_archive = resolve_optional_path(repo_root, wasmtime_linux_archive)
     quickjs_required = any(
-        workload_uses_placeholder(workload, "{quickjs}") for workload in native_workloads
+        workload_uses_placeholder(workload, "{quickjs}") for workload in provisioned_native
     )
     simd_probe_required = any(
-        workload_uses_placeholder(workload, "{simd_lanes}") for workload in native_workloads
+        workload_uses_placeholder(workload, "{simd_lanes}") for workload in provisioned_native
     )
     quickjs_policy = quickjs_native_policy(repo_root) if quickjs_required else None
     quickjs_source_archive = (
