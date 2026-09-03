@@ -30,13 +30,13 @@ use helios_hal::io::IoError;
 use helios_netstack::{
     DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage, DhcpDnsServers,
     DhcpMessageType, DhcpPacket, DnsQuestionWriter, DnsRecordType, DnsResponse, EthernetFrame,
-    EthernetProtocol, IcmpEchoKey, IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, IpAddress, IpCidr,
-    IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet,
+    EthernetProtocol, FlowTuple, IcmpEchoKey, IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, IpAddress,
+    IpCidr, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet,
     MAX_OUTBOUND_FRAMES, NeighborEntry, NetworkInterface as NetworkDevice, OutboundBatchStatus,
     Route, RouteTable, RxChecksumOffload, RxFrame, SegmentationOffload, Stack, StackConfig,
     StackError, StackEvent, StackInstant, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
     TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState, UdpEndpoint, UdpPacket,
-    UdpPayload, UdpSocketBinding, UdpSocketError,
+    UdpPayload, UdpSocketBinding, UdpSocketError, flow_hash,
 };
 use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
@@ -755,6 +755,26 @@ where
         .await
     }
 
+    /// The source address this interface would use to reach
+    /// `destination`.
+    ///
+    /// Read from the default shard because the control plane
+    /// republishes the address table to every shard, so any of them
+    /// answers the same — and it has to be answerable before a shard is
+    /// chosen, since the answer is half of the flow the choice hashes.
+    fn local_address_for(&self, destination: IpAddress) -> Option<IpAddress> {
+        self.inner.state.with(|state| match destination {
+            IpAddress::Ipv4(_) => state
+                .stack
+                .primary_ipv4_address()
+                .map(|cidr| IpAddress::Ipv4(cidr.address())),
+            IpAddress::Ipv6(_) => state
+                .stack
+                .primary_ipv6_address()
+                .map(|cidr| IpAddress::Ipv6(cidr.address())),
+        })
+    }
+
     /// Every resolved address worth attempting for this destination,
     /// in the order the connect walk should try them.
     ///
@@ -829,10 +849,14 @@ where
         ready: impl Fn(bool) -> bool,
     ) -> Result<(), Error> {
         loop {
-            // Interface configuration runs on the shard that owns the
-            // DHCP client port, which is also where DHCP offers and
-            // Router Advertisements demux back to.
-            let wait = self.inner.state.shard_wait_for_local_port(DHCP_CLIENT_PORT);
+            // Interface configuration runs on the default shard, which
+            // is where the DHCP exchange and the Router Advertisements
+            // that answer it demux back to: neither has a flow the hash
+            // can name.
+            let wait = self
+                .inner
+                .state
+                .shard_wait(self.inner.state.default_shard_idx());
             let ipv4_configured = self
                 .drive_ipv4_configuration()
                 .await
@@ -859,31 +883,26 @@ where
             .await
             .map_err(NetworkConfigurationError::Device)?;
         let now = StackInstant::from_nanos(self.now_nanos());
-        // DHCP runs on the shard that owns DHCP_CLIENT_PORT (68);
-        // since 68 < EPHEMERAL_PORT_START it always routes to
-        // shard 0, which is where DHCP responses also demux back.
-        //
-        // IPv6 stateless autoconfiguration rides the same poll and the
-        // same shard. Router Advertisements are ICMPv6, which the RX
-        // demux has no local port for and therefore also routes to
-        // shard 0, so the shard that solicits is the shard that
-        // receives — and `publish_from_shard` republishes the resulting
-        // addresses and routes to the rest of the set.
-        let configured = self
-            .inner
-            .state
-            .with_local_port(DHCP_CLIENT_PORT, |state| {
-                state
-                    .drive_dhcp(now)
-                    .map_err(NetworkConfigurationError::Control)?;
-                state
-                    .drive_ipv6_autoconfig(now)
-                    .map_err(NetworkConfigurationError::Control)?;
-                if state.is_configured() {
-                    self.inner.control.publish_from_shard(state);
-                }
-                Ok::<bool, NetworkConfigurationError>(state.is_configured())
-            })?;
+        // DHCP runs on the default shard, and so does IPv6 stateless
+        // autoconfiguration: the DHCP exchange is broadcast at a moment
+        // when the interface has no address to hash a flow with, and a
+        // Router Advertisement is ICMPv6 with no ports at all, so the
+        // shard that solicits is the shard that receives.
+        // `publish_from_shard` republishes the resulting addresses and
+        // routes to the rest of the set.
+        let configured = {
+            let mut state = self.inner.state.shard_for_default().lock();
+            state
+                .drive_dhcp(now)
+                .map_err(NetworkConfigurationError::Control)?;
+            state
+                .drive_ipv6_autoconfig(now)
+                .map_err(NetworkConfigurationError::Control)?;
+            if state.is_configured() {
+                self.inner.control.publish_from_shard(&state);
+            }
+            state.is_configured()
+        };
         if configured {
             self.synchronize_control_plane();
         }
@@ -1582,9 +1601,10 @@ mod tests {
 
         state
             .start_tcp_connect(
+                IpAddress::Ipv6(local),
                 IpAddress::Ipv6(remote),
                 443,
-                0,
+                49_152,
                 helios_netstack::DEFAULT_HOP_LIMIT,
             )
             .expect("IPv6 TCP connect should allocate a socket");
@@ -1624,9 +1644,10 @@ mod tests {
         });
         let stream = state
             .start_tcp_connect(
+                IpAddress::Ipv6(local),
                 IpAddress::Ipv6(remote),
                 443,
-                0,
+                49_152,
                 helios_netstack::DEFAULT_HOP_LIMIT,
             )
             .expect("IPv6 TCP connect should allocate a socket");
@@ -2166,8 +2187,22 @@ mod tests {
                 NetworkShard::remove_udp_replica,
             )
             .expect("the bind should install on every shard");
-        let owner = super::shard_idx_for_port(Some(49_153), state.shard_count());
-        assert_eq!(owner, 1, "port 49_153 demuxes to shard 1");
+        // The flow decides the shard, so the peer port is chosen to
+        // make this a genuinely cross-processor delivery: the fixture
+        // drains as processor 0 and the socket's replica on shard 1 is
+        // the one that must be released.
+        let owner = 1;
+        let peer_port = (1024..u16::MAX)
+            .find(|peer_port| {
+                super::shard_idx_for_flow(
+                    IpAddress::Ipv4(local),
+                    49_153,
+                    IpAddress::Ipv4(peer),
+                    *peer_port,
+                    state.shard_count(),
+                ) == owner
+            })
+            .expect("some peer port hashes to the foreign shard");
 
         // The operation's park, taken the way every per-operation wait
         // takes it: mark first, then inspect.
@@ -2189,7 +2224,7 @@ mod tests {
 
         // Processor 0 drains the reply and demuxes it, exactly as the
         // packet pump does.
-        let (reply, reply_len) = ipv4_udp_frame(peer, 53, local, 49_153, b"reply");
+        let (reply, reply_len) = ipv4_udp_frame(peer, peer_port, local, 49_153, b"reply");
         let mut arrivals = super::ShardArrivals::new();
         match state.dispatch_rx_frame(
             &RxFrame::new(Bytes::copy_from_slice(&reply[..reply_len])),
@@ -2226,6 +2261,149 @@ mod tests {
                 .is_some(),
             "the released operation must find its datagram"
         );
+    }
+
+    /// The receive rule and the placement rule have to agree, or a
+    /// socket is opened on a shard its own frames never reach.
+    #[test]
+    fn a_frame_lands_on_the_shard_its_flow_was_placed_on() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([198, 51, 100, 20]);
+        for shard_count in [1usize, 2, 3, 4, 8] {
+            for local_port in [49_152u16, 50_000, 60_123] {
+                for peer_port in [53u16, 443, 8080] {
+                    let placed = super::shard_idx_for_flow(
+                        IpAddress::Ipv4(local),
+                        local_port,
+                        IpAddress::Ipv4(peer),
+                        peer_port,
+                        shard_count,
+                    );
+                    let (frame, len) =
+                        ipv4_udp_frame(peer, peer_port, local, local_port, b"payload");
+                    assert_eq!(
+                        super::shard_idx_for_frame(&frame[..len], shard_count),
+                        placed,
+                        "the demux and the placement rule must agree"
+                    );
+                    assert!(placed < shard_count);
+                }
+            }
+        }
+    }
+
+    /// A DHCP exchange has no address to hash a flow with, so it is
+    /// owned by the default shard however its ports would hash.
+    #[test]
+    fn the_dhcp_exchange_stays_on_the_default_shard() {
+        let server = Ipv4Address::new([192, 0, 2, 1]);
+        let client = Ipv4Address::new([192, 0, 2, 10]);
+        let broadcast = Ipv4Address::new([255, 255, 255, 255]);
+        for shard_count in [1usize, 2, 4, 8] {
+            let (offer, offer_len) = ipv4_udp_frame(
+                server,
+                helios_netstack::DHCP_SERVER_PORT,
+                client,
+                helios_netstack::DHCP_CLIENT_PORT,
+                b"offer",
+            );
+            assert_eq!(
+                super::shard_idx_for_frame(&offer[..offer_len], shard_count),
+                super::DEFAULT_SHARD_IDX
+            );
+            let (discover, discover_len) = ipv4_udp_frame(
+                Ipv4Address::UNSPECIFIED,
+                helios_netstack::DHCP_CLIENT_PORT,
+                broadcast,
+                helios_netstack::DHCP_SERVER_PORT,
+                b"discover",
+            );
+            assert_eq!(
+                super::shard_idx_for_frame(&discover[..discover_len], shard_count),
+                super::DEFAULT_SHARD_IDX
+            );
+        }
+    }
+
+    /// An ICMP error quotes the packet that provoked it, so it belongs
+    /// to that flow's shard — the one with a socket to tell — and not
+    /// to the default shard it would fall back to.
+    #[test]
+    fn an_icmp_error_follows_the_flow_it_quotes() {
+        let local = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let peer = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        let router = Ipv6Address::new([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3]);
+        let shard_count = 4;
+        let (sent, sent_len) = ipv6_udp_frame(local, 49_153, peer, 53, b"query");
+        let (error, error_len) = ipv6_packet_too_big_frame(router, local, &sent[..sent_len], 1280);
+
+        let flow = super::shard_idx_for_flow(
+            IpAddress::Ipv6(local),
+            49_153,
+            IpAddress::Ipv6(peer),
+            53,
+            shard_count,
+        );
+        assert_eq!(
+            super::shard_idx_for_frame(&error[..error_len], shard_count),
+            flow
+        );
+    }
+
+    /// Frames with no flow at all fall to the default shard, which is
+    /// where the control plane that handles them runs.
+    #[test]
+    fn a_frame_without_a_flow_falls_to_the_default_shard() {
+        for shard_count in [1usize, 2, 4] {
+            assert_eq!(
+                super::shard_idx_for_frame(&[], shard_count),
+                super::DEFAULT_SHARD_IDX,
+                "an unparseable frame has no flow"
+            );
+            let mut arp = [0u8; ETHERNET_FRAME_BYTES];
+            let len = EthernetFrame::encode_header(
+                &mut arp,
+                [0x02, 0, 0, 0, 0, 1],
+                [0xff; 6],
+                EthernetProtocol::Arp,
+            )
+            .expect("test Ethernet header should fit");
+            assert_eq!(
+                super::shard_idx_for_frame(&arp[..len], shard_count),
+                super::DEFAULT_SHARD_IDX,
+                "ARP carries no ports"
+            );
+        }
+    }
+
+    /// Each shard walks its own contiguous slice of the ephemeral
+    /// range, so two shards never hand out the same port at once and
+    /// every port belongs to exactly one window.
+    #[test]
+    fn ephemeral_windows_partition_the_range() {
+        for shard_count in [1usize, 2, 3, 4, 8] {
+            let mut previous_end = None;
+            for shard_idx in 0..shard_count {
+                let shard = NetworkShard::new(test_stack_config(), 1, shard_idx, shard_count);
+                let (first, last) = shard.ephemeral_window();
+                assert!(first <= last);
+                match previous_end {
+                    None => assert_eq!(first, super::EPHEMERAL_PORT_START),
+                    Some(previous) => assert_eq!(first, previous + 1),
+                }
+                previous_end = Some(last);
+                assert_eq!(
+                    shard.advance_ephemeral_port(last),
+                    first,
+                    "the walk wraps inside its own window"
+                );
+                assert_eq!(
+                    shard.ephemeral_port_attempts(),
+                    usize::from(last - first) + 1
+                );
+            }
+            assert_eq!(previous_end, Some(super::EPHEMERAL_PORT_END));
+        }
     }
 
     /// A listener exists on every shard, and `accept` starts at the
@@ -2435,7 +2613,13 @@ mod tests {
             )
             .expect("the bind should install on every shard");
 
-        let sender = super::shard_idx_for_port(Some(49_153), state.shard_count());
+        let sender = super::shard_idx_for_flow(
+            IpAddress::Ipv6(local),
+            49_153,
+            IpAddress::Ipv6(peer),
+            53,
+            state.shard_count(),
+        );
         let payload = [0u8; 1233];
         let (packet_too_big, packet_too_big_len) = {
             let mut shard = state.shard_at(sender).lock();

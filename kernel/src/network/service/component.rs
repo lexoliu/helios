@@ -144,17 +144,30 @@ where
     fn open_resolver_socket(&self, resolver: IpAddress) -> Result<ResolverSocket, DnsError> {
         let processor = self.inner.cpu.current_processor();
         let shard_idx = self.inner.state.shard_idx_for_processor(processor);
-        let mut shard = self.inner.state.shard_at(shard_idx).lock();
-        let local_port = shard.allocate_udp_local_port().map_err(|_| DnsError {
-            kind: DnsErrorKind::Unavailable,
-            detail: NetworkErrorDetail::DnsQueryStartFailed,
-        })?;
-        let local = shard
-            .udp_local_endpoint(local_port, resolver)
-            .map_err(|_| DnsError {
-                kind: DnsErrorKind::Unavailable,
-                detail: NetworkErrorDetail::DnsServersUnavailable,
-            })?;
+        let shard_count = self.inner.state.shard_count();
+        // The port is picked on this processor's shard, preferring one
+        // whose answers hash back here, and the socket is then opened
+        // on whichever shard the flow actually hashes to — so the
+        // lookup's answers are demultiplexed straight into the queue
+        // this call is about to poll.
+        let (local, local_port) = {
+            let mut shard = self.inner.state.shard_at(shard_idx).lock();
+            let local_port = shard
+                .allocate_udp_local_port_for(resolver, DNS_PORT, shard_count)
+                .map_err(|_| DnsError {
+                    kind: DnsErrorKind::Unavailable,
+                    detail: NetworkErrorDetail::DnsQueryStartFailed,
+                })?;
+            let local = shard
+                .udp_local_endpoint(local_port, resolver)
+                .map_err(|_| DnsError {
+                    kind: DnsErrorKind::Unavailable,
+                    detail: NetworkErrorDetail::DnsServersUnavailable,
+                })?;
+            (local, local_port)
+        };
+        let shard_idx =
+            shard_idx_for_flow(local.address, local_port, resolver, DNS_PORT, shard_count);
         let binding = UdpSocketBinding::connected(
             local,
             UdpEndpoint {
@@ -162,10 +175,17 @@ where
                 port: DNS_PORT,
             },
         );
-        let stack_socket = shard.stack.open_udp(binding).map_err(|_| DnsError {
-            kind: DnsErrorKind::Unavailable,
-            detail: NetworkErrorDetail::DnsQueryStartFailed,
-        })?;
+        let stack_socket = self
+            .inner
+            .state
+            .shard_at(shard_idx)
+            .lock()
+            .stack
+            .open_udp(binding)
+            .map_err(|_| DnsError {
+                kind: DnsErrorKind::Unavailable,
+                detail: NetworkErrorDetail::DnsQueryStartFailed,
+            })?;
         Ok(ResolverSocket {
             shard_idx,
             stack_socket,
@@ -241,9 +261,12 @@ where
 
     pub(super) async fn acquire_dhcp_address(&self) -> Result<KernelIpv4Cidr, NetworkControlError> {
         loop {
-            // The lease is negotiated on the shard that owns the DHCP
-            // client port, and the offer demuxes back to it.
-            let wait = self.inner.state.shard_wait_for_local_port(DHCP_CLIENT_PORT);
+            // The lease is negotiated on the default shard, which is
+            // where the offer demuxes back to.
+            let wait = self
+                .inner
+                .state
+                .shard_wait(self.inner.state.default_shard_idx());
             self.drive_network(NetworkPollSource::Configuration)
                 .await
                 .map_err(|_| NetworkControlError::BackendFault)?;

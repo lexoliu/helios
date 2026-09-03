@@ -3,10 +3,10 @@
 //! # SMP contract
 //!
 //! There is one [`NetworkShard`] per processor and every shard owns an
-//! independent `Stack`, socket slab and port allocator. A local port
-//! belongs to exactly one shard ([`shard_idx_for_port`]), so the frames
-//! for a socket are always placed in that socket's shard whichever
-//! processor drained them off the device.
+//! independent `Stack`, socket slab and port allocator. A flow belongs
+//! to exactly one shard ([`shard_idx_for_frame`]), so the frames for a
+//! socket are always placed in that socket's shard whichever processor
+//! drained them off the device.
 //!
 //! Placement is therefore routinely cross-processor: the shard lock is
 //! taken by the draining CPU, not the owning one. That hand-off is
@@ -20,73 +20,140 @@
 
 use super::*;
 
-/// Peek the L4 destination port out of a parsed Ethernet frame.
-/// Used by the RX demux to route frames to the shard that owns the
-/// local port. Returns `None` for non-IP frames (ARP), non-TCP/UDP
-/// IP frames (ICMP), or malformed packets — all of which route to
-/// shard 0 in the dispatch path because there is no socket-local
-/// owner to identify.
-pub(super) fn peek_local_port(frame: &[u8]) -> Option<u16> {
+/// The shard a received frame belongs to.
+///
+/// This is the one receive-side ownership rule in the kernel, and it is
+/// the rule a device's RSS engine reproduces: the flow's Toeplitz hash,
+/// modulo the shard count. A device that steers by the same hash
+/// delivers the frame on the queue whose processor already owns the
+/// socket; a device that cannot steer delivers everything on queue zero
+/// and this routes it to the same shard anyway, so only the CPU hop
+/// differs.
+///
+/// Three kinds of frame have no flow the hash can name and belong to
+/// [`DEFAULT_SHARD_IDX`]:
+///
+/// * ARP, ICMP echo and neighbour discovery, which carry no ports;
+/// * anything unparseable, which the owning stack will drop;
+/// * the DHCP client's exchange, which is broadcast at a moment when
+///   the interface has no address to hash a flow with.
+///
+/// An ICMP error is not one of them: it quotes the packet that provoked
+/// it, so the flow it concerns is recoverable and the error is routed to
+/// that flow's shard rather than to a shard with no socket to tell.
+pub(super) fn shard_idx_for_frame(frame: &[u8], shard_count: usize) -> usize {
+    flow_tuple_for_frame(frame)
+        .map(|tuple| flow_hash(&tuple).bucket(shard_count))
+        .unwrap_or(DEFAULT_SHARD_IDX)
+}
+
+/// The received flow a frame belongs to, or `None` when it has none.
+fn flow_tuple_for_frame(frame: &[u8]) -> Option<FlowTuple> {
     let ethernet = EthernetFrame::parse(frame)?;
-    let payload = ethernet.payload;
     let (protocol, l4_payload) = match ethernet.protocol {
         EthernetProtocol::Ipv4 => {
-            let packet = Ipv4Packet::parse(payload)?;
+            let packet = Ipv4Packet::parse(ethernet.payload)?;
             (packet.protocol, packet.payload)
         }
         EthernetProtocol::Ipv6 => {
-            let packet = Ipv6Packet::parse(payload)?;
+            let packet = Ipv6Packet::parse(ethernet.payload)?;
             (packet.next_header, packet.payload)
         }
         _ => return None,
     };
     match protocol {
-        IpProtocol::Tcp => Some(TcpPacket::parse(l4_payload)?.destination_port),
-        IpProtocol::Udp => Some(UdpPacket::parse(l4_payload)?.destination_port),
-        IpProtocol::Icmp => peek_icmpv4_quoted_local_port(l4_payload),
-        IpProtocol::Icmpv6 => peek_icmpv6_quoted_local_port(l4_payload),
+        IpProtocol::Tcp | IpProtocol::Udp => {
+            if is_dhcp_exchange(protocol, l4_payload) {
+                return None;
+            }
+            FlowTuple::from_frame(frame)
+        }
+        IpProtocol::Icmp => icmpv4_quoted_flow(l4_payload),
+        IpProtocol::Icmpv6 => icmpv6_quoted_flow(l4_payload),
     }
 }
 
-pub(super) fn peek_icmpv4_quoted_local_port(bytes: &[u8]) -> Option<u16> {
+/// Whether a datagram is part of the DHCP client's exchange.
+///
+/// It is checked on the ports rather than on the addresses because a
+/// reply may be unicast or broadcast, and the client has no address of
+/// its own to match against until the exchange has finished.
+fn is_dhcp_exchange(protocol: IpProtocol, payload: &[u8]) -> bool {
+    if protocol != IpProtocol::Udp {
+        return false;
+    }
+    let Some(packet) = UdpPacket::parse(payload) else {
+        return false;
+    };
+    [packet.source_port, packet.destination_port]
+        .iter()
+        .any(|port| *port == DHCP_CLIENT_PORT || *port == DHCP_SERVER_PORT)
+}
+
+/// The flow an ICMPv4 error concerns, in the direction this interface
+/// receives it.
+///
+/// The quoted header is the packet *we sent*, so its tuple is the
+/// outgoing direction and has to be reversed to match how the frames of
+/// that flow arrive — which is what the hash is taken over.
+fn icmpv4_quoted_flow(bytes: &[u8]) -> Option<FlowTuple> {
     let Icmpv4Packet::DestinationUnreachable(unreachable) = Icmpv4Packet::parse(bytes)? else {
         return None;
     };
     let quoted = Ipv4Packet::parse_quoted(unreachable.original)?;
-    match quoted.protocol {
-        IpProtocol::Tcp => Some(TcpPacket::parse_ports(quoted.payload)?.source),
-        IpProtocol::Udp => Some(UdpPacket::parse_ports(quoted.payload)?.source),
-        _ => None,
-    }
+    let ports = quoted_ports(quoted.protocol, quoted.payload)?;
+    Some(FlowTuple::ipv4(quoted.source, ports.0, quoted.destination, ports.1).reversed())
 }
 
-pub(super) fn peek_icmpv6_quoted_local_port(bytes: &[u8]) -> Option<u16> {
+/// The flow an ICMPv6 error concerns, in the receive direction.
+fn icmpv6_quoted_flow(bytes: &[u8]) -> Option<FlowTuple> {
     let original = match Icmpv6Packet::parse(bytes)? {
         Icmpv6Packet::DestinationUnreachable(unreachable) => unreachable.original,
         Icmpv6Packet::PacketTooBig(packet_too_big) => packet_too_big.original,
         _ => return None,
     };
     let quoted = Ipv6Packet::parse_quoted(original)?;
-    match quoted.next_header {
-        IpProtocol::Tcp => Some(TcpPacket::parse_ports(quoted.payload)?.source),
-        IpProtocol::Udp => Some(UdpPacket::parse_ports(quoted.payload)?.source),
-        _ => None,
-    }
+    let ports = quoted_ports(quoted.next_header, quoted.payload)?;
+    Some(FlowTuple::ipv6(quoted.source, ports.0, quoted.destination, ports.1).reversed())
 }
 
-/// Maps a local port to the index of the shard that owns it. Server
-/// listening ports (anything below `EPHEMERAL_PORT_START`) always
-/// route to shard 0; ephemeral ports stride across shards so a
-/// freshly-allocated outgoing port `EPHEMERAL_PORT_START + k` lands
-/// on shard `k % shard_count`. Frames whose port is `None` (ARP,
-/// ICMP, …) or unparseable also map to shard 0.
-pub(super) fn shard_idx_for_port(port: Option<u16>, shard_count: usize) -> usize {
-    let Some(port) = port else { return 0 };
-    if port < EPHEMERAL_PORT_START {
-        return 0;
-    }
-    let stride_idx = port - EPHEMERAL_PORT_START;
-    usize::from(stride_idx) % shard_count
+/// The port pair of a quoted transport header. An ICMP error only has
+/// to quote the first eight bytes of it, which is exactly the ports.
+fn quoted_ports(protocol: IpProtocol, payload: &[u8]) -> Option<(u16, u16)> {
+    let ports = match protocol {
+        IpProtocol::Tcp => TcpPacket::parse_ports(payload)?,
+        IpProtocol::Udp => UdpPacket::parse_ports(payload)?,
+        _ => return None,
+    };
+    Some((ports.source, ports.destination))
+}
+
+/// Ports per shard when the ephemeral range is split evenly.
+///
+/// The last shard keeps whatever remainder the division leaves, so
+/// every port in the range belongs to exactly one window.
+fn ephemeral_window_len(shard_count: usize) -> u16 {
+    let total = u32::from(EPHEMERAL_PORT_END - EPHEMERAL_PORT_START) + 1;
+    let window = total / (shard_count as u32).max(1);
+    u16::try_from(window.max(1)).unwrap_or(u16::MAX)
+}
+
+/// The shard that will receive a flow between these endpoints.
+///
+/// Called before a socket is opened, so the socket is placed where its
+/// frames will arrive. The tuple is the receive direction — remote to
+/// local — because that is what the demux hashes, and the standard
+/// Toeplitz key is not symmetric.
+pub(super) fn shard_idx_for_flow(
+    local: IpAddress,
+    local_port: u16,
+    remote: IpAddress,
+    remote_port: u16,
+    shard_count: usize,
+) -> usize {
+    FlowTuple::between(remote, remote_port, local, local_port)
+        .map(|tuple| flow_hash(&tuple).bucket(shard_count))
+        .unwrap_or(DEFAULT_SHARD_IDX)
 }
 
 pub(super) struct NetworkShard {
@@ -583,12 +650,6 @@ impl NetworkShardSet {
         self.shard_wait(self.shard_idx_for_handle(handle))
     }
 
-    /// Samples the arrival signal of the shard owning `port`.
-    #[inline]
-    pub(super) fn shard_wait_for_local_port(&self, port: u16) -> ShardWait {
-        self.shard_wait(self.shard_idx_for_local_port(port))
-    }
-
     /// Samples the arrival signal of the shard that unqualified
     /// operations run on.
     #[inline]
@@ -634,8 +695,7 @@ impl NetworkShardSet {
         received_at: StackInstant,
         control: &NetworkControlPlane,
     ) -> RxFrameDispatch {
-        let port = peek_local_port(frame.as_ref());
-        let shard_idx = shard_idx_for_port(port, self.shard_count());
+        let shard_idx = shard_idx_for_frame(frame.as_ref(), self.shard_count());
         let mut shard = self.shards[shard_idx].inner.lock();
         let dispatch = match shard.stack.receive_rx_frame(frame.clone(), received_at) {
             Ok(backpressured) => RxFrameDispatch::Delivered {
@@ -660,30 +720,14 @@ impl NetworkShardSet {
         &self.shards[idx].inner
     }
 
-    /// Picks the shard that should receive a new socket created on
-    /// the given processor. Future RX traffic for the socket's
-    /// stride-allocated ephemeral port will demux back to this
-    /// shard, so creation must place the slab entry here. Falls
-    /// back to shard 0 for processor ids out of the configured
-    /// range.
-    #[inline]
-    pub(super) fn shard_for_processor(
-        &self,
-        processor: helios_hal::cpu::ProcessorId,
-    ) -> &SpinMutex<NetworkShard> {
-        &self.shards[self.shard_idx_for_processor(processor)].inner
-    }
-
-    /// Index of the shard [`Self::shard_for_processor`] resolves to.
+    /// The shard a socket created on `processor` should prefer.
+    ///
+    /// Only a preference: ownership follows the flow hash, and this is
+    /// what an allocator aims at so a socket opened on one processor is
+    /// also received on it.
     #[inline]
     pub(super) fn shard_idx_for_processor(&self, processor: helios_hal::cpu::ProcessorId) -> usize {
         (processor.id() as usize) % self.shards.len()
-    }
-
-    /// Index of the shard owning a fixed local port.
-    #[inline]
-    pub(super) fn shard_idx_for_local_port(&self, port: u16) -> usize {
-        shard_idx_for_port(Some(port), self.shards.len())
     }
 
     pub(super) fn with<R>(&self, f: impl FnOnce(&NetworkShard) -> R) -> R {
@@ -711,34 +755,6 @@ impl NetworkShardSet {
         f: impl FnOnce(&mut NetworkShard) -> R,
     ) -> R {
         let mut state = self.shard_for_handle(handle).lock();
-        f(&mut state)
-    }
-
-    /// Locks the shard owning the given processor and runs the
-    /// closure against it. Used by socket-creation paths so the
-    /// new socket lives on the processor that minted it; ephemeral
-    /// ports allocated under the stride scheme will demux back to
-    /// this shard for incoming traffic.
-    pub(super) fn with_processor<R>(
-        &self,
-        processor: helios_hal::cpu::ProcessorId,
-        f: impl FnOnce(&mut NetworkShard) -> R,
-    ) -> R {
-        let mut state = self.shard_for_processor(processor).lock();
-        f(&mut state)
-    }
-
-    /// Locks the shard owning a fixed local port (server listener,
-    /// explicit UDP bind). Maps via `shard_idx_for_port` so RX
-    /// demux for the same port reaches the same shard.
-    pub(super) fn with_local_port<R>(
-        &self,
-        port: u16,
-        f: impl FnOnce(&mut NetworkShard) -> R,
-    ) -> R {
-        let mut state = self.shards[self.shard_idx_for_local_port(port)]
-            .inner
-            .lock();
         f(&mut state)
     }
 
@@ -782,7 +798,8 @@ impl NetworkShard {
             shard_idx < shard_count,
             "shard idx {shard_idx} out of range for {shard_count} shards"
         );
-        let initial_ephemeral = EPHEMERAL_PORT_START + shard_idx as u16;
+        let initial_ephemeral =
+            EPHEMERAL_PORT_START + (shard_idx as u16) * ephemeral_window_len(shard_count);
         let mut stack = Box::new(Stack::new(stack_config));
         let mut udp_sockets = HandleSlab::new();
         // Every shard opens the DHCP client socket, and always in the
@@ -861,26 +878,42 @@ impl NetworkShard {
         }
     }
 
-    /// Number of ephemeral ports owned by this shard under the
-    /// stride-allocation scheme. Equal to the total ephemeral
-    /// range divided by the shard count, rounded up.
-    pub(super) fn ephemeral_port_attempts(&self) -> usize {
-        let total = usize::from(EPHEMERAL_PORT_END - EPHEMERAL_PORT_START) + 1;
-        total.div_ceil(self.shard_count)
+    /// The contiguous slice of the ephemeral range this shard hands
+    /// out, as an inclusive `(first, last)` pair.
+    ///
+    /// A socket's shard follows its flow hash, so the allocator no
+    /// longer has to make a port decode back to a shard. What it still
+    /// has to do is keep two shards from handing out the same port at
+    /// the same moment, which one window each achieves without any
+    /// shared state — and unlike the old stride it leaves each shard
+    /// walking consecutive numbers instead of skipping `shard_count` at
+    /// a time.
+    pub(super) fn ephemeral_window(&self) -> (u16, u16) {
+        let window = ephemeral_window_len(self.shard_count);
+        let first = EPHEMERAL_PORT_START + (self.shard_idx as u16) * window;
+        let last = if self.shard_idx + 1 == self.shard_count {
+            EPHEMERAL_PORT_END
+        } else {
+            first + window - 1
+        };
+        (first, last)
     }
 
-    /// Advances the rolling allocator pointer by `shard_count`,
-    /// wrapping back to the shard's first ephemeral port when we
-    /// step past `EPHEMERAL_PORT_END`. The result is always a port
-    /// that satisfies `(port - EPHEMERAL_PORT_START) % shard_count
-    /// == shard_idx`, matching `shard_idx_for_port` so RX demux
-    /// routes back to this shard.
+    /// How many candidates an allocation walk may try before it gives
+    /// up: every port in this shard's window.
+    pub(super) fn ephemeral_port_attempts(&self) -> usize {
+        let (first, last) = self.ephemeral_window();
+        usize::from(last - first) + 1
+    }
+
+    /// Advances the rolling allocator pointer, wrapping at the end of
+    /// this shard's window.
     pub(super) fn advance_ephemeral_port(&self, current: u16) -> u16 {
-        let stride = self.shard_count as u16;
-        let next = current.checked_add(stride);
-        match next {
-            Some(value) if value <= EPHEMERAL_PORT_END => value,
-            _ => EPHEMERAL_PORT_START + self.shard_idx as u16,
+        let (first, last) = self.ephemeral_window();
+        if current >= last || current < first {
+            first
+        } else {
+            current + 1
         }
     }
 

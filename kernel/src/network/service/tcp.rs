@@ -294,19 +294,36 @@ where
         if matches!(destination, IpAddress::Ipv4(_)) {
             self.wait_for_ipv4_tcp(deadline_nanos).await?;
         }
-        // A caller-selected local port already has a deterministic
-        // shard owner; route there so RX demux and handle routing agree.
-        // Port 0 allocates from the current processor's shard.
-        let stream = if local_port == 0 {
-            let processor = self.inner.cpu.current_processor();
-            self.inner.state.with_processor(processor, |state| {
-                state.start_tcp_connect(destination, port, local_port, hop_limit)
-            })
+        // The source address is the same on every shard — the control
+        // plane republishes it — so the flow can be hashed before a
+        // shard is chosen, and the socket is opened on the shard that
+        // will receive its segments.
+        let local = self.local_address_for(destination).ok_or(TcpError {
+            kind: TcpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::NetworkServiceUnavailable,
+        })?;
+        let shard_count = self.inner.state.shard_count();
+        let local_port = if local_port == 0 {
+            // Allocating from this processor's own shard, preferring a
+            // port whose answers hash back to it, is what keeps a
+            // connection opened here from being received somewhere
+            // else. Ownership follows the hash either way.
+            self.inner
+                .state
+                .shard_at(self.accepting_shard_idx())
+                .lock()
+                .allocate_tcp_local_port_for(local, destination, port, shard_count)?
         } else {
-            self.inner.state.with_local_port(local_port, |state| {
-                state.start_tcp_connect(destination, port, local_port, hop_limit)
-            })
-        }?;
+            local_port
+        };
+        let owner = shard_idx_for_flow(local, local_port, destination, port, shard_count);
+        let stream = self.inner.state.shard_at(owner).lock().start_tcp_connect(
+            local,
+            destination,
+            port,
+            local_port,
+            hop_limit,
+        )?;
 
         loop {
             // Sampled before the handshake state is inspected, so a SYN-ACK
@@ -1093,39 +1110,22 @@ where
 }
 
 impl NetworkShard {
+    /// Opens a connection on this shard, which the caller has already
+    /// established is the one the flow hashes to.
     pub(super) fn start_tcp_connect(
         &mut self,
+        local: IpAddress,
         destination: IpAddress,
         port: u16,
         local_port: u16,
         hop_limit: u8,
     ) -> Result<TcpStreamId, TcpError> {
-        let local_port = if local_port == 0 {
-            self.allocate_tcp_local_port()?
-        } else if self.is_tcp_local_port_free(local_port) {
-            local_port
-        } else {
+        if !self.is_tcp_local_port_free(local_port) {
             return Err(TcpError {
                 kind: TcpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::TcpConnectStartFailed,
             });
-        };
-        let local = match destination {
-            IpAddress::Ipv4(_) => self
-                .stack
-                .primary_ipv4_address()
-                .map(|cidr| IpAddress::Ipv4(cidr.address())),
-            IpAddress::Ipv6(_) => self
-                .stack
-                .primary_ipv6_address()
-                .map(|cidr| IpAddress::Ipv6(cidr.address())),
-        };
-        let Some(local) = local else {
-            return Err(TcpError {
-                kind: TcpErrorKind::Unavailable,
-                detail: NetworkErrorDetail::NetworkServiceUnavailable,
-            });
-        };
+        }
         let socket = self
             .stack
             .open_tcp_connect(
@@ -1383,6 +1383,42 @@ impl NetworkShard {
             }
         }
         Err(TcpError {
+            kind: TcpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::TcpNoEphemeralPorts,
+        })
+    }
+
+    /// Allocates an ephemeral port for a flow to a known peer,
+    /// preferring one whose answers hash back to this shard.
+    ///
+    /// Ownership follows the hash whatever port is chosen, so this is
+    /// not a correctness requirement — it is what makes steering pay:
+    /// a connection opened on this processor is then also received on
+    /// it, with no cross-processor hop for its whole life. The walk is
+    /// bounded by the shard's own window, and falls back to the first
+    /// free port it saw, which the caller then places by its hash.
+    pub(super) fn allocate_tcp_local_port_for(
+        &mut self,
+        local: IpAddress,
+        remote: IpAddress,
+        remote_port: u16,
+        shard_count: usize,
+    ) -> Result<u16, TcpError> {
+        let mut fallback = None;
+        for _ in 0..self.ephemeral_port_attempts() {
+            let candidate = self.next_tcp_local_port;
+            self.next_tcp_local_port = self.advance_ephemeral_port(self.next_tcp_local_port);
+            if !self.is_tcp_local_port_free(candidate) {
+                continue;
+            }
+            if shard_idx_for_flow(local, candidate, remote, remote_port, shard_count)
+                == self.shard_idx
+            {
+                return Ok(candidate);
+            }
+            fallback.get_or_insert(candidate);
+        }
+        fallback.ok_or(TcpError {
             kind: TcpErrorKind::Unavailable,
             detail: NetworkErrorDetail::TcpNoEphemeralPorts,
         })

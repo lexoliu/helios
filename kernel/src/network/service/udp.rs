@@ -587,6 +587,42 @@ impl NetworkShard {
         state.stack_socket
     }
 
+    /// Allocates an ephemeral datagram port for a flow to a known
+    /// peer, preferring one whose answers hash back to this shard.
+    ///
+    /// The same trade as the TCP form: ownership follows the hash
+    /// whatever port is chosen, and aiming at this shard is what keeps
+    /// a socket opened on this processor being received on it.
+    pub(super) fn allocate_udp_local_port_for(
+        &mut self,
+        remote: IpAddress,
+        remote_port: u16,
+        shard_count: usize,
+    ) -> Result<u16, UdpError> {
+        let local = self
+            .udp_local_endpoint(0, remote)
+            .map_err(map_udp_connect_error)?
+            .address;
+        let mut fallback = None;
+        for _ in 0..self.ephemeral_port_attempts() {
+            let candidate = self.next_udp_local_port;
+            self.next_udp_local_port = self.advance_ephemeral_port(self.next_udp_local_port);
+            if !self.is_udp_local_port_free(candidate) {
+                continue;
+            }
+            if shard_idx_for_flow(local, candidate, remote, remote_port, shard_count)
+                == self.shard_idx
+            {
+                return Ok(candidate);
+            }
+            fallback.get_or_insert(candidate);
+        }
+        fallback.ok_or(UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UdpNoEphemeralPorts,
+        })
+    }
+
     pub(super) fn allocate_udp_local_port(&mut self) -> Result<u16, UdpError> {
         for _ in 0..self.ephemeral_port_attempts() {
             let candidate = self.next_udp_local_port;
