@@ -643,7 +643,8 @@ mod tests {
         CONFIG_NUM_PAGES, F_DEFLATE_ON_OOM, F_FREE_PAGE_HINT, F_MUST_TELL_HOST, F_PAGE_REPORTING,
         F_STATS_VQ, FREE_PAGE_CMD_ID_STOP, QueueLayout, VirtioBalloonDevice,
     };
-    use crate::testing::{FakeTransport, FakeTransportConfig};
+    use crate::bus::DmaBuffer;
+    use crate::testing::{FakeTransport, FakeTransportConfig, WindowDmaBuffer, WindowDmaPool};
     use crate::transport::{DeviceType, VirtioFeatures, VirtioTransport};
     use alloc::vec::Vec;
     use core::pin::pin;
@@ -662,32 +663,50 @@ mod tests {
         | F_FREE_PAGE_HINT
         | F_PAGE_REPORTING;
 
-    fn device_with(offered: u64) -> VirtioBalloonDevice<FakeTransport> {
-        VirtioBalloonDevice::new(FakeTransport::new(FakeTransportConfig {
-            device_type: DeviceType::MemoryBalloon,
-            offered_features: offered,
-            queue_size: 8,
-            supports_queue_reset: false,
-        }))
+    type Device = VirtioBalloonDevice<FakeTransport<WindowDmaPool>>;
+
+    /// The memory a test's rings and pages come from.
+    ///
+    /// The balloon protocol carries 32-bit page frame numbers, so the
+    /// pages a test posts must translate to small device addresses
+    /// wherever the host heap happens to sit; the window pool provides
+    /// that for the rings and the pages alike.
+    fn arena() -> WindowDmaPool {
+        WindowDmaPool::new(64 * BALLOON_PAGE_SIZE)
+    }
+
+    fn device_with(offered: u64, dma: WindowDmaPool) -> Device {
+        VirtioBalloonDevice::new(FakeTransport::with_dma(
+            FakeTransportConfig {
+                device_type: DeviceType::MemoryBalloon,
+                offered_features: offered,
+                queue_size: 8,
+                supports_queue_reset: false,
+            },
+            dma,
+        ))
         .expect("balloon device should initialize")
     }
 
-    fn device() -> VirtioBalloonDevice<FakeTransport> {
-        device_with(ALL_BALLOON_FEATURES)
+    fn device() -> Device {
+        device_with(ALL_BALLOON_FEATURES, arena())
     }
 
     /// Page-aligned guest memory a test can hand to the driver.
-    struct Pages(Vec<u8>);
+    struct Pages(WindowDmaBuffer);
 
     impl Pages {
-        fn new(count: usize) -> Self {
-            Self(alloc::vec![0; count * BALLOON_PAGE_SIZE + BALLOON_PAGE_SIZE])
+        fn new(dma: &WindowDmaPool, count: usize) -> Self {
+            Self(dma.pages(count))
         }
 
         fn range(&mut self, count: usize) -> &mut [u8] {
-            let base = self.0.as_ptr() as usize;
-            let offset = base.next_multiple_of(BALLOON_PAGE_SIZE) - base;
-            &mut self.0[offset..offset + count * BALLOON_PAGE_SIZE]
+            &mut self.0.as_mut_slice()[..count * BALLOON_PAGE_SIZE]
+        }
+
+        /// The address the device sees for the first page.
+        fn device_base(&self) -> u64 {
+            self.0.phys_addr()
         }
     }
 
@@ -696,7 +715,7 @@ mod tests {
     /// A completed identifier goes back to the ring's free pool, so the
     /// requests of one sequence do not land on ascending descriptors and
     /// a test that assumed they did would read an empty slot.
-    fn next_token(queue: &BalloonQueue<FakeTransport>) -> u16 {
+    fn next_token(queue: &BalloonQueue<FakeTransport<WindowDmaPool>>) -> u16 {
         queue
             .queue
             .try_lock()
@@ -706,7 +725,7 @@ mod tests {
 
     /// Plays the device: finishes `token` on `queue` and raises the
     /// used-buffer interrupt.
-    fn complete(device: &VirtioBalloonDevice<FakeTransport>, queue_index: u16, token: u16) {
+    fn complete(device: &Device, queue_index: u16, token: u16) {
         let queue = match queue_index {
             0 => &device.inflate,
             1 => &device.deflate,
@@ -767,13 +786,14 @@ mod tests {
 
     #[test]
     fn a_device_offering_no_optional_features_still_inflates() {
-        let device = device_with(VirtioFeatures::VERSION_1.bits());
+        let dma = arena();
+        let device = device_with(VirtioFeatures::VERSION_1.bits(), dma.clone());
         assert!(!device.must_tell_host());
         assert!(!device.reports_free_pages());
         assert!(!device.hints_free_pages());
         assert!(!device.publishes_stats());
 
-        let mut pages = Pages::new(1);
+        let mut pages = Pages::new(&dma, 1);
         let mut range = [pages.range(1)];
         let mut inflate = pin!(device.inflate(&mut range));
         assert!(block_on(poll_once(inflate.as_mut())).is_none());
@@ -802,10 +822,11 @@ mod tests {
     /// ranges it was given, in ascending address order.
     #[test]
     fn inflate_posts_one_page_frame_number_per_page() {
-        let device = device();
-        let mut pages = Pages::new(3);
+        let dma = arena();
+        let device = device_with(ALL_BALLOON_FEATURES, dma.clone());
+        let mut pages = Pages::new(&dma, 3);
+        let base = pages.device_base();
         let range = pages.range(3);
-        let base = range.as_ptr() as u64;
         let mut ranges = [range];
 
         let mut inflate = pin!(device.inflate(&mut ranges));
@@ -839,9 +860,10 @@ mod tests {
     /// memory the guest had just taken back.
     #[test]
     fn deflate_posts_on_the_deflate_queue() {
-        let device = device();
-        let mut pages = Pages::new(1);
-        let base = pages.range(1).as_ptr() as u64;
+        let dma = arena();
+        let device = device_with(ALL_BALLOON_FEATURES, dma.clone());
+        let mut pages = Pages::new(&dma, 1);
+        let base = pages.device_base();
         let mut ranges = [pages.range(1)];
 
         let idle_inflate = device
@@ -893,11 +915,12 @@ mod tests {
     /// writable buffers, one descriptor per run.
     #[test]
     fn reporting_posts_each_run_as_a_writable_descriptor() {
-        let device = device();
-        let mut first = Pages::new(2);
-        let mut second = Pages::new(1);
-        let first_base = first.range(2).as_ptr() as u64;
-        let second_base = second.range(1).as_ptr() as u64;
+        let dma = arena();
+        let device = device_with(ALL_BALLOON_FEATURES, dma.clone());
+        let mut first = Pages::new(&dma, 2);
+        let mut second = Pages::new(&dma, 1);
+        let first_base = first.device_base();
+        let second_base = second.device_base();
         let mut ranges = [first.range(2), second.range(1)];
 
         let mut report = pin!(device.report_free(&mut ranges));
@@ -927,15 +950,16 @@ mod tests {
     /// published, the free memory, then the stop identifier.
     #[test]
     fn a_free_page_hint_is_framed_by_its_command_identifier() {
-        let device = device();
+        let dma = arena();
+        let device = device_with(ALL_BALLOON_FEATURES, dma.clone());
         device
             .transport
             .set_config_u32(CONFIG_FREE_PAGE_HINT_CMD_ID, 7);
         assert_eq!(device.free_page_hint_cmd_id(), Some(7));
 
         let free_page = device.free_page.as_ref().expect("free-page queue");
-        let mut pages = Pages::new(1);
-        let page_base = pages.range(1).as_ptr() as u64;
+        let mut pages = Pages::new(&dma, 1);
+        let page_base = pages.device_base();
         let mut ranges = [pages.range(1)];
         // The identifier the device published opens the sequence.
         let mut begin = pin!(device.begin_free_page_hint(7));
@@ -1046,10 +1070,11 @@ mod tests {
     /// the host waiting forever for a guest that never answers again.
     #[test]
     fn a_completion_wakes_the_queue_it_belongs_to_even_while_another_waits() {
-        let device = device();
-        let mut pages = Pages::new(1);
+        let dma = arena();
+        let device = device_with(ALL_BALLOON_FEATURES, dma.clone());
+        let mut pages = Pages::new(&dma, 1);
         let mut inflated = [pages.range(1)];
-        let mut free = Pages::new(1);
+        let mut free = Pages::new(&dma, 1);
         let mut reported = [free.range(1)];
 
         let mut inflate = pin!(device.inflate(&mut inflated));
