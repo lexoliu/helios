@@ -159,6 +159,66 @@ pub(super) enum RxFrameDispatch {
     Malformed,
 }
 
+/// A socket handle with the shard that owns it written into it.
+///
+/// The owner used to be recovered as `(id - 1) % shard_count`, which
+/// only worked because a socket was placed on the shard its ephemeral
+/// port strided to — the id encoded the *placement rule* rather than
+/// the placement. Ownership now follows the flow hash, so there is no
+/// rule left to invert and the owner is carried explicitly: the high
+/// half of the id is the shard, the low half is that shard's slab slot.
+///
+/// The low half is stored as `slot + 1` so a handle is never zero, and
+/// so slot 0 of shard 0 is still a valid id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ShardHandle(NonZeroU32);
+
+impl ShardHandle {
+    const SLOT_BITS: u32 = 16;
+    const SLOT_MASK: u32 = (1 << Self::SLOT_BITS) - 1;
+
+    pub(super) fn new(owner: usize, slot: usize) -> Self {
+        let owner = u32::try_from(owner)
+            .ok()
+            .filter(|owner| *owner <= Self::SLOT_MASK)
+            .unwrap_or_else(|| panic!("network shard {owner} does not fit a handle's owner half"));
+        let encoded_slot = u32::try_from(slot)
+            .ok()
+            .and_then(|slot| slot.checked_add(1))
+            .filter(|slot| *slot <= Self::SLOT_MASK)
+            .unwrap_or_else(|| panic!("network handle slot {slot} does not fit a handle"));
+        Self(
+            NonZeroU32::new((owner << Self::SLOT_BITS) | encoded_slot)
+                .unwrap_or_else(|| panic!("network handle slot {slot} encoded to zero")),
+        )
+    }
+
+    /// The shard that minted this handle and owns the socket behind it.
+    pub(super) const fn owner(self) -> usize {
+        (self.0.get() >> Self::SLOT_BITS) as usize
+    }
+
+    /// The owning shard's slab slot.
+    pub(super) const fn slot(self) -> usize {
+        ((self.0.get() & Self::SLOT_MASK) - 1) as usize
+    }
+
+    pub(super) const fn get(self) -> NonZeroU32 {
+        self.0
+    }
+
+    /// Rebuilds a handle a component host round-tripped through a raw
+    /// integer. A value that never named a slot is a caller bug, not a
+    /// recoverable error.
+    pub(super) fn from_raw(raw: NonZeroU32) -> Self {
+        assert!(
+            raw.get() & Self::SLOT_MASK != 0,
+            "network handle {raw} carries no slab slot"
+        );
+        Self(raw)
+    }
+}
+
 /// A shard's arrival signal sampled before the caller inspected that
 /// shard, together with the shard it came from.
 ///
@@ -239,36 +299,41 @@ impl NetworkShardSet {
 
     /// Picks the shard responsible for an unqualified operation
     /// (control-plane queries, admin commands that target every
-    /// shard, etc.). Implemented in terms of `shard_for_handle(0)`
-    /// so the routing rule lives in exactly one place.
+    /// shard, etc.).
     #[inline]
     pub(super) fn shard_for_default(&self) -> &SpinMutex<NetworkShard> {
         &self.shards[self.default_shard_idx()].inner
     }
 
     /// Index of the shard [`Self::shard_for_default`] resolves to.
+    ///
+    /// The same shard that owns every frame the hash cannot name, so a
+    /// control-plane operation and an ARP reply meet on one shard.
     #[inline]
-    pub(super) fn default_shard_idx(&self) -> usize {
-        // Handle id 1 is the canonical "shard 0" id under the
-        // stride encoding (slot 0 in shard 0 -> id = 1), so
-        // shard_for_default and shard_for_handle agree on shard 0.
-        self.shard_idx_for_handle(1u64)
+    pub(super) const fn default_shard_idx(&self) -> usize {
+        DEFAULT_SHARD_IDX
     }
 
-    /// Picks the shard owning a given socket / connection handle
-    /// using the inverse of `NetworkShard::encode_handle_id`:
-    /// `(handle - 1) % shard_count == shard_idx`.
+    /// Picks the shard owning a given socket / connection handle.
     #[inline]
-    pub(super) fn shard_for_handle<H: Into<u64>>(&self, handle: H) -> &SpinMutex<NetworkShard> {
+    pub(super) fn shard_for_handle<H: Into<ShardHandle>>(
+        &self,
+        handle: H,
+    ) -> &SpinMutex<NetworkShard> {
         &self.shards[self.shard_idx_for_handle(handle)].inner
     }
 
-    /// Index of the shard owning `handle`.
+    /// Index of the shard owning `handle`, as the handle itself records
+    /// it.
     #[inline]
-    pub(super) fn shard_idx_for_handle<H: Into<u64>>(&self, handle: H) -> usize {
-        let handle: u64 = handle.into();
-        let normalized = handle.saturating_sub(1) as usize;
-        normalized % self.shards.len()
+    pub(super) fn shard_idx_for_handle<H: Into<ShardHandle>>(&self, handle: H) -> usize {
+        let owner = handle.into().owner();
+        assert!(
+            owner < self.shards.len(),
+            "network handle names shard {owner} but the set has {}",
+            self.shards.len()
+        );
+        owner
     }
 
     /// The shard's cross-processor arrival signal. Raised by whichever
@@ -305,7 +370,7 @@ impl NetworkShardSet {
 
     /// Samples the arrival signal of the shard owning `handle`.
     #[inline]
-    pub(super) fn shard_wait_for_handle<H: Into<u64>>(&self, handle: H) -> ShardWait {
+    pub(super) fn shard_wait_for_handle<H: Into<ShardHandle>>(&self, handle: H) -> ShardWait {
         self.shard_wait(self.shard_idx_for_handle(handle))
     }
 
@@ -427,7 +492,7 @@ impl NetworkShardSet {
     /// etc.) needs interior mutation; a read-only sibling would only
     /// be useful for diagnostic peeks the kernel does not currently
     /// expose.
-    pub(super) fn with_handle<H: Into<u64>, R>(
+    pub(super) fn with_handle<H: Into<ShardHandle>, R>(
         &self,
         handle: H,
         f: impl FnOnce(&mut NetworkShard) -> R,
@@ -551,38 +616,25 @@ impl NetworkShard {
         }
     }
 
-    /// Encodes a per-shard slab index into a globally unique handle
-    /// id whose value satisfies `(id - 1) % shard_count == shard_idx`.
-    /// This is the inverse of `NetworkShardSet::shard_for_handle`
-    /// so an operation arriving with a handle can route directly to
-    /// the shard that minted it without consulting a side table.
-    pub(super) fn encode_handle_id(&self, slot: usize) -> u32 {
-        let stride = self.shard_count;
-        let raw = slot
-            .checked_mul(stride)
-            .and_then(|product| product.checked_add(self.shard_idx + 1))
-            .unwrap_or_else(|| {
-                panic!(
-                    "network handle slot {slot} overflowed stride {stride} encoding for shard {}",
-                    self.shard_idx
-                )
-            });
-        u32::try_from(raw).unwrap_or_else(|_| panic!("encoded handle id {raw} exceeds u32 range"))
+    /// Mints a handle for one of this shard's slab slots, stamping this
+    /// shard as its owner so an operation arriving with the handle
+    /// routes straight back here without a side table.
+    pub(super) fn encode_handle_id(&self, slot: usize) -> ShardHandle {
+        ShardHandle::new(self.shard_idx, slot)
     }
 
-    /// Reverses `encode_handle_id`. Panics if the handle was minted
-    /// by a different shard, since misrouted handles indicate a
-    /// caller-side dispatch bug.
-    pub(super) fn decode_handle_slot(&self, raw: u32) -> usize {
-        let value = (raw - 1) as usize;
+    /// Reads the slab slot out of a handle this shard owns. Panics if
+    /// the handle was minted by a different shard, since a misrouted
+    /// handle is a caller-side dispatch bug.
+    pub(super) fn decode_handle_slot(&self, handle: ShardHandle) -> usize {
         assert_eq!(
-            value % self.shard_count,
+            handle.owner(),
             self.shard_idx,
-            "handle id {raw} routed to shard {} but encodes shard {}",
+            "handle routed to shard {} but names shard {}",
             self.shard_idx,
-            value % self.shard_count
+            handle.owner()
         );
-        value / self.shard_count
+        handle.slot()
     }
 
     pub(super) fn is_configured(&self) -> bool {

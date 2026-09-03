@@ -54,6 +54,15 @@ use triomphe::Arc;
 const EPHEMERAL_PORT_START: u16 = 49_152;
 const EPHEMERAL_PORT_END: u16 = 65_535;
 
+/// The shard that owns everything the flow hash cannot name.
+///
+/// ARP and ICMP carry no four-tuple, and the DHCP client's exchange is
+/// broadcast at a moment when the interface has no address to hash
+/// with, so all of them are demultiplexed here on every backend. It is
+/// also where unqualified control-plane operations run, so a route the
+/// ARP reply taught and the query that reads it meet on one shard.
+const DEFAULT_SHARD_IDX: usize = 0;
+
 const INTERNAL_DNS_PORT: u16 = 49_151;
 const INTERNAL_DHCP_SOCKET_INDEX: usize = 0;
 const INTERNAL_DNS_SOCKET_INDEX: usize = 1;
@@ -191,6 +200,12 @@ impl From<TcpStreamId> for u64 {
     }
 }
 
+impl From<TcpStreamId> for ShardHandle {
+    fn from(id: TcpStreamId) -> Self {
+        ShardHandle::from_raw(id.0)
+    }
+}
+
 #[cfg(feature = "wasmtime-runtime")]
 impl crate::ComponentHostTcpStreamToken for TcpStreamId {
     fn into_raw(self) -> u64 {
@@ -215,6 +230,12 @@ impl From<TcpListenerId> for u64 {
     }
 }
 
+impl From<TcpListenerId> for ShardHandle {
+    fn from(id: TcpListenerId) -> Self {
+        ShardHandle::from_raw(id.0)
+    }
+}
+
 #[cfg(feature = "wasmtime-runtime")]
 impl crate::ComponentHostTcpListenerToken for TcpListenerId {
     fn into_raw(self) -> u64 {
@@ -236,6 +257,12 @@ pub struct UdpSocketId(NonZeroU32);
 impl From<UdpSocketId> for u64 {
     fn from(id: UdpSocketId) -> Self {
         u64::from(id.0.get())
+    }
+}
+
+impl From<UdpSocketId> for ShardHandle {
+    fn from(id: UdpSocketId) -> Self {
+        ShardHandle::from_raw(id.0)
     }
 }
 
@@ -2120,6 +2147,40 @@ mod tests {
                 .is_some(),
             "the released operation must find its datagram"
         );
+    }
+
+    /// A handle carries its owner, so an operation routes to the shard
+    /// that minted it without anybody re-deriving where the socket
+    /// "should" have been placed.
+    #[test]
+    fn a_handle_names_the_shard_that_minted_it() {
+        use super::ShardHandle;
+
+        for owner in [0usize, 1, 7, 4095] {
+            for slot in [0usize, 1, 255, 4095] {
+                let handle = ShardHandle::new(owner, slot);
+                assert_eq!(handle.owner(), owner);
+                assert_eq!(handle.slot(), slot);
+                assert_eq!(ShardHandle::from_raw(handle.get()), handle);
+            }
+        }
+    }
+
+    /// Slot 0 of shard 0 has to be a usable handle, and no handle may
+    /// be zero — the public ids are `NonZeroU32`.
+    #[test]
+    fn the_first_slot_of_the_first_shard_is_a_valid_handle() {
+        let handle = super::ShardHandle::new(0, 0);
+        assert_eq!(handle.get().get(), 1);
+        assert_eq!(handle.owner(), 0);
+        assert_eq!(handle.slot(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "carries no slab slot")]
+    fn a_raw_handle_without_a_slot_is_rejected() {
+        let raw = core::num::NonZeroU32::new(1 << 16).expect("owner-only handle is non-zero");
+        let _ = super::ShardHandle::from_raw(raw);
     }
 
     /// A batch that lands several frames in the same shard releases it
