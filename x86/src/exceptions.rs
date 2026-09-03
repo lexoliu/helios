@@ -35,11 +35,6 @@ pub(crate) const NETWORK_QUEUE_INTERRUPT_VECTORS: [u8; MAX_NETWORK_QUEUE_VECTORS
 pub(crate) const HOST_FS_INTERRUPT_VECTOR: u8 = 0x31;
 pub(crate) const ENTROPY_INTERRUPT_VECTOR: u8 = 0x32;
 pub(crate) const VSOCK_INTERRUPT_VECTOR: u8 = 0x37;
-/// The memory balloon's vector sits after the block devices' rather
-/// than filling the first free slot: the vsock transport claims `0x37`,
-/// and two devices sharing a vector would each be told about the
-/// other's completions.
-pub(crate) const BALLOON_INTERRUPT_VECTOR: u8 = 0x38;
 /// One vector per block device the routing table can hold: the platform
 /// exposes the boot image and the kernel's own disk as separate
 /// functions, and each of them delivers its completions on its own
@@ -48,12 +43,16 @@ pub(crate) const BLOCK_INTERRUPT_VECTORS: [u8; helios_kernel::MAX_BLOCK_DEVICES]
     [0x33, 0x34, 0x35, 0x36];
 
 /// Device interrupt routing table for this backend, keyed by IDT vector.
+///
+/// The memory balloon has no slot to fill: its PCI function carries no
+/// MSI-X capability, and `balloon` reads its interrupt status on the
+/// kernel timer instead.
 pub(crate) type DeviceInterruptRoutes = helios_kernel::ExternalInterruptRoutes<
     u8,
     crate::net::VirtioNetworkDevice,
     crate::host_fs::HostFsTransportService,
     crate::entropy::VirtioEntropyDevice,
-    crate::balloon::VirtioBalloonInterrupt,
+    core::convert::Infallible,
     crate::vsock::VirtioVsockFunction,
     crate::block::VirtioBlockDevice,
 >;
@@ -83,7 +82,6 @@ unsafe extern "C" {
     fn helios_x86_interrupt_host_fs();
     fn helios_x86_interrupt_entropy();
     fn helios_x86_interrupt_vsock();
-    fn helios_x86_interrupt_balloon();
     fn helios_x86_interrupt_block_0();
     fn helios_x86_interrupt_block_1();
     fn helios_x86_interrupt_block_2();
@@ -158,8 +156,6 @@ impl ProcessorIdt {
                 .set_handler_addr(handler_address(helios_x86_interrupt_entropy));
             table[VSOCK_INTERRUPT_VECTOR]
                 .set_handler_addr(handler_address(helios_x86_interrupt_vsock));
-            table[BALLOON_INTERRUPT_VECTOR]
-                .set_handler_addr(handler_address(helios_x86_interrupt_balloon));
             let block_stubs: [unsafe extern "C" fn(); helios_kernel::MAX_BLOCK_DEVICES] = [
                 helios_x86_interrupt_block_0,
                 helios_x86_interrupt_block_1,
@@ -241,7 +237,6 @@ extern "C" fn helios_x86_interrupt_dispatch(frame: &mut ExceptionFrame) {
             "unhandled x86 interrupt vector={:#x} rip={:#x}; device vectors are \
              network={NETWORK_INTERRUPT_VECTOR:#x} host-fs={HOST_FS_INTERRUPT_VECTOR:#x} \
              entropy={ENTROPY_INTERRUPT_VECTOR:#x} vsock={VSOCK_INTERRUPT_VECTOR:#x} \
-             entropy={ENTROPY_INTERRUPT_VECTOR:#x} balloon={BALLOON_INTERRUPT_VECTOR:#x} \
              block={BLOCK_INTERRUPT_VECTORS:#x?}",
             frame.vector, frame.rip
         ),
@@ -263,7 +258,6 @@ fn is_device_interrupt(vector: u8) -> bool {
             | HOST_FS_INTERRUPT_VECTOR
             | ENTROPY_INTERRUPT_VECTOR
             | VSOCK_INTERRUPT_VECTOR
-            | BALLOON_INTERRUPT_VECTOR
     ) || BLOCK_INTERRUPT_VECTORS.contains(&vector)
         || NETWORK_QUEUE_INTERRUPT_VECTORS.contains(&vector)
 }
