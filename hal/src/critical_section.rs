@@ -57,7 +57,7 @@ impl ProcessorIdentity {
     /// bit would then collide with the bootstrapping tag.
     pub fn installed<Runtime>(runtime: &Runtime) -> Self {
         assert!(
-            align_of::<Runtime>() % 2 == 0,
+            align_of::<Runtime>().is_multiple_of(2),
             "a per-processor runtime must be at least two-byte aligned"
         );
         let address = core::ptr::from_ref(runtime) as usize;
