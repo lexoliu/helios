@@ -41,8 +41,10 @@ pub struct ProgramOutOfMemory {
 ///
 /// Long enough for a wasmtime error's own sentence, short enough that every
 /// program error stays a stack value in a kernel that does not allocate on
-/// failure paths.
-const RUNTIME_MESSAGE_CAPACITY: usize = 192;
+/// failure paths — and small enough that `ProgramExecError` still fits the
+/// budget asserted below, since the error travels by value through every
+/// `Result` on the program path.
+const RUNTIME_MESSAGE_CAPACITY: usize = 112;
 
 /// What the runtime itself said about a failure the kernel has no name for.
 ///
@@ -228,6 +230,15 @@ pub struct ProgramExecError {
     pub kind: ProgramExecErrorKind,
     pub detail: ProgramExecErrorDetail,
 }
+
+/// Every fallible program operation returns this by value, so its size is a
+/// property of the whole program path rather than of this type alone. 128
+/// bytes is `clippy::result_large_err`'s budget for an `Err` variant, and
+/// [`RUNTIME_MESSAGE_CAPACITY`] is what has to give if the struct grows.
+const _: () = assert!(
+    size_of::<ProgramExecError>() <= 128,
+    "ProgramExecError outgrew the budget an Err variant is allowed to carry"
+);
 
 #[cfg(test)]
 mod tests {
