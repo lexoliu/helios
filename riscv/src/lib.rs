@@ -9,6 +9,7 @@ mod host_fs;
 mod net;
 mod pci;
 mod rtc;
+mod vsock;
 mod watchdog;
 
 mod debug_state {
@@ -564,9 +565,15 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     let debug_state = shared_debug_state(timebase_frequency, hart_count);
     let debug_transport = DebugTransport::discover(&fdt);
     let watchdog = shared_watchdog(&fdt);
+    let has_vsock = vsock::has_vsock_device(&fdt);
+    // The boot UART carries kernel tracing unless the embedded system
+    // component needs the line to itself for its RPC framing. It needs
+    // the line only when the machine has no vsock device: with one, the
+    // component serves its RPC there and the UART stays a console, which
+    // is the whole reason the vsock transport exists.
     let console = sbi_console(
         debug_state.clone(),
-        !helios_kernel::has_embedded_system_component(),
+        !helios_kernel::has_embedded_system_component() || has_vsock,
     );
     let cpu = RiscvCpu::new(
         current_hart,
@@ -594,6 +601,9 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     }
     if balloon::has_balloon_device(&fdt) {
         devices = devices.with_memory_balloon();
+    }
+    if has_vsock {
+        devices = devices.with_vsock();
     }
     let kernel = helios_kernel::init_with_watchdog(
         helios_kernel::Platform::with_watchdog(
@@ -655,6 +665,9 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             if let Some(balloon) = balloon::install(&kernel, &fdt) {
                 debug_state.install_memory_balloon(balloon.handle.clone());
                 interrupts.attach_balloon(balloon);
+            }
+            if let Some(vsock) = vsock::install(&kernel, &cpu, &fdt, &debug_state) {
+                interrupts.attach_vsock(vsock);
             }
             for block in block::install(&cpu, &kernel, &fdt, &debug_state, root_entropy) {
                 interrupts.attach_block(block);

@@ -1,0 +1,88 @@
+package helios:system@0.1.0;
+
+/// Host/guest stream sockets over the machine's vsock transport.
+///
+/// vsock addresses are `(context id, port)` pairs and the link is
+/// point-to-point: there is no routing, no name resolution and no
+/// network for a peer to be reachable through. That is what makes it
+/// the transport for the inspector RPC and the debugger — it works on a
+/// machine whose network is down, misconfigured, or deliberately absent.
+interface vsock {
+  /// Monotonic nanoseconds since system boot.
+  type mono-nanos = u64;
+
+  record vsock-address {
+    cid: u64,
+    port: u32,
+  }
+
+  enum vsock-error-kind {
+    /// This machine has no vsock device.
+    unavailable,
+    /// The port is already bound, or no ephemeral port is free.
+    address-in-use,
+    /// The peer refused the connection.
+    connection-refused,
+    /// The connection was reset.
+    connection-reset,
+    /// The connection is closed for this operation.
+    closed,
+    /// The deadline passed before the operation could finish.
+    timeout,
+    /// The program's authority does not cover this operation.
+    permission-denied,
+    internal,
+  }
+
+  record vsock-error {
+    kind: vsock-error-kind,
+    detail: string,
+  }
+
+  resource vsock-stream {
+    /// The address of the peer this stream is connected to.
+    peer: async func() -> result<vsock-address, vsock-error>;
+
+    /// Reads up to `max-bytes` octets from the peer.
+    ///
+    /// `none` indicates an orderly end of file after the peer closed its
+    /// transmit side and everything it sent has been handed over.
+    read: async func(max-bytes: u32, timeout: mono-nanos) -> result<option<list<u8>>, vsock-error>;
+
+    /// Writes as much of `bytes` as the peer's credit window allows
+    /// before the deadline, returning how many octets were written.
+    ///
+    /// A short write is backpressure, not an error: the caller decides
+    /// whether to come back for the rest.
+    write: async func(bytes: list<u8>, timeout: mono-nanos) -> result<u64, vsock-error>;
+
+    /// Announces that this end will send no more octets. The peer may
+    /// keep sending, and this stream keeps delivering what arrives.
+    shutdown-send: async func() -> result<_, vsock-error>;
+
+    /// Releases the connection immediately, resetting the peer.
+    close: async func() -> result<_, vsock-error>;
+  }
+
+  resource vsock-listener {
+    /// The port this listener is bound to, which a caller that asked for
+    /// an ephemeral port needs in order to name it.
+    port: async func() -> result<u32, vsock-error>;
+
+    /// Waits for the next connection that completed its handshake.
+    accept: async func(timeout: mono-nanos) -> result<vsock-stream, vsock-error>;
+
+    /// Releases the bound port. Connections already accepted stay open.
+    close: async func() -> result<_, vsock-error>;
+  }
+
+  /// The context id the hypervisor assigned this machine, or `none` on a
+  /// machine with no vsock device.
+  guest-cid: async func() -> option<u64>;
+
+  /// Binds `port`, or an ephemeral port when `port` is zero.
+  listen: async func(port: u32, backlog: u32) -> result<vsock-listener, vsock-error>;
+
+  /// Opens a stream to `address`.
+  connect: async func(address: vsock-address, timeout: mono-nanos) -> result<vsock-stream, vsock-error>;
+}

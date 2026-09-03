@@ -44,6 +44,9 @@ pub enum DeviceType {
     Entropy = 4,
     MemoryBalloon = 5,
     _9P = 9,
+    /// virtio-vsock: the host/guest socket transport the inspector RPC
+    /// and the debugger ride on.
+    Vsock = 19,
     /// virtio-iommu: the translation unit the platform's confined
     /// devices issue their DMA through.
     Iommu = 23,
@@ -60,6 +63,7 @@ impl DeviceType {
             4 => Some(Self::Entropy),
             5 => Some(Self::MemoryBalloon),
             9 => Some(Self::_9P),
+            19 => Some(Self::Vsock),
             23 => Some(Self::Iommu),
             _ => None,
         }

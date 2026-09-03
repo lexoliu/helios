@@ -741,6 +741,23 @@ where
     VirtioBalloonDevice::new(transport)
 }
 
+/// Builds a virtio-vsock driver on top of a modern virtio-PCI function.
+pub fn vsock_from_pci<A, M, P>(
+    access: &A,
+    address: PciAddress,
+    mapper: &M,
+    dma: P,
+    msix_vector: Option<u16>,
+) -> IoResult<crate::vsock::VirtioVsockDevice<VirtioPciTransport<P>>>
+where
+    A: ConfigRegionAccess,
+    M: PciMmioMapper,
+    P: DmaPool,
+{
+    let transport = VirtioPciTransport::new(access, address, mapper, dma, msix_vector)?;
+    crate::vsock::VirtioVsockDevice::new(transport)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{MODERN_DEVICE_ID_BASE, device_type_from_ids, interrupt_status};

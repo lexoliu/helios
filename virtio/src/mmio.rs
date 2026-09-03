@@ -10,11 +10,13 @@ use crate::net::VirtioNetDevice;
 use crate::p9::Virtio9pDevice;
 use crate::rng::VirtioRngDevice;
 use crate::transport::VirtioMmioTransport;
+use crate::vsock::VirtioVsockDevice;
 
 pub type VirtioMmioBlockDevice<C> = VirtioBlockResource<VirtioMmioTransport<MmioBus>, C>;
 pub type VirtioMmioNetDevice = VirtioNetDevice<VirtioMmioTransport<MmioBus>>;
 pub type VirtioMmio9pDevice = Virtio9pDevice<VirtioMmioTransport<MmioBus>>;
 pub type VirtioMmioRngDevice = VirtioRngDevice<VirtioMmioTransport<MmioBus>>;
+pub type VirtioMmioVsockDevice = VirtioVsockDevice<VirtioMmioTransport<MmioBus>>;
 pub type VirtioMmioBalloonDevice = VirtioBalloonDevice<VirtioMmioTransport<MmioBus>>;
 
 /// Builds a VirtIO block resource from a permanently mapped MMIO header.
@@ -186,4 +188,40 @@ where
     let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
     let transport = VirtioMmioTransport::new(bus)?;
     VirtioBalloonDevice::new(transport)
+}
+
+/// Builds a VirtIO vsock device from a permanently mapped MMIO header.
+///
+/// # Safety
+///
+/// `header..header+mmio_size` must refer to a valid, permanently mapped VirtIO
+/// MMIO register block for a vsock device, and no other code may violate the
+/// transport's register access invariants while the returned driver is alive.
+pub unsafe fn vsock_from_mmio(
+    header: NonNull<u8>,
+    mmio_size: usize,
+) -> IoResult<VirtioMmioVsockDevice> {
+    let bus = unsafe { MmioBus::new(header, mmio_size, IdentityDmaPool) }?;
+    let transport = VirtioMmioTransport::new(bus)?;
+    VirtioVsockDevice::new(transport)
+}
+
+/// Builds a VirtIO vsock device on a bus whose DMA addresses are
+/// translated, such as a backend running behind a physical-memory
+/// offset map.
+///
+/// # Safety
+///
+/// Same as [`vsock_from_mmio`].
+pub unsafe fn vsock_from_mmio_with_dma<P>(
+    header: NonNull<u8>,
+    mmio_size: usize,
+    dma: P,
+) -> IoResult<VirtioVsockDevice<VirtioMmioTransport<MmioBus<P>>>>
+where
+    P: DmaPool,
+{
+    let bus = unsafe { MmioBus::new(header, mmio_size, dma) }?;
+    let transport = VirtioMmioTransport::new(bus)?;
+    VirtioVsockDevice::new(transport)
 }

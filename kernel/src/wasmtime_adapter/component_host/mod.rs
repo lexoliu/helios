@@ -69,6 +69,7 @@ fn lower_bytes_to_vec(bytes: Bytes) -> Vec<u8> {
 mod network;
 pub mod service;
 mod topology;
+mod vsock;
 
 struct SerialFmtWriter {
     write_serial: fn(&[u8]),
@@ -105,6 +106,8 @@ pub use topology::{
 };
 
 pub type SbiSerialPort = crate::ComponentSerialPort;
+
+pub use vsock::{ComponentVsockListener, ComponentVsockStream};
 
 pub type NetworkTcpBackend = crate::ComponentTcpBackend<ComponentHostNetworkService>;
 pub type NetworkUdpBackend = crate::ComponentUdpBackend<ComponentHostNetworkService>;
@@ -1543,6 +1546,7 @@ where
 {
     add_programs_to_linker(linker)?;
     add_net_to_linker(linker)?;
+    vsock::add_vsock_to_linker::<vsock::DebuggerVsock, _, _>(linker)?;
     add_stats_to_linker(linker)?;
     add_instances_to_linker(linker)?;
     add_tracing_to_linker(linker)?;
@@ -1727,6 +1731,7 @@ where
 {
     add_programs_to_program_linker(linker)?;
     add_net_to_program_linker(linker)?;
+    vsock::add_vsock_to_linker::<vsock::ProgramVsock, _, _>(linker)?;
     add_stats_to_program_linker(linker)?;
     add_tracing_to_program_linker(linker)?;
     Ok(())

@@ -56,6 +56,12 @@ const BALLOON_IOTHREAD_ID: &str = "balloon-io";
 /// How long the guest's reported balloon size has to hold still before a
 /// wait calls it settled short of the target it was given.
 const BALLOON_STILL_FOR: Duration = Duration::from_secs(10);
+/// How much of QEMU's log a failed session quotes.
+///
+/// The log holds QEMU's own stdout and stderr and stays small, because
+/// the guest console goes to the serial socket instead; the cap is there
+/// so a `-d` trace run cannot bury the error that matters.
+const QEMU_REPORT_TAIL_BYTES: usize = 8192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -141,6 +147,32 @@ enum VmBalloonProfile {
     VirtioBalloonPci,
 }
 
+/// How a profile exposes the guest's vsock transport.
+///
+/// Unlike the other devices this one is optional at run time as well as
+/// per profile: the backend is `vhost-vsock`, which exists only where
+/// the host kernel provides `/dev/vhost-vsock`, so a session asks for it
+/// explicitly and the inspector refuses rather than silently omitting
+/// the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VmVsockProfile {
+    VhostVsockMmio,
+    VhostVsockPci,
+}
+
+/// Which transport carries the inspector RPC to the guest debugger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum VmRpcTransport {
+    /// The debug serial line, shared with the guest console.
+    #[default]
+    Serial,
+    /// A vsock connection to the guest debugger, leaving the serial line
+    /// to the console alone. Requires a host that can provide a vsock
+    /// device; the session fails rather than falling back.
+    Vsock,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VmProfile {
     arch: VmArch,
@@ -165,6 +197,9 @@ struct VmProfile {
     /// behind, if any.
     iommu: Option<VmIommuProfile>,
     balloon: VmBalloonProfile,
+    /// How this profile would attach a vsock device, when a session asks
+    /// for the vsock RPC transport.
+    vsock: VmVsockProfile,
 }
 
 /// The aarch64 platform is device-tree only: the kernel reads the GIC
@@ -197,6 +232,7 @@ const AARCH64_VIRT_HVF_PROFILE: VmProfile = VmProfile {
     // here it could confine.
     iommu: None,
     balloon: VmBalloonProfile::VirtioBalloonMmio,
+    vsock: VmVsockProfile::VhostVsockMmio,
 };
 
 #[cfg(test)]
@@ -224,6 +260,7 @@ const AARCH64_VIRT_TCG_PROFILE: VmProfile = VmProfile {
     // here it could confine.
     iommu: None,
     balloon: VmBalloonProfile::VirtioBalloonMmio,
+    vsock: VmVsockProfile::VhostVsockMmio,
 };
 
 const RISCV64_VM_PROFILE: VmProfile = VmProfile {
@@ -250,6 +287,7 @@ const RISCV64_VM_PROFILE: VmProfile = VmProfile {
     // here it could confine.
     iommu: None,
     balloon: VmBalloonProfile::VirtioBalloonMmio,
+    vsock: VmVsockProfile::VhostVsockMmio,
 };
 
 const X86_64_VM_PROFILE: VmProfile = VmProfile {
@@ -273,6 +311,7 @@ const X86_64_VM_PROFILE: VmProfile = VmProfile {
     entropy: VmEntropyProfile::VirtioRngPci,
     iommu: Some(VmIommuProfile::VirtioIommuPci),
     balloon: VmBalloonProfile::VirtioBalloonPci,
+    vsock: VmVsockProfile::VhostVsockPci,
 };
 
 /// Virtqueue ring layout the inspector asks every virtio device for.
@@ -363,6 +402,10 @@ enum VmIommuProfile {
 pub(crate) struct VmConfigFile {
     #[serde(default)]
     pub(crate) arch: Option<VmArch>,
+    #[serde(default)]
+    pub(crate) rpc_transport: Option<VmRpcTransport>,
+    #[serde(default)]
+    pub(crate) vsock_cid: Option<u32>,
     #[serde(default)]
     pub(crate) debug: Option<bool>,
     #[serde(default)]
@@ -540,6 +583,16 @@ pub(crate) struct VmCommand {
     /// reaches the memory the kernel maps into its domain.
     #[arg(long, default_value_t = false)]
     iommu: bool,
+    /// Transport carrying the inspector RPC to the guest debugger.
+    ///
+    /// `vsock` needs a host that can provide a vsock device; the session
+    /// fails with an explanation rather than falling back to serial.
+    #[arg(long, value_enum)]
+    rpc_transport: Option<VmRpcTransport>,
+
+    /// Context id given to the guest's vsock device.
+    #[arg(long)]
+    vsock_cid: Option<u32>,
 
     /// Create every virtio device with the packed virtqueue layout.
     #[arg(long, default_value_t = false)]
@@ -666,6 +719,8 @@ struct ResolvedVmCommand {
     keep_runtime_dir: bool,
     iommu: bool,
     virtio_devices: VirtioDeviceProfile,
+    rpc_transport: VmRpcTransport,
+    vsock_cid: u32,
     network: VmNetwork,
     qemu_net: Option<QemuNetArgs>,
     command: Option<ResolvedVmSessionCommand>,
@@ -701,8 +756,15 @@ pub(crate) fn run(mut command: VmCommand) -> Result<()> {
     let mut runtime = VmRuntime::spawn(&command)?;
     let result = connect_and_run(&command, &mut runtime);
     let runtime_dir = runtime.runtime_dir_path().to_path_buf();
+    // QEMU's own log is the only account of a machine it refused to
+    // build or a device backend that never started, and the runtime
+    // directory is about to go away, so a failed session reads it here.
+    let report = result.is_err().then(|| runtime.qemu_report());
     runtime.shutdown();
-    result.with_context(|| format!("VM runtime directory: {}", runtime_dir.display()))
+    result.with_context(|| match &report {
+        Some(report) => format!("VM runtime directory: {}\n{report}", runtime_dir.display()),
+        None => format!("VM runtime directory: {}", runtime_dir.display()),
+    })
 }
 
 fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
@@ -762,6 +824,29 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
     let gdb_wait = debug || command.gdb_wait || file.gdb_wait.unwrap_or(false);
     if gdb_wait && gdb.is_none() {
         bail!("--gdb-wait requires --gdb or --debug");
+    }
+    let rpc_transport = command
+        .rpc_transport
+        .or(file.rpc_transport)
+        .unwrap_or_default();
+    let vsock_cid = command
+        .vsock_cid
+        .or(file.vsock_cid)
+        .unwrap_or_else(crate::vsock::default_guest_cid);
+    if rpc_transport == VmRpcTransport::Vsock {
+        // Refuse here, before anything is built or booted: a host that
+        // cannot provide the device would otherwise fail deep inside
+        // QEMU with a message about a device model that does not exist.
+        crate::vsock::preflight()?;
+        if command.serial_stdio || command.serial_pty {
+            bail!(
+                "--rpc-transport vsock keeps the guest console on the serial line, \
+                 which --serial-stdio and --serial-pty take over"
+            );
+        }
+        if vsock_cid < 3 {
+            bail!("--vsock-cid must be 3 or greater; 0, 1 and 2 are reserved");
+        }
     }
     let monitor = command.monitor.or(file.monitor);
     if command.serial_stdio && matches!(monitor.as_deref(), Some("stdio")) {
@@ -858,6 +943,8 @@ fn resolve(command: VmCommand) -> Result<ResolvedVmCommand> {
         keep_runtime_dir,
         iommu,
         virtio_devices,
+        rpc_transport,
+        vsock_cid,
         network,
         qemu_net,
         needs_qmp: matches!(session_command, Some(ResolvedVmSessionCommand::Balloon(_))),
@@ -1044,6 +1131,38 @@ fn connect_and_run(command: &ResolvedVmCommand, runtime: &mut VmRuntime) -> Resu
                 .await
                 .context("failed to connect inspector RPC client over QEMU stdio serial")
         })?,
+        VmTransport::VsockAfterSerial {
+            serial_socket,
+            guest_cid,
+        } => {
+            let socket = serial_socket.to_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "socket path must be valid UTF-8: {}",
+                    serial_socket.display()
+                )
+            })?;
+            let baud = command.baud;
+            crate::runtime::block_on(async move {
+                let io = crate::serial::open(socket, baud).await?;
+                let (mut read, _write) = io.into_split();
+                crate::ready::wait_for_boot(&mut read).await?;
+                // The console echo starts before the RPC connection, not
+                // after it: nothing else reads the serial socket once the
+                // RPC has moved off it, and a socket QEMU cannot write
+                // into stops the guest console — but more importantly a
+                // connection that never comes up is exactly when the
+                // guest's own account of why is worth having.
+                crate::ready::echo_serial_console(read);
+                let (vsock_read, vsock_write) =
+                    crate::vsock::connect(guest_cid, helios_inspector_protocol::VSOCK_RPC_PORT)
+                        .await?;
+                let mut client =
+                    helios_inspector_protocol::transport::Client::new(vsock_read, vsock_write);
+                crate::ready::wait_until_ready(&mut client).await?;
+                Ok::<_, anyhow::Error>(client)
+            })
+            .context("failed to connect inspector RPC client over vsock")?
+        }
     };
     match command.command.clone() {
         Some(ResolvedVmSessionCommand::AotBench(command)) => run_aot_bench(client, command),
@@ -1633,12 +1752,22 @@ struct VmRuntime {
     /// The QMP socket the inspector created, when it owns one.
     qmp_socket: Option<PathBuf>,
     runtime_dir: VmRuntimeDir,
+    qemu_log: PathBuf,
     child: Child,
 }
 
 enum VmTransport {
     SerialSocket(PathBuf),
     SerialIo(crate::serial::SerialIo),
+    /// RPC over vsock, with the guest console left on the serial socket.
+    ///
+    /// The boot markers are printed before any RPC transport exists, so
+    /// the serial socket is still what says when the guest is up; the
+    /// vsock connection is opened once it has.
+    VsockAfterSerial {
+        serial_socket: PathBuf,
+        guest_cid: u32,
+    },
 }
 
 enum VmRuntimeDir {
@@ -1810,6 +1939,14 @@ impl VmRuntime {
         }
         configure_entropy_device(&mut qemu, command.profile.entropy, command.virtio_devices);
         configure_balloon(&mut qemu, command.profile.balloon, command.virtio_devices);
+        if command.rpc_transport == VmRpcTransport::Vsock {
+            configure_vsock_device(
+                &mut qemu,
+                command.profile.vsock,
+                command.vsock_cid,
+                command.virtio_devices,
+            );
+        }
 
         let mut child = qemu.spawn().with_context(|| {
             format!(
@@ -1833,7 +1970,13 @@ impl VmRuntime {
             VmTransport::SerialIo(serial_pty.io)
         } else {
             wait_for_socket(&socket_path, &qemu_log, &mut child)?;
-            VmTransport::SerialSocket(socket_path)
+            match command.rpc_transport {
+                VmRpcTransport::Serial => VmTransport::SerialSocket(socket_path),
+                VmRpcTransport::Vsock => VmTransport::VsockAfterSerial {
+                    serial_socket: socket_path,
+                    guest_cid: command.vsock_cid,
+                },
+            }
         };
         spinner.finish_with_message(format!(
             "{} runtime={} log={}",
@@ -1845,6 +1988,7 @@ impl VmRuntime {
             transport: Some(transport),
             _serial_pty_slave: serial_pty_slave,
             qmp_socket: qmp_socket_path(command, runtime_dir.path()),
+            qemu_log,
             runtime_dir,
             child,
         })
@@ -1858,6 +2002,7 @@ impl VmRuntime {
             .expect("VM transport was already taken")
         {
             VmTransport::SerialSocket(socket_path) => socket_path,
+            VmTransport::VsockAfterSerial { serial_socket, .. } => serial_socket,
             VmTransport::SerialIo(_) => {
                 panic!("QEMU stdio serial transport does not have a socket path")
             }
@@ -1872,6 +2017,30 @@ impl VmRuntime {
 
     fn runtime_dir_path(&self) -> &Path {
         self.runtime_dir.path()
+    }
+
+    /// What QEMU has to say about a session that failed.
+    ///
+    /// QEMU writes its own diagnostics to the runtime directory's log,
+    /// and they are the only account of two failures the RPC path
+    /// cannot see: a machine QEMU refused to build, and a device whose
+    /// host backend never started — a `vhost` backend that gave up
+    /// leaves the device in place, answering configuration reads and
+    /// carrying no traffic at all. The exit status joins the report when
+    /// QEMU is already gone.
+    fn qemu_report(&mut self) -> String {
+        let log = fs::read(&self.qemu_log).unwrap_or_default();
+        let start = log.len().saturating_sub(QEMU_REPORT_TAIL_BYTES);
+        let tail = String::from_utf8_lossy(&log[start..]);
+        let epitaph = match self.child.try_wait().ok().flatten() {
+            Some(status) => format!("QEMU exited with {status}"),
+            None => "QEMU was still running".to_owned(),
+        };
+        format!(
+            "{epitaph}; {} says:\n{}",
+            self.qemu_log.display(),
+            tail.trim()
+        )
     }
 
     fn shutdown(&mut self) {
@@ -2345,6 +2514,26 @@ fn configure_balloon(qemu: &mut Command, balloon: VmBalloonProfile, devices: Vir
     qemu.arg("-device").arg(device.to_string());
 }
 
+/// Gives the guest a vsock device on the host's `vhost-vsock` backend.
+///
+/// There is no user-space vsock backend in QEMU: the host kernel carries
+/// the packets, which is why this is reachable only after
+/// [`crate::vsock::preflight`] has confirmed the host can.
+fn configure_vsock_device(
+    qemu: &mut Command,
+    vsock: VmVsockProfile,
+    guest_cid: u32,
+    queues: VirtioDeviceProfile,
+) {
+    let mut device = QemuOptions::new(match vsock {
+        VmVsockProfile::VhostVsockMmio => "vhost-vsock-device",
+        VmVsockProfile::VhostVsockPci => "vhost-vsock-pci",
+    });
+    device.set("guest-cid", guest_cid);
+    queues.apply(&mut device);
+    qemu.arg("-device").arg(device.to_string());
+}
+
 fn configure_watchdog(qemu: &mut Command, watchdog: VmWatchdogProfile) {
     match watchdog {
         VmWatchdogProfile::I6300Esb => {
@@ -2383,11 +2572,55 @@ mod tests {
     use super::*;
 
     const WATCHDOG_SELF_TEST_DELAY_MS: &str = "5000";
+
     const WATCHDOG_TIMEOUT_SECS: &str = "10";
     const WATCHDOG_STAGE_TIMEOUT: Duration = Duration::from_secs(120);
     const DIRECT_EXEC_TIMEOUT: Duration = Duration::from_secs(900);
     const SERIAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
     const SERIAL_READ_TIMEOUT: Duration = Duration::from_millis(500);
+
+    /// Renders the `-device` argument `configure_vsock_device` would
+    /// pass QEMU, without spawning one.
+    fn vsock_device_argument(vsock: VmVsockProfile, guest_cid: u32) -> String {
+        let mut qemu = Command::new("true");
+        configure_vsock_device(&mut qemu, vsock, guest_cid, VirtioDeviceProfile::default());
+        qemu.get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn the_vsock_device_carries_its_context_id_on_each_bus() {
+        assert_eq!(
+            vsock_device_argument(VmVsockProfile::VhostVsockMmio, 42),
+            "-device vhost-vsock-device,guest-cid=42"
+        );
+        assert_eq!(
+            vsock_device_argument(VmVsockProfile::VhostVsockPci, 7),
+            "-device vhost-vsock-pci,guest-cid=7"
+        );
+    }
+
+    #[test]
+    fn every_profile_names_the_vsock_bus_its_other_devices_use() {
+        // A profile that attached a PCI vsock device to an MMIO-only
+        // machine would fail at QEMU startup rather than at review.
+        assert_eq!(
+            AARCH64_VIRT_HVF_PROFILE.vsock,
+            VmVsockProfile::VhostVsockMmio
+        );
+        assert_eq!(RISCV64_VM_PROFILE.vsock, VmVsockProfile::VhostVsockMmio);
+        assert_eq!(X86_64_VM_PROFILE.vsock, VmVsockProfile::VhostVsockPci);
+    }
+
+    #[test]
+    fn the_rpc_transport_defaults_to_the_serial_line() {
+        // vsock needs a host that can provide the device, so it is opted
+        // into rather than guessed at.
+        assert_eq!(VmRpcTransport::default(), VmRpcTransport::Serial);
+    }
+
     const DEBUGGER_RUN_STAGE_MARKER: &[u8] = b"[KDBG run:begin]";
 
     fn default_network_args() -> VmNetworkArgs {
@@ -2574,6 +2807,8 @@ mod tests {
     /// only care about one option.
     fn minimal_command() -> VmCommand {
         VmCommand {
+            rpc_transport: None,
+            vsock_cid: None,
             arch: VmArch::X86_64,
             debug: false,
             release: false,
@@ -2619,6 +2854,8 @@ mod tests {
             tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
         let missing_config = tempdir.path().join("missing-vm.json");
         let command = VmCommand {
+            rpc_transport: None,
+            vsock_cid: None,
             arch: VmArch::X86_64,
             debug: false,
             release: false,
@@ -2742,6 +2979,8 @@ mod tests {
         let tempdir =
             tempfile::tempdir().expect("temporary directory for VM config resolution must exist");
         let command = VmCommand {
+            rpc_transport: None,
+            vsock_cid: None,
             arch: VmArch::X86_64,
             debug: true,
             release: false,
@@ -2880,8 +3119,10 @@ mod tests {
             runtime_dir: None,
             keep_runtime_dir: false,
             iommu: false,
-            virtio_devices: VirtioDeviceProfile::default(),
             needs_qmp: false,
+            virtio_devices: VirtioDeviceProfile::default(),
+            rpc_transport: VmRpcTransport::Serial,
+            vsock_cid: crate::vsock::default_guest_cid(),
             network: default_network(),
             qemu_net: profile.network.map(|device| {
                 default_network()
@@ -3049,8 +3290,10 @@ mod tests {
             runtime_dir: None,
             keep_runtime_dir: false,
             iommu: false,
-            virtio_devices: VirtioDeviceProfile::default(),
             needs_qmp: false,
+            virtio_devices: VirtioDeviceProfile::default(),
+            rpc_transport: VmRpcTransport::Serial,
+            vsock_cid: crate::vsock::default_guest_cid(),
             network: default_network(),
             qemu_net: profile.network.map(|device| {
                 default_network()
