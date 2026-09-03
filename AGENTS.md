@@ -258,6 +258,18 @@ online` boot line records the queue-pair count and the checksum/TSO bits
 the run actually had. `docs/networking.md` covers the backends, the
 privileged setup, and what each one can exercise.
 
+Locally that baseline is an arm64 host with a tap backend. **In CI the
+multi-queue network baseline is the x86-64 KVM lane**, and it is the
+only lane that can produce one: GitHub's Arm Linux runners expose
+neither `/dev/kvm` nor a readable `/dev/vhost-net`, so a guest there
+would run under TCG behind a userspace tap, with no accelerator and no
+offload to measure. That is why there is no aarch64 Linux benchmark
+lane. The aarch64 numbers come from the macOS HVF lane, whose network
+backend is slirp and whose network numbers are therefore not a
+baseline for anything the driver negotiates. Until an Arm runner with
+KVM exists, do not read a cross-architecture network comparison out of
+CI; take the arm64 tap baseline on a real machine instead.
+
 ## 3.6 Architectural ambition
 
 - Performance, scalability, and architectural cleanliness work must
