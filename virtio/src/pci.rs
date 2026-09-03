@@ -802,14 +802,14 @@ pub fn vsock_from_pci<A, M, P>(
     address: PciAddress,
     mapper: &M,
     dma: P,
-    msix_vector: Option<u16>,
+    msix: Option<MsixBinding>,
 ) -> IoResult<crate::vsock::VirtioVsockDevice<VirtioPciTransport<P>>>
 where
     A: ConfigRegionAccess,
     M: PciMmioMapper,
     P: DmaPool,
 {
-    let transport = VirtioPciTransport::new(access, address, mapper, dma, msix_vector)?;
+    let transport = VirtioPciTransport::new(access, address, mapper, dma, msix)?;
     crate::vsock::VirtioVsockDevice::new(transport)
 }
 
