@@ -6,6 +6,7 @@ mod checksum;
 mod congestion;
 mod dhcp;
 mod dns;
+mod hash;
 mod ndp;
 mod packet;
 mod stack;
@@ -34,6 +35,7 @@ pub use dhcp::{
 pub use dns::{
     DNS_MAX_ADDRESS_RECORDS, DNS_PORT, DnsMessage, DnsQuestionWriter, DnsRecordType, DnsResponse,
 };
+pub use hash::{FlowHash, FlowTuple, RSS_KEY_BYTES, STANDARD_RSS_KEY, flow_hash, toeplitz};
 pub use ndp::{
     Ipv6DnsServers, Ipv6RouterConfiguration, MAX_ADVERTISED_PREFIXES, MAX_IPV6_DNS_SERVERS,
     MAX_ROUTER_SOLICITATIONS, NeighborDiscovery, ROUTER_SOLICITATION_INTERVAL_NANOS,
