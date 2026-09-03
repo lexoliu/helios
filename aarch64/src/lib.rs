@@ -109,10 +109,10 @@ struct SyncTrapFrame {
     spsr: u64,
     /// The `SP_EL1` the interrupted context was running on.
     sp: u64,
-    /// `q0`-`q31`.
-    v: [u128; 32],
     fpsr: u64,
     fpcr: u64,
+    /// `q0`-`q31`.
+    v: [u128; 32],
 }
 
 const _: () = {
@@ -120,9 +120,9 @@ const _: () = {
     assert!(core::mem::offset_of!(SyncTrapFrame, elr) == 0xf8);
     assert!(core::mem::offset_of!(SyncTrapFrame, spsr) == 0x100);
     assert!(core::mem::offset_of!(SyncTrapFrame, sp) == 0x108);
-    assert!(core::mem::offset_of!(SyncTrapFrame, v) == 0x110);
-    assert!(core::mem::offset_of!(SyncTrapFrame, fpsr) == 0x310);
-    assert!(core::mem::offset_of!(SyncTrapFrame, fpcr) == 0x318);
+    assert!(core::mem::offset_of!(SyncTrapFrame, fpsr) == 0x110);
+    assert!(core::mem::offset_of!(SyncTrapFrame, fpcr) == 0x118);
+    assert!(core::mem::offset_of!(SyncTrapFrame, v) == 0x120);
 };
 
 mod vmm;
