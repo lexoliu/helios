@@ -13,7 +13,7 @@ use core::cell::UnsafeCell;
 use core::future::Future;
 use core::ops::{Deref, DerefMut};
 use core::pin::Pin;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 
 use event_listener::{Event, EventListener};
@@ -36,6 +36,41 @@ pub struct Notified<'a> {
 
 /// Reusable state for polling a [`Notify`] without allocating a Future.
 pub struct NotifyWaiter {
+    listener: Option<EventListener>,
+}
+
+/// Broadcast progress signal for level-triggered "something moved" events.
+///
+/// [`Notify`] hands out permits, so one signal is claimed by exactly one
+/// waiter and a broadcast has to know in advance how many waiters exist.
+/// A progress signal instead publishes a monotonically increasing
+/// generation: a waiter samples it with [`ProgressSignal::mark`] before
+/// it inspects the state it is waiting on, then parks on
+/// [`ProgressSignal::changed`]. Every waiter observes every signal,
+/// including one raised between the inspection and the park, and a
+/// signal with no waiters costs a single atomic increment.
+///
+/// # SMP contract
+///
+/// [`ProgressSignal::signal`] is lock-free, allocation-free and safe to
+/// call from interrupt context on any processor; it is the primitive a
+/// producer running on one CPU uses to release a consumer parked on
+/// another. [`ProgressSignal::mark`] is a plain acquire load and
+/// [`ProgressSignal::changed`] never spins.
+pub struct ProgressSignal {
+    generation: AtomicU64,
+    event: Event,
+}
+
+/// A [`ProgressSignal`] generation sampled by a waiter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProgressMark(u64);
+
+/// Future returned by [`ProgressSignal::changed`].
+#[must_use = "futures do nothing unless awaited"]
+pub struct ProgressChanged<'a> {
+    signal: &'a ProgressSignal,
+    mark: ProgressMark,
     listener: Option<EventListener>,
 }
 
@@ -260,6 +295,84 @@ impl Future for Notified<'_> {
         let result = self.notify.poll_notified(cx, &mut waiter);
         self.listener = waiter.listener;
         result
+    }
+}
+
+impl ProgressSignal {
+    pub const fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            event: Event::new(),
+        }
+    }
+
+    /// Samples the current generation.
+    ///
+    /// The caller must take its mark *before* it inspects the state the
+    /// signal describes. A signal raised between the inspection and the
+    /// park then still lands after the mark, and [`Self::changed`]
+    /// completes immediately instead of parking on a wake that already
+    /// happened.
+    pub fn mark(&self) -> ProgressMark {
+        ProgressMark(self.generation.load(Ordering::Acquire))
+    }
+
+    /// Waits until the signal is raised at least once after `mark`.
+    pub fn changed(&self, mark: ProgressMark) -> ProgressChanged<'_> {
+        ProgressChanged {
+            signal: self,
+            mark,
+            listener: None,
+        }
+    }
+
+    /// Publishes progress to every waiter.
+    ///
+    /// Non-blocking and safe from interrupt context on any processor.
+    pub fn signal(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.event.notify(usize::MAX);
+    }
+}
+
+impl Default for ProgressSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Future for ProgressChanged<'_> {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        loop {
+            if self.signal.generation.load(Ordering::Acquire) != self.mark.0 {
+                self.listener = None;
+                return Poll::Ready(());
+            }
+
+            if self.listener.is_none() {
+                // Registering before the generation is re-read above on
+                // the next turn of the loop is what closes the lost-wake
+                // window.
+                self.listener = Some(self.signal.event.listen());
+                continue;
+            }
+
+            let listener = self
+                .listener
+                .as_mut()
+                .expect("progress listener disappeared unexpectedly");
+            let mut listener = core::pin::pin!(listener);
+
+            match listener.as_mut().poll(cx) {
+                Poll::Ready(()) => {
+                    self.listener = None;
+                    continue;
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
     }
 }
 
@@ -508,9 +621,42 @@ mod tests {
     use alloc::vec::Vec;
     use core::sync::atomic::{AtomicBool, Ordering};
 
-    use futures_lite::future::{block_on, yield_now, zip};
+    use futures_lite::future::{block_on, poll_once, yield_now, zip};
 
-    use super::{Mutex, Notify, RawMutex, RwLock};
+    use super::{Mutex, Notify, ProgressSignal, RawMutex, RwLock};
+
+    /// One signal releases every parked waiter, which is the whole
+    /// reason a shard arrival cannot be a permit-based `Notify`: a
+    /// shard routinely has several operations waiting on it at once and
+    /// a permit would wake exactly one of them.
+    #[test]
+    fn progress_signal_releases_every_waiter() {
+        let signal = ProgressSignal::new();
+        let first = signal.mark();
+        let second = signal.mark();
+        signal.signal();
+
+        block_on(zip(signal.changed(first), signal.changed(second)));
+    }
+
+    /// A signal raised between the caller's inspection and its park is
+    /// the race the mark exists to close.
+    #[test]
+    fn progress_signal_marked_before_the_signal_does_not_park() {
+        let signal = ProgressSignal::new();
+        let mark = signal.mark();
+        signal.signal();
+
+        block_on(signal.changed(mark));
+    }
+
+    #[test]
+    fn progress_signal_without_a_signal_stays_pending() {
+        let signal = ProgressSignal::new();
+        let mark = signal.mark();
+
+        assert!(block_on(poll_once(signal.changed(mark))).is_none());
+    }
 
     #[test]
     fn notify_preserves_signal_sent_before_await() {

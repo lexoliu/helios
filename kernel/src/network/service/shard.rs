@@ -1,3 +1,23 @@
+//! Per-processor network shards and the RX demux that feeds them.
+//!
+//! # SMP contract
+//!
+//! There is one [`NetworkShard`] per processor and every shard owns an
+//! independent `Stack`, socket slab and port allocator. A local port
+//! belongs to exactly one shard ([`shard_idx_for_port`]), so the frames
+//! for a socket are always placed in that socket's shard whichever
+//! processor drained them off the device.
+//!
+//! Placement is therefore routinely cross-processor: the shard lock is
+//! taken by the draining CPU, not the owning one. That hand-off is
+//! completed by [`PaddedShard::arrival`] — the draining CPU raises the
+//! owning shard's progress signal after it releases the lock, and
+//! [`NetworkShardSet::notify_arrivals`] additionally wakes the owning
+//! processor when it is not the one that drained, so a parked executor
+//! runs the released waiter instead of sleeping to its own deadline.
+//! Nothing in this module spins, and no shard lock is ever held across
+//! an await point.
+
 use super::*;
 
 /// Peek the L4 destination port out of a parsed Ethernet frame.
@@ -104,10 +124,91 @@ pub(super) struct NetworkShard {
 #[repr(align(64))]
 pub(super) struct PaddedShard {
     pub(super) inner: SpinMutex<NetworkShard>,
+    /// Raised every time a frame is placed in this shard's stack.
+    ///
+    /// Deliberately outside the `SpinMutex`: the processor that drained
+    /// the frame signals after it has released the lock, and a waiter
+    /// parks on the signal without taking the lock at all.
+    pub(super) arrival: ProgressSignal,
+}
+
+/// Shards that took a frame during one receive batch.
+///
+/// A batch drains at most [`NETWORK_RX_BATCH_FRAMES`] frames and each
+/// frame reaches exactly one shard, so the set of shards to signal
+/// afterwards is bounded by the batch rather than by the processor
+/// count — no allocation, and no cap on how many CPUs the kernel runs
+/// on.
+pub(super) struct ShardArrivals {
+    touched: [u16; NETWORK_RX_BATCH_FRAMES],
+    len: usize,
+}
+
+/// What the RX demux did with one received frame.
+pub(super) enum RxFrameDispatch {
+    /// The owning shard took the frame. `backpressured` reports that its
+    /// receive window closed as it did.
+    Delivered {
+        shard_idx: usize,
+        backpressured: bool,
+    },
+    /// The owning shard refused the frame; the caller must stop draining
+    /// and let the stack catch up.
+    Backpressured,
+    /// Nothing parsed the frame. It is consumed, but no shard changed.
+    Malformed,
+}
+
+/// A shard's arrival signal sampled before the caller inspected that
+/// shard, together with the shard it came from.
+///
+/// Carrying the two as one value is what keeps the wait hard to misuse:
+/// an operation cannot park on one shard's signal holding another
+/// shard's mark, and taking the mark is the same call that decides which
+/// shard the operation belongs to.
+#[derive(Clone, Copy)]
+pub(super) struct ShardWait {
+    pub(super) shard_idx: usize,
+    pub(super) mark: ProgressMark,
 }
 
 pub(super) struct NetworkShardSet {
     pub(super) shards: Box<[PaddedShard]>,
+}
+
+impl ShardArrivals {
+    pub(super) const fn new() -> Self {
+        Self {
+            touched: [0; NETWORK_RX_BATCH_FRAMES],
+            len: 0,
+        }
+    }
+
+    /// Records that `shard_idx` took a frame, ignoring a shard that is
+    /// already in the set. The linear scan is over at most the batch
+    /// size and beats a bitmap that would have to be sized to the
+    /// machine's processor count.
+    pub(super) fn record(&mut self, shard_idx: usize) {
+        let shard_idx = u16::try_from(shard_idx)
+            .unwrap_or_else(|_| panic!("network shard index {shard_idx} exceeds u16 range"));
+        if self.touched[..self.len].contains(&shard_idx) {
+            return;
+        }
+        assert!(
+            self.len < self.touched.len(),
+            "receive batch touched more shards than it drained frames"
+        );
+        self.touched[self.len] = shard_idx;
+        self.len += 1;
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.touched[..self.len].iter().map(|idx| usize::from(*idx))
+    }
+
+    pub(super) const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 impl NetworkShardSet {
@@ -124,6 +225,7 @@ impl NetworkShardSet {
         for index in 0..shard_count {
             shards.push(PaddedShard {
                 inner: SpinMutex::new(factory(index)),
+                arrival: ProgressSignal::new(),
             });
         }
         Self {
@@ -141,10 +243,16 @@ impl NetworkShardSet {
     /// so the routing rule lives in exactly one place.
     #[inline]
     pub(super) fn shard_for_default(&self) -> &SpinMutex<NetworkShard> {
+        &self.shards[self.default_shard_idx()].inner
+    }
+
+    /// Index of the shard [`Self::shard_for_default`] resolves to.
+    #[inline]
+    pub(super) fn default_shard_idx(&self) -> usize {
         // Handle id 1 is the canonical "shard 0" id under the
         // stride encoding (slot 0 in shard 0 -> id = 1), so
         // shard_for_default and shard_for_handle agree on shard 0.
-        self.shard_for_handle(1u64)
+        self.shard_idx_for_handle(1u64)
     }
 
     /// Picks the shard owning a given socket / connection handle
@@ -152,10 +260,118 @@ impl NetworkShardSet {
     /// `(handle - 1) % shard_count == shard_idx`.
     #[inline]
     pub(super) fn shard_for_handle<H: Into<u64>>(&self, handle: H) -> &SpinMutex<NetworkShard> {
+        &self.shards[self.shard_idx_for_handle(handle)].inner
+    }
+
+    /// Index of the shard owning `handle`.
+    #[inline]
+    pub(super) fn shard_idx_for_handle<H: Into<u64>>(&self, handle: H) -> usize {
         let handle: u64 = handle.into();
         let normalized = handle.saturating_sub(1) as usize;
-        let idx = normalized % self.shards.len();
-        &self.shards[idx].inner
+        normalized % self.shards.len()
+    }
+
+    /// The shard's cross-processor arrival signal. Raised by whichever
+    /// processor placed a frame in the shard; waited on by the
+    /// operations the shard owns.
+    #[inline]
+    pub(super) fn arrival(&self, idx: usize) -> &ProgressSignal {
+        &self.shards[idx].arrival
+    }
+
+    /// The processor whose executor owns `idx`'s work.
+    ///
+    /// The inverse of [`Self::shard_idx_for_processor`] for the
+    /// `shard_count == processor_count` layout the service builds:
+    /// shard `i` belongs to processor `i`.
+    #[inline]
+    pub(super) fn owner_processor(&self, idx: usize) -> helios_hal::cpu::ProcessorId {
+        helios_hal::cpu::ProcessorId::new(
+            u16::try_from(idx)
+                .unwrap_or_else(|_| panic!("network shard index {idx} exceeds processor id range")),
+        )
+    }
+
+    /// Samples `idx`'s arrival signal. Callers take this *before* they
+    /// inspect the shard, so an arrival that lands between the
+    /// inspection and the park is still observed.
+    #[inline]
+    pub(super) fn shard_wait(&self, idx: usize) -> ShardWait {
+        ShardWait {
+            shard_idx: idx,
+            mark: self.arrival(idx).mark(),
+        }
+    }
+
+    /// Samples the arrival signal of the shard owning `handle`.
+    #[inline]
+    pub(super) fn shard_wait_for_handle<H: Into<u64>>(&self, handle: H) -> ShardWait {
+        self.shard_wait(self.shard_idx_for_handle(handle))
+    }
+
+    /// Samples the arrival signal of the shard owning `port`.
+    #[inline]
+    pub(super) fn shard_wait_for_local_port(&self, port: u16) -> ShardWait {
+        self.shard_wait(self.shard_idx_for_local_port(port))
+    }
+
+    /// Samples the arrival signal of the shard that unqualified
+    /// operations run on.
+    #[inline]
+    pub(super) fn default_shard_wait(&self) -> ShardWait {
+        self.shard_wait(self.default_shard_idx())
+    }
+
+    /// Releases every operation parked on a shard that just took a
+    /// frame, and pulls the owning processor out of its idle park when
+    /// the frame was drained somewhere else.
+    ///
+    /// Signalling happens after the per-frame shard locks are released,
+    /// so a woken waiter never contends with the drain that woke it.
+    pub(super) fn notify_arrivals<CpuImpl: Cpu>(&self, arrivals: &ShardArrivals, cpu: &CpuImpl) {
+        if arrivals.is_empty() {
+            return;
+        }
+        let current = cpu.current_processor();
+        for shard_idx in arrivals.iter() {
+            self.arrival(shard_idx).signal();
+            let owner = self.owner_processor(shard_idx);
+            if owner != current {
+                cpu.wake_processor(owner);
+            }
+        }
+    }
+
+    /// Places one received frame in the shard that owns its local port.
+    ///
+    /// This is the single RX ownership decision in the kernel: the
+    /// destination port picks the shard, the shard's lock is taken for
+    /// exactly as long as the stack needs the frame, and the returned
+    /// shard index is what the caller signals once it has let go.
+    /// Non-IP and non-TCP/UDP frames (ARP, ICMP, malformed) carry no
+    /// local port and route to shard 0.
+    pub(super) fn dispatch_rx_frame(
+        &self,
+        frame: &RxFrame,
+        received_at: StackInstant,
+        control: &NetworkControlPlane,
+    ) -> RxFrameDispatch {
+        let port = peek_local_port(frame.as_ref());
+        let shard_idx = shard_idx_for_port(port, self.shard_count());
+        let mut shard = self.shards[shard_idx].inner.lock();
+        let dispatch = match shard.stack.receive_rx_frame(frame.clone(), received_at) {
+            Ok(backpressured) => RxFrameDispatch::Delivered {
+                shard_idx,
+                backpressured,
+            },
+            Err(StackError::ReceiveBackpressure) => RxFrameDispatch::Backpressured,
+            Err(error) => {
+                tracing::debug!(?error, "dropped malformed network frame");
+                RxFrameDispatch::Malformed
+            }
+        };
+        shard.drain_control_events(control);
+        dispatch
     }
 
     /// Locks shard `idx` directly. Used by the RX demux which has
@@ -177,8 +393,19 @@ impl NetworkShardSet {
         &self,
         processor: helios_hal::cpu::ProcessorId,
     ) -> &SpinMutex<NetworkShard> {
-        let idx = (processor.id() as usize) % self.shards.len();
-        &self.shards[idx].inner
+        &self.shards[self.shard_idx_for_processor(processor)].inner
+    }
+
+    /// Index of the shard [`Self::shard_for_processor`] resolves to.
+    #[inline]
+    pub(super) fn shard_idx_for_processor(&self, processor: helios_hal::cpu::ProcessorId) -> usize {
+        (processor.id() as usize) % self.shards.len()
+    }
+
+    /// Index of the shard owning a fixed local port.
+    #[inline]
+    pub(super) fn shard_idx_for_local_port(&self, port: u16) -> usize {
+        shard_idx_for_port(Some(port), self.shards.len())
     }
 
     pub(super) fn with<R>(&self, f: impl FnOnce(&NetworkShard) -> R) -> R {
@@ -231,8 +458,9 @@ impl NetworkShardSet {
         port: u16,
         f: impl FnOnce(&mut NetworkShard) -> R,
     ) -> R {
-        let idx = shard_idx_for_port(Some(port), self.shards.len());
-        let mut state = self.shards[idx].inner.lock();
+        let mut state = self.shards[self.shard_idx_for_local_port(port)]
+            .inner
+            .lock();
         f(&mut state)
     }
 

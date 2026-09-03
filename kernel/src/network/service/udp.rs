@@ -247,6 +247,13 @@ where
     ) -> Result<Option<UdpDatagram>, UdpError> {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         loop {
+            // The datagram is placed in the socket's own shard by
+            // whichever processor drained it off the device, so that
+            // shard's arrival signal — sampled before the socket is
+            // polled — is what ends this wait. Nothing here owes a
+            // retransmission, so the only other bound is the caller's
+            // deadline.
+            let wait = self.inner.state.shard_wait_for_handle(socket);
             self.drive_udp().await?;
             let received = self.inner.state.with_handle(socket, |state| {
                 state.poll_udp_receive(socket, max_bytes as usize)
@@ -260,7 +267,8 @@ where
                             detail: NetworkErrorDetail::UdpReceiveTimeout,
                         });
                     }
-                    self.wait_for_progress(NETWORK_PROGRESS_WAIT).await;
+                    self.wait_for_shard_progress(wait, self.deadline_wait(deadline_nanos))
+                        .await;
                 }
             }
         }

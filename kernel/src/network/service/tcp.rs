@@ -290,6 +290,9 @@ where
         }?;
 
         loop {
+            // Sampled before the handshake state is inspected, so a SYN-ACK
+            // another processor drains in between resolves the wait.
+            let wait = self.inner.state.shard_wait_for_handle(stream);
             self.drive_tcp().await?;
             let now_nanos = self.now_nanos();
             let poll_connect = self.inner.state.with_handle(stream, |state| {
@@ -315,7 +318,7 @@ where
             if matches!(poll_connect, TcpConnectProgress::Connected) {
                 return Ok(stream);
             }
-            self.wait_for_tcp_progress(deadline_nanos).await;
+            self.wait_for_tcp_progress(wait, deadline_nanos).await;
         }
     }
 
@@ -346,6 +349,7 @@ where
     ) -> Result<TcpAccepted<TcpStreamId>, TcpError> {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         loop {
+            let wait = self.inner.state.shard_wait_for_handle(listener);
             self.drive_tcp().await?;
             let accepted = self
                 .inner
@@ -360,7 +364,7 @@ where
                     detail: NetworkErrorDetail::TcpAcceptTimeout,
                 });
             }
-            self.wait_for_tcp_progress(deadline_nanos).await;
+            self.wait_for_tcp_progress(wait, deadline_nanos).await;
         }
     }
 
@@ -372,6 +376,9 @@ where
     ) -> Result<(), TcpError> {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         while !bytes.is_empty() {
+            // A blocked write is unblocked by the peer's window opening,
+            // which arrives as an ACK on this stream's shard.
+            let wait = self.inner.state.shard_wait_for_handle(stream);
             self.drive_tcp().await?;
             let written = self.inner.state.with_handle(stream, |state| {
                 state.try_write_tcp_bytes(stream, &mut bytes)
@@ -385,7 +392,7 @@ where
                     detail: NetworkErrorDetail::TcpWriteTimeout,
                 });
             }
-            self.wait_for_tcp_progress(deadline_nanos).await;
+            self.wait_for_tcp_progress(wait, deadline_nanos).await;
         }
         Ok(())
     }
@@ -399,6 +406,7 @@ where
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         let max_bytes = max_bytes as usize;
         loop {
+            let wait = self.inner.state.shard_wait_for_handle(stream);
             match self.poll_tcp_read_once(stream, max_bytes, TcpReadPhasePrefix::Initial)? {
                 TcpReadProgress::Data(bytes) => return Ok(Some(bytes)),
                 TcpReadProgress::Eof => return Ok(None),
@@ -428,7 +436,7 @@ where
                 });
             }
             let wait_started = self.profile_start();
-            self.wait_for_tcp_progress(deadline_nanos).await;
+            self.wait_for_tcp_progress(wait, deadline_nanos).await;
             self.record_network_profile("tcp-read-wait", wait_started);
         }
     }
@@ -442,6 +450,7 @@ where
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         let max_bytes = buffer.capacity();
         loop {
+            let wait = self.inner.state.shard_wait_for_handle(stream);
             match self.poll_tcp_read_into_once(
                 stream,
                 &mut buffer,
@@ -479,7 +488,7 @@ where
                 });
             }
             let wait_started = self.profile_start();
-            self.wait_for_tcp_progress(deadline_nanos).await;
+            self.wait_for_tcp_progress(wait, deadline_nanos).await;
             self.record_network_profile("tcp-read-into-wait", wait_started);
         }
     }
@@ -819,37 +828,49 @@ where
             // we lock the owning shard per-frame so different
             // ports can be processed in parallel by other CPUs and
             // each shard's Stack only sees the connections it
-            // actually owns. Non-IP / non-TCP-UDP frames (ARP,
-            // ICMP, malformed) route to shard 0 via
-            // `shard_idx_for_port(None, ...)`.
-            let shard_count = self.inner.state.shard_count();
+            // actually owns.
+            //
+            // The shard that took a frame is remembered rather than
+            // signalled here: the signal belongs after the lock is
+            // released, and a batch that lands several frames in the
+            // same shard should release its waiters once.
+            let mut arrivals = ShardArrivals::new();
             for frame in frames[..received_batch].iter().flatten() {
                 if receive_backpressured {
                     break;
                 }
                 let frame_len = frame.len();
-                let port = peek_local_port(frame.as_ref());
-                let shard_idx = shard_idx_for_port(port, shard_count);
-                let mut shard = self.inner.state.shard_at(shard_idx).lock();
-                match shard.stack.receive_rx_frame(frame.clone(), received_at) {
-                    Ok(backpressured) => {
+                match self
+                    .inner
+                    .state
+                    .dispatch_rx_frame(frame, received_at, &self.inner.control)
+                {
+                    RxFrameDispatch::Delivered {
+                        shard_idx,
+                        backpressured,
+                    } => {
+                        arrivals.record(shard_idx);
                         received += 1;
                         received_bytes = received_bytes.saturating_add(frame_len);
                         if backpressured {
                             receive_backpressured = true;
                         }
                     }
-                    Err(StackError::ReceiveBackpressure) => {
+                    RxFrameDispatch::Backpressured => {
                         receive_backpressured = true;
                     }
-                    Err(error) => {
-                        tracing::debug!(?error, "dropped malformed network frame");
+                    RxFrameDispatch::Malformed => {
                         received += 1;
                         received_bytes = received_bytes.saturating_add(frame_len);
                     }
                 }
-                shard.drain_control_events(&self.inner.control);
             }
+            // Every shard that took a frame is released here, and the
+            // processor that owns it is pulled out of its idle park when
+            // this is not that processor. Without this a reply demuxed
+            // into a foreign shard would sit there until its waiter's own
+            // deadline expired.
+            self.inner.state.notify_arrivals(&arrivals, &self.inner.cpu);
 
             if self
                 .inner
@@ -922,7 +943,19 @@ where
         })
     }
 
-    pub(super) async fn wait_for_tcp_progress(&self, operation_deadline_nanos: u64) {
+    /// Parks a TCP operation until its shard makes progress.
+    ///
+    /// `wait` must have been sampled before the operation inspected its
+    /// stream or listener, so a segment another processor drained in
+    /// between resolves the wait rather than being slept through. The
+    /// timer bound is the sooner of the caller's deadline and the next
+    /// protocol deadline any shard owes — a retransmit or a delayed ACK
+    /// is driven by nothing but the clock.
+    pub(super) async fn wait_for_tcp_progress(
+        &self,
+        wait: ShardWait,
+        operation_deadline_nanos: u64,
+    ) {
         let now_nanos = self.now_nanos();
         if now_nanos >= operation_deadline_nanos {
             return;
@@ -932,7 +965,8 @@ where
             .unwrap_or(operation_deadline_nanos)
             .min(operation_deadline_nanos);
         let timer_wait = Duration::from_nanos(next_deadline.saturating_sub(now_nanos));
-        self.wait_for_progress(self.progress_wait(timer_wait)).await;
+        self.wait_for_shard_progress(wait, self.progress_wait(timer_wait))
+            .await;
     }
 
     pub(super) fn record_tcp_read_progress(
