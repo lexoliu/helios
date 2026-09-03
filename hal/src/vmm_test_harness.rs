@@ -229,7 +229,7 @@ where
     A: AddressSpace,
 {
     let address_space = fresh();
-    let translation = address_space.translate(VirtAddr::new(0xfacefeed_0000));
+    let translation = address_space.translate(VirtAddr::new(0xface_feed_0000));
     assert_eq!(translation, Translation::Unmapped);
 }
 
