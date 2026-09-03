@@ -196,7 +196,25 @@ impl PciRoot {
         device_type: DeviceType,
     ) -> impl Iterator<Item = PciAddress> + '_ {
         self.functions().filter(move |address| {
-            helios_virtio::virtio_pci_device_type(&self.access, *address) == Some(device_type)
+            if helios_virtio::virtio_pci_device_type(&self.access, *address) != Some(device_type) {
+                return false;
+            }
+            // MSI-X is the only interrupt path this backend programs:
+            // every driver it installs is bound to a message, and there
+            // is no INTx fallback to fall back to. A function without
+            // one is a function the kernel cannot drive, which is the
+            // same situation as the device not being there — and the
+            // callers all handle that. Panicking the machine over an
+            // optional device would not.
+            if self.msix_table_size(*address).is_none() {
+                tracing::warn!(
+                    function = %address,
+                    ?device_type,
+                    "ignoring a virtio function that exposes no MSI-X capability"
+                );
+                return false;
+            }
+            true
         })
     }
 
@@ -222,7 +240,8 @@ impl PciRoot {
         helios_virtio::MsixBinding::shared(entry)
     }
 
-    /// Entries in the MSI-X table of `address`.
+    /// Entries in the MSI-X table of `address`, or `None` when the
+    /// function exposes no MSI-X capability at all.
     ///
     /// The table is the device's, and a function that offers four
     /// entries steers four messages however many processors the machine
@@ -231,17 +250,15 @@ impl PciRoot {
     /// this first; [`Self::bind_msix_vectors`] treats overrunning the
     /// table as the programming error it is rather than truncating
     /// silently.
-    pub(crate) fn msix_table_size(&self, address: PciAddress) -> u16 {
+    pub(crate) fn msix_table_size(&self, address: PciAddress) -> Option<u16> {
         let header = PciHeader::new(address);
-        let endpoint = EndpointHeader::from_header(header, self.access)
-            .unwrap_or_else(|| panic!("PCI function {address} is not an endpoint"));
+        let endpoint = EndpointHeader::from_header(header, self.access)?;
         endpoint
             .capabilities(self.access)
             .find_map(|capability| match capability {
                 PciCapability::MsiX(msix) => Some(msix.table_size()),
                 _ => None,
             })
-            .unwrap_or_else(|| panic!("PCI function {address} exposes no MSI-X capability"))
     }
 
     /// Points the first `messages.len()` MSI-X table entries of

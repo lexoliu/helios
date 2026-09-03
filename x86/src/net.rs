@@ -111,7 +111,10 @@ where
         destination_apic_id,
     } = delivery;
     let queue_vectors = crate::exceptions::NETWORK_QUEUE_INTERRUPT_VECTORS;
-    let steerable = usize::from(pci.msix_table_size(address)).saturating_sub(1);
+    let table_entries = pci.msix_table_size(address).unwrap_or_else(|| {
+        panic!("virtio-net function {address} was discovered without an MSI-X capability")
+    });
+    let steerable = usize::from(table_entries).saturating_sub(1);
     let steered = cpu
         .processor_count()
         .min(queue_vectors.len())
