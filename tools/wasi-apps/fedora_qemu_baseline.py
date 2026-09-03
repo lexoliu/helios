@@ -14,6 +14,8 @@ import tomllib
 import time
 from pathlib import Path
 
+import linux_workload_runner as runner
+
 
 # Pinned Fedora Cloud Base images. Both architectures track the same Fedora
 # compose so the two host lanes measure the same userspace, and both are
@@ -138,7 +140,6 @@ FEDORA_PACKAGES = [
     "dash",
     "coreutils",
     "curl",
-    "hyperfine",
     "gcc",
     "make",
     "cmake",
@@ -958,7 +959,6 @@ def ensure_provisioned(
             "dash -c true",
             "cat --version >/dev/null",
             "curl --version >/dev/null",
-            "hyperfine --version >/dev/null",
         ]
     )
     verify_parts = [base_verify_command]
@@ -1019,28 +1019,6 @@ def ensure_provisioned(
     ssh(repo_root, key, port, command, timeout=timeout_seconds)
 
 
-def wasmtime_guest_paths(repo_root: Path, workloads: list[dict]) -> list[Path]:
-    paths: dict[str, Path] = {}
-    for workload in workloads:
-        profile = workload.get("wasmtime_profile")
-        if not profile:
-            continue
-        wasm_path = profile.get("wasm_path")
-        if not wasm_path:
-            raise SystemExit(f"workload {workload['name']} wasmtime_profile is missing wasm_path")
-        profile_paths = [wasm_path, *profile.get("guest_paths", [])]
-        for value in profile.get("wasmtime_flags", []):
-            profile_paths.extend(
-                match.group(1) for match in re.finditer(r"\{repo_root\}/([^:\s]+)", value)
-            )
-        for relative in profile_paths:
-            path = repo_root / relative
-            if not path.exists():
-                raise SystemExit(f"Wasmtime Linux baseline artifact is missing: {path}")
-            paths[str(path.relative_to(repo_root))] = path
-    return [paths[key] for key in sorted(paths)]
-
-
 def copy_guest_files(
     repo_root: Path,
     key: Path,
@@ -1048,7 +1026,8 @@ def copy_guest_files(
     quickjs_source_archive: Path | None,
     wasmtime_linux_bin: Path | None,
     wasmtime_linux_archive: Path | None,
-    wasmtime_workloads: list[dict],
+    workloads: list[dict],
+    native_bin_dir: Path | None,
 ) -> None:
     ssh(
         repo_root,
@@ -1077,7 +1056,7 @@ def copy_guest_files(
     ]
     files = [
         repo_root / "tools/wasi-apps/workloads.json",
-        repo_root / "tools/wasi-apps/linux-workload-runner.py",
+        repo_root / "tools/wasi-apps/linux_workload_runner.py",
         repo_root / "tools/wasi-apps/linux_tcp_throughput_client.py",
     ]
     run([*scp_base, *(str(path) for path in files), f"{SSH_USER}@127.0.0.1:{REMOTE_ROOT}/tools/wasi-apps/"], repo_root)
@@ -1103,9 +1082,24 @@ def copy_guest_files(
             wasmtime_linux_archive,
             REMOTE_WASMTIME_ARCHIVE,
         )
-    for path in wasmtime_guest_paths(repo_root, wasmtime_workloads):
+    for path in runner.guest_paths(repo_root, workloads):
         remote_path = f"{REMOTE_ROOT}/{path.relative_to(repo_root)}"
         copy_path_to_guest(repo_root, key, port, path, remote_path)
+    if native_bin_dir is not None:
+        copy_path_to_guest(
+            repo_root,
+            key,
+            port,
+            native_bin_dir,
+            f"{REMOTE_ROOT}/{runner.NATIVE_BIN_DIR}",
+        )
+        ssh(
+            repo_root,
+            key,
+            port,
+            f"chmod 0755 {shlex.quote(f'{REMOTE_ROOT}/{runner.NATIVE_BIN_DIR}')}/*",
+            timeout=30,
+        )
 
 
 def ensure_wasmtime_linux(
@@ -1180,45 +1174,69 @@ def linux_cpu_features(
     return result
 
 
-def hyperfine_command(
+def runner_command(
     iterations: int,
     workloads: list[dict],
     host_http_url: str | None,
     host_tcp_host: str | None,
     host_tcp_port: int | None,
+    host_tcp_echo_port: int | None,
     output_name: str,
-    mode: str,
+    side: str,
     wasmtime_bin: str | None = None,
 ) -> str:
     command = [
-        "hyperfine",
-        "--runs",
-        str(iterations),
-        "--export-json",
-        f"{REMOTE_OUT}/{output_name}",
+        "python3",
+        f"{REMOTE_ROOT}/tools/wasi-apps/linux_workload_runner.py",
+        "--manifest",
+        f"{REMOTE_ROOT}/tools/wasi-apps/workloads.json",
+        "--repo-root",
+        REMOTE_ROOT,
     ]
-    for workload in workloads:
-        runner = [
-            "python3",
-            f"{REMOTE_ROOT}/tools/wasi-apps/linux-workload-runner.py",
-            "--manifest",
-            f"{REMOTE_ROOT}/tools/wasi-apps/workloads.json",
-            "--workload",
-            workload["name"],
-            "--mode",
-            mode,
+    if wasmtime_bin is not None:
+        command.extend(["--wasmtime-bin", wasmtime_bin])
+    command.extend(
+        [
+            "run",
+            "--side",
+            side,
+            "--iterations",
+            str(iterations),
+            "--out",
+            f"{REMOTE_OUT}/{output_name}",
         ]
-        if wasmtime_bin is not None:
-            runner.extend(["--wasmtime-bin", wasmtime_bin])
-        if host_http_url:
-            runner.extend(["--host-http-url", host_http_url])
-        if host_tcp_host and host_tcp_port is not None:
-            runner.extend(["--host-tcp-host", host_tcp_host, "--host-tcp-port", str(host_tcp_port)])
-        command.extend(["--command-name", workload["name"], shlex.join(runner)])
+    )
+    for workload in workloads:
+        command.extend(["--workload", workload["name"]])
+    if host_http_url:
+        command.extend(["--host-http-url", host_http_url])
+    if host_tcp_host and host_tcp_port is not None:
+        command.extend(["--host-tcp-host", host_tcp_host, "--host-tcp-port", str(host_tcp_port)])
+    if host_tcp_host and host_tcp_echo_port is not None:
+        if host_tcp_port is None:
+            command.extend(["--host-tcp-host", host_tcp_host])
+        command.extend(["--host-tcp-echo-port", str(host_tcp_echo_port)])
     return shlex.join(command)
 
 
-def copy_hyperfine_json(repo_root: Path, key: Path, port: int, remote_name: str, destination: Path) -> None:
+def precompile_command(workloads: list[dict], wasmtime_bin: str) -> str:
+    command = [
+        "python3",
+        f"{REMOTE_ROOT}/tools/wasi-apps/linux_workload_runner.py",
+        "--manifest",
+        f"{REMOTE_ROOT}/tools/wasi-apps/workloads.json",
+        "--repo-root",
+        REMOTE_ROOT,
+        "--wasmtime-bin",
+        wasmtime_bin,
+        "precompile",
+    ]
+    for workload in workloads:
+        command.extend(["--workload", workload["name"]])
+    return shlex.join(command)
+
+
+def copy_guest_output(repo_root: Path, key: Path, port: int, remote_name: str, destination: Path) -> None:
     scp_base = [
         "scp",
         "-i",
@@ -1236,8 +1254,7 @@ def copy_hyperfine_json(repo_root: Path, key: Path, port: int, remote_name: str,
 
 
 def workload_uses_placeholder(workload: dict, placeholder: str) -> bool:
-    values = [workload.get("command", ""), workload.get("program", ""), *workload.get("args", [])]
-    return any(placeholder in value for value in values)
+    return runner.uses_placeholder(workload, "linux_native", placeholder)
 
 
 def run_fedora_qemu_linux(
@@ -1257,19 +1274,26 @@ def run_fedora_qemu_linux(
     host_http_url: str | None,
     host_tcp_host: str | None,
     host_tcp_port: int | None,
+    host_tcp_echo_port: int | None,
     quickjs_source_archive: Path | None = None,
     wasmtime_linux_bin: Path | None = None,
     wasmtime_linux_archive: Path | None = None,
     guest_arch: str | None = None,
     accel: str | None = None,
+    native_bin_dir: Path | None = None,
 ) -> tuple[Path | None, Path | None, dict]:
     guest_arch = guest_arch or host_arch()
     accel = accel or default_accel(guest_arch)
     machine, cpu = machine_and_cpu(guest_arch, accel)
-    native_workloads = [
-        workload for workload in workloads if workload["runner"] in ("shell", "program")
-    ]
-    wasmtime_workloads = [workload for workload in workloads if workload.get("wasmtime_profile")]
+    native_workloads = runner.workloads_with_counterpart(workloads, "linux_native")
+    wasmtime_workloads = runner.workloads_with_counterpart(workloads, "linux_wasmtime")
+    native_bin_dir = resolve_optional_path(repo_root, native_bin_dir)
+    if runner.needs_native_bin(workloads):
+        if native_bin_dir is None or not native_bin_dir.is_dir():
+            raise SystemExit(
+                "the selected workloads need the native counterparts; build them with "
+                f"tools/bench/native/build.sh {guest_arch} and pass --native-bin-dir"
+            )
     asset_dir = resolve_asset_dir(repo_root, asset_dir)
     asset_dir.mkdir(parents=True, exist_ok=True)
     wasmtime_linux_bin = resolve_optional_path(repo_root, wasmtime_linux_bin)
@@ -1350,7 +1374,8 @@ def run_fedora_qemu_linux(
             quickjs_source_archive,
             wasmtime_linux_bin,
             wasmtime_linux_archive,
-            wasmtime_workloads,
+            workloads,
+            native_bin_dir,
         )
         ensure_provisioned(
             repo_root,
@@ -1372,51 +1397,56 @@ def run_fedora_qemu_linux(
                 wasmtime_linux_archive,
             )
             wasmtime_bin = REMOTE_WASMTIME_BIN
-        hyperfine_json = None
+        native_jsonl = None
         if native_workloads:
             ssh(
                 repo_root,
                 key,
                 port,
-                hyperfine_command(
+                runner_command(
                     iterations,
                     native_workloads,
                     host_http_url,
                     host_tcp_host,
                     host_tcp_port,
-                    "linux-hyperfine.json",
-                    "native",
+                    host_tcp_echo_port,
+                    "linux-native.jsonl",
+                    "linux_native",
                 ),
                 timeout=setup_timeout_seconds,
             )
-            hyperfine_json = out_dir / "linux-hyperfine.json"
-            copy_hyperfine_json(repo_root, key, port, "linux-hyperfine.json", hyperfine_json)
-        wasmtime_hyperfine_json = None
+            native_jsonl = out_dir / "linux-native.jsonl"
+            copy_guest_output(repo_root, key, port, "linux-native.jsonl", native_jsonl)
+        wasmtime_jsonl = None
         if wasmtime_workloads:
+            # Compile every module once up front so the timed iterations
+            # load precompiled code, the way Helios loads its cwasm.
             ssh(
                 repo_root,
                 key,
                 port,
-                hyperfine_command(
+                precompile_command(wasmtime_workloads, wasmtime_bin),
+                timeout=setup_timeout_seconds,
+            )
+            ssh(
+                repo_root,
+                key,
+                port,
+                runner_command(
                     iterations,
                     wasmtime_workloads,
                     host_http_url,
                     host_tcp_host,
                     host_tcp_port,
-                    "wasmtime-linux-hyperfine.json",
-                    "wasmtime",
+                    host_tcp_echo_port,
+                    "linux-wasmtime.jsonl",
+                    "linux_wasmtime",
                     wasmtime_bin,
                 ),
                 timeout=setup_timeout_seconds,
             )
-            wasmtime_hyperfine_json = out_dir / "wasmtime-linux-hyperfine.json"
-            copy_hyperfine_json(
-                repo_root,
-                key,
-                port,
-                "wasmtime-linux-hyperfine.json",
-                wasmtime_hyperfine_json,
-            )
-        return hyperfine_json, wasmtime_hyperfine_json, provenance
+            wasmtime_jsonl = out_dir / "linux-wasmtime.jsonl"
+            copy_guest_output(repo_root, key, port, "linux-wasmtime.jsonl", wasmtime_jsonl)
+        return native_jsonl, wasmtime_jsonl, provenance
     finally:
         shutdown_vm(repo_root, key, port, process)

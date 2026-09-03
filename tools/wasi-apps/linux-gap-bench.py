@@ -16,6 +16,7 @@ import time
 import tomllib
 from pathlib import Path
 
+import linux_workload_runner as runner
 from fedora_qemu_baseline import (
     DEFAULT_DISK_SIZE,
     DEFAULT_MEMORY,
@@ -31,7 +32,12 @@ from fedora_qemu_baseline import (
 
 # Helios inspector arch name -> Fedora guest arch name.
 LINUX_GUEST_ARCHES = {"aarch64": "aarch64", "x86-64": "x86_64"}
+from tcp_echo_server import start_tcp_echo_server
 from tcp_throughput_server import DEFAULT_PAYLOAD_BYTES, start_tcp_throughput_server
+
+# Workload classes in the order the report lists them; each names the design
+# claim its workloads isolate (see docs/benchmarks.md).
+WORKLOAD_CLASSES = ["startup", "hostcall", "ipc", "sched", "net", "fs", "compute"]
 
 HTTP_PAYLOAD_FILE = "payload.txt"
 HTTP_LARGE_PAYLOAD_FILE = "payload-64m.bin"
@@ -130,11 +136,7 @@ def output(command: list[str]) -> str:
 
 
 def load_manifest(path: Path) -> dict:
-    with path.open("r", encoding="utf-8") as handle:
-        manifest = json.load(handle)
-    if manifest.get("schema_version") != 1:
-        raise SystemExit(f"unsupported workload manifest schema_version {manifest.get('schema_version')}")
-    return manifest
+    return runner.load_manifest(path)
 
 
 def selected_workloads(manifest: dict, classes: list[str], names: list[str]) -> list[dict]:
@@ -340,6 +342,7 @@ def run_helios(
     host_http_url: str | None,
     host_tcp_host: str | None,
     host_tcp_port: int | None,
+    host_tcp_echo_port: int | None,
     timeout_seconds: int,
 ) -> Path:
     log = out_dir / "helios.jsonl"
@@ -361,6 +364,7 @@ def run_helios(
                 host_http_url,
                 host_tcp_host,
                 host_tcp_port,
+                host_tcp_echo_port,
                 timeout_seconds,
             )
             class_logs.append(class_log)
@@ -379,6 +383,7 @@ def run_helios(
         host_http_url,
         host_tcp_host,
         host_tcp_port,
+        host_tcp_echo_port,
         timeout_seconds,
     )
     return log
@@ -394,6 +399,7 @@ def run_helios_once(
     host_http_url: str | None,
     host_tcp_host: str | None,
     host_tcp_port: int | None,
+    host_tcp_echo_port: int | None,
     timeout_seconds: int,
 ) -> None:
     env = os.environ.copy()
@@ -420,6 +426,8 @@ def run_helios_once(
         env["HELIOS_WORKLOAD_BENCH_HOST_TCP_HOST"] = host_tcp_host
     if host_tcp_port is not None:
         env["HELIOS_WORKLOAD_BENCH_HOST_TCP_PORT"] = str(host_tcp_port)
+    if host_tcp_echo_port is not None:
+        env["HELIOS_WORKLOAD_BENCH_HOST_TCP_ECHO_PORT"] = str(host_tcp_echo_port)
     run_isolated(["tools/wasi-apps/workload-bench.sh"], env=env, timeout_seconds=timeout_seconds)
 
 
@@ -440,11 +448,13 @@ def run_linux(
     host_http_url: str | None,
     host_tcp_host: str | None,
     linux_tcp_port: int | None,
+    linux_tcp_echo_port: int | None,
     quickjs_source_archive: Path | None,
     wasmtime_linux_bin: Path | None,
     wasmtime_linux_archive: Path | None,
     guest_arch: str,
     accel: str | None,
+    native_bin_dir: Path | None,
 ) -> tuple[Path | None, Path | None, dict]:
     return run_fedora_qemu_linux(
         repo_root(),
@@ -463,11 +473,13 @@ def run_linux(
         host_http_url,
         host_tcp_host,
         linux_tcp_port,
+        linux_tcp_echo_port,
         quickjs_source_archive,
         wasmtime_linux_bin,
         wasmtime_linux_archive,
         guest_arch=guest_arch,
         accel=accel,
+        native_bin_dir=native_bin_dir,
     )
 
 
@@ -528,12 +540,30 @@ def parse_jsonl(path: Path | None) -> tuple[dict, dict[str, dict]]:
     return run_record, summaries
 
 
-def parse_hyperfine(path: Path | None) -> dict[str, dict]:
+def parse_linux_jsonl(path: Path | None) -> dict[str, dict]:
+    """Per-workload summaries of one Linux side, keyed by workload name.
+
+    ``median`` is kept in seconds because that is the unit every comparison
+    below derives its milliseconds from.
+    """
     if path is None or not path.exists():
         return {}
+    summaries: dict[str, dict] = {}
+    metrics: dict[str, list[dict]] = {}
     with path.open("r", encoding="utf-8") as handle:
-        data = json.load(handle)
-    return {entry["command"]: entry for entry in data.get("results", [])}
+        for line in handle:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if record["type"] == "iteration":
+                metrics.setdefault(record["workload"], []).append(record["metrics"])
+            if record["type"] == "summary":
+                summaries[record["workload"]] = {
+                    "median": record["median_elapsed_ms"] / 1000.0,
+                    "elapsed_ms": record["elapsed_ms"],
+                    "metrics": metrics.get(record["workload"], []),
+                }
+    return summaries
 
 
 def helios_perf_metric_paths(helios_jsonl: Path | None) -> list[Path]:
@@ -865,7 +895,8 @@ def write_summary_json(
             ),
             "release": (linux_provenance or {}).get("wasmtime_linux_release"),
             "workloads": [
-                workload["name"] for workload in workloads if workload.get("wasmtime_profile")
+                workload["name"]
+                for workload in runner.workloads_with_counterpart(workloads, "linux_wasmtime")
             ],
         },
         "vm": run_record.get("vm"),
@@ -1149,8 +1180,8 @@ def write_report(
     wasmtime_profiles: list[Path],
 ) -> None:
     run_record, helios = parse_jsonl(helios_jsonl)
-    linux = parse_hyperfine(linux_json)
-    wasmtime_linux = parse_hyperfine(wasmtime_linux_json)
+    linux = parse_linux_jsonl(linux_json)
+    wasmtime_linux = parse_linux_jsonl(wasmtime_linux_json)
     rows = comparison_rows(workloads, helios, linux, wasmtime_linux)
     perf_metric_paths = helios_perf_metric_paths(helios_jsonl)
     helios_kernel_flamegraphs = render_helios_kernel_flamegraphs(helios_jsonl)
@@ -1184,8 +1215,8 @@ def write_report(
         "![Helios vs Fedora native and Wasmtime median timings](helios-vs-linux.svg)",
         "",
         f"- Helios JSONL: `{helios_jsonl or 'not-run'}`",
-        f"- Linux Hyperfine JSON: `{linux_json or 'not-run'}`",
-        f"- Wasmtime-on-Linux Hyperfine JSON: `{wasmtime_linux_json or 'not-run'}`",
+        f"- Linux native JSONL: `{linux_json or 'not-run'}`",
+        f"- Wasmtime-on-Linux JSONL: `{wasmtime_linux_json or 'not-run'}`",
         f"- Machine-readable summary: `{summary_json}`",
         f"- Helios git SHA: `{run_record.get('git_sha', git_sha())}`",
         f"- Linux baseline: `{(linux_provenance or {}).get('kind', 'not-run')}`",
@@ -1207,7 +1238,7 @@ def write_report(
     for workload in workloads:
         helios_summary = helios.get(workload["name"])
         wasmtime_summary = wasmtime_linux.get(workload["name"])
-        if not workload.get("wasmtime_profile"):
+        if runner.counterpart(workload, "linux_wasmtime") is None:
             wasmtime_floor_missing.append(workload["name"])
             continue
         helios_ms = helios_summary.get("median_elapsed_ms") if helios_summary else None
@@ -1368,7 +1399,8 @@ def write_report(
             )
         lines.append("")
 
-    for workload_class, title in [("cpu-bound", "CPU-Bound"), ("io-bound", "IO-Bound")]:
+    for workload_class in WORKLOAD_CLASSES:
+        title = workload_class.capitalize()
         class_workloads = [workload for workload in workloads if workload["class"] == workload_class]
         if not class_workloads:
             continue
@@ -1413,8 +1445,8 @@ def write_report(
             "## Raw Iterations",
             "",
             f"- Helios raw iteration timings are in `{helios_jsonl or 'not-run'}`.",
-            f"- Linux raw hyperfine timings are in `{linux_json or 'not-run'}`.",
-            f"- Wasmtime-on-Linux raw hyperfine timings are in `{wasmtime_linux_json or 'not-run'}`.",
+            f"- Linux native raw iteration timings are in `{linux_json or 'not-run'}`.",
+            f"- Wasmtime-on-Linux raw iteration timings are in `{wasmtime_linux_json or 'not-run'}`.",
         ]
     )
     for perf_path in perf_metric_paths:
@@ -1456,7 +1488,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, default=repo_root() / "tools/wasi-apps/workloads.json")
     parser.add_argument("--iterations", type=int, default=5)
-    parser.add_argument("--class", dest="classes", action="append", choices=["cpu-bound", "io-bound"], default=[])
+    parser.add_argument("--class", dest="classes", action="append", choices=WORKLOAD_CLASSES, default=[])
     parser.add_argument("--workload", dest="workloads", action="append", default=[])
     parser.add_argument("--arch", default="aarch64")
     parser.add_argument("--helios-host-http-host", default="10.0.2.2")
@@ -1477,6 +1509,12 @@ def main() -> None:
         ),
     )
     parser.add_argument("--linux-vm-dir", type=Path, default=None)
+    parser.add_argument(
+        "--native-bin-dir",
+        type=Path,
+        default=None,
+        help="Static Linux binaries from tools/bench/native/build.sh; defaults to artifacts/bench-native/<guest-arch>.",
+    )
     parser.add_argument("--linux-vm-qemu-bin", default=None)
     parser.add_argument(
         "--linux-vm-accel",
@@ -1570,6 +1608,8 @@ def main() -> None:
             args.linux_vm_qemu_bin = QEMU_BINS[linux_guest_arch]
         if args.linux_vm_dir is None:
             args.linux_vm_dir = default_asset_dir(linux_guest_arch)
+        if args.native_bin_dir is None:
+            args.native_bin_dir = repo_root() / "artifacts/bench-native" / linux_guest_arch
 
     if not args.skip_helios:
         enforce_no_stale_helios_benchmark_processes()
@@ -1589,12 +1629,15 @@ def main() -> None:
     profile_workloads = selected_workloads(manifest, [], args.wasmtime_profile_workload) if args.wasmtime_profile_workload else []
     needs_http = any(workload.get("requires_host_http", False) for workload in workloads + profile_workloads)
     needs_tcp = any(workload.get("requires_host_tcp", False) for workload in workloads)
+    needs_tcp_echo = any(workload.get("requires_host_tcp_echo", False) for workload in workloads)
     server = None
     tcp_server = None
+    tcp_echo_server = None
     host_http_url = None
     local_http_url = None
     host_tcp_host = None
     host_tcp_port = None
+    host_tcp_echo_port = None
     if needs_http:
         server, port = start_host_http(http_root)
         host_http_url = f"http://{args.helios_host_http_host}:{port}/{HTTP_PAYLOAD_FILE}"
@@ -1605,7 +1648,12 @@ def main() -> None:
         )
         host_tcp_host = args.helios_host_tcp_host
         host_tcp_port = port
+    if needs_tcp_echo and (not args.skip_helios or not args.skip_linux):
+        tcp_echo_server, port = start_tcp_echo_server("127.0.0.1", 0)
+        host_tcp_host = args.helios_host_tcp_host
+        host_tcp_echo_port = port
     linux_tcp_port = host_tcp_port if needs_tcp and not args.skip_linux else None
+    linux_tcp_echo_port = host_tcp_echo_port if needs_tcp_echo and not args.skip_linux else None
 
     try:
         helios_jsonl = None
@@ -1623,6 +1671,7 @@ def main() -> None:
                 host_http_url,
                 host_tcp_host,
                 host_tcp_port,
+                host_tcp_echo_port,
                 args.helios_timeout_seconds,
             )
         if not args.skip_linux:
@@ -1643,11 +1692,13 @@ def main() -> None:
                 host_http_url,
                 host_tcp_host,
                 linux_tcp_port,
+                linux_tcp_echo_port,
                 args.quickjs_source_archive,
                 args.wasmtime_linux_bin,
                 args.wasmtime_linux_archive,
                 linux_guest_arch,
                 args.linux_vm_accel,
+                args.native_bin_dir,
             )
         if args.wasmtime_profile_workload:
             wasmtime_profiles = run_wasmtime_profiles(
@@ -1681,6 +1732,9 @@ def main() -> None:
         if tcp_server:
             tcp_server.shutdown()
             tcp_server.server_close()
+        if tcp_echo_server:
+            tcp_echo_server.shutdown()
+            tcp_echo_server.server_close()
 
 
 if __name__ == "__main__":

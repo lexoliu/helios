@@ -263,8 +263,8 @@ comma-separated workload list when narrowing a run.
 The Helios/Linux gap report has three timing lines: Helios, native Fedora
 under QEMU, and Wasmtime running the same wasm artifact inside that Fedora
 guest. Wasmtime-on-Linux is the floor: every workload with a
-`wasmtime_profile` entry in `tools/wasi-apps/workloads.json` must be beaten by
-Helios before the result is acceptable.
+`counterparts.linux_wasmtime` entry in `tools/wasi-apps/workloads.json` must be
+beaten by Helios before the result is acceptable.
 
 ```bash
 tools/wasi-apps/linux-gap-bench.sh --workload quickjs-loop
@@ -313,8 +313,8 @@ directory, and the guest itself still needs no internet access for the
 measured run. `--fedora-image-url` requires a matching
 `--fedora-image-sha256`; `--wasmtime-linux-bin` and `--wasmtime-linux-archive`
 override the staged Wasmtime with a local executable or tar archive for the
-guest architecture. Workloads without `wasmtime_profile` are reported as
-uncovered by the floor rather than silently approximated through a different
+guest architecture. Workloads whose `counterparts.linux_wasmtime` is `null` are
+reported as uncovered by the floor rather than silently approximated through a different
 program or ABI. `wasi-tcp-throughput` is the standard WASI sockets network
 floor workload: Helios, Fedora native, and Wasmtime-on-Linux all receive the
 same deterministic 64 MiB local TCP stream, and Helios and Wasmtime execute
