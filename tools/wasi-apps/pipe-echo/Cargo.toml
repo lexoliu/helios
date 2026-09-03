@@ -1,0 +1,14 @@
+[package]
+name = "helios-pipe-echo-wasi"
+version = "0.1.0"
+edition = "2024"
+description = "Echoes stdin to stdout one read at a time; the child of the pipe IPC workloads."
+
+[dependencies]
+thiserror = "2.0.17"
+
+[[bin]]
+name = "helios_pipe_echo_wasi"
+path = "src/main.rs"
+
+[workspace]

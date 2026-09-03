@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -10,6 +11,11 @@ use helios_inspector_protocol::system::programs as system_programs;
 use serde::{Deserialize, Serialize};
 
 const HOST_HTTP_LARGE_PAYLOAD_FILE: &str = "payload-64m.bin";
+const WORKLOAD_MANIFEST_SCHEMA_VERSION: u16 = 2;
+/// Prefix of the stdout lines a workload uses to report a secondary
+/// measurement, `bench.<name>=<number>`; the Linux runner parses the same
+/// lines so every side of the comparison carries the same metric names.
+const METRIC_LINE_PREFIX: &str = "bench.";
 
 /// How long one workload iteration may take before the run gives up on
 /// it.
@@ -75,6 +81,10 @@ pub(crate) struct WorkloadBenchCommand {
     #[arg(long)]
     host_tcp_port: Option<u16>,
 
+    /// Host TCP echo port visible from inside the VM for round-trip latency workloads.
+    #[arg(long)]
+    host_tcp_echo_port: Option<u16>,
+
     /// Write folded kernel/user profile samples collected during the workload run.
     #[arg(long)]
     pub(crate) profile_output: Option<PathBuf>,
@@ -96,11 +106,18 @@ pub(crate) struct WorkloadBenchCommand {
     pub(crate) workload_timeout_seconds: u32,
 }
 
+/// The design claim a workload isolates; `docs/benchmarks.md` describes
+/// each class and the Linux counterpart it is compared against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum WorkloadClass {
-    CpuBound,
-    IoBound,
+    Startup,
+    Hostcall,
+    Ipc,
+    Sched,
+    Net,
+    Fs,
+    Compute,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +138,9 @@ struct WorkloadManifest {
 struct Workload {
     name: String,
     class: WorkloadClass,
+    /// Whether the regression gate and the README table carry this workload.
+    #[serde(default)]
+    headline: bool,
     runner: WorkloadRunner,
     #[serde(rename = "description")]
     _description: String,
@@ -140,6 +160,8 @@ struct Workload {
     requires_host_http: bool,
     #[serde(default)]
     requires_host_tcp: bool,
+    #[serde(default)]
+    requires_host_tcp_echo: bool,
     #[serde(default)]
     wasm_path: Option<PathBuf>,
     #[serde(default)]
@@ -174,9 +196,12 @@ enum JsonlRecord<'a> {
     Iteration {
         workload: &'a str,
         class: WorkloadClass,
+        headline: bool,
         runner: WorkloadRunner,
         iteration: u16,
         elapsed_ms: u128,
+        /// Secondary measurements the workload printed as `bench.<name>=<number>`.
+        metrics: BTreeMap<String, f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         throughput_bytes: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -188,6 +213,7 @@ enum JsonlRecord<'a> {
     Summary {
         workload: &'a str,
         class: WorkloadClass,
+        headline: bool,
         runner: WorkloadRunner,
         median_elapsed_ms: u128,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -294,9 +320,11 @@ pub(crate) async fn run_inner(
             write_record(&JsonlRecord::Iteration {
                 workload: &workload.name,
                 class: workload.class,
+                headline: workload.headline,
                 runner: workload.runner,
                 iteration,
                 elapsed_ms: output.elapsed_ms,
+                metrics: parse_metrics(&output.stdout)?,
                 throughput_bytes: workload.throughput_bytes,
                 throughput_mib_per_second: throughput_mib_per_second(
                     workload.throughput_bytes,
@@ -311,6 +339,7 @@ pub(crate) async fn run_inner(
         write_record(&JsonlRecord::Summary {
             workload: &workload.name,
             class: workload.class,
+            headline: workload.headline,
             runner: workload.runner,
             median_elapsed_ms: median,
             throughput_bytes: workload.throughput_bytes,
@@ -512,10 +541,11 @@ fn load_manifest(path: &Path) -> Result<WorkloadManifest> {
         .with_context(|| format!("failed to read workload manifest {}", path.display()))?;
     let manifest: WorkloadManifest = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed to decode workload manifest {}", path.display()))?;
-    if manifest.schema_version != 1 {
+    if manifest.schema_version != WORKLOAD_MANIFEST_SCHEMA_VERSION {
         bail!(
-            "unsupported workload manifest schema_version {}",
-            manifest.schema_version
+            "unsupported workload manifest schema_version {}, expected {}",
+            manifest.schema_version,
+            WORKLOAD_MANIFEST_SCHEMA_VERSION
         );
     }
     Ok(manifest)
@@ -628,7 +658,48 @@ fn render_helios_template(
         })?;
         rendered = rendered.replace("{host_tcp_port}", &port.to_string());
     }
+    if workload.requires_host_tcp_echo
+        && (command.host_tcp_host.is_none() || command.host_tcp_echo_port.is_none())
+    {
+        bail!(
+            "workload {} requires --host-tcp-host and --host-tcp-echo-port for VM-visible host TCP echo",
+            workload.name
+        );
+    }
+    if rendered.contains("{host_tcp_echo_port}") {
+        let port = command.host_tcp_echo_port.ok_or_else(|| {
+            anyhow::anyhow!(
+                "workload {} requires --host-tcp-echo-port for VM-visible host TCP echo",
+                workload.name
+            )
+        })?;
+        rendered = rendered.replace("{host_tcp_echo_port}", &port.to_string());
+    }
     Ok(rendered)
+}
+
+/// Collects the `bench.<name>=<number>` lines a workload printed.
+///
+/// A malformed metric line is a workload bug, not noise to skip: the
+/// report would silently lose the measurement the workload exists for.
+fn parse_metrics(stdout: &[u8]) -> Result<BTreeMap<String, f64>> {
+    let mut metrics = BTreeMap::new();
+    for line in String::from_utf8_lossy(stdout).lines() {
+        let Some(assignment) = line.strip_prefix(METRIC_LINE_PREFIX) else {
+            continue;
+        };
+        let (name, value) = assignment
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("metric line {line:?} has no `=`"))?;
+        let value = value
+            .trim()
+            .parse::<f64>()
+            .with_context(|| format!("metric line {line:?} has a non-numeric value"))?;
+        if metrics.insert(name.trim().to_owned(), value).is_some() {
+            bail!("metric {name:?} was reported twice");
+        }
+    }
+    Ok(metrics)
 }
 
 fn large_host_http_url(host_http_url: &str) -> Result<String> {
@@ -783,6 +854,7 @@ mod tests {
             host_http_url: None,
             host_tcp_host: None,
             host_tcp_port: None,
+            host_tcp_echo_port: None,
             profile_output: None,
             kernel_profile_output: None,
             user_profile_output: None,
@@ -831,7 +903,7 @@ mod tests {
     }
 
     #[test]
-    fn io_class_filter_excludes_cpu_workloads() {
+    fn net_class_filter_excludes_compute_workloads() {
         let command = WorkloadBenchCommand {
             manifest: Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
@@ -839,10 +911,11 @@ mod tests {
                 .join("tools/wasi-apps/workloads.json"),
             iterations: 5,
             workloads: Vec::new(),
-            classes: vec![WorkloadClass::IoBound],
+            classes: vec![WorkloadClass::Net],
             host_http_url: None,
             host_tcp_host: None,
             host_tcp_port: None,
+            host_tcp_echo_port: None,
             profile_output: None,
             kernel_profile_output: None,
             user_profile_output: None,
@@ -853,8 +926,61 @@ mod tests {
         assert!(
             workloads
                 .iter()
-                .all(|workload| workload.class == WorkloadClass::IoBound)
+                .all(|workload| workload.class == WorkloadClass::Net)
         );
+    }
+
+    #[test]
+    fn headline_workloads_cover_every_design_claim() {
+        let command = WorkloadBenchCommand {
+            manifest: Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("inspector crate must live under repo root")
+                .join("tools/wasi-apps/workloads.json"),
+            iterations: 5,
+            workloads: Vec::new(),
+            classes: Vec::new(),
+            host_http_url: None,
+            host_tcp_host: None,
+            host_tcp_port: None,
+            host_tcp_echo_port: None,
+            profile_output: None,
+            kernel_profile_output: None,
+            user_profile_output: None,
+            perf_metrics_output: None,
+        };
+        let workloads = select_workloads(&command).expect("manifest must parse");
+        for class in [
+            WorkloadClass::Startup,
+            WorkloadClass::Hostcall,
+            WorkloadClass::Ipc,
+            WorkloadClass::Sched,
+            WorkloadClass::Net,
+            WorkloadClass::Fs,
+            WorkloadClass::Compute,
+        ] {
+            assert!(
+                workloads
+                    .iter()
+                    .any(|workload| workload.class == class && workload.headline),
+                "class {class:?} has no headline workload"
+            );
+        }
+        let latency = workloads
+            .iter()
+            .find(|workload| workload.name == "tcp-latency")
+            .expect("manifest must contain the TCP latency workload");
+        assert!(latency.requires_host_tcp_echo);
+    }
+
+    #[test]
+    fn metric_lines_are_collected_and_validated() {
+        let metrics = parse_metrics(b"pipe-pingpong:20000\nbench.rtt_p50_us=12.5\nbench.rtt_p99_us=40\n")
+            .expect("well-formed metrics parse");
+        assert_eq!(metrics.get("rtt_p50_us"), Some(&12.5));
+        assert_eq!(metrics.get("rtt_p99_us"), Some(&40.0));
+        assert!(parse_metrics(b"bench.broken\n").is_err());
+        assert!(parse_metrics(b"bench.x=1\nbench.x=2\n").is_err());
     }
 
     #[test]

@@ -1617,6 +1617,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-bench-metrics"
+version = "0.1.0"
+
+[[package]]
 name = "helios-cli"
 version = "0.1.0"
 dependencies = [
@@ -1886,6 +1890,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-procbench"
+version = "0.1.0"
+dependencies = [
+ "helios-api",
+ "helios-bench-metrics",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "helios-riscv"
 version = "0.1.0"
 dependencies = [
@@ -1906,6 +1919,15 @@ dependencies = [
  "sbi-spec",
  "spin 0.9.8",
  "tracing",
+]
+
+[[package]]
+name = "helios-sched-tasks"
+version = "0.1.0"
+dependencies = [
+ "helios-api",
+ "helios-bench-metrics",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
