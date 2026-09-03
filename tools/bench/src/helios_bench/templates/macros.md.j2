@@ -1,0 +1,20 @@
+{% macro cell(workload, side) -%}
+{% set cell = workload.cells.get(side) %}
+{% if cell is none %}n/a{% else %}{{ cell.warm.median | ms }} {{ cell.warm.ci_low | ci(cell.warm.ci_high) }}{% if cell.rejected %} (rejected){% endif %}{% endif %}
+{%- endmacro %}
+{% macro speedup(workload, side) -%}
+{% set found = namespace(text="n/a") %}
+{% for comparison in workload.comparisons %}
+{% if comparison.against == side %}
+{% set found.text = comparison.speedup | speedup ~ ("" if comparison.significant and comparison.beyond_noise else " (within noise)") %}
+{% endif %}
+{% endfor %}
+{{ found.text }}
+{%- endmacro %}
+{% macro row(workload) -%}
+| `{{ workload.name }}`{% if workload.headline %} (headline){% endif %}{% if workload.parity_bug %} **parity bug**{% endif %} | {{ cell(workload, Side.HELIOS) }} | {{ cell(workload, Side.LINUX_WASMTIME) }} | {{ cell(workload, Side.LINUX_NATIVE) }} | {{ speedup(workload, Side.LINUX_WASMTIME) }} | {{ speedup(workload, Side.LINUX_NATIVE) }} |
+{%- endmacro %}
+{% macro header() -%}
+| Workload | Helios | Linux + Wasmtime | Native Linux | vs Wasmtime | vs native |
+| --- | ---: | ---: | ---: | ---: | ---: |
+{%- endmacro %}

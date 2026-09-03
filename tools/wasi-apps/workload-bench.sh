@@ -34,6 +34,10 @@ if [[ -n "${HELIOS_WORKLOAD_BENCH_VM_MEMORY:-}" ]]; then
     command+=(--memory "${HELIOS_WORKLOAD_BENCH_VM_MEMORY}")
 fi
 
+if [[ -n "${HELIOS_WORKLOAD_BENCH_VM_SMP:-}" ]]; then
+    command+=(--smp "${HELIOS_WORKLOAD_BENCH_VM_SMP}")
+fi
+
 # Host packet path for the guest's virtio-net device. Only a multi-queue
 # backend can exercise the driver's multiqueue and offload paths; see
 # docs/networking.md.

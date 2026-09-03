@@ -1,0 +1,35 @@
+{% import "macros.md.j2" as m with context %}
+Rendered from CI run [{{ run_id }}]({{ reports[0].run.url }}) by `helios-bench render docs --run {{ run_id }}`; the reports it was rendered from are committed under `docs/benchmarks/runs/{{ run_id }}/`.
+
+{% for report in reports %}
+### Lane `{{ report.run.lane }}`
+
+{% if not report.run.publishable %}
+Advisory: this report is from `{{ report.run.runner_label }}`, not a dedicated runner{% for deviation in report.run.deviations %}; {{ deviation }}{% endfor %}. Its numbers show the shape of the comparison, not a publishable result.
+
+{% endif %}
+| Pin | Value |
+| --- | --- |
+| Helios | `{{ report.run.helios_git_sha }}` |
+| Vendored Wasmtime | `{{ report.pins.wasmtime_revision }}` |
+| Wasmtime on Linux | `{{ report.pins.wasmtime_linux_release }}` |
+| Fedora image | `{{ report.pins.fedora_image_sha256[:16] }}…` |
+| QEMU | pinned `{{ report.pins.qemu_version }}`, ran `{{ report.hardware.qemu_version or "unknown" }}` |
+| Guest | {{ report.pins.vcpus }} vCPUs, {{ report.pins.memory }} (Helios) / {{ report.pins.linux_vm_memory }} (Linux), `{{ report.pins.net_backend }}` network, {{ report.pins.devices | join(", ") }} |
+| Host | {{ report.hardware.cpu }}, {{ report.hardware.logical_cpus }} logical CPUs, {{ report.hardware.accelerator }} |
+{% if report.control %}
+| Noise floor | {{ report.control.noise_floor | percent }} from `{{ report.control.workload }}` before and after the suite |
+{% endif %}
+
+{% for workload_class, workloads in report.by_class().items() %}
+#### {{ CLASS_LABELS[workload_class] }}
+
+![{{ CLASS_LABELS[workload_class] }} on {{ report.run.lane }}](benchmarks/runs/{{ run_id }}/{{ report.run.lane }}-{{ workload_class }}.svg)
+
+{{ m.header() }}
+{% for workload in workloads %}
+{{ m.row(workload) }}
+{% endfor %}
+
+{% endfor %}
+{% endfor %}
