@@ -239,15 +239,15 @@
       }
     },
     {
-      "name": "instance-startup-1000",
+      "name": "instance-startup-500",
       "class": "startup",
       "headline": false,
       "runner": "program",
-      "description": "Time to first output across 1000 concurrently spawned instances, and memory per instance.",
+      "description": "Time to first output across 500 concurrently spawned instances, and memory per instance.",
       "program": "/bin/procbench",
       "args": [
         "startup",
-        "1000",
+        "500",
         "/bin/hello",
         "hold"
       ],
@@ -256,7 +256,7 @@
         "hello"
       ],
       "stdout_contains": [
-        "instance-startup:1000"
+        "instance-startup:500"
       ],
       "stderr_empty": true,
       "counterparts": {
@@ -264,7 +264,7 @@
           "program": "{native_bin}/procbench",
           "args": [
             "startup",
-            "1000",
+            "500",
             "{native_bin}/hello",
             "hold"
           ]
@@ -273,7 +273,7 @@
           "program": "{native_bin}/procbench",
           "args": [
             "startup",
-            "1000",
+            "500",
             "{wasmtime_run}",
             "{cwasm:artifacts/wasi-tools/hello.wasm}",
             "hold"

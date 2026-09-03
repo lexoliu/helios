@@ -132,6 +132,17 @@ stdlib, and runs upstream WASI tools such as Python and curl, and
 `docs/debug-serial.md` for the guest's debug serial line, the raw
 host-side capture every session keeps of it, and how to read one.
 
+## Performance
+
+Helios is measured against Linux + Wasmtime and native Linux on the same
+machine, accelerator and virtio devices, with the same wasm precompiled by
+the same Wasmtime revision. The suite, its pins and its statistics are
+described in [docs/benchmarks.md](docs/benchmarks.md).
+
+<!-- helios-bench:begin run=pending -->
+No advisory run has been rendered into this section yet.
+<!-- helios-bench:end -->
+
 ## Kernel Plugins
 
 Helios uses `kernel plugin` as an architectural term for a very specific

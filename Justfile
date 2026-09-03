@@ -165,3 +165,13 @@ test-embedded-debugger:
         --cargo cargo
     HELIOS_KERNEL_PREBUILD_MANIFEST="${out_dir}/kernel-prebuild.json" \
         cargo test -p helios-hosted init_program::tests::embedded_debugger_ -- --nocapture
+
+# Unit tests and lint of the benchmark-suite tooling (tools/bench); no benchmark runs.
+check-bench-tools:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{repo_root}}/tools/bench"
+    uv sync --quiet
+    uv run ruff check .
+    uv run ruff format --check .
+    uv run pytest -q

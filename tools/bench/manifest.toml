@@ -33,6 +33,8 @@ runner_label = "helios-bench-x86-kvm"
 shared_runner = "ubuntu-24.04"
 # QEMU release the lane is pinned to; ubuntu-24.04's qemu-system-x86 package.
 qemu_version = "8.2.2"
+# KVM boots in seconds; a marker hang should fail fast.
+boot_timeout_seconds = 300
 vcpus = 4
 # Without lazy-commit virtual memory the x86 kernel allocates WASIX
 # shared-memory capacity eagerly, so the shell workloads need more guest RAM.
@@ -51,6 +53,7 @@ runner_label = "helios-bench-arm-hvf"
 shared_runner = "macos-15"
 # Homebrew qemu on the dedicated Apple Silicon machine.
 qemu_version = "10.2.2"
+boot_timeout_seconds = 3600
 vcpus = 4
 memory = "2G"
 linux_vm_memory = "4G"
