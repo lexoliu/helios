@@ -222,6 +222,28 @@ impl PciRoot {
         helios_virtio::MsixBinding::shared(entry)
     }
 
+    /// Entries in the MSI-X table of `address`.
+    ///
+    /// The table is the device's, and a function that offers four
+    /// entries steers four messages however many processors the machine
+    /// has. Callers that size a request from something on this side of
+    /// the bus — a processor count, a queue-pair count — bound it by
+    /// this first; [`Self::bind_msix_vectors`] treats overrunning the
+    /// table as the programming error it is rather than truncating
+    /// silently.
+    pub(crate) fn msix_table_size(&self, address: PciAddress) -> u16 {
+        let header = PciHeader::new(address);
+        let endpoint = EndpointHeader::from_header(header, self.access)
+            .unwrap_or_else(|| panic!("PCI function {address} is not an endpoint"));
+        endpoint
+            .capabilities(self.access)
+            .find_map(|capability| match capability {
+                PciCapability::MsiX(msix) => Some(msix.table_size()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("PCI function {address} exposes no MSI-X capability"))
+    }
+
     /// Points the first `messages.len()` MSI-X table entries of
     /// `address` at the given vectors and local APICs, and enables MSI-X
     /// on the function.
