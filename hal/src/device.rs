@@ -2,9 +2,9 @@
 //!
 //! These are capability types: they say what a piece of hardware
 //! presents and what it may do to memory, and nothing about who drives
-//! it. A driver that lives in the kernel and a driver that lives in a
-//! wasm plugin are described by the same values here; the difference is
-//! entirely in what the layers above do with them.
+//! it. A driver that lives in the kernel and a driver that lives in an
+//! isolated user-mode instance are described by the same values here;
+//! the difference is entirely in what the layers above do with them.
 
 use crate::interrupt::InterruptSource;
 use crate::iommu::DomainId;

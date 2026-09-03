@@ -8,6 +8,7 @@ extern crate std;
 
 mod bootfs;
 mod component;
+mod device;
 mod embedded;
 mod exec;
 mod host_fs;
@@ -64,6 +65,10 @@ pub use component::{
     directory_prefix, map_resource_table_error, parent_path, path_is_within_directory,
     provider_channel, resolve_absolute_path, resolve_child_path, resolve_guest_path,
     strip_directory_prefix, wait_until_runtime_deadline,
+};
+pub use device::{
+    DeviceGrant, DeviceGrantError, DeviceHost, DmaRegion, GrantReclaim, GuestWindow,
+    MAX_DEVICE_DMA_REGIONS, MAX_DEVICE_INTERRUPTS, MAX_DEVICE_REGIONS, MappedRegion,
 };
 pub use embedded::{
     EmbeddedComponent, EmbeddedInit, embedded_boot_component, embedded_init,
