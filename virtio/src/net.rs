@@ -784,7 +784,9 @@ impl RxBufferSlot {
 impl<T: VirtioTransport> VirtioNetDevice<T> {
     pub fn new(transport: T) -> IoResult<Self> {
         if transport.device_type() != DeviceType::Network {
-            return Err(IoError::Unsupported);
+            return Err(IoError::InvalidDeviceConfig(
+                "virtio function handed to the network driver is not a network device",
+            ));
         }
 
         let features = negotiate_with(&transport, |offered| {
@@ -936,9 +938,6 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         } else {
             1
         };
-        if pair_count == 0 {
-            return Err(IoError::Unsupported);
-        }
 
         let mut queue_pairs: Vec<NetQueuePair<T>> = Vec::with_capacity(usize::from(pair_count));
         for pair_idx in 0..pair_count {
@@ -946,12 +945,29 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             let tx_queue_index = tx_queue_index(pair_idx);
             let rx_queue_size = transport.queue_max_size(rx_queue_index).min(NET_QUEUE_SIZE);
             let tx_queue_size = transport.queue_max_size(tx_queue_index).min(NET_QUEUE_SIZE);
-            if rx_queue_size == 0
-                || tx_queue_size == 0
-                || !rx_queue_size.is_power_of_two()
-                || !tx_queue_size.is_power_of_two()
-            {
-                return Err(IoError::Unsupported);
+            // Each condition is named on its own: this is the first thing
+            // a device with fewer queues than it advertises pairs, or
+            // with an odd ring size, trips over, and the panic that
+            // carries it is all a headless boot reports.
+            if rx_queue_size == 0 {
+                return Err(IoError::InvalidDeviceConfig(
+                    "virtio-net advertises a queue pair whose receive queue has size 0",
+                ));
+            }
+            if tx_queue_size == 0 {
+                return Err(IoError::InvalidDeviceConfig(
+                    "virtio-net advertises a queue pair whose transmit queue has size 0",
+                ));
+            }
+            if !rx_queue_size.is_power_of_two() {
+                return Err(IoError::InvalidDeviceConfig(
+                    "virtio-net receive queue size is not a power of two",
+                ));
+            }
+            if !tx_queue_size.is_power_of_two() {
+                return Err(IoError::InvalidDeviceConfig(
+                    "virtio-net transmit queue size is not a power of two",
+                ));
             }
 
             let mut rx_queue = VirtQueue::new(
@@ -1275,7 +1291,9 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     /// only spells out its own payload.
     fn send_control_command(&self, class: u8, command: u8, payload: &[u8]) -> IoResult<()> {
         let Some(control) = self.control.as_ref() else {
-            return Err(IoError::Unsupported);
+            return Err(IoError::InvalidDeviceConfig(
+                "virtio-net control command issued without a negotiated control queue",
+            ));
         };
         let mut state = control.lock();
         // Destructure under `&mut` so the split borrows of the

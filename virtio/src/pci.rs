@@ -322,13 +322,17 @@ impl<P: DmaPool> VirtioPciTransport<P> {
         let header = PciHeader::new(address);
         let (vendor_id, device_id) = header.id(access);
         if vendor_id != VIRTIO_PCI_VENDOR_ID {
-            return Err(IoError::Unsupported);
+            return Err(IoError::InvalidDeviceConfig(
+                "PCI function does not carry the virtio vendor id",
+            ));
         }
-        let mut endpoint =
-            EndpointHeader::from_header(header, access).ok_or(IoError::Unsupported)?;
+        let mut endpoint = EndpointHeader::from_header(header, access).ok_or(
+            IoError::InvalidDeviceConfig("virtio PCI function is not an endpoint header"),
+        )?;
         let (subsystem_id, _) = endpoint.subsystem(access);
-        let device_type =
-            device_type_from_ids(device_id, subsystem_id).ok_or(IoError::Unsupported)?;
+        let device_type = device_type_from_ids(device_id, subsystem_id).ok_or(
+            IoError::InvalidDeviceConfig("virtio PCI device id names no known device type"),
+        )?;
 
         // BAR sizing writes all-ones probe values, so decode has to be
         // off while the capabilities and BARs are read.
