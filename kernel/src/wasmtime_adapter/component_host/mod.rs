@@ -3764,6 +3764,26 @@ macro_rules! convert_host_share_stats {
     };
 }
 
+macro_rules! convert_network_stats {
+    ($bindings:path, $network:expr) => {
+        $network.map(|network: crate::NetworkStats| {
+            use $bindings as stats_bindings;
+            stats_bindings::Network {
+                queues: network
+                    .queues
+                    .into_iter()
+                    .map(|queue| stats_bindings::NetworkQueue {
+                        id: queue.id,
+                        rx_frames: queue.rx_frames,
+                        tx_frames: queue.tx_frames,
+                        interrupts: queue.interrupts,
+                    })
+                    .collect(),
+            }
+        })
+    };
+}
+
 macro_rules! convert_block_stats {
     ($bindings:path, $block:expr) => {
         $block.map(|block: crate::BlockStats| {
@@ -3835,6 +3855,7 @@ fn convert_sample(sample: StatsSample) -> debugger_bindings::helios::system::sta
             debugger_bindings::helios::system::stats,
             sample.host_share
         ),
+        network: convert_network_stats!(debugger_bindings::helios::system::stats, sample.network),
     }
 }
 
@@ -3867,6 +3888,7 @@ fn convert_program_sample(sample: StatsSample) -> program_bindings::helios::syst
             program_bindings::helios::system::stats,
             sample.host_share
         ),
+        network: convert_network_stats!(program_bindings::helios::system::stats, sample.network),
     }
 }
 

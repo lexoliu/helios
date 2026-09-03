@@ -117,6 +117,31 @@ interface stats {
     invalidations: u64,
   }
 
+  /// One network queue pair, and the shard and processor that own it.
+  record network-queue {
+    /// The shard, and therefore the processor and the queue pair.
+    id: u32,
+    /// Frames this shard's stack took off the device.
+    rx-frames: u64,
+    /// Frames it handed back to the device.
+    tx-frames: u64,
+    /// Interrupts the device raised for this pair's own message. Zero on
+    /// a transport that cannot tell its queues apart, where every
+    /// completion arrives on one line.
+    interrupts: u64,
+  }
+
+  /// How the interface's work is spread across processors.
+  ///
+  /// One entry per shard, which is one per processor. A device that
+  /// steers by flow hash puts each flow's frames on the queue whose
+  /// processor owns the socket, so both the frame counts and the
+  /// interrupt counts spread; a device that cannot steer leaves every
+  /// frame on the first entry.
+  record network {
+    queues: list<network-queue>,
+  }
+
   record sample {
     timestamp: mono-nanos,
     uptime: mono-nanos,
@@ -136,6 +161,8 @@ interface stats {
     /// Absent on a machine with no host share, or one whose host
     /// filesystem is reached without a 9p session in front of it.
     host-share: option<host-share-cache>,
+    /// Absent on a machine that gave the kernel no network device.
+    network: option<network>,
   }
 
   /// Returns the latest coherent system-wide observation snapshot.

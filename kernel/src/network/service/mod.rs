@@ -20,7 +20,7 @@ use alloc::sync::Arc as StdArc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::num::NonZeroU32;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use core::task::Poll;
 use core::time::Duration;
 
@@ -191,6 +191,34 @@ struct NetworkIpv6DnsServers {
 #[derive(Clone, Debug)]
 struct NetworkNeighborTable {
     entries: Vec<NeighborEntry>,
+}
+
+/// What one queue pair's shard has moved, and how often its processor
+/// was interrupted for it.
+///
+/// One record per shard, which is one per processor: the spread across
+/// them is what says whether steering is working. A device that steers
+/// puts each flow's frames on the queue whose processor owns the socket,
+/// so both the frame counts and the interrupt counts spread; a device
+/// that cannot leaves every frame on the default shard and every
+/// interrupt on one processor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NetworkQueueStats {
+    /// The shard, and therefore the processor and the queue pair.
+    pub id: u32,
+    /// Frames this shard's stack took off the device.
+    pub rx_frames: u64,
+    /// Frames it handed back to the device.
+    pub tx_frames: u64,
+    /// Interrupts the device raised for this pair's own message. Zero on
+    /// a transport that cannot tell its queues apart.
+    pub interrupts: u64,
+}
+
+/// Per-shard network counters, one entry per processor.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NetworkStats {
+    pub queues: Vec<NetworkQueueStats>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -634,6 +662,27 @@ where
                 link_up: AtomicBool::new(device.link_state().is_up()),
                 device,
             }),
+        }
+    }
+
+    /// Per-shard frame and interrupt counters.
+    ///
+    /// Read without locking a shard: the counters are relaxed atomics
+    /// outside the shard mutex, so a statistics sweep never contends
+    /// with the receive path it is measuring.
+    pub fn stats(&self) -> NetworkStats {
+        NetworkStats {
+            queues: (0..self.inner.state.shard_count())
+                .map(|idx| {
+                    let (rx_frames, tx_frames) = self.inner.state.frame_counts(idx);
+                    NetworkQueueStats {
+                        id: idx as u32,
+                        rx_frames,
+                        tx_frames,
+                        interrupts: self.inner.device.queue_interrupts(idx),
+                    }
+                })
+                .collect(),
         }
     }
 

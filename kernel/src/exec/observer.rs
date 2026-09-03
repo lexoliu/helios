@@ -53,7 +53,7 @@ pub enum TraceLevel {
     Trace,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StatsSample {
     pub timestamp: u64,
     pub uptime: u64,
@@ -75,6 +75,9 @@ pub struct StatsSample {
     /// How the host share's 9p caches have served the kernel, absent on
     /// a machine with no host share behind a 9p session.
     pub host_share: Option<crate::HostFsCacheStats>,
+    /// How the interface's work is spread across processors, absent on a
+    /// machine that gave the kernel no network device.
+    pub network: Option<crate::NetworkStats>,
 }
 
 #[derive(Clone, Debug)]

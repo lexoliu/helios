@@ -928,6 +928,7 @@ where
                         backpressured,
                     } => {
                         arrivals.record(shard_idx);
+                        self.inner.state.record_received(shard_idx, 1);
                         received += 1;
                         received_bytes = received_bytes.saturating_add(frame_len);
                         if backpressured {

@@ -27,7 +27,7 @@ use bytes::Bytes;
 use core::cell::UnsafeCell;
 use core::mem::size_of;
 use core::ops::Range;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use helios_hal::io::{IoError, IoResult};
 use helios_netstack::{
@@ -605,6 +605,12 @@ impl<T: VirtioTransport> NetQueuePair<T> {
     /// A pair another processor currently holds is reported as idle:
     /// that processor is draining it, so it needs no wake, and an
     /// interrupt handler must not wait for a lock in any case.
+    /// Counts one interrupt for this pair and releases its waiters.
+    fn raise_interrupt(&self) {
+        self.interrupt_count.fetch_add(1, Ordering::Relaxed);
+        self.interrupts.notify_all();
+    }
+
     fn has_pending_completions(&self) -> bool {
         let receive = self
             .rx_state
@@ -623,6 +629,13 @@ impl<T: VirtioTransport> NetQueuePair<T> {
 /// slab so submissions on different CPUs do not contend on the same
 /// SpinMutex / async lock.
 struct NetQueuePair<T: VirtioTransport> {
+    /// Interrupts raised for this pair alone.
+    ///
+    /// The distribution across pairs is the evidence that steering
+    /// works: with per-queue vectors each of these is incremented on the
+    /// processor that drains the pair, so the counts spread instead of
+    /// piling on whichever processor owns a single vector.
+    interrupt_count: AtomicU64,
     /// Progress on this pair alone.
     ///
     /// A per-CPU queue layout wants a per-queue wake: a waiter whose
@@ -1000,6 +1013,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             let tx_payloads = vec![None; tx_buffer_count].into_boxed_slice();
 
             queue_pairs.push(NetQueuePair {
+                interrupt_count: AtomicU64::new(0),
                 interrupts: Notify::new(),
                 rx_state: AsyncMutex::new(NetRxState {
                     rx_queue,
@@ -1398,7 +1412,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 continue;
             }
             progress.record(pair_idx);
-            pair.interrupts.notify_all();
+            pair.raise_interrupt();
         }
         // A configuration change belongs to no pair, and neither does a
         // control-queue completion, so the device-wide notification
@@ -1415,7 +1429,14 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     pub fn handle_interrupt_on(&self, pair_idx: usize) {
         let pair_idx = self.normalize_pair_idx(pair_idx);
         self.transport.ack_interrupt();
-        self.queue_pairs[pair_idx].interrupts.notify_all();
+        self.queue_pairs[pair_idx].raise_interrupt();
+    }
+
+    /// Interrupts raised for one queue pair since boot.
+    pub fn queue_interrupts(&self, pair_idx: usize) -> u64 {
+        self.queue_pairs
+            .get(self.normalize_pair_idx(pair_idx))
+            .map_or(0, |pair| pair.interrupt_count.load(Ordering::Relaxed))
     }
 
     /// Handles an interrupt raised by the configuration-change vector.

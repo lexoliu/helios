@@ -637,6 +637,18 @@ pub trait NetworkInterface: Clone + Send + Sync + 'static {
     /// Waits for interface progress, such as RX arrival or TX completion.
     fn wait_for_event(&self) -> impl Future<Output = ()> + Send + '_;
 
+    /// Interrupts this queue pair's own message has raised since boot.
+    ///
+    /// The distribution across pairs is what says whether steering is
+    /// actually working: a device that steers raises each pair's
+    /// interrupt on the processor that drains it, so the counts spread
+    /// across processors instead of piling on one. Zero for an interface
+    /// that cannot tell its queues apart.
+    fn queue_interrupts(&self, queue_idx: usize) -> u64 {
+        let _ = queue_idx;
+        0
+    }
+
     /// Waits for progress on one queue pair, or for anything the device
     /// reports that belongs to no pair.
     ///

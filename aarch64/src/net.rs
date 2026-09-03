@@ -173,6 +173,10 @@ impl NetworkDevice for VirtioNetworkDevice {
     async fn wait_for_event_on(&self, queue_idx: usize) {
         self.inner.wait_for_interrupt_on(queue_idx).await;
     }
+
+    fn queue_interrupts(&self, queue_idx: usize) -> u64 {
+        self.inner.queue_interrupts(queue_idx)
+    }
 }
 
 fn discover_network_device(

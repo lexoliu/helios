@@ -580,6 +580,10 @@ where
     Runtime: ComponentRuntimeState + Sync,
     DeviceImpl: NetworkDevice,
 {
+    fn network_stats(&self) -> crate::NetworkStats {
+        NetworkService::stats(self)
+    }
+
     async fn bridge_port(
         &self,
         port: NetworkPortId,

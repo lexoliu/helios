@@ -199,6 +199,16 @@ pub(super) struct NetworkShard {
 #[repr(align(64))]
 pub(super) struct PaddedShard {
     pub(super) inner: SpinMutex<NetworkShard>,
+    /// Frames this shard's stack has taken off the device, and frames
+    /// it has handed back to it.
+    ///
+    /// Counted per shard because that is the distribution the steering
+    /// work exists to produce: a device that steers spreads a machine's
+    /// flows across these, and one that cannot leaves them all on the
+    /// default shard's counter. Relaxed atomics — a statistic that is a
+    /// few frames stale is still the right answer.
+    pub(super) rx_frames: AtomicU64,
+    pub(super) tx_frames: AtomicU64,
     /// Raised every time a frame is placed in this shard's stack.
     ///
     /// Deliberately outside the `SpinMutex`: the processor that drained
@@ -469,6 +479,8 @@ impl NetworkShardSet {
         for index in 0..shard_count {
             shards.push(PaddedShard {
                 inner: SpinMutex::new(factory(index)),
+                rx_frames: AtomicU64::new(0),
+                tx_frames: AtomicU64::new(0),
                 arrival: ProgressSignal::new(),
             });
         }
@@ -599,6 +611,30 @@ impl NetworkShardSet {
             self.shards.len()
         );
         owner
+    }
+
+    /// Records frames this shard took off the device.
+    #[inline]
+    pub(super) fn record_received(&self, idx: usize, frames: usize) {
+        self.shards[idx]
+            .rx_frames
+            .fetch_add(frames as u64, AtomicOrdering::Relaxed);
+    }
+
+    /// Records frames this shard handed to the device.
+    #[inline]
+    pub(super) fn record_transmitted(&self, idx: usize, frames: usize) {
+        self.shards[idx]
+            .tx_frames
+            .fetch_add(frames as u64, AtomicOrdering::Relaxed);
+    }
+
+    /// Frames this shard has moved in each direction since boot.
+    pub(super) fn frame_counts(&self, idx: usize) -> (u64, u64) {
+        (
+            self.shards[idx].rx_frames.load(AtomicOrdering::Relaxed),
+            self.shards[idx].tx_frames.load(AtomicOrdering::Relaxed),
+        )
     }
 
     /// The shard's cross-processor arrival signal. Raised by whichever
