@@ -219,6 +219,91 @@ impl ShardHandle {
     }
 }
 
+/// A handle for a socket that exists on every shard at once.
+///
+/// A listener and a wildcard-bound datagram socket cannot belong to one
+/// shard: the flow hash of an inbound SYN or of a datagram from an
+/// arbitrary peer is not known when the socket is opened, so it lands
+/// wherever the hash says. Both are therefore installed on every shard
+/// in the *same* slab slot, and the handle names only that slot — the
+/// shard is chosen at receive time by the hash rather than written into
+/// the id.
+///
+/// The slot is stored as `slot + 1` so a handle is never zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ReplicaHandle(NonZeroU32);
+
+impl ReplicaHandle {
+    pub(super) fn new(slot: usize) -> Self {
+        let encoded = u32::try_from(slot)
+            .ok()
+            .and_then(|slot| slot.checked_add(1))
+            .unwrap_or_else(|| panic!("replicated handle slot {slot} does not fit a handle"));
+        Self(
+            NonZeroU32::new(encoded)
+                .unwrap_or_else(|| panic!("replicated handle slot {slot} encoded to zero")),
+        )
+    }
+
+    /// The slab slot this socket occupies on every shard.
+    pub(super) const fn slot(self) -> usize {
+        (self.0.get() - 1) as usize
+    }
+
+    pub(super) const fn get(self) -> NonZeroU32 {
+        self.0
+    }
+
+    pub(super) const fn from_raw(raw: NonZeroU32) -> Self {
+        Self(raw)
+    }
+}
+
+/// Slab slots reserved across every shard at once.
+///
+/// A replicated socket has to occupy the same slot in each shard's
+/// slab, which the per-shard free lists cannot agree on by themselves.
+/// This allocator is the single owner of that decision; the shards then
+/// take the slot it hands out.
+pub(super) struct ReplicaSlots<const CAPACITY: usize> {
+    used: SpinMutex<[bool; CAPACITY]>,
+}
+
+impl<const CAPACITY: usize> ReplicaSlots<CAPACITY> {
+    /// Builds an allocator whose first `reserved` slots are already
+    /// taken, for sockets the shards install at construction.
+    pub(super) fn new(reserved: usize) -> Self {
+        assert!(
+            reserved <= CAPACITY,
+            "cannot reserve {reserved} of {CAPACITY} replicated slots"
+        );
+        let mut used = [false; CAPACITY];
+        for slot in &mut used[..reserved] {
+            *slot = true;
+        }
+        Self {
+            used: SpinMutex::new(used),
+        }
+    }
+
+    /// Takes the lowest free slot, or `None` when the table is full.
+    pub(super) fn allocate(&self) -> Option<usize> {
+        let mut used = self.used.lock();
+        let slot = used.iter().position(|taken| !*taken)?;
+        used[slot] = true;
+        Some(slot)
+    }
+
+    /// Returns a slot after every shard has dropped its replica.
+    pub(super) fn release(&self, slot: usize) {
+        let mut used = self.used.lock();
+        assert!(
+            core::mem::replace(&mut used[slot], false),
+            "replicated slot {slot} was released twice"
+        );
+    }
+}
+
 /// A shard's arrival signal sampled before the caller inspected that
 /// shard, together with the shard it came from.
 ///
@@ -228,12 +313,36 @@ impl ShardHandle {
 /// shard the operation belongs to.
 #[derive(Clone, Copy)]
 pub(super) struct ShardWait {
-    pub(super) shard_idx: usize,
+    pub(super) target: WaitTarget,
     pub(super) mark: ProgressMark,
+}
+
+/// Which arrival signal an operation parks on.
+///
+/// A socket that lives on one shard waits for that shard. A replicated
+/// socket cannot: an inbound connection or a datagram from an arbitrary
+/// peer lands on whichever shard its flow hashes to, so the operation
+/// waits for the whole set instead.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum WaitTarget {
+    Shard(usize),
+    AnyShard,
 }
 
 pub(super) struct NetworkShardSet {
     pub(super) shards: Box<[PaddedShard]>,
+    /// Slots for listeners, which exist on every shard because an
+    /// inbound connection's hash is not known when the port is opened.
+    pub(super) listener_slots: ReplicaSlots<MAX_TCP_LISTENER_HANDLES>,
+    /// Slots for bound datagram sockets, for the same reason.
+    pub(super) udp_slots: ReplicaSlots<MAX_UDP_SOCKET_HANDLES>,
+    /// Raised whenever any shard takes a frame.
+    ///
+    /// A replicated socket has no single shard to watch, so this is what
+    /// its operations park on. Raising it costs one atomic increment per
+    /// receive batch, and the waiters it releases are the accept and
+    /// datagram-receive calls of server sockets.
+    pub(super) replica_arrival: ProgressSignal,
 }
 
 impl ShardArrivals {
@@ -290,7 +399,88 @@ impl NetworkShardSet {
         }
         Self {
             shards: shards.into_boxed_slice(),
+            listener_slots: ReplicaSlots::new(0),
+            // Slot zero is the DHCP client, which every shard reserves
+            // so a replicated bind cannot land on top of it.
+            udp_slots: ReplicaSlots::new(INTERNAL_UDP_RESERVED_SLOTS),
+            replica_arrival: ProgressSignal::new(),
         }
+    }
+
+    /// Installs a replicated socket on every shard, or on none.
+    ///
+    /// A partial install would leave a port taken on some shards and
+    /// free on others, and the next bind would then disagree with the
+    /// receive path about who owns it, so a shard that refuses unwinds
+    /// the ones that already took it.
+    pub(super) fn install_replica<E>(
+        &self,
+        slot: usize,
+        mut install: impl FnMut(&mut NetworkShard, usize) -> Result<(), E>,
+        mut remove: impl FnMut(&mut NetworkShard, usize),
+    ) -> Result<(), E> {
+        for (installed, shard) in self.shards.iter().enumerate() {
+            let outcome = install(&mut shard.inner.lock(), slot);
+            if let Err(error) = outcome {
+                for unwound in &self.shards[..installed] {
+                    remove(&mut unwound.inner.lock(), slot);
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Runs `f` against each shard's replica in turn, starting at
+    /// `start`, and stops at the first one that answers.
+    ///
+    /// Receiving from a replicated socket works this way: the caller's
+    /// own shard is the likeliest to hold something and costs no
+    /// cross-processor traffic, and the rest are visited afterwards so
+    /// a datagram or a connection the hash placed elsewhere is never
+    /// stranded. An error from any replica ends the walk, because a
+    /// replicated socket that failed on one shard is not healthy on the
+    /// others.
+    pub(super) fn find_in_replicas<R, E>(
+        &self,
+        start: usize,
+        mut f: impl FnMut(&mut NetworkShard) -> Result<Option<R>, E>,
+    ) -> Result<Option<R>, E> {
+        for offset in 0..self.shards.len() {
+            let idx = (start + offset) % self.shards.len();
+            let mut shard = self.shards[idx].inner.lock();
+            if let Some(found) = f(&mut shard)? {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Retargets every replica of a socket, in shard order.
+    ///
+    /// The first shard decides the outcome. Every replica holds the same
+    /// binding and reads the same replicated address table, so a later
+    /// shard that disagrees means the set has drifted — a kernel bug,
+    /// not a caller error — and it is reported as one rather than left
+    /// as a half-applied change.
+    pub(super) fn for_each_replica<E: core::fmt::Display>(
+        &self,
+        operation: &'static str,
+        mut f: impl FnMut(&mut NetworkShard) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut shards = self.shards.iter();
+        let first = shards
+            .next()
+            .unwrap_or_else(|| panic!("a network shard set is never empty"));
+        f(&mut first.inner.lock())?;
+        for shard in shards {
+            if let Err(error) = f(&mut shard.inner.lock()) {
+                panic!(
+                    "replicated {operation} succeeded on the first shard but failed on a later one: {error}"
+                );
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn shard_count(&self) -> usize {
@@ -363,8 +553,27 @@ impl NetworkShardSet {
     #[inline]
     pub(super) fn shard_wait(&self, idx: usize) -> ShardWait {
         ShardWait {
-            shard_idx: idx,
+            target: WaitTarget::Shard(idx),
             mark: self.arrival(idx).mark(),
+        }
+    }
+
+    /// Samples the set-wide arrival signal, for an operation on a
+    /// socket that lives on every shard.
+    #[inline]
+    pub(super) fn replica_wait(&self) -> ShardWait {
+        ShardWait {
+            target: WaitTarget::AnyShard,
+            mark: self.replica_arrival.mark(),
+        }
+    }
+
+    /// The signal a sampled wait belongs to.
+    #[inline]
+    pub(super) fn arrival_for(&self, target: WaitTarget) -> &ProgressSignal {
+        match target {
+            WaitTarget::Shard(idx) => self.arrival(idx),
+            WaitTarget::AnyShard => &self.replica_arrival,
         }
     }
 
@@ -405,6 +614,10 @@ impl NetworkShardSet {
                 cpu.wake_processor(owner);
             }
         }
+        // A replicated socket's operations watch the whole set, because
+        // the shard their next connection or datagram lands on is not
+        // known until its flow is hashed.
+        self.replica_arrival.signal();
     }
 
     /// Places one received frame in the shard that owns its local port.
@@ -572,34 +785,24 @@ impl NetworkShard {
         let initial_ephemeral = EPHEMERAL_PORT_START + shard_idx as u16;
         let mut stack = Box::new(Stack::new(stack_config));
         let mut udp_sockets = HandleSlab::new();
-        if shard_idx == shard_idx_for_port(Some(DHCP_CLIENT_PORT), shard_count) {
-            let binding = UdpSocketBinding::wildcard(DHCP_CLIENT_PORT);
-            let stack_socket = stack
-                .open_udp(binding)
-                .unwrap_or_else(|error| panic!("failed to open DHCP UDP socket: {error}"));
-            let slot = udp_sockets.insert(UdpSocketState {
-                stack_socket,
-                binding,
-            });
-            assert_eq!(
-                slot, INTERNAL_DHCP_SOCKET_INDEX,
-                "DHCP internal UDP socket slot changed"
-            );
-        }
-        if shard_idx == shard_idx_for_port(Some(INTERNAL_DNS_PORT), shard_count) {
-            let binding = UdpSocketBinding::wildcard(INTERNAL_DNS_PORT);
-            let stack_socket = stack
-                .open_udp(binding)
-                .unwrap_or_else(|error| panic!("failed to open DNS UDP socket: {error}"));
-            let slot = udp_sockets.insert(UdpSocketState {
-                stack_socket,
-                binding,
-            });
-            assert_eq!(
-                slot, INTERNAL_DNS_SOCKET_INDEX,
-                "DNS internal UDP socket slot changed"
-            );
-        }
+        // Every shard opens the DHCP client socket, and always in the
+        // same slab slot, because a replicated bind occupies one slot
+        // index across the whole set and must not land on top of it.
+        // Only the default shard ever receives on it — a DHCP exchange
+        // is broadcast at a moment when the interface has no address to
+        // hash a flow with — but the slot is spent everywhere.
+        let binding = UdpSocketBinding::wildcard(DHCP_CLIENT_PORT);
+        let stack_socket = stack
+            .open_udp(binding)
+            .unwrap_or_else(|error| panic!("failed to open DHCP UDP socket: {error}"));
+        let slot = udp_sockets.insert(UdpSocketState {
+            stack_socket,
+            binding,
+        });
+        assert_eq!(
+            slot, INTERNAL_DHCP_SOCKET_INDEX,
+            "DHCP internal UDP socket slot changed"
+        );
         Self {
             stack,
             shard_idx,

@@ -54,31 +54,46 @@ where
         }
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         self.wait_for_dns_transport(deadline_nanos).await?;
-        let queries = self.inner.state.with_mut(|state| DnsQueryPair {
-            a: state.next_dns_query_id(),
-            aaaa: state.next_dns_query_id(),
-        });
-        let mut answers = DnsAnswers::new();
+        // The lookup runs on its own connected socket rather than a
+        // shared well-known port: a connected socket's four-tuple is
+        // known when it is opened, so it is placed on the shard its
+        // answers will demux to, and two lookups on two processors no
+        // longer share one queue on one shard.
+        let resolver = self.resolver_endpoint()?;
+        let socket = self.open_resolver_socket(resolver)?;
+        let result = self.resolve_through(&socket, host, deadline_nanos).await;
+        self.close_resolver_socket(&socket);
+        result
+    }
 
+    /// Runs one dual-family lookup over an already-open resolver socket.
+    async fn resolve_through(
+        &self,
+        socket: &ResolverSocket,
+        host: &str,
+        deadline_nanos: u64,
+    ) -> Result<Vec<NetworkIpAddress>, DnsError> {
+        let queries = self
+            .inner
+            .state
+            .shard_at(socket.shard_idx)
+            .lock()
+            .next_dns_query_pair();
+        let mut answers = DnsAnswers::new();
         loop {
-            // The internal resolver socket is bound to
-            // `INTERNAL_DNS_PORT`, so a response demuxes to that port's
-            // shard whichever processor drained it off the device. The
-            // mark is taken before the responses are polled, so a
-            // response that lands in between resolves the wait instead
-            // of being slept through — the exact case that made
-            // `--smp 4` DNS lookups time out while the per-operation
-            // wait was a device-event wait.
-            let wait = self
-                .inner
-                .state
-                .shard_wait_for_local_port(INTERNAL_DNS_PORT);
+            // The answers land in the socket's own shard, whichever
+            // processor drained them off the device. The mark is taken
+            // before they are polled, so a response that arrives in
+            // between resolves the wait instead of being slept through —
+            // the exact case that made `--smp 4` DNS lookups time out
+            // while the per-operation wait was a device-event wait.
+            let wait = self.inner.state.shard_wait(socket.shard_idx);
             self.drive_dns().await?;
             let now = StackInstant::from_nanos(self.now_nanos());
-            self.inner.state.with_mut(|state| -> Result<(), DnsError> {
-                state.send_dns_queries(queries, host, &answers, now)?;
-                state.poll_dns_responses(queries, &mut answers)
-            })?;
+            let mut shard = self.inner.state.shard_at(socket.shard_idx).lock();
+            shard.send_dns_queries(socket, queries, host, &answers, now)?;
+            shard.poll_dns_responses(socket, queries, &mut answers)?;
+            drop(shard);
             if answers.complete() {
                 return answers.finish();
             }
@@ -100,6 +115,75 @@ where
             )
             .await;
         }
+    }
+
+    /// The resolver this link can actually reach.
+    ///
+    /// A DHCP-supplied resolver is preferred because the IPv4 path is
+    /// always configured first; a Router Advertisement's RDNSS servers
+    /// stand in on a link that offers IPv6 only.
+    fn resolver_endpoint(&self) -> Result<IpAddress, DnsError> {
+        self.inner
+            .state
+            .with(|state| {
+                state
+                    .dns_servers
+                    .first()
+                    .copied()
+                    .map(IpAddress::Ipv4)
+                    .or_else(|| state.stack.ipv6_dns_servers().next().map(IpAddress::Ipv6))
+            })
+            .ok_or(DnsError {
+                kind: DnsErrorKind::Unavailable,
+                detail: NetworkErrorDetail::DnsServersUnavailable,
+            })
+    }
+
+    /// Opens a connected socket to `resolver` on the shard that will
+    /// receive its answers.
+    fn open_resolver_socket(&self, resolver: IpAddress) -> Result<ResolverSocket, DnsError> {
+        let processor = self.inner.cpu.current_processor();
+        let shard_idx = self.inner.state.shard_idx_for_processor(processor);
+        let mut shard = self.inner.state.shard_at(shard_idx).lock();
+        let local_port = shard.allocate_udp_local_port().map_err(|_| DnsError {
+            kind: DnsErrorKind::Unavailable,
+            detail: NetworkErrorDetail::DnsQueryStartFailed,
+        })?;
+        let local = shard
+            .udp_local_endpoint(local_port, resolver)
+            .map_err(|_| DnsError {
+                kind: DnsErrorKind::Unavailable,
+                detail: NetworkErrorDetail::DnsServersUnavailable,
+            })?;
+        let binding = UdpSocketBinding::connected(
+            local,
+            UdpEndpoint {
+                address: resolver,
+                port: DNS_PORT,
+            },
+        );
+        let stack_socket = shard.stack.open_udp(binding).map_err(|_| DnsError {
+            kind: DnsErrorKind::Unavailable,
+            detail: NetworkErrorDetail::DnsQueryStartFailed,
+        })?;
+        Ok(ResolverSocket {
+            shard_idx,
+            stack_socket,
+            resolver,
+        })
+    }
+
+    /// Releases the socket and its ephemeral port. A lookup that timed
+    /// out releases it just like one that answered, so an abandoned
+    /// query cannot leak a port or keep matching later datagrams.
+    fn close_resolver_socket(&self, socket: &ResolverSocket) {
+        self.inner
+            .state
+            .shard_at(socket.shard_idx)
+            .lock()
+            .stack
+            .remove_udp_socket(socket.stack_socket)
+            .unwrap_or_else(|_| panic!("resolver socket referenced an unknown stack socket"));
     }
 
     pub(super) async fn wait_for_dns_transport(&self, deadline_nanos: u64) -> Result<(), DnsError> {
@@ -850,7 +934,7 @@ impl NetworkShard {
         self.stack.take_icmp_echo_reply(key)
     }
 
-    pub(super) fn next_dns_query_id(&mut self) -> u16 {
+    fn next_dns_query_id(&mut self) -> u16 {
         let id = self.next_dns_query_id;
         self.next_dns_query_id = self.next_dns_query_id.wrapping_add(1);
         if self.next_dns_query_id == 0 {
@@ -859,28 +943,38 @@ impl NetworkShard {
         id
     }
 
+    /// The two question ids one dual-family lookup will carry.
+    pub(super) fn next_dns_query_pair(&mut self) -> DnsQueryPair {
+        DnsQueryPair {
+            a: self.next_dns_query_id(),
+            aaaa: self.next_dns_query_id(),
+        }
+    }
+
     /// Sends whichever of the pair's questions is still outstanding.
     ///
     /// Called on every poll iteration, so an unanswered question is
     /// retransmitted while its peer's answer is already banked.
     pub(super) fn send_dns_queries(
         &mut self,
+        socket: &ResolverSocket,
         queries: DnsQueryPair,
         host: &str,
         answers: &DnsAnswers,
         now: StackInstant,
     ) -> Result<(), DnsError> {
         if !answers.a_answered {
-            self.send_dns_query(queries.a, host, DnsRecordType::A, now)?;
+            self.send_dns_query(socket, queries.a, host, DnsRecordType::A, now)?;
         }
         if !answers.aaaa_answered {
-            self.send_dns_query(queries.aaaa, host, DnsRecordType::Aaaa, now)?;
+            self.send_dns_query(socket, queries.aaaa, host, DnsRecordType::Aaaa, now)?;
         }
         Ok(())
     }
 
     fn send_dns_query(
         &mut self,
+        socket: &ResolverSocket,
         query_id: u16,
         host: &str,
         record: DnsRecordType,
@@ -893,42 +987,31 @@ impl NetworkShard {
                 kind: DnsErrorKind::UnresolvedHost,
                 detail: NetworkErrorDetail::DnsQueryStartFailed,
             })?;
-        // A DHCP-supplied resolver is preferred because the IPv4 path
-        // is always configured first; a Router Advertisement's RDNSS
-        // servers stand in on a link that offers IPv6 only.
-        let ipv6_server = self.stack.ipv6_dns_servers().next();
-        let queued = if let Some(server) = self.dns_servers.first().copied() {
-            self.stack.send_udp_ipv4(
-                INTERNAL_DNS_PORT,
-                server,
+        self.stack
+            .send_udp(
+                socket.stack_socket,
+                socket.resolver,
                 DNS_PORT,
                 &payload[..len],
                 query_id,
                 now,
             )
-        } else if let Some(server) = ipv6_server {
-            self.stack
-                .send_udp_ipv6(INTERNAL_DNS_PORT, server, DNS_PORT, &payload[..len], now)
-        } else {
-            return Err(DnsError {
+            .map(|_| ())
+            .map_err(|_| DnsError {
                 kind: DnsErrorKind::Unavailable,
-                detail: NetworkErrorDetail::DnsServersUnavailable,
-            });
-        };
-        queued.map(|_| ()).map_err(|_| DnsError {
-            kind: DnsErrorKind::Unavailable,
-            detail: NetworkErrorDetail::DnsQueryStartFailed,
-        })
+                detail: NetworkErrorDetail::DnsQueryStartFailed,
+            })
     }
 
-    /// Drains the shared internal DNS socket, banking whichever of the
+    /// Drains this lookup's resolver socket, banking whichever of the
     /// pair's answers have arrived.
     pub(super) fn poll_dns_responses(
         &mut self,
+        socket: &ResolverSocket,
         queries: DnsQueryPair,
         answers: &mut DnsAnswers,
     ) -> Result<(), DnsError> {
-        let socket = self.internal_udp_socket(INTERNAL_DNS_SOCKET_INDEX, INTERNAL_DNS_PORT);
+        let socket = socket.stack_socket;
         while let Some(datagram) = self.stack.take_udp(socket).map_err(|_| DnsError {
             kind: DnsErrorKind::Unavailable,
             detail: NetworkErrorDetail::DnsQueryStartFailed,
@@ -965,6 +1048,17 @@ impl NetworkShard {
     }
 }
 
+/// One lookup's connected socket to a resolver.
+///
+/// Both questions of a dual-family lookup share it, so their answers
+/// arrive on one queue on one shard — the shard the socket's four-tuple
+/// belongs to, which is where the receive path places them.
+pub(super) struct ResolverSocket {
+    pub(super) shard_idx: usize,
+    pub(super) stack_socket: helios_netstack::UdpSocketId,
+    pub(super) resolver: IpAddress,
+}
+
 /// The two question ids one dual-family lookup has outstanding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct DnsQueryPair {
@@ -974,9 +1068,9 @@ pub(super) struct DnsQueryPair {
 
 /// Answers accumulated for one dual-family lookup.
 ///
-/// Both questions share the internal DNS socket, so answers arrive
-/// interleaved with each other and with responses to abandoned lookups;
-/// this keeps per-lookup state out of the shard.
+/// Both questions share the lookup's resolver socket, so answers arrive
+/// interleaved with each other; this keeps per-lookup state out of the
+/// shard.
 pub(super) struct DnsAnswers {
     addresses: Vec<NetworkIpAddress>,
     a_answered: bool,

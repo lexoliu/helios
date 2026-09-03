@@ -31,9 +31,9 @@ where
 
     /// Retargets a bound datagram socket's IPv4 TTL / IPv6 hop limit.
     pub fn udp_set_hop_limit(&self, socket: UdpSocketId, hop_limit: u8) -> Result<(), UdpError> {
-        self.inner
-            .state
-            .with_handle(socket, |state| state.set_udp_hop_limit(socket, hop_limit))
+        self.inner.state.for_each_replica("udp hop limit", |state| {
+            state.set_udp_hop_limit(socket, hop_limit)
+        })
     }
 
     pub async fn udp_send(
@@ -77,21 +77,36 @@ where
     /// A bound UDP socket is always writable — sends are not window-limited.
     pub async fn udp_readiness(&self, socket: UdpSocketId) -> Result<SocketReadiness, UdpError> {
         self.drive_udp().await?;
-        self.inner.state.with_handle(socket, |state| {
-            let stack_socket = state.udp_socket(socket)?.stack_socket;
-            let readable = state
-                .stack
-                .udp_receive_pending(stack_socket)
-                .map_err(|_| UdpError {
-                    kind: UdpErrorKind::Unavailable,
-                    detail: NetworkErrorDetail::UdpReceiveFailed,
-                })?;
-            Ok(SocketReadiness {
-                readable,
-                writable: true,
-                hangup: false,
-            })
+        // Readable means "some replica has a datagram queued", so the
+        // probe walks them the same way `receive` does.
+        let readable = self
+            .inner
+            .state
+            .find_in_replicas(self.receiving_shard_idx(), |state| {
+                let stack_socket = state.udp_socket(socket)?.stack_socket;
+                state
+                    .stack
+                    .udp_receive_pending(stack_socket)
+                    .map(|pending| pending.then_some(()))
+                    .map_err(|_| UdpError {
+                        kind: UdpErrorKind::Unavailable,
+                        detail: NetworkErrorDetail::UdpReceiveFailed,
+                    })
+            })?
+            .is_some();
+        Ok(SocketReadiness {
+            readable,
+            writable: true,
+            hangup: false,
         })
+    }
+
+    /// The shard a receive walk starts at: this processor's own, which
+    /// it can drain without touching another CPU's cache.
+    fn receiving_shard_idx(&self) -> usize {
+        self.inner
+            .state
+            .shard_idx_for_processor(self.inner.cpu.current_processor())
     }
 
     pub async fn udp_join_multicast_v4(
@@ -111,30 +126,62 @@ where
     }
 
     pub async fn udp_close(&self, socket: UdpSocketId) {
-        self.inner.state.with_handle(socket, |state| {
-            state.remove_udp_socket(socket);
-        });
+        let slot = ReplicaHandle::from(socket).slot();
+        self.inner
+            .state
+            .for_each_replica("udp close", |state| {
+                state.remove_udp_replica(slot);
+                Ok::<(), core::convert::Infallible>(())
+            })
+            .unwrap_or_else(|infallible| match infallible {});
+        self.inner.state.udp_slots.release(slot);
     }
 
     pub(super) async fn execute_udp_bind(
         &self,
         local_port: u16,
     ) -> Result<UdpBinding<UdpSocketId>, UdpError> {
-        // local_port == 0 means "allocate ephemeral"; the binding
-        // should live on the current processor's shard so its
-        // freshly stride-allocated port demuxes RX traffic back
-        // here. A non-zero `local_port` is fixed by the caller, so
-        // route by the port's stride owner instead.
-        if local_port == 0 {
-            let processor = self.inner.cpu.current_processor();
-            self.inner
+        // A wildcard-bound datagram socket cannot belong to one shard:
+        // it accepts datagrams from arbitrary peers, and each of those
+        // flows hashes wherever it hashes. The socket is therefore
+        // installed on every shard in one slab slot the whole set
+        // agrees on, each with its own receive queue.
+        let slot = self.inner.state.udp_slots.allocate().ok_or(UdpError {
+            kind: UdpErrorKind::Unavailable,
+            detail: NetworkErrorDetail::UdpPortInUse,
+        })?;
+        // The port is chosen once and bound identically on every
+        // replica, so which shard answered cannot change the socket's
+        // local port.
+        let local_port = match local_port {
+            0 => self
+                .inner
                 .state
-                .with_processor(processor, |state| state.start_udp_bind(local_port))
-        } else {
-            self.inner
-                .state
-                .with_local_port(local_port, |state| state.start_udp_bind(local_port))
+                .shard_for_default()
+                .lock()
+                .allocate_udp_local_port(),
+            port => Ok(port),
+        };
+        let local_port = match local_port {
+            Ok(port) => port,
+            Err(error) => {
+                self.inner.state.udp_slots.release(slot);
+                return Err(error);
+            }
+        };
+        let install = self.inner.state.install_replica(
+            slot,
+            |shard, slot| shard.install_udp_bind(slot, local_port),
+            NetworkShard::remove_udp_replica,
+        );
+        if let Err(error) = install {
+            self.inner.state.udp_slots.release(slot);
+            return Err(error);
         }
+        Ok(UdpBinding {
+            socket: UdpSocketId(ReplicaHandle::new(slot).get()),
+            local_port,
+        })
     }
 
     pub(super) fn execute_udp_connect(
@@ -145,7 +192,10 @@ where
     ) -> Result<(), UdpError> {
         self.synchronize_control_plane();
         let destination = map_network_ip_address(remote_address);
-        self.inner.state.with_handle(socket, |state| {
+        // Every replica is retargeted: a connected socket only accepts
+        // datagrams from its peer, and a replica left wildcard-bound
+        // would still take one whose hash landed on it.
+        self.inner.state.for_each_replica("udp connect", |state| {
             state.connect_udp_socket(socket, destination, port)
         })
     }
@@ -153,7 +203,9 @@ where
     pub(super) fn execute_udp_disconnect(&self, socket: UdpSocketId) -> Result<(), UdpError> {
         self.inner
             .state
-            .with_handle(socket, |state| state.disconnect_udp_socket(socket))
+            .for_each_replica("udp disconnect", |state| {
+                state.disconnect_udp_socket(socket)
+            })
     }
 
     pub(super) async fn execute_udp_send(
@@ -233,9 +285,15 @@ where
     ) -> Result<u64, UdpError> {
         self.synchronize_control_plane();
         let now = StackInstant::from_nanos(self.now_nanos());
-        let written = self.inner.state.with_handle(socket, |state| {
-            state.try_send_udp(socket, destination, port, bytes, now)
-        })?;
+        // Every replica carries the same binding, so the frame this
+        // produces is identical whichever one sends it; the caller's own
+        // shard is the one that costs no cross-processor traffic.
+        let written = self
+            .inner
+            .state
+            .shard_at(self.receiving_shard_idx())
+            .lock()
+            .try_send_udp(socket, destination, port, bytes, now)?;
         Ok(u64::try_from(written).unwrap_or_else(|_| panic!("udp write length exceeds u64")))
     }
 
@@ -247,15 +305,15 @@ where
     ) -> Result<Option<UdpDatagram>, UdpError> {
         let deadline_nanos = self.now_nanos().saturating_add(timeout_nanos);
         loop {
-            // The datagram is placed in the socket's own shard by
-            // whichever processor drained it off the device, so that
-            // shard's arrival signal — sampled before the socket is
-            // polled — is what ends this wait. Nothing here owes a
-            // retransmission, so the only other bound is the caller's
-            // deadline.
-            let wait = self.inner.state.shard_wait_for_handle(socket);
+            // A bound socket has a receive queue on every shard, and a
+            // datagram lands on whichever one its peer's flow hashes to,
+            // so the walk starts at this processor's own and the wait
+            // watches the whole set. Nothing here owes a retransmission,
+            // so the only other bound is the caller's deadline.
+            let wait = self.inner.state.replica_wait();
+            let start = self.receiving_shard_idx();
             self.drive_udp().await?;
-            let received = self.inner.state.with_handle(socket, |state| {
+            let received = self.inner.state.find_in_replicas(start, |state| {
                 state.poll_udp_receive(socket, max_bytes as usize)
             })?;
             match received {
@@ -340,29 +398,33 @@ where
 }
 
 impl NetworkShard {
-    pub(super) fn start_udp_bind(
+    /// Installs this shard's replica of a bound datagram socket into
+    /// `slot`.
+    ///
+    /// The slot and the port are decided once for the whole set, so
+    /// every replica of the same socket answers to the same handle and
+    /// binds the same port.
+    pub(super) fn install_udp_bind(
         &mut self,
+        slot: usize,
         local_port: u16,
-    ) -> Result<UdpBinding<UdpSocketId>, UdpError> {
-        let local_port = if local_port == 0 {
-            self.allocate_udp_local_port()?
-        } else if self
-            .stack
-            .udp_binding_free(UdpSocketBinding::wildcard(local_port))
-        {
-            local_port
-        } else {
+    ) -> Result<(), UdpError> {
+        let binding = UdpSocketBinding::wildcard(local_port);
+        if !self.stack.udp_binding_free(binding) {
             return Err(UdpError {
                 kind: UdpErrorKind::Unavailable,
                 detail: NetworkErrorDetail::UdpPortInUse,
             });
-        };
-        let binding = UdpSocketBinding::wildcard(local_port);
+        }
         let stack_socket = self.stack.open_udp(binding).map_err(map_udp_bind_error)?;
-        Ok(UdpBinding {
-            socket: self.insert_udp_socket(stack_socket, binding),
-            local_port,
-        })
+        self.udp_sockets.insert_at(
+            slot,
+            UdpSocketState {
+                stack_socket,
+                binding,
+            },
+        );
+        Ok(())
     }
 
     pub(super) fn connect_udp_socket(
@@ -371,7 +433,7 @@ impl NetworkShard {
         destination: IpAddress,
         port: u16,
     ) -> Result<(), UdpError> {
-        let slot = self.decode_handle_slot(socket.into());
+        let slot = ReplicaHandle::from(socket).slot();
         let state = *self.udp_socket(socket)?;
         let local = self
             .udp_local_endpoint(state.binding.local_port, destination)
@@ -407,7 +469,7 @@ impl NetworkShard {
     }
 
     pub(super) fn disconnect_udp_socket(&mut self, socket: UdpSocketId) -> Result<(), UdpError> {
-        let slot = self.decode_handle_slot(socket.into());
+        let slot = ReplicaHandle::from(socket).slot();
         let state = *self.udp_socket(socket)?;
         if state.binding.remote.is_none() {
             return Err(UdpError {
@@ -491,8 +553,9 @@ impl NetworkShard {
         }))
     }
 
-    pub(super) fn remove_udp_socket(&mut self, socket: UdpSocketId) {
-        let slot = self.decode_handle_slot(socket.into());
+    /// Drops this shard's replica of a bound socket, used both to close
+    /// one and to unwind a partial install.
+    pub(super) fn remove_udp_replica(&mut self, slot: usize) {
         if let Some(socket) = self.udp_sockets.remove(slot) {
             self.stack
                 .remove_udp_socket(socket.stack_socket)
@@ -500,20 +563,8 @@ impl NetworkShard {
         }
     }
 
-    pub(super) fn insert_udp_socket(
-        &mut self,
-        stack_socket: helios_netstack::UdpSocketId,
-        binding: UdpSocketBinding,
-    ) -> UdpSocketId {
-        let slot = self.udp_sockets.insert(UdpSocketState {
-            stack_socket,
-            binding,
-        });
-        UdpSocketId(self.encode_handle_id(slot).get())
-    }
-
     pub(super) fn udp_socket(&self, socket: UdpSocketId) -> Result<&UdpSocketState, UdpError> {
-        let slot = self.decode_handle_slot(socket.into());
+        let slot = ReplicaHandle::from(socket).slot();
         self.udp_sockets.get(slot).ok_or_else(|| UdpError {
             kind: UdpErrorKind::Unavailable,
             detail: NetworkErrorDetail::UnknownUdpSocket,
