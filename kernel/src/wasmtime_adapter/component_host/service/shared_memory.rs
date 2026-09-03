@@ -229,9 +229,16 @@ pub(super) fn imported_shared_memory_with_declared_maximum(
 /// is capped by [`PROGRAM_SHARED_MEMORY_MAX_PAGES`] so one program
 /// cannot claim a pool that later programs still need.
 pub(super) fn user_shared_memory_budget_pages() -> u32 {
-    let allocatable_pages = user_heap_stats().largest_allocatable_bytes() / WASM_PAGE_SIZE;
-    let allocatable_pages = u32::try_from(allocatable_pages).unwrap_or(u32::MAX);
-    allocatable_pages.min(PROGRAM_SHARED_MEMORY_MAX_PAGES)
+    // The cap is applied first so the probe never asks the pool for a block
+    // larger than a single program is allowed to claim.
+    let cap_bytes = usize::try_from(PROGRAM_SHARED_MEMORY_MAX_PAGES)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(WASM_PAGE_SIZE);
+    // Not `largest_allocatable_bytes`: that is what the pool could serve if
+    // its free space were one intact buddy, and a budget the allocator then
+    // refuses is the failure this whole function exists to avoid (#62).
+    let servable_pages = largest_servable_user_bytes(cap_bytes) / WASM_PAGE_SIZE;
+    u32::try_from(servable_pages).unwrap_or(u32::MAX)
 }
 
 pub(super) fn imported_shared_memory_spec_with_user_budget(

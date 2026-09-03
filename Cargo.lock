@@ -1568,6 +1568,7 @@ dependencies = [
 name = "helios-aarch64"
 version = "0.1.0"
 dependencies = [
+ "acpi",
  "arm-gic",
  "bytes",
  "critical-section",
@@ -1577,6 +1578,7 @@ dependencies = [
  "helios-virtio",
  "limine 0.6.3",
  "spin 0.10.0",
+ "thiserror 2.0.18",
  "tracing",
  "triomphe",
 ]

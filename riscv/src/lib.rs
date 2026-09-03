@@ -627,9 +627,20 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
     // the entropy device joins it as soon as the executor runs. This
     // follows `init` so the source line reaches the log the kernel just
     // installed.
+    // The entropy device comes up before the root DRBG is seeded,
+    // because riscv64 has no entropy instruction and a platform whose
+    // firmware leaves no `/chosen/rng-seed` has this device and nothing
+    // else. Its PLIC source is attached later, with every other
+    // device's; the bring-up read polls the used ring and needs none.
+    let entropy_device = (current_hart == bootstrap_processor)
+        .then(|| entropy::bring_up(&fdt))
+        .flatten();
     let root_entropy = (current_hart == bootstrap_processor).then(|| {
-        let root =
-            helios_kernel::seed_root_entropy(&cpu, helios_hal::entropy::device_tree_seed(&fdt));
+        let root = helios_kernel::seed_root_entropy(
+            &cpu,
+            helios_hal::entropy::device_tree_seed(&fdt),
+            entropy_device.as_ref().map(|entropy| &entropy.device),
+        );
         debug_state.install_root_entropy(root.clone());
         // The calendar is read once, on the bootstrap hart, before any
         // component can ask what time it is. The hart timer carries wall
@@ -659,7 +670,8 @@ fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
             if let Some(host_fs) = host_fs::install(&cpu, &fdt, &debug_state) {
                 interrupts.attach_host_fs(host_fs);
             }
-            if let Some(entropy) = entropy::install(&kernel, &fdt, root_entropy.clone()) {
+            if let Some(entropy) = entropy_device {
+                entropy::install(&kernel, &entropy, root_entropy.clone());
                 interrupts.attach_entropy(entropy);
             }
             if let Some(balloon) = balloon::install(&kernel, &fdt) {

@@ -13,8 +13,9 @@ use core::ptr::NonNull;
 use arm_gic::gicv3::registers::{Gicd, GicrSgi};
 use arm_gic::gicv3::{GicCpuInterface, GicV3, SgiTarget, SgiTargetGroup};
 use arm_gic::{IntId, InterruptGroup, Trigger, UniqueMmioPointer};
-use fdt::Fdt;
 use spin::Mutex;
+
+use crate::platform::GicDescription;
 
 /// The kernel runs at non-secure EL1, where group 1 interrupts are the
 /// ones signalled as IRQ.
@@ -37,64 +38,6 @@ const PRIORITY_MASK_ALL: u8 = 0xff;
 /// bits 32..40. `GICR_TYPER.Affinity` is reported in the same shape.
 const MPIDR_AFFINITY_MASK: u64 = 0x0000_00ff_00ff_ffff;
 
-/// Physical layout of the GICv3 register frames, as the device tree
-/// describes them.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct GicRegions {
-    distributor: usize,
-    distributor_bytes: usize,
-    redistributor: usize,
-    redistributor_bytes: usize,
-}
-
-impl GicRegions {
-    /// Reads the distributor and redistributor windows from the
-    /// `arm,gic-v3` interrupt controller node.
-    ///
-    /// The redistributor window covers one frame pair per processor, so
-    /// the driver walks it with the stride the frames themselves report.
-    pub(crate) fn discover(fdt: &Fdt<'_>) -> Self {
-        let node = fdt
-            .all_nodes()
-            .find(|node| {
-                node.compatible()
-                    .is_some_and(|compatible| compatible.all().any(|entry| entry == "arm,gic-v3"))
-            })
-            .unwrap_or_else(|| {
-                panic!("AArch64 device tree does not describe an arm,gic-v3 interrupt controller")
-            });
-        if let Some(regions) = node.property("#redistributor-regions") {
-            let regions =
-                crate::fdt_cells_to_usize(regions.value, "AArch64 GIC #redistributor-regions");
-            assert!(
-                regions == 1,
-                "AArch64 GIC declares {regions} redistributor regions, only one is supported"
-            );
-        }
-        let mut reg = node
-            .raw_reg()
-            .unwrap_or_else(|| panic!("AArch64 GIC node has no reg property"));
-        let distributor = reg
-            .next()
-            .unwrap_or_else(|| panic!("AArch64 GIC node has no distributor reg entry"));
-        let redistributor = reg
-            .next()
-            .unwrap_or_else(|| panic!("AArch64 GIC node has no redistributor reg entry"));
-        Self {
-            distributor: crate::fdt_cells_to_usize(distributor.address, "AArch64 GICD reg address"),
-            distributor_bytes: crate::fdt_cells_to_usize(distributor.size, "AArch64 GICD reg size"),
-            redistributor: crate::fdt_cells_to_usize(
-                redistributor.address,
-                "AArch64 GICR reg address",
-            ),
-            redistributor_bytes: crate::fdt_cells_to_usize(
-                redistributor.size,
-                "AArch64 GICR reg size",
-            ),
-        }
-    }
-}
-
 /// The platform's interrupt controller.
 pub(crate) struct Gic {
     inner: Mutex<GicV3<'static>>,
@@ -110,37 +53,30 @@ impl Gic {
     /// for, so an interrupt the firmware left armed fails loudly in the
     /// dispatcher instead of being silently acknowledged.
     pub(crate) fn new(
-        regions: GicRegions,
-        processor_count: usize,
+        description: &GicDescription,
+        processor_mpidrs: impl Iterator<Item = u64> + Clone,
         bootstrap_mpidr: u64,
         physical_memory_offset: usize,
         handoff: &crate::LimineBootHandoff,
     ) -> Self {
-        crate::map_mmio_range(
-            regions.distributor,
-            regions.distributor_bytes,
-            physical_memory_offset,
-            handoff,
-        );
-        crate::map_mmio_range(
-            regions.redistributor,
-            regions.redistributor_bytes,
-            physical_memory_offset,
-            handoff,
-        );
+        let processor_count = processor_mpidrs.clone().count();
+        description.check_covers(processor_mpidrs);
+        for region in [description.distributor, description.redistributor] {
+            crate::map_mmio_range(region.base, region.size, physical_memory_offset, handoff);
+        }
         let distributor = NonNull::new(crate::mmio_virtual_base(
-            regions.distributor,
+            description.distributor.base,
             physical_memory_offset,
         ) as *mut Gicd)
         .unwrap_or_else(|| panic!("AArch64 GIC distributor mapped to a null address"));
         let redistributor = NonNull::new(crate::mmio_virtual_base(
-            regions.redistributor,
+            description.redistributor.base,
             physical_memory_offset,
         ) as *mut GicrSgi)
         .unwrap_or_else(|| panic!("AArch64 GIC redistributor mapped to a null address"));
         // SAFETY: both windows were just mapped as device memory from
-        // the device tree's own description, and this is the only
-        // driver instance the kernel constructs.
+        // the platform's own description, and this is the only driver
+        // instance the kernel constructs.
         let distributor = unsafe { UniqueMmioPointer::new(distributor) };
         let mut gic = unsafe { GicV3::new(distributor, redistributor, processor_count) }
             .unwrap_or_else(|error| panic!("AArch64 GICv3 initialisation failed: {error}"));
@@ -149,8 +85,8 @@ impl Gic {
         gic.enable_all_interrupts(false);
         tracing::info!(
             "GICv3 online gicd={:#x} gicr={:#x} processors={processor_count} bootstrap_redistributor={bootstrap}",
-            regions.distributor,
-            regions.redistributor,
+            description.distributor.base,
+            description.redistributor.base,
         );
         Self {
             inner: Mutex::new(gic),
@@ -226,27 +162,6 @@ pub(crate) fn acknowledge_interrupt() -> Option<IntId> {
 /// Drops the priority of an acknowledged interrupt and deactivates it.
 pub(crate) fn end_interrupt(intid: IntId) {
     GicCpuInterface::end_interrupt(intid, GROUP);
-}
-
-/// Resolves the INTID and trigger mode of the shared peripheral
-/// interrupt a `virtio,mmio` node declares. A device the kernel drives
-/// must name one: without it the driver would have no way to learn about
-/// completions other than polling.
-pub(crate) fn device_interrupt(
-    interrupt: Option<helios_virtio::MmioInterrupt>,
-    base: usize,
-) -> (IntId, Trigger) {
-    let interrupt = interrupt.unwrap_or_else(|| {
-        panic!("virtio MMIO device at {base:#x} declares no interrupt in the device tree")
-    });
-    let trigger = interrupt.trigger.unwrap_or_else(|| {
-        panic!("virtio MMIO device at {base:#x} declares no interrupt trigger mode")
-    });
-    let trigger = match trigger {
-        helios_virtio::InterruptTrigger::Edge => Trigger::Edge,
-        helios_virtio::InterruptTrigger::Level => Trigger::Level,
-    };
-    (IntId::spi(interrupt.number), trigger)
 }
 
 /// Finds the redistributor frame belonging to the processor with

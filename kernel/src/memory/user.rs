@@ -116,6 +116,43 @@ impl UserMemoryPool {
         Ok((ptr, size))
     }
 
+    /// The largest block the pool will actually hand out right now, at most
+    /// `limit` bytes.
+    ///
+    /// [`UserHeapStats::largest_allocatable_bytes`] is a granularity bound
+    /// derived from the free byte count alone: it answers what the allocator
+    /// could serve if its free space were one intact buddy. It usually is not.
+    /// A pool with 1000 MiB free reports 512 MiB and then refuses the 512 MiB
+    /// request, because one earlier allocation landing inside that buddy split
+    /// it for good — issue #62, where a spawning program sized its shared
+    /// memory from the bound and died on the allocation that followed.
+    ///
+    /// The buddy heap does not publish its free lists, so the only honest
+    /// answer is the one it gives when asked. This takes a candidate block and
+    /// releases it immediately, halving until one is served. What it returns is
+    /// a size, not a reservation: the caller still races every other processor
+    /// for it, so callers keep handling [`ProgramOutOfMemory`].
+    pub fn largest_servable_bytes(&self, limit: usize) -> usize {
+        let mut candidate = self.stats().largest_allocatable_bytes().min(limit);
+        // The buddy heap rounds every request up to a power of two, so only
+        // powers of two are worth probing.
+        candidate = previous_power_of_two(candidate);
+        while candidate >= PhysFrame::SIZE {
+            let layout = Layout::from_size_align(candidate, PhysFrame::SIZE)
+                .unwrap_or_else(|_| panic!("invalid probe layout for {candidate} bytes"));
+            // The probe deliberately skips the reported-frame check and the
+            // zeroing it can trigger: nothing reads this block, and paying to
+            // zero half a gigabyte to answer a question would be absurd.
+            if let Ok((ptr, size)) = self.allocate_raw(layout, None) {
+                self.deallocate_with_processor(ptr, layout, None);
+                debug_assert_eq!(size, candidate);
+                return candidate;
+            }
+            candidate /= 2;
+        }
+        0
+    }
+
     /// The pool's allocation path without the reported-frame check.
     ///
     /// Free-page reporting takes runs out of the pool only to hand them
@@ -299,6 +336,15 @@ pub struct UserHeapStats {
     pub allocated_bytes: usize,
 }
 
+/// The largest power of two not greater than `value`, or `0` for `0`.
+fn previous_power_of_two(value: usize) -> usize {
+    if value == 0 {
+        return 0;
+    }
+
+    1_usize << (usize::BITS - 1 - value.leading_zeros())
+}
+
 impl UserHeapStats {
     pub fn available_bytes(self) -> usize {
         self.total_bytes.saturating_sub(self.allocated_bytes)
@@ -320,11 +366,7 @@ impl UserHeapStats {
     /// fragmented across smaller buddies, so callers keep handling
     /// [`ProgramOutOfMemory`].
     pub fn largest_allocatable_bytes(self) -> usize {
-        let available = self.available_bytes();
-        if available == 0 {
-            return 0;
-        }
-        1_usize << (usize::BITS - 1 - available.leading_zeros())
+        previous_power_of_two(self.available_bytes())
     }
 }
 
@@ -360,6 +402,11 @@ fn user_memory_pool() -> &'static UserMemoryPool {
 
 pub fn user_heap_stats() -> UserHeapStats {
     user_memory_pool().stats()
+}
+
+/// See [`UserMemoryPool::largest_servable_bytes`].
+pub fn largest_servable_user_bytes(limit: usize) -> usize {
+    user_memory_pool().largest_servable_bytes(limit)
 }
 
 pub fn allocate_user_frame_zeroed() -> Result<NonNull<u8>, ProgramOutOfMemory> {
@@ -488,6 +535,101 @@ mod tests {
         let pool = UserMemoryPool::empty();
         pool.add_region(start, start + bytes);
         pool
+    }
+
+    /// Asserts the pool hands out exactly what it just advertised.
+    fn assert_advertises_what_it_serves(pool: &UserMemoryPool) -> usize {
+        let advertised = pool.largest_servable_bytes(usize::MAX);
+        assert!(advertised > 0, "a pool with free space advertises a block");
+        let layout =
+            Layout::from_size_align(advertised, PhysFrame::SIZE).expect("advertised layout");
+        let (served, _) = pool
+            .allocate_raw(layout, None)
+            .expect("the pool serves the block it advertised");
+        pool.deallocate_with_processor(served, layout, None);
+        advertised
+    }
+
+    /// Regression for #62.
+    ///
+    /// A spawning program sized its shared memory from
+    /// `largest_allocatable_bytes`, which reads the free byte count and
+    /// answers with the power of two below it. A buddy heap serves that only
+    /// while the matching buddy is intact -- which it is not over a region
+    /// that is not naturally aligned, and stops being the moment anything is
+    /// allocated inside it. The pool then refuses a request it had just
+    /// advertised, which is what the guest reported verbatim: "program memory
+    /// request of 536870912 bytes exceeds its memory budget:
+    /// available=1048576000 reserved=0".
+    #[test]
+    fn the_granularity_bound_overstates_what_the_pool_serves() {
+        let pool = pool(8 * 1024 * 1024);
+
+        let bound = pool.stats().largest_allocatable_bytes();
+        let servable = assert_advertises_what_it_serves(&pool);
+        assert!(
+            servable < bound,
+            "the bound claims {bound} bytes but the pool serves {servable}"
+        );
+
+        // Fragmenting it further must not break the promise either.
+        let frame = Layout::from_size_align(PhysFrame::SIZE, PhysFrame::SIZE).expect("frame");
+        let (held, _) = pool
+            .allocate_raw(frame, None)
+            .expect("a fresh pool has a frame");
+        let fragmented = assert_advertises_what_it_serves(&pool);
+        assert!(fragmented <= servable);
+
+        pool.deallocate_with_processor(held, frame, None);
+    }
+
+    #[test]
+    fn an_exhausted_pool_advertises_nothing() {
+        let pool = pool(8 * 1024 * 1024);
+        let mut held = alloc::vec::Vec::new();
+
+        // Taking the largest servable block repeatedly is the only way to
+        // actually drain a buddy heap: asking for `available_bytes` in one go
+        // is refused even on an untouched pool, which is the bug this whole
+        // family of tests is about.
+        loop {
+            let servable = pool.largest_servable_bytes(usize::MAX);
+            if servable == 0 {
+                break;
+            }
+            let layout =
+                Layout::from_size_align(servable, PhysFrame::SIZE).expect("servable layout");
+            let (ptr, _) = pool
+                .allocate_raw(layout, None)
+                .expect("the pool serves the block it advertised");
+            held.push((ptr, layout));
+        }
+
+        assert_eq!(pool.largest_servable_bytes(usize::MAX), 0);
+        assert!(
+            pool.stats().available_bytes() < PhysFrame::SIZE,
+            "draining by servable blocks leaves less than a frame"
+        );
+
+        for (ptr, layout) in held {
+            pool.deallocate_with_processor(ptr, layout, None);
+        }
+    }
+
+    #[test]
+    fn a_limit_caps_what_the_pool_advertises() {
+        let pool = pool(8 * 1024 * 1024);
+
+        assert_eq!(
+            pool.largest_servable_bytes(1024 * 1024),
+            1024 * 1024,
+            "a caller's cap is applied before the pool is asked"
+        );
+        assert_eq!(
+            pool.largest_servable_bytes(3 * 1024 * 1024),
+            2 * 1024 * 1024,
+            "a cap that is not a power of two rounds down to a buddy block"
+        );
     }
 
     fn tail_byte(address: usize, bytes: usize) -> u8 {

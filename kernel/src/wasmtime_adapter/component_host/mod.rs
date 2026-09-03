@@ -25,7 +25,8 @@ use crate::{
     ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, RawMutex,
     RawMutexGuardResource, RawMutexResource, RawRwLock, RawRwLockReadGuardResource,
     RawRwLockResource, RawRwLockWriteGuardResource, SerialPortResource, elapsed_millis,
-    emit_serial_stage_marker, heap_stats, monotonic_nanos, user_heap_stats,
+    emit_serial_stage_marker, heap_stats, largest_servable_user_bytes, monotonic_nanos,
+    user_heap_stats,
 };
 use helios_hal::cpu::Cpu;
 use helios_hal::serial::ByteSerial;

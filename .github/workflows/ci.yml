@@ -267,6 +267,109 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  # On macOS rather than on an Arm Linux runner: those have no
+  # `/dev/kvm`, and the QEMU 8.2 that Ubuntu 24.04 ships asserts in its
+  # emulated GICv3 CPU interface under multi-threaded TCG
+  # (`gicv3_cpuif_update: assertion failed: (qemu_mutex_iothread_locked())`),
+  # so a four-processor aarch64 guest cannot boot there at all. The
+  # macOS runners have HVF and a current QEMU. See issue #85.
+  smoke-aarch64:
+    name: smoke-aarch64
+    runs-on: macos-15
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: helios
+      - uses: ./helios/.github/actions/checkout-wasmtime
+      - name: Install host dependencies
+        run: |
+          brew install qemu just cmake ninja
+          qemu-system-aarch64 --version
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-tools
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+      - name: Stage Limine bootloader share
+        run: |
+          git clone --depth 1 --branch v11.x-binary \
+            https://github.com/limine-bootloader/limine "$GITHUB_WORKSPACE/limine"
+          make -C "$GITHUB_WORKSPACE/limine"
+      - name: Restore WASI tooling artifacts
+        id: artifact-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            helios/artifacts/wasi-tools
+            helios/artifacts/python3-root
+            helios/artifacts/wasix
+          key: wasi-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('helios/tools/wasi-apps/**', 'helios/Cargo.lock') }}
+      - name: Stage WASI tooling artifacts
+        if: steps.artifact-cache.outputs.cache-hit != 'true'
+        working-directory: helios
+        run: tools/wasi-apps/build.sh
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: helios
+          key: smoke-aarch64
+      - name: Build inspector
+        working-directory: helios
+        run: cargo build --release -p helios-inspector
+      # The aarch64 backend takes its whole platform description from
+      # the firmware, and QEMU's `virt` publishes a device tree or ACPI
+      # tables but never both. Both descriptions have to boot, so the
+      # same smoke runs twice and each mode asserts which one the kernel
+      # actually used.
+      - name: Boot aarch64 guest from the device tree
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/device-tree"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' 2>&1 > boot-dt.out | tee "$runtime/inspector.log"
+          cat boot-dt.out
+          grep -Fqx ok boot-dt.out
+          grep -F 'platform described by device-tree' "$runtime/inspector.log"
+      # Under HVF like the device-tree boot above. ACPI carries no
+      # counterpart to `/chosen/rng-seed` and the Apple cores behind HVF
+      # implement no FEAT_RNG, so this boot's only entropy source is the
+      # bring-up read of the virtio-rng device.
+      - name: Boot aarch64 guest from ACPI
+        shell: bash
+        working-directory: helios
+        env:
+          HELIOS_LIMINE_SHARE: ${{ github.workspace }}/limine
+          HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
+          HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
+        run: |
+          runtime="$GITHUB_WORKSPACE/smoke-runtime/acpi"
+          mkdir -p "$runtime"
+          ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G --acpi \
+            --runtime-dir "$runtime" --keep-runtime-dir \
+            --boot-program dash --boot-program debugger --no-compiler-plugin \
+            shell -c 'echo ok' 2>&1 > boot-acpi.out | tee "$runtime/inspector.log"
+          cat boot-acpi.out
+          grep -Fqx ok boot-acpi.out
+          grep -F 'platform described by acpi' "$runtime/inspector.log"
+      - name: Upload the inspector runtime directories
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-aarch64-runtime
+          path: |
+            smoke-runtime/*/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
   bench:
     name: bench-${{ matrix.name }}
     runs-on: ${{ matrix.runner }}

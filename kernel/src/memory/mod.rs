@@ -18,8 +18,8 @@ mod user;
 pub use balloon::{BalloonHandle, BalloonStats, FREE_PAGE_REPORT_INTERVAL, install_memory_balloon};
 pub use entropy::{
     ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources, HardwareEntropySource,
-    NoCryptographicEntropy, ROOT_ENTROPY_MATERIAL_BYTES, RootEntropy, RootEntropyHandle,
-    install_entropy_device, seed_root_entropy,
+    NoCryptographicEntropy, NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RootEntropy,
+    RootEntropyHandle, install_entropy_device, seed_root_entropy,
 };
 pub use pmm::KernelPhysFrameAllocator;
 pub use reservations::{
@@ -29,7 +29,7 @@ pub use reservations::{
 pub use user::{
     UserHeapStats, UserMemoryPool, allocate_user_frame_uninit_on, allocate_user_frame_zeroed,
     allocate_user_frame_zeroed_on, deallocate_user_frame, deallocate_user_frame_on,
-    user_heap_stats,
+    largest_servable_user_bytes, user_heap_stats,
 };
 pub(crate) use user::{
     allocate_user_memory_pool, allocate_user_uninit_on, deallocate_user_on,

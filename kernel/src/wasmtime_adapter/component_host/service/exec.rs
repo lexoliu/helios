@@ -1691,8 +1691,21 @@ pub(super) fn plugin_runtime_should_be_recycled(error: &ProgramExecError) -> boo
     )
 }
 
+/// Whether `error` is, or was caused by, the user pool refusing an allocation.
+///
+/// `Error::is` only inspects the outermost error, and wasmtime wraps whatever
+/// the memory creator returned in its own context, so an out-of-memory that
+/// arrives through `SharedMemory::new` was being classified as an internal
+/// failure. Walking the chain is what tells a caller it ran out of memory
+/// rather than hitting a bug (#62).
+fn caused_by_out_of_memory(error: &wasmtime::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<crate::ProgramOutOfMemory>())
+}
+
 pub(super) fn map_program_runtime_error(error: wasmtime::Error) -> ProgramExecError {
-    if error.is::<crate::ProgramOutOfMemory>() {
+    if caused_by_out_of_memory(&error) {
         tracing::error!(?error, "program runtime reported out of memory");
         return ProgramExecError {
             kind: ProgramExecErrorKind::OutOfMemory,
