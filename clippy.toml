@@ -1,0 +1,9 @@
+# `ProgramExecError` carries the runtime's own failure sentence inline, in a
+# 192-byte `ArrayString`, because the kernel does not allocate on failure
+# paths — see `RUNTIME_MESSAGE_CAPACITY` in `kernel/src/process/program_service.rs`.
+# That puts it past `clippy::result_large_err`'s 128-byte default, whose
+# suggested remedy — box the error — is exactly the allocation the type exists
+# to avoid. The threshold is raised to the smallest value that admits that
+# error and nothing larger, so the lint still catches a kernel error that grows
+# past what it was meant to keep on the stack.
+large-error-threshold = 208
