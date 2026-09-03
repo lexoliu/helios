@@ -35,7 +35,10 @@ pub use dhcp::{
 pub use dns::{
     DNS_MAX_ADDRESS_RECORDS, DNS_PORT, DnsMessage, DnsQuestionWriter, DnsRecordType, DnsResponse,
 };
-pub use hash::{FlowHash, FlowTuple, RSS_KEY_BYTES, STANDARD_RSS_KEY, flow_hash, toeplitz};
+pub use hash::{
+    FlowHash, FlowTuple, RSS_INDIRECTION_ENTRIES, RSS_KEY_BYTES, STANDARD_RSS_KEY, flow_hash,
+    rss_indirection_entry, toeplitz,
+};
 pub use ndp::{
     Ipv6DnsServers, Ipv6RouterConfiguration, MAX_ADVERTISED_PREFIXES, MAX_IPV6_DNS_SERVERS,
     MAX_ROUTER_SOLICITATIONS, NeighborDiscovery, ROUTER_SOLICITATION_INTERVAL_NANOS,
@@ -127,6 +130,14 @@ pub struct RxFrameOffload {
     /// received segments into this frame (large receive offload), or
     /// `None` for a frame that arrived as it is.
     pub large_receive_segment_bytes: Option<u16>,
+    /// The flow hash the device computed for this frame, when it
+    /// reported one.
+    ///
+    /// A device that steers has already hashed the frame to pick the
+    /// queue it delivered on, so a driver that hashes it again is doing
+    /// the work twice. `None` means the device said nothing and the
+    /// receive path computes the hash itself, which is the same number.
+    pub flow_hash: Option<FlowHash>,
 }
 
 impl RxFrameOffload {
@@ -135,6 +146,7 @@ impl RxFrameOffload {
         Self {
             checksum: RxChecksumReport::Unverified,
             large_receive_segment_bytes: None,
+            flow_hash: None,
         }
     }
 
@@ -144,6 +156,7 @@ impl RxFrameOffload {
         Self {
             checksum: RxChecksumReport::Validated,
             large_receive_segment_bytes: None,
+            flow_hash: None,
         }
     }
 
@@ -152,6 +165,7 @@ impl RxFrameOffload {
         Self {
             checksum: RxChecksumReport::Partial { start, offset },
             large_receive_segment_bytes: None,
+            flow_hash: None,
         }
     }
 

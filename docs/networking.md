@@ -45,8 +45,9 @@ the device-class facts, transmit and receive:
 INFO [helios_virtio::net] virtio-net online queue_pairs=4 csum=true
   host_tso4=true host_tso6=true guest_csum=true guest_tso4=true
   guest_tso6=true guest_ecn=true guest_ufo=true mrg_rxbuf=true mq=true
-  ctrl_vq=true notf_coal=true vq_notf_coal=true notf_coal_max_packets=8
-  notf_coal_max_usecs=50 status=true link_up=true max_frame_len=1514
+  ctrl_vq=true rss=true hash_report=true notf_coal=true vq_notf_coal=true
+  notf_coal_max_packets=8 notf_coal_max_usecs=50 status=true link_up=true
+  max_frame_len=1514
   max_receive_frame_len=65550 rx_buffer_len=4096
 ```
 
@@ -58,6 +59,25 @@ Those need somewhere to put a 64 KiB frame, which is `mrg_rxbuf`:
 receive buffers are one page each and a coalesced frame arrives as a
 chain of them, so `max_receive_frame_len` exceeds `max_frame_len`
 exactly when receive segmentation was negotiated.
+
+`rss` and `hash_report` are the steering bits. With
+`VIRTIO_NET_F_RSS` the device hashes each received frame's four-tuple,
+masks the hash to a slot in a 128-entry indirection table the driver
+programmed, and delivers the frame on the queue that slot names — so a
+flow arrives on the queue whose processor already owns its socket, with
+no cross-core hand-off. The table is `slot % queue_pairs` and the key is
+the standard 40-byte Toeplitz key, which is also what the kernel's own
+demux computes: a device that cannot steer delivers everything on queue
+zero and the software hash still routes the flow to the same shard, so
+only the CPU hop differs. `hash_report` adds the device's hash to the
+receive header (and eight bytes to the header in both directions) so the
+kernel reads that number instead of computing it again.
+
+A device that offers RSS but cannot hold a 128-entry table, a 40-byte
+key, or all four of the TCP/UDP over IPv4/IPv6 hash types is left
+unsteered rather than half-programmed — a wrong table would put a flow
+on a queue whose processor does not own the socket, which is worse than
+the extra hop. The boot log says so when it happens.
 
 `notf_coal` and `vq_notf_coal` are the notification-coalescing bits
 (`VIRTIO_NET_F_NOTF_COAL` / `VIRTIO_NET_F_VQ_NOTF_COAL`): the device
@@ -247,6 +267,8 @@ halfway through machine construction:
 | `mrg_rxbuf` | `on`/`off` | Offer mergeable receive buffers. |
 | `event_idx` | `on`/`off` | Offer `VIRTIO_F_RING_EVENT_IDX` on this device. |
 | `indirect_desc` | `on`/`off` | Offer `VIRTIO_F_INDIRECT_DESC` on this device. |
+| `rss` | `on`/`off` | Offer `VIRTIO_NET_F_RSS` (steer received flows across queues). |
+| `hash` | `on`/`off` | Offer `VIRTIO_NET_F_HASH_REPORT` (report the flow hash in the receive header). |
 | `notf_coal` | `on`/`off` | Offer `VIRTIO_NET_F_NOTF_COAL` (device-wide notification coalescing). |
 | `vq_notf_coal` | `on`/`off` | Offer `VIRTIO_NET_F_VQ_NOTF_COAL` (per-virtqueue coalescing). |
 

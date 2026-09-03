@@ -41,8 +41,16 @@ use super::*;
 /// An ICMP error is not one of them: it quotes the packet that provoked
 /// it, so the flow it concerns is recoverable and the error is routed to
 /// that flow's shard rather than to a shard with no socket to tell.
-pub(super) fn shard_idx_for_frame(frame: &[u8], shard_count: usize) -> usize {
-    flow_tuple_for_frame(frame)
+pub(super) fn shard_idx_for_frame(frame: &RxFrame, shard_count: usize) -> usize {
+    // A device that steers has already hashed the frame to pick the
+    // queue it delivered on, so taking its number rather than
+    // recomputing the same one is the whole benefit of `HASH_REPORT`.
+    // It is the same function over the same bytes under the same key,
+    // so the answer does not depend on which side produced it.
+    if let Some(hash) = frame.offload.flow_hash {
+        return hash.bucket(shard_count);
+    }
+    flow_tuple_for_frame(frame.as_ref())
         .map(|tuple| flow_hash(&tuple).bucket(shard_count))
         .unwrap_or(DEFAULT_SHARD_IDX)
 }
@@ -695,7 +703,7 @@ impl NetworkShardSet {
         received_at: StackInstant,
         control: &NetworkControlPlane,
     ) -> RxFrameDispatch {
-        let shard_idx = shard_idx_for_frame(frame.as_ref(), self.shard_count());
+        let shard_idx = shard_idx_for_frame(frame, self.shard_count());
         let mut shard = self.shards[shard_idx].inner.lock();
         let dispatch = match shard.stack.receive_rx_frame(frame.clone(), received_at) {
             Ok(backpressured) => RxFrameDispatch::Delivered {

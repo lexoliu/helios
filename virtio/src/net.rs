@@ -31,8 +31,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use helios_hal::io::{IoError, IoResult};
 use helios_netstack::{
-    ChecksumOffload, DEFAULT_POLL_BUDGET, EventDeliveryCapabilities, InterfaceCapabilities,
-    LinkState, QueueTopology, RxChecksumReport, RxFrameOffload, SegmentationOffload,
+    ChecksumOffload, DEFAULT_POLL_BUDGET, EventDeliveryCapabilities, FlowHash,
+    InterfaceCapabilities, LinkState, QueueTopology, RSS_INDIRECTION_ENTRIES, RSS_KEY_BYTES,
+    RxChecksumReport, RxFrameOffload, STANDARD_RSS_KEY, SegmentationOffload, rss_indirection_entry,
 };
 use spin::Mutex as SpinMutex;
 
@@ -117,6 +118,17 @@ const NET_FEATURE_MRG_RXBUF: u64 = 1 << 15;
 /// Byte offset of the `status` field in the virtio-net configuration
 /// space (mac[6], status[2], max_virtqueue_pairs[2], mtu[2]).
 const NET_CONFIG_STATUS_OFFSET: usize = 6;
+/// `duplex`, after mac[6], status[2], max_virtqueue_pairs[2], mtu[2]
+/// and speed[4]. The RSS limits share its aligned dword.
+const NET_CONFIG_DUPLEX_OFFSET: usize = 16;
+/// `rss_max_key_size`, after mac[6], status[2], max_virtqueue_pairs[2],
+/// mtu[2], speed[4] and duplex[1].
+const NET_CONFIG_RSS_MAX_KEY_SIZE_OFFSET: usize = 17;
+/// `rss_max_indirection_table_length`, the entry count the device can
+/// hold minus one is *not* what this reports: it is the length itself.
+const NET_CONFIG_RSS_MAX_TABLE_LEN_OFFSET: usize = 18;
+/// `supported_hash_types`.
+const NET_CONFIG_SUPPORTED_HASH_TYPES_OFFSET: usize = 20;
 /// VIRTIO_NET_S_LINK_UP: the device reports carrier in `status`.
 const NET_STATUS_LINK_UP: u16 = 1;
 /// VIRTIO_NET_F_MQ: device exposes multiple TX/RX queue pairs and
@@ -130,6 +142,17 @@ const NET_FEATURE_MQ: u64 = 1 << 22;
 /// driver uses to issue runtime configuration commands such as
 /// `VQ_PAIRS_SET`. Required when negotiating `NET_FEATURE_MQ`.
 const NET_FEATURE_CTRL_VQ: u64 = 1 << 17;
+/// VIRTIO_NET_F_RSS: the device steers received frames across its queue
+/// pairs by hashing the flow and reading a queue out of a driver-programmed
+/// indirection table. What makes a per-CPU queue layout pay: without it
+/// every frame arrives on queue zero and reaches its owner's processor
+/// only after a cross-core hand-off.
+const NET_FEATURE_RSS: u64 = 1 << 60;
+/// VIRTIO_NET_F_HASH_REPORT: the device writes the hash it computed into
+/// the receive header, so the driver does not have to compute the same
+/// number a second time. Costs eight extra header bytes per frame in
+/// both directions.
+const NET_FEATURE_HASH_REPORT: u64 = 1 << 57;
 /// VIRTIO_NET_F_NOTF_COAL: the device can hold a notification back
 /// until a packet count or a delay is reached, so a busy queue raises
 /// one interrupt per batch instead of one per descriptor. Programmed
@@ -148,6 +171,24 @@ const NET_MAX_QUEUE_PAIRS: u16 = 16;
 const CTRL_CLASS_MQ: u8 = 4;
 /// Control-queue command id for `VQ_PAIRS_SET` under class MQ.
 const CTRL_CMD_MQ_VQ_PAIRS_SET: u8 = 0;
+/// Control-queue command id for `RSS_CONFIG` under class MQ. It carries
+/// the active queue-pair count itself, so a device that steers is
+/// configured with this instead of `VQ_PAIRS_SET`.
+const CTRL_CMD_MQ_RSS_CONFIG: u8 = 1;
+/// `VIRTIO_NET_HASH_TYPE_*`: the flows the device is asked to hash.
+///
+/// Only the four-tuple types are requested. A frame the device cannot
+/// classify goes to `unclassified_queue`, which is queue zero — exactly
+/// where the driver's own rule puts a frame with no flow to hash.
+const NET_HASH_TYPE_TCPV4: u32 = 1 << 1;
+const NET_HASH_TYPE_UDPV4: u32 = 1 << 2;
+const NET_HASH_TYPE_TCPV6: u32 = 1 << 4;
+const NET_HASH_TYPE_UDPV6: u32 = 1 << 5;
+const NET_RSS_HASH_TYPES: u32 =
+    NET_HASH_TYPE_TCPV4 | NET_HASH_TYPE_UDPV4 | NET_HASH_TYPE_TCPV6 | NET_HASH_TYPE_UDPV6;
+/// `VIRTIO_NET_HASH_REPORT_NONE`: the device classified nothing, so the
+/// hash field of the receive header says nothing either.
+const NET_HASH_REPORT_NONE: u16 = 0;
 /// Control-queue command class for `VIRTIO_NET_CTRL_NOTF_COAL`.
 const CTRL_CLASS_NOTF_COAL: u8 = 6;
 /// Coalescing command ids under class `VIRTIO_NET_CTRL_NOTF_COAL`.
@@ -167,10 +208,15 @@ const CTRL_NOTF_COAL_PAYLOAD_BYTES: usize = 8;
 /// Bytes a `NOTF_COAL_VQ_SET` payload occupies: `le16 vqn`, `le16`
 /// reserved, then the same pair of le32 fields.
 const CTRL_NOTF_COAL_VQ_PAYLOAD_BYTES: usize = 12;
+/// Bytes a `RSS_CONFIG` payload occupies: `struct virtio_net_rss_config`
+/// — hash types, table mask, unclassified queue, the table itself, the
+/// transmit queue count, and the key with its length byte.
+const CTRL_RSS_CONFIG_PAYLOAD_BYTES: usize =
+    4 + 2 + 2 + 2 * RSS_INDIRECTION_ENTRIES + 2 + 1 + RSS_KEY_BYTES;
 /// Maximum command payload size the control queue scratch buffer is
 /// sized for, plus the two-byte class/command prefix every command
 /// carries.
-const CTRL_CMD_MAX_BYTES: usize = 2 + CTRL_NOTF_COAL_VQ_PAYLOAD_BYTES;
+const CTRL_CMD_MAX_BYTES: usize = 2 + CTRL_RSS_CONFIG_PAYLOAD_BYTES;
 /// The scratch buffer is sized once at bring-up and shared by every
 /// control command, so a command that outgrew it would assert at
 /// runtime on a path only real hardware reaches. Checking it here means
@@ -179,6 +225,10 @@ const _: () = {
     assert!(CTRL_CMD_MAX_BYTES >= 2 + CTRL_MQ_PAIRS_PAYLOAD_BYTES);
     assert!(CTRL_CMD_MAX_BYTES >= 2 + CTRL_NOTF_COAL_PAYLOAD_BYTES);
     assert!(CTRL_CMD_MAX_BYTES >= 2 + CTRL_NOTF_COAL_VQ_PAYLOAD_BYTES);
+    assert!(CTRL_CMD_MAX_BYTES >= 2 + CTRL_RSS_CONFIG_PAYLOAD_BYTES);
+    // The device masks the hash to an indirection-table slot, so the
+    // table length it is told about has to be a power of two.
+    assert!(RSS_INDIRECTION_ENTRIES.is_power_of_two());
 };
 
 /// Frames a queue may accumulate before the device raises its
@@ -192,6 +242,11 @@ const NET_NOTF_COAL_MAX_PACKETS: u32 = 8;
 /// Microseconds a queue may hold a notification back before raising it
 /// even though the packet count was never reached.
 const NET_NOTF_COAL_MAX_USECS: u32 = 50;
+
+/// Bytes of `struct virtio_net_hdr_v1_hash`: the ordinary header plus
+/// the reported hash, its report type, and two bytes of padding. Both
+/// directions carry it once `VIRTIO_NET_F_HASH_REPORT` is negotiated.
+const HASH_REPORT_HEADER_BYTES: usize = size_of::<VirtioNetHeader>() + 8;
 
 /// virtqueue index of a queue pair's receive ring.
 ///
@@ -340,15 +395,30 @@ struct RxHeader {
     /// Buffers this frame occupies, valid only with
     /// `VIRTIO_NET_F_MRG_RXBUF`.
     num_buffers: u16,
+    /// The flow hash the device computed, valid only with
+    /// `VIRTIO_NET_F_HASH_REPORT` and only when `hash_report` says the
+    /// device classified the frame.
+    hash_value: u32,
+    hash_report: u16,
 }
 
 impl RxHeader {
-    /// Reads the fixed 12-byte header. Every field is little-endian.
-    fn parse(bytes: &[u8]) -> Self {
+    /// Reads the header. Every field is little-endian, and the eight
+    /// trailing hash bytes exist only under `VIRTIO_NET_F_HASH_REPORT`,
+    /// which is what `header_len` records.
+    fn parse(bytes: &[u8], header_len: usize) -> Self {
         assert!(
-            bytes.len() >= size_of::<VirtioNetHeader>(),
+            header_len >= size_of::<VirtioNetHeader>() && bytes.len() >= header_len,
             "virtio net receive header is shorter than the header layout"
         );
+        let (hash_value, hash_report) = if header_len >= HASH_REPORT_HEADER_BYTES {
+            (
+                u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+                u16::from_le_bytes([bytes[16], bytes[17]]),
+            )
+        } else {
+            (0, NET_HASH_REPORT_NONE)
+        };
         Self {
             flags: bytes[0],
             gso_type: bytes[1],
@@ -356,6 +426,17 @@ impl RxHeader {
             csum_start: u16::from_le_bytes([bytes[6], bytes[7]]),
             csum_offset: u16::from_le_bytes([bytes[8], bytes[9]]),
             num_buffers: u16::from_le_bytes([bytes[10], bytes[11]]),
+            hash_value,
+            hash_report,
+        }
+    }
+
+    /// The hash the device reported, if it reported one.
+    const fn flow_hash(self) -> Option<FlowHash> {
+        if self.hash_report == NET_HASH_REPORT_NONE {
+            None
+        } else {
+            Some(FlowHash::new(self.hash_value))
         }
     }
 
@@ -561,6 +642,13 @@ pub struct VirtioNetDevice<T: VirtioTransport> {
     /// Last link state read out of the configuration space. Devices
     /// without VIRTIO_NET_F_STATUS are always up.
     link_up: AtomicBool,
+    /// The receive-side scaling limits the device reported, present
+    /// only when `VIRTIO_NET_F_RSS` was negotiated *and* the device can
+    /// hold the table and key this driver's demux is defined in terms
+    /// of. A device that cannot is left unsteered rather than
+    /// half-programmed: a wrong table would put a flow on a queue whose
+    /// processor does not own the socket, which is worse than the hop.
+    rss: Option<RssLimits>,
 }
 
 /// Control queue state: a single descriptor pair (header bytes
@@ -658,6 +746,17 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             } else {
                 0
             };
+            // Receive-side scaling is what makes the per-CPU queue
+            // layout pay, but only together with multiqueue: on a
+            // single-pair device there is nothing to steer to. The
+            // hash report rides along so the driver reads the number
+            // the device already computed instead of computing it
+            // again; both are programmed over the control queue.
+            let rss_mask = if mq_supported && offered & NET_FEATURE_RSS != 0 {
+                NET_FEATURE_RSS | (offered & NET_FEATURE_HASH_REPORT)
+            } else {
+                0
+            };
             // Notification coalescing is programmed over the control
             // queue, so it is only worth asking for when the control
             // queue itself is in. The per-virtqueue form is a strict
@@ -690,6 +789,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
                 | mrg_mask
                 | guest_gso_mask
                 | coalescing_mask
+                | rss_mask
         })?;
 
         let mac_address = read_mac_address(&transport);
@@ -697,7 +797,26 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         let max_frame_len = ip_mtu
             .checked_add(ETH_HEADER_LEN)
             .ok_or(IoError::DeviceFault)?;
-        let header_len = size_of::<VirtioNetHeader>();
+        // A device that cannot hold the table and key this driver's
+        // demux is defined in terms of is left unsteered rather than
+        // half-programmed.
+        let rss = features
+            .device(NET_FEATURE_RSS)
+            .then(|| read_rss_limits(&transport))
+            .filter(|limits| limits.accepts_our_table());
+        if features.device(NET_FEATURE_RSS) && rss.is_none() {
+            tracing::warn!(
+                "virtio-net offered RSS but cannot hold a {RSS_INDIRECTION_ENTRIES}-entry table with a {RSS_KEY_BYTES}-byte key over the four-tuple hash types; receives stay unsteered"
+            );
+        }
+        // `VIRTIO_NET_F_HASH_REPORT` lengthens the header in both
+        // directions, so it is one number every buffer size derives
+        // from rather than a per-path branch.
+        let header_len = if features.device(NET_FEATURE_HASH_REPORT) {
+            HASH_REPORT_HEADER_BYTES
+        } else {
+            size_of::<VirtioNetHeader>()
+        };
         let mergeable_rx_buffers = features.device(NET_FEATURE_MRG_RXBUF);
         let guest_tso_v4_negotiated = features.device(NET_FEATURE_GUEST_TSO4);
         let guest_tso_v6_negotiated = features.device(NET_FEATURE_GUEST_TSO6);
@@ -913,6 +1032,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             guest_ufo_negotiated,
             status_negotiated: features.device(NET_FEATURE_STATUS),
             link_up: AtomicBool::new(true),
+            rss,
         };
         device
             .link_up
@@ -921,8 +1041,12 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         // Activate every queue pair on the device side. The device
         // ships with a single pair active by default; without this
         // command extra RX queues we just allocated would not
-        // receive traffic.
-        if features.device(NET_FEATURE_MQ) && device.queue_pair_count() > 1 {
+        // receive traffic. A steering device is told the same count
+        // inside its RSS configuration instead, which is the command
+        // that also hands it the table and the key.
+        if device.steers_receives() {
+            device.send_rss_config()?;
+        } else if features.device(NET_FEATURE_MQ) && device.queue_pair_count() > 1 {
             device.send_set_vq_pairs(device.queue_pair_count())?;
         }
 
@@ -956,6 +1080,8 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             mrg_rxbuf = device.mergeable_rx_buffers,
             mq = features.device(NET_FEATURE_MQ),
             ctrl_vq = features.device(NET_FEATURE_CTRL_VQ),
+            rss = device.steers_receives(),
+            hash_report = features.device(NET_FEATURE_HASH_REPORT),
             notf_coal = features.device(NET_FEATURE_NOTF_COAL),
             vq_notf_coal = features.device(NET_FEATURE_VQ_NOTF_COAL),
             notf_coal_max_packets = NET_NOTF_COAL_MAX_PACKETS,
@@ -986,8 +1112,14 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             rx_queues: self.queue_pair_count(),
             tx_queues: self.queue_pair_count(),
             tx_queue_depth: self.tx_queue_depth(),
-            rss: false,
+            rss: self.steers_receives(),
         }
+    }
+
+    /// Whether the device steers received frames across its queues by
+    /// flow hash, rather than delivering everything on queue zero.
+    pub fn steers_receives(&self) -> bool {
+        self.rss.is_some()
     }
 
     /// The capability set the network stack specializes its data paths
@@ -1138,6 +1270,43 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             CTRL_CMD_NOTF_COAL_TX_SET,
             &budget.encode(),
         )
+    }
+
+    /// Hands the device the indirection table and the key the driver's
+    /// own demux is defined in terms of.
+    ///
+    /// The table is not stored: entry `i` is `i % pairs`, which is
+    /// exactly what [`rss_indirection_entry`] computes when the receive
+    /// path has to reach the same answer in software. Programming it
+    /// this way is the whole point — a frame the device steers and a
+    /// frame the driver hashes land on the same shard.
+    fn send_rss_config(&self) -> IoResult<()> {
+        let pairs = u16::try_from(self.queue_pair_count()).map_err(|_| IoError::DeviceFault)?;
+        let mut payload = [0_u8; CTRL_RSS_CONFIG_PAYLOAD_BYTES];
+        let mut offset = 0;
+        let mut push = |bytes: &[u8]| {
+            payload[offset..offset + bytes.len()].copy_from_slice(bytes);
+            offset += bytes.len();
+        };
+        push(&NET_RSS_HASH_TYPES.to_le_bytes());
+        // The mask is the table length minus one, which is why the
+        // length has to be a power of two.
+        push(&((RSS_INDIRECTION_ENTRIES - 1) as u16).to_le_bytes());
+        // A frame the device cannot classify goes here — the same queue
+        // the driver's own rule sends a frame with no flow to.
+        push(&0_u16.to_le_bytes());
+        for slot in 0..RSS_INDIRECTION_ENTRIES {
+            let queue = rss_indirection_entry(slot, usize::from(pairs));
+            push(&(queue as u16).to_le_bytes());
+        }
+        push(&pairs.to_le_bytes());
+        push(&[RSS_KEY_BYTES as u8]);
+        push(&STANDARD_RSS_KEY);
+        assert_eq!(
+            offset, CTRL_RSS_CONFIG_PAYLOAD_BYTES,
+            "the RSS configuration payload was not filled exactly"
+        );
+        self.send_control_command(CTRL_CLASS_MQ, CTRL_CMD_MQ_RSS_CONFIG, &payload)
     }
 
     /// Whether the device holds notifications back for a batch or a
@@ -1380,7 +1549,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             return Err(IoError::DeviceFault);
         }
         let slot = &self.queue_pairs[pair_idx].rx_slots[usize::from(slot_index)];
-        let header = RxHeader::parse(&slot.buffer()[..self.header_len]);
+        let header = RxHeader::parse(&slot.buffer()[..self.header_len], self.header_len);
         let offload = match self.rx_offload(header) {
             Ok(offload) => offload,
             Err(error) => {
@@ -1514,6 +1683,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         Ok(RxFrameOffload {
             checksum,
             large_receive_segment_bytes,
+            flow_hash: header.flow_hash(),
         })
     }
 
@@ -1820,6 +1990,49 @@ fn read_max_virtqueue_pairs<T: VirtioTransport>(transport: &T) -> u16 {
     // status (2B), max_virtqueue_pairs (2B at offset 8).
     let config = transport.read_config_u32(8).to_le_bytes();
     u16::from_le_bytes([config[0], config[1]])
+}
+
+/// `rss_max_key_size`, `rss_max_indirection_table_length` and
+/// `supported_hash_types`, read as one dword each so the transport's
+/// aligned config accessors cover them.
+fn read_rss_limits<T: VirtioTransport>(transport: &T) -> RssLimits {
+    // The three fields straddle one aligned dword: `duplex` at 16,
+    // `rss_max_key_size` at 17, and the table length at 18..20.
+    let word = transport
+        .read_config_u32(NET_CONFIG_DUPLEX_OFFSET)
+        .to_le_bytes();
+    let key_index = NET_CONFIG_RSS_MAX_KEY_SIZE_OFFSET - NET_CONFIG_DUPLEX_OFFSET;
+    let table_index = NET_CONFIG_RSS_MAX_TABLE_LEN_OFFSET - NET_CONFIG_DUPLEX_OFFSET;
+    RssLimits {
+        max_key_bytes: usize::from(word[key_index]),
+        max_table_len: usize::from(u16::from_le_bytes([
+            word[table_index],
+            word[table_index + 1],
+        ])),
+        supported_hash_types: transport.read_config_u32(NET_CONFIG_SUPPORTED_HASH_TYPES_OFFSET),
+    }
+}
+
+/// What a device says it can do about receive-side scaling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RssLimits {
+    max_key_bytes: usize,
+    max_table_len: usize,
+    supported_hash_types: u32,
+}
+
+impl RssLimits {
+    /// Whether the device can be programmed with the table and key this
+    /// driver's own demux is defined in terms of.
+    ///
+    /// A device that cannot is not steered at all: half-programming it
+    /// would put a flow on a queue whose processor does not own the
+    /// socket, which is worse than the extra hop.
+    const fn accepts_our_table(self) -> bool {
+        self.max_key_bytes >= RSS_KEY_BYTES
+            && self.max_table_len >= RSS_INDIRECTION_ENTRIES
+            && self.supported_hash_types & NET_RSS_HASH_TYPES == NET_RSS_HASH_TYPES
+    }
 }
 
 fn read_mac_address<T: VirtioTransport>(transport: &T) -> [u8; 6] {
@@ -2825,6 +3038,95 @@ mod tests {
         assert_eq!(super::rx_queue_index(3), 6);
         assert_eq!(super::tx_queue_index(3), 7);
         assert_eq!(super::control_queue_index(4), 8);
+    }
+
+    /// The table the device is handed has to be the same function the
+    /// driver evaluates in software, entry for entry, or a steered
+    /// frame lands on a queue whose processor does not own the socket.
+    #[test]
+    fn the_rss_table_matches_the_software_rule() {
+        for pairs in [1usize, 2, 3, 4, 8] {
+            for slot in 0..super::RSS_INDIRECTION_ENTRIES {
+                let queue = super::rss_indirection_entry(slot, pairs);
+                assert!(queue < pairs);
+                assert_eq!(
+                    queue,
+                    super::FlowHash::new(slot as u32).bucket(pairs),
+                    "the programmed table and the software bucket must agree"
+                );
+            }
+        }
+    }
+
+    /// A device that cannot hold the driver's table or key, or that
+    /// cannot hash all four flow types, is left unsteered rather than
+    /// half-programmed.
+    #[test]
+    fn rss_limits_are_checked_before_the_device_is_steered() {
+        let usable = super::RssLimits {
+            max_key_bytes: super::RSS_KEY_BYTES,
+            max_table_len: super::RSS_INDIRECTION_ENTRIES,
+            supported_hash_types: super::NET_RSS_HASH_TYPES,
+        };
+        assert!(usable.accepts_our_table());
+        assert!(
+            !super::RssLimits {
+                max_key_bytes: super::RSS_KEY_BYTES - 1,
+                ..usable
+            }
+            .accepts_our_table()
+        );
+        assert!(
+            !super::RssLimits {
+                max_table_len: super::RSS_INDIRECTION_ENTRIES - 1,
+                ..usable
+            }
+            .accepts_our_table()
+        );
+        assert!(
+            !super::RssLimits {
+                supported_hash_types: super::NET_RSS_HASH_TYPES & !super::NET_HASH_TYPE_UDPV6,
+                ..usable
+            }
+            .accepts_our_table()
+        );
+        // A device offering more than the driver needs is still usable.
+        assert!(
+            super::RssLimits {
+                max_key_bytes: 64,
+                max_table_len: 512,
+                supported_hash_types: u32::MAX,
+            }
+            .accepts_our_table()
+        );
+    }
+
+    /// The hash the device reports is only meaningful when it says it
+    /// classified the frame, and it only exists in the longer header.
+    #[test]
+    fn a_reported_hash_needs_both_the_long_header_and_a_report_type() {
+        let mut header = [0_u8; super::HASH_REPORT_HEADER_BYTES];
+        header[12..16].copy_from_slice(&0xdead_beef_u32.to_le_bytes());
+        header[16..18].copy_from_slice(&1_u16.to_le_bytes());
+
+        let long = super::RxHeader::parse(&header, super::HASH_REPORT_HEADER_BYTES);
+        assert_eq!(
+            long.flow_hash().map(super::FlowHash::get),
+            Some(0xdead_beef)
+        );
+
+        // The same bytes read as a short header report nothing: those
+        // eight bytes are the next frame's, not a hash.
+        let short = super::RxHeader::parse(&header, size_of::<VirtioNetHeader>());
+        assert_eq!(short.flow_hash(), None);
+
+        // A long header whose report type is NONE means the device
+        // classified nothing.
+        header[16..18].copy_from_slice(&super::NET_HASH_REPORT_NONE.to_le_bytes());
+        assert_eq!(
+            super::RxHeader::parse(&header, super::HASH_REPORT_HEADER_BYTES).flow_hash(),
+            None
+        );
     }
 
     #[test]

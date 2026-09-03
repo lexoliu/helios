@@ -305,6 +305,16 @@ const VIRTIO_NET_PROPERTIES: &[VirtioNetPropertySpec] = &[
         owner: Some("--net-queues"),
     },
     VirtioNetPropertySpec {
+        name: "rss",
+        value: VirtioNetPropertyValue::Toggle,
+        owner: None,
+    },
+    VirtioNetPropertySpec {
+        name: "hash",
+        value: VirtioNetPropertyValue::Toggle,
+        owner: None,
+    },
+    VirtioNetPropertySpec {
         name: "notf_coal",
         value: VirtioNetPropertyValue::Toggle,
         owner: None,

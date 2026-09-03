@@ -27,6 +27,28 @@ use crate::types::{IpAddress, Ipv4Address, Ipv6Address};
 /// to expects.
 pub const RSS_KEY_BYTES: usize = 40;
 
+/// Entries in the receive-side scaling indirection table.
+///
+/// A device masks the hash down to a slot in this table and reads the
+/// receive queue out of it, so the length must be a power of two. Fixing
+/// it here rather than taking whatever a device happens to allow is what
+/// lets the driver reproduce the device's decision exactly: both index
+/// the same table the same way, for any shard count.
+pub const RSS_INDIRECTION_ENTRIES: usize = 128;
+
+/// The queue an indirection-table slot points at.
+///
+/// The table is not stored anywhere: it is this function, evaluated
+/// per slot when the device is programmed and per frame when the
+/// software path has to reach the same answer.
+pub const fn rss_indirection_entry(slot: usize, buckets: usize) -> usize {
+    assert!(
+        buckets != 0,
+        "an indirection table needs at least one queue"
+    );
+    slot % buckets
+}
+
 /// Largest tuple the hash is computed over: two IPv6 addresses plus two
 /// ports.
 const MAX_TUPLE_BYTES: usize = 16 + 16 + 2 + 2;
@@ -69,13 +91,21 @@ impl FlowHash {
 
     /// The receive queue, and therefore the shard, this flow belongs to.
     ///
-    /// This is the one placement rule: a device with RSS programs its
-    /// indirection table so the same modulo picks the same queue, and a
-    /// device without it delivers everything on queue 0 while the
-    /// software hash still routes to the same shard.
+    /// This is the one placement rule, and it is deliberately the
+    /// two-step mapping a device performs rather than a plain
+    /// `hash % buckets`: an RSS engine can only *mask* the hash down to
+    /// an indirection-table slot and then read a queue out of the
+    /// table, so a driver that divided instead would disagree with it
+    /// for every bucket count that is not a power of two. Masking here
+    /// too means a device that steers and a device that cannot land the
+    /// same flow on the same shard.
     pub const fn bucket(self, buckets: usize) -> usize {
-        assert!(buckets != 0, "flow hash needs at least one bucket");
-        (self.0 as usize) % buckets
+        rss_indirection_entry(self.slot(), buckets)
+    }
+
+    /// The indirection-table slot this flow masks down to.
+    pub const fn slot(self) -> usize {
+        (self.0 as usize) & (RSS_INDIRECTION_ENTRIES - 1)
     }
 }
 
@@ -330,6 +360,38 @@ mod tests {
         ]);
         let tuple = FlowTuple::ipv6(source, 2794, destination, 1766);
         assert_eq!(flow_hash(&tuple).get(), 0x4020_7d3d);
+    }
+
+    /// The bucket rule has to be exactly what a device computes:
+    /// mask to a table slot, then read the queue out of the table.
+    #[test]
+    fn a_bucket_is_the_indirection_table_entry_for_the_masked_hash() {
+        assert!(RSS_INDIRECTION_ENTRIES.is_power_of_two());
+        for raw in [0u32, 1, 127, 128, 129, 0xffff_ffff, 0x8000_0001] {
+            let hash = FlowHash::new(raw);
+            assert_eq!(hash.slot(), (raw as usize) % RSS_INDIRECTION_ENTRIES);
+            for buckets in [1usize, 2, 3, 4, 5, 8, 12] {
+                assert_eq!(
+                    hash.bucket(buckets),
+                    rss_indirection_entry(hash.slot(), buckets)
+                );
+                assert!(hash.bucket(buckets) < buckets);
+            }
+        }
+    }
+
+    /// Every slot of the table is reachable, so no shard is starved of
+    /// the flows that hash to it.
+    #[test]
+    fn every_bucket_is_reachable_from_some_slot() {
+        for buckets in [1usize, 2, 3, 4, 8] {
+            for bucket in 0..buckets {
+                assert!(
+                    (0..RSS_INDIRECTION_ENTRIES)
+                        .any(|slot| rss_indirection_entry(slot, buckets) == bucket)
+                );
+            }
+        }
     }
 
     #[test]

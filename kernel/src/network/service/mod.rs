@@ -1488,6 +1488,12 @@ mod tests {
     /// Listeners reserve nothing, so their first slot is zero.
     const FIRST_TEST_LISTENER_SLOT: usize = 0;
 
+    /// A received frame the device reported no hash for, which is what
+    /// every backend without `HASH_REPORT` delivers.
+    fn unhashed(bytes: &[u8]) -> RxFrame {
+        RxFrame::new(Bytes::copy_from_slice(bytes))
+    }
+
     fn test_network_shard() -> NetworkShard {
         NetworkShard::new(test_stack_config(), 1, 0, 1)
     }
@@ -2282,12 +2288,43 @@ mod tests {
                     let (frame, len) =
                         ipv4_udp_frame(peer, peer_port, local, local_port, b"payload");
                     assert_eq!(
-                        super::shard_idx_for_frame(&frame[..len], shard_count),
+                        super::shard_idx_for_frame(&unhashed(&frame[..len]), shard_count),
                         placed,
                         "the demux and the placement rule must agree"
                     );
                     assert!(placed < shard_count);
                 }
+            }
+        }
+    }
+
+    /// A device that reports its hash and one that does not must reach
+    /// the same shard for the same frame, or a flow would move when the
+    /// backend changes.
+    #[test]
+    fn a_reported_hash_and_a_computed_one_agree() {
+        let local = Ipv4Address::new([192, 0, 2, 10]);
+        let peer = Ipv4Address::new([198, 51, 100, 20]);
+        for shard_count in [1usize, 2, 3, 4, 8] {
+            for peer_port in [53u16, 443, 8080, 40_000] {
+                let (frame, len) = ipv4_udp_frame(peer, peer_port, local, 49_153, b"payload");
+                let computed = super::shard_idx_for_frame(&unhashed(&frame[..len]), shard_count);
+
+                // What the device would have written into the receive
+                // header: the same function over the same bytes.
+                let tuple = helios_netstack::FlowTuple::ipv4(peer, peer_port, local, 49_153);
+                let reported = RxFrame::with_offload(
+                    Bytes::copy_from_slice(&frame[..len]),
+                    helios_netstack::RxFrameOffload {
+                        flow_hash: Some(helios_netstack::flow_hash(&tuple)),
+                        ..helios_netstack::RxFrameOffload::none()
+                    },
+                );
+                assert_eq!(
+                    super::shard_idx_for_frame(&reported, shard_count),
+                    computed,
+                    "a steered frame and a software-hashed one belong to the same shard"
+                );
             }
         }
     }
@@ -2308,7 +2345,7 @@ mod tests {
                 b"offer",
             );
             assert_eq!(
-                super::shard_idx_for_frame(&offer[..offer_len], shard_count),
+                super::shard_idx_for_frame(&unhashed(&offer[..offer_len]), shard_count),
                 super::DEFAULT_SHARD_IDX
             );
             let (discover, discover_len) = ipv4_udp_frame(
@@ -2319,7 +2356,7 @@ mod tests {
                 b"discover",
             );
             assert_eq!(
-                super::shard_idx_for_frame(&discover[..discover_len], shard_count),
+                super::shard_idx_for_frame(&unhashed(&discover[..discover_len]), shard_count),
                 super::DEFAULT_SHARD_IDX
             );
         }
@@ -2345,7 +2382,7 @@ mod tests {
             shard_count,
         );
         assert_eq!(
-            super::shard_idx_for_frame(&error[..error_len], shard_count),
+            super::shard_idx_for_frame(&unhashed(&error[..error_len]), shard_count),
             flow
         );
     }
@@ -2356,7 +2393,7 @@ mod tests {
     fn a_frame_without_a_flow_falls_to_the_default_shard() {
         for shard_count in [1usize, 2, 4] {
             assert_eq!(
-                super::shard_idx_for_frame(&[], shard_count),
+                super::shard_idx_for_frame(&unhashed(&[]), shard_count),
                 super::DEFAULT_SHARD_IDX,
                 "an unparseable frame has no flow"
             );
@@ -2369,7 +2406,7 @@ mod tests {
             )
             .expect("test Ethernet header should fit");
             assert_eq!(
-                super::shard_idx_for_frame(&arp[..len], shard_count),
+                super::shard_idx_for_frame(&unhashed(&arp[..len]), shard_count),
                 super::DEFAULT_SHARD_IDX,
                 "ARP carries no ports"
             );

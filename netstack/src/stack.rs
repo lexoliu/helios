@@ -7371,6 +7371,7 @@ mod tests {
                     RxFrameOffload {
                         checksum: RxChecksumReport::Validated,
                         large_receive_segment_bytes: Some(1460),
+                        flow_hash: None,
                     },
                 ),
                 StackInstant::from_nanos(2),
