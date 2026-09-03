@@ -1858,7 +1858,11 @@ impl Write for PanicSerialWriter {
 #[cfg(target_os = "none")]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    let _ = writeln!(PanicSerialWriter, "{info}");
+    // One indivisible message, like every other console producer: the panic
+    // report shares this UART with kernel tracing and the debugger markers.
+    helios_kernel::emit_console_line(|| {
+        let _ = writeln!(PanicSerialWriter, "{info}");
+    });
     helios_kernel::panic_log(info);
     loop {
         unsafe {

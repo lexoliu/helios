@@ -1018,19 +1018,24 @@ fn fatal_panic(info: &core::panic::PanicInfo<'_>) -> ! {
         }
     }
 
-    let mut console = PanicConsole;
-    let _ = console.write_str("Kernel panic");
-    if let Some(location) = info.location() {
-        let _ = write!(
-            console,
-            " at {}:{}:{}",
-            location.file(),
-            location.line(),
-            location.column()
-        );
-    }
-    let _ = console.write_str("\n");
-    let _ = writeln!(console, "{}", info.message());
+    // The panic report shares the UART with kernel tracing and the debugger's
+    // stage markers, so it goes out as one indivisible message like every
+    // other console producer. Nothing follows it: the hart shuts down next.
+    helios_kernel::emit_console_line(|| {
+        let mut console = PanicConsole;
+        let _ = console.write_str("Kernel panic");
+        if let Some(location) = info.location() {
+            let _ = write!(
+                console,
+                " at {}:{}:{}",
+                location.file(),
+                location.line(),
+                location.column()
+            );
+        }
+        let _ = console.write_str("\n");
+        let _ = writeln!(console, "{}", info.message());
+    });
 
     shutdown_machine()
 }
