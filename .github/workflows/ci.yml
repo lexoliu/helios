@@ -137,6 +137,9 @@ jobs:
           # under TCG and needs an emulation-sized bring-up budget.
           HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
         run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
           runtime="$GITHUB_WORKSPACE/smoke-runtime/boot"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch riscv64 --release --memory 2G \
@@ -176,6 +179,9 @@ jobs:
         env:
           HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
         run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
           # coreutils is one multicall WASIX module published under several
           # bootfs names, so every applet is launched by bare name and dash
           # resolves it through PATH. Issue #39 died here on riscv64.
@@ -198,6 +204,9 @@ jobs:
         env:
           HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
         run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
           # Same interpreter and one-liner as tools/wasi-apps/smoke.sh, so the
           # riscv64 lane covers the stdlib import path that issue #39 broke.
           runtime="$GITHUB_WORKSPACE/smoke-runtime/cpython"
@@ -238,6 +247,9 @@ jobs:
         env:
           HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
         run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
           # curl speaks wasi:http, which the kernel forwards to the
           # http-client plugin, so both boot programs are required. curl is
           # invoked by bare name so dash resolves it through PATH and execs
@@ -330,6 +342,9 @@ jobs:
           HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
           HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
         run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
           runtime="$GITHUB_WORKSPACE/smoke-runtime/device-tree"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
@@ -351,6 +366,9 @@ jobs:
           HELIOS_LIMINE_BIN: ${{ github.workspace }}/limine/limine
           HELIOS_BOOT_SYNC_TIMEOUT_SECS: "3600"
         run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
           runtime="$GITHUB_WORKSPACE/smoke-runtime/acpi"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G --acpi \
@@ -398,14 +416,14 @@ jobs:
             # TSO paths exist at all. See docs/networking.md.
             net-backend: tap
             net-host: 10.77.0.1
-          - name: aarch64-linux
-            runner: ubuntu-24.04-arm
-            helios-arch: aarch64
-            vm-memory: 2G
-            boot-timeout: "3600"
-            workloads: ""
-            net-backend: tap
-            net-host: 10.77.0.1
+          # There is deliberately no aarch64 Linux lane. GitHub's Arm
+          # runners expose neither /dev/kvm nor a readable
+          # /dev/vhost-net, so an aarch64 guest there would run under
+          # TCG with a userspace tap — no accelerator and no multi-queue
+          # offload — which is not evidence for anything AGENTS.md §3.5
+          # asks a benchmark to show. The Arm numbers come from the HVF
+          # lane below, and the multi-queue network baseline from the
+          # x86-64 KVM lane above.
           - name: aarch64-macos
             runner: macos-15
             helios-arch: aarch64
@@ -478,6 +496,14 @@ jobs:
         if: matrix.net-backend == 'tap'
         working-directory: helios
         run: |
+          # QEMU's vhost-net backend opens /dev/vhost-net itself; udev
+          # creates that node root:kvm mode 0660 and the runner account is
+          # not in the group, so without this QEMU warns four times, fails
+          # its tap client and asserts before the guest boots. The lane's
+          # pipeline status used to hide exactly that.
+          sudo modprobe vhost_net
+          sudo chmod 0666 /dev/vhost-net
+          ls -l /dev/vhost-net
           ./target/release/helios-inspector vm net-setup \
             --net-backend tap \
             --net-ifname "${HELIOS_NET_IFNAME}" \
@@ -492,6 +518,9 @@ jobs:
           HELIOS_WORKLOAD_BENCH_VM_MEMORY: ${{ matrix.vm-memory }}
           HELIOS_WORKLOAD_BENCH_NET_BACKEND: ${{ matrix.net-backend }}
         run: |
+          # Without this the step reports tee's status, not the
+          # command's, and a runner script that fails is invisible.
+          set -o pipefail
           if [ "${{ matrix.net-backend }}" = tap ]; then
             export HELIOS_WORKLOAD_BENCH_NET_IFNAME="${HELIOS_NET_IFNAME}"
             export HELIOS_WORKLOAD_BENCH_NET_BRIDGE="${HELIOS_NET_BRIDGE}"

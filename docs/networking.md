@@ -288,12 +288,22 @@ comes from `--virtio-packed`. The error names the flag to use instead.
 
 ## Continuous integration
 
-The `bench` job's Linux lanes provision a tap through `net-setup` and run
-with `--net-backend tap --net-queues $(nproc)` (the tap netdev always
-carries `vhost=on`), so multiqueue
-and offload are exercised on every run and the negotiated feature set is
-printed into the job log. The macOS lane keeps `user`: GitHub's macOS
-runners give no way to hold the vmnet entitlement or install the
-`socket_vmnet` daemon, so that lane is labelled single-queue,
-no-offload in its summary and its numbers are not comparable with the
-Linux lanes' network workloads.
+The `bench` job's x86-64 Linux lane provisions a tap through `net-setup`
+and runs with `--net-backend tap --net-queues $(nproc)` (the tap netdev
+always carries `vhost=on`), so multiqueue and offload are exercised on
+every run and the negotiated feature set is printed into the job log.
+**That lane is the multi-queue network baseline**, and until an Arm
+runner with KVM exists it is the only one CI has.
+
+The macOS lane keeps `user`: GitHub's macOS runners give no way to hold
+the vmnet entitlement or install the `socket_vmnet` daemon, so that lane
+is labelled single-queue, no-offload in its summary and its numbers are
+not comparable with the x86-64 lane's network workloads. It is there for
+the aarch64 CPU-side numbers, which HVF can produce honestly.
+
+There is deliberately no aarch64 Linux lane. GitHub's Arm runners expose
+neither `/dev/kvm` nor a readable `/dev/vhost-net`, so a guest there runs
+under TCG behind a userspace tap: no accelerator, and none of the
+multiqueue or offload paths the tap backend exists to exercise. A lane
+in that shape measures the emulator, so an arm64 multi-queue baseline is
+taken on a real machine (see AGENTS.md §3.5) rather than read out of CI.
