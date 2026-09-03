@@ -60,6 +60,9 @@ const COMMON_DEVICE_FEATURE: usize = 0x04;
 const COMMON_DRIVER_FEATURE_SELECT: usize = 0x08;
 const COMMON_DRIVER_FEATURE: usize = 0x0c;
 const COMMON_CONFIG_MSIX_VECTOR: usize = 0x10;
+/// `num_queues` in the modern common configuration: the number of
+/// virtqueues this function presents.
+const COMMON_NUM_QUEUES: usize = 0x12;
 const COMMON_DEVICE_STATUS: usize = 0x14;
 const COMMON_QUEUE_SELECT: usize = 0x16;
 const COMMON_QUEUE_SIZE: usize = 0x18;
@@ -487,6 +490,10 @@ impl<P: DmaPool> VirtioTransport for VirtioPciTransport<P> {
     fn queue_max_size(&self, index: u16) -> u16 {
         self.select_queue(index);
         self.common.read_u16(COMMON_QUEUE_SIZE)
+    }
+
+    fn presented_queue_count(&self) -> Option<u16> {
+        Some(self.common.read_u16(COMMON_NUM_QUEUES))
     }
 
     fn set_queue(
