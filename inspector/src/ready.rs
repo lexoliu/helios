@@ -12,6 +12,13 @@ const BOOT_SYNC_TIMEOUT: Duration = Duration::from_secs(900);
 const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const READY_DRAIN_QUIET_PERIOD: Duration = Duration::from_millis(100);
 const DEBUGGER_RUN_STAGE: &str = "run:begin";
+/// Bytes one serial line may gather before it is rendered anyway.
+///
+/// A guest that stops emitting newlines — a corrupted stream, a binary
+/// blob on the console — would otherwise grow a single line for as long
+/// as the session runs, and an unbounded line is also what a log viewer
+/// refuses to render.
+const MAX_GUEST_LINE_BYTES: usize = 8 * 1024;
 
 /// Boot-marker deadline. Firmware loading a release kernel image under
 /// pure TCG can legitimately take longer than the default 15 minutes,
@@ -79,13 +86,33 @@ async fn wait_for_debugger_stage(read: &mut SerialReader) -> Result<()> {
                 line.clear();
             }
             b'\r' => {}
-            other => line.push(other),
+            other => {
+                line.push(other);
+                if line.len() >= MAX_GUEST_LINE_BYTES {
+                    if let Some(text) = printable_guest_line(&line) {
+                        eprintln!("guest serial: {text}");
+                    }
+                    line.clear();
+                }
+            }
         }
     }
 }
 
+/// The one control character a rendered line keeps.
+///
+/// The guest colours its log with ANSI escape sequences, which read
+/// correctly in a terminal and in a CI log alike.
+const ESCAPE: char = '\u{1b}';
+
 /// Renders a non-marker serial line for diagnostics, or `None` when the
 /// line is empty or carries no printable text (RPC framing bytes).
+///
+/// Control characters are dropped from the middle of the line and not
+/// only trimmed off its ends. A serial line that carries RPC framing or
+/// a partially written buffer can hold a NUL anywhere in it, and one NUL
+/// is enough for a CI log collector to discard the whole step's output —
+/// which is exactly the evidence a failing boot exists to leave behind.
 fn printable_guest_line(line: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(line);
     let trimmed = text.trim_matches(|c: char| c.is_control() || c == '\u{fffd}');
@@ -93,7 +120,15 @@ fn printable_guest_line(line: &[u8]) -> Option<String> {
         .chars()
         .filter(|c| !c.is_control() && *c != '\u{fffd}')
         .count();
-    (printable >= 4 && printable * 2 >= trimmed.chars().count()).then(|| trimmed.to_owned())
+    if printable < 4 || printable * 2 < trimmed.chars().count() {
+        return None;
+    }
+    Some(
+        trimmed
+            .chars()
+            .filter(|character| *character == ESCAPE || !character.is_control())
+            .collect(),
+    )
 }
 
 /// After a panic line appears, the guest usually follows with the panic
