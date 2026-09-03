@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -25,6 +26,8 @@ from helios_bench.runner import NetworkOptions, RunOptions, run_suite
 
 README_PATH = REPO_ROOT / "README.md"
 DOCS_PATH = REPO_ROOT / "docs" / "benchmarks.md"
+# Marker run id of a section that no run has been rendered into yet.
+PENDING_RUN = "pending"
 
 
 def parse_sides(raw: str) -> frozenset[Side]:
@@ -58,6 +61,17 @@ def command_run(args: argparse.Namespace) -> int:
     write_text(options.out_dir / "tables.md", render_tables(report))
     plot_report(report, options.out_dir)
     print(report_path)
+    return 0
+
+
+def command_lanes(args: argparse.Namespace) -> int:
+    manifest = load_manifest()
+    lanes = manifest.lanes if args.select == "all" else [manifest.lane(args.select)]
+    if args.format == "github-matrix":
+        print(json.dumps([lane.github_matrix_entry() for lane in lanes]))
+    else:
+        for lane in lanes:
+            print(lane.name)
     return 0
 
 
@@ -122,6 +136,9 @@ def command_render_check(args: argparse.Namespace) -> int:
         if args.run and marker_run != args.run:
             failures.append(f"{path}: marker names run {marker_run}, expected {args.run}")
             continue
+        if marker_run == PENDING_RUN:
+            print(f"{path}: no run rendered yet (marker run={PENDING_RUN})")
+            continue
         expected = renderer(marker_run, args.runs_dir).rstrip()
         if body.rstrip() != expected:
             failures.append(f"{path}: rendered section differs from run {marker_run}'s report; re-run render")
@@ -169,6 +186,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--net-bridge")
     run.add_argument("--net-queues", type=int)
     run.set_defaults(func=command_run)
+
+    lanes = subcommands.add_parser("lanes", help="list the lanes of the manifest")
+    lanes.add_argument("--select", default="all", help="a lane name, or all")
+    lanes.add_argument("--format", choices=["names", "github-matrix"], default="names")
+    lanes.set_defaults(func=command_lanes)
 
     host_check = subcommands.add_parser("host-check", help="list how this host deviates from a lane")
     host_check.add_argument("--lane", required=True)

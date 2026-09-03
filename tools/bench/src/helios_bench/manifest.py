@@ -38,6 +38,7 @@ class Lane(BaseModel):
     runner_label: str
     shared_runner: str
     qemu_version: str
+    boot_timeout_seconds: int = Field(ge=1)
     vcpus: int = Field(ge=1)
     memory: str
     linux_vm_memory: str
@@ -48,6 +49,18 @@ class Lane(BaseModel):
     @property
     def qemu_binary(self) -> str:
         return f"qemu-system-{self.guest_arch}"
+
+    def github_matrix_entry(self) -> dict[str, str]:
+        """One `include` entry of the bench-suite workflow matrix."""
+        return {
+            "lane": self.name,
+            "shared-runner": self.shared_runner,
+            "dedicated-runner": self.runner_label,
+            "helios-arch": self.helios_arch,
+            "guest-arch": self.guest_arch,
+            "net-backend": self.net_backend,
+            "boot-timeout": str(self.boot_timeout_seconds),
+        }
 
 
 class Manifest(BaseModel):

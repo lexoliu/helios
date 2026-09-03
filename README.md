@@ -130,6 +130,17 @@ See `docs/wasi-tools.md` for the reproducible workflow that stages the
 standard WASIX `/bin/dash` boot artifact, boots CPython with its upstream
 stdlib, and runs upstream WASI tools such as Python and curl.
 
+## Performance
+
+Helios is measured against Linux + Wasmtime and native Linux on the same
+machine, accelerator and virtio devices, with the same wasm precompiled by
+the same Wasmtime revision. The suite, its pins and its statistics are
+described in [docs/benchmarks.md](docs/benchmarks.md).
+
+<!-- helios-bench:begin run=pending -->
+No advisory run has been rendered into this section yet.
+<!-- helios-bench:end -->
+
 ## Kernel Plugins
 
 Helios uses `kernel plugin` as an architectural term for a very specific

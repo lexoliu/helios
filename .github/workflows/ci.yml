@@ -507,6 +507,9 @@ jobs:
             helios/target/perf-baselines/linux-vm/fedora-aarch64/sources
             helios/target/perf-baselines/linux-vm/fedora-aarch64/tools
           key: fedora-vm-assets-aarch64-44-1.7-wasmtime-48.0.0
+      - name: Build the native Linux counterparts
+        working-directory: helios
+        run: tools/bench/native/build.sh aarch64
       - name: Run Linux baseline workloads
         working-directory: helios
         run: |
