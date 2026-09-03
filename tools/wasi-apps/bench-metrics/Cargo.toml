@@ -1,0 +1,11 @@
+[package]
+name = "helios-bench-metrics"
+version = "0.1.0"
+edition = "2024"
+description = "Latency sample collection and `bench.<name>=<value>` reporting shared by the benchmark workload programs."
+
+[lib]
+name = "helios_bench_metrics"
+path = "src/lib.rs"
+
+[dependencies]

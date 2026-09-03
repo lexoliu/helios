@@ -8,11 +8,9 @@
 !/artifacts/wasix/dash/*
 !/artifacts/wasix/coreutils/
 !/artifacts/wasix/coreutils/*
-/tools/wasi-apps/python/target
-/tools/wasi-apps/curl/target
-/tools/wasi-apps/tcp-throughput/target
-/tools/wasi-apps/wasi-tcp-throughput/target
-/tools/wasi-apps/wasix-tcp-throughput/target
+/tools/wasi-apps/*/target
+/tools/bench/.venv
+/.notes-*.md
 __pycache__/
 *.wasm
 !/artifacts/wasix/dash/dash.wasm

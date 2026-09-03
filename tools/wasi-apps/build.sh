@@ -6,7 +6,8 @@
 #   from `brettcannon/cpython-wasi-build`, runs it through the wasi
 #   preview1→p2 adapter shipped alongside wasmtime, and stashes the
 #   component + stdlib under `$out_dir/../python3-root`.
-# - Builds our Rust `curl-wasi` and raw TCP throughput tool from source.
+# - Builds our Rust `curl-wasi`, the TCP throughput tools, and the
+#   benchmark-suite workload programs from source.
 # - Stages standard Wasmer WASIX shell/coreutils artifacts and builds QuickJS
 #   with wasm SIMD enabled for the boot filesystem.
 #
@@ -251,49 +252,33 @@ build_env=(
   RUSTFLAGS='-C debuginfo=0 -C strip=debuginfo'
 )
 
-env "${build_env[@]}" cargo build \
-  --manifest-path "$repo_root/tools/wasi-apps/curl/Cargo.toml" \
-  --target wasm32-wasip2 \
-  --release
+# Builds one Rust WASI tool crate from tools/wasi-apps/<crate> and stages
+# the raw and stripped modules under $out_dir/<name>.wasm.
+build_wasi_tool() {
+  local crate="$1"
+  local artifact="$2"
+  local target="$3"
+  local name="$4"
+  env "${build_env[@]}" cargo build \
+    --manifest-path "$repo_root/tools/wasi-apps/$crate/Cargo.toml" \
+    --target "$target" \
+    --release
+  cp -f \
+    "$repo_root/tools/wasi-apps/$crate/target/$target/release/$artifact.wasm" \
+    "$out_dir/$name.wasm"
+  wasm-tools strip "$out_dir/$name.wasm" -o "$out_dir/$name-stripped.wasm"
+}
 
-cp -f \
-  "$repo_root/tools/wasi-apps/curl/target/wasm32-wasip2/release/helios_curl_wasi.wasm" \
-  "$out_dir/curl.wasm"
-
-wasm-tools strip "$out_dir/curl.wasm" -o "$out_dir/curl-stripped.wasm"
-
-env "${build_env[@]}" cargo build \
-  --manifest-path "$repo_root/tools/wasi-apps/tcp-throughput/Cargo.toml" \
-  --target wasm32-wasip2 \
-  --release
-
-cp -f \
-  "$repo_root/tools/wasi-apps/tcp-throughput/target/wasm32-wasip2/release/helios_tcp_throughput_wasi.wasm" \
-  "$out_dir/tcp-throughput.wasm"
-
-wasm-tools strip "$out_dir/tcp-throughput.wasm" -o "$out_dir/tcp-throughput-stripped.wasm"
-
-env "${build_env[@]}" cargo build \
-  --manifest-path "$repo_root/tools/wasi-apps/wasi-tcp-throughput/Cargo.toml" \
-  --target wasm32-wasip2 \
-  --release
-
-cp -f \
-  "$repo_root/tools/wasi-apps/wasi-tcp-throughput/target/wasm32-wasip2/release/helios_wasi_tcp_throughput.wasm" \
-  "$out_dir/wasi-tcp-throughput.wasm"
-
-wasm-tools strip "$out_dir/wasi-tcp-throughput.wasm" -o "$out_dir/wasi-tcp-throughput-stripped.wasm"
-
-env "${build_env[@]}" cargo build \
-  --manifest-path "$repo_root/tools/wasi-apps/wasix-tcp-throughput/Cargo.toml" \
-  --target wasm32-wasip1 \
-  --release
-
-cp -f \
-  "$repo_root/tools/wasi-apps/wasix-tcp-throughput/target/wasm32-wasip1/release/wasix-tcp-throughput.wasm" \
-  "$out_dir/wasix-tcp-throughput.wasm"
-
-wasm-tools strip "$out_dir/wasix-tcp-throughput.wasm" -o "$out_dir/wasix-tcp-throughput-stripped.wasm"
+build_wasi_tool curl helios_curl_wasi wasm32-wasip2 curl
+build_wasi_tool tcp-throughput helios_tcp_throughput_wasi wasm32-wasip2 tcp-throughput
+build_wasi_tool wasi-tcp-throughput helios_wasi_tcp_throughput wasm32-wasip2 wasi-tcp-throughput
+build_wasi_tool wasix-tcp-throughput wasix-tcp-throughput wasm32-wasip1 wasix-tcp-throughput
+# Benchmark-suite workloads that run unchanged on Helios and under Wasmtime
+# on Linux; docs/benchmarks.md lists what each one measures.
+build_wasi_tool hello helios_hello_wasi wasm32-wasip2 hello
+build_wasi_tool pipe-echo helios_pipe_echo_wasi wasm32-wasip2 pipe-echo
+build_wasi_tool hostcall-loop helios_hostcall_loop_wasi wasm32-wasip2 hostcall-loop
+build_wasi_tool tcp-latency helios_tcp_latency_wasi wasm32-wasip2 tcp-latency
 
 echo "wasi artifacts written to: $out_dir and $python_root"
-ls -lh "$out_dir"/{curl,tcp-throughput,wasi-tcp-throughput,wasix-tcp-throughput}*.wasm
+ls -lh "$out_dir"/{curl,tcp-throughput,wasi-tcp-throughput,wasix-tcp-throughput,hello,pipe-echo,hostcall-loop,tcp-latency}*.wasm

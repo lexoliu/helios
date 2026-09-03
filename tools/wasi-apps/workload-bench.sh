@@ -87,6 +87,10 @@ if [[ -n "${HELIOS_WORKLOAD_BENCH_HOST_TCP_PORT:-}" ]]; then
     command+=(--host-tcp-port "${HELIOS_WORKLOAD_BENCH_HOST_TCP_PORT}")
 fi
 
+if [[ -n "${HELIOS_WORKLOAD_BENCH_HOST_TCP_ECHO_PORT:-}" ]]; then
+    command+=(--host-tcp-echo-port "${HELIOS_WORKLOAD_BENCH_HOST_TCP_ECHO_PORT}")
+fi
+
 if [[ -n "${HELIOS_WORKLOAD_BENCH_PROFILE_OUTPUT:-}" ]]; then
     command+=(--profile-output "${HELIOS_WORKLOAD_BENCH_PROFILE_OUTPUT}")
 fi

@@ -1,0 +1,16 @@
+[package]
+name = "helios-hostcall-loop-wasi"
+version = "0.1.0"
+edition = "2024"
+description = "Tight loop over wasi:clocks/monotonic-clock.now, the cheapest host call a WASI program can make."
+
+[dependencies]
+helios-bench-metrics = { path = "../bench-metrics" }
+thiserror = "2.0.17"
+wasi = "0.14.2"
+
+[[bin]]
+name = "helios_hostcall_loop_wasi"
+path = "src/main.rs"
+
+[workspace]
