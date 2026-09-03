@@ -238,6 +238,10 @@ impl<P: DmaPool> DeviceBus for VirtioPciBus<P> {
         self.config().read_u8(offset)
     }
 
+    fn read_u16(&self, offset: usize) -> u16 {
+        self.config().read_u16(offset)
+    }
+
     fn read_u32(&self, offset: usize) -> u32 {
         self.config().read_u32(offset)
     }
@@ -579,6 +583,10 @@ impl<P: DmaPool> VirtioTransport for VirtioPciTransport<P> {
         // here, so the read is harmless either way.
         let status = self.isr.read_u8(0);
         interrupt_status(status, self.msix.is_some())
+    }
+
+    fn read_config_u16(&self, offset: usize) -> u16 {
+        self.bus.read_u16(offset)
     }
 
     fn read_config_u32(&self, offset: usize) -> u32 {

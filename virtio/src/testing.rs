@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
-use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use helios_hal::io::{IoError, IoResult};
 use spin::Mutex;
@@ -63,6 +63,11 @@ impl MmioRegisterBus {
 impl DeviceBus for MmioRegisterBus {
     type DmaPool = IdentityDmaPool;
 
+    fn read_u16(&self, offset: usize) -> u16 {
+        let word = self.read_u32(offset & !0x3);
+        (word >> ((offset & 0x3) * 8)) as u16
+    }
+
     fn read_u32(&self, offset: usize) -> u32 {
         if offset == REG_DEVICE_FEATURES {
             let half = self.register(REG_DEVICE_FEATURES_SEL);
@@ -109,6 +114,11 @@ impl<P> HeapBus<P> {
 }
 
 impl<P: DmaPool> DeviceBus for HeapBus<P> {
+    fn read_u16(&self, offset: usize) -> u16 {
+        let word = self.read_u32(offset & !0x3);
+        (word >> ((offset & 0x3) * 8)) as u16
+    }
+
     fn read_u32(&self, offset: usize) -> u32 {
         unsafe { (*self.config.get())[offset / 4] }
     }
@@ -204,6 +214,12 @@ pub(crate) struct FakeTransport<P = IdentityDmaPool> {
     queue_size: u16,
     supports_queue_reset: bool,
     absent_queues: &'static [u16],
+    /// Where the device's configuration structure ends. A real device
+    /// sizes it to the last feature it offers and answers any access
+    /// that runs past the end with all-ones, so a test that sets this
+    /// sees exactly what a driver reading a field with the wrong width
+    /// would see.
+    config_len: AtomicUsize,
     log: Mutex<FakeTransportLog>,
 }
 
@@ -227,8 +243,19 @@ impl<P: DmaPool> FakeTransport<P> {
             queue_size: config.queue_size,
             supports_queue_reset: config.supports_queue_reset,
             absent_queues: config.absent_queues,
+            config_len: AtomicUsize::new(usize::MAX),
             log: Mutex::new(FakeTransportLog::default()),
         }
+    }
+
+    /// Ends the device configuration structure at `len` bytes, the way
+    /// a device that offers nothing past a given feature does.
+    pub(crate) fn bound_config_len(&self, len: usize) {
+        self.config_len.store(len, Ordering::Relaxed);
+    }
+
+    fn config_access_fits(&self, offset: usize, width: usize) -> bool {
+        offset + width <= self.config_len.load(Ordering::Relaxed)
     }
 
     /// The feature word the driver wrote back to the device.
@@ -378,7 +405,24 @@ impl<P: DmaPool> VirtioTransport for FakeTransport<P> {
         InterruptStatus::from_isr(core::mem::take(&mut log.pending_interrupt))
     }
 
+    fn read_config_u8(&self, offset: usize) -> u8 {
+        if !self.config_access_fits(offset, 1) {
+            return u8::MAX;
+        }
+        self.bus.read_u8(offset)
+    }
+
+    fn read_config_u16(&self, offset: usize) -> u16 {
+        if !self.config_access_fits(offset, 2) {
+            return u16::MAX;
+        }
+        self.bus.read_u16(offset)
+    }
+
     fn read_config_u32(&self, offset: usize) -> u32 {
+        if !self.config_access_fits(offset, 4) {
+            return u32::MAX;
+        }
         self.bus.read_u32(offset)
     }
 

@@ -213,6 +213,16 @@ pub trait VirtioTransport: Send + Sync + 'static {
     /// Acknowledges the pending interrupt and reports what it was for.
     fn ack_interrupt(&self) -> InterruptStatus;
 
+    /// Reads one 16-bit device configuration field with a 16-bit access.
+    ///
+    /// Required rather than derived from the dword read: the device
+    /// bounds configuration accesses by the length of the structure
+    /// it exposes for the negotiated features, and a dword that
+    /// straddles that end reads as all-ones on both the PCI and the
+    /// MMIO transport. virtio-net's `max_virtqueue_pairs` sits exactly
+    /// there whenever MQ is the last feature the device offers.
+    fn read_config_u16(&self, offset: usize) -> u16;
+
     fn read_config_u32(&self, offset: usize) -> u32;
 
     /// Writes one 32-bit device configuration field.
@@ -351,6 +361,10 @@ impl<B: DeviceBus> VirtioTransport for VirtioMmioTransport<B> {
             self.bus.write_u32(REG_INTERRUPT_ACK, status);
         }
         InterruptStatus::from_isr(status)
+    }
+
+    fn read_config_u16(&self, offset: usize) -> u16 {
+        self.bus.read_u16(CONFIG_SPACE_OFFSET + offset)
     }
 
     fn read_config_u32(&self, offset: usize) -> u32 {

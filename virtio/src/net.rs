@@ -117,6 +117,15 @@ const NET_FEATURE_MRG_RXBUF: u64 = 1 << 15;
 /// Byte offset of the `status` field in the virtio-net configuration
 /// space (mac[6], status[2], max_virtqueue_pairs[2], mtu[2]).
 const NET_CONFIG_STATUS_OFFSET: usize = 6;
+/// `max_virtqueue_pairs`, after mac[6] and status[2]. It exists only
+/// once VIRTIO_NET_F_MQ is negotiated, and on a device that offers
+/// nothing past MQ it is also the last field: the configuration
+/// structure ends at byte 10, so the field is read with the 16-bit
+/// access the spec requires rather than as part of a dword.
+const NET_CONFIG_MAX_VIRTQUEUE_PAIRS_OFFSET: usize = 8;
+/// `mtu`, after `max_virtqueue_pairs`; present once VIRTIO_NET_F_MTU is
+/// negotiated.
+const NET_CONFIG_MTU_OFFSET: usize = 10;
 /// `duplex`, after mac[6], status[2], max_virtqueue_pairs[2], mtu[2]
 /// and speed[4]. The RSS limits share its aligned dword.
 const NET_CONFIG_DUPLEX_OFFSET: usize = 16;
@@ -2219,10 +2228,7 @@ impl DescriptorBitSet {
 }
 
 fn read_max_virtqueue_pairs<T: VirtioTransport>(transport: &T) -> u16 {
-    // virtio-net config layout (when F_MQ negotiated): mac (6B),
-    // status (2B), max_virtqueue_pairs (2B at offset 8).
-    let config = transport.read_config_u32(8).to_le_bytes();
-    u16::from_le_bytes([config[0], config[1]])
+    transport.read_config_u16(NET_CONFIG_MAX_VIRTQUEUE_PAIRS_OFFSET)
 }
 
 /// `rss_max_key_size`, `rss_max_indirection_table_length` and
@@ -2269,8 +2275,12 @@ impl RssLimits {
 }
 
 fn read_mac_address<T: VirtioTransport>(transport: &T) -> [u8; 6] {
+    // The address ends at byte 6, so its last two bytes are read as a
+    // half word: a device that offers MAC and nothing past it sizes its
+    // configuration structure to six bytes and answers the dword at 4
+    // with all-ones.
     let low = transport.read_config_u32(0).to_le_bytes();
-    let high = transport.read_config_u32(4).to_le_bytes();
+    let high = transport.read_config_u16(4).to_le_bytes();
     [low[0], low[1], low[2], low[3], high[0], high[1]]
 }
 
@@ -2281,13 +2291,7 @@ fn read_link_up<T: VirtioTransport>(transport: &T, features: NegotiatedFeatures)
     if !features.device(NET_FEATURE_STATUS) {
         return true;
     }
-    // The status field straddles bytes 6..8, the upper half of the
-    // aligned dword at offset 4.
-    let config = transport
-        .read_config_u32(NET_CONFIG_STATUS_OFFSET & !0x3)
-        .to_le_bytes();
-    let status = u16::from_le_bytes([config[2], config[3]]);
-    status & NET_STATUS_LINK_UP != 0
+    transport.read_config_u16(NET_CONFIG_STATUS_OFFSET) & NET_STATUS_LINK_UP != 0
 }
 
 fn read_mtu<T: VirtioTransport>(transport: &T, features: NegotiatedFeatures) -> usize {
@@ -2295,8 +2299,7 @@ fn read_mtu<T: VirtioTransport>(transport: &T, features: NegotiatedFeatures) -> 
         return DEFAULT_IP_MTU;
     }
 
-    let config = transport.read_config_u32(8).to_le_bytes();
-    let mtu = u16::from_le_bytes([config[2], config[3]]) as usize;
+    let mtu = usize::from(transport.read_config_u16(NET_CONFIG_MTU_OFFSET));
     if mtu == 0 {
         return DEFAULT_IP_MTU;
     }
@@ -2412,13 +2415,14 @@ mod tests {
 
     use super::{
         DescriptorBitSet, ETH_HEADER_LEN, MAX_LARGE_RECEIVE_FRAME_BYTES,
-        MAX_SEGMENTED_TRANSMIT_FRAME_BYTES, NET_CONFIG_STATUS_OFFSET, NET_FEATURE_CSUM,
+        MAX_SEGMENTED_TRANSMIT_FRAME_BYTES, NET_CONFIG_MAX_VIRTQUEUE_PAIRS_OFFSET,
+        NET_CONFIG_MTU_OFFSET, NET_CONFIG_STATUS_OFFSET, NET_FEATURE_CSUM, NET_FEATURE_CTRL_VQ,
         NET_FEATURE_GUEST_CSUM, NET_FEATURE_GUEST_ECN, NET_FEATURE_GUEST_TSO4,
         NET_FEATURE_GUEST_TSO6, NET_FEATURE_GUEST_UFO, NET_FEATURE_HOST_ECN, NET_FEATURE_HOST_TSO4,
-        NET_FEATURE_HOST_TSO6, NET_FEATURE_MRG_RXBUF, NET_FEATURE_STATUS, NET_STATUS_LINK_UP,
-        RX_PAGE_BYTES, RxFrame, TxChecksumMeta, TxGsoMeta, VIRTIO_NET_HDR_F_DATA_VALID,
-        VIRTIO_NET_HDR_F_NEEDS_CSUM, VIRTIO_NET_HDR_GSO_TCPV4, VirtioNetDevice, VirtioNetHeader,
-        write_tx_payload,
+        NET_FEATURE_HOST_TSO6, NET_FEATURE_MQ, NET_FEATURE_MRG_RXBUF, NET_FEATURE_STATUS,
+        NET_STATUS_LINK_UP, RX_PAGE_BYTES, RxFrame, TxChecksumMeta, TxGsoMeta,
+        VIRTIO_NET_HDR_F_DATA_VALID, VIRTIO_NET_HDR_F_NEEDS_CSUM, VIRTIO_NET_HDR_GSO_TCPV4,
+        VirtioNetDevice, VirtioNetHeader, read_max_virtqueue_pairs, write_tx_payload,
     };
     use crate::testing::{FakeTransport, FakeTransportConfig};
     use crate::transport::{DeviceType, VirtioFeatures};
@@ -3399,6 +3403,32 @@ mod tests {
     }
 
     #[test]
+    fn max_virtqueue_pairs_is_read_with_a_half_word_access() {
+        use super::VirtioTransport as _;
+
+        // A device that offers nothing past MQ ends its configuration
+        // structure at byte 10, and answers a dword read at 8, which runs
+        // two bytes past that end, with all-ones. The field is 16 bits
+        // wide and has to be read as such.
+        let transport = FakeTransport::new(FakeTransportConfig {
+            device_type: DeviceType::Network,
+            offered_features: VirtioFeatures::VERSION_1.bits()
+                | NET_FEATURE_MQ
+                | NET_FEATURE_CTRL_VQ,
+            queue_size: 8,
+            supports_queue_reset: false,
+            absent_queues: &[],
+        });
+        transport.set_config_u16(NET_CONFIG_MAX_VIRTQUEUE_PAIRS_OFFSET, 4);
+        transport.bound_config_len(NET_CONFIG_MTU_OFFSET);
+        assert_eq!(
+            transport.read_config_u32(NET_CONFIG_MAX_VIRTQUEUE_PAIRS_OFFSET),
+            u32::MAX
+        );
+        assert_eq!(read_max_virtqueue_pairs(&transport), 4);
+    }
+
+    #[test]
     fn coalescing_budget_encodes_the_control_queue_payloads() {
         let budget = super::CoalescingBudget {
             max_packets: 8,
@@ -3416,9 +3446,6 @@ mod tests {
         );
     }
 
-    /// The virtio-net configuration field holding `max_virtqueue_pairs`.
-    const CONFIG_MAX_VIRTQUEUE_PAIRS_OFFSET: usize = 8;
-
     /// A device presenting `queue_size`-deep queues at every index
     /// except the ones named, advertising `advertised_pairs` in its
     /// configuration space.
@@ -3434,7 +3461,7 @@ mod tests {
             supports_queue_reset: false,
             absent_queues,
         });
-        transport.set_config_u16(CONFIG_MAX_VIRTQUEUE_PAIRS_OFFSET, advertised_pairs);
+        transport.set_config_u16(NET_CONFIG_MAX_VIRTQUEUE_PAIRS_OFFSET, advertised_pairs);
         transport
     }
 
@@ -3445,7 +3472,7 @@ mod tests {
     #[test]
     fn a_device_advertising_more_pairs_than_it_presents_comes_up_on_the_pairs_it_has() {
         let transport = multiqueue_transport(
-            super::NET_FEATURE_MQ | super::NET_FEATURE_CTRL_VQ,
+            NET_FEATURE_MQ | NET_FEATURE_CTRL_VQ,
             4,
             // Pair 1's receive queue is missing, so only pair 0 is
             // usable. The control queue still sits at 2 * 4.
@@ -3467,8 +3494,7 @@ mod tests {
         // The driver only accepts `CTRL_VQ` when it has something to
         // say over it, so this is the multiqueue shape with the control
         // queue — at 2 * 4 — missing.
-        let transport =
-            multiqueue_transport(super::NET_FEATURE_MQ | super::NET_FEATURE_CTRL_VQ, 4, &[8]);
+        let transport = multiqueue_transport(NET_FEATURE_MQ | NET_FEATURE_CTRL_VQ, 4, &[8]);
 
         let Err(error) = VirtioNetDevice::new(transport) else {
             panic!("a device that offers a queue it does not have is misconfigured");

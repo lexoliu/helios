@@ -173,7 +173,7 @@ impl<T: VirtioTransport> Drop for Virtio9pDevice<T> {
 }
 
 fn read_mount_tag<T: VirtioTransport>(transport: &T) -> IoResult<String> {
-    let tag_len = u16::from_le_bytes([transport.read_config_u8(0), transport.read_config_u8(1)]);
+    let tag_len = transport.read_config_u16(0);
     if tag_len == 0 {
         return Err(IoError::InvalidDeviceConfig(
             "virtio-9p mount tag length was zero",
