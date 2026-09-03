@@ -95,12 +95,14 @@ use core::arch::{asm, global_asm};
 use core::cell::Cell;
 use core::fmt::Write;
 use core::mem;
+use core::num::NonZeroUsize;
 use core::ops::Range;
 use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence};
 
 use arrayvec::ArrayVec;
 use fdt::Fdt;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId};
+use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
 use helios_hal::{DeviceInventory, DmaModel, ProcessorStartupPolicy, ProcessorTopology};
@@ -259,17 +261,8 @@ impl helios_hal::critical_section::InterruptOps for SupervisorInterruptOps {
         unsafe { riscv::interrupt::supervisor::enable() };
     }
 
-    fn current_owner() -> usize {
-        let runtime = read_hart_runtime();
-        if runtime != 0 {
-            return runtime;
-        }
-
-        // Before hart-local runtime state is installed, the kernel has not yet
-        // started using any shared async synchronization primitives. Use a stable
-        // bootstrap sentinel in that narrow window so early critical sections still
-        // function without requiring M-mode-only hart-id registers.
-        1
+    fn current_identity() -> ProcessorIdentity {
+        read_hart_identity()
     }
 }
 
@@ -298,11 +291,18 @@ struct HartRuntime {
 }
 
 impl HartRuntime {
+    /// Publishes this runtime as the hart's identity.
+    ///
+    /// `trapframe` owns `sscratch`, so hart-local runtime state lives in `tp`.
+    /// This keeps trap entry correct while still giving the kernel a cheap
+    /// per-hart lookup path. The hart already carried a bootstrapping identity
+    /// in `tp`; this replaces it, and both forms are distinguishable, so the
+    /// critical section never confuses two harts for one.
+    ///
+    /// The runtime must outlive the hart: `run_hart` never returns, so the
+    /// stack frame holding it lives as long as the hart does.
     fn install(&self) {
-        // `trapframe` owns `sscratch`, so hart-local runtime state lives in `tp`.
-        // This keeps trap entry correct while still giving the kernel a cheap
-        // per-hart lookup path.
-        write_hart_runtime(self as *const Self);
+        write_hart_identity(ProcessorIdentity::installed(self));
     }
 }
 
@@ -360,12 +360,7 @@ impl RiscvCpu {
 
 impl Cpu for RiscvCpu {
     fn current_processor(&self) -> ProcessorId {
-        let runtime_ptr = read_hart_runtime();
-        if runtime_ptr == 0 {
-            return self.current_hart;
-        }
-
-        unsafe { (*(runtime_ptr as *const HartRuntime)).hart_id }
+        installed_hart_runtime().map_or(self.current_hart, |runtime| runtime.hart_id)
     }
 
     fn processor_count(&self) -> usize {
@@ -523,7 +518,12 @@ fn trap_dispatch(tf: &mut TrapFrame) {
 }
 
 fn run_hart(hart_id: usize, fdt_addr: usize) -> ! {
-    clear_hart_runtime();
+    // Every hart takes critical sections long before it builds its runtime,
+    // and several harts run this prologue concurrently. Seeding `tp` with the
+    // hart's own bootstrapping identity here is what keeps those acquires
+    // distinguishable; sharing one sentinel makes a second hart's acquire look
+    // like the first hart's nested re-acquire and voids mutual exclusion.
+    write_hart_identity(ProcessorIdentity::bootstrapping(hart_id));
     let fdt = unsafe { Fdt::from_ptr(fdt_addr as *const u8) }
         .expect("OpenSBI did not provide a valid FDT");
     let mut cpus = fdt.cpus();
@@ -851,10 +851,7 @@ fn hart_status(hart: ProcessorId) -> usize {
 }
 
 fn current_hart_runtime() -> &'static HartRuntime {
-    let ptr = read_hart_runtime();
-    assert!(ptr != 0, "hart runtime is not installed");
-
-    unsafe { &*(ptr as *const HartRuntime) }
+    installed_hart_runtime().expect("hart runtime is not installed")
 }
 
 pub(crate) fn current_hart_id() -> ProcessorId {
@@ -879,12 +876,9 @@ pub(crate) fn write_debug_serial_bytes(bytes: &[u8]) {
 
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_tls_get(slot: usize) -> *mut u8 {
-    let runtime = read_hart_runtime();
-    if runtime == 0 {
-        return core::ptr::null_mut();
-    }
-
-    unsafe { (*(runtime as *const HartRuntime)).wasmtime_tls.get(slot) }
+    installed_hart_runtime().map_or(core::ptr::null_mut(), |runtime| {
+        runtime.wasmtime_tls.get(slot)
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -1081,18 +1075,27 @@ fn current_hart_runtime_ptr() -> usize {
     runtime_ptr
 }
 
-fn read_hart_runtime() -> usize {
-    current_hart_runtime_ptr()
+/// The identity this hart carries in `tp`: its bootstrapping form until
+/// [`HartRuntime::install`] replaces it with the runtime address.
+fn read_hart_identity() -> ProcessorIdentity {
+    let word = NonZeroUsize::new(current_hart_runtime_ptr())
+        .expect("tp lost the hart identity `run_hart` seeded");
+    ProcessorIdentity::from_raw(word)
 }
 
-fn write_hart_runtime(runtime: *const HartRuntime) {
+fn write_hart_identity(identity: ProcessorIdentity) {
     unsafe {
-        asm!("mv tp, {}", in(reg) runtime, options(nostack, preserves_flags));
+        asm!("mv tp, {}", in(reg) identity.raw(), options(nostack, preserves_flags));
     }
 }
 
-fn clear_hart_runtime() {
-    write_hart_runtime(core::ptr::null());
+/// The installed runtime, or `None` while the hart still carries only its
+/// bootstrapping identity.
+fn installed_hart_runtime() -> Option<&'static HartRuntime> {
+    let address = read_hart_identity().runtime_address()?;
+    // SAFETY: only `HartRuntime::install` publishes a runtime address, and it
+    // does so from a `&'static HartRuntime`.
+    Some(unsafe { &*(address.get() as *const HartRuntime) })
 }
 
 #[unsafe(no_mangle)]

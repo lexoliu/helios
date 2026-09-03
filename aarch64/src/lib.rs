@@ -6,6 +6,7 @@ extern crate alloc;
 use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
 use core::fmt::{self, Write};
+use core::num::NonZeroUsize;
 use core::ops::Range;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -19,6 +20,7 @@ use helios_hal::boot::{
     BootMemoryRegion, BootModule, BootModules, FirmwareKind,
 };
 use helios_hal::cpu::{Cpu, HardwarePerfCounters, Instant, ProcessorId};
+use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::entropy::{EntropyQuality, EntropyUnavailable};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::serial::ByteSerial;
@@ -405,13 +407,17 @@ impl helios_hal::critical_section::InterruptOps for Aarch64InterruptOps {
         unsafe { unmask_irq() };
     }
 
-    fn current_owner() -> usize {
-        let runtime = read_processor_runtime();
-        if runtime != 0 {
-            return runtime;
+    fn current_identity() -> ProcessorIdentity {
+        match NonZeroUsize::new(read_processor_runtime()) {
+            Some(runtime) => ProcessorIdentity::from_raw(runtime),
+            // A processor takes critical sections from its first instruction,
+            // well before it writes `tpidr_el1`, and several secondaries run
+            // that prologue concurrently. `MPIDR_EL1` is unique and readable
+            // throughout, so it stands in until the runtime address exists;
+            // one shared value would make a second processor's acquire look
+            // like the first processor's nested re-acquire.
+            None => ProcessorIdentity::bootstrapping(read_mpidr_affinity()),
         }
-
-        1
     }
 }
 
@@ -1144,6 +1150,19 @@ unsafe fn unmask_irq() {
             options(nomem, nostack, preserves_flags)
         );
     }
+}
+
+/// The affinity fields of `MPIDR_EL1`, which name this processor uniquely on
+/// every AArch64 implementation.
+fn read_mpidr_affinity() -> usize {
+    let mpidr: u64;
+    unsafe {
+        asm!("mrs {mpidr}, mpidr_el1", mpidr = out(reg) mpidr, options(nomem, nostack, preserves_flags));
+    }
+    const AFFINITY_0_TO_2: u64 = 0x00ff_ffff;
+    const AFFINITY_3: u64 = 0xff << 32;
+    let affinity = (mpidr & AFFINITY_0_TO_2) | ((mpidr & AFFINITY_3) >> 8);
+    usize::try_from(affinity).expect("AArch64 MPIDR affinity does not fit usize")
 }
 
 fn read_processor_runtime() -> usize {

@@ -6,10 +6,13 @@ use alloc::alloc::{Layout, alloc_zeroed};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::arch::x86_64::__cpuid;
+use core::num::NonZeroUsize;
+
 use core::ops::Range;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use helios_hal::cpu::{ProcessorId, ticks_to_nanos};
+use helios_hal::critical_section::ProcessorIdentity;
 use helios_hal::watchdog::Watchdog;
 use helios_kernel::{Timer, WasmtimeTlsSlots};
 use pci_types::ConfigRegionAccess;
@@ -236,6 +239,33 @@ pub(crate) fn current_processor() -> ProcessorId {
 
 pub(crate) fn current_runtime_address() -> usize {
     unsafe { rdmsr(IA32_FS_BASE) as usize }
+}
+
+/// The identity this processor answers critical-section acquires with.
+///
+/// A processor takes critical sections from its first instruction, well before
+/// [`activate_runtime`] publishes its runtime address, and several application
+/// processors run that prologue concurrently. The local APIC id is unique and
+/// readable throughout, so it stands in until the runtime address exists;
+/// sharing one value across processors would make a second processor's acquire
+/// look like the first processor's nested re-acquire.
+pub(crate) fn current_identity() -> ProcessorIdentity {
+    match NonZeroUsize::new(current_runtime_address()) {
+        Some(runtime) => ProcessorIdentity::from_raw(runtime),
+        None => ProcessorIdentity::bootstrapping(current_apic_id() as usize),
+    }
+}
+
+/// The local APIC id of the executing processor, from the topology leaf when
+/// the CPU publishes one and the legacy 8-bit initial APIC id otherwise.
+fn current_apic_id() -> u32 {
+    let max_basic_leaf = unsafe { __cpuid(0) }.eax;
+    if max_basic_leaf >= 0x0b {
+        let topology = unsafe { __cpuid(0x0b) };
+        return topology.edx;
+    }
+
+    unsafe { __cpuid(1) }.ebx >> 24
 }
 
 impl ProcessorRuntime {
