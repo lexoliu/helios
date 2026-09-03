@@ -1505,13 +1505,12 @@ where
             .map_err(map_program_runtime_error)?
             .call(&mut store, ())
             .map_err(map_program_runtime_error)? as u32;
-        let thread_pointer =
-            tls_base
-                .checked_add(pthread_self_offset)
-                .ok_or(ProgramExecError {
-                    kind: ProgramExecErrorKind::Internal,
-                    detail: ProgramExecErrorDetail::CompilerThreadPointerOverflow,
-                })?;
+        let thread_pointer = tls_base
+            .checked_add(pthread_self_offset)
+            .ok_or(ProgramExecError {
+                kind: ProgramExecErrorKind::Internal,
+                detail: ProgramExecErrorDetail::CompilerThreadPointerOverflow,
+            })?;
         let initialize = instance
             .get_typed_func::<i32, ()>(&mut store, HELIOS_COMPILER_INITIALIZE)
             .map_err(map_program_runtime_error)?;

@@ -617,8 +617,7 @@ mod tests {
 
     use super::{
         PerfMetricFilter, PerfMetricHistory, PerfSample, ProfileFilter, ProfileHistory,
-        ProfileScope,
-        TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceValue,
+        ProfileScope, TraceEvent, TraceField, TraceFilter, TraceHistory, TraceLevel, TraceValue,
         matches_trace_filter, parse_console_text,
     };
     use helios_hal::cpu::HardwarePerfCounterDelta;

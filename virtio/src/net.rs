@@ -1750,8 +1750,7 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         // list by this drain and is not referenced by any live frame,
         // and the caller holds the receive state that serialises drains.
         let assembly = unsafe { &mut *target.buffer_ptr() };
-        assembly[..assembled]
-            .copy_from_slice(&head_slot.buffer()[self.header_len..head.used_len]);
+        assembly[..assembled].copy_from_slice(&head_slot.buffer()[self.header_len..head.used_len]);
         self.repost_rx_buffer_deferred(pair_idx, state, head.slot)?;
         let mut expected_position = head.position;
         for _ in 1..buffers {

@@ -46,8 +46,7 @@ use crate::wasmtime_adapter::wasi::ChannelStreamProducer;
 use crate::wasmtime_adapter::wasi::bindings::filesystem::types::ErrorCode as FsErrorCode;
 use crate::{
     HeapStats, PerfMetricFilter, PerfSample, ProfileFilter, ProfileScope, StatsSample, TraceEvent,
-    TraceField,
-    TraceFilter, TraceLevel, TraceValue,
+    TraceField, TraceFilter, TraceLevel, TraceValue,
 };
 
 const SYNC_INSTANCE: &str = "helios:system/sync@0.1.0";

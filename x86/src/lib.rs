@@ -1034,9 +1034,7 @@ fn detect_x86_native_feature(feature: &str) -> Option<bool> {
         "avx512vbmi" => {
             Some(leaf7.is_some_and(|leaf| leaf.ecx & (1 << 1) != 0) && avx512_os_enabled)
         }
-        "lzcnt" => {
-            Some(max_extended >= 0x8000_0001 && __cpuid(0x8000_0001).ecx & (1 << 5) != 0)
-        }
+        "lzcnt" => Some(max_extended >= 0x8000_0001 && __cpuid(0x8000_0001).ecx & (1 << 5) != 0),
         _ => None,
     }
 }

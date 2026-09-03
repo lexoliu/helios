@@ -29,15 +29,14 @@ use helios_hal::cpu::{Cpu, HardwarePerfCounters};
 use helios_hal::io::IoError;
 use helios_netstack::{
     DEFAULT_HOP_LIMIT, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpClientMessage,
-    DhcpDnsServers,
-    DhcpMessageType, DhcpPacket, DnsQuestionWriter, DnsRecordType, DnsResponse, EthernetFrame,
-    EthernetProtocol, FlowTuple, IcmpEchoKey, IcmpEchoReply, Icmpv4Packet, Icmpv6Packet, IpAddress,
-    IpCidr, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address, Ipv6Cidr, Ipv6Packet,
-    MAX_OUTBOUND_FRAMES, NeighborEntry, NetworkInterface as NetworkDevice, OutboundBatchStatus,
-    Route, RouteTable, RxChecksumOffload, RxFrame, SegmentationOffload, Stack, StackConfig,
-    StackError, StackEvent, StackInstant, TcpConnectState, TcpConnectTerminalError, TcpEndpoint,
-    TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState, UdpEndpoint, UdpPacket,
-    UdpEgress, UdpPayload, UdpSocketBinding, UdpSocketError, flow_hash,
+    DhcpDnsServers, DhcpMessageType, DhcpPacket, DnsQuestionWriter, DnsRecordType, DnsResponse,
+    EthernetFrame, EthernetProtocol, FlowTuple, IcmpEchoKey, IcmpEchoReply, Icmpv4Packet,
+    Icmpv6Packet, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv4Cidr, Ipv4Packet, Ipv6Address,
+    Ipv6Cidr, Ipv6Packet, MAX_OUTBOUND_FRAMES, NeighborEntry, NetworkInterface as NetworkDevice,
+    OutboundBatchStatus, Route, RouteTable, RxChecksumOffload, RxFrame, SegmentationOffload, Stack,
+    StackConfig, StackError, StackEvent, StackInstant, TcpConnectState, TcpConnectTerminalError,
+    TcpEndpoint, TcpListenBacklog, TcpPacket, TcpReadIntoState, TcpReadState, UdpEgress,
+    UdpEndpoint, UdpPacket, UdpPayload, UdpSocketBinding, UdpSocketError, flow_hash,
 };
 use spin::{Mutex as SpinMutex, RwLock as SpinRwLock};
 
@@ -1275,19 +1274,17 @@ where
             phase,
             elapsed_nanos,
         );
-        self.inner
-            .runtime_state
-            .record_perf_metric_parts(
-                crate::ProfileScope::Kernel,
-                "kernel;network;",
-                phase,
-                crate::PerfSample {
-                    events: usize_to_u64(events, "network profile event count"),
-                    elapsed_nanos,
-                    counters,
-                    bytes: usize_to_u64(bytes, "network profile byte count"),
-                },
-            );
+        self.inner.runtime_state.record_perf_metric_parts(
+            crate::ProfileScope::Kernel,
+            "kernel;network;",
+            phase,
+            crate::PerfSample {
+                events: usize_to_u64(events, "network profile event count"),
+                elapsed_nanos,
+                counters,
+                bytes: usize_to_u64(bytes, "network profile byte count"),
+            },
+        );
     }
 
     pub fn hardware_address(&self) -> [u8; 6] {

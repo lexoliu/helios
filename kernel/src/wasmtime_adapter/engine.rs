@@ -181,9 +181,7 @@ pub fn resolve_wasi_cli_run<T: 'static>(
         .ok_or_else(|| wasmtime::Error::new(WasiCliRunResolveError::FunctionMissing))?;
     instance
         .get_typed_func::<(), (core::result::Result<(), ()>,)>(&mut store, &run)
-        .map_err(|error| {
-            wasmtime::Error::new(WasiCliRunResolveError::FunctionTypeMismatch(error))
-        })
+        .map_err(|error| wasmtime::Error::new(WasiCliRunResolveError::FunctionTypeMismatch(error)))
 }
 
 use super::config::build_component_engine_config;

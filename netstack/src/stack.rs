@@ -3804,7 +3804,10 @@ where
             .checked_add(payload.len())
             .ok_or(StackError::PacketTooLarge)?;
         self.ensure_path_packet_fits(
-            PathMtuKey::new(IpAddress::Ipv4(path.source), IpAddress::Ipv4(path.destination)),
+            PathMtuKey::new(
+                IpAddress::Ipv4(path.source),
+                IpAddress::Ipv4(path.destination),
+            ),
             EthernetFrame::HEADER_LEN + Ipv4Packet::MIN_HEADER_LEN,
             udp_len,
         )?;
@@ -3860,7 +3863,10 @@ where
             .checked_add(payload.len())
             .ok_or(StackError::PacketTooLarge)?;
         self.ensure_path_packet_fits(
-            PathMtuKey::new(IpAddress::Ipv6(path.source), IpAddress::Ipv6(path.destination)),
+            PathMtuKey::new(
+                IpAddress::Ipv6(path.source),
+                IpAddress::Ipv6(path.destination),
+            ),
             EthernetFrame::HEADER_LEN + Ipv6Packet::HEADER_LEN,
             udp_len,
         )?;

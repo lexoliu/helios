@@ -5,8 +5,37 @@ use super::*;
 /// A `func_wrap_async` closure has to spell out the guest's parameter
 /// tuple, and these two calls pass every argument as an `i32` pointer
 /// or length; the shape is the ABI, not a modelling choice.
-type WasixHostArgs13 = (i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32);
-type WasixHostArgs14 = (i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32);
+type WasixHostArgs13 = (
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+);
+type WasixHostArgs14 = (
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+);
 
 /// What a spawning guest hands down to its child besides the program
 /// itself. `None` means the child inherits the parent's.
@@ -1723,7 +1752,10 @@ where
     Err(wasmtime::Error::new(Preview1Exit))
 }
 
-#[expect(clippy::too_many_arguments, reason = "the parameter list is the guest ABI of this call, so grouping it would hide the contract and break the one-to-one match with the linker registration")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the parameter list is the guest ABI of this call, so grouping it would hide the contract and break the one-to-one match with the linker registration"
+)]
 pub(super) async fn wasix_proc_exec3<CpuImpl, HostFs>(
     caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, HostFs>>,
     name: u32,

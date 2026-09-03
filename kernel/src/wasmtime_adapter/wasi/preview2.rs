@@ -1511,16 +1511,17 @@ where
         // host-fs service first so the sync embedded path sees a fully
         // populated view.
         if let Some(host_path) = crate::guest_host_share_path(&descriptor.path)
-            && let Ok(service) = self.filesystem().host_service().map_err(error_code_from_p3) {
-                let host_path = host_path.to_owned();
-                match service.read_dir(&host_path).await {
-                    Ok(entries) => {
-                        self.filesystem_mut()
-                            .seed_host_directory_entries(&descriptor.path, entries);
-                    }
-                    Err(err) => return Ok(Err(error_code_from_p3(map_host_fs_error(err)))),
+            && let Ok(service) = self.filesystem().host_service().map_err(error_code_from_p3)
+        {
+            let host_path = host_path.to_owned();
+            match service.read_dir(&host_path).await {
+                Ok(entries) => {
+                    self.filesystem_mut()
+                        .seed_host_directory_entries(&descriptor.path, entries);
                 }
+                Err(err) => return Ok(Err(error_code_from_p3(map_host_fs_error(err)))),
             }
+        }
         match self.filesystem_mut().read_directory(&descriptor.path) {
             Ok(entries) => {
                 let resource = self.table.push(DirectoryEntryStream {

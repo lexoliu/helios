@@ -2488,13 +2488,12 @@ where
                 fin: false,
             });
         }
-        (matches!(self.state, TcpState::FinWait1 | TcpState::LastAck) && !self.fin_queued).then_some(
-            TcpPersistProbe {
+        (matches!(self.state, TcpState::FinWait1 | TcpState::LastAck) && !self.fin_queued)
+            .then_some(TcpPersistProbe {
                 sequence: self.send_next,
                 sequence_len: 1,
                 fin: true,
-            },
-        )
+            })
     }
 
     fn mark_persist_probe_queued(&mut self, probe: TcpPersistProbe, now_nanos: u64) {

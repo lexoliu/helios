@@ -10,8 +10,7 @@ use crate::{
     EmbeddedBootFs, FoldedProfileSample, FutexKey, FutexTable, FutexWaitRegistration,
     HEAP_SIZE_CLASS_COUNT, HeapStats, InstanceRegistry, Notify, PerfMetricFilter,
     PerfMetricHistory, PerfMetricSample, PerfSample, ProfileFilter, ProfileHistory, ProfileScope,
-    StatsSample,
-    TraceEvent, TraceFilter, TraceHistory, embedded_init,
+    StatsSample, TraceEvent, TraceFilter, TraceHistory, embedded_init,
 };
 use crate::{RootEntropy, RootEntropyHandle};
 use helios_hal::cpu::HardwarePerfCounterDelta;

@@ -1029,9 +1029,10 @@ fn default_cpu(profile: &VmProfile, accel: &[String]) -> Option<&'static str> {
 
 fn ensure_qemu_command(command: &ResolvedVmCommand) -> Result<()> {
     if let Some(shared_dir) = &command.shared_dir
-        && !shared_dir.is_dir() {
-            bail!("shared directory does not exist: {}", shared_dir.display());
-        }
+        && !shared_dir.is_dir()
+    {
+        bail!("shared directory does not exist: {}", shared_dir.display());
+    }
     if command.profile.arch == VmArch::Aarch64
         && command.accel.iter().any(|accel| accel == "hvf")
         && std::env::consts::ARCH != "aarch64"
@@ -1714,9 +1715,10 @@ fn discover_helios_cli() -> Result<PathBuf> {
     }
     let current_exe = std::env::current_exe().context("failed to locate current executable")?;
     if let Some(candidate) = current_exe.parent().map(|dir| dir.join("helios-cli"))
-        && candidate.is_file() {
-            return Ok(candidate);
-        }
+        && candidate.is_file()
+    {
+        return Ok(candidate);
+    }
     if let Some(candidate) = find_executable_in_path("helios-cli") {
         return Ok(candidate);
     }
@@ -1928,9 +1930,10 @@ impl VmRuntime {
             command.virtio_devices,
         );
         if let Some(host_share) = command.profile.host_share
-            && let Some(shared_dir) = &command.shared_dir {
-                configure_host_share(&mut qemu, host_share, shared_dir, command.virtio_devices);
-            }
+            && let Some(shared_dir) = &command.shared_dir
+        {
+            configure_host_share(&mut qemu, host_share, shared_dir, command.virtio_devices);
+        }
         if let Some(watchdog) = command.profile.watchdog {
             configure_watchdog(&mut qemu, watchdog);
         }

@@ -531,10 +531,9 @@ where
     };
     record_program_kernel_profile_sample(store_teardown_profile, "core-store-teardown");
 
-    if recycle_allowed
-        && let (Some(spec), Some(memory)) = (imported_memory_spec, recycle_memory) {
-            spawn_scrubbed_recycle(&recycle_spawner, shared_memory_pool.clone(), spec, memory);
-        }
+    if recycle_allowed && let (Some(spec), Some(memory)) = (imported_memory_spec, recycle_memory) {
+        spawn_scrubbed_recycle(&recycle_spawner, shared_memory_pool.clone(), spec, memory);
+    }
     match completion {
         CoreModuleRunCompletion::Exit(result) => result,
         CoreModuleRunCompletion::Exec(replacement) => {
@@ -1664,10 +1663,9 @@ pub(super) fn validate_preview1_program_import(
                 return Ok(());
             }
         }
-        WASIX_MODULE
-            if crate::wasmtime_adapter::wasix::LINKED_IMPORTS.contains(&name) => {
-                return Ok(());
-            }
+        WASIX_MODULE if crate::wasmtime_adapter::wasix::LINKED_IMPORTS.contains(&name) => {
+            return Ok(());
+        }
         _ => {}
     }
     tracing::error!(

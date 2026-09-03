@@ -1856,9 +1856,9 @@ where
         if source_node.kind == FsNodeKind::Directory
             && (destination_absolute == source_absolute
                 || crate::path_is_within_directory(&destination_absolute, &source_absolute))
-            {
-                return Err(fs_types::ErrorCode::NotPermitted);
-            }
+        {
+            return Err(fs_types::ErrorCode::NotPermitted);
+        }
 
         let mut state = self.snapshot.inner.lock();
         for node in &mut state.nodes {

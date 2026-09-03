@@ -385,12 +385,10 @@ pub(super) fn write_shared_memory(
 ) -> Result<(), ProgramExecError> {
     let data = memory.data();
     let start = ptr as usize;
-    let end = start
-        .checked_add(bytes.len())
-        .ok_or(ProgramExecError {
-            kind: ProgramExecErrorKind::InvalidBinary,
-            detail: ProgramExecErrorDetail::GuestMemoryAccessOverflow,
-        })?;
+    let end = start.checked_add(bytes.len()).ok_or(ProgramExecError {
+        kind: ProgramExecErrorKind::InvalidBinary,
+        detail: ProgramExecErrorDetail::GuestMemoryAccessOverflow,
+    })?;
     if end > data.len() {
         tracing::error!(
             start,
