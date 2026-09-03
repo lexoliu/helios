@@ -518,7 +518,8 @@ jobs:
           print(f"### Linux baseline: {payload['linux_baseline']['kind']}\n")
           print(f"- Wasmtime floor: `{payload['wasmtime_linux_baseline'].get('release')}`")
           print(f"- Guest CPU: `{payload['linux_baseline'].get('qemu_cpu')}` "
-                f"on `{payload['linux_baseline'].get('qemu_machine')}`\n")
+                f"on `{payload['linux_baseline'].get('qemu_machine')}`")
+          print(f"- Guest RAM: `{payload['linux_baseline'].get('qemu_ram')}`\n")
           print("| workload | class | Linux native (ms) | Wasmtime-on-Linux (ms) |")
           print("| --- | --- | ---: | ---: |")
           for row in payload["workloads"]:
@@ -534,5 +535,6 @@ jobs:
           name: perf-baselines-linux-baseline-aarch64
           path: |
             helios/target/perf-baselines/ci-linux-baseline-aarch64/**
-            helios/target/perf-baselines/linux-vm/fedora-aarch64/serial.log
+            helios/target/perf-baselines/linux-vm/fedora-aarch64/serial.boot-attempt-*.log
+            helios/target/perf-baselines/linux-vm/fedora-aarch64/host-memory.boot-attempt-*.json
           if-no-files-found: warn
