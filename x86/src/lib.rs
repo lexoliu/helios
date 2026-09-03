@@ -1279,7 +1279,11 @@ pub(crate) fn write_debug_serial_bytes(bytes: &[u8]) {
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     serial_uart_init();
-    let _ = writeln!(PanicSerialWriter, "{info}");
+    // One indivisible message, like every other console producer: the panic
+    // report shares this UART with kernel tracing and the debugger markers.
+    helios_kernel::emit_console_line(|| {
+        let _ = writeln!(PanicSerialWriter, "{info}");
+    });
     helios_kernel::panic_log(info);
     loop {
         core::hint::spin_loop();

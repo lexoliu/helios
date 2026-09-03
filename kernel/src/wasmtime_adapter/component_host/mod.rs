@@ -84,9 +84,13 @@ impl Write for SerialFmtWriter {
 
 fn write_serial_fmt(write_serial: fn(&[u8]), arguments: fmt::Arguments<'_>) {
     let mut writer = SerialFmtWriter { write_serial };
-    writer
-        .write_fmt(arguments)
-        .expect("serial formatting should not fail");
+    // `write_fmt` hands the sink one fragment per format piece, so the gate
+    // spans the whole message rather than each fragment.
+    crate::io::emit_console_line(|| {
+        writer
+            .write_fmt(arguments)
+            .expect("serial formatting should not fail");
+    });
 }
 
 pub use network::{
