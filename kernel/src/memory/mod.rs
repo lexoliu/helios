@@ -18,8 +18,8 @@ mod user;
 pub use balloon::{BalloonHandle, BalloonStats, FREE_PAGE_REPORT_INTERVAL, install_memory_balloon};
 pub use entropy::{
     ENTROPY_RESEED_INTERVAL, EntropyPool, EntropySources, HardwareEntropySource,
-    NoCryptographicEntropy, ROOT_ENTROPY_MATERIAL_BYTES, RootEntropy, RootEntropyHandle,
-    install_entropy_device, seed_root_entropy,
+    NoCryptographicEntropy, NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES, RootEntropy,
+    RootEntropyHandle, install_entropy_device, seed_root_entropy,
 };
 pub use pmm::KernelPhysFrameAllocator;
 pub use reservations::{

@@ -39,6 +39,10 @@ impl HardwareEntropySource for VirtioEntropyDevice {
     ) -> impl Future<Output = Result<(), IoError>> + Send + 'a {
         self.device.fill(buffer)
     }
+
+    fn drain_completions(&self) {
+        self.device.handle_interrupt();
+    }
 }
 
 /// The PCI function that carries the platform's entropy device.

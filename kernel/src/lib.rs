@@ -114,7 +114,7 @@ pub use kernel_exception::{
 pub use memory::{
     AccessibilityPlan, BalloonHandle, BalloonStats, CommittedRegion, ENTROPY_RESEED_INTERVAL,
     EntropyPool, EntropySources, FREE_PAGE_REPORT_INTERVAL, HardwareEntropySource,
-    KernelPhysFrameAllocator, NoCryptographicEntropy, ROOT_ENTROPY_MATERIAL_BYTES,
+    KernelPhysFrameAllocator, NoCryptographicEntropy, NoEntropyDevice, ROOT_ENTROPY_MATERIAL_BYTES,
     ReservationLookup, ReservationTracker, RootEntropy, RootEntropyHandle, UserHeapStats, VaCursor,
     allocate_user_frame_uninit_on, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,
     deallocate_user_frame, deallocate_user_frame_on, install_entropy_device,

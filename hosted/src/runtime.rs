@@ -260,7 +260,13 @@ fn spawn_processor_thread(
                 // The hosted backend has no entropy device: the host OS
                 // is the only cryptographic source, and it is always
                 // there, so the root DRBG never reseeds after boot.
-                debug_state.install_root_entropy(helios_kernel::seed_root_entropy(&cpu, None));
+                // `NoEntropyDevice` is uninhabited, which is how that
+                // fact is stated to the type system.
+                debug_state.install_root_entropy(helios_kernel::seed_root_entropy(
+                    &cpu,
+                    None,
+                    None::<&helios_kernel::NoEntropyDevice>,
+                ));
 
                 // The host's clock is this backend's calendar, and it is
                 // read once, here, before any component can ask what
