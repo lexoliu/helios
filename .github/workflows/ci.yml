@@ -267,9 +267,15 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+  # On macOS rather than on an Arm Linux runner: those have no
+  # `/dev/kvm`, and the QEMU 8.2 that Ubuntu 24.04 ships asserts in its
+  # emulated GICv3 CPU interface under multi-threaded TCG
+  # (`gicv3_cpuif_update: assertion failed: (qemu_mutex_iothread_locked())`),
+  # so a four-processor aarch64 guest cannot boot there at all. The
+  # macOS runners have HVF and a current QEMU. See issue #85.
   smoke-aarch64:
     name: smoke-aarch64
-    runs-on: ubuntu-24.04-arm
+    runs-on: macos-15
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
@@ -278,15 +284,8 @@ jobs:
       - uses: ./helios/.github/actions/checkout-wasmtime
       - name: Install host dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libudev-dev just cmake ninja-build \
-            qemu-system-arm qemu-efi-aarch64
+          brew install qemu just cmake ninja
           qemu-system-aarch64 --version
-          if [ -e /dev/kvm ]; then
-            sudo chmod 666 /dev/kvm
-            ls -la /dev/kvm
-          fi
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-tools
@@ -343,8 +342,9 @@ jobs:
       # Under TCG with `-cpu max`, because ACPI carries no counterpart to
       # the device tree's `/chosen/rng-seed` and the kernel refuses to
       # boot without a pre-executor entropy source. `-cpu max`
-      # implements FEAT_RNG, which the Neoverse cores these runners use
-      # do not. See issue #83.
+      # implements FEAT_RNG, which the Apple cores behind HVF do not.
+      # Two processors rather than four, to bound what TCG has to
+      # emulate. See issue #83.
       - name: Boot aarch64 guest from ACPI
         shell: bash
         working-directory: helios
@@ -356,7 +356,7 @@ jobs:
           runtime="$GITHUB_WORKSPACE/smoke-runtime/acpi"
           mkdir -p "$runtime"
           ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G --acpi \
-            --accel tcg --cpu max \
+            --accel tcg --cpu max --smp 2 \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --boot-program dash --boot-program debugger --no-compiler-plugin \
             shell -c 'echo ok' 2>&1 > boot-acpi.out | tee "$runtime/inspector.log"
